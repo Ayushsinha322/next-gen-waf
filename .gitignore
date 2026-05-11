@@ -1,0 +1,43 @@
+# Build artifacts
+target/
+**/target/
+dist/
+build/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Go
+control-plane/bin/
+*.test
+*.out
+vendor/
+
+# Node
+node_modules/
+.next/
+out/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Secrets / local
+.env
+.env.local
+*.key
+*.pem
+!**/testdata/**/*.pem
+
+# Logs / data
+*.log
+/var/
+/data/
+
+# Generated
+*.pb.go
+*_pb2.py
+generated/

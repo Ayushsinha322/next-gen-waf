@@ -1,0 +1,73 @@
+# =====================================================================
+# Sentinel WAF — FULL Docker Compose (everything in containers).
+# Use this for CI integration tests or for users who want one-command
+# trial without installing Rust/Go/Node toolchains.
+#
+# Usage:
+#   docker compose -f deploy/docker/compose.full.yml up --build
+# =====================================================================
+
+name: sentinel-full
+
+services:
+  postgres:
+    extends: { file: compose.dev.yml, service: postgres }
+  redis:
+    extends: { file: compose.dev.yml, service: redis }
+  clickhouse:
+    extends: { file: compose.dev.yml, service: clickhouse }
+  minio:
+    extends: { file: compose.dev.yml, service: minio }
+
+  controlplane:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+      target: sentinel-controlplane
+    container_name: sentinel-controlplane
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    environment:
+      SENTINEL_DB_URL: postgres://sentinel:sentinel_dev@postgres:5432/sentinel?sslmode=disable
+      SENTINEL_REDIS_URL: redis://redis:6379
+      SENTINEL_CLICKHOUSE_URL: http://sentinel:sentinel_dev@clickhouse:8123/sentinel_logs
+      SENTINEL_S3_ENDPOINT: http://minio:9000
+    ports:
+      - "7443:7443"   # gRPC
+      - "8443:8443"   # REST/admin
+
+  dataplane:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+      target: sentinel-dataplane
+    container_name: sentinel-dataplane
+    depends_on:
+      controlplane: { condition: service_started }
+    cap_add:
+      - NET_ADMIN          # eBPF/XDP
+      - SYS_RESOURCE
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"      # HTTP/3
+    volumes:
+      - ../../configs/examples/sentinel.yaml:/etc/sentinel/sentinel.yaml:ro
+
+  dashboard:
+    build:
+      context: ../../dashboard
+      dockerfile: ../deploy/docker/Dockerfile.dashboard
+    container_name: sentinel-dashboard
+    depends_on: [controlplane]
+    environment:
+      NEXT_PUBLIC_API_URL: http://controlplane:8443
+    ports:
+      - "3000:3000"
+
+volumes:
+  pgdata:
+  redisdata:
+  chdata:
+  miniodata:

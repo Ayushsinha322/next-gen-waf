@@ -1,0 +1,90 @@
+# Sentinel WAF — Default configuration
+# Hot-reloaded on SIGHUP or via control-plane gRPC push.
+
+cluster:
+  name: sentinel-prod
+  node_id: auto                    # auto = derive from hostname+mac
+  control_plane:
+    endpoints: ["https://cp-1.internal:7443", "https://cp-2.internal:7443"]
+    tls:
+      ca: /etc/sentinel/pki/ca.crt
+      cert: /etc/sentinel/pki/node.crt
+      key: /etc/sentinel/pki/node.key
+
+listeners:
+  - name: http
+    bind: "0.0.0.0:80"
+    protocol: http1
+  - name: https
+    bind: "0.0.0.0:443"
+    protocol: [http1, http2]
+    tls:
+      cert: /etc/sentinel/pki/server.crt
+      key: /etc/sentinel/pki/server.key
+      min_version: tls1.2
+      post_quantum: hybrid          # disabled | hybrid | required
+  - name: h3
+    bind: "0.0.0.0:443"
+    protocol: http3                 # QUIC
+
+sites:
+  - id: example
+    domains: ["example.com", "*.example.com"]
+    upstream:
+      load_balancer: round_robin    # round_robin | least_conn | ip_hash | adaptive
+      servers:
+        - { host: "10.0.0.10", port: 8080, weight: 1 }
+        - { host: "10.0.0.11", port: 8080, weight: 1 }
+      health_check:
+        path: /healthz
+        interval: 5s
+        timeout: 2s
+    waf:
+      mode: blocking                # off | learning | blocking
+      paranoia_level: 2             # 1..4 (CRS-style)
+      anomaly_threshold: 5
+      rules:
+        - owasp-crs/v4
+        - custom/api-rules
+      ml:
+        enable: true
+        models: [anomaly_v1, payload_classifier_v1]
+        sensitivity: 0.85
+      rate_limit:
+        global: { rps: 1000, burst: 2000 }
+        per_ip: { rps: 50, burst: 100 }
+      bot_detection:
+        ja4: true
+        challenge: turnstile        # off | native_pow | hcaptcha | turnstile
+      dlp:
+        enable: true
+        patterns: [credit_card, ssn, api_key, jwt]
+      api_discovery: true
+      graphql:
+        enable: true
+        max_depth: 10
+        max_complexity: 1000
+    plugins:
+      - name: jwt-validator
+        config: { issuer: "https://auth.example.com", audience: "api" }
+
+logging:
+  level: info
+  format: json
+  outputs:
+    - type: stdout
+    - type: otlp
+      endpoint: "http://otel-collector:4317"
+    - type: file
+      path: /var/log/sentinel/access.log
+      rotate: { size: 100MB, keep: 10 }
+
+storage:
+  cache: { backend: memory, size: 512MB }
+  kv:    { backend: rocksdb, path: /var/lib/sentinel/kv }
+
+ebpf:
+  enable: true
+  programs:
+    - xdp_ddos_filter
+    - tc_ja4_capture
