@@ -1,0 +1,570 @@
+use anyhow::Result;
+use once_cell::sync::Lazy;
+use regex::Regex;
+use tracing::warn;
+
+use crate::dsl::ast::{
+    ChainCondition, Directive, Operator, RuleAction, RuleDef, RuleFile, RuleItem, RulePhase,
+    Target, TargetCombinator, TargetExpr,
+};
+use super::secrule::{CrsAction, CrsActions, parse_crs_actions, parse_crs_operator, split_crs_targets};
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Import a ModSecurity `.conf` source string and produce an SRL `RuleFile`.
+///
+/// `data_dir` is the directory used to resolve `@pmFromFile filename.data`
+/// references.  Pass `None` to disable file loading; affected rules will be
+/// emitted with an empty word list (effectively disabled).
+///
+/// Handles:
+/// - `SecRule TARGETS "operator" "actions"` — converted to `RuleDef`
+/// - `SecRule … chain` followed by continuation rules — fully supported
+/// - `@pmFromFile filename` — loaded from `data_dir/filename`
+/// - `SecRuleEngine On|Off|DetectionOnly`
+/// - `SecRequestBodyAccess On|Off`
+/// - `SecResponseBodyAccess On|Off`
+/// - `SecDefaultAction "..."`
+/// - `SecMarker "..."`
+/// - `Include glob`
+///
+/// Unsupported directives are silently skipped with a warning.
+pub fn import_secrule_conf_dir(
+    source: &str,
+    data_dir: Option<&std::path::Path>,
+) -> Result<RuleFile> {
+    let collapsed = collapse_continuations(source);
+    let expanded = expand_pmfromfile(&collapsed, data_dir);
+    let cleaned = comment_unknown_directives(&expanded);
+
+    let parsed = crate::dsl::parser::parse_rule_file(&cleaned)?;
+
+    let mut out_items: Vec<RuleItem> = Vec::new();
+    // When Some, we're accumulating chain members onto the buffered rule.
+    let mut pending_chain: Option<RuleDef> = None;
+
+    for item in parsed.items {
+        match item {
+            RuleItem::Directive(Directive::SecRule(dir)) => {
+                let actions = parse_crs_actions(&dir.actions);
+                let is_chain = actions.chain;
+
+                if let Some(ref mut pending) = pending_chain {
+                    // This directive is a chain member — add its condition.
+                    let targets = parse_crs_target_str(&dir.targets);
+                    let (op_name, op_pat) = parse_crs_operator(&dir.operator);
+                    match crs_op_to_operator(&op_name, &op_pat) {
+                        Ok(operator) => {
+                            // Chain members may have empty targets (bare operator
+                            // that applies to the previously matched value) — we
+                            // treat those as Exists stubs.
+                            pending.chain_conditions.push(ChainCondition { targets, operator });
+                        }
+                        Err(e) => {
+                            warn!("CRS importer: skipping chain condition: {e}");
+                        }
+                    }
+
+                    if !is_chain {
+                        // End of chain — emit the fully-built rule.
+                        out_items.push(RuleItem::Rule(pending_chain.take().unwrap()));
+                    }
+                    // If still chaining, keep pending_chain in place.
+                } else {
+                    // First rule in a (possibly chained) sequence.
+                    match secrule_directive_to_rule_with_actions(
+                        &dir.targets,
+                        &dir.operator,
+                        &actions,
+                    ) {
+                        Ok(Some(rule)) => {
+                            if is_chain {
+                                pending_chain = Some(rule);
+                            } else {
+                                out_items.push(RuleItem::Rule(rule));
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            warn!("CRS importer: skipping SecRule: {}", e);
+                        }
+                    }
+                }
+            }
+            other => {
+                // Non-SecRule item breaks any open chain.
+                if let Some(pending) = pending_chain.take() {
+                    out_items.push(RuleItem::Rule(pending));
+                }
+                out_items.push(other);
+            }
+        }
+    }
+
+    // Finalize any trailing chain rule.
+    if let Some(pending) = pending_chain.take() {
+        out_items.push(RuleItem::Rule(pending));
+    }
+
+    Ok(RuleFile { items: out_items })
+}
+
+/// Convenience wrapper — no data directory (e.g. unit tests, inline snippets).
+pub fn import_secrule_conf(source: &str) -> Result<RuleFile> {
+    import_secrule_conf_dir(source, None)
+}
+
+// ---------------------------------------------------------------------------
+// @pmFromFile expansion
+// ---------------------------------------------------------------------------
+
+static PMFROMFILE_RE: Lazy<Regex> = Lazy::new(|| {
+    // Match @pmFromFile followed by a filename; stop before whitespace or quotes
+    // so we don't accidentally consume the surrounding CRS operator string delimiters.
+    Regex::new(r#"(?i)@pmFromFile\s+([^\s"']+)"#).expect("pmFromFile regex")
+});
+
+/// Replace every `@pmFromFile filename` occurrence with `@pm word1 word2 …`
+/// by reading the word list from `data_dir/filename`.
+///
+/// If `data_dir` is `None` or the file cannot be read, the occurrence is
+/// replaced with an impossible sentinel string so the rule loads but never
+/// fires (logged as a warning).
+fn expand_pmfromfile(source: &str, data_dir: Option<&std::path::Path>) -> String {
+    PMFROMFILE_RE
+        .replace_all(source, |caps: &regex::Captures| {
+            let filename = &caps[1];
+
+            let Some(dir) = data_dir else {
+                warn!(
+                    filename,
+                    "@pmFromFile: no data_dir provided — rule will not match"
+                );
+                return "@pm __sentinel_pmfromfile_missing__".to_owned();
+            };
+
+            let path = dir.join(filename);
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    let words: Vec<&str> = content
+                        .lines()
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                        .collect();
+                    if words.is_empty() {
+                        warn!(
+                            file = %path.display(),
+                            "@pmFromFile: word list is empty — rule will not match"
+                        );
+                        "@pm __sentinel_pmfromfile_empty__".to_owned()
+                    } else {
+                        format!("@pm {}", words.join(" "))
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        file = %path.display(),
+                        "@pmFromFile: cannot read word list ({e}) — rule will not match"
+                    );
+                    "@pm __sentinel_pmfromfile_missing__".to_owned()
+                }
+            }
+        })
+        .into_owned()
+}
+
+// ---------------------------------------------------------------------------
+// Rule conversion helpers
+// ---------------------------------------------------------------------------
+
+/// Convert a raw SecRule directive into a `RuleDef`, using pre-parsed actions.
+fn secrule_directive_to_rule_with_actions(
+    targets_str: &str,
+    operator_str: &str,
+    actions: &CrsActions,
+) -> Result<Option<RuleDef>> {
+    let rule_id = match actions.id {
+        Some(id) => id,
+        None => {
+            return Ok(None); // No ID — likely an orphaned chain member
+        }
+    };
+
+    for u in &actions.unknown {
+        warn!(rule_id, unknown_action = %u, "CRS importer: unrecognised action token");
+    }
+
+    let phase = actions.phase.unwrap_or(RulePhase::RequestBody);
+
+    let targets = parse_crs_target_str(targets_str);
+    if targets.is_empty() {
+        warn!(
+            rule_id,
+            targets = targets_str,
+            "CRS importer: skipping rule — all targets unsupported"
+        );
+        return Ok(None);
+    }
+
+    let (op_name, op_pattern) = parse_crs_operator(operator_str);
+    let operator = crs_op_to_operator(&op_name, &op_pattern)?;
+
+    let rule_action = match actions.action {
+        CrsAction::Block | CrsAction::Deny => {
+            if actions.score_delta.is_some() {
+                RuleAction::Score
+            } else {
+                RuleAction::Block
+            }
+        }
+        CrsAction::Pass | CrsAction::Log | CrsAction::NoLog => RuleAction::Score,
+        CrsAction::Allow => RuleAction::Allow,
+    };
+
+    Ok(Some(RuleDef {
+        id: rule_id,
+        phase,
+        targets,
+        operator,
+        score_delta: actions.score_delta,
+        severity: actions.severity,
+        message: actions.msg.clone(),
+        action: rule_action,
+        tags: actions.tags.clone(),
+        chain_conditions: Vec::new(),
+    }))
+}
+
+/// Public helper — kept for tests that pass actions as a raw string.
+pub fn secrule_directive_to_rule(
+    targets_str: &str,
+    operator_str: &str,
+    actions_str: &str,
+) -> Result<Option<RuleDef>> {
+    let actions = parse_crs_actions(actions_str);
+    secrule_directive_to_rule_with_actions(targets_str, operator_str, &actions)
+}
+
+fn parse_crs_target_str(s: &str) -> Vec<TargetExpr> {
+    let mut out: Vec<TargetExpr> = split_crs_targets(s)
+        .into_iter()
+        .filter_map(|tok| {
+            token_to_target(&tok).map(|target| TargetExpr {
+                target,
+                combinator: Some(TargetCombinator::Or),
+            })
+        })
+        .collect();
+    if let Some(last) = out.last_mut() {
+        last.combinator = None;
+    }
+    out
+}
+
+fn token_to_target(tok: &str) -> Option<Target> {
+    let tok = tok.trim();
+    if let Some(rest) = tok.strip_prefix('!') {
+        let _ = rest;
+        return None;
+    }
+    let tok = tok.strip_prefix('&').unwrap_or(tok);
+
+    let (base, sub) = if let Some(pos) = tok.find(':') {
+        (&tok[..pos], Some(&tok[pos + 1..]))
+    } else {
+        (tok, None)
+    };
+
+    match base {
+        "ARGS" => Some(Target::Args),
+        "ARGS_NAMES" => Some(Target::ArgsNames),
+        "REQUEST_BODY" | "REQUEST_BODY_RAW" => Some(Target::RequestBody),
+        "REQUEST_URI" | "REQUEST_URI_RAW" => Some(Target::RequestUri),
+        "REQUEST_LINE" => Some(Target::RequestLine),
+        "REQUEST_HEADERS" => Some(Target::RequestHeaders(
+            sub.map(str::to_lowercase)
+                .map(|s| s.trim_matches('\'').to_owned()),
+        )),
+        "REQUEST_COOKIES" => Some(Target::RequestCookies(sub.map(str::to_owned))),
+        "RESPONSE_HEADERS" => Some(Target::ResponseHeaders(sub.map(str::to_owned))),
+        "RESPONSE_BODY" => Some(Target::ResponseBody),
+        "REMOTE_ADDR" => Some(Target::RemoteAddr),
+        "GEO" => Some(Target::Geo),
+        "TX" => Some(Target::TxVar(
+            sub.unwrap_or("anomaly_score").to_ascii_uppercase(),
+        )),
+        "MATCHED_VAR" | "MATCHED_VARS" | "MATCHED_VAR_NAME" | "MATCHED_VARS_NAMES" => None,
+        "FILES" | "FILES_NAMES" | "FILES_COMBINED_SIZE" | "FILES_TMPNAMES" => None,
+        "XML" | "MULTIPART_FILENAME" | "MULTIPART_NAME" => None,
+        other => {
+            warn!(target = other, "CRS importer: unknown target token, skipping");
+            None
+        }
+    }
+}
+
+pub(crate) fn crs_op_to_operator(op_name: &str, pattern: &str) -> Result<Operator> {
+    if let Some(inner_name) = op_name.strip_prefix('!') {
+        let inner = crs_op_to_operator(inner_name, pattern)?;
+        return Ok(Operator::Not(Box::new(inner)));
+    }
+
+    if pattern.contains("%{") {
+        warn!(
+            op = op_name,
+            pattern,
+            "CRS importer: pattern contains `%{{...}}` interpolation — replacing with stub"
+        );
+        return Ok(Operator::Exists);
+    }
+
+    match op_name {
+        "rx" => Ok(Operator::Rx(pattern.to_owned())),
+        "pm" | "pmfromfile" => {
+            let words: Vec<String> = pattern.split_whitespace().map(String::from).collect();
+            Ok(Operator::ContainsWord(words))
+        }
+        "contains" => Ok(Operator::ContainsWord(vec![pattern.to_owned()])),
+        "beginswith" => Ok(Operator::Rx(format!("^{}", regex::escape(pattern)))),
+        "endswith" => Ok(Operator::Rx(format!("{}$", regex::escape(pattern)))),
+        "streq" | "eq" => Ok(Operator::Eq(pattern.to_owned())),
+        "ge" => pattern
+            .parse::<i64>()
+            .map(Operator::Ge)
+            .map_err(|_| anyhow::anyhow!("invalid integer in @ge: {}", pattern)),
+        "lt" => {
+            // @lt N → less-than comparison; expressed as Not(Ge(N)).
+            // Used by CRS for TX:DETECTION_PARANOIA_LEVEL skip-gate rules.
+            pattern
+                .parse::<i64>()
+                .map(|n| Operator::Not(Box::new(Operator::Ge(n))))
+                .map_err(|_| anyhow::anyhow!("invalid integer in @lt: {}", pattern))
+        }
+        "le" => {
+            // @le N → less-than-or-equal; expressed as Not(Ge(N+1)).
+            pattern
+                .parse::<i64>()
+                .map(|n| Operator::Not(Box::new(Operator::Ge(n + 1))))
+                .map_err(|_| anyhow::anyhow!("invalid integer in @le: {}", pattern))
+        }
+        "within" => {
+            let words: Vec<String> = pattern.split_whitespace().map(String::from).collect();
+            Ok(Operator::ContainsWord(words))
+        }
+        "exists" | "unconditionalMatch" => Ok(Operator::Exists),
+        "noMatch" => Ok(Operator::Not(Box::new(Operator::Exists))),
+        "detectsqli" => {
+            warn!(op = op_name, "CRS importer: @detectSQLi mapped to stub regex");
+            Ok(Operator::Rx(
+                r"(?i)\b(?:select|union|insert|update|delete|drop|exec|sleep|benchmark|waitfor)\b"
+                    .to_owned(),
+            ))
+        }
+        "detectxss" => {
+            warn!(op = op_name, "CRS importer: @detectXSS mapped to stub regex");
+            Ok(Operator::Rx(
+                r"(?i)<\s*script|on\w+\s*=|javascript:|<\s*img[^>]*onerror".to_owned(),
+            ))
+        }
+        "validateurlencoding" | "validateutf8encoding" | "validatebyterange"
+        | "validateschema" | "validatedtd" | "verifycc" | "verifycpf" | "verifyssn"
+        | "geolookup" | "ipmatch" | "ipmatchf" | "ipmatchfromfile" | "rbl"
+        | "fuzzyhash" | "inspectfile" | "gt" | "lookup" => {
+            warn!(op = op_name, "CRS importer: unsupported operator '{op_name}' — rule disabled");
+            Ok(Operator::Not(Box::new(Operator::Exists)))
+        }
+        other => {
+            warn!(op = other, "CRS importer: unknown operator '{other}' — rule disabled");
+            Ok(Operator::Not(Box::new(Operator::Exists)))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ModSecurity directive preprocessing
+// ---------------------------------------------------------------------------
+
+const KNOWN_DIRECTIVES: &[&str] = &[
+    "SecRule",
+    "SecRuleEngine",
+    "SecRequestBodyAccess",
+    "SecResponseBodyAccess",
+    "SecDefaultAction",
+    "SecMarker",
+    "SecAction",
+];
+
+fn comment_unknown_directives(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        let first_token = trimmed
+            .split(|c: char| c.is_whitespace())
+            .next()
+            .unwrap_or("");
+
+        let is_known = KNOWN_DIRECTIVES.iter().any(|d| first_token == *d);
+        let is_unknown_sec = first_token.starts_with("Sec") && !is_known;
+
+        if is_unknown_sec {
+            out.push_str("# [crs-compat skipped] ");
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+fn collapse_continuations(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut chars = source.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.peek() {
+                Some('\n') => {
+                    chars.next();
+                    out.push(' ');
+                }
+                Some('\\') => {
+                    chars.next();
+                    out.push('\\');
+                    out.push('\\');
+                }
+                _ => out.push(c),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skips_unknown_sec_directives() {
+        let src = r#"SecComponentSignature "OWASP_CRS/4.7.0"
+SecAuditEngine RelevantOnly
+SecRule ARGS "@rx evil" "id:1,phase:2,block,msg:'x'"
+"#;
+        let rf = import_secrule_conf(src).expect("import failed despite unknown directives");
+        assert_eq!(
+            rf.items.iter().filter(|i| matches!(i, RuleItem::Rule(_))).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn import_simple_secrule() {
+        let src = r##"SecRule ARGS "@rx (?i)(select|union)" "id:942100,phase:2,block,msg:'SQL Injection',severity:'CRITICAL'""##;
+        let rf = import_secrule_conf(src).expect("import failed");
+        assert_eq!(rf.items.len(), 1);
+        if let RuleItem::Rule(rule) = &rf.items[0] {
+            assert_eq!(rule.id, 942100);
+            assert_eq!(rule.phase, RulePhase::RequestBody);
+            assert!(matches!(&rule.operator, Operator::Rx(_)));
+        } else {
+            panic!("expected Rule");
+        }
+    }
+
+    #[test]
+    fn import_multi_target() {
+        let src = r#"SecRule ARGS|ARGS_NAMES|REQUEST_BODY "@rx select" "id:100,phase:2,pass""#;
+        let rf = import_secrule_conf(src).expect("import");
+        if let RuleItem::Rule(rule) = &rf.items[0] {
+            assert!(rule.targets.len() >= 1);
+        }
+    }
+
+    #[test]
+    fn chain_directive_combines_conditions() {
+        let src = r#"SecRule ARGS "@rx select" "id:100,phase:2,pass,log,chain"
+SecRule REQUEST_HEADERS:User-Agent "@rx sqlmap" "t:none"
+"#;
+        let rf = import_secrule_conf(src).expect("import");
+        let rules: Vec<_> = rf.items.iter().filter_map(|i| {
+            if let RuleItem::Rule(r) = i { Some(r) } else { None }
+        }).collect();
+        assert_eq!(rules.len(), 1, "chained rules should produce one RuleDef");
+        assert_eq!(rules[0].id, 100);
+        assert_eq!(rules[0].chain_conditions.len(), 1, "one chain condition expected");
+    }
+
+    #[test]
+    fn chain_triple_combines_all() {
+        let src = r#"SecRule ARGS "@rx foo" "id:200,phase:2,pass,chain"
+SecRule ARGS "@rx bar" "chain"
+SecRule ARGS "@rx baz" "t:none"
+"#;
+        let rf = import_secrule_conf(src).expect("import");
+        let rules: Vec<_> = rf.items.iter().filter_map(|i| {
+            if let RuleItem::Rule(r) = i { Some(r) } else { None }
+        }).collect();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].chain_conditions.len(), 2);
+    }
+
+    #[test]
+    fn pmfromfile_without_dir_produces_empty_words() {
+        let src = r#"SecRule ARGS "@pmFromFile scanners.data" "id:300,phase:2,block""#;
+        let rf = import_secrule_conf(src).expect("import");
+        let rules: Vec<_> = rf.items.iter().filter_map(|i| {
+            if let RuleItem::Rule(r) = i { Some(r) } else { None }
+        }).collect();
+        assert_eq!(rules.len(), 1, "rule should still be emitted");
+        if let Operator::ContainsWord(words) = &rules[0].operator {
+            // The placeholder word is injected so the AC set still compiles.
+            assert!(!words.is_empty());
+        } else {
+            panic!("expected ContainsWord operator");
+        }
+    }
+
+    #[test]
+    fn pmfromfile_with_dir_loads_words() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("test.data");
+        let mut f = std::fs::File::create(&file_path).unwrap();
+        writeln!(f, "# comment").unwrap();
+        writeln!(f, "sqlmap").unwrap();
+        writeln!(f, "nikto").unwrap();
+
+        let src = r#"SecRule REQUEST_HEADERS:User-Agent "@pmFromFile test.data" "id:400,phase:1,block""#;
+        let rf = import_secrule_conf_dir(src, Some(dir.path())).expect("import");
+        let rules: Vec<_> = rf.items.iter().filter_map(|i| {
+            if let RuleItem::Rule(r) = i { Some(r) } else { None }
+        }).collect();
+        assert_eq!(rules.len(), 1);
+        if let Operator::ContainsWord(words) = &rules[0].operator {
+            assert!(words.contains(&"sqlmap".to_owned()));
+            assert!(words.contains(&"nikto".to_owned()));
+            assert!(!words.iter().any(|w| w.starts_with('#')));
+        } else {
+            panic!("expected ContainsWord operator");
+        }
+    }
+
+    #[test]
+    fn lt_operator_maps_to_not_ge() {
+        let src = r#"SecRule TX:DETECTION_PARANOIA_LEVEL "@lt 2" "id:500,phase:1,pass,nolog""#;
+        let rf = import_secrule_conf(src).expect("import");
+        let rules: Vec<_> = rf.items.iter().filter_map(|i| {
+            if let RuleItem::Rule(r) = i { Some(r) } else { None }
+        }).collect();
+        assert_eq!(rules.len(), 1);
+        assert!(
+            matches!(&rules[0].operator, Operator::Not(inner) if matches!(inner.as_ref(), Operator::Ge(2))),
+            "expected Not(Ge(2)) for @lt 2"
+        );
+    }
+}

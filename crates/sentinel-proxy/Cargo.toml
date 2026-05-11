@@ -22,3 +22,5 @@ arc-swap = { workspace = true }
 dashmap = { workspace = true }
 serde_json = { workspace = true }
 sentinel-core = { path = "../sentinel-core" }
+sentinel-rules = { path = "../sentinel-rules" }
+sentinel-modules = { path = "../sentinel-modules" }

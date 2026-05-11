@@ -41,3 +41,10 @@ out/
 *.pb.go
 *_pb2.py
 generated/
+
+
+# Local notes
+SAVE1.md
+ROADMAP.md
+.local/
+notes/

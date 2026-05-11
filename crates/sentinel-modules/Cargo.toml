@@ -10,3 +10,11 @@ tracing = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+dashmap = { workspace = true }
+arc-swap = { workspace = true }
+regex = { workspace = true }
+once_cell = { workspace = true }
+parking_lot = { workspace = true }
+ipnet = { workspace = true }
+maxminddb = { workspace = true }
+sentinel-core = { path = "../sentinel-core" }

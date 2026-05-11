@@ -251,12 +251,15 @@ pub struct WafConfig {
     #[serde(default)]
     pub rules: Vec<String>,
     pub ml: Option<MlConfig>,
+    pub ip_reputation: Option<IpReputationConfig>,
     pub rate_limit: Option<RateLimitConfig>,
     pub bot_detection: Option<BotDetectionConfig>,
     pub dlp: Option<DlpConfig>,
     #[serde(default)]
     pub api_discovery: bool,
     pub graphql: Option<GraphqlConfig>,
+    pub anti_ddos: Option<AntiDdosConfig>,
+    pub geoip: Option<GeoIpConfig>,
 }
 
 fn default_paranoia() -> u8 {
@@ -289,6 +292,46 @@ pub struct MlConfig {
 fn default_sensitivity() -> f32 {
     0.85
 }
+
+// ---------------------------------------------------------------------------
+// IP Reputation
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IpReputationConfig {
+    /// CIDR ranges that are always allowed (overrides blocklist).
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// CIDR ranges that are always blocked.
+    #[serde(default)]
+    pub block: Vec<String>,
+    /// External feed URLs (AbuseIPDB, Spamhaus, etc.) — loaded at startup.
+    #[serde(default)]
+    pub feeds: Vec<IpFeedConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpFeedConfig {
+    pub url: String,
+    /// How often to refresh the feed (e.g. "1h").
+    #[serde(default = "default_feed_interval")]
+    pub interval: String,
+    /// Feed format: "cidr" (one CIDR per line) or "json".
+    #[serde(default = "default_feed_format")]
+    pub format: String,
+}
+
+fn default_feed_interval() -> String {
+    "1h".to_string()
+}
+
+fn default_feed_format() -> String {
+    "cidr".to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Rate limit
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RateLimitConfig {
@@ -344,6 +387,66 @@ fn default_gql_depth() -> u32 {
 
 fn default_gql_complexity() -> u32 {
     1000
+}
+
+// ---------------------------------------------------------------------------
+// Anti-DDoS
+// ---------------------------------------------------------------------------
+
+/// Connection-rate-based DDoS protection (Phase 0, before site matching).
+///
+/// Tracks new TCP connections per source IP in a 1-second sliding window.
+/// IPs that exceed `conn_rate_limit + burst` connections/second are blocked
+/// for `block_duration_secs` seconds.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AntiDdosConfig {
+    /// Enable connection-rate DDoS protection.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum new connections allowed per IP per second before blocking.
+    #[serde(default = "default_conn_rate")]
+    pub conn_rate_limit: u32,
+    /// Initial burst budget (connections allowed before rate limit activates).
+    #[serde(default = "default_conn_burst")]
+    pub burst: u32,
+    /// How long (seconds) a violating IP stays blocked.
+    #[serde(default = "default_block_duration")]
+    pub block_duration_secs: u64,
+}
+
+fn default_conn_rate() -> u32 {
+    200
+}
+fn default_conn_burst() -> u32 {
+    50
+}
+fn default_block_duration() -> u64 {
+    300
+}
+
+// ---------------------------------------------------------------------------
+// GeoIP
+// ---------------------------------------------------------------------------
+
+/// Country-level IP filtering via MaxMind GeoLite2-Country .mmdb.
+///
+/// If `allow_countries` is non-empty, ONLY those countries are allowed
+/// (block-list mode ignored).  If only `block_countries` is set, all
+/// listed countries are blocked and all others pass.
+///
+/// If the `.mmdb` file is missing or unreadable the filter degrades
+/// gracefully — all IPs pass (Unknown → Allow).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeoIpConfig {
+    /// Path to the MaxMind GeoLite2-Country.mmdb file.
+    pub db_path: String,
+    /// ISO 3166-1 alpha-2 country codes to block (e.g. `["CN", "RU"]`).
+    #[serde(default)]
+    pub block_countries: Vec<String>,
+    /// Allow-only country codes.  If non-empty, all other countries are
+    /// blocked regardless of `block_countries`.
+    #[serde(default)]
+    pub allow_countries: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------

@@ -72,6 +72,9 @@ bytes = "1"
 ahash = "0.8"
 smallvec = "1"
 
+# Parsing
+nom = "7"
+
 # Pattern matching
 regex = "1"
 aho-corasick = "1"
@@ -111,13 +114,26 @@ clap = { version = "4", features = ["derive", "env"] }
 # IDs
 uuid = { version = "1", features = ["v4", "fast-rng"] }
 
+# URL percent-decoding
+percent-encoding = "2"
+
+# IP/CIDR matching
+ipnet = "2"
+
+# GeoIP (MaxMind GeoLite2)
+maxminddb = "0.24"
+
 # TLS utilities
 rustls-pemfile = "2"
+
+# CLI / system
+libc = "0.2"
 
 # Testing
 tokio-test = "0.4"
 proptest = "1"
 criterion = { version = "0.5", features = ["async_tokio"] }
+tempfile = "3"
 
 [profile.release]
 opt-level = 3

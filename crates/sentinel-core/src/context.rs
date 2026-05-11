@@ -119,6 +119,8 @@ pub struct RequestContext {
     pub rule_matches: Vec<RuleMatch>,
     /// Per-model ML classifier scores (model name → [0.0, 1.0]).
     pub ml_scores: HashMap<String, f32>,
+    /// Transaction variables for rule chaining (e.g. TX:anomaly_score_pl1).
+    pub tx_vars: HashMap<String, String>,
     pub decision: WafDecision,
     /// Human-readable reason for a Block/Challenge decision.
     pub block_reason: Option<String>,
@@ -152,6 +154,7 @@ impl RequestContext {
             anomaly_score: 0,
             rule_matches: Vec::new(),
             ml_scores: HashMap::new(),
+            tx_vars: HashMap::new(),
             decision: WafDecision::Allow,
             block_reason: None,
             upstream_addr: None,
