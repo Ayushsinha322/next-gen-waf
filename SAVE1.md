@@ -106,21 +106,28 @@
 
 ---
 
+### ✅ Session 5 — Phase 0 Complete
+
+- `git init` + initial commit (52 files, `31bc554`)
+- `crates/sentinel-core/src/config/mod.rs` — full YAML config types + `ConfigLoader` with `arc-swap` hot-reload + `SIGHUP` watcher
+- `crates/sentinel-core/src/context.rs` — `RequestContext`, `Phase` (0-6), `WafDecision`, `RuleMatch`, `Severity`
+- `crates/sentinel-core/src/error.rs` — `SentinelError` thiserror enum
+- `crates/sentinel-core/src/lib.rs` — module wiring + re-exports
+- `crates/sentinel-proxy/src/lib.rs` — full async reverse proxy: TCP accept loop, TLS (rustls ALPN h2/http1.1), HTTP/1.1 + HTTP/2 (hyper v1), hop-by-hop stripping, XFF injection, security header injection, WAF phase stubs (Phases 0-6), structured request logging
+- `crates/sentinel-proxy/src/upstream.rs` — `UpstreamPool` with atomic round-robin + per-request HTTP/1.1 upstream connection
+- `crates/sentinel-bin/src/main.rs` — tokio multi-thread runtime, `clap` CLI (`--config`, `--log-level`, `--check`), JSON tracing, SIGHUP config reload, graceful shutdown on SIGINT/SIGTERM
+- `dashboard/package.json` + `tsconfig.json` + `next.config.ts` + `tailwind.config.ts` + `app/layout.tsx` + `app/page.tsx` + `lib/api.ts` — Next.js 14 App Router scaffold
+- `docs/rfcs/0001-rule-dsl.md` — full Rule DSL RFC: SRL syntax, PEG grammar, compilation pipeline, SRL-VM instruction set, `nom` vs `pest` decision, CRS compat mapping, file layout, implementation schedule
+- **All tests pass: 7/7** (`cargo test -p sentinel-core -p sentinel-proxy`)
+- Workspace deps extended: `uuid`, `clap`, `rustls-pemfile`
+
+---
+
 ## What Has NOT Been Done Yet (Pending)
 
-### 🔴 Phase 0 (Start here next session)
-- [ ] `git init` the repo
-- [ ] Real `Cargo.lock` (need `cargo build` to run)
-- [ ] `crates/sentinel-proxy/src/` — actual async reverse proxy code (hyper + rustls)
-- [ ] `crates/sentinel-core/src/config/` — config loader (serde_yaml, hot-reload via SIGHUP)
-- [ ] `crates/sentinel-core/src/context.rs` — request transaction context struct
-- [ ] `crates/sentinel-bin/src/main.rs` — real tokio runtime startup
-- [ ] `dashboard/package.json` + Next.js init
-- [ ] `scripts/dev/up.sh` — one-command dev startup
-
-### 🟡 Phase 1 (Rule Engine)
-- [ ] Rule DSL spec RFC → `docs/rfcs/0001-rule-dsl.md`
-- [ ] `crates/sentinel-rules/src/dsl/` — DSL grammar (pest or nom parser)
+### 🟡 Phase 1 (Rule Engine) — START HERE NEXT SESSION
+- [x] Rule DSL spec RFC → `docs/rfcs/0001-rule-dsl.md` ✅ DONE
+- [ ] `crates/sentinel-rules/src/dsl/` — DSL grammar (nom parser per RFC)
 - [ ] `crates/sentinel-rules/src/compiler/` — AST → bytecode
 - [ ] `crates/sentinel-rules/src/crs_compat/` — ModSecurity CRS importer
 - [ ] First working rule: block SQL injection pattern
@@ -298,4 +305,4 @@ VTMScan is **not a WAF**. It is a periodic vulnerability scanner (like Nessus/ZA
 
 ---
 
-*Last updated: Session 4 — full competitive analysis from WAF Comparison PDF, BunkerWeb docs, and ESDS VTMScan manual. Competitor feature matrix updated with all 33 features across 6 competitors.*
+*Last updated: Session 5 — Phase 0 complete. Git initialized. sentinel-core, sentinel-proxy, sentinel-bin built and tested. Next.js dashboard scaffolded. Rule DSL RFC written. Next: Phase 1 rule engine (sentinel-rules nom parser).*

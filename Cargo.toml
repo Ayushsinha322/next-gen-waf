@@ -105,6 +105,15 @@ aya-log = "0.2"
 thiserror = "1"
 anyhow = "1"
 
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# IDs
+uuid = { version = "1", features = ["v4", "fast-rng"] }
+
+# TLS utilities
+rustls-pemfile = "2"
+
 # Testing
 tokio-test = "0.4"
 proptest = "1"
