@@ -260,6 +260,9 @@ pub struct WafConfig {
     pub graphql: Option<GraphqlConfig>,
     pub anti_ddos: Option<AntiDdosConfig>,
     pub geoip: Option<GeoIpConfig>,
+    /// Paths to plugin manifests (`sentinel-plugin.toml` files).
+    #[serde(default)]
+    pub plugins: Vec<String>,
 }
 
 fn default_paranoia() -> u8 {

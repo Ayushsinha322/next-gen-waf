@@ -24,3 +24,5 @@ serde_json = { workspace = true }
 sentinel-core = { path = "../sentinel-core" }
 sentinel-rules = { path = "../sentinel-rules" }
 sentinel-modules = { path = "../sentinel-modules" }
+sentinel-plugins = { path = "../sentinel-plugins" }
+sentinel-ml = { path = "../sentinel-ml" }

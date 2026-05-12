@@ -40,10 +40,12 @@ use sentinel_core::{
     },
     context::{Phase, RequestContext, WafDecision},
 };
+use sentinel_ml::MlEngine;
 use sentinel_modules::{
     AntiDdos, BotDetector, BotVerdict, DdosVerdict, GeoIp, GeoVerdict, IpReputation, IpVerdict,
     RateLimiter,
 };
+use sentinel_plugins::PluginRuntime;
 use sentinel_rules::RuleEngine;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -108,6 +110,8 @@ struct ServerState {
     upstream_pool: Arc<UpstreamPool>,
     engines: Arc<ArcSwap<RuleEngineMap>>,
     modules: Arc<ModulesState>,
+    plugin_runtime: Arc<ArcSwap<PluginRuntime>>,
+    ml_engine: Arc<MlEngine>,
 }
 
 // ---------------------------------------------------------------------------
@@ -152,11 +156,28 @@ impl ProxyServer {
             feed_cache: Arc::clone(&feed_cache),
         });
 
+        let plugin_runtime = build_plugin_runtime(&cfg)
+            .unwrap_or_else(|e| {
+                warn!("failed to load plugins: {e:#}");
+                PluginRuntime::new().expect("create empty plugin runtime")
+            });
+
+        let plugin_runtime: Arc<ArcSwap<PluginRuntime>> =
+            Arc::new(ArcSwap::new(Arc::new(plugin_runtime)));
+
+        // Build ML engine (always active, no external deps required).
+        let ml_engine = {
+            let model_dir = std::path::Path::new("ml-models");
+            Arc::new(MlEngine::new(4096, 256, if model_dir.exists() { Some(model_dir) } else { None }))
+        };
+
         let state = Arc::new(ServerState {
             config: Arc::clone(&self.config),
             upstream_pool,
             engines: Arc::clone(&engines),
             modules: Arc::clone(&modules),
+            plugin_runtime: Arc::clone(&plugin_runtime),
+            ml_engine: Arc::clone(&ml_engine),
         });
 
         // --- Background task: config hot-reload watcher ---
@@ -171,11 +192,13 @@ impl ProxyServer {
             let config_watch = Arc::clone(&self.config);
             let engines_swap = Arc::clone(&engines);
             let modules_ref = Arc::clone(&modules);
+            let plugin_swap = Arc::clone(&plugin_runtime);
             tokio::spawn(async move {
                 loop {
                     let cw = Arc::clone(&config_watch);
                     let es = Arc::clone(&engines_swap);
                     let mr = Arc::clone(&modules_ref);
+                    let ps = Arc::clone(&plugin_swap);
                     let handle = tokio::spawn(async move {
                         let mut last_ptr = Arc::as_ptr(&cw.load_full()) as usize;
                         loop {
@@ -194,6 +217,17 @@ impl ProxyServer {
                                     .store(Arc::new(build_ip_reputation(&current, &feed_cidrs)));
                                 mr.bot_detector.store(Arc::new(BotDetector::new()));
                                 mr.geoip_map.store(Arc::new(build_geoip_map(&current)));
+
+                                match build_plugin_runtime(&current) {
+                                    Ok(new_pr) => {
+                                        ps.store(Arc::new(new_pr));
+                                        info!("plugin runtime hot-reloaded");
+                                    }
+                                    Err(e) => {
+                                        warn!("failed to reload plugins — keeping current runtime: {e:#}");
+                                    }
+                                }
+
                                 info!(
                                     rules = rule_count,
                                     "rule engines and security modules hot-reloaded"
@@ -559,8 +593,11 @@ async fn proxy(
         ctx.site_id = Some(s.id.clone());
     }
 
-    // WAF phase 1: rate limit → bot detect → GeoIP → rule engine.
-    phase1_headers(&mut ctx, site, &engine_map, &state.modules)?;
+    // WAF phase 1: rate limit → bot detect → GeoIP → rule engine → plugins.
+    {
+        let pr = state.plugin_runtime.load();
+        phase1_headers(&mut ctx, site, &engine_map, &state.modules, &pr).await?;
+    }
 
     if ctx.decision == WafDecision::Block {
         let resp = block_response(&ctx);
@@ -584,7 +621,7 @@ async fn proxy(
             .context("collecting request body")?;
         let bytes = collected.to_bytes();
         ctx.request_body = Some(bytes.clone());
-        phase2_body(&mut ctx, site, &engine_map)?;
+        phase2_body(&mut ctx, site, &engine_map, &state.ml_engine)?;
         if ctx.decision == WafDecision::Block {
             let resp = block_response(&ctx);
             ctx.response_status = Some(resp.status());
@@ -655,12 +692,13 @@ async fn proxy(
 // WAF phases
 // ---------------------------------------------------------------------------
 
-/// Phase 1: rate limit → bot detect → GeoIP → rule engine.
-fn phase1_headers(
+/// Phase 1: rate limit → bot detect → GeoIP → rule engine → plugins.
+async fn phase1_headers(
     ctx: &mut RequestContext,
     site: Option<&SiteConfig>,
     engines: &RuleEngineMap,
     modules: &ModulesState,
+    plugin_runtime: &PluginRuntime,
 ) -> anyhow::Result<()> {
     let Some(site) = site else { return Ok(()) };
     if site.waf.mode == WafMode::Off {
@@ -743,25 +781,150 @@ fn phase1_headers(
         }
     }
 
+    // --- WASM plugins ---
+    if ctx.decision == WafDecision::Allow {
+        let plugin_names = plugin_runtime.plugin_names();
+        for plugin_name in &plugin_names {
+            let result = plugin_runtime.evaluate_plugin(plugin_name, ctx).await;
+            // Apply anomaly score delta.
+            if result.anomaly_score_delta > 0 {
+                ctx.anomaly_score = ctx.anomaly_score.saturating_add(result.anomaly_score_delta);
+            }
+            // Apply plugin decision (only if more severe than current).
+            match result.decision {
+                WafDecision::Block => {
+                    ctx.decision = WafDecision::Block;
+                    ctx.block_reason = Some(format!("plugin '{}' set decision", plugin_name));
+                    break;
+                }
+                WafDecision::Challenge if ctx.decision == WafDecision::Allow => {
+                    ctx.decision = WafDecision::Challenge;
+                    ctx.block_reason = Some(format!("plugin '{}' requested challenge", plugin_name));
+                }
+                _ => {}
+            }
+            // Store response headers from plugin.
+            for (name, value) in &result.response_headers {
+                ctx.tx_vars.insert(
+                    format!("plugin_response_header:{}", name),
+                    value.clone(),
+                );
+            }
+
+            // Two-pass callout pattern: if the plugin queued HTTP callouts,
+            // execute them and re-run the plugin so it can read the results.
+            if let Some(ref callouts) = result.pending_callouts {
+                if !callouts.is_empty() {
+                    plugin_runtime.execute_pending_callouts(callouts.clone()).await;
+                    // Re-run the plugin so it can read callout results.
+                    let result2 = plugin_runtime.evaluate_plugin(plugin_name, ctx).await;
+                    if result2.anomaly_score_delta > 0 {
+                        ctx.anomaly_score = ctx.anomaly_score.saturating_add(result2.anomaly_score_delta);
+                    }
+                    match result2.decision {
+                        WafDecision::Block => {
+                            ctx.decision = WafDecision::Block;
+                            ctx.block_reason = Some(format!("plugin '{}' set decision", plugin_name));
+                            break;
+                        }
+                        WafDecision::Challenge if ctx.decision == WafDecision::Allow => {
+                            ctx.decision = WafDecision::Challenge;
+                            ctx.block_reason = Some(format!("plugin '{}' requested challenge", plugin_name));
+                        }
+                        _ => {}
+                    }
+                    for (name, value) in &result2.response_headers {
+                        ctx.tx_vars.insert(
+                            format!("plugin_response_header:{}", name),
+                            value.clone(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     enforce_mode(ctx, &site.waf.mode);
     Ok(())
 }
 
-/// Phase 2: body inspection + anomaly threshold catch-all.
+/// Phase 2: body inspection + ML scoring + anomaly threshold catch-all.
 fn phase2_body(
     ctx: &mut RequestContext,
     site: Option<&SiteConfig>,
     engines: &RuleEngineMap,
+    ml_engine: &MlEngine,
 ) -> anyhow::Result<()> {
     let Some(site) = site else { return Ok(()) };
     if site.waf.mode == WafMode::Off {
         return Ok(());
     }
 
+    // Run the rule engine against the request body.
     if let Some(engine) = engines.get(&site.id) {
         engine.evaluate(ctx, Phase::RequestBody);
     }
 
+    // --- ML scoring ---
+    if let Some(ref ml_cfg) = site.waf.ml {
+        if ml_cfg.enable {
+            let ml_scores = ml_engine.evaluate(ctx);
+
+            // Record all ML scores in the context.
+            ctx.ml_scores
+                .insert("anomaly".to_string(), ml_scores.anomaly_score);
+            ctx.ml_scores
+                .insert("payload_attack".to_string(), ml_scores.payload_attack_score);
+            for (model, score) in &ml_scores.onnx_scores {
+                let key = format!("onnx:{model}");
+                ctx.ml_scores.insert(key, *score);
+            }
+
+            // Add a combined ML score for the rule engine to reference
+            // (SRL operators like `ml_score` can use this).
+            ctx.ml_scores
+                .insert("combined".to_string(), ml_scores.combined_score);
+
+            // If the combined ML score exceeds the sensitivity threshold,
+            // contribute to the anomaly score and flag the request.
+            if ml_scores.combined_score >= ml_cfg.sensitivity {
+                let ml_anomaly_points: u32 =
+                    ((ml_scores.combined_score - ml_cfg.sensitivity) * 10.0).ceil() as u32;
+                let ml_anomaly_points = ml_anomaly_points.min(8);
+
+                if ml_anomaly_points > 0 {
+                    let reason = if ml_scores.anomaly_score >= ml_cfg.sensitivity {
+                        format!(
+                            "ML anomaly: {:.3} (threshold: {:.3})",
+                            ml_scores.anomaly_score, ml_cfg.sensitivity
+                        )
+                    } else if ml_scores.payload_attack_score >= ml_cfg.sensitivity {
+                        format!(
+                            "ML payload attack: {:.3} (threshold: {:.3})",
+                            ml_scores.payload_attack_score, ml_cfg.sensitivity
+                        )
+                    } else {
+                        format!(
+                            "ML combined: {:.3} (threshold: {:.3})",
+                            ml_scores.combined_score, ml_cfg.sensitivity
+                        )
+                    };
+
+                    ctx.anomaly_score = ctx.anomaly_score.saturating_add(ml_anomaly_points);
+                    ctx.rule_matches.push(sentinel_core::context::RuleMatch {
+                        rule_id: "ML-ANOMALY".to_string(),
+                        message: reason,
+                        severity: sentinel_core::context::Severity::Medium,
+                        score: ml_anomaly_points,
+                        target: "ML".to_string(),
+                        phase: Phase::RequestBody,
+                    });
+                }
+            }
+        }
+    }
+
+    // Config-level anomaly threshold catch-all.
     if ctx.decision != WafDecision::Block
         && ctx.anomaly_score > 0
         && ctx.anomaly_score >= site.waf.anomaly_threshold
@@ -926,6 +1089,36 @@ fn load_site_engine(site: &SiteConfig) -> anyhow::Result<RuleEngine> {
     sentinel_rules::compile(merged)
         .map(RuleEngine::new)
         .with_context(|| format!("compiling rules for site '{}'", site.id))
+}
+
+// ---------------------------------------------------------------------------
+// Plugin runtime builder
+// ---------------------------------------------------------------------------
+
+/// Build a [`PluginRuntime`] by loading all plugin manifests referenced in
+/// the site configs.  Errors for individual plugins are logged and skipped.
+fn build_plugin_runtime(cfg: &SentinelConfig) -> anyhow::Result<PluginRuntime> {
+    let mut rt = PluginRuntime::new()?;
+    let mut loaded = 0usize;
+    let mut failed = 0usize;
+
+    for site in &cfg.sites {
+        for manifest_path in &site.waf.plugins {
+            match rt.load_from_manifest(std::path::Path::new(manifest_path)) {
+                Ok(()) => loaded += 1,
+                Err(e) => {
+                    warn!(site = %site.id, path = %manifest_path, "failed to load plugin: {e:#}");
+                    failed += 1;
+                }
+            }
+        }
+    }
+
+    if loaded > 0 || failed > 0 {
+        info!(loaded, failed, "plugin runtime built");
+    }
+
+    Ok(rt)
 }
 
 // ---------------------------------------------------------------------------

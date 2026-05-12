@@ -26,6 +26,7 @@ use sentinel_core::config::{
     LoadBalancerStrategy, LogFormat, LogOutput, LoggingConfig, ListenerConfig, Protocol,
     ProtocolSpec, SentinelConfig, SiteConfig, UpstreamConfig, UpstreamServer, WafConfig, WafMode,
 };
+use sentinel_ml::llm_copilot::CopilotService;
 
 const DEFAULT_BIND: &str = "127.0.0.1:8080";
 
@@ -80,6 +81,12 @@ enum Cmd {
         action: SiteCmd,
     },
 
+    /// Manage WASM plugins (install from OCI registry).
+    Plugin {
+        #[command(subcommand)]
+        action: PluginCmd,
+    },
+
     /// View or follow the request log.
     Logs {
         /// Follow new lines (like `tail -f`).
@@ -100,8 +107,45 @@ enum Cmd {
         site: Option<String>,
     },
 
+    /// AI-powered security assistant: explain alerts, suggest rules, generate patches.
+    Copilot {
+        #[command(subcommand)]
+        action: CopilotCmd,
+    },
+
     /// Print the full path of important files (config, log, pid, binary).
     Paths,
+}
+
+#[derive(Subcommand)]
+enum CopilotCmd {
+    /// Test the LLM copilot with a one-shot prompt.
+    Chat {
+        /// The prompt to send.
+        #[arg(short, long)]
+        prompt: String,
+        /// System message / personality.
+        #[arg(short, long, default_value = "You are a helpful WAF security assistant.")]
+        system: String,
+    },
+    /// Explain why a recent request was blocked (paste log line or describe it).
+    Explain {
+        /// The alert details (URI, rules fired, reason).
+        alert: String,
+    },
+    /// Generate an SRL rule from a human description.
+    SuggestRule {
+        /// Natural-language description of what to detect.
+        description: String,
+    },
+    /// Generate a virtual patch for a CVE.
+    Patch {
+        /// CVE identifier (e.g. CVE-2024-1234).
+        cve: String,
+        /// Short description of the vulnerability.
+        #[arg(short, long)]
+        description: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -152,18 +196,58 @@ enum SiteCmd {
     },
 }
 
+#[derive(Subcommand)]
+enum PluginCmd {
+    /// Install a plugin from an OCI-compatible registry.
+    Install {
+        /// Plugin reference in `registry.example.com/namespace/name:tag` format.
+        reference: String,
+        /// Directory to install the plugin into.
+        #[arg(long, default_value = "~/.config/sentinel/plugins")]
+        dir: String,
+    },
+    /// List installed plugins.
+    #[command(alias = "ls")]
+    List {
+        /// Directory containing installed plugins.
+        #[arg(long, default_value = "~/.config/sentinel/plugins")]
+        dir: String,
+    },
+    /// Remove an installed plugin.
+    #[command(alias = "rm")]
+    Remove {
+        /// Plugin name (directory name under `--dir`).
+        name: String,
+        /// Directory containing installed plugins.
+        #[arg(long, default_value = "~/.config/sentinel/plugins")]
+        dir: String,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
 fn main() {
-    if let Err(e) = run() {
+    // rustls crypto provider required for HTTPS in copilot commands.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("error: failed to build tokio runtime: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = rt.block_on(run()) {
         eprintln!("error: {e:#}");
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<()> {
+async fn run() -> Result<()> {
     let cli = Cli::parse();
     let cfg_path = match cli.config.clone() {
         Some(p) => p,
@@ -194,8 +278,14 @@ fn run() -> Result<()> {
             SiteCmd::List => cmd_site_list(&cfg_path),
             SiteCmd::Mode { name, mode } => cmd_site_mode(&cfg_path, &name, &mode),
         },
+        Cmd::Plugin { action } => match action {
+            PluginCmd::Install { reference, dir } => cmd_plugin_install(&reference, &dir),
+            PluginCmd::List { dir } => cmd_plugin_list(&dir),
+            PluginCmd::Remove { name, dir } => cmd_plugin_remove(&name, &dir),
+        },
         Cmd::Logs { follow, lines, raw } => cmd_logs(follow, lines, raw),
         Cmd::Test { site } => cmd_test(&cfg_path, site.as_deref()),
+        Cmd::Copilot { action } => cmd_copilot(action).await,
         Cmd::Paths => cmd_paths(&cfg_path, cli.data_plane_bin.as_deref()),
     }
 }
@@ -658,6 +748,7 @@ fn cmd_site_add(
             graphql: None,
             anti_ddos: None,
             geoip: None,
+            plugins: vec![],
         },
         plugins: vec![],
     };
@@ -939,6 +1030,77 @@ fn cmd_paths(cfg_path: &Path, override_bin: Option<&Path>) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Copilot commands
+// ---------------------------------------------------------------------------
+
+async fn cmd_copilot(action: CopilotCmd) -> Result<()> {
+    use sentinel_ml::llm_copilot::{CopilotConfig, CopilotService};
+
+    // Build config from env vars — defaults to company in-house AI.
+    let cfg = CopilotConfig {
+        endpoint: std::env::var("SENTINEL_LLM_ENDPOINT")
+            .unwrap_or_else(|_| "https://ai.enlight.dev/api".into()),
+        api_key: std::env::var("SENTINEL_LLM_API_KEY")
+            .unwrap_or_else(|_| "sk-f87a48c6102447abb3382b596ebf51de".into()),
+        model: std::env::var("SENTINEL_LLM_MODEL")
+            .unwrap_or_else(|_| "deepseek-r1:8b".into()),
+        timeout_secs: 30,
+    };
+
+    println!("LLM Copilot");
+    println!("  Endpoint:  {}", cfg.endpoint);
+    println!("  Model:     {}", cfg.model);
+    println!();
+
+    let copilot = CopilotService::new(cfg);
+
+    match action {
+        CopilotCmd::Chat { prompt, system } => {
+            // Use internal chat method via a direct JSON approach.
+            // CopilotService::chat is private; we'll use the public API.
+            println!("Asking: {prompt}");
+            println!();
+            // We expose this via the explain method with a crafted context.
+            // For raw chat, we send a simple JSON request.
+            let client = &copilot; // borrow
+            let resp = raw_chat(client, &system, &prompt).await?;
+            println!("Response:\n{resp}");
+        }
+        CopilotCmd::Explain { alert } => {
+            println!("Alert: {alert}");
+            println!();
+            let explanation = raw_chat(
+                &copilot,
+                "You are a WAF security analyst. Explain in plain English why this alert fired.",
+                &format!("Explain this WAF alert: {alert}"),
+            )
+            .await?;
+            println!("Explanation:\n{explanation}");
+        }
+        CopilotCmd::SuggestRule { description } => {
+            println!("Generating rule for: {description}");
+            println!();
+            let rule = copilot.suggest_rule(&description).await?;
+            println!("{rule}");
+        }
+        CopilotCmd::Patch { cve, description } => {
+            println!("Generating virtual patch for: {cve}");
+            println!();
+            let patch = copilot.generate_virtual_patch(&cve, &description).await?;
+            println!("{patch}");
+        }
+    }
+    Ok(())
+}
+
+/// Raw chat: send a prompt and system message, get text back.
+async fn raw_chat(copilot: &CopilotService, system: &str, user: &str) -> Result<String> {
+    copilot.ask(system, user).await.map_err(|e| {
+        anyhow!("LLM call failed: {e}. Check that the endpoint and API key are correct.")
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Helpers — formatting, parsing
 // ---------------------------------------------------------------------------
 
@@ -1074,5 +1236,254 @@ fn print_log_line(line: &str) {
     } else {
         let target = v.get("target").and_then(|x| x.as_str()).unwrap_or("");
         println!("{ts} {level:<5} {target} {msg}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Plugin commands
+// ---------------------------------------------------------------------------
+
+fn cmd_plugin_install(reference: &str, dir: &str) -> Result<()> {
+    let (registry, repo, tag) = parse_plugin_reference(reference)?;
+    let plugin_dir = PathBuf::from(dir);
+    fs::create_dir_all(&plugin_dir)?;
+
+    println!("Installing plugin '{}' from {}", reference, registry);
+    println!();
+
+    let api_base = if registry.contains("://") {
+        registry.clone()
+    } else {
+        format!("https://{}", registry)
+    };
+
+    let manifest_url = format!("{}/v2/{}/manifests/{}", api_base, repo, tag);
+    println!("  → Fetching manifest: {}", manifest_url);
+
+    let manifest_resp = ureq::get(&manifest_url)
+        .set("Accept", "application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json")
+        .set("User-Agent", "sentinel-waf-cli/0.1")
+        .call()
+        .with_context(|| format!("fetching manifest from {manifest_url}"))?;
+
+    if manifest_resp.status() != 200 {
+        anyhow::bail!(
+            "registry returned HTTP {} for manifest. Check the plugin reference.",
+            manifest_resp.status()
+        );
+    }
+
+    let manifest: serde_json::Value = manifest_resp
+        .into_json()
+        .context("parsing manifest JSON")?;
+
+    let layers = manifest["layers"]
+        .as_array()
+        .ok_or_else(|| anyhow!("manifest has no 'layers' array — expected OCI image"))?;
+
+    if layers.is_empty() {
+        anyhow::bail!("manifest has no layers");
+    }
+
+    let plugin_name = repo.split('/').last().unwrap_or(&repo).to_string();
+    let install_dir = plugin_dir.join(&plugin_name);
+    fs::create_dir_all(&install_dir)?;
+
+    let mut manifest_written = false;
+    for (i, layer) in layers.iter().enumerate() {
+        let digest = layer["digest"]
+            .as_str()
+            .ok_or_else(|| anyhow!("layer {i} missing 'digest'"))?;
+        let media_type = layer["mediaType"].as_str().unwrap_or("");
+
+        let blob_url = format!("{}/v2/{}/blobs/{}", api_base, repo, digest);
+        println!("  → Downloading layer {}/{}: {}", i + 1, layers.len(), digest);
+
+        let blob_resp = ureq::get(&blob_url)
+            .set("User-Agent", "sentinel-waf-cli/0.1")
+            .call()
+            .with_context(|| format!("downloading blob {digest}"))?;
+
+        let blob_status = blob_resp.status();
+        if !(200..300).contains(&blob_status) {
+            anyhow::bail!("download failed with HTTP {}", blob_resp.status());
+        }
+
+        let mut data = Vec::new();
+        blob_resp
+            .into_reader()
+            .read_to_end(&mut data)
+            .context("reading blob data")?;
+
+        if media_type.contains("wasm") || digest.contains("wasm") {
+            let wasm_path = install_dir.join(format!("{}.wasm", plugin_name));
+            fs::write(&wasm_path, &data)?;
+            println!("     → Saved {}", wasm_path.display());
+        } else if data.len() > 2 && data[0] == 0x1f && data[1] == 0x8b {
+            match decompress_gzip_tar(&data, &install_dir) {
+                Ok(files) => {
+                    for f in &files {
+                        println!("     → Extracted {}", f.display());
+                    }
+                }
+                Err(e) => {
+                    let raw_path = install_dir.join(format!("layer_{}.bin", i));
+                    fs::write(&raw_path, &data)?;
+                    println!("     → Decompress failed ({e}), saved raw blob to {}", raw_path.display());
+                }
+            }
+        } else {
+            let raw_path = install_dir.join(format!("layer_{}.bin", i));
+            fs::write(&raw_path, &data)?;
+            println!("     → Saved to {}", raw_path.display());
+        }
+
+        if !manifest_written {
+            let manifest_str = serde_json::to_string_pretty(&manifest)?;
+            fs::write(install_dir.join("manifest.json"), manifest_str)?;
+            manifest_written = true;
+        }
+    }
+
+    let toml_path = install_dir.join("sentinel-plugin.toml");
+    if !toml_path.exists() {
+        let toml_content = format!(
+            "[plugin]\nname = \"{}\"\nversion = \"{}\"\nwasm = \"{}.wasm\"\n\n[plugin.hooks]\nrequest_headers = true\n\n[plugin.permissions]\nhost_log = true\nhost_get_req_header = true\nhost_set_decision = true\nhost_add_score = true\n",
+            plugin_name, tag, plugin_name
+        );
+        fs::write(&toml_path, toml_content)?;
+        println!("     → Generated {}", toml_path.display());
+    }
+
+    println!();
+    println!("Plugin installed to {}", install_dir.display());
+    println!();
+    println!("To use it, add this to your site's sentinel.yaml:");
+    println!("  waf:");
+    println!("    plugins:");
+    println!("      - \"{}\"", toml_path.display());
+
+    Ok(())
+}
+
+fn cmd_plugin_list(dir: &str) -> Result<()> {
+    let plugin_dir = PathBuf::from(dir);
+    if !plugin_dir.is_dir() {
+        println!("No plugins installed (directory does not exist: {})", plugin_dir.display());
+        return Ok(());
+    }
+
+    let mut found = false;
+    for entry in fs::read_dir(&plugin_dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let manifest_path = entry.path().join("sentinel-plugin.toml");
+            if manifest_path.exists() {
+                let raw = fs::read_to_string(&manifest_path).unwrap_or_default();
+                let version = raw
+                    .lines()
+                    .find(|l| l.trim().starts_with("version"))
+                    .and_then(|l| l.split('=').nth(1))
+                    .map(|v| v.trim().trim_matches('"').to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                let wasm_path = entry.path().join(format!("{}.wasm", name));
+                let wasm_size = if wasm_path.exists() {
+                    fs::metadata(&wasm_path).map(|m| m.len()).unwrap_or(0)
+                } else {
+                    0
+                };
+                println!("{:<24} {}  ({})", name, version, fmt_bytes(wasm_size));
+                found = true;
+            } else {
+                println!("{:<24} (no manifest)", name);
+                found = true;
+            }
+        }
+    }
+
+    if !found {
+        println!("No plugins found in {}", plugin_dir.display());
+    }
+
+    Ok(())
+}
+
+fn cmd_plugin_remove(name: &str, dir: &str) -> Result<()> {
+    let target = PathBuf::from(dir).join(name);
+    if !target.exists() {
+        anyhow::bail!("plugin '{}' not found at {}", name, target.display());
+    }
+    fs::remove_dir_all(&target)
+        .with_context(|| format!("removing plugin directory '{}'", target.display()))?;
+    println!("Removed plugin '{}'", name);
+    Ok(())
+}
+
+fn parse_plugin_reference(reference: &str) -> Result<(String, String, String)> {
+    let parts: Vec<&str> = reference.rsplitn(2, ':').collect();
+    let (rest, tag) = if parts.len() == 2 {
+        (parts[1], parts[0])
+    } else {
+        (reference, "latest")
+    };
+
+    let parts: Vec<&str> = rest.splitn(2, '/').collect();
+    if parts.len() < 2 {
+        anyhow::bail!(
+            "invalid plugin reference '{}'. Expected format: [registry/]namespace/name:tag",
+            reference
+        );
+    }
+
+    let first = parts[0];
+    let remainder = parts[1];
+
+    if first.contains('.') || first.contains(':') || first == "localhost" {
+        Ok((first.to_string(), remainder.to_string(), tag.to_string()))
+    } else {
+        Ok((
+            "registry-1.docker.io".to_string(),
+            format!("{}/{}", first, remainder),
+            tag.to_string(),
+        ))
+    }
+}
+
+fn decompress_gzip_tar(data: &[u8], dest: &Path) -> Result<Vec<PathBuf>> {
+    use std::io::Read;
+
+    let gz = flate2::read::GzDecoder::new(data);
+    let mut archive = tar::Archive::new(gz);
+
+    let mut files = Vec::new();
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.to_path_buf();
+        let dest_path = dest.join(&path);
+
+        if entry.header().entry_type().is_dir() {
+            fs::create_dir_all(&dest_path)?;
+        } else {
+            if let Some(parent) = dest_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut data = Vec::new();
+            entry.read_to_end(&mut data)?;
+            fs::write(&dest_path, &data)?;
+            files.push(dest_path);
+        }
+    }
+
+    Ok(files)
+}
+
+fn fmt_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} B", bytes)
     }
 }

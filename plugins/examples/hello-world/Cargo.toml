@@ -1,0 +1,21 @@
+[package]
+name = "sentinel-plugin-hello-world"
+version = "0.1.0"
+edition = "2021"
+description = "Hello-world example WASM plugin for Sentinel WAF"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+sentinel-plugin-sdk = { path = "../../sdk-rust" }
+wee_alloc = "0.4"
+
+[profile.release]
+opt-level = "s"    # favour size for WASM
+lto = true
+strip = true
+panic = "abort"
+
+[workspace]
+# standalone — not part of the parent sentinel workspace
