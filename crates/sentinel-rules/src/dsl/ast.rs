@@ -112,6 +112,7 @@ pub enum Target {
     RemoteAddr,
     Geo,
     TxVar(String),
+    CountOf(Box<Target>),
 }
 
 // ---------------------------------------------------------------------------
@@ -129,6 +130,7 @@ pub enum Operator {
     MlScore { model: String, op: CmpOp, threshold: f32 },
     RateLimit { dimension: RateLimitDim, rps: u32, burst: u32 },
     Not(Box<Operator>),
+    Never,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

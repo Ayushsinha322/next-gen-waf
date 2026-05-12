@@ -27,6 +27,7 @@ pub enum TargetSpec {
     RemoteAddr,
     Geo,
     TxVar(String),
+    CountOf(Box<TargetSpec>),
 }
 
 impl From<&Target> for TargetSpec {
@@ -47,6 +48,7 @@ impl From<&Target> for TargetSpec {
             Target::RemoteAddr => TargetSpec::RemoteAddr,
             Target::Geo => TargetSpec::Geo,
             Target::TxVar(v) => TargetSpec::TxVar(v.clone()),
+            Target::CountOf(inner) => TargetSpec::CountOf(Box::new(TargetSpec::from(inner.as_ref()))),
         }
     }
 }
@@ -75,6 +77,9 @@ pub enum Instruction {
 
     /// Pop `StrVec`, push `Bool(!values.is_empty() && values.iter().any(|s| !s.is_empty()))`.
     Exists,
+
+    /// Always push `Bool(false)` — used for intentionally disabled rules.
+    Never,
 
     /// Push the current anomaly score as `Int`.
     LoadAnomalyScore,

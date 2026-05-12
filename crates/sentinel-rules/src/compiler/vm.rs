@@ -26,6 +26,7 @@ enum StackVal {
     Strings(Vec<String>),
     Int(i64),
     Float(f32),
+    Absent,
 }
 
 // ---------------------------------------------------------------------------
@@ -146,6 +147,20 @@ fn extract_target(spec: &TargetSpec, ctx: &RequestContext) -> Vec<String> {
             .get(name)
             .map(|v| vec![v.clone()])
             .unwrap_or_default(),
+        TargetSpec::CountOf(inner) => {
+            let count = match inner.as_ref() {
+                TargetSpec::RequestHeader(name) => {
+                    ctx.request_headers.get_all(name.as_str()).iter().count()
+                }
+                TargetSpec::ResponseHeader(name) => ctx
+                    .response_headers
+                    .as_ref()
+                    .map(|h| h.get_all(name.as_str()).iter().count())
+                    .unwrap_or(0),
+                other => extract_target(other, ctx).len(),
+            };
+            vec![count.to_string()]
+        }
     }
 }
 
@@ -188,35 +203,48 @@ pub fn evaluate(ruleset: &CompiledRuleSet, ctx: &mut RequestContext, phase: Phas
 
             Instruction::MatchRx { pattern_id } => {
                 let values = pop_strings(&mut stack);
-                let regex = &ruleset.patterns[*pattern_id];
-                let matched = values.iter().any(|s| regex.is_match(s));
-                debug!(
-                    pattern = %regex.as_str(),
-                    matched,
-                    "MatchRx"
-                );
-                stack.push(StackVal::Bool(matched));
+                if values.is_empty() {
+                    stack.push(StackVal::Absent);
+                } else {
+                    let regex = &ruleset.patterns[*pattern_id];
+                    let matched = values.iter().any(|s| regex.is_match(s));
+                    debug!(pattern = %regex.as_str(), matched, "MatchRx");
+                    stack.push(StackVal::Bool(matched));
+                }
             }
 
             Instruction::MatchMulti { set_id } => {
                 let values = pop_strings(&mut stack);
-                let ac = &ruleset.ac_sets[*set_id];
-                let matched = values.iter().any(|s| ac.is_match(s));
-                debug!(set_id, matched, "MatchMulti");
-                stack.push(StackVal::Bool(matched));
+                if values.is_empty() {
+                    stack.push(StackVal::Absent);
+                } else {
+                    let ac = &ruleset.ac_sets[*set_id];
+                    let matched = values.iter().any(|s| ac.is_match(s));
+                    debug!(set_id, matched, "MatchMulti");
+                    stack.push(StackVal::Bool(matched));
+                }
             }
 
             Instruction::MatchEq { literal_id } => {
                 let values = pop_strings(&mut stack);
-                let literal = &ruleset.literals[*literal_id];
-                let matched = values.iter().any(|s| s == literal);
-                stack.push(StackVal::Bool(matched));
+                if values.is_empty() {
+                    stack.push(StackVal::Absent);
+                } else {
+                    let literal = &ruleset.literals[*literal_id];
+                    let matched = values.iter().any(|s| s == literal);
+                    stack.push(StackVal::Bool(matched));
+                }
             }
 
             Instruction::Exists => {
                 let values = pop_strings(&mut stack);
                 let exists = !values.is_empty() && values.iter().any(|s| !s.is_empty());
                 stack.push(StackVal::Bool(exists));
+            }
+
+            Instruction::Never => {
+                let _ = pop_strings(&mut stack);
+                stack.push(StackVal::Bool(false));
             }
 
             Instruction::LoadAnomalyScore => {
@@ -252,8 +280,14 @@ pub fn evaluate(ruleset: &CompiledRuleSet, ctx: &mut RequestContext, phase: Phas
             }
 
             Instruction::Not => {
-                let b = pop_bool(&mut stack);
-                stack.push(StackVal::Bool(!b));
+                match stack.pop() {
+                    Some(StackVal::Absent) => stack.push(StackVal::Bool(false)),
+                    Some(StackVal::Bool(b)) => stack.push(StackVal::Bool(!b)),
+                    other => {
+                        warn!("VM: Not: unexpected stack value {:?}", other);
+                        stack.push(StackVal::Bool(false));
+                    }
+                }
             }
 
             Instruction::JmpIfFalse { offset } => {
@@ -352,6 +386,7 @@ fn pop_strings(stack: &mut Vec<StackVal>) -> Vec<String> {
 fn pop_bool(stack: &mut Vec<StackVal>) -> bool {
     match stack.pop() {
         Some(StackVal::Bool(b)) => b,
+        Some(StackVal::Absent) => false,
         Some(other) => {
             warn!("VM: expected Bool on stack, got {:?}", other);
             false

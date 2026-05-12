@@ -269,6 +269,7 @@ fn token_to_target(tok: &str) -> Option<Target> {
         let _ = rest;
         return None;
     }
+    let is_count = tok.starts_with('&');
     let tok = tok.strip_prefix('&').unwrap_or(tok);
 
     let (base, sub) = if let Some(pos) = tok.find(':') {
@@ -277,7 +278,7 @@ fn token_to_target(tok: &str) -> Option<Target> {
         (tok, None)
     };
 
-    match base {
+    let result: Option<Target> = match base {
         "ARGS" => Some(Target::Args),
         "ARGS_NAMES" => Some(Target::ArgsNames),
         "REQUEST_BODY" | "REQUEST_BODY_RAW" => Some(Target::RequestBody),
@@ -302,22 +303,27 @@ fn token_to_target(tok: &str) -> Option<Target> {
             warn!(target = other, "CRS importer: unknown target token, skipping");
             None
         }
+    };
+    if is_count {
+        result.map(|t| Target::CountOf(Box::new(t)))
+    } else {
+        result
     }
 }
 
 pub(crate) fn crs_op_to_operator(op_name: &str, pattern: &str) -> Result<Operator> {
-    if let Some(inner_name) = op_name.strip_prefix('!') {
-        let inner = crs_op_to_operator(inner_name, pattern)?;
-        return Ok(Operator::Not(Box::new(inner)));
-    }
-
     if pattern.contains("%{") {
         warn!(
             op = op_name,
             pattern,
-            "CRS importer: pattern contains `%{{...}}` interpolation — replacing with stub"
+            "CRS importer: pattern contains `%{{...}}` interpolation — rule disabled"
         );
-        return Ok(Operator::Exists);
+        return Ok(Operator::Never);
+    }
+
+    if let Some(inner_name) = op_name.strip_prefix('!') {
+        let inner = crs_op_to_operator(inner_name, pattern)?;
+        return Ok(Operator::Not(Box::new(inner)));
     }
 
     match op_name {
@@ -368,16 +374,20 @@ pub(crate) fn crs_op_to_operator(op_name: &str, pattern: &str) -> Result<Operato
                 r"(?i)<\s*script|on\w+\s*=|javascript:|<\s*img[^>]*onerror".to_owned(),
             ))
         }
+        "gt" => pattern
+            .parse::<i64>()
+            .map(|n| Operator::Ge(n + 1))
+            .map_err(|_| anyhow::anyhow!("invalid integer in @gt: {}", pattern)),
         "validateurlencoding" | "validateutf8encoding" | "validatebyterange"
         | "validateschema" | "validatedtd" | "verifycc" | "verifycpf" | "verifyssn"
         | "geolookup" | "ipmatch" | "ipmatchf" | "ipmatchfromfile" | "rbl"
-        | "fuzzyhash" | "inspectfile" | "gt" | "lookup" => {
+        | "fuzzyhash" | "inspectfile" | "lookup" => {
             warn!(op = op_name, "CRS importer: unsupported operator '{op_name}' — rule disabled");
-            Ok(Operator::Not(Box::new(Operator::Exists)))
+            Ok(Operator::Never)
         }
         other => {
             warn!(op = other, "CRS importer: unknown operator '{other}' — rule disabled");
-            Ok(Operator::Not(Box::new(Operator::Exists)))
+            Ok(Operator::Never)
         }
     }
 }
@@ -565,6 +575,41 @@ SecRule ARGS "@rx baz" "t:none"
         assert!(
             matches!(&rules[0].operator, Operator::Not(inner) if matches!(inner.as_ref(), Operator::Ge(2))),
             "expected Not(Ge(2)) for @lt 2"
+        );
+    }
+
+    #[test]
+    fn count_target_with_gt_operator() {
+        let src = r#"SecRule &REQUEST_HEADERS:Content-Type "@gt 1" "id:920620,phase:1,block,msg:'Multiple Content-Type Request Headers',severity:'CRITICAL'""#;
+        let rf = import_secrule_conf(src).expect("import");
+        let rules: Vec<_> = rf.items.iter().filter_map(|i| {
+            if let RuleItem::Rule(r) = i { Some(r) } else { None }
+        }).collect();
+        assert_eq!(rules.len(), 1);
+        assert!(
+            matches!(&rules[0].targets[0].target, Target::CountOf(inner) if matches!(inner.as_ref(), Target::RequestHeaders(Some(h)) if h == "content-type")),
+            "expected CountOf(RequestHeaders(content-type)) target"
+        );
+        assert!(
+            matches!(&rules[0].operator, Operator::Ge(2)),
+            "expected Ge(2) for @gt 1"
+        );
+    }
+
+    #[test]
+    fn count_target_does_not_block_clean_get() {
+        use crate::RuleEngine;
+        use sentinel_core::context::{Phase, RequestContext, WafDecision};
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let src = r#"SecRule &REQUEST_HEADERS:Content-Type "@gt 1" "id:920620,phase:1,block,msg:'Multiple Content-Type',severity:'CRITICAL'""#;
+        let engine = RuleEngine::from_crs_conf(src).expect("engine");
+
+        let mut ctx = RequestContext::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345);
+        let decision = engine.evaluate(&mut ctx, Phase::RequestHeaders);
+        assert!(
+            !matches!(decision, WafDecision::Block),
+            "clean GET with no Content-Type must not be blocked by 920620"
         );
     }
 }

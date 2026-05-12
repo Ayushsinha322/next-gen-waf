@@ -6,7 +6,7 @@
 //! Checked at Phase 1 (request headers) after the site is identified.
 
 use std::net::IpAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use sentinel_core::config::RateLimitConfig;
@@ -26,15 +26,19 @@ struct TokenBucket {
     /// Tokens added per second.
     refill_rate: f64,
     last_refill: Instant,
+    /// Updated on every `try_consume` call; used by GC to evict idle buckets.
+    last_used: Instant,
 }
 
 impl TokenBucket {
     fn new(rps: u32, burst: u32) -> Self {
+        let now = Instant::now();
         Self {
             tokens: burst as f64,
             capacity: burst as f64,
             refill_rate: rps as f64,
-            last_refill: Instant::now(),
+            last_refill: now,
+            last_used: now,
         }
     }
 
@@ -46,6 +50,7 @@ impl TokenBucket {
         let elapsed = now.duration_since(self.last_refill).as_secs_f64();
         self.tokens = (self.tokens + elapsed * self.refill_rate).min(self.capacity);
         self.last_refill = now;
+        self.last_used = now;
 
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
@@ -129,14 +134,17 @@ impl RateLimiter {
         self.per_site.len()
     }
 
-    /// Evict idle buckets that are full (no rate-limited traffic recently).
+    /// Evict buckets that have not seen traffic in the last 5 minutes.
     ///
-    /// Called periodically to bound memory usage.  A bucket whose token
-    /// count equals its capacity has not seen any traffic since it last
-    /// filled — safe to remove without affecting rate-limit accuracy.
+    /// The previous approach (retain only non-full buckets) was incorrect:
+    /// any bucket that had ever consumed a token kept `tokens < capacity`
+    /// permanently and was never evicted, causing unbounded memory growth.
+    /// TTL-based eviction correctly handles both idle and exhausted buckets.
     pub fn gc(&self) {
-        self.per_ip.retain(|_, v| v.tokens < v.capacity);
-        self.per_site.retain(|_, v| v.tokens < v.capacity);
+        const TTL: Duration = Duration::from_secs(300);
+        let now = Instant::now();
+        self.per_ip.retain(|_, v| now.duration_since(v.last_used) < TTL);
+        self.per_site.retain(|_, v| now.duration_since(v.last_used) < TTL);
     }
 }
 

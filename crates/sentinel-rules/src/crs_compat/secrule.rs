@@ -201,17 +201,27 @@ fn parse_action_token(token: &str, out: &mut CrsActions) {
 
 /// Try to parse a `setvar:tx.something=+N` into a score delta.
 fn parse_setvar_score_delta(s: &str) -> Option<i32> {
-    // We care about patterns like:
-    //   tx.anomaly_score=+5
-    //   tx.critical_anomaly_score=+5
-    //   tx.sql_injection_score=+5
-    // and ignore references like `+%{tx.critical_anomaly_score}`.
     let (_lhs, rhs) = s.split_once('=')?;
-    let rhs = rhs.trim();
-    if rhs.starts_with('%') {
-        return None; // variable reference — skip
+    let rhs = rhs.trim().trim_start_matches('+');
+
+    // Direct numeric: tx.anomaly_score=+5
+    if let Ok(n) = rhs.parse::<i32>() {
+        return Some(n);
     }
-    rhs.parse::<i32>().ok()
+
+    // CRS v4 variable references: +%{tx.critical_anomaly_score} etc.
+    if rhs.starts_with("%{") && rhs.ends_with('}') {
+        let inner = &rhs[2..rhs.len() - 1];
+        return match inner.to_ascii_lowercase().as_str() {
+            "tx.critical_anomaly_score" => Some(5),
+            "tx.error_anomaly_score" => Some(4),
+            "tx.warning_anomaly_score" => Some(3),
+            "tx.notice_anomaly_score" => Some(2),
+            _ => None,
+        };
+    }
+
+    None
 }
 
 fn parse_crs_severity(s: &str) -> Option<RuleSeverity> {

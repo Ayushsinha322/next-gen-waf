@@ -310,6 +310,9 @@ fn emit_operator_match(
         Operator::Exists => {
             instrs.push(Instruction::Exists);
         }
+        Operator::Never => {
+            instrs.push(Instruction::Never);
+        }
         Operator::Not(inner) => {
             emit_operator_match(inner, state, instrs)?;
             instrs.push(Instruction::Not);

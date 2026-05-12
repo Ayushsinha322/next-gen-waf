@@ -164,37 +164,48 @@ impl ProxyServer {
         // config.  Rebuilds stateless modules (rule engines, ip_rep, geoip,
         // bot detector) on every change.  Stateful modules (rate_limiter,
         // anti_ddos) are intentionally NOT rebuilt.
+        // Wrapped in a watchdog: if the task panics it is automatically
+        // restarted after a 1-second back-off so that a transient failure
+        // (e.g. rule-file I/O error) does not permanently disable hot-reload.
         {
             let config_watch = Arc::clone(&self.config);
             let engines_swap = Arc::clone(&engines);
             let modules_ref = Arc::clone(&modules);
             tokio::spawn(async move {
-                let mut last_ptr = Arc::as_ptr(&config_watch.load_full()) as usize;
                 loop {
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    let current = config_watch.load_full();
-                    let ptr = Arc::as_ptr(&current) as usize;
-                    if ptr != last_ptr {
-                        last_ptr = ptr;
-                        let new_engines = build_rule_engines(&current);
-                        let rule_count: usize =
-                            new_engines.values().map(|e| e.rule_count()).sum();
-                        engines_swap.store(Arc::new(new_engines));
+                    let cw = Arc::clone(&config_watch);
+                    let es = Arc::clone(&engines_swap);
+                    let mr = Arc::clone(&modules_ref);
+                    let handle = tokio::spawn(async move {
+                        let mut last_ptr = Arc::as_ptr(&cw.load_full()) as usize;
+                        loop {
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            let current = cw.load_full();
+                            let ptr = Arc::as_ptr(&current) as usize;
+                            if ptr != last_ptr {
+                                last_ptr = ptr;
+                                let new_engines = build_rule_engines(&current);
+                                let rule_count: usize =
+                                    new_engines.values().map(|e| e.rule_count()).sum();
+                                es.store(Arc::new(new_engines));
 
-                        let feed_cidrs = modules_ref.feed_cache.load_full();
-                        modules_ref
-                            .ip_rep
-                            .store(Arc::new(build_ip_reputation(&current, &feed_cidrs)));
-                        modules_ref
-                            .bot_detector
-                            .store(Arc::new(BotDetector::new()));
-                        modules_ref
-                            .geoip_map
-                            .store(Arc::new(build_geoip_map(&current)));
-                        info!(
-                            rules = rule_count,
-                            "rule engines and security modules hot-reloaded"
-                        );
+                                let feed_cidrs = mr.feed_cache.load_full();
+                                mr.ip_rep
+                                    .store(Arc::new(build_ip_reputation(&current, &feed_cidrs)));
+                                mr.bot_detector.store(Arc::new(BotDetector::new()));
+                                mr.geoip_map.store(Arc::new(build_geoip_map(&current)));
+                                info!(
+                                    rules = rule_count,
+                                    "rule engines and security modules hot-reloaded"
+                                );
+                            }
+                        }
+                    });
+                    if let Err(e) = handle.await {
+                        if e.is_panic() {
+                            error!("config hot-reload watcher panicked, restarting in 1s: {e}");
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
                     }
                 }
             });
@@ -204,18 +215,27 @@ impl ProxyServer {
         {
             let modules_ref = Arc::clone(&modules);
             tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(60));
-                interval.set_missed_tick_behavior(
-                    tokio::time::MissedTickBehavior::Skip,
-                );
                 loop {
-                    interval.tick().await;
-                    modules_ref.rate_limiter.gc();
-                    debug!(
-                        ip_buckets = modules_ref.rate_limiter.per_ip_bucket_count(),
-                        site_buckets = modules_ref.rate_limiter.per_site_bucket_count(),
-                        "rate-limiter GC complete"
-                    );
+                    let mr = Arc::clone(&modules_ref);
+                    let handle = tokio::spawn(async move {
+                        let mut interval = tokio::time::interval(Duration::from_secs(60));
+                        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        loop {
+                            interval.tick().await;
+                            mr.rate_limiter.gc();
+                            debug!(
+                                ip_buckets = mr.rate_limiter.per_ip_bucket_count(),
+                                site_buckets = mr.rate_limiter.per_site_bucket_count(),
+                                "rate-limiter GC complete"
+                            );
+                        }
+                    });
+                    if let Err(e) = handle.await {
+                        if e.is_panic() {
+                            error!("rate-limiter GC task panicked, restarting in 1s: {e}");
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    }
                 }
             });
         }
@@ -224,18 +244,27 @@ impl ProxyServer {
         {
             let modules_ref = Arc::clone(&modules);
             tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(60));
-                interval.set_missed_tick_behavior(
-                    tokio::time::MissedTickBehavior::Skip,
-                );
                 loop {
-                    interval.tick().await;
-                    modules_ref.anti_ddos.gc();
-                    debug!(
-                        blocked = modules_ref.anti_ddos.blocked_count(),
-                        tracked = modules_ref.anti_ddos.tracked_count(),
-                        "anti-DDoS GC complete"
-                    );
+                    let mr = Arc::clone(&modules_ref);
+                    let handle = tokio::spawn(async move {
+                        let mut interval = tokio::time::interval(Duration::from_secs(60));
+                        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        loop {
+                            interval.tick().await;
+                            mr.anti_ddos.gc();
+                            debug!(
+                                blocked = mr.anti_ddos.blocked_count(),
+                                tracked = mr.anti_ddos.tracked_count(),
+                                "anti-DDoS GC complete"
+                            );
+                        }
+                    });
+                    if let Err(e) = handle.await {
+                        if e.is_panic() {
+                            error!("anti-DDoS GC task panicked, restarting in 1s: {e}");
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    }
                 }
             });
         }
@@ -248,49 +277,59 @@ impl ProxyServer {
             let config_watch = Arc::clone(&self.config);
             let modules_ref = Arc::clone(&modules);
             tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(300));
-                interval.set_missed_tick_behavior(
-                    tokio::time::MissedTickBehavior::Skip,
-                );
                 loop {
-                    interval.tick().await;
-                    let cfg = config_watch.load_full();
-                    let feeds: Vec<_> = cfg
-                        .sites
-                        .iter()
-                        .filter_map(|s| s.waf.ip_reputation.as_ref())
-                        .flat_map(|r| r.feeds.iter().cloned())
-                        .collect();
+                    let cw = Arc::clone(&config_watch);
+                    let mr = Arc::clone(&modules_ref);
+                    let handle = tokio::spawn(async move {
+                        let mut interval = tokio::time::interval(Duration::from_secs(300));
+                        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        loop {
+                            interval.tick().await;
+                            let cfg = cw.load_full();
+                            let feeds: Vec<_> = cfg
+                                .sites
+                                .iter()
+                                .filter_map(|s| s.waf.ip_reputation.as_ref())
+                                .flat_map(|r| r.feeds.iter().cloned())
+                                .collect();
 
-                    if feeds.is_empty() {
-                        continue;
-                    }
+                            if feeds.is_empty() {
+                                continue;
+                            }
 
-                    let mut new_cidrs: Vec<(String, Vec<String>)> = Vec::new();
-                    for feed in &feeds {
-                        match fetch_feed_cidrs(&feed.url).await {
-                            Ok(cidrs) => {
-                                info!(
-                                    url = %feed.url,
-                                    count = cidrs.len(),
-                                    "IP reputation feed loaded"
-                                );
-                                for cidr in cidrs {
-                                    new_cidrs.push((cidr, vec!["feed".to_string()]));
+                            let mut new_cidrs: Vec<(String, Vec<String>)> = Vec::new();
+                            for feed in &feeds {
+                                match fetch_feed_cidrs(&feed.url).await {
+                                    Ok(cidrs) => {
+                                        info!(
+                                            url = %feed.url,
+                                            count = cidrs.len(),
+                                            "IP reputation feed loaded"
+                                        );
+                                        for cidr in cidrs {
+                                            new_cidrs.push((cidr, vec!["feed".to_string()]));
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(url = %feed.url, "IP feed fetch failed: {e}");
+                                    }
                                 }
                             }
-                            Err(e) => {
-                                warn!(url = %feed.url, "IP feed fetch failed: {e}");
-                            }
+
+                            let new_arc: Arc<Vec<(String, Vec<String>)>> = Arc::new(new_cidrs);
+                            mr.feed_cache.store(Arc::clone(&new_arc));
+                            let new_ip_rep = build_ip_reputation(&cfg, &new_arc);
+                            let entry_count = new_ip_rep.entry_count();
+                            mr.ip_rep.store(Arc::new(new_ip_rep));
+                            info!(entries = entry_count, "IP reputation table rebuilt from feeds");
+                        }
+                    });
+                    if let Err(e) = handle.await {
+                        if e.is_panic() {
+                            error!("IP feed loader task panicked, restarting in 1s: {e}");
+                            tokio::time::sleep(Duration::from_secs(1)).await;
                         }
                     }
-
-                    let new_arc: Arc<Vec<(String, Vec<String>)>> = Arc::new(new_cidrs);
-                    modules_ref.feed_cache.store(Arc::clone(&new_arc));
-                    let new_ip_rep = build_ip_reputation(&cfg, &new_arc);
-                    let entry_count = new_ip_rep.entry_count();
-                    modules_ref.ip_rep.store(Arc::new(new_ip_rep));
-                    info!(entries = entry_count, "IP reputation table rebuilt from feeds");
                 }
             });
         }
@@ -951,12 +990,16 @@ fn parse_cidr_text(text: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 fn site_matches(site: &SiteConfig, host: &str) -> bool {
+    // HTTP Host headers are case-insensitive per RFC 7230 §5.4.
+    // Lowercase both sides so `Host: JUICE.LOCAL` still matches `juice.local`.
+    let host_lc = host.to_ascii_lowercase();
     site.domains.iter().any(|d| {
-        if d.starts_with("*.") {
-            let suffix = &d[1..];
-            host.ends_with(suffix) || host == &d[2..]
+        let d_lc = d.to_ascii_lowercase();
+        if d_lc.starts_with("*.") {
+            let suffix = &d_lc[1..];
+            host_lc.ends_with(&*suffix) || host_lc == &d_lc[2..]
         } else {
-            d == host
+            d_lc == host_lc
         }
     })
 }
