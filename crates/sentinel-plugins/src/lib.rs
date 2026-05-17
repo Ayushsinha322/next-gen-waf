@@ -19,8 +19,11 @@
 
 pub mod abi;
 pub mod manifest;
+pub mod registry;
 pub mod runtime;
+pub mod sdk;
 
 pub use abi::{HttpCalloutRequest, HttpCalloutResult};
 pub use manifest::PluginManifest;
+pub use registry::{download_wasm, pull_wasm};
 pub use runtime::{PluginEvalResult, PluginRuntime};

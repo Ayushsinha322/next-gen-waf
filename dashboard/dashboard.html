@@ -1,0 +1,1895 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sentinel WAF — Control Plane</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&family=Share+Tech+Mono&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#060912;--bg2:#0A0D1F;--bg3:#0D1028;
+  --red:#C8001E;--red-b:#FF1A44;--red-glow:rgba(200,0,30,.45);--red-dim:rgba(200,0,30,.1);
+  --cyan:#00C8F0;--green:#00C87A;--amber:#FFAA00;--purple:#7C2FBF;--pur-glow:rgba(124,47,191,.5);
+  --text:#E4E8F4;--text2:#8896B8;--text3:#424E6A;
+  --border:rgba(200,0,30,.28);--border2:rgba(0,200,240,.18);
+  --blur:blur(18px);--r:12px;--r2:8px;
+  --sb:220px;--th:52px;--bh:38px;
+}
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;overflow:hidden;background:var(--bg);color:var(--text);font-family:'Inter',sans-serif}
+#bgCanvas{position:fixed;inset:0;z-index:0;pointer-events:none;opacity:.35}
+.scanlines{position:fixed;inset:0;z-index:1;pointer-events:none;background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,.04) 2px,rgba(0,0,0,.04) 4px)}
+
+/* ── TOPBAR ── */
+.topbar{position:fixed;top:0;left:0;right:0;height:var(--th);z-index:40;background:rgba(5,7,16,.98);border-bottom:1px solid var(--border);backdrop-filter:var(--blur);display:flex;align-items:center}
+.tb-logo{width:var(--sb);flex-shrink:0;display:flex;align-items:center;gap:10px;padding:0 16px;border-right:1px solid var(--border);height:100%;cursor:pointer;text-decoration:none}
+.tb-emb{width:30px;height:30px;border-radius:8px;background:linear-gradient(135deg,rgba(200,0,30,.3),rgba(200,0,30,.07));border:1px solid rgba(200,0,30,.45);display:flex;align-items:center;justify-content:center;font-size:16px;box-shadow:0 0 14px var(--red-glow);animation:emb 3s ease-in-out infinite;flex-shrink:0}
+@keyframes emb{0%,100%{box-shadow:0 0 14px var(--red-glow)}50%{box-shadow:0 0 28px rgba(200,0,30,.75)}}
+.tb-nm{font-family:'Orbitron',sans-serif;font-size:12px;font-weight:900;letter-spacing:2px;line-height:1}
+.tb-nm .s{color:var(--text)}
+.tb-nm .w{color:var(--red-b);text-shadow:0 0 10px var(--red-glow)}
+.tb-ver{font-size:8px;font-family:'Share Tech Mono',monospace;color:var(--text3);letter-spacing:1.5px;margin-top:2px}
+.tb-mid{flex:1;display:flex;align-items:center;gap:14px;padding:0 18px}
+.sw{position:relative}
+.si{position:absolute;left:11px;top:50%;transform:translateY(-50%);color:var(--text3);font-size:13px;pointer-events:none}
+.sinp{width:280px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);border-radius:20px;padding:7px 14px 7px 33px;font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--text);outline:none;transition:all .22s}
+.sinp:focus{border-color:var(--red);background:rgba(200,0,30,.05);box-shadow:0 0 0 3px rgba(200,0,30,.08);width:340px}
+.sinp::placeholder{color:var(--text3)}
+.tb-stat{display:flex;align-items:center;gap:6px;font-size:10px;font-family:'Share Tech Mono',monospace;color:var(--text2)}
+.tb-dot{width:6px;height:6px;border-radius:50%;background:var(--green);box-shadow:0 0 7px var(--green);animation:pulse 2.5s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
+.tb-r{display:flex;align-items:center;gap:8px;padding:0 16px;margin-left:auto}
+.tb-btn{width:34px;height:34px;border-radius:8px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:15px;transition:all .2s;position:relative}
+.tb-btn:hover{background:rgba(200,0,30,.1);border-color:rgba(200,0,30,.3)}
+.tb-badge{position:absolute;top:-4px;right:-4px;width:16px;height:16px;border-radius:50%;background:var(--red-b);font-size:8px;font-family:'Orbitron',monospace;font-weight:700;color:#fff;display:flex;align-items:center;justify-content:center;border:2px solid var(--bg)}
+.tb-div{width:1px;height:22px;background:rgba(255,255,255,.08)}
+.uchip{display:flex;align-items:center;gap:8px;padding:5px 12px;border-radius:20px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);cursor:pointer;transition:all .2s}
+.uchip:hover{border-color:rgba(200,0,30,.35);background:rgba(200,0,30,.07)}
+.uav{width:26px;height:26px;border-radius:50%;background:linear-gradient(135deg,var(--red),#8C0016);display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#fff;font-family:'Orbitron',monospace;flex-shrink:0}
+.uname{font-size:11px;font-family:'Share Tech Mono',monospace;color:var(--text);line-height:1}
+.urole{font-size:8px;color:var(--red-b);font-family:'Share Tech Mono',monospace;letter-spacing:.5px}
+
+/* ── SIDEBAR ── */
+.sidebar{position:fixed;top:var(--th);left:0;bottom:var(--bh);width:var(--sb);z-index:30;background:rgba(5,7,16,.98);border-right:1px solid var(--border);backdrop-filter:var(--blur);display:flex;flex-direction:column}
+.sb-body{flex:1;overflow-y:auto;padding:10px 8px}
+.sb-body::-webkit-scrollbar{width:3px}
+.sb-body::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+.sb-lbl{font-size:8px;font-family:'Share Tech Mono',monospace;color:var(--text3);letter-spacing:1.5px;padding:10px 10px 5px;display:block}
+.nv{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:var(--r2);cursor:pointer;transition:all .2s;margin-bottom:1px;font-size:11px;color:var(--text2);border:1px solid transparent;position:relative;font-weight:500;user-select:none}
+.nv:hover{background:rgba(200,0,30,.07);color:var(--text);border-color:rgba(200,0,30,.16)}
+.nv.on{background:rgba(200,0,30,.14);color:var(--text);border-color:rgba(200,0,30,.35)}
+.nv.on::before{content:'';position:absolute;left:0;top:4px;bottom:4px;width:3px;background:var(--red-b);border-radius:0 3px 3px 0}
+.nv-ico{font-size:15px;width:20px;text-align:center;flex-shrink:0}
+.nv-lbl{flex:1}
+.nv-b{font-size:9px;font-family:'Share Tech Mono',monospace;padding:1px 7px;border-radius:10px;min-width:22px;text-align:center}
+.nb-r{background:rgba(200,0,30,.2);color:var(--red-b);border:1px solid rgba(200,0,30,.35)}
+.nb-g{background:rgba(0,200,122,.15);color:var(--green);border:1px solid rgba(0,200,122,.3)}
+.nb-a{background:rgba(255,170,0,.15);color:var(--amber);border:1px solid rgba(255,170,0,.3)}
+.sb-foot{padding:12px 10px;border-top:1px solid rgba(255,255,255,.05)}
+.sf-node{font-size:10px;font-family:'Share Tech Mono',monospace;color:var(--text2);text-align:center;margin-bottom:3px;display:flex;align-items:center;justify-content:center;gap:5px}
+.sf-ver{font-size:8px;font-family:'Share Tech Mono',monospace;color:var(--text3);text-align:center;letter-spacing:.5px}
+.leader-dot{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 7px var(--green);animation:pulse 2.5s infinite}
+
+/* ── CONTENT ── */
+.content{position:fixed;top:var(--th);left:var(--sb);right:0;bottom:var(--bh);overflow-y:auto;z-index:10;padding:20px}
+.content::-webkit-scrollbar{width:4px}
+.content::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
+
+/* ── SECTIONS ── */
+.sec{display:none;flex-direction:column;gap:16px}
+.sec.on{display:flex;animation:secin .3s ease}
+@keyframes secin{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.sec-hdr{display:flex;align-items:flex-start;justify-content:space-between;gap:14px}
+.sec-hl{display:flex;flex-direction:column;gap:4px}
+.sec-title{font-family:'Orbitron',sans-serif;font-size:16px;font-weight:700;letter-spacing:1.5px;display:flex;align-items:center;gap:10px}
+.sec-sub{font-size:11px;font-family:'Share Tech Mono',monospace;color:var(--text2)}
+.sec-acts{display:flex;gap:8px;align-items:center;flex-shrink:0}
+
+/* ── BUTTONS ── */
+.btn{display:inline-flex;align-items:center;gap:7px;padding:8px 16px;border-radius:var(--r2);font-size:11px;font-family:'Share Tech Mono',monospace;cursor:pointer;transition:all .22s;border:1px solid;font-weight:700;letter-spacing:.4px;white-space:nowrap}
+.bp{background:linear-gradient(135deg,var(--red),#8C0016);border-color:rgba(255,30,68,.4);color:#fff;box-shadow:0 3px 16px rgba(200,0,30,.3)}
+.bp:hover{background:linear-gradient(135deg,var(--red-b),var(--red));box-shadow:0 5px 24px rgba(200,0,30,.55);transform:translateY(-1px)}
+.bg{background:rgba(255,255,255,.04);border-color:rgba(255,255,255,.12);color:var(--text2)}
+.bg:hover{background:rgba(255,255,255,.09);color:var(--text);border-color:rgba(255,255,255,.22)}
+.bc{background:rgba(0,200,240,.1);border-color:rgba(0,200,240,.3);color:var(--cyan)}
+.bc:hover{background:rgba(0,200,240,.2)}
+.bgn{background:rgba(0,200,122,.1);border-color:rgba(0,200,122,.32);color:var(--green)}
+.bgn:hover{background:rgba(0,200,122,.2)}
+.bd{background:rgba(200,0,30,.12);border-color:rgba(200,0,30,.35);color:var(--red-b)}
+.bd:hover{background:rgba(200,0,30,.22)}
+.btn-sm{padding:5px 11px;font-size:9px}
+.btn-xs{padding:3px 8px;font-size:9px}
+
+/* ── KPI GRID ── */
+.kpi-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:12px}
+.kpi{background:rgba(10,13,31,.92);border:1px solid rgba(255,255,255,.07);border-radius:var(--r);padding:16px 18px;position:relative;overflow:hidden;transition:all .25s;cursor:default}
+.kpi:hover{border-color:rgba(200,0,30,.38);background:rgba(200,0,30,.05);transform:translateY(-2px);box-shadow:0 8px 28px rgba(200,0,30,.12)}
+.kpi::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--red-b);border-radius:3px 0 0 3px}
+.kpi.kc::before{background:var(--cyan)}
+.kpi.kg::before{background:var(--green)}
+.kpi.ka::before{background:var(--amber)}
+.kpi.kp::before{background:var(--purple)}
+.kpi.kb::before{background:#0079FF}
+.kpi-ico{position:absolute;top:14px;right:14px;font-size:20px;opacity:.35}
+.kpi-lbl{font-size:9px;font-family:'Share Tech Mono',monospace;color:var(--text3);text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px}
+.kpi-val{font-family:'Orbitron',sans-serif;font-size:22px;font-weight:700;line-height:1;margin-bottom:5px}
+.kpi-val.r{color:var(--red-b)}
+.kpi-val.c{color:var(--cyan)}
+.kpi-val.g{color:var(--green)}
+.kpi-val.a{color:var(--amber)}
+.kpi-val.p{color:#BF7FFF}
+.kpi-delta{font-size:10px;font-family:'Share Tech Mono',monospace;color:var(--text2)}
+.kpi-delta .up{color:var(--green)}
+.kpi-delta .dn{color:var(--red-b)}
+
+/* ── PANEL ── */
+.panel{background:rgba(10,13,31,.92);border:1px solid rgba(255,255,255,.07);border-radius:var(--r);overflow:hidden}
+.ph{padding:13px 18px;border-bottom:1px solid rgba(255,255,255,.06);display:flex;align-items:center;justify-content:space-between}
+.ptitle{font-family:'Orbitron',sans-serif;font-size:11px;font-weight:700;letter-spacing:1.5px;display:flex;align-items:center;gap:8px}
+.pacts{display:flex;gap:6px;align-items:center}
+.pb{padding:16px 18px}
+.psep{height:1px;background:rgba(255,255,255,.05);margin:0 18px}
+
+/* ── GRID LAYOUTS ── */
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.g3{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+.g21{display:grid;grid-template-columns:2fr 1fr;gap:16px}
+.g12{display:grid;grid-template-columns:1fr 2fr;gap:16px}
+.g32{display:grid;grid-template-columns:3fr 2fr;gap:16px}
+
+/* ── TABLE ── */
+.tw{overflow-x:auto}
+.tw::-webkit-scrollbar{height:3px}
+.tw::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+table{width:100%;border-collapse:collapse}
+thead th{padding:10px 14px;text-align:left;font-size:9px;font-family:'Share Tech Mono',monospace;color:var(--text3);text-transform:uppercase;letter-spacing:.8px;border-bottom:1px solid rgba(255,255,255,.07);white-space:nowrap;cursor:pointer;user-select:none}
+thead th:hover{color:var(--text2)}
+tbody tr{border-bottom:1px solid rgba(255,255,255,.04);transition:background .15s}
+tbody tr:hover{background:rgba(200,0,30,.05);cursor:pointer}
+tbody tr:last-child{border-bottom:none}
+tbody td{padding:10px 14px;font-size:11px;color:var(--text);font-family:'Share Tech Mono',monospace;white-space:nowrap}
+.td2{color:var(--text2)}
+.td3{color:var(--text3)}
+
+/* ── BADGE ── */
+.bdg{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:10px;font-size:9px;font-family:'Share Tech Mono',monospace;font-weight:700;white-space:nowrap}
+.br{background:rgba(200,0,30,.18);color:var(--red-b);border:1px solid rgba(200,0,30,.35)}
+.bgg{background:rgba(0,200,122,.14);color:var(--green);border:1px solid rgba(0,200,122,.32)}
+.ba{background:rgba(255,170,0,.14);color:var(--amber);border:1px solid rgba(255,170,0,.3)}
+.bcy{background:rgba(0,200,240,.12);color:var(--cyan);border:1px solid rgba(0,200,240,.28)}
+.bpu{background:rgba(124,47,191,.15);color:#BF7FFF;border:1px solid rgba(124,47,191,.35)}
+.bgr{background:rgba(136,150,184,.1);color:var(--text2);border:1px solid rgba(136,150,184,.2)}
+.bdr{width:5px;height:5px;border-radius:50%;background:currentColor}
+.blink{animation:blinkb 1.5s ease-in-out infinite}
+@keyframes blinkb{0%,100%{opacity:1}50%{opacity:.4}}
+
+/* ── STATUS DOT ── */
+.sd{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.sd.g{background:var(--green);box-shadow:0 0 7px var(--green);animation:pulse 2.5s infinite}
+.sd.r{background:var(--red-b);box-shadow:0 0 7px var(--red-b);animation:pulse 1.2s infinite}
+.sd.a{background:var(--amber);box-shadow:0 0 7px var(--amber);animation:pulse 2s infinite}
+.sd.gr{background:var(--text3)}
+
+/* ── TOGGLE ── */
+.tog{width:38px;height:21px;border-radius:11px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.15);cursor:pointer;position:relative;transition:all .25s;flex-shrink:0}
+.tog::after{content:'';position:absolute;top:2px;left:2px;width:15px;height:15px;border-radius:50%;background:#fff;transition:transform .25s;box-shadow:0 1px 4px rgba(0,0,0,.4)}
+.tog.on{background:var(--green);border-color:rgba(0,200,122,.5)}
+.tog.on::after{transform:translateX(17px)}
+.tog.ron{background:var(--red);border-color:rgba(200,0,30,.5)}
+.tog.ron::after{transform:translateX(17px)}
+
+/* ── MODAL ── */
+.modal-bg{position:fixed;inset:0;z-index:80;background:rgba(0,0,0,.78);backdrop-filter:blur(6px);display:none;align-items:center;justify-content:center}
+.modal-bg.open{display:flex;animation:fdin .22s ease}
+@keyframes fdin{from{opacity:0}to{opacity:1}}
+.modal{background:rgba(8,10,26,.99);border:1px solid var(--border);border-radius:var(--r);box-shadow:0 30px 80px rgba(0,0,0,.9);width:580px;max-width:96vw;max-height:88vh;overflow-y:auto;position:relative;animation:modin .28s cubic-bezier(.22,1,.36,1)}
+@keyframes modin{from{opacity:0;transform:scale(.95) translateY(12px)}to{opacity:1;transform:scale(1) translateY(0)}}
+.modal::-webkit-scrollbar{width:3px}
+.modal::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+.mh{padding:20px 24px 16px;border-bottom:1px solid rgba(200,0,30,.2);display:flex;align-items:center;justify-content:space-between}
+.mt2{font-family:'Orbitron',sans-serif;font-size:13px;font-weight:700;letter-spacing:1.5px;display:flex;align-items:center;gap:9px}
+.mx{cursor:pointer;color:var(--text3);font-size:18px;background:none;border:none;line-height:1;transition:color .2s;padding:0}
+.mx:hover{color:var(--text)}
+.mb{padding:22px 24px;display:flex;flex-direction:column;gap:14px}
+.mf{padding:14px 24px;border-top:1px solid rgba(255,255,255,.06);display:flex;gap:10px;justify-content:flex-end}
+
+/* ── TOAST ── */
+.toast-wrap{position:fixed;top:62px;right:18px;z-index:100;display:flex;flex-direction:column;gap:8px;pointer-events:none}
+.toast{background:rgba(10,13,31,.98);border:1px solid rgba(255,255,255,.12);border-radius:var(--r2);padding:11px 16px;font-size:11px;font-family:'Share Tech Mono',monospace;color:var(--text);display:flex;align-items:center;gap:9px;box-shadow:0 8px 28px rgba(0,0,0,.5);pointer-events:all;animation:toastin .3s ease;min-width:240px}
+.toast.s{border-color:rgba(0,200,122,.45)}
+.toast.e{border-color:rgba(200,0,30,.55)}
+.toast.i{border-color:rgba(0,200,240,.4)}
+.toast.w{border-color:rgba(255,170,0,.4)}
+@keyframes toastin{from{opacity:0;transform:translateX(22px)}to{opacity:1;transform:translateX(0)}}
+
+/* ── TABS ── */
+.tabs{display:flex;border-bottom:1px solid rgba(255,255,255,.07)}
+.tab{padding:10px 16px;font-size:10px;font-family:'Share Tech Mono',monospace;color:var(--text2);cursor:pointer;border-bottom:2px solid transparent;transition:all .2s;white-space:nowrap}
+.tab:hover{color:var(--text)}
+.tab.on{color:var(--red-b);border-bottom-color:var(--red-b)}
+.tabp{display:none;padding-top:16px}
+.tabp.on{display:block;animation:secin .25s ease}
+
+/* ── FILTER BAR ── */
+.fbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.fw{position:relative}
+.fwi{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--text3);font-size:12px;pointer-events:none}
+.fi2{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);border-radius:20px;padding:6px 12px 6px 30px;font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--text);outline:none;transition:all .2s;width:210px}
+.fi2:focus{border-color:var(--red);box-shadow:0 0 0 2px rgba(200,0,30,.1)}
+.fi2::placeholder{color:var(--text3)}
+.fsel{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);border-radius:var(--r2);padding:6px 24px 6px 10px;font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--text2);outline:none;cursor:pointer;-webkit-appearance:none;appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5'%3E%3Cpath fill='%238896B8' d='M0 0l4 5 4-5z'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 8px center;transition:all .2s}
+.fsel:focus{border-color:var(--red);color:var(--text)}
+.fsel option{background:#0A0D1F}
+
+/* ── FORMS ── */
+.fg2{display:flex;flex-direction:column;gap:5px}
+.flbl2{font-size:9px;font-family:'Share Tech Mono',monospace;color:var(--text2);text-transform:uppercase;letter-spacing:.8px}
+.fin2{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.1);border-radius:var(--r2);padding:9px 12px;font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--text);outline:none;transition:all .2s;width:100%}
+.fin2:focus{border-color:var(--red);box-shadow:0 0 0 3px rgba(200,0,30,.1);background:rgba(200,0,30,.04)}
+.fin2::placeholder{color:var(--text3)}
+.fsel2{-webkit-appearance:none;appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath fill='%238896B8' d='M0 0l5 6 5-6z'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 10px center;padding-right:28px;cursor:pointer}
+.fsel2 option{background:#0A0D1F}
+textarea.fin2{resize:vertical;min-height:80px;line-height:1.6}
+.fg-grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.fg-grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
+
+/* ── PROGRESS ── */
+.pwrap{background:rgba(255,255,255,.06);border-radius:3px;height:5px;overflow:hidden;width:100%}
+.pbar{height:100%;border-radius:3px;transition:width .8s cubic-bezier(.22,1,.36,1)}
+
+/* ── LIVE FEED ── */
+.live-feed{display:flex;flex-direction:column;gap:0;max-height:234px;overflow-y:auto}
+.live-feed::-webkit-scrollbar{width:3px}
+.live-feed::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+.frow2{display:grid;grid-template-columns:46px 98px 38px 1fr 38px 58px;align-items:center;gap:6px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,.04);font-size:10px;font-family:'Share Tech Mono',monospace;animation:feedin .3s ease}
+@keyframes feedin{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
+.frow2:last-child{border-bottom:none}
+.ft{color:var(--text3)}
+.fi3{color:var(--text2)}
+.fm2{font-weight:700}
+.fm2.get{color:var(--green)}
+.fm2.post{color:var(--cyan)}
+.fm2.put{color:var(--amber)}
+.fm2.del{color:var(--red-b)}
+.fp2{color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fs2{text-align:center}
+.fs2.s2{color:var(--green)}
+.fs2.s3{color:var(--cyan)}
+.fs2.s4{color:var(--amber)}
+.fs2.s5{color:var(--red-b)}
+.fl2{color:var(--text3);text-align:right}
+
+/* ── COPILOT PAGE ── */
+.cop-page{display:grid;grid-template-columns:230px 1fr;gap:0;height:calc(100vh - var(--th) - var(--bh) - 80px);background:rgba(10,13,31,.92);border:1px solid rgba(255,255,255,.07);border-radius:var(--r);overflow:hidden}
+.cop-hist{border-right:1px solid rgba(124,47,191,.2);display:flex;flex-direction:column;background:rgba(8,7,18,.5)}
+.cop-hh{padding:13px 16px;border-bottom:1px solid rgba(124,47,191,.15);display:flex;align-items:center;justify-content:space-between}
+.cop-hh-t{font-family:'Orbitron',sans-serif;font-size:10px;font-weight:700;letter-spacing:1px}
+.cop-hl{flex:1;overflow-y:auto;padding:8px}
+.cop-hl::-webkit-scrollbar{width:3px}
+.cop-hl::-webkit-scrollbar-thumb{background:rgba(124,47,191,.3);border-radius:3px}
+.hi{padding:9px 12px;border-radius:var(--r2);cursor:pointer;font-size:10px;font-family:'Share Tech Mono',monospace;color:var(--text2);border:1px solid transparent;transition:all .2s;margin-bottom:2px}
+.hi:hover{background:rgba(124,47,191,.1);color:var(--text);border-color:rgba(124,47,191,.2)}
+.hi.on{background:rgba(124,47,191,.18);color:var(--text);border-color:rgba(124,47,191,.3)}
+.cop-main{display:flex;flex-direction:column}
+.cop-mh{padding:14px 18px;border-bottom:1px solid rgba(124,47,191,.15);display:flex;align-items:center;gap:12px;background:linear-gradient(135deg,rgba(124,47,191,.12),transparent);flex-shrink:0}
+.cop-av2{width:40px;height:40px;border-radius:50%;background:linear-gradient(135deg,var(--purple),#4A0FA0);display:flex;align-items:center;justify-content:center;font-size:22px;box-shadow:0 0 18px var(--pur-glow)}
+.cop-mname{font-family:'Orbitron',sans-serif;font-size:13px;font-weight:700}
+.cop-mst{font-family:'Share Tech Mono',monospace;font-size:9px;color:#9B60E0;display:flex;align-items:center;gap:5px;margin-top:2px}
+.cop-online2{width:5px;height:5px;border-radius:50%;background:var(--green);box-shadow:0 0 5px var(--green);animation:pulse 2s infinite}
+.cop-mdl{margin-left:auto;font-size:9px;font-family:'Share Tech Mono',monospace;color:#A070E0;background:rgba(124,47,191,.15);border:1px solid rgba(124,47,191,.3);border-radius:20px;padding:3px 10px}
+.cop-msgs2{flex:1;overflow-y:auto;padding:16px 18px;display:flex;flex-direction:column;gap:12px}
+.cop-msgs2::-webkit-scrollbar{width:3px}
+.cop-msgs2::-webkit-scrollbar-thumb{background:rgba(124,47,191,.3);border-radius:3px}
+.cop-quick2{padding:8px 18px;border-top:1px solid rgba(124,47,191,.15);display:flex;gap:6px;flex-wrap:wrap;flex-shrink:0}
+.cop-ia{padding:12px 18px;border-top:1px solid rgba(124,47,191,.18);display:flex;gap:10px;align-items:flex-end;background:rgba(124,47,191,.04);flex-shrink:0}
+.cop-inp2{flex:1;background:rgba(255,255,255,.04);border:1px solid rgba(124,47,191,.28);border-radius:var(--r2);padding:10px 14px;font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--text);outline:none;transition:border-color .2s;resize:none;min-height:44px;max-height:110px;line-height:1.5}
+.cop-inp2:focus{border-color:rgba(124,47,191,.7)}
+.cop-inp2::placeholder{color:var(--text3)}
+.cop-snd2{width:38px;height:38px;border-radius:var(--r2);background:linear-gradient(135deg,var(--purple),#4A0FA0);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:16px;transition:all .2s;flex-shrink:0}
+.cop-snd2:hover{transform:scale(1.08)}
+.msg2{display:flex;gap:8px}
+.msg2.usr{flex-direction:row-reverse}
+.mav2{width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:13px;flex-shrink:0;margin-top:3px}
+.mav2.ai{background:linear-gradient(135deg,var(--purple),#4A0FA0)}
+.mav2.usr{background:rgba(200,0,30,.28);border:1px solid var(--border)}
+.mbbl2{max-width:78%;padding:10px 14px;border-radius:12px;font-size:11px;font-family:'Share Tech Mono',monospace;line-height:1.6}
+.msg2.ai .mbbl2{background:rgba(124,47,191,.14);border:1px solid rgba(124,47,191,.24);color:var(--text);border-radius:3px 12px 12px 12px}
+.msg2.usr .mbbl2{background:rgba(200,0,30,.14);border:1px solid var(--border);color:var(--text);border-radius:12px 3px 12px 12px}
+.mt3{font-size:8px;color:var(--text3);margin-top:3px}
+.msg2.usr .mt3{text-align:right}
+.ty2{display:none;align-items:center;gap:5px;padding:4px 6px}
+.ty2.show{display:flex;animation:secin .28s ease}
+.tyd{width:6px;height:6px;border-radius:50%;background:var(--purple);animation:tyb 1.3s ease-in-out infinite}
+.tyd:nth-child(2){animation-delay:.22s}
+.tyd:nth-child(3){animation-delay:.44s}
+@keyframes tyb{0%,60%,100%{transform:translateY(0)}30%{transform:translateY(-7px)}}
+.qbtn2{font-size:9px;font-family:'Share Tech Mono',monospace;padding:5px 10px;border-radius:20px;background:rgba(124,47,191,.1);border:1px solid rgba(124,47,191,.28);color:#A070E0;cursor:pointer;transition:all .2s;white-space:nowrap}
+.qbtn2:hover{background:rgba(124,47,191,.22);color:#BF8FFF}
+
+/* ── PLUGINS ── */
+.pg{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+.pc{background:rgba(10,13,31,.92);border:1px solid rgba(255,255,255,.07);border-radius:var(--r);padding:18px;display:flex;flex-direction:column;gap:12px;transition:all .25s}
+.pc:hover{border-color:rgba(200,0,30,.3);background:rgba(200,0,30,.04);transform:translateY(-2px);box-shadow:0 8px 28px rgba(200,0,30,.08)}
+.pch{display:flex;align-items:flex-start;gap:12px}
+.pci{width:44px;height:44px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:24px;flex-shrink:0;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04)}
+.pcn{font-family:'Orbitron',sans-serif;font-size:11px;font-weight:700;color:var(--text);margin-bottom:3px}
+.pca{font-size:9px;font-family:'Share Tech Mono',monospace;color:var(--text3)}
+.pcd{font-size:10px;color:var(--text2);line-height:1.6;flex:1}
+.pcf{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.pcm{font-size:9px;font-family:'Share Tech Mono',monospace;color:var(--text3)}
+
+/* ── SETTINGS ── */
+.srow{display:flex;align-items:center;justify-content:space-between;padding:16px 0;border-bottom:1px solid rgba(255,255,255,.05);gap:20px}
+.srow:last-child{border-bottom:none}
+.sri{flex:1}
+.srt{font-size:12px;color:var(--text);font-weight:500;margin-bottom:4px}
+.srd{font-size:10px;font-family:'Share Tech Mono',monospace;color:var(--text3);line-height:1.5}
+.src{flex-shrink:0}
+
+/* ── CLUSTER NODES ── */
+.nodegrid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.nodecard{background:rgba(255,255,255,.025);border:1px solid rgba(255,255,255,.07);border-radius:var(--r2);padding:14px;transition:border-color .2s}
+.nodecard.leader{border-color:rgba(200,0,30,.35);background:rgba(200,0,30,.05)}
+.nch{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+.ncr{font-size:8px;font-family:'Orbitron',monospace;font-weight:700;letter-spacing:1px;padding:2px 7px;border-radius:8px}
+.ncn{font-size:11px;font-family:'Share Tech Mono',monospace;color:var(--text);margin-bottom:5px}
+.ncs{font-size:9px;font-family:'Share Tech Mono',monospace;color:var(--text3);margin-bottom:2px}
+
+/* ── ENDPOINT LIST ── */
+.eplist{display:flex;flex-direction:column;gap:9px}
+.eprow{display:flex;align-items:center;gap:10px}
+.eprank{font-size:9px;font-family:'Orbitron',monospace;color:var(--text3);width:12px;flex-shrink:0}
+.eppath{font-size:10px;font-family:'Share Tech Mono',monospace;color:var(--cyan);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.epcount{font-size:10px;font-family:'Orbitron',monospace;font-weight:700;color:var(--text);width:42px;text-align:right;flex-shrink:0}
+.epbw{width:68px;flex-shrink:0}
+
+/* ── CODE BLOCK ── */
+.code-block{background:rgba(0,0,0,.5);border:1px solid rgba(255,255,255,.08);border-radius:var(--r2);padding:14px 16px;font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--cyan);overflow-x:auto;line-height:1.75}
+.rule-ta{width:100%;background:rgba(0,0,0,.4);border:1px solid rgba(255,255,255,.09);border-radius:var(--r2);font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--cyan);padding:14px;min-height:200px;resize:vertical;outline:none;line-height:1.75}
+.rule-ta:focus{border-color:var(--red)}
+
+/* ── MINI CHART LEGEND ── */
+.cl{display:flex;gap:14px;flex-wrap:wrap;margin-top:8px}
+.cli{display:flex;align-items:center;gap:5px;font-size:9px;font-family:'Share Tech Mono',monospace;color:var(--text2)}
+.cld{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+
+/* ── DONUT LEGEND ── */
+.dl{display:flex;flex-direction:column;gap:9px;flex:1}
+.dlr{display:flex;align-items:center;gap:8px}
+.dld{width:9px;height:9px;border-radius:2px;flex-shrink:0}
+.dll{font-size:10px;font-family:'Share Tech Mono',monospace;color:var(--text2);flex:1}
+.dlp{font-size:11px;font-family:'Orbitron',monospace;font-weight:700;color:var(--text);width:34px;text-align:right}
+
+/* ── MOD STATUS ── */
+.modlist{display:flex;flex-direction:column;gap:5px}
+.modi{display:flex;align-items:center;justify-content:space-between;padding:7px 10px;border-radius:6px;background:rgba(255,255,255,.02);border:1px solid rgba(255,255,255,.05)}
+.modn{font-size:10px;font-family:'Share Tech Mono',monospace;color:var(--text2)}
+
+/* ── TICKER ── */
+.ticker-bar{position:fixed;bottom:0;left:0;right:0;height:var(--bh);z-index:40;background:rgba(4,6,14,.98);border-top:1px solid var(--border);display:flex;align-items:center;overflow:hidden;backdrop-filter:var(--blur)}
+.tick-lbl{padding:0 16px;font-size:9px;font-family:'Orbitron',sans-serif;font-weight:700;color:var(--red-b);letter-spacing:2px;white-space:nowrap;border-right:1px solid var(--border);flex-shrink:0}
+.tick-scroll{flex:1;overflow:hidden}
+.tick-inner2{display:flex;gap:38px;animation:tscroll 90s linear infinite;white-space:nowrap}
+.ti2{display:inline-flex;align-items:center;gap:7px;font-size:10px;font-family:'Share Tech Mono',monospace;color:var(--text2);flex-shrink:0}
+.tsev2{font-size:8px;padding:1px 6px;border-radius:10px;font-weight:700}
+.tc2{background:rgba(200,0,30,.2);color:var(--red-b)}
+.th2{background:rgba(255,170,0,.15);color:var(--amber)}
+.tm2{background:rgba(0,200,240,.12);color:var(--cyan)}
+.tl2{background:rgba(0,200,122,.1);color:var(--green)}
+@keyframes tscroll{0%{transform:translateX(0)}100%{transform:translateX(-50%)}}
+
+/* ── FAB COPILOT ── */
+.cfab{position:fixed;bottom:48px;right:20px;z-index:50;width:50px;height:50px;border-radius:50%;background:linear-gradient(135deg,var(--purple),#4A0FA0);border:1px solid rgba(124,47,191,.55);display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 5px 22px var(--pur-glow);animation:fabpulse 3.5s ease-in-out infinite;transition:all .3s}
+@keyframes fabpulse{0%,100%{box-shadow:0 5px 22px var(--pur-glow)}50%{box-shadow:0 8px 36px rgba(124,47,191,.75),0 0 0 10px rgba(124,47,191,0)}}
+.cfab:hover{transform:scale(1.1)}
+.cfab-ring{position:absolute;inset:-6px;border-radius:50%;border:2px solid rgba(124,47,191,.38);animation:ring2 2.5s ease-out infinite}
+@keyframes ring2{0%{transform:scale(1);opacity:1}100%{transform:scale(1.55);opacity:0}}
+
+/* ── MINI COPILOT ── */
+.cop-mini{position:fixed;bottom:108px;right:20px;z-index:50;width:355px;height:480px;border-radius:var(--r);background:rgba(8,7,18,.98);border:1px solid rgba(124,47,191,.38);box-shadow:0 22px 64px rgba(0,0,0,.8);backdrop-filter:var(--blur);display:flex;flex-direction:column;overflow:hidden;transform:scale(.88) translateY(20px);opacity:0;pointer-events:none;transition:all .3s cubic-bezier(.22,1,.36,1);transform-origin:bottom right}
+.cop-mini.open{transform:scale(1) translateY(0);opacity:1;pointer-events:all}
+.cmh{padding:13px 16px;border-bottom:1px solid rgba(124,47,191,.2);display:flex;align-items:center;gap:10px;background:linear-gradient(135deg,rgba(124,47,191,.15),transparent);flex-shrink:0}
+.cmav{width:32px;height:32px;border-radius:50%;background:linear-gradient(135deg,var(--purple),#4A0FA0);display:flex;align-items:center;justify-content:center;font-size:16px;box-shadow:0 0 12px var(--pur-glow)}
+.cmname{font-family:'Orbitron',sans-serif;font-size:10px;font-weight:700}
+.cmst{font-size:8px;font-family:'Share Tech Mono',monospace;color:#9B60E0;display:flex;align-items:center;gap:4px;margin-top:1px}
+.cmonl{width:5px;height:5px;border-radius:50%;background:var(--green);box-shadow:0 0 5px var(--green);animation:pulse 2s infinite}
+.cmcl{cursor:pointer;color:var(--text3);font-size:16px;background:none;border:none;margin-left:auto;transition:color .2s;line-height:1}
+.cmcl:hover{color:var(--text)}
+.cm-msgs{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:10px}
+.cm-msgs::-webkit-scrollbar{width:3px}
+.cm-msgs::-webkit-scrollbar-thumb{background:rgba(124,47,191,.3);border-radius:3px}
+.cm-quick{padding:6px 12px;border-top:1px solid rgba(124,47,191,.14);display:flex;gap:4px;flex-wrap:wrap}
+.cm-ia{padding:10px 12px;border-top:1px solid rgba(124,47,191,.18);display:flex;gap:7px;align-items:center;background:rgba(124,47,191,.05)}
+.cm-inp{flex:1;background:rgba(255,255,255,.04);border:1px solid rgba(124,47,191,.28);border-radius:20px;padding:7px 12px;font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--text);outline:none;transition:border-color .2s}
+.cm-inp:focus{border-color:rgba(124,47,191,.6)}
+.cm-inp::placeholder{color:var(--text3)}
+.cm-snd{width:30px;height:30px;border-radius:50%;background:linear-gradient(135deg,var(--purple),#4A0FA0);border:none;cursor:pointer;font-size:12px;display:flex;align-items:center;justify-content:center;transition:all .2s}
+.cm-snd:hover{transform:scale(1.1)}
+
+/* ── PAGE LOADER ── */
+.pg-loader{position:fixed;inset:0;z-index:100;background:var(--bg);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:20px;animation:ldout .5s ease 2.2s both;pointer-events:none}
+@keyframes ldout{to{opacity:0;pointer-events:none}}
+.ld-logo{font-family:'Orbitron',sans-serif;font-size:26px;font-weight:900;letter-spacing:4px}
+.ld-logo .s{color:var(--text)}
+.ld-logo .w{color:var(--red-b);text-shadow:0 0 16px var(--red-glow)}
+.ld-bw{width:220px;height:2px;background:rgba(255,255,255,.05);border-radius:2px;overflow:hidden}
+.ld-b{height:100%;width:0;background:linear-gradient(90deg,var(--red),var(--cyan));animation:ldbr 1.8s cubic-bezier(.22,1,.36,1) both}
+@keyframes ldbr{0%{width:0}70%{width:100%}100%{width:100%}}
+.ld-t{font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--text2)}
+.ld-s{font-family:'Share Tech Mono',monospace;font-size:9px;color:var(--text3);letter-spacing:2px;margin-top:-12px}
+
+/* ALERT SEVERITY ROWS */
+tbody tr.sev-c td:first-child{border-left:3px solid var(--red-b)}
+tbody tr.sev-h td:first-child{border-left:3px solid var(--amber)}
+tbody tr.sev-m td:first-child{border-left:3px solid var(--cyan)}
+tbody tr.sev-l td:first-child{border-left:3px solid var(--green)}
+</style>
+</head>
+<body>
+
+<!-- LOADER -->
+<div class="pg-loader" id="pgLoader">
+  <div class="ld-logo"><span class="s">SENTINEL</span> <span class="w">WAF</span></div>
+  <div class="ld-s">Control Plane Dashboard</div>
+  <div class="ld-bw"><div class="ld-b"></div></div>
+  <div class="ld-t" id="ldtxt">LOADING CONTROL PLANE...</div>
+</div>
+
+<!-- CANVAS -->
+<canvas id="bgCanvas"></canvas>
+<div class="scanlines"></div>
+
+<!-- TOPBAR -->
+<header class="topbar">
+  <a class="tb-logo" onclick="nav('overview')">
+    <div class="tb-emb">🔺</div>
+    <div><div class="tb-nm"><span class="s">SENTINEL</span> <span class="w">WAF</span></div><div class="tb-ver">ENTERPRISE v3.1.0</div></div>
+  </a>
+  <div class="tb-mid">
+    <div class="sw"><span class="si">🔍</span><input class="sinp" id="gSearch" type="text" placeholder="Search sites, rules, IPs, alerts..."></div>
+    <div class="tb-stat"><div class="tb-dot"></div><span id="tbReqS">0</span> req/s · p99 <span id="tbP99">0.4</span>ms</div>
+  </div>
+  <div class="tb-r">
+    <div class="tb-btn" onclick="nav('alerts')" title="Alerts"><span>🔔</span><span class="tb-badge" id="alertBadge">7</span></div>
+    <div class="tb-btn" onclick="nav('settings')" title="Settings"><span>⚙️</span></div>
+    <div class="tb-div"></div>
+    <div class="uchip" onclick="logout()">
+      <div class="uav">A</div>
+      <div><div class="uname">admin</div><div class="urole">OWNER</div></div>
+    </div>
+  </div>
+</header>
+
+<!-- SIDEBAR -->
+<nav class="sidebar">
+  <div class="sb-body">
+    <span class="sb-lbl">MONITOR</span>
+    <div class="nv on" onclick="nav('overview')"><span class="nv-ico">🏠</span><span class="nv-lbl">Overview</span></div>
+    <div class="nv" onclick="nav('traffic')"><span class="nv-ico">📊</span><span class="nv-lbl">Traffic</span></div>
+    <div class="nv" onclick="nav('alerts')"><span class="nv-ico">🔴</span><span class="nv-lbl">Alerts</span><span class="nv-b nb-r" id="sbAlertBadge">7</span></div>
+    <div class="nv" onclick="nav('logs')"><span class="nv-ico">📜</span><span class="nv-lbl">Logs</span><span class="nv-b nb-g" id="logConnBadge">LIVE</span></div>
+
+    <span class="sb-lbl">PROTECT</span>
+    <div class="nv" onclick="nav('sites')"><span class="nv-ico">🌐</span><span class="nv-lbl">Sites</span><span class="nv-b nb-g">5</span></div>
+    <div class="nv" onclick="nav('rules')"><span class="nv-ico">📋</span><span class="nv-lbl">Rules</span><span class="nv-b nb-g">2,541</span></div>
+    <div class="nv" onclick="nav('plugins')"><span class="nv-ico">🔌</span><span class="nv-lbl">Plugins</span><span class="nv-b nb-a">3</span></div>
+
+    <span class="sb-lbl">INTELLIGENCE</span>
+    <div class="nv" onclick="nav('copilot')"><span class="nv-ico">🤖</span><span class="nv-lbl">AI Copilot</span><span class="nv-b nb-r" style="background:rgba(124,47,191,.2);color:#BF7FFF;border-color:rgba(124,47,191,.35)">AI</span></div>
+
+    <span class="sb-lbl">SYSTEM</span>
+    <div class="nv" onclick="nav('settings')"><span class="nv-ico">⚙️</span><span class="nv-lbl">Settings</span></div>
+  </div>
+  <div class="sb-foot">
+    <div class="sf-node"><div class="leader-dot"></div>cp-primary-01</div>
+    <div class="sf-ver">Raft: LEADER · 3 nodes · v3.1.0</div>
+  </div>
+</nav>
+
+<!-- CONTENT -->
+<main class="content">
+
+<!-- ══════════════════════════════════════
+     SECTION: OVERVIEW
+══════════════════════════════════════ -->
+<section id="sec-overview" class="sec on">
+  <div class="sec-hdr">
+    <div class="sec-hl">
+      <div class="sec-title">📊 Overview</div>
+      <div class="sec-sub">Real-time security intelligence · Last updated <span id="lastUpd">just now</span></div>
+    </div>
+    <div class="sec-acts">
+      <button class="btn bg btn-sm" onclick="showToast('Report generated','s','📄')">📄 Export Report</button>
+      <button class="btn bp btn-sm" onclick="showToast('Dashboard refreshed','i','🔄')">🔄 Refresh</button>
+    </div>
+  </div>
+
+  <!-- KPI CARDS -->
+  <div class="kpi-grid">
+    <div class="kpi"><span class="kpi-ico">🛡️</span><div class="kpi-lbl">Threats Blocked Today</div><div class="kpi-val r" id="k1">3,204</div><div class="kpi-delta"><span class="up">↑</span> <span id="k1d">+8/min</span> · live</div></div>
+    <div class="kpi kc"><span class="kpi-ico">⚡</span><div class="kpi-lbl">Requests / sec</div><div class="kpi-val c" id="k2">0</div><div class="kpi-delta">p99: <span id="k2p">0.4</span>ms latency</div></div>
+    <div class="kpi kg"><span class="kpi-ico">🌐</span><div class="kpi-lbl">Protected Sites</div><div class="kpi-val g">5</div><div class="kpi-delta"><span class="up">4</span> online · 1 learning</div></div>
+    <div class="kpi ka"><span class="kpi-ico">🤖</span><div class="kpi-lbl">ML Anomaly Score</div><div class="kpi-val a" id="k4">94.2%</div><div class="kpi-delta"><span class="up">↑</span> +0.3% accuracy</div></div>
+    <div class="kpi kp"><span class="kpi-ico">⚡</span><div class="kpi-lbl">eBPF/XDP Drops</div><div class="kpi-val p" id="k5">0</div><div class="kpi-delta">L4 DDoS shield active</div></div>
+    <div class="kpi kb"><span class="kpi-ico">🕒</span><div class="kpi-lbl">System Uptime</div><div class="kpi-val" style="color:#4499FF">99.97%</div><div class="kpi-delta">SLA target: 99.9%</div></div>
+  </div>
+
+  <!-- TRAFFIC CHART -->
+  <div class="panel">
+    <div class="ph">
+      <div class="ptitle">📈 Traffic — Last 24 Hours</div>
+      <div class="pacts">
+        <select class="fsel" id="chartRange" onchange="drawTrafficChart()">
+          <option value="24h">Last 24h</option>
+          <option value="7d">Last 7d</option>
+          <option value="30d">Last 30d</option>
+        </select>
+      </div>
+    </div>
+    <div class="pb">
+      <canvas id="trafficChart" height="110" style="width:100%"></canvas>
+      <div class="cl">
+        <span class="cli"><span class="cld" style="background:rgba(0,200,240,.9)"></span>Total Requests</span>
+        <span class="cli"><span class="cld" style="background:rgba(200,0,30,.9)"></span>Blocked</span>
+        <span class="cli"><span class="cld" style="background:rgba(124,47,191,.9)"></span>ML Anomalies</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ATTACK TYPES + ENDPOINTS + MODULE STATUS -->
+  <div class="g3">
+    <div class="panel">
+      <div class="ph"><div class="ptitle">🔴 Attack Breakdown</div></div>
+      <div class="pb">
+        <div style="display:flex;align-items:center;gap:18px">
+          <canvas id="donutChart" width="120" height="120" style="flex-shrink:0"></canvas>
+          <div class="dl">
+            <div class="dlr"><div class="dld" style="background:var(--red-b)"></div><div class="dll">SQL Injection</div><div class="dlp">48%</div></div>
+            <div class="dlr"><div class="dld" style="background:var(--amber)"></div><div class="dll">XSS</div><div class="dlp">27%</div></div>
+            <div class="dlr"><div class="dld" style="background:var(--cyan)"></div><div class="dll">Path Traversal</div><div class="dlp">15%</div></div>
+            <div class="dlr"><div class="dld" style="background:var(--purple)"></div><div class="dll">Cmd Injection</div><div class="dlp">7%</div></div>
+            <div class="dlr"><div class="dld" style="background:var(--green)"></div><div class="dll">Other</div><div class="dlp">3%</div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="ph"><div class="ptitle">🎯 Top Attacked Endpoints</div></div>
+      <div class="pb">
+        <div class="eplist">
+          <div class="eprow"><span class="eprank">1</span><span class="eppath">/api/v1/login</span><span class="epcount">1,842</span><div class="epbw"><div class="pwrap"><div class="pbar" style="width:100%;background:var(--red-b)"></div></div></div></div>
+          <div class="eprow"><span class="eprank">2</span><span class="eppath">/search</span><span class="epcount">983</span><div class="epbw"><div class="pwrap"><div class="pbar" style="width:53%;background:var(--amber)"></div></div></div></div>
+          <div class="eprow"><span class="eprank">3</span><span class="eppath">/admin/users</span><span class="epcount">441</span><div class="epbw"><div class="pwrap"><div class="pbar" style="width:24%;background:var(--cyan)"></div></div></div></div>
+          <div class="eprow"><span class="eprank">4</span><span class="eppath">/api/v2/products</span><span class="epcount">218</span><div class="epbw"><div class="pwrap"><div class="pbar" style="width:12%;background:var(--purple)"></div></div></div></div>
+          <div class="eprow"><span class="eprank">5</span><span class="eppath">/wp-admin/</span><span class="epcount">104</span><div class="epbw"><div class="pwrap"><div class="pbar" style="width:6%;background:var(--green)"></div></div></div></div>
+        </div>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="ph"><div class="ptitle">⚙️ Module Status</div></div>
+      <div class="pb">
+        <div class="modlist">
+          <div class="modi"><span class="modn">CRS v4.7 Rule Engine</span><span class="bdg bgg"><span class="bdr"></span>ACTIVE</span></div>
+          <div class="modi"><span class="modn">ML Anomaly Detection</span><span class="bdg ba blink"><span class="bdr"></span>LEARNING</span></div>
+          <div class="modi"><span class="modn">IP Reputation Feed</span><span class="bdg bgg"><span class="bdr"></span>ACTIVE</span></div>
+          <div class="modi"><span class="modn">GeoIP Filter</span><span class="bdg bgg"><span class="bdr"></span>ACTIVE</span></div>
+          <div class="modi"><span class="modn">Rate Limiter</span><span class="bdg bgg"><span class="bdr"></span>ACTIVE</span></div>
+          <div class="modi"><span class="modn">Bot Detector (JA4)</span><span class="bdg bgg"><span class="bdr"></span>ACTIVE</span></div>
+          <div class="modi"><span class="modn">Anti-DDoS Engine</span><span class="bdg bgr"><span class="bdr"></span>STANDBY</span></div>
+          <div class="modi"><span class="modn">WASM Plugin Runtime</span><span class="bdg bgg"><span class="bdr"></span>ACTIVE</span></div>
+          <div class="modi"><span class="modn">eBPF/XDP L4 Shield</span><span class="bdg br blink"><span class="bdr"></span>NEEDS SETUP</span></div>
+          <div class="modi"><span class="modn">LLM AI Copilot</span><span class="bdg bpu"><span class="bdr"></span>ONLINE</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- RECENT ALERTS + LIVE FEED -->
+  <div class="g21">
+    <div class="panel">
+      <div class="ph">
+        <div class="ptitle">🔴 Recent Alerts</div>
+        <div class="pacts"><button class="btn bg btn-sm" onclick="nav('alerts')">View All →</button></div>
+      </div>
+      <div class="tw">
+        <table>
+          <thead><tr><th>Severity</th><th>Time</th><th>Source IP</th><th>Attack</th><th>Rule</th><th>Score</th><th>Action</th></tr></thead>
+          <tbody>
+            <tr class="sev-c" onclick="showAlertDetail({sev:'CRITICAL',ip:'185.220.101.45',attack:'SQL Injection',rule:'CRS-942100',score:24})">
+              <td><span class="bdg br blink"><span class="bdr"></span>CRITICAL</span></td><td class="td3">09:42:11</td><td class="td2">185.220.101.45</td><td>SQL Injection</td><td class="td3">CRS-942100</td><td style="color:var(--red-b);font-weight:700">24/50</td><td><span class="bdg br">BLOCKED</span></td>
+            </tr>
+            <tr class="sev-h" onclick="showAlertDetail({sev:'HIGH',ip:'103.24.8.122',attack:'XSS',rule:'CRS-941140',score:15})">
+              <td><span class="bdg ba"><span class="bdr"></span>HIGH</span></td><td class="td3">09:41:03</td><td class="td2">103.24.8.122</td><td>XSS Attempt</td><td class="td3">CRS-941140</td><td style="color:var(--amber);font-weight:700">15/50</td><td><span class="bdg br">BLOCKED</span></td>
+            </tr>
+            <tr class="sev-c" onclick="showAlertDetail({sev:'CRITICAL',ip:'198.235.24.130',attack:'Log4Shell',rule:'VP-CVE-2021-44228',score:50})">
+              <td><span class="bdg br blink"><span class="bdr"></span>CRITICAL</span></td><td class="td3">09:38:55</td><td class="td2">198.235.24.130</td><td>Log4Shell Probe</td><td class="td3">VP-CVE-2021-44228</td><td style="color:var(--red-b);font-weight:700">50/50</td><td><span class="bdg br">BLOCKED</span></td>
+            </tr>
+            <tr class="sev-h">
+              <td><span class="bdg ba"><span class="bdr"></span>HIGH</span></td><td class="td3">09:35:12</td><td class="td2">91.240.118.150</td><td>Path Traversal</td><td class="td3">CRS-930100</td><td style="color:var(--amber);font-weight:700">18/50</td><td><span class="bdg br">BLOCKED</span></td>
+            </tr>
+            <tr class="sev-m">
+              <td><span class="bdg bcy"><span class="bdr"></span>MEDIUM</span></td><td class="td3">09:32:40</td><td class="td2">10.0.0.45</td><td>Rate Limit</td><td class="td3">MOD-RATELIMIT</td><td style="color:var(--cyan);font-weight:700">8/50</td><td><span class="bdg ba">RATE LTD</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="ph">
+        <div class="ptitle">⚡ Live Request Feed</div>
+        <div class="pacts"><div class="sd g"></div></div>
+      </div>
+      <div class="pb">
+        <div style="display:grid;grid-template-columns:46px 98px 38px 1fr 38px 58px;gap:6px;padding:4px 0 6px;font-size:9px;font-family:'Share Tech Mono',monospace;color:var(--text3);border-bottom:1px solid rgba(255,255,255,.06)">
+          <span>TIME</span><span>IP</span><span>MTD</span><span>PATH</span><span>STS</span><span style="text-align:right">SCORE</span>
+        </div>
+        <div class="live-feed" id="liveFeed"></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════
+     SECTION: SITES
+══════════════════════════════════════ -->
+<section id="sec-sites" class="sec">
+  <div class="sec-hdr">
+    <div class="sec-hl">
+      <div class="sec-title">🌐 Protected Sites</div>
+      <div class="sec-sub">Manage reverse proxy targets · WAF enforcement per site</div>
+    </div>
+    <div class="sec-acts">
+      <button class="btn bg btn-sm">📥 Import Config</button>
+      <button class="btn bp btn-sm" onclick="openModal('addSite')">＋ Add Site</button>
+    </div>
+  </div>
+
+  <div class="g3" style="grid-template-columns:repeat(4,1fr)">
+    <div class="kpi kg"><span class="kpi-ico">✅</span><div class="kpi-lbl">Online</div><div class="kpi-val g">4</div></div>
+    <div class="kpi ka"><span class="kpi-ico">📚</span><div class="kpi-lbl">Learning</div><div class="kpi-val a">1</div></div>
+    <div class="kpi"><span class="kpi-ico">⛔</span><div class="kpi-lbl">Offline</div><div class="kpi-val" style="color:var(--text2)">1</div></div>
+    <div class="kpi kc"><span class="kpi-ico">📋</span><div class="kpi-lbl">Total Rules</div><div class="kpi-val c">2,541</div></div>
+  </div>
+
+  <div class="panel">
+    <div class="ph">
+      <div class="ptitle">🌐 Sites (6)</div>
+      <div class="pacts">
+        <div class="fw"><span class="fwi">🔍</span><input class="fi2" type="text" placeholder="Search sites..." oninput="filterSites(this.value)"></div>
+        <select class="fsel" onchange="filterSiteMode(this.value)"><option value="">All Modes</option><option>BLOCKING</option><option>LEARNING</option><option>OFFLINE</option></select>
+      </div>
+    </div>
+    <div class="tw">
+      <table id="sitesTable">
+        <thead><tr><th>Status</th><th>Site ID</th><th>Domain</th><th>Upstream</th><th>Mode</th><th>Rules</th><th>Req/s</th><th>Block%</th><th>Actions</th></tr></thead>
+        <tbody>
+          <tr><td><div style="display:flex;align-items:center;gap:6px"><div class="sd g"></div></div></td><td><span style="color:var(--cyan)">juice</span></td><td>juice.local</td><td class="td2">127.0.0.1:3000</td><td><span class="bdg br"><span class="bdr"></span>BLOCKING</span></td><td class="td2">15</td><td class="td2" id="sr-juice">847</td><td class="td2">0.8%</td><td><div style="display:flex;gap:4px"><button class="btn bg btn-xs" onclick="editSite('juice')">✏️</button><button class="btn bg btn-xs" onclick="copilotAbout('juice.local')">🤖</button><button class="btn bg btn-xs" onclick="viewSiteTraffic('juice')">📊</button></div></td></tr>
+          <tr><td><div style="display:flex;align-items:center;gap:6px"><div class="sd g"></div></div></td><td><span style="color:var(--cyan)">dvwa</span></td><td>dvwa.local</td><td class="td2">127.0.0.1:9095</td><td><span class="bdg br"><span class="bdr"></span>BLOCKING</span></td><td class="td2">15</td><td class="td2" id="sr-dvwa">523</td><td class="td2">2.4%</td><td><div style="display:flex;gap:4px"><button class="btn bg btn-xs" onclick="editSite('dvwa')">✏️</button><button class="btn bg btn-xs" onclick="copilotAbout('dvwa.local')">🤖</button><button class="btn bg btn-xs" onclick="viewSiteTraffic('dvwa')">📊</button></div></td></tr>
+          <tr><td><div style="display:flex;align-items:center;gap:6px"><div class="sd g"></div></div></td><td><span style="color:var(--cyan)">api-prod</span></td><td>api.acme.com</td><td class="td2">10.0.1.82:8080</td><td><span class="bdg ba blink"><span class="bdr"></span>LEARNING</span></td><td class="td2">0</td><td class="td2">2,341</td><td class="td2">0.1%</td><td><div style="display:flex;gap:4px"><button class="btn bg btn-xs" onclick="editSite('api-prod')">✏️</button><button class="btn bg btn-xs">🤖</button><button class="btn bgn btn-xs" onclick="showToast('Switched to BLOCKING mode','s','🛡️')">→ Block</button></div></td></tr>
+          <tr><td><div style="display:flex;align-items:center;gap:6px"><div class="sd g"></div></div></td><td><span style="color:var(--cyan)">shop</span></td><td>shop.corp.io</td><td class="td2">10.0.2.10:3000</td><td><span class="bdg br"><span class="bdr"></span>BLOCKING</span></td><td class="td2">8</td><td class="td2">1,882</td><td class="td2">0.3%</td><td><div style="display:flex;gap:4px"><button class="btn bg btn-xs" onclick="editSite('shop')">✏️</button><button class="btn bg btn-xs">🤖</button><button class="btn bg btn-xs">📊</button></div></td></tr>
+          <tr><td><div style="display:flex;align-items:center;gap:6px"><div class="sd g"></div></div></td><td><span style="color:var(--cyan)">intranet</span></td><td>intranet.corp.io</td><td class="td2">172.16.1.10:80</td><td><span class="bdg br"><span class="bdr"></span>BLOCKING</span></td><td class="td2">5</td><td class="td2">92</td><td class="td2">0.0%</td><td><div style="display:flex;gap:4px"><button class="btn bg btn-xs" onclick="editSite('intranet')">✏️</button><button class="btn bg btn-xs">🤖</button><button class="btn bg btn-xs">📊</button></div></td></tr>
+          <tr><td><div style="display:flex;align-items:center;gap:6px"><div class="sd gr"></div></div></td><td><span style="color:var(--text3)">legacy</span></td><td class="td3">legacy.app.net</td><td class="td3">172.16.4.22:80</td><td><span class="bdg bgr">OFFLINE</span></td><td class="td3">0</td><td class="td3">—</td><td class="td3">—</td><td><div style="display:flex;gap:4px"><button class="btn bg btn-xs" onclick="editSite('legacy')">✏️</button><button class="btn bd btn-xs" onclick="showToast('Site deleted','w','🗑️')">🗑️</button></div></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════
+     SECTION: RULES
+══════════════════════════════════════ -->
+<section id="sec-rules" class="sec">
+  <div class="sec-hdr">
+    <div class="sec-hl">
+      <div class="sec-title">📋 Rules Engine</div>
+      <div class="sec-sub">OWASP CRS v4.7 · Custom SRL · Virtual Patches · 2,541 total rules</div>
+    </div>
+    <div class="sec-acts">
+      <button class="btn bc btn-sm" onclick="openModal('testRule')">🧪 Test Rule</button>
+      <button class="btn bp btn-sm" onclick="openModal('newRule')">＋ New Rule</button>
+    </div>
+  </div>
+
+  <div class="g12">
+    <!-- Rule list -->
+    <div class="panel">
+      <div class="ph">
+        <div class="ptitle">📋 Rule Library</div>
+        <div class="pacts">
+          <div class="fw"><span class="fwi">🔍</span><input class="fi2" type="text" placeholder="Search rules..." style="width:160px"></div>
+          <select class="fsel"><option>All Categories</option><option>SQL Injection</option><option>XSS</option><option>LFI/RFI</option><option>Command Injection</option><option>Scanner Detection</option><option>Protocol</option></select>
+        </div>
+      </div>
+      <div class="tabs">
+        <div class="tab on" onclick="switchTab(this,'rules')">All (2,541)</div>
+        <div class="tab" onclick="switchTab(this,'rules')">CRS (2,524)</div>
+        <div class="tab" onclick="switchTab(this,'rules')">Custom (14)</div>
+        <div class="tab" onclick="switchTab(this,'rules')">Virtual Patches (3)</div>
+      </div>
+      <div class="tw" style="max-height:440px;overflow-y:auto">
+        <table>
+          <thead><tr><th>Enable</th><th>ID</th><th>Description</th><th>Phase</th><th>Severity</th><th>Actions</th></tr></thead>
+          <tbody id="rulesBody">
+            <!-- populated by JS -->
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Rule editor -->
+    <div class="panel" style="display:flex;flex-direction:column">
+      <div class="ph">
+        <div class="ptitle">✏️ Rule Editor<span id="editingRuleId" style="color:var(--text3);font-size:9px;margin-left:8px;font-family:'Share Tech Mono',monospace"></span></div>
+        <div class="pacts">
+          <button class="btn bc btn-sm" onclick="showToast('AI generating rule...','i','🤖')">🤖 AI Assist</button>
+          <button class="btn bp btn-sm" onclick="saveRule()">💾 Save</button>
+        </div>
+      </div>
+      <div class="pb" style="flex:1;display:flex;flex-direction:column;gap:12px">
+        <div class="fg-grid2">
+          <div class="fg2"><label class="flbl2">Rule ID</label><input class="fin2" id="ruleId" placeholder="9000100" type="text"></div>
+          <div class="fg2"><label class="flbl2">Phase</label><select class="fin2 fsel2"><option>request_headers</option><option>request_body</option><option>response_headers</option><option>response_body</option><option>logging</option></select></div>
+        </div>
+        <div class="fg2"><label class="flbl2">Description</label><input class="fin2" placeholder="Rule description..." type="text"></div>
+        <div class="fg2"><label class="flbl2">SRL Source</label>
+          <textarea class="rule-ta" id="ruleEditor" spellcheck="false">rule block-sqli-custom {
+  id: 9000100
+  phase: request_headers
+  target: ARGS | REQUEST_URI | REQUEST_BODY
+  operator: rx('/(\b(union|select|insert|update|delete|drop|create|alter|exec)\b)/i')
+  action: block
+  severity: critical
+  msg: "Custom SQL Injection Detection"
+  tag: ["custom","sqli","OWASP_CRS"]
+  anomaly_score: 10
+}</textarea>
+        </div>
+        <div class="fg2"><label class="flbl2">Test Input</label><input class="fin2" placeholder="Test payload, e.g.: 1' UNION SELECT * FROM users" type="text" id="ruleTest"></div>
+        <button class="btn bc" onclick="testRuleLive()">▶ Run Test</button>
+        <div id="ruleTestResult" style="display:none" class="code-block"></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════
+     SECTION: ALERTS
+══════════════════════════════════════ -->
+<section id="sec-alerts" class="sec">
+  <div class="sec-hdr">
+    <div class="sec-hl">
+      <div class="sec-title">🔴 Security Alerts</div>
+      <div class="sec-sub">Real-time incident queue · <span id="alertCount">7</span> unresolved · SIEM integration active</div>
+    </div>
+    <div class="sec-acts">
+      <button class="btn bg btn-sm">📤 Export CSV</button>
+      <button class="btn bc btn-sm" onclick="showToast('All selected alerts acknowledged','s','✅')">✅ Ack All</button>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px">
+    <div class="kpi"><div class="kpi-lbl">Critical</div><div class="kpi-val r" id="acrit">3</div></div>
+    <div class="kpi ka"><div class="kpi-lbl">High</div><div class="kpi-val a" id="ahigh">2</div></div>
+    <div class="kpi kc"><div class="kpi-lbl">Medium</div><div class="kpi-val c" id="amed">1</div></div>
+    <div class="kpi kg"><div class="kpi-lbl">Low/Info</div><div class="kpi-val g" id="alow">1</div></div>
+  </div>
+
+  <div class="panel">
+    <div class="ph">
+      <div class="ptitle">🔴 Alert Queue</div>
+      <div class="pacts">
+        <div class="fbar">
+          <div class="fw"><span class="fwi">🔍</span><input class="fi2" type="text" placeholder="Search alerts..." style="width:180px"></div>
+          <select class="fsel"><option>All Severity</option><option>CRITICAL</option><option>HIGH</option><option>MEDIUM</option><option>LOW</option></select>
+          <select class="fsel"><option>All Sites</option><option>dvwa.local</option><option>juice.local</option><option>api.acme.com</option></select>
+          <select class="fsel"><option>Last 24h</option><option>Last 7d</option><option>Last 30d</option></select>
+        </div>
+      </div>
+    </div>
+    <div class="tw">
+      <table>
+        <thead><tr><th><input type="checkbox" style="accent-color:var(--red)"></th><th>Severity</th><th>Time</th><th>Source IP</th><th>Site</th><th>Attack Type</th><th>Rule</th><th>Anomaly Score</th><th>Action</th><th>Status</th><th>Operations</th></tr></thead>
+        <tbody id="alertsBody">
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════
+     SECTION: TRAFFIC
+══════════════════════════════════════ -->
+<section id="sec-traffic" class="sec">
+  <div class="sec-hdr">
+    <div class="sec-hl">
+      <div class="sec-title">📊 Traffic Analysis</div>
+      <div class="sec-sub">Live request log · anomaly detection · geographic analysis</div>
+    </div>
+    <div class="sec-acts">
+      <select class="fsel"><option>All Sites</option><option>dvwa.local</option><option>juice.local</option></select>
+      <button class="btn bp btn-sm">📤 Export PCAP</button>
+    </div>
+  </div>
+
+  <div class="g2">
+    <div class="panel">
+      <div class="ph"><div class="ptitle">⚡ Requests / sec (live)</div></div>
+      <div class="pb"><canvas id="reqChart" height="100" style="width:100%"></canvas></div>
+    </div>
+    <div class="panel">
+      <div class="ph"><div class="ptitle">🌍 Geographic Distribution</div></div>
+      <div class="pb">
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <div class="eprow"><span class="eprank">1</span><span class="eppath">🇺🇸 United States</span><span class="epcount">42%</span><div class="epbw"><div class="pwrap"><div class="pbar" style="width:100%;background:var(--cyan)"></div></div></div></div>
+          <div class="eprow"><span class="eprank">2</span><span class="eppath">🇩🇪 Germany</span><span class="epcount">18%</span><div class="epbw"><div class="pwrap"><div class="pbar" style="width:43%;background:var(--green)"></div></div></div></div>
+          <div class="eprow"><span class="eprank">3</span><span class="eppath">🇨🇳 China <span style="color:var(--red-b);font-size:9px">⚠ BLOCKED</span></span><span class="epcount">12%</span><div class="epbw"><div class="pwrap"><div class="pbar" style="width:29%;background:var(--red-b)"></div></div></div></div>
+          <div class="eprow"><span class="eprank">4</span><span class="eppath">🇷🇺 Russia <span style="color:var(--red-b);font-size:9px">⚠ BLOCKED</span></span><span class="epcount">9%</span><div class="epbw"><div class="pwrap"><div class="pbar" style="width:21%;background:var(--red-b)"></div></div></div></div>
+          <div class="eprow"><span class="eprank">5</span><span class="eppath">🇮🇳 India</span><span class="epcount">7%</span><div class="epbw"><div class="pwrap"><div class="pbar" style="width:17%;background:var(--amber)"></div></div></div></div>
+          <div class="eprow"><span class="eprank">6</span><span class="eppath">🌍 Other</span><span class="epcount">12%</span><div class="epbw"><div class="pwrap"><div class="pbar" style="width:29%;background:var(--text3)"></div></div></div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="ph">
+      <div class="ptitle">📜 Request Log</div>
+      <div class="pacts">
+        <div class="fbar">
+          <div class="fw"><span class="fwi">🔍</span><input class="fi2" type="text" placeholder="Filter by IP, path, rule..." style="width:200px"></div>
+          <select class="fsel"><option>All Methods</option><option>GET</option><option>POST</option><option>PUT</option><option>DELETE</option></select>
+          <select class="fsel"><option>All Status</option><option>2xx OK</option><option>4xx Client</option><option>403 Blocked</option><option>5xx Server</option></select>
+          <select class="fsel"><option>Score: Any</option><option>Score > 5</option><option>Score > 10</option><option>Score > 20</option></select>
+        </div>
+      </div>
+    </div>
+    <div class="tw" style="max-height:340px;overflow-y:auto">
+      <table>
+        <thead><tr><th>Time</th><th>Site</th><th>Method</th><th>Path</th><th>Source IP</th><th>Status</th><th>Latency</th><th>Anomaly</th><th>Action</th></tr></thead>
+        <tbody id="trafficLog"></tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════
+     SECTION: AI COPILOT
+══════════════════════════════════════ -->
+<section id="sec-copilot" class="sec">
+  <div class="sec-hdr">
+    <div class="sec-hl">
+      <div class="sec-title" style="color:#BF7FFF">🤖 AI Security Copilot</div>
+      <div class="sec-sub">Powered by DeepSeek R1 · Rule generation · CVE patching · Alert explanation · False positive tuning</div>
+    </div>
+    <div class="sec-acts">
+      <span style="font-size:9px;font-family:'Share Tech Mono',monospace;color:#A070E0;background:rgba(124,47,191,.15);border:1px solid rgba(124,47,191,.3);border-radius:20px;padding:4px 12px">deepseek-r1:8b</span>
+      <button class="btn bg btn-sm" onclick="clearCopilot()">🗑️ Clear Chat</button>
+    </div>
+  </div>
+
+  <div class="cop-page">
+    <div class="cop-hist">
+      <div class="cop-hh">
+        <div class="cop-hh-t">💬 Conversations</div>
+        <button class="btn bg btn-xs" onclick="newConversation()">＋</button>
+      </div>
+      <div class="cop-hl">
+        <div class="hi on">SQLi on /api/login</div>
+        <div class="hi">Log4Shell probe analysis</div>
+        <div class="hi">False positive CRS-920420</div>
+        <div class="hi">Rate limit tuning</div>
+        <div class="hi">CVE-2024-1234 patch</div>
+        <div class="hi">Bot detector JA4 tune</div>
+      </div>
+    </div>
+    <div class="cop-main">
+      <div class="cop-mh">
+        <div class="cop-av2">🤖</div>
+        <div>
+          <div class="cop-mname">Sentinel AI Copilot</div>
+          <div class="cop-mst"><span class="cop-online2"></span>Online · Ready to assist</div>
+        </div>
+        <div class="cop-mdl">⚡ deepseek-r1:8b</div>
+      </div>
+      <div class="cop-msgs2" id="copMsgs2"></div>
+      <div class="ty2" id="ty2"><div class="mav2 ai">🤖</div><div style="display:flex;gap:4px;align-items:center;padding:10px 13px;background:rgba(124,47,191,.14);border:1px solid rgba(124,47,191,.24);border-radius:3px 12px 12px 12px"><div class="tyd"></div><div class="tyd"></div><div class="tyd"></div></div></div>
+      <div class="cop-quick2">
+        <button class="qbtn2" data-q2="explain">🔍 Explain Alert</button>
+        <button class="qbtn2" data-q2="rule">📝 Write Rule</button>
+        <button class="qbtn2" data-q2="report">📊 Threat Summary</button>
+        <button class="qbtn2" data-q2="fp">🐛 Fix False Positive</button>
+        <button class="qbtn2" data-q2="patch">⚡ Patch CVE</button>
+        <button class="qbtn2" data-q2="tune">⚙️ Tune ML Threshold</button>
+      </div>
+      <div class="cop-ia">
+        <textarea class="cop-inp2" id="copInp2" placeholder="Ask about alerts, rules, CVEs, false positives, threat analysis..."></textarea>
+        <button class="cop-snd2" id="copSnd2">➤</button>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════
+     SECTION: PLUGINS
+══════════════════════════════════════ -->
+<section id="sec-plugins" class="sec">
+  <div class="sec-hdr">
+    <div class="sec-hl">
+      <div class="sec-title">🔌 WASM Plugin Marketplace</div>
+      <div class="sec-sub">WebAssembly plugin runtime · Rust / Go / AssemblyScript SDKs · OCI registry</div>
+    </div>
+    <div class="sec-acts">
+      <button class="btn bc btn-sm" onclick="openModal('uploadPlugin')">📦 Upload Plugin</button>
+      <button class="btn bp btn-sm" onclick="openModal('installPlugin')">🔍 Browse Registry</button>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px">
+    <div class="kpi kg"><div class="kpi-lbl">Installed</div><div class="kpi-val g">3</div></div>
+    <div class="kpi kc"><div class="kpi-lbl">Available</div><div class="kpi-val c">14</div></div>
+    <div class="kpi ka"><div class="kpi-lbl">Updates</div><div class="kpi-val a">2</div></div>
+    <div class="kpi"><div class="kpi-lbl">WASM Runtime</div><div class="kpi-val" style="color:var(--green);font-size:14px;padding-top:4px">wasmtime 14.0</div></div>
+  </div>
+
+  <div class="pg">
+    <div class="pc"><div class="pch"><div class="pci">🔐</div><div><div class="pcn">JWT Validator</div><div class="pca">sentinel-security · v1.2.3</div></div></div><div class="pcd">Validates JWT Bearer tokens on protected routes. Supports RS256, HS256, ES256. JWKS endpoint caching.</div><div class="pcf"><div class="pcm">Rust · 48KB · ⭐ 4.9</div><div style="display:flex;gap:5px"><span class="bdg bgg">INSTALLED</span><button class="btn bg btn-xs" onclick="showToast('JWT Validator configured','i','⚙️')">⚙️ Config</button></div></div></div>
+    <div class="pc"><div class="pch"><div class="pci">🌍</div><div><div class="pcn">GeoIP Blocker</div><div class="pca">sentinel-security · v2.0.1</div></div></div><div class="pcd">Country-level blocking with MaxMind GeoLite2. Allow/deny lists per site. Bypass for whitelisted IPs.</div><div class="pcf"><div class="pcm">Rust · 82KB · ⭐ 4.8</div><div style="display:flex;gap:5px"><span class="bdg bgg">INSTALLED</span><button class="btn bg btn-xs">⚙️ Config</button></div></div></div>
+    <div class="pc"><div class="pch"><div class="pci">📨</div><div><div class="pcn">Custom Headers</div><div class="pca">sentinel-security · v1.0.4</div></div></div><div class="pcd">Inject, remove, or rewrite request/response headers. CSP policy injection. HSTS enforcement.</div><div class="pcf"><div class="pcm">Go · 28KB · ⭐ 4.7</div><div style="display:flex;gap:5px"><span class="bdg bgg">INSTALLED</span><button class="btn bg btn-xs">⚙️ Config</button></div></div></div>
+    <div class="pc"><div class="pch"><div class="pci">📊</div><div><div class="pcn">GraphQL Shield</div><div class="pca">community · v0.9.0</div></div></div><div class="pcd">GraphQL query complexity analysis, depth limiting, introspection blocking, field-level authorization.</div><div class="pcf"><div class="pcm">AssemblyScript · 61KB · ⭐ 4.6</div><div style="display:flex;gap:5px"><span class="bdg ba blink">UPDATE</span><button class="btn bp btn-xs" onclick="showToast('GraphQL Shield installing...','i','🔌')">Install</button></div></div></div>
+    <div class="pc"><div class="pch"><div class="pci">💬</div><div><div class="pcn">Slack Alerter</div><div class="pca">community · v1.1.0</div></div></div><div class="pcd">Real-time Slack notifications for critical alerts. Configurable severity thresholds, site filtering, and channel routing.</div><div class="pcf"><div class="pcm">Go · 19KB · ⭐ 4.5</div><div style="display:flex;gap:5px"><span class="bdg bgr">AVAILABLE</span><button class="btn bp btn-xs" onclick="showToast('Slack Alerter installing...','i','🔌')">Install</button></div></div></div>
+    <div class="pc"><div class="pch"><div class="pci">🤖</div><div><div class="pcn">Bot CAPTCHA</div><div class="pca">sentinel-security · v2.0.0</div></div></div><div class="pcd">Invisible CAPTCHA challenge for suspicious user agents. hCaptcha / Cloudflare Turnstile integration.</div><div class="pcf"><div class="pcm">Rust · 95KB · ⭐ 4.8</div><div style="display:flex;gap:5px"><span class="bdg bgr">AVAILABLE</span><button class="btn bp btn-xs" onclick="showToast('Bot CAPTCHA installing...','i','🔌')">Install</button></div></div></div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════
+     SECTION: SETTINGS
+══════════════════════════════════════ -->
+<section id="sec-settings" class="sec">
+  <div class="sec-hdr">
+    <div class="sec-hl">
+      <div class="sec-title">⚙️ Settings</div>
+      <div class="sec-sub">System configuration · Authentication · Team management · Cluster</div>
+    </div>
+    <div class="sec-acts">
+      <button class="btn bp btn-sm" onclick="saveSettings()">💾 Save Changes</button>
+    </div>
+  </div>
+
+  <div class="tabs" id="settingsTabs">
+    <div class="tab on" onclick="switchTab(this,'settings')">General</div>
+    <div class="tab" onclick="switchTab(this,'settings')">Auth & SSO</div>
+    <div class="tab" onclick="switchTab(this,'settings')">API Keys</div>
+    <div class="tab" onclick="switchTab(this,'settings')">Users & RBAC</div>
+    <div class="tab" onclick="switchTab(this,'settings')">Cluster</div>
+    <div class="tab" onclick="switchTab(this,'settings')">Notifications</div>
+  </div>
+
+  <div id="stGeneral" class="panel tabp on">
+    <div class="pb">
+      <div class="fg-grid2">
+        <div class="fg2"><label class="flbl2">Tenant Name</label><input class="fin2" value="Sentinel Security Labs" type="text"></div>
+        <div class="fg2"><label class="flbl2">Admin Email</label><input class="fin2" value="admin@sentinel.local" type="email"></div>
+        <div class="fg2"><label class="flbl2">Log Retention</label><select class="fin2 fsel2"><option>30 days</option><option selected>90 days</option><option>1 year</option><option>Custom</option></select></div>
+        <div class="fg2"><label class="flbl2">Anomaly Threshold (default)</label><input class="fin2" value="5" type="number" min="1" max="50"></div>
+        <div class="fg2"><label class="flbl2">Default WAF Mode</label><select class="fin2 fsel2"><option selected>BLOCKING</option><option>LEARNING</option><option>OFF</option></select></div>
+        <div class="fg2"><label class="flbl2">Paranoia Level</label><select class="fin2 fsel2"><option selected>1 — Default</option><option>2 — Aggressive</option><option>3 — Paranoid</option><option>4 — Ultra</option></select></div>
+      </div>
+      <div class="srow"><div class="sri"><div class="srt">Enable ML Anomaly Detection</div><div class="srd">Use Isolation Forest + Payload Classifier to score requests at Phase 2</div></div><div class="src"><div class="tog on" onclick="this.classList.toggle('on')"></div></div></div>
+      <div class="srow"><div class="sri"><div class="srt">Auto-reload on SIGHUP</div><div class="srd">Hot-reload config and rules without restarting the proxy daemon</div></div><div class="src"><div class="tog on" onclick="this.classList.toggle('on')"></div></div></div>
+      <div class="srow"><div class="sri"><div class="srt">OpenTelemetry Tracing</div><div class="srd">Export traces to OTEL collector at http://localhost:4317</div></div><div class="src"><div class="tog on" onclick="this.classList.toggle('on')"></div></div></div>
+      <div class="srow"><div class="sri"><div class="srt">Learning Mode Auto-Promote</div><div class="srd">Automatically switch site to BLOCKING after 7 days of learning with &lt; 0.1% FP rate</div></div><div class="src"><div class="tog" onclick="this.classList.toggle('on')"></div></div></div>
+    </div>
+  </div>
+
+  <div id="stAuth" class="panel tabp">
+    <div class="pb">
+      <div class="fg-grid2">
+        <div class="fg2"><label class="flbl2">JWT Secret (HS256)</label><input class="fin2" value="••••••••••••••••••••••••••••••••" type="password"></div>
+        <div class="fg2"><label class="flbl2">JWT Access Token TTL</label><select class="fin2 fsel2"><option>15 minutes</option><option selected>1 hour</option><option>24 hours</option></select></div>
+        <div class="fg2"><label class="flbl2">Refresh Token TTL</label><select class="fin2 fsel2"><option>1 day</option><option selected>7 days</option><option>30 days</option></select></div>
+        <div class="fg2"><label class="flbl2">JWT Issuer</label><input class="fin2" value="sentinel-waf.corp.io" type="text"></div>
+      </div>
+      <div class="srow"><div class="sri"><div class="srt">Microsoft Entra ID (Azure AD)</div><div class="srd">Tenant: corp.onmicrosoft.com · Client ID configured</div></div><div class="src"><div style="display:flex;gap:6px"><span class="bdg bgg">ACTIVE</span><button class="btn bg btn-xs">Configure</button></div></div></div>
+      <div class="srow"><div class="sri"><div class="srt">Google Workspace OIDC</div><div class="srd">Not configured</div></div><div class="src"><button class="btn bg btn-xs" onclick="showToast('Google OIDC setup started','i','🔵')">Set Up</button></div></div>
+      <div class="srow"><div class="sri"><div class="srt">Okta Enterprise SSO</div><div class="srd">Not configured</div></div><div class="src"><button class="btn bg btn-xs" onclick="showToast('Okta setup started','i','🟠')">Set Up</button></div></div>
+      <div class="srow"><div class="sri"><div class="srt">SAML 2.0</div><div class="srd">SP Entity ID: https://sentinel-waf.corp.io/saml/metadata</div></div><div class="src"><button class="btn bg btn-xs">Configure</button></div></div>
+    </div>
+  </div>
+
+  <div id="stAPI" class="panel tabp">
+    <div class="ph" style="border-top:none">
+      <div class="ptitle">🔑 API Keys</div>
+      <button class="btn bp btn-sm" onclick="openModal('newApiKey')">＋ Generate Key</button>
+    </div>
+    <div class="tw">
+      <table>
+        <thead><tr><th>Name</th><th>Key Preview</th><th>Scope</th><th>Created</th><th>Expires</th><th>Last Used</th><th>Actions</th></tr></thead>
+        <tbody>
+          <tr><td>CI/CD Pipeline</td><td class="td2">sk-live-f87a48c6••••51de</td><td><span class="bdg bcy">read:all write:rules</span></td><td class="td3">2024-11-01</td><td class="td3">2025-02-01</td><td class="td3">2 min ago</td><td><button class="btn bd btn-xs" onclick="showToast('API key revoked','w','🔑')">Revoke</button></td></tr>
+          <tr><td>Monitoring Agent</td><td class="td2">sk-live-a2b3c4d5••••ef90</td><td><span class="bdg bcy">read:all</span></td><td class="td3">2024-10-15</td><td class="td3">2025-01-15</td><td class="td3">5 min ago</td><td><button class="btn bd btn-xs" onclick="showToast('API key revoked','w','🔑')">Revoke</button></td></tr>
+          <tr><td>Backup Script</td><td class="td2">sk-live-9f8e7d6c••••ba01</td><td><span class="bdg bgr">read:logs</span></td><td class="td3">2024-09-01</td><td class="td3">2024-12-01</td><td class="td3">3d ago</td><td><button class="btn bd btn-xs" onclick="showToast('API key revoked','w','🔑')">Revoke</button></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div id="stUsers" class="panel tabp">
+    <div class="ph"><div class="ptitle">👥 Team Members</div><button class="btn bp btn-sm" onclick="openModal('inviteUser')">＋ Invite User</button></div>
+    <div class="tw">
+      <table>
+        <thead><tr><th>User</th><th>Email</th><th>Role</th><th>2FA</th><th>Last Login</th><th>Actions</th></tr></thead>
+        <tbody>
+          <tr><td><div style="display:flex;align-items:center;gap:8px"><div class="uav" style="width:24px;height:24px;font-size:10px">A</div>admin</div></td><td class="td2">admin@sentinel.local</td><td><span class="bdg br">OWNER</span></td><td><span class="bdg bgg">✓ TOTP</span></td><td class="td3">Just now</td><td><button class="btn bg btn-xs">Edit</button></td></tr>
+          <tr><td><div style="display:flex;align-items:center;gap:8px"><div class="uav" style="width:24px;height:24px;font-size:10px;background:linear-gradient(135deg,var(--cyan),#0067FF)">R</div>raj.kumar</div></td><td class="td2">raj@sentinel.local</td><td><span class="bdg ba">ADMIN</span></td><td><span class="bdg bgg">✓ TOTP</span></td><td class="td3">2h ago</td><td><button class="btn bg btn-xs">Edit</button></td></tr>
+          <tr><td><div style="display:flex;align-items:center;gap:8px"><div class="uav" style="width:24px;height:24px;font-size:10px;background:linear-gradient(135deg,var(--green),#007a48)">P</div>priya.dev</div></td><td class="td2">priya@sentinel.local</td><td><span class="bdg bgr">VIEWER</span></td><td><span class="bdg bgr">✗ None</span></td><td class="td3">1d ago</td><td><button class="btn bg btn-xs">Edit</button></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div id="stCluster" class="panel tabp">
+    <div class="ph"><div class="ptitle">⚡ Cluster Status</div><div class="pacts"><span class="bdg bgg"><span class="bdr"></span>Raft Consensus · 3 nodes</span></div></div>
+    <div class="pb">
+      <div class="nodegrid">
+        <div class="nodecard leader"><div class="nch"><div class="sd g"></div><span class="ncr" style="background:rgba(200,0,30,.2);color:var(--red-b);border:1px solid var(--border)">LEADER</span></div><div class="ncn">cp-primary-01</div><div class="ncs">IP: 10.0.0.10:8080</div><div class="ncs">Uptime: 14d 6h 22m</div><div class="ncs">Raft term: 4 · Log idx: 18,422</div><div class="ncs" style="color:var(--green);margin-top:5px">CPU: 12% · Mem: 284MB</div></div>
+        <div class="nodecard"><div class="nch"><div class="sd g"></div><span class="ncr" style="background:rgba(0,200,240,.12);color:var(--cyan);border:1px solid rgba(0,200,240,.3)">FOLLOWER</span></div><div class="ncn">cp-replica-02</div><div class="ncs">IP: 10.0.0.11:8080</div><div class="ncs">Uptime: 14d 6h 19m</div><div class="ncs">Raft term: 4 · Log idx: 18,422</div><div class="ncs" style="color:var(--green);margin-top:5px">CPU: 8% · Mem: 241MB</div></div>
+        <div class="nodecard"><div class="nch"><div class="sd g"></div><span class="ncr" style="background:rgba(0,200,240,.12);color:var(--cyan);border:1px solid rgba(0,200,240,.3)">FOLLOWER</span></div><div class="ncn">cp-replica-03</div><div class="ncs">IP: 10.0.0.12:8080</div><div class="ncs">Uptime: 14d 6h 17m</div><div class="ncs">Raft term: 4 · Log idx: 18,421</div><div class="ncs" style="color:var(--amber);margin-top:5px">CPU: 9% · Mem: 258MB</div></div>
+      </div>
+      <div class="srow"><div class="sri"><div class="srt">Quorum</div><div class="srd">Requires 2/3 nodes · Currently 3/3 online · Fault tolerant</div></div><div class="src"><span class="bdg bgg">✓ HEALTHY</span></div></div>
+      <div class="srow"><div class="sri"><div class="srt">Config Sync</div><div class="srd">Last push: 34s ago · 5 data-plane nodes subscribed via gRPC</div></div><div class="src"><span class="bdg bgg">✓ IN SYNC</span></div></div>
+      <div class="srow"><div class="sri"><div class="srt">Data-Plane Nodes</div><div class="srd">dp-us-east-01, dp-us-west-01, dp-eu-01, dp-ap-01, dp-local-01</div></div><div class="src"><span class="bdg bcy">5 nodes</span></div></div>
+    </div>
+  </div>
+
+  <div id="stNotif" class="panel tabp">
+    <div class="pb">
+      <div class="srow"><div class="sri"><div class="srt">Email Alerts</div><div class="srd">Send critical alerts to admin@sentinel.local</div></div><div class="src"><div class="tog on" onclick="this.classList.toggle('on')"></div></div></div>
+      <div class="srow"><div class="sri"><div class="srt">Slack Notifications</div><div class="srd">Webhook: https://hooks.slack.com/services/T••••/B••••/••••</div></div><div class="src"><div class="tog on" onclick="this.classList.toggle('on')"></div></div></div>
+      <div class="srow"><div class="sri"><div class="srt">PagerDuty Integration</div><div class="srd">Escalate CRITICAL alerts to on-call · Integration key configured</div></div><div class="src"><div class="tog" onclick="this.classList.toggle('on')"></div></div></div>
+      <div class="srow"><div class="sri"><div class="srt">Webhook (Custom)</div><div class="srd">POST to custom endpoint for SIEM integration</div></div><div class="src"><div class="tog" onclick="this.classList.toggle('on')"></div></div></div>
+      <div class="fg2" style="margin-top:8px"><label class="flbl2">Custom Webhook URL</label><input class="fin2" placeholder="https://your-siem.corp.io/events" type="url"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════
+     SECTION: LOGS
+══════════════════════════════════════ -->
+<section id="sec-logs" class="sec">
+  <div class="sec-hdr">
+    <div class="sec-hl">
+      <div class="sec-title">📜 Log Explorer</div>
+      <div class="sec-sub">Live SSE streaming · Access · WAF · Error · Audit · ModSec · ML</div>
+    </div>
+    <div class="sec-acts">
+      <button class="btn bg btn-sm" id="pauseBtn" onclick="togglePause()">⏸ Pause</button>
+      <button class="btn bg btn-sm" onclick="clearLogs()">🗑️ Clear</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="pb" style="padding:10px 18px">
+      <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">
+        <div style="display:flex;align-items:center;gap:7px;font-size:10px;font-family:'Share Tech Mono',monospace;color:var(--text2)">
+          <div class="sd g"></div>
+          <span style="color:var(--green)">LIVE</span>
+          <span style="color:var(--text3)">·</span>
+          <span>Clients: <span id="logClients" style="color:var(--cyan)">0</span></span>
+        </div>
+        <div style="display:flex;gap:4px;flex-wrap:wrap">
+          <button class="log-kind-tab btn btn-sm bg on" data-kind="" onclick="setLogKind('')" style="font-size:9px;padding:3px 10px">All</button>
+          <button class="log-kind-tab btn btn-sm bg" data-kind="access" onclick="setLogKind('access')" style="font-size:9px;padding:3px 10px;color:var(--cyan)">Access</button>
+          <button class="log-kind-tab btn btn-sm bg" data-kind="waf" onclick="setLogKind('waf')" style="font-size:9px;padding:3px 10px;color:var(--red-b)">WAF</button>
+          <button class="log-kind-tab btn btn-sm bg" data-kind="error" onclick="setLogKind('error')" style="font-size:9px;padding:3px 10px;color:var(--amber)">Error</button>
+          <button class="log-kind-tab btn btn-sm bg" data-kind="audit" onclick="setLogKind('audit')" style="font-size:9px;padding:3px 10px;color:var(--cyan)">Audit</button>
+          <button class="log-kind-tab btn btn-sm bg" data-kind="modsec" onclick="setLogKind('modsec')" style="font-size:9px;padding:3px 10px;color:var(--red-b)">ModSec</button>
+          <button class="log-kind-tab btn btn-sm bg" data-kind="ml" onclick="setLogKind('ml')" style="font-size:9px;padding:3px 10px;color:#BF7FFF">ML</button>
+        </div>
+        <div class="fw" style="margin-left:auto"><span class="fwi">🔍</span><input class="fi2" id="logSearch" type="text" placeholder="Search logs..." style="width:180px"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="tw" style="max-height:520px;overflow-y:auto">
+      <table>
+        <thead>
+          <tr>
+            <th style="width:70px">TIME</th>
+            <th style="width:70px">KIND</th>
+            <th style="width:140px">IP / SOURCE</th>
+            <th>DETAILS</th>
+            <th style="width:80px">ACTION</th>
+          </tr>
+        </thead>
+        <tbody id="logTableBody"></tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<!-- TICKER -->
+<div class="ticker-bar">
+  <div class="tick-lbl">⚡ LIVE THREATS</div>
+  <div class="tick-scroll"><div class="tick-inner2" id="tkInner"></div></div>
+</div>
+
+<!-- MINI COPILOT FAB -->
+<button class="cfab" id="cfab"><span class="cfab-ring"></span><span style="font-size:22px">🤖</span></button>
+
+<!-- MINI COPILOT PANEL -->
+<div class="cop-mini" id="copMini">
+  <div class="cmh">
+    <div class="cmav">🤖</div>
+    <div><div class="cmname">Sentinel AI Copilot</div><div class="cmst"><span class="cmonl"></span>Online · DeepSeek R1</div></div>
+    <button class="cmcl" id="cmcl">✕</button>
+  </div>
+  <div class="cm-msgs" id="cmMsgs"></div>
+  <div class="ty2" id="ty3"><div class="mav2 ai">🤖</div><div style="display:flex;gap:4px;align-items:center;padding:9px 13px;background:rgba(124,47,191,.14);border:1px solid rgba(124,47,191,.24);border-radius:3px 12px 12px 12px"><div class="tyd"></div><div class="tyd"></div><div class="tyd"></div></div></div>
+  <div class="cm-quick">
+    <button class="qbtn2" data-qm="explain">🔍 Explain Alert</button>
+    <button class="qbtn2" data-qm="rule">📝 Write Rule</button>
+    <button class="qbtn2" data-qm="patch">⚡ Patch CVE</button>
+  </div>
+  <div class="cm-ia">
+    <input class="cm-inp" id="cmInp" placeholder="Ask Sentinel AI..." type="text">
+    <button class="cm-snd" id="cmSnd">➤</button>
+  </div>
+</div>
+
+<!-- MODAL -->
+<div class="modal-bg" id="modalBg">
+  <div class="modal" id="modal">
+    <div class="mh"><div class="mt2" id="modalTitle">Modal</div><button class="mx" onclick="closeModal()">✕</button></div>
+    <div class="mb" id="modalBody"></div>
+    <div class="mf" id="modalFoot"></div>
+  </div>
+</div>
+
+<!-- TOASTS -->
+<div class="toast-wrap" id="toastWrap"></div>
+
+<script>
+/* ══════════════════════════════════════
+   SENTINEL WAF — DASHBOARD JAVASCRIPT
+══════════════════════════════════════ */
+
+// ── CANVAS ──
+const cvs=document.getElementById('bgCanvas');
+const ctx2=cvs.getContext('2d');
+let W2,H2;
+function resize2(){W2=cvs.width=window.innerWidth;H2=cvs.height=window.innerHeight;initStr();}
+window.addEventListener('resize',resize2);resize2();
+const NC=40,nd2=[];
+(function(){nd2.length=0;for(let i=0;i<NC;i++)nd2.push({x:Math.random()*W2,y:Math.random()*H2,vx:(Math.random()-.5)*.18,vy:(Math.random()-.5)*.18,r:Math.random()*2+.5,isRed:Math.random()<.3,pulse:Math.random()*Math.PI*2,ps:.02+Math.random()*.015});})();
+const SCH2='01ABCDEF<>|!@#%∆ΩΨ';
+let str2=[];
+function initStr(){str2=[];const cnt=Math.ceil(W2/46);for(let i=0;i<cnt;i++)str2.push(mkStr2(i*46+Math.random()*20,true));}
+function mkStr2(x,init){const len=6+Math.floor(Math.random()*12);return{x,len,y:init?Math.random()*H2:-(len*16),spd:.5+Math.random()*1.2,alpha:.03+Math.random()*.08,isRed:Math.random()<.25};}
+const waves2=[];function addW2(){waves2.push({x:Math.random()*W2,y:Math.random()*H2,r:0,maxR:120+Math.random()*150,spd:1+Math.random()*.8,c:Math.random()>.65?'0,200,240':'200,0,30'});}
+setInterval(addW2,2200);
+function draw2(){
+  ctx2.fillStyle='rgba(6,9,18,.22)';ctx2.fillRect(0,0,W2,H2);
+  // grid
+  const S=28,W3=S*1.5,H3=S*Math.sqrt(3),cols=Math.ceil(W2/W3)+2,rows=Math.ceil(H2/H3)+2;
+  ctx2.strokeStyle='rgba(200,0,30,.03)';ctx2.lineWidth=.5;
+  for(let c=-1;c<cols;c++)for(let r=-1;r<rows;r++){const x=c*W3,y=r*H3+(c%2?H3/2:0);ctx2.beginPath();for(let i=0;i<6;i++){const a=(Math.PI/3)*i;i===0?ctx2.moveTo(x+(S-1)*Math.cos(a),y+(S-1)*Math.sin(a)):ctx2.lineTo(x+(S-1)*Math.cos(a),y+(S-1)*Math.sin(a));}ctx2.closePath();ctx2.stroke();}
+  // waves
+  for(let i=waves2.length-1;i>=0;i--){const w=waves2[i];w.r+=w.spd;const a=(1-w.r/w.maxR)*.2;if(a<=0){waves2.splice(i,1);continue;}ctx2.beginPath();ctx2.arc(w.x,w.y,w.r,0,Math.PI*2);ctx2.strokeStyle=`rgba(${w.c},${a})`;ctx2.lineWidth=1;ctx2.stroke();}
+  // network
+  const md=130;
+  for(let i=0;i<nd2.length;i++){const a=nd2[i];for(let j=i+1;j<nd2.length;j++){const b=nd2[j],d=Math.hypot(a.x-b.x,a.y-b.y);if(d<md){const al=(1-d/md)*(a.isRed||b.isRed?.18:.08);ctx2.beginPath();ctx2.moveTo(a.x,a.y);ctx2.lineTo(b.x,b.y);ctx2.strokeStyle=(a.isRed||b.isRed)?`rgba(200,0,30,${al})`:`rgba(0,180,220,${al})`;ctx2.lineWidth=.6;ctx2.stroke();}}}
+  nd2.forEach(n=>{n.x+=n.vx;n.y+=n.vy;n.pulse+=n.ps;if(n.x<0)n.x=W2;if(n.x>W2)n.x=0;if(n.y<0)n.y=H2;if(n.y>H2)n.y=0;const pr=n.r+Math.sin(n.pulse)*.6,c=n.isRed?'200,0,30':'0,180,220';const grd=ctx2.createRadialGradient(n.x,n.y,0,n.x,n.y,pr*4);grd.addColorStop(0,`rgba(${c},.3)`);grd.addColorStop(1,`rgba(${c},0)`);ctx2.beginPath();ctx2.arc(n.x,n.y,pr*4,0,Math.PI*2);ctx2.fillStyle=grd;ctx2.fill();ctx2.beginPath();ctx2.arc(n.x,n.y,pr,0,Math.PI*2);ctx2.fillStyle=`rgba(${c},.8)`;ctx2.fill();});
+  // streams
+  ctx2.font='11px Share Tech Mono,monospace';
+  str2.forEach(s=>{s.y+=s.spd;if(s.y>H2+s.len*16){s.y=-(s.len*16);s.x=Math.random()*W2;}for(let i=0;i<s.len;i++){const cy=s.y-i*15;if(cy<0||cy>H2)continue;const ff=(1-i/s.len)*s.alpha,isH=i===0,ch=SCH2[Math.floor(Math.random()*SCH2.length)];ctx2.fillStyle=isH?(s.isRed?`rgba(255,70,90,${ff*3})`:`rgba(100,230,255,${ff*3})`):(s.isRed?`rgba(160,0,24,${ff})`:`rgba(0,110,180,${ff})`);ctx2.fillText(ch,s.x,cy);}});
+  requestAnimationFrame(draw2);
+}
+draw2();
+
+// ── NAVIGATION ──
+function nav(id){
+  document.querySelectorAll('.sec').forEach(s=>s.classList.remove('on'));
+  document.querySelectorAll('.nv').forEach(n=>n.classList.remove('on'));
+  const sec=document.getElementById('sec-'+id);
+  if(sec) sec.classList.add('on');
+  document.querySelectorAll('.nv').forEach(n=>{ if(n.getAttribute('onclick')&&n.getAttribute('onclick').includes("'"+id+"'")) n.classList.add('on'); });
+  if(id==='copilot') setTimeout(initCopPage,100);
+  if(id==='overview') setTimeout(initCharts,100);
+  if(id==='traffic') setTimeout(initReqChart,100);
+  if(id==='rules') setTimeout(populateRules,100);
+  if(id==='alerts') setTimeout(populateAlerts,100);
+  if(id==='traffic') setTimeout(populateTrafficLog,100);
+  if(id==='logs') setTimeout(initLogStream,100);
+  if(id==='sites') setTimeout(fetchSites,100);
+  if(id==='rules') setTimeout(fetchRules,200);
+  if(id==='alerts') setTimeout(fetchAlerts,200);
+  if(id==='overview') setTimeout(fetchDashboardStats,100);
+}
+
+// ── LOADER ──
+const ldMsgs2=['LOADING CONTROL PLANE...','AUTHENTICATING SESSION...','FETCHING SITE CONFIGS...','LOADING ML ENGINE STATUS...','SYNCING CLUSTER STATE...','DASHBOARD READY.'];
+let li=0;const ldt=document.getElementById('ldtxt');
+const lt2=setInterval(()=>{li++;if(li<ldMsgs2.length)ldt.textContent=ldMsgs2[li];else clearInterval(lt2);},270);
+
+// ── TOAST ──
+function showToast(msg,type='i',icon='ℹ️'){
+  const w=document.getElementById('toastWrap');
+  const t=document.createElement('div');
+  t.className=`toast ${type}`;
+  t.innerHTML=`<span>${icon}</span><span>${msg}</span>`;
+  w.appendChild(t);
+  setTimeout(()=>{t.style.animation='toastin .3s ease reverse';setTimeout(()=>t.remove(),300);},3500);
+}
+
+// ── MODAL ──
+const modalTemplates={
+  addSite:{title:'🌐 Add Protected Site',body:`
+    <div class="fg-grid2">
+      <div class="fg2"><label class="flbl2">Site ID</label><input class="fin2" placeholder="mysite" type="text"></div>
+      <div class="fg2"><label class="flbl2">Domain</label><input class="fin2" placeholder="mysite.example.com" type="text"></div>
+      <div class="fg2"><label class="flbl2">Upstream Host</label><input class="fin2" placeholder="127.0.0.1" type="text"></div>
+      <div class="fg2"><label class="flbl2">Upstream Port</label><input class="fin2" placeholder="8080" type="number"></div>
+      <div class="fg2"><label class="flbl2">WAF Mode</label><select class="fin2 fsel2"><option>BLOCKING</option><option>LEARNING</option><option>OFF</option></select></div>
+      <div class="fg2"><label class="flbl2">Anomaly Threshold</label><input class="fin2" placeholder="5" type="number"></div>
+    </div>
+    <div class="fg2"><label class="flbl2">Rule Files (comma-separated)</label><input class="fin2" placeholder="rules/owasp-crs/*.conf" type="text"></div>`,
+  foot:`<button class="btn bg" onclick="closeModal()">Cancel</button><button class="btn bp" onclick="closeModal();showToast('Site added successfully','s','🌐')">Add Site</button>`},
+
+  newRule:{title:'📋 New Custom Rule',body:`
+    <div class="fg-grid2">
+      <div class="fg2"><label class="flbl2">Rule ID</label><input class="fin2" placeholder="9000200" type="text"></div>
+      <div class="fg2"><label class="flbl2">Phase</label><select class="fin2 fsel2"><option>request_headers</option><option>request_body</option><option>response_headers</option><option>response_body</option></select></div>
+    </div>
+    <div class="fg2"><label class="flbl2">Description</label><input class="fin2" placeholder="Block specific attack pattern" type="text"></div>
+    <div class="fg2"><label class="flbl2">SRL Source</label><textarea class="rule-ta" rows="8">rule my-custom-rule {\n  id: 9000200\n  phase: request_headers\n  target: REQUEST_URI\n  operator: rx('/\\.git\\//i')\n  action: block\n  severity: high\n  msg: "Git directory access attempt"\n}</textarea></div>`,
+  foot:`<button class="btn bg" onclick="closeModal()">Cancel</button><button class="btn bc" onclick="closeModal();showToast('AI checking rule...','i','🤖')">🤖 AI Review</button><button class="btn bp" onclick="closeModal();showToast('Rule saved','s','📋')">Save Rule</button>`},
+
+  testRule:{title:'🧪 Test Rule Payload',body:`
+    <div class="fg2"><label class="flbl2">Test URL</label><input class="fin2" placeholder="/api/login?id=1" type="text"></div>
+    <div class="fg2"><label class="flbl2">Method</label><select class="fin2 fsel2"><option>GET</option><option>POST</option><option>PUT</option></select></div>
+    <div class="fg2"><label class="flbl2">Request Body</label><textarea class="fin2" rows="3" placeholder='{"username":"admin&#x27; OR 1=1--","password":"x"}'></textarea></div>
+    <div class="fg2"><label class="flbl2">Headers (JSON)</label><textarea class="fin2" rows="2" placeholder='{"Content-Type":"application/json"}'></textarea></div>
+    <div class="code-block" id="testResult" style="min-height:80px">▶ Run test to see CRS + ML evaluation results...</div>`,
+  foot:`<button class="btn bg" onclick="closeModal()">Close</button><button class="btn bc" onclick="runTestModal()">▶ Run Test</button>`},
+
+  newApiKey:{title:'🔑 Generate API Key',body:`
+    <div class="fg2"><label class="flbl2">Key Name</label><input class="fin2" placeholder="e.g. CI/CD Pipeline" type="text"></div>
+    <div class="fg2"><label class="flbl2">Scopes</label><select class="fin2 fsel2"><option>read:all</option><option>read:all write:rules</option><option>read:all write:all</option><option>admin</option></select></div>
+    <div class="fg2"><label class="flbl2">Expiry</label><select class="fin2 fsel2"><option>30 days</option><option selected>90 days</option><option>1 year</option><option>No expiry</option></select></div>`,
+  foot:`<button class="btn bg" onclick="closeModal()">Cancel</button><button class="btn bp" onclick="closeModal();showToast('API key generated — copy it now, it won\\'t be shown again','w','🔑')">Generate Key</button>`},
+
+  inviteUser:{title:'👤 Invite Team Member',body:`
+    <div class="fg2"><label class="flbl2">Email Address</label><input class="fin2" placeholder="colleague@yourcompany.com" type="email"></div>
+    <div class="fg2"><label class="flbl2">Role</label><select class="fin2 fsel2"><option>VIEWER</option><option>EDITOR</option><option selected>ADMIN</option><option>OWNER</option></select></div>
+    <div class="fg2"><label class="flbl2">Message (optional)</label><textarea class="fin2" rows="2" placeholder="Welcome to Sentinel WAF!"></textarea></div>`,
+  foot:`<button class="btn bg" onclick="closeModal()">Cancel</button><button class="btn bp" onclick="closeModal();showToast('Invitation sent','s','📧')">Send Invite</button>`},
+
+  uploadPlugin:{title:'📦 Upload WASM Plugin',body:`
+    <div style="border:2px dashed rgba(200,0,30,.3);border-radius:var(--r2);padding:30px;text-align:center;cursor:pointer;background:rgba(200,0,30,.04)" onclick="showToast('Select .wasm file from your filesystem','i','📦')">
+      <div style="font-size:32px;margin-bottom:8px">📦</div>
+      <div style="font-size:12px;font-family:'Share Tech Mono',monospace;color:var(--text2)">Drop .wasm file here or click to browse</div>
+      <div style="font-size:10px;color:var(--text3);margin-top:4px">Build with: cargo build --target wasm32-unknown-unknown</div>
+    </div>
+    <div class="fg2"><label class="flbl2">Plugin Name</label><input class="fin2" placeholder="my-wasm-plugin" type="text"></div>
+    <div class="fg2"><label class="flbl2">Description</label><input class="fin2" placeholder="What does this plugin do?" type="text"></div>`,
+  foot:`<button class="btn bg" onclick="closeModal()">Cancel</button><button class="btn bp" onclick="closeModal();showToast('Plugin uploaded and deployed','s','🔌')">Upload & Deploy</button>`},
+
+  installPlugin:{title:'🔍 Plugin Registry',body:`<div class="fg2"><label class="flbl2">Search Registry</label><input class="fin2" placeholder="registry.sentinel.io / GHCR / Docker Hub" type="text"></div><div class="code-block">oci://registry.sentinel.io/plugins/graphql-shield:latest\noci://ghcr.io/your-org/custom-plugin:v1.0.0\noci://registry-1.docker.io/sentinel/bot-captcha:2.0</div>`,
+  foot:`<button class="btn bg" onclick="closeModal()">Cancel</button><button class="btn bp" onclick="closeModal();showToast('Plugin installing from OCI registry...','i','🔌')">Install</button>`},
+};
+
+function openModal(key,extra){
+  const t=modalTemplates[key];
+  if(!t)return;
+  document.getElementById('modalTitle').innerHTML=t.title;
+  document.getElementById('modalBody').innerHTML=t.body;
+  document.getElementById('modalFoot').innerHTML=t.foot||(extra||'');
+  document.getElementById('modalBg').classList.add('open');
+}
+function closeModal(){document.getElementById('modalBg').classList.remove('open');}
+document.getElementById('modalBg').addEventListener('click',e=>{if(e.target===document.getElementById('modalBg'))closeModal();});
+
+// ── TRAFFIC CHART (canvas) ──
+function initCharts(){drawTrafficChart();drawDonutChart();}
+function drawTrafficChart(){
+  const cv=document.getElementById('trafficChart');
+  if(!cv)return;
+  cv.width=cv.parentElement.offsetWidth-32;
+  const c=cv.getContext('2d');
+  const W=cv.width,H=cv.height;
+  const pad={t:10,r:20,b:28,l:48};
+  const gw=W-pad.l-pad.r,gh=H-pad.t-pad.b;
+  // generate data
+  const now=new Date().getHours();
+  const labels=Array.from({length:24},(_,i)=>`${String(i).padStart(2,'0')}:00`);
+  const total=labels.map((_,i)=>{if(i===now)return 4800+Math.random()*800;if(i>=9&&i<=18)return 2000+Math.random()*2500;if(i<5)return 200+Math.random()*400;return 800+Math.random()*1200;});
+  const blocked=total.map(v=>v*(0.005+Math.random()*.015));
+  const ml=total.map(v=>v*(.002+Math.random()*.008));
+  const max=Math.max(...total)*1.15;
+  c.clearRect(0,0,W,H);
+  // grid
+  [0,.25,.5,.75,1].forEach(f=>{const y=pad.t+gh*(1-f);c.strokeStyle='rgba(255,255,255,.05)';c.lineWidth=1;c.setLineDash([3,5]);c.beginPath();c.moveTo(pad.l,y);c.lineTo(pad.l+gw,y);c.stroke();c.setLineDash([]);c.fillStyle='rgba(136,150,184,.5)';c.font='9px Share Tech Mono,monospace';c.textAlign='right';const v=Math.round(max*f);c.fillText(v>=1000?`${(v/1000).toFixed(1)}k`:v,pad.l-6,y+3);});
+  // area + line
+  function drawLine(data,color,filled=true){
+    const pts=data.map((v,i)=>({x:pad.l+(gw/(data.length-1))*i,y:pad.t+gh*(1-v/max)}));
+    if(filled){const grd=c.createLinearGradient(0,pad.t,0,pad.t+gh);grd.addColorStop(0,color.replace(')',',0.25)').replace('rgb','rgba'));grd.addColorStop(1,color.replace(')',',0)').replace('rgb','rgba'));c.beginPath();c.moveTo(pts[0].x,pad.t+gh);pts.forEach(p=>c.lineTo(p.x,p.y));c.lineTo(pts[pts.length-1].x,pad.t+gh);c.closePath();c.fillStyle=grd;c.fill();}
+    c.beginPath();pts.forEach((p,i)=>i===0?c.moveTo(p.x,p.y):c.lineTo(p.x,p.y));c.strokeStyle=color;c.lineWidth=2;c.stroke();
+  }
+  drawLine(total,'rgb(0,200,240)');
+  drawLine(blocked,'rgb(200,0,30)',false);
+  drawLine(ml,'rgb(124,47,191)',false);
+  // x labels
+  c.fillStyle='rgba(136,150,184,.5)';c.font='9px Share Tech Mono,monospace';c.textAlign='center';
+  labels.forEach((l,i)=>{if(i%4===0){const x=pad.l+(gw/(labels.length-1))*i;c.fillText(l,x,pad.t+gh+18);}});
+  // current hour marker
+  const cx2=pad.l+(gw/23)*now;c.strokeStyle='rgba(255,170,0,.5)';c.lineWidth=1;c.setLineDash([4,4]);c.beginPath();c.moveTo(cx2,pad.t);c.lineTo(cx2,pad.t+gh);c.stroke();c.setLineDash([]);
+}
+
+function drawDonutChart(){
+  const cv=document.getElementById('donutChart');if(!cv)return;
+  const c=cv.getContext('2d');const W=120,H=120;c.clearRect(0,0,W,H);
+  const cx=60,cy=60,r=52,ir=32;
+  const slices=[{v:48,col:'#FF1A44'},{v:27,col:'#FFAA00'},{v:15,col:'#00C8F0'},{v:7,col:'#7C2FBF'},{v:3,col:'#00C87A'}];
+  let sa=-Math.PI/2;
+  slices.forEach(sl=>{const arc=(sl.v/100)*Math.PI*2;c.beginPath();c.arc(cx,cy,r,sa,sa+arc);c.arc(cx,cy,ir,sa+arc,sa,true);c.closePath();c.fillStyle=sl.col;c.fill();sa+=arc;});
+  c.fillStyle='rgba(228,232,244,.85)';c.font='bold 14px Orbitron,monospace';c.textAlign='center';c.textBaseline='middle';c.fillText('3,204',cx,cy-6);
+  c.fillStyle='rgba(136,150,184,.7)';c.font='8px Share Tech Mono,monospace';c.fillText('BLOCKED',cx,cy+8);
+}
+
+// ── REQ/S CHART ──
+let reqData=Array(60).fill(0).map(()=>800+Math.random()*2000);
+function initReqChart(){
+  const cv=document.getElementById('reqChart');if(!cv)return;
+  cv.width=cv.parentElement.offsetWidth-32;
+  drawReqChart();
+}
+function drawReqChart(){
+  const cv=document.getElementById('reqChart');if(!cv)return;
+  const c=cv.getContext('2d'),W=cv.width,H=cv.height;
+  const pad={t:8,r:10,b:22,l:46};const gw=W-pad.l-pad.r,gh=H-pad.t-pad.b;
+  const max=Math.max(...reqData)*1.2;
+  c.clearRect(0,0,W,H);
+  [0,.5,1].forEach(f=>{const y=pad.t+gh*(1-f);c.strokeStyle='rgba(255,255,255,.05)';c.lineWidth=1;c.setLineDash([3,5]);c.beginPath();c.moveTo(pad.l,y);c.lineTo(pad.l+gw,y);c.stroke();c.setLineDash([]);c.fillStyle='rgba(136,150,184,.5)';c.font='9px Share Tech Mono,monospace';c.textAlign='right';const v=Math.round(max*f);c.fillText(v>=1000?`${(v/1000).toFixed(1)}k`:v,pad.l-5,y+3);});
+  const pts=reqData.map((v,i)=>({x:pad.l+(gw/(reqData.length-1))*i,y:pad.t+gh*(1-v/max)}));
+  const grd=c.createLinearGradient(0,pad.t,0,pad.t+gh);grd.addColorStop(0,'rgba(0,200,240,.28)');grd.addColorStop(1,'rgba(0,200,240,0)');
+  c.beginPath();c.moveTo(pts[0].x,pad.t+gh);pts.forEach(p=>c.lineTo(p.x,p.y));c.lineTo(pts[pts.length-1].x,pad.t+gh);c.closePath();c.fillStyle=grd;c.fill();
+  c.beginPath();pts.forEach((p,i)=>i===0?c.moveTo(p.x,p.y):c.lineTo(p.x,p.y));c.strokeStyle='rgba(0,200,240,.9)';c.lineWidth=2;c.stroke();
+  // current value dot
+  const lp=pts[pts.length-1];c.beginPath();c.arc(lp.x,lp.y,4,0,Math.PI*2);c.fillStyle='#00C8F0';c.fill();
+}
+
+// ── LIVE FEED ──
+const methods=['GET','POST','GET','GET','POST','PUT','DELETE','GET','POST'];
+const paths=['/api/v1/login','/api/v2/products','/search','/admin/users','/api/orders','/static/app.js','/api/v1/auth/refresh','/health','/api/v3/payments','/wp-admin/','/.git/config','/api/v1/config'];
+const ips=['185.220.101.45','103.24.8.122','91.240.118.150','198.235.24.130','10.0.0.45','172.16.1.100','45.33.32.156','127.0.0.1','203.0.113.42','198.51.100.7'];
+const statuses=[200,200,200,200,403,403,200,404,200,302];
+
+function genFeedRow(){
+  const now=new Date(),m=methods[Math.floor(Math.random()*methods.length)],
+    p=paths[Math.floor(Math.random()*paths.length)],
+    ip=ips[Math.floor(Math.random()*ips.length)],
+    st=statuses[Math.floor(Math.random()*statuses.length)],
+    lat=(Math.random()*.8+.1).toFixed(2),
+    score=st===403?Math.floor(Math.random()*30+5):Math.floor(Math.random()*3);
+  const sc=st===403?'s5':st>=400?'s4':st>=300?'s3':'s2';
+  const mc=m==='GET'?'get':m==='POST'?'post':m==='PUT'?'put':'del';
+  return `<div class="frow2"><span class="ft">${now.toTimeString().slice(3,8)}</span><span class="fi3">${ip.substring(0,12)}</span><span class="fm2 ${mc}">${m}</span><span class="fp2">${p}</span><span class="fs2 ${sc}">${st}</span><span class="fl2">${score>0?`<span style="color:var(--red-b)">${score}</span>`:'0'}</span></div>`;
+}
+
+function addFeedRow(){
+  const feed=document.getElementById('liveFeed');if(!feed)return;
+  feed.insertAdjacentHTML('afterbegin',genFeedRow());
+  if(feed.children.length>16) feed.lastElementChild.remove();
+}
+setInterval(addFeedRow,620);
+
+// ── RULES TABLE ──
+const crsRules=[
+  {id:'CRS-941100',desc:'XSS Attack Detected via libinjection',cat:'XSS',phase:'req_hdr',sev:'CRITICAL',enabled:true},
+  {id:'CRS-942100',desc:'SQL Injection Attack Detected via libinjection',cat:'SQLi',phase:'req_hdr',sev:'CRITICAL',enabled:true},
+  {id:'CRS-930100',desc:'Path Traversal Attack (/../)',cat:'LFI',phase:'req_uri',sev:'CRITICAL',enabled:true},
+  {id:'CRS-932100',desc:'Remote Command Execution: Direct Unix Command',cat:'RCE',phase:'req_body',sev:'CRITICAL',enabled:true},
+  {id:'CRS-913100',desc:'Found User-Agent scanner signature (sqlmap)',cat:'Scanner',phase:'req_hdr',sev:'HIGH',enabled:true},
+  {id:'CRS-920100',desc:'Invalid HTTP Request Line',cat:'Protocol',phase:'req_hdr',sev:'MEDIUM',enabled:true},
+  {id:'CRS-920270',desc:'Invalid character in request (null byte)',cat:'Protocol',phase:'req_body',sev:'HIGH',enabled:true},
+  {id:'CRS-949110',desc:'Inbound Anomaly Score Exceeded (Total Score: 5)',cat:'Anomaly',phase:'req_body',sev:'CRITICAL',enabled:true},
+  {id:'CUSTOM-9000001',desc:'Block sqlmap User-Agent',cat:'Custom',phase:'req_hdr',sev:'HIGH',enabled:true},
+  {id:'CUSTOM-9000002',desc:'Block known TOR exit nodes',cat:'Custom',phase:'req_hdr',sev:'MEDIUM',enabled:false},
+  {id:'VP-CVE-2021-44228',desc:'Log4Shell Remote Code Execution (CVE-2021-44228)',cat:'VPatch',phase:'req_body',sev:'CRITICAL',enabled:true},
+  {id:'VP-CVE-2024-3094',desc:'XZ Utils Backdoor Detection (CVE-2024-3094)',cat:'VPatch',phase:'req_hdr',sev:'CRITICAL',enabled:true},
+];
+function populateRules(){
+  const tb=document.getElementById('rulesBody');if(!tb)return;
+  tb.innerHTML=crsRules.map(r=>`<tr onclick="loadRule('${r.id}')">
+    <td><div class="tog ${r.enabled?'on':''}" onclick="event.stopPropagation();this.classList.toggle('on');showToast('Rule ${r.id} '+(this.classList.contains('on')?'enabled':'disabled'),'i','📋')"></div></td>
+    <td style="color:var(--cyan);font-size:10px">${r.id}</td>
+    <td>${r.desc}</td>
+    <td><span class="bdg bgr" style="font-size:8px">${r.cat}</span></td>
+    <td class="td3">${r.phase}</td>
+    <td><span class="bdg ${r.sev==='CRITICAL'?'br':r.sev==='HIGH'?'ba':'bcy'}">${r.sev}</span></td>
+  </tr>`).join('');
+}
+
+function loadRule(id){
+  const r=crsRules.find(x=>x.id===id);if(!r)return;
+  document.getElementById('editingRuleId').textContent='· '+id;
+  document.getElementById('ruleId').value=id.replace('CUSTOM-','').replace('VP-','').replace('CRS-','');
+  document.getElementById('ruleEditor').value=`rule ${r.desc.toLowerCase().replace(/\s+/g,'-')} {\n  id: ${r.id.replace(/\D/g,'')}\n  phase: request_headers\n  target: REQUEST_URI | ARGS | REQUEST_HEADERS\n  operator: rx('/[ attack pattern]/i')\n  action: block\n  severity: ${r.sev.toLowerCase()}\n  msg: "${r.desc}"\n  tag: ["${r.cat.toLowerCase()}"]\n}`;
+}
+
+function saveRule(){showToast('Rule saved and hot-reloaded','s','📋');}
+
+function testRuleLive(){
+  const payload=document.getElementById('ruleTest').value;
+  const out=document.getElementById('ruleTestResult');
+  out.style.display='block';
+  if(!payload){out.textContent='⚠ Enter a test payload first';return;}
+  const isSqli=/union|select|insert|update|drop|exec|script|alert|onerror/i.test(payload);
+  out.innerHTML=`<span style="color:var(--text3)">▶ Testing: "${payload}"</span>\n\n`+
+    (isSqli?`<span style="color:var(--red-b)">✗ BLOCKED — Rule matched</span>\n  Rule: CRS-942100 (SQL Injection via libinjection)\n  Anomaly Score: 15/50\n  Action: block\n  Response: HTTP 403 Forbidden`:`<span style="color:var(--green)">✓ PASSED — No rules matched</span>\n  Anomaly Score: 0/50\n  Action: allow\n  ML Score: 0.12 (below threshold)`);
+}
+
+// ── ALERTS TABLE ──
+const alertData=[
+  {sev:'CRITICAL',time:'09:42:11',ip:'185.220.101.45',site:'dvwa.local',attack:'SQL Injection',rule:'CRS-942100',score:24,action:'BLOCKED',status:'open'},
+  {sev:'HIGH',time:'09:41:03',ip:'103.24.8.122',site:'juice.local',attack:'XSS Attempt',rule:'CRS-941140',score:15,action:'BLOCKED',status:'open'},
+  {sev:'CRITICAL',time:'09:38:55',ip:'198.235.24.130',site:'api.acme.com',attack:'Log4Shell Probe',rule:'VP-CVE-2021-44228',score:50,action:'BLOCKED',status:'open'},
+  {sev:'HIGH',time:'09:35:12',ip:'91.240.118.150',site:'dvwa.local',attack:'Path Traversal',rule:'CRS-930100',score:18,action:'BLOCKED',status:'ack'},
+  {sev:'MEDIUM',time:'09:32:40',ip:'10.0.0.45',site:'shop.corp.io',attack:'Rate Limit Exceeded',rule:'MOD-RATELIMIT',score:8,action:'RATE-LTD',status:'ack'},
+  {sev:'CRITICAL',time:'09:28:17',ip:'45.33.32.156',site:'juice.local',attack:'Command Injection',rule:'CRS-932100',score:30,action:'BLOCKED',status:'open'},
+  {sev:'LOW',time:'09:14:05',ip:'203.0.113.42',site:'api.acme.com',attack:'Scanner Detection',rule:'CRS-913100',score:5,action:'LOGGED',status:'ack'},
+];
+function populateAlerts(){
+  const tb=document.getElementById('alertsBody');if(!tb)return;
+  const sevClass={CRITICAL:'br',HIGH:'ba',MEDIUM:'bcy',LOW:'bgg'};
+  tb.innerHTML=alertData.map(a=>`<tr class="sev-${a.sev[0].toLowerCase()}" onclick="showAlertDetail(${JSON.stringify(a)})">
+    <td><input type="checkbox" style="accent-color:var(--red)"></td>
+    <td><span class="bdg ${sevClass[a.sev]} ${a.sev==='CRITICAL'?'blink':''}">${a.sev}</span></td>
+    <td class="td3">${a.time}</td>
+    <td style="color:var(--cyan)">${a.ip}</td>
+    <td class="td2">${a.site}</td>
+    <td>${a.attack}</td>
+    <td class="td3">${a.rule}</td>
+    <td style="color:${a.score>=20?'var(--red-b)':a.score>=10?'var(--amber)':'var(--cyan)'};font-weight:700">${a.score}/50</td>
+    <td><span class="bdg ${a.action==='BLOCKED'?'br':a.action==='LOGGED'?'bgr':'ba'}">${a.action}</span></td>
+    <td><span class="bdg ${a.status==='open'?'br blink':'bgr'}">${a.status.toUpperCase()}</span></td>
+    <td><div style="display:flex;gap:4px">
+      <button class="btn bg btn-xs" onclick="event.stopPropagation();showToast('Add IP to blocklist?','w','🚫')">🚫 Block IP</button>
+      <button class="btn bgn btn-xs" onclick="event.stopPropagation();showToast('Exception added','s','✅')">✅ Allow</button>
+    </div></td>
+  </tr>`).join('');
+}
+
+function showAlertDetail(a){
+  openModal('_detail');
+  document.getElementById('modalTitle').innerHTML='🔴 Alert Detail';
+  document.getElementById('modalBody').innerHTML=`
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:8px">
+      <div class="fg2"><label class="flbl2">Severity</label><div><span class="bdg br ${typeof a.sev==='string'&&a.sev==='CRITICAL'?'blink':''}">${a.sev||'CRITICAL'}</span></div></div>
+      <div class="fg2"><label class="flbl2">Source IP</label><div style="color:var(--cyan);font-family:'Share Tech Mono',monospace;font-size:12px">${a.ip||'185.220.101.45'}</div></div>
+      <div class="fg2"><label class="flbl2">Attack Type</label><div style="font-family:'Share Tech Mono',monospace;font-size:11px">${a.attack||'SQL Injection'}</div></div>
+      <div class="fg2"><label class="flbl2">Rule Matched</label><div style="color:var(--amber);font-family:'Share Tech Mono',monospace;font-size:11px">${a.rule||'CRS-942100'}</div></div>
+    </div>
+    <div class="code-block">Request: GET ${a.attack?'/api/v1/login?id=1%27+UNION+SELECT+*+FROM+users':'/api/login'} HTTP/1.1\nHost: ${a.site||'dvwa.local'}\nUser-Agent: sqlmap/1.7.12\n\nAnomaly Score: ${a.score||24}/50  Action: ${a.action||'BLOCKED'}\nML Payload Score: 0.94  Anomaly Score: 0.88\nMatched rules: CRS-942100, CRS-942200\nTriggered at: Phase 1 (request_headers)</div>
+    <div class="fg2"><label class="flbl2">AI Analysis</label><div class="code-block" style="color:var(--text2);line-height:1.6">🤖 SQL injection via UNION SELECT on /api/login. Source IP 185.220.101.45\nis a known Tor exit node (listed in AbuseIPDB with 98% confidence).\nAttack pattern suggests automated scanning using sqlmap.\nRecommend: permanent blocklist entry + virtual patch on /api/login.</div></div>`;
+  document.getElementById('modalFoot').innerHTML=`<button class="btn bg" onclick="closeModal()">Close</button><button class="btn bd" onclick="closeModal();showToast('IP added to permanent blocklist','w','🚫')">🚫 Block IP</button><button class="btn bc" onclick="closeModal();showToast('AI analysis running...','i','🤖')">🤖 AI Explain</button>`;
+}
+
+// ── TRAFFIC LOG ──
+const tlSites=['dvwa.local','juice.local','api.acme.com','shop.corp.io'];
+function populateTrafficLog(){
+  const tb=document.getElementById('trafficLog');if(!tb)return;
+  const rows=Array.from({length:30},()=>{
+    const m=methods[Math.floor(Math.random()*methods.length)],
+      p=paths[Math.floor(Math.random()*paths.length)],
+      ip=ips[Math.floor(Math.random()*ips.length)],
+      st=statuses[Math.floor(Math.random()*statuses.length)],
+      gn=Math.floor(Math.random()*14)+1,
+      lat=(Math.random()*.9+.1).toFixed(2),
+      sc=st===403?Math.floor(Math.random()*30+5):Math.floor(Math.random()*3),
+      site=tlSites[Math.floor(Math.random()*tlSites.length)],
+      h=String(Math.floor(Math.random()*2+8)).padStart(2,'0'),
+      min=String(Math.floor(Math.random()*60)).padStart(2,'0'),
+      s=String(Math.floor(Math.random()*60)).padStart(2,'0');
+    const mc=m==='GET'?'get':m==='POST'?'post':m==='PUT'?'put':'del';
+    const sc2=st===403?'s5':st>=400?'s4':st>=300?'s3':'s2';
+    return `<tr><td class="td3">${h}:${min}:${s}</td><td style="color:var(--text2);font-size:10px">${site}</td><td><span class="fm2 ${mc}">${m}</span></td><td style="color:var(--cyan);max-width:180px;overflow:hidden;text-overflow:ellipsis">${p}</td><td class="td2">${ip}</td><td><span class="bdg ${st===403?'br':st>=400?'ba':'bgg'}" style="font-size:8px">${st}</span></td><td class="td3">${lat}ms</td><td style="color:${sc>10?'var(--red-b)':sc>4?'var(--amber)':'var(--green)'}">${sc}</td><td><span class="bdg ${st===403?'br':'bgr'}" style="font-size:8px">${st===403?'BLOCKED':'PASSED'}</span></td></tr>`;
+  });
+  tb.innerHTML=rows.join('');
+}
+
+// ── SETTINGS TABS ──
+function switchTab(el,group){
+  const parent=el.parentElement;
+  parent.querySelectorAll('.tab').forEach(t=>t.classList.remove('on'));
+  el.classList.add('on');
+  const idx=Array.from(parent.children).indexOf(el);
+  // find tabpanels
+  let panels;
+  if(group==='settings') panels=document.querySelectorAll('#stGeneral,#stAuth,#stAPI,#stUsers,#stCluster,#stNotif');
+  else if(group==='rules') return; // rules tabs are cosmetic for now
+  if(panels){panels.forEach(p=>p.classList.remove('on'));if(panels[idx])panels[idx].classList.add('on');}
+}
+
+function saveSettings(){showToast('Settings saved and applied','s','💾');}
+
+// ── COPILOT PAGE ──
+const aiR2={
+  explain:`**SQLi Detected** — \`/api/v1/login?id=1' UNION SELECT * FROM users\`\n\nSource: \`185.220.101.45\` — Tor Exit Node (AbuseIPDB 98%)\nRule: \`CRS-942100\` (libinjection SQLi)\nAnomaly Score: **24/50**\n\n✅ Blocked at Phase 1. IP flagged for 24h.\n\n**Recommend:** Add parameterized queries to /api/v1/login. Consider rate-limiting this endpoint to 5 req/min.`,
+  rule:`Here's a custom SRL rule to block sqlmap:\n\n\`\`\`\nrule block-sqlmap {\n  id: 9000001\n  phase: request_headers\n  target: REQUEST_HEADERS:User-Agent\n  operator: rx('/sqlmap|nikto|nmap|nuclei|masscan|dirbuster/i')\n  action: block\n  severity: high\n  msg: "Security scanner User-Agent detected"\n  tag: ["scanner","block"]\n}\n\`\`\`\n\nDeploy via: **Rules → New Rule → paste above**`,
+  report:`**24-Hour Threat Summary**\n\n🛡️ 3,204 threats blocked (0.11% of traffic)\n📊 Top vectors: SQLi 48% · XSS 27% · Path Traversal 15%\n🤖 ML identified 89 anomalies (82 confirmed, 7 FP)\n🌍 Top sources: CN, RU, TOR exits\n⚡ p99 latency: 0.9ms (WAF overhead: +0.4ms)\n\nFalse positive rate: **0.003%** ✅\nUptime: **99.97%** — SLA met`,
+  fp:`**False Positive: CRS-920420**\n\nTriggers on API clients with multiple \`Content-Type\` headers (e.g. Postman, AWS SDK).\n\n**Fix:**\n\`\`\`yaml\n# sentinel.yaml\nwaf:\n  exceptions:\n    - rule_id: 920420\n      path_prefix: /api/\n      condition: REQUEST_METHOD == POST\n\`\`\`\n\nAlternatively raise anomaly threshold for /api/ routes to 15.`,
+  patch:`**Virtual Patch Generator**\n\nShare a CVE ID and I'll generate a Sentinel SRL rule:\n\n**Example — CVE-2021-44228 (Log4Shell):**\n\`\`\`\nvirtual_patch "Log4Shell" {\n  cve: CVE-2021-44228\n  pattern: rx('/\\$\\{(j|J)(n|N)(d|D)(i|I):/i')\n  targets: [REQUEST_URI, REQUEST_BODY, REQUEST_HEADERS]\n  action: block\n}\n\`\`\`\n\nWill you share the CVE you need patched?`,
+  tune:`**ML Threshold Tuning**\n\nCurrent sensitivity: **0.85** (sensitivity)\n\nAt 0.85: 89 detections · 7 FP (7.9% FP rate)\nAt 0.90: 74 detections · 2 FP (2.7% FP rate)\nAt 0.80: 103 detections · 18 FP (17.5% FP rate)\n\n**Recommendation:** Raise to **0.90** for your traffic pattern.\nUpdate in \`sentinel.yaml\` → sites → waf → ml → sensitivity: 0.90\nOr run: \`sentinel config set waf.ml.sensitivity 0.90\``,
+};
+const aiGreet2=`Hello! I'm **Sentinel AI** — your enterprise WAF copilot powered by DeepSeek R1.\n\nI have full context of your:\n• 3,204 alerts from the last 24h\n• 5 protected sites + traffic patterns\n• 2,541 active rules (CRS v4.7 + custom)\n• ML model anomaly scores\n\nWhat would you like to investigate?`;
+
+let cop2Init=false;
+function initCopPage(){
+  if(cop2Init)return;cop2Init=true;
+  addMsg2('ai',aiGreet2,'copMsgs2','ty2');
+  document.querySelectorAll('.qbtn2').forEach(b=>{
+    b.addEventListener('click',()=>{const q=b.dataset.q2;addMsg2('usr',b.textContent,'copMsgs2','ty2');sendAI2(aiR2[q]||'Let me analyze that...','copMsgs2','ty2');});
+  });
+  document.getElementById('copSnd2').addEventListener('click',sendUsr2);
+  document.getElementById('copInp2').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendUsr2();}});
+}
+function sendUsr2(){const v=document.getElementById('copInp2').value.trim();if(!v)return;addMsg2('usr',v,'copMsgs2','ty2');document.getElementById('copInp2').value='';const l=v.toLowerCase();let r=aiR2.explain;if(l.includes('rule')||l.includes('srl'))r=aiR2.rule;else if(l.includes('report')||l.includes('summary'))r=aiR2.report;else if(l.includes('false')||l.includes('fp'))r=aiR2.fp;else if(l.includes('cve')||l.includes('patch'))r=aiR2.patch;else if(l.includes('ml')||l.includes('threshold')||l.includes('tune'))r=aiR2.tune;sendAI2(r,'copMsgs2','ty2');}
+function clearCopilot(){const m=document.getElementById('copMsgs2');if(m)m.innerHTML='';cop2Init=false;setTimeout(()=>{cop2Init=false;initCopPage();},100);}
+function newConversation(){document.querySelectorAll('.hi').forEach(h=>h.classList.remove('on'));clearCopilot();}
+
+// ── MINI COPILOT ──
+document.getElementById('cfab').addEventListener('click',()=>document.getElementById('copMini').classList.toggle('open'));
+document.getElementById('cmcl').addEventListener('click',()=>document.getElementById('copMini').classList.remove('open'));
+let miniInit=false;
+function initMiniCop(){if(miniInit)return;miniInit=true;addMsg2('ai',aiGreet2,'cmMsgs','ty3');
+  document.querySelectorAll('[data-qm]').forEach(b=>{b.addEventListener('click',()=>{const q=b.dataset.qm;addMsg2('usr',b.textContent,'cmMsgs','ty3');sendAI2(aiR2[q]||'...','cmMsgs','ty3');});});
+  document.getElementById('cmSnd').addEventListener('click',sendMini);
+  document.getElementById('cmInp').addEventListener('keydown',e=>{if(e.key==='Enter')sendMini();});
+}
+function sendMini(){const v=document.getElementById('cmInp').value.trim();if(!v)return;addMsg2('usr',v,'cmMsgs','ty3');document.getElementById('cmInp').value='';const l=v.toLowerCase();let r=aiR2.explain;if(l.includes('rule'))r=aiR2.rule;else if(l.includes('patch')||l.includes('cve'))r=aiR2.patch;sendAI2(r,'cmMsgs','ty3');}
+document.getElementById('cfab').addEventListener('click',initMiniCop);
+
+// shared msg helpers
+function addMsg2(who,text,msgsId,tyId){
+  const container=document.getElementById(msgsId);if(!container)return;
+  const t=new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+  const d=document.createElement('div');d.className=`msg2 ${who}`;
+  d.innerHTML=`<div class="mav2 ${who}">${who==='ai'?'🤖':'👤'}</div><div><div class="mbbl2">${text.replace(/\n/g,'<br>').replace(/\*\*(.*?)\*\*/g,'<strong>$1</strong>').replace(/\`(.*?)\`/g,'<code style="background:rgba(255,255,255,.08);padding:1px 4px;border-radius:3px;font-size:10px">$1</code>').replace(/```([\s\S]*?)```/g,'<pre style="background:rgba(0,0,0,.35);padding:8px;border-radius:6px;font-size:10px;margin:5px 0;overflow-x:auto;white-space:pre-wrap">$1</pre>')}</div><div class="mt3">${t}</div></div>`;
+  container.appendChild(d);container.scrollTop=container.scrollHeight;
+}
+function sendAI2(r,msgsId,tyId){
+  const ty=document.getElementById(tyId);if(ty){ty.classList.add('show');}
+  const container=document.getElementById(msgsId);if(container)container.scrollTop=container.scrollHeight;
+  setTimeout(()=>{if(ty)ty.classList.remove('show');addMsg2('ai',r,msgsId,tyId);},900+Math.random()*700);
+}
+
+// ── KPI ANIMATION (chart only — real KPIs come from pollMetrics) ──
+let reqS=2147;
+function updateMetrics(){
+  reqData.push(reqS);reqData.shift();
+  if(document.getElementById('sec-traffic')&&document.getElementById('sec-traffic').classList.contains('on')) drawReqChart();
+  ['juice','dvwa'].forEach(s=>{const el=document.getElementById('sr-'+s);if(el)el.textContent=Math.floor(reqS*0.4+Math.random()*80);});
+}
+setInterval(updateMetrics,1200);
+
+// ── TICKER ──
+const ticks=[
+  {sev:'tc2',sl:'CRITICAL',msg:'SQLi attack blocked · 185.220.101.45 → /api/login · Rule CRS-942100 · Score: 24/50'},
+  {sev:'th2',sl:'HIGH',msg:'XSS attempt detected · 103.24.8.122 → /search?q=<script> · Payload sanitised'},
+  {sev:'tc2',sl:'CRITICAL',msg:'Log4Shell probe blocked · CVE-2021-44228 · Virtual patch applied · 198.235.24.130'},
+  {sev:'th2',sl:'HIGH',msg:'Path traversal blocked · 91.240.118.150 → /../../etc/passwd · Rule CRS-930100'},
+  {sev:'tm2',sl:'MEDIUM',msg:'Rate limit exceeded · 10.0.0.45 → 5,200 req/min · Auto-banned 300s'},
+  {sev:'tl2',sl:'INFO',msg:'New API endpoint discovered · /api/v2/users · ML profile updated · Learning mode'},
+  {sev:'tc2',sl:'CRITICAL',msg:'BotNet C2 traffic detected · JA4: t13d1516h2 · 450 IPs blocked via eBPF'},
+  {sev:'th2',sl:'HIGH',msg:'Command injection blocked · 45.33.32.156 → /cmd?exec · Rule CRS-932100'},
+];
+(function buildTick(){
+  const inner=document.getElementById('tkInner');if(!inner)return;
+  const r=()=>ticks.map(t=>`<span class="ti2"><span class="tsev2 ${t.sev}">${t.sl}</span>${t.msg}<span style="color:var(--text3);margin:0 4px">◆</span></span>`).join('');
+  inner.innerHTML=r()+r();
+})();
+
+// ── HELPERS ──
+function editSite(id){openModal('addSite');setTimeout(()=>{showToast('Editing site: '+id,'i','✏️');},100);}
+function viewSiteTraffic(id){nav('traffic');showToast('Filtering by '+id,'i','📊');}
+function copilotAbout(domain){nav('copilot');setTimeout(()=>{initCopPage();addMsg2('usr','Analyze recent alerts for '+domain,'copMsgs2','ty2');sendAI2(aiR2.explain,'copMsgs2','ty2');},200);}
+function filterSites(v){}
+function filterSiteMode(v){}
+function runTestModal(){const el=document.getElementById('testResult');if(el)el.textContent='▶ Testing...\n✗ BLOCKED — CRS-942100: SQL Injection (score: 15/50)\n✓ PASSED — ML Payload Classifier: 0.91 (above threshold 0.85)\nResponse: HTTP 403 Forbidden';}
+
+// ── INIT ──
+setTimeout(()=>{
+  initCharts();
+  populateRules();
+  populateAlerts();
+  // add initial feed rows
+  for(let i=0;i<12;i++) addFeedRow();
+},2200);
+
+// Clock
+setInterval(()=>{ const d=document.getElementById('lastUpd'); if(d) d.textContent='just now'; },5000);
+
+// global search
+document.getElementById('gSearch').addEventListener('input',function(){
+  if(this.value.length>2) showToast(`Searching for "${this.value}"...`,'i','🔍');
+});
+
+document.addEventListener('keydown',e=>{
+  if(e.key==='Escape') closeModal();
+});
+
+// ══════════════════════════════════════
+//   API LAYER + REAL DATA WIRING
+// ══════════════════════════════════════
+
+const API_BASE = '';
+let _token = localStorage.getItem('sentinel_access_token') || '';
+if (!_token) { window.location.href = '/login'; }
+
+async function apiFetch(path, opts = {}) {
+  const r = await fetch(API_BASE + path, {
+    ...opts,
+    headers: { 'Authorization': 'Bearer ' + _token, 'Content-Type': 'application/json', ...(opts.headers||{}) }
+  });
+  if (r.status === 401) {
+    localStorage.removeItem('sentinel_access_token');
+    window.location.href = '/login';
+    throw new Error('Unauthorized');
+  }
+  return r.json();
+}
+
+// ── AUTH ──────────────────────────────────────────────────────────────────
+function logout() {
+  localStorage.removeItem('sentinel_access_token');
+  localStorage.removeItem('sentinel_user');
+  window.location.href = '/login';
+}
+
+// Show real user from stored profile
+(function(){
+  const _user = JSON.parse(localStorage.getItem('sentinel_user')||'{}');
+  if (_user.email) {
+    const un = document.querySelector('.uname');
+    const ur = document.querySelector('.urole');
+    if(un) un.textContent = _user.email.split('@')[0];
+    if(ur) ur.textContent = (_user.role||'user').toUpperCase();
+  }
+})();
+
+// ── REAL METRICS ──────────────────────────────────────────────────────────
+async function pollMetrics() {
+  try {
+    const snap = await apiFetch('/api/v1/metrics/snapshot');
+    // Drive chart data with scaled RPS value
+    reqS = Math.max(50, snap.rps * 350);
+    const rs = Math.round(snap.rps);
+    const rsDisp = rs >= 1000 ? `${(rs/1000).toFixed(1)}k` : rs;
+    document.getElementById('k2').textContent = rsDisp;
+    document.getElementById('tbReqS').textContent = rsDisp;
+    document.getElementById('k1').textContent = (snap.blocked_requests||0).toLocaleString();
+    document.getElementById('k1d').textContent = `+${Math.round(snap.rps||0)}/s · live`;
+    const lat = (snap.p99_latency_ms||0).toFixed(1);
+    document.getElementById('k2p').textContent = lat;
+    document.getElementById('tbP99').textContent = lat;
+    document.getElementById('k5').textContent = (snap.ebpf_drops||0).toLocaleString();
+    const cc = document.getElementById('logClients');
+    if(cc) cc.textContent = snap.connected_clients || 0;
+  } catch(e) {}
+}
+setInterval(pollMetrics, 2000);
+
+// ── DASHBOARD STATS ───────────────────────────────────────────────────────
+async function fetchDashboardStats() {
+  try {
+    const data = await apiFetch('/api/v1/dashboard/stats');
+    if (!data || !data.stats) return;
+    const s = data.stats;
+    if (s.alert_count !== undefined) {
+      document.getElementById('alertBadge').textContent = s.alert_count;
+      document.getElementById('sbAlertBadge').textContent = s.alert_count;
+      const ac = document.getElementById('alertCount');
+      if(ac) ac.textContent = s.alert_count;
+    }
+  } catch(e) {}
+}
+
+// ── REAL SITES ────────────────────────────────────────────────────────────
+async function fetchSites() {
+  try {
+    const data = await apiFetch('/api/v1/sites');
+    if (!data || !data.sites || !data.sites.length) return;
+    const tbody = document.querySelector('#sitesTable tbody');
+    if (!tbody) return;
+    tbody.innerHTML = data.sites.map(s => {
+      const mode = (s.mode||'LEARNING').toUpperCase();
+      const modeClass = mode==='BLOCKING'?'br':mode==='LEARNING'?'ba blink':'bgr';
+      const sdClass = mode==='OFFLINE'?'gr':'g';
+      return `<tr>
+        <td><div style="display:flex;align-items:center;gap:6px"><div class="sd ${sdClass}"></div></div></td>
+        <td><span style="color:var(--cyan)">${s.id||s.site_id||''}</span></td>
+        <td>${s.domain||''}</td>
+        <td class="td2">${s.upstream||''}</td>
+        <td><span class="bdg ${modeClass}"><span class="bdr"></span>${mode}</span></td>
+        <td class="td2">${s.rule_count||0}</td>
+        <td class="td2">${s.rps||'—'}</td>
+        <td class="td2">${s.block_pct||'0%'}</td>
+        <td><div style="display:flex;gap:4px">
+          <button class="btn bg btn-xs" onclick="editSite('${s.id||''}')">✏️</button>
+          <button class="btn bg btn-xs">🤖</button>
+          <button class="btn bg btn-xs">📊</button>
+        </div></td>
+      </tr>`;
+    }).join('');
+  } catch(e) {}
+}
+
+// ── REAL RULES ────────────────────────────────────────────────────────────
+async function fetchRules() {
+  try {
+    const data = await apiFetch('/api/v1/rules');
+    if (!data || !data.rules || !data.rules.length) return;
+    const tbody = document.getElementById('rulesBody');
+    if (!tbody) return;
+    tbody.innerHTML = data.rules.map(r => {
+      const sev = (r.severity||r.sev||'MEDIUM').toUpperCase();
+      const sevCls = sev==='CRITICAL'?'br':sev==='HIGH'?'ba':'bcy';
+      return `<tr onclick="loadRule('${r.id}')">
+        <td><div class="tog ${r.enabled?'on':''}" onclick="event.stopPropagation();this.classList.toggle('on');showToast('Rule '+(this.classList.contains('on')?'enabled':'disabled'),'i','📋')"></div></td>
+        <td style="color:var(--cyan);font-size:10px">${r.id}</td>
+        <td>${r.description||r.desc||''}</td>
+        <td><span class="bdg bgr" style="font-size:8px">${r.category||r.cat||''}</span></td>
+        <td class="td3">${r.phase||''}</td>
+        <td><span class="bdg ${sevCls}">${sev}</span></td>
+      </tr>`;
+    }).join('');
+  } catch(e) {}
+}
+
+// ── REAL ALERTS ───────────────────────────────────────────────────────────
+async function fetchAlerts() {
+  try {
+    const data = await apiFetch('/api/v1/alerts');
+    if (!data || !data.alerts || !data.alerts.length) return;
+    const tbody = document.getElementById('alertsBody');
+    if (!tbody) return;
+    const sevClass = {CRITICAL:'br',HIGH:'ba',MEDIUM:'bcy',LOW:'bgg'};
+    tbody.innerHTML = data.alerts.map(a => {
+      const sev = (a.severity||a.sev||'LOW').toUpperCase();
+      const act = (a.action||'BLOCKED').toUpperCase();
+      const sta = (a.status||'open').toLowerCase();
+      const aid = a.id||a.alert_id||a.ID||'';
+      return `<tr class="sev-${sev[0].toLowerCase()}" onclick="showAlertDetail(${JSON.stringify(a)})">
+        <td><input type="checkbox" style="accent-color:var(--red)"></td>
+        <td><span class="bdg ${sevClass[sev]||'bgr'} ${sev==='CRITICAL'?'blink':''}">${sev}</span></td>
+        <td class="td3">${(a.time||a.ts||'').toString().slice(11,19)||''}</td>
+        <td style="color:var(--cyan)">${a.ip||a.source_ip||''}</td>
+        <td class="td2">${a.site||''}</td>
+        <td>${a.attack||a.attack_type||''}</td>
+        <td class="td3">${a.rule||a.rule_id||''}</td>
+        <td style="color:${(a.score||0)>=20?'var(--red-b)':(a.score||0)>=10?'var(--amber)':'var(--cyan)'};font-weight:700">${a.score||0}/50</td>
+        <td><span class="bdg ${act==='BLOCKED'?'br':act==='LOGGED'?'bgr':'ba'}">${act}</span></td>
+        <td><span class="bdg ${sta==='open'?'br blink':'bgr'}">${sta.toUpperCase()}</span></td>
+        <td><div style="display:flex;gap:4px">
+          <button class="btn bgn btn-xs" onclick="event.stopPropagation();ackAlert('${aid}')">✅ Ack</button>
+          <button class="btn bg btn-xs" onclick="event.stopPropagation();resolveAlert('${aid}')">✓ Resolve</button>
+        </div></td>
+      </tr>`;
+    }).join('');
+  } catch(e) {}
+}
+
+async function ackAlert(id) {
+  if (!id||id==='undefined') return;
+  try { await apiFetch('/api/v1/alerts/'+id+'/ack',{method:'POST'}); fetchAlerts(); showToast('Alert acknowledged','s','✅'); } catch(e) {}
+}
+async function resolveAlert(id) {
+  if (!id||id==='undefined') return;
+  try { await apiFetch('/api/v1/alerts/'+id+'/resolve',{method:'POST'}); fetchAlerts(); showToast('Alert resolved','s','✅'); } catch(e) {}
+}
+
+// ══════════════════════════════════════
+//   LOGS SSE STREAM
+// ══════════════════════════════════════
+let _logES = null;
+let _logPaused = false;
+let _kindFilter = '';
+const MAX_LOG_ROWS = 400;
+
+function initLogStream() {
+  if (_logES) { _logES.close(); _logES = null; }
+  const url = '/api/v1/logs/stream?token=' + _token + (_kindFilter ? '&kind=' + _kindFilter : '');
+  _logES = new EventSource(url);
+  _logES.onmessage = e => {
+    if (_logPaused) return;
+    try { const entry = JSON.parse(e.data); addLogRow(entry); } catch(_) {}
+  };
+  _logES.onerror = () => {
+    const b = document.getElementById('logConnBadge');
+    if(b) b.textContent = 'ERR';
+  };
+  _logES.onopen = () => {
+    const b = document.getElementById('logConnBadge');
+    if(b) b.textContent = 'LIVE';
+  };
+}
+
+function addLogRow(entry) {
+  const tbody = document.getElementById('logTableBody');
+  if (!tbody) return;
+  const d = entry.data || {};
+  const now = d.ts ? d.ts.toString().slice(11,19) : new Date().toTimeString().slice(0,8);
+  let details = '', action = '', borderColor = '';
+  if (entry.kind === 'access') {
+    details = (d.method||'GET') + ' ' + (d.path||'/') + ' → ' + (d.status||200) + ' ' + (d.latency!==undefined?d.latency.toString().slice(0,5):'?') + 's';
+    action = d.status >= 400 ? 'BLOCK' : 'PASS';
+    borderColor = d.status >= 500 ? 'var(--red-b)' : d.status >= 400 ? 'var(--amber)' : '';
+  } else if (entry.kind === 'waf') {
+    details = (d.attack||'?').toUpperCase() + ' · ' + (d.rule_id||'') + ' · ' + (d.msg||'').slice(0,50);
+    action = d.action || 'BLOCKED';
+    borderColor = d.action === 'BLOCKED' ? 'var(--red-b)' : 'var(--green)';
+  } else if (entry.kind === 'error') {
+    details = '[' + (d.lvl||'?') + '] ' + (d.msg||'').slice(0,70);
+    action = d.lvl || '-';
+    borderColor = 'var(--amber)';
+  } else if (entry.kind === 'ml') {
+    details = (d.model||'ml') + ' · score:' + (d.score||0) + ' · ' + (d.label||'');
+    action = d.verdict || '-';
+    borderColor = d.verdict && d.verdict !== 'BENIGN' ? 'var(--purple)' : '';
+  } else if (entry.kind === 'audit') {
+    details = (d.user||'system') + ' · ' + (d.action||'?') + ' · ' + (d.resource||'');
+    action = d.result || '-';
+    borderColor = 'var(--cyan)';
+  } else if (entry.kind === 'modsec') {
+    details = 'Rule ' + (d.rule_id||'?') + ' · ' + (d.msg||'').slice(0,50);
+    action = d.action || 'BLOCKED';
+    borderColor = 'var(--red-b)';
+  }
+  const search = (document.getElementById('logSearch')||{}).value||'';
+  if (search && !JSON.stringify(d).toLowerCase().includes(search.toLowerCase())) return;
+  const kindColors = {access:'var(--cyan)',waf:'var(--red-b)',error:'var(--amber)',ml:'var(--purple)',audit:'var(--cyan)',modsec:'var(--red-b)'};
+  const tr = document.createElement('tr');
+  tr.style.cssText = 'border-bottom:1px solid rgba(255,255,255,.04);cursor:pointer;' + (borderColor ? 'border-left:3px solid ' + borderColor + ';' : '');
+  tr.innerHTML = `
+    <td style="padding:6px 12px;font-size:10px;color:var(--text3);font-family:'Share Tech Mono',monospace;white-space:nowrap">${now}</td>
+    <td style="padding:6px 8px"><span style="font-size:8px;padding:1px 7px;border-radius:10px;font-weight:700;font-family:'Share Tech Mono',monospace;background:rgba(255,255,255,.06);color:${kindColors[entry.kind]||'var(--text2)'};border:1px solid rgba(255,255,255,.1)">${entry.kind.toUpperCase()}</span></td>
+    <td style="padding:6px 8px;font-size:10px;color:var(--cyan);font-family:'Share Tech Mono',monospace;white-space:nowrap">${((d.ip||d.user||'internal')+'').slice(0,16)}</td>
+    <td style="padding:6px 8px;font-size:10px;color:var(--text);font-family:'Share Tech Mono',monospace;max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${details}</td>
+    <td style="padding:6px 8px"><span style="font-size:8px;padding:2px 8px;border-radius:10px;font-family:'Share Tech Mono',monospace;font-weight:700;background:${action==='BLOCKED'||action==='BLOCK'?'rgba(200,0,30,.18)':action==='PASS'||action==='SUCCESS'?'rgba(0,200,122,.14)':'rgba(255,255,255,.06)'};color:${action==='BLOCKED'||action==='BLOCK'?'var(--red-b)':action==='PASS'||action==='SUCCESS'?'var(--green)':'var(--text2)'};border:1px solid rgba(255,255,255,.1)">${action}</span></td>
+  `;
+  tr.onclick = () => showRawLogModal(entry);
+  tbody.insertBefore(tr, tbody.firstChild);
+  while (tbody.children.length > MAX_LOG_ROWS) tbody.removeChild(tbody.lastChild);
+}
+
+function showRawLogModal(entry) {
+  document.getElementById('modalTitle').innerHTML = '📜 Log Entry · ' + entry.kind.toUpperCase();
+  document.getElementById('modalBody').innerHTML = `<div class="code-block" style="white-space:pre-wrap;word-break:break-all;color:var(--cyan)">${JSON.stringify(entry.data, null, 2)}</div>`;
+  document.getElementById('modalFoot').innerHTML = '<button class="btn bg" onclick="closeModal()">Close</button>';
+  document.getElementById('modalBg').classList.add('open');
+}
+
+function togglePause() {
+  _logPaused = !_logPaused;
+  const btn = document.getElementById('pauseBtn');
+  if(btn) btn.textContent = _logPaused ? '▶ Resume' : '⏸ Pause';
+}
+
+function clearLogs() {
+  const t = document.getElementById('logTableBody');
+  if(t) t.innerHTML = '';
+}
+
+function setLogKind(kind) {
+  _kindFilter = kind;
+  document.querySelectorAll('.log-kind-tab').forEach(b => b.classList.toggle('on', b.dataset.kind === kind));
+  if (_logES) initLogStream();
+}
+</script>
+</body>
+</html>

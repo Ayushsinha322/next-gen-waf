@@ -4,7 +4,7 @@ use aho_corasick::AhoCorasick;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::dsl::ast::{RuleAction, RulePhase, RuleSeverity, Target};
+use crate::dsl::ast::{RuleAction, RulePhase, RuleSeverity, Target, Transform};
 
 // ---------------------------------------------------------------------------
 // Target specification stored in instructions
@@ -99,6 +99,9 @@ pub enum Instruction {
     Or,
     Not,
 
+    /// Pop `StrVec`, apply each transform in order, push transformed `StrVec`.
+    ApplyTransforms(Vec<Transform>),
+
     /// Jump `offset` instructions forward if stack top is Bool(false).
     /// Does NOT pop the stack.
     JmpIfFalse { offset: i32 },
@@ -106,6 +109,11 @@ pub enum Instruction {
     /// Pop Bool from stack.  If true, apply the rule's action/score/log.
     /// The rule metadata is looked up by `rule_id` in `CompiledRuleSet::rule_meta`.
     RuleEnd { rule_id: u32 },
+
+    /// Named label emitted for each `SecMarker` directive.
+    /// Acts as a no-op at runtime; `skipAfter` rules jump to the first
+    /// `Marker` whose name matches their `skip_after` field.
+    Marker(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -121,6 +129,9 @@ pub struct RuleMeta {
     pub action: RuleAction,
     pub tags: Vec<String>,
     pub phase: RulePhase,
+    /// CRS `skipAfter:MARKER` — if this rule fires, the VM jumps forward
+    /// to the `Marker` instruction with this name, skipping all rules in between.
+    pub skip_after: Option<String>,
 }
 
 impl Default for RuleMeta {
@@ -133,6 +144,7 @@ impl Default for RuleMeta {
             action: RuleAction::Log,
             tags: Vec::new(),
             phase: RulePhase::RequestBody,
+            skip_after: None,
         }
     }
 }

@@ -16,8 +16,6 @@ package db
 
 import (
 	"context"
-	"errors"
-	"fmt"
 )
 
 // Config holds DB connection settings.
@@ -58,12 +56,4 @@ type Row interface {
 	Scan(dest ...any) error
 }
 
-// Open dials Postgres (or SQLite in dev mode) and returns a Pool.
-// Implementation lives in pgx.go / sqlite.go.
-func Open(ctx context.Context, cfg Config) (Pool, error) {
-	if cfg.URL == "" {
-		return nil, errors.New("db: empty connection URL")
-	}
-	// TODO: detect scheme; route to pgx or sqlite implementation.
-	return nil, fmt.Errorf("db: not implemented yet — see internal/db/pgx.go")
-}
+

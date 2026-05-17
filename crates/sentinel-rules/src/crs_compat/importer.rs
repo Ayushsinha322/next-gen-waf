@@ -234,6 +234,8 @@ fn secrule_directive_to_rule_with_actions(
         action: rule_action,
         tags: actions.tags.clone(),
         chain_conditions: Vec::new(),
+        transforms: actions.transforms.clone(),
+        skip_after: actions.skip_after.clone(),
     }))
 }
 

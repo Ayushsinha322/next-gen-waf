@@ -2,7 +2,7 @@ use sentinel_core::context::{Phase, RequestContext, RuleMatch, Severity, WafDeci
 use tracing::{debug, warn};
 
 use super::emitter::{CompiledRuleSet, Instruction, RuleMeta, TargetSpec};
-use crate::dsl::ast::{RuleAction, RulePhase, RuleSeverity};
+use crate::dsl::ast::{RuleAction, RulePhase, RuleSeverity, Transform};
 
 fn rule_phase_to_phase(rp: RulePhase) -> Phase {
     match rp {
@@ -247,6 +247,15 @@ pub fn evaluate(ruleset: &CompiledRuleSet, ctx: &mut RequestContext, phase: Phas
                 stack.push(StackVal::Bool(false));
             }
 
+            Instruction::ApplyTransforms(transforms) => {
+                let values = pop_strings(&mut stack);
+                let transformed: Vec<String> = values
+                    .into_iter()
+                    .map(|s| apply_transforms(s, transforms))
+                    .collect();
+                stack.push(StackVal::Strings(transformed));
+            }
+
             Instruction::LoadAnomalyScore => {
                 stack.push(StackVal::Int(ctx.anomaly_score as i64));
             }
@@ -303,10 +312,24 @@ pub fn evaluate(ruleset: &CompiledRuleSet, ctx: &mut RequestContext, phase: Phas
                 if fired {
                     if let Some(meta) = ruleset.rule_meta.get(rule_id) {
                         fire_rule(ctx, meta);
+                        // skipAfter: scan forward for the named Marker and jump to it.
+                        // ip += 1 at loop end then steps past the Marker (which is a no-op).
+                        if let Some(marker) = &meta.skip_after {
+                            let search_from = ip + 1;
+                            if let Some(rel) = program[search_from..].iter().position(|instr| {
+                                if let Instruction::Marker(m) = instr { m == marker } else { false }
+                            }) {
+                                ip = search_from + rel;
+                            }
+                        }
                     } else {
                         warn!(rule_id, "RuleEnd: no metadata found for rule");
                     }
                 }
+            }
+
+            Instruction::Marker(_) => {
+                // Named label — no-op at runtime; used as a skip target.
             }
         }
         ip += 1;
@@ -363,6 +386,163 @@ fn fire_rule(ctx: &mut RequestContext, meta: &RuleMeta) {
         score_delta = meta.score_delta,
         "rule fired"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Transform helpers
+// ---------------------------------------------------------------------------
+
+fn apply_transforms(mut s: String, transforms: &[Transform]) -> String {
+    for t in transforms {
+        s = match t {
+            Transform::Lowercase => s.to_ascii_lowercase(),
+            Transform::UrlDecodeUni => percent_decode(&s),
+            Transform::RemoveNulls => s.replace('\0', ""),
+            Transform::ReplaceNulls => s.replace('\0', " "),
+            Transform::HtmlEntityDecode => decode_html_entities(s),
+            Transform::RemoveWhitespace => s.chars().filter(|c| !c.is_ascii_whitespace()).collect(),
+            Transform::CompressWhitespace => compress_whitespace(s),
+            Transform::JsDecode => decode_js_escapes(s),
+            Transform::CssDecode => decode_css_escapes(s),
+        };
+    }
+    s
+}
+
+fn decode_html_entities(s: String) -> String {
+    if !s.contains('&') {
+        return s;
+    }
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#x27;", "'")
+        .replace("&#39;", "'")
+        .replace("&#x2F;", "/")
+        .replace("&#47;", "/")
+        .replace("&#x3C;", "<")
+        .replace("&#60;", "<")
+        .replace("&#x3E;", ">")
+        .replace("&#62;", ">")
+}
+
+fn compress_whitespace(s: String) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for c in s.chars() {
+        if c.is_ascii_whitespace() {
+            if !prev_space {
+                out.push(' ');
+            }
+            prev_space = true;
+        } else {
+            out.push(c);
+            prev_space = false;
+        }
+    }
+    out
+}
+
+fn decode_js_escapes(s: String) -> String {
+    if !s.contains('\\') {
+        return s;
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek().copied() {
+            Some('u') => {
+                chars.next();
+                let hex: String = chars.by_ref().take(4).collect();
+                if hex.len() == 4 {
+                    if let Ok(n) = u32::from_str_radix(&hex, 16) {
+                        if let Some(ch) = char::from_u32(n) {
+                            out.push(ch);
+                            continue;
+                        }
+                    }
+                }
+                out.push('\\');
+                out.push('u');
+                out.push_str(&hex);
+            }
+            Some('x') => {
+                chars.next();
+                let hex: String = chars.by_ref().take(2).collect();
+                if hex.len() == 2 {
+                    if let Ok(n) = u32::from_str_radix(&hex, 16) {
+                        if let Some(ch) = char::from_u32(n) {
+                            out.push(ch);
+                            continue;
+                        }
+                    }
+                }
+                out.push('\\');
+                out.push('x');
+                out.push_str(&hex);
+            }
+            Some('n') => { chars.next(); out.push('\n'); }
+            Some('r') => { chars.next(); out.push('\r'); }
+            Some('t') => { chars.next(); out.push('\t'); }
+            Some('\\') => { chars.next(); out.push('\\'); }
+            _ => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Decode CSS hex escape sequences: `\NNNNNN` (1-6 hex digits) optionally
+/// followed by a single whitespace character or semicolon.
+///
+/// Examples: `\0041` → `A`, `\26 ` → `&`, `\000026;` → `&`.
+fn decode_css_escapes(s: String) -> String {
+    if !s.contains('\\') {
+        return s;
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        // Collect up to 6 hex digits.
+        let mut hex = String::new();
+        while hex.len() < 6 {
+            match chars.peek() {
+                Some(&h) if h.is_ascii_hexdigit() => { hex.push(h); chars.next(); }
+                _ => break,
+            }
+        }
+        if hex.is_empty() {
+            // Not a hex escape — treat backslash literally.
+            out.push('\\');
+            continue;
+        }
+        // Consume optional trailing whitespace/semicolon (one char only).
+        match chars.peek() {
+            Some(&' ') | Some(&'\t') | Some(&'\n') | Some(&'\r') | Some(&'\x0C') | Some(&';') => {
+                chars.next();
+            }
+            _ => {}
+        }
+        if let Ok(n) = u32::from_str_radix(&hex, 16) {
+            if let Some(ch) = char::from_u32(n) {
+                out.push(ch);
+                continue;
+            }
+        }
+        // Invalid codepoint — emit the escape literally.
+        out.push('\\');
+        out.push_str(&hex);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------

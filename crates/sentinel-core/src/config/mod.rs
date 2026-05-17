@@ -118,6 +118,10 @@ pub struct ListenerConfig {
     pub bind: String,
     pub protocol: ProtocolSpec,
     pub tls: Option<TlsFileConfig>,
+    /// When set, requests that don't match any site by Host header are routed
+    /// to this site ID — enables port-based routing (e.g. :9095 → dvwa).
+    #[serde(default)]
+    pub default_site: Option<String>,
 }
 
 impl ListenerConfig {
@@ -528,6 +532,21 @@ pub struct LogRotateConfig {
 pub struct StorageConfig {
     pub cache: Option<CacheConfig>,
     pub kv: Option<KvConfig>,
+    pub timeseries: Option<TimeSeriesConfig>,
+}
+
+/// ClickHouse connection for traffic-history persistence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimeSeriesConfig {
+    /// HTTP endpoint, e.g. `http://127.0.0.1:8123`.
+    pub url: String,
+    /// Database name (default: `sentinel`).
+    #[serde(default = "default_ts_database")]
+    pub database: String,
+}
+
+fn default_ts_database() -> String {
+    "sentinel".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -553,7 +572,7 @@ pub struct KvConfig {
     pub url: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum KvBackend {
     #[default]

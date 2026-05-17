@@ -37,6 +37,12 @@ pub struct RuleDef {
     /// All chain conditions must match for the rule to fire.
     #[serde(default)]
     pub chain_conditions: Vec<ChainCondition>,
+    /// Transformations applied to target values before operator matching.
+    #[serde(default)]
+    pub transforms: Vec<Transform>,
+    /// CRS `skipAfter:MARKER` — if this rule fires, skip to the named SecMarker.
+    #[serde(default)]
+    pub skip_after: Option<String>,
 }
 
 /// A single chained condition from a CRS `chain` SecRule.
@@ -59,6 +65,8 @@ impl Default for RuleDef {
             action: RuleAction::Log,
             tags: Vec::new(),
             chain_conditions: Vec::new(),
+            transforms: Vec::new(),
+            skip_after: None,
         }
     }
 }
@@ -113,6 +121,25 @@ pub enum Target {
     Geo,
     TxVar(String),
     CountOf(Box<Target>),
+}
+
+// ---------------------------------------------------------------------------
+// Transforms
+// ---------------------------------------------------------------------------
+
+/// Input transformations applied to target values before operator matching.
+/// Applied in declaration order; `t:none` resets the list (handled by the importer).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Transform {
+    Lowercase,
+    UrlDecodeUni,
+    RemoveNulls,
+    ReplaceNulls,
+    HtmlEntityDecode,
+    RemoveWhitespace,
+    CompressWhitespace,
+    JsDecode,
+    CssDecode,
 }
 
 // ---------------------------------------------------------------------------

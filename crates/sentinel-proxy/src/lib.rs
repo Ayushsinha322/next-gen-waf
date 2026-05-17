@@ -28,9 +28,9 @@ use anyhow::{anyhow, Context};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use http::{header, Request, Response, StatusCode, Uri};
-use http_body_util::{BodyExt, Empty, Full};
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
-use hyper_util::client::legacy::{connect::HttpConnector, Client};
+use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rustls::ServerConfig;
 use sentinel_core::{
@@ -411,6 +411,8 @@ async fn serve_listener(
         None
     };
 
+    let default_site = cfg.default_site.clone();
+
     loop {
         tokio::select! {
             accept = tcp.accept() => {
@@ -418,8 +420,9 @@ async fn serve_listener(
                 let state = Arc::clone(&state);
                 let acceptor = tls_acceptor.clone();
                 let protos = cfg.protocols();
+                let ds = default_site.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, peer, acceptor, protos, state).await {
+                    if let Err(e) = handle_connection(stream, peer, acceptor, protos, state, ds).await {
                         debug!(peer = %peer, "connection error: {e}");
                     }
                 });
@@ -443,6 +446,7 @@ async fn handle_connection(
     tls_acceptor: Option<TlsAcceptor>,
     protocols: Vec<Protocol>,
     state: Arc<ServerState>,
+    default_site: Option<String>,
 ) -> anyhow::Result<()> {
     stream.set_nodelay(true)?;
 
@@ -456,16 +460,16 @@ async fn handle_connection(
         let io = TokioIo::new(tls);
 
         if negotiated.as_deref() == Some(b"h2") {
-            serve_http2(io, peer, state).await
+            serve_http2(io, peer, state, default_site).await
         } else {
-            serve_http1(io, peer, state).await
+            serve_http1(io, peer, state, default_site).await
         }
     } else {
         let io = TokioIo::new(stream);
         if protocols.contains(&Protocol::Http2) && !protocols.contains(&Protocol::Http1) {
-            serve_http2(io, peer, state).await
+            serve_http2(io, peer, state, default_site).await
         } else {
-            serve_http1(io, peer, state).await
+            serve_http1(io, peer, state, default_site).await
         }
     }
 }
@@ -474,6 +478,7 @@ async fn serve_http1<T>(
     io: TokioIo<T>,
     peer: SocketAddr,
     state: Arc<ServerState>,
+    default_site: Option<String>,
 ) -> anyhow::Result<()>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -483,7 +488,8 @@ where
             io,
             hyper::service::service_fn(move |req| {
                 let s = Arc::clone(&state);
-                async move { handle_request(s, peer, req).await }
+                let ds = default_site.clone();
+                async move { handle_request(s, peer, req, ds).await }
             }),
         )
         .with_upgrades()
@@ -495,6 +501,7 @@ async fn serve_http2<T>(
     io: TokioIo<T>,
     peer: SocketAddr,
     state: Arc<ServerState>,
+    default_site: Option<String>,
 ) -> anyhow::Result<()>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -504,7 +511,8 @@ where
             io,
             hyper::service::service_fn(move |req| {
                 let s = Arc::clone(&state);
-                async move { handle_request(s, peer, req).await }
+                let ds = default_site.clone();
+                async move { handle_request(s, peer, req, ds).await }
             }),
         )
         .await
@@ -519,8 +527,9 @@ async fn handle_request(
     state: Arc<ServerState>,
     peer: SocketAddr,
     req: Request<Incoming>,
+    default_site: Option<String>,
 ) -> Result<Response<BoxBody>, Infallible> {
-    match proxy(state, peer, req).await {
+    match proxy(state, peer, req, default_site).await {
         Ok(resp) => Ok(resp),
         Err(e) => {
             error!("proxy error: {e:#}");
@@ -533,6 +542,7 @@ async fn proxy(
     state: Arc<ServerState>,
     peer: SocketAddr,
     req: Request<Incoming>,
+    default_site: Option<String>,
 ) -> anyhow::Result<Response<BoxBody>> {
     let cfg = state.config.load();
     let engine_map = state.engines.load_full();
@@ -583,11 +593,17 @@ async fn proxy(
     ctx.uri = parts.uri.clone();
     ctx.request_headers = parts.headers.clone();
 
-    // Match site by Host header.
+    // Match site by Host header; fall back to the listener's default_site for
+    // port-based routing (e.g. requests arriving on :9095 always go to dvwa).
     let host = ctx.host().map(str::to_owned);
     let site = host
         .as_deref()
-        .and_then(|h| cfg.sites.iter().find(|s| site_matches(s, h)));
+        .and_then(|h| cfg.sites.iter().find(|s| site_matches(s, h)))
+        .or_else(|| {
+            default_site
+                .as_deref()
+                .and_then(|ds| cfg.sites.iter().find(|s| s.id == ds))
+        });
 
     if let Some(s) = &site {
         ctx.site_id = Some(s.id.clone());
@@ -1125,19 +1141,11 @@ fn build_plugin_runtime(cfg: &SentinelConfig) -> anyhow::Result<PluginRuntime> {
 // IP feed loader helpers
 // ---------------------------------------------------------------------------
 
-/// Fetch a CIDR block-list from an HTTP URL and return one CIDR per line.
+/// Fetch a CIDR block-list from an HTTP or HTTPS URL and return one CIDR per line.
 ///
 /// Lines starting with `#` and blank lines are skipped.
-/// HTTPS URLs are not yet supported (Phase 3+); a descriptive error is
-/// returned so the caller can log and continue.
+/// Supports HTTP, HTTPS (via hyper-rustls with WebPKI roots), and `file://` paths.
 async fn fetch_feed_cidrs(url: &str) -> anyhow::Result<Vec<String>> {
-    if url.starts_with("https://") {
-        anyhow::bail!(
-            "HTTPS feeds require rustls connector (Phase 3+): {url}. \
-             Use an HTTP mirror or a file:// path for now."
-        );
-    }
-
     if let Some(path) = url.strip_prefix("file://") {
         let text = tokio::fs::read_to_string(path)
             .await
@@ -1145,15 +1153,25 @@ async fn fetch_feed_cidrs(url: &str) -> anyhow::Result<Vec<String>> {
         return Ok(parse_cidr_text(&text));
     }
 
-    let client: Client<HttpConnector, Empty<Bytes>> =
-        Client::builder(TokioExecutor::new()).build(HttpConnector::new());
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_webpki_roots()
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .build();
+    let client: Client<_, http_body_util::combinators::BoxBody<Bytes, hyper::Error>> =
+        Client::builder(TokioExecutor::new()).build(https);
 
     let uri: Uri = url.parse().with_context(|| format!("invalid feed URL: {url}"))?;
     let req = Request::builder()
         .method("GET")
         .uri(uri)
-        .header("User-Agent", "sentinel-waf/0.1 (ip-reputation-feed)")
-        .body(Empty::<Bytes>::new())
+        .header("User-Agent", "sentinel-waf/1.0 ip-reputation-feed-fetcher")
+        .body(
+            http_body_util::Empty::<Bytes>::new()
+                .map_err(|never: std::convert::Infallible| match never {})
+                .boxed(),
+        )
         .context("building feed request")?;
 
     let resp = tokio::time::timeout(Duration::from_secs(30), client.request(req))
@@ -1327,6 +1345,85 @@ fn log_request(ctx: &RequestContext) {
         block_reason = ctx.block_reason.as_deref().unwrap_or(""),
         "request"
     );
+    if let Err(e) = ndjson_log(ctx) {
+        tracing::warn!(error = %e, "ndjson log write failed");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NDJSON file logger — writes to $SENTINEL_LOG_DIR (default /tmp/sentinel-logs)
+// ---------------------------------------------------------------------------
+
+fn ndjson_log(ctx: &RequestContext) -> std::io::Result<()> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    let log_dir = std::env::var("SENTINEL_LOG_DIR")
+        .unwrap_or_else(|_| "/tmp/sentinel-logs".to_string());
+    let dir = std::path::Path::new(&log_dir);
+    std::fs::create_dir_all(dir)?;
+
+    let ts  = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let status = ctx.response_status.map(|s| s.as_u16()).unwrap_or(0);
+    let ua  = ctx.request_headers
+        .get(http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-");
+    let action = match ctx.decision {
+        WafDecision::Block | WafDecision::Challenge => "BLOCK",
+        _ => "PASS",
+    };
+    let site = ctx.site_id.as_deref().unwrap_or("-");
+
+    // ── access.log ──────────────────────────────────────────────────────────
+    let access = serde_json::json!({
+        "ts":      ts,
+        "ip":      ctx.client_ip.to_string(),
+        "method":  ctx.method.as_str(),
+        "path":    ctx.uri.path(),
+        "status":  status,
+        "latency": format!("{:.2}", ctx.elapsed_ms()),
+        "bytes":   ctx.bytes_sent,
+        "site":    site,
+        "ua":      ua,
+        "action":  action,
+        "score":   ctx.anomaly_score,
+    });
+    {
+        let mut f = OpenOptions::new().append(true).create(true)
+            .open(dir.join("access.log"))?;
+        writeln!(f, "{}", access)?;
+    }
+
+    // ── waf.log — only when rules fired or request is blocked ───────────────
+    if !ctx.rule_matches.is_empty() || matches!(ctx.decision, WafDecision::Block) {
+        let top = ctx.rule_matches.first();
+        let sev_str = top
+            .map(|r| format!("{:?}", r.severity).to_uppercase())
+            .unwrap_or_else(|| "MEDIUM".to_string());
+        let attack = top
+            .map(|r| r.message.as_str())
+            .unwrap_or("anomaly threshold exceeded");
+
+        let waf = serde_json::json!({
+            "ts":     ts,
+            "ip":     ctx.client_ip.to_string(),
+            "method": ctx.method.as_str(),
+            "path":   ctx.uri.path(),
+            "rule":   top.map(|r| r.rule_id.as_str()).unwrap_or("-"),
+            "score":  ctx.anomaly_score,
+            "sev":    sev_str,
+            "attack": attack,
+            "action": action,
+            "site":   site,
+            "msg":    ctx.block_reason.as_deref().unwrap_or(""),
+        });
+        let mut f = OpenOptions::new().append(true).create(true)
+            .open(dir.join("waf.log"))?;
+        writeln!(f, "{}", waf)?;
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

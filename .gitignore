@@ -10,6 +10,8 @@ build/
 
 # Go
 control-plane/bin/
+control-plane/sentinelctl
+/sentinelctl
 *.test
 *.out
 vendor/

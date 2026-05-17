@@ -1,4 +1,4 @@
-//! IP reputation module — CIDR-based allowlists / blocklists.
+//! IP reputation module — CIDR-based allowlists / blocklists with HTTP(S) feed support.
 //!
 //! Checked at Phase 0 (connection), before any HTTP parsing.  An explicit
 //! allowlist entry always wins over a blocklist entry for the same IP.
@@ -6,9 +6,20 @@
 use std::net::IpAddr;
 use std::str::FromStr;
 
+use bytes::Bytes;
+use http_body_util::{BodyExt, Empty};
+use hyper::Request;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::TokioExecutor;
 use ipnet::IpNet;
-use sentinel_core::config::IpReputationConfig;
+use sentinel_core::config::{IpFeedConfig, IpReputationConfig};
 use tracing::warn;
+
+type HttpsClient = Client<
+    hyper_rustls::HttpsConnector<HttpConnector>,
+    http_body_util::combinators::BoxBody<Bytes, hyper::Error>,
+>;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -144,6 +155,112 @@ impl IpReputation {
     pub fn entry_count(&self) -> usize {
         self.allowlist.len() + self.blocklist.len() + self.suspect_list.len()
     }
+
+    /// Fetch all configured feed URLs and ingest their CIDR lists.
+    ///
+    /// Supports both HTTP and HTTPS.  Feeds are fetched sequentially; any feed
+    /// that fails is logged and skipped.  Returns the total number of new
+    /// entries added to the suspect list.
+    pub async fn load_feeds(&mut self, feeds: &[IpFeedConfig]) -> usize {
+        if feeds.is_empty() {
+            return 0;
+        }
+        let client = build_https_client();
+        let mut total = 0usize;
+        for feed in feeds {
+            match fetch_text(&client, &feed.url).await {
+                Ok(body) => {
+                    let count = self.ingest_cidr_feed(&body, &feed.url);
+                    tracing::info!(url = %feed.url, count, "ip_reputation: feed loaded");
+                    total += count;
+                }
+                Err(e) => {
+                    warn!(url = %feed.url, error = %e, "ip_reputation: feed fetch failed — skipping");
+                }
+            }
+        }
+        total
+    }
+
+    /// Parse a text feed body (one CIDR or IP per line) and add entries to the
+    /// suspect list tagged with `feed:<url>`.  Returns the count added.
+    fn ingest_cidr_feed(&mut self, body: &str, source_url: &str) -> usize {
+        let tag = format!("feed:{}", source_url);
+        let mut count = 0usize;
+        for line in body.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+                continue;
+            }
+            // Some feeds use "IP|category" or "IP category" format — take just the IP/CIDR.
+            let cidr_str = line.split_whitespace().next().unwrap_or(line);
+            let cidr_str = cidr_str.split('|').next().unwrap_or(cidr_str);
+
+            let cidr = if cidr_str.contains('/') {
+                cidr_str.to_owned()
+            } else {
+                match cidr_str.parse::<IpAddr>() {
+                    Ok(IpAddr::V4(_)) => format!("{}/32", cidr_str),
+                    Ok(IpAddr::V6(_)) => format!("{}/128", cidr_str),
+                    Err(_) => {
+                        tracing::debug!(entry = %cidr_str, "ip_reputation: skipping non-CIDR feed line");
+                        continue;
+                    }
+                }
+            };
+
+            match self.add_suspect_cidr(&cidr, vec![tag.clone()]) {
+                Ok(()) => count += 1,
+                Err(e) => tracing::debug!(cidr, error = %e, "ip_reputation: invalid CIDR in feed"),
+            }
+        }
+        count
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP(S) feed helpers
+// ---------------------------------------------------------------------------
+
+fn build_https_client() -> HttpsClient {
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_webpki_roots()
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .build();
+    Client::builder(TokioExecutor::new()).build(https)
+}
+
+async fn fetch_text(client: &HttpsClient, url: &str) -> anyhow::Result<String> {
+    let uri: hyper::Uri = url
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid feed URL '{}': {}", url, e))?;
+
+    let req = Request::builder()
+        .uri(uri)
+        .header("User-Agent", "sentinel-waf/1.0 ip-reputation-feed-fetcher")
+        .body(
+            Empty::<Bytes>::new()
+                .map_err(|never: std::convert::Infallible| match never {})
+                .boxed(),
+        )?;
+
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        client.request(req),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("feed '{}' timed out after 30s", url))??;
+
+    let status = resp.status();
+    if !status.is_success() {
+        anyhow::bail!("feed '{}' returned HTTP {}", url, status);
+    }
+
+    let bytes = resp.collect().await?.to_bytes();
+    String::from_utf8(bytes.to_vec())
+        .map_err(|e| anyhow::anyhow!("feed '{}' body is not valid UTF-8: {}", url, e))
 }
 
 // ---------------------------------------------------------------------------

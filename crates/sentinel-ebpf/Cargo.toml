@@ -4,9 +4,25 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# "kernel" enables real aya-based XDP loading (requires CAP_BPF / root + Linux).
+# Not enabled by default; the crate always falls back to the userspace
+# software implementation when kernel mode is unavailable.
+default = []
+kernel = ["dep:aya", "dep:aya-log"]
+
 [dependencies]
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+ipnet = { workspace = true }
+
+# eBPF / XDP — only compiled when the "kernel" feature is enabled
+aya     = { workspace = true, optional = true }
+aya-log = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }

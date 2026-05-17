@@ -173,6 +173,46 @@ impl PluginRuntime {
         }
     }
 
+    /// Replace a loaded plugin with a new WASM binary without restarting.
+    ///
+    /// If no plugin with `name` is currently loaded this behaves identically
+    /// to [`load_plugin`].  The swap is performed while holding `&mut self`,
+    /// so it is atomic from the caller's perspective.  For zero-downtime
+    /// hot-reload in production, clone the runtime, call this method on the
+    /// clone, then swap it in via the proxy's `ArcSwap<PluginRuntime>`.
+    pub fn hot_reload(&mut self, name: &str, wasm_bytes: &[u8]) -> anyhow::Result<()> {
+        let module = Module::from_binary(&self.engine, wasm_bytes)
+            .map_err(|e| anyhow::anyhow!("failed to recompile plugin '{}': {}", name, e))?;
+        let replaced = self.modules.insert(name.to_string(), module).is_some();
+        if replaced {
+            tracing::info!(%name, "plugin module hot-reloaded");
+        } else {
+            tracing::info!(%name, "plugin module loaded (new via hot_reload)");
+        }
+        Ok(())
+    }
+
+    /// Download a WASM binary from `url` and load it as plugin `name`.
+    ///
+    /// Supports plain HTTP and HTTPS.  For OCI registry URLs use
+    /// [`install_from_oci`] instead.
+    pub async fn install_from_url(&mut self, name: &str, url: &str) -> anyhow::Result<()> {
+        let bytes = crate::registry::download_wasm(url)
+            .await
+            .map_err(|e| anyhow::anyhow!("install_from_url '{}': {}", url, e))?;
+        self.load_plugin(name, &bytes)
+    }
+
+    /// Pull a WASM binary from an OCI registry and load it as plugin `name`.
+    ///
+    /// `oci_ref` format: `oci://registry/image:tag` or `oci://registry/image@sha256:digest`.
+    pub async fn install_from_oci(&mut self, name: &str, oci_ref: &str) -> anyhow::Result<()> {
+        let bytes = crate::registry::pull_wasm(oci_ref)
+            .await
+            .map_err(|e| anyhow::anyhow!("install_from_oci '{}': {}", oci_ref, e))?;
+        self.load_plugin(name, &bytes)
+    }
+
     /// Load a plugin from a `sentinel-plugin.toml` manifest file.
     ///
     /// Reads the manifest, resolves the `.wasm` path relative to the manifest
