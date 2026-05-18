@@ -45,8 +45,11 @@ out/
 generated/
 
 
-# Local notes
+# Local notes / dev references (machine-specific, not for the repo)
 SAVE1.md
-ROADMAP.md
+COMMANDS.md
+AGENTS.md
+sentinel-about.md
+waf-comparsion.md
 .local/
 notes/
