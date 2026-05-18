@@ -1,0 +1,14 @@
+[package]
+name = "sentinel-plugin-sdk"
+version = "0.1.0"
+edition = "2021"
+description = "Rust SDK for building Sentinel WAF WASM plugins"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+
+[workspace]
+# standalone crate — not part of the parent sentinel workspace
+

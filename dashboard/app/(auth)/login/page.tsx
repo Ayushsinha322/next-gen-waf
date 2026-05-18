@@ -1,0 +1,388 @@
+"use client";
+import { useState, useEffect, useRef } from "react";
+import { useRouter } from "next/navigation";
+import { login, clearSessionCookie } from "@/lib/auth";
+
+type AuthTab  = "std" | "sso" | "api";
+type BtnState = "idle" | "loading" | "success";
+
+const THREAT_LABELS = [
+  "THREAT BLOCKED: SQLi attempt",
+  "THREAT BLOCKED: XSS payload",
+  "RATE LIMIT: 10.0.0.44",
+  "BOT DETECTED: crawler",
+  "CVE-2024-3912: patched",
+  "DDoS DROP: SYN flood",
+];
+
+export default function LoginPage() {
+  const router = useRouter();
+
+  // ── Preserved logic state ────────────────────────────────────────────────
+  const [email, setEmail]           = useState("");
+  const [password, setPassword]     = useState("");
+  const [loginError, setLoginError] = useState("");
+  const [btnState, setBtnState]     = useState<BtnState>("idle");
+
+  // ── UI state ─────────────────────────────────────────────────────────────
+  const [tab, setTab]               = useState<AuthTab>("std");
+  const [showPwd, setShowPwd]       = useState(false);
+  const [threatLabel, setThreatLabel] = useState(THREAT_LABELS[0]);
+
+  // ── Refs ─────────────────────────────────────────────────────────────────
+  const canvasRef   = useRef<HTMLCanvasElement>(null);
+  const scanlineRef = useRef<HTMLDivElement>(null);
+  const lpRef       = useRef<HTMLDivElement>(null);
+
+  // ── Clear any stale session cookie on login page mount ───────────────────
+  useEffect(() => { clearSessionCookie(); }, []);
+
+  // ── Threat label rotation ─────────────────────────────────────────────────
+  useEffect(() => {
+    let i = 0;
+    const t = setInterval(() => {
+      i = (i + 1) % THREAT_LABELS.length;
+      setThreatLabel(THREAT_LABELS[i]);
+    }, 3000);
+    return () => clearInterval(t);
+  }, []);
+
+  // ── Canvas animation (ported from sentinel_waf_login.html) ───────────────
+  useEffect(() => {
+    const c  = canvasRef.current;
+    if (!c) return;
+    const cx = c.getContext("2d");
+    if (!cx) return;
+
+    function rsz() {
+      if (!c) return;
+      c.width  = c.offsetWidth;
+      c.height = c.offsetHeight;
+    }
+    rsz();
+
+    type Node = { x: number; y: number; vx: number; vy: number; r: number };
+    const nodes: Node[] = [];
+    for (let i = 0; i < 28; i++) {
+      nodes.push({
+        x:  Math.random() * c.width,
+        y:  Math.random() * c.height,
+        vx: (Math.random() - 0.5) * 0.25,
+        vy: (Math.random() - 0.5) * 0.25,
+        r:  Math.random() * 1.8 + 0.5,
+      });
+    }
+
+    type Stream = { x: number; y: number; spd: number; ch: string[]; len: number; a: number };
+    const streams: Stream[] = [];
+    const gl = "01><#$@ABCDEFabcdef";
+
+    function addS() {
+      if (!c) return;
+      streams.push({ x: Math.random() * c.width, y: 0, spd: 0.5 + Math.random(), ch: [], len: 5 + Math.floor(Math.random() * 8), a: 0.15 + Math.random() * 0.2 });
+    }
+    for (let i = 0; i < 12; i++) setTimeout(addS, i * 200);
+    const streamInt = setInterval(addS, 400);
+
+    let t = 0;
+    let rafId: number;
+
+    function draw() {
+      if (!c || !cx) return;
+      cx.clearRect(0, 0, c.width, c.height);
+      cx.fillStyle = "rgba(4,7,15,0.85)";
+      cx.fillRect(0, 0, c.width, c.height);
+      t++;
+
+      // Grid dots
+      for (let x = 0; x < c.width; x += 50) {
+        for (let y = 0; y < c.height; y += 50) {
+          cx.beginPath(); cx.arc(x, y, 1, 0, Math.PI * 2);
+          cx.fillStyle = "rgba(59,130,246,0.12)"; cx.fill();
+        }
+      }
+
+      // Move + draw nodes with connections
+      nodes.forEach(n => {
+        n.x += n.vx; n.y += n.vy;
+        if (n.x < 0 || n.x > c!.width)  n.vx *= -1;
+        if (n.y < 0 || n.y > c!.height) n.vy *= -1;
+      });
+      nodes.forEach((n, i) => {
+        nodes.forEach((m, j) => {
+          if (j <= i) return;
+          const d = Math.hypot(n.x - m.x, n.y - m.y);
+          if (d < 100) {
+            cx!.beginPath(); cx!.moveTo(n.x, n.y); cx!.lineTo(m.x, m.y);
+            cx!.strokeStyle = `rgba(59,130,246,${0.12 * (1 - d / 100)})`;
+            cx!.lineWidth = 0.5; cx!.stroke();
+          }
+        });
+        const p = 0.3 + 0.3 * Math.sin(t * 0.04 + i);
+        cx!.beginPath(); cx!.arc(n.x, n.y, n.r, 0, Math.PI * 2);
+        cx!.fillStyle = `rgba(96,165,250,${p})`; cx!.fill();
+      });
+
+      // Data streams
+      cx.font = "9px 'JetBrains Mono',monospace";
+      for (let idx = streams.length - 1; idx >= 0; idx--) {
+        const s = streams[idx];
+        s.y += s.spd;
+        for (let i = 0; i < s.len; i++) {
+          if (t % 5 === 0) s.ch[i] = gl[Math.floor(Math.random() * gl.length)];
+          const sy = s.y - i * 11;
+          if (sy < 0 || sy > c!.height) continue;
+          cx!.fillStyle = `rgba(59,130,246,${i === 0 ? s.a : (1 - i / s.len) * s.a * 0.6})`;
+          cx!.fillText(s.ch[i] ?? "0", s.x, sy);
+        }
+        if (s.y > c!.height + s.len * 11) streams.splice(idx, 1);
+      }
+
+      // Radar (bottom-left)
+      const ra = (t * 0.008) % (Math.PI * 2);
+      cx.save(); cx.translate(70, c.height - 70);
+      cx.beginPath(); cx.moveTo(0, 0); cx.arc(0, 0, 55, ra - 0.5, ra); cx.closePath();
+      cx.fillStyle = "rgba(59,130,246,0.07)"; cx.fill();
+      [55, 38, 20].forEach(r => {
+        cx!.beginPath(); cx!.arc(0, 0, r, 0, Math.PI * 2);
+        cx!.strokeStyle = "rgba(59,130,246,0.12)"; cx!.lineWidth = 0.5; cx!.stroke();
+      });
+      cx.beginPath(); cx.moveTo(0, 0); cx.lineTo(55 * Math.cos(ra), 55 * Math.sin(ra));
+      cx.strokeStyle = "rgba(96,165,250,0.5)"; cx.lineWidth = 1; cx.stroke();
+      cx.restore();
+
+      rafId = requestAnimationFrame(draw);
+    }
+    draw();
+
+    const onResize = () => rsz();
+    window.addEventListener("resize", onResize);
+    return () => {
+      cancelAnimationFrame(rafId);
+      clearInterval(streamInt);
+      window.removeEventListener("resize", onResize);
+    };
+  }, []);
+
+  // ── Scanline RAF ──────────────────────────────────────────────────────────
+  useEffect(() => {
+    const el = scanlineRef.current;
+    const lp = lpRef.current;
+    if (!el || !lp) return;
+    let sy = 0;
+    let rafId: number;
+    function ss() {
+      sy = (sy + 1.2) % lp!.offsetHeight;
+      el!.style.top = `${sy}px`;
+      rafId = requestAnimationFrame(ss);
+    }
+    rafId = requestAnimationFrame(ss);
+    return () => cancelAnimationFrame(rafId);
+  }, []);
+
+  // ── Login handler (preserved exactly) ────────────────────────────────────
+  async function doLogin() {
+    if (btnState !== "idle") return;
+    setBtnState("loading");
+    setLoginError("");
+    try {
+      await login(email, password);
+      const token = typeof window !== "undefined"
+        ? localStorage.getItem("sentinel_access_token")
+        : null;
+      if (token) {
+        document.cookie = `sentinel_token=${token}; path=/; max-age=604800; SameSite=Lax`;
+      }
+      setBtnState("success");
+      setTimeout(() => router.push("/overview"), 900);
+    } catch (err: unknown) {
+      setBtnState("idle");
+      clearSessionCookie(); // ensure no stale cookie survives a failed login
+      setLoginError(err instanceof Error ? err.message : "Login failed");
+    }
+  }
+
+  return (
+    <div id="LR">
+
+      {/* ══ LEFT PANEL ══════════════════════════════════════════════════════ */}
+      <div id="LP" ref={lpRef}>
+        <canvas id="LC" ref={canvasRef} />
+
+        {/* Scanline */}
+        <div ref={scanlineRef} style={{
+          position: "absolute", left: 0, width: "100%", height: 1,
+          background: "rgba(59,130,246,0.12)", zIndex: 1, pointerEvents: "none",
+        }} />
+
+        <div id="LP-content">
+          {/* Shield logo */}
+          <div id="shield">
+            <div id="shield-icon">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+                <path d="M12 2L3 6.5V12c0 5.5 3.8 10.7 9 12 5.2-1.3 9-6.5 9-12V6.5L12 2z"
+                  stroke="#3b82f6" strokeWidth="1.5" fill="rgba(59,130,246,0.1)" />
+                <path d="M8.5 12l2.5 2.5 4.5-4.5"
+                  stroke="#60a5fa" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </div>
+            <div>
+              <div id="brand-text">Sentinel WAF</div>
+              <div id="brand-sub">Enterprise Security Platform</div>
+            </div>
+          </div>
+
+          <div id="hero-title">Protect every<br />request. <span>Instantly.</span></div>
+          <div id="hero-desc">
+            Next-generation Web Application Firewall with AI-powered threat detection,
+            eBPF kernel-level DDoS mitigation, and sub-millisecond latency.
+          </div>
+
+          {/* Stats */}
+          <div id="stats">
+            <div className="stat-item">
+              <div className="sv green">&lt;1ms</div>
+              <div className="sl">p99 latency</div>
+            </div>
+            <div className="stat-item">
+              <div className="sv blue">500k+</div>
+              <div className="sl">req/s throughput</div>
+            </div>
+            <div className="stat-item">
+              <div className="sv" style={{ color: "#a78bfa" }}>99.9%</div>
+              <div className="sl">DDoS mitigation</div>
+            </div>
+          </div>
+
+          {/* Feature pills */}
+          <div id="feats">
+            {["eBPF / XDP","OWASP CRS v4","WASM Plugins","LLM Copilot",
+              "Post-Quantum TLS","Raft HA","GraphQL FW","Outbound DLP"].map(f => (
+              <div key={f} className="feat-pill">{f}</div>
+            ))}
+          </div>
+        </div>
+
+        <div id="LP-bottom">
+          <div id="lp-footer">
+            <div className="lp-dot" />
+            <span>All systems operational &nbsp;·&nbsp; v4.2.1 &nbsp;·&nbsp; AES-256-GCM</span>
+          </div>
+        </div>
+      </div>
+
+      {/* ══ THREAT FEED BADGE ═══════════════════════════════════════════════ */}
+      <div id="threat-feed">
+        <div className="tf-dot" />
+        <div id="tf-text">{threatLabel}</div>
+      </div>
+
+      {/* ══ RIGHT PANEL ═════════════════════════════════════════════════════ */}
+      <div id="RP">
+        <div id="form-box">
+
+          <div id="form-header">
+            <div id="form-title">Welcome back</div>
+            <div id="form-sub">Sign in to your Sentinel dashboard</div>
+          </div>
+
+          {/* Auth tabs */}
+          <div id="auth-tabs">
+            {(["std", "sso", "api"] as AuthTab[]).map(t => (
+              <div
+                key={t}
+                className={`atab${tab === t ? " active" : ""}`}
+                onClick={() => setTab(t)}
+              >
+                {t === "std" ? "Password" : t === "sso" ? "SSO / OIDC" : "API Key"}
+              </div>
+            ))}
+          </div>
+
+          {/* Email */}
+          <div className="fg">
+            <label className="fl">Email address</label>
+            <div className="fi-wrap">
+              <input
+                className="fi"
+                type="email"
+                placeholder="admin@sentinel.local"
+                autoComplete="username"
+                value={email}
+                onChange={e => setEmail(e.target.value)}
+              />
+              <span className="fi-icon">✉</span>
+            </div>
+          </div>
+
+          {/* Password */}
+          <div className="fg">
+            <label className="fl">Password</label>
+            <div className="fi-wrap">
+              <input
+                className="fi"
+                type={showPwd ? "text" : "password"}
+                placeholder="Enter password"
+                autoComplete="current-password"
+                value={password}
+                onChange={e => setPassword(e.target.value)}
+                onKeyDown={e => { if (e.key === "Enter") doLogin(); }}
+              />
+              <button className="fi-icon" onClick={() => setShowPwd(p => !p)}>
+                {showPwd ? "🙈" : "👁️"}
+              </button>
+            </div>
+          </div>
+
+          {/* Remember + Forgot */}
+          <div id="extras">
+            <label className="remember">
+              <input type="checkbox" defaultChecked />
+              Remember this device
+            </label>
+            <a id="forgot" href="#">Forgot password?</a>
+          </div>
+
+          {/* Error */}
+          {loginError && <div className="login-error">⚠ {loginError}</div>}
+
+          {/* Submit */}
+          <button
+            id="sub-btn"
+            className={btnState === "loading" ? "loading" : btnState === "success" ? "success" : ""}
+            onClick={doLogin}
+            disabled={btnState !== "idle"}
+          >
+            {btnState === "idle"    && "🔐 Sign in to Sentinel"}
+            {btnState === "loading" && <><span className="btn-spin" /> Authenticating...</>}
+            {btnState === "success" && "✓ Access granted"}
+          </button>
+
+          {/* Divider */}
+          <div className="div-row">
+            <div className="div-line" />
+            <div className="div-text">or continue with</div>
+            <div className="div-line" />
+          </div>
+
+          {/* SAML / LDAP */}
+          <button id="sso-btn" onClick={doLogin}>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+              <circle cx="12" cy="12" r="10" stroke="#94a3b8" strokeWidth="1.5" />
+              <path d="M2 12h20M12 2a15.3 15.3 0 010 20M12 2a15.3 15.3 0 000 20"
+                stroke="#94a3b8" strokeWidth="1.5" fill="none" />
+            </svg>
+            Sign in with SAML / LDAP
+          </button>
+
+          <div id="form-footer">
+            Protected by Sentinel WAF · AES-256 encrypted<br />
+            All authentication attempts are logged and audited
+          </div>
+
+        </div>
+      </div>
+
+    </div>
+  );
+}

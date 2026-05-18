@@ -5,8 +5,26 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+sentinel-core = { path = "../sentinel-core" }
+dashmap = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+wasmtime = { workspace = true }
+toml = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "tls12", "webpki-roots"] }
+http = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+rustls = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+wat = "1"
+tokio = { workspace = true, features = ["full"] }
+http = { workspace = true }

@@ -28,9 +28,9 @@ use anyhow::{anyhow, Context};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use http::{header, Request, Response, StatusCode, Uri};
-use http_body_util::{BodyExt, Empty, Full};
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
-use hyper_util::client::legacy::{connect::HttpConnector, Client};
+use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rustls::ServerConfig;
 use sentinel_core::{
@@ -40,10 +40,12 @@ use sentinel_core::{
     },
     context::{Phase, RequestContext, WafDecision},
 };
+use sentinel_ml::MlEngine;
 use sentinel_modules::{
     AntiDdos, BotDetector, BotVerdict, DdosVerdict, GeoIp, GeoVerdict, IpReputation, IpVerdict,
     RateLimiter,
 };
+use sentinel_plugins::PluginRuntime;
 use sentinel_rules::RuleEngine;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -108,11 +110,20 @@ struct ServerState {
     upstream_pool: Arc<UpstreamPool>,
     engines: Arc<ArcSwap<RuleEngineMap>>,
     modules: Arc<ModulesState>,
+    plugin_runtime: Arc<ArcSwap<PluginRuntime>>,
+    ml_engine: Arc<MlEngine>,
 }
 
 // ---------------------------------------------------------------------------
 // ProxyServer
 // ---------------------------------------------------------------------------
+
+/// Response shape from `GET /api/v1/internal/config`.
+#[derive(serde::Deserialize)]
+struct ConfigSyncResponse {
+    version: u64,
+    sites:   Vec<SiteConfig>,
+}
 
 /// Top-level proxy server.  One instance manages all configured listeners.
 pub struct ProxyServer {
@@ -152,11 +163,28 @@ impl ProxyServer {
             feed_cache: Arc::clone(&feed_cache),
         });
 
+        let plugin_runtime = build_plugin_runtime(&cfg)
+            .unwrap_or_else(|e| {
+                warn!("failed to load plugins: {e:#}");
+                PluginRuntime::new().expect("create empty plugin runtime")
+            });
+
+        let plugin_runtime: Arc<ArcSwap<PluginRuntime>> =
+            Arc::new(ArcSwap::new(Arc::new(plugin_runtime)));
+
+        // Build ML engine (always active, no external deps required).
+        let ml_engine = {
+            let model_dir = std::path::Path::new("ml-models");
+            Arc::new(MlEngine::new(4096, 256, if model_dir.exists() { Some(model_dir) } else { None }))
+        };
+
         let state = Arc::new(ServerState {
             config: Arc::clone(&self.config),
             upstream_pool,
             engines: Arc::clone(&engines),
             modules: Arc::clone(&modules),
+            plugin_runtime: Arc::clone(&plugin_runtime),
+            ml_engine: Arc::clone(&ml_engine),
         });
 
         // --- Background task: config hot-reload watcher ---
@@ -164,36 +192,129 @@ impl ProxyServer {
         // config.  Rebuilds stateless modules (rule engines, ip_rep, geoip,
         // bot detector) on every change.  Stateful modules (rate_limiter,
         // anti_ddos) are intentionally NOT rebuilt.
+        // Wrapped in a watchdog: if the task panics it is automatically
+        // restarted after a 1-second back-off so that a transient failure
+        // (e.g. rule-file I/O error) does not permanently disable hot-reload.
         {
             let config_watch = Arc::clone(&self.config);
             let engines_swap = Arc::clone(&engines);
             let modules_ref = Arc::clone(&modules);
+            let plugin_swap = Arc::clone(&plugin_runtime);
             tokio::spawn(async move {
-                let mut last_ptr = Arc::as_ptr(&config_watch.load_full()) as usize;
                 loop {
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    let current = config_watch.load_full();
-                    let ptr = Arc::as_ptr(&current) as usize;
-                    if ptr != last_ptr {
-                        last_ptr = ptr;
-                        let new_engines = build_rule_engines(&current);
-                        let rule_count: usize =
-                            new_engines.values().map(|e| e.rule_count()).sum();
-                        engines_swap.store(Arc::new(new_engines));
+                    let cw = Arc::clone(&config_watch);
+                    let es = Arc::clone(&engines_swap);
+                    let mr = Arc::clone(&modules_ref);
+                    let ps = Arc::clone(&plugin_swap);
+                    let handle = tokio::spawn(async move {
+                        let mut last_ptr = Arc::as_ptr(&cw.load_full()) as usize;
+                        loop {
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            let current = cw.load_full();
+                            let ptr = Arc::as_ptr(&current) as usize;
+                            if ptr != last_ptr {
+                                last_ptr = ptr;
+                                let new_engines = build_rule_engines(&current);
+                                let rule_count: usize =
+                                    new_engines.values().map(|e| e.rule_count()).sum();
+                                es.store(Arc::new(new_engines));
 
-                        let feed_cidrs = modules_ref.feed_cache.load_full();
-                        modules_ref
-                            .ip_rep
-                            .store(Arc::new(build_ip_reputation(&current, &feed_cidrs)));
-                        modules_ref
-                            .bot_detector
-                            .store(Arc::new(BotDetector::new()));
-                        modules_ref
-                            .geoip_map
-                            .store(Arc::new(build_geoip_map(&current)));
+                                let feed_cidrs = mr.feed_cache.load_full();
+                                mr.ip_rep
+                                    .store(Arc::new(build_ip_reputation(&current, &feed_cidrs)));
+                                mr.bot_detector.store(Arc::new(BotDetector::new()));
+                                mr.geoip_map.store(Arc::new(build_geoip_map(&current)));
+
+                                match build_plugin_runtime(&current) {
+                                    Ok(new_pr) => {
+                                        ps.store(Arc::new(new_pr));
+                                        info!("plugin runtime hot-reloaded");
+                                    }
+                                    Err(e) => {
+                                        warn!("failed to reload plugins — keeping current runtime: {e:#}");
+                                    }
+                                }
+
+                                info!(
+                                    rules = rule_count,
+                                    "rule engines and security modules hot-reloaded"
+                                );
+                            }
+                        }
+                    });
+                    if let Err(e) = handle.await {
+                        if e.is_panic() {
+                            error!("config hot-reload watcher panicked, restarting in 1s: {e}");
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                }
+            });
+        }
+
+        // --- Background task: control-plane site sync ---
+        // Polls GET {sync_url}/api/v1/internal/config every sync_interval_secs.
+        // When the version number changes, hot-replaces the sites list and
+        // upstream pool — no SIGHUP needed, zero dropped connections.
+        if let Some(sync_url) = cfg.cluster.sync_url.clone() {
+            let poll_cfg  = Arc::clone(&state.config);
+            let poll_pool = Arc::clone(&state.upstream_pool);
+            let secs      = cfg.cluster.sync_interval_secs.max(1);
+            tokio::spawn(async move {
+                use http_body_util::BodyExt as _;
+                use hyper_util::client::legacy::Client;
+                use hyper_util::rt::TokioExecutor;
+                type EmptyBody = http_body_util::Empty<bytes::Bytes>;
+                let client: Client<_, EmptyBody> =
+                    Client::builder(TokioExecutor::new()).build_http();
+                let mut last_version: u64 = 0;
+                let mut ticker = tokio::time::interval(Duration::from_secs(secs));
+                ticker.set_missed_tick_behavior(
+                    tokio::time::MissedTickBehavior::Skip,
+                );
+                loop {
+                    ticker.tick().await;
+                    let url = format!("{}/api/v1/internal/config", sync_url);
+                    let uri: hyper::Uri = match url.parse() {
+                        Ok(u) => u,
+                        Err(e) => { warn!("config sync: bad url: {e}"); continue; }
+                    };
+                    let req = hyper::Request::builder()
+                        .method("GET")
+                        .uri(uri)
+                        .body(http_body_util::Empty::new())
+                        .unwrap();
+                    let resp = match client.request(req).await {
+                        Ok(r)  => r,
+                        Err(e) => { warn!("config sync fetch: {e}"); continue; }
+                    };
+                    let bytes = match resp.collect().await {
+                        Ok(b)  => b.to_bytes(),
+                        Err(e) => { warn!("config sync body: {e}"); continue; }
+                    };
+                    let sync: ConfigSyncResponse =
+                        match serde_json::from_slice(&bytes) {
+                            Ok(s)  => s,
+                            Err(e) => {
+                                warn!(
+                                    "config sync parse: {e} — snippet: {}",
+                                    String::from_utf8_lossy(&bytes)
+                                        .chars()
+                                        .take(120)
+                                        .collect::<String>()
+                                );
+                                continue;
+                            }
+                        };
+                    if sync.version != last_version {
+                        let count = sync.sites.len();
+                        poll_pool.sync_sites(&sync.sites);
+                        sentinel_core::config::update_sites(&poll_cfg, sync.sites);
+                        last_version = sync.version;
                         info!(
-                            rules = rule_count,
-                            "rule engines and security modules hot-reloaded"
+                            version = last_version,
+                            sites   = count,
+                            "sites hot-synced from control plane",
                         );
                     }
                 }
@@ -204,18 +325,27 @@ impl ProxyServer {
         {
             let modules_ref = Arc::clone(&modules);
             tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(60));
-                interval.set_missed_tick_behavior(
-                    tokio::time::MissedTickBehavior::Skip,
-                );
                 loop {
-                    interval.tick().await;
-                    modules_ref.rate_limiter.gc();
-                    debug!(
-                        ip_buckets = modules_ref.rate_limiter.per_ip_bucket_count(),
-                        site_buckets = modules_ref.rate_limiter.per_site_bucket_count(),
-                        "rate-limiter GC complete"
-                    );
+                    let mr = Arc::clone(&modules_ref);
+                    let handle = tokio::spawn(async move {
+                        let mut interval = tokio::time::interval(Duration::from_secs(60));
+                        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        loop {
+                            interval.tick().await;
+                            mr.rate_limiter.gc();
+                            debug!(
+                                ip_buckets = mr.rate_limiter.per_ip_bucket_count(),
+                                site_buckets = mr.rate_limiter.per_site_bucket_count(),
+                                "rate-limiter GC complete"
+                            );
+                        }
+                    });
+                    if let Err(e) = handle.await {
+                        if e.is_panic() {
+                            error!("rate-limiter GC task panicked, restarting in 1s: {e}");
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    }
                 }
             });
         }
@@ -224,18 +354,27 @@ impl ProxyServer {
         {
             let modules_ref = Arc::clone(&modules);
             tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(60));
-                interval.set_missed_tick_behavior(
-                    tokio::time::MissedTickBehavior::Skip,
-                );
                 loop {
-                    interval.tick().await;
-                    modules_ref.anti_ddos.gc();
-                    debug!(
-                        blocked = modules_ref.anti_ddos.blocked_count(),
-                        tracked = modules_ref.anti_ddos.tracked_count(),
-                        "anti-DDoS GC complete"
-                    );
+                    let mr = Arc::clone(&modules_ref);
+                    let handle = tokio::spawn(async move {
+                        let mut interval = tokio::time::interval(Duration::from_secs(60));
+                        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        loop {
+                            interval.tick().await;
+                            mr.anti_ddos.gc();
+                            debug!(
+                                blocked = mr.anti_ddos.blocked_count(),
+                                tracked = mr.anti_ddos.tracked_count(),
+                                "anti-DDoS GC complete"
+                            );
+                        }
+                    });
+                    if let Err(e) = handle.await {
+                        if e.is_panic() {
+                            error!("anti-DDoS GC task panicked, restarting in 1s: {e}");
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    }
                 }
             });
         }
@@ -248,49 +387,59 @@ impl ProxyServer {
             let config_watch = Arc::clone(&self.config);
             let modules_ref = Arc::clone(&modules);
             tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(300));
-                interval.set_missed_tick_behavior(
-                    tokio::time::MissedTickBehavior::Skip,
-                );
                 loop {
-                    interval.tick().await;
-                    let cfg = config_watch.load_full();
-                    let feeds: Vec<_> = cfg
-                        .sites
-                        .iter()
-                        .filter_map(|s| s.waf.ip_reputation.as_ref())
-                        .flat_map(|r| r.feeds.iter().cloned())
-                        .collect();
+                    let cw = Arc::clone(&config_watch);
+                    let mr = Arc::clone(&modules_ref);
+                    let handle = tokio::spawn(async move {
+                        let mut interval = tokio::time::interval(Duration::from_secs(300));
+                        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        loop {
+                            interval.tick().await;
+                            let cfg = cw.load_full();
+                            let feeds: Vec<_> = cfg
+                                .sites
+                                .iter()
+                                .filter_map(|s| s.waf.ip_reputation.as_ref())
+                                .flat_map(|r| r.feeds.iter().cloned())
+                                .collect();
 
-                    if feeds.is_empty() {
-                        continue;
-                    }
+                            if feeds.is_empty() {
+                                continue;
+                            }
 
-                    let mut new_cidrs: Vec<(String, Vec<String>)> = Vec::new();
-                    for feed in &feeds {
-                        match fetch_feed_cidrs(&feed.url).await {
-                            Ok(cidrs) => {
-                                info!(
-                                    url = %feed.url,
-                                    count = cidrs.len(),
-                                    "IP reputation feed loaded"
-                                );
-                                for cidr in cidrs {
-                                    new_cidrs.push((cidr, vec!["feed".to_string()]));
+                            let mut new_cidrs: Vec<(String, Vec<String>)> = Vec::new();
+                            for feed in &feeds {
+                                match fetch_feed_cidrs(&feed.url).await {
+                                    Ok(cidrs) => {
+                                        info!(
+                                            url = %feed.url,
+                                            count = cidrs.len(),
+                                            "IP reputation feed loaded"
+                                        );
+                                        for cidr in cidrs {
+                                            new_cidrs.push((cidr, vec!["feed".to_string()]));
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(url = %feed.url, "IP feed fetch failed: {e}");
+                                    }
                                 }
                             }
-                            Err(e) => {
-                                warn!(url = %feed.url, "IP feed fetch failed: {e}");
-                            }
+
+                            let new_arc: Arc<Vec<(String, Vec<String>)>> = Arc::new(new_cidrs);
+                            mr.feed_cache.store(Arc::clone(&new_arc));
+                            let new_ip_rep = build_ip_reputation(&cfg, &new_arc);
+                            let entry_count = new_ip_rep.entry_count();
+                            mr.ip_rep.store(Arc::new(new_ip_rep));
+                            info!(entries = entry_count, "IP reputation table rebuilt from feeds");
+                        }
+                    });
+                    if let Err(e) = handle.await {
+                        if e.is_panic() {
+                            error!("IP feed loader task panicked, restarting in 1s: {e}");
+                            tokio::time::sleep(Duration::from_secs(1)).await;
                         }
                     }
-
-                    let new_arc: Arc<Vec<(String, Vec<String>)>> = Arc::new(new_cidrs);
-                    modules_ref.feed_cache.store(Arc::clone(&new_arc));
-                    let new_ip_rep = build_ip_reputation(&cfg, &new_arc);
-                    let entry_count = new_ip_rep.entry_count();
-                    modules_ref.ip_rep.store(Arc::new(new_ip_rep));
-                    info!(entries = entry_count, "IP reputation table rebuilt from feeds");
                 }
             });
         }
@@ -338,6 +487,8 @@ async fn serve_listener(
         None
     };
 
+    let default_site = cfg.default_site.clone();
+
     loop {
         tokio::select! {
             accept = tcp.accept() => {
@@ -345,8 +496,9 @@ async fn serve_listener(
                 let state = Arc::clone(&state);
                 let acceptor = tls_acceptor.clone();
                 let protos = cfg.protocols();
+                let ds = default_site.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, peer, acceptor, protos, state).await {
+                    if let Err(e) = handle_connection(stream, peer, acceptor, protos, state, ds).await {
                         debug!(peer = %peer, "connection error: {e}");
                     }
                 });
@@ -370,6 +522,7 @@ async fn handle_connection(
     tls_acceptor: Option<TlsAcceptor>,
     protocols: Vec<Protocol>,
     state: Arc<ServerState>,
+    default_site: Option<String>,
 ) -> anyhow::Result<()> {
     stream.set_nodelay(true)?;
 
@@ -383,16 +536,16 @@ async fn handle_connection(
         let io = TokioIo::new(tls);
 
         if negotiated.as_deref() == Some(b"h2") {
-            serve_http2(io, peer, state).await
+            serve_http2(io, peer, state, default_site).await
         } else {
-            serve_http1(io, peer, state).await
+            serve_http1(io, peer, state, default_site).await
         }
     } else {
         let io = TokioIo::new(stream);
         if protocols.contains(&Protocol::Http2) && !protocols.contains(&Protocol::Http1) {
-            serve_http2(io, peer, state).await
+            serve_http2(io, peer, state, default_site).await
         } else {
-            serve_http1(io, peer, state).await
+            serve_http1(io, peer, state, default_site).await
         }
     }
 }
@@ -401,6 +554,7 @@ async fn serve_http1<T>(
     io: TokioIo<T>,
     peer: SocketAddr,
     state: Arc<ServerState>,
+    default_site: Option<String>,
 ) -> anyhow::Result<()>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -410,7 +564,8 @@ where
             io,
             hyper::service::service_fn(move |req| {
                 let s = Arc::clone(&state);
-                async move { handle_request(s, peer, req).await }
+                let ds = default_site.clone();
+                async move { handle_request(s, peer, req, ds).await }
             }),
         )
         .with_upgrades()
@@ -422,6 +577,7 @@ async fn serve_http2<T>(
     io: TokioIo<T>,
     peer: SocketAddr,
     state: Arc<ServerState>,
+    default_site: Option<String>,
 ) -> anyhow::Result<()>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -431,7 +587,8 @@ where
             io,
             hyper::service::service_fn(move |req| {
                 let s = Arc::clone(&state);
-                async move { handle_request(s, peer, req).await }
+                let ds = default_site.clone();
+                async move { handle_request(s, peer, req, ds).await }
             }),
         )
         .await
@@ -446,8 +603,9 @@ async fn handle_request(
     state: Arc<ServerState>,
     peer: SocketAddr,
     req: Request<Incoming>,
+    default_site: Option<String>,
 ) -> Result<Response<BoxBody>, Infallible> {
-    match proxy(state, peer, req).await {
+    match proxy(state, peer, req, default_site).await {
         Ok(resp) => Ok(resp),
         Err(e) => {
             error!("proxy error: {e:#}");
@@ -460,6 +618,7 @@ async fn proxy(
     state: Arc<ServerState>,
     peer: SocketAddr,
     req: Request<Incoming>,
+    default_site: Option<String>,
 ) -> anyhow::Result<Response<BoxBody>> {
     let cfg = state.config.load();
     let engine_map = state.engines.load_full();
@@ -510,18 +669,27 @@ async fn proxy(
     ctx.uri = parts.uri.clone();
     ctx.request_headers = parts.headers.clone();
 
-    // Match site by Host header.
+    // Match site by Host header; fall back to the listener's default_site for
+    // port-based routing (e.g. requests arriving on :9095 always go to dvwa).
     let host = ctx.host().map(str::to_owned);
     let site = host
         .as_deref()
-        .and_then(|h| cfg.sites.iter().find(|s| site_matches(s, h)));
+        .and_then(|h| cfg.sites.iter().find(|s| site_matches(s, h)))
+        .or_else(|| {
+            default_site
+                .as_deref()
+                .and_then(|ds| cfg.sites.iter().find(|s| s.id == ds))
+        });
 
     if let Some(s) = &site {
         ctx.site_id = Some(s.id.clone());
     }
 
-    // WAF phase 1: rate limit → bot detect → GeoIP → rule engine.
-    phase1_headers(&mut ctx, site, &engine_map, &state.modules)?;
+    // WAF phase 1: rate limit → bot detect → GeoIP → rule engine → plugins.
+    {
+        let pr = state.plugin_runtime.load();
+        phase1_headers(&mut ctx, site, &engine_map, &state.modules, &pr).await?;
+    }
 
     if ctx.decision == WafDecision::Block {
         let resp = block_response(&ctx);
@@ -545,7 +713,7 @@ async fn proxy(
             .context("collecting request body")?;
         let bytes = collected.to_bytes();
         ctx.request_body = Some(bytes.clone());
-        phase2_body(&mut ctx, site, &engine_map)?;
+        phase2_body(&mut ctx, site, &engine_map, &state.ml_engine)?;
         if ctx.decision == WafDecision::Block {
             let resp = block_response(&ctx);
             ctx.response_status = Some(resp.status());
@@ -616,12 +784,13 @@ async fn proxy(
 // WAF phases
 // ---------------------------------------------------------------------------
 
-/// Phase 1: rate limit → bot detect → GeoIP → rule engine.
-fn phase1_headers(
+/// Phase 1: rate limit → bot detect → GeoIP → rule engine → plugins.
+async fn phase1_headers(
     ctx: &mut RequestContext,
     site: Option<&SiteConfig>,
     engines: &RuleEngineMap,
     modules: &ModulesState,
+    plugin_runtime: &PluginRuntime,
 ) -> anyhow::Result<()> {
     let Some(site) = site else { return Ok(()) };
     if site.waf.mode == WafMode::Off {
@@ -704,25 +873,150 @@ fn phase1_headers(
         }
     }
 
+    // --- WASM plugins ---
+    if ctx.decision == WafDecision::Allow {
+        let plugin_names = plugin_runtime.plugin_names();
+        for plugin_name in &plugin_names {
+            let result = plugin_runtime.evaluate_plugin(plugin_name, ctx).await;
+            // Apply anomaly score delta.
+            if result.anomaly_score_delta > 0 {
+                ctx.anomaly_score = ctx.anomaly_score.saturating_add(result.anomaly_score_delta);
+            }
+            // Apply plugin decision (only if more severe than current).
+            match result.decision {
+                WafDecision::Block => {
+                    ctx.decision = WafDecision::Block;
+                    ctx.block_reason = Some(format!("plugin '{}' set decision", plugin_name));
+                    break;
+                }
+                WafDecision::Challenge if ctx.decision == WafDecision::Allow => {
+                    ctx.decision = WafDecision::Challenge;
+                    ctx.block_reason = Some(format!("plugin '{}' requested challenge", plugin_name));
+                }
+                _ => {}
+            }
+            // Store response headers from plugin.
+            for (name, value) in &result.response_headers {
+                ctx.tx_vars.insert(
+                    format!("plugin_response_header:{}", name),
+                    value.clone(),
+                );
+            }
+
+            // Two-pass callout pattern: if the plugin queued HTTP callouts,
+            // execute them and re-run the plugin so it can read the results.
+            if let Some(ref callouts) = result.pending_callouts {
+                if !callouts.is_empty() {
+                    plugin_runtime.execute_pending_callouts(callouts.clone()).await;
+                    // Re-run the plugin so it can read callout results.
+                    let result2 = plugin_runtime.evaluate_plugin(plugin_name, ctx).await;
+                    if result2.anomaly_score_delta > 0 {
+                        ctx.anomaly_score = ctx.anomaly_score.saturating_add(result2.anomaly_score_delta);
+                    }
+                    match result2.decision {
+                        WafDecision::Block => {
+                            ctx.decision = WafDecision::Block;
+                            ctx.block_reason = Some(format!("plugin '{}' set decision", plugin_name));
+                            break;
+                        }
+                        WafDecision::Challenge if ctx.decision == WafDecision::Allow => {
+                            ctx.decision = WafDecision::Challenge;
+                            ctx.block_reason = Some(format!("plugin '{}' requested challenge", plugin_name));
+                        }
+                        _ => {}
+                    }
+                    for (name, value) in &result2.response_headers {
+                        ctx.tx_vars.insert(
+                            format!("plugin_response_header:{}", name),
+                            value.clone(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     enforce_mode(ctx, &site.waf.mode);
     Ok(())
 }
 
-/// Phase 2: body inspection + anomaly threshold catch-all.
+/// Phase 2: body inspection + ML scoring + anomaly threshold catch-all.
 fn phase2_body(
     ctx: &mut RequestContext,
     site: Option<&SiteConfig>,
     engines: &RuleEngineMap,
+    ml_engine: &MlEngine,
 ) -> anyhow::Result<()> {
     let Some(site) = site else { return Ok(()) };
     if site.waf.mode == WafMode::Off {
         return Ok(());
     }
 
+    // Run the rule engine against the request body.
     if let Some(engine) = engines.get(&site.id) {
         engine.evaluate(ctx, Phase::RequestBody);
     }
 
+    // --- ML scoring ---
+    if let Some(ref ml_cfg) = site.waf.ml {
+        if ml_cfg.enable {
+            let ml_scores = ml_engine.evaluate(ctx);
+
+            // Record all ML scores in the context.
+            ctx.ml_scores
+                .insert("anomaly".to_string(), ml_scores.anomaly_score);
+            ctx.ml_scores
+                .insert("payload_attack".to_string(), ml_scores.payload_attack_score);
+            for (model, score) in &ml_scores.onnx_scores {
+                let key = format!("onnx:{model}");
+                ctx.ml_scores.insert(key, *score);
+            }
+
+            // Add a combined ML score for the rule engine to reference
+            // (SRL operators like `ml_score` can use this).
+            ctx.ml_scores
+                .insert("combined".to_string(), ml_scores.combined_score);
+
+            // If the combined ML score exceeds the sensitivity threshold,
+            // contribute to the anomaly score and flag the request.
+            if ml_scores.combined_score >= ml_cfg.sensitivity {
+                let ml_anomaly_points: u32 =
+                    ((ml_scores.combined_score - ml_cfg.sensitivity) * 10.0).ceil() as u32;
+                let ml_anomaly_points = ml_anomaly_points.min(8);
+
+                if ml_anomaly_points > 0 {
+                    let reason = if ml_scores.anomaly_score >= ml_cfg.sensitivity {
+                        format!(
+                            "ML anomaly: {:.3} (threshold: {:.3})",
+                            ml_scores.anomaly_score, ml_cfg.sensitivity
+                        )
+                    } else if ml_scores.payload_attack_score >= ml_cfg.sensitivity {
+                        format!(
+                            "ML payload attack: {:.3} (threshold: {:.3})",
+                            ml_scores.payload_attack_score, ml_cfg.sensitivity
+                        )
+                    } else {
+                        format!(
+                            "ML combined: {:.3} (threshold: {:.3})",
+                            ml_scores.combined_score, ml_cfg.sensitivity
+                        )
+                    };
+
+                    ctx.anomaly_score = ctx.anomaly_score.saturating_add(ml_anomaly_points);
+                    ctx.rule_matches.push(sentinel_core::context::RuleMatch {
+                        rule_id: "ML-ANOMALY".to_string(),
+                        message: reason,
+                        severity: sentinel_core::context::Severity::Medium,
+                        score: ml_anomaly_points,
+                        target: "ML".to_string(),
+                        phase: Phase::RequestBody,
+                    });
+                }
+            }
+        }
+    }
+
+    // Config-level anomaly threshold catch-all.
     if ctx.decision != WafDecision::Block
         && ctx.anomaly_score > 0
         && ctx.anomaly_score >= site.waf.anomaly_threshold
@@ -834,6 +1128,31 @@ fn build_anti_ddos(cfg: &SentinelConfig) -> AntiDdos {
     AntiDdos::disabled()
 }
 
+/// Return a canonical upper-case name for a target (used for exclusion matching).
+fn target_name(t: &sentinel_rules::dsl::ast::Target) -> String {
+    use sentinel_rules::dsl::ast::Target;
+    match t {
+        Target::Args => "ARGS".into(),
+        Target::ArgsNames => "ARGS_NAMES".into(),
+        Target::RequestBody => "REQUEST_BODY".into(),
+        Target::RequestUri => "REQUEST_URI".into(),
+        Target::RequestFilename => "REQUEST_FILENAME".into(),
+        Target::RequestMethod => "REQUEST_METHOD".into(),
+        Target::RequestLine => "REQUEST_LINE".into(),
+        Target::RequestHeaders(None) => "REQUEST_HEADERS".into(),
+        Target::RequestHeaders(Some(h)) => format!("REQUEST_HEADERS:{h}"),
+        Target::RequestCookies(None) => "REQUEST_COOKIES".into(),
+        Target::RequestCookies(Some(c)) => format!("REQUEST_COOKIES:{c}"),
+        Target::ResponseHeaders(None) => "RESPONSE_HEADERS".into(),
+        Target::ResponseHeaders(Some(h)) => format!("RESPONSE_HEADERS:{h}"),
+        Target::ResponseBody => "RESPONSE_BODY".into(),
+        Target::RemoteAddr => "REMOTE_ADDR".into(),
+        Target::Geo => "GEO".into(),
+        Target::TxVar(v) => format!("TX:{v}"),
+        Target::CountOf(_) => "COUNT_OF".into(),
+    }
+}
+
 fn load_site_engine(site: &SiteConfig) -> anyhow::Result<RuleEngine> {
     use sentinel_rules::dsl::ast::{RuleFile, RuleItem};
 
@@ -884,28 +1203,81 @@ fn load_site_engine(site: &SiteConfig) -> anyhow::Result<RuleEngine> {
         );
     }
 
+    // Apply rule target exclusions (ctl:ruleRemoveTargetById equivalent).
+    // Removes the specified targets from a rule before compilation so that
+    // known false-positive targets are never evaluated for that rule.
+    for exclusion in &site.waf.rule_exclusions {
+        if exclusion.exclude_targets.is_empty() {
+            continue;
+        }
+        let excl_upper: Vec<String> = exclusion
+            .exclude_targets
+            .iter()
+            .map(|t| t.to_ascii_uppercase())
+            .collect();
+        for item in &mut merged.items {
+            if let RuleItem::Rule(rule) = item {
+                if rule.id == exclusion.rule_id {
+                    let before_len = rule.targets.len();
+                    rule.targets
+                        .retain(|t| !excl_upper.contains(&target_name(&t.target).to_ascii_uppercase()));
+                    if rule.targets.len() < before_len {
+                        debug!(
+                            site = %site.id,
+                            rule_id = exclusion.rule_id,
+                            excluded = ?excl_upper,
+                            "rule target exclusion applied"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     sentinel_rules::compile(merged)
         .map(RuleEngine::new)
         .with_context(|| format!("compiling rules for site '{}'", site.id))
 }
 
 // ---------------------------------------------------------------------------
+// Plugin runtime builder
+// ---------------------------------------------------------------------------
+
+/// Build a [`PluginRuntime`] by loading all plugin manifests referenced in
+/// the site configs.  Errors for individual plugins are logged and skipped.
+fn build_plugin_runtime(cfg: &SentinelConfig) -> anyhow::Result<PluginRuntime> {
+    let mut rt = PluginRuntime::new()?;
+    let mut loaded = 0usize;
+    let mut failed = 0usize;
+
+    for site in &cfg.sites {
+        for manifest_path in &site.waf.plugins {
+            match rt.load_from_manifest(std::path::Path::new(manifest_path)) {
+                Ok(()) => loaded += 1,
+                Err(e) => {
+                    warn!(site = %site.id, path = %manifest_path, "failed to load plugin: {e:#}");
+                    failed += 1;
+                }
+            }
+        }
+    }
+
+    if loaded > 0 || failed > 0 {
+        info!(loaded, failed, "plugin runtime built");
+    }
+
+    Ok(rt)
+}
+
+// ---------------------------------------------------------------------------
 // IP feed loader helpers
 // ---------------------------------------------------------------------------
 
-/// Fetch a CIDR block-list from an HTTP URL and return one CIDR per line.
+/// Fetch a CIDR block-list from an HTTP or HTTPS URL and return one CIDR per line.
 ///
 /// Lines starting with `#` and blank lines are skipped.
-/// HTTPS URLs are not yet supported (Phase 3+); a descriptive error is
-/// returned so the caller can log and continue.
+/// Supports HTTP, HTTPS (via hyper-rustls with WebPKI roots), and `file://` paths.
 async fn fetch_feed_cidrs(url: &str) -> anyhow::Result<Vec<String>> {
-    if url.starts_with("https://") {
-        anyhow::bail!(
-            "HTTPS feeds require rustls connector (Phase 3+): {url}. \
-             Use an HTTP mirror or a file:// path for now."
-        );
-    }
-
     if let Some(path) = url.strip_prefix("file://") {
         let text = tokio::fs::read_to_string(path)
             .await
@@ -913,15 +1285,25 @@ async fn fetch_feed_cidrs(url: &str) -> anyhow::Result<Vec<String>> {
         return Ok(parse_cidr_text(&text));
     }
 
-    let client: Client<HttpConnector, Empty<Bytes>> =
-        Client::builder(TokioExecutor::new()).build(HttpConnector::new());
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_webpki_roots()
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .build();
+    let client: Client<_, http_body_util::combinators::BoxBody<Bytes, hyper::Error>> =
+        Client::builder(TokioExecutor::new()).build(https);
 
     let uri: Uri = url.parse().with_context(|| format!("invalid feed URL: {url}"))?;
     let req = Request::builder()
         .method("GET")
         .uri(uri)
-        .header("User-Agent", "sentinel-waf/0.1 (ip-reputation-feed)")
-        .body(Empty::<Bytes>::new())
+        .header("User-Agent", "sentinel-waf/1.0 ip-reputation-feed-fetcher")
+        .body(
+            http_body_util::Empty::<Bytes>::new()
+                .map_err(|never: std::convert::Infallible| match never {})
+                .boxed(),
+        )
         .context("building feed request")?;
 
     let resp = tokio::time::timeout(Duration::from_secs(30), client.request(req))
@@ -951,12 +1333,16 @@ fn parse_cidr_text(text: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 fn site_matches(site: &SiteConfig, host: &str) -> bool {
+    // HTTP Host headers are case-insensitive per RFC 7230 §5.4.
+    // Lowercase both sides so `Host: JUICE.LOCAL` still matches `juice.local`.
+    let host_lc = host.to_ascii_lowercase();
     site.domains.iter().any(|d| {
-        if d.starts_with("*.") {
-            let suffix = &d[1..];
-            host.ends_with(suffix) || host == &d[2..]
+        let d_lc = d.to_ascii_lowercase();
+        if d_lc.starts_with("*.") {
+            let suffix = &d_lc[1..];
+            host_lc.ends_with(&*suffix) || host_lc == &d_lc[2..]
         } else {
-            d == host
+            d_lc == host_lc
         }
     })
 }
@@ -1091,6 +1477,85 @@ fn log_request(ctx: &RequestContext) {
         block_reason = ctx.block_reason.as_deref().unwrap_or(""),
         "request"
     );
+    if let Err(e) = ndjson_log(ctx) {
+        tracing::warn!(error = %e, "ndjson log write failed");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NDJSON file logger — writes to $SENTINEL_LOG_DIR (default /tmp/sentinel-logs)
+// ---------------------------------------------------------------------------
+
+fn ndjson_log(ctx: &RequestContext) -> std::io::Result<()> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    let log_dir = std::env::var("SENTINEL_LOG_DIR")
+        .unwrap_or_else(|_| "/tmp/sentinel-logs".to_string());
+    let dir = std::path::Path::new(&log_dir);
+    std::fs::create_dir_all(dir)?;
+
+    let ts  = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let status = ctx.response_status.map(|s| s.as_u16()).unwrap_or(0);
+    let ua  = ctx.request_headers
+        .get(http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-");
+    let action = match ctx.decision {
+        WafDecision::Block | WafDecision::Challenge => "BLOCK",
+        _ => "PASS",
+    };
+    let site = ctx.site_id.as_deref().unwrap_or("-");
+
+    // ── access.log ──────────────────────────────────────────────────────────
+    let access = serde_json::json!({
+        "ts":      ts,
+        "ip":      ctx.client_ip.to_string(),
+        "method":  ctx.method.as_str(),
+        "path":    ctx.uri.path(),
+        "status":  status,
+        "latency": format!("{:.2}", ctx.elapsed_ms()),
+        "bytes":   ctx.bytes_sent,
+        "site":    site,
+        "ua":      ua,
+        "action":  action,
+        "score":   ctx.anomaly_score,
+    });
+    {
+        let mut f = OpenOptions::new().append(true).create(true)
+            .open(dir.join("access.log"))?;
+        writeln!(f, "{}", access)?;
+    }
+
+    // ── waf.log — only when rules fired or request is blocked ───────────────
+    if !ctx.rule_matches.is_empty() || matches!(ctx.decision, WafDecision::Block) {
+        let top = ctx.rule_matches.first();
+        let sev_str = top
+            .map(|r| format!("{:?}", r.severity).to_uppercase())
+            .unwrap_or_else(|| "MEDIUM".to_string());
+        let attack = top
+            .map(|r| r.message.as_str())
+            .unwrap_or("anomaly threshold exceeded");
+
+        let waf = serde_json::json!({
+            "ts":     ts,
+            "ip":     ctx.client_ip.to_string(),
+            "method": ctx.method.as_str(),
+            "path":   ctx.uri.path(),
+            "rule":   top.map(|r| r.rule_id.as_str()).unwrap_or("-"),
+            "score":  ctx.anomaly_score,
+            "sev":    sev_str,
+            "attack": attack,
+            "action": action,
+            "site":   site,
+            "msg":    ctx.block_reason.as_deref().unwrap_or(""),
+        });
+        let mut f = OpenOptions::new().append(true).create(true)
+            .open(dir.join("waf.log"))?;
+        writeln!(f, "{}", waf)?;
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

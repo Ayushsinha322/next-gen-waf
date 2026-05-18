@@ -10,4 +10,4 @@ if [ ! -d node_modules ]; then
   npm install
 fi
 
-exec npm run dev
+exec npm run dev -- --port 2222

@@ -301,4 +301,200 @@ rule 2 { phase: request_headers targets: ARGS operator: exists action: log messa
         .unwrap();
         assert_eq!(engine.rule_count(), 2);
     }
+
+    // ------------------------------------------------------------------
+    // Transform tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn transform_lowercase_catches_uppercase_attack() {
+        // Rule uses @rx with a lowercase pattern; t:lowercase ensures it matches UPPERCASE input.
+        let engine = RuleEngine::from_crs_conf(
+            r#"SecRule ARGS "@rx select" "id:1001,phase:2,block,t:lowercase,msg:'SQLi lower'""#,
+        )
+        .unwrap();
+
+        let mut ctx = make_ctx();
+        ctx.uri = "http://example.com/?q=SELECT%201".parse().unwrap();
+
+        engine.evaluate(&mut ctx, Phase::RequestBody);
+        assert_eq!(ctx.decision, WafDecision::Block, "lowercase transform should normalise SELECT → select");
+    }
+
+    #[test]
+    fn transform_lowercase_clean_request_passes() {
+        let engine = RuleEngine::from_crs_conf(
+            r#"SecRule ARGS "@rx select" "id:1001,phase:2,block,t:lowercase,msg:'SQLi lower'""#,
+        )
+        .unwrap();
+
+        let mut ctx = make_ctx();
+        ctx.uri = "http://example.com/?q=normal+query".parse().unwrap();
+
+        engine.evaluate(&mut ctx, Phase::RequestBody);
+        assert!(
+            ctx.decision != WafDecision::Block,
+            "clean request must not be blocked by lowercase rule"
+        );
+    }
+
+    #[test]
+    fn transform_remove_nulls_strips_before_match() {
+        // Null-byte injection: "se\0lect" evades naive regex but RemoveNulls fixes that.
+        let engine = RuleEngine::from_crs_conf(
+            r#"SecRule ARGS "@rx select" "id:1002,phase:2,block,t:removeNulls,t:lowercase,msg:'null inject'""#,
+        )
+        .unwrap();
+
+        let mut ctx = make_ctx();
+        // "se\x00lect" — null byte injected into the keyword
+        ctx.uri = "http://example.com/?x=se%00lect".parse().unwrap();
+
+        engine.evaluate(&mut ctx, Phase::RequestBody);
+        assert_eq!(
+            ctx.decision,
+            WafDecision::Block,
+            "removeNulls + lowercase should expose the injected keyword"
+        );
+    }
+
+    #[test]
+    fn transform_html_entity_decode_catches_encoded_xss() {
+        // &lt;script&gt; decoded → <script> which the regex matches.
+        let engine = RuleEngine::from_crs_conf(
+            r#"SecRule ARGS "@rx <script" "id:1003,phase:2,block,t:htmlEntityDecode,t:lowercase,msg:'XSS'""#,
+        )
+        .unwrap();
+
+        let mut ctx = make_ctx();
+        ctx.uri = "http://example.com/?x=%26lt%3Bscript%26gt%3B".parse().unwrap();
+        // Decoded ARGS value: "&lt;script&gt;" — htmlEntityDecode turns this to "<script>"
+        ctx.request_body = Some(Bytes::from("x=&lt;script&gt;alert(1)&lt;/script&gt;"));
+
+        engine.evaluate(&mut ctx, Phase::RequestBody);
+        assert_eq!(ctx.decision, WafDecision::Block, "htmlEntityDecode should expose encoded script tag");
+    }
+
+    // ------------------------------------------------------------------
+    // setvar fix tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn setvar_only_anomaly_score_lhs_counts() {
+        use crate::crs_compat::secrule::parse_crs_actions;
+        // LHS is a category tracker — should NOT contribute to rule score_delta
+        let actions = parse_crs_actions("id:1,phase:2,pass,setvar:tx.sql_injection_score=+%{tx.critical_anomaly_score}");
+        assert_eq!(
+            actions.score_delta, None,
+            "category score vars must not be counted as anomaly_score deltas"
+        );
+    }
+
+    #[test]
+    fn setvar_anomaly_score_lhs_gives_delta() {
+        use crate::crs_compat::secrule::parse_crs_actions;
+        let actions = parse_crs_actions(
+            "id:1,phase:2,pass,setvar:tx.anomaly_score=+%{tx.critical_anomaly_score}",
+        );
+        assert_eq!(actions.score_delta, Some(5));
+    }
+
+    #[test]
+    fn setvar_negative_delta() {
+        use crate::crs_compat::secrule::parse_crs_actions;
+        let actions = parse_crs_actions("id:1,phase:2,pass,setvar:tx.anomaly_score=-3");
+        assert_eq!(actions.score_delta, Some(-3));
+    }
+
+    #[test]
+    fn setvar_absolute_assignment_ignored() {
+        use crate::crs_compat::secrule::parse_crs_actions;
+        // No + or - prefix → absolute assignment, not a delta
+        let actions = parse_crs_actions("id:1,phase:2,pass,setvar:tx.anomaly_score=10");
+        assert_eq!(
+            actions.score_delta, None,
+            "absolute setvar assignment must not be treated as a delta"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // skipAfter tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn skipafter_is_not_in_unknown_actions() {
+        use crate::crs_compat::secrule::parse_crs_actions;
+        let actions = parse_crs_actions(
+            "id:920020,phase:1,pass,nolog,skipAfter:END-REQUEST-920-PROTOCOL-ENFORCEMENT",
+        );
+        assert!(
+            actions.unknown.is_empty(),
+            "skipAfter must not produce unrecognised-action warnings, got: {:?}",
+            actions.unknown
+        );
+        assert_eq!(
+            actions.skip_after.as_deref(),
+            Some("END-REQUEST-920-PROTOCOL-ENFORCEMENT")
+        );
+    }
+
+    #[test]
+    fn skipafter_stored_on_rule_def() {
+        use crate::crs_compat::import_secrule_conf;
+        use crate::dsl::ast::RuleItem;
+        let src = r#"SecRule TX:DETECTION_PARANOIA_LEVEL "@lt 2" "id:920020,phase:1,pass,nolog,skipAfter:END-REQUEST-ENFORCEMENT""#;
+        let rf = import_secrule_conf(src).expect("import");
+        let rule = rf.items.iter().find_map(|i| {
+            if let RuleItem::Rule(r) = i { Some(r) } else { None }
+        }).expect("rule");
+        assert_eq!(rule.skip_after.as_deref(), Some("END-REQUEST-ENFORCEMENT"));
+    }
+
+    #[test]
+    fn skipafter_enforced_in_vm() {
+        // Gate rule (id=10): fires for ARGS="safe" → skipAfter:SECTION_END skips rule 20.
+        // Block rule (id=20): fires for any ARGS — must be skipped when gate fires.
+        // SecMarker SECTION_END
+        //
+        // This matches real CRS paranoia-level gating: the gate rule fires when
+        // the input meets a "safe" criterion and jumps past the stricter rules.
+        let src = r#"
+SecRule ARGS "@rx ^safe$" "id:10,phase:2,pass,nolog,skipAfter:SECTION_END,msg:'gate fired'"
+SecRule ARGS "@rx ." "id:20,phase:2,block,msg:'catch-all block — skipped when gate fires'"
+SecMarker "SECTION_END"
+"#;
+        use crate::crs_compat::import_secrule_conf;
+        let rf = import_secrule_conf(src).expect("import");
+        let engine = RuleEngine::new(compile(rf).expect("compile"));
+
+        // === Path 1: ARGS="safe" → gate fires, block rule must be skipped ===
+        let mut ctx_gate = make_ctx();
+        ctx_gate.uri = "http://example.com/?param=safe".parse().unwrap();
+        engine.evaluate(&mut ctx_gate, Phase::RequestBody);
+
+        assert!(
+            ctx_gate.rule_matches.iter().any(|m| m.rule_id == "10"),
+            "gate rule must fire for ARGS=safe"
+        );
+        assert!(
+            !ctx_gate.rule_matches.iter().any(|m| m.rule_id == "20"),
+            "block rule must be skipped when gate fires"
+        );
+        assert_eq!(ctx_gate.decision, WafDecision::Allow, "gate uses pass — must stay Allow");
+
+        // === Path 2: ARGS="other" → gate does NOT fire, block rule runs ===
+        let mut ctx_no_gate = make_ctx();
+        ctx_no_gate.uri = "http://example.com/?param=other".parse().unwrap();
+        engine.evaluate(&mut ctx_no_gate, Phase::RequestBody);
+
+        assert!(
+            !ctx_no_gate.rule_matches.iter().any(|m| m.rule_id == "10"),
+            "gate must not fire for ARGS=other"
+        );
+        assert!(
+            ctx_no_gate.rule_matches.iter().any(|m| m.rule_id == "20"),
+            "block rule must fire when gate doesn't"
+        );
+        assert_eq!(ctx_no_gate.decision, WafDecision::Block);
+    }
 }

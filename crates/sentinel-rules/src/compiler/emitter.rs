@@ -4,7 +4,7 @@ use aho_corasick::AhoCorasick;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::dsl::ast::{RuleAction, RulePhase, RuleSeverity, Target};
+use crate::dsl::ast::{RuleAction, RulePhase, RuleSeverity, Target, Transform};
 
 // ---------------------------------------------------------------------------
 // Target specification stored in instructions
@@ -16,6 +16,8 @@ pub enum TargetSpec {
     ArgsNames,
     RequestBody,
     RequestUri,
+    RequestFilename,
+    RequestMethod,
     RequestLine,
     RequestHeadersAll,
     RequestHeader(String),
@@ -27,6 +29,7 @@ pub enum TargetSpec {
     RemoteAddr,
     Geo,
     TxVar(String),
+    CountOf(Box<TargetSpec>),
 }
 
 impl From<&Target> for TargetSpec {
@@ -36,6 +39,8 @@ impl From<&Target> for TargetSpec {
             Target::ArgsNames => TargetSpec::ArgsNames,
             Target::RequestBody => TargetSpec::RequestBody,
             Target::RequestUri => TargetSpec::RequestUri,
+            Target::RequestFilename => TargetSpec::RequestFilename,
+            Target::RequestMethod => TargetSpec::RequestMethod,
             Target::RequestLine => TargetSpec::RequestLine,
             Target::RequestHeaders(None) => TargetSpec::RequestHeadersAll,
             Target::RequestHeaders(Some(h)) => TargetSpec::RequestHeader(h.clone()),
@@ -47,6 +52,7 @@ impl From<&Target> for TargetSpec {
             Target::RemoteAddr => TargetSpec::RemoteAddr,
             Target::Geo => TargetSpec::Geo,
             Target::TxVar(v) => TargetSpec::TxVar(v.clone()),
+            Target::CountOf(inner) => TargetSpec::CountOf(Box::new(TargetSpec::from(inner.as_ref()))),
         }
     }
 }
@@ -76,6 +82,9 @@ pub enum Instruction {
     /// Pop `StrVec`, push `Bool(!values.is_empty() && values.iter().any(|s| !s.is_empty()))`.
     Exists,
 
+    /// Always push `Bool(false)` — used for intentionally disabled rules.
+    Never,
+
     /// Push the current anomaly score as `Int`.
     LoadAnomalyScore,
 
@@ -94,6 +103,9 @@ pub enum Instruction {
     Or,
     Not,
 
+    /// Pop `StrVec`, apply each transform in order, push transformed `StrVec`.
+    ApplyTransforms(Vec<Transform>),
+
     /// Jump `offset` instructions forward if stack top is Bool(false).
     /// Does NOT pop the stack.
     JmpIfFalse { offset: i32 },
@@ -101,6 +113,11 @@ pub enum Instruction {
     /// Pop Bool from stack.  If true, apply the rule's action/score/log.
     /// The rule metadata is looked up by `rule_id` in `CompiledRuleSet::rule_meta`.
     RuleEnd { rule_id: u32 },
+
+    /// Named label emitted for each `SecMarker` directive.
+    /// Acts as a no-op at runtime; `skipAfter` rules jump to the first
+    /// `Marker` whose name matches their `skip_after` field.
+    Marker(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +133,9 @@ pub struct RuleMeta {
     pub action: RuleAction,
     pub tags: Vec<String>,
     pub phase: RulePhase,
+    /// CRS `skipAfter:MARKER` — if this rule fires, the VM jumps forward
+    /// to the `Marker` instruction with this name, skipping all rules in between.
+    pub skip_after: Option<String>,
 }
 
 impl Default for RuleMeta {
@@ -128,6 +148,7 @@ impl Default for RuleMeta {
             action: RuleAction::Log,
             tags: Vec::new(),
             phase: RulePhase::RequestBody,
+            skip_after: None,
         }
     }
 }

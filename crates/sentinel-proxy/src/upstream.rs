@@ -75,6 +75,20 @@ impl UpstreamPool {
             .cloned()
     }
 
+    /// Atomically sync the pool from a new site list received from the
+    /// control plane. Adds/updates entries and removes stale ones.
+    pub fn sync_sites(&self, sites: &[sentinel_core::config::SiteConfig]) {
+        use std::collections::HashSet;
+        for site in sites {
+            self.sites.insert(
+                site.id.clone(),
+                Arc::new(SiteUpstream::new(site.upstream.servers.clone())),
+            );
+        }
+        let live: HashSet<&str> = sites.iter().map(|s| s.id.as_str()).collect();
+        self.sites.retain(|id, _| live.contains(id.as_str()));
+    }
+
     /// Send an HTTP/1.1 request to the upstream.
     ///
     /// Opens a fresh TCP connection for each request.  A keep-alive pool

@@ -2,7 +2,7 @@ use sentinel_core::context::{Phase, RequestContext, RuleMatch, Severity, WafDeci
 use tracing::{debug, warn};
 
 use super::emitter::{CompiledRuleSet, Instruction, RuleMeta, TargetSpec};
-use crate::dsl::ast::{RuleAction, RulePhase, RuleSeverity};
+use crate::dsl::ast::{RuleAction, RulePhase, RuleSeverity, Transform};
 
 fn rule_phase_to_phase(rp: RulePhase) -> Phase {
     match rp {
@@ -26,6 +26,7 @@ enum StackVal {
     Strings(Vec<String>),
     Int(i64),
     Float(f32),
+    Absent,
 }
 
 // ---------------------------------------------------------------------------
@@ -50,6 +51,58 @@ fn percent_decode(s: &str) -> String {
     percent_encoding::percent_decode_str(s)
         .decode_utf8_lossy()
         .into_owned()
+}
+
+/// Decode both standard `%XX` and Microsoft IIS-style `%uXXXX` Unicode escapes.
+/// Used by the `UrlDecodeUni` transform to match ModSecurity's `t:urlDecodeUni`.
+fn url_decode_uni(s: &str) -> String {
+    // Fast path: if no `%`, nothing to decode.
+    if !s.contains('%') {
+        return s.to_owned();
+    }
+
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            // Check for %uXXXX (4 hex digits after 'u' or 'U').
+            if i + 5 < bytes.len()
+                && (bytes[i + 1] == b'u' || bytes[i + 1] == b'U')
+                && bytes[i + 2..i + 6].iter().all(|b| b.is_ascii_hexdigit())
+            {
+                let hex = std::str::from_utf8(&bytes[i + 2..i + 6]).unwrap_or("0000");
+                if let Ok(n) = u32::from_str_radix(hex, 16) {
+                    if let Some(ch) = char::from_u32(n) {
+                        out.push(ch);
+                        i += 6;
+                        continue;
+                    }
+                }
+            }
+            // Standard %XX — delegate to percent_encoding for the remainder.
+            out.push_str(&percent_encoding::percent_decode_str(&s[i..])
+                .decode_utf8_lossy()
+                .chars()
+                .take(1)
+                .collect::<String>());
+            // Advance past `%XX` (3 bytes if valid, 1 byte if not).
+            if i + 2 < bytes.len()
+                && bytes[i + 1].is_ascii_hexdigit()
+                && bytes[i + 2].is_ascii_hexdigit()
+            {
+                i += 3;
+            } else {
+                out.pop();
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Parse the Cookie header into (name, value) pairs.
@@ -79,6 +132,8 @@ fn extract_target(spec: &TargetSpec, ctx: &RequestContext) -> Vec<String> {
                 .collect()
         }
         TargetSpec::RequestUri => vec![ctx.uri.to_string()],
+        TargetSpec::RequestFilename => vec![ctx.uri.path().to_owned()],
+        TargetSpec::RequestMethod => vec![ctx.method.as_str().to_owned()],
         TargetSpec::RequestLine => vec![format!(
             "{} {} {:?}",
             ctx.method, ctx.uri, ctx.http_version
@@ -146,6 +201,20 @@ fn extract_target(spec: &TargetSpec, ctx: &RequestContext) -> Vec<String> {
             .get(name)
             .map(|v| vec![v.clone()])
             .unwrap_or_default(),
+        TargetSpec::CountOf(inner) => {
+            let count = match inner.as_ref() {
+                TargetSpec::RequestHeader(name) => {
+                    ctx.request_headers.get_all(name.as_str()).iter().count()
+                }
+                TargetSpec::ResponseHeader(name) => ctx
+                    .response_headers
+                    .as_ref()
+                    .map(|h| h.get_all(name.as_str()).iter().count())
+                    .unwrap_or(0),
+                other => extract_target(other, ctx).len(),
+            };
+            vec![count.to_string()]
+        }
     }
 }
 
@@ -188,35 +257,57 @@ pub fn evaluate(ruleset: &CompiledRuleSet, ctx: &mut RequestContext, phase: Phas
 
             Instruction::MatchRx { pattern_id } => {
                 let values = pop_strings(&mut stack);
-                let regex = &ruleset.patterns[*pattern_id];
-                let matched = values.iter().any(|s| regex.is_match(s));
-                debug!(
-                    pattern = %regex.as_str(),
-                    matched,
-                    "MatchRx"
-                );
-                stack.push(StackVal::Bool(matched));
+                if values.is_empty() {
+                    stack.push(StackVal::Absent);
+                } else {
+                    let regex = &ruleset.patterns[*pattern_id];
+                    let matched = values.iter().any(|s| regex.is_match(s));
+                    debug!(pattern = %regex.as_str(), matched, "MatchRx");
+                    stack.push(StackVal::Bool(matched));
+                }
             }
 
             Instruction::MatchMulti { set_id } => {
                 let values = pop_strings(&mut stack);
-                let ac = &ruleset.ac_sets[*set_id];
-                let matched = values.iter().any(|s| ac.is_match(s));
-                debug!(set_id, matched, "MatchMulti");
-                stack.push(StackVal::Bool(matched));
+                if values.is_empty() {
+                    stack.push(StackVal::Absent);
+                } else {
+                    let ac = &ruleset.ac_sets[*set_id];
+                    let matched = values.iter().any(|s| ac.is_match(s));
+                    debug!(set_id, matched, "MatchMulti");
+                    stack.push(StackVal::Bool(matched));
+                }
             }
 
             Instruction::MatchEq { literal_id } => {
                 let values = pop_strings(&mut stack);
-                let literal = &ruleset.literals[*literal_id];
-                let matched = values.iter().any(|s| s == literal);
-                stack.push(StackVal::Bool(matched));
+                if values.is_empty() {
+                    stack.push(StackVal::Absent);
+                } else {
+                    let literal = &ruleset.literals[*literal_id];
+                    let matched = values.iter().any(|s| s == literal);
+                    stack.push(StackVal::Bool(matched));
+                }
             }
 
             Instruction::Exists => {
                 let values = pop_strings(&mut stack);
                 let exists = !values.is_empty() && values.iter().any(|s| !s.is_empty());
                 stack.push(StackVal::Bool(exists));
+            }
+
+            Instruction::Never => {
+                let _ = pop_strings(&mut stack);
+                stack.push(StackVal::Bool(false));
+            }
+
+            Instruction::ApplyTransforms(transforms) => {
+                let values = pop_strings(&mut stack);
+                let transformed: Vec<String> = values
+                    .into_iter()
+                    .map(|s| apply_transforms(s, transforms))
+                    .collect();
+                stack.push(StackVal::Strings(transformed));
             }
 
             Instruction::LoadAnomalyScore => {
@@ -252,8 +343,14 @@ pub fn evaluate(ruleset: &CompiledRuleSet, ctx: &mut RequestContext, phase: Phas
             }
 
             Instruction::Not => {
-                let b = pop_bool(&mut stack);
-                stack.push(StackVal::Bool(!b));
+                match stack.pop() {
+                    Some(StackVal::Absent) => stack.push(StackVal::Bool(false)),
+                    Some(StackVal::Bool(b)) => stack.push(StackVal::Bool(!b)),
+                    other => {
+                        warn!("VM: Not: unexpected stack value {:?}", other);
+                        stack.push(StackVal::Bool(false));
+                    }
+                }
             }
 
             Instruction::JmpIfFalse { offset } => {
@@ -269,10 +366,24 @@ pub fn evaluate(ruleset: &CompiledRuleSet, ctx: &mut RequestContext, phase: Phas
                 if fired {
                     if let Some(meta) = ruleset.rule_meta.get(rule_id) {
                         fire_rule(ctx, meta);
+                        // skipAfter: scan forward for the named Marker and jump to it.
+                        // ip += 1 at loop end then steps past the Marker (which is a no-op).
+                        if let Some(marker) = &meta.skip_after {
+                            let search_from = ip + 1;
+                            if let Some(rel) = program[search_from..].iter().position(|instr| {
+                                if let Instruction::Marker(m) = instr { m == marker } else { false }
+                            }) {
+                                ip = search_from + rel;
+                            }
+                        }
                     } else {
                         warn!(rule_id, "RuleEnd: no metadata found for rule");
                     }
                 }
+            }
+
+            Instruction::Marker(_) => {
+                // Named label — no-op at runtime; used as a skip target.
             }
         }
         ip += 1;
@@ -313,15 +424,22 @@ fn fire_rule(ctx: &mut RequestContext, meta: &RuleMeta) {
         ctx.anomaly_score = ctx.anomaly_score.saturating_add(meta.score_delta as u32);
     }
 
-    // Log the match
-    ctx.rule_matches.push(RuleMatch {
-        rule_id: meta.id.to_string(),
-        message: meta.message.clone(),
-        severity: map_severity(meta.severity),
-        score: meta.score_delta.max(0) as u32,
-        target: String::new(), // TODO: capture which target matched
-        phase,
-    });
+    // Only record in rule_matches when the rule has observable effect.
+    // CRS paranoia-level skip-gates (pass, no score, no message) are silent.
+    let is_silent = meta.message.is_empty()
+        && meta.score_delta <= 0
+        && matches!(meta.action, RuleAction::Score | RuleAction::Log);
+
+    if !is_silent {
+        ctx.rule_matches.push(RuleMatch {
+            rule_id: meta.id.to_string(),
+            message: meta.message.clone(),
+            severity: map_severity(meta.severity),
+            score: meta.score_delta.max(0) as u32,
+            target: String::new(),
+            phase,
+        });
+    }
 
     debug!(
         rule_id = meta.id,
@@ -329,6 +447,163 @@ fn fire_rule(ctx: &mut RequestContext, meta: &RuleMeta) {
         score_delta = meta.score_delta,
         "rule fired"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Transform helpers
+// ---------------------------------------------------------------------------
+
+fn apply_transforms(mut s: String, transforms: &[Transform]) -> String {
+    for t in transforms {
+        s = match t {
+            Transform::Lowercase => s.to_ascii_lowercase(),
+            Transform::UrlDecodeUni => url_decode_uni(&s),
+            Transform::RemoveNulls => s.replace('\0', ""),
+            Transform::ReplaceNulls => s.replace('\0', " "),
+            Transform::HtmlEntityDecode => decode_html_entities(s),
+            Transform::RemoveWhitespace => s.chars().filter(|c| !c.is_ascii_whitespace()).collect(),
+            Transform::CompressWhitespace => compress_whitespace(s),
+            Transform::JsDecode => decode_js_escapes(s),
+            Transform::CssDecode => decode_css_escapes(s),
+        };
+    }
+    s
+}
+
+fn decode_html_entities(s: String) -> String {
+    if !s.contains('&') {
+        return s;
+    }
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#x27;", "'")
+        .replace("&#39;", "'")
+        .replace("&#x2F;", "/")
+        .replace("&#47;", "/")
+        .replace("&#x3C;", "<")
+        .replace("&#60;", "<")
+        .replace("&#x3E;", ">")
+        .replace("&#62;", ">")
+}
+
+fn compress_whitespace(s: String) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for c in s.chars() {
+        if c.is_ascii_whitespace() {
+            if !prev_space {
+                out.push(' ');
+            }
+            prev_space = true;
+        } else {
+            out.push(c);
+            prev_space = false;
+        }
+    }
+    out
+}
+
+fn decode_js_escapes(s: String) -> String {
+    if !s.contains('\\') {
+        return s;
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek().copied() {
+            Some('u') => {
+                chars.next();
+                let hex: String = chars.by_ref().take(4).collect();
+                if hex.len() == 4 {
+                    if let Ok(n) = u32::from_str_radix(&hex, 16) {
+                        if let Some(ch) = char::from_u32(n) {
+                            out.push(ch);
+                            continue;
+                        }
+                    }
+                }
+                out.push('\\');
+                out.push('u');
+                out.push_str(&hex);
+            }
+            Some('x') => {
+                chars.next();
+                let hex: String = chars.by_ref().take(2).collect();
+                if hex.len() == 2 {
+                    if let Ok(n) = u32::from_str_radix(&hex, 16) {
+                        if let Some(ch) = char::from_u32(n) {
+                            out.push(ch);
+                            continue;
+                        }
+                    }
+                }
+                out.push('\\');
+                out.push('x');
+                out.push_str(&hex);
+            }
+            Some('n') => { chars.next(); out.push('\n'); }
+            Some('r') => { chars.next(); out.push('\r'); }
+            Some('t') => { chars.next(); out.push('\t'); }
+            Some('\\') => { chars.next(); out.push('\\'); }
+            _ => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Decode CSS hex escape sequences: `\NNNNNN` (1-6 hex digits) optionally
+/// followed by a single whitespace character or semicolon.
+///
+/// Examples: `\0041` → `A`, `\26 ` → `&`, `\000026;` → `&`.
+fn decode_css_escapes(s: String) -> String {
+    if !s.contains('\\') {
+        return s;
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        // Collect up to 6 hex digits.
+        let mut hex = String::new();
+        while hex.len() < 6 {
+            match chars.peek() {
+                Some(&h) if h.is_ascii_hexdigit() => { hex.push(h); chars.next(); }
+                _ => break,
+            }
+        }
+        if hex.is_empty() {
+            // Not a hex escape — treat backslash literally.
+            out.push('\\');
+            continue;
+        }
+        // Consume optional trailing whitespace/semicolon (one char only).
+        match chars.peek() {
+            Some(&' ') | Some(&'\t') | Some(&'\n') | Some(&'\r') | Some(&'\x0C') | Some(&';') => {
+                chars.next();
+            }
+            _ => {}
+        }
+        if let Ok(n) = u32::from_str_radix(&hex, 16) {
+            if let Some(ch) = char::from_u32(n) {
+                out.push(ch);
+                continue;
+            }
+        }
+        // Invalid codepoint — emit the escape literally.
+        out.push('\\');
+        out.push_str(&hex);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -352,6 +627,7 @@ fn pop_strings(stack: &mut Vec<StackVal>) -> Vec<String> {
 fn pop_bool(stack: &mut Vec<StackVal>) -> bool {
     match stack.pop() {
         Some(StackVal::Bool(b)) => b,
+        Some(StackVal::Absent) => false,
         Some(other) => {
             warn!("VM: expected Bool on stack, got {:?}", other);
             false

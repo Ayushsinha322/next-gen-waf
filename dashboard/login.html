@@ -1,0 +1,787 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sentinel WAF — Secure Access</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&family=Share+Tech+Mono&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#060912;--bg2:#0A0D1F;
+  --red:#C8001E;--red-b:#FF1A44;--red-glow:rgba(200,0,30,.45);--red-dim:rgba(200,0,30,.1);
+  --cyan:#00C8F0;--green:#00C87A;--amber:#FFAA00;--purple:#7C2FBF;--pur-glow:rgba(124,47,191,.5);
+  --text:#E4E8F4;--text2:#8896B8;--text3:#424E6A;
+  --border:rgba(200,0,30,.3);--border2:rgba(0,200,240,.18);
+  --blur:blur(20px);--r:14px;--r2:9px;
+}
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;overflow:hidden;background:var(--bg);color:var(--text);font-family:'Inter',sans-serif}
+#bgCanvas{position:fixed;inset:0;z-index:0;pointer-events:none}
+.scanlines{position:fixed;inset:0;z-index:1;pointer-events:none;background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,.06) 2px,rgba(0,0,0,.06) 4px)}
+.amb{position:fixed;inset:0;z-index:2;pointer-events:none;opacity:0}
+.amb-r{background:radial-gradient(ellipse 60% 50% at 50% 50%,rgba(200,0,30,.06) 0%,transparent 70%);animation:ambp 6s ease-in-out infinite}
+.amb-c{background:radial-gradient(ellipse 40% 35% at 80% 20%,rgba(0,200,240,.04) 0%,transparent 70%);animation:ambp 8s ease-in-out infinite 3s}
+@keyframes ambp{0%,100%{opacity:0}50%{opacity:1}}
+
+/* ── STATUS BAR ── */
+.sbar{position:fixed;top:0;left:0;right:0;height:36px;z-index:20;background:rgba(4,6,14,.97);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 24px;backdrop-filter:var(--blur)}
+.sbar-l{display:flex;align-items:center;gap:20px;font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--text2)}
+.sbar-brand{font-family:'Orbitron',sans-serif;font-size:13px;font-weight:900;letter-spacing:3px}
+.sbar-brand .s{color:var(--text)}
+.sbar-brand .w{color:var(--red-b);text-shadow:0 0 14px var(--red-glow)}
+.sbar-status{display:flex;align-items:center;gap:6px}
+.sbar-dot{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 9px var(--green);animation:pulse 2.5s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(.85)}}
+.sbar-r{display:flex;align-items:center;gap:22px;font-family:'Share Tech Mono',monospace;font-size:11px}
+.sbar-threat{color:var(--amber)}
+.sbar-time{color:var(--cyan);letter-spacing:1.5px}
+.sbar-node{color:var(--text3);font-size:10px}
+
+/* ── MAIN LAYOUT ── */
+.layout{position:fixed;inset:36px 0 40px 0;z-index:5;display:flex;align-items:center;justify-content:center;padding:20px}
+
+/* ── CARD ── */
+.card{
+  width:100%;max-width:445px;
+  background:rgba(6,8,18,.95);border:1px solid var(--border);
+  border-radius:var(--r);backdrop-filter:var(--blur);
+  box-shadow:0 0 0 1px rgba(200,0,30,.12),0 30px 80px rgba(0,0,0,.9),0 0 60px rgba(200,0,30,.08);
+  position:relative;overflow:hidden;
+  animation:cardin .9s cubic-bezier(.22,1,.36,1) .15s both;
+}
+@keyframes cardin{from{opacity:0;transform:translateY(30px) scale(.97)}to{opacity:1;transform:translateY(0) scale(1)}}
+
+/* Corner brackets */
+.cbr{position:absolute;width:20px;height:20px;z-index:5;pointer-events:none}
+.cbr-tl{top:-1px;left:-1px;border-top:2px solid var(--red-b);border-left:2px solid var(--red-b);border-radius:3px 0 0}
+.cbr-tr{top:-1px;right:-1px;border-top:2px solid var(--red-b);border-right:2px solid var(--red-b);border-radius:0 3px 0}
+.cbr-bl{bottom:-1px;left:-1px;border-bottom:2px solid var(--red-b);border-left:2px solid var(--red-b);border-radius:0 0 0 3px}
+.cbr-br{bottom:-1px;right:-1px;border-bottom:2px solid var(--red-b);border-right:2px solid var(--red-b);border-radius:0 0 3px}
+.cbr{animation:bkp 3.5s ease-in-out infinite}
+.cbr-tr{animation-delay:.875s}
+.cbr-bl{animation-delay:1.75s}
+.cbr-br{animation-delay:2.625s}
+@keyframes bkp{0%,100%{opacity:1;box-shadow:0 0 8px var(--red-glow)}50%{opacity:.4;box-shadow:0 0 22px rgba(200,0,30,.8)}}
+
+/* Scan bar */
+.scan{position:absolute;top:0;left:-100%;width:100%;height:2px;z-index:6;background:linear-gradient(90deg,transparent 0%,var(--red-b) 45%,var(--cyan) 55%,transparent 100%);animation:scan 3.5s linear infinite}
+@keyframes scan{to{left:100%}}
+
+/* Card header */
+.ch{padding:28px 30px 18px;text-align:center;position:relative}
+.logo-badge{
+  width:64px;height:64px;border-radius:16px;margin:0 auto 14px;
+  background:linear-gradient(135deg,rgba(200,0,30,.25),rgba(200,0,30,.06));
+  border:1px solid rgba(200,0,30,.45);
+  display:flex;align-items:center;justify-content:center;font-size:32px;
+  box-shadow:0 0 30px var(--red-glow),0 0 60px rgba(200,0,30,.2),inset 0 1px 0 rgba(255,255,255,.08);
+  animation:embpulse 3s ease-in-out infinite;
+}
+@keyframes embpulse{0%,100%{box-shadow:0 0 24px var(--red-glow)}50%{box-shadow:0 0 46px rgba(200,0,30,.75),0 0 80px rgba(200,0,30,.25)}}
+.logo-name{font-family:'Orbitron',sans-serif;font-size:26px;font-weight:900;letter-spacing:4px;line-height:1;margin-bottom:5px;animation:glitch 8s ease-in-out infinite}
+.logo-name .s{color:var(--text)}
+.logo-name .w{color:var(--red-b);text-shadow:0 0 20px var(--red-glow),0 0 40px rgba(200,0,30,.4)}
+@keyframes glitch{
+  0%,80%,100%{text-shadow:none;transform:translate(0)}
+  81%{text-shadow:2px 0 var(--cyan),-2px 0 var(--red-b);transform:translate(-1px)}
+  82%{text-shadow:-2px 0 var(--cyan),2px 0 var(--red-b);transform:translate(1px)}
+  83%{text-shadow:none;transform:translate(0)}
+  84%{text-shadow:3px 0 rgba(0,200,240,.6);transform:translate(-2px,1px)}
+  85%{text-shadow:-3px 0 rgba(200,0,30,.6);transform:translate(2px,-1px)}
+  86%{text-shadow:none;transform:translate(0)}
+}
+.logo-sub{font-family:'Share Tech Mono',monospace;font-size:9px;color:var(--text3);letter-spacing:4px;text-transform:uppercase;margin-bottom:8px}
+.auth-hint{font-size:11px;color:var(--text2);display:flex;align-items:center;justify-content:center;gap:6px}
+.auth-hint .hl{color:var(--cyan);font-family:'Share Tech Mono',monospace;font-size:10px}
+.auth-hint .dot{width:3px;height:3px;border-radius:50%;background:var(--text3)}
+
+/* Auth tabs */
+.atabs{display:flex;background:rgba(255,255,255,.03);border-radius:9px;padding:3px;margin:0 30px;gap:2px;border:1px solid rgba(255,255,255,.06)}
+.atab{flex:1;padding:8px 4px;text-align:center;font-size:10px;font-family:'Share Tech Mono',monospace;color:var(--text2);cursor:pointer;border-radius:7px;transition:all .22s;border:1px solid transparent;user-select:none}
+.atab.on{background:rgba(200,0,30,.2);color:var(--red-b);border-color:rgba(200,0,30,.4);box-shadow:0 0 16px rgba(200,0,30,.1)}
+.atab:hover:not(.on){color:var(--text);background:rgba(255,255,255,.05)}
+
+/* Card body */
+.cb{padding:18px 30px 26px;display:flex;flex-direction:column;gap:14px}
+
+/* Auth panels */
+.apanel{display:none;flex-direction:column;gap:12px;animation:apslide .28s ease both}
+.apanel.on{display:flex}
+@keyframes apslide{from{opacity:0;transform:translateX(10px)}to{opacity:1;transform:translateX(0)}}
+
+/* Form groups */
+.fg{position:relative}
+.flbl{font-size:9px;font-family:'Share Tech Mono',monospace;color:var(--text2);letter-spacing:1.2px;text-transform:uppercase;margin-bottom:5px;display:flex;align-items:center;gap:5px}
+.flbl-dot{width:4px;height:4px;border-radius:50%;background:var(--red-b);animation:pulse 2s ease-in-out infinite}
+.fin-wrap{position:relative}
+.fin-ico{position:absolute;left:13px;top:50%;transform:translateY(-50%);font-size:14px;color:var(--text3);pointer-events:none;transition:color .2s}
+.fin{
+  width:100%;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.1);
+  border-radius:var(--r2);padding:12px 42px 12px 40px;
+  font-family:'Share Tech Mono',monospace;font-size:12px;color:var(--text);
+  outline:none;transition:all .22s
+}
+.fin::placeholder{color:var(--text3)}
+.fin:focus{border-color:var(--red);box-shadow:0 0 0 3px rgba(200,0,30,.12),0 0 18px rgba(200,0,30,.06);background:rgba(200,0,30,.04)}
+.fin:focus+.fin-ico,.fin-wrap:focus-within .fin-ico{color:var(--red)}
+.fin-end{position:absolute;right:12px;top:50%;transform:translateY(-50%);cursor:pointer;color:var(--text3);font-size:14px;transition:color .2s;background:none;border:none;padding:0}
+.fin-end:hover{color:var(--text)}
+
+/* 2FA OTP */
+.otp-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:7px}
+.otp-in{
+  aspect-ratio:1;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.1);
+  border-radius:9px;text-align:center;font-family:'Orbitron',sans-serif;font-size:16px;font-weight:700;
+  color:var(--text);outline:none;transition:all .2s;width:100%
+}
+.otp-in:focus{border-color:var(--red);box-shadow:0 0 0 2px rgba(200,0,30,.15);background:rgba(200,0,30,.05)}
+.otp-in.filled{border-color:rgba(0,200,122,.45);background:rgba(0,200,122,.06);color:var(--green)}
+.twofa{display:none}
+.twofa.show{display:block;animation:apslide .3s ease}
+.twofa-hdr{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+.twofa-ic{width:26px;height:26px;border-radius:6px;background:rgba(200,0,30,.12);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;font-size:13px}
+.twofa-lbl{font-size:10px;font-family:'Share Tech Mono',monospace;color:var(--text2)}
+
+/* Remember + forgot */
+.frow{display:flex;align-items:center;justify-content:space-between;margin-top:-2px}
+.chk-lbl{display:flex;align-items:center;gap:6px;cursor:pointer;font-size:10px;font-family:'Share Tech Mono',monospace;color:var(--text2);user-select:none}
+.chk-lbl input[type=checkbox]{display:none}
+.cbox{width:15px;height:15px;border:1px solid rgba(255,255,255,.18);border-radius:3px;display:flex;align-items:center;justify-content:center;font-size:9px;transition:all .2s}
+.chk-lbl input:checked+.cbox{background:var(--red);border-color:var(--red);color:#fff}
+.flink{font-size:10px;font-family:'Share Tech Mono',monospace;color:var(--red);text-decoration:none;transition:color .2s}
+.flink:hover{color:var(--red-b)}
+
+/* Sign in button */
+.sbtn{
+  width:100%;padding:14px;border-radius:var(--r2);
+  background:linear-gradient(135deg,var(--red) 0%,#8C0016 100%);
+  border:1px solid rgba(255,30,68,.4);color:#fff;
+  font-family:'Orbitron',sans-serif;font-size:13px;font-weight:700;letter-spacing:2.5px;
+  text-transform:uppercase;cursor:pointer;transition:all .28s;
+  display:flex;align-items:center;justify-content:center;gap:10px;
+  position:relative;overflow:hidden;
+  box-shadow:0 4px 26px rgba(200,0,30,.42),0 0 0 1px rgba(255,30,68,.14)
+}
+.sbtn::before{content:'';position:absolute;inset:0;background:linear-gradient(135deg,rgba(255,255,255,.12) 0%,transparent 50%);pointer-events:none}
+.sbtn:hover:not(:disabled){background:linear-gradient(135deg,var(--red-b) 0%,var(--red) 100%);box-shadow:0 6px 36px rgba(200,0,30,.65),0 0 28px rgba(255,30,68,.25);transform:translateY(-1px)}
+.sbtn:active:not(:disabled){transform:translateY(0)}
+.sbtn:disabled{opacity:.65;cursor:not-allowed}
+.sbtn.loading{animation:btnpulse 1.3s ease-in-out infinite}
+.sbtn.success{background:linear-gradient(135deg,var(--green) 0%,#007a48 100%);border-color:rgba(0,200,122,.45);box-shadow:0 4px 24px rgba(0,200,122,.4);animation:none}
+@keyframes btnpulse{0%,100%{box-shadow:0 4px 26px rgba(200,0,30,.42)}50%{box-shadow:0 4px 40px rgba(200,0,30,.85)}}
+.spin{width:16px;height:16px;border-radius:50%;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;animation:sp .8s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+
+/* SSO */
+.sso-grid{display:grid;grid-template-columns:1fr 1fr;gap:9px}
+.sso-btn{display:flex;align-items:center;gap:9px;padding:11px 14px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.1);border-radius:var(--r2);cursor:pointer;transition:all .2s;font-size:11px;font-family:'Share Tech Mono',monospace;color:var(--text2)}
+.sso-btn:hover{background:rgba(255,255,255,.09);border-color:rgba(255,255,255,.22);color:var(--text)}
+.sso-ico{font-size:18px}
+.sso-nm{font-size:10px;color:var(--text);font-family:'Share Tech Mono',monospace}
+.sso-tp{font-size:8px;color:var(--text3)}
+.sso-div{display:flex;align-items:center;gap:10px;font-size:9px;font-family:'Share Tech Mono',monospace;color:var(--text3)}
+.sso-div::before,.sso-div::after{content:'';flex:1;height:1px;background:rgba(255,255,255,.07)}
+
+/* API Key */
+.apikey-info{background:rgba(255,170,0,.07);border:1px solid rgba(255,170,0,.22);border-radius:var(--r2);padding:11px 14px;font-size:10px;font-family:'Share Tech Mono',monospace;color:var(--amber);display:flex;align-items:flex-start;gap:7px;line-height:1.55}
+.apikey-info .ico{font-size:15px;flex-shrink:0;margin-top:1px}
+
+/* Security badges */
+.sec-badges{display:flex;flex-wrap:wrap;gap:5px;justify-content:center;margin-top:2px}
+.sbadge{font-size:8px;font-family:'Share Tech Mono',monospace;padding:3px 9px;border-radius:20px;display:flex;align-items:center;gap:4px}
+.sbadge.ok{background:rgba(0,200,122,.08);border:1px solid rgba(0,200,122,.25);color:var(--green)}
+.sbadge.warn{background:rgba(255,170,0,.08);border:1px solid rgba(255,170,0,.25);color:var(--amber)}
+.sbadge.def{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.1);color:var(--text2)}
+.sbadge-dot{width:4px;height:4px;border-radius:50%;background:currentColor}
+.card-div{height:1px;background:linear-gradient(90deg,transparent,rgba(200,0,30,.2),transparent);margin:0 -30px}
+
+/* ── SCANNER WIDGET ── */
+.scanner-widget{
+  position:fixed;bottom:52px;left:28px;z-index:10;
+  width:160px;height:160px;
+  animation:wgtin .8s cubic-bezier(.22,1,.36,1) .6s both
+}
+@keyframes wgtin{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
+.sw-canvas{position:absolute;inset:0}
+.sw-info{
+  position:absolute;bottom:-6px;left:0;right:0;
+  background:rgba(6,8,18,.96);border:1px solid var(--border);border-radius:8px;
+  padding:7px 10px;font-family:'Share Tech Mono',monospace;backdrop-filter:blur(8px)
+}
+.sw-title{font-size:8px;color:var(--red-b);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:4px;font-family:'Orbitron',monospace;font-weight:700}
+.sw-row{display:flex;justify-content:space-between;font-size:9px;color:var(--text3);margin-bottom:1px}
+.sw-row span{color:var(--text2)}
+
+/* ── TICKER ── */
+.ticker{position:fixed;bottom:0;left:0;right:0;height:40px;z-index:20;background:rgba(4,6,14,.97);border-top:1px solid var(--border);display:flex;align-items:center;overflow:hidden;backdrop-filter:var(--blur)}
+.tick-lbl{padding:0 16px;font-size:9px;font-family:'Orbitron',sans-serif;font-weight:700;color:var(--red-b);letter-spacing:2px;white-space:nowrap;border-right:1px solid var(--border);flex-shrink:0}
+.tick-scroll{flex:1;overflow:hidden}
+.tick-inner{display:flex;gap:38px;animation:tscroll 90s linear infinite;white-space:nowrap}
+.ti{display:inline-flex;align-items:center;gap:7px;font-size:10px;font-family:'Share Tech Mono',monospace;color:var(--text2);flex-shrink:0}
+.tsev{font-size:8px;padding:1px 6px;border-radius:10px;font-weight:700}
+.tc{background:rgba(200,0,30,.2);color:var(--red-b)}
+.th{background:rgba(255,170,0,.15);color:var(--amber)}
+.tm{background:rgba(0,200,240,.12);color:var(--cyan)}
+.tl{background:rgba(0,200,122,.1);color:var(--green)}
+.tsep{color:var(--text3)}
+@keyframes tscroll{0%{transform:translateX(0)}100%{transform:translateX(-50%)}}
+
+/* ── COPILOT FAB ── */
+.copilot-fab{position:fixed;bottom:54px;right:28px;z-index:30;width:52px;height:52px;border-radius:50%;background:linear-gradient(135deg,var(--purple) 0%,#4A0FA0 100%);border:1px solid rgba(124,47,191,.55);display:flex;align-items:center;justify-content:center;cursor:pointer;transition:all .3s;outline:none;box-shadow:0 5px 24px var(--pur-glow);animation:fabpulse 3.5s ease-in-out infinite}
+@keyframes fabpulse{0%,100%{box-shadow:0 5px 24px var(--pur-glow)}50%{box-shadow:0 8px 38px rgba(124,47,191,.75),0 0 0 10px rgba(124,47,191,0)}}
+.copilot-fab:hover{transform:scale(1.1)}
+.fab-ring{position:absolute;inset:-7px;border-radius:50%;border:2px solid rgba(124,47,191,.38);animation:ring 2.5s ease-out infinite}
+@keyframes ring{0%{transform:scale(1);opacity:1}100%{transform:scale(1.55);opacity:0}}
+.fab-badge{position:absolute;top:-2px;right:-2px;width:16px;height:16px;background:var(--red-b);border-radius:50%;font-size:9px;font-family:'Orbitron',monospace;font-weight:700;color:#fff;display:flex;align-items:center;justify-content:center;border:2px solid var(--bg)}
+.fab-tip{position:absolute;right:62px;top:50%;transform:translateY(-50%);background:rgba(20,12,38,.96);backdrop-filter:blur(8px);border:1px solid rgba(124,47,191,.4);border-radius:20px;padding:5px 12px;font-size:10px;font-family:'Share Tech Mono',monospace;color:#fff;white-space:nowrap;opacity:0;pointer-events:none;transition:opacity .2s}
+.copilot-fab:hover .fab-tip{opacity:1}
+
+/* ── COPILOT PANEL ── */
+.cop-panel{position:fixed;bottom:118px;right:28px;z-index:30;width:358px;height:492px;border-radius:var(--r);background:rgba(8,7,18,.98);border:1px solid rgba(124,47,191,.38);box-shadow:0 22px 64px rgba(0,0,0,.8),0 0 0 1px rgba(124,47,191,.14);backdrop-filter:var(--blur);display:flex;flex-direction:column;overflow:hidden;transform:scale(.88) translateY(22px);opacity:0;pointer-events:none;transition:all .3s cubic-bezier(.22,1,.36,1);transform-origin:bottom right}
+.cop-panel.open{transform:scale(1) translateY(0);opacity:1;pointer-events:all}
+.cop-hdr{padding:14px 18px;border-bottom:1px solid rgba(124,47,191,.2);display:flex;align-items:center;gap:11px;background:linear-gradient(135deg,rgba(124,47,191,.15) 0%,transparent 100%);flex-shrink:0}
+.cop-av{width:34px;height:34px;border-radius:50%;background:linear-gradient(135deg,var(--purple),#4A0FA0);display:flex;align-items:center;justify-content:center;font-size:17px;box-shadow:0 0 14px var(--pur-glow)}
+.cop-name{font-family:'Orbitron',sans-serif;font-size:11px;font-weight:700;color:var(--text)}
+.cop-st{font-family:'Share Tech Mono',monospace;font-size:9px;color:#9B60E0;display:flex;align-items:center;gap:4px;margin-top:1px}
+.cop-online{width:5px;height:5px;border-radius:50%;background:var(--green);box-shadow:0 0 5px var(--green);animation:pulse 2s infinite}
+.cop-close{cursor:pointer;color:var(--text3);font-size:17px;background:none;border:none;margin-left:auto;line-height:1;transition:color .2s}
+.cop-close:hover{color:var(--text)}
+.cop-msgs{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:11px}
+.cop-msgs::-webkit-scrollbar{width:3px}
+.cop-msgs::-webkit-scrollbar-thumb{background:rgba(124,47,191,.3);border-radius:3px}
+.msg{display:flex;gap:7px;animation:msgIn .28s ease}
+@keyframes msgIn{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:translateY(0)}}
+.msg.usr{flex-direction:row-reverse}
+.mav{width:24px;height:24px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;flex-shrink:0;margin-top:2px}
+.mav.ai{background:linear-gradient(135deg,var(--purple),#4A0FA0)}
+.mav.usr{background:rgba(200,0,30,.28);border:1px solid var(--border)}
+.mbbl{max-width:82%;padding:9px 13px;border-radius:12px;font-size:11px;font-family:'Share Tech Mono',monospace;line-height:1.55}
+.msg.ai .mbbl{background:rgba(124,47,191,.14);border:1px solid rgba(124,47,191,.24);color:var(--text);border-radius:3px 12px 12px 12px}
+.msg.usr .mbbl{background:rgba(200,0,30,.14);border:1px solid var(--border);color:var(--text);border-radius:12px 3px 12px 12px}
+.mt{font-size:8px;color:var(--text3);margin-top:3px}
+.msg.usr .mt{text-align:right}
+.typing{display:none;align-items:center;gap:5px;padding:4px 6px}
+.typing.show{display:flex;animation:msgIn .28s ease}
+.tydot{width:6px;height:6px;border-radius:50%;background:var(--purple);animation:tybounce 1.3s ease-in-out infinite}
+.tydot:nth-child(2){animation-delay:.22s}
+.tydot:nth-child(3){animation-delay:.44s}
+@keyframes tybounce{0%,60%,100%{transform:translateY(0)}30%{transform:translateY(-7px)}}
+.cop-quick{padding:7px 14px;border-top:1px solid rgba(124,47,191,.14);display:flex;gap:5px;flex-wrap:wrap;flex-shrink:0}
+.qbtn{font-size:9px;font-family:'Share Tech Mono',monospace;padding:4px 9px;border-radius:20px;background:rgba(124,47,191,.1);border:1px solid rgba(124,47,191,.28);color:#A070E0;cursor:pointer;transition:all .2s;white-space:nowrap}
+.qbtn:hover{background:rgba(124,47,191,.22);color:#BF8FFF}
+.cop-inp-area{padding:11px 14px;border-top:1px solid rgba(124,47,191,.18);display:flex;gap:8px;align-items:center;background:rgba(124,47,191,.05);flex-shrink:0}
+.cop-inp{flex:1;background:rgba(255,255,255,.04);border:1px solid rgba(124,47,191,.28);border-radius:20px;padding:8px 13px;font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--text);outline:none;transition:border-color .2s}
+.cop-inp:focus{border-color:rgba(124,47,191,.6)}
+.cop-inp::placeholder{color:var(--text3)}
+.cop-send{width:32px;height:32px;border-radius:50%;background:linear-gradient(135deg,var(--purple),#4A0FA0);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:13px;transition:all .2s;flex-shrink:0}
+.cop-send:hover{transform:scale(1.1)}
+
+/* ── LOADER ── */
+.loader{position:fixed;inset:0;z-index:100;background:var(--bg);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:22px;animation:ldout .6s ease 2.2s both}
+@keyframes ldout{to{opacity:0;pointer-events:none}}
+.ld-logo{font-family:'Orbitron',sans-serif;font-size:28px;font-weight:900;letter-spacing:5px}
+.ld-logo .s{color:var(--text)}
+.ld-logo .w{color:var(--red-b);text-shadow:0 0 18px var(--red-glow)}
+.ld-sub{font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--text3);letter-spacing:3px;margin-top:-14px}
+.ld-bar-w{width:240px;height:2px;background:rgba(255,255,255,.05);border-radius:2px;overflow:hidden}
+.ld-bar{height:100%;width:0;background:linear-gradient(90deg,var(--red),var(--cyan));animation:ldbr 2s cubic-bezier(.22,1,.36,1) both}
+@keyframes ldbr{0%{width:0}70%{width:100%}100%{width:100%}}
+.ld-txt{font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--text2)}
+
+@media(max-width:600px){.ch,.cb{padding-left:18px;padding-right:18px}.atabs{margin:0 18px}.scanner-widget{display:none}.cop-panel{right:8px;left:8px;width:auto}}
+</style>
+</head>
+<body>
+
+<!-- LOADER -->
+<div class="loader" id="loader">
+  <div class="ld-logo"><span class="s">SENTINEL</span> <span class="w">WAF</span></div>
+  <div class="ld-sub">Enterprise Security Platform v3.1</div>
+  <div class="ld-bar-w"><div class="ld-bar"></div></div>
+  <div class="ld-txt" id="ldtxt">INITIALIZING SECURITY MODULES...</div>
+</div>
+
+<!-- CANVAS -->
+<canvas id="bgCanvas"></canvas>
+<div class="scanlines"></div>
+<div class="amb amb-r"></div>
+<div class="amb amb-c"></div>
+
+<!-- STATUS BAR -->
+<header class="sbar">
+  <div class="sbar-l">
+    <span class="sbar-brand"><span class="s">⬡ SENTINEL</span> <span class="w">WAF</span></span>
+    <div class="sbar-status"><div class="sbar-dot"></div><span>All Systems Operational</span></div>
+    <span style="color:var(--text3);font-size:10px">v3.1.0-enterprise</span>
+  </div>
+  <div class="sbar-r">
+    <span style="color:var(--text3);font-size:10px">NODE: cp-primary-01</span>
+    <span class="sbar-threat">⚡ <span id="sbThreats">0</span> threats blocked today</span>
+    <span class="sbar-time" id="sbTime">--:--:--</span>
+  </div>
+</header>
+
+<!-- MAIN LAYOUT -->
+<div class="layout">
+  <div class="card">
+    <div class="cbr cbr-tl"></div>
+    <div class="cbr cbr-tr"></div>
+    <div class="cbr cbr-bl"></div>
+    <div class="cbr cbr-br"></div>
+    <div class="scan"></div>
+
+    <!-- Header -->
+    <div class="ch">
+      <div class="logo-badge">🔺</div>
+      <div class="logo-name"><span class="s">SENTINEL</span> <span class="w">WAF</span></div>
+      <div class="logo-sub">Enterprise Web Application Firewall</div>
+      <div class="auth-hint">Secure Portal<span class="dot"></span><span class="hl">Zero-Trust Access</span><span class="dot"></span>FIPS 140-2</div>
+    </div>
+
+    <!-- Auth tabs -->
+    <div class="atabs">
+      <div class="atab on" data-tab="std">🔐 Standard</div>
+      <div class="atab" data-tab="sso">🏢 SSO / OIDC</div>
+      <div class="atab" data-tab="api">🔑 API Key</div>
+    </div>
+
+    <!-- Body -->
+    <div class="cb">
+
+      <!-- STANDARD -->
+      <div class="apanel on" id="tab-std">
+        <div class="fg">
+          <div class="flbl"><span class="flbl-dot"></span>Username / Email</div>
+          <div class="fin-wrap">
+            <span class="fin-ico">👤</span>
+            <input class="fin" type="text" id="username" placeholder="admin@sentinel.local" autocomplete="username">
+          </div>
+        </div>
+        <div class="fg">
+          <div class="flbl"><span class="flbl-dot"></span>Password</div>
+          <div class="fin-wrap">
+            <span class="fin-ico">🔒</span>
+            <input class="fin" type="password" id="password" placeholder="Enter your password" autocomplete="current-password">
+            <button class="fin-end" id="togglePwd" type="button">👁️</button>
+          </div>
+        </div>
+        <div class="twofa" id="twofaSection">
+          <div class="twofa-hdr">
+            <div class="twofa-ic">🛡️</div>
+            <div class="twofa-lbl">Two-Factor Authentication (TOTP)</div>
+          </div>
+          <div class="otp-grid" id="otpGrid">
+            <input class="otp-in" type="text" maxlength="1" inputmode="numeric">
+            <input class="otp-in" type="text" maxlength="1" inputmode="numeric">
+            <input class="otp-in" type="text" maxlength="1" inputmode="numeric">
+            <input class="otp-in" type="text" maxlength="1" inputmode="numeric">
+            <input class="otp-in" type="text" maxlength="1" inputmode="numeric">
+            <input class="otp-in" type="text" maxlength="1" inputmode="numeric">
+          </div>
+        </div>
+        <div class="frow">
+          <label class="chk-lbl"><input type="checkbox" id="remember"><span class="cbox">✓</span> Remember device 30d</label>
+          <a href="#" class="flink">Forgot password?</a>
+        </div>
+        <button class="sbtn" id="loginBtn" type="button">
+          <span id="btnIco">🔐</span>
+          <span id="btnTxt">SIGN IN</span>
+        </button>
+      </div>
+
+      <!-- SSO -->
+      <div class="apanel" id="tab-sso">
+        <div class="sso-grid">
+          <button class="sso-btn" onclick="ssoLogin('microsoft')"><span class="sso-ico">🔵</span><span><div class="sso-nm">Microsoft</div><div class="sso-tp">Azure AD / Entra</div></span></button>
+          <button class="sso-btn" onclick="ssoLogin('google')"><span class="sso-ico">🔴</span><span><div class="sso-nm">Google</div><div class="sso-tp">Workspace OIDC</div></span></button>
+          <button class="sso-btn" onclick="ssoLogin('okta')"><span class="sso-ico">🟠</span><span><div class="sso-nm">Okta</div><div class="sso-tp">Enterprise SSO</div></span></button>
+          <button class="sso-btn" onclick="ssoLogin('github')"><span class="sso-ico">⚫</span><span><div class="sso-nm">GitHub</div><div class="sso-tp">Enterprise</div></span></button>
+        </div>
+        <div class="sso-div">or use SAML 2.0 / domain lookup</div>
+        <div class="fg">
+          <div class="flbl"><span class="flbl-dot"></span>Organisation Domain</div>
+          <div class="fin-wrap">
+            <span class="fin-ico">🌐</span>
+            <input class="fin" type="text" id="ssoDomain" placeholder="yourdomain.com">
+          </div>
+        </div>
+        <button class="sbtn" onclick="ssoLogin('domain')"><span>🚀</span><span>CONTINUE WITH SSO</span></button>
+        <div class="sso-div" style="font-size:9px">OpenID Connect · SAML 2.0 · OAuth 2.0</div>
+      </div>
+
+      <!-- API KEY -->
+      <div class="apanel" id="tab-api">
+        <div class="apikey-info"><span class="ico">⚠️</span>API Key auth is intended for CI/CD pipelines, automation, and CLI access. Use Standard login for interactive sessions.</div>
+        <div class="fg">
+          <div class="flbl"><span class="flbl-dot"></span>API Key</div>
+          <div class="fin-wrap">
+            <span class="fin-ico">🔑</span>
+            <input class="fin" type="password" id="apiKey" placeholder="sk-live-xxxxxxxxxxxxxxxxxxxxxxxx" autocomplete="off">
+            <button class="fin-end" onclick="toggleApiKey()" type="button">👁️</button>
+          </div>
+        </div>
+        <div class="fg">
+          <div class="flbl"><span class="flbl-dot"></span>Key Scope</div>
+          <div class="fin-wrap">
+            <span class="fin-ico">🏷️</span>
+            <input class="fin" type="text" placeholder="read:all write:rules (default: read-only)" autocomplete="off">
+          </div>
+        </div>
+        <button class="sbtn" onclick="apiLogin()"><span>⚡</span><span>CONNECT</span></button>
+        <div class="sso-div" style="font-size:9px">Generate in Settings → API Keys · Expire in 90d</div>
+      </div>
+
+      <div class="card-div"></div>
+      <div class="sec-badges">
+        <span class="sbadge ok"><span class="sbadge-dot"></span>AES-256-GCM</span>
+        <span class="sbadge ok"><span class="sbadge-dot"></span>TLS 1.3</span>
+        <span class="sbadge ok"><span class="sbadge-dot"></span>FIPS 140-2</span>
+        <span class="sbadge warn"><span class="sbadge-dot"></span>SOC 2</span>
+        <span class="sbadge def"><span class="sbadge-dot"></span>ISO 27001</span>
+        <span class="sbadge def"><span class="sbadge-dot"></span>Zero-Trust</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- SCANNER WIDGET (bottom-left, like ESDS bot) -->
+<div class="scanner-widget">
+  <canvas id="scannerCanvas" class="sw-canvas" width="160" height="110"></canvas>
+  <div class="sw-info" style="position:relative;margin-top:110px">
+    <div class="sw-title">⬡ Active Scanner</div>
+    <div class="sw-row">Threats/hr <span id="swT">342</span></div>
+    <div class="sw-row">Rules active <span>2,541</span></div>
+    <div class="sw-row">ML status <span style="color:var(--green)">ONLINE</span></div>
+  </div>
+</div>
+
+<!-- TICKER -->
+<div class="ticker">
+  <div class="tick-lbl">⚡ LIVE THREATS</div>
+  <div class="tick-scroll"><div class="tick-inner" id="tickerInner"></div></div>
+</div>
+
+<!-- COPILOT FAB -->
+<button class="copilot-fab" id="copilotFab" aria-label="AI Copilot">
+  <span class="fab-ring"></span>
+  <span style="font-size:22px">🤖</span>
+  <span class="fab-tip">Sentinel AI Copilot</span>
+  <span class="fab-badge">AI</span>
+</button>
+
+<!-- COPILOT PANEL -->
+<div class="cop-panel" id="copPanel">
+  <div class="cop-hdr">
+    <div class="cop-av">🤖</div>
+    <div>
+      <div class="cop-name">Sentinel AI Copilot</div>
+      <div class="cop-st"><span class="cop-online"></span>Online · DeepSeek R1</div>
+    </div>
+    <button class="cop-close" id="copClose">✕</button>
+  </div>
+  <div class="cop-msgs" id="copMsgs"></div>
+  <div class="typing" id="typing">
+    <div class="mav ai">🤖</div>
+    <div style="display:flex;gap:4px;align-items:center;padding:10px 13px;background:rgba(124,47,191,.14);border:1px solid rgba(124,47,191,.24);border-radius:3px 12px 12px 12px">
+      <div class="tydot"></div><div class="tydot"></div><div class="tydot"></div>
+    </div>
+  </div>
+  <div class="cop-quick">
+    <button class="qbtn" data-q="explain">🔍 Explain Alert</button>
+    <button class="qbtn" data-q="rule">📝 Write Rule</button>
+    <button class="qbtn" data-q="report">🛡️ Threat Report</button>
+    <button class="qbtn" data-q="fp">🐛 False Positive</button>
+    <button class="qbtn" data-q="patch">⚡ Patch CVE</button>
+  </div>
+  <div class="cop-inp-area">
+    <input class="cop-inp" id="copInput" placeholder="Ask Sentinel AI anything..." type="text">
+    <button class="cop-send" id="copSend">➤</button>
+  </div>
+</div>
+
+<script>
+/* ══════════════════════════════════════
+   SENTINEL WAF — LOGIN JAVASCRIPT
+══════════════════════════════════════ */
+
+// ── CANVAS ──────────────────────────
+const canvas = document.getElementById('bgCanvas');
+const ctx = canvas.getContext('2d');
+let W, H;
+function resize(){ W = canvas.width = window.innerWidth; H = canvas.height = window.innerHeight; initStreams(); }
+window.addEventListener('resize', resize); resize();
+
+// Nodes
+const NCNT = 55;
+const nodes = [];
+(function initN(){ nodes.length=0; for(let i=0;i<NCNT;i++) nodes.push({x:Math.random()*W*1.1-W*.05,y:Math.random()*H*1.1-H*.05,vx:(Math.random()-.5)*.22,vy:(Math.random()-.5)*.22,r:Math.random()*2.2+.7,isRed:Math.random()<.3,pulse:Math.random()*Math.PI*2,ps:.025+Math.random()*.02}); })();
+
+// Streams
+const SCHARS='01ABCDEF<>|!@#%⟨⟩{}[]⊕⊗∑∆ΩΨ';
+let streams=[];
+function initStreams(){ streams=[]; const cnt=Math.ceil(W/38); for(let i=0;i<cnt;i++) streams.push(mkS(i*38+Math.random()*20,true)); }
+function mkS(x,init){ const len=7+Math.floor(Math.random()*14); return{x,len,y:init?Math.random()*H:-(len*16),spd:.6+Math.random()*1.4,alpha:.04+Math.random()*.11,isRed:Math.random()<.28}; }
+
+// Particles
+const parts=[];
+for(let i=0;i<100;i++) parts.push({x:Math.random()*2000,y:Math.random()*1200,r:Math.random()*1.4+.3,vx:(Math.random()-.5)*.18,vy:(Math.random()-.5)*.18,c:Math.random()<.3?'200,0,30':(Math.random()<.5?'0,200,240':'255,255,255'),a:Math.random()*.4+.08});
+
+// Waves
+const waves=[];
+function addWave(){ waves.push({x:Math.random()*W,y:Math.random()*H,r:0,maxR:130+Math.random()*170,spd:1.2+Math.random()*.8,c:Math.random()>.65?'0,200,240':'200,0,30'}); }
+setInterval(addWave,1900);
+
+// Radar
+const blips=Array.from({length:7},()=>({a:Math.random()*Math.PI*2,r:30+Math.random()*88}));
+let ra1=0,ra2=Math.PI;
+
+function animate(){
+  ctx.fillStyle='rgba(6,9,18,.18)'; ctx.fillRect(0,0,W,H);
+  // Hex grid
+  const S=26,W2=S*1.5,H2=S*Math.sqrt(3);
+  const cols=Math.ceil(W/W2)+2,rows=Math.ceil(H/H2)+2;
+  ctx.strokeStyle='rgba(200,0,30,.038)'; ctx.lineWidth=.5;
+  for(let c=-1;c<cols;c++) for(let r=-1;r<rows;r++){
+    const x=c*W2,y=r*H2+(c%2?H2/2:0);
+    ctx.beginPath();
+    for(let i=0;i<6;i++){const a=(Math.PI/3)*i; const xi=x+(S-1)*Math.cos(a),yi=y+(S-1)*Math.sin(a); i===0?ctx.moveTo(xi,yi):ctx.lineTo(xi,yi);}
+    ctx.closePath(); ctx.stroke();
+  }
+  // Waves
+  for(let i=waves.length-1;i>=0;i--){
+    const w=waves[i]; w.r+=w.spd;
+    const a=(1-w.r/w.maxR)*.26;
+    if(a<=0){waves.splice(i,1);continue;}
+    ctx.beginPath(); ctx.arc(w.x,w.y,w.r,0,Math.PI*2);
+    ctx.strokeStyle=`rgba(${w.c},${a})`; ctx.lineWidth=1; ctx.stroke();
+  }
+  // Network
+  const md=140;
+  for(let i=0;i<nodes.length;i++){
+    const a=nodes[i];
+    for(let j=i+1;j<nodes.length;j++){
+      const b=nodes[j],d=Math.hypot(a.x-b.x,a.y-b.y);
+      if(d<md){const al=(1-d/md)*(a.isRed||b.isRed?.22:.1); ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.strokeStyle=(a.isRed||b.isRed)?`rgba(200,0,30,${al})`:`rgba(0,180,220,${al})`; ctx.lineWidth=.7; ctx.stroke();}
+    }
+  }
+  nodes.forEach(n=>{
+    n.x+=n.vx; n.y+=n.vy; n.pulse+=n.ps;
+    if(n.x<-60)n.x=W+60; if(n.x>W+60)n.x=-60;
+    if(n.y<-60)n.y=H+60; if(n.y>H+60)n.y=-60;
+    const pr=n.r+Math.sin(n.pulse)*.7,c=n.isRed?'200,0,30':'0,180,220';
+    const grd=ctx.createRadialGradient(n.x,n.y,0,n.x,n.y,pr*4.5);
+    grd.addColorStop(0,`rgba(${c},.35)`); grd.addColorStop(1,`rgba(${c},0)`);
+    ctx.beginPath(); ctx.arc(n.x,n.y,pr*4.5,0,Math.PI*2); ctx.fillStyle=grd; ctx.fill();
+    ctx.beginPath(); ctx.arc(n.x,n.y,pr,0,Math.PI*2); ctx.fillStyle=`rgba(${c},.85)`; ctx.fill();
+  });
+  // Streams
+  ctx.font='11px Share Tech Mono,monospace';
+  streams.forEach(s=>{
+    s.y+=s.spd;
+    if(s.y>H+s.len*16){s.y=-(s.len*16);s.x=Math.random()*W;}
+    for(let i=0;i<s.len;i++){
+      const cy=s.y-i*15; if(cy<0||cy>H) continue;
+      const ff=(1-i/s.len)*s.alpha,isH=i===0,ch=SCHARS[Math.floor(Math.random()*SCHARS.length)];
+      ctx.fillStyle=isH?(s.isRed?`rgba(255,70,90,${ff*3.5})`:`rgba(100,230,255,${ff*3.5})`):(s.isRed?`rgba(160,0,24,${ff})`:`rgba(0,110,180,${ff})`);
+      ctx.fillText(ch,s.x,cy);
+    }
+  });
+  // Particles
+  parts.forEach(p=>{
+    p.x+=p.vx; p.y+=p.vy;
+    if(p.x<0)p.x=W; if(p.x>W)p.x=0;
+    if(p.y<0)p.y=H; if(p.y>H)p.y=0;
+    ctx.beginPath(); ctx.arc(p.x,p.y,p.r,0,Math.PI*2);
+    ctx.fillStyle=`rgba(${p.c},${p.a})`; ctx.fill();
+  });
+  // Radar
+  const cx=W-130,cy=130,r=96;
+  ctx.save(); ctx.globalAlpha=.6;
+  ctx.strokeStyle='rgba(200,0,30,.18)'; ctx.lineWidth=1;
+  [1,.66,.33].forEach(f=>{ctx.beginPath();ctx.arc(cx,cy,r*f,0,Math.PI*2);ctx.stroke();});
+  ctx.beginPath(); ctx.moveTo(cx-r,cy); ctx.lineTo(cx+r,cy); ctx.moveTo(cx,cy-r); ctx.lineTo(cx,cy+r); ctx.stroke();
+  function sweep(angle,col){ const steps=24,arc=Math.PI*.42; ctx.save(); ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); ctx.clip(); for(let i=0;i<steps;i++){const a1=angle-arc+arc*i/steps,a2=angle-arc+arc*(i+1)/steps; ctx.beginPath(); ctx.moveTo(cx,cy); ctx.arc(cx,cy,r,a1,a2); ctx.closePath(); ctx.fillStyle=`rgba(${col},${(i/steps)*.22})`; ctx.fill();} ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(cx+Math.cos(angle)*r,cy+Math.sin(angle)*r); ctx.strokeStyle=`rgba(${col},.85)`; ctx.lineWidth=1.5; ctx.stroke(); ctx.restore(); }
+  ra1+=.014; ra2+=.009; sweep(ra1,'200,0,30'); sweep(ra2,'0,200,240');
+  blips.forEach(b=>{
+    const bx=cx+b.r*Math.cos(b.a),by=cy+b.r*Math.sin(b.a);
+    const d=((b.a-ra1)%(Math.PI*2)+Math.PI*2)%(Math.PI*2),age=1-Math.min(d/(Math.PI*.5),1);
+    if(age>0){ctx.beginPath();ctx.arc(bx,by,3,0,Math.PI*2);ctx.fillStyle=`rgba(255,30,68,${age*.9})`;ctx.fill();}
+  });
+  ctx.restore();
+  requestAnimationFrame(animate);
+}
+animate();
+
+// ── SCANNER WIDGET ANIMATION ──
+(function scannerAnim(){
+  const sc=document.getElementById('scannerCanvas');
+  if(!sc) return;
+  const c2=sc.getContext('2d');
+  const cx=80,cy=55,R=50;
+  let sa=0;
+  function drawScanner(){
+    c2.clearRect(0,0,160,110);
+    // circles
+    c2.strokeStyle='rgba(200,0,30,.25)'; c2.lineWidth=1;
+    [1,.66,.33].forEach(f=>{ c2.beginPath(); c2.arc(cx,cy,R*f,0,Math.PI*2); c2.stroke(); });
+    c2.beginPath(); c2.moveTo(cx-R,cy); c2.lineTo(cx+R,cy); c2.moveTo(cx,cy-R); c2.lineTo(cx,cy+R); c2.stroke();
+    // sweep
+    const steps=20,arc=Math.PI*.44;
+    c2.save(); c2.beginPath(); c2.arc(cx,cy,R,0,Math.PI*2); c2.clip();
+    for(let i=0;i<steps;i++){
+      const a1=sa-arc+arc*i/steps,a2=sa-arc+arc*(i+1)/steps;
+      c2.beginPath(); c2.moveTo(cx,cy); c2.arc(cx,cy,R,a1,a2); c2.closePath();
+      c2.fillStyle=`rgba(200,0,30,${(i/steps)*.3})`; c2.fill();
+    }
+    c2.beginPath(); c2.moveTo(cx,cy); c2.lineTo(cx+Math.cos(sa)*R,cy+Math.sin(sa)*R);
+    c2.strokeStyle='rgba(255,30,68,.9)'; c2.lineWidth=2; c2.stroke();
+    c2.restore();
+    // sensor dot
+    c2.beginPath(); c2.arc(cx,cy,4,0,Math.PI*2);
+    c2.fillStyle='rgba(200,0,30,.9)'; c2.fill();
+    // blips
+    [{a:.8,r:30},{a:2.1,r:42},{a:4.5,r:22}].forEach(b=>{
+      const bx=cx+b.r*Math.cos(b.a),by=cy+b.r*Math.sin(b.a);
+      const d=((b.a-sa)%(Math.PI*2)+Math.PI*2)%(Math.PI*2),age=1-Math.min(d/(Math.PI*.5),1);
+      if(age>.05){c2.beginPath();c2.arc(bx,by,2.5,0,Math.PI*2);c2.fillStyle=`rgba(255,30,68,${age*.9})`;c2.fill();}
+    });
+    sa+=.016;
+    requestAnimationFrame(drawScanner);
+  }
+  drawScanner();
+})();
+
+// ── CLOCK ──
+function tick(){ document.getElementById('sbTime').textContent=new Date().toTimeString().slice(0,8); }
+setInterval(tick,1000); tick();
+
+// ── THREAT COUNTER ──
+let tc=2847293;
+function fmt(n){ return n>=1e6?(n/1e6).toFixed(2)+'M':n>=1e3?(n/1e3).toFixed(1)+'K':Math.round(n).toString(); }
+function animC(el,target,dur=1800){ const start=performance.now(); function up(now){ const t=Math.min((now-start)/dur,1),e=1-Math.pow(1-t,3); el.textContent=fmt(Math.round(target*e)); if(t<1)requestAnimationFrame(up); } requestAnimationFrame(up); }
+setTimeout(()=>{ animC(document.getElementById('sbThreats'),tc,1600); animC(document.getElementById('swT'),342,1200); },2300);
+setInterval(()=>{ tc+=Math.floor(Math.random()*12+1); document.getElementById('sbThreats').textContent=fmt(tc); },3200);
+
+// ── LOADER SEQUENCE ──
+const ldMsgs=['INITIALIZING SECURITY MODULES...','LOADING OWASP CRS v4.7 RULES...','STARTING ML INFERENCE ENGINE...','CONNECTING CLUSTER NODES...','LAUNCHING AI COPILOT SERVICE...','ACCESS PORTAL READY.'];
+let ldIdx=0;
+const ldTxt=document.getElementById('ldtxt');
+const ldT=setInterval(()=>{ ldIdx++; if(ldIdx<ldMsgs.length) ldTxt.textContent=ldMsgs[ldIdx]; else clearInterval(ldT); },280);
+
+// ── AUTH TABS ──
+document.querySelectorAll('.atab').forEach(tab=>{
+  tab.addEventListener('click',()=>{
+    document.querySelectorAll('.atab').forEach(t=>t.classList.remove('on'));
+    document.querySelectorAll('.apanel').forEach(p=>p.classList.remove('on'));
+    tab.classList.add('on');
+    document.getElementById('tab-'+tab.dataset.tab).classList.add('on');
+  });
+});
+
+// ── PASSWORD TOGGLE ──
+document.getElementById('togglePwd').addEventListener('click',()=>{
+  const inp=document.getElementById('password'),btn=document.getElementById('togglePwd');
+  if(inp.type==='password'){inp.type='text';btn.textContent='🙈';}else{inp.type='password';btn.textContent='👁️';}
+});
+function toggleApiKey(){ const inp=document.getElementById('apiKey'); inp.type=inp.type==='password'?'text':'password'; }
+
+// ── 2FA OTP ──
+const otpInputs=document.querySelectorAll('.otp-in');
+otpInputs.forEach((inp,idx)=>{
+  inp.addEventListener('input',e=>{ if(e.target.value.length===1){inp.classList.add('filled');if(idx<otpInputs.length-1)otpInputs[idx+1].focus();}else inp.classList.remove('filled'); });
+  inp.addEventListener('keydown',e=>{ if(e.key==='Backspace'&&!inp.value&&idx>0){otpInputs[idx-1].value='';otpInputs[idx-1].classList.remove('filled');otpInputs[idx-1].focus();} });
+  inp.addEventListener('paste',e=>{ e.preventDefault(); const p=(e.clipboardData||window.clipboardData).getData('text').replace(/\D/g,''); p.split('').forEach((c,i)=>{if(otpInputs[idx+i]){otpInputs[idx+i].value=c;otpInputs[idx+i].classList.add('filled');}}); });
+});
+
+let twoFaShown=false;
+document.getElementById('password').addEventListener('focus',()=>{ if(!twoFaShown){setTimeout(()=>{document.getElementById('twofaSection').classList.add('show');twoFaShown=true;},500);} });
+
+// ── LOGIN ──
+document.getElementById('loginBtn').addEventListener('click',doLogin);
+document.addEventListener('keydown',e=>{ if(e.key==='Enter'&&document.querySelector('.atab.on').dataset.tab==='std') doLogin(); });
+
+async function doLogin(){
+  const btn=document.getElementById('loginBtn'),ico=document.getElementById('btnIco'),txt=document.getElementById('btnTxt');
+  if(btn.classList.contains('loading')||btn.classList.contains('success')) return;
+  const email=document.getElementById('username').value.trim()||'admin@sentinel.local';
+  const password=document.getElementById('password').value||'admin123';
+  btn.classList.add('loading'); btn.disabled=true;
+  ico.innerHTML='<span class="spin"></span>'; txt.textContent='AUTHENTICATING...';
+  try {
+    const r=await fetch('/api/v1/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,password})});
+    const data=await r.json();
+    if(!r.ok){ throw new Error(data.error||'Login failed'); }
+    localStorage.setItem('sentinel_access_token', data.access_token);
+    localStorage.setItem('sentinel_user', JSON.stringify(data.user||{email,role:'admin'}));
+    btn.classList.remove('loading'); btn.classList.add('success');
+    ico.textContent='✓'; txt.textContent='ACCESS GRANTED';
+    setTimeout(()=>{ window.location.href='/dashboard'; },1200);
+  } catch(e) {
+    btn.classList.remove('loading'); btn.disabled=false;
+    ico.textContent='🔐'; txt.textContent='SIGN IN';
+    // show error
+    let errEl=document.getElementById('loginErr');
+    if(!errEl){errEl=document.createElement('div');errEl.id='loginErr';errEl.style.cssText='color:#FF1A44;font-family:Share Tech Mono,monospace;font-size:11px;margin-top:8px;text-align:center';const form=btn.parentElement;form.appendChild(errEl);}
+    errEl.textContent='⚠ '+(e.message||'Authentication failed');
+    setTimeout(()=>{if(errEl)errEl.textContent='';},4000);
+  }
+}
+function ssoLogin(p){ doLogin(); }
+function apiLogin(){ doLogin(); }
+
+// ── TICKER ──
+const tickItems=[
+  {sev:'tc',sl:'CRITICAL',msg:'SQLi attack blocked · 185.220.101.45 → /api/login · Rule CRS-942100 · Score: 24/50'},
+  {sev:'th',sl:'HIGH',msg:'XSS attempt detected · 103.24.8.122 → /search?q= · Payload: <script>alert()'},
+  {sev:'tc',sl:'CRITICAL',msg:'Log4Shell probe blocked · CVE-2021-44228 · Virtual patch applied · 198.235.24.130'},
+  {sev:'th',sl:'HIGH',msg:'Path traversal blocked · 91.240.118.150 → /../../etc/passwd · Rule CRS-930100'},
+  {sev:'tm',sl:'MEDIUM',msg:'Rate limit exceeded · 10.0.0.45 → 5,200 req/min · Auto-banned 300s'},
+  {sev:'tl',sl:'INFO',msg:'New API endpoint discovered · /api/v2/users · ML profile updated · Learning mode'},
+  {sev:'tc',sl:'CRITICAL',msg:'BotNet detected · JA4: t13d1516h2_8daaf615 · 450 IPs blocked · eBPF active'},
+  {sev:'th',sl:'HIGH',msg:'Command injection blocked · 45.33.32.156 → /cmd?exec · Rule CRS-932100'},
+  {sev:'tm',sl:'MEDIUM',msg:'Suspicious TLS fingerprint · JA3: 7dcce5b76c8b17472ef3... · Score +4'},
+  {sev:'th',sl:'HIGH',msg:'Credential stuffing · 320 attempts in 60s · 45.142.212.100 · Blocked + reported'},
+  {sev:'tl',sl:'INFO',msg:'GeoIP block enforced · CN → Blocked 1,247 requests today'},
+  {sev:'tc',sl:'CRITICAL',msg:'SSRF attempt · 192.168.100.12 → /internal/metadata · Dropped · Alert raised'},
+];
+(function buildTicker(){
+  const inner=document.getElementById('tickerInner');
+  const r=()=>tickItems.map(t=>`<span class="ti"><span class="tsev ${t.sev}">${t.sl}</span>${t.msg}<span class="tsep">◆</span></span>`).join('');
+  inner.innerHTML=r()+r();
+})();
+
+// ── COPILOT ──
+const copFab=document.getElementById('copilotFab'),copPanel=document.getElementById('copPanel'),copClose=document.getElementById('copClose'),copMsgs=document.getElementById('copMsgs'),copInput=document.getElementById('copInput'),typing=document.getElementById('typing');
+copFab.addEventListener('click',()=>{ copPanel.classList.toggle('open'); if(copPanel.classList.contains('open')) copInput.focus(); });
+copClose.addEventListener('click',()=>copPanel.classList.remove('open'));
+
+const aiR={
+  explain:`**SQL Injection Detected** at \`/api/login\`\n\nRule \`CRS-942100\` matched \`UNION SELECT\` in param \`id\`.\nSource: \`185.220.101.45\` (Tor Exit Node)\nAnomaly Score: **24/50** — threshold exceeded.\n\n✅ Action: Terminated + IP flagged for 24h.`,
+  rule:"Here's a custom SRL rule to block scanners:\n\n```\nrule block-scanners {\n  id: 9000001\n  phase: request_headers\n  target: REQUEST_HEADERS:User-Agent\n  operator: rx('/sqlmap|nikto|nmap|nuclei/i')\n  action: block\n  severity: critical\n}\n```",
+  report:"**24-Hour Summary**\n\n• 2,847,293 total requests\n• 3,204 threats blocked (0.11%)\n• Top attacks: SQLi 48% · XSS 27% · Path Traversal 15%\n• ML detections: **89** (82 confirmed)\n• False positive rate: **0.003%** ✅",
+  fp:"**False Positive Fix**\n\nRule `CRS-920420` may trigger on API clients with multiple `Content-Type` headers.\n\n**Fix:**\n```yaml\nwaf:\n  exceptions:\n    - rule_id: 920420\n      path_prefix: /api/\n```",
+  patch:"Share the CVE ID (e.g. `CVE-2024-12345`) and description — I'll generate a Sentinel SRL virtual patch deployable instantly with zero restart.",
+};
+const greet="Hello! I'm **Sentinel AI Copilot** — powered by DeepSeek R1.\n\nI can help:\n• 🔍 Explain security alerts\n• 📝 Generate SRL WAF rules\n• 🛡️ Create CVE virtual patches\n• 🐛 Debug false positives\n• 📊 Security reports\n\nWhat would you like to know?";
+
+function addMsg(who,text){ const t=new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}); const d=document.createElement('div'); d.className=`msg ${who}`; d.innerHTML=`<div class="mav ${who}">${who==='ai'?'🤖':'👤'}</div><div><div class="mbbl">${text.replace(/\n/g,'<br>').replace(/\*\*(.*?)\*\*/g,'<strong>$1</strong>').replace(/\`(.*?)\`/g,'<code style="background:rgba(255,255,255,.08);padding:1px 5px;border-radius:3px;font-size:10px">$1</code>').replace(/```([\s\S]*?)```/g,'<pre style="background:rgba(0,0,0,.3);padding:8px;border-radius:6px;font-size:10px;margin:5px 0;overflow-x:auto;white-space:pre-wrap">$1</pre>')}</div><div class="mt">${t}</div></div>`; copMsgs.appendChild(d); copMsgs.scrollTop=copMsgs.scrollHeight; }
+function showTyping(){ typing.classList.add('show'); copMsgs.scrollTop=copMsgs.scrollHeight; }
+function hideTyping(){ typing.classList.remove('show'); }
+function sendAI(r){ showTyping(); setTimeout(()=>{ hideTyping(); addMsg('ai',r); },900+Math.random()*600); }
+
+setTimeout(()=>addMsg('ai',greet),2600);
+
+document.querySelectorAll('.qbtn').forEach(btn=>{
+  btn.addEventListener('click',()=>{
+    const q=btn.dataset.q,labels={explain:'Explain the latest alert',rule:'Write a custom WAF rule',report:'Generate threat report',fp:'Debug a false positive',patch:'Generate CVE virtual patch'};
+    addMsg('usr',labels[q]); sendAI(aiR[q]);
+  });
+});
+
+function sendUser(){ const v=copInput.value.trim(); if(!v) return; addMsg('usr',v); copInput.value=''; const l=v.toLowerCase(); let r=aiR.explain; if(l.includes('rule')||l.includes('srl')) r=aiR.rule; else if(l.includes('report')) r=aiR.report; else if(l.includes('false')||l.includes('fp')) r=aiR.fp; else if(l.includes('cve')||l.includes('patch')) r=aiR.patch; sendAI(r); }
+document.getElementById('copSend').addEventListener('click',sendUser);
+copInput.addEventListener('keydown',e=>{ if(e.key==='Enter') sendUser(); });
+</script>
+</body>
+</html>

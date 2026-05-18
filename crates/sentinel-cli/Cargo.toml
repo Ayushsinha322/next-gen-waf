@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 sentinel-core = { path = "../sentinel-core" }
+sentinel-ml = { path = "../sentinel-ml" }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -17,3 +18,8 @@ serde_yaml = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 libc = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+rustls = { workspace = true }
+ureq = { version = "2", features = ["tls", "json"] }
+flate2 = "1"
+tar = "0.4"

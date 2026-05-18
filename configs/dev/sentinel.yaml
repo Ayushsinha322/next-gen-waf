@@ -1,0 +1,141 @@
+# Sentinel WAF — dev configuration
+#
+# Three listeners:
+#   :9080  — shared WAF proxy (routes by Host header, for curl/CLI testing)
+#   :9095  — transparent DVWA port  (WAF takes over DVWA's port, default_site: dvwa)
+#   :3000  — transparent Juice Shop port (WAF takes over Juice's port, default_site: juiceshop)
+#
+# Upstreams must be on different ports since WAF owns the originals:
+#   DVWA        → docker run -p 9096:80   (was 9095)
+#   Juice Shop  → docker run -p 3001:3000 (was 3000)
+#
+# /etc/hosts entries for browser testing via Host-header listener:
+#   127.0.0.1  dvwa.local
+#   127.0.0.1  juice.local
+
+cluster:
+  name: sentinel-dev
+  node_id: auto
+  # Control-plane URL for site hot-sync. The proxy polls this every 5 s
+  # and rebuilds its site list when the version changes.
+  sync_url: "http://localhost:9501"
+  sync_interval_secs: 5
+
+listeners:
+  - name: http
+    bind: "0.0.0.0:9080"
+    protocol: http1
+
+  - name: dvwa-port
+    bind: "0.0.0.0:9095"
+    protocol: http1
+    default_site: dvwa.local   # matches DB site name
+
+  - name: juice-port
+    bind: "0.0.0.0:3000"
+    protocol: http1
+    default_site: juice.local  # matches DB site name
+
+sites:
+  - id: dvwa.local
+    domains: ["dvwa.local", "dvwa"]
+    upstream:
+      load_balancer: round_robin
+      servers:
+        - { host: "127.0.0.1", port: 9096, weight: 1 }
+      health_check:
+        path: /
+        interval: 10s
+        timeout: 3s
+    waf:
+      mode: blocking
+      paranoia_level: 2
+      anomaly_threshold: 5
+      rules:
+        # OWASP CRS 4.7.0 — attack detection rules
+        # REQUEST-901 (init) is intentionally omitted: it blocks all traffic
+        # if TX:crs_setup_version is absent, which our engine does not set.
+        # REQUEST-949 (blocking evaluation) is omitted: native anomaly_threshold
+        # above already handles the block decision.
+        - "rules/owasp-crs/rules/REQUEST-911-METHOD-ENFORCEMENT.conf"
+        - "rules/owasp-crs/rules/REQUEST-913-SCANNER-DETECTION.conf"
+        - "rules/owasp-crs/rules/REQUEST-920-PROTOCOL-ENFORCEMENT.conf"
+        - "rules/owasp-crs/rules/REQUEST-921-PROTOCOL-ATTACK.conf"
+        - "rules/owasp-crs/rules/REQUEST-930-APPLICATION-ATTACK-LFI.conf"
+        - "rules/owasp-crs/rules/REQUEST-931-APPLICATION-ATTACK-RFI.conf"
+        - "rules/owasp-crs/rules/REQUEST-932-APPLICATION-ATTACK-RCE.conf"
+        - "rules/owasp-crs/rules/REQUEST-933-APPLICATION-ATTACK-PHP.conf"
+        - "rules/owasp-crs/rules/REQUEST-934-APPLICATION-ATTACK-GENERIC.conf"
+        - "rules/owasp-crs/rules/REQUEST-941-APPLICATION-ATTACK-XSS.conf"
+        - "rules/owasp-crs/rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf"
+        - "rules/owasp-crs/rules/REQUEST-943-APPLICATION-ATTACK-SESSION-FIXATION.conf"
+        - "rules/owasp-crs/rules/REQUEST-944-APPLICATION-ATTACK-JAVA.conf"
+      # CRS false-positive suppressions (equivalent to ctl:ruleRemoveTargetById)
+      rule_exclusions:
+        # Rule 932236 (RCE: Unix Command Injection) matches the generic parameter
+        # name "id" via its ^-anchored regex against ARGS_NAMES. Since "id" is an
+        # extremely common query-param name (DVWA, REST APIs), exclude ARGS_NAMES
+        # from this rule while still checking ARGS values and other targets.
+        - rule_id: 932236
+          exclude_targets: ["ARGS_NAMES"]
+      ml:
+        enable: false
+        models: []
+        sensitivity: 0.85
+      rate_limit:
+        global:  { rps: 5000,  burst: 10000 }
+        per_ip:  { rps: 100,   burst: 50 }
+      bot_detection:
+        ja4: false
+        challenge: "off"
+
+  - id: juice.local
+    domains: ["juice.local", "juice"]
+    upstream:
+      load_balancer: round_robin
+      servers:
+        - { host: "127.0.0.1", port: 3001, weight: 1 }
+      health_check:
+        path: /
+        interval: 10s
+        timeout: 3s
+    waf:
+      mode: blocking
+      paranoia_level: 2
+      anomaly_threshold: 5
+      rules:
+        - "rules/owasp-crs/rules/REQUEST-911-METHOD-ENFORCEMENT.conf"
+        - "rules/owasp-crs/rules/REQUEST-913-SCANNER-DETECTION.conf"
+        - "rules/owasp-crs/rules/REQUEST-920-PROTOCOL-ENFORCEMENT.conf"
+        - "rules/owasp-crs/rules/REQUEST-921-PROTOCOL-ATTACK.conf"
+        - "rules/owasp-crs/rules/REQUEST-930-APPLICATION-ATTACK-LFI.conf"
+        - "rules/owasp-crs/rules/REQUEST-931-APPLICATION-ATTACK-RFI.conf"
+        - "rules/owasp-crs/rules/REQUEST-932-APPLICATION-ATTACK-RCE.conf"
+        - "rules/owasp-crs/rules/REQUEST-933-APPLICATION-ATTACK-PHP.conf"
+        - "rules/owasp-crs/rules/REQUEST-934-APPLICATION-ATTACK-GENERIC.conf"
+        - "rules/owasp-crs/rules/REQUEST-941-APPLICATION-ATTACK-XSS.conf"
+        - "rules/owasp-crs/rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf"
+        - "rules/owasp-crs/rules/REQUEST-943-APPLICATION-ATTACK-SESSION-FIXATION.conf"
+        - "rules/owasp-crs/rules/REQUEST-944-APPLICATION-ATTACK-JAVA.conf"
+      rule_exclusions:
+        - rule_id: 932236
+          exclude_targets: ["ARGS_NAMES"]
+      ml:
+        enable: false
+        models: []
+        sensitivity: 0.85
+      rate_limit:
+        global:  { rps: 5000,  burst: 10000 }
+        per_ip:  { rps: 100,   burst: 50 }
+      bot_detection:
+        ja4: false
+        challenge: "off"
+
+logging:
+  level: info
+  format: json
+  outputs:
+    - type: stdout
+
+storage:
+  cache: { backend: memory, size: 64MB }

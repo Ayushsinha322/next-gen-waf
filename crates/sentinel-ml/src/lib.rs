@@ -1,1 +1,339 @@
-//! sentinel-ml — see crates/sentinel-ml/README.md
+//! sentinel-ml — Machine Learning engine for Sentinel WAF.
+//!
+//! Provides three tiers of intelligence on the request path:
+//!
+//! **Tier 1 — Built-in models (always active, zero external deps):**
+//! * [`MlEngine`] — orchestrates feature extraction, Isolation Forest
+//!   anomaly scoring, and payload attack classification.
+//! * Feature extraction: 24-dimensional normalised vector per request.
+//! * Isolation Forest: online unsupervised anomaly detection.
+//! * Payload Classifier: multi-category attack-payload scoring.
+//!
+//! **Tier 2 — ONNX inference (optional feature `ort-inference`):**
+//! * Load `.onnx` models from `ml-models/`.
+//! * Scored alongside built-in models; contributes to `ml_scores`.
+//!
+//! **Tier 3 — LLM Copilot (async, out-of-band):**
+//! * Not on the request path.  Used for alert explanations, rule
+//!   generation, and virtual patches.
+//!
+//! # Usage
+//! ```ignore
+//! use sentinel_ml::MlEngine;
+//!
+//! let mut engine = MlEngine::new(1024, 64, None);
+//! // On each request:
+//! let scores = engine.evaluate(&ctx);
+//! if scores.anomaly_score > 0.7 {
+//!     // Flag request as suspicious.
+//! }
+//! ```
+
+pub mod features;
+pub mod inference;
+pub mod llm_copilot;
+pub mod models;
+
+use std::path::Path;
+
+use parking_lot::RwLock;
+use tracing::{debug, info};
+
+use self::features::FeatureVector;
+use self::inference::ModelRegistry;
+use self::models::isolation_forest::IncrementalForest;
+use self::models::payload_classifier::PayloadClassifier;
+
+// ---------------------------------------------------------------------------
+// ML scores returned per request
+// ---------------------------------------------------------------------------
+
+/// Aggregated ML scores for a single request.
+#[derive(Debug, Clone)]
+pub struct MlScores {
+    /// Isolation Forest anomaly score ∈ [0, 1].
+    /// >0.6 = suspicious, >0.7 = likely anomalous.
+    pub anomaly_score: f32,
+    /// Payload Classifier attack probability ∈ [0, 1].
+    pub payload_attack_score: f32,
+    /// Per-ONNX-model scores, keyed by model name.
+    pub onnx_scores: Vec<(String, f32)>,
+    /// Combined score (max of all sources) ∈ [0, 1].
+    pub combined_score: f32,
+}
+
+impl Default for MlScores {
+    fn default() -> Self {
+        Self {
+            anomaly_score: 0.5,
+            payload_attack_score: 0.0,
+            onnx_scores: Vec::new(),
+            combined_score: 0.5,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Engine configuration
+// ---------------------------------------------------------------------------
+
+/// Per-instance ML engine configuration.
+#[derive(Debug, Clone)]
+pub struct MlEngineConfig {
+    /// Isolation Forest ring-buffer capacity (recent request vectors kept).
+    pub buffer_capacity: usize,
+    /// Retrain the forest after this many new observations.
+    pub retrain_every: usize,
+    /// Path to ONNX model directory (default: `ml-models/`).
+    pub model_dir: Option<String>,
+    /// Sensitivity threshold [0, 1] — combined score above this flags a
+    /// request as suspicious (default: 0.85 from config).
+    pub sensitivity: f32,
+}
+
+impl Default for MlEngineConfig {
+    fn default() -> Self {
+        Self {
+            buffer_capacity: 4096,
+            retrain_every: 256,
+            model_dir: None,
+            sensitivity: 0.85,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ML Engine
+// ---------------------------------------------------------------------------
+
+/// Central ML orchestrator — created once, shared across all request
+/// handlers.
+///
+/// # Thread safety
+/// All fields are behind `RwLock` so the engine is `Send + Sync`.
+/// Reads (scoring) are fast shared-lock; writes (retraining) are rare.
+pub struct MlEngine {
+    forest: IncrementalForest,
+    payload_classifier: PayloadClassifier,
+    model_registry: RwLock<ModelRegistry>,
+    config: RwLock<MlEngineConfig>,
+}
+
+impl MlEngine {
+    /// Create a new ML engine.
+    ///
+    /// * `buffer_capacity` — max recent vector count for Isolation Forest.
+    /// * `retrain_every` — retrain forest after N new observations.
+    /// * `model_dir` — path to load `.onnx` models from.
+    pub fn new(
+        buffer_capacity: usize,
+        retrain_every: usize,
+        model_dir: Option<&Path>,
+    ) -> Self {
+        let mut registry = ModelRegistry::new();
+        let config = MlEngineConfig {
+            buffer_capacity,
+            retrain_every,
+            model_dir: model_dir.map(|p| p.display().to_string()),
+            sensitivity: 0.85,
+        };
+
+        if let Some(dir) = model_dir {
+            match std::fs::read_dir(dir) {
+                Ok(entries) => {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().and_then(|e| e.to_str()) == Some("onnx") {
+                            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                                if let Err(e) = registry.load(stem, dir) {
+                                    tracing::warn!("failed to load ONNX model {stem}: {e}");
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!("cannot read model dir {dir:?}: {e}"),
+            }
+        }
+
+        if !registry.is_empty() {
+            info!(count = registry.len(), "ONNX models loaded");
+        }
+
+        Self {
+            forest: IncrementalForest::new(buffer_capacity, retrain_every),
+            payload_classifier: PayloadClassifier::default(),
+            model_registry: RwLock::new(registry),
+            config: RwLock::new(config),
+        }
+    }
+
+    /// Evaluate ML scores for a request and feed the result into online
+    /// learning.
+    ///
+    /// This is the only method that should be called on the request path.
+    pub fn evaluate(&self, ctx: &sentinel_core::context::RequestContext) -> MlScores {
+        let fv = FeatureVector::extract(ctx);
+
+        // 1. Isolation Forest anomaly score.
+        let anomaly_score = self.forest.score(fv.as_slice());
+        // Feed for online learning.
+        self.forest.observe(fv.as_slice());
+
+        // 2. Payload Classifier attack probability.
+        let payload_attack_score = self.payload_classifier.score(&fv);
+
+        // 3. ONNX model scores (if any loaded).
+        let registry = self.model_registry.read();
+        let onnx_scores: Vec<(String, f32)> = registry
+            .model_names()
+            .map(|name| {
+                let raw = registry.predict(name, &fv.values);
+                let score = raw.first().copied().unwrap_or(0.5);
+                (name.to_string(), score)
+            })
+            .collect();
+        drop(registry);
+
+        let combined = anomaly_score.max(payload_attack_score);
+
+        let scores = MlScores {
+            anomaly_score,
+            payload_attack_score,
+            onnx_scores,
+            combined_score: combined,
+        };
+
+        debug!(
+            anomaly = %anomaly_score,
+            payload_attack = %payload_attack_score,
+            combined = %combined,
+            "ML scored request"
+        );
+
+        scores
+    }
+
+    /// Update sensitivity threshold from config (hot-reload).
+    pub fn set_sensitivity(&self, sensitivity: f32) {
+        self.config.write().sensitivity = sensitivity.clamp(0.0, 1.0);
+    }
+
+    /// Current sensitivity threshold.
+    pub fn sensitivity(&self) -> f32 {
+        self.config.read().sensitivity
+    }
+
+    /// Whether the Isolation Forest has been trained at least once.
+    pub fn is_trained(&self) -> bool {
+        self.forest.is_trained()
+    }
+
+    /// Number of requests in the learning buffer.
+    pub fn buffer_len(&self) -> usize {
+        self.forest.buffer_len()
+    }
+
+    /// Training generation counter.
+    pub fn generation(&self) -> u64 {
+        self.forest.generation()
+    }
+
+    /// Number of ONNX models loaded.
+    pub fn onnx_model_count(&self) -> usize {
+        self.model_registry.read().len()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn engine_creates_and_scores() {
+        let engine = MlEngine::new(1024, 64, None);
+        // Not trained yet — scores neutral.
+        assert!(!engine.is_trained());
+        assert_eq!(engine.buffer_len(), 0);
+    }
+
+    #[test]
+    fn engine_evaluates_clean_request() {
+        let engine = MlEngine::new(1024, 64, None);
+        let mut ctx =
+            sentinel_core::context::RequestContext::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1234);
+        ctx.uri = "http://example.com/".parse().unwrap();
+        let scores = engine.evaluate(&ctx);
+        assert!((0.0..=1.0).contains(&scores.anomaly_score));
+        assert!((0.0..=1.0).contains(&scores.payload_attack_score));
+        assert!((0.0..=1.0).contains(&scores.combined_score));
+        assert_eq!(engine.buffer_len(), 1);
+    }
+
+    #[test]
+    fn engine_trains_after_enough_data() {
+        let engine = MlEngine::new(512, 64, None);
+        let mut ctx =
+            sentinel_core::context::RequestContext::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1234);
+        ctx.uri = "http://example.com/".parse().unwrap();
+
+        for i in 0..64 {
+            ctx.uri = format!("http://example.com/page{i}").parse().unwrap();
+            engine.evaluate(&ctx);
+        }
+        // After 64 evaluations, the forest should be trained.
+        assert!(engine.is_trained(), "forest should be trained");
+        assert!(engine.generation() >= 1, "at least one retrain");
+    }
+
+    #[test]
+    fn sql_injection_scores_higher_than_clean() {
+        let engine = MlEngine::new(512, 64, None);
+
+        // Feed some "clean" traffic to give the forest a baseline.
+        let mut ctx =
+            sentinel_core::context::RequestContext::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1234);
+        for i in 0..64 {
+            ctx.uri = format!("http://example.com/products/{i}?page=1").parse().unwrap();
+            engine.evaluate(&ctx);
+        }
+        assert!(engine.is_trained());
+
+        let mut clean_ctx =
+            sentinel_core::context::RequestContext::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1234);
+        clean_ctx.uri = "http://example.com/products/42?page=1".parse().unwrap();
+        let clean = engine.evaluate(&clean_ctx);
+
+        // Use a percent-encoded SQLi so the URI is valid.
+        let mut sqli_ctx =
+            sentinel_core::context::RequestContext::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1234);
+        sqli_ctx.uri = "http://example.com/products?id=1%27%20UNION%20SELECT%20*%20FROM%20users%20--"
+            .parse()
+            .unwrap();
+        let sqli = engine.evaluate(&sqli_ctx);
+
+        // The attack should score higher on the payload classifier.
+        assert!(
+            sqli.payload_attack_score > clean.payload_attack_score,
+            "SQLi payload attack score ({}) should exceed clean ({})",
+            sqli.payload_attack_score,
+            clean.payload_attack_score
+        );
+    }
+
+    #[test]
+    fn sensitivity_clamped() {
+        let engine = MlEngine::new(512, 64, None);
+        engine.set_sensitivity(1.5);
+        assert_eq!(engine.sensitivity(), 1.0);
+        engine.set_sensitivity(-0.2);
+        assert_eq!(engine.sensitivity(), 0.0);
+        engine.set_sensitivity(0.73);
+        assert_eq!(engine.sensitivity(), 0.73);
+    }
+}

@@ -1,4 +1,4 @@
-use crate::dsl::ast::{RulePhase, RuleSeverity};
+use crate::dsl::ast::{RulePhase, RuleSeverity, Transform};
 
 // ---------------------------------------------------------------------------
 // Parsed CRS action attributes
@@ -10,12 +10,19 @@ pub struct CrsActions {
     pub id: Option<u32>,
     pub phase: Option<RulePhase>,
     pub action: CrsAction,
+    /// True once a primary action keyword (block/pass/allow/deny) was seen.
+    /// `log`/`nolog` are logging modifiers and must not overwrite a primary action.
+    pub primary_action_set: bool,
     pub msg: Option<String>,
     pub severity: Option<RuleSeverity>,
     pub tags: Vec<String>,
     pub score_delta: Option<i32>,
     /// Whether this rule has a `chain` action (next SecRule is a chain member).
     pub chain: bool,
+    /// Ordered list of transformations to apply to target values before matching.
+    pub transforms: Vec<Transform>,
+    /// CRS `skipAfter:MARKER` label (if present).
+    pub skip_after: Option<String>,
     /// Unrecognised action tokens (emitted as warnings).
     pub unknown: Vec<String>,
 }
@@ -146,10 +153,11 @@ fn parse_action_token(token: &str, out: &mut CrsActions) {
         out.tags.push(unquote(rest.trim()));
         return;
     }
-    // setvar:tx.anomaly_score=+5 or setvar:tx.sql_injection_score=+%{...}
+    // setvar:tx.anomaly_score=+5 or setvar:tx.anomaly_score=+%{tx.critical_anomaly_score}
     if let Some(rest) = token.strip_prefix("setvar:") {
         if let Some(delta) = parse_setvar_score_delta(rest.trim()) {
-            out.score_delta = Some(delta);
+            // Sum all anomaly-score deltas in the rule (CRS v4 has exactly one per rule).
+            out.score_delta = Some(out.score_delta.unwrap_or(0) + delta);
         }
         return;
     }
@@ -170,26 +178,47 @@ fn parse_action_token(token: &str, out: &mut CrsActions) {
     if token.starts_with("maturity:") || token.starts_with("accuracy:") {
         return;
     }
-    // skip/skipAfter — skip chains for now
-    if token.starts_with("skip:") || token.starts_with("skipAfter:") {
-        out.unknown.push(token.to_owned());
+    // skip:N — skip N rules (not relevant to our rule ordering)
+    if token.starts_with("skip:") {
+        return; // silently ignore — no runtime skip-by-count
+    }
+    // skipAfter:MARKER — jump to named SecMarker when this rule fires
+    if let Some(rest) = token.strip_prefix("skipAfter:") {
+        out.skip_after = Some(unquote(rest.trim()));
         return;
     }
 
     // Simple action keywords
-    match token.to_lowercase().as_str() {
-        "block" | "deny" => out.action = CrsAction::Block,
-        "pass" => out.action = CrsAction::Pass,
-        "allow" => out.action = CrsAction::Allow,
-        "log" => out.action = CrsAction::Log,
-        "nolog" => out.action = CrsAction::NoLog,
-        "noauditlog" | "auditlog" | "capture" | "t:none" | "t:lowercase"
-        | "t:urlDecodeUni" | "t:htmlEntityDecode" | "t:removeNulls"
-        | "t:removeWhitespace" | "t:cssDecode" | "t:jsDecode" => {
-            // Transformation / log flags — silently skip
+    match token.to_ascii_lowercase().as_str() {
+        "block" | "deny" => { out.action = CrsAction::Block; out.primary_action_set = true; }
+        "pass" => { out.action = CrsAction::Pass; out.primary_action_set = true; }
+        "allow" => { out.action = CrsAction::Allow; out.primary_action_set = true; }
+        // `log`/`nolog` are logging modifiers in CRS, NOT the primary action.
+        // "block,log" → primary=block; "log" alone → Log (no primary set).
+        "log" => {
+            if !out.primary_action_set {
+                out.action = CrsAction::Log;
+            }
         }
-        other if other.starts_with("t:") => {} // any other transform
-        other if other.starts_with("ctl:") => {} // control directives
+        "nolog" => {
+            if !out.primary_action_set {
+                out.action = CrsAction::NoLog;
+            }
+        }
+        "noauditlog" | "auditlog" | "capture" => {}
+        // Transforms — applied in declaration order; t:none resets the list
+        "t:none" => out.transforms.clear(),
+        "t:lowercase" => out.transforms.push(Transform::Lowercase),
+        "t:urldecodeuni" | "t:urldecode" => out.transforms.push(Transform::UrlDecodeUni),
+        "t:removenulls" => out.transforms.push(Transform::RemoveNulls),
+        "t:replacenulls" => out.transforms.push(Transform::ReplaceNulls),
+        "t:htmlentitydecode" => out.transforms.push(Transform::HtmlEntityDecode),
+        "t:removewhitespace" => out.transforms.push(Transform::RemoveWhitespace),
+        "t:compresswhitespace" => out.transforms.push(Transform::CompressWhitespace),
+        "t:jsdecode" => out.transforms.push(Transform::JsDecode),
+        "t:cssdecode" => out.transforms.push(Transform::CssDecode),
+        other if other.starts_with("t:") => {} // other transforms (base64, hex, etc.) — no-op
+        other if other.starts_with("ctl:") => {} // control directives — no-op
         "chain" => {
             out.chain = true;
         }
@@ -199,19 +228,55 @@ fn parse_action_token(token: &str, out: &mut CrsActions) {
     }
 }
 
-/// Try to parse a `setvar:tx.something=+N` into a score delta.
+/// Try to parse a `setvar:tx.anomaly_score=+N` into a score delta.
+///
+/// Rules:
+/// - Only `tx.anomaly_score` updates are extracted (category vars like
+///   `tx.sql_injection_score` track subcategories but CRS rules also always
+///   include a corresponding `tx.anomaly_score` delta, so we take that one).
+/// - Only delta operations (`+N` or `-N`) are extracted; absolute assignments
+///   (`=N` without sign) are ignored for scoring purposes.
 fn parse_setvar_score_delta(s: &str) -> Option<i32> {
-    // We care about patterns like:
-    //   tx.anomaly_score=+5
-    //   tx.critical_anomaly_score=+5
-    //   tx.sql_injection_score=+5
-    // and ignore references like `+%{tx.critical_anomaly_score}`.
-    let (_lhs, rhs) = s.split_once('=')?;
+    // Strip quotes CRS sometimes wraps setvar values in
+    let s = s.trim().trim_matches('\'');
+    let (lhs, rhs) = s.split_once('=')?;
+    let lhs = lhs.trim().to_ascii_lowercase();
     let rhs = rhs.trim();
-    if rhs.starts_with('%') {
-        return None; // variable reference — skip
+
+    // Only accumulate anomaly_score deltas; ignore category score vars.
+    if lhs != "tx.anomaly_score" {
+        return None;
     }
-    rhs.parse::<i32>().ok()
+
+    // Must start with + or - to be a delta operation.
+    let (sign, num_str) = if let Some(rest) = rhs.strip_prefix('+') {
+        (1i32, rest)
+    } else if let Some(rest) = rhs.strip_prefix('-') {
+        (-1i32, rest)
+    } else {
+        return None; // absolute assignment — not a delta
+    };
+
+    // Direct numeric: +5
+    if let Ok(n) = num_str.trim().parse::<i32>() {
+        return Some(sign * n);
+    }
+
+    // Variable reference: +%{tx.critical_anomaly_score}
+    let num_str = num_str.trim();
+    if num_str.starts_with("%{") && num_str.ends_with('}') {
+        let inner = &num_str[2..num_str.len() - 1];
+        let mapped = match inner.to_ascii_lowercase().as_str() {
+            "tx.critical_anomaly_score" => Some(5),
+            "tx.error_anomaly_score" => Some(4),
+            "tx.warning_anomaly_score" => Some(3),
+            "tx.notice_anomaly_score" => Some(2),
+            _ => None,
+        };
+        return mapped.map(|v| sign * v);
+    }
+
+    None
 }
 
 fn parse_crs_severity(s: &str) -> Option<RuleSeverity> {

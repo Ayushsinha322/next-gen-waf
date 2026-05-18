@@ -8,8 +8,8 @@ use regex::Regex;
 use tracing::debug;
 
 use crate::dsl::ast::{
-    CmpOp, Operator, RuleDef, RuleFile, RuleItem, RulePhase, RuleSeverity,
-    TargetCombinator, TargetExpr, VirtualPatch,
+    CmpOp, Directive, Operator, RuleDef, RuleFile, RuleItem, RulePhase, RuleSeverity,
+    TargetCombinator, TargetExpr, Transform, VirtualPatch,
 };
 use emitter::{CompiledRuleSet, Instruction, RuleMeta, TargetSpec};
 use optimizer::build_ac;
@@ -89,16 +89,35 @@ pub fn compile(file: RuleFile) -> Result<CompiledRuleSet> {
     let mut rule_meta: std::collections::HashMap<u32, RuleMeta> =
         std::collections::HashMap::new();
 
-    // Sort items so rules within a phase are ordered by rule_id (CRS requirement).
-    let mut rules: Vec<(RulePhase, u32, Vec<Instruction>, RuleMeta)> = Vec::new();
+    // Process items in source order — CRS skip-gate correctness depends on it.
+    //
+    // CRS structures each rule file as:
+    //   skip-gate(@lt 1)  ←── fires if PL < 1; jumps to END marker
+    //   PL1 rules
+    //   skip-gate(@lt 2)  ←── fires if PL < 2; jumps to END marker
+    //   PL2 rules
+    //   …
+    //   SecMarker END-REQUEST-xxx
+    //
+    // Sorting by rule_id would move all skip-gates (small IDs like 941012)
+    // ahead of all detection rules (larger IDs like 941100+), causing the
+    // skip-gate to fire and skip past every detection rule.
+    //
+    // SecMarker instructions are emitted into EVERY phase program at the
+    // current source position so that skip-gates in any phase can find their
+    // target (CRS uses the same marker name for phase-1 and phase-2 gates).
 
     let mut skipped = 0usize;
     for item in file.items {
         match item {
             RuleItem::Rule(rule) => {
                 let rule_id = rule.id;
+                let phase = rule.phase;
                 match compile_rule(&rule, &mut state) {
-                    Ok((instrs, meta)) => rules.push((rule.phase, rule.id, instrs, meta)),
+                    Ok((instrs, meta)) => {
+                        rule_meta.insert(meta.id, meta);
+                        phase_programs[phase as usize].extend(instrs);
+                    }
                     Err(e) => {
                         skipped += 1;
                         tracing::warn!(rule_id, "skipping rule (compile error): {e:#}");
@@ -106,11 +125,13 @@ pub fn compile(file: RuleFile) -> Result<CompiledRuleSet> {
                 }
             }
             RuleItem::VirtualPatch(vp) => {
+                let phase = vp.phase;
                 let cve = vp.cve.clone();
                 match compile_virtual_patch(&vp, &mut state) {
                     Ok((instrs, meta)) => {
                         let vp_id: u32 = cve_to_id(&vp.cve);
-                        rules.push((vp.phase, vp_id, instrs, meta));
+                        rule_meta.insert(vp_id, meta);
+                        phase_programs[phase as usize].extend(instrs);
                     }
                     Err(e) => {
                         skipped += 1;
@@ -118,22 +139,20 @@ pub fn compile(file: RuleFile) -> Result<CompiledRuleSet> {
                     }
                 }
             }
+            RuleItem::Directive(Directive::SecMarker(name)) => {
+                // Emit the marker into every phase program at the current
+                // position so skip-gates in phase 1 and phase 2 both find it.
+                for prog in phase_programs.iter_mut() {
+                    prog.push(Instruction::Marker(name.clone()));
+                }
+            }
             RuleItem::Directive(_) => {
-                // Directives are handled at load time, not compiled to bytecode.
+                // Other directives handled at load time, not compiled to bytecode.
             }
         }
     }
     if skipped > 0 {
         tracing::warn!(skipped, "compiler: skipped rules due to errors");
-    }
-
-    // Sort by (phase, rule_id) for deterministic per-phase ordering.
-    rules.sort_by_key(|(phase, id, _, _)| (*phase as usize, *id));
-
-    for (phase, _, instrs, meta) in rules {
-        rule_meta.insert(meta.id, meta);
-        let prog = &mut phase_programs[phase as usize];
-        prog.extend(instrs);
     }
 
     // Build Aho-Corasick automata from interned word-list tables.
@@ -178,13 +197,15 @@ fn compile_rule(
         action: rule.action.clone(),
         tags: rule.tags.clone(),
         phase: rule.phase,
+        skip_after: rule.skip_after.clone(),
     };
 
-    emit_condition(&rule.targets, &rule.operator, state, &mut instrs)?;
+    emit_condition(&rule.targets, &rule.operator, &rule.transforms, state, &mut instrs)?;
 
-    // Chain conditions: each is AND-ed with the accumulated result.
+    // Chain conditions: AND-ed with the primary condition result.
+    // Transforms from the parent rule also apply to chain member targets.
     for chain in &rule.chain_conditions {
-        emit_condition(&chain.targets, &chain.operator, state, &mut instrs)?;
+        emit_condition(&chain.targets, &chain.operator, &rule.transforms, state, &mut instrs)?;
         instrs.push(Instruction::And);
     }
 
@@ -207,9 +228,10 @@ fn compile_virtual_patch(
         action: vp.action.clone(),
         tags: vec![format!("virtual-patch/{}", vp.cve)],
         phase: vp.phase,
+        skip_after: None,
     };
 
-    emit_condition(&vp.targets, &vp.operator, state, &mut instrs)?;
+    emit_condition(&vp.targets, &vp.operator, &[], state, &mut instrs)?;
     instrs.push(Instruction::RuleEnd { rule_id: vp_id });
 
     Ok((instrs, meta))
@@ -219,13 +241,14 @@ fn compile_virtual_patch(
 ///
 /// For multi-target expressions like `ARGS | REQUEST_BODY`, this emits:
 /// ```text
-/// LoadTarget(Args)  MatchRx(0)
-/// LoadTarget(RequestBody)  MatchRx(0)
+/// LoadTarget(Args)  [ApplyTransforms]  MatchRx(0)
+/// LoadTarget(RequestBody)  [ApplyTransforms]  MatchRx(0)
 /// Or
 /// ```
 fn emit_condition(
     targets: &[TargetExpr],
     operator: &Operator,
+    transforms: &[Transform],
     state: &mut CompilerState,
     instrs: &mut Vec<Instruction>,
 ) -> Result<()> {
@@ -263,10 +286,13 @@ fn emit_condition(
         return Ok(());
     }
 
-    // Emit one "load+match" per target, combining with And/Or combinators.
+    // Emit one "load+[transforms]+match" per target, combining with And/Or combinators.
     for (i, tex) in targets.iter().enumerate() {
         let spec = TargetSpec::from(&tex.target);
         instrs.push(Instruction::LoadTarget(spec));
+        if !transforms.is_empty() {
+            instrs.push(Instruction::ApplyTransforms(transforms.to_vec()));
+        }
         emit_operator_match(operator, state, instrs)?;
 
         // Apply combinator from previous target
@@ -309,6 +335,9 @@ fn emit_operator_match(
         }
         Operator::Exists => {
             instrs.push(Instruction::Exists);
+        }
+        Operator::Never => {
+            instrs.push(Instruction::Never);
         }
         Operator::Not(inner) => {
             emit_operator_match(inner, state, instrs)?;

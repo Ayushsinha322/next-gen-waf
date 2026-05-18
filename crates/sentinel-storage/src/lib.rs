@@ -1,1 +1,251 @@
-//! sentinel-storage — see crates/sentinel-storage/README.md
+//! sentinel-storage — Redis KV + ClickHouse time-series for Sentinel WAF.
+//!
+//! # Backends
+//!
+//! | Backend      | Purpose                                            |
+//! |---|---|
+//! | Redis        | Distributed rate-limit state across WAF nodes      |
+//! | ClickHouse   | Traffic-bucket persistence (1-sec + 1-min rollups) |
+//! | MemoryStore  | In-process fallback for dev / unit tests           |
+//!
+//! # Quick start
+//!
+//! ```rust,no_run
+//! use sentinel_storage::{StorageBackendConfig, StorageHandle};
+//!
+//! #[tokio::main]
+//! async fn main() {
+//!     let cfg = StorageBackendConfig {
+//!         redis_url: Some("redis://127.0.0.1:6379".into()),
+//!         clickhouse_url: Some("http://127.0.0.1:8123".into()),
+//!         clickhouse_db: Some("sentinel".into()),
+//!     };
+//!     let handle = StorageHandle::connect(&cfg).await;
+//!
+//!     if let Some(redis) = &handle.redis {
+//!         let allowed = redis.rate_check("rate:ip:site1:1.2.3.4", 100, 1000).await.unwrap();
+//!         println!("request allowed: {allowed}");
+//!     }
+//! }
+//! ```
+
+pub mod clickhouse;
+pub mod error;
+pub mod memory;
+pub mod redis;
+
+pub use clickhouse::{ClickHouseClient, TrafficRow};
+pub use error::StorageError;
+pub use memory::MemoryStore;
+pub use redis::RedisClient;
+
+use std::sync::Arc;
+use tracing::{info, warn};
+
+// ---------------------------------------------------------------------------
+// StorageBackendConfig
+// ---------------------------------------------------------------------------
+
+/// Flat config consumed by [`StorageHandle::connect`].
+///
+/// Constructed either from environment variables (CLI / control-plane) or by
+/// converting from `sentinel_core::config::StorageConfig` via
+/// [`StorageBackendConfig::from_core`].
+#[derive(Debug, Clone, Default)]
+pub struct StorageBackendConfig {
+    /// Redis URL, e.g. `redis://127.0.0.1:6379`.  `None` → Redis disabled.
+    pub redis_url: Option<String>,
+    /// ClickHouse HTTP URL, e.g. `http://127.0.0.1:8123`.  `None` → CH disabled.
+    pub clickhouse_url: Option<String>,
+    /// ClickHouse database name. Defaults to `"sentinel"` when `None`.
+    pub clickhouse_db: Option<String>,
+}
+
+impl StorageBackendConfig {
+    /// Build from `sentinel_core::config::StorageConfig`.
+    ///
+    /// - Redis URL is taken from `storage.kv.url` when `backend = redis`.
+    /// - ClickHouse URL + database from `storage.timeseries`.
+    pub fn from_core(cfg: &sentinel_core::config::StorageConfig) -> Self {
+        use sentinel_core::config::KvBackend;
+
+        let redis_url = cfg
+            .kv
+            .as_ref()
+            .filter(|kv| kv.backend == KvBackend::Redis)
+            .and_then(|kv| kv.url.clone());
+
+        let clickhouse_url = cfg.timeseries.as_ref().map(|ts| ts.url.clone());
+        let clickhouse_db = cfg.timeseries.as_ref().map(|ts| ts.database.clone());
+
+        Self {
+            redis_url,
+            clickhouse_url,
+            clickhouse_db,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StorageHandle
+// ---------------------------------------------------------------------------
+
+/// Live handles to all configured storage backends.
+///
+/// Fields are `Option` — a backend is `None` when its URL is absent from
+/// config or when the connection attempt fails at startup.  Callers must
+/// degrade gracefully (e.g. fall back to `memory` for rate limiting).
+#[derive(Clone)]
+pub struct StorageHandle {
+    pub redis: Option<Arc<RedisClient>>,
+    pub clickhouse: Option<Arc<ClickHouseClient>>,
+    /// Always present: in-process KV store used as fallback.
+    pub memory: Arc<MemoryStore>,
+}
+
+impl Default for StorageHandle {
+    fn default() -> Self {
+        Self {
+            redis: None,
+            clickhouse: None,
+            memory: Arc::new(MemoryStore::new()),
+        }
+    }
+}
+
+impl StorageHandle {
+    /// Connect to all configured backends.
+    ///
+    /// Missing or unreachable backends are skipped with a `warn!` log rather
+    /// than causing startup failure — the WAF continues in degraded mode.
+    pub async fn connect(cfg: &StorageBackendConfig) -> Self {
+        let mut handle = Self::default();
+
+        // --- Redis -----------------------------------------------------------
+        if let Some(url) = &cfg.redis_url {
+            match RedisClient::connect(url).await {
+                Ok(client) => {
+                    info!(url, "redis connected");
+                    handle.redis = Some(Arc::new(client));
+                }
+                Err(e) => {
+                    warn!(
+                        url,
+                        error = %e,
+                        "redis unavailable — rate limit falls back to in-process store"
+                    );
+                }
+            }
+        }
+
+        // --- ClickHouse ------------------------------------------------------
+        if let Some(url) = &cfg.clickhouse_url {
+            let db = cfg.clickhouse_db.as_deref().unwrap_or("sentinel");
+            let client = ClickHouseClient::new(url, db);
+            match client.ping().await {
+                Ok(()) => match client.ensure_schema().await {
+                    Ok(()) => {
+                        info!(url, database = db, "clickhouse connected");
+                        handle.clickhouse = Some(Arc::new(client));
+                    }
+                    Err(e) => {
+                        warn!(url, error = %e, "clickhouse schema init failed — traffic history disabled");
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        url,
+                        error = %e,
+                        "clickhouse unreachable — traffic history will not persist across restarts"
+                    );
+                }
+            }
+        }
+
+        handle
+    }
+
+    /// `true` if Redis is connected and available.
+    pub fn has_redis(&self) -> bool {
+        self.redis.is_some()
+    }
+
+    /// `true` if ClickHouse is connected and available.
+    pub fn has_clickhouse(&self) -> bool {
+        self.clickhouse.is_some()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn default_handle_has_no_remote_backends() {
+        let h = StorageHandle::default();
+        assert!(!h.has_redis());
+        assert!(!h.has_clickhouse());
+    }
+
+    #[tokio::test]
+    async fn connect_with_empty_config_is_ok() {
+        let h = StorageHandle::connect(&StorageBackendConfig::default()).await;
+        assert!(!h.has_redis());
+        assert!(!h.has_clickhouse());
+    }
+
+    #[tokio::test]
+    async fn connect_with_bad_redis_url_degrades_gracefully() {
+        let cfg = StorageBackendConfig {
+            redis_url: Some("redis://127.0.0.1:19999".into()), // nothing listening
+            ..Default::default()
+        };
+        let h = StorageHandle::connect(&cfg).await;
+        assert!(!h.has_redis(), "should degrade, not panic");
+    }
+
+    #[tokio::test]
+    async fn connect_with_bad_clickhouse_url_degrades_gracefully() {
+        let cfg = StorageBackendConfig {
+            clickhouse_url: Some("http://127.0.0.1:19999".into()),
+            ..Default::default()
+        };
+        let h = StorageHandle::connect(&cfg).await;
+        assert!(!h.has_clickhouse(), "should degrade, not panic");
+    }
+
+    #[test]
+    fn from_core_redis_url_extracted() {
+        use sentinel_core::config::{KvBackend, KvConfig, StorageConfig};
+        let cfg = StorageConfig {
+            kv: Some(KvConfig {
+                backend: KvBackend::Redis,
+                path: None,
+                url: Some("redis://localhost:6379".into()),
+            }),
+            ..Default::default()
+        };
+        let backend = StorageBackendConfig::from_core(&cfg);
+        assert_eq!(backend.redis_url.as_deref(), Some("redis://localhost:6379"));
+        assert!(backend.clickhouse_url.is_none());
+    }
+
+    #[test]
+    fn from_core_timeseries_extracted() {
+        use sentinel_core::config::{StorageConfig, TimeSeriesConfig};
+        let cfg = StorageConfig {
+            timeseries: Some(TimeSeriesConfig {
+                url: "http://ch:8123".into(),
+                database: "mydb".into(),
+            }),
+            ..Default::default()
+        };
+        let backend = StorageBackendConfig::from_core(&cfg);
+        assert_eq!(backend.clickhouse_url.as_deref(), Some("http://ch:8123"));
+        assert_eq!(backend.clickhouse_db.as_deref(), Some("mydb"));
+    }
+}

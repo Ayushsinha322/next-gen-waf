@@ -1,0 +1,135 @@
+"use client";
+import { usePathname, useRouter } from "next/navigation";
+
+// ── Inline SVG icons ─────────────────────────────────────────────────────────
+const Icon = {
+  Overview: () => (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/>
+      <rect x="14" y="14" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/>
+    </svg>
+  ),
+  Traffic: () => (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+    </svg>
+  ),
+  Alerts: () => (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/>
+    </svg>
+  ),
+  Logs: () => (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>
+    </svg>
+  ),
+  Sites: () => (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/>
+      <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+    </svg>
+  ),
+  Rules: () => (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+    </svg>
+  ),
+  Plugins: () => (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/>
+      <line x1="7" y1="7" x2="7.01" y2="7"/>
+    </svg>
+  ),
+  Copilot: () => (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 2a10 10 0 1 0 10 10H12V2z"/><path d="M12 2a10 10 0 0 1 10 10"/>
+      <circle cx="12" cy="12" r="3"/>
+    </svg>
+  ),
+  ML: () => (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/>
+    </svg>
+  ),
+  Settings: () => (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="3"/>
+      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+    </svg>
+  ),
+};
+
+const NAV = [
+  { group: "MONITOR", items: [
+    { id: "overview", Icon: Icon.Overview, label: "Overview" },
+    { id: "traffic",  Icon: Icon.Traffic,  label: "Traffic",  badge: "LIVE", badgeCls: "nb-g" },
+    { id: "alerts",   Icon: Icon.Alerts,   label: "Alerts",   badge: "7",    badgeCls: "nb-r" },
+    { id: "logs",     Icon: Icon.Logs,     label: "Logs",     badge: "LIVE", badgeCls: "nb-g" },
+  ]},
+  { group: "PROTECT", items: [
+    { id: "sites",   Icon: Icon.Sites,   label: "Sites",   badge: "5",     badgeCls: "nb-g" },
+    { id: "rules",   Icon: Icon.Rules,   label: "Rules",   badge: "2,541", badgeCls: "nb-c" },
+    { id: "plugins", Icon: Icon.Plugins, label: "Plugins", badge: "3",     badgeCls: "nb-a" },
+  ]},
+  { group: "INTELLIGENCE", items: [
+    { id: "copilot", Icon: Icon.Copilot, label: "AI Copilot", badge: "AI",   badgeCls: "nb-a", badgeStyle: { background: "rgba(124,58,237,.18)", color: "#a78bfa", borderColor: "rgba(124,58,237,.3)" } },
+    { id: "ml",      Icon: Icon.ML,      label: "ML Engine",  badge: "LIVE", badgeCls: "nb-g" },
+  ]},
+  { group: "SYSTEM", items: [
+    { id: "settings", Icon: Icon.Settings, label: "Settings" },
+  ]},
+];
+
+export default function SideBar() {
+  const pathname = usePathname();
+  const router   = useRouter();
+  const current  = pathname.split("/").pop() || "overview";
+
+  return (
+    <nav className="sidebar">
+      <div style={{ flex: 1, overflowY: "auto", padding: "8px 8px" }}>
+        {NAV.map(g => (
+          <div key={g.group}>
+            <span className="sb-lbl">{g.group}</span>
+            {g.items.map(item => (
+              <div
+                key={item.id}
+                className={`nv ${current === item.id ? "active" : ""}`}
+                onClick={() => router.push(`/${item.id}`)}
+              >
+                <span className="nv-ico"><item.Icon /></span>
+                <span className="nv-lbl">{item.label}</span>
+                {item.badge && (
+                  <span
+                    className={`nv-b ${item.badgeCls}`}
+                    style={(item as any).badgeStyle}
+                  >
+                    {item.badge}
+                  </span>
+                )}
+              </div>
+            ))}
+          </div>
+        ))}
+      </div>
+
+      {/* Cluster status footer */}
+      <div style={{
+        padding: "10px 12px",
+        borderTop: "1px solid rgba(0,212,255,.08)",
+        display: "flex", flexDirection: "column", gap: 4,
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <span className="leader-dot" />
+          <span style={{ fontSize: 10, fontFamily: "'JetBrains Mono',monospace", color: "var(--text2)", fontWeight: 600 }}>
+            cp-primary-01
+          </span>
+        </div>
+        <div style={{ fontSize: 9, fontFamily: "'JetBrains Mono',monospace", color: "var(--text3)", letterSpacing: ".4px" }}>
+          Raft: LEADER · 3 nodes · v3.1.0
+        </div>
+      </div>
+    </nav>
+  );
+}
