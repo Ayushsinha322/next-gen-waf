@@ -47,6 +47,7 @@ generated/
 
 # Local notes / dev references (machine-specific, not for the repo)
 SAVE1.md
+ROADMAP.md
 COMMANDS.md
 AGENTS.md
 sentinel-about.md
