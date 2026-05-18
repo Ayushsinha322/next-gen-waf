@@ -285,6 +285,8 @@ fn token_to_target(tok: &str) -> Option<Target> {
         "ARGS_NAMES" => Some(Target::ArgsNames),
         "REQUEST_BODY" | "REQUEST_BODY_RAW" => Some(Target::RequestBody),
         "REQUEST_URI" | "REQUEST_URI_RAW" => Some(Target::RequestUri),
+        "REQUEST_FILENAME" | "REQUEST_BASENAME" => Some(Target::RequestFilename),
+        "REQUEST_METHOD" => Some(Target::RequestMethod),
         "REQUEST_LINE" => Some(Target::RequestLine),
         "REQUEST_HEADERS" => Some(Target::RequestHeaders(
             sub.map(str::to_lowercase)
@@ -366,14 +368,15 @@ pub(crate) fn crs_op_to_operator(op_name: &str, pattern: &str) -> Result<Operato
         "detectsqli" => {
             warn!(op = op_name, "CRS importer: @detectSQLi mapped to stub regex");
             Ok(Operator::Rx(
-                r"(?i)\b(?:select|union|insert|update|delete|drop|exec|sleep|benchmark|waitfor)\b"
+                r"(?i)\b(?:select|union|insert|update|delete|drop|exec(?:ute)?|sleep|benchmark|waitfor|information_schema|load_file|outfile|dumpfile|hex|char|ascii|substr|version|database|schema|table_name|column_name|concat|group_concat)\b"
                     .to_owned(),
             ))
         }
         "detectxss" => {
             warn!(op = op_name, "CRS importer: @detectXSS mapped to stub regex");
             Ok(Operator::Rx(
-                r"(?i)<\s*script|on\w+\s*=|javascript:|<\s*img[^>]*onerror".to_owned(),
+                r#"(?i)(?:<\s*script|<\s*(?:img|svg|body|iframe|object|embed|link|meta|input|button|a)[^>]*\s+on\w+\s*=|on\w+\s*=\s*["']?(?:alert|confirm|prompt|eval|document|window|location)|javascript\s*:|vbscript\s*:|data\s*:\s*text/html|expression\s*\()"#
+                    .to_owned(),
             ))
         }
         "gt" => pattern

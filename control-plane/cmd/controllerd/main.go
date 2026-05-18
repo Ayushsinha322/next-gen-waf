@@ -130,6 +130,8 @@ func run() error {
 		protected.GET("/dashboard/stats", func(c *gin.Context) { handleDashboardStats(c, enforcer, store) })
 		protected.GET("/sites", func(c *gin.Context) { handleListSites(c, enforcer, store) })
 		protected.POST("/sites", func(c *gin.Context) { handleCreateSite(c, enforcer, store, hub) })
+		protected.DELETE("/sites/:id", func(c *gin.Context) { handleDeleteSite(c, enforcer, store, hub) })
+		protected.PATCH("/sites/:id/status", func(c *gin.Context) { handleUpdateSiteStatus(c, enforcer, store, hub) })
 		protected.GET("/rules", func(c *gin.Context) { handleListRules(c, enforcer, store) })
 		protected.POST("/rules", func(c *gin.Context) { handleCreateRule(c, enforcer, store, hub) })
 		protected.PATCH("/rules/:id", func(c *gin.Context) { handleToggleRule(c, enforcer, store, hub) })
@@ -148,6 +150,11 @@ func run() error {
 	// SSE endpoint lives outside the protected group so the ?token= query-param
 	// path in handleLogsStream is reachable. EventSource cannot set headers.
 	router.GET("/api/v1/logs/stream", func(c *gin.Context) { handleLogsStream(c, jwtSvc, hub) })
+
+	// Internal config endpoint — called by the Rust data-plane proxy for site
+	// hot-sync. No JWT: the proxy runs on the same host (or private network).
+	// In production, protect this with mTLS or a network policy.
+	router.GET("/api/v1/internal/config", func(c *gin.Context) { handleInternalConfig(c, store) })
 
 	admin := router.Group("/api/v1/admin")
 	admin.Use(auth.GinAuthMiddleware(jwtSvc, true))

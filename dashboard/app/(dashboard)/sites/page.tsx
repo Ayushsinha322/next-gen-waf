@@ -243,8 +243,30 @@ export default function SitesPage() {
                         <div style={{ display: "flex", gap: 4 }}>
                           <button className="btn bg-btn btn-xs" onClick={() => router.push(`/logs?site=${s.name}&tab=waf`)}>🛡️</button>
                           <button className="btn bg-btn btn-xs" onClick={() => router.push(`/logs?site=${s.name}`)}>📜 Logs</button>
-                          <button className="btn bg-btn btn-xs" onClick={() => showToast(`Editing ${s.name}`, "i", "✏️")}>✏️</button>
-                          <button className="btn bg-btn btn-xs" onClick={() => showToast(`AI analysis for ${s.name}`, "i", "🤖")}>🤖</button>
+                          <button
+                            className="btn bg-btn btn-xs"
+                            title={s.status === "active" ? "Pause site" : "Activate site"}
+                            onClick={async () => {
+                              const next = s.status === "active" ? "paused" : "active";
+                              try {
+                                await api.sites.updateStatus(s.id, next);
+                                showToast(`Site ${next}`, "s", next === "active" ? "✅" : "⏸️");
+                                loadSites();
+                              } catch { showToast("Failed", "e", "⚠️"); }
+                            }}
+                          >{s.status === "active" ? "⏸️" : "▶️"}</button>
+                          <button
+                            className="btn bg-btn btn-xs"
+                            title="Delete site"
+                            onClick={async () => {
+                              if (!confirm(`Delete site "${s.name}"? This cannot be undone.`)) return;
+                              try {
+                                await api.sites.delete(s.id);
+                                showToast("Site deleted", "s", "🗑️");
+                                loadSites();
+                              } catch { showToast("Failed to delete", "e", "⚠️"); }
+                            }}
+                          >🗑️</button>
                         </div>
                       </td>
                     </tr>

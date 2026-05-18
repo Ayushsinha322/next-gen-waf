@@ -89,21 +89,35 @@ pub fn compile(file: RuleFile) -> Result<CompiledRuleSet> {
     let mut rule_meta: std::collections::HashMap<u32, RuleMeta> =
         std::collections::HashMap::new();
 
-    // Sort items so rules within a phase are ordered by rule_id (CRS requirement).
-    let mut rules: Vec<(RulePhase, u32, Vec<Instruction>, RuleMeta)> = Vec::new();
-    // SecMarker directives — emitted after all rules in their phase, in source order.
-    let mut phase_markers: Vec<(RulePhase, String)> = Vec::new();
-    // Tracks the phase of the most-recently-seen rule so markers can inherit it.
-    let mut current_phase = RulePhase::RequestHeaders;
+    // Process items in source order — CRS skip-gate correctness depends on it.
+    //
+    // CRS structures each rule file as:
+    //   skip-gate(@lt 1)  ←── fires if PL < 1; jumps to END marker
+    //   PL1 rules
+    //   skip-gate(@lt 2)  ←── fires if PL < 2; jumps to END marker
+    //   PL2 rules
+    //   …
+    //   SecMarker END-REQUEST-xxx
+    //
+    // Sorting by rule_id would move all skip-gates (small IDs like 941012)
+    // ahead of all detection rules (larger IDs like 941100+), causing the
+    // skip-gate to fire and skip past every detection rule.
+    //
+    // SecMarker instructions are emitted into EVERY phase program at the
+    // current source position so that skip-gates in any phase can find their
+    // target (CRS uses the same marker name for phase-1 and phase-2 gates).
 
     let mut skipped = 0usize;
     for item in file.items {
         match item {
             RuleItem::Rule(rule) => {
-                current_phase = rule.phase;
                 let rule_id = rule.id;
+                let phase = rule.phase;
                 match compile_rule(&rule, &mut state) {
-                    Ok((instrs, meta)) => rules.push((rule.phase, rule.id, instrs, meta)),
+                    Ok((instrs, meta)) => {
+                        rule_meta.insert(meta.id, meta);
+                        phase_programs[phase as usize].extend(instrs);
+                    }
                     Err(e) => {
                         skipped += 1;
                         tracing::warn!(rule_id, "skipping rule (compile error): {e:#}");
@@ -111,12 +125,13 @@ pub fn compile(file: RuleFile) -> Result<CompiledRuleSet> {
                 }
             }
             RuleItem::VirtualPatch(vp) => {
-                current_phase = vp.phase;
+                let phase = vp.phase;
                 let cve = vp.cve.clone();
                 match compile_virtual_patch(&vp, &mut state) {
                     Ok((instrs, meta)) => {
                         let vp_id: u32 = cve_to_id(&vp.cve);
-                        rules.push((vp.phase, vp_id, instrs, meta));
+                        rule_meta.insert(vp_id, meta);
+                        phase_programs[phase as usize].extend(instrs);
                     }
                     Err(e) => {
                         skipped += 1;
@@ -125,7 +140,11 @@ pub fn compile(file: RuleFile) -> Result<CompiledRuleSet> {
                 }
             }
             RuleItem::Directive(Directive::SecMarker(name)) => {
-                phase_markers.push((current_phase, name));
+                // Emit the marker into every phase program at the current
+                // position so skip-gates in phase 1 and phase 2 both find it.
+                for prog in phase_programs.iter_mut() {
+                    prog.push(Instruction::Marker(name.clone()));
+                }
             }
             RuleItem::Directive(_) => {
                 // Other directives handled at load time, not compiled to bytecode.
@@ -134,22 +153,6 @@ pub fn compile(file: RuleFile) -> Result<CompiledRuleSet> {
     }
     if skipped > 0 {
         tracing::warn!(skipped, "compiler: skipped rules due to errors");
-    }
-
-    // Sort by (phase, rule_id) for deterministic per-phase ordering.
-    rules.sort_by_key(|(phase, id, _, _)| (*phase as usize, *id));
-
-    for (phase, _, instrs, meta) in rules {
-        rule_meta.insert(meta.id, meta);
-        let prog = &mut phase_programs[phase as usize];
-        prog.extend(instrs);
-    }
-
-    // Append SecMarker labels to their phase programs in source order.
-    // Markers always appear after the rules they gate, so appending after the
-    // sorted rules preserves the correct skip target ordering.
-    for (phase, name) in phase_markers {
-        phase_programs[phase as usize].push(Instruction::Marker(name));
     }
 
     // Build Aho-Corasick automata from interned word-list tables.

@@ -53,6 +53,58 @@ fn percent_decode(s: &str) -> String {
         .into_owned()
 }
 
+/// Decode both standard `%XX` and Microsoft IIS-style `%uXXXX` Unicode escapes.
+/// Used by the `UrlDecodeUni` transform to match ModSecurity's `t:urlDecodeUni`.
+fn url_decode_uni(s: &str) -> String {
+    // Fast path: if no `%`, nothing to decode.
+    if !s.contains('%') {
+        return s.to_owned();
+    }
+
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            // Check for %uXXXX (4 hex digits after 'u' or 'U').
+            if i + 5 < bytes.len()
+                && (bytes[i + 1] == b'u' || bytes[i + 1] == b'U')
+                && bytes[i + 2..i + 6].iter().all(|b| b.is_ascii_hexdigit())
+            {
+                let hex = std::str::from_utf8(&bytes[i + 2..i + 6]).unwrap_or("0000");
+                if let Ok(n) = u32::from_str_radix(hex, 16) {
+                    if let Some(ch) = char::from_u32(n) {
+                        out.push(ch);
+                        i += 6;
+                        continue;
+                    }
+                }
+            }
+            // Standard %XX — delegate to percent_encoding for the remainder.
+            out.push_str(&percent_encoding::percent_decode_str(&s[i..])
+                .decode_utf8_lossy()
+                .chars()
+                .take(1)
+                .collect::<String>());
+            // Advance past `%XX` (3 bytes if valid, 1 byte if not).
+            if i + 2 < bytes.len()
+                && bytes[i + 1].is_ascii_hexdigit()
+                && bytes[i + 2].is_ascii_hexdigit()
+            {
+                i += 3;
+            } else {
+                out.pop();
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Parse the Cookie header into (name, value) pairs.
 fn parse_cookies(header_val: &str) -> Vec<(String, String)> {
     header_val
@@ -80,6 +132,8 @@ fn extract_target(spec: &TargetSpec, ctx: &RequestContext) -> Vec<String> {
                 .collect()
         }
         TargetSpec::RequestUri => vec![ctx.uri.to_string()],
+        TargetSpec::RequestFilename => vec![ctx.uri.path().to_owned()],
+        TargetSpec::RequestMethod => vec![ctx.method.as_str().to_owned()],
         TargetSpec::RequestLine => vec![format!(
             "{} {} {:?}",
             ctx.method, ctx.uri, ctx.http_version
@@ -370,15 +424,22 @@ fn fire_rule(ctx: &mut RequestContext, meta: &RuleMeta) {
         ctx.anomaly_score = ctx.anomaly_score.saturating_add(meta.score_delta as u32);
     }
 
-    // Log the match
-    ctx.rule_matches.push(RuleMatch {
-        rule_id: meta.id.to_string(),
-        message: meta.message.clone(),
-        severity: map_severity(meta.severity),
-        score: meta.score_delta.max(0) as u32,
-        target: String::new(), // TODO: capture which target matched
-        phase,
-    });
+    // Only record in rule_matches when the rule has observable effect.
+    // CRS paranoia-level skip-gates (pass, no score, no message) are silent.
+    let is_silent = meta.message.is_empty()
+        && meta.score_delta <= 0
+        && matches!(meta.action, RuleAction::Score | RuleAction::Log);
+
+    if !is_silent {
+        ctx.rule_matches.push(RuleMatch {
+            rule_id: meta.id.to_string(),
+            message: meta.message.clone(),
+            severity: map_severity(meta.severity),
+            score: meta.score_delta.max(0) as u32,
+            target: String::new(),
+            phase,
+        });
+    }
 
     debug!(
         rule_id = meta.id,
@@ -396,7 +457,7 @@ fn apply_transforms(mut s: String, transforms: &[Transform]) -> String {
     for t in transforms {
         s = match t {
             Transform::Lowercase => s.to_ascii_lowercase(),
-            Transform::UrlDecodeUni => percent_decode(&s),
+            Transform::UrlDecodeUni => url_decode_uni(&s),
             Transform::RemoveNulls => s.replace('\0', ""),
             Transform::ReplaceNulls => s.replace('\0', " "),
             Transform::HtmlEntityDecode => decode_html_entities(s),

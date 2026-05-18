@@ -118,6 +118,13 @@ struct ServerState {
 // ProxyServer
 // ---------------------------------------------------------------------------
 
+/// Response shape from `GET /api/v1/internal/config`.
+#[derive(serde::Deserialize)]
+struct ConfigSyncResponse {
+    version: u64,
+    sites:   Vec<SiteConfig>,
+}
+
 /// Top-level proxy server.  One instance manages all configured listeners.
 pub struct ProxyServer {
     config: ConfigHandle,
@@ -240,6 +247,75 @@ impl ProxyServer {
                             error!("config hot-reload watcher panicked, restarting in 1s: {e}");
                             tokio::time::sleep(Duration::from_secs(1)).await;
                         }
+                    }
+                }
+            });
+        }
+
+        // --- Background task: control-plane site sync ---
+        // Polls GET {sync_url}/api/v1/internal/config every sync_interval_secs.
+        // When the version number changes, hot-replaces the sites list and
+        // upstream pool — no SIGHUP needed, zero dropped connections.
+        if let Some(sync_url) = cfg.cluster.sync_url.clone() {
+            let poll_cfg  = Arc::clone(&state.config);
+            let poll_pool = Arc::clone(&state.upstream_pool);
+            let secs      = cfg.cluster.sync_interval_secs.max(1);
+            tokio::spawn(async move {
+                use http_body_util::BodyExt as _;
+                use hyper_util::client::legacy::Client;
+                use hyper_util::rt::TokioExecutor;
+                type EmptyBody = http_body_util::Empty<bytes::Bytes>;
+                let client: Client<_, EmptyBody> =
+                    Client::builder(TokioExecutor::new()).build_http();
+                let mut last_version: u64 = 0;
+                let mut ticker = tokio::time::interval(Duration::from_secs(secs));
+                ticker.set_missed_tick_behavior(
+                    tokio::time::MissedTickBehavior::Skip,
+                );
+                loop {
+                    ticker.tick().await;
+                    let url = format!("{}/api/v1/internal/config", sync_url);
+                    let uri: hyper::Uri = match url.parse() {
+                        Ok(u) => u,
+                        Err(e) => { warn!("config sync: bad url: {e}"); continue; }
+                    };
+                    let req = hyper::Request::builder()
+                        .method("GET")
+                        .uri(uri)
+                        .body(http_body_util::Empty::new())
+                        .unwrap();
+                    let resp = match client.request(req).await {
+                        Ok(r)  => r,
+                        Err(e) => { warn!("config sync fetch: {e}"); continue; }
+                    };
+                    let bytes = match resp.collect().await {
+                        Ok(b)  => b.to_bytes(),
+                        Err(e) => { warn!("config sync body: {e}"); continue; }
+                    };
+                    let sync: ConfigSyncResponse =
+                        match serde_json::from_slice(&bytes) {
+                            Ok(s)  => s,
+                            Err(e) => {
+                                warn!(
+                                    "config sync parse: {e} — snippet: {}",
+                                    String::from_utf8_lossy(&bytes)
+                                        .chars()
+                                        .take(120)
+                                        .collect::<String>()
+                                );
+                                continue;
+                            }
+                        };
+                    if sync.version != last_version {
+                        let count = sync.sites.len();
+                        poll_pool.sync_sites(&sync.sites);
+                        sentinel_core::config::update_sites(&poll_cfg, sync.sites);
+                        last_version = sync.version;
+                        info!(
+                            version = last_version,
+                            sites   = count,
+                            "sites hot-synced from control plane",
+                        );
                     }
                 }
             });
@@ -1052,6 +1128,31 @@ fn build_anti_ddos(cfg: &SentinelConfig) -> AntiDdos {
     AntiDdos::disabled()
 }
 
+/// Return a canonical upper-case name for a target (used for exclusion matching).
+fn target_name(t: &sentinel_rules::dsl::ast::Target) -> String {
+    use sentinel_rules::dsl::ast::Target;
+    match t {
+        Target::Args => "ARGS".into(),
+        Target::ArgsNames => "ARGS_NAMES".into(),
+        Target::RequestBody => "REQUEST_BODY".into(),
+        Target::RequestUri => "REQUEST_URI".into(),
+        Target::RequestFilename => "REQUEST_FILENAME".into(),
+        Target::RequestMethod => "REQUEST_METHOD".into(),
+        Target::RequestLine => "REQUEST_LINE".into(),
+        Target::RequestHeaders(None) => "REQUEST_HEADERS".into(),
+        Target::RequestHeaders(Some(h)) => format!("REQUEST_HEADERS:{h}"),
+        Target::RequestCookies(None) => "REQUEST_COOKIES".into(),
+        Target::RequestCookies(Some(c)) => format!("REQUEST_COOKIES:{c}"),
+        Target::ResponseHeaders(None) => "RESPONSE_HEADERS".into(),
+        Target::ResponseHeaders(Some(h)) => format!("RESPONSE_HEADERS:{h}"),
+        Target::ResponseBody => "RESPONSE_BODY".into(),
+        Target::RemoteAddr => "REMOTE_ADDR".into(),
+        Target::Geo => "GEO".into(),
+        Target::TxVar(v) => format!("TX:{v}"),
+        Target::CountOf(_) => "COUNT_OF".into(),
+    }
+}
+
 fn load_site_engine(site: &SiteConfig) -> anyhow::Result<RuleEngine> {
     use sentinel_rules::dsl::ast::{RuleFile, RuleItem};
 
@@ -1100,6 +1201,37 @@ fn load_site_engine(site: &SiteConfig) -> anyhow::Result<RuleEngine> {
             filtered,
             "rule engine: paranoia level gating removed rules"
         );
+    }
+
+    // Apply rule target exclusions (ctl:ruleRemoveTargetById equivalent).
+    // Removes the specified targets from a rule before compilation so that
+    // known false-positive targets are never evaluated for that rule.
+    for exclusion in &site.waf.rule_exclusions {
+        if exclusion.exclude_targets.is_empty() {
+            continue;
+        }
+        let excl_upper: Vec<String> = exclusion
+            .exclude_targets
+            .iter()
+            .map(|t| t.to_ascii_uppercase())
+            .collect();
+        for item in &mut merged.items {
+            if let RuleItem::Rule(rule) = item {
+                if rule.id == exclusion.rule_id {
+                    let before_len = rule.targets.len();
+                    rule.targets
+                        .retain(|t| !excl_upper.contains(&target_name(&t.target).to_ascii_uppercase()));
+                    if rule.targets.len() < before_len {
+                        debug!(
+                            site = %site.id,
+                            rule_id = exclusion.rule_id,
+                            excluded = ?excl_upper,
+                            "rule target exclusion applied"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     sentinel_rules::compile(merged)

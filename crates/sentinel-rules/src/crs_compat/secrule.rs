@@ -10,6 +10,9 @@ pub struct CrsActions {
     pub id: Option<u32>,
     pub phase: Option<RulePhase>,
     pub action: CrsAction,
+    /// True once a primary action keyword (block/pass/allow/deny) was seen.
+    /// `log`/`nolog` are logging modifiers and must not overwrite a primary action.
+    pub primary_action_set: bool,
     pub msg: Option<String>,
     pub severity: Option<RuleSeverity>,
     pub tags: Vec<String>,
@@ -187,11 +190,21 @@ fn parse_action_token(token: &str, out: &mut CrsActions) {
 
     // Simple action keywords
     match token.to_ascii_lowercase().as_str() {
-        "block" | "deny" => out.action = CrsAction::Block,
-        "pass" => out.action = CrsAction::Pass,
-        "allow" => out.action = CrsAction::Allow,
-        "log" => out.action = CrsAction::Log,
-        "nolog" => out.action = CrsAction::NoLog,
+        "block" | "deny" => { out.action = CrsAction::Block; out.primary_action_set = true; }
+        "pass" => { out.action = CrsAction::Pass; out.primary_action_set = true; }
+        "allow" => { out.action = CrsAction::Allow; out.primary_action_set = true; }
+        // `log`/`nolog` are logging modifiers in CRS, NOT the primary action.
+        // "block,log" → primary=block; "log" alone → Log (no primary set).
+        "log" => {
+            if !out.primary_action_set {
+                out.action = CrsAction::Log;
+            }
+        }
+        "nolog" => {
+            if !out.primary_action_set {
+                out.action = CrsAction::NoLog;
+            }
+        }
         "noauditlog" | "auditlog" | "capture" => {}
         // Transforms — applied in declaration order; t:none resets the list
         "t:none" => out.transforms.clear(),

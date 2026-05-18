@@ -68,21 +68,24 @@ func SeedDev(ctx context.Context, pool Pool) error {
 
 	// ── Sample sites ─────────────────────────────────────────────────────────
 	type siteSpec struct {
-		name   string
-		domain string
-		mode   string
-		status string
+		name     string
+		domain   string
+		mode     string
+		status   string
+		upstream string // host:port for the real backend
 	}
 	sites := []siteSpec{
-		{"dvwa.local", "dvwa.local", "blocking", "active"},
-		{"juice.local", "juice.local", "blocking", "active"},
-		{"api.acme.com", "api.acme.com", "learning", "active"},
-		{"shop.corp.io", "shop.corp.io", "blocking", "active"},
-		{"legacy.app.net", "legacy.app.net", "off", "paused"},
+		// dvwa.local: WAF listens on :9095, upstream is docker on :9096
+		{"dvwa.local", "dvwa.local", "blocking", "active", "127.0.0.1:9096"},
+		// juice.local: WAF listens on :3000, upstream is docker on :3001
+		{"juice.local", "juice.local", "blocking", "active", "127.0.0.1:3001"},
+		{"api.acme.com", "api.acme.com", "learning", "active", "127.0.0.1:8080"},
+		{"shop.corp.io", "shop.corp.io", "blocking", "active", "127.0.0.1:8080"},
+		{"legacy.app.net", "legacy.app.net", "off", "paused", "127.0.0.1:8080"},
 	}
 	for _, s := range sites {
 		up, _ := json.Marshal(map[string]any{
-			"servers": []string{"127.0.0.1:8080"},
+			"servers": []string{s.upstream},
 			"lb":      "round_robin",
 		})
 		wp, _ := json.Marshal(map[string]any{
@@ -90,10 +93,13 @@ func SeedDev(ctx context.Context, pool Pool) error {
 			"paranoia_level":    2,
 			"anomaly_threshold": 5,
 		})
+		// DO UPDATE ensures the upstream port is always correct on restart.
 		_, err = tx.Exec(ctx, `
 			INSERT INTO sites (tenant_id, name, domains, upstream, waf_policy, status)
 			VALUES ($1, $2, $3, $4, $5, $6)
-			ON CONFLICT (tenant_id, name) DO NOTHING`,
+			ON CONFLICT (tenant_id, name) DO UPDATE
+			  SET upstream = EXCLUDED.upstream,
+			      waf_policy = EXCLUDED.waf_policy`,
 			DevTenantID, s.name, []string{s.domain}, up, wp, s.status)
 		if err != nil {
 			return fmt.Errorf("seed: site %s: %w", s.name, err)

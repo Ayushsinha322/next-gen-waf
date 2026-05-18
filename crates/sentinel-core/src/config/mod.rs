@@ -48,6 +48,14 @@ pub struct ClusterConfig {
     #[serde(default = "default_node_id")]
     pub node_id: String,
     pub control_plane: Option<ControlPlaneConfig>,
+    /// Control-plane REST URL for site config polling.
+    /// E.g. `"http://localhost:9501"`. When set, the proxy polls
+    /// `GET {sync_url}/api/v1/internal/config` every `sync_interval_secs`
+    /// and hot-syncs the sites list without a SIGHUP.
+    #[serde(default)]
+    pub sync_url: Option<String>,
+    #[serde(default = "default_sync_interval")]
+    pub sync_interval_secs: u64,
 }
 
 impl Default for ClusterConfig {
@@ -56,6 +64,8 @@ impl Default for ClusterConfig {
             name: default_cluster_name(),
             node_id: default_node_id(),
             control_plane: None,
+            sync_url: None,
+            sync_interval_secs: default_sync_interval(),
         }
     }
 }
@@ -73,6 +83,8 @@ pub struct ControlPlaneConfig {
     pub endpoints: Vec<String>,
     pub tls: TlsFileConfig,
 }
+
+fn default_sync_interval() -> u64 { 5 }
 
 // ---------------------------------------------------------------------------
 // TLS
@@ -267,6 +279,19 @@ pub struct WafConfig {
     /// Paths to plugin manifests (`sentinel-plugin.toml` files).
     #[serde(default)]
     pub plugins: Vec<String>,
+    /// Per-rule exclusions: remove specific targets from a rule to suppress false positives.
+    #[serde(default)]
+    pub rule_exclusions: Vec<RuleExclusion>,
+}
+
+/// Removes one or more targets from a rule to suppress known false positives.
+/// Mirrors the CRS `ctl:ruleRemoveTargetById` mechanism.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RuleExclusion {
+    pub rule_id: u32,
+    /// Target names to exclude, e.g. `["ARGS_NAMES"]`.
+    #[serde(default)]
+    pub exclude_targets: Vec<String>,
 }
 
 fn default_paranoia() -> u8 {
@@ -659,6 +684,22 @@ impl ConfigLoader {
     pub fn spawn_signal_watcher(_loader: Arc<Self>) {
         // No SIGHUP on non-Unix platforms; hot-reload via control-plane gRPC only.
     }
+}
+
+// ---------------------------------------------------------------------------
+// Live site update — called by the control-plane polling task
+// ---------------------------------------------------------------------------
+
+/// Atomically replace the sites list in `handle` without touching listeners,
+/// logging, storage, or eBPF config. The hot-reload watcher in sentinel-proxy
+/// detects the Arc pointer change and rebuilds rule engines automatically.
+pub fn update_sites(handle: &ConfigHandle, sites: Vec<SiteConfig>) {
+    let count = sites.len();
+    let current = handle.load_full();
+    let mut new_cfg = (*current).clone();
+    new_cfg.sites = sites;
+    handle.store(Arc::new(new_cfg));
+    info!(count, "sites hot-synced from control plane");
 }
 
 // ---------------------------------------------------------------------------

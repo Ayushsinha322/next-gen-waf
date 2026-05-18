@@ -240,6 +240,34 @@ func (s *Store) CreateSite(ctx context.Context, tenantID, userID string, req Cre
 	return &r, tx.Commit(ctx)
 }
 
+func (s *Store) DeleteSite(ctx context.Context, tenantID, siteID string) error {
+	tx, err := s.pool.BeginTenant(ctx, tenantID, tenantID)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if err = tx.Exec(ctx,
+		`DELETE FROM sites WHERE id = $1 AND tenant_id = $2`,
+		siteID, tenantID); err != nil {
+		return fmt.Errorf("store: delete site: %w", err)
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Store) UpdateSiteStatus(ctx context.Context, tenantID, siteID, status string) error {
+	tx, err := s.pool.BeginTenant(ctx, tenantID, tenantID)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if err = tx.Exec(ctx,
+		`UPDATE sites SET status = $1, updated_at = now() WHERE id = $2 AND tenant_id = $3`,
+		status, siteID, tenantID); err != nil {
+		return fmt.Errorf("store: update site status: %w", err)
+	}
+	return tx.Commit(ctx)
+}
+
 // ---------------------------------------------------------------------------
 // Rules
 // ---------------------------------------------------------------------------

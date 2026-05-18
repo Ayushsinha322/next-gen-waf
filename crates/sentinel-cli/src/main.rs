@@ -459,6 +459,7 @@ fn cmd_init(cfg_path: &Path, bind: &str) -> Result<()> {
             bind: bind.to_string(),
             protocol: ProtocolSpec::Single(Protocol::Http1),
             tls: None,
+            default_site: None,
         }],
         sites: vec![],
         logging: LoggingConfig {

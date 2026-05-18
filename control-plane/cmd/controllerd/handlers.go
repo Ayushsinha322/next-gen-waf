@@ -4,9 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"regexp"
+	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -16,6 +19,11 @@ import (
 	"github.com/your-org/sentinel-waf/control-plane/internal/rbac"
 	"go.uber.org/zap"
 )
+
+// configVersion is incremented on every site create / delete / status change.
+// The data-plane proxy polls /api/v1/internal/config and only re-fetches the
+// full site list when this number changes — keeps polling cheap.
+var configVersion atomic.Int64
 
 // ---------------------------------------------------------------------------
 // Auth handlers
@@ -307,6 +315,7 @@ func handleCreateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	configVersion.Add(1)
 	writeAuditEntry(c, store, hub, &db.WriteAuditRequest{
 		TenantID:    claims.TenantID,
 		ActorUserID: &claims.UserID,
@@ -315,6 +324,161 @@ func handleCreateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 		TargetID:    &site.ID,
 	})
 	c.JSON(http.StatusCreated, gin.H{"site": site})
+}
+
+func handleDeleteSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub) {
+	claims, _ := auth.GetClaims(c.Request.Context())
+	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceSite, rbac.ActionCreate) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
+		return
+	}
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
+		return
+	}
+	siteID := c.Param("id")
+	if err := store.DeleteSite(c.Request.Context(), claims.TenantID, siteID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	configVersion.Add(1)
+	writeAuditEntry(c, store, hub, &db.WriteAuditRequest{
+		TenantID:   claims.TenantID,
+		Action:     "site.delete",
+		TargetKind: "site",
+		TargetID:   &siteID,
+	})
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+func handleUpdateSiteStatus(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub) {
+	claims, _ := auth.GetClaims(c.Request.Context())
+	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceSite, rbac.ActionCreate) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
+		return
+	}
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
+		return
+	}
+	siteID := c.Param("id")
+	var body struct {
+		Status string `json:"status"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || (body.Status != "active" && body.Status != "paused") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "status must be 'active' or 'paused'"})
+		return
+	}
+	if err := store.UpdateSiteStatus(c.Request.Context(), claims.TenantID, siteID, body.Status); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	configVersion.Add(1)
+	writeAuditEntry(c, store, hub, &db.WriteAuditRequest{
+		TenantID:   claims.TenantID,
+		Action:     "site.status." + body.Status,
+		TargetKind: "site",
+		TargetID:   &siteID,
+	})
+	c.JSON(http.StatusOK, gin.H{"ok": true, "status": body.Status})
+}
+
+// handleInternalConfig is called by the Rust data-plane proxy (no JWT — internal
+// network only). Returns the current active site list in a format the proxy can
+// deserialize directly into Vec<SiteConfig>.
+func handleInternalConfig(c *gin.Context, store *db.Store) {
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "db unavailable"})
+		return
+	}
+	// List all sites for the dev tenant — in production this would be
+	// scoped per node/cluster, but for single-tenant dev this is correct.
+	sites, err := store.ListSites(c.Request.Context(), db.DevTenantID, db.DevAdminID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	rustSites := make([]map[string]any, 0, len(sites))
+	for _, s := range sites {
+		if s.Status == "paused" || s.Status == "deleted" {
+			continue
+		}
+		rs, err := siteRowToRustConfig(s)
+		if err != nil {
+			continue
+		}
+		rustSites = append(rustSites, rs)
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"version": configVersion.Load(),
+		"sites":   rustSites,
+	})
+}
+
+// siteRowToRustConfig converts a DB SiteRow into the JSON shape that the
+// Rust SiteConfig serde deserializer expects.
+func siteRowToRustConfig(s db.SiteRow) (map[string]any, error) {
+	// DB upstream format: {"servers":["host:port"],"lb":"round_robin"}
+	var upDB struct {
+		Servers []string `json:"servers"`
+		LB      string   `json:"lb"`
+	}
+	if err := json.Unmarshal(s.Upstream, &upDB); err != nil {
+		return nil, err
+	}
+	rustServers := make([]map[string]any, 0, len(upDB.Servers))
+	for _, addr := range upDB.Servers {
+		host, portStr, err := net.SplitHostPort(addr)
+		if err != nil {
+			host, portStr = addr, "80"
+		}
+		port, _ := strconv.Atoi(portStr)
+		if port == 0 {
+			port = 80
+		}
+		rustServers = append(rustServers, map[string]any{
+			"host": host, "port": port, "weight": 1,
+		})
+	}
+	lb := upDB.LB
+	if lb == "" {
+		lb = "round_robin"
+	}
+
+	// DB waf_policy format: {"mode":"blocking","paranoia_level":2,"anomaly_threshold":5}
+	var wafDB struct {
+		Mode             string `json:"mode"`
+		ParanoiaLevel    int    `json:"paranoia_level"`
+		AnomalyThreshold int    `json:"anomaly_threshold"`
+	}
+	if err := json.Unmarshal(s.WafPolicy, &wafDB); err != nil {
+		return nil, err
+	}
+	if wafDB.Mode == "" {
+		wafDB.Mode = "blocking"
+	}
+	if wafDB.ParanoiaLevel == 0 {
+		wafDB.ParanoiaLevel = 2
+	}
+	if wafDB.AnomalyThreshold == 0 {
+		wafDB.AnomalyThreshold = 5
+	}
+
+	return map[string]any{
+		"id":      s.Name, // proxy matches by site ID — use name (e.g., "dvwa.local")
+		"domains": s.Domains,
+		"upstream": map[string]any{
+			"load_balancer": lb,
+			"servers":       rustServers,
+		},
+		"waf": map[string]any{
+			"mode":              wafDB.Mode,
+			"paranoia_level":    wafDB.ParanoiaLevel,
+			"anomaly_threshold": wafDB.AnomalyThreshold,
+			"rules":             []string{},
+		},
+		"plugins": []any{},
+	}, nil
 }
 
 // ---------------------------------------------------------------------------

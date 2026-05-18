@@ -113,6 +113,8 @@ pub enum Target {
     RequestHeaders(Option<String>),
     RequestBody,
     RequestUri,
+    RequestFilename,
+    RequestMethod,
     RequestLine,
     RequestCookies(Option<String>),
     ResponseHeaders(Option<String>),

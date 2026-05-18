@@ -195,6 +195,12 @@ export const api = {
     list: () => apiFetch<{ sites: Site[]; tenant_id: string }>("/sites"),
     create: (body: { name: string; domains: string[]; upstream?: object; waf_policy?: object }) =>
       apiFetch<{ site: Site }>("/sites", { method: "POST", body: JSON.stringify(body) }),
+    delete: (id: string) =>
+      apiFetch<{ ok: boolean }>(`/sites/${id}`, { method: "DELETE" }),
+    updateStatus: (id: string, status: "active" | "paused") =>
+      apiFetch<{ ok: boolean; status: string }>(`/sites/${id}/status`, {
+        method: "PATCH", body: JSON.stringify({ status }),
+      }),
   },
 
   rules: {

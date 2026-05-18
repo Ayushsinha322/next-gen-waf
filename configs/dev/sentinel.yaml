@@ -16,6 +16,10 @@
 cluster:
   name: sentinel-dev
   node_id: auto
+  # Control-plane URL for site hot-sync. The proxy polls this every 5 s
+  # and rebuilds its site list when the version changes.
+  sync_url: "http://localhost:9501"
+  sync_interval_secs: 5
 
 listeners:
   - name: http
@@ -25,15 +29,15 @@ listeners:
   - name: dvwa-port
     bind: "0.0.0.0:9095"
     protocol: http1
-    default_site: dvwa
+    default_site: dvwa.local   # matches DB site name
 
   - name: juice-port
     bind: "0.0.0.0:3000"
     protocol: http1
-    default_site: juiceshop
+    default_site: juice.local  # matches DB site name
 
 sites:
-  - id: dvwa
+  - id: dvwa.local
     domains: ["dvwa.local", "dvwa"]
     upstream:
       load_balancer: round_robin
@@ -47,19 +51,45 @@ sites:
       mode: blocking
       paranoia_level: 2
       anomaly_threshold: 5
-      rules: []
+      rules:
+        # OWASP CRS 4.7.0 — attack detection rules
+        # REQUEST-901 (init) is intentionally omitted: it blocks all traffic
+        # if TX:crs_setup_version is absent, which our engine does not set.
+        # REQUEST-949 (blocking evaluation) is omitted: native anomaly_threshold
+        # above already handles the block decision.
+        - "rules/owasp-crs/rules/REQUEST-911-METHOD-ENFORCEMENT.conf"
+        - "rules/owasp-crs/rules/REQUEST-913-SCANNER-DETECTION.conf"
+        - "rules/owasp-crs/rules/REQUEST-920-PROTOCOL-ENFORCEMENT.conf"
+        - "rules/owasp-crs/rules/REQUEST-921-PROTOCOL-ATTACK.conf"
+        - "rules/owasp-crs/rules/REQUEST-930-APPLICATION-ATTACK-LFI.conf"
+        - "rules/owasp-crs/rules/REQUEST-931-APPLICATION-ATTACK-RFI.conf"
+        - "rules/owasp-crs/rules/REQUEST-932-APPLICATION-ATTACK-RCE.conf"
+        - "rules/owasp-crs/rules/REQUEST-933-APPLICATION-ATTACK-PHP.conf"
+        - "rules/owasp-crs/rules/REQUEST-934-APPLICATION-ATTACK-GENERIC.conf"
+        - "rules/owasp-crs/rules/REQUEST-941-APPLICATION-ATTACK-XSS.conf"
+        - "rules/owasp-crs/rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf"
+        - "rules/owasp-crs/rules/REQUEST-943-APPLICATION-ATTACK-SESSION-FIXATION.conf"
+        - "rules/owasp-crs/rules/REQUEST-944-APPLICATION-ATTACK-JAVA.conf"
+      # CRS false-positive suppressions (equivalent to ctl:ruleRemoveTargetById)
+      rule_exclusions:
+        # Rule 932236 (RCE: Unix Command Injection) matches the generic parameter
+        # name "id" via its ^-anchored regex against ARGS_NAMES. Since "id" is an
+        # extremely common query-param name (DVWA, REST APIs), exclude ARGS_NAMES
+        # from this rule while still checking ARGS values and other targets.
+        - rule_id: 932236
+          exclude_targets: ["ARGS_NAMES"]
       ml:
         enable: false
         models: []
         sensitivity: 0.85
       rate_limit:
         global:  { rps: 5000,  burst: 10000 }
-        per_ip:  { rps: 200,   burst: 500 }
+        per_ip:  { rps: 100,   burst: 50 }
       bot_detection:
         ja4: false
         challenge: "off"
 
-  - id: juiceshop
+  - id: juice.local
     domains: ["juice.local", "juice"]
     upstream:
       load_balancer: round_robin
@@ -73,14 +103,30 @@ sites:
       mode: blocking
       paranoia_level: 2
       anomaly_threshold: 5
-      rules: []
+      rules:
+        - "rules/owasp-crs/rules/REQUEST-911-METHOD-ENFORCEMENT.conf"
+        - "rules/owasp-crs/rules/REQUEST-913-SCANNER-DETECTION.conf"
+        - "rules/owasp-crs/rules/REQUEST-920-PROTOCOL-ENFORCEMENT.conf"
+        - "rules/owasp-crs/rules/REQUEST-921-PROTOCOL-ATTACK.conf"
+        - "rules/owasp-crs/rules/REQUEST-930-APPLICATION-ATTACK-LFI.conf"
+        - "rules/owasp-crs/rules/REQUEST-931-APPLICATION-ATTACK-RFI.conf"
+        - "rules/owasp-crs/rules/REQUEST-932-APPLICATION-ATTACK-RCE.conf"
+        - "rules/owasp-crs/rules/REQUEST-933-APPLICATION-ATTACK-PHP.conf"
+        - "rules/owasp-crs/rules/REQUEST-934-APPLICATION-ATTACK-GENERIC.conf"
+        - "rules/owasp-crs/rules/REQUEST-941-APPLICATION-ATTACK-XSS.conf"
+        - "rules/owasp-crs/rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf"
+        - "rules/owasp-crs/rules/REQUEST-943-APPLICATION-ATTACK-SESSION-FIXATION.conf"
+        - "rules/owasp-crs/rules/REQUEST-944-APPLICATION-ATTACK-JAVA.conf"
+      rule_exclusions:
+        - rule_id: 932236
+          exclude_targets: ["ARGS_NAMES"]
       ml:
         enable: false
         models: []
         sensitivity: 0.85
       rate_limit:
         global:  { rps: 5000,  burst: 10000 }
-        per_ip:  { rps: 200,   burst: 500 }
+        per_ip:  { rps: 100,   burst: 50 }
       bot_detection:
         ja4: false
         challenge: "off"
