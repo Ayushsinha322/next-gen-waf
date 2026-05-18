@@ -116,5 +116,4 @@ See [docs/architecture/](docs/architecture/) for design details and [ROADMAP.md]
 
 ## License
 
-Copyright © 2026 ESDS Networks Pvt. Ltd. All rights reserved.
-This software is proprietary and confidential. See [LICENSE](LICENSE) for details.
+Proprietary — © 2026 ESDS Networks Pvt. Ltd. All rights reserved.
