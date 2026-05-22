@@ -11,9 +11,13 @@ import (
 	"syscall"
 	"time"
 
+	"strconv"
+	"strings"
+
 	"github.com/gin-gonic/gin"
 	"github.com/your-org/sentinel-waf/control-plane/internal/api"
 	"github.com/your-org/sentinel-waf/control-plane/internal/auth"
+	"github.com/your-org/sentinel-waf/control-plane/internal/cluster"
 	"github.com/your-org/sentinel-waf/control-plane/internal/db"
 	controlgrpc "github.com/your-org/sentinel-waf/control-plane/internal/grpc"
 	"github.com/your-org/sentinel-waf/control-plane/internal/logs"
@@ -79,6 +83,17 @@ func run() error {
 	// ── RBAC ──────────────────────────────────────────────────────────────────
 	enforcer := rbac.NewEnforcer()
 
+	// ── Raft cluster (optional) ──────────────────────────────────────────────
+	// Activated when SENTINEL_RAFT_ADDR is set.  Single-node bootstrap when
+	// SENTINEL_RAFT_PEERS is empty.  Disabled entirely otherwise — all writes
+	// proceed unconditionally, preserving pre-cluster behaviour.
+	cl, clErr := startCluster(log)
+	if clErr != nil {
+		log.Warn("cluster init failed — continuing in standalone mode", zap.Error(clErr))
+	} else if cl != nil {
+		defer cl.Stop()
+	}
+
 	// ── gRPC ──────────────────────────────────────────────────────────────────
 	grpcAddr := envOrDefault("SENTINEL_GRPC_ADDR", "0.0.0.0:9500")
 	restAddr := envOrDefault("SENTINEL_REST_ADDR", "0.0.0.0:9501")
@@ -129,22 +144,26 @@ func run() error {
 	{
 		protected.GET("/dashboard/stats", func(c *gin.Context) { handleDashboardStats(c, enforcer, store) })
 		protected.GET("/sites", func(c *gin.Context) { handleListSites(c, enforcer, store) })
-		protected.POST("/sites", func(c *gin.Context) { handleCreateSite(c, enforcer, store, hub) })
-		protected.DELETE("/sites/:id", func(c *gin.Context) { handleDeleteSite(c, enforcer, store, hub) })
-		protected.PATCH("/sites/:id/status", func(c *gin.Context) { handleUpdateSiteStatus(c, enforcer, store, hub) })
+		protected.POST("/sites", func(c *gin.Context) { handleCreateSite(c, enforcer, store, hub, cl) })
+		protected.GET("/sites/:id", func(c *gin.Context) { handleGetSite(c, enforcer, store) })
+		protected.PUT("/sites/:id", func(c *gin.Context) { handleUpdateSite(c, enforcer, store, hub, cl) })
+		protected.PATCH("/sites/:id", func(c *gin.Context) { handleUpdateSite(c, enforcer, store, hub, cl) })
+		protected.DELETE("/sites/:id", func(c *gin.Context) { handleDeleteSite(c, enforcer, store, hub, cl) })
+		protected.PATCH("/sites/:id/status", func(c *gin.Context) { handleUpdateSiteStatus(c, enforcer, store, hub, cl) })
 		protected.GET("/rules", func(c *gin.Context) { handleListRules(c, enforcer, store) })
-		protected.POST("/rules", func(c *gin.Context) { handleCreateRule(c, enforcer, store, hub) })
-		protected.PATCH("/rules/:id", func(c *gin.Context) { handleToggleRule(c, enforcer, store, hub) })
-		protected.DELETE("/rules/:id", func(c *gin.Context) { handleDeleteRule(c, enforcer, store, hub) })
+		protected.POST("/rules", func(c *gin.Context) { handleCreateRule(c, enforcer, store, hub, cl) })
+		protected.PATCH("/rules/:id", func(c *gin.Context) { handleToggleRule(c, enforcer, store, hub, cl) })
+		protected.DELETE("/rules/:id", func(c *gin.Context) { handleDeleteRule(c, enforcer, store, hub, cl) })
 		protected.POST("/rules/test", func(c *gin.Context) { handleTestRule(c, enforcer) })
 		protected.GET("/ml/stats", func(c *gin.Context) { handleMLStats(c, hub) })
 		protected.GET("/traffic/history", func(c *gin.Context) { handleTrafficHistory(c, hub) })
 		protected.GET("/plugins", func(c *gin.Context) { handleListPlugins(c, enforcer) })
 		protected.GET("/alerts", func(c *gin.Context) { handleListAlerts(c, enforcer, store) })
-		protected.POST("/alerts/:id/ack", func(c *gin.Context) { handleAckAlert(c, enforcer, store, hub) })
-		protected.POST("/alerts/:id/resolve", func(c *gin.Context) { handleResolveAlert(c, enforcer, store, hub) })
+		protected.POST("/alerts/:id/ack", func(c *gin.Context) { handleAckAlert(c, enforcer, store, hub, cl) })
+		protected.POST("/alerts/:id/resolve", func(c *gin.Context) { handleResolveAlert(c, enforcer, store, hub, cl) })
 		protected.GET("/metrics/snapshot", func(c *gin.Context) { handleMetricsSnapshot(c, hub) })
 		protected.GET("/audit", func(c *gin.Context) { handleListAudit(c, enforcer, store) })
+		protected.GET("/cluster/status", func(c *gin.Context) { handleClusterStatus(c, cl) })
 	}
 
 	// SSE endpoint lives outside the protected group so the ?token= query-param
@@ -275,4 +294,72 @@ func autoStartDataPlane(log *zap.Logger) bool {
 	}()
 
 	return true
+}
+
+// startCluster reads SENTINEL_RAFT_* env vars and starts a Raft node if
+// SENTINEL_RAFT_ADDR is set.  Returns (nil, nil) when Raft is disabled (no
+// addr).  Returns (nil, err) on misconfiguration.
+//
+// Env:
+//
+//	SENTINEL_NODE_ID      uint64    required if RAFT_ADDR set
+//	SENTINEL_RAFT_ADDR    host:port required to enable
+//	SENTINEL_RAFT_PEERS   "2=host:9602,3=host:9603"  (empty = single-node)
+//	SENTINEL_RAFT_DIR     persistent state dir (default: ./raft-data)
+func startCluster(log *zap.Logger) (*cluster.Cluster, error) {
+	addr := os.Getenv("SENTINEL_RAFT_ADDR")
+	if addr == "" {
+		log.Info("Raft disabled (SENTINEL_RAFT_ADDR not set) — running standalone")
+		return nil, nil
+	}
+	idStr := os.Getenv("SENTINEL_NODE_ID")
+	if idStr == "" {
+		return nil, fmt.Errorf("SENTINEL_NODE_ID required when SENTINEL_RAFT_ADDR is set")
+	}
+	id, err := strconv.ParseUint(idStr, 10, 64)
+	if err != nil || id == 0 {
+		return nil, fmt.Errorf("SENTINEL_NODE_ID must be a positive integer: %v", err)
+	}
+
+	peers := map[cluster.NodeID]string{}
+	if raw := os.Getenv("SENTINEL_RAFT_PEERS"); raw != "" {
+		for _, kv := range strings.Split(raw, ",") {
+			kv = strings.TrimSpace(kv)
+			if kv == "" {
+				continue
+			}
+			parts := strings.SplitN(kv, "=", 2)
+			if len(parts) != 2 {
+				return nil, fmt.Errorf("invalid SENTINEL_RAFT_PEERS entry %q (want id=host:port)", kv)
+			}
+			pid, perr := strconv.ParseUint(strings.TrimSpace(parts[0]), 10, 64)
+			if perr != nil || pid == 0 {
+				return nil, fmt.Errorf("invalid peer id in %q", kv)
+			}
+			peers[cluster.NodeID(pid)] = strings.TrimSpace(parts[1])
+		}
+	}
+
+	dataDir := envOrDefault("SENTINEL_RAFT_DIR", filepath.Join(".", "raft-data", idStr))
+
+	cfg := cluster.Config{
+		NodeID:     cluster.NodeID(id),
+		ListenAddr: addr,
+		Peers:      peers,
+		DataDir:    dataDir,
+		Logger:     log.Named("raft"),
+		Apply: func(cmd cluster.Command) error {
+			// At apply time the leader has already written through Postgres
+			// (DB is shared) and followers re-read state on demand.  This
+			// hook is currently a no-op log entry; future work may stream
+			// applied commands to the data-plane for live mirroring.
+			log.Debug("raft apply",
+				zap.String("kind", string(cmd.Kind)),
+				zap.Int("payload_bytes", len(cmd.Payload)),
+			)
+			return nil
+		},
+	}
+
+	return cluster.Start(cfg)
 }

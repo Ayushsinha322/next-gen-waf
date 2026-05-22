@@ -14,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/your-org/sentinel-waf/control-plane/internal/auth"
+	"github.com/your-org/sentinel-waf/control-plane/internal/cluster"
 	"github.com/your-org/sentinel-waf/control-plane/internal/db"
 	"github.com/your-org/sentinel-waf/control-plane/internal/logs"
 	"github.com/your-org/sentinel-waf/control-plane/internal/rbac"
@@ -289,7 +290,7 @@ func handleListSites(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 	})
 }
 
-func handleCreateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub) {
+func handleCreateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceSite, rbac.ActionCreate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
@@ -310,6 +311,9 @@ func handleCreateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 	if req.WafPolicy == nil {
 		req.WafPolicy = json.RawMessage(`{"mode":"blocking","paranoia_level":2,"anomaly_threshold":5}`)
 	}
+	if !proposeBest(c, cl, cluster.CmdSiteCreate, gin.H{"tenant_id": claims.TenantID, "req": req}) {
+		return
+	}
 	site, err := store.CreateSite(c.Request.Context(), claims.TenantID, claims.UserID, req)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -326,9 +330,28 @@ func handleCreateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 	c.JSON(http.StatusCreated, gin.H{"site": site})
 }
 
-func handleDeleteSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub) {
+func handleGetSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 	claims, _ := auth.GetClaims(c.Request.Context())
-	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceSite, rbac.ActionCreate) {
+	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceSite, rbac.ActionRead) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
+		return
+	}
+	siteID := c.Param("id")
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
+		return
+	}
+	site, err := store.GetSite(c.Request.Context(), claims.TenantID, siteID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "site not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"site": site})
+}
+
+func handleUpdateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
+	claims, _ := auth.GetClaims(c.Request.Context())
+	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceSite, rbac.ActionUpdate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
 		return
 	}
@@ -337,6 +360,44 @@ func handleDeleteSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 		return
 	}
 	siteID := c.Param("id")
+	var req db.UpdateSiteRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if !proposeBest(c, cl, cluster.CmdSiteUpdate, gin.H{"tenant_id": claims.TenantID, "site_id": siteID, "req": req}) {
+		return
+	}
+	site, err := store.UpdateSite(c.Request.Context(), claims.TenantID, claims.UserID, siteID, req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	configVersion.Add(1)
+	writeAuditEntry(c, store, hub, &db.WriteAuditRequest{
+		TenantID:    claims.TenantID,
+		ActorUserID: &claims.UserID,
+		Action:      "site.update",
+		TargetKind:  "site",
+		TargetID:    &siteID,
+	})
+	c.JSON(http.StatusOK, gin.H{"site": site})
+}
+
+func handleDeleteSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
+	claims, _ := auth.GetClaims(c.Request.Context())
+	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceSite, rbac.ActionDelete) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
+		return
+	}
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
+		return
+	}
+	siteID := c.Param("id")
+	if !proposeBest(c, cl, cluster.CmdSiteDelete, gin.H{"tenant_id": claims.TenantID, "site_id": siteID}) {
+		return
+	}
 	if err := store.DeleteSite(c.Request.Context(), claims.TenantID, siteID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -351,9 +412,9 @@ func handleDeleteSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
-func handleUpdateSiteStatus(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub) {
+func handleUpdateSiteStatus(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
 	claims, _ := auth.GetClaims(c.Request.Context())
-	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceSite, rbac.ActionCreate) {
+	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceSite, rbac.ActionUpdate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
 		return
 	}
@@ -367,6 +428,9 @@ func handleUpdateSiteStatus(c *gin.Context, enf *rbac.Enforcer, store *db.Store,
 	}
 	if err := c.ShouldBindJSON(&body); err != nil || (body.Status != "active" && body.Status != "paused") {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "status must be 'active' or 'paused'"})
+		return
+	}
+	if !proposeBest(c, cl, cluster.CmdSiteStatus, gin.H{"tenant_id": claims.TenantID, "site_id": siteID, "status": body.Status}) {
 		return
 	}
 	if err := store.UpdateSiteStatus(c.Request.Context(), claims.TenantID, siteID, body.Status); err != nil {
@@ -464,6 +528,28 @@ func siteRowToRustConfig(s db.SiteRow) (map[string]any, error) {
 		wafDB.AnomalyThreshold = 5
 	}
 
+	// Inject the full OWASP CRS rule set for any non-off site so that
+	// dynamically-deployed sites receive WAF protection immediately.
+	// The paths are relative to the proxy's working directory.
+	var rules []string
+	if wafDB.Mode != "off" {
+		rules = []string{
+			"rules/owasp-crs/rules/REQUEST-911-METHOD-ENFORCEMENT.conf",
+			"rules/owasp-crs/rules/REQUEST-913-SCANNER-DETECTION.conf",
+			"rules/owasp-crs/rules/REQUEST-920-PROTOCOL-ENFORCEMENT.conf",
+			"rules/owasp-crs/rules/REQUEST-921-PROTOCOL-ATTACK.conf",
+			"rules/owasp-crs/rules/REQUEST-930-APPLICATION-ATTACK-LFI.conf",
+			"rules/owasp-crs/rules/REQUEST-931-APPLICATION-ATTACK-RFI.conf",
+			"rules/owasp-crs/rules/REQUEST-932-APPLICATION-ATTACK-RCE.conf",
+			"rules/owasp-crs/rules/REQUEST-933-APPLICATION-ATTACK-PHP.conf",
+			"rules/owasp-crs/rules/REQUEST-934-APPLICATION-ATTACK-GENERIC.conf",
+			"rules/owasp-crs/rules/REQUEST-941-APPLICATION-ATTACK-XSS.conf",
+			"rules/owasp-crs/rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
+			"rules/owasp-crs/rules/REQUEST-943-APPLICATION-ATTACK-SESSION-FIXATION.conf",
+			"rules/owasp-crs/rules/REQUEST-944-APPLICATION-ATTACK-JAVA.conf",
+		}
+	}
+
 	return map[string]any{
 		"id":      s.Name, // proxy matches by site ID — use name (e.g., "dvwa.local")
 		"domains": s.Domains,
@@ -475,7 +561,10 @@ func siteRowToRustConfig(s db.SiteRow) (map[string]any, error) {
 			"mode":              wafDB.Mode,
 			"paranoia_level":    wafDB.ParanoiaLevel,
 			"anomaly_threshold": wafDB.AnomalyThreshold,
-			"rules":             []string{},
+			"rules":             rules,
+			"rule_exclusions": []map[string]any{
+				{"rule_id": 932236, "exclude_targets": []string{"ARGS_NAMES"}},
+			},
 		},
 		"plugins": []any{},
 	}, nil
@@ -528,7 +617,7 @@ func handleListAlerts(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 	c.JSON(http.StatusOK, gin.H{"alerts": []interface{}{}, "tenant_id": claims.TenantID})
 }
 
-func handleAckAlert(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub) {
+func handleAckAlert(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceAlert, rbac.ActionUpdate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
@@ -537,6 +626,9 @@ func handleAckAlert(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *lo
 	id := c.Param("id")
 	if store == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
+		return
+	}
+	if !proposeBest(c, cl, cluster.CmdAlertAck, gin.H{"tenant_id": claims.TenantID, "alert_id": id}) {
 		return
 	}
 	if err := store.AckAlert(c.Request.Context(), claims.TenantID, claims.UserID, id); err != nil {
@@ -553,7 +645,7 @@ func handleAckAlert(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *lo
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
-func handleResolveAlert(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub) {
+func handleResolveAlert(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceAlert, rbac.ActionUpdate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
@@ -562,6 +654,9 @@ func handleResolveAlert(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub
 	id := c.Param("id")
 	if store == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
+		return
+	}
+	if !proposeBest(c, cl, cluster.CmdAlertResolve, gin.H{"tenant_id": claims.TenantID, "alert_id": id}) {
 		return
 	}
 	if err := store.ResolveAlert(c.Request.Context(), claims.TenantID, claims.UserID, id); err != nil {
@@ -799,7 +894,7 @@ var _ = fmt.Sprintf
 // Rule CRUD
 // ---------------------------------------------------------------------------
 
-func handleCreateRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub) {
+func handleCreateRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceRule, rbac.ActionCreate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
@@ -808,6 +903,9 @@ func handleCreateRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 	var req db.CreateRuleRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if !proposeBest(c, cl, cluster.CmdRuleCreate, gin.H{"tenant_id": claims.TenantID, "req": req}) {
 		return
 	}
 	if store != nil {
@@ -836,7 +934,7 @@ func handleCreateRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 	}})
 }
 
-func handleToggleRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub) {
+func handleToggleRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceRule, rbac.ActionUpdate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
@@ -848,6 +946,9 @@ func handleToggleRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if !proposeBest(c, cl, cluster.CmdRuleToggle, gin.H{"tenant_id": claims.TenantID, "rule_id": id, "enabled": req.Enabled}) {
 		return
 	}
 	if store != nil {
@@ -866,13 +967,16 @@ func handleToggleRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 	c.JSON(http.StatusOK, gin.H{"ok": true, "id": id, "enabled": req.Enabled})
 }
 
-func handleDeleteRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub) {
+func handleDeleteRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceRule, rbac.ActionDelete) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
 		return
 	}
 	id := c.Param("id")
+	if !proposeBest(c, cl, cluster.CmdRuleDelete, gin.H{"tenant_id": claims.TenantID, "rule_id": id}) {
+		return
+	}
 	if store != nil {
 		if err := store.DeleteRule(c.Request.Context(), claims.TenantID, claims.UserID, id); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
