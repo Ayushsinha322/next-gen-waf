@@ -1,0 +1,8 @@
+---
+# Sentinel WAF — Ansible inventory
+# Replace <target-host> with your server's IP or hostname.
+all:
+  hosts:
+    sentinel:
+      ansible_host: "<target-host>"
+      ansible_user: root

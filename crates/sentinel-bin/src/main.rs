@@ -43,6 +43,9 @@ struct Args {
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
+    // Install default rustls crypto provider (required by rustls 0.23+).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Bootstrap a minimal logger before config is loaded (so startup errors
     // are visible).  The log level from config is applied after loading.
     init_tracing(args.log_level.as_deref().unwrap_or("info"));

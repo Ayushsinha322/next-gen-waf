@@ -1,38 +1,40 @@
 "use client";
 import { useState, useEffect } from "react";
+import { motion } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
 import Toggle from "@/components/ui/Toggle";
 import { api, type UserRow, type APIKeyRow } from "@/lib/api";
+import { staggerContainer, fadeUp, spring } from "@/lib/animations";
 
 const TABS = ["General","Auth & SSO","API Keys","Users & RBAC","Cluster","Notifications"];
 
 export default function SettingsPage() {
   const [tab, setTab] = useState(0);
   return (
-    <div className="sec">
-      <div style={{ display:"flex", alignItems:"flex-start", justifyContent:"space-between", gap:14 }}>
+    <motion.div className="sec" variants={staggerContainer} initial="hidden" animate="visible">
+      <motion.div variants={fadeUp} style={{ display:"flex", alignItems:"flex-start", justifyContent:"space-between", gap:14 }}>
         <div>
           <div className="sec-title">⚙️ Settings</div>
           <div className="sec-sub">System configuration · Authentication · Team management · Cluster</div>
         </div>
-        <button className="btn bp btn-sm" onClick={() => showToast("Settings saved","s","💾")}>💾 Save</button>
-      </div>
-      <div className="tabs">
+        <motion.button className="btn bp btn-sm" onClick={() => showToast("Settings saved","s","💾")} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>💾 Save</motion.button>
+      </motion.div>
+      <motion.div className="tabs" variants={fadeUp}>
         {TABS.map((t,i) => <div key={i} className={`tab ${tab===i?"active":""}`} onClick={() => setTab(i)}>{t}</div>)}
-      </div>
+      </motion.div>
       {tab === 0 && <GeneralTab />}
       {tab === 1 && <AuthTab />}
       {tab === 2 && <APIKeysTab />}
       {tab === 3 && <UsersTab />}
       {tab === 4 && <ClusterTab />}
       {tab === 5 && <NotificationsTab />}
-    </div>
+    </motion.div>
   );
 }
 
 function GeneralTab() {
   return (
-    <div className="panel">
+    <motion.div className="panel" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}>
       <div className="pb">
         <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12, marginBottom:16 }}>
           <div className="fg2"><label className="flbl2">Tenant Name</label><input className="fin2" defaultValue="Sentinel Security Labs" /></div>
@@ -54,13 +56,13 @@ function GeneralTab() {
           </div>
         ))}
       </div>
-    </div>
+    </motion.div>
   );
 }
 
 function AuthTab() {
   return (
-    <div className="panel">
+    <motion.div className="panel" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}>
       <div className="pb">
         <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12, marginBottom:16 }}>
           <div className="fg2"><label className="flbl2">JWT Secret (HS256)</label><input className="fin2" defaultValue="••••••••••••••••••••••••••••••••" type="password" /></div>
@@ -76,11 +78,11 @@ function AuthTab() {
         ] as [string,string,string][]).map(([t,d,btn]) => (
           <div key={t} className="srow">
             <div style={{flex:1}}><div className="srt">{t}</div><div className="srd">{d}</div></div>
-            <button className="btn bg-btn btn-xs" onClick={() => showToast(`${btn} clicked`,"i","🔧")}>{btn}</button>
+            <motion.button className="btn bg-btn btn-xs" onClick={() => showToast(`${btn} clicked`,"i","🔧")} whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.96 }}>{btn}</motion.button>
           </div>
         ))}
       </div>
-    </div>
+    </motion.div>
   );
 }
 
@@ -122,12 +124,12 @@ function APIKeysTab() {
   }
 
   return (
-    <div className="panel">
+    <motion.div className="panel" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}>
       <div className="ph">
         <div className="ptitle">🔑 API Keys</div>
-        <button className="btn bp btn-sm" onClick={() => { setShowCreate(s=>!s); setRevealKey(null); }}>
+        <motion.button className="btn bp btn-sm" onClick={() => { setShowCreate(s=>!s); setRevealKey(null); }} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
           {showCreate ? "✕ Cancel" : "＋ Generate Key"}
-        </button>
+        </motion.button>
       </div>
       {showCreate && (
         <div className="pb" style={{ borderBottom:"1px solid rgba(255,255,255,.06)", paddingBottom:14 }}>
@@ -142,15 +144,15 @@ function APIKeysTab() {
                 <option value="write:all">write:all</option>
               </select></div>
           </div>
-          <button className="btn bp btn-sm" style={{marginTop:10}} onClick={generate} disabled={creating}>
+          <motion.button className="btn bp btn-sm" style={{marginTop:10}} onClick={generate} disabled={creating} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
             {creating ? "Generating…" : "🔑 Generate"}
-          </button>
+          </motion.button>
           {revealKey && (
             <div className="code-block" style={{marginTop:10}}>
               <div style={{color:"var(--amber)",fontSize:10,marginBottom:4}}>⚠ Copy now — shown only once</div>
               <code style={{color:"var(--green)",wordBreak:"break-all"}}>{revealKey}</code>
-              <button className="btn bg-btn btn-xs" style={{marginLeft:8}}
-                onClick={() => { navigator.clipboard?.writeText(revealKey); showToast("Copied!","s","📋"); }}>Copy</button>
+              <motion.button className="btn bg-btn btn-xs" style={{marginLeft:8}}
+                onClick={() => { navigator.clipboard?.writeText(revealKey); showToast("Copied!","s","📋"); }} whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.96 }}>Copy</motion.button>
             </div>
           )}
         </div>
@@ -162,21 +164,21 @@ function APIKeysTab() {
           <table>
             <thead><tr><th>Name</th><th>Key Preview</th><th>Scope</th><th>Expires</th><th>Last Used</th><th>Actions</th></tr></thead>
             <tbody>
-              {keys.map(k => (
-                <tr key={k.id}>
+              {keys.map((k, idx) => (
+                <motion.tr key={k.id} initial={{ opacity: 0, x: -6 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: idx * 0.02 }}>
                   <td>{k.name}</td>
                   <td className="td2">{k.preview}</td>
                   <td><span className="bdg bcy">{k.scope}</span></td>
                   <td className="td3">{k.expires_at ? new Date(k.expires_at).toLocaleDateString() : "—"}</td>
                   <td className="td3">{k.last_used}</td>
-                  <td><button className="btn bd btn-xs" onClick={() => revoke(k.id,k.name)}>Revoke</button></td>
-                </tr>
+                  <td><motion.button className="btn bd btn-xs" onClick={() => revoke(k.id,k.name)} whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.96 }}>Revoke</motion.button></td>
+                </motion.tr>
               ))}
             </tbody>
           </table>
         )}
       </div>
-    </div>
+    </motion.div>
   );
 }
 
@@ -223,12 +225,12 @@ function UsersTab() {
   }
 
   return (
-    <div className="panel">
+    <motion.div className="panel" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}>
       <div className="ph">
         <div className="ptitle">👥 Team Members</div>
-        <button className="btn bp btn-sm" onClick={() => setShowInvite(s=>!s)}>
+        <motion.button className="btn bp btn-sm" onClick={() => setShowInvite(s=>!s)} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
           {showInvite ? "✕ Cancel" : "＋ Invite User"}
-        </button>
+        </motion.button>
       </div>
       {showInvite && (
         <div className="pb" style={{ borderBottom:"1px solid rgba(255,255,255,.06)", paddingBottom:14 }}>
@@ -239,14 +241,12 @@ function UsersTab() {
               <input className="fin2" placeholder="Jane Smith" value={invName} onChange={e=>setInvName(e.target.value)} /></div>
             <div className="fg2"><label className="flbl2">Role</label>
               <select className="fin2 fsel2" value={invRole} onChange={e=>setInvRole(e.target.value)}>
-                <option value="viewer">Viewer</option>
-                <option value="editor">Editor</option>
-                <option value="admin">Admin</option>
+                <option value="viewer">Viewer</option><option value="editor">Editor</option><option value="admin">Admin</option>
               </select></div>
           </div>
-          <button className="btn bp btn-sm" style={{marginTop:10}} onClick={invite} disabled={inviting}>
+          <motion.button className="btn bp btn-sm" style={{marginTop:10}} onClick={invite} disabled={inviting} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
             {inviting ? "Sending…" : "📧 Send Invite"}
-          </button>
+          </motion.button>
         </div>
       )}
       <div className="tw">
@@ -256,27 +256,27 @@ function UsersTab() {
           <table>
             <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>2FA</th><th>Last Login</th><th>Status</th></tr></thead>
             <tbody>
-              {users.map(u => (
-                <tr key={u.id}>
+              {users.map((u, idx) => (
+                <motion.tr key={u.id} initial={{ opacity: 0, x: -6 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: idx * 0.02 }}>
                   <td>{u.name||"—"}</td>
                   <td className="td2">{u.email}</td>
                   <td>{roleBadge(u.role)}</td>
                   <td><span className={`bdg ${u.twofa?"bgg":"bgr"}`}>{u.twofa?"✓ TOTP":"✗ None"}</span></td>
                   <td className="td3">{fmtLogin(u.last_login)}</td>
                   <td><span className={`bdg ${u.status==="active"?"bgg":"bgr"}`}>{u.status.toUpperCase()}</span></td>
-                </tr>
+                </motion.tr>
               ))}
             </tbody>
           </table>
         )}
       </div>
-    </div>
+    </motion.div>
   );
 }
 
 function ClusterTab() {
   return (
-    <div className="panel">
+    <motion.div className="panel" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}>
       <div className="ph">
         <div className="ptitle">⚡ Cluster Status</div>
         <span className="bdg bgg"><span className="bdr" />Raft · 3 nodes</span>
@@ -287,20 +287,17 @@ function ClusterTab() {
             {role:"LEADER",  name:"cp-primary-01", ip:"10.0.0.10:8080", uptime:"14d 6h", term:4, idx:"18,422", cpu:"12%", mem:"284MB", leader:true},
             {role:"FOLLOWER",name:"cp-replica-02", ip:"10.0.0.11:8080", uptime:"14d 6h", term:4, idx:"18,422", cpu:"8%",  mem:"241MB", leader:false},
             {role:"FOLLOWER",name:"cp-replica-03", ip:"10.0.0.12:8080", uptime:"14d 6h", term:4, idx:"18,421", cpu:"9%",  mem:"258MB", leader:false},
-          ]).map(n => (
-            <div key={n.name} className={`nodecard ${n.leader?"leader":""}`}>
+          ]).map((n, idx) => (
+            <motion.div key={n.name} className={`nodecard ${n.leader?"leader":""}`} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: idx * 0.08, ...spring }}>
               <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
                 <div className="sd g" />
-                <span className="ncr" style={n.leader?{background:"rgba(200,0,30,.2)",color:"var(--red-b)",border:"1px solid var(--border)"}:{background:"rgba(0,200,240,.12)",color:"var(--cyan)",border:"1px solid rgba(0,200,240,.3)"}}>
-                  {n.role}
-                </span>
+                <span className="ncr" style={n.leader?{background:"rgba(200,0,30,.2)",color:"var(--red-b)",border:"1px solid var(--border)"}:{background:"rgba(0,200,240,.12)",color:"var(--cyan)",border:"1px solid rgba(0,200,240,.3)"}}>{n.role}</span>
               </div>
               <div className="ncn">{n.name}</div>
-              <div className="ncs">IP: {n.ip}</div>
-              <div className="ncs">Uptime: {n.uptime}</div>
+              <div className="ncs">IP: {n.ip}</div><div className="ncs">Uptime: {n.uptime}</div>
               <div className="ncs">Term: {n.term} · Log idx: {n.idx}</div>
               <div className="ncs" style={{color:"var(--green)",marginTop:5}}>CPU: {n.cpu} · Mem: {n.mem}</div>
-            </div>
+            </motion.div>
           ))}
         </div>
         {([
@@ -314,13 +311,13 @@ function ClusterTab() {
           </div>
         ))}
       </div>
-    </div>
+    </motion.div>
   );
 }
 
 function NotificationsTab() {
   return (
-    <div className="panel">
+    <motion.div className="panel" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}>
       <div className="pb">
         {([
           ["Email Alerts","Send critical alerts to admin@sentinel.local",true],
@@ -338,6 +335,6 @@ function NotificationsTab() {
           <input className="fin2" placeholder="https://your-siem.corp.io/events" type="url" />
         </div>
       </div>
-    </div>
+    </motion.div>
   );
 }

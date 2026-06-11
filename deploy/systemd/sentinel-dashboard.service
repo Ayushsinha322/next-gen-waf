@@ -1,0 +1,21 @@
+[Unit]
+Description=Sentinel WAF Dashboard
+Documentation=https://github.com/your-org/sentinel-waf
+After=sentinel-controlplane.service
+Wants=sentinel-controlplane.service
+
+[Service]
+Type=simple
+User=sentinel
+Group=sentinel
+WorkingDirectory=/opt/sentinel/dashboard
+ExecStart=/usr/bin/npm start
+Restart=always
+RestartSec=5
+
+Environment=NEXT_PUBLIC_CONTROL_PLANE_URL=http://localhost:9501
+Environment=PORT=3000
+Environment=NODE_OPTIONS=--max-old-space-size=3072
+
+[Install]
+WantedBy=multi-user.target

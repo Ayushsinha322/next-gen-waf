@@ -236,6 +236,7 @@ fn secrule_directive_to_rule_with_actions(
         chain_conditions: Vec::new(),
         transforms: actions.transforms.clone(),
         skip_after: actions.skip_after.clone(),
+        multi_match: actions.multi_match,
     }))
 }
 
@@ -611,7 +612,7 @@ SecRule ARGS "@rx baz" "t:none"
         let engine = RuleEngine::from_crs_conf(src).expect("engine");
 
         let mut ctx = RequestContext::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345);
-        let decision = engine.evaluate(&mut ctx, Phase::RequestHeaders);
+        let decision = engine.evaluate(&mut ctx, Phase::RequestHeaders, 0);
         assert!(
             !matches!(decision, WafDecision::Block),
             "clean GET with no Content-Type must not be blocked by 920620"

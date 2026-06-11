@@ -1,7 +1,9 @@
 "use client";
 import { useState, useEffect } from "react";
+import { motion } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
 import { api, type Rule, type RuleTestResult } from "@/lib/api";
+import { staggerContainer, cardVariants, fadeUp, spring } from "@/lib/animations";
 
 const PHASE_LABELS = ["conn","req_hdr","req_body","upstream","resp_hdr","resp_body","log"];
 
@@ -117,25 +119,25 @@ export default function RulesPage() {
   }
 
   return (
-    <div className="sec">
-      <div style={{ display:"flex", alignItems:"flex-start", justifyContent:"space-between", gap:14 }}>
+    <motion.div className="sec" variants={staggerContainer} initial="hidden" animate="visible">
+      <motion.div variants={fadeUp} style={{ display:"flex", alignItems:"flex-start", justifyContent:"space-between", gap:14 }}>
         <div>
           <div className="sec-title">📋 Rules Engine</div>
           <div className="sec-sub">OWASP CRS v4.7 · Custom SRL · Virtual Patches · {rules.length} loaded rules</div>
         </div>
         <div style={{ display:"flex", gap:8 }}>
-          <button className="btn bc btn-sm" onClick={runTest} disabled={testLoading}>
+          <motion.button className="btn bc btn-sm" onClick={runTest} disabled={testLoading} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
             {testLoading ? "⏳ Testing…" : "🧪 Test Rule"}
-          </button>
-          <button className="btn bp btn-sm" onClick={() => {
+          </motion.button>
+          <motion.button className="btn bp btn-sm" whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }} onClick={() => {
             setEditorRule(null); setEditorDSL(BLANK_DSL);
             setEditorName(""); setEditorPhase(2); setEditorSev("high");
             setTestResult(null); setShowModal(true);
-          }}>＋ New Rule</button>
+          }}>＋ New Rule</motion.button>
         </div>
-      </div>
+      </motion.div>
 
-      <div style={{ display:"grid", gridTemplateColumns:"1fr 2fr", gap:16 }}>
+      <motion.div variants={fadeUp} style={{ display:"grid", gridTemplateColumns:"1fr 2fr", gap:16 }}>
         <div className="panel">
           <div className="ph">
             <div className="ptitle">📋 Rule Library</div>
@@ -159,7 +161,8 @@ export default function RulesPage() {
                 <thead><tr><th>On</th><th>Name</th><th>Phase</th><th>Sev</th><th></th></tr></thead>
                 <tbody>
                   {displayed.map(r => (
-                    <tr key={r.id} onClick={() => openEditor(r)}
+                    <motion.tr key={r.id} initial={{ opacity: 0, x: -6 }} animate={{ opacity: 1, x: 0 }} transition={{ duration: 0.2 }}
+                      onClick={() => openEditor(r)}
                       style={{ cursor:"pointer", background: editorRule?.id===r.id ? "rgba(0,200,240,0.06)" : undefined }}>
                       <td onClick={e => { e.stopPropagation(); toggleRule(r); }}>
                         <div className={`tog ${r.enabled?"on":""}`} />
@@ -173,7 +176,7 @@ export default function RulesPage() {
                             onClick={e=>{ e.stopPropagation(); deleteRule(r); }}>🗑</span>
                         )}
                       </td>
-                    </tr>
+                    </motion.tr>
                   ))}
                 </tbody>
               </table>
@@ -187,9 +190,9 @@ export default function RulesPage() {
               ✏️ Rule Editor
               {editorRule && <span style={{ fontSize:10, color:"var(--text3)", marginLeft:8 }}>— {editorRule.name}</span>}
             </div>
-            <button className="btn bc btn-sm" onClick={runTest} disabled={testLoading}>
+            <motion.button className="btn bc btn-sm" onClick={runTest} disabled={testLoading} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
               {testLoading ? "⏳" : "▶ Test"}
-            </button>
+            </motion.button>
           </div>
           <div className="pb" style={{ flex:1, display:"flex", flexDirection:"column", gap:12 }}>
             {editorRule ? (
@@ -218,25 +221,28 @@ export default function RulesPage() {
               <input className="fin2" value={testPayload} onChange={e => setTestPayload(e.target.value)}
                 placeholder="Test payload, e.g.: 1' UNION SELECT * FROM users--" />
             </div>
-            <button className="btn bc" onClick={runTest} disabled={testLoading}>
+            <motion.button className="btn bc" onClick={runTest} disabled={testLoading} whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.98 }}>
               {testLoading ? "⏳ Running…" : "▶ Run Test"}
-            </button>
+            </motion.button>
 
             {testResult && (
-              <div className="code-block" style={{ whiteSpace:"pre-wrap" }}>
+              <motion.div className="code-block" style={{ whiteSpace:"pre-wrap" }} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}>
                 <span style={{ color: testResult.verdict==="BLOCK" ? "var(--red-b)" : testResult.verdict==="ERROR" ? "var(--amber)" : "var(--green)" }}>
                   ● {testResult.verdict}
                 </span>{" "}— {testResult.detail}{"\n"}
                 Score: {testResult.anomaly_score} · Phases: {testResult.phases_run.join(", ")}
-              </div>
+              </motion.div>
             )}
           </div>
         </div>
-      </div>
+      </motion.div>
 
       {showModal && (
-        <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.75)", zIndex:200, display:"flex", alignItems:"center", justifyContent:"center" }}>
-          <div className="panel" style={{ width:560, maxHeight:"80vh", overflowY:"auto" }}>
+        <motion.div
+          style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.75)", zIndex:200, display:"flex", alignItems:"center", justifyContent:"center" }}
+          initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+        >
+          <motion.div className="panel" style={{ width:560, maxHeight:"80vh", overflowY:"auto" }} initial={{ scale: 0.94, y: 14 }} animate={{ scale: 1, y: 0 }} transition={spring}>
             <div className="ph">
               <div className="ptitle">＋ New Custom Rule</div>
               <button className="btn bg-btn btn-sm" onClick={() => setShowModal(false)}>✕</button>
@@ -259,14 +265,14 @@ export default function RulesPage() {
                 <textarea className="rule-ta" value={editorDSL} onChange={e=>setEditorDSL(e.target.value)} style={{ minHeight:160 }} /></div>
               <div style={{ display:"flex", gap:8, justifyContent:"flex-end" }}>
                 <button className="btn bg-btn" onClick={() => setShowModal(false)}>Cancel</button>
-                <button className="btn bp" onClick={createRule} disabled={saving}>
+                <motion.button className="btn bp" onClick={createRule} disabled={saving} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
                   {saving ? "Saving…" : "💾 Create Rule"}
-                </button>
+                </motion.button>
               </div>
             </div>
-          </div>
-        </div>
+          </motion.div>
+        </motion.div>
       )}
-    </div>
+    </motion.div>
   );
 }

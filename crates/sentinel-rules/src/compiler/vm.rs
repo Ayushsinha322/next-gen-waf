@@ -240,7 +240,12 @@ fn map_severity(s: RuleSeverity) -> Severity {
 ///
 /// Returns the final `WafDecision` (may update `ctx.decision` and
 /// `ctx.rule_matches` internally).
-pub fn evaluate(ruleset: &CompiledRuleSet, ctx: &mut RequestContext, phase: Phase) -> WafDecision {
+pub fn evaluate(
+    ruleset: &CompiledRuleSet,
+    ctx: &mut RequestContext,
+    phase: Phase,
+    anomaly_threshold: u32,
+) -> WafDecision {
     let phase_idx = phase as usize;
     let program = &ruleset.phase_programs[phase_idx];
 
@@ -248,6 +253,11 @@ pub fn evaluate(ruleset: &CompiledRuleSet, ctx: &mut RequestContext, phase: Phas
     let mut ip: usize = 0; // instruction pointer
 
     while ip < program.len() {
+        // Early exit: if already decided (Block/Challenge), stop evaluating.
+        if ctx.decision != WafDecision::Allow {
+            return ctx.decision.clone();
+        }
+
         let instr = &program[ip];
         match instr {
             Instruction::LoadTarget(spec) => {
@@ -301,13 +311,29 @@ pub fn evaluate(ruleset: &CompiledRuleSet, ctx: &mut RequestContext, phase: Phas
                 stack.push(StackVal::Bool(false));
             }
 
-            Instruction::ApplyTransforms(transforms) => {
+            Instruction::ApplyTransforms { transforms, multi_match } => {
                 let values = pop_strings(&mut stack);
-                let transformed: Vec<String> = values
-                    .into_iter()
-                    .map(|s| apply_transforms(s, transforms))
-                    .collect();
-                stack.push(StackVal::Strings(transformed));
+                if *multi_match && !transforms.is_empty() {
+                    // multiMatch: collect the original values plus the result
+                    // after each cumulative transform prefix so the subsequent
+                    // operator can match at any intermediate step.
+                    let mut all: Vec<String> = Vec::with_capacity(values.len() * (transforms.len() + 1));
+                    for v in &values {
+                        let mut s = v.clone();
+                        all.push(s.clone()); // original
+                        for t in transforms.iter() {
+                            s = apply_single_transform(s, t);
+                            all.push(s.clone()); // after this transform
+                        }
+                    }
+                    stack.push(StackVal::Strings(all));
+                } else {
+                    let transformed: Vec<String> = values
+                        .into_iter()
+                        .map(|s| apply_transforms(s, transforms))
+                        .collect();
+                    stack.push(StackVal::Strings(transformed));
+                }
             }
 
             Instruction::LoadAnomalyScore => {
@@ -375,6 +401,17 @@ pub fn evaluate(ruleset: &CompiledRuleSet, ctx: &mut RequestContext, phase: Phas
                             }) {
                                 ip = search_from + rel;
                             }
+                        }
+                        // Short-circuit: if anomaly score exceeds threshold, block immediately.
+                        if anomaly_threshold > 0 && ctx.anomaly_score >= anomaly_threshold
+                            && ctx.decision == WafDecision::Allow
+                        {
+                            ctx.decision = WafDecision::Block;
+                            ctx.block_reason = Some(format!(
+                                "anomaly score {} >= threshold {}",
+                                ctx.anomaly_score, anomaly_threshold
+                            ));
+                            return WafDecision::Block;
                         }
                     } else {
                         warn!(rule_id, "RuleEnd: no metadata found for rule");
@@ -453,21 +490,47 @@ fn fire_rule(ctx: &mut RequestContext, meta: &RuleMeta) {
 // Transform helpers
 // ---------------------------------------------------------------------------
 
+/// Apply all transforms in declaration order (strictly chained output → input).
 fn apply_transforms(mut s: String, transforms: &[Transform]) -> String {
     for t in transforms {
-        s = match t {
-            Transform::Lowercase => s.to_ascii_lowercase(),
-            Transform::UrlDecodeUni => url_decode_uni(&s),
-            Transform::RemoveNulls => s.replace('\0', ""),
-            Transform::ReplaceNulls => s.replace('\0', " "),
-            Transform::HtmlEntityDecode => decode_html_entities(s),
-            Transform::RemoveWhitespace => s.chars().filter(|c| !c.is_ascii_whitespace()).collect(),
-            Transform::CompressWhitespace => compress_whitespace(s),
-            Transform::JsDecode => decode_js_escapes(s),
-            Transform::CssDecode => decode_css_escapes(s),
-        };
+        s = apply_single_transform(s, t);
     }
     s
+}
+
+/// Apply a single transform step.  Used both by `apply_transforms` and by
+/// the multiMatch loop in the VM.
+fn apply_single_transform(s: String, t: &Transform) -> String {
+    match t {
+        Transform::Lowercase          => s.to_ascii_lowercase(),
+        Transform::UrlDecodeUni       => url_decode_uni(&s),
+        Transform::RemoveNulls        => s.replace('\0', ""),
+        Transform::ReplaceNulls       => s.replace('\0', " "),
+        Transform::HtmlEntityDecode   => decode_html_entities(s),
+        Transform::RemoveWhitespace   => s.chars().filter(|c| !c.is_ascii_whitespace()).collect(),
+        Transform::CompressWhitespace => compress_whitespace(s),
+        Transform::JsDecode           => decode_js_escapes(s),
+        Transform::CssDecode          => decode_css_escapes(s),
+        Transform::Base64Decode       => base64_decode_transform(&s),
+        Transform::HexDecode          => hex_decode_transform(&s),
+        Transform::NormalisePath      => normalise_path_transform(s.replace('\\', "/")),
+        Transform::NormalisePathWin   => normalise_path_transform(s.replace('\\', "/")),
+        Transform::Trim               => s.trim().to_owned(),
+        Transform::TrimLeft           => s.trim_start().to_owned(),
+        Transform::TrimRight          => s.trim_end().to_owned(),
+        // UTF-8 to Unicode — replace non-ASCII bytes with \uXXXX (basic ASCII pass-through)
+        Transform::Utf8ToUnicode      => s.chars().flat_map(|c| {
+            if c.is_ascii() {
+                vec![c]
+            } else {
+                format!("\\u{:04X}", c as u32).chars().collect::<Vec<_>>()
+            }
+        }).collect(),
+        // Comment removal — strip /* ... */ style C comments
+        Transform::RemoveCommentsChar => remove_comments_char(s),
+        Transform::RemoveComments     => remove_sql_comments(s),
+        Transform::ReplaceComments    => replace_sql_comments(s),
+    }
 }
 
 fn decode_html_entities(s: String) -> String {
@@ -604,6 +667,111 @@ fn decode_css_escapes(s: String) -> String {
         out.push_str(&hex);
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// New transform helpers (base64, hex, path normalisation, comment removal)
+// ---------------------------------------------------------------------------
+
+/// Decode standard base64 (MIME alphabet, with and without `=` padding).
+/// Strips whitespace first (headers often have line breaks).
+/// Returns the original string unchanged on any decoding error.
+fn base64_decode_transform(s: &str) -> String {
+    let cleaned: String = s.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    let decode = |c: u8| -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            b'=' => Some(0),
+            _ => None,
+        }
+    };
+    let bytes = cleaned.as_bytes();
+    if bytes.is_empty() || bytes.len() % 4 != 0 {
+        return s.to_owned();
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len() * 3 / 4);
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        let b0 = match decode(bytes[i]) { Some(v) => v, None => return s.to_owned() };
+        let b1 = match decode(bytes[i + 1]) { Some(v) => v, None => return s.to_owned() };
+        let b2 = match decode(bytes[i + 2]) { Some(v) => v, None => return s.to_owned() };
+        let b3 = match decode(bytes[i + 3]) { Some(v) => v, None => return s.to_owned() };
+        out.push((b0 << 2) | (b1 >> 4));
+        if bytes[i + 2] != b'=' { out.push((b1 << 4) | (b2 >> 2)); }
+        if bytes[i + 3] != b'=' { out.push((b2 << 6) | b3); }
+        i += 4;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_owned())
+}
+
+/// Decode a hex-encoded string (optional `0x`/`0X` prefix; even-length hex bytes).
+/// Returns original on error or invalid input.
+fn hex_decode_transform(s: &str) -> String {
+    let hex = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s).trim();
+    if hex.is_empty() || hex.len() % 2 != 0 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return s.to_owned();
+    }
+    let bytes: Option<Vec<u8>> = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+        .collect();
+    bytes
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_else(|| s.to_owned())
+}
+
+/// Collapse `..` and `.` path segments; deduplicate adjacent slashes.
+fn normalise_path_transform(s: String) -> String {
+    if !s.contains("..") && !s.contains("//") && !s.contains("./") {
+        return s;
+    }
+    let leading = s.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in s.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => { parts.pop(); }
+            other => parts.push(other),
+        }
+    }
+    let mut out = parts.join("/");
+    if leading { out.insert(0, '/'); }
+    out
+}
+
+/// Strip C-style comment characters (`/*` and `*/`) from input.
+fn remove_comments_char(s: String) -> String {
+    s.replace("/*", "").replace("*/", "").replace("//", "")
+}
+
+/// Remove SQL/C block comments (`/* ... */`) from input.
+fn remove_sql_comments(mut s: String) -> String {
+    loop {
+        let start = match s.find("/*") { Some(i) => i, None => break };
+        let end = match s[start + 2..].find("*/") {
+            Some(i) => start + 2 + i + 2,
+            None => break,
+        };
+        s = format!("{}{}", &s[..start], &s[end..]);
+    }
+    s
+}
+
+/// Replace SQL/C block comments with a single space.
+fn replace_sql_comments(mut s: String) -> String {
+    loop {
+        let start = match s.find("/*") { Some(i) => i, None => break };
+        let end = match s[start + 2..].find("*/") {
+            Some(i) => start + 2 + i + 2,
+            None => break,
+        };
+        s = format!("{} {}", &s[..start], &s[end..]);
+    }
+    s
 }
 
 // ---------------------------------------------------------------------------

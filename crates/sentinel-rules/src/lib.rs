@@ -19,7 +19,7 @@
 //! "#).unwrap();
 //!
 //! let mut ctx = RequestContext::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345);
-//! engine.evaluate(&mut ctx, Phase::RequestBody);
+//! engine.evaluate(&mut ctx, Phase::RequestBody, 0);
 //! ```
 
 pub mod compiler;
@@ -89,8 +89,17 @@ impl RuleEngine {
     ///
     /// Updates `ctx.decision`, `ctx.anomaly_score`, and `ctx.rule_matches`
     /// as rules fire.  Returns the current decision after this phase.
-    pub fn evaluate(&self, ctx: &mut RequestContext, phase: Phase) -> WafDecision {
-        compiler::vm::evaluate(&self.ruleset, ctx, phase)
+    ///
+    /// `anomaly_threshold` enables early-exit: when a rule pushes the anomaly
+    /// score at or above this value the VM stops evaluating remaining rules
+    /// and returns `WafDecision::Block`.  Pass 0 to disable.
+    pub fn evaluate(
+        &self,
+        ctx: &mut RequestContext,
+        phase: Phase,
+        anomaly_threshold: u32,
+    ) -> WafDecision {
+        compiler::vm::evaluate(&self.ruleset, ctx, phase, anomaly_threshold)
     }
 
     /// Return the number of compiled rules.
@@ -158,7 +167,7 @@ rule 942100 {
             .unwrap();
         ctx.request_body = Some(Bytes::from("id=1 SELECT * FROM users"));
 
-        engine.evaluate(&mut ctx, Phase::RequestBody);
+        engine.evaluate(&mut ctx, Phase::RequestBody, 0);
 
         assert!(ctx.anomaly_score > 0, "anomaly_score should be > 0");
         assert_eq!(ctx.rule_matches.len(), 1, "one rule match expected");
@@ -184,7 +193,7 @@ rule 942101 {
         let mut ctx = make_ctx();
         ctx.uri = "http://example.com/?cmd=xp_cmdshell".parse().unwrap();
 
-        engine.evaluate(&mut ctx, Phase::RequestBody);
+        engine.evaluate(&mut ctx, Phase::RequestBody, 0);
 
         assert_eq!(ctx.decision, WafDecision::Block);
     }
@@ -208,7 +217,7 @@ rule 942100 {
         let mut ctx = make_ctx();
         ctx.uri = "http://example.com/?name=John".parse().unwrap();
 
-        engine.evaluate(&mut ctx, Phase::RequestBody);
+        engine.evaluate(&mut ctx, Phase::RequestBody, 0);
 
         assert_eq!(ctx.anomaly_score, 0);
         assert_eq!(ctx.rule_matches.len(), 0);
@@ -240,7 +249,7 @@ rule 980130 {
         let mut ctx = make_ctx();
         ctx.uri = "http://example.com/?q=select%20foo".parse().unwrap();
 
-        engine.evaluate(&mut ctx, Phase::RequestBody);
+        engine.evaluate(&mut ctx, Phase::RequestBody, 0);
 
         assert_eq!(ctx.decision, WafDecision::Block, "should block via anomaly threshold");
     }
@@ -265,7 +274,7 @@ rule 942200 {
         ctx.uri = "http://example.com/".parse().unwrap();
         ctx.request_body = Some(Bytes::from("data=xp_cmdshell"));
 
-        engine.evaluate(&mut ctx, Phase::RequestBody);
+        engine.evaluate(&mut ctx, Phase::RequestBody, 0);
 
         assert_eq!(ctx.decision, WafDecision::Block);
     }
@@ -285,7 +294,7 @@ rule 942200 {
         ctx.uri = "http://example.com/?id=1%20SELECT%20%2A".parse().unwrap();
         ctx.request_body = Some(Bytes::from("field=SELECT * FROM users"));
 
-        engine.evaluate(&mut ctx, Phase::RequestBody);
+        engine.evaluate(&mut ctx, Phase::RequestBody, 0);
 
         assert_eq!(ctx.decision, WafDecision::Block);
     }
@@ -317,7 +326,7 @@ rule 2 { phase: request_headers targets: ARGS operator: exists action: log messa
         let mut ctx = make_ctx();
         ctx.uri = "http://example.com/?q=SELECT%201".parse().unwrap();
 
-        engine.evaluate(&mut ctx, Phase::RequestBody);
+        engine.evaluate(&mut ctx, Phase::RequestBody, 0);
         assert_eq!(ctx.decision, WafDecision::Block, "lowercase transform should normalise SELECT → select");
     }
 
@@ -331,7 +340,7 @@ rule 2 { phase: request_headers targets: ARGS operator: exists action: log messa
         let mut ctx = make_ctx();
         ctx.uri = "http://example.com/?q=normal+query".parse().unwrap();
 
-        engine.evaluate(&mut ctx, Phase::RequestBody);
+        engine.evaluate(&mut ctx, Phase::RequestBody, 0);
         assert!(
             ctx.decision != WafDecision::Block,
             "clean request must not be blocked by lowercase rule"
@@ -350,7 +359,7 @@ rule 2 { phase: request_headers targets: ARGS operator: exists action: log messa
         // "se\x00lect" — null byte injected into the keyword
         ctx.uri = "http://example.com/?x=se%00lect".parse().unwrap();
 
-        engine.evaluate(&mut ctx, Phase::RequestBody);
+        engine.evaluate(&mut ctx, Phase::RequestBody, 0);
         assert_eq!(
             ctx.decision,
             WafDecision::Block,
@@ -371,7 +380,7 @@ rule 2 { phase: request_headers targets: ARGS operator: exists action: log messa
         // Decoded ARGS value: "&lt;script&gt;" — htmlEntityDecode turns this to "<script>"
         ctx.request_body = Some(Bytes::from("x=&lt;script&gt;alert(1)&lt;/script&gt;"));
 
-        engine.evaluate(&mut ctx, Phase::RequestBody);
+        engine.evaluate(&mut ctx, Phase::RequestBody, 0);
         assert_eq!(ctx.decision, WafDecision::Block, "htmlEntityDecode should expose encoded script tag");
     }
 
@@ -470,7 +479,7 @@ SecMarker "SECTION_END"
         // === Path 1: ARGS="safe" → gate fires, block rule must be skipped ===
         let mut ctx_gate = make_ctx();
         ctx_gate.uri = "http://example.com/?param=safe".parse().unwrap();
-        engine.evaluate(&mut ctx_gate, Phase::RequestBody);
+        engine.evaluate(&mut ctx_gate, Phase::RequestBody, 0);
 
         assert!(
             ctx_gate.rule_matches.iter().any(|m| m.rule_id == "10"),
@@ -485,7 +494,7 @@ SecMarker "SECTION_END"
         // === Path 2: ARGS="other" → gate does NOT fire, block rule runs ===
         let mut ctx_no_gate = make_ctx();
         ctx_no_gate.uri = "http://example.com/?param=other".parse().unwrap();
-        engine.evaluate(&mut ctx_no_gate, Phase::RequestBody);
+        engine.evaluate(&mut ctx_no_gate, Phase::RequestBody, 0);
 
         assert!(
             !ctx_no_gate.rule_matches.iter().any(|m| m.rule_id == "10"),

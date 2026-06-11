@@ -43,6 +43,11 @@ pub struct RuleDef {
     /// CRS `skipAfter:MARKER` — if this rule fires, skip to the named SecMarker.
     #[serde(default)]
     pub skip_after: Option<String>,
+    /// When `true`, the operator is tested at each cumulative transform step
+    /// (original → after first transform → after first+second → …), not only
+    /// against the fully-transformed value.  Mirrors ModSecurity `multiMatch`.
+    #[serde(default)]
+    pub multi_match: bool,
 }
 
 /// A single chained condition from a CRS `chain` SecRule.
@@ -67,6 +72,7 @@ impl Default for RuleDef {
             chain_conditions: Vec::new(),
             transforms: Vec::new(),
             skip_after: None,
+            multi_match: false,
         }
     }
 }
@@ -142,6 +148,18 @@ pub enum Transform {
     CompressWhitespace,
     JsDecode,
     CssDecode,
+    // Additional transforms for CRS encoding-evasion coverage
+    Base64Decode,
+    HexDecode,
+    NormalisePath,
+    NormalisePathWin,
+    Trim,
+    TrimLeft,
+    TrimRight,
+    Utf8ToUnicode,
+    RemoveCommentsChar,
+    RemoveComments,
+    ReplaceComments,
 }
 
 // ---------------------------------------------------------------------------

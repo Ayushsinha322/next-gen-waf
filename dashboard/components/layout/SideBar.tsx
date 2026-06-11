@@ -1,5 +1,7 @@
 "use client";
 import { usePathname, useRouter } from "next/navigation";
+import { motion } from "framer-motion";
+import { navGroupStagger, navItemVariants, spring } from "@/lib/animations";
 
 // ── Inline SVG icons ─────────────────────────────────────────────────────────
 const Icon = {
@@ -55,7 +57,7 @@ const Icon = {
   Settings: () => (
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
       <circle cx="12" cy="12" r="3"/>
-      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06-.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
     </svg>
   ),
 };
@@ -87,16 +89,25 @@ export default function SideBar() {
   const current  = pathname.split("/").pop() || "overview";
 
   return (
-    <nav className="sidebar">
+    <motion.nav
+      className="sidebar"
+      initial={{ x: -240, opacity: 0 }}
+      animate={{ x: 0, opacity: 1 }}
+      transition={{ ...spring, stiffness: 200, damping: 22 }}
+    >
       <div style={{ flex: 1, overflowY: "auto", padding: "8px 8px" }}>
         {NAV.map(g => (
-          <div key={g.group}>
+          <motion.div key={g.group} variants={navGroupStagger} initial="hidden" animate="visible">
             <span className="sb-lbl">{g.group}</span>
-            {g.items.map(item => (
-              <div
+            {g.items.map((item, idx) => (
+              <motion.div
                 key={item.id}
+                variants={navItemVariants}
+                custom={idx}
                 className={`nv ${current === item.id ? "active" : ""}`}
                 onClick={() => router.push(`/${item.id}`)}
+                whileHover={{ x: 3 }}
+                whileTap={{ scale: 0.98 }}
               >
                 <span className="nv-ico"><item.Icon /></span>
                 <span className="nv-lbl">{item.label}</span>
@@ -108,18 +119,23 @@ export default function SideBar() {
                     {item.badge}
                   </span>
                 )}
-              </div>
+              </motion.div>
             ))}
-          </div>
+          </motion.div>
         ))}
       </div>
 
       {/* Cluster status footer */}
-      <div style={{
-        padding: "10px 12px",
-        borderTop: "1px solid rgba(0,212,255,.08)",
-        display: "flex", flexDirection: "column", gap: 4,
-      }}>
+      <motion.div
+        initial={{ opacity: 0, y: 10 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: 0.4, ...spring }}
+        style={{
+          padding: "10px 12px",
+          borderTop: "1px solid rgba(0,212,255,.08)",
+          display: "flex", flexDirection: "column", gap: 4,
+        }}
+      >
         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
           <span className="leader-dot" />
           <span style={{ fontSize: 10, fontFamily: "'JetBrains Mono',monospace", color: "var(--text2)", fontWeight: 600 }}>
@@ -129,7 +145,7 @@ export default function SideBar() {
         <div style={{ fontSize: 9, fontFamily: "'JetBrains Mono',monospace", color: "var(--text3)", letterSpacing: ".4px" }}>
           Raft: LEADER · 3 nodes · v3.1.0
         </div>
-      </div>
-    </nav>
+      </motion.div>
+    </motion.nav>
   );
 }

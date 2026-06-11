@@ -1,0 +1,32 @@
+[Unit]
+Description=Sentinel WAF — Data Plane Proxy
+Documentation=https://github.com/your-org/sentinel-waf
+After=network-online.target sentinel-controlplane.service
+Wants=network-online.target sentinel-controlplane.service
+
+[Service]
+Type=notify
+User=sentinel
+Group=sentinel
+ExecStart=/opt/sentinel/sentinel-bin
+Restart=always
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/sentinel /var/log/sentinel
+PrivateTmp=yes
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+Environment=SENTINEL_CONFIG=/etc/sentinel/sentinel.yaml
+Environment=SENTINEL_LOG_DIR=/var/log/sentinel
+Environment=RUST_LOG=info,sentinel=debug
+Environment=RUST_BACKTRACE=1
+
+# Bind to privileged ports (80/443) without root via ambient capabilities
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

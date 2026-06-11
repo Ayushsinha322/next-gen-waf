@@ -193,14 +193,31 @@ export const api = {
 
   sites: {
     list: () => apiFetch<{ sites: Site[]; tenant_id: string }>("/sites"),
+    get:  (id: string) => apiFetch<{ site: Site }>(`/sites/${id}`),
     create: (body: { name: string; domains: string[]; upstream?: object; waf_policy?: object }) =>
       apiFetch<{ site: Site }>("/sites", { method: "POST", body: JSON.stringify(body) }),
+    update: (id: string, body: { name?: string; domains?: string[]; upstream?: object; waf_policy?: object }) =>
+      apiFetch<{ site: Site }>(`/sites/${id}`, { method: "PUT", body: JSON.stringify(body) }),
     delete: (id: string) =>
       apiFetch<{ ok: boolean }>(`/sites/${id}`, { method: "DELETE" }),
     updateStatus: (id: string, status: "active" | "paused") =>
       apiFetch<{ ok: boolean; status: string }>(`/sites/${id}/status`, {
         method: "PATCH", body: JSON.stringify({ status }),
       }),
+    /** Returns the full site catalogue as a YAML string (Config-as-Code). */
+    exportYaml: async (): Promise<string> => {
+      const token = getToken();
+      const res = await fetch(`${BASE}/sites/export`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (!res.ok) throw new Error(`export failed: ${res.status}`);
+      return res.text();
+    },
+    /** Upserts sites from a YAML document (Config-as-Code). */
+    importYaml: (yaml: string) =>
+      apiFetch<{ ok: boolean; created: number; updated: number; total: number }>(
+        "/sites/import", { method: "POST", body: JSON.stringify({ yaml }) }
+      ),
   },
 
   rules: {
@@ -256,6 +273,11 @@ export const api = {
 
   audit: {
     list: () => apiFetch<{ entries: AuditEntry[]; tenant_id: string }>("/audit"),
+  },
+
+  waf: {
+    status: () =>
+      apiFetch<{ waf_running: boolean; uptime_secs?: number; sites?: number; listeners?: string[]; upstreams_healthy?: number; upstreams_total?: number; error?: string }>("/waf/status"),
   },
 
   metrics: {

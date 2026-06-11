@@ -696,6 +696,7 @@ fn cmd_site_add(
                 host: h,
                 port: p,
                 weight: 1,
+                tls: false,
             })
         })
         .collect::<Result<_>>()?;
@@ -750,6 +751,10 @@ fn cmd_site_add(
             anti_ddos: None,
             geoip: None,
             plugins: vec![],
+            rule_exclusions: vec![],
+            max_body_size: 10 * 1024 * 1024,
+            max_uri_length: 8192,
+            max_header_count: 100,
         },
         plugins: vec![],
     };

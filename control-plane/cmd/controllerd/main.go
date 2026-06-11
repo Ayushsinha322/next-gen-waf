@@ -144,6 +144,8 @@ func run() error {
 	{
 		protected.GET("/dashboard/stats", func(c *gin.Context) { handleDashboardStats(c, enforcer, store) })
 		protected.GET("/sites", func(c *gin.Context) { handleListSites(c, enforcer, store) })
+		protected.GET("/sites/export", func(c *gin.Context) { handleExportSites(c, enforcer, store) })
+		protected.POST("/sites/import", func(c *gin.Context) { handleImportSites(c, enforcer, store, hub, cl) })
 		protected.POST("/sites", func(c *gin.Context) { handleCreateSite(c, enforcer, store, hub, cl) })
 		protected.GET("/sites/:id", func(c *gin.Context) { handleGetSite(c, enforcer, store) })
 		protected.PUT("/sites/:id", func(c *gin.Context) { handleUpdateSite(c, enforcer, store, hub, cl) })
@@ -164,6 +166,7 @@ func run() error {
 		protected.GET("/metrics/snapshot", func(c *gin.Context) { handleMetricsSnapshot(c, hub) })
 		protected.GET("/audit", func(c *gin.Context) { handleListAudit(c, enforcer, store) })
 		protected.GET("/cluster/status", func(c *gin.Context) { handleClusterStatus(c, cl) })
+		protected.GET("/waf/status", func(c *gin.Context) { handleProxyHealth(c) })
 	}
 
 	// SSE endpoint lives outside the protected group so the ?token= query-param

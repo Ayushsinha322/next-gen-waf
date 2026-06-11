@@ -1,7 +1,9 @@
 "use client";
 import { useState, useEffect } from "react";
+import { motion } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
 import { api, type Alert } from "@/lib/api";
+import { staggerContainer, cardVariants, fadeUp, spring } from "@/lib/animations";
 
 export default function AlertsPage() {
   const [alerts, setAlerts]       = useState<Alert[]>([]);
@@ -72,22 +74,25 @@ export default function AlertsPage() {
   }
 
   return (
-    <div className="sec">
-      <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",gap:14}}>
+    <motion.div className="sec" variants={staggerContainer} initial="hidden" animate="visible">
+      <motion.div variants={fadeUp} style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",gap:14}}>
         <div><div className="sec-title">🔴 Security Alerts</div><div className="sec-sub">Real-time incident queue · {alerts.filter(a=>a.state==="open").length} open · DB-backed</div></div>
         <div style={{display:"flex",gap:8}}>
-          <button className="btn bg-btn btn-sm" onClick={loadAlerts}>⟳ Refresh</button>
-          <button className="btn bc btn-sm" onClick={ackAll}>✅ Ack All Open</button>
+          <motion.button className="btn bg-btn btn-sm" onClick={loadAlerts} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>⟳ Refresh</motion.button>
+          <motion.button className="btn bc btn-sm" onClick={ackAll} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>✅ Ack All Open</motion.button>
         </div>
-      </div>
+      </motion.div>
 
-      <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12}}>
+      <motion.div variants={staggerContainer} initial="hidden" animate="visible" style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12}}>
         {[{cls:"",lbl:"Critical",val:String(counts.critical),valCls:"r"},{cls:"ka",lbl:"High",val:String(counts.high),valCls:"a"},{cls:"kc",lbl:"Medium",val:String(counts.medium),valCls:"c"},{cls:"kg",lbl:"Low/Info",val:String(counts.low),valCls:"g"}].map((k,i)=>(
-          <div key={i} className={`kpi ${k.cls}`}><div className="kpi-lbl">{k.lbl}</div><div className={`kpi-val ${k.valCls}`}>{k.val}</div></div>
+          <motion.div key={i} className={`kpi ${k.cls}`} variants={cardVariants}>
+            <div className="kpi-lbl">{k.lbl}</div>
+            <div className={`kpi-val ${k.valCls}`}>{k.val}</div>
+          </motion.div>
         ))}
-      </div>
+      </motion.div>
 
-      <div className="panel">
+      <motion.div className="panel" variants={fadeUp}>
         <div className="ph">
           <div className="ptitle">🔴 Alert Queue ({filtered.length})</div>
           <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
@@ -105,29 +110,29 @@ export default function AlertsPage() {
             <table>
               <thead><tr><th>Severity</th><th>Time</th><th>Kind</th><th>Summary</th><th>State</th><th>Actions</th></tr></thead>
               <tbody>
-                {filtered.map(a => {
+                {filtered.map((a, idx) => {
                   const det = a.details as Record<string, unknown>;
                   return (
-                    <tr key={a.id} className={`sev-${a.severity[0].toLowerCase()}`}>
+                    <motion.tr key={a.id} className={`sev-${a.severity[0].toLowerCase()}`} initial={{ opacity: 0, x: -8 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: idx * 0.015 }}>
                       <td>{sevBadge(a.severity)}</td>
                       <td className="td3">{new Date(a.created_at).toLocaleTimeString()}</td>
                       <td><span className="bdg bcy"><span className="bdr" />{a.kind}</span></td>
                       <td style={{maxWidth:260,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{a.summary}</td>
                       <td><span className={`bdg ${a.state==="open"?"br":a.state==="acked"?"ba":a.state==="resolved"?"bgg":"bgr"}`}>{a.state.toUpperCase()}</span></td>
                       <td><div style={{display:"flex",gap:4}}>
-                        {det?.ip && <button className="btn bgn btn-xs" onClick={() => showToast(`${det.ip} flagged`,"s","🛡️")}>Block IP</button>}
-                        {a.state === "open" && <button className="btn bg-btn btn-xs" onClick={() => ackAlert(a.id)}>✓ Ack</button>}
-                        {a.state !== "resolved" && <button className="btn bg-btn btn-xs" onClick={() => resolveAlert(a.id)}>✓ Close</button>}
+                        {det?.ip && <motion.button className="btn bgn btn-xs" whileHover={{ scale: 1.06 }} whileTap={{ scale: 0.95 }} onClick={() => showToast(`${det.ip} flagged`,"s","🛡️")}>Block IP</motion.button>}
+                        {a.state === "open" && <motion.button className="btn bg-btn btn-xs" whileHover={{ scale: 1.06 }} whileTap={{ scale: 0.95 }} onClick={() => ackAlert(a.id)}>✓ Ack</motion.button>}
+                        {a.state !== "resolved" && <motion.button className="btn bg-btn btn-xs" whileHover={{ scale: 1.06 }} whileTap={{ scale: 0.95 }} onClick={() => resolveAlert(a.id)}>✓ Close</motion.button>}
                         <button className="btn bc btn-xs" onClick={() => showToast("Analysing with AI...","i","🤖")}>🤖</button>
                       </div></td>
-                    </tr>
+                    </motion.tr>
                   );
                 })}
               </tbody>
             </table>
           )}
         </div>
-      </div>
-    </div>
+      </motion.div>
+    </motion.div>
   );
 }

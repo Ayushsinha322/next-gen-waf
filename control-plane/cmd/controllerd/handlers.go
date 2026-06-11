@@ -479,95 +479,306 @@ func handleInternalConfig(c *gin.Context, store *db.Store) {
 	})
 }
 
-// siteRowToRustConfig converts a DB SiteRow into the JSON shape that the
-// Rust SiteConfig serde deserializer expects.
-func siteRowToRustConfig(s db.SiteRow) (map[string]any, error) {
-	// DB upstream format: {"servers":["host:port"],"lb":"round_robin"}
-	var upDB struct {
-		Servers []string `json:"servers"`
-		LB      string   `json:"lb"`
+// handleProxyHealth probes the local WAF proxy's /healthz endpoint and
+// returns a summary the dashboard can use for live status.
+func handleProxyHealth(c *gin.Context) {
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get("http://localhost:9080/healthz")
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{"waf_running": false, "error": err.Error()})
+		return
 	}
-	if err := json.Unmarshal(s.Upstream, &upDB); err != nil {
+	defer resp.Body.Close()
+
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		c.JSON(http.StatusOK, gin.H{"waf_running": true, "raw_status": "ok (unparseable)"})
+		return
+	}
+	body["waf_running"] = true
+	c.JSON(http.StatusOK, body)
+}
+
+// crsCategoryFiles maps the UI-friendly OWASP CRS category keys exposed in the
+// dashboard to the underlying .conf rule files shipped with the proxy. Keeping
+// this map here lets operators toggle protection categories per-site from the
+// UI while the data plane keeps loading concrete files.
+var crsCategoryFiles = map[string]string{
+	"method":          "rules/owasp-crs/rules/REQUEST-911-METHOD-ENFORCEMENT.conf",
+	"scanner":         "rules/owasp-crs/rules/REQUEST-913-SCANNER-DETECTION.conf",
+	"protocol":        "rules/owasp-crs/rules/REQUEST-920-PROTOCOL-ENFORCEMENT.conf",
+	"protocol_attack": "rules/owasp-crs/rules/REQUEST-921-PROTOCOL-ATTACK.conf",
+	"lfi":             "rules/owasp-crs/rules/REQUEST-930-APPLICATION-ATTACK-LFI.conf",
+	"rfi":             "rules/owasp-crs/rules/REQUEST-931-APPLICATION-ATTACK-RFI.conf",
+	"rce":             "rules/owasp-crs/rules/REQUEST-932-APPLICATION-ATTACK-RCE.conf",
+	"php":             "rules/owasp-crs/rules/REQUEST-933-APPLICATION-ATTACK-PHP.conf",
+	"generic":         "rules/owasp-crs/rules/REQUEST-934-APPLICATION-ATTACK-GENERIC.conf",
+	"xss":             "rules/owasp-crs/rules/REQUEST-941-APPLICATION-ATTACK-XSS.conf",
+	"sqli":            "rules/owasp-crs/rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
+	"session":         "rules/owasp-crs/rules/REQUEST-943-APPLICATION-ATTACK-SESSION-FIXATION.conf",
+	"java":            "rules/owasp-crs/rules/REQUEST-944-APPLICATION-ATTACK-JAVA.conf",
+}
+
+// crsCategoryOrder is the canonical load order for the categories above.
+var crsCategoryOrder = []string{
+	"method", "scanner", "protocol", "protocol_attack", "lfi", "rfi", "rce",
+	"php", "generic", "xss", "sqli", "session", "java",
+}
+
+// crsFilesForCategories returns the concrete .conf files for a set of UI
+// category keys, preserving canonical load order. An empty/nil selection means
+// "all categories" so existing sites keep full protection.
+func crsFilesForCategories(cats []string) []string {
+	if len(cats) == 0 {
+		files := make([]string, 0, len(crsCategoryOrder))
+		for _, k := range crsCategoryOrder {
+			files = append(files, crsCategoryFiles[k])
+		}
+		return files
+	}
+	want := make(map[string]bool, len(cats))
+	for _, c := range cats {
+		want[c] = true
+	}
+	files := make([]string, 0, len(cats))
+	for _, k := range crsCategoryOrder {
+		if want[k] {
+			files = append(files, crsCategoryFiles[k])
+		}
+	}
+	return files
+}
+
+// siteRowToRustConfig converts a DB SiteRow into the JSON shape that the Rust
+// SiteConfig serde deserializer expects. It is backward compatible with the
+// legacy minimal blobs while passing through the full rich configuration that
+// the dashboard now lets operators set per-site (multi-server upstreams with
+// weights + per-server TLS, health checks, rate limiting, bot detection,
+// anti-DDoS, GeoIP, ML, IP reputation, request limits and rule exclusions).
+func siteRowToRustConfig(s db.SiteRow) (map[string]any, error) {
+	upstream, err := buildRustUpstream(s.Upstream)
+	if err != nil {
 		return nil, err
 	}
-	rustServers := make([]map[string]any, 0, len(upDB.Servers))
-	for _, addr := range upDB.Servers {
-		host, portStr, err := net.SplitHostPort(addr)
-		if err != nil {
-			host, portStr = addr, "80"
-		}
-		port, _ := strconv.Atoi(portStr)
-		if port == 0 {
-			port = 80
-		}
-		rustServers = append(rustServers, map[string]any{
-			"host": host, "port": port, "weight": 1,
-		})
+	waf, err := buildRustWaf(s.WafPolicy)
+	if err != nil {
+		return nil, err
 	}
-	lb := upDB.LB
+	return map[string]any{
+		"id":       s.Name, // proxy matches by site ID — use name (e.g., "dvwa.local")
+		"domains":  s.Domains,
+		"upstream": upstream,
+		"waf":      waf,
+		"plugins":  []any{},
+	}, nil
+}
+
+// buildRustUpstream accepts both the legacy shape
+//
+//	{"servers":["host:port"],"lb":"round_robin"}
+//
+// and the rich shape
+//
+//	{"load_balancer":"least_conn",
+//	 "servers":[{"host":"h","port":8080,"weight":2,"tls":true}],
+//	 "health_check":{"path":"/","interval":"10s","timeout":"3s"}}
+func buildRustUpstream(raw json.RawMessage) (map[string]any, error) {
+	var generic struct {
+		Servers      json.RawMessage `json:"servers"`
+		LB           string          `json:"lb"`
+		LoadBalancer string          `json:"load_balancer"`
+		HealthCheck  json.RawMessage `json:"health_check"`
+	}
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &generic); err != nil {
+			return nil, err
+		}
+	}
+
+	lb := generic.LoadBalancer
+	if lb == "" {
+		lb = generic.LB
+	}
 	if lb == "" {
 		lb = "round_robin"
 	}
 
-	// DB waf_policy format: {"mode":"blocking","paranoia_level":2,"anomaly_threshold":5}
-	var wafDB struct {
-		Mode             string `json:"mode"`
-		ParanoiaLevel    int    `json:"paranoia_level"`
-		AnomalyThreshold int    `json:"anomaly_threshold"`
-	}
-	if err := json.Unmarshal(s.WafPolicy, &wafDB); err != nil {
-		return nil, err
-	}
-	if wafDB.Mode == "" {
-		wafDB.Mode = "blocking"
-	}
-	if wafDB.ParanoiaLevel == 0 {
-		wafDB.ParanoiaLevel = 2
-	}
-	if wafDB.AnomalyThreshold == 0 {
-		wafDB.AnomalyThreshold = 5
-	}
-
-	// Inject the full OWASP CRS rule set for any non-off site so that
-	// dynamically-deployed sites receive WAF protection immediately.
-	// The paths are relative to the proxy's working directory.
-	var rules []string
-	if wafDB.Mode != "off" {
-		rules = []string{
-			"rules/owasp-crs/rules/REQUEST-911-METHOD-ENFORCEMENT.conf",
-			"rules/owasp-crs/rules/REQUEST-913-SCANNER-DETECTION.conf",
-			"rules/owasp-crs/rules/REQUEST-920-PROTOCOL-ENFORCEMENT.conf",
-			"rules/owasp-crs/rules/REQUEST-921-PROTOCOL-ATTACK.conf",
-			"rules/owasp-crs/rules/REQUEST-930-APPLICATION-ATTACK-LFI.conf",
-			"rules/owasp-crs/rules/REQUEST-931-APPLICATION-ATTACK-RFI.conf",
-			"rules/owasp-crs/rules/REQUEST-932-APPLICATION-ATTACK-RCE.conf",
-			"rules/owasp-crs/rules/REQUEST-933-APPLICATION-ATTACK-PHP.conf",
-			"rules/owasp-crs/rules/REQUEST-934-APPLICATION-ATTACK-GENERIC.conf",
-			"rules/owasp-crs/rules/REQUEST-941-APPLICATION-ATTACK-XSS.conf",
-			"rules/owasp-crs/rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
-			"rules/owasp-crs/rules/REQUEST-943-APPLICATION-ATTACK-SESSION-FIXATION.conf",
-			"rules/owasp-crs/rules/REQUEST-944-APPLICATION-ATTACK-JAVA.conf",
+	rustServers := make([]map[string]any, 0)
+	if len(generic.Servers) > 0 {
+		// Try object form first: [{host,port,weight,tls}]
+		var objs []struct {
+			Host   string `json:"host"`
+			Port   int    `json:"port"`
+			Weight int    `json:"weight"`
+			TLS    bool   `json:"tls"`
+		}
+		if err := json.Unmarshal(generic.Servers, &objs); err == nil && len(objs) > 0 && objs[0].Host != "" {
+			for _, o := range objs {
+				port := o.Port
+				if port == 0 {
+					port = 80
+				}
+				weight := o.Weight
+				if weight == 0 {
+					weight = 1
+				}
+				rustServers = append(rustServers, map[string]any{
+					"host": o.Host, "port": port, "weight": weight, "tls": o.TLS,
+				})
+			}
+		} else {
+			// Fall back to string form: ["host:port"]
+			var strs []string
+			if err := json.Unmarshal(generic.Servers, &strs); err != nil {
+				return nil, err
+			}
+			for _, addr := range strs {
+				host, portStr, err := net.SplitHostPort(addr)
+				if err != nil {
+					host, portStr = addr, "80"
+				}
+				port, _ := strconv.Atoi(portStr)
+				if port == 0 {
+					port = 80
+				}
+				rustServers = append(rustServers, map[string]any{
+					"host": host, "port": port, "weight": 1, "tls": false,
+				})
+			}
 		}
 	}
 
-	return map[string]any{
-		"id":      s.Name, // proxy matches by site ID — use name (e.g., "dvwa.local")
-		"domains": s.Domains,
-		"upstream": map[string]any{
-			"load_balancer": lb,
-			"servers":       rustServers,
-		},
-		"waf": map[string]any{
-			"mode":              wafDB.Mode,
-			"paranoia_level":    wafDB.ParanoiaLevel,
-			"anomaly_threshold": wafDB.AnomalyThreshold,
-			"rules":             rules,
-			"rule_exclusions": []map[string]any{
-				{"rule_id": 932236, "exclude_targets": []string{"ARGS_NAMES"}},
-			},
-		},
-		"plugins": []any{},
-	}, nil
+	upstream := map[string]any{
+		"load_balancer": lb,
+		"servers":       rustServers,
+	}
+
+	if len(generic.HealthCheck) > 0 {
+		var hc map[string]any
+		if err := json.Unmarshal(generic.HealthCheck, &hc); err == nil && len(hc) > 0 {
+			upstream["health_check"] = hc
+		}
+	}
+	return upstream, nil
+}
+
+// buildRustWaf accepts the legacy minimal blob and the rich dashboard blob and
+// produces the Rust WafConfig JSON. Unknown/empty sections are omitted so the
+// Rust defaults apply.
+func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
+	var p struct {
+		Mode             string          `json:"mode"`
+		ParanoiaLevel    int             `json:"paranoia_level"`
+		AnomalyThreshold int             `json:"anomaly_threshold"`
+		RuleCategories   []string        `json:"rule_categories"`
+		RuleExclusions   json.RawMessage `json:"rule_exclusions"`
+		RateLimit        json.RawMessage `json:"rate_limit"`
+		BotDetection     json.RawMessage `json:"bot_detection"`
+		AntiDdos         json.RawMessage `json:"anti_ddos"`
+		GeoIP            json.RawMessage `json:"geoip"`
+		ML               json.RawMessage `json:"ml"`
+		IPReputation     json.RawMessage `json:"ip_reputation"`
+		MaxBodySize      *uint64         `json:"max_body_size"`
+		MaxURILength     *uint32         `json:"max_uri_length"`
+		MaxHeaderCount   *uint32         `json:"max_header_count"`
+		APIDiscovery     bool            `json:"api_discovery"`
+	}
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, err
+		}
+	}
+
+	if p.Mode == "" {
+		p.Mode = "blocking"
+	}
+	if p.ParanoiaLevel == 0 {
+		p.ParanoiaLevel = 2
+	}
+	if p.AnomalyThreshold == 0 {
+		p.AnomalyThreshold = 5
+	}
+
+	var rules []string
+	if p.Mode != "off" {
+		rules = crsFilesForCategories(p.RuleCategories)
+	}
+
+	waf := map[string]any{
+		"mode":              p.Mode,
+		"paranoia_level":    p.ParanoiaLevel,
+		"anomaly_threshold": p.AnomalyThreshold,
+		"rules":             rules,
+		"api_discovery":     p.APIDiscovery,
+	}
+
+	// Rule exclusions — default to the well-known DVWA "id" suppression when
+	// the operator hasn't specified their own, preserving prior behaviour.
+	if len(p.RuleExclusions) > 0 {
+		var ex []map[string]any
+		if err := json.Unmarshal(p.RuleExclusions, &ex); err == nil {
+			waf["rule_exclusions"] = ex
+		}
+	} else {
+		waf["rule_exclusions"] = []map[string]any{
+			{"rule_id": 932236, "exclude_targets": []string{"ARGS_NAMES"}},
+		}
+	}
+
+	attachRawObject(waf, "rate_limit", p.RateLimit)
+	attachRawObject(waf, "bot_detection", p.BotDetection)
+	attachRawObject(waf, "ml", p.ML)
+	attachRawObject(waf, "ip_reputation", p.IPReputation)
+
+	// anti_ddos — only attach when explicitly enabled.
+	if len(p.AntiDdos) > 0 {
+		var ad map[string]any
+		if err := json.Unmarshal(p.AntiDdos, &ad); err == nil {
+			if enabled, _ := ad["enabled"].(bool); enabled {
+				waf["anti_ddos"] = ad
+			}
+		}
+	}
+
+	// geoip — Rust requires db_path; inject a default and only attach when the
+	// operator selected at least one country to allow/block.
+	if len(p.GeoIP) > 0 {
+		var g map[string]any
+		if err := json.Unmarshal(p.GeoIP, &g); err == nil {
+			block, _ := g["block_countries"].([]any)
+			allow, _ := g["allow_countries"].([]any)
+			if len(block) > 0 || len(allow) > 0 {
+				if _, ok := g["db_path"]; !ok || g["db_path"] == "" {
+					g["db_path"] = osGetenv("SENTINEL_GEOIP_DB", "rules/GeoLite2-Country.mmdb")
+				}
+				waf["geoip"] = g
+			}
+		}
+	}
+
+	if p.MaxBodySize != nil {
+		waf["max_body_size"] = *p.MaxBodySize
+	}
+	if p.MaxURILength != nil {
+		waf["max_uri_length"] = *p.MaxURILength
+	}
+	if p.MaxHeaderCount != nil {
+		waf["max_header_count"] = *p.MaxHeaderCount
+	}
+
+	return waf, nil
+}
+
+// attachRawObject decodes a raw JSON object and attaches it under key when
+// non-empty. Invalid/empty sections are silently skipped.
+func attachRawObject(dst map[string]any, key string, raw json.RawMessage) {
+	if len(raw) == 0 {
+		return
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err == nil && len(obj) > 0 {
+		dst[key] = obj
+	}
 }
 
 // ---------------------------------------------------------------------------

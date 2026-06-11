@@ -1,7 +1,9 @@
 "use client";
 import { useState, useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
+import { motion } from "framer-motion";
 import { login, clearSessionCookie } from "@/lib/auth";
+import { spring } from "@/lib/animations";
 
 type AuthTab  = "std" | "sso" | "api";
 type BtnState = "idle" | "loading" | "success";
@@ -94,7 +96,6 @@ export default function LoginPage() {
       cx.fillRect(0, 0, c.width, c.height);
       t++;
 
-      // Grid dots
       for (let x = 0; x < c.width; x += 50) {
         for (let y = 0; y < c.height; y += 50) {
           cx.beginPath(); cx.arc(x, y, 1, 0, Math.PI * 2);
@@ -102,7 +103,6 @@ export default function LoginPage() {
         }
       }
 
-      // Move + draw nodes with connections
       nodes.forEach(n => {
         n.x += n.vx; n.y += n.vy;
         if (n.x < 0 || n.x > c!.width)  n.vx *= -1;
@@ -123,7 +123,6 @@ export default function LoginPage() {
         cx!.fillStyle = `rgba(96,165,250,${p})`; cx!.fill();
       });
 
-      // Data streams
       cx.font = "9px 'JetBrains Mono',monospace";
       for (let idx = streams.length - 1; idx >= 0; idx--) {
         const s = streams[idx];
@@ -138,7 +137,6 @@ export default function LoginPage() {
         if (s.y > c!.height + s.len * 11) streams.splice(idx, 1);
       }
 
-      // Radar (bottom-left)
       const ra = (t * 0.008) % (Math.PI * 2);
       cx.save(); cx.translate(70, c.height - 70);
       cx.beginPath(); cx.moveTo(0, 0); cx.arc(0, 0, 55, ra - 0.5, ra); cx.closePath();
@@ -197,49 +195,52 @@ export default function LoginPage() {
       setTimeout(() => router.push("/overview"), 900);
     } catch (err: unknown) {
       setBtnState("idle");
-      clearSessionCookie(); // ensure no stale cookie survives a failed login
+      clearSessionCookie();
       setLoginError(err instanceof Error ? err.message : "Login failed");
     }
   }
 
   return (
-    <div id="LR">
-
+    <motion.div
+      id="LR"
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      transition={{ duration: 0.5 }}
+    >
       {/* ══ LEFT PANEL ══════════════════════════════════════════════════════ */}
       <div id="LP" ref={lpRef}>
         <canvas id="LC" ref={canvasRef} />
 
-        {/* Scanline */}
         <div ref={scanlineRef} style={{
           position: "absolute", left: 0, width: "100%", height: 1,
           background: "rgba(59,130,246,0.12)", zIndex: 1, pointerEvents: "none",
         }} />
 
         <div id="LP-content">
-          {/* Shield logo */}
-          <div id="shield">
-            <div id="shield-icon">
+          <motion.div id="shield" initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.2, ...spring }}>
+            <motion.div id="shield-icon" animate={{ boxShadow: ["0 0 12px rgba(59,130,246,.3)", "0 0 24px rgba(59,130,246,.5)", "0 0 12px rgba(59,130,246,.3)"] }} transition={{ duration: 3, repeat: Infinity }}>
               <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
                 <path d="M12 2L3 6.5V12c0 5.5 3.8 10.7 9 12 5.2-1.3 9-6.5 9-12V6.5L12 2z"
                   stroke="#3b82f6" strokeWidth="1.5" fill="rgba(59,130,246,0.1)" />
                 <path d="M8.5 12l2.5 2.5 4.5-4.5"
                   stroke="#60a5fa" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
               </svg>
-            </div>
+            </motion.div>
             <div>
               <div id="brand-text">Sentinel WAF</div>
               <div id="brand-sub">Enterprise Security Platform</div>
             </div>
-          </div>
+          </motion.div>
 
-          <div id="hero-title">Protect every<br />request. <span>Instantly.</span></div>
-          <div id="hero-desc">
+          <motion.div id="hero-title" initial={{ opacity: 0, x: -20 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: 0.35, ...spring }}>
+            Protect every<br />request. <span>Instantly.</span>
+          </motion.div>
+          <motion.div id="hero-desc" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.45, duration: 0.4 }}>
             Next-generation Web Application Firewall with AI-powered threat detection,
             eBPF kernel-level DDoS mitigation, and sub-millisecond latency.
-          </div>
+          </motion.div>
 
-          {/* Stats */}
-          <div id="stats">
+          <motion.div id="stats" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.55, ...spring }}>
             <div className="stat-item">
               <div className="sv green">&lt;1ms</div>
               <div className="sl">p99 latency</div>
@@ -252,15 +253,14 @@ export default function LoginPage() {
               <div className="sv" style={{ color: "#a78bfa" }}>99.9%</div>
               <div className="sl">DDoS mitigation</div>
             </div>
-          </div>
+          </motion.div>
 
-          {/* Feature pills */}
-          <div id="feats">
+          <motion.div id="feats" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.65 }}>
             {["eBPF / XDP","OWASP CRS v4","WASM Plugins","LLM Copilot",
               "Post-Quantum TLS","Raft HA","GraphQL FW","Outbound DLP"].map(f => (
               <div key={f} className="feat-pill">{f}</div>
             ))}
-          </div>
+          </motion.div>
         </div>
 
         <div id="LP-bottom">
@@ -272,15 +272,25 @@ export default function LoginPage() {
       </div>
 
       {/* ══ THREAT FEED BADGE ═══════════════════════════════════════════════ */}
-      <div id="threat-feed">
+      <motion.div
+        id="threat-feed"
+        key={threatLabel}
+        initial={{ opacity: 0, y: -8 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.25 }}
+      >
         <div className="tf-dot" />
         <div id="tf-text">{threatLabel}</div>
-      </div>
+      </motion.div>
 
       {/* ══ RIGHT PANEL ═════════════════════════════════════════════════════ */}
       <div id="RP">
-        <div id="form-box">
-
+        <motion.div
+          id="form-box"
+          initial={{ opacity: 0, x: 30, scale: 0.96 }}
+          animate={{ opacity: 1, x: 0, scale: 1 }}
+          transition={{ delay: 0.15, ...spring }}
+        >
           <div id="form-header">
             <div id="form-title">Welcome back</div>
             <div id="form-sub">Sign in to your Sentinel dashboard</div>
@@ -344,19 +354,25 @@ export default function LoginPage() {
           </div>
 
           {/* Error */}
-          {loginError && <div className="login-error">⚠ {loginError}</div>}
+          {loginError && (
+            <motion.div className="login-error" initial={{ opacity: 0, y: -4 }} animate={{ opacity: 1, y: 0 }}>
+              ⚠ {loginError}
+            </motion.div>
+          )}
 
           {/* Submit */}
-          <button
+          <motion.button
             id="sub-btn"
             className={btnState === "loading" ? "loading" : btnState === "success" ? "success" : ""}
             onClick={doLogin}
             disabled={btnState !== "idle"}
+            whileHover={btnState === "idle" ? { scale: 1.02, y: -1 } : {}}
+            whileTap={btnState === "idle" ? { scale: 0.98 } : {}}
           >
             {btnState === "idle"    && "🔐 Sign in to Sentinel"}
             {btnState === "loading" && <><span className="btn-spin" /> Authenticating...</>}
             {btnState === "success" && "✓ Access granted"}
-          </button>
+          </motion.button>
 
           {/* Divider */}
           <div className="div-row">
@@ -366,23 +382,21 @@ export default function LoginPage() {
           </div>
 
           {/* SAML / LDAP */}
-          <button id="sso-btn" onClick={doLogin}>
+          <motion.button id="sso-btn" onClick={doLogin} whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.98 }}>
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
               <circle cx="12" cy="12" r="10" stroke="#94a3b8" strokeWidth="1.5" />
               <path d="M2 12h20M12 2a15.3 15.3 0 010 20M12 2a15.3 15.3 0 000 20"
                 stroke="#94a3b8" strokeWidth="1.5" fill="none" />
             </svg>
             Sign in with SAML / LDAP
-          </button>
+          </motion.button>
 
           <div id="form-footer">
             Protected by Sentinel WAF · AES-256 encrypted<br />
             All authentication attempts are logged and audited
           </div>
-
-        </div>
+        </motion.div>
       </div>
-
-    </div>
+    </motion.div>
   );
 }

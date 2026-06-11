@@ -1,7 +1,9 @@
 "use client";
 import { useState, useEffect, useRef, useCallback } from "react";
+import { motion } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
 import { api, type TrafficBucket, type MetricsSnapshot } from "@/lib/api";
+import { staggerContainer, cardVariants, fadeUp, spring } from "@/lib/animations";
 
 interface AccessRow {
   ts:      string;
@@ -149,8 +151,8 @@ export default function TrafficPage() {
   const siteList = Array.from(liveSites.current);
 
   return (
-    <div className="sec">
-      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 14 }}>
+    <motion.div className="sec" variants={staggerContainer} initial="hidden" animate="visible">
+      <motion.div variants={fadeUp} style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 14 }}>
         <div>
           <div className="sec-title">📊 Traffic Analysis</div>
           <div className="sec-sub">Live request stream · real-time anomaly scoring · source IP analysis</div>
@@ -160,27 +162,27 @@ export default function TrafficPage() {
             <option>All Sites</option>
             {siteList.map(s => <option key={s}>{s}</option>)}
           </select>
-          <button className="btn bp btn-sm" onClick={() => showToast("Export coming in Phase 5", "i", "📤")}>📤 Export</button>
+          <motion.button className="btn bp btn-sm" whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }} onClick={() => showToast("Export coming in Phase 5", "i", "📤")}>📤 Export</motion.button>
         </div>
-      </div>
+      </motion.div>
 
       {/* KPIs */}
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(4,minmax(0,1fr))", gap: 12 }}>
+      <motion.div variants={staggerContainer} initial="hidden" animate="visible" style={{ display: "grid", gridTemplateColumns: "repeat(4,minmax(0,1fr))", gap: 12 }}>
         {([
           { label: "Req / sec",      val: metrics ? metrics.rps.toFixed(1)                    : "—", cls: "blue" },
           { label: "Blocked total",  val: metrics ? metrics.blocked_requests.toLocaleString() : "—", cls: "red"  },
           { label: "p99 Latency",    val: metrics ? metrics.p99_latency_ms.toFixed(1) + " ms"  : "—", cls: "green"},
           { label: "eBPF Drops",     val: metrics ? metrics.ebpf_drops.toLocaleString()        : "—", cls: "pur" },
         ] as { label: string; val: string; cls: string }[]).map(k => (
-          <div key={k.label} className={`mc ${k.cls}`}>
+          <motion.div key={k.label} className={`mc ${k.cls}`} variants={cardVariants}>
             <div className="mc-label">{k.label}</div>
             <div className="mc-val">{k.val}</div>
-          </div>
+          </motion.div>
         ))}
-      </div>
+      </motion.div>
 
       {/* Chart + Top IPs */}
-      <div style={{ display: "grid", gridTemplateColumns: "1.6fr 1fr", gap: 14 }}>
+      <motion.div variants={fadeUp} style={{ display: "grid", gridTemplateColumns: "1.6fr 1fr", gap: 14 }}>
         <div className="panel">
           <div className="ph">
             <div className="ptitle">⚡ Request rate (live)</div>
@@ -210,8 +212,8 @@ export default function TrafficPage() {
                 No traffic yet
               </div>
             ) : (
-              topIPs.map(([ip, cnt]) => (
-                <div key={ip} className="eprow" style={{ marginBottom: 7 }}>
+              topIPs.map(([ip, cnt], idx) => (
+                <motion.div key={ip} className="eprow" style={{ marginBottom: 7 }} initial={{ opacity: 0, x: -6 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: idx * 0.04 }}>
                   <span className="eppath" style={{ fontSize: 10, minWidth: 120 }}>{ip}</span>
                   <div className="epbw" style={{ flex: 1 }}>
                     <div className="pwrap">
@@ -219,15 +221,15 @@ export default function TrafficPage() {
                     </div>
                   </div>
                   <span className="epcount">{cnt}</span>
-                </div>
+                </motion.div>
               ))
             )}
           </div>
         </div>
-      </div>
+      </motion.div>
 
       {/* Live request log */}
-      <div className="panel">
+      <motion.div className="panel" variants={fadeUp}>
         <div className="ph">
           <div className="ptitle">📜 Live Request Log</div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
@@ -260,7 +262,7 @@ export default function TrafficPage() {
               </thead>
               <tbody>
                 {displayed.slice(0, 200).map((r, i) => (
-                  <tr key={i}>
+                  <motion.tr key={i} initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: Math.min(i * 0.01, 0.3) }}>
                     <td className="td3">{r.ts}</td>
                     <td className="td2">{r.site || "—"}</td>
                     <td><span className={`fm2 ${r.method.toLowerCase()}`}>{r.method}</span></td>
@@ -270,13 +272,13 @@ export default function TrafficPage() {
                     <td className="td3">{r.latency > 0 ? r.latency.toFixed(1) + " ms" : "—"}</td>
                     <td style={{ color: r.score > 5 ? "var(--red-b)" : r.score > 2 ? "var(--amber)" : "var(--text3)" }}>{r.score > 0 ? r.score : "—"}</td>
                     <td><span className={`bdg ${r.action === "BLOCKED" ? "br" : "bgr"}`}>{r.action}</span></td>
-                  </tr>
+                  </motion.tr>
                 ))}
               </tbody>
             </table>
           )}
         </div>
-      </div>
-    </div>
+      </motion.div>
+    </motion.div>
   );
 }

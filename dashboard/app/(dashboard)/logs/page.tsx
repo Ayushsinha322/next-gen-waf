@@ -1,6 +1,8 @@
 "use client";
 import { useState, useEffect, useRef, Suspense } from "react";
+import { motion } from "framer-motion";
 import { api } from "@/lib/api";
+import { spring } from "@/lib/animations";
 
 type LogKind = "access" | "waf" | "error" | "audit" | "modsec" | "ml";
 interface LogRow { _lid: number; [k: string]: unknown; }
@@ -18,7 +20,7 @@ const LOG_FILES: LogFile[] = [
 ];
 
 const MAX = 500;
-const GROUPS = [...new Set(LOG_FILES.map(f => f.group))];
+const GROUPS = Array.from(new Set(LOG_FILES.map(f => f.group)));
 
 function escHtml(s: string) {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -94,7 +96,6 @@ function LogsInner() {
   const esRef     = useRef<EventSource | null>(null);
   const ddRef     = useRef<HTMLDivElement>(null);
 
-  // SSE connection
   useEffect(() => {
     function connect() {
       const es = new EventSource(api.logs.streamURL());
@@ -115,14 +116,12 @@ function LogsInner() {
     return () => esRef.current?.close();
   }, []);
 
-  // Auto-scroll
   useEffect(() => {
     if (follow && bodyRef.current) {
       bodyRef.current.scrollTop = bodyRef.current.scrollHeight;
     }
   }, [logs, follow, kind]);
 
-  // Close dropdown on outside click
   useEffect(() => {
     function onDown(e: MouseEvent) {
       if (ddRef.current && !ddRef.current.contains(e.target as Node)) setDdOpen(false);
@@ -156,43 +155,40 @@ function LogsInner() {
 
   return (
     <div className="lgw">
-
-      {/* ── Header ─────────────────────────────────── */}
       <div className="lgw-hd">
         <div className="lgw-bc">/ <span>Operations</span> / <span>Logs</span></div>
         <div className="lgw-acts">
-          <button className="lgw-btn" onClick={copyAll}>
+          <motion.button className="lgw-btn" onClick={copyAll} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
             Copy
-          </button>
-          <button className="lgw-btn" onClick={exportLog}>
+          </motion.button>
+          <motion.button className="lgw-btn" onClick={exportLog} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
             Download
-          </button>
-          <button
+          </motion.button>
+          <motion.button
             className={`lgw-btn${follow ? " lgw-flw-on" : ""}`}
             onClick={() => setFollow(f => !f)}
+            whileHover={{ scale: 1.03 }}
+            whileTap={{ scale: 0.97 }}
           >
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M5 3l14 9-14 9V3z"/></svg>
             {follow ? "Unfollow" : "Follow"}
-          </button>
+          </motion.button>
         </div>
       </div>
 
-      {/* ── Controls: Select File + Search + Live ─── */}
       <div className="lgw-ctrl">
-
-        {/* Select File dropdown */}
         <div className="lgw-sf-wrap" ref={ddRef}>
-          <button className="lgw-sfbtn" onClick={() => setDdOpen(o => !o)}>
+          <motion.button className="lgw-sfbtn" onClick={() => setDdOpen(o => !o)} whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.98 }}>
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M13 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>
             Select File
             <span className="lgw-sf-cur">{currFile.label}</span>
             <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ marginLeft: "auto", opacity: .6 }}><path d="M6 9l6 6 6-6"/></svg>
-          </button>
+          </motion.button>
 
           {ddOpen && (
-            <div className="lgw-dd">
+            <motion.div className="lgw-dd" initial={{ opacity: 0, y: -4 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.15 }}>
               {GROUPS.map(g => (
                 <div key={g}>
                   <div className="lgw-dd-grp">{g}</div>
@@ -209,19 +205,13 @@ function LogsInner() {
                   ))}
                 </div>
               ))}
-            </div>
+            </motion.div>
           )}
         </div>
 
-        {/* Search input */}
         <div className="lgw-search">
           <svg className="lgw-sico" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
-          <input
-            className="lgw-si"
-            placeholder="Search logs… IP, rule, path, status"
-            value={search}
-            onChange={e => setSearch(e.target.value)}
-          />
+          <input className="lgw-si" placeholder="Search logs… IP, rule, path, status" value={search} onChange={e => setSearch(e.target.value)} />
           {search && (
             <button className="lgw-clr" onClick={() => setSearch("")}>
               <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
@@ -229,20 +219,18 @@ function LogsInner() {
           )}
         </div>
 
-        {/* Pause toggle */}
-        <button
+        <motion.button
           className={`lgw-btn lgw-pause${pausedRef.current ? " off" : ""}`}
           onClick={() => { pausedRef.current = !pausedRef.current; }}
+          whileHover={{ scale: 1.03 }}
+          whileTap={{ scale: 0.97 }}
         >
           <div className={`lgw-ldot${connected ? "" : " off"}`} />
           {connected ? "Live" : "Reconnecting"}
-        </button>
+        </motion.button>
       </div>
 
-      {/* ── Viewer ─────────────────────────────────── */}
       <div className="lgw-viewer">
-
-        {/* Viewer top bar */}
         <div className="lgw-vhd">
           <div className="lgw-vfn">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="rgba(0,212,255,.7)" strokeWidth="1.5"><path d="M13 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>
@@ -256,7 +244,6 @@ function LogsInner() {
           </span>
         </div>
 
-        {/* Scrollable log body */}
         <div className="lgw-body" ref={bodyRef}>
           {filtered.length === 0 ? (
             <div className="lgw-empty">
@@ -265,26 +252,30 @@ function LogsInner() {
             </div>
           ) : (
             filtered.map((r, i) => (
-              <div key={r._lid as number} className={`ll ${rowClass(kind, r)}`}>
+              <motion.div
+                key={r._lid as number}
+                className={`ll ${rowClass(kind, r)}`}
+                initial={{ opacity: 0, y: 2 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ duration: 0.12, delay: Math.min(i * 0.005, 0.15) }}
+              >
                 <div className="ll-n">{i + 1}</div>
                 <div className="ll-t" dangerouslySetInnerHTML={{ __html: hl(fmt(kind, r)) }} />
-              </div>
+              </motion.div>
             ))
           )}
         </div>
 
-        {/* Footer stats */}
         <div className="lgw-ft">
           <span className="lgw-fstat">Lines: <b>{rows.length}</b></span>
           <span className="lgw-fstat">Shown: <b>{filtered.length}</b></span>
           <span className="lgw-fstat">Threats: <b className="lgw-r">{threats}</b></span>
           <span className="lgw-fstat">Errors: <b className="lgw-a">{errors}</b></span>
           <div style={{ flex: 1 }} />
-          <button className="lgw-pg" onClick={() => { if (bodyRef.current) bodyRef.current.scrollTop = 0; }}>↑ Top</button>
-          <button className="lgw-pg" onClick={() => { if (bodyRef.current) bodyRef.current.scrollTop = bodyRef.current.scrollHeight; }}>↓ Bottom</button>
+          <motion.button className="lgw-pg" onClick={() => { if (bodyRef.current) bodyRef.current.scrollTop = 0; }} whileHover={{ color: "var(--cyan)" }}>↑ Top</motion.button>
+          <motion.button className="lgw-pg" onClick={() => { if (bodyRef.current) bodyRef.current.scrollTop = bodyRef.current.scrollHeight; }} whileHover={{ color: "var(--cyan)" }}>↓ Bottom</motion.button>
         </div>
       </div>
-
     </div>
   );
 }

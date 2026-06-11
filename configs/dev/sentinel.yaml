@@ -18,6 +18,7 @@ cluster:
   node_id: auto
   # Control-plane URL for site hot-sync. The proxy polls this every 5 s
   # and rebuilds its site list when the version changes.
+  # File-based sites serve as bootstrap only; control plane is authoritative.
   sync_url: "http://localhost:9501"
   sync_interval_secs: 5
 
@@ -36,6 +37,16 @@ listeners:
     protocol: http1
     default_site: juice.local  # matches DB site name
 
+  - name: httpbin-port
+    bind: "0.0.0.0:8081"
+    protocol: http1
+    default_site: httpbin
+
+  - name: acme-port
+    bind: "0.0.0.0:8088"
+    protocol: http1
+    default_site: acme.local
+    
 sites:
   - id: dvwa.local
     domains: ["dvwa.local", "dvwa"]
@@ -131,6 +142,64 @@ sites:
         ja4: false
         challenge: "off"
 
+  - id: httpbin
+    domains: ["httpbin.local", "httpbin"]
+    upstream:
+      load_balancer: round_robin
+      servers:
+        - { host: "127.0.0.1", port: 8080, weight: 1 }
+    waf:
+      mode: blocking
+      paranoia_level: 2
+      anomaly_threshold: 5
+      rules:
+        - "rules/owasp-crs/rules/REQUEST-911-METHOD-ENFORCEMENT.conf"
+        - "rules/owasp-crs/rules/REQUEST-913-SCANNER-DETECTION.conf"
+        - "rules/owasp-crs/rules/REQUEST-920-PROTOCOL-ENFORCEMENT.conf"
+        - "rules/owasp-crs/rules/REQUEST-921-PROTOCOL-ATTACK.conf"
+        - "rules/owasp-crs/rules/REQUEST-930-APPLICATION-ATTACK-LFI.conf"
+        - "rules/owasp-crs/rules/REQUEST-931-APPLICATION-ATTACK-RFI.conf"
+        - "rules/owasp-crs/rules/REQUEST-932-APPLICATION-ATTACK-RCE.conf"
+        - "rules/owasp-crs/rules/REQUEST-933-APPLICATION-ATTACK-PHP.conf"
+        - "rules/owasp-crs/rules/REQUEST-934-APPLICATION-ATTACK-GENERIC.conf"
+        - "rules/owasp-crs/rules/REQUEST-941-APPLICATION-ATTACK-XSS.conf"
+        - "rules/owasp-crs/rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf"
+        - "rules/owasp-crs/rules/REQUEST-943-APPLICATION-ATTACK-SESSION-FIXATION.conf"
+        - "rules/owasp-crs/rules/REQUEST-944-APPLICATION-ATTACK-JAVA.conf"
+      rule_exclusions:
+        - rule_id: 932236
+          exclude_targets: ["ARGS_NAMES"]
+  - id: acme.local
+    domains: ["acme.local", "acme"]
+    upstream:
+      load_balancer: round_robin
+      servers:
+        - { host: "127.0.0.1", port: 9999, weight: 1 }
+      health_check:
+        path: /
+        interval: 10s
+        timeout: 3s
+    waf:
+      mode: blocking
+      paranoia_level: 2
+      anomaly_threshold: 5
+      rules:
+        - "rules/owasp-crs/rules/REQUEST-911-METHOD-ENFORCEMENT.conf"
+        - "rules/owasp-crs/rules/REQUEST-913-SCANNER-DETECTION.conf"
+        - "rules/owasp-crs/rules/REQUEST-920-PROTOCOL-ENFORCEMENT.conf"
+        - "rules/owasp-crs/rules/REQUEST-921-PROTOCOL-ATTACK.conf"
+        - "rules/owasp-crs/rules/REQUEST-930-APPLICATION-ATTACK-LFI.conf"
+        - "rules/owasp-crs/rules/REQUEST-931-APPLICATION-ATTACK-RFI.conf"
+        - "rules/owasp-crs/rules/REQUEST-932-APPLICATION-ATTACK-RCE.conf"
+        - "rules/owasp-crs/rules/REQUEST-933-APPLICATION-ATTACK-PHP.conf"
+        - "rules/owasp-crs/rules/REQUEST-934-APPLICATION-ATTACK-GENERIC.conf"
+        - "rules/owasp-crs/rules/REQUEST-941-APPLICATION-ATTACK-XSS.conf"
+        - "rules/owasp-crs/rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf"
+        - "rules/owasp-crs/rules/REQUEST-943-APPLICATION-ATTACK-SESSION-FIXATION.conf"
+        - "rules/owasp-crs/rules/REQUEST-944-APPLICATION-ATTACK-JAVA.conf"
+      rule_exclusions:
+        - rule_id: 932236
+          exclude_targets: ["ARGS_NAMES"]
 logging:
   level: info
   format: json

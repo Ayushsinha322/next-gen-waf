@@ -1,0 +1,28 @@
+[Unit]
+Description=Sentinel WAF — Control Plane (REST + gRPC)
+Documentation=https://github.com/your-org/sentinel-waf
+After=network-online.target postgresql.service
+Wants=network-online.target postgresql.service
+
+[Service]
+Type=simple
+User=sentinel
+Group=sentinel
+ExecStart=/opt/sentinel/controllerd
+Restart=always
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/sentinel /var/log/sentinel /tmp/sentinel-logs
+PrivateTmp=yes
+
+Environment=SENTINEL_DB_URL=postgres://sentinel:sentinel_dev@localhost:5432/sentinel?sslmode=disable
+Environment=SENTINEL_JWT_SECRET=change-me-to-a-random-64-char-string
+Environment=SENTINEL_REST_ADDR=0.0.0.0:9501
+Environment=SENTINEL_GRPC_ADDR=0.0.0.0:9500
+
+[Install]
+WantedBy=multi-user.target

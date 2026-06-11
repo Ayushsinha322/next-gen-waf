@@ -200,12 +200,12 @@ fn compile_rule(
         skip_after: rule.skip_after.clone(),
     };
 
-    emit_condition(&rule.targets, &rule.operator, &rule.transforms, state, &mut instrs)?;
+    emit_condition(&rule.targets, &rule.operator, &rule.transforms, rule.multi_match, state, &mut instrs)?;
 
     // Chain conditions: AND-ed with the primary condition result.
     // Transforms from the parent rule also apply to chain member targets.
     for chain in &rule.chain_conditions {
-        emit_condition(&chain.targets, &chain.operator, &rule.transforms, state, &mut instrs)?;
+        emit_condition(&chain.targets, &chain.operator, &rule.transforms, rule.multi_match, state, &mut instrs)?;
         instrs.push(Instruction::And);
     }
 
@@ -231,7 +231,7 @@ fn compile_virtual_patch(
         skip_after: None,
     };
 
-    emit_condition(&vp.targets, &vp.operator, &[], state, &mut instrs)?;
+    emit_condition(&vp.targets, &vp.operator, &[], false, state, &mut instrs)?;
     instrs.push(Instruction::RuleEnd { rule_id: vp_id });
 
     Ok((instrs, meta))
@@ -249,6 +249,7 @@ fn emit_condition(
     targets: &[TargetExpr],
     operator: &Operator,
     transforms: &[Transform],
+    multi_match: bool,
     state: &mut CompilerState,
     instrs: &mut Vec<Instruction>,
 ) -> Result<()> {
@@ -291,7 +292,10 @@ fn emit_condition(
         let spec = TargetSpec::from(&tex.target);
         instrs.push(Instruction::LoadTarget(spec));
         if !transforms.is_empty() {
-            instrs.push(Instruction::ApplyTransforms(transforms.to_vec()));
+            instrs.push(Instruction::ApplyTransforms {
+                transforms: transforms.to_vec(),
+                multi_match,
+            });
         }
         emit_operator_match(operator, state, instrs)?;
 

@@ -22,9 +22,13 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 arc-swap = { workspace = true }
 dashmap = { workspace = true }
 serde_json = { workspace = true }
+regex = { workspace = true }
 chrono    = { version = "0.4", default-features = false, features = ["clock", "std"] }
+rcgen = { workspace = true }
 sentinel-core = { path = "../sentinel-core" }
 sentinel-rules = { path = "../sentinel-rules" }
 sentinel-modules = { path = "../sentinel-modules" }
 sentinel-plugins = { path = "../sentinel-plugins" }
 sentinel-ml = { path = "../sentinel-ml" }
+sentinel-telemetry = { path = "../sentinel-telemetry" }
+sentinel-ebpf = { path = "../sentinel-ebpf" }

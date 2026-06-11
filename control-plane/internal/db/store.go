@@ -240,6 +240,64 @@ func (s *Store) CreateSite(ctx context.Context, tenantID, userID string, req Cre
 	return &r, tx.Commit(ctx)
 }
 
+func (s *Store) GetSite(ctx context.Context, tenantID, siteID string) (*SiteRow, error) {
+	tx, err := s.pool.BeginTenant(ctx, tenantID, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	var r SiteRow
+	err = tx.QueryRow(ctx,
+		`SELECT id, tenant_id, name, domains, upstream, waf_policy, status, created_at, updated_at
+		 FROM sites WHERE id = $1 AND tenant_id = $2`,
+		siteID, tenantID,
+	).Scan(&r.ID, &r.TenantID, &r.Name, &r.Domains, &r.Upstream, &r.WafPolicy, &r.Status, &r.CreatedAt, &r.UpdatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("store: get site: %w", err)
+	}
+	return &r, tx.Commit(ctx)
+}
+
+// UpdateSiteRequest holds the fields that can be changed on an existing site.
+type UpdateSiteRequest struct {
+	Name      *string         `json:"name,omitempty"`
+	Domains   []string        `json:"domains,omitempty"`
+	Upstream  json.RawMessage `json:"upstream,omitempty"`
+	WafPolicy json.RawMessage `json:"waf_policy,omitempty"`
+}
+
+func (s *Store) UpdateSite(ctx context.Context, tenantID, userID, siteID string, req UpdateSiteRequest) (*SiteRow, error) {
+	tx, err := s.pool.BeginTenant(ctx, tenantID, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	var r SiteRow
+	err = tx.QueryRow(ctx,
+		`UPDATE sites
+		 SET name       = COALESCE($3, name),
+		     domains    = COALESCE($4, domains),
+		     upstream   = COALESCE($5, upstream),
+		     waf_policy = COALESCE($6, waf_policy),
+		     updated_at = now()
+		 WHERE id = $1 AND tenant_id = $2
+		 RETURNING id, tenant_id, name, domains, upstream, waf_policy, status, created_at, updated_at`,
+		siteID, tenantID, req.Name, nullableStringArray(req.Domains), nullableJSON(req.Upstream), nullableJSON(req.WafPolicy),
+	).Scan(&r.ID, &r.TenantID, &r.Name, &r.Domains, &r.Upstream, &r.WafPolicy, &r.Status, &r.CreatedAt, &r.UpdatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("store: update site: %w", err)
+	}
+	return &r, tx.Commit(ctx)
+}
+
+// nullableStringArray returns nil for empty slices.
+func nullableStringArray(s []string) interface{} {
+	if len(s) == 0 {
+		return nil
+	}
+	return s
+}
+
 func (s *Store) DeleteSite(ctx context.Context, tenantID, siteID string) error {
 	tx, err := s.pool.BeginTenant(ctx, tenantID, tenantID)
 	if err != nil {

@@ -218,6 +218,10 @@ pub struct UpstreamServer {
     pub port: u16,
     #[serde(default = "default_weight")]
     pub weight: u32,
+    /// Connect to this upstream over TLS (HTTPS).  Set to `true` when the
+    /// backend runs on HTTPS and false (default) for plain HTTP.
+    #[serde(default)]
+    pub tls: bool,
 }
 
 impl UpstreamServer {
@@ -282,6 +286,16 @@ pub struct WafConfig {
     /// Per-rule exclusions: remove specific targets from a rule to suppress false positives.
     #[serde(default)]
     pub rule_exclusions: Vec<RuleExclusion>,
+    /// Maximum request body size in bytes (0 = unlimited, default 10 MiB).
+    /// Requests with bodies exceeding this limit receive 413 Payload Too Large.
+    #[serde(default = "default_max_body_size")]
+    pub max_body_size: u64,
+    /// Maximum URI length in bytes (0 = unlimited, default 8192).
+    #[serde(default = "default_max_uri_length")]
+    pub max_uri_length: u32,
+    /// Maximum number of request headers (0 = unlimited, default 100).
+    #[serde(default = "default_max_header_count")]
+    pub max_header_count: u32,
 }
 
 /// Removes one or more targets from a rule to suppress known false positives.
@@ -292,6 +306,18 @@ pub struct RuleExclusion {
     /// Target names to exclude, e.g. `["ARGS_NAMES"]`.
     #[serde(default)]
     pub exclude_targets: Vec<String>,
+}
+
+fn default_max_body_size() -> u64 {
+    10 * 1024 * 1024  // 10 MiB
+}
+
+fn default_max_uri_length() -> u32 {
+    8192
+}
+
+fn default_max_header_count() -> u32 {
+    100
 }
 
 fn default_paranoia() -> u8 {
@@ -690,16 +716,31 @@ impl ConfigLoader {
 // Live site update — called by the control-plane polling task
 // ---------------------------------------------------------------------------
 
-/// Atomically replace the sites list in `handle` without touching listeners,
-/// logging, storage, or eBPF config. The hot-reload watcher in sentinel-proxy
-/// detects the Arc pointer change and rebuilds rule engines automatically.
-pub fn update_sites(handle: &ConfigHandle, sites: Vec<SiteConfig>) {
-    let count = sites.len();
+/// Merge sites received from the control plane into the live config.
+///
+/// DB sites are authoritative for any site they know about (same ID = full
+/// replacement).  File-based sites that the DB does *not* mention are preserved
+/// as bootstrap entries.  This avoids the "DB deletes your YAML sites" problem
+/// while still letting the UI add/update/delete sites at runtime.
+pub fn update_sites(handle: &ConfigHandle, db_sites: Vec<SiteConfig>) {
     let current = handle.load_full();
+
+    // Build a lookup of file-based sites that exist BEFORE the merge.
+    let mut file_sites: Vec<SiteConfig> = current
+        .sites
+        .iter()
+        .filter(|s| !db_sites.iter().any(|ds| ds.id == s.id))
+        .cloned()
+        .collect();
+
+    let mut merged = db_sites;
+    merged.append(&mut file_sites);
+
+    let count = merged.len();
     let mut new_cfg = (*current).clone();
-    new_cfg.sites = sites;
+    new_cfg.sites = merged;
     handle.store(Arc::new(new_cfg));
-    info!(count, "sites hot-synced from control plane");
+    info!(count, "sites merged from control plane (file + db)");
 }
 
 // ---------------------------------------------------------------------------

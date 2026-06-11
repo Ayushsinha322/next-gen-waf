@@ -1,0 +1,313 @@
+---
+# Sentinel WAF — single-VM deployment playbook
+#
+# Targets: Ubuntu 22.04 / Debian 12 (x86-64)
+# Usage:
+#   1. Edit inventory.yml with your target host IP
+#   2. ansible-playbook -i inventory.yml deploy.yml -u root
+#
+# What it does:
+#   - Installs Postgres 16, Node.js 20, build-essential
+#   - Creates `sentinel` system user
+#   - Deploys pre-built binaries (control-plane, data-plane)
+#   - Drops config files, opens firewall ports, enables systemd units
+#   - DB is seeded automatically on first start (idempotent)
+
+- name: Deploy Sentinel WAF to target host
+  hosts: all
+  become: yes
+  vars:
+    sentinel_user: sentinel
+    install_root: /opt/sentinel
+    config_root: /etc/sentinel
+    log_dir: /var/log/sentinel
+    db_url: "postgres://sentinel:sentinel_dev@localhost:5432/sentinel?sslmode=disable"
+    jwt_secret: "change-me-to-a-random-64-character-string"
+    # Set to the path of your pre-built binary (or "" to skip data-plane)
+    proxy_binary: ""
+    controlplane_binary: ""
+    dashboard_dir: ""
+
+  tasks:
+    # ------------------------------------------------------------------
+    # 1. Base packages
+    # ------------------------------------------------------------------
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install system packages
+      apt:
+        name:
+          - curl
+          - ca-certificates
+          - gnupg
+          - lsb-release
+          - ufw
+          - unzip
+        state: present
+
+    # ------------------------------------------------------------------
+    # 2. Postgres 16
+    # ------------------------------------------------------------------
+    - name: Add Postgres APT repo key
+      ansible.builtin.get_url:
+        url: https://www.postgresql.org/media/keys/ACCC4CF8.asc
+        dest: /usr/share/keyrings/postgresql.asc
+        mode: "0644"
+
+    - name: Add Postgres APT repo
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/usr/share/keyrings/postgresql.asc] http://apt.postgresql.org/pub/repos/apt {{ ansible_distribution_release }}-pgdg main"
+        state: present
+        filename: pgdg
+
+    - name: Install Postgres 16
+      apt:
+        name:
+          - postgresql-16
+          - postgresql-client-16
+        state: present
+
+    - name: Start and enable Postgres
+      systemd:
+        name: postgresql
+        state: started
+        enabled: yes
+
+    - name: Create sentinel DB and user
+      become: yes
+      become_user: postgres
+      community.postgresql.postgresql_db:
+        name: sentinel
+      ignore_errors: yes
+
+    - name: Create DB user
+      become: yes
+      become_user: postgres
+      community.postgresql.postgresql_user:
+        db: sentinel
+        name: sentinel
+        password: sentinel_dev
+        priv: ALL
+      ignore_errors: yes
+
+    # ------------------------------------------------------------------
+    # 3. Node.js 20 (for Dashboard)
+    # ------------------------------------------------------------------
+    - name: Add NodeSource GPG key
+      ansible.builtin.get_url:
+        url: https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key
+        dest: /usr/share/keyrings/nodesource.asc
+        mode: "0644"
+
+    - name: Add NodeSource repo
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/usr/share/keyrings/nodesource.asc] https://deb.nodesource.com/node_20.x {{ ansible_distribution_release }} main"
+        state: present
+        filename: nodesource
+
+    - name: Install Node.js
+      apt:
+        name: nodejs
+        state: present
+
+    # ------------------------------------------------------------------
+    # 4. sentinel system user & directories
+    # ------------------------------------------------------------------
+    - name: Create sentinel system user
+      user:
+        name: "{{ sentinel_user }}"
+        system: yes
+        shell: /usr/sbin/nologin
+        create_home: no
+
+    - name: Create directory layout
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ sentinel_user }}"
+        group: "{{ sentinel_user }}"
+        mode: "0755"
+      loop:
+        - "{{ install_root }}"
+        - "{{ config_root }}"
+        - "{{ log_dir }}"
+        - "{{ install_root }}/rules"
+
+    # ------------------------------------------------------------------
+    # 5. Deploy binaries + config
+    # ------------------------------------------------------------------
+    - name: Copy control-plane binary
+      copy:
+        src: "{{ controlplane_binary }}"
+        dest: "{{ install_root }}/controllerd"
+        owner: "{{ sentinel_user }}"
+        group: "{{ sentinel_user }}"
+        mode: "0755"
+      when: controlplane_binary != ""
+
+    - name: Copy data-plane binary
+      copy:
+        src: "{{ proxy_binary }}"
+        dest: "{{ install_root }}/sentinel-bin"
+        owner: "{{ sentinel_user }}"
+        group: "{{ sentinel_user }}"
+        mode: "0755"
+      when: proxy_binary != ""
+
+    - name: Copy OWASP CRS rules
+      copy:
+        src: "{{ playbook_dir }}/../rules/owasp-crs/"
+        dest: "{{ install_root }}/rules/owasp-crs/"
+        owner: "{{ sentinel_user }}"
+        group: "{{ sentinel_user }}"
+        mode: "0644"
+
+    - name: Drop sentinel.yaml config
+      copy:
+        content: |
+          cluster:
+            name: sentinel-prod
+            node_id: auto
+            sync_url: "http://localhost:9501"
+            sync_interval_secs: 5
+
+          listeners:
+            - name: https
+              bind: "0.0.0.0:443"
+              protocol: http1
+
+          sites: []
+
+          logging:
+            level: info
+            format: json
+            outputs:
+              - type: stdout
+
+          storage:
+            cache:
+              backend: memory
+              size: 256MB
+        dest: "{{ config_root }}/sentinel.yaml"
+        owner: "{{ sentinel_user }}"
+        group: "{{ sentinel_user }}"
+        mode: "0644"
+
+    # ------------------------------------------------------------------
+    # 6. systemd units
+    # ------------------------------------------------------------------
+    - name: Install systemd unit files
+      copy:
+        src: "{{ item }}"
+        dest: "/etc/systemd/system/{{ item | basename }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop:
+        - "{{ playbook_dir }}/../systemd/sentinel-controlplane.service"
+        - "{{ playbook_dir }}/../systemd/sentinel-proxy.service"
+
+    - name: Copy Dashboard if provided
+      copy:
+        src: "{{ dashboard_dir }}/"
+        dest: "{{ install_root }}/dashboard/"
+        owner: "{{ sentinel_user }}"
+        group: "{{ sentinel_user }}"
+        mode: "0755"
+      when: dashboard_dir != ""
+
+    - name: Install Dashboard systemd unit
+      copy:
+        src: "{{ playbook_dir }}/../systemd/sentinel-dashboard.service"
+        dest: "/etc/systemd/system/sentinel-dashboard.service"
+        owner: root
+        group: root
+        mode: "0644"
+      when: dashboard_dir != ""
+
+    - name: Reload systemd
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and start control plane
+      systemd:
+        name: sentinel-controlplane
+        state: started
+        enabled: yes
+
+    - name: Wait for control plane
+      wait_for:
+        port: 9501
+        timeout: 30
+
+    - name: Enable and start data plane
+      systemd:
+        name: sentinel-proxy
+        state: started
+        enabled: yes
+
+    - name: Enable and start dashboard
+      systemd:
+        name: sentinel-dashboard
+        state: started
+        enabled: yes
+      when: dashboard_dir != ""
+
+    # ------------------------------------------------------------------
+    # 7. Firewall
+    # ------------------------------------------------------------------
+    - name: Open control-plane REST port
+      ufw:
+        rule: allow
+        port: "9501"
+        proto: tcp
+        comment: Sentinel control plane
+
+    - name: Open WAF proxy port
+      ufw:
+        rule: allow
+        port: "443"
+        proto: tcp
+        comment: Sentinel WAF proxy HTTPS
+
+    - name: Open WAF proxy HTTP
+      ufw:
+        rule: allow
+        port: "80"
+        proto: tcp
+        comment: Sentinel WAF proxy HTTP
+
+    - name: Enable UFW
+      ufw:
+        state: enabled
+        policy: deny
+      when: ansible_check_mode == false  # skip in dry-run
+
+    # ------------------------------------------------------------------
+    # 8. Verify
+    # ------------------------------------------------------------------
+    - name: Check health endpoint
+      uri:
+        url: http://localhost:9501/health
+        return_content: yes
+      register: health_check
+      retries: 5
+      delay: 2
+      until: health_check.status == 200
+
+    - name: Show deploy summary
+      debug:
+        msg:
+          - "======================================"
+          - " Sentinel WAF deployed successfully!"
+          - "======================================"
+          - "Control plane:  http://{{ ansible_default_ipv4.address }}:9501"
+          - "WAF proxy:      {{ ansible_default_ipv4.address }}:443"
+          {% if dashboard_dir != "" %}- "Dashboard:      http://{{ ansible_default_ipv4.address }}:3000"{% endif %}
+          - ""
+          - "Login:    admin@sentinel.local"
+          - "Password: admin123"
+          - "======================================"

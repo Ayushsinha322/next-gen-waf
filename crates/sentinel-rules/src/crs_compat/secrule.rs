@@ -23,6 +23,8 @@ pub struct CrsActions {
     pub transforms: Vec<Transform>,
     /// CRS `skipAfter:MARKER` label (if present).
     pub skip_after: Option<String>,
+    /// Whether `multiMatch` was specified — re-test operator at each transform step.
+    pub multi_match: bool,
     /// Unrecognised action tokens (emitted as warnings).
     pub unknown: Vec<String>,
 }
@@ -217,7 +219,19 @@ fn parse_action_token(token: &str, out: &mut CrsActions) {
         "t:compresswhitespace" => out.transforms.push(Transform::CompressWhitespace),
         "t:jsdecode" => out.transforms.push(Transform::JsDecode),
         "t:cssdecode" => out.transforms.push(Transform::CssDecode),
-        other if other.starts_with("t:") => {} // other transforms (base64, hex, etc.) — no-op
+        "t:base64decode" => out.transforms.push(Transform::Base64Decode),
+        "t:hexdecode" => out.transforms.push(Transform::HexDecode),
+        "t:normalisepath" | "t:normalizepath" => out.transforms.push(Transform::NormalisePath),
+        "t:normalisepathwin" | "t:normalizepathwin" => out.transforms.push(Transform::NormalisePathWin),
+        "t:trim" => out.transforms.push(Transform::Trim),
+        "t:trimleft" => out.transforms.push(Transform::TrimLeft),
+        "t:trimright" => out.transforms.push(Transform::TrimRight),
+        "t:utf8tounicode" => out.transforms.push(Transform::Utf8ToUnicode),
+        "t:removecommentschar" => out.transforms.push(Transform::RemoveCommentsChar),
+        "t:removecomments" => out.transforms.push(Transform::RemoveComments),
+        "t:replacecomments" => out.transforms.push(Transform::ReplaceComments),
+        other if other.starts_with("t:") => {} // remaining transforms — no-op
+        "multimatch" => out.multi_match = true,
         other if other.starts_with("ctl:") => {} // control directives — no-op
         "chain" => {
             out.chain = true;

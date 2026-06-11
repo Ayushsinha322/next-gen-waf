@@ -104,7 +104,9 @@ pub enum Instruction {
     Not,
 
     /// Pop `StrVec`, apply each transform in order, push transformed `StrVec`.
-    ApplyTransforms(Vec<Transform>),
+    /// When `multi_match` is `true`, also push results after each intermediate
+    /// transform prefix so the subsequent operator can match at any step.
+    ApplyTransforms { transforms: Vec<Transform>, multi_match: bool },
 
     /// Jump `offset` instructions forward if stack top is Bool(false).
     /// Does NOT pop the stack.

@@ -20,7 +20,7 @@ const nextConfig = {
     return [
       {
         source: "/api/v1/:path*",
-        destination: (process.env.CONTROL_PLANE_URL ?? "http://localhost:9501") + "/api/v1/:path*",
+        destination: (process.env.NEXT_PUBLIC_CONTROL_PLANE_URL ?? process.env.CONTROL_PLANE_URL ?? "http://localhost:9501") + "/api/v1/:path*",
       },
     ];
   },
