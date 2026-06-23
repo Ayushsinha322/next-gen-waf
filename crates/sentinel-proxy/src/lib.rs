@@ -57,7 +57,7 @@ use sentinel_ebpf::{EbpfConfig, EbpfManager};
 use sentinel_ml::MlEngine;
 use sentinel_modules::{
     AntiDdos, BotDetector, BotVerdict, DdosVerdict, GeoIp, GeoVerdict, IpReputation, IpVerdict,
-    RateLimiter,
+    RateLimiter, SmugglingVerdict, detect_smuggling,
 };
 use sentinel_plugins::PluginRuntime;
 use sentinel_rules::RuleEngine;
@@ -507,7 +507,7 @@ impl ProxyServer {
                         .method("GET")
                         .uri(uri)
                         .body(http_body_util::Empty::new())
-                        .unwrap();
+                        .expect("BUG: building config-sync request");
                     let resp = match client.request(req).await {
                         Ok(r) => r,
                         Err(e) => {
@@ -1010,7 +1010,17 @@ async fn proxy(
 
     if ctx.decision == WafDecision::Block || ctx.decision == WafDecision::Challenge {
         state.modules.correlation.record_block(ctx.client_ip);
-        let resp = block_response(&ctx);
+        let resp = if ctx
+            .block_reason
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("HTTP request smuggling")
+        {
+            // RFC 7230 §3.3.3: malformed requests MUST be rejected with 400.
+            error_response(StatusCode::BAD_REQUEST, ctx.block_reason.as_deref().unwrap_or("Bad Request"))
+        } else {
+            block_response(&ctx)
+        };
         ctx.response_status = Some(resp.status());
         ctx.advance_phase(Phase::Logging);
         log_request(&ctx);
@@ -1277,6 +1287,23 @@ async fn phase1_headers(
         "DETECTION_PARANOIA_LEVEL".to_owned(),
         site.waf.paranoia_level.to_string(),
     );
+
+    // --- HTTP request smuggling / desync detection ---
+    // Runs before any other Phase 1 checks — a smuggling attempt invalidates
+    // the entire request. Reject with 400 Bad Request.
+    if ctx.decision == WafDecision::Allow {
+        match detect_smuggling(&ctx.request_headers) {
+            SmugglingVerdict::Reject { reason } => {
+                ctx.decision = WafDecision::Block;
+                ctx.block_reason = Some(reason);
+            }
+            SmugglingVerdict::Clean => {}
+        }
+    }
+
+    if ctx.decision == WafDecision::Block {
+        return Ok(());
+    }
 
     // --- Rate limiting ---
     if ctx.decision == WafDecision::Allow {

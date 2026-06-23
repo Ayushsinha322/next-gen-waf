@@ -14,9 +14,11 @@ pub mod bot_detect;
 pub mod geoip;
 pub mod ip_reputation;
 pub mod rate_limit;
+pub mod smuggling;
 
 pub use anti_ddos::{AntiDdos, DdosVerdict};
 pub use bot_detect::{BotDetector, BotVerdict};
 pub use geoip::{GeoIp, GeoVerdict};
 pub use ip_reputation::{IpReputation, IpVerdict};
 pub use rate_limit::RateLimiter;
+pub use smuggling::{detect as detect_smuggling, SmugglingVerdict};
