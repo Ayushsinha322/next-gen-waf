@@ -57,22 +57,28 @@ func run() error {
 
 	// ── DB pool ───────────────────────────────────────────────────────────────
 	ctx := context.Background()
-	dbURL := envOrDefault("SENTINEL_DB_URL",
-		"postgres://sentinel:sentinel_dev@localhost:5432/sentinel?sslmode=disable")
+	dbURL := os.Getenv("SENTINEL_DB_URL")
+	if dbURL == "" {
+		log.Warn("SENTINEL_DB_URL not set — running in degraded mode (mock data only)")
+	}
 
 	var store *db.Store
-	pool, dbErr := db.Open(ctx, db.Config{URL: dbURL, MaxConns: 20, MinConns: 2})
-	if dbErr != nil {
-		log.Warn("DB unavailable — running in degraded mode (mock data only)", zap.Error(dbErr))
-	} else {
-		log.Info("DB connected", zap.String("url", maskPassword(dbURL)))
-		store = db.NewStore(pool)
-
-		// Seed dev data (idempotent).
-		if err := db.SeedDev(ctx, pool); err != nil {
-			log.Warn("DB seed failed (non-fatal)", zap.Error(err))
+	var pool db.Pool // lifted for shutdown access
+	if dbURL != "" {
+		var dbErr error
+		pool, dbErr = db.Open(ctx, db.Config{URL: dbURL, MaxConns: 20, MinConns: 2})
+		if dbErr != nil {
+			log.Warn("DB unavailable — running in degraded mode (mock data only)", zap.Error(dbErr))
 		} else {
-			log.Info("DB seeded")
+			log.Info("DB connected", zap.String("url", maskPassword(dbURL)))
+			store = db.NewStore(pool)
+
+			// Seed dev data (idempotent).
+			if err := db.SeedDev(ctx, pool); err != nil {
+				log.Warn("DB seed failed (non-fatal)", zap.Error(err))
+			} else {
+				log.Info("DB seeded")
+			}
 		}
 	}
 
@@ -102,9 +108,15 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("creating gRPC server: %w", err)
 	}
+
+	// ── Graceful shutdown ─────────────────────────────────────────────────────
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
 	go func() {
 		if err := grpcSrv.Start(); err != nil {
-			log.Fatal("gRPC server failed", zap.Error(err))
+			log.Error("gRPC server failed", zap.Error(err))
+			sigCh <- syscall.SIGTERM
 		}
 	}()
 
@@ -122,7 +134,7 @@ func run() error {
 	}
 
 	// ── REST (Gin) ────────────────────────────────────────────────────────────
-	router := api.SetupRouter(api.DefaultCORS())
+	router := api.SetupRouter(api.CORSFromEnv())
 
 	// ── Static dashboard files (served BEFORE API routes) ─────────────────────
 	dashDir := envOrDefault("SENTINEL_DASHBOARD_DIR", "../dashboard")
@@ -189,15 +201,14 @@ func run() error {
 	}
 
 	// ── Graceful shutdown ─────────────────────────────────────────────────────
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	httpSrv := &http.Server{Addr: restAddr, Handler: router}
 
 	go func() {
 		log.Info("REST API listening", zap.String("addr", restAddr))
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatal("REST server failed", zap.Error(err))
+			log.Error("REST server failed", zap.Error(err))
+			sigCh <- syscall.SIGTERM
 		}
 	}()
 
@@ -229,12 +240,20 @@ func maskPassword(dsn string) string {
 // child process, restarting automatically on crash. Returns true if the binary
 // was found and launched, false if the binary doesn't exist yet (not built).
 func autoStartDataPlane(log *zap.Logger) bool {
+	// Allow the launcher to own the proxy lifecycle itself. When set to "0"
+	// (the dev launcher does this), the control plane does NOT spawn its own
+	// proxy, preventing a duplicate data-plane process from running.
+	if os.Getenv("SENTINEL_AUTOSTART_DATAPLANE") == "0" {
+		log.Info("data-plane auto-start disabled (SENTINEL_AUTOSTART_DATAPLANE=0) — launcher owns the proxy")
+		return true
+	}
 	// Candidate binary locations relative to CWD (repo root).
+	// Prefer the optimized release build to keep memory low; fall back to debug.
 	candidates := []string{
-		"./target/debug/sentinel-bin",
 		"./target/release/sentinel-bin",
-		"../target/debug/sentinel-bin",
 		"../target/release/sentinel-bin",
+		"./target/debug/sentinel-bin",
+		"../target/debug/sentinel-bin",
 	}
 	// Also honour an explicit override.
 	if override := os.Getenv("SENTINEL_PROXY_BIN"); override != "" {

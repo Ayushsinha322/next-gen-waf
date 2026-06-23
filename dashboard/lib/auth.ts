@@ -77,6 +77,10 @@ export async function login(email: string, password: string): Promise<LoginRespo
   store(ACCESS_KEY,  data.access_token);
   store(REFRESH_KEY, data.refresh_token);
   store(USER_KEY,    JSON.stringify(data.user));
+  // Set cookie so Next.js middleware allows page navigations.
+  if (typeof document !== "undefined") {
+    document.cookie = `sentinel_token=${data.access_token}; path=/; max-age=604800; SameSite=Lax`;
+  }
   return data;
 }
 

@@ -41,7 +41,7 @@ impl RedisClient {
         // to call TIME (avoids a round-trip and keeps the Lua deterministic).
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("system clock before Unix epoch")
             .as_millis() as i64;
         let cutoff_ms = now_ms - window_ms as i64;
         let expire_secs = (window_ms / 1000 + 2) as i64;

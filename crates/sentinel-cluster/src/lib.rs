@@ -503,7 +503,7 @@ impl RaftActor {
     async fn run(mut self, mut rx: mpsc::Receiver<ActorMsg>) {
         // Bind listener first so we can accept peer RPCs.
         let addr: SocketAddr = self.listen_addr.parse().unwrap_or_else(|_| {
-            "127.0.0.1:9502".parse().unwrap()
+            "127.0.0.1:9502".parse().expect("hardcoded fallback address must be valid")
         });
         let listener = match TcpListener::bind(addr).await {
             Ok(l) => l,

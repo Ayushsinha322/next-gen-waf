@@ -616,7 +616,7 @@ fn cmd_status(cfg_path: &Path) -> Result<()> {
     let pid = read_pid()?;
     let alive = pid.map(process_alive).unwrap_or(false);
     if alive {
-        println!("  Status:    RUNNING (pid {})", pid.unwrap());
+        println!("  Status:    RUNNING (pid {})", pid.expect("pid must exist when alive"));
     } else {
         println!("  Status:    stopped");
     }

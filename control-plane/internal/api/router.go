@@ -4,6 +4,7 @@ package api
 
 import (
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -38,6 +39,26 @@ func DefaultCORS() CORSOptions {
 			"http://localhost:3005",
 			"http://localhost:9501",
 		},
+		AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+		AllowedHeaders:   []string{"Authorization", "Content-Type", "X-Requested-With", "Accept", "Origin"},
+		AllowCredentials: true,
+		MaxAge:           86400,
+	}
+}
+
+// CORSFromEnv reads SENTINEL_CORS_ORIGINS (comma-separated) and returns
+// CORS options. Falls back to DefaultCORS() when the env var is unset.
+func CORSFromEnv() CORSOptions {
+	raw := os.Getenv("SENTINEL_CORS_ORIGINS")
+	if raw == "" {
+		return DefaultCORS()
+	}
+	origins := strings.Split(raw, ",")
+	for i := range origins {
+		origins[i] = strings.TrimSpace(origins[i])
+	}
+	return CORSOptions{
+		AllowedOrigins:   origins,
 		AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"Authorization", "Content-Type", "X-Requested-With", "Accept", "Origin"},
 		AllowCredentials: true,

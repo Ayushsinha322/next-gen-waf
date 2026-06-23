@@ -8,8 +8,12 @@ import (
 )
 
 func main() {
-	url := "postgres://sentinel:sentinel_dev@localhost:5432/sentinel?sslmode=disable"
-	pool, err := db.Open(context.Background(), db.Config{URL: url, MaxConns: 5, MinConns: 1})
+	dbURL := os.Getenv("SENTINEL_DB_URL")
+	if dbURL == "" {
+		fmt.Fprintln(os.Stderr, "SENTINEL_DB_URL is required")
+		os.Exit(1)
+	}
+	pool, err := db.Open(context.Background(), db.Config{URL: dbURL, MaxConns: 5, MinConns: 1})
 	if err != nil { fmt.Println("connect:", err); os.Exit(1) }
 	defer pool.Close()
 	if err := db.SeedDev(context.Background(), pool); err != nil {

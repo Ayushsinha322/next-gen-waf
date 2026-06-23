@@ -141,7 +141,7 @@ async fn pull_wasm_from_registry(client: &HttpsClient, r: &OciRef) -> Result<Vec
         .iter()
         .find(|l| l.media_type == "application/wasm")
         .or_else(|| manifest.layers.first())
-        .unwrap();
+        .expect("OCI manifest has no layers");
 
     tracing::debug!(
         registry = %r.registry,
