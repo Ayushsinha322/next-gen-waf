@@ -117,32 +117,74 @@ fn parse_cookies(header_val: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Return `true` when the request body is `application/x-www-form-urlencoded`.
-fn body_is_form_urlencoded(ctx: &RequestContext) -> bool {
+/// Lower-cased `Content-Type` value, or empty string if absent/unparsable.
+fn content_type(ctx: &RequestContext) -> String {
     ctx.request_headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
-        .map(|ct| {
-            ct.to_ascii_lowercase()
-                .starts_with("application/x-www-form-urlencoded")
-        })
-        .unwrap_or(false)
+        .map(|ct| ct.to_ascii_lowercase())
+        .unwrap_or_default()
 }
 
-/// Parse urlencoded POST body parameters, if present and form-encoded.
-/// ModSecurity's `ARGS` collection merges query-string and POST body
-/// parameters; the rule engine must inspect both so that body-borne
-/// attacks (the common case for login/search forms) are not missed.
-fn body_form_params(ctx: &RequestContext) -> Vec<(String, String)> {
-    if !body_is_form_urlencoded(ctx) {
-        return Vec::new();
-    }
-    match ctx.request_body.as_ref() {
-        Some(body) => {
-            let text = String::from_utf8_lossy(body);
-            parse_query_params(&text)
+/// Recursively flatten a JSON value into ModSecurity-style `(name, value)`
+/// pairs.  Object keys become the parameter name; array elements inherit the
+/// parent name (matching ModSecurity's `ARGS:json.path` behaviour closely
+/// enough for detection).  Scalars are stringified; `null` is skipped.
+fn flatten_json(prefix: &str, val: &serde_json::Value, out: &mut Vec<(String, String)>) {
+    use serde_json::Value;
+    match val {
+        Value::Object(map) => {
+            for (k, v) in map {
+                let key = if prefix.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{prefix}.{k}")
+                };
+                flatten_json(&key, v, out);
+            }
         }
-        None => Vec::new(),
+        Value::Array(arr) => {
+            for v in arr {
+                // Array elements share the parent name (ModSecurity treats
+                // repeated ARGS with the same name); keeps names meaningful.
+                flatten_json(prefix, v, out);
+            }
+        }
+        Value::String(s) => out.push((prefix.to_owned(), s.clone())),
+        Value::Number(n) => out.push((prefix.to_owned(), n.to_string())),
+        Value::Bool(b) => out.push((prefix.to_owned(), b.to_string())),
+        Value::Null => {}
+    }
+}
+
+/// Parse POST-body parameters into `(name, value)` pairs.
+///
+/// ModSecurity's `ARGS` collection merges query-string and POST-body
+/// parameters; the rule engine must inspect both so that body-borne attacks
+/// (the common case for login/search forms and JSON APIs) are not missed.
+/// Supports `application/x-www-form-urlencoded` and `application/json`
+/// (including `+json` suffixes such as `application/vnd.api+json`).
+fn body_args(ctx: &RequestContext) -> Vec<(String, String)> {
+    let Some(body) = ctx.request_body.as_ref() else {
+        return Vec::new();
+    };
+    let ct = content_type(ctx);
+    if ct.starts_with("application/x-www-form-urlencoded") {
+        let text = String::from_utf8_lossy(body);
+        parse_query_params(&text)
+    } else if ct.starts_with("application/json") || ct.contains("+json") {
+        match serde_json::from_slice::<serde_json::Value>(body) {
+            Ok(val) => {
+                let mut out = Vec::new();
+                flatten_json("", &val, &mut out);
+                out
+            }
+            // Malformed JSON: fall back to scanning the raw body as one value
+            // so obfuscated/broken payloads still reach the regex operators.
+            Err(_) => vec![(String::new(), String::from_utf8_lossy(body).into_owned())],
+        }
+    } else {
+        Vec::new()
     }
 }
 
@@ -153,8 +195,8 @@ fn extract_target(spec: &TargetSpec, ctx: &RequestContext) -> Vec<String> {
                 .into_iter()
                 .map(|(_, v)| v)
                 .collect();
-            // ARGS also includes urlencoded POST body parameters.
-            values.extend(body_form_params(ctx).into_iter().map(|(_, v)| v));
+            // ARGS also includes urlencoded / JSON POST body parameters.
+            values.extend(body_args(ctx).into_iter().map(|(_, v)| v));
             values
         }
         TargetSpec::ArgsNames => {
@@ -162,7 +204,7 @@ fn extract_target(spec: &TargetSpec, ctx: &RequestContext) -> Vec<String> {
                 .into_iter()
                 .map(|(k, _)| k)
                 .collect();
-            names.extend(body_form_params(ctx).into_iter().map(|(k, _)| k));
+            names.extend(body_args(ctx).into_iter().map(|(k, _)| k));
             names
         }
         TargetSpec::RequestUri => vec![ctx.uri.to_string()],
@@ -227,7 +269,11 @@ fn extract_target(spec: &TargetSpec, ctx: &RequestContext) -> Vec<String> {
             .and_then(|v| v.to_str().ok())
             .map(|v| vec![v.to_owned()])
             .unwrap_or_default(),
-        TargetSpec::ResponseBody => vec![], // TODO: implement when Phase 5 wired
+        TargetSpec::ResponseBody => ctx
+            .response_body
+            .as_ref()
+            .map(|b| vec![String::from_utf8_lossy(b).into_owned()])
+            .unwrap_or_default(),
         TargetSpec::RemoteAddr => vec![ctx.client_ip.to_string()],
         TargetSpec::Geo => vec![], // TODO: GeoIP in Phase 2
         TargetSpec::TxVar(name) => ctx

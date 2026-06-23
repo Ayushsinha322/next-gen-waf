@@ -380,9 +380,22 @@ impl ProxyServer {
 
         let feed_cache: FeedCache = Arc::new(ArcSwap::new(Arc::new(Vec::new())));
 
+        // Connect storage backends (Redis for distributed rate limiting,
+        // ClickHouse for traffic history).  Missing/unreachable backends
+        // degrade gracefully — the rate limiter falls back to in-memory.
+        let storage = sentinel_storage::StorageHandle::connect(
+            &sentinel_storage::StorageBackendConfig::from_core(&cfg.storage),
+        )
+        .await;
+        if storage.has_redis() {
+            info!("rate limiting: distributed mode (Redis backend active)");
+        } else {
+            info!("rate limiting: in-memory mode (no Redis backend)");
+        }
+
         let modules = Arc::new(ModulesState {
             ip_rep: ArcSwap::new(Arc::new(build_ip_reputation(&cfg, &[]))),
-            rate_limiter: RateLimiter::new(),
+            rate_limiter: RateLimiter::with_redis(storage.redis.clone()),
             bot_detector: ArcSwap::new(Arc::new(BotDetector::new())),
             geoip_map: ArcSwap::new(Arc::new(build_geoip_map(&cfg))),
             anti_ddos: build_anti_ddos(&cfg),
@@ -1189,36 +1202,70 @@ async fn proxy(
     strip_hop_by_hop(&mut resp_parts.headers);
     inject_security_headers(&mut resp_parts.headers);
 
-    // --- Phase 5: Response body — DLP scan ---
+    // --- Phase 5: Response body — rule engine + DLP scan ---
     ctx.advance_phase(Phase::ResponseBody);
 
     let dlp_map = state.dlp_map.load_full();
-    let final_body: BoxBody = if let Some(dlp) = dlp_map.get(&site_cfg.id) {
-        if dlp.enabled {
-            // Collect response body for DLP scanning (capped at 512 KiB).
-            // Large streaming responses (e.g. video) bypass DLP — check
-            // Content-Type to skip binary/media responses.
-            let ct = resp_parts
-                .headers
-                .get(header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            let is_scannable = ct.contains("text")
-                || ct.contains("json")
-                || ct.contains("xml")
-                || ct.contains("javascript")
-                || ct.is_empty();
+    let resp_engines = state.engines.load_full();
 
-            if is_scannable {
-                // Collect up to 512 KiB of the response for scanning.  Larger
-                // responses are passed through uninspected (streaming would
-                // require incremental pattern matching — a future enhancement).
-                const DLP_SCAN_CAP: u64 = 512 * 1024;
-                let upper = resp_body.size_hint().upper().unwrap_or(0);
-                if upper <= DLP_SCAN_CAP || upper == u64::MAX {
-                    match resp_body.collect().await {
-                        Ok(collected) => {
-                            let bytes = collected.to_bytes();
+    // Inspect the response body only when something actually needs it: a DLP
+    // scanner is enabled for the site, OR the site's rule set has response-body
+    // rules (e.g. CRS RESPONSE-* data-leakage rules).  Most sites have neither,
+    // so the response streams straight through with zero added latency.
+    let dlp = dlp_map.get(&site_cfg.id).filter(|d| d.enabled);
+    let resp_engine = resp_engines
+        .get(&site_cfg.id)
+        .filter(|e| e.has_response_body_rules());
+    let needs_inspection = dlp.is_some() || resp_engine.is_some();
+
+    let final_body: BoxBody = if needs_inspection {
+        // Only buffer text-ish responses; skip binary/media to avoid breaking
+        // streaming downloads.
+        let ct = resp_parts
+            .headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let is_scannable = ct.contains("text")
+            || ct.contains("json")
+            || ct.contains("xml")
+            || ct.contains("javascript")
+            || ct.is_empty();
+
+        if is_scannable {
+            // Collect up to 512 KiB for scanning.  Larger responses pass
+            // through uninspected (streaming inspection is a future change).
+            const SCAN_CAP: u64 = 512 * 1024;
+            let upper = resp_body.size_hint().upper().unwrap_or(0);
+            if upper <= SCAN_CAP || upper == u64::MAX {
+                match resp_body.collect().await {
+                    Ok(collected) => {
+                        let bytes = collected.to_bytes();
+
+                        // (1) Response-body rule engine (CRS RESPONSE-* etc.).
+                        if let Some(engine) = resp_engine {
+                            ctx.response_body = Some(bytes.clone());
+                            engine.evaluate(
+                                &mut ctx,
+                                Phase::ResponseBody,
+                                site_cfg.waf.anomaly_threshold,
+                            );
+                            // Respect learning mode (downgrade Block → Log).
+                            enforce_mode(&mut ctx, &site_cfg.waf.mode);
+                            if ctx.decision == WafDecision::Block {
+                                warn!(
+                                    site = %site_cfg.id,
+                                    client_ip = %ctx.client_ip,
+                                    "response-body rule matched — blocking"
+                                );
+                                ctx.advance_phase(Phase::Logging);
+                                log_request(&ctx);
+                                return Ok(block_response(&ctx));
+                            }
+                        }
+
+                        // (2) DLP scan (PII / secret leakage).
+                        if let Some(dlp) = dlp {
                             if let Some(matched) = dlp.scan(&bytes) {
                                 warn!(
                                     site = %site_cfg.id,
@@ -1234,22 +1281,21 @@ async fn proxy(
                                 log_request(&ctx);
                                 return Ok(block_response(&ctx));
                             }
-                            Full::new(bytes)
-                                .map_err(|never: Infallible| match never {})
-                                .boxed()
                         }
-                        Err(e) => {
-                            warn!("DLP: body collection error: {e}");
-                            http_body_util::Empty::<Bytes>::new()
-                                .map_err(|never: Infallible| match never {})
-                                .boxed()
-                        }
+
+                        Full::new(bytes)
+                            .map_err(|never: Infallible| match never {})
+                            .boxed()
                     }
-                } else {
-                    // Response too large to buffer — skip DLP scan.
-                    resp_body.boxed()
+                    Err(e) => {
+                        warn!("response-body collection error: {e}");
+                        http_body_util::Empty::<Bytes>::new()
+                            .map_err(|never: Infallible| match never {})
+                            .boxed()
+                    }
                 }
             } else {
+                // Response too large to buffer — pass through uninspected.
                 resp_body.boxed()
             }
         } else {
@@ -1308,7 +1354,11 @@ async fn phase1_headers(
     // --- Rate limiting ---
     if ctx.decision == WafDecision::Allow {
         if let Some(ref rl_cfg) = site.waf.rate_limit {
-            if modules.rate_limiter.check(&site.id, ctx.client_ip, rl_cfg) {
+            if modules
+                .rate_limiter
+                .check_async(&site.id, ctx.client_ip, rl_cfg)
+                .await
+            {
                 ctx.decision = WafDecision::Block;
                 ctx.block_reason =
                     Some(format!("rate limit exceeded for {}", ctx.client_ip));

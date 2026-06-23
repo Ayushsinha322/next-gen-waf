@@ -6,10 +6,12 @@
 //! Checked at Phase 1 (request headers) after the site is identified.
 
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use sentinel_core::config::RateLimitConfig;
+use sentinel_storage::RedisClient;
 
 // ---------------------------------------------------------------------------
 // Token bucket
@@ -76,6 +78,10 @@ impl TokenBucket {
 pub struct RateLimiter {
     per_ip: DashMap<(String, IpAddr), TokenBucket>,
     per_site: DashMap<String, TokenBucket>,
+    /// Optional distributed backend.  When present, limits are enforced via an
+    /// atomic Redis sliding window shared across all WAF nodes; when `None`,
+    /// the in-memory token buckets above are used (single-instance only).
+    redis: Option<Arc<RedisClient>>,
 }
 
 impl Default for RateLimiter {
@@ -86,10 +92,72 @@ impl Default for RateLimiter {
 
 impl RateLimiter {
     pub fn new() -> Self {
+        Self::with_redis(None)
+    }
+
+    /// Construct a limiter with an optional distributed Redis backend.
+    pub fn with_redis(redis: Option<Arc<RedisClient>>) -> Self {
         Self {
             per_ip: DashMap::new(),
             per_site: DashMap::new(),
+            redis,
         }
+    }
+
+    /// `true` if a distributed (Redis) backend is active.
+    pub fn is_distributed(&self) -> bool {
+        self.redis.is_some()
+    }
+
+    /// Distributed rate check.  Uses the shared Redis sliding window when a
+    /// backend is configured; otherwise delegates to the in-memory [`check`].
+    ///
+    /// Returns `true` (= **block request**) if any limit is exceeded.  On any
+    /// Redis error the check degrades to the in-memory limiter rather than
+    /// failing open, so a Redis outage never disables rate limiting entirely.
+    ///
+    /// [`check`]: RateLimiter::check
+    pub async fn check_async(
+        &self,
+        site_id: &str,
+        ip: IpAddr,
+        config: &RateLimitConfig,
+    ) -> bool {
+        let Some(redis) = &self.redis else {
+            return self.check(site_id, ip, config);
+        };
+
+        // 1-second sliding window; allow `rps + burst` requests within it so
+        // short bursts pass while sustained rate is capped (mirrors the
+        // token-bucket semantics of the in-memory path).
+        const WINDOW_MS: u64 = 1000;
+        let mut limited = false;
+
+        if let Some(ref global) = config.global {
+            let key = format!("rate:site:{site_id}");
+            let limit = (global.rps + global.burst) as u64;
+            match redis.rate_check(&key, limit, WINDOW_MS).await {
+                Ok(allowed) => limited |= !allowed,
+                Err(e) => {
+                    tracing::warn!(error = %e, "redis rate_check failed — falling back to in-memory");
+                    return self.check(site_id, ip, config);
+                }
+            }
+        }
+
+        if let Some(ref per_ip_cfg) = config.per_ip {
+            let key = format!("rate:ip:{site_id}:{ip}");
+            let limit = (per_ip_cfg.rps + per_ip_cfg.burst) as u64;
+            match redis.rate_check(&key, limit, WINDOW_MS).await {
+                Ok(allowed) => limited |= !allowed,
+                Err(e) => {
+                    tracing::warn!(error = %e, "redis rate_check failed — falling back to in-memory");
+                    return self.check(site_id, ip, config);
+                }
+            }
+        }
+
+        limited
     }
 
     /// Check whether a request should be rate-limited.

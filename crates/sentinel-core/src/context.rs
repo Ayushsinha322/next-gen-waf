@@ -131,6 +131,10 @@ pub struct RequestContext {
     pub upstream_latency_us: Option<u64>,
     pub response_status: Option<StatusCode>,
     pub response_headers: Option<HeaderMap>,
+    /// Response body, buffered in Phase 5 for response-body rule inspection
+    /// (e.g. CRS RESPONSE-* data-leakage rules) and DLP scanning.  `None` until
+    /// collected; stays `None` for streaming / oversized / non-text responses.
+    pub response_body: Option<Bytes>,
     pub bytes_sent: u64,
     pub bytes_received: u64,
 }
@@ -161,6 +165,7 @@ impl RequestContext {
             upstream_latency_us: None,
             response_status: None,
             response_headers: None,
+            response_body: None,
             bytes_sent: 0,
             bytes_received: 0,
         }

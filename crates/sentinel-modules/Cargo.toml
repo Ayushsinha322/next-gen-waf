@@ -18,6 +18,7 @@ parking_lot = { workspace = true }
 ipnet = { workspace = true }
 maxminddb = { workspace = true }
 sentinel-core = { path = "../sentinel-core" }
+sentinel-storage = { path = "../sentinel-storage" }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "tls12", "webpki-roots"] }

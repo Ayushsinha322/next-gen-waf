@@ -106,6 +106,23 @@ impl RuleEngine {
     pub fn rule_count(&self) -> usize {
         self.ruleset.rule_meta.len()
     }
+
+    /// `true` if this rule set has any rules in the response-body phase.
+    ///
+    /// The proxy uses this to decide whether to buffer the response body for
+    /// inspection — most rule sets (e.g. CRS REQUEST-* only) have none, so the
+    /// response can stream straight through with zero added latency.
+    ///
+    /// Checks rule metadata rather than the phase program, because `SecMarker`
+    /// directives are emitted into every phase program (so a non-empty program
+    /// does not by itself imply a real response-body rule).
+    pub fn has_response_body_rules(&self) -> bool {
+        use crate::dsl::ast::RulePhase;
+        self.ruleset
+            .rule_meta
+            .values()
+            .any(|m| m.phase == RulePhase::ResponseBody)
+    }
 }
 
 // ---------------------------------------------------------------------------
