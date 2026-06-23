@@ -1,0 +1,45 @@
+# E2E Vegeta Targets — Sentinel WAF Benchmark
+# 
+# Usage:
+#   vegeta attack -targets=benchmarks/vegeta/e2e-targets.txt -duration=30s -rate=100/s | \
+#     vegeta report -type=text
+#
+# Requires a running Sentinel proxy with CRS rules loaded.
+
+# Target 1: Clean GET request (should pass through)
+GET http://127.0.0.1:9080/
+Host: dvwa.local
+User-Agent: Mozilla/5.0 (X11; Linux x86_64) Chrome/125.0
+
+# Target 2: Clean POST with form data
+POST http://127.0.0.1:9080/login.php
+Host: dvwa.local
+Content-Type: application/x-www-form-urlencoded
+User-Agent: Mozilla/5.0 (X11; Linux x86_64) Chrome/125.0
+
+@clean-body.txt
+
+# Target 3: SQLi attack (should block with 403)
+GET http://127.0.0.1:9080/vulnerabilities/sqli/?id=1%27%20OR%201%3D1--&Submit=Submit
+Host: dvwa.local
+User-Agent: Mozilla/5.0 (X11; Linux x86_64) Chrome/125.0
+
+# Target 4: XSS attack (should block with 403)
+GET http://127.0.0.1:9080/vulnerabilities/xss_r/?name=%3Cscript%3Ealert(1)%3C%2Fscript%3E
+Host: dvwa.local
+User-Agent: Mozilla/5.0 (X11; Linux x86_64) Chrome/125.0
+
+# Target 5: LFI attack (should block with 403)
+GET http://127.0.0.1:9080/vulnerabilities/fi/?page=../../etc/passwd
+Host: dvwa.local
+User-Agent: Mozilla/5.0 (X11; Linux x86_64) Chrome/125.0
+
+# Target 6: Health check
+GET http://127.0.0.1:9080/healthz
+Host: dvwa.local
+
+# Target 7: Clean API request with JSON
+GET http://127.0.0.1:9080/api/v1/status
+Host: dvwa.local
+Accept: application/json
+User-Agent: Mozilla/5.0 (X11; Linux x86_64) Chrome/125.0
