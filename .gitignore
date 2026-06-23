@@ -54,3 +54,6 @@ sentinel-about.md
 waf-comparsion.md
 .local/
 notes/
+
+# Internal documentation — kept local, not pushed to remote
+docs/
