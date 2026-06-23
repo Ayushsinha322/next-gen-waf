@@ -55,8 +55,16 @@ waf-comparsion.md
 .local/
 notes/
 
-# Internal documentation — kept local, not pushed to remote
-docs/
+# Internal documentation — kept local by default.
+# A curated public subset is explicitly tracked (negated below).
+docs/*
+!docs/README.md
+!docs/launcher.md
+!docs/architecture
+docs/architecture/*
+!docs/architecture/overview.md
+!docs/architecture/raft-cluster.md
+!docs/architecture/architecture-diagram.html
 
 # Presentation deck — kept local, not pushed to remote
 Sentinel_WAF_Overview.pptx
