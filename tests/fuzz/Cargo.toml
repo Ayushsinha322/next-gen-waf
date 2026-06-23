@@ -1,0 +1,41 @@
+[package]
+name = "sentinel-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.sentinel-rules]
+path = "../../crates/sentinel-rules"
+
+[dependencies.sentinel-modules]
+path = "../../crates/sentinel-modules"
+
+[dependencies.sentinel-core]
+path = "../../crates/sentinel-core"
+
+[dependencies.http]
+version = "1"
+
+[[bin]]
+name = "srl_parser"
+path = "targets/srl_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "crs_importer"
+path = "targets/crs_importer.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "smuggling_detector"
+path = "targets/smuggling_detector.rs"
+test = false
+doc = false

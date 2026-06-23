@@ -32,3 +32,14 @@ sentinel-plugins = { path = "../sentinel-plugins" }
 sentinel-ml = { path = "../sentinel-ml" }
 sentinel-telemetry = { path = "../sentinel-telemetry" }
 sentinel-ebpf = { path = "../sentinel-ebpf" }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+hyper = { workspace = true, features = ["client", "http1", "server"] }
+hyper-util = { workspace = true, features = ["client-legacy", "server-auto", "tokio"] }
+http = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+arc-swap = { workspace = true }
+rustls = { workspace = true }
