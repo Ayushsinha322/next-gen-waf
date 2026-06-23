@@ -12,6 +12,11 @@ ExecStart=/opt/sentinel/sentinel-bin
 Restart=always
 RestartSec=5
 
+# Soft memory guardrail only — the data plane is the critical traffic path, so
+# we let the kernel reclaim past this hint rather than hard-kill under a spike.
+# Tune up for high-traffic VMs (e.g. MemoryHigh=2G).
+MemoryHigh=1G
+
 # Hardening
 NoNewPrivileges=yes
 ProtectSystem=strict

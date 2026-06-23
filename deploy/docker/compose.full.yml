@@ -33,6 +33,9 @@ services:
       SENTINEL_REDIS_URL: redis://redis:6379
       SENTINEL_CLICKHOUSE_URL: http://sentinel:sentinel_dev@clickhouse:8123/sentinel_logs
       SENTINEL_S3_ENDPOINT: http://minio:9000
+      # The dedicated 'dataplane' service runs the proxy — stop the control
+      # plane from spawning a duplicate one inside its own container.
+      SENTINEL_AUTOSTART_DATAPLANE: "0"
     ports:
       - "7443:7443"   # gRPC
       - "8443:8443"   # REST/admin

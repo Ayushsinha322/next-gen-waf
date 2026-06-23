@@ -13,9 +13,13 @@ ExecStart=/usr/bin/npm start
 Restart=always
 RestartSec=5
 
+# Memory guardrail — serving a built Next.js app needs far less than 3 GB
+MemoryHigh=768M
+MemoryMax=1G
+
 Environment=NEXT_PUBLIC_CONTROL_PLANE_URL=http://localhost:9501
 Environment=PORT=3000
-Environment=NODE_OPTIONS=--max-old-space-size=3072
+Environment=NODE_OPTIONS=--max-old-space-size=1024
 
 [Install]
 WantedBy=multi-user.target

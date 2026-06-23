@@ -21,8 +21,9 @@
     install_root: /opt/sentinel
     config_root: /etc/sentinel
     log_dir: /var/log/sentinel
-    db_url: "postgres://sentinel:sentinel_dev@localhost:5432/sentinel?sslmode=disable"
-    jwt_secret: "change-me-to-a-random-64-character-string"
+    # ⚠️  OVERRIDE THESE before running. Secrets MUST be set per deployment.
+    db_url: "SET_ME_DB_URL"   # e.g. postgres://user:pass@host:5432/sentinel?sslmode=require
+    jwt_secret: "SET_ME_JWT_SECRET"   # generate with: openssl rand -hex 64
     # Set to the path of your pre-built binary (or "" to skip data-plane)
     proxy_binary: ""
     controlplane_binary: ""
@@ -89,7 +90,7 @@
       community.postgresql.postgresql_user:
         db: sentinel
         name: sentinel
-        password: sentinel_dev
+        password: "{{ db_password | default('SET_ME_DB_PASSWORD') }}"
         priv: ALL
       ignore_errors: yes
 

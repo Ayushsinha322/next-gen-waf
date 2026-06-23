@@ -12,6 +12,10 @@ ExecStart=/opt/sentinel/controllerd
 Restart=always
 RestartSec=5
 
+# Memory guardrail (soft reclaim) — control plane is lightweight
+MemoryHigh=384M
+MemoryMax=512M
+
 # Hardening
 NoNewPrivileges=yes
 ProtectSystem=strict
@@ -23,6 +27,10 @@ Environment=SENTINEL_DB_URL=postgres://sentinel:sentinel_dev@localhost:5432/sent
 Environment=SENTINEL_JWT_SECRET=change-me-to-a-random-64-char-string
 Environment=SENTINEL_REST_ADDR=0.0.0.0:9501
 Environment=SENTINEL_GRPC_ADDR=0.0.0.0:9500
+# The dedicated sentinel-proxy.service owns the data plane. Prevent the control
+# plane from spawning a SECOND proxy (which, lacking CAP_NET_BIND_SERVICE here,
+# would crash-loop trying to bind :80/:443).
+Environment=SENTINEL_AUTOSTART_DATAPLANE=0
 
 [Install]
 WantedBy=multi-user.target

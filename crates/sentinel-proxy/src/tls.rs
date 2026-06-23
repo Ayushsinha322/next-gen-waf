@@ -79,7 +79,7 @@ impl AutoCertResolver {
 
     /// Pre-warm the cache so the first TLS handshake is fast.
     pub fn pre_warm(&self, domains: &[String]) {
-        let mut store = self.store.lock().unwrap();
+        let mut store = self.store.lock().expect("AutoCertResolver lock poisoned");
         for d in domains {
             let _ = store.get_or_generate(d);
         }
@@ -92,7 +92,7 @@ impl ResolvesServerCert for AutoCertResolver {
         client_hello: rustls::server::ClientHello,
     ) -> Option<Arc<CertifiedKey>> {
         let sni = client_hello.server_name()?;
-        let mut store = self.store.lock().unwrap();
+        let mut store = self.store.lock().expect("AutoCertResolver lock poisoned");
         store.get_or_generate(sni)
     }
 }

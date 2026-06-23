@@ -1,0 +1,805 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sentinel WAF — Architecture Diagram</title>
+<style>
+/* ── Reset ─────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+/* ── Base ──────────────────────────────────────────────────────────── */
+body {
+  background: #06080f;
+  color: #e2e8f0;
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  padding: 48px 24px 80px;
+  min-height: 100vh;
+}
+
+/* ── Header ────────────────────────────────────────────────────────── */
+.page-header {
+  text-align: center;
+  margin-bottom: 56px;
+}
+.page-header h1 {
+  font-size: 1.9rem;
+  font-weight: 900;
+  letter-spacing: 6px;
+  text-transform: uppercase;
+  color: #f8fafc;
+  margin-bottom: 6px;
+}
+.page-header h1 span { color: #e94560; }
+.page-header p {
+  font-size: 0.72rem;
+  letter-spacing: 3px;
+  color: #475569;
+  text-transform: uppercase;
+}
+.divider {
+  width: 60px;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, #e94560, transparent);
+  margin: 12px auto;
+}
+
+/* ── Outer grid: main column + storage sidebar ─────────────────────── */
+.canvas {
+  max-width: 1160px;
+  margin: 0 auto;
+  position: relative;
+}
+
+.main-flow {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0;
+  margin-right: 230px; /* leave room for side storage */
+}
+
+/* ── Storage sidebar (absolute, aligned to right) ─────────────────── */
+.storage-rail {
+  position: absolute;
+  right: 0;
+  top: 0;
+  width: 215px;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+/* ── Layer boxes ───────────────────────────────────────────────────── */
+.layer {
+  border-radius: 12px;
+  padding: 20px 22px;
+  position: relative;
+  border: 1px solid;
+}
+
+.layer-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+.layer-icon { font-size: 1.15rem; }
+.layer-title {
+  font-size: 0.68rem;
+  font-weight: 800;
+  letter-spacing: 2.5px;
+  text-transform: uppercase;
+  flex: 1;
+}
+.layer-badge {
+  font-size: 0.54rem;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  border-radius: 20px;
+  opacity: 0.8;
+}
+
+/* Layer themes */
+.l-internet  { background: #080f1c; border-color: #1e4d7b; box-shadow: 0 0 28px rgba(30,77,123,.18); }
+.l-internet  .layer-title { color: #3b82f6; }
+.l-internet  .layer-badge { background: rgba(59,130,246,.15); color: #60a5fa; }
+
+.l-ebpf      { background: #0d0c05; border-color: #854d0e; box-shadow: 0 0 28px rgba(133,77,14,.18); }
+.l-ebpf      .layer-title { color: #f59e0b; }
+.l-ebpf      .layer-badge { background: rgba(245,158,11,.15); color: #fcd34d; }
+
+.l-dataplane { background: #0b0613; border-color: #e94560; box-shadow: 0 0 36px rgba(233,69,96,.16); }
+.l-dataplane .layer-title { color: #e94560; }
+.l-dataplane .layer-badge { background: rgba(233,69,96,.15); color: #fb7185; }
+
+.l-control   { background: #08081c; border-color: #6d28d9; box-shadow: 0 0 28px rgba(109,40,217,.18); }
+.l-control   .layer-title { color: #8b5cf6; }
+.l-control   .layer-badge { background: rgba(139,92,246,.15); color: #a78bfa; }
+
+.l-dashboard { background: #050f17; border-color: #0e7490; box-shadow: 0 0 28px rgba(14,116,144,.18); }
+.l-dashboard .layer-title { color: #22d3ee; }
+.l-dashboard .layer-badge { background: rgba(34,211,238,.15); color: #67e8f9; }
+
+/* ── Chips / badges ────────────────────────────────────────────────── */
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+
+.chip {
+  padding: 4px 10px;
+  border-radius: 5px;
+  font-size: 0.64rem;
+  font-weight: 600;
+  border: 1px solid;
+  white-space: nowrap;
+  line-height: 1.4;
+}
+.c-blue   { background:rgba(59,130,246,.12); border-color:rgba(59,130,246,.35); color:#93c5fd; }
+.c-yellow { background:rgba(245,158,11,.12); border-color:rgba(245,158,11,.35); color:#fde68a; }
+.c-red    { background:rgba(239,68,68,.12);  border-color:rgba(239,68,68,.35);  color:#fca5a5; }
+.c-pink   { background:rgba(233,69,96,.12);  border-color:rgba(233,69,96,.35);  color:#fda4af; }
+.c-orange { background:rgba(249,115,22,.12); border-color:rgba(249,115,22,.35); color:#fdba74; }
+.c-amber  { background:rgba(245,158,11,.12); border-color:rgba(217,119,6,.35);  color:#fef08a; }
+.c-green  { background:rgba(34,197,94,.12);  border-color:rgba(34,197,94,.35);  color:#86efac; }
+.c-teal   { background:rgba(20,184,166,.12); border-color:rgba(20,184,166,.35); color:#5eead4; }
+.c-cyan   { background:rgba(34,211,238,.12); border-color:rgba(34,211,238,.35); color:#a5f3fc; }
+.c-violet { background:rgba(139,92,246,.12); border-color:rgba(139,92,246,.35); color:#c4b5fd; }
+.c-slate  { background:rgba(100,116,139,.12);border-color:rgba(100,116,139,.35);color:#cbd5e1; }
+
+/* ── Listeners strip inside data plane ─────────────────────────────── */
+.listeners-row {
+  margin-bottom: 14px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid rgba(233,69,96,.22);
+}
+.listeners-label {
+  font-size: 0.55rem;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: #e94560;
+  opacity: .6;
+  margin-bottom: 8px;
+}
+
+/* ── Phase pipeline ────────────────────────────────────────────────── */
+.phases { display: flex; flex-direction: column; gap: 5px; }
+
+.phase {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 14px;
+  border-radius: 7px;
+  background: rgba(255,255,255,.025);
+  border-left: 3px solid;
+}
+
+.phase-num {
+  font-size: 0.55rem;
+  font-weight: 900;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  min-width: 54px;
+  opacity: .75;
+  flex-shrink: 0;
+}
+
+/* ── Arrows between layers ─────────────────────────────────────────── */
+.arrow-block {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 10px 0 8px;
+  gap: 8px;
+}
+
+.arrow-v {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+.shaft    { width: 1px; height: 22px; background: linear-gradient(to bottom, #1e293b, #334155); }
+.head-d   { width: 0; height: 0; border-left: 5px solid transparent; border-right: 5px solid transparent; border-top: 9px solid #334155; }
+.head-u   { width: 0; height: 0; border-left: 5px solid transparent; border-right: 5px solid transparent; border-bottom: 9px solid #334155; }
+
+.arrow-text {
+  font-size: 0.58rem;
+  color: #475569;
+  letter-spacing: 1px;
+  text-align: center;
+  font-style: italic;
+}
+
+/* ── Footnote text inside layers ───────────────────────────────────── */
+.note {
+  margin-top: 10px;
+  font-size: 0.6rem;
+  line-height: 1.65;
+  color: #4a5568;
+}
+.note strong { font-weight: 700; }
+
+/* ── Storage boxes ─────────────────────────────────────────────────── */
+.stor-spacer { flex-shrink: 0; }
+
+.stor-label {
+  font-size: 0.54rem;
+  letter-spacing: 2.5px;
+  text-transform: uppercase;
+  text-align: center;
+  margin-bottom: 10px;
+  color: #334155;
+}
+
+.stor-connect {
+  font-size: 0.56rem;
+  color: #334155;
+  text-align: center;
+  padding: 5px 0 3px;
+  letter-spacing: 1px;
+}
+
+.stor-box {
+  border-radius: 8px;
+  padding: 12px 14px;
+  border: 1px solid;
+  margin-bottom: 0;
+}
+.stor-name {
+  font-size: 0.66rem;
+  font-weight: 800;
+  letter-spacing: 1.5px;
+  margin-bottom: 5px;
+}
+.stor-desc {
+  font-size: 0.59rem;
+  line-height: 1.6;
+  opacity: .65;
+}
+
+.s-redis { background:#040f04; border-color:#14532d; }
+.s-redis .stor-name { color:#4ade80; }
+
+.s-ch    { background:#040810; border-color:#1e3a6e; }
+.s-ch    .stor-name { color:#60a5fa; }
+
+.s-s3    { background:#0d0804; border-color:#7c3516; }
+.s-s3    .stor-name { color:#fb923c; }
+
+.s-pg    { background:#06051a; border-color:#3730a3; }
+.s-pg    .stor-name { color:#818cf8; }
+
+/* ── Connector line (storage ↔ main flow) ─────────────────────────── */
+.stor-box::before {
+  content: '⟵';
+  position: absolute;
+  left: -22px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 0.75rem;
+  color: #1e293b;
+}
+.stor-box { position: relative; }
+
+/* ── Attack trace ──────────────────────────────────────────────────── */
+.trace-block {
+  max-width: 1160px;
+  margin: 36px auto 0;
+  background: #06080f;
+  border: 1px solid #1e293b;
+  border-radius: 10px;
+  padding: 22px 26px;
+}
+.trace-title {
+  font-size: 0.6rem;
+  letter-spacing: 3px;
+  text-transform: uppercase;
+  color: #475569;
+  margin-bottom: 16px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.trace-title::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: #1e293b;
+}
+.trace-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 5px 0;
+  font-size: 0.66rem;
+  font-family: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace;
+  border-bottom: 1px solid rgba(255,255,255,.03);
+}
+.trace-row:last-child { border-bottom: none; }
+.tr-step { color: #334155; min-width: 20px; }
+.tr-phase { font-weight: 800; min-width: 90px; flex-shrink: 0; }
+.tr-body  { color: #9ca3af; line-height: 1.5; }
+.tr-pass  { color: #4ade80; font-weight: 700; }
+.tr-block { color: #ef4444; font-weight: 700; }
+
+/* ── Legend ────────────────────────────────────────────────────────── */
+.legend {
+  max-width: 1160px;
+  margin: 24px auto 0;
+  border: 1px solid #0f172a;
+  border-radius: 8px;
+  padding: 16px 22px;
+}
+.legend-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  align-items: center;
+}
+.lg-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 0.62rem;
+  color: #64748b;
+}
+.lg-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+
+/* ── Responsive ────────────────────────────────────────────────────── */
+@media (max-width: 860px) {
+  .main-flow  { margin-right: 0; }
+  .storage-rail { position: static; width: 100%; margin-top: 28px; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .stor-spacer { display: none; }
+  .stor-connect { display: none; }
+}
+</style>
+</head>
+<body>
+
+<!-- ═════════════════════════════════════════════════════════════════
+     PAGE HEADER
+     ═════════════════════════════════════════════════════════════════ -->
+<div class="page-header">
+  <h1>Sentinel <span>WAF</span></h1>
+  <div class="divider"></div>
+  <p>Architecture Diagram · Request Lifecycle · System Overview</p>
+</div>
+
+
+<!-- ═════════════════════════════════════════════════════════════════
+     MAIN CANVAS
+     ═════════════════════════════════════════════════════════════════ -->
+<div class="canvas">
+
+  <!-- ─────────────── MAIN VERTICAL FLOW ─────────────── -->
+  <div class="main-flow">
+
+    <!-- ══════════════════════════════════════════════════
+         1. INTERNET CLIENTS
+         ══════════════════════════════════════════════ -->
+    <div class="layer l-internet">
+      <div class="layer-head">
+        <span class="layer-icon">🌐</span>
+        <span class="layer-title">Internet — Clients</span>
+        <span class="layer-badge">ENTRY POINT</span>
+      </div>
+      <div class="chips">
+        <span class="chip c-blue">👤 Users / Browsers</span>
+        <span class="chip c-blue">📱 Mobile Apps &amp; APIs</span>
+        <span class="chip c-blue">🤖 Botnets &amp; Scanners</span>
+        <span class="chip c-blue">💀 DDoS Attackers</span>
+      </div>
+      <div class="note">
+        All arrive on the same IP:443 — the WAF's job is to separate
+        <strong style="color:#60a5fa">legitimate</strong> traffic from
+        <strong style="color:#f87171">malicious</strong> traffic before it ever touches your app.
+      </div>
+    </div>
+
+    <!-- arrow ↓ -->
+    <div class="arrow-block">
+      <div class="arrow-v">
+        <div class="shaft"></div>
+        <div class="head-d"></div>
+      </div>
+      <div class="arrow-text">HTTP / HTTPS / HTTP3 (QUIC)</div>
+    </div>
+
+    <!-- ══════════════════════════════════════════════════
+         2. KERNEL SPACE — eBPF / XDP
+         ══════════════════════════════════════════════ -->
+    <div class="layer l-ebpf">
+      <div class="layer-head">
+        <span class="layer-icon">⚡</span>
+        <span class="layer-title">Kernel Space — eBPF / XDP</span>
+        <span class="layer-badge">LAYER 4 · PRE-USERSPACE</span>
+      </div>
+      <div class="chips">
+        <span class="chip c-yellow">🔬 XDP Packet Filter (NIC level)</span>
+        <span class="chip c-yellow">🗺 BPF Hash Map — Blocklist</span>
+        <span class="chip c-yellow">🚫 IP + CIDR Drop Rules</span>
+        <span class="chip c-yellow">⚡ ~50 ns drop latency</span>
+        <span class="chip c-yellow">📊 25 M packets / sec per core</span>
+      </div>
+      <div class="note">
+        <strong style="color:#fbbf24">Runs inside the Linux kernel</strong>, attached at the NIC driver hook (XDP).
+        Known bad IPs hit an O(1) BPF map lookup — the packet is dropped before Linux even allocates an
+        <code style="color:#fde68a">sk_buff</code>. ~10× faster than dropping in userspace.
+        Cannot inspect HTTP (only sees IP/port), but that's enough for L4 DDoS &amp; large botnets.
+        The Rust data plane can push IPs here dynamically via <code style="color:#fde68a">sentinel block add</code>.
+      </div>
+    </div>
+
+    <!-- arrow ↓ -->
+    <div class="arrow-block">
+      <div class="arrow-v">
+        <div class="shaft"></div>
+        <div class="head-d"></div>
+      </div>
+      <div class="arrow-text">Clean traffic passes to userspace TCP stack</div>
+    </div>
+
+    <!-- ══════════════════════════════════════════════════
+         3. SENTINEL DATA PLANE — RUST
+         ══════════════════════════════════════════════ -->
+    <div class="layer l-dataplane">
+      <div class="layer-head">
+        <span class="layer-icon">🛡</span>
+        <span class="layer-title">Sentinel Data Plane — Rust</span>
+        <span class="layer-badge">P99 &lt; 1 MS · NO GC · STATELESS</span>
+      </div>
+
+      <!-- Listeners -->
+      <div class="listeners-row">
+        <div class="listeners-label">Listeners — TLS Termination</div>
+        <div class="chips">
+          <span class="chip c-pink">HTTP/1.1 · hyper</span>
+          <span class="chip c-pink">HTTP/2 · h2</span>
+          <span class="chip c-pink">HTTP/3 / QUIC · s2n-quic</span>
+          <span class="chip c-pink">TLS · rustls (no OpenSSL)</span>
+          <span class="chip c-pink">🔐 Post-Quantum: Kyber + Dilithium</span>
+          <span class="chip c-pink">SNI → site config lookup</span>
+        </div>
+      </div>
+
+      <!-- Phases -->
+      <div class="phases">
+
+        <!-- Phase 0 -->
+        <div class="phase" style="border-color:#ef4444;">
+          <span class="phase-num" style="color:#ef4444;">PH 0<br>CONN</span>
+          <div class="chips">
+            <span class="chip c-red">Anti-DDoS · Token Bucket · conn/sec per IP</span>
+            <span class="chip c-red">IP Reputation · Threat Intelligence feeds</span>
+            <span class="chip c-red">CIDR Allow / Deny lists</span>
+            <span class="chip c-red">Cumulative score from Correlation Engine</span>
+          </div>
+        </div>
+
+        <!-- Phase 1 -->
+        <div class="phase" style="border-color:#f97316;">
+          <span class="phase-num" style="color:#f97316;">PH 1<br>HDRS</span>
+          <div class="chips">
+            <span class="chip c-orange">Rate Limiting · Token Bucket (Redis)</span>
+            <span class="chip c-orange">Bot Detection · User-Agent classify</span>
+            <span class="chip c-orange">JA4 TLS Fingerprint · catches fake UAs</span>
+            <span class="chip c-orange">GeoIP · MaxMind GeoLite2 · country allow/deny</span>
+            <span class="chip c-orange">Rule Engine (SRL) · DSL → AST → bytecode VM</span>
+            <span class="chip c-orange">OWASP CRS 4.7 · SecRule compat layer</span>
+            <span class="chip c-orange">WASM Plugins · wasmtime sandboxed</span>
+          </div>
+        </div>
+
+        <!-- Phase 2 -->
+        <div class="phase" style="border-color:#eab308;">
+          <span class="phase-num" style="color:#eab308;">PH 2<br>BODY</span>
+          <div class="chips">
+            <span class="chip c-amber">Body Size Limit · 413 if exceeded</span>
+            <span class="chip c-amber">CRS Body Rules · POST vars · JSON</span>
+            <span class="chip c-amber">ML: 24-dim feature extraction</span>
+            <span class="chip c-amber">ML: ONNX Classifier · ~2 ms · SQLi/XSS/RCE…</span>
+            <span class="chip c-amber">ML: Isolation Forest · zero-day anomaly</span>
+            <span class="chip c-amber">Anomaly Gate · combined score ≥ threshold → 403</span>
+          </div>
+        </div>
+
+        <!-- Phase 3 -->
+        <div class="phase" style="border-color:#22c55e;">
+          <span class="phase-num" style="color:#22c55e;">PH 3<br>FWRD</span>
+          <div class="chips">
+            <span class="chip c-green">Load Balancer · RoundRobin / LeastConn / IpHash</span>
+            <span class="chip c-green">Adaptive LB · response-time weighted</span>
+            <span class="chip c-green">Active Health Checks · GET /health probes</span>
+            <span class="chip c-green">Passive Failure Tracking · 5xx / timeout</span>
+            <span class="chip c-green">Circuit Breaker · open → half-open → close</span>
+            <span class="chip c-green">WebSocket Relay · Upgrade: websocket</span>
+          </div>
+        </div>
+
+        <!-- Phase 4 -->
+        <div class="phase" style="border-color:#06b6d4;">
+          <span class="phase-num" style="color:#06b6d4;">PH 4<br>RESP</span>
+          <div class="chips">
+            <span class="chip c-teal">HSTS · max-age=31536000; includeSubDomains</span>
+            <span class="chip c-teal">X-Frame-Options: DENY</span>
+            <span class="chip c-teal">Content-Security-Policy injection</span>
+            <span class="chip c-teal">Strip hop-by-hop headers</span>
+            <span class="chip c-teal">Server header scrubbing</span>
+          </div>
+        </div>
+
+        <!-- Phase 5 -->
+        <div class="phase" style="border-color:#a78bfa;">
+          <span class="phase-num" style="color:#a78bfa;">PH 5<br>DLP</span>
+          <div class="chips">
+            <span class="chip c-violet">Credit Cards · Luhn algo + card prefixes</span>
+            <span class="chip c-violet">SSN · regex + area validation</span>
+            <span class="chip c-violet">API Keys · Stripe / GitHub / AWS patterns</span>
+            <span class="chip c-violet">JWT tokens · eyJ… base64url detection</span>
+            <span class="chip c-violet">High-entropy strings · Shannon &gt; 4.5</span>
+            <span class="chip c-violet">Mode: log | mask | block</span>
+          </div>
+        </div>
+
+        <!-- Phase 6 -->
+        <div class="phase" style="border-color:#475569;">
+          <span class="phase-num" style="color:#64748b;">PH 6<br>LOG</span>
+          <div class="chips">
+            <span class="chip c-slate">NDJSON Structured Logs · access + WAF events</span>
+            <span class="chip c-slate">OpenTelemetry Traces · per-phase spans</span>
+            <span class="chip c-slate">Prometheus Metrics · RPS / latency / blocks</span>
+            <span class="chip c-slate">Correlation Engine · per-IP score in Redis</span>
+            <span class="chip c-slate">Auto-blocklist · score ≥ 80 → eBPF BPF map</span>
+          </div>
+        </div>
+
+      </div><!-- /.phases -->
+
+      <div class="note">
+        Every phase can <strong style="color:#e94560">BLOCK</strong> (return 403/429) or
+        <strong style="color:#4ade80">PASS</strong> the request. Rules and WASM plugins
+        register against specific phases. The data plane is completely stateless — config
+        is hot-swapped via <code style="color:#fda4af">Arc&lt;ArcSwap&lt;SiteConfig&gt;&gt;</code>
+        pushed from the control plane over gRPC with zero downtime.
+      </div>
+    </div><!-- /.l-dataplane -->
+
+    <!-- arrow ↕ bidirectional gRPC -->
+    <div class="arrow-block" style="gap:16px;">
+      <div class="arrow-v">
+        <div class="head-u"></div>
+        <div class="shaft"></div>
+      </div>
+      <div>
+        <div class="arrow-text">gRPC / mTLS — Config Push (Control → Data)</div>
+        <div class="arrow-text" style="margin-top:2px;">OTel Metrics Push (Data → Control)</div>
+      </div>
+      <div class="arrow-v">
+        <div class="shaft"></div>
+        <div class="head-d"></div>
+      </div>
+    </div>
+
+    <!-- ══════════════════════════════════════════════════
+         4. CONTROL PLANE — GO + RAFT
+         ══════════════════════════════════════════════ -->
+    <div class="layer l-control">
+      <div class="layer-head">
+        <span class="layer-icon">🟣</span>
+        <span class="layer-title">Control Plane — Go + Raft Cluster</span>
+        <span class="layer-badge">3–5 NODES · HA · NOT ON REQUEST PATH</span>
+      </div>
+      <div class="chips" style="margin-bottom:14px;">
+        <span class="chip c-violet">REST API · Gin · /api/v1/*</span>
+        <span class="chip c-violet">gRPC Server · port 9500</span>
+        <span class="chip c-violet">Raft Consensus · leader election ~150 ms</span>
+        <span class="chip c-violet">JWT / OIDC Auth</span>
+        <span class="chip c-violet">RBAC · admin / operator / viewer</span>
+        <span class="chip c-violet">HMAC Audit Log · tamper-evident chain</span>
+        <span class="chip c-violet">Config Service · write PG → Raft → gRPC push</span>
+        <span class="chip c-violet">SSE Log Stream · live logs to dashboard</span>
+        <span class="chip c-violet">PostgreSQL 16 · RLS multi-tenancy</span>
+        <span class="chip c-violet">LLM Copilot Proxy</span>
+      </div>
+      <div class="note">
+        <strong style="color:#a78bfa">Raft:</strong> 3 or 5 nodes — one leader handles writes,
+        followers replicate state. Leader dies → new election in ~150 ms. No SPOF.
+        <strong style="color:#a78bfa">RLS:</strong> every PostgreSQL table has
+        <code style="color:#c4b5fd">tenant_id</code> + row-level security — even a bug in
+        app code cannot leak another tenant's data. Writes to rules/sites automatically
+        propagate to all data planes via gRPC streaming config push.
+      </div>
+    </div>
+
+    <!-- arrow ↓ -->
+    <div class="arrow-block">
+      <div class="arrow-v">
+        <div class="shaft"></div>
+        <div class="head-d"></div>
+      </div>
+      <div class="arrow-text">REST / HTTP  ·  Server-Sent Events (SSE live logs)</div>
+    </div>
+
+    <!-- ══════════════════════════════════════════════════
+         5. DASHBOARD — NEXT.JS 14
+         ══════════════════════════════════════════════ -->
+    <div class="layer l-dashboard">
+      <div class="layer-head">
+        <span class="layer-icon">💻</span>
+        <span class="layer-title">Admin Dashboard — Next.js 14 + TypeScript</span>
+        <span class="layer-badge">STATELESS · JWT SESSION</span>
+      </div>
+      <div class="chips">
+        <span class="chip c-cyan">📊 Overview — RPS · p99 · blocks · eBPF drops</span>
+        <span class="chip c-cyan">🌐 Sites — CRUD · upstreams · TLS · rules assign</span>
+        <span class="chip c-cyan">📜 Rules — editor · dry-run tester · CRS browser</span>
+        <span class="chip c-cyan">📋 Live Logs — SSE stream · filter by site / phase</span>
+        <span class="chip c-cyan">🚨 Alerts — ack / resolve workflows</span>
+        <span class="chip c-cyan">🤖 ML Stats — precision · recall · FP/TP rates</span>
+        <span class="chip c-cyan">🔌 WASM Plugins — install · manage · cap grants</span>
+        <span class="chip c-cyan">🔑 Users &amp; RBAC · audit log viewer</span>
+        <span class="chip c-cyan">💬 LLM Copilot — explain alerts · suggest rules</span>
+      </div>
+      <div class="note">
+        Calls the Go REST API for all CRUD operations. Connects to
+        <code style="color:#67e8f9">GET /api/v1/logs/stream</code> via
+        <strong style="color:#22d3ee">Server-Sent Events</strong> for real-time log tailing.
+        The LLM Copilot sends alert context to the control plane which proxies to an LLM
+        to return plain-English explanations or generated SRL rule suggestions.
+      </div>
+    </div>
+
+  </div><!-- /.main-flow -->
+
+
+  <!-- ─────────────── STORAGE SIDEBAR ─────────────── -->
+  <div class="storage-rail">
+
+    <!-- Spacer: aligns with start of data plane
+         (internet ~148px + arrow ~60px + ebpf ~188px + arrow ~60px = ~456px) -->
+    <div class="stor-spacer" style="height: 462px;"></div>
+
+    <div class="stor-label">Storage Backends</div>
+
+    <div class="stor-connect">⟵ Phase 0–1 · rate limits</div>
+    <div class="stor-box s-redis">
+      <div class="stor-name">Redis 7</div>
+      <div class="stor-desc">
+        Rate-limit token buckets<br>
+        Per-IP correlation scores<br>
+        Pub/sub for live log stream<br>
+        Distributed locks<br>
+        <em style="color:#166534;">Fallback: in-memory HashMap</em>
+      </div>
+    </div>
+
+    <div class="stor-connect">⟵ Phase 6 · access logs</div>
+    <div class="stor-box s-ch">
+      <div class="stor-name">ClickHouse</div>
+      <div class="stor-desc">
+        NDJSON access log events<br>
+        WAF block / alert events<br>
+        Time-series: 1s / 1m / 1h<br>
+        Dashboard chart queries<br>
+        <em style="color:#1e3a6e;">Fallback: in-memory ring buf</em>
+      </div>
+    </div>
+
+    <div class="stor-connect">⟵ Phase 1–2 · ML + WASM</div>
+    <div class="stor-box s-s3">
+      <div class="stor-name">S3 / MinIO</div>
+      <div class="stor-desc">
+        ONNX ML model blobs<br>
+        WASM plugin binaries<br>
+        Scanner reports<br>
+        Config backups<br>
+        <em style="color:#7c3516;">Fallback: local file cache</em>
+      </div>
+    </div>
+
+    <!-- gap aligns roughly with control plane -->
+    <div class="stor-spacer" style="height: 80px;"></div>
+
+    <div class="stor-connect">⟵ Control Plane · config</div>
+    <div class="stor-box s-pg">
+      <div class="stor-name">PostgreSQL 16</div>
+      <div class="stor-desc">
+        Tenants / users / sites<br>
+        Rules / plugins / alerts<br>
+        Audit log (HMAC chain)<br>
+        OIDC config · API keys<br>
+        <em style="color:#3730a3;">RLS: per-tenant isolation</em>
+      </div>
+    </div>
+
+  </div><!-- /.storage-rail -->
+
+</div><!-- /.canvas -->
+
+
+<!-- ═════════════════════════════════════════════════════════════════
+     ATTACK TRACE EXAMPLE
+     ═════════════════════════════════════════════════════════════════ -->
+<div class="trace-block">
+  <div class="trace-title">End-to-End Trace — SQL Injection Attack</div>
+
+  <div class="trace-row">
+    <span class="tr-step">0</span>
+    <span class="tr-phase" style="color:#64748b;">REQUEST</span>
+    <span class="tr-body">
+      Client sends <code style="color:#fca5a5;">POST /login</code>
+      &nbsp; body: <code style="color:#fca5a5;">username=admin'--&amp;password=x</code>
+    </span>
+  </div>
+  <div class="trace-row">
+    <span class="tr-step">1</span>
+    <span class="tr-phase" style="color:#f59e0b;">eBPF / XDP</span>
+    <span class="tr-body">IP <code>203.0.113.5</code> → BPF map lookup (~50 ns) → not in blocklist</span>
+    <span class="tr-pass">PASS</span>
+  </div>
+  <div class="trace-row">
+    <span class="tr-step">2</span>
+    <span class="tr-phase" style="color:#ef4444;">Phase 0</span>
+    <span class="tr-body">2 connections / sec (threshold: 100) · IP rep score: 0</span>
+    <span class="tr-pass">PASS</span>
+  </div>
+  <div class="trace-row">
+    <span class="tr-step">3</span>
+    <span class="tr-phase" style="color:#f97316;">Phase 1</span>
+    <span class="tr-body">JA4 fingerprint = real Chrome · User-Agent: browser · GeoIP: US (allowed) · rate: 20 req/min (limit 1000)</span>
+    <span class="tr-pass">PASS</span>
+  </div>
+  <div class="trace-row">
+    <span class="tr-step">4</span>
+    <span class="tr-phase" style="color:#eab308;">Phase 2</span>
+    <span class="tr-body">
+      Rule 1000001 matches <code style="color:#fef08a;">admin'--</code> (UNION/comment SQLi pattern) → <strong>+10 anomaly pts</strong>
+      &nbsp;·&nbsp; ML ONNX: 94% confidence SQLi → combined score <strong>10.87 ≥ threshold 10</strong>
+    </span>
+    <span class="tr-block">BLOCK 403</span>
+  </div>
+  <div class="trace-row">
+    <span class="tr-step">5</span>
+    <span class="tr-phase" style="color:#64748b;">Phase 6</span>
+    <span class="tr-body">
+      Redis: IP score updated to +67 · ClickHouse: WAF event written · OTel: span emitted · Backend: never saw request
+      &nbsp;·&nbsp; <strong style="color:#4ade80;">Total WAF overhead: ~0.4 ms</strong>
+    </span>
+  </div>
+</div>
+
+
+<!-- ═════════════════════════════════════════════════════════════════
+     SCALING NOTE + LEGEND
+     ═════════════════════════════════════════════════════════════════ -->
+<div class="legend" style="margin-top:20px;">
+  <div class="legend-row" style="margin-bottom:12px;">
+    <span style="font-size:0.58rem;letter-spacing:2px;text-transform:uppercase;color:#334155;margin-right:10px;">Scaling</span>
+    <span style="font-size:0.62rem;color:#475569;">
+      <strong style="color:#64748b;">Data Plane (Rust)</strong> — stateless, scale horizontally to 1 → 1000 nodes behind any L4 LB &nbsp;|&nbsp;
+      <strong style="color:#64748b;">Control Plane (Go)</strong> — Raft cluster (3–5 nodes), shared PostgreSQL &nbsp;|&nbsp;
+      <strong style="color:#64748b;">Dashboard</strong> — stateless Next.js, JWT carries session, CDN-friendly
+    </span>
+  </div>
+  <div class="legend-row">
+    <span style="font-size:0.58rem;letter-spacing:2px;text-transform:uppercase;color:#334155;margin-right:10px;">Legend</span>
+    <div class="lg-item"><div class="lg-dot" style="background:#3b82f6;"></div>Internet / Clients</div>
+    <div class="lg-item"><div class="lg-dot" style="background:#f59e0b;"></div>eBPF / XDP Kernel</div>
+    <div class="lg-item"><div class="lg-dot" style="background:#e94560;"></div>Data Plane · Rust</div>
+    <div class="lg-item"><div class="lg-dot" style="background:#8b5cf6;"></div>Control Plane · Go</div>
+    <div class="lg-item"><div class="lg-dot" style="background:#22d3ee;"></div>Dashboard · Next.js</div>
+    <div class="lg-item"><div class="lg-dot" style="background:#4ade80;"></div>Redis</div>
+    <div class="lg-item"><div class="lg-dot" style="background:#60a5fa;"></div>ClickHouse</div>
+    <div class="lg-item"><div class="lg-dot" style="background:#fb923c;"></div>S3 / MinIO</div>
+    <div class="lg-item"><div class="lg-dot" style="background:#818cf8;"></div>PostgreSQL</div>
+  </div>
+</div>
+
+</body>
+</html>

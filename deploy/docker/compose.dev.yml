@@ -17,6 +17,7 @@ services:
     image: postgres:16-alpine
     container_name: sentinel-postgres
     restart: unless-stopped
+    mem_limit: 256m
     environment:
       POSTGRES_USER: sentinel
       POSTGRES_PASSWORD: sentinel_dev
@@ -37,7 +38,8 @@ services:
     image: redis:7-alpine
     container_name: sentinel-redis
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "512mb", "--maxmemory-policy", "allkeys-lru"]
+    mem_limit: 320m
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
     ports:
       - "6379:6379"
     volumes:
@@ -52,6 +54,7 @@ services:
     image: clickhouse/clickhouse-server:24-alpine
     container_name: sentinel-clickhouse
     restart: unless-stopped
+    mem_limit: 1536m
     ulimits:
       nofile: { soft: 262144, hard: 262144 }
     environment:
@@ -59,6 +62,8 @@ services:
       CLICKHOUSE_USER: sentinel
       CLICKHOUSE_PASSWORD: sentinel_dev
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+      # Cap ClickHouse's own memory bookkeeping so it respects the container limit
+      CLICKHOUSE_MAX_SERVER_MEMORY_USAGE_TO_RAM_RATIO: "0.6"
     ports:
       - "8123:8123"   # HTTP
       - "9000:9000"   # native
@@ -69,6 +74,7 @@ services:
     image: minio/minio:latest
     container_name: sentinel-minio
     restart: unless-stopped
+    mem_limit: 256m
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: sentinel
@@ -84,6 +90,7 @@ services:
     image: otel/opentelemetry-collector-contrib:latest
     container_name: sentinel-otel
     restart: unless-stopped
+    mem_limit: 256m
     command: ["--config=/etc/otel/config.yaml"]
     volumes:
       - ./otel-config.yaml:/etc/otel/config.yaml:ro
@@ -96,8 +103,11 @@ services:
     image: jaegertracing/all-in-one:latest
     container_name: sentinel-jaeger
     restart: unless-stopped
+    mem_limit: 256m
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
+      # Bound the in-memory trace store instead of letting it grow unbounded
+      MEMORY_MAX_TRACES: "10000"
     ports:
       - "16686:16686" # UI
       - "14250:14250"
@@ -107,6 +117,7 @@ services:
     image: kennethreitz/httpbin:latest
     container_name: sentinel-upstream-demo
     restart: unless-stopped
+    mem_limit: 128m
     ports:
       - "8080:80"
 

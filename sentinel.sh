@@ -38,7 +38,12 @@ CP_URL="http://localhost:$CP_REST"
 DASH_LOG=/tmp/sentinel-dashboard.log
 CP_LOG=/tmp/sentinel-controlplane.log
 WAF_LOG=/tmp/sentinel-waf.log
-WAF_BIN="$REPO/target/debug/sentinel-bin"
+# Prefer the optimized release build (lower RAM, faster); fall back to debug.
+if [[ -f "$REPO/target/release/sentinel-bin" ]]; then
+  WAF_BIN="$REPO/target/release/sentinel-bin"
+else
+  WAF_BIN="$REPO/target/debug/sentinel-bin"
+fi
 WAF_CONFIG="$REPO/configs/dev/sentinel.yaml"
 
 # Sites config file — one line per site:  name:container:host_port:container_port:image
@@ -137,7 +142,7 @@ _build_dash() {
   info "Building dashboard (this takes ~30 s)…"
   cd "$DASH"
   if NEXT_PUBLIC_CONTROL_PLANE_URL=$CP_URL \
-     NODE_OPTIONS="--max-old-space-size=3072" \
+     NODE_OPTIONS="--max-old-space-size=2048" \
      npm run build 2>&1; then
     success "Dashboard built"
   else
@@ -150,6 +155,9 @@ _build_dash() {
 _start_cp() {
   info "Starting control plane…"
   mkdir -p /tmp/sentinel-logs
+  # This launcher manages the WAF proxy itself (see _start_proxy), so tell the
+  # control plane NOT to spawn a second proxy — avoids a duplicate data plane.
+  SENTINEL_AUTOSTART_DATAPLANE=0 \
   nohup "$CP/bin/controllerd" > "$CP_LOG" 2>&1 &
   disown
   wait_for_port $CP_REST "Control plane"
@@ -182,7 +190,7 @@ _start_dash() {
   cd "$DASH"
   NEXT_PUBLIC_CONTROL_PLANE_URL=$CP_URL \
   PORT=$DASH_PORT \
-  NODE_OPTIONS="--max-old-space-size=3072" \
+  NODE_OPTIONS="--max-old-space-size=1024" \
   nohup npm start > "$DASH_LOG" 2>&1 &
   disown
   wait_for_port $DASH_PORT "Dashboard"
@@ -276,8 +284,20 @@ cmd_site_on() {
     info "Starting existing container '$container'…"
     docker start "$container" >/dev/null
   else
-    info "Pulling + starting '$name' ($image)…"
-    docker run -d --name "$container" -p "${host_port}:${container_port}" --restart unless-stopped "$image" >/dev/null
+    # Cap each lab site's RAM. Node-based sites (Juice Shop) need a bit more
+    # than lightweight Apache/PHP sites; default keeps any new site bounded.
+    local mem_limit
+    case "$name" in
+      juiceshop) mem_limit="768m" ;;
+      dvwa)      mem_limit="512m" ;;
+      *)         mem_limit="512m" ;;
+    esac
+    info "Pulling + starting '$name' ($image, mem≤${mem_limit})…"
+    # Cap RAM but leave Docker's default swap headroom (2× mem) as a safety
+    # valve so a brief spike never hard-kills a working site.
+    docker run -d --name "$container" -p "${host_port}:${container_port}" \
+      --memory="$mem_limit" \
+      --restart unless-stopped "$image" >/dev/null
   fi
 
   local tries=0
