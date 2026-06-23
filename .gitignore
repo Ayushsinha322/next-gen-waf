@@ -57,3 +57,6 @@ notes/
 
 # Internal documentation — kept local, not pushed to remote
 docs/
+
+# Presentation deck — kept local, not pushed to remote
+Sentinel_WAF_Overview.pptx
