@@ -173,6 +173,10 @@ pub enum Operator {
     Eq(String),
     Ge(i64),
     Exists,
+    /// libinjection-based SQL-injection detection (`@detectSQLi`).
+    DetectSqli,
+    /// libinjection-based cross-site-scripting detection (`@detectXSS`).
+    DetectXss,
     AnomalyScore { op: CmpOp, threshold: u32 },
     MlScore { model: String, op: CmpOp, threshold: f32 },
     RateLimit { dimension: RateLimitDim, rps: u32, burst: u32 },

@@ -1417,6 +1417,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
+name = "libinjectionrs"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b35e2042f461acc92e23665eaecdee7a403e08d7aaa41935dd6cd66c84209be1"
+dependencies = [
+ "bitflags",
+ "serde_json",
+ "smallvec",
+]
+
+[[package]]
 name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2269,6 +2280,7 @@ dependencies = [
  "bytes",
  "criterion",
  "http",
+ "libinjectionrs",
  "nom",
  "once_cell",
  "parking_lot",

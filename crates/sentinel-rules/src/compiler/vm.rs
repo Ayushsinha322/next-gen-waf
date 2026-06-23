@@ -386,6 +386,32 @@ pub fn evaluate(
                 stack.push(StackVal::Bool(exists));
             }
 
+            Instruction::DetectSqli => {
+                let values = pop_strings(&mut stack);
+                if values.is_empty() {
+                    stack.push(StackVal::Absent);
+                } else {
+                    let matched = values
+                        .iter()
+                        .any(|s| libinjectionrs::detect_sqli(s.as_bytes()).is_injection());
+                    debug!(matched, "DetectSqli");
+                    stack.push(StackVal::Bool(matched));
+                }
+            }
+
+            Instruction::DetectXss => {
+                let values = pop_strings(&mut stack);
+                if values.is_empty() {
+                    stack.push(StackVal::Absent);
+                } else {
+                    let matched = values
+                        .iter()
+                        .any(|s| libinjectionrs::detect_xss(s.as_bytes()).is_injection());
+                    debug!(matched, "DetectXss");
+                    stack.push(StackVal::Bool(matched));
+                }
+            }
+
             Instruction::Never => {
                 let _ = pop_strings(&mut stack);
                 stack.push(StackVal::Bool(false));

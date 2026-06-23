@@ -340,6 +340,12 @@ fn emit_operator_match(
         Operator::Exists => {
             instrs.push(Instruction::Exists);
         }
+        Operator::DetectSqli => {
+            instrs.push(Instruction::DetectSqli);
+        }
+        Operator::DetectXss => {
+            instrs.push(Instruction::DetectXss);
+        }
         Operator::Never => {
             instrs.push(Instruction::Never);
         }

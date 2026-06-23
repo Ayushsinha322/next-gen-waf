@@ -82,6 +82,14 @@ pub enum Instruction {
     /// Pop `StrVec`, push `Bool(!values.is_empty() && values.iter().any(|s| !s.is_empty()))`.
     Exists,
 
+    /// Pop `StrVec`, run libinjection SQLi detection on each value, push
+    /// `Bool(any value flagged as SQL injection)`.
+    DetectSqli,
+
+    /// Pop `StrVec`, run libinjection XSS detection on each value, push
+    /// `Bool(any value flagged as XSS)`.
+    DetectXss,
+
     /// Always push `Bool(false)` — used for intentionally disabled rules.
     Never,
 

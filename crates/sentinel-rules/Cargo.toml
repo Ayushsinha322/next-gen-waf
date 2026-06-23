@@ -19,6 +19,7 @@ bytes = { workspace = true }
 once_cell = { workspace = true }
 parking_lot = { workspace = true }
 percent-encoding = { workspace = true }
+libinjectionrs = "0.1"
 
 [dev-dependencies]
 tempfile = { workspace = true }

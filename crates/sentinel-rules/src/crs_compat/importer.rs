@@ -366,20 +366,10 @@ pub(crate) fn crs_op_to_operator(op_name: &str, pattern: &str) -> Result<Operato
         }
         "exists" | "unconditionalMatch" => Ok(Operator::Exists),
         "noMatch" => Ok(Operator::Not(Box::new(Operator::Exists))),
-        "detectsqli" => {
-            warn!(op = op_name, "CRS importer: @detectSQLi mapped to stub regex");
-            Ok(Operator::Rx(
-                r"(?i)\b(?:select|union|insert|update|delete|drop|exec(?:ute)?|sleep|benchmark|waitfor|information_schema|load_file|outfile|dumpfile|hex|char|ascii|substr|version|database|schema|table_name|column_name|concat|group_concat)\b"
-                    .to_owned(),
-            ))
-        }
-        "detectxss" => {
-            warn!(op = op_name, "CRS importer: @detectXSS mapped to stub regex");
-            Ok(Operator::Rx(
-                r#"(?i)(?:<\s*script|<\s*(?:img|svg|body|iframe|object|embed|link|meta|input|button|a)[^>]*\s+on\w+\s*=|on\w+\s*=\s*["']?(?:alert|confirm|prompt|eval|document|window|location)|javascript\s*:|vbscript\s*:|data\s*:\s*text/html|expression\s*\()"#
-                    .to_owned(),
-            ))
-        }
+        // Real libinjection-based detection (tokenising SQLi/XSS analysis),
+        // replacing the previous coarse regex approximations.
+        "detectsqli" => Ok(Operator::DetectSqli),
+        "detectxss" => Ok(Operator::DetectXss),
         "gt" => pattern
             .parse::<i64>()
             .map(|n| Operator::Ge(n + 1))
