@@ -68,3 +68,9 @@ docs/architecture/*
 
 # Presentation deck — kept local, not pushed to remote
 Sentinel_WAF_Overview.pptx
+
+# Internal scratch notes — kept local, not pushed to remote
+notes.md
+notes11.md
+features-improvement.md
+features-improvement
