@@ -69,7 +69,7 @@ pub fn import_secrule_conf_dir(
 
                     if !is_chain {
                         // End of chain — emit the fully-built rule.
-                        out_items.push(RuleItem::Rule(pending_chain.take().unwrap()));
+                        out_items.push(RuleItem::Rule(pending_chain.take().expect("pending_chain must exist at chain end")));
                     }
                     // If still chaining, keep pending_chain in place.
                 } else {

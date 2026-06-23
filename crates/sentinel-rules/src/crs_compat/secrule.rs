@@ -257,8 +257,16 @@ fn parse_setvar_score_delta(s: &str) -> Option<i32> {
     let lhs = lhs.trim().to_ascii_lowercase();
     let rhs = rhs.trim();
 
-    // Only accumulate anomaly_score deltas; ignore category score vars.
-    if lhs != "tx.anomaly_score" {
+    // Accumulate anomaly-score deltas only. CRS v4 detection rules raise the
+    // per-paranoia-level inbound score (e.g. tx.inbound_anomaly_score_pl1),
+    // which the 949 blocking-evaluation rule later sums. We map each of those
+    // PL deltas straight onto the rule's score so the VM accumulates the total
+    // anomaly score directly. Category scores (tx.sql_injection_score, etc.)
+    // are deliberately ignored to avoid double-counting, and the legacy
+    // tx.anomaly_score name is still honoured for older rule sets.
+    let is_score_delta =
+        lhs == "tx.anomaly_score" || lhs.starts_with("tx.inbound_anomaly_score_pl");
+    if !is_score_delta {
         return None;
     }
 

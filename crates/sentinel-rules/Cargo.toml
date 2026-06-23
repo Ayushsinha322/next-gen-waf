@@ -23,6 +23,9 @@ percent-encoding = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 criterion = { workspace = true }
+http = { workspace = true }
+bytes = { workspace = true }
+sentinel-modules = { path = "../sentinel-modules" }
 
 [[bench]]
 name = "vm_bench"

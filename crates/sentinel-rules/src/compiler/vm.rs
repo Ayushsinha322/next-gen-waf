@@ -117,19 +117,53 @@ fn parse_cookies(header_val: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Return `true` when the request body is `application/x-www-form-urlencoded`.
+fn body_is_form_urlencoded(ctx: &RequestContext) -> bool {
+    ctx.request_headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| {
+            ct.to_ascii_lowercase()
+                .starts_with("application/x-www-form-urlencoded")
+        })
+        .unwrap_or(false)
+}
+
+/// Parse urlencoded POST body parameters, if present and form-encoded.
+/// ModSecurity's `ARGS` collection merges query-string and POST body
+/// parameters; the rule engine must inspect both so that body-borne
+/// attacks (the common case for login/search forms) are not missed.
+fn body_form_params(ctx: &RequestContext) -> Vec<(String, String)> {
+    if !body_is_form_urlencoded(ctx) {
+        return Vec::new();
+    }
+    match ctx.request_body.as_ref() {
+        Some(body) => {
+            let text = String::from_utf8_lossy(body);
+            parse_query_params(&text)
+        }
+        None => Vec::new(),
+    }
+}
+
 fn extract_target(spec: &TargetSpec, ctx: &RequestContext) -> Vec<String> {
     match spec {
         TargetSpec::Args => {
-            parse_query_params(ctx.uri.query().unwrap_or(""))
+            let mut values: Vec<String> = parse_query_params(ctx.uri.query().unwrap_or(""))
                 .into_iter()
                 .map(|(_, v)| v)
-                .collect()
+                .collect();
+            // ARGS also includes urlencoded POST body parameters.
+            values.extend(body_form_params(ctx).into_iter().map(|(_, v)| v));
+            values
         }
         TargetSpec::ArgsNames => {
-            parse_query_params(ctx.uri.query().unwrap_or(""))
+            let mut names: Vec<String> = parse_query_params(ctx.uri.query().unwrap_or(""))
                 .into_iter()
                 .map(|(k, _)| k)
-                .collect()
+                .collect();
+            names.extend(body_form_params(ctx).into_iter().map(|(k, _)| k));
+            names
         }
         TargetSpec::RequestUri => vec![ctx.uri.to_string()],
         TargetSpec::RequestFilename => vec![ctx.uri.path().to_owned()],
