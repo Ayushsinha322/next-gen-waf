@@ -54,6 +54,12 @@ const Icon = {
       <circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/>
     </svg>
   ),
+  Certificates: () => (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="4" width="18" height="12" rx="2"/><circle cx="9" cy="10" r="2.2"/>
+      <path d="M9 12.2V20l-1.6-1.2L5.8 20v-7.8"/><line x1="14" y1="9" x2="18" y2="9"/><line x1="14" y1="12" x2="17" y2="12"/>
+    </svg>
+  ),
   Settings: () => (
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
       <circle cx="12" cy="12" r="3"/>
@@ -72,6 +78,7 @@ const NAV = [
   { group: "PROTECT", items: [
     { id: "sites",   Icon: Icon.Sites,   label: "Sites",   badge: "5",     badgeCls: "nb-g" },
     { id: "rules",   Icon: Icon.Rules,   label: "Rules",   badge: "2,541", badgeCls: "nb-c" },
+    { id: "certificates", Icon: Icon.Certificates, label: "Certificates", badge: "TLS", badgeCls: "nb-g" },
     { id: "plugins", Icon: Icon.Plugins, label: "Plugins", badge: "3",     badgeCls: "nb-a" },
   ]},
   { group: "INTELLIGENCE", items: [

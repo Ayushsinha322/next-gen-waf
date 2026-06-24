@@ -757,6 +757,7 @@ fn cmd_site_add(
             max_header_count: 100,
         },
         plugins: vec![],
+        tls: Default::default(),
     };
 
     cfg.sites.push(site);

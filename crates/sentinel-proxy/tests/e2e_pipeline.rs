@@ -79,6 +79,51 @@ fn test_config(listen_port: u16, upstream_port: u16, rule_file: &str, mode: WafM
                 ..Default::default()
             },
             plugins: vec![],
+            tls: Default::default(),
+        }],
+        ..Default::default()
+    }
+}
+
+/// Config for the ML-only test: NO WAF rules are loaded, but the ML engine is
+/// enabled. Any block therefore comes purely from ML inference, not the rule
+/// engine — proving the ML path works end-to-end in the proxy.
+fn ml_only_config(listen_port: u16, upstream_port: u16, sensitivity: f32) -> SentinelConfig {
+    SentinelConfig {
+        listeners: vec![ListenerConfig {
+            name: "test".into(),
+            bind: format!("127.0.0.1:{listen_port}"),
+            protocol: ProtocolSpec::Single(Protocol::Http1),
+            tls: None,
+            default_site: Some("test-site".into()),
+        }],
+        sites: vec![SiteConfig {
+            id: "test-site".into(),
+            domains: vec!["test-site.local".into(), "localhost".into()],
+            upstream: UpstreamConfig {
+                load_balancer: sentinel_core::config::LoadBalancerStrategy::RoundRobin,
+                servers: vec![UpstreamServer {
+                    host: "127.0.0.1".into(),
+                    port: upstream_port,
+                    weight: 1,
+                    tls: false,
+                }],
+                health_check: None,
+            },
+            waf: WafConfig {
+                mode: WafMode::Blocking,
+                rules: vec![], // no rules — only ML can block
+                anomaly_threshold: 3,
+                paranoia_level: 2,
+                ml: Some(sentinel_core::config::MlConfig {
+                    enable: true,
+                    models: vec![],
+                    sensitivity,
+                }),
+                ..Default::default()
+            },
+            plugins: vec![],
+            tls: Default::default(),
         }],
         ..Default::default()
     }
@@ -304,5 +349,59 @@ async fn clean_post_passes_through() {
 
     shutdown_proxy(shutdown_tx, jh).await;
     assert_eq!(status, StatusCode::OK, "clean POST should pass");
+    assert!(body.starts_with(b"upstream-ok:"));
+}
+// ============================================================================
+// ML inference E2E — no WAF rules loaded; only the ML engine can block.
+// Proves the trained classifier + anomaly model run on the live request path
+// and drive the block decision.
+// ============================================================================
+
+#[tokio::test]
+async fn e2e_ml_blocks_attack_with_no_rules() {
+    let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
+    let listen_port = next_port();
+    // sensitivity 0.6: the trained classifier scores SQLi well above this.
+    let cfg = ml_only_config(listen_port, upstream_addr.port(), 0.6);
+    let (shutdown_tx, jh) = start_proxy(cfg).await;
+
+    // Strong SQLi in the body. No SQLi rules are loaded, so only ML can flag it.
+    let (status, _) = send_request(
+        listen_port,
+        "test-site.local",
+        "/login",
+        Method::POST,
+        "user=admin&q=1' UNION SELECT username,password FROM users-- -",
+    )
+    .await;
+
+    shutdown_proxy(shutdown_tx, jh).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "ML inference (no rules) should block the SQLi payload, got {status}"
+    );
+}
+
+#[tokio::test]
+async fn e2e_ml_allows_clean_request_with_no_rules() {
+    let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
+    let listen_port = next_port();
+    let cfg = ml_only_config(listen_port, upstream_addr.port(), 0.6);
+    let (shutdown_tx, jh) = start_proxy(cfg).await;
+
+    // A benign request shaped like normal traffic must pass — ML must not be a
+    // blanket blocker.
+    let (status, body) = send_request(
+        listen_port,
+        "test-site.local",
+        "/products?page=1&sort=price",
+        Method::GET,
+        "",
+    )
+    .await;
+
+    shutdown_proxy(shutdown_tx, jh).await;
+    assert_eq!(status, StatusCode::OK, "clean request must pass ML, got {status}");
     assert!(body.starts_with(b"upstream-ok:"));
 }

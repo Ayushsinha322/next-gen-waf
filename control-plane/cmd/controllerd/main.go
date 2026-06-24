@@ -179,6 +179,13 @@ func run() error {
 		protected.GET("/audit", func(c *gin.Context) { handleListAudit(c, enforcer, store) })
 		protected.GET("/cluster/status", func(c *gin.Context) { handleClusterStatus(c, cl) })
 		protected.GET("/waf/status", func(c *gin.Context) { handleProxyHealth(c) })
+
+		// TLS / ACME certificate management — bridges to the data-plane internal API.
+		protected.GET("/certs", func(c *gin.Context) { handleListCerts(c, enforcer) })
+		protected.POST("/certs/manual", func(c *gin.Context) { handleUploadManualCert(c, enforcer) })
+		protected.POST("/certs/acme", func(c *gin.Context) { handleRequestAcmeCert(c, enforcer) })
+		protected.POST("/certs/:domain/renew", func(c *gin.Context) { handleRenewCert(c, enforcer) })
+		protected.DELETE("/certs/:domain", func(c *gin.Context) { handleDeleteCert(c, enforcer) })
 	}
 
 	// SSE endpoint lives outside the protected group so the ?token= query-param

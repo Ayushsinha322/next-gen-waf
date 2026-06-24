@@ -329,6 +329,11 @@ struct ServerState {
     plugin_runtime: Arc<ArcSwap<PluginRuntime>>,
     ml_engine: Arc<MlEngine>,
     ebpf: Arc<EbpfManager>,
+    /// ACME/TLS certificate manager — hot-swaps certs without listener restart.
+    cert_manager: Arc<tls::CertManager>,
+    /// HTTP-01 ACME challenge tokens: token → key_authorization.
+    /// Checked in handle_request before any WAF pipeline work.
+    http01_tokens: Arc<DashMap<String, String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -412,11 +417,15 @@ impl ProxyServer {
 
         let ml_engine = {
             let model_dir = std::path::Path::new("ml-models");
-            Arc::new(MlEngine::new(
+            let engine = Arc::new(MlEngine::new(
                 4096,
                 256,
                 if model_dir.exists() { Some(model_dir) } else { None },
-            ))
+            ));
+            // Warm-start the anomaly model so it scores meaningfully from the
+            // first request instead of cold-starting at neutral 0.5.
+            engine.warm_start();
+            engine
         };
 
         let ebpf = Arc::new(
@@ -424,6 +433,51 @@ impl ProxyServer {
                 .await
                 .context("EbpfManager init")?,
         );
+
+        // Certificate manager — loads persisted ACME/manual certs from disk,
+        // then runs background renewal every hour.
+        let cert_dir = cfg.cert_dir.clone().unwrap_or_else(|| {
+            // $HOME/.config/sentinel/certs, or /var/lib/sentinel/certs as fallback.
+            std::env::var("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".config/sentinel/certs"))
+                .unwrap_or_else(|_| std::path::PathBuf::from("/var/lib/sentinel/certs"))
+        });
+        let cert_manager = tls::CertManager::new(cert_dir.clone());
+        match cert_manager.load_from_disk() {
+            Ok(n) if n > 0 => info!(certs = n, "loaded persisted TLS certs from disk"),
+            Ok(_) => {}
+            Err(e) => warn!("cert disk load: {e:#}"),
+        }
+        let http01_tokens = Arc::clone(&cert_manager.http01_tokens);
+
+        // Trigger initial ACME issuance for any site that has tls.mode = acme
+        // but no cert on disk yet.
+        for site in &cfg.sites {
+            if site.tls.mode == sentinel_core::config::TlsCertMode::Acme {
+                if let Some(acme_cfg) = &site.tls.acme {
+                    let has_all = site.domains.iter().all(|d| cert_manager.store.get_meta(d).is_some());
+                    if !has_all {
+                        let cm = Arc::clone(&cert_manager);
+                        let domains = site.domains.clone();
+                        let acme = acme_cfg.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = cm.issue_acme(domains.clone(), &acme).await {
+                                warn!(?domains, "initial ACME issuance failed: {e:#}");
+                            }
+                        });
+                    }
+                }
+            }
+        }
+
+        // Renewal background task (checks every hour).
+        {
+            let cm = Arc::clone(&cert_manager);
+            let cfg_handle = Arc::clone(&self.config);
+            tokio::spawn(async move {
+                tls::renewal::renewal_loop(cm, cfg_handle).await;
+            });
+        }
 
         let state = Arc::new(ServerState {
             config: Arc::clone(&self.config),
@@ -434,6 +488,8 @@ impl ProxyServer {
             plugin_runtime: Arc::clone(&plugin_runtime),
             ml_engine: Arc::clone(&ml_engine),
             ebpf,
+            cert_manager,
+            http01_tokens,
         });
 
         // --- Background: config hot-reload watcher ---
@@ -715,13 +771,13 @@ async fn serve_listener(
                 .iter()
                 .flat_map(|s| s.domains.iter().cloned())
                 .collect();
-            let resolved = tls::AutoCertResolver::new(std::collections::HashMap::new());
+            let resolver = tls::SentinelCertResolver::new(Arc::clone(&state.cert_manager.store));
             if !domains.is_empty() {
-                resolved.pre_warm(&domains);
+                resolver.pre_warm(&domains);
             }
             let mut server_cfg = ServerConfig::builder()
                 .with_no_client_auth()
-                .with_cert_resolver(Arc::new(resolved));
+                .with_cert_resolver(resolver);
             server_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
             Some(TlsAcceptor::from(Arc::new(server_cfg)))
         }
@@ -847,6 +903,32 @@ async fn handle_request(
     // count, and listener status.  No auth required; internal-only.
     if req.uri().path() == "/healthz" || req.uri().path() == "/health" {
         return Ok(health_response(&state));
+    }
+
+    // ACME HTTP-01 challenge — intercepted BEFORE eBPF, before site routing.
+    // The ACME server fetches /.well-known/acme-challenge/<token> on port 80
+    // to verify domain ownership.
+    const ACME_PREFIX: &str = "/.well-known/acme-challenge/";
+    if let Some(token) = req.uri().path().strip_prefix(ACME_PREFIX) {
+        if let Some(key_auth) = state.http01_tokens.get(token) {
+            let body = Bytes::from(key_auth.clone());
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .body(full_body(body))
+                .unwrap());
+        }
+        // Unknown token — fall through to normal routing (will 404 from upstream).
+    }
+
+    // Internal cert-management API (control plane / dashboard bridge).
+    // Loopback-only: these endpoints share the public listener, so anything
+    // under /api/v1/internal/certs is refused unless the peer is on localhost.
+    if req.uri().path().starts_with("/api/v1/internal/certs") {
+        if !peer.ip().is_loopback() {
+            return Ok(error_response(StatusCode::FORBIDDEN, "internal endpoint"));
+        }
+        return Ok(handle_internal_cert_api(state, req).await);
     }
 
     // eBPF fast-fail: known-blocked IPs never enter the WAF pipeline.
@@ -1666,6 +1748,9 @@ fn target_name(t: &sentinel_rules::dsl::ast::Target) -> String {
         Target::ResponseHeaders(None) => "RESPONSE_HEADERS".into(),
         Target::ResponseHeaders(Some(h)) => format!("RESPONSE_HEADERS:{h}"),
         Target::ResponseBody => "RESPONSE_BODY".into(),
+        Target::Files => "FILES".into(),
+        Target::FilesNames => "FILES_NAMES".into(),
+        Target::FilesCombinedSize => "FILES_COMBINED_SIZE".into(),
         Target::RemoteAddr => "REMOTE_ADDR".into(),
         Target::Geo => "GEO".into(),
         Target::TxVar(v) => format!("TX:{v}"),
@@ -1968,6 +2053,160 @@ fn block_response(ctx: &RequestContext) -> Response<BoxBody> {
         .unwrap()
 }
 
+/// Internal certificate-management API.  Loopback-only (enforced by the caller).
+///
+/// Routes:
+///   GET    /api/v1/internal/certs                 → list cert metadata
+///   POST   /api/v1/internal/certs/manual          → install operator-supplied PEM
+///   POST   /api/v1/internal/certs/acme            → issue/renew via ACME (blocking)
+///   POST   /api/v1/internal/certs/{domain}/renew  → force ACME re-issue
+///   DELETE /api/v1/internal/certs/{domain}        → remove cert
+async fn handle_internal_cert_api(
+    state: Arc<ServerState>,
+    req: Request<Incoming>,
+) -> Response<BoxBody> {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+
+    // GET list — no body needed.
+    if method == hyper::Method::GET && path == "/api/v1/internal/certs" {
+        let meta = state.cert_manager.store.all_meta();
+        let json = serde_json::to_string(&meta).unwrap_or_else(|_| "[]".to_string());
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(full_body(Bytes::from(json)))
+            .unwrap();
+    }
+
+    // DELETE /api/v1/internal/certs/{domain}
+    if method == hyper::Method::DELETE {
+        if let Some(domain) = path.strip_prefix("/api/v1/internal/certs/") {
+            let domain = domain.trim_end_matches('/');
+            return match state.cert_manager.store.remove(domain) {
+                Ok(()) => json_ok(serde_json::json!({"removed": domain})),
+                Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}")),
+            };
+        }
+    }
+
+    // From here on we need the request body.
+    let body_bytes = match req.into_body().collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(e) => return json_err(StatusCode::BAD_REQUEST, &format!("body read failed: {e}")),
+    };
+
+    // POST /api/v1/internal/certs/manual  { domain, cert_pem, key_pem }
+    if method == hyper::Method::POST && path == "/api/v1/internal/certs/manual" {
+        #[derive(serde::Deserialize)]
+        struct ManualReq {
+            domain: String,
+            cert_pem: String,
+            key_pem: String,
+        }
+        let r: ManualReq = match serde_json::from_slice(&body_bytes) {
+            Ok(r) => r,
+            Err(e) => return json_err(StatusCode::BAD_REQUEST, &format!("invalid JSON: {e}")),
+        };
+        return match state
+            .cert_manager
+            .install_manual(&r.domain, &r.cert_pem, &r.key_pem)
+        {
+            Ok(()) => json_ok(serde_json::json!({"installed": r.domain})),
+            Err(e) => json_err(StatusCode::BAD_REQUEST, &format!("{e:#}")),
+        };
+    }
+
+    // POST /api/v1/internal/certs/acme  { domains:[..], email, provider, challenge, renew_before_days? }
+    // POST /api/v1/internal/certs/{domain}/renew  (re-uses the matching site's ACME config)
+    if method == hyper::Method::POST
+        && (path == "/api/v1/internal/certs/acme" || path.ends_with("/renew"))
+    {
+        use sentinel_core::config::{AcmeChallengeType, AcmeProvider, SiteAcmeConfig};
+
+        let (domains, acme_cfg) = if path.ends_with("/renew") {
+            // Look up the site whose TLS config owns this domain.
+            let domain = path
+                .strip_prefix("/api/v1/internal/certs/")
+                .and_then(|s| s.strip_suffix("/renew"))
+                .unwrap_or("")
+                .to_string();
+            let cfg = state.config.load();
+            let site = cfg.sites.iter().find(|s| {
+                s.domains.iter().any(|d| d == &domain) && s.tls.acme.is_some()
+            });
+            match site {
+                Some(s) => (s.domains.clone(), s.tls.acme.clone().unwrap()),
+                None => {
+                    return json_err(
+                        StatusCode::NOT_FOUND,
+                        "no ACME-configured site owns that domain",
+                    )
+                }
+            }
+        } else {
+            #[derive(serde::Deserialize)]
+            struct AcmeReq {
+                domains: Vec<String>,
+                email: String,
+                #[serde(default)]
+                provider: Option<String>,
+                #[serde(default)]
+                challenge: Option<String>,
+                #[serde(default)]
+                renew_before_days: Option<u32>,
+            }
+            let r: AcmeReq = match serde_json::from_slice(&body_bytes) {
+                Ok(r) => r,
+                Err(e) => return json_err(StatusCode::BAD_REQUEST, &format!("invalid JSON: {e}")),
+            };
+            if r.domains.is_empty() {
+                return json_err(StatusCode::BAD_REQUEST, "domains must not be empty");
+            }
+            let provider = match r.provider.as_deref() {
+                Some("letsencrypt_staging") | Some("staging") => AcmeProvider::LetsEncryptStaging,
+                Some("zerossl") => AcmeProvider::ZeroSsl,
+                _ => AcmeProvider::LetsEncrypt,
+            };
+            let challenge = match r.challenge.as_deref() {
+                Some("tls_alpn_01") | Some("tls-alpn-01") => AcmeChallengeType::TlsAlpn01,
+                _ => AcmeChallengeType::Http01,
+            };
+            let cfg = SiteAcmeConfig {
+                email: r.email,
+                provider,
+                challenge,
+                renew_before_days: r.renew_before_days.unwrap_or(30),
+            };
+            (r.domains, cfg)
+        };
+
+        return match state.cert_manager.issue_acme(domains.clone(), &acme_cfg).await {
+            Ok(()) => json_ok(serde_json::json!({"issued": domains})),
+            Err(e) => json_err(StatusCode::BAD_GATEWAY, &format!("ACME issuance failed: {e:#}")),
+        };
+    }
+
+    json_err(StatusCode::NOT_FOUND, "unknown cert endpoint")
+}
+
+fn json_ok(value: serde_json::Value) -> Response<BoxBody> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(full_body(Bytes::from(value.to_string())))
+        .unwrap()
+}
+
+fn json_err(status: StatusCode, message: &str) -> Response<BoxBody> {
+    let body = serde_json::json!({"error": message}).to_string();
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(full_body(Bytes::from(body)))
+        .unwrap()
+}
+
 fn health_response(state: &ServerState) -> Response<BoxBody> {
     use std::time::SystemTime;
 
@@ -2007,15 +2246,17 @@ fn health_response(state: &ServerState) -> Response<BoxBody> {
 // Server start time — captured once, shared across health responses.
 static START_TIME: std::sync::OnceLock<SystemTime> = std::sync::OnceLock::new();
 
+fn full_body(bytes: Bytes) -> BoxBody {
+    Full::new(bytes)
+        .map_err(|never: Infallible| match never {})
+        .boxed()
+}
+
 fn error_response(status: StatusCode, message: &str) -> Response<BoxBody> {
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "text/plain")
-        .body(
-            Full::new(Bytes::from(message.to_string()))
-                .map_err(|never: Infallible| match never {})
-                .boxed(),
-        )
+        .body(full_body(Bytes::from(message.to_string())))
         .unwrap()
 }
 

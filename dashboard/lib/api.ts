@@ -173,6 +173,24 @@ export interface RuleTestResult {
   phases_run:    string[];
 }
 
+/** Certificate source as reported by the data plane. */
+export type CertSource =
+  | "self_signed"
+  | { acme: { provider: string; email: string } }
+  | "manual";
+
+export interface Certificate {
+  domain:      string;
+  san:         string[];
+  issued_at:   number; // UNIX seconds
+  expires_at:  number; // UNIX seconds (0 = unknown)
+  fingerprint: string;
+  source:      CertSource;
+}
+
+export type AcmeProvider = "letsencrypt" | "letsencrypt_staging" | "zerossl";
+export type AcmeChallenge = "http_01" | "tls_alpn_01";
+
 // ---------------------------------------------------------------------------
 // API methods
 // ---------------------------------------------------------------------------
@@ -278,6 +296,32 @@ export const api = {
   waf: {
     status: () =>
       apiFetch<{ waf_running: boolean; uptime_secs?: number; sites?: number; listeners?: string[]; upstreams_healthy?: number; upstreams_total?: number; error?: string }>("/waf/status"),
+  },
+
+  certs: {
+    list: () => apiFetch<{ certs: Certificate[]; waf_running: boolean }>("/certs"),
+    uploadManual: (body: { domain: string; cert_pem: string; key_pem: string }) =>
+      apiFetch<{ installed: string }>("/certs/manual", {
+        method: "POST", body: JSON.stringify(body),
+      }),
+    requestAcme: (body: {
+      domains: string[];
+      email: string;
+      provider?: AcmeProvider;
+      challenge?: AcmeChallenge;
+      renew_before_days?: number;
+    }) =>
+      apiFetch<{ issued: string[] }>("/certs/acme", {
+        method: "POST", body: JSON.stringify(body),
+      }),
+    renew: (domain: string) =>
+      apiFetch<{ issued: string[] }>(`/certs/${encodeURIComponent(domain)}/renew`, {
+        method: "POST",
+      }),
+    delete: (domain: string) =>
+      apiFetch<{ removed: string }>(`/certs/${encodeURIComponent(domain)}`, {
+        method: "DELETE",
+      }),
   },
 
   metrics: {

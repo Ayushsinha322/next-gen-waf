@@ -34,6 +34,9 @@ pub struct SentinelConfig {
     pub storage: StorageConfig,
     #[serde(default)]
     pub ebpf: EbpfConfig,
+    /// Directory where ACME certs are persisted.
+    /// Defaults to `$HOME/.config/sentinel/certs` or `/var/lib/sentinel/certs`.
+    pub cert_dir: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -187,6 +190,83 @@ pub struct SiteConfig {
     pub waf: WafConfig,
     #[serde(default)]
     pub plugins: Vec<PluginConfig>,
+    /// Per-site TLS certificate configuration.
+    #[serde(default)]
+    pub tls: SiteTlsConfig,
+}
+
+// ---------------------------------------------------------------------------
+// Per-site TLS / ACME
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SiteTlsConfig {
+    /// How to obtain the TLS cert for this site's domains.
+    #[serde(default)]
+    pub mode: TlsCertMode,
+    /// Manual mode: path to certificate PEM file.
+    pub cert: Option<PathBuf>,
+    /// Manual mode: path to private key PEM file.
+    pub key: Option<PathBuf>,
+    /// ACME mode configuration.
+    pub acme: Option<SiteAcmeConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TlsCertMode {
+    /// No TLS managed for this site (served via an HTTP listener or terminated upstream).
+    #[default]
+    Off,
+    /// Auto-generate a self-signed cert (useful for internal / dev sites).
+    SelfSigned,
+    /// Operator-uploaded PEM cert + key.
+    Manual,
+    /// Automatic ACME (Let's Encrypt / ZeroSSL) — issues and renews automatically.
+    Acme,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SiteAcmeConfig {
+    /// Contact email for the ACME account.
+    pub email: String,
+    /// CA provider (default: Let's Encrypt production).
+    #[serde(default)]
+    pub provider: AcmeProvider,
+    /// ACME challenge type (default: HTTP-01).
+    #[serde(default)]
+    pub challenge: AcmeChallengeType,
+    /// Renew the cert this many days before expiry (default: 30).
+    #[serde(default = "default_renew_before_days")]
+    pub renew_before_days: u32,
+}
+
+fn default_renew_before_days() -> u32 {
+    30
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AcmeProvider {
+    /// Let's Encrypt production CA (https://acme-v02.api.letsencrypt.org/).
+    #[default]
+    LetsEncrypt,
+    /// Let's Encrypt staging CA — free to test against, issues untrusted certs.
+    LetsEncryptStaging,
+    /// ZeroSSL (https://acme.zerossl.com/v2/DV90).
+    ZeroSsl,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AcmeChallengeType {
+    /// HTTP-01: ACME server fetches `http://<domain>/.well-known/acme-challenge/<token>`.
+    /// Requires the proxy to be reachable on port 80 for the domain.
+    #[default]
+    Http01,
+    /// TLS-ALPN-01: ACME server connects to port 443 with ALPN "acme-tls/1".
+    /// Works without port 80 — great for port-80-blocked environments.
+    TlsAlpn01,
 }
 
 // ---------------------------------------------------------------------------

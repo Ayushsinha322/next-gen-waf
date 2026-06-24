@@ -125,7 +125,8 @@ maxminddb = "0.24"
 
 # TLS utilities
 rustls-pemfile = "2"
-rcgen = "0.12"    # self-signed cert generation for per-site TLS
+rcgen = "0.12"    # self-signed cert generation + CSR for per-site TLS
+hex = "0.4"
 
 # CLI / system
 libc = "0.2"
