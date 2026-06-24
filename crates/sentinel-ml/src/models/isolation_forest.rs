@@ -308,6 +308,31 @@ impl IncrementalForest {
         }
     }
 
+    /// Seed the forest with known-normal vectors and train immediately.
+    ///
+    /// Without seeding the forest cold-starts: it scores every request a
+    /// neutral 0.5 until `retrain_every` live observations accumulate. Seeding
+    /// it with a baseline of benign traffic makes anomaly scoring useful from
+    /// the very first request; subsequent online observations then adapt the
+    /// model to the site's real traffic profile.
+    pub fn seed(&self, vectors: &[Vec<f32>]) {
+        if vectors.is_empty() {
+            return;
+        }
+        let mut state = self.inner.write();
+        for v in vectors {
+            if state.buffer.len() >= self.buffer_capacity {
+                state.buffer.remove(0);
+            }
+            state.buffer.push(v.clone());
+        }
+        if state.buffer.len() >= 8 {
+            state.forest = IsolationForest::train(&state.buffer);
+            state.generation += 1;
+            state.samples_since_train = 0;
+        }
+    }
+
     /// Score a feature vector against the current forest.
     ///
     /// Returns 0.5 (neutral) if the forest has insufficient data.

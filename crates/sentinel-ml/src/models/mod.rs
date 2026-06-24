@@ -6,5 +6,7 @@
 //! * [`PayloadClassifier`](payload_classifier::PayloadClassifier) —
 //!   multi-category attack-payload scoring (SQLi, XSS, traversal, etc.).
 
+pub mod corpus;
 pub mod isolation_forest;
+pub mod logistic;
 pub mod payload_classifier;

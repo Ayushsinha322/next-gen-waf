@@ -6,12 +6,19 @@
 //! * [`MlEngine`] — orchestrates feature extraction, Isolation Forest
 //!   anomaly scoring, and payload attack classification.
 //! * Feature extraction: 24-dimensional normalised vector per request.
-//! * Isolation Forest: online unsupervised anomaly detection.
-//! * Payload Classifier: multi-category attack-payload scoring.
+//! * Isolation Forest: online unsupervised anomaly detection, warm-started
+//!   from a benign baseline and protected against attack-poisoning (only
+//!   clean-looking traffic updates the "normal" model).
+//! * Payload Classifier: a **trained logistic-regression** model whose weights
+//!   are learned from a bundled labeled corpus (see `models::corpus`). Measured
+//!   held-out accuracy lives in `tests/ml_validation.rs`.
 //!
-//! **Tier 2 — ONNX inference (optional feature `ort-inference`):**
-//! * Load `.onnx` models from `ml-models/`.
-//! * Scored alongside built-in models; contributes to `ml_scores`.
+//! **Tier 2 — ONNX inference (optional, OFF by default — feature
+//! `ort-inference`):**
+//! * No models ship by default; this is an extension point for teams that
+//!   train their own `.onnx` models and drop them in `ml-models/`.
+//! * When enabled and a model is present, it is scored alongside the built-in
+//!   models and contributes to `ml_scores`.
 //!
 //! **Tier 3 — LLM Copilot (async, out-of-band):**
 //! * Not on the request path.  Used for alert explanations, rule
@@ -175,15 +182,24 @@ impl MlEngine {
     pub fn evaluate(&self, ctx: &sentinel_core::context::RequestContext) -> MlScores {
         let fv = FeatureVector::extract(ctx);
 
-        // 1. Isolation Forest anomaly score.
+        // 1. Isolation Forest anomaly score (against the current model, before
+        //    feeding this request in).
         let anomaly_score = self.forest.score(fv.as_slice());
-        // Feed for online learning.
-        self.forest.observe(fv.as_slice());
 
         // 2. Payload Classifier attack probability.
         let payload_attack_score = self.payload_classifier.score(&fv);
 
-        // 3. ONNX model scores (if any loaded).
+        // 3. Online learning — poisoning guard: only let *clean-looking*
+        //    traffic update the "normal" model. A request that the rule engine
+        //    already scored, or that the classifier flags, must not teach the
+        //    Isolation Forest that attacks are normal.
+        let looks_clean = ctx.anomaly_score == 0 && payload_attack_score < 0.5;
+        if looks_clean {
+            self.forest.observe(fv.as_slice());
+        }
+
+        // 4. ONNX model scores (optional; only if real .onnx models were
+        //    loaded — disabled by default, see inference module).
         let registry = self.model_registry.read();
         let onnx_scores: Vec<(String, f32)> = registry
             .model_names()
@@ -212,6 +228,22 @@ impl MlEngine {
         );
 
         scores
+    }
+
+    /// Warm-start the anomaly model with a baseline of benign traffic so it
+    /// scores meaningfully from the first live request instead of cold-starting
+    /// at the neutral 0.5.  Seeds the Isolation Forest with the benign portion
+    /// of the bundled corpus, then trains immediately.  Call once after
+    /// construction (the proxy does this at startup).
+    pub fn warm_start(&self) {
+        let benign: Vec<Vec<f32>> = self::models::corpus::training_corpus()
+            .into_iter()
+            .filter(|s| s.label == 0.0)
+            .map(|s| s.fv.values.to_vec())
+            .collect();
+        let n = benign.len();
+        self.forest.seed(&benign);
+        info!(seeded = n, "ML anomaly model warm-started from benign baseline");
     }
 
     /// Update sensitivity threshold from config (hot-reload).

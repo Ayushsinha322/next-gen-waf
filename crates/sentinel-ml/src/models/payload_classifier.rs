@@ -1,57 +1,63 @@
-//! Payload Classifier — multi-category attack-pattern scoring.
+//! Payload Classifier — a *trained* logistic-regression attack detector.
 //!
-//! Scores a request against six attack families using word-list heuristics:
-//! SQL injection, XSS, path traversal, command injection, encoding abuse,
-//! and header injection.
+//! The classifier is a [`LogisticRegression`] model whose weights are learned
+//! by gradient descent from the bundled labeled [`corpus`], over the full
+//! 24-dimensional [`FeatureVector`] (lengths, entropy, special-char density,
+//! percent-encoding, method, keyword scores, …).  Because it learns over the
+//! whole vector — not just keyword hits — it can flag attacks that evade the
+//! keyword lists via high entropy / encoding-abuse / structural anomalies.
 //!
-//! Each category returns a continuous score ∈ [0, 1].  The final combined
-//! score is a sigmoid over the weighted sum, producing a probability that the
-//! request contains an attack payload.
+//! Training is deterministic and runs once (cached in a `Lazy`), so every
+//! engine instance shares the same reproducible model.  Inference is a single
+//! dot product + sigmoid.
 //!
-//! Unlike the rule engine's binary match/no-match, this classifier produces
-//! a *confidence* — useful for ranking alerts and auto-tuning the anomaly
-//! threshold.
+//! Unlike the rule engine's binary match/no-match, this classifier produces a
+//! *confidence* ∈ [0, 1] — useful for ranking alerts and auto-tuning the
+//! anomaly threshold.  See `tests/ml_validation.rs` for measured FPR/FNR.
+
+use once_cell::sync::Lazy;
 
 use super::super::features::FeatureVector;
+use super::corpus::corpus_xy;
+use super::logistic::{LogisticRegression, TrainConfig};
+
+/// The payload classifier model, trained once from the bundled corpus.
+static TRAINED_MODEL: Lazy<LogisticRegression> = Lazy::new(|| {
+    let (x, y) = corpus_xy();
+    LogisticRegression::fit(&x, &y, TrainConfig::default())
+});
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Fixed-weight payload classifier using keyword-based attack detection.
+/// Trained logistic-regression payload classifier.
 #[derive(Debug, Clone)]
 pub struct PayloadClassifier {
-    /// Sigmoid steepness — higher = sharper threshold.
-    pub steepness: f32,
+    model: LogisticRegression,
 }
 
 impl Default for PayloadClassifier {
     fn default() -> Self {
-        Self { steepness: 4.0 }
+        // Share the globally-trained model (cheap clone of 24 weights).
+        Self {
+            model: TRAINED_MODEL.clone(),
+        }
     }
 }
 
 impl PayloadClassifier {
-    /// Compute the combined attack probability ∈ [0, 1].
-    ///
-    /// Uses the max category score (dominant signal) plus the sum of all
-    /// categories (breadth signal), passed through a sigmoid.
+    /// Train a fresh classifier from an explicit dataset.  Used by the
+    /// validation harness to train on a held-out split.
+    pub fn from_dataset(x: &[Vec<f32>], y: &[f32]) -> Self {
+        Self {
+            model: LogisticRegression::fit(x, y, TrainConfig::default()),
+        }
+    }
+
+    /// Compute the attack probability ∈ [0, 1] for a request.
     pub fn score(&self, fv: &FeatureVector) -> f32 {
-        // Each category ∈ [0, 1], extracted from the keyword scores already
-        // computed during feature extraction, plus additional patterns.
-        let sqli = fv.values[super::super::features::idx::SQL_KEYWORD_SCORE];
-        let xss = fv.values[super::super::features::idx::XSS_KEYWORD_SCORE];
-        let path_trav = path_traversal_score(fv);
-        let cmd_inj = command_injection_score(fv);
-        let enc_abuse = encoding_abuse_score(fv);
-        let header_inj = 0.0; // header injection detected at Phase 1, not body
-
-        let max_cat = sqli.max(xss).max(path_trav).max(cmd_inj).max(enc_abuse);
-        let sum_cat = sqli + xss + path_trav + cmd_inj + enc_abuse + header_inj;
-
-        // Score = sigmoid(steepness * (max + 0.3 * sum - 0.5))
-        // The 0.5 offset is the decision boundary; max + sum push it over.
-        sigmoid(self.steepness * (max_cat + 0.3 * sum_cat - 0.5))
+        self.model.predict_proba(fv.as_slice())
     }
 
     /// Return per-category scores for diagnostic use.
@@ -79,12 +85,9 @@ pub struct CategoryScores {
 }
 
 // ---------------------------------------------------------------------------
-// Category detectors
+// Category detectors (diagnostic breakdown for alerts/dashboard; the trained
+// model above is what actually scores the request)
 // ---------------------------------------------------------------------------
-
-fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
-}
 
 /// Path traversal score based on URI path patterns.
 fn path_traversal_score(fv: &FeatureVector) -> f32 {
