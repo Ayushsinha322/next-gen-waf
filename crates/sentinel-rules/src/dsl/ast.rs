@@ -125,6 +125,15 @@ pub enum Target {
     RequestCookies(Option<String>),
     ResponseHeaders(Option<String>),
     ResponseBody,
+    /// Uploaded files' original filenames (the `filename=` attribute of
+    /// `multipart/form-data` file parts). ModSecurity `FILES`.
+    Files,
+    /// Form-field names used for file uploads (the `name=` attribute of
+    /// `multipart/form-data` file parts). ModSecurity `FILES_NAMES`.
+    FilesNames,
+    /// Total byte size of all uploaded file contents. ModSecurity
+    /// `FILES_COMBINED_SIZE`.
+    FilesCombinedSize,
     RemoteAddr,
     Geo,
     TxVar(String),
@@ -177,6 +186,12 @@ pub enum Operator {
     DetectSqli,
     /// libinjection-based cross-site-scripting detection (`@detectXSS`).
     DetectXss,
+    /// Off-domain URL / Remote-File-Inclusion detection. Fires when a value
+    /// contains a `scheme://host` URL whose host is neither the request's own
+    /// Host nor a subdomain of it. Reproduces the semantics of CRS rule 931130
+    /// (which our importer cannot express directly — it needs capture groups,
+    /// dynamic `setvar`, a `TX:/regex/` collection, and `%{}` macro expansion).
+    OffDomainUrl,
     AnomalyScore { op: CmpOp, threshold: u32 },
     MlScore { model: String, op: CmpOp, threshold: f32 },
     RateLimit { dimension: RateLimitDim, rps: u32, burst: u32 },

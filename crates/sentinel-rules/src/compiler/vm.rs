@@ -126,6 +126,62 @@ fn content_type(ctx: &RequestContext) -> String {
         .unwrap_or_default()
 }
 
+/// The request's own Host header, lowercased, port stripped. Empty if absent.
+fn request_host(ctx: &RequestContext) -> String {
+    ctx.request_headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .map(|h| h.split(':').next().unwrap_or(h).trim().to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+/// True if `value` contains a `scheme://host` URL whose host is off-domain
+/// relative to `request_host` — i.e. not equal to it and not a subdomain of
+/// it. Reproduces CRS 931130 (off-domain reference / RFI). When the request
+/// has no Host header, any absolute URL counts as off-domain.
+fn contains_off_domain_url(value: &str, request_host: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let mut search = lower.as_str();
+    while let Some(pos) = search.find("://") {
+        // Validate the scheme: alnum/+/-/. immediately before "://".
+        let scheme: String = search[..pos]
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+            .collect();
+        let scheme_ok = scheme.chars().next().is_some_and(|c| c.is_ascii_alphabetic());
+
+        let after = &search[pos + 3..];
+        // Authority ends at the first path/query/fragment delimiter.
+        let authority_end = after
+            .find(['/', '?', '#', '\\', ' ', '\t', '"', '\''])
+            .unwrap_or(after.len());
+        let mut authority = &after[..authority_end];
+        // Strip userinfo (`user:pass@`).
+        if let Some(at) = authority.rfind('@') {
+            authority = &authority[at + 1..];
+        }
+        // Strip a trailing `:port`.
+        let host = authority.split(':').next().unwrap_or(authority);
+
+        if scheme_ok && !host.is_empty() {
+            if request_host.is_empty() {
+                return true; // no own host → any absolute URL is off-domain
+            }
+            // On-domain iff host == own host, or host is a subdomain of it.
+            let on_domain =
+                host == request_host || host.ends_with(&format!(".{request_host}"));
+            if !on_domain {
+                return true;
+            }
+        }
+
+        // Continue scanning past this occurrence.
+        search = &search[pos + 3..];
+    }
+    false
+}
+
 /// Recursively flatten a JSON value into ModSecurity-style `(name, value)`
 /// pairs.  Object keys become the parameter name; array elements inherit the
 /// parent name (matching ModSecurity's `ARGS:json.path` behaviour closely
@@ -157,6 +213,169 @@ fn flatten_json(prefix: &str, val: &serde_json::Value, out: &mut Vec<(String, St
     }
 }
 
+// ---------------------------------------------------------------------------
+// multipart/form-data parsing
+// ---------------------------------------------------------------------------
+
+/// Parsed components of a `multipart/form-data` request body.
+#[derive(Default)]
+struct MultipartParts {
+    /// Non-file form fields: `(name, value)`.  These feed ARGS/ARGS_NAMES so
+    /// injection delivered through a multipart form is inspected exactly like
+    /// an `application/x-www-form-urlencoded` form.
+    fields: Vec<(String, String)>,
+    /// Original client filenames (the `filename=` attribute). ModSec `FILES`.
+    filenames: Vec<String>,
+    /// Field names of file-upload parts (the `name=` attribute). ModSec
+    /// `FILES_NAMES`.
+    field_names: Vec<String>,
+    /// Combined byte size of every file part's content. ModSec
+    /// `FILES_COMBINED_SIZE`.
+    combined_size: usize,
+}
+
+/// Locate the first occurrence of `needle` within `haystack`.
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Extract the `boundary` parameter from a `multipart/form-data` Content-Type.
+/// The media type is matched case-insensitively, but the boundary value is
+/// returned verbatim (boundaries are case-sensitive).  Note: ASCII-lowercasing
+/// preserves byte length, so indices computed on the lowercased copy are valid
+/// offsets into the original header value.
+fn multipart_boundary(ctx: &RequestContext) -> Option<String> {
+    let raw = ctx
+        .request_headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())?;
+    let lower = raw.to_ascii_lowercase();
+    if !lower.trim_start().starts_with("multipart/form-data") {
+        return None;
+    }
+    let pos = lower.find("boundary=")? + "boundary=".len();
+    let rest = raw[pos..].trim_start();
+    let val = if let Some(stripped) = rest.strip_prefix('"') {
+        stripped.split('"').next().unwrap_or("")
+    } else {
+        rest.split([';', ' ', '\t']).next().unwrap_or("")
+    };
+    (!val.is_empty()).then(|| val.to_owned())
+}
+
+/// Parse a `multipart/form-data` body into its constituent parts.  Malformed
+/// or non-multipart bodies yield an empty result (fail-open on parse, but the
+/// raw body is still reachable via `REQUEST_BODY` rules).
+fn multipart_parts(ctx: &RequestContext) -> MultipartParts {
+    let mut out = MultipartParts::default();
+    let (Some(body), Some(boundary)) = (ctx.request_body.as_ref(), multipart_boundary(ctx))
+    else {
+        return out;
+    };
+    let body: &[u8] = body;
+    let delim = format!("--{boundary}");
+    let delim = delim.as_bytes();
+
+    // Position just past the first boundary marker.
+    let mut search_from = match find_bytes(body, delim) {
+        Some(p) => p + delim.len(),
+        None => return out,
+    };
+    loop {
+        let after = &body[search_from..];
+        // "--" immediately after a delimiter marks the closing boundary.
+        if after.starts_with(b"--") {
+            break;
+        }
+        // The part body begins after the CRLF that terminates the delimiter line.
+        let part_start = match find_bytes(after, b"\r\n") {
+            Some(p) => search_from + p + 2,
+            None => break,
+        };
+        // The part runs up to the next boundary delimiter.
+        let next = match find_bytes(&body[part_start..], delim) {
+            Some(p) => part_start + p,
+            None => break, // no closing delimiter — treat as malformed, stop
+        };
+        // Trim the CRLF that precedes the delimiter from the part content.
+        let mut part_end = next;
+        if part_end >= part_start + 2 && &body[part_end - 2..part_end] == b"\r\n" {
+            part_end -= 2;
+        }
+        parse_one_part(&body[part_start..part_end], &mut out);
+        search_from = next + delim.len();
+    }
+    out
+}
+
+/// Parse a single multipart part (its headers and content) and record it.
+fn parse_one_part(part: &[u8], out: &mut MultipartParts) {
+    let (headers, content) = match find_bytes(part, b"\r\n\r\n") {
+        Some(p) => (&part[..p], &part[p + 4..]),
+        None => (part, &b""[..]),
+    };
+    let headers = String::from_utf8_lossy(headers);
+    let mut name: Option<String> = None;
+    let mut filename: Option<String> = None;
+    for line in headers.split("\r\n") {
+        if line
+            .to_ascii_lowercase()
+            .trim_start()
+            .starts_with("content-disposition:")
+        {
+            name = disposition_param(line, "name");
+            filename = disposition_param(line, "filename");
+            break;
+        }
+    }
+    match filename {
+        // A part with a `filename` attribute is a file upload.
+        Some(fname) => {
+            out.filenames.push(fname);
+            if let Some(n) = name {
+                out.field_names.push(n);
+            }
+            out.combined_size += content.len();
+        }
+        // Otherwise it is a regular form field; its value feeds ARGS.
+        None => {
+            if let Some(n) = name {
+                out.fields
+                    .push((n, String::from_utf8_lossy(content).into_owned()));
+            }
+        }
+    }
+}
+
+/// Extract a `key="value"` (or unquoted `key=value`) parameter from a
+/// Content-Disposition line.  The key is matched only on a token boundary
+/// (start of line, or after `;`/whitespace) so that searching for `name`
+/// does not match inside `filename`.
+fn disposition_param(line: &str, key: &str) -> Option<String> {
+    let lower = line.to_ascii_lowercase();
+    let needle = format!("{key}=");
+    let mut idx = 0usize;
+    loop {
+        let rel = lower[idx..].find(&needle)?;
+        let at = idx + rel;
+        let on_boundary =
+            at == 0 || matches!(lower.as_bytes()[at - 1], b';' | b' ' | b'\t');
+        if on_boundary {
+            let rest = &line[at + needle.len()..];
+            let val = if let Some(stripped) = rest.strip_prefix('"') {
+                stripped.split('"').next().unwrap_or("")
+            } else {
+                rest.split([';', ' ', '\t']).next().unwrap_or("")
+            };
+            return Some(val.to_owned());
+        }
+        idx = at + needle.len();
+    }
+}
+
 /// Parse POST-body parameters into `(name, value)` pairs.
 ///
 /// ModSecurity's `ARGS` collection merges query-string and POST-body
@@ -183,6 +402,11 @@ fn body_args(ctx: &RequestContext) -> Vec<(String, String)> {
             // so obfuscated/broken payloads still reach the regex operators.
             Err(_) => vec![(String::new(), String::from_utf8_lossy(body).into_owned())],
         }
+    } else if ct.starts_with("multipart/form-data") {
+        // Non-file form fields feed ARGS exactly like a urlencoded form, so
+        // injection delivered through a multipart body is inspected the same
+        // way.  File parts are surfaced via the FILES* targets, not ARGS.
+        multipart_parts(ctx).fields
     } else {
         Vec::new()
     }
@@ -274,6 +498,9 @@ fn extract_target(spec: &TargetSpec, ctx: &RequestContext) -> Vec<String> {
             .as_ref()
             .map(|b| vec![String::from_utf8_lossy(b).into_owned()])
             .unwrap_or_default(),
+        TargetSpec::Files => multipart_parts(ctx).filenames,
+        TargetSpec::FilesNames => multipart_parts(ctx).field_names,
+        TargetSpec::FilesCombinedSize => vec![multipart_parts(ctx).combined_size.to_string()],
         TargetSpec::RemoteAddr => vec![ctx.client_ip.to_string()],
         TargetSpec::Geo => vec![], // TODO: GeoIP in Phase 2
         TargetSpec::TxVar(name) => ctx
@@ -408,6 +635,18 @@ pub fn evaluate(
                         .iter()
                         .any(|s| libinjectionrs::detect_xss(s.as_bytes()).is_injection());
                     debug!(matched, "DetectXss");
+                    stack.push(StackVal::Bool(matched));
+                }
+            }
+
+            Instruction::DetectOffDomainUrl => {
+                let values = pop_strings(&mut stack);
+                if values.is_empty() {
+                    stack.push(StackVal::Absent);
+                } else {
+                    let host = request_host(ctx);
+                    let matched = values.iter().any(|v| contains_off_domain_url(v, &host));
+                    debug!(matched, "DetectOffDomainUrl");
                     stack.push(StackVal::Bool(matched));
                 }
             }

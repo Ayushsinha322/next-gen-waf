@@ -26,6 +26,9 @@ pub enum TargetSpec {
     ResponseHeadersAll,
     ResponseHeader(String),
     ResponseBody,
+    Files,
+    FilesNames,
+    FilesCombinedSize,
     RemoteAddr,
     Geo,
     TxVar(String),
@@ -49,6 +52,9 @@ impl From<&Target> for TargetSpec {
             Target::ResponseHeaders(None) => TargetSpec::ResponseHeadersAll,
             Target::ResponseHeaders(Some(h)) => TargetSpec::ResponseHeader(h.clone()),
             Target::ResponseBody => TargetSpec::ResponseBody,
+            Target::Files => TargetSpec::Files,
+            Target::FilesNames => TargetSpec::FilesNames,
+            Target::FilesCombinedSize => TargetSpec::FilesCombinedSize,
             Target::RemoteAddr => TargetSpec::RemoteAddr,
             Target::Geo => TargetSpec::Geo,
             Target::TxVar(v) => TargetSpec::TxVar(v.clone()),
@@ -89,6 +95,8 @@ pub enum Instruction {
     /// Pop `StrVec`, run libinjection XSS detection on each value, push
     /// `Bool(any value flagged as XSS)`.
     DetectXss,
+    /// Pop `StrVec`, push `Bool(any value is an off-domain URL)`.
+    DetectOffDomainUrl,
 
     /// Always push `Bool(false)` — used for intentionally disabled rules.
     Never,

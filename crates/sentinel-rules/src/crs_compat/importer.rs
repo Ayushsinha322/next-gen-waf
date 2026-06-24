@@ -49,7 +49,11 @@ pub fn import_secrule_conf_dir(
         match item {
             RuleItem::Directive(Directive::SecRule(dir)) => {
                 let actions = parse_crs_actions(&dir.actions);
-                let is_chain = actions.chain;
+                // 931130/931131 are collapsed into a single native OffDomainUrl
+                // rule (see secrule_directive_to_rule_with_actions); suppress chain
+                // accumulation so the unexpressable macro child condition is dropped.
+                let is_chain =
+                    actions.chain && !matches!(actions.id, Some(931130) | Some(931131));
 
                 if let Some(ref mut pending) = pending_chain {
                     // This directive is a chain member — add its condition.
@@ -223,12 +227,24 @@ fn secrule_directive_to_rule_with_actions(
         CrsAction::Allow => RuleAction::Allow,
     };
 
+    // CRS 931130/931131 (off-domain reference / RFI) are chained rules that need
+    // capture groups, a dynamic `setvar`, a `TX:/regex/` collection, and a
+    // `%{request_headers.host}`-macro `@endsWith` — none of which the importer can
+    // express, so they were effectively disabled. Collapse them into the native
+    // `OffDomainUrl` operator and apply their critical score directly, preserving
+    // faithful detection (the chained child condition is dropped in the caller).
+    let (operator, score_delta, rule_action) = if matches!(rule_id, 931130 | 931131) {
+        (Operator::OffDomainUrl, Some(5), RuleAction::Score)
+    } else {
+        (operator, actions.score_delta, rule_action)
+    };
+
     Ok(Some(RuleDef {
         id: rule_id,
         phase,
         targets,
         operator,
-        score_delta: actions.score_delta,
+        score_delta,
         severity: actions.severity,
         message: actions.msg.clone(),
         action: rule_action,
@@ -302,7 +318,11 @@ fn token_to_target(tok: &str) -> Option<Target> {
             sub.unwrap_or("anomaly_score").to_ascii_uppercase(),
         )),
         "MATCHED_VAR" | "MATCHED_VARS" | "MATCHED_VAR_NAME" | "MATCHED_VARS_NAMES" => None,
-        "FILES" | "FILES_NAMES" | "FILES_COMBINED_SIZE" | "FILES_TMPNAMES" => None,
+        "FILES" => Some(Target::Files),
+        "FILES_NAMES" => Some(Target::FilesNames),
+        "FILES_COMBINED_SIZE" => Some(Target::FilesCombinedSize),
+        // No on-disk temp files in a streaming proxy; per-file sizes unmodeled.
+        "FILES_TMPNAMES" | "FILES_SIZES" | "FILES_TMP_CONTENT" => None,
         "XML" | "MULTIPART_FILENAME" | "MULTIPART_NAME" => None,
         other => {
             warn!(target = other, "CRS importer: unknown target token, skipping");

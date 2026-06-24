@@ -233,6 +233,11 @@ fn target_name(input: &str) -> IResult<&str, Target> {
             |(_, opt_name)| Target::ResponseHeaders(opt_name),
         ),
         value(Target::ResponseBody, tag("RESPONSE_BODY")),
+        // FILES family — longest tags first so the shorter `FILES` does not
+        // shadow `FILES_NAMES` / `FILES_COMBINED_SIZE`.
+        value(Target::FilesCombinedSize, tag("FILES_COMBINED_SIZE")),
+        value(Target::FilesNames, tag("FILES_NAMES")),
+        value(Target::Files, tag("FILES")),
         // TX:var_name
         map(
             preceded(pair(tag("TX"), char(':')), map(identifier, String::from)),

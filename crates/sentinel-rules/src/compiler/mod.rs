@@ -346,6 +346,9 @@ fn emit_operator_match(
         Operator::DetectXss => {
             instrs.push(Instruction::DetectXss);
         }
+        Operator::OffDomainUrl => {
+            instrs.push(Instruction::DetectOffDomainUrl);
+        }
         Operator::Never => {
             instrs.push(Instruction::Never);
         }
