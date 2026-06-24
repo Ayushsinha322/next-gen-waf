@@ -281,13 +281,17 @@ impl AcmeClient {
                 .find(|c| c.kind == acme_chtype)
                 .ok_or_else(|| anyhow!("CA did not offer {acme_chtype} for {domain}"))?;
 
-            let key_auth = format!("{}.{}", challenge.token, self.key.thumbprint());
+            let token = challenge
+                .token
+                .clone()
+                .ok_or_else(|| anyhow!("{acme_chtype} challenge for {domain} carries no token"))?;
+            let key_auth = format!("{}.{}", token, self.key.thumbprint());
 
             match challenge_type {
                 AcmeChallengeType::Http01 => {
-                    http01_tokens.insert(challenge.token.clone(), key_auth);
-                    cleanup.push(CleanupAction::Http01(challenge.token.clone()));
-                    tracing::debug!(domain, token = %challenge.token, "HTTP-01 token armed");
+                    http01_tokens.insert(token.clone(), key_auth);
+                    cleanup.push(CleanupAction::Http01(token.clone()));
+                    tracing::debug!(domain, token = %token, "HTTP-01 token armed");
                 }
                 AcmeChallengeType::TlsAlpn01 => {
                     let digest: [u8; 32] = Sha256::digest(key_auth.as_bytes()).into();
@@ -526,7 +530,10 @@ struct AcmeIdentifier {
 struct AcmeChallenge {
     #[serde(rename = "type")]
     kind: String,
-    token: String,
+    /// Optional: newer challenge types (e.g. `dns-persist-01`) carry no token.
+    /// Always present for http-01 / dns-01 / tls-alpn-01.
+    #[serde(default)]
+    token: Option<String>,
     url: String,
 }
 
@@ -809,5 +816,99 @@ mod tests {
         let ts = parse_asn1_time(0x17, b"251231235959Z").unwrap();
         // sanity: this is in 2025, well after 2020 epoch offset
         assert!(ts > 1_767_000_000 && ts < 1_768_000_000, "got {ts}");
+    }
+
+    /// Live network test against the Let's Encrypt **staging** CA.
+    ///
+    /// Exercises the full ACME protocol/crypto subset that does NOT require
+    /// owning the domain or inbound connectivity:
+    ///   directory → newNonce → newAccount (ES256/JWS + JWK) →
+    ///   newOrder (kid-signed JWS) → POST-as-GET authz (empty-payload JWS).
+    ///
+    /// This proves the hand-rolled JWS signing, JWK, nonce handling and
+    /// base64url are all wire-correct — a bad signature is rejected by LE
+    /// immediately with a `malformed`/`JWS verification` error.
+    ///
+    /// The challenge-validation step is intentionally skipped (it needs a
+    /// public domain pointed at this host). Run explicitly:
+    ///   cargo test -p sentinel-proxy --lib tls::acme -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "hits the Let's Encrypt staging CA over the network"]
+    async fn live_le_staging_account_order_authz() {
+        // The production binary installs this at startup (sentinel-bin/main.rs);
+        // the test harness must do the same before building any rustls config.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let cert_dir = std::env::temp_dir().join("sentinel-acme-livetest");
+        // Fresh account each run so we test creation, not the load-from-disk path.
+        let _ = std::fs::remove_dir_all(&cert_dir);
+
+        let config = SiteAcmeConfig {
+            // LE rejects example.com as a contact domain; use a real-domain address.
+            email: "ayush.sinha@esds.co.in".to_string(),
+            provider: AcmeProvider::LetsEncryptStaging,
+            challenge: AcmeChallengeType::Http01,
+            renew_before_days: 30,
+        };
+
+        // 1. Account creation — directory + nonce + jwk-header ES256 JWS.
+        let mut client = AcmeClient::new_or_load(&cert_dir, &config)
+            .await
+            .expect("ACME account creation against LE staging failed");
+        let kid = client.kid.clone().expect("account KID must be set");
+        assert!(
+            kid.contains("acme-staging-v02.api.letsencrypt.org"),
+            "KID should be a staging account URL, got: {kid}"
+        );
+        eprintln!("✅ account created: {kid}");
+
+        // 2. newOrder — kid-header ES256 JWS + nonce chaining.
+        // Ownership is only checked at challenge time, so a test domain is fine.
+        let domain = "sentinel-waf-acme-smoketest.com";
+        let new_order_url = client.directory.new_order.clone();
+        let order_resp = client
+            .post_jws_kid(
+                &new_order_url,
+                Some(&serde_json::json!({
+                    "identifiers": [{"type": "dns", "value": domain}]
+                })),
+            )
+            .await
+            .expect("newOrder failed (would indicate a JWS/kid signing bug)");
+        let order_url = order_resp.location.clone().expect("order Location header");
+        let order: OrderResp = order_resp.json().expect("parse order");
+        assert!(
+            !order.authorizations.is_empty(),
+            "order must contain authorizations"
+        );
+        eprintln!("✅ order created: {order_url} (status={})", order.status);
+
+        // 3. POST-as-GET the authorization — empty-payload JWS.
+        let authz: AuthzResp = client
+            .post_as_get(&order.authorizations[0])
+            .await
+            .expect("fetch authz failed (would indicate a POST-as-GET signing bug)")
+            .json()
+            .expect("parse authz");
+        assert_eq!(authz.identifier.value, domain);
+        assert!(
+            authz.challenges.iter().any(|c| c.kind == "http-01"),
+            "CA must offer an http-01 challenge"
+        );
+        assert!(
+            authz.challenges.iter().any(|c| c.kind == "tls-alpn-01"),
+            "CA must offer a tls-alpn-01 challenge"
+        );
+        eprintln!(
+            "✅ authz fetched: {} challenges offered ({})",
+            authz.challenges.len(),
+            authz
+                .challenges
+                .iter()
+                .map(|c| c.kind.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        eprintln!("✅ LE staging protocol+crypto path verified end-to-end (pre-validation)");
     }
 }
