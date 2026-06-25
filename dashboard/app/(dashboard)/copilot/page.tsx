@@ -5,7 +5,7 @@ import { GREET } from "@/lib/aiResponses";
 import { spring } from "@/lib/animations";
 
 function fmt(text: string) {
-  return text.replace(/\n/g,"<br>").replace(/\*\*(.*?)\*\*/g,"<strong>$1</strong>").replace(/`(.*?)`/g,'<code style="background:rgba(255,255,255,.08);padding:1px 5px;border-radius:3px;font-size:10px">$1</code>').replace(/```([\s\S]*?)```/g,'<pre style="background:rgba(0,0,0,.3);padding:8px;border-radius:6px;font-size:10px;margin:5px 0;overflow-x:auto;white-space:pre-wrap">$1</pre>');
+  return text.replace(/\n/g,"<br>").replace(/\*\*(.*?)\*\*/g,"<strong>$1</strong>").replace(/`(.*?)`/g,'<code style="background:rgba(255,255,255,.08);padding:1px 5px;border-radius:3px;font-size:12px">$1</code>').replace(/```([\s\S]*?)```/g,'<pre style="background:rgba(0,0,0,.3);padding:8px;border-radius:6px;font-size:12px;margin:5px 0;overflow-x:auto;white-space:pre-wrap">$1</pre>');
 }
 
 const CONVOS = ["SQLi on /api/login","Log4Shell probe analysis","False positive CRS-920420","Rate limit tuning","CVE-2024-1234 patch","Bot detector JA4 tune"];
@@ -80,7 +80,7 @@ export default function CopilotPage() {
       <motion.div className="cop-page" initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ ...spring, delay: 0.1 }}>
         <div className="cop-hist">
           <div style={{padding:"13px 16px",borderBottom:"1px solid rgba(124,47,191,.15)",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
-            <div style={{fontFamily:"'Orbitron',sans-serif",fontSize:10,fontWeight:700,letterSpacing:1}}>💬 Conversations</div>
+            <div style={{fontFamily:"'Orbitron',sans-serif",fontSize:12,fontWeight:700,letterSpacing:1}}>💬 Conversations</div>
             <motion.button className="btn bg-btn btn-xs" onClick={() => { setMsgs([]); }} whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.96 }}>＋</motion.button>
           </div>
           <div style={{flex:1,overflowY:"auto",padding:8}}>

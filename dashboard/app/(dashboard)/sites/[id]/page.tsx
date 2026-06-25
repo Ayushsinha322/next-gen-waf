@@ -1,0 +1,508 @@
+"use client";
+/**
+ * Client Services — per-site management dashboard.
+ * Everything here is real: site config from the control plane, per-site
+ * request/block counters from the proxy NDJSON stream, live WAF/access logs
+ * filtered to this site, the certificate from the /certs API, and a
+ * learning↔blocking↔off mode control that hot-applies in ~5s.
+ */
+import { useState, useEffect, useMemo, useCallback } from "react";
+import { useParams, useRouter } from "next/navigation";
+import { motion, AnimatePresence } from "framer-motion";
+import { showToast } from "@/components/ui/Toast";
+import { api, type Site, type Certificate, type SiteStat, type LearningStat } from "@/lib/api";
+import { staggerContainer, cardVariants, fadeUp } from "@/lib/animations";
+import SiteWizard from "@/components/sites/SiteWizard";
+import { siteToForm, type SiteForm, CRS_CATEGORIES } from "@/lib/siteConfig";
+
+type WafRow = { ts: string; ip: string; rule: string; attack: string; sev: string; action: string };
+type AccessRow = { ts: string; ip: string; method: string; path: string; status: number; latency: number };
+type Tab = "overview" | "waf" | "access" | "learning" | "cert";
+
+const MODES = [
+  { key: "off",      label: "Off",      desc: "WAF disabled — pass-through",         color: "var(--text3)" },
+  { key: "learning", label: "Learning", desc: "Log only · no traffic impact",        color: "var(--amber, #ffb020)" },
+  { key: "blocking", label: "Blocking", desc: "Enforce · block malicious requests",  color: "#ef4444" },
+] as const;
+
+function timePart(ts: unknown): string {
+  const s = String(ts ?? "");
+  const m = s.match(/(\d{2}:\d{2}:\d{2})/);
+  return m ? m[1] : new Date().toTimeString().slice(0, 8);
+}
+
+export default function SiteDetailPage() {
+  const params = useParams();
+  const router = useRouter();
+  const siteId = String(params.id);
+
+  const [site, setSite] = useState<Site | null>(null);
+  const [form, setForm] = useState<SiteForm | null>(null);
+  const [stat, setStat] = useState<SiteStat | null>(null);
+  const [certs, setCerts] = useState<Certificate[]>([]);
+  const [wafLogs, setWafLogs] = useState<WafRow[]>([]);
+  const [accessLogs, setAccessLogs] = useState<AccessRow[]>([]);
+  const [learn, setLearn] = useState<LearningStat[]>([]);
+  const [learnBusy, setLearnBusy] = useState<number | null>(null);
+  const [tab, setTab] = useState<Tab>("overview");
+  const [busy, setBusy] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [loading, setLoading] = useState(true);
+
+  const loadSite = useCallback(async () => {
+    try {
+      const res = await api.sites.get(siteId);
+      setSite(res.site);
+      setForm(siteToForm(res.site));
+    } catch {
+      showToast("Failed to load site", "e", "⚠️");
+    } finally { setLoading(false); }
+  }, [siteId]);
+
+  useEffect(() => { loadSite(); }, [loadSite]);
+  useEffect(() => { api.certs.list().then(r => setCerts(r.certs ?? [])).catch(() => {}); }, []);
+
+  // Per-site cumulative counters (real, from the hub).
+  useEffect(() => {
+    if (!site) return;
+    let cancelled = false;
+    async function f() {
+      try {
+        const r = await api.metrics.sites();
+        if (!cancelled && site) setStat(r.sites?.[site.name] ?? { total: 0, blocked: 0, status_4xx: 0, status_5xx: 0 });
+      } catch { /* control plane down */ }
+    }
+    f(); const t = setInterval(f, 5_000); return () => { cancelled = true; clearInterval(t); };
+  }, [site]);
+
+  // Live WAF + access logs filtered to this site.
+  useEffect(() => {
+    if (!site) return;
+    const match = (s: unknown) => { const v = String(s ?? ""); return v === site.name || site.domains.includes(v); };
+    const wafES = new EventSource(api.logs.streamURL("waf"));
+    wafES.onmessage = (evt) => {
+      try {
+        const e: { data: Record<string, unknown> } = JSON.parse(evt.data);
+        if (!e.data || !match(e.data.site)) return;
+        setWafLogs(p => [{ ts: timePart(e.data.ts), ip: String(e.data.ip ?? ""), rule: String(e.data.rule ?? "-"), attack: String(e.data.attack ?? ""), sev: String(e.data.sev ?? ""), action: String(e.data.action ?? "") }, ...p].slice(0, 40));
+      } catch { /* */ }
+    };
+    const accES = new EventSource(api.logs.streamURL("access"));
+    accES.onmessage = (evt) => {
+      try {
+        const e: { data: Record<string, unknown> } = JSON.parse(evt.data);
+        if (!e.data || !match(e.data.site)) return;
+        setAccessLogs(p => [{ ts: timePart(e.data.ts), ip: String(e.data.ip ?? ""), method: String(e.data.method ?? "GET"), path: String(e.data.path ?? "/"), status: Number(e.data.status ?? 0), latency: parseFloat(String(e.data.latency ?? 0)) }, ...p].slice(0, 40));
+      } catch { /* */ }
+    };
+    return () => { wafES.close(); accES.close(); };
+  }, [site]);
+
+  // Learning-mode would-have-blocked aggregation (polled while the tab is open).
+  useEffect(() => {
+    if (!site || tab !== "learning") return;
+    let cancelled = false;
+    async function f() {
+      try {
+        const r = await api.metrics.learning(site!.name);
+        if (!cancelled) setLearn(r.rules ?? []);
+      } catch { /* control plane down */ }
+    }
+    f(); const t = setInterval(f, 5_000); return () => { cancelled = true; clearInterval(t); };
+  }, [site, tab]);
+
+  const mode = site?.waf_policy?.mode ?? "blocking";
+  // Rule IDs currently excluded on this site (from the persisted waf_policy).
+  const excludedIds = useMemo(
+    () => new Set((form?.rule_exclusions ?? []).map(e => String(e.rule_id))),
+    [form]
+  );
+
+  async function disableRule(ruleId: string) {
+    if (!site) return;
+    const id = Number(ruleId);
+    if (!Number.isFinite(id) || id === 0) { showToast("Rule has no numeric ID", "e", "⚠️"); return; }
+    setLearnBusy(id);
+    try {
+      await api.sites.addExclusion(siteId, { rule_id: id });
+      showToast(`Rule ${ruleId} disabled · applies in ~5s`, "s", "🔕");
+      await loadSite();
+    } catch (e) { showToast(e instanceof Error ? e.message : "Failed", "e", "⚠️"); }
+    finally { setLearnBusy(null); }
+  }
+
+  async function reEnableRule(ruleId: string) {
+    if (!site) return;
+    const id = Number(ruleId);
+    setLearnBusy(id);
+    try {
+      await api.sites.removeExclusion(siteId, id);
+      showToast(`Rule ${ruleId} re-enabled · applies in ~5s`, "s", "🔔");
+      await loadSite();
+    } catch (e) { showToast(e instanceof Error ? e.message : "Failed", "e", "⚠️"); }
+    finally { setLearnBusy(null); }
+  }
+
+  const cert = useMemo(() => {
+    if (!site) return undefined;
+    return certs.find(c => site.domains.includes(c.domain) || (c.san ?? []).some(s => site.domains.includes(s)));
+  }, [certs, site]);
+
+  async function setMode(newMode: string) {
+    if (!site || busy || newMode === mode) return;
+    setBusy(true);
+    try {
+      await api.sites.update(siteId, { waf_policy: { ...(site.waf_policy as object), mode: newMode } });
+      showToast(`Mode → ${newMode.toUpperCase()} · applies in ~5s`, "s", newMode === "blocking" ? "🛡️" : newMode === "learning" ? "📚" : "⏸️");
+      await loadSite();
+    } catch (e) { showToast(e instanceof Error ? e.message : "Failed", "e", "⚠️"); }
+    finally { setBusy(false); }
+  }
+
+  async function toggleStatus() {
+    if (!site) return;
+    const next = site.status === "active" ? "paused" : "active";
+    try { await api.sites.updateStatus(siteId, next); showToast(`Site ${next}`, "s", next === "active" ? "✅" : "⏸️"); await loadSite(); }
+    catch { showToast("Failed", "e", "⚠️"); }
+  }
+
+  async function del() {
+    if (!site || !confirm(`Delete site "${site.name}"? This cannot be undone.`)) return;
+    try { await api.sites.delete(siteId); showToast("Site deleted", "s", "🗑️"); router.push("/sites"); }
+    catch { showToast("Failed to delete", "e", "⚠️"); }
+  }
+
+  if (loading) return <div className="sec"><div style={{ padding: 40, textAlign: "center", color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", fontSize: 12 }}>Loading site…</div></div>;
+  if (!site || !form) return <div className="sec"><div style={{ padding: 40, textAlign: "center", color: "var(--text3)" }}>Site not found. <button className="btn bg-btn btn-sm" onClick={() => router.push("/sites")}>← Back</button></div></div>;
+
+  const scheme = form.front_https ? "https" : "http";
+  const blockRate = stat && stat.total > 0 ? (stat.blocked / stat.total) * 100 : 0;
+  const certDays = cert && cert.expires_at > 0 ? Math.round((cert.expires_at * 1000 - Date.now()) / 86400000) : null;
+
+  return (
+    <motion.div className="sec" variants={staggerContainer} initial="hidden" animate="visible">
+
+      {/* Header */}
+      <motion.div variants={fadeUp} style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 14 }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          <button onClick={() => router.push("/sites")} style={{ background: "none", border: "none", color: "var(--text3)", cursor: "pointer", fontSize: 11, padding: 0, textAlign: "left", fontFamily: "'Share Tech Mono',monospace" }}>← All sites</button>
+          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+            <div className="sec-title">{site.name}</div>
+            <span className={`bdg ${site.status === "active" ? "bgg" : "bgr"}`}>{site.status}</span>
+          </div>
+          <div className="sec-sub" style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+            {site.domains.map(d => <a key={d} href={`${scheme}://${d}:9080/`} target="_blank" rel="noreferrer" style={{ color: "var(--cyan)", fontFamily: "'Share Tech Mono',monospace", fontSize: 11 }}>{scheme}://{d} ↗</a>)}
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
+          <button className="btn bc btn-sm" onClick={() => setEditing(true)}>✏️ Edit</button>
+          <button className="btn bg-btn btn-sm" onClick={toggleStatus}>{site.status === "active" ? "⏸️ Pause" : "▶️ Activate"}</button>
+          <button className="btn bg-btn btn-sm" onClick={del} style={{ color: "#ef4444" }}>🗑️ Delete</button>
+        </div>
+      </motion.div>
+
+      {/* Mode control — the learning→blocking workflow */}
+      <motion.div className="panel" variants={fadeUp}>
+        <div className="ph"><div className="ptitle">WAF Enforcement Mode</div><span className="panel-badge pb-info">applies live ~5s</span></div>
+        <div className="pb" style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 12 }}>
+          {MODES.map(m => {
+            const active = mode === m.key;
+            return (
+              <div key={m.key} onClick={() => setMode(m.key)} style={{
+                cursor: busy ? "wait" : "pointer", padding: "14px 16px", borderRadius: 12,
+                background: active ? "color-mix(in srgb, " + m.color + " 14%, transparent)" : "var(--bg3)",
+                border: `1.5px solid ${active ? m.color : "var(--bg4)"}`, opacity: busy ? 0.7 : 1, transition: "all .15s",
+              }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                  <span style={{ fontWeight: 700, fontSize: 14, color: active ? m.color : "var(--text2)", fontFamily: "'Orbitron',sans-serif" }}>{m.label}</span>
+                  {active && <span style={{ width: 10, height: 10, borderRadius: "50%", background: m.color }} />}
+                </div>
+                <div style={{ fontSize: 12, color: "var(--text3)", marginTop: 6, lineHeight: 1.5 }}>{m.desc}</div>
+              </div>
+            );
+          })}
+        </div>
+        {mode === "learning" && (
+          <div className="pb" style={{ paddingTop: 0 }}>
+            <div style={{ padding: "9px 13px", background: "rgba(255,176,32,.08)", border: "1px solid rgba(255,176,32,.25)", borderRadius: "var(--r2)", fontSize: 10.5, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", lineHeight: 1.6 }}>
+              📚 In Learning mode the WAF logs what it <strong>would</strong> block without affecting traffic. Watch the <strong>WAF Logs</strong> tab below, then switch to <strong>Blocking</strong> when false-positives are tuned out.
+            </div>
+          </div>
+        )}
+      </motion.div>
+
+      {/* Per-site KPIs (real) */}
+      <motion.div variants={staggerContainer} style={{ display: "grid", gridTemplateColumns: "repeat(5,1fr)", gap: 12 }}>
+        {[
+          { lbl: "Requests", val: stat ? stat.total.toLocaleString() : "—", ico: "📡", accent: "var(--text)" },
+          { lbl: "Blocked", val: stat ? stat.blocked.toLocaleString() : "—", ico: "🛑", accent: "#ef4444" },
+          { lbl: "Block rate", val: stat ? `${blockRate.toFixed(1)}%` : "—", ico: "📊", accent: "var(--cyan)" },
+          { lbl: "4xx / 5xx", val: stat ? `${stat.status_4xx} / ${stat.status_5xx}` : "—", ico: "⚠️", accent: "var(--amber,#ffb020)" },
+          { lbl: "Certificate", val: cert ? (certDays !== null ? `${certDays}d` : "active") : "none", ico: "🔐", accent: cert ? "var(--green)" : "var(--text3)" },
+        ].map((k, i) => (
+          <motion.div key={i} className="panel" variants={cardVariants} style={{ padding: "13px 15px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <span style={{ fontSize: 12, color: "var(--text3)", textTransform: "uppercase", letterSpacing: 1, fontFamily: "'Share Tech Mono',monospace" }}>{k.lbl}</span>
+              <span style={{ fontSize: 13 }}>{k.ico}</span>
+            </div>
+            <div style={{ fontSize: 22, fontWeight: 800, color: k.accent, marginTop: 6, fontFamily: "'Orbitron',sans-serif" }}>{k.val}</div>
+          </motion.div>
+        ))}
+      </motion.div>
+
+      {/* Tabs */}
+      <motion.div variants={fadeUp} style={{ display: "flex", gap: 4, padding: 4, background: "var(--bg3)", borderRadius: 10, width: "fit-content" }}>
+        {([["overview", "🗂 Overview"], ["waf", "🛡️ WAF Logs"], ["access", "📡 Access Logs"], ["learning", "📚 Learning Report"], ["cert", "🔐 Certificate"]] as [Tab, string][]).map(([k, label]) => (
+          <button key={k} onClick={() => setTab(k)} style={{
+            padding: "7px 16px", borderRadius: 7, border: "none", cursor: "pointer", fontSize: 12, fontWeight: 600,
+            background: tab === k ? "var(--cyan)" : "transparent", color: tab === k ? "#021018" : "var(--text2)",
+          }}>{label}</button>
+        ))}
+      </motion.div>
+
+      <AnimatePresence mode="wait">
+        <motion.div key={tab} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} transition={{ duration: 0.15 }}>
+
+          {/* OVERVIEW — rich config */}
+          {tab === "overview" && (
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+              <ConfigCard title="Reverse Proxy">
+                <KV k="Load balancer" v={form.lb} />
+                {form.servers.map((s, i) => <KV key={i} k={`Upstream #${i + 1}`} v={`${s.tls ? "https" : "http"}://${s.host}:${s.port} · w${s.weight}`} />)}
+                <KV k="Health checks" v={form.health.enabled ? `${form.health.path} every ${form.health.interval}` : "off"} />
+                <KV k="WebSocket" v={form.proxy_websocket ? "on" : "off"} />
+              </ConfigCard>
+              <ConfigCard title="WAF Rules">
+                <KV k="Paranoia level" v={`PL${form.paranoia_level}`} />
+                <KV k="Anomaly threshold" v={String(form.anomaly_threshold)} />
+                <KV k="CRS categories" v={`${form.rule_categories.length}/${CRS_CATEGORIES.length} enabled`} />
+                <KV k="Rule exclusions" v={`${form.rule_exclusions.length}`} />
+                <KV k="ML anomaly" v={form.ml_enabled ? `on (${form.ml_sensitivity})` : "off"} />
+              </ConfigCard>
+              <ConfigCard title="Rate & DDoS">
+                <KV k="Rate limit" v={form.rate_limit_enabled ? `${form.rl_per_ip.rps}/s per IP · ${form.rl_global.rps}/s global` : "off"} />
+                <KV k="Anti-DDoS" v={form.antiddos_enabled ? `${form.antiddos_conn_rate} conn/s · block ${form.antiddos_block_secs}s` : "off"} />
+                <KV k="Max body" v={`${form.max_body_size_mb} MB`} />
+                <KV k="Allowed methods" v={form.allowed_methods.join(" ")} />
+              </ConfigCard>
+              <ConfigCard title="Bots · Geo · IP">
+                <KV k="JA4 fingerprint" v={form.bot_ja4 ? "on" : "off"} />
+                <KV k="Challenge" v={form.bot_challenge} />
+                <KV k="GeoIP" v={form.geo_mode === "off" ? "off" : `${form.geo_mode}: ${form.geo_countries.join(", ") || "—"}`} />
+                <KV k="IP lists" v={`${form.ip_allow.length} allow · ${form.ip_block.length} block`} />
+                <KV k="Blacklists" v={form.dnsbl_enabled ? "DNSBL on" : "off"} />
+              </ConfigCard>
+              <ConfigCard title="Front Service / TLS">
+                <KV k="Public" v={`${scheme}://:${form.front_https ? 9443 : 9080}${form.force_https ? " · force-https" : ""}`} />
+                <KV k="HTTP/2 · HTTP/3" v={`${form.http2 ? "h2" : "—"} · ${form.http3 ? "h3" : "—"}`} />
+                <KV k="TLS mode" v={form.tls_mode === "auto" ? `auto · ${form.acme_staging ? "staging" : form.acme_provider}` : form.tls_mode} />
+                <KV k="HSTS" v={form.hsts ? "on" : "off"} />
+              </ConfigCard>
+              <ConfigCard title="HTTP Headers">
+                <KV k="CSP" v={form.csp || "default"} />
+                <KV k="Referrer-Policy" v={form.referrer_policy} />
+                <KV k="CORS" v={form.cors_enabled ? form.cors_origins : "off"} />
+                <KV k="Custom headers" v={`${form.custom_headers.filter(h => h.name).length}`} />
+              </ConfigCard>
+            </div>
+          )}
+
+          {/* WAF LOGS */}
+          {tab === "waf" && (
+            <div className="panel">
+              <div className="ph"><div className="ptitle">WAF events — {site.name}</div><span className="panel-badge pb-live">● Live</span></div>
+              <div className="tw">
+                {wafLogs.length === 0 ? <Empty text="No WAF events yet — send traffic through the proxy to populate." /> : (
+                  <table><thead><tr><th>Time</th><th>IP</th><th>Rule</th><th>Attack</th><th>Severity</th><th>Action</th></tr></thead>
+                    <tbody>{wafLogs.map((r, i) => (
+                      <tr key={i}>
+                        <td className="td3">{r.ts}</td><td className="td2">{r.ip}</td>
+                        <td className="td3">{r.rule}</td>
+                        <td style={{ maxWidth: 240, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.attack}</td>
+                        <td><span className={`bdg ${r.sev === "CRITICAL" ? "br blink" : r.sev === "HIGH" ? "ba" : "bcy"}`}>{r.sev || "—"}</span></td>
+                        <td><span className={`bdg ${r.action === "BLOCK" ? "br" : "ba"}`}>{r.action === "BLOCK" ? "BLOCKED" : "LOGGED"}</span></td>
+                      </tr>
+                    ))}</tbody>
+                  </table>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* ACCESS LOGS */}
+          {tab === "access" && (
+            <div className="panel">
+              <div className="ph"><div className="ptitle">Access log — {site.name}</div><span className="panel-badge pb-live">● Live</span></div>
+              <div className="tw">
+                {accessLogs.length === 0 ? <Empty text="No requests yet — traffic to this site will appear here in real time." /> : (
+                  <table><thead><tr><th>Time</th><th>IP</th><th>Method</th><th>Path</th><th>Status</th><th>Latency</th></tr></thead>
+                    <tbody>{accessLogs.map((r, i) => (
+                      <tr key={i}>
+                        <td className="td3">{r.ts}</td><td className="td2">{r.ip}</td><td className="td3">{r.method}</td>
+                        <td style={{ maxWidth: 260, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.path}</td>
+                        <td><span className={`bdg ${r.status === 403 || r.status >= 500 ? "br" : r.status >= 400 ? "ba" : "bgg"}`}>{r.status || "—"}</span></td>
+                        <td className="td3">{r.latency ? `${r.latency.toFixed(2)}ms` : "—"}</td>
+                      </tr>
+                    ))}</tbody>
+                  </table>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* LEARNING REPORT — would-have-blocked tuning */}
+          {tab === "learning" && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              <div style={{
+                fontSize: 11, color: "var(--text3)", lineHeight: 1.7, fontFamily: "'Share Tech Mono',monospace",
+                background: "var(--bg3)", borderRadius: 8, padding: "10px 14px",
+              }}>
+                {mode === "learning"
+                  ? <>📚 <strong>Learning mode is on.</strong> Each row is a rule that <strong>would</strong> have blocked traffic but didn&apos;t. Review the sample paths — if a rule is a false positive for your app, <strong>Disable</strong> it, then switch to <strong>Blocking</strong> once the list is clean.</>
+                  : <>This report aggregates <strong>would-have-blocked</strong> detections recorded while the site ran in <strong>Learning</strong> mode. Switch the mode control above to <strong>Learning</strong> to collect fresh data without impacting traffic.</>}
+              </div>
+              <div className="panel">
+                <div className="ph">
+                  <div className="ptitle">Would-have-blocked by rule — {site.name}</div>
+                  <span className="panel-badge">{learn.length} rule{learn.length === 1 ? "" : "s"}</span>
+                </div>
+                <div className="tw">
+                  {learn.length === 0 ? (
+                    <Empty text="No would-have-blocked detections recorded yet. Put the site in Learning mode and send traffic." />
+                  ) : (
+                    <table>
+                      <thead><tr><th>Rule</th><th>Category</th><th>Severity</th><th>Count</th><th>Sample paths</th><th>Last seen</th><th style={{ textAlign: "right" }}>Action</th></tr></thead>
+                      <tbody>
+                        {learn.map((r) => {
+                          const excluded = excludedIds.has(r.rule_id);
+                          const isBusy = learnBusy === Number(r.rule_id);
+                          return (
+                            <tr key={r.rule_id} style={excluded ? { opacity: 0.55 } : undefined}>
+                              <td className="td3">{r.rule_id}</td>
+                              <td><span className="bdg bcy">{r.category || "—"}</span></td>
+                              <td><span className={`bdg ${r.severity === "CRITICAL" ? "br" : r.severity === "HIGH" ? "ba" : "bcy"}`}>{r.severity || "—"}</span></td>
+                              <td className="td2" style={{ fontWeight: 700 }}>{r.count}</td>
+                              <td style={{ maxWidth: 300 }}>
+                                <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                                  {r.samples.slice(0, 3).map((p, i) => (
+                                    <span key={i} style={{ fontSize: 12, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p}</span>
+                                  ))}
+                                  {r.samples.length === 0 && <span style={{ fontSize: 12, color: "var(--text3)" }}>—</span>}
+                                </div>
+                              </td>
+                              <td className="td3">{timePart(r.last_seen)}</td>
+                              <td style={{ textAlign: "right" }}>
+                                {excluded ? (
+                                  <button className="btn bg-btn btn-xs" disabled={isBusy} onClick={() => reEnableRule(r.rule_id)}>🔔 Re-enable</button>
+                                ) : (
+                                  <button className="btn bc btn-xs" disabled={isBusy} onClick={() => disableRule(r.rule_id)}>🔕 Disable rule</button>
+                                )}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+              </div>
+
+              {/* Active exclusions not (or no longer) appearing in the report. */}
+              {(form.rule_exclusions ?? []).length > 0 && (
+                <div className="panel">
+                  <div className="ph"><div className="ptitle">Active rule exclusions ({form.rule_exclusions.length})</div></div>
+                  <div className="tw">
+                    <table>
+                      <thead><tr><th>Rule</th><th>Scope</th><th style={{ textAlign: "right" }}>Action</th></tr></thead>
+                      <tbody>
+                        {form.rule_exclusions.map((e) => (
+                          <tr key={e.rule_id}>
+                            <td className="td3">{e.rule_id}</td>
+                            <td className="td2">{e.disable || !e.exclude_targets?.length ? "whole rule disabled" : `targets: ${e.exclude_targets.join(", ")}`}</td>
+                            <td style={{ textAlign: "right" }}>
+                              <button className="btn bg-btn btn-xs" disabled={learnBusy === e.rule_id} onClick={() => reEnableRule(String(e.rule_id))}>🔔 Re-enable</button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* CERTIFICATE */}
+          {tab === "cert" && (
+            <div className="panel">
+              <div className="ph"><div className="ptitle">TLS Certificate</div></div>
+              <div className="pb">
+                {!cert ? (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                    <Empty text="No certificate installed for this site's domains." />
+                    <div style={{ fontSize: 11, color: "var(--text3)", lineHeight: 1.7, fontFamily: "'Share Tech Mono',monospace" }}>
+                      Configure TLS in <button className="btn bg-btn btn-xs" onClick={() => setEditing(true)}>✏️ Edit → Front Service</button>. With automatic ACME, a cert is requested on save (once DNS points here). Self-signed is served until then.
+                    </div>
+                  </div>
+                ) : (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                      <KV k="Domain" v={cert.domain} />
+                      <KV k="Source" v={typeof cert.source === "string" ? cert.source : "acme"} />
+                      <KV k="SAN" v={(cert.san ?? []).join(", ") || "—"} />
+                      <KV k="Fingerprint" v={cert.fingerprint ? cert.fingerprint.slice(0, 24) + "…" : "—"} />
+                    </div>
+                    {certDays !== null && (
+                      <div>
+                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "var(--text3)", marginBottom: 4, fontFamily: "'Share Tech Mono',monospace" }}>
+                          <span>Validity</span><span>{certDays} days remaining</span>
+                        </div>
+                        <div style={{ height: 7, background: "var(--bg3)", borderRadius: 4, overflow: "hidden" }}>
+                          <div style={{ height: "100%", width: `${Math.max(3, Math.min(100, (certDays / 90) * 100))}%`, background: certDays < 14 ? "#ef4444" : certDays < 30 ? "var(--amber,#ffb020)" : "var(--green)", borderRadius: 4 }} />
+                        </div>
+                      </div>
+                    )}
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <button className="btn bg-btn btn-sm" onClick={async () => { try { await api.certs.renew(cert.domain); showToast("Renewal requested", "s", "🔐"); } catch (e) { showToast(e instanceof Error ? e.message : "Renew failed", "e", "⚠️"); } }}>🔄 Renew</button>
+                      <button className="btn bg-btn btn-sm" onClick={() => router.push("/certificates")}>Manage all certs →</button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </motion.div>
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {editing && (
+          <SiteWizard mode="edit" siteId={siteId} initial={form}
+            onClose={() => setEditing(false)}
+            onSaved={() => { setEditing(false); loadSite(); }} />
+        )}
+      </AnimatePresence>
+    </motion.div>
+  );
+}
+
+function ConfigCard({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <motion.div className="panel" variants={cardVariants}>
+      <div className="ph"><div className="ptitle">{title}</div></div>
+      <div className="pb" style={{ display: "flex", flexDirection: "column", gap: 7 }}>{children}</div>
+    </motion.div>
+  );
+}
+
+function KV({ k, v }: { k: string; v: string }) {
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", gap: 10, fontSize: 11 }}>
+      <span style={{ color: "var(--text3)" }}>{k}</span>
+      <span style={{ color: "var(--text)", fontFamily: "'Share Tech Mono',monospace", textAlign: "right", maxWidth: "62%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{v}</span>
+    </div>
+  );
+}
+
+function Empty({ text }: { text: string }) {
+  return <div style={{ padding: "22px 12px", textAlign: "center", fontSize: 11, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>{text}</div>;
+}

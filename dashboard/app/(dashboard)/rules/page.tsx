@@ -167,7 +167,7 @@ export default function RulesPage() {
                       <td onClick={e => { e.stopPropagation(); toggleRule(r); }}>
                         <div className={`tog ${r.enabled?"on":""}`} />
                       </td>
-                      <td><span style={{ color:"var(--cyan)", fontSize:10 }}>{r.name}</span></td>
+                      <td><span style={{ color:"var(--cyan)", fontSize:12 }}>{r.name}</span></td>
                       <td className="td3">{PHASE_LABELS[r.phase]??`ph${r.phase}`}</td>
                       <td><SevBadge sev={r.severity} /></td>
                       <td>
@@ -188,7 +188,7 @@ export default function RulesPage() {
           <div className="ph">
             <div className="ptitle">
               ✏️ Rule Editor
-              {editorRule && <span style={{ fontSize:10, color:"var(--text3)", marginLeft:8 }}>— {editorRule.name}</span>}
+              {editorRule && <span style={{ fontSize:12, color:"var(--text3)", marginLeft:8 }}>— {editorRule.name}</span>}
             </div>
             <motion.button className="btn bc btn-sm" onClick={runTest} disabled={testLoading} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
               {testLoading ? "⏳" : "▶ Test"}

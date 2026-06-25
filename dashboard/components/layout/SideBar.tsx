@@ -26,6 +26,11 @@ const Icon = {
       <polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>
     </svg>
   ),
+  Search: () => (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+    </svg>
+  ),
   Sites: () => (
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
       <circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/>
@@ -60,6 +65,12 @@ const Icon = {
       <path d="M9 12.2V20l-1.6-1.2L5.8 20v-7.8"/><line x1="14" y1="9" x2="18" y2="9"/><line x1="14" y1="12" x2="17" y2="12"/>
     </svg>
   ),
+  Audit: () => (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M9 11l3 3L22 4"/>
+      <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>
+    </svg>
+  ),
   Settings: () => (
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
       <circle cx="12" cy="12" r="3"/>
@@ -74,6 +85,7 @@ const NAV = [
     { id: "traffic",  Icon: Icon.Traffic,  label: "Traffic",  badge: "LIVE", badgeCls: "nb-g" },
     { id: "alerts",   Icon: Icon.Alerts,   label: "Alerts",   badge: "7",    badgeCls: "nb-r" },
     { id: "logs",     Icon: Icon.Logs,     label: "Logs",     badge: "LIVE", badgeCls: "nb-g" },
+    { id: "events",   Icon: Icon.Search,   label: "Threat Search" },
   ]},
   { group: "PROTECT", items: [
     { id: "sites",   Icon: Icon.Sites,   label: "Sites",   badge: "5",     badgeCls: "nb-g" },
@@ -86,6 +98,7 @@ const NAV = [
     { id: "ml",      Icon: Icon.ML,      label: "ML Engine",  badge: "LIVE", badgeCls: "nb-g" },
   ]},
   { group: "SYSTEM", items: [
+    { id: "audit",    Icon: Icon.Audit,    label: "Audit Log" },
     { id: "settings", Icon: Icon.Settings, label: "Settings" },
   ]},
 ];
@@ -145,11 +158,11 @@ export default function SideBar() {
       >
         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
           <span className="leader-dot" />
-          <span style={{ fontSize: 10, fontFamily: "'JetBrains Mono',monospace", color: "var(--text2)", fontWeight: 600 }}>
+          <span style={{ fontSize: 12, fontFamily: "'JetBrains Mono',monospace", color: "var(--text2)", fontWeight: 600 }}>
             cp-primary-01
           </span>
         </div>
-        <div style={{ fontSize: 9, fontFamily: "'JetBrains Mono',monospace", color: "var(--text3)", letterSpacing: ".4px" }}>
+        <div style={{ fontSize: 11, fontFamily: "'JetBrains Mono',monospace", color: "var(--text3)", letterSpacing: ".4px" }}>
           Raft: LEADER · 3 nodes · v3.1.0
         </div>
       </motion.div>

@@ -3,7 +3,7 @@ import { useState, useEffect } from "react";
 import { motion } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
 import Toggle from "@/components/ui/Toggle";
-import { api, type UserRow, type APIKeyRow } from "@/lib/api";
+import { api, type UserRow, type APIKeyRow, type NotificationChannel, type ChannelType, type ChannelConfig, type Severity } from "@/lib/api";
 import { staggerContainer, fadeUp, spring } from "@/lib/animations";
 
 const TABS = ["General","Auth & SSO","API Keys","Users & RBAC","Cluster","Notifications"];
@@ -149,7 +149,7 @@ function APIKeysTab() {
           </motion.button>
           {revealKey && (
             <div className="code-block" style={{marginTop:10}}>
-              <div style={{color:"var(--amber)",fontSize:10,marginBottom:4}}>⚠ Copy now — shown only once</div>
+              <div style={{color:"var(--amber)",fontSize:12,marginBottom:4}}>⚠ Copy now — shown only once</div>
               <code style={{color:"var(--green)",wordBreak:"break-all"}}>{revealKey}</code>
               <motion.button className="btn bg-btn btn-xs" style={{marginLeft:8}}
                 onClick={() => { navigator.clipboard?.writeText(revealKey); showToast("Copied!","s","📋"); }} whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.96 }}>Copy</motion.button>
@@ -315,25 +315,145 @@ function ClusterTab() {
   );
 }
 
+const CHANNEL_META: Record<ChannelType, { label: string; icon: string; blurb: string }> = {
+  webhook: { label: "Webhook", icon: "🔗", blurb: "POST signed JSON to any HTTP endpoint (SIEM, SOAR, custom)" },
+  slack:   { label: "Slack",   icon: "💬", blurb: "Slack incoming-webhook formatted message" },
+  syslog:  { label: "Syslog",  icon: "📜", blurb: "RFC 5424 over UDP/TCP to a syslog collector" },
+  cef:     { label: "CEF",     icon: "🛰️", blurb: "ArcSight Common Event Format over syslog (SIEM)" },
+};
+const SEVERITIES: Severity[] = ["info", "low", "medium", "high", "critical"];
+
+const emptyForm = {
+  name: "", type: "webhook" as ChannelType, min_severity: "medium" as Severity,
+  url: "", secret: "", host: "", port: 514, protocol: "udp" as "udp" | "tcp",
+};
+
 function NotificationsTab() {
+  const [channels, setChannels] = useState<NotificationChannel[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [adding, setAdding] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [form, setForm] = useState({ ...emptyForm });
+
+  async function load() {
+    setLoading(true);
+    try { setChannels((await api.notifications.list()).channels ?? []); }
+    catch { showToast("Failed to load channels", "e", "⚠️"); }
+    finally { setLoading(false); }
+  }
+  useEffect(() => { load(); }, []);
+
+  function buildConfig(): ChannelConfig {
+    if (form.type === "webhook") return { url: form.url.trim(), ...(form.secret ? { secret: form.secret } : {}) };
+    if (form.type === "slack")   return { url: form.url.trim() };
+    return { host: form.host.trim(), port: Number(form.port) || 514, protocol: form.protocol };
+  }
+  function formValid(): boolean {
+    if (!form.name.trim()) return false;
+    if (form.type === "webhook" || form.type === "slack") return /^https?:\/\//.test(form.url.trim());
+    return !!form.host.trim();
+  }
+
+  async function create() {
+    if (!formValid()) { showToast("Fill in the required fields", "e", "⚠️"); return; }
+    setBusy("new");
+    try {
+      await api.notifications.create({ name: form.name.trim(), type: form.type, config: buildConfig(), min_severity: form.min_severity });
+      showToast("Channel added", "s", "🔔");
+      setForm({ ...emptyForm }); setAdding(false); await load();
+    } catch (e) { showToast(e instanceof Error ? e.message : "Create failed", "e", "⚠️"); }
+    finally { setBusy(null); }
+  }
+  async function test(id: string) {
+    setBusy(id);
+    try { const r = await api.notifications.test(id); showToast(r.ok ? "✓ Test alert delivered" : "Delivery failed", r.ok ? "s" : "e", r.ok ? "✅" : "⚠️"); await load(); }
+    catch (e) { showToast(e instanceof Error ? e.message : "Delivery failed", "e", "⚠️"); await load(); }
+    finally { setBusy(null); }
+  }
+  async function toggle(ch: NotificationChannel) {
+    setBusy(ch.id);
+    try { await api.notifications.update(ch.id, { enabled: !ch.enabled }); await load(); }
+    catch { showToast("Update failed", "e", "⚠️"); }
+    finally { setBusy(null); }
+  }
+  async function del(ch: NotificationChannel) {
+    if (!confirm(`Delete channel "${ch.name}"?`)) return;
+    setBusy(ch.id);
+    try { await api.notifications.delete(ch.id); showToast("Channel deleted", "s", "🗑️"); await load(); }
+    catch { showToast("Delete failed", "e", "⚠️"); }
+    finally { setBusy(null); }
+  }
+
+  const isNet = form.type === "syslog" || form.type === "cef";
+
   return (
     <motion.div className="panel" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}>
+      <div className="ph">
+        <div className="ptitle">🔔 Notification Channels</div>
+        <motion.button className="btn bc btn-sm" onClick={() => setAdding(a => !a)} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
+          {adding ? "✕ Cancel" : "+ Add Channel"}
+        </motion.button>
+      </div>
       <div className="pb">
-        {([
-          ["Email Alerts","Send critical alerts to admin@sentinel.local",true],
-          ["Slack Notifications","Webhook: https://hooks.slack.com/services/T••••/B••••/••••",true],
-          ["PagerDuty","Escalate CRITICAL alerts to on-call",false],
-          ["Webhook (Custom)","POST to custom endpoint for SIEM integration",false],
-        ] as [string,string,boolean][]).map(([t,d,on]) => (
-          <div key={t} className="srow">
-            <div style={{flex:1}}><div className="srt">{t}</div><div className="srd">{d}</div></div>
-            <Toggle defaultOn={on} />
+        <div style={{ fontSize: 11, color: "var(--text3)", lineHeight: 1.7, marginBottom: 12, fontFamily: "'Share Tech Mono',monospace" }}>
+          Alerts (attack spikes, repeat offenders, critical blocks) are delivered to every enabled channel whose minimum severity the alert meets. Webhook payloads are optionally HMAC-SHA256 signed (<code>X-Sentinel-Signature</code>).
+        </div>
+
+        {adding && (
+          <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }} style={{ overflow: "hidden", marginBottom: 16, border: "1px solid var(--border, rgba(0,229,255,0.15))", borderRadius: 10, padding: 14 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+              <div className="fg2"><label className="flbl2">Name</label><input className="fin2" value={form.name} placeholder="prod-soc-webhook" onChange={e => setForm(f => ({ ...f, name: e.target.value }))} /></div>
+              <div className="fg2"><label className="flbl2">Type</label>
+                <select className="fin2 fsel2" value={form.type} onChange={e => setForm(f => ({ ...f, type: e.target.value as ChannelType }))}>
+                  {(Object.keys(CHANNEL_META) as ChannelType[]).map(t => <option key={t} value={t}>{CHANNEL_META[t].icon} {CHANNEL_META[t].label}</option>)}
+                </select>
+              </div>
+            </div>
+            <div style={{ fontSize: 10.5, color: "var(--text3)", margin: "2px 0 10px" }}>{CHANNEL_META[form.type].blurb}</div>
+
+            {!isNet ? (
+              <div style={{ display: "grid", gridTemplateColumns: form.type === "webhook" ? "1fr 1fr" : "1fr", gap: 10 }}>
+                <div className="fg2"><label className="flbl2">{form.type === "slack" ? "Slack Webhook URL" : "Endpoint URL"}</label><input className="fin2" value={form.url} placeholder="https://…" onChange={e => setForm(f => ({ ...f, url: e.target.value }))} /></div>
+                {form.type === "webhook" && <div className="fg2"><label className="flbl2">Signing Secret (optional)</label><input className="fin2" value={form.secret} placeholder="HMAC-SHA256 key" onChange={e => setForm(f => ({ ...f, secret: e.target.value }))} /></div>}
+              </div>
+            ) : (
+              <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr", gap: 10 }}>
+                <div className="fg2"><label className="flbl2">Collector Host</label><input className="fin2" value={form.host} placeholder="siem.corp.io" onChange={e => setForm(f => ({ ...f, host: e.target.value }))} /></div>
+                <div className="fg2"><label className="flbl2">Port</label><input className="fin2" type="number" value={form.port} onChange={e => setForm(f => ({ ...f, port: Number(e.target.value) }))} /></div>
+                <div className="fg2"><label className="flbl2">Protocol</label><select className="fin2 fsel2" value={form.protocol} onChange={e => setForm(f => ({ ...f, protocol: e.target.value as "udp" | "tcp" }))}><option value="udp">UDP</option><option value="tcp">TCP</option></select></div>
+              </div>
+            )}
+            <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 10, alignItems: "end", marginTop: 4 }}>
+              <div className="fg2"><label className="flbl2">Minimum severity</label>
+                <select className="fin2 fsel2" value={form.min_severity} onChange={e => setForm(f => ({ ...f, min_severity: e.target.value as Severity }))}>
+                  {SEVERITIES.map(s => <option key={s} value={s}>{s.toUpperCase()}</option>)}
+                </select>
+              </div>
+              <button className="btn bp btn-sm" disabled={busy === "new"} onClick={create}>{busy === "new" ? "Saving…" : "✓ Add Channel"}</button>
+            </div>
+          </motion.div>
+        )}
+
+        {loading ? (
+          <div style={{ padding: 24, textAlign: "center", fontSize: 11, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>Loading channels…</div>
+        ) : channels.length === 0 ? (
+          <div style={{ padding: 24, textAlign: "center", fontSize: 11, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>No channels configured. Add one to start delivering alerts to your SOC.</div>
+        ) : channels.map(ch => (
+          <div key={ch.id} className="srow">
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div className="srt">{CHANNEL_META[ch.type]?.icon} {ch.name} <span className="bdg bcy" style={{ marginLeft: 6 }}>{ch.type.toUpperCase()}</span> <span className="bdg" style={{ marginLeft: 4 }}>≥ {ch.min_severity.toUpperCase()}</span></div>
+              <div className="srd" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {ch.type === "webhook" || ch.type === "slack" ? ch.config.url : `${ch.config.host}:${ch.config.port}/${ch.config.protocol}`}
+                {ch.last_status && <span style={{ marginLeft: 8, color: ch.last_status === "ok" ? "var(--green)" : "#ef4444" }}>· last: {ch.last_status === "ok" ? "✓ ok" : ch.last_status}</span>}
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 6, alignItems: "center", flexShrink: 0 }}>
+              <button className="btn bg-btn btn-xs" disabled={busy === ch.id} onClick={() => test(ch.id)}>{busy === ch.id ? "…" : "Test"}</button>
+              <Toggle defaultOn={ch.enabled} onChange={() => toggle(ch)} />
+              <button className="btn bg-btn btn-xs" style={{ color: "#ef4444" }} disabled={busy === ch.id} onClick={() => del(ch)}>🗑️</button>
+            </div>
           </div>
         ))}
-        <div className="fg2" style={{marginTop:8}}>
-          <label className="flbl2">Custom Webhook URL</label>
-          <input className="fin2" placeholder="https://your-siem.corp.io/events" type="url" />
-        </div>
       </div>
     </motion.div>
   );

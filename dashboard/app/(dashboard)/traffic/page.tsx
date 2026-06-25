@@ -194,7 +194,7 @@ export default function TrafficPage() {
           <div className="pb">
             <canvas ref={chartRef} height={110} style={{ width: "100%", display: "block" }} />
             {buckets.length === 0 && (
-              <div style={{ textAlign: "center", paddingTop: 8, fontSize: 10, fontFamily: "'Share Tech Mono',monospace", color: "rgba(100,116,139,0.5)" }}>
+              <div style={{ textAlign: "center", paddingTop: 8, fontSize: 12, fontFamily: "'Share Tech Mono',monospace", color: "rgba(100,116,139,0.5)" }}>
                 waiting for traffic data…
               </div>
             )}
@@ -214,7 +214,7 @@ export default function TrafficPage() {
             ) : (
               topIPs.map(([ip, cnt], idx) => (
                 <motion.div key={ip} className="eprow" style={{ marginBottom: 7 }} initial={{ opacity: 0, x: -6 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: idx * 0.04 }}>
-                  <span className="eppath" style={{ fontSize: 10, minWidth: 120 }}>{ip}</span>
+                  <span className="eppath" style={{ fontSize: 12, minWidth: 120 }}>{ip}</span>
                   <div className="epbw" style={{ flex: 1 }}>
                     <div className="pwrap">
                       <div className="pbar" style={{ width: `${Math.round(cnt / maxIp * 100)}%`, background: cnt > 5 ? "var(--red-b)" : "var(--cyan)" }} />

@@ -1,21 +1,32 @@
 "use client";
 /**
- * SiteWizard — a friendly, full-screen, multi-step wizard for adding and
- * editing protected sites. Designed to be dramatically easier than BunkerWeb:
- *   • Easy mode: 3 steps + one-click security templates (most users never
- *     touch anything else).
- *   • Advanced mode: full control over upstream LB, WAF, rate limiting,
- *     anti-DDoS, bot/geo/IP filtering, request limits, and ML — all from the UI.
- * Everything maps to the rich per-site config the data plane already supports.
+ * SiteWizard — full-screen, multi-step wizard for adding and editing protected
+ * sites. Designed to be clearer AND more capable than BunkerWeb:
+ *   • Easy mode (5 steps): name, front service (HTTPS + cert), upstream host:port,
+ *     protection template, review — a client can be live in a minute.
+ *   • Advanced mode (10 steps): the full "Front Service" surface (public exposure
+ *     + complete TLS/ACME/custom-cert configuration), reverse proxy, WAF rules,
+ *     rate/DDoS, antibot, geo/IP, HTTP headers and ML.
+ *
+ * Honesty tags on every section:
+ *   ● Enforced — the data plane acts on it today
+ *   ◐ Stored   — carried through / honoured where supported (e.g. DNS-01,
+ *                ZeroSSL API tuning, custom-cert-by-path are roadmap)
  */
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
-import { api } from "@/lib/api";
+import { api, type Certificate } from "@/lib/api";
 import {
   SiteForm, emptyForm, applyPreset, formToPayload, PRESETS, CRS_CATEGORIES,
   ALL_CRS_KEYS, COUNTRIES, PresetKey, UpstreamServer, normalizeDomain,
+  HTTP_METHODS, ACME_PROVIDERS, CustomHeader, certCoversHost,
 } from "@/lib/siteConfig";
+
+/** All names a cert presents (primary domain + SANs), lowercased. */
+function certNames(c: Certificate): string[] {
+  return [c.domain, ...(c.san ?? [])].filter(Boolean).map(s => s.toLowerCase());
+}
 
 type Mode = "create" | "edit";
 
@@ -27,9 +38,34 @@ interface Props {
   onSaved:  (deployedDomain?: string) => void;
 }
 
-/* ── small controlled primitives ─────────────────────────────── */
+/* ── primitives ─────────────────────────────────────────────── */
 function Sw({ on, set }: { on: boolean; set: (v: boolean) => void }) {
   return <div className={`tog ${on ? "on" : ""}`} onClick={() => set(!on)} style={{ cursor: "pointer" }} />;
+}
+
+function Tag({ kind }: { kind: "enforced" | "stored" }) {
+  const enforced = kind === "enforced";
+  return (
+    <span style={{
+      fontSize: 8.5, fontWeight: 700, letterSpacing: 0.5, padding: "2px 7px", borderRadius: 20,
+      fontFamily: "'Share Tech Mono',monospace", textTransform: "uppercase",
+      color: enforced ? "var(--green)" : "var(--amber, #ffb020)",
+      background: enforced ? "rgba(0,230,118,.1)" : "rgba(255,176,32,.1)",
+      border: `1px solid ${enforced ? "rgba(0,230,118,.35)" : "rgba(255,176,32,.35)"}`,
+    }}>{enforced ? "● Enforced" : "◐ Stored"}</span>
+  );
+}
+
+function StepHead({ title, sub, tag }: { title: string; sub: string; tag?: "enforced" | "stored" }) {
+  return (
+    <div style={{ marginBottom: 4 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <span style={{ fontFamily: "'Orbitron',sans-serif", fontSize: 15, fontWeight: 700, color: "var(--text)" }}>{title}</span>
+        {tag && <Tag kind={tag} />}
+      </div>
+      <div style={{ fontSize: 11, color: "var(--text3)", marginTop: 3 }}>{sub}</div>
+    </div>
+  );
 }
 
 function ChipInput({
@@ -49,12 +85,10 @@ function ChipInput({
   return (
     <div>
       <div style={{ display: "flex", gap: 8 }}>
-        <input
-          className="fin2" placeholder={placeholder} value={draft}
+        <input className="fin2" placeholder={placeholder} value={draft}
           style={mono ? { fontFamily: "'Share Tech Mono',monospace" } : undefined}
           onChange={e => setDraft(e.target.value)}
-          onKeyDown={e => { if (e.key === "Enter") { e.preventDefault(); add(); } }}
-        />
+          onKeyDown={e => { if (e.key === "Enter") { e.preventDefault(); add(); } }} />
         <button className="btn bg-btn btn-sm" onClick={add} type="button">＋ Add</button>
       </div>
       {values.length > 0 && (
@@ -63,11 +97,9 @@ function ChipInput({
             <span key={v} style={{
               display: "inline-flex", alignItems: "center", gap: 6, padding: "3px 8px",
               background: "rgba(0,212,255,.1)", border: "1px solid rgba(0,212,255,.28)",
-              borderRadius: 12, fontSize: 10, fontFamily: "'Share Tech Mono',monospace", color: "var(--cyan)",
+              borderRadius: 12, fontSize: 12, fontFamily: "'Share Tech Mono',monospace", color: "var(--cyan)",
             }}>
-              {v}
-              <span style={{ cursor: "pointer", color: "var(--text3)" }}
-                onClick={() => onChange(values.filter(x => x !== v))}>✕</span>
+              {v}<span style={{ cursor: "pointer", color: "var(--text3)" }} onClick={() => onChange(values.filter(x => x !== v))}>✕</span>
             </span>
           ))}
         </div>
@@ -86,8 +118,23 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
   );
 }
 
-function Row({ children }: { children: React.ReactNode }) {
-  return <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>{children}</div>;
+function SecretInput({ value, set, placeholder }: { value: string; set: (v: string) => void; placeholder?: string }) {
+  const [show, setShow] = useState(false);
+  return (
+    <div style={{ position: "relative" }}>
+      <input className="fin2" type={show ? "text" : "password"} value={value} placeholder={placeholder}
+        style={{ fontFamily: "'Share Tech Mono',monospace", paddingRight: 34 }}
+        onChange={e => set(e.target.value)} />
+      <span onClick={() => setShow(s => !s)} title={show ? "Hide" : "Reveal"}
+        style={{ position: "absolute", right: 10, top: "50%", transform: "translateY(-50%)", cursor: "pointer", color: "var(--text3)", fontSize: 13 }}>
+        {show ? "🙈" : "👁"}
+      </span>
+    </div>
+  );
+}
+
+function Row({ children, cols = "1fr 1fr" }: { children: React.ReactNode; cols?: string }) {
+  return <div style={{ display: "grid", gridTemplateColumns: cols, gap: 12 }}>{children}</div>;
 }
 
 function SectionToggle({ label, desc, on, set }: { label: string; desc: string; on: boolean; set: (v: boolean) => void }) {
@@ -99,30 +146,49 @@ function SectionToggle({ label, desc, on, set }: { label: string; desc: string; 
     }}>
       <div>
         <div style={{ fontSize: 12, fontWeight: 600, color: "var(--text)" }}>{label}</div>
-        <div style={{ fontSize: 10, color: "var(--text3)", marginTop: 2 }}>{desc}</div>
+        <div style={{ fontSize: 12, color: "var(--text3)", marginTop: 2 }}>{desc}</div>
       </div>
       <Sw on={on} set={set} />
     </div>
   );
 }
 
+function GroupLabel({ children }: { children: React.ReactNode }) {
+  return <div style={{ fontSize: 12, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", letterSpacing: 1, textTransform: "uppercase", marginTop: 4, display: "flex", alignItems: "center", gap: 8 }}>{children}</div>;
+}
+
+function InfoBox({ children, tone = "cyan" }: { children: React.ReactNode; tone?: "cyan" | "green" | "amber" }) {
+  const c = tone === "green" ? ["rgba(0,230,118,.07)", "rgba(0,230,118,.2)"]
+          : tone === "amber" ? ["rgba(255,176,32,.07)", "rgba(255,176,32,.25)"]
+          : ["rgba(0,212,255,.06)", "rgba(0,212,255,.18)"];
+  return (
+    <div style={{ padding: "10px 14px", background: c[0], border: `1px solid ${c[1]}`, borderRadius: "var(--r2)", fontSize: 10.5, color: "var(--text3)", lineHeight: 1.7, fontFamily: "'Share Tech Mono',monospace" }}>
+      {children}
+    </div>
+  );
+}
+
 /* ── steps ───────────────────────────────────────────────────── */
-const EASY_STEPS     = ["Basics", "Reverse Proxy", "Protection", "Review"];
-const ADVANCED_STEPS = ["Basics", "Reverse Proxy", "WAF Rules", "Rate & DDoS", "Bots / Geo / IP", "Advanced", "Review"];
+const EASY_STEPS     = ["Basics", "Front Service", "Reverse Proxy", "Protection", "Review"];
+const ADVANCED_STEPS = ["Basics", "Front Service", "Reverse Proxy", "WAF Rules", "Rate & DDoS", "Antibot", "Geo & IP", "HTTP Headers", "Advanced", "Review"];
 
 export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: Props) {
   const [adv, setAdv]   = useState(mode === "edit");
   const [step, setStep] = useState(0);
   const [form, setForm] = useState<SiteForm>(initial ?? emptyForm());
   const [saving, setSaving] = useState(false);
+  const [repoCerts, setRepoCerts] = useState<Certificate[]>([]);
+
+  // Load the certificate repository so the user can assign an existing cert
+  // (e.g. an enterprise wildcard) without re-uploading per site.
+  useEffect(() => { api.certs.list().then(r => setRepoCerts(r.certs ?? [])).catch(() => {}); }, []);
 
   const steps = adv ? ADVANCED_STEPS : EASY_STEPS;
   const upd = (patch: Partial<SiteForm>) => setForm(f => ({ ...f, ...patch }));
 
-  // Map a wizard step index to a logical screen id (easy mode skips some).
   const screen = useMemo(() => {
-    if (!adv) return ["basics", "proxy", "protect", "review"][step];
-    return ["basics", "proxy", "rules", "rate", "bots", "advanced", "review"][step];
+    if (!adv) return ["basics", "front", "proxy", "protect", "review"][step];
+    return ["basics", "front", "proxy", "rules", "rate", "antibot", "geoip", "headers", "advanced", "review"][step];
   }, [adv, step]);
 
   function setServer(i: number, patch: Partial<UpstreamServer>) {
@@ -130,21 +196,58 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
   }
   function addServer() { upd({ servers: [...form.servers, { host: "127.0.0.1", port: 8080, weight: 1, tls: false }] }); }
   function rmServer(i: number) { upd({ servers: form.servers.filter((_, idx) => idx !== i) }); }
-
+  function setHeader(i: number, patch: Partial<CustomHeader>) {
+    upd({ custom_headers: form.custom_headers.map((h, idx) => idx === i ? { ...h, ...patch } : h) });
+  }
   function choosePreset(p: PresetKey) { setForm(f => applyPreset(f, p)); }
 
-  // Full validation used only at deploy/save time — navigation between steps
-  // is always free so the user can jump to any section in any order.
   function validateAll(): string | null {
     if (!form.name.trim()) return "Site name is required (Basics)";
     if (form.domains.length === 0) return "Add at least one domain (Basics)";
     if (form.servers.length === 0) return "Add at least one upstream server (Reverse Proxy)";
     if (form.servers.some(s => !s.host || !s.port)) return "Every upstream server needs a host and port (Reverse Proxy)";
+    if (form.tls_mode === "auto" && form.front_https && !form.acme_email.trim()) return "An email is required for automatic certificates (Front Service)";
+    if (form.tls_mode === "existing" && form.front_https && !form.tls_existing_cert) return "Select a certificate from the repository (Front Service)";
+    if (form.tls_mode === "manual" && form.custom_priority === "data" && (!form.cert_pem.trim() || !form.key_pem.trim())) return "Paste both the certificate and private key (Front Service)";
+    if (form.tls_mode === "manual" && form.custom_priority === "file" && (!form.cert_path.trim() || !form.key_path.trim())) return "Provide both certificate and key paths (Front Service)";
     return null;
   }
 
   function next() { setStep(s => Math.min(s + 1, steps.length - 1)); }
   function back() { setStep(s => Math.max(s - 1, 0)); }
+
+  /** Best-effort TLS provisioning after the site is saved. Never blocks deploy. */
+  async function provisionTls() {
+    if (!form.front_https || form.tls_mode === "off") return;
+    // Repository cert: nothing to issue/upload — the data plane already serves it
+    // by SNI (incl. wildcard), so it's shared across every matching site.
+    if (form.tls_mode === "existing") {
+      showToast(`Using "${form.tls_existing_cert}" from the certificate repository — served via SNI, no upload`, "i", "📚");
+      return;
+    }
+    // DNS-01 / wildcard issuance is roadmap — config is stored, issuance skipped.
+    if (form.tls_mode === "auto" && (form.acme_challenge === "dns_01" || form.acme_wildcard)) {
+      showToast("Wildcard/DNS-01 saved as config — issuance via DNS-01 is on the roadmap", "i", "📝");
+      return;
+    }
+    try {
+      if (form.tls_mode === "auto") {
+        const provider = form.acme_staging ? "letsencrypt_staging" : form.acme_provider;
+        await api.certs.requestAcme({
+          domains: form.domains, email: form.acme_email.trim(),
+          provider, challenge: form.acme_challenge as "http_01" | "tls_alpn_01",
+        });
+        showToast(`Certificate requested for ${form.domains[0]}`, "s", "🔐");
+      } else if (form.tls_mode === "manual" && form.custom_priority === "data") {
+        await api.certs.uploadManual({ domain: form.domains[0], cert_pem: form.cert_pem, key_pem: form.key_pem });
+        showToast(`Certificate installed for ${form.domains[0]}`, "s", "🔐");
+      } else {
+        showToast("Custom certificate paths saved — loaded by the node from disk", "i", "📝");
+      }
+    } catch (e) {
+      showToast(`Site saved, TLS pending: ${e instanceof Error ? e.message : "cert error"}`, "e", "⚠️");
+    }
+  }
 
   async function save() {
     const err = validateAll();
@@ -152,106 +255,68 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
     setSaving(true);
     try {
       const payload = formToPayload(form);
-      if (mode === "edit" && siteId) {
-        await api.sites.update(siteId, payload);
-        showToast("Site updated", "s", "✅");
-      } else {
-        await api.sites.create(payload);
-        showToast("Site deployed", "s", "🚀");
-      }
+      if (mode === "edit" && siteId) { await api.sites.update(siteId, payload); await provisionTls(); showToast("Site updated", "s", "✅"); }
+      else { await api.sites.create(payload); await provisionTls(); showToast("Site deployed", "s", "🚀"); }
       onSaved(form.domains[0]);
     } catch (e) {
       showToast(e instanceof Error ? e.message : "Save failed", "e", "⚠️");
-    } finally {
-      setSaving(false);
-    }
+    } finally { setSaving(false); }
   }
 
-  const toggleCat = (k: string) =>
-    upd({ rule_categories: form.rule_categories.includes(k)
-      ? form.rule_categories.filter(x => x !== k)
-      : [...form.rule_categories, k] });
+  const toggleCat = (k: string) => upd({ rule_categories: form.rule_categories.includes(k) ? form.rule_categories.filter(x => x !== k) : [...form.rule_categories, k] });
+  const toggleMethod = (m: string) => upd({ allowed_methods: form.allowed_methods.includes(m) ? form.allowed_methods.filter(x => x !== m) : [...form.allowed_methods, m] });
+
+  const scheme = form.front_https ? "https" : "http";
+  const frontPort = form.front_https ? 9443 : 9080;
+  const primary = form.servers[0] ?? { host: "127.0.0.1", port: 8080, weight: 1, tls: false };
 
   return (
     <motion.div
-      style={{
-        position: "fixed", inset: 0, zIndex: 1000, background: "rgba(2,6,14,.82)",
-        backdropFilter: "blur(6px)", display: "flex", alignItems: "center", justifyContent: "center", padding: 24,
-      }}
+      style={{ position: "fixed", inset: 0, zIndex: 1000, background: "rgba(2,6,14,.82)", backdropFilter: "blur(6px)", display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}
       initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-      onClick={e => { if (e.target === e.currentTarget) onClose(); }}
-    >
+      onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
       <motion.div
         initial={{ opacity: 0, scale: 0.96, y: 16 }} animate={{ opacity: 1, scale: 1, y: 0 }}
         transition={{ type: "spring", stiffness: 260, damping: 24 }}
-        style={{
-          width: "min(1040px, 96vw)", height: "min(720px, 92vh)", display: "flex",
-          background: "var(--bg2, #0a1018)", border: "1px solid rgba(0,212,255,.18)",
-          borderRadius: 16, overflow: "hidden", boxShadow: "0 30px 90px rgba(0,0,0,.6)",
-        }}
-      >
-        {/* ── Sidebar / stepper ── */}
-        <div style={{
-          width: 248, flexShrink: 0, padding: "22px 18px", display: "flex", flexDirection: "column",
-          background: "linear-gradient(180deg, rgba(0,212,255,.06), rgba(0,0,0,.15))",
-          borderRight: "1px solid rgba(255,255,255,.06)",
-        }}>
+        style={{ width: "min(1100px, 96vw)", height: "min(760px, 94vh)", display: "flex", background: "var(--bg2, #0a1018)", border: "1px solid rgba(0,212,255,.18)", borderRadius: 16, overflow: "hidden", boxShadow: "0 30px 90px rgba(0,0,0,.6)" }}>
+
+        {/* Sidebar / stepper */}
+        <div style={{ width: 256, flexShrink: 0, padding: "22px 18px", display: "flex", flexDirection: "column", background: "linear-gradient(180deg, rgba(0,212,255,.06), rgba(0,0,0,.15))", borderRight: "1px solid rgba(255,255,255,.06)", overflowY: "auto" }}>
           <div style={{ fontFamily: "'Orbitron',sans-serif", fontWeight: 700, fontSize: 15, color: "var(--text)", letterSpacing: 1 }}>
             {mode === "edit" ? "✏️ Edit Site" : "🌐 New Protected Site"}
           </div>
-          <div style={{ fontSize: 10, color: "var(--text3)", marginTop: 4, fontFamily: "'Share Tech Mono',monospace" }}>
+          <div style={{ fontSize: 12, color: "var(--text3)", marginTop: 4, fontFamily: "'Share Tech Mono',monospace" }}>
             {mode === "edit" ? form.name : "Reverse proxy + WAF in minutes"}
           </div>
-
-          {/* Easy / Advanced switch */}
           <div style={{ display: "flex", gap: 4, margin: "16px 0 18px", padding: 3, background: "rgba(0,0,0,.3)", borderRadius: 10 }}>
             {(["Easy", "Advanced"] as const).map((m, i) => {
               const active = (i === 1) === adv;
               return (
-                <button key={m} type="button"
-                  onClick={() => { setAdv(i === 1); setStep(0); }}
-                  style={{
-                    flex: 1, padding: "6px 0", borderRadius: 8, border: "none", cursor: "pointer",
-                    fontSize: 11, fontWeight: 700, fontFamily: "'Inter',sans-serif",
-                    background: active ? "linear-gradient(135deg,rgba(0,212,255,.9),rgba(0,150,210,.9))" : "transparent",
-                    color: active ? "#021018" : "var(--text3)",
-                  }}>{m}</button>
+                <button key={m} type="button" onClick={() => { setAdv(i === 1); setStep(0); }}
+                  style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 11, fontWeight: 700, fontFamily: "'Inter',sans-serif", background: active ? "linear-gradient(135deg,rgba(0,212,255,.9),rgba(0,150,210,.9))" : "transparent", color: active ? "#021018" : "var(--text3)" }}>{m}</button>
               );
             })}
           </div>
-
           <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
             {steps.map((s, i) => {
               const done = i < step, cur = i === step;
               return (
                 <div key={s} onClick={() => setStep(i)}
-                  style={{
-                    display: "flex", alignItems: "center", gap: 10, padding: "8px 10px", borderRadius: 8,
-                    cursor: "pointer",
-                    background: cur ? "rgba(0,212,255,.12)" : "transparent",
-                    border: cur ? "1px solid rgba(0,212,255,.3)" : "1px solid transparent",
-                    transition: "background .15s",
-                  }}
+                  style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 10px", borderRadius: 8, cursor: "pointer", background: cur ? "rgba(0,212,255,.12)" : "transparent", border: cur ? "1px solid rgba(0,212,255,.3)" : "1px solid transparent", transition: "background .15s" }}
                   onMouseEnter={e => { if (!cur) e.currentTarget.style.background = "rgba(255,255,255,.04)"; }}
                   onMouseLeave={e => { if (!cur) e.currentTarget.style.background = "transparent"; }}>
-                  <div style={{
-                    width: 22, height: 22, borderRadius: "50%", flexShrink: 0, display: "flex",
-                    alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 700,
-                    background: done ? "var(--green)" : cur ? "var(--cyan)" : "rgba(255,255,255,.08)",
-                    color: done || cur ? "#021018" : "var(--text3)",
-                  }}>{done ? "✓" : i + 1}</div>
+                  <div style={{ width: 22, height: 22, borderRadius: "50%", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 700, background: done ? "var(--green)" : cur ? "var(--cyan)" : "rgba(255,255,255,.08)", color: done || cur ? "#021018" : "var(--text3)" }}>{done ? "✓" : i + 1}</div>
                   <span style={{ fontSize: 12, color: cur ? "var(--text)" : "var(--text2)", fontWeight: cur ? 600 : 400 }}>{s}</span>
                 </div>
               );
             })}
           </div>
-
-          <div style={{ marginTop: "auto", fontSize: 9, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", lineHeight: 1.6 }}>
-            💡 Traffic flows through the WAF proxy on port <span style={{ color: "var(--cyan)" }}>9080</span>.
+          <div style={{ marginTop: "auto", paddingTop: 16, fontSize: 9, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", lineHeight: 1.6 }}>
+            💡 Public traffic enters on <span style={{ color: "var(--cyan)" }}>{scheme}://:{frontPort}</span> and is proxied to your upstreams.
           </div>
         </div>
 
-        {/* ── Content ── */}
+        {/* Content */}
         <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "16px 22px", borderBottom: "1px solid rgba(255,255,255,.06)" }}>
             <div style={{ fontFamily: "'Orbitron',sans-serif", fontSize: 14, fontWeight: 700, color: "var(--text)" }}>{steps[step]}</div>
@@ -260,19 +325,16 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
 
           <div style={{ flex: 1, overflowY: "auto", padding: "20px 22px" }}>
             <AnimatePresence mode="wait">
-              <motion.div key={screen}
-                initial={{ opacity: 0, x: 12 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -12 }}
-                transition={{ duration: 0.18 }}
-                style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+              <motion.div key={screen} initial={{ opacity: 0, x: 12 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -12 }} transition={{ duration: 0.18 }} style={{ display: "flex", flexDirection: "column", gap: 16 }}>
 
                 {/* ───────── BASICS ───────── */}
                 {screen === "basics" && (<>
+                  <StepHead title="Basics" sub="Name this site, choose enforcement mode and the domains it protects." tag="enforced" />
                   <Row>
                     <Field label="Site Name" hint="Internal identifier (e.g. shop-prod)">
-                      <input className="fin2" placeholder="my-app" value={form.name}
-                        onChange={e => upd({ name: e.target.value })} />
+                      <input className="fin2" placeholder="my-app" value={form.name} onChange={e => upd({ name: e.target.value })} />
                     </Field>
-                    <Field label="Server / WAF Mode" hint="Learning logs only; Blocking enforces">
+                    <Field label="Security Mode" hint="Learning logs only; Blocking enforces">
                       <select className="fin2 fsel2" value={form.mode} onChange={e => upd({ mode: e.target.value as SiteForm["mode"] })}>
                         <option value="blocking">Blocking</option>
                         <option value="learning">Learning</option>
@@ -280,101 +342,271 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                       </select>
                     </Field>
                   </Row>
-                  <Field label="Domains / Server Names" hint="Bare hostnames only (no http:// or port). Press Enter to add.">
+                  <Field label="Server Names / Domains" hint="Bare hostnames only (no http:// or port). Press Enter to add.">
                     <ChipInput values={form.domains} onChange={v => upd({ domains: v })} placeholder="app.example.com" transform={normalizeDomain} />
                   </Field>
-
-                  <div style={{ fontSize: 10, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", letterSpacing: 1, textTransform: "uppercase", marginTop: 6 }}>Security Template</div>
+                  <GroupLabel>Security Template</GroupLabel>
                   <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 10 }}>
                     {(Object.keys(PRESETS) as Array<keyof typeof PRESETS>).map(k => {
                       const p = PRESETS[k]; const active = form.preset === k;
                       return (
-                        <div key={k} onClick={() => choosePreset(k)} style={{
-                          cursor: "pointer", padding: 14, borderRadius: 12,
-                          background: active ? "rgba(0,212,255,.1)" : "rgba(255,255,255,.03)",
-                          border: active ? "1px solid rgba(0,212,255,.45)" : "1px solid rgba(255,255,255,.08)",
-                        }}>
+                        <div key={k} onClick={() => choosePreset(k)} style={{ cursor: "pointer", padding: 14, borderRadius: 12, background: active ? "rgba(0,212,255,.1)" : "rgba(255,255,255,.03)", border: active ? "1px solid rgba(0,212,255,.45)" : "1px solid rgba(255,255,255,.08)" }}>
                           <div style={{ fontSize: 20 }}>{p.icon}</div>
                           <div style={{ fontWeight: 700, fontSize: 13, color: "var(--text)", marginTop: 6 }}>{p.label}</div>
-                          <div style={{ fontSize: 10, color: "var(--text3)", marginTop: 4, lineHeight: 1.5 }}>{p.desc}</div>
-                          <div style={{ fontSize: 9, color: "var(--cyan)", marginTop: 8, fontFamily: "'Share Tech Mono',monospace" }}>
-                            PL{p.paranoia_level} · thr {p.anomaly_threshold}
-                          </div>
+                          <div style={{ fontSize: 12, color: "var(--text3)", marginTop: 4, lineHeight: 1.5 }}>{p.desc}</div>
+                          <div style={{ fontSize: 9, color: "var(--cyan)", marginTop: 8, fontFamily: "'Share Tech Mono',monospace" }}>PL{p.paranoia_level} · thr {p.anomaly_threshold}</div>
                         </div>
                       );
                     })}
                   </div>
                 </>)}
 
-                {/* ───────── REVERSE PROXY ───────── */}
-                {screen === "proxy" && (<>
-                  <Field label="Load Balancing" hint="Strategy across upstream servers">
-                    <select className="fin2 fsel2" value={form.lb} onChange={e => upd({ lb: e.target.value as SiteForm["lb"] })}>
-                      <option value="round_robin">Round Robin</option>
-                      <option value="least_conn">Least Connections</option>
-                      <option value="ip_hash">IP Hash (sticky)</option>
-                      <option value="random">Random</option>
-                      <option value="adaptive">Adaptive (latency-aware)</option>
-                    </select>
-                  </Field>
+                {/* ───────── FRONT SERVICE (exposure + full TLS) ───────── */}
+                {screen === "front" && (<>
+                  <StepHead title="Front Service" sub="The public, client-facing side of this site: how it's exposed and its TLS certificate." tag="enforced" />
 
-                  <div style={{ fontSize: 10, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", letterSpacing: 1, textTransform: "uppercase" }}>Upstream Servers</div>
-                  {form.servers.map((s, i) => (
-                    <div key={i} style={{ display: "grid", gridTemplateColumns: "2fr 1fr 0.8fr auto auto", gap: 8, alignItems: "end" }}>
-                      <Field label={`Host #${i + 1}`}><input className="fin2" value={s.host} placeholder="127.0.0.1" onChange={e => setServer(i, { host: e.target.value })} /></Field>
-                      <Field label="Port"><input className="fin2" type="number" value={s.port} onChange={e => setServer(i, { port: Number(e.target.value) })} /></Field>
-                      <Field label="Weight"><input className="fin2" type="number" value={s.weight} onChange={e => setServer(i, { weight: Number(e.target.value) })} /></Field>
-                      <div style={{ display: "flex", flexDirection: "column", gap: 4, alignItems: "center" }}>
-                        <label className="flbl2">TLS</label><Sw on={s.tls} set={v => setServer(i, { tls: v })} />
-                      </div>
-                      <button className="btn bg-btn btn-sm" type="button" disabled={form.servers.length === 1}
-                        onClick={() => rmServer(i)} style={{ opacity: form.servers.length === 1 ? 0.4 : 1 }}>🗑</button>
-                    </div>
-                  ))}
-                  <button className="btn bg-btn btn-sm" type="button" onClick={addServer} style={{ alignSelf: "flex-start" }}>＋ Add Server</button>
+                  {/* exposure */}
+                  <Row cols={adv ? "1fr 1fr" : "1fr 1fr"}>
+                    <SectionToggle label="Serve HTTPS" desc="Terminate TLS on the public listener" on={form.front_https} set={v => upd({ front_https: v })} />
+                    <SectionToggle label="Force HTTPS redirect" desc="301 plain HTTP → HTTPS" on={form.force_https} set={v => upd({ force_https: v })} />
+                  </Row>
+                  {adv && (
+                    <Row>
+                      <SectionToggle label="HTTP/2" desc="Multiplexed connections (TLS)" on={form.http2} set={v => upd({ http2: v })} />
+                      <SectionToggle label="HTTP/3 (QUIC)" desc="UDP-based, lower latency" on={form.http3} set={v => upd({ http3: v })} />
+                    </Row>
+                  )}
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                    {form.domains.length === 0
+                      ? <InfoBox tone="amber">Add a domain in <strong>Basics</strong> to see the public endpoint.</InfoBox>
+                      : form.domains.map(d => (
+                        <span key={d} style={{ padding: "5px 11px", borderRadius: 8, background: "rgba(0,212,255,.06)", border: "1px solid rgba(0,212,255,.18)", fontFamily: "'Share Tech Mono',monospace", fontSize: 11, color: "var(--cyan)" }}>
+                          {scheme}://{d}<span style={{ color: "var(--text3)" }}> → :{frontPort}</span>
+                        </span>
+                      ))}
+                  </div>
 
-                  <SectionToggle label="Active Health Checks" desc="Probe upstreams and route around failures"
-                    on={form.health.enabled} set={v => upd({ health: { ...form.health, enabled: v } })} />
-                  {form.health.enabled && (
-                    <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr", gap: 12 }}>
-                      <Field label="Path"><input className="fin2" value={form.health.path} onChange={e => upd({ health: { ...form.health, path: e.target.value } })} /></Field>
-                      <Field label="Interval"><input className="fin2" value={form.health.interval} onChange={e => upd({ health: { ...form.health, interval: e.target.value } })} /></Field>
-                      <Field label="Timeout"><input className="fin2" value={form.health.timeout} onChange={e => upd({ health: { ...form.health, timeout: e.target.value } })} /></Field>
+                  {/* TLS mode */}
+                  <GroupLabel>TLS Certificate</GroupLabel>
+                  {!form.front_https && <InfoBox tone="amber">HTTPS is off above — enable &ldquo;Serve HTTPS&rdquo; to configure certificates.</InfoBox>}
+                  {form.front_https && (
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(2,1fr)", gap: 10 }}>
+                      {([
+                        ["auto", "⚡ Automatic (ACME)", "Free Let's Encrypt / ZeroSSL cert, auto-renewed"],
+                        ["existing", "📚 From Repository", "Reuse an uploaded cert (e.g. wildcard) — no re-upload"],
+                        ["manual", "📤 Upload New", "Paste your own certificate (saved to the repository)"],
+                        ["off", "🚫 No certificate", "Plain HTTP only (not recommended)"],
+                      ] as const).map(([k, label, desc]) => {
+                        const active = form.tls_mode === k;
+                        return (
+                          <div key={k} onClick={() => upd({ tls_mode: k })} style={{ cursor: "pointer", padding: 13, borderRadius: 12, background: active ? "rgba(0,212,255,.1)" : "rgba(255,255,255,.03)", border: active ? "1px solid rgba(0,212,255,.45)" : "1px solid rgba(255,255,255,.08)" }}>
+                            <div style={{ fontWeight: 700, fontSize: 12.5, color: "var(--text)" }}>{label}</div>
+                            <div style={{ fontSize: 12, color: "var(--text3)", marginTop: 5, lineHeight: 1.5 }}>{desc}</div>
+                          </div>
+                        );
+                      })}
                     </div>
                   )}
+
+                  {/* FROM REPOSITORY — select an existing cert (enterprise wildcard etc.) */}
+                  {form.front_https && form.tls_mode === "existing" && (<>
+                    {repoCerts.length === 0 ? (
+                      <InfoBox tone="amber">No certificates in the repository yet. Upload one on the <strong>Certificates</strong> page (or choose <strong>Upload New</strong>), then it&apos;s reusable across every matching site.</InfoBox>
+                    ) : (<>
+                      <Field label="Certificate" hint="One cert (e.g. a wildcard) can protect many sites — no re-upload">
+                        <select className="fin2 fsel2" value={form.tls_existing_cert} onChange={e => upd({ tls_existing_cert: e.target.value })}>
+                          <option value="">— Select a certificate —</option>
+                          {repoCerts.map(c => {
+                            const names = certNames(c);
+                            const wild = names.some(n => n.startsWith("*."));
+                            const days = c.expires_at > 0 ? Math.round((c.expires_at * 1000 - Date.now()) / 86400000) : null;
+                            const label = c.name ? `${c.name} (${c.domain})` : c.domain;
+                            return <option key={c.domain} value={c.domain}>{label}{wild ? " (wildcard)" : ""}{c.san && c.san.length > 1 ? ` +${c.san.length - 1} SAN` : ""}{days !== null ? ` · ${days}d left` : ""}</option>;
+                          })}
+                        </select>
+                      </Field>
+                      {form.tls_existing_cert && (() => {
+                        const sel = repoCerts.find(c => c.domain === form.tls_existing_cert);
+                        if (!sel) return null;
+                        const names = certNames(sel);
+                        const covered = form.domains.filter(d => certCoversHost(names, d));
+                        const uncovered = form.domains.filter(d => !certCoversHost(names, d));
+                        return (
+                          <InfoBox tone={uncovered.length === 0 && form.domains.length > 0 ? "green" : "amber"}>
+                            🔐 <strong style={{ color: "var(--text2)" }}>{sel.domain}</strong> presents: {names.join(", ")}.<br />
+                            {form.domains.length === 0 ? "Add domains in Basics to check coverage." : <>
+                              {covered.length > 0 && <>✅ Covers: <strong style={{ color: "var(--green)" }}>{covered.join(", ")}</strong>. </>}
+                              {uncovered.length > 0 && <>⚠️ Not covered: <strong style={{ color: "var(--amber,#ffb020)" }}>{uncovered.join(", ")}</strong> — these will fall back to a self-signed cert.</>}
+                            </>}
+                          </InfoBox>
+                        );
+                      })()}
+                    </>)}
+                  </>)}
+
+                  {/* AUTO / ACME */}
+                  {form.front_https && form.tls_mode === "auto" && (<>
+                    <Row>
+                      <Field label="Certificate Authority">
+                        <select className="fin2 fsel2" value={form.acme_provider} onChange={e => upd({ acme_provider: e.target.value as SiteForm["acme_provider"] })}>
+                          {ACME_PROVIDERS.map(p => <option key={p.key} value={p.key}>{p.label}</option>)}
+                        </select>
+                      </Field>
+                      <Field label="Contact Email" hint="Expiry notices + ACME account">
+                        <input className="fin2" value={form.acme_email} placeholder="admin@example.com" onChange={e => upd({ acme_email: e.target.value })} />
+                      </Field>
+                    </Row>
+                    <Row>
+                      <Field label="Challenge Type" hint="HTTP-01 needs :80 · TLS-ALPN-01 needs :443 · DNS-01 for wildcards">
+                        <select className="fin2 fsel2" value={form.acme_challenge} onChange={e => upd({ acme_challenge: e.target.value as SiteForm["acme_challenge"] })}>
+                          <option value="http_01">HTTP-01</option>
+                          <option value="tls_alpn_01">TLS-ALPN-01</option>
+                          <option value="dns_01">DNS-01 (wildcard)</option>
+                        </select>
+                      </Field>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 8, justifyContent: "center" }}>
+                        <SectionToggle label="Use staging" desc="Test certs · avoids rate limits" on={form.acme_staging} set={v => upd({ acme_staging: v })} />
+                        <SectionToggle label="Wildcard (*.domain)" desc="Requires DNS-01" on={form.acme_wildcard} set={v => upd({ acme_wildcard: v, acme_challenge: v ? "dns_01" : form.acme_challenge })} />
+                      </div>
+                    </Row>
+                    {adv && (
+                      <Field label="Custom CA Directory URL" hint="Override the ACME directory endpoint (blank = provider default)">
+                        <input className="fin2" value={form.acme_ca_server} placeholder="https://acme-v02.api.letsencrypt.org/directory" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 11 }} onChange={e => upd({ acme_ca_server: e.target.value })} />
+                      </Field>
+                    )}
+                    {adv && form.acme_provider === "zerossl" && (<>
+                      <GroupLabel>ZeroSSL API <Tag kind="stored" /></GroupLabel>
+                      <Row>
+                        <Field label="ZeroSSL API Key"><SecretInput value={form.zerossl_api_key} set={v => upd({ zerossl_api_key: v })} /></Field>
+                        <Field label="API Retries"><input className="fin2" type="number" value={form.zerossl_retries} onChange={e => upd({ zerossl_retries: Number(e.target.value) })} /></Field>
+                      </Row>
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
+                        <Field label="Retry Delay (s)"><input className="fin2" type="number" value={form.zerossl_retry_delay} onChange={e => upd({ zerossl_retry_delay: Number(e.target.value) })} /></Field>
+                        <Field label="Connect Timeout (s)"><input className="fin2" type="number" value={form.zerossl_connect_timeout} onChange={e => upd({ zerossl_connect_timeout: Number(e.target.value) })} /></Field>
+                        <Field label="Max Time (s)"><input className="fin2" type="number" value={form.zerossl_max_time} onChange={e => upd({ zerossl_max_time: Number(e.target.value) })} /></Field>
+                      </div>
+                    </>)}
+                    {adv && (form.acme_challenge === "dns_01" || form.acme_wildcard) && (<>
+                      <GroupLabel>DNS-01 Automation <Tag kind="stored" /></GroupLabel>
+                      <InfoBox tone="amber">DNS-01 issuance is on the roadmap. These settings are saved with the site; the cert is not auto-issued yet — use HTTP-01/TLS-ALPN-01 or upload a wildcard cert manually.</InfoBox>
+                      <Row cols="1fr 1fr 1fr">
+                        <Field label="DNS Provider"><input className="fin2" value={form.dns_provider} placeholder="cloudflare" onChange={e => upd({ dns_provider: e.target.value })} /></Field>
+                        <Field label="Propagation"><input className="fin2" value={form.dns_propagation} onChange={e => upd({ dns_propagation: e.target.value })} /></Field>
+                        <Field label="Credential Item"><input className="fin2" value={form.dns_credential} placeholder="CF_TOKEN=…" onChange={e => upd({ dns_credential: e.target.value })} /></Field>
+                      </Row>
+                    </>)}
+                    <InfoBox>🔐 On deploy we request a certificate for <strong style={{ color: "var(--cyan)" }}>{form.domains.join(", ") || "your domains"}</strong>. If DNS isn&apos;t pointed here yet, the site still deploys and issuance retries automatically.</InfoBox>
+                  </>)}
+
+                  {/* MANUAL */}
+                  {form.front_https && form.tls_mode === "manual" && (<>
+                    <Field label="Certificate Source">
+                      <select className="fin2 fsel2" value={form.custom_priority} onChange={e => upd({ custom_priority: e.target.value as SiteForm["custom_priority"] })}>
+                        <option value="data">Paste PEM data</option>
+                        <option value="file">Path on WAF node</option>
+                      </select>
+                    </Field>
+                    {form.custom_priority === "data" ? (<>
+                      <Field label="Certificate (PEM)" hint="Full chain: leaf + intermediates">
+                        <textarea className="fin2" rows={4} value={form.cert_pem} placeholder="-----BEGIN CERTIFICATE-----" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 12, resize: "vertical" }} onChange={e => upd({ cert_pem: e.target.value })} />
+                      </Field>
+                      <Field label="Private Key (PEM)" hint="Stays on your control plane">
+                        <textarea className="fin2" rows={3} value={form.key_pem} placeholder="-----BEGIN PRIVATE KEY-----" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 12, resize: "vertical" }} onChange={e => upd({ key_pem: e.target.value })} />
+                      </Field>
+                    </>) : (
+                      <Row>
+                        <Field label="Certificate Path" hint="On the WAF node"><input className="fin2" value={form.cert_path} placeholder="/etc/ssl/site.crt" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 11 }} onChange={e => upd({ cert_path: e.target.value })} /></Field>
+                        <Field label="Key Path"><input className="fin2" value={form.key_path} placeholder="/etc/ssl/site.key" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 11 }} onChange={e => upd({ key_path: e.target.value })} /></Field>
+                      </Row>
+                    )}
+                  </>)}
+
+                  {form.front_https && form.tls_mode !== "off" && (
+                    <SectionToggle label="HSTS (Strict-Transport-Security)" desc={`max-age ${form.hsts_max_age}s · force HTTPS in browsers`} on={form.hsts} set={v => upd({ hsts: v })} />
+                  )}
+                </>)}
+
+                {/* ───────── REVERSE PROXY ───────── */}
+                {screen === "proxy" && (<>
+                  <StepHead title="Reverse Proxy" sub="The upstream application server(s) the WAF protects." tag="enforced" />
+                  {!adv ? (<>
+                    {/* Easy: one clear host + port */}
+                    <Row cols="2fr 1fr">
+                      <Field label="Application Host" hint="Where your app runs (IP or hostname)">
+                        <input className="fin2" value={primary.host} placeholder="127.0.0.1" onChange={e => setServer(0, { host: e.target.value })} />
+                      </Field>
+                      <Field label="Port" hint="Your app's port">
+                        <input className="fin2" type="number" value={primary.port} placeholder="8080" onChange={e => setServer(0, { port: Number(e.target.value) })} />
+                      </Field>
+                    </Row>
+                    <SectionToggle label="Upstream uses HTTPS" desc="The app behind the WAF serves TLS" on={primary.tls} set={v => setServer(0, { tls: v })} />
+                    <InfoBox>✅ Traffic to <strong style={{ color: "var(--cyan)" }}>{scheme}://{form.domains[0] || "your-domain"}</strong> will be proxied to <strong style={{ color: "var(--cyan)" }}>{primary.tls ? "https" : "http"}://{primary.host || "host"}:{primary.port || "port"}</strong>. Need load balancing or health checks? Switch to <strong>Advanced</strong>.</InfoBox>
+                  </>) : (<>
+                    <Field label="Load Balancing" hint="Strategy across upstream servers">
+                      <select className="fin2 fsel2" value={form.lb} onChange={e => upd({ lb: e.target.value as SiteForm["lb"] })}>
+                        <option value="round_robin">Round Robin</option>
+                        <option value="least_conn">Least Connections</option>
+                        <option value="ip_hash">IP Hash (sticky)</option>
+                        <option value="random">Random</option>
+                        <option value="adaptive">Adaptive (latency-aware)</option>
+                      </select>
+                    </Field>
+                    <GroupLabel>Upstream Servers</GroupLabel>
+                    {form.servers.map((s, i) => (
+                      <div key={i} style={{ display: "grid", gridTemplateColumns: "2fr 1fr 0.8fr auto auto", gap: 8, alignItems: "end" }}>
+                        <Field label={`Host #${i + 1}`}><input className="fin2" value={s.host} placeholder="127.0.0.1" onChange={e => setServer(i, { host: e.target.value })} /></Field>
+                        <Field label="Port"><input className="fin2" type="number" value={s.port} onChange={e => setServer(i, { port: Number(e.target.value) })} /></Field>
+                        <Field label="Weight"><input className="fin2" type="number" value={s.weight} onChange={e => setServer(i, { weight: Number(e.target.value) })} /></Field>
+                        <div style={{ display: "flex", flexDirection: "column", gap: 4, alignItems: "center" }}><label className="flbl2">TLS</label><Sw on={s.tls} set={v => setServer(i, { tls: v })} /></div>
+                        <button className="btn bg-btn btn-sm" type="button" disabled={form.servers.length === 1} onClick={() => rmServer(i)} style={{ opacity: form.servers.length === 1 ? 0.4 : 1 }}>🗑</button>
+                      </div>
+                    ))}
+                    <button className="btn bg-btn btn-sm" type="button" onClick={addServer} style={{ alignSelf: "flex-start" }}>＋ Add Server</button>
+                    <SectionToggle label="Active Health Checks" desc="Probe upstreams and route around failures" on={form.health.enabled} set={v => upd({ health: { ...form.health, enabled: v } })} />
+                    {form.health.enabled && (
+                      <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr", gap: 12 }}>
+                        <Field label="Path"><input className="fin2" value={form.health.path} onChange={e => upd({ health: { ...form.health, path: e.target.value } })} /></Field>
+                        <Field label="Interval"><input className="fin2" value={form.health.interval} onChange={e => upd({ health: { ...form.health, interval: e.target.value } })} /></Field>
+                        <Field label="Timeout"><input className="fin2" value={form.health.timeout} onChange={e => upd({ health: { ...form.health, timeout: e.target.value } })} /></Field>
+                      </div>
+                    )}
+                    <GroupLabel>Proxy Options <Tag kind="stored" /></GroupLabel>
+                    <Row>
+                      <Field label="Custom Host Header" hint="Override Host sent upstream (blank = pass-through)"><input className="fin2" value={form.proxy_host_header} placeholder="app.internal" onChange={e => upd({ proxy_host_header: e.target.value })} /></Field>
+                      <Field label="SSL SNI Name" hint="Sent when upstream uses TLS"><input className="fin2" value={form.proxy_ssl_sni_name} placeholder="backend.example.com" onChange={e => upd({ proxy_ssl_sni_name: e.target.value, proxy_ssl_sni: !!e.target.value })} /></Field>
+                    </Row>
+                    <Row>
+                      <SectionToggle label="WebSocket / Upgrade" desc="Allow Connection: Upgrade passthrough" on={form.proxy_websocket} set={v => upd({ proxy_websocket: v })} />
+                      <SectionToggle label="Upstream Keep-Alive" desc="Reuse upstream connections" on={form.proxy_keepalive} set={v => upd({ proxy_keepalive: v })} />
+                    </Row>
+                    <Row>
+                      <Field label="Connect Timeout"><input className="fin2" value={form.proxy_connect_timeout} onChange={e => upd({ proxy_connect_timeout: e.target.value })} /></Field>
+                      <Field label="Read Timeout"><input className="fin2" value={form.proxy_read_timeout} onChange={e => upd({ proxy_read_timeout: e.target.value })} /></Field>
+                    </Row>
+                  </>)}
                 </>)}
 
                 {/* ───────── PROTECTION (easy) ───────── */}
                 {screen === "protect" && (<>
+                  <StepHead title="Protection" sub="Core WAF settings. Switch to Advanced for full control." tag="enforced" />
                   <Row>
-                    <Field label="Paranoia Level" hint="1 = fewer false positives · 4 = strictest">
-                      <input className="fin2" type="number" min={1} max={4} value={form.paranoia_level} onChange={e => upd({ paranoia_level: Number(e.target.value), preset: "custom" })} />
-                    </Field>
-                    <Field label="Anomaly Threshold" hint="Score needed to block a request">
-                      <input className="fin2" type="number" value={form.anomaly_threshold} onChange={e => upd({ anomaly_threshold: Number(e.target.value), preset: "custom" })} />
-                    </Field>
+                    <Field label="Paranoia Level" hint="1 = fewer false positives · 4 = strictest"><input className="fin2" type="number" min={1} max={4} value={form.paranoia_level} onChange={e => upd({ paranoia_level: Number(e.target.value), preset: "custom" })} /></Field>
+                    <Field label="Anomaly Threshold" hint="Score needed to block a request"><input className="fin2" type="number" value={form.anomaly_threshold} onChange={e => upd({ anomaly_threshold: Number(e.target.value), preset: "custom" })} /></Field>
                   </Row>
-                  <SectionToggle label="Per-IP Rate Limiting" desc={`${form.rl_per_ip.rps} req/s · burst ${form.rl_per_ip.burst}`}
-                    on={form.rate_limit_enabled} set={v => upd({ rate_limit_enabled: v })} />
-                  <SectionToggle label="Bot Detection (JA4 fingerprinting)" desc="Identify automated clients by TLS fingerprint"
-                    on={form.bot_ja4} set={v => upd({ bot_ja4: v })} />
-                  <div style={{ padding: "10px 14px", background: "rgba(0,212,255,.06)", border: "1px solid rgba(0,212,255,.15)", borderRadius: "var(--r2)", fontSize: 10, color: "var(--text3)", lineHeight: 1.7, fontFamily: "'Share Tech Mono',monospace" }}>
-                    🛡️ All OWASP CRS categories are enabled by this template. Switch to <strong style={{ color: "var(--cyan)" }}>Advanced</strong> to fine-tune rules, GeoIP, anti-DDoS and ML.
-                  </div>
+                  <SectionToggle label="Per-IP Rate Limiting" desc={`${form.rl_per_ip.rps} req/s · burst ${form.rl_per_ip.burst}`} on={form.rate_limit_enabled} set={v => upd({ rate_limit_enabled: v })} />
+                  <SectionToggle label="Bot Detection (JA4 fingerprinting)" desc="Identify automated clients by TLS fingerprint" on={form.bot_ja4} set={v => upd({ bot_ja4: v })} />
+                  <InfoBox>🛡️ All OWASP CRS categories are enabled by this template. Switch to <strong style={{ color: "var(--cyan)" }}>Advanced</strong> to fine-tune rules, antibot, GeoIP, headers, anti-DDoS and ML.</InfoBox>
                 </>)}
 
                 {/* ───────── WAF RULES (advanced) ───────── */}
                 {screen === "rules" && (<>
+                  <StepHead title="WAF Rules" sub="OWASP CRS categories, paranoia level and per-rule exclusions." tag="enforced" />
                   <Row>
-                    <Field label="Paranoia Level" hint="1–4 · higher = stricter">
-                      <input className="fin2" type="number" min={1} max={4} value={form.paranoia_level} onChange={e => upd({ paranoia_level: Number(e.target.value) })} />
-                    </Field>
-                    <Field label="Anomaly Threshold">
-                      <input className="fin2" type="number" value={form.anomaly_threshold} onChange={e => upd({ anomaly_threshold: Number(e.target.value) })} />
-                    </Field>
+                    <Field label="Paranoia Level" hint="1–4 · higher = stricter"><input className="fin2" type="number" min={1} max={4} value={form.paranoia_level} onChange={e => upd({ paranoia_level: Number(e.target.value) })} /></Field>
+                    <Field label="Anomaly Threshold"><input className="fin2" type="number" value={form.anomaly_threshold} onChange={e => upd({ anomaly_threshold: Number(e.target.value) })} /></Field>
                   </Row>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                    <div style={{ fontSize: 10, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", letterSpacing: 1, textTransform: "uppercase" }}>OWASP CRS Categories ({form.rule_categories.length}/{CRS_CATEGORIES.length})</div>
+                    <GroupLabel>OWASP CRS Categories ({form.rule_categories.length}/{CRS_CATEGORIES.length})</GroupLabel>
                     <div style={{ display: "flex", gap: 6 }}>
                       <button className="btn bg-btn btn-xs" type="button" onClick={() => upd({ rule_categories: [...ALL_CRS_KEYS] })}>All</button>
                       <button className="btn bg-btn btn-xs" type="button" onClick={() => upd({ rule_categories: CRS_CATEGORIES.filter(c => c.core).map(c => c.key) })}>Core only</button>
@@ -384,26 +616,28 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     {CRS_CATEGORIES.map(c => {
                       const on = form.rule_categories.includes(c.key);
                       return (
-                        <div key={c.key} onClick={() => toggleCat(c.key)} style={{
-                          cursor: "pointer", padding: "8px 11px", borderRadius: 8, display: "flex", justifyContent: "space-between", gap: 8,
-                          background: on ? "rgba(0,230,118,.07)" : "rgba(255,255,255,.02)",
-                          border: on ? "1px solid rgba(0,230,118,.3)" : "1px solid rgba(255,255,255,.07)",
-                        }}>
-                          <div>
-                            <div style={{ fontSize: 11, fontWeight: 600, color: "var(--text)" }}>{c.label}</div>
-                            <div style={{ fontSize: 9, color: "var(--text3)", marginTop: 2 }}>{c.desc}</div>
-                          </div>
+                        <div key={c.key} onClick={() => toggleCat(c.key)} style={{ cursor: "pointer", padding: "8px 11px", borderRadius: 8, display: "flex", justifyContent: "space-between", gap: 8, background: on ? "rgba(0,230,118,.07)" : "rgba(255,255,255,.02)", border: on ? "1px solid rgba(0,230,118,.3)" : "1px solid rgba(255,255,255,.07)" }}>
+                          <div><div style={{ fontSize: 11, fontWeight: 600, color: "var(--text)" }}>{c.label}</div><div style={{ fontSize: 9, color: "var(--text3)", marginTop: 2 }}>{c.desc}</div></div>
                           <div style={{ fontSize: 13, color: on ? "var(--green)" : "var(--text3)" }}>{on ? "✓" : "○"}</div>
                         </div>
                       );
                     })}
                   </div>
+                  <GroupLabel>Rule Exclusions (false-positive tuning)</GroupLabel>
+                  {form.rule_exclusions.map((ex, i) => (
+                    <div key={i} style={{ display: "grid", gridTemplateColumns: "1fr 2fr auto", gap: 8, alignItems: "end" }}>
+                      <Field label="Rule ID"><input className="fin2" type="number" value={ex.rule_id} onChange={e => upd({ rule_exclusions: form.rule_exclusions.map((x, idx) => idx === i ? { ...x, rule_id: Number(e.target.value) } : x) })} /></Field>
+                      <Field label="Exclude Targets" hint="comma-separated (e.g. ARGS:id, REQUEST_HEADERS:Referer)"><input className="fin2" value={ex.exclude_targets.join(", ")} onChange={e => upd({ rule_exclusions: form.rule_exclusions.map((x, idx) => idx === i ? { ...x, exclude_targets: e.target.value.split(",").map(t => t.trim()).filter(Boolean) } : x) })} /></Field>
+                      <button className="btn bg-btn btn-sm" type="button" onClick={() => upd({ rule_exclusions: form.rule_exclusions.filter((_, idx) => idx !== i) })}>🗑</button>
+                    </div>
+                  ))}
+                  <button className="btn bg-btn btn-xs" type="button" style={{ alignSelf: "flex-start" }} onClick={() => upd({ rule_exclusions: [...form.rule_exclusions, { rule_id: 0, exclude_targets: [] }] })}>＋ Add Exclusion</button>
                 </>)}
 
                 {/* ───────── RATE & DDOS (advanced) ───────── */}
                 {screen === "rate" && (<>
-                  <SectionToggle label="Rate Limiting" desc="Token-bucket limits per IP and globally"
-                    on={form.rate_limit_enabled} set={v => upd({ rate_limit_enabled: v })} />
+                  <StepHead title="Rate & DDoS" sub="Token-bucket rate limits and connection-rate anti-DDoS." tag="enforced" />
+                  <SectionToggle label="Rate Limiting" desc="Token-bucket limits per IP and globally" on={form.rate_limit_enabled} set={v => upd({ rate_limit_enabled: v })} />
                   {form.rate_limit_enabled && (
                     <Row>
                       <div style={{ display: "flex", flexDirection: "column", gap: 10, padding: 12, borderRadius: 10, border: "1px solid rgba(255,255,255,.07)" }}>
@@ -418,8 +652,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                       </div>
                     </Row>
                   )}
-                  <SectionToggle label="Connection-rate Anti-DDoS" desc="Block IPs opening too many connections per second"
-                    on={form.antiddos_enabled} set={v => upd({ antiddos_enabled: v })} />
+                  <SectionToggle label="Connection-rate Anti-DDoS" desc="Block IPs opening too many connections per second" on={form.antiddos_enabled} set={v => upd({ antiddos_enabled: v })} />
                   {form.antiddos_enabled && (
                     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
                       <Field label="Conn/s limit"><input className="fin2" type="number" value={form.antiddos_conn_rate} onChange={e => upd({ antiddos_conn_rate: Number(e.target.value) })} /></Field>
@@ -429,18 +662,44 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                   )}
                 </>)}
 
-                {/* ───────── BOTS / GEO / IP (advanced) ───────── */}
-                {screen === "bots" && (<>
-                  <SectionToggle label="JA4 Bot Fingerprinting" desc="Detect automated clients by TLS fingerprint"
-                    on={form.bot_ja4} set={v => upd({ bot_ja4: v })} />
-                  <Field label="Bot Challenge" hint="Challenge suspicious clients before passing">
+                {/* ───────── ANTIBOT (advanced) ───────── */}
+                {screen === "antibot" && (<>
+                  <StepHead title="Antibot" sub="Fingerprint and challenge automated clients before they reach your app." tag="enforced" />
+                  <SectionToggle label="JA4 Bot Fingerprinting" desc="Detect automated clients by TLS fingerprint" on={form.bot_ja4} set={v => upd({ bot_ja4: v })} />
+                  <Field label="Challenge Type" hint="Challenge suspicious clients before passing them upstream">
                     <select className="fin2 fsel2" value={form.bot_challenge} onChange={e => upd({ bot_challenge: e.target.value as SiteForm["bot_challenge"] })}>
                       <option value="off">Off</option>
-                      <option value="native_pow">Native Proof-of-Work</option>
+                      <option value="native_pow">Native Proof-of-Work (no third party)</option>
+                      <option value="recaptcha">Google reCAPTCHA</option>
                       <option value="hcaptcha">hCaptcha</option>
                       <option value="turnstile">Cloudflare Turnstile</option>
                     </select>
                   </Field>
+                  {form.bot_challenge === "recaptcha" && (<>
+                    <Row>
+                      <Field label="reCAPTCHA Site Key"><input className="fin2" value={form.bot_recaptcha_sitekey} onChange={e => upd({ bot_recaptcha_sitekey: e.target.value })} /></Field>
+                      <Field label="v3 Score Threshold" hint="0 = lenient · 1 = strict"><input className="fin2" type="number" min={0} max={1} step={0.1} value={form.bot_recaptcha_score} onChange={e => upd({ bot_recaptcha_score: Number(e.target.value) })} /></Field>
+                    </Row>
+                    <Field label="reCAPTCHA Secret"><SecretInput value={form.bot_recaptcha_secret} set={v => upd({ bot_recaptcha_secret: v })} /></Field>
+                  </>)}
+                  {form.bot_challenge === "hcaptcha" && (
+                    <Row>
+                      <Field label="hCaptcha Site Key"><input className="fin2" value={form.bot_hcaptcha_sitekey} onChange={e => upd({ bot_hcaptcha_sitekey: e.target.value })} /></Field>
+                      <Field label="hCaptcha Secret"><SecretInput value={form.bot_hcaptcha_secret} set={v => upd({ bot_hcaptcha_secret: v })} /></Field>
+                    </Row>
+                  )}
+                  {form.bot_challenge === "turnstile" && (
+                    <Row>
+                      <Field label="Turnstile Site Key"><input className="fin2" value={form.bot_turnstile_sitekey} onChange={e => upd({ bot_turnstile_sitekey: e.target.value })} /></Field>
+                      <Field label="Turnstile Secret"><SecretInput value={form.bot_turnstile_secret} set={v => upd({ bot_turnstile_secret: v })} /></Field>
+                    </Row>
+                  )}
+                  {form.bot_challenge === "native_pow" && <InfoBox tone="green">⚙️ Native proof-of-work runs entirely on the WAF — no third-party keys, no external requests, fully on-prem.</InfoBox>}
+                </>)}
+
+                {/* ───────── GEO & IP (advanced) ───────── */}
+                {screen === "geoip" && (<>
+                  <StepHead title="Geo & IP" sub="Country filtering, IP allow/block lists and external blacklist sources." tag="enforced" />
                   <Field label="GeoIP Filtering" hint="Allow-list takes precedence over block-list">
                     <select className="fin2 fsel2" value={form.geo_mode} onChange={e => upd({ geo_mode: e.target.value as SiteForm["geo_mode"] })}>
                       <option value="off">Disabled</option>
@@ -454,70 +713,104 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                         const on = form.geo_countries.includes(c.code);
                         return (
                           <span key={c.code} onClick={() => upd({ geo_countries: on ? form.geo_countries.filter(x => x !== c.code) : [...form.geo_countries, c.code] })}
-                            style={{
-                              cursor: "pointer", padding: "4px 9px", borderRadius: 12, fontSize: 10, fontFamily: "'Share Tech Mono',monospace",
-                              background: on ? (form.geo_mode === "allow" ? "rgba(0,230,118,.12)" : "rgba(255,45,85,.12)") : "rgba(255,255,255,.03)",
-                              border: on ? `1px solid ${form.geo_mode === "allow" ? "rgba(0,230,118,.4)" : "rgba(255,45,85,.4)"}` : "1px solid rgba(255,255,255,.08)",
-                              color: on ? "var(--text)" : "var(--text3)",
-                            }}>{c.code} {c.name}</span>
+                            style={{ cursor: "pointer", padding: "4px 9px", borderRadius: 12, fontSize: 12, fontFamily: "'Share Tech Mono',monospace", background: on ? (form.geo_mode === "allow" ? "rgba(0,230,118,.12)" : "rgba(255,45,85,.12)") : "rgba(255,255,255,.03)", border: on ? `1px solid ${form.geo_mode === "allow" ? "rgba(0,230,118,.4)" : "rgba(255,45,85,.4)"}` : "1px solid rgba(255,255,255,.08)", color: on ? "var(--text)" : "var(--text3)" }}>{c.code} {c.name}</span>
                         );
                       })}
                     </div>
                   )}
                   <Row>
-                    <Field label="IP / CIDR Allow-list" hint="Always permitted (overrides blocks)">
-                      <ChipInput values={form.ip_allow} onChange={v => upd({ ip_allow: v })} placeholder="10.0.0.0/8" />
-                    </Field>
-                    <Field label="IP / CIDR Block-list" hint="Always denied">
-                      <ChipInput values={form.ip_block} onChange={v => upd({ ip_block: v })} placeholder="203.0.113.7" />
-                    </Field>
+                    <Field label="IP / CIDR Allow-list" hint="Always permitted (overrides blocks)"><ChipInput values={form.ip_allow} onChange={v => upd({ ip_allow: v })} placeholder="10.0.0.0/8" /></Field>
+                    <Field label="IP / CIDR Block-list" hint="Always denied"><ChipInput values={form.ip_block} onChange={v => upd({ ip_block: v })} placeholder="203.0.113.7" /></Field>
                   </Row>
+                  <GroupLabel>Blacklist Sources <Tag kind="stored" /></GroupLabel>
+                  <SectionToggle label="DNSBL (DNS blacklists)" desc="Reject IPs listed on the configured DNSBL servers" on={form.dnsbl_enabled} set={v => upd({ dnsbl_enabled: v })} />
+                  {form.dnsbl_enabled && <Field label="DNSBL Servers" hint="e.g. bl.blocklist.de, sbl.spamhaus.org"><ChipInput values={form.dnsbl_servers} onChange={v => upd({ dnsbl_servers: v })} placeholder="bl.blocklist.de" /></Field>}
+                  <Row>
+                    <Field label="Block User-Agents" hint="Substring match"><ChipInput values={form.blacklist_user_agents} onChange={v => upd({ blacklist_user_agents: v })} placeholder="sqlmap" /></Field>
+                    <Field label="Block URI Patterns" hint="Substring match"><ChipInput values={form.blacklist_uris} onChange={v => upd({ blacklist_uris: v })} placeholder="/.env" /></Field>
+                  </Row>
+                </>)}
+
+                {/* ───────── HTTP HEADERS (advanced) ───────── */}
+                {screen === "headers" && (<>
+                  <StepHead title="HTTP Headers" sub="Response security headers. The WAF always injects secure defaults; these override per-site." tag="stored" />
+                  <InfoBox>🛡️ Secure defaults (X-Content-Type-Options, X-Frame-Options, X-XSS-Protection) are always applied. The values below override them for this site.</InfoBox>
+                  <Field label="Content-Security-Policy" hint="Leave blank to omit CSP"><input className="fin2" value={form.csp} placeholder="default-src 'self'" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 11 }} onChange={e => upd({ csp: e.target.value })} /></Field>
+                  <Row>
+                    <Field label="Referrer-Policy">
+                      <select className="fin2 fsel2" value={form.referrer_policy} onChange={e => upd({ referrer_policy: e.target.value })}>
+                        {["no-referrer", "no-referrer-when-downgrade", "strict-origin", "strict-origin-when-cross-origin", "same-origin", "origin"].map(v => <option key={v} value={v}>{v}</option>)}
+                      </select>
+                    </Field>
+                    <Field label="Cookie Flags" hint="Applied to Set-Cookie"><input className="fin2" value={form.cookie_flags} style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 11 }} onChange={e => upd({ cookie_flags: e.target.value })} /></Field>
+                  </Row>
+                  <Field label="Permissions-Policy"><input className="fin2" value={form.permissions_policy} style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 11 }} onChange={e => upd({ permissions_policy: e.target.value })} /></Field>
+                  <SectionToggle label="CORS (Access-Control-Allow-Origin)" desc="Add cross-origin response headers" on={form.cors_enabled} set={v => upd({ cors_enabled: v })} />
+                  {form.cors_enabled && <Field label="Allowed Origins" hint="* or comma-separated origins"><input className="fin2" value={form.cors_origins} style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 11 }} onChange={e => upd({ cors_origins: e.target.value })} /></Field>}
+                  <GroupLabel>Custom Headers</GroupLabel>
+                  {form.custom_headers.map((h, i) => (
+                    <div key={i} style={{ display: "grid", gridTemplateColumns: "1fr 1.5fr auto", gap: 8, alignItems: "end" }}>
+                      <Field label="Name"><input className="fin2" value={h.name} placeholder="X-Custom" onChange={e => setHeader(i, { name: e.target.value })} /></Field>
+                      <Field label="Value"><input className="fin2" value={h.value} onChange={e => setHeader(i, { value: e.target.value })} /></Field>
+                      <button className="btn bg-btn btn-sm" type="button" onClick={() => upd({ custom_headers: form.custom_headers.filter((_, idx) => idx !== i) })}>🗑</button>
+                    </div>
+                  ))}
+                  <button className="btn bg-btn btn-xs" type="button" style={{ alignSelf: "flex-start" }} onClick={() => upd({ custom_headers: [...form.custom_headers, { name: "", value: "" }] })}>＋ Add Header</button>
                 </>)}
 
                 {/* ───────── ADVANCED ───────── */}
                 {screen === "advanced" && (<>
-                  <div style={{ fontSize: 10, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", letterSpacing: 1, textTransform: "uppercase" }}>Request Limits</div>
+                  <StepHead title="Advanced" sub="Request limits, allowed methods, ML anomaly detection and API discovery." tag="enforced" />
+                  <GroupLabel>Request Limits</GroupLabel>
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
                     <Field label="Max Body (MB)"><input className="fin2" type="number" value={form.max_body_size_mb} onChange={e => upd({ max_body_size_mb: Number(e.target.value) })} /></Field>
                     <Field label="Max URI (bytes)"><input className="fin2" type="number" value={form.max_uri_length} onChange={e => upd({ max_uri_length: Number(e.target.value) })} /></Field>
                     <Field label="Max Headers"><input className="fin2" type="number" value={form.max_header_count} onChange={e => upd({ max_header_count: Number(e.target.value) })} /></Field>
                   </div>
-                  <SectionToggle label="ML Anomaly Detection" desc="Score requests with the bundled ML models"
-                    on={form.ml_enabled} set={v => upd({ ml_enabled: v })} />
+                  <GroupLabel>Allowed HTTP Methods</GroupLabel>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                    {HTTP_METHODS.map(m => {
+                      const on = form.allowed_methods.includes(m);
+                      return (
+                        <span key={m} onClick={() => toggleMethod(m)} style={{ cursor: "pointer", padding: "5px 11px", borderRadius: 8, fontSize: 11, fontWeight: 600, fontFamily: "'Share Tech Mono',monospace", background: on ? "rgba(0,230,118,.1)" : "rgba(255,255,255,.03)", border: on ? "1px solid rgba(0,230,118,.35)" : "1px solid rgba(255,255,255,.08)", color: on ? "var(--text)" : "var(--text3)" }}>{m}</span>
+                      );
+                    })}
+                  </div>
+                  <SectionToggle label="ML Anomaly Detection" desc="Score requests with the bundled ML models" on={form.ml_enabled} set={v => upd({ ml_enabled: v })} />
                   {form.ml_enabled && (
                     <Field label={`ML Sensitivity (${form.ml_sensitivity})`} hint="0 = lenient · 1 = aggressive">
-                      <input type="range" min={0} max={1} step={0.05} value={form.ml_sensitivity}
-                        onChange={e => upd({ ml_sensitivity: Number(e.target.value) })} style={{ width: "100%" }} />
+                      <input type="range" min={0} max={1} step={0.05} value={form.ml_sensitivity} onChange={e => upd({ ml_sensitivity: Number(e.target.value) })} style={{ width: "100%" }} />
                     </Field>
                   )}
-                  <SectionToggle label="API Discovery" desc="Learn and document API endpoints automatically"
-                    on={form.api_discovery} set={v => upd({ api_discovery: v })} />
+                  <SectionToggle label="API Discovery" desc="Learn and document API endpoints automatically" on={form.api_discovery} set={v => upd({ api_discovery: v })} />
                 </>)}
 
                 {/* ───────── REVIEW ───────── */}
                 {screen === "review" && (
                   <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-                    <div style={{ padding: "12px 16px", background: "rgba(0,230,118,.07)", border: "1px solid rgba(0,230,118,.25)", borderRadius: 10, fontSize: 11, color: "var(--green)", fontFamily: "'Share Tech Mono',monospace" }}>
-                      ✅ Review your configuration, then {mode === "edit" ? "save changes" : "deploy"}. Protection activates in ~5s.
-                    </div>
+                    <StepHead title="Review" sub={`Confirm your configuration, then ${mode === "edit" ? "save changes" : "deploy"}. Protection activates in ~5s.`} />
                     {[
                       ["Name", form.name || "—"],
                       ["Domains", form.domains.join(", ") || "—"],
                       ["Mode", form.mode.toUpperCase()],
+                      ["Public", `${scheme}://:${frontPort}${form.force_https ? " · force-https" : ""}${form.http2 ? " · h2" : ""}${form.http3 ? " · h3" : ""}`],
+                      ["TLS", form.tls_mode === "off" || !form.front_https ? "off" : form.tls_mode === "auto" ? `auto · ${form.acme_staging ? "staging" : form.acme_provider} · ${form.acme_challenge}${form.acme_wildcard ? " · wildcard" : ""}` : form.tls_mode === "existing" ? `repository · ${form.tls_existing_cert || "—"}` : `custom (${form.custom_priority})`],
                       ["Upstreams", form.servers.map(s => `${s.host}:${s.port}${s.tls ? " (TLS)" : ""}`).join(", ")],
                       ["Load Balancer", form.lb],
                       ["Paranoia / Threshold", `PL${form.paranoia_level} · ${form.anomaly_threshold}`],
-                      ["CRS Categories", `${form.rule_categories.length} enabled`],
+                      ["CRS Categories", `${form.rule_categories.length} enabled · ${form.rule_exclusions.length} exclusions`],
+                      ["Allowed Methods", form.allowed_methods.join(" ")],
                       ["Rate Limit", form.rate_limit_enabled ? `${form.rl_per_ip.rps}/s per IP` : "off"],
                       ["Anti-DDoS", form.antiddos_enabled ? `${form.antiddos_conn_rate} conn/s` : "off"],
-                      ["Bot JA4", form.bot_ja4 ? "on" : "off"],
+                      ["Antibot", `${form.bot_ja4 ? "JA4" : ""}${form.bot_ja4 && form.bot_challenge !== "off" ? " · " : ""}${form.bot_challenge !== "off" ? form.bot_challenge : ""}` || "off"],
                       ["GeoIP", form.geo_mode === "off" ? "off" : `${form.geo_mode} ${form.geo_countries.join(",")}`],
-                      ["IP Lists", `${form.ip_allow.length} allow · ${form.ip_block.length} block`],
+                      ["IP / Blacklist", `${form.ip_allow.length} allow · ${form.ip_block.length} block${form.dnsbl_enabled ? " · DNSBL" : ""}`],
+                      ["Headers", `${form.csp ? "CSP " : ""}${form.cors_enabled ? "CORS " : ""}${form.hsts ? "HSTS " : ""}${form.custom_headers.filter(h => h.name).length} custom`],
                       ["ML", form.ml_enabled ? `on (${form.ml_sensitivity})` : "off"],
                     ].map(([k, v]) => (
                       <div key={k} style={{ display: "flex", justifyContent: "space-between", padding: "7px 12px", background: "rgba(255,255,255,.02)", borderRadius: 8, fontSize: 11 }}>
                         <span style={{ color: "var(--text3)" }}>{k}</span>
-                        <span style={{ color: "var(--text)", fontFamily: "'Share Tech Mono',monospace", textAlign: "right", maxWidth: "60%" }}>{v}</span>
+                        <span style={{ color: "var(--text)", fontFamily: "'Share Tech Mono',monospace", textAlign: "right", maxWidth: "62%" }}>{v}</span>
                       </div>
                     ))}
                   </div>
@@ -526,17 +819,13 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
             </AnimatePresence>
           </div>
 
-          {/* ── Footer ── */}
+          {/* Footer */}
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 22px", borderTop: "1px solid rgba(255,255,255,.06)" }}>
-            <div style={{ fontSize: 10, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>Step {step + 1} / {steps.length}</div>
+            <div style={{ fontSize: 12, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>Step {step + 1} / {steps.length}</div>
             <div style={{ display: "flex", gap: 8 }}>
               <button className="btn bg-btn" type="button" onClick={step === 0 ? onClose : back}>{step === 0 ? "Cancel" : "← Back"}</button>
-              {step < steps.length - 1 && (
-                <button className="btn bg-btn" type="button" onClick={next}>Next →</button>
-              )}
-              <button className="btn bp" type="button" disabled={saving} onClick={save}>
-                {saving ? <span className="btn-spin" /> : (mode === "edit" ? "💾 Save Changes" : "🚀 Deploy Site")}
-              </button>
+              {step < steps.length - 1 && <button className="btn bg-btn" type="button" onClick={next}>Next →</button>}
+              <button className="btn bp" type="button" disabled={saving} onClick={save}>{saving ? <span className="btn-spin" /> : (mode === "edit" ? "💾 Save Changes" : "🚀 Deploy Site")}</button>
             </div>
           </div>
         </div>

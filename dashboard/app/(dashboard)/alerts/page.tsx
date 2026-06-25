@@ -26,6 +26,39 @@ export default function AlertsPage() {
 
   useEffect(() => { loadAlerts(); }, []);
 
+  // Live SOC feed: the alert engine publishes "alert" entries to the hub as it
+  // raises them — surface them instantly without waiting for a refresh.
+  const [live, setLive] = useState(false);
+  useEffect(() => {
+    let es: EventSource | null = null;
+    try {
+      es = new EventSource(api.logs.streamURL("alert"));
+      es.onopen = () => setLive(true);
+      es.onerror = () => setLive(false);
+      es.onmessage = (evt) => {
+        try {
+          const e: { data: Record<string, unknown> } = JSON.parse(evt.data);
+          if (!e.data || !e.data.id) return;
+          const incoming = {
+            id: String(e.data.id),
+            tenant_id: "",
+            site_id: null,
+            severity: String(e.data.severity ?? "medium") as Alert["severity"],
+            kind: String(e.data.kind ?? "alert"),
+            summary: String(e.data.summary ?? ""),
+            details: {} as Record<string, unknown>,
+            state: (String(e.data.state ?? "open")) as Alert["state"],
+            created_at: String(e.data.ts ?? new Date().toISOString()),
+            resolved_at: null,
+          };
+          // De-dupe against existing (the SSE replays recent buffer on connect).
+          setAlerts(p => p.some(a => a.id === incoming.id) ? p : [incoming, ...p].slice(0, 300));
+        } catch { /* */ }
+      };
+    } catch { /* */ }
+    return () => { es?.close(); };
+  }, []);
+
   const filtered = alerts.filter(a => {
     const hay = JSON.stringify(a).toLowerCase();
     const matchSearch = !search || hay.includes(search.toLowerCase());
@@ -76,9 +109,10 @@ export default function AlertsPage() {
   return (
     <motion.div className="sec" variants={staggerContainer} initial="hidden" animate="visible">
       <motion.div variants={fadeUp} style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",gap:14}}>
-        <div><div className="sec-title">🔴 Security Alerts</div><div className="sec-sub">Real-time incident queue · {alerts.filter(a=>a.state==="open").length} open · DB-backed</div></div>
+        <div><div className="sec-title">🔴 Security Alerts</div><div className="sec-sub">Real-time incident queue · {alerts.filter(a=>a.state==="open").length} open · {live ? <span style={{color:"var(--green)"}}>● live</span> : <span style={{color:"var(--text3)"}}>○ offline</span>} · DB-backed</div></div>
         <div style={{display:"flex",gap:8}}>
           <motion.button className="btn bg-btn btn-sm" onClick={loadAlerts} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>⟳ Refresh</motion.button>
+          <motion.a className="btn bg-btn btn-sm" href="/settings" whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>🔔 Channels</motion.a>
           <motion.button className="btn bc btn-sm" onClick={ackAll} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>✅ Ack All Open</motion.button>
         </div>
       </motion.div>

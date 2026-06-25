@@ -71,19 +71,19 @@ export default function SitesPage() {
             ✅ Site saved and WAF protection active in ~5 seconds
           </div>
           <div>
-            <div style={{ fontSize: 10, color: "var(--text2)", marginBottom: 6, fontFamily: "'Share Tech Mono',monospace", letterSpacing: 1 }}>STEP 1 — Add to /etc/hosts (run once as root)</div>
+            <div style={{ fontSize: 12, color: "var(--text2)", marginBottom: 6, fontFamily: "'Share Tech Mono',monospace", letterSpacing: 1 }}>STEP 1 — Add to /etc/hosts (run once as root)</div>
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
               <code style={{ flex: 1, padding: "8px 12px", background: "rgba(0,0,0,.35)", border: "1px solid rgba(255,255,255,.08)", borderRadius: "var(--r2)", fontFamily: "'Share Tech Mono',monospace", fontSize: 11, color: "var(--text)", userSelect: "all" }}>
                 {hostsEntry}
               </code>
               <button className="btn bg-btn btn-sm" onClick={() => { navigator.clipboard.writeText(`echo '${hostsEntry}' | sudo tee -a /etc/hosts`); showToast("Copied!", "s", "📋"); }}>📋 Copy cmd</button>
             </div>
-            <div style={{ marginTop: 6, fontFamily: "'Share Tech Mono',monospace", fontSize: 10, color: "var(--text3)" }}>
+            <div style={{ marginTop: 6, fontFamily: "'Share Tech Mono',monospace", fontSize: 12, color: "var(--text3)" }}>
               echo &apos;{hostsEntry}&apos; | sudo tee -a /etc/hosts
             </div>
           </div>
           <div>
-            <div style={{ fontSize: 10, color: "var(--text2)", marginBottom: 6, fontFamily: "'Share Tech Mono',monospace", letterSpacing: 1 }}>STEP 2 — Browse through the WAF proxy (port 9080)</div>
+            <div style={{ fontSize: 12, color: "var(--text2)", marginBottom: 6, fontFamily: "'Share Tech Mono',monospace", letterSpacing: 1 }}>STEP 2 — Browse through the WAF proxy (port 9080)</div>
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
               <code style={{ flex: 1, padding: "8px 12px", background: "rgba(0,0,0,.35)", border: "1px solid rgba(255,255,255,.08)", borderRadius: "var(--r2)", fontFamily: "'Share Tech Mono',monospace", fontSize: 11, color: "var(--green)" }}>
                 {browseURL}
@@ -92,7 +92,7 @@ export default function SitesPage() {
               <a className="btn bp btn-sm" href={browseURL} target="_blank" rel="noreferrer">↗ Open</a>
             </div>
           </div>
-          <div style={{ padding: "10px 14px", background: "rgba(255,165,0,.07)", border: "1px solid rgba(255,165,0,.2)", borderRadius: "var(--r2)", fontFamily: "'Share Tech Mono',monospace", fontSize: 10, color: "rgba(255,200,80,1)", lineHeight: 1.7 }}>
+          <div style={{ padding: "10px 14px", background: "rgba(255,165,0,.07)", border: "1px solid rgba(255,165,0,.2)", borderRadius: "var(--r2)", fontFamily: "'Share Tech Mono',monospace", fontSize: 12, color: "rgba(255,200,80,1)", lineHeight: 1.7 }}>
             ⚠️ Do NOT browse <span style={{ color: "var(--red-b)" }}>{upstream}</span> directly — that bypasses the WAF and generates no logs.
             <br />Always use <span style={{ color: "var(--green)" }}>{browseURL}</span> to route traffic through the WAF.
           </div>
@@ -265,13 +265,13 @@ export default function SitesPage() {
                     </div>
                   </div>
                   <div className="pb">
-                    <div style={{ fontSize: 10, color: "var(--text2)", lineHeight: 1.6, marginBottom: 12, fontFamily: "'Share Tech Mono',monospace" }}>
+                    <div style={{ fontSize: 12, color: "var(--text2)", lineHeight: 1.6, marginBottom: 12, fontFamily: "'Share Tech Mono',monospace" }}>
                       {meta.desc}
                     </div>
                     <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                      <motion.button className="btn bp btn-sm" onClick={() => router.push(`/logs?site=${name}&tab=waf`)} whileHover={{ scale: 1.04 }} whileTap={{ scale: 0.96 }}>🛡️ WAF Logs</motion.button>
-                      <motion.button className="btn bc btn-sm" onClick={() => router.push(`/logs?site=${name}&tab=access`)} whileHover={{ scale: 1.04 }} whileTap={{ scale: 0.96 }}>📡 Access Logs</motion.button>
-                      <button className="btn bg-btn btn-sm" onClick={() => router.push(`/logs?site=${name}&tab=ml`)}>🤖 ML Intel</button>
+                      <motion.button className="btn bp btn-sm" disabled={!site} onClick={() => site && router.push(`/sites/${site.id}`)} whileHover={{ scale: 1.04 }} whileTap={{ scale: 0.96 }} style={!site ? { opacity: 0.5 } : undefined}>📂 Open Dashboard</motion.button>
+                      <motion.button className="btn bc btn-sm" onClick={() => router.push(`/logs?site=${name}&tab=waf`)} whileHover={{ scale: 1.04 }} whileTap={{ scale: 0.96 }}>🛡️ WAF Logs</motion.button>
+                      <button className="btn bg-btn btn-sm" onClick={() => router.push(`/logs?site=${name}&tab=access`)}>📡 Access Logs</button>
                       <button className="btn bg-btn btn-sm" disabled={!site} onClick={() => site && openEdit(site)} style={!site ? { opacity: 0.5 } : undefined}>✏️ Edit</button>
                     </div>
                     <div style={{ marginTop: 10, padding: "8px 10px", background: "rgba(0,0,0,.2)", borderRadius: "var(--r2)", fontFamily: "'Share Tech Mono',monospace", fontSize: 9, color: "var(--text3)", display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6 }}>
@@ -328,6 +328,7 @@ export default function SitesPage() {
                       <td><span className={`bdg ${s.status === "active" ? "bgg" : "bgr"}`}>{s.status}</span></td>
                       <td>
                         <div style={{ display: "flex", gap: 4 }}>
+                          <motion.button className="btn bc btn-xs" title="Open site dashboard" onClick={() => router.push(`/sites/${s.id}`)} whileHover={{ scale: 1.08 }} whileTap={{ scale: 0.94 }}>📂 Open</motion.button>
                           <motion.button className="btn bg-btn btn-xs" onClick={() => router.push(`/logs?site=${s.name}&tab=waf`)} whileHover={{ scale: 1.08 }} whileTap={{ scale: 0.94 }}>🛡️</motion.button>
                           <motion.button className="btn bg-btn btn-xs" onClick={() => router.push(`/logs?site=${s.name}`)} whileHover={{ scale: 1.08 }} whileTap={{ scale: 0.94 }}>📜 Logs</motion.button>
                           <motion.button className="btn bc btn-xs" title="Edit site" onClick={() => openEdit(s)} whileHover={{ scale: 1.08 }} whileTap={{ scale: 0.94 }}>✏️</motion.button>

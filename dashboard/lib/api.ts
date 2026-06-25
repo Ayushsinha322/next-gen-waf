@@ -93,6 +93,39 @@ export interface Alert {
   resolved_at: string | null;
 }
 
+export type Severity = "info" | "low" | "medium" | "high" | "critical";
+export type ChannelType = "webhook" | "slack" | "syslog" | "cef";
+
+/** Type-specific settings for a notification channel (superset; only the
+ *  relevant subset is used per channel type). */
+export interface ChannelConfig {
+  // webhook / slack
+  url?:      string;
+  method?:   string;
+  headers?:  Record<string, string>;
+  secret?:   string;
+  // syslog / cef
+  host?:     string;
+  port?:     number;
+  protocol?: "udp" | "tcp";
+  facility?: number;
+  tag?:      string;
+}
+
+export interface NotificationChannel {
+  id:           string;
+  tenant_id:    string;
+  name:         string;
+  type:         ChannelType;
+  config:       ChannelConfig;
+  min_severity: Severity;
+  enabled:      boolean;
+  last_status?: string | null;
+  last_sent_at?: string | null;
+  created_at:   string;
+  updated_at:   string;
+}
+
 export interface AuditEntry {
   id:            string;
   tenant_id:     string;
@@ -113,6 +146,17 @@ export interface MetricsSnapshot {
   error_count:       number;
   ebpf_drops:        number;
   connected_clients: number;
+  // Real aggregates derived from the proxy NDJSON stream.
+  unique_blocked_ips: number;
+  status_2xx:         number;
+  status_3xx:         number;
+  status_4xx:         number;
+  status_5xx:         number;
+  attack_breakdown:   Record<string, number>;
+  by_country:         Record<string, number>;
+  geoip_loaded:       boolean;
+  mem_used_bytes:     number;
+  mem_total_bytes:    number;
 }
 
 export interface TrafficBucket {
@@ -120,6 +164,55 @@ export interface TrafficBucket {
   reqs:    number;
   blocked: number;
   p99_ms:  number;
+}
+
+/** Cumulative per-site counters (keyed by site label) from /metrics/sites. */
+export interface SiteStat {
+  total:      number;
+  blocked:    number;
+  status_4xx: number;
+  status_5xx: number;
+}
+
+/** A rule's would-have-blocked aggregation while a site runs in Learning mode. */
+export interface LearningStat {
+  rule_id:   string;
+  category:  string;
+  severity:  string;
+  message:   string;
+  count:     number;
+  last_seen: string;
+  samples:   string[];
+}
+
+/** A ClickHouse-stored WAF event (searchable history). */
+export interface WafEvent {
+  ts:       number;  // unix seconds
+  ip:       string;
+  country:  string;
+  site:     string;
+  method:   string;
+  path:     string;
+  rule:     string;
+  attack:   string;
+  action:   string;  // BLOCK | DETECT
+  severity: string;
+  score:    number;
+  status:   number;
+}
+
+export interface TimelineBucket { ts: number; total: number; blocked: number }
+
+export interface EventQuery {
+  site?: string; country?: string; rule?: string; action?: string;
+  ip?: string; q?: string; from?: number; to?: number; limit?: number;
+}
+
+/** A per-site rule exclusion stored in waf_policy.rule_exclusions. */
+export interface RuleExclusion {
+  rule_id:          number;
+  exclude_targets?: string[];
+  disable?:         boolean;
 }
 
 export interface MLModel {
@@ -181,6 +274,7 @@ export type CertSource =
 
 export interface Certificate {
   domain:      string;
+  name?:       string; // operator-assigned friendly profile label (empty = use domain)
   san:         string[];
   issued_at:   number; // UNIX seconds
   expires_at:  number; // UNIX seconds (0 = unknown)
@@ -194,6 +288,15 @@ export type AcmeChallenge = "http_01" | "tls_alpn_01";
 // ---------------------------------------------------------------------------
 // API methods
 // ---------------------------------------------------------------------------
+
+/** Build a query string from event filters, dropping empty values. */
+function eventQS(f: EventQuery): string {
+  const p = new URLSearchParams();
+  for (const [k, v] of Object.entries(f)) {
+    if (v !== undefined && v !== null && v !== "") p.set(k, String(v));
+  }
+  return p.toString();
+}
 
 export const api = {
   auth: {
@@ -221,6 +324,17 @@ export const api = {
     updateStatus: (id: string, status: "active" | "paused") =>
       apiFetch<{ ok: boolean; status: string }>(`/sites/${id}/status`, {
         method: "PATCH", body: JSON.stringify({ status }),
+      }),
+    /** Add (or update) a rule exclusion on a site — learning-report tuning.
+     *  Omit exclude_targets to disable the whole rule (the common case). */
+    addExclusion: (id: string, body: { rule_id: number; exclude_targets?: string[]; disable?: boolean }) =>
+      apiFetch<{ site: Site; rule_exclusions: RuleExclusion[] }>(`/sites/${id}/exclusions`, {
+        method: "POST", body: JSON.stringify(body),
+      }),
+    /** Remove the exclusion for a rule (re-enable it). */
+    removeExclusion: (id: string, ruleId: number) =>
+      apiFetch<{ site: Site; rule_exclusions: RuleExclusion[] }>(`/sites/${id}/exclusions/${ruleId}`, {
+        method: "DELETE",
       }),
     /** Returns the full site catalogue as a YAML string (Config-as-Code). */
     exportYaml: async (): Promise<string> => {
@@ -289,6 +403,33 @@ export const api = {
     resolve: (id: string) => apiFetch<{ ok: boolean }>(`/alerts/${id}/resolve`, { method: "POST" }),
   },
 
+  notifications: {
+    list: () => apiFetch<{ channels: NotificationChannel[] }>("/notifications/channels"),
+    create: (body: { name: string; type: ChannelType; config: ChannelConfig; min_severity?: Severity; enabled?: boolean }) =>
+      apiFetch<{ channel: NotificationChannel }>("/notifications/channels", {
+        method: "POST", body: JSON.stringify(body),
+      }),
+    update: (id: string, body: { name?: string; config?: ChannelConfig; min_severity?: Severity; enabled?: boolean }) =>
+      apiFetch<{ channel: NotificationChannel }>(`/notifications/channels/${id}`, {
+        method: "PUT", body: JSON.stringify(body),
+      }),
+    delete: (id: string) =>
+      apiFetch<{ ok: boolean }>(`/notifications/channels/${id}`, { method: "DELETE" }),
+    test: (id: string) =>
+      apiFetch<{ ok: boolean; message?: string }>(`/notifications/channels/${id}/test`, { method: "POST" }),
+  },
+
+  plugins: {
+    list: () => apiFetch<{ plugins: unknown[]; tenant_id: string }>("/plugins"),
+  },
+
+  cluster: {
+    status: () =>
+      apiFetch<{ enabled: boolean; leader?: string; status?: { node_id?: string; state?: string; peers?: unknown[] } }>(
+        "/cluster/status"
+      ),
+  },
+
   audit: {
     list: () => apiFetch<{ entries: AuditEntry[]; tenant_id: string }>("/audit"),
   },
@@ -300,9 +441,13 @@ export const api = {
 
   certs: {
     list: () => apiFetch<{ certs: Certificate[]; waf_running: boolean }>("/certs"),
-    uploadManual: (body: { domain: string; cert_pem: string; key_pem: string }) =>
+    uploadManual: (body: { domain: string; name?: string; cert_pem: string; key_pem: string }) =>
       apiFetch<{ installed: string }>("/certs/manual", {
         method: "POST", body: JSON.stringify(body),
+      }),
+    rename: (domain: string, name: string) =>
+      apiFetch<{ renamed: string; name: string }>(`/certs/${encodeURIComponent(domain)}`, {
+        method: "PATCH", body: JSON.stringify({ name }),
       }),
     requestAcme: (body: {
       domains: string[];
@@ -324,8 +469,44 @@ export const api = {
       }),
   },
 
+  events: {
+    /** ClickHouse reachability + row counts (drives the empty state). */
+    status: () => apiFetch<{ configured: boolean; reachable: boolean; events?: number; traffic_buckets?: number; error?: string }>("/events/status"),
+    /** Search waf_events with optional filters; from/to are unix seconds. */
+    search: (f: EventQuery) =>
+      apiFetch<{ events: WafEvent[]; clickhouse: boolean }>(`/events/search?${eventQS(f)}`),
+    timeline: (from?: number, to?: number, bucket = 60) =>
+      apiFetch<{ buckets: TimelineBucket[]; clickhouse: boolean }>(
+        `/events/timeline?${eventQS({ from, to })}&bucket=${bucket}`),
+    facets: (column: string, from?: number, to?: number, limit = 10) =>
+      apiFetch<{ facets: { key: string; count: number }[]; column: string; clickhouse: boolean }>(
+        `/events/facets?column=${encodeURIComponent(column)}&${eventQS({ from, to })}&limit=${limit}`),
+  },
+
+  geoip: {
+    /** Union of blocked ISO country codes across all sites. */
+    listBlocked: () => apiFetch<{ countries: string[] }>("/geoip/blocked"),
+    /** Block a country across all active sites (hot-applies in ~5s). */
+    block: (code: string) =>
+      apiFetch<{ ok: boolean; country: string; sites_changed: number; countries: string[] }>(
+        "/geoip/block", { method: "POST", body: JSON.stringify({ country: code }) }
+      ),
+    /** Remove a country block across all sites. */
+    unblock: (code: string) =>
+      apiFetch<{ ok: boolean; country: string; sites_changed: number; countries: string[] }>(
+        `/geoip/block/${encodeURIComponent(code)}`, { method: "DELETE" }
+      ),
+  },
+
   metrics: {
     snapshot: () => apiFetch<MetricsSnapshot>("/metrics/snapshot"),
+    sites: () => apiFetch<{ sites: Record<string, SiteStat> }>("/metrics/sites"),
+    /** Learning-mode would-have-blocked aggregation. Pass a site label to scope
+     *  it; omit for all sites. Rules sorted by detection count desc. */
+    learning: (site?: string) =>
+      apiFetch<{ site: string; rules: LearningStat[] }>(
+        `/metrics/learning${site ? `?site=${encodeURIComponent(site)}` : ""}`
+      ),
   },
 
   /** Returns the EventSource URL for the log stream (SSE).

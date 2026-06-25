@@ -8,8 +8,24 @@ import {
   type CertSource,
   type AcmeProvider,
   type AcmeChallenge,
+  type Site,
 } from "@/lib/api";
+import { certCoversHost } from "@/lib/siteConfig";
 import { staggerContainer, cardVariants, fadeUp } from "@/lib/animations";
+
+/** All names a cert presents (primary + SANs). */
+function certNames(c: Certificate): string[] {
+  return [c.domain, ...(c.san ?? [])].filter(Boolean);
+}
+/** Is this cert a wildcard? */
+function isWildcard(c: Certificate): boolean {
+  return certNames(c).some(n => n.startsWith("*."));
+}
+/** Configured sites this cert protects (exact or wildcard match on any domain). */
+function protectedSites(c: Certificate, sites: Site[]): Site[] {
+  const names = certNames(c);
+  return sites.filter(s => (s.domains ?? []).some(d => certCoversHost(names, d)));
+}
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -73,6 +89,7 @@ function lifeBar(c: Certificate) {
 
 export default function CertificatesPage() {
   const [certs, setCerts]   = useState<Certificate[]>([]);
+  const [sites, setSites]   = useState<Site[]>([]);
   const [loading, setLoading] = useState(true);
   const [wafUp, setWafUp]   = useState(true);
   const [busy, setBusy]     = useState<string | null>(null);
@@ -86,6 +103,7 @@ export default function CertificatesPage() {
 
   // Manual form
   const [manualDomain, setManualDomain] = useState("");
+  const [manualName, setManualName]     = useState("");
   const [manualCert, setManualCert]     = useState("");
   const [manualKey, setManualKey]       = useState("");
 
@@ -100,6 +118,7 @@ export default function CertificatesPage() {
     } finally {
       setLoading(false);
     }
+    try { const s = await api.sites.list(); setSites(s.sites ?? []); } catch { /* sites optional */ }
   }
 
   useEffect(() => { load(); }, []);
@@ -136,15 +155,29 @@ export default function CertificatesPage() {
       return showToast("Domain, certificate and key are all required", "e", "⚠️");
     setBusy("manual");
     try {
-      await api.certs.uploadManual({ domain: manualDomain, cert_pem: manualCert, key_pem: manualKey });
-      showToast(`Installed certificate for ${manualDomain}`, "s", "✅");
-      setManualDomain(""); setManualCert(""); setManualKey("");
+      await api.certs.uploadManual({ domain: manualDomain, name: manualName.trim(), cert_pem: manualCert, key_pem: manualKey });
+      showToast(`Installed certificate ${manualName.trim() || manualDomain}`, "s", "✅");
+      setManualDomain(""); setManualName(""); setManualCert(""); setManualKey("");
       load();
     } catch (e) {
       showToast(`Upload failed: ${(e as Error).message}`, "e", "⚠️");
     } finally {
       setBusy(null);
     }
+  }
+
+  async function rename(c: Certificate) {
+    const current = c.name ?? "";
+    const next = window.prompt(`Profile name for ${c.domain}`, current);
+    if (next === null || next.trim() === current) return;
+    setBusy(c.domain);
+    try {
+      await api.certs.rename(c.domain, next.trim());
+      showToast(`Renamed to "${next.trim() || c.domain}"`, "s", "🏷️");
+      load();
+    } catch (e) {
+      showToast(`Rename failed: ${(e as Error).message}`, "e", "⚠️");
+    } finally { setBusy(null); }
   }
 
   async function renew(domain: string) {
@@ -186,9 +219,9 @@ export default function CertificatesPage() {
     <motion.div className="sec" variants={staggerContainer} initial="hidden" animate="visible">
       <motion.div variants={fadeUp} style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 14 }}>
         <div>
-          <div className="sec-title">🔐 TLS Certificates</div>
+          <div className="sec-title">🔐 Certificate Repository</div>
           <div className="sec-sub">
-            Automatic SSL via ACME · manual upload · hot-swap rotation ·{" "}
+            Upload once, assign to many sites · wildcards cover every subdomain · ACME auto-renew · hot-swap ·{" "}
             {wafUp ? <span style={{ color: "var(--green)" }}>data plane online</span>
                    : <span style={{ color: "var(--amber)" }}>data plane offline</span>}
           </div>
@@ -257,11 +290,20 @@ export default function CertificatesPage() {
             <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
               <div style={{ fontSize: 12, color: "var(--text2)" }}>
                 Paste a PEM certificate chain and its private key. Installed instantly via hot-swap — no restart.
+                Once uploaded it lives in the repository and can be assigned to any matching site from the Add-Site wizard
+                (<strong>Front Service → From Repository</strong>) — no re-upload. Enter a <strong>wildcard</strong> like
+                <code style={{ color: "var(--cyan)" }}> *.company.com</code> to cover every subdomain with a single cert.
               </div>
-              <label style={{ display: "flex", flexDirection: "column", gap: 4, maxWidth: 360 }}>
-                <span className="td3">Domain</span>
-                <input className="fi2" placeholder="example.com" value={manualDomain} onChange={e => setManualDomain(e.target.value)} />
-              </label>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, maxWidth: 540 }}>
+                <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                  <span className="td3">Profile name (optional, e.g. &ldquo;Corp Wildcard 2026&rdquo;)</span>
+                  <input className="fi2" placeholder="Corp Wildcard" value={manualName} onChange={e => setManualName(e.target.value)} />
+                </label>
+                <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                  <span className="td3">Domain (use *.company.com for a wildcard)</span>
+                  <input className="fi2" placeholder="*.company.com" value={manualDomain} onChange={e => setManualDomain(e.target.value)} />
+                </label>
+              </div>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
                 <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                   <span className="td3">Certificate (PEM, full chain)</span>
@@ -298,17 +340,28 @@ export default function CertificatesPage() {
             </div>
           ) : (
             <table>
-              <thead><tr><th>Domain</th><th>Source</th><th>Status</th><th>Expiry</th><th>Lifetime</th><th>Actions</th></tr></thead>
+              <thead><tr><th>Domain</th><th>Protects</th><th>Source</th><th>Status</th><th>Expiry</th><th>Lifetime</th><th>Actions</th></tr></thead>
               <tbody>
                 {certs.map((c, idx) => {
                   const src = sourceLabel(c.source);
                   const st = statusOf(c);
                   const isAcme = typeof c.source === "object" && "acme" in c.source;
+                  const covered = protectedSites(c, sites);
                   return (
                     <motion.tr key={c.domain} initial={{ opacity: 0, x: -8 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: idx * 0.02 }}>
                       <td>
-                        <div style={{ fontWeight: 600 }}>{c.domain}</div>
-                        {c.san.length > 1 && <div className="td3" style={{ fontSize: 10 }}>+{c.san.length - 1} SAN</div>}
+                        <div style={{ fontWeight: 600, display: "flex", alignItems: "center", gap: 6 }}>
+                          {c.name ? c.name : c.domain}
+                          {isWildcard(c) && <span className="bdg bcy" title="Wildcard — covers all subdomains">✦ wildcard</span>}
+                        </div>
+                        <div className="td3" style={{ fontSize: 12 }}>
+                          {c.name ? c.domain : ""}{c.san.length > 1 ? `${c.name ? " · " : ""}+${c.san.length - 1} SAN` : ""}
+                        </div>
+                      </td>
+                      <td title={covered.map(s => s.name).join(", ")}>
+                        {covered.length === 0
+                          ? <span className="td3" style={{ fontSize: 12 }}>—</span>
+                          : <span className="bdg bgg">{covered.length} site{covered.length > 1 ? "s" : ""}</span>}
                       </td>
                       <td><span className={`bdg ${src.cls}`}><span className="bdr" />{src.text}</span></td>
                       <td><span className={`bdg ${st.cls}`}><span className="bdr" />{st.label}</span></td>
@@ -316,6 +369,9 @@ export default function CertificatesPage() {
                       <td style={{ minWidth: 150 }}>{lifeBar(c)}</td>
                       <td>
                         <div style={{ display: "flex", gap: 4 }}>
+                          <motion.button className="btn bg-btn btn-xs" disabled={busy === c.domain} whileHover={{ scale: 1.06 }} whileTap={{ scale: 0.95 }} onClick={() => rename(c)} title="Set profile name">
+                            🏷️ Rename
+                          </motion.button>
                           {isAcme && (
                             <motion.button className="btn bg-btn btn-xs" disabled={busy === c.domain} whileHover={{ scale: 1.06 }} whileTap={{ scale: 0.95 }} onClick={() => renew(c.domain)}>
                               {busy === c.domain ? "…" : "🔄 Renew"}

@@ -9,8 +9,8 @@ function formatMsg(text: string) {
   return text
     .replace(/\n/g, "<br>")
     .replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>")
-    .replace(/`(.*?)`/g, '<code style="background:rgba(255,255,255,.08);padding:1px 5px;border-radius:3px;font-size:10px">$1</code>')
-    .replace(/```([\s\S]*?)```/g, '<pre style="background:rgba(0,0,0,.3);padding:8px;border-radius:6px;font-size:10px;margin:5px 0;overflow-x:auto;white-space:pre-wrap">$1</pre>');
+    .replace(/`(.*?)`/g, '<code style="background:rgba(255,255,255,.08);padding:1px 5px;border-radius:3px;font-size:12px">$1</code>')
+    .replace(/```([\s\S]*?)```/g, '<pre style="background:rgba(0,0,0,.3);padding:8px;border-radius:6px;font-size:12px;margin:5px 0;overflow-x:auto;white-space:pre-wrap">$1</pre>');
 }
 
 const QUICK_LABELS: Record<string, string> = {
@@ -72,7 +72,7 @@ export default function CopilotFab({ variant = "login" }: { variant?: "login" | 
         <span className={variant === "dashboard" ? "cfab-ring" : "fab-ring"} />
         <span style={{ fontSize: 22 }}>🤖</span>
         {variant === "login" && <span className="fab-badge">AI</span>}
-        {variant === "login" && <span style={{ position: "absolute", right: 62, top: "50%", transform: "translateY(-50%)", background: "rgba(20,12,38,.96)", backdropFilter: "blur(8px)", border: "1px solid rgba(124,47,191,.4)", borderRadius: 20, padding: "5px 12px", fontSize: 10, fontFamily: "'Share Tech Mono',monospace", color: "#fff", whiteSpace: "nowrap", opacity: 0, pointerEvents: "none" }} className="fab-tip">Sentinel AI Copilot</span>}
+        {variant === "login" && <span style={{ position: "absolute", right: 62, top: "50%", transform: "translateY(-50%)", background: "rgba(20,12,38,.96)", backdropFilter: "blur(8px)", border: "1px solid rgba(124,47,191,.4)", borderRadius: 20, padding: "5px 12px", fontSize: 12, fontFamily: "'Share Tech Mono',monospace", color: "#fff", whiteSpace: "nowrap", opacity: 0, pointerEvents: "none" }} className="fab-tip">Sentinel AI Copilot</span>}
       </motion.button>
 
       <AnimatePresence>
