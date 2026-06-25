@@ -77,6 +77,7 @@ impl CertManager {
         let primary = domains.first().cloned().unwrap_or_default();
         let meta = CertMeta {
             domain: primary.clone(),
+            name: String::new(),
             san: domains,
             issued_at: unix_now(),
             expires_at,
@@ -90,10 +91,12 @@ impl CertManager {
     }
 
     /// Upload a PEM cert + key that the operator provides manually.
-    pub fn install_manual(&self, domain: &str, cert_pem: &str, key_pem: &str) -> Result<()> {
+    /// `name` is an optional friendly profile label (empty = use domain).
+    pub fn install_manual(&self, domain: &str, name: &str, cert_pem: &str, key_pem: &str) -> Result<()> {
         let expires_at = parse_expiry(cert_pem).unwrap_or(unix_now() + 90 * 86_400);
         let meta = CertMeta {
             domain: domain.to_string(),
+            name: name.to_string(),
             san: vec![domain.to_string()],
             issued_at: unix_now(),
             expires_at,

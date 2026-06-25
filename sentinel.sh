@@ -38,6 +38,10 @@ CP_URL="http://localhost:$CP_REST"
 DASH_LOG=/tmp/sentinel-dashboard.log
 CP_LOG=/tmp/sentinel-controlplane.log
 WAF_LOG=/tmp/sentinel-waf.log
+# NDJSON access/waf logs go to REAL DISK (not /tmp — that's tmpfs/RAM and would
+# OOM the host under sustained traffic). Writer (proxy) + reader (hub) share it.
+SENTINEL_LOG_DIR="${SENTINEL_LOG_DIR:-$HOME/.local/share/sentinel/logs}"
+export SENTINEL_LOG_DIR
 # Prefer the optimized release build (lower RAM, faster); fall back to debug.
 if [[ -f "$REPO/target/release/sentinel-bin" ]]; then
   WAF_BIN="$REPO/target/release/sentinel-bin"
@@ -154,7 +158,7 @@ _build_dash() {
 # ── Start helpers ─────────────────────────────────────────────────────────────
 _start_cp() {
   info "Starting control plane…"
-  mkdir -p /tmp/sentinel-logs
+  mkdir -p "$SENTINEL_LOG_DIR"
   # This launcher manages the WAF proxy itself (see _start_proxy), so tell the
   # control plane NOT to spawn a second proxy — avoids a duplicate data plane.
   SENTINEL_AUTOSTART_DATAPLANE=0 \
@@ -170,9 +174,9 @@ _start_proxy() {
     return
   fi
   info "Starting WAF proxy…"
-  mkdir -p /tmp/sentinel-logs
+  mkdir -p "$SENTINEL_LOG_DIR"
   SENTINEL_CONFIG="$WAF_CONFIG" \
-  SENTINEL_LOG_DIR=/tmp/sentinel-logs \
+  SENTINEL_LOG_DIR="$SENTINEL_LOG_DIR" \
   RUST_LOG=info,sentinel=debug \
   nohup "$WAF_BIN" > "$WAF_LOG" 2>&1 &
   disown

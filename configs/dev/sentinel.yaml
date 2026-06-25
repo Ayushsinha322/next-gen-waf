@@ -208,3 +208,8 @@ logging:
 
 storage:
   cache: { backend: memory, size: 64MB }
+  timeseries:
+    url: "http://127.0.0.1:8123"
+    database: "sentinel_logs"
+    username: "sentinel"
+    password: "sentinel_dev"

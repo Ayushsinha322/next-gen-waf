@@ -22,6 +22,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CertMeta {
     pub domain: String,
+    /// Operator-assigned friendly name / profile label (empty = use domain).
+    #[serde(default)]
+    pub name: String,
     pub san: Vec<String>,
     /// UNIX timestamp of issuance.
     pub issued_at: u64,
@@ -118,6 +121,7 @@ impl CertStore {
                 let domain = entry.file_name().to_string_lossy().replace("_wildcard_", "*");
                 CertMeta {
                     domain: domain.clone(),
+                    name: String::new(),
                     san: vec![domain],
                     issued_at: 0,
                     expires_at: 0,
@@ -174,6 +178,27 @@ impl CertStore {
         if dir.exists() {
             std::fs::remove_dir_all(&dir)?;
         }
+        Ok(())
+    }
+
+    /// Set the operator-assigned friendly name (profile label) for a cert.
+    /// Updates the persisted meta.json and hot-swaps the live entry's metadata
+    /// (reloads the existing PEM so the served key is unchanged).
+    pub fn set_name(&self, domain: &str, name: &str) -> Result<()> {
+        let dir = self.cert_dir.join(domain_to_dirname(domain));
+        let meta_file = dir.join("meta.json");
+        let mut meta: CertMeta = serde_json::from_str(
+            &std::fs::read_to_string(&meta_file)
+                .with_context(|| format!("no metadata for cert '{domain}'"))?,
+        )?;
+        meta.name = name.to_string();
+        std::fs::write(&meta_file, serde_json::to_string_pretty(&meta)?)?;
+
+        let cert_pem = std::fs::read_to_string(dir.join("cert.pem"))?;
+        let key_pem = std::fs::read_to_string(dir.join("key.pem"))?;
+        let ck = load_pem_bytes(cert_pem.as_bytes(), key_pem.as_bytes())
+            .context("reloading cert after rename")?;
+        self.live.insert(domain.to_string(), Arc::new(CertEntry { key: ck, meta }));
         Ok(())
     }
 

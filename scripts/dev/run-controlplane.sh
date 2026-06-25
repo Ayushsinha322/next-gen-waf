@@ -12,7 +12,7 @@ export SENTINEL_CLICKHOUSE_URL="${SENTINEL_CLICKHOUSE_URL:-http://sentinel:senti
 export SENTINEL_S3_ENDPOINT="${SENTINEL_S3_ENDPOINT:-http://localhost:9002}"
 export OTEL_EXPORTER_OTLP_ENDPOINT="${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4317}"
 export SENTINEL_LOG_LEVEL="${SENTINEL_LOG_LEVEL:-debug}"
-export SENTINEL_LOG_DIR="${SENTINEL_LOG_DIR:-/tmp/sentinel-logs}"
+export SENTINEL_LOG_DIR="${SENTINEL_LOG_DIR:-$HOME/.local/share/sentinel/logs}"  # real disk, NOT tmpfs
 export SENTINEL_CONFIG="${SENTINEL_CONFIG:-$REPO_ROOT/configs/dev/sentinel.yaml}"
 
 # Point autoStartDataPlane at the correct binary path.

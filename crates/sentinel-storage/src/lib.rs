@@ -34,7 +34,7 @@ pub mod error;
 pub mod memory;
 pub mod redis;
 
-pub use clickhouse::{ClickHouseClient, TrafficRow};
+pub use clickhouse::{ClickHouseClient, TrafficRow, WafEventRow};
 pub use error::StorageError;
 pub use memory::MemoryStore;
 pub use redis::RedisClient;
@@ -57,8 +57,12 @@ pub struct StorageBackendConfig {
     pub redis_url: Option<String>,
     /// ClickHouse HTTP URL, e.g. `http://127.0.0.1:8123`.  `None` → CH disabled.
     pub clickhouse_url: Option<String>,
-    /// ClickHouse database name. Defaults to `"sentinel"` when `None`.
+    /// ClickHouse database name. Defaults to `"sentinel_logs"` when `None`.
     pub clickhouse_db: Option<String>,
+    /// ClickHouse username (access-management auth).
+    pub clickhouse_user: Option<String>,
+    /// ClickHouse password.
+    pub clickhouse_password: Option<String>,
 }
 
 impl StorageBackendConfig {
@@ -77,11 +81,15 @@ impl StorageBackendConfig {
 
         let clickhouse_url = cfg.timeseries.as_ref().map(|ts| ts.url.clone());
         let clickhouse_db = cfg.timeseries.as_ref().map(|ts| ts.database.clone());
+        let clickhouse_user = cfg.timeseries.as_ref().and_then(|ts| ts.username.clone());
+        let clickhouse_password = cfg.timeseries.as_ref().and_then(|ts| ts.password.clone());
 
         Self {
             redis_url,
             clickhouse_url,
             clickhouse_db,
+            clickhouse_user,
+            clickhouse_password,
         }
     }
 }
@@ -140,8 +148,12 @@ impl StorageHandle {
 
         // --- ClickHouse ------------------------------------------------------
         if let Some(url) = &cfg.clickhouse_url {
-            let db = cfg.clickhouse_db.as_deref().unwrap_or("sentinel");
-            let client = ClickHouseClient::new(url, db);
+            let db = cfg.clickhouse_db.as_deref().unwrap_or("sentinel_logs");
+            let client = ClickHouseClient::with_auth(
+                url, db,
+                cfg.clickhouse_user.clone(),
+                cfg.clickhouse_password.clone(),
+            );
             match client.ping().await {
                 Ok(()) => match client.ensure_schema().await {
                     Ok(()) => {
@@ -241,6 +253,8 @@ mod tests {
             timeseries: Some(TimeSeriesConfig {
                 url: "http://ch:8123".into(),
                 database: "mydb".into(),
+                username: None,
+                password: None,
             }),
             ..Default::default()
         };

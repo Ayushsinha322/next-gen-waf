@@ -25,6 +25,7 @@
 pub mod upstream;
 pub mod websocket;
 pub mod tls;
+pub mod challenge;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -396,6 +397,58 @@ impl ProxyServer {
             info!("rate limiting: distributed mode (Redis backend active)");
         } else {
             info!("rate limiting: in-memory mode (no Redis backend)");
+        }
+
+        // Guardrail: refuse to silently fill RAM. /tmp and /dev/shm are tmpfs on
+        // most distros, so high-volume NDJSON logs there would OOM the host.
+        {
+            let ld = resolve_log_dir();
+            let lds = ld.to_string_lossy();
+            if lds.starts_with("/tmp") || lds.starts_with("/dev/shm") {
+                warn!(
+                    log_dir = %lds,
+                    "log directory is on tmpfs (RAM) — logs can exhaust memory under load; \
+                     set SENTINEL_LOG_DIR to a real-disk path (e.g. /var/log/sentinel)"
+                );
+            } else {
+                info!(log_dir = %lds, "ndjson logs (rotating) → real disk");
+            }
+        }
+
+        // ClickHouse traffic flusher: snapshot the per-second accumulator every
+        // second and bulk-insert every 5s (or 500 rows). Async + drop-on-error
+        // so logging never blocks or grows unbounded if ClickHouse is down.
+        if let Some(ch) = storage.clickhouse.clone() {
+            tokio::spawn(async move {
+                let mut buf: Vec<sentinel_storage::TrafficRow> = Vec::new();
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+                let mut ticks = 0u32;
+                loop {
+                    ticker.tick().await;
+                    buf.extend(drain_traffic(unix_now()));
+                    ticks += 1;
+                    if (ticks >= 5 || buf.len() >= 500) && !buf.is_empty() {
+                        if let Err(e) = ch.insert_traffic_batch(&buf).await {
+                            warn!(error = %e, rows = buf.len(), "clickhouse traffic flush failed — dropping batch");
+                        } else {
+                            debug!(rows = buf.len(), "clickhouse traffic flushed");
+                        }
+                        buf.clear(); // bounded: drop after every attempt
+                        ticks = 0;
+                    }
+
+                    // Flush detailed events on the same cadence.
+                    let events = drain_events();
+                    if !events.is_empty() {
+                        if let Err(e) = ch.insert_events_batch(&events).await {
+                            warn!(error = %e, rows = events.len(), "clickhouse events flush failed — dropping batch");
+                        } else {
+                            debug!(rows = events.len(), "clickhouse events flushed");
+                        }
+                    }
+                }
+            });
+            info!("clickhouse traffic flusher started (1s sample · 5s flush → traffic_buckets)");
         }
 
         let modules = Arc::new(ModulesState {
@@ -1103,7 +1156,17 @@ async fn proxy(
         phase1_headers(&mut ctx, site, &engine_map, &state.modules, &pr).await?;
     }
 
-    if ctx.decision == WafDecision::Block || ctx.decision == WafDecision::Challenge {
+    // Browser challenge (Proof-of-Work) — serve an interstitial or, if the
+    // client already solved it, grant clearance and bounce back.
+    if ctx.decision == WafDecision::Challenge {
+        let resp = challenge_response(&ctx);
+        ctx.response_status = Some(resp.status());
+        ctx.advance_phase(Phase::Logging);
+        log_request(&ctx);
+        return Ok(resp);
+    }
+
+    if ctx.decision == WafDecision::Block {
         state.modules.correlation.record_block(ctx.client_ip);
         let resp = if ctx
             .block_reason
@@ -1467,7 +1530,11 @@ async fn phase1_headers(
                 BotVerdict::SuspiciousBot => {
                     ctx.tx_vars.insert("bot_suspicious".to_string(), "1".to_string());
                     ctx.anomaly_score = ctx.anomaly_score.saturating_add(2);
-                    if bot_cfg.challenge != ChallengeMode::Off {
+                    // Skip the challenge entirely if the client already solved one
+                    // (valid, unexpired clearance cookie bound to its IP).
+                    if bot_cfg.challenge != ChallengeMode::Off
+                        && !crate::challenge::clearance_valid(&ctx.request_headers, ctx.client_ip)
+                    {
                         ctx.decision = WafDecision::Challenge;
                         ctx.block_reason =
                             Some("suspicious bot UA — browser challenge required".to_string());
@@ -1647,7 +1714,10 @@ fn enforce_mode(ctx: &mut RequestContext, mode: &WafMode) {
         && (ctx.decision == WafDecision::Block || ctx.decision == WafDecision::Challenge)
     {
         ctx.decision = WafDecision::Log;
-        ctx.block_reason = None;
+        // Record the would-have-blocked signal for the learning report. We keep
+        // `block_reason` so the report can explain *why* the rule would fire;
+        // the downgraded decision (Log) means traffic still passes through.
+        ctx.would_block = true;
     }
 }
 
@@ -1805,9 +1875,32 @@ fn load_site_engine(site: &SiteConfig) -> anyhow::Result<RuleEngine> {
         );
     }
 
+    // Whole-rule exclusions (disable). Applied first so a disabled rule is gone
+    // regardless of any target-level entry for the same ID.
+    let disabled_ids: std::collections::HashSet<u32> = site
+        .waf
+        .rule_exclusions
+        .iter()
+        .filter(|e| e.disable)
+        .map(|e| e.rule_id)
+        .collect();
+    if !disabled_ids.is_empty() {
+        let before = merged.items.len();
+        merged.items.retain(|item| match item {
+            RuleItem::Rule(rule) => !disabled_ids.contains(&rule.id),
+            _ => true,
+        });
+        debug!(
+            site = %site.id,
+            removed = before - merged.items.len(),
+            disabled_ids = ?disabled_ids,
+            "whole-rule exclusions applied"
+        );
+    }
+
     // Rule target exclusions.
     for exclusion in &site.waf.rule_exclusions {
-        if exclusion.exclude_targets.is_empty() {
+        if exclusion.disable || exclusion.exclude_targets.is_empty() {
             continue;
         }
         let excl_upper: Vec<String> = exclusion
@@ -2031,6 +2124,37 @@ fn inject_security_headers(headers: &mut http::HeaderMap) {
     insert(headers, "permissions-policy", "geolocation=(), microphone=(), camera=()");
 }
 
+/// Build the HTTP response for a `Challenge` decision: either the interstitial
+/// Proof-of-Work page, or (when the client submitted a valid proof) a 302 that
+/// sets the clearance cookie and bounces back to the original URL.
+fn challenge_response(ctx: &RequestContext) -> Response<BoxBody> {
+    match challenge::resolve(&ctx.request_headers, ctx.client_ip, &ctx.uri) {
+        challenge::Outcome::Grant { location, set_cookie, expire_pow } => Response::builder()
+            .status(StatusCode::FOUND)
+            .header(header::LOCATION, location)
+            .header(header::SET_COOKIE, set_cookie)
+            .header(header::SET_COOKIE, expire_pow)
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(
+                Full::new(Bytes::new())
+                    .map_err(|never: Infallible| match never {})
+                    .boxed(),
+            )
+            .unwrap(),
+        challenge::Outcome::Serve { html } => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .header(header::CACHE_CONTROL, "no-store")
+            .header("X-Sentinel-Challenge", "pow")
+            .body(
+                Full::new(Bytes::from(html))
+                    .map_err(|never: Infallible| match never {})
+                    .boxed(),
+            )
+            .unwrap(),
+    }
+}
+
 fn block_response(ctx: &RequestContext) -> Response<BoxBody> {
     let reason = ctx
         .block_reason
@@ -2096,11 +2220,13 @@ async fn handle_internal_cert_api(
         Err(e) => return json_err(StatusCode::BAD_REQUEST, &format!("body read failed: {e}")),
     };
 
-    // POST /api/v1/internal/certs/manual  { domain, cert_pem, key_pem }
+    // POST /api/v1/internal/certs/manual  { domain, name?, cert_pem, key_pem }
     if method == hyper::Method::POST && path == "/api/v1/internal/certs/manual" {
         #[derive(serde::Deserialize)]
         struct ManualReq {
             domain: String,
+            #[serde(default)]
+            name: String,
             cert_pem: String,
             key_pem: String,
         }
@@ -2110,11 +2236,28 @@ async fn handle_internal_cert_api(
         };
         return match state
             .cert_manager
-            .install_manual(&r.domain, &r.cert_pem, &r.key_pem)
+            .install_manual(&r.domain, &r.name, &r.cert_pem, &r.key_pem)
         {
             Ok(()) => json_ok(serde_json::json!({"installed": r.domain})),
             Err(e) => json_err(StatusCode::BAD_REQUEST, &format!("{e:#}")),
         };
+    }
+
+    // PATCH /api/v1/internal/certs/{domain}  { name }  — set friendly profile name
+    if method == hyper::Method::PATCH {
+        if let Some(rest) = path.strip_prefix("/api/v1/internal/certs/") {
+            let domain = rest.trim_end_matches('/');
+            #[derive(serde::Deserialize)]
+            struct RenameReq { name: String }
+            let r: RenameReq = match serde_json::from_slice(&body_bytes) {
+                Ok(r) => r,
+                Err(e) => return json_err(StatusCode::BAD_REQUEST, &format!("invalid JSON: {e}")),
+            };
+            return match state.cert_manager.store.set_name(domain, &r.name) {
+                Ok(()) => json_ok(serde_json::json!({"renamed": domain, "name": r.name})),
+                Err(e) => json_err(StatusCode::BAD_REQUEST, &format!("{e:#}")),
+            };
+        }
     }
 
     // POST /api/v1/internal/certs/acme  { domains:[..], email, provider, challenge, renew_before_days? }
@@ -2286,19 +2429,195 @@ fn log_request(ctx: &RequestContext) {
     if let Err(e) = ndjson_log(ctx) {
         tracing::warn!(error = %e, "ndjson log write failed");
     }
+
+    // Feed the per-second traffic accumulator (drained by the ClickHouse
+    // flusher, when ClickHouse is configured). Cheap; no-op when CH is off.
+    let blocked = matches!(ctx.decision, WafDecision::Block | WafDecision::Challenge);
+    record_traffic(ctx.site_id.as_deref().unwrap_or("-"), blocked, ctx.elapsed_ms());
+    record_event(ctx);
+}
+
+// ---------------------------------------------------------------------------
+// Per-second traffic accumulator → ClickHouse traffic_buckets
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct SiteAccum {
+    reqs: u64,
+    blocked: u64,
+    lat: Vec<f64>,
+}
+
+static TRAFFIC_ACC: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, SiteAccum>>> =
+    std::sync::OnceLock::new();
+
+fn traffic_acc() -> &'static std::sync::Mutex<std::collections::HashMap<String, SiteAccum>> {
+    TRAFFIC_ACC.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Record one request into the current second's tally. Latency samples are
+/// capped per-site to bound memory under floods.
+fn record_traffic(site: &str, blocked: bool, latency_ms: f64) {
+    if let Ok(mut m) = traffic_acc().lock() {
+        let e = m.entry(site.to_string()).or_default();
+        e.reqs += 1;
+        if blocked {
+            e.blocked += 1;
+        }
+        if latency_ms > 0.0 && e.lat.len() < 4096 {
+            e.lat.push(latency_ms);
+        }
+    }
+}
+
+/// Drain the accumulator into one TrafficRow per site, stamped with `ts`.
+fn drain_traffic(ts: i64) -> Vec<sentinel_storage::TrafficRow> {
+    let mut m = match traffic_acc().lock() {
+        Ok(m) => m,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::with_capacity(m.len());
+    for (site, mut a) in m.drain() {
+        a.lat.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+        let p99 = if a.lat.is_empty() {
+            0.0
+        } else {
+            let idx = (((a.lat.len() as f64) * 0.99).ceil() as usize).saturating_sub(1);
+            a.lat[idx.min(a.lat.len() - 1)]
+        };
+        out.push(sentinel_storage::TrafficRow {
+            ts,
+            site_id: site,
+            reqs: a.reqs as i64,
+            blocked: a.blocked as i64,
+            p99_ms: p99,
+        });
+    }
+    out
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+// --- Detailed event buffer → ClickHouse waf_events ---
+
+static WAF_EVENTS: std::sync::OnceLock<std::sync::Mutex<Vec<sentinel_storage::WafEventRow>>> =
+    std::sync::OnceLock::new();
+
+fn waf_events() -> &'static std::sync::Mutex<Vec<sentinel_storage::WafEventRow>> {
+    WAF_EVENTS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Buffer one notable event (block or learning DETECT) for ClickHouse. Plain
+/// passes are skipped to keep volume sane. Buffer is capped to bound memory if
+/// ClickHouse is down/slow.
+fn record_event(ctx: &RequestContext) {
+    let action = match ctx.decision {
+        WafDecision::Block | WafDecision::Challenge => "BLOCK",
+        _ if ctx.would_block => "DETECT",
+        _ => return, // not notable — don't store
+    };
+    let top = ctx.rule_matches.first();
+    let row = sentinel_storage::WafEventRow {
+        ts: unix_now(),
+        ip: ctx.client_ip.to_string(),
+        country: String::new(), // populated once GeoIP is loaded
+        site: ctx.site_id.clone().unwrap_or_else(|| "-".to_string()),
+        method: ctx.method.as_str().to_string(),
+        path: ctx.uri.path().to_string(),
+        rule: top.map(|r| r.rule_id.clone()).unwrap_or_default(),
+        attack: top.map(|r| r.message.clone()).unwrap_or_default(),
+        action: action.to_string(),
+        severity: top.map(|r| format!("{:?}", r.severity).to_uppercase()).unwrap_or_default(),
+        score: ctx.anomaly_score,
+        status: ctx.response_status.map(|s| s.as_u16()).unwrap_or(0),
+    };
+    if let Ok(mut buf) = waf_events().lock() {
+        if buf.len() < 20_000 {
+            buf.push(row);
+        }
+    }
+}
+
+/// Drain up to all buffered events for flushing.
+fn drain_events() -> Vec<sentinel_storage::WafEventRow> {
+    match waf_events().lock() {
+        Ok(mut buf) => std::mem::take(&mut *buf),
+        Err(_) => Vec::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------
 // NDJSON file logger
 // ---------------------------------------------------------------------------
 
-fn ndjson_log(ctx: &RequestContext) -> std::io::Result<()> {
-    use std::fs::OpenOptions;
+/// Resolve the NDJSON log directory. Order: `SENTINEL_LOG_DIR` env →
+/// `$HOME/.local/share/sentinel/logs` (real disk, no root) → `/var/log/sentinel`.
+/// Deliberately NOT `/tmp` — that is tmpfs (RAM) on most distros and would let
+/// logs exhaust memory under sustained load.
+fn resolve_log_dir() -> std::path::PathBuf {
+    if let Ok(d) = std::env::var("SENTINEL_LOG_DIR") {
+        if !d.is_empty() {
+            return std::path::PathBuf::from(d);
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            return std::path::PathBuf::from(home).join(".local/share/sentinel/logs");
+        }
+    }
+    std::path::PathBuf::from("/var/log/sentinel")
+}
+
+/// Append a line to `dir/name`, rotating first if the file would exceed the
+/// configured size cap. Rotation shifts `name.{k-1}` → `name.k` (dropping the
+/// oldest) and `name` → `name.1`, then writes to a fresh file. Bounds total
+/// on-disk log size to `max_bytes * (keep + 1)` per stream.
+fn append_rotating(dir: &std::path::Path, name: &str, line: &str) -> std::io::Result<()> {
+    use std::fs::{self, OpenOptions};
     use std::io::Write;
 
-    let log_dir = std::env::var("SENTINEL_LOG_DIR")
-        .unwrap_or_else(|_| "/tmp/sentinel-logs".to_string());
-    let dir = std::path::Path::new(&log_dir);
+    let max_bytes = std::env::var("SENTINEL_LOG_MAX_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(100)
+        .saturating_mul(1024 * 1024);
+    let keep = std::env::var("SENTINEL_LOG_KEEP")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(5);
+
+    let path = dir.join(name);
+    // Rotate when the existing file plus this line would exceed the cap.
+    if max_bytes > 0 {
+        if let Ok(meta) = fs::metadata(&path) {
+            if meta.len().saturating_add(line.len() as u64 + 1) > max_bytes {
+                // Drop the oldest, shift the rest up.
+                let oldest = dir.join(format!("{name}.{keep}"));
+                let _ = fs::remove_file(&oldest);
+                for i in (1..keep).rev() {
+                    let from = dir.join(format!("{name}.{i}"));
+                    let to = dir.join(format!("{name}.{}", i + 1));
+                    if from.exists() {
+                        let _ = fs::rename(&from, &to);
+                    }
+                }
+                let _ = fs::rename(&path, dir.join(format!("{name}.1")));
+            }
+        }
+    }
+
+    let mut f = OpenOptions::new().append(true).create(true).open(&path)?;
+    writeln!(f, "{line}")
+}
+
+fn ndjson_log(ctx: &RequestContext) -> std::io::Result<()> {
+    let dir = resolve_log_dir();
+    let dir = dir.as_path();
     std::fs::create_dir_all(dir)?;
 
     let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
@@ -2310,6 +2629,9 @@ fn ndjson_log(ctx: &RequestContext) -> std::io::Result<()> {
         .unwrap_or("-");
     let action = match ctx.decision {
         WafDecision::Block | WafDecision::Challenge => "BLOCK",
+        // Learning mode: the request passed through, but a rule *would* have
+        // blocked it. Marked distinctly so the learning report can aggregate it.
+        _ if ctx.would_block => "DETECT",
         _ => "PASS",
     };
     let site = ctx.site_id.as_deref().unwrap_or("-");
@@ -2327,13 +2649,7 @@ fn ndjson_log(ctx: &RequestContext) -> std::io::Result<()> {
         "action":  action,
         "score":   ctx.anomaly_score,
     });
-    {
-        let mut f = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(dir.join("access.log"))?;
-        writeln!(f, "{}", access)?;
-    }
+    append_rotating(dir, "access.log", &access.to_string())?;
 
     if !ctx.rule_matches.is_empty() || matches!(ctx.decision, WafDecision::Block) {
         let top = ctx.rule_matches.first();
@@ -2356,13 +2672,10 @@ fn ndjson_log(ctx: &RequestContext) -> std::io::Result<()> {
             "action": action,
             "site":   site,
             "msg":    ctx.block_reason.as_deref().unwrap_or(""),
+            "would_block": ctx.would_block,
             "ml_scores": ctx.ml_scores,
         });
-        let mut f = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(dir.join("waf.log"))?;
-        writeln!(f, "{}", waf)?;
+        append_rotating(dir, "waf.log", &waf.to_string())?;
     }
 
     Ok(())
@@ -2403,4 +2716,41 @@ fn build_tls_acceptor(tls: &sentinel_core::config::TlsFileConfig) -> anyhow::Res
     server_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     Ok(TlsAcceptor::from(Arc::new(server_cfg)))
+}
+
+#[cfg(test)]
+mod log_rotation_tests {
+    use super::*;
+
+    #[test]
+    fn append_rotating_caps_size_and_prunes_backups() {
+        let dir = std::env::temp_dir().join(format!("sentinel-rot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 1 MB cap, keep 2 backups.
+        std::env::set_var("SENTINEL_LOG_MAX_MB", "1");
+        std::env::set_var("SENTINEL_LOG_KEEP", "2");
+
+        // ~10 KB lines; ~3.4 MB total → forces several rotations.
+        let line = "x".repeat(10_000);
+        for _ in 0..340 {
+            append_rotating(&dir, "access.log", &line).unwrap();
+        }
+
+        let live = dir.join("access.log");
+        assert!(live.exists(), "live log must exist");
+        assert!(
+            std::fs::metadata(&live).unwrap().len() <= 1024 * 1024,
+            "live log must stay under the 1MB cap"
+        );
+        // Backups are bounded to keep=2: .1 and .2 exist, .3 must be pruned.
+        assert!(dir.join("access.log.1").exists(), "expected access.log.1");
+        assert!(dir.join("access.log.2").exists(), "expected access.log.2");
+        assert!(!dir.join("access.log.3").exists(), "keep=2 must drop access.log.3");
+
+        std::env::remove_var("SENTINEL_LOG_MAX_MB");
+        std::env::remove_var("SENTINEL_LOG_KEEP");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

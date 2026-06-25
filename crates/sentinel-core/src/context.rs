@@ -124,6 +124,11 @@ pub struct RequestContext {
     pub decision: WafDecision,
     /// Human-readable reason for a Block/Challenge decision.
     pub block_reason: Option<String>,
+    /// True when the WAF *would* have blocked/challenged this request but the
+    /// site is in Learning mode, so the decision was downgraded to Log. Drives
+    /// the learning report (would-have-blocked aggregation) without affecting
+    /// traffic. The reason that triggered it is retained in `block_reason`.
+    pub would_block: bool,
 
     // --- Upstream / response ---
     pub upstream_addr: Option<std::net::SocketAddr>,
@@ -161,6 +166,7 @@ impl RequestContext {
             tx_vars: HashMap::new(),
             decision: WafDecision::Allow,
             block_reason: None,
+            would_block: false,
             upstream_addr: None,
             upstream_latency_us: None,
             response_status: None,

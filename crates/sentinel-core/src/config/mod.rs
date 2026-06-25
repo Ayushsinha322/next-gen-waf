@@ -379,13 +379,18 @@ pub struct WafConfig {
 }
 
 /// Removes one or more targets from a rule to suppress known false positives.
-/// Mirrors the CRS `ctl:ruleRemoveTargetById` mechanism.
+/// Mirrors the CRS `ctl:ruleRemoveTargetById` mechanism. When `disable` is set
+/// the whole rule is dropped (CRS `SecRuleRemoveById`) — used by the learning
+/// report's one-click "disable rule" tuning action for a confirmed false positive.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RuleExclusion {
     pub rule_id: u32,
     /// Target names to exclude, e.g. `["ARGS_NAMES"]`.
     #[serde(default)]
     pub exclude_targets: Vec<String>,
+    /// Drop the entire rule rather than only specific targets.
+    #[serde(default)]
+    pub disable: bool,
 }
 
 fn default_max_body_size() -> u64 {
@@ -492,11 +497,12 @@ pub struct BotDetectionConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum ChallengeMode {
     #[default]
     Off,
     NativePow,
+    Recaptcha,
     Hcaptcha,
     Turnstile,
 }
@@ -671,13 +677,20 @@ pub struct StorageConfig {
 pub struct TimeSeriesConfig {
     /// HTTP endpoint, e.g. `http://127.0.0.1:8123`.
     pub url: String,
-    /// Database name (default: `sentinel`).
+    /// Database name (default: `sentinel_logs`).
     #[serde(default = "default_ts_database")]
     pub database: String,
+    /// ClickHouse username (sent as `X-ClickHouse-User`). Required when the
+    /// server has access-management enabled.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// ClickHouse password (sent as `X-ClickHouse-Key`).
+    #[serde(default)]
+    pub password: Option<String>,
 }
 
 fn default_ts_database() -> String {
-    "sentinel".to_string()
+    "sentinel_logs".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

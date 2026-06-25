@@ -3,12 +3,12 @@
 # Proxies:
 #   dvwa.local   → 127.0.0.1:9095  (DVWA)
 #   juice.local  → 127.0.0.1:3000  (OWASP Juice Shop)
-# Logs → /tmp/sentinel-logs/*.log  (picked up by control-plane SSE hub)
+# Logs → $HOME/.local/share/sentinel/logs/*.log  (picked up by control-plane SSE hub)
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 export SENTINEL_CONFIG="${SENTINEL_CONFIG:-configs/dev/sentinel.yaml}"
-export SENTINEL_LOG_DIR="${SENTINEL_LOG_DIR:-/tmp/sentinel-logs}"
+export SENTINEL_LOG_DIR="${SENTINEL_LOG_DIR:-$HOME/.local/share/sentinel/logs}"  # real disk, NOT tmpfs
 export OTEL_EXPORTER_OTLP_ENDPOINT="${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4317}"
 export RUST_LOG="${RUST_LOG:-info,sentinel=debug}"
 export RUST_BACKTRACE=1
