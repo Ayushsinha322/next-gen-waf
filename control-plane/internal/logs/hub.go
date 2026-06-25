@@ -37,7 +37,54 @@ type Snapshot struct {
 	ErrorCount       int64   `json:"error_count"`
 	EbpfDrops        int64   `json:"ebpf_drops"`
 	ConnectedClients int     `json:"connected_clients"`
+
+	// Derived aggregates (all real — computed from the proxy NDJSON stream).
+	UniqueBlockedIPs int64 `json:"unique_blocked_ips"`
+	Status2xx        int64 `json:"status_2xx"`
+	Status3xx        int64 `json:"status_3xx"`
+	Status4xx        int64 `json:"status_4xx"`
+	Status5xx        int64 `json:"status_5xx"`
+	// AttackBreakdown maps an attack category (sqli, xss, rfi_lfi, rce, …) to
+	// the number of waf.log events that matched a rule in that category.
+	AttackBreakdown map[string]int64 `json:"attack_breakdown"`
+	// ByCountry maps an ISO-3166-1 alpha-2 code to blocked-request count.
+	// Empty until a GeoIP database is loaded (geoip_loaded=false) — never faked.
+	ByCountry    map[string]int64 `json:"by_country"`
+	GeoIPLoaded  bool             `json:"geoip_loaded"`
+
+	// Host resource usage (Linux /proc/meminfo; zero when unavailable).
+	MemUsedBytes  uint64 `json:"mem_used_bytes"`
+	MemTotalBytes uint64 `json:"mem_total_bytes"`
 }
+
+// SiteStat is a cumulative per-site request/block counter, derived from the
+// proxy NDJSON stream (real — not simulated when the data plane is running).
+type SiteStat struct {
+	Total   int64 `json:"total"`
+	Blocked int64 `json:"blocked"`
+	S4xx    int64 `json:"status_4xx"`
+	S5xx    int64 `json:"status_5xx"`
+}
+
+// LearningStat aggregates a single rule's would-have-blocked detections while a
+// site runs in WAF Learning mode. Derived from waf.log entries the data plane
+// marks with action="DETECT" / would_block=true — these are requests that
+// passed through but *would* have been blocked in Blocking mode. This is the
+// raw material for the tuning workflow: review what each rule would block,
+// then add an exclusion for the false positives before flipping to Blocking.
+type LearningStat struct {
+	RuleID   string   `json:"rule_id"`
+	Category string   `json:"category"`
+	Severity string   `json:"severity"`
+	Message  string   `json:"message"`
+	Count    int64    `json:"count"`
+	LastSeen string   `json:"last_seen"`
+	Samples  []string `json:"samples"` // up to learningSampleCap distinct request paths
+}
+
+// learningSampleCap bounds the number of distinct sample paths retained per
+// rule so a noisy rule can't grow the aggregate unboundedly.
+const learningSampleCap = 5
 
 // TrafficBucket captures one second of traffic metrics for the history chart.
 type TrafficBucket struct {
@@ -59,6 +106,30 @@ type Hub struct {
 	mlAnomalies     atomic.Int64
 	errorCount      atomic.Int64
 	ebpfDrops       atomic.Int64
+
+	// HTTP status-class counters (from access.log).
+	status2xx atomic.Int64
+	status3xx atomic.Int64
+	status4xx atomic.Int64
+	status5xx atomic.Int64
+
+	// Distinct blocked client IPs and per-category attack counts.
+	aggMu       sync.Mutex
+	blockedIPs  map[string]struct{}
+	attackCats  map[string]int64
+	byCountry   map[string]int64
+	geoipLoaded bool
+
+	// Per-site request/block counters (keyed by the site label in the NDJSON).
+	siteStats map[string]*SiteStat
+
+	// Learning-mode would-have-blocked aggregation: site label → rule ID →
+	// stat. Guarded by aggMu (same lock as the other waf.log aggregates).
+	learnStats map[string]map[string]*LearningStat
+
+	// Host memory (sampled from /proc/meminfo).
+	memUsed  atomic.Uint64
+	memTotal atomic.Uint64
 
 	// Rolling window for RPS: timestamps of recent access events.
 	rpsMu   sync.Mutex
@@ -82,16 +153,25 @@ func LogDir() string {
 	if d := os.Getenv("SENTINEL_LOG_DIR"); d != "" {
 		return d
 	}
-	return "/tmp/sentinel-logs"
+	// Real disk, not /tmp (tmpfs/RAM). Mirrors the proxy's resolve_log_dir().
+	if home := os.Getenv("HOME"); home != "" {
+		return filepath.Join(home, ".local/share/sentinel/logs")
+	}
+	return "/var/log/sentinel"
 }
 
 // NewHub creates a Hub and starts background file tailers for every known
 // log kind.
 func NewHub() *Hub {
 	h := &Hub{
-		subs:   make(map[chan Entry]struct{}),
-		done:   make(chan struct{}),
-		latBuf: make([]float64, 0, 1000),
+		subs:       make(map[chan Entry]struct{}),
+		done:       make(chan struct{}),
+		latBuf:     make([]float64, 0, 1000),
+		blockedIPs: make(map[string]struct{}),
+		attackCats: make(map[string]int64),
+		byCountry:  make(map[string]int64),
+		siteStats:  make(map[string]*SiteStat),
+		learnStats: make(map[string]map[string]*LearningStat),
 	}
 
 	dir := LogDir()
@@ -102,6 +182,7 @@ func NewHub() *Hub {
 	}
 
 	go h.runBucketSampler()
+	go h.runMemSampler()
 
 	return h
 }
@@ -175,6 +256,20 @@ func (h *Hub) ConnectedClients() int {
 func (h *Hub) GetSnapshot() Snapshot {
 	rps := h.computeRPS()
 	p99 := h.computeP99()
+
+	h.aggMu.Lock()
+	uniqueBlocked := int64(len(h.blockedIPs))
+	attacks := make(map[string]int64, len(h.attackCats))
+	for k, v := range h.attackCats {
+		attacks[k] = v
+	}
+	country := make(map[string]int64, len(h.byCountry))
+	for k, v := range h.byCountry {
+		country[k] = v
+	}
+	geoLoaded := h.geoipLoaded
+	h.aggMu.Unlock()
+
 	return Snapshot{
 		RPS:              rps,
 		P99LatencyMs:     p99,
@@ -184,7 +279,107 @@ func (h *Hub) GetSnapshot() Snapshot {
 		ErrorCount:       h.errorCount.Load(),
 		EbpfDrops:        h.ebpfDrops.Load(),
 		ConnectedClients: h.ConnectedClients(),
+		UniqueBlockedIPs: uniqueBlocked,
+		Status2xx:        h.status2xx.Load(),
+		Status3xx:        h.status3xx.Load(),
+		Status4xx:        h.status4xx.Load(),
+		Status5xx:        h.status5xx.Load(),
+		AttackBreakdown:  attacks,
+		ByCountry:        country,
+		GeoIPLoaded:      geoLoaded,
+		MemUsedBytes:     h.memUsed.Load(),
+		MemTotalBytes:    h.memTotal.Load(),
 	}
+}
+
+// GetSiteStats returns a copy of the cumulative per-site request/block counters.
+func (h *Hub) GetSiteStats() map[string]SiteStat {
+	h.aggMu.Lock()
+	defer h.aggMu.Unlock()
+	out := make(map[string]SiteStat, len(h.siteStats))
+	for k, v := range h.siteStats {
+		out[k] = *v
+	}
+	return out
+}
+
+// recordLearningLocked folds one would-have-blocked detection into the
+// per-site/per-rule aggregate. Caller must hold aggMu.
+func (h *Hub) recordLearningLocked(site, rule, cat, sev, msg, path, ts string) {
+	bySite := h.learnStats[site]
+	if bySite == nil {
+		bySite = make(map[string]*LearningStat)
+		h.learnStats[site] = bySite
+	}
+	st := bySite[rule]
+	if st == nil {
+		st = &LearningStat{RuleID: rule, Category: cat, Severity: sev, Message: msg}
+		bySite[rule] = st
+	}
+	st.Count++
+	st.LastSeen = ts
+	if sev != "" {
+		st.Severity = sev
+	}
+	if msg != "" {
+		st.Message = msg
+	}
+	// Keep a small set of distinct sample paths.
+	if path != "" && len(st.Samples) < learningSampleCap {
+		for _, p := range st.Samples {
+			if p == path {
+				return
+			}
+		}
+		st.Samples = append(st.Samples, path)
+	}
+}
+
+// GetLearningStats returns the would-have-blocked aggregation for a site,
+// sorted by count descending. An empty/"" site returns the aggregate across
+// all sites (rules with the same ID merged). Always returns a non-nil slice.
+func (h *Hub) GetLearningStats(site string) []LearningStat {
+	h.aggMu.Lock()
+	defer h.aggMu.Unlock()
+
+	merged := make(map[string]*LearningStat)
+	fold := func(src map[string]*LearningStat) {
+		for rule, st := range src {
+			dst := merged[rule]
+			if dst == nil {
+				cp := *st
+				cp.Samples = append([]string(nil), st.Samples...)
+				merged[rule] = &cp
+				continue
+			}
+			dst.Count += st.Count
+			if st.LastSeen > dst.LastSeen {
+				dst.LastSeen = st.LastSeen
+				dst.Message = st.Message
+			}
+			for _, p := range st.Samples {
+				if len(dst.Samples) >= learningSampleCap {
+					break
+				}
+				dst.Samples = append(dst.Samples, p)
+			}
+		}
+	}
+
+	if site == "" {
+		for _, bySite := range h.learnStats {
+			fold(bySite)
+		}
+	} else if bySite, ok := h.learnStats[site]; ok {
+		fold(bySite)
+	}
+
+	out := make([]LearningStat, 0, len(merged))
+	for _, st := range merged {
+		out = append(out, *st)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Count > out[j].Count })
+	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -203,9 +398,13 @@ func (h *Hub) updateMetrics(e Entry) {
 		h.rpsWin = h.rpsWin[i:]
 		h.rpsMu.Unlock()
 
-		// Extract latency from the data.
+		// Extract latency, status class and block action from the data.
 		var row struct {
 			Latency interface{} `json:"latency"`
+			Status  int         `json:"status"`
+			Action  string      `json:"action"`
+			IP      string      `json:"ip"`
+			Site    string      `json:"site"`
 		}
 		if json.Unmarshal(e.Data, &row) == nil {
 			var ms float64
@@ -224,14 +423,73 @@ func (h *Hub) updateMetrics(e Entry) {
 				}
 				h.latMu.Unlock()
 			}
+			switch {
+			case row.Status >= 500:
+				h.status5xx.Add(1)
+			case row.Status >= 400:
+				h.status4xx.Add(1)
+			case row.Status >= 300:
+				h.status3xx.Add(1)
+			case row.Status >= 200:
+				h.status2xx.Add(1)
+			}
+			h.aggMu.Lock()
+			if row.Action == "BLOCK" && row.IP != "" {
+				h.blockedIPs[row.IP] = struct{}{}
+			}
+			if row.Site != "" && row.Site != "-" {
+				ss := h.siteStats[row.Site]
+				if ss == nil {
+					ss = &SiteStat{}
+					h.siteStats[row.Site] = ss
+				}
+				ss.Total++
+				if row.Status >= 500 {
+					ss.S5xx++
+				} else if row.Status >= 400 {
+					ss.S4xx++
+				}
+			}
+			h.aggMu.Unlock()
 		}
 
 	case "waf":
 		var row struct {
-			Action string `json:"action"`
+			Action     string `json:"action"`
+			Rule       string `json:"rule"`
+			IP         string `json:"ip"`
+			Site       string `json:"site"`
+			Path       string `json:"path"`
+			Sev        string `json:"sev"`
+			Attack     string `json:"attack"`
+			TS         string `json:"ts"`
+			WouldBlock bool   `json:"would_block"`
 		}
-		if json.Unmarshal(e.Data, &row) == nil && row.Action == "BLOCKED" {
-			h.blockedRequests.Add(1)
+		if json.Unmarshal(e.Data, &row) == nil {
+			blocked := row.Action == "BLOCK" || row.Action == "BLOCKED"
+			if blocked {
+				h.blockedRequests.Add(1)
+			}
+			cat := attackCategory(row.Rule)
+			h.aggMu.Lock()
+			h.attackCats[cat]++
+			if blocked && row.IP != "" {
+				h.blockedIPs[row.IP] = struct{}{}
+			}
+			if blocked && row.Site != "" && row.Site != "-" {
+				ss := h.siteStats[row.Site]
+				if ss == nil {
+					ss = &SiteStat{}
+					h.siteStats[row.Site] = ss
+				}
+				ss.Blocked++
+			}
+			// Learning mode: aggregate would-have-blocked detections per rule.
+			if (row.Action == "DETECT" || row.WouldBlock) && row.Rule != "" && row.Rule != "-" &&
+				row.Site != "" && row.Site != "-" {
+				h.recordLearningLocked(row.Site, row.Rule, cat, row.Sev, row.Attack, row.Path, row.TS)
+			}
+			h.aggMu.Unlock()
 		}
 
 	case "ml":
@@ -253,6 +511,87 @@ func (h *Hub) updateMetrics(e Entry) {
 			if row.Lvl == "ERROR" || row.Lvl == "FATAL" {
 				h.errorCount.Add(1)
 			}
+		}
+	}
+}
+
+// attackCategory maps a (CRS or native) rule ID to a coarse attack category for
+// the dashboard breakdown. Mapping follows the OWASP CRS rule-ID numbering:
+//
+//	911 method · 913 scanner/bot · 920/921 protocol · 930 LFI · 931 RFI
+//	932 RCE · 933 PHP · 934 generic/SSRF · 941 XSS · 942 SQLi · 943 session
+//	944 Java.
+//
+// Unknown / native rule IDs fall through to "other".
+func attackCategory(rule string) string {
+	if len(rule) < 3 {
+		return "other"
+	}
+	switch rule[:3] {
+	case "942":
+		return "sqli"
+	case "941":
+		return "xss"
+	case "930", "931":
+		return "rfi_lfi"
+	case "932", "933", "944":
+		return "rce"
+	case "934":
+		return "ssrf"
+	case "913":
+		return "bot"
+	case "911", "920", "921":
+		return "protocol"
+	default:
+		return "other"
+	}
+}
+
+// runMemSampler refreshes host memory usage from /proc/meminfo every 5 s.
+// Non-Linux hosts (no /proc/meminfo) simply leave the gauges at zero.
+func (h *Hub) runMemSampler() {
+	sample := func() {
+		data, err := os.ReadFile("/proc/meminfo")
+		if err != nil {
+			return
+		}
+		var total, available uint64
+		for _, line := range bytes.Split(data, []byte("\n")) {
+			fields := bytes.Fields(line)
+			if len(fields) < 2 {
+				continue
+			}
+			// values are in kB
+			var kb uint64
+			for _, c := range fields[1] {
+				if c < '0' || c > '9' {
+					break
+				}
+				kb = kb*10 + uint64(c-'0')
+			}
+			switch string(fields[0]) {
+			case "MemTotal:":
+				total = kb * 1024
+			case "MemAvailable:":
+				available = kb * 1024
+			}
+		}
+		if total > 0 {
+			h.memTotal.Store(total)
+			if available <= total {
+				h.memUsed.Store(total - available)
+			}
+		}
+	}
+	sample()
+	tick := time.NewTicker(5 * time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case <-h.done:
+			return
+		case <-tick.C:
+			sample()
 		}
 	}
 }

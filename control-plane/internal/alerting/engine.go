@@ -1,0 +1,341 @@
+// Package alerting turns the live WAF event stream into actionable alerts.
+// It subscribes to the log hub, applies threshold/anomaly conditions with
+// throttling, persists alerts to the store, republishes them to the hub for
+// live SSE delivery, and fans them out to configured notification channels.
+package alerting
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/your-org/sentinel-waf/control-plane/internal/db"
+	"github.com/your-org/sentinel-waf/control-plane/internal/logs"
+	"github.com/your-org/sentinel-waf/control-plane/internal/notify"
+)
+
+// Config tunes the alert-generation thresholds. Zero values fall back to
+// sensible defaults in New.
+type Config struct {
+	SpikeWindow       time.Duration // sliding window for spike/offender counting
+	SpikeThreshold    int           // blocks per site in window → attack_spike
+	OffenderThreshold int           // blocks per IP in window → repeat_offender
+	Throttle          time.Duration // min interval between identical alerts
+}
+
+// Engine consumes hub events and raises alerts. It owns one tenant context
+// (the proxy NDJSON stream is not tenant-tagged, so single-tenant by design;
+// documented honestly).
+type Engine struct {
+	store      *db.Store
+	hub        *logs.Hub
+	dispatcher *notify.Dispatcher
+	tenantID   string
+	userID     string
+	log        *zap.Logger
+	cfg        Config
+
+	mu         sync.Mutex
+	lastRaise  map[string]time.Time
+	ipWindow   map[string][]time.Time
+	siteWindow map[string][]time.Time
+
+	done chan struct{}
+}
+
+// New constructs an Engine with defaults applied.
+func New(store *db.Store, hub *logs.Hub, tenantID, userID string, cfg Config, log *zap.Logger) *Engine {
+	if cfg.SpikeWindow == 0 {
+		cfg.SpikeWindow = 60 * time.Second
+	}
+	if cfg.SpikeThreshold == 0 {
+		cfg.SpikeThreshold = 20
+	}
+	if cfg.OffenderThreshold == 0 {
+		cfg.OffenderThreshold = 15
+	}
+	if cfg.Throttle == 0 {
+		cfg.Throttle = 5 * time.Minute
+	}
+	return &Engine{
+		store:      store,
+		hub:        hub,
+		dispatcher: &notify.Dispatcher{},
+		tenantID:   tenantID,
+		userID:     userID,
+		log:        log,
+		cfg:        cfg,
+		lastRaise:  make(map[string]time.Time),
+		ipWindow:   make(map[string][]time.Time),
+		siteWindow: make(map[string][]time.Time),
+		done:       make(chan struct{}),
+	}
+}
+
+// Start subscribes to the hub and processes events until Stop is called.
+func (e *Engine) Start() {
+	if e.store == nil {
+		e.log.Warn("alerting disabled — no database (channels + alert persistence require DB)")
+		return
+	}
+	ch := e.hub.Subscribe()
+	go e.loop(ch)
+	go e.janitor()
+	e.log.Info("alert engine started",
+		zap.Int("spike_threshold", e.cfg.SpikeThreshold),
+		zap.Int("offender_threshold", e.cfg.OffenderThreshold),
+		zap.Duration("window", e.cfg.SpikeWindow))
+}
+
+// Stop halts the engine.
+func (e *Engine) Stop() { close(e.done) }
+
+func (e *Engine) loop(ch chan logs.Entry) {
+	for {
+		select {
+		case <-e.done:
+			return
+		case ent, ok := <-ch:
+			if !ok {
+				return
+			}
+			if ent.Kind == "waf" {
+				e.onWaf(ent.Data)
+			}
+		}
+	}
+}
+
+// wafEvent is the subset of waf.log we evaluate.
+type wafEvent struct {
+	Action string `json:"action"`
+	Rule   string `json:"rule"`
+	IP     string `json:"ip"`
+	Site   string `json:"site"`
+	Sev    string `json:"sev"`
+	Attack string `json:"attack"`
+	Path   string `json:"path"`
+}
+
+func (e *Engine) onWaf(data json.RawMessage) {
+	var ev wafEvent
+	if json.Unmarshal(data, &ev) != nil {
+		return
+	}
+	// Only real blocks drive alerts (DETECT/learning and PASS do not).
+	if ev.Action != "BLOCK" && ev.Action != "BLOCKED" {
+		return
+	}
+	now := time.Now()
+	sev := strings.ToLower(ev.Sev)
+
+	// Condition 1 — repeat offender: one IP blocked many times in the window.
+	if ev.IP != "" {
+		if n := e.bumpWindow(e.ipWindow, ev.IP, now); n >= e.cfg.OffenderThreshold {
+			e.raise("offender:"+ev.IP, db.CreateAlertRequest{
+				Severity: "high",
+				Kind:     "repeat_offender",
+				Summary:  fmt.Sprintf("IP %s blocked %d times in %s", ev.IP, n, e.cfg.SpikeWindow),
+				Details:  jsonObj(map[string]any{"ip": ev.IP, "count": n, "window": e.cfg.SpikeWindow.String(), "last_rule": ev.Rule}),
+			}, notify.Alert{Severity: "high", Kind: "repeat_offender", SourceIP: ev.IP, Rule: ev.Rule, Site: ev.Site, Count: n})
+		}
+	}
+
+	// Condition 2 — attack spike: a site sees a burst of blocks in the window.
+	if ev.Site != "" && ev.Site != "-" {
+		if n := e.bumpWindow(e.siteWindow, ev.Site, now); n >= e.cfg.SpikeThreshold {
+			e.raise("spike:"+ev.Site, db.CreateAlertRequest{
+				Severity: "critical",
+				Kind:     "attack_spike",
+				Summary:  fmt.Sprintf("Attack spike on %s — %d blocks in %s", ev.Site, n, e.cfg.SpikeWindow),
+				Details:  jsonObj(map[string]any{"site": ev.Site, "count": n, "window": e.cfg.SpikeWindow.String()}),
+			}, notify.Alert{Severity: "critical", Kind: "attack_spike", Site: ev.Site, Count: n})
+		}
+	}
+
+	// Condition 3 — a single critical/high block is itself notable.
+	if sev == "critical" || sev == "high" {
+		e.raise(fmt.Sprintf("sev:%s:%s", ev.Rule, ev.IP), db.CreateAlertRequest{
+			Severity: sev,
+			Kind:     attackKind(ev.Attack, ev.Rule),
+			Summary:  fmt.Sprintf("%s blocked on %s (rule %s) from %s", capitalize(attackKind(ev.Attack, ev.Rule)), siteOr(ev.Site), ev.Rule, ev.IP),
+			Details:  jsonObj(map[string]any{"rule": ev.Rule, "ip": ev.IP, "site": ev.Site, "path": ev.Path, "attack": ev.Attack}),
+		}, notify.Alert{Severity: sev, Kind: attackKind(ev.Attack, ev.Rule), SourceIP: ev.IP, Rule: ev.Rule, Site: ev.Site})
+	}
+}
+
+// bumpWindow appends now to the named sliding window, trims expired entries,
+// and returns the current count.
+func (e *Engine) bumpWindow(m map[string][]time.Time, key string, now time.Time) int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	cutoff := now.Add(-e.cfg.SpikeWindow)
+	w := append(m[key], now)
+	i := sort.Search(len(w), func(i int) bool { return w[i].After(cutoff) })
+	w = w[i:]
+	m[key] = w
+	return len(w)
+}
+
+// raise persists, republishes, and dispatches an alert unless throttled.
+func (e *Engine) raise(throttleKey string, req db.CreateAlertRequest, na notify.Alert) {
+	e.mu.Lock()
+	if last, ok := e.lastRaise[throttleKey]; ok && time.Since(last) < e.cfg.Throttle {
+		e.mu.Unlock()
+		return
+	}
+	e.lastRaise[throttleKey] = time.Now()
+	e.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	row, err := e.store.CreateAlert(ctx, e.tenantID, e.userID, req)
+	if err != nil {
+		e.log.Warn("alert persist failed", zap.Error(err), zap.String("kind", req.Kind))
+		return
+	}
+	na.ID = row.ID
+	na.Summary = req.Summary
+	na.CreatedAt = row.CreatedAt
+
+	// Live SSE: surface the alert on the dashboard immediately.
+	e.publishToHub(row)
+
+	// Fan out to configured channels.
+	e.dispatch(ctx, na)
+	e.log.Info("alert raised", zap.String("kind", req.Kind), zap.String("severity", req.Severity), zap.String("summary", req.Summary))
+}
+
+func (e *Engine) publishToHub(row *db.AlertRow) {
+	payload, _ := json.Marshal(map[string]any{
+		"id": row.ID, "severity": row.Severity, "kind": row.Kind,
+		"summary": row.Summary, "state": row.State,
+		"ts": row.CreatedAt.Format(time.RFC3339),
+	})
+	e.hub.PublishDirect(logs.Entry{Kind: "alert", Data: payload})
+}
+
+func (e *Engine) dispatch(ctx context.Context, na notify.Alert) {
+	rows, err := e.store.ListChannels(ctx, e.tenantID, e.userID)
+	if err != nil || len(rows) == 0 {
+		return
+	}
+	var channels []notify.Channel
+	for _, r := range rows {
+		if !r.Enabled {
+			continue
+		}
+		channels = append(channels, toNotifyChannel(r))
+	}
+	results := e.dispatcher.Dispatch(ctx, na, channels)
+	for _, res := range results {
+		if err := e.store.RecordChannelDelivery(ctx, e.tenantID, e.userID, res.ChannelID, res.Status()); err != nil {
+			e.log.Debug("record delivery failed", zap.Error(err))
+		}
+		if !res.OK {
+			e.log.Warn("alert delivery failed", zap.String("channel", res.Name), zap.String("err", res.Err))
+		}
+	}
+}
+
+// janitor periodically drops stale throttle/window entries.
+func (e *Engine) janitor() {
+	t := time.NewTicker(5 * time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-e.done:
+			return
+		case <-t.C:
+			now := time.Now()
+			e.mu.Lock()
+			for k, v := range e.lastRaise {
+				if now.Sub(v) > e.cfg.Throttle*2 {
+					delete(e.lastRaise, k)
+				}
+			}
+			cutoff := now.Add(-e.cfg.SpikeWindow)
+			trim := func(m map[string][]time.Time) {
+				for k, w := range m {
+					i := sort.Search(len(w), func(i int) bool { return w[i].After(cutoff) })
+					if i >= len(w) {
+						delete(m, k)
+					} else {
+						m[k] = w[i:]
+					}
+				}
+			}
+			trim(e.ipWindow)
+			trim(e.siteWindow)
+			e.mu.Unlock()
+		}
+	}
+}
+
+// toNotifyChannel converts a stored channel row into a notify.Channel.
+func toNotifyChannel(r db.ChannelRow) notify.Channel {
+	var cfg notify.Config
+	_ = json.Unmarshal(r.Config, &cfg)
+	return notify.Channel{
+		ID:          r.ID,
+		Name:        r.Name,
+		Type:        r.Type,
+		MinSeverity: r.MinSeverity,
+		Config:      cfg,
+	}
+}
+
+func jsonObj(m map[string]any) json.RawMessage {
+	b, _ := json.Marshal(m)
+	return b
+}
+
+func capitalize(s string) string {
+	if s == "" {
+		return s
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
+}
+
+func siteOr(s string) string {
+	if s == "" || s == "-" {
+		return "site"
+	}
+	return s
+}
+
+// attackKind derives a coarse alert kind from the attack message / rule ID.
+func attackKind(attack, rule string) string {
+	a := strings.ToLower(attack)
+	switch {
+	case strings.Contains(a, "sql"):
+		return "sqli"
+	case strings.Contains(a, "xss") || strings.Contains(a, "cross-site script"):
+		return "xss"
+	case strings.Contains(a, "rce") || strings.Contains(a, "command"):
+		return "rce"
+	case strings.Contains(a, "lfi") || strings.Contains(a, "rfi") || strings.Contains(a, "traversal") || strings.Contains(a, "file"):
+		return "file_inclusion"
+	case strings.Contains(a, "scanner") || strings.Contains(a, "bot"):
+		return "scanner"
+	}
+	// Fall back to CRS rule-family prefix.
+	switch {
+	case strings.HasPrefix(rule, "942"):
+		return "sqli"
+	case strings.HasPrefix(rule, "941"):
+		return "xss"
+	case strings.HasPrefix(rule, "930"), strings.HasPrefix(rule, "931"):
+		return "file_inclusion"
+	case strings.HasPrefix(rule, "932"), strings.HasPrefix(rule, "933"), strings.HasPrefix(rule, "944"):
+		return "rce"
+	}
+	return "attack"
+}

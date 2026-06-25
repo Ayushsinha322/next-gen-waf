@@ -49,6 +49,7 @@ const (
 	ResourceIPList    = "ip_list"
 	ResourceAlert     = "alert"
 	ResourceAudit     = "audit_log"
+	ResourceNotification = "notification" // notification channels (webhook/syslog/cef)
 )
 
 // Action verbs.
@@ -100,6 +101,11 @@ var rolePermissions = map[Role]map[string]struct{}{
 		perm(ResourceAlert, ActionRead):     {},
 		perm(ResourceAlert, ActionUpdate):   {},
 		perm(ResourceAlert, ActionList):     {},
+		perm(ResourceNotification, ActionCreate): {},
+		perm(ResourceNotification, ActionRead):   {},
+		perm(ResourceNotification, ActionUpdate): {},
+		perm(ResourceNotification, ActionDelete): {},
+		perm(ResourceNotification, ActionList):   {},
 		perm(ResourceAudit, ActionRead):     {},
 		perm(ResourceAudit, ActionDownload): {},
 	},
@@ -137,6 +143,11 @@ var rolePermissions = map[Role]map[string]struct{}{
 		perm(ResourceAlert, ActionRead):     {},
 		perm(ResourceAlert, ActionUpdate):   {},
 		perm(ResourceAlert, ActionList):     {},
+		perm(ResourceNotification, ActionCreate): {},
+		perm(ResourceNotification, ActionRead):   {},
+		perm(ResourceNotification, ActionUpdate): {},
+		perm(ResourceNotification, ActionDelete): {},
+		perm(ResourceNotification, ActionList):   {},
 		perm(ResourceAudit, ActionRead):     {},
 		perm(ResourceAudit, ActionDownload): {},
 	},
@@ -163,6 +174,8 @@ var rolePermissions = map[Role]map[string]struct{}{
 		perm(ResourceAlert, ActionRead):     {},
 		perm(ResourceAlert, ActionUpdate):   {},
 		perm(ResourceAlert, ActionList):     {},
+		perm(ResourceNotification, ActionRead): {},
+		perm(ResourceNotification, ActionList): {},
 		perm(ResourceAudit, ActionRead):     {},
 	},
 	RoleViewer: {
@@ -178,6 +191,8 @@ var rolePermissions = map[Role]map[string]struct{}{
 		perm(ResourceIPList, ActionList):    {},
 		perm(ResourceAlert, ActionRead):     {},
 		perm(ResourceAlert, ActionList):     {},
+		perm(ResourceNotification, ActionRead): {},
+		perm(ResourceNotification, ActionList): {},
 	},
 	RoleAuditor: {
 		perm(ResourceSite, ActionRead):      {},
@@ -192,6 +207,8 @@ var rolePermissions = map[Role]map[string]struct{}{
 		perm(ResourceIPList, ActionList):    {},
 		perm(ResourceAlert, ActionRead):     {},
 		perm(ResourceAlert, ActionList):     {},
+		perm(ResourceNotification, ActionRead): {},
+		perm(ResourceNotification, ActionList): {},
 		perm(ResourceAudit, ActionRead):     {},
 		perm(ResourceAudit, ActionDownload): {},
 	},

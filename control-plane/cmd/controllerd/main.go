@@ -15,8 +15,10 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/your-org/sentinel-waf/control-plane/internal/alerting"
 	"github.com/your-org/sentinel-waf/control-plane/internal/api"
 	"github.com/your-org/sentinel-waf/control-plane/internal/auth"
+	chreader "github.com/your-org/sentinel-waf/control-plane/internal/clickhouse"
 	"github.com/your-org/sentinel-waf/control-plane/internal/cluster"
 	"github.com/your-org/sentinel-waf/control-plane/internal/db"
 	controlgrpc "github.com/your-org/sentinel-waf/control-plane/internal/grpc"
@@ -79,12 +81,37 @@ func run() error {
 			} else {
 				log.Info("DB seeded")
 			}
+
+			// Ensure the notification_channels table exists (idempotent —
+			// works even when goose migrations haven't been run manually).
+			if err := db.EnsureNotificationSchema(ctx, pool); err != nil {
+				log.Warn("notification schema ensure failed (non-fatal)", zap.Error(err))
+			}
 		}
 	}
 
 	// ── Log hub (SSE) ─────────────────────────────────────────────────────────
 	hub := logs.NewHub()
 	defer hub.Stop()
+
+	// ── ClickHouse reader (searchable history; disabled if URL unset) ─────────
+	chClient := chreader.FromEnv()
+	if chClient.Enabled() {
+		log.Info("clickhouse reader enabled (searchable WAF history)")
+	} else {
+		log.Info("clickhouse reader disabled — set SENTINEL_CLICKHOUSE_URL to enable event search")
+	}
+
+	// ── Alert engine ──────────────────────────────────────────────────────────
+	// Turns the live WAF event stream into alerts (spikes, repeat offenders,
+	// critical blocks), persists them, surfaces them on the dashboard via SSE,
+	// and fans them out to configured notification channels. Single-tenant
+	// (dev tenant) because the proxy NDJSON stream is not tenant-tagged.
+	if store != nil {
+		engine := alerting.New(store, hub, db.DevTenantID, db.DevAdminID, alertingConfigFromEnv(), log)
+		engine.Start()
+		defer engine.Stop()
+	}
 
 	// ── RBAC ──────────────────────────────────────────────────────────────────
 	enforcer := rbac.NewEnforcer()
@@ -164,6 +191,8 @@ func run() error {
 		protected.PATCH("/sites/:id", func(c *gin.Context) { handleUpdateSite(c, enforcer, store, hub, cl) })
 		protected.DELETE("/sites/:id", func(c *gin.Context) { handleDeleteSite(c, enforcer, store, hub, cl) })
 		protected.PATCH("/sites/:id/status", func(c *gin.Context) { handleUpdateSiteStatus(c, enforcer, store, hub, cl) })
+		protected.POST("/sites/:id/exclusions", func(c *gin.Context) { handleAddSiteExclusion(c, enforcer, store, hub, cl) })
+		protected.DELETE("/sites/:id/exclusions/:rule_id", func(c *gin.Context) { handleDeleteSiteExclusion(c, enforcer, store, hub, cl) })
 		protected.GET("/rules", func(c *gin.Context) { handleListRules(c, enforcer, store) })
 		protected.POST("/rules", func(c *gin.Context) { handleCreateRule(c, enforcer, store, hub, cl) })
 		protected.PATCH("/rules/:id", func(c *gin.Context) { handleToggleRule(c, enforcer, store, hub, cl) })
@@ -175,7 +204,27 @@ func run() error {
 		protected.GET("/alerts", func(c *gin.Context) { handleListAlerts(c, enforcer, store) })
 		protected.POST("/alerts/:id/ack", func(c *gin.Context) { handleAckAlert(c, enforcer, store, hub, cl) })
 		protected.POST("/alerts/:id/resolve", func(c *gin.Context) { handleResolveAlert(c, enforcer, store, hub, cl) })
+
+		// Notification channels (SOC integration: webhook / Slack / syslog / CEF).
+		protected.GET("/notifications/channels", func(c *gin.Context) { handleListChannels(c, enforcer, store) })
+		protected.POST("/notifications/channels", func(c *gin.Context) { handleCreateChannel(c, enforcer, store, hub) })
+		protected.PUT("/notifications/channels/:id", func(c *gin.Context) { handleUpdateChannel(c, enforcer, store, hub) })
+		protected.DELETE("/notifications/channels/:id", func(c *gin.Context) { handleDeleteChannel(c, enforcer, store, hub) })
+		protected.POST("/notifications/channels/:id/test", func(c *gin.Context) { handleTestChannel(c, enforcer, store) })
+
+		// GeoIP country blocking (global policy applied across active sites).
+		// Searchable WAF history (ClickHouse-backed).
+		protected.GET("/events/status", func(c *gin.Context) { handleEventsStatus(c, chClient) })
+		protected.GET("/events/search", func(c *gin.Context) { handleEventsSearch(c, enforcer, chClient) })
+		protected.GET("/events/timeline", func(c *gin.Context) { handleEventsTimeline(c, enforcer, chClient) })
+		protected.GET("/events/facets", func(c *gin.Context) { handleEventsFacets(c, enforcer, chClient) })
+
+		protected.GET("/geoip/blocked", func(c *gin.Context) { handleListBlockedCountries(c, enforcer, store) })
+		protected.POST("/geoip/block", func(c *gin.Context) { handleBlockCountry(c, enforcer, store, hub) })
+		protected.DELETE("/geoip/block/:code", func(c *gin.Context) { handleUnblockCountry(c, enforcer, store, hub) })
 		protected.GET("/metrics/snapshot", func(c *gin.Context) { handleMetricsSnapshot(c, hub) })
+		protected.GET("/metrics/sites", func(c *gin.Context) { handleSiteMetrics(c, hub) })
+		protected.GET("/metrics/learning", func(c *gin.Context) { handleLearningReport(c, hub) })
 		protected.GET("/audit", func(c *gin.Context) { handleListAudit(c, enforcer, store) })
 		protected.GET("/cluster/status", func(c *gin.Context) { handleClusterStatus(c, cl) })
 		protected.GET("/waf/status", func(c *gin.Context) { handleProxyHealth(c) })
@@ -185,6 +234,7 @@ func run() error {
 		protected.POST("/certs/manual", func(c *gin.Context) { handleUploadManualCert(c, enforcer) })
 		protected.POST("/certs/acme", func(c *gin.Context) { handleRequestAcmeCert(c, enforcer) })
 		protected.POST("/certs/:domain/renew", func(c *gin.Context) { handleRenewCert(c, enforcer) })
+		protected.PATCH("/certs/:domain", func(c *gin.Context) { handleRenameCert(c, enforcer) })
 		protected.DELETE("/certs/:domain", func(c *gin.Context) { handleDeleteCert(c, enforcer) })
 	}
 
@@ -243,6 +293,24 @@ func maskPassword(dsn string) string {
 	return dsn
 }
 
+// alertingConfigFromEnv builds the alert-engine thresholds from optional env
+// vars, falling back to defaults inside alerting.New when unset/invalid.
+func alertingConfigFromEnv() alerting.Config {
+	atoi := func(key string) int { n, _ := strconv.Atoi(os.Getenv(key)); return n }
+	secs := func(key string) time.Duration {
+		if n, _ := strconv.Atoi(os.Getenv(key)); n > 0 {
+			return time.Duration(n) * time.Second
+		}
+		return 0
+	}
+	return alerting.Config{
+		SpikeWindow:       secs("SENTINEL_ALERT_WINDOW_SECS"),
+		SpikeThreshold:    atoi("SENTINEL_ALERT_SPIKE_THRESHOLD"),
+		OffenderThreshold: atoi("SENTINEL_ALERT_OFFENDER_THRESHOLD"),
+		Throttle:          secs("SENTINEL_ALERT_THROTTLE_SECS"),
+	}
+}
+
 // autoStartDataPlane finds the Rust proxy binary and starts it as a managed
 // child process, restarting automatically on crash. Returns true if the binary
 // was found and launched, false if the binary doesn't exist yet (not built).
@@ -279,7 +347,9 @@ func autoStartDataPlane(log *zap.Logger) bool {
 		return false
 	}
 
-	logDir := envOrDefault("SENTINEL_LOG_DIR", "/tmp/sentinel-logs")
+	// Resolve via the shared hub logic (real disk, not tmpfs) and pass it to the
+	// spawned proxy so writer and reader always agree on the directory.
+	logDir := logs.LogDir()
 	cfg := envOrDefault("SENTINEL_CONFIG", "configs/dev/sentinel.yaml")
 	// Make config path absolute so the proxy finds it regardless of CWD.
 	if absCfg, err := filepath.Abs(cfg); err == nil {

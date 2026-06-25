@@ -56,6 +56,7 @@ func handleListCerts(c *gin.Context, enf *rbac.Enforcer) {
 
 type manualCertRequest struct {
 	Domain  string `json:"domain" binding:"required"`
+	Name    string `json:"name"` // optional friendly profile label
 	CertPEM string `json:"cert_pem" binding:"required"`
 	KeyPEM  string `json:"key_pem" binding:"required"`
 }
@@ -133,6 +134,33 @@ func handleRenewCert(c *gin.Context, enf *rbac.Enforcer) {
 		return
 	}
 	proxyToDataPlane(c, http.MethodPost, "/api/v1/internal/certs/"+domain+"/renew", nil)
+}
+
+// ---------------------------------------------------------------------------
+// PATCH /api/v1/certs/:domain — set the friendly profile name for a cert
+// ---------------------------------------------------------------------------
+
+type renameCertRequest struct {
+	Name string `json:"name"`
+}
+
+func handleRenameCert(c *gin.Context, enf *rbac.Enforcer) {
+	claims, _ := auth.GetClaims(c.Request.Context())
+	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceSite, rbac.ActionUpdate) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
+		return
+	}
+	domain := c.Param("domain")
+	if domain == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "domain is required"})
+		return
+	}
+	var req renameCertRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	proxyToDataPlane(c, http.MethodPatch, "/api/v1/internal/certs/"+domain, req)
 }
 
 // ---------------------------------------------------------------------------

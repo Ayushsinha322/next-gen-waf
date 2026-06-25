@@ -447,6 +447,171 @@ func handleUpdateSiteStatus(c *gin.Context, enf *rbac.Enforcer, store *db.Store,
 	c.JSON(http.StatusOK, gin.H{"ok": true, "status": body.Status})
 }
 
+// ruleExclusionSpec mirrors the Rust RuleExclusion struct. Stored inside a
+// site's waf_policy.rule_exclusions array and emitted verbatim to the data
+// plane by buildRustWaf.
+type ruleExclusionSpec struct {
+	RuleID         int      `json:"rule_id"`
+	ExcludeTargets []string `json:"exclude_targets,omitempty"`
+	Disable        bool     `json:"disable,omitempty"`
+}
+
+// handleAddSiteExclusion adds (or updates) a rule exclusion on a site's
+// waf_policy — the learning report's one-click tuning action. Body:
+//
+//	{ "rule_id": 942100, "disable": true }                       // drop the whole rule
+//	{ "rule_id": 942100, "exclude_targets": ["ARGS:q"] }         // strip targets only
+//
+// Re-uses the standard site-update path so the change is proposed through the
+// cluster, persisted, and hot-synced to the proxy via configVersion.
+func handleAddSiteExclusion(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
+	claims, _ := auth.GetClaims(c.Request.Context())
+	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceSite, rbac.ActionUpdate) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
+		return
+	}
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
+		return
+	}
+	siteID := c.Param("id")
+	var body ruleExclusionSpec
+	if err := c.ShouldBindJSON(&body); err != nil || body.RuleID == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "rule_id is required"})
+		return
+	}
+	// Default to disabling the whole rule when no targets are given — the most
+	// common learning-report action for a confirmed false positive.
+	if len(body.ExcludeTargets) == 0 {
+		body.Disable = true
+	}
+
+	site, err := store.GetSite(c.Request.Context(), claims.TenantID, siteID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "site not found"})
+		return
+	}
+	waf, excl := parseExclusions(site.WafPolicy)
+
+	// Upsert by rule_id.
+	found := false
+	for i := range excl {
+		if excl[i].RuleID == body.RuleID {
+			excl[i] = body
+			found = true
+			break
+		}
+	}
+	if !found {
+		excl = append(excl, body)
+	}
+
+	newPolicy, err := encodeExclusions(waf, excl)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	req := db.UpdateSiteRequest{WafPolicy: newPolicy}
+	if !proposeBest(c, cl, cluster.CmdSiteUpdate, gin.H{"tenant_id": claims.TenantID, "site_id": siteID, "req": req}) {
+		return
+	}
+	updated, err := store.UpdateSite(c.Request.Context(), claims.TenantID, claims.UserID, siteID, req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	configVersion.Add(1)
+	writeAuditEntry(c, store, hub, &db.WriteAuditRequest{
+		TenantID:    claims.TenantID,
+		ActorUserID: &claims.UserID,
+		Action:      "site.exclusion.add.rule_" + strconv.Itoa(body.RuleID),
+		TargetKind:  "site",
+		TargetID:    &siteID,
+	})
+	c.JSON(http.StatusOK, gin.H{"site": updated, "rule_exclusions": excl})
+}
+
+// handleDeleteSiteExclusion removes the exclusion for a given rule_id from a
+// site's waf_policy (undo a tuning action / re-enable a rule).
+func handleDeleteSiteExclusion(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
+	claims, _ := auth.GetClaims(c.Request.Context())
+	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceSite, rbac.ActionUpdate) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
+		return
+	}
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
+		return
+	}
+	siteID := c.Param("id")
+	ruleID, err := strconv.Atoi(c.Param("rule_id"))
+	if err != nil || ruleID == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid rule_id"})
+		return
+	}
+	site, err := store.GetSite(c.Request.Context(), claims.TenantID, siteID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "site not found"})
+		return
+	}
+	waf, excl := parseExclusions(site.WafPolicy)
+	kept := excl[:0]
+	for _, e := range excl {
+		if e.RuleID != ruleID {
+			kept = append(kept, e)
+		}
+	}
+	newPolicy, err := encodeExclusions(waf, kept)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	req := db.UpdateSiteRequest{WafPolicy: newPolicy}
+	if !proposeBest(c, cl, cluster.CmdSiteUpdate, gin.H{"tenant_id": claims.TenantID, "site_id": siteID, "req": req}) {
+		return
+	}
+	updated, err := store.UpdateSite(c.Request.Context(), claims.TenantID, claims.UserID, siteID, req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	configVersion.Add(1)
+	writeAuditEntry(c, store, hub, &db.WriteAuditRequest{
+		TenantID:    claims.TenantID,
+		ActorUserID: &claims.UserID,
+		Action:      "site.exclusion.remove.rule_" + strconv.Itoa(ruleID),
+		TargetKind:  "site",
+		TargetID:    &siteID,
+	})
+	c.JSON(http.StatusOK, gin.H{"site": updated, "rule_exclusions": kept})
+}
+
+// parseExclusions splits a waf_policy blob into the generic policy map (minus
+// rule_exclusions) and the typed exclusion list. A nil/empty policy yields an
+// empty map and nil slice.
+func parseExclusions(raw json.RawMessage) (map[string]json.RawMessage, []ruleExclusionSpec) {
+	waf := map[string]json.RawMessage{}
+	if len(raw) > 0 {
+		_ = json.Unmarshal(raw, &waf)
+	}
+	var excl []ruleExclusionSpec
+	if rx, ok := waf["rule_exclusions"]; ok {
+		_ = json.Unmarshal(rx, &excl)
+	}
+	delete(waf, "rule_exclusions")
+	return waf, excl
+}
+
+// encodeExclusions reassembles a waf_policy blob with the given exclusion list.
+func encodeExclusions(waf map[string]json.RawMessage, excl []ruleExclusionSpec) (json.RawMessage, error) {
+	rx, err := json.Marshal(excl)
+	if err != nil {
+		return nil, err
+	}
+	waf["rule_exclusions"] = rx
+	return json.Marshal(waf)
+}
+
 // handleInternalConfig is called by the Rust data-plane proxy (no JWT — internal
 // network only). Returns the current active site list in a format the proxy can
 // deserialize directly into Vec<SiteConfig>.
@@ -712,18 +877,28 @@ func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
 		"api_discovery":     p.APIDiscovery,
 	}
 
-	// Rule exclusions — default to the well-known DVWA "id" suppression when
-	// the operator hasn't specified their own, preserving prior behaviour.
+	// Rule exclusions — always include the well-known 932236 "ARGS_NAMES" / id
+	// suppression (avoids the `?id=42` false positive, see CRS importer notes)
+	// unless the operator has their own entry for that rule, then append any
+	// operator-defined exclusions (e.g. one-click disables from the learning
+	// report). Previously a custom list silently dropped the 932236 default.
+	ex := []map[string]any{}
+	hasArgsNamesDefault := false
 	if len(p.RuleExclusions) > 0 {
-		var ex []map[string]any
-		if err := json.Unmarshal(p.RuleExclusions, &ex); err == nil {
-			waf["rule_exclusions"] = ex
+		if err := json.Unmarshal(p.RuleExclusions, &ex); err != nil {
+			ex = []map[string]any{}
 		}
-	} else {
-		waf["rule_exclusions"] = []map[string]any{
-			{"rule_id": 932236, "exclude_targets": []string{"ARGS_NAMES"}},
+		for _, e := range ex {
+			if ruleIDEquals(e["rule_id"], 932236) {
+				hasArgsNamesDefault = true
+				break
+			}
 		}
 	}
+	if !hasArgsNamesDefault {
+		ex = append(ex, map[string]any{"rule_id": 932236, "exclude_targets": []string{"ARGS_NAMES"}})
+	}
+	waf["rule_exclusions"] = ex
 
 	attachRawObject(waf, "rate_limit", p.RateLimit)
 	attachRawObject(waf, "bot_detection", p.BotDetection)
@@ -767,6 +942,21 @@ func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
 	}
 
 	return waf, nil
+}
+
+// ruleIDEquals compares a JSON-decoded rule_id (which may be float64, json.Number,
+// or int) against an expected integer.
+func ruleIDEquals(v any, want int) bool {
+	switch n := v.(type) {
+	case float64:
+		return int(n) == want
+	case int:
+		return n == want
+	case json.Number:
+		i, _ := n.Int64()
+		return int(i) == want
+	}
+	return false
 }
 
 // attachRawObject decodes a raw JSON object and attaches it under key when
@@ -1033,6 +1223,20 @@ func handleLogsStream(c *gin.Context, jwtSvc *auth.JWTService, hub *logs.Hub) {
 func handleMetricsSnapshot(c *gin.Context, hub *logs.Hub) {
 	snap := hub.GetSnapshot()
 	c.JSON(http.StatusOK, snap)
+}
+
+// handleSiteMetrics returns cumulative per-site request/block counters derived
+// from the proxy NDJSON stream (keyed by the site label, e.g. "dvwa.local").
+func handleSiteMetrics(c *gin.Context, hub *logs.Hub) {
+	c.JSON(http.StatusOK, gin.H{"sites": hub.GetSiteStats()})
+}
+
+// handleLearningReport returns the would-have-blocked aggregation for the WAF
+// learning workflow. Optional ?site=<label> scopes it to one site; omitted =
+// across all sites. The "rules" array is sorted by detection count desc.
+func handleLearningReport(c *gin.Context, hub *logs.Hub) {
+	site := c.Query("site")
+	c.JSON(http.StatusOK, gin.H{"site": site, "rules": hub.GetLearningStats(site)})
 }
 
 // ---------------------------------------------------------------------------
