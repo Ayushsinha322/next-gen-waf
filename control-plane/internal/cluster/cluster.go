@@ -11,6 +11,9 @@ package cluster
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -46,6 +49,10 @@ type Config struct {
 	DataDir    string                 // persistent state location
 	Apply      func(cmd Command) error // called on every committed entry
 	Logger     *zap.Logger
+	// Secret is a pre-shared key used to authenticate inter-node RPC (HMAC over
+	// each frame). Required for multi-node clusters; empty disables auth (only
+	// safe for single-node, where no RPC crosses the wire).
+	Secret string
 }
 
 // CommandKind enumerates the operation categories the control-plane replicates.
@@ -652,6 +659,54 @@ func (c *Cluster) applyUpTo(idx uint64) error {
 	return nil
 }
 
+// ─── RPC authentication ──────────────────────────────────────────────────────
+//
+// Every inter-node frame is wrapped in an envelope carrying an HMAC-SHA256 tag
+// over the exact inner-message bytes, keyed by the shared cluster secret. This
+// authenticates the peer and detects tampering without ever putting the secret
+// on the wire — so a node that can merely reach the port can no longer forge log
+// entries or spoof votes. (It does not provide confidentiality; run the cluster
+// on a trusted/isolated network, or front it with TLS, if that is required.)
+
+type rpcEnvelope struct {
+	Auth string          `json:"auth,omitempty"`
+	Msg  json.RawMessage `json:"msg"`
+}
+
+func (c *Cluster) authTag(msg []byte) string {
+	mac := hmac.New(sha256.New, []byte(c.cfg.Secret))
+	mac.Write(msg)
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// seal marshals an RPC message and, when a secret is configured, tags it.
+func (c *Cluster) seal(msg rpcMsg) (rpcEnvelope, error) {
+	body, err := json.Marshal(msg)
+	if err != nil {
+		return rpcEnvelope{}, err
+	}
+	env := rpcEnvelope{Msg: body}
+	if c.cfg.Secret != "" {
+		env.Auth = c.authTag(body)
+	}
+	return env, nil
+}
+
+// open verifies the envelope's tag (constant-time, when a secret is configured)
+// and returns the inner RPC message.
+func (c *Cluster) open(env rpcEnvelope) (rpcMsg, error) {
+	if c.cfg.Secret != "" {
+		if !hmac.Equal([]byte(c.authTag(env.Msg)), []byte(env.Auth)) {
+			return rpcMsg{}, errors.New("cluster: RPC authentication failed")
+		}
+	}
+	var msg rpcMsg
+	if err := json.Unmarshal(env.Msg, &msg); err != nil {
+		return rpcMsg{}, err
+	}
+	return msg, nil
+}
+
 // ─── RPC server ──────────────────────────────────────────────────────────────
 
 func (c *Cluster) acceptLoop() {
@@ -674,17 +729,26 @@ func (c *Cluster) serveConn(conn net.Conn) {
 	dec := json.NewDecoder(conn)
 	enc := json.NewEncoder(conn)
 	for {
-		var req rpcMsg
+		var env rpcEnvelope
 		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		if err := dec.Decode(&req); err != nil {
+		if err := dec.Decode(&env); err != nil {
+			return
+		}
+		req, err := c.open(env)
+		if err != nil {
+			c.log.Warn("rejecting RPC", zap.Error(err), zap.String("remote", conn.RemoteAddr().String()))
 			return
 		}
 		reply, ok := c.handleRPC(req)
 		if !ok {
 			return
 		}
+		out, err := c.seal(reply)
+		if err != nil {
+			return
+		}
 		_ = conn.SetWriteDeadline(time.Now().Add(rpcReadTimeout))
-		if err := enc.Encode(reply); err != nil {
+		if err := enc.Encode(out); err != nil {
 			return
 		}
 	}
@@ -795,16 +859,20 @@ func (c *Cluster) sendRPC(addr string, msg rpcMsg) (rpcMsg, error) {
 		return rpcMsg{}, err
 	}
 	defer conn.Close()
+	out, err := c.seal(msg)
+	if err != nil {
+		return rpcMsg{}, err
+	}
 	_ = conn.SetWriteDeadline(time.Now().Add(rpcReadTimeout))
-	if err := json.NewEncoder(conn).Encode(msg); err != nil {
+	if err := json.NewEncoder(conn).Encode(out); err != nil {
 		return rpcMsg{}, err
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(rpcReadTimeout))
-	var reply rpcMsg
-	if err := json.NewDecoder(conn).Decode(&reply); err != nil {
+	var replyEnv rpcEnvelope
+	if err := json.NewDecoder(conn).Decode(&replyEnv); err != nil {
 		return rpcMsg{}, err
 	}
-	return reply, nil
+	return c.open(replyEnv)
 }
 
 func (c *Cluster) markPeerSeen(id NodeID) {

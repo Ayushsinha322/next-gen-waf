@@ -441,11 +441,21 @@ func startCluster(log *zap.Logger) (*cluster.Cluster, error) {
 
 	dataDir := envOrDefault("SENTINEL_RAFT_DIR", filepath.Join(".", "raft-data", idStr))
 
+	// Inter-node RPC must be authenticated with a shared secret. Require it
+	// whenever peers are configured (multi-node) so a node on the cluster
+	// network can't forge log entries or spoof votes. Single-node clusters
+	// exchange no RPC, so the secret is optional there.
+	secret := os.Getenv("SENTINEL_RAFT_SECRET")
+	if len(peers) > 0 && secret == "" {
+		return nil, fmt.Errorf("SENTINEL_RAFT_SECRET is required for a multi-node cluster (peers configured)")
+	}
+
 	cfg := cluster.Config{
 		NodeID:     cluster.NodeID(id),
 		ListenAddr: addr,
 		Peers:      peers,
 		DataDir:    dataDir,
+		Secret:     secret,
 		Logger:     log.Named("raft"),
 		Apply: func(cmd cluster.Command) error {
 			// At apply time the leader has already written through Postgres

@@ -9,6 +9,7 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -33,6 +34,16 @@ var configVersion atomic.Int64
 type loginRequest struct {
 	Email    string `json:"email" binding:"required"`
 	Password string `json:"password" binding:"required"`
+}
+
+// devLoginEnabled reports whether the no-database admin/admin123 backdoor is
+// explicitly permitted (local development only).
+func devLoginEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("SENTINEL_DEV_LOGIN"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 func handleLogin(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store, hub *logs.Hub) {
@@ -67,6 +78,16 @@ func handleLogin(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store, hub *
 			AuthMethod: "password",
 		}
 	} else {
+		// No user database. The built-in admin/admin123 backdoor exists only for
+		// local development and must be explicitly enabled — otherwise a
+		// misconfigured prod node (DB unreachable at boot) would expose a known
+		// credential. Off by default; opt in with SENTINEL_DEV_LOGIN=1.
+		if !devLoginEnabled() {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error": "authentication unavailable: no user database configured",
+			})
+			return
+		}
 		if req.Email != "admin@sentinel.local" || req.Password != "admin123" {
 			writeAuditEntry(c, nil, hub, &db.WriteAuditRequest{
 				TenantID:   db.DevTenantID,

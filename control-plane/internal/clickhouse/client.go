@@ -281,12 +281,21 @@ func facetColumn(c string) (string, bool) {
 	return "", false
 }
 
+// eq builds a "col = 'val'" predicate. col MUST be a trusted/whitelisted column
+// name (see facetColumn); only val is escaped.
 func eq(col, val string) string { return fmt.Sprintf("%s = '%s'", col, esc(val)) }
 
-// esc escapes a value for a single-quoted ClickHouse SQL literal.
+// esc renders a user value safe inside a single-quoted ClickHouse string
+// literal. ClickHouse's HTTP interface on this path has no bind-parameter
+// support, so injection-safety rests on three invariants, all upheld here:
+//   - every user-supplied value passes through esc(),
+//   - column/table names are whitelisted (facetColumn) — never interpolated raw,
+//   - numeric bounds (from/to/limit/bucket) are formatted with %d.
+// Backslash is escaped before the quote so the quote-escape can't be undone.
 func esc(s string) string {
-	s = strings.ReplaceAll(s, "\\", "\\\\")
+	s = strings.ReplaceAll(s, "\\", "\\\\") // must run first
 	s = strings.ReplaceAll(s, "'", "\\'")
+	s = strings.ReplaceAll(s, "\x00", "") // defensive: drop embedded NULs
 	return s
 }
 
