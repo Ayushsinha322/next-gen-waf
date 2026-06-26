@@ -75,7 +75,7 @@ function lifeBar(c: Certificate) {
   const color = d <= 0 ? "var(--red)" : d <= 14 ? "var(--red)" : d <= 30 ? "var(--amber)" : "var(--green)";
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-      <div style={{ flex: 1, height: 6, background: "rgba(255,255,255,.06)", borderRadius: 3, overflow: "hidden", minWidth: 60 }}>
+      <div style={{ flex: 1, height: 6, background: "rgba(255,255,255,.06)", borderRadius: 3, overflow: "hidden", minWidth: 80 }}>
         <div style={{ width: `${pct}%`, height: "100%", background: color, transition: "width .4s" }} />
       </div>
       <span className="td3" style={{ minWidth: 64, textAlign: "right" }}>
@@ -362,12 +362,14 @@ export default function CertificatesPage() {
                   const covered = coveredByDomain.get(c.domain) ?? [];
                   return (
                     <motion.tr key={c.domain} initial={{ opacity: 0, x: -8 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: idx * 0.02 }}>
-                      <td>
-                        <div style={{ fontWeight: 600, display: "flex", alignItems: "center", gap: 6 }}>
-                          {c.name ? c.name : c.domain}
-                          {isWildcard(c) && <span className="bdg bcy" title="Wildcard — covers all subdomains">✦ wildcard</span>}
+                      <td style={{ maxWidth: 260 }}>
+                        <div style={{ fontWeight: 600, display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
+                          <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={c.name || c.domain}>
+                            {c.name ? c.name : c.domain}
+                          </span>
+                          {isWildcard(c) && <span className="bdg bcy" style={{ flexShrink: 0 }} title="Wildcard — covers all subdomains">✦ wildcard</span>}
                         </div>
-                        <div className="td3" style={{ fontSize: 12 }}>
+                        <div className="td3" style={{ fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                           {c.name ? c.domain : ""}{c.san.length > 1 ? `${c.name ? " · " : ""}+${c.san.length - 1} SAN` : ""}
                         </div>
                       </td>
@@ -379,7 +381,7 @@ export default function CertificatesPage() {
                       <td><span className={`bdg ${src.cls}`}><span className="bdr" />{src.text}</span></td>
                       <td><span className={`bdg ${st.cls}`}><span className="bdr" />{st.label}</span></td>
                       <td className="td3">{fmtDate(c.expires_at)}</td>
-                      <td style={{ minWidth: 150 }}>{lifeBar(c)}</td>
+                      <td style={{ minWidth: 180 }}>{lifeBar(c)}</td>
                       <td>
                         <div style={{ display: "flex", gap: 4 }}>
                           <motion.button className="btn bg-btn btn-xs" disabled={busy === c.domain} whileHover={{ scale: 1.06 }} whileTap={{ scale: 0.95 }} onClick={() => rename(c)} title="Set profile name">

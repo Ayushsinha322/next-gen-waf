@@ -348,21 +348,22 @@ export default function OverviewPage() {
           <div className="ph"><div className="ptitle">Blocked requests by origin</div><span className="panel-badge pb-info">{metrics?.geoip_loaded ? "GeoIP" : "GeoIP off"}</span></div>
           <div className="pb"><WorldMap data={metrics?.by_country ?? {}} loaded={!!metrics?.geoip_loaded} /></div>
         </div>
-        <div className="panel">
+        <div className="panel" style={{ display: "flex", flexDirection: "column" }}>
           <div className="ph"><div className="ptitle">Response status</div><span className="panel-badge pb-info">{sTotal.toLocaleString()} reqs</span></div>
-          <div className="pb" style={{ display: "flex", alignItems: "center", gap: 18 }}>
-            <div style={{ width: 110, height: 110, borderRadius: "50%", background: `conic-gradient(${conic})`, position: "relative", flexShrink: 0 }}>
-              <div style={{ position: "absolute", inset: 14, borderRadius: "50%", background: "var(--bg2)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
-                <div style={{ fontSize: 16, fontWeight: 800, color: "var(--text)", fontFamily: "'Orbitron',sans-serif" }}>{sTotal > 0 ? `${((s2 / sTotal) * 100).toFixed(0)}%` : "—"}</div>
-                <div style={{ fontSize: 8, color: "var(--text3)" }}>success</div>
+          <div className="pb" style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 24, padding: "8px 18px" }}>
+            <div style={{ width: 132, height: 132, borderRadius: "50%", background: `conic-gradient(${conic})`, position: "relative", flexShrink: 0 }}>
+              <div style={{ position: "absolute", inset: 17, borderRadius: "50%", background: "var(--bg2)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
+                <div style={{ fontSize: 20, fontWeight: 800, color: "var(--text)", fontFamily: "'Orbitron',sans-serif" }}>{sTotal > 0 ? `${((s2 / sTotal) * 100).toFixed(0)}%` : "—"}</div>
+                <div style={{ fontSize: 9, color: "var(--text3)" }}>success</div>
               </div>
             </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 7, flex: 1 }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 12, flex: 1, maxWidth: 200 }}>
               {statusSlices.map(s => (
-                <div key={s.label} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11 }}>
-                  <span style={{ width: 9, height: 9, borderRadius: 2, background: s.color }} />
+                <div key={s.label} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
+                  <span style={{ width: 10, height: 10, borderRadius: 2, background: s.color, flexShrink: 0 }} />
                   <span style={{ color: "var(--text2)", flex: 1, fontFamily: "'Share Tech Mono',monospace" }}>{s.label}</span>
                   <span style={{ color: "var(--text)", fontFamily: "'Share Tech Mono',monospace" }}>{s.v.toLocaleString()}</span>
+                  <span style={{ color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", width: 38, textAlign: "right" }}>{sTotal > 0 ? `${((s.v / sTotal) * 100).toFixed(0)}%` : "—"}</span>
                 </div>
               ))}
             </div>
