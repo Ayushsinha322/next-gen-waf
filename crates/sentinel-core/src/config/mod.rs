@@ -496,11 +496,14 @@ pub struct BotDetectionConfig {
     pub challenge: ChallengeMode,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ChallengeMode {
     #[default]
     Off,
+    // `alias` keeps configs written under the old `rename_all = "lowercase"`
+    // scheme ("nativepow") deserializing after the switch to snake_case.
+    #[serde(alias = "nativepow")]
     NativePow,
     Recaptcha,
     Hcaptcha,

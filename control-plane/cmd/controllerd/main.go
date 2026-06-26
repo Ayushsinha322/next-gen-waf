@@ -214,14 +214,14 @@ func run() error {
 
 		// GeoIP country blocking (global policy applied across active sites).
 		// Searchable WAF history (ClickHouse-backed).
-		protected.GET("/events/status", func(c *gin.Context) { handleEventsStatus(c, chClient) })
+		protected.GET("/events/status", func(c *gin.Context) { handleEventsStatus(c, enforcer, chClient) })
 		protected.GET("/events/search", func(c *gin.Context) { handleEventsSearch(c, enforcer, chClient) })
 		protected.GET("/events/timeline", func(c *gin.Context) { handleEventsTimeline(c, enforcer, chClient) })
 		protected.GET("/events/facets", func(c *gin.Context) { handleEventsFacets(c, enforcer, chClient) })
 
 		protected.GET("/geoip/blocked", func(c *gin.Context) { handleListBlockedCountries(c, enforcer, store) })
-		protected.POST("/geoip/block", func(c *gin.Context) { handleBlockCountry(c, enforcer, store, hub) })
-		protected.DELETE("/geoip/block/:code", func(c *gin.Context) { handleUnblockCountry(c, enforcer, store, hub) })
+		protected.POST("/geoip/block", func(c *gin.Context) { handleBlockCountry(c, enforcer, store, hub, cl) })
+		protected.DELETE("/geoip/block/:code", func(c *gin.Context) { handleUnblockCountry(c, enforcer, store, hub, cl) })
 		protected.GET("/metrics/snapshot", func(c *gin.Context) { handleMetricsSnapshot(c, hub) })
 		protected.GET("/metrics/sites", func(c *gin.Context) { handleSiteMetrics(c, hub) })
 		protected.GET("/metrics/learning", func(c *gin.Context) { handleLearningReport(c, hub) })

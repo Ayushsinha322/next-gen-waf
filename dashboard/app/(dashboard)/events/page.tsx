@@ -36,11 +36,14 @@ export default function EventsPage() {
   const [action, setAction] = useState("");
   const [ip, setIp] = useState("");
 
-  const run = useCallback(async () => {
+  // `override` lets callers search with a value they just set this render —
+  // `setRule(k); run()` would otherwise search with the *previous* rule because
+  // state updates and this captured closure both lag a render behind.
+  const run = useCallback(async (override?: Partial<EventQuery>) => {
     setLoading(true);
     const to = Math.floor(Date.now() / 1000) + 60;
     const from = to - rangeSecs - 60;
-    const filter: EventQuery = { from, to, limit: 300, q, site, rule, action, ip };
+    const filter: EventQuery = { from, to, limit: 300, q, site, rule, action, ip, ...override };
     try {
       const st = await api.events.status();
       setStatus(st);
@@ -62,7 +65,7 @@ export default function EventsPage() {
   useEffect(() => { run(); }, [rangeSecs]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const maxBucket = Math.max(1, ...timeline.map(b => b.total));
-  const clearFilters = () => { setQ(""); setSite(""); setRule(""); setAction(""); setIp(""); setTimeout(run, 0); };
+  const clearFilters = () => { setQ(""); setSite(""); setRule(""); setAction(""); setIp(""); run({ q: "", site: "", rule: "", action: "", ip: "" }); };
   const activeFilters = [["site", site], ["rule", rule], ["action", action], ["ip", ip], ["q", q]].filter(([, v]) => v) as [string, string][];
 
   return (
@@ -109,7 +112,7 @@ export default function EventsPage() {
             <select className="fsel" value={action} onChange={e => setAction(e.target.value)}>
               <option value="">All actions</option><option value="BLOCK">BLOCK</option><option value="DETECT">DETECT</option>
             </select>
-            <button className="btn bc btn-sm" onClick={run}>Search</button>
+            <button className="btn bc btn-sm" onClick={() => run()}>Search</button>
             {activeFilters.length > 0 && <button className="btn bg-btn btn-sm" onClick={clearFilters}>✕ Clear</button>}
           </div></motion.div>
 
@@ -130,8 +133,8 @@ export default function EventsPage() {
           {/* facets + results */}
           <div style={{ display: "grid", gridTemplateColumns: "260px 1fr", gap: 14 }}>
             <motion.div variants={cardVariants} style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-              <FacetCard title="Top Rules" facets={ruleFacets} onPick={k => { setRule(k); setTimeout(run, 0); }} />
-              <FacetCard title="Top Source IPs" facets={ipFacets} onPick={k => { setIp(k); setTimeout(run, 0); }} />
+              <FacetCard title="Top Rules" facets={ruleFacets} onPick={k => { setRule(k); run({ rule: k }); }} />
+              <FacetCard title="Top Source IPs" facets={ipFacets} onPick={k => { setIp(k); run({ ip: k }); }} />
             </motion.div>
 
             <motion.div className="panel" variants={cardVariants}>

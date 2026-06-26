@@ -557,9 +557,16 @@ func handleDeleteSiteExclusion(c *gin.Context, enf *rbac.Enforcer, store *db.Sto
 	waf, excl := parseExclusions(site.WafPolicy)
 	kept := excl[:0]
 	for _, e := range excl {
-		if e.RuleID != ruleID {
-			kept = append(kept, e)
+		if e.RuleID == ruleID {
+			// 932236 is auto-injected by buildRustWaf; a plain removal would be
+			// silently re-added. Leave an empty opt-out marker so the rule stays
+			// fully enabled across rebuilds.
+			if ruleID == 932236 {
+				kept = append(kept, ruleExclusionSpec{RuleID: 932236})
+			}
+			continue
 		}
+		kept = append(kept, e)
 	}
 	newPolicy, err := encodeExclusions(waf, kept)
 	if err != nil {
@@ -877,28 +884,37 @@ func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
 		"api_discovery":     p.APIDiscovery,
 	}
 
-	// Rule exclusions — always include the well-known 932236 "ARGS_NAMES" / id
-	// suppression (avoids the `?id=42` false positive, see CRS importer notes)
-	// unless the operator has their own entry for that rule, then append any
-	// operator-defined exclusions (e.g. one-click disables from the learning
-	// report). Previously a custom list silently dropped the 932236 default.
+	// Rule exclusions — include the well-known 932236 "ARGS_NAMES" / id
+	// suppression by default (avoids the `?id=42` false positive, see CRS
+	// importer notes), even alongside operator-defined exclusions (e.g. one-click
+	// disables from the learning report).
+	//
+	// An operator can fully re-enable 932236 by storing an *empty* 932236 entry
+	// (no targets, not disabled): that acts as an opt-out marker — it suppresses
+	// the injected default and is itself dropped (a no-op to the data plane).
+	// `handleDeleteSiteExclusion` leaves this marker when 932236 is removed, so
+	// the default isn't silently re-added on the next build.
 	ex := []map[string]any{}
-	hasArgsNamesDefault := false
+	has932236 := false
+	out := make([]map[string]any, 0, len(ex)+1)
 	if len(p.RuleExclusions) > 0 {
 		if err := json.Unmarshal(p.RuleExclusions, &ex); err != nil {
 			ex = []map[string]any{}
 		}
 		for _, e := range ex {
 			if ruleIDEquals(e["rule_id"], 932236) {
-				hasArgsNamesDefault = true
-				break
+				has932236 = true
+				if isEmptyExclusion(e) {
+					continue // opt-out marker — drop it, don't emit to the proxy
+				}
 			}
+			out = append(out, e)
 		}
 	}
-	if !hasArgsNamesDefault {
-		ex = append(ex, map[string]any{"rule_id": 932236, "exclude_targets": []string{"ARGS_NAMES"}})
+	if !has932236 {
+		out = append(out, map[string]any{"rule_id": 932236, "exclude_targets": []string{"ARGS_NAMES"}})
 	}
-	waf["rule_exclusions"] = ex
+	waf["rule_exclusions"] = out
 
 	attachRawObject(waf, "rate_limit", p.RateLimit)
 	attachRawObject(waf, "bot_detection", p.BotDetection)
@@ -957,6 +973,19 @@ func ruleIDEquals(v any, want int) bool {
 		return int(i) == want
 	}
 	return false
+}
+
+// isEmptyExclusion reports whether a decoded exclusion is a no-op: not a
+// whole-rule disable and with no target list. Such an entry only ever serves as
+// an explicit "keep this rule fully enabled" opt-out marker (see buildRustWaf).
+func isEmptyExclusion(e map[string]any) bool {
+	if dis, _ := e["disable"].(bool); dis {
+		return false
+	}
+	if t, ok := e["exclude_targets"].([]any); ok && len(t) > 0 {
+		return false
+	}
+	return true
 }
 
 // attachRawObject decodes a raw JSON object and attaches it under key when

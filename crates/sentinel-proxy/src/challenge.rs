@@ -34,6 +34,9 @@ const CLEAR_COOKIE: &str = "sentinel_clear";
 
 /// What the request handler should do for a Challenge decision.
 pub enum Outcome {
+    /// Client already holds a valid clearance cookie — let the request through
+    /// without re-challenging.
+    Pass,
     /// Proof verified — set a clearance cookie and redirect back to `location`.
     Grant { location: String, set_cookie: String, expire_pow: String },
     /// Serve the interstitial challenge page.
@@ -156,7 +159,15 @@ fn make_clearance_cookie(ip: IpAddr) -> String {
 }
 
 /// Resolve a Challenge decision into a concrete action.
+///
+/// This is the single point every challenge source funnels through (suspicious
+/// bot, CRS rule, WASM plugin), so the clearance check lives here — a client
+/// that already solved a PoW within the clearance TTL is never re-challenged,
+/// regardless of which subsystem requested the challenge.
 pub fn resolve(headers: &HeaderMap, ip: IpAddr, uri: &Uri) -> Outcome {
+    if clearance_valid(headers, ip) {
+        return Outcome::Pass;
+    }
     if pow_valid(headers) {
         // Proof accepted — grant clearance and bounce back to the original URL.
         let location = uri.path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| "/".to_string());
@@ -178,8 +189,11 @@ fn interstitial() -> String {
     let diff = DIFFICULTY_BITS.to_string();
     let sig = sign(&[&nonce, &ts, &diff]);
 
+    // The PoW cookie must outlive the server's accept window, or a slow device
+    // loses it before submitting a still-valid solution. Drive the cookie's
+    // max-age from CHALLENGE_TTL_SECS so the two can't drift apart.
     let head = format!(
-        r#"<script>window.SENTINEL_CH={{nonce:"{nonce}",ts:{ts},diff:{diff},sig:"{sig}"}};</script>"#
+        r#"<script>window.SENTINEL_CH={{nonce:"{nonce}",ts:{ts},diff:{diff},sig:"{sig}",maxage:{CHALLENGE_TTL_SECS}}};</script>"#
     );
     format!("{HTML_HEAD}{head}{HTML_BODY}{SOLVER_JS}{HTML_TAIL}")
 }
@@ -220,7 +234,7 @@ function leadOk(hex,diff){var full=diff>>2,rem=diff&3,i;for(i=0;i<full;i++)if(he
 var CH=window.SENTINEL_CH,n=0,pb=document.getElementById("pb");
 function step(){
   var end=n+4000;
-  for(;n<end;n++){ if(leadOk(sha256(CH.nonce+"."+n),CH.diff)){ document.cookie="sentinel_pow="+CH.nonce+"."+CH.ts+"."+CH.diff+"."+CH.sig+"."+n+"; path=/; max-age=120; SameSite=Lax"; location.reload(); return; } }
+  for(;n<end;n++){ if(leadOk(sha256(CH.nonce+"."+n),CH.diff)){ document.cookie="sentinel_pow="+CH.nonce+"."+CH.ts+"."+CH.diff+"."+CH.sig+"."+n+"; path=/; max-age="+CH.maxage+"; SameSite=Lax"; location.reload(); return; } }
   if(pb)pb.style.width=((n%200000)/2000)+"%";
   setTimeout(step,0);
 }
@@ -284,6 +298,29 @@ mod tests {
         let sol = solve(nonce, 10);
         let stale = format!("{POW_COOKIE}={nonce}.{old_ts}.{diff}.{sig}.{sol}");
         assert!(!pow_valid(&headers_with(&stale)), "expired challenge must fail");
+    }
+
+    #[test]
+    fn resolve_passes_on_valid_clearance_without_rechallenge() {
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        let exp = (now() + 100).to_string();
+        let sig = sign(&[&ip.to_string(), &exp]);
+        let ck = format!("{CLEAR_COOKIE}={exp}.{sig}");
+        let uri: Uri = "/dashboard".parse().unwrap();
+
+        // A rule/plugin can set Challenge even though the client is already
+        // cleared; resolve() must let it through rather than serving a new PoW.
+        assert!(
+            matches!(resolve(&headers_with(&ck), ip, &uri), Outcome::Pass),
+            "valid clearance must Pass (no perpetual challenge loop)"
+        );
+
+        // No cookies at all → serve the interstitial.
+        let empty = HeaderMap::new();
+        assert!(
+            matches!(resolve(&empty, ip, &uri), Outcome::Serve { .. }),
+            "no clearance and no proof must serve the challenge"
+        );
     }
 
     #[test]

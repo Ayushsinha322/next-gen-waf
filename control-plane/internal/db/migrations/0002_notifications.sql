@@ -40,8 +40,19 @@ DO $$ BEGIN
     END IF;
 END $$;
 
-CREATE TRIGGER trg_notification_channels_updated BEFORE UPDATE ON notification_channels
-    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+-- Idempotent: this migration is also applied at startup by
+-- EnsureNotificationSchema, so guard the trigger (Postgres has no
+-- CREATE TRIGGER IF NOT EXISTS) to keep re-runs from failing.
+DO $$ BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger
+        WHERE tgname = 'trg_notification_channels_updated'
+          AND tgrelid = 'notification_channels'::regclass
+    ) THEN
+        CREATE TRIGGER trg_notification_channels_updated BEFORE UPDATE ON notification_channels
+            FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+    END IF;
+END $$;
 
 -- +goose StatementEnd
 

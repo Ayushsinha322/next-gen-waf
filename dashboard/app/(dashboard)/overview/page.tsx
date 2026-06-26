@@ -412,7 +412,7 @@ export default function OverviewPage() {
               { name: "SQL injection suite", on: enabledRules > 0 },
               { name: "XSS ruleset", on: enabledRules > 0 },
               { name: "Bot / scanner signatures", on: enabledRules > 0 },
-              { name: "ML anomaly engine", on: mlDet >= 0 && wafStatus?.running },
+              { name: "ML anomaly engine", on: !!wafStatus?.running },
               { name: "Custom site rules", on: totalRules > 0 },
             ].map((row, idx) => (
               <motion.div key={row.name} className="rule-row" initial={{ opacity: 0, x: -4 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: 0.5 + idx * 0.05 }}>

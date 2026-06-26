@@ -1,5 +1,5 @@
 "use client";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { motion } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
 import {
@@ -110,18 +110,31 @@ export default function CertificatesPage() {
   async function load() {
     setLoading(true);
     try {
-      const res = await api.certs.list();
+      // Independent calls — fetch concurrently. Sites are optional, so swallow
+      // their failure without failing the whole load.
+      const [res, s] = await Promise.all([
+        api.certs.list(),
+        api.sites.list().catch(() => ({ sites: [] as Site[] })),
+      ]);
       setCerts(res.certs ?? []);
       setWafUp(res.waf_running);
+      setSites(s.sites ?? []);
     } catch {
       showToast("Failed to load certificates", "e", "⚠️");
     } finally {
       setLoading(false);
     }
-    try { const s = await api.sites.list(); setSites(s.sites ?? []); } catch { /* sites optional */ }
   }
 
   useEffect(() => { load(); }, []);
+
+  // Map each cert → the sites it protects once per certs/sites change, instead
+  // of recomputing the O(certs × sites) match for every row on every render.
+  const coveredByDomain = useMemo(() => {
+    const m = new Map<string, Site[]>();
+    for (const c of certs) m.set(c.domain, protectedSites(c, sites));
+    return m;
+  }, [certs, sites]);
 
   const counts = {
     total:    certs.length,
@@ -346,7 +359,7 @@ export default function CertificatesPage() {
                   const src = sourceLabel(c.source);
                   const st = statusOf(c);
                   const isAcme = typeof c.source === "object" && "acme" in c.source;
-                  const covered = protectedSites(c, sites);
+                  const covered = coveredByDomain.get(c.domain) ?? [];
                   return (
                     <motion.tr key={c.domain} initial={{ opacity: 0, x: -8 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: idx * 0.02 }}>
                       <td>

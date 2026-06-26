@@ -419,36 +419,47 @@ impl ProxyServer {
         // second and bulk-insert every 5s (or 500 rows). Async + drop-on-error
         // so logging never blocks or grows unbounded if ClickHouse is down.
         if let Some(ch) = storage.clickhouse.clone() {
+            // Gate buffering on an active sink: record_event/record_traffic check
+            // this and become no-ops when ClickHouse is off, so the buffers don't
+            // grow unbounded with nothing to drain them.
+            CLICKHOUSE_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
             tokio::spawn(async move {
                 let mut buf: Vec<sentinel_storage::TrafficRow> = Vec::new();
+                let mut evbuf: Vec<sentinel_storage::WafEventRow> = Vec::new();
                 let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
                 let mut ticks = 0u32;
                 loop {
                     ticker.tick().await;
                     buf.extend(drain_traffic(unix_now()));
+                    evbuf.extend(drain_events());
                     ticks += 1;
-                    if (ticks >= 5 || buf.len() >= 500) && !buf.is_empty() {
+                    // Both streams flush on the same 5s-or-500-row cadence.
+                    let time_due = ticks >= 5;
+
+                    if (time_due || buf.len() >= 500) && !buf.is_empty() {
                         if let Err(e) = ch.insert_traffic_batch(&buf).await {
                             warn!(error = %e, rows = buf.len(), "clickhouse traffic flush failed — dropping batch");
                         } else {
                             debug!(rows = buf.len(), "clickhouse traffic flushed");
                         }
                         buf.clear(); // bounded: drop after every attempt
-                        ticks = 0;
                     }
 
-                    // Flush detailed events on the same cadence.
-                    let events = drain_events();
-                    if !events.is_empty() {
-                        if let Err(e) = ch.insert_events_batch(&events).await {
-                            warn!(error = %e, rows = events.len(), "clickhouse events flush failed — dropping batch");
+                    if (time_due || evbuf.len() >= 500) && !evbuf.is_empty() {
+                        if let Err(e) = ch.insert_events_batch(&evbuf).await {
+                            warn!(error = %e, rows = evbuf.len(), "clickhouse events flush failed — dropping batch");
                         } else {
-                            debug!(rows = events.len(), "clickhouse events flushed");
+                            debug!(rows = evbuf.len(), "clickhouse events flushed");
                         }
+                        evbuf.clear(); // bounded: drop after every attempt
+                    }
+
+                    if time_due {
+                        ticks = 0;
                     }
                 }
             });
-            info!("clickhouse traffic flusher started (1s sample · 5s flush → traffic_buckets)");
+            info!("clickhouse flusher started (1s sample · 5s/500-row flush → traffic_buckets + waf_events)");
         }
 
         let modules = Arc::new(ModulesState {
@@ -1157,13 +1168,22 @@ async fn proxy(
     }
 
     // Browser challenge (Proof-of-Work) — serve an interstitial or, if the
-    // client already solved it, grant clearance and bounce back.
+    // client already solved it, grant clearance and bounce back.  A client that
+    // already holds valid clearance gets `None` here (regardless of which
+    // subsystem asked for the challenge) and proceeds to origin — no re-loop.
     if ctx.decision == WafDecision::Challenge {
-        let resp = challenge_response(&ctx);
-        ctx.response_status = Some(resp.status());
-        ctx.advance_phase(Phase::Logging);
-        log_request(&ctx);
-        return Ok(resp);
+        let challenge_mode = site
+            .and_then(|s| s.waf.bot_detection.as_ref())
+            .map(|b| b.challenge)
+            .unwrap_or(ChallengeMode::NativePow);
+        if let Some(resp) = challenge_response(&mut ctx, challenge_mode) {
+            ctx.response_status = Some(resp.status());
+            ctx.advance_phase(Phase::Logging);
+            log_request(&ctx);
+            return Ok(resp);
+        }
+        // Cleared (or an in-line grant for an unsafe method) — proceed to origin.
+        ctx.decision = WafDecision::Allow;
     }
 
     if ctx.decision == WafDecision::Block {
@@ -1347,6 +1367,14 @@ async fn proxy(
     strip_hop_by_hop(&mut resp_parts.headers);
     inject_security_headers(&mut resp_parts.headers);
 
+    // Attach any clearance cookies from an in-line PoW grant (challenged POST/PUT
+    // that proceeded to origin instead of being 302'd to a bodyless GET).
+    for cookie in ctx.pending_set_cookies.drain(..) {
+        if let Ok(val) = header::HeaderValue::from_str(&cookie) {
+            resp_parts.headers.append(header::SET_COOKIE, val);
+        }
+    }
+
     // --- Phase 5: Response body — rule engine + DLP scan ---
     ctx.advance_phase(Phase::ResponseBody);
 
@@ -1412,19 +1440,32 @@ async fn proxy(
                         // (2) DLP scan (PII / secret leakage).
                         if let Some(dlp) = dlp {
                             if let Some(matched) = dlp.scan(&bytes) {
-                                warn!(
-                                    site = %site_cfg.id,
-                                    client_ip = %ctx.client_ip,
-                                    pattern = matched,
-                                    "DLP: sensitive data in response — blocking"
-                                );
                                 ctx.decision = WafDecision::Block;
                                 ctx.block_reason = Some(format!(
                                     "DLP: sensitive data pattern matched: {matched}"
                                 ));
-                                ctx.advance_phase(Phase::Logging);
-                                log_request(&ctx);
-                                return Ok(block_response(&ctx));
+                                // Respect learning mode (downgrade Block → Log)
+                                // exactly like the response-body rule path above —
+                                // a learning-mode site must not block or rewrite
+                                // the response, only record the would-block.
+                                enforce_mode(&mut ctx, &site_cfg.waf.mode);
+                                if ctx.decision == WafDecision::Block {
+                                    warn!(
+                                        site = %site_cfg.id,
+                                        client_ip = %ctx.client_ip,
+                                        pattern = matched,
+                                        "DLP: sensitive data in response — blocking"
+                                    );
+                                    ctx.advance_phase(Phase::Logging);
+                                    log_request(&ctx);
+                                    return Ok(block_response(&ctx));
+                                }
+                                warn!(
+                                    site = %site_cfg.id,
+                                    client_ip = %ctx.client_ip,
+                                    pattern = matched,
+                                    "DLP: sensitive data in response — would block (learning mode)"
+                                );
                             }
                         }
 
@@ -1555,8 +1596,9 @@ async fn phase1_headers(
             if let Some(geoip) = geoip_map.get(&site.id) {
                 match geoip.check(ctx.client_ip) {
                     GeoVerdict::Block { country_code } => {
-                        ctx.decision = WafDecision::Block;
                         ctx.block_reason = Some(format!("country blocked: {country_code}"));
+                        ctx.geo_country = Some(country_code);
+                        ctx.decision = WafDecision::Block;
                     }
                     GeoVerdict::Allow | GeoVerdict::Unknown => {}
                 }
@@ -2127,21 +2169,53 @@ fn inject_security_headers(headers: &mut http::HeaderMap) {
 /// Build the HTTP response for a `Challenge` decision: either the interstitial
 /// Proof-of-Work page, or (when the client submitted a valid proof) a 302 that
 /// sets the clearance cookie and bounces back to the original URL.
-fn challenge_response(ctx: &RequestContext) -> Response<BoxBody> {
+///
+/// Returns `None` when the request must proceed to origin instead of receiving
+/// a challenge response — either because the client already holds valid
+/// clearance, or because a Proof-of-Work grant was consumed in-line for an
+/// unsafe method (see below).
+///
+/// `mode` is the site's configured challenge backend. Only `NativePow` is
+/// implemented today; a configured third-party CAPTCHA provider is logged once
+/// and falls back to native Proof-of-Work rather than being silently ignored.
+///
+/// On a grant we normally 302 back to the original URL. That is correct for
+/// safe methods (GET/HEAD) but downgrades a challenged POST/PUT to a bodyless
+/// GET — the form submission is silently lost. For unsafe methods we instead
+/// stash the clearance cookies on `ctx` and return `None`, letting the request
+/// continue to origin with its method and body intact; the cookies are attached
+/// to the origin response by the caller.
+fn challenge_response(ctx: &mut RequestContext, mode: ChallengeMode) -> Option<Response<BoxBody>> {
+    if matches!(
+        mode,
+        ChallengeMode::Recaptcha | ChallengeMode::Hcaptcha | ChallengeMode::Turnstile
+    ) {
+        warn_unsupported_challenge(mode);
+    }
     match challenge::resolve(&ctx.request_headers, ctx.client_ip, &ctx.uri) {
-        challenge::Outcome::Grant { location, set_cookie, expire_pow } => Response::builder()
-            .status(StatusCode::FOUND)
-            .header(header::LOCATION, location)
-            .header(header::SET_COOKIE, set_cookie)
-            .header(header::SET_COOKIE, expire_pow)
-            .header(header::CACHE_CONTROL, "no-store")
-            .body(
-                Full::new(Bytes::new())
-                    .map_err(|never: Infallible| match never {})
-                    .boxed(),
-            )
-            .unwrap(),
-        challenge::Outcome::Serve { html } => Response::builder()
+        challenge::Outcome::Pass => None,
+        challenge::Outcome::Grant { location, set_cookie, expire_pow } => {
+            // Idempotent/safe methods can take the clean 302 redirect.
+            let safe = matches!(ctx.method, http::Method::GET | http::Method::HEAD);
+            if !safe {
+                ctx.pending_set_cookies.push(set_cookie);
+                ctx.pending_set_cookies.push(expire_pow);
+                return None;
+            }
+            Some(Response::builder()
+                .status(StatusCode::FOUND)
+                .header(header::LOCATION, location)
+                .header(header::SET_COOKIE, set_cookie)
+                .header(header::SET_COOKIE, expire_pow)
+                .header(header::CACHE_CONTROL, "no-store")
+                .body(
+                    Full::new(Bytes::new())
+                        .map_err(|never: Infallible| match never {})
+                        .boxed(),
+                )
+                .unwrap())
+        }
+        challenge::Outcome::Serve { html } => Some(Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
             .header(header::CACHE_CONTROL, "no-store")
@@ -2151,7 +2225,26 @@ fn challenge_response(ctx: &RequestContext) -> Response<BoxBody> {
                     .map_err(|never: Infallible| match never {})
                     .boxed(),
             )
-            .unwrap(),
+            .unwrap()),
+    }
+}
+
+/// Warn at most once per provider that a configured third-party CAPTCHA mode is
+/// not implemented and native Proof-of-Work is served instead.
+fn warn_unsupported_challenge(mode: ChallengeMode) {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static WARNED: AtomicU8 = AtomicU8::new(0);
+    let bit = match mode {
+        ChallengeMode::Recaptcha => 0b001,
+        ChallengeMode::Hcaptcha => 0b010,
+        ChallengeMode::Turnstile => 0b100,
+        _ => return,
+    };
+    if WARNED.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+        warn!(
+            "challenge mode {:?} is configured but not implemented; serving native Proof-of-Work instead",
+            mode
+        );
     }
 }
 
@@ -2458,6 +2551,10 @@ fn traffic_acc() -> &'static std::sync::Mutex<std::collections::HashMap<String, 
 /// Record one request into the current second's tally. Latency samples are
 /// capped per-site to bound memory under floods.
 fn record_traffic(site: &str, blocked: bool, latency_ms: f64) {
+    // No sink → no accumulation (the drainer only runs when ClickHouse is on).
+    if !CLICKHOUSE_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     if let Ok(mut m) = traffic_acc().lock() {
         let e = m.entry(site.to_string()).or_default();
         e.reqs += 1;
@@ -2508,6 +2605,11 @@ fn unix_now() -> i64 {
 static WAF_EVENTS: std::sync::OnceLock<std::sync::Mutex<Vec<sentinel_storage::WafEventRow>>> =
     std::sync::OnceLock::new();
 
+/// Set true once the ClickHouse flusher task is running. When ClickHouse is not
+/// configured nothing ever drains the buffers, so we must not buffer at all —
+/// otherwise the event buffer grows to its cap and is pinned in memory forever.
+static CLICKHOUSE_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn waf_events() -> &'static std::sync::Mutex<Vec<sentinel_storage::WafEventRow>> {
     WAF_EVENTS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
@@ -2516,6 +2618,10 @@ fn waf_events() -> &'static std::sync::Mutex<Vec<sentinel_storage::WafEventRow>>
 /// passes are skipped to keep volume sane. Buffer is capped to bound memory if
 /// ClickHouse is down/slow.
 fn record_event(ctx: &RequestContext) {
+    // No sink → no buffering (the drainer only runs when ClickHouse is enabled).
+    if !CLICKHOUSE_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     let action = match ctx.decision {
         WafDecision::Block | WafDecision::Challenge => "BLOCK",
         _ if ctx.would_block => "DETECT",
@@ -2525,7 +2631,7 @@ fn record_event(ctx: &RequestContext) {
     let row = sentinel_storage::WafEventRow {
         ts: unix_now(),
         ip: ctx.client_ip.to_string(),
-        country: String::new(), // populated once GeoIP is loaded
+        country: ctx.geo_country.clone().unwrap_or_default(), // set when GeoIP resolved a country
         site: ctx.site_id.clone().unwrap_or_else(|| "-".to_string()),
         method: ctx.method.as_str().to_string(),
         path: ctx.uri.path().to_string(),
@@ -2580,6 +2686,16 @@ fn resolve_log_dir() -> std::path::PathBuf {
 fn append_rotating(dir: &std::path::Path, name: &str, line: &str) -> std::io::Result<()> {
     use std::fs::{self, OpenOptions};
     use std::io::Write;
+    use std::sync::Mutex;
+
+    // Serialize the entire check-rotate-write sequence across all logging
+    // threads. `ndjson_log` runs inline on the multi-threaded tokio runtime, so
+    // without this lock two concurrent requests can both pass the size check and
+    // both run the rename shuffle — the second clobbers the first's `.1` backup,
+    // and lines written to a renamed-out fd land in the wrong/dropped file.
+    // Recover from a poisoned lock rather than wedging logging forever.
+    static LOG_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let max_bytes = std::env::var("SENTINEL_LOG_MAX_MB")
         .ok()
@@ -2596,17 +2712,23 @@ fn append_rotating(dir: &std::path::Path, name: &str, line: &str) -> std::io::Re
     if max_bytes > 0 {
         if let Ok(meta) = fs::metadata(&path) {
             if meta.len().saturating_add(line.len() as u64 + 1) > max_bytes {
-                // Drop the oldest, shift the rest up.
-                let oldest = dir.join(format!("{name}.{keep}"));
-                let _ = fs::remove_file(&oldest);
-                for i in (1..keep).rev() {
-                    let from = dir.join(format!("{name}.{i}"));
-                    let to = dir.join(format!("{name}.{}", i + 1));
-                    if from.exists() {
-                        let _ = fs::rename(&from, &to);
+                if keep == 0 {
+                    // Keep zero backups: discard the full file outright. (Renaming
+                    // it to `.1` would retain one backup, contradicting keep=0.)
+                    let _ = fs::remove_file(&path);
+                } else {
+                    // Drop the oldest, shift the rest up, then retire the live file.
+                    let oldest = dir.join(format!("{name}.{keep}"));
+                    let _ = fs::remove_file(&oldest);
+                    for i in (1..keep).rev() {
+                        let from = dir.join(format!("{name}.{i}"));
+                        let to = dir.join(format!("{name}.{}", i + 1));
+                        if from.exists() {
+                            let _ = fs::rename(&from, &to);
+                        }
                     }
+                    let _ = fs::rename(&path, dir.join(format!("{name}.1")));
                 }
-                let _ = fs::rename(&path, dir.join(format!("{name}.1")));
             }
         }
     }
@@ -2651,21 +2773,31 @@ fn ndjson_log(ctx: &RequestContext) -> std::io::Result<()> {
     });
     append_rotating(dir, "access.log", &access.to_string())?;
 
-    if !ctx.rule_matches.is_empty() || matches!(ctx.decision, WafDecision::Block) {
+    // Emit a waf.log line for anything the WAF acted on or *would* have acted on:
+    // any rule match, an enforced block, or a learning-mode would-block. The last
+    // case covers GeoIP / rate-limit / bot-challenge / smuggling blocks that were
+    // downgraded to Log in learning mode and carry no rule match — without it the
+    // learning report (which consumes only waf.log) undercounts would-have-blocks.
+    if !ctx.rule_matches.is_empty() || matches!(ctx.decision, WafDecision::Block) || ctx.would_block {
         let top = ctx.rule_matches.first();
         let sev_str = top
             .map(|r| format!("{:?}", r.severity).to_uppercase())
             .unwrap_or_else(|| "MEDIUM".to_string());
-        let attack = top
-            .map(|r| r.message.as_str())
-            .unwrap_or("anomaly threshold exceeded");
+        // For non-rule blocks (GeoIP, rate limit, smuggling, bot challenge, bare
+        // anomaly threshold) synthesize a stable rule label and attack name from
+        // the block reason, so the dashboard's attack breakdown and the learning
+        // report can categorize them instead of collapsing them into "-"/"other".
+        let (rule, attack): (&str, &str) = match top {
+            Some(r) => (r.rule_id.as_str(), r.message.as_str()),
+            None => classify_nonrule_block(ctx.block_reason.as_deref().unwrap_or("")),
+        };
 
         let waf = serde_json::json!({
             "ts":     ts,
             "ip":     ctx.client_ip.to_string(),
             "method": ctx.method.as_str(),
             "path":   ctx.uri.path(),
-            "rule":   top.map(|r| r.rule_id.as_str()).unwrap_or("-"),
+            "rule":   rule,
             "score":  ctx.anomaly_score,
             "sev":    sev_str,
             "attack": attack,
@@ -2679,6 +2811,25 @@ fn ndjson_log(ctx: &RequestContext) -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+/// Map a non-rule block reason to a stable `(rule, attack)` label pair. These
+/// synthetic rule labels mirror the categories the control-plane recognizes in
+/// `attackCategory`, so GeoIP / rate-limit / smuggling / bot blocks are counted
+/// distinctly rather than lumped under "-"/"other".
+fn classify_nonrule_block(reason: &str) -> (&'static str, &'static str) {
+    let r = reason.to_ascii_lowercase();
+    if r.contains("country blocked") || r.contains("geoip") {
+        ("GEOIP", "GeoIP country block")
+    } else if r.contains("rate limit") {
+        ("RATELIMIT", "Rate limit exceeded")
+    } else if r.contains("smuggling") {
+        ("SMUGGLING", "HTTP request smuggling")
+    } else if r.contains("bot") || r.contains("challenge") {
+        ("BOT", "Bot challenge")
+    } else {
+        ("ANOMALY", "anomaly threshold exceeded")
+    }
 }
 
 // ---------------------------------------------------------------------------

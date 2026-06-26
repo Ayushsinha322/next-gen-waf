@@ -59,9 +59,10 @@ export default function AlertsPage() {
     return () => { es?.close(); };
   }, []);
 
+  const needle = search.toLowerCase();
   const filtered = alerts.filter(a => {
-    const hay = JSON.stringify(a).toLowerCase();
-    const matchSearch = !search || hay.includes(search.toLowerCase());
+    // Only pay for the JSON.stringify scan when there's actually a search term.
+    const matchSearch = !needle || JSON.stringify(a).toLowerCase().includes(needle);
     const matchSev    = !sevFilter   || a.severity.toUpperCase() === sevFilter;
     const matchState  = !stateFilter || a.state === stateFilter;
     return matchSearch && matchSev && matchState;

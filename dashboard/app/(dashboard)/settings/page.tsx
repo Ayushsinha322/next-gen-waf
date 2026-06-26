@@ -372,8 +372,9 @@ function NotificationsTab() {
   }
   async function toggle(ch: NotificationChannel) {
     setBusy(ch.id);
+    // Re-throw so the optimistic <Toggle> rolls back when the save fails.
     try { await api.notifications.update(ch.id, { enabled: !ch.enabled }); await load(); }
-    catch { showToast("Update failed", "e", "⚠️"); }
+    catch (e) { showToast("Update failed", "e", "⚠️"); throw e; }
     finally { setBusy(null); }
   }
   async function del(ch: NotificationChannel) {
