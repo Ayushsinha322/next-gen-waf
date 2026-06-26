@@ -2519,9 +2519,7 @@ fn log_request(ctx: &RequestContext) {
         block_reason = ctx.block_reason.as_deref().unwrap_or(""),
         "request"
     );
-    if let Err(e) = ndjson_log(ctx) {
-        tracing::warn!(error = %e, "ndjson log write failed");
-    }
+    ndjson_log(ctx);
 
     // Feed the per-second traffic accumulator (drained by the ClickHouse
     // flusher, when ClickHouse is configured). Cheap; no-op when CH is off.
@@ -2679,24 +2677,118 @@ fn resolve_log_dir() -> std::path::PathBuf {
     std::path::PathBuf::from("/var/log/sentinel")
 }
 
-/// Append a line to `dir/name`, rotating first if the file would exceed the
-/// configured size cap. Rotation shifts `name.{k-1}` → `name.k` (dropping the
-/// oldest) and `name` → `name.1`, then writes to a fresh file. Bounds total
-/// on-disk log size to `max_bytes * (keep + 1)` per stream.
-fn append_rotating(dir: &std::path::Path, name: &str, line: &str) -> std::io::Result<()> {
-    use std::fs::{self, OpenOptions};
-    use std::io::Write;
-    use std::sync::Mutex;
+// ── Async NDJSON writer ──────────────────────────────────────────────────────
+//
+// Logging runs off the request hot path. Each request formats its line(s) and
+// hands them to a single dedicated OS thread over a bounded channel; the thread
+// is the sole writer, so it needs no lock, keeps file handles open (no per-line
+// `open`/`metadata` syscall), tracks size in memory for rotation, and batches
+// flushes. A full channel drops lines (and counts them) rather than blocking a
+// tokio worker — under extreme load, shedding access-log lines beats stalling
+// traffic.
 
-    // Serialize the entire check-rotate-write sequence across all logging
-    // threads. `ndjson_log` runs inline on the multi-threaded tokio runtime, so
-    // without this lock two concurrent requests can both pass the size check and
-    // both run the rename shuffle — the second clobbers the first's `.1` backup,
-    // and lines written to a renamed-out fd land in the wrong/dropped file.
-    // Recover from a poisoned lock rather than wedging logging forever.
-    static LOG_LOCK: Mutex<()> = Mutex::new(());
-    let _guard = LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+struct LogRecord {
+    name: &'static str,
+    line: String,
+}
 
+static LOG_TX: std::sync::OnceLock<std::sync::mpsc::SyncSender<LogRecord>> = std::sync::OnceLock::new();
+static LOG_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn log_sender() -> &'static std::sync::mpsc::SyncSender<LogRecord> {
+    LOG_TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<LogRecord>(65_536);
+        std::thread::Builder::new()
+            .name("sentinel-logwriter".into())
+            .spawn(move || log_writer_loop(rx))
+            .expect("spawn ndjson log writer");
+        tx
+    })
+}
+
+/// Hand a pre-formatted line to the writer thread. Non-blocking: drops (and
+/// counts) when the queue is saturated so the request path never stalls on I/O.
+fn enqueue_log(name: &'static str, line: String) {
+    if log_sender().try_send(LogRecord { name, line }).is_err() {
+        LOG_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// A single rotating log stream owned by the writer thread. Holds an open handle
+/// and tracks the on-disk size in memory, so writing a line costs no extra
+/// syscall beyond the buffered write itself. Rotation shifts `name.{k-1}` →
+/// `name.k` (dropping the oldest) and `name` → `name.1`; `keep == 0` discards the
+/// file outright. Bounds on-disk size to `max_bytes * (keep + 1)` per stream.
+struct RotatingFile {
+    dir: std::path::PathBuf,
+    name: &'static str,
+    max_bytes: u64,
+    keep: u32,
+    size: u64,
+    w: std::io::BufWriter<std::fs::File>,
+}
+
+impl RotatingFile {
+    fn open(dir: &std::path::Path, name: &'static str, max_bytes: u64, keep: u32) -> std::io::Result<Self> {
+        let f = std::fs::OpenOptions::new().append(true).create(true).open(dir.join(name))?;
+        let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            name,
+            max_bytes,
+            keep,
+            size,
+            w: std::io::BufWriter::new(f),
+        })
+    }
+
+    fn write_line(&mut self, line: &str) {
+        use std::io::Write;
+        let n = line.len() as u64 + 1;
+        if self.max_bytes > 0 && self.size + n > self.max_bytes {
+            let _ = self.rotate();
+        }
+        if writeln!(self.w, "{line}").is_ok() {
+            self.size += n;
+        }
+    }
+
+    fn flush(&mut self) {
+        use std::io::Write;
+        let _ = self.w.flush();
+    }
+
+    fn rotate(&mut self) -> std::io::Result<()> {
+        use std::io::Write;
+        let _ = self.w.flush(); // land buffered bytes in the file we're retiring
+        let (dir, name, keep) = (&self.dir, self.name, self.keep);
+        let path = dir.join(name);
+        if keep == 0 {
+            // Keep zero backups: discard the full file outright.
+            let _ = std::fs::remove_file(&path);
+        } else {
+            let _ = std::fs::remove_file(dir.join(format!("{name}.{keep}")));
+            for i in (1..keep).rev() {
+                let from = dir.join(format!("{name}.{i}"));
+                let to = dir.join(format!("{name}.{}", i + 1));
+                if from.exists() {
+                    let _ = std::fs::rename(&from, &to);
+                }
+            }
+            let _ = std::fs::rename(&path, dir.join(format!("{name}.1")));
+        }
+        let f = std::fs::OpenOptions::new().append(true).create(true).open(&path)?;
+        self.w = std::io::BufWriter::new(f);
+        self.size = 0;
+        Ok(())
+    }
+}
+
+/// The dedicated writer thread: resolve config once, then drain the channel,
+/// batching writes and flushing per batch.
+fn log_writer_loop(rx: std::sync::mpsc::Receiver<LogRecord>) {
+    let dir = resolve_log_dir();
+    let _ = std::fs::create_dir_all(&dir);
     let max_bytes = std::env::var("SENTINEL_LOG_MAX_MB")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -2707,41 +2799,65 @@ fn append_rotating(dir: &std::path::Path, name: &str, line: &str) -> std::io::Re
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(5);
 
-    let path = dir.join(name);
-    // Rotate when the existing file plus this line would exceed the cap.
-    if max_bytes > 0 {
-        if let Ok(meta) = fs::metadata(&path) {
-            if meta.len().saturating_add(line.len() as u64 + 1) > max_bytes {
-                if keep == 0 {
-                    // Keep zero backups: discard the full file outright. (Renaming
-                    // it to `.1` would retain one backup, contradicting keep=0.)
-                    let _ = fs::remove_file(&path);
-                } else {
-                    // Drop the oldest, shift the rest up, then retire the live file.
-                    let oldest = dir.join(format!("{name}.{keep}"));
-                    let _ = fs::remove_file(&oldest);
-                    for i in (1..keep).rev() {
-                        let from = dir.join(format!("{name}.{i}"));
-                        let to = dir.join(format!("{name}.{}", i + 1));
-                        if from.exists() {
-                            let _ = fs::rename(&from, &to);
-                        }
-                    }
-                    let _ = fs::rename(&path, dir.join(format!("{name}.1")));
+    let mut files: std::collections::HashMap<&'static str, RotatingFile> = std::collections::HashMap::new();
+    let mut last_dropped = 0u64;
+
+    let mut write_one = |files: &mut std::collections::HashMap<&'static str, RotatingFile>, rec: LogRecord| {
+        if !files.contains_key(rec.name) {
+            match RotatingFile::open(&dir, rec.name, max_bytes, keep) {
+                Ok(rf) => {
+                    files.insert(rec.name, rf);
                 }
+                Err(_) => return, // can't open the file — drop the line
             }
         }
-    }
+        if let Some(rf) = files.get_mut(rec.name) {
+            rf.write_line(&rec.line);
+        }
+    };
 
-    let mut f = OpenOptions::new().append(true).create(true).open(&path)?;
-    writeln!(f, "{line}")
+    loop {
+        let rec = match rx.recv() {
+            Ok(r) => r,
+            Err(_) => return, // all senders gone (process shutdown)
+        };
+        write_one(&mut files, rec);
+        // Opportunistically drain whatever else is queued, then flush once.
+        while let Ok(rec) = rx.try_recv() {
+            write_one(&mut files, rec);
+        }
+        for f in files.values_mut() {
+            f.flush();
+        }
+        let dropped = LOG_DROPPED.load(std::sync::atomic::Ordering::Relaxed);
+        if dropped > last_dropped {
+            warn!(
+                dropped = dropped - last_dropped,
+                total = dropped,
+                "ndjson log writer: dropped lines (channel saturated)"
+            );
+            last_dropped = dropped;
+        }
+    }
 }
 
-fn ndjson_log(ctx: &RequestContext) -> std::io::Result<()> {
-    let dir = resolve_log_dir();
-    let dir = dir.as_path();
-    std::fs::create_dir_all(dir)?;
+/// File-based NDJSON logging is on by default; set `SENTINEL_NDJSON_LOG=0`
+/// (or false/off) to disable it — useful when shipping events to ClickHouse
+/// only, or when the synchronous per-request file write is a throughput limit.
+fn ndjson_logging_enabled() -> bool {
+    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EN.get_or_init(|| {
+        !matches!(
+            std::env::var("SENTINEL_NDJSON_LOG").ok().as_deref(),
+            Some("0") | Some("false") | Some("off")
+        )
+    })
+}
 
+fn ndjson_log(ctx: &RequestContext) {
+    if !ndjson_logging_enabled() {
+        return;
+    }
     let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let status = ctx.response_status.map(|s| s.as_u16()).unwrap_or(0);
     let ua = ctx
@@ -2771,7 +2887,7 @@ fn ndjson_log(ctx: &RequestContext) -> std::io::Result<()> {
         "action":  action,
         "score":   ctx.anomaly_score,
     });
-    append_rotating(dir, "access.log", &access.to_string())?;
+    enqueue_log("access.log", access.to_string());
 
     // Emit a waf.log line for anything the WAF acted on or *would* have acted on:
     // any rule match, an enforced block, or a learning-mode would-block. The last
@@ -2807,10 +2923,8 @@ fn ndjson_log(ctx: &RequestContext) -> std::io::Result<()> {
             "would_block": ctx.would_block,
             "ml_scores": ctx.ml_scores,
         });
-        append_rotating(dir, "waf.log", &waf.to_string())?;
+        enqueue_log("waf.log", waf.to_string());
     }
-
-    Ok(())
 }
 
 /// Map a non-rule block reason to a stable `(rule, attack)` label pair. These
@@ -2874,20 +2988,20 @@ mod log_rotation_tests {
     use super::*;
 
     #[test]
-    fn append_rotating_caps_size_and_prunes_backups() {
+    fn rotating_file_caps_size_and_prunes_backups() {
         let dir = std::env::temp_dir().join(format!("sentinel-rot-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        // 1 MB cap, keep 2 backups.
-        std::env::set_var("SENTINEL_LOG_MAX_MB", "1");
-        std::env::set_var("SENTINEL_LOG_KEEP", "2");
-
-        // ~10 KB lines; ~3.4 MB total → forces several rotations.
+        // 1 MB cap, keep 2 backups. ~10 KB lines, ~3.4 MB → several rotations.
         let line = "x".repeat(10_000);
-        for _ in 0..340 {
-            append_rotating(&dir, "access.log", &line).unwrap();
-        }
+        {
+            let mut rf = RotatingFile::open(&dir, "access.log", 1024 * 1024, 2).unwrap();
+            for _ in 0..340 {
+                rf.write_line(&line);
+            }
+            rf.flush();
+        } // drop closes the handle
 
         let live = dir.join("access.log");
         assert!(live.exists(), "live log must exist");
@@ -2900,8 +3014,26 @@ mod log_rotation_tests {
         assert!(dir.join("access.log.2").exists(), "expected access.log.2");
         assert!(!dir.join("access.log.3").exists(), "keep=2 must drop access.log.3");
 
-        std::env::remove_var("SENTINEL_LOG_MAX_MB");
-        std::env::remove_var("SENTINEL_LOG_KEEP");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotating_file_keep_zero_retains_no_backup() {
+        let dir = std::env::temp_dir().join(format!("sentinel-rot0-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let line = "y".repeat(10_000);
+        {
+            let mut rf = RotatingFile::open(&dir, "access.log", 1024 * 1024, 0).unwrap();
+            for _ in 0..340 {
+                rf.write_line(&line);
+            }
+            rf.flush();
+        }
+        assert!(dir.join("access.log").exists(), "live log must exist");
+        assert!(!dir.join("access.log.1").exists(), "keep=0 must retain no backup");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
