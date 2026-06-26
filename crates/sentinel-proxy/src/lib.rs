@@ -50,7 +50,7 @@ use rustls::ServerConfig;
 use sentinel_core::{
     config::{
         ChallengeMode, ConfigHandle, DlpConfig, IpReputationConfig, ListenerConfig, Protocol,
-        SentinelConfig, SiteConfig, WafMode,
+        SecurityHeadersConfig, SentinelConfig, SiteConfig, WafMode,
     },
     context::{Phase, RequestContext, WafDecision},
 };
@@ -1158,6 +1158,20 @@ async fn proxy(
                     ));
                 }
             }
+            // HTTP method allow-list (empty = allow all). Case-insensitive.
+            if !s.waf.allowed_methods.is_empty() {
+                let m = ctx.method.as_str();
+                if !s.waf.allowed_methods.iter().any(|a| a.eq_ignore_ascii_case(m)) {
+                    ctx.decision = WafDecision::Block;
+                    ctx.block_reason = Some(format!("method not allowed: {m}"));
+                    ctx.advance_phase(Phase::Logging);
+                    log_request(&ctx);
+                    return Ok(error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "Method Not Allowed",
+                    ));
+                }
+            }
         }
     }
 
@@ -1365,7 +1379,7 @@ async fn proxy(
     }
 
     strip_hop_by_hop(&mut resp_parts.headers);
-    inject_security_headers(&mut resp_parts.headers);
+    inject_security_headers(&mut resp_parts.headers, site_cfg.waf.security_headers.as_ref());
 
     // Attach any clearance cookies from an in-line PoW grant (challenged POST/PUT
     // that proceeded to origin instead of being 302'd to a bodyless GET).
@@ -2154,16 +2168,61 @@ fn inject_forwarding_headers(
     Ok(())
 }
 
-fn inject_security_headers(headers: &mut http::HeaderMap) {
-    let insert = |h: &mut http::HeaderMap, name: &'static str, value: &'static str| {
-        h.entry(header::HeaderName::from_static(name))
-            .or_insert_with(|| value.parse().unwrap());
+fn inject_security_headers(headers: &mut http::HeaderMap, cfg: Option<&SecurityHeadersConfig>) {
+    // Secure defaults — only when the upstream didn't already set them.
+    let default = |h: &mut http::HeaderMap, name: &'static str, value: &str| {
+        if let Ok(v) = http::HeaderValue::from_str(value) {
+            h.entry(header::HeaderName::from_static(name)).or_insert(v);
+        }
     };
-    insert(headers, "x-content-type-options", "nosniff");
-    insert(headers, "x-frame-options", "SAMEORIGIN");
-    insert(headers, "referrer-policy", "strict-origin-when-cross-origin");
-    insert(headers, "x-xss-protection", "1; mode=block");
-    insert(headers, "permissions-policy", "geolocation=(), microphone=(), camera=()");
+    default(headers, "x-content-type-options", "nosniff");
+    default(headers, "x-frame-options", "SAMEORIGIN");
+    default(headers, "x-xss-protection", "1; mode=block");
+
+    // Referrer-Policy / Permissions-Policy: force the operator's value when
+    // configured, otherwise fall back to a secure default.
+    let force = |h: &mut http::HeaderMap, name: &'static str, value: &str| {
+        if let Ok(v) = http::HeaderValue::from_str(value) {
+            h.insert(header::HeaderName::from_static(name), v);
+        }
+    };
+    match cfg.and_then(|c| c.referrer_policy.as_deref()).filter(|s| !s.is_empty()) {
+        Some(rp) => force(headers, "referrer-policy", rp),
+        None => default(headers, "referrer-policy", "strict-origin-when-cross-origin"),
+    }
+    match cfg.and_then(|c| c.permissions_policy.as_deref()).filter(|s| !s.is_empty()) {
+        Some(pp) => force(headers, "permissions-policy", pp),
+        None => default(headers, "permissions-policy", "geolocation=(), microphone=(), camera=()"),
+    }
+
+    let Some(cfg) = cfg else { return };
+
+    // CSP has no default (it can break apps) — emit only when configured.
+    if let Some(csp) = cfg.content_security_policy.as_deref().filter(|s| !s.is_empty()) {
+        if let Ok(v) = http::HeaderValue::from_str(csp) {
+            headers.insert(header::CONTENT_SECURITY_POLICY, v);
+        }
+    }
+    // CORS allow-origin.
+    if let Some(cors) = &cfg.cors {
+        if cors.enabled && !cors.allow_origin.is_empty() {
+            if let Ok(v) = http::HeaderValue::from_str(&cors.allow_origin) {
+                headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
+            }
+        }
+    }
+    // Operator-defined custom headers, applied last so they win.
+    for h in &cfg.custom {
+        if h.name.is_empty() {
+            continue;
+        }
+        if let (Ok(name), Ok(val)) = (
+            header::HeaderName::from_bytes(h.name.as_bytes()),
+            http::HeaderValue::from_str(&h.value),
+        ) {
+            headers.insert(name, val);
+        }
+    }
 }
 
 /// Build the HTTP response for a `Challenge` decision: either the interstitial

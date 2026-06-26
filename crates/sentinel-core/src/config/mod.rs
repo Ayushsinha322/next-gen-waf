@@ -376,6 +376,44 @@ pub struct WafConfig {
     /// Maximum number of request headers (0 = unlimited, default 100).
     #[serde(default = "default_max_header_count")]
     pub max_header_count: u32,
+    /// Allowed HTTP methods. Empty = allow all; otherwise a request whose method
+    /// isn't listed is rejected with 405. Case-insensitive.
+    #[serde(default)]
+    pub allowed_methods: Vec<String>,
+    /// Per-site response/security header policy (overrides the proxy defaults
+    /// and injects operator-defined headers).
+    pub security_headers: Option<SecurityHeadersConfig>,
+}
+
+/// Operator-configurable response headers, applied on top of the proxy's secure
+/// defaults. Empty/absent fields fall back to the built-in defaults.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SecurityHeadersConfig {
+    /// `Content-Security-Policy` value (omitted by default — CSP can break apps).
+    pub content_security_policy: Option<String>,
+    /// Override `Referrer-Policy` (default: strict-origin-when-cross-origin).
+    pub referrer_policy: Option<String>,
+    /// Override `Permissions-Policy`.
+    pub permissions_policy: Option<String>,
+    /// CORS handling (`Access-Control-Allow-Origin`).
+    pub cors: Option<CorsConfig>,
+    /// Arbitrary operator-defined response headers (name/value), applied last.
+    #[serde(default)]
+    pub custom: Vec<CustomHeader>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CorsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub allow_origin: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CustomHeader {
+    pub name: String,
+    pub value: String,
 }
 
 /// Removes one or more targets from a rule to suppress known false positives.

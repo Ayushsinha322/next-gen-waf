@@ -875,6 +875,8 @@ func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
 		MaxURILength     *uint32         `json:"max_uri_length"`
 		MaxHeaderCount   *uint32         `json:"max_header_count"`
 		APIDiscovery     bool            `json:"api_discovery"`
+		AllowedMethods   []string        `json:"allowed_methods"`
+		SecurityHeaders  json.RawMessage `json:"security_headers"`
 	}
 	if len(raw) > 0 {
 		if err := json.Unmarshal(raw, &p); err != nil {
@@ -977,6 +979,14 @@ func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
 	if p.MaxHeaderCount != nil {
 		waf["max_header_count"] = *p.MaxHeaderCount
 	}
+
+	// Method allow-list and response/security headers — pass through so the
+	// data plane can actually enforce what the wizard collects (a full method
+	// list means "no restriction"; an empty/partial list restricts).
+	if len(p.AllowedMethods) > 0 {
+		waf["allowed_methods"] = p.AllowedMethods
+	}
+	attachRawObject(waf, "security_headers", p.SecurityHeaders)
 
 	return waf, nil
 }
