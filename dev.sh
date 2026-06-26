@@ -50,7 +50,15 @@ _start_dash_bg() {
 _start_cp_bg() {
   cd "$CP"
   GOTOOLCHAIN=local go build -o bin/controllerd ./cmd/controllerd 2>&1 | grep -v "^$" || true
-  nohup ./bin/controllerd > /tmp/controllerd.log 2>&1 &
+  # Local dev runs without a database, so enable the built-in admin login
+  # (admin@sentinel.local / admin123). This backdoor is gated off by default in
+  # prod; SENTINEL_DEV_LOGIN=1 is the explicit dev opt-in.
+  # SENTINEL_CONFIG/PROXY_BIN must be absolute: the auto-started data plane runs
+  # with CWD=control-plane, so the default relative config path won't resolve.
+  SENTINEL_DEV_LOGIN=1 \
+    SENTINEL_CONFIG="$REPO/configs/dev/sentinel.yaml" \
+    SENTINEL_PROXY_BIN="$REPO/target/debug/sentinel-bin" \
+    nohup ./bin/controllerd > /tmp/controllerd.log 2>&1 &
   echo "control plane started → http://localhost:$CP_REST  (logs: /tmp/controllerd.log)"
 }
 
