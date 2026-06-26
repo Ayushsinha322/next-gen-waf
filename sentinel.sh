@@ -161,7 +161,16 @@ _start_cp() {
   mkdir -p "$SENTINEL_LOG_DIR"
   # This launcher manages the WAF proxy itself (see _start_proxy), so tell the
   # control plane NOT to spawn a second proxy — avoids a duplicate data plane.
+  #
+  # cmd_infra_up already started Postgres + Redis, so point the control plane at
+  # them: with a DB the control plane migrates + seeds the admin user
+  # (admin@sentinel.local / admin123) and login works the normal way. If the DB
+  # is somehow unreachable it falls back to degraded mode, where SENTINEL_DEV_LOGIN
+  # keeps the built-in admin login working (it's gated off by default in prod).
   SENTINEL_AUTOSTART_DATAPLANE=0 \
+  SENTINEL_DB_URL="${SENTINEL_DB_URL:-postgres://sentinel:sentinel_dev@localhost:5432/sentinel?sslmode=disable}" \
+  SENTINEL_REDIS_URL="${SENTINEL_REDIS_URL:-redis://localhost:6379}" \
+  SENTINEL_DEV_LOGIN=1 \
   nohup "$CP/bin/controllerd" > "$CP_LOG" 2>&1 &
   disown
   wait_for_port $CP_REST "Control plane"
