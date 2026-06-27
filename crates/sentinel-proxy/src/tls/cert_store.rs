@@ -280,7 +280,11 @@ impl ResolvesServerCert for SentinelCertResolver {
         &self,
         client_hello: rustls::server::ClientHello<'_>,
     ) -> Option<Arc<CertifiedKey>> {
-        let sni = client_hello.server_name()?;
+        // Clients connecting by bare IP (and some older clients) send no SNI.
+        // Serve a stable default self-signed cert so the handshake still
+        // completes — Host-header routing then selects the site. Without this,
+        // returning None here would abort the handshake and break IP access.
+        let sni = client_hello.server_name().unwrap_or("default");
 
         // 1. TLS-ALPN-01 challenge takes highest priority
         let is_acme_alpn = client_hello

@@ -989,7 +989,10 @@ async fn handle_request(
     // Loopback-only: these endpoints share the public listener, so anything
     // under /api/v1/internal/certs is refused unless the peer is on localhost.
     if req.uri().path().starts_with("/api/v1/internal/certs") {
-        if !peer.ip().is_loopback() {
+        // Allowed from loopback (co-located dev) OR with a valid shared-secret
+        // header — the control plane uses the latter to reach the data plane
+        // across containers (Docker/K8s), where the peer is not loopback.
+        if !peer.ip().is_loopback() && !internal_auth_ok(req.headers()) {
             return Ok(error_response(StatusCode::FORBIDDEN, "internal endpoint"));
         }
         return Ok(handle_internal_cert_api(state, req).await);
@@ -1103,6 +1106,19 @@ async fn proxy(
 
     // --- Phase 1: Request headers ---
     let (mut parts, body) = req.into_parts();
+
+    // HTTP/2 carries the authority in the `:authority` pseudo-header (surfaced as
+    // the request URI's authority) rather than a `Host` header. Synthesize a Host
+    // header from it when absent, so site-matching, WAF rules, logging, and
+    // upstream forwarding all see a consistent host — otherwise h2 requests match
+    // no site and 502.
+    if !parts.headers.contains_key(header::HOST) {
+        if let Some(auth) = parts.uri.authority().map(|a| a.as_str().to_owned()) {
+            if let Ok(hv) = header::HeaderValue::from_str(&auth) {
+                parts.headers.insert(header::HOST, hv);
+            }
+        }
+    }
 
     ctx.http_version = parts.version;
     ctx.method = parts.method.clone();
@@ -1318,6 +1334,10 @@ async fn proxy(
     inject_forwarding_headers(&mut parts.headers, peer.ip())?;
 
     parts.uri = upstream_uri;
+    // Forward to the upstream as HTTP/1.1 regardless of the client's protocol.
+    // An h2 client request still carries version=HTTP/2, which the HTTP/1.1
+    // upstream client cannot send (→ "upstream request failed" / 502).
+    parts.version = http::Version::HTTP_11;
     let upstream_req = Request::from_parts(parts, boxed_body);
 
     let upstream_start = std::time::Instant::now();
@@ -2068,6 +2088,33 @@ fn parse_cidr_text(text: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Constant-time byte comparison to avoid leaking the shared secret via timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Permit the otherwise loopback-only internal cert API when the caller presents
+/// the shared internal secret (env `SENTINEL_INTERNAL_SECRET`) via the
+/// `X-Sentinel-Internal` header. This lets the control plane reach the data
+/// plane across containers. Returns false when the secret is unset/empty.
+fn internal_auth_ok(headers: &http::HeaderMap) -> bool {
+    match std::env::var("SENTINEL_INTERNAL_SECRET") {
+        Ok(secret) if !secret.is_empty() => headers
+            .get("x-sentinel-internal")
+            .and_then(|v| v.to_str().ok())
+            .map(|got| constant_time_eq(got.as_bytes(), secret.as_bytes()))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
 
 fn site_matches(site: &SiteConfig, host: &str) -> bool {
     let host_lc = host.to_ascii_lowercase();

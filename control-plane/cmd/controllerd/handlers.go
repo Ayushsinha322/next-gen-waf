@@ -763,7 +763,103 @@ func siteRowToRustConfig(s db.SiteRow) (map[string]any, error) {
 		"upstream": upstream,
 		"waf":      waf,
 		"plugins":  []any{},
+		// Per-site TLS intent (the dashboard nests it under waf_policy.tls) lifted
+		// to the top-level Rust SiteConfig.tls, so the data plane honors per-site
+		// cert mode (ACME auto-issuance/renewal, manual cert paths). Serving certs
+		// by SNI works regardless of this; mode=acme additionally drives issuance.
+		"tls": buildRustSiteTLS(s.WafPolicy),
 	}, nil
+}
+
+// buildRustSiteTLS extracts the per-site TLS intent the dashboard nests under
+// waf_policy.tls and converts it to the Rust SiteTlsConfig shape
+// (mode: off | self_signed | manual | acme). Dashboard modes map as:
+//
+//	auto     -> acme (+ acme{email,provider,challenge}) — drives auto-issue/renew
+//	manual   -> manual{cert,key} when the operator chose "path on WAF node";
+//	            a pasted PEM is already in the cert repository (served by SNI) -> off
+//	existing -> off (the chosen repo cert is served by SNI for the domain)
+//	off / "" -> off
+//
+// It always returns a valid SiteTlsConfig so the config-sync never fails to parse.
+func buildRustSiteTLS(raw json.RawMessage) map[string]any {
+	off := map[string]any{"mode": "off"}
+	if len(raw) == 0 {
+		return off
+	}
+	var p struct {
+		TLS *struct {
+			Mode        string `json:"mode"`
+			Email       string `json:"email"`
+			Provider    string `json:"provider"`
+			Challenge   string `json:"challenge"`
+			RenewBefore uint32 `json:"renew_before_days"`
+			Custom      *struct {
+				Priority string `json:"priority"`
+				CertPath string `json:"cert_path"`
+				KeyPath  string `json:"key_path"`
+			} `json:"custom"`
+		} `json:"tls"`
+	}
+	if err := json.Unmarshal(raw, &p); err != nil || p.TLS == nil {
+		return off
+	}
+	t := p.TLS
+	switch t.Mode {
+	case "auto":
+		if t.Email == "" {
+			return off // ACME needs a contact email; nothing to do without one
+		}
+		acme := map[string]any{"email": t.Email}
+		if prov := rustAcmeProvider(t.Provider); prov != "" {
+			acme["provider"] = prov
+		}
+		if ch := rustAcmeChallenge(t.Challenge); ch != "" {
+			acme["challenge"] = ch
+		}
+		if t.RenewBefore > 0 {
+			acme["renew_before_days"] = t.RenewBefore
+		}
+		return map[string]any{"mode": "acme", "acme": acme}
+	case "manual":
+		if t.Custom != nil && t.Custom.Priority == "file" && t.Custom.CertPath != "" && t.Custom.KeyPath != "" {
+			return map[string]any{"mode": "manual", "cert": t.Custom.CertPath, "key": t.Custom.KeyPath}
+		}
+		return off // pasted PEM lives in the cert repository; served by SNI
+	case "self_signed":
+		return map[string]any{"mode": "self_signed"}
+	default: // "existing", "off", "" → served by SNI / no per-site action
+		return off
+	}
+}
+
+// rustAcmeProvider maps the dashboard provider id to the Rust AcmeProvider serde
+// value; returns "" to let the Rust default (lets_encrypt) apply.
+func rustAcmeProvider(p string) string {
+	switch p {
+	case "letsencrypt", "lets_encrypt":
+		return "lets_encrypt"
+	case "letsencrypt_staging", "lets_encrypt_staging":
+		return "lets_encrypt_staging"
+	case "zerossl", "zero_ssl":
+		return "zero_ssl"
+	default:
+		return ""
+	}
+}
+
+// rustAcmeChallenge maps the dashboard challenge id to the Rust AcmeChallengeType
+// serde value; returns "" to let the Rust default (http01) apply. DNS-01 is not
+// supported by the data plane yet, so it falls back to the default.
+func rustAcmeChallenge(c string) string {
+	switch c {
+	case "http_01", "http01":
+		return "http01"
+	case "tls_alpn_01", "tls_alpn01":
+		return "tls_alpn01"
+	default:
+		return ""
+	}
 }
 
 // buildRustUpstream accepts both the legacy shape

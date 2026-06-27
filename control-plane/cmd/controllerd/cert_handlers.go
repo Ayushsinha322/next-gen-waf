@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -13,10 +14,21 @@ import (
 	"github.com/your-org/sentinel-waf/control-plane/internal/rbac"
 )
 
-// dataPlaneBaseURL is where the Rust WAF proxy serves its loopback-only internal
-// API. It is overridable for tests / non-standard deployments.
+// dataPlaneBaseURL is where the Rust WAF proxy serves its internal cert API.
+// It is overridable for tests / non-standard deployments (in Docker/K8s the
+// control plane and data plane are separate containers, e.g. http://dataplane:8080).
 func dataPlaneBaseURL() string {
 	return envOrDefault("SENTINEL_DATAPLANE_URL", "http://localhost:9080")
+}
+
+// setInternalAuth stamps the shared-secret header so the data plane accepts this
+// control-plane→data-plane call across containers — the cert API is otherwise
+// loopback-only. No-op when SENTINEL_INTERNAL_SECRET is unset (co-located dev,
+// where the call originates from loopback and is allowed anyway).
+func setInternalAuth(req *http.Request) {
+	if s := os.Getenv("SENTINEL_INTERNAL_SECRET"); s != "" {
+		req.Header.Set("X-Sentinel-Internal", s)
+	}
 }
 
 // certHTTPClient is shared by all cert handlers. ACME issuance can take a while
@@ -34,7 +46,9 @@ func handleListCerts(c *gin.Context, enf *rbac.Enforcer) {
 		return
 	}
 
-	resp, err := certHTTPClient.Get(dataPlaneBaseURL() + "/api/v1/internal/certs")
+	listReq, _ := http.NewRequest(http.MethodGet, dataPlaneBaseURL()+"/api/v1/internal/certs", nil)
+	setInternalAuth(listReq)
+	resp, err := certHTTPClient.Do(listReq)
 	if err != nil {
 		// Data plane down — return empty list so the dashboard renders gracefully.
 		c.JSON(http.StatusOK, gin.H{"certs": []any{}, "waf_running": false})
@@ -204,6 +218,7 @@ func proxyToDataPlane(c *gin.Context, method, path string, payload any) {
 	if payload != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	setInternalAuth(req)
 
 	resp, err := certHTTPClient.Do(req)
 	if err != nil {
