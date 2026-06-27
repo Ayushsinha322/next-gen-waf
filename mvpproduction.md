@@ -171,8 +171,17 @@ ssh -i ~/.ssh/sentinel_deploy root@172.16.21.71 '
 '
 # From anywhere that can reach the VM:
 curl -s http://172.16.21.71:3000 -o /dev/null -w "dashboard %{http_code}\n"
-curl -s "http://172.16.21.71/?q=1' OR '1'='1" -o /dev/null -w "SQLi attempt -> %{http_code} (expect 403)\n"
+# -G + --data-urlencode keeps the payload readable AND encodes it. A raw
+# "?q=1' OR '1'='1" has an unencoded space → curl sends a bad request line → 000.
+curl -s -G "http://172.16.21.71/" --data-urlencode "q=1' OR '1'='1" -o /dev/null -w "SQLi attempt -> %{http_code} (expect 403)\n"
 ```
+> ⚠️ **Repeat-attacker self-flag:** the data-plane correlation engine
+> (`CorrelationEngine`, 60s window, escalate at ≥3 blocks) adds a standing
+> anomaly penalty (+3, → +8 at ≥9 blocks) to **every** request from an IP that
+> was just blocked several times — so after firing a few attacks, *clean* traffic
+> from the same IP also 403s. Auto-clears ~60s after the last request from that
+> IP, or instantly on `docker compose -f compose.prod.yml restart dataplane`. When
+> verifying, run the clean-traffic check before the attacks (or from another host).
 
 ---
 

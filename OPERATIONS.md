@@ -214,7 +214,10 @@ curl -fsS http://127.0.0.1:9501/health && echo "  <- control plane OK"
 curl -s http://172.16.21.71:3000 -o /dev/null -w "dashboard %{http_code}\n"
 
 # 4) Does the WAF block an attack? (expect 403)
-curl -s "http://172.16.21.71/?q=1' OR '1'='1" -o /dev/null -w "SQLi attempt -> %{http_code} (expect 403)\n"
+#    Use -G + --data-urlencode: it keeps the SQLi payload readable AND encodes it
+#    properly. A raw "?q=1' OR '1'='1" has an unencoded space, so curl sends a
+#    malformed request line and you get 000 (not 403) — looks broken but isn't.
+curl -s -G "http://172.16.21.71/" --data-urlencode "q=1' OR '1'='1" -o /dev/null -w "SQLi attempt -> %{http_code} (expect 403)\n"
 
 # 5) Does the WAF pass clean traffic? (expect 200 — Juice Shop served through the WAF)
 curl -s http://172.16.21.71/ -o /dev/null -w "clean request -> %{http_code} (expect 200)\n"
@@ -224,6 +227,18 @@ If #4 returns **403** and #5 returns **200**, your WAF is doing its job: blockin
 attacks, passing real visitors. **Best proof of all: open the dashboard in a
 browser** (`http://172.16.21.71:3000`), log in, and watch the live Logs / Recent
 Events panels light up as requests come in.
+
+> ⚠️ **Demo gotcha — the WAF will flag *you* if you fire several attacks.** After
+> ~3 blocked requests from the same source IP within 60 seconds, the WAF marks
+> that IP a repeat attacker and adds a standing penalty (+3, rising to +8 at ~9
+> blocks) to **every** request from it — so even clean traffic from your machine
+> then returns **403**. This is the WAF working, not a bug. It **auto-clears ~60s
+> after the last request** from that IP (stop hitting it and wait). So when
+> demoing, either run the "clean traffic passes" check **before** the attacks, or
+> run clean checks from a **different machine** than the one you attack from. (A
+> browser tab left open on the protected site keeps polling and keeps the penalty
+> alive — close it first.) Last resort: `docker compose -f compose.prod.yml
+> restart dataplane` clears the in-memory state instantly.
 
 ---
 
@@ -244,6 +259,7 @@ docker compose -f compose.prod.yml logs --tail 100 <the-unhealthy-service>
 | **Login returns 503** | Control plane is in "degraded" mode (lost the database) | Check `postgres` is `Up (healthy)`; then `restart controlplane` (it now retries the DB on boot) |
 | **Website returns 502 Bad Gateway** through the WAF | Upstream (`juiceshop`) is down, or the WAF has no site config yet | `ps` (is `juiceshop` Up?); `logs --tail 100 dataplane`; ensure a site exists in the dashboard |
 | **Attacks are NOT blocked (get 200)** | Site is in "detection" mode, not "blocking", or no policy | In the dashboard, set the site's WAF policy mode to **blocking** |
+| **Clean traffic gets 403 right after you tested attacks** | The WAF flagged *your* source IP as a repeat attacker (≥3 blocks in 60s → standing anomaly penalty on every request from that IP) | Expected — it's the WAF working. Stop hitting it from that IP and wait ~60s (the penalty auto-clears), or test clean traffic from another machine. Close any browser tab left open on the protected site (it keeps polling). Last resort: `restart dataplane` clears it instantly. |
 | **Logs page stuck "Connecting to log stream…"** | SSE/CORS issue (port 9501 or origin) | Confirm `controlplane` is `Up` and port `9501` is reachable from your browser; this is a known config area — see `mvpproduction.md` §3 |
 | **A site change isn't taking effect** | The WAF syncs config every ~5 seconds | Wait 5–10s; if still nothing, `logs --tail 50 controlplane` and `dataplane` |
 | **One container keeps `Restarting`** | It crashes on boot (bad config/dependency) | `logs --tail 200 <service>` — the error is almost always in the last lines |
@@ -349,7 +365,7 @@ docker compose -f compose.prod.yml logs -f NAME   # watch one service
 
 # ── health checks ─────────────────────────────────────────
 curl -fsS http://127.0.0.1:9501/health                 # control plane (on VM)
-curl -s "http://172.16.21.71/?q=1' OR '1'='1" -o /dev/null -w "%{http_code}\n"  # expect 403
+curl -s -G "http://172.16.21.71/" --data-urlencode "q=1' OR '1'='1" -o /dev/null -w "%{http_code}\n"  # expect 403 (raw ?q=... with a space → 000)
 curl -s http://172.16.21.71/ -o /dev/null -w "%{http_code}\n"                   # expect 200
 
 # ── careful ───────────────────────────────────────────────
