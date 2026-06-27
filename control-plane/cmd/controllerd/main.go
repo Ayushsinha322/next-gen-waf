@@ -36,6 +36,59 @@ func main() {
 	}
 }
 
+// dbConnectMaxWait is how long openDBWithRetry keeps retrying the initial DB
+// connection before giving up (then falling back to degraded mode). Override
+// with SENTINEL_DB_CONNECT_TIMEOUT (seconds); 0 disables retry. Default 60s.
+func dbConnectMaxWait() time.Duration {
+	if v := os.Getenv("SENTINEL_DB_CONNECT_TIMEOUT"); v != "" {
+		if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
+			return time.Duration(secs) * time.Second
+		}
+	}
+	return 60 * time.Second
+}
+
+// openDBWithRetry repeatedly attempts to open the DB pool until it succeeds or
+// maxWait elapses, using capped exponential backoff. Each attempt is bounded by
+// its own short timeout so a hung connect can't stall startup forever. This
+// makes the control plane resilient to start-ordering — Postgres not yet
+// accepting connections (docker compose restart, Kubernetes pod ordering) —
+// instead of failing into degraded mode on the first ping.
+func openDBWithRetry(ctx context.Context, log *zap.Logger, cfg db.Config, maxWait time.Duration) (db.Pool, error) {
+	deadline := time.Now().Add(maxWait)
+	backoff := time.Second
+	const maxBackoff = 5 * time.Second
+	for attempt := 1; ; attempt++ {
+		attemptCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		pool, err := db.Open(attemptCtx, cfg)
+		cancel()
+		if err == nil {
+			if attempt > 1 {
+				log.Info("DB reachable after retry", zap.Int("attempts", attempt))
+			}
+			return pool, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("db not reachable after %d attempts over %s: %w", attempt, maxWait, err)
+		}
+		log.Warn("DB not ready yet — retrying",
+			zap.Int("attempt", attempt),
+			zap.Duration("next_retry_in", backoff),
+			zap.Error(err))
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		if backoff < maxBackoff {
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+	}
+}
+
 func run() error {
 	// ── Logger ────────────────────────────────────────────────────────────────
 	logCfg := zap.NewDevelopmentConfig()
@@ -68,7 +121,10 @@ func run() error {
 	var pool db.Pool // lifted for shutdown access
 	if dbURL != "" {
 		var dbErr error
-		pool, dbErr = db.Open(ctx, db.Config{URL: dbURL, MaxConns: 20, MinConns: 2})
+		// Retry with backoff so the control plane survives starting before
+		// Postgres is ready (docker compose restart, Kubernetes pod ordering)
+		// instead of dropping straight into degraded mode on the first ping.
+		pool, dbErr = openDBWithRetry(ctx, log, db.Config{URL: dbURL, MaxConns: 20, MinConns: 2}, dbConnectMaxWait())
 		if dbErr != nil {
 			log.Warn("DB unavailable — running in degraded mode (mock data only)", zap.Error(dbErr))
 		} else {
