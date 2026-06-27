@@ -1,0 +1,46 @@
+# Sentinel WAF — data-plane config for the Docker/compose deployment.
+#
+# Sites are intentionally EMPTY here: the control plane is authoritative and
+# hot-syncs the live site list to this proxy every few seconds via
+# {sync_url}/api/v1/internal/config. Add/edit sites in the dashboard (or the
+# control-plane REST API) — they appear here automatically, no restart.
+#
+# Listener binds a high port (8080) inside the container; compose maps host
+# :80 -> :8080 so the proxy never needs privileged-port capabilities.
+
+cluster:
+  name: sentinel-prod
+  node_id: auto
+  sync_url: "http://controlplane:9501"
+  sync_interval_secs: 5
+
+# Certificate repository on disk: ACME-issued + operator/client-uploaded certs
+# persist here (mounted volume). The SNI resolver loads these at startup and
+# hot-swaps new ones without a restart.
+cert_dir: /var/lib/sentinel/certs
+
+listeners:
+  - name: http
+    bind: "0.0.0.0:8080"
+    protocol: http1
+  # HTTPS via the SNI cert resolver: selects the per-domain cert from the
+  # repository by the client's SNI, with a self-signed fallback (incl. a
+  # "default" cert for bare-IP / no-SNI clients so the handshake completes).
+  # HTTP/2 enabled — the proxy synthesizes the Host from the h2 :authority.
+  - name: https
+    bind: "0.0.0.0:8443"
+    protocol: [http1, http2]
+    tls: {}
+
+sites: []
+
+logging:
+  level: info
+  format: json
+  outputs:
+    - type: stdout
+
+storage:
+  cache:
+    backend: memory
+    size: 128MB
