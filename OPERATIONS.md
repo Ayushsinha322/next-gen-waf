@@ -1,0 +1,365 @@
+# Sentinel WAF — Operator's Guide (run the VM like an expert)
+
+> Plain-English, beginner-friendly playbook for running the Sentinel WAF on the
+> demo/MVP VM. If you only remember one section, remember **§9 Cheat Sheet**.
+>
+> VM: `172.16.21.71` · login user: `root` · SSH key: `~/.ssh/sentinel_deploy`
+> All commands live on the VM under `/opt/sentinel-src/deploy/docker`.
+
+---
+
+## 0. The mental model (read this once, everything else makes sense)
+
+Think of it as a building:
+
+- **The VM** (`172.16.21.71`) is the building — a remote Linux computer in the
+  ESDS network. You don't sit in front of it; you walk in remotely with **SSH**.
+- **Docker** is the building's facilities manager. It runs each part of the WAF
+  in its own sealed room called a **container**.
+- **docker compose** is the master switch panel that turns all the rooms on/off
+  together, wired up by one file: `compose.prod.yml`.
+
+There are **6 containers** (rooms). Their real names on the VM are
+`sentinel-<service>-1`:
+
+| Container | What it does | Who talks to it |
+|---|---|---|
+| `sentinel-dataplane-1` | **The WAF itself** (Rust). Inspects traffic, blocks attacks. | The public — on port **80** (HTTP) and **443** (HTTPS) |
+| `sentinel-dashboard-1` | The web UI you log into (Next.js) | You, in a browser — port **3000** |
+| `sentinel-controlplane-1` | The brain (Go). Stores sites/policies, feeds the dashboard, pushes config to the WAF. | Dashboard + the WAF — port **9501** |
+| `sentinel-postgres-1` | The database (sites, users, settings) | Control plane only (internal) |
+| `sentinel-redis-1` | Fast cache | Control plane only (internal) |
+| `sentinel-juiceshop-1` | A deliberately-vulnerable demo website the WAF protects | Only reachable **through** the WAF |
+
+**The flow of a request:** Browser → port 80/443 (the WAF) → WAF checks for
+attacks → if clean, forwards to Juice Shop → response comes back. Attacks get a
+**403 Forbidden** and never reach Juice Shop.
+
+**The two URLs that matter:**
+- Dashboard (you manage the WAF here): `http://172.16.21.71:3000`
+- Protected site (what a visitor sees, guarded by the WAF): `http://172.16.21.71/`
+- Login: `admin@sentinel.local` / `admin123` *(change this — see §8)*
+
+---
+
+## 1. Step 1 — Get into the VM (SSH)
+
+**SSH** = "Secure Shell." It's how you log into a remote computer's command line.
+You run it **from your own machine** (your Parrot laptop / build host).
+
+```bash
+ssh -i ~/.ssh/sentinel_deploy root@172.16.21.71
+```
+
+Breaking that down so it's never mysterious again:
+- `ssh` — the remote-login program.
+- `-i ~/.ssh/sentinel_deploy` — "use **this private key file** as my ID badge."
+  (The matching public key is already installed on the VM, so no password.)
+- `root@172.16.21.71` — "log in as the user **root** on the machine at **172.16.21.71**."
+
+**First time only:** it prints a fingerprint and asks
+`Are you sure you want to continue connecting?` → type `yes` and Enter. It won't
+ask again.
+
+When it works, your prompt changes to something like `root@vm:~#`. **You are now
+inside the VM** — every command you type runs there, not on your laptop.
+
+**To leave the VM:** type `exit` (or press `Ctrl-D`). You're back on your laptop.
+
+### Make it one word (do this once — it's the "expert" move)
+Typing the full command every time is annoying. On **your laptop**, edit
+`~/.ssh/config` and add:
+
+```
+Host sentinel
+    HostName 172.16.21.71
+    User root
+    IdentityFile ~/.ssh/sentinel_deploy
+```
+
+Now you just type:
+
+```bash
+ssh sentinel
+```
+
+### Run one command without "going inside"
+You can fire a single command on the VM and come straight back — handy for quick
+checks:
+
+```bash
+ssh sentinel 'cd /opt/sentinel-src/deploy/docker && docker compose -f compose.prod.yml ps'
+```
+
+### If SSH won't connect (the 3 usual culprits)
+| Message | Meaning | Fix |
+|---|---|---|
+| `Connection timed out` / `No route to host` | You can't reach the VM's network | Get on the ESDS internal network / VPN; confirm the VM is powered on |
+| `Permission denied (publickey)` | Wrong/missing key | Check the path `~/.ssh/sentinel_deploy` exists; you're using `-i` (or the `~/.ssh/config` above) |
+| `Host key verification failed` | The VM's identity changed (e.g. rebuilt) | `ssh-keygen -R 172.16.21.71` then reconnect and type `yes` again |
+
+---
+
+## 2. Step 2 — Go to the control room
+
+Everything is driven from one folder on the VM. **Always go there first:**
+
+```bash
+cd /opt/sentinel-src/deploy/docker
+```
+
+That folder has `compose.prod.yml` — the file that defines all 6 containers.
+Every command below uses `-f compose.prod.yml` to point at it.
+
+> **Power tip (optional):** so you never type `-f compose.prod.yml` again, run
+> this once per login (or add it to `~/.bashrc` on the VM to make it permanent):
+> ```bash
+> alias dc='docker compose -f /opt/sentinel-src/deploy/docker/compose.prod.yml'
+> ```
+> Then `dc ps`, `dc logs -f`, `dc restart`, etc. The guide below spells out the
+> full commands so they always work even without the alias.
+
+---
+
+## 3. The 5 commands you'll use 95% of the time
+
+Run these from `/opt/sentinel-src/deploy/docker`.
+
+### 3.1 See what's running (your #1 habit)
+```bash
+docker compose -f compose.prod.yml ps
+```
+You want every service to show **`Up`** (and ideally `(healthy)` for postgres/redis).
+`Exited` or `Restarting` = something's wrong → go to §6 logs/troubleshooting.
+
+### 3.2 Start everything
+```bash
+docker compose -f compose.prod.yml up -d
+```
+`up` = create + start. `-d` = "detached" (runs in the background, gives you your
+prompt back). Safe to run even if things are already up — it only changes what's
+needed. **This is the normal way to bring the stack up.**
+
+### 3.3 Stop everything (but keep it ready to restart)
+```bash
+docker compose -f compose.prod.yml stop
+```
+Containers stop; nothing is deleted. Start them again with:
+```bash
+docker compose -f compose.prod.yml start
+```
+
+### 3.4 Restart
+```bash
+# restart everything
+docker compose -f compose.prod.yml restart
+
+# restart just one service (most common — e.g. after a config change)
+docker compose -f compose.prod.yml restart controlplane
+```
+Use `restart <service>` when only one part is misbehaving — it's faster and
+leaves the rest untouched.
+
+### 3.5 Watch the logs (your eyes into "why")
+```bash
+# follow ALL services live (Ctrl-C to stop watching — does NOT stop the WAF)
+docker compose -f compose.prod.yml logs -f
+
+# follow just one service
+docker compose -f compose.prod.yml logs -f dataplane
+
+# last 200 lines of one service, no live follow
+docker compose -f compose.prod.yml logs --tail 200 controlplane
+```
+`-f` = "follow" (keep streaming new lines). Pressing `Ctrl-C` only stops the
+*watching*; the containers keep running.
+
+---
+
+## 4. The one dangerous command — know the difference
+
+```bash
+docker compose -f compose.prod.yml down
+```
+`down` **stops AND deletes** the containers (the rooms are torn down). Your data
+is still safe because it lives in **volumes** (`pgdata`, `sentinel-certs`,
+`sentinel-logs`), which `down` keeps. Recreate everything with `up -d`.
+
+```bash
+docker compose -f compose.prod.yml down -v      # ⚠️ DO NOT run casually
+```
+The `-v` also **deletes the volumes** — that wipes your **database** (all sites,
+users, settings) and certificates. Only ever use `-v` if you intentionally want a
+factory reset (and you'd then have to re-run migrations + re-seed from
+`mvpproduction.md`).
+
+**Rule of thumb:** `stop`/`start`/`restart` for daily life. `up -d` to bring up.
+`down` rarely. `down -v` almost never.
+
+---
+
+## 5. Is the WAF actually working? (health checks)
+
+Run these any time to prove the system is healthy. The first two run **on the VM**;
+the last two you can run from anywhere that can reach the VM.
+
+```bash
+# 1) All containers Up?
+docker compose -f compose.prod.yml ps
+
+# 2) Is the brain alive? (run on the VM)
+curl -fsS http://127.0.0.1:9501/health && echo "  <- control plane OK"
+
+# 3) Does the dashboard load? (expect 200 or 307)
+curl -s http://172.16.21.71:3000 -o /dev/null -w "dashboard %{http_code}\n"
+
+# 4) Does the WAF block an attack? (expect 403)
+curl -s "http://172.16.21.71/?q=1' OR '1'='1" -o /dev/null -w "SQLi attempt -> %{http_code} (expect 403)\n"
+
+# 5) Does the WAF pass clean traffic? (expect 200 — Juice Shop served through the WAF)
+curl -s http://172.16.21.71/ -o /dev/null -w "clean request -> %{http_code} (expect 200)\n"
+```
+
+If #4 returns **403** and #5 returns **200**, your WAF is doing its job: blocking
+attacks, passing real visitors. **Best proof of all: open the dashboard in a
+browser** (`http://172.16.21.71:3000`), log in, and watch the live Logs / Recent
+Events panels light up as requests come in.
+
+---
+
+## 6. When something breaks — symptom → cause → fix
+
+**Golden rule of debugging here:** always start with `ps` (what's down?) then
+`logs` (why?). 90% of issues are answered by those two.
+
+```bash
+docker compose -f compose.prod.yml ps
+docker compose -f compose.prod.yml logs --tail 100 <the-unhealthy-service>
+```
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| **Dashboard won't load** in browser | `dashboard` container down, or you're not on the ESDS network | `ps`; if `dashboard` isn't `Up` → `up -d`; confirm network access |
+| **Login spins / returns 500** | Dashboard can't reach the control plane | `logs --tail 100 dashboard` and check `controlplane` is `Up`; `restart dashboard` |
+| **Login returns 503** | Control plane is in "degraded" mode (lost the database) | Check `postgres` is `Up (healthy)`; then `restart controlplane` (it now retries the DB on boot) |
+| **Website returns 502 Bad Gateway** through the WAF | Upstream (`juiceshop`) is down, or the WAF has no site config yet | `ps` (is `juiceshop` Up?); `logs --tail 100 dataplane`; ensure a site exists in the dashboard |
+| **Attacks are NOT blocked (get 200)** | Site is in "detection" mode, not "blocking", or no policy | In the dashboard, set the site's WAF policy mode to **blocking** |
+| **Logs page stuck "Connecting to log stream…"** | SSE/CORS issue (port 9501 or origin) | Confirm `controlplane` is `Up` and port `9501` is reachable from your browser; this is a known config area — see `mvpproduction.md` §3 |
+| **A site change isn't taking effect** | The WAF syncs config every ~5 seconds | Wait 5–10s; if still nothing, `logs --tail 50 controlplane` and `dataplane` |
+| **One container keeps `Restarting`** | It crashes on boot (bad config/dependency) | `logs --tail 200 <service>` — the error is almost always in the last lines |
+
+**Useful deeper looks:**
+```bash
+# get a shell INSIDE a container to poke around (e.g. postgres)
+docker exec -it sentinel-postgres-1 sh
+
+# check the WAF's raw access logs (NDJSON) on the shared volume
+docker exec -it sentinel-dataplane-1 sh -c 'tail -n 50 /var/log/sentinel/*.log'
+
+# how much disk/CPU/memory each container is using
+docker stats --no-stream
+```
+
+---
+
+## 7. After a VM reboot
+
+The containers are set to **`restart: unless-stopped`**, so when the VM boots,
+Docker starts and the whole stack comes back **on its own**. After a reboot, just
+verify:
+
+```bash
+ssh sentinel
+cd /opt/sentinel-src/deploy/docker
+docker compose -f compose.prod.yml ps
+```
+
+If they're **not** up, the usual reasons and fixes:
+
+```bash
+# Is the Docker engine itself running?
+systemctl status docker
+# If not:
+systemctl start docker
+
+# Then bring the stack up:
+cd /opt/sentinel-src/deploy/docker && docker compose -f compose.prod.yml up -d
+```
+
+> Historical note: a bad `/etc/fstab` entry once caused the disk to mount
+> read-only after reboot, which stopped Docker. That has been **fixed** (root now
+> mounts read-write on boot). If you ever see "read-only file system" errors after
+> a reboot, that's the area to check — see `mvpproduction.md`.
+
+---
+
+## 8. Routine admin tasks
+
+**Add/edit a protected site:** Do it in the dashboard → *Sites* → *Site Wizard*
+(easiest), or via the control-plane API (see `mvpproduction.md` §5e/§6). Changes
+hot-sync to the WAF within ~5 seconds — **no restart needed**.
+
+**Change the admin password** (still on the to-do list): log into the dashboard
+and change it from the user/settings menu. `admin123` must not survive a real demo.
+
+**Check disk space** (logs and images grow over time):
+```bash
+df -h /                    # overall disk
+docker system df           # how much Docker is using
+docker system prune -f     # safe cleanup: removes unused images/build cache (NOT your volumes/data)
+```
+
+**Update the code and redeploy** (after you change the source):
+```bash
+# from your laptop — push the latest source to the VM
+cd /home/ayush3750/waf-development
+rsync -az --delete -e "ssh -i ~/.ssh/sentinel_deploy" \
+  --exclude 'target/' --exclude '.git/' --exclude '**/node_modules/' \
+  --exclude 'dashboard/.next/' --exclude '*.tsbuildinfo' \
+  ./ root@172.16.21.71:/opt/sentinel-src/
+
+# then on the VM — rebuild changed images and restart
+ssh sentinel 'cd /opt/sentinel-src/deploy/docker && \
+  docker compose -f compose.prod.yml up -d --build'
+```
+(Full from-scratch build/deploy steps, DB migrations, and demo-site seeding are
+in `mvpproduction.md` — keep that as the deploy reference; keep **this** file as
+the day-to-day operations reference.)
+
+---
+
+## 9. Cheat Sheet (print this)
+
+```bash
+# ── connect ───────────────────────────────────────────────
+ssh sentinel                       # (after ~/.ssh/config setup)
+#   or: ssh -i ~/.ssh/sentinel_deploy root@172.16.21.71
+cd /opt/sentinel-src/deploy/docker # always work from here
+exit                               # leave the VM
+
+# ── everyday (run from the folder above) ──────────────────
+docker compose -f compose.prod.yml ps             # what's running?
+docker compose -f compose.prod.yml up -d          # start everything
+docker compose -f compose.prod.yml stop           # stop (keep)
+docker compose -f compose.prod.yml start          # start after stop
+docker compose -f compose.prod.yml restart        # restart all
+docker compose -f compose.prod.yml restart NAME   # restart one (e.g. controlplane)
+docker compose -f compose.prod.yml logs -f        # watch all logs (Ctrl-C to stop watching)
+docker compose -f compose.prod.yml logs -f NAME   # watch one service
+
+# ── health checks ─────────────────────────────────────────
+curl -fsS http://127.0.0.1:9501/health                 # control plane (on VM)
+curl -s "http://172.16.21.71/?q=1' OR '1'='1" -o /dev/null -w "%{http_code}\n"  # expect 403
+curl -s http://172.16.21.71/ -o /dev/null -w "%{http_code}\n"                   # expect 200
+
+# ── careful ───────────────────────────────────────────────
+docker compose -f compose.prod.yml down            # stop + remove containers (data safe)
+docker compose -f compose.prod.yml down -v         # ⚠️ ALSO deletes DB + certs — almost never
+
+# ── service names ─────────────────────────────────────────
+#   dataplane (the WAF) · dashboard · controlplane · postgres · redis · juiceshop
+
+# ── the two URLs ──────────────────────────────────────────
+#   Dashboard:  http://172.16.21.71:3000   (admin@sentinel.local / admin123)
+#   Protected:  http://172.16.21.71/
+```
