@@ -83,7 +83,8 @@ services:
     ports:
       # Exposed so the browser's SSE log stream can connect to the control plane
       # directly (the Next.js proxy buffers SSE). REST still goes via the dashboard.
-      # ⚠ also exposes /api/v1/internal/config (unauthed) on the internal network — lock down for prod.
+      # /api/v1/internal/config is now gated by SENTINEL_INTERNAL_SECRET (the data
+      # plane sends X-Sentinel-Internal); it no longer leaks site config unauthed.
       - "9501:9501"
     networks: [sentinel]
 

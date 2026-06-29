@@ -646,6 +646,13 @@ impl ProxyServer {
                 let client: Client<_, EmptyBody> =
                     Client::builder(TokioExecutor::new()).build_http();
                 let mut last_version: u64 = u64::MAX;
+                // Authenticate the config-sync poll with the shared internal
+                // secret when configured, so the control plane's internal/config
+                // endpoint can be gated (not exposed unauthenticated). Unset =
+                // co-located dev (no header sent; control plane allows).
+                let internal_secret = std::env::var("SENTINEL_INTERNAL_SECRET")
+                    .ok()
+                    .filter(|s| !s.is_empty());
                 let mut ticker = tokio::time::interval(Duration::from_secs(secs));
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
@@ -658,9 +665,11 @@ impl ProxyServer {
                             continue;
                         }
                     };
-                    let req = hyper::Request::builder()
-                        .method("GET")
-                        .uri(uri)
+                    let mut builder = hyper::Request::builder().method("GET").uri(uri);
+                    if let Some(secret) = &internal_secret {
+                        builder = builder.header("x-sentinel-internal", secret);
+                    }
+                    let req = builder
                         .body(http_body_util::Empty::new())
                         .expect("BUG: building config-sync request");
                     let resp = match client.request(req).await {

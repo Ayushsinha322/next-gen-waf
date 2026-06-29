@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -641,10 +642,30 @@ func encodeExclusions(waf map[string]json.RawMessage, excl []ruleExclusionSpec) 
 	return json.Marshal(waf)
 }
 
-// handleInternalConfig is called by the Rust data-plane proxy (no JWT — internal
-// network only). Returns the current active site list in a format the proxy can
-// deserialize directly into Vec<SiteConfig>.
+// internalSecretOK gates the unauthenticated-by-design internal endpoints with
+// the shared secret (X-Sentinel-Internal == SENTINEL_INTERNAL_SECRET). When the
+// secret is unset (co-located dev), it allows the call for backward-compat — the
+// data-plane sync client likewise sends no header in that mode. Constant-time
+// compare to avoid leaking the secret via timing.
+func internalSecretOK(c *gin.Context) bool {
+	secret := os.Getenv("SENTINEL_INTERNAL_SECRET")
+	if secret == "" {
+		return true
+	}
+	got := c.GetHeader("X-Sentinel-Internal")
+	return subtle.ConstantTimeCompare([]byte(got), []byte(secret)) == 1
+}
+
+// handleInternalConfig is called by the Rust data-plane proxy to sync the active
+// site list. It is gated by the shared internal secret (not JWT): exposing the
+// REST port must not leak site topology (upstreams, rules) to anyone who can
+// reach it. Returns the sites in a format the proxy deserializes into
+// Vec<SiteConfig>.
 func handleInternalConfig(c *gin.Context, store *db.Store) {
+	if !internalSecretOK(c) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+		return
+	}
 	if store == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "db unavailable"})
 		return
