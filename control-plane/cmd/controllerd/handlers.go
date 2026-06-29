@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +11,7 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -33,6 +36,16 @@ var configVersion atomic.Int64
 type loginRequest struct {
 	Email    string `json:"email" binding:"required"`
 	Password string `json:"password" binding:"required"`
+}
+
+// devLoginEnabled reports whether the no-database admin/admin123 backdoor is
+// explicitly permitted (local development only).
+func devLoginEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("SENTINEL_DEV_LOGIN"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 func handleLogin(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store, hub *logs.Hub) {
@@ -67,6 +80,16 @@ func handleLogin(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store, hub *
 			AuthMethod: "password",
 		}
 	} else {
+		// No user database. The built-in admin/admin123 backdoor exists only for
+		// local development and must be explicitly enabled — otherwise a
+		// misconfigured prod node (DB unreachable at boot) would expose a known
+		// credential. Off by default; opt in with SENTINEL_DEV_LOGIN=1.
+		if !devLoginEnabled() {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error": "authentication unavailable: no user database configured",
+			})
+			return
+		}
 		if req.Email != "admin@sentinel.local" || req.Password != "admin123" {
 			writeAuditEntry(c, nil, hub, &db.WriteAuditRequest{
 				TenantID:   db.DevTenantID,
@@ -557,9 +580,16 @@ func handleDeleteSiteExclusion(c *gin.Context, enf *rbac.Enforcer, store *db.Sto
 	waf, excl := parseExclusions(site.WafPolicy)
 	kept := excl[:0]
 	for _, e := range excl {
-		if e.RuleID != ruleID {
-			kept = append(kept, e)
+		if e.RuleID == ruleID {
+			// 932236 is auto-injected by buildRustWaf; a plain removal would be
+			// silently re-added. Leave an empty opt-out marker so the rule stays
+			// fully enabled across rebuilds.
+			if ruleID == 932236 {
+				kept = append(kept, ruleExclusionSpec{RuleID: 932236})
+			}
+			continue
 		}
+		kept = append(kept, e)
 	}
 	newPolicy, err := encodeExclusions(waf, kept)
 	if err != nil {
@@ -612,10 +642,30 @@ func encodeExclusions(waf map[string]json.RawMessage, excl []ruleExclusionSpec) 
 	return json.Marshal(waf)
 }
 
-// handleInternalConfig is called by the Rust data-plane proxy (no JWT — internal
-// network only). Returns the current active site list in a format the proxy can
-// deserialize directly into Vec<SiteConfig>.
+// internalSecretOK gates the unauthenticated-by-design internal endpoints with
+// the shared secret (X-Sentinel-Internal == SENTINEL_INTERNAL_SECRET). When the
+// secret is unset (co-located dev), it allows the call for backward-compat — the
+// data-plane sync client likewise sends no header in that mode. Constant-time
+// compare to avoid leaking the secret via timing.
+func internalSecretOK(c *gin.Context) bool {
+	secret := os.Getenv("SENTINEL_INTERNAL_SECRET")
+	if secret == "" {
+		return true
+	}
+	got := c.GetHeader("X-Sentinel-Internal")
+	return subtle.ConstantTimeCompare([]byte(got), []byte(secret)) == 1
+}
+
+// handleInternalConfig is called by the Rust data-plane proxy to sync the active
+// site list. It is gated by the shared internal secret (not JWT): exposing the
+// REST port must not leak site topology (upstreams, rules) to anyone who can
+// reach it. Returns the sites in a format the proxy deserializes into
+// Vec<SiteConfig>.
 func handleInternalConfig(c *gin.Context, store *db.Store) {
+	if !internalSecretOK(c) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+		return
+	}
 	if store == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "db unavailable"})
 		return
@@ -735,7 +785,103 @@ func siteRowToRustConfig(s db.SiteRow) (map[string]any, error) {
 		"upstream": upstream,
 		"waf":      waf,
 		"plugins":  []any{},
+		// Per-site TLS intent (the dashboard nests it under waf_policy.tls) lifted
+		// to the top-level Rust SiteConfig.tls, so the data plane honors per-site
+		// cert mode (ACME auto-issuance/renewal, manual cert paths). Serving certs
+		// by SNI works regardless of this; mode=acme additionally drives issuance.
+		"tls": buildRustSiteTLS(s.WafPolicy),
 	}, nil
+}
+
+// buildRustSiteTLS extracts the per-site TLS intent the dashboard nests under
+// waf_policy.tls and converts it to the Rust SiteTlsConfig shape
+// (mode: off | self_signed | manual | acme). Dashboard modes map as:
+//
+//	auto     -> acme (+ acme{email,provider,challenge}) — drives auto-issue/renew
+//	manual   -> manual{cert,key} when the operator chose "path on WAF node";
+//	            a pasted PEM is already in the cert repository (served by SNI) -> off
+//	existing -> off (the chosen repo cert is served by SNI for the domain)
+//	off / "" -> off
+//
+// It always returns a valid SiteTlsConfig so the config-sync never fails to parse.
+func buildRustSiteTLS(raw json.RawMessage) map[string]any {
+	off := map[string]any{"mode": "off"}
+	if len(raw) == 0 {
+		return off
+	}
+	var p struct {
+		TLS *struct {
+			Mode        string `json:"mode"`
+			Email       string `json:"email"`
+			Provider    string `json:"provider"`
+			Challenge   string `json:"challenge"`
+			RenewBefore uint32 `json:"renew_before_days"`
+			Custom      *struct {
+				Priority string `json:"priority"`
+				CertPath string `json:"cert_path"`
+				KeyPath  string `json:"key_path"`
+			} `json:"custom"`
+		} `json:"tls"`
+	}
+	if err := json.Unmarshal(raw, &p); err != nil || p.TLS == nil {
+		return off
+	}
+	t := p.TLS
+	switch t.Mode {
+	case "auto":
+		if t.Email == "" {
+			return off // ACME needs a contact email; nothing to do without one
+		}
+		acme := map[string]any{"email": t.Email}
+		if prov := rustAcmeProvider(t.Provider); prov != "" {
+			acme["provider"] = prov
+		}
+		if ch := rustAcmeChallenge(t.Challenge); ch != "" {
+			acme["challenge"] = ch
+		}
+		if t.RenewBefore > 0 {
+			acme["renew_before_days"] = t.RenewBefore
+		}
+		return map[string]any{"mode": "acme", "acme": acme}
+	case "manual":
+		if t.Custom != nil && t.Custom.Priority == "file" && t.Custom.CertPath != "" && t.Custom.KeyPath != "" {
+			return map[string]any{"mode": "manual", "cert": t.Custom.CertPath, "key": t.Custom.KeyPath}
+		}
+		return off // pasted PEM lives in the cert repository; served by SNI
+	case "self_signed":
+		return map[string]any{"mode": "self_signed"}
+	default: // "existing", "off", "" → served by SNI / no per-site action
+		return off
+	}
+}
+
+// rustAcmeProvider maps the dashboard provider id to the Rust AcmeProvider serde
+// value; returns "" to let the Rust default (lets_encrypt) apply.
+func rustAcmeProvider(p string) string {
+	switch p {
+	case "letsencrypt", "lets_encrypt":
+		return "lets_encrypt"
+	case "letsencrypt_staging", "lets_encrypt_staging":
+		return "lets_encrypt_staging"
+	case "zerossl", "zero_ssl":
+		return "zero_ssl"
+	default:
+		return ""
+	}
+}
+
+// rustAcmeChallenge maps the dashboard challenge id to the Rust AcmeChallengeType
+// serde value; returns "" to let the Rust default (http01) apply. DNS-01 is not
+// supported by the data plane yet, so it falls back to the default.
+func rustAcmeChallenge(c string) string {
+	switch c {
+	case "http_01", "http01":
+		return "http01"
+	case "tls_alpn_01", "tls_alpn01":
+		return "tls_alpn01"
+	default:
+		return ""
+	}
 }
 
 // buildRustUpstream accepts both the legacy shape
@@ -847,6 +993,8 @@ func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
 		MaxURILength     *uint32         `json:"max_uri_length"`
 		MaxHeaderCount   *uint32         `json:"max_header_count"`
 		APIDiscovery     bool            `json:"api_discovery"`
+		AllowedMethods   []string        `json:"allowed_methods"`
+		SecurityHeaders  json.RawMessage `json:"security_headers"`
 	}
 	if len(raw) > 0 {
 		if err := json.Unmarshal(raw, &p); err != nil {
@@ -877,28 +1025,37 @@ func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
 		"api_discovery":     p.APIDiscovery,
 	}
 
-	// Rule exclusions — always include the well-known 932236 "ARGS_NAMES" / id
-	// suppression (avoids the `?id=42` false positive, see CRS importer notes)
-	// unless the operator has their own entry for that rule, then append any
-	// operator-defined exclusions (e.g. one-click disables from the learning
-	// report). Previously a custom list silently dropped the 932236 default.
+	// Rule exclusions — include the well-known 932236 "ARGS_NAMES" / id
+	// suppression by default (avoids the `?id=42` false positive, see CRS
+	// importer notes), even alongside operator-defined exclusions (e.g. one-click
+	// disables from the learning report).
+	//
+	// An operator can fully re-enable 932236 by storing an *empty* 932236 entry
+	// (no targets, not disabled): that acts as an opt-out marker — it suppresses
+	// the injected default and is itself dropped (a no-op to the data plane).
+	// `handleDeleteSiteExclusion` leaves this marker when 932236 is removed, so
+	// the default isn't silently re-added on the next build.
 	ex := []map[string]any{}
-	hasArgsNamesDefault := false
+	has932236 := false
+	out := make([]map[string]any, 0, len(ex)+1)
 	if len(p.RuleExclusions) > 0 {
 		if err := json.Unmarshal(p.RuleExclusions, &ex); err != nil {
 			ex = []map[string]any{}
 		}
 		for _, e := range ex {
 			if ruleIDEquals(e["rule_id"], 932236) {
-				hasArgsNamesDefault = true
-				break
+				has932236 = true
+				if isEmptyExclusion(e) {
+					continue // opt-out marker — drop it, don't emit to the proxy
+				}
 			}
+			out = append(out, e)
 		}
 	}
-	if !hasArgsNamesDefault {
-		ex = append(ex, map[string]any{"rule_id": 932236, "exclude_targets": []string{"ARGS_NAMES"}})
+	if !has932236 {
+		out = append(out, map[string]any{"rule_id": 932236, "exclude_targets": []string{"ARGS_NAMES"}})
 	}
-	waf["rule_exclusions"] = ex
+	waf["rule_exclusions"] = out
 
 	attachRawObject(waf, "rate_limit", p.RateLimit)
 	attachRawObject(waf, "bot_detection", p.BotDetection)
@@ -941,6 +1098,14 @@ func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
 		waf["max_header_count"] = *p.MaxHeaderCount
 	}
 
+	// Method allow-list and response/security headers — pass through so the
+	// data plane can actually enforce what the wizard collects (a full method
+	// list means "no restriction"; an empty/partial list restricts).
+	if len(p.AllowedMethods) > 0 {
+		waf["allowed_methods"] = p.AllowedMethods
+	}
+	attachRawObject(waf, "security_headers", p.SecurityHeaders)
+
 	return waf, nil
 }
 
@@ -957,6 +1122,19 @@ func ruleIDEquals(v any, want int) bool {
 		return int(i) == want
 	}
 	return false
+}
+
+// isEmptyExclusion reports whether a decoded exclusion is a no-op: not a
+// whole-rule disable and with no target list. Such an entry only ever serves as
+// an explicit "keep this rule fully enabled" opt-out marker (see buildRustWaf).
+func isEmptyExclusion(e map[string]any) bool {
+	if dis, _ := e["disable"].(bool); dis {
+		return false
+	}
+	if t, ok := e["exclude_targets"].([]any); ok && len(t) > 0 {
+		return false
+	}
+	return true
 }
 
 // attachRawObject decodes a raw JSON object and attaches it under key when
@@ -1276,8 +1454,16 @@ func writeAuditEntry(c *gin.Context, store *db.Store, hub *logs.Hub, req *db.Wri
 
 	if store != nil {
 		reqCopy := *req
+		// Detach from the request context: the HTTP response often returns
+		// before this write finishes, which would cancel c.Request.Context()
+		// and silently drop the audit row. Use a fresh bounded context so the
+		// audit entry is durably persisted regardless of response lifecycle.
 		go func() {
-			_ = store.WriteAuditLog(c.Request.Context(), reqCopy, auditHMACKey())
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := store.WriteAuditLog(ctx, reqCopy, auditHMACKey()); err != nil {
+				zap.L().Warn("audit write failed", zap.String("action", reqCopy.Action), zap.Error(err))
+			}
 		}()
 	}
 }

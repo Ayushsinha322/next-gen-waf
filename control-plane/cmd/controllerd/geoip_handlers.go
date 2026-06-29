@@ -9,6 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/your-org/sentinel-waf/control-plane/internal/auth"
+	"github.com/your-org/sentinel-waf/control-plane/internal/cluster"
 	"github.com/your-org/sentinel-waf/control-plane/internal/db"
 	"github.com/your-org/sentinel-waf/control-plane/internal/logs"
 	"github.com/your-org/sentinel-waf/control-plane/internal/rbac"
@@ -44,16 +45,16 @@ func handleListBlockedCountries(c *gin.Context, enf *rbac.Enforcer, store *db.St
 }
 
 // handleBlockCountry adds a country code to every active site's geoip block list.
-func handleBlockCountry(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub) {
-	geoipMutate(c, enf, store, hub, true)
+func handleBlockCountry(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
+	geoipMutate(c, enf, store, hub, cl, true)
 }
 
 // handleUnblockCountry removes a country code from every site's geoip block list.
-func handleUnblockCountry(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub) {
-	geoipMutate(c, enf, store, hub, false)
+func handleUnblockCountry(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
+	geoipMutate(c, enf, store, hub, cl, false)
 }
 
-func geoipMutate(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, block bool) {
+func geoipMutate(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster, block bool) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceSite, rbac.ActionUpdate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
@@ -61,6 +62,12 @@ func geoipMutate(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.
 	}
 	if store == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
+		return
+	}
+	// GeoIP blocking is a site mutation and must follow the same Raft path as
+	// every other site write: reject early on a follower so the client retries
+	// against the leader, and replicate each change through the log below.
+	if !requireLeader(c, cl) {
 		return
 	}
 
@@ -90,11 +97,27 @@ func geoipMutate(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.
 		return
 	}
 
+	// Compute the planned per-site changes up front. setCountryBlock is a no-op
+	// for sites already in the desired state, so a retry after a partial failure
+	// resumes from where it stopped (idempotent).
+	updated := make(map[string]json.RawMessage)
+	for _, s := range sites {
+		if newPolicy, did := setCountryBlock(s.WafPolicy, code, block); did {
+			updated[s.ID] = newPolicy
+		}
+	}
+
 	changed := 0
 	for _, s := range sites {
-		newPolicy, did := setCountryBlock(s.WafPolicy, code, block)
-		if !did {
+		newPolicy, ok := updated[s.ID]
+		if !ok {
 			continue
+		}
+		// Replicate through Raft before the local write, identical to every
+		// other site mutation (handlers.go / sites_config.go).
+		if !proposeBest(c, cl, cluster.CmdSiteUpdate,
+			gin.H{"tenant_id": claims.TenantID, "site_id": s.ID, "req": db.UpdateSiteRequest{WafPolicy: newPolicy}}) {
+			return
 		}
 		if _, err := store.UpdateSite(c.Request.Context(), claims.TenantID, claims.UserID, s.ID,
 			db.UpdateSiteRequest{WafPolicy: newPolicy}); err != nil {
@@ -116,8 +139,13 @@ func geoipMutate(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.
 		Action: action, TargetKind: "geoip",
 	})
 
-	// Re-read the union so the UI reflects the new state.
-	sites, _ = store.ListSites(c.Request.Context(), claims.TenantID, claims.UserID)
+	// Reflect the new union from the in-memory state we just wrote — no second
+	// round-trip to the database.
+	for i := range sites {
+		if np, ok := updated[sites[i].ID]; ok {
+			sites[i].WafPolicy = np
+		}
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"ok": true, "country": code, "blocked": block,
 		"sites_changed": changed, "countries": blockedUnion(sites),

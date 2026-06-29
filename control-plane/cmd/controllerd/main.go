@@ -36,6 +36,59 @@ func main() {
 	}
 }
 
+// dbConnectMaxWait is how long openDBWithRetry keeps retrying the initial DB
+// connection before giving up (then falling back to degraded mode). Override
+// with SENTINEL_DB_CONNECT_TIMEOUT (seconds); 0 disables retry. Default 60s.
+func dbConnectMaxWait() time.Duration {
+	if v := os.Getenv("SENTINEL_DB_CONNECT_TIMEOUT"); v != "" {
+		if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
+			return time.Duration(secs) * time.Second
+		}
+	}
+	return 60 * time.Second
+}
+
+// openDBWithRetry repeatedly attempts to open the DB pool until it succeeds or
+// maxWait elapses, using capped exponential backoff. Each attempt is bounded by
+// its own short timeout so a hung connect can't stall startup forever. This
+// makes the control plane resilient to start-ordering — Postgres not yet
+// accepting connections (docker compose restart, Kubernetes pod ordering) —
+// instead of failing into degraded mode on the first ping.
+func openDBWithRetry(ctx context.Context, log *zap.Logger, cfg db.Config, maxWait time.Duration) (db.Pool, error) {
+	deadline := time.Now().Add(maxWait)
+	backoff := time.Second
+	const maxBackoff = 5 * time.Second
+	for attempt := 1; ; attempt++ {
+		attemptCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		pool, err := db.Open(attemptCtx, cfg)
+		cancel()
+		if err == nil {
+			if attempt > 1 {
+				log.Info("DB reachable after retry", zap.Int("attempts", attempt))
+			}
+			return pool, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("db not reachable after %d attempts over %s: %w", attempt, maxWait, err)
+		}
+		log.Warn("DB not ready yet — retrying",
+			zap.Int("attempt", attempt),
+			zap.Duration("next_retry_in", backoff),
+			zap.Error(err))
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		if backoff < maxBackoff {
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+	}
+}
+
 func run() error {
 	// ── Logger ────────────────────────────────────────────────────────────────
 	logCfg := zap.NewDevelopmentConfig()
@@ -68,7 +121,10 @@ func run() error {
 	var pool db.Pool // lifted for shutdown access
 	if dbURL != "" {
 		var dbErr error
-		pool, dbErr = db.Open(ctx, db.Config{URL: dbURL, MaxConns: 20, MinConns: 2})
+		// Retry with backoff so the control plane survives starting before
+		// Postgres is ready (docker compose restart, Kubernetes pod ordering)
+		// instead of dropping straight into degraded mode on the first ping.
+		pool, dbErr = openDBWithRetry(ctx, log, db.Config{URL: dbURL, MaxConns: 20, MinConns: 2}, dbConnectMaxWait())
 		if dbErr != nil {
 			log.Warn("DB unavailable — running in degraded mode (mock data only)", zap.Error(dbErr))
 		} else {
@@ -214,14 +270,14 @@ func run() error {
 
 		// GeoIP country blocking (global policy applied across active sites).
 		// Searchable WAF history (ClickHouse-backed).
-		protected.GET("/events/status", func(c *gin.Context) { handleEventsStatus(c, chClient) })
+		protected.GET("/events/status", func(c *gin.Context) { handleEventsStatus(c, enforcer, chClient) })
 		protected.GET("/events/search", func(c *gin.Context) { handleEventsSearch(c, enforcer, chClient) })
 		protected.GET("/events/timeline", func(c *gin.Context) { handleEventsTimeline(c, enforcer, chClient) })
 		protected.GET("/events/facets", func(c *gin.Context) { handleEventsFacets(c, enforcer, chClient) })
 
 		protected.GET("/geoip/blocked", func(c *gin.Context) { handleListBlockedCountries(c, enforcer, store) })
-		protected.POST("/geoip/block", func(c *gin.Context) { handleBlockCountry(c, enforcer, store, hub) })
-		protected.DELETE("/geoip/block/:code", func(c *gin.Context) { handleUnblockCountry(c, enforcer, store, hub) })
+		protected.POST("/geoip/block", func(c *gin.Context) { handleBlockCountry(c, enforcer, store, hub, cl) })
+		protected.DELETE("/geoip/block/:code", func(c *gin.Context) { handleUnblockCountry(c, enforcer, store, hub, cl) })
 		protected.GET("/metrics/snapshot", func(c *gin.Context) { handleMetricsSnapshot(c, hub) })
 		protected.GET("/metrics/sites", func(c *gin.Context) { handleSiteMetrics(c, hub) })
 		protected.GET("/metrics/learning", func(c *gin.Context) { handleLearningReport(c, hub) })
@@ -231,6 +287,12 @@ func run() error {
 
 		// TLS / ACME certificate management — bridges to the data-plane internal API.
 		protected.GET("/certs", func(c *gin.Context) { handleListCerts(c, enforcer) })
+		protected.GET("/certs/root-ca", func(c *gin.Context) { handleDownloadRootCA(c, enforcer) })
+		protected.GET("/certs/root-ca/info", func(c *gin.Context) { handleRootCAInfo(c, enforcer) })
+		// Management-console TLS (the cert the admin UI itself is served with).
+		protected.GET("/management-tls", func(c *gin.Context) { handleGetManagementTLS(c, enforcer) })
+		protected.POST("/management-tls", func(c *gin.Context) { handleUploadManagementTLS(c, enforcer, store, hub) })
+		protected.DELETE("/management-tls", func(c *gin.Context) { handleRevertManagementTLS(c, enforcer, store, hub) })
 		protected.POST("/certs/manual", func(c *gin.Context) { handleUploadManualCert(c, enforcer) })
 		protected.POST("/certs/acme", func(c *gin.Context) { handleRequestAcmeCert(c, enforcer) })
 		protected.POST("/certs/:domain/renew", func(c *gin.Context) { handleRenewCert(c, enforcer) })
@@ -441,11 +503,21 @@ func startCluster(log *zap.Logger) (*cluster.Cluster, error) {
 
 	dataDir := envOrDefault("SENTINEL_RAFT_DIR", filepath.Join(".", "raft-data", idStr))
 
+	// Inter-node RPC must be authenticated with a shared secret. Require it
+	// whenever peers are configured (multi-node) so a node on the cluster
+	// network can't forge log entries or spoof votes. Single-node clusters
+	// exchange no RPC, so the secret is optional there.
+	secret := os.Getenv("SENTINEL_RAFT_SECRET")
+	if len(peers) > 0 && secret == "" {
+		return nil, fmt.Errorf("SENTINEL_RAFT_SECRET is required for a multi-node cluster (peers configured)")
+	}
+
 	cfg := cluster.Config{
 		NodeID:     cluster.NodeID(id),
 		ListenAddr: addr,
 		Peers:      peers,
 		DataDir:    dataDir,
+		Secret:     secret,
 		Logger:     log.Named("raft"),
 		Apply: func(cmd cluster.Command) error {
 			// At apply time the leader has already written through Postgres

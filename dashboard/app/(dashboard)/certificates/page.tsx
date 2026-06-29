@@ -1,5 +1,5 @@
 "use client";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { motion } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
 import {
@@ -75,7 +75,7 @@ function lifeBar(c: Certificate) {
   const color = d <= 0 ? "var(--red)" : d <= 14 ? "var(--red)" : d <= 30 ? "var(--amber)" : "var(--green)";
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-      <div style={{ flex: 1, height: 6, background: "rgba(255,255,255,.06)", borderRadius: 3, overflow: "hidden", minWidth: 60 }}>
+      <div style={{ flex: 1, height: 6, background: "rgba(255,255,255,.06)", borderRadius: 3, overflow: "hidden", minWidth: 80 }}>
         <div style={{ width: `${pct}%`, height: "100%", background: color, transition: "width .4s" }} />
       </div>
       <span className="td3" style={{ minWidth: 64, textAlign: "right" }}>
@@ -94,6 +94,7 @@ export default function CertificatesPage() {
   const [wafUp, setWafUp]   = useState(true);
   const [busy, setBusy]     = useState<string | null>(null);
   const [tab, setTab]       = useState<"acme" | "manual">("acme");
+  const [rootCA, setRootCA] = useState<{ available: boolean; subject?: string; not_after?: number; fingerprint?: string } | null>(null);
 
   // ACME form
   const [acmeDomains, setAcmeDomains]   = useState("");
@@ -110,18 +111,45 @@ export default function CertificatesPage() {
   async function load() {
     setLoading(true);
     try {
-      const res = await api.certs.list();
+      // Independent calls — fetch concurrently. Sites are optional, so swallow
+      // their failure without failing the whole load.
+      const [res, s, ca] = await Promise.all([
+        api.certs.list(),
+        api.sites.list().catch(() => ({ sites: [] as Site[] })),
+        api.certs.rootCAInfo().catch(() => ({ available: false })),
+      ]);
       setCerts(res.certs ?? []);
       setWafUp(res.waf_running);
+      setSites(s.sites ?? []);
+      setRootCA(ca);
     } catch {
       showToast("Failed to load certificates", "e", "⚠️");
     } finally {
       setLoading(false);
     }
-    try { const s = await api.sites.list(); setSites(s.sites ?? []); } catch { /* sites optional */ }
   }
 
   useEffect(() => { load(); }, []);
+
+  async function downloadRootCA() {
+    setBusy("rootca");
+    try {
+      await api.certs.downloadRootCA();
+      showToast("Root CA downloaded — import it as a trusted root authority for a green lock", "s", "🛡️");
+    } catch {
+      showToast("Failed to download root CA", "e", "⚠️");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  // Map each cert → the sites it protects once per certs/sites change, instead
+  // of recomputing the O(certs × sites) match for every row on every render.
+  const coveredByDomain = useMemo(() => {
+    const m = new Map<string, Site[]>();
+    for (const c of certs) m.set(c.domain, protectedSites(c, sites));
+    return m;
+  }, [certs, sites]);
 
   const counts = {
     total:    certs.length,
@@ -228,6 +256,26 @@ export default function CertificatesPage() {
         </div>
         <motion.button className="btn bg-btn btn-sm" onClick={load} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>⟳ Refresh</motion.button>
       </motion.div>
+
+      {rootCA?.available && (
+        <motion.div className="panel" variants={fadeUp}
+          style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 14, flexWrap: "wrap" }}>
+          <div style={{ minWidth: 0 }}>
+            <div style={{ fontWeight: 600 }}>🛡️ Trust this WAF (import the Root CA)</div>
+            <div className="sec-sub" style={{ marginTop: 4 }}>
+              Browsers warn on the WAF&apos;s HTTPS-by-IP endpoint until they trust our private CA. Download it
+              once and install it as a <em>trusted root authority</em> to get a green lock — encryption is
+              already on regardless.
+              {rootCA.subject ? <> · <span style={{ opacity: .85 }}>{rootCA.subject}</span></> : null}
+              {rootCA.not_after ? <> · valid to {fmtDate(rootCA.not_after)}</> : null}
+            </div>
+          </div>
+          <motion.button className="btn bc btn-sm" disabled={busy === "rootca"} onClick={downloadRootCA}
+            whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
+            {busy === "rootca" ? "Downloading…" : "⬇ Download Root CA"}
+          </motion.button>
+        </motion.div>
+      )}
 
       <motion.div variants={staggerContainer} initial="hidden" animate="visible" style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 12 }}>
         {kpis.map((k, i) => (
@@ -346,15 +394,17 @@ export default function CertificatesPage() {
                   const src = sourceLabel(c.source);
                   const st = statusOf(c);
                   const isAcme = typeof c.source === "object" && "acme" in c.source;
-                  const covered = protectedSites(c, sites);
+                  const covered = coveredByDomain.get(c.domain) ?? [];
                   return (
                     <motion.tr key={c.domain} initial={{ opacity: 0, x: -8 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: idx * 0.02 }}>
-                      <td>
-                        <div style={{ fontWeight: 600, display: "flex", alignItems: "center", gap: 6 }}>
-                          {c.name ? c.name : c.domain}
-                          {isWildcard(c) && <span className="bdg bcy" title="Wildcard — covers all subdomains">✦ wildcard</span>}
+                      <td style={{ maxWidth: 260 }}>
+                        <div style={{ fontWeight: 600, display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
+                          <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={c.name || c.domain}>
+                            {c.name ? c.name : c.domain}
+                          </span>
+                          {isWildcard(c) && <span className="bdg bcy" style={{ flexShrink: 0 }} title="Wildcard — covers all subdomains">✦ wildcard</span>}
                         </div>
-                        <div className="td3" style={{ fontSize: 12 }}>
+                        <div className="td3" style={{ fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                           {c.name ? c.domain : ""}{c.san.length > 1 ? `${c.name ? " · " : ""}+${c.san.length - 1} SAN` : ""}
                         </div>
                       </td>
@@ -366,7 +416,7 @@ export default function CertificatesPage() {
                       <td><span className={`bdg ${src.cls}`}><span className="bdr" />{src.text}</span></td>
                       <td><span className={`bdg ${st.cls}`}><span className="bdr" />{st.label}</span></td>
                       <td className="td3">{fmtDate(c.expires_at)}</td>
-                      <td style={{ minWidth: 150 }}>{lifeBar(c)}</td>
+                      <td style={{ minWidth: 180 }}>{lifeBar(c)}</td>
                       <td>
                         <div style={{ display: "flex", gap: 4 }}>
                           <motion.button className="btn bg-btn btn-xs" disabled={busy === c.domain} whileHover={{ scale: 1.06 }} whileTap={{ scale: 0.95 }} onClick={() => rename(c)} title="Set profile name">

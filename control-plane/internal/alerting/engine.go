@@ -46,6 +46,12 @@ type Engine struct {
 	ipWindow   map[string][]time.Time
 	siteWindow map[string][]time.Time
 
+	// dispatchCh decouples the (slow, network-bound) channel fan-out from the
+	// single hub-consumer goroutine. Without it an unreachable webhook/syslog
+	// channel would block the consumer for the per-channel timeout and make the
+	// engine drop WAF events during an attack spike.
+	dispatchCh chan notify.Alert
+
 	done chan struct{}
 }
 
@@ -74,6 +80,7 @@ func New(store *db.Store, hub *logs.Hub, tenantID, userID string, cfg Config, lo
 		lastRaise:  make(map[string]time.Time),
 		ipWindow:   make(map[string][]time.Time),
 		siteWindow: make(map[string][]time.Time),
+		dispatchCh: make(chan notify.Alert, 256),
 		done:       make(chan struct{}),
 	}
 }
@@ -86,6 +93,7 @@ func (e *Engine) Start() {
 	}
 	ch := e.hub.Subscribe()
 	go e.loop(ch)
+	go e.dispatchWorker()
 	go e.janitor()
 	e.log.Info("alert engine started",
 		zap.Int("spike_threshold", e.cfg.SpikeThreshold),
@@ -161,7 +169,11 @@ func (e *Engine) onWaf(data json.RawMessage) {
 
 	// Condition 3 — a single critical/high block is itself notable.
 	if sev == "critical" || sev == "high" {
-		e.raise(fmt.Sprintf("sev:%s:%s", ev.Rule, ev.IP), db.CreateAlertRequest{
+		// Throttle by a full identity (severity + attack kind + site + IP), not
+		// just rule+IP — otherwise blocks with no rule/IP collapse to one bucket
+		// ("sev::") and distinct critical events coalesce into a single alert.
+		throttleKey := fmt.Sprintf("sev:%s:%s:%s:%s", sev, attackKind(ev.Attack, ev.Rule), ev.Site, ev.IP)
+		e.raise(throttleKey, db.CreateAlertRequest{
 			Severity: sev,
 			Kind:     attackKind(ev.Attack, ev.Rule),
 			Summary:  fmt.Sprintf("%s blocked on %s (rule %s) from %s", capitalize(attackKind(ev.Attack, ev.Rule)), siteOr(ev.Site), ev.Rule, ev.IP),
@@ -208,9 +220,32 @@ func (e *Engine) raise(throttleKey string, req db.CreateAlertRequest, na notify.
 	// Live SSE: surface the alert on the dashboard immediately.
 	e.publishToHub(row)
 
-	// Fan out to configured channels.
-	e.dispatch(ctx, na)
+	// Hand the channel fan-out to the dispatch worker so a slow/unreachable
+	// channel can't stall this consumer goroutine. Non-blocking: if the queue is
+	// saturated we drop the fan-out (the alert is already persisted + on the
+	// dashboard) rather than block event processing.
+	select {
+	case e.dispatchCh <- na:
+	default:
+		e.log.Warn("alert dispatch queue full — dropping channel fan-out", zap.String("kind", req.Kind))
+	}
 	e.log.Info("alert raised", zap.String("kind", req.Kind), zap.String("severity", req.Severity), zap.String("summary", req.Summary))
+}
+
+// dispatchWorker drains the dispatch queue, fanning each alert out to the
+// configured notification channels with its own timeout — off the hub-consumer
+// goroutine so per-channel latency never backs up event processing.
+func (e *Engine) dispatchWorker() {
+	for {
+		select {
+		case <-e.done:
+			return
+		case na := <-e.dispatchCh:
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			e.dispatch(ctx, na)
+			cancel()
+		}
+	}
 }
 
 func (e *Engine) publishToHub(row *db.AlertRow) {

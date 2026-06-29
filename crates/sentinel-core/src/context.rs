@@ -112,6 +112,8 @@ pub struct RequestContext {
     // --- Site routing ---
     /// Which site config matched (by Host header / SNI).
     pub site_id: Option<String>,
+    /// ISO-3166-1 alpha-2 country code resolved by the GeoIP module, when known.
+    pub geo_country: Option<String>,
 
     // --- WAF state ---
     pub phase: Phase,
@@ -142,6 +144,11 @@ pub struct RequestContext {
     pub response_body: Option<Bytes>,
     pub bytes_sent: u64,
     pub bytes_received: u64,
+
+    /// `Set-Cookie` values to attach to the eventual origin response. Used when a
+    /// Proof-of-Work grant is consumed in-line (e.g. a challenged POST that must
+    /// reach origin with its body intact) instead of via a 302 redirect.
+    pub pending_set_cookies: Vec<String>,
 }
 
 impl RequestContext {
@@ -159,6 +166,7 @@ impl RequestContext {
             request_headers: HeaderMap::new(),
             request_body: None,
             site_id: None,
+            geo_country: None,
             phase: Phase::Connection,
             anomaly_score: 0,
             rule_matches: Vec::new(),
@@ -174,6 +182,7 @@ impl RequestContext {
             response_body: None,
             bytes_sent: 0,
             bytes_received: 0,
+            pending_set_cookies: Vec::new(),
         }
     }
 

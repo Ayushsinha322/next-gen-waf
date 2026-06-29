@@ -348,23 +348,46 @@ export default function OverviewPage() {
           <div className="ph"><div className="ptitle">Blocked requests by origin</div><span className="panel-badge pb-info">{metrics?.geoip_loaded ? "GeoIP" : "GeoIP off"}</span></div>
           <div className="pb"><WorldMap data={metrics?.by_country ?? {}} loaded={!!metrics?.geoip_loaded} /></div>
         </div>
-        <div className="panel">
+        <div className="panel" style={{ display: "flex", flexDirection: "column" }}>
           <div className="ph"><div className="ptitle">Response status</div><span className="panel-badge pb-info">{sTotal.toLocaleString()} reqs</span></div>
-          <div className="pb" style={{ display: "flex", alignItems: "center", gap: 18 }}>
-            <div style={{ width: 110, height: 110, borderRadius: "50%", background: `conic-gradient(${conic})`, position: "relative", flexShrink: 0 }}>
-              <div style={{ position: "absolute", inset: 14, borderRadius: "50%", background: "var(--bg2)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
-                <div style={{ fontSize: 16, fontWeight: 800, color: "var(--text)", fontFamily: "'Orbitron',sans-serif" }}>{sTotal > 0 ? `${((s2 / sTotal) * 100).toFixed(0)}%` : "—"}</div>
-                <div style={{ fontSize: 8, color: "var(--text3)" }}>success</div>
+          <div className="pb" style={{ flex: 1, display: "flex", flexDirection: "column", justifyContent: "space-between", gap: 18, padding: "22px 18px" }}>
+
+            {/* Donut */}
+            <div style={{ display: "flex", justifyContent: "center" }}>
+              <div style={{ width: 172, height: 172, borderRadius: "50%", background: `conic-gradient(${conic})`, position: "relative" }}>
+                <div style={{ position: "absolute", inset: 23, borderRadius: "50%", background: "var(--bg2)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
+                  <div style={{ fontSize: 32, fontWeight: 800, color: "var(--text)", fontFamily: "'Orbitron',sans-serif", lineHeight: 1 }}>{sTotal > 0 ? `${((s2 / sTotal) * 100).toFixed(0)}%` : "—"}</div>
+                  <div style={{ fontSize: 10, color: "var(--text3)", marginTop: 5, letterSpacing: 1, textTransform: "uppercase", fontFamily: "'Share Tech Mono',monospace" }}>success</div>
+                </div>
               </div>
             </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 7, flex: 1 }}>
+
+            {/* Per-status proportion bars */}
+            <div style={{ display: "flex", flexDirection: "column", gap: 15 }}>
               {statusSlices.map(s => (
-                <div key={s.label} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11 }}>
-                  <span style={{ width: 9, height: 9, borderRadius: 2, background: s.color }} />
-                  <span style={{ color: "var(--text2)", flex: 1, fontFamily: "'Share Tech Mono',monospace" }}>{s.label}</span>
-                  <span style={{ color: "var(--text)", fontFamily: "'Share Tech Mono',monospace" }}>{s.v.toLocaleString()}</span>
+                <div key={s.label} style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12 }}>
+                  <span style={{ width: 10, height: 10, borderRadius: 2, background: s.color, flexShrink: 0 }} />
+                  <span style={{ color: "var(--text2)", width: 30, fontFamily: "'Share Tech Mono',monospace", flexShrink: 0 }}>{s.label}</span>
+                  <div className="atk-bar-bg" style={{ flex: 1 }}>
+                    <div className="atk-bar" style={{ width: `${sTotal > 0 ? (s.v / sTotal) * 100 : 0}%`, background: s.color }} />
+                  </div>
+                  <span style={{ color: "var(--text)", fontFamily: "'Share Tech Mono',monospace", width: 48, textAlign: "right", flexShrink: 0 }}>{s.v.toLocaleString()}</span>
+                  <span style={{ color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", width: 38, textAlign: "right", flexShrink: 0 }}>{sTotal > 0 ? `${((s.v / sTotal) * 100).toFixed(0)}%` : "—"}</span>
                 </div>
               ))}
+            </div>
+
+            {/* Summary footer */}
+            <div style={{ display: "flex", alignItems: "stretch", gap: 12, borderTop: "1px solid var(--bg4)", paddingTop: 16 }}>
+              <div style={{ flex: 1, textAlign: "center" }}>
+                <div style={{ fontSize: 19, fontWeight: 800, color: "#22c55e", fontFamily: "'Orbitron',sans-serif", lineHeight: 1 }}>{sTotal > 0 ? `${(((s2 + s3) / sTotal) * 100).toFixed(1)}%` : "—"}</div>
+                <div style={{ fontSize: 9, color: "var(--text3)", letterSpacing: 1, textTransform: "uppercase", marginTop: 5, fontFamily: "'Share Tech Mono',monospace" }}>OK · 2xx/3xx</div>
+              </div>
+              <div style={{ width: 1, background: "var(--bg4)" }} />
+              <div style={{ flex: 1, textAlign: "center" }}>
+                <div style={{ fontSize: 19, fontWeight: 800, color: "#ef4444", fontFamily: "'Orbitron',sans-serif", lineHeight: 1 }}>{(s4 + s5).toLocaleString()}</div>
+                <div style={{ fontSize: 9, color: "var(--text3)", letterSpacing: 1, textTransform: "uppercase", marginTop: 5, fontFamily: "'Share Tech Mono',monospace" }}>Errors · 4xx/5xx</div>
+              </div>
             </div>
           </div>
         </div>
@@ -412,7 +435,7 @@ export default function OverviewPage() {
               { name: "SQL injection suite", on: enabledRules > 0 },
               { name: "XSS ruleset", on: enabledRules > 0 },
               { name: "Bot / scanner signatures", on: enabledRules > 0 },
-              { name: "ML anomaly engine", on: mlDet >= 0 && wafStatus?.running },
+              { name: "ML anomaly engine", on: !!wafStatus?.running },
               { name: "Custom site rules", on: totalRules > 0 },
             ].map((row, idx) => (
               <motion.div key={row.name} className="rule-row" initial={{ opacity: 0, x: -4 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: 0.5 + idx * 0.05 }}>

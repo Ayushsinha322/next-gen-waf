@@ -7,6 +7,14 @@ FROM node:20-alpine AS builder
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
+# Next.js bakes BOTH the rewrite() destination AND NEXT_PUBLIC_* client vars at
+# BUILD time. Two distinct URLs:
+#   CONTROL_PLANE_URL            → server-side REST proxy, internal hostname (portable)
+#   NEXT_PUBLIC_CONTROL_PLANE_URL → client-side SSE log stream, must be BROWSER-reachable
+ARG CONTROL_PLANE_URL=http://controlplane:9501
+ARG NEXT_PUBLIC_CONTROL_PLANE_URL=http://controlplane:9501
+ENV CONTROL_PLANE_URL=${CONTROL_PLANE_URL}
+ENV NEXT_PUBLIC_CONTROL_PLANE_URL=${NEXT_PUBLIC_CONTROL_PLANE_URL}
 RUN npm run build
 
 FROM node:20-alpine AS runner

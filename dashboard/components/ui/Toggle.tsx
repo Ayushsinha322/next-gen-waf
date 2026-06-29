@@ -7,15 +7,24 @@ export default function Toggle({
   onChange,
 }: {
   defaultOn?: boolean;
-  /** Called with the new state when toggled. When provided, the component is
-   *  still visually optimistic but the caller drives the real state. */
-  onChange?: (on: boolean) => void;
+  /** Called with the new state when toggled. The flip is optimistic; if this
+   *  throws or rejects (e.g. the backend save fails) the toggle rolls back to
+   *  its previous state. */
+  onChange?: (on: boolean) => void | Promise<void>;
 }) {
   const [on, setOn] = useState(defaultOn);
   return (
     <motion.div
       className={`tog ${on ? "on" : ""}`}
-      onClick={() => { const next = !on; setOn(next); onChange?.(next); }}
+      onClick={async () => {
+        const next = !on;
+        setOn(next); // optimistic
+        try {
+          await onChange?.(next);
+        } catch {
+          setOn(!next); // persistence failed — roll back
+        }
+      }}
       whileTap={{ scale: 0.92 }}
     />
   );

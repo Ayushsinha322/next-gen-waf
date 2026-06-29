@@ -285,5 +285,52 @@ func TestNotLeaderError(t *testing.T) {
 	}
 }
 
+// TestRPCAuth verifies the inter-node RPC authentication: a frame sealed with
+// the cluster secret is accepted by a node holding the same secret, and rejected
+// when the secret differs or the body is tampered with. A node with no secret
+// configured (single-node) round-trips without auth for backward compatibility.
+func TestRPCAuth(t *testing.T) {
+	signer := &Cluster{cfg: Config{Secret: "shared-cluster-secret"}}
+
+	env, err := signer.seal(rpcMsg{Type: rpcRequestVote, Term: 7, CandidateID: 1})
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	if env.Auth == "" {
+		t.Fatal("sealed envelope must carry an auth tag when a secret is set")
+	}
+
+	// Correct secret accepts.
+	if _, err := signer.open(env); err != nil {
+		t.Fatalf("valid tag rejected: %v", err)
+	}
+
+	// Wrong secret is rejected (forgery / spoofing without the shared key).
+	attacker := &Cluster{cfg: Config{Secret: "wrong-secret"}}
+	if _, err := attacker.open(env); err == nil {
+		t.Fatal("frame under the wrong secret must be rejected")
+	}
+
+	// Tampered body (e.g. forging a higher term to win an election) is rejected.
+	tampered := env
+	tampered.Msg = []byte(`{"type":"RequestVote","term":99,"candidate_id":1}`)
+	if _, err := signer.open(tampered); err == nil {
+		t.Fatal("tampered body must be rejected")
+	}
+
+	// No secret configured (single-node): seal/open round-trips without auth.
+	plain := &Cluster{cfg: Config{}}
+	penv, err := plain.seal(rpcMsg{Type: rpcRequestVote, Term: 1})
+	if err != nil {
+		t.Fatalf("seal (no secret): %v", err)
+	}
+	if penv.Auth != "" {
+		t.Fatal("no-secret envelope must not carry an auth tag")
+	}
+	if _, err := plain.open(penv); err != nil {
+		t.Fatalf("no-secret round-trip failed: %v", err)
+	}
+}
+
 // (compile-time: ensure fmt is imported for any sprintf usage we might add)
 var _ = fmt.Sprintf

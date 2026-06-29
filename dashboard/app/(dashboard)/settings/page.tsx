@@ -3,10 +3,10 @@ import { useState, useEffect } from "react";
 import { motion } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
 import Toggle from "@/components/ui/Toggle";
-import { api, type UserRow, type APIKeyRow, type NotificationChannel, type ChannelType, type ChannelConfig, type Severity } from "@/lib/api";
+import { api, type UserRow, type APIKeyRow, type NotificationChannel, type ChannelType, type ChannelConfig, type Severity, type ManagementTLSInfo } from "@/lib/api";
 import { staggerContainer, fadeUp, spring } from "@/lib/animations";
 
-const TABS = ["General","Auth & SSO","API Keys","Users & RBAC","Cluster","Notifications"];
+const TABS = ["General","Auth & SSO","API Keys","Users & RBAC","Cluster","Notifications","Management TLS"];
 
 export default function SettingsPage() {
   const [tab, setTab] = useState(0);
@@ -28,6 +28,7 @@ export default function SettingsPage() {
       {tab === 3 && <UsersTab />}
       {tab === 4 && <ClusterTab />}
       {tab === 5 && <NotificationsTab />}
+      {tab === 6 && <ManagementTLSTab />}
     </motion.div>
   );
 }
@@ -372,8 +373,9 @@ function NotificationsTab() {
   }
   async function toggle(ch: NotificationChannel) {
     setBusy(ch.id);
+    // Re-throw so the optimistic <Toggle> rolls back when the save fails.
     try { await api.notifications.update(ch.id, { enabled: !ch.enabled }); await load(); }
-    catch { showToast("Update failed", "e", "⚠️"); }
+    catch (e) { showToast("Update failed", "e", "⚠️"); throw e; }
     finally { setBusy(null); }
   }
   async function del(ch: NotificationChannel) {
@@ -454,6 +456,152 @@ function NotificationsTab() {
             </div>
           </div>
         ))}
+      </div>
+    </motion.div>
+  );
+}
+
+// ── Management TLS ─────────────────────────────────────────────────────────────
+function MgmtField({ label, value, mono }: { label: string; value?: string; mono?: boolean }) {
+  return (
+    <div className="fg2">
+      <label className="flbl2">{label}</label>
+      <div style={{ fontFamily: mono ? "monospace" : undefined, fontSize: mono ? 11 : 13, wordBreak: "break-all" }}>
+        {value && value.length ? value : "—"}
+      </div>
+    </div>
+  );
+}
+
+function ManagementTLSTab() {
+  const [info, setInfo] = useState<ManagementTLSInfo | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [cert, setCert] = useState("");
+  const [pkey, setPkey] = useState("");
+  const [ca, setCa] = useState("");
+  const [name, setName] = useState("");
+  const [host, setHost] = useState("");
+  const [warnings, setWarnings] = useState<string[]>([]);
+
+  async function load() {
+    setLoading(true);
+    try { setInfo(await api.managementTls.get()); }
+    catch { showToast("Failed to load management TLS", "e", "⚠️"); }
+    finally { setLoading(false); }
+  }
+  useEffect(() => { load(); }, []);
+
+  const fmtDate = (u?: number) =>
+    u ? new Date(u * 1000).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" }) : "—";
+  const daysLeft = (u?: number) => (u ? Math.floor((u * 1000 - Date.now()) / 86_400_000) : null);
+
+  async function upload() {
+    if (!cert.trim() || !pkey.trim()) { showToast("Paste both the certificate and the private key", "e", "⚠️"); return; }
+    setBusy("upload"); setWarnings([]);
+    try {
+      const r = await api.managementTls.upload({
+        cert_pem: cert, key_pem: pkey,
+        ca_bundle_pem: ca.trim() || undefined,
+        name: name.trim() || undefined,
+        expected_host: host.trim() || undefined,
+      });
+      setWarnings(r.warnings ?? []);
+      showToast("Management certificate installed — applies on the next connection", "s", "🔐");
+      setCert(""); setPkey(""); setCa("");
+      await load();
+    } catch (e) {
+      showToast(e instanceof Error ? e.message : "Upload failed", "e", "⛔");
+    } finally { setBusy(null); }
+  }
+
+  async function revert() {
+    if (!confirm("Revert to the self-signed default management certificate?")) return;
+    setBusy("revert");
+    try { await api.managementTls.revert(); showToast("Reverted to self-signed default", "s", "↩️"); await load(); }
+    catch { showToast("Revert failed", "e", "⚠️"); }
+    finally { setBusy(null); }
+  }
+
+  const d = daysLeft(info?.expires_at);
+  return (
+    <motion.div className="panel" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}>
+      <div className="ph">
+        <div className="ptitle">🔐 Management Console Certificate</div>
+        {info && !info.self_signed && (
+          <motion.button className="btn bg-btn btn-sm" disabled={busy === "revert"} onClick={revert}
+            whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>↩️ Revert to self-signed</motion.button>
+        )}
+      </div>
+      <div className="pb">
+        <p className="sec-sub" style={{ marginTop: 0 }}>
+          The certificate the WAF presents on its <b>management endpoint</b> (this admin console). Served by
+          Sentinel&apos;s own engine — no third-party proxy. Customer-website certificates are separate and live
+          under <b>Certificates</b>.
+        </p>
+
+        {loading ? (
+          <div className="sec-sub">Loading…</div>
+        ) : info?.self_signed ? (
+          <div className="panel" style={{ background: "rgba(245,158,11,.08)", borderColor: "var(--amber)" }}>
+            <div className="pb">
+              <b>⚠️ Self-signed default in use</b>
+              <div className="sec-sub">
+                Browsers warn until you install a trusted certificate below (or import the Sentinel root CA from
+                the Certificates page). Traffic is encrypted either way.
+              </div>
+            </div>
+          </div>
+        ) : (
+          <>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(2,1fr)", gap: 10 }}>
+              <MgmtField label="Profile / Subject" value={info?.name} />
+              <MgmtField label="Issuer" value={info?.issuer} />
+              <MgmtField label="Valid until" value={`${fmtDate(info?.expires_at)}${d !== null ? ` · ${d}d left` : ""}`} />
+              <MgmtField label="Key type" value={info?.key_type} />
+              <MgmtField label="SAN" value={(info?.san || []).join(", ")} />
+              <MgmtField label="Fingerprint (SHA-256)" value={info?.fingerprint} mono />
+            </div>
+            {d !== null && d <= 30 && (
+              <div style={{ color: "var(--red)", fontSize: 13, marginTop: 8 }}>⚠️ Expires in {d} day(s) — plan a rotation.</div>
+            )}
+          </>
+        )}
+
+        <div style={{ marginTop: 18 }}>
+          <div className="ptitle" style={{ fontSize: 14, marginBottom: 8 }}>Upload a new management certificate</div>
+          <div className="fg2"><label className="flbl2">Profile name (optional)</label>
+            <input className="fin2" value={name} placeholder="Company management cert" onChange={e => setName(e.target.value)} /></div>
+          <div className="fg2"><label className="flbl2">Certificate (PEM — leaf first, then any intermediates)</label>
+            <textarea className="fin2" style={{ minHeight: 120, fontFamily: "monospace" }} value={cert}
+              placeholder="-----BEGIN CERTIFICATE-----" onChange={e => setCert(e.target.value)} /></div>
+          <div className="fg2"><label className="flbl2">Private key (PEM)</label>
+            <textarea className="fin2" style={{ minHeight: 90, fontFamily: "monospace" }} value={pkey}
+              placeholder="-----BEGIN PRIVATE KEY-----" onChange={e => setPkey(e.target.value)} /></div>
+          <div className="fg2"><label className="flbl2">CA bundle (PEM, optional — enables chain verification)</label>
+            <textarea className="fin2" style={{ minHeight: 70, fontFamily: "monospace" }} value={ca}
+              placeholder="-----BEGIN CERTIFICATE----- (roots / intermediates)" onChange={e => setCa(e.target.value)} /></div>
+          <div className="fg2"><label className="flbl2">Expected hostname / IP (optional — warns on SAN mismatch)</label>
+            <input className="fin2" value={host} placeholder="172.16.21.71" onChange={e => setHost(e.target.value)} /></div>
+
+          <div className="sec-sub" style={{ fontSize: 12, margin: "4px 0 10px" }}>
+            🔒 The key is validated (matches the cert, in-date, has a SAN), stored only on the WAF node, and is
+            never written to the database, logged, or shown again.
+          </div>
+
+          {warnings.length > 0 && (
+            <div className="panel" style={{ background: "rgba(245,158,11,.08)", borderColor: "var(--amber)", marginBottom: 10 }}>
+              <div className="pb">
+                <b>Installed with warnings:</b>
+                <ul style={{ margin: "6px 0 0 18px" }}>{warnings.map((w, i) => <li key={i} className="sec-sub">{w}</li>)}</ul>
+              </div>
+            </div>
+          )}
+
+          <button className="btn bp btn-sm" disabled={busy === "upload"} onClick={upload}>
+            {busy === "upload" ? "Validating…" : "🔐 Validate & Install"}
+          </button>
+        </div>
       </div>
     </motion.div>
   );

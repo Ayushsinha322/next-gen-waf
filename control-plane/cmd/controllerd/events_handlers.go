@@ -13,12 +13,15 @@ import (
 
 // Searchable WAF history, backed by ClickHouse (the proxy writes; we read).
 
-func handleEventsStatus(c *gin.Context, ch *clickhouse.Client) {
-	st, err := ch.Status(c.Request.Context())
-	if err != nil {
-		c.JSON(http.StatusOK, gin.H{"configured": ch.Enabled(), "reachable": false, "error": err.Error()})
+func handleEventsStatus(c *gin.Context, enf *rbac.Enforcer, ch *clickhouse.Client) {
+	claims, _ := auth.GetClaims(c.Request.Context())
+	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceAlert, rbac.ActionList) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
 		return
 	}
+	// Status never returns a non-nil error — reachability/errors are encoded in
+	// the returned map itself.
+	st, _ := ch.Status(c.Request.Context())
 	c.JSON(http.StatusOK, st)
 }
 

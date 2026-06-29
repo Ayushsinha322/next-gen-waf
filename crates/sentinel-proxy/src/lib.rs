@@ -50,7 +50,7 @@ use rustls::ServerConfig;
 use sentinel_core::{
     config::{
         ChallengeMode, ConfigHandle, DlpConfig, IpReputationConfig, ListenerConfig, Protocol,
-        SentinelConfig, SiteConfig, WafMode,
+        SecurityHeadersConfig, SentinelConfig, SiteConfig, WafMode,
     },
     context::{Phase, RequestContext, WafDecision},
 };
@@ -337,6 +337,28 @@ struct ServerState {
     http01_tokens: Arc<DashMap<String, String>>,
 }
 
+/// Upstreams the dedicated management listener reverse-proxies to. The admin
+/// console is served by the WAF's own engine (no third-party proxy): requests
+/// to `/api/*` go to the control plane, everything else to the dashboard.
+#[derive(Debug)]
+struct ManagementUpstreams {
+    /// Base URL of the dashboard UI, e.g. "http://dashboard:3000".
+    dashboard: String,
+    /// Base URL of the control-plane REST/SSE API, e.g. "http://controlplane:9501".
+    api: String,
+}
+
+impl ManagementUpstreams {
+    /// Build from env, with co-located-dev defaults.
+    fn from_env() -> Self {
+        let dashboard = std::env::var("SENTINEL_MGMT_DASHBOARD_UPSTREAM")
+            .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
+        let api = std::env::var("SENTINEL_MGMT_API_UPSTREAM")
+            .unwrap_or_else(|_| "http://127.0.0.1:9501".to_string());
+        Self { dashboard, api }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ProxyServer
 // ---------------------------------------------------------------------------
@@ -419,36 +441,47 @@ impl ProxyServer {
         // second and bulk-insert every 5s (or 500 rows). Async + drop-on-error
         // so logging never blocks or grows unbounded if ClickHouse is down.
         if let Some(ch) = storage.clickhouse.clone() {
+            // Gate buffering on an active sink: record_event/record_traffic check
+            // this and become no-ops when ClickHouse is off, so the buffers don't
+            // grow unbounded with nothing to drain them.
+            CLICKHOUSE_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
             tokio::spawn(async move {
                 let mut buf: Vec<sentinel_storage::TrafficRow> = Vec::new();
+                let mut evbuf: Vec<sentinel_storage::WafEventRow> = Vec::new();
                 let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
                 let mut ticks = 0u32;
                 loop {
                     ticker.tick().await;
                     buf.extend(drain_traffic(unix_now()));
+                    evbuf.extend(drain_events());
                     ticks += 1;
-                    if (ticks >= 5 || buf.len() >= 500) && !buf.is_empty() {
+                    // Both streams flush on the same 5s-or-500-row cadence.
+                    let time_due = ticks >= 5;
+
+                    if (time_due || buf.len() >= 500) && !buf.is_empty() {
                         if let Err(e) = ch.insert_traffic_batch(&buf).await {
                             warn!(error = %e, rows = buf.len(), "clickhouse traffic flush failed — dropping batch");
                         } else {
                             debug!(rows = buf.len(), "clickhouse traffic flushed");
                         }
                         buf.clear(); // bounded: drop after every attempt
-                        ticks = 0;
                     }
 
-                    // Flush detailed events on the same cadence.
-                    let events = drain_events();
-                    if !events.is_empty() {
-                        if let Err(e) = ch.insert_events_batch(&events).await {
-                            warn!(error = %e, rows = events.len(), "clickhouse events flush failed — dropping batch");
+                    if (time_due || evbuf.len() >= 500) && !evbuf.is_empty() {
+                        if let Err(e) = ch.insert_events_batch(&evbuf).await {
+                            warn!(error = %e, rows = evbuf.len(), "clickhouse events flush failed — dropping batch");
                         } else {
-                            debug!(rows = events.len(), "clickhouse events flushed");
+                            debug!(rows = evbuf.len(), "clickhouse events flushed");
                         }
+                        evbuf.clear(); // bounded: drop after every attempt
+                    }
+
+                    if time_due {
+                        ticks = 0;
                     }
                 }
             });
-            info!("clickhouse traffic flusher started (1s sample · 5s flush → traffic_buckets)");
+            info!("clickhouse flusher started (1s sample · 5s/500-row flush → traffic_buckets + waf_events)");
         }
 
         let modules = Arc::new(ModulesState {
@@ -613,6 +646,13 @@ impl ProxyServer {
                 let client: Client<_, EmptyBody> =
                     Client::builder(TokioExecutor::new()).build_http();
                 let mut last_version: u64 = u64::MAX;
+                // Authenticate the config-sync poll with the shared internal
+                // secret when configured, so the control plane's internal/config
+                // endpoint can be gated (not exposed unauthenticated). Unset =
+                // co-located dev (no header sent; control plane allows).
+                let internal_secret = std::env::var("SENTINEL_INTERNAL_SECRET")
+                    .ok()
+                    .filter(|s| !s.is_empty());
                 let mut ticker = tokio::time::interval(Duration::from_secs(secs));
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
@@ -625,9 +665,11 @@ impl ProxyServer {
                             continue;
                         }
                     };
-                    let req = hyper::Request::builder()
-                        .method("GET")
-                        .uri(uri)
+                    let mut builder = hyper::Request::builder().method("GET").uri(uri);
+                    if let Some(secret) = &internal_secret {
+                        builder = builder.header("x-sentinel-internal", secret);
+                    }
+                    let req = builder
                         .body(http_body_util::Empty::new())
                         .expect("BUG: building config-sync request");
                     let resp = match client.request(req).await {
@@ -809,15 +851,44 @@ async fn serve_listener(
         .await
         .with_context(|| format!("binding listener '{}' on {}", cfg.name, cfg.bind))?;
 
-    info!(listener = %cfg.name, bind = %cfg.bind, tls = cfg.is_tls(), "listener started");
+    // The management listener is a dedicated admin-console endpoint: it bypasses
+    // the WAF pipeline and reverse-proxies the dashboard + control-plane API,
+    // presenting the hot-swappable management certificate (F5 "device cert").
+    let management: Option<Arc<ManagementUpstreams>> = if cfg.is_management() {
+        let up = Arc::new(ManagementUpstreams::from_env());
+        info!(
+            listener = %cfg.name, dashboard = %up.dashboard, api = %up.api,
+            "management listener: serving admin console over this endpoint"
+        );
+        if !cfg.is_tls() {
+            warn!(listener = %cfg.name, "management listener has no TLS — admin console will be served over cleartext");
+        }
+        Some(up)
+    } else {
+        None
+    };
+
+    info!(listener = %cfg.name, bind = %cfg.bind, tls = cfg.is_tls(), management = management.is_some(), "listener started");
 
     let tls_acceptor = if cfg.is_tls() {
         let tls_cfg = cfg.tls.as_ref().unwrap();
-        // If explicit cert/key paths are provided, use them directly.
-        // Otherwise, use SNI-based auto-generation for all sites.
-        if tls_cfg.cert.is_some() && tls_cfg.key.is_some() {
+        if management.is_some() {
+            // Management listener: always serve the single management cert
+            // (ignores SNI), with a self-signed fallback until one is uploaded.
+            let resolver = tls::SentinelCertResolver::new_fixed(
+                Arc::clone(&state.cert_manager.store),
+                tls::MANAGEMENT_CERT_KEY,
+            );
+            let mut server_cfg = ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(resolver);
+            server_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            Some(TlsAcceptor::from(Arc::new(server_cfg)))
+        } else if tls_cfg.cert.is_some() && tls_cfg.key.is_some() {
+            // Explicit cert/key paths — use them directly.
             Some(build_tls_acceptor(tls_cfg)?)
         } else {
+            // SNI-based per-domain resolution across all sites.
             let cfg_snap = state.config.load();
             let domains: Vec<String> = cfg_snap
                 .sites
@@ -848,8 +919,9 @@ async fn serve_listener(
                 let acceptor = tls_acceptor.clone();
                 let protos = cfg.protocols();
                 let ds = default_site.clone();
+                let mgmt = management.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, peer, acceptor, protos, state, ds).await {
+                    if let Err(e) = handle_connection(stream, peer, acceptor, protos, state, ds, mgmt).await {
                         debug!(peer = %peer, "connection error: {e}");
                     }
                 });
@@ -874,6 +946,7 @@ async fn handle_connection(
     protocols: Vec<Protocol>,
     state: Arc<ServerState>,
     default_site: Option<String>,
+    management: Option<Arc<ManagementUpstreams>>,
 ) -> anyhow::Result<()> {
     stream.set_nodelay(true)?;
 
@@ -882,16 +955,16 @@ async fn handle_connection(
         let negotiated = tls.get_ref().1.alpn_protocol().map(|p| p.to_vec());
         let io = TokioIo::new(tls);
         if negotiated.as_deref() == Some(b"h2") {
-            serve_http2(io, peer, state, default_site).await
+            serve_http2(io, peer, state, default_site, management).await
         } else {
-            serve_http1(io, peer, state, default_site).await
+            serve_http1(io, peer, state, default_site, management).await
         }
     } else {
         let io = TokioIo::new(stream);
         if protocols.contains(&Protocol::Http2) && !protocols.contains(&Protocol::Http1) {
-            serve_http2(io, peer, state, default_site).await
+            serve_http2(io, peer, state, default_site, management).await
         } else {
-            serve_http1(io, peer, state, default_site).await
+            serve_http1(io, peer, state, default_site, management).await
         }
     }
 }
@@ -901,6 +974,7 @@ async fn serve_http1<T>(
     peer: SocketAddr,
     state: Arc<ServerState>,
     default_site: Option<String>,
+    management: Option<Arc<ManagementUpstreams>>,
 ) -> anyhow::Result<()>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -911,7 +985,8 @@ where
             hyper::service::service_fn(move |req| {
                 let s = Arc::clone(&state);
                 let ds = default_site.clone();
-                async move { handle_request(s, peer, req, ds).await }
+                let mgmt = management.clone();
+                async move { handle_request(s, peer, req, ds, mgmt).await }
             }),
         )
         .with_upgrades()
@@ -924,6 +999,7 @@ async fn serve_http2<T>(
     peer: SocketAddr,
     state: Arc<ServerState>,
     default_site: Option<String>,
+    management: Option<Arc<ManagementUpstreams>>,
 ) -> anyhow::Result<()>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -934,7 +1010,8 @@ where
             hyper::service::service_fn(move |req| {
                 let s = Arc::clone(&state);
                 let ds = default_site.clone();
-                async move { handle_request(s, peer, req, ds).await }
+                let mgmt = management.clone();
+                async move { handle_request(s, peer, req, ds, mgmt).await }
             }),
         )
         .await
@@ -950,12 +1027,21 @@ async fn handle_request(
     peer: SocketAddr,
     req: Request<Incoming>,
     default_site: Option<String>,
+    management: Option<Arc<ManagementUpstreams>>,
 ) -> Result<Response<BoxBody>, Infallible> {
     // Health / readiness endpoint — served before any WAF pipeline work.
     // GET /healthz or GET /health returns JSON with proxy uptime, site
     // count, and listener status.  No auth required; internal-only.
     if req.uri().path() == "/healthz" || req.uri().path() == "/health" {
         return Ok(health_response(&state));
+    }
+
+    // Management listener: this is the dedicated admin-console endpoint. It
+    // bypasses the WAF pipeline entirely and reverse-proxies the dashboard +
+    // control-plane API (the admin UI is auth-gated by the control plane). Done
+    // by our own engine — no third-party proxy.
+    if let Some(mgmt) = management {
+        return handle_management_request(state, peer, req, mgmt).await;
     }
 
     // ACME HTTP-01 challenge — intercepted BEFORE eBPF, before site routing.
@@ -974,14 +1060,22 @@ async fn handle_request(
         // Unknown token — fall through to normal routing (will 404 from upstream).
     }
 
-    // Internal cert-management API (control plane / dashboard bridge).
+    // Internal control-plane bridge API (cert + management-TLS management).
     // Loopback-only: these endpoints share the public listener, so anything
-    // under /api/v1/internal/certs is refused unless the peer is on localhost.
-    if req.uri().path().starts_with("/api/v1/internal/certs") {
-        if !peer.ip().is_loopback() {
+    // under /api/v1/internal/ is refused unless the peer is on localhost OR the
+    // caller presents the shared secret (control plane → data plane across
+    // containers).
+    if req.uri().path().starts_with("/api/v1/internal/") {
+        if !peer.ip().is_loopback() && !internal_auth_ok(req.headers()) {
             return Ok(error_response(StatusCode::FORBIDDEN, "internal endpoint"));
         }
-        return Ok(handle_internal_cert_api(state, req).await);
+        if req.uri().path().starts_with("/api/v1/internal/management-tls") {
+            return Ok(handle_internal_mgmt_tls_api(state, req).await);
+        }
+        if req.uri().path().starts_with("/api/v1/internal/certs") {
+            return Ok(handle_internal_cert_api(state, req).await);
+        }
+        return Ok(error_response(StatusCode::NOT_FOUND, "unknown internal endpoint"));
     }
 
     // eBPF fast-fail: known-blocked IPs never enter the WAF pipeline.
@@ -1093,6 +1187,19 @@ async fn proxy(
     // --- Phase 1: Request headers ---
     let (mut parts, body) = req.into_parts();
 
+    // HTTP/2 carries the authority in the `:authority` pseudo-header (surfaced as
+    // the request URI's authority) rather than a `Host` header. Synthesize a Host
+    // header from it when absent, so site-matching, WAF rules, logging, and
+    // upstream forwarding all see a consistent host — otherwise h2 requests match
+    // no site and 502.
+    if !parts.headers.contains_key(header::HOST) {
+        if let Some(auth) = parts.uri.authority().map(|a| a.as_str().to_owned()) {
+            if let Ok(hv) = header::HeaderValue::from_str(&auth) {
+                parts.headers.insert(header::HOST, hv);
+            }
+        }
+    }
+
     ctx.http_version = parts.version;
     ctx.method = parts.method.clone();
     ctx.uri = parts.uri.clone();
@@ -1147,6 +1254,20 @@ async fn proxy(
                     ));
                 }
             }
+            // HTTP method allow-list (empty = allow all). Case-insensitive.
+            if !s.waf.allowed_methods.is_empty() {
+                let m = ctx.method.as_str();
+                if !s.waf.allowed_methods.iter().any(|a| a.eq_ignore_ascii_case(m)) {
+                    ctx.decision = WafDecision::Block;
+                    ctx.block_reason = Some(format!("method not allowed: {m}"));
+                    ctx.advance_phase(Phase::Logging);
+                    log_request(&ctx);
+                    return Ok(error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "Method Not Allowed",
+                    ));
+                }
+            }
         }
     }
 
@@ -1157,13 +1278,22 @@ async fn proxy(
     }
 
     // Browser challenge (Proof-of-Work) — serve an interstitial or, if the
-    // client already solved it, grant clearance and bounce back.
+    // client already solved it, grant clearance and bounce back.  A client that
+    // already holds valid clearance gets `None` here (regardless of which
+    // subsystem asked for the challenge) and proceeds to origin — no re-loop.
     if ctx.decision == WafDecision::Challenge {
-        let resp = challenge_response(&ctx);
-        ctx.response_status = Some(resp.status());
-        ctx.advance_phase(Phase::Logging);
-        log_request(&ctx);
-        return Ok(resp);
+        let challenge_mode = site
+            .and_then(|s| s.waf.bot_detection.as_ref())
+            .map(|b| b.challenge)
+            .unwrap_or(ChallengeMode::NativePow);
+        if let Some(resp) = challenge_response(&mut ctx, challenge_mode) {
+            ctx.response_status = Some(resp.status());
+            ctx.advance_phase(Phase::Logging);
+            log_request(&ctx);
+            return Ok(resp);
+        }
+        // Cleared (or an in-line grant for an unsafe method) — proceed to origin.
+        ctx.decision = WafDecision::Allow;
     }
 
     if ctx.decision == WafDecision::Block {
@@ -1284,6 +1414,10 @@ async fn proxy(
     inject_forwarding_headers(&mut parts.headers, peer.ip())?;
 
     parts.uri = upstream_uri;
+    // Forward to the upstream as HTTP/1.1 regardless of the client's protocol.
+    // An h2 client request still carries version=HTTP/2, which the HTTP/1.1
+    // upstream client cannot send (→ "upstream request failed" / 502).
+    parts.version = http::Version::HTTP_11;
     let upstream_req = Request::from_parts(parts, boxed_body);
 
     let upstream_start = std::time::Instant::now();
@@ -1345,7 +1479,15 @@ async fn proxy(
     }
 
     strip_hop_by_hop(&mut resp_parts.headers);
-    inject_security_headers(&mut resp_parts.headers);
+    inject_security_headers(&mut resp_parts.headers, site_cfg.waf.security_headers.as_ref());
+
+    // Attach any clearance cookies from an in-line PoW grant (challenged POST/PUT
+    // that proceeded to origin instead of being 302'd to a bodyless GET).
+    for cookie in ctx.pending_set_cookies.drain(..) {
+        if let Ok(val) = header::HeaderValue::from_str(&cookie) {
+            resp_parts.headers.append(header::SET_COOKIE, val);
+        }
+    }
 
     // --- Phase 5: Response body — rule engine + DLP scan ---
     ctx.advance_phase(Phase::ResponseBody);
@@ -1412,19 +1554,32 @@ async fn proxy(
                         // (2) DLP scan (PII / secret leakage).
                         if let Some(dlp) = dlp {
                             if let Some(matched) = dlp.scan(&bytes) {
-                                warn!(
-                                    site = %site_cfg.id,
-                                    client_ip = %ctx.client_ip,
-                                    pattern = matched,
-                                    "DLP: sensitive data in response — blocking"
-                                );
                                 ctx.decision = WafDecision::Block;
                                 ctx.block_reason = Some(format!(
                                     "DLP: sensitive data pattern matched: {matched}"
                                 ));
-                                ctx.advance_phase(Phase::Logging);
-                                log_request(&ctx);
-                                return Ok(block_response(&ctx));
+                                // Respect learning mode (downgrade Block → Log)
+                                // exactly like the response-body rule path above —
+                                // a learning-mode site must not block or rewrite
+                                // the response, only record the would-block.
+                                enforce_mode(&mut ctx, &site_cfg.waf.mode);
+                                if ctx.decision == WafDecision::Block {
+                                    warn!(
+                                        site = %site_cfg.id,
+                                        client_ip = %ctx.client_ip,
+                                        pattern = matched,
+                                        "DLP: sensitive data in response — blocking"
+                                    );
+                                    ctx.advance_phase(Phase::Logging);
+                                    log_request(&ctx);
+                                    return Ok(block_response(&ctx));
+                                }
+                                warn!(
+                                    site = %site_cfg.id,
+                                    client_ip = %ctx.client_ip,
+                                    pattern = matched,
+                                    "DLP: sensitive data in response — would block (learning mode)"
+                                );
                             }
                         }
 
@@ -1555,8 +1710,9 @@ async fn phase1_headers(
             if let Some(geoip) = geoip_map.get(&site.id) {
                 match geoip.check(ctx.client_ip) {
                     GeoVerdict::Block { country_code } => {
-                        ctx.decision = WafDecision::Block;
                         ctx.block_reason = Some(format!("country blocked: {country_code}"));
+                        ctx.geo_country = Some(country_code);
+                        ctx.decision = WafDecision::Block;
                     }
                     GeoVerdict::Allow | GeoVerdict::Unknown => {}
                 }
@@ -2013,6 +2169,33 @@ fn parse_cidr_text(text: &str) -> Vec<String> {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Constant-time byte comparison to avoid leaking the shared secret via timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Permit the otherwise loopback-only internal cert API when the caller presents
+/// the shared internal secret (env `SENTINEL_INTERNAL_SECRET`) via the
+/// `X-Sentinel-Internal` header. This lets the control plane reach the data
+/// plane across containers. Returns false when the secret is unset/empty.
+fn internal_auth_ok(headers: &http::HeaderMap) -> bool {
+    match std::env::var("SENTINEL_INTERNAL_SECRET") {
+        Ok(secret) if !secret.is_empty() => headers
+            .get("x-sentinel-internal")
+            .and_then(|v| v.to_str().ok())
+            .map(|got| constant_time_eq(got.as_bytes(), secret.as_bytes()))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
 fn site_matches(site: &SiteConfig, host: &str) -> bool {
     let host_lc = host.to_ascii_lowercase();
     site.domains.iter().any(|d| {
@@ -2112,36 +2295,113 @@ fn inject_forwarding_headers(
     Ok(())
 }
 
-fn inject_security_headers(headers: &mut http::HeaderMap) {
-    let insert = |h: &mut http::HeaderMap, name: &'static str, value: &'static str| {
-        h.entry(header::HeaderName::from_static(name))
-            .or_insert_with(|| value.parse().unwrap());
+fn inject_security_headers(headers: &mut http::HeaderMap, cfg: Option<&SecurityHeadersConfig>) {
+    // Secure defaults — only when the upstream didn't already set them.
+    let default = |h: &mut http::HeaderMap, name: &'static str, value: &str| {
+        if let Ok(v) = http::HeaderValue::from_str(value) {
+            h.entry(header::HeaderName::from_static(name)).or_insert(v);
+        }
     };
-    insert(headers, "x-content-type-options", "nosniff");
-    insert(headers, "x-frame-options", "SAMEORIGIN");
-    insert(headers, "referrer-policy", "strict-origin-when-cross-origin");
-    insert(headers, "x-xss-protection", "1; mode=block");
-    insert(headers, "permissions-policy", "geolocation=(), microphone=(), camera=()");
+    default(headers, "x-content-type-options", "nosniff");
+    default(headers, "x-frame-options", "SAMEORIGIN");
+    default(headers, "x-xss-protection", "1; mode=block");
+
+    // Referrer-Policy / Permissions-Policy: force the operator's value when
+    // configured, otherwise fall back to a secure default.
+    let force = |h: &mut http::HeaderMap, name: &'static str, value: &str| {
+        if let Ok(v) = http::HeaderValue::from_str(value) {
+            h.insert(header::HeaderName::from_static(name), v);
+        }
+    };
+    match cfg.and_then(|c| c.referrer_policy.as_deref()).filter(|s| !s.is_empty()) {
+        Some(rp) => force(headers, "referrer-policy", rp),
+        None => default(headers, "referrer-policy", "strict-origin-when-cross-origin"),
+    }
+    match cfg.and_then(|c| c.permissions_policy.as_deref()).filter(|s| !s.is_empty()) {
+        Some(pp) => force(headers, "permissions-policy", pp),
+        None => default(headers, "permissions-policy", "geolocation=(), microphone=(), camera=()"),
+    }
+
+    let Some(cfg) = cfg else { return };
+
+    // CSP has no default (it can break apps) — emit only when configured.
+    if let Some(csp) = cfg.content_security_policy.as_deref().filter(|s| !s.is_empty()) {
+        if let Ok(v) = http::HeaderValue::from_str(csp) {
+            headers.insert(header::CONTENT_SECURITY_POLICY, v);
+        }
+    }
+    // CORS allow-origin.
+    if let Some(cors) = &cfg.cors {
+        if cors.enabled && !cors.allow_origin.is_empty() {
+            if let Ok(v) = http::HeaderValue::from_str(&cors.allow_origin) {
+                headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
+            }
+        }
+    }
+    // Operator-defined custom headers, applied last so they win.
+    for h in &cfg.custom {
+        if h.name.is_empty() {
+            continue;
+        }
+        if let (Ok(name), Ok(val)) = (
+            header::HeaderName::from_bytes(h.name.as_bytes()),
+            http::HeaderValue::from_str(&h.value),
+        ) {
+            headers.insert(name, val);
+        }
+    }
 }
 
 /// Build the HTTP response for a `Challenge` decision: either the interstitial
 /// Proof-of-Work page, or (when the client submitted a valid proof) a 302 that
 /// sets the clearance cookie and bounces back to the original URL.
-fn challenge_response(ctx: &RequestContext) -> Response<BoxBody> {
+///
+/// Returns `None` when the request must proceed to origin instead of receiving
+/// a challenge response — either because the client already holds valid
+/// clearance, or because a Proof-of-Work grant was consumed in-line for an
+/// unsafe method (see below).
+///
+/// `mode` is the site's configured challenge backend. Only `NativePow` is
+/// implemented today; a configured third-party CAPTCHA provider is logged once
+/// and falls back to native Proof-of-Work rather than being silently ignored.
+///
+/// On a grant we normally 302 back to the original URL. That is correct for
+/// safe methods (GET/HEAD) but downgrades a challenged POST/PUT to a bodyless
+/// GET — the form submission is silently lost. For unsafe methods we instead
+/// stash the clearance cookies on `ctx` and return `None`, letting the request
+/// continue to origin with its method and body intact; the cookies are attached
+/// to the origin response by the caller.
+fn challenge_response(ctx: &mut RequestContext, mode: ChallengeMode) -> Option<Response<BoxBody>> {
+    if matches!(
+        mode,
+        ChallengeMode::Recaptcha | ChallengeMode::Hcaptcha | ChallengeMode::Turnstile
+    ) {
+        warn_unsupported_challenge(mode);
+    }
     match challenge::resolve(&ctx.request_headers, ctx.client_ip, &ctx.uri) {
-        challenge::Outcome::Grant { location, set_cookie, expire_pow } => Response::builder()
-            .status(StatusCode::FOUND)
-            .header(header::LOCATION, location)
-            .header(header::SET_COOKIE, set_cookie)
-            .header(header::SET_COOKIE, expire_pow)
-            .header(header::CACHE_CONTROL, "no-store")
-            .body(
-                Full::new(Bytes::new())
-                    .map_err(|never: Infallible| match never {})
-                    .boxed(),
-            )
-            .unwrap(),
-        challenge::Outcome::Serve { html } => Response::builder()
+        challenge::Outcome::Pass => None,
+        challenge::Outcome::Grant { location, set_cookie, expire_pow } => {
+            // Idempotent/safe methods can take the clean 302 redirect.
+            let safe = matches!(ctx.method, http::Method::GET | http::Method::HEAD);
+            if !safe {
+                ctx.pending_set_cookies.push(set_cookie);
+                ctx.pending_set_cookies.push(expire_pow);
+                return None;
+            }
+            Some(Response::builder()
+                .status(StatusCode::FOUND)
+                .header(header::LOCATION, location)
+                .header(header::SET_COOKIE, set_cookie)
+                .header(header::SET_COOKIE, expire_pow)
+                .header(header::CACHE_CONTROL, "no-store")
+                .body(
+                    Full::new(Bytes::new())
+                        .map_err(|never: Infallible| match never {})
+                        .boxed(),
+                )
+                .unwrap())
+        }
+        challenge::Outcome::Serve { html } => Some(Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
             .header(header::CACHE_CONTROL, "no-store")
@@ -2151,7 +2411,26 @@ fn challenge_response(ctx: &RequestContext) -> Response<BoxBody> {
                     .map_err(|never: Infallible| match never {})
                     .boxed(),
             )
-            .unwrap(),
+            .unwrap()),
+    }
+}
+
+/// Warn at most once per provider that a configured third-party CAPTCHA mode is
+/// not implemented and native Proof-of-Work is served instead.
+fn warn_unsupported_challenge(mode: ChallengeMode) {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static WARNED: AtomicU8 = AtomicU8::new(0);
+    let bit = match mode {
+        ChallengeMode::Recaptcha => 0b001,
+        ChallengeMode::Hcaptcha => 0b010,
+        ChallengeMode::Turnstile => 0b100,
+        _ => return,
+    };
+    if WARNED.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+        warn!(
+            "challenge mode {:?} is configured but not implemented; serving native Proof-of-Work instead",
+            mode
+        );
     }
 }
 
@@ -2185,6 +2464,15 @@ fn block_response(ctx: &RequestContext) -> Response<BoxBody> {
 ///   POST   /api/v1/internal/certs/acme            → issue/renew via ACME (blocking)
 ///   POST   /api/v1/internal/certs/{domain}/renew  → force ACME re-issue
 ///   DELETE /api/v1/internal/certs/{domain}        → remove cert
+/// Cert keys beginning with "__" are reserved for internal use (e.g. the
+/// management cert "__management__"). The customer cert repository API must not
+/// be able to create, overwrite, rename, or delete them — that's the Management
+/// TLS API's job, which is separately RBAC-gated. This closes a privilege gap
+/// where a Site:Update editor could otherwise hijack the management cert.
+fn is_reserved_cert_key(domain: &str) -> bool {
+    domain.trim().starts_with("__")
+}
+
 async fn handle_internal_cert_api(
     state: Arc<ServerState>,
     req: Request<Incoming>,
@@ -2207,6 +2495,9 @@ async fn handle_internal_cert_api(
     if method == hyper::Method::DELETE {
         if let Some(domain) = path.strip_prefix("/api/v1/internal/certs/") {
             let domain = domain.trim_end_matches('/');
+            if is_reserved_cert_key(domain) {
+                return json_err(StatusCode::FORBIDDEN, "reserved certificate key — use the Management TLS API");
+            }
             return match state.cert_manager.store.remove(domain) {
                 Ok(()) => json_ok(serde_json::json!({"removed": domain})),
                 Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}")),
@@ -2234,6 +2525,9 @@ async fn handle_internal_cert_api(
             Ok(r) => r,
             Err(e) => return json_err(StatusCode::BAD_REQUEST, &format!("invalid JSON: {e}")),
         };
+        if is_reserved_cert_key(&r.domain) {
+            return json_err(StatusCode::FORBIDDEN, "reserved certificate key — use the Management TLS API");
+        }
         return match state
             .cert_manager
             .install_manual(&r.domain, &r.name, &r.cert_pem, &r.key_pem)
@@ -2247,6 +2541,9 @@ async fn handle_internal_cert_api(
     if method == hyper::Method::PATCH {
         if let Some(rest) = path.strip_prefix("/api/v1/internal/certs/") {
             let domain = rest.trim_end_matches('/');
+            if is_reserved_cert_key(domain) {
+                return json_err(StatusCode::FORBIDDEN, "reserved certificate key — use the Management TLS API");
+            }
             #[derive(serde::Deserialize)]
             struct RenameReq { name: String }
             let r: RenameReq = match serde_json::from_slice(&body_bytes) {
@@ -2331,6 +2628,170 @@ async fn handle_internal_cert_api(
     }
 
     json_err(StatusCode::NOT_FOUND, "unknown cert endpoint")
+}
+
+// ---------------------------------------------------------------------------
+// Management listener: reverse-proxy the admin console (our own engine)
+// ---------------------------------------------------------------------------
+
+/// Reverse-proxy a request arriving on the management listener. Path `/api/*`
+/// (REST + SSE) goes to the control plane; everything else to the dashboard.
+/// Bodies stream in both directions, so Server-Sent Events are unbuffered.
+async fn handle_management_request(
+    state: Arc<ServerState>,
+    peer: SocketAddr,
+    req: Request<Incoming>,
+    mgmt: Arc<ManagementUpstreams>,
+) -> Result<Response<BoxBody>, Infallible> {
+    let path = req.uri().path();
+    // Never expose the control plane's unauthenticated internal endpoints (e.g.
+    // /api/v1/internal/config, which leaks upstream topology) through the public
+    // management console. The admin UI only needs /api/v1/<feature> routes.
+    if path.starts_with("/api/v1/internal") {
+        return Ok(error_response(StatusCode::NOT_FOUND, "not found"));
+    }
+    let base = if path.starts_with("/api/") { &mgmt.api } else { &mgmt.dashboard };
+    let pq = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/");
+    let target = format!("{base}{pq}");
+    let target_uri: Uri = match target.parse() {
+        Ok(u) => u,
+        Err(e) => return Ok(error_response(StatusCode::BAD_GATEWAY, &format!("bad management target: {e}"))),
+    };
+
+    let (mut parts, body) = req.into_parts();
+    strip_hop_by_hop(&mut parts.headers);
+    // This listener is directly client-facing (no trusted forwarder in front),
+    // so RESET the forwarding headers to the real peer — never trust a
+    // client-supplied X-Forwarded-For chain (it would spoof the audit-logged IP).
+    let peer_ip = peer.ip().to_string();
+    if let Ok(hv) = header::HeaderValue::from_str(&peer_ip) {
+        parts.headers.insert(header::HeaderName::from_static("x-forwarded-for"), hv.clone());
+        parts.headers.insert(header::HeaderName::from_static("x-real-ip"), hv);
+    }
+    // The management listener terminates TLS; tell the upstream the original
+    // scheme so the dashboard/control plane generate correct https URLs/cookies.
+    parts.headers.insert(
+        header::HeaderName::from_static("x-forwarded-proto"),
+        header::HeaderValue::from_static("https"),
+    );
+    // Set Host to the upstream authority so behavior doesn't depend on the
+    // client-supplied Host or undocumented client Host-derivation.
+    if let Some(auth) = target_uri.authority() {
+        if let Ok(hv) = header::HeaderValue::from_str(auth.as_str()) {
+            parts.headers.insert(header::HOST, hv);
+        }
+    }
+    parts.uri = target_uri;
+    parts.version = http::Version::HTTP_11;
+    let upstream_req = Request::from_parts(parts, body.boxed());
+
+    match state.upstream_pool.forward(upstream_req).await {
+        Ok(resp) => {
+            let (rp, rb) = resp.into_parts();
+            Ok(Response::from_parts(rp, rb.boxed()))
+        }
+        Err(e) => Ok(error_response(
+            StatusCode::BAD_GATEWAY,
+            &format!("management upstream unreachable: {e}"),
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal management-TLS API (control-plane bridge)
+//
+//   GET    /api/v1/internal/management-tls   → current management cert metadata
+//   POST   /api/v1/internal/management-tls   → install validated PEM (hot-swap)
+//   DELETE /api/v1/internal/management-tls   → revert to self-signed default
+// ---------------------------------------------------------------------------
+
+async fn handle_internal_mgmt_tls_api(
+    state: Arc<ServerState>,
+    req: Request<Incoming>,
+) -> Response<BoxBody> {
+    let method = req.method().clone();
+
+    if method == hyper::Method::GET {
+        return match state.cert_manager.store.get_meta(tls::MANAGEMENT_CERT_KEY) {
+            Some(m) => {
+                let mut v = serde_json::to_value(&m).unwrap_or_else(|_| serde_json::json!({}));
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("self_signed".to_string(), serde_json::json!(false));
+                }
+                json_ok(v)
+            }
+            None => json_ok(serde_json::json!({"self_signed": true})),
+        };
+    }
+
+    if method == hyper::Method::DELETE {
+        return match state.cert_manager.store.revert_management() {
+            Ok(()) => json_ok(serde_json::json!({"reverted": true})),
+            Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}")),
+        };
+    }
+
+    if method == hyper::Method::POST {
+        let body_bytes = match req.into_body().collect().await {
+            Ok(c) => c.to_bytes(),
+            Err(e) => return json_err(StatusCode::BAD_REQUEST, &format!("body read failed: {e}")),
+        };
+        #[derive(serde::Deserialize)]
+        struct MgmtReq {
+            cert_pem: String,
+            key_pem: String,
+            #[serde(default)]
+            name: String,
+            #[serde(default)]
+            subject: String,
+            #[serde(default)]
+            issuer: String,
+            #[serde(default)]
+            san: Vec<String>,
+            #[serde(default)]
+            issued_at: u64,
+            #[serde(default)]
+            expires_at: u64,
+            #[serde(default)]
+            fingerprint: String,
+            #[serde(default)]
+            key_type: String,
+        }
+        let r: MgmtReq = match serde_json::from_slice(&body_bytes) {
+            Ok(r) => r,
+            Err(e) => return json_err(StatusCode::BAD_REQUEST, &format!("invalid JSON: {e}")),
+        };
+        let display_name = if r.name.is_empty() {
+            if r.subject.is_empty() { "Management TLS".to_string() } else { r.subject.clone() }
+        } else {
+            r.name
+        };
+        let meta = tls::CertMeta {
+            domain: tls::MANAGEMENT_CERT_KEY.to_string(),
+            name: display_name,
+            san: r.san,
+            issued_at: r.issued_at,
+            expires_at: r.expires_at,
+            fingerprint: r.fingerprint,
+            source: tls::CertSource::Manual,
+            issuer: r.issuer,
+            key_type: r.key_type,
+        };
+        return match state
+            .cert_manager
+            .store
+            .install_management(&r.cert_pem, &r.key_pem, meta)
+        {
+            Ok(prev) => json_ok(serde_json::json!({"installed": true, "previous_fingerprint": prev})),
+            Err(e) => json_err(StatusCode::BAD_REQUEST, &format!("{e:#}")),
+        };
+    }
+
+    json_err(StatusCode::METHOD_NOT_ALLOWED, "unsupported method")
 }
 
 fn json_ok(value: serde_json::Value) -> Response<BoxBody> {
@@ -2426,9 +2887,7 @@ fn log_request(ctx: &RequestContext) {
         block_reason = ctx.block_reason.as_deref().unwrap_or(""),
         "request"
     );
-    if let Err(e) = ndjson_log(ctx) {
-        tracing::warn!(error = %e, "ndjson log write failed");
-    }
+    ndjson_log(ctx);
 
     // Feed the per-second traffic accumulator (drained by the ClickHouse
     // flusher, when ClickHouse is configured). Cheap; no-op when CH is off.
@@ -2458,6 +2917,10 @@ fn traffic_acc() -> &'static std::sync::Mutex<std::collections::HashMap<String, 
 /// Record one request into the current second's tally. Latency samples are
 /// capped per-site to bound memory under floods.
 fn record_traffic(site: &str, blocked: bool, latency_ms: f64) {
+    // No sink → no accumulation (the drainer only runs when ClickHouse is on).
+    if !CLICKHOUSE_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     if let Ok(mut m) = traffic_acc().lock() {
         let e = m.entry(site.to_string()).or_default();
         e.reqs += 1;
@@ -2508,6 +2971,11 @@ fn unix_now() -> i64 {
 static WAF_EVENTS: std::sync::OnceLock<std::sync::Mutex<Vec<sentinel_storage::WafEventRow>>> =
     std::sync::OnceLock::new();
 
+/// Set true once the ClickHouse flusher task is running. When ClickHouse is not
+/// configured nothing ever drains the buffers, so we must not buffer at all —
+/// otherwise the event buffer grows to its cap and is pinned in memory forever.
+static CLICKHOUSE_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn waf_events() -> &'static std::sync::Mutex<Vec<sentinel_storage::WafEventRow>> {
     WAF_EVENTS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
@@ -2516,6 +2984,10 @@ fn waf_events() -> &'static std::sync::Mutex<Vec<sentinel_storage::WafEventRow>>
 /// passes are skipped to keep volume sane. Buffer is capped to bound memory if
 /// ClickHouse is down/slow.
 fn record_event(ctx: &RequestContext) {
+    // No sink → no buffering (the drainer only runs when ClickHouse is enabled).
+    if !CLICKHOUSE_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     let action = match ctx.decision {
         WafDecision::Block | WafDecision::Challenge => "BLOCK",
         _ if ctx.would_block => "DETECT",
@@ -2525,7 +2997,7 @@ fn record_event(ctx: &RequestContext) {
     let row = sentinel_storage::WafEventRow {
         ts: unix_now(),
         ip: ctx.client_ip.to_string(),
-        country: String::new(), // populated once GeoIP is loaded
+        country: ctx.geo_country.clone().unwrap_or_default(), // set when GeoIP resolved a country
         site: ctx.site_id.clone().unwrap_or_else(|| "-".to_string()),
         method: ctx.method.as_str().to_string(),
         path: ctx.uri.path().to_string(),
@@ -2573,14 +3045,118 @@ fn resolve_log_dir() -> std::path::PathBuf {
     std::path::PathBuf::from("/var/log/sentinel")
 }
 
-/// Append a line to `dir/name`, rotating first if the file would exceed the
-/// configured size cap. Rotation shifts `name.{k-1}` → `name.k` (dropping the
-/// oldest) and `name` → `name.1`, then writes to a fresh file. Bounds total
-/// on-disk log size to `max_bytes * (keep + 1)` per stream.
-fn append_rotating(dir: &std::path::Path, name: &str, line: &str) -> std::io::Result<()> {
-    use std::fs::{self, OpenOptions};
-    use std::io::Write;
+// ── Async NDJSON writer ──────────────────────────────────────────────────────
+//
+// Logging runs off the request hot path. Each request formats its line(s) and
+// hands them to a single dedicated OS thread over a bounded channel; the thread
+// is the sole writer, so it needs no lock, keeps file handles open (no per-line
+// `open`/`metadata` syscall), tracks size in memory for rotation, and batches
+// flushes. A full channel drops lines (and counts them) rather than blocking a
+// tokio worker — under extreme load, shedding access-log lines beats stalling
+// traffic.
 
+struct LogRecord {
+    name: &'static str,
+    line: String,
+}
+
+static LOG_TX: std::sync::OnceLock<std::sync::mpsc::SyncSender<LogRecord>> = std::sync::OnceLock::new();
+static LOG_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn log_sender() -> &'static std::sync::mpsc::SyncSender<LogRecord> {
+    LOG_TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<LogRecord>(65_536);
+        std::thread::Builder::new()
+            .name("sentinel-logwriter".into())
+            .spawn(move || log_writer_loop(rx))
+            .expect("spawn ndjson log writer");
+        tx
+    })
+}
+
+/// Hand a pre-formatted line to the writer thread. Non-blocking: drops (and
+/// counts) when the queue is saturated so the request path never stalls on I/O.
+fn enqueue_log(name: &'static str, line: String) {
+    if log_sender().try_send(LogRecord { name, line }).is_err() {
+        LOG_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// A single rotating log stream owned by the writer thread. Holds an open handle
+/// and tracks the on-disk size in memory, so writing a line costs no extra
+/// syscall beyond the buffered write itself. Rotation shifts `name.{k-1}` →
+/// `name.k` (dropping the oldest) and `name` → `name.1`; `keep == 0` discards the
+/// file outright. Bounds on-disk size to `max_bytes * (keep + 1)` per stream.
+struct RotatingFile {
+    dir: std::path::PathBuf,
+    name: &'static str,
+    max_bytes: u64,
+    keep: u32,
+    size: u64,
+    w: std::io::BufWriter<std::fs::File>,
+}
+
+impl RotatingFile {
+    fn open(dir: &std::path::Path, name: &'static str, max_bytes: u64, keep: u32) -> std::io::Result<Self> {
+        let f = std::fs::OpenOptions::new().append(true).create(true).open(dir.join(name))?;
+        let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            name,
+            max_bytes,
+            keep,
+            size,
+            w: std::io::BufWriter::new(f),
+        })
+    }
+
+    fn write_line(&mut self, line: &str) {
+        use std::io::Write;
+        let n = line.len() as u64 + 1;
+        if self.max_bytes > 0 && self.size + n > self.max_bytes {
+            let _ = self.rotate();
+        }
+        if writeln!(self.w, "{line}").is_ok() {
+            self.size += n;
+        }
+    }
+
+    fn flush(&mut self) {
+        use std::io::Write;
+        let _ = self.w.flush();
+    }
+
+    fn rotate(&mut self) -> std::io::Result<()> {
+        use std::io::Write;
+        let _ = self.w.flush(); // land buffered bytes in the file we're retiring
+        let (dir, name, keep) = (&self.dir, self.name, self.keep);
+        let path = dir.join(name);
+        if keep == 0 {
+            // Keep zero backups: discard the full file outright.
+            let _ = std::fs::remove_file(&path);
+        } else {
+            let _ = std::fs::remove_file(dir.join(format!("{name}.{keep}")));
+            for i in (1..keep).rev() {
+                let from = dir.join(format!("{name}.{i}"));
+                let to = dir.join(format!("{name}.{}", i + 1));
+                if from.exists() {
+                    let _ = std::fs::rename(&from, &to);
+                }
+            }
+            let _ = std::fs::rename(&path, dir.join(format!("{name}.1")));
+        }
+        let f = std::fs::OpenOptions::new().append(true).create(true).open(&path)?;
+        self.w = std::io::BufWriter::new(f);
+        self.size = 0;
+        Ok(())
+    }
+}
+
+/// The dedicated writer thread: resolve config once, then drain the channel,
+/// batching writes and flushing per batch.
+fn log_writer_loop(rx: std::sync::mpsc::Receiver<LogRecord>) {
+    let dir = resolve_log_dir();
+    let _ = std::fs::create_dir_all(&dir);
     let max_bytes = std::env::var("SENTINEL_LOG_MAX_MB")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -2591,35 +3167,65 @@ fn append_rotating(dir: &std::path::Path, name: &str, line: &str) -> std::io::Re
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(5);
 
-    let path = dir.join(name);
-    // Rotate when the existing file plus this line would exceed the cap.
-    if max_bytes > 0 {
-        if let Ok(meta) = fs::metadata(&path) {
-            if meta.len().saturating_add(line.len() as u64 + 1) > max_bytes {
-                // Drop the oldest, shift the rest up.
-                let oldest = dir.join(format!("{name}.{keep}"));
-                let _ = fs::remove_file(&oldest);
-                for i in (1..keep).rev() {
-                    let from = dir.join(format!("{name}.{i}"));
-                    let to = dir.join(format!("{name}.{}", i + 1));
-                    if from.exists() {
-                        let _ = fs::rename(&from, &to);
-                    }
+    let mut files: std::collections::HashMap<&'static str, RotatingFile> = std::collections::HashMap::new();
+    let mut last_dropped = 0u64;
+
+    let mut write_one = |files: &mut std::collections::HashMap<&'static str, RotatingFile>, rec: LogRecord| {
+        if !files.contains_key(rec.name) {
+            match RotatingFile::open(&dir, rec.name, max_bytes, keep) {
+                Ok(rf) => {
+                    files.insert(rec.name, rf);
                 }
-                let _ = fs::rename(&path, dir.join(format!("{name}.1")));
+                Err(_) => return, // can't open the file — drop the line
             }
         }
-    }
+        if let Some(rf) = files.get_mut(rec.name) {
+            rf.write_line(&rec.line);
+        }
+    };
 
-    let mut f = OpenOptions::new().append(true).create(true).open(&path)?;
-    writeln!(f, "{line}")
+    loop {
+        let rec = match rx.recv() {
+            Ok(r) => r,
+            Err(_) => return, // all senders gone (process shutdown)
+        };
+        write_one(&mut files, rec);
+        // Opportunistically drain whatever else is queued, then flush once.
+        while let Ok(rec) = rx.try_recv() {
+            write_one(&mut files, rec);
+        }
+        for f in files.values_mut() {
+            f.flush();
+        }
+        let dropped = LOG_DROPPED.load(std::sync::atomic::Ordering::Relaxed);
+        if dropped > last_dropped {
+            warn!(
+                dropped = dropped - last_dropped,
+                total = dropped,
+                "ndjson log writer: dropped lines (channel saturated)"
+            );
+            last_dropped = dropped;
+        }
+    }
 }
 
-fn ndjson_log(ctx: &RequestContext) -> std::io::Result<()> {
-    let dir = resolve_log_dir();
-    let dir = dir.as_path();
-    std::fs::create_dir_all(dir)?;
+/// File-based NDJSON logging is on by default; set `SENTINEL_NDJSON_LOG=0`
+/// (or false/off) to disable it — useful when shipping events to ClickHouse
+/// only, or when the synchronous per-request file write is a throughput limit.
+fn ndjson_logging_enabled() -> bool {
+    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EN.get_or_init(|| {
+        !matches!(
+            std::env::var("SENTINEL_NDJSON_LOG").ok().as_deref(),
+            Some("0") | Some("false") | Some("off")
+        )
+    })
+}
 
+fn ndjson_log(ctx: &RequestContext) {
+    if !ndjson_logging_enabled() {
+        return;
+    }
     let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let status = ctx.response_status.map(|s| s.as_u16()).unwrap_or(0);
     let ua = ctx
@@ -2649,23 +3255,33 @@ fn ndjson_log(ctx: &RequestContext) -> std::io::Result<()> {
         "action":  action,
         "score":   ctx.anomaly_score,
     });
-    append_rotating(dir, "access.log", &access.to_string())?;
+    enqueue_log("access.log", access.to_string());
 
-    if !ctx.rule_matches.is_empty() || matches!(ctx.decision, WafDecision::Block) {
+    // Emit a waf.log line for anything the WAF acted on or *would* have acted on:
+    // any rule match, an enforced block, or a learning-mode would-block. The last
+    // case covers GeoIP / rate-limit / bot-challenge / smuggling blocks that were
+    // downgraded to Log in learning mode and carry no rule match — without it the
+    // learning report (which consumes only waf.log) undercounts would-have-blocks.
+    if !ctx.rule_matches.is_empty() || matches!(ctx.decision, WafDecision::Block) || ctx.would_block {
         let top = ctx.rule_matches.first();
         let sev_str = top
             .map(|r| format!("{:?}", r.severity).to_uppercase())
             .unwrap_or_else(|| "MEDIUM".to_string());
-        let attack = top
-            .map(|r| r.message.as_str())
-            .unwrap_or("anomaly threshold exceeded");
+        // For non-rule blocks (GeoIP, rate limit, smuggling, bot challenge, bare
+        // anomaly threshold) synthesize a stable rule label and attack name from
+        // the block reason, so the dashboard's attack breakdown and the learning
+        // report can categorize them instead of collapsing them into "-"/"other".
+        let (rule, attack): (&str, &str) = match top {
+            Some(r) => (r.rule_id.as_str(), r.message.as_str()),
+            None => classify_nonrule_block(ctx.block_reason.as_deref().unwrap_or("")),
+        };
 
         let waf = serde_json::json!({
             "ts":     ts,
             "ip":     ctx.client_ip.to_string(),
             "method": ctx.method.as_str(),
             "path":   ctx.uri.path(),
-            "rule":   top.map(|r| r.rule_id.as_str()).unwrap_or("-"),
+            "rule":   rule,
             "score":  ctx.anomaly_score,
             "sev":    sev_str,
             "attack": attack,
@@ -2675,10 +3291,27 @@ fn ndjson_log(ctx: &RequestContext) -> std::io::Result<()> {
             "would_block": ctx.would_block,
             "ml_scores": ctx.ml_scores,
         });
-        append_rotating(dir, "waf.log", &waf.to_string())?;
+        enqueue_log("waf.log", waf.to_string());
     }
+}
 
-    Ok(())
+/// Map a non-rule block reason to a stable `(rule, attack)` label pair. These
+/// synthetic rule labels mirror the categories the control-plane recognizes in
+/// `attackCategory`, so GeoIP / rate-limit / smuggling / bot blocks are counted
+/// distinctly rather than lumped under "-"/"other".
+fn classify_nonrule_block(reason: &str) -> (&'static str, &'static str) {
+    let r = reason.to_ascii_lowercase();
+    if r.contains("country blocked") || r.contains("geoip") {
+        ("GEOIP", "GeoIP country block")
+    } else if r.contains("rate limit") {
+        ("RATELIMIT", "Rate limit exceeded")
+    } else if r.contains("smuggling") {
+        ("SMUGGLING", "HTTP request smuggling")
+    } else if r.contains("bot") || r.contains("challenge") {
+        ("BOT", "Bot challenge")
+    } else {
+        ("ANOMALY", "anomaly threshold exceeded")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2723,20 +3356,20 @@ mod log_rotation_tests {
     use super::*;
 
     #[test]
-    fn append_rotating_caps_size_and_prunes_backups() {
+    fn rotating_file_caps_size_and_prunes_backups() {
         let dir = std::env::temp_dir().join(format!("sentinel-rot-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        // 1 MB cap, keep 2 backups.
-        std::env::set_var("SENTINEL_LOG_MAX_MB", "1");
-        std::env::set_var("SENTINEL_LOG_KEEP", "2");
-
-        // ~10 KB lines; ~3.4 MB total → forces several rotations.
+        // 1 MB cap, keep 2 backups. ~10 KB lines, ~3.4 MB → several rotations.
         let line = "x".repeat(10_000);
-        for _ in 0..340 {
-            append_rotating(&dir, "access.log", &line).unwrap();
-        }
+        {
+            let mut rf = RotatingFile::open(&dir, "access.log", 1024 * 1024, 2).unwrap();
+            for _ in 0..340 {
+                rf.write_line(&line);
+            }
+            rf.flush();
+        } // drop closes the handle
 
         let live = dir.join("access.log");
         assert!(live.exists(), "live log must exist");
@@ -2749,8 +3382,26 @@ mod log_rotation_tests {
         assert!(dir.join("access.log.2").exists(), "expected access.log.2");
         assert!(!dir.join("access.log.3").exists(), "keep=2 must drop access.log.3");
 
-        std::env::remove_var("SENTINEL_LOG_MAX_MB");
-        std::env::remove_var("SENTINEL_LOG_KEEP");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotating_file_keep_zero_retains_no_backup() {
+        let dir = std::env::temp_dir().join(format!("sentinel-rot0-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let line = "y".repeat(10_000);
+        {
+            let mut rf = RotatingFile::open(&dir, "access.log", 1024 * 1024, 0).unwrap();
+            for _ in 0..340 {
+                rf.write_line(&line);
+            }
+            rf.flush();
+        }
+        assert!(dir.join("access.log").exists(), "live log must exist");
+        assert!(!dir.join("access.log.1").exists(), "keep=0 must retain no backup");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

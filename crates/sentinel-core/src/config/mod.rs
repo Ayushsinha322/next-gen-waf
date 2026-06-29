@@ -137,6 +137,26 @@ pub struct ListenerConfig {
     /// to this site ID — enables port-based routing (e.g. :9095 → dvwa).
     #[serde(default)]
     pub default_site: Option<String>,
+    /// Listener role. `normal` (default) runs the full WAF pipeline and routes
+    /// to customer sites by Host. `management` turns this listener into the
+    /// dedicated management endpoint: it bypasses the WAF pipeline, presents the
+    /// hot-swappable management certificate, and reverse-proxies the admin UI
+    /// (path `/api/*` → control plane, everything else → dashboard).
+    #[serde(default)]
+    pub role: ListenerRole,
+}
+
+/// What a listener is for. Mirrors the F5 "management interface vs data plane"
+/// separation: customer traffic and the appliance's own admin console are
+/// served by the same engine but on distinct listeners with distinct certs.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ListenerRole {
+    /// Customer-facing WAF listener: full pipeline, Host-routed to sites.
+    #[default]
+    Normal,
+    /// Dedicated management console listener (admin UI + API over HTTPS).
+    Management,
 }
 
 impl ListenerConfig {
@@ -149,6 +169,10 @@ impl ListenerConfig {
 
     pub fn is_tls(&self) -> bool {
         self.tls.is_some()
+    }
+
+    pub fn is_management(&self) -> bool {
+        self.role == ListenerRole::Management
     }
 }
 
@@ -376,6 +400,44 @@ pub struct WafConfig {
     /// Maximum number of request headers (0 = unlimited, default 100).
     #[serde(default = "default_max_header_count")]
     pub max_header_count: u32,
+    /// Allowed HTTP methods. Empty = allow all; otherwise a request whose method
+    /// isn't listed is rejected with 405. Case-insensitive.
+    #[serde(default)]
+    pub allowed_methods: Vec<String>,
+    /// Per-site response/security header policy (overrides the proxy defaults
+    /// and injects operator-defined headers).
+    pub security_headers: Option<SecurityHeadersConfig>,
+}
+
+/// Operator-configurable response headers, applied on top of the proxy's secure
+/// defaults. Empty/absent fields fall back to the built-in defaults.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SecurityHeadersConfig {
+    /// `Content-Security-Policy` value (omitted by default — CSP can break apps).
+    pub content_security_policy: Option<String>,
+    /// Override `Referrer-Policy` (default: strict-origin-when-cross-origin).
+    pub referrer_policy: Option<String>,
+    /// Override `Permissions-Policy`.
+    pub permissions_policy: Option<String>,
+    /// CORS handling (`Access-Control-Allow-Origin`).
+    pub cors: Option<CorsConfig>,
+    /// Arbitrary operator-defined response headers (name/value), applied last.
+    #[serde(default)]
+    pub custom: Vec<CustomHeader>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CorsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub allow_origin: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CustomHeader {
+    pub name: String,
+    pub value: String,
 }
 
 /// Removes one or more targets from a rule to suppress known false positives.
@@ -496,11 +558,14 @@ pub struct BotDetectionConfig {
     pub challenge: ChallengeMode,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ChallengeMode {
     #[default]
     Off,
+    // `alias` keeps configs written under the old `rename_all = "lowercase"`
+    // scheme ("nativepow") deserializing after the switch to snake_case.
+    #[serde(alias = "nativepow")]
     NativePow,
     Recaptcha,
     Hcaptcha,

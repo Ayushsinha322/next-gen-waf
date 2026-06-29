@@ -18,7 +18,8 @@
 //!     let cfg = StorageBackendConfig {
 //!         redis_url: Some("redis://127.0.0.1:6379".into()),
 //!         clickhouse_url: Some("http://127.0.0.1:8123".into()),
-//!         clickhouse_db: Some("sentinel".into()),
+//!         clickhouse_db: Some("sentinel_logs".into()),
+//!         ..Default::default()
 //!     };
 //!     let handle = StorageHandle::connect(&cfg).await;
 //!

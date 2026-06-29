@@ -251,8 +251,8 @@ func cefExtension(kv map[string]string) string {
 	var b strings.Builder
 	for _, k := range order {
 		v, ok := kv[k]
-		if !ok || v == "" || v == "0" {
-			continue
+		if !ok || v == "" {
+			continue // skip only missing/empty — "0" is a legitimate value (e.g. cnt=0)
 		}
 		if b.Len() > 0 {
 			b.WriteByte(' ')

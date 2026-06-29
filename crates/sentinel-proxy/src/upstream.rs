@@ -252,9 +252,21 @@ impl UpstreamPool {
             .enable_http2()
             .build();
 
+        // Keep-alive pool sizing. 32 idle/host is far too low for a reverse
+        // proxy: once in-flight concurrency to an upstream exceeds it, the
+        // surplus connections are closed when briefly idle and reopened on the
+        // next burst — churning TCP handshakes and piling up TIME_WAIT sockets
+        // (ephemeral-port-exhaustion risk under load). Default high; override
+        // with SENTINEL_UPSTREAM_MAX_IDLE for very large fleets / FD limits.
+        let max_idle = std::env::var("SENTINEL_UPSTREAM_MAX_IDLE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(256);
+
         let client = Client::builder(TokioExecutor::new())
             .pool_idle_timeout(Duration::from_secs(90))
-            .pool_max_idle_per_host(32)
+            .pool_max_idle_per_host(max_idle)
             .build(https);
 
         let pool = Self {
@@ -295,6 +307,22 @@ impl UpstreamPool {
     // -----------------------------------------------------------------------
     // Request forwarding
     // -----------------------------------------------------------------------
+
+    /// Forward a pre-built request straight to the host in its URI, using the
+    /// shared keep-alive pool but WITHOUT site selection / load-balancing /
+    /// circuit-breaker bookkeeping. Used by the management listener to
+    /// reverse-proxy the admin console (dashboard + control-plane API). Streams
+    /// both request and response bodies, so Server-Sent Events pass through
+    /// unbuffered.
+    pub async fn forward(
+        &self,
+        req: Request<BoxBody<Bytes, hyper::Error>>,
+    ) -> anyhow::Result<http::Response<hyper::body::Incoming>> {
+        self.client
+            .request(req)
+            .await
+            .map_err(|e| anyhow::anyhow!("management upstream request failed: {e}"))
+    }
 
     /// Send a pre-built upstream request and return the response.
     ///

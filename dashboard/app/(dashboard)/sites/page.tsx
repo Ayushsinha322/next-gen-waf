@@ -322,7 +322,7 @@ export default function SitesPage() {
                           {meta ? `${meta.icon} ` : ""}{s.name}
                         </span>
                       </td>
-                      <td>{s.domains.join(", ")}</td>
+                      <td style={{ maxWidth: 240, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={s.domains.join(", ")}>{s.domains.join(", ")}</td>
                       <td><span className={`bdg ${mode === "BLOCKING" ? "br" : mode === "LEARNING" ? "ba blink" : "bgr"}`}><span className="bdr" />{mode}</span></td>
                       <td className="td3">paranoia {s.waf_policy?.paranoia_level ?? "—"}</td>
                       <td><span className={`bdg ${s.status === "active" ? "bgg" : "bgr"}`}>{s.status}</span></td>

@@ -15,6 +15,7 @@ pub mod renewal;
 pub use acme::CertManager;
 pub use cert_store::{
     CertMeta, CertSource, CertStore, SentinelCertResolver, generate_self_signed, load_pem_bytes,
+    MANAGEMENT_CERT_KEY,
 };
 
 // Keep AutoCertResolver name so the remaining build_tls_acceptor path in lib.rs compiles.

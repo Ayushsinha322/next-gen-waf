@@ -75,3 +75,6 @@ notes.md
 notes11.md
 features-improvement.md
 features-improvement
+
+# Deploy secrets — never commit
+deploy/docker/.env

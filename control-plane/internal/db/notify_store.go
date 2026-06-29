@@ -83,6 +83,16 @@ DO $$ BEGIN
             USING  (tenant_id::text = current_setting('app.current_tenant', true))
             WITH CHECK (tenant_id::text = current_setting('app.current_tenant', true));
     END IF;
+END $$;
+DO $$ BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger
+        WHERE tgname = 'trg_notification_channels_updated'
+          AND tgrelid = 'notification_channels'::regclass
+    ) THEN
+        CREATE TRIGGER trg_notification_channels_updated BEFORE UPDATE ON notification_channels
+            FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+    END IF;
 END $$;`
 	if _, err := pg.pool.Exec(ctx, ddl); err != nil {
 		return fmt.Errorf("notify schema: %w", err)

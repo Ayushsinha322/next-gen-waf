@@ -472,7 +472,13 @@ func (h *Hub) updateMetrics(e Entry) {
 			}
 			cat := attackCategory(row.Rule)
 			h.aggMu.Lock()
-			h.attackCats[cat]++
+			// The attack breakdown counts what the WAF actually blocked — not
+			// every rule match (a PASSed match isn't an attack that got through)
+			// nor learning-mode DETECTs (surfaced separately in the learning
+			// report).
+			if blocked {
+				h.attackCats[cat]++
+			}
 			if blocked && row.IP != "" {
 				h.blockedIPs[row.IP] = struct{}{}
 			}
@@ -524,6 +530,20 @@ func (h *Hub) updateMetrics(e Entry) {
 //
 // Unknown / native rule IDs fall through to "other".
 func attackCategory(rule string) string {
+	// Synthetic labels the data plane emits for non-rule blocks (see
+	// classify_nonrule_block in the proxy).
+	switch rule {
+	case "GEOIP":
+		return "geoip"
+	case "RATELIMIT":
+		return "ratelimit"
+	case "SMUGGLING":
+		return "protocol"
+	case "BOT":
+		return "bot"
+	case "ANOMALY":
+		return "anomaly"
+	}
 	if len(rule) < 3 {
 		return "other"
 	}
@@ -555,7 +575,8 @@ func (h *Hub) runMemSampler() {
 		if err != nil {
 			return
 		}
-		var total, available uint64
+		var total, available, free, buffers, cached uint64
+		haveAvailable := false
 		for _, line := range bytes.Split(data, []byte("\n")) {
 			fields := bytes.Fields(line)
 			if len(fields) < 2 {
@@ -574,9 +595,22 @@ func (h *Hub) runMemSampler() {
 				total = kb * 1024
 			case "MemAvailable:":
 				available = kb * 1024
+				haveAvailable = true
+			case "MemFree:":
+				free = kb * 1024
+			case "Buffers:":
+				buffers = kb * 1024
+			case "Cached:":
+				cached = kb * 1024
 			}
 		}
-		if total > 0 {
+		// Older kernels / some containers omit MemAvailable; estimate it from
+		// MemFree+Buffers+Cached rather than treating it as 0 (which would report
+		// memUsed == total, i.e. a permanent 100%).
+		if !haveAvailable {
+			available = free + buffers + cached
+		}
+		if total > 0 && (haveAvailable || available > 0) {
 			h.memTotal.Store(total)
 			if available <= total {
 				h.memUsed.Store(total - available)

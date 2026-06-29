@@ -20,7 +20,10 @@ const nextConfig = {
     return [
       {
         source: "/api/v1/:path*",
-        destination: (process.env.NEXT_PUBLIC_CONTROL_PLANE_URL ?? process.env.CONTROL_PLANE_URL ?? "http://localhost:9501") + "/api/v1/:path*",
+        // Server-side REST proxy → internal control-plane hostname (portable).
+        // NOTE: SSE (api.ts logs.streamURL) is separate and uses the *browser-
+        // reachable* NEXT_PUBLIC_CONTROL_PLANE_URL, since the Next proxy buffers SSE.
+        destination: (process.env.CONTROL_PLANE_URL ?? process.env.NEXT_PUBLIC_CONTROL_PLANE_URL ?? "http://localhost:9501") + "/api/v1/:path*",
       },
     ];
   },

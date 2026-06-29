@@ -57,6 +57,7 @@ fn test_config(listen_port: u16, upstream_port: u16, rule_file: &str, mode: WafM
             protocol: ProtocolSpec::Single(Protocol::Http1),
             tls: None,
             default_site: Some("test-site".into()),
+            role: Default::default(),
         }],
         sites: vec![SiteConfig {
             id: "test-site".into(),
@@ -96,6 +97,7 @@ fn ml_only_config(listen_port: u16, upstream_port: u16, sensitivity: f32) -> Sen
             protocol: ProtocolSpec::Single(Protocol::Http1),
             tls: None,
             default_site: Some("test-site".into()),
+            role: Default::default(),
         }],
         sites: vec![SiteConfig {
             id: "test-site".into(),
