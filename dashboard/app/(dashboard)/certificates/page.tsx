@@ -94,6 +94,7 @@ export default function CertificatesPage() {
   const [wafUp, setWafUp]   = useState(true);
   const [busy, setBusy]     = useState<string | null>(null);
   const [tab, setTab]       = useState<"acme" | "manual">("acme");
+  const [rootCA, setRootCA] = useState<{ available: boolean; subject?: string; not_after?: number; fingerprint?: string } | null>(null);
 
   // ACME form
   const [acmeDomains, setAcmeDomains]   = useState("");
@@ -112,13 +113,15 @@ export default function CertificatesPage() {
     try {
       // Independent calls — fetch concurrently. Sites are optional, so swallow
       // their failure without failing the whole load.
-      const [res, s] = await Promise.all([
+      const [res, s, ca] = await Promise.all([
         api.certs.list(),
         api.sites.list().catch(() => ({ sites: [] as Site[] })),
+        api.certs.rootCAInfo().catch(() => ({ available: false })),
       ]);
       setCerts(res.certs ?? []);
       setWafUp(res.waf_running);
       setSites(s.sites ?? []);
+      setRootCA(ca);
     } catch {
       showToast("Failed to load certificates", "e", "⚠️");
     } finally {
@@ -127,6 +130,18 @@ export default function CertificatesPage() {
   }
 
   useEffect(() => { load(); }, []);
+
+  async function downloadRootCA() {
+    setBusy("rootca");
+    try {
+      await api.certs.downloadRootCA();
+      showToast("Root CA downloaded — import it as a trusted root authority for a green lock", "s", "🛡️");
+    } catch {
+      showToast("Failed to download root CA", "e", "⚠️");
+    } finally {
+      setBusy(null);
+    }
+  }
 
   // Map each cert → the sites it protects once per certs/sites change, instead
   // of recomputing the O(certs × sites) match for every row on every render.
@@ -241,6 +256,26 @@ export default function CertificatesPage() {
         </div>
         <motion.button className="btn bg-btn btn-sm" onClick={load} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>⟳ Refresh</motion.button>
       </motion.div>
+
+      {rootCA?.available && (
+        <motion.div className="panel" variants={fadeUp}
+          style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 14, flexWrap: "wrap" }}>
+          <div style={{ minWidth: 0 }}>
+            <div style={{ fontWeight: 600 }}>🛡️ Trust this WAF (import the Root CA)</div>
+            <div className="sec-sub" style={{ marginTop: 4 }}>
+              Browsers warn on the WAF&apos;s HTTPS-by-IP endpoint until they trust our private CA. Download it
+              once and install it as a <em>trusted root authority</em> to get a green lock — encryption is
+              already on regardless.
+              {rootCA.subject ? <> · <span style={{ opacity: .85 }}>{rootCA.subject}</span></> : null}
+              {rootCA.not_after ? <> · valid to {fmtDate(rootCA.not_after)}</> : null}
+            </div>
+          </div>
+          <motion.button className="btn bc btn-sm" disabled={busy === "rootca"} onClick={downloadRootCA}
+            whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
+            {busy === "rootca" ? "Downloading…" : "⬇ Download Root CA"}
+          </motion.button>
+        </motion.div>
+      )}
 
       <motion.div variants={staggerContainer} initial="hidden" animate="visible" style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 12 }}>
         {kpis.map((k, i) => (

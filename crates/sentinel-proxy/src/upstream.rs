@@ -308,6 +308,22 @@ impl UpstreamPool {
     // Request forwarding
     // -----------------------------------------------------------------------
 
+    /// Forward a pre-built request straight to the host in its URI, using the
+    /// shared keep-alive pool but WITHOUT site selection / load-balancing /
+    /// circuit-breaker bookkeeping. Used by the management listener to
+    /// reverse-proxy the admin console (dashboard + control-plane API). Streams
+    /// both request and response bodies, so Server-Sent Events pass through
+    /// unbuffered.
+    pub async fn forward(
+        &self,
+        req: Request<BoxBody<Bytes, hyper::Error>>,
+    ) -> anyhow::Result<http::Response<hyper::body::Incoming>> {
+        self.client
+            .request(req)
+            .await
+            .map_err(|e| anyhow::anyhow!("management upstream request failed: {e}"))
+    }
+
     /// Send a pre-built upstream request and return the response.
     ///
     /// The request URI must already point at the upstream server.  Connection

@@ -344,7 +344,125 @@ the day-to-day operations reference.)
 
 ---
 
-## 9. Cheat Sheet (print this)
+## 9. HTTPS / TLS certificates
+
+**What's live:** the WAF serves HTTPS on `:443`. For bare-IP access
+(`https://172.16.21.71/` over the VPN) it presents a **real certificate signed by
+our own private CA** — *"Sentinel WAF Internal Root CA"* — not a throwaway
+self-signed one. The cert has the VM's IP in its SAN, so it's a valid,
+chain-verifiable cert.
+
+**Why the browser still warns (and why that's fine):** the CA is *ours*, not a
+public one (Let's Encrypt etc. can't issue for a private IP). Until a machine
+trusts our root, the browser shows the usual "not secure" warning. The traffic is
+still fully encrypted — the warning is about *who vouches for the cert*, not the
+encryption. Two choices:
+- **Accept the warning** (decided for the internal demo) — click through, done.
+- **Get the green lock** — import our root CA **once** per client (below).
+
+### Make the lock go green (import the root CA, optional)
+**Easiest — from the dashboard:** log in → **Certificates** → the *"🛡️ Trust this
+WAF"* panel → **⬇ Download Root CA**. Saves `sentinel-root-ca.crt`.
+
+**Or grab it off the VM:**
+```bash
+scp -i ~/.ssh/sentinel_deploy root@172.16.21.71:/opt/sentinel-pki/root.crt sentinel-root-ca.crt
+```
+Either way, install `sentinel-root-ca.crt` as a *trusted root authority*:
+- **Windows:** double-click → *Install Certificate* → *Local Machine* → *Place in*
+  → *Trusted Root Certification Authorities*. (Or `certutil -addstore -f Root sentinel-root-ca.crt` as admin.)
+- **macOS:** double-click → Keychain *System* → set the cert to *Always Trust*.
+- **Linux:** `sudo cp sentinel-root-ca.crt /usr/local/share/ca-certificates/ && sudo update-ca-certificates`.
+- **Firefox** (uses its own store): *Settings → Privacy & Security → Certificates →
+  View Certificates → Authorities → Import* → tick *Trust for websites*.
+
+After import, `https://172.16.21.71/` shows a normal padlock — no warning.
+
+### Where the cert lives / the trust model
+| File (on the VM, `/opt/sentinel-pki/`) | What it is | Sensitivity |
+|---|---|---|
+| `root.crt` | the public Root CA | **safe to share** — hand it to anyone |
+| `root.key` | the Root CA private key | **SECRET** — never copy off the VM; anyone with it can mint trusted certs |
+| `leaf.crt` / `leaf.pkcs8.key` | the IP server cert + key | served by the WAF |
+| `issue-ip-cert.sh` | the re-issuer script | re-run to rotate |
+
+The served copy lives in the data-plane cert repository (the `sentinel-certs`
+volume) under the special **`default`** entry — that's the cert shown to any
+client that connects without SNI, i.e. by IP. Dir is `0700`, keys `0600`.
+
+### Re-issue / rotate the cert
+The IP cert is valid until **Oct 2028** (~825 days). To rotate it (or after the IP
+changes), re-run the issuer on the VM, then reload the WAF:
+```bash
+ssh sentinel 'bash /opt/sentinel-pki/issue-ip-cert.sh'          # keeps the same Root CA, mints a fresh leaf
+ssh sentinel 'cd /opt/sentinel-src/deploy/docker && docker compose -f compose.prod.yml restart dataplane'
+# override defaults if needed:  WAF_IP=10.x.x.x LEAF_DAYS=825 bash issue-ip-cert.sh
+```
+The Root CA (valid to 2036) is created once and reused, so clients that already
+trust it keep working across rotations — no re-import needed.
+
+### Verify what's being served
+```bash
+# what cert is on :443 for a bare-IP (no-SNI) client? — issuer should be the Sentinel Root CA
+ssh sentinel 'echo | openssl s_client -connect 127.0.0.1:443 2>/dev/null | openssl x509 -noout -subject -issuer'
+# does it validate against our root? — expect "Verify return code: 0 (ok)"
+ssh sentinel 'echo | openssl s_client -connect 127.0.0.1:443 -CAfile /opt/sentinel-pki/root.crt 2>/dev/null | grep "Verify return"'
+# HTTPS works AND attacks still blocked? — expect 200 then 403
+ssh sentinel 'curl -s --cacert /opt/sentinel-pki/root.crt https://172.16.21.71/ -o /dev/null -w "benign=%{http_code}\n"'
+ssh sentinel 'curl -s --cacert /opt/sentinel-pki/root.crt -G "https://172.16.21.71/" --data-urlencode "q=1'\'' OR '\''1'\''='\''1" -o /dev/null -w "attack=%{http_code}\n"'
+```
+
+> **Per-domain certs** (if you ever front a real hostname): upload them in the
+> dashboard → *Certificates*. They're served by SNI for that hostname; the `default`
+> IP cert above still covers bare-IP access. Customer-supplied wildcards auto-cover
+> all their subdomains via SNI.
+
+### The management console & its certificate (the F5 "device cert" model)
+
+There are **two completely separate certs** (don't confuse them):
+- **Customer-website certs** — what visitors of a protected site see. Managed under
+  *Certificates* (§9 above). The customer brings their own / ACME.
+- **The management certificate** — what *you* (the admin) see when you open the
+  Sentinel console itself. This is its own thing, like an F5 appliance's *Device
+  Certificate*.
+
+**The console now has a dedicated, TLS-secured endpoint:**
+
+```
+https://172.16.21.71:9443/      ← the management console (admin UI + API over HTTPS)
+http://172.16.21.71:3000/       ← legacy/break-glass (cleartext; prefer :9443)
+```
+
+`:9443` is served by the WAF's **own engine** (not a third-party proxy): one
+dedicated listener that reverse-proxies the dashboard + API and presents a
+**replaceable management certificate**. It bypasses the WAF rule pipeline (it's the
+admin console) and refuses to forward internal endpoints.
+
+Out of the box it serves a **self-signed** cert (browser warning — expected). To
+replace it with your own / your company-PKI cert:
+
+**Dashboard → Settings → Management TLS** → paste the **certificate** + **private
+key** (+ optional CA bundle) → *Validate & Install*. The upload is fully validated
+before anything is written:
+- the key must **match** the certificate,
+- it must be **in date** (not expired, not yet-valid),
+- it must have a **SAN**,
+- the **chain** is verified if you supply a CA bundle,
+- a **hostname mismatch** is a warning (not a hard stop).
+
+On success it **hot-swaps with zero downtime** (next connection picks it up),
+records an **audit event** (old→new fingerprint), and shows issuer / expiry / days
+remaining / fingerprint / key type. The private key is stored **only on the WAF
+node at mode 0600**, never in the database, never logged, never shown again. Use
+*Revert to self-signed* to roll back.
+
+> Tip: to get a green lock on `:9443` for an internal demo, mint a leaf from the
+> Sentinel internal CA (`/opt/sentinel-pki/`) for `172.16.21.71`, upload it here,
+> and import `root.crt` on the client (§9). Or upload a cert from your company PKI.
+
+---
+
+## 10. Cheat Sheet (print this)
 
 ```bash
 # ── connect ───────────────────────────────────────────────
@@ -375,7 +493,9 @@ docker compose -f compose.prod.yml down -v         # ⚠️ ALSO deletes DB + ce
 # ── service names ─────────────────────────────────────────
 #   dataplane (the WAF) · dashboard · controlplane · postgres · redis · juiceshop
 
-# ── the two URLs ──────────────────────────────────────────
-#   Dashboard:  http://172.16.21.71:3000   (admin@sentinel.local / admin123)
-#   Protected:  http://172.16.21.71/
+# ── the URLs ──────────────────────────────────────────────
+#   Console:    https://172.16.21.71:9443  (admin console over TLS — preferred; §9)
+#               http://172.16.21.71:3000   (legacy/break-glass, cleartext)
+#   Protected:  http://172.16.21.71/   ·   https://172.16.21.71/  (real CA cert, see §9)
+#   Login:      admin@sentinel.local / Admin@123#
 ```

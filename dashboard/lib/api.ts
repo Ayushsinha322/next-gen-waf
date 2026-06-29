@@ -285,6 +285,33 @@ export interface Certificate {
 export type AcmeProvider = "letsencrypt" | "letsencrypt_staging" | "zerossl";
 export type AcmeChallenge = "http_01" | "tls_alpn_01";
 
+/** Current management-console TLS cert (or the self-signed default). */
+export interface ManagementTLSInfo {
+  self_signed:  boolean;
+  domain?:      string;
+  name?:        string;  // operator profile label, or the cert subject when none set
+  issuer?:      string;
+  san?:         string[];
+  issued_at?:   number;  // UNIX seconds
+  expires_at?:  number;  // UNIX seconds
+  fingerprint?: string;
+  key_type?:    string;
+}
+
+/** Validated metadata returned after a successful management-cert upload. */
+export interface CertValidationResult {
+  subject:        string;
+  issuer:         string;
+  san:            string[];
+  not_before:     number;
+  not_after:      number;
+  days_remaining: number;
+  fingerprint:    string;
+  key_type:       string;
+  self_signed:    boolean;
+  warnings:       string[];
+}
+
 // ---------------------------------------------------------------------------
 // API methods
 // ---------------------------------------------------------------------------
@@ -441,6 +468,27 @@ export const api = {
 
   certs: {
     list: () => apiFetch<{ certs: Certificate[]; waf_running: boolean }>("/certs"),
+    /** Metadata for the WAF's internal Root CA (drives the "Download Root CA" UI). */
+    rootCAInfo: () =>
+      apiFetch<{ available: boolean; subject?: string; not_after?: number; fingerprint?: string; filename?: string }>(
+        "/certs/root-ca/info"),
+    /** Download the public Root CA PEM as a file (so users can import it as a trusted root). */
+    downloadRootCA: async (): Promise<void> => {
+      const token = getToken();
+      const res = await fetch(`${BASE}/certs/root-ca`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (!res.ok) throw new Error(`root CA download failed: ${res.status}`);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "sentinel-root-ca.crt";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    },
     uploadManual: (body: { domain: string; name?: string; cert_pem: string; key_pem: string }) =>
       apiFetch<{ installed: string }>("/certs/manual", {
         method: "POST", body: JSON.stringify(body),
@@ -467,6 +515,30 @@ export const api = {
       apiFetch<{ removed: string }>(`/certs/${encodeURIComponent(domain)}`, {
         method: "DELETE",
       }),
+  },
+
+  /** Management-console TLS — the cert the admin UI itself is served with. */
+  managementTls: {
+    get: () => apiFetch<ManagementTLSInfo>("/management-tls"),
+    /** Validate + install. Throws with the server's validation message on failure. */
+    upload: async (body: {
+      cert_pem: string;
+      key_pem: string;
+      ca_bundle_pem?: string;
+      name?: string;
+      expected_host?: string;
+    }): Promise<{ ok: boolean; info: CertValidationResult; warnings: string[] }> => {
+      const token = getToken();
+      const res = await fetch(`${BASE}/management-tls`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json().catch(() => ({} as Record<string, unknown>));
+      if (!res.ok) throw new Error((data as { error?: string }).error || `upload failed: ${res.status}`);
+      return data as { ok: boolean; info: CertValidationResult; warnings: string[] };
+    },
+    revert: () => apiFetch<{ ok: boolean; reverted: boolean }>("/management-tls", { method: "DELETE" }),
   },
 
   events: {

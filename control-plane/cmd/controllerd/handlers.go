@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1432,8 +1433,16 @@ func writeAuditEntry(c *gin.Context, store *db.Store, hub *logs.Hub, req *db.Wri
 
 	if store != nil {
 		reqCopy := *req
+		// Detach from the request context: the HTTP response often returns
+		// before this write finishes, which would cancel c.Request.Context()
+		// and silently drop the audit row. Use a fresh bounded context so the
+		// audit entry is durably persisted regardless of response lifecycle.
 		go func() {
-			_ = store.WriteAuditLog(c.Request.Context(), reqCopy, auditHMACKey())
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := store.WriteAuditLog(ctx, reqCopy, auditHMACKey()); err != nil {
+				zap.L().Warn("audit write failed", zap.String("action", reqCopy.Action), zap.Error(err))
+			}
 		}()
 	}
 }

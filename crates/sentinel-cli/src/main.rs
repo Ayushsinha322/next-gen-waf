@@ -460,6 +460,7 @@ fn cmd_init(cfg_path: &Path, bind: &str) -> Result<()> {
             protocol: ProtocolSpec::Single(Protocol::Http1),
             tls: None,
             default_site: None,
+            role: Default::default(),
         }],
         sites: vec![],
         logging: LoggingConfig {
@@ -755,6 +756,8 @@ fn cmd_site_add(
             max_body_size: 10 * 1024 * 1024,
             max_uri_length: 8192,
             max_header_count: 100,
+            allowed_methods: Default::default(),
+            security_headers: Default::default(),
         },
         plugins: vec![],
         tls: Default::default(),

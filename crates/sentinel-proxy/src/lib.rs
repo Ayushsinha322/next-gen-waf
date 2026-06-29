@@ -337,6 +337,28 @@ struct ServerState {
     http01_tokens: Arc<DashMap<String, String>>,
 }
 
+/// Upstreams the dedicated management listener reverse-proxies to. The admin
+/// console is served by the WAF's own engine (no third-party proxy): requests
+/// to `/api/*` go to the control plane, everything else to the dashboard.
+#[derive(Debug)]
+struct ManagementUpstreams {
+    /// Base URL of the dashboard UI, e.g. "http://dashboard:3000".
+    dashboard: String,
+    /// Base URL of the control-plane REST/SSE API, e.g. "http://controlplane:9501".
+    api: String,
+}
+
+impl ManagementUpstreams {
+    /// Build from env, with co-located-dev defaults.
+    fn from_env() -> Self {
+        let dashboard = std::env::var("SENTINEL_MGMT_DASHBOARD_UPSTREAM")
+            .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
+        let api = std::env::var("SENTINEL_MGMT_API_UPSTREAM")
+            .unwrap_or_else(|_| "http://127.0.0.1:9501".to_string());
+        Self { dashboard, api }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ProxyServer
 // ---------------------------------------------------------------------------
@@ -820,15 +842,44 @@ async fn serve_listener(
         .await
         .with_context(|| format!("binding listener '{}' on {}", cfg.name, cfg.bind))?;
 
-    info!(listener = %cfg.name, bind = %cfg.bind, tls = cfg.is_tls(), "listener started");
+    // The management listener is a dedicated admin-console endpoint: it bypasses
+    // the WAF pipeline and reverse-proxies the dashboard + control-plane API,
+    // presenting the hot-swappable management certificate (F5 "device cert").
+    let management: Option<Arc<ManagementUpstreams>> = if cfg.is_management() {
+        let up = Arc::new(ManagementUpstreams::from_env());
+        info!(
+            listener = %cfg.name, dashboard = %up.dashboard, api = %up.api,
+            "management listener: serving admin console over this endpoint"
+        );
+        if !cfg.is_tls() {
+            warn!(listener = %cfg.name, "management listener has no TLS — admin console will be served over cleartext");
+        }
+        Some(up)
+    } else {
+        None
+    };
+
+    info!(listener = %cfg.name, bind = %cfg.bind, tls = cfg.is_tls(), management = management.is_some(), "listener started");
 
     let tls_acceptor = if cfg.is_tls() {
         let tls_cfg = cfg.tls.as_ref().unwrap();
-        // If explicit cert/key paths are provided, use them directly.
-        // Otherwise, use SNI-based auto-generation for all sites.
-        if tls_cfg.cert.is_some() && tls_cfg.key.is_some() {
+        if management.is_some() {
+            // Management listener: always serve the single management cert
+            // (ignores SNI), with a self-signed fallback until one is uploaded.
+            let resolver = tls::SentinelCertResolver::new_fixed(
+                Arc::clone(&state.cert_manager.store),
+                tls::MANAGEMENT_CERT_KEY,
+            );
+            let mut server_cfg = ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(resolver);
+            server_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            Some(TlsAcceptor::from(Arc::new(server_cfg)))
+        } else if tls_cfg.cert.is_some() && tls_cfg.key.is_some() {
+            // Explicit cert/key paths — use them directly.
             Some(build_tls_acceptor(tls_cfg)?)
         } else {
+            // SNI-based per-domain resolution across all sites.
             let cfg_snap = state.config.load();
             let domains: Vec<String> = cfg_snap
                 .sites
@@ -859,8 +910,9 @@ async fn serve_listener(
                 let acceptor = tls_acceptor.clone();
                 let protos = cfg.protocols();
                 let ds = default_site.clone();
+                let mgmt = management.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, peer, acceptor, protos, state, ds).await {
+                    if let Err(e) = handle_connection(stream, peer, acceptor, protos, state, ds, mgmt).await {
                         debug!(peer = %peer, "connection error: {e}");
                     }
                 });
@@ -885,6 +937,7 @@ async fn handle_connection(
     protocols: Vec<Protocol>,
     state: Arc<ServerState>,
     default_site: Option<String>,
+    management: Option<Arc<ManagementUpstreams>>,
 ) -> anyhow::Result<()> {
     stream.set_nodelay(true)?;
 
@@ -893,16 +946,16 @@ async fn handle_connection(
         let negotiated = tls.get_ref().1.alpn_protocol().map(|p| p.to_vec());
         let io = TokioIo::new(tls);
         if negotiated.as_deref() == Some(b"h2") {
-            serve_http2(io, peer, state, default_site).await
+            serve_http2(io, peer, state, default_site, management).await
         } else {
-            serve_http1(io, peer, state, default_site).await
+            serve_http1(io, peer, state, default_site, management).await
         }
     } else {
         let io = TokioIo::new(stream);
         if protocols.contains(&Protocol::Http2) && !protocols.contains(&Protocol::Http1) {
-            serve_http2(io, peer, state, default_site).await
+            serve_http2(io, peer, state, default_site, management).await
         } else {
-            serve_http1(io, peer, state, default_site).await
+            serve_http1(io, peer, state, default_site, management).await
         }
     }
 }
@@ -912,6 +965,7 @@ async fn serve_http1<T>(
     peer: SocketAddr,
     state: Arc<ServerState>,
     default_site: Option<String>,
+    management: Option<Arc<ManagementUpstreams>>,
 ) -> anyhow::Result<()>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -922,7 +976,8 @@ where
             hyper::service::service_fn(move |req| {
                 let s = Arc::clone(&state);
                 let ds = default_site.clone();
-                async move { handle_request(s, peer, req, ds).await }
+                let mgmt = management.clone();
+                async move { handle_request(s, peer, req, ds, mgmt).await }
             }),
         )
         .with_upgrades()
@@ -935,6 +990,7 @@ async fn serve_http2<T>(
     peer: SocketAddr,
     state: Arc<ServerState>,
     default_site: Option<String>,
+    management: Option<Arc<ManagementUpstreams>>,
 ) -> anyhow::Result<()>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -945,7 +1001,8 @@ where
             hyper::service::service_fn(move |req| {
                 let s = Arc::clone(&state);
                 let ds = default_site.clone();
-                async move { handle_request(s, peer, req, ds).await }
+                let mgmt = management.clone();
+                async move { handle_request(s, peer, req, ds, mgmt).await }
             }),
         )
         .await
@@ -961,12 +1018,21 @@ async fn handle_request(
     peer: SocketAddr,
     req: Request<Incoming>,
     default_site: Option<String>,
+    management: Option<Arc<ManagementUpstreams>>,
 ) -> Result<Response<BoxBody>, Infallible> {
     // Health / readiness endpoint — served before any WAF pipeline work.
     // GET /healthz or GET /health returns JSON with proxy uptime, site
     // count, and listener status.  No auth required; internal-only.
     if req.uri().path() == "/healthz" || req.uri().path() == "/health" {
         return Ok(health_response(&state));
+    }
+
+    // Management listener: this is the dedicated admin-console endpoint. It
+    // bypasses the WAF pipeline entirely and reverse-proxies the dashboard +
+    // control-plane API (the admin UI is auth-gated by the control plane). Done
+    // by our own engine — no third-party proxy.
+    if let Some(mgmt) = management {
+        return handle_management_request(state, peer, req, mgmt).await;
     }
 
     // ACME HTTP-01 challenge — intercepted BEFORE eBPF, before site routing.
@@ -985,17 +1051,22 @@ async fn handle_request(
         // Unknown token — fall through to normal routing (will 404 from upstream).
     }
 
-    // Internal cert-management API (control plane / dashboard bridge).
+    // Internal control-plane bridge API (cert + management-TLS management).
     // Loopback-only: these endpoints share the public listener, so anything
-    // under /api/v1/internal/certs is refused unless the peer is on localhost.
-    if req.uri().path().starts_with("/api/v1/internal/certs") {
-        // Allowed from loopback (co-located dev) OR with a valid shared-secret
-        // header — the control plane uses the latter to reach the data plane
-        // across containers (Docker/K8s), where the peer is not loopback.
+    // under /api/v1/internal/ is refused unless the peer is on localhost OR the
+    // caller presents the shared secret (control plane → data plane across
+    // containers).
+    if req.uri().path().starts_with("/api/v1/internal/") {
         if !peer.ip().is_loopback() && !internal_auth_ok(req.headers()) {
             return Ok(error_response(StatusCode::FORBIDDEN, "internal endpoint"));
         }
-        return Ok(handle_internal_cert_api(state, req).await);
+        if req.uri().path().starts_with("/api/v1/internal/management-tls") {
+            return Ok(handle_internal_mgmt_tls_api(state, req).await);
+        }
+        if req.uri().path().starts_with("/api/v1/internal/certs") {
+            return Ok(handle_internal_cert_api(state, req).await);
+        }
+        return Ok(error_response(StatusCode::NOT_FOUND, "unknown internal endpoint"));
     }
 
     // eBPF fast-fail: known-blocked IPs never enter the WAF pipeline.
@@ -2384,6 +2455,15 @@ fn block_response(ctx: &RequestContext) -> Response<BoxBody> {
 ///   POST   /api/v1/internal/certs/acme            → issue/renew via ACME (blocking)
 ///   POST   /api/v1/internal/certs/{domain}/renew  → force ACME re-issue
 ///   DELETE /api/v1/internal/certs/{domain}        → remove cert
+/// Cert keys beginning with "__" are reserved for internal use (e.g. the
+/// management cert "__management__"). The customer cert repository API must not
+/// be able to create, overwrite, rename, or delete them — that's the Management
+/// TLS API's job, which is separately RBAC-gated. This closes a privilege gap
+/// where a Site:Update editor could otherwise hijack the management cert.
+fn is_reserved_cert_key(domain: &str) -> bool {
+    domain.trim().starts_with("__")
+}
+
 async fn handle_internal_cert_api(
     state: Arc<ServerState>,
     req: Request<Incoming>,
@@ -2406,6 +2486,9 @@ async fn handle_internal_cert_api(
     if method == hyper::Method::DELETE {
         if let Some(domain) = path.strip_prefix("/api/v1/internal/certs/") {
             let domain = domain.trim_end_matches('/');
+            if is_reserved_cert_key(domain) {
+                return json_err(StatusCode::FORBIDDEN, "reserved certificate key — use the Management TLS API");
+            }
             return match state.cert_manager.store.remove(domain) {
                 Ok(()) => json_ok(serde_json::json!({"removed": domain})),
                 Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}")),
@@ -2433,6 +2516,9 @@ async fn handle_internal_cert_api(
             Ok(r) => r,
             Err(e) => return json_err(StatusCode::BAD_REQUEST, &format!("invalid JSON: {e}")),
         };
+        if is_reserved_cert_key(&r.domain) {
+            return json_err(StatusCode::FORBIDDEN, "reserved certificate key — use the Management TLS API");
+        }
         return match state
             .cert_manager
             .install_manual(&r.domain, &r.name, &r.cert_pem, &r.key_pem)
@@ -2446,6 +2532,9 @@ async fn handle_internal_cert_api(
     if method == hyper::Method::PATCH {
         if let Some(rest) = path.strip_prefix("/api/v1/internal/certs/") {
             let domain = rest.trim_end_matches('/');
+            if is_reserved_cert_key(domain) {
+                return json_err(StatusCode::FORBIDDEN, "reserved certificate key — use the Management TLS API");
+            }
             #[derive(serde::Deserialize)]
             struct RenameReq { name: String }
             let r: RenameReq = match serde_json::from_slice(&body_bytes) {
@@ -2530,6 +2619,170 @@ async fn handle_internal_cert_api(
     }
 
     json_err(StatusCode::NOT_FOUND, "unknown cert endpoint")
+}
+
+// ---------------------------------------------------------------------------
+// Management listener: reverse-proxy the admin console (our own engine)
+// ---------------------------------------------------------------------------
+
+/// Reverse-proxy a request arriving on the management listener. Path `/api/*`
+/// (REST + SSE) goes to the control plane; everything else to the dashboard.
+/// Bodies stream in both directions, so Server-Sent Events are unbuffered.
+async fn handle_management_request(
+    state: Arc<ServerState>,
+    peer: SocketAddr,
+    req: Request<Incoming>,
+    mgmt: Arc<ManagementUpstreams>,
+) -> Result<Response<BoxBody>, Infallible> {
+    let path = req.uri().path();
+    // Never expose the control plane's unauthenticated internal endpoints (e.g.
+    // /api/v1/internal/config, which leaks upstream topology) through the public
+    // management console. The admin UI only needs /api/v1/<feature> routes.
+    if path.starts_with("/api/v1/internal") {
+        return Ok(error_response(StatusCode::NOT_FOUND, "not found"));
+    }
+    let base = if path.starts_with("/api/") { &mgmt.api } else { &mgmt.dashboard };
+    let pq = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/");
+    let target = format!("{base}{pq}");
+    let target_uri: Uri = match target.parse() {
+        Ok(u) => u,
+        Err(e) => return Ok(error_response(StatusCode::BAD_GATEWAY, &format!("bad management target: {e}"))),
+    };
+
+    let (mut parts, body) = req.into_parts();
+    strip_hop_by_hop(&mut parts.headers);
+    // This listener is directly client-facing (no trusted forwarder in front),
+    // so RESET the forwarding headers to the real peer — never trust a
+    // client-supplied X-Forwarded-For chain (it would spoof the audit-logged IP).
+    let peer_ip = peer.ip().to_string();
+    if let Ok(hv) = header::HeaderValue::from_str(&peer_ip) {
+        parts.headers.insert(header::HeaderName::from_static("x-forwarded-for"), hv.clone());
+        parts.headers.insert(header::HeaderName::from_static("x-real-ip"), hv);
+    }
+    // The management listener terminates TLS; tell the upstream the original
+    // scheme so the dashboard/control plane generate correct https URLs/cookies.
+    parts.headers.insert(
+        header::HeaderName::from_static("x-forwarded-proto"),
+        header::HeaderValue::from_static("https"),
+    );
+    // Set Host to the upstream authority so behavior doesn't depend on the
+    // client-supplied Host or undocumented client Host-derivation.
+    if let Some(auth) = target_uri.authority() {
+        if let Ok(hv) = header::HeaderValue::from_str(auth.as_str()) {
+            parts.headers.insert(header::HOST, hv);
+        }
+    }
+    parts.uri = target_uri;
+    parts.version = http::Version::HTTP_11;
+    let upstream_req = Request::from_parts(parts, body.boxed());
+
+    match state.upstream_pool.forward(upstream_req).await {
+        Ok(resp) => {
+            let (rp, rb) = resp.into_parts();
+            Ok(Response::from_parts(rp, rb.boxed()))
+        }
+        Err(e) => Ok(error_response(
+            StatusCode::BAD_GATEWAY,
+            &format!("management upstream unreachable: {e}"),
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal management-TLS API (control-plane bridge)
+//
+//   GET    /api/v1/internal/management-tls   → current management cert metadata
+//   POST   /api/v1/internal/management-tls   → install validated PEM (hot-swap)
+//   DELETE /api/v1/internal/management-tls   → revert to self-signed default
+// ---------------------------------------------------------------------------
+
+async fn handle_internal_mgmt_tls_api(
+    state: Arc<ServerState>,
+    req: Request<Incoming>,
+) -> Response<BoxBody> {
+    let method = req.method().clone();
+
+    if method == hyper::Method::GET {
+        return match state.cert_manager.store.get_meta(tls::MANAGEMENT_CERT_KEY) {
+            Some(m) => {
+                let mut v = serde_json::to_value(&m).unwrap_or_else(|_| serde_json::json!({}));
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("self_signed".to_string(), serde_json::json!(false));
+                }
+                json_ok(v)
+            }
+            None => json_ok(serde_json::json!({"self_signed": true})),
+        };
+    }
+
+    if method == hyper::Method::DELETE {
+        return match state.cert_manager.store.revert_management() {
+            Ok(()) => json_ok(serde_json::json!({"reverted": true})),
+            Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}")),
+        };
+    }
+
+    if method == hyper::Method::POST {
+        let body_bytes = match req.into_body().collect().await {
+            Ok(c) => c.to_bytes(),
+            Err(e) => return json_err(StatusCode::BAD_REQUEST, &format!("body read failed: {e}")),
+        };
+        #[derive(serde::Deserialize)]
+        struct MgmtReq {
+            cert_pem: String,
+            key_pem: String,
+            #[serde(default)]
+            name: String,
+            #[serde(default)]
+            subject: String,
+            #[serde(default)]
+            issuer: String,
+            #[serde(default)]
+            san: Vec<String>,
+            #[serde(default)]
+            issued_at: u64,
+            #[serde(default)]
+            expires_at: u64,
+            #[serde(default)]
+            fingerprint: String,
+            #[serde(default)]
+            key_type: String,
+        }
+        let r: MgmtReq = match serde_json::from_slice(&body_bytes) {
+            Ok(r) => r,
+            Err(e) => return json_err(StatusCode::BAD_REQUEST, &format!("invalid JSON: {e}")),
+        };
+        let display_name = if r.name.is_empty() {
+            if r.subject.is_empty() { "Management TLS".to_string() } else { r.subject.clone() }
+        } else {
+            r.name
+        };
+        let meta = tls::CertMeta {
+            domain: tls::MANAGEMENT_CERT_KEY.to_string(),
+            name: display_name,
+            san: r.san,
+            issued_at: r.issued_at,
+            expires_at: r.expires_at,
+            fingerprint: r.fingerprint,
+            source: tls::CertSource::Manual,
+            issuer: r.issuer,
+            key_type: r.key_type,
+        };
+        return match state
+            .cert_manager
+            .store
+            .install_management(&r.cert_pem, &r.key_pem, meta)
+        {
+            Ok(prev) => json_ok(serde_json::json!({"installed": true, "previous_fingerprint": prev})),
+            Err(e) => json_err(StatusCode::BAD_REQUEST, &format!("{e:#}")),
+        };
+    }
+
+    json_err(StatusCode::METHOD_NOT_ALLOWED, "unsupported method")
 }
 
 fn json_ok(value: serde_json::Value) -> Response<BoxBody> {

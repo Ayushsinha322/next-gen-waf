@@ -33,7 +33,21 @@ pub struct CertMeta {
     /// SHA-256 fingerprint of the leaf cert (hex, lower-case).
     pub fingerprint: String,
     pub source: CertSource,
+    /// Issuer common name (filled by the validating uploader; empty = unknown).
+    #[serde(default)]
+    pub issuer: String,
+    /// Key type label, e.g. "ECDSA P-256" / "RSA 2048" (empty = unknown).
+    #[serde(default)]
+    pub key_type: String,
 }
+
+/// Reserved cert key for the management-console certificate. Kept out of the
+/// customer-facing cert repository listing so it can't be renamed/deleted there.
+pub const MANAGEMENT_CERT_KEY: &str = "__management__";
+
+/// Cert store keys beginning with this prefix are internal (e.g. the management
+/// cert) and are hidden from the customer cert repository listing.
+const RESERVED_PREFIX: &str = "__";
 
 impl CertMeta {
     pub fn days_until_expiry(&self) -> i64 {
@@ -127,6 +141,8 @@ impl CertStore {
                     expires_at: 0,
                     fingerprint: String::new(),
                     source: CertSource::Manual,
+                    issuer: String::new(),
+                    key_type: String::new(),
                 }
             };
 
@@ -202,13 +218,94 @@ impl CertStore {
         Ok(())
     }
 
-    /// All cert metadata (for the dashboard API).
+    /// All cert metadata for the customer cert repository (the dashboard API).
+    /// Internal/reserved certs (e.g. the management cert) are hidden so they
+    /// can't be listed, renamed, or deleted from the customer cert page.
     pub fn all_meta(&self) -> Vec<CertMeta> {
-        self.live.iter().map(|e| e.value().meta.clone()).collect()
+        self.live
+            .iter()
+            .filter(|e| !e.key().starts_with(RESERVED_PREFIX))
+            .map(|e| e.value().meta.clone())
+            .collect()
     }
 
     pub fn get_meta(&self, domain: &str) -> Option<CertMeta> {
         self.live.get(domain).map(|e| e.value().meta.clone())
+    }
+
+    /// Install (or replace) the management-console certificate, hot-swapped with
+    /// zero downtime. Unlike `install`, this writes the PEM files **atomically**
+    /// (temp file + rename) and only swaps the live key after the new PEM has
+    /// successfully parsed — so a bad upload can never leave a half-written or
+    /// mismatched cert on disk or in memory. Returns the previous fingerprint
+    /// (if any) so the caller can record an audit old→new transition.
+    pub fn install_management(
+        &self,
+        cert_pem: &str,
+        key_pem: &str,
+        meta: CertMeta,
+    ) -> Result<Option<String>> {
+        // 1. Parse + build the signing key FIRST, and verify the private key
+        //    actually matches the leaf cert (defense-in-depth: the control plane
+        //    validates this too, but a direct internal-API call must not be able
+        //    to install a mismatched pair). Bail before touching disk/live store.
+        let ck = load_pem_bytes(cert_pem.as_bytes(), key_pem.as_bytes())
+            .context("management cert PEM failed to load")?;
+        ck.keys_match()
+            .map_err(|e| anyhow::anyhow!("private key does not match certificate: {e}"))?;
+
+        let prev_fp = self
+            .live
+            .get(MANAGEMENT_CERT_KEY)
+            .map(|e| e.value().meta.fingerprint.clone());
+
+        // 2. Atomic disk write with restore-on-failure. Snapshot the existing
+        //    files first; if any write fails, restore the snapshot so disk never
+        //    ends up with a mismatched new-cert/old-key pair.
+        let dir = self.cert_dir.join(domain_to_dirname(MANAGEMENT_CERT_KEY));
+        std::fs::create_dir_all(&dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        let meta_path = dir.join("meta.json");
+        let snapshot: Vec<(PathBuf, Option<Vec<u8>>)> = [&cert_path, &key_path, &meta_path]
+            .iter()
+            .map(|p| ((*p).clone(), std::fs::read(p).ok()))
+            .collect();
+
+        let meta_json = serde_json::to_string_pretty(&meta)?;
+        let write_res = (|| -> Result<()> {
+            write_atomic(&cert_path, cert_pem.as_bytes())?;
+            write_atomic(&key_path, key_pem.as_bytes())?;
+            write_atomic(&meta_path, meta_json.as_bytes())?;
+            Ok(())
+        })();
+        if let Err(e) = write_res {
+            // Restore the previous on-disk state (or remove if there was none).
+            for (p, prev) in &snapshot {
+                match prev {
+                    Some(bytes) => { let _ = write_atomic(p, bytes); }
+                    None => { let _ = std::fs::remove_file(p); }
+                }
+            }
+            return Err(e).context("installing management cert (restored previous on-disk state)");
+        }
+
+        // 3. Hot-swap the live entry — picked up on the next TLS handshake.
+        self.live
+            .insert(MANAGEMENT_CERT_KEY.to_string(), Arc::new(CertEntry { key: ck, meta }));
+        tracing::info!("management TLS cert installed and hot-swapped");
+        Ok(prev_fp)
+    }
+
+    /// Revert the management cert to the built-in self-signed default (removes
+    /// the uploaded management cert from disk + the live store).
+    pub fn revert_management(&self) -> Result<()> {
+        self.remove(MANAGEMENT_CERT_KEY)
     }
 
     // ── TLS-ALPN-01 challenge helpers ─────────────────────────────────────────
@@ -246,6 +343,9 @@ pub struct SentinelCertResolver {
     store: Arc<CertStore>,
     /// Self-signed fallback (generated once per domain, cached).
     fallback: Mutex<HashMap<String, Arc<CertifiedKey>>>,
+    /// When set, every handshake resolves THIS store key regardless of SNI.
+    /// Used by the management listener to always serve the management cert.
+    fixed_key: Option<String>,
 }
 
 impl std::fmt::Debug for SentinelCertResolver {
@@ -259,6 +359,19 @@ impl SentinelCertResolver {
         Arc::new(Self {
             store,
             fallback: Mutex::new(HashMap::new()),
+            fixed_key: None,
+        })
+    }
+
+    /// Resolver that always serves the cert stored under `key` (ignoring SNI),
+    /// falling back to a self-signed cert for `key` until one is uploaded. This
+    /// backs the management listener: it's a single-purpose HTTPS endpoint, so
+    /// there's no SNI multiplexing — one cert, hot-swappable.
+    pub fn new_fixed(store: Arc<CertStore>, key: &str) -> Arc<Self> {
+        Arc::new(Self {
+            store,
+            fallback: Mutex::new(HashMap::new()),
+            fixed_key: Some(key.to_string()),
         })
     }
 
@@ -280,6 +393,21 @@ impl ResolvesServerCert for SentinelCertResolver {
         &self,
         client_hello: rustls::server::ClientHello<'_>,
     ) -> Option<Arc<CertifiedKey>> {
+        // Fixed-key mode (management listener): always serve the one configured
+        // cert, regardless of SNI, with a self-signed fallback until uploaded.
+        if let Some(key) = &self.fixed_key {
+            if let Some(ck) = self.store.resolve_live(key) {
+                return Some(ck);
+            }
+            let mut fb = self.fallback.lock().expect("fallback lock");
+            if let Some(ck) = fb.get(key) {
+                return Some(Arc::clone(ck));
+            }
+            let ck = generate_self_signed(key).ok()?;
+            fb.insert(key.clone(), Arc::clone(&ck));
+            return Some(ck);
+        }
+
         // Clients connecting by bare IP (and some older clients) send no SNI.
         // Serve a stable default self-signed cert so the handshake still
         // completes — Host-header routing then selects the site. Without this,
@@ -360,4 +488,114 @@ pub fn load_pem_bytes(cert_pem: &[u8], key_pem: &[u8]) -> Result<Arc<CertifiedKe
 
 fn domain_to_dirname(domain: &str) -> String {
     domain.replace('*', "_wildcard_").replace(['/', '\\'], "_")
+}
+
+/// Write `bytes` to `path` atomically and owner-only (0600): write to a sibling
+/// temp file created with mode 0600, fsync, then rename over the target (atomic
+/// on the same filesystem). Prevents a crash/partial write from leaving a
+/// truncated cert or key, and never leaves a private key world-readable. The
+/// temp file is removed on any failure.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension("tmp");
+
+    let res = (|| -> Result<()> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts
+            .open(&tmp)
+            .with_context(|| format!("creating temp file {}", tmp.display()))?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(e) = res {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(anyhow::Error::from(e)
+            .context(format!("renaming {} -> {}", tmp.display(), path.display())));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+
+    fn tmp_store() -> Arc<CertStore> {
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join(format!("sentinel-certtest-{}-{}", std::process::id(), n));
+        let _ = std::fs::remove_dir_all(&dir);
+        CertStore::new(dir)
+    }
+
+    fn self_signed_pem(cn: &str) -> (String, String) {
+        let cert = rcgen::generate_simple_self_signed(vec![cn.to_string()]).unwrap();
+        (cert.serialize_pem().unwrap(), cert.serialize_private_key_pem())
+    }
+
+    fn meta(fp: &str) -> CertMeta {
+        CertMeta {
+            domain: MANAGEMENT_CERT_KEY.to_string(),
+            name: "Mgmt".into(),
+            san: vec!["mgmt.test".into()],
+            issued_at: 1,
+            expires_at: 2,
+            fingerprint: fp.into(),
+            source: CertSource::Manual,
+            issuer: "Test CA".into(),
+            key_type: "ECDSA P-256".into(),
+        }
+    }
+
+    #[test]
+    fn management_cert_install_get_hidden_and_revert() {
+        let store = tmp_store();
+        let (cert, key) = self_signed_pem("mgmt.test");
+
+        // First install: no previous fingerprint.
+        let prev = store.install_management(&cert, &key, meta("fp1")).unwrap();
+        assert_eq!(prev, None);
+
+        // Readable via the dedicated getter, with the extended metadata.
+        let got = store.get_meta(MANAGEMENT_CERT_KEY).unwrap();
+        assert_eq!(got.issuer, "Test CA");
+        assert_eq!(got.key_type, "ECDSA P-256");
+        assert_eq!(got.fingerprint, "fp1");
+
+        // Hidden from the customer cert repository listing.
+        assert!(store.all_meta().iter().all(|m| m.domain != MANAGEMENT_CERT_KEY));
+
+        // Re-install returns the previous fingerprint (for audit old→new).
+        let (cert2, key2) = self_signed_pem("mgmt.test");
+        let prev2 = store.install_management(&cert2, &key2, meta("fp2")).unwrap();
+        assert_eq!(prev2, Some("fp1".to_string()));
+
+        // Revert removes it → resolver falls back to self-signed.
+        store.revert_management().unwrap();
+        assert!(store.get_meta(MANAGEMENT_CERT_KEY).is_none());
+    }
+
+    #[test]
+    fn install_management_rejects_malformed_pem() {
+        let store = tmp_store();
+        assert!(store
+            .install_management("not a cert", "not a key", meta("x"))
+            .is_err());
+        // Nothing installed on failure.
+        assert!(store.get_meta(MANAGEMENT_CERT_KEY).is_none());
+    }
 }

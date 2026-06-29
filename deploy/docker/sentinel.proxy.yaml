@@ -31,6 +31,16 @@ listeners:
     bind: "0.0.0.0:8443"
     protocol: [http1, http2]
     tls: {}
+  # Dedicated MANAGEMENT listener (admin console). Served by Sentinel's own
+  # engine — no third-party proxy. Bypasses the WAF pipeline and reverse-proxies
+  # the admin UI: /api/* → control plane, everything else → dashboard. Presents
+  # the hot-swappable management certificate (self-signed until one is uploaded
+  # via Settings → Management TLS). Upstreams come from SENTINEL_MGMT_*_UPSTREAM.
+  - name: management
+    bind: "0.0.0.0:9443"
+    protocol: [http1, http2]
+    tls: {}
+    role: management
 
 sites: []
 

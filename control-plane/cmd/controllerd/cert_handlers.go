@@ -2,7 +2,12 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -230,4 +235,76 @@ func proxyToDataPlane(c *gin.Context, method, path string, payload any) {
 	raw, _ := io.ReadAll(resp.Body)
 	// Relay the data plane's JSON body and status verbatim.
 	c.Data(resp.StatusCode, "application/json", raw)
+}
+
+// ---------------------------------------------------------------------------
+// Root CA download — lets internal users TRUST the WAF's management/IP cert.
+//
+// On an internal deployment the WAF presents a private-CA cert on bare-IP
+// (no-SNI) HTTPS, so browsers warn until the client imports our Root CA once.
+// These endpoints hand out that PUBLIC root cert (never the private key) so a
+// user can install it as a trusted root authority and get a green lock. The
+// file path is provided by SENTINEL_ROOT_CA_PATH (mounted read-only); when
+// unset/missing the dashboard simply hides the download.
+// ---------------------------------------------------------------------------
+
+// loadRootCA reads the configured root CA PEM and (best-effort) parses the leaf
+// for metadata. Returns the raw PEM, the parsed cert (may be nil), and an error.
+func loadRootCA() ([]byte, *x509.Certificate, error) {
+	p := os.Getenv("SENTINEL_ROOT_CA_PATH")
+	if p == "" {
+		return nil, nil, fmt.Errorf("root CA not configured")
+	}
+	pemBytes, err := os.ReadFile(p)
+	if err != nil {
+		return nil, nil, fmt.Errorf("root CA unavailable: %w", err)
+	}
+	block, _ := pem.Decode(pemBytes)
+	if block == nil {
+		return pemBytes, nil, fmt.Errorf("root CA file is not valid PEM")
+	}
+	crt, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return pemBytes, nil, fmt.Errorf("parse root CA: %w", err)
+	}
+	return pemBytes, crt, nil
+}
+
+// GET /api/v1/certs/root-ca/info — metadata so the dashboard can show/hide the
+// download and display the CA's subject + expiry.
+func handleRootCAInfo(c *gin.Context, enf *rbac.Enforcer) {
+	claims, _ := auth.GetClaims(c.Request.Context())
+	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceSite, rbac.ActionRead) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
+		return
+	}
+	_, crt, err := loadRootCA()
+	if err != nil || crt == nil {
+		c.JSON(http.StatusOK, gin.H{"available": false})
+		return
+	}
+	sum := sha256.Sum256(crt.Raw)
+	c.JSON(http.StatusOK, gin.H{
+		"available":   true,
+		"subject":     crt.Subject.CommonName,
+		"not_after":   crt.NotAfter.Unix(),
+		"fingerprint": hex.EncodeToString(sum[:]),
+		"filename":    "sentinel-root-ca.crt",
+	})
+}
+
+// GET /api/v1/certs/root-ca — download the public Root CA PEM.
+func handleDownloadRootCA(c *gin.Context, enf *rbac.Enforcer) {
+	claims, _ := auth.GetClaims(c.Request.Context())
+	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceSite, rbac.ActionRead) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
+		return
+	}
+	pemBytes, _, err := loadRootCA()
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	c.Header("Content-Disposition", `attachment; filename="sentinel-root-ca.crt"`)
+	c.Data(http.StatusOK, "application/x-pem-file", pemBytes)
 }

@@ -50,6 +50,7 @@ const (
 	ResourceAlert     = "alert"
 	ResourceAudit     = "audit_log"
 	ResourceNotification = "notification" // notification channels (webhook/syslog/cef)
+	ResourceManagementTLS = "management_tls" // management-console TLS certificate
 )
 
 // Action verbs.
@@ -108,6 +109,8 @@ var rolePermissions = map[Role]map[string]struct{}{
 		perm(ResourceNotification, ActionList):   {},
 		perm(ResourceAudit, ActionRead):     {},
 		perm(ResourceAudit, ActionDownload): {},
+		perm(ResourceManagementTLS, ActionRead):   {},
+		perm(ResourceManagementTLS, ActionUpdate): {},
 	},
 	RoleAdmin: {
 		perm(ResourceUser, ActionCreate):    {},
@@ -150,6 +153,8 @@ var rolePermissions = map[Role]map[string]struct{}{
 		perm(ResourceNotification, ActionList):   {},
 		perm(ResourceAudit, ActionRead):     {},
 		perm(ResourceAudit, ActionDownload): {},
+		perm(ResourceManagementTLS, ActionRead):   {},
+		perm(ResourceManagementTLS, ActionUpdate): {},
 	},
 	RoleEditor: {
 		perm(ResourceSite, ActionCreate):    {},
@@ -177,6 +182,7 @@ var rolePermissions = map[Role]map[string]struct{}{
 		perm(ResourceNotification, ActionRead): {},
 		perm(ResourceNotification, ActionList): {},
 		perm(ResourceAudit, ActionRead):     {},
+		perm(ResourceManagementTLS, ActionRead): {},
 	},
 	RoleViewer: {
 		perm(ResourceSite, ActionRead):      {},
@@ -193,6 +199,7 @@ var rolePermissions = map[Role]map[string]struct{}{
 		perm(ResourceAlert, ActionList):     {},
 		perm(ResourceNotification, ActionRead): {},
 		perm(ResourceNotification, ActionList): {},
+		perm(ResourceManagementTLS, ActionRead): {},
 	},
 	RoleAuditor: {
 		perm(ResourceSite, ActionRead):      {},
@@ -211,6 +218,7 @@ var rolePermissions = map[Role]map[string]struct{}{
 		perm(ResourceNotification, ActionList): {},
 		perm(ResourceAudit, ActionRead):     {},
 		perm(ResourceAudit, ActionDownload): {},
+		perm(ResourceManagementTLS, ActionRead): {},
 	},
 }
 

@@ -86,6 +86,8 @@ impl CertManager {
                 provider: format!("{:?}", config.provider),
                 email: config.email.clone(),
             },
+            issuer: String::new(),
+            key_type: String::new(),
         };
         self.store.install(&primary, &cert_pem, &key_pem, meta)
     }
@@ -102,6 +104,8 @@ impl CertManager {
             expires_at,
             fingerprint: fingerprint(cert_pem),
             source: CertSource::Manual,
+            issuer: String::new(),
+            key_type: String::new(),
         };
         self.store.install(domain, cert_pem, key_pem, meta)
     }

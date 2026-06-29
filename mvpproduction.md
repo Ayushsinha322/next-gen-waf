@@ -188,7 +188,7 @@ curl -s -G "http://172.16.21.71/" --data-urlencode "q=1' OR '1'='1" -o /dev/null
 ## 8. Follow-ups (not blockers for the demo)
 - [ ] **Rotate the VM root password** (was pasted in plaintext for key setup).
 - [ ] **Change `admin123`** dashboard password after first login.
-- [ ] **TLS** — currently HTTP on `:80`. Internal IP (no public domain) rules out Let's Encrypt; options: self-signed cert + `:443` listener, or front with a cert-terminating proxy.
+- [x] **TLS** — ✅ DONE. HTTPS on `:443` via the SNI cert resolver. Internal IP (no public domain) rules out Let's Encrypt, so we stood up a **private CA** (*Sentinel WAF Internal Root CA*, on the VM at `/opt/sentinel-pki/`) and issued a **real CA-signed cert for the bare IP** (IP SAN `172.16.21.71`, valid to Oct 2028), staged into the cert repo under the `default` key (served on no-SNI/IP connections). Browsers warn until clients import `root.crt` (then green lock); re-issue with `/opt/sentinel-pki/issue-ip-cert.sh`. Full operator steps in `OPERATIONS.md §9`.
 - [ ] **ClickHouse + MinIO** if the demo needs Threat Search / log analytics (add as compose services).
 - [ ] **K8s migration** — reuse `sentinel/controlplane`, `sentinel/dataplane`, `sentinel/dashboard` images; translate compose → Deployments/Services; push images to a registry; move secrets to K8s Secrets; harden `securityContext`.
 
@@ -206,7 +206,9 @@ All three images built; all 6 containers up. Verified end-to-end:
 | Proxied login `POST /api/v1/auth/login` | **200** + JWT (after dashboard build-arg fix) |
 | WAF benign `GET http://172.16.21.71/` | **200** (Juice Shop via proxy) |
 | WAF SQLi / XSS / path-traversal | **403 blocked** |
+| HTTPS `GET https://172.16.21.71/` (trust via our root, no `-k`) | **200** — cert chain verifies (return code 0) |
+| HTTPS SQLi | **403 blocked** over TLS |
 
-**Access:** dashboard `http://172.16.21.71:3000` · login `admin@sentinel.local` / `admin123` · protected app `http://172.16.21.71/`.
+**Access:** dashboard `http://172.16.21.71:3000` · login `admin@sentinel.local` / `Admin@123#` · protected app `http://172.16.21.71/` or `https://172.16.21.71/`.
 
-Immediate follow-ups before showing anyone externally: rotate VM root password, change `admin123`, add TLS (§8).
+Follow-ups done since: VM root password rotated, admin password changed to `Admin@123#`, TLS live with a real internal-CA cert (§8). Remaining: ClickHouse/MinIO (if Threat Search needed), migrations-as-code, K8s migration.

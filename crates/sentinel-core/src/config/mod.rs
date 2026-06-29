@@ -137,6 +137,26 @@ pub struct ListenerConfig {
     /// to this site ID — enables port-based routing (e.g. :9095 → dvwa).
     #[serde(default)]
     pub default_site: Option<String>,
+    /// Listener role. `normal` (default) runs the full WAF pipeline and routes
+    /// to customer sites by Host. `management` turns this listener into the
+    /// dedicated management endpoint: it bypasses the WAF pipeline, presents the
+    /// hot-swappable management certificate, and reverse-proxies the admin UI
+    /// (path `/api/*` → control plane, everything else → dashboard).
+    #[serde(default)]
+    pub role: ListenerRole,
+}
+
+/// What a listener is for. Mirrors the F5 "management interface vs data plane"
+/// separation: customer traffic and the appliance's own admin console are
+/// served by the same engine but on distinct listeners with distinct certs.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ListenerRole {
+    /// Customer-facing WAF listener: full pipeline, Host-routed to sites.
+    #[default]
+    Normal,
+    /// Dedicated management console listener (admin UI + API over HTTPS).
+    Management,
 }
 
 impl ListenerConfig {
@@ -149,6 +169,10 @@ impl ListenerConfig {
 
     pub fn is_tls(&self) -> bool {
         self.tls.is_some()
+    }
+
+    pub fn is_management(&self) -> bool {
+        self.role == ListenerRole::Management
     }
 }
 

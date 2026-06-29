@@ -287,6 +287,12 @@ func run() error {
 
 		// TLS / ACME certificate management — bridges to the data-plane internal API.
 		protected.GET("/certs", func(c *gin.Context) { handleListCerts(c, enforcer) })
+		protected.GET("/certs/root-ca", func(c *gin.Context) { handleDownloadRootCA(c, enforcer) })
+		protected.GET("/certs/root-ca/info", func(c *gin.Context) { handleRootCAInfo(c, enforcer) })
+		// Management-console TLS (the cert the admin UI itself is served with).
+		protected.GET("/management-tls", func(c *gin.Context) { handleGetManagementTLS(c, enforcer) })
+		protected.POST("/management-tls", func(c *gin.Context) { handleUploadManagementTLS(c, enforcer, store, hub) })
+		protected.DELETE("/management-tls", func(c *gin.Context) { handleRevertManagementTLS(c, enforcer, store, hub) })
 		protected.POST("/certs/manual", func(c *gin.Context) { handleUploadManualCert(c, enforcer) })
 		protected.POST("/certs/acme", func(c *gin.Context) { handleRequestAcmeCert(c, enforcer) })
 		protected.POST("/certs/:domain/renew", func(c *gin.Context) { handleRenewCert(c, enforcer) })
