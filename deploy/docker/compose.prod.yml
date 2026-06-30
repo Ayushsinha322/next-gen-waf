@@ -3,7 +3,8 @@
 #
 #   postgres + redis  → control-plane backing stores
 #   clickhouse        → on-prem traffic/event log store (powers Threat Search)
-#   controlplane      → REST :9501 / gRPC :9500, migrates+seeds DB on boot
+#   migrate           → one-shot goose DB migrations (runs to completion first)
+#   controlplane      → REST :9501 / gRPC :9500, seeds DB on boot (after migrate)
 #   dataplane         → Rust WAF proxy, host :80 -> container :8080
 #   dashboard         → Next.js UI on :3000
 #   juiceshop         → demo upstream to protect (internal only)
@@ -63,12 +64,31 @@ services:
     volumes:
       - chdata:/var/lib/clickhouse
     healthcheck:
-      # /ping needs no auth; busybox wget ships in the alpine image.
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8123/ping | grep -q Ok || exit 1"]
+      # /ping needs no auth; busybox wget ships in the alpine image. Use the
+      # IPv4 loopback explicitly: this host is IPv4-only and `localhost` resolves
+      # to ::1 first, where ClickHouse can't bind (IPv6 disabled) → false-unhealthy.
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8123/ping | grep -q Ok || exit 1"]
       interval: 10s
       timeout: 3s
       retries: 30
       start_period: 20s
+    networks: [sentinel]
+
+  # One-shot DB migrations (goose). Runs to completion before the control plane
+  # starts, so its SeedDev finds the schema. The control plane does NOT migrate
+  # on boot — it only seeds. goose `up` is idempotent (no-op once current).
+  migrate:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+      target: sentinel-migrate
+    image: sentinel/migrate:latest
+    restart: "no"
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      # goose reads GOOSE_DBSTRING; the SENTINEL_DB_URL DSN form works as-is.
+      GOOSE_DBSTRING: ${SENTINEL_DB_URL}
     networks: [sentinel]
 
   controlplane:
@@ -83,8 +103,12 @@ services:
     user: "0:0"
     depends_on:
       postgres: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
       redis: { condition: service_healthy }
-      clickhouse: { condition: service_healthy }
+      # service_started (not _healthy): never gate the control plane on the
+      # analytics store's health. The reader degrades gracefully; the writer
+      # self-heals. (A broken CH healthcheck previously gated and downed the stack.)
+      clickhouse: { condition: service_started }
     environment:
       SENTINEL_DB_URL: ${SENTINEL_DB_URL}
       SENTINEL_REDIS_URL: redis://redis:6379
@@ -134,17 +158,20 @@ services:
     user: "0:0"
     depends_on:
       controlplane: { condition: service_started }
-      redis: { condition: service_healthy }
-      clickhouse: { condition: service_healthy }
+      # service_started, not _healthy: the WAF must boot regardless of ClickHouse.
+      # The proxy's history writer self-heals (background reconnect with backoff),
+      # so it starts persisting once CH is reachable — no restart, no WAF gating.
+      clickhouse: { condition: service_started }
     environment:
       SENTINEL_CONFIG: /etc/sentinel/sentinel.yaml
       SENTINEL_LOG_DIR: /var/log/sentinel
       RUST_LOG: info,sentinel=info
       # Shared secret so the control plane can reach the loopback-only cert API.
       SENTINEL_INTERNAL_SECRET: ${SENTINEL_INTERNAL_SECRET}
-      # Redis backend → distributed rate limiting across WAF nodes (falls back
-      # to in-process counters if unreachable). Overlaid on the proxy YAML.
-      SENTINEL_REDIS_URL: redis://redis:6379
+      # NOTE: SENTINEL_REDIS_URL is intentionally NOT set here. This is a single
+      # data-plane node, so the in-process token-bucket rate limiter is correct;
+      # pointing it at Redis would switch to sliding-window semantics + a per-
+      # request round-trip for no benefit. Set it only for a multi-node fleet.
       # ClickHouse writer → the proxy bulk-inserts traffic_buckets + waf_events
       # (creates the schema on first connect). Same Secret as the reader above
       # so both planes agree; keeps the CH password out of the committed YAML.

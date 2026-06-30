@@ -35,7 +35,11 @@ data:
   SENTINEL_MGMT_DASHBOARD_UPSTREAM: http://dashboard:3000
 
   # ── shared backing stores (Service DNS within the namespace) ─────────────────
-  SENTINEL_REDIS_URL: redis://redis:6379
+  # NOTE: SENTINEL_REDIS_URL is intentionally NOT set. The control plane does not
+  # use Redis, and this edge runs a single data-plane replica, so the in-process
+  # token-bucket rate limiter is correct. Set SENTINEL_REDIS_URL=redis://redis:6379
+  # ONLY on the dataplane container if you scale the data plane to multiple nodes
+  # (and re-tune rps/burst for sliding-window semantics).
   # ClickHouse powers Threat Search: the data plane WRITES, the control plane
   # READS. Password comes from the Secret (SENTINEL_CLICKHOUSE_PASSWORD).
   SENTINEL_CLICKHOUSE_URL: http://clickhouse:8123

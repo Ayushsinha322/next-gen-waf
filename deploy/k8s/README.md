@@ -98,14 +98,18 @@ Make the images available to every node. Either:
 ```bash
 cd deploy/k8s
 
-# 1) Secret (never committed)
+# 1) Namespace FIRST — the Secret and every resource live in it, and
+#    `kubectl apply -f secrets.yaml` fails if the namespace doesn't exist yet.
+kubectl apply -f 00-namespace.yaml
+
+# 2) Secret (never committed)
 cp 11-secrets.example.yaml secrets.yaml
 #    edit secrets.yaml — replace every CHANGE_ME (openssl rand -hex 24 / -hex 64),
 #    keep CLICKHOUSE_PASSWORD == SENTINEL_CLICKHOUSE_PASSWORD, embed the postgres
 #    password in SENTINEL_DB_URL.
 kubectl apply -f secrets.yaml
 
-# 2) Everything else
+# 3) Everything else (re-applies the namespace harmlessly)
 kubectl apply -k .
 ```
 

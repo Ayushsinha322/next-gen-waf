@@ -698,7 +698,9 @@ func handleInternalConfig(c *gin.Context, store *db.Store) {
 // returns a summary the dashboard can use for live status.
 func handleProxyHealth(c *gin.Context) {
 	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get("http://localhost:9080/healthz")
+	// Probe the data plane at its configured base URL (SENTINEL_DATAPLANE_URL),
+	// not a hardcoded port: prod/K8s bind :8080, only the dev config uses :9080.
+	resp, err := client.Get(dataPlaneBaseURL() + "/healthz")
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{"waf_running": false, "error": err.Error()})
 		return

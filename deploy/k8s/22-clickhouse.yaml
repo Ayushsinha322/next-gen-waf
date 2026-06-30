@@ -44,13 +44,15 @@ spec:
           volumeMounts:
             - { name: chdata, mountPath: /var/lib/clickhouse }
           readinessProbe:
-            # /ping needs no auth; busybox wget ships in the alpine image.
-            exec: { command: ["sh", "-c", "wget -qO- http://localhost:8123/ping | grep -q Ok"] }
+            # /ping needs no auth; busybox wget ships in the alpine image. Use the
+            # IPv4 loopback explicitly — `localhost` may resolve to ::1 where
+            # ClickHouse can't bind on IPv4-only nodes (false-negative probe).
+            exec: { command: ["sh", "-c", "wget -qO- http://127.0.0.1:8123/ping | grep -q Ok"] }
             initialDelaySeconds: 10
             periodSeconds: 10
             timeoutSeconds: 3
           livenessProbe:
-            exec: { command: ["sh", "-c", "wget -qO- http://localhost:8123/ping | grep -q Ok"] }
+            exec: { command: ["sh", "-c", "wget -qO- http://127.0.0.1:8123/ping | grep -q Ok"] }
             initialDelaySeconds: 30
             periodSeconds: 15
             timeoutSeconds: 3
