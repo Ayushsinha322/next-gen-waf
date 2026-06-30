@@ -411,8 +411,12 @@ impl ProxyServer {
         // Connect storage backends (Redis for distributed rate limiting,
         // ClickHouse for traffic history).  Missing/unreachable backends
         // degrade gracefully — the rate limiter falls back to in-memory.
+        // File config first, then SENTINEL_CLICKHOUSE_*/SENTINEL_REDIS_URL env
+        // overlay so the data plane is configured identically to the Go control
+        // plane (same Secret in compose/K8s; no CH password in the proxy YAML).
         let storage = sentinel_storage::StorageHandle::connect(
-            &sentinel_storage::StorageBackendConfig::from_core(&cfg.storage),
+            &sentinel_storage::StorageBackendConfig::from_core(&cfg.storage)
+                .with_env_overrides(),
         )
         .await;
         if storage.has_redis() {
