@@ -1,0 +1,8 @@
+# Sentinel WAF — Kubernetes namespace.
+# Everything in this directory deploys into the `sentinel` namespace.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sentinel
+  labels:
+    app.kubernetes.io/part-of: sentinel-waf

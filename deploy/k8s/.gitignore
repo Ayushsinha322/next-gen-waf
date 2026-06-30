@@ -1,0 +1,5 @@
+# Never commit real secrets. Edit a copy of 11-secrets.example.yaml.
+secrets.yaml
+*.secret.yaml
+# Optional Root CA ConfigMap if generated locally (see README "Root CA download").
+root-ca-configmap.yaml

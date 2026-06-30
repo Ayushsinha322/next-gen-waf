@@ -1,0 +1,146 @@
+# ============================================================================
+# Sentinel WAF "edge" pod — the data plane (Rust proxy) and control plane (Go)
+# run as TWO containers in ONE pod, sharing an emptyDir at /var/log/sentinel.
+#
+# WHY co-located (and not two Deployments)?
+#   The control-plane log hub TAILS the NDJSON the data-plane proxy writes. That
+#   stream feeds live dashboard logs, the overview/per-site metrics, the
+#   learning report AND the alert engine. In compose they share a named volume;
+#   the faithful K8s equivalent on RWO (local-path) storage is a shared emptyDir
+#   inside one pod. (Threat Search is independent — the proxy writes ClickHouse
+#   and the control plane reads it over the network, so that works either way.)
+#
+#   Consequence: replicas is pinned to 1. Running N copies would mean N alert
+#   engines (duplicate alerts) racing on the same Postgres. Horizontally scaling
+#   the data plane is a later step that needs the hub to ingest events over the
+#   network (e.g. ClickHouse/gRPC) instead of a shared file — see README.
+# ============================================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sentinel-certs
+  namespace: sentinel
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources: { requests: { storage: 2Gi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinel-edge
+  namespace: sentinel
+spec:
+  replicas: 1                 # MUST stay 1 — see header note.
+  strategy:
+    type: Recreate            # RWO certs PVC can't be held by two pods at once.
+  selector: { matchLabels: { app: sentinel-edge } }
+  template:
+    metadata:
+      labels: { app: sentinel-edge }
+    spec:
+      # Migrations-as-code: bring the schema current BEFORE the control plane
+      # starts (so its idempotent SeedDev finds the tables). goose `up` is a
+      # no-op once current; the retry loop waits for Postgres to accept conns.
+      initContainers:
+        - name: migrate
+          image: sentinel/migrate:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              n=0
+              until goose up; do
+                n=$((n+1))
+                if [ "$n" -ge 60 ]; then echo "migrate: giving up after $n tries"; exit 1; fi
+                echo "migrate: database not ready, retry $n…"; sleep 3
+              done
+          env:
+            - { name: GOOSE_DBSTRING, valueFrom: { secretKeyRef: { name: sentinel-secrets, key: SENTINEL_DB_URL } } }
+      containers:
+        # ── Control plane (Go) ────────────────────────────────────────────────
+        - name: controlplane
+          image: sentinel/controlplane:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef: { name: sentinel-env }
+            - secretRef:    { name: sentinel-secrets }
+          ports:
+            - { name: rest, containerPort: 9501 }
+            - { name: grpc, containerPort: 9500 }
+          volumeMounts:
+            - { name: logs, mountPath: /var/log/sentinel }
+          readinessProbe:
+            httpGet: { path: /health, port: 9501 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits:   { memory: "512Mi" }
+        # ── Data plane (Rust WAF proxy) ───────────────────────────────────────
+        - name: dataplane
+          image: sentinel/dataplane:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef: { name: sentinel-env }
+            - secretRef:    { name: sentinel-secrets }
+          ports:
+            - { name: http,  containerPort: 8080 }
+            - { name: https, containerPort: 8443 }
+            - { name: mgmt,  containerPort: 9443 }
+          volumeMounts:
+            - { name: proxy-config, mountPath: /etc/sentinel/sentinel.yaml, subPath: sentinel.yaml, readOnly: true }
+            - { name: certs, mountPath: /var/lib/sentinel/certs }
+            - { name: logs,  mountPath: /var/log/sentinel }
+          readinessProbe:
+            tcpSocket: { port: 8080 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "250m", memory: "256Mi" }
+            limits:   { memory: "1Gi" }
+      volumes:
+        - name: logs
+          emptyDir: {}        # scratch shared between the two containers (live tail)
+        - name: proxy-config
+          configMap: { name: sentinel-proxy-config }
+        - name: certs
+          persistentVolumeClaim: { claimName: sentinel-certs }
+---
+# Internal-only control-plane Service (REST + gRPC). Not exposed externally —
+# browsers reach the API/SSE through the data plane's :9443 management listener.
+apiVersion: v1
+kind: Service
+metadata:
+  name: controlplane
+  namespace: sentinel
+  labels: { app: sentinel-edge }
+spec:
+  type: ClusterIP
+  selector: { app: sentinel-edge }
+  ports:
+    - { name: rest, port: 9501, targetPort: 9501 }
+    - { name: grpc, port: 9500, targetPort: 9500 }
+---
+# External WAF entrypoint via MetalLB. One LoadBalancer VIP serves:
+#   :80   public HTTP            → proxy :8080
+#   :443  public HTTPS (SNI)     → proxy :8443
+#   :9443 management console     → proxy :9443 (admin UI + API + SSE)
+apiVersion: v1
+kind: Service
+metadata:
+  name: sentinel-waf
+  namespace: sentinel
+  labels: { app: sentinel-edge }
+  annotations:
+    # Pin a stable VIP from your MetalLB pool (see 90-metallb-pool.example.yaml).
+    # Must match the host baked into the dashboard image's NEXT_PUBLIC URL.
+    metallb.universe.tf/loadBalancerIPs: "172.16.21.80"
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local   # preserve real client IPs for the WAF
+  selector: { app: sentinel-edge }
+  ports:
+    - { name: http,  port: 80,   targetPort: 8080 }
+    - { name: https, port: 443,  targetPort: 8443 }
+    - { name: mgmt,  port: 9443, targetPort: 9443 }

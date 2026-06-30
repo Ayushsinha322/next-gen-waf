@@ -1,0 +1,35 @@
+# Juice Shop — DEMO upstream the WAF protects (matches the compose stack).
+# Internal only. Remove this file (and its kustomization entry) for a real
+# deployment; point your sites at your actual upstreams via the dashboard.
+apiVersion: v1
+kind: Service
+metadata:
+  name: juiceshop
+  namespace: sentinel
+  labels: { app: juiceshop }
+spec:
+  type: ClusterIP
+  selector: { app: juiceshop }
+  ports:
+    - { name: http, port: 3000, targetPort: 3000 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: juiceshop
+  namespace: sentinel
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: juiceshop } }
+  template:
+    metadata:
+      labels: { app: juiceshop }
+    spec:
+      containers:
+        - name: juiceshop
+          image: bkimminich/juice-shop:latest
+          ports:
+            - { name: http, containerPort: 3000 }
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits:   { memory: "768Mi" }

@@ -1,0 +1,32 @@
+# ============================================================================
+# MetalLB address pool — EXAMPLE. Apply AFTER installing MetalLB.
+#
+# Prereqs:
+#   1. Install MetalLB (https://metallb.universe.tf/installation/).
+#   2. On k3s, DISABLE the bundled servicelb so it doesn't fight MetalLB:
+#        start k3s with `--disable servicelb`  (or set disable: [servicelb]).
+#      (If you'd rather keep k3s servicelb and skip MetalLB entirely, you can —
+#       the sentinel-waf LoadBalancer Service works with either; just drop the
+#       metallb loadBalancerIPs annotation in 30-sentinel-edge.yaml.)
+#
+# Pick a range on your LAN that is OUTSIDE the DHCP scope and not otherwise used.
+# The first address here (172.16.21.80) is the WAF VIP referenced by
+# 30-sentinel-edge.yaml and the dashboard image's NEXT_PUBLIC URL.
+# ============================================================================
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: sentinel-pool
+  namespace: metallb-system
+spec:
+  addresses:
+    - 172.16.21.80-172.16.21.85
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: sentinel-l2
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - sentinel-pool
