@@ -38,8 +38,13 @@ http-body-util = "0.1"
 tower = "0.5"
 rustls = "0.23"
 tokio-rustls = "0.26"
-quinn = "0.11"             # HTTP/3
-h3 = "0.0.6"
+# HTTP/3 (QUIC transport). Server-only: drop quinn's default `platform-verifier`
+# (a client-side native cert verifier that drags in jni/security-framework/windows
+# deps) and pin the ring crypto backend so QUIC matches the process-default rustls
+# provider installed in sentinel-bin (rustls::crypto::ring).
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+h3 = "0.0.8"               # HTTP/3 protocol layer
+h3-quinn = "0.0.10"        # h3 <-> quinn adapter
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
