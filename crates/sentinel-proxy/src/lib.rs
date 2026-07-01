@@ -3005,6 +3005,31 @@ fn health_response(state: &ServerState) -> Response<BoxBody> {
         .iter()
         .map(|l| format!("{}:{}", l.name, l.bind))
         .collect();
+
+    // HTTP/3 summary for the dashboard status card. Mirrors the enable logic in
+    // `serve_listener`: h3 is offered on a TLS, non-management listener whose
+    // protocol set includes Http3. The advertised UDP port is what browsers
+    // reach (SENTINEL_HTTP3_ADVERTISE_PORT, else the listener's bind port).
+    let h3_listener = cfg.listeners.iter().find(|l| {
+        l.is_tls() && !l.is_management() && l.protocols().contains(&Protocol::Http3)
+    });
+    let http3 = match h3_listener {
+        Some(l) => {
+            let bind_port = l.bind.parse::<SocketAddr>().map(|a| a.port()).unwrap_or(0);
+            let advertise_port = std::env::var("SENTINEL_HTTP3_ADVERTISE_PORT")
+                .ok()
+                .and_then(|s| s.parse::<u16>().ok())
+                .unwrap_or(bind_port);
+            serde_json::json!({
+                "enabled": true,
+                "listener": l.name,
+                "bind": l.bind,
+                "advertise_port": advertise_port,
+            })
+        }
+        None => serde_json::json!({ "enabled": false }),
+    };
+
     let pool_stats = state.upstream_pool.stats();
     let start = *START_TIME.get_or_init(SystemTime::now);
     let uptime_secs = start.elapsed().unwrap_or_default().as_secs();
@@ -3014,6 +3039,7 @@ fn health_response(state: &ServerState) -> Response<BoxBody> {
         "uptime_secs": uptime_secs,
         "sites": site_count,
         "listeners": listeners,
+        "http3": http3,
         "upstreams_healthy": pool_stats.healthy,
         "upstreams_total": pool_stats.total,
         "version": env!("CARGO_PKG_VERSION"),
@@ -3191,6 +3217,7 @@ fn record_event(ctx: &RequestContext) {
         severity: top.map(|r| format!("{:?}", r.severity).to_uppercase()).unwrap_or_default(),
         score: ctx.anomaly_score,
         status: ctx.response_status.map(|s| s.as_u16()).unwrap_or(0),
+        protocol: protocol_label(ctx.http_version).to_string(),
     };
     if let Ok(mut buf) = waf_events().lock() {
         if buf.len() < 20_000 {
@@ -3406,6 +3433,20 @@ fn ndjson_logging_enabled() -> bool {
     })
 }
 
+/// Canonical short protocol label used everywhere protocol is surfaced — NDJSON
+/// logs, the ClickHouse `waf_events.protocol` column, and the dashboard
+/// filters/facets: HTTP/1.x → `h1`, HTTP/2 → `h2`, HTTP/3 → `h3`. Keeping a
+/// single vocabulary is what lets the Threat Search facet/filter join line up
+/// across the Rust writer, the Go reader, and the UI.
+fn protocol_label(v: http::Version) -> &'static str {
+    match v {
+        http::Version::HTTP_2 => "h2",
+        http::Version::HTTP_3 => "h3",
+        // HTTP/0.9, 1.0 and 1.1 all bucket as h1.
+        _ => "h1",
+    }
+}
+
 fn ndjson_log(ctx: &RequestContext) {
     if !ndjson_logging_enabled() {
         return;
@@ -3433,11 +3474,12 @@ fn ndjson_log(ctx: &RequestContext) {
         "path":    ctx.uri.path(),
         "status":  status,
         "latency": format!("{:.2}", ctx.elapsed_ms()),
-        "bytes":   ctx.bytes_sent,
-        "site":    site,
-        "ua":      ua,
-        "action":  action,
-        "score":   ctx.anomaly_score,
+        "bytes":    ctx.bytes_sent,
+        "site":     site,
+        "protocol": protocol_label(ctx.http_version),
+        "ua":       ua,
+        "action":   action,
+        "score":    ctx.anomaly_score,
     });
     enqueue_log("access.log", access.to_string());
 
@@ -3471,6 +3513,7 @@ fn ndjson_log(ctx: &RequestContext) {
             "attack": attack,
             "action": action,
             "site":   site,
+            "protocol": protocol_label(ctx.http_version),
             "msg":    ctx.block_reason.as_deref().unwrap_or(""),
             "would_block": ctx.would_block,
             "ml_scores": ctx.ml_scores,

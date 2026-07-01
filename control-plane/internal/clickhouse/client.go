@@ -133,6 +133,7 @@ type Event struct {
 	Severity string `json:"severity"`
 	Score    int    `json:"score"`
 	Status   int    `json:"status"`
+	Protocol string `json:"protocol"`
 }
 
 type TimelineBucket struct {
@@ -148,9 +149,9 @@ type Facet struct {
 
 // SearchFilter holds the (already-untrusted) search parameters.
 type SearchFilter struct {
-	Site, Country, Rule, Action, IP, Query string
-	From, To                               int64
-	Limit                                  int
+	Site, Country, Rule, Action, IP, Protocol, Query string
+	From, To                                         int64
+	Limit                                            int
 }
 
 // ---------------------------------------------------------------------------
@@ -198,6 +199,9 @@ func (c *Client) Search(ctx context.Context, f SearchFilter) ([]Event, error) {
 	if f.IP != "" {
 		where = append(where, eq("ip", f.IP))
 	}
+	if f.Protocol != "" {
+		where = append(where, eq("protocol", strings.ToLower(f.Protocol)))
+	}
 	if f.Query != "" {
 		// substring match across path / attack / rule
 		q := esc(f.Query)
@@ -210,7 +214,7 @@ func (c *Client) Search(ctx context.Context, f SearchFilter) ([]Event, error) {
 		limit = 200
 	}
 	sql := fmt.Sprintf(
-		"SELECT toUnixTimestamp(ts) AS ts, ip, country, site, method, path, rule, attack, action, severity, score, status "+
+		"SELECT toUnixTimestamp(ts) AS ts, ip, country, site, method, path, rule, attack, action, severity, score, status, protocol "+
 			"FROM %s.waf_events WHERE %s ORDER BY ts DESC LIMIT %d",
 		c.db, strings.Join(where, " AND "), limit)
 	var out []Event
@@ -275,7 +279,7 @@ func (c *Client) timeWhere(from, to int64) []string {
 // facetColumn whitelists groupable columns (prevents SQL injection via column).
 func facetColumn(c string) (string, bool) {
 	switch strings.ToLower(c) {
-	case "rule", "ip", "country", "action", "site", "severity":
+	case "rule", "ip", "country", "action", "site", "severity", "protocol":
 		return strings.ToLower(c), true
 	}
 	return "", false
@@ -291,6 +295,7 @@ func eq(col, val string) string { return fmt.Sprintf("%s = '%s'", col, esc(val))
 //   - every user-supplied value passes through esc(),
 //   - column/table names are whitelisted (facetColumn) — never interpolated raw,
 //   - numeric bounds (from/to/limit/bucket) are formatted with %d.
+//
 // Backslash is escaped before the quote so the quote-escape can't be undone.
 func esc(s string) string {
 	s = strings.ReplaceAll(s, "\\", "\\\\") // must run first

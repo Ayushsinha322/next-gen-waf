@@ -195,7 +195,10 @@ async fn handle_h3_request(
         .resolve_request()
         .await
         .context("resolving HTTP/3 request headers")?;
-    let (parts, ()) = req.into_parts();
+    let (mut parts, ()) = req.into_parts();
+    // h3 delivers the request head without an http::Version tag; stamp it so the
+    // WAF pipeline, NDJSON logs, and ClickHouse all record this request as h3.
+    parts.version = http::Version::HTTP_3;
     debug!(method = %parts.method, uri = %parts.uri, "HTTP/3 request");
 
     // Buffer the request body from the QUIC stream (capped as an OOM guard;

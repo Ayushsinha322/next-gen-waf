@@ -69,6 +69,10 @@ pub struct WafEventRow {
     pub severity: String,
     pub score: u32,
     pub status: u16,
+    /// Canonical HTTP protocol label: `h1` | `h2` | `h3`. `#[serde(default)]`
+    /// keeps old rows (persisted before this column existed) deserializable.
+    #[serde(default)]
+    pub protocol: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -176,12 +180,22 @@ impl ClickHouseClient {
               site LowCardinality(String), method LowCardinality(String), \
               path String, rule LowCardinality(String), attack String, \
               action LowCardinality(String), severity LowCardinality(String), \
-              score UInt32, status UInt16) \
+              score UInt32, status UInt16, protocol LowCardinality(String)) \
              ENGINE = MergeTree() \
              PARTITION BY toYYYYMMDD(ts) \
              ORDER BY (site, ts) \
              TTL ts + INTERVAL 90 DAY \
              SETTINGS index_granularity = 8192",
+            db = self.database
+        ))
+        .await?;
+
+        // Idempotent online migration for tables created before `protocol`
+        // existed (e.g. the already-running VM deployment). ADD COLUMN IF NOT
+        // EXISTS is a no-op on a fresh table that already has the column.
+        self.exec(format!(
+            "ALTER TABLE {db}.waf_events \
+             ADD COLUMN IF NOT EXISTS protocol LowCardinality(String) DEFAULT ''",
             db = self.database
         ))
         .await
@@ -194,7 +208,7 @@ impl ClickHouseClient {
         }
         let mut sql = format!(
             "INSERT INTO {db}.waf_events \
-             (ts, ip, country, site, method, path, rule, attack, action, severity, score, status) \
+             (ts, ip, country, site, method, path, rule, attack, action, severity, score, status, protocol) \
              FORMAT JSONEachRow\n",
             db = self.database
         );
@@ -232,7 +246,7 @@ impl ClickHouseClient {
         }
         let sql = format!(
             "SELECT toUnixTimestamp(ts) AS ts, ip, country, site, method, path, \
-             rule, attack, action, severity, score, status \
+             rule, attack, action, severity, score, status, protocol \
              FROM {db}.waf_events WHERE {where_} \
              ORDER BY ts DESC LIMIT {limit} \
              SETTINGS output_format_json_quote_64bit_integers = 0 \
@@ -514,6 +528,7 @@ mod tests {
             severity: "CRITICAL".into(),
             score: 5,
             status: 403,
+            protocol: "h2".into(),
         }
     }
 }

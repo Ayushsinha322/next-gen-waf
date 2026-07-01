@@ -494,6 +494,7 @@ input, select, textarea { font-family:inherit; }
 .mc.red::before   { background:linear-gradient(90deg,#991b1b,var(--red-b),#991b1b); background-size:200% 100%; animation:shimmer 2.5s linear infinite .6s; }
 .mc.green::before { background:linear-gradient(90deg,#166534,var(--green),#166534); background-size:200% 100%; animation:shimmer 2.5s linear infinite 1.2s; }
 .mc.pur::before   { background:linear-gradient(90deg,#5b21b6,#a78bfa,#5b21b6); background-size:200% 100%; animation:shimmer 2.5s linear infinite 1.8s; }
+.mc.cyan::before  { background:linear-gradient(90deg,var(--cyan),var(--cyan-b),var(--cyan)); background-size:200% 100%; animation:shimmer 2.5s linear infinite 2.4s; }
 .mc-label { font-size:12px; font-family:'Inter',sans-serif; font-weight:600; color:var(--text3); text-transform:uppercase; letter-spacing:.8px; margin-bottom:8px; }
 .mc-val   { font-family:'JetBrains Mono',monospace; font-size:30px; font-weight:700; line-height:1; margin-bottom:6px; color:var(--text); }
 .mc-delta { font-size:12px; font-family:'JetBrains Mono',monospace; color:var(--text2); }
@@ -503,6 +504,7 @@ input, select, textarea { font-family:inherit; }
 .mc.red   .mc-val { color:var(--red-b); }
 .mc.green .mc-val { color:var(--green); }
 .mc.pur   .mc-val { color:#a78bfa; }
+.mc.cyan  .mc-val { color:var(--cyan-b); }
 
 /* ═══════════════════════════════════════════
    PANEL / CARD — translucent glass with neon border

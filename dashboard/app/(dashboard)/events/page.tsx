@@ -26,6 +26,7 @@ export default function EventsPage() {
   const [timeline, setTimeline] = useState<TimelineBucket[]>([]);
   const [ruleFacets, setRuleFacets] = useState<{ key: string; count: number }[]>([]);
   const [ipFacets, setIpFacets] = useState<{ key: string; count: number }[]>([]);
+  const [protocolFacets, setProtocolFacets] = useState<{ key: string; count: number }[]>([]);
   const [loading, setLoading] = useState(true);
   const [rangeSecs, setRangeSecs] = useState(86400);
 
@@ -35,6 +36,7 @@ export default function EventsPage() {
   const [rule, setRule] = useState("");
   const [action, setAction] = useState("");
   const [ip, setIp] = useState("");
+  const [protocol, setProtocol] = useState("");
 
   // `override` lets callers search with a value they just set this render —
   // `setRule(k); run()` would otherwise search with the *previous* rule because
@@ -43,30 +45,32 @@ export default function EventsPage() {
     setLoading(true);
     const to = Math.floor(Date.now() / 1000) + 60;
     const from = to - rangeSecs - 60;
-    const filter: EventQuery = { from, to, limit: 300, q, site, rule, action, ip, ...override };
+    const filter: EventQuery = { from, to, limit: 300, q, site, rule, action, ip, protocol, ...override };
     try {
       const st = await api.events.status();
       setStatus(st);
       if (!st.configured || !st.reachable) { setLoading(false); return; }
-      const [s, t, rf, ipf] = await Promise.all([
+      const [s, t, rf, ipf, pf] = await Promise.all([
         api.events.search(filter),
         api.events.timeline(from, to, rangeSecs > 86400 ? 3600 : 60),
         api.events.facets("rule", from, to, 8),
         api.events.facets("ip", from, to, 8),
+        api.events.facets("protocol", from, to, 8),
       ]);
       setEvents(s.events ?? []);
       setTimeline(t.buckets ?? []);
       setRuleFacets(rf.facets ?? []);
       setIpFacets(ipf.facets ?? []);
+      setProtocolFacets(pf.facets ?? []);
     } catch (e) { showToast(e instanceof Error ? e.message : "Search failed", "e", "⚠️"); }
     finally { setLoading(false); }
-  }, [rangeSecs, q, site, rule, action, ip]);
+  }, [rangeSecs, q, site, rule, action, ip, protocol]);
 
   useEffect(() => { run(); }, [rangeSecs]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const maxBucket = Math.max(1, ...timeline.map(b => b.total));
-  const clearFilters = () => { setQ(""); setSite(""); setRule(""); setAction(""); setIp(""); run({ q: "", site: "", rule: "", action: "", ip: "" }); };
-  const activeFilters = [["site", site], ["rule", rule], ["action", action], ["ip", ip], ["q", q]].filter(([, v]) => v) as [string, string][];
+  const clearFilters = () => { setQ(""); setSite(""); setRule(""); setAction(""); setIp(""); setProtocol(""); run({ q: "", site: "", rule: "", action: "", ip: "", protocol: "" }); };
+  const activeFilters = [["site", site], ["rule", rule], ["action", action], ["ip", ip], ["protocol", protocol], ["q", q]].filter(([, v]) => v) as [string, string][];
 
   return (
     <motion.div className="sec" variants={staggerContainer} initial="hidden" animate="visible">
@@ -109,6 +113,9 @@ export default function EventsPage() {
             <input className="fi2" placeholder="site" style={{ width: 130 }} value={site} onChange={e => setSite(e.target.value)} onKeyDown={e => e.key === "Enter" && run()} />
             <input className="fi2" placeholder="rule" style={{ width: 90 }} value={rule} onChange={e => setRule(e.target.value)} onKeyDown={e => e.key === "Enter" && run()} />
             <input className="fi2" placeholder="IP" style={{ width: 120 }} value={ip} onChange={e => setIp(e.target.value)} onKeyDown={e => e.key === "Enter" && run()} />
+            <select className="fsel" value={protocol} onChange={e => { setProtocol(e.target.value); run({ protocol: e.target.value }); }}>
+              <option value="">All protocols</option><option value="h1">HTTP/1.x</option><option value="h2">HTTP/2</option><option value="h3">HTTP/3</option>
+            </select>
             <select className="fsel" value={action} onChange={e => setAction(e.target.value)}>
               <option value="">All actions</option><option value="BLOCK">BLOCK</option><option value="DETECT">DETECT</option>
             </select>
@@ -135,6 +142,7 @@ export default function EventsPage() {
             <motion.div variants={cardVariants} style={{ display: "flex", flexDirection: "column", gap: 14 }}>
               <FacetCard title="Top Rules" facets={ruleFacets} onPick={k => { setRule(k); run({ rule: k }); }} />
               <FacetCard title="Top Source IPs" facets={ipFacets} onPick={k => { setIp(k); run({ ip: k }); }} />
+              <FacetCard title="Top Protocols" facets={protocolFacets} onPick={k => { setProtocol(k); run({ protocol: k }); }} />
             </motion.div>
 
             <motion.div className="panel" variants={cardVariants}>
@@ -142,13 +150,14 @@ export default function EventsPage() {
               <div className="tw" style={{ maxHeight: 520, overflow: "auto" }}>
                 {events.length === 0 ? <Empty text={loading ? "Searching…" : "No events match these filters in this window."} /> : (
                   <table>
-                    <thead><tr><th>Time</th><th>IP</th><th>Site</th><th>Method</th><th>Path</th><th>Rule</th><th>Sev</th><th>Action</th><th>Status</th></tr></thead>
+                    <thead><tr><th>Time</th><th>IP</th><th>Site</th><th>Method</th><th>Proto</th><th>Path</th><th>Rule</th><th>Sev</th><th>Action</th><th>Status</th></tr></thead>
                     <tbody>{events.map((e, i) => (
                       <tr key={i}>
                         <td className="td3" style={{ whiteSpace: "nowrap" }}>{fmtTime(e.ts)}</td>
                         <td className="td2">{e.ip}{e.country ? ` (${e.country})` : ""}</td>
                         <td className="td3">{e.site}</td>
                         <td className="td3">{e.method}</td>
+                        <td className="td3"><span className="bdg bcy">{e.protocol || "—"}</span></td>
                         <td style={{ maxWidth: 280, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={`${e.path} — ${e.attack}`}>{e.path}</td>
                         <td className="td3">{e.rule}</td>
                         <td><span className={`bdg ${e.severity === "CRITICAL" ? "br" : e.severity === "HIGH" ? "ba" : "bcy"}`}>{e.severity || "—"}</span></td>
