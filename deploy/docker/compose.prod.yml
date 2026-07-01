@@ -182,13 +182,18 @@ services:
       # Upstreams the dedicated management listener (:9443) reverse-proxies to.
       SENTINEL_MGMT_DASHBOARD_UPSTREAM: http://dashboard:3000
       SENTINEL_MGMT_API_UPSTREAM: http://controlplane:9501
+      # HTTP/3: the https listener binds :8443 inside the container but is
+      # published on host :443, so advertise h3 on :443 in the Alt-Svc header
+      # (else browsers try to reach h3 on :8443 and fail to upgrade).
+      SENTINEL_HTTP3_ADVERTISE_PORT: "443"
     volumes:
       - ./sentinel.proxy.yaml:/etc/sentinel/sentinel.yaml:ro
       - sentinel-logs:/var/log/sentinel
       - sentinel-certs:/var/lib/sentinel/certs   # cert repository (persists ACME/uploaded certs)
     ports:
       - "80:8080"               # public WAF entrypoint (HTTP)
-      - "443:8443"              # public WAF entrypoint (HTTPS — SNI cert resolver)
+      - "443:8443"              # public WAF entrypoint (HTTPS/TCP — h1+h2, SNI cert resolver)
+      - "443:8443/udp"          # public WAF entrypoint (HTTP/3 over QUIC — same cert resolver)
       - "9443:9443"             # MANAGEMENT console (HTTPS — admin UI + API, replaceable mgmt cert)
     networks: [sentinel]
 
