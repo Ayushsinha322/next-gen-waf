@@ -93,6 +93,49 @@ impl StorageBackendConfig {
             clickhouse_password,
         }
     }
+
+    /// Overlay `SENTINEL_*` environment variables on top of the file-derived
+    /// config. A variable wins only when present and non-empty; otherwise the
+    /// file value is kept.
+    ///
+    /// This mirrors the Go control plane's `clickhouse.FromEnv`, so the data
+    /// plane and control plane are configured identically from compose/K8s
+    /// env — no ClickHouse password has to be baked into the committed proxy
+    /// YAML, and the same `SENTINEL_CLICKHOUSE_*` Secret feeds both planes.
+    ///
+    /// Recognised vars: `SENTINEL_REDIS_URL`, `SENTINEL_CLICKHOUSE_URL`,
+    /// `SENTINEL_CLICKHOUSE_DB`, `SENTINEL_CLICKHOUSE_USER`,
+    /// `SENTINEL_CLICKHOUSE_PASSWORD`.
+    pub fn with_env_overrides(self) -> Self {
+        self.apply_overrides(|k| std::env::var(k).ok())
+    }
+
+    /// Inner, testable form of [`with_env_overrides`]: takes the variable
+    /// lookup as a closure so unit tests need not mutate the process
+    /// environment (which races across parallel tests).
+    fn apply_overrides(mut self, lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let get = |k: &str| {
+            lookup(k)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        if let Some(v) = get("SENTINEL_REDIS_URL") {
+            self.redis_url = Some(v);
+        }
+        if let Some(v) = get("SENTINEL_CLICKHOUSE_URL") {
+            self.clickhouse_url = Some(v);
+        }
+        if let Some(v) = get("SENTINEL_CLICKHOUSE_DB") {
+            self.clickhouse_db = Some(v);
+        }
+        if let Some(v) = get("SENTINEL_CLICKHOUSE_USER") {
+            self.clickhouse_user = Some(v);
+        }
+        if let Some(v) = get("SENTINEL_CLICKHOUSE_PASSWORD") {
+            self.clickhouse_password = Some(v);
+        }
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -262,5 +305,41 @@ mod tests {
         let backend = StorageBackendConfig::from_core(&cfg);
         assert_eq!(backend.clickhouse_url.as_deref(), Some("http://ch:8123"));
         assert_eq!(backend.clickhouse_db.as_deref(), Some("mydb"));
+    }
+
+    #[test]
+    fn env_overrides_apply_over_file_config() {
+        // File config had no ClickHouse; env (compose/K8s Secret) supplies it.
+        let cfg = StorageBackendConfig::default().apply_overrides(|k| {
+            match k {
+                "SENTINEL_CLICKHOUSE_URL" => Some("http://clickhouse:8123".to_string()),
+                "SENTINEL_CLICKHOUSE_DB" => Some("sentinel_logs".to_string()),
+                "SENTINEL_CLICKHOUSE_USER" => Some("sentinel".to_string()),
+                "SENTINEL_CLICKHOUSE_PASSWORD" => Some("s3cr3t".to_string()),
+                "SENTINEL_REDIS_URL" => Some("redis://redis:6379".to_string()),
+                _ => None,
+            }
+        });
+        assert_eq!(cfg.clickhouse_url.as_deref(), Some("http://clickhouse:8123"));
+        assert_eq!(cfg.clickhouse_db.as_deref(), Some("sentinel_logs"));
+        assert_eq!(cfg.clickhouse_user.as_deref(), Some("sentinel"));
+        assert_eq!(cfg.clickhouse_password.as_deref(), Some("s3cr3t"));
+        assert_eq!(cfg.redis_url.as_deref(), Some("redis://redis:6379"));
+    }
+
+    #[test]
+    fn env_overrides_ignore_blank_and_missing_keep_file_value() {
+        // A blank or absent var must NOT clobber a value that came from the file.
+        let base = StorageBackendConfig {
+            clickhouse_url: Some("http://from-file:8123".into()),
+            clickhouse_db: Some("filedb".into()),
+            ..Default::default()
+        };
+        let cfg = base.apply_overrides(|k| match k {
+            "SENTINEL_CLICKHOUSE_URL" => Some("   ".to_string()), // whitespace → ignored
+            _ => None,                                            // CH_DB absent → kept
+        });
+        assert_eq!(cfg.clickhouse_url.as_deref(), Some("http://from-file:8123"));
+        assert_eq!(cfg.clickhouse_db.as_deref(), Some("filedb"));
     }
 }

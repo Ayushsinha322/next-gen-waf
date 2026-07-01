@@ -44,3 +44,25 @@ COPY --from=go-builder /out/controllerd /usr/local/bin/controllerd
 COPY --from=go-builder /out/sentinelctl  /usr/local/bin/sentinelctl
 EXPOSE 9500 9501
 ENTRYPOINT ["/usr/local/bin/controllerd"]
+
+# ---- DB migrations (goose) ----
+# Self-contained migration runner: bundles the goose CLI + the SQL migrations so
+# a K8s initContainer/Job (or `docker run`) can bring a fresh database to the
+# current schema. goose tracks applied versions in goose_db_version, so it is
+# safe to re-run — `up` is a no-op once the DB is current. This replaces the
+# manual "apply goose Up via psql" step (raw psql is wrong here: the .sql files
+# carry goose Up/Down markers). Connection comes from GOOSE_DBSTRING at runtime.
+FROM golang:1.24-alpine AS goose-builder
+ENV CGO_ENABLED=0
+# Pinned for reproducibility; no_sqlite3 keeps the build pure-Go (postgres only).
+RUN go install -tags='no_sqlite3' github.com/pressly/goose/v3/cmd/goose@v3.22.1
+
+FROM alpine:3.20 AS sentinel-migrate
+RUN apk add --no-cache ca-certificates
+COPY --from=goose-builder /go/bin/goose /usr/local/bin/goose
+COPY control-plane/internal/db/migrations /migrations
+ENV GOOSE_DRIVER=postgres \
+    GOOSE_MIGRATION_DIR=/migrations
+# GOOSE_DBSTRING (the postgres DSN) is injected at run time. Default: apply Up.
+ENTRYPOINT ["goose"]
+CMD ["up"]

@@ -1,0 +1,55 @@
+# Dashboard (Next.js). Internal Service only — browsers reach it through the
+# data plane's :9443 management console (which reverse-proxies / → dashboard and
+# /api → control plane, same-origin so live-log SSE needs no CORS).
+#
+# IMPORTANT: NEXT_PUBLIC_CONTROL_PLANE_URL is baked at IMAGE BUILD time. Build
+# the dashboard image with your external console URL, e.g.
+#   docker build -f deploy/docker/Dockerfile.dashboard \
+#     --build-arg CONTROL_PLANE_URL=http://controlplane:9501 \
+#     --build-arg NEXT_PUBLIC_CONTROL_PLANE_URL=https://172.16.21.80:9443 \
+#     -t sentinel/dashboard:latest dashboard
+# (172.16.21.80 = the sentinel-waf LoadBalancer VIP from 30-sentinel-edge.yaml.)
+apiVersion: v1
+kind: Service
+metadata:
+  name: dashboard
+  namespace: sentinel
+  labels: { app: dashboard }
+spec:
+  type: ClusterIP
+  selector: { app: dashboard }
+  ports:
+    - { name: http, port: 3000, targetPort: 3000 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dashboard
+  namespace: sentinel
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: dashboard } }
+  template:
+    metadata:
+      labels: { app: dashboard }
+    spec:
+      containers:
+        - name: dashboard
+          image: sentinel/dashboard:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            # Server-side Next.js REST rewrite → internal control plane.
+            - { name: CONTROL_PLANE_URL, value: http://controlplane:9501 }
+            # Mirror of the build-time public base (effective only if rebuilt).
+            - { name: NEXT_PUBLIC_CONTROL_PLANE_URL, value: https://172.16.21.80:9443 }
+            - { name: PORT, value: "3000" }
+            - { name: NODE_ENV, value: production }
+          ports:
+            - { name: http, containerPort: 3000 }
+          readinessProbe:
+            httpGet: { path: /, port: 3000 }   # login redirect (3xx) counts as ready
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits:   { memory: "512Mi" }

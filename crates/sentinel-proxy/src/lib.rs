@@ -411,10 +411,12 @@ impl ProxyServer {
         // Connect storage backends (Redis for distributed rate limiting,
         // ClickHouse for traffic history).  Missing/unreachable backends
         // degrade gracefully — the rate limiter falls back to in-memory.
-        let storage = sentinel_storage::StorageHandle::connect(
-            &sentinel_storage::StorageBackendConfig::from_core(&cfg.storage),
-        )
-        .await;
+        // File config first, then SENTINEL_CLICKHOUSE_*/SENTINEL_REDIS_URL env
+        // overlay so the data plane is configured identically to the Go control
+        // plane (same Secret in compose/K8s; no CH password in the proxy YAML).
+        let storage_backend_cfg = sentinel_storage::StorageBackendConfig::from_core(&cfg.storage)
+            .with_env_overrides();
+        let storage = sentinel_storage::StorageHandle::connect(&storage_backend_cfg).await;
         if storage.has_redis() {
             info!("rate limiting: distributed mode (Redis backend active)");
         } else {
@@ -437,43 +439,112 @@ impl ProxyServer {
             }
         }
 
-        // ClickHouse traffic flusher: snapshot the per-second accumulator every
-        // second and bulk-insert every 5s (or 500 rows). Async + drop-on-error
-        // so logging never blocks or grows unbounded if ClickHouse is down.
-        if let Some(ch) = storage.clickhouse.clone() {
-            // Gate buffering on an active sink: record_event/record_traffic check
-            // this and become no-ops when ClickHouse is off, so the buffers don't
-            // grow unbounded with nothing to drain them.
-            CLICKHOUSE_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+        // ClickHouse traffic + event flusher. Spawned whenever a ClickHouse URL
+        // is configured — even if the INITIAL connect failed — so the writer is
+        // SELF-HEALING: it (re)connects in the background with backoff and starts
+        // persisting once ClickHouse is reachable, with no data-plane restart.
+        //
+        // Why this matters: the data plane must boot WITHOUT waiting on ClickHouse
+        // (request availability comes first), and K8s gives no cross-pod start
+        // ordering, so the writer routinely races a not-yet-ready ClickHouse
+        // StatefulSet on cold start. A one-shot connect would leave the writer a
+        // permanent silent no-op until someone restarted the proxy. CLICKHOUSE_ENABLED
+        // gates buffering and is true ONLY while connected, so the in-memory
+        // buffers stay bounded whenever ClickHouse is down.
+        if storage_backend_cfg.clickhouse_url.is_some() {
+            let initial = storage.clickhouse.clone();
+            if initial.is_some() {
+                CLICKHOUSE_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            let ch_cfg = storage_backend_cfg.clone();
             tokio::spawn(async move {
+                let mut ch: Option<std::sync::Arc<sentinel_storage::ClickHouseClient>> = initial;
                 let mut buf: Vec<sentinel_storage::TrafficRow> = Vec::new();
                 let mut evbuf: Vec<sentinel_storage::WafEventRow> = Vec::new();
                 let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
                 let mut ticks = 0u32;
+                // Seconds remaining until the next reconnect attempt while down.
+                let mut reconnect_in = 0u32;
                 loop {
                     ticker.tick().await;
+
+                    // --- (re)connect in the background when we have no client ---
+                    if ch.is_none() {
+                        if reconnect_in == 0 {
+                            if let Some(url) = ch_cfg.clickhouse_url.as_deref() {
+                                let db = ch_cfg.clickhouse_db.as_deref().unwrap_or("sentinel_logs");
+                                let client = sentinel_storage::ClickHouseClient::with_auth(
+                                    url,
+                                    db,
+                                    ch_cfg.clickhouse_user.clone(),
+                                    ch_cfg.clickhouse_password.clone(),
+                                );
+                                match client.ping().await {
+                                    Ok(()) => match client.ensure_schema().await {
+                                        Ok(()) => {
+                                            info!(url, database = db, "clickhouse connected — waf history writer enabled");
+                                            ch = Some(std::sync::Arc::new(client));
+                                            CLICKHOUSE_ENABLED
+                                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                                        }
+                                        Err(e) => {
+                                            warn!(error = %e, "clickhouse reachable but schema init failed — retrying in 10s");
+                                            reconnect_in = 10;
+                                        }
+                                    },
+                                    Err(e) => {
+                                        warn!(error = %e, "clickhouse unreachable — waf history writer disabled, retrying in 10s");
+                                        reconnect_in = 10;
+                                    }
+                                }
+                            }
+                        } else {
+                            reconnect_in -= 1;
+                        }
+                    }
+
+                    // Always drain to keep buffers bounded; record_* only fills
+                    // them while CLICKHOUSE_ENABLED (i.e. while connected).
                     buf.extend(drain_traffic(unix_now()));
                     evbuf.extend(drain_events());
                     ticks += 1;
                     // Both streams flush on the same 5s-or-500-row cadence.
                     let time_due = ticks >= 5;
 
-                    if (time_due || buf.len() >= 500) && !buf.is_empty() {
-                        if let Err(e) = ch.insert_traffic_batch(&buf).await {
-                            warn!(error = %e, rows = buf.len(), "clickhouse traffic flush failed — dropping batch");
-                        } else {
-                            debug!(rows = buf.len(), "clickhouse traffic flushed");
+                    if let Some(client) = ch.clone() {
+                        let mut conn_lost = false;
+                        if (time_due || buf.len() >= 500) && !buf.is_empty() {
+                            if let Err(e) = client.insert_traffic_batch(&buf).await {
+                                warn!(error = %e, rows = buf.len(), "clickhouse traffic flush failed — dropping batch, will reconnect");
+                                conn_lost = true;
+                            } else {
+                                debug!(rows = buf.len(), "clickhouse traffic flushed");
+                            }
+                            buf.clear(); // bounded: drop after every attempt
                         }
-                        buf.clear(); // bounded: drop after every attempt
-                    }
 
-                    if (time_due || evbuf.len() >= 500) && !evbuf.is_empty() {
-                        if let Err(e) = ch.insert_events_batch(&evbuf).await {
-                            warn!(error = %e, rows = evbuf.len(), "clickhouse events flush failed — dropping batch");
-                        } else {
-                            debug!(rows = evbuf.len(), "clickhouse events flushed");
+                        if (time_due || evbuf.len() >= 500) && !evbuf.is_empty() {
+                            if let Err(e) = client.insert_events_batch(&evbuf).await {
+                                warn!(error = %e, rows = evbuf.len(), "clickhouse events flush failed — dropping batch, will reconnect");
+                                conn_lost = true;
+                            } else {
+                                debug!(rows = evbuf.len(), "clickhouse events flushed");
+                            }
+                            evbuf.clear(); // bounded: drop after every attempt
                         }
-                        evbuf.clear(); // bounded: drop after every attempt
+
+                        // A failed insert usually means the server/connection went
+                        // away — drop the client so the loop reconnects, and stop
+                        // buffering (CLICKHOUSE_ENABLED=false) until it does.
+                        if conn_lost {
+                            CLICKHOUSE_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+                            ch = None;
+                            reconnect_in = 5;
+                        }
+                    } else {
+                        // Disconnected: discard anything drained to stay bounded.
+                        buf.clear();
+                        evbuf.clear();
                     }
 
                     if time_due {
@@ -481,7 +552,7 @@ impl ProxyServer {
                     }
                 }
             });
-            info!("clickhouse flusher started (1s sample · 5s/500-row flush → traffic_buckets + waf_events)");
+            info!("clickhouse flusher started (1s sample · 5s/500-row flush → traffic_buckets + waf_events; self-healing reconnect)");
         }
 
         let modules = Arc::new(ModulesState {

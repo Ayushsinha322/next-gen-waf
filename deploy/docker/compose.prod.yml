@@ -2,7 +2,9 @@
 # Sentinel WAF — lean production / MVP-demo Docker Compose.
 #
 #   postgres + redis  → control-plane backing stores
-#   controlplane      → REST :9501 / gRPC :9500, migrates+seeds DB on boot
+#   clickhouse        → on-prem traffic/event log store (powers Threat Search)
+#   migrate           → one-shot goose DB migrations (runs to completion first)
+#   controlplane      → REST :9501 / gRPC :9500, seeds DB on boot (after migrate)
 #   dataplane         → Rust WAF proxy, host :80 -> container :8080
 #   dashboard         → Next.js UI on :3000
 #   juiceshop         → demo upstream to protect (internal only)
@@ -42,6 +44,53 @@ services:
       retries: 30
     networks: [sentinel]
 
+  # On-prem time-series log store. The data plane WRITES traffic_buckets +
+  # waf_events here; the control plane READS them for the dashboard's "Threat
+  # Search" (/events) page. Internal-only — no host port is published; both
+  # planes reach it over the docker network at clickhouse:8123.
+  clickhouse:
+    image: clickhouse/clickhouse-server:24-alpine
+    restart: unless-stopped
+    mem_limit: 1536m
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+      # Keep ClickHouse's own memory accounting within the container limit.
+      CLICKHOUSE_MAX_SERVER_MEMORY_USAGE_TO_RAM_RATIO: "0.6"
+    volumes:
+      - chdata:/var/lib/clickhouse
+    healthcheck:
+      # /ping needs no auth; busybox wget ships in the alpine image. Use the
+      # IPv4 loopback explicitly: this host is IPv4-only and `localhost` resolves
+      # to ::1 first, where ClickHouse can't bind (IPv6 disabled) → false-unhealthy.
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8123/ping | grep -q Ok || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+    networks: [sentinel]
+
+  # One-shot DB migrations (goose). Runs to completion before the control plane
+  # starts, so its SeedDev finds the schema. The control plane does NOT migrate
+  # on boot — it only seeds. goose `up` is idempotent (no-op once current).
+  migrate:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+      target: sentinel-migrate
+    image: sentinel/migrate:latest
+    restart: "no"
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      # goose reads GOOSE_DBSTRING; the SENTINEL_DB_URL DSN form works as-is.
+      GOOSE_DBSTRING: ${SENTINEL_DB_URL}
+    networks: [sentinel]
+
   controlplane:
     build:
       context: ../..
@@ -54,10 +103,21 @@ services:
     user: "0:0"
     depends_on:
       postgres: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
       redis: { condition: service_healthy }
+      # service_started (not _healthy): never gate the control plane on the
+      # analytics store's health. The reader degrades gracefully; the writer
+      # self-heals. (A broken CH healthcheck previously gated and downed the stack.)
+      clickhouse: { condition: service_started }
     environment:
       SENTINEL_DB_URL: ${SENTINEL_DB_URL}
       SENTINEL_REDIS_URL: redis://redis:6379
+      # ClickHouse reader → powers the dashboard's "Threat Search" (/events).
+      # Unset = reader disabled (honest empty state); set = event search live.
+      SENTINEL_CLICKHOUSE_URL: http://clickhouse:8123
+      SENTINEL_CLICKHOUSE_DB: ${CLICKHOUSE_DB}
+      SENTINEL_CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      SENTINEL_CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
       SENTINEL_JWT_SECRET: ${SENTINEL_JWT_SECRET}
       SENTINEL_REST_ADDR: 0.0.0.0:9501
       SENTINEL_GRPC_ADDR: 0.0.0.0:9500
@@ -98,12 +158,27 @@ services:
     user: "0:0"
     depends_on:
       controlplane: { condition: service_started }
+      # service_started, not _healthy: the WAF must boot regardless of ClickHouse.
+      # The proxy's history writer self-heals (background reconnect with backoff),
+      # so it starts persisting once CH is reachable — no restart, no WAF gating.
+      clickhouse: { condition: service_started }
     environment:
       SENTINEL_CONFIG: /etc/sentinel/sentinel.yaml
       SENTINEL_LOG_DIR: /var/log/sentinel
       RUST_LOG: info,sentinel=info
       # Shared secret so the control plane can reach the loopback-only cert API.
       SENTINEL_INTERNAL_SECRET: ${SENTINEL_INTERNAL_SECRET}
+      # NOTE: SENTINEL_REDIS_URL is intentionally NOT set here. This is a single
+      # data-plane node, so the in-process token-bucket rate limiter is correct;
+      # pointing it at Redis would switch to sliding-window semantics + a per-
+      # request round-trip for no benefit. Set it only for a multi-node fleet.
+      # ClickHouse writer → the proxy bulk-inserts traffic_buckets + waf_events
+      # (creates the schema on first connect). Same Secret as the reader above
+      # so both planes agree; keeps the CH password out of the committed YAML.
+      SENTINEL_CLICKHOUSE_URL: http://clickhouse:8123
+      SENTINEL_CLICKHOUSE_DB: ${CLICKHOUSE_DB}
+      SENTINEL_CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      SENTINEL_CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
       # Upstreams the dedicated management listener (:9443) reverse-proxies to.
       SENTINEL_MGMT_DASHBOARD_UPSTREAM: http://dashboard:3000
       SENTINEL_MGMT_API_UPSTREAM: http://controlplane:9501
@@ -151,6 +226,7 @@ services:
 
 volumes:
   pgdata:
+  chdata:
   sentinel-logs:
   sentinel-certs:
 

@@ -1,0 +1,22 @@
+# Sentinel WAF — Kustomize entrypoint.
+#
+#   kubectl apply -k deploy/k8s
+#
+# NOTE: the Secret is intentionally NOT listed here — create it first from
+# 11-secrets.example.yaml (copy → secrets.yaml → edit → apply). The MetalLB pool
+# (90-metallb-pool.example.yaml) is also applied separately (different namespace,
+# after MetalLB is installed). See README.md.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: sentinel
+
+resources:
+  - 00-namespace.yaml
+  - 10-config.yaml
+  - 20-postgres.yaml
+  - 21-redis.yaml
+  - 22-clickhouse.yaml
+  - 30-sentinel-edge.yaml
+  - 40-dashboard.yaml
+  - 41-juiceshop.yaml      # demo upstream — remove for a real deployment

@@ -1,0 +1,71 @@
+# ClickHouse — on-prem time-series log store that powers the dashboard's
+# "Threat Search" (/events). The data plane WRITES traffic_buckets + waf_events
+# (creating the schema on first connect); the control plane READS them. Internal
+# only — no external Service. StatefulSet + local-path PVC for durable history.
+apiVersion: v1
+kind: Service
+metadata:
+  name: clickhouse
+  namespace: sentinel
+  labels: { app: clickhouse }
+spec:
+  clusterIP: None            # headless — stable DNS for the StatefulSet pod
+  selector: { app: clickhouse }
+  ports:
+    - { name: http,   port: 8123, targetPort: 8123 }
+    - { name: native, port: 9000, targetPort: 9000 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: clickhouse
+  namespace: sentinel
+spec:
+  serviceName: clickhouse
+  replicas: 1
+  selector: { matchLabels: { app: clickhouse } }
+  template:
+    metadata:
+      labels: { app: clickhouse }
+    spec:
+      containers:
+        - name: clickhouse
+          image: clickhouse/clickhouse-server:24-alpine
+          env:
+            - { name: CLICKHOUSE_DB,   valueFrom: { configMapKeyRef: { name: sentinel-env, key: CLICKHOUSE_DB } } }
+            - { name: CLICKHOUSE_USER, valueFrom: { configMapKeyRef: { name: sentinel-env, key: CLICKHOUSE_USER } } }
+            - { name: CLICKHOUSE_PASSWORD, valueFrom: { secretKeyRef: { name: sentinel-secrets, key: CLICKHOUSE_PASSWORD } } }
+            - { name: CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT, value: "1" }
+            # Keep ClickHouse's own memory accounting within the container limit.
+            - { name: CLICKHOUSE_MAX_SERVER_MEMORY_USAGE_TO_RAM_RATIO, value: "0.6" }
+          ports:
+            - { name: http,   containerPort: 8123 }
+            - { name: native, containerPort: 9000 }
+          volumeMounts:
+            - { name: chdata, mountPath: /var/lib/clickhouse }
+          readinessProbe:
+            # /ping needs no auth; busybox wget ships in the alpine image. Use the
+            # IPv4 loopback explicitly — `localhost` may resolve to ::1 where
+            # ClickHouse can't bind on IPv4-only nodes (false-negative probe).
+            exec: { command: ["sh", "-c", "wget -qO- http://127.0.0.1:8123/ping | grep -q Ok"] }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            exec: { command: ["sh", "-c", "wget -qO- http://127.0.0.1:8123/ping | grep -q Ok"] }
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 3
+          # ClickHouse wants a high open-file limit. containerd's default nofile
+          # (usually 1048576) is sufficient; raise the node limit if you see
+          # "Too many open files" under heavy ingest.
+          resources:
+            requests: { cpu: "250m", memory: "512Mi" }
+            limits:   { memory: "1536Mi" }
+  volumeClaimTemplates:
+    - metadata:
+        name: chdata
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: local-path
+        resources: { requests: { storage: 20Gi } }
