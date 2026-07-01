@@ -199,13 +199,14 @@ export interface WafEvent {
   severity: string;
   score:    number;
   status:   number;
+  protocol?: string; // h1 | h2 | h3
 }
 
 export interface TimelineBucket { ts: number; total: number; blocked: number }
 
 export interface EventQuery {
   site?: string; country?: string; rule?: string; action?: string;
-  ip?: string; q?: string; from?: number; to?: number; limit?: number;
+  ip?: string; protocol?: string; q?: string; from?: number; to?: number; limit?: number;
 }
 
 /** A per-site rule exclusion stored in waf_policy.rule_exclusions. */
@@ -463,7 +464,7 @@ export const api = {
 
   waf: {
     status: () =>
-      apiFetch<{ waf_running: boolean; uptime_secs?: number; sites?: number; listeners?: string[]; upstreams_healthy?: number; upstreams_total?: number; error?: string }>("/waf/status"),
+      apiFetch<{ waf_running: boolean; uptime_secs?: number; sites?: number; listeners?: string[]; upstreams_healthy?: number; upstreams_total?: number; http3?: { enabled: boolean; listener?: string; bind?: string; advertise_port?: number }; error?: string }>("/waf/status"),
   },
 
   certs: {

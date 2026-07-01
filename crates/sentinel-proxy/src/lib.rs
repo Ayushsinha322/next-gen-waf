@@ -22,6 +22,7 @@
 //! Phase 6: logging + correlation state update
 //! ```
 
+pub mod http3;
 pub mod upstream;
 pub mod websocket;
 pub mod tls;
@@ -74,7 +75,7 @@ use crate::upstream::UpstreamPool;
 // Type aliases
 // ---------------------------------------------------------------------------
 
-type BoxBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
+pub(crate) type BoxBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
 
 /// Maps `site_id` → compiled [`RuleEngine`].
 type RuleEngineMap = HashMap<String, RuleEngine>;
@@ -941,7 +942,14 @@ async fn serve_listener(
 
     info!(listener = %cfg.name, bind = %cfg.bind, tls = cfg.is_tls(), management = management.is_some(), "listener started");
 
-    let tls_acceptor = if cfg.is_tls() {
+    // HTTP/3 is offered on TLS, non-management listeners whose protocol set
+    // includes `http3`. QUIC reuses the exact same cert resolver as TCP.
+    let h3_enabled =
+        cfg.is_tls() && !cfg.is_management() && cfg.protocols().contains(&Protocol::Http3);
+
+    let (tls_acceptor, quic_config): (Option<TlsAcceptor>, Option<quinn::ServerConfig>) = if cfg
+        .is_tls()
+    {
         let tls_cfg = cfg.tls.as_ref().unwrap();
         if management.is_some() {
             // Management listener: always serve the single management cert
@@ -954,10 +962,13 @@ async fn serve_listener(
                 .with_no_client_auth()
                 .with_cert_resolver(resolver);
             server_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-            Some(TlsAcceptor::from(Arc::new(server_cfg)))
+            (Some(TlsAcceptor::from(Arc::new(server_cfg))), None)
         } else if tls_cfg.cert.is_some() && tls_cfg.key.is_some() {
-            // Explicit cert/key paths — use them directly.
-            Some(build_tls_acceptor(tls_cfg)?)
+            // Explicit cert/key paths — used directly for TCP.
+            if h3_enabled {
+                warn!(listener = %cfg.name, "HTTP/3 is only wired for the SNI cert-resolver path, not explicit cert/key listeners; serving TCP only");
+            }
+            (Some(build_tls_acceptor(tls_cfg)?), None)
         } else {
             // SNI-based per-domain resolution across all sites.
             let cfg_snap = state.config.load();
@@ -970,17 +981,76 @@ async fn serve_listener(
             if !domains.is_empty() {
                 resolver.pre_warm(&domains);
             }
+
+            // Same resolver → QUIC server config (ALPN h3), when enabled. Build
+            // this from a clone *before* the TCP config consumes the resolver.
+            let quic = if h3_enabled {
+                match http3::quic_server_config_from_resolver(Arc::clone(&resolver)) {
+                    Ok(q) => Some(q),
+                    Err(e) => {
+                        error!(listener = %cfg.name, "failed to build HTTP/3 server config: {e}; serving TCP only");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             let mut server_cfg = ServerConfig::builder()
                 .with_no_client_auth()
                 .with_cert_resolver(resolver);
             server_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-            Some(TlsAcceptor::from(Arc::new(server_cfg)))
+            (Some(TlsAcceptor::from(Arc::new(server_cfg))), quic)
         }
     } else {
-        None
+        (None, None)
     };
 
     let default_site = cfg.default_site.clone();
+
+    // Spawn the HTTP/3 (QUIC over UDP) endpoint on the same address as the TCP
+    // listener. It shares the listener's shutdown signal and feeds requests into
+    // the same WAF pipeline (see `http3::serve_quic`).
+    if let Some(qcfg) = quic_config {
+        match cfg.bind.parse::<SocketAddr>() {
+            Ok(quic_bind) => {
+                let state_q = Arc::clone(&state);
+                let ds_q = default_site.clone();
+                let shutdown_q = shutdown.clone();
+                let lname = cfg.name.clone();
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        http3::serve_quic(quic_bind, qcfg, state_q, ds_q, shutdown_q).await
+                    {
+                        error!(listener = %lname, "HTTP/3 endpoint error: {e}");
+                    }
+                });
+                info!(listener = %cfg.name, bind = %cfg.bind, "HTTP/3 (QUIC) enabled on this listener");
+            }
+            Err(e) => {
+                error!(listener = %cfg.name, bind = %cfg.bind, "HTTP/3 requested but bind is not a socket address ({e}); h3 disabled");
+            }
+        }
+    }
+
+    // Alt-Svc advertisement — browsers connect over TCP first, then upgrade to
+    // h3 on the advertised UDP port. Defaults to this listener's bind port;
+    // override with SENTINEL_HTTP3_ADVERTISE_PORT when the public port differs
+    // (e.g. a container mapping host :443/udp → container :8443/udp).
+    let alt_svc: Option<header::HeaderValue> = if h3_enabled {
+        let bind_port = cfg
+            .bind
+            .parse::<SocketAddr>()
+            .map(|a| a.port())
+            .unwrap_or(0);
+        let port = std::env::var("SENTINEL_HTTP3_ADVERTISE_PORT")
+            .ok()
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(bind_port);
+        header::HeaderValue::from_str(&format!("h3=\":{port}\"; ma=86400")).ok()
+    } else {
+        None
+    };
 
     loop {
         tokio::select! {
@@ -991,8 +1061,9 @@ async fn serve_listener(
                 let protos = cfg.protocols();
                 let ds = default_site.clone();
                 let mgmt = management.clone();
+                let av = alt_svc.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, peer, acceptor, protos, state, ds, mgmt).await {
+                    if let Err(e) = handle_connection(stream, peer, acceptor, protos, state, ds, mgmt, av).await {
                         debug!(peer = %peer, "connection error: {e}");
                     }
                 });
@@ -1018,6 +1089,7 @@ async fn handle_connection(
     state: Arc<ServerState>,
     default_site: Option<String>,
     management: Option<Arc<ManagementUpstreams>>,
+    alt_svc: Option<header::HeaderValue>,
 ) -> anyhow::Result<()> {
     stream.set_nodelay(true)?;
 
@@ -1026,16 +1098,16 @@ async fn handle_connection(
         let negotiated = tls.get_ref().1.alpn_protocol().map(|p| p.to_vec());
         let io = TokioIo::new(tls);
         if negotiated.as_deref() == Some(b"h2") {
-            serve_http2(io, peer, state, default_site, management).await
+            serve_http2(io, peer, state, default_site, management, alt_svc).await
         } else {
-            serve_http1(io, peer, state, default_site, management).await
+            serve_http1(io, peer, state, default_site, management, alt_svc).await
         }
     } else {
         let io = TokioIo::new(stream);
         if protocols.contains(&Protocol::Http2) && !protocols.contains(&Protocol::Http1) {
-            serve_http2(io, peer, state, default_site, management).await
+            serve_http2(io, peer, state, default_site, management, alt_svc).await
         } else {
-            serve_http1(io, peer, state, default_site, management).await
+            serve_http1(io, peer, state, default_site, management, alt_svc).await
         }
     }
 }
@@ -1046,6 +1118,7 @@ async fn serve_http1<T>(
     state: Arc<ServerState>,
     default_site: Option<String>,
     management: Option<Arc<ManagementUpstreams>>,
+    alt_svc: Option<header::HeaderValue>,
 ) -> anyhow::Result<()>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -1057,7 +1130,8 @@ where
                 let s = Arc::clone(&state);
                 let ds = default_site.clone();
                 let mgmt = management.clone();
-                async move { handle_request(s, peer, req, ds, mgmt).await }
+                let av = alt_svc.clone();
+                async move { with_alt_svc(handle_request(s, peer, req, ds, mgmt).await, av) }
             }),
         )
         .with_upgrades()
@@ -1071,6 +1145,7 @@ async fn serve_http2<T>(
     state: Arc<ServerState>,
     default_site: Option<String>,
     management: Option<Arc<ManagementUpstreams>>,
+    alt_svc: Option<header::HeaderValue>,
 ) -> anyhow::Result<()>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -1082,11 +1157,27 @@ where
                 let s = Arc::clone(&state);
                 let ds = default_site.clone();
                 let mgmt = management.clone();
-                async move { handle_request(s, peer, req, ds, mgmt).await }
+                let av = alt_svc.clone();
+                async move { with_alt_svc(handle_request(s, peer, req, ds, mgmt).await, av) }
             }),
         )
         .await
         .map_err(|e| anyhow!("http2 serve error: {e}"))
+}
+
+/// Attach the `Alt-Svc` header (advertising HTTP/3) to a TCP response when the
+/// listener has h3 enabled. No-op when `alt_svc` is `None`.
+fn with_alt_svc(
+    resp: Result<Response<BoxBody>, Infallible>,
+    alt_svc: Option<header::HeaderValue>,
+) -> Result<Response<BoxBody>, Infallible> {
+    match (resp, alt_svc) {
+        (Ok(mut r), Some(v)) => {
+            r.headers_mut().insert(header::ALT_SVC, v);
+            Ok(r)
+        }
+        (other, _) => other,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1149,13 +1240,34 @@ async fn handle_request(
         return Ok(error_response(StatusCode::NOT_FOUND, "unknown internal endpoint"));
     }
 
+    // Hand off to the shared WAF pipeline. The TCP body (`Incoming`) is boxed
+    // into `BoxBody` so one pipeline serves both TCP (h1/h2) and QUIC (h3) — see
+    // `run_pipeline`, also called by the HTTP/3 adapter in `http3.rs`. `.map()`
+    // preserves request extensions, so the WebSocket `OnUpgrade` handle captured
+    // by hyper survives the body swap (`CanUpgrade` is generic over the body).
+    Ok(run_pipeline(state, peer, req.map(|b| b.boxed()), default_site).await)
+}
+
+/// Shared request pipeline, transport-agnostic over the request body type.
+///
+/// Runs the eBPF fast-fail, sets up the tracing span, drives the WAF pipeline
+/// (`proxy`), and records metrics. Called by the TCP handler (`handle_request`,
+/// after its health/management/ACME routing boxes the `Incoming` body) and by
+/// the HTTP/3 adapter (`crate::http3`), which builds a `BoxBody` from the QUIC
+/// request stream. Never returns an error — upstream failures become responses.
+pub(crate) async fn run_pipeline(
+    state: Arc<ServerState>,
+    peer: SocketAddr,
+    req: Request<BoxBody>,
+    default_site: Option<String>,
+) -> Response<BoxBody> {
     // eBPF fast-fail: known-blocked IPs never enter the WAF pipeline.
     // Runs before body reads, header parsing, or any other work.
     if state.ebpf.is_blocked(peer.ip()) {
         inc_ebpf_drops();
         inc_requests();
         inc_blocked();
-        return Ok(error_response(StatusCode::FORBIDDEN, "Forbidden"));
+        return error_response(StatusCode::FORBIDDEN, "Forbidden");
     }
 
     let t0 = Instant::now();
@@ -1189,13 +1301,13 @@ async fn handle_request(
     }
     observe_duration(t0.elapsed().as_secs_f64() * 1000.0);
 
-    Ok(resp)
+    resp
 }
 
 async fn proxy(
     state: Arc<ServerState>,
     peer: SocketAddr,
-    mut req: Request<Incoming>,
+    mut req: Request<BoxBody>,
     default_site: Option<String>,
 ) -> anyhow::Result<Response<BoxBody>> {
     let cfg = state.config.load();
@@ -1448,7 +1560,8 @@ async fn proxy(
             .map_err(|never: Infallible| match never {})
             .boxed()
     } else {
-        body.boxed()
+        // Already a `BoxBody` (TCP: boxed `Incoming`; h3: buffered QUIC body).
+        body
     };
 
     // --- Phase 3: Upstream ---
@@ -2892,6 +3005,31 @@ fn health_response(state: &ServerState) -> Response<BoxBody> {
         .iter()
         .map(|l| format!("{}:{}", l.name, l.bind))
         .collect();
+
+    // HTTP/3 summary for the dashboard status card. Mirrors the enable logic in
+    // `serve_listener`: h3 is offered on a TLS, non-management listener whose
+    // protocol set includes Http3. The advertised UDP port is what browsers
+    // reach (SENTINEL_HTTP3_ADVERTISE_PORT, else the listener's bind port).
+    let h3_listener = cfg.listeners.iter().find(|l| {
+        l.is_tls() && !l.is_management() && l.protocols().contains(&Protocol::Http3)
+    });
+    let http3 = match h3_listener {
+        Some(l) => {
+            let bind_port = l.bind.parse::<SocketAddr>().map(|a| a.port()).unwrap_or(0);
+            let advertise_port = std::env::var("SENTINEL_HTTP3_ADVERTISE_PORT")
+                .ok()
+                .and_then(|s| s.parse::<u16>().ok())
+                .unwrap_or(bind_port);
+            serde_json::json!({
+                "enabled": true,
+                "listener": l.name,
+                "bind": l.bind,
+                "advertise_port": advertise_port,
+            })
+        }
+        None => serde_json::json!({ "enabled": false }),
+    };
+
     let pool_stats = state.upstream_pool.stats();
     let start = *START_TIME.get_or_init(SystemTime::now);
     let uptime_secs = start.elapsed().unwrap_or_default().as_secs();
@@ -2901,6 +3039,7 @@ fn health_response(state: &ServerState) -> Response<BoxBody> {
         "uptime_secs": uptime_secs,
         "sites": site_count,
         "listeners": listeners,
+        "http3": http3,
         "upstreams_healthy": pool_stats.healthy,
         "upstreams_total": pool_stats.total,
         "version": env!("CARGO_PKG_VERSION"),
@@ -3078,6 +3217,7 @@ fn record_event(ctx: &RequestContext) {
         severity: top.map(|r| format!("{:?}", r.severity).to_uppercase()).unwrap_or_default(),
         score: ctx.anomaly_score,
         status: ctx.response_status.map(|s| s.as_u16()).unwrap_or(0),
+        protocol: protocol_label(ctx.http_version).to_string(),
     };
     if let Ok(mut buf) = waf_events().lock() {
         if buf.len() < 20_000 {
@@ -3293,6 +3433,20 @@ fn ndjson_logging_enabled() -> bool {
     })
 }
 
+/// Canonical short protocol label used everywhere protocol is surfaced — NDJSON
+/// logs, the ClickHouse `waf_events.protocol` column, and the dashboard
+/// filters/facets: HTTP/1.x → `h1`, HTTP/2 → `h2`, HTTP/3 → `h3`. Keeping a
+/// single vocabulary is what lets the Threat Search facet/filter join line up
+/// across the Rust writer, the Go reader, and the UI.
+fn protocol_label(v: http::Version) -> &'static str {
+    match v {
+        http::Version::HTTP_2 => "h2",
+        http::Version::HTTP_3 => "h3",
+        // HTTP/0.9, 1.0 and 1.1 all bucket as h1.
+        _ => "h1",
+    }
+}
+
 fn ndjson_log(ctx: &RequestContext) {
     if !ndjson_logging_enabled() {
         return;
@@ -3320,11 +3474,12 @@ fn ndjson_log(ctx: &RequestContext) {
         "path":    ctx.uri.path(),
         "status":  status,
         "latency": format!("{:.2}", ctx.elapsed_ms()),
-        "bytes":   ctx.bytes_sent,
-        "site":    site,
-        "ua":      ua,
-        "action":  action,
-        "score":   ctx.anomaly_score,
+        "bytes":    ctx.bytes_sent,
+        "site":     site,
+        "protocol": protocol_label(ctx.http_version),
+        "ua":       ua,
+        "action":   action,
+        "score":    ctx.anomaly_score,
     });
     enqueue_log("access.log", access.to_string());
 
@@ -3358,6 +3513,7 @@ fn ndjson_log(ctx: &RequestContext) {
             "attack": attack,
             "action": action,
             "site":   site,
+            "protocol": protocol_label(ctx.http_version),
             "msg":    ctx.block_reason.as_deref().unwrap_or(""),
             "would_block": ctx.would_block,
             "ml_scores": ctx.ml_scores,

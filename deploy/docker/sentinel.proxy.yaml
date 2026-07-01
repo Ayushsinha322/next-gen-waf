@@ -27,9 +27,13 @@ listeners:
   # repository by the client's SNI, with a self-signed fallback (incl. a
   # "default" cert for bare-IP / no-SNI clients so the handshake completes).
   # HTTP/2 enabled — the proxy synthesizes the Host from the h2 :authority.
+  # HTTP/3 (QUIC) is served on the same address over UDP, reusing this SNI
+  # resolver; browsers discover it via the Alt-Svc header on h1/h2 responses.
+  # (compose publishes host 443/udp -> 8443/udp; advertise port set via
+  # SENTINEL_HTTP3_ADVERTISE_PORT=443.)
   - name: https
     bind: "0.0.0.0:8443"
-    protocol: [http1, http2]
+    protocol: [http1, http2, http3]
     tls: {}
   # Dedicated MANAGEMENT listener (admin console). Served by Sentinel's own
   # engine — no third-party proxy. Bypasses the WAF pipeline and reverse-proxies

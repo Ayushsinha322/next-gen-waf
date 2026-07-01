@@ -30,9 +30,9 @@ function fmt(kind: LogKind, r: Record<string, unknown>): string {
   const ts = String(r.ts ?? "");
   switch (kind) {
     case "access":
-      return `${ts} [${Number(r.status ?? 200) >= 400 ? "BLOCK" : "PASS"}] ${r.ip} ${r.method} ${r.path} ${r.status} latency=${r.latency}ms bytes=${r.bytes} site=${r.site} ua="${r.ua ?? "-"}"`;
+      return `${ts} [${Number(r.status ?? 200) >= 400 ? "BLOCK" : "PASS"}] ${r.ip} ${r.method} ${r.path} ${r.status} proto=${r.protocol ?? "-"} latency=${r.latency}ms bytes=${r.bytes} site=${r.site} ua="${r.ua ?? "-"}"`;
     case "waf":
-      return `${ts} [${r.action ?? "BLOCK"}] ${r.ip} ${r.method} ${r.path} rule=${r.rule ?? r.rule_id} score=${r.score} sev=${r.sev} attack="${r.attack}" site=${r.site}`;
+      return `${ts} [${r.action ?? "BLOCK"}] ${r.ip} ${r.method} ${r.path} rule=${r.rule ?? r.rule_id} score=${r.score} sev=${r.sev} attack="${r.attack}" proto=${r.protocol ?? "-"} site=${r.site}`;
     case "error":
       return `${ts} [${r.lvl ?? "ERROR"}] component=${r.subsystem ?? r.component} code=${r.code ?? "-"} msg="${r.msg}"`;
     case "audit":
@@ -59,6 +59,7 @@ function hl(raw: string): string {
     .replace(/\b(403|429|400|401|405|500|502|503)\b/g,'<span class="hl-block">$1</span>')
     .replace(/\b(200|201|204|301|302|304)\b/g,        '<span class="hl-ok">$1</span>')
     .replace(/ (\/[^\s"&;]+)/g,                       ' <span class="hl-path">$1</span>')
+    .replace(/proto=(h[123]|-)/g,                     'proto=<span class="hl-method">$1</span>')
     .replace(/score=(\d+)/g,                          'score=<span class="hl-score">$1</span>');
 }
 

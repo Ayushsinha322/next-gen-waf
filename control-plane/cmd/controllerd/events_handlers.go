@@ -36,15 +36,16 @@ func handleEventsSearch(c *gin.Context, enf *rbac.Enforcer, ch *clickhouse.Clien
 		return
 	}
 	f := clickhouse.SearchFilter{
-		Site:    c.Query("site"),
-		Country: c.Query("country"),
-		Rule:    c.Query("rule"),
-		Action:  c.Query("action"),
-		IP:      c.Query("ip"),
-		Query:   c.Query("q"),
-		From:    atoi64(c.Query("from")),
-		To:      atoi64(c.Query("to")),
-		Limit:   int(atoi64(c.Query("limit"))),
+		Site:     c.Query("site"),
+		Country:  c.Query("country"),
+		Rule:     c.Query("rule"),
+		Action:   c.Query("action"),
+		IP:       c.Query("ip"),
+		Protocol: c.Query("protocol"),
+		Query:    c.Query("q"),
+		From:     atoi64(c.Query("from")),
+		To:       atoi64(c.Query("to")),
+		Limit:    int(atoi64(c.Query("limit"))),
 	}
 	events, err := ch.Search(c.Request.Context(), f)
 	if err != nil {

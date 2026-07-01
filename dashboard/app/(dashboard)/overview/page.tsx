@@ -78,7 +78,7 @@ export default function OverviewPage() {
   const [stats, setStats]     = useState<DashboardStats | null>(null);
   const [metrics, setMetrics] = useState<MetricsSnapshot | null>(null);
   const [feed, setFeed]       = useState<FeedRow[]>([]);
-  const [wafStatus, setWafStatus] = useState<{ running: boolean; uptime?: number; sites?: number; upstreams_healthy?: number; upstreams_total?: number } | null>(null);
+  const [wafStatus, setWafStatus] = useState<{ running: boolean; uptime?: number; sites?: number; upstreams_healthy?: number; upstreams_total?: number; http3?: { enabled: boolean; listener?: string; bind?: string; advertise_port?: number } } | null>(null);
   const [plugins, setPlugins] = useState<number | null>(null);
   const [instances, setInstances] = useState<number | null>(null);
 
@@ -98,7 +98,7 @@ export default function OverviewPage() {
     async function f() {
       try {
         const r = await api.waf.status();
-        if (!cancelled) setWafStatus({ running: r.waf_running, uptime: r.uptime_secs, sites: r.sites, upstreams_healthy: r.upstreams_healthy, upstreams_total: r.upstreams_total });
+        if (!cancelled) setWafStatus({ running: r.waf_running, uptime: r.uptime_secs, sites: r.sites, upstreams_healthy: r.upstreams_healthy, upstreams_total: r.upstreams_total, http3: r.http3 });
       } catch { setWafStatus(null); }
     }
     f(); const t = setInterval(f, 10_000); return () => { cancelled = true; clearInterval(t); };
@@ -307,11 +307,18 @@ export default function OverviewPage() {
       </motion.div>
 
       {/* Live metric cards */}
-      <motion.div variants={staggerContainer} style={{ display: "grid", gridTemplateColumns: "repeat(4,minmax(0,1fr))", gap: 14 }}>
+      <motion.div variants={staggerContainer} style={{ display: "grid", gridTemplateColumns: "repeat(5,minmax(0,1fr))", gap: 14 }}>
         <motion.div className="mc blue" variants={cardVariants}><div className="mc-label">Requests / sec</div><div className="mc-val"><AnimatedValue value={rps} /></div><div className="mc-delta up">▲ live · 1-sec samples</div></motion.div>
         <motion.div className="mc red" variants={cardVariants}><div className="mc-label">Threats blocked</div><div className="mc-val"><AnimatedValue value={blkCount} /></div><div className="mc-delta up">▲ {openAlerts} open alerts</div></motion.div>
         <motion.div className="mc green" variants={cardVariants}><div className="mc-label">p99 Latency</div><div className="mc-val">{p99 > 0 ? p99.toFixed(2) + "ms" : "—"}</div><div className="mc-delta up">▼ sub-millisecond target</div></motion.div>
         <motion.div className="mc pur" variants={cardVariants}><div className="mc-label">ML detections</div><div className="mc-val"><AnimatedValue value={mlDet} /></div><div className="mc-delta" style={{ color: "#c4b5fd" }}>▲ anomaly engine active</div></motion.div>
+        <motion.div className="mc cyan" variants={cardVariants}>
+          <div className="mc-label">HTTP/3</div>
+          <div className="mc-val" style={{ fontSize: 22 }}>{wafStatus?.http3?.enabled ? "Active" : "Off"}</div>
+          <div className="mc-delta" style={{ color: wafStatus?.http3?.enabled ? "#67e8f9" : "var(--text3)" }}>
+            {wafStatus?.http3?.enabled ? `▲ QUIC · :${wafStatus.http3.advertise_port ?? "443"}` : "— not enabled"}
+          </div>
+        </motion.div>
       </motion.div>
 
       {/* Traffic chart + Attack breakdown */}
