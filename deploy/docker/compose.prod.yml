@@ -229,11 +229,50 @@ services:
     mem_limit: 768m
     networks: [sentinel]
 
+  # Metrics stack. Prometheus scrapes the control plane's /metrics (real
+  # aggregated WAF metrics); Grafana ships a provisioned datasource + the
+  # "Sentinel WAF — Overview" dashboard. Grafana UI on host :3001.
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=15d
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
+    depends_on:
+      controlplane: { condition: service_started }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks: [sentinel]
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafanadata:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      prometheus: { condition: service_started }
+    ports:
+      - "3001:3000"
+    networks: [sentinel]
+
 volumes:
   pgdata:
   chdata:
   sentinel-logs:
   sentinel-certs:
+  promdata:
+  grafanadata:
 
 networks:
   sentinel:

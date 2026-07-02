@@ -89,30 +89,69 @@ type DashboardStats struct {
 // Auth helpers
 // ---------------------------------------------------------------------------
 
-// ValidatePassword looks up the user by email within the tenant and verifies
-// the plaintext password against the stored argon2id hash.
-// Returns (true, userID, role, nil) on success.
-func (s *Store) ValidatePassword(ctx context.Context, tenantID, email, password string) (bool, string, string, error) {
+// ValidatePassword looks up the user by email and verifies the plaintext
+// password against the stored argon2id hash. It returns the user's real
+// tenant_id so the issued token carries the correct tenant (not a hardcoded
+// one), which is what makes the per-tenant RLS + query predicates actually
+// isolate tenants. Returns (true, userID, tenantID, role, nil) on success.
+//
+// NOTE: pre-auth lookup is intentionally by email (across tenants). Under a
+// future non-superuser DB role with FORCE RLS this needs an RLS carve-out for
+// the users table (SECURITY DEFINER fn or a login-lookup policy) — see the
+// migration 0003 runbook.
+func (s *Store) ValidatePassword(ctx context.Context, tenantID, email, password string) (bool, string, string, string, error) {
 	tx, err := s.pool.BeginTenant(ctx, tenantID, "system")
 	if err != nil {
-		return false, "", "", err
+		return false, "", "", "", err
 	}
 	defer tx.Rollback(ctx)
 
-	var userID, role, pwdHash string
+	var userID, userTenantID, role, pwdHash string
 	err = tx.QueryRow(ctx,
-		`SELECT id, role, password_hash FROM users
+		`SELECT id, tenant_id, role, password_hash FROM users
 		 WHERE email = $1 AND status = 'active' AND password_hash IS NOT NULL`,
-		email).Scan(&userID, &role, &pwdHash)
+		email).Scan(&userID, &userTenantID, &role, &pwdHash)
 	if err != nil {
-		return false, "", "", nil
+		return false, "", "", "", nil
 	}
 	tx.Commit(ctx)
 
 	if !checkPassword(password, pwdHash) {
-		return false, "", "", nil
+		return false, "", "", "", nil
 	}
-	return true, userID, role, nil
+	return true, userID, userTenantID, role, nil
+}
+
+// ListAllActiveSites returns all non-deleted sites across EVERY tenant. It is
+// used only by the internal data-plane config sync: the shared proxy serves all
+// tenants' sites, so this path must not be tenant-scoped (unlike ListSites,
+// which is per-tenant for the dashboard). Intentionally node-global.
+//
+// NOTE: under a non-superuser role with FORCE RLS this returns nothing unless
+// granted an RLS bypass for this path — see the migration 0003 runbook.
+func (s *Store) ListAllActiveSites(ctx context.Context) ([]SiteRow, error) {
+	pg, ok := s.pool.(*pgxPool)
+	if !ok {
+		return nil, fmt.Errorf("store: pool is not a *pgxPool")
+	}
+	rows, err := pg.pool.Query(ctx,
+		`SELECT id, tenant_id, name, domains, upstream, waf_policy, status, created_at, updated_at
+		 FROM sites WHERE status <> 'deleted' ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("store: list all active sites: %w", err)
+	}
+	defer rows.Close()
+
+	var sites []SiteRow
+	for rows.Next() {
+		var r SiteRow
+		if err := rows.Scan(&r.ID, &r.TenantID, &r.Name, &r.Domains,
+			&r.Upstream, &r.WafPolicy, &r.Status, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		sites = append(sites, r)
+	}
+	return sites, rows.Err()
 }
 
 // checkPassword verifies plaintext against "argon2id$<hexSalt>$<hexHash>".

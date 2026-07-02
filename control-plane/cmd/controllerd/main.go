@@ -332,6 +332,10 @@ func run() error {
 	// path in handleLogsStream is reachable. EventSource cannot set headers.
 	router.GET("/api/v1/logs/stream", func(c *gin.Context) { handleLogsStream(c, jwtSvc, enforcer, hub) })
 
+	// Prometheus scrape endpoint (real aggregated WAF metrics). Optionally gated
+	// by SENTINEL_METRICS_TOKEN; intended for internal network scraping.
+	router.GET("/metrics", func(c *gin.Context) { handleMetrics(c, hub) })
+
 	// Internal config endpoint — called by the Rust data-plane proxy for site
 	// hot-sync. No JWT: the proxy runs on the same host (or private network).
 	// In production, protect this with mTLS or a network policy.

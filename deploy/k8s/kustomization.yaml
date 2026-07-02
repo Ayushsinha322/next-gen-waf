@@ -20,3 +20,4 @@ resources:
   - 30-sentinel-edge.yaml
   - 40-dashboard.yaml
   - 41-juiceshop.yaml      # demo upstream — remove for a real deployment
+  - 50-networkpolicy.yaml  # datastore network isolation (needs a CNI that enforces NetworkPolicy)

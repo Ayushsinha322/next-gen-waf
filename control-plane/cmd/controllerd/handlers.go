@@ -76,7 +76,7 @@ func handleLogin(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store, hub *
 	var claims auth.Claims
 	var loginResult = "SUCCESS"
 	if store != nil {
-		ok, userID, role, err := store.ValidatePassword(c.Request.Context(),
+		ok, userID, userTenant, role, err := store.ValidatePassword(c.Request.Context(),
 			db.DevTenantID, req.Email, req.Password)
 		if err != nil || !ok {
 			loginResult = "FAILURE"
@@ -89,8 +89,10 @@ func handleLogin(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store, hub *
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid email or password"})
 			return
 		}
+		// Issue the token with the user's REAL tenant so per-tenant RLS and the
+		// query predicates actually scope this session to that tenant.
 		claims = auth.Claims{
-			TenantID:   db.DevTenantID,
+			TenantID:   userTenant,
 			UserID:     userID,
 			Role:       role,
 			AuthMethod: "password",
@@ -129,10 +131,10 @@ func handleLogin(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store, hub *
 		return
 	}
 
-	// Write successful login audit entry.
+	// Write successful login audit entry (scoped to the user's real tenant).
 	userID := claims.UserID
 	writeAuditEntry(c, store, hub, &db.WriteAuditRequest{
-		TenantID:    db.DevTenantID,
+		TenantID:    claims.TenantID,
 		ActorUserID: &userID,
 		Action:      "user.login",
 		TargetKind:  "user",
@@ -748,9 +750,9 @@ func handleInternalConfig(c *gin.Context, store *db.Store) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "db unavailable"})
 		return
 	}
-	// List all sites for the dev tenant — in production this would be
-	// scoped per node/cluster, but for single-tenant dev this is correct.
-	sites, err := store.ListSites(c.Request.Context(), db.DevTenantID, db.DevAdminID)
+	// Node-global: the shared data plane serves EVERY tenant's sites, so this
+	// sync must list all active sites across tenants (not one tenant's view).
+	sites, err := store.ListAllActiveSites(c.Request.Context())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -1823,6 +1825,59 @@ func handleMLStats(c *gin.Context, hub *logs.Hub) {
 func handleTrafficHistory(c *gin.Context, hub *logs.Hub) {
 	buckets := hub.GetTrafficHistory(60)
 	c.JSON(http.StatusOK, gin.H{"buckets": buckets})
+}
+
+// ---------------------------------------------------------------------------
+// Prometheus metrics  GET /metrics
+// ---------------------------------------------------------------------------
+// Exposes the real, aggregated WAF metrics (from the data-plane NDJSON stream)
+// in Prometheus text exposition format. Intended for internal scraping.
+//
+// If SENTINEL_METRICS_TOKEN is set, a matching `Authorization: Bearer <token>`
+// is required (configure it as `authorization` in the Prometheus scrape job);
+// when unset the endpoint is open for same-network scraping.
+
+func promMetric(b *strings.Builder, name, typ, help string, val float64) {
+	fmt.Fprintf(b, "# HELP %s %s\n# TYPE %s %s\n%s %g\n", name, help, name, typ, name, val)
+}
+
+func handleMetrics(c *gin.Context, hub *logs.Hub) {
+	if tok := os.Getenv("SENTINEL_METRICS_TOKEN"); tok != "" {
+		got, _ := auth.BearerToken(c.GetHeader("Authorization"))
+		if subtle.ConstantTimeCompare([]byte(got), []byte(tok)) != 1 {
+			c.String(http.StatusUnauthorized, "unauthorized")
+			return
+		}
+	}
+	s := hub.GetSnapshot()
+	var b strings.Builder
+	promMetric(&b, "sentinel_requests_total", "counter", "Total requests processed by the data plane", float64(s.TotalRequests))
+	promMetric(&b, "sentinel_blocked_total", "counter", "Requests blocked by the WAF", float64(s.BlockedRequests))
+	promMetric(&b, "sentinel_ml_anomalies_total", "counter", "Requests flagged anomalous by ML", float64(s.MLAnomalies))
+	promMetric(&b, "sentinel_errors_total", "counter", "Upstream/proxy errors", float64(s.ErrorCount))
+	promMetric(&b, "sentinel_ebpf_drops_total", "counter", "Packets dropped by the L4 blocklist", float64(s.EbpfDrops))
+	promMetric(&b, "sentinel_unique_blocked_ips", "gauge", "Distinct client IPs blocked", float64(s.UniqueBlockedIPs))
+	promMetric(&b, "sentinel_requests_per_second", "gauge", "Current request rate", s.RPS)
+	promMetric(&b, "sentinel_p99_latency_ms", "gauge", "p99 request latency in milliseconds", s.P99LatencyMs)
+	promMetric(&b, "sentinel_connected_clients", "gauge", "Currently connected clients", float64(s.ConnectedClients))
+	promMetric(&b, "sentinel_mem_used_bytes", "gauge", "Host memory used in bytes", float64(s.MemUsedBytes))
+
+	// Response status classes as a labeled counter.
+	b.WriteString("# HELP sentinel_responses_total Responses by HTTP status class\n# TYPE sentinel_responses_total counter\n")
+	fmt.Fprintf(&b, "sentinel_responses_total{class=\"2xx\"} %d\n", s.Status2xx)
+	fmt.Fprintf(&b, "sentinel_responses_total{class=\"3xx\"} %d\n", s.Status3xx)
+	fmt.Fprintf(&b, "sentinel_responses_total{class=\"4xx\"} %d\n", s.Status4xx)
+	fmt.Fprintf(&b, "sentinel_responses_total{class=\"5xx\"} %d\n", s.Status5xx)
+
+	// Attack breakdown as a labeled counter (real rule-match categories).
+	if len(s.AttackBreakdown) > 0 {
+		b.WriteString("# HELP sentinel_attacks_total WAF rule matches by attack category\n# TYPE sentinel_attacks_total counter\n")
+		for cat, n := range s.AttackBreakdown {
+			fmt.Fprintf(&b, "sentinel_attacks_total{category=%q} %d\n", cat, n)
+		}
+	}
+
+	c.Data(http.StatusOK, "text/plain; version=0.0.4; charset=utf-8", []byte(b.String()))
 }
 
 // ---------------------------------------------------------------------------
