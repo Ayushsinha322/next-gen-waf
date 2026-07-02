@@ -310,5 +310,7 @@
           {% if dashboard_dir != "" %}- "Dashboard:      http://{{ ansible_default_ipv4.address }}:3000"{% endif %}
           - ""
           - "Login:    admin@sentinel.local"
-          - "Password: admin123"
+          - "Password: set via SENTINEL_BOOTSTRAP_ADMIN_PASSWORD, or see the"
+          - "          control-plane startup logs for the generated password"
+          - "          (then log in and rotate it immediately)."
           - "======================================"

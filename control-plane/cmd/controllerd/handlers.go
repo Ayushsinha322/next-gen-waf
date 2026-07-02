@@ -48,6 +48,22 @@ func devLoginEnabled() bool {
 	return false
 }
 
+// requirePerm enforces an RBAC permission inside a route closure for handlers
+// that don't take the enforcer directly (telemetry/status reads). Returns true
+// when allowed; otherwise writes the appropriate 401/403 and returns false.
+func requirePerm(c *gin.Context, enf *rbac.Enforcer, resource, action string) bool {
+	claims, ok := auth.GetClaims(c.Request.Context())
+	if !ok {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthenticated"})
+		return false
+	}
+	if !enf.Allow(rbac.Role(claims.Role), resource, action) {
+		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
+		return false
+	}
+	return true
+}
+
 func handleLogin(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store, hub *logs.Hub) {
 	var req loginRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -164,20 +180,53 @@ func handleRefresh(c *gin.Context, jwtSvc *auth.JWTService) {
 	c.JSON(http.StatusOK, gin.H{"access_token": accessToken, "token_type": "Bearer"})
 }
 
-func handleOIDCLogin(c *gin.Context, jwtSvc *auth.JWTService, log *zap.Logger) {
-	providerURL := c.Query("provider")
-	if providerURL == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "provider query param required"})
-		return
+// oidcStateCookie holds the per-login CSRF state that binds the /login redirect
+// to its /callback.
+const oidcStateCookie = "sentinel_oidc_state"
+
+// oidcConfigFromEnv builds the OIDC config from server-side environment ONLY.
+//
+// The issuer is never taken from a request parameter: previously both handlers
+// read `?provider=`, so an unauthenticated attacker could point the callback at
+// their own IdP and receive a valid editor token. OIDC is now opt-in — disabled
+// unless an HTTPS issuer and a client secret are configured — and the issuer is
+// pinned here, so the exchange can only ever talk to the operator's provider.
+func oidcConfigFromEnv() (auth.OIDCConfig, bool) {
+	issuer := strings.TrimSpace(os.Getenv("SENTINEL_OIDC_ISSUER"))
+	secret := os.Getenv("SENTINEL_OIDC_CLIENT_SECRET")
+	// Fail closed when not explicitly configured, and only trust an HTTPS
+	// issuer (blocks MITM and SSRF to plaintext/internal endpoints).
+	if issuer == "" || secret == "" || !strings.HasPrefix(issuer, "https://") {
+		return auth.OIDCConfig{}, false
 	}
-	oidcCfg := auth.OIDCConfig{
-		ProviderURL:  providerURL,
+	cfg := auth.OIDCConfig{
+		ProviderURL:  issuer,
 		ClientID:     osGetenv("SENTINEL_OIDC_CLIENT_ID", "sentinel"),
-		ClientSecret: osGetenv("SENTINEL_OIDC_CLIENT_SECRET", ""),
+		ClientSecret: secret,
 		RedirectURL:  osGetenv("SENTINEL_OIDC_REDIRECT_URL", "http://localhost:9501/api/v1/auth/oidc/callback"),
 	}
-	oidcSvc := auth.NewOIDCService(oidcCfg)
-	state, _ := auth.NewState()
+	if doms := strings.TrimSpace(os.Getenv("SENTINEL_OIDC_ALLOWED_DOMAINS")); doms != "" {
+		for _, d := range strings.Split(doms, ",") {
+			if d = strings.TrimSpace(d); d != "" {
+				cfg.AllowedDomains = append(cfg.AllowedDomains, d)
+			}
+		}
+	}
+	return cfg, true
+}
+
+func handleOIDCLogin(c *gin.Context, jwtSvc *auth.JWTService, log *zap.Logger) {
+	cfg, ok := oidcConfigFromEnv()
+	if !ok {
+		c.JSON(http.StatusNotImplemented, gin.H{"error": "OIDC login is not configured"})
+		return
+	}
+	oidcSvc := auth.NewOIDCService(cfg)
+	state, err := auth.NewState()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start login"})
+		return
+	}
 	nonce, _ := auth.NewNonce()
 	authURL, err := oidcSvc.AuthURL(c.Request.Context(), state, nonce)
 	if err != nil {
@@ -185,22 +234,41 @@ func handleOIDCLogin(c *gin.Context, jwtSvc *auth.JWTService, log *zap.Logger) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to build auth URL"})
 		return
 	}
+	// Bind `state` to the browser via a short-lived HttpOnly cookie so the
+	// callback can verify it (CSRF / login-fixation protection). SameSite=Lax
+	// lets the cookie ride the top-level redirect back from the IdP.
+	secure := strings.HasPrefix(cfg.RedirectURL, "https://")
+	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetCookie(oidcStateCookie, state, 300, "/", "", secure, true)
 	c.Redirect(http.StatusFound, authURL)
 }
 
 func handleOIDCCallback(c *gin.Context, jwtSvc *auth.JWTService, log *zap.Logger) {
+	cfg, ok := oidcConfigFromEnv()
+	if !ok {
+		c.JSON(http.StatusNotImplemented, gin.H{"error": "OIDC login is not configured"})
+		return
+	}
 	code := c.Query("code")
 	if code == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "missing code"})
 		return
 	}
-	oidcCfg := auth.OIDCConfig{
-		ProviderURL:  c.Query("provider"),
-		ClientID:     osGetenv("SENTINEL_OIDC_CLIENT_ID", "sentinel"),
-		ClientSecret: osGetenv("SENTINEL_OIDC_CLIENT_SECRET", ""),
-		RedirectURL:  osGetenv("SENTINEL_OIDC_REDIRECT_URL", "http://localhost:9501/api/v1/auth/oidc/callback"),
+	// Verify the state parameter against the cookie set when the login started.
+	// Combined with the server-pinned issuer, this is what makes the callback
+	// un-forgeable: no valid cookie + matching state, no token.
+	wantState, err := c.Cookie(oidcStateCookie)
+	if err != nil || wantState == "" ||
+		subtle.ConstantTimeCompare([]byte(wantState), []byte(c.Query("state"))) != 1 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid or missing OIDC state"})
+		return
 	}
-	oidcSvc := auth.NewOIDCService(oidcCfg)
+	// One-time use: clear the state cookie immediately.
+	secure := strings.HasPrefix(cfg.RedirectURL, "https://")
+	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetCookie(oidcStateCookie, "", -1, "/", "", secure, true)
+
+	oidcSvc := auth.NewOIDCService(cfg)
 	userInfo, err := oidcSvc.ExchangeToken(c.Request.Context(), code)
 	if err != nil {
 		log.Error("oidc exchange", zap.Error(err))
@@ -650,7 +718,17 @@ func encodeExclusions(waf map[string]json.RawMessage, excl []ruleExclusionSpec) 
 func internalSecretOK(c *gin.Context) bool {
 	secret := os.Getenv("SENTINEL_INTERNAL_SECRET")
 	if secret == "" {
-		return true
+		// Fail closed. With no shared secret configured, only accept the
+		// data-plane sync from a loopback peer (same host) — a remote caller on
+		// the exposed REST port must not be able to read site topology. Set
+		// SENTINEL_INTERNAL_SECRET when the data plane runs on another host or
+		// in a separate container.
+		host, _, err := net.SplitHostPort(c.Request.RemoteAddr)
+		if err != nil {
+			host = c.Request.RemoteAddr
+		}
+		ip := net.ParseIP(host)
+		return ip != nil && ip.IsLoopback()
 	}
 	got := c.GetHeader("X-Sentinel-Internal")
 	return subtle.ConstantTimeCompare([]byte(got), []byte(secret)) == 1
@@ -1340,7 +1418,7 @@ func handleCreateAPIKey(c *gin.Context, enf *rbac.Enforcer) {
 // Authorization header (preferred) or as the ?token= query parameter (needed
 // when EventSource in the browser cannot set headers).
 
-func handleLogsStream(c *gin.Context, jwtSvc *auth.JWTService, hub *logs.Hub) {
+func handleLogsStream(c *gin.Context, jwtSvc *auth.JWTService, enf *rbac.Enforcer, hub *logs.Hub) {
 	// Allow token via query param for browser EventSource compatibility.
 	if c.GetHeader("Authorization") == "" {
 		if t := c.Query("token"); t != "" {
@@ -1354,12 +1432,32 @@ func handleLogsStream(c *gin.Context, jwtSvc *auth.JWTService, hub *logs.Hub) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
 		return
 	}
-	if _, err := jwtSvc.Validate(tokenStr); err != nil {
+	claims, err := jwtSvc.Validate(tokenStr)
+	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
+		return
+	}
+	if claims.AuthMethod == "refresh" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "refresh token is not valid for API access"})
+		return
+	}
+
+	// RBAC: only roles that can view operational data may stream, and the audit
+	// stream is restricted to roles allowed to read audit logs. Previously any
+	// authenticated role (incl. viewer) could read the live audit trail.
+	role := rbac.Role(claims.Role)
+	canView := enf.Allow(role, rbac.ResourceSite, rbac.ActionList)
+	canAudit := enf.Allow(role, rbac.ResourceAudit, rbac.ActionList)
+	if !canView && !canAudit {
+		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
 		return
 	}
 
 	kindFilter := c.Query("kind") // empty = all
+	if kindFilter == "audit" && !canAudit {
+		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions for audit stream"})
+		return
+	}
 
 	ch := hub.Subscribe()
 	defer hub.Unsubscribe(ch)
@@ -1390,6 +1488,11 @@ func handleLogsStream(c *gin.Context, jwtSvc *auth.JWTService, hub *logs.Hub) {
 				return
 			}
 			if kindFilter == "" || entry.Kind == kindFilter {
+				// Never leak audit events to a role that can't read audit logs,
+				// even on the unfiltered ("all kinds") stream.
+				if entry.Kind == "audit" && !canAudit {
+					continue
+				}
 				writeEvent(entry)
 			}
 		}

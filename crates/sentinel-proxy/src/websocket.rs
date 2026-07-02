@@ -45,6 +45,14 @@ const MAX_FRAMES_PER_SEC: u32 = 60;
 /// than this are passed through without content inspection.
 const MAX_INSPECT_FRAME_BYTES: usize = 64 * 1024; // 64 KiB
 
+/// Absolute maximum WebSocket frame payload we will buffer and relay (bytes).
+/// A frame declaring a larger length is rejected and the connection is torn
+/// down.  This guard runs *before* any allocation, so a malicious length field
+/// cannot trigger an allocation-capacity panic (release builds use
+/// `panic = "abort"`, so such a panic would crash the entire proxy process)
+/// or exhaust worker memory.
+const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+
 /// Synthetic URI used when constructing a RequestContext for frame inspection.
 const WS_INSPECT_URI: &str = "/__sentinel_ws_frame__";
 
@@ -93,6 +101,16 @@ pub async fn read_frame<R: AsyncReadExt + Unpin>(
         }
         n => n as usize,
     };
+
+    // Hard-cap the declared length BEFORE allocating.  Without this, a ~10-byte
+    // frame declaring a huge length reaches `vec![0u8; payload_len]` below and
+    // aborts the process (capacity-overflow panic under panic=abort) or OOMs
+    // the worker.  Reject oversized frames and let the caller close the relay.
+    if payload_len > MAX_FRAME_BYTES {
+        anyhow::bail!(
+            "WS frame payload length {payload_len} exceeds maximum {MAX_FRAME_BYTES}"
+        );
+    }
 
     let mask = if masked {
         let mut m = [0u8; 4];

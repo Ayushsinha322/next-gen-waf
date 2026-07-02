@@ -216,7 +216,9 @@ impl AcmeClient {
             AcmeKey::from_der(&std::fs::read(&account_file)?)?
         } else {
             let k = AcmeKey::generate()?;
-            std::fs::write(&account_file, &k.pkcs8_der)?;
+            // The ACME account key is private key material — write it 0600
+            // (atomic), not at the world-readable process umask default.
+            super::cert_store::write_atomic(&account_file, &k.pkcs8_der)?;
             k
         };
 

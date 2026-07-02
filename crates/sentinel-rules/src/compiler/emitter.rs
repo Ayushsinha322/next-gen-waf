@@ -175,6 +175,19 @@ impl Default for RuleMeta {
 // Compiled rule set
 // ---------------------------------------------------------------------------
 
+/// Which rules from the source ruleset are NOT actually enforced, so operators
+/// can see coverage gaps instead of them vanishing into a log line. Populated
+/// by the compiler and surfaced at load time.
+#[derive(Debug, Clone, Default)]
+pub struct RuleCoverage {
+    /// Rules that failed to compile (e.g. an unsupported PCRE regex) and are
+    /// therefore not loaded at all: `(rule_id, reason)`.
+    pub dropped: Vec<(u32, String)>,
+    /// Rules that loaded but are permanently inert because their operator is
+    /// unsupported (imported as `Never`) — they can never match.
+    pub disabled: Vec<u32>,
+}
+
 /// The output of the compiler — shared across all request-processing threads
 /// via `Arc`.  All fields are immutable after compilation.
 pub struct CompiledRuleSet {
@@ -198,6 +211,10 @@ pub struct CompiledRuleSet {
 
     /// Rule metadata keyed by `rule_id`.
     pub rule_meta: HashMap<u32, RuleMeta>,
+
+    /// Rules from the source set that are not enforced (compile-dropped or
+    /// disabled). Empty when every rule compiled and is active.
+    pub coverage: RuleCoverage,
 }
 
 impl Default for CompiledRuleSet {
@@ -210,6 +227,7 @@ impl Default for CompiledRuleSet {
             ml_models: Vec::new(),
             plugin_names: Vec::new(),
             rule_meta: HashMap::new(),
+            coverage: RuleCoverage::default(),
         }
     }
 }

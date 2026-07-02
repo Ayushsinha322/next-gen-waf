@@ -45,7 +45,7 @@ use hyper::body::Body;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper_util::client::legacy::Client;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use regex::Regex;
 use rustls::ServerConfig;
 use sentinel_core::{
@@ -1081,6 +1081,18 @@ async fn serve_listener(
 // Per-connection handler
 // ---------------------------------------------------------------------------
 
+/// Max time a client may take to send the complete request head before the
+/// HTTP/1 connection is dropped — bounds slowloris header-dribbling.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
+/// Max time allowed for the TLS handshake to complete, so a client that opens a
+/// socket and then stalls the handshake can't pin a worker task indefinitely.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+/// HTTP/2 stream-concurrency cap (bounds stream-flood / rapid-reset amplification).
+const H2_MAX_CONCURRENT_STREAMS: u32 = 256;
+/// HTTP/2 keep-alive ping cadence + timeout, so stalled/dead peers are reaped.
+const H2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const H2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+
 async fn handle_connection(
     stream: TcpStream,
     peer: SocketAddr,
@@ -1094,7 +1106,10 @@ async fn handle_connection(
     stream.set_nodelay(true)?;
 
     if let Some(acceptor) = tls_acceptor {
-        let tls = acceptor.accept(stream).await.context("TLS handshake failed")?;
+        let tls = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream))
+            .await
+            .context("TLS handshake timed out")?
+            .context("TLS handshake failed")?;
         let negotiated = tls.get_ref().1.alpn_protocol().map(|p| p.to_vec());
         let io = TokioIo::new(tls);
         if negotiated.as_deref() == Some(b"h2") {
@@ -1124,6 +1139,10 @@ where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     hyper::server::conn::http1::Builder::new()
+        // A timer must be configured for header_read_timeout to arm (hyper
+        // panics at runtime otherwise).
+        .timer(TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT)
         .serve_connection(
             io,
             hyper::service::service_fn(move |req| {
@@ -1151,6 +1170,11 @@ where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+        // Timer required for the keep-alive interval/timeout to arm.
+        .timer(TokioTimer::new())
+        .max_concurrent_streams(H2_MAX_CONCURRENT_STREAMS)
+        .keep_alive_interval(H2_KEEPALIVE_INTERVAL)
+        .keep_alive_timeout(H2_KEEPALIVE_TIMEOUT)
         .serve_connection(
             io,
             hyper::service::service_fn(move |req| {
@@ -1510,6 +1534,8 @@ async fn proxy(
         // data read), then verify again after buffering for chunked bodies that
         // lack a Content-Length header.
         let bytes = if max_bytes > 0 {
+            // Cheap early reject when the client declares an oversized
+            // Content-Length (no body bytes read yet).
             let upper = body.size_hint().upper().unwrap_or(0);
             if upper > max_bytes {
                 ctx.decision = WafDecision::Block;
@@ -1524,22 +1550,31 @@ async fn proxy(
                     "Request Entity Too Large",
                 ));
             }
-            let b = body.collect().await.context("collecting request body")?.to_bytes();
-            if b.len() as u64 > max_bytes {
-                ctx.decision = WafDecision::Block;
-                ctx.block_reason = Some(format!(
-                    "request body too large: {} bytes (limit {})",
-                    b.len(),
-                    max_bytes
-                ));
-                ctx.advance_phase(Phase::Logging);
-                log_request(&ctx);
-                return Ok(error_response(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "Request Entity Too Large",
-                ));
+            // Enforce the cap WHILE streaming. For `Transfer-Encoding: chunked`
+            // bodies size_hint is None (→0), so without this an attacker could
+            // stream gigabytes into memory before the post-collection check ever
+            // ran. `Limited` aborts collection the instant the body exceeds the
+            // cap, bounding memory to `max_bytes`.
+            match http_body_util::Limited::new(body, max_bytes as usize)
+                .collect()
+                .await
+            {
+                Ok(collected) => collected.to_bytes(),
+                Err(e) if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() => {
+                    ctx.decision = WafDecision::Block;
+                    ctx.block_reason = Some(format!(
+                        "request body too large (limit {} bytes)",
+                        max_bytes
+                    ));
+                    ctx.advance_phase(Phase::Logging);
+                    log_request(&ctx);
+                    return Ok(error_response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "Request Entity Too Large",
+                    ));
+                }
+                Err(e) => return Err(anyhow::anyhow!("collecting request body: {e}")),
             }
-            b
         } else {
             body.collect().await.context("collecting request body")?.to_bytes()
         };
@@ -3381,7 +3416,7 @@ fn log_writer_loop(rx: std::sync::mpsc::Receiver<LogRecord>) {
     let mut files: std::collections::HashMap<&'static str, RotatingFile> = std::collections::HashMap::new();
     let mut last_dropped = 0u64;
 
-    let mut write_one = |files: &mut std::collections::HashMap<&'static str, RotatingFile>, rec: LogRecord| {
+    let write_one = |files: &mut std::collections::HashMap<&'static str, RotatingFile>, rec: LogRecord| {
         if !files.contains_key(rec.name) {
             match RotatingFile::open(&dir, rec.name, max_bytes, keep) {
                 Ok(rf) => {

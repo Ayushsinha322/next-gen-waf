@@ -6,9 +6,31 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
+	"strings"
 
 	"golang.org/x/crypto/argon2"
 )
+
+// seedAdminPassword decides the initial admin password. Precedence:
+//  1. SENTINEL_BOOTSTRAP_ADMIN_PASSWORD  — operator-supplied (recommended in prod)
+//  2. "admin123"                          — only when SENTINEL_DEV_LOGIN is on
+//  3. a freshly generated random secret   — the secure default for any other deploy
+//
+// The second return value reports whether the password was generated, so the
+// caller can print it once for the operator to retrieve and rotate.
+func seedAdminPassword() (string, bool) {
+	if pw := strings.TrimSpace(os.Getenv("SENTINEL_BOOTSTRAP_ADMIN_PASSWORD")); pw != "" {
+		return pw, false
+	}
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("SENTINEL_DEV_LOGIN"))) {
+	case "1", "true", "yes", "on":
+		return "admin123", false
+	}
+	b := make([]byte, 24)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b), true
+}
 
 const (
 	// DevTenantID is the well-known UUID for the default dev tenant.
@@ -49,21 +71,31 @@ func SeedDev(ctx context.Context, pool Pool) error {
 		return fmt.Errorf("seed: tenant: %w", err)
 	}
 
-	// ── Admin user (password = admin123) ────────────────────────────────────
+	// ── Admin user ───────────────────────────────────────────────────────────
+	adminPw, generatedPw := seedAdminPassword()
 	salt := make([]byte, 16)
 	if _, err := rand.Read(salt); err != nil {
 		return fmt.Errorf("seed: salt: %w", err)
 	}
-	hash := argon2.IDKey([]byte("admin123"), salt, 1, 64*1024, 4, 32)
+	hash := argon2.IDKey([]byte(adminPw), salt, 1, 64*1024, 4, 32)
 	pwdHash := fmt.Sprintf("argon2id$%s$%s", hex.EncodeToString(salt), hex.EncodeToString(hash))
 
-	_, err = tx.Exec(ctx, `
+	ct, err := tx.Exec(ctx, `
 		INSERT INTO users (id, tenant_id, email, name, password_hash, role, status)
 		VALUES ($1, $2, 'admin@sentinel.local', 'Admin User', $3, 'admin', 'active')
 		ON CONFLICT (id) DO NOTHING`,
 		DevAdminID, DevTenantID, pwdHash)
 	if err != nil {
 		return fmt.Errorf("seed: admin user: %w", err)
+	}
+	// If we generated the password AND actually created the row (didn't hit the
+	// ON CONFLICT no-op), surface it once so the operator can log in and rotate.
+	if generatedPw && ct.RowsAffected() > 0 {
+		fmt.Fprintf(os.Stderr,
+			"\n[sentinel] Seeded initial admin 'admin@sentinel.local' with a GENERATED password:\n"+
+				"[sentinel]     %s\n"+
+				"[sentinel] Log in and change it immediately. Set SENTINEL_BOOTSTRAP_ADMIN_PASSWORD to control it.\n\n",
+			adminPw)
 	}
 
 	// ── Sample sites ─────────────────────────────────────────────────────────

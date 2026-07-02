@@ -78,6 +78,15 @@ func GinAuthMiddleware(jwt *JWTService, adminOnly bool) gin.HandlerFunc {
 			return
 		}
 
+		// A refresh token is not an access credential. Only the /auth/refresh
+		// endpoint (which validates the body token itself) may consume it;
+		// rejecting it here stops a 7-day refresh token from authenticating
+		// protected routes for a week.
+		if claims.AuthMethod == "refresh" {
+			abortWithAuthError(c, ErrTokenInvalid)
+			return
+		}
+
 		if adminOnly && claims.Role != "owner" && claims.Role != "admin" {
 			abortWithAuthError(c, errors.New("auth: admin role required"))
 			return
@@ -177,6 +186,11 @@ func authenticateGRPC(ctx context.Context, jwt *JWTService) (context.Context, er
 			return nil, status.Error(codes.Unauthenticated, "token expired")
 		}
 		return nil, status.Errorf(codes.Unauthenticated, "invalid token: %v", err)
+	}
+
+	// Refresh tokens are not access credentials (see GinAuthMiddleware).
+	if claims.AuthMethod == "refresh" {
+		return nil, status.Error(codes.Unauthenticated, "refresh token is not valid for API access")
 	}
 
 	newCtx := context.WithValue(ctx, ClaimsKey, claims)

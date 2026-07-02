@@ -187,9 +187,12 @@ func (s *Store) ListSites(ctx context.Context, tenantID, userID string) ([]SiteR
 	}
 	defer tx.Rollback(ctx)
 
+	// Explicit tenant predicate (defense-in-depth): isolation holds even if RLS
+	// is bypassed (e.g. the app connects as a superuser/owner). See migration
+	// 0003 for the RLS-layer hardening.
 	rows, err := tx.Query(ctx,
 		`SELECT id, tenant_id, name, domains, upstream, waf_policy, status, created_at, updated_at
-		 FROM sites ORDER BY created_at DESC`)
+		 FROM sites WHERE tenant_id = $1 ORDER BY created_at DESC`, tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("store: list sites: %w", err)
 	}
@@ -337,9 +340,10 @@ func (s *Store) ListRules(ctx context.Context, tenantID, userID string) ([]RuleR
 	}
 	defer tx.Rollback(ctx)
 
+	// Explicit tenant predicate (defense-in-depth): see ListSites / migration 0003.
 	rows, err := tx.Query(ctx,
 		`SELECT id, tenant_id, name, source, phase, severity, dsl, enabled, tags, created_at, updated_at
-		 FROM rules ORDER BY created_at DESC`)
+		 FROM rules WHERE tenant_id = $1 ORDER BY created_at DESC`, tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("store: list rules: %w", err)
 	}
@@ -373,11 +377,12 @@ func (s *Store) ListAlerts(ctx context.Context, tenantID, userID string, stateFi
 	}
 	defer tx.Rollback(ctx)
 
+	// Explicit tenant predicate (defense-in-depth): see ListSites / migration 0003.
 	query := `SELECT id, tenant_id, site_id, severity, kind, summary, details, state, created_at, resolved_at
-	          FROM alerts`
-	var args []any
+	          FROM alerts WHERE tenant_id = $1`
+	args := []any{tenantID}
 	if stateFilter != "" && stateFilter != "all" {
-		query += ` WHERE state = $1`
+		query += ` AND state = $2`
 		args = append(args, stateFilter)
 	}
 	query += ` ORDER BY created_at DESC LIMIT 200`
