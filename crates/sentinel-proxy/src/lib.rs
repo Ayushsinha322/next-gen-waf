@@ -1425,6 +1425,7 @@ async fn proxy(
 
     if let Some(s) = &site {
         ctx.site_id = Some(s.id.clone());
+        ctx.tenant_id = Some(s.tenant_id.clone());
     }
 
     // Request size limits: URI and header count (Phase 1, before body read).
@@ -3244,6 +3245,7 @@ fn record_event(ctx: &RequestContext) {
         ip: ctx.client_ip.to_string(),
         country: ctx.geo_country.clone().unwrap_or_default(), // set when GeoIP resolved a country
         site: ctx.site_id.clone().unwrap_or_else(|| "-".to_string()),
+        tenant: ctx.tenant_id.clone().unwrap_or_default(),
         method: ctx.method.as_str().to_string(),
         path: ctx.uri.path().to_string(),
         rule: top.map(|r| r.rule_id.clone()).unwrap_or_default(),

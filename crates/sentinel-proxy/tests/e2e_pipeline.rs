@@ -61,6 +61,7 @@ fn test_config(listen_port: u16, upstream_port: u16, rule_file: &str, mode: WafM
         }],
         sites: vec![SiteConfig {
             id: "test-site".into(),
+            tenant_id: String::new(),
             domains: vec!["test-site.local".into(), "localhost".into()],
             upstream: UpstreamConfig {
                 load_balancer: sentinel_core::config::LoadBalancerStrategy::RoundRobin,
@@ -101,6 +102,7 @@ fn ml_only_config(listen_port: u16, upstream_port: u16, sensitivity: f32) -> Sen
         }],
         sites: vec![SiteConfig {
             id: "test-site".into(),
+            tenant_id: String::new(),
             domains: vec!["test-site.local".into(), "localhost".into()],
             upstream: UpstreamConfig {
                 load_balancer: sentinel_core::config::LoadBalancerStrategy::RoundRobin,

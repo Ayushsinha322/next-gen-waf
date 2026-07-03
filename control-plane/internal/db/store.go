@@ -106,10 +106,12 @@ func (s *Store) ValidatePassword(ctx context.Context, tenantID, email, password 
 	}
 	defer tx.Rollback(ctx)
 
+	// Cross-tenant pre-auth lookup via the SECURITY DEFINER carve-out (works
+	// under both the superuser and the non-superuser sentinel_app role); see
+	// migration 0004.
 	var userID, userTenantID, role, pwdHash string
 	err = tx.QueryRow(ctx,
-		`SELECT id, tenant_id, role, password_hash FROM users
-		 WHERE email = $1 AND status = 'active' AND password_hash IS NOT NULL`,
+		`SELECT id, tenant_id, role, password_hash FROM sentinel_auth_lookup($1)`,
 		email).Scan(&userID, &userTenantID, &role, &pwdHash)
 	if err != nil {
 		return false, "", "", "", nil
@@ -134,9 +136,11 @@ func (s *Store) ListAllActiveSites(ctx context.Context) ([]SiteRow, error) {
 	if !ok {
 		return nil, fmt.Errorf("store: pool is not a *pgxPool")
 	}
+	// Node-global list via the SECURITY DEFINER carve-out (see migration 0004),
+	// so this works under the non-superuser sentinel_app role with FORCE RLS.
 	rows, err := pg.pool.Query(ctx,
 		`SELECT id, tenant_id, name, domains, upstream, waf_policy, status, created_at, updated_at
-		 FROM sites WHERE status <> 'deleted' ORDER BY created_at DESC`)
+		 FROM sentinel_active_sites()`)
 	if err != nil {
 		return nil, fmt.Errorf("store: list all active sites: %w", err)
 	}

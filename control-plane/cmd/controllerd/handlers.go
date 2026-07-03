@@ -862,8 +862,9 @@ func siteRowToRustConfig(s db.SiteRow) (map[string]any, error) {
 		return nil, err
 	}
 	return map[string]any{
-		"id":       s.Name, // proxy matches by site ID — use name (e.g., "dvwa.local")
-		"domains":  s.Domains,
+		"id":        s.Name, // proxy matches by site ID — use name (e.g., "dvwa.local")
+		"tenant_id": s.TenantID, // propagated so per-request telemetry is tenant-scoped
+		"domains":   s.Domains,
 		"upstream": upstream,
 		"waf":      waf,
 		"plugins":  []any{},

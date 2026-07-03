@@ -21,7 +21,7 @@ func handleEventsStatus(c *gin.Context, enf *rbac.Enforcer, ch *clickhouse.Clien
 	}
 	// Status never returns a non-nil error — reachability/errors are encoded in
 	// the returned map itself.
-	st, _ := ch.Status(c.Request.Context())
+	st, _ := ch.Status(c.Request.Context(), claims.TenantID)
 	c.JSON(http.StatusOK, st)
 }
 
@@ -36,6 +36,7 @@ func handleEventsSearch(c *gin.Context, enf *rbac.Enforcer, ch *clickhouse.Clien
 		return
 	}
 	f := clickhouse.SearchFilter{
+		Tenant:   claims.TenantID, // isolation boundary — never from client input
 		Site:     c.Query("site"),
 		Country:  c.Query("country"),
 		Rule:     c.Query("rule"),
@@ -93,7 +94,7 @@ func handleEventsFacets(c *gin.Context, enf *rbac.Enforcer, ch *clickhouse.Clien
 		c.JSON(http.StatusOK, gin.H{"facets": []any{}, "column": col, "clickhouse": false})
 		return
 	}
-	facets, err := ch.Facets(c.Request.Context(), col, atoi64(c.Query("from")), atoi64(c.Query("to")), int(atoi64(c.Query("limit"))))
+	facets, err := ch.Facets(c.Request.Context(), col, claims.TenantID, atoi64(c.Query("from")), atoi64(c.Query("to")), int(atoi64(c.Query("limit"))))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return

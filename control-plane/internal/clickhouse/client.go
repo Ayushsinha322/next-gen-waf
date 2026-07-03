@@ -149,6 +149,9 @@ type Facet struct {
 
 // SearchFilter holds the (already-untrusted) search parameters.
 type SearchFilter struct {
+	// Tenant scopes the query to one tenant's events. It is the security
+	// boundary for Threat Search and is always applied by searchWhere.
+	Tenant                                           string
 	Site, Country, Rule, Action, IP, Protocol, Query string
 	From, To                                         int64
 	Limit                                            int
@@ -159,7 +162,7 @@ type SearchFilter struct {
 // ---------------------------------------------------------------------------
 
 // Status reports reachability + table row counts (for the UI empty state).
-func (c *Client) Status(ctx context.Context) (map[string]any, error) {
+func (c *Client) Status(ctx context.Context, tenant string) (map[string]any, error) {
 	if !c.enabled {
 		return map[string]any{"configured": false, "reachable": false}, nil
 	}
@@ -167,9 +170,10 @@ func (c *Client) Status(ctx context.Context) (map[string]any, error) {
 		Events  int64 `json:"events"`
 		Traffic int64 `json:"traffic"`
 	}
+	// Event count is tenant-scoped; traffic_buckets is aggregate (no tenant col).
 	err := c.queryJSON(ctx, fmt.Sprintf(
-		"SELECT (SELECT count() FROM %s.waf_events) AS events, "+
-			"(SELECT count() FROM %s.traffic_buckets) AS traffic", c.db, c.db), &rows)
+		"SELECT (SELECT count() FROM %s.waf_events WHERE tenant = '%s') AS events, "+
+			"(SELECT count() FROM %s.traffic_buckets) AS traffic", c.db, esc(tenant), c.db), &rows)
 	if err != nil {
 		return map[string]any{"configured": true, "reachable": false, "error": err.Error()}, nil
 	}
@@ -182,8 +186,12 @@ func (c *Client) Status(ctx context.Context) (map[string]any, error) {
 }
 
 // Search returns matching waf_events, newest first.
-func (c *Client) Search(ctx context.Context, f SearchFilter) ([]Event, error) {
+// searchWhere builds the WHERE clauses for a Threat Search query. The tenant
+// predicate is ALWAYS included first — it is the cross-tenant isolation
+// boundary — so no code path can accidentally query another tenant's events.
+func (c *Client) searchWhere(f SearchFilter) []string {
 	where := c.timeWhere(f.From, f.To)
+	where = append(where, eq("tenant", f.Tenant))
 	if f.Site != "" {
 		where = append(where, eq("site", f.Site))
 	}
@@ -209,6 +217,11 @@ func (c *Client) Search(ctx context.Context, f SearchFilter) ([]Event, error) {
 			"(positionCaseInsensitive(path, '%s') > 0 OR positionCaseInsensitive(attack, '%s') > 0 OR rule = '%s')",
 			q, q, q))
 	}
+	return where
+}
+
+func (c *Client) Search(ctx context.Context, f SearchFilter) ([]Event, error) {
+	where := c.searchWhere(f)
 	limit := f.Limit
 	if limit <= 0 || limit > 1000 {
 		limit = 200
@@ -243,7 +256,7 @@ func (c *Client) Timeline(ctx context.Context, from, to int64, bucketSecs int) (
 }
 
 // Facets returns top values for a column (rule|ip|country|action|site).
-func (c *Client) Facets(ctx context.Context, column string, from, to int64, limit int) ([]Facet, error) {
+func (c *Client) Facets(ctx context.Context, column, tenant string, from, to int64, limit int) ([]Facet, error) {
 	col, ok := facetColumn(column)
 	if !ok {
 		return nil, fmt.Errorf("invalid facet column %q", column)
@@ -251,10 +264,12 @@ func (c *Client) Facets(ctx context.Context, column string, from, to int64, limi
 	if limit <= 0 || limit > 50 {
 		limit = 10
 	}
+	// Tenant-scoped (isolation boundary), like Search.
+	where := append(c.timeWhere(from, to), eq("tenant", tenant))
 	sql := fmt.Sprintf(
 		"SELECT %s AS key, count() AS count FROM %s.waf_events WHERE %s AND %s != '' "+
 			"GROUP BY key ORDER BY count DESC LIMIT %d",
-		col, c.db, strings.Join(c.timeWhere(from, to), " AND "), col, limit)
+		col, c.db, strings.Join(where, " AND "), col, limit)
 	var out []Facet
 	if err := c.queryJSON(ctx, sql, &out); err != nil {
 		return nil, err
