@@ -24,6 +24,7 @@ import (
 	controlgrpc "github.com/your-org/sentinel-waf/control-plane/internal/grpc"
 	"github.com/your-org/sentinel-waf/control-plane/internal/logs"
 	"github.com/your-org/sentinel-waf/control-plane/internal/rbac"
+	"github.com/your-org/sentinel-waf/control-plane/internal/threatintel"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -143,6 +144,11 @@ func run() error {
 			if err := db.EnsureNotificationSchema(ctx, pool); err != nil {
 				log.Warn("notification schema ensure failed (non-fatal)", zap.Error(err))
 			}
+
+			// Ensure the threat_intel_iocs table exists (idempotent).
+			if err := db.EnsureThreatIntelSchema(ctx, pool); err != nil {
+				log.Warn("threat-intel schema ensure failed (non-fatal)", zap.Error(err))
+			}
 		}
 	}
 
@@ -167,6 +173,21 @@ func run() error {
 		engine := alerting.New(store, hub, db.DevTenantID, db.DevAdminID, alertingConfigFromEnv(), log)
 		engine.Start()
 		defer engine.Stop()
+	}
+
+	// ── Threat Intelligence aggregator ────────────────────────────────────────
+	// Ingests open CTI feeds (Tor exit nodes, abuse.ch Feodo/URLhaus, optional
+	// STIX/TAXII) into threat_intel_iocs on an hourly ticker; the Rust data plane
+	// hot-syncs the result via GET /api/v1/internal/threat-intel. Disable with
+	// SENTINEL_THREATINTEL_ENABLED=false (e.g. air-gapped installs).
+	if store != nil {
+		if tiCfg := threatintel.ConfigFromEnv(); tiCfg.Enabled {
+			agg := threatintel.New(store, tiCfg, log)
+			agg.Start(ctx)
+			defer agg.Stop()
+		} else {
+			log.Info("threat-intel aggregator disabled (SENTINEL_THREATINTEL_ENABLED=false)")
+		}
 	}
 
 	// ── RBAC ──────────────────────────────────────────────────────────────────
@@ -340,6 +361,10 @@ func run() error {
 	// hot-sync. No JWT: the proxy runs on the same host (or private network).
 	// In production, protect this with mTLS or a network policy.
 	router.GET("/api/v1/internal/config", func(c *gin.Context) { handleInternalConfig(c, store) })
+
+	// Internal threat-intel endpoint — the data plane hot-syncs the active IOC
+	// set from here (same shared-secret gate as /internal/config).
+	router.GET("/api/v1/internal/threat-intel", func(c *gin.Context) { handleInternalThreatIntel(c, store) })
 
 	admin := router.Group("/api/v1/admin")
 	admin.Use(auth.GinAuthMiddleware(jwtSvc, true))
