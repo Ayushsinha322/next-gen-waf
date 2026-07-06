@@ -936,7 +936,11 @@ impl ProxyServer {
                         let count = feed.entry_count();
                         last_version = sync.version;
                         ti_modules.threat_intel.store(Arc::new(feed));
-                        info!(version = last_version, iocs = count, "threat-intel hot-synced");
+                        info!(
+                            version = last_version,
+                            iocs = count,
+                            "threat-intel hot-synced"
+                        );
                     }
                 }
             });
@@ -4067,7 +4071,12 @@ mod threat_intel_contract_tests {
 
         // Clean traffic → pass.
         assert_eq!(
-            feed.check(ip("1.1.1.1"), Some("Mozilla/5.0"), Some("good.example"), "/"),
+            feed.check(
+                ip("1.1.1.1"),
+                Some("Mozilla/5.0"),
+                Some("good.example"),
+                "/"
+            ),
             ThreatVerdict::None
         );
     }

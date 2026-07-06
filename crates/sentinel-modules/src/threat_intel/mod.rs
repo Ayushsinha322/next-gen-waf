@@ -76,7 +76,9 @@ impl IpMatcher {
             IpNet::V4(n) => {
                 let plen = n.prefix_len();
                 let key = u32::from(n.network()) & v4_mask(plen);
-                if self.cidr_v4.entry(plen).or_default().insert(key) && !self.v4_lens.contains(&plen) {
+                if self.cidr_v4.entry(plen).or_default().insert(key)
+                    && !self.v4_lens.contains(&plen)
+                {
                     self.v4_lens.push(plen);
                     self.v4_lens.sort_unstable();
                 }
@@ -84,7 +86,9 @@ impl IpMatcher {
             IpNet::V6(n) => {
                 let plen = n.prefix_len();
                 let key = u128::from(n.network()) & v6_mask(plen);
-                if self.cidr_v6.entry(plen).or_default().insert(key) && !self.v6_lens.contains(&plen) {
+                if self.cidr_v6.entry(plen).or_default().insert(key)
+                    && !self.v6_lens.contains(&plen)
+                {
                     self.v6_lens.push(plen);
                     self.v6_lens.sort_unstable();
                 }
@@ -145,8 +149,8 @@ fn v6_mask(plen: u8) -> u128 {
 #[derive(Default)]
 struct Tier {
     ips: IpMatcher,
-    user_agents: Vec<String>, // lowercased substring tokens
-    domains: HashSet<String>, // lowercased exact hostnames
+    user_agents: Vec<String>,    // lowercased substring tokens
+    domains: HashSet<String>,    // lowercased exact hostnames
     url_substrings: Vec<String>, // lowercased URI substrings
 }
 
@@ -212,7 +216,11 @@ impl Tier {
             }
         }
         if let Some(uri) = uri_low {
-            if let Some(s) = self.url_substrings.iter().find(|s| uri.contains(s.as_str())) {
+            if let Some(s) = self
+                .url_substrings
+                .iter()
+                .find(|s| uri.contains(s.as_str()))
+            {
                 return Some(format!("malicious URL pattern (~{s})"));
             }
         }
@@ -283,7 +291,13 @@ impl ThreatFeed {
     /// Evaluate a request against the feed. Block tier wins over watch tier.
     /// `ua`, `host`, and `uri` are the raw request values (host may include a
     /// port; casing is irrelevant — normalization happens here).
-    pub fn check(&self, ip: IpAddr, ua: Option<&str>, host: Option<&str>, uri: &str) -> ThreatVerdict {
+    pub fn check(
+        &self,
+        ip: IpAddr,
+        ua: Option<&str>,
+        host: Option<&str>,
+        uri: &str,
+    ) -> ThreatVerdict {
         if self.empty {
             return ThreatVerdict::None;
         }
@@ -303,16 +317,20 @@ impl ThreatFeed {
             None
         };
 
-        if let Some(reason) =
-            self.block
-                .match_reason(ip, ua_low.as_deref(), host_low.as_deref(), uri_low.as_deref())
-        {
+        if let Some(reason) = self.block.match_reason(
+            ip,
+            ua_low.as_deref(),
+            host_low.as_deref(),
+            uri_low.as_deref(),
+        ) {
             return ThreatVerdict::Block { reason };
         }
-        if let Some(tag) =
-            self.watch
-                .match_reason(ip, ua_low.as_deref(), host_low.as_deref(), uri_low.as_deref())
-        {
+        if let Some(tag) = self.watch.match_reason(
+            ip,
+            ua_low.as_deref(),
+            host_low.as_deref(),
+            uri_low.as_deref(),
+        ) {
             return ThreatVerdict::Score {
                 score: self.watch_score,
                 tag,
@@ -333,7 +351,9 @@ fn strip_port(host: &str) -> &str {
         }
     }
     match host.rfind(':') {
-        Some(i) if !host[i + 1..].is_empty() && host[i + 1..].bytes().all(|b| b.is_ascii_digit()) => {
+        Some(i)
+            if !host[i + 1..].is_empty() && host[i + 1..].bytes().all(|b| b.is_ascii_digit()) =>
+        {
             &host[..i]
         }
         _ => host,
@@ -432,7 +452,12 @@ mod tests {
     fn clean_request_passes() {
         let f = feed();
         assert_eq!(
-            f.check(ip("1.1.1.1"), Some("Mozilla/5.0"), Some("good.example"), "/index.html"),
+            f.check(
+                ip("1.1.1.1"),
+                Some("Mozilla/5.0"),
+                Some("good.example"),
+                "/index.html"
+            ),
             ThreatVerdict::None
         );
     }
@@ -441,6 +466,9 @@ mod tests {
     fn empty_feed_matches_nothing() {
         let f = ThreatFeed::empty();
         assert!(f.is_empty());
-        assert_eq!(f.check(ip("9.9.9.9"), Some("sqlmap"), None, "/"), ThreatVerdict::None);
+        assert_eq!(
+            f.check(ip("9.9.9.9"), Some("sqlmap"), None, "/"),
+            ThreatVerdict::None
+        );
     }
 }
