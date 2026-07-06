@@ -39,6 +39,15 @@ spec:
     metadata:
       labels: { app: sentinel-edge }
     spec:
+      # Run unprivileged. The distroless images ship a non-root user (65532);
+      # fsGroup makes the mounted cert PVC + log emptyDir group-writable by it.
+      # All listeners bind >1024, so no NET_BIND_SERVICE capability is needed.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
       # Migrations-as-code: bring the schema current BEFORE the control plane
       # starts (so its idempotent SeedDev finds the tables). goose `up` is a
       # no-op once current; the retry loop waits for Postgres to accept conns.
@@ -70,13 +79,22 @@ spec:
             - { name: grpc, containerPort: 9500 }
           volumeMounts:
             - { name: logs, mountPath: /var/log/sentinel }
+            - { name: tmp,  mountPath: /tmp }
           readinessProbe:
             httpGet: { path: /health, port: 9501 }
             initialDelaySeconds: 5
             periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: 9501 }
+            initialDelaySeconds: 15
+            periodSeconds: 20
           resources:
             requests: { cpu: "100m", memory: "128Mi" }
             limits:   { memory: "512Mi" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
         # ── Data plane (Rust WAF proxy) ───────────────────────────────────────
         - name: dataplane
           image: sentinel/dataplane:latest
@@ -92,16 +110,27 @@ spec:
             - { name: proxy-config, mountPath: /etc/sentinel/sentinel.yaml, subPath: sentinel.yaml, readOnly: true }
             - { name: certs, mountPath: /var/lib/sentinel/certs }
             - { name: logs,  mountPath: /var/log/sentinel }
+            - { name: tmp,   mountPath: /tmp }
           readinessProbe:
-            tcpSocket: { port: 8080 }
+            httpGet: { path: /healthz, port: 8080 }
             initialDelaySeconds: 5
             periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 15
+            periodSeconds: 20
           resources:
             requests: { cpu: "250m", memory: "256Mi" }
             limits:   { memory: "1Gi" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
       volumes:
         - name: logs
           emptyDir: {}        # scratch shared between the two containers (live tail)
+        - name: tmp
+          emptyDir: {}        # writable scratch for readOnlyRootFilesystem containers
         - name: proxy-config
           configMap: { name: sentinel-proxy-config }
         - name: certs

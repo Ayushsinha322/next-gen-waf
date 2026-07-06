@@ -89,30 +89,73 @@ type DashboardStats struct {
 // Auth helpers
 // ---------------------------------------------------------------------------
 
-// ValidatePassword looks up the user by email within the tenant and verifies
-// the plaintext password against the stored argon2id hash.
-// Returns (true, userID, role, nil) on success.
-func (s *Store) ValidatePassword(ctx context.Context, tenantID, email, password string) (bool, string, string, error) {
+// ValidatePassword looks up the user by email and verifies the plaintext
+// password against the stored argon2id hash. It returns the user's real
+// tenant_id so the issued token carries the correct tenant (not a hardcoded
+// one), which is what makes the per-tenant RLS + query predicates actually
+// isolate tenants. Returns (true, userID, tenantID, role, nil) on success.
+//
+// NOTE: pre-auth lookup is intentionally by email (across tenants). Under a
+// future non-superuser DB role with FORCE RLS this needs an RLS carve-out for
+// the users table (SECURITY DEFINER fn or a login-lookup policy) — see the
+// migration 0003 runbook.
+func (s *Store) ValidatePassword(ctx context.Context, tenantID, email, password string) (bool, string, string, string, error) {
 	tx, err := s.pool.BeginTenant(ctx, tenantID, "system")
 	if err != nil {
-		return false, "", "", err
+		return false, "", "", "", err
 	}
 	defer tx.Rollback(ctx)
 
-	var userID, role, pwdHash string
+	// Cross-tenant pre-auth lookup via the SECURITY DEFINER carve-out (works
+	// under both the superuser and the non-superuser sentinel_app role); see
+	// migration 0004.
+	var userID, userTenantID, role, pwdHash string
 	err = tx.QueryRow(ctx,
-		`SELECT id, role, password_hash FROM users
-		 WHERE email = $1 AND status = 'active' AND password_hash IS NOT NULL`,
-		email).Scan(&userID, &role, &pwdHash)
+		`SELECT id, tenant_id, role, password_hash FROM sentinel_auth_lookup($1)`,
+		email).Scan(&userID, &userTenantID, &role, &pwdHash)
 	if err != nil {
-		return false, "", "", nil
+		return false, "", "", "", nil
 	}
 	tx.Commit(ctx)
 
 	if !checkPassword(password, pwdHash) {
-		return false, "", "", nil
+		return false, "", "", "", nil
 	}
-	return true, userID, role, nil
+	return true, userID, userTenantID, role, nil
+}
+
+// ListAllActiveSites returns all non-deleted sites across EVERY tenant. It is
+// used only by the internal data-plane config sync: the shared proxy serves all
+// tenants' sites, so this path must not be tenant-scoped (unlike ListSites,
+// which is per-tenant for the dashboard). Intentionally node-global.
+//
+// NOTE: under a non-superuser role with FORCE RLS this returns nothing unless
+// granted an RLS bypass for this path — see the migration 0003 runbook.
+func (s *Store) ListAllActiveSites(ctx context.Context) ([]SiteRow, error) {
+	pg, ok := s.pool.(*pgxPool)
+	if !ok {
+		return nil, fmt.Errorf("store: pool is not a *pgxPool")
+	}
+	// Node-global list via the SECURITY DEFINER carve-out (see migration 0004),
+	// so this works under the non-superuser sentinel_app role with FORCE RLS.
+	rows, err := pg.pool.Query(ctx,
+		`SELECT id, tenant_id, name, domains, upstream, waf_policy, status, created_at, updated_at
+		 FROM sentinel_active_sites()`)
+	if err != nil {
+		return nil, fmt.Errorf("store: list all active sites: %w", err)
+	}
+	defer rows.Close()
+
+	var sites []SiteRow
+	for rows.Next() {
+		var r SiteRow
+		if err := rows.Scan(&r.ID, &r.TenantID, &r.Name, &r.Domains,
+			&r.Upstream, &r.WafPolicy, &r.Status, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		sites = append(sites, r)
+	}
+	return sites, rows.Err()
 }
 
 // checkPassword verifies plaintext against "argon2id$<hexSalt>$<hexHash>".
@@ -187,9 +230,12 @@ func (s *Store) ListSites(ctx context.Context, tenantID, userID string) ([]SiteR
 	}
 	defer tx.Rollback(ctx)
 
+	// Explicit tenant predicate (defense-in-depth): isolation holds even if RLS
+	// is bypassed (e.g. the app connects as a superuser/owner). See migration
+	// 0003 for the RLS-layer hardening.
 	rows, err := tx.Query(ctx,
 		`SELECT id, tenant_id, name, domains, upstream, waf_policy, status, created_at, updated_at
-		 FROM sites ORDER BY created_at DESC`)
+		 FROM sites WHERE tenant_id = $1 ORDER BY created_at DESC`, tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("store: list sites: %w", err)
 	}
@@ -337,9 +383,10 @@ func (s *Store) ListRules(ctx context.Context, tenantID, userID string) ([]RuleR
 	}
 	defer tx.Rollback(ctx)
 
+	// Explicit tenant predicate (defense-in-depth): see ListSites / migration 0003.
 	rows, err := tx.Query(ctx,
 		`SELECT id, tenant_id, name, source, phase, severity, dsl, enabled, tags, created_at, updated_at
-		 FROM rules ORDER BY created_at DESC`)
+		 FROM rules WHERE tenant_id = $1 ORDER BY created_at DESC`, tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("store: list rules: %w", err)
 	}
@@ -373,11 +420,12 @@ func (s *Store) ListAlerts(ctx context.Context, tenantID, userID string, stateFi
 	}
 	defer tx.Rollback(ctx)
 
+	// Explicit tenant predicate (defense-in-depth): see ListSites / migration 0003.
 	query := `SELECT id, tenant_id, site_id, severity, kind, summary, details, state, created_at, resolved_at
-	          FROM alerts`
-	var args []any
+	          FROM alerts WHERE tenant_id = $1`
+	args := []any{tenantID}
 	if stateFilter != "" && stateFilter != "all" {
-		query += ` WHERE state = $1`
+		query += ` AND state = $2`
 		args = append(args, stateFilter)
 	}
 	query += ` ORDER BY created_at DESC LIMIT 200`

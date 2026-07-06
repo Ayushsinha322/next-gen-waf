@@ -13,7 +13,7 @@ A next-generation, high-performance Web Application Firewall written in **Rust**
 | **HTTP/3 + Post-Quantum TLS** | Future-proof crypto (Kyber/Dilithium hybrid) |
 | **API-aware** | OpenAPI auto-discovery, GraphQL/gRPC schema firewalling |
 | **Egress DLP** | Outbound PII/secret leak prevention |
-| **Raft clustering** | True active/active HA, no CARP/VRRP limits |
+| **Raft clustering** | Leader-elected HA with automatic failover (active/passive writes over a shared datastore; horizontal write-scaling on the roadmap) |
 | **OTel native** | Traces, metrics, logs out of the box |
 
 ## Architecture

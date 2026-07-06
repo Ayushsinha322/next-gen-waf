@@ -112,6 +112,8 @@ pub struct RequestContext {
     // --- Site routing ---
     /// Which site config matched (by Host header / SNI).
     pub site_id: Option<String>,
+    /// Owning tenant of the matched site (for per-tenant telemetry scoping).
+    pub tenant_id: Option<String>,
     /// ISO-3166-1 alpha-2 country code resolved by the GeoIP module, when known.
     pub geo_country: Option<String>,
 
@@ -166,6 +168,7 @@ impl RequestContext {
             request_headers: HeaderMap::new(),
             request_body: None,
             site_id: None,
+            tenant_id: None,
             geo_country: None,
             phase: Phase::Connection,
             anomaly_score: 0,

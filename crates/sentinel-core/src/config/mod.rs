@@ -208,6 +208,11 @@ pub enum Protocol {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SiteConfig {
     pub id: String,
+    /// Owning tenant, propagated from the control plane so per-request telemetry
+    /// (ClickHouse waf_events / traffic) can be scoped per tenant. Empty in
+    /// standalone/file-based configs.
+    #[serde(default)]
+    pub tenant_id: String,
     pub domains: Vec<String>,
     pub upstream: UpstreamConfig,
     #[serde(default)]

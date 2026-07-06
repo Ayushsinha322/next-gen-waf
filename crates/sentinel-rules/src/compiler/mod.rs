@@ -8,10 +8,10 @@ use regex::Regex;
 use tracing::debug;
 
 use crate::dsl::ast::{
-    CmpOp, Directive, Operator, RuleDef, RuleFile, RuleItem, RulePhase, RuleSeverity,
+    CmpOp, Directive, Operator, RuleDef, RuleFile, RuleItem, RuleSeverity,
     TargetCombinator, TargetExpr, Transform, VirtualPatch,
 };
-use emitter::{CompiledRuleSet, Instruction, RuleMeta, TargetSpec};
+use emitter::{CompiledRuleSet, Instruction, RuleCoverage, RuleMeta, TargetSpec};
 use optimizer::build_ac;
 
 // ---------------------------------------------------------------------------
@@ -107,7 +107,8 @@ pub fn compile(file: RuleFile) -> Result<CompiledRuleSet> {
     // current source position so that skip-gates in any phase can find their
     // target (CRS uses the same marker name for phase-1 and phase-2 gates).
 
-    let mut skipped = 0usize;
+    let mut dropped: Vec<(u32, String)> = Vec::new();
+    let mut disabled: Vec<u32> = Vec::new();
     for item in file.items {
         match item {
             RuleItem::Rule(rule) => {
@@ -117,9 +118,15 @@ pub fn compile(file: RuleFile) -> Result<CompiledRuleSet> {
                     Ok((instrs, meta)) => {
                         rule_meta.insert(meta.id, meta);
                         phase_programs[phase as usize].extend(instrs);
+                        // A rule imported with an unsupported operator compiles
+                        // but can never match — record it as a coverage gap so
+                        // it isn't silently counted as "loaded protection".
+                        if matches!(rule.operator, Operator::Never) {
+                            disabled.push(rule_id);
+                        }
                     }
                     Err(e) => {
-                        skipped += 1;
+                        dropped.push((rule_id, format!("{e:#}")));
                         tracing::warn!(rule_id, "skipping rule (compile error): {e:#}");
                     }
                 }
@@ -134,7 +141,7 @@ pub fn compile(file: RuleFile) -> Result<CompiledRuleSet> {
                         phase_programs[phase as usize].extend(instrs);
                     }
                     Err(e) => {
-                        skipped += 1;
+                        dropped.push((cve_to_id(&cve), format!("{e:#}")));
                         tracing::warn!(cve = %cve, "skipping virtual-patch (compile error): {e:#}");
                     }
                 }
@@ -151,8 +158,16 @@ pub fn compile(file: RuleFile) -> Result<CompiledRuleSet> {
             }
         }
     }
-    if skipped > 0 {
-        tracing::warn!(skipped, "compiler: skipped rules due to errors");
+    if !dropped.is_empty() || !disabled.is_empty() {
+        let dropped_ids: Vec<u32> = dropped.iter().map(|(id, _)| *id).collect();
+        tracing::warn!(
+            dropped = dropped.len(),
+            disabled = disabled.len(),
+            dropped_rule_ids = ?dropped_ids,
+            disabled_rule_ids = ?disabled,
+            "rule coverage gap: these rules are NOT enforced (dropped on compile error or unsupported operator) — \
+             review before relying on full CRS coverage"
+        );
     }
 
     // Build Aho-Corasick automata from interned word-list tables.
@@ -177,6 +192,7 @@ pub fn compile(file: RuleFile) -> Result<CompiledRuleSet> {
         ml_models: state.ml_models,
         plugin_names: state.plugin_names,
         rule_meta,
+        coverage: RuleCoverage { dropped, disabled },
     })
 }
 

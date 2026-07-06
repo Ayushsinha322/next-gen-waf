@@ -1,0 +1,51 @@
+# ============================================================================
+# Network isolation for the backing datastores. Selecting a pod with any
+# NetworkPolicy makes it deny-by-default for ingress, so these policies lock
+# Postgres / Redis / ClickHouse down to the sentinel-edge pod (the only client:
+# the control plane + data plane both run there). Nothing else in or outside the
+# namespace can reach them.
+#
+# App-to-app flows (dashboard → controlplane, LB → edge) are intentionally left
+# open here — tighten them once validated against the live SSE/proxy paths.
+# ============================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-allow-edge
+  namespace: sentinel
+spec:
+  podSelector: { matchLabels: { app: postgres } }
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app: sentinel-edge } }
+      ports:
+        - { protocol: TCP, port: 5432 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-allow-edge
+  namespace: sentinel
+spec:
+  podSelector: { matchLabels: { app: redis } }
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app: sentinel-edge } }
+      ports:
+        - { protocol: TCP, port: 6379 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: clickhouse-allow-edge
+  namespace: sentinel
+spec:
+  podSelector: { matchLabels: { app: clickhouse } }
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app: sentinel-edge } }
+      ports:
+        - { protocol: TCP, port: 8123 }

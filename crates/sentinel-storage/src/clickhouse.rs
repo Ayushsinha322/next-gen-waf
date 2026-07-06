@@ -58,6 +58,10 @@ pub struct WafEventRow {
     /// ISO country code (empty until GeoIP is loaded).
     pub country: String,
     pub site: String,
+    /// Owning tenant id, for per-tenant Threat Search scoping. Empty on rows
+    /// written before tenant scoping; `#[serde(default)]` keeps them readable.
+    #[serde(default)]
+    pub tenant: String,
     pub method: String,
     pub path: String,
     /// Top matched rule ID (empty if none).
@@ -177,7 +181,8 @@ impl ClickHouseClient {
         self.exec(format!(
             "CREATE TABLE IF NOT EXISTS {db}.waf_events \
              (ts DateTime, ip String, country LowCardinality(String), \
-              site LowCardinality(String), method LowCardinality(String), \
+              site LowCardinality(String), tenant LowCardinality(String), \
+              method LowCardinality(String), \
               path String, rule LowCardinality(String), attack String, \
               action LowCardinality(String), severity LowCardinality(String), \
               score UInt32, status UInt16, protocol LowCardinality(String)) \
@@ -198,6 +203,16 @@ impl ClickHouseClient {
              ADD COLUMN IF NOT EXISTS protocol LowCardinality(String) DEFAULT ''",
             db = self.database
         ))
+        .await?;
+
+        // Additive online migration: per-tenant scoping column. Empty on rows
+        // written before this existed — those are hidden from every tenant
+        // (fail-closed), never shown cross-tenant.
+        self.exec(format!(
+            "ALTER TABLE {db}.waf_events \
+             ADD COLUMN IF NOT EXISTS tenant LowCardinality(String) DEFAULT ''",
+            db = self.database
+        ))
         .await
     }
 
@@ -208,7 +223,7 @@ impl ClickHouseClient {
         }
         let mut sql = format!(
             "INSERT INTO {db}.waf_events \
-             (ts, ip, country, site, method, path, rule, attack, action, severity, score, status, protocol) \
+             (ts, ip, country, site, tenant, method, path, rule, attack, action, severity, score, status, protocol) \
              FORMAT JSONEachRow\n",
             db = self.database
         );
@@ -520,6 +535,7 @@ mod tests {
             ip: "203.0.113.9".into(),
             country: String::new(),
             site: site.into(),
+            tenant: "tenant-test".into(),
             method: "GET".into(),
             path: "/?id=1 UNION SELECT".into(),
             rule: rule.into(),

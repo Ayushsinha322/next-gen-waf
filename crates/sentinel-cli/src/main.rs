@@ -731,6 +731,7 @@ fn cmd_site_add(
 
     let site = SiteConfig {
         id: name.to_string(),
+        tenant_id: String::new(),
         domains: domains.to_vec(),
         upstream: UpstreamConfig {
             load_balancer: LoadBalancerStrategy::RoundRobin,

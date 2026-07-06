@@ -1,0 +1,80 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "schemaVersion": 39,
+  "tags": ["sentinel", "waf"],
+  "title": "Sentinel WAF — Overview",
+  "uid": "sentinel-overview",
+  "time": { "from": "now-6h", "to": "now" },
+  "refresh": "15s",
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Total Requests",
+      "datasource": { "type": "prometheus", "uid": "sentinel-prom" },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "blue" } }, "overrides": [] },
+      "targets": [ { "expr": "sentinel_requests_total", "refId": "A" } ]
+    },
+    {
+      "type": "stat",
+      "title": "Blocked",
+      "datasource": { "type": "prometheus", "uid": "sentinel-prom" },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "red" } }, "overrides": [] },
+      "targets": [ { "expr": "sentinel_blocked_total", "refId": "A" } ]
+    },
+    {
+      "type": "gauge",
+      "title": "Block Rate %",
+      "datasource": { "type": "prometheus", "uid": "sentinel-prom" },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 20 }, { "color": "red", "value": 50 } ] } }, "overrides": [] },
+      "targets": [ { "expr": "100 * sentinel_blocked_total / clamp_min(sentinel_requests_total, 1)", "refId": "A" } ]
+    },
+    {
+      "type": "stat",
+      "title": "p99 Latency (ms)",
+      "datasource": { "type": "prometheus", "uid": "sentinel-prom" },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "ms", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 10 } ] } }, "overrides": [] },
+      "targets": [ { "expr": "sentinel_p99_latency_ms", "refId": "A" } ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Requests / sec",
+      "datasource": { "type": "prometheus", "uid": "sentinel-prom" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 15 } }, "overrides": [] },
+      "targets": [ { "expr": "sentinel_requests_per_second", "legendFormat": "rps", "refId": "A" } ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Responses by Status Class",
+      "datasource": { "type": "prometheus", "uid": "sentinel-prom" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 10, "stacking": { "mode": "normal" } } }, "overrides": [] },
+      "targets": [ { "expr": "sum by (class) (rate(sentinel_responses_total[5m]))", "legendFormat": "{{class}}", "refId": "A" } ]
+    },
+    {
+      "type": "barchart",
+      "title": "Attacks by Category",
+      "datasource": { "type": "prometheus", "uid": "sentinel-prom" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "targets": [ { "expr": "sentinel_attacks_total", "legendFormat": "{{category}}", "refId": "A" } ]
+    },
+    {
+      "type": "timeseries",
+      "title": "ML Anomalies & L4 Drops",
+      "datasource": { "type": "prometheus", "uid": "sentinel-prom" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        { "expr": "sentinel_ml_anomalies_total", "legendFormat": "ml anomalies", "refId": "A" },
+        { "expr": "sentinel_ebpf_drops_total", "legendFormat": "l4 drops", "refId": "B" }
+      ]
+    }
+  ]
+}

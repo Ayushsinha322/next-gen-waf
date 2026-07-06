@@ -173,11 +173,21 @@ impl CertStore {
     ) -> Result<()> {
         let dir = self.cert_dir.join(domain_to_dirname(domain));
         std::fs::create_dir_all(&dir)?;
-        std::fs::write(dir.join("cert.pem"), cert_pem)?;
-        std::fs::write(dir.join("key.pem"), key_pem)?;
-        std::fs::write(
-            dir.join("meta.json"),
-            serde_json::to_string_pretty(&meta)?,
+        // The directory (and thus the private key it holds) must not be
+        // world-readable. Lock it to 0700, then write every file atomically at
+        // 0600 — same hardening the management-cert path already uses. A bare
+        // `std::fs::write` here previously left customer private keys at the
+        // process umask (typically 0644, world-readable).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
+        write_atomic(&dir.join("cert.pem"), cert_pem.as_bytes())?;
+        write_atomic(&dir.join("key.pem"), key_pem.as_bytes())?;
+        write_atomic(
+            &dir.join("meta.json"),
+            serde_json::to_string_pretty(&meta)?.as_bytes(),
         )?;
 
         let ck = load_pem_bytes(cert_pem.as_bytes(), key_pem.as_bytes())
@@ -486,8 +496,34 @@ pub fn load_pem_bytes(cert_pem: &[u8], key_pem: &[u8]) -> Result<Arc<CertifiedKe
     Ok(Arc::new(CertifiedKey::new(certs, signing)))
 }
 
+/// Map a hostname to a single, traversal-safe filesystem directory component.
+///
+/// Wildcards become a literal token; every character outside a strict allow-list
+/// (letters, digits, `.`, `-`, `_`) — including path separators and NULs — is
+/// replaced with `_`. Finally, a component made up only of dots (`""`, `"."`,
+/// `".."`, …) is neutralized, because otherwise a crafted `:domain` such as
+/// `DELETE /certs/..` would resolve to `cert_dir/..` via `Path::join` and let
+/// `remove_dir_all` escape the certificate directory.
+///
+/// For all legitimate hostnames (and the reserved `__management__` key) this is
+/// identical to the previous mapping, so existing on-disk cert dirs are stable.
 fn domain_to_dirname(domain: &str) -> String {
-    domain.replace('*', "_wildcard_").replace(['/', '\\'], "_")
+    let mut sanitized: String = domain
+        .replace('*', "_wildcard_")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() || sanitized.chars().all(|c| c == '.') {
+        // e.g. "" -> "_", "." -> "_.", ".." -> "_.." — never a traversal.
+        sanitized.insert(0, '_');
+    }
+    sanitized
 }
 
 /// Write `bytes` to `path` atomically and owner-only (0600): write to a sibling
@@ -495,7 +531,7 @@ fn domain_to_dirname(domain: &str) -> String {
 /// on the same filesystem). Prevents a crash/partial write from leaving a
 /// truncated cert or key, and never leaves a private key world-readable. The
 /// temp file is removed on any failure.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     let tmp = path.with_extension("tmp");
 

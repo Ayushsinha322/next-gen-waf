@@ -254,8 +254,16 @@ func run() error {
 		protected.PATCH("/rules/:id", func(c *gin.Context) { handleToggleRule(c, enforcer, store, hub, cl) })
 		protected.DELETE("/rules/:id", func(c *gin.Context) { handleDeleteRule(c, enforcer, store, hub, cl) })
 		protected.POST("/rules/test", func(c *gin.Context) { handleTestRule(c, enforcer) })
-		protected.GET("/ml/stats", func(c *gin.Context) { handleMLStats(c, hub) })
-		protected.GET("/traffic/history", func(c *gin.Context) { handleTrafficHistory(c, hub) })
+		protected.GET("/ml/stats", func(c *gin.Context) {
+			if requirePerm(c, enforcer, rbac.ResourceSite, rbac.ActionList) {
+				handleMLStats(c, hub)
+			}
+		})
+		protected.GET("/traffic/history", func(c *gin.Context) {
+			if requirePerm(c, enforcer, rbac.ResourceSite, rbac.ActionList) {
+				handleTrafficHistory(c, hub)
+			}
+		})
 		protected.GET("/plugins", func(c *gin.Context) { handleListPlugins(c, enforcer) })
 		protected.GET("/alerts", func(c *gin.Context) { handleListAlerts(c, enforcer, store) })
 		protected.POST("/alerts/:id/ack", func(c *gin.Context) { handleAckAlert(c, enforcer, store, hub, cl) })
@@ -278,12 +286,32 @@ func run() error {
 		protected.GET("/geoip/blocked", func(c *gin.Context) { handleListBlockedCountries(c, enforcer, store) })
 		protected.POST("/geoip/block", func(c *gin.Context) { handleBlockCountry(c, enforcer, store, hub, cl) })
 		protected.DELETE("/geoip/block/:code", func(c *gin.Context) { handleUnblockCountry(c, enforcer, store, hub, cl) })
-		protected.GET("/metrics/snapshot", func(c *gin.Context) { handleMetricsSnapshot(c, hub) })
-		protected.GET("/metrics/sites", func(c *gin.Context) { handleSiteMetrics(c, hub) })
-		protected.GET("/metrics/learning", func(c *gin.Context) { handleLearningReport(c, hub) })
+		protected.GET("/metrics/snapshot", func(c *gin.Context) {
+			if requirePerm(c, enforcer, rbac.ResourceSite, rbac.ActionList) {
+				handleMetricsSnapshot(c, hub)
+			}
+		})
+		protected.GET("/metrics/sites", func(c *gin.Context) {
+			if requirePerm(c, enforcer, rbac.ResourceSite, rbac.ActionList) {
+				handleSiteMetrics(c, hub)
+			}
+		})
+		protected.GET("/metrics/learning", func(c *gin.Context) {
+			if requirePerm(c, enforcer, rbac.ResourceSite, rbac.ActionList) {
+				handleLearningReport(c, hub)
+			}
+		})
 		protected.GET("/audit", func(c *gin.Context) { handleListAudit(c, enforcer, store) })
-		protected.GET("/cluster/status", func(c *gin.Context) { handleClusterStatus(c, cl) })
-		protected.GET("/waf/status", func(c *gin.Context) { handleProxyHealth(c) })
+		protected.GET("/cluster/status", func(c *gin.Context) {
+			if requirePerm(c, enforcer, rbac.ResourceSite, rbac.ActionList) {
+				handleClusterStatus(c, cl)
+			}
+		})
+		protected.GET("/waf/status", func(c *gin.Context) {
+			if requirePerm(c, enforcer, rbac.ResourceSite, rbac.ActionList) {
+				handleProxyHealth(c)
+			}
+		})
 
 		// TLS / ACME certificate management — bridges to the data-plane internal API.
 		protected.GET("/certs", func(c *gin.Context) { handleListCerts(c, enforcer) })
@@ -302,7 +330,11 @@ func run() error {
 
 	// SSE endpoint lives outside the protected group so the ?token= query-param
 	// path in handleLogsStream is reachable. EventSource cannot set headers.
-	router.GET("/api/v1/logs/stream", func(c *gin.Context) { handleLogsStream(c, jwtSvc, hub) })
+	router.GET("/api/v1/logs/stream", func(c *gin.Context) { handleLogsStream(c, jwtSvc, enforcer, hub) })
+
+	// Prometheus scrape endpoint (real aggregated WAF metrics). Optionally gated
+	// by SENTINEL_METRICS_TOKEN; intended for internal network scraping.
+	router.GET("/metrics", func(c *gin.Context) { handleMetrics(c, hub) })
 
 	// Internal config endpoint — called by the Rust data-plane proxy for site
 	// hot-sync. No JWT: the proxy runs on the same host (or private network).
