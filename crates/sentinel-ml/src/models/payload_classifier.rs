@@ -2,7 +2,7 @@
 //!
 //! The classifier is a [`LogisticRegression`] model whose weights are learned
 //! by gradient descent from the bundled labeled [`corpus`], over the full
-//! 24-dimensional [`FeatureVector`] (lengths, entropy, special-char density,
+//! 25-dimensional [`FeatureVector`] (lengths, entropy, special-char density,
 //! percent-encoding, method, keyword scores, …).  Because it learns over the
 //! whole vector — not just keyword hits — it can flag attacks that evade the
 //! keyword lists via high entropy / encoding-abuse / structural anomalies.
@@ -21,11 +21,31 @@ use super::super::features::FeatureVector;
 use super::corpus::corpus_xy;
 use super::logistic::{LogisticRegression, TrainConfig};
 
-/// The payload classifier model, trained once from the bundled corpus.
+/// The payload classifier model, trained once from the bundled corpus, then
+/// augmented with the threat-intel prior (see [`apply_threat_intel_prior`]).
 static TRAINED_MODEL: Lazy<LogisticRegression> = Lazy::new(|| {
     let (x, y) = corpus_xy();
-    LogisticRegression::fit(&x, &y, TrainConfig::default())
+    let mut model = LogisticRegression::fit(&x, &y, TrainConfig::default());
+    apply_threat_intel_prior(&mut model);
+    model
 });
+
+/// Fixed prior weight for the `MATCHES_THREAT_INTEL` feature. The bundled corpus
+/// is payload-only, so it cannot teach a weight for this *runtime* signal (and
+/// L2 would drive an untaught weight toward 0). We instead set a strong positive
+/// weight post-training: with the feature at 1.0 the logit gains +4.0, pushing
+/// σ(·) ≳ 0.98 so the classifier treats any feed-matched request as an attack.
+/// For all corpus / normal traffic the feature is 0.0, so `0 · w = 0` changes no
+/// existing score and leaves the validation metrics untouched.
+const THREAT_INTEL_PRIOR_WEIGHT: f32 = 4.0;
+
+/// Overwrite the learned weight of the threat-intel feature with the fixed prior.
+fn apply_threat_intel_prior(model: &mut LogisticRegression) {
+    use super::super::features::idx;
+    if let Some(w) = model.weights.get_mut(idx::MATCHES_THREAT_INTEL) {
+        *w = THREAT_INTEL_PRIOR_WEIGHT;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -39,7 +59,7 @@ pub struct PayloadClassifier {
 
 impl Default for PayloadClassifier {
     fn default() -> Self {
-        // Share the globally-trained model (cheap clone of 24 weights).
+        // Share the globally-trained model (cheap clone of the weight vector).
         Self {
             model: TRAINED_MODEL.clone(),
         }
@@ -163,6 +183,23 @@ mod tests {
         let fv = FeatureVector::extract(&ctx);
         let s = cls.score(&fv);
         assert!(s > 0.5, "XSS request scored {s}");
+    }
+
+    #[test]
+    fn threat_intel_hit_scores_as_attack() {
+        use super::super::super::features::{idx, FeatureVector};
+        let cls = PayloadClassifier::default();
+
+        // An otherwise-benign feature vector (all zeros) that only carries the
+        // threat-intel flag must score as a near-certain attack — the whole
+        // point of the injected prior.
+        let benign = cls.score(&FeatureVector::default());
+        let mut fv = FeatureVector::default();
+        fv.values[idx::MATCHES_THREAT_INTEL] = 1.0;
+        let hit = cls.score(&fv);
+
+        assert!(hit > 0.85, "threat-intel hit must score high, got {hit}");
+        assert!(hit > benign + 0.3, "hit ({hit}) must far exceed benign ({benign})");
     }
 
     #[test]
