@@ -26,7 +26,11 @@ fn off_domain_http_url_is_flagged() {
     let eng = load_crs_engine("REQUEST-931-APPLICATION-ATTACK-RFI.conf");
     let mut ctx = url_arg_ctx("http://evil.example/shell.txt");
     eval(&eng, &mut ctx, Phase::RequestBody);
-    assert_score(&ctx, 5, "off-domain http URL in an arg should be flagged as RFI");
+    assert_score(
+        &ctx,
+        5,
+        "off-domain http URL in an arg should be flagged as RFI",
+    );
 }
 
 #[test]
@@ -58,5 +62,8 @@ fn subdomain_url_is_not_flagged() {
     // A subdomain of our own host is on-domain.
     let mut ctx = url_arg_ctx("https://cdn.example.com/assets/app.js");
     eval(&eng, &mut ctx, Phase::RequestBody);
-    assert_clean(&ctx, "a subdomain of the request host must not be flagged as RFI");
+    assert_clean(
+        &ctx,
+        "a subdomain of the request host must not be flagged as RFI",
+    );
 }

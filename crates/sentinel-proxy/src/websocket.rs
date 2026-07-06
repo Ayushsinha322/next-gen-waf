@@ -91,12 +91,18 @@ pub async fn read_frame<R: AsyncReadExt + Unpin>(
     let payload_len: usize = match len_byte {
         126 => {
             let mut ext = [0u8; 2];
-            reader.read_exact(&mut ext).await.context("WS frame 16-bit length")?;
+            reader
+                .read_exact(&mut ext)
+                .await
+                .context("WS frame 16-bit length")?;
             u16::from_be_bytes(ext) as usize
         }
         127 => {
             let mut ext = [0u8; 8];
-            reader.read_exact(&mut ext).await.context("WS frame 64-bit length")?;
+            reader
+                .read_exact(&mut ext)
+                .await
+                .context("WS frame 64-bit length")?;
             u64::from_be_bytes(ext) as usize
         }
         n => n as usize,
@@ -107,9 +113,7 @@ pub async fn read_frame<R: AsyncReadExt + Unpin>(
     // aborts the process (capacity-overflow panic under panic=abort) or OOMs
     // the worker.  Reject oversized frames and let the caller close the relay.
     if payload_len > MAX_FRAME_BYTES {
-        anyhow::bail!(
-            "WS frame payload length {payload_len} exceeds maximum {MAX_FRAME_BYTES}"
-        );
+        anyhow::bail!("WS frame payload length {payload_len} exceeds maximum {MAX_FRAME_BYTES}");
     }
 
     let mask = if masked {
@@ -122,7 +126,10 @@ pub async fn read_frame<R: AsyncReadExt + Unpin>(
 
     let mut payload = vec![0u8; payload_len];
     if payload_len > 0 {
-        reader.read_exact(&mut payload).await.context("WS frame payload")?;
+        reader
+            .read_exact(&mut payload)
+            .await
+            .context("WS frame payload")?;
     }
 
     // Unmask if needed.
@@ -135,7 +142,14 @@ pub async fn read_frame<R: AsyncReadExt + Unpin>(
     // Re-encode the raw frame for forwarding (without mask for simplicity).
     let raw = encode_frame(fin, opcode, false, [0u8; 4], &payload);
 
-    Ok(Some(WsFrame { fin, opcode, masked, mask, payload, raw }))
+    Ok(Some(WsFrame {
+        fin,
+        opcode,
+        masked,
+        mask,
+        payload,
+        raw,
+    }))
 }
 
 /// Encode a WebSocket frame.
@@ -238,7 +252,9 @@ pub async fn relay<C, U>(
                     // WAF inspection via full RuleEngine.
                     if let Some(ref engine) = c2u_engine {
                         let mut ctx = RequestContext::new(client_ip, 0);
-                        ctx.uri = WS_INSPECT_URI.parse().unwrap_or_else(|_| Uri::from_static(WS_INSPECT_URI));
+                        ctx.uri = WS_INSPECT_URI
+                            .parse()
+                            .unwrap_or_else(|_| Uri::from_static(WS_INSPECT_URI));
                         ctx.http_version = Version::HTTP_11;
                         ctx.method = Method::POST;
                         ctx.site_id = Some(c2u_site.clone());

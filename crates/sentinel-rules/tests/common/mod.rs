@@ -42,8 +42,7 @@ pub fn load_crs_engines(filenames: &[&str]) -> RuleEngine {
             .unwrap_or_else(|e| panic!("failed to import {}: {}", path.display(), e));
         merged.items.extend(file.items);
     }
-    let ruleset = sentinel_rules::compile(merged)
-        .expect("failed to compile merged CRS rules");
+    let ruleset = sentinel_rules::compile(merged).expect("failed to compile merged CRS rules");
     RuleEngine::new(ruleset)
 }
 
@@ -61,7 +60,9 @@ fn apply_baseline_headers(ctx: &mut RequestContext) {
         .insert(http::header::HOST, "example.com".parse().unwrap());
     ctx.request_headers.insert(
         http::header::USER_AGENT,
-        "Mozilla/5.0 (X11; Linux x86_64) Chrome/125.0".parse().unwrap(),
+        "Mozilla/5.0 (X11; Linux x86_64) Chrome/125.0"
+            .parse()
+            .unwrap(),
     );
 }
 

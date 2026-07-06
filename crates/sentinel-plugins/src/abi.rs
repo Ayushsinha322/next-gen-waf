@@ -353,7 +353,10 @@ fn host_http_callout_body(
     out_max_len: i32,
 ) -> i32 {
     let results = crate::runtime::get_callout_results();
-    let body = results.get(&id).map(|r| r.value().body.clone()).unwrap_or_default();
+    let body = results
+        .get(&id)
+        .map(|r| r.value().body.clone())
+        .unwrap_or_default();
     if body.is_empty() {
         -1
     } else {

@@ -141,7 +141,9 @@ impl TryFrom<&str> for IpNet {
 
     fn try_from(s: &str) -> std::result::Result<Self, String> {
         // Delegate to the ipnet workspace crate for parsing
-        let parsed: ipnet::IpNet = s.parse().map_err(|e: ipnet::AddrParseError| e.to_string())?;
+        let parsed: ipnet::IpNet = s
+            .parse()
+            .map_err(|e: ipnet::AddrParseError| e.to_string())?;
         Ok(Self {
             addr: parsed.network(),
             prefix_len: parsed.prefix_len(),
@@ -445,18 +447,14 @@ impl EbpfManager {
 
         tokio::spawn(async move {
             info!(mode = %mode, interface = %iface, "eBPF background task started");
-            let mut ticker =
-                tokio::time::interval(Duration::from_secs(interval_secs));
+            let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
             ticker.tick().await; // skip the immediate first tick
 
             while running.load(Ordering::Relaxed) {
                 ticker.tick().await;
 
                 let snap = stats.snapshot();
-                let bl_len = blocklist
-                    .read()
-                    .expect("blocklist RwLock poisoned")
-                    .len();
+                let bl_len = blocklist.read().expect("blocklist RwLock poisoned").len();
 
                 debug!(
                     mode = %mode,
@@ -830,9 +828,7 @@ mod tests {
         let ip: IpAddr = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
         mgr.block_ip(ip);
         assert!(mgr.is_blocked(ip));
-        assert!(!mgr.is_blocked(IpAddr::V6(Ipv6Addr::new(
-            0x2001, 0xdb8, 0, 0, 0, 0, 0, 2
-        ))));
+        assert!(!mgr.is_blocked(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2))));
     }
 
     // ------------------------------------------------------------------

@@ -39,8 +39,8 @@
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
-    Allow     = 0,
-    Block     = 1,
+    Allow = 0,
+    Block = 1,
     Challenge = 2,
 }
 
@@ -78,16 +78,11 @@ macro_rules! import_host_functions {
             /// Get the value of request header `name` (ptr+len).
             /// Writes the value into `out_ptr` (max `out_cap` bytes) and returns actual length.
             /// Returns -1 if the header is absent.
-            pub fn host_get_header(
-                name_ptr: i32, name_len: i32,
-                out_ptr: i32, out_cap: i32,
-            ) -> i32;
+            pub fn host_get_header(name_ptr: i32, name_len: i32, out_ptr: i32, out_cap: i32)
+                -> i32;
 
             /// Overwrite or add a response header.
-            pub fn host_set_header(
-                name_ptr: i32, name_len: i32,
-                val_ptr:  i32, val_len:  i32,
-            );
+            pub fn host_set_header(name_ptr: i32, name_len: i32, val_ptr: i32, val_len: i32);
 
             /// Read the current WAF decision (0=Allow, 1=Block, 2=Challenge).
             pub fn host_get_decision() -> i32;
@@ -100,35 +95,31 @@ macro_rules! import_host_functions {
 
             /// Read a string value from the plugin KV store (shared across plugins).
             /// Returns actual length; -1 if key absent.
-            pub fn host_kv_get(
-                key_ptr: i32, key_len: i32,
-                out_ptr: i32, out_cap: i32,
-            ) -> i32;
+            pub fn host_kv_get(key_ptr: i32, key_len: i32, out_ptr: i32, out_cap: i32) -> i32;
 
             /// Write a string value to the plugin KV store.
-            pub fn host_kv_set(
-                key_ptr: i32, key_len: i32,
-                val_ptr: i32, val_len: i32,
-            );
+            pub fn host_kv_set(key_ptr: i32, key_len: i32, val_ptr: i32, val_len: i32);
 
             /// Queue an outbound HTTP callout.  `headers_json` is a JSON object
             /// of request headers.  Returns a callout ID to pass to
             /// `host_http_callout_status` / `host_http_callout_body`.
             pub fn host_http_callout(
-                id:          i32,
-                url_ptr:     i32, url_len:     i32,
-                method_ptr:  i32, method_len:  i32,
-                headers_ptr: i32, headers_len: i32,
-                body_ptr:    i32, body_len:    i32,
+                id: i32,
+                url_ptr: i32,
+                url_len: i32,
+                method_ptr: i32,
+                method_len: i32,
+                headers_ptr: i32,
+                headers_len: i32,
+                body_ptr: i32,
+                body_len: i32,
             );
 
             /// Get the HTTP status of a completed callout (-1 = pending/failed).
             pub fn host_http_callout_status(id: i32) -> i32;
 
             /// Read the body of a completed callout.  Returns actual byte count.
-            pub fn host_http_callout_body(
-                id: i32, out_ptr: i32, out_cap: i32,
-            ) -> i32;
+            pub fn host_http_callout_body(id: i32, out_ptr: i32, out_cap: i32) -> i32;
         }
     };
 }
@@ -150,8 +141,10 @@ pub fn get_header(name: &str) -> Option<String> {
     let mut buf = vec![0u8; 4096];
     let len = unsafe {
         host_get_header(
-            name.as_ptr() as i32, name.len() as i32,
-            buf.as_mut_ptr() as i32, buf.len() as i32,
+            name.as_ptr() as i32,
+            name.len() as i32,
+            buf.as_mut_ptr() as i32,
+            buf.len() as i32,
         )
     };
     if len < 0 {
@@ -179,8 +172,10 @@ pub fn kv_get(key: &str) -> Option<String> {
     let mut buf = vec![0u8; 4096];
     let len = unsafe {
         host_kv_get(
-            key.as_ptr() as i32, key.len() as i32,
-            buf.as_mut_ptr() as i32, buf.len() as i32,
+            key.as_ptr() as i32,
+            key.len() as i32,
+            buf.as_mut_ptr() as i32,
+            buf.len() as i32,
         )
     };
     if len < 0 {
@@ -195,8 +190,10 @@ pub fn kv_get(key: &str) -> Option<String> {
 pub fn kv_set(key: &str, value: &str) {
     unsafe {
         host_kv_set(
-            key.as_ptr() as i32, key.len() as i32,
-            value.as_ptr() as i32, value.len() as i32,
+            key.as_ptr() as i32,
+            key.len() as i32,
+            value.as_ptr() as i32,
+            value.len() as i32,
         )
     }
 }

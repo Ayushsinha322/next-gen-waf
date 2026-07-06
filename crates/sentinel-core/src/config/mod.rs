@@ -7,8 +7,6 @@ use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-
-
 // ---------------------------------------------------------------------------
 // Handle type — shared cheap clone passed everywhere
 // ---------------------------------------------------------------------------
@@ -87,7 +85,9 @@ pub struct ControlPlaneConfig {
     pub tls: TlsFileConfig,
 }
 
-fn default_sync_interval() -> u64 { 5 }
+fn default_sync_interval() -> u64 {
+    5
+}
 
 // ---------------------------------------------------------------------------
 // TLS
@@ -461,7 +461,7 @@ pub struct RuleExclusion {
 }
 
 fn default_max_body_size() -> u64 {
-    10 * 1024 * 1024  // 10 MiB
+    10 * 1024 * 1024 // 10 MiB
 }
 
 fn default_max_uri_length() -> u32 {

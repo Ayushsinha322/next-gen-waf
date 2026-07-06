@@ -186,7 +186,9 @@ impl AntiDdos {
         let now = Instant::now();
         let stale_threshold = self.window * 10;
 
-        let expired_blocks = self.blocked.iter()
+        let expired_blocks = self
+            .blocked
+            .iter()
             .filter(|e| now >= *e.value())
             .map(|e| *e.key())
             .collect::<Vec<_>>();
@@ -195,7 +197,9 @@ impl AntiDdos {
             self.blocked.remove(&ip);
         }
 
-        let stale_stats = self.stats.iter()
+        let stale_stats = self
+            .stats
+            .iter()
             .filter(|e| now.duration_since(e.value().window_start) > stale_threshold)
             .map(|e| *e.key())
             .collect::<Vec<_>>();
@@ -264,8 +268,11 @@ mod tests {
         assert_eq!(ddos.check_connection(ip), DdosVerdict::Allow); // 1
         assert_eq!(ddos.check_connection(ip), DdosVerdict::Allow); // 2
         assert_eq!(ddos.check_connection(ip), DdosVerdict::Allow); // 3 (= threshold)
-        // 4th exceeds threshold → block
-        assert!(matches!(ddos.check_connection(ip), DdosVerdict::Block { .. }));
+                                                                   // 4th exceeds threshold → block
+        assert!(matches!(
+            ddos.check_connection(ip),
+            DdosVerdict::Block { .. }
+        ));
     }
 
     #[test]
@@ -277,8 +284,14 @@ mod tests {
         // Second connection: count = 2 > threshold, triggers block.
         let _ = ddos.check_connection(ip);
         // All subsequent calls return Block.
-        assert!(matches!(ddos.check_connection(ip), DdosVerdict::Block { .. }));
-        assert!(matches!(ddos.check_connection(ip), DdosVerdict::Block { .. }));
+        assert!(matches!(
+            ddos.check_connection(ip),
+            DdosVerdict::Block { .. }
+        ));
+        assert!(matches!(
+            ddos.check_connection(ip),
+            DdosVerdict::Block { .. }
+        ));
         assert_eq!(ddos.blocked_count(), 1);
     }
 
@@ -312,7 +325,8 @@ mod tests {
         // threshold = 0 means count(1) > 0 → block on first call.
         let _ = ddos.check_connection(ip);
         // Regardless of exact behavior, force populate blocked map.
-        ddos.blocked.insert(ip, Instant::now() - Duration::from_secs(1));
+        ddos.blocked
+            .insert(ip, Instant::now() - Duration::from_secs(1));
         assert_eq!(ddos.blocked_count(), 1);
         ddos.gc();
         assert_eq!(ddos.blocked_count(), 0);

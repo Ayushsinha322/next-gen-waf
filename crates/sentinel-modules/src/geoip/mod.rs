@@ -181,19 +181,13 @@ mod tests {
     #[test]
     fn disabled_returns_unknown() {
         let geo = GeoIp::disabled();
-        assert_eq!(
-            geo.check("1.2.3.4".parse().unwrap()),
-            GeoVerdict::Unknown
-        );
+        assert_eq!(geo.check("1.2.3.4".parse().unwrap()), GeoVerdict::Unknown);
     }
 
     #[test]
     fn nonexistent_db_path_is_graceful() {
         let geo = GeoIp::from_path("/nonexistent/path/GeoLite2-Country.mmdb", vec![], vec![]);
-        assert_eq!(
-            geo.check("8.8.8.8".parse().unwrap()),
-            GeoVerdict::Unknown
-        );
+        assert_eq!(geo.check("8.8.8.8".parse().unwrap()), GeoVerdict::Unknown);
         assert!(!geo.is_active());
     }
 
@@ -202,11 +196,15 @@ mod tests {
         let geo = geo_blocklist(&["CN", "RU"]);
         assert_eq!(
             geo.classify(Some("CN")),
-            GeoVerdict::Block { country_code: "CN".into() }
+            GeoVerdict::Block {
+                country_code: "CN".into()
+            }
         );
         assert_eq!(
             geo.classify(Some("RU")),
-            GeoVerdict::Block { country_code: "RU".into() }
+            GeoVerdict::Block {
+                country_code: "RU".into()
+            }
         );
     }
 
@@ -222,11 +220,15 @@ mod tests {
         let geo = geo_allowlist(&["US", "DE", "GB"]);
         assert_eq!(
             geo.classify(Some("CN")),
-            GeoVerdict::Block { country_code: "CN".into() }
+            GeoVerdict::Block {
+                country_code: "CN".into()
+            }
         );
         assert_eq!(
             geo.classify(Some("RU")),
-            GeoVerdict::Block { country_code: "RU".into() }
+            GeoVerdict::Block {
+                country_code: "RU".into()
+            }
         );
     }
 
@@ -250,7 +252,9 @@ mod tests {
         // DE is not in allow_countries → Block.
         assert_eq!(
             geo.classify(Some("DE")),
-            GeoVerdict::Block { country_code: "DE".into() }
+            GeoVerdict::Block {
+                country_code: "DE".into()
+            }
         );
     }
 
@@ -265,11 +269,15 @@ mod tests {
         let geo = geo_blocklist(&["cn"]);
         assert_eq!(
             geo.classify(Some("CN")),
-            GeoVerdict::Block { country_code: "CN".into() }
+            GeoVerdict::Block {
+                country_code: "CN".into()
+            }
         );
         assert_eq!(
             geo.classify(Some("cn")),
-            GeoVerdict::Block { country_code: "CN".into() }
+            GeoVerdict::Block {
+                country_code: "CN".into()
+            }
         );
     }
 }

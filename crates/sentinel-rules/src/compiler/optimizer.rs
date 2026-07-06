@@ -21,8 +21,7 @@ pub struct SharedAcGroup {
 
 pub fn optimize(file: &RuleFile) -> OptimizationHints {
     // Collect ContainsWord rules per word-list hash
-    let mut groups: std::collections::HashMap<String, Vec<u32>> =
-        std::collections::HashMap::new();
+    let mut groups: std::collections::HashMap<String, Vec<u32>> = std::collections::HashMap::new();
 
     for item in &file.items {
         if let RuleItem::Rule(rule) = item {

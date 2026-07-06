@@ -97,7 +97,10 @@ impl LogisticRegression {
             b -= cfg.lr * grad_b * inv_n;
         }
 
-        Self { weights: w, bias: b }
+        Self {
+            weights: w,
+            bias: b,
+        }
     }
 
     /// Predicted attack probability ∈ [0, 1] for one feature vector.
@@ -125,8 +128,14 @@ mod tests {
         }
         let model = LogisticRegression::fit(&x, &y, TrainConfig::default());
 
-        assert!(model.predict_proba(&[0.9, 0.3]) > 0.8, "high feature → attack");
-        assert!(model.predict_proba(&[0.1, 0.3]) < 0.2, "low feature → benign");
+        assert!(
+            model.predict_proba(&[0.9, 0.3]) > 0.8,
+            "high feature → attack"
+        );
+        assert!(
+            model.predict_proba(&[0.1, 0.3]) < 0.2,
+            "low feature → benign"
+        );
         // The discriminative feature must carry more weight than the noise one.
         assert!(model.weights[0].abs() > model.weights[1].abs());
     }

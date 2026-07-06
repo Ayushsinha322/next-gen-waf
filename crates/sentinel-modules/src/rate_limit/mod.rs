@@ -117,12 +117,7 @@ impl RateLimiter {
     /// failing open, so a Redis outage never disables rate limiting entirely.
     ///
     /// [`check`]: RateLimiter::check
-    pub async fn check_async(
-        &self,
-        site_id: &str,
-        ip: IpAddr,
-        config: &RateLimitConfig,
-    ) -> bool {
+    pub async fn check_async(&self, site_id: &str, ip: IpAddr, config: &RateLimitConfig) -> bool {
         let Some(redis) = &self.redis else {
             return self.check(site_id, ip, config);
         };
@@ -211,8 +206,10 @@ impl RateLimiter {
     pub fn gc(&self) {
         const TTL: Duration = Duration::from_secs(300);
         let now = Instant::now();
-        self.per_ip.retain(|_, v| now.duration_since(v.last_used) < TTL);
-        self.per_site.retain(|_, v| now.duration_since(v.last_used) < TTL);
+        self.per_ip
+            .retain(|_, v| now.duration_since(v.last_used) < TTL);
+        self.per_site
+            .retain(|_, v| now.duration_since(v.last_used) < TTL);
     }
 }
 

@@ -11,10 +11,7 @@ use super::acme::CertManager;
 
 const CHECK_INTERVAL: Duration = Duration::from_secs(3_600); // 1 hour
 
-pub async fn renewal_loop(
-    cert_manager: Arc<CertManager>,
-    config_handle: ConfigHandle,
-) {
+pub async fn renewal_loop(cert_manager: Arc<CertManager>, config_handle: ConfigHandle) {
     loop {
         tokio::time::sleep(CHECK_INTERVAL).await;
         let cfg = config_handle.load();
@@ -58,10 +55,7 @@ async fn trigger_issuance(
     match cert_manager.issue_acme(domains.clone(), config).await {
         Ok(()) => {}
         Err(e) => {
-            tracing::error!(
-                ?domains,
-                "ACME renewal failed: {e:#}"
-            );
+            tracing::error!(?domains, "ACME renewal failed: {e:#}");
         }
     }
 }

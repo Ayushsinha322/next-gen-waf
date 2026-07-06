@@ -32,7 +32,11 @@ fn sqli_in_json_body_is_detected() {
     );
     set_paranoia(&mut ctx, 2);
     eval(&eng, &mut ctx, Phase::RequestBody);
-    assert_score(&ctx, 5, "SQLi inside a JSON body field should trigger SQLi rules");
+    assert_score(
+        &ctx,
+        5,
+        "SQLi inside a JSON body field should trigger SQLi rules",
+    );
 }
 
 #[test]
@@ -82,8 +86,8 @@ fn response_body_engine() -> RuleEngine {
 SecRule RESPONSE_BODY "@rx TOP_SECRET_TOKEN" \
     "id:9001,phase:4,block,msg:'data leakage detected in response body'"
 "#;
-    let file = sentinel_rules::import_secrule_conf_dir(conf, None)
-        .expect("import response-body rule");
+    let file =
+        sentinel_rules::import_secrule_conf_dir(conf, None).expect("import response-body rule");
     let ruleset = sentinel_rules::compile(file).expect("compile response-body rule");
     RuleEngine::new(ruleset)
 }

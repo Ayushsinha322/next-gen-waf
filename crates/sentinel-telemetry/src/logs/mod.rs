@@ -105,7 +105,16 @@ fn epoch_to_ymdhms(epoch: u64) -> (u64, u64, u64, u64, u64, u64) {
     let month_days: [u64; 12] = [
         31,
         if leap_year { 29 } else { 28 },
-        31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
     ];
     let mut month = 1u64;
     for &md in &month_days {
@@ -235,23 +244,22 @@ impl EventLogger {
     /// The directory is created if it does not exist.
     pub fn new(log_dir: impl AsRef<Path>) -> Result<Arc<Self>> {
         let dir = log_dir.as_ref();
-        fs::create_dir_all(dir)
-            .with_context(|| format!("create log dir: {}", dir.display()))?;
+        fs::create_dir_all(dir).with_context(|| format!("create log dir: {}", dir.display()))?;
 
         Ok(Arc::new(Self {
             access: LogFile::open(&dir.join("access.log"))?,
-            waf:    LogFile::open(&dir.join("waf.log"))?,
-            error:  LogFile::open(&dir.join("error.log"))?,
-            audit:  LogFile::open(&dir.join("audit.log"))?,
+            waf: LogFile::open(&dir.join("waf.log"))?,
+            error: LogFile::open(&dir.join("error.log"))?,
+            audit: LogFile::open(&dir.join("audit.log"))?,
             modsec: LogFile::open(&dir.join("modsec.log"))?,
-            ml:     LogFile::open(&dir.join("ml.log"))?,
+            ml: LogFile::open(&dir.join("ml.log"))?,
         }))
     }
 
     /// Create from the `SENTINEL_LOG_DIR` env var, defaulting to `/tmp/sentinel-logs`.
     pub fn from_env() -> Result<Arc<Self>> {
-        let dir = std::env::var("SENTINEL_LOG_DIR")
-            .unwrap_or_else(|_| "/tmp/sentinel-logs".to_owned());
+        let dir =
+            std::env::var("SENTINEL_LOG_DIR").unwrap_or_else(|_| "/tmp/sentinel-logs".to_owned());
         Self::new(dir)
     }
 
@@ -317,7 +325,16 @@ impl EventLogger {
 // ---------------------------------------------------------------------------
 
 impl AccessEvent {
-    pub fn new(site: &str, method: &str, path: &str, ip: &str, status: u16, bytes: u64, latency_ms: f64, ua: &str) -> Self {
+    pub fn new(
+        site: &str,
+        method: &str,
+        path: &str,
+        ip: &str,
+        status: u16,
+        bytes: u64,
+        latency_ms: f64,
+        ua: &str,
+    ) -> Self {
         Self {
             ts: now_ts(),
             site: site.to_owned(),
@@ -334,7 +351,17 @@ impl AccessEvent {
 }
 
 impl WafEvent {
-    pub fn new(ip: &str, site: &str, attack: &str, rule: &str, score: u32, sev: &str, action: &str, method: &str, path: &str) -> Self {
+    pub fn new(
+        ip: &str,
+        site: &str,
+        attack: &str,
+        rule: &str,
+        score: u32,
+        sev: &str,
+        action: &str,
+        method: &str,
+        path: &str,
+    ) -> Self {
         Self {
             ts: now_ts(),
             ip: ip.to_owned(),
@@ -365,7 +392,16 @@ impl ErrorEvent {
 }
 
 impl MlEvent {
-    pub fn new(ip: &str, site: &str, path: &str, verdict: &str, conf: f64, model: &str, latency_ms: f64, features: u32) -> Self {
+    pub fn new(
+        ip: &str,
+        site: &str,
+        path: &str,
+        verdict: &str,
+        conf: f64,
+        model: &str,
+        latency_ms: f64,
+        features: u32,
+    ) -> Self {
         Self {
             ts: now_ts(),
             ip: ip.to_owned(),
@@ -390,8 +426,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let logger = EventLogger::new(dir.path()).unwrap();
         logger.log_access(AccessEvent::new(
-            "test.local", "GET", "/api/v1/health", "127.0.0.1",
-            200, 128, 0.5, "sentinel-test/1.0",
+            "test.local",
+            "GET",
+            "/api/v1/health",
+            "127.0.0.1",
+            200,
+            128,
+            0.5,
+            "sentinel-test/1.0",
         ));
         let contents = std::fs::read_to_string(dir.path().join("access.log")).unwrap();
         assert!(contents.contains("\"site\":\"test.local\""));
@@ -405,8 +447,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let logger = EventLogger::new(dir.path()).unwrap();
         logger.log_waf(WafEvent::new(
-            "1.2.3.4", "api.acme.com", "SQL Injection", "CRS-942100",
-            25, "HIGH", "BLOCKED", "POST", "/search",
+            "1.2.3.4",
+            "api.acme.com",
+            "SQL Injection",
+            "CRS-942100",
+            25,
+            "HIGH",
+            "BLOCKED",
+            "POST",
+            "/search",
         ));
         let contents = std::fs::read_to_string(dir.path().join("waf.log")).unwrap();
         assert!(contents.contains("BLOCKED"));

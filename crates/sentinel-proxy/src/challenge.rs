@@ -18,7 +18,10 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use http::{header, HeaderMap, Uri};
-use ring::{hmac, rand::{SecureRandom, SystemRandom}};
+use ring::{
+    hmac,
+    rand::{SecureRandom, SystemRandom},
+};
 
 /// PoW difficulty in leading zero **bits** of SHA-256(nonce "." solution).
 /// 17 bits ≈ ~131k expected hashes ≈ a few hundred ms in-browser once per TTL —
@@ -38,13 +41,20 @@ pub enum Outcome {
     /// without re-challenging.
     Pass,
     /// Proof verified — set a clearance cookie and redirect back to `location`.
-    Grant { location: String, set_cookie: String, expire_pow: String },
+    Grant {
+        location: String,
+        set_cookie: String,
+        expire_pow: String,
+    },
     /// Serve the interstitial challenge page.
     Serve { html: String },
 }
 
 fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn key() -> &'static hmac::Key {
@@ -111,10 +121,16 @@ fn leading_zero_bits(bytes: &[u8]) -> u32 {
 
 /// Is there a valid, unexpired clearance cookie bound to this client IP?
 pub fn clearance_valid(headers: &HeaderMap, ip: IpAddr) -> bool {
-    let Some(val) = cookie(headers, CLEAR_COOKIE) else { return false };
+    let Some(val) = cookie(headers, CLEAR_COOKIE) else {
+        return false;
+    };
     let mut it = val.splitn(2, '.');
-    let (Some(exp_s), Some(sig)) = (it.next(), it.next()) else { return false };
-    let Ok(exp) = exp_s.parse::<u64>() else { return false };
+    let (Some(exp_s), Some(sig)) = (it.next(), it.next()) else {
+        return false;
+    };
+    let Ok(exp) = exp_s.parse::<u64>() else {
+        return false;
+    };
     if exp < now() {
         return false;
     }
@@ -123,7 +139,9 @@ pub fn clearance_valid(headers: &HeaderMap, ip: IpAddr) -> bool {
 
 /// Verify a submitted Proof-of-Work cookie: `nonce.ts.diff.sig.solution`.
 fn pow_valid(headers: &HeaderMap) -> bool {
-    let Some(val) = cookie(headers, POW_COOKIE) else { return false };
+    let Some(val) = cookie(headers, POW_COOKIE) else {
+        return false;
+    };
     let parts: Vec<&str> = val.split('.').collect();
     if parts.len() != 5 {
         return false;
@@ -134,13 +152,17 @@ fn pow_valid(headers: &HeaderMap) -> bool {
         return false;
     }
     // 2. freshness
-    let Ok(ts) = ts_s.parse::<u64>() else { return false };
+    let Ok(ts) = ts_s.parse::<u64>() else {
+        return false;
+    };
     let n = now();
     if ts > n + 5 || n.saturating_sub(ts) > CHALLENGE_TTL_SECS {
         return false;
     }
     // 3. the actual work: SHA-256(nonce "." solution) must have `diff` leading zero bits
-    let Ok(diff) = diff_s.parse::<u32>() else { return false };
+    let Ok(diff) = diff_s.parse::<u32>() else {
+        return false;
+    };
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(nonce.as_bytes());
@@ -170,14 +192,19 @@ pub fn resolve(headers: &HeaderMap, ip: IpAddr, uri: &Uri) -> Outcome {
     }
     if pow_valid(headers) {
         // Proof accepted — grant clearance and bounce back to the original URL.
-        let location = uri.path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| "/".to_string());
+        let location = uri
+            .path_and_query()
+            .map(|p| p.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
         return Outcome::Grant {
             location,
             set_cookie: make_clearance_cookie(ip),
             expire_pow: format!("{POW_COOKIE}=; Path=/; Max-Age=0"),
         };
     }
-    Outcome::Serve { html: interstitial() }
+    Outcome::Serve {
+        html: interstitial(),
+    }
 }
 
 /// Build the interstitial HTML embedding a fresh, signed challenge.
@@ -285,8 +312,14 @@ mod tests {
         assert!(!pow_valid(&headers_with(&forged)), "forged sig must fail");
 
         // Right signature but wrong/insufficient solution must fail.
-        let bad_sol = format!("{POW_COOKIE}={nonce}.{ts}.30.{}.1", sign(&[nonce, &ts, "30"]));
-        assert!(!pow_valid(&headers_with(&bad_sol)), "insufficient work must fail");
+        let bad_sol = format!(
+            "{POW_COOKIE}={nonce}.{ts}.30.{}.1",
+            sign(&[nonce, &ts, "30"])
+        );
+        assert!(
+            !pow_valid(&headers_with(&bad_sol)),
+            "insufficient work must fail"
+        );
     }
 
     #[test]
@@ -297,7 +330,10 @@ mod tests {
         let sig = sign(&[nonce, &old_ts, diff]);
         let sol = solve(nonce, 10);
         let stale = format!("{POW_COOKIE}={nonce}.{old_ts}.{diff}.{sig}.{sol}");
-        assert!(!pow_valid(&headers_with(&stale)), "expired challenge must fail");
+        assert!(
+            !pow_valid(&headers_with(&stale)),
+            "expired challenge must fail"
+        );
     }
 
     #[test]
@@ -330,14 +366,23 @@ mod tests {
         let sig = sign(&[&ip.to_string(), &exp]);
         let ck = format!("{CLEAR_COOKIE}={exp}.{sig}");
 
-        assert!(clearance_valid(&headers_with(&ck), ip), "valid clearance passes");
+        assert!(
+            clearance_valid(&headers_with(&ck), ip),
+            "valid clearance passes"
+        );
 
         let other: IpAddr = "9.9.9.9".parse().unwrap();
-        assert!(!clearance_valid(&headers_with(&ck), other), "other IP cannot reuse");
+        assert!(
+            !clearance_valid(&headers_with(&ck), other),
+            "other IP cannot reuse"
+        );
 
         let past = (now() - 10).to_string();
         let psig = sign(&[&ip.to_string(), &past]);
         let expired = format!("{CLEAR_COOKIE}={past}.{psig}");
-        assert!(!clearance_valid(&headers_with(&expired), ip), "expired clearance fails");
+        assert!(
+            !clearance_valid(&headers_with(&expired), ip),
+            "expired clearance fails"
+        );
     }
 }

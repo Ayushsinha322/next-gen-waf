@@ -23,7 +23,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use sentinel_core::config::{
-    LoadBalancerStrategy, LogFormat, LogOutput, LoggingConfig, ListenerConfig, Protocol,
+    ListenerConfig, LoadBalancerStrategy, LogFormat, LogOutput, LoggingConfig, Protocol,
     ProtocolSpec, SentinelConfig, SiteConfig, UpstreamConfig, UpstreamServer, WafConfig, WafMode,
 };
 use sentinel_ml::llm_copilot::CopilotService;
@@ -125,7 +125,11 @@ enum CopilotCmd {
         #[arg(short, long)]
         prompt: String,
         /// System message / personality.
-        #[arg(short, long, default_value = "You are a helpful WAF security assistant.")]
+        #[arg(
+            short,
+            long,
+            default_value = "You are a helpful WAF security assistant."
+        )]
         system: String,
     },
     /// Explain why a recent request was blocked (paste log line or describe it).
@@ -273,7 +277,9 @@ async fn run() -> Result<()> {
                 mode,
                 threshold,
                 no_crs,
-            } => cmd_site_add(&cfg_path, &name, &domain, &upstream, &mode, threshold, no_crs),
+            } => cmd_site_add(
+                &cfg_path, &name, &domain, &upstream, &mode, threshold, no_crs,
+            ),
             SiteCmd::Remove { name } => cmd_site_remove(&cfg_path, &name),
             SiteCmd::List => cmd_site_list(&cfg_path),
             SiteCmd::Mode { name, mode } => cmd_site_mode(&cfg_path, &name, &mode),
@@ -371,7 +377,9 @@ fn find_crs_dir() -> Option<PathBuf> {
     }
     candidates.push(PathBuf::from("rules/owasp-crs/rules"));
     candidates.push(PathBuf::from("/usr/share/sentinel/rules/owasp-crs/rules"));
-    candidates.push(PathBuf::from("/usr/local/share/sentinel/rules/owasp-crs/rules"));
+    candidates.push(PathBuf::from(
+        "/usr/local/share/sentinel/rules/owasp-crs/rules",
+    ));
 
     for c in candidates {
         if c.is_dir() {
@@ -402,8 +410,7 @@ fn save_config(path: &Path, cfg: &SentinelConfig) -> Result<()> {
         fs::create_dir_all(p)?;
     }
     let yaml = serde_yaml::to_string(cfg)?;
-    fs::write(path, yaml)
-        .with_context(|| format!("writing config '{}'", path.display()))?;
+    fs::write(path, yaml).with_context(|| format!("writing config '{}'", path.display()))?;
     Ok(())
 }
 
@@ -537,9 +544,9 @@ fn cmd_start(cfg_path: &Path, override_bin: Option<&Path>) -> Result<()> {
         });
     }
 
-    let child = cmd.spawn().with_context(|| {
-        format!("spawning data-plane binary '{}'", bin.display())
-    })?;
+    let child = cmd
+        .spawn()
+        .with_context(|| format!("spawning data-plane binary '{}'", bin.display()))?;
     let pid = child.id() as i32;
     write_pid(pid as u32)?;
 
@@ -617,7 +624,10 @@ fn cmd_status(cfg_path: &Path) -> Result<()> {
     let pid = read_pid()?;
     let alive = pid.map(process_alive).unwrap_or(false);
     if alive {
-        println!("  Status:    RUNNING (pid {})", pid.expect("pid must exist when alive"));
+        println!(
+            "  Status:    RUNNING (pid {})",
+            pid.expect("pid must exist when alive")
+        );
     } else {
         println!("  Status:    stopped");
     }
@@ -682,9 +692,7 @@ fn cmd_site_add(
     let mut cfg = load_config(cfg_path)?;
 
     if cfg.sites.iter().any(|s| s.id == name) {
-        bail!(
-            "site '{name}' already exists. Remove it first:  sentinel site rm {name}"
-        );
+        bail!("site '{name}' already exists. Remove it first:  sentinel site rm {name}");
     }
 
     let waf_mode = parse_mode(mode)?;
@@ -948,16 +956,51 @@ fn cmd_test(cfg_path: &Path, site_filter: Option<&str>) -> Result<()> {
     println!();
 
     let attacks: &[(&str, &str, Option<&str>, bool)] = &[
-        ("Clean GET",         "/",                                                                None,                                              false),
-        ("Clean query",       "/?id=42&name=alice",                                               None,                                              false),
-        ("SQL injection",     "/?id=1%27%20UNION%20SELECT%20username%2Cpassword%20FROM%20users",  None,                                              true),
-        ("SQLi (SLEEP)",      "/login?u=admin%27%20OR%20SLEEP(5)--%20",                           None,                                              true),
-        ("XSS (script tag)",  "/?q=%3Cscript%3Ealert(1)%3C/script%3E",                            None,                                              true),
-        ("XSS (img onerror)", "/?q=%3Cimg%20src=x%20onerror=alert(1)%3E",                         None,                                              true),
-        ("Path traversal",    "/?file=..%2F..%2F..%2F..%2Fetc%2Fpasswd",                          None,                                              true),
-        ("RCE attempt",       "/?cmd=%3Bcat%20%2Fetc%2Fpasswd",                                   None,                                              true),
-        ("PHP wrapper",       "/?file=php%3A%2F%2Ffilter%2Fconvert.base64-encode%2Fresource%3Da", None,                                              true),
-        ("Login bypass POST", "/login",                                                           Some("user=admin&pass=%27%20OR%20%271%27%3D%271"), true),
+        ("Clean GET", "/", None, false),
+        ("Clean query", "/?id=42&name=alice", None, false),
+        (
+            "SQL injection",
+            "/?id=1%27%20UNION%20SELECT%20username%2Cpassword%20FROM%20users",
+            None,
+            true,
+        ),
+        (
+            "SQLi (SLEEP)",
+            "/login?u=admin%27%20OR%20SLEEP(5)--%20",
+            None,
+            true,
+        ),
+        (
+            "XSS (script tag)",
+            "/?q=%3Cscript%3Ealert(1)%3C/script%3E",
+            None,
+            true,
+        ),
+        (
+            "XSS (img onerror)",
+            "/?q=%3Cimg%20src=x%20onerror=alert(1)%3E",
+            None,
+            true,
+        ),
+        (
+            "Path traversal",
+            "/?file=..%2F..%2F..%2F..%2Fetc%2Fpasswd",
+            None,
+            true,
+        ),
+        ("RCE attempt", "/?cmd=%3Bcat%20%2Fetc%2Fpasswd", None, true),
+        (
+            "PHP wrapper",
+            "/?file=php%3A%2F%2Ffilter%2Fconvert.base64-encode%2Fresource%3Da",
+            None,
+            true,
+        ),
+        (
+            "Login bypass POST",
+            "/login",
+            Some("user=admin&pass=%27%20OR%20%271%27%3D%271"),
+            true,
+        ),
     ];
 
     let mut blocked = 0usize;
@@ -997,15 +1040,13 @@ fn cmd_test(cfg_path: &Path, site_filter: Option<&str>) -> Result<()> {
 
         let (label, expected_ok) = match result.as_str() {
             "403" => ("BLOCKED", *is_attack),
-            "200" => ("PASSED",  !*is_attack),
+            "200" => ("PASSED", !*is_attack),
             "502" | "503" | "504" => ("UPSTREAM-ERR", false),
             _ => (result.as_str(), false),
         };
 
         let marker = if expected_ok { "  ok " } else { " WARN" };
-        println!(
-            "  [{marker}] {label:<13}  {name:<20} {path}",
-        );
+        println!("  [{marker}] {label:<13}  {name:<20} {path}",);
 
         if result == "403" {
             blocked += 1;
@@ -1031,11 +1072,13 @@ fn cmd_paths(cfg_path: &Path, override_bin: Option<&Path>) -> Result<()> {
     println!("log_file     : {}", log_path()?.display());
     println!(
         "data_plane   : {}",
-        bin.map(|p| p.display().to_string()).unwrap_or_else(|| "(not found)".into())
+        bin.map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(not found)".into())
     );
     println!(
         "crs_rules_dir: {}",
-        crs.map(|p| p.display().to_string()).unwrap_or_else(|| "(not found)".into())
+        crs.map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(not found)".into())
     );
     Ok(())
 }
@@ -1053,8 +1096,7 @@ async fn cmd_copilot(action: CopilotCmd) -> Result<()> {
             .unwrap_or_else(|_| "https://ai.enlight.dev/api".into()),
         api_key: std::env::var("SENTINEL_LLM_API_KEY")
             .unwrap_or_else(|_| "sk-f87a48c6102447abb3382b596ebf51de".into()),
-        model: std::env::var("SENTINEL_LLM_MODEL")
-            .unwrap_or_else(|_| "deepseek-r1:8b".into()),
+        model: std::env::var("SENTINEL_LLM_MODEL").unwrap_or_else(|_| "deepseek-r1:8b".into()),
         timeout_secs: 30,
     };
 
@@ -1203,10 +1245,7 @@ fn print_log_line(line: &str) {
     // the log target/message at the top.  Prefer fields for our structured
     // request log entries.
     let fields = v.get("fields").unwrap_or(&v);
-    let msg = fields
-        .get("message")
-        .and_then(|x| x.as_str())
-        .unwrap_or("");
+    let msg = fields.get("message").and_then(|x| x.as_str()).unwrap_or("");
 
     if msg == "request" {
         let decision = fields
@@ -1284,9 +1323,7 @@ fn cmd_plugin_install(reference: &str, dir: &str) -> Result<()> {
         );
     }
 
-    let manifest: serde_json::Value = manifest_resp
-        .into_json()
-        .context("parsing manifest JSON")?;
+    let manifest: serde_json::Value = manifest_resp.into_json().context("parsing manifest JSON")?;
 
     let layers = manifest["layers"]
         .as_array()
@@ -1308,7 +1345,12 @@ fn cmd_plugin_install(reference: &str, dir: &str) -> Result<()> {
         let media_type = layer["mediaType"].as_str().unwrap_or("");
 
         let blob_url = format!("{}/v2/{}/blobs/{}", api_base, repo, digest);
-        println!("  → Downloading layer {}/{}: {}", i + 1, layers.len(), digest);
+        println!(
+            "  → Downloading layer {}/{}: {}",
+            i + 1,
+            layers.len(),
+            digest
+        );
 
         let blob_resp = ureq::get(&blob_url)
             .set("User-Agent", "sentinel-waf-cli/0.1")
@@ -1340,7 +1382,10 @@ fn cmd_plugin_install(reference: &str, dir: &str) -> Result<()> {
                 Err(e) => {
                     let raw_path = install_dir.join(format!("layer_{}.bin", i));
                     fs::write(&raw_path, &data)?;
-                    println!("     → Decompress failed ({e}), saved raw blob to {}", raw_path.display());
+                    println!(
+                        "     → Decompress failed ({e}), saved raw blob to {}",
+                        raw_path.display()
+                    );
                 }
             }
         } else {
@@ -1380,7 +1425,10 @@ fn cmd_plugin_install(reference: &str, dir: &str) -> Result<()> {
 fn cmd_plugin_list(dir: &str) -> Result<()> {
     let plugin_dir = PathBuf::from(dir);
     if !plugin_dir.is_dir() {
-        println!("No plugins installed (directory does not exist: {})", plugin_dir.display());
+        println!(
+            "No plugins installed (directory does not exist: {})",
+            plugin_dir.display()
+        );
         return Ok(());
     }
 

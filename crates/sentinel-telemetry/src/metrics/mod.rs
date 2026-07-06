@@ -194,10 +194,7 @@ impl MetricsRegistry {
     /// Register and return a new gauge.
     pub fn register_gauge(&self, name: impl Into<String>, help: impl Into<String>) -> Gauge {
         let g = Gauge::new(name, help);
-        self.gauges
-            .lock()
-            .expect("gauges poisoned")
-            .push(g.clone());
+        self.gauges.lock().expect("gauges poisoned").push(g.clone());
         g
     }
 

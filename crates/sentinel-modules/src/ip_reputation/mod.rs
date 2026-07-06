@@ -93,24 +93,24 @@ impl IpReputation {
 
     /// Add a CIDR range to the allowlist.
     pub fn add_allowed_cidr(&mut self, cidr: &str) -> anyhow::Result<()> {
-        let net = IpNet::from_str(cidr)
-            .map_err(|e| anyhow::anyhow!("invalid CIDR '{cidr}': {e}"))?;
+        let net =
+            IpNet::from_str(cidr).map_err(|e| anyhow::anyhow!("invalid CIDR '{cidr}': {e}"))?;
         self.allowlist.push(net);
         Ok(())
     }
 
     /// Add a CIDR range to the blocklist with a human-readable reason.
     pub fn add_blocked_cidr(&mut self, cidr: &str, reason: &str) -> anyhow::Result<()> {
-        let net = IpNet::from_str(cidr)
-            .map_err(|e| anyhow::anyhow!("invalid CIDR '{cidr}': {e}"))?;
+        let net =
+            IpNet::from_str(cidr).map_err(|e| anyhow::anyhow!("invalid CIDR '{cidr}': {e}"))?;
         self.blocklist.push((net, reason.to_string()));
         Ok(())
     }
 
     /// Add a CIDR range to the suspect list with category tags.
     pub fn add_suspect_cidr(&mut self, cidr: &str, tags: Vec<String>) -> anyhow::Result<()> {
-        let net = IpNet::from_str(cidr)
-            .map_err(|e| anyhow::anyhow!("invalid CIDR '{cidr}': {e}"))?;
+        let net =
+            IpNet::from_str(cidr).map_err(|e| anyhow::anyhow!("invalid CIDR '{cidr}': {e}"))?;
         self.suspect_list.push((net, tags));
         Ok(())
     }
@@ -246,12 +246,9 @@ async fn fetch_text(client: &HttpsClient, url: &str) -> anyhow::Result<String> {
                 .boxed(),
         )?;
 
-    let resp = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        client.request(req),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("feed '{}' timed out after 30s", url))??;
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(30), client.request(req))
+        .await
+        .map_err(|_| anyhow::anyhow!("feed '{}' timed out after 30s", url))??;
 
     let status = resp.status();
     if !status.is_success() {
@@ -310,7 +307,8 @@ mod tests {
     #[test]
     fn blocklist_match() {
         let mut rep = IpReputation::new();
-        rep.add_blocked_cidr("10.0.0.0/8", "private network").unwrap();
+        rep.add_blocked_cidr("10.0.0.0/8", "private network")
+            .unwrap();
         assert!(matches!(
             rep.check(ipv4(10, 1, 2, 3)),
             IpVerdict::Block { .. }

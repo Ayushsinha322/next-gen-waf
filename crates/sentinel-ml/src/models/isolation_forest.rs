@@ -75,12 +75,7 @@ impl IsolationTree {
     /// Build a tree from `samples` (each is a row of feature values).
     /// `depth`: current depth; `max_depth`: depth limit (`⌈log₂ ψ⌉`).
     /// Panics if `samples` is empty.
-    fn build(
-        samples: &[&[f32]],
-        depth: usize,
-        max_depth: usize,
-        rng: &mut XorShift64,
-    ) -> Self {
+    fn build(samples: &[&[f32]], depth: usize, max_depth: usize, rng: &mut XorShift64) -> Self {
         if samples.is_empty() {
             return IsolationTree::Leaf { size: 0 };
         }
@@ -109,7 +104,10 @@ impl IsolationTree {
             feature = rng.next_usize(dim);
         }
 
-        let min: f32 = samples.iter().map(|r| r[feature]).fold(f32::INFINITY, f32::min);
+        let min: f32 = samples
+            .iter()
+            .map(|r| r[feature])
+            .fold(f32::INFINITY, f32::min);
         let max: f32 = samples
             .iter()
             .map(|r| r[feature])
@@ -136,8 +134,18 @@ impl IsolationTree {
             .collect();
 
         IsolationTree::Branch {
-            left: Box::new(IsolationTree::build(&left_samples, depth + 1, max_depth, rng)),
-            right: Box::new(IsolationTree::build(&right_samples, depth + 1, max_depth, rng)),
+            left: Box::new(IsolationTree::build(
+                &left_samples,
+                depth + 1,
+                max_depth,
+                rng,
+            )),
+            right: Box::new(IsolationTree::build(
+                &right_samples,
+                depth + 1,
+                max_depth,
+                rng,
+            )),
             split_feature: feature,
             split_value,
             size: samples.len(),
@@ -436,9 +444,7 @@ mod tests {
 
     #[test]
     fn small_data_trains() {
-        let data: Vec<Vec<f32>> = (0..32)
-            .map(|i| vec![(i % 5) as f32 / 5.0, 0.5])
-            .collect();
+        let data: Vec<Vec<f32>> = (0..32).map(|i| vec![(i % 5) as f32 / 5.0, 0.5]).collect();
         let f = IsolationForest::train(&data);
         assert!(f.is_trained());
         assert_eq!(f.tree_count(), IsolationForest::N_TREES);
@@ -451,10 +457,7 @@ mod tests {
         // Normal cluster near (0.0, 0.0)
         let mut normal: Vec<Vec<f32>> = Vec::new();
         for _ in 0..128 {
-            normal.push(vec![
-                random_jitter(0.0, 0.05),
-                random_jitter(0.0, 0.05),
-            ]);
+            normal.push(vec![random_jitter(0.0, 0.05), random_jitter(0.0, 0.05)]);
         }
         let f = IsolationForest::train(&normal);
         let normal_score = f.score(&[0.01, 0.01]);

@@ -17,8 +17,7 @@ fn detect_engine() -> RuleEngine {
 SecRule ARGS "@detectSQLi" "id:8001,phase:2,block,msg:'libinjection sqli'"
 SecRule ARGS "@detectXSS" "id:8002,phase:2,block,msg:'libinjection xss'"
 "#;
-    let file =
-        sentinel_rules::import_secrule_conf_dir(conf, None).expect("import detect rules");
+    let file = sentinel_rules::import_secrule_conf_dir(conf, None).expect("import detect rules");
     let ruleset = sentinel_rules::compile(file).expect("compile detect rules");
     RuleEngine::new(ruleset)
 }
@@ -36,14 +35,22 @@ fn keywordless_sql_tautology_is_detected() {
     // libinjection flags the `' OR '1'='1` tautology.
     let eng = detect_engine();
     let mut ctx = make_post_ctx("/login", "user=admin&pass=1' OR '1'='1");
-    assert_eq!(run(&eng, &mut ctx), WafDecision::Block, "tautology SQLi must block");
+    assert_eq!(
+        run(&eng, &mut ctx),
+        WafDecision::Block,
+        "tautology SQLi must block"
+    );
 }
 
 #[test]
 fn union_select_sqli_is_detected() {
     let eng = detect_engine();
     let mut ctx = make_post_ctx("/q", "id=1 UNION SELECT username,password FROM users");
-    assert_eq!(run(&eng, &mut ctx), WafDecision::Block, "UNION SELECT must block");
+    assert_eq!(
+        run(&eng, &mut ctx),
+        WafDecision::Block,
+        "UNION SELECT must block"
+    );
 }
 
 #[test]
@@ -51,7 +58,11 @@ fn clean_sql_like_text_passes() {
     let eng = detect_engine();
     // Natural-language value that merely contains the word "or" must not block.
     let mut ctx = make_post_ctx("/comment", "text=tea or coffee, your choice");
-    assert_eq!(run(&eng, &mut ctx), WafDecision::Allow, "benign prose must pass");
+    assert_eq!(
+        run(&eng, &mut ctx),
+        WafDecision::Allow,
+        "benign prose must pass"
+    );
 }
 
 // --- XSS -------------------------------------------------------------------
@@ -61,19 +72,31 @@ fn attribute_event_handler_xss_is_detected() {
     // No literal `<script>` tag — attribute/event-handler XSS.
     let eng = detect_engine();
     let mut ctx = make_post_ctx("/c", "html=<img src=x onerror=alert(1)>");
-    assert_eq!(run(&eng, &mut ctx), WafDecision::Block, "onerror XSS must block");
+    assert_eq!(
+        run(&eng, &mut ctx),
+        WafDecision::Block,
+        "onerror XSS must block"
+    );
 }
 
 #[test]
 fn script_tag_xss_is_detected() {
     let eng = detect_engine();
     let mut ctx = make_post_ctx("/c", "html=<script>alert(document.cookie)</script>");
-    assert_eq!(run(&eng, &mut ctx), WafDecision::Block, "script-tag XSS must block");
+    assert_eq!(
+        run(&eng, &mut ctx),
+        WafDecision::Block,
+        "script-tag XSS must block"
+    );
 }
 
 #[test]
 fn clean_html_mention_passes() {
     let eng = detect_engine();
     let mut ctx = make_post_ctx("/c", "text=I like the script of that movie");
-    assert_eq!(run(&eng, &mut ctx), WafDecision::Allow, "benign mention must pass");
+    assert_eq!(
+        run(&eng, &mut ctx),
+        WafDecision::Allow,
+        "benign mention must pass"
+    );
 }

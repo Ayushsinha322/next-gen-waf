@@ -93,10 +93,7 @@ impl FeatureVector {
 
         // --- Headers ---
         v[idx::HEADER_COUNT] = log_scale(ctx.request_headers.len(), 50);
-        v[idx::HAS_UA] = ctx
-            .request_headers
-            .contains_key(http::header::USER_AGENT)
-            as u8 as f32;
+        v[idx::HAS_UA] = ctx.request_headers.contains_key(http::header::USER_AGENT) as u8 as f32;
         let ua_len = ctx
             .request_headers
             .get(http::header::USER_AGENT)
@@ -104,10 +101,8 @@ impl FeatureVector {
             .map(|s| s.len())
             .unwrap_or(0);
         v[idx::UA_LEN] = log_scale(ua_len, 512);
-        v[idx::CONTENT_TYPE_PRESENT] = ctx
-            .request_headers
-            .contains_key(http::header::CONTENT_TYPE)
-            as u8 as f32;
+        v[idx::CONTENT_TYPE_PRESENT] =
+            ctx.request_headers.contains_key(http::header::CONTENT_TYPE) as u8 as f32;
         let cookie_count = ctx
             .request_headers
             .get_all(http::header::COOKIE)
@@ -180,8 +175,20 @@ fn special_char_density(bytes: &[u8]) -> f32 {
         .filter(|&&b| {
             matches!(
                 b,
-                b'\'' | b'"' | b'<' | b'>' | b';' | b'(' | b')' | b'\\'
-                    | b'|' | b'`' | b'&' | b'-' | b'+' | b'/'
+                b'\''
+                    | b'"'
+                    | b'<'
+                    | b'>'
+                    | b';'
+                    | b'('
+                    | b')'
+                    | b'\\'
+                    | b'|'
+                    | b'`'
+                    | b'&'
+                    | b'-'
+                    | b'+'
+                    | b'/'
             )
         })
         .count();
@@ -300,7 +307,8 @@ mod tests {
 
     #[test]
     fn sqli_detected_in_query_string() {
-        let ctx = ctx_from_uri("http://example.com/item?id=1%27%20UNION%20SELECT%20*%20FROM%20users");
+        let ctx =
+            ctx_from_uri("http://example.com/item?id=1%27%20UNION%20SELECT%20*%20FROM%20users");
         let fv = FeatureVector::extract(&ctx);
         assert!(
             fv.values[idx::SQL_KEYWORD_SCORE] > 0.5 || fv.values[idx::PCT_ENCODED_COUNT] > 0.0,
@@ -321,9 +329,7 @@ mod tests {
     #[test]
     fn raw_xss_detected() {
         // Percent-encode the <script> tag so Uri parser accepts it.
-        let ctx = ctx_from_uri(
-            "http://example.com/search?q=%3Cscript%3Ealert(1)%3C%2Fscript%3E",
-        );
+        let ctx = ctx_from_uri("http://example.com/search?q=%3Cscript%3Ealert(1)%3C%2Fscript%3E");
         let fv = FeatureVector::extract(&ctx);
         assert!(
             fv.values[idx::XSS_KEYWORD_SCORE] > 0.5,
@@ -334,9 +340,8 @@ mod tests {
 
     #[test]
     fn raw_sqli_detected() {
-        let ctx = ctx_from_uri(
-            "http://example.com/page?id=1%27%20UNION%20SELECT%20*%20FROM%20users",
-        );
+        let ctx =
+            ctx_from_uri("http://example.com/page?id=1%27%20UNION%20SELECT%20*%20FROM%20users");
         let fv = FeatureVector::extract(&ctx);
         assert!(
             fv.values[idx::SQL_KEYWORD_SCORE] > 0.5,
@@ -350,15 +355,15 @@ mod tests {
         let ctx = ctx_from_uri("http://example.com/api/v2/users?sort=name&order=asc");
         let fv = FeatureVector::extract(&ctx);
         for (i, v) in fv.values.iter().enumerate() {
-            assert!(
-                *v >= 0.0 && *v <= 1.0,
-                "feature[{i}] = {v} out of [0,1]"
-            );
+            assert!(*v >= 0.0 && *v <= 1.0, "feature[{i}] = {v} out of [0,1]");
         }
     }
 
     #[test]
     fn log_scale_saturates() {
-        assert!(log_scale(1_000_000, 2048) <= 1.2, "log-scale should not blow up");
+        assert!(
+            log_scale(1_000_000, 2048) <= 1.2,
+            "log-scale should not blow up"
+        );
     }
 }

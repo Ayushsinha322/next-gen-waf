@@ -43,10 +43,10 @@ impl MemoryStore {
 
     pub async fn set(&self, key: &str, value: Vec<u8>, ttl: Option<Duration>) {
         let expires = ttl.map(|d| Instant::now() + d);
-        self.data.write().await.insert(
-            key.to_string(),
-            Entry { value, expires },
-        );
+        self.data
+            .write()
+            .await
+            .insert(key.to_string(), Entry { value, expires });
     }
 
     pub async fn del(&self, key: &str) {
@@ -118,7 +118,9 @@ mod tests {
     #[tokio::test]
     async fn gc_removes_expired() {
         let store = MemoryStore::new();
-        store.set("a", b"1".to_vec(), Some(Duration::from_millis(1))).await;
+        store
+            .set("a", b"1".to_vec(), Some(Duration::from_millis(1)))
+            .await;
         store.set("b", b"2".to_vec(), None).await;
         tokio::time::sleep(Duration::from_millis(5)).await;
         store.gc().await;

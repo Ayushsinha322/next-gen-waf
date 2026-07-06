@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
-use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::ResolvesServerCert;
 use rustls::sign::CertifiedKey;
 use serde::{Deserialize, Serialize};
@@ -71,7 +71,15 @@ impl CertMeta {
 
     pub fn status_label(&self) -> &'static str {
         let d = self.days_until_expiry();
-        if d <= 0 { "expired" } else if d <= 14 { "critical" } else if d <= 30 { "expiring" } else { "valid" }
+        if d <= 0 {
+            "expired"
+        } else if d <= 14 {
+            "critical"
+        } else if d <= 30 {
+            "expiring"
+        } else {
+            "valid"
+        }
     }
 }
 
@@ -132,7 +140,10 @@ impl CertStore {
             let meta: CertMeta = if meta_file.exists() {
                 serde_json::from_str(&std::fs::read_to_string(&meta_file)?)?
             } else {
-                let domain = entry.file_name().to_string_lossy().replace("_wildcard_", "*");
+                let domain = entry
+                    .file_name()
+                    .to_string_lossy()
+                    .replace("_wildcard_", "*");
                 CertMeta {
                     domain: domain.clone(),
                     name: String::new(),
@@ -148,10 +159,8 @@ impl CertStore {
 
             match load_pem_files(&cert_file, &key_file) {
                 Ok(ck) => {
-                    self.live.insert(
-                        meta.domain.clone(),
-                        Arc::new(CertEntry { key: ck, meta }),
-                    );
+                    self.live
+                        .insert(meta.domain.clone(), Arc::new(CertEntry { key: ck, meta }));
                     count += 1;
                 }
                 Err(e) => {
@@ -193,7 +202,8 @@ impl CertStore {
         let ck = load_pem_bytes(cert_pem.as_bytes(), key_pem.as_bytes())
             .context("loading installed cert into rustls")?;
 
-        self.live.insert(domain.to_string(), Arc::new(CertEntry { key: ck, meta }));
+        self.live
+            .insert(domain.to_string(), Arc::new(CertEntry { key: ck, meta }));
         tracing::info!(domain, "TLS cert installed and hot-swapped");
         Ok(())
     }
@@ -224,7 +234,8 @@ impl CertStore {
         let key_pem = std::fs::read_to_string(dir.join("key.pem"))?;
         let ck = load_pem_bytes(cert_pem.as_bytes(), key_pem.as_bytes())
             .context("reloading cert after rename")?;
-        self.live.insert(domain.to_string(), Arc::new(CertEntry { key: ck, meta }));
+        self.live
+            .insert(domain.to_string(), Arc::new(CertEntry { key: ck, meta }));
         Ok(())
     }
 
@@ -298,16 +309,22 @@ impl CertStore {
             // Restore the previous on-disk state (or remove if there was none).
             for (p, prev) in &snapshot {
                 match prev {
-                    Some(bytes) => { let _ = write_atomic(p, bytes); }
-                    None => { let _ = std::fs::remove_file(p); }
+                    Some(bytes) => {
+                        let _ = write_atomic(p, bytes);
+                    }
+                    None => {
+                        let _ = std::fs::remove_file(p);
+                    }
                 }
             }
             return Err(e).context("installing management cert (restored previous on-disk state)");
         }
 
         // 3. Hot-swap the live entry — picked up on the next TLS handshake.
-        self.live
-            .insert(MANAGEMENT_CERT_KEY.to_string(), Arc::new(CertEntry { key: ck, meta }));
+        self.live.insert(
+            MANAGEMENT_CERT_KEY.to_string(),
+            Arc::new(CertEntry { key: ck, meta }),
+        );
         tracing::info!("management TLS cert installed and hot-swapped");
         Ok(prev_fp)
     }
@@ -360,7 +377,8 @@ pub struct SentinelCertResolver {
 
 impl std::fmt::Debug for SentinelCertResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SentinelCertResolver").finish_non_exhaustive()
+        f.debug_struct("SentinelCertResolver")
+            .finish_non_exhaustive()
     }
 }
 
@@ -399,10 +417,7 @@ impl SentinelCertResolver {
 }
 
 impl ResolvesServerCert for SentinelCertResolver {
-    fn resolve(
-        &self,
-        client_hello: rustls::server::ClientHello<'_>,
-    ) -> Option<Arc<CertifiedKey>> {
+    fn resolve(&self, client_hello: rustls::server::ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         // Fixed-key mode (management listener): always serve the one configured
         // cert, regardless of SNI, with a self-signed fallback until uploaded.
         if let Some(key) = &self.fixed_key {
@@ -457,8 +472,8 @@ impl ResolvesServerCert for SentinelCertResolver {
 
 pub fn generate_self_signed(domain: &str) -> Result<Arc<CertifiedKey>> {
     let names = vec![domain.to_string(), format!("*.{domain}")];
-    let cert = rcgen::generate_simple_self_signed(names)
-        .context("rcgen generate_simple_self_signed")?;
+    let cert =
+        rcgen::generate_simple_self_signed(names).context("rcgen generate_simple_self_signed")?;
     let cert_der = cert.serialize_der().context("serialize cert DER")?;
     let key_der = cert.serialize_private_key_der();
 
@@ -557,8 +572,11 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     }
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
-        return Err(anyhow::Error::from(e)
-            .context(format!("renaming {} -> {}", tmp.display(), path.display())));
+        return Err(anyhow::Error::from(e).context(format!(
+            "renaming {} -> {}",
+            tmp.display(),
+            path.display()
+        )));
     }
     Ok(())
 }
@@ -572,15 +590,18 @@ mod tests {
 
     fn tmp_store() -> Arc<CertStore> {
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir()
-            .join(format!("sentinel-certtest-{}-{}", std::process::id(), n));
+        let dir =
+            std::env::temp_dir().join(format!("sentinel-certtest-{}-{}", std::process::id(), n));
         let _ = std::fs::remove_dir_all(&dir);
         CertStore::new(dir)
     }
 
     fn self_signed_pem(cn: &str) -> (String, String) {
         let cert = rcgen::generate_simple_self_signed(vec![cn.to_string()]).unwrap();
-        (cert.serialize_pem().unwrap(), cert.serialize_private_key_pem())
+        (
+            cert.serialize_pem().unwrap(),
+            cert.serialize_private_key_pem(),
+        )
     }
 
     fn meta(fp: &str) -> CertMeta {
@@ -613,11 +634,16 @@ mod tests {
         assert_eq!(got.fingerprint, "fp1");
 
         // Hidden from the customer cert repository listing.
-        assert!(store.all_meta().iter().all(|m| m.domain != MANAGEMENT_CERT_KEY));
+        assert!(store
+            .all_meta()
+            .iter()
+            .all(|m| m.domain != MANAGEMENT_CERT_KEY));
 
         // Re-install returns the previous fingerprint (for audit old→new).
         let (cert2, key2) = self_signed_pem("mgmt.test");
-        let prev2 = store.install_management(&cert2, &key2, meta("fp2")).unwrap();
+        let prev2 = store
+            .install_management(&cert2, &key2, meta("fp2"))
+            .unwrap();
         assert_eq!(prev2, Some("fp1".to_string()));
 
         // Revert removes it → resolver falls back to self-signed.

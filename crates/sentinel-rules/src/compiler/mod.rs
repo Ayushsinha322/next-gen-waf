@@ -8,8 +8,8 @@ use regex::Regex;
 use tracing::debug;
 
 use crate::dsl::ast::{
-    CmpOp, Directive, Operator, RuleDef, RuleFile, RuleItem, RuleSeverity,
-    TargetCombinator, TargetExpr, Transform, VirtualPatch,
+    CmpOp, Directive, Operator, RuleDef, RuleFile, RuleItem, RuleSeverity, TargetCombinator,
+    TargetExpr, Transform, VirtualPatch,
 };
 use emitter::{CompiledRuleSet, Instruction, RuleCoverage, RuleMeta, TargetSpec};
 use optimizer::build_ac;
@@ -42,8 +42,7 @@ impl CompilerState {
         if let Some(idx) = self.patterns.iter().position(|r| r.as_str() == pattern) {
             return Ok(idx);
         }
-        let re = Regex::new(pattern)
-            .with_context(|| format!("invalid regex: {pattern}"))?;
+        let re = Regex::new(pattern).with_context(|| format!("invalid regex: {pattern}"))?;
         let idx = self.patterns.len();
         self.patterns.push(re);
         Ok(idx)
@@ -86,8 +85,7 @@ impl CompilerState {
 pub fn compile(file: RuleFile) -> Result<CompiledRuleSet> {
     let mut state = CompilerState::new();
     let mut phase_programs: [Vec<Instruction>; 7] = Default::default();
-    let mut rule_meta: std::collections::HashMap<u32, RuleMeta> =
-        std::collections::HashMap::new();
+    let mut rule_meta: std::collections::HashMap<u32, RuleMeta> = std::collections::HashMap::new();
 
     // Process items in source order — CRS skip-gate correctness depends on it.
     //
@@ -200,10 +198,7 @@ pub fn compile(file: RuleFile) -> Result<CompiledRuleSet> {
 // Rule compilation helpers
 // ---------------------------------------------------------------------------
 
-fn compile_rule(
-    rule: &RuleDef,
-    state: &mut CompilerState,
-) -> Result<(Vec<Instruction>, RuleMeta)> {
+fn compile_rule(rule: &RuleDef, state: &mut CompilerState) -> Result<(Vec<Instruction>, RuleMeta)> {
     let mut instrs: Vec<Instruction> = Vec::new();
     let meta = RuleMeta {
         id: rule.id,
@@ -216,12 +211,26 @@ fn compile_rule(
         skip_after: rule.skip_after.clone(),
     };
 
-    emit_condition(&rule.targets, &rule.operator, &rule.transforms, rule.multi_match, state, &mut instrs)?;
+    emit_condition(
+        &rule.targets,
+        &rule.operator,
+        &rule.transforms,
+        rule.multi_match,
+        state,
+        &mut instrs,
+    )?;
 
     // Chain conditions: AND-ed with the primary condition result.
     // Transforms from the parent rule also apply to chain member targets.
     for chain in &rule.chain_conditions {
-        emit_condition(&chain.targets, &chain.operator, &rule.transforms, rule.multi_match, state, &mut instrs)?;
+        emit_condition(
+            &chain.targets,
+            &chain.operator,
+            &rule.transforms,
+            rule.multi_match,
+            state,
+            &mut instrs,
+        )?;
         instrs.push(Instruction::And);
     }
 
@@ -238,7 +247,10 @@ fn compile_virtual_patch(
     let mut instrs: Vec<Instruction> = Vec::new();
     let meta = RuleMeta {
         id: vp_id,
-        message: vp.message.clone().unwrap_or_else(|| format!("Virtual patch: {}", vp.cve)),
+        message: vp
+            .message
+            .clone()
+            .unwrap_or_else(|| format!("Virtual patch: {}", vp.cve)),
         severity: RuleSeverity::Critical,
         score_delta: 0,
         action: vp.action.clone(),
@@ -280,10 +292,16 @@ fn emit_condition(
             instrs.push(Instruction::CmpGe { threshold: t });
             return Ok(());
         }
-        Operator::MlScore { model, op: _, threshold } => {
+        Operator::MlScore {
+            model,
+            op: _,
+            threshold,
+        } => {
             let model_id = state.intern_ml_model(model);
             instrs.push(Instruction::MlScore { model_id });
-            instrs.push(Instruction::CmpGe { threshold: *threshold as f64 });
+            instrs.push(Instruction::CmpGe {
+                threshold: *threshold as f64,
+            });
             return Ok(());
         }
         Operator::RateLimit { .. } => {
@@ -351,7 +369,9 @@ fn emit_operator_match(
             instrs.push(Instruction::MatchEq { literal_id });
         }
         Operator::Ge(n) => {
-            instrs.push(Instruction::CmpGe { threshold: *n as f64 });
+            instrs.push(Instruction::CmpGe {
+                threshold: *n as f64,
+            });
         }
         Operator::Exists => {
             instrs.push(Instruction::Exists);
@@ -373,9 +393,7 @@ fn emit_operator_match(
             instrs.push(Instruction::Not);
         }
         // Non-target operators handled above in emit_condition
-        Operator::AnomalyScore { .. }
-        | Operator::MlScore { .. }
-        | Operator::RateLimit { .. } => {}
+        Operator::AnomalyScore { .. } | Operator::MlScore { .. } | Operator::RateLimit { .. } => {}
     }
     Ok(())
 }

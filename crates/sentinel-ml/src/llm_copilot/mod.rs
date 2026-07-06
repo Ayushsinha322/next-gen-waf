@@ -135,15 +135,18 @@ impl CopilotService {
             ctx.block_reason.as_deref().unwrap_or("unknown"),
         );
 
-        self.chat(&prompt, "You are a concise WAF security expert. Always answer in one sentence.")
-            .await
-            .unwrap_or_else(|e| {
-                warn!("copilot explain failed: {e}");
-                format!(
-                    "Request to {} was blocked due to anomaly score {} and rules: {}",
-                    ctx.uri, ctx.anomaly_score, rules_text
-                )
-            })
+        self.chat(
+            &prompt,
+            "You are a concise WAF security expert. Always answer in one sentence.",
+        )
+        .await
+        .unwrap_or_else(|e| {
+            warn!("copilot explain failed: {e}");
+            format!(
+                "Request to {} was blocked due to anomaly score {} and rules: {}",
+                ctx.uri, ctx.anomaly_score, rules_text
+            )
+        })
     }
 
     /// Generate an SRL rule from a human description.
@@ -238,7 +241,10 @@ impl CopilotService {
             .to_bytes();
 
         if http_status != StatusCode::OK {
-            let err_str = String::from_utf8_lossy(&body_bytes).chars().take(300).collect::<String>();
+            let err_str = String::from_utf8_lossy(&body_bytes)
+                .chars()
+                .take(300)
+                .collect::<String>();
             anyhow::bail!("copilot returned HTTP {http_status} — {err_str}");
         }
 

@@ -24,10 +24,8 @@ fn make_ctx() -> RequestContext {
         http::header::USER_AGENT,
         "Mozilla/5.0 (Test)".parse().unwrap(),
     );
-    ctx.request_headers.insert(
-        http::header::HOST,
-        "example.com".parse().unwrap(),
-    );
+    ctx.request_headers
+        .insert(http::header::HOST, "example.com".parse().unwrap());
     ctx
 }
 

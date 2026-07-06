@@ -132,11 +132,7 @@ impl MlEngine {
     /// * `buffer_capacity` — max recent vector count for Isolation Forest.
     /// * `retrain_every` — retrain forest after N new observations.
     /// * `model_dir` — path to load `.onnx` models from.
-    pub fn new(
-        buffer_capacity: usize,
-        retrain_every: usize,
-        model_dir: Option<&Path>,
-    ) -> Self {
+    pub fn new(buffer_capacity: usize, retrain_every: usize, model_dir: Option<&Path>) -> Self {
         let mut registry = ModelRegistry::new();
         let config = MlEngineConfig {
             buffer_capacity,
@@ -243,7 +239,10 @@ impl MlEngine {
             .collect();
         let n = benign.len();
         self.forest.seed(&benign);
-        info!(seeded = n, "ML anomaly model warm-started from benign baseline");
+        info!(
+            seeded = n,
+            "ML anomaly model warm-started from benign baseline"
+        );
     }
 
     /// Update sensitivity threshold from config (hot-reload).
@@ -331,7 +330,9 @@ mod tests {
         let mut ctx =
             sentinel_core::context::RequestContext::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1234);
         for i in 0..64 {
-            ctx.uri = format!("http://example.com/products/{i}?page=1").parse().unwrap();
+            ctx.uri = format!("http://example.com/products/{i}?page=1")
+                .parse()
+                .unwrap();
             engine.evaluate(&ctx);
         }
         assert!(engine.is_trained());
@@ -344,9 +345,10 @@ mod tests {
         // Use a percent-encoded SQLi so the URI is valid.
         let mut sqli_ctx =
             sentinel_core::context::RequestContext::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1234);
-        sqli_ctx.uri = "http://example.com/products?id=1%27%20UNION%20SELECT%20*%20FROM%20users%20--"
-            .parse()
-            .unwrap();
+        sqli_ctx.uri =
+            "http://example.com/products?id=1%27%20UNION%20SELECT%20*%20FROM%20users%20--"
+                .parse()
+                .unwrap();
         let sqli = engine.evaluate(&sqli_ctx);
 
         // The attack should score higher on the payload classifier.

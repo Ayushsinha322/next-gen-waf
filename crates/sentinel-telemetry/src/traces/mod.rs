@@ -114,11 +114,7 @@ pub struct Span {
 }
 
 impl Span {
-    fn new(
-        name: impl Into<String>,
-        trace_id: TraceId,
-        parent_span_id: Option<SpanId>,
-    ) -> Self {
+    fn new(name: impl Into<String>, trace_id: TraceId, parent_span_id: Option<SpanId>) -> Self {
         let start_wall = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -155,8 +151,8 @@ impl Span {
             .unwrap_or_default();
 
         // Serialise attributes to a JSON string for the log field.
-        let attrs_json = serde_json::to_string(&self.attributes)
-            .unwrap_or_else(|_| "{}".to_owned());
+        let attrs_json =
+            serde_json::to_string(&self.attributes).unwrap_or_else(|_| "{}".to_owned());
 
         tracing::info!(
             target: "sentinel_trace",
