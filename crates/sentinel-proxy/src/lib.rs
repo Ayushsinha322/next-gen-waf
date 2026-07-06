@@ -59,7 +59,7 @@ use sentinel_ebpf::{EbpfConfig, EbpfManager};
 use sentinel_ml::MlEngine;
 use sentinel_modules::{
     detect_smuggling, AntiDdos, BotDetector, BotVerdict, DdosVerdict, GeoIp, GeoVerdict,
-    IpReputation, IpVerdict, RateLimiter, SmugglingVerdict,
+    IpReputation, IpVerdict, RateLimiter, RawTier, SmugglingVerdict, ThreatFeed, ThreatVerdict,
 };
 use sentinel_plugins::PluginRuntime;
 use sentinel_rules::RuleEngine;
@@ -336,6 +336,11 @@ struct ModulesState {
 
     /// Suspect CIDRs from external feeds; updated by the feed-loader task.
     feed_cache: FeedCache,
+
+    /// Global threat-intelligence feed (malicious IPs/CIDRs/UAs/domains/URL
+    /// patterns) hot-synced from the control plane. Atomically swapped by the
+    /// threat-intel poller — updates never block a live request.
+    threat_intel: ArcSwap<ThreatFeed>,
 }
 
 // ---------------------------------------------------------------------------
@@ -388,6 +393,44 @@ impl ManagementUpstreams {
 struct ConfigSyncResponse {
     version: u64,
     sites: Vec<SiteConfig>,
+}
+
+/// Response from the control-plane `/api/v1/internal/threat-intel` endpoint —
+/// IOCs pre-split into block (high-confidence → reject) and watch (→ score)
+/// tiers. See `sentinel_modules::threat_intel`.
+#[derive(serde::Deserialize, Default)]
+struct ThreatIntelSyncResponse {
+    version: i64,
+    #[serde(default)]
+    block: ThreatTierResponse,
+    #[serde(default)]
+    watch: ThreatTierResponse,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct ThreatTierResponse {
+    #[serde(default)]
+    ips: Vec<String>,
+    #[serde(default)]
+    cidrs: Vec<String>,
+    #[serde(default)]
+    user_agents: Vec<String>,
+    #[serde(default)]
+    domains: Vec<String>,
+    #[serde(default)]
+    url_substrings: Vec<String>,
+}
+
+impl From<ThreatTierResponse> for RawTier {
+    fn from(t: ThreatTierResponse) -> Self {
+        RawTier {
+            ips: t.ips,
+            cidrs: t.cidrs,
+            user_agents: t.user_agents,
+            domains: t.domains,
+            url_substrings: t.url_substrings,
+        }
+    }
 }
 
 /// Top-level proxy server.  One instance manages all configured listeners.
@@ -584,6 +627,7 @@ impl ProxyServer {
             anti_ddos: build_anti_ddos(&cfg),
             correlation: CorrelationEngine::new(),
             feed_cache: Arc::clone(&feed_cache),
+            threat_intel: ArcSwap::new(Arc::new(ThreatFeed::empty())),
         });
 
         let plugin_runtime = build_plugin_runtime(&cfg).unwrap_or_else(|e| {
@@ -805,6 +849,94 @@ impl ProxyServer {
                         sentinel_core::config::update_sites(&poll_cfg, sync.sites);
                         last_version = sync.version;
                         info!(version = last_version, sites = count, "sites hot-synced");
+                    }
+                }
+            });
+        }
+
+        // --- Background: control-plane threat-intelligence sync (every 60 s) ---
+        // Mirrors the site-config sync above: polls the internal threat-intel
+        // endpoint, and on a version change rebuilds + atomically swaps the
+        // ThreatFeed so hundreds of thousands of IOCs update without dropping a
+        // live request. Uses the same shared-secret auth as config sync.
+        if let Some(sync_url) = cfg.cluster.sync_url.clone() {
+            let ti_modules = Arc::clone(&modules);
+            let secs = std::env::var("SENTINEL_TI_SYNC_INTERVAL_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(60);
+            // Anomaly score added when a watch-tier (lower-confidence) IOC matches.
+            let watch_score = std::env::var("SENTINEL_TI_WATCH_SCORE")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(3);
+            tokio::spawn(async move {
+                use http_body_util::BodyExt as _;
+                type EmptyBody = http_body_util::Empty<bytes::Bytes>;
+                let client: Client<_, EmptyBody> =
+                    Client::builder(TokioExecutor::new()).build_http();
+                let internal_secret = std::env::var("SENTINEL_INTERNAL_SECRET")
+                    .ok()
+                    .filter(|s| !s.is_empty());
+                let mut last_version: i64 = i64::MIN;
+                let mut ticker = tokio::time::interval(Duration::from_secs(secs));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    ticker.tick().await;
+                    let url = format!("{}/api/v1/internal/threat-intel", sync_url);
+                    let uri: hyper::Uri = match url.parse() {
+                        Ok(u) => u,
+                        Err(e) => {
+                            warn!("threat-intel sync: bad url: {e}");
+                            continue;
+                        }
+                    };
+                    let mut builder = hyper::Request::builder().method("GET").uri(uri);
+                    if let Some(secret) = &internal_secret {
+                        builder = builder.header("x-sentinel-internal", secret);
+                    }
+                    let req = builder
+                        .body(http_body_util::Empty::new())
+                        .expect("BUG: building threat-intel sync request");
+                    let resp = match client.request(req).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            warn!("threat-intel sync fetch: {e}");
+                            continue;
+                        }
+                    };
+                    let bytes = match resp.collect().await {
+                        Ok(b) => b.to_bytes(),
+                        Err(e) => {
+                            warn!("threat-intel sync body: {e}");
+                            continue;
+                        }
+                    };
+                    let sync: ThreatIntelSyncResponse = match serde_json::from_slice(&bytes) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!(
+                                "threat-intel sync parse: {e} — snippet: {}",
+                                String::from_utf8_lossy(&bytes)
+                                    .chars()
+                                    .take(120)
+                                    .collect::<String>()
+                            );
+                            continue;
+                        }
+                    };
+                    if sync.version != last_version {
+                        let feed = ThreatFeed::from_parts(
+                            sync.version,
+                            watch_score,
+                            sync.block.into(),
+                            sync.watch.into(),
+                        );
+                        let count = feed.entry_count();
+                        last_version = sync.version;
+                        ti_modules.threat_intel.store(Arc::new(feed));
+                        info!(version = last_version, iocs = count, "threat-intel hot-synced");
                     }
                 }
             });
@@ -1414,6 +1546,46 @@ async fn proxy(
                 ctx.anomaly_score = ctx.anomaly_score.saturating_add(2);
             }
             IpVerdict::Allow => {}
+        }
+    }
+
+    // Threat intelligence: dynamic global IOC feed (malicious IPs/CIDRs, botnet
+    // C2, Tor exits, scanner UAs, malicious domains/URL patterns) hot-synced from
+    // the control plane. Block tier = high-confidence → reject now (like an
+    // explicit blocklist, mode-independent); watch tier = add anomaly score and
+    // let the rule engine / ML decide.
+    {
+        let ti = state.modules.threat_intel.load();
+        if !ti.is_empty() {
+            let ua = req
+                .headers()
+                .get(http::header::USER_AGENT)
+                .and_then(|v| v.to_str().ok());
+            let host = req
+                .headers()
+                .get(http::header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .or_else(|| req.uri().authority().map(|a| a.as_str()));
+            match ti.check(ctx.client_ip, ua, host, req.uri().path()) {
+                ThreatVerdict::Block { reason } => {
+                    ctx.threat_intel_hit = true;
+                    ctx.decision = WafDecision::Block;
+                    ctx.block_reason = Some(format!("threat intel: {reason}"));
+                    state.modules.correlation.record_block(ctx.client_ip);
+                    ctx.advance_phase(Phase::Logging);
+                    log_request(&ctx);
+                    return Ok(block_response(&ctx));
+                }
+                ThreatVerdict::Score { score, tag } => {
+                    // Feed the ML "learning" loop: this flag becomes a strongly-
+                    // weighted feature so the classifier treats feed-matched
+                    // traffic as highly anomalous (see sentinel-ml).
+                    ctx.threat_intel_hit = true;
+                    ctx.tx_vars.insert("threat_intel".to_string(), tag);
+                    ctx.anomaly_score = ctx.anomaly_score.saturating_add(score);
+                }
+                ThreatVerdict::None => {}
+            }
         }
     }
 
@@ -3828,5 +4000,75 @@ mod log_rotation_tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod threat_intel_contract_tests {
+    use super::*;
+    use std::net::IpAddr;
+    use std::str::FromStr;
+
+    // Locks the Go↔Rust wire contract: this is byte-for-byte the shape the
+    // control-plane /api/v1/internal/threat-intel endpoint emits. If either side
+    // drifts (field rename, tier restructure), this fails.
+    const SAMPLE: &str = r#"{
+        "version": 1783337955,
+        "generated_at": "2026-07-06T00:00:00Z",
+        "count": 3,
+        "block_confidence": 80,
+        "block": {
+            "ips": ["9.9.9.9"],
+            "cidrs": ["203.0.113.0/24"],
+            "user_agents": ["sqlmap"],
+            "domains": ["evil.example"],
+            "url_substrings": []
+        },
+        "watch": {
+            "ips": ["8.8.8.8"],
+            "cidrs": [],
+            "user_agents": [],
+            "domains": [],
+            "url_substrings": []
+        }
+    }"#;
+
+    #[test]
+    fn deserializes_and_enforces_tiers() {
+        let sync: ThreatIntelSyncResponse =
+            serde_json::from_str(SAMPLE).expect("parse threat-intel sync JSON");
+        assert_eq!(sync.version, 1783337955);
+
+        let feed = ThreatFeed::from_parts(sync.version, 3, sync.block.into(), sync.watch.into());
+        assert_eq!(feed.version(), 1783337955);
+        assert!(!feed.is_empty());
+
+        let ip = |s: &str| IpAddr::from_str(s).unwrap();
+
+        // Block tier → reject.
+        assert!(matches!(
+            feed.check(ip("9.9.9.9"), None, None, "/"),
+            ThreatVerdict::Block { .. }
+        ));
+        assert!(matches!(
+            feed.check(ip("203.0.113.200"), None, None, "/"),
+            ThreatVerdict::Block { .. }
+        ));
+        assert!(matches!(
+            feed.check(ip("1.1.1.1"), Some("curl sqlmap/1.0"), None, "/"),
+            ThreatVerdict::Block { .. }
+        ));
+
+        // Watch tier → score, not block.
+        assert!(matches!(
+            feed.check(ip("8.8.8.8"), None, None, "/"),
+            ThreatVerdict::Score { score: 3, .. }
+        ));
+
+        // Clean traffic → pass.
+        assert_eq!(
+            feed.check(ip("1.1.1.1"), Some("Mozilla/5.0"), Some("good.example"), "/"),
+            ThreatVerdict::None
+        );
     }
 }

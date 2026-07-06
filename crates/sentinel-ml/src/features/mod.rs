@@ -1,11 +1,11 @@
 //! Feature extraction: `RequestContext` → `FeatureVector`.
 //!
-//! Produces a 24-dimensional row vector of normalised floats that is consumed
+//! Produces a 25-dimensional row vector of normalised floats that is consumed
 //! by both the Isolation Forest (anomaly detection) and the Payload Classifier.
 
 use sentinel_core::context::RequestContext;
 
-pub const FEATURE_DIM: usize = 24;
+pub const FEATURE_DIM: usize = 25;
 
 /// Named indices into `FeatureVector::values`.
 pub mod idx {
@@ -33,9 +33,13 @@ pub mod idx {
     pub const CONTENT_TYPE_PRESENT: usize = 21;
     pub const COOKIE_COUNT: usize = 22;
     pub const IS_TLS: usize = 23;
+    /// Set to 1.0 when the request matched the hot threat-intelligence feed.
+    /// Carries a strong, fixed prior weight in the payload classifier (the
+    /// corpus cannot teach a runtime signal), so a hit dominates the score.
+    pub const MATCHES_THREAT_INTEL: usize = 24;
 }
 
-/// 24-dimensional, fully-normalised feature row extracted from a request.
+/// 25-dimensional, fully-normalised feature row extracted from a request.
 /// Every element ∈ [0.0, 1.0].
 #[derive(Debug, Clone)]
 pub struct FeatureVector {
@@ -145,6 +149,9 @@ impl FeatureVector {
 
         // --- Existing WAF anomaly score (rule engine output) ---
         v[idx::ANOMALY_SCORE] = (ctx.anomaly_score as f32 / 100.0).min(1.0);
+
+        // --- Threat-intelligence feed match (dynamic CTI signal) ---
+        v[idx::MATCHES_THREAT_INTEL] = ctx.threat_intel_hit as u8 as f32;
 
         Self { values: v }
     }

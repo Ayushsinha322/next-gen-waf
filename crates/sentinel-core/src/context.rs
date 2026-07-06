@@ -133,6 +133,11 @@ pub struct RequestContext {
     /// the learning report (would-have-blocked aggregation) without affecting
     /// traffic. The reason that triggered it is retained in `block_reason`.
     pub would_block: bool,
+    /// True when this request matched the hot threat-intelligence feed at a
+    /// *watch* tier (high-confidence block-tier IOCs are rejected before ML
+    /// runs). The ML feature extractor turns this into a strong anomaly signal
+    /// so the classifier learns to treat feed-matched traffic as malicious.
+    pub threat_intel_hit: bool,
 
     // --- Upstream / response ---
     pub upstream_addr: Option<std::net::SocketAddr>,
@@ -178,6 +183,7 @@ impl RequestContext {
             decision: WafDecision::Allow,
             block_reason: None,
             would_block: false,
+            threat_intel_hit: false,
             upstream_addr: None,
             upstream_latency_us: None,
             response_status: None,
