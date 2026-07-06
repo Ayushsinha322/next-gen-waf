@@ -199,7 +199,10 @@ mod tests {
         let hit = cls.score(&fv);
 
         assert!(hit > 0.85, "threat-intel hit must score high, got {hit}");
-        assert!(hit > benign + 0.3, "hit ({hit}) must far exceed benign ({benign})");
+        assert!(
+            hit > benign + 0.3,
+            "hit ({hit}) must far exceed benign ({benign})"
+        );
     }
 
     #[test]
