@@ -9,7 +9,7 @@ stages:
 # ── Rust data plane ──────────────────────────────────────────────────────────
 rust:
   stage: test
-  image: rust:1.82
+  image: rust:1.85
   tags:
     - k8s-docker
   variables:
