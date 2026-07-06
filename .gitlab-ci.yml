@@ -10,6 +10,8 @@ stages:
 rust:
   stage: test
   image: rust:1.82
+  tags:
+    - k8s-docker
   variables:
     CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
   cache:
@@ -29,6 +31,8 @@ rust:
 go:
   stage: test
   image: golang:1.22
+  tags:
+    - k8s-docker
   cache:
     key: "go-$CI_COMMIT_REF_SLUG"
     paths:
@@ -45,6 +49,8 @@ go:
 dashboard:
   stage: build
   image: node:20
+  tags:
+    - k8s-docker
   cache:
     key: "node-$CI_COMMIT_REF_SLUG"
     paths:
@@ -60,3 +66,7 @@ dashboard:
 # GitLab ships native secret detection; enable it instead of the gitleaks action.
 include:
   - template: Security/Secret-Detection.gitlab-ci.yml
+
+secret_detection:
+  tags:
+    - k8s-docker
