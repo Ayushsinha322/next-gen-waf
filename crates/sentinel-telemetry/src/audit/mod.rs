@@ -70,8 +70,7 @@ pub struct AuditEntry {
 // ---------------------------------------------------------------------------
 
 fn compute_hmac(key: &[u8], message: &[u8]) -> String {
-    let mut mac =
-        HmacSha256::new_from_slice(key).expect("HMAC accepts keys of any length");
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts keys of any length");
     mac.update(message);
     let result = mac.finalize();
     hex::encode(result.into_bytes())
@@ -146,7 +145,16 @@ fn now_iso8601() -> String {
     let month_days: [u64; 12] = [
         31,
         if leap_year { 29 } else { 28 },
-        31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
     ];
     let mut month = 1u64;
     for &md in &month_days {
@@ -212,8 +220,8 @@ impl AuditLogger {
 
     /// Create from `$SENTINEL_LOG_DIR` (default: `/tmp/sentinel-logs`).
     pub fn from_env() -> Result<Self> {
-        let dir = std::env::var("SENTINEL_LOG_DIR")
-            .unwrap_or_else(|_| "/tmp/sentinel-logs".to_owned());
+        let dir =
+            std::env::var("SENTINEL_LOG_DIR").unwrap_or_else(|_| "/tmp/sentinel-logs".to_owned());
         Self::new(PathBuf::from(dir).join("audit.log"))
     }
 
@@ -222,7 +230,8 @@ impl AuditLogger {
         if !path.exists() {
             return Ok(String::new());
         }
-        let f = File::open(path).with_context(|| format!("open audit log for read: {}", path.display()))?;
+        let f = File::open(path)
+            .with_context(|| format!("open audit log for read: {}", path.display()))?;
         let reader = BufReader::new(f);
         let mut last = String::new();
         for line in reader.lines() {
@@ -234,8 +243,8 @@ impl AuditLogger {
         if last.is_empty() {
             return Ok(String::new());
         }
-        let entry: AuditEntry = serde_json::from_str(&last)
-            .with_context(|| "parse last audit entry")?;
+        let entry: AuditEntry =
+            serde_json::from_str(&last).with_context(|| "parse last audit entry")?;
         Ok(entry.hash)
     }
 
@@ -414,7 +423,13 @@ mod tests {
             .write("alice", "rule.create", "WafRule", "crs-942100", "10.0.0.1")
             .unwrap();
         logger
-            .write("bob", "policy.update", "SitePolicy", "default", "192.168.1.5")
+            .write(
+                "bob",
+                "policy.update",
+                "SitePolicy",
+                "default",
+                "192.168.1.5",
+            )
             .unwrap();
         logger
             .write("alice", "rule.delete", "WafRule", "crs-942100", "10.0.0.1")
@@ -434,7 +449,13 @@ mod tests {
             .write("alice", "rule.create", "WafRule", "crs-942100", "10.0.0.1")
             .unwrap();
         logger
-            .write("bob", "policy.update", "SitePolicy", "default", "192.168.1.5")
+            .write(
+                "bob",
+                "policy.update",
+                "SitePolicy",
+                "default",
+                "192.168.1.5",
+            )
             .unwrap();
 
         // Tamper: replace the file content with a modified first line.

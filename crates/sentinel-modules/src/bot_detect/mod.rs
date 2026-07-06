@@ -47,7 +47,10 @@ static ATTACKER_PATTERNS: &[(&str, &str)] = &[
     (r"(?i)\bnmap\b", "Nmap"),
     (r"(?i)\bmasscan\b", "Masscan"),
     (r"(?i)\bzgrab\b", "ZGrab"),
-    (r"(?i)\bdirbuster\b|\bgobuster\b|\bffuf\b|\bwfuzz\b|\bferoxbuster\b", "DirBruter"),
+    (
+        r"(?i)\bdirbuster\b|\bgobuster\b|\bffuf\b|\bwfuzz\b|\bferoxbuster\b",
+        "DirBruter",
+    ),
     (r"(?i)\bzaproxy\b|\bZAP/\b", "OWASP ZAP"),
     (r"(?i)\bbsqlbf\b", "BSQL Brute Force"),
     (r"(?i)\bhavij\b", "Havij"),
@@ -247,25 +250,37 @@ mod tests {
     #[test]
     fn sqlmap_blocked() {
         let ua = "sqlmap/1.8.3#stable (https://sqlmap.org)";
-        assert!(matches!(det().classify(ua, None), BotVerdict::KnownAttacker(_)));
+        assert!(matches!(
+            det().classify(ua, None),
+            BotVerdict::KnownAttacker(_)
+        ));
     }
 
     #[test]
     fn nikto_blocked() {
         let ua = "Mozilla/5.00 (Nikto/2.1.6)";
-        assert!(matches!(det().classify(ua, None), BotVerdict::KnownAttacker(_)));
+        assert!(matches!(
+            det().classify(ua, None),
+            BotVerdict::KnownAttacker(_)
+        ));
     }
 
     #[test]
     fn gobuster_blocked() {
         let ua = "gobuster/3.6";
-        assert!(matches!(det().classify(ua, None), BotVerdict::KnownAttacker(_)));
+        assert!(matches!(
+            det().classify(ua, None),
+            BotVerdict::KnownAttacker(_)
+        ));
     }
 
     #[test]
     fn burp_suite_blocked() {
         let ua = "Mozilla/5.0 (compatible; BurpSuite/2024.3)";
-        assert!(matches!(det().classify(ua, None), BotVerdict::KnownAttacker(_)));
+        assert!(matches!(
+            det().classify(ua, None),
+            BotVerdict::KnownAttacker(_)
+        ));
     }
 
     #[test]
@@ -327,6 +342,9 @@ mod tests {
     #[test]
     fn headless_browser_blocked() {
         let ua = "Mozilla/5.0 (X11; Linux x86_64) HeadlessChrome/124.0";
-        assert!(matches!(det().classify(ua, None), BotVerdict::KnownAttacker(_)));
+        assert!(matches!(
+            det().classify(ua, None),
+            BotVerdict::KnownAttacker(_)
+        ));
     }
 }

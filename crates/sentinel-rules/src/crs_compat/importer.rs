@@ -3,11 +3,13 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use tracing::warn;
 
+use super::secrule::{
+    parse_crs_actions, parse_crs_operator, split_crs_targets, CrsAction, CrsActions,
+};
 use crate::dsl::ast::{
     ChainCondition, Directive, Operator, RuleAction, RuleDef, RuleFile, RuleItem, RulePhase,
     Target, TargetCombinator, TargetExpr,
 };
-use super::secrule::{CrsAction, CrsActions, parse_crs_actions, parse_crs_operator, split_crs_targets};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -52,8 +54,7 @@ pub fn import_secrule_conf_dir(
                 // 931130/931131 are collapsed into a single native OffDomainUrl
                 // rule (see secrule_directive_to_rule_with_actions); suppress chain
                 // accumulation so the unexpressable macro child condition is dropped.
-                let is_chain =
-                    actions.chain && !matches!(actions.id, Some(931130) | Some(931131));
+                let is_chain = actions.chain && !matches!(actions.id, Some(931130) | Some(931131));
 
                 if let Some(ref mut pending) = pending_chain {
                     // This directive is a chain member — add its condition.
@@ -64,7 +65,9 @@ pub fn import_secrule_conf_dir(
                             // Chain members may have empty targets (bare operator
                             // that applies to the previously matched value) — we
                             // treat those as Exists stubs.
-                            pending.chain_conditions.push(ChainCondition { targets, operator });
+                            pending
+                                .chain_conditions
+                                .push(ChainCondition { targets, operator });
                         }
                         Err(e) => {
                             warn!("CRS importer: skipping chain condition: {e}");
@@ -73,7 +76,11 @@ pub fn import_secrule_conf_dir(
 
                     if !is_chain {
                         // End of chain — emit the fully-built rule.
-                        out_items.push(RuleItem::Rule(pending_chain.take().expect("pending_chain must exist at chain end")));
+                        out_items.push(RuleItem::Rule(
+                            pending_chain
+                                .take()
+                                .expect("pending_chain must exist at chain end"),
+                        ));
                     }
                     // If still chaining, keep pending_chain in place.
                 } else {
@@ -325,7 +332,10 @@ fn token_to_target(tok: &str) -> Option<Target> {
         "FILES_TMPNAMES" | "FILES_SIZES" | "FILES_TMP_CONTENT" => None,
         "XML" | "MULTIPART_FILENAME" | "MULTIPART_NAME" => None,
         other => {
-            warn!(target = other, "CRS importer: unknown target token, skipping");
+            warn!(
+                target = other,
+                "CRS importer: unknown target token, skipping"
+            );
             None
         }
     };
@@ -340,8 +350,7 @@ pub(crate) fn crs_op_to_operator(op_name: &str, pattern: &str) -> Result<Operato
     if pattern.contains("%{") {
         warn!(
             op = op_name,
-            pattern,
-            "CRS importer: pattern contains `%{{...}}` interpolation — rule disabled"
+            pattern, "CRS importer: pattern contains `%{{...}}` interpolation — rule disabled"
         );
         return Ok(Operator::Never);
     }
@@ -394,15 +403,33 @@ pub(crate) fn crs_op_to_operator(op_name: &str, pattern: &str) -> Result<Operato
             .parse::<i64>()
             .map(|n| Operator::Ge(n + 1))
             .map_err(|_| anyhow::anyhow!("invalid integer in @gt: {}", pattern)),
-        "validateurlencoding" | "validateutf8encoding" | "validatebyterange"
-        | "validateschema" | "validatedtd" | "verifycc" | "verifycpf" | "verifyssn"
-        | "geolookup" | "ipmatch" | "ipmatchf" | "ipmatchfromfile" | "rbl"
-        | "fuzzyhash" | "inspectfile" | "lookup" => {
-            warn!(op = op_name, "CRS importer: unsupported operator '{op_name}' — rule disabled");
+        "validateurlencoding"
+        | "validateutf8encoding"
+        | "validatebyterange"
+        | "validateschema"
+        | "validatedtd"
+        | "verifycc"
+        | "verifycpf"
+        | "verifyssn"
+        | "geolookup"
+        | "ipmatch"
+        | "ipmatchf"
+        | "ipmatchfromfile"
+        | "rbl"
+        | "fuzzyhash"
+        | "inspectfile"
+        | "lookup" => {
+            warn!(
+                op = op_name,
+                "CRS importer: unsupported operator '{op_name}' — rule disabled"
+            );
             Ok(Operator::Never)
         }
         other => {
-            warn!(op = other, "CRS importer: unknown operator '{other}' — rule disabled");
+            warn!(
+                op = other,
+                "CRS importer: unknown operator '{other}' — rule disabled"
+            );
             Ok(Operator::Never)
         }
     }
@@ -483,7 +510,10 @@ SecRule ARGS "@rx evil" "id:1,phase:2,block,msg:'x'"
 "#;
         let rf = import_secrule_conf(src).expect("import failed despite unknown directives");
         assert_eq!(
-            rf.items.iter().filter(|i| matches!(i, RuleItem::Rule(_))).count(),
+            rf.items
+                .iter()
+                .filter(|i| matches!(i, RuleItem::Rule(_)))
+                .count(),
             1
         );
     }
@@ -517,12 +547,24 @@ SecRule ARGS "@rx evil" "id:1,phase:2,block,msg:'x'"
 SecRule REQUEST_HEADERS:User-Agent "@rx sqlmap" "t:none"
 "#;
         let rf = import_secrule_conf(src).expect("import");
-        let rules: Vec<_> = rf.items.iter().filter_map(|i| {
-            if let RuleItem::Rule(r) = i { Some(r) } else { None }
-        }).collect();
+        let rules: Vec<_> = rf
+            .items
+            .iter()
+            .filter_map(|i| {
+                if let RuleItem::Rule(r) = i {
+                    Some(r)
+                } else {
+                    None
+                }
+            })
+            .collect();
         assert_eq!(rules.len(), 1, "chained rules should produce one RuleDef");
         assert_eq!(rules[0].id, 100);
-        assert_eq!(rules[0].chain_conditions.len(), 1, "one chain condition expected");
+        assert_eq!(
+            rules[0].chain_conditions.len(),
+            1,
+            "one chain condition expected"
+        );
     }
 
     #[test]
@@ -532,9 +574,17 @@ SecRule ARGS "@rx bar" "chain"
 SecRule ARGS "@rx baz" "t:none"
 "#;
         let rf = import_secrule_conf(src).expect("import");
-        let rules: Vec<_> = rf.items.iter().filter_map(|i| {
-            if let RuleItem::Rule(r) = i { Some(r) } else { None }
-        }).collect();
+        let rules: Vec<_> = rf
+            .items
+            .iter()
+            .filter_map(|i| {
+                if let RuleItem::Rule(r) = i {
+                    Some(r)
+                } else {
+                    None
+                }
+            })
+            .collect();
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].chain_conditions.len(), 2);
     }
@@ -543,9 +593,17 @@ SecRule ARGS "@rx baz" "t:none"
     fn pmfromfile_without_dir_produces_empty_words() {
         let src = r#"SecRule ARGS "@pmFromFile scanners.data" "id:300,phase:2,block""#;
         let rf = import_secrule_conf(src).expect("import");
-        let rules: Vec<_> = rf.items.iter().filter_map(|i| {
-            if let RuleItem::Rule(r) = i { Some(r) } else { None }
-        }).collect();
+        let rules: Vec<_> = rf
+            .items
+            .iter()
+            .filter_map(|i| {
+                if let RuleItem::Rule(r) = i {
+                    Some(r)
+                } else {
+                    None
+                }
+            })
+            .collect();
         assert_eq!(rules.len(), 1, "rule should still be emitted");
         if let Operator::ContainsWord(words) = &rules[0].operator {
             // The placeholder word is injected so the AC set still compiles.
@@ -565,11 +623,20 @@ SecRule ARGS "@rx baz" "t:none"
         writeln!(f, "sqlmap").unwrap();
         writeln!(f, "nikto").unwrap();
 
-        let src = r#"SecRule REQUEST_HEADERS:User-Agent "@pmFromFile test.data" "id:400,phase:1,block""#;
+        let src =
+            r#"SecRule REQUEST_HEADERS:User-Agent "@pmFromFile test.data" "id:400,phase:1,block""#;
         let rf = import_secrule_conf_dir(src, Some(dir.path())).expect("import");
-        let rules: Vec<_> = rf.items.iter().filter_map(|i| {
-            if let RuleItem::Rule(r) = i { Some(r) } else { None }
-        }).collect();
+        let rules: Vec<_> = rf
+            .items
+            .iter()
+            .filter_map(|i| {
+                if let RuleItem::Rule(r) = i {
+                    Some(r)
+                } else {
+                    None
+                }
+            })
+            .collect();
         assert_eq!(rules.len(), 1);
         if let Operator::ContainsWord(words) = &rules[0].operator {
             assert!(words.contains(&"sqlmap".to_owned()));
@@ -584,9 +651,17 @@ SecRule ARGS "@rx baz" "t:none"
     fn lt_operator_maps_to_not_ge() {
         let src = r#"SecRule TX:DETECTION_PARANOIA_LEVEL "@lt 2" "id:500,phase:1,pass,nolog""#;
         let rf = import_secrule_conf(src).expect("import");
-        let rules: Vec<_> = rf.items.iter().filter_map(|i| {
-            if let RuleItem::Rule(r) = i { Some(r) } else { None }
-        }).collect();
+        let rules: Vec<_> = rf
+            .items
+            .iter()
+            .filter_map(|i| {
+                if let RuleItem::Rule(r) = i {
+                    Some(r)
+                } else {
+                    None
+                }
+            })
+            .collect();
         assert_eq!(rules.len(), 1);
         assert!(
             matches!(&rules[0].operator, Operator::Not(inner) if matches!(inner.as_ref(), Operator::Ge(2))),
@@ -598,9 +673,17 @@ SecRule ARGS "@rx baz" "t:none"
     fn count_target_with_gt_operator() {
         let src = r#"SecRule &REQUEST_HEADERS:Content-Type "@gt 1" "id:920620,phase:1,block,msg:'Multiple Content-Type Request Headers',severity:'CRITICAL'""#;
         let rf = import_secrule_conf(src).expect("import");
-        let rules: Vec<_> = rf.items.iter().filter_map(|i| {
-            if let RuleItem::Rule(r) = i { Some(r) } else { None }
-        }).collect();
+        let rules: Vec<_> = rf
+            .items
+            .iter()
+            .filter_map(|i| {
+                if let RuleItem::Rule(r) = i {
+                    Some(r)
+                } else {
+                    None
+                }
+            })
+            .collect();
         assert_eq!(rules.len(), 1);
         assert!(
             matches!(&rules[0].targets[0].target, Target::CountOf(inner) if matches!(inner.as_ref(), Target::RequestHeaders(Some(h)) if h == "content-type")),

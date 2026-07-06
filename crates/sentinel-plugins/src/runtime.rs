@@ -135,8 +135,7 @@ impl PluginRuntime {
     pub fn set_memory_limit(&mut self, plugin_name: &str, limit_bytes: Option<usize>) {
         match limit_bytes {
             Some(bytes) => {
-                self.memory_limits
-                    .insert(plugin_name.to_string(), bytes);
+                self.memory_limits.insert(plugin_name.to_string(), bytes);
             }
             None => {
                 self.memory_limits.remove(plugin_name);
@@ -383,10 +382,7 @@ impl PluginRuntime {
     /// Call this after `evaluate_plugin()` if the plugin may have queued
     /// callouts.  If there are pending callouts, call `evaluate_plugin()`
     /// again so the plugin can read the results.
-    pub async fn execute_pending_callouts(
-        &self,
-        callouts: Vec<crate::abi::HttpCalloutRequest>,
-    ) {
+    pub async fn execute_pending_callouts(&self, callouts: Vec<crate::abi::HttpCalloutRequest>) {
         CALLOUT_RESULTS.clear();
         for callout in &callouts {
             tracing::debug!(
@@ -559,10 +555,7 @@ mod tests {
     #[tokio::test]
     async fn evaluate_missing_plugin_returns_allow() {
         let rt = PluginRuntime::new().unwrap();
-        let ctx = RequestContext::new(
-            std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
-            12345,
-        );
+        let ctx = RequestContext::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 12345);
         let result = rt.evaluate_plugin("nonexistent", &ctx).await;
         assert_eq!(result.decision, WafDecision::Allow);
         assert_eq!(result.anomaly_score_delta, 0);
@@ -573,7 +566,8 @@ mod tests {
     #[test]
     fn kv_store_shared_across_plugins() {
         let rt = PluginRuntime::new().unwrap();
-        rt.kv_store.insert("global_key".into(), "shared_value".into());
+        rt.kv_store
+            .insert("global_key".into(), "shared_value".into());
 
         let another_ref = rt.kv_store.clone();
         assert_eq!(

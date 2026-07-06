@@ -383,8 +383,9 @@ mod tests {
             .await
             .unwrap();
 
-        let (mut driver, mut send_request) =
-            h3::client::new(h3_quinn::Connection::new(conn)).await.unwrap();
+        let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(conn))
+            .await
+            .unwrap();
         let drive = tokio::spawn(async move {
             let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
         });

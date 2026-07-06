@@ -22,11 +22,11 @@
 //! Phase 6: logging + correlation state update
 //! ```
 
+pub mod challenge;
 pub mod http3;
+pub mod tls;
 pub mod upstream;
 pub mod websocket;
-pub mod tls;
-pub mod challenge;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -41,8 +41,8 @@ use arc_swap::ArcSwap;
 use bytes::Bytes;
 use dashmap::DashMap;
 use http::{header, Request, Response, StatusCode, Uri};
-use hyper::body::Body;
 use http_body_util::{BodyExt, Full};
+use hyper::body::Body;
 use hyper::body::Incoming;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
@@ -58,8 +58,8 @@ use sentinel_core::{
 use sentinel_ebpf::{EbpfConfig, EbpfManager};
 use sentinel_ml::MlEngine;
 use sentinel_modules::{
-    AntiDdos, BotDetector, BotVerdict, DdosVerdict, GeoIp, GeoVerdict, IpReputation, IpVerdict,
-    RateLimiter, RawTier, SmugglingVerdict, ThreatFeed, ThreatVerdict, detect_smuggling,
+    detect_smuggling, AntiDdos, BotDetector, BotVerdict, DdosVerdict, GeoIp, GeoVerdict,
+    IpReputation, IpVerdict, RateLimiter, RawTier, SmugglingVerdict, ThreatFeed, ThreatVerdict,
 };
 use sentinel_plugins::PluginRuntime;
 use sentinel_rules::RuleEngine;
@@ -105,19 +105,37 @@ impl DlpScanner {
     fn from_config(cfg: &DlpConfig) -> Self {
         let builtin: &[(&str, &str)] = &[
             // Credit / debit card numbers (Luhn-shaped 13-19 digit groups)
-            (r"(?<!\d)(?:4[0-9]{12,15}|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12}|(?:2131|1800|35\d{3})\d{11})(?!\d)", "credit_card"),
+            (
+                r"(?<!\d)(?:4[0-9]{12,15}|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12}|(?:2131|1800|35\d{3})\d{11})(?!\d)",
+                "credit_card",
+            ),
             // US Social Security Number
-            (r"\b(?!000|666|9\d{2})\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b", "ssn"),
+            (
+                r"\b(?!000|666|9\d{2})\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b",
+                "ssn",
+            ),
             // PEM private key header
-            (r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----", "private_key"),
+            (
+                r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----",
+                "private_key",
+            ),
             // AWS access key
             (r"\bAKIA[0-9A-Z]{16}\b", "aws_access_key"),
             // AWS secret key (contextual — next to known keyword)
-            (r#"(?i)aws[_\-\s]*secret[_\-\s]*(?:access[_\-\s]*)?key["'\s:=]+[A-Za-z0-9/+]{40}"#, "aws_secret_key"),
+            (
+                r#"(?i)aws[_\-\s]*secret[_\-\s]*(?:access[_\-\s]*)?key["'\s:=]+[A-Za-z0-9/+]{40}"#,
+                "aws_secret_key",
+            ),
             // Generic high-entropy API tokens / bearer tokens in JSON
-            (r#"(?i)(?:"|\b)(?:api[_-]?key|access[_-]?token|auth[_-]?token|bearer|secret)["\s]*[:=]+\s*["']?[A-Za-z0-9/+_\-]{32,}"#, "api_token"),
+            (
+                r#"(?i)(?:"|\b)(?:api[_-]?key|access[_-]?token|auth[_-]?token|bearer|secret)["\s]*[:=]+\s*["']?[A-Za-z0-9/+_\-]{32,}"#,
+                "api_token",
+            ),
             // Password leaked in JSON response
-            (r#""(?:password|passwd|pwd)"\s*:\s*"[^"]{4,}""#, "password_in_json"),
+            (
+                r#""(?:password|passwd|pwd)"\s*:\s*"[^"]{4,}""#,
+                "password_in_json",
+            ),
             // Generic private-looking 40-char hex string (git-style secrets)
             (r"\b[0-9a-f]{40}\b", "hex_secret"),
         ];
@@ -249,7 +267,9 @@ impl CorrelationEngine {
                 }
             }
             match oldest_ip {
-                Some(ip) => { self.state.remove(&ip); }
+                Some(ip) => {
+                    self.state.remove(&ip);
+                }
                 None => break,
             }
         }
@@ -437,11 +457,7 @@ impl ProxyServer {
         let upstream_pool = Arc::new(UpstreamPool::from_config(&cfg));
 
         // Spawn active health-check tasks for sites that configure them.
-        UpstreamPool::spawn_health_checks(
-            Arc::clone(&upstream_pool),
-            &cfg,
-            shutdown.clone(),
-        );
+        UpstreamPool::spawn_health_checks(Arc::clone(&upstream_pool), &cfg, shutdown.clone());
 
         let initial_engines = build_rule_engines(&cfg);
         let engines: Arc<ArcSwap<RuleEngineMap>> =
@@ -458,8 +474,8 @@ impl ProxyServer {
         // File config first, then SENTINEL_CLICKHOUSE_*/SENTINEL_REDIS_URL env
         // overlay so the data plane is configured identically to the Go control
         // plane (same Secret in compose/K8s; no CH password in the proxy YAML).
-        let storage_backend_cfg = sentinel_storage::StorageBackendConfig::from_core(&cfg.storage)
-            .with_env_overrides();
+        let storage_backend_cfg =
+            sentinel_storage::StorageBackendConfig::from_core(&cfg.storage).with_env_overrides();
         let storage = sentinel_storage::StorageHandle::connect(&storage_backend_cfg).await;
         if storage.has_redis() {
             info!("rate limiting: distributed mode (Redis backend active)");
@@ -524,18 +540,22 @@ impl ProxyServer {
                                     ch_cfg.clickhouse_password.clone(),
                                 );
                                 match client.ping().await {
-                                    Ok(()) => match client.ensure_schema().await {
-                                        Ok(()) => {
-                                            info!(url, database = db, "clickhouse connected — waf history writer enabled");
-                                            ch = Some(std::sync::Arc::new(client));
-                                            CLICKHOUSE_ENABLED
-                                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                                    Ok(()) => {
+                                        match client.ensure_schema().await {
+                                            Ok(()) => {
+                                                info!(url, database = db, "clickhouse connected — waf history writer enabled");
+                                                ch = Some(std::sync::Arc::new(client));
+                                                CLICKHOUSE_ENABLED.store(
+                                                    true,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                );
+                                            }
+                                            Err(e) => {
+                                                warn!(error = %e, "clickhouse reachable but schema init failed — retrying in 10s");
+                                                reconnect_in = 10;
+                                            }
                                         }
-                                        Err(e) => {
-                                            warn!(error = %e, "clickhouse reachable but schema init failed — retrying in 10s");
-                                            reconnect_in = 10;
-                                        }
-                                    },
+                                    }
                                     Err(e) => {
                                         warn!(error = %e, "clickhouse unreachable — waf history writer disabled, retrying in 10s");
                                         reconnect_in = 10;
@@ -622,7 +642,11 @@ impl ProxyServer {
             let engine = Arc::new(MlEngine::new(
                 4096,
                 256,
-                if model_dir.exists() { Some(model_dir) } else { None },
+                if model_dir.exists() {
+                    Some(model_dir)
+                } else {
+                    None
+                },
             ));
             // Warm-start the anomaly model so it scores meaningfully from the
             // first request instead of cold-starting at neutral 0.5.
@@ -657,7 +681,10 @@ impl ProxyServer {
         for site in &cfg.sites {
             if site.tls.mode == sentinel_core::config::TlsCertMode::Acme {
                 if let Some(acme_cfg) = &site.tls.acme {
-                    let has_all = site.domains.iter().all(|d| cert_manager.store.get_meta(d).is_some());
+                    let has_all = site
+                        .domains
+                        .iter()
+                        .all(|d| cert_manager.store.get_meta(d).is_some());
                     if !has_all {
                         let cm = Arc::clone(&cert_manager);
                         let domains = site.domains.clone();
@@ -723,7 +750,8 @@ impl ProxyServer {
                                 ds.store(Arc::new(build_dlp_map(&current)));
 
                                 let feed_cidrs = mr.feed_cache.load_full();
-                                mr.ip_rep.store(Arc::new(build_ip_reputation(&current, &feed_cidrs)));
+                                mr.ip_rep
+                                    .store(Arc::new(build_ip_reputation(&current, &feed_cidrs)));
                                 mr.bot_detector.store(Arc::new(BotDetector::new()));
                                 mr.geoip_map.store(Arc::new(build_geoip_map(&current)));
 
@@ -1387,13 +1415,20 @@ async fn handle_request(
         if !peer.ip().is_loopback() && !internal_auth_ok(req.headers()) {
             return Ok(error_response(StatusCode::FORBIDDEN, "internal endpoint"));
         }
-        if req.uri().path().starts_with("/api/v1/internal/management-tls") {
+        if req
+            .uri()
+            .path()
+            .starts_with("/api/v1/internal/management-tls")
+        {
             return Ok(handle_internal_mgmt_tls_api(state, req).await);
         }
         if req.uri().path().starts_with("/api/v1/internal/certs") {
             return Ok(handle_internal_cert_api(state, req).await);
         }
-        return Ok(error_response(StatusCode::NOT_FOUND, "unknown internal endpoint"));
+        return Ok(error_response(
+            StatusCode::NOT_FOUND,
+            "unknown internal endpoint",
+        ));
     }
 
     // Hand off to the shared WAF pipeline. The TCP body (`Incoming`) is boxed
@@ -1506,7 +1541,8 @@ async fn proxy(
                 return Ok(block_response(&ctx));
             }
             IpVerdict::Suspect { tags } => {
-                ctx.tx_vars.insert("ip_rep_tags".to_string(), tags.join(","));
+                ctx.tx_vars
+                    .insert("ip_rep_tags".to_string(), tags.join(","));
                 ctx.anomaly_score = ctx.anomaly_score.saturating_add(2);
             }
             IpVerdict::Allow => {}
@@ -1637,7 +1673,12 @@ async fn proxy(
             // HTTP method allow-list (empty = allow all). Case-insensitive.
             if !s.waf.allowed_methods.is_empty() {
                 let m = ctx.method.as_str();
-                if !s.waf.allowed_methods.iter().any(|a| a.eq_ignore_ascii_case(m)) {
+                if !s
+                    .waf
+                    .allowed_methods
+                    .iter()
+                    .any(|a| a.eq_ignore_ascii_case(m))
+                {
                     ctx.decision = WafDecision::Block;
                     ctx.block_reason = Some(format!("method not allowed: {m}"));
                     ctx.advance_phase(Phase::Logging);
@@ -1685,7 +1726,10 @@ async fn proxy(
             .starts_with("HTTP request smuggling")
         {
             // RFC 7230 §3.3.3: malformed requests MUST be rejected with 400.
-            error_response(StatusCode::BAD_REQUEST, ctx.block_reason.as_deref().unwrap_or("Bad Request"))
+            error_response(
+                StatusCode::BAD_REQUEST,
+                ctx.block_reason.as_deref().unwrap_or("Bad Request"),
+            )
         } else {
             block_response(&ctx)
         };
@@ -1733,7 +1777,10 @@ async fn proxy(
                 .await
             {
                 Ok(collected) => collected.to_bytes(),
-                Err(e) if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() => {
+                Err(e)
+                    if e.downcast_ref::<http_body_util::LengthLimitError>()
+                        .is_some() =>
+                {
                     ctx.decision = WafDecision::Block;
                     ctx.block_reason = Some(format!(
                         "request body too large (limit {} bytes)",
@@ -1749,7 +1796,10 @@ async fn proxy(
                 Err(e) => return Err(anyhow::anyhow!("collecting request body: {e}")),
             }
         } else {
-            body.collect().await.context("collecting request body")?.to_bytes()
+            body.collect()
+                .await
+                .context("collecting request body")?
+                .to_bytes()
         };
 
         ctx.request_body = Some(bytes.clone());
@@ -1836,9 +1886,10 @@ async fn proxy(
     // the bidirectional relay with WAF frame inspection and return immediately.
     if resp_parts.status == StatusCode::SWITCHING_PROTOCOLS {
         if let Some(client_upgrade_fut) = ws_upgrade {
-            let upstream_upgrade_fut = hyper::upgrade::on(
-                &mut Response::from_parts(resp_parts.clone(), http_body_util::Empty::<Bytes>::new()),
-            );
+            let upstream_upgrade_fut = hyper::upgrade::on(&mut Response::from_parts(
+                resp_parts.clone(),
+                http_body_util::Empty::<Bytes>::new(),
+            ));
             let client_ip = ctx.client_ip;
             let site_id = site_cfg.id.clone();
             let ws_engine = engine_map.get(&site_id).cloned().map(Arc::new);
@@ -1849,11 +1900,17 @@ async fn proxy(
             tokio::spawn(async move {
                 let client_io = match client_upgrade_fut.await {
                     Ok(io) => io,
-                    Err(e) => { warn!("WS: client upgrade failed: {e}"); return; }
+                    Err(e) => {
+                        warn!("WS: client upgrade failed: {e}");
+                        return;
+                    }
                 };
                 let upstream_io = match upstream_upgrade_fut.await {
                     Ok(io) => io,
-                    Err(e) => { warn!("WS: upstream upgrade failed: {e}"); return; }
+                    Err(e) => {
+                        warn!("WS: upstream upgrade failed: {e}");
+                        return;
+                    }
                 };
                 websocket::relay(
                     TokioIo::new(client_io),
@@ -1861,7 +1918,8 @@ async fn proxy(
                     client_ip,
                     site_id,
                     ws_engine,
-                ).await;
+                )
+                .await;
             });
 
             // Return the 101 response to the client immediately.
@@ -1871,7 +1929,10 @@ async fn proxy(
     }
 
     strip_hop_by_hop(&mut resp_parts.headers);
-    inject_security_headers(&mut resp_parts.headers, site_cfg.waf.security_headers.as_ref());
+    inject_security_headers(
+        &mut resp_parts.headers,
+        site_cfg.waf.security_headers.as_ref(),
+    );
 
     // Attach any clearance cookies from an in-line PoW grant (challenged POST/PUT
     // that proceeded to origin instead of being 302'd to a bodyless GET).
@@ -1947,9 +2008,8 @@ async fn proxy(
                         if let Some(dlp) = dlp {
                             if let Some(matched) = dlp.scan(&bytes) {
                                 ctx.decision = WafDecision::Block;
-                                ctx.block_reason = Some(format!(
-                                    "DLP: sensitive data pattern matched: {matched}"
-                                ));
+                                ctx.block_reason =
+                                    Some(format!("DLP: sensitive data pattern matched: {matched}"));
                                 // Respect learning mode (downgrade Block → Log)
                                 // exactly like the response-body rule path above —
                                 // a learning-mode site must not block or rewrite
@@ -2052,8 +2112,7 @@ async fn phase1_headers(
                 .await
             {
                 ctx.decision = WafDecision::Block;
-                ctx.block_reason =
-                    Some(format!("rate limit exceeded for {}", ctx.client_ip));
+                ctx.block_reason = Some(format!("rate limit exceeded for {}", ctx.client_ip));
             }
         }
     }
@@ -2075,7 +2134,8 @@ async fn phase1_headers(
                     ctx.block_reason = Some(format!("known attack tool: {tool}"));
                 }
                 BotVerdict::SuspiciousBot => {
-                    ctx.tx_vars.insert("bot_suspicious".to_string(), "1".to_string());
+                    ctx.tx_vars
+                        .insert("bot_suspicious".to_string(), "1".to_string());
                     ctx.anomaly_score = ctx.anomaly_score.saturating_add(2);
                     // Skip the challenge entirely if the client already solved one
                     // (valid, unexpired clearance cookie bound to its IP).
@@ -2124,42 +2184,39 @@ async fn phase1_headers(
         for plugin_name in &plugin_runtime.plugin_names() {
             let result = plugin_runtime.evaluate_plugin(plugin_name, ctx).await;
             if result.anomaly_score_delta > 0 {
-                ctx.anomaly_score =
-                    ctx.anomaly_score.saturating_add(result.anomaly_score_delta);
+                ctx.anomaly_score = ctx.anomaly_score.saturating_add(result.anomaly_score_delta);
             }
             match result.decision {
                 WafDecision::Block => {
                     ctx.decision = WafDecision::Block;
-                    ctx.block_reason =
-                        Some(format!("plugin '{plugin_name}' set decision"));
+                    ctx.block_reason = Some(format!("plugin '{plugin_name}' set decision"));
                     break;
                 }
                 WafDecision::Challenge if ctx.decision == WafDecision::Allow => {
                     ctx.decision = WafDecision::Challenge;
-                    ctx.block_reason =
-                        Some(format!("plugin '{plugin_name}' requested challenge"));
+                    ctx.block_reason = Some(format!("plugin '{plugin_name}' requested challenge"));
                 }
                 _ => {}
             }
             for (name, value) in &result.response_headers {
-                ctx.tx_vars.insert(
-                    format!("plugin_response_header:{name}"),
-                    value.clone(),
-                );
+                ctx.tx_vars
+                    .insert(format!("plugin_response_header:{name}"), value.clone());
             }
             if let Some(ref callouts) = result.pending_callouts {
                 if !callouts.is_empty() {
-                    plugin_runtime.execute_pending_callouts(callouts.clone()).await;
+                    plugin_runtime
+                        .execute_pending_callouts(callouts.clone())
+                        .await;
                     let result2 = plugin_runtime.evaluate_plugin(plugin_name, ctx).await;
                     if result2.anomaly_score_delta > 0 {
-                        ctx.anomaly_score =
-                            ctx.anomaly_score.saturating_add(result2.anomaly_score_delta);
+                        ctx.anomaly_score = ctx
+                            .anomaly_score
+                            .saturating_add(result2.anomaly_score_delta);
                     }
                     match result2.decision {
                         WafDecision::Block => {
                             ctx.decision = WafDecision::Block;
-                            ctx.block_reason =
-                                Some(format!("plugin '{plugin_name}' set decision"));
+                            ctx.block_reason = Some(format!("plugin '{plugin_name}' set decision"));
                             break;
                         }
                         WafDecision::Challenge if ctx.decision == WafDecision::Allow => {
@@ -2170,10 +2227,8 @@ async fn phase1_headers(
                         _ => {}
                     }
                     for (name, value) in &result2.response_headers {
-                        ctx.tx_vars.insert(
-                            format!("plugin_response_header:{name}"),
-                            value.clone(),
-                        );
+                        ctx.tx_vars
+                            .insert(format!("plugin_response_header:{name}"), value.clone());
                     }
                 }
             }
@@ -2204,13 +2259,15 @@ fn phase2_body(
         if ml_cfg.enable {
             let ml_scores = ml_engine.evaluate(ctx);
 
-            ctx.ml_scores.insert("anomaly".to_string(), ml_scores.anomaly_score);
+            ctx.ml_scores
+                .insert("anomaly".to_string(), ml_scores.anomaly_score);
             ctx.ml_scores
                 .insert("payload_attack".to_string(), ml_scores.payload_attack_score);
             for (model, score) in &ml_scores.onnx_scores {
                 ctx.ml_scores.insert(format!("onnx:{model}"), *score);
             }
-            ctx.ml_scores.insert("combined".to_string(), ml_scores.combined_score);
+            ctx.ml_scores
+                .insert("combined".to_string(), ml_scores.combined_score);
 
             if ml_scores.combined_score >= ml_cfg.sensitivity {
                 let delta: u32 =
@@ -2302,10 +2359,7 @@ fn build_dlp_map(cfg: &SentinelConfig) -> DlpMap {
     map
 }
 
-fn build_ip_reputation(
-    cfg: &SentinelConfig,
-    feed_cidrs: &[(String, Vec<String>)],
-) -> IpReputation {
+fn build_ip_reputation(cfg: &SentinelConfig, feed_cidrs: &[(String, Vec<String>)]) -> IpReputation {
     let configs: Vec<&IpReputationConfig> = cfg
         .sites
         .iter()
@@ -2523,7 +2577,9 @@ async fn fetch_feed_cidrs(url: &str) -> anyhow::Result<Vec<String>> {
     let client: Client<_, http_body_util::combinators::BoxBody<Bytes, hyper::Error>> =
         Client::builder(TokioExecutor::new()).build(https);
 
-    let uri: Uri = url.parse().with_context(|| format!("invalid feed URL: {url}"))?;
+    let uri: Uri = url
+        .parse()
+        .with_context(|| format!("invalid feed URL: {url}"))?;
     let req = Request::builder()
         .method("GET")
         .uri(uri)
@@ -2544,7 +2600,11 @@ async fn fetch_feed_cidrs(url: &str) -> anyhow::Result<Vec<String>> {
         anyhow::bail!("feed returned HTTP {}", resp.status());
     }
 
-    let body = resp.collect().await.context("reading feed body")?.to_bytes();
+    let body = resp
+        .collect()
+        .await
+        .context("reading feed body")?
+        .to_bytes();
     let text = std::str::from_utf8(&body).context("feed body is not valid UTF-8")?;
     Ok(parse_cidr_text(text))
 }
@@ -2653,9 +2713,14 @@ fn strip_hop_by_hop(headers: &mut http::HeaderMap) {
 /// Strip hop-by-hop headers but preserve `Upgrade` and `Connection` so that
 /// WebSocket upgrade handshakes pass through to the upstream correctly.
 fn strip_hop_by_hop_except_upgrade(headers: &mut http::HeaderMap) {
-    const PRESERVE: &[&str] = &["upgrade", "connection", "sec-websocket-key",
-                                 "sec-websocket-version", "sec-websocket-extensions",
-                                 "sec-websocket-protocol"];
+    const PRESERVE: &[&str] = &[
+        "upgrade",
+        "connection",
+        "sec-websocket-key",
+        "sec-websocket-version",
+        "sec-websocket-extensions",
+        "sec-websocket-protocol",
+    ];
     for name in HOP_BY_HOP {
         if !PRESERVE.contains(name) {
             headers.remove(*name);
@@ -2705,19 +2770,37 @@ fn inject_security_headers(headers: &mut http::HeaderMap, cfg: Option<&SecurityH
             h.insert(header::HeaderName::from_static(name), v);
         }
     };
-    match cfg.and_then(|c| c.referrer_policy.as_deref()).filter(|s| !s.is_empty()) {
+    match cfg
+        .and_then(|c| c.referrer_policy.as_deref())
+        .filter(|s| !s.is_empty())
+    {
         Some(rp) => force(headers, "referrer-policy", rp),
-        None => default(headers, "referrer-policy", "strict-origin-when-cross-origin"),
+        None => default(
+            headers,
+            "referrer-policy",
+            "strict-origin-when-cross-origin",
+        ),
     }
-    match cfg.and_then(|c| c.permissions_policy.as_deref()).filter(|s| !s.is_empty()) {
+    match cfg
+        .and_then(|c| c.permissions_policy.as_deref())
+        .filter(|s| !s.is_empty())
+    {
         Some(pp) => force(headers, "permissions-policy", pp),
-        None => default(headers, "permissions-policy", "geolocation=(), microphone=(), camera=()"),
+        None => default(
+            headers,
+            "permissions-policy",
+            "geolocation=(), microphone=(), camera=()",
+        ),
     }
 
     let Some(cfg) = cfg else { return };
 
     // CSP has no default (it can break apps) — emit only when configured.
-    if let Some(csp) = cfg.content_security_policy.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(csp) = cfg
+        .content_security_policy
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    {
         if let Ok(v) = http::HeaderValue::from_str(csp) {
             headers.insert(header::CONTENT_SECURITY_POLICY, v);
         }
@@ -2772,7 +2855,11 @@ fn challenge_response(ctx: &mut RequestContext, mode: ChallengeMode) -> Option<R
     }
     match challenge::resolve(&ctx.request_headers, ctx.client_ip, &ctx.uri) {
         challenge::Outcome::Pass => None,
-        challenge::Outcome::Grant { location, set_cookie, expire_pow } => {
+        challenge::Outcome::Grant {
+            location,
+            set_cookie,
+            expire_pow,
+        } => {
             // Idempotent/safe methods can take the clean 302 redirect.
             let safe = matches!(ctx.method, http::Method::GET | http::Method::HEAD);
             if !safe {
@@ -2780,30 +2867,34 @@ fn challenge_response(ctx: &mut RequestContext, mode: ChallengeMode) -> Option<R
                 ctx.pending_set_cookies.push(expire_pow);
                 return None;
             }
-            Some(Response::builder()
-                .status(StatusCode::FOUND)
-                .header(header::LOCATION, location)
-                .header(header::SET_COOKIE, set_cookie)
-                .header(header::SET_COOKIE, expire_pow)
+            Some(
+                Response::builder()
+                    .status(StatusCode::FOUND)
+                    .header(header::LOCATION, location)
+                    .header(header::SET_COOKIE, set_cookie)
+                    .header(header::SET_COOKIE, expire_pow)
+                    .header(header::CACHE_CONTROL, "no-store")
+                    .body(
+                        Full::new(Bytes::new())
+                            .map_err(|never: Infallible| match never {})
+                            .boxed(),
+                    )
+                    .unwrap(),
+            )
+        }
+        challenge::Outcome::Serve { html } => Some(
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
                 .header(header::CACHE_CONTROL, "no-store")
+                .header("X-Sentinel-Challenge", "pow")
                 .body(
-                    Full::new(Bytes::new())
+                    Full::new(Bytes::from(html))
                         .map_err(|never: Infallible| match never {})
                         .boxed(),
                 )
-                .unwrap())
-        }
-        challenge::Outcome::Serve { html } => Some(Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-            .header(header::CACHE_CONTROL, "no-store")
-            .header("X-Sentinel-Challenge", "pow")
-            .body(
-                Full::new(Bytes::from(html))
-                    .map_err(|never: Infallible| match never {})
-                    .boxed(),
-            )
-            .unwrap()),
+                .unwrap(),
+        ),
     }
 }
 
@@ -2888,7 +2979,10 @@ async fn handle_internal_cert_api(
         if let Some(domain) = path.strip_prefix("/api/v1/internal/certs/") {
             let domain = domain.trim_end_matches('/');
             if is_reserved_cert_key(domain) {
-                return json_err(StatusCode::FORBIDDEN, "reserved certificate key — use the Management TLS API");
+                return json_err(
+                    StatusCode::FORBIDDEN,
+                    "reserved certificate key — use the Management TLS API",
+                );
             }
             return match state.cert_manager.store.remove(domain) {
                 Ok(()) => json_ok(serde_json::json!({"removed": domain})),
@@ -2918,7 +3012,10 @@ async fn handle_internal_cert_api(
             Err(e) => return json_err(StatusCode::BAD_REQUEST, &format!("invalid JSON: {e}")),
         };
         if is_reserved_cert_key(&r.domain) {
-            return json_err(StatusCode::FORBIDDEN, "reserved certificate key — use the Management TLS API");
+            return json_err(
+                StatusCode::FORBIDDEN,
+                "reserved certificate key — use the Management TLS API",
+            );
         }
         return match state
             .cert_manager
@@ -2934,10 +3031,15 @@ async fn handle_internal_cert_api(
         if let Some(rest) = path.strip_prefix("/api/v1/internal/certs/") {
             let domain = rest.trim_end_matches('/');
             if is_reserved_cert_key(domain) {
-                return json_err(StatusCode::FORBIDDEN, "reserved certificate key — use the Management TLS API");
+                return json_err(
+                    StatusCode::FORBIDDEN,
+                    "reserved certificate key — use the Management TLS API",
+                );
             }
             #[derive(serde::Deserialize)]
-            struct RenameReq { name: String }
+            struct RenameReq {
+                name: String,
+            }
             let r: RenameReq = match serde_json::from_slice(&body_bytes) {
                 Ok(r) => r,
                 Err(e) => return json_err(StatusCode::BAD_REQUEST, &format!("invalid JSON: {e}")),
@@ -2964,9 +3066,10 @@ async fn handle_internal_cert_api(
                 .unwrap_or("")
                 .to_string();
             let cfg = state.config.load();
-            let site = cfg.sites.iter().find(|s| {
-                s.domains.iter().any(|d| d == &domain) && s.tls.acme.is_some()
-            });
+            let site = cfg
+                .sites
+                .iter()
+                .find(|s| s.domains.iter().any(|d| d == &domain) && s.tls.acme.is_some());
             match site {
                 Some(s) => (s.domains.clone(), s.tls.acme.clone().unwrap()),
                 None => {
@@ -3013,9 +3116,16 @@ async fn handle_internal_cert_api(
             (r.domains, cfg)
         };
 
-        return match state.cert_manager.issue_acme(domains.clone(), &acme_cfg).await {
+        return match state
+            .cert_manager
+            .issue_acme(domains.clone(), &acme_cfg)
+            .await
+        {
             Ok(()) => json_ok(serde_json::json!({"issued": domains})),
-            Err(e) => json_err(StatusCode::BAD_GATEWAY, &format!("ACME issuance failed: {e:#}")),
+            Err(e) => json_err(
+                StatusCode::BAD_GATEWAY,
+                &format!("ACME issuance failed: {e:#}"),
+            ),
         };
     }
 
@@ -3042,7 +3152,11 @@ async fn handle_management_request(
     if path.starts_with("/api/v1/internal") {
         return Ok(error_response(StatusCode::NOT_FOUND, "not found"));
     }
-    let base = if path.starts_with("/api/") { &mgmt.api } else { &mgmt.dashboard };
+    let base = if path.starts_with("/api/") {
+        &mgmt.api
+    } else {
+        &mgmt.dashboard
+    };
     let pq = req
         .uri()
         .path_and_query()
@@ -3051,7 +3165,12 @@ async fn handle_management_request(
     let target = format!("{base}{pq}");
     let target_uri: Uri = match target.parse() {
         Ok(u) => u,
-        Err(e) => return Ok(error_response(StatusCode::BAD_GATEWAY, &format!("bad management target: {e}"))),
+        Err(e) => {
+            return Ok(error_response(
+                StatusCode::BAD_GATEWAY,
+                &format!("bad management target: {e}"),
+            ))
+        }
     };
 
     let (mut parts, body) = req.into_parts();
@@ -3061,8 +3180,13 @@ async fn handle_management_request(
     // client-supplied X-Forwarded-For chain (it would spoof the audit-logged IP).
     let peer_ip = peer.ip().to_string();
     if let Ok(hv) = header::HeaderValue::from_str(&peer_ip) {
-        parts.headers.insert(header::HeaderName::from_static("x-forwarded-for"), hv.clone());
-        parts.headers.insert(header::HeaderName::from_static("x-real-ip"), hv);
+        parts.headers.insert(
+            header::HeaderName::from_static("x-forwarded-for"),
+            hv.clone(),
+        );
+        parts
+            .headers
+            .insert(header::HeaderName::from_static("x-real-ip"), hv);
     }
     // The management listener terminates TLS; tell the upstream the original
     // scheme so the dashboard/control plane generate correct https URLs/cookies.
@@ -3158,7 +3282,11 @@ async fn handle_internal_mgmt_tls_api(
             Err(e) => return json_err(StatusCode::BAD_REQUEST, &format!("invalid JSON: {e}")),
         };
         let display_name = if r.name.is_empty() {
-            if r.subject.is_empty() { "Management TLS".to_string() } else { r.subject.clone() }
+            if r.subject.is_empty() {
+                "Management TLS".to_string()
+            } else {
+                r.subject.clone()
+            }
         } else {
             r.name
         };
@@ -3178,7 +3306,9 @@ async fn handle_internal_mgmt_tls_api(
             .store
             .install_management(&r.cert_pem, &r.key_pem, meta)
         {
-            Ok(prev) => json_ok(serde_json::json!({"installed": true, "previous_fingerprint": prev})),
+            Ok(prev) => {
+                json_ok(serde_json::json!({"installed": true, "previous_fingerprint": prev}))
+            }
             Err(e) => json_err(StatusCode::BAD_REQUEST, &format!("{e:#}")),
         };
     }
@@ -3218,9 +3348,10 @@ fn health_response(state: &ServerState) -> Response<BoxBody> {
     // `serve_listener`: h3 is offered on a TLS, non-management listener whose
     // protocol set includes Http3. The advertised UDP port is what browsers
     // reach (SENTINEL_HTTP3_ADVERTISE_PORT, else the listener's bind port).
-    let h3_listener = cfg.listeners.iter().find(|l| {
-        l.is_tls() && !l.is_management() && l.protocols().contains(&Protocol::Http3)
-    });
+    let h3_listener = cfg
+        .listeners
+        .iter()
+        .find(|l| l.is_tls() && !l.is_management() && l.protocols().contains(&Protocol::Http3));
     let http3 = match h3_listener {
         Some(l) => {
             let bind_port = l.bind.parse::<SocketAddr>().map(|a| a.port()).unwrap_or(0);
@@ -3310,7 +3441,11 @@ fn log_request(ctx: &RequestContext) {
     // Feed the per-second traffic accumulator (drained by the ClickHouse
     // flusher, when ClickHouse is configured). Cheap; no-op when CH is off.
     let blocked = matches!(ctx.decision, WafDecision::Block | WafDecision::Challenge);
-    record_traffic(ctx.site_id.as_deref().unwrap_or("-"), blocked, ctx.elapsed_ms());
+    record_traffic(
+        ctx.site_id.as_deref().unwrap_or("-"),
+        blocked,
+        ctx.elapsed_ms(),
+    );
     record_event(ctx);
 }
 
@@ -3325,8 +3460,9 @@ struct SiteAccum {
     lat: Vec<f64>,
 }
 
-static TRAFFIC_ACC: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, SiteAccum>>> =
-    std::sync::OnceLock::new();
+static TRAFFIC_ACC: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, SiteAccum>>,
+> = std::sync::OnceLock::new();
 
 fn traffic_acc() -> &'static std::sync::Mutex<std::collections::HashMap<String, SiteAccum>> {
     TRAFFIC_ACC.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
@@ -3359,7 +3495,8 @@ fn drain_traffic(ts: i64) -> Vec<sentinel_storage::TrafficRow> {
     };
     let mut out = Vec::with_capacity(m.len());
     for (site, mut a) in m.drain() {
-        a.lat.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+        a.lat
+            .sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
         let p99 = if a.lat.is_empty() {
             0.0
         } else {
@@ -3392,7 +3529,8 @@ static WAF_EVENTS: std::sync::OnceLock<std::sync::Mutex<Vec<sentinel_storage::Wa
 /// Set true once the ClickHouse flusher task is running. When ClickHouse is not
 /// configured nothing ever drains the buffers, so we must not buffer at all —
 /// otherwise the event buffer grows to its cap and is pinned in memory forever.
-static CLICKHOUSE_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static CLICKHOUSE_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 fn waf_events() -> &'static std::sync::Mutex<Vec<sentinel_storage::WafEventRow>> {
     WAF_EVENTS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
@@ -3423,7 +3561,9 @@ fn record_event(ctx: &RequestContext) {
         rule: top.map(|r| r.rule_id.clone()).unwrap_or_default(),
         attack: top.map(|r| r.message.clone()).unwrap_or_default(),
         action: action.to_string(),
-        severity: top.map(|r| format!("{:?}", r.severity).to_uppercase()).unwrap_or_default(),
+        severity: top
+            .map(|r| format!("{:?}", r.severity).to_uppercase())
+            .unwrap_or_default(),
         score: ctx.anomaly_score,
         status: ctx.response_status.map(|s| s.as_u16()).unwrap_or(0),
         protocol: protocol_label(ctx.http_version).to_string(),
@@ -3480,7 +3620,8 @@ struct LogRecord {
     line: String,
 }
 
-static LOG_TX: std::sync::OnceLock<std::sync::mpsc::SyncSender<LogRecord>> = std::sync::OnceLock::new();
+static LOG_TX: std::sync::OnceLock<std::sync::mpsc::SyncSender<LogRecord>> =
+    std::sync::OnceLock::new();
 static LOG_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn log_sender() -> &'static std::sync::mpsc::SyncSender<LogRecord> {
@@ -3517,8 +3658,16 @@ struct RotatingFile {
 }
 
 impl RotatingFile {
-    fn open(dir: &std::path::Path, name: &'static str, max_bytes: u64, keep: u32) -> std::io::Result<Self> {
-        let f = std::fs::OpenOptions::new().append(true).create(true).open(dir.join(name))?;
+    fn open(
+        dir: &std::path::Path,
+        name: &'static str,
+        max_bytes: u64,
+        keep: u32,
+    ) -> std::io::Result<Self> {
+        let f = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(dir.join(name))?;
         let size = f.metadata().map(|m| m.len()).unwrap_or(0);
         Ok(Self {
             dir: dir.to_path_buf(),
@@ -3565,7 +3714,10 @@ impl RotatingFile {
             }
             let _ = std::fs::rename(&path, dir.join(format!("{name}.1")));
         }
-        let f = std::fs::OpenOptions::new().append(true).create(true).open(&path)?;
+        let f = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&path)?;
         self.w = std::io::BufWriter::new(f);
         self.size = 0;
         Ok(())
@@ -3587,10 +3739,12 @@ fn log_writer_loop(rx: std::sync::mpsc::Receiver<LogRecord>) {
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(5);
 
-    let mut files: std::collections::HashMap<&'static str, RotatingFile> = std::collections::HashMap::new();
+    let mut files: std::collections::HashMap<&'static str, RotatingFile> =
+        std::collections::HashMap::new();
     let mut last_dropped = 0u64;
 
-    let write_one = |files: &mut std::collections::HashMap<&'static str, RotatingFile>, rec: LogRecord| {
+    let write_one = |files: &mut std::collections::HashMap<&'static str, RotatingFile>,
+                     rec: LogRecord| {
         if !files.contains_key(rec.name) {
             match RotatingFile::open(&dir, rec.name, max_bytes, keep) {
                 Ok(rf) => {
@@ -3697,7 +3851,8 @@ fn ndjson_log(ctx: &RequestContext) {
     // case covers GeoIP / rate-limit / bot-challenge / smuggling blocks that were
     // downgraded to Log in learning mode and carry no rule match — without it the
     // learning report (which consumes only waf.log) undercounts would-have-blocks.
-    if !ctx.rule_matches.is_empty() || matches!(ctx.decision, WafDecision::Block) || ctx.would_block {
+    if !ctx.rule_matches.is_empty() || matches!(ctx.decision, WafDecision::Block) || ctx.would_block
+    {
         let top = ctx.rule_matches.first();
         let sev_str = top
             .map(|r| format!("{:?}", r.severity).to_uppercase())
@@ -3816,7 +3971,10 @@ mod log_rotation_tests {
         // Backups are bounded to keep=2: .1 and .2 exist, .3 must be pruned.
         assert!(dir.join("access.log.1").exists(), "expected access.log.1");
         assert!(dir.join("access.log.2").exists(), "expected access.log.2");
-        assert!(!dir.join("access.log.3").exists(), "keep=2 must drop access.log.3");
+        assert!(
+            !dir.join("access.log.3").exists(),
+            "keep=2 must drop access.log.3"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3836,7 +3994,10 @@ mod log_rotation_tests {
             rf.flush();
         }
         assert!(dir.join("access.log").exists(), "live log must exist");
-        assert!(!dir.join("access.log.1").exists(), "keep=0 must retain no backup");
+        assert!(
+            !dir.join("access.log.1").exists(),
+            "keep=0 must retain no backup"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

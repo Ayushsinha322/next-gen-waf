@@ -130,7 +130,11 @@ fn check_te_obfuscation(headers: &http::HeaderMap) -> Option<SmugglingVerdict> {
     }
 
     // Split by comma, trim each token.
-    let tokens: Vec<&str> = value.split(',').map(str::trim).filter(|t| !t.is_empty()).collect();
+    let tokens: Vec<&str> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .collect();
 
     // Multiple tokens → reject (e.g. "chunked, identity").
     if tokens.len() > 1 {
@@ -176,7 +180,12 @@ fn check_duplicate_te_headers(headers: &http::HeaderMap) -> Option<SmugglingVerd
     //
     // This check is redundant with `check_te_obfuscation` which already
     // detects multiple values, but we keep it as a belt-and-suspenders.
-    if headers.get_all(http::header::TRANSFER_ENCODING).iter().count() > 1 {
+    if headers
+        .get_all(http::header::TRANSFER_ENCODING)
+        .iter()
+        .count()
+        > 1
+    {
         return Some(SmugglingVerdict::Reject {
             reason: "HTTP request smuggling: duplicate Transfer-Encoding headers".to_string(),
         });
@@ -196,10 +205,7 @@ fn check_header_injection(headers: &http::HeaderMap) -> Option<SmugglingVerdict>
             Err(_) => {
                 // Non-UTF-8 header value — could be a binary smuggling attempt.
                 return Some(SmugglingVerdict::Reject {
-                    reason: format!(
-                        "HTTP request smuggling: invalid UTF-8 in header '{}'",
-                        name
-                    ),
+                    reason: format!("HTTP request smuggling: invalid UTF-8 in header '{}'", name),
                 });
             }
         };
@@ -302,8 +308,8 @@ fn check_cl_validity(headers: &http::HeaderMap) -> Option<SmugglingVerdict> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::header::{CONTENT_LENGTH, HOST, TRANSFER_ENCODING};
     use http::HeaderMap;
-    use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING, HOST};
 
     fn headers_from_pairs(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut map = HeaderMap::new();
@@ -338,7 +344,8 @@ mod tests {
 
     #[test]
     fn clean_te_chunked_only() {
-        let headers = headers_from_pairs(&[("host", "example.com"), ("transfer-encoding", "chunked")]);
+        let headers =
+            headers_from_pairs(&[("host", "example.com"), ("transfer-encoding", "chunked")]);
         assert_eq!(detect(&headers), SmugglingVerdict::Clean);
     }
 
@@ -384,10 +391,8 @@ mod tests {
     fn reject_te_xchunked() {
         // "xchunked" — a front-end that strips by prefix match might miss it,
         // back-end sees "chunked".
-        let headers = headers_from_pairs(&[
-            ("host", "example.com"),
-            ("transfer-encoding", "xchunked"),
-        ]);
+        let headers =
+            headers_from_pairs(&[("host", "example.com"), ("transfer-encoding", "xchunked")]);
         match detect(&headers) {
             SmugglingVerdict::Reject { reason } => {
                 assert!(reason.contains("xchunked"));
@@ -412,10 +417,8 @@ mod tests {
 
     #[test]
     fn reject_te_unknown_encoding() {
-        let headers = headers_from_pairs(&[
-            ("host", "example.com"),
-            ("transfer-encoding", "bogus"),
-        ]);
+        let headers =
+            headers_from_pairs(&[("host", "example.com"), ("transfer-encoding", "bogus")]);
         match detect(&headers) {
             SmugglingVerdict::Reject { reason } => {
                 assert!(reason.contains("bogus"));
@@ -426,10 +429,7 @@ mod tests {
 
     #[test]
     fn reject_te_empty() {
-        let headers = headers_from_pairs(&[
-            ("host", "example.com"),
-            ("transfer-encoding", ""),
-        ]);
+        let headers = headers_from_pairs(&[("host", "example.com"), ("transfer-encoding", "")]);
         match detect(&headers) {
             SmugglingVerdict::Reject { reason } => {
                 assert!(reason.contains("empty"));
@@ -444,10 +444,8 @@ mod tests {
         // time. Our TE obfuscation check verifies the value is not split
         // across multiple headers or containing comma-separated tokens.
         // This test verifies that valid single-token TE passes.
-        let headers = headers_from_pairs(&[
-            ("host", "example.com"),
-            ("transfer-encoding", "chunked"),
-        ]);
+        let headers =
+            headers_from_pairs(&[("host", "example.com"), ("transfer-encoding", "chunked")]);
         assert_eq!(detect(&headers), SmugglingVerdict::Clean);
     }
 
@@ -471,10 +469,7 @@ mod tests {
 
     #[test]
     fn reject_cl_not_a_number() {
-        let headers = headers_from_pairs(&[
-            ("host", "example.com"),
-            ("content-length", "hello"),
-        ]);
+        let headers = headers_from_pairs(&[("host", "example.com"), ("content-length", "hello")]);
         match detect(&headers) {
             SmugglingVerdict::Reject { reason } => {
                 assert!(reason.contains("invalid"));
@@ -485,10 +480,7 @@ mod tests {
 
     #[test]
     fn reject_cl_leading_zero() {
-        let headers = headers_from_pairs(&[
-            ("host", "example.com"),
-            ("content-length", "042"),
-        ]);
+        let headers = headers_from_pairs(&[("host", "example.com"), ("content-length", "042")]);
         match detect(&headers) {
             SmugglingVerdict::Reject { reason } => {
                 assert!(reason.contains("leading zero"));
@@ -499,10 +491,7 @@ mod tests {
 
     #[test]
     fn reject_cl_leading_plus() {
-        let headers = headers_from_pairs(&[
-            ("host", "example.com"),
-            ("content-length", "+42"),
-        ]);
+        let headers = headers_from_pairs(&[("host", "example.com"), ("content-length", "+42")]);
         match detect(&headers) {
             SmugglingVerdict::Reject { reason } => {
                 assert!(reason.contains("leading '+'"));
@@ -513,10 +502,7 @@ mod tests {
 
     #[test]
     fn reject_cl_comma_separated() {
-        let headers = headers_from_pairs(&[
-            ("host", "example.com"),
-            ("content-length", "0, 0"),
-        ]);
+        let headers = headers_from_pairs(&[("host", "example.com"), ("content-length", "0, 0")]);
         match detect(&headers) {
             SmugglingVerdict::Reject { reason } => {
                 assert!(reason.contains("comma"));
@@ -528,10 +514,7 @@ mod tests {
     #[test]
     fn accept_cl_zero() {
         // Zero is valid — e.g. GET requests with no body.
-        let headers = headers_from_pairs(&[
-            ("host", "example.com"),
-            ("content-length", "0"),
-        ]);
+        let headers = headers_from_pairs(&[("host", "example.com"), ("content-length", "0")]);
         assert_eq!(detect(&headers), SmugglingVerdict::Clean);
     }
 
@@ -542,10 +525,7 @@ mod tests {
         // CR/LF in headers is rejected by the http crate at parse time.
         // Our check_header_injection is defense-in-depth.
         // Verify that valid headers with no injection pass cleanly.
-        let headers = headers_from_pairs(&[
-            ("host", "example.com"),
-            ("x-custom", "normal-value"),
-        ]);
+        let headers = headers_from_pairs(&[("host", "example.com"), ("x-custom", "normal-value")]);
         assert_eq!(detect(&headers), SmugglingVerdict::Clean);
     }
 
@@ -564,29 +544,21 @@ mod tests {
     fn reject_te_gzip_smuggling() {
         // "gzip" is valid but combined with CL → rejected by CL.TE check.
         // This tests that "gzip" alone is NOT rejected.
-        let headers = headers_from_pairs(&[
-            ("host", "example.com"),
-            ("transfer-encoding", "gzip"),
-        ]);
+        let headers = headers_from_pairs(&[("host", "example.com"), ("transfer-encoding", "gzip")]);
         assert_eq!(detect(&headers), SmugglingVerdict::Clean);
     }
 
     #[test]
     fn reject_te_deflate_valid() {
-        let headers = headers_from_pairs(&[
-            ("host", "example.com"),
-            ("transfer-encoding", "deflate"),
-        ]);
+        let headers =
+            headers_from_pairs(&[("host", "example.com"), ("transfer-encoding", "deflate")]);
         assert_eq!(detect(&headers), SmugglingVerdict::Clean);
     }
 
     #[test]
     fn reject_cl_negative() {
         // A negative CL is invalid per the HTTP spec.
-        let headers = headers_from_pairs(&[
-            ("host", "example.com"),
-            ("content-length", "-1"),
-        ]);
+        let headers = headers_from_pairs(&[("host", "example.com"), ("content-length", "-1")]);
         match detect(&headers) {
             SmugglingVerdict::Reject { .. } => {}
             _ => panic!("expected Reject for negative CL"),
@@ -596,10 +568,7 @@ mod tests {
     #[test]
     fn accept_cl_with_whitespace() {
         // Values with surrounding whitespace should be trimmed and accepted.
-        let headers = headers_from_pairs(&[
-            ("host", "example.com"),
-            ("content-length", "  42  "),
-        ]);
+        let headers = headers_from_pairs(&[("host", "example.com"), ("content-length", "  42  ")]);
         assert_eq!(detect(&headers), SmugglingVerdict::Clean);
     }
 
@@ -615,10 +584,8 @@ mod tests {
     #[test]
     fn reject_te_chunked_capitalised() {
         // Casing should be normalised — "CHUNKED" is valid.
-        let headers = headers_from_pairs(&[
-            ("host", "example.com"),
-            ("transfer-encoding", "CHUNKED"),
-        ]);
+        let headers =
+            headers_from_pairs(&[("host", "example.com"), ("transfer-encoding", "CHUNKED")]);
         assert_eq!(detect(&headers), SmugglingVerdict::Clean);
     }
 

@@ -1,8 +1,10 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use sentinel_core::context::{Phase, RequestContext};
-use sentinel_rules::{compile, RuleEngine};
-use sentinel_rules::dsl::ast::{RuleAction, RuleDef, RuleFile, RuleItem, RulePhase, RuleSeverity, Target, TargetExpr};
 use sentinel_rules::dsl::ast::Operator;
+use sentinel_rules::dsl::ast::{
+    RuleAction, RuleDef, RuleFile, RuleItem, RulePhase, RuleSeverity, Target, TargetExpr,
+};
+use sentinel_rules::{compile, RuleEngine};
 
 use std::net::{IpAddr, Ipv4Addr};
 
@@ -38,7 +40,9 @@ fn build_rules(n: usize) -> RuleFile {
 /// Clean request — contains no attack patterns, no rules fire.
 fn clean_ctx() -> RequestContext {
     let mut ctx = RequestContext::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345);
-    ctx.uri = "http://example.com/?name=John&city=NYC&page=1".parse().unwrap();
+    ctx.uri = "http://example.com/?name=John&city=NYC&page=1"
+        .parse()
+        .unwrap();
     ctx
 }
 
@@ -56,13 +60,20 @@ fn bench_clean_no_early_exit(c: &mut Criterion) {
     let ruleset = compile(file).unwrap();
     let engine = RuleEngine::new(ruleset);
 
-    c.bench_function(&format!("vm_clean_{}_no_early_exit", engine.rule_count()), |b| {
-        b.iter(|| {
-            let mut ctx = clean_ctx();
-            black_box(engine.evaluate(black_box(&mut ctx), black_box(Phase::RequestBody), black_box(0)));
-            black_box(&ctx);
-        })
-    });
+    c.bench_function(
+        &format!("vm_clean_{}_no_early_exit", engine.rule_count()),
+        |b| {
+            b.iter(|| {
+                let mut ctx = clean_ctx();
+                black_box(engine.evaluate(
+                    black_box(&mut ctx),
+                    black_box(Phase::RequestBody),
+                    black_box(0),
+                ));
+                black_box(&ctx);
+            })
+        },
+    );
 }
 
 fn bench_clean_with_early_exit(c: &mut Criterion) {
@@ -70,13 +81,20 @@ fn bench_clean_with_early_exit(c: &mut Criterion) {
     let ruleset = compile(file).unwrap();
     let engine = RuleEngine::new(ruleset);
 
-    c.bench_function(&format!("vm_clean_{}_early_exit_threshold=5", engine.rule_count()), |b| {
-        b.iter(|| {
-            let mut ctx = clean_ctx();
-            black_box(engine.evaluate(black_box(&mut ctx), black_box(Phase::RequestBody), black_box(5)));
-            black_box(&ctx);
-        })
-    });
+    c.bench_function(
+        &format!("vm_clean_{}_early_exit_threshold=5", engine.rule_count()),
+        |b| {
+            b.iter(|| {
+                let mut ctx = clean_ctx();
+                black_box(engine.evaluate(
+                    black_box(&mut ctx),
+                    black_box(Phase::RequestBody),
+                    black_box(5),
+                ));
+                black_box(&ctx);
+            })
+        },
+    );
 }
 
 fn bench_malicious_no_early_exit(c: &mut Criterion) {
@@ -84,13 +102,20 @@ fn bench_malicious_no_early_exit(c: &mut Criterion) {
     let ruleset = compile(file).unwrap();
     let engine = RuleEngine::new(ruleset);
 
-    c.bench_function(&format!("vm_malicious_{}_no_early_exit", engine.rule_count()), |b| {
-        b.iter(|| {
-            let mut ctx = malicious_ctx();
-            black_box(engine.evaluate(black_box(&mut ctx), black_box(Phase::RequestBody), black_box(0)));
-            black_box(&ctx);
-        })
-    });
+    c.bench_function(
+        &format!("vm_malicious_{}_no_early_exit", engine.rule_count()),
+        |b| {
+            b.iter(|| {
+                let mut ctx = malicious_ctx();
+                black_box(engine.evaluate(
+                    black_box(&mut ctx),
+                    black_box(Phase::RequestBody),
+                    black_box(0),
+                ));
+                black_box(&ctx);
+            })
+        },
+    );
 }
 
 fn bench_malicious_with_early_exit(c: &mut Criterion) {
@@ -98,13 +123,23 @@ fn bench_malicious_with_early_exit(c: &mut Criterion) {
     let ruleset = compile(file).unwrap();
     let engine = RuleEngine::new(ruleset);
 
-    c.bench_function(&format!("vm_malicious_{}_early_exit_threshold=5", engine.rule_count()), |b| {
-        b.iter(|| {
-            let mut ctx = malicious_ctx();
-            black_box(engine.evaluate(black_box(&mut ctx), black_box(Phase::RequestBody), black_box(5)));
-            black_box(&ctx);
-        })
-    });
+    c.bench_function(
+        &format!(
+            "vm_malicious_{}_early_exit_threshold=5",
+            engine.rule_count()
+        ),
+        |b| {
+            b.iter(|| {
+                let mut ctx = malicious_ctx();
+                black_box(engine.evaluate(
+                    black_box(&mut ctx),
+                    black_box(Phase::RequestBody),
+                    black_box(5),
+                ));
+                black_box(&ctx);
+            })
+        },
+    );
 }
 
 fn bench_varying_rule_counts(c: &mut Criterion) {
@@ -117,7 +152,11 @@ fn bench_varying_rule_counts(c: &mut Criterion) {
         c.bench_function(&format!("vm_clean_{n}r_clean_input"), |b| {
             b.iter(|| {
                 let mut ctx = clean_ctx();
-                black_box(engine.evaluate(black_box(&mut ctx), black_box(Phase::RequestBody), black_box(0)));
+                black_box(engine.evaluate(
+                    black_box(&mut ctx),
+                    black_box(Phase::RequestBody),
+                    black_box(0),
+                ));
                 black_box(&ctx);
             })
         });
@@ -126,14 +165,19 @@ fn bench_varying_rule_counts(c: &mut Criterion) {
         c.bench_function(&format!("vm_malicious_{n}r_early_exit"), |b| {
             b.iter(|| {
                 let mut ctx = malicious_ctx();
-                black_box(engine.evaluate(black_box(&mut ctx), black_box(Phase::RequestBody), black_box(5)));
+                black_box(engine.evaluate(
+                    black_box(&mut ctx),
+                    black_box(Phase::RequestBody),
+                    black_box(5),
+                ));
                 black_box(&ctx);
             })
         });
     }
 }
 
-criterion_group!(benches,
+criterion_group!(
+    benches,
     bench_clean_no_early_exit,
     bench_clean_with_early_exit,
     bench_malicious_no_early_exit,

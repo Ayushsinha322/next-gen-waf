@@ -192,9 +192,20 @@ pub enum Operator {
     /// (which our importer cannot express directly — it needs capture groups,
     /// dynamic `setvar`, a `TX:/regex/` collection, and `%{}` macro expansion).
     OffDomainUrl,
-    AnomalyScore { op: CmpOp, threshold: u32 },
-    MlScore { model: String, op: CmpOp, threshold: f32 },
-    RateLimit { dimension: RateLimitDim, rps: u32, burst: u32 },
+    AnomalyScore {
+        op: CmpOp,
+        threshold: u32,
+    },
+    MlScore {
+        model: String,
+        op: CmpOp,
+        threshold: f32,
+    },
+    RateLimit {
+        dimension: RateLimitDim,
+        rps: u32,
+        burst: u32,
+    },
     Not(Box<Operator>),
     Never,
 }
@@ -226,7 +237,10 @@ pub enum RuleAction {
     Allow,
     Log,
     Challenge(ChallengeMode),
-    PluginCall { name: String, args: serde_json::Value },
+    PluginCall {
+        name: String,
+        args: serde_json::Value,
+    },
     Redirect(String),
 }
 
@@ -242,13 +256,13 @@ pub enum ChallengeMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RulePhase {
-    Connection      = 0,
-    RequestHeaders  = 1,
-    RequestBody     = 2,
-    Upstream        = 3,
+    Connection = 0,
+    RequestHeaders = 1,
+    RequestBody = 2,
+    Upstream = 3,
     ResponseHeaders = 4,
-    ResponseBody    = 5,
-    Logging         = 6,
+    ResponseBody = 5,
+    Logging = 6,
 }
 
 impl RulePhase {
@@ -292,7 +306,11 @@ pub enum Directive {
     SecRule(SecRuleDirective),
     SecAction(String),
     SecMarker(String),
-    VarDecl { name: String, var_type: VarType, initial: String },
+    VarDecl {
+        name: String,
+        var_type: VarType,
+        initial: String,
+    },
     Import(String),
 }
 

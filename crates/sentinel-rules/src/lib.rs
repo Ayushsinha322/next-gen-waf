@@ -268,7 +268,11 @@ rule 980130 {
 
         engine.evaluate(&mut ctx, Phase::RequestBody, 0);
 
-        assert_eq!(ctx.decision, WafDecision::Block, "should block via anomaly threshold");
+        assert_eq!(
+            ctx.decision,
+            WafDecision::Block,
+            "should block via anomaly threshold"
+        );
     }
 
     #[test]
@@ -344,7 +348,11 @@ rule 2 { phase: request_headers targets: ARGS operator: exists action: log messa
         ctx.uri = "http://example.com/?q=SELECT%201".parse().unwrap();
 
         engine.evaluate(&mut ctx, Phase::RequestBody, 0);
-        assert_eq!(ctx.decision, WafDecision::Block, "lowercase transform should normalise SELECT → select");
+        assert_eq!(
+            ctx.decision,
+            WafDecision::Block,
+            "lowercase transform should normalise SELECT → select"
+        );
     }
 
     #[test]
@@ -393,12 +401,18 @@ rule 2 { phase: request_headers targets: ARGS operator: exists action: log messa
         .unwrap();
 
         let mut ctx = make_ctx();
-        ctx.uri = "http://example.com/?x=%26lt%3Bscript%26gt%3B".parse().unwrap();
+        ctx.uri = "http://example.com/?x=%26lt%3Bscript%26gt%3B"
+            .parse()
+            .unwrap();
         // Decoded ARGS value: "&lt;script&gt;" — htmlEntityDecode turns this to "<script>"
         ctx.request_body = Some(Bytes::from("x=&lt;script&gt;alert(1)&lt;/script&gt;"));
 
         engine.evaluate(&mut ctx, Phase::RequestBody, 0);
-        assert_eq!(ctx.decision, WafDecision::Block, "htmlEntityDecode should expose encoded script tag");
+        assert_eq!(
+            ctx.decision,
+            WafDecision::Block,
+            "htmlEntityDecode should expose encoded script tag"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -409,7 +423,9 @@ rule 2 { phase: request_headers targets: ARGS operator: exists action: log messa
     fn setvar_only_anomaly_score_lhs_counts() {
         use crate::crs_compat::secrule::parse_crs_actions;
         // LHS is a category tracker — should NOT contribute to rule score_delta
-        let actions = parse_crs_actions("id:1,phase:2,pass,setvar:tx.sql_injection_score=+%{tx.critical_anomaly_score}");
+        let actions = parse_crs_actions(
+            "id:1,phase:2,pass,setvar:tx.sql_injection_score=+%{tx.critical_anomaly_score}",
+        );
         assert_eq!(
             actions.score_delta, None,
             "category score vars must not be counted as anomaly_score deltas"
@@ -470,9 +486,17 @@ rule 2 { phase: request_headers targets: ARGS operator: exists action: log messa
         use crate::dsl::ast::RuleItem;
         let src = r#"SecRule TX:DETECTION_PARANOIA_LEVEL "@lt 2" "id:920020,phase:1,pass,nolog,skipAfter:END-REQUEST-ENFORCEMENT""#;
         let rf = import_secrule_conf(src).expect("import");
-        let rule = rf.items.iter().find_map(|i| {
-            if let RuleItem::Rule(r) = i { Some(r) } else { None }
-        }).expect("rule");
+        let rule = rf
+            .items
+            .iter()
+            .find_map(|i| {
+                if let RuleItem::Rule(r) = i {
+                    Some(r)
+                } else {
+                    None
+                }
+            })
+            .expect("rule");
         assert_eq!(rule.skip_after.as_deref(), Some("END-REQUEST-ENFORCEMENT"));
     }
 
@@ -506,7 +530,11 @@ SecMarker "SECTION_END"
             !ctx_gate.rule_matches.iter().any(|m| m.rule_id == "20"),
             "block rule must be skipped when gate fires"
         );
-        assert_eq!(ctx_gate.decision, WafDecision::Allow, "gate uses pass — must stay Allow");
+        assert_eq!(
+            ctx_gate.decision,
+            WafDecision::Allow,
+            "gate uses pass — must stay Allow"
+        );
 
         // === Path 2: ARGS="other" → gate does NOT fire, block rule runs ===
         let mut ctx_no_gate = make_ctx();

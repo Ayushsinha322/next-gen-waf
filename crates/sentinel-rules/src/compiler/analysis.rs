@@ -18,7 +18,10 @@ pub fn analyse(file: &mut RuleFile) -> Result<()> {
             RuleItem::Rule(rule) => {
                 // Check duplicate IDs
                 if let Some(prev_idx) = seen_ids.insert(rule.id, idx) {
-                    warn!(rule_id = rule.id, prev_idx, "duplicate rule ID; keeping latest");
+                    warn!(
+                        rule_id = rule.id,
+                        prev_idx, "duplicate rule ID; keeping latest"
+                    );
                 }
 
                 // Validate targets vs operator
@@ -28,7 +31,10 @@ pub fn analyse(file: &mut RuleFile) -> Result<()> {
                 if matches!(rule.action, crate::dsl::ast::RuleAction::Score)
                     && rule.score_delta.is_none()
                 {
-                    warn!(rule_id = rule.id, "rule has action:score but no score field");
+                    warn!(
+                        rule_id = rule.id,
+                        "rule has action:score but no score field"
+                    );
                 }
             }
             RuleItem::VirtualPatch(vp) => {
@@ -51,7 +57,10 @@ fn validate_targets_operator(
     errors: &mut Vec<String>,
 ) {
     // anomaly_score and ml_score don't need targets
-    if matches!(op, Operator::AnomalyScore { .. } | Operator::MlScore { .. } | Operator::RateLimit { .. }) {
+    if matches!(
+        op,
+        Operator::AnomalyScore { .. } | Operator::MlScore { .. } | Operator::RateLimit { .. }
+    ) {
         return;
     }
     if targets.is_empty() {
@@ -69,6 +78,8 @@ fn validate_vp_targets_operator(
         return;
     }
     if targets.is_empty() {
-        errors.push(format!("virtual_patch {cve}: operator requires at least one target"));
+        errors.push(format!(
+            "virtual_patch {cve}: operator requires at least one target"
+        ));
     }
 }

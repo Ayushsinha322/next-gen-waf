@@ -212,12 +212,18 @@ fn benign_requests() -> Vec<RequestContext> {
         "/maps/directions?origin=Pune&destination=Mumbai&mode=driving",
     ];
     let posts = [
-        ("/login", "username=alice&password=correcthorsebatterystaple"),
+        (
+            "/login",
+            "username=alice&password=correcthorsebatterystaple",
+        ),
         ("/contact", "email=bob@example.com&subscribe=true"),
         ("/api/save", "first_name=John&last_name=Doe&age=34"),
         ("/comment", "comment=Great+article+thanks+for+sharing"),
         ("/order", "product_name=Wireless+Mouse&qty=3&color=black"),
-        ("/feedback", "rating=5&review=Excellent+product+would+buy+again"),
+        (
+            "/feedback",
+            "rating=5&review=Excellent+product+would+buy+again",
+        ),
         ("/profile", "city=Bangalore&pincode=560001&country=India"),
         ("/search", "search=summer+dresses&color=blue&size=M"),
         ("/support", "subject=Invoice+request&priority=normal"),
@@ -225,10 +231,22 @@ fn benign_requests() -> Vec<RequestContext> {
     ];
     let jsons = [
         ("/api/login", r#"{"username":"alice","remember":true}"#),
-        ("/api/order", r#"{"product_id":12345,"quantity":2,"color":"red"}"#),
-        ("/api/search", r#"{"query":"laptop","filters":{"brand":"acme","price_max":1500}}"#),
-        ("/api/profile", r#"{"name":"John Doe","address":{"city":"Pune","zip":"411001"}}"#),
-        ("/api/review", r#"{"comment":"Looks great, shipping was fast","stars":5}"#),
+        (
+            "/api/order",
+            r#"{"product_id":12345,"quantity":2,"color":"red"}"#,
+        ),
+        (
+            "/api/search",
+            r#"{"query":"laptop","filters":{"brand":"acme","price_max":1500}}"#,
+        ),
+        (
+            "/api/profile",
+            r#"{"name":"John Doe","address":{"city":"Pune","zip":"411001"}}"#,
+        ),
+        (
+            "/api/review",
+            r#"{"comment":"Looks great, shipping was fast","stars":5}"#,
+        ),
     ];
 
     let mut out = Vec::new();
@@ -240,8 +258,10 @@ fn benign_requests() -> Vec<RequestContext> {
     }
     for (p, b) in jsons {
         let mut ctx = benign_post(p, b);
-        ctx.request_headers
-            .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+        ctx.request_headers.insert(
+            http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
         out.push(ctx);
     }
     out
@@ -314,15 +334,33 @@ fn crs_detection_accuracy_and_throughput() {
 
     // --- Report ---
     println!("\n================ CRS DETECTION ACCURACY (PL{PARANOIA}) ================");
-    println!("ruleset: full CRS v4.7 request side ({} conf files)", CRS_FILES.len());
+    println!(
+        "ruleset: full CRS v4.7 request side ({} conf files)",
+        CRS_FILES.len()
+    );
     println!("\nPer-category detection rate:");
     for (cat, (hit, tot)) in &by_cat {
-        println!("  {:<12} {:>3}/{:<3}  {:>6.1}%", cat, hit, tot, 100.0 * *hit as f32 / *tot as f32);
+        println!(
+            "  {:<12} {:>3}/{:<3}  {:>6.1}%",
+            cat,
+            hit,
+            tot,
+            100.0 * *hit as f32 / *tot as f32
+        );
     }
-    println!("\nOVERALL detection rate : {detected_total}/{total_attacks}  = {:.1}%", 100.0 * detection_rate);
-    println!("False positives        : {false_positives}/{total_benign}  = {:.1}% FPR", 100.0 * fpr);
+    println!(
+        "\nOVERALL detection rate : {detected_total}/{total_attacks}  = {:.1}%",
+        100.0 * detection_rate
+    );
+    println!(
+        "False positives        : {false_positives}/{total_benign}  = {:.1}% FPR",
+        100.0 * fpr
+    );
     println!("\n---------------- THROUGHPUT (rule engine, single-thread) ----------------");
-    println!("evaluated {total_evals} requests in {:.3}s", elapsed.as_secs_f64());
+    println!(
+        "evaluated {total_evals} requests in {:.3}s",
+        elapsed.as_secs_f64()
+    );
     println!("  ~{per_eval_us:.1} µs/request   ~{throughput:.0} req/s (1 core, in-process)");
     println!("  (checksum {sink})");
     println!("=========================================================================\n");

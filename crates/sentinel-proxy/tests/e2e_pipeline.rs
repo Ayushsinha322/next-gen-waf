@@ -13,8 +13,8 @@ use http::{header, Method, Request, StatusCode};
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
 use sentinel_core::config::{
-    ConfigHandle, ListenerConfig, Protocol, ProtocolSpec, SentinelConfig,
-    SiteConfig, UpstreamConfig, UpstreamServer, WafConfig, WafMode,
+    ConfigHandle, ListenerConfig, Protocol, ProtocolSpec, SentinelConfig, SiteConfig,
+    UpstreamConfig, UpstreamServer, WafConfig, WafMode,
 };
 use sentinel_proxy::ProxyServer;
 use std::sync::Once;
@@ -48,7 +48,12 @@ fn crs_rule_dir() -> std::path::PathBuf {
     manifest.join("../../rules/owasp-crs/rules")
 }
 
-fn test_config(listen_port: u16, upstream_port: u16, rule_file: &str, mode: WafMode) -> SentinelConfig {
+fn test_config(
+    listen_port: u16,
+    upstream_port: u16,
+    rule_file: &str,
+    mode: WafMode,
+) -> SentinelConfig {
     let rule_path = crs_rule_dir().join(rule_file);
     SentinelConfig {
         listeners: vec![ListenerConfig {
@@ -138,7 +143,9 @@ fn ml_only_config(listen_port: u16, upstream_port: u16, sensitivity: f32) -> Sen
 // ---------------------------------------------------------------------------
 
 async fn start_mock_upstream() -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock upstream");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock upstream");
     let addr = listener.local_addr().unwrap();
     let handle = tokio::spawn(async move {
         loop {
@@ -150,7 +157,11 @@ async fn start_mock_upstream() -> (SocketAddr, tokio::task::JoinHandle<()>) {
                 let io = TokioIo::new(stream);
                 let svc = hyper::service::service_fn(|req: Request<Incoming>| async move {
                     let path = req.uri().path().to_string();
-                    let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
+                    let query = req
+                        .uri()
+                        .query()
+                        .map(|q| format!("?{q}"))
+                        .unwrap_or_default();
                     Ok::<_, std::convert::Infallible>(
                         http::Response::builder()
                             .status(StatusCode::OK)
@@ -175,7 +186,10 @@ async fn start_mock_upstream() -> (SocketAddr, tokio::task::JoinHandle<()>) {
 
 async fn start_proxy(
     cfg: SentinelConfig,
-) -> (watch::Sender<bool>, tokio::task::JoinHandle<anyhow::Result<()>>) {
+) -> (
+    watch::Sender<bool>,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
     install_crypto();
     let handle = config_handle(cfg);
     let proxy = ProxyServer::new(handle);
@@ -190,7 +204,13 @@ async fn shutdown_proxy(tx: watch::Sender<bool>, jh: tokio::task::JoinHandle<any
     let _ = jh.await;
 }
 
-async fn send_request(listen_port: u16, host: &str, uri: &str, method: Method, body: &str) -> (StatusCode, Vec<u8>) {
+async fn send_request(
+    listen_port: u16,
+    host: &str,
+    uri: &str,
+    method: Method,
+    body: &str,
+) -> (StatusCode, Vec<u8>) {
     // Bind a short-lived socket to allocate an ephemeral port for the client.
     // This ensures each test gets a fresh client port, avoiding TIME_WAIT conflicts.
     {
@@ -214,14 +234,20 @@ async fn send_request(listen_port: u16, host: &str, uri: &str, method: Method, b
         .method(method)
         .uri(uri)
         .header(header::HOST, host)
-        .header(header::USER_AGENT, "Mozilla/5.0 (X11; Linux x86_64) Chrome/125.0");
+        .header(
+            header::USER_AGENT,
+            "Mozilla/5.0 (X11; Linux x86_64) Chrome/125.0",
+        );
 
     let req = if !body.is_empty() {
         req.header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(http_body_util::Full::new(bytes::Bytes::from(body.to_string())))
+            .body(http_body_util::Full::new(bytes::Bytes::from(
+                body.to_string(),
+            )))
             .unwrap()
     } else {
-        req.body(http_body_util::Full::new(bytes::Bytes::new())).unwrap()
+        req.body(http_body_util::Full::new(bytes::Bytes::new()))
+            .unwrap()
     };
 
     let resp = sender.send_request(req).await.expect("send request");
@@ -240,10 +266,22 @@ async fn send_request(listen_port: u16, host: &str, uri: &str, method: Method, b
 async fn clean_request_reaches_upstream() {
     let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
     let listen_port = next_port();
-    let cfg = test_config(listen_port, upstream_addr.port(), "REQUEST-942-APPLICATION-ATTACK-SQLI.conf", WafMode::Blocking);
+    let cfg = test_config(
+        listen_port,
+        upstream_addr.port(),
+        "REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
+        WafMode::Blocking,
+    );
     let (shutdown_tx, jh) = start_proxy(cfg).await;
 
-    let (status, body) = send_request(listen_port, "test-site.local", "/hello?name=world", Method::GET, "").await;
+    let (status, body) = send_request(
+        listen_port,
+        "test-site.local",
+        "/hello?name=world",
+        Method::GET,
+        "",
+    )
+    .await;
 
     shutdown_proxy(shutdown_tx, jh).await;
     assert_eq!(status, StatusCode::OK);
@@ -254,10 +292,22 @@ async fn clean_request_reaches_upstream() {
 async fn sqli_attack_is_blocked() {
     let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
     let listen_port = next_port();
-    let cfg = test_config(listen_port, upstream_addr.port(), "REQUEST-942-APPLICATION-ATTACK-SQLI.conf", WafMode::Blocking);
+    let cfg = test_config(
+        listen_port,
+        upstream_addr.port(),
+        "REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
+        WafMode::Blocking,
+    );
     let (shutdown_tx, jh) = start_proxy(cfg).await;
 
-    let (status, _) = send_request(listen_port, "test-site.local", "/search?q=1%27%20OR%201%3D1--", Method::GET, "").await;
+    let (status, _) = send_request(
+        listen_port,
+        "test-site.local",
+        "/search?q=1%27%20OR%201%3D1--",
+        Method::GET,
+        "",
+    )
+    .await;
 
     shutdown_proxy(shutdown_tx, jh).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "SQLi attack should be 403");
@@ -267,10 +317,22 @@ async fn sqli_attack_is_blocked() {
 async fn xss_attack_is_blocked() {
     let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
     let listen_port = next_port();
-    let cfg = test_config(listen_port, upstream_addr.port(), "REQUEST-941-APPLICATION-ATTACK-XSS.conf", WafMode::Blocking);
+    let cfg = test_config(
+        listen_port,
+        upstream_addr.port(),
+        "REQUEST-941-APPLICATION-ATTACK-XSS.conf",
+        WafMode::Blocking,
+    );
     let (shutdown_tx, jh) = start_proxy(cfg).await;
 
-    let (status, _) = send_request(listen_port, "test-site.local", "/search?q=%3Cscript%3Ealert(1)%3C%2Fscript%3E", Method::GET, "").await;
+    let (status, _) = send_request(
+        listen_port,
+        "test-site.local",
+        "/search?q=%3Cscript%3Ealert(1)%3C%2Fscript%3E",
+        Method::GET,
+        "",
+    )
+    .await;
 
     shutdown_proxy(shutdown_tx, jh).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "XSS attack should be 403");
@@ -280,10 +342,16 @@ async fn xss_attack_is_blocked() {
 async fn health_check_endpoint() {
     let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
     let listen_port = next_port();
-    let cfg = test_config(listen_port, upstream_addr.port(), "REQUEST-942-APPLICATION-ATTACK-SQLI.conf", WafMode::Blocking);
+    let cfg = test_config(
+        listen_port,
+        upstream_addr.port(),
+        "REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
+        WafMode::Blocking,
+    );
     let (shutdown_tx, jh) = start_proxy(cfg).await;
 
-    let (status, _) = send_request(listen_port, "test-site.local", "/healthz", Method::GET, "").await;
+    let (status, _) =
+        send_request(listen_port, "test-site.local", "/healthz", Method::GET, "").await;
 
     shutdown_proxy(shutdown_tx, jh).await;
     assert_eq!(status, StatusCode::OK, "healthz should return 200");
@@ -293,37 +361,80 @@ async fn health_check_endpoint() {
 async fn post_body_sqli_is_blocked() {
     let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
     let listen_port = next_port();
-    let cfg = test_config(listen_port, upstream_addr.port(), "REQUEST-942-APPLICATION-ATTACK-SQLI.conf", WafMode::Blocking);
+    let cfg = test_config(
+        listen_port,
+        upstream_addr.port(),
+        "REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
+        WafMode::Blocking,
+    );
     let (shutdown_tx, jh) = start_proxy(cfg).await;
 
-    let (status, _) = send_request(listen_port, "test-site.local", "/login", Method::POST, "user=admin' OR 1=1--&pass=foo").await;
+    let (status, _) = send_request(
+        listen_port,
+        "test-site.local",
+        "/login",
+        Method::POST,
+        "user=admin' OR 1=1--&pass=foo",
+    )
+    .await;
 
     shutdown_proxy(shutdown_tx, jh).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "POST SQLi body should be 403");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "POST SQLi body should be 403"
+    );
 }
 
 #[tokio::test]
 async fn learning_mode_passes_attack() {
     let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
     let listen_port = next_port();
-    let cfg = test_config(listen_port, upstream_addr.port(), "REQUEST-942-APPLICATION-ATTACK-SQLI.conf", WafMode::Learning);
+    let cfg = test_config(
+        listen_port,
+        upstream_addr.port(),
+        "REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
+        WafMode::Learning,
+    );
     let (shutdown_tx, jh) = start_proxy(cfg).await;
 
-    let (status, body) = send_request(listen_port, "test-site.local", "/search?q=1%20UNION%20SELECT%20*%20FROM%20users", Method::GET, "").await;
+    let (status, body) = send_request(
+        listen_port,
+        "test-site.local",
+        "/search?q=1%20UNION%20SELECT%20*%20FROM%20users",
+        Method::GET,
+        "",
+    )
+    .await;
 
     shutdown_proxy(shutdown_tx, jh).await;
     assert_eq!(status, StatusCode::OK, "learning mode should forward");
-    assert!(body.starts_with(b"upstream-ok:"), "learning mode should reach upstream");
+    assert!(
+        body.starts_with(b"upstream-ok:"),
+        "learning mode should reach upstream"
+    );
 }
 
 #[tokio::test]
 async fn e2e_lfi_attack_is_blocked() {
     let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
     let listen_port = next_port();
-    let cfg = test_config(listen_port, upstream_addr.port(), "REQUEST-930-APPLICATION-ATTACK-LFI.conf", WafMode::Blocking);
+    let cfg = test_config(
+        listen_port,
+        upstream_addr.port(),
+        "REQUEST-930-APPLICATION-ATTACK-LFI.conf",
+        WafMode::Blocking,
+    );
     let (shutdown_tx, jh) = start_proxy(cfg).await;
 
-    let (status, _) = send_request(listen_port, "test-site.local", "/?file=../../etc/passwd", Method::GET, "").await;
+    let (status, _) = send_request(
+        listen_port,
+        "test-site.local",
+        "/?file=../../etc/passwd",
+        Method::GET,
+        "",
+    )
+    .await;
 
     shutdown_proxy(shutdown_tx, jh).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "LFI attack should be 403");
@@ -333,10 +444,22 @@ async fn e2e_lfi_attack_is_blocked() {
 async fn e2e_rce_attack_is_blocked() {
     let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
     let listen_port = next_port();
-    let cfg = test_config(listen_port, upstream_addr.port(), "REQUEST-932-APPLICATION-ATTACK-RCE.conf", WafMode::Blocking);
+    let cfg = test_config(
+        listen_port,
+        upstream_addr.port(),
+        "REQUEST-932-APPLICATION-ATTACK-RCE.conf",
+        WafMode::Blocking,
+    );
     let (shutdown_tx, jh) = start_proxy(cfg).await;
 
-    let (status, _) = send_request(listen_port, "test-site.local", "/exec?cmd=cat%20/etc/passwd", Method::GET, "").await;
+    let (status, _) = send_request(
+        listen_port,
+        "test-site.local",
+        "/exec?cmd=cat%20/etc/passwd",
+        Method::GET,
+        "",
+    )
+    .await;
 
     shutdown_proxy(shutdown_tx, jh).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "RCE attack should be 403");
@@ -346,10 +469,22 @@ async fn e2e_rce_attack_is_blocked() {
 async fn clean_post_passes_through() {
     let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
     let listen_port = next_port();
-    let cfg = test_config(listen_port, upstream_addr.port(), "REQUEST-942-APPLICATION-ATTACK-SQLI.conf", WafMode::Blocking);
+    let cfg = test_config(
+        listen_port,
+        upstream_addr.port(),
+        "REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
+        WafMode::Blocking,
+    );
     let (shutdown_tx, jh) = start_proxy(cfg).await;
 
-    let (status, body) = send_request(listen_port, "test-site.local", "/api/users", Method::POST, "name=John&email=john@example.com").await;
+    let (status, body) = send_request(
+        listen_port,
+        "test-site.local",
+        "/api/users",
+        Method::POST,
+        "name=John&email=john@example.com",
+    )
+    .await;
 
     shutdown_proxy(shutdown_tx, jh).await;
     assert_eq!(status, StatusCode::OK, "clean POST should pass");
@@ -406,6 +541,10 @@ async fn e2e_ml_allows_clean_request_with_no_rules() {
     .await;
 
     shutdown_proxy(shutdown_tx, jh).await;
-    assert_eq!(status, StatusCode::OK, "clean request must pass ML, got {status}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "clean request must pass ML, got {status}"
+    );
     assert!(body.starts_with(b"upstream-ok:"));
 }

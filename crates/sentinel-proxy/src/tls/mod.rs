@@ -14,7 +14,7 @@ pub mod renewal;
 
 pub use acme::CertManager;
 pub use cert_store::{
-    CertMeta, CertSource, CertStore, SentinelCertResolver, generate_self_signed, load_pem_bytes,
+    generate_self_signed, load_pem_bytes, CertMeta, CertSource, CertStore, SentinelCertResolver,
     MANAGEMENT_CERT_KEY,
 };
 

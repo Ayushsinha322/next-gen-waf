@@ -274,7 +274,13 @@ pub fn training_corpus() -> Vec<LabeledSample> {
     for uri in BENIGN_QUERIES {
         push(get(uri), 0.0);
         // Slight variation so vectors aren't identical duplicates.
-        push(get(&format!("{uri}{}ref=home", if uri.contains('?') { "&" } else { "?" })), 0.0);
+        push(
+            get(&format!(
+                "{uri}{}ref=home",
+                if uri.contains('?') { "&" } else { "?" }
+            )),
+            0.0,
+        );
     }
     let benign_paths = ["/login", "/contact", "/api/save", "/comment", "/order"];
     for (i, body) in BENIGN_FORMS.iter().enumerate() {
@@ -309,9 +315,15 @@ mod tests {
         assert!(samples.len() > 100, "corpus too small: {}", samples.len());
         let attacks = samples.iter().filter(|s| s.label == 1.0).count();
         let benign = samples.iter().filter(|s| s.label == 0.0).count();
-        assert!(attacks > 40 && benign > 40, "imbalanced: {attacks} atk / {benign} benign");
+        assert!(
+            attacks > 40 && benign > 40,
+            "imbalanced: {attacks} atk / {benign} benign"
+        );
         // Roughly balanced (within 2x) so the classifier isn't biased.
         let ratio = attacks as f32 / benign as f32;
-        assert!((0.5..=2.0).contains(&ratio), "class ratio {ratio} out of range");
+        assert!(
+            (0.5..=2.0).contains(&ratio),
+            "class ratio {ratio} out of range"
+        );
     }
 }

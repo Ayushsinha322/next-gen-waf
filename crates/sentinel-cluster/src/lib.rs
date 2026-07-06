@@ -224,8 +224,7 @@ impl RaftState {
     fn new(cfg: &ClusterConfig) -> Self {
         let peer_map: HashMap<NodeId, bool> =
             cfg.peers.iter().map(|(id, _)| (*id, false)).collect();
-        let peer_last: HashMap<NodeId, u64> =
-            cfg.peers.iter().map(|(id, _)| (*id, 0)).collect();
+        let peer_last: HashMap<NodeId, u64> = cfg.peers.iter().map(|(id, _)| (*id, 0)).collect();
         Self {
             node_id: cfg.node_id,
             peers: cfg.peers.clone(),
@@ -254,7 +253,11 @@ impl RaftState {
     }
 
     fn become_leader(&mut self) {
-        info!(node_id = self.node_id, term = self.current_term, "becoming leader");
+        info!(
+            node_id = self.node_id,
+            term = self.current_term,
+            "becoming leader"
+        );
         self.role = RaftRole::Leader;
         self.leader_id = Some(self.node_id);
         let next = self.log.last_index() + 1;
@@ -326,7 +329,11 @@ impl RaftState {
                 self.current_term = ps.current_term;
                 self.voted_for = ps.voted_for;
                 self.log.entries = ps.log_entries;
-                info!(node_id = self.node_id, term = self.current_term, "loaded persisted state");
+                info!(
+                    node_id = self.node_id,
+                    term = self.current_term,
+                    "loaded persisted state"
+                );
             }
             Err(e) => warn!("load: deserialize failed: {e}"),
         }
@@ -440,7 +447,12 @@ impl ClusterHandle {
     /// Return a status snapshot for monitoring.
     pub async fn status(&self) -> ClusterStatus {
         let (reply_tx, reply_rx) = oneshot::channel();
-        if self.tx.send(ActorMsg::Status { reply: reply_tx }).await.is_err() {
+        if self
+            .tx
+            .send(ActorMsg::Status { reply: reply_tx })
+            .await
+            .is_err()
+        {
             return ClusterStatus {
                 node_id: self.node_id,
                 role: NodeRole::Follower,
@@ -471,7 +483,7 @@ impl ClusterHandle {
 /// All mutable Raft state lives here, driven by a single async task.
 struct RaftActor {
     state: RaftState,
-    peers: Vec<(NodeId, String)>,     // snapshot for network calls
+    peers: Vec<(NodeId, String)>, // snapshot for network calls
     listen_addr: String,
 }
 
@@ -503,7 +515,9 @@ impl RaftActor {
     async fn run(mut self, mut rx: mpsc::Receiver<ActorMsg>) {
         // Bind listener first so we can accept peer RPCs.
         let addr: SocketAddr = self.listen_addr.parse().unwrap_or_else(|_| {
-            "127.0.0.1:9502".parse().expect("hardcoded fallback address must be valid")
+            "127.0.0.1:9502"
+                .parse()
+                .expect("hardcoded fallback address must be valid")
         });
         let listener = match TcpListener::bind(addr).await {
             Ok(l) => l,
@@ -520,7 +534,10 @@ impl RaftActor {
             self.state.voted_for = Some(self.state.node_id);
             self.state.become_leader();
             self.state.persist();
-            info!(node_id = self.state.node_id, "single-node cluster: instantly leader");
+            info!(
+                node_id = self.state.node_id,
+                "single-node cluster: instantly leader"
+            );
         }
 
         // Channel for incoming TCP connections to pass RPCs into the actor.
@@ -661,7 +678,7 @@ impl RaftActor {
             });
         }
         drop(res_tx); // close so recv returns None when all done
-        drop(futs);   // silence unused warning
+        drop(futs); // silence unused warning
 
         let deadline = tokio::time::sleep(Duration::from_millis(500));
         tokio::pin!(deadline);
@@ -799,7 +816,10 @@ impl RaftActor {
 
         // Election failed (no quorum); revert to follower.
         if self.state.role == RaftRole::Candidate {
-            debug!(node_id = self.state.node_id, "election failed, reverting to follower");
+            debug!(
+                node_id = self.state.node_id,
+                "election failed, reverting to follower"
+            );
             self.state.role = RaftRole::Follower;
         }
     }
@@ -826,12 +846,7 @@ impl RaftActor {
     fn build_append_entries(&self, peer_id: NodeId) -> RaftRpc {
         let next = self.state.next_index.get(&peer_id).copied().unwrap_or(1);
         let prev_index = next.saturating_sub(1);
-        let prev_term = self
-            .state
-            .log
-            .get(prev_index)
-            .map(|e| e.term)
-            .unwrap_or(0);
+        let prev_term = self.state.log.get(prev_index).map(|e| e.term).unwrap_or(0);
         let entries: Vec<LogEntry> = self
             .state
             .log
@@ -913,8 +928,7 @@ impl RaftActor {
 
         let vote_granted = term >= self.state.current_term
             && log_ok
-            && (self.state.voted_for.is_none()
-                || self.state.voted_for == Some(candidate_id));
+            && (self.state.voted_for.is_none() || self.state.voted_for == Some(candidate_id));
 
         if vote_granted {
             self.state.voted_for = Some(candidate_id);
@@ -976,8 +990,7 @@ impl RaftActor {
         }
 
         if leader_commit > self.state.log.commit_index {
-            self.state.log.commit_index =
-                leader_commit.min(self.state.log.last_index());
+            self.state.log.commit_index = leader_commit.min(self.state.log.last_index());
             self.state.log.last_applied = self.state.log.commit_index;
         }
 
@@ -1021,7 +1034,11 @@ impl RaftActor {
                 is_reachable: self.state.peer_reachable.get(id).copied().unwrap_or(false),
                 last_seen: {
                     let t = self.state.peer_last_seen.get(id).copied().unwrap_or(0);
-                    if t == 0 { None } else { Some(t) }
+                    if t == 0 {
+                        None
+                    } else {
+                        Some(t)
+                    }
                 },
             })
             .collect();
@@ -1050,7 +1067,10 @@ async fn send_rpc(addr: &str, rpc: &RaftRpc) -> Result<String, ClusterError> {
         .map_err(ClusterError::Io)?;
 
     let (reader, mut writer) = stream.into_split();
-    writer.write_all(line.as_bytes()).await.map_err(ClusterError::Io)?;
+    writer
+        .write_all(line.as_bytes())
+        .await
+        .map_err(ClusterError::Io)?;
 
     let mut buf = String::new();
     let mut reader = BufReader::new(reader);
@@ -1064,11 +1084,7 @@ async fn send_rpc(addr: &str, rpc: &RaftRpc) -> Result<String, ClusterError> {
 
 /// Handle one incoming TCP connection: read a JSON line, dispatch via channel,
 /// write back the reply.
-async fn handle_connection(
-    stream: TcpStream,
-    _peer: SocketAddr,
-    actor_tx: mpsc::Sender<ActorMsg>,
-) {
+async fn handle_connection(stream: TcpStream, _peer: SocketAddr, actor_tx: mpsc::Sender<ActorMsg>) {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
@@ -1086,9 +1102,7 @@ async fn handle_connection(
         .await;
 
     // Wait briefly for a reply and write it back.
-    if let Ok(Some(reply)) =
-        timeout(Duration::from_millis(300), reply_rx.recv()).await
-    {
+    if let Ok(Some(reply)) = timeout(Duration::from_millis(300), reply_rx.recv()).await {
         let mut out = reply;
         out.push('\n');
         let _ = writer.write_all(out.as_bytes()).await;
@@ -1268,8 +1282,12 @@ mod tests {
     #[test]
     fn test_cluster_command_serde() {
         let cmds = vec![
-            ClusterCommand::BlockIp { ip: "10.0.0.1".into() },
-            ClusterCommand::UnblockIp { ip: "10.0.0.1".into() },
+            ClusterCommand::BlockIp {
+                ip: "10.0.0.1".into(),
+            },
+            ClusterCommand::UnblockIp {
+                ip: "10.0.0.1".into(),
+            },
             ClusterCommand::UpdateSiteConfig {
                 site_id: "site-1".into(),
                 config_json: r#"{"rate_limit":100}"#.into(),
@@ -1326,7 +1344,9 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         handle
-            .propose(ClusterCommand::BlockIp { ip: "5.6.7.8".into() })
+            .propose(ClusterCommand::BlockIp {
+                ip: "5.6.7.8".into(),
+            })
             .await
             .expect("propose should succeed on leader");
 
@@ -1380,10 +1400,7 @@ mod tests {
         let cfg_3 = ClusterConfig {
             node_id: 1,
             listen_addr: "127.0.0.1:9999".into(),
-            peers: vec![
-                (2, "127.0.0.1:9503".into()),
-                (3, "127.0.0.1:9504".into()),
-            ],
+            peers: vec![(2, "127.0.0.1:9503".into()), (3, "127.0.0.1:9504".into())],
             data_dir: "/tmp/test".into(),
         };
         assert_eq!(RaftState::new(&cfg_3).quorum(), 2);
@@ -1404,7 +1421,12 @@ mod tests {
 
     #[test]
     fn test_node_role_serde() {
-        let roles = [NodeRole::Leader, NodeRole::Follower, NodeRole::Candidate, NodeRole::Learner];
+        let roles = [
+            NodeRole::Leader,
+            NodeRole::Follower,
+            NodeRole::Candidate,
+            NodeRole::Learner,
+        ];
         for role in &roles {
             let json = serde_json::to_string(role).expect("serialize");
             let back: NodeRole = serde_json::from_str(&json).expect("deserialize");

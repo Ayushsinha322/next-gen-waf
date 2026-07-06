@@ -32,9 +32,8 @@ fn double_encoded_sqli_is_detected() {
 #[test]
 fn double_encoded_xss_is_detected() {
     let eng = load_crs_engine("REQUEST-941-APPLICATION-ATTACK-XSS.conf");
-    let mut ctx = make_get_ctx(
-        "http://example.com/?q=%253Cscript%253Ealert(1)%253C%252Fscript%253E",
-    );
+    let mut ctx =
+        make_get_ctx("http://example.com/?q=%253Cscript%253Ealert(1)%253C%252Fscript%253E");
     set_paranoia(&mut ctx, 2);
     eval(&eng, &mut ctx, Phase::RequestBody);
     assert_score(&ctx, 5, "double-encoded XSS should be detected");
@@ -160,7 +159,8 @@ fn newline_in_sqli_payload() {
 #[test]
 fn inline_comment_sqli_is_detected() {
     let eng = load_crs_engine("REQUEST-942-APPLICATION-ATTACK-SQLI.conf");
-    let mut ctx = make_get_ctx("http://example.com/?id=1%20UNION%20SEL/**/ECT%20*%20FROM%20users--");
+    let mut ctx =
+        make_get_ctx("http://example.com/?id=1%20UNION%20SEL/**/ECT%20*%20FROM%20users--");
     set_paranoia(&mut ctx, 2);
     eval(&eng, &mut ctx, Phase::RequestBody);
     assert_score(&ctx, 5, "inline-comment SQLi should be detected");
@@ -169,7 +169,8 @@ fn inline_comment_sqli_is_detected() {
 #[test]
 fn repeated_inline_comments_in_sqli() {
     let eng = load_crs_engine("REQUEST-942-APPLICATION-ATTACK-SQLI.conf");
-    let mut ctx = make_get_ctx("http://example.com/?id=1%20UN/**/ION/**/SE/**/LECT%20*%20FROM%20users");
+    let mut ctx =
+        make_get_ctx("http://example.com/?id=1%20UN/**/ION/**/SE/**/LECT%20*%20FROM%20users");
     set_paranoia(&mut ctx, 2);
     eval(&eng, &mut ctx, Phase::RequestBody);
     assert_score(&ctx, 5, "multi-inline-comment SQLi should be detected");
@@ -198,7 +199,10 @@ fn content_length_and_transfer_encoding_both_present_is_rejected() {
     headers.insert("Content-Length", "5".parse().unwrap());
     headers.insert("Transfer-Encoding", "chunked".parse().unwrap());
     let verdict = sentinel_modules::detect_smuggling(&headers);
-    assert!(matches!(verdict, SmugglingVerdict::Reject { .. }), "CL.TE conflict must be rejected");
+    assert!(
+        matches!(verdict, SmugglingVerdict::Reject { .. }),
+        "CL.TE conflict must be rejected"
+    );
 }
 
 #[test]
@@ -206,7 +210,10 @@ fn transfer_encoding_with_obfuscated_chunked_is_rejected() {
     let mut headers = http::HeaderMap::new();
     headers.insert("Transfer-Encoding", "xchunked".parse().unwrap());
     let verdict = sentinel_modules::detect_smuggling(&headers);
-    assert!(matches!(verdict, SmugglingVerdict::Reject { .. }), "obfuscated TE must be rejected");
+    assert!(
+        matches!(verdict, SmugglingVerdict::Reject { .. }),
+        "obfuscated TE must be rejected"
+    );
 }
 
 #[test]
@@ -214,7 +221,10 @@ fn transfer_encoding_with_multiple_values_is_rejected() {
     let mut headers = http::HeaderMap::new();
     headers.insert("Transfer-Encoding", "chunked, identity".parse().unwrap());
     let verdict = sentinel_modules::detect_smuggling(&headers);
-    assert!(matches!(verdict, SmugglingVerdict::Reject { .. }), "multiple TE tokens must be rejected");
+    assert!(
+        matches!(verdict, SmugglingVerdict::Reject { .. }),
+        "multiple TE tokens must be rejected"
+    );
 }
 
 #[test]
@@ -232,7 +242,10 @@ fn duplicate_transfer_encoding_headers_are_rejected() {
     headers.append("Transfer-Encoding", "chunked".parse().unwrap());
     headers.append("Transfer-encoding", "identity".parse().unwrap());
     let verdict = sentinel_modules::detect_smuggling(&headers);
-    assert!(matches!(verdict, SmugglingVerdict::Reject { .. }), "duplicate TE headers must be rejected");
+    assert!(
+        matches!(verdict, SmugglingVerdict::Reject { .. }),
+        "duplicate TE headers must be rejected"
+    );
 }
 
 #[test]
@@ -240,7 +253,10 @@ fn content_length_with_leading_plus_is_rejected() {
     let mut headers = http::HeaderMap::new();
     headers.insert("Content-Length", "+10".parse().unwrap());
     let verdict = sentinel_modules::detect_smuggling(&headers);
-    assert!(matches!(verdict, SmugglingVerdict::Reject { .. }), "CL with leading + must be rejected");
+    assert!(
+        matches!(verdict, SmugglingVerdict::Reject { .. }),
+        "CL with leading + must be rejected"
+    );
 }
 
 #[test]
@@ -249,7 +265,10 @@ fn multiple_content_length_headers_are_rejected() {
     headers.append("Content-Length", "10".parse().unwrap());
     headers.append("Content-Length", "0".parse().unwrap());
     let verdict = sentinel_modules::detect_smuggling(&headers);
-    assert!(matches!(verdict, SmugglingVerdict::Reject { .. }), "multiple CL headers must be rejected");
+    assert!(
+        matches!(verdict, SmugglingVerdict::Reject { .. }),
+        "multiple CL headers must be rejected"
+    );
 }
 
 #[test]
@@ -274,7 +293,8 @@ fn clean_request_passes_smuggling_detection() {
 #[test]
 fn double_encoded_path_traversal_detected() {
     let eng = load_crs_engine("REQUEST-930-APPLICATION-ATTACK-LFI.conf");
-    let mut ctx = make_get_ctx("http://example.com/?file=%252e%252e%252f%252e%252e%252fetc%252fpasswd");
+    let mut ctx =
+        make_get_ctx("http://example.com/?file=%252e%252e%252f%252e%252e%252fetc%252fpasswd");
     set_paranoia(&mut ctx, 2);
     eval(&eng, &mut ctx, Phase::RequestBody);
     assert_score(&ctx, 5, "double-encoded path traversal should be detected");

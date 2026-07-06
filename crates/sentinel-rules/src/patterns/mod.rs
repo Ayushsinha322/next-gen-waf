@@ -59,9 +59,7 @@ impl PatternRegistry {
                 .build(words)
                 .map_err(|e| anyhow::anyhow!("AhoCorasick build: {}", e))?,
         );
-        self.ac_cache
-            .write()
-            .insert(key, Arc::clone(&ac));
+        self.ac_cache.write().insert(key, Arc::clone(&ac));
         debug!(words = words.len(), "built new AC automaton");
         Ok(ac)
     }

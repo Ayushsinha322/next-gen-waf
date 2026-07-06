@@ -137,7 +137,11 @@ fn parse_action_token(token: &str, out: &mut CrsActions) {
     }
     // phase:N
     if let Some(rest) = token.strip_prefix("phase:") {
-        out.phase = rest.trim().parse::<u8>().ok().and_then(RulePhase::from_modsec);
+        out.phase = rest
+            .trim()
+            .parse::<u8>()
+            .ok()
+            .and_then(RulePhase::from_modsec);
         return;
     }
     // msg:'...' or msg:"..."
@@ -192,9 +196,18 @@ fn parse_action_token(token: &str, out: &mut CrsActions) {
 
     // Simple action keywords
     match token.to_ascii_lowercase().as_str() {
-        "block" | "deny" => { out.action = CrsAction::Block; out.primary_action_set = true; }
-        "pass" => { out.action = CrsAction::Pass; out.primary_action_set = true; }
-        "allow" => { out.action = CrsAction::Allow; out.primary_action_set = true; }
+        "block" | "deny" => {
+            out.action = CrsAction::Block;
+            out.primary_action_set = true;
+        }
+        "pass" => {
+            out.action = CrsAction::Pass;
+            out.primary_action_set = true;
+        }
+        "allow" => {
+            out.action = CrsAction::Allow;
+            out.primary_action_set = true;
+        }
         // `log`/`nolog` are logging modifiers in CRS, NOT the primary action.
         // "block,log" → primary=block; "log" alone → Log (no primary set).
         "log" => {
@@ -222,7 +235,9 @@ fn parse_action_token(token: &str, out: &mut CrsActions) {
         "t:base64decode" => out.transforms.push(Transform::Base64Decode),
         "t:hexdecode" => out.transforms.push(Transform::HexDecode),
         "t:normalisepath" | "t:normalizepath" => out.transforms.push(Transform::NormalisePath),
-        "t:normalisepathwin" | "t:normalizepathwin" => out.transforms.push(Transform::NormalisePathWin),
+        "t:normalisepathwin" | "t:normalizepathwin" => {
+            out.transforms.push(Transform::NormalisePathWin)
+        }
         "t:trim" => out.transforms.push(Transform::Trim),
         "t:trimleft" => out.transforms.push(Transform::TrimLeft),
         "t:trimright" => out.transforms.push(Transform::TrimRight),
@@ -313,9 +328,7 @@ fn parse_crs_severity(s: &str) -> Option<RuleSeverity> {
 
 /// Strip single or double quotes from a value.
 fn unquote(s: &str) -> String {
-    if (s.starts_with('\'') && s.ends_with('\''))
-        || (s.starts_with('"') && s.ends_with('"'))
-    {
+    if (s.starts_with('\'') && s.ends_with('\'')) || (s.starts_with('"') && s.ends_with('"')) {
         s[1..s.len() - 1].to_owned()
     } else {
         s.to_owned()
@@ -358,8 +371,7 @@ mod tests {
 
     #[test]
     fn test_parse_crs_actions_setvar() {
-        let actions =
-            parse_crs_actions("id:942100,phase:2,pass,setvar:tx.anomaly_score=+5");
+        let actions = parse_crs_actions("id:942100,phase:2,pass,setvar:tx.anomaly_score=+5");
         assert_eq!(actions.score_delta, Some(5));
     }
 }

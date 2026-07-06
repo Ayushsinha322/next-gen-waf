@@ -58,7 +58,9 @@ impl From<&Target> for TargetSpec {
             Target::RemoteAddr => TargetSpec::RemoteAddr,
             Target::Geo => TargetSpec::Geo,
             Target::TxVar(v) => TargetSpec::TxVar(v.clone()),
-            Target::CountOf(inner) => TargetSpec::CountOf(Box::new(TargetSpec::from(inner.as_ref()))),
+            Target::CountOf(inner) => {
+                TargetSpec::CountOf(Box::new(TargetSpec::from(inner.as_ref())))
+            }
         }
     }
 }
@@ -77,13 +79,19 @@ pub enum Instruction {
     LoadTarget(TargetSpec),
 
     /// Pop `StrVec`, apply regex `patterns[pattern_id]`, push `Bool(any_match)`.
-    MatchRx { pattern_id: usize },
+    MatchRx {
+        pattern_id: usize,
+    },
 
     /// Pop `StrVec`, apply Aho-Corasick set `ac_sets[set_id]`, push `Bool(any_match)`.
-    MatchMulti { set_id: usize },
+    MatchMulti {
+        set_id: usize,
+    },
 
     /// Pop `StrVec`, check any == `literals[literal_id]`, push `Bool`.
-    MatchEq { literal_id: usize },
+    MatchEq {
+        literal_id: usize,
+    },
 
     /// Pop `StrVec`, push `Bool(!values.is_empty() && values.iter().any(|s| !s.is_empty()))`.
     Exists,
@@ -106,13 +114,19 @@ pub enum Instruction {
 
     /// Pop `Int` or `Float`, compare >= threshold, push `Bool`.
     /// Threshold is stored as f64 so it works for both anomaly scores and ML probabilities.
-    CmpGe { threshold: f64 },
+    CmpGe {
+        threshold: f64,
+    },
 
     /// Push the ML score for model `ml_models[model_id]` as `Float`.
-    MlScore { model_id: usize },
+    MlScore {
+        model_id: usize,
+    },
 
     /// Push a `Bool` for whether the rate limit `window_id` is exceeded (host call).
-    RateCheck { window_id: usize },
+    RateCheck {
+        window_id: usize,
+    },
 
     // --- Boolean combinators ---
     And,
@@ -122,15 +136,22 @@ pub enum Instruction {
     /// Pop `StrVec`, apply each transform in order, push transformed `StrVec`.
     /// When `multi_match` is `true`, also push results after each intermediate
     /// transform prefix so the subsequent operator can match at any step.
-    ApplyTransforms { transforms: Vec<Transform>, multi_match: bool },
+    ApplyTransforms {
+        transforms: Vec<Transform>,
+        multi_match: bool,
+    },
 
     /// Jump `offset` instructions forward if stack top is Bool(false).
     /// Does NOT pop the stack.
-    JmpIfFalse { offset: i32 },
+    JmpIfFalse {
+        offset: i32,
+    },
 
     /// Pop Bool from stack.  If true, apply the rule's action/score/log.
     /// The rule metadata is looked up by `rule_id` in `CompiledRuleSet::rule_meta`.
-    RuleEnd { rule_id: u32 },
+    RuleEnd {
+        rule_id: u32,
+    },
 
     /// Named label emitted for each `SecMarker` directive.
     /// Acts as a no-op at runtime; `skipAfter` rules jump to the first

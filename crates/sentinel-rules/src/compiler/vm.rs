@@ -81,11 +81,13 @@ fn url_decode_uni(s: &str) -> String {
                 }
             }
             // Standard %XX — delegate to percent_encoding for the remainder.
-            out.push_str(&percent_encoding::percent_decode_str(&s[i..])
-                .decode_utf8_lossy()
-                .chars()
-                .take(1)
-                .collect::<String>());
+            out.push_str(
+                &percent_encoding::percent_decode_str(&s[i..])
+                    .decode_utf8_lossy()
+                    .chars()
+                    .take(1)
+                    .collect::<String>(),
+            );
             // Advance past `%XX` (3 bytes if valid, 1 byte if not).
             if i + 2 < bytes.len()
                 && bytes[i + 1].is_ascii_hexdigit()
@@ -149,7 +151,10 @@ fn contains_off_domain_url(value: &str, request_host: &str) -> bool {
             .rev()
             .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
             .collect();
-        let scheme_ok = scheme.chars().next().is_some_and(|c| c.is_ascii_alphabetic());
+        let scheme_ok = scheme
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic());
 
         let after = &search[pos + 3..];
         // Authority ends at the first path/query/fragment delimiter.
@@ -169,8 +174,7 @@ fn contains_off_domain_url(value: &str, request_host: &str) -> bool {
                 return true; // no own host → any absolute URL is off-domain
             }
             // On-domain iff host == own host, or host is a subdomain of it.
-            let on_domain =
-                host == request_host || host.ends_with(&format!(".{request_host}"));
+            let on_domain = host == request_host || host.ends_with(&format!(".{request_host}"));
             if !on_domain {
                 return true;
             }
@@ -271,8 +275,7 @@ fn multipart_boundary(ctx: &RequestContext) -> Option<String> {
 /// raw body is still reachable via `REQUEST_BODY` rules).
 fn multipart_parts(ctx: &RequestContext) -> MultipartParts {
     let mut out = MultipartParts::default();
-    let (Some(body), Some(boundary)) = (ctx.request_body.as_ref(), multipart_boundary(ctx))
-    else {
+    let (Some(body), Some(boundary)) = (ctx.request_body.as_ref(), multipart_boundary(ctx)) else {
         return out;
     };
     let body: &[u8] = body;
@@ -361,8 +364,7 @@ fn disposition_param(line: &str, key: &str) -> Option<String> {
     loop {
         let rel = lower[idx..].find(&needle)?;
         let at = idx + rel;
-        let on_boundary =
-            at == 0 || matches!(lower.as_bytes()[at - 1], b';' | b' ' | b'\t');
+        let on_boundary = at == 0 || matches!(lower.as_bytes()[at - 1], b';' | b' ' | b'\t');
         if on_boundary {
             let rest = &line[at + needle.len()..];
             let val = if let Some(stripped) = rest.strip_prefix('"') {
@@ -434,16 +436,14 @@ fn extract_target(spec: &TargetSpec, ctx: &RequestContext) -> Vec<String> {
         TargetSpec::RequestUri => vec![ctx.uri.to_string()],
         TargetSpec::RequestFilename => vec![ctx.uri.path().to_owned()],
         TargetSpec::RequestMethod => vec![ctx.method.as_str().to_owned()],
-        TargetSpec::RequestLine => vec![format!(
-            "{} {} {:?}",
-            ctx.method, ctx.uri, ctx.http_version
-        )],
-        TargetSpec::RequestBody => {
-            ctx.request_body
-                .as_ref()
-                .map(|b| vec![String::from_utf8_lossy(b).into_owned()])
-                .unwrap_or_default()
+        TargetSpec::RequestLine => {
+            vec![format!("{} {} {:?}", ctx.method, ctx.uri, ctx.http_version)]
         }
+        TargetSpec::RequestBody => ctx
+            .request_body
+            .as_ref()
+            .map(|b| vec![String::from_utf8_lossy(b).into_owned()])
+            .unwrap_or_default(),
         TargetSpec::RequestHeadersAll => ctx
             .request_headers
             .values()
@@ -656,13 +656,17 @@ pub fn evaluate(
                 stack.push(StackVal::Bool(false));
             }
 
-            Instruction::ApplyTransforms { transforms, multi_match } => {
+            Instruction::ApplyTransforms {
+                transforms,
+                multi_match,
+            } => {
                 let values = pop_strings(&mut stack);
                 if *multi_match && !transforms.is_empty() {
                     // multiMatch: collect the original values plus the result
                     // after each cumulative transform prefix so the subsequent
                     // operator can match at any intermediate step.
-                    let mut all: Vec<String> = Vec::with_capacity(values.len() * (transforms.len() + 1));
+                    let mut all: Vec<String> =
+                        Vec::with_capacity(values.len() * (transforms.len() + 1));
                     for v in &values {
                         let mut s = v.clone();
                         all.push(s.clone()); // original
@@ -713,16 +717,14 @@ pub fn evaluate(
                 stack.push(StackVal::Bool(a || b));
             }
 
-            Instruction::Not => {
-                match stack.pop() {
-                    Some(StackVal::Absent) => stack.push(StackVal::Bool(false)),
-                    Some(StackVal::Bool(b)) => stack.push(StackVal::Bool(!b)),
-                    other => {
-                        warn!("VM: Not: unexpected stack value {:?}", other);
-                        stack.push(StackVal::Bool(false));
-                    }
+            Instruction::Not => match stack.pop() {
+                Some(StackVal::Absent) => stack.push(StackVal::Bool(false)),
+                Some(StackVal::Bool(b)) => stack.push(StackVal::Bool(!b)),
+                other => {
+                    warn!("VM: Not: unexpected stack value {:?}", other);
+                    stack.push(StackVal::Bool(false));
                 }
-            }
+            },
 
             Instruction::JmpIfFalse { offset } => {
                 if let Some(StackVal::Bool(false)) = stack.last() {
@@ -742,13 +744,18 @@ pub fn evaluate(
                         if let Some(marker) = &meta.skip_after {
                             let search_from = ip + 1;
                             if let Some(rel) = program[search_from..].iter().position(|instr| {
-                                if let Instruction::Marker(m) = instr { m == marker } else { false }
+                                if let Instruction::Marker(m) = instr {
+                                    m == marker
+                                } else {
+                                    false
+                                }
                             }) {
                                 ip = search_from + rel;
                             }
                         }
                         // Short-circuit: if anomaly score exceeds threshold, block immediately.
-                        if anomaly_threshold > 0 && ctx.anomaly_score >= anomaly_threshold
+                        if anomaly_threshold > 0
+                            && ctx.anomaly_score >= anomaly_threshold
                             && ctx.decision == WafDecision::Allow
                         {
                             ctx.decision = WafDecision::Block;
@@ -847,34 +854,37 @@ fn apply_transforms(mut s: String, transforms: &[Transform]) -> String {
 /// the multiMatch loop in the VM.
 fn apply_single_transform(s: String, t: &Transform) -> String {
     match t {
-        Transform::Lowercase          => s.to_ascii_lowercase(),
-        Transform::UrlDecodeUni       => url_decode_uni(&s),
-        Transform::RemoveNulls        => s.replace('\0', ""),
-        Transform::ReplaceNulls       => s.replace('\0', " "),
-        Transform::HtmlEntityDecode   => decode_html_entities(s),
-        Transform::RemoveWhitespace   => s.chars().filter(|c| !c.is_ascii_whitespace()).collect(),
+        Transform::Lowercase => s.to_ascii_lowercase(),
+        Transform::UrlDecodeUni => url_decode_uni(&s),
+        Transform::RemoveNulls => s.replace('\0', ""),
+        Transform::ReplaceNulls => s.replace('\0', " "),
+        Transform::HtmlEntityDecode => decode_html_entities(s),
+        Transform::RemoveWhitespace => s.chars().filter(|c| !c.is_ascii_whitespace()).collect(),
         Transform::CompressWhitespace => compress_whitespace(s),
-        Transform::JsDecode           => decode_js_escapes(s),
-        Transform::CssDecode          => decode_css_escapes(s),
-        Transform::Base64Decode       => base64_decode_transform(&s),
-        Transform::HexDecode          => hex_decode_transform(&s),
-        Transform::NormalisePath      => normalise_path_transform(s.replace('\\', "/")),
-        Transform::NormalisePathWin   => normalise_path_transform(s.replace('\\', "/")),
-        Transform::Trim               => s.trim().to_owned(),
-        Transform::TrimLeft           => s.trim_start().to_owned(),
-        Transform::TrimRight          => s.trim_end().to_owned(),
+        Transform::JsDecode => decode_js_escapes(s),
+        Transform::CssDecode => decode_css_escapes(s),
+        Transform::Base64Decode => base64_decode_transform(&s),
+        Transform::HexDecode => hex_decode_transform(&s),
+        Transform::NormalisePath => normalise_path_transform(s.replace('\\', "/")),
+        Transform::NormalisePathWin => normalise_path_transform(s.replace('\\', "/")),
+        Transform::Trim => s.trim().to_owned(),
+        Transform::TrimLeft => s.trim_start().to_owned(),
+        Transform::TrimRight => s.trim_end().to_owned(),
         // UTF-8 to Unicode — replace non-ASCII bytes with \uXXXX (basic ASCII pass-through)
-        Transform::Utf8ToUnicode      => s.chars().flat_map(|c| {
-            if c.is_ascii() {
-                vec![c]
-            } else {
-                format!("\\u{:04X}", c as u32).chars().collect::<Vec<_>>()
-            }
-        }).collect(),
+        Transform::Utf8ToUnicode => s
+            .chars()
+            .flat_map(|c| {
+                if c.is_ascii() {
+                    vec![c]
+                } else {
+                    format!("\\u{:04X}", c as u32).chars().collect::<Vec<_>>()
+                }
+            })
+            .collect(),
         // Comment removal — strip /* ... */ style C comments
         Transform::RemoveCommentsChar => remove_comments_char(s),
-        Transform::RemoveComments     => remove_sql_comments(s),
-        Transform::ReplaceComments    => replace_sql_comments(s),
+        Transform::RemoveComments => remove_sql_comments(s),
+        Transform::ReplaceComments => replace_sql_comments(s),
     }
 }
 
@@ -956,10 +966,22 @@ fn decode_js_escapes(s: String) -> String {
                 out.push('x');
                 out.push_str(&hex);
             }
-            Some('n') => { chars.next(); out.push('\n'); }
-            Some('r') => { chars.next(); out.push('\r'); }
-            Some('t') => { chars.next(); out.push('\t'); }
-            Some('\\') => { chars.next(); out.push('\\'); }
+            Some('n') => {
+                chars.next();
+                out.push('\n');
+            }
+            Some('r') => {
+                chars.next();
+                out.push('\r');
+            }
+            Some('t') => {
+                chars.next();
+                out.push('\t');
+            }
+            Some('\\') => {
+                chars.next();
+                out.push('\\');
+            }
             _ => out.push('\\'),
         }
     }
@@ -985,7 +1007,10 @@ fn decode_css_escapes(s: String) -> String {
         let mut hex = String::new();
         while hex.len() < 6 {
             match chars.peek() {
-                Some(&h) if h.is_ascii_hexdigit() => { hex.push(h); chars.next(); }
+                Some(&h) if h.is_ascii_hexdigit() => {
+                    hex.push(h);
+                    chars.next();
+                }
                 _ => break,
             }
         }
@@ -1041,13 +1066,29 @@ fn base64_decode_transform(s: &str) -> String {
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len() * 3 / 4);
     let mut i = 0;
     while i + 3 < bytes.len() {
-        let b0 = match decode(bytes[i]) { Some(v) => v, None => return s.to_owned() };
-        let b1 = match decode(bytes[i + 1]) { Some(v) => v, None => return s.to_owned() };
-        let b2 = match decode(bytes[i + 2]) { Some(v) => v, None => return s.to_owned() };
-        let b3 = match decode(bytes[i + 3]) { Some(v) => v, None => return s.to_owned() };
+        let b0 = match decode(bytes[i]) {
+            Some(v) => v,
+            None => return s.to_owned(),
+        };
+        let b1 = match decode(bytes[i + 1]) {
+            Some(v) => v,
+            None => return s.to_owned(),
+        };
+        let b2 = match decode(bytes[i + 2]) {
+            Some(v) => v,
+            None => return s.to_owned(),
+        };
+        let b3 = match decode(bytes[i + 3]) {
+            Some(v) => v,
+            None => return s.to_owned(),
+        };
         out.push((b0 << 2) | (b1 >> 4));
-        if bytes[i + 2] != b'=' { out.push((b1 << 4) | (b2 >> 2)); }
-        if bytes[i + 3] != b'=' { out.push((b2 << 6) | b3); }
+        if bytes[i + 2] != b'=' {
+            out.push((b1 << 4) | (b2 >> 2));
+        }
+        if bytes[i + 3] != b'=' {
+            out.push((b2 << 6) | b3);
+        }
         i += 4;
     }
     String::from_utf8(out).unwrap_or_else(|_| s.to_owned())
@@ -1056,7 +1097,11 @@ fn base64_decode_transform(s: &str) -> String {
 /// Decode a hex-encoded string (optional `0x`/`0X` prefix; even-length hex bytes).
 /// Returns original on error or invalid input.
 fn hex_decode_transform(s: &str) -> String {
-    let hex = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s).trim();
+    let hex = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s)
+        .trim();
     if hex.is_empty() || hex.len() % 2 != 0 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
         return s.to_owned();
     }
@@ -1079,12 +1124,16 @@ fn normalise_path_transform(s: String) -> String {
     for seg in s.split('/') {
         match seg {
             "" | "." => {}
-            ".." => { parts.pop(); }
+            ".." => {
+                parts.pop();
+            }
             other => parts.push(other),
         }
     }
     let mut out = parts.join("/");
-    if leading { out.insert(0, '/'); }
+    if leading {
+        out.insert(0, '/');
+    }
     out
 }
 
@@ -1096,7 +1145,10 @@ fn remove_comments_char(s: String) -> String {
 /// Remove SQL/C block comments (`/* ... */`) from input.
 fn remove_sql_comments(mut s: String) -> String {
     loop {
-        let start = match s.find("/*") { Some(i) => i, None => break };
+        let start = match s.find("/*") {
+            Some(i) => i,
+            None => break,
+        };
         let end = match s[start + 2..].find("*/") {
             Some(i) => start + 2 + i + 2,
             None => break,
@@ -1109,7 +1161,10 @@ fn remove_sql_comments(mut s: String) -> String {
 /// Replace SQL/C block comments with a single space.
 fn replace_sql_comments(mut s: String) -> String {
     loop {
-        let start = match s.find("/*") { Some(i) => i, None => break };
+        let start = match s.find("/*") {
+            Some(i) => i,
+            None => break,
+        };
         let end = match s[start + 2..].find("*/") {
             Some(i) => start + 2 + i + 2,
             None => break,
@@ -1158,10 +1213,7 @@ fn pop_numeric_f64(stack: &mut Vec<StackVal>) -> f64 {
         Some(StackVal::Float(v)) => v as f64,
         // TX variables are stored as strings; parse numerically when compared.
         // This makes @lt / @ge work against TX:DETECTION_PARANOIA_LEVEL etc.
-        Some(StackVal::Strings(v)) => v
-            .first()
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(0.0),
+        Some(StackVal::Strings(v)) => v.first().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0),
         Some(other) => {
             warn!("VM: expected numeric on stack, got {:?}", other);
             0.0

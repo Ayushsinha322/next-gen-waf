@@ -13,24 +13,19 @@
 //! ));
 //! ```
 
+pub mod audit;
 pub mod logs;
 pub mod metrics;
 pub mod traces;
-pub mod audit;
 
-pub use logs::{
-    AccessEvent, AuditEvent, ErrorEvent, EventLogger, MlEvent, ModsecEvent, WafEvent,
-};
+pub use logs::{AccessEvent, AuditEvent, ErrorEvent, EventLogger, MlEvent, ModsecEvent, WafEvent};
 
 pub use metrics::{
-    Counter, Gauge, Histogram, MetricsRegistry, MetricsSnapshot, MetricLine,
-    inc_requests, inc_blocked, observe_duration, set_active_connections,
-    inc_rule_hits, inc_ebpf_drops, prometheus_text, snapshot,
+    inc_blocked, inc_ebpf_drops, inc_requests, inc_rule_hits, observe_duration, prometheus_text,
+    set_active_connections, snapshot, Counter, Gauge, Histogram, MetricLine, MetricsRegistry,
+    MetricsSnapshot,
 };
 
-pub use traces::{
-    TraceId, SpanId, Span, Tracer, TRACER,
-    start_span, start_child_span,
-};
+pub use traces::{start_child_span, start_span, Span, SpanId, TraceId, Tracer, TRACER};
 
 pub use audit::{AuditEntry, AuditLogger};

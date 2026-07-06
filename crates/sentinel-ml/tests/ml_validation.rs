@@ -103,7 +103,10 @@ fn classifier_meets_accuracy_targets_on_holdout() {
 
     println!("\n=== Payload Classifier — held-out validation ===");
     println!("train size: {}   test size: {}", train_x.len(), test.len());
-    println!("confusion: TP={} TN={} FP={} FN={}", m.tp, m.tn, m.fp, m.fn_);
+    println!(
+        "confusion: TP={} TN={} FP={} FN={}",
+        m.tp, m.tn, m.fp, m.fn_
+    );
     println!("precision : {:.3}", m.precision());
     println!("recall    : {:.3}  (attack detection rate)", m.recall());
     println!("FPR       : {:.3}  (benign wrongly flagged)", m.fpr());

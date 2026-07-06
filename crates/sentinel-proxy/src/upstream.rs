@@ -120,7 +120,8 @@ impl ServerHealth {
         let failures = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
         if failures >= CIRCUIT_OPEN_THRESHOLD {
             self.healthy.store(false, Ordering::Relaxed);
-            self.circuit_opened_at.store(unix_now_secs() as usize, Ordering::Relaxed);
+            self.circuit_opened_at
+                .store(unix_now_secs() as usize, Ordering::Relaxed);
             warn!(
                 host = %self.server.host,
                 port = self.server.port,
@@ -144,7 +145,10 @@ pub(crate) struct SiteUpstream {
 impl SiteUpstream {
     fn new(servers: Vec<UpstreamServer>, strategy: LoadBalancerStrategy) -> Self {
         Self {
-            servers: servers.into_iter().map(|s| Arc::new(ServerHealth::new(s))).collect(),
+            servers: servers
+                .into_iter()
+                .map(|s| Arc::new(ServerHealth::new(s)))
+                .collect(),
             cursor: AtomicUsize::new(0),
             strategy,
         }
@@ -297,7 +301,11 @@ impl UpstreamPool {
 
     /// Select a server using the configured LB strategy and an optional client
     /// IP (used for IpHash session affinity).
-    pub fn select_server(&self, site_id: &str, client_ip: Option<IpAddr>) -> Option<UpstreamServer> {
+    pub fn select_server(
+        &self,
+        site_id: &str,
+        client_ip: Option<IpAddr>,
+    ) -> Option<UpstreamServer> {
         self.sites
             .get(site_id)?
             .select(client_ip)
@@ -341,13 +349,12 @@ impl UpstreamPool {
     ) -> anyhow::Result<http::Response<hyper::body::Incoming>> {
         // Locate the ServerHealth for this specific server so we can track
         // active connections and circuit-breaker state.
-        let srv_health: Option<Arc<ServerHealth>> =
-            self.sites.get(site_id).and_then(|site| {
-                site.servers
-                    .iter()
-                    .find(|h| h.server.host == server_host && h.server.port == server_port)
-                    .cloned()
-            });
+        let srv_health: Option<Arc<ServerHealth>> = self.sites.get(site_id).and_then(|site| {
+            site.servers
+                .iter()
+                .find(|h| h.server.host == server_host && h.server.port == server_port)
+                .cloned()
+        });
 
         if let Some(ref h) = srv_health {
             h.active_conns.fetch_add(1, Ordering::Relaxed);
@@ -406,9 +413,7 @@ impl UpstreamPool {
 
                 Arc::new(SiteUpstream {
                     servers: new_servers,
-                    cursor: AtomicUsize::new(
-                        existing.cursor.load(Ordering::Relaxed),
-                    ),
+                    cursor: AtomicUsize::new(existing.cursor.load(Ordering::Relaxed)),
                     strategy,
                 })
             } else {
@@ -453,8 +458,7 @@ impl UpstreamPool {
             let mut sd = shutdown.clone();
 
             tokio::spawn(async move {
-                let mut ticker =
-                    tokio::time::interval(Duration::from_secs(interval_secs));
+                let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
                 loop {

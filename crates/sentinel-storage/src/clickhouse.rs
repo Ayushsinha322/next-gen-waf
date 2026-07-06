@@ -429,8 +429,7 @@ mod tests {
     use super::*;
 
     fn ch_url() -> String {
-        std::env::var("CLICKHOUSE_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:8123".to_string())
+        std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://127.0.0.1:8123".to_string())
     }
 
     // Authenticated client for live tests. Creds default to the dev compose
@@ -493,9 +492,27 @@ mod tests {
             .as_secs() as i64;
 
         let rows = vec![
-            TrafficRow { ts: now - 5, site_id: "s1".into(), reqs: 10, blocked: 1, p99_ms: 2.0 },
-            TrafficRow { ts: now - 4, site_id: "s1".into(), reqs: 20, blocked: 0, p99_ms: 1.5 },
-            TrafficRow { ts: now - 3, site_id: "s1".into(), reqs: 15, blocked: 2, p99_ms: 3.1 },
+            TrafficRow {
+                ts: now - 5,
+                site_id: "s1".into(),
+                reqs: 10,
+                blocked: 1,
+                p99_ms: 2.0,
+            },
+            TrafficRow {
+                ts: now - 4,
+                site_id: "s1".into(),
+                reqs: 20,
+                blocked: 0,
+                p99_ms: 1.5,
+            },
+            TrafficRow {
+                ts: now - 3,
+                site_id: "s1".into(),
+                reqs: 15,
+                blocked: 2,
+                p99_ms: 3.1,
+            },
         ];
 
         c.insert_traffic_batch(&rows).await.unwrap();
@@ -525,8 +542,11 @@ mod tests {
             .query_events("TESTSITE.example", "", "", now - 10, now + 10, 50)
             .await
             .unwrap();
-        assert!(out.iter().any(|e| e.rule == "942100" && e.site == "TESTSITE.example"),
-            "inserted event not found: {out:?}");
+        assert!(
+            out.iter()
+                .any(|e| e.rule == "942100" && e.site == "TESTSITE.example"),
+            "inserted event not found: {out:?}"
+        );
     }
 
     fn sentinel_event_fixture(ts: i64, site: &str, rule: &str) -> WafEventRow {

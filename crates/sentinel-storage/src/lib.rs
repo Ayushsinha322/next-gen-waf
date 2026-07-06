@@ -194,7 +194,8 @@ impl StorageHandle {
         if let Some(url) = &cfg.clickhouse_url {
             let db = cfg.clickhouse_db.as_deref().unwrap_or("sentinel_logs");
             let client = ClickHouseClient::with_auth(
-                url, db,
+                url,
+                db,
                 cfg.clickhouse_user.clone(),
                 cfg.clickhouse_password.clone(),
             );
@@ -310,17 +311,18 @@ mod tests {
     #[test]
     fn env_overrides_apply_over_file_config() {
         // File config had no ClickHouse; env (compose/K8s Secret) supplies it.
-        let cfg = StorageBackendConfig::default().apply_overrides(|k| {
-            match k {
-                "SENTINEL_CLICKHOUSE_URL" => Some("http://clickhouse:8123".to_string()),
-                "SENTINEL_CLICKHOUSE_DB" => Some("sentinel_logs".to_string()),
-                "SENTINEL_CLICKHOUSE_USER" => Some("sentinel".to_string()),
-                "SENTINEL_CLICKHOUSE_PASSWORD" => Some("s3cr3t".to_string()),
-                "SENTINEL_REDIS_URL" => Some("redis://redis:6379".to_string()),
-                _ => None,
-            }
+        let cfg = StorageBackendConfig::default().apply_overrides(|k| match k {
+            "SENTINEL_CLICKHOUSE_URL" => Some("http://clickhouse:8123".to_string()),
+            "SENTINEL_CLICKHOUSE_DB" => Some("sentinel_logs".to_string()),
+            "SENTINEL_CLICKHOUSE_USER" => Some("sentinel".to_string()),
+            "SENTINEL_CLICKHOUSE_PASSWORD" => Some("s3cr3t".to_string()),
+            "SENTINEL_REDIS_URL" => Some("redis://redis:6379".to_string()),
+            _ => None,
         });
-        assert_eq!(cfg.clickhouse_url.as_deref(), Some("http://clickhouse:8123"));
+        assert_eq!(
+            cfg.clickhouse_url.as_deref(),
+            Some("http://clickhouse:8123")
+        );
         assert_eq!(cfg.clickhouse_db.as_deref(), Some("sentinel_logs"));
         assert_eq!(cfg.clickhouse_user.as_deref(), Some("sentinel"));
         assert_eq!(cfg.clickhouse_password.as_deref(), Some("s3cr3t"));

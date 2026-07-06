@@ -198,12 +198,9 @@ async fn fetch_with_accept(client: &HttpsClient, url: &str, accept: &str) -> Res
                 .boxed(),
         )?;
 
-    let resp = tokio::time::timeout(
-        std::time::Duration::from_secs(60),
-        client.request(req),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("request to '{}' timed out after 60s", url))??;
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(60), client.request(req))
+        .await
+        .map_err(|_| anyhow::anyhow!("request to '{}' timed out after 60s", url))??;
 
     let status = resp.status();
     if !status.is_success() {
@@ -223,7 +220,8 @@ mod tests {
 
     #[test]
     fn parse_oci_ref_tag() {
-        let r = parse_oci_ref("oci://registry.example.com/sentinel-plugins/my-plugin:v1.2.3").unwrap();
+        let r =
+            parse_oci_ref("oci://registry.example.com/sentinel-plugins/my-plugin:v1.2.3").unwrap();
         assert_eq!(r.registry, "registry.example.com");
         assert_eq!(r.name, "sentinel-plugins/my-plugin");
         assert_eq!(r.reference, "v1.2.3");

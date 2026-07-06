@@ -55,9 +55,8 @@ impl OnnxModel {
     /// Run inference on a single feature vector (24 floats).
     /// Returns the raw output tensor as a flat `Vec<f32>`.
     pub fn predict(&self, features: &[f32; FEATURE_DIM]) -> anyhow::Result<Vec<f32>> {
-        let array =
-            ndarray::Array2::from_shape_vec((1, FEATURE_DIM), features.to_vec())
-                .map_err(|e| anyhow::anyhow!("ONNX input shape: {e}"))?;
+        let array = ndarray::Array2::from_shape_vec((1, FEATURE_DIM), features.to_vec())
+            .map_err(|e| anyhow::anyhow!("ONNX input shape: {e}"))?;
         let outputs = self
             .session
             .run(ort::inputs![self.input_name.as_str() => array.view()]?)?;

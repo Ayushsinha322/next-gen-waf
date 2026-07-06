@@ -1,11 +1,11 @@
 use nom::{
-    IResult,
     branch::alt,
     bytes::complete::{tag, tag_no_case, take_while, take_while1},
     character::complete::{char, digit1, multispace0, multispace1, space1},
     combinator::{map, map_res, opt, recognize, value},
     multi::{many0, separated_list0},
     sequence::{delimited, pair, preceded, terminated, tuple},
+    IResult,
 };
 
 use super::ast::*;
@@ -248,8 +248,14 @@ fn target_name(input: &str) -> IResult<&str, Target> {
 
 fn target_combinator(input: &str) -> IResult<&str, TargetCombinator> {
     alt((
-        value(TargetCombinator::Or, preceded(iws, preceded(char('|'), iws))),
-        value(TargetCombinator::And, preceded(iws, preceded(char('&'), iws))),
+        value(
+            TargetCombinator::Or,
+            preceded(iws, preceded(char('|'), iws)),
+        ),
+        value(
+            TargetCombinator::And,
+            preceded(iws, preceded(char('&'), iws)),
+        ),
     ))(input)
 }
 
@@ -265,12 +271,18 @@ fn target_expr_full(input: &str) -> IResult<&str, Vec<TargetExpr>> {
         match opt_comb {
             Some(comb) => {
                 let (rest2, next) = target_name(rest)?;
-                targets.push(TargetExpr { target: current, combinator: Some(comb) });
+                targets.push(TargetExpr {
+                    target: current,
+                    combinator: Some(comb),
+                });
                 current = next;
                 remaining = rest2;
             }
             None => {
-                targets.push(TargetExpr { target: current, combinator: None });
+                targets.push(TargetExpr {
+                    target: current,
+                    combinator: None,
+                });
                 break;
             }
         }
@@ -301,10 +313,7 @@ fn cmp_op(input: &str) -> IResult<&str, CmpOp> {
 fn word_list(input: &str) -> IResult<&str, Vec<String>> {
     delimited(
         pair(char('['), ws),
-        separated_list0(
-            preceded(ws, preceded(char(','), ws)),
-            quoted_string,
-        ),
+        separated_list0(preceded(ws, preceded(char(','), ws)), quoted_string),
         pair(ws, char(']')),
     )(input)
 }
@@ -328,7 +337,9 @@ fn operator_expr(input: &str) -> IResult<&str, Operator> {
         ),
         // ge N
         map(
-            map_res(preceded(pair(tag("ge"), space1), digit1), |s: &str| s.parse::<i64>()),
+            map_res(preceded(pair(tag("ge"), space1), digit1), |s: &str| {
+                s.parse::<i64>()
+            }),
             Operator::Ge,
         ),
         // exists
@@ -348,12 +359,19 @@ fn operator_expr(input: &str) -> IResult<&str, Operator> {
                 tag("ml_score"),
                 delimited(char('('), quoted_string, char(')')),
                 preceded(iws, cmp_op),
-                preceded(iws, map_res(
-                    recognize(tuple((digit1, opt(pair(char('.'), digit1))))),
-                    |s: &str| s.parse::<f32>(),
-                )),
+                preceded(
+                    iws,
+                    map_res(
+                        recognize(tuple((digit1, opt(pair(char('.'), digit1))))),
+                        |s: &str| s.parse::<f32>(),
+                    ),
+                ),
             )),
-            |(_, model, op, threshold)| Operator::MlScore { model, op, threshold },
+            |(_, model, op, threshold)| Operator::MlScore {
+                model,
+                op,
+                threshold,
+            },
         ),
         // rate_limit_exceeded(per_ip, rps=50, burst=100)
         map(
@@ -361,7 +379,11 @@ fn operator_expr(input: &str) -> IResult<&str, Operator> {
                 tag("rate_limit_exceeded("),
                 terminated(parse_rate_args, char(')')),
             ),
-            |(dimension, rps, burst)| Operator::RateLimit { dimension, rps, burst },
+            |(dimension, rps, burst)| Operator::RateLimit {
+                dimension,
+                rps,
+                burst,
+            },
         ),
         // !(operator)
         map(
@@ -413,7 +435,10 @@ fn action_expr(input: &str) -> IResult<&str, RuleAction> {
         ),
         // redirect("url")
         map(
-            preceded(pair(tag("redirect"), char('(')), terminated(quoted_string, char(')'))),
+            preceded(
+                pair(tag("redirect"), char('(')),
+                terminated(quoted_string, char(')')),
+            ),
             RuleAction::Redirect,
         ),
         // plugin_call("name", {...})
@@ -461,7 +486,8 @@ fn parse_plugin_call_args(input: &str) -> IResult<&str, (String, serde_json::Val
     }
     let json_str = &input[..end];
     let remaining = &input[end..];
-    let val = serde_json::from_str(json_str).unwrap_or(serde_json::Value::Object(Default::default()));
+    let val =
+        serde_json::from_str(json_str).unwrap_or(serde_json::Value::Object(Default::default()));
     Ok((remaining, (name, val)))
 }
 
@@ -496,10 +522,7 @@ fn severity_keyword(input: &str) -> IResult<&str, RuleSeverity> {
 fn tag_list(input: &str) -> IResult<&str, Vec<String>> {
     delimited(
         pair(char('['), ws),
-        separated_list0(
-            preceded(ws, preceded(char(','), ws)),
-            quoted_string,
-        ),
+        separated_list0(preceded(ws, preceded(char(','), ws)), quoted_string),
         pair(ws, char(']')),
     )(input)
 }
@@ -520,7 +543,8 @@ fn rule_field(input: &str) -> IResult<&str, RuleField> {
         "tag" => map(tag_list, RuleField::Tags)(input),
         "expires" => {
             // parse date literal YYYY-MM-DD
-            let (input, date) = recognize(tuple((digit1, char('-'), digit1, char('-'), digit1)))(input)?;
+            let (input, date) =
+                recognize(tuple((digit1, char('-'), digit1, char('-'), digit1)))(input)?;
             Ok((input, RuleField::Expires(date.to_owned())))
         }
         _ => Err(nom::Err::Error(nom::error::Error::new(
@@ -549,7 +573,10 @@ fn rule_def(input: &str) -> IResult<&str, RuleDef> {
     let (input, fields) = rule_body(input)?;
     let (input, _) = preceded(ws, char('}'))(input)?;
 
-    let mut def = RuleDef { id, ..Default::default() };
+    let mut def = RuleDef {
+        id,
+        ..Default::default()
+    };
     for field in fields {
         match field {
             RuleField::Phase(p) => def.phase = p,
@@ -630,10 +657,7 @@ fn directive(input: &str) -> IResult<&str, Directive> {
         map(
             preceded(
                 pair(tag("SecRequestBodyAccess"), space1),
-                alt((
-                    value(true, tag("On")),
-                    value(false, tag("Off")),
-                )),
+                alt((value(true, tag("On")), value(false, tag("Off")))),
             ),
             Directive::RequestBodyAccess,
         ),
@@ -641,10 +665,7 @@ fn directive(input: &str) -> IResult<&str, Directive> {
         map(
             preceded(
                 pair(tag("SecResponseBodyAccess"), space1),
-                alt((
-                    value(true, tag("On")),
-                    value(false, tag("Off")),
-                )),
+                alt((value(true, tag("On")), value(false, tag("Off")))),
             ),
             Directive::ResponseBodyAccess,
         ),
@@ -657,7 +678,10 @@ fn directive(input: &str) -> IResult<&str, Directive> {
         map(
             preceded(
                 pair(tag("SecMarker"), space1),
-                alt((quoted_string, map(take_while1(|c: char| !c.is_whitespace()), String::from))),
+                alt((
+                    quoted_string,
+                    map(take_while1(|c: char| !c.is_whitespace()), String::from),
+                )),
             ),
             Directive::SecMarker,
         ),
@@ -703,7 +727,14 @@ fn parse_var_decl(input: &str) -> IResult<&str, Directive> {
     let (input, _) = preceded(iws, char('='))(input)?;
     let (input, _) = iws(input)?;
     let (input, initial) = map(take_while1(|c: char| c != '\n'), String::from)(input)?;
-    Ok((input, Directive::VarDecl { name, var_type, initial: initial.trim().to_owned() }))
+    Ok((
+        input,
+        Directive::VarDecl {
+            name,
+            var_type,
+            initial: initial.trim().to_owned(),
+        },
+    ))
 }
 
 fn parse_secrule_directive(input: &str) -> IResult<&str, Directive> {

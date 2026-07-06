@@ -71,7 +71,12 @@ impl CertManager {
     ) -> Result<()> {
         let mut client = AcmeClient::new_or_load(&self.cert_dir, config).await?;
         let (cert_pem, key_pem, expires_at) = client
-            .issue(&domains, &config.challenge, &self.http01_tokens, &self.store)
+            .issue(
+                &domains,
+                &config.challenge,
+                &self.http01_tokens,
+                &self.store,
+            )
             .await?;
 
         let primary = domains.first().cloned().unwrap_or_default();
@@ -94,7 +99,13 @@ impl CertManager {
 
     /// Upload a PEM cert + key that the operator provides manually.
     /// `name` is an optional friendly profile label (empty = use domain).
-    pub fn install_manual(&self, domain: &str, name: &str, cert_pem: &str, key_pem: &str) -> Result<()> {
+    pub fn install_manual(
+        &self,
+        domain: &str,
+        name: &str,
+        cert_pem: &str,
+        key_pem: &str,
+    ) -> Result<()> {
         let expires_at = parse_expiry(cert_pem).unwrap_or(unix_now() + 90 * 86_400);
         let meta = CertMeta {
             domain: domain.to_string(),
@@ -261,7 +272,10 @@ impl AcmeClient {
             .collect();
         let new_order_url = self.directory.new_order.clone();
         let order_resp = self
-            .post_jws_kid(&new_order_url, Some(&serde_json::json!({"identifiers": identifiers})))
+            .post_jws_kid(
+                &new_order_url,
+                Some(&serde_json::json!({"identifiers": identifiers})),
+            )
             .await?;
         let order_url = order_resp
             .location
@@ -278,9 +292,16 @@ impl AcmeClient {
         let mut cleanup: Vec<CleanupAction> = Vec::new();
 
         for authz_url in &order.authorizations {
-            let authz: AuthzResp = self.post_as_get(authz_url).await?.json().context("parsing authz")?;
+            let authz: AuthzResp = self
+                .post_as_get(authz_url)
+                .await?
+                .json()
+                .context("parsing authz")?;
             if authz.identifier.kind != "dns" {
-                return Err(anyhow!("unsupported identifier type: {}", authz.identifier.kind));
+                return Err(anyhow!(
+                    "unsupported identifier type: {}",
+                    authz.identifier.kind
+                ));
             }
             let domain = authz.identifier.value.clone();
 
@@ -326,7 +347,9 @@ impl AcmeClient {
                 let o: OrderResp = self.post_as_get(&order_url).await?.json()?;
                 match o.status.as_str() {
                     "ready" | "valid" => {
-                        break o.finalize.ok_or_else(|| anyhow!("order missing finalize URL"))?
+                        break o
+                            .finalize
+                            .ok_or_else(|| anyhow!("order missing finalize URL"))?
                     }
                     "invalid" => {
                         self.run_cleanup(&cleanup, http01_tokens, store);
@@ -350,8 +373,11 @@ impl AcmeClient {
         let key_pem = cert.serialize_private_key_pem();
 
         // 6. Finalize the order with the CSR.
-        self.post_jws_kid(&finalize_url, Some(&serde_json::json!({"csr": b64url(&csr_der)})))
-            .await?;
+        self.post_jws_kid(
+            &finalize_url,
+            Some(&serde_json::json!({"csr": b64url(&csr_der)})),
+        )
+        .await?;
 
         // 7. Poll the order for the issued certificate URL (60s budget).
         let cert_url = {
@@ -380,11 +406,7 @@ impl AcmeClient {
     // ── JWS request helpers ───────────────────────────────────────────────────
 
     /// POST a JWS with a `jwk` protected header (used only for newAccount).
-    async fn post_jws_jwk(
-        &mut self,
-        url: &str,
-        payload: &serde_json::Value,
-    ) -> Result<AcmeResp> {
+    async fn post_jws_jwk(&mut self, url: &str, payload: &serde_json::Value) -> Result<AcmeResp> {
         let nonce = self.fresh_nonce().await?;
         let header = serde_json::json!({
             "alg": "ES256",
@@ -401,7 +423,10 @@ impl AcmeClient {
         url: &str,
         payload: Option<&serde_json::Value>,
     ) -> Result<AcmeResp> {
-        let kid = self.kid.clone().ok_or_else(|| anyhow!("no ACME account KID"))?;
+        let kid = self
+            .kid
+            .clone()
+            .ok_or_else(|| anyhow!("no ACME account KID"))?;
         let nonce = self.fresh_nonce().await?;
         let header = serde_json::json!({
             "alg": "ES256",
@@ -562,7 +587,8 @@ fn build_alpn_cert(
 
     let mut params = rcgen::CertificateParams::new(vec![domain.to_string()]);
     params.alg = &rcgen::PKCS_ECDSA_P256_SHA256;
-    let mut ext = rcgen::CustomExtension::from_oid_content(&[1, 3, 6, 1, 5, 5, 7, 1, 31], ext_value);
+    let mut ext =
+        rcgen::CustomExtension::from_oid_content(&[1, 3, 6, 1, 5, 5, 7, 1, 31], ext_value);
     ext.set_criticality(true);
     params.custom_extensions = vec![ext];
 
@@ -816,7 +842,10 @@ mod tests {
         let tp = k.thumbprint();
         assert_eq!(tp, k.thumbprint(), "thumbprint must be deterministic");
         assert!(!tp.contains('='), "thumbprint must be unpadded");
-        assert!(!tp.contains('+') && !tp.contains('/'), "thumbprint must be url-safe");
+        assert!(
+            !tp.contains('+') && !tp.contains('/'),
+            "thumbprint must be url-safe"
+        );
     }
 
     #[test]

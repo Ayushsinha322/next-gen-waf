@@ -104,7 +104,10 @@ fn clean_multipart_form_passes() {
     let mut ctx = multipart_ctx("/profile", &body, false);
     set_paranoia(&mut ctx, 2);
     eval(&eng, &mut ctx, Phase::RequestBody);
-    assert_clean(&ctx, "a legitimate multipart form must not trigger SQLi rules");
+    assert_clean(
+        &ctx,
+        "a legitimate multipart form must not trigger SQLi rules",
+    );
 }
 
 #[test]
