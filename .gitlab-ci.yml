@@ -39,8 +39,18 @@ go:
       - .go/pkg/mod/
   variables:
     GOPATH: "$CI_PROJECT_DIR/.go"
-  script:
+  before_script:
+    # protoc compiler + the two Go plugins (messages + gRPC service stubs)
+    - apt-get update && apt-get install -y protobuf-compiler
+    - go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+    - go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+    - export PATH="$PATH:$(go env GOPATH)/bin"
+    # generate config.pb.go + config_grpc.pb.go into pkg/proto/sentinelv1
     - cd control-plane
+    - protoc --go_out=. --go_opt=module=github.com/your-org/sentinel-waf/control-plane
+             --go-grpc_out=. --go-grpc_opt=module=github.com/your-org/sentinel-waf/control-plane
+             api/proto/config.proto
+  script:
     - go vet ./...
     - go test ./...
     - go build ./...
