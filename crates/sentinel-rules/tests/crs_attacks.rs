@@ -6,7 +6,7 @@
 mod common;
 
 use common::*;
-use sentinel_core::context::{Phase, WafDecision};
+use sentinel_core::context::Phase;
 
 // ============================================================================
 // SQL Injection (REQUEST-942)

@@ -1,4 +1,5 @@
 //! Shared test utilities for integration tests.
+#![allow(dead_code)] // shared helpers; not every integration-test binary uses all of them
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
@@ -30,7 +31,7 @@ pub fn load_crs_engine(filename: &str) -> RuleEngine {
 
 /// Load multiple CRS rule files and compile into a merged RuleEngine.
 pub fn load_crs_engines(filenames: &[&str]) -> RuleEngine {
-    use sentinel_rules::dsl::ast::{RuleFile, RuleItem};
+    use sentinel_rules::dsl::ast::RuleFile;
 
     let mut merged = RuleFile::default();
     for filename in filenames {

@@ -549,7 +549,7 @@ mod tests {
         rt.set_memory_limit("my-plugin", Some(8 * 1024 * 1024));
         assert_eq!(rt.memory_limits.get("my-plugin"), Some(&(8 * 1024 * 1024)));
         rt.set_memory_limit("my-plugin", None);
-        assert!(rt.memory_limits.get("my-plugin").is_none());
+        assert!(!rt.memory_limits.contains_key("my-plugin"));
     }
 
     #[tokio::test]

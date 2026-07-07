@@ -1144,11 +1144,7 @@ fn remove_comments_char(s: String) -> String {
 
 /// Remove SQL/C block comments (`/* ... */`) from input.
 fn remove_sql_comments(mut s: String) -> String {
-    loop {
-        let start = match s.find("/*") {
-            Some(i) => i,
-            None => break,
-        };
+    while let Some(start) = s.find("/*") {
         let end = match s[start + 2..].find("*/") {
             Some(i) => start + 2 + i + 2,
             None => break,
@@ -1160,11 +1156,7 @@ fn remove_sql_comments(mut s: String) -> String {
 
 /// Replace SQL/C block comments with a single space.
 fn replace_sql_comments(mut s: String) -> String {
-    loop {
-        let start = match s.find("/*") {
-            Some(i) => i,
-            None => break,
-        };
+    while let Some(start) = s.find("/*") {
         let end = match s[start + 2..].find("*/") {
             Some(i) => start + 2 + i + 2,
             None => break,

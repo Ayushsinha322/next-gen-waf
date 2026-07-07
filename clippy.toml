@@ -1,0 +1,9 @@
+# Clippy configuration for the Sentinel WAF workspace.
+#
+# Permit unwrap()/expect() in test code — tests legitimately unwrap to fail fast
+# on a bad assumption. Several crates (e.g. sentinel-ebpf) set
+# `#![deny(clippy::unwrap_used)]` to keep production code panic-free but use
+# unwrap freely in their `#[cfg(test)]` modules; without this, the deny fires on
+# every test unwrap.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

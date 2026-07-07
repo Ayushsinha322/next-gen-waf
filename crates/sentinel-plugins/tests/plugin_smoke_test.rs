@@ -3,6 +3,7 @@
 //!
 //! These tests use the hello-world example plugin compiled to WASM, so they
 //! exercise the full stack: SDK → compile → load → evaluate → result.
+#![allow(dead_code)] // helper(s) not used by every test configuration
 
 use sentinel_core::{context::RequestContext, WafDecision};
 use sentinel_plugins::{PluginEvalResult, PluginRuntime};

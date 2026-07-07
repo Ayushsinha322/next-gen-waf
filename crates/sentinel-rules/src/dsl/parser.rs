@@ -68,7 +68,7 @@ fn quoted_string(input: &str) -> IResult<&str, String> {
     let mut result = String::new();
     let mut remaining = input;
     loop {
-        match remaining.find(|c| c == '"' || c == '\\') {
+        match remaining.find(['"', '\\']) {
             None => {
                 return Err(nom::Err::Error(nom::error::Error::new(
                     input,
@@ -107,7 +107,7 @@ pub fn single_quoted_string(input: &str) -> IResult<&str, String> {
     let mut result = String::new();
     let mut remaining = input;
     loop {
-        match remaining.find(|c| c == '\'' || c == '\\') {
+        match remaining.find(['\'', '\\']) {
             None => {
                 return Err(nom::Err::Error(nom::error::Error::new(
                     input,
@@ -143,7 +143,7 @@ fn regex_literal(input: &str) -> IResult<&str, String> {
     let mut pattern = String::new();
     let mut remaining = input;
     loop {
-        match remaining.find(|c| c == '/' || c == '\\') {
+        match remaining.find(['/', '\\']) {
             None => {
                 return Err(nom::Err::Error(nom::error::Error::new(
                     input,
@@ -790,6 +790,7 @@ fn rule_item(input: &str) -> IResult<&str, RuleItem> {
 // ---------------------------------------------------------------------------
 
 /// Parse a complete SRL source string into a `RuleFile`.
+#[allow(clippy::while_let_loop)] // loop skips ws/comments then parses; clearer as a plain loop
 pub fn parse_rule_file(source: &str) -> Result<RuleFile, ParseError> {
     let mut items = Vec::new();
     let mut remaining = source;

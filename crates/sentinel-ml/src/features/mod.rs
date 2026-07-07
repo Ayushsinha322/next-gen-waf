@@ -293,6 +293,7 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
 
+    #[allow(clippy::unnecessary_to_owned)] // Uri::from_maybe_shared needs an owned 'static arg
     fn ctx_from_uri(uri: &str) -> RequestContext {
         let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let mut ctx = RequestContext::new(ip, 1234);

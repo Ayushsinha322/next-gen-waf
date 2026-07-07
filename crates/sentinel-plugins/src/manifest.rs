@@ -104,6 +104,7 @@ impl PluginManifest {
     }
 
     /// Parse a manifest from a string.
+    #[allow(clippy::should_implement_trait)] // intentional inherent method, not std::str::FromStr
     pub fn from_str(s: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(s)
     }

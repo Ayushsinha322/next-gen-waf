@@ -211,6 +211,7 @@ pub struct RuleCoverage {
 
 /// The output of the compiler — shared across all request-processing threads
 /// via `Arc`.  All fields are immutable after compilation.
+#[derive(Default)]
 pub struct CompiledRuleSet {
     /// Instruction sequences, indexed by `RulePhase as usize` (0-6).
     pub phase_programs: [Vec<Instruction>; 7],
@@ -236,21 +237,6 @@ pub struct CompiledRuleSet {
     /// Rules from the source set that are not enforced (compile-dropped or
     /// disabled). Empty when every rule compiled and is active.
     pub coverage: RuleCoverage,
-}
-
-impl Default for CompiledRuleSet {
-    fn default() -> Self {
-        Self {
-            phase_programs: Default::default(),
-            patterns: Vec::new(),
-            ac_sets: Vec::new(),
-            literals: Vec::new(),
-            ml_models: Vec::new(),
-            plugin_names: Vec::new(),
-            rule_meta: HashMap::new(),
-            coverage: RuleCoverage::default(),
-        }
-    }
 }
 
 impl std::fmt::Debug for CompiledRuleSet {

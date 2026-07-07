@@ -325,6 +325,7 @@ impl EventLogger {
 // ---------------------------------------------------------------------------
 
 impl AccessEvent {
+    #[allow(clippy::too_many_arguments)] // event constructor: one arg per log field
     pub fn new(
         site: &str,
         method: &str,
@@ -351,6 +352,7 @@ impl AccessEvent {
 }
 
 impl WafEvent {
+    #[allow(clippy::too_many_arguments)] // event constructor: one arg per log field
     pub fn new(
         ip: &str,
         site: &str,
@@ -392,6 +394,7 @@ impl ErrorEvent {
 }
 
 impl MlEvent {
+    #[allow(clippy::too_many_arguments)] // event constructor: one arg per log field
     pub fn new(
         ip: &str,
         site: &str,
