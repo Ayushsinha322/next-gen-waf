@@ -4,6 +4,13 @@
 cluster:
   name: sentinel-prod
   node_id: auto                    # auto = derive from hostname+mac
+  # REST poll of the control plane: the data plane GETs
+  # {sync_url}/api/v1/internal/config AND /api/v1/internal/threat-intel every
+  # sync_interval_secs. REQUIRED for live site hot-sync and for the dynamic
+  # threat-intelligence feed to reach the data plane — omit it and neither
+  # poller starts. Point at your control plane's REST address.
+  sync_url: "http://localhost:9501"
+  sync_interval_secs: 5
   control_plane:
     endpoints: ["https://cp-1.internal:7443", "https://cp-2.internal:7443"]
     tls:
