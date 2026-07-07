@@ -537,7 +537,7 @@ SecRule ARGS "@rx evil" "id:1,phase:2,block,msg:'x'"
         let src = r#"SecRule ARGS|ARGS_NAMES|REQUEST_BODY "@rx select" "id:100,phase:2,pass""#;
         let rf = import_secrule_conf(src).expect("import");
         if let RuleItem::Rule(rule) = &rf.items[0] {
-            assert!(rule.targets.len() >= 1);
+            assert!(!rule.targets.is_empty());
         }
     }
 

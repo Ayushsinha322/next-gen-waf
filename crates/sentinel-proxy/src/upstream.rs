@@ -465,7 +465,7 @@ impl UpstreamPool {
                     tokio::select! {
                         _ = ticker.tick() => {
                             let Some(site_up) = pool2.sites.get(&site_id) else { continue };
-                            let servers: Vec<Arc<ServerHealth>> = site_up.servers.iter().cloned().collect();
+                            let servers: Vec<Arc<ServerHealth>> = site_up.servers.to_vec();
                             drop(site_up); // release DashMap read guard
 
                             for srv in servers {

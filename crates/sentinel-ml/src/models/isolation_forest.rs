@@ -396,7 +396,7 @@ fn harmonic(k: usize) -> f32 {
         sum
     } else {
         let kf = k as f32;
-        (kf).ln() + 0.5772156649 + 1.0 / (2.0 * kf) - 1.0 / (12.0 * kf * kf)
+        (kf).ln() + 0.577_215_7 + 1.0 / (2.0 * kf) - 1.0 / (12.0 * kf * kf)
     }
 }
 
@@ -406,10 +406,10 @@ fn reservoir_sample<'a>(data: &'a [Vec<f32>], k: usize, rng: &mut XorShift64) ->
         return data.iter().map(|v| v.as_slice()).collect();
     }
     let mut reservoir: Vec<&[f32]> = data.iter().take(k).map(|v| v.as_slice()).collect();
-    for i in k..data.len() {
+    for (i, item) in data.iter().enumerate().skip(k) {
         let j = rng.next_usize(i + 1);
         if j < k {
-            reservoir[j] = data[i].as_slice();
+            reservoir[j] = item.as_slice();
         }
     }
     reservoir

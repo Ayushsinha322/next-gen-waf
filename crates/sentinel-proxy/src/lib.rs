@@ -1257,6 +1257,7 @@ const H2_MAX_CONCURRENT_STREAMS: u32 = 256;
 const H2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const H2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
+#[allow(clippy::too_many_arguments)] // connection handler threads through per-listener state
 async fn handle_connection(
     stream: TcpStream,
     peer: SocketAddr,
@@ -1890,7 +1891,7 @@ async fn proxy(
     // the bidirectional relay with WAF frame inspection and return immediately.
     if resp_parts.status == StatusCode::SWITCHING_PROTOCOLS {
         if let Some(client_upgrade_fut) = ws_upgrade {
-            let upstream_upgrade_fut = hyper::upgrade::on(&mut Response::from_parts(
+            let upstream_upgrade_fut = hyper::upgrade::on(Response::from_parts(
                 resp_parts.clone(),
                 http_body_util::Empty::<Bytes>::new(),
             ));
@@ -2160,18 +2161,16 @@ async fn phase1_headers(
     }
 
     // --- GeoIP ---
-    if ctx.decision == WafDecision::Allow {
-        if site.waf.geoip.is_some() {
-            let geoip_map = modules.geoip_map.load();
-            if let Some(geoip) = geoip_map.get(&site.id) {
-                match geoip.check(ctx.client_ip) {
-                    GeoVerdict::Block { country_code } => {
-                        ctx.block_reason = Some(format!("country blocked: {country_code}"));
-                        ctx.geo_country = Some(country_code);
-                        ctx.decision = WafDecision::Block;
-                    }
-                    GeoVerdict::Allow | GeoVerdict::Unknown => {}
+    if ctx.decision == WafDecision::Allow && site.waf.geoip.is_some() {
+        let geoip_map = modules.geoip_map.load();
+        if let Some(geoip) = geoip_map.get(&site.id) {
+            match geoip.check(ctx.client_ip) {
+                GeoVerdict::Block { country_code } => {
+                    ctx.block_reason = Some(format!("country blocked: {country_code}"));
+                    ctx.geo_country = Some(country_code);
+                    ctx.decision = WafDecision::Block;
                 }
+                GeoVerdict::Allow | GeoVerdict::Unknown => {}
             }
         }
     }
@@ -2652,13 +2651,17 @@ fn internal_auth_ok(headers: &http::HeaderMap) -> bool {
     }
 }
 
+// Wildcard host matching indexes the domain by byte offset after a "*." check;
+// keep the explicit slicing rather than strip_prefix — it is security-sensitive
+// and the manual form is unambiguous.
+#[allow(clippy::manual_strip)]
 fn site_matches(site: &SiteConfig, host: &str) -> bool {
     let host_lc = host.to_ascii_lowercase();
     site.domains.iter().any(|d| {
         let d_lc = d.to_ascii_lowercase();
         if d_lc.starts_with("*.") {
             let suffix = &d_lc[1..];
-            host_lc.ends_with(&*suffix) || host_lc == &d_lc[2..]
+            host_lc.ends_with(suffix) || host_lc == d_lc[2..]
         } else {
             d_lc == host_lc
         }

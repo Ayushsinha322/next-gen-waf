@@ -434,7 +434,7 @@ rule 942100 {
         let file = parse_rule_file(src).expect("parse");
         let ruleset = compile(file).expect("compile");
         assert_eq!(ruleset.rule_meta.len(), 1);
-        assert!(ruleset.patterns.len() >= 1);
+        assert!(!ruleset.patterns.is_empty());
     }
 
     #[test]

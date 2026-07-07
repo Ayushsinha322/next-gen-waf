@@ -62,6 +62,7 @@ impl Metrics {
 
 /// Deterministic train/test split: every 4th sample (by index) is held out for
 /// testing, the rest train. ~75/25 split, reproducible.
+#[allow(clippy::type_complexity)] // train/test split return tuple; a type alias adds no clarity
 fn split() -> (Vec<Vec<f32>>, Vec<f32>, Vec<(FeatureVector, f32)>) {
     let corpus = training_corpus();
     let mut train_x = Vec::new();

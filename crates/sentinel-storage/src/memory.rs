@@ -12,7 +12,7 @@ struct Entry {
 
 impl Entry {
     fn is_expired(&self) -> bool {
-        self.expires.map_or(false, |exp| Instant::now() > exp)
+        self.expires.is_some_and(|exp| Instant::now() > exp)
     }
 }
 

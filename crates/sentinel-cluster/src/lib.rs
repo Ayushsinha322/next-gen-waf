@@ -688,27 +688,26 @@ impl RaftActor {
                 Some((peer_id, result)) = res_rx.recv() => {
                     match result {
                         Ok(reply_json) => {
-                            if let Ok(rpc) = serde_json::from_str::<RaftRpc>(&reply_json) {
-                                match rpc {
-                                    RaftRpc::AppendEntriesReply { term, success, match_index } => {
-                                        if term > self.state.current_term {
-                                            self.state.become_follower(term);
-                                            self.state.persist();
-                                            return Err(ClusterError::NotLeader(None));
-                                        }
-                                        if success {
-                                            self.state.match_index.insert(peer_id, match_index);
-                                            self.state.next_index.insert(peer_id, match_index + 1);
-                                            self.state.peer_reachable.insert(peer_id, true);
-                                            self.state.peer_last_seen.insert(peer_id, unix_now());
-                                            acks += 1;
-                                        } else {
-                                            // Decrement next_index and retry (simplified: just mark unreachable).
-                                            let ni = self.state.next_index.entry(peer_id).or_insert(1);
-                                            if *ni > 1 { *ni -= 1; }
-                                        }
+                            if let Ok(RaftRpc::AppendEntriesReply { term, success, match_index }) =
+                                serde_json::from_str::<RaftRpc>(&reply_json)
+                            {
+                                if term > self.state.current_term {
+                                    self.state.become_follower(term);
+                                    self.state.persist();
+                                    return Err(ClusterError::NotLeader(None));
+                                }
+                                if success {
+                                    self.state.match_index.insert(peer_id, match_index);
+                                    self.state.next_index.insert(peer_id, match_index + 1);
+                                    self.state.peer_reachable.insert(peer_id, true);
+                                    self.state.peer_last_seen.insert(peer_id, unix_now());
+                                    acks += 1;
+                                } else {
+                                    // Decrement next_index and retry (simplified: just mark unreachable).
+                                    let ni = self.state.next_index.entry(peer_id).or_insert(1);
+                                    if *ni > 1 {
+                                        *ni -= 1;
                                     }
-                                    _ => {}
                                 }
                             }
                         }
