@@ -37,7 +37,7 @@ export default function ClientShell({ children }: { children: React.ReactNode })
                 <path d="M8.5 12l2.5 2.5 4.5-4.5" stroke="#60a5fa" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
               </svg>
             </div>
-            <div><div className="nl-brand">Sentinel WAF</div></div>
+            <div><div className="nl-brand">Next-Gen ESDS WAF</div></div>
             <div className="nl-ver">v4.2.1</div>
           </div>
           <div className="nav-link">Documentation</div>

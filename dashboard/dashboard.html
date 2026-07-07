@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Sentinel WAF — Control Plane</title>
+<title>Next-Gen ESDS WAF — Control Plane</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&family=Share+Tech+Mono&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -23,12 +23,12 @@ html,body{width:100%;height:100%;overflow:hidden;background:var(--bg);color:var(
 
 /* ── TOPBAR ── */
 .topbar{position:fixed;top:0;left:0;right:0;height:var(--th);z-index:40;background:rgba(5,7,16,.98);border-bottom:1px solid var(--border);backdrop-filter:var(--blur);display:flex;align-items:center}
-.tb-logo{width:var(--sb);flex-shrink:0;display:flex;align-items:center;gap:10px;padding:0 16px;border-right:1px solid var(--border);height:100%;cursor:pointer;text-decoration:none}
+.tb-logo{width:var(--sb);flex-shrink:0;display:flex;align-items:center;gap:10px;padding:0 16px;border-right:1px solid var(--border);height:100%;cursor:pointer;text-decoration:none;overflow:hidden}
 .tb-emb{width:30px;height:30px;border-radius:8px;background:linear-gradient(135deg,rgba(200,0,30,.3),rgba(200,0,30,.07));border:1px solid rgba(200,0,30,.45);display:flex;align-items:center;justify-content:center;font-size:16px;box-shadow:0 0 14px var(--red-glow);animation:emb 3s ease-in-out infinite;flex-shrink:0}
 @keyframes emb{0%,100%{box-shadow:0 0 14px var(--red-glow)}50%{box-shadow:0 0 28px rgba(200,0,30,.75)}}
-.tb-nm{font-family:'Orbitron',sans-serif;font-size:12px;font-weight:900;letter-spacing:2px;line-height:1}
-.tb-nm .s{color:var(--text)}
-.tb-nm .w{color:var(--red-b);text-shadow:0 0 10px var(--red-glow)}
+.tb-nm{font-family:'Orbitron',sans-serif;font-weight:900;letter-spacing:0.8px;line-height:1.1;display:flex;flex-direction:column;gap:2px;white-space:nowrap}
+.tb-nm .s{color:var(--text);font-size:12px}
+.tb-nm .w{color:var(--red-b);font-size:14px;letter-spacing:2px;text-shadow:0 0 10px var(--red-glow)}
 .tb-ver{font-size:8px;font-family:'Share Tech Mono',monospace;color:var(--text3);letter-spacing:1.5px;margin-top:2px}
 .tb-mid{flex:1;display:flex;align-items:center;gap:14px;padding:0 18px}
 .sw{position:relative}
@@ -410,7 +410,7 @@ textarea.fin2{resize:vertical;min-height:80px;line-height:1.6}
 /* ── PAGE LOADER ── */
 .pg-loader{position:fixed;inset:0;z-index:100;background:var(--bg);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:20px;animation:ldout .5s ease 2.2s both;pointer-events:none}
 @keyframes ldout{to{opacity:0;pointer-events:none}}
-.ld-logo{font-family:'Orbitron',sans-serif;font-size:26px;font-weight:900;letter-spacing:4px}
+.ld-logo{font-family:'Orbitron',sans-serif;font-size:26px;font-weight:900;letter-spacing:2px}
 .ld-logo .s{color:var(--text)}
 .ld-logo .w{color:var(--red-b);text-shadow:0 0 16px var(--red-glow)}
 .ld-bw{width:220px;height:2px;background:rgba(255,255,255,.05);border-radius:2px;overflow:hidden}
@@ -430,7 +430,7 @@ tbody tr.sev-l td:first-child{border-left:3px solid var(--green)}
 
 <!-- LOADER -->
 <div class="pg-loader" id="pgLoader">
-  <div class="ld-logo"><span class="s">SENTINEL</span> <span class="w">WAF</span></div>
+  <div class="ld-logo"><span class="s">NEXT-GEN ESDS</span> <span class="w">WAF</span></div>
   <div class="ld-s">Control Plane Dashboard</div>
   <div class="ld-bw"><div class="ld-b"></div></div>
   <div class="ld-t" id="ldtxt">LOADING CONTROL PLANE...</div>
@@ -444,7 +444,7 @@ tbody tr.sev-l td:first-child{border-left:3px solid var(--green)}
 <header class="topbar">
   <a class="tb-logo" onclick="nav('overview')">
     <div class="tb-emb">🔺</div>
-    <div><div class="tb-nm"><span class="s">SENTINEL</span> <span class="w">WAF</span></div><div class="tb-ver">ENTERPRISE v3.1.0</div></div>
+    <div><div class="tb-nm"><span class="s">NEXT-GEN ESDS</span> <span class="w">WAF</span></div><div class="tb-ver">ENTERPRISE v3.1.0</div></div>
   </a>
   <div class="tb-mid">
     <div class="sw"><span class="si">🔍</span><input class="sinp" id="gSearch" type="text" placeholder="Search sites, rules, IPs, alerts..."></div>
@@ -1265,7 +1265,7 @@ const modalTemplates={
   inviteUser:{title:'👤 Invite Team Member',body:`
     <div class="fg2"><label class="flbl2">Email Address</label><input class="fin2" placeholder="colleague@yourcompany.com" type="email"></div>
     <div class="fg2"><label class="flbl2">Role</label><select class="fin2 fsel2"><option>VIEWER</option><option>EDITOR</option><option selected>ADMIN</option><option>OWNER</option></select></div>
-    <div class="fg2"><label class="flbl2">Message (optional)</label><textarea class="fin2" rows="2" placeholder="Welcome to Sentinel WAF!"></textarea></div>`,
+    <div class="fg2"><label class="flbl2">Message (optional)</label><textarea class="fin2" rows="2" placeholder="Welcome to Next-Gen ESDS WAF!"></textarea></div>`,
   foot:`<button class="btn bg" onclick="closeModal()">Cancel</button><button class="btn bp" onclick="closeModal();showToast('Invitation sent','s','📧')">Send Invite</button>`},
 
   uploadPlugin:{title:'📦 Upload WASM Plugin',body:`

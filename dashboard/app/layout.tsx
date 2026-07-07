@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Sentinel WAF — Enterprise Security Platform",
+  title: "Next-Gen ESDS WAF — Enterprise Security Platform",
   description: "High-performance Web Application Firewall control plane",
 };
 

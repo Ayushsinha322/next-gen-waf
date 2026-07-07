@@ -110,7 +110,8 @@ export default function TopBar() {
         </motion.div>
         <div>
           <div className="tb-nm">
-            <span className="s">SENTINEL</span> <span className="w">WAF</span>
+            <span className="s">NEXT-GEN ESDS</span>
+            <span className="w">WAF</span>
           </div>
           <div className="tb-ver">ENTERPRISE v3.1.0</div>
         </div>
