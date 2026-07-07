@@ -299,7 +299,7 @@ export default function CertificatesPage() {
         <div style={{ padding: 16 }}>
           {tab === "acme" ? (
             <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-              <div style={{ fontSize: 12, color: "var(--text2)" }}>
+              <div style={{ fontSize: 14, color: "var(--text2)" }}>
                 Sentinel speaks ACME natively (no certbot). Domains must resolve to this WAF and be reachable
                 on port 80 (HTTP-01) or 443 (TLS-ALPN-01). Certs auto-renew 30 days before expiry.
               </div>
@@ -336,7 +336,7 @@ export default function CertificatesPage() {
             </div>
           ) : (
             <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-              <div style={{ fontSize: 12, color: "var(--text2)" }}>
+              <div style={{ fontSize: 14, color: "var(--text2)" }}>
                 Paste a PEM certificate chain and its private key. Installed instantly via hot-swap — no restart.
                 Once uploaded it lives in the repository and can be assigned to any matching site from the Add-Site wizard
                 (<strong>Front Service → From Repository</strong>) — no re-upload. Enter a <strong>wildcard</strong> like
@@ -355,12 +355,12 @@ export default function CertificatesPage() {
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
                 <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                   <span className="td3">Certificate (PEM, full chain)</span>
-                  <textarea className="fi2" rows={8} style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 11, resize: "vertical" }}
+                  <textarea className="fi2" rows={8} style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 13, resize: "vertical" }}
                     placeholder="-----BEGIN CERTIFICATE-----" value={manualCert} onChange={e => setManualCert(e.target.value)} />
                 </label>
                 <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                   <span className="td3">Private Key (PEM)</span>
-                  <textarea className="fi2" rows={8} style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 11, resize: "vertical" }}
+                  <textarea className="fi2" rows={8} style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 13, resize: "vertical" }}
                     placeholder="-----BEGIN PRIVATE KEY-----" value={manualKey} onChange={e => setManualKey(e.target.value)} />
                 </label>
               </div>
@@ -381,9 +381,9 @@ export default function CertificatesPage() {
         </div>
         <div className="tw">
           {loading ? (
-            <div style={{ padding: 24, textAlign: "center", fontFamily: "'Share Tech Mono',monospace", fontSize: 11, color: "var(--text3)" }}>Loading certificates…</div>
+            <div style={{ padding: 24, textAlign: "center", fontFamily: "'Share Tech Mono',monospace", fontSize: 13, color: "var(--text3)" }}>Loading certificates…</div>
           ) : certs.length === 0 ? (
-            <div style={{ padding: 24, textAlign: "center", fontFamily: "'Share Tech Mono',monospace", fontSize: 11, color: "var(--text3)" }}>
+            <div style={{ padding: 24, textAlign: "center", fontFamily: "'Share Tech Mono',monospace", fontSize: 13, color: "var(--text3)" }}>
               No certificates yet — request one with ACME or upload a PEM above.
             </div>
           ) : (
@@ -404,13 +404,13 @@ export default function CertificatesPage() {
                           </span>
                           {isWildcard(c) && <span className="bdg bcy" style={{ flexShrink: 0 }} title="Wildcard — covers all subdomains">✦ wildcard</span>}
                         </div>
-                        <div className="td3" style={{ fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        <div className="td3" style={{ fontSize: 14, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                           {c.name ? c.domain : ""}{c.san.length > 1 ? `${c.name ? " · " : ""}+${c.san.length - 1} SAN` : ""}
                         </div>
                       </td>
                       <td title={covered.map(s => s.name).join(", ")}>
                         {covered.length === 0
-                          ? <span className="td3" style={{ fontSize: 12 }}>—</span>
+                          ? <span className="td3" style={{ fontSize: 14 }}>—</span>
                           : <span className="bdg bgg">{covered.length} site{covered.length > 1 ? "s" : ""}</span>}
                       </td>
                       <td><span className={`bdg ${src.cls}`}><span className="bdr" />{src.text}</span></td>

@@ -129,7 +129,7 @@ export default function TopBar() {
             display: "flex", alignItems: "center", gap: 7,
             padding: "5px 12px", borderRadius: 6,
             background: "rgba(0,212,255,.06)", border: "1px solid rgba(0,212,255,.14)",
-            fontSize: 13, fontFamily: "'JetBrains Mono',monospace", color: "var(--text2)",
+            fontSize: 15, fontFamily: "'JetBrains Mono',monospace", color: "var(--text2)",
           }}
           whileHover={{ scale: 1.03, borderColor: "rgba(0,212,255,.3)" }}
         >
@@ -145,7 +145,7 @@ export default function TopBar() {
           display: "flex", alignItems: "center", gap: 5,
           padding: "4px 10px", borderRadius: 6,
           background: "rgba(0,200,122,.06)", border: "1px solid rgba(0,200,122,.18)",
-          fontSize: 12, fontFamily: "'Inter',sans-serif", fontWeight: 500, color: "var(--green)",
+          fontSize: 14, fontFamily: "'Inter',sans-serif", fontWeight: 500, color: "var(--green)",
           whiteSpace: "nowrap",
         }}>
           <div className="sd g" style={{ width: 5, height: 5 }} />

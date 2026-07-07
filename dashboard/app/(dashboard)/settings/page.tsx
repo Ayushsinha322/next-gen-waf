@@ -150,7 +150,7 @@ function APIKeysTab() {
           </motion.button>
           {revealKey && (
             <div className="code-block" style={{marginTop:10}}>
-              <div style={{color:"var(--amber)",fontSize:12,marginBottom:4}}>⚠ Copy now — shown only once</div>
+              <div style={{color:"var(--amber)",fontSize: 14,marginBottom:4}}>⚠ Copy now — shown only once</div>
               <code style={{color:"var(--green)",wordBreak:"break-all"}}>{revealKey}</code>
               <motion.button className="btn bg-btn btn-xs" style={{marginLeft:8}}
                 onClick={() => { navigator.clipboard?.writeText(revealKey); showToast("Copied!","s","📋"); }} whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.96 }}>Copy</motion.button>
@@ -160,7 +160,7 @@ function APIKeysTab() {
       )}
       <div className="tw">
         {loading ? (
-          <div style={{padding:"16px",textAlign:"center",fontSize:11,color:"var(--text3)"}}>Loading…</div>
+          <div style={{padding:"16px",textAlign:"center",fontSize: 13,color:"var(--text3)"}}>Loading…</div>
         ) : (
           <table>
             <thead><tr><th>Name</th><th>Key Preview</th><th>Scope</th><th>Expires</th><th>Last Used</th><th>Actions</th></tr></thead>
@@ -252,7 +252,7 @@ function UsersTab() {
       )}
       <div className="tw">
         {loading ? (
-          <div style={{padding:"16px",textAlign:"center",fontSize:11,color:"var(--text3)"}}>Loading…</div>
+          <div style={{padding:"16px",textAlign:"center",fontSize: 13,color:"var(--text3)"}}>Loading…</div>
         ) : (
           <table>
             <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>2FA</th><th>Last Login</th><th>Status</th></tr></thead>
@@ -397,7 +397,7 @@ function NotificationsTab() {
         </motion.button>
       </div>
       <div className="pb">
-        <div style={{ fontSize: 11, color: "var(--text3)", lineHeight: 1.7, marginBottom: 12, fontFamily: "'Share Tech Mono',monospace" }}>
+        <div style={{ fontSize: 13, color: "var(--text3)", lineHeight: 1.7, marginBottom: 12, fontFamily: "'Share Tech Mono',monospace" }}>
           Alerts (attack spikes, repeat offenders, critical blocks) are delivered to every enabled channel whose minimum severity the alert meets. Webhook payloads are optionally HMAC-SHA256 signed (<code>X-Sentinel-Signature</code>).
         </div>
 
@@ -411,7 +411,7 @@ function NotificationsTab() {
                 </select>
               </div>
             </div>
-            <div style={{ fontSize: 10.5, color: "var(--text3)", margin: "2px 0 10px" }}>{CHANNEL_META[form.type].blurb}</div>
+            <div style={{ fontSize: 12.5, color: "var(--text3)", margin: "2px 0 10px" }}>{CHANNEL_META[form.type].blurb}</div>
 
             {!isNet ? (
               <div style={{ display: "grid", gridTemplateColumns: form.type === "webhook" ? "1fr 1fr" : "1fr", gap: 10 }}>
@@ -437,9 +437,9 @@ function NotificationsTab() {
         )}
 
         {loading ? (
-          <div style={{ padding: 24, textAlign: "center", fontSize: 11, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>Loading channels…</div>
+          <div style={{ padding: 24, textAlign: "center", fontSize: 13, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>Loading channels…</div>
         ) : channels.length === 0 ? (
-          <div style={{ padding: 24, textAlign: "center", fontSize: 11, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>No channels configured. Add one to start delivering alerts to your SOC.</div>
+          <div style={{ padding: 24, textAlign: "center", fontSize: 13, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>No channels configured. Add one to start delivering alerts to your SOC.</div>
         ) : channels.map(ch => (
           <div key={ch.id} className="srow">
             <div style={{ flex: 1, minWidth: 0 }}>
@@ -563,13 +563,13 @@ function ManagementTLSTab() {
               <MgmtField label="Fingerprint (SHA-256)" value={info?.fingerprint} mono />
             </div>
             {d !== null && d <= 30 && (
-              <div style={{ color: "var(--red)", fontSize: 13, marginTop: 8 }}>⚠️ Expires in {d} day(s) — plan a rotation.</div>
+              <div style={{ color: "var(--red)", fontSize: 15, marginTop: 8 }}>⚠️ Expires in {d} day(s) — plan a rotation.</div>
             )}
           </>
         )}
 
         <div style={{ marginTop: 18 }}>
-          <div className="ptitle" style={{ fontSize: 14, marginBottom: 8 }}>Upload a new management certificate</div>
+          <div className="ptitle" style={{ fontSize: 16, marginBottom: 8 }}>Upload a new management certificate</div>
           <div className="fg2"><label className="flbl2">Profile name (optional)</label>
             <input className="fin2" value={name} placeholder="Company management cert" onChange={e => setName(e.target.value)} /></div>
           <div className="fg2"><label className="flbl2">Certificate (PEM — leaf first, then any intermediates)</label>
@@ -584,7 +584,7 @@ function ManagementTLSTab() {
           <div className="fg2"><label className="flbl2">Expected hostname / IP (optional — warns on SAN mismatch)</label>
             <input className="fin2" value={host} placeholder="172.16.21.71" onChange={e => setHost(e.target.value)} /></div>
 
-          <div className="sec-sub" style={{ fontSize: 12, margin: "4px 0 10px" }}>
+          <div className="sec-sub" style={{ fontSize: 14, margin: "4px 0 10px" }}>
             🔒 The key is validated (matches the cert, in-date, has a SAN), stored only on the WAF node, and is
             never written to the database, logged, or shown again.
           </div>

@@ -142,7 +142,7 @@ export default function RulesPage() {
           <div className="ph">
             <div className="ptitle">📋 Rule Library</div>
             <div style={{ position:"relative" }}>
-              <span style={{ position:"absolute", left:10, top:"50%", transform:"translateY(-50%)", color:"var(--text3)", fontSize:12, pointerEvents:"none" }}>🔍</span>
+              <span style={{ position:"absolute", left:10, top:"50%", transform:"translateY(-50%)", color:"var(--text3)", fontSize: 14, pointerEvents:"none" }}>🔍</span>
               <input className="fi2" type="text" placeholder="Search…" style={{ width:150 }}
                 value={search} onChange={e => setSearch(e.target.value)} />
             </div>
@@ -155,7 +155,7 @@ export default function RulesPage() {
           </div>
           <div className="tw" style={{ maxHeight:480, overflowY:"auto" }}>
             {loading ? (
-              <div style={{ padding:"24px", textAlign:"center", fontFamily:"'Share Tech Mono',monospace", fontSize:11, color:"var(--text3)" }}>Loading…</div>
+              <div style={{ padding:"24px", textAlign:"center", fontFamily:"'Share Tech Mono',monospace", fontSize: 13, color:"var(--text3)" }}>Loading…</div>
             ) : (
               <table>
                 <thead><tr><th>On</th><th>Name</th><th>Phase</th><th>Sev</th><th></th></tr></thead>
@@ -167,12 +167,12 @@ export default function RulesPage() {
                       <td onClick={e => { e.stopPropagation(); toggleRule(r); }}>
                         <div className={`tog ${r.enabled?"on":""}`} />
                       </td>
-                      <td><span style={{ color:"var(--cyan)", fontSize:12 }}>{r.name}</span></td>
+                      <td><span style={{ color:"var(--cyan)", fontSize: 14 }}>{r.name}</span></td>
                       <td className="td3">{PHASE_LABELS[r.phase]??`ph${r.phase}`}</td>
                       <td><SevBadge sev={r.severity} /></td>
                       <td>
                         {(r.source==="custom"||r.source==="ai_generated"||r.source==="virtual_patch") && (
-                          <span style={{ cursor:"pointer", color:"var(--red-b)", fontSize:11 }}
+                          <span style={{ cursor:"pointer", color:"var(--red-b)", fontSize: 13 }}
                             onClick={e=>{ e.stopPropagation(); deleteRule(r); }}>🗑</span>
                         )}
                       </td>
@@ -188,7 +188,7 @@ export default function RulesPage() {
           <div className="ph">
             <div className="ptitle">
               ✏️ Rule Editor
-              {editorRule && <span style={{ fontSize:12, color:"var(--text3)", marginLeft:8 }}>— {editorRule.name}</span>}
+              {editorRule && <span style={{ fontSize: 14, color:"var(--text3)", marginLeft:8 }}>— {editorRule.name}</span>}
             </div>
             <motion.button className="btn bc btn-sm" onClick={runTest} disabled={testLoading} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
               {testLoading ? "⏳" : "▶ Test"}
@@ -203,7 +203,7 @@ export default function RulesPage() {
                   <input className="fin2" value={PHASE_LABELS[editorRule.phase]??`phase ${editorRule.phase}`} readOnly style={{ opacity:0.6 }} /></div>
               </div>
             ) : (
-              <div style={{ padding:"16px 0", textAlign:"center", fontSize:11, fontFamily:"'Share Tech Mono',monospace", color:"var(--text3)" }}>
+              <div style={{ padding:"16px 0", textAlign:"center", fontSize: 13, fontFamily:"'Share Tech Mono',monospace", color:"var(--text3)" }}>
                 ← Click a rule to inspect · or use &ldquo;＋ New Rule&rdquo;
               </div>
             )}

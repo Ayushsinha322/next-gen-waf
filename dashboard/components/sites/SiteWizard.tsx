@@ -47,7 +47,7 @@ function Tag({ kind }: { kind: "enforced" | "stored" }) {
   const enforced = kind === "enforced";
   return (
     <span style={{
-      fontSize: 8.5, fontWeight: 700, letterSpacing: 0.5, padding: "2px 7px", borderRadius: 20,
+      fontSize: 10.5, fontWeight: 700, letterSpacing: 0.5, padding: "2px 7px", borderRadius: 20,
       fontFamily: "'Share Tech Mono',monospace", textTransform: "uppercase",
       color: enforced ? "var(--green)" : "var(--amber, #ffb020)",
       background: enforced ? "rgba(0,230,118,.1)" : "rgba(255,176,32,.1)",
@@ -60,10 +60,10 @@ function StepHead({ title, sub, tag }: { title: string; sub: string; tag?: "enfo
   return (
     <div style={{ marginBottom: 4 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-        <span style={{ fontFamily: "'Orbitron',sans-serif", fontSize: 15, fontWeight: 700, color: "var(--text)" }}>{title}</span>
+        <span style={{ fontFamily: "'Orbitron',sans-serif", fontSize: 17, fontWeight: 700, color: "var(--text)" }}>{title}</span>
         {tag && <Tag kind={tag} />}
       </div>
-      <div style={{ fontSize: 11, color: "var(--text3)", marginTop: 3 }}>{sub}</div>
+      <div style={{ fontSize: 13, color: "var(--text3)", marginTop: 3 }}>{sub}</div>
     </div>
   );
 }
@@ -97,7 +97,7 @@ function ChipInput({
             <span key={v} style={{
               display: "inline-flex", alignItems: "center", gap: 6, padding: "3px 8px",
               background: "rgba(0,212,255,.1)", border: "1px solid rgba(0,212,255,.28)",
-              borderRadius: 12, fontSize: 12, fontFamily: "'Share Tech Mono',monospace", color: "var(--cyan)",
+              borderRadius: 12, fontSize: 14, fontFamily: "'Share Tech Mono',monospace", color: "var(--cyan)",
             }}>
               {v}<span style={{ cursor: "pointer", color: "var(--text3)" }} onClick={() => onChange(values.filter(x => x !== v))}>✕</span>
             </span>
@@ -113,7 +113,7 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
     <div className="fg2">
       <label className="flbl2">{label}</label>
       {children}
-      {hint && <div style={{ fontSize: 9, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>{hint}</div>}
+      {hint && <div style={{ fontSize: 11, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>{hint}</div>}
     </div>
   );
 }
@@ -126,7 +126,7 @@ function SecretInput({ value, set, placeholder }: { value: string; set: (v: stri
         style={{ fontFamily: "'Share Tech Mono',monospace", paddingRight: 34 }}
         onChange={e => set(e.target.value)} />
       <span onClick={() => setShow(s => !s)} title={show ? "Hide" : "Reveal"}
-        style={{ position: "absolute", right: 10, top: "50%", transform: "translateY(-50%)", cursor: "pointer", color: "var(--text3)", fontSize: 13 }}>
+        style={{ position: "absolute", right: 10, top: "50%", transform: "translateY(-50%)", cursor: "pointer", color: "var(--text3)", fontSize: 15 }}>
         {show ? "🙈" : "👁"}
       </span>
     </div>
@@ -145,8 +145,8 @@ function SectionToggle({ label, desc, on, set }: { label: string; desc: string; 
       border: "1px solid rgba(255,255,255,.07)", borderRadius: "var(--r2)",
     }}>
       <div>
-        <div style={{ fontSize: 12, fontWeight: 600, color: "var(--text)" }}>{label}</div>
-        <div style={{ fontSize: 12, color: "var(--text3)", marginTop: 2 }}>{desc}</div>
+        <div style={{ fontSize: 14, fontWeight: 600, color: "var(--text)" }}>{label}</div>
+        <div style={{ fontSize: 14, color: "var(--text3)", marginTop: 2 }}>{desc}</div>
       </div>
       <Sw on={on} set={set} />
     </div>
@@ -154,7 +154,7 @@ function SectionToggle({ label, desc, on, set }: { label: string; desc: string; 
 }
 
 function GroupLabel({ children }: { children: React.ReactNode }) {
-  return <div style={{ fontSize: 12, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", letterSpacing: 1, textTransform: "uppercase", marginTop: 4, display: "flex", alignItems: "center", gap: 8 }}>{children}</div>;
+  return <div style={{ fontSize: 14, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", letterSpacing: 1, textTransform: "uppercase", marginTop: 4, display: "flex", alignItems: "center", gap: 8 }}>{children}</div>;
 }
 
 function InfoBox({ children, tone = "cyan" }: { children: React.ReactNode; tone?: "cyan" | "green" | "amber" }) {
@@ -162,7 +162,7 @@ function InfoBox({ children, tone = "cyan" }: { children: React.ReactNode; tone?
           : tone === "amber" ? ["rgba(255,176,32,.07)", "rgba(255,176,32,.25)"]
           : ["rgba(0,212,255,.06)", "rgba(0,212,255,.18)"];
   return (
-    <div style={{ padding: "10px 14px", background: c[0], border: `1px solid ${c[1]}`, borderRadius: "var(--r2)", fontSize: 10.5, color: "var(--text3)", lineHeight: 1.7, fontFamily: "'Share Tech Mono',monospace" }}>
+    <div style={{ padding: "10px 14px", background: c[0], border: `1px solid ${c[1]}`, borderRadius: "var(--r2)", fontSize: 12.5, color: "var(--text3)", lineHeight: 1.7, fontFamily: "'Share Tech Mono',monospace" }}>
       {children}
     </div>
   );
@@ -282,10 +282,10 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
 
         {/* Sidebar / stepper */}
         <div style={{ width: 256, flexShrink: 0, padding: "22px 18px", display: "flex", flexDirection: "column", background: "linear-gradient(180deg, rgba(0,212,255,.06), rgba(0,0,0,.15))", borderRight: "1px solid rgba(255,255,255,.06)", overflowY: "auto" }}>
-          <div style={{ fontFamily: "'Orbitron',sans-serif", fontWeight: 700, fontSize: 15, color: "var(--text)", letterSpacing: 1 }}>
+          <div style={{ fontFamily: "'Orbitron',sans-serif", fontWeight: 700, fontSize: 17, color: "var(--text)", letterSpacing: 1 }}>
             {mode === "edit" ? "✏️ Edit Site" : "🌐 New Protected Site"}
           </div>
-          <div style={{ fontSize: 12, color: "var(--text3)", marginTop: 4, fontFamily: "'Share Tech Mono',monospace" }}>
+          <div style={{ fontSize: 14, color: "var(--text3)", marginTop: 4, fontFamily: "'Share Tech Mono',monospace" }}>
             {mode === "edit" ? form.name : "Reverse proxy + WAF in minutes"}
           </div>
           <div style={{ display: "flex", gap: 4, margin: "16px 0 18px", padding: 3, background: "rgba(0,0,0,.3)", borderRadius: 10 }}>
@@ -293,7 +293,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
               const active = (i === 1) === adv;
               return (
                 <button key={m} type="button" onClick={() => { setAdv(i === 1); setStep(0); }}
-                  style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 11, fontWeight: 700, fontFamily: "'Inter',sans-serif", background: active ? "linear-gradient(135deg,rgba(0,212,255,.9),rgba(0,150,210,.9))" : "transparent", color: active ? "#021018" : "var(--text3)" }}>{m}</button>
+                  style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 13, fontWeight: 700, fontFamily: "'Inter',sans-serif", background: active ? "linear-gradient(135deg,rgba(0,212,255,.9),rgba(0,150,210,.9))" : "transparent", color: active ? "#021018" : "var(--text3)" }}>{m}</button>
               );
             })}
           </div>
@@ -305,13 +305,13 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                   style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 10px", borderRadius: 8, cursor: "pointer", background: cur ? "rgba(0,212,255,.12)" : "transparent", border: cur ? "1px solid rgba(0,212,255,.3)" : "1px solid transparent", transition: "background .15s" }}
                   onMouseEnter={e => { if (!cur) e.currentTarget.style.background = "rgba(255,255,255,.04)"; }}
                   onMouseLeave={e => { if (!cur) e.currentTarget.style.background = "transparent"; }}>
-                  <div style={{ width: 22, height: 22, borderRadius: "50%", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 700, background: done ? "var(--green)" : cur ? "var(--cyan)" : "rgba(255,255,255,.08)", color: done || cur ? "#021018" : "var(--text3)" }}>{done ? "✓" : i + 1}</div>
-                  <span style={{ fontSize: 12, color: cur ? "var(--text)" : "var(--text2)", fontWeight: cur ? 600 : 400 }}>{s}</span>
+                  <div style={{ width: 22, height: 22, borderRadius: "50%", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, fontWeight: 700, background: done ? "var(--green)" : cur ? "var(--cyan)" : "rgba(255,255,255,.08)", color: done || cur ? "#021018" : "var(--text3)" }}>{done ? "✓" : i + 1}</div>
+                  <span style={{ fontSize: 14, color: cur ? "var(--text)" : "var(--text2)", fontWeight: cur ? 600 : 400 }}>{s}</span>
                 </div>
               );
             })}
           </div>
-          <div style={{ marginTop: "auto", paddingTop: 16, fontSize: 9, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", lineHeight: 1.6 }}>
+          <div style={{ marginTop: "auto", paddingTop: 16, fontSize: 11, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", lineHeight: 1.6 }}>
             💡 Public traffic enters on <span style={{ color: "var(--cyan)" }}>{scheme}://:{frontPort}</span> and is proxied to your upstreams.
           </div>
         </div>
@@ -319,8 +319,8 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
         {/* Content */}
         <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "16px 22px", borderBottom: "1px solid rgba(255,255,255,.06)" }}>
-            <div style={{ fontFamily: "'Orbitron',sans-serif", fontSize: 14, fontWeight: 700, color: "var(--text)" }}>{steps[step]}</div>
-            <button onClick={onClose} style={{ background: "none", border: "none", color: "var(--text3)", fontSize: 18, cursor: "pointer" }}>✕</button>
+            <div style={{ fontFamily: "'Orbitron',sans-serif", fontSize: 16, fontWeight: 700, color: "var(--text)" }}>{steps[step]}</div>
+            <button onClick={onClose} style={{ background: "none", border: "none", color: "var(--text3)", fontSize: 20, cursor: "pointer" }}>✕</button>
           </div>
 
           <div style={{ flex: 1, overflowY: "auto", padding: "20px 22px" }}>
@@ -351,10 +351,10 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                       const p = PRESETS[k]; const active = form.preset === k;
                       return (
                         <div key={k} onClick={() => choosePreset(k)} style={{ cursor: "pointer", padding: 14, borderRadius: 12, background: active ? "rgba(0,212,255,.1)" : "rgba(255,255,255,.03)", border: active ? "1px solid rgba(0,212,255,.45)" : "1px solid rgba(255,255,255,.08)" }}>
-                          <div style={{ fontSize: 20 }}>{p.icon}</div>
-                          <div style={{ fontWeight: 700, fontSize: 13, color: "var(--text)", marginTop: 6 }}>{p.label}</div>
-                          <div style={{ fontSize: 12, color: "var(--text3)", marginTop: 4, lineHeight: 1.5 }}>{p.desc}</div>
-                          <div style={{ fontSize: 9, color: "var(--cyan)", marginTop: 8, fontFamily: "'Share Tech Mono',monospace" }}>PL{p.paranoia_level} · thr {p.anomaly_threshold}</div>
+                          <div style={{ fontSize: 23 }}>{p.icon}</div>
+                          <div style={{ fontWeight: 700, fontSize: 15, color: "var(--text)", marginTop: 6 }}>{p.label}</div>
+                          <div style={{ fontSize: 14, color: "var(--text3)", marginTop: 4, lineHeight: 1.5 }}>{p.desc}</div>
+                          <div style={{ fontSize: 11, color: "var(--cyan)", marginTop: 8, fontFamily: "'Share Tech Mono',monospace" }}>PL{p.paranoia_level} · thr {p.anomaly_threshold}</div>
                         </div>
                       );
                     })}
@@ -380,7 +380,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     {form.domains.length === 0
                       ? <InfoBox tone="amber">Add a domain in <strong>Basics</strong> to see the public endpoint.</InfoBox>
                       : form.domains.map(d => (
-                        <span key={d} style={{ padding: "5px 11px", borderRadius: 8, background: "rgba(0,212,255,.06)", border: "1px solid rgba(0,212,255,.18)", fontFamily: "'Share Tech Mono',monospace", fontSize: 11, color: "var(--cyan)" }}>
+                        <span key={d} style={{ padding: "5px 11px", borderRadius: 8, background: "rgba(0,212,255,.06)", border: "1px solid rgba(0,212,255,.18)", fontFamily: "'Share Tech Mono',monospace", fontSize: 13, color: "var(--cyan)" }}>
                           {scheme}://{d}<span style={{ color: "var(--text3)" }}> → :{frontPort}</span>
                         </span>
                       ))}
@@ -400,8 +400,8 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                         const active = form.tls_mode === k;
                         return (
                           <div key={k} onClick={() => upd({ tls_mode: k })} style={{ cursor: "pointer", padding: 13, borderRadius: 12, background: active ? "rgba(0,212,255,.1)" : "rgba(255,255,255,.03)", border: active ? "1px solid rgba(0,212,255,.45)" : "1px solid rgba(255,255,255,.08)" }}>
-                            <div style={{ fontWeight: 700, fontSize: 12.5, color: "var(--text)" }}>{label}</div>
-                            <div style={{ fontSize: 12, color: "var(--text3)", marginTop: 5, lineHeight: 1.5 }}>{desc}</div>
+                            <div style={{ fontWeight: 700, fontSize: 14.5, color: "var(--text)" }}>{label}</div>
+                            <div style={{ fontSize: 14, color: "var(--text3)", marginTop: 5, lineHeight: 1.5 }}>{desc}</div>
                           </div>
                         );
                       })}
@@ -471,7 +471,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     </Row>
                     {adv && (
                       <Field label="Custom CA Directory URL" hint="Override the ACME directory endpoint (blank = provider default)">
-                        <input className="fin2" value={form.acme_ca_server} placeholder="https://acme-v02.api.letsencrypt.org/directory" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 11 }} onChange={e => upd({ acme_ca_server: e.target.value })} />
+                        <input className="fin2" value={form.acme_ca_server} placeholder="https://acme-v02.api.letsencrypt.org/directory" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 13 }} onChange={e => upd({ acme_ca_server: e.target.value })} />
                       </Field>
                     )}
                     {adv && form.acme_provider === "zerossl" && (<>
@@ -508,15 +508,15 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     </Field>
                     {form.custom_priority === "data" ? (<>
                       <Field label="Certificate (PEM)" hint="Full chain: leaf + intermediates">
-                        <textarea className="fin2" rows={4} value={form.cert_pem} placeholder="-----BEGIN CERTIFICATE-----" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 12, resize: "vertical" }} onChange={e => upd({ cert_pem: e.target.value })} />
+                        <textarea className="fin2" rows={4} value={form.cert_pem} placeholder="-----BEGIN CERTIFICATE-----" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 14, resize: "vertical" }} onChange={e => upd({ cert_pem: e.target.value })} />
                       </Field>
                       <Field label="Private Key (PEM)" hint="Stays on your control plane">
-                        <textarea className="fin2" rows={3} value={form.key_pem} placeholder="-----BEGIN PRIVATE KEY-----" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 12, resize: "vertical" }} onChange={e => upd({ key_pem: e.target.value })} />
+                        <textarea className="fin2" rows={3} value={form.key_pem} placeholder="-----BEGIN PRIVATE KEY-----" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 14, resize: "vertical" }} onChange={e => upd({ key_pem: e.target.value })} />
                       </Field>
                     </>) : (
                       <Row>
-                        <Field label="Certificate Path" hint="On the WAF node"><input className="fin2" value={form.cert_path} placeholder="/etc/ssl/site.crt" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 11 }} onChange={e => upd({ cert_path: e.target.value })} /></Field>
-                        <Field label="Key Path"><input className="fin2" value={form.key_path} placeholder="/etc/ssl/site.key" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 11 }} onChange={e => upd({ key_path: e.target.value })} /></Field>
+                        <Field label="Certificate Path" hint="On the WAF node"><input className="fin2" value={form.cert_path} placeholder="/etc/ssl/site.crt" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 13 }} onChange={e => upd({ cert_path: e.target.value })} /></Field>
+                        <Field label="Key Path"><input className="fin2" value={form.key_path} placeholder="/etc/ssl/site.key" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 13 }} onChange={e => upd({ key_path: e.target.value })} /></Field>
                       </Row>
                     )}
                   </>)}
@@ -617,8 +617,8 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                       const on = form.rule_categories.includes(c.key);
                       return (
                         <div key={c.key} onClick={() => toggleCat(c.key)} style={{ cursor: "pointer", padding: "8px 11px", borderRadius: 8, display: "flex", justifyContent: "space-between", gap: 8, background: on ? "rgba(0,230,118,.07)" : "rgba(255,255,255,.02)", border: on ? "1px solid rgba(0,230,118,.3)" : "1px solid rgba(255,255,255,.07)" }}>
-                          <div><div style={{ fontSize: 11, fontWeight: 600, color: "var(--text)" }}>{c.label}</div><div style={{ fontSize: 9, color: "var(--text3)", marginTop: 2 }}>{c.desc}</div></div>
-                          <div style={{ fontSize: 13, color: on ? "var(--green)" : "var(--text3)" }}>{on ? "✓" : "○"}</div>
+                          <div><div style={{ fontSize: 13, fontWeight: 600, color: "var(--text)" }}>{c.label}</div><div style={{ fontSize: 11, color: "var(--text3)", marginTop: 2 }}>{c.desc}</div></div>
+                          <div style={{ fontSize: 15, color: on ? "var(--green)" : "var(--text3)" }}>{on ? "✓" : "○"}</div>
                         </div>
                       );
                     })}
@@ -641,12 +641,12 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                   {form.rate_limit_enabled && (
                     <Row>
                       <div style={{ display: "flex", flexDirection: "column", gap: 10, padding: 12, borderRadius: 10, border: "1px solid rgba(255,255,255,.07)" }}>
-                        <div style={{ fontSize: 11, fontWeight: 700, color: "var(--cyan)" }}>Per-IP</div>
+                        <div style={{ fontSize: 13, fontWeight: 700, color: "var(--cyan)" }}>Per-IP</div>
                         <Field label="Requests / sec"><input className="fin2" type="number" value={form.rl_per_ip.rps} onChange={e => upd({ rl_per_ip: { ...form.rl_per_ip, rps: Number(e.target.value) } })} /></Field>
                         <Field label="Burst"><input className="fin2" type="number" value={form.rl_per_ip.burst} onChange={e => upd({ rl_per_ip: { ...form.rl_per_ip, burst: Number(e.target.value) } })} /></Field>
                       </div>
                       <div style={{ display: "flex", flexDirection: "column", gap: 10, padding: 12, borderRadius: 10, border: "1px solid rgba(255,255,255,.07)" }}>
-                        <div style={{ fontSize: 11, fontWeight: 700, color: "var(--cyan)" }}>Global</div>
+                        <div style={{ fontSize: 13, fontWeight: 700, color: "var(--cyan)" }}>Global</div>
                         <Field label="Requests / sec"><input className="fin2" type="number" value={form.rl_global.rps} onChange={e => upd({ rl_global: { ...form.rl_global, rps: Number(e.target.value) } })} /></Field>
                         <Field label="Burst"><input className="fin2" type="number" value={form.rl_global.burst} onChange={e => upd({ rl_global: { ...form.rl_global, burst: Number(e.target.value) } })} /></Field>
                       </div>
@@ -713,7 +713,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                         const on = form.geo_countries.includes(c.code);
                         return (
                           <span key={c.code} onClick={() => upd({ geo_countries: on ? form.geo_countries.filter(x => x !== c.code) : [...form.geo_countries, c.code] })}
-                            style={{ cursor: "pointer", padding: "4px 9px", borderRadius: 12, fontSize: 12, fontFamily: "'Share Tech Mono',monospace", background: on ? (form.geo_mode === "allow" ? "rgba(0,230,118,.12)" : "rgba(255,45,85,.12)") : "rgba(255,255,255,.03)", border: on ? `1px solid ${form.geo_mode === "allow" ? "rgba(0,230,118,.4)" : "rgba(255,45,85,.4)"}` : "1px solid rgba(255,255,255,.08)", color: on ? "var(--text)" : "var(--text3)" }}>{c.code} {c.name}</span>
+                            style={{ cursor: "pointer", padding: "4px 9px", borderRadius: 12, fontSize: 14, fontFamily: "'Share Tech Mono',monospace", background: on ? (form.geo_mode === "allow" ? "rgba(0,230,118,.12)" : "rgba(255,45,85,.12)") : "rgba(255,255,255,.03)", border: on ? `1px solid ${form.geo_mode === "allow" ? "rgba(0,230,118,.4)" : "rgba(255,45,85,.4)"}` : "1px solid rgba(255,255,255,.08)", color: on ? "var(--text)" : "var(--text3)" }}>{c.code} {c.name}</span>
                         );
                       })}
                     </div>
@@ -735,18 +735,18 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                 {screen === "headers" && (<>
                   <StepHead title="HTTP Headers" sub="Response security headers. The WAF always injects secure defaults; these override per-site." tag="stored" />
                   <InfoBox>🛡️ Secure defaults (X-Content-Type-Options, X-Frame-Options, X-XSS-Protection) are always applied. The values below override them for this site.</InfoBox>
-                  <Field label="Content-Security-Policy" hint="Leave blank to omit CSP"><input className="fin2" value={form.csp} placeholder="default-src 'self'" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 11 }} onChange={e => upd({ csp: e.target.value })} /></Field>
+                  <Field label="Content-Security-Policy" hint="Leave blank to omit CSP"><input className="fin2" value={form.csp} placeholder="default-src 'self'" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 13 }} onChange={e => upd({ csp: e.target.value })} /></Field>
                   <Row>
                     <Field label="Referrer-Policy">
                       <select className="fin2 fsel2" value={form.referrer_policy} onChange={e => upd({ referrer_policy: e.target.value })}>
                         {["no-referrer", "no-referrer-when-downgrade", "strict-origin", "strict-origin-when-cross-origin", "same-origin", "origin"].map(v => <option key={v} value={v}>{v}</option>)}
                       </select>
                     </Field>
-                    <Field label="Cookie Flags" hint="Applied to Set-Cookie"><input className="fin2" value={form.cookie_flags} style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 11 }} onChange={e => upd({ cookie_flags: e.target.value })} /></Field>
+                    <Field label="Cookie Flags" hint="Applied to Set-Cookie"><input className="fin2" value={form.cookie_flags} style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 13 }} onChange={e => upd({ cookie_flags: e.target.value })} /></Field>
                   </Row>
-                  <Field label="Permissions-Policy"><input className="fin2" value={form.permissions_policy} style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 11 }} onChange={e => upd({ permissions_policy: e.target.value })} /></Field>
+                  <Field label="Permissions-Policy"><input className="fin2" value={form.permissions_policy} style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 13 }} onChange={e => upd({ permissions_policy: e.target.value })} /></Field>
                   <SectionToggle label="CORS (Access-Control-Allow-Origin)" desc="Add cross-origin response headers" on={form.cors_enabled} set={v => upd({ cors_enabled: v })} />
-                  {form.cors_enabled && <Field label="Allowed Origins" hint="* or comma-separated origins"><input className="fin2" value={form.cors_origins} style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 11 }} onChange={e => upd({ cors_origins: e.target.value })} /></Field>}
+                  {form.cors_enabled && <Field label="Allowed Origins" hint="* or comma-separated origins"><input className="fin2" value={form.cors_origins} style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 13 }} onChange={e => upd({ cors_origins: e.target.value })} /></Field>}
                   <GroupLabel>Custom Headers</GroupLabel>
                   {form.custom_headers.map((h, i) => (
                     <div key={i} style={{ display: "grid", gridTemplateColumns: "1fr 1.5fr auto", gap: 8, alignItems: "end" }}>
@@ -772,7 +772,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     {HTTP_METHODS.map(m => {
                       const on = form.allowed_methods.includes(m);
                       return (
-                        <span key={m} onClick={() => toggleMethod(m)} style={{ cursor: "pointer", padding: "5px 11px", borderRadius: 8, fontSize: 11, fontWeight: 600, fontFamily: "'Share Tech Mono',monospace", background: on ? "rgba(0,230,118,.1)" : "rgba(255,255,255,.03)", border: on ? "1px solid rgba(0,230,118,.35)" : "1px solid rgba(255,255,255,.08)", color: on ? "var(--text)" : "var(--text3)" }}>{m}</span>
+                        <span key={m} onClick={() => toggleMethod(m)} style={{ cursor: "pointer", padding: "5px 11px", borderRadius: 8, fontSize: 13, fontWeight: 600, fontFamily: "'Share Tech Mono',monospace", background: on ? "rgba(0,230,118,.1)" : "rgba(255,255,255,.03)", border: on ? "1px solid rgba(0,230,118,.35)" : "1px solid rgba(255,255,255,.08)", color: on ? "var(--text)" : "var(--text3)" }}>{m}</span>
                       );
                     })}
                   </div>
@@ -808,7 +808,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                       ["Headers", `${form.csp ? "CSP " : ""}${form.cors_enabled ? "CORS " : ""}${form.hsts ? "HSTS " : ""}${form.custom_headers.filter(h => h.name).length} custom`],
                       ["ML", form.ml_enabled ? `on (${form.ml_sensitivity})` : "off"],
                     ].map(([k, v]) => (
-                      <div key={k} style={{ display: "flex", justifyContent: "space-between", padding: "7px 12px", background: "rgba(255,255,255,.02)", borderRadius: 8, fontSize: 11 }}>
+                      <div key={k} style={{ display: "flex", justifyContent: "space-between", padding: "7px 12px", background: "rgba(255,255,255,.02)", borderRadius: 8, fontSize: 13 }}>
                         <span style={{ color: "var(--text3)" }}>{k}</span>
                         <span style={{ color: "var(--text)", fontFamily: "'Share Tech Mono',monospace", textAlign: "right", maxWidth: "62%" }}>{v}</span>
                       </div>
@@ -821,7 +821,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
 
           {/* Footer */}
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 22px", borderTop: "1px solid rgba(255,255,255,.06)" }}>
-            <div style={{ fontSize: 12, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>Step {step + 1} / {steps.length}</div>
+            <div style={{ fontSize: 14, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>Step {step + 1} / {steps.length}</div>
             <div style={{ display: "flex", gap: 8 }}>
               <button className="btn bg-btn" type="button" onClick={step === 0 ? onClose : back}>{step === 0 ? "Cancel" : "← Back"}</button>
               {step < steps.length - 1 && <button className="btn bg-btn" type="button" onClick={next}>Next →</button>}

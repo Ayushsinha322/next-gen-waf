@@ -62,11 +62,11 @@ function Kpi({ icon, label, value, sub, accent }: { icon: string; label: string;
   return (
     <motion.div className="panel" variants={cardVariants} style={{ padding: "14px 16px" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-        <div style={{ fontSize: 12, color: "var(--text3)", textTransform: "uppercase", letterSpacing: 1, fontFamily: "'Share Tech Mono',monospace" }}>{label}</div>
-        <span style={{ fontSize: 15, opacity: 0.85 }}>{icon}</span>
+        <div style={{ fontSize: 14, color: "var(--text3)", textTransform: "uppercase", letterSpacing: 1, fontFamily: "'Share Tech Mono',monospace" }}>{label}</div>
+        <span style={{ fontSize: 17, opacity: 0.85 }}>{icon}</span>
       </div>
-      <div style={{ fontSize: 24, fontWeight: 800, color: accent ?? "var(--text)", marginTop: 8, fontFamily: "'Orbitron',sans-serif", lineHeight: 1 }}>{value}</div>
-      {sub && <div style={{ fontSize: 12, color: "var(--text3)", marginTop: 6, fontFamily: "'Share Tech Mono',monospace" }}>{sub}</div>}
+      <div style={{ fontSize: 27, fontWeight: 800, color: accent ?? "var(--text)", marginTop: 8, fontFamily: "'Orbitron',sans-serif", lineHeight: 1 }}>{value}</div>
+      {sub && <div style={{ fontSize: 14, color: "var(--text3)", marginTop: 6, fontFamily: "'Share Tech Mono',monospace" }}>{sub}</div>}
     </motion.div>
   );
 }
@@ -249,7 +249,7 @@ export default function OverviewPage() {
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center", flexShrink: 0 }}>
           <motion.div
-            style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 12px", background: wafStatus?.running ? "rgba(34,197,94,0.08)" : "rgba(239,68,68,0.08)", border: wafStatus?.running ? "1px solid rgba(34,197,94,0.2)" : "1px solid rgba(239,68,68,0.2)", borderRadius: 20, fontSize: 11, color: wafStatus?.running ? "#86efac" : "#fca5a5" }}
+            style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 12px", background: wafStatus?.running ? "rgba(34,197,94,0.08)" : "rgba(239,68,68,0.08)", border: wafStatus?.running ? "1px solid rgba(34,197,94,0.2)" : "1px solid rgba(239,68,68,0.2)", borderRadius: 20, fontSize: 13, color: wafStatus?.running ? "#86efac" : "#fca5a5" }}
             animate={{ boxShadow: wafStatus?.running ? ["0 0 8px rgba(34,197,94,.15)", "0 0 18px rgba(34,197,94,.3)", "0 0 8px rgba(34,197,94,.15)"] : ["0 0 8px rgba(239,68,68,.15)", "0 0 18px rgba(239,68,68,.3)", "0 0 8px rgba(239,68,68,.15)"] }}
             transition={{ duration: 2, repeat: Infinity }}>
             <div className={`sd ${wafStatus?.running ? "g" : "r"}`} />
@@ -268,22 +268,22 @@ export default function OverviewPage() {
             <div key={k} className="panel" style={{ padding: 18, position: "relative", border: active ? "1px solid var(--cyan-ring)" : undefined, background: active ? "var(--cyan-dim)" : undefined }}>
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                  <span style={{ fontFamily: "'Orbitron',sans-serif", fontSize: 18, fontWeight: 800, color: p.accent }}>{p.name}</span>
-                  {active && <span style={{ fontSize: 9, fontWeight: 700, padding: "3px 9px", borderRadius: 20, background: "var(--cyan)", color: "#021018", letterSpacing: 0.5 }}>● CURRENT PLAN</span>}
+                  <span style={{ fontFamily: "'Orbitron',sans-serif", fontSize: 20, fontWeight: 800, color: p.accent }}>{p.name}</span>
+                  {active && <span style={{ fontSize: 11, fontWeight: 700, padding: "3px 9px", borderRadius: 20, background: "var(--cyan)", color: "#021018", letterSpacing: 0.5 }}>● CURRENT PLAN</span>}
                 </div>
-                <span style={{ fontSize: 11, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>{p.price}</span>
+                <span style={{ fontSize: 13, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>{p.price}</span>
               </div>
-              <div style={{ fontSize: 11, color: "var(--text3)", marginTop: 4 }}>{p.tagline}</div>
+              <div style={{ fontSize: 13, color: "var(--text3)", marginTop: 4 }}>{p.tagline}</div>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, margin: "14px 0" }}>
                 {Object.entries(p.limits).map(([key, val]) => (
-                  <div key={key} style={{ fontSize: 10.5, color: "var(--text2)", display: "flex", alignItems: "center", gap: 6 }}>
+                  <div key={key} style={{ fontSize: 12.5, color: "var(--text2)", display: "flex", alignItems: "center", gap: 6 }}>
                     <span style={{ color: p.accent }}>▸</span>{val}
                   </div>
                 ))}
               </div>
               <div style={{ display: "flex", flexDirection: "column", gap: 5, borderTop: "1px solid var(--bg4)", paddingTop: 12 }}>
                 {p.highlights.map(h => (
-                  <div key={h} style={{ fontSize: 10.5, color: h.endsWith(":") ? "var(--text3)" : "var(--text2)", display: "flex", gap: 7 }}>
+                  <div key={h} style={{ fontSize: 12.5, color: h.endsWith(":") ? "var(--text3)" : "var(--text2)", display: "flex", gap: 7 }}>
                     {!h.endsWith(":") && <span style={{ color: "var(--green)" }}>✓</span>}{h}
                   </div>
                 ))}
@@ -314,7 +314,7 @@ export default function OverviewPage() {
         <motion.div className="mc pur" variants={cardVariants}><div className="mc-label">ML detections</div><div className="mc-val"><AnimatedValue value={mlDet} /></div><div className="mc-delta" style={{ color: "#c4b5fd" }}>▲ anomaly engine active</div></motion.div>
         <motion.div className="mc cyan" variants={cardVariants}>
           <div className="mc-label">HTTP/3</div>
-          <div className="mc-val" style={{ fontSize: 22 }}>{wafStatus?.http3?.enabled ? "Active" : "Off"}</div>
+          <div className="mc-val" style={{ fontSize: 25 }}>{wafStatus?.http3?.enabled ? "Active" : "Off"}</div>
           <div className="mc-delta" style={{ color: wafStatus?.http3?.enabled ? "#67e8f9" : "var(--text3)" }}>
             {wafStatus?.http3?.enabled ? `▲ QUIC · :${wafStatus.http3.advertise_port ?? "443"}` : "— not enabled"}
           </div>
@@ -327,14 +327,14 @@ export default function OverviewPage() {
           <div className="ph"><div className="ptitle">Traffic &amp; threat timeline</div><div style={{ display: "flex", gap: 8 }}><span className="panel-badge pb-live">● Live</span><span className="panel-badge pb-info">Last 60s</span></div></div>
           <div className="pb">
             <canvas ref={chartRef} height={160} style={{ width: "100%", display: "block" }} />
-            {metrics === null && <div style={{ textAlign: "center", paddingTop: 8, fontSize: 12, fontFamily: "'Share Tech Mono',monospace", color: "var(--text3)" }}>waiting for data plane…</div>}
+            {metrics === null && <div style={{ textAlign: "center", paddingTop: 8, fontSize: 14, fontFamily: "'Share Tech Mono',monospace", color: "var(--text3)" }}>waiting for data plane…</div>}
           </div>
         </div>
         <div className="panel">
           <div className="ph"><div className="ptitle">Attack breakdown</div><span className="panel-badge pb-info">Live</span></div>
           <div className="pb">
             {attackRows.length === 0 ? (
-              <div style={{ padding: "20px 0", textAlign: "center", fontSize: 11, fontFamily: "'Share Tech Mono',monospace", color: "var(--text3)" }}>No attacks detected yet</div>
+              <div style={{ padding: "20px 0", textAlign: "center", fontSize: 13, fontFamily: "'Share Tech Mono',monospace", color: "var(--text3)" }}>No attacks detected yet</div>
             ) : attackRows.map(([key, count], idx) => {
               const meta = ATTACK_META[key];
               return (
@@ -363,8 +363,8 @@ export default function OverviewPage() {
             <div style={{ display: "flex", justifyContent: "center" }}>
               <div style={{ width: 172, height: 172, borderRadius: "50%", background: `conic-gradient(${conic})`, position: "relative" }}>
                 <div style={{ position: "absolute", inset: 23, borderRadius: "50%", background: "var(--bg2)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
-                  <div style={{ fontSize: 32, fontWeight: 800, color: "var(--text)", fontFamily: "'Orbitron',sans-serif", lineHeight: 1 }}>{sTotal > 0 ? `${((s2 / sTotal) * 100).toFixed(0)}%` : "—"}</div>
-                  <div style={{ fontSize: 10, color: "var(--text3)", marginTop: 5, letterSpacing: 1, textTransform: "uppercase", fontFamily: "'Share Tech Mono',monospace" }}>success</div>
+                  <div style={{ fontSize: 36, fontWeight: 800, color: "var(--text)", fontFamily: "'Orbitron',sans-serif", lineHeight: 1 }}>{sTotal > 0 ? `${((s2 / sTotal) * 100).toFixed(0)}%` : "—"}</div>
+                  <div style={{ fontSize: 12, color: "var(--text3)", marginTop: 5, letterSpacing: 1, textTransform: "uppercase", fontFamily: "'Share Tech Mono',monospace" }}>success</div>
                 </div>
               </div>
             </div>
@@ -372,7 +372,7 @@ export default function OverviewPage() {
             {/* Per-status proportion bars */}
             <div style={{ display: "flex", flexDirection: "column", gap: 15 }}>
               {statusSlices.map(s => (
-                <div key={s.label} style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12 }}>
+                <div key={s.label} style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 14 }}>
                   <span style={{ width: 10, height: 10, borderRadius: 2, background: s.color, flexShrink: 0 }} />
                   <span style={{ color: "var(--text2)", width: 30, fontFamily: "'Share Tech Mono',monospace", flexShrink: 0 }}>{s.label}</span>
                   <div className="atk-bar-bg" style={{ flex: 1 }}>
@@ -387,13 +387,13 @@ export default function OverviewPage() {
             {/* Summary footer */}
             <div style={{ display: "flex", alignItems: "stretch", gap: 12, borderTop: "1px solid var(--bg4)", paddingTop: 16 }}>
               <div style={{ flex: 1, textAlign: "center" }}>
-                <div style={{ fontSize: 19, fontWeight: 800, color: "#22c55e", fontFamily: "'Orbitron',sans-serif", lineHeight: 1 }}>{sTotal > 0 ? `${(((s2 + s3) / sTotal) * 100).toFixed(1)}%` : "—"}</div>
-                <div style={{ fontSize: 9, color: "var(--text3)", letterSpacing: 1, textTransform: "uppercase", marginTop: 5, fontFamily: "'Share Tech Mono',monospace" }}>OK · 2xx/3xx</div>
+                <div style={{ fontSize: 21, fontWeight: 800, color: "#22c55e", fontFamily: "'Orbitron',sans-serif", lineHeight: 1 }}>{sTotal > 0 ? `${(((s2 + s3) / sTotal) * 100).toFixed(1)}%` : "—"}</div>
+                <div style={{ fontSize: 11, color: "var(--text3)", letterSpacing: 1, textTransform: "uppercase", marginTop: 5, fontFamily: "'Share Tech Mono',monospace" }}>OK · 2xx/3xx</div>
               </div>
               <div style={{ width: 1, background: "var(--bg4)" }} />
               <div style={{ flex: 1, textAlign: "center" }}>
-                <div style={{ fontSize: 19, fontWeight: 800, color: "#ef4444", fontFamily: "'Orbitron',sans-serif", lineHeight: 1 }}>{(s4 + s5).toLocaleString()}</div>
-                <div style={{ fontSize: 9, color: "var(--text3)", letterSpacing: 1, textTransform: "uppercase", marginTop: 5, fontFamily: "'Share Tech Mono',monospace" }}>Errors · 4xx/5xx</div>
+                <div style={{ fontSize: 21, fontWeight: 800, color: "#ef4444", fontFamily: "'Orbitron',sans-serif", lineHeight: 1 }}>{(s4 + s5).toLocaleString()}</div>
+                <div style={{ fontSize: 11, color: "var(--text3)", letterSpacing: 1, textTransform: "uppercase", marginTop: 5, fontFamily: "'Share Tech Mono',monospace" }}>Errors · 4xx/5xx</div>
               </div>
             </div>
           </div>
@@ -406,7 +406,7 @@ export default function OverviewPage() {
           <div className="ph"><div className="ptitle">Recent events</div><span className="panel-badge pb-live">Live</span></div>
           <div className="pb">
             {feed.length === 0 ? (
-              <div style={{ padding: "16px 0", textAlign: "center", fontSize: 11, fontFamily: "'Share Tech Mono',monospace", color: "var(--text3)" }}>Waiting for events…</div>
+              <div style={{ padding: "16px 0", textAlign: "center", fontSize: 13, fontFamily: "'Share Tech Mono',monospace", color: "var(--text3)" }}>Waiting for events…</div>
             ) : feed.slice(0, 7).map((r, i) => {
               const dotCls = r.st === 403 || r.st === 400 ? "ev-red" : r.st >= 500 || r.latency > 3 ? "ev-amber" : r.m === "POST" || r.m === "PUT" ? "ev-blue" : "ev-green";
               const label = r.st === 403 ? `Blocked — ${r.m} ${r.path}` : r.st >= 500 ? `Error — ${r.m} ${r.path}` : `${r.m} ${r.path}`;
@@ -424,7 +424,7 @@ export default function OverviewPage() {
           <div className="ph"><div className="ptitle">Top attacker IPs</div><span className="panel-badge pb-info">Live feed</span></div>
           <div className="pb">
             {topIPs.length === 0 ? (
-              <div style={{ padding: "16px 0", textAlign: "center", fontSize: 11, fontFamily: "'Share Tech Mono',monospace", color: "var(--text3)" }}>No traffic yet</div>
+              <div style={{ padding: "16px 0", textAlign: "center", fontSize: 13, fontFamily: "'Share Tech Mono',monospace", color: "var(--text3)" }}>No traffic yet</div>
             ) : topIPs.map(([ip, cnt], idx) => (
               <motion.div key={ip} className="ip-row" initial={{ opacity: 0, x: -6 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: 0.5 + idx * 0.05 }}>
                 <div className="ip-addr">{ip}</div><div className="ip-count">{cnt} hits</div>
@@ -476,7 +476,7 @@ function AlertsPreview() {
       </div>
       <div className="tw">
         {alerts.length === 0 ? (
-          <div style={{ padding: "16px", fontFamily: "'Share Tech Mono',monospace", fontSize: 11, color: "var(--text3)", textAlign: "center" }}>No open alerts</div>
+          <div style={{ padding: "16px", fontFamily: "'Share Tech Mono',monospace", fontSize: 13, color: "var(--text3)", textAlign: "center" }}>No open alerts</div>
         ) : (
           <table>
             <thead><tr><th>Severity</th><th>Time</th><th>Kind</th><th>Summary</th><th>State</th></tr></thead>

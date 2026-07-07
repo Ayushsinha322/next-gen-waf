@@ -90,7 +90,7 @@ export default function MLPage() {
             ML / AI Engine
             {stats && <span className="ml-status-dot" style={{ background: statusColor }} title={stats.model_status} />}
           </div>
-          <div style={{ fontSize: 11, fontFamily: "'Share Tech Mono',monospace", color: "var(--text2)" }}>Auto-refresh: 5 s</div>
+          <div style={{ fontSize: 13, fontFamily: "'Share Tech Mono',monospace", color: "var(--text2)" }}>Auto-refresh: 5 s</div>
         </div>
       </motion.div>
 

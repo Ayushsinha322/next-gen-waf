@@ -172,7 +172,7 @@ export default function SiteDetailPage() {
     catch { showToast("Failed to delete", "e", "⚠️"); }
   }
 
-  if (loading) return <div className="sec"><div style={{ padding: 40, textAlign: "center", color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", fontSize: 12 }}>Loading site…</div></div>;
+  if (loading) return <div className="sec"><div style={{ padding: 40, textAlign: "center", color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", fontSize: 14 }}>Loading site…</div></div>;
   if (!site || !form) return <div className="sec"><div style={{ padding: 40, textAlign: "center", color: "var(--text3)" }}>Site not found. <button className="btn bg-btn btn-sm" onClick={() => router.push("/sites")}>← Back</button></div></div>;
 
   const scheme = form.front_https ? "https" : "http";
@@ -185,13 +185,13 @@ export default function SiteDetailPage() {
       {/* Header */}
       <motion.div variants={fadeUp} style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 14 }}>
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-          <button onClick={() => router.push("/sites")} style={{ background: "none", border: "none", color: "var(--text3)", cursor: "pointer", fontSize: 11, padding: 0, textAlign: "left", fontFamily: "'Share Tech Mono',monospace" }}>← All sites</button>
+          <button onClick={() => router.push("/sites")} style={{ background: "none", border: "none", color: "var(--text3)", cursor: "pointer", fontSize: 13, padding: 0, textAlign: "left", fontFamily: "'Share Tech Mono',monospace" }}>← All sites</button>
           <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
             <div className="sec-title">{site.name}</div>
             <span className={`bdg ${site.status === "active" ? "bgg" : "bgr"}`}>{site.status}</span>
           </div>
           <div className="sec-sub" style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-            {site.domains.map(d => <a key={d} href={`${scheme}://${d}:9080/`} target="_blank" rel="noreferrer" style={{ color: "var(--cyan)", fontFamily: "'Share Tech Mono',monospace", fontSize: 11 }}>{scheme}://{d} ↗</a>)}
+            {site.domains.map(d => <a key={d} href={`${scheme}://${d}:9080/`} target="_blank" rel="noreferrer" style={{ color: "var(--cyan)", fontFamily: "'Share Tech Mono',monospace", fontSize: 13 }}>{scheme}://{d} ↗</a>)}
           </div>
         </div>
         <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
@@ -214,17 +214,17 @@ export default function SiteDetailPage() {
                 border: `1.5px solid ${active ? m.color : "var(--bg4)"}`, opacity: busy ? 0.7 : 1, transition: "all .15s",
               }}>
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                  <span style={{ fontWeight: 700, fontSize: 14, color: active ? m.color : "var(--text2)", fontFamily: "'Orbitron',sans-serif" }}>{m.label}</span>
+                  <span style={{ fontWeight: 700, fontSize: 16, color: active ? m.color : "var(--text2)", fontFamily: "'Orbitron',sans-serif" }}>{m.label}</span>
                   {active && <span style={{ width: 10, height: 10, borderRadius: "50%", background: m.color }} />}
                 </div>
-                <div style={{ fontSize: 12, color: "var(--text3)", marginTop: 6, lineHeight: 1.5 }}>{m.desc}</div>
+                <div style={{ fontSize: 14, color: "var(--text3)", marginTop: 6, lineHeight: 1.5 }}>{m.desc}</div>
               </div>
             );
           })}
         </div>
         {mode === "learning" && (
           <div className="pb" style={{ paddingTop: 0 }}>
-            <div style={{ padding: "9px 13px", background: "rgba(255,176,32,.08)", border: "1px solid rgba(255,176,32,.25)", borderRadius: "var(--r2)", fontSize: 10.5, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", lineHeight: 1.6 }}>
+            <div style={{ padding: "9px 13px", background: "rgba(255,176,32,.08)", border: "1px solid rgba(255,176,32,.25)", borderRadius: "var(--r2)", fontSize: 12.5, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", lineHeight: 1.6 }}>
               📚 In Learning mode the WAF logs what it <strong>would</strong> block without affecting traffic. Watch the <strong>WAF Logs</strong> tab below, then switch to <strong>Blocking</strong> when false-positives are tuned out.
             </div>
           </div>
@@ -242,10 +242,10 @@ export default function SiteDetailPage() {
         ].map((k, i) => (
           <motion.div key={i} className="panel" variants={cardVariants} style={{ padding: "13px 15px" }}>
             <div style={{ display: "flex", justifyContent: "space-between" }}>
-              <span style={{ fontSize: 12, color: "var(--text3)", textTransform: "uppercase", letterSpacing: 1, fontFamily: "'Share Tech Mono',monospace" }}>{k.lbl}</span>
-              <span style={{ fontSize: 13 }}>{k.ico}</span>
+              <span style={{ fontSize: 14, color: "var(--text3)", textTransform: "uppercase", letterSpacing: 1, fontFamily: "'Share Tech Mono',monospace" }}>{k.lbl}</span>
+              <span style={{ fontSize: 15 }}>{k.ico}</span>
             </div>
-            <div style={{ fontSize: 22, fontWeight: 800, color: k.accent, marginTop: 6, fontFamily: "'Orbitron',sans-serif" }}>{k.val}</div>
+            <div style={{ fontSize: 25, fontWeight: 800, color: k.accent, marginTop: 6, fontFamily: "'Orbitron',sans-serif" }}>{k.val}</div>
           </motion.div>
         ))}
       </motion.div>
@@ -254,7 +254,7 @@ export default function SiteDetailPage() {
       <motion.div variants={fadeUp} style={{ display: "flex", gap: 4, padding: 4, background: "var(--bg3)", borderRadius: 10, width: "fit-content" }}>
         {([["overview", "🗂 Overview"], ["waf", "🛡️ WAF Logs"], ["access", "📡 Access Logs"], ["learning", "📚 Learning Report"], ["cert", "🔐 Certificate"]] as [Tab, string][]).map(([k, label]) => (
           <button key={k} onClick={() => setTab(k)} style={{
-            padding: "7px 16px", borderRadius: 7, border: "none", cursor: "pointer", fontSize: 12, fontWeight: 600,
+            padding: "7px 16px", borderRadius: 7, border: "none", cursor: "pointer", fontSize: 14, fontWeight: 600,
             background: tab === k ? "var(--cyan)" : "transparent", color: tab === k ? "#021018" : "var(--text2)",
           }}>{label}</button>
         ))}
@@ -354,7 +354,7 @@ export default function SiteDetailPage() {
           {tab === "learning" && (
             <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
               <div style={{
-                fontSize: 11, color: "var(--text3)", lineHeight: 1.7, fontFamily: "'Share Tech Mono',monospace",
+                fontSize: 13, color: "var(--text3)", lineHeight: 1.7, fontFamily: "'Share Tech Mono',monospace",
                 background: "var(--bg3)", borderRadius: 8, padding: "10px 14px",
               }}>
                 {mode === "learning"
@@ -385,9 +385,9 @@ export default function SiteDetailPage() {
                               <td style={{ maxWidth: 300 }}>
                                 <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
                                   {r.samples.slice(0, 3).map((p, i) => (
-                                    <span key={i} style={{ fontSize: 12, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p}</span>
+                                    <span key={i} style={{ fontSize: 14, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p}</span>
                                   ))}
-                                  {r.samples.length === 0 && <span style={{ fontSize: 12, color: "var(--text3)" }}>—</span>}
+                                  {r.samples.length === 0 && <span style={{ fontSize: 14, color: "var(--text3)" }}>—</span>}
                                 </div>
                               </td>
                               <td className="td3">{timePart(r.last_seen)}</td>
@@ -440,7 +440,7 @@ export default function SiteDetailPage() {
                 {!cert ? (
                   <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
                     <Empty text="No certificate installed for this site's domains." />
-                    <div style={{ fontSize: 11, color: "var(--text3)", lineHeight: 1.7, fontFamily: "'Share Tech Mono',monospace" }}>
+                    <div style={{ fontSize: 13, color: "var(--text3)", lineHeight: 1.7, fontFamily: "'Share Tech Mono',monospace" }}>
                       Configure TLS in <button className="btn bg-btn btn-xs" onClick={() => setEditing(true)}>✏️ Edit → Front Service</button>. With automatic ACME, a cert is requested on save (once DNS points here). Self-signed is served until then.
                     </div>
                   </div>
@@ -454,7 +454,7 @@ export default function SiteDetailPage() {
                     </div>
                     {certDays !== null && (
                       <div>
-                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "var(--text3)", marginBottom: 4, fontFamily: "'Share Tech Mono',monospace" }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 14, color: "var(--text3)", marginBottom: 4, fontFamily: "'Share Tech Mono',monospace" }}>
                           <span>Validity</span><span>{certDays} days remaining</span>
                         </div>
                         <div style={{ height: 7, background: "var(--bg3)", borderRadius: 4, overflow: "hidden" }}>
@@ -496,7 +496,7 @@ function ConfigCard({ title, children }: { title: string; children: React.ReactN
 
 function KV({ k, v }: { k: string; v: string }) {
   return (
-    <div style={{ display: "flex", justifyContent: "space-between", gap: 10, fontSize: 11 }}>
+    <div style={{ display: "flex", justifyContent: "space-between", gap: 10, fontSize: 13 }}>
       <span style={{ color: "var(--text3)" }}>{k}</span>
       <span style={{ color: "var(--text)", fontFamily: "'Share Tech Mono',monospace", textAlign: "right", maxWidth: "62%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{v}</span>
     </div>
@@ -504,5 +504,5 @@ function KV({ k, v }: { k: string; v: string }) {
 }
 
 function Empty({ text }: { text: string }) {
-  return <div style={{ padding: "22px 12px", textAlign: "center", fontSize: 11, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>{text}</div>;
+  return <div style={{ padding: "22px 12px", textAlign: "center", fontSize: 13, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>{text}</div>;
 }

@@ -131,16 +131,16 @@ export default function AlertsPage() {
         <div className="ph">
           <div className="ptitle">🔴 Alert Queue ({filtered.length})</div>
           <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
-            <div style={{position:"relative"}}><span style={{position:"absolute",left:10,top:"50%",transform:"translateY(-50%)",color:"var(--text3)",fontSize:12,pointerEvents:"none"}}>🔍</span><input className="fi2" type="text" placeholder="Search alerts..." style={{width:180}} value={search} onChange={e=>setSearch(e.target.value)} /></div>
+            <div style={{position:"relative"}}><span style={{position:"absolute",left:10,top:"50%",transform:"translateY(-50%)",color:"var(--text3)",fontSize: 14,pointerEvents:"none"}}>🔍</span><input className="fi2" type="text" placeholder="Search alerts..." style={{width:180}} value={search} onChange={e=>setSearch(e.target.value)} /></div>
             <select className="fsel" value={sevFilter} onChange={e=>setSevFilter(e.target.value)}><option value="">All Severity</option><option value="CRITICAL">CRITICAL</option><option value="HIGH">HIGH</option><option value="MEDIUM">MEDIUM</option><option value="LOW">LOW</option></select>
             <select className="fsel" value={stateFilter} onChange={e=>setStateFilter(e.target.value)}><option value="">All States</option><option value="open">Open</option><option value="acked">Acknowledged</option><option value="resolved">Resolved</option></select>
           </div>
         </div>
         <div className="tw">
           {loading ? (
-            <div style={{padding:"24px",textAlign:"center",fontFamily:"'Share Tech Mono',monospace",fontSize:11,color:"var(--text3)"}}>Loading alerts…</div>
+            <div style={{padding:"24px",textAlign:"center",fontFamily:"'Share Tech Mono',monospace",fontSize: 13,color:"var(--text3)"}}>Loading alerts…</div>
           ) : filtered.length === 0 ? (
-            <div style={{padding:"24px",textAlign:"center",fontFamily:"'Share Tech Mono',monospace",fontSize:11,color:"var(--text3)"}}>No alerts found</div>
+            <div style={{padding:"24px",textAlign:"center",fontFamily:"'Share Tech Mono',monospace",fontSize: 13,color:"var(--text3)"}}>No alerts found</div>
           ) : (
             <table>
               <thead><tr><th>Severity</th><th>Time</th><th>Kind</th><th>Summary</th><th>State</th><th>Actions</th></tr></thead>

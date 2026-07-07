@@ -194,7 +194,7 @@ export default function WorldMap({
             ["⟲", reset]].map(([label, fn], i) => (
             <button key={i} onClick={fn as () => void} style={{
               width: 26, height: 26, borderRadius: 6, border: "1px solid var(--bg4)",
-              background: "var(--bg2)", color: "var(--text2)", cursor: "pointer", fontSize: 13, lineHeight: 1,
+              background: "var(--bg2)", color: "var(--text2)", cursor: "pointer", fontSize: 15, lineHeight: 1,
               fontFamily: "'Share Tech Mono',monospace",
             }}>{label as string}</button>
           ))}
@@ -203,7 +203,7 @@ export default function WorldMap({
         {/* hover readout */}
         <div style={{
           position: "absolute", top: 8, right: 8, padding: "5px 10px", borderRadius: 8,
-          background: "var(--bg2)", border: "1px solid var(--bg4)", fontSize: 12,
+          background: "var(--bg2)", border: "1px solid var(--bg4)", fontSize: 14,
           color: "var(--text2)", fontFamily: "'Share Tech Mono',monospace",
           opacity: hover ? 1 : 0.45, transition: "opacity .15s", pointerEvents: "none", maxWidth: 200,
         }}>
@@ -219,17 +219,17 @@ export default function WorldMap({
             boxShadow: "0 10px 30px rgba(0,0,0,.5)", padding: 10, width: 210, zIndex: 20,
           }}>
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-              <span style={{ fontSize: 16 }}>{menu.flag}</span>
+              <span style={{ fontSize: 18 }}>{menu.flag}</span>
               <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 13, color: "var(--text)", fontWeight: 600 }}>{menu.name}</div>
-                <div style={{ fontSize: 11, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>
+                <div style={{ fontSize: 15, color: "var(--text)", fontWeight: 600 }}>{menu.name}</div>
+                <div style={{ fontSize: 13, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>
                   {menu.n > 0 ? `${menu.n.toLocaleString()} blocked requests` : "no blocked traffic"}
                 </div>
               </div>
             </div>
             <button disabled={busy === menu.code} onClick={() => toggleBlock(menu.code, menu.name)}
               style={{
-                width: "100%", padding: "7px 10px", borderRadius: 7, cursor: "pointer", fontSize: 12, fontWeight: 600,
+                width: "100%", padding: "7px 10px", borderRadius: 7, cursor: "pointer", fontSize: 14, fontWeight: 600,
                 border: "1px solid " + (blocked.has(menu.code) ? "rgba(0,230,118,.4)" : "rgba(255,69,96,.45)"),
                 background: blocked.has(menu.code) ? "rgba(0,230,118,.12)" : "rgba(255,69,96,.14)",
                 color: blocked.has(menu.code) ? "var(--green)" : "#ff8095",
@@ -237,7 +237,7 @@ export default function WorldMap({
               {busy === menu.code ? "…" : blocked.has(menu.code) ? "\u{1F513} Unblock this country" : "\u{1F6AB} Block this country"}
             </button>
             {!loaded && (
-              <div style={{ fontSize: 10, color: "var(--text3)", marginTop: 6, lineHeight: 1.4, fontFamily: "'Share Tech Mono',monospace" }}>
+              <div style={{ fontSize: 12, color: "var(--text3)", marginTop: 6, lineHeight: 1.4, fontFamily: "'Share Tech Mono',monospace" }}>
                 Stored now — enforces once a GeoLite2-Country.mmdb is in rules/.
               </div>
             )}
@@ -251,8 +251,8 @@ export default function WorldMap({
             display: "flex", alignItems: "center", gap: 10, justifyContent: "center",
             background: "linear-gradient(0deg, rgba(4,8,16,.92), transparent)", textAlign: "center", pointerEvents: "none",
           }}>
-            <span style={{ fontSize: 16 }}>{"\u{1F30D}"}</span>
-            <span style={{ fontSize: 12, color: "var(--text3)", lineHeight: 1.5, fontFamily: "'Share Tech Mono',monospace" }}>
+            <span style={{ fontSize: 18 }}>{"\u{1F30D}"}</span>
+            <span style={{ fontSize: 14, color: "var(--text3)", lineHeight: 1.5, fontFamily: "'Share Tech Mono',monospace" }}>
               GeoIP not loaded — drop a <span style={{ color: "var(--cyan)" }}>GeoLite2-Country.mmdb</span> into <span style={{ color: "var(--cyan)" }}>rules/</span> to map live origins.
             </span>
           </div>
@@ -261,26 +261,26 @@ export default function WorldMap({
 
       {/* ── ranked list ── */}
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-        <div style={{ fontSize: 12, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", letterSpacing: 1, textTransform: "uppercase" }}>
+        <div style={{ fontSize: 14, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", letterSpacing: 1, textTransform: "uppercase" }}>
           Top origins {loaded && totalCountries > 0 ? `(${totalCountries})` : ""}
           {blocked.size > 0 && <span style={{ color: "var(--amber,#ffb020)" }}> · {blocked.size} blocked</span>}
         </div>
         {ranked.length === 0 ? (
-          <div style={{ fontSize: 12, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", padding: "8px 0" }}>
+          <div style={{ fontSize: 14, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", padding: "8px 0" }}>
             {loaded ? "No blocked traffic yet" : "Awaiting GeoIP data"}
           </div>
         ) : ranked.map(([code, n]) => (
           <div key={code} style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <span style={{ fontSize: 14 }}>{flagFor(code)}</span>
+            <span style={{ fontSize: 16 }}>{flagFor(code)}</span>
             <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontSize: 12, color: "var(--text2)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+              <div style={{ fontSize: 14, color: "var(--text2)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                 {nameFor(code)}{blocked.has(code) && <span style={{ color: "var(--amber,#ffb020)", marginLeft: 5 }}>{"\u{1F6AB}"}</span>}
               </div>
               <div style={{ height: 5, background: "var(--bg3)", borderRadius: 3, marginTop: 3, overflow: "hidden" }}>
                 <div style={{ height: "100%", width: `${(n / max) * 100}%`, background: "rgba(255,69,96,.8)", borderRadius: 3 }} />
               </div>
             </div>
-            <span style={{ fontSize: 12, color: "var(--text)", fontFamily: "'Share Tech Mono',monospace" }}>{n.toLocaleString()}</span>
+            <span style={{ fontSize: 14, color: "var(--text)", fontFamily: "'Share Tech Mono',monospace" }}>{n.toLocaleString()}</span>
           </div>
         ))}
       </div>

@@ -65,7 +65,7 @@ export default function AuditPage() {
           <div className="ptitle">Activity ({filtered.length})</div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
             <div style={{ position: "relative" }}>
-              <span style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", color: "var(--text3)", fontSize: 12, pointerEvents: "none" }}>🔍</span>
+              <span style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", color: "var(--text3)", fontSize: 14, pointerEvents: "none" }}>🔍</span>
               <input className="fi2" type="text" placeholder="Search actions, IPs…" style={{ width: 200 }} value={search} onChange={e => setSearch(e.target.value)} />
             </div>
             <select className="fsel" value={kind} onChange={e => setKind(e.target.value)}>
@@ -76,9 +76,9 @@ export default function AuditPage() {
         </div>
         <div className="tw">
           {loading ? (
-            <div style={{ padding: 24, textAlign: "center", fontFamily: "'Share Tech Mono',monospace", fontSize: 11, color: "var(--text3)" }}>Loading audit log…</div>
+            <div style={{ padding: 24, textAlign: "center", fontFamily: "'Share Tech Mono',monospace", fontSize: 13, color: "var(--text3)" }}>Loading audit log…</div>
           ) : filtered.length === 0 ? (
-            <div style={{ padding: 24, textAlign: "center", fontFamily: "'Share Tech Mono',monospace", fontSize: 11, color: "var(--text3)" }}>No audit events recorded yet. Administrative actions (site/rule/channel changes, logins) appear here.</div>
+            <div style={{ padding: 24, textAlign: "center", fontFamily: "'Share Tech Mono',monospace", fontSize: 13, color: "var(--text3)" }}>No audit events recorded yet. Administrative actions (site/rule/channel changes, logins) appear here.</div>
           ) : (
             <table>
               <thead><tr><th>Time</th><th>Action</th><th>Target</th><th>Actor</th><th>Source IP</th></tr></thead>
