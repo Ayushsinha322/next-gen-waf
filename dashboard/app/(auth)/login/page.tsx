@@ -227,7 +227,7 @@ export default function LoginPage() {
               </svg>
             </motion.div>
             <div>
-              <div id="brand-text">Sentinel WAF</div>
+              <div id="brand-text">NEXT-GEN ESDS <span className="w">WAF</span></div>
               <div id="brand-sub">Enterprise Security Platform</div>
             </div>
           </motion.div>
@@ -293,7 +293,7 @@ export default function LoginPage() {
         >
           <div id="form-header">
             <div id="form-title">Welcome back</div>
-            <div id="form-sub">Sign in to your Sentinel dashboard</div>
+            <div id="form-sub">Sign in to your Next-Gen ESDS WAF dashboard</div>
           </div>
 
           {/* Auth tabs */}
@@ -369,7 +369,7 @@ export default function LoginPage() {
             whileHover={btnState === "idle" ? { scale: 1.02, y: -1 } : {}}
             whileTap={btnState === "idle" ? { scale: 0.98 } : {}}
           >
-            {btnState === "idle"    && "🔐 Sign in to Sentinel"}
+            {btnState === "idle"    && "🔐 Sign in to Next-Gen ESDS WAF"}
             {btnState === "loading" && <><span className="btn-spin" /> Authenticating...</>}
             {btnState === "success" && "✓ Access granted"}
           </motion.button>
@@ -392,7 +392,7 @@ export default function LoginPage() {
           </motion.button>
 
           <div id="form-footer">
-            Protected by Sentinel WAF · AES-256 encrypted<br />
+            Protected by Next-Gen ESDS WAF · AES-256 encrypted<br />
             All authentication attempts are logged and audited
           </div>
         </motion.div>

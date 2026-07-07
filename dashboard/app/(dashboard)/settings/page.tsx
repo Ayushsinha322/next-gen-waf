@@ -536,7 +536,7 @@ function ManagementTLSTab() {
       <div className="pb">
         <p className="sec-sub" style={{ marginTop: 0 }}>
           The certificate the WAF presents on its <b>management endpoint</b> (this admin console). Served by
-          Sentinel&apos;s own engine — no third-party proxy. Customer-website certificates are separate and live
+          Next-Gen ESDS WAF&apos;s own engine — no third-party proxy. Customer-website certificates are separate and live
           under <b>Certificates</b>.
         </p>
 
