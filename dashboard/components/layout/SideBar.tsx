@@ -77,6 +77,13 @@ const Icon = {
       <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06-.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
     </svg>
   ),
+  ThreatIntel: () => (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3.5"/>
+      <line x1="12" y1="1.5" x2="12" y2="5"/><line x1="12" y1="19" x2="12" y2="22.5"/>
+      <line x1="1.5" y1="12" x2="5" y2="12"/><line x1="19" y1="12" x2="22.5" y2="12"/>
+    </svg>
+  ),
 };
 
 const NAV = [
@@ -94,6 +101,7 @@ const NAV = [
     { id: "plugins", Icon: Icon.Plugins, label: "Plugins", badge: "3",     badgeCls: "nb-a" },
   ]},
   { group: "INTELLIGENCE", items: [
+    { id: "threat-intel", Icon: Icon.ThreatIntel, label: "Threat Intel", badge: "NEW", badgeCls: "nb-c" },
     { id: "copilot", Icon: Icon.Copilot, label: "AI Copilot", badge: "AI",   badgeCls: "nb-a", badgeStyle: { background: "rgba(124,58,237,.18)", color: "#a78bfa", borderColor: "rgba(124,58,237,.3)" } },
     { id: "ml",      Icon: Icon.ML,      label: "ML Engine",  badge: "LIVE", badgeCls: "nb-g" },
   ]},

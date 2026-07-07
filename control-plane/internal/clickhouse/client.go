@@ -277,6 +277,30 @@ func (c *Client) Facets(ctx context.Context, column, tenant string, from, to int
 	return out, nil
 }
 
+// RecentThreatIntelBlocks returns the newest threat-intel-driven blocks for a
+// tenant (events the data plane tagged rule="THREATINTEL"; the human reason is
+// in the `attack` column). Tenant-scoped: although the IOC corpus is node-global,
+// these are per-tenant TRAFFIC records (client IPs, paths, sites), so they must
+// not leak across tenants — pass the caller's tenant, never client input.
+// Returns empty when ClickHouse is disabled at the handler layer.
+func (c *Client) RecentThreatIntelBlocks(ctx context.Context, tenant string, from, to int64, limit int) ([]Event, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	where := c.timeWhere(from, to)
+	where = append(where, eq("tenant", tenant))   // isolation boundary — never from client input
+	where = append(where, "rule = 'THREATINTEL'") // constant literal — no injection surface
+	sql := fmt.Sprintf(
+		"SELECT toUnixTimestamp(ts) AS ts, ip, country, site, method, path, rule, attack, action, severity, score, status, protocol "+
+			"FROM %s.waf_events WHERE %s ORDER BY ts DESC LIMIT %d",
+		c.db, strings.Join(where, " AND "), limit)
+	var out []Event
+	if err := c.queryJSON(ctx, sql, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

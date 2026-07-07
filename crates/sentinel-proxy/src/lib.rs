@@ -3557,6 +3557,32 @@ fn record_event(ctx: &RequestContext) {
         _ => return, // not notable — don't store
     };
     let top = ctx.rule_matches.first();
+    // Tag non-rule blocks so waf_events stays queryable. A threat-intel block
+    // carries no RuleMatch and its reason isn't otherwise persisted here, so
+    // surface it as rule="THREATINTEL" with the reason in `attack`; other
+    // non-rule blocks (geoip/rate-limit/smuggling) reuse classify_nonrule_block.
+    // Key the THREATINTEL tag on the actual block reason, NOT ctx.threat_intel_hit:
+    // a watch-tier IOC match sets threat_intel_hit=true without blocking, so a
+    // later geoip/rate-limit/anomaly block on that same request must not be
+    // mislabeled. A genuine threat-intel block always carries the "threat intel:"
+    // reason prefix; everything else falls through to classify_nonrule_block.
+    let (ev_rule, ev_attack) = match top {
+        Some(r) => (r.rule_id.clone(), r.message.clone()),
+        None if ctx
+            .block_reason
+            .as_deref()
+            .is_some_and(|r| r.starts_with("threat intel:")) =>
+        {
+            (
+                "THREATINTEL".to_string(),
+                ctx.block_reason.clone().unwrap_or_default(),
+            )
+        }
+        None => {
+            let (r, a) = classify_nonrule_block(ctx.block_reason.as_deref().unwrap_or(""));
+            (r.to_string(), a.to_string())
+        }
+    };
     let row = sentinel_storage::WafEventRow {
         ts: unix_now(),
         ip: ctx.client_ip.to_string(),
@@ -3565,8 +3591,8 @@ fn record_event(ctx: &RequestContext) {
         tenant: ctx.tenant_id.clone().unwrap_or_default(),
         method: ctx.method.as_str().to_string(),
         path: ctx.uri.path().to_string(),
-        rule: top.map(|r| r.rule_id.clone()).unwrap_or_default(),
-        attack: top.map(|r| r.message.clone()).unwrap_or_default(),
+        rule: ev_rule,
+        attack: ev_attack,
         action: action.to_string(),
         severity: top
             .map(|r| format!("{:?}", r.severity).to_uppercase())
