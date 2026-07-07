@@ -209,6 +209,52 @@ export interface EventQuery {
   ip?: string; protocol?: string; q?: string; from?: number; to?: number; limit?: number;
 }
 
+// --- Threat Intelligence -----------------------------------------------------
+// Mirrors the control-plane threat_intel_iocs schema. IOCs are node-global; the
+// tier (block/watch) is derived from confidence vs the block threshold.
+
+export type IOCType = "ip" | "cidr" | "user_agent" | "domain" | "url_substring";
+export type IOCTier = "block" | "watch";
+
+/** A single Indicator of Compromise. */
+export interface IOC {
+  id:         number;
+  type:       IOCType;
+  value:      string;      // 1.2.3.4 · 10.0.0.0/8 · sqlmap · evil.example · /wp-admin/x
+  source:     string;      // tor · feodo · urlhaus · stix · builtin_bad_ua · manual
+  category:   string;
+  confidence: number;      // 0..100
+  tier:       IOCTier;     // derived: confidence >= threshold ? "block" : "watch"
+  first_seen: string;
+  last_seen:  string;
+  expires_at: string | null;
+}
+
+/** KPI/summary counters that drive the top stat row + facet bars. */
+export interface ThreatIntelSummary {
+  total_active: number;
+  block_tier:   number;
+  watch_tier:   number;
+  threshold:    number;
+  by_type:      Record<string, number>;
+  by_source:    Record<string, number>;
+  by_category:  Record<string, number>;
+  newest_seen:  string | null;
+  oldest_seen:  string | null;
+}
+
+export interface IOCPage { items: IOC[]; total: number; limit: number; offset: number }
+
+/** Filters for the IOC browse table (all optional). */
+export interface IOCQuery {
+  q?: string; type?: string; tier?: string; source?: string; limit?: number; offset?: number;
+}
+
+/** A recent threat-intel-driven enforcement hit (from ClickHouse waf_events). */
+export interface TIBlock {
+  ts: number; ip: string; country: string; site: string; path: string; reason: string;
+}
+
 /** A per-site rule exclusion stored in waf_policy.rule_exclusions. */
 export interface RuleExclusion {
   rule_id:          number;
@@ -317,8 +363,8 @@ export interface CertValidationResult {
 // API methods
 // ---------------------------------------------------------------------------
 
-/** Build a query string from event filters, dropping empty values. */
-function eventQS(f: EventQuery): string {
+/** Build a query string from a filter object, dropping empty values. */
+function eventQS(f: Record<string, string | number | undefined>): string {
   const p = new URLSearchParams();
   for (const [k, v] of Object.entries(f)) {
     if (v !== undefined && v !== null && v !== "") p.set(k, String(v));
@@ -554,6 +600,21 @@ export const api = {
     facets: (column: string, from?: number, to?: number, limit = 10) =>
       apiFetch<{ facets: { key: string; count: number }[]; column: string; clickhouse: boolean }>(
         `/events/facets?column=${encodeURIComponent(column)}&${eventQS({ from, to })}&limit=${limit}`),
+  },
+
+  threatIntel: {
+    /** Summary counters + facet maps for the KPI row. */
+    stats: () => apiFetch<ThreatIntelSummary>("/threat-intel/stats"),
+    /** Filtered, paginated IOC list. */
+    list: (f: IOCQuery = {}) => apiFetch<IOCPage>(`/threat-intel/iocs?${eventQS(f)}`),
+    /** Add a manual indicator (block-tier by default). */
+    create: (body: { type: IOCType; value: string; tier?: IOCTier; source?: string; category?: string; confidence?: number; expires_at?: string | null }) =>
+      apiFetch<{ ioc: IOC }>("/threat-intel/iocs", { method: "POST", body: JSON.stringify(body) }),
+    /** Remove an indicator by id (re-allows matching traffic). */
+    remove: (id: number) => apiFetch<{ ok: boolean }>(`/threat-intel/iocs/${id}`, { method: "DELETE" }),
+    /** Recent threat-intel-driven blocks (ClickHouse-backed; empty when absent). */
+    recentBlocks: (limit = 100) =>
+      apiFetch<{ blocks: TIBlock[]; clickhouse: boolean }>(`/threat-intel/recent-blocks?limit=${limit}`),
   },
 
   geoip: {

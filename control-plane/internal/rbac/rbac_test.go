@@ -100,3 +100,23 @@ func TestMustAllow_PassesOnAllow(t *testing.T) {
 		enf.MustAllow(RoleAdmin, ResourceSite, ActionCreate)
 	})
 }
+
+func TestThreatIntelPermissions(t *testing.T) {
+	enf := NewEnforcer()
+	// Owner + Admin curate the corpus: create/read/delete/list.
+	for _, r := range []Role{RoleOwner, RoleAdmin} {
+		require.True(t, enf.Allow(r, ResourceThreatIntel, ActionCreate), "%s create", r)
+		require.True(t, enf.Allow(r, ResourceThreatIntel, ActionDelete), "%s delete", r)
+		require.True(t, enf.Allow(r, ResourceThreatIntel, ActionRead), "%s read", r)
+		require.True(t, enf.Allow(r, ResourceThreatIntel, ActionList), "%s list", r)
+	}
+	// Editor / Viewer / Auditor are read-only: never create or delete IOCs.
+	for _, r := range []Role{RoleEditor, RoleViewer, RoleAuditor} {
+		require.True(t, enf.Allow(r, ResourceThreatIntel, ActionRead), "%s read", r)
+		require.True(t, enf.Allow(r, ResourceThreatIntel, ActionList), "%s list", r)
+		require.False(t, enf.Allow(r, ResourceThreatIntel, ActionCreate), "%s must NOT create", r)
+		require.False(t, enf.Allow(r, ResourceThreatIntel, ActionDelete), "%s must NOT delete", r)
+	}
+	// Unknown role denied by default.
+	require.False(t, enf.Allow(Role("superuser"), ResourceThreatIntel, ActionRead))
+}

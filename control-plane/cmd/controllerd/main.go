@@ -297,6 +297,14 @@ func run() error {
 		protected.DELETE("/notifications/channels/:id", func(c *gin.Context) { handleDeleteChannel(c, enforcer, store, hub) })
 		protected.POST("/notifications/channels/:id/test", func(c *gin.Context) { handleTestChannel(c, enforcer, store) })
 
+		// Threat intelligence (dashboard-facing; JWT + RBAC via ResourceThreatIntel).
+		// Distinct from the secret-gated data-plane sync at /api/v1/internal/threat-intel.
+		protected.GET("/threat-intel/stats", func(c *gin.Context) { handleThreatIntelStats(c, enforcer, store) })
+		protected.GET("/threat-intel/iocs", func(c *gin.Context) { handleListIOCs(c, enforcer, store) })
+		protected.POST("/threat-intel/iocs", func(c *gin.Context) { handleCreateIOC(c, enforcer, store, hub) })
+		protected.DELETE("/threat-intel/iocs/:id", func(c *gin.Context) { handleDeleteIOC(c, enforcer, store, hub) })
+		protected.GET("/threat-intel/recent-blocks", func(c *gin.Context) { handleRecentTIBlocks(c, enforcer, chClient) })
+
 		// GeoIP country blocking (global policy applied across active sites).
 		// Searchable WAF history (ClickHouse-backed).
 		protected.GET("/events/status", func(c *gin.Context) { handleEventsStatus(c, enforcer, chClient) })
