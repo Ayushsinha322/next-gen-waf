@@ -277,18 +277,24 @@ func (c *Client) Facets(ctx context.Context, column, tenant string, from, to int
 	return out, nil
 }
 
-// RecentThreatIntelBlocks returns the newest threat-intel-driven blocks for a
-// tenant (events the data plane tagged rule="THREATINTEL"; the human reason is
-// in the `attack` column). Tenant-scoped: although the IOC corpus is node-global,
-// these are per-tenant TRAFFIC records (client IPs, paths, sites), so they must
-// not leak across tenants — pass the caller's tenant, never client input.
+// RecentThreatIntelBlocks returns the newest threat-intel-driven blocks visible
+// to a tenant (events the data plane tagged rule="THREATINTEL"; the human reason
+// is in the `attack` column). The IOC corpus is node-global and enforced BEFORE
+// site matching, so most TI blocks carry an empty tenant/site: those are
+// node-global threat events and are surfaced to every tenant. Rows that DID match
+// a site carry that site's tenant and stay private to it. So the predicate is
+// (tenant = caller OR tenant is empty): the caller's own TI blocks plus node-global
+// ones, but never another tenant's site-attributed traffic. Pass the caller's
+// tenant from the JWT, never client input.
 // Returns empty when ClickHouse is disabled at the handler layer.
 func (c *Client) RecentThreatIntelBlocks(ctx context.Context, tenant string, from, to int64, limit int) ([]Event, error) {
 	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
 	where := c.timeWhere(from, to)
-	where = append(where, eq("tenant", tenant))   // isolation boundary — never from client input
+	// Node-global TI blocks (tenant='') are shown to all tenants; site-attributed
+	// ones only to their owner. eq() escapes the caller tenant; '' is a constant.
+	where = append(where, "("+eq("tenant", tenant)+" OR tenant = '')")
 	where = append(where, "rule = 'THREATINTEL'") // constant literal — no injection surface
 	sql := fmt.Sprintf(
 		"SELECT toUnixTimestamp(ts) AS ts, ip, country, site, method, path, rule, attack, action, severity, score, status, protocol "+
