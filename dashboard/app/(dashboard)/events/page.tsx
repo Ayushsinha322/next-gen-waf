@@ -84,7 +84,7 @@ export default function EventsPage() {
         <div style={{ display: "flex", gap: 4, padding: 4, background: "var(--bg3)", borderRadius: 10 }}>
           {RANGES.map(r => (
             <button key={r.label} onClick={() => setRangeSecs(r.secs)} style={{
-              padding: "6px 14px", borderRadius: 7, border: "none", cursor: "pointer", fontSize: 12, fontWeight: 600,
+              padding: "6px 14px", borderRadius: 7, border: "none", cursor: "pointer", fontSize: 14, fontWeight: 600,
               background: rangeSecs === r.secs ? "var(--cyan)" : "transparent", color: rangeSecs === r.secs ? "#021018" : "var(--text2)",
             }}>{r.label}</button>
           ))}
@@ -94,14 +94,14 @@ export default function EventsPage() {
       {/* not-configured state */}
       {status && !status.configured ? (
         <motion.div className="panel" variants={fadeUp}><div className="pb" style={{ textAlign: "center", padding: 40 }}>
-          <div style={{ fontSize: 30, marginBottom: 10 }}>🗄️</div>
-          <div style={{ fontSize: 14, fontWeight: 700, color: "var(--text2)", marginBottom: 6 }}>ClickHouse not configured</div>
-          <div style={{ fontSize: 12, color: "var(--text3)", lineHeight: 1.7, fontFamily: "'Share Tech Mono',monospace", maxWidth: 520, margin: "0 auto" }}>
+          <div style={{ fontSize: 34, marginBottom: 10 }}>🗄️</div>
+          <div style={{ fontSize: 16, fontWeight: 700, color: "var(--text2)", marginBottom: 6 }}>ClickHouse not configured</div>
+          <div style={{ fontSize: 14, color: "var(--text3)", lineHeight: 1.7, fontFamily: "'Share Tech Mono',monospace", maxWidth: 520, margin: "0 auto" }}>
             Set <span style={{ color: "var(--cyan)" }}>SENTINEL_CLICKHOUSE_URL</span> on the control plane and run the ClickHouse container to enable durable, searchable WAF history. Live events still stream on the <strong>Logs</strong> page.
           </div>
         </div></motion.div>
       ) : status && !status.reachable ? (
-        <motion.div className="panel" variants={fadeUp}><div className="pb" style={{ textAlign: "center", padding: 30, fontSize: 12, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>
+        <motion.div className="panel" variants={fadeUp}><div className="pb" style={{ textAlign: "center", padding: 30, fontSize: 14, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>
           ClickHouse configured but unreachable{status.error ? ` — ${status.error}` : ""}.
         </div></motion.div>
       ) : (
@@ -182,10 +182,10 @@ function FacetCard({ title, facets, onPick }: { title: string; facets: { key: st
     <div className="panel">
       <div className="ph"><div className="ptitle">{title}</div></div>
       <div className="pb" style={{ display: "flex", flexDirection: "column", gap: 7 }}>
-        {facets.length === 0 ? <div style={{ fontSize: 11, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>—</div> :
+        {facets.length === 0 ? <div style={{ fontSize: 13, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>—</div> :
           facets.map(f => (
             <div key={f.key} onClick={() => onPick(f.key)} style={{ cursor: "pointer" }} title="Filter by this">
-              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, marginBottom: 2 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, marginBottom: 2 }}>
                 <span style={{ color: "var(--text2)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 160, fontFamily: "'Share Tech Mono',monospace" }}>{f.key}</span>
                 <span style={{ color: "var(--text)", fontFamily: "'Share Tech Mono',monospace" }}>{f.count.toLocaleString()}</span>
               </div>
@@ -200,5 +200,5 @@ function FacetCard({ title, facets, onPick }: { title: string; facets: { key: st
 }
 
 function Empty({ text }: { text: string }) {
-  return <div style={{ padding: "22px 12px", textAlign: "center", fontSize: 11, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", width: "100%" }}>{text}</div>;
+  return <div style={{ padding: "22px 12px", textAlign: "center", fontSize: 13, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", width: "100%" }}>{text}</div>;
 }

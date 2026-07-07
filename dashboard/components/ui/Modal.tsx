@@ -33,7 +33,7 @@ export default function ModalContainer() {
           >
             <div className="mh">
               <div className="mt2">{state.title}</div>
-              <button style={{ cursor: "pointer", color: "var(--text3)", fontSize: 18, background: "none", border: "none", lineHeight: 1, transition: "color .2s" }} onClick={close}>✕</button>
+              <button style={{ cursor: "pointer", color: "var(--text3)", fontSize: 20, background: "none", border: "none", lineHeight: 1, transition: "color .2s" }} onClick={close}>✕</button>
             </div>
             <div className="mb">{state.body}</div>
             <div className="mf">{state.footer}</div>

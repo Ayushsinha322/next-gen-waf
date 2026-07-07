@@ -72,7 +72,7 @@ export default function CopilotPage() {
       <motion.div initial={{ opacity: 0, y: 14 }} animate={{ opacity: 1, y: 0 }} transition={spring} style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",gap:14}}>
         <div><div className="sec-title" style={{color:"#BF7FFF"}}>🤖 AI Security Copilot</div><div className="sec-sub">Powered by DeepSeek R1 · Rule generation · CVE patching · Alert explanation</div></div>
         <div style={{display:"flex",gap:8,alignItems:"center"}}>
-          <span style={{fontSize:9,fontFamily:"'Share Tech Mono',monospace",color:"#A070E0",background:"rgba(124,47,191,.15)",border:"1px solid rgba(124,47,191,.3)",borderRadius:20,padding:"4px 12px"}}>deepseek-r1:8b</span>
+          <span style={{fontSize: 11,fontFamily:"'Share Tech Mono',monospace",color:"#A070E0",background:"rgba(124,47,191,.15)",border:"1px solid rgba(124,47,191,.3)",borderRadius:20,padding:"4px 12px"}}>deepseek-r1:8b</span>
           <motion.button className="btn bg-btn btn-sm" whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }} onClick={() => { setMsgs([]); setTimeout(() => { const now=new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}); setMsgs([{who:"ai",text:GREET,time:now}]); },100); }}>🗑️ Clear Chat</motion.button>
         </div>
       </motion.div>
@@ -80,7 +80,7 @@ export default function CopilotPage() {
       <motion.div className="cop-page" initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ ...spring, delay: 0.1 }}>
         <div className="cop-hist">
           <div style={{padding:"13px 16px",borderBottom:"1px solid rgba(124,47,191,.15)",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
-            <div style={{fontFamily:"'Orbitron',sans-serif",fontSize:12,fontWeight:700,letterSpacing:1}}>💬 Conversations</div>
+            <div style={{fontFamily:"'Orbitron',sans-serif",fontSize: 14,fontWeight:700,letterSpacing:1}}>💬 Conversations</div>
             <motion.button className="btn bg-btn btn-xs" onClick={() => { setMsgs([]); }} whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.96 }}>＋</motion.button>
           </div>
           <div style={{flex:1,overflowY:"auto",padding:8}}>
@@ -90,14 +90,14 @@ export default function CopilotPage() {
 
         <div className="cop-main">
           <div style={{padding:"14px 18px",borderBottom:"1px solid rgba(124,47,191,.15)",display:"flex",alignItems:"center",gap:12,background:"linear-gradient(135deg,rgba(124,47,191,.12),transparent)",flexShrink:0}}>
-            <motion.div animate={{ boxShadow: ["0 0 18px var(--pur-glow)", "0 0 32px rgba(124,58,237,.6)", "0 0 18px var(--pur-glow)"] }} transition={{ duration: 3, repeat: Infinity }} style={{width:40,height:40,borderRadius:"50%",background:"linear-gradient(135deg,var(--purple),#4A0FA0)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:22}}>🤖</motion.div>
+            <motion.div animate={{ boxShadow: ["0 0 18px var(--pur-glow)", "0 0 32px rgba(124,58,237,.6)", "0 0 18px var(--pur-glow)"] }} transition={{ duration: 3, repeat: Infinity }} style={{width:40,height:40,borderRadius:"50%",background:"linear-gradient(135deg,var(--purple),#4A0FA0)",display:"flex",alignItems:"center",justifyContent:"center",fontSize: 25}}>🤖</motion.div>
             <div>
-              <div style={{fontFamily:"'Orbitron',sans-serif",fontSize:13,fontWeight:700}}>Sentinel AI Copilot</div>
-              <div style={{fontFamily:"'Share Tech Mono',monospace",fontSize:9,color:"#9B60E0",display:"flex",alignItems:"center",gap:5,marginTop:2}}>
+              <div style={{fontFamily:"'Orbitron',sans-serif",fontSize: 15,fontWeight:700}}>Sentinel AI Copilot</div>
+              <div style={{fontFamily:"'Share Tech Mono',monospace",fontSize: 11,color:"#9B60E0",display:"flex",alignItems:"center",gap:5,marginTop:2}}>
                 <span style={{width:5,height:5,borderRadius:"50%",background:"var(--green)",boxShadow:"0 0 5px var(--green)",display:"inline-block"}} />Online · Ready to assist
               </div>
             </div>
-            <div style={{marginLeft:"auto",fontSize:9,fontFamily:"'Share Tech Mono',monospace",color:"#A070E0",background:"rgba(124,47,191,.15)",border:"1px solid rgba(124,47,191,.3)",borderRadius:20,padding:"3px 10px"}}>⚡ deepseek-r1:8b</div>
+            <div style={{marginLeft:"auto",fontSize: 11,fontFamily:"'Share Tech Mono',monospace",color:"#A070E0",background:"rgba(124,47,191,.15)",border:"1px solid rgba(124,47,191,.3)",borderRadius:20,padding:"3px 10px"}}>⚡ deepseek-r1:8b</div>
           </div>
 
           <div ref={msgsRef} className="flex-1 overflow-y-auto" style={{padding:"16px 18px",display:"flex",flexDirection:"column",gap:12}}>
@@ -126,7 +126,7 @@ export default function CopilotPage() {
           </div>
           <div style={{padding:"12px 18px",borderTop:"1px solid rgba(124,47,191,.18)",display:"flex",gap:10,alignItems:"flex-end",background:"rgba(124,47,191,.04)",flexShrink:0}}>
             <textarea className="cop-inp2" value={input} onChange={e => setInput(e.target.value)} onKeyDown={e => { if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();send();} }} placeholder="Ask about alerts, rules, CVEs, false positives, threat analysis..." />
-            <motion.button style={{width:38,height:38,borderRadius:9,background:"linear-gradient(135deg,var(--purple),#4A0FA0)",border:"none",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,transition:"all .2s",flexShrink:0}} onClick={send} whileHover={{ scale: 1.08 }} whileTap={{ scale: 0.94 }}>➤</motion.button>
+            <motion.button style={{width:38,height:38,borderRadius:9,background:"linear-gradient(135deg,var(--purple),#4A0FA0)",border:"none",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",fontSize: 18,transition:"all .2s",flexShrink:0}} onClick={send} whileHover={{ scale: 1.08 }} whileTap={{ scale: 0.94 }}>➤</motion.button>
           </div>
         </div>
       </motion.div>

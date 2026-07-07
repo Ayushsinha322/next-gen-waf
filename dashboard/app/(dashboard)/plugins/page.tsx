@@ -27,7 +27,7 @@ export default function PluginsPage() {
         {[{cls:"kg",lbl:"Installed",val:"3",valCls:"g"},{cls:"kc",lbl:"Available",val:"14",valCls:"c"},{cls:"ka",lbl:"Updates",val:"2",valCls:"a"},{cls:"",lbl:"WASM Runtime",val:"wasmtime 14.0",valCls:""}].map((k,i)=>(
           <motion.div key={i} className={`kpi ${k.cls}`} variants={cardVariants}>
             <div className="kpi-lbl">{k.lbl}</div>
-            <div className="kpi-val" style={k.valCls?{}:{color:"var(--green)",fontSize:14,paddingTop:4}}>{k.val}</div>
+            <div className="kpi-val" style={k.valCls?{}:{color:"var(--green)",fontSize: 16,paddingTop:4}}>{k.val}</div>
           </motion.div>
         ))}
       </motion.div>
@@ -41,7 +41,7 @@ export default function PluginsPage() {
             </div>
             <div className="pcd">{p.desc}</div>
             <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8}}>
-              <div style={{fontSize:9,fontFamily:"'Share Tech Mono',monospace",color:"var(--text3)"}}>{p.meta}</div>
+              <div style={{fontSize: 11,fontFamily:"'Share Tech Mono',monospace",color:"var(--text3)"}}>{p.meta}</div>
               <div style={{display:"flex",gap:5}}>
                 {p.status==="installed" && <><span className="bdg bgg">INSTALLED</span><motion.button className="btn bg-btn btn-xs" onClick={() => showToast(`${p.name} configured`,"i","⚙️")} whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.96 }}>⚙️ Config</motion.button></>}
                 {p.status==="update" && <><span className="bdg ba blink">UPDATE</span><motion.button className="btn bp btn-xs" onClick={() => showToast(`${p.name} updating...`,"i","🔌")} whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.96 }}>Update</motion.button></>}

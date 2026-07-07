@@ -194,7 +194,7 @@ export default function TrafficPage() {
           <div className="pb">
             <canvas ref={chartRef} height={110} style={{ width: "100%", display: "block" }} />
             {buckets.length === 0 && (
-              <div style={{ textAlign: "center", paddingTop: 8, fontSize: 12, fontFamily: "'Share Tech Mono',monospace", color: "rgba(100,116,139,0.5)" }}>
+              <div style={{ textAlign: "center", paddingTop: 8, fontSize: 14, fontFamily: "'Share Tech Mono',monospace", color: "rgba(100,116,139,0.5)" }}>
                 waiting for traffic data…
               </div>
             )}
@@ -208,13 +208,13 @@ export default function TrafficPage() {
           </div>
           <div className="pb">
             {topIPs.length === 0 ? (
-              <div style={{ padding: "16px 0", textAlign: "center", fontSize: 11, fontFamily: "'Share Tech Mono',monospace", color: "rgba(100,116,139,0.5)" }}>
+              <div style={{ padding: "16px 0", textAlign: "center", fontSize: 13, fontFamily: "'Share Tech Mono',monospace", color: "rgba(100,116,139,0.5)" }}>
                 No traffic yet
               </div>
             ) : (
               topIPs.map(([ip, cnt], idx) => (
                 <motion.div key={ip} className="eprow" style={{ marginBottom: 7 }} initial={{ opacity: 0, x: -6 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: idx * 0.04 }}>
-                  <span className="eppath" style={{ fontSize: 12, minWidth: 120 }}>{ip}</span>
+                  <span className="eppath" style={{ fontSize: 14, minWidth: 120 }}>{ip}</span>
                   <div className="epbw" style={{ flex: 1 }}>
                     <div className="pwrap">
                       <div className="pbar" style={{ width: `${Math.round(cnt / maxIp * 100)}%`, background: cnt > 5 ? "var(--red-b)" : "var(--cyan)" }} />
@@ -234,7 +234,7 @@ export default function TrafficPage() {
           <div className="ptitle">📜 Live Request Log</div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
             <div style={{ position: "relative" }}>
-              <span style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", color: "var(--text3)", fontSize: 12, pointerEvents: "none" }}>🔍</span>
+              <span style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", color: "var(--text3)", fontSize: 14, pointerEvents: "none" }}>🔍</span>
               <input className="fi2" type="text" placeholder="Filter by IP, path, site…" style={{ width: 200 }}
                 value={search} onChange={e => setSearch(e.target.value)} />
             </div>
@@ -252,7 +252,7 @@ export default function TrafficPage() {
         </div>
         <div className="tw" style={{ maxHeight: 380, overflowY: "auto" }}>
           {displayed.length === 0 ? (
-            <div style={{ padding: "24px", textAlign: "center", fontFamily: "'Share Tech Mono',monospace", fontSize: 11, color: "var(--text3)" }}>
+            <div style={{ padding: "24px", textAlign: "center", fontFamily: "'Share Tech Mono',monospace", fontSize: 13, color: "var(--text3)" }}>
               {rows.length === 0 ? "Waiting for live events…" : "No rows match current filters"}
             </div>
           ) : (

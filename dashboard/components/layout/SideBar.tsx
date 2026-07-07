@@ -166,11 +166,11 @@ export default function SideBar() {
       >
         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
           <span className="leader-dot" />
-          <span style={{ fontSize: 12, fontFamily: "'JetBrains Mono',monospace", color: "var(--text2)", fontWeight: 600 }}>
+          <span style={{ fontSize: 14, fontFamily: "'JetBrains Mono',monospace", color: "var(--text2)", fontWeight: 600 }}>
             cp-primary-01
           </span>
         </div>
-        <div style={{ fontSize: 11, fontFamily: "'JetBrains Mono',monospace", color: "var(--text3)", letterSpacing: ".4px" }}>
+        <div style={{ fontSize: 13, fontFamily: "'JetBrains Mono',monospace", color: "var(--text3)", letterSpacing: ".4px" }}>
           Raft: LEADER · 3 nodes · v3.1.0
         </div>
       </motion.div>

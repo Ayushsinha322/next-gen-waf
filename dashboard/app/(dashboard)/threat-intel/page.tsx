@@ -220,7 +220,7 @@ export default function ThreatIntelPage() {
         <div className="kpi"><div className="kpi-lbl">Block tier</div><div className="kpi-val" style={{ color: "var(--red)" }}>{summary?.block_tier?.toLocaleString() ?? "—"}</div></div>
         <div className="kpi ka"><div className="kpi-lbl">Watch tier</div><div className="kpi-val" style={{ color: "var(--amber)" }}>{summary?.watch_tier?.toLocaleString() ?? "—"}</div></div>
         <div className="kpi kg"><div className="kpi-lbl">Feed sources</div><div className="kpi-val">{summary ? sourceCount : "—"}</div></div>
-        <div className="kpi kc"><div className="kpi-lbl">Freshness</div><div className="kpi-val" style={{ fontSize: 18 }}>{fmtAgo(summary?.newest_seen ?? null)}</div></div>
+        <div className="kpi kc"><div className="kpi-lbl">Freshness</div><div className="kpi-val" style={{ fontSize: 20 }}>{fmtAgo(summary?.newest_seen ?? null)}</div></div>
       </motion.div>
 
       {/* Filter bar */}
@@ -312,9 +312,9 @@ export default function ThreatIntelPage() {
         <div className="tw" style={{ maxHeight: 340, overflow: "auto" }}>
           {!chOk ? (
             <div style={{ padding: 28, textAlign: "center" }}>
-              <div style={{ fontSize: 26, marginBottom: 8 }}>🛰️</div>
-              <div style={{ fontSize: 13, fontWeight: 700, color: "var(--text2)", marginBottom: 6 }}>Block history not available</div>
-              <div style={{ fontSize: 12, color: "var(--text3)", lineHeight: 1.7, fontFamily: "'Share Tech Mono',monospace", maxWidth: 520, margin: "0 auto" }}>
+              <div style={{ fontSize: 30, marginBottom: 8 }}>🛰️</div>
+              <div style={{ fontSize: 15, fontWeight: 700, color: "var(--text2)", marginBottom: 6 }}>Block history not available</div>
+              <div style={{ fontSize: 14, color: "var(--text3)", lineHeight: 1.7, fontFamily: "'Share Tech Mono',monospace", maxWidth: 520, margin: "0 auto" }}>
                 Set <span style={{ color: "var(--cyan)" }}>SENTINEL_CLICKHOUSE_URL</span> on the control plane to record and search intel-driven blocks. Enforcement still works without it.
               </div>
             </div>
@@ -361,11 +361,11 @@ function Facet({
       <div className="ph"><div className="ptitle">{title}</div></div>
       <div className="pb" style={{ display: "flex", flexDirection: "column", gap: 7 }}>
         {rows.length === 0 ? (
-          <div style={{ fontSize: 11, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>—</div>
+          <div style={{ fontSize: 13, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>—</div>
         ) : (
           rows.map(([k, v]) => (
             <div key={k} onClick={() => onPick?.(k)} style={{ cursor: onPick ? "pointer" : "default" }} title={onPick ? "Filter by this" : undefined}>
-              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, marginBottom: 2 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, marginBottom: 2 }}>
                 <span style={{ color: "var(--text2)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 160, fontFamily: "'Share Tech Mono',monospace" }}>{render ? render(k) : k}</span>
                 <span style={{ color: "var(--text)", fontFamily: "'Share Tech Mono',monospace" }}>{v.toLocaleString()}</span>
               </div>
@@ -382,7 +382,7 @@ function Facet({
 
 function Empty({ text }: { text: string }) {
   return (
-    <div style={{ padding: "22px 12px", textAlign: "center", fontSize: 11, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", width: "100%" }}>
+    <div style={{ padding: "22px 12px", textAlign: "center", fontSize: 13, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", width: "100%" }}>
       {text}
     </div>
   );
