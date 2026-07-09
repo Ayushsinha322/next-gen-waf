@@ -58,7 +58,7 @@ use sentinel_core::{
 use sentinel_ebpf::{EbpfConfig, EbpfManager};
 use sentinel_ml::MlEngine;
 use sentinel_modules::{
-    detect_smuggling, AntiDdos, BotDetector, BotVerdict, DdosVerdict, GeoIp, GeoVerdict,
+    detect_smuggling, AntiDdos, BotDetector, BotSignals, BotTier, DdosVerdict, GeoIp, GeoVerdict,
     IpReputation, IpVerdict, RateLimiter, RawTier, SmugglingVerdict, ThreatFeed, ThreatVerdict,
 };
 use sentinel_plugins::PluginRuntime;
@@ -2157,31 +2157,53 @@ async fn phase1_headers(
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
             let bot_det = modules.bot_detector.load();
-            let verdict = bot_det.classify(ua, ctx.tls_fingerprint.as_deref());
-
-            match &verdict {
-                BotVerdict::KnownAttacker(tool) => {
+            // Weighted 0-100 bot score fusing JA4, UA patterns, browser-header
+            // presence, and repeat-offender velocity → tiered response.
+            let sig = BotSignals {
+                user_agent: ua,
+                ja4: ctx.tls_fingerprint.as_deref(),
+                has_accept: ctx.request_headers.contains_key(http::header::ACCEPT),
+                has_accept_language: ctx
+                    .request_headers
+                    .contains_key(http::header::ACCEPT_LANGUAGE),
+                recent_block_score: modules.correlation.score_for_ip(ctx.client_ip),
+            };
+            let bs = bot_det.score(&sig);
+            ctx.tx_vars
+                .insert("bot_score".to_string(), bs.score.to_string());
+            if bs.verified_good_bot {
+                ctx.tx_vars.insert("bot_good".to_string(), "1".to_string());
+            }
+            let challenge_enabled = bot_cfg.challenge != ChallengeMode::Off;
+            // Skip a challenge if the client already solved one (valid, unexpired
+            // clearance cookie bound to its IP).
+            let has_clearance =
+                crate::challenge::clearance_valid(&ctx.request_headers, ctx.client_ip);
+            match bs.tier {
+                BotTier::Block => {
                     ctx.decision = WafDecision::Block;
-                    ctx.block_reason = Some(format!("known attack tool: {tool}"));
+                    ctx.block_reason = Some(format!(
+                        "bot score {} ({})",
+                        bs.score,
+                        bs.reasons.join(", ")
+                    ));
                 }
-                BotVerdict::SuspiciousBot => {
-                    ctx.tx_vars
-                        .insert("bot_suspicious".to_string(), "1".to_string());
-                    ctx.anomaly_score = ctx.anomaly_score.saturating_add(2);
-                    // Skip the challenge entirely if the client already solved one
-                    // (valid, unexpired clearance cookie bound to its IP).
-                    if bot_cfg.challenge != ChallengeMode::Off
-                        && !crate::challenge::clearance_valid(&ctx.request_headers, ctx.client_ip)
-                    {
-                        ctx.decision = WafDecision::Challenge;
-                        ctx.block_reason =
-                            Some("suspicious bot UA — browser challenge required".to_string());
+                BotTier::Captcha | BotTier::JsChallenge if challenge_enabled && !has_clearance => {
+                    ctx.decision = WafDecision::Challenge;
+                    ctx.block_reason = Some(format!(
+                        "bot score {} — browser challenge required ({})",
+                        bs.score,
+                        bs.reasons.join(", ")
+                    ));
+                }
+                BotTier::Captcha | BotTier::JsChallenge => {
+                    ctx.anomaly_score = ctx.anomaly_score.saturating_add((bs.score / 10) as u32);
+                }
+                BotTier::Allow => {
+                    if bs.score >= 15 {
+                        ctx.anomaly_score = ctx.anomaly_score.saturating_add(2);
                     }
                 }
-                BotVerdict::GoodBot(name) => {
-                    ctx.tx_vars.insert("bot_good".to_string(), name.clone());
-                }
-                _ => {}
             }
         }
     }

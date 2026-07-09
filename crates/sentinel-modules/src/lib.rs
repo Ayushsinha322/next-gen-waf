@@ -19,7 +19,7 @@ pub mod threat_intel;
 pub mod tls_fingerprint;
 
 pub use anti_ddos::{AntiDdos, DdosVerdict};
-pub use bot_detect::{BotDetector, BotVerdict};
+pub use bot_detect::{BotDetector, BotScore, BotSignals, BotTier, BotVerdict};
 pub use geoip::{GeoIp, GeoVerdict};
 pub use ip_reputation::{IpReputation, IpVerdict};
 pub use rate_limit::RateLimiter;
