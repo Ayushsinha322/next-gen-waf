@@ -593,6 +593,10 @@ pub struct GraphqlConfig {
     pub max_depth: u32,
     #[serde(default = "default_gql_complexity")]
     pub max_complexity: u32,
+    /// Block introspection queries (`__schema` / `__type`). Defaults to `true`
+    /// so schema disclosure is refused unless an operator opts out.
+    #[serde(default = "default_true")]
+    pub block_introspection: bool,
 }
 
 fn default_gql_depth() -> u32 {
@@ -601,6 +605,10 @@ fn default_gql_depth() -> u32 {
 
 fn default_gql_complexity() -> u32 {
     1000
+}
+
+fn default_true() -> bool {
+    true
 }
 
 // ---------------------------------------------------------------------------

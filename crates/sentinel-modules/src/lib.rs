@@ -12,6 +12,7 @@
 pub mod anti_ddos;
 pub mod bot_detect;
 pub mod geoip;
+pub mod graphql;
 pub mod ip_reputation;
 pub mod rate_limit;
 pub mod smuggling;
@@ -21,6 +22,7 @@ pub mod tls_fingerprint;
 pub use anti_ddos::{AntiDdos, DdosVerdict};
 pub use bot_detect::{BotDetector, BotScore, BotSignals, BotTier, BotVerdict};
 pub use geoip::{GeoIp, GeoVerdict};
+pub use graphql::{inspect as inspect_graphql, GraphqlLimits};
 pub use ip_reputation::{IpReputation, IpVerdict};
 pub use rate_limit::RateLimiter;
 pub use smuggling::{detect as detect_smuggling, SmugglingVerdict};

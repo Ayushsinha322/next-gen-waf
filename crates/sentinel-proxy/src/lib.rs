@@ -58,8 +58,9 @@ use sentinel_core::{
 use sentinel_ebpf::{EbpfConfig, EbpfManager};
 use sentinel_ml::MlEngine;
 use sentinel_modules::{
-    detect_smuggling, AntiDdos, BotDetector, BotSignals, BotTier, DdosVerdict, GeoIp, GeoVerdict,
-    IpReputation, IpVerdict, RateLimiter, RawTier, SmugglingVerdict, ThreatFeed, ThreatVerdict,
+    detect_smuggling, inspect_graphql, AntiDdos, BotDetector, BotSignals, BotTier, DdosVerdict,
+    GeoIp, GeoVerdict, GraphqlLimits, IpReputation, IpVerdict, RateLimiter, RawTier,
+    SmugglingVerdict, ThreatFeed, ThreatVerdict,
 };
 use sentinel_plugins::PluginRuntime;
 use sentinel_rules::RuleEngine;
@@ -1835,6 +1836,35 @@ async fn proxy(
 
         ctx.request_body = Some(bytes.clone());
         phase2_body(&mut ctx, site, &engine_map, &state.ml_engine)?;
+
+        // GraphQL firewall — query depth / complexity / introspection on the
+        // body. Gated to GraphQL endpoints so nested REST-JSON bodies aren't
+        // misread as GraphQL queries.
+        if ctx.decision == WafDecision::Allow {
+            if let Some(gql) = site
+                .and_then(|s| s.waf.graphql.as_ref())
+                .filter(|g| g.enable)
+            {
+                let is_graphql = ctx.method == http::Method::POST
+                    && (ctx.uri.path().contains("graphql")
+                        || ctx
+                            .request_headers
+                            .get(http::header::CONTENT_TYPE)
+                            .and_then(|v| v.to_str().ok())
+                            .is_some_and(|ct| ct.contains("application/graphql")));
+                if is_graphql {
+                    let limits = GraphqlLimits {
+                        max_depth: gql.max_depth,
+                        max_complexity: gql.max_complexity,
+                        block_introspection: gql.block_introspection,
+                    };
+                    if let Some(reason) = inspect_graphql(&bytes, &limits) {
+                        ctx.decision = WafDecision::Block;
+                        ctx.block_reason = Some(reason);
+                    }
+                }
+            }
+        }
 
         if ctx.decision == WafDecision::Block {
             state.modules.correlation.record_block(ctx.client_ip);
