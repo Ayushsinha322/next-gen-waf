@@ -6,6 +6,7 @@
 //! - [`bot_detect`]    — User-Agent classification and JA4 fingerprint matching.
 //! - [`geoip`]         — Country-level IP filtering via MaxMind GeoLite2.
 //! - [`anti_ddos`]     — Connection-rate DDoS protection with auto-blocking.
+//! - [`jwt_auth`]      — Edge JWT (bearer-token) validation for customer APIs.
 //!
 //! All modules are wired into the sentinel-proxy Phase 0/1 pipeline.
 
@@ -14,6 +15,7 @@ pub mod bot_detect;
 pub mod geoip;
 pub mod graphql;
 pub mod ip_reputation;
+pub mod jwt_auth;
 pub mod rate_limit;
 pub mod smuggling;
 pub mod threat_intel;
@@ -24,6 +26,7 @@ pub use bot_detect::{BotDetector, BotScore, BotSignals, BotTier, BotVerdict};
 pub use geoip::{GeoIp, GeoVerdict};
 pub use graphql::{inspect as inspect_graphql, GraphqlLimits};
 pub use ip_reputation::{IpReputation, IpVerdict};
+pub use jwt_auth::{decoding_keys_from_jwks, token_header, validate as validate_jwt, JwtPolicy};
 pub use rate_limit::RateLimiter;
 pub use smuggling::{detect as detect_smuggling, SmugglingVerdict};
 pub use threat_intel::{RawTier, ThreatFeed, ThreatVerdict};

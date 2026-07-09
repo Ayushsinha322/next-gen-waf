@@ -58,9 +58,9 @@ use sentinel_core::{
 use sentinel_ebpf::{EbpfConfig, EbpfManager};
 use sentinel_ml::MlEngine;
 use sentinel_modules::{
-    detect_smuggling, inspect_graphql, AntiDdos, BotDetector, BotSignals, BotTier, DdosVerdict,
-    GeoIp, GeoVerdict, GraphqlLimits, IpReputation, IpVerdict, RateLimiter, RawTier,
-    SmugglingVerdict, ThreatFeed, ThreatVerdict,
+    detect_smuggling, inspect_graphql, validate_jwt, AntiDdos, BotDetector, BotSignals, BotTier,
+    DdosVerdict, GeoIp, GeoVerdict, GraphqlLimits, IpReputation, IpVerdict, JwtPolicy, RateLimiter,
+    RawTier, SmugglingVerdict, ThreatFeed, ThreatVerdict,
 };
 use sentinel_plugins::PluginRuntime;
 use sentinel_rules::RuleEngine;
@@ -1751,17 +1751,17 @@ async fn proxy(
 
     if ctx.decision == WafDecision::Block {
         state.modules.correlation.record_block(ctx.client_ip);
-        let resp = if ctx
-            .block_reason
-            .as_deref()
-            .unwrap_or("")
-            .starts_with("HTTP request smuggling")
-        {
+        let reason = ctx.block_reason.as_deref().unwrap_or("");
+        let resp = if reason.starts_with("HTTP request smuggling") {
             // RFC 7230 §3.3.3: malformed requests MUST be rejected with 400.
             error_response(
                 StatusCode::BAD_REQUEST,
                 ctx.block_reason.as_deref().unwrap_or("Bad Request"),
             )
+        } else if reason.starts_with("jwt:") {
+            // Authentication failure — 401 Unauthorized. The specific reason is
+            // logged server-side but never leaked to the client.
+            error_response(StatusCode::UNAUTHORIZED, "Unauthorized")
         } else {
             block_response(&ctx)
         };
@@ -2249,6 +2249,81 @@ async fn phase1_headers(
                     ctx.decision = WafDecision::Block;
                 }
                 GeoVerdict::Allow | GeoVerdict::Unknown => {}
+            }
+        }
+    }
+
+    // --- Edge JWT (bearer-token) validation ---
+    // Verifies signature + expiry + issuer/audience/scopes against a fixed
+    // algorithm allow-list before the request reaches origin. Static key
+    // material only (HS256 secret or public-key PEM); JWKS-by-`kid` is a
+    // documented follow-up. Reasons are prefixed "jwt:" so the block renderer
+    // returns 401 (not the generic 403) without leaking the reason to clients.
+    if ctx.decision == WafDecision::Allow {
+        if let Some(ref jwt_cfg) = site.waf.jwt {
+            if jwt_cfg.enable {
+                let bearer = ctx
+                    .request_headers
+                    .get(http::header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| {
+                        s.strip_prefix("Bearer ")
+                            .or_else(|| s.strip_prefix("bearer "))
+                    })
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty());
+                match bearer {
+                    None => {
+                        if jwt_cfg.required {
+                            ctx.decision = WafDecision::Block;
+                            ctx.block_reason = Some("jwt: missing bearer token".to_string());
+                        }
+                    }
+                    Some(token) => {
+                        // Build the verification key from the site's static key
+                        // material. A public-key PEM is parsed as EC when the
+                        // policy lists an ES* algorithm, otherwise as RSA.
+                        let key = if let Some(secret) = jwt_cfg.hs_secret.as_deref() {
+                            Some(jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()))
+                        } else if let Some(pem) = jwt_cfg.public_key_pem.as_deref() {
+                            let is_ec = jwt_cfg.algorithms.iter().any(|a| a.starts_with("ES"));
+                            if is_ec {
+                                jsonwebtoken::DecodingKey::from_ec_pem(pem.as_bytes()).ok()
+                            } else {
+                                jsonwebtoken::DecodingKey::from_rsa_pem(pem.as_bytes()).ok()
+                            }
+                        } else {
+                            None
+                        };
+                        match key {
+                            Some(key) => {
+                                let policy = JwtPolicy {
+                                    algorithms: jwt_cfg.algorithms.clone(),
+                                    issuer: jwt_cfg.issuer.clone(),
+                                    audience: jwt_cfg.audience.clone(),
+                                    required_scopes: jwt_cfg.required_scopes.clone(),
+                                    scope_claim: jwt_cfg.scope_claim.clone(),
+                                };
+                                if let Err(reason) = validate_jwt(token, &key, &policy) {
+                                    if jwt_cfg.required {
+                                        ctx.decision = WafDecision::Block;
+                                        ctx.block_reason = Some(format!("jwt: {reason}"));
+                                    }
+                                }
+                            }
+                            None => {
+                                // No usable static key (JWKS-only or an
+                                // unparseable PEM). Fail closed when required.
+                                if jwt_cfg.required {
+                                    ctx.decision = WafDecision::Block;
+                                    ctx.block_reason = Some(
+                                        "jwt: no usable verification key configured".to_string(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }

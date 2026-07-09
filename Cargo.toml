@@ -67,6 +67,10 @@ ring = "0.17"
 sha2 = "0.10"
 hmac = "0.12"
 argon2 = "0.5"
+# Edge JWT validation for customer APIs (bearer-token verification in the data
+# plane). v9 provides DecodingKey::from_secret/from_rsa_pem/from_ec_pem/from_jwk
+# and Validation with iss/aud/exp/nbf/algorithms.
+jsonwebtoken = "9"
 
 # Data structures / utils
 dashmap = "6"

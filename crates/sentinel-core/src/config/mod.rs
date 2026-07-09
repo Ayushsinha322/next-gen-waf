@@ -387,6 +387,7 @@ pub struct WafConfig {
     #[serde(default)]
     pub api_discovery: bool,
     pub graphql: Option<GraphqlConfig>,
+    pub jwt: Option<JwtConfig>,
     pub anti_ddos: Option<AntiDdosConfig>,
     pub geoip: Option<GeoIpConfig>,
     /// Paths to plugin manifests (`sentinel-plugin.toml` files).
@@ -597,6 +598,50 @@ pub struct GraphqlConfig {
     /// so schema disclosure is refused unless an operator opts out.
     #[serde(default = "default_true")]
     pub block_introspection: bool,
+}
+
+/// Per-site edge JWT / OAuth2 validation for protected customer APIs. When
+/// `enable` is set, the WAF verifies the client's `Authorization: Bearer` token
+/// (signature + expiry + issuer/audience + required scopes) before forwarding.
+/// Key material comes from a static HS256 secret, a public-key PEM, or a JWKS
+/// endpoint (fetched + cached, rotated by `kid`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JwtConfig {
+    #[serde(default)]
+    pub enable: bool,
+    /// Reject requests whose token is missing or invalid. When false, a token
+    /// is verified if present but a missing token is allowed through.
+    #[serde(default = "default_true")]
+    pub required: bool,
+    #[serde(default)]
+    pub issuer: Option<String>,
+    #[serde(default)]
+    pub audience: Option<String>,
+    #[serde(default = "default_jwt_algorithms")]
+    pub algorithms: Vec<String>,
+    /// HS256 shared secret (symmetric).
+    #[serde(default)]
+    pub hs_secret: Option<String>,
+    /// RSA / EC public key in PEM form (asymmetric static key).
+    #[serde(default)]
+    pub public_key_pem: Option<String>,
+    /// JWKS endpoint URL — keys fetched + cached, selected by token `kid`.
+    #[serde(default)]
+    pub jwks_url: Option<String>,
+    /// All of these scopes must be present in the token to pass.
+    #[serde(default)]
+    pub required_scopes: Vec<String>,
+    /// Claim carrying scopes (space-delimited string or array). Default `scope`.
+    #[serde(default = "default_scope_claim")]
+    pub scope_claim: String,
+}
+
+fn default_jwt_algorithms() -> Vec<String> {
+    vec!["RS256".to_string()]
+}
+
+fn default_scope_claim() -> String {
+    "scope".to_string()
 }
 
 fn default_gql_depth() -> u32 {
