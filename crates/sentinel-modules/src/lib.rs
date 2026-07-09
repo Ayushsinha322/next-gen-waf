@@ -16,6 +16,7 @@ pub mod ip_reputation;
 pub mod rate_limit;
 pub mod smuggling;
 pub mod threat_intel;
+pub mod tls_fingerprint;
 
 pub use anti_ddos::{AntiDdos, DdosVerdict};
 pub use bot_detect::{BotDetector, BotVerdict};
@@ -24,3 +25,4 @@ pub use ip_reputation::{IpReputation, IpVerdict};
 pub use rate_limit::RateLimiter;
 pub use smuggling::{detect as detect_smuggling, SmugglingVerdict};
 pub use threat_intel::{RawTier, ThreatFeed, ThreatVerdict};
+pub use tls_fingerprint::{ja4, ja4_from_client_hello, parse_client_hello, ClientHelloInfo};

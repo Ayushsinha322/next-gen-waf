@@ -1271,6 +1271,9 @@ async fn handle_connection(
     stream.set_nodelay(true)?;
 
     if let Some(acceptor) = tls_acceptor {
+        // Fingerprint the TLS ClientHello (JA4) by peeking the socket without
+        // consuming it — rustls then reads the same bytes for the handshake.
+        let tls_fp = peek_ja4(&stream).await;
         let tls = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream))
             .await
             .context("TLS handshake timed out")?
@@ -1278,17 +1281,30 @@ async fn handle_connection(
         let negotiated = tls.get_ref().1.alpn_protocol().map(|p| p.to_vec());
         let io = TokioIo::new(tls);
         if negotiated.as_deref() == Some(b"h2") {
-            serve_http2(io, peer, state, default_site, management, alt_svc).await
+            serve_http2(io, peer, state, default_site, management, alt_svc, tls_fp).await
         } else {
-            serve_http1(io, peer, state, default_site, management, alt_svc).await
+            serve_http1(io, peer, state, default_site, management, alt_svc, tls_fp).await
         }
     } else {
         let io = TokioIo::new(stream);
         if protocols.contains(&Protocol::Http2) && !protocols.contains(&Protocol::Http1) {
-            serve_http2(io, peer, state, default_site, management, alt_svc).await
+            serve_http2(io, peer, state, default_site, management, alt_svc, None).await
         } else {
-            serve_http1(io, peer, state, default_site, management, alt_svc).await
+            serve_http1(io, peer, state, default_site, management, alt_svc, None).await
         }
+    }
+}
+
+/// Peek the TLS ClientHello off the accepted TCP stream WITHOUT consuming it
+/// (`peek` leaves the bytes in the socket buffer for rustls to read during the
+/// handshake) and compute a JA4 fingerprint. Best-effort: returns `None` on a
+/// partial/absent ClientHello or timeout, so it never delays or breaks the
+/// handshake. HTTP/3 (QUIC) connections don't take this path (fingerprint None).
+async fn peek_ja4(stream: &TcpStream) -> Option<String> {
+    let mut buf = [0u8; 4096];
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.peek(&mut buf)).await {
+        Ok(Ok(n)) if n > 0 => sentinel_modules::ja4_from_client_hello(&buf[..n], false),
+        _ => None,
     }
 }
 
@@ -1299,6 +1315,7 @@ async fn serve_http1<T>(
     default_site: Option<String>,
     management: Option<Arc<ManagementUpstreams>>,
     alt_svc: Option<header::HeaderValue>,
+    tls_fp: Option<String>,
 ) -> anyhow::Result<()>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -1315,7 +1332,8 @@ where
                 let ds = default_site.clone();
                 let mgmt = management.clone();
                 let av = alt_svc.clone();
-                async move { with_alt_svc(handle_request(s, peer, req, ds, mgmt).await, av) }
+                let fp = tls_fp.clone();
+                async move { with_alt_svc(handle_request(s, peer, req, ds, mgmt, fp).await, av) }
             }),
         )
         .with_upgrades()
@@ -1330,6 +1348,7 @@ async fn serve_http2<T>(
     default_site: Option<String>,
     management: Option<Arc<ManagementUpstreams>>,
     alt_svc: Option<header::HeaderValue>,
+    tls_fp: Option<String>,
 ) -> anyhow::Result<()>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -1347,7 +1366,8 @@ where
                 let ds = default_site.clone();
                 let mgmt = management.clone();
                 let av = alt_svc.clone();
-                async move { with_alt_svc(handle_request(s, peer, req, ds, mgmt).await, av) }
+                let fp = tls_fp.clone();
+                async move { with_alt_svc(handle_request(s, peer, req, ds, mgmt, fp).await, av) }
             }),
         )
         .await
@@ -1379,6 +1399,7 @@ async fn handle_request(
     req: Request<Incoming>,
     default_site: Option<String>,
     management: Option<Arc<ManagementUpstreams>>,
+    tls_fp: Option<String>,
 ) -> Result<Response<BoxBody>, Infallible> {
     // Health / readiness endpoint — served before any WAF pipeline work.
     // GET /healthz or GET /health returns JSON with proxy uptime, site
@@ -1441,7 +1462,7 @@ async fn handle_request(
     // `run_pipeline`, also called by the HTTP/3 adapter in `http3.rs`. `.map()`
     // preserves request extensions, so the WebSocket `OnUpgrade` handle captured
     // by hyper survives the body swap (`CanUpgrade` is generic over the body).
-    Ok(run_pipeline(state, peer, req.map(|b| b.boxed()), default_site).await)
+    Ok(run_pipeline(state, peer, req.map(|b| b.boxed()), default_site, tls_fp).await)
 }
 
 /// Shared request pipeline, transport-agnostic over the request body type.
@@ -1456,6 +1477,7 @@ pub(crate) async fn run_pipeline(
     peer: SocketAddr,
     req: Request<BoxBody>,
     default_site: Option<String>,
+    tls_fp: Option<String>,
 ) -> Response<BoxBody> {
     // eBPF fast-fail: known-blocked IPs never enter the WAF pipeline.
     // Runs before body reads, header parsing, or any other work.
@@ -1478,7 +1500,7 @@ pub(crate) async fn run_pipeline(
     );
 
     let resp = async move {
-        match proxy(state, peer, req, default_site).await {
+        match proxy(state, peer, req, default_site, tls_fp).await {
             Ok(r) => r,
             Err(e) => {
                 error!("proxy error: {e:#}");
@@ -1505,6 +1527,7 @@ async fn proxy(
     peer: SocketAddr,
     mut req: Request<BoxBody>,
     default_site: Option<String>,
+    tls_fp: Option<String>,
 ) -> anyhow::Result<Response<BoxBody>> {
     let cfg = state.config.load();
     let engine_map = state.engines.load_full();
@@ -1519,6 +1542,9 @@ async fn proxy(
 
     // --- Phase 0: Connection ---
     let mut ctx = RequestContext::new(peer.ip(), peer.port());
+    // JA4 TLS fingerprint computed from the ClientHello during the handshake
+    // (None for plaintext/HTTP-3 listeners). Consumed by the bot classifier.
+    ctx.tls_fingerprint = tls_fp;
 
     // Anti-DDoS: connection-rate check.
     match state.modules.anti_ddos.check_connection(ctx.client_ip) {
@@ -3436,6 +3462,7 @@ fn log_request(ctx: &RequestContext) {
         site = ctx.site_id.as_deref().unwrap_or("-"),
         status,
         latency_ms = ctx.elapsed_ms(),
+        ja4 = ctx.tls_fingerprint.as_deref().unwrap_or("-"),
         anomaly_score = ctx.anomaly_score,
         rule_matches = ctx.rule_matches.len(),
         rule_ids = rule_ids.join(","),

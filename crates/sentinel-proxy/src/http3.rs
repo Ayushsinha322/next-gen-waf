@@ -226,8 +226,9 @@ async fn handle_h3_request(
         .boxed();
     let pipeline_req = Request::from_parts(parts, body);
 
-    // Run the full WAF pipeline — identical to the TCP path.
-    let resp = run_pipeline(state, peer, pipeline_req, default_site).await;
+    // Run the full WAF pipeline — identical to the TCP path. JA4 for QUIC/h3
+    // is not yet wired (None); the TCP path supplies the fingerprint today.
+    let resp = run_pipeline(state, peer, pipeline_req, default_site, None).await;
 
     // Relay the response over the QUIC stream: headers first, then body.
     let (mut resp_parts, resp_body) = resp.into_parts();
