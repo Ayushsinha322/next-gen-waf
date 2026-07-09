@@ -348,35 +348,35 @@ func handleListSites(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 				"name": "dvwa.local", "domains": []string{"dvwa.local"},
 				"upstream":   gin.H{"servers": []string{"127.0.0.1:80"}, "lb": "round_robin"},
 				"waf_policy": gin.H{"mode": "blocking", "paranoia_level": 2, "anomaly_threshold": 5},
-				"status": "active", "created_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-01T00:00:00Z",
+				"status":     "active", "created_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-01T00:00:00Z",
 			},
 			{
 				"id": "00000000-0000-0000-0001-000000000002", "tenant_id": claims.TenantID,
 				"name": "juice.local", "domains": []string{"juice.local"},
 				"upstream":   gin.H{"servers": []string{"127.0.0.1:3000"}, "lb": "round_robin"},
 				"waf_policy": gin.H{"mode": "blocking", "paranoia_level": 2, "anomaly_threshold": 5},
-				"status": "active", "created_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-01T00:00:00Z",
+				"status":     "active", "created_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-01T00:00:00Z",
 			},
 			{
 				"id": "00000000-0000-0000-0001-000000000003", "tenant_id": claims.TenantID,
 				"name": "api.acme.com", "domains": []string{"api.acme.com"},
 				"upstream":   gin.H{"servers": []string{"127.0.0.1:8080"}, "lb": "round_robin"},
 				"waf_policy": gin.H{"mode": "learning", "paranoia_level": 1, "anomaly_threshold": 10},
-				"status": "active", "created_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-01T00:00:00Z",
+				"status":     "active", "created_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-01T00:00:00Z",
 			},
 			{
 				"id": "00000000-0000-0000-0001-000000000004", "tenant_id": claims.TenantID,
 				"name": "shop.corp.io", "domains": []string{"shop.corp.io"},
 				"upstream":   gin.H{"servers": []string{"127.0.0.1:8443"}, "lb": "round_robin"},
 				"waf_policy": gin.H{"mode": "blocking", "paranoia_level": 3, "anomaly_threshold": 5},
-				"status": "active", "created_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-01T00:00:00Z",
+				"status":     "active", "created_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-01T00:00:00Z",
 			},
 			{
 				"id": "00000000-0000-0000-0001-000000000005", "tenant_id": claims.TenantID,
 				"name": "legacy.app.net", "domains": []string{"legacy.app.net"},
 				"upstream":   gin.H{"servers": []string{"127.0.0.1:8088"}, "lb": "round_robin"},
 				"waf_policy": gin.H{"mode": "off", "paranoia_level": 1, "anomaly_threshold": 50},
-				"status": "paused", "created_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-01T00:00:00Z",
+				"status":     "paused", "created_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-01T00:00:00Z",
 			},
 		},
 		"tenant_id": claims.TenantID,
@@ -862,12 +862,12 @@ func siteRowToRustConfig(s db.SiteRow) (map[string]any, error) {
 		return nil, err
 	}
 	return map[string]any{
-		"id":        s.Name, // proxy matches by site ID — use name (e.g., "dvwa.local")
+		"id":        s.Name,     // proxy matches by site ID — use name (e.g., "dvwa.local")
 		"tenant_id": s.TenantID, // propagated so per-request telemetry is tenant-scoped
 		"domains":   s.Domains,
-		"upstream": upstream,
-		"waf":      waf,
-		"plugins":  []any{},
+		"upstream":  upstream,
+		"waf":       waf,
+		"plugins":   []any{},
 		// Per-site TLS intent (the dashboard nests it under waf_policy.tls) lifted
 		// to the top-level Rust SiteConfig.tls, so the data plane honors per-site
 		// cert mode (ACME auto-issuance/renewal, manual cert paths). Serving certs
@@ -1068,6 +1068,7 @@ func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
 		RuleExclusions   json.RawMessage `json:"rule_exclusions"`
 		RateLimit        json.RawMessage `json:"rate_limit"`
 		BotDetection     json.RawMessage `json:"bot_detection"`
+		Graphql          json.RawMessage `json:"graphql"`
 		AntiDdos         json.RawMessage `json:"anti_ddos"`
 		GeoIP            json.RawMessage `json:"geoip"`
 		ML               json.RawMessage `json:"ml"`
@@ -1142,6 +1143,7 @@ func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
 
 	attachRawObject(waf, "rate_limit", p.RateLimit)
 	attachRawObject(waf, "bot_detection", p.BotDetection)
+	attachRawObject(waf, "graphql", p.Graphql)
 	attachRawObject(waf, "ml", p.ML)
 	attachRawObject(waf, "ip_reputation", p.IPReputation)
 
@@ -1636,8 +1638,20 @@ func handleCreateRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 	id := fmt.Sprintf("custom-%d", time.Now().UnixNano()%100000000)
 	c.JSON(http.StatusCreated, gin.H{"rule": gin.H{
 		"id": id, "tenant_id": claims.TenantID,
-		"name": req.Name, "source": func() string { if req.Source != "" { return req.Source } else { return "custom" } }(),
-		"phase": req.Phase, "severity": func() string { if req.Severity != "" { return req.Severity } else { return "medium" } }(),
+		"name": req.Name, "source": func() string {
+			if req.Source != "" {
+				return req.Source
+			} else {
+				return "custom"
+			}
+		}(),
+		"phase": req.Phase, "severity": func() string {
+			if req.Severity != "" {
+				return req.Severity
+			} else {
+				return "medium"
+			}
+		}(),
 		"dsl": req.DSL, "enabled": true, "tags": req.Tags,
 		"created_at": time.Now(), "updated_at": time.Now(),
 	}})
@@ -1669,9 +1683,15 @@ func handleToggleRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 	writeAuditEntry(c, store, hub, &db.WriteAuditRequest{
 		TenantID:    claims.TenantID,
 		ActorUserID: &claims.UserID,
-		Action:      fmt.Sprintf("rule.%s", func() string { if req.Enabled { return "enable" } else { return "disable" } }()),
-		TargetKind:  "rule",
-		TargetID:    &id,
+		Action: fmt.Sprintf("rule.%s", func() string {
+			if req.Enabled {
+				return "enable"
+			} else {
+				return "disable"
+			}
+		}()),
+		TargetKind: "rule",
+		TargetID:   &id,
 	})
 	c.JSON(http.StatusOK, gin.H{"ok": true, "id": id, "enabled": req.Enabled})
 }
@@ -1921,7 +1941,7 @@ func handleCreateUserReal(c *gin.Context, enf *rbac.Enforcer) {
 	}
 	c.JSON(http.StatusCreated, gin.H{
 		"user": gin.H{
-			"id": fmt.Sprintf("user-%d", time.Now().UnixNano()%100000000),
+			"id":    fmt.Sprintf("user-%d", time.Now().UnixNano()%100000000),
 			"email": req.Email, "name": req.Name, "role": req.Role,
 			"status": "active", "twofa": false, "last_login": nil,
 		},
@@ -1952,8 +1972,8 @@ func handleCreateAPIKeyReal(c *gin.Context, enf *rbac.Enforcer) {
 		return
 	}
 	var req struct {
-		Name    string `json:"name" binding:"required"`
-		Scope   string `json:"scope"`
+		Name  string `json:"name" binding:"required"`
+		Scope string `json:"scope"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
