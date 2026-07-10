@@ -579,12 +579,29 @@ pub enum ChallengeMode {
     Turnstile,
 }
 
+/// What the DLP scanner does when it finds sensitive data in a response body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DlpAction {
+    /// Block the entire response (default — backward compatible).
+    #[default]
+    Block,
+    /// Redact the matched data in place and forward the sanitized response.
+    Mask,
+    /// Log the finding but forward the response unchanged.
+    Detect,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DlpConfig {
     #[serde(default)]
     pub enable: bool,
     #[serde(default)]
     pub patterns: Vec<String>,
+    /// Response action when sensitive data is found: `block` (default), `mask`,
+    /// or `detect` (log-only).
+    #[serde(default)]
+    pub action: DlpAction,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

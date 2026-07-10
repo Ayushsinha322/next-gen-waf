@@ -4,6 +4,7 @@
 //! - [`ip_reputation`] — CIDR-based block/allowlists and feed ingestion.
 //! - [`rate_limit`]    — Token-bucket rate limiter (per-IP, per-site, global).
 //! - [`bot_detect`]    — User-Agent classification and JA4 fingerprint matching.
+//! - [`dlp`]           — Response-body DLP: PII/secret detection + length-preserving redaction.
 //! - [`geoip`]         — Country-level IP filtering via MaxMind GeoLite2.
 //! - [`anti_ddos`]     — Connection-rate DDoS protection with auto-blocking.
 //! - [`jwt_auth`]      — Edge JWT (bearer-token) validation for customer APIs.
@@ -13,6 +14,7 @@
 
 pub mod anti_ddos;
 pub mod bot_detect;
+pub mod dlp;
 pub mod geoip;
 pub mod graphql;
 pub mod grpc;
@@ -25,6 +27,7 @@ pub mod tls_fingerprint;
 
 pub use anti_ddos::{AntiDdos, DdosVerdict};
 pub use bot_detect::{BotDetector, BotScore, BotSignals, BotTier, BotVerdict};
+pub use dlp::DlpEngine;
 pub use geoip::{GeoIp, GeoVerdict};
 pub use graphql::{inspect as inspect_graphql, GraphqlLimits};
 pub use grpc::{

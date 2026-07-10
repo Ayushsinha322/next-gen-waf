@@ -47,12 +47,11 @@ use hyper::body::Body;
 use hyper::body::Incoming;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
-use regex::Regex;
 use rustls::ServerConfig;
 use sentinel_core::{
     config::{
-        ChallengeMode, ConfigHandle, DlpConfig, IpReputationConfig, ListenerConfig, Protocol,
-        SecurityHeadersConfig, SentinelConfig, SiteConfig, WafMode,
+        ChallengeMode, ConfigHandle, DlpAction, DlpConfig, IpReputationConfig, ListenerConfig,
+        Protocol, SecurityHeadersConfig, SentinelConfig, SiteConfig, WafMode,
     },
     context::{Phase, RequestContext, WafDecision},
 };
@@ -60,9 +59,9 @@ use sentinel_ebpf::{EbpfConfig, EbpfManager};
 use sentinel_ml::MlEngine;
 use sentinel_modules::{
     check_grpc_body, check_grpc_request, detect_smuggling, inspect_graphql, is_grpc, token_header,
-    validate_jwt, AntiDdos, BotDetector, BotSignals, BotTier, DdosVerdict, GeoIp, GeoVerdict,
-    GraphqlLimits, GrpcLimits, IpReputation, IpVerdict, JwtPolicy, RateLimiter, RawTier,
-    SmugglingVerdict, ThreatFeed, ThreatVerdict,
+    validate_jwt, AntiDdos, BotDetector, BotSignals, BotTier, DdosVerdict, DlpEngine, GeoIp,
+    GeoVerdict, GraphqlLimits, GrpcLimits, IpReputation, IpVerdict, JwtPolicy, RateLimiter,
+    RawTier, SmugglingVerdict, ThreatFeed, ThreatVerdict,
 };
 use sentinel_plugins::PluginRuntime;
 use sentinel_rules::RuleEngine;
@@ -97,98 +96,40 @@ type FeedCache = Arc<ArcSwap<Vec<(String, Vec<String>)>>>;
 // ---------------------------------------------------------------------------
 
 /// Per-site DLP scanner.  Built once at startup / reload; scans response
-/// bodies for PII and secret patterns.
+/// bodies for PII and secret patterns via the shared [`DlpEngine`] (builtin
+/// card/SSN/AWS/token/key patterns + India PII: PAN, Aadhaar, mobile) and
+/// applies the configured action (block / mask / detect).
 struct DlpScanner {
-    patterns: Vec<(Regex, &'static str)>,
-    user_patterns: Vec<Regex>,
+    engine: DlpEngine,
     enabled: bool,
+    action: DlpAction,
 }
 
 impl DlpScanner {
     fn from_config(cfg: &DlpConfig) -> Self {
-        let builtin: &[(&str, &str)] = &[
-            // Credit / debit card numbers (Luhn-shaped 13-19 digit groups)
-            (
-                r"(?<!\d)(?:4[0-9]{12,15}|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12}|(?:2131|1800|35\d{3})\d{11})(?!\d)",
-                "credit_card",
-            ),
-            // US Social Security Number
-            (
-                r"\b(?!000|666|9\d{2})\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b",
-                "ssn",
-            ),
-            // PEM private key header
-            (
-                r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----",
-                "private_key",
-            ),
-            // AWS access key
-            (r"\bAKIA[0-9A-Z]{16}\b", "aws_access_key"),
-            // AWS secret key (contextual — next to known keyword)
-            (
-                r#"(?i)aws[_\-\s]*secret[_\-\s]*(?:access[_\-\s]*)?key["'\s:=]+[A-Za-z0-9/+]{40}"#,
-                "aws_secret_key",
-            ),
-            // Generic high-entropy API tokens / bearer tokens in JSON
-            (
-                r#"(?i)(?:"|\b)(?:api[_-]?key|access[_-]?token|auth[_-]?token|bearer|secret)["\s]*[:=]+\s*["']?[A-Za-z0-9/+_\-]{32,}"#,
-                "api_token",
-            ),
-            // Password leaked in JSON response
-            (
-                r#""(?:password|passwd|pwd)"\s*:\s*"[^"]{4,}""#,
-                "password_in_json",
-            ),
-            // Generic private-looking 40-char hex string (git-style secrets)
-            (r"\b[0-9a-f]{40}\b", "hex_secret"),
-        ];
-
-        let mut compiled_builtins: Vec<(Regex, &'static str)> = Vec::new();
-        for (pat, label) in builtin {
-            match Regex::new(pat) {
-                Ok(re) => compiled_builtins.push((re, label)),
-                Err(e) => warn!("DLP built-in pattern compile error ({label}): {e}"),
-            }
-        }
-
-        let user_patterns: Vec<Regex> = cfg
-            .patterns
-            .iter()
-            .filter_map(|p| match Regex::new(p) {
-                Ok(re) => Some(re),
-                Err(e) => {
-                    warn!("DLP user pattern compile error ({p}): {e}");
-                    None
-                }
-            })
-            .collect();
-
         Self {
-            patterns: compiled_builtins,
-            user_patterns,
+            engine: DlpEngine::new(&cfg.patterns),
             enabled: cfg.enable,
+            action: cfg.action,
         }
     }
 
-    /// Scan `body` for sensitive data.  Returns the first matched label, or
-    /// `None` if clean.  Only scans the first 512 KiB of a large body.
+    /// Scan `body` for sensitive data — first matched label, or `None` if clean
+    /// (only the first 512 KiB is inspected).
     fn scan(&self, body: &[u8]) -> Option<&'static str> {
         if !self.enabled {
             return None;
         }
-        let cap = body.len().min(512 * 1024);
-        let text = std::str::from_utf8(&body[..cap]).ok()?;
-        for (re, label) in &self.patterns {
-            if re.is_match(text) {
-                return Some(label);
-            }
+        self.engine.scan(body)
+    }
+
+    /// Redact every match in place (length-preserving) and return the sanitized
+    /// body plus the hit labels, or `None` if nothing matched.
+    fn mask(&self, body: &[u8]) -> Option<(Vec<u8>, Vec<String>)> {
+        if !self.enabled {
+            return None;
         }
-        for re in &self.user_patterns {
-            if re.is_match(text) {
-                return Some("user_pattern");
-            }
-        }
-        None
+        self.engine.mask(body)
     }
 }
 
@@ -2073,7 +2014,7 @@ async fn proxy(
             if upper <= SCAN_CAP || upper == u64::MAX {
                 match resp_body.collect().await {
                     Ok(collected) => {
-                        let bytes = collected.to_bytes();
+                        let mut bytes = collected.to_bytes();
 
                         // (1) Response-body rule engine (CRS RESPONSE-* etc.).
                         if let Some(engine) = resp_engine {
@@ -2097,34 +2038,84 @@ async fn proxy(
                             }
                         }
 
-                        // (2) DLP scan (PII / secret leakage).
+                        // (2) DLP — scan / mask / detect on PII & secret
+                        // leakage, per the site's configured action.
                         if let Some(dlp) = dlp {
-                            if let Some(matched) = dlp.scan(&bytes) {
-                                ctx.decision = WafDecision::Block;
-                                ctx.block_reason =
-                                    Some(format!("DLP: sensitive data pattern matched: {matched}"));
-                                // Respect learning mode (downgrade Block → Log)
-                                // exactly like the response-body rule path above —
-                                // a learning-mode site must not block or rewrite
-                                // the response, only record the would-block.
-                                enforce_mode(&mut ctx, &site_cfg.waf.mode);
-                                if ctx.decision == WafDecision::Block {
-                                    warn!(
-                                        site = %site_cfg.id,
-                                        client_ip = %ctx.client_ip,
-                                        pattern = matched,
-                                        "DLP: sensitive data in response — blocking"
-                                    );
-                                    ctx.advance_phase(Phase::Logging);
-                                    log_request(&ctx);
-                                    return Ok(block_response(&ctx));
+                            match dlp.action {
+                                // Block the whole response on any match.
+                                DlpAction::Block => {
+                                    if let Some(matched) = dlp.scan(&bytes) {
+                                        ctx.decision = WafDecision::Block;
+                                        ctx.block_reason = Some(format!(
+                                            "DLP: sensitive data pattern matched: {matched}"
+                                        ));
+                                        // Learning mode downgrades Block → Log —
+                                        // must not block or rewrite, only record.
+                                        enforce_mode(&mut ctx, &site_cfg.waf.mode);
+                                        if ctx.decision == WafDecision::Block {
+                                            warn!(
+                                                site = %site_cfg.id,
+                                                client_ip = %ctx.client_ip,
+                                                pattern = matched,
+                                                "DLP: sensitive data in response — blocking"
+                                            );
+                                            ctx.advance_phase(Phase::Logging);
+                                            log_request(&ctx);
+                                            return Ok(block_response(&ctx));
+                                        }
+                                        warn!(
+                                            site = %site_cfg.id,
+                                            client_ip = %ctx.client_ip,
+                                            pattern = matched,
+                                            "DLP: sensitive data in response — would block (learning mode)"
+                                        );
+                                    }
                                 }
-                                warn!(
-                                    site = %site_cfg.id,
-                                    client_ip = %ctx.client_ip,
-                                    pattern = matched,
-                                    "DLP: sensitive data in response — would block (learning mode)"
-                                );
+                                // Redact matched data in place (length-preserving)
+                                // and forward the sanitized response.
+                                DlpAction::Mask => {
+                                    if site_cfg.waf.mode == WafMode::Learning {
+                                        // Observe only — never rewrite in learning mode.
+                                        if let Some(matched) = dlp.scan(&bytes) {
+                                            ctx.tx_vars.insert(
+                                                "dlp_would_mask".to_string(),
+                                                matched.to_string(),
+                                            );
+                                            warn!(
+                                                site = %site_cfg.id,
+                                                client_ip = %ctx.client_ip,
+                                                pattern = matched,
+                                                "DLP: sensitive data in response — would mask (learning mode)"
+                                            );
+                                        }
+                                    } else if let Some((masked, hits)) = dlp.mask(&bytes) {
+                                        let hits_str = hits.join(", ");
+                                        ctx.tx_vars
+                                            .insert("dlp_masked".to_string(), hits_str.clone());
+                                        warn!(
+                                            site = %site_cfg.id,
+                                            client_ip = %ctx.client_ip,
+                                            hits = %hits_str,
+                                            "DLP: masked sensitive data in response"
+                                        );
+                                        bytes = Bytes::from(masked);
+                                    }
+                                }
+                                // Log the finding but forward unchanged.
+                                DlpAction::Detect => {
+                                    if let Some(matched) = dlp.scan(&bytes) {
+                                        ctx.tx_vars.insert(
+                                            "dlp_detected".to_string(),
+                                            matched.to_string(),
+                                        );
+                                        warn!(
+                                            site = %site_cfg.id,
+                                            client_ip = %ctx.client_ip,
+                                            pattern = matched,
+                                            "DLP: sensitive data in response — detected (forwarded unchanged)"
+                                        );
+                                    }
+                                }
                             }
                         }
 
