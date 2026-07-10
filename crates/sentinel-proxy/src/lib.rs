@@ -24,6 +24,7 @@
 
 pub mod challenge;
 pub mod http3;
+mod jwks;
 pub mod tls;
 pub mod upstream;
 pub mod websocket;
@@ -58,9 +59,10 @@ use sentinel_core::{
 use sentinel_ebpf::{EbpfConfig, EbpfManager};
 use sentinel_ml::MlEngine;
 use sentinel_modules::{
-    detect_smuggling, inspect_graphql, validate_jwt, AntiDdos, BotDetector, BotSignals, BotTier,
-    DdosVerdict, GeoIp, GeoVerdict, GraphqlLimits, IpReputation, IpVerdict, JwtPolicy, RateLimiter,
-    RawTier, SmugglingVerdict, ThreatFeed, ThreatVerdict,
+    check_grpc_body, check_grpc_request, detect_smuggling, inspect_graphql, is_grpc, token_header,
+    validate_jwt, AntiDdos, BotDetector, BotSignals, BotTier, DdosVerdict, GeoIp, GeoVerdict,
+    GraphqlLimits, GrpcLimits, IpReputation, IpVerdict, JwtPolicy, RateLimiter, RawTier,
+    SmugglingVerdict, ThreatFeed, ThreatVerdict,
 };
 use sentinel_plugins::PluginRuntime;
 use sentinel_rules::RuleEngine;
@@ -342,6 +344,11 @@ struct ModulesState {
     /// patterns) hot-synced from the control plane. Atomically swapped by the
     /// threat-intel poller — updates never block a live request.
     threat_intel: ArcSwap<ThreatFeed>,
+
+    /// Per-endpoint JWKS cache for edge-JWT validation (fetched on demand,
+    /// rotated by `kid`). Persists across config reloads so cached keys are
+    /// not dropped when a site's policy changes.
+    jwks: jwks::JwksCache,
 }
 
 // ---------------------------------------------------------------------------
@@ -629,6 +636,7 @@ impl ProxyServer {
             correlation: CorrelationEngine::new(),
             feed_cache: Arc::clone(&feed_cache),
             threat_intel: ArcSwap::new(Arc::new(ThreatFeed::empty())),
+            jwks: jwks::JwksCache::new(),
         });
 
         let plugin_runtime = build_plugin_runtime(&cfg).unwrap_or_else(|e| {
@@ -1866,6 +1874,30 @@ async fn proxy(
             }
         }
 
+        // gRPC firewall — message/frame-size limits on the buffered body.
+        if ctx.decision == WafDecision::Allow {
+            if let Some(grpc_cfg) = site.and_then(|s| s.waf.grpc.as_ref()).filter(|g| g.enable) {
+                let is_grpc_ct = ctx
+                    .request_headers
+                    .get(http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(is_grpc);
+                if is_grpc_ct {
+                    let limits = GrpcLimits {
+                        max_message_bytes: grpc_cfg.max_message_bytes,
+                        max_frames: grpc_cfg.max_frames,
+                        block_reflection: grpc_cfg.block_reflection,
+                        allowed_methods: grpc_cfg.allowed_methods.clone(),
+                        blocked_methods: grpc_cfg.blocked_methods.clone(),
+                    };
+                    if let Some(reason) = check_grpc_body(&bytes, &limits) {
+                        ctx.decision = WafDecision::Block;
+                        ctx.block_reason = Some(format!("grpc: {reason}"));
+                    }
+                }
+            }
+        }
+
         if ctx.decision == WafDecision::Block {
             state.modules.correlation.record_block(ctx.client_ip);
             let resp = block_response(&ctx);
@@ -2255,10 +2287,12 @@ async fn phase1_headers(
 
     // --- Edge JWT (bearer-token) validation ---
     // Verifies signature + expiry + issuer/audience/scopes against a fixed
-    // algorithm allow-list before the request reaches origin. Static key
-    // material only (HS256 secret or public-key PEM); JWKS-by-`kid` is a
-    // documented follow-up. Reasons are prefixed "jwt:" so the block renderer
-    // returns 401 (not the generic 403) without leaking the reason to clients.
+    // algorithm allow-list before the request reaches origin. Key material is
+    // a static HS256 secret, a static public-key PEM, or an IdP's JWKS endpoint
+    // (fetched + cached, rotated by `kid`). Reasons are prefixed "jwt:" so the
+    // block renderer returns 401 (not the generic 403) without leaking the
+    // reason to clients. A *present* token that fails validation is always
+    // rejected; `required` only governs whether a *missing* token is allowed.
     if ctx.decision == WafDecision::Allow {
         if let Some(ref jwt_cfg) = site.waf.jwt {
             if jwt_cfg.enable {
@@ -2280,48 +2314,88 @@ async fn phase1_headers(
                         }
                     }
                     Some(token) => {
-                        // Build the verification key from the site's static key
-                        // material. A public-key PEM is parsed as EC when the
-                        // policy lists an ES* algorithm, otherwise as RSA.
-                        let key = if let Some(secret) = jwt_cfg.hs_secret.as_deref() {
-                            Some(jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()))
+                        let policy = JwtPolicy {
+                            algorithms: jwt_cfg.algorithms.clone(),
+                            issuer: jwt_cfg.issuer.clone(),
+                            audience: jwt_cfg.audience.clone(),
+                            required_scopes: jwt_cfg.required_scopes.clone(),
+                            scope_claim: jwt_cfg.scope_claim.clone(),
+                        };
+                        // Select key material in priority order: static HS
+                        // secret → static public PEM → JWKS endpoint. A public
+                        // PEM is parsed as EC when the policy lists an ES*
+                        // algorithm, otherwise as RSA.
+                        let result: Result<(), String> = if let Some(secret) =
+                            jwt_cfg.hs_secret.as_deref()
+                        {
+                            let key = jsonwebtoken::DecodingKey::from_secret(secret.as_bytes());
+                            validate_jwt(token, &key, &policy)
                         } else if let Some(pem) = jwt_cfg.public_key_pem.as_deref() {
                             let is_ec = jwt_cfg.algorithms.iter().any(|a| a.starts_with("ES"));
-                            if is_ec {
-                                jsonwebtoken::DecodingKey::from_ec_pem(pem.as_bytes()).ok()
+                            let built = if is_ec {
+                                jsonwebtoken::DecodingKey::from_ec_pem(pem.as_bytes())
                             } else {
-                                jsonwebtoken::DecodingKey::from_rsa_pem(pem.as_bytes()).ok()
+                                jsonwebtoken::DecodingKey::from_rsa_pem(pem.as_bytes())
+                            };
+                            match built {
+                                Ok(key) => validate_jwt(token, &key, &policy),
+                                Err(_) => Err("misconfigured public key".to_string()),
                             }
-                        } else {
-                            None
-                        };
-                        match key {
-                            Some(key) => {
-                                let policy = JwtPolicy {
-                                    algorithms: jwt_cfg.algorithms.clone(),
-                                    issuer: jwt_cfg.issuer.clone(),
-                                    audience: jwt_cfg.audience.clone(),
-                                    required_scopes: jwt_cfg.required_scopes.clone(),
-                                    scope_claim: jwt_cfg.scope_claim.clone(),
-                                };
-                                if let Err(reason) = validate_jwt(token, &key, &policy) {
-                                    if jwt_cfg.required {
-                                        ctx.decision = WafDecision::Block;
-                                        ctx.block_reason = Some(format!("jwt: {reason}"));
+                        } else if let Some(url) = jwt_cfg.jwks_url.as_deref() {
+                            // JWKS: pick the key by the token's `kid`. An
+                            // unknown `kid` forces a cache refresh (rotation).
+                            match token_header(token) {
+                                Some((Some(kid), _alg)) => {
+                                    let keys = modules.jwks.keys(url, Some(kid.as_str())).await;
+                                    match keys.get(&kid) {
+                                        Some(key) => validate_jwt(token, key, &policy),
+                                        None => Err(format!("unknown key id: {kid}")),
                                     }
                                 }
-                            }
-                            None => {
-                                // No usable static key (JWKS-only or an
-                                // unparseable PEM). Fail closed when required.
-                                if jwt_cfg.required {
-                                    ctx.decision = WafDecision::Block;
-                                    ctx.block_reason = Some(
-                                        "jwt: no usable verification key configured".to_string(),
-                                    );
+                                Some((None, _)) => {
+                                    Err("token header missing kid (required for JWKS)".to_string())
                                 }
+                                None => Err("malformed token header".to_string()),
                             }
+                        } else {
+                            Err("no verification key configured".to_string())
+                        };
+                        // A token was presented; if it does not validate, reject
+                        // regardless of `required` (WafMode::Learning still
+                        // downgrades Block → Log via enforce_mode below).
+                        if let Err(reason) = result {
+                            ctx.decision = WafDecision::Block;
+                            ctx.block_reason = Some(format!("jwt: {reason}"));
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    // --- gRPC firewall (method / reflection gate) ---
+    // Path-level checks on gRPC traffic before the body is buffered: per-method
+    // allow/deny and server-reflection blocking. Frame/size limits run later in
+    // phase2 once the body is available.
+    if ctx.decision == WafDecision::Allow {
+        if let Some(ref grpc_cfg) = site.waf.grpc {
+            if grpc_cfg.enable {
+                let is_grpc_ct = ctx
+                    .request_headers
+                    .get(http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(is_grpc);
+                if is_grpc_ct {
+                    let limits = GrpcLimits {
+                        max_message_bytes: grpc_cfg.max_message_bytes,
+                        max_frames: grpc_cfg.max_frames,
+                        block_reflection: grpc_cfg.block_reflection,
+                        allowed_methods: grpc_cfg.allowed_methods.clone(),
+                        blocked_methods: grpc_cfg.blocked_methods.clone(),
+                    };
+                    if let Some(reason) = check_grpc_request(ctx.uri.path(), &limits) {
+                        ctx.decision = WafDecision::Block;
+                        ctx.block_reason = Some(format!("grpc: {reason}"));
                     }
                 }
             }

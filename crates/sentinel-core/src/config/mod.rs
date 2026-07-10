@@ -388,6 +388,7 @@ pub struct WafConfig {
     pub api_discovery: bool,
     pub graphql: Option<GraphqlConfig>,
     pub jwt: Option<JwtConfig>,
+    pub grpc: Option<GrpcConfig>,
     pub anti_ddos: Option<AntiDdosConfig>,
     pub geoip: Option<GeoIpConfig>,
     /// Paths to plugin manifests (`sentinel-plugin.toml` files).
@@ -642,6 +643,39 @@ fn default_jwt_algorithms() -> Vec<String> {
 
 fn default_scope_claim() -> String {
     "scope".to_string()
+}
+
+/// gRPC firewall — protocol-aware limits for `application/grpc(+web)` traffic.
+/// Enforces message/frame size caps, per-method allow/deny lists, and blocks
+/// server-reflection. Applied only to requests whose content-type is gRPC.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrpcConfig {
+    #[serde(default)]
+    pub enable: bool,
+    /// Per-message size cap in bytes (anti-DoS). Default 4 MiB.
+    #[serde(default = "default_grpc_max_message")]
+    pub max_message_bytes: usize,
+    /// Max message frames allowed in one request body. Default 512.
+    #[serde(default = "default_grpc_max_frames")]
+    pub max_frames: usize,
+    /// Block gRPC server-reflection services (schema disclosure). Default true.
+    #[serde(default = "default_true")]
+    pub block_reflection: bool,
+    /// If non-empty, only these `/package.Service/Method` paths (or `/svc/`
+    /// prefixes ending in `/`) are allowed; all others are blocked.
+    #[serde(default)]
+    pub allowed_methods: Vec<String>,
+    /// These `/package.Service/Method` paths (or `/svc/` prefixes) are blocked.
+    #[serde(default)]
+    pub blocked_methods: Vec<String>,
+}
+
+fn default_grpc_max_message() -> usize {
+    4 * 1024 * 1024
+}
+
+fn default_grpc_max_frames() -> usize {
+    512
 }
 
 fn default_gql_depth() -> u32 {
