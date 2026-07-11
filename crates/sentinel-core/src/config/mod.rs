@@ -369,6 +369,45 @@ fn default_timeout() -> String {
 // WAF
 // ---------------------------------------------------------------------------
 
+/// Weighted verdict fusion: combine per-engine anomaly contributions with
+/// configurable weights, then decide the verdict against per-paranoia-level
+/// thresholds — with a soft LIMIT tier below the hard BLOCK tier. When `enable`
+/// is false the WAF uses the legacy flat `anomaly_threshold`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FusionConfig {
+    #[serde(default)]
+    pub enable: bool,
+    /// Per-engine weight multipliers (engine name → weight). Engines not listed
+    /// default to 1.0. Recognised engines: `rules`, `ml`, `bot`, `threat_intel`,
+    /// `reputation`, `correlation`, `plugin`.
+    #[serde(default)]
+    pub weights: HashMap<String, f32>,
+    /// Hard-block threshold per paranoia level (index 0 = PL1 … 3 = PL4). If the
+    /// list is shorter than the site's paranoia level, the last entry is used.
+    #[serde(default = "default_block_thresholds")]
+    pub block_thresholds: Vec<u32>,
+    /// Soft-LIMIT threshold per paranoia level (must be below block). Empty
+    /// disables the LIMIT tier (fused verdict is only ever Allow or Block).
+    #[serde(default = "default_limit_thresholds")]
+    pub limit_thresholds: Vec<u32>,
+    /// HTTP status returned for a LIMIT verdict.
+    #[serde(default = "default_limit_status")]
+    pub limit_status: u16,
+}
+
+fn default_block_thresholds() -> Vec<u32> {
+    // Stricter (lower) at higher paranoia levels — PL1..PL4.
+    vec![7, 5, 4, 3]
+}
+
+fn default_limit_thresholds() -> Vec<u32> {
+    vec![4, 3, 2, 2]
+}
+
+fn default_limit_status() -> u16 {
+    429
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WafConfig {
     #[serde(default)]
@@ -377,6 +416,9 @@ pub struct WafConfig {
     pub paranoia_level: u8,
     #[serde(default = "default_threshold")]
     pub anomaly_threshold: u32,
+    /// Weighted verdict fusion (per-engine weights + LIMIT tier + per-paranoia
+    /// thresholds). When absent/disabled the flat `anomaly_threshold` is used.
+    pub fusion: Option<FusionConfig>,
     #[serde(default)]
     pub rules: Vec<String>,
     pub ml: Option<MlConfig>,

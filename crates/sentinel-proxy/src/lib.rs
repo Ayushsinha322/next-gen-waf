@@ -50,8 +50,9 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use rustls::ServerConfig;
 use sentinel_core::{
     config::{
-        ChallengeMode, ConfigHandle, DlpAction, DlpConfig, IpReputationConfig, ListenerConfig,
-        Protocol, SecurityHeadersConfig, SentinelConfig, SiteConfig, WafMode,
+        ChallengeMode, ConfigHandle, DlpAction, DlpConfig, FusionConfig, IpReputationConfig,
+        ListenerConfig, Protocol, SecurityHeadersConfig, SentinelConfig, SiteConfig, WafConfig,
+        WafMode,
     },
     context::{Phase, RequestContext, WafDecision},
 };
@@ -1571,7 +1572,7 @@ async fn proxy(
             IpVerdict::Suspect { tags } => {
                 ctx.tx_vars
                     .insert("ip_rep_tags".to_string(), tags.join(","));
-                ctx.anomaly_score = ctx.anomaly_score.saturating_add(2);
+                ctx.add_engine_score("reputation", 2);
             }
             IpVerdict::Allow => {}
         }
@@ -1610,7 +1611,7 @@ async fn proxy(
                     // traffic as highly anomalous (see sentinel-ml).
                     ctx.threat_intel_hit = true;
                     ctx.tx_vars.insert("threat_intel".to_string(), tag);
-                    ctx.anomaly_score = ctx.anomaly_score.saturating_add(score);
+                    ctx.add_engine_score("threat_intel", score);
                 }
                 ThreatVerdict::None => {}
             }
@@ -1620,7 +1621,7 @@ async fn proxy(
     // Correlation engine: add extra score for repeat attackers.
     let corr_score = state.modules.correlation.score_for_ip(ctx.client_ip);
     if corr_score > 0 {
-        ctx.anomaly_score = ctx.anomaly_score.saturating_add(corr_score);
+        ctx.add_engine_score("correlation", corr_score);
         ctx.tx_vars
             .insert("correlation_score".to_string(), corr_score.to_string());
     }
@@ -1886,6 +1887,15 @@ async fn proxy(
             }
         }
 
+        if ctx.decision == WafDecision::Limit {
+            // Soft-deny from weighted fusion — throttle with 429 (configurable),
+            // do not auto-ban (uncertain traffic).
+            let resp = limit_response(&ctx, site);
+            ctx.response_status = Some(resp.status());
+            ctx.advance_phase(Phase::Logging);
+            log_request(&ctx);
+            return Ok(resp);
+        }
         if ctx.decision == WafDecision::Block {
             note_block(&state, ctx.client_ip);
             let resp = block_response(&ctx);
@@ -2297,11 +2307,11 @@ async fn phase1_headers(
                     ));
                 }
                 BotTier::Captcha | BotTier::JsChallenge => {
-                    ctx.anomaly_score = ctx.anomaly_score.saturating_add((bs.score / 10) as u32);
+                    ctx.add_engine_score("bot", (bs.score / 10) as u32);
                 }
                 BotTier::Allow => {
                     if bs.score >= 15 {
-                        ctx.anomaly_score = ctx.anomaly_score.saturating_add(2);
+                        ctx.add_engine_score("bot", 2);
                     }
                 }
             }
@@ -2443,7 +2453,7 @@ async fn phase1_headers(
     // --- Rule engine (CRS / SRL) ---
     if ctx.decision == WafDecision::Allow {
         if let Some(engine) = engines.get(&site.id) {
-            engine.evaluate(ctx, Phase::RequestHeaders, site.waf.anomaly_threshold);
+            eval_rules(ctx, engine, Phase::RequestHeaders, &site.waf);
         }
     }
 
@@ -2452,7 +2462,7 @@ async fn phase1_headers(
         for plugin_name in &plugin_runtime.plugin_names() {
             let result = plugin_runtime.evaluate_plugin(plugin_name, ctx).await;
             if result.anomaly_score_delta > 0 {
-                ctx.anomaly_score = ctx.anomaly_score.saturating_add(result.anomaly_score_delta);
+                ctx.add_engine_score("plugin", result.anomaly_score_delta);
             }
             match result.decision {
                 WafDecision::Block => {
@@ -2477,9 +2487,7 @@ async fn phase1_headers(
                         .await;
                     let result2 = plugin_runtime.evaluate_plugin(plugin_name, ctx).await;
                     if result2.anomaly_score_delta > 0 {
-                        ctx.anomaly_score = ctx
-                            .anomaly_score
-                            .saturating_add(result2.anomaly_score_delta);
+                        ctx.add_engine_score("plugin", result2.anomaly_score_delta);
                     }
                     match result2.decision {
                         WafDecision::Block => {
@@ -2520,7 +2528,7 @@ fn phase2_body(
     }
 
     if let Some(engine) = engines.get(&site.id) {
-        engine.evaluate(ctx, Phase::RequestBody, site.waf.anomaly_threshold);
+        eval_rules(ctx, engine, Phase::RequestBody, &site.waf);
     }
 
     if let Some(ref ml_cfg) = site.waf.ml {
@@ -2553,7 +2561,7 @@ fn phase2_body(
                             ml_scores.combined_score, ml_cfg.sensitivity
                         )
                     };
-                    ctx.anomaly_score = ctx.anomaly_score.saturating_add(delta);
+                    ctx.add_engine_score("ml", delta);
                     ctx.rule_matches.push(sentinel_core::context::RuleMatch {
                         rule_id: "ML-ANOMALY".to_string(),
                         message: reason,
@@ -2567,24 +2575,114 @@ fn phase2_body(
         }
     }
 
-    if ctx.decision != WafDecision::Block
-        && ctx.anomaly_score > 0
-        && ctx.anomaly_score >= site.waf.anomaly_threshold
-    {
-        ctx.decision = WafDecision::Block;
-        ctx.block_reason = Some(format!(
-            "anomaly score {} >= threshold {}",
-            ctx.anomaly_score, site.waf.anomaly_threshold
-        ));
-    }
+    apply_verdict(ctx, &site.waf);
 
     enforce_mode(ctx, &site.waf.mode);
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Weighted verdict fusion (#11)
+// ---------------------------------------------------------------------------
+
+/// Whether weighted fusion is active for this site.
+fn fusion_enabled(waf: &WafConfig) -> bool {
+    waf.fusion.as_ref().is_some_and(|f| f.enable)
+}
+
+/// Threshold for the site's (1-based) paranoia level from a per-PL list; the
+/// last entry repeats when the list is shorter than the level. `None` if empty.
+fn threshold_for_pl(list: &[u32], pl: u8) -> Option<u32> {
+    if list.is_empty() {
+        return None;
+    }
+    let idx = (pl.max(1) as usize - 1).min(list.len() - 1);
+    Some(list[idx])
+}
+
+/// Weighted fused score: Σ weight[engine]·bucket[engine], plus any anomaly
+/// score not attributed to an engine (counted at weight 1, so no contribution
+/// is ever silently dropped).
+fn fused_score(ctx: &RequestContext, f: &FusionConfig) -> u32 {
+    let mut weighted = 0f32;
+    let mut bucketed: u32 = 0;
+    for (engine, raw) in &ctx.engine_scores {
+        let w = f.weights.get(engine).copied().unwrap_or(1.0).max(0.0);
+        weighted += w * (*raw as f32);
+        bucketed = bucketed.saturating_add(*raw);
+    }
+    let remainder = ctx.anomaly_score.saturating_sub(bucketed);
+    (weighted.round().max(0.0) as u32).saturating_add(remainder)
+}
+
+/// Final verdict fusion. With fusion enabled: weighted score vs per-paranoia
+/// block/limit thresholds (→ Block / Limit / Allow). Otherwise the legacy flat
+/// `anomaly_threshold`. An explicit Block from an earlier phase is preserved.
+fn apply_verdict(ctx: &mut RequestContext, waf: &WafConfig) {
+    if ctx.decision == WafDecision::Block {
+        return;
+    }
+    match waf.fusion.as_ref().filter(|f| f.enable) {
+        Some(f) => {
+            let score = fused_score(ctx, f);
+            ctx.tx_vars
+                .insert("fused_score".to_string(), score.to_string());
+            let block_t = threshold_for_pl(&f.block_thresholds, waf.paranoia_level)
+                .unwrap_or(waf.anomaly_threshold);
+            if score > 0 && score >= block_t {
+                ctx.decision = WafDecision::Block;
+                ctx.block_reason = Some(format!(
+                    "fused anomaly score {score} >= block threshold {block_t} (PL{})",
+                    waf.paranoia_level
+                ));
+            } else if ctx.decision == WafDecision::Allow {
+                if let Some(limit_t) = threshold_for_pl(&f.limit_thresholds, waf.paranoia_level) {
+                    if score > 0 && score >= limit_t {
+                        ctx.decision = WafDecision::Limit;
+                        ctx.block_reason = Some(format!(
+                            "fused anomaly score {score} >= limit threshold {limit_t} (PL{})",
+                            waf.paranoia_level
+                        ));
+                    }
+                }
+            }
+        }
+        None => {
+            if ctx.anomaly_score > 0 && ctx.anomaly_score >= waf.anomaly_threshold {
+                ctx.decision = WafDecision::Block;
+                ctx.block_reason = Some(format!(
+                    "anomaly score {} >= threshold {}",
+                    ctx.anomaly_score, waf.anomaly_threshold
+                ));
+            }
+        }
+    }
+}
+
+/// Run the rule engine for `phase`, disabling its internal flat-threshold
+/// early-exit when fusion is on (rules then only accumulate score and honor
+/// explicit `deny` rules — the proxy makes the final weighted verdict), and
+/// attribute the score delta to the `rules` engine bucket.
+fn eval_rules(ctx: &mut RequestContext, engine: &RuleEngine, phase: Phase, waf: &WafConfig) {
+    let threshold = if fusion_enabled(waf) {
+        0
+    } else {
+        waf.anomaly_threshold
+    };
+    let before = ctx.anomaly_score;
+    engine.evaluate(ctx, phase, threshold);
+    let delta = ctx.anomaly_score.saturating_sub(before);
+    if delta > 0 {
+        *ctx.engine_scores.entry("rules".to_string()).or_insert(0) += delta;
+    }
+}
+
 fn enforce_mode(ctx: &mut RequestContext, mode: &WafMode) {
     if *mode == WafMode::Learning
-        && (ctx.decision == WafDecision::Block || ctx.decision == WafDecision::Challenge)
+        && matches!(
+            ctx.decision,
+            WafDecision::Block | WafDecision::Challenge | WafDecision::Limit
+        )
     {
         ctx.decision = WafDecision::Log;
         // Record the would-have-blocked signal for the learning report. We keep
@@ -3347,6 +3445,20 @@ fn warn_unsupported_challenge(mode: ChallengeMode) {
             mode
         );
     }
+}
+
+/// Response for a LIMIT verdict (weighted fusion soft-deny). Uses the site's
+/// configured `limit_status` (default 429 Too Many Requests).
+fn limit_response(ctx: &RequestContext, site: Option<&SiteConfig>) -> Response<BoxBody> {
+    let status = site
+        .and_then(|s| s.waf.fusion.as_ref())
+        .and_then(|f| StatusCode::from_u16(f.limit_status).ok())
+        .unwrap_or(StatusCode::TOO_MANY_REQUESTS);
+    let reason = ctx
+        .block_reason
+        .as_deref()
+        .unwrap_or("Request rate-limited by Sentinel WAF");
+    error_response(status, reason)
 }
 
 fn block_response(ctx: &RequestContext) -> Response<BoxBody> {
@@ -4534,5 +4646,127 @@ mod threat_intel_contract_tests {
             ),
             ThreatVerdict::None
         );
+    }
+}
+
+#[cfg(test)]
+mod fusion_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn waf(pl: u8, threshold: u32, fusion: Option<FusionConfig>) -> WafConfig {
+        WafConfig {
+            paranoia_level: pl,
+            anomaly_threshold: threshold,
+            fusion,
+            ..WafConfig::default()
+        }
+    }
+    fn ctx() -> RequestContext {
+        RequestContext::new("203.0.113.7".parse().unwrap(), 1234)
+    }
+    fn fusion(
+        enable: bool,
+        weights: &[(&str, f32)],
+        block: Vec<u32>,
+        limit: Vec<u32>,
+    ) -> FusionConfig {
+        FusionConfig {
+            enable,
+            weights: weights
+                .iter()
+                .map(|(k, v)| (k.to_string(), *v))
+                .collect::<HashMap<_, _>>(),
+            block_thresholds: block,
+            limit_thresholds: limit,
+            limit_status: 429,
+        }
+    }
+
+    #[test]
+    fn threshold_for_pl_indexes_and_repeats_last() {
+        let l = [10u32, 8, 6, 4];
+        assert_eq!(threshold_for_pl(&l, 1), Some(10));
+        assert_eq!(threshold_for_pl(&l, 2), Some(8));
+        assert_eq!(threshold_for_pl(&l, 4), Some(4));
+        assert_eq!(threshold_for_pl(&l, 9), Some(4)); // repeats last
+        assert_eq!(threshold_for_pl(&l, 0), Some(10)); // clamps to PL1
+        assert_eq!(threshold_for_pl(&[], 2), None);
+    }
+
+    #[test]
+    fn fused_score_applies_weights_and_counts_remainder() {
+        let f = fusion(true, &[("bot", 3.0)], vec![100], vec![50]);
+        let mut c = ctx();
+        c.add_engine_score("bot", 3); // weighted 3*3 = 9
+        c.add_engine_score("rules", 2); // weight 1 = 2
+        c.anomaly_score = c.anomaly_score.saturating_add(5); // unbucketed remainder @ weight 1
+        assert_eq!(fused_score(&c, &f), 16); // 9 + 2 + 5
+    }
+
+    #[test]
+    fn legacy_flat_threshold_when_fusion_absent() {
+        let w = waf(2, 5, None);
+        let mut c = ctx();
+        c.add_engine_score("rules", 5);
+        apply_verdict(&mut c, &w);
+        assert_eq!(c.decision, WafDecision::Block);
+    }
+
+    #[test]
+    fn fusion_block_limit_allow_bands() {
+        let f = fusion(true, &[], vec![10, 8, 6, 4], vec![5, 4, 3, 2]); // PL2 → block 8, limit 4
+        let w = waf(2, 100, Some(f));
+        let mut c = ctx();
+        c.add_engine_score("rules", 9);
+        apply_verdict(&mut c, &w);
+        assert_eq!(c.decision, WafDecision::Block);
+
+        let mut c = ctx();
+        c.add_engine_score("rules", 5);
+        apply_verdict(&mut c, &w);
+        assert_eq!(c.decision, WafDecision::Limit);
+
+        let mut c = ctx();
+        c.add_engine_score("rules", 3);
+        apply_verdict(&mut c, &w);
+        assert_eq!(c.decision, WafDecision::Allow);
+    }
+
+    #[test]
+    fn weights_change_the_verdict() {
+        let mut c = ctx();
+        c.add_engine_score("bot", 4);
+        apply_verdict(
+            &mut c,
+            &waf(
+                1,
+                100,
+                Some(fusion(true, &[("bot", 1.0)], vec![10], vec![])),
+            ),
+        );
+        assert_eq!(c.decision, WafDecision::Allow); // 4 < 10
+
+        let mut c2 = ctx();
+        c2.add_engine_score("bot", 4);
+        apply_verdict(
+            &mut c2,
+            &waf(
+                1,
+                100,
+                Some(fusion(true, &[("bot", 3.0)], vec![10], vec![])),
+            ),
+        );
+        assert_eq!(c2.decision, WafDecision::Block); // 12 >= 10
+    }
+
+    #[test]
+    fn existing_block_is_preserved() {
+        let w = waf(2, 100, Some(fusion(true, &[], vec![10], vec![5])));
+        let mut c = ctx();
+        c.decision = WafDecision::Block;
+        c.add_engine_score("rules", 1);
+        apply_verdict(&mut c, &w);
+        assert_eq!(c.decision, WafDecision::Block);
     }
 }

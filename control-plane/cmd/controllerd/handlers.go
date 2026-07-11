@@ -1072,6 +1072,7 @@ func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
 		Jwt              json.RawMessage `json:"jwt"`
 		Grpc             json.RawMessage `json:"grpc"`
 		Dlp              json.RawMessage `json:"dlp"`
+		Fusion           json.RawMessage `json:"fusion"`
 		AntiDdos         json.RawMessage `json:"anti_ddos"`
 		GeoIP            json.RawMessage `json:"geoip"`
 		ML               json.RawMessage `json:"ml"`
@@ -1150,6 +1151,7 @@ func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
 	attachRawObject(waf, "jwt", p.Jwt)
 	attachRawObject(waf, "grpc", p.Grpc)
 	attachRawObject(waf, "dlp", p.Dlp)
+	attachRawObject(waf, "fusion", p.Fusion)
 	attachRawObject(waf, "ml", p.ML)
 	attachRawObject(waf, "ip_reputation", p.IPReputation)
 
