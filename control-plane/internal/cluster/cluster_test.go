@@ -334,3 +334,100 @@ func TestRPCAuth(t *testing.T) {
 
 // (compile-time: ensure fmt is imported for any sprintf usage we might add)
 var _ = fmt.Sprintf
+
+// TestLeaderFailover is the manager's scenario: with a 3-node cluster, stop the
+// current leader and assert a *different* surviving node is elected leader
+// quickly (well within a couple of election timeouts).
+func TestLeaderFailover(t *testing.T) {
+	addrs := []string{freeAddr(t), freeAddr(t), freeAddr(t)}
+	peers := func(self NodeID) map[NodeID]string {
+		m := map[NodeID]string{}
+		for i, a := range addrs {
+			id := NodeID(i + 1)
+			if id != self {
+				m[id] = a
+			}
+		}
+		return m
+	}
+	nodes := make([]*Cluster, 3)
+	for i := 0; i < 3; i++ {
+		n, err := Start(Config{
+			NodeID:     NodeID(i + 1),
+			ListenAddr: addrs[i],
+			Peers:      peers(NodeID(i + 1)),
+			DataDir:    t.TempDir(),
+			Apply:      func(Command) error { return nil },
+		})
+		if err != nil {
+			t.Fatalf("Start node %d: %v", i+1, err)
+		}
+		nodes[i] = n
+	}
+	defer func() {
+		for _, n := range nodes {
+			if n != nil {
+				n.Stop()
+			}
+		}
+	}()
+
+	currentLeader := func() *Cluster {
+		for _, n := range nodes {
+			if n != nil && n.IsLeader() {
+				return n
+			}
+		}
+		return nil
+	}
+	waitLeader := func(exclude NodeID, d time.Duration) *Cluster {
+		deadline := time.Now().Add(d)
+		for time.Now().Before(deadline) {
+			cnt, ldr := 0, (*Cluster)(nil)
+			for _, n := range nodes {
+				if n != nil && n.IsLeader() {
+					cnt++
+					ldr = n
+				}
+			}
+			if cnt == 1 && ldr.Status().NodeID != exclude {
+				return ldr
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		return nil
+	}
+
+	// 1) Initial leader.
+	leader := waitLeader(0, 5*time.Second)
+	if leader == nil {
+		t.Fatal("no initial leader elected")
+	}
+	oldID := leader.Status().NodeID
+	t.Logf("initial leader = node %d (term %d)", oldID, leader.Status().Term)
+
+	// 2) Turn off the leader.
+	start := time.Now()
+	leader.Stop()
+	for i := range nodes {
+		if nodes[i].Status().NodeID == oldID {
+			nodes[i] = nil
+		}
+	}
+
+	// 3) A different surviving node must take over quickly.
+	newLeader := waitLeader(oldID, 5*time.Second)
+	if newLeader == nil {
+		t.Fatal("no new leader elected after leader failure")
+	}
+	elapsed := time.Since(start)
+	newID := newLeader.Status().NodeID
+	t.Logf("FAILOVER: node %d took over in %v (term %d)", newID, elapsed, newLeader.Status().Term)
+	if newID == oldID {
+		t.Fatalf("new leader %d is the stopped node", newID)
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("failover too slow: %v", elapsed)
+	}
+	_ = currentLeader
+}

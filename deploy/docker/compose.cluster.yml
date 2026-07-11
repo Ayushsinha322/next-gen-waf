@@ -1,0 +1,68 @@
+# Raft cluster demo overlay.
+#
+# Turns the single control plane into a 3-node Raft cluster (node ids 1/2/3)
+# sharing the existing Postgres + sites, so the running data plane keeps
+# protecting Juice Shop throughout a leader failover. No image rebuild — the
+# cluster is gated purely on SENTINEL_RAFT_* env, already in the image.
+#
+# Usage (from /opt/sentinel-src):
+#   docker compose -f deploy/docker/compose.prod.yml -f deploy/docker/compose.cluster.yml up -d controlplane cp2 cp3
+#
+# Then drive the failover with demo/cluster-failover-demo.sh.
+
+services:
+  # Node 1 = the existing control plane, now a Raft member.
+  controlplane:
+    environment:
+      SENTINEL_NODE_ID: "1"
+      SENTINEL_RAFT_ADDR: controlplane:9600
+      SENTINEL_RAFT_PEERS: "2=cp2:9600,3=cp3:9600"
+      SENTINEL_RAFT_SECRET: ${SENTINEL_RAFT_SECRET:-demo-raft-cluster-secret}
+
+  cp2:
+    image: sentinel/controlplane:latest
+    restart: unless-stopped
+    user: "0:0"
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    environment:
+      SENTINEL_DB_URL: ${SENTINEL_DB_URL}
+      SENTINEL_REDIS_URL: redis://redis:6379
+      SENTINEL_JWT_SECRET: ${SENTINEL_JWT_SECRET}
+      SENTINEL_REST_ADDR: 0.0.0.0:9501
+      SENTINEL_GRPC_ADDR: 0.0.0.0:9500
+      SENTINEL_AUTOSTART_DATAPLANE: "0"
+      SENTINEL_LOG_DIR: /var/log/sentinel
+      SENTINEL_INTERNAL_SECRET: ${SENTINEL_INTERNAL_SECRET}
+      SENTINEL_NODE_ID: "2"
+      SENTINEL_RAFT_ADDR: cp2:9600
+      SENTINEL_RAFT_PEERS: "1=controlplane:9600,3=cp3:9600"
+      SENTINEL_RAFT_SECRET: ${SENTINEL_RAFT_SECRET:-demo-raft-cluster-secret}
+    volumes:
+      - sentinel-logs:/var/log/sentinel
+    networks: [sentinel]
+
+  cp3:
+    image: sentinel/controlplane:latest
+    restart: unless-stopped
+    user: "0:0"
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    environment:
+      SENTINEL_DB_URL: ${SENTINEL_DB_URL}
+      SENTINEL_REDIS_URL: redis://redis:6379
+      SENTINEL_JWT_SECRET: ${SENTINEL_JWT_SECRET}
+      SENTINEL_REST_ADDR: 0.0.0.0:9501
+      SENTINEL_GRPC_ADDR: 0.0.0.0:9500
+      SENTINEL_AUTOSTART_DATAPLANE: "0"
+      SENTINEL_LOG_DIR: /var/log/sentinel
+      SENTINEL_INTERNAL_SECRET: ${SENTINEL_INTERNAL_SECRET}
+      SENTINEL_NODE_ID: "3"
+      SENTINEL_RAFT_ADDR: cp3:9600
+      SENTINEL_RAFT_PEERS: "1=controlplane:9600,2=cp2:9600"
+      SENTINEL_RAFT_SECRET: ${SENTINEL_RAFT_SECRET:-demo-raft-cluster-secret}
+    volumes:
+      - sentinel-logs:/var/log/sentinel
+    networks: [sentinel]
