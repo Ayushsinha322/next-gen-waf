@@ -156,6 +156,16 @@ services:
     image: sentinel/dataplane:latest
     restart: unless-stopped
     user: "0:0"
+    # Kernel XDP needs these to load/attach the BPF program and its maps.
+    # Without them the data plane simply falls back to the userspace software
+    # fast-fail, so the stack still boots on hosts that don't allow XDP.
+    cap_add:
+      - NET_ADMIN
+      - BPF
+      - SYS_RESOURCE
+      - PERFMON
+    ulimits:
+      memlock: -1
     depends_on:
       controlplane: { condition: service_started }
       # service_started, not _healthy: the WAF must boot regardless of ClickHouse.
@@ -186,8 +196,14 @@ services:
       # published on host :443, so advertise h3 on :443 in the Alt-Svc header
       # (else browsers try to reach h3 on :8443 and fail to upgrade).
       SENTINEL_HTTP3_ADVERTISE_PORT: "443"
+      # Kernel XDP fast-path: drop blocked source IPs in the NIC/driver path
+      # before they reach the proxy. Degrades to software mode if attach fails.
+      SENTINEL_XDP_ENABLE: "1"
+      SENTINEL_XDP_IFACE: eth0
     volumes:
       - ./sentinel.proxy.yaml:/etc/sentinel/sentinel.yaml:ro
+      # Kernel BTF so aya can load the BTF-typed BPF maps.
+      - /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro
       - sentinel-logs:/var/log/sentinel
       - sentinel-certs:/var/lib/sentinel/certs   # cert repository (persists ACME/uploaded certs)
     ports:
