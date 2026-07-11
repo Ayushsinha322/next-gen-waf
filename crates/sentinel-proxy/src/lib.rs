@@ -55,7 +55,7 @@ use sentinel_core::{
     },
     context::{Phase, RequestContext, WafDecision},
 };
-use sentinel_ebpf::{EbpfConfig, EbpfManager};
+use sentinel_ebpf::{EbpfConfig, EbpfManager, IpNet};
 use sentinel_ml::MlEngine;
 use sentinel_modules::{
     check_grpc_body, check_grpc_request, detect_smuggling, inspect_graphql, is_grpc, token_header,
@@ -605,7 +605,7 @@ impl ProxyServer {
         };
 
         let ebpf = Arc::new(
-            EbpfManager::new(EbpfConfig::default())
+            EbpfManager::new(build_ebpf_config())
                 .await
                 .context("EbpfManager init")?,
         );
@@ -2578,6 +2578,53 @@ fn build_dlp_map(cfg: &SentinelConfig) -> DlpMap {
         }
     }
     map
+}
+
+/// Parse a `SENTINEL_XDP_BLOCK` entry — either a bare IP (`1.2.3.4`, treated as
+/// a /32 or /128) or a CIDR (`10.0.0.0/8`) — into an [`IpNet`].
+fn parse_block_cidr(s: &str) -> Option<IpNet> {
+    let (addr_str, pfx) = match s.split_once('/') {
+        Some((a, p)) => (a, Some(p.trim().parse::<u8>().ok()?)),
+        None => (s, None),
+    };
+    let addr: std::net::IpAddr = addr_str.trim().parse().ok()?;
+    let prefix = pfx.unwrap_or(if addr.is_ipv4() { 32 } else { 128 });
+    Some(IpNet::new(addr, prefix))
+}
+
+/// Build the eBPF/XDP configuration from the environment. Kernel XDP is
+/// opt-in and needs CAP_BPF/CAP_NET_ADMIN plus the `kernel` build feature;
+/// otherwise the manager runs the userspace software fast-fail:
+///   `SENTINEL_XDP_ENABLE=1`                    — attempt kernel XDP attach
+///   `SENTINEL_XDP_IFACE=eth0`                  — interface to attach to
+///   `SENTINEL_XDP_BLOCK=1.2.3.4,10.0.0.0/8`    — seed CIDRs to drop at XDP
+fn build_ebpf_config() -> EbpfConfig {
+    let enable_kernel = std::env::var("SENTINEL_XDP_ENABLE")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    let interface = std::env::var("SENTINEL_XDP_IFACE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "eth0".to_string());
+    let blocklist: Vec<IpNet> = std::env::var("SENTINEL_XDP_BLOCK")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(parse_block_cidr)
+        .collect();
+    if enable_kernel || !blocklist.is_empty() {
+        info!(
+            interface = %interface,
+            enable_kernel,
+            seed_entries = blocklist.len(),
+            "eBPF/XDP config from environment"
+        );
+    }
+    EbpfConfig {
+        interface,
+        blocklist,
+        enable_kernel,
+        stats_interval_secs: 5,
+    }
 }
 
 fn build_ip_reputation(cfg: &SentinelConfig, feed_cidrs: &[(String, Vec<String>)]) -> IpReputation {

@@ -315,49 +315,257 @@ impl Blocklist {
 }
 
 // ---------------------------------------------------------------------------
+// LPM-trie key encoding (byte order) — shared, panic-free, endianness-safe
+// ---------------------------------------------------------------------------
+
+/// Encode an IPv4 address into the `u32` that an LPM-trie key's `data` field
+/// must hold.
+///
+/// BYTE-ORDER CONTRACT (locked, do not "simplify"):
+/// The kernel LPM trie matches the key `data` **MSB-first over its raw
+/// in-memory bytes**, and the C program stores `ip->saddr` verbatim — i.e. the
+/// IPv4 octets `a.b.c.d` in network (big-endian) byte order. So the userspace
+/// key `data` must be the `u32` whose **native in-memory bytes are exactly the
+/// octets `[a, b, c, d]`**. `u32::from_ne_bytes(octets)` produces precisely
+/// that value on any host endianness (unlike `from_be_bytes`, which yields a
+/// host-numeric value whose memory layout differs on little-endian). This is
+/// verified by `lpm_v4_key_data_is_network_order_octets`.
+#[cfg(any(test, feature = "kernel"))]
+fn lpm_v4_key_data(ip: std::net::Ipv4Addr) -> u32 {
+    u32::from_ne_bytes(ip.octets())
+}
+
+// ---------------------------------------------------------------------------
 // XDP kernel backend (feature-gated)
 // ---------------------------------------------------------------------------
 
-// When the "kernel" feature is present we expose a thin aya wrapper.
-// The XDP ELF binary should be embedded here (e.g. via include_bytes!) or
-// loaded from a path supplied in config.  For now the slot is reserved and
-// the software fallback is used even with the feature enabled unless a real
-// ELF is provided.
-//
-// To plug in a real program:
-//   1. Compile `xdp_blocklist.bpf.c` with clang -target bpf -O2
-//   2. Replace the None below with Some(include_bytes!("../bpf/xdp_blocklist.bpf.o"))
-//   3. Implement XdpKernel::attach() with aya calls
+// When the "kernel" feature is enabled we expose a thin aya 0.13 wrapper around
+// the committed XDP ELF (`bpf/sentinel_xdp.o`). It loads + attaches the program
+// and mirrors the blocklist into the kernel LPM-trie maps. Every operation is
+// panic-free: any error degrades to the userspace software path.
 
 #[cfg(feature = "kernel")]
 mod kernel_xdp {
-    use super::*;
+    use super::{lpm_v4_key_data, EbpfError, IpNet, Result};
+    use std::net::IpAddr;
+    use std::sync::Mutex;
 
-    /// Placeholder ELF bytes.  Replace with `include_bytes!("path/to/prog.o")`.
-    const XDP_PROGRAM_BYTES: Option<&[u8]> = None;
+    use aya::maps::lpm_trie::{Key, LpmTrie};
+    use aya::maps::PerCpuArray;
+    use aya::programs::{Xdp, XdpFlags};
+    use aya::Ebpf;
+    use tracing::{info, warn};
 
+    /// The compiled XDP object file, committed to the repo and embedded at
+    /// build time so no BPF toolchain is required at runtime.
+    const XDP_PROGRAM_BYTES: &[u8] = include_bytes!("bpf/sentinel_xdp.o");
+
+    /// The program/function name (matches `SEC("xdp") int sentinel_xdp(...)`).
+    const PROGRAM_NAME: &str = "sentinel_xdp";
+    const MAP_V4: &str = "blocked_v4";
+    const MAP_V6: &str = "blocked_v6";
+    const MAP_COUNTERS: &str = "counters";
+    const COUNTER_PASS: u32 = 0;
+    const COUNTER_DROP: u32 = 1;
+
+    /// Owns the loaded aya `Ebpf` for the lifetime of the attachment. Dropping
+    /// this detaches the XDP program from the interface.
     pub struct XdpKernel {
-        _iface: String,
+        // `Mutex` so that `&self` methods can mutate the maps (aya map handles
+        // require `&mut MapData`).
+        ebpf: Mutex<Ebpf>,
+        iface: String,
     }
 
     impl XdpKernel {
-        /// Try to load and attach the XDP program.  Returns `None` if no ELF
-        /// is embedded or if loading fails (caller falls back to software).
+        /// Load and attach the XDP program on `iface`.
+        ///
+        /// Returns `None` (never panics / propagates) on ANY error so the
+        /// caller falls back to software mode. Tries native (driver) XDP first,
+        /// then retries in generic/SKB mode which is required on veth / Docker.
         pub fn try_attach(iface: &str) -> Option<Self> {
-            let _bytes = XDP_PROGRAM_BYTES?;
+            let mut ebpf = match Ebpf::load(XDP_PROGRAM_BYTES) {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!(iface, error = %e, "kernel XDP: failed to load ELF");
+                    return None;
+                }
+            };
 
-            // Real implementation would be:
-            //   let mut ebpf = aya::Ebpf::load(bytes).ok()?;
-            //   aya_log::EbpfLogger::init(&mut ebpf).ok();
-            //   let prog: &mut aya::programs::Xdp =
-            //       ebpf.program_mut("xdp_blocklist")?.try_into().ok()?;
-            //   prog.load().ok()?;
-            //   prog.attach(iface, aya::programs::XdpFlags::default()).ok()?;
-            //   Some(Self { _iface: iface.to_string() })
+            // Best-effort log relay; the program emits no logs, so ignore errors.
+            let _ = aya_log::EbpfLogger::init(&mut ebpf);
 
-            warn!("kernel XDP: no ELF embedded — falling back to software mode");
-            None
+            let program: &mut Xdp = match ebpf.program_mut(PROGRAM_NAME) {
+                Some(p) => match p.try_into() {
+                    Ok(x) => x,
+                    Err(e) => {
+                        warn!(iface, error = %e, "kernel XDP: program is not an Xdp program");
+                        return None;
+                    }
+                },
+                None => {
+                    warn!(
+                        iface,
+                        program = PROGRAM_NAME,
+                        "kernel XDP: program not found in ELF"
+                    );
+                    return None;
+                }
+            };
+
+            if let Err(e) = program.load() {
+                warn!(iface, error = %e, "kernel XDP: program load() failed");
+                return None;
+            }
+
+            // Native XDP first, then generic (SKB) mode for veth/Docker.
+            match program.attach(iface, XdpFlags::default()) {
+                Ok(_) => {
+                    info!(iface, mode = "native", "kernel XDP attached");
+                }
+                Err(native_err) => {
+                    debug_attach_fallback(iface, &native_err);
+                    match program.attach(iface, XdpFlags::SKB_MODE) {
+                        Ok(_) => {
+                            info!(iface, mode = "skb", "kernel XDP attached (generic)");
+                        }
+                        Err(skb_err) => {
+                            warn!(
+                                iface,
+                                native_error = %native_err,
+                                skb_error = %skb_err,
+                                "kernel XDP: attach failed in both native and SKB mode"
+                            );
+                            return None;
+                        }
+                    }
+                }
+            }
+
+            Some(Self {
+                ebpf: Mutex::new(ebpf),
+                iface: iface.to_string(),
+            })
         }
+
+        /// Interface the program is attached to.
+        #[allow(dead_code)]
+        pub fn iface(&self) -> &str {
+            &self.iface
+        }
+
+        /// Block a single address (host-length prefix: /32 v4, /128 v6).
+        pub fn block_ip(&self, ip: IpAddr) -> Result<()> {
+            match ip {
+                IpAddr::V4(v4) => self.insert_v4(lpm_v4_key_data(v4), 32),
+                IpAddr::V6(v6) => self.insert_v6(v6.octets(), 128),
+            }
+        }
+
+        /// Block a CIDR network, inserting with its prefix length.
+        pub fn block_net(&self, net: &IpNet) -> Result<()> {
+            match net.addr {
+                IpAddr::V4(v4) => self.insert_v4(lpm_v4_key_data(v4), net.prefix_len as u32),
+                IpAddr::V6(v6) => self.insert_v6(v6.octets(), net.prefix_len as u32),
+            }
+        }
+
+        /// Remove a single address (host-length prefix) from the trie.
+        pub fn unblock_ip(&self, ip: IpAddr) -> Result<()> {
+            let mut ebpf = self.lock()?;
+            match ip {
+                IpAddr::V4(v4) => {
+                    let map = ebpf
+                        .map_mut(MAP_V4)
+                        .ok_or_else(|| EbpfError::MapError(format!("map {MAP_V4} not found")))?;
+                    let mut trie: LpmTrie<_, u32, u32> =
+                        LpmTrie::try_from(map).map_err(|e| EbpfError::MapError(e.to_string()))?;
+                    let key = Key::new(32, lpm_v4_key_data(v4));
+                    trie.remove(&key)
+                        .map_err(|e| EbpfError::MapError(e.to_string()))
+                }
+                IpAddr::V6(v6) => {
+                    let map = ebpf
+                        .map_mut(MAP_V6)
+                        .ok_or_else(|| EbpfError::MapError(format!("map {MAP_V6} not found")))?;
+                    let mut trie: LpmTrie<_, [u8; 16], u32> =
+                        LpmTrie::try_from(map).map_err(|e| EbpfError::MapError(e.to_string()))?;
+                    let key = Key::new(128, v6.octets());
+                    trie.remove(&key)
+                        .map_err(|e| EbpfError::MapError(e.to_string()))
+                }
+            }
+        }
+
+        /// Read the per-CPU [pass, drop] counters, summed across all CPUs.
+        /// Panic-free: returns `(0, 0)` if the map cannot be read.
+        pub fn read_counters(&self) -> (u64, u64) {
+            let ebpf = match self.lock() {
+                Ok(g) => g,
+                Err(e) => {
+                    warn!(error = %e, "kernel XDP: cannot lock ebpf to read counters");
+                    return (0, 0);
+                }
+            };
+            let map = match ebpf.map(MAP_COUNTERS) {
+                Some(m) => m,
+                None => return (0, 0),
+            };
+            let array: PerCpuArray<_, u64> = match PerCpuArray::try_from(map) {
+                Ok(a) => a,
+                Err(e) => {
+                    warn!(error = %e, "kernel XDP: counters map has unexpected type");
+                    return (0, 0);
+                }
+            };
+            let sum = |idx: u32| -> u64 {
+                match array.get(&idx, 0) {
+                    Ok(vals) => vals.iter().copied().sum(),
+                    Err(_) => 0,
+                }
+            };
+            (sum(COUNTER_PASS), sum(COUNTER_DROP))
+        }
+
+        // -- internals ------------------------------------------------------
+
+        fn lock(&self) -> Result<std::sync::MutexGuard<'_, Ebpf>> {
+            self.ebpf
+                .lock()
+                .map_err(|_| EbpfError::MapError("ebpf mutex poisoned".to_string()))
+        }
+
+        fn insert_v4(&self, data: u32, prefix_len: u32) -> Result<()> {
+            let mut ebpf = self.lock()?;
+            let map = ebpf
+                .map_mut(MAP_V4)
+                .ok_or_else(|| EbpfError::MapError(format!("map {MAP_V4} not found")))?;
+            let mut trie: LpmTrie<_, u32, u32> =
+                LpmTrie::try_from(map).map_err(|e| EbpfError::MapError(e.to_string()))?;
+            let key = Key::new(prefix_len, data);
+            trie.insert(&key, 1u32, 0)
+                .map_err(|e| EbpfError::MapError(e.to_string()))
+        }
+
+        fn insert_v6(&self, octets: [u8; 16], prefix_len: u32) -> Result<()> {
+            let mut ebpf = self.lock()?;
+            let map = ebpf
+                .map_mut(MAP_V6)
+                .ok_or_else(|| EbpfError::MapError(format!("map {MAP_V6} not found")))?;
+            let mut trie: LpmTrie<_, [u8; 16], u32> =
+                LpmTrie::try_from(map).map_err(|e| EbpfError::MapError(e.to_string()))?;
+            let key = Key::new(prefix_len, octets);
+            trie.insert(&key, 1u32, 0)
+                .map_err(|e| EbpfError::MapError(e.to_string()))
+        }
+    }
+
+    fn debug_attach_fallback(iface: &str, err: &aya::programs::ProgramError) {
+        tracing::debug!(
+            iface,
+            error = %err,
+            "kernel XDP: native attach failed, retrying in SKB (generic) mode"
+        );
     }
 }
 
@@ -376,33 +584,52 @@ pub struct EbpfManager {
     stats: Arc<AtomicStats>,
     running: Arc<AtomicBool>,
     mode: EbpfMode,
+    /// Live XDP attachment when running in kernel mode. Kept alive for the
+    /// lifetime of the manager (dropping it detaches the program). Wrapped in
+    /// `Arc` so the background stats task can poll kernel counters.
+    #[cfg(feature = "kernel")]
+    kernel: Option<Arc<kernel_xdp::XdpKernel>>,
 }
 
 impl EbpfManager {
     /// Create a new manager.  Does NOT start the background task; call
     /// [`start`][Self::start] afterwards.
     pub async fn new(cfg: EbpfConfig) -> Result<Self> {
-        let mode = if cfg.enable_kernel {
-            #[cfg(feature = "kernel")]
-            {
-                if kernel_xdp::XdpKernel::try_attach(&cfg.interface).is_some() {
-                    EbpfMode::Kernel
-                } else {
+        // Try to bring up the kernel XDP path; on any failure fall back to
+        // software mode. The attached handle (if any) must be stored so the
+        // program stays attached and its maps stay live.
+        #[cfg(feature = "kernel")]
+        let (mode, kernel) = if cfg.enable_kernel {
+            match kernel_xdp::XdpKernel::try_attach(&cfg.interface) {
+                Some(k) => {
+                    // Seed the kernel maps from the configured blocklist so the
+                    // XDP program drops these immediately.
+                    for net in &cfg.blocklist {
+                        if let Err(e) = k.block_net(net) {
+                            debug!(%net, error = %e, "kernel XDP: failed to seed blocklist entry");
+                        }
+                    }
+                    (EbpfMode::Kernel, Some(Arc::new(k)))
+                }
+                None => {
                     info!(
                         interface = %cfg.interface,
                         "XDP kernel attach unavailable — using software mode"
                     );
-                    EbpfMode::Software
+                    (EbpfMode::Software, None)
                 }
             }
-            #[cfg(not(feature = "kernel"))]
-            {
-                info!(
-                    "sentinel-ebpf: 'kernel' feature not enabled — using software mode \
-                     (rebuild with --features kernel for XDP)"
-                );
-                EbpfMode::Software
-            }
+        } else {
+            (EbpfMode::Software, None)
+        };
+
+        #[cfg(not(feature = "kernel"))]
+        let mode = if cfg.enable_kernel {
+            info!(
+                "sentinel-ebpf: 'kernel' feature not enabled — using software mode \
+                 (rebuild with --features kernel for XDP)"
+            );
+            EbpfMode::Software
         } else {
             EbpfMode::Software
         };
@@ -421,6 +648,8 @@ impl EbpfManager {
             running: Arc::new(AtomicBool::new(false)),
             mode,
             config: Arc::new(cfg),
+            #[cfg(feature = "kernel")]
+            kernel,
         })
     }
 
@@ -444,6 +673,8 @@ impl EbpfManager {
         let interval_secs = self.config.stats_interval_secs.max(1);
         let mode = self.mode;
         let iface = self.config.interface.clone();
+        #[cfg(feature = "kernel")]
+        let kernel = self.kernel.clone();
 
         tokio::spawn(async move {
             info!(mode = %mode, interface = %iface, "eBPF background task started");
@@ -452,6 +683,17 @@ impl EbpfManager {
 
             while running.load(Ordering::Relaxed) {
                 ticker.tick().await;
+
+                // In kernel mode, refresh our counters from the live BPF
+                // per-CPU array so stats()/ebpf_drops() reflect real kernel
+                // drops (packets dropped in the NIC driver never touch
+                // userspace, so is_blocked() cannot account for them).
+                #[cfg(feature = "kernel")]
+                if let Some(k) = kernel.as_ref() {
+                    let (pass, drop) = k.read_counters();
+                    stats.xdp_pass.store(pass, Ordering::Relaxed);
+                    stats.xdp_drop.store(drop, Ordering::Relaxed);
+                }
 
                 let snap = stats.snapshot();
                 let bl_len = blocklist.read().expect("blocklist RwLock poisoned").len();
@@ -464,9 +706,6 @@ impl EbpfManager {
                     blocklist_entries = bl_len,
                     "eBPF stats"
                 );
-
-                // In kernel mode: here we would re-read BPF map counters via
-                // aya and merge them into `stats`.
             }
 
             info!("eBPF background task stopped");
@@ -497,6 +736,14 @@ impl EbpfManager {
         bl.add_ip(ip);
         self.stats.xdp_drop.fetch_add(0, Ordering::Relaxed); // no-op; update on match
         debug!(%ip, "blocked IP added");
+        drop(bl);
+        // Mirror into the kernel LPM trie so XDP drops it immediately.
+        #[cfg(feature = "kernel")]
+        if let Some(k) = &self.kernel {
+            if let Err(e) = k.block_ip(ip) {
+                debug!(%ip, error = %e, "kernel XDP: block_ip mirror failed");
+            }
+        }
     }
 
     /// Add a CIDR range to the blocklist.
@@ -504,6 +751,13 @@ impl EbpfManager {
         let mut bl = self.blocklist.write().expect("blocklist RwLock poisoned");
         bl.ranges.push(net.clone());
         debug!(%net, "blocked CIDR range added");
+        drop(bl);
+        #[cfg(feature = "kernel")]
+        if let Some(k) = &self.kernel {
+            if let Err(e) = k.block_net(&net) {
+                debug!(%net, error = %e, "kernel XDP: block_net mirror failed");
+            }
+        }
     }
 
     /// Remove a single IP from the blocklist.
@@ -511,6 +765,13 @@ impl EbpfManager {
         let mut bl = self.blocklist.write().expect("blocklist RwLock poisoned");
         bl.remove_ip(&ip);
         debug!(%ip, "unblocked IP removed");
+        drop(bl);
+        #[cfg(feature = "kernel")]
+        if let Some(k) = &self.kernel {
+            if let Err(e) = k.unblock_ip(ip) {
+                debug!(%ip, error = %e, "kernel XDP: unblock_ip mirror failed");
+            }
+        }
     }
 
     /// Check whether `ip` is covered by the current blocklist.
@@ -586,7 +847,31 @@ impl fmt::Debug for EbpfManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv6Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    // ------------------------------------------------------------------
+    // LPM-trie key byte order (must match the C program's network-order key)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn lpm_v4_key_data_is_network_order_octets() {
+        // The C side keys the trie on `ip->saddr` (network byte order), and
+        // the trie matches MSB-first over the key's raw bytes. So the u32 we
+        // hand aya MUST have in-memory bytes equal to the octets a.b.c.d.
+        let ip: Ipv4Addr = "1.2.3.4".parse().unwrap();
+        assert_eq!(
+            lpm_v4_key_data(ip).to_ne_bytes(),
+            [1u8, 2, 3, 4],
+            "key data bytes must equal the octets in network (MSB-first) order"
+        );
+
+        // Asymmetric high/low octets catch any accidental byte-swap.
+        let ip2: Ipv4Addr = "255.0.0.1".parse().unwrap();
+        assert_eq!(lpm_v4_key_data(ip2).to_ne_bytes(), [255u8, 0, 0, 1]);
+
+        let ip3: Ipv4Addr = "10.20.30.40".parse().unwrap();
+        assert_eq!(lpm_v4_key_data(ip3).to_ne_bytes(), ip3.octets());
+    }
 
     // ------------------------------------------------------------------
     // IpNet::contains

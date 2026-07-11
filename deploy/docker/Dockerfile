@@ -16,7 +16,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev clang cmake protobuf-compiler && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN cargo build --release --bin sentinel-bin
+# --features kernel enables aya-based XDP (the committed BPF ELF is embedded via
+# include_bytes!, so no BPF toolchain is needed here). At runtime it attaches
+# XDP when the container has CAP_BPF/CAP_NET_ADMIN, else falls back to software.
+RUN cargo build --release --bin sentinel-bin --features kernel
 
 FROM golang:1.24-alpine AS go-builder
 ENV CGO_ENABLED=0
