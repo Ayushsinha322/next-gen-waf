@@ -40,7 +40,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{anyhow, Context};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use http::{header, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Body;
@@ -195,6 +195,19 @@ impl CorrelationEngine {
         } else {
             0
         }
+    }
+
+    /// Number of blocks recorded for `ip` within the current rolling window
+    /// (0 if unknown or the window has expired). Used by the XDP auto-ban.
+    fn block_count_for_ip(&self, ip: IpAddr) -> u32 {
+        let Some(rec) = self.state.get(&ip) else {
+            return 0;
+        };
+        let last = rec.last_block_at.load(Ordering::Relaxed) as u64;
+        if unix_now_secs().saturating_sub(last) > self.window_secs {
+            return 0;
+        }
+        rec.blocks.load(Ordering::Relaxed) as u32
     }
 
     /// Record that `ip` was just blocked.
@@ -609,6 +622,9 @@ impl ProxyServer {
                 .await
                 .context("EbpfManager init")?,
         );
+        // Mirror operator-configured static IP-reputation blocks into the eBPF
+        // blocklist so they're dropped at XDP (or the userspace fast-fail).
+        seed_ebpf_from_ip_reputation(&ebpf, &cfg);
 
         // Certificate manager — loads persisted ACME/manual certs from disk,
         // then runs background renewal every hour.
@@ -666,7 +682,7 @@ impl ProxyServer {
             modules: Arc::clone(&modules),
             plugin_runtime: Arc::clone(&plugin_runtime),
             ml_engine: Arc::clone(&ml_engine),
-            ebpf,
+            ebpf: Arc::clone(&ebpf),
             cert_manager,
             http01_tokens,
         });
@@ -811,6 +827,13 @@ impl ProxyServer {
         // live request. Uses the same shared-secret auth as config sync.
         if let Some(sync_url) = cfg.cluster.sync_url.clone() {
             let ti_modules = Arc::clone(&modules);
+            // Optionally offload high-confidence threat-intel IPs to XDP. Off by
+            // default: the block tier is already enforced in userspace, and the
+            // feed can carry 100k+ churny IOCs — enable only to drop them in-kernel.
+            let ti_ebpf = Arc::clone(&ebpf);
+            let seed_ti_xdp = std::env::var("SENTINEL_XDP_SEED_THREATINTEL")
+                .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(false);
             let secs = std::env::var("SENTINEL_TI_SYNC_INTERVAL_SECS")
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
@@ -877,6 +900,30 @@ impl ProxyServer {
                         }
                     };
                     if sync.version != last_version {
+                        // Mirror block-tier IPs/CIDRs into the eBPF/XDP blocklist
+                        // (insert-only, capped) before the tier is consumed below.
+                        if seed_ti_xdp {
+                            const CAP: usize = 60_000;
+                            let mut n = 0usize;
+                            for ip_s in sync.block.ips.iter().take(CAP) {
+                                if let Ok(ip) = ip_s.parse::<std::net::IpAddr>() {
+                                    ti_ebpf.block_ip(ip);
+                                    n += 1;
+                                }
+                            }
+                            for cidr in sync.block.cidrs.iter().take(CAP.saturating_sub(n)) {
+                                if let Some(net) = parse_block_cidr(cidr) {
+                                    ti_ebpf.block_net(net);
+                                    n += 1;
+                                }
+                            }
+                            if n > 0 {
+                                info!(
+                                    entries = n,
+                                    "seeded eBPF/XDP blocklist from threat-intel block tier"
+                                );
+                            }
+                        }
                         let feed = ThreatFeed::from_parts(
                             sync.version,
                             watch_score,
@@ -1501,7 +1548,7 @@ async fn proxy(
         DdosVerdict::Block { reason } => {
             ctx.decision = WafDecision::Block;
             ctx.block_reason = Some(reason);
-            state.modules.correlation.record_block(ctx.client_ip);
+            note_block(&state, ctx.client_ip);
             ctx.advance_phase(Phase::Logging);
             log_request(&ctx);
             return Ok(block_response(&ctx));
@@ -1516,7 +1563,7 @@ async fn proxy(
             IpVerdict::Block { reason } => {
                 ctx.decision = WafDecision::Block;
                 ctx.block_reason = Some(format!("IP reputation: {reason}"));
-                state.modules.correlation.record_block(ctx.client_ip);
+                note_block(&state, ctx.client_ip);
                 ctx.advance_phase(Phase::Logging);
                 log_request(&ctx);
                 return Ok(block_response(&ctx));
@@ -1552,7 +1599,7 @@ async fn proxy(
                     ctx.threat_intel_hit = true;
                     ctx.decision = WafDecision::Block;
                     ctx.block_reason = Some(format!("threat intel: {reason}"));
-                    state.modules.correlation.record_block(ctx.client_ip);
+                    note_block(&state, ctx.client_ip);
                     ctx.advance_phase(Phase::Logging);
                     log_request(&ctx);
                     return Ok(block_response(&ctx));
@@ -1699,7 +1746,7 @@ async fn proxy(
     }
 
     if ctx.decision == WafDecision::Block {
-        state.modules.correlation.record_block(ctx.client_ip);
+        note_block(&state, ctx.client_ip);
         let reason = ctx.block_reason.as_deref().unwrap_or("");
         let resp = if reason.starts_with("HTTP request smuggling") {
             // RFC 7230 §3.3.3: malformed requests MUST be rejected with 400.
@@ -1840,7 +1887,7 @@ async fn proxy(
         }
 
         if ctx.decision == WafDecision::Block {
-            state.modules.correlation.record_block(ctx.client_ip);
+            note_block(&state, ctx.client_ip);
             let resp = block_response(&ctx);
             ctx.response_status = Some(resp.status());
             ctx.advance_phase(Phase::Logging);
@@ -2624,6 +2671,119 @@ fn build_ebpf_config() -> EbpfConfig {
         blocklist,
         enable_kernel,
         stats_interval_secs: 5,
+    }
+}
+
+/// XDP auto-ban policy: when a source IP is blocked by the WAF often enough
+/// within the correlation window, add it to the eBPF blocklist so its packets
+/// are dropped in-kernel (or by the userspace fast-fail in software mode).
+#[derive(Clone, Copy)]
+struct AutoBanConfig {
+    enabled: bool,
+    threshold_blocks: u32,
+    include_private: bool,
+}
+
+/// Read the auto-ban policy from the environment (once):
+///   `SENTINEL_XDP_AUTOBAN=0`                 — disable (default on)
+///   `SENTINEL_XDP_AUTOBAN_BLOCKS=20`         — blocks-in-window before banning
+///   `SENTINEL_XDP_AUTOBAN_INCLUDE_PRIVATE=1` — also ban RFC1918/loopback (test only)
+fn autoban_config() -> AutoBanConfig {
+    static CFG: std::sync::OnceLock<AutoBanConfig> = std::sync::OnceLock::new();
+    *CFG.get_or_init(|| {
+        let threshold = std::env::var("SENTINEL_XDP_AUTOBAN_BLOCKS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        let enabled = std::env::var("SENTINEL_XDP_AUTOBAN")
+            .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(true)
+            && threshold != Some(0);
+        AutoBanConfig {
+            enabled,
+            threshold_blocks: threshold.unwrap_or(20).max(1),
+            include_private: std::env::var("SENTINEL_XDP_AUTOBAN_INCLUDE_PRIVATE")
+                .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(false),
+        }
+    })
+}
+
+/// IPs already pushed to the eBPF blocklist by the auto-ban, so we ban + log
+/// each offender once instead of on every subsequent block.
+fn xdp_autobanned() -> &'static DashSet<std::net::IpAddr> {
+    static SET: std::sync::OnceLock<DashSet<std::net::IpAddr>> = std::sync::OnceLock::new();
+    SET.get_or_init(DashSet::new)
+}
+
+/// Whether an IP is eligible for auto-ban. Private/loopback/link-local/etc. are
+/// excluded by default so the single-node demo (where every client appears as
+/// the docker gateway) never bans itself; a real edge deployment sees public
+/// client IPs and bans normally.
+fn autoban_eligible(ip: std::net::IpAddr, include_private: bool) -> bool {
+    use std::net::IpAddr;
+    if include_private {
+        return !ip.is_unspecified();
+    }
+    match ip {
+        IpAddr::V4(v4) => {
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_unspecified()
+                || v4.is_documentation())
+        }
+        IpAddr::V6(v6) => {
+            let seg0 = v6.segments()[0];
+            let unique_local = (seg0 & 0xfe00) == 0xfc00; // fc00::/7
+            let link_local = (seg0 & 0xffc0) == 0xfe80; // fe80::/10
+            !(v6.is_loopback() || v6.is_unspecified() || unique_local || link_local)
+        }
+    }
+}
+
+/// Record a WAF block against `ip` and, if it has crossed the auto-ban
+/// threshold, push it to the eBPF/XDP blocklist (idempotent; logged once).
+fn note_block(state: &ServerState, ip: std::net::IpAddr) {
+    state.modules.correlation.record_block(ip);
+    let ab = autoban_config();
+    if !ab.enabled || !autoban_eligible(ip, ab.include_private) {
+        return;
+    }
+    if state.modules.correlation.block_count_for_ip(ip) >= ab.threshold_blocks
+        && xdp_autobanned().insert(ip)
+    {
+        state.ebpf.block_ip(ip);
+        warn!(
+            %ip,
+            threshold = ab.threshold_blocks,
+            mode = %state.ebpf.mode(),
+            "auto-banned repeat offender — added to eBPF/XDP blocklist"
+        );
+    }
+}
+
+/// Seed the eBPF blocklist from operator-configured IP-reputation block CIDRs
+/// (`waf.ip_reputation.block`). These are static, curated, low-volume bans, so
+/// mirroring them into XDP drops those sources in-kernel from the first packet.
+fn seed_ebpf_from_ip_reputation(ebpf: &EbpfManager, cfg: &SentinelConfig) {
+    let mut seeded = 0usize;
+    for site in &cfg.sites {
+        let Some(rep) = site.waf.ip_reputation.as_ref() else {
+            continue;
+        };
+        for cidr in &rep.block {
+            if let Some(net) = parse_block_cidr(cidr) {
+                ebpf.block_net(net);
+                seeded += 1;
+            }
+        }
+    }
+    if seeded > 0 {
+        info!(
+            entries = seeded,
+            "seeded eBPF blocklist from ip_reputation.block"
+        );
     }
 }
 
