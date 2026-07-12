@@ -8,12 +8,13 @@
 #  - persistent volume per pod → Raft log/term/vote survive a restart.
 #  - PodDisruptionBudget minAvailable: 2 → drains never break quorum.
 #
-# NOTE (one required image tweak): each pod needs its own SENTINEL_NODE_ID and a
-# peer list that excludes itself. The distroless image can't run a shell to
-# derive these, so add a tiny entrypoint (or app support) that, when
-# SENTINEL_NODE_ID is unset, derives it from the pod ordinal in $HOSTNAME
-# (sentinel-controlplane-0 → id 1) and builds SENTINEL_RAFT_PEERS for the other
-# ordinals. Values it should produce are shown in the comments below.
+# StatefulSet identity: a StatefulSet gives every pod identical env, so NODE_ID
+# and the self-excluding peer list can't be hard-coded. controllerd derives them
+# natively (no entrypoint/shell needed — works in the distroless image): when
+# SENTINEL_NODE_ID is unset it reads SENTINEL_RAFT_POD_NAME (the pod ordinal),
+# SENTINEL_RAFT_REPLICAS, and SENTINEL_RAFT_SERVICE to compute NODE_ID = ordinal+1
+# and SENTINEL_RAFT_PEERS over the headless-Service DNS of the other ordinals.
+# See deriveRaftTopology in control-plane/cmd/controllerd/main.go.
 ---
 apiVersion: v1
 kind: Service
@@ -80,13 +81,18 @@ spec:
               valueFrom: { secretKeyRef: { name: sentinel-secrets, key: internal-secret } }
             - name: SENTINEL_RAFT_SECRET
               valueFrom: { secretKeyRef: { name: sentinel-secrets, key: raft-secret } }
-            # --- Raft, per-pod (produced by the entrypoint from the ordinal) ---
-            # pod sentinel-controlplane-0 → SENTINEL_NODE_ID=1
-            #   SENTINEL_RAFT_PEERS=2=sentinel-controlplane-1.sentinel-controlplane-headless:9600,3=sentinel-controlplane-2.sentinel-controlplane-headless:9600
-            # (…-1 → id 2, …-2 → id 3, each excluding itself)
+            # --- Raft identity, derived by controllerd from the pod ordinal ---
+            # NODE_ID and PEERS are NOT set here on purpose: with these three
+            # env vars + the pod name, controllerd computes them itself, e.g.
+            #   sentinel-controlplane-0 → NODE_ID=1,
+            #     PEERS=2=sentinel-controlplane-1.sentinel-controlplane-headless:9600,
+            #           3=sentinel-controlplane-2.sentinel-controlplane-headless:9600
             - { name: SENTINEL_RAFT_ADDR, value: "0.0.0.0:9600" }
             - { name: SENTINEL_RAFT_DIR, value: "/var/lib/sentinel/raft" }
-            - name: POD_NAME     # entrypoint reads this to derive NODE_ID + PEERS
+            - { name: SENTINEL_RAFT_REPLICAS, value: "3" }   # MUST match spec.replicas above
+            - { name: SENTINEL_RAFT_SERVICE, value: "sentinel-controlplane-headless" }
+            - { name: SENTINEL_RAFT_PORT, value: "9600" }
+            - name: SENTINEL_RAFT_POD_NAME   # controllerd reads this to derive NODE_ID + PEERS
               valueFrom: { fieldRef: { fieldPath: metadata.name } }
           volumeMounts:
             - { name: raft-data, mountPath: /var/lib/sentinel/raft }

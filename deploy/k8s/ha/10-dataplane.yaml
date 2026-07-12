@@ -6,9 +6,9 @@
 #  - podAntiAffinity (required) → the scheduler REFUSES to co-locate two WAF pods
 #    on the same node, so a node outage never takes more than one replica.
 #  - topologySpreadConstraints → also spread across availability zones.
-#  - readiness/liveness probes → K8s only sends traffic to pods that are up, and
-#    restarts dead ones. (See the readiness NOTE below — needs /readyz for true
-#    config-sync readiness; until then we gate with a startupProbe delay.)
+#  - readiness/liveness probes → liveness (/healthz) restarts dead pods; readiness
+#    + startup (/readyz) hold traffic off a pod until its WAF config has synced
+#    (sites>0), so rollouts and rejoins never 502.
 #  - PodDisruptionBudget → voluntary disruptions (drains/upgrades) keep >=2 up.
 #  - HorizontalPodAutoscaler → scale the fleet with load.
 #
@@ -66,22 +66,23 @@ spec:
           resources:
             requests: { cpu: "500m", memory: "256Mi" }
             limits:   { cpu: "2",    memory: "1Gi" }
-          # Liveness: restart the pod if the proxy process is dead.
+          # Liveness: /healthz = "process is up". Restart the pod if it's dead.
           livenessProbe:
             httpGet: { path: /healthz, port: 8080 }
             periodSeconds: 5
             failureThreshold: 3
-          # Readiness: only receive traffic when the pod can serve.
-          # NOTE: /healthz returns 200 even before config sync, so a rejoining pod
-          # could briefly 502. FOLLOW-UP: add a /readyz that returns 200 only once
-          # config is synced (sites>0) and point readinessProbe at it. Until then,
-          # the startupProbe below holds traffic off for ~20s to cover the sync.
+          # Readiness: /readyz = "config synced, can actually protect" (200 only
+          # when sites>0). The Service won't route to a pod until it's ready, so
+          # a rejoining or freshly-rolled pod never serves traffic before its
+          # rules load → no 502s on rollout/recovery.
           readinessProbe:
-            httpGet: { path: /healthz, port: 8080 }
+            httpGet: { path: /readyz, port: 8080 }
             periodSeconds: 3
             failureThreshold: 2
+          # Startup: also /readyz, so liveness doesn't start counting until the
+          # first sync completes (up to ~30s grace on a cold start).
           startupProbe:
-            httpGet: { path: /healthz, port: 8080 }
+            httpGet: { path: /readyz, port: 8080 }
             periodSeconds: 2
             failureThreshold: 15   # ~30s grace for config sync before liveness/readiness engage
       volumes:

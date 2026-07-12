@@ -62,15 +62,19 @@ kubectl apply -f 10-dataplane.yaml
 kubectl apply -f 40-loadbalancer.yaml
 ```
 
-## Honest follow-ups before this is "apply and done"
-Small but real (noted inline in the manifests):
-1. **`/readyz` on the data plane** — `/healthz` returns 200 before config sync, so
-   the readiness probe can mark a pod Ready ~15s too early. Add `/readyz` that
-   returns 200 only when `sites > 0` and point the readinessProbe at it. (The
-   `startupProbe` delay covers it until then.)
-2. **Control-plane NODE_ID from pod ordinal** — the distroless image needs a tiny
-   entrypoint that derives `SENTINEL_NODE_ID` + `SENTINEL_RAFT_PEERS` from
-   `$POD_NAME`, since a StatefulSet gives all pods identical env.
+## Follow-ups
+Done — the manifests are turnkey against the current images:
+1. ✅ **`/readyz` on the data plane** — returns 200 only when config has synced
+   (`sites > 0`), 503 otherwise. The readiness + startup probes point at it, so a
+   pod never receives traffic before its rules load (no 502s on rollout/recovery).
+   (`crates/sentinel-proxy/src/lib.rs`.)
+2. ✅ **Control-plane NODE_ID from pod ordinal** — `controllerd` derives
+   `SENTINEL_NODE_ID` + `SENTINEL_RAFT_PEERS` from the pod ordinal natively (no
+   entrypoint/shell needed in the distroless image) via
+   `SENTINEL_RAFT_POD_NAME` / `_REPLICAS` / `_SERVICE`. See `deriveRaftTopology`
+   in `control-plane/cmd/controllerd/main.go`.
+
+Still environment-specific (do at deploy time):
 3. **TLS/cert management** — wire cert-manager or the built-in ACME for HTTPS.
 4. **Push images to a registry**; set `imagePullSecrets` if private.
 

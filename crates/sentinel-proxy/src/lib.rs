@@ -1406,6 +1406,16 @@ async fn handle_request(
         return Ok(health_response(&state));
     }
 
+    // Kubernetes READINESS probe. Unlike /healthz (liveness — "the process is
+    // up"), /readyz reports whether this node can actually protect traffic: it
+    // returns 200 only once the WAF config has synced from the control plane
+    // (sites > 0). A freshly-started or rejoining pod reports 503 until its
+    // rules are loaded, so the Service / load balancer won't route to it early
+    // → no 502s on rollout or recovery. No auth required; internal-only.
+    if req.uri().path() == "/readyz" || req.uri().path() == "/ready" {
+        return Ok(readyz_response(&state));
+    }
+
     // Management listener: this is the dedicated admin-console endpoint. It
     // bypasses the WAF pipeline entirely and reverse-proxies the dashboard +
     // control-plane API (the admin UI is auth-gated by the control plane). Done
@@ -3937,6 +3947,31 @@ fn health_response(state: &ServerState) -> Response<BoxBody> {
                 .map_err(|never: Infallible| match never {})
                 .boxed(),
         )
+        .unwrap()
+}
+
+// Kubernetes readiness: 200 only when the WAF config has synced (sites > 0),
+// otherwise 503. Cheap and self-contained (no upstream hit) so kubelet can poll
+// it every second. Distinct from /healthz, which is liveness — a node whose
+// process is up but hasn't synced rules is live-but-not-ready.
+fn readyz_response(state: &ServerState) -> Response<BoxBody> {
+    let site_count = state.config.load().sites.len();
+    let ready = site_count > 0;
+    let (status, body) = if ready {
+        (
+            StatusCode::OK,
+            serde_json::json!({ "status": "ready", "sites": site_count }),
+        )
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({ "status": "not_ready", "reason": "config not synced", "sites": 0 }),
+        )
+    };
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(full_body(Bytes::from(body.to_string())))
         .unwrap()
 }
 

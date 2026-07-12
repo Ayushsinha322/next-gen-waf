@@ -539,8 +539,43 @@ func startCluster(log *zap.Logger) (*cluster.Cluster, error) {
 		return nil, nil
 	}
 	idStr := os.Getenv("SENTINEL_NODE_ID")
+	peersRaw := os.Getenv("SENTINEL_RAFT_PEERS")
+
+	// Kubernetes StatefulSet mode: a StatefulSet gives every replica identical
+	// env, so NODE_ID/PEERS can't be hard-coded per pod. When NODE_ID isn't set
+	// explicitly but the pod name is available (downward API →
+	// SENTINEL_RAFT_POD_NAME or POD_NAME), derive both from the pod's ordinal:
+	// "sentinel-controlplane-2" + replicas=3 + service=<headless> →
+	// id=3, peers="1=sentinel-controlplane-0.<svc>:9600,2=...-1.<svc>:9600".
+	// This lets the same manifest scale replicas without per-pod config.
 	if idStr == "" {
-		return nil, fmt.Errorf("SENTINEL_NODE_ID required when SENTINEL_RAFT_ADDR is set")
+		pod := os.Getenv("SENTINEL_RAFT_POD_NAME")
+		if pod == "" {
+			pod = os.Getenv("POD_NAME")
+		}
+		if pod != "" {
+			derivedID, derivedPeers, derr := deriveRaftTopology(
+				pod,
+				os.Getenv("SENTINEL_RAFT_REPLICAS"),
+				os.Getenv("SENTINEL_RAFT_SERVICE"),
+				envOrDefault("SENTINEL_RAFT_PORT", "9600"),
+			)
+			if derr != nil {
+				return nil, fmt.Errorf("deriving Raft topology from pod ordinal: %w", derr)
+			}
+			idStr = strconv.FormatUint(derivedID, 10)
+			if peersRaw == "" {
+				peersRaw = derivedPeers
+			}
+			log.Info("derived Raft topology from pod ordinal (StatefulSet mode)",
+				zap.String("pod", pod),
+				zap.String("node_id", idStr),
+				zap.String("peers", peersRaw))
+		}
+	}
+	if idStr == "" {
+		return nil, fmt.Errorf("SENTINEL_NODE_ID required when SENTINEL_RAFT_ADDR is set " +
+			"(or set SENTINEL_RAFT_POD_NAME/_REPLICAS/_SERVICE for StatefulSet mode)")
 	}
 	id, err := strconv.ParseUint(idStr, 10, 64)
 	if err != nil || id == 0 {
@@ -548,7 +583,7 @@ func startCluster(log *zap.Logger) (*cluster.Cluster, error) {
 	}
 
 	peers := map[cluster.NodeID]string{}
-	if raw := os.Getenv("SENTINEL_RAFT_PEERS"); raw != "" {
+	if raw := peersRaw; raw != "" {
 		for _, kv := range strings.Split(raw, ",") {
 			kv = strings.TrimSpace(kv)
 			if kv == "" {
@@ -598,4 +633,46 @@ func startCluster(log *zap.Logger) (*cluster.Cluster, error) {
 	}
 
 	return cluster.Start(cfg)
+}
+
+// deriveRaftTopology computes this node's Raft ID and peer list from its
+// StatefulSet pod ordinal, so one manifest serves every replica.
+//
+//	pod="sentinel-controlplane-2", replicas="3", service="sentinel-controlplane-hl", port="9600"
+//	  → id=3, peers="1=sentinel-controlplane-0.sentinel-controlplane-hl:9600,
+//	                 2=sentinel-controlplane-1.sentinel-controlplane-hl:9600"
+//
+// Node IDs are 1-based (ordinal+1) because Raft treats 0 as "no node". Peer
+// addresses use the per-pod stable DNS a headless Service provides
+// (<pod>.<service>), which resolves within the namespace and survives restarts.
+func deriveRaftTopology(pod, replicasStr, service, port string) (uint64, string, error) {
+	dash := strings.LastIndex(pod, "-")
+	if dash < 0 || dash == len(pod)-1 {
+		return 0, "", fmt.Errorf("pod name %q has no ordinal suffix (expected name-N)", pod)
+	}
+	ordinal, err := strconv.Atoi(pod[dash+1:])
+	if err != nil || ordinal < 0 {
+		return 0, "", fmt.Errorf("pod name %q has a non-ordinal suffix %q", pod, pod[dash+1:])
+	}
+	prefix := pod[:dash] // e.g. "sentinel-controlplane"
+
+	replicas, err := strconv.Atoi(replicasStr)
+	if err != nil || replicas < 1 {
+		return 0, "", fmt.Errorf("SENTINEL_RAFT_REPLICAS must be a positive integer, got %q", replicasStr)
+	}
+	if ordinal >= replicas {
+		return 0, "", fmt.Errorf("pod ordinal %d is out of range for %d replicas", ordinal, replicas)
+	}
+	if service == "" {
+		return 0, "", fmt.Errorf("SENTINEL_RAFT_SERVICE (headless service name) is required for StatefulSet mode")
+	}
+
+	var peers []string
+	for i := 0; i < replicas; i++ {
+		if i == ordinal {
+			continue // skip self
+		}
+		peers = append(peers, fmt.Sprintf("%d=%s-%d.%s:%s", i+1, prefix, i, service, port))
+	}
+	return uint64(ordinal + 1), strings.Join(peers, ","), nil
 }
