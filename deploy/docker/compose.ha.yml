@@ -1,0 +1,48 @@
+# Data-plane HA overlay — the cloud-WAF model.
+#
+# An active-active fleet of 3 stateless WAF nodes behind an HAProxy load
+# balancer. Every node inspects independently (rules/DLP/JWT/etc. from the same
+# control-plane config); Redis holds shared rate-limit state so limits are
+# fleet-wide. Kill any node → HAProxy routes around it in ~1s with zero
+# downtime. Add more nodes by adding waf4/waf5… — horizontal scale.
+#
+# Usage (from /opt/sentinel-src) — see demo/dataplane-ha-demo.sh which also
+# frees :80 by stopping the single-node data plane first:
+#   docker compose -f deploy/docker/compose.prod.yml -f deploy/docker/compose.ha.yml up -d waf1 waf2 waf3 lb
+
+services:
+  waf1: &wafnode
+    image: sentinel/dataplane:latest
+    restart: unless-stopped
+    user: "0:0"
+    depends_on:
+      controlplane: { condition: service_started }
+      redis: { condition: service_healthy }
+    environment:
+      SENTINEL_CONFIG: /etc/sentinel/sentinel.yaml
+      RUST_LOG: info,sentinel=info
+      SENTINEL_INTERNAL_SECRET: ${SENTINEL_INTERNAL_SECRET}
+      # Shared rate-limit state across the fleet (distributed sliding window).
+      SENTINEL_REDIS_URL: redis://redis:6379
+      SENTINEL_CLICKHOUSE_URL: http://clickhouse:8123
+      SENTINEL_CLICKHOUSE_DB: ${CLICKHOUSE_DB}
+      SENTINEL_CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      SENTINEL_CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+    volumes:
+      - ./sentinel.proxy.yaml:/etc/sentinel/sentinel.yaml:ro
+    networks: [sentinel]
+  waf2:
+    <<: *wafnode
+  waf3:
+    <<: *wafnode
+
+  lb:
+    image: haproxy:2.9-alpine
+    restart: unless-stopped
+    depends_on: [waf1, waf2, waf3]
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "80:80"       # public WAF entrypoint (in front of the fleet)
+      - "8404:8404"   # HAProxy health/stats view
+    networks: [sentinel]
