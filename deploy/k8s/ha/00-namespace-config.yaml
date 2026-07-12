@@ -1,0 +1,41 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sentinel
+---
+# Data-plane proxy config. The key line is sync_url → the control-plane Service:
+# every WAF pod pulls its site/rule config from the control-plane cluster.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sentinel-proxy-config
+  namespace: sentinel
+data:
+  sentinel.yaml: |
+    listeners:
+      - name: http
+        bind: "0.0.0.0:8080"
+        protocols: [http1, http2]
+      - name: https
+        bind: "0.0.0.0:8443"
+        protocols: [http1, http2, http3]
+        tls: { acme: false }
+    cluster:
+      # Pull config from the HA control-plane Service (K8s load-balances across
+      # the 3 control-plane pods, so a reader survives any single pod failure).
+      sync_url: "http://sentinel-controlplane:9501"
+    sites: []   # control plane is authoritative; sites are hot-synced
+---
+# Secrets — REPLACE these with real values (or use an external secrets manager /
+# sealed-secrets). stringData is plaintext for readability; kubectl base64s it.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sentinel-secrets
+  namespace: sentinel
+type: Opaque
+stringData:
+  db-url: "postgres://sentinel:CHANGE_ME@sentinel-postgres-rw:5432/sentinel?sslmode=require"
+  jwt-secret: "CHANGE_ME_jwt_signing_secret"
+  internal-secret: "CHANGE_ME_dataplane_controlplane_shared_secret"
+  raft-secret: "CHANGE_ME_raft_inter_node_secret"

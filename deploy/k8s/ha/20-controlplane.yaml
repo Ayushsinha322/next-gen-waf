@@ -1,0 +1,117 @@
+# Control plane — 3-replica Raft cluster (management brain HA).
+#
+# HA properties:
+#  - StatefulSet, replicas: 3 → Raft quorum survives 1 node failure (2/3 majority).
+#  - headless Service → stable per-pod DNS (sentinel-controlplane-0.<svc> …) that
+#    Raft peers use to find each other.
+#  - podAntiAffinity → one replica per node.
+#  - persistent volume per pod → Raft log/term/vote survive a restart.
+#  - PodDisruptionBudget minAvailable: 2 → drains never break quorum.
+#
+# NOTE (one required image tweak): each pod needs its own SENTINEL_NODE_ID and a
+# peer list that excludes itself. The distroless image can't run a shell to
+# derive these, so add a tiny entrypoint (or app support) that, when
+# SENTINEL_NODE_ID is unset, derives it from the pod ordinal in $HOSTNAME
+# (sentinel-controlplane-0 → id 1) and builds SENTINEL_RAFT_PEERS for the other
+# ordinals. Values it should produce are shown in the comments below.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sentinel-controlplane-headless
+  namespace: sentinel
+  labels: { app: sentinel, tier: controlplane }
+spec:
+  clusterIP: None                 # headless → stable pod DNS for Raft peers
+  publishNotReadyAddresses: true  # peers must resolve each other during election, before "ready"
+  selector: { app: sentinel, tier: controlplane }
+  ports:
+    - { name: raft, port: 9600 }
+    - { name: rest, port: 9501 }
+---
+apiVersion: v1
+kind: Service                     # stable client endpoint (REST API) the data plane syncs from
+metadata:
+  name: sentinel-controlplane
+  namespace: sentinel
+spec:
+  selector: { app: sentinel, tier: controlplane }
+  ports:
+    - { name: rest, port: 9501, targetPort: 9501 }
+    - { name: grpc, port: 9500, targetPort: 9500 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sentinel-controlplane
+  namespace: sentinel
+spec:
+  serviceName: sentinel-controlplane-headless
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: { app: sentinel, tier: controlplane }
+  template:
+    metadata:
+      labels: { app: sentinel, tier: controlplane }
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels: { app: sentinel, tier: controlplane }
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: controlplane
+          image: registry.example.com/sentinel/controlplane:latest
+          ports:
+            - { name: rest, containerPort: 9501 }
+            - { name: grpc, containerPort: 9500 }
+            - { name: raft, containerPort: 9600 }
+          env:
+            - { name: SENTINEL_REST_ADDR, value: "0.0.0.0:9501" }
+            - { name: SENTINEL_GRPC_ADDR, value: "0.0.0.0:9500" }
+            - { name: SENTINEL_AUTOSTART_DATAPLANE, value: "0" }
+            - name: SENTINEL_DB_URL
+              valueFrom: { secretKeyRef: { name: sentinel-secrets, key: db-url } }
+            - name: SENTINEL_JWT_SECRET
+              valueFrom: { secretKeyRef: { name: sentinel-secrets, key: jwt-secret } }
+            - name: SENTINEL_INTERNAL_SECRET
+              valueFrom: { secretKeyRef: { name: sentinel-secrets, key: internal-secret } }
+            - name: SENTINEL_RAFT_SECRET
+              valueFrom: { secretKeyRef: { name: sentinel-secrets, key: raft-secret } }
+            # --- Raft, per-pod (produced by the entrypoint from the ordinal) ---
+            # pod sentinel-controlplane-0 → SENTINEL_NODE_ID=1
+            #   SENTINEL_RAFT_PEERS=2=sentinel-controlplane-1.sentinel-controlplane-headless:9600,3=sentinel-controlplane-2.sentinel-controlplane-headless:9600
+            # (…-1 → id 2, …-2 → id 3, each excluding itself)
+            - { name: SENTINEL_RAFT_ADDR, value: "0.0.0.0:9600" }
+            - { name: SENTINEL_RAFT_DIR, value: "/var/lib/sentinel/raft" }
+            - name: POD_NAME     # entrypoint reads this to derive NODE_ID + PEERS
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+          volumeMounts:
+            - { name: raft-data, mountPath: /var/lib/sentinel/raft }
+          resources:
+            requests: { cpu: "250m", memory: "256Mi" }
+            limits:   { cpu: "1",    memory: "512Mi" }
+          readinessProbe:
+            httpGet: { path: /health, port: 9501 }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health, port: 9501 }
+            periodSeconds: 10
+            failureThreshold: 3
+  volumeClaimTemplates:
+    - metadata: { name: raft-data }
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: { requests: { storage: 1Gi } }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sentinel-controlplane-pdb
+  namespace: sentinel
+spec:
+  minAvailable: 2               # keep Raft quorum during voluntary disruptions
+  selector:
+    matchLabels: { app: sentinel, tier: controlplane }

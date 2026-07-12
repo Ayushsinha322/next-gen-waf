@@ -1,0 +1,52 @@
+# Stateful dependencies — made HA so they aren't single points of failure.
+#
+# ── Postgres (control-plane store) ───────────────────────────────────────────
+# A single Postgres pod is a SPOF. We use the CloudNativePG operator to run a
+# 3-instance cluster (1 primary + 2 hot standbys, synchronous replication, auto
+# failover, spread across nodes). Install the operator first:
+#   kubectl apply --server-side -f \
+#     https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.24/releases/cnpg-1.24.0.yaml
+#
+# The operator publishes services: sentinel-postgres-rw (primary, writes) and
+# sentinel-postgres-ro (standbys, reads). The control plane's db-url uses -rw.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: sentinel-postgres
+  namespace: sentinel
+spec:
+  instances: 3
+  primaryUpdateStrategy: unsupervised
+  storage:
+    size: 20Gi
+  postgresql:
+    parameters:
+      max_connections: "200"
+  # Synchronous replication → a committed write survives losing the primary.
+  minSyncReplicas: 1
+  maxSyncReplicas: 1
+  # Spread the 3 instances across nodes/zones so one node loss ≠ DB outage.
+  affinity:
+    enablePodAntiAffinity: true
+    topologyKey: kubernetes.io/hostname
+  bootstrap:
+    initdb:
+      database: sentinel
+      owner: sentinel
+      # secret with username/password for the sentinel role (create separately or
+      # let the operator generate it; wire it into sentinel-secrets/db-url).
+      secret: { name: sentinel-postgres-app }
+---
+# ── Redis (shared rate-limit state) ──────────────────────────────────────────
+# NOTE: Redis is NOT a hard HA requirement for protection — without it each WAF
+# pod falls back to a correct per-pod (in-process) rate limiter; only the
+# cross-fleet shared counter is lost. So a Redis outage degrades gracefully, it
+# doesn't drop protection.
+#
+# For fleet-wide shared limits with HA, run a Redis with automatic failover via
+# an operator (recommended) rather than a single pod, e.g. the Redis Operator:
+#   helm repo add ot-helm https://ot-container-kit.github.io/helm-charts/
+#   helm install redis-operator ot-helm/redis-operator -n sentinel
+# then a RedisReplication (1 master + 2 replicas) + RedisSentinel for failover,
+# exposing a Service named `sentinel-redis` (referenced by the data plane's
+# SENTINEL_REDIS_URL). A single-pod Redis is acceptable ONLY for a pilot.

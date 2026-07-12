@@ -1,0 +1,33 @@
+# External entrypoint (the HA load balancer for the fleet).
+#
+# For a WAF, the data plane IS the edge proxy, so we don't put another L7 proxy
+# in front — we expose the fleet with a Service of type LoadBalancer. Kubernetes
+# then load-balances external traffic across the (node-spread) WAF pods and only
+# routes to Ready ones, which IS the fleet failover the HAProxy demo showed —
+# now with no single LB box.
+#
+# The LoadBalancer itself must be HA (else it's the new SPOF):
+#  - Public cloud (AWS/GCP/Azure): the cloud L4 LB is HA + multi-AZ by default.
+#  - Bare metal / private cloud (ESDS): install MetalLB in BGP mode (multiple
+#    speaker nodes advertise the VIP → no single LB node) or L2 mode with a
+#    failover VIP. Anycast/BGP is the closest to the Cloudflare model.
+#      helm install metallb metallb/metallb -n metallb-system
+#    then an IPAddressPool + BGPAdvertisement for the VIP.
+apiVersion: v1
+kind: Service
+metadata:
+  name: sentinel-waf-lb
+  namespace: sentinel
+  labels: { app: sentinel, tier: dataplane }
+  annotations:
+    # Preserve the real client IP (so the WAF sees the true source, not the LB).
+    # Trade-off: routes only to pods on the receiving node — pair with the
+    # node-spread we already have. Use "Cluster" if you need even LB spread.
+    externalTrafficPolicy: Local
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector: { app: sentinel, tier: dataplane }
+  ports:
+    - { name: http,  port: 80,  targetPort: 8080 }
+    - { name: https, port: 443, targetPort: 8443 }
