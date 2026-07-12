@@ -11,6 +11,7 @@ build/
 # Go
 control-plane/bin/
 control-plane/sentinelctl
+control-plane/controllerd
 /sentinelctl
 *.test
 *.out
