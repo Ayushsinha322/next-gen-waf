@@ -6,35 +6,45 @@
 # fleet-wide. Kill any node → HAProxy routes around it in ~1s with zero
 # downtime. Add more nodes by adding waf4/waf5… — horizontal scale.
 #
+# Each node sets `hostname:` so it reports a friendly id (waf1/waf2/waf3) in its
+# heartbeat — that id is what shows on the Cluster & Node Health page and must
+# match the HAProxy backend server names below.
+#
 # Usage (from /opt/sentinel-src) — see demo/dataplane-ha-demo.sh which also
 # frees :80 by stopping the single-node data plane first:
 #   docker compose -f deploy/docker/compose.prod.yml -f deploy/docker/compose.ha.yml up -d waf1 waf2 waf3 lb
 
+x-wafnode: &wafnode
+  image: sentinel/dataplane:latest
+  restart: unless-stopped
+  user: "0:0"
+  depends_on:
+    controlplane: { condition: service_started }
+    redis: { condition: service_healthy }
+  environment:
+    SENTINEL_CONFIG: /etc/sentinel/sentinel.yaml
+    RUST_LOG: info,sentinel=info
+    SENTINEL_INTERNAL_SECRET: ${SENTINEL_INTERNAL_SECRET}
+    # Shared rate-limit state across the fleet (distributed sliding window).
+    SENTINEL_REDIS_URL: redis://redis:6379
+    SENTINEL_CLICKHOUSE_URL: http://clickhouse:8123
+    SENTINEL_CLICKHOUSE_DB: ${CLICKHOUSE_DB}
+    SENTINEL_CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+    SENTINEL_CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+  volumes:
+    - ./sentinel.proxy.yaml:/etc/sentinel/sentinel.yaml:ro
+  networks: [sentinel]
+
 services:
-  waf1: &wafnode
-    image: sentinel/dataplane:latest
-    restart: unless-stopped
-    user: "0:0"
-    depends_on:
-      controlplane: { condition: service_started }
-      redis: { condition: service_healthy }
-    environment:
-      SENTINEL_CONFIG: /etc/sentinel/sentinel.yaml
-      RUST_LOG: info,sentinel=info
-      SENTINEL_INTERNAL_SECRET: ${SENTINEL_INTERNAL_SECRET}
-      # Shared rate-limit state across the fleet (distributed sliding window).
-      SENTINEL_REDIS_URL: redis://redis:6379
-      SENTINEL_CLICKHOUSE_URL: http://clickhouse:8123
-      SENTINEL_CLICKHOUSE_DB: ${CLICKHOUSE_DB}
-      SENTINEL_CLICKHOUSE_USER: ${CLICKHOUSE_USER}
-      SENTINEL_CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
-    volumes:
-      - ./sentinel.proxy.yaml:/etc/sentinel/sentinel.yaml:ro
-    networks: [sentinel]
+  waf1:
+    <<: *wafnode
+    hostname: waf1     # → heartbeat node id "waf1" (matches the LB backend name)
   waf2:
     <<: *wafnode
+    hostname: waf2
   waf3:
     <<: *wafnode
+    hostname: waf3
 
   lb:
     image: haproxy:2.9-alpine

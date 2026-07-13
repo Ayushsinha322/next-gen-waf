@@ -184,6 +184,14 @@ func (m *Monitor) checkControlPlane() {
 	if m.cl == nil {
 		return
 	}
+	// Raft tracks peer liveness only leader->follower (a follower never RPCs its
+	// fellow followers, so it sees them as "unreachable"). Only the leader has an
+	// accurate view, so only the leader evaluates control-plane health and raises
+	// cp_node_down / quorum alerts — this also guarantees a single alerter, not
+	// one per follower.
+	if !m.cl.IsLeader() {
+		return
+	}
 	st := m.cl.Status()
 
 	for _, peer := range st.Peers {

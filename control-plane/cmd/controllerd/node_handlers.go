@@ -169,7 +169,15 @@ func handleClusterHealth(c *gin.Context, enf *rbac.Enforcer, store *db.Store, cl
 		}
 	} else {
 		st := cl.Status()
-		selfIsLeader := st.LeaderID != nil && *st.LeaderID == st.NodeID
+		hasLeader := st.LeaderID != nil
+		selfIsLeader := hasLeader && *st.LeaderID == st.NodeID
+		// Raft tracks peer liveness only leader->follower, so peer.Reachable is
+		// trustworthy ONLY when this node is the leader. When queried on a
+		// follower we can't see other peers directly — but a present leader
+		// implies a healthy majority (Raft invariant), so report peers as
+		// reachable instead of falsely "down". (Precise per-node CP liveness is
+		// available whenever the dashboard's control plane is the leader.)
+		trustReach := selfIsLeader
 		cpNodes := []gin.H{
 			{
 				"node_id":       uint64(st.NodeID),
@@ -183,18 +191,26 @@ func handleClusterHealth(c *gin.Context, enf *rbac.Enforcer, store *db.Store, cl
 		}
 		healthy := 1
 		for _, p := range st.Peers {
-			if p.Reachable {
+			reachable := p.Reachable
+			if !trustReach {
+				reachable = hasLeader
+			}
+			if reachable {
 				healthy++
 			} else {
 				cpAnyUnreachable = true
 			}
-			isLeader := st.LeaderID != nil && *st.LeaderID == p.NodeID
+			isLeader := hasLeader && *st.LeaderID == p.NodeID
+			role := "follower"
+			if isLeader {
+				role = "leader"
+			}
 			cpNodes = append(cpNodes, gin.H{
 				"node_id":       uint64(p.NodeID),
-				"role":          "unknown",
+				"role":          role,
 				"is_leader":     isLeader,
 				"is_self":       false,
-				"reachable":     p.Reachable,
+				"reachable":     reachable,
 				"last_seen_sec": p.LastSeenSec,
 				"addr":          p.Addr,
 			})
@@ -202,7 +218,7 @@ func handleClusterHealth(c *gin.Context, enf *rbac.Enforcer, store *db.Store, cl
 		total := len(st.Peers) + 1
 		quorumSize := total/2 + 1
 		var leaderID interface{}
-		if st.LeaderID != nil {
+		if hasLeader {
 			leaderID = uint64(*st.LeaderID)
 		}
 		controlPlane = gin.H{
@@ -211,7 +227,7 @@ func handleClusterHealth(c *gin.Context, enf *rbac.Enforcer, store *db.Store, cl
 			"total":             total,
 			"healthy":           healthy,
 			"quorum_size":       quorumSize,
-			"quorum_ok":         healthy >= quorumSize,
+			"quorum_ok":         hasLeader && healthy >= quorumSize,
 			"leader_id":         leaderID,
 			"term":              st.Term,
 			"resilience_budget": maxInt(0, healthy-quorumSize),
