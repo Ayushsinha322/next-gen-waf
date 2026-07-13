@@ -195,6 +195,13 @@ func (e *Engine) bumpWindow(m map[string][]time.Time, key string, now time.Time)
 	return len(w)
 }
 
+// Raise is an exported wrapper over raise so out-of-package monitors (e.g. the
+// node-health monitor) can surface alerts through the same persistence +
+// throttling + channel fan-out path. Callers MUST set na.Severity and na.Kind.
+func (e *Engine) Raise(throttleKey string, req db.CreateAlertRequest, na notify.Alert) {
+	e.raise(throttleKey, req, na)
+}
+
 // raise persists, republishes, and dispatches an alert unless throttled.
 func (e *Engine) raise(throttleKey string, req db.CreateAlertRequest, na notify.Alert) {
 	e.mu.Lock()

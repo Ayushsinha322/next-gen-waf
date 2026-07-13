@@ -23,6 +23,7 @@ import (
 	"github.com/your-org/sentinel-waf/control-plane/internal/db"
 	controlgrpc "github.com/your-org/sentinel-waf/control-plane/internal/grpc"
 	"github.com/your-org/sentinel-waf/control-plane/internal/logs"
+	"github.com/your-org/sentinel-waf/control-plane/internal/nodehealth"
 	"github.com/your-org/sentinel-waf/control-plane/internal/rbac"
 	"github.com/your-org/sentinel-waf/control-plane/internal/threatintel"
 	"go.uber.org/zap"
@@ -149,6 +150,11 @@ func run() error {
 			if err := db.EnsureThreatIntelSchema(ctx, pool); err != nil {
 				log.Warn("threat-intel schema ensure failed (non-fatal)", zap.Error(err))
 			}
+
+			// Ensure the nodes table exists (idempotent) — node-health tracking.
+			if err := db.EnsureNodesSchema(ctx, pool); err != nil {
+				log.Warn("nodes schema ensure failed (non-fatal)", zap.Error(err))
+			}
 		}
 	}
 
@@ -169,8 +175,9 @@ func run() error {
 	// critical blocks), persists them, surfaces them on the dashboard via SSE,
 	// and fans them out to configured notification channels. Single-tenant
 	// (dev tenant) because the proxy NDJSON stream is not tenant-tagged.
+	var engine *alerting.Engine
 	if store != nil {
-		engine := alerting.New(store, hub, db.DevTenantID, db.DevAdminID, alertingConfigFromEnv(), log)
+		engine = alerting.New(store, hub, db.DevTenantID, db.DevAdminID, alertingConfigFromEnv(), log)
 		engine.Start()
 		defer engine.Stop()
 	}
@@ -202,6 +209,16 @@ func run() error {
 		log.Warn("cluster init failed — continuing in standalone mode", zap.Error(clErr))
 	} else if cl != nil {
 		defer cl.Stop()
+	}
+
+	// ── Node-health monitor ───────────────────────────────────────────────────
+	// Flips stale data-plane nodes DOWN, watches Raft quorum, and raises alerts
+	// through the engine on transitions. Started after the cluster so it can use
+	// the same cl handle; only when a store + engine exist.
+	if store != nil && engine != nil {
+		nm := nodehealth.New(store, engine, cl, log)
+		nm.Start()
+		defer nm.Stop()
 	}
 
 	// ── gRPC ──────────────────────────────────────────────────────────────────
@@ -336,6 +353,7 @@ func run() error {
 				handleClusterStatus(c, cl)
 			}
 		})
+		protected.GET("/cluster/health", func(c *gin.Context) { handleClusterHealth(c, enforcer, store, cl) })
 		protected.GET("/waf/status", func(c *gin.Context) {
 			if requirePerm(c, enforcer, rbac.ResourceSite, rbac.ActionList) {
 				handleProxyHealth(c)
@@ -373,6 +391,10 @@ func run() error {
 	// Internal threat-intel endpoint — the data plane hot-syncs the active IOC
 	// set from here (same shared-secret gate as /internal/config).
 	router.GET("/api/v1/internal/threat-intel", func(c *gin.Context) { handleInternalThreatIntel(c, store) })
+
+	// Internal node-health heartbeat — data-plane nodes POST their status here
+	// (same shared-secret gate as /internal/config).
+	router.POST("/api/v1/internal/nodes/heartbeat", func(c *gin.Context) { handleNodeHeartbeat(c, store) })
 
 	admin := router.Group("/api/v1/admin")
 	admin.Use(auth.GinAuthMiddleware(jwtSvc, true))

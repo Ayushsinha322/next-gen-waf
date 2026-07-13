@@ -359,6 +359,63 @@ export interface CertValidationResult {
   warnings:       string[];
 }
 
+// --- Cluster & Node Health ---------------------------------------------------
+// Mirrors GET /cluster/health: a fleet-wide roll-up of every data-plane node
+// plus the control-plane (Raft) quorum, used by the Cluster health dashboard.
+
+/** A single data-plane (WAF) node in the fleet. */
+export interface DataPlaneNode {
+  id:               string;
+  hostname:         string;
+  role:             string;
+  version:          string;
+  status:           "healthy" | "degraded" | "down";
+  last_seen:        number; // unix seconds
+  seconds_since_seen: number;
+  uptime_secs:      number;
+  sites:            number;
+  upstreams_healthy: number;
+  upstreams_total:  number;
+}
+
+/** A single control-plane (Raft) node. */
+export interface ControlPlaneNode {
+  node_id:      number;
+  role:         "leader" | "follower" | "candidate" | "unknown";
+  is_leader:    boolean;
+  is_self:      boolean;
+  reachable:    boolean;
+  last_seen_sec: number;
+  addr:         string;
+}
+
+/** Fleet-wide health roll-up (data plane + control plane). */
+export interface ClusterHealth {
+  generated_at:      number; // unix seconds
+  overall:           "healthy" | "degraded" | "critical";
+  protection_active: boolean;
+  data_plane: {
+    total:            number;
+    healthy:          number;
+    degraded:         number;
+    down:             number;
+    resilience_budget: number;
+    nodes:            DataPlaneNode[];
+  };
+  control_plane: {
+    enabled:          boolean;
+    role:             "standalone" | null;
+    total:            number;
+    healthy:          number;
+    quorum_size:      number;
+    quorum_ok:        boolean;
+    leader_id:        number | null;
+    term:             number;
+    resilience_budget: number;
+    nodes:            ControlPlaneNode[];
+  };
+}
+
 // ---------------------------------------------------------------------------
 // API methods
 // ---------------------------------------------------------------------------
@@ -502,6 +559,8 @@ export const api = {
       apiFetch<{ enabled: boolean; leader?: string; status?: { node_id?: string; state?: string; peers?: unknown[] } }>(
         "/cluster/status"
       ),
+    /** Fleet-wide health roll-up: data-plane nodes + control-plane (Raft) quorum. */
+    health: () => apiFetch<ClusterHealth>("/cluster/health"),
   },
 
   audit: {

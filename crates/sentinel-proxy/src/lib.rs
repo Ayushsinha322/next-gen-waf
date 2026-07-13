@@ -944,6 +944,110 @@ impl ProxyServer {
             });
         }
 
+        // --- Background: control-plane node heartbeat (every 10 s) ---
+        // Mirrors the config-sync loop above: POSTs this node's health to the
+        // control plane so the cluster view knows the data plane is alive and
+        // how it's doing. Same shared-secret auth. Never blocks the proxy: on
+        // any error we warn and keep ticking.
+        if let Some(sync_url) = cfg.cluster.sync_url.clone() {
+            let hb_cfg = Arc::clone(&state.config);
+            let hb_pool = Arc::clone(&state.upstream_pool);
+            // Resolve the node identity once (the configured id defaults to the
+            // literal "auto", which we resolve from env / hostname).
+            let node_id = if cfg.cluster.node_id != "auto" {
+                cfg.cluster.node_id.clone()
+            } else {
+                std::env::var("SENTINEL_NODE_ID")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
+                    .unwrap_or_else(|| "node".to_string())
+            };
+            let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| node_id.clone());
+            tokio::spawn(async move {
+                type JsonBody = http_body_util::Full<bytes::Bytes>;
+                let client: Client<_, JsonBody> =
+                    Client::builder(TokioExecutor::new()).build_http();
+                let internal_secret = std::env::var("SENTINEL_INTERNAL_SECRET")
+                    .ok()
+                    .filter(|s| !s.is_empty());
+                let version = env!("CARGO_PKG_VERSION");
+                let mut ticker = tokio::time::interval(Duration::from_secs(10));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    ticker.tick().await;
+
+                    // Snapshot health for this tick (mirrors health_response()).
+                    let cfg_snap = hb_cfg.load();
+                    let sites = cfg_snap.sites.len();
+                    let listeners: Vec<String> = cfg_snap
+                        .listeners
+                        .iter()
+                        .map(|l| format!("{}:{}", l.name, l.bind))
+                        .collect();
+                    let http3_enabled = cfg_snap.listeners.iter().any(|l| {
+                        l.is_tls() && !l.is_management() && l.protocols().contains(&Protocol::Http3)
+                    });
+                    let pool = hb_pool.stats();
+                    let uptime = START_TIME
+                        .get_or_init(SystemTime::now)
+                        .elapsed()
+                        .unwrap_or_default()
+                        .as_secs();
+                    // Degraded when we have origins configured but none reachable.
+                    let status = if pool.total > 0 && pool.healthy == 0 {
+                        "degraded"
+                    } else {
+                        "healthy"
+                    };
+
+                    let body = serde_json::json!({
+                        "id": node_id,
+                        "hostname": hostname,
+                        "role": "data-plane",
+                        "version": version,
+                        "status": status,
+                        "metadata": {
+                            "uptime_secs": uptime,
+                            "sites": sites,
+                            "listeners": listeners,
+                            "upstreams_healthy": pool.healthy,
+                            "upstreams_total": pool.total,
+                            "http3_enabled": http3_enabled,
+                        }
+                    })
+                    .to_string();
+
+                    let url = format!("{}/api/v1/internal/nodes/heartbeat", sync_url);
+                    let uri: hyper::Uri = match url.parse() {
+                        Ok(u) => u,
+                        Err(e) => {
+                            warn!("heartbeat: bad url: {e}");
+                            continue;
+                        }
+                    };
+                    let mut builder = hyper::Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json");
+                    if let Some(secret) = &internal_secret {
+                        builder = builder.header("x-sentinel-internal", secret);
+                    }
+                    let req = builder
+                        .body(http_body_util::Full::new(bytes::Bytes::from(body)))
+                        .expect("BUG: building heartbeat request");
+                    match client.request(req).await {
+                        Ok(resp) => {
+                            debug!(status = %resp.status(), "heartbeat posted");
+                        }
+                        Err(e) => {
+                            warn!("heartbeat post: {e}");
+                        }
+                    }
+                }
+            });
+        }
+
         // --- Background: RateLimiter GC (every 60 s) ---
         {
             let modules_ref = Arc::clone(&modules);

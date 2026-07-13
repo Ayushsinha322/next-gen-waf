@@ -84,6 +84,12 @@ const Icon = {
       <line x1="1.5" y1="12" x2="5" y2="12"/><line x1="19" y1="12" x2="22.5" y2="12"/>
     </svg>
   ),
+  Cluster: () => (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="4" r="2.4"/><circle cx="5" cy="19" r="2.4"/><circle cx="19" cy="19" r="2.4"/>
+      <line x1="12" y1="6.4" x2="6.3" y2="16.8"/><line x1="12" y1="6.4" x2="17.7" y2="16.8"/><line x1="7.4" y1="19" x2="16.6" y2="19"/>
+    </svg>
+  ),
 };
 
 const NAV = [
@@ -106,6 +112,7 @@ const NAV = [
     { id: "ml",      Icon: Icon.ML,      label: "ML Engine",  badge: "LIVE", badgeCls: "nb-g" },
   ]},
   { group: "SYSTEM", items: [
+    { id: "cluster",  Icon: Icon.Cluster,  label: "Cluster" },
     { id: "audit",    Icon: Icon.Audit,    label: "Audit Log" },
     { id: "settings", Icon: Icon.Settings, label: "Settings" },
   ]},
