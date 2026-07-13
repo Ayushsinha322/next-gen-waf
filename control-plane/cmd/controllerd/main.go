@@ -18,6 +18,7 @@ import (
 	"github.com/your-org/sentinel-waf/control-plane/internal/alerting"
 	"github.com/your-org/sentinel-waf/control-plane/internal/api"
 	"github.com/your-org/sentinel-waf/control-plane/internal/auth"
+	"github.com/your-org/sentinel-waf/control-plane/internal/certmon"
 	chreader "github.com/your-org/sentinel-waf/control-plane/internal/clickhouse"
 	"github.com/your-org/sentinel-waf/control-plane/internal/cluster"
 	"github.com/your-org/sentinel-waf/control-plane/internal/db"
@@ -219,6 +220,17 @@ func run() error {
 		nm := nodehealth.New(store, engine, cl, log)
 		nm.Start()
 		defer nm.Stop()
+	}
+
+	// ── Certificate-expiry monitor ────────────────────────────────────────────
+	// Polls the data-plane cert inventory on a slow ticker and raises escalating
+	// cert_expiring alerts before a cert lapses (the data plane auto-renews ACME
+	// certs but never alerts, and does nothing for manual certs). Base URL +
+	// secret are passed in since those helpers live in package main.
+	if store != nil && engine != nil {
+		cm := certmon.New(engine, dataPlaneBaseURL(), os.Getenv("SENTINEL_INTERNAL_SECRET"), log)
+		cm.Start()
+		defer cm.Stop()
 	}
 
 	// ── gRPC ──────────────────────────────────────────────────────────────────

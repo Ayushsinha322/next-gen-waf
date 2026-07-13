@@ -53,7 +53,7 @@ function statusOf(c: Certificate): { label: string; cls: string } {
   const d = daysUntil(c.expires_at);
   if (d === null) return { label: "UNKNOWN", cls: "bgr" };
   if (d <= 0) return { label: "EXPIRED", cls: "br blink" };
-  if (d <= 14) return { label: "CRITICAL", cls: "br" };
+  if (d <= 7) return { label: "CRITICAL", cls: "br" };
   if (d <= 30) return { label: "EXPIRING", cls: "ba" };
   return { label: "VALID", cls: "bgg" };
 }
@@ -72,7 +72,7 @@ function lifeBar(c: Certificate) {
   const d = daysUntil(c.expires_at);
   if (d === null) return null;
   const pct = Math.max(0, Math.min(100, (d / 90) * 100));
-  const color = d <= 0 ? "var(--red)" : d <= 14 ? "var(--red)" : d <= 30 ? "var(--amber)" : "var(--green)";
+  const color = d <= 7 ? "var(--red)" : d <= 30 ? "var(--amber)" : "var(--green)";
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
       <div style={{ flex: 1, height: 6, background: "rgba(255,255,255,.06)", borderRadius: 3, overflow: "hidden", minWidth: 80 }}>
@@ -157,6 +157,13 @@ export default function CertificatesPage() {
     expiring: certs.filter(c => { const d = daysUntil(c.expires_at); return d !== null && d > 0 && d <= 30; }).length,
     expired:  certs.filter(c => { const d = daysUntil(c.expires_at); return d !== null && d <= 0; }).length,
   };
+
+  // Sort soonest-expiring first so at-risk certs surface at the top of the
+  // table; unknown expiry (expires_at 0 → null) sinks to the bottom.
+  const sortedCerts = useMemo(
+    () => [...certs].sort((a, b) => (daysUntil(a.expires_at) ?? Infinity) - (daysUntil(b.expires_at) ?? Infinity)),
+    [certs],
+  );
 
   async function submitAcme() {
     const domains = acmeDomains.split(/[\s,]+/).map(s => s.trim()).filter(Boolean);
@@ -378,6 +385,11 @@ export default function CertificatesPage() {
       <motion.div className="panel" variants={fadeUp}>
         <div className="ph">
           <div className="ptitle">📜 Installed Certificates ({certs.length})</div>
+          {(counts.expiring + counts.expired) > 0 && (
+            <span className={`bdg ${counts.expired > 0 ? "br" : "ba"}`}><span className="bdr" />
+              {counts.expired > 0 ? `${counts.expired} expired · ` : ""}{counts.expiring} expiring ≤30d
+            </span>
+          )}
         </div>
         <div className="tw">
           {loading ? (
@@ -390,7 +402,7 @@ export default function CertificatesPage() {
             <table>
               <thead><tr><th>Domain</th><th>Protects</th><th>Source</th><th>Status</th><th>Expiry</th><th>Lifetime</th><th>Actions</th></tr></thead>
               <tbody>
-                {certs.map((c, idx) => {
+                {sortedCerts.map((c, idx) => {
                   const src = sourceLabel(c.source);
                   const st = statusOf(c);
                   const isAcme = typeof c.source === "object" && "acme" in c.source;
