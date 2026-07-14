@@ -4263,6 +4263,7 @@ fn log_request(ctx: &RequestContext) {
     // flusher, when ClickHouse is configured). Cheap; no-op when CH is off.
     let blocked = matches!(ctx.decision, WafDecision::Block | WafDecision::Challenge);
     record_traffic(
+        ctx.tenant_id.as_deref().unwrap_or(""),
         ctx.site_id.as_deref().unwrap_or("-"),
         blocked,
         ctx.elapsed_ms(),
@@ -4281,23 +4282,25 @@ struct SiteAccum {
     lat: Vec<f64>,
 }
 
+// Keyed by (tenant, site) so per-tenant traffic never merges across tenants.
 static TRAFFIC_ACC: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, SiteAccum>>,
+    std::sync::Mutex<std::collections::HashMap<(String, String), SiteAccum>>,
 > = std::sync::OnceLock::new();
 
-fn traffic_acc() -> &'static std::sync::Mutex<std::collections::HashMap<String, SiteAccum>> {
+fn traffic_acc() -> &'static std::sync::Mutex<std::collections::HashMap<(String, String), SiteAccum>>
+{
     TRAFFIC_ACC.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 /// Record one request into the current second's tally. Latency samples are
-/// capped per-site to bound memory under floods.
-fn record_traffic(site: &str, blocked: bool, latency_ms: f64) {
+/// capped per (tenant,site) to bound memory under floods.
+fn record_traffic(tenant: &str, site: &str, blocked: bool, latency_ms: f64) {
     // No sink → no accumulation (the drainer only runs when ClickHouse is on).
     if !CLICKHOUSE_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
     if let Ok(mut m) = traffic_acc().lock() {
-        let e = m.entry(site.to_string()).or_default();
+        let e = m.entry((tenant.to_string(), site.to_string())).or_default();
         e.reqs += 1;
         if blocked {
             e.blocked += 1;
@@ -4315,7 +4318,7 @@ fn drain_traffic(ts: i64) -> Vec<sentinel_storage::TrafficRow> {
         Err(_) => return Vec::new(),
     };
     let mut out = Vec::with_capacity(m.len());
-    for (site, mut a) in m.drain() {
+    for ((tenant, site), mut a) in m.drain() {
         a.lat
             .sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
         let p99 = if a.lat.is_empty() {
@@ -4326,6 +4329,7 @@ fn drain_traffic(ts: i64) -> Vec<sentinel_storage::TrafficRow> {
         };
         out.push(sentinel_storage::TrafficRow {
             ts,
+            tenant,
             site_id: site,
             reqs: a.reqs as i64,
             blocked: a.blocked as i64,
@@ -4676,6 +4680,7 @@ fn ndjson_log(ctx: &RequestContext) {
         _ => "PASS",
     };
     let site = ctx.site_id.as_deref().unwrap_or("-");
+    let tenant = ctx.tenant_id.as_deref().unwrap_or("");
 
     let access = serde_json::json!({
         "ts":      ts,
@@ -4686,6 +4691,7 @@ fn ndjson_log(ctx: &RequestContext) {
         "latency": format!("{:.2}", ctx.elapsed_ms()),
         "bytes":    ctx.bytes_sent,
         "site":     site,
+        "tenant":   tenant,
         "protocol": protocol_label(ctx.http_version),
         "ua":       ua,
         "action":   action,
@@ -4724,6 +4730,7 @@ fn ndjson_log(ctx: &RequestContext) {
             "attack": attack,
             "action": action,
             "site":   site,
+            "tenant": tenant,
             "protocol": protocol_label(ctx.http_version),
             "msg":    ctx.block_reason.as_deref().unwrap_or(""),
             "would_block": ctx.would_block,

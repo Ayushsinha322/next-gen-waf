@@ -126,6 +126,7 @@ type wafEvent struct {
 	Rule   string `json:"rule"`
 	IP     string `json:"ip"`
 	Site   string `json:"site"`
+	Tenant string `json:"tenant"`
 	Sev    string `json:"sev"`
 	Attack string `json:"attack"`
 	Path   string `json:"path"`
@@ -142,11 +143,17 @@ func (e *Engine) onWaf(data json.RawMessage) {
 	}
 	now := time.Now()
 	sev := strings.ToLower(ev.Sev)
+	// Attribute the alert to the owning tenant (the proxy now tags every event
+	// with it); fall back to the default tenant for untagged events.
+	effTenant := ev.Tenant
+	if effTenant == "" {
+		effTenant = e.tenantID
+	}
 
 	// Condition 1 — repeat offender: one IP blocked many times in the window.
 	if ev.IP != "" {
 		if n := e.bumpWindow(e.ipWindow, ev.IP, now); n >= e.cfg.OffenderThreshold {
-			e.raise("offender:"+ev.IP, db.CreateAlertRequest{
+			e.raiseForTenant(effTenant, "offender:"+ev.IP, db.CreateAlertRequest{
 				Severity: "high",
 				Kind:     "repeat_offender",
 				Summary:  fmt.Sprintf("IP %s blocked %d times in %s", ev.IP, n, e.cfg.SpikeWindow),
@@ -158,7 +165,7 @@ func (e *Engine) onWaf(data json.RawMessage) {
 	// Condition 2 — attack spike: a site sees a burst of blocks in the window.
 	if ev.Site != "" && ev.Site != "-" {
 		if n := e.bumpWindow(e.siteWindow, ev.Site, now); n >= e.cfg.SpikeThreshold {
-			e.raise("spike:"+ev.Site, db.CreateAlertRequest{
+			e.raiseForTenant(effTenant, "spike:"+ev.Site, db.CreateAlertRequest{
 				Severity: "critical",
 				Kind:     "attack_spike",
 				Summary:  fmt.Sprintf("Attack spike on %s — %d blocks in %s", ev.Site, n, e.cfg.SpikeWindow),
@@ -173,7 +180,7 @@ func (e *Engine) onWaf(data json.RawMessage) {
 		// just rule+IP — otherwise blocks with no rule/IP collapse to one bucket
 		// ("sev::") and distinct critical events coalesce into a single alert.
 		throttleKey := fmt.Sprintf("sev:%s:%s:%s:%s", sev, attackKind(ev.Attack, ev.Rule), ev.Site, ev.IP)
-		e.raise(throttleKey, db.CreateAlertRequest{
+		e.raiseForTenant(effTenant, throttleKey, db.CreateAlertRequest{
 			Severity: sev,
 			Kind:     attackKind(ev.Attack, ev.Rule),
 			Summary:  fmt.Sprintf("%s blocked on %s (rule %s) from %s", capitalize(attackKind(ev.Attack, ev.Rule)), siteOr(ev.Site), ev.Rule, ev.IP),
@@ -202,20 +209,32 @@ func (e *Engine) Raise(throttleKey string, req db.CreateAlertRequest, na notify.
 	e.raise(throttleKey, req, na)
 }
 
-// raise persists, republishes, and dispatches an alert unless throttled.
+// raise persists+dispatches under the default tenant (used by the exported
+// Raise wrapper and the node-health/cert monitors).
 func (e *Engine) raise(throttleKey string, req db.CreateAlertRequest, na notify.Alert) {
+	e.raiseForTenant(e.tenantID, throttleKey, req, na)
+}
+
+// raiseForTenant persists, republishes, and dispatches an alert attributed to a
+// specific tenant, unless throttled. The throttle bucket is namespaced by
+// tenant so one tenant's activity never suppresses another's.
+func (e *Engine) raiseForTenant(tenantID, throttleKey string, req db.CreateAlertRequest, na notify.Alert) {
+	if tenantID == "" {
+		tenantID = e.tenantID
+	}
+	key := tenantID + "|" + throttleKey
 	e.mu.Lock()
-	if last, ok := e.lastRaise[throttleKey]; ok && time.Since(last) < e.cfg.Throttle {
+	if last, ok := e.lastRaise[key]; ok && time.Since(last) < e.cfg.Throttle {
 		e.mu.Unlock()
 		return
 	}
-	e.lastRaise[throttleKey] = time.Now()
+	e.lastRaise[key] = time.Now()
 	e.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	row, err := e.store.CreateAlert(ctx, e.tenantID, e.userID, req)
+	row, err := e.store.CreateAlert(ctx, tenantID, e.userID, req)
 	if err != nil {
 		e.log.Warn("alert persist failed", zap.Error(err), zap.String("kind", req.Kind))
 		return
@@ -223,6 +242,7 @@ func (e *Engine) raise(throttleKey string, req db.CreateAlertRequest, na notify.
 	na.ID = row.ID
 	na.Summary = req.Summary
 	na.CreatedAt = row.CreatedAt
+	na.Tenant = tenantID
 
 	// Live SSE: surface the alert on the dashboard immediately.
 	e.publishToHub(row)
@@ -265,7 +285,12 @@ func (e *Engine) publishToHub(row *db.AlertRow) {
 }
 
 func (e *Engine) dispatch(ctx context.Context, na notify.Alert) {
-	rows, err := e.store.ListChannels(ctx, e.tenantID, e.userID)
+	// Route to the owning tenant's channels (na.Tenant), not a fixed tenant.
+	tenantID := na.Tenant
+	if tenantID == "" {
+		tenantID = e.tenantID
+	}
+	rows, err := e.store.ListChannels(ctx, tenantID, e.userID)
 	if err != nil || len(rows) == 0 {
 		return
 	}
@@ -278,7 +303,7 @@ func (e *Engine) dispatch(ctx context.Context, na notify.Alert) {
 	}
 	results := e.dispatcher.Dispatch(ctx, na, channels)
 	for _, res := range results {
-		if err := e.store.RecordChannelDelivery(ctx, e.tenantID, e.userID, res.ChannelID, res.Status()); err != nil {
+		if err := e.store.RecordChannelDelivery(ctx, tenantID, e.userID, res.ChannelID, res.Status()); err != nil {
 			e.log.Debug("record delivery failed", zap.Error(err))
 		}
 		if !res.OK {

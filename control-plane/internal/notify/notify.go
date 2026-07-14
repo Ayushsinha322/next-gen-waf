@@ -29,6 +29,7 @@ type Alert struct {
 	Severity  string                 `json:"severity"`
 	Kind      string                 `json:"kind"`
 	Summary   string                 `json:"summary"`
+	Tenant    string                 `json:"tenant,omitempty"`
 	Site      string                 `json:"site,omitempty"`
 	SourceIP  string                 `json:"source_ip,omitempty"`
 	Rule      string                 `json:"rule,omitempty"`

@@ -170,10 +170,11 @@ func (c *Client) Status(ctx context.Context, tenant string) (map[string]any, err
 		Events  int64 `json:"events"`
 		Traffic int64 `json:"traffic"`
 	}
-	// Event count is tenant-scoped; traffic_buckets is aggregate (no tenant col).
+	// Both counts are tenant-scoped now (traffic_buckets gained a tenant column).
 	err := c.queryJSON(ctx, fmt.Sprintf(
 		"SELECT (SELECT count() FROM %s.waf_events WHERE tenant = '%s') AS events, "+
-			"(SELECT count() FROM %s.traffic_buckets) AS traffic", c.db, esc(tenant), c.db), &rows)
+			"(SELECT count() FROM %s.traffic_buckets WHERE tenant = '%s') AS traffic",
+		c.db, esc(tenant), c.db, esc(tenant)), &rows)
 	if err != nil {
 		return map[string]any{"configured": true, "reachable": false, "error": err.Error()}, nil
 	}
@@ -237,17 +238,19 @@ func (c *Client) Search(ctx context.Context, f SearchFilter) ([]Event, error) {
 	return out, nil
 }
 
-// Timeline returns per-bucket total/blocked counts from traffic_buckets.
-func (c *Client) Timeline(ctx context.Context, from, to int64, bucketSecs int) ([]TimelineBucket, error) {
+// Timeline returns per-bucket total/blocked counts from traffic_buckets,
+// scoped to the given tenant.
+func (c *Client) Timeline(ctx context.Context, tenant string, from, to int64, bucketSecs int) ([]TimelineBucket, error) {
 	if bucketSecs <= 0 {
 		bucketSecs = 60
 	}
+	where := append(c.timeWhere(from, to), eq("tenant", tenant))
 	sql := fmt.Sprintf(
 		"SELECT toUnixTimestamp(toStartOfInterval(ts, INTERVAL %d SECOND)) AS ts, "+
 			"sum(reqs) AS total, sum(blocked) AS blocked "+
 			"FROM %s.traffic_buckets WHERE %s "+
 			"GROUP BY ts ORDER BY ts",
-		bucketSecs, c.db, strings.Join(c.timeWhere(from, to), " AND "))
+		bucketSecs, c.db, strings.Join(where, " AND "))
 	var out []TimelineBucket
 	if err := c.queryJSON(ctx, sql, &out); err != nil {
 		return nil, err

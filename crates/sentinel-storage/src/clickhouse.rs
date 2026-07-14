@@ -38,6 +38,10 @@ type HyperClient = Client<HttpConnector, Full<Bytes>>;
 pub struct TrafficRow {
     /// Unix timestamp (seconds).
     pub ts: i64,
+    /// Owning tenant.  Empty on rows written before per-tenant scoping existed
+    /// (hidden from every tenant, fail-closed).
+    #[serde(default)]
+    pub tenant: String,
     /// Site identifier.  Empty string = aggregate / unattributed.
     pub site_id: String,
     /// Total requests during this second.
@@ -166,11 +170,11 @@ impl ClickHouseClient {
 
         self.exec(format!(
             "CREATE TABLE IF NOT EXISTS {db}.traffic_buckets \
-             (ts DateTime, site_id LowCardinality(String), \
+             (ts DateTime, tenant LowCardinality(String), site_id LowCardinality(String), \
               reqs Int64, blocked Int64, p99_ms Float64) \
              ENGINE = MergeTree() \
              PARTITION BY toYYYYMM(ts) \
-             ORDER BY (site_id, ts) \
+             ORDER BY (tenant, site_id, ts) \
              TTL ts + INTERVAL 30 DAY \
              SETTINGS index_granularity = 8192",
             db = self.database
@@ -210,6 +214,15 @@ impl ClickHouseClient {
         // (fail-closed), never shown cross-tenant.
         self.exec(format!(
             "ALTER TABLE {db}.waf_events \
+             ADD COLUMN IF NOT EXISTS tenant LowCardinality(String) DEFAULT ''",
+            db = self.database
+        ))
+        .await?;
+
+        // Additive online migration: per-tenant scoping on traffic_buckets too
+        // (empty on pre-existing rows → hidden from every tenant, fail-closed).
+        self.exec(format!(
+            "ALTER TABLE {db}.traffic_buckets \
              ADD COLUMN IF NOT EXISTS tenant LowCardinality(String) DEFAULT ''",
             db = self.database
         ))
@@ -290,7 +303,7 @@ impl ClickHouseClient {
 
         let mut sql = format!(
             "INSERT INTO {db}.traffic_buckets \
-             (ts, site_id, reqs, blocked, p99_ms) \
+             (ts, tenant, site_id, reqs, blocked, p99_ms) \
              FORMAT JSONEachRow\n",
             db = self.database
         );
@@ -309,7 +322,7 @@ impl ClickHouseClient {
         limit: u32,
     ) -> Result<Vec<TrafficRow>, StorageError> {
         let sql = format!(
-            "SELECT toUnixTimestamp(ts) AS ts, site_id, reqs, blocked, p99_ms \
+            "SELECT toUnixTimestamp(ts) AS ts, tenant, site_id, reqs, blocked, p99_ms \
              FROM {db}.traffic_buckets \
              WHERE ts >= toDateTime({from}) AND ts <= toDateTime({to}) \
              ORDER BY ts LIMIT {limit} \
@@ -332,11 +345,11 @@ impl ClickHouseClient {
         limit: u32,
     ) -> Result<Vec<TrafficRow>, StorageError> {
         let sql = format!(
-            "SELECT toUnixTimestamp(toStartOfMinute(ts)) AS ts, site_id, \
+            "SELECT toUnixTimestamp(toStartOfMinute(ts)) AS ts, tenant, site_id, \
              sum(reqs) AS reqs, sum(blocked) AS blocked, avg(p99_ms) AS p99_ms \
              FROM {db}.traffic_buckets \
              WHERE ts >= toDateTime({from}) AND ts <= toDateTime({to}) \
-             GROUP BY site_id, toStartOfMinute(ts) \
+             GROUP BY tenant, site_id, toStartOfMinute(ts) \
              ORDER BY ts LIMIT {limit} \
              SETTINGS output_format_json_quote_64bit_integers = 0 \
              FORMAT JSONEachRow",
@@ -447,6 +460,7 @@ mod tests {
     fn traffic_row_json_roundtrip() {
         let row = TrafficRow {
             ts: 1_700_000_000,
+            tenant: "t1".to_string(),
             site_id: "site1".to_string(),
             reqs: 42,
             blocked: 3,
@@ -494,6 +508,7 @@ mod tests {
         let rows = vec![
             TrafficRow {
                 ts: now - 5,
+                tenant: "t1".into(),
                 site_id: "s1".into(),
                 reqs: 10,
                 blocked: 1,
@@ -501,6 +516,7 @@ mod tests {
             },
             TrafficRow {
                 ts: now - 4,
+                tenant: "t1".into(),
                 site_id: "s1".into(),
                 reqs: 20,
                 blocked: 0,
@@ -508,6 +524,7 @@ mod tests {
             },
             TrafficRow {
                 ts: now - 3,
+                tenant: "t1".into(),
                 site_id: "s1".into(),
                 reqs: 15,
                 blocked: 2,

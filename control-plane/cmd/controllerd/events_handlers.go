@@ -69,7 +69,7 @@ func handleEventsTimeline(c *gin.Context, enf *rbac.Enforcer, ch *clickhouse.Cli
 		c.JSON(http.StatusOK, gin.H{"buckets": []any{}, "clickhouse": false})
 		return
 	}
-	buckets, err := ch.Timeline(c.Request.Context(), atoi64(c.Query("from")), atoi64(c.Query("to")), int(atoi64(c.Query("bucket"))))
+	buckets, err := ch.Timeline(c.Request.Context(), claims.TenantID, atoi64(c.Query("from")), atoi64(c.Query("to")), int(atoi64(c.Query("bucket"))))
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
 		return
