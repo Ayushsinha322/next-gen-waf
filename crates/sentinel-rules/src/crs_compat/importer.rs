@@ -331,7 +331,13 @@ fn token_to_target(tok: &str) -> Option<Target> {
         "FILES_COMBINED_SIZE" => Some(Target::FilesCombinedSize),
         // No on-disk temp files in a streaming proxy; per-file sizes unmodeled.
         "FILES_TMPNAMES" | "FILES_SIZES" | "FILES_TMP_CONTENT" => None,
-        "XML" | "MULTIPART_FILENAME" | "MULTIPART_NAME" => None,
+        // XML/SOAP bodies are flattened into ARGS by the VM (element text,
+        // attribute values, CDATA), so an `XML`/`XML:/xpath` target maps to
+        // ARGS. The XPath sub-selector is dropped — we inspect the whole
+        // flattened body rather than evaluating XPath, which is enough to catch
+        // injection payloads carried inside XML.
+        "XML" => Some(Target::Args),
+        "MULTIPART_FILENAME" | "MULTIPART_NAME" => None,
         other => {
             warn!(
                 target = other,

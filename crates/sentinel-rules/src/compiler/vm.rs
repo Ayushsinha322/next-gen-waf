@@ -409,9 +409,194 @@ fn body_args(ctx: &RequestContext) -> Vec<(String, String)> {
         // injection delivered through a multipart body is inspected the same
         // way.  File parts are surfaced via the FILES* targets, not ARGS.
         multipart_parts(ctx).fields
+    } else if is_xml_content_type(&ct) {
+        // XML / SOAP bodies: surface element text, attribute values, and CDATA
+        // into ARGS so payloads delivered inside XML reach the same operators
+        // as form/JSON parameters (SOAP APIs are a common injection vector).
+        parse_xml_args(body)
     } else {
         Vec::new()
     }
+}
+
+/// True for XML and SOAP content types — `text/xml`, `application/xml`,
+/// `application/soap+xml`, and any `…+xml` suffix (e.g. `application/rss+xml`).
+fn is_xml_content_type(ct: &str) -> bool {
+    ct.starts_with("text/xml")
+        || ct.starts_with("application/xml")
+        || ct.starts_with("application/soap+xml")
+        || ct.contains("+xml")
+}
+
+/// Flatten an XML/SOAP body into ModSecurity-style `(name, value)` pairs.
+///
+/// This is a detection-oriented extractor, **not** a validating parser: it
+/// surfaces every element's text content (keyed by the element's local name),
+/// every attribute value (keyed by the attribute name), and every CDATA section
+/// — decoding the standard XML entities — so injection delivered inside XML
+/// reaches the ARGS operators. Comments, processing instructions, DOCTYPE
+/// declarations, namespaces, and DTDs are ignored. Malformed input fails open
+/// (extracts what it can). Byte offsets only ever land on ASCII delimiters
+/// (`<`, `>`, `]]>`, …), so all `&str` slicing stays on char boundaries.
+fn parse_xml_args(body: &[u8]) -> Vec<(String, String)> {
+    let text = String::from_utf8_lossy(body);
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut cur_elem = String::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            // Text node — runs up to the next tag.
+            let end = text[i..].find('<').map(|p| i + p).unwrap_or(bytes.len());
+            let chunk = &text[i..end];
+            if !chunk.trim().is_empty() {
+                out.push((cur_elem.clone(), decode_xml_entities(chunk)));
+            }
+            i = end;
+            continue;
+        }
+
+        // A markup construct beginning at `<`.
+        if text[i..].starts_with("<!--") {
+            match text[i + 4..].find("-->") {
+                Some(rel) => i += 4 + rel + 3,
+                None => break,
+            }
+        } else if text[i..].starts_with("<![CDATA[") {
+            let start = i + 9;
+            match text[start..].find("]]>") {
+                Some(rel) => {
+                    let content = &text[start..start + rel];
+                    if !content.trim().is_empty() {
+                        out.push((cur_elem.clone(), content.to_owned()));
+                    }
+                    i = start + rel + 3;
+                }
+                None => break,
+            }
+        } else if text[i..].starts_with("<?") || text[i..].starts_with("<!") {
+            // Processing instruction / DOCTYPE / declaration — skip to `>`.
+            match text[i..].find('>') {
+                Some(rel) => i += rel + 1,
+                None => break,
+            }
+        } else {
+            // Element start or end tag.
+            let Some(rel) = text[i + 1..].find('>') else {
+                break;
+            };
+            let inner = text[i + 1..i + 1 + rel].trim();
+            i = i + 1 + rel + 1;
+            if let Some(_close) = inner.strip_prefix('/') {
+                // Closing tag — the element's text context ends.
+                cur_elem.clear();
+            } else {
+                // Opening or self-closing tag: `name attr="v" .../`.
+                let body_str = inner.trim_end_matches('/').trim();
+                let name_end = body_str.find(char::is_whitespace).unwrap_or(body_str.len());
+                cur_elem = local_name(&body_str[..name_end]);
+                extract_xml_attributes(&body_str[name_end..], &mut out);
+            }
+        }
+    }
+
+    out
+}
+
+/// The local part of a possibly namespace-prefixed XML name
+/// (`soap:Envelope` → `Envelope`).
+fn local_name(raw: &str) -> String {
+    raw.rsplit(':').next().unwrap_or(raw).to_owned()
+}
+
+/// Extract `name="value"` / `name='value'` attribute pairs from the portion of
+/// a start tag after the element name, decoding XML entities in each value.
+fn extract_xml_attributes(attrs: &str, out: &mut Vec<(String, String)>) {
+    let chars: Vec<char> = attrs.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+    while i < n {
+        while i < n && chars[i].is_whitespace() {
+            i += 1;
+        }
+        let name_start = i;
+        while i < n && chars[i] != '=' && !chars[i].is_whitespace() {
+            i += 1;
+        }
+        let name: String = chars[name_start..i].iter().collect();
+        while i < n && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i < n && chars[i] == '=' {
+            i += 1;
+            while i < n && chars[i].is_whitespace() {
+                i += 1;
+            }
+            if i < n && (chars[i] == '"' || chars[i] == '\'') {
+                let quote = chars[i];
+                i += 1;
+                let val_start = i;
+                while i < n && chars[i] != quote {
+                    i += 1;
+                }
+                let val: String = chars[val_start..i].iter().collect();
+                if i < n {
+                    i += 1; // consume the closing quote
+                }
+                if !name.is_empty() {
+                    out.push((name, decode_xml_entities(&val)));
+                }
+            }
+        }
+    }
+}
+
+/// Decode the five predefined XML entities plus numeric character references
+/// (`&#NN;` / `&#xHH;`). Unknown entities are left verbatim.
+fn decode_xml_entities(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_owned();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(pos) = rest.find('&') {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos..];
+        let Some(semi) = after.find(';') else {
+            out.push('&');
+            rest = &after[1..];
+            continue;
+        };
+        let entity = &after[1..semi];
+        let decoded = match entity {
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "amp" => Some('&'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            _ => entity.strip_prefix('#').and_then(|num| {
+                let cp = match num.strip_prefix(['x', 'X']) {
+                    Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                    None => num.parse::<u32>().ok(),
+                };
+                cp.and_then(char::from_u32)
+            }),
+        };
+        match decoded {
+            Some(c) => {
+                out.push(c);
+                rest = &after[semi + 1..];
+            }
+            None => {
+                // Not a recognised entity — keep the literal `&` and continue.
+                out.push('&');
+                rest = &after[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn extract_target(spec: &TargetSpec, ctx: &RequestContext) -> Vec<String> {
@@ -1327,5 +1512,96 @@ fn pop_numeric_f64(stack: &mut Vec<StackVal>) -> f64 {
             warn!("VM: stack underflow on pop_numeric");
             0.0
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// XML / SOAP body extraction tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod xml_tests {
+    use super::*;
+
+    #[test]
+    fn xml_content_type_detection() {
+        assert!(is_xml_content_type("text/xml"));
+        assert!(is_xml_content_type("application/xml; charset=utf-8"));
+        assert!(is_xml_content_type("application/soap+xml; action=\"x\""));
+        assert!(is_xml_content_type("application/rss+xml"));
+        assert!(!is_xml_content_type("application/json"));
+        assert!(!is_xml_content_type("text/html"));
+    }
+
+    #[test]
+    fn xml_extracts_element_text_and_attributes() {
+        let body = br#"<order id="42"><item cat="books">' OR 1=1--</item></order>"#;
+        let pairs = parse_xml_args(body);
+        assert!(
+            pairs.iter().any(|(k, v)| k == "id" && v == "42"),
+            "attribute value must be surfaced: {pairs:?}"
+        );
+        assert!(pairs.iter().any(|(k, v)| k == "cat" && v == "books"));
+        assert!(
+            pairs.iter().any(|(k, v)| k == "item" && v == "' OR 1=1--"),
+            "element text keyed by local element name: {pairs:?}"
+        );
+    }
+
+    #[test]
+    fn xml_decodes_entities_and_cdata() {
+        let body = br#"<a>&lt;script&gt;</a><b><![CDATA[<xss>alert(1)</xss>]]></b>"#;
+        let pairs = parse_xml_args(body);
+        assert!(
+            pairs.iter().any(|(_, v)| v == "<script>"),
+            "entities decoded: {pairs:?}"
+        );
+        assert!(
+            pairs.iter().any(|(_, v)| v == "<xss>alert(1)</xss>"),
+            "CDATA content surfaced raw: {pairs:?}"
+        );
+    }
+
+    #[test]
+    fn xml_strips_namespace_prefixes_soap() {
+        let body =
+            br#"<soap:Envelope><soap:Body><q>select * from users</q></soap:Body></soap:Envelope>"#;
+        let pairs = parse_xml_args(body);
+        assert!(
+            pairs
+                .iter()
+                .any(|(k, v)| k == "q" && v == "select * from users"),
+            "namespace prefix stripped to local name: {pairs:?}"
+        );
+    }
+
+    #[test]
+    fn xml_ignores_comments_pi_and_doctype() {
+        let body = br#"<?xml version="1.0"?><!DOCTYPE x><!-- <injected> --><root>data</root>"#;
+        let pairs = parse_xml_args(body);
+        assert!(pairs.iter().any(|(k, v)| k == "root" && v == "data"));
+        assert!(
+            !pairs.iter().any(|(_, v)| v.contains("injected")),
+            "comment content must not leak into ARGS: {pairs:?}"
+        );
+    }
+
+    #[test]
+    fn xml_entity_decoding_numeric_and_unknown() {
+        assert_eq!(decode_xml_entities("&#60;&#x3E;"), "<>");
+        assert_eq!(decode_xml_entities("a &amp; b"), "a & b");
+        assert_eq!(decode_xml_entities("no entities here"), "no entities here");
+        // Unknown entities are preserved verbatim (fail open, don't drop data).
+        assert_eq!(decode_xml_entities("&bogus;x"), "&bogus;x");
+    }
+
+    #[test]
+    fn xml_malformed_fails_open() {
+        // Unterminated tag / truncated body must not panic and should still
+        // surface whatever text it can.
+        let pairs = parse_xml_args(b"<a>hello");
+        assert!(pairs.iter().any(|(k, v)| k == "a" && v == "hello"));
+        let _ = parse_xml_args(b"<a href=\"unterminated");
+        let _ = parse_xml_args(b"<![CDATA[unterminated");
     }
 }
