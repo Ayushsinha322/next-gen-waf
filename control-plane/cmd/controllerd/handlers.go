@@ -71,6 +71,15 @@ func handleLogin(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store, hub *
 		return
 	}
 
+	// Brute-force lockout: reject early if the account is currently locked out
+	// after too many recent failures.
+	loginKey := strings.ToLower(strings.TrimSpace(req.Email))
+	if locked, wait := loginAttempts.locked(loginKey); locked {
+		c.Header("Retry-After", fmt.Sprintf("%d", int(wait.Seconds())+1))
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "too many failed attempts; try again later"})
+		return
+	}
+
 	// Validate credentials.  When a DB pool is available we check the users
 	// table; otherwise fall back to the hardcoded dev backdoor.
 	var claims auth.Claims
@@ -80,6 +89,7 @@ func handleLogin(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store, hub *
 			db.DevTenantID, req.Email, req.Password)
 		if err != nil || !ok {
 			loginResult = "FAILURE"
+			loginAttempts.recordFailure(loginKey)
 			writeAuditEntry(c, store, hub, &db.WriteAuditRequest{
 				TenantID:   db.DevTenantID,
 				Action:     "user.login",
@@ -109,6 +119,7 @@ func handleLogin(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store, hub *
 			return
 		}
 		if req.Email != "admin@sentinel.local" || req.Password != "admin123" {
+			loginAttempts.recordFailure(loginKey)
 			writeAuditEntry(c, nil, hub, &db.WriteAuditRequest{
 				TenantID:   db.DevTenantID,
 				Action:     "user.login",
@@ -124,6 +135,8 @@ func handleLogin(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store, hub *
 			AuthMethod: "password",
 		}
 	}
+
+	loginAttempts.recordSuccess(loginKey)
 
 	pair, err := jwtSvc.IssueTokenPair(claims)
 	if err != nil {
@@ -180,6 +193,39 @@ func handleRefresh(c *gin.Context, jwtSvc *auth.JWTService) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"access_token": accessToken, "token_type": "Bearer"})
+}
+
+// handleLogout revokes the caller's current access token (and, if supplied, the
+// refresh token) by adding their jti to the shared denylist — so the session is
+// dead across the whole HA cluster, not just this node. Mounted on the
+// authenticated (protected) group so the access-token claims are available.
+func handleLogout(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store) {
+	claims, ok := auth.GetClaims(c.Request.Context())
+	if !ok || claims == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "not authenticated"})
+		return
+	}
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
+		return
+	}
+	// Revoke the current access token.
+	if claims.ID != "" && claims.ExpiresAt != nil {
+		if err := store.RevokeToken(c.Request.Context(), claims.ID, claims.ExpiresAt.Time); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	// Best-effort: also revoke the refresh token if the client sends it.
+	var body struct {
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := c.ShouldBindJSON(&body); err == nil && body.RefreshToken != "" {
+		if rc, err := jwtSvc.Validate(body.RefreshToken); err == nil && rc.ID != "" && rc.ExpiresAt != nil {
+			_ = store.RevokeToken(c.Request.Context(), rc.ID, rc.ExpiresAt.Time)
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
 // oidcStateCookie holds the per-login CSRF state that binds the /login redirect

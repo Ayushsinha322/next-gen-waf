@@ -75,6 +75,17 @@ type TokenPair struct {
 type JWTService struct {
 	cfg JWTConfig
 	key []byte
+	// revoked, if set, reports whether a token's jti has been revoked (logout /
+	// forced sign-out). Injected from main() so the auth package needn't import
+	// db. Called on every Validate, so it should be cheap.
+	revoked func(jti string) bool
+}
+
+// SetRevocationChecker wires a jti-denylist check into Validate. Every token
+// path (HTTP middleware, gRPC, SSE, refresh) goes through Validate, so a single
+// check here covers them all.
+func (s *JWTService) SetRevocationChecker(f func(jti string) bool) {
+	s.revoked = f
 }
 
 // NewJWTService creates a JWTService. If cfg.Secret is empty, a random 256-bit
@@ -174,6 +185,11 @@ func (s *JWTService) Validate(tokenString string) (*Claims, error) {
 
 	claims, ok := token.Claims.(*Claims)
 	if !ok || !token.Valid {
+		return nil, ErrTokenInvalid
+	}
+	// Denylist check (logout / forced revocation). Covers all token paths since
+	// they all funnel through Validate.
+	if s.revoked != nil && claims.ID != "" && s.revoked(claims.ID) {
 		return nil, ErrTokenInvalid
 	}
 	return claims, nil

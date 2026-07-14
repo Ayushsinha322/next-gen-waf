@@ -163,6 +163,32 @@ func run() error {
 			if err := db.EnsureNodesSchema(ctx, pool); err != nil {
 				log.Warn("nodes schema ensure failed (non-fatal)", zap.Error(err))
 			}
+
+			// JWT revocation: consult the shared denylist on every Validate so a
+			// logout kills the session cluster-wide. Fail OPEN on a DB error (a
+			// blip must not lock everyone out). Prune expired rows hourly.
+			jwtSvc.SetRevocationChecker(func(jti string) bool {
+				revoked, err := store.IsTokenRevoked(context.Background(), jti)
+				if err != nil {
+					log.Warn("token revocation check failed (fail-open)", zap.Error(err))
+					return false
+				}
+				return revoked
+			})
+			go func() {
+				t := time.NewTicker(time.Hour)
+				defer t.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-t.C:
+						if _, err := store.CleanupExpiredRevokedTokens(context.Background()); err != nil {
+							log.Warn("revoked-token cleanup failed", zap.Error(err))
+						}
+					}
+				}
+			}()
 		}
 	}
 
@@ -314,6 +340,7 @@ func run() error {
 	protected := router.Group("/api/v1")
 	protected.Use(auth.GinAuthMiddlewareWithAPIKey(jwtSvc, false, apiKeyResolver))
 	{
+		protected.POST("/auth/logout", func(c *gin.Context) { handleLogout(c, jwtSvc, store) })
 		protected.GET("/dashboard/stats", func(c *gin.Context) { handleDashboardStats(c, enforcer, store) })
 		protected.GET("/sites", func(c *gin.Context) { handleListSites(c, enforcer, store) })
 		protected.GET("/sites/export", func(c *gin.Context) { handleExportSites(c, enforcer, store) })
