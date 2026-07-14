@@ -260,6 +260,7 @@ fn secrule_directive_to_rule_with_actions(
         transforms: actions.transforms.clone(),
         skip_after: actions.skip_after.clone(),
         multi_match: actions.multi_match,
+        setvars: actions.setvars.clone(),
     }))
 }
 

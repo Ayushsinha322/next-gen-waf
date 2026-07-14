@@ -2,7 +2,7 @@ use sentinel_core::context::{Phase, RequestContext, RuleMatch, Severity, WafDeci
 use tracing::{debug, warn};
 
 use super::emitter::{CompiledRuleSet, Instruction, RuleMeta, TargetSpec};
-use crate::dsl::ast::{RuleAction, RulePhase, RuleSeverity, Transform};
+use crate::dsl::ast::{RuleAction, RulePhase, RuleSeverity, SetVar, SetVarOp, Transform};
 
 fn rule_phase_to_phase(rp: RulePhase) -> Phase {
     match rp {
@@ -813,6 +813,14 @@ fn fire_rule(ctx: &mut RequestContext, meta: &RuleMeta) {
         ctx.anomaly_score = ctx.anomaly_score.saturating_add(meta.score_delta as u32);
     }
 
+    // Apply setvar mutations to the per-request TX store. Runs whenever the rule
+    // fires — including "silent" score-gate rules below — so category scores
+    // (tx.sql_injection_score, …) and correlation state accumulate for later
+    // rules to read via `TX:` targets.
+    for sv in &meta.setvars {
+        apply_setvar(ctx, sv);
+    }
+
     // Only record in rule_matches when the rule has observable effect.
     // CRS paranoia-level skip-gates (pass, no score, no message) are silent.
     let is_silent = meta.message.is_empty()
@@ -836,6 +844,111 @@ fn fire_rule(ctx: &mut RequestContext, meta: &RuleMeta) {
         score_delta = meta.score_delta,
         "rule fired"
     );
+}
+
+// ---------------------------------------------------------------------------
+// setvar — per-request TX variable mutation
+// ---------------------------------------------------------------------------
+
+/// Apply one `setvar` mutation to the per-request TX store (`ctx.tx_vars`).
+///
+/// `Add`/`Sub` treat the current value and the (macro-expanded) operand as
+/// integers, defaulting a missing/non-numeric value to 0 — matching CRS
+/// category-score accumulation. `Set` stores the macro-expanded string as-is.
+fn apply_setvar(ctx: &mut RequestContext, sv: &SetVar) {
+    match &sv.op {
+        SetVarOp::Unset => {
+            ctx.tx_vars.remove(&sv.name);
+        }
+        SetVarOp::Set(val) => {
+            let expanded = expand_tx_macros(val, ctx);
+            ctx.tx_vars.insert(sv.name.clone(), expanded);
+        }
+        SetVarOp::Add(expr) => {
+            let delta = expand_tx_macros(expr, ctx)
+                .trim()
+                .parse::<i64>()
+                .unwrap_or(0);
+            let cur = tx_var_i64(ctx, &sv.name);
+            ctx.tx_vars
+                .insert(sv.name.clone(), cur.saturating_add(delta).to_string());
+        }
+        SetVarOp::Sub(expr) => {
+            let delta = expand_tx_macros(expr, ctx)
+                .trim()
+                .parse::<i64>()
+                .unwrap_or(0);
+            let cur = tx_var_i64(ctx, &sv.name);
+            ctx.tx_vars
+                .insert(sv.name.clone(), cur.saturating_sub(delta).to_string());
+        }
+    }
+}
+
+/// Read a TX variable as an integer, treating missing/non-numeric as 0.
+fn tx_var_i64(ctx: &RequestContext, name: &str) -> i64 {
+    ctx.tx_vars
+        .get(name)
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+/// Expand `%{...}` macros in a setvar value against the current TX store and the
+/// CRS numeric constants. A macro that resolves to nothing expands to an empty
+/// string (which is treated as 0 in the numeric `Add`/`Sub` context). UTF-8 safe.
+fn expand_tx_macros(input: &str, ctx: &RequestContext) -> String {
+    if !input.contains("%{") {
+        return input.to_owned();
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find("%{") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        match after.find('}') {
+            Some(end) => {
+                out.push_str(&resolve_macro(&after[..end], ctx));
+                rest = &after[end + 1..];
+            }
+            None => {
+                // Unterminated `%{` — emit the literal remainder verbatim.
+                out.push_str(&rest[start..]);
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Resolve a single macro body such as `tx.critical_anomaly_score`. Only `tx.*`
+/// references (and their CRS numeric-constant fallbacks) are modelled; any other
+/// collection resolves to an empty string.
+fn resolve_macro(inner: &str, ctx: &RequestContext) -> String {
+    let lower = inner.trim().to_ascii_lowercase();
+    match lower.strip_prefix("tx.") {
+        Some(var) => {
+            let key = var.to_ascii_uppercase();
+            ctx.tx_vars
+                .get(&key)
+                .cloned()
+                .or_else(|| crs_constant(&key).map(str::to_owned))
+                .unwrap_or_default()
+        }
+        None => String::new(),
+    }
+}
+
+/// CRS numeric constants normally seeded by `crs-setup.conf`. Referenced by
+/// category-score setvars like `setvar:tx.sql_injection_score=+%{tx.critical_anomaly_score}`.
+fn crs_constant(key_upper: &str) -> Option<&'static str> {
+    match key_upper {
+        "CRITICAL_ANOMALY_SCORE" => Some("5"),
+        "ERROR_ANOMALY_SCORE" => Some("4"),
+        "WARNING_ANOMALY_SCORE" => Some("3"),
+        "NOTICE_ANOMALY_SCORE" => Some("2"),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------

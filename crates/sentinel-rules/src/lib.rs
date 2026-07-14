@@ -320,6 +320,85 @@ rule 942200 {
         assert_eq!(ctx.decision, WafDecision::Block);
     }
 
+    // ------------------------------------------------------------------
+    // TX-variable state engine: category-score / correlation rules
+    // ------------------------------------------------------------------
+
+    /// A detection rule writes a category score into the TX store via `setvar`;
+    /// a later correlation rule reads it back with `TX:` and blocks. This is the
+    /// end-to-end proof that arbitrary `tx.*` state now flows between rules
+    /// (previously every non-anomaly-score setvar was dropped, so this was inert).
+    #[test]
+    fn crs_category_score_correlation_rule_fires() {
+        let engine = RuleEngine::from_crs_conf(
+            "SecRule ARGS \"@rx (?i)select\" \"id:9001,phase:2,pass,setvar:tx.sql_injection_score=+5\"\n\
+             SecRule TX:SQL_INJECTION_SCORE \"@ge 5\" \"id:9002,phase:2,block,msg:'Inbound SQLi category correlation'\"",
+        )
+        .unwrap();
+
+        let mut ctx = make_ctx();
+        ctx.uri = "http://example.com/?q=select".parse().unwrap();
+
+        engine.evaluate(&mut ctx, Phase::RequestBody, 0);
+
+        assert_eq!(
+            ctx.tx_vars.get("SQL_INJECTION_SCORE").map(String::as_str),
+            Some("5"),
+            "detection rule must accumulate the category score in the TX store"
+        );
+        assert_eq!(
+            ctx.decision,
+            WafDecision::Block,
+            "correlation rule should block after reading TX:SQL_INJECTION_SCORE"
+        );
+    }
+
+    /// The correlation rule must NOT fire when the category score never crossed
+    /// the threshold — proving the block is driven by real TX state, not a
+    /// spurious match on an absent variable.
+    #[test]
+    fn crs_correlation_does_not_fire_below_threshold() {
+        let engine = RuleEngine::from_crs_conf(
+            "SecRule ARGS \"@rx (?i)select\" \"id:9001,phase:2,pass,setvar:tx.sql_injection_score=+5\"\n\
+             SecRule TX:SQL_INJECTION_SCORE \"@ge 5\" \"id:9002,phase:2,block,msg:'Inbound SQLi category correlation'\"",
+        )
+        .unwrap();
+
+        let mut ctx = make_ctx();
+        // Clean request — the detection rule never matches, so the category
+        // score stays unset (0) and the correlation rule stays silent.
+        ctx.uri = "http://example.com/?q=hello".parse().unwrap();
+
+        engine.evaluate(&mut ctx, Phase::RequestBody, 0);
+
+        assert!(!ctx.tx_vars.contains_key("SQL_INJECTION_SCORE"));
+        assert_ne!(ctx.decision, WafDecision::Block);
+    }
+
+    /// `setvar` values may reference other TX variables / CRS constants via
+    /// `%{...}`; the macro is expanded at fire time. Here the category score is
+    /// incremented by `%{tx.critical_anomaly_score}` (CRS constant = 5).
+    #[test]
+    fn crs_setvar_macro_expands_crs_constant() {
+        let engine = RuleEngine::from_crs_conf(
+            "SecRule ARGS \"@rx (?i)select\" \"id:9101,phase:2,pass,setvar:tx.sql_injection_score=+%{tx.critical_anomaly_score}\"\n\
+             SecRule TX:SQL_INJECTION_SCORE \"@ge 5\" \"id:9102,phase:2,block,msg:'correlation via macro'\"",
+        )
+        .unwrap();
+
+        let mut ctx = make_ctx();
+        ctx.uri = "http://example.com/?q=select".parse().unwrap();
+
+        engine.evaluate(&mut ctx, Phase::RequestBody, 0);
+
+        assert_eq!(
+            ctx.tx_vars.get("SQL_INJECTION_SCORE").map(String::as_str),
+            Some("5"),
+            "%{{tx.critical_anomaly_score}} must expand to the CRS constant 5"
+        );
+        assert_eq!(ctx.decision, WafDecision::Block);
+    }
+
     #[test]
     fn engine_rule_count() {
         let engine = RuleEngine::from_srl(

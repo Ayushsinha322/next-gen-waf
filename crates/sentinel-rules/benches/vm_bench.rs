@@ -31,6 +31,7 @@ fn build_rules(n: usize) -> RuleFile {
                 transforms: vec![],
                 skip_after: None,
                 multi_match: false,
+                setvars: vec![],
             })
         })
         .collect();

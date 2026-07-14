@@ -48,6 +48,42 @@ pub struct RuleDef {
     /// against the fully-transformed value.  Mirrors ModSecurity `multiMatch`.
     #[serde(default)]
     pub multi_match: bool,
+    /// `setvar` mutations applied to the per-request TX store when this rule
+    /// fires. Lets category-score and correlation rules accumulate state
+    /// (e.g. `tx.sql_injection_score`) that later rules read via `TX:` targets.
+    #[serde(default)]
+    pub setvars: Vec<SetVar>,
+}
+
+// ---------------------------------------------------------------------------
+// setvar — per-request TX variable mutation
+// ---------------------------------------------------------------------------
+
+/// A single `setvar` operation attached to a rule, executed when the rule fires
+/// (all its conditions match), mutating the per-request TX variable store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetVar {
+    /// TX variable name, UPPERCASED and WITHOUT the `tx.` prefix. This matches
+    /// the key convention used when reading `TX:` targets (see the CRS importer
+    /// and `TargetSpec::TxVar`), so a value written here is readable by a later
+    /// rule's `TX:NAME` target.
+    pub name: String,
+    pub op: SetVarOp,
+}
+
+/// The mutation a [`SetVar`] applies. Values may contain `%{...}` macros, which
+/// are expanded against the current TX store (and CRS numeric constants) at the
+/// moment the rule fires.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SetVarOp {
+    /// `setvar:!tx.name` — remove the variable.
+    Unset,
+    /// `setvar:tx.name=value` — set to a (possibly macro-expanded) string.
+    Set(String),
+    /// `setvar:tx.name=+expr` — numeric increment by the expanded expression.
+    Add(String),
+    /// `setvar:tx.name=-expr` — numeric decrement by the expanded expression.
+    Sub(String),
 }
 
 /// A single chained condition from a CRS `chain` SecRule.
@@ -73,6 +109,7 @@ impl Default for RuleDef {
             transforms: Vec::new(),
             skip_after: None,
             multi_match: false,
+            setvars: Vec::new(),
         }
     }
 }
