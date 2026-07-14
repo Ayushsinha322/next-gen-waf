@@ -207,6 +207,8 @@ export interface TimelineBucket { ts: number; total: number; blocked: number }
 export interface EventQuery {
   site?: string; country?: string; rule?: string; action?: string;
   ip?: string; protocol?: string; q?: string; from?: number; to?: number; limit?: number;
+  // Query-param bag: also indexable so it can be fed to eventQS().
+  [key: string]: string | number | undefined;
 }
 
 // --- Threat Intelligence -----------------------------------------------------
@@ -248,6 +250,8 @@ export interface IOCPage { items: IOC[]; total: number; limit: number; offset: n
 /** Filters for the IOC browse table (all optional). */
 export interface IOCQuery {
   q?: string; type?: string; tier?: string; source?: string; limit?: number; offset?: number;
+  // Query-param bag: also indexable so it can be fed to eventQS().
+  [key: string]: string | number | undefined;
 }
 
 /** A recent threat-intel-driven enforcement hit (from ClickHouse waf_events). */
@@ -421,7 +425,7 @@ export interface ClusterHealth {
 // ---------------------------------------------------------------------------
 
 /** Build a query string from a filter object, dropping empty values. */
-function eventQS(f: Record<string, string | number | undefined>): string {
+export function eventQS(f: Record<string, unknown>): string {
   const p = new URLSearchParams();
   for (const [k, v] of Object.entries(f)) {
     if (v !== undefined && v !== null && v !== "") p.set(k, String(v));
