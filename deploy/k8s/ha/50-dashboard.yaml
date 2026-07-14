@@ -1,0 +1,74 @@
+# Dashboard (Next.js admin UI). Internal ClusterIP Service — browsers reach it
+# through the data plane's :9443 management console (SENTINEL_MGMT_DASHBOARD_UPSTREAM
+# → this Service), not directly. Two replicas so the UI survives a pod/node loss.
+#
+# NOTE: NEXT_PUBLIC_CONTROL_PLANE_URL is baked into the image at BUILD time (the
+# SSE live-log stream uses it). Build the dashboard image with the external
+# console URL/VIP (e.g. https://172.16.21.80:9443); the Deployment env only
+# mirrors the server-side REST target and does not change the baked value.
+apiVersion: v1
+kind: Service
+metadata:
+  name: sentinel-dashboard
+  namespace: sentinel
+  labels: { app: sentinel, tier: dashboard }
+spec:
+  selector: { app: sentinel, tier: dashboard }
+  ports:
+    - { name: http, port: 3000, targetPort: 3000 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinel-dashboard
+  namespace: sentinel
+  labels: { app: sentinel, tier: dashboard }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: sentinel, tier: dashboard }
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }
+  template:
+    metadata:
+      labels: { app: sentinel, tier: dashboard }
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels: { app: sentinel, tier: dashboard }
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: dashboard
+          image: registry.example.com/sentinel/dashboard:latest   # push your image here
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: http, containerPort: 3000 }
+          env:
+            # Server-side REST proxy target (Next.js rewrites /api/v1 → here).
+            - { name: CONTROL_PLANE_URL, value: "http://sentinel-controlplane:9501" }
+            # Mirrors the build-time value; effective only when the image is built with it.
+            - { name: NEXT_PUBLIC_CONTROL_PLANE_URL, value: "https://172.16.21.80:9443" }
+            - { name: PORT, value: "3000" }
+            - { name: NODE_ENV, value: "production" }
+          readinessProbe:
+            httpGet: { path: /, port: 3000 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits:   { memory: "512Mi" }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sentinel-dashboard-pdb
+  namespace: sentinel
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app: sentinel, tier: dashboard }

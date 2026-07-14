@@ -32,13 +32,18 @@ spec:
     metadata:
       labels: { app: sentinel, tier: dataplane }
     spec:
-      # Never place two WAF pods on the same node → a node loss = at most 1 replica.
+      # Strongly prefer one WAF pod per node (a node loss then costs ≤1 replica),
+      # but PREFERRED not required — so the HPA can scale past the node count and
+      # a rolling update's surge pod can still schedule. topologySpread below adds
+      # even zone distribution. (Use required only if nodes ≥ maxReplicas+1.)
       affinity:
         podAntiAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            - labelSelector:
-                matchLabels: { app: sentinel, tier: dataplane }
-              topologyKey: kubernetes.io/hostname
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels: { app: sentinel, tier: dataplane }
+                topologyKey: kubernetes.io/hostname
       # Also spread evenly across availability zones.
       topologySpreadConstraints:
         - maxSkew: 1
@@ -54,11 +59,22 @@ spec:
           ports:
             - { name: http, containerPort: 8080 }
             - { name: https, containerPort: 8443 }
+            - { name: mgmt, containerPort: 9443 }   # admin console (reverse-proxied)
           env:
             - { name: SENTINEL_CONFIG, value: /etc/sentinel/sentinel.yaml }
             - { name: RUST_LOG, value: "info,sentinel=info" }
             # Shared rate-limit state so limits are fleet-wide (points at the HA Redis).
             - { name: SENTINEL_REDIS_URL, value: "redis://sentinel-redis:6379" }
+            # ClickHouse writer: the data plane bulk-inserts traffic + WAF events
+            # (creates the schema on first connect). Powers Threat Search history.
+            - { name: SENTINEL_CLICKHOUSE_URL, value: "http://sentinel-clickhouse:8123" }
+            - { name: SENTINEL_CLICKHOUSE_DB, value: "sentinel_logs" }
+            - { name: SENTINEL_CLICKHOUSE_USER, value: "sentinel" }
+            - name: SENTINEL_CLICKHOUSE_PASSWORD
+              valueFrom: { secretKeyRef: { name: sentinel-secrets, key: clickhouse-password } }
+            # Management console upstreams — the :9443 listener reverse-proxies these.
+            - { name: SENTINEL_MGMT_DASHBOARD_UPSTREAM, value: "http://sentinel-dashboard:3000" }
+            - { name: SENTINEL_MGMT_API_UPSTREAM, value: "http://sentinel-controlplane:9501" }
             - name: SENTINEL_INTERNAL_SECRET
               valueFrom: { secretKeyRef: { name: sentinel-secrets, key: internal-secret } }
           volumeMounts:
@@ -79,12 +95,15 @@ spec:
             httpGet: { path: /readyz, port: 8080 }
             periodSeconds: 3
             failureThreshold: 2
-          # Startup: also /readyz, so liveness doesn't start counting until the
-          # first sync completes (up to ~30s grace on a cold start).
+          # Startup: /healthz (process-up), NOT /readyz. /readyz returns 503 until
+          # the first config sync (sites>0), which on a cold cluster can exceed the
+          # startup window (CNPG bootstrap + control-plane seed + sync) and would
+          # CrashLoop the whole fleet. Readiness (/readyz) still holds traffic off
+          # until rules load — it removes the pod from the Service, it doesn't kill it.
           startupProbe:
-            httpGet: { path: /readyz, port: 8080 }
+            httpGet: { path: /healthz, port: 8080 }
             periodSeconds: 2
-            failureThreshold: 15   # ~30s grace for config sync before liveness/readiness engage
+            failureThreshold: 30   # ~60s grace for the process to bind :8080
       volumes:
         - name: config
           configMap: { name: sentinel-proxy-config }

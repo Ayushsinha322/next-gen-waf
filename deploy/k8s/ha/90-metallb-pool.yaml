@@ -1,0 +1,53 @@
+# MetalLB address pool — gives the `sentinel-waf-lb` Service a real external VIP
+# on bare metal / private cloud (ESDS). Applied SEPARATELY: it lives in the
+# metallb-system namespace and needs MetalLB installed first, so it is NOT in
+# kustomization.yaml.
+#   helm repo add metallb https://metallb.github.io/metallb
+#   helm install metallb metallb/metallb -n metallb-system --create-namespace
+#   kubectl apply -f 90-metallb-pool.yaml
+#
+# Set the address range to IPs your network routes to the cluster nodes. The
+# first address (172.16.21.80) is the WAF VIP — keep it consistent with the
+# dashboard image's baked NEXT_PUBLIC_CONTROL_PLANE_URL.
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: sentinel-pool
+  namespace: metallb-system
+spec:
+  addresses:
+    - 172.16.21.80-172.16.21.85
+---
+# L2 mode (ARP/NDP) — simplest, works on any L2 network; the VIP lives on one
+# node at a time and fails over to another node in seconds if that node dies.
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: sentinel-l2
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - sentinel-pool
+---
+# BGP mode (RECOMMENDED for true no-SPOF ingress) — multiple nodes advertise the
+# VIP to your routers, so traffic can enter through any of them (ECMP). Requires
+# BGP peering with your network. Uncomment + set your router's ASN/address, then
+# use this INSTEAD of the L2Advertisement above.
+# apiVersion: metallb.io/v1beta1
+# kind: BGPPeer
+# metadata:
+#   name: sentinel-router
+#   namespace: metallb-system
+# spec:
+#   myASN: 64512
+#   peerASN: 64512
+#   peerAddress: 172.16.21.1
+# ---
+# apiVersion: metallb.io/v1beta1
+# kind: BGPAdvertisement
+# metadata:
+#   name: sentinel-bgp
+#   namespace: metallb-system
+# spec:
+#   ipAddressPools:
+#     - sentinel-pool

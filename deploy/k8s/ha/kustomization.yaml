@@ -1,0 +1,27 @@
+# Sentinel WAF — production HA, deployable as one unit:
+#   kubectl apply -k deploy/k8s/ha
+#
+# Prerequisites (installed on the cluster BEFORE apply — see README):
+#   • CloudNativePG operator   (for the Postgres `Cluster` in 30-datastores.yaml)
+#   • A LoadBalancer provider   (MetalLB on bare metal → apply 90-metallb-pool.yaml)
+#   • metrics-server            (for the data-plane HorizontalPodAutoscaler)
+#   • Images pushed to a registry the cluster can pull (replace registry.example.com/*)
+#   • Real values in the sentinel-secrets Secret AND the sentinel-postgres-app
+#     Secret (00-namespace-config.yaml) — the Postgres password must match db-url
+#
+# Applied SEPARATELY (they need extra operators/CRDs or a different namespace, so
+# they are intentionally NOT listed here):
+#   • 70-monitoring.yaml     — needs the Prometheus Operator
+#   • 80-tls.yaml            — needs cert-manager (optional; WAF does its own TLS)
+#   • 90-metallb-pool.yaml   — metallb-system namespace; needs MetalLB
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - 00-namespace-config.yaml   # Namespace + proxy ConfigMap + Secret
+  - 30-datastores.yaml         # Postgres (CNPG) + Redis + ClickHouse
+  - 20-controlplane.yaml       # 3-node Raft control plane
+  - 10-dataplane.yaml          # WAF fleet (Deployment ×3 + HPA + PDB)
+  - 50-dashboard.yaml          # admin UI
+  - 40-loadbalancer.yaml       # external VIP (:80/:443/:9443)
+  - 60-networkpolicy.yaml      # datastore lockdown

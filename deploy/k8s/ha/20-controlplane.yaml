@@ -21,7 +21,6 @@ kind: Service
 metadata:
   name: sentinel-controlplane-headless
   namespace: sentinel
-  labels: { app: sentinel, tier: controlplane }
 spec:
   clusterIP: None                 # headless → stable pod DNS for Raft peers
   publishNotReadyAddresses: true  # peers must resolve each other during election, before "ready"
@@ -35,6 +34,10 @@ kind: Service                     # stable client endpoint (REST API) the data p
 metadata:
   name: sentinel-controlplane
   namespace: sentinel
+  # ServiceMonitor (70-monitoring) matches THIS client Service — ready pods only,
+  # job="sentinel-controlplane". Keep these labels off the headless Service or the
+  # monitor double-scrapes and the alert's job matcher breaks.
+  labels: { app: sentinel, tier: controlplane }
 spec:
   selector: { app: sentinel, tier: controlplane }
   ports:
@@ -73,6 +76,13 @@ spec:
             - { name: SENTINEL_REST_ADDR, value: "0.0.0.0:9501" }
             - { name: SENTINEL_GRPC_ADDR, value: "0.0.0.0:9500" }
             - { name: SENTINEL_AUTOSTART_DATAPLANE, value: "0" }
+            # ClickHouse reader: powers Threat Search / event history (/events/*).
+            # Same DB/creds the data-plane writer uses. Omit to disable search.
+            - { name: SENTINEL_CLICKHOUSE_URL, value: "http://sentinel-clickhouse:8123" }
+            - { name: SENTINEL_CLICKHOUSE_DB, value: "sentinel_logs" }
+            - { name: SENTINEL_CLICKHOUSE_USER, value: "sentinel" }
+            - name: SENTINEL_CLICKHOUSE_PASSWORD
+              valueFrom: { secretKeyRef: { name: sentinel-secrets, key: clickhouse-password } }
             - name: SENTINEL_DB_URL
               valueFrom: { secretKeyRef: { name: sentinel-secrets, key: db-url } }
             - name: SENTINEL_JWT_SECRET

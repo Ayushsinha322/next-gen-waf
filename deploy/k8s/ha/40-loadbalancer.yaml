@@ -19,15 +19,16 @@ metadata:
   name: sentinel-waf-lb
   namespace: sentinel
   labels: { app: sentinel, tier: dataplane }
-  annotations:
-    # Preserve the real client IP (so the WAF sees the true source, not the LB).
-    # Trade-off: routes only to pods on the receiving node — pair with the
-    # node-spread we already have. Use "Cluster" if you need even LB spread.
-    externalTrafficPolicy: Local
 spec:
   type: LoadBalancer
+  # Preserve the real client IP (so the WAF sees the true source, not the LB).
+  # Trade-off: routes only to pods on the receiving node — pair with the
+  # node-spread we already have. Use "Cluster" if you need even LB spread.
   externalTrafficPolicy: Local
   selector: { app: sentinel, tier: dataplane }
   ports:
     - { name: http,  port: 80,  targetPort: 8080 }
     - { name: https, port: 443, targetPort: 8443 }
+    # Admin console (HTTPS). For stricter security, split this into a separate,
+    # internal-only Service (ClusterIP + Ingress, or a second VIP you firewall).
+    - { name: mgmt,  port: 9443, targetPort: 9443 }

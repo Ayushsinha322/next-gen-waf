@@ -44,39 +44,44 @@ Label nodes by zone so the spread works:
 kubectl label node <node> topology.kubernetes.io/zone=<az>
 ```
 
-## Prerequisites
-1. Kubernetes v1.28+ across the 7 VMs, nodes labelled by zone.
+## The set (11 files)
+Core (deployed by `kustomization.yaml`):
+`00-namespace-config` (Namespace + proxy ConfigMap + Secrets) · `10-dataplane`
+(WAF fleet + HPA + PDB) · `20-controlplane` (3-node Raft StatefulSet) ·
+`30-datastores` (CNPG Postgres + Redis + ClickHouse) · `40-loadbalancer` (VIP,
+:80/:443/:9443) · `50-dashboard` (admin UI) · `60-networkpolicy`.
+Applied separately (need extra operators/CRDs): `70-monitoring` (Prometheus
+Operator) · `80-tls` (cert-manager, optional — the WAF does its own TLS) ·
+`90-metallb-pool` (MetalLB, `metallb-system` ns).
+
+## Prerequisites (install BEFORE apply)
+1. Kubernetes v1.28+ across the VMs, nodes labelled by zone.
 2. Images in a registry the cluster can pull — replace
-   `registry.example.com/sentinel/{dataplane,controlplane}:latest`.
-3. **CloudNativePG operator** (see `30-datastores.yaml`).
-4. External LB: cloud LB, or **MetalLB** (BGP) on bare metal (see `40-loadbalancer.yaml`).
-5. (Optional) Redis operator for shared-rate-limit HA.
-6. Real values in `sentinel-secrets` (`00-namespace-config.yaml`).
+   `registry.example.com/sentinel/{dataplane,controlplane,dashboard}:latest`.
+3. **CloudNativePG operator** (Postgres `Cluster`).
+4. **MetalLB** (bare metal) → then `kubectl apply -f 90-metallb-pool.yaml`. (Cloud: the cloud LB is automatic.)
+5. **metrics-server** (for the data-plane HPA).
+6. A **NetworkPolicy-enforcing CNI** (Calico/Cilium) for `60-networkpolicy`.
+7. Real values in the `sentinel-secrets` **and** `sentinel-postgres-app` Secrets
+   (`00-namespace-config.yaml`) — the Postgres password must match `db-url`.
 
-## Apply order
+## Apply
 ```
-kubectl apply -f 00-namespace-config.yaml
-kubectl apply -f 30-datastores.yaml     # after the CNPG operator is installed
-kubectl apply -f 20-controlplane.yaml
-kubectl apply -f 10-dataplane.yaml
-kubectl apply -f 40-loadbalancer.yaml
+kubectl apply -k deploy/k8s/ha          # the whole core set, one command
+# then the separate add-ons, once their operators are installed:
+kubectl apply -f deploy/k8s/ha/90-metallb-pool.yaml   # bare-metal VIP
+kubectl apply -f deploy/k8s/ha/70-monitoring.yaml     # Prometheus Operator present
+kubectl apply -f deploy/k8s/ha/80-tls.yaml            # cert-manager present (optional)
 ```
 
-## Follow-ups
-Done — the manifests are turnkey against the current images:
-1. ✅ **`/readyz` on the data plane** — returns 200 only when config has synced
-   (`sites > 0`), 503 otherwise. The readiness + startup probes point at it, so a
-   pod never receives traffic before its rules load (no 502s on rollout/recovery).
-   (`crates/sentinel-proxy/src/lib.rs`.)
-2. ✅ **Control-plane NODE_ID from pod ordinal** — `controllerd` derives
-   `SENTINEL_NODE_ID` + `SENTINEL_RAFT_PEERS` from the pod ordinal natively (no
-   entrypoint/shell needed in the distroless image) via
-   `SENTINEL_RAFT_POD_NAME` / `_REPLICAS` / `_SERVICE`. See `deriveRaftTopology`
-   in `control-plane/cmd/controllerd/main.go`.
-
-Still environment-specific (do at deploy time):
-3. **TLS/cert management** — wire cert-manager or the built-in ACME for HTTPS.
-4. **Push images to a registry**; set `imagePullSecrets` if private.
+## Application follow-ups — all done
+1. ✅ **`/readyz`** on the data plane (readiness only; `startupProbe` uses
+   `/healthz` so a cold cluster doesn't CrashLoop the fleet).
+2. ✅ **Control-plane NODE_ID from pod ordinal** (`deriveRaftTopology`).
+3. ✅ **Redis, ClickHouse, Dashboard** HA workloads + wiring.
+4. ✅ **Management console (:9443)** exposed via the LB + mgmt upstreams.
+5. ✅ **ServiceMonitor + PrometheusRule** (scrape the control plane's `/metrics`).
+Deploy-time: push real images; set real Secret values; choose MetalLB L2 vs BGP.
 
 ## What this gives you — and what it doesn't
 - ✅ **Single-cluster, multi-AZ enterprise HA** — survives node and (with zone

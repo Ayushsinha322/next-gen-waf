@@ -33,8 +33,10 @@ spec:
     initdb:
       database: sentinel
       owner: sentinel
-      # secret with username/password for the sentinel role (create separately or
-      # let the operator generate it; wire it into sentinel-secrets/db-url).
+      # Uses the sentinel-postgres-app basic-auth Secret (defined in
+      # 00-namespace-config.yaml). Because this field is SET, CNPG does NOT
+      # auto-generate credentials — that Secret must exist and its password must
+      # match sentinel-secrets/db-url, or the primary never finishes bootstrap.
       secret: { name: sentinel-postgres-app }
 ---
 # ── Redis (shared rate-limit state) ──────────────────────────────────────────
@@ -50,3 +52,105 @@ spec:
 # then a RedisReplication (1 master + 2 replicas) + RedisSentinel for failover,
 # exposing a Service named `sentinel-redis` (referenced by the data plane's
 # SENTINEL_REDIS_URL). A single-pod Redis is acceptable ONLY for a pilot.
+#
+# Baseline below: a single-pod `sentinel-redis` so the set applies out of the box.
+# Swap it for the operator (RedisReplication + Sentinel) for true Redis HA.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sentinel-redis
+  namespace: sentinel
+  labels: { app: sentinel, tier: redis }
+spec:
+  selector: { app: sentinel, tier: redis }
+  ports:
+    - { name: redis, port: 6379, targetPort: 6379 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinel-redis
+  namespace: sentinel
+  labels: { app: sentinel, tier: redis }
+spec:
+  replicas: 1                       # single pod baseline — see operator note above for HA
+  selector:
+    matchLabels: { app: sentinel, tier: redis }
+  template:
+    metadata:
+      labels: { app: sentinel, tier: redis }
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          args: ["redis-server", "--save", "", "--appendonly", "no"]   # ephemeral rate-limit state
+          ports:
+            - { name: redis, containerPort: 6379 }
+          readinessProbe:
+            exec: { command: ["redis-cli", "ping"] }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits:   { memory: "320Mi" }
+---
+# ── ClickHouse (searchable event history — Threat Search) ─────────────────────
+# The data plane WRITES traffic + WAF events here; the control plane READS them.
+# Optional: without it, protection is unaffected but /events search is disabled.
+# Single-node StatefulSet baseline; for HA use a replicated ClickHouse (Altinity
+# operator / ClickHouse Keeper cluster) and a networked StorageClass.
+apiVersion: v1
+kind: Service
+metadata:
+  name: sentinel-clickhouse
+  namespace: sentinel
+  labels: { app: sentinel, tier: clickhouse }
+spec:
+  clusterIP: None                   # headless (stable pod DNS for the StatefulSet)
+  selector: { app: sentinel, tier: clickhouse }
+  ports:
+    - { name: http,   port: 8123, targetPort: 8123 }
+    - { name: native, port: 9000, targetPort: 9000 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sentinel-clickhouse
+  namespace: sentinel
+  labels: { app: sentinel, tier: clickhouse }
+spec:
+  serviceName: sentinel-clickhouse
+  replicas: 1
+  selector:
+    matchLabels: { app: sentinel, tier: clickhouse }
+  template:
+    metadata:
+      labels: { app: sentinel, tier: clickhouse }
+    spec:
+      containers:
+        - name: clickhouse
+          image: clickhouse/clickhouse-server:24-alpine
+          ports:
+            - { name: http,   containerPort: 8123 }
+            - { name: native, containerPort: 9000 }
+          env:
+            - { name: CLICKHOUSE_DB, value: "sentinel_logs" }
+            - { name: CLICKHOUSE_USER, value: "sentinel" }
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom: { secretKeyRef: { name: sentinel-secrets, key: clickhouse-password } }
+            - { name: CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT, value: "1" }
+          volumeMounts:
+            - { name: chdata, mountPath: /var/lib/clickhouse }
+          readinessProbe:
+            exec: { command: ["sh", "-c", "wget -qO- http://127.0.0.1:8123/ping | grep -q Ok"] }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "250m", memory: "512Mi" }
+            limits:   { memory: "1536Mi" }
+  volumeClaimTemplates:
+    - metadata: { name: chdata }
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: { requests: { storage: 20Gi } }

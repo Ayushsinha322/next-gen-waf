@@ -1,0 +1,50 @@
+# cert-manager TLS — OPTIONAL, applied SEPARATELY (needs cert-manager installed;
+# uses cert-manager.io CRDs, so NOT in kustomization.yaml).
+#   kubectl apply -f 80-tls.yaml
+#
+# NOTE: By default the WAF handles its OWN TLS — the management console presents
+# a self-signed cert (replaceable in Settings), and public site certs come from
+# the WAF's built-in ACME + its cert repository (PVC). So cert-manager is NOT
+# required. Use these only if you prefer a Kubernetes-managed cert — e.g. to
+# front the dashboard/console with an Ingress that terminates TLS with this cert.
+#
+# Two issuers: a self-signed ClusterIssuer (works offline, good default) and a
+# commented Let's Encrypt ClusterIssuer (public ACME) you can switch to.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: sentinel-selfsigned
+spec:
+  selfSigned: {}
+---
+# Let's Encrypt (public certs). Uncomment + set a real email + an ingress class
+# with a public DNS name to use it instead of the self-signed issuer.
+# apiVersion: cert-manager.io/v1
+# kind: ClusterIssuer
+# metadata:
+#   name: sentinel-letsencrypt
+# spec:
+#   acme:
+#     server: https://acme-v02.api.letsencrypt.org/directory
+#     email: admin@your-domain.example
+#     privateKeySecretRef: { name: sentinel-letsencrypt-account }
+#     solvers:
+#       - http01: { ingress: { class: nginx } }
+---
+# A management-console certificate issued into a Secret an Ingress (or the mgmt
+# listener, if you wire it to read a mounted secret) can consume.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: sentinel-mgmt-cert
+  namespace: sentinel
+spec:
+  secretName: sentinel-mgmt-tls
+  duration: 2160h      # 90d
+  renewBefore: 360h    # 15d
+  dnsNames:
+    - sentinel-dashboard.sentinel.svc
+    - waf.your-domain.example      # replace with the console's real hostname
+  issuerRef:
+    name: sentinel-selfsigned
+    kind: ClusterIssuer

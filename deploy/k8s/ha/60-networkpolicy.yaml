@@ -1,0 +1,45 @@
+# NetworkPolicies — restrict the datastores so only the WAF tiers can reach them.
+# Each policy makes ONLY its selected pods deny-by-default for ingress; it does
+# not affect other pods, so app↔app flows (dashboard→control plane, LB→data
+# plane, Raft peers) stay open.
+#
+# Postgres is intentionally NOT locked down here: it is managed by the
+# CloudNativePG operator, which needs intra-cluster replication + operator
+# access. Restricting it wrongly breaks the DB — follow CNPG's own NetworkPolicy
+# guidance (allow same cnpg.io/cluster + the operator namespace + tier:controlplane).
+#
+# Requires a CNI that enforces NetworkPolicy (Calico, Cilium, etc.).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-allow-dataplane
+  namespace: sentinel
+spec:
+  podSelector:
+    matchLabels: { app: sentinel, tier: redis }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { app: sentinel, tier: dataplane }
+      ports:
+        - { protocol: TCP, port: 6379 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: clickhouse-allow-planes
+  namespace: sentinel
+spec:
+  podSelector:
+    matchLabels: { app: sentinel, tier: clickhouse }
+  policyTypes: [Ingress]
+  ingress:
+    # Data plane (writer) + control plane (reader) reach ClickHouse over HTTP 8123.
+    - from:
+        - podSelector:
+            matchLabels: { app: sentinel, tier: dataplane }
+        - podSelector:
+            matchLabels: { app: sentinel, tier: controlplane }
+      ports:
+        - { protocol: TCP, port: 8123 }
