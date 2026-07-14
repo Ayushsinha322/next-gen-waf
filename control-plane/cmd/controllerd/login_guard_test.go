@@ -1,9 +1,12 @@
 package main
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestLoginGuardLockout(t *testing.T) {
-	g := newLoginGuard() // maxFails=5
+	g := newLoginGuard(5, 15*time.Minute, 15*time.Minute) // maxFails=5
 	key := "user@example.com"
 
 	// Below the threshold: not locked.

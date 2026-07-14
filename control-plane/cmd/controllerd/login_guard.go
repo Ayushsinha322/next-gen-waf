@@ -23,12 +23,12 @@ type loginState struct {
 	lockedUntil time.Time
 }
 
-func newLoginGuard() *loginGuard {
+func newLoginGuard(maxFails int, lockFor, window time.Duration) *loginGuard {
 	return &loginGuard{
 		state:    make(map[string]*loginState),
-		maxFails: 5,
-		lockFor:  15 * time.Minute,
-		window:   15 * time.Minute,
+		maxFails: maxFails,
+		lockFor:  lockFor,
+		window:   window,
 	}
 }
 
@@ -71,5 +71,13 @@ func (g *loginGuard) recordSuccess(key string) {
 	delete(g.state, key)
 }
 
-// loginAttempts is the process-wide login limiter.
-var loginAttempts = newLoginGuard()
+// loginAttempts limits failures per ACCOUNT (email): 5 fails / 15 min.
+var loginAttempts = newLoginGuard(5, 15*time.Minute, 15*time.Minute)
+
+// ipLoginAttempts limits TOTAL failures from a single source IP across all
+// accounts, to blunt credential stuffing (many accounts, a few tries each, so
+// no single account trips the per-account guard). Threshold is higher so a
+// shared NAT isn't locked out by a handful of honest mistakes. Both guards are
+// in-memory/per-node; a Redis-backed shared limiter for multi-node HA is a
+// follow-up (single-node deployments are fully covered).
+var ipLoginAttempts = newLoginGuard(30, 15*time.Minute, 15*time.Minute)

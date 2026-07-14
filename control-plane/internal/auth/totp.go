@@ -43,22 +43,30 @@ func TOTPURI(issuer, account, secret string) string {
 // VerifyTOTP checks a 6-digit code against the secret for the current 30s step,
 // allowing ±1 step for clock skew. Constant-time compare on the code.
 func VerifyTOTP(secret, code string) bool {
+	ok, _ := VerifyTOTPStep(secret, code)
+	return ok
+}
+
+// VerifyTOTPStep is VerifyTOTP but also returns the matched 30s step counter, so
+// callers can BURN a used step to prevent replay of an observed code within the
+// ±1 skew window (RFC 6238 §5.2). The step is meaningful only when ok is true.
+func VerifyTOTPStep(secret, code string) (ok bool, step int64) {
 	secret = strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(secret), " ", ""))
 	key, err := b32.DecodeString(secret)
 	if err != nil || len(key) == 0 {
-		return false
+		return false, 0
 	}
 	code = strings.TrimSpace(code)
 	if len(code) != 6 {
-		return false
+		return false, 0
 	}
-	step := time.Now().Unix() / 30
+	now := time.Now().Unix() / 30
 	for _, w := range []int64{0, -1, 1} {
-		if subtle.ConstantTimeCompare([]byte(hotp(key, uint64(step+w))), []byte(code)) == 1 {
-			return true
+		if subtle.ConstantTimeCompare([]byte(hotp(key, uint64(now+w))), []byte(code)) == 1 {
+			return true, now + w
 		}
 	}
-	return false
+	return false, 0
 }
 
 // hotp computes the RFC 4226 HOTP value (6 digits) for a counter.

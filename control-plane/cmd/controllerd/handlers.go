@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/your-org/sentinel-waf/control-plane/internal/auth"
 	"github.com/your-org/sentinel-waf/control-plane/internal/cluster"
 	"github.com/your-org/sentinel-waf/control-plane/internal/db"
@@ -74,13 +75,25 @@ func handleLogin(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store, hub *
 		return
 	}
 
-	// Brute-force lockout: reject early if the account is currently locked out
-	// after too many recent failures.
+	// Brute-force lockout: reject early if either the account OR the source IP
+	// is currently locked out (per-account guards password guessing; per-IP
+	// guards credential stuffing across many accounts from one source).
 	loginKey := strings.ToLower(strings.TrimSpace(req.Email))
+	ipKey := "ip:" + c.ClientIP()
 	if locked, wait := loginAttempts.locked(loginKey); locked {
 		c.Header("Retry-After", fmt.Sprintf("%d", int(wait.Seconds())+1))
 		c.JSON(http.StatusTooManyRequests, gin.H{"error": "too many failed attempts; try again later"})
 		return
+	}
+	if locked, wait := ipLoginAttempts.locked(ipKey); locked {
+		c.Header("Retry-After", fmt.Sprintf("%d", int(wait.Seconds())+1))
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "too many failed attempts; try again later"})
+		return
+	}
+	// recordFail notes a failure against both the account and the source IP.
+	recordFail := func() {
+		loginAttempts.recordFailure(loginKey)
+		ipLoginAttempts.recordFailure(ipKey)
 	}
 
 	// Validate credentials.  When a DB pool is available we check the users
@@ -92,7 +105,7 @@ func handleLogin(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store, hub *
 			db.DevTenantID, req.Email, req.Password)
 		if err != nil || !ok {
 			loginResult = "FAILURE"
-			loginAttempts.recordFailure(loginKey)
+			recordFail()
 			writeAuditEntry(c, store, hub, &db.WriteAuditRequest{
 				TenantID:   db.DevTenantID,
 				Action:     "user.login",
@@ -124,9 +137,22 @@ func handleLogin(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store, hub *
 				c.JSON(http.StatusUnauthorized, gin.H{"error": "mfa_required", "mfa_required": true})
 				return
 			}
-			if !auth.VerifyTOTP(mfaSecret, req.MFACode) {
-				loginAttempts.recordFailure(loginKey)
+			ok, step := auth.VerifyTOTPStep(mfaSecret, req.MFACode)
+			if !ok {
+				recordFail()
 				c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid mfa code"})
+				return
+			}
+			// Burn the step so an observed code can't be replayed within the
+			// ±1 skew window (RFC 6238 §5.2).
+			consumed, cerr := store.ConsumeMFAStep(c.Request.Context(), userTenant, userID, step)
+			if cerr != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "mfa verification failed"})
+				return
+			}
+			if !consumed {
+				recordFail()
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "mfa code already used"})
 				return
 			}
 		}
@@ -142,7 +168,7 @@ func handleLogin(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store, hub *
 			return
 		}
 		if req.Email != "admin@sentinel.local" || req.Password != "admin123" {
-			loginAttempts.recordFailure(loginKey)
+			recordFail()
 			writeAuditEntry(c, nil, hub, &db.WriteAuditRequest{
 				TenantID:   db.DevTenantID,
 				Action:     "user.login",
@@ -252,11 +278,18 @@ func handleLogout(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store) {
 	// Revoke the current access token.
 	if claims.ID != "" && claims.ExpiresAt != nil {
 		if err := store.RevokeToken(c.Request.Context(), claims.ID, claims.ExpiresAt.Time); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "logout failed"})
 			return
 		}
 	}
-	// Best-effort: also revoke the refresh token if the client sends it.
+	// Revoke the PAIRED refresh token server-side using the rjti embedded in the
+	// access token — so logout kills the session without the client having to
+	// resend the refresh token. Retain the denylist entry past the refresh TTL.
+	if claims.RefreshJTI != "" {
+		_ = store.RevokeToken(c.Request.Context(), claims.RefreshJTI, time.Now().Add(jwtSvc.RefreshTTL()))
+	}
+	// Best-effort: also honor an explicitly-supplied refresh token (older tokens
+	// issued before rjti binding, or belt-and-suspenders).
 	var body struct {
 		RefreshToken string `json:"refresh_token"`
 	}
@@ -299,6 +332,14 @@ func handleMFAConfirm(c *gin.Context, store *db.Store) {
 	}
 	if store == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
+		return
+	}
+	// Step-up: refuse to overwrite an already-enrolled secret via confirm. To
+	// rotate MFA the user must first disable it (which requires a CURRENT code),
+	// so a stolen access token cannot silently replace the second factor and
+	// lock the real user out.
+	if cur, cerr := store.GetMFASecret(c.Request.Context(), claims.TenantID, claims.UserID); cerr == nil && cur != "" {
+		c.JSON(http.StatusConflict, gin.H{"error": "mfa already enabled; disable it first (requires a current code)"})
 		return
 	}
 	var req struct {
@@ -2108,6 +2149,24 @@ func validUserRole(r string) bool {
 	return false
 }
 
+// respondStoreError maps a store/DB error to a sanitized client response so raw
+// driver/schema detail (table names, constraints, SQLSTATE) never leaks to the
+// caller: a unique-constraint violation becomes 409, a generic "not found"
+// becomes 404, and anything else a generic 500. The raw error is intentionally
+// not echoed.
+func respondStoreError(c *gin.Context, err error) {
+	var pgErr *pgconn.PgError
+	switch {
+	case errors.As(err, &pgErr) && pgErr.Code == "23505":
+		c.JSON(http.StatusConflict, gin.H{"error": "already exists"})
+	case err != nil && strings.Contains(err.Error(), "not found"):
+		// Store not-found messages are fixed, safe strings (no user input).
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+	default:
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+	}
+}
+
 func handleListUsersReal(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceUser, rbac.ActionList) {
@@ -2120,7 +2179,7 @@ func handleListUsersReal(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 	}
 	users, err := store.ListUsers(c.Request.Context(), claims.TenantID, claims.UserID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		respondStoreError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"users": users, "tenant_id": claims.TenantID})
@@ -2155,7 +2214,7 @@ func handleCreateUserReal(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 	}
 	u, err := store.CreateUser(c.Request.Context(), claims.TenantID, claims.UserID, req.Email, req.Name, req.Role, req.Password)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		respondStoreError(c, err)
 		return
 	}
 	c.JSON(http.StatusCreated, gin.H{"user": u})
@@ -2184,7 +2243,7 @@ func handleUpdateUser(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 		return
 	}
 	if err := store.UpdateUser(c.Request.Context(), claims.TenantID, claims.UserID, c.Param("id"), req.Role, req.Status); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		respondStoreError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
@@ -2205,7 +2264,7 @@ func handleDeleteUser(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 		return
 	}
 	if err := store.DeleteUser(c.Request.Context(), claims.TenantID, claims.UserID, c.Param("id")); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		respondStoreError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
@@ -2223,7 +2282,7 @@ func handleListAPIKeysReal(c *gin.Context, enf *rbac.Enforcer, store *db.Store) 
 	}
 	keys, err := store.ListAPIKeys(c.Request.Context(), claims.TenantID, claims.UserID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		respondStoreError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"api_keys": keys, "tenant_id": claims.TenantID})
@@ -2263,7 +2322,7 @@ func handleCreateAPIKeyReal(c *gin.Context, enf *rbac.Enforcer, store *db.Store)
 	}
 	row, fullKey, err := store.CreateAPIKey(c.Request.Context(), claims.TenantID, claims.UserID, req.Name, req.Role, req.Scopes, expiresAt)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		respondStoreError(c, err)
 		return
 	}
 	c.JSON(http.StatusCreated, gin.H{
@@ -2284,7 +2343,7 @@ func handleRevokeAPIKey(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 		return
 	}
 	if err := store.RevokeAPIKey(c.Request.Context(), claims.TenantID, claims.UserID, c.Param("id")); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		respondStoreError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true, "message": "API key revoked"})

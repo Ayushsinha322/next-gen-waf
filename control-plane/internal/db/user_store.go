@@ -206,8 +206,10 @@ func (s *Store) SetMFASecret(ctx context.Context, tenantID, userID, secret strin
 	defer tx.Rollback(ctx)
 
 	var got string
+	// Reset the replay guard whenever the secret changes (fresh enroll or
+	// disable) so a newly enrolled secret starts from a clean step counter.
 	err = tx.QueryRow(ctx,
-		`UPDATE users SET mfa_secret = NULLIF($2, '') WHERE id = $1 AND tenant_id = $3 RETURNING id`,
+		`UPDATE users SET mfa_secret = NULLIF($2, ''), mfa_last_step = 0 WHERE id = $1 AND tenant_id = $3 RETURNING id`,
 		userID, secret, tenantID).Scan(&got)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -216,6 +218,32 @@ func (s *Store) SetMFASecret(ctx context.Context, tenantID, userID, secret strin
 		return fmt.Errorf("set mfa secret: %w", err)
 	}
 	return tx.Commit(ctx)
+}
+
+// ConsumeMFAStep atomically records a successfully verified TOTP step and
+// rejects replay: it succeeds only when step is strictly greater than the user's
+// last consumed step. Returns false (no error) when the step was already used —
+// i.e. the presented code is a replay of one accepted within the skew window.
+func (s *Store) ConsumeMFAStep(ctx context.Context, tenantID, userID string, step int64) (bool, error) {
+	tx, err := s.pool.BeginTenant(ctx, tenantID, userID)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+
+	var got string
+	err = tx.QueryRow(ctx,
+		`UPDATE users SET mfa_last_step = $3
+		   WHERE id = $1 AND tenant_id = $2 AND mfa_last_step < $3
+		   RETURNING id`,
+		userID, tenantID, step).Scan(&got)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil // step already consumed -> replay
+		}
+		return false, fmt.Errorf("consume mfa step: %w", err)
+	}
+	return true, tx.Commit(ctx)
 }
 
 // GetMFASecret returns a user's TOTP secret ("" if MFA is not enabled).

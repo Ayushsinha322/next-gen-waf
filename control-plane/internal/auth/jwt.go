@@ -37,6 +37,12 @@ type Claims struct {
 	Scopes []string `json:"scopes,omitempty"`
 	// AuthMethod is "password", "oidc", or "apikey".
 	AuthMethod string `json:"auth_method"`
+	// RefreshJTI links an access token to its paired refresh token's jti so
+	// logout can revoke the refresh token server-side WITHOUT the client having
+	// to resend it. Set on both tokens of a pair (the refresh token points at
+	// itself) and preserved across refresh so a re-minted access token still
+	// carries it.
+	RefreshJTI string `json:"rjti,omitempty"`
 }
 
 // JWTConfig holds settings for JWT token issuance and validation.
@@ -143,13 +149,34 @@ func (s *JWTService) IssueRefreshToken(claims Claims) (string, error) {
 	return token.SignedString(s.key)
 }
 
-// IssueTokenPair returns both an access and refresh token.
+// IssueTokenPair returns both an access and refresh token, linked by a shared
+// refresh jti so logout can revoke the refresh token without the client
+// resending it.
 func (s *JWTService) IssueTokenPair(claims Claims) (*TokenPair, error) {
-	access, err := s.IssueAccessToken(claims)
+	// Pre-generate the refresh jti and stamp it on BOTH tokens. The refresh
+	// token points at itself so that access tokens later minted from it (via
+	// refresh) inherit the same rjti and remain revocable at logout.
+	refreshJTI := newTokenID()
+	now := time.Now()
+
+	refreshClaims := claims
+	refreshClaims.AuthMethod = "refresh"
+	refreshClaims.RefreshJTI = refreshJTI
+	refreshClaims.RegisteredClaims = jwt.RegisteredClaims{
+		Issuer:    s.cfg.Issuer,
+		Subject:   claims.UserID,
+		IssuedAt:  jwt.NewNumericDate(now),
+		ExpiresAt: jwt.NewNumericDate(now.Add(s.cfg.RefreshTokenTTL)),
+		ID:        refreshJTI,
+	}
+	refresh, err := jwt.NewWithClaims(jwt.SigningMethodHS256, refreshClaims).SignedString(s.key)
 	if err != nil {
 		return nil, err
 	}
-	refresh, err := s.IssueRefreshToken(claims)
+
+	accessClaims := claims
+	accessClaims.RefreshJTI = refreshJTI
+	access, err := s.IssueAccessToken(accessClaims)
 	if err != nil {
 		return nil, err
 	}
@@ -160,6 +187,10 @@ func (s *JWTService) IssueTokenPair(claims Claims) (*TokenPair, error) {
 		TokenType:    "Bearer",
 	}, nil
 }
+
+// RefreshTTL exposes the configured refresh-token lifetime so callers (logout)
+// can set a denylist retention that outlives the refresh token.
+func (s *JWTService) RefreshTTL() time.Duration { return s.cfg.RefreshTokenTTL }
 
 // Validate parses and validates a JWT token string, returning the embedded
 // claims if the token is valid.

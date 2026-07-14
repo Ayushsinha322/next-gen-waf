@@ -114,6 +114,9 @@ func (s *Store) ValidatePassword(ctx context.Context, tenantID, email, password 
 		`SELECT id, tenant_id, role, password_hash FROM sentinel_auth_lookup($1)`,
 		email).Scan(&userID, &userTenantID, &role, &pwdHash)
 	if err != nil {
+		// User not found: still run argon2 against a dummy hash so the response
+		// time matches the found-but-wrong-password path (no enumeration oracle).
+		checkPassword(password, dummyPasswordHash)
 		return false, "", "", "", nil
 	}
 	tx.Commit(ctx)
@@ -172,9 +175,25 @@ func checkPassword(plain, stored string) bool {
 	if err != nil {
 		return false
 	}
+	// Reject a malformed/corrupted row with an empty salt or hash segment: a
+	// zero-length hash would make argon2 produce a zero-length digest and the
+	// constant-time compare of two empty slices would succeed for ANY password.
+	if len(salt) == 0 || len(expected) == 0 {
+		return false
+	}
 	hash := argon2.IDKey([]byte(plain), salt, 1, 64*1024, 4, uint32(len(expected)))
 	return subtle.ConstantTimeCompare(hash, expected) == 1
 }
+
+// dummyPasswordHash is a valid-format argon2id hash computed once at startup. It
+// is verified against on the user-not-found login path so the response time of a
+// failed login is the same whether or not the email exists — closing the timing
+// side channel that would otherwise enumerate valid accounts.
+var dummyPasswordHash = func() string {
+	salt := []byte("sentinel-dummy16")
+	h := argon2.IDKey([]byte("not-a-real-password"), salt, 1, 64*1024, 4, 32)
+	return "argon2id$" + hex.EncodeToString(salt) + "$" + hex.EncodeToString(h)
+}()
 
 // ---------------------------------------------------------------------------
 // DashboardStats
@@ -562,18 +581,14 @@ type WriteAuditRequest struct {
 // tamper-evident HMAC stored alongside the record; use a stable secret loaded
 // from the environment.
 func (s *Store) WriteAuditLog(ctx context.Context, req WriteAuditRequest, hmacKey []byte) error {
-	// Compute HMAC over the immutable fields.
-	mac := hmac.New(sha256.New, hmacKey)
-	fmt.Fprintf(mac, "%s|%v|%s|%s|%v|%v|%d",
-		req.TenantID,
-		strPtr(req.ActorUserID),
-		req.Action,
-		req.TargetKind,
-		strPtr(req.TargetID),
-		strPtr(req.IP),
-		time.Now().UnixNano(),
-	)
-	sig := mac.Sum(nil)
+	// Sign over a PERSISTED, deterministic timestamp (truncated to Postgres's
+	// microsecond precision so it round-trips exactly) plus every material
+	// field, and store that same created_at — otherwise the HMAC could never be
+	// recomputed and the "tamper-evident" property would be cosmetic. See
+	// VerifyAuditLog, which recomputes and compares.
+	createdAt := time.Now().UTC().Truncate(time.Microsecond)
+	sig := auditMAC(hmacKey, req.TenantID, req.ActorUserID, req.Action, req.TargetKind,
+		req.TargetID, req.IP, req.UserAgent, req.Diff, createdAt)
 
 	// Use a system-level tenant context for the write.  The INSERT policy on
 	// audit_logs has WITH CHECK (true) so any tenant_id is accepted.
@@ -585,8 +600,8 @@ func (s *Store) WriteAuditLog(ctx context.Context, req WriteAuditRequest, hmacKe
 
 	err = tx.Exec(ctx,
 		`INSERT INTO audit_logs
-			(tenant_id, actor_user_id, action, target_kind, target_id, ip, user_agent, diff, hmac)
-		 VALUES ($1, $2, $3, $4, $5, $6::inet, $7, $8, $9)`,
+			(tenant_id, actor_user_id, action, target_kind, target_id, ip, user_agent, diff, created_at, hmac)
+		 VALUES ($1, $2, $3, $4, $5, $6::inet, $7, $8, $9, $10)`,
 		req.TenantID,
 		req.ActorUserID,
 		req.Action,
@@ -595,12 +610,80 @@ func (s *Store) WriteAuditLog(ctx context.Context, req WriteAuditRequest, hmacKe
 		req.IP,
 		req.UserAgent,
 		nullableJSON(req.Diff),
+		createdAt,
 		sig,
 	)
 	if err != nil {
 		return fmt.Errorf("store: audit insert: %w", err)
 	}
 	return tx.Commit(ctx)
+}
+
+// auditMAC computes the tamper-evidence HMAC over the persisted, immutable
+// fields of an audit row. Used by both WriteAuditLog and VerifyAuditLog so the
+// signature is reproducible. The timestamp is formatted at microsecond
+// precision to match what Postgres stores.
+func auditMAC(key []byte, tenantID string, actor *string, action, targetKind string,
+	targetID, ip, userAgent *string, diff json.RawMessage, createdAt time.Time) []byte {
+	mac := hmac.New(sha256.New, key)
+	fmt.Fprintf(mac, "%s|%s|%s|%s|%s|%s|%s|%s|%s",
+		tenantID,
+		strPtr(actor),
+		action,
+		targetKind,
+		strPtr(targetID),
+		strPtr(ip),
+		strPtr(userAgent),
+		string(diff),
+		createdAt.UTC().Format(time.RFC3339Nano),
+	)
+	return mac.Sum(nil)
+}
+
+// VerifyAuditLog recomputes the HMAC over every stored audit row (optionally
+// scoped to a tenant; "" = all) and returns how many were checked plus the IDs
+// of any whose stored HMAC does not match — proving the audit log is genuinely
+// tamper-evident (a mismatch means the row was altered or signed with a
+// different key). limit <= 0 checks all rows.
+func (s *Store) VerifyAuditLog(ctx context.Context, tenantID string, hmacKey []byte, limit int) (checked int, bad []string, err error) {
+	pg, ok := s.pool.(*pgxPool)
+	if !ok {
+		return 0, nil, fmt.Errorf("store: pool is not a *pgxPool")
+	}
+	q := `SELECT id, tenant_id, actor_user_id, action, target_kind, target_id,
+	             host(ip), user_agent, diff, created_at, hmac
+	        FROM audit_logs`
+	args := []any{}
+	if tenantID != "" {
+		q += ` WHERE tenant_id = $1`
+		args = append(args, tenantID)
+	}
+	q += ` ORDER BY created_at DESC`
+	if limit > 0 {
+		q += fmt.Sprintf(" LIMIT %d", limit)
+	}
+	rows, err := pg.pool.Query(ctx, q, args...)
+	if err != nil {
+		return 0, nil, fmt.Errorf("store: audit verify query: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, tid, action, targetKind string
+		var actor, targetID, ip, ua *string
+		var diff json.RawMessage
+		var createdAt time.Time
+		var storedMAC []byte
+		if err := rows.Scan(&id, &tid, &actor, &action, &targetKind, &targetID,
+			&ip, &ua, &diff, &createdAt, &storedMAC); err != nil {
+			return checked, bad, err
+		}
+		checked++
+		want := auditMAC(hmacKey, tid, actor, action, targetKind, targetID, ip, ua, diff, createdAt)
+		if !hmac.Equal(want, storedMAC) {
+			bad = append(bad, id)
+		}
+	}
+	return checked, bad, rows.Err()
 }
 
 func strPtr(s *string) string {
