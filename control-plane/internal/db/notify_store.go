@@ -107,10 +107,14 @@ func (s *Store) ListChannels(ctx context.Context, tenantID, userID string) ([]Ch
 	}
 	defer tx.Rollback(ctx)
 
+	// Explicit tenant_id predicate (defense-in-depth): without it, alert fan-out
+	// would depend solely on RLS and could dispatch one tenant's alert — and
+	// leak other tenants' channel secrets (webhook URLs, Slack tokens) — to
+	// every tenant's channels if RLS is ever inactive for the connecting role.
 	rows, err := tx.Query(ctx,
 		`SELECT id, tenant_id, name, type, config, min_severity, enabled,
 		        last_status, last_sent_at, created_at, updated_at
-		   FROM notification_channels ORDER BY created_at DESC`)
+		   FROM notification_channels WHERE tenant_id = $1 ORDER BY created_at DESC`, tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("store: list channels: %w", err)
 	}

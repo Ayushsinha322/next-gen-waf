@@ -51,6 +51,17 @@ func dbConnectMaxWait() time.Duration {
 	return 60 * time.Second
 }
 
+// allowSuperuserDB reports whether the operator has explicitly opted in to
+// running the control plane on a Postgres superuser/BYPASSRLS role. This is only
+// safe for single-tenant dev/demo, where RLS is not the tenant boundary.
+func allowSuperuserDB() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("SENTINEL_ALLOW_SUPERUSER_DB"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
 // openDBWithRetry repeatedly attempts to open the DB pool until it succeeds or
 // maxWait elapses, using capped exponential backoff. Each attempt is bounded by
 // its own short timeout so a hung connect can't stall startup forever. This
@@ -147,27 +158,48 @@ func run() error {
 			log.Info("DB connected", zap.String("url", maskPassword(dbURL)))
 			store = db.NewStore(pool)
 
-			// Seed dev data (idempotent).
-			if err := db.SeedDev(ctx, pool); err != nil {
-				log.Warn("DB seed failed (non-fatal)", zap.Error(err))
+			// Tenant isolation ultimately rests on FORCE ROW LEVEL SECURITY,
+			// which Postgres SILENTLY IGNORES for superusers and BYPASSRLS
+			// roles. Refuse to boot as such a role so RLS is never a no-op in
+			// multi-tenant use. The explicit tenant_id predicates in the stores
+			// are the first line of defense; this assertion is the backstop.
+			// SENTINEL_ALLOW_SUPERUSER_DB=1 is an explicit, logged opt-out for
+			// single-tenant dev/demo (where RLS is not the isolation boundary).
+			privileged, role, perr := store.ConnRoleIsPrivileged(ctx)
+			if perr != nil {
+				log.Warn("could not verify DB role privileges", zap.Error(perr))
+			} else if privileged {
+				if allowSuperuserDB() {
+					log.Warn("DB role BYPASSES row-level security — tenant isolation relies on explicit predicates only. DO NOT use this role for multi-tenant production.",
+						zap.String("db_role", role))
+				} else {
+					log.Fatal("refusing to start: control plane connects to Postgres as a SUPERUSER/BYPASSRLS role, which nullifies FORCE ROW LEVEL SECURITY (tenant isolation). Point SENTINEL_DB_URL at the non-superuser 'sentinel_app' role, or set SENTINEL_ALLOW_SUPERUSER_DB=1 for single-tenant dev/demo.",
+						zap.String("db_role", role))
+				}
+			}
+
+			// Auto-seed and idempotent schema-ensure require CREATE / cross-
+			// tenant INSERT privileges the non-superuser sentinel_app role does
+			// not have — in that posture the migrate step (run as the owner
+			// role) is responsible for schema + seed. Only run these when
+			// connected as a privileged/dev role.
+			if privileged {
+				if err := db.SeedDev(ctx, pool); err != nil {
+					log.Warn("DB seed failed (non-fatal)", zap.Error(err))
+				} else {
+					log.Info("DB seeded")
+				}
+				if err := db.EnsureNotificationSchema(ctx, pool); err != nil {
+					log.Warn("notification schema ensure failed (non-fatal)", zap.Error(err))
+				}
+				if err := db.EnsureThreatIntelSchema(ctx, pool); err != nil {
+					log.Warn("threat-intel schema ensure failed (non-fatal)", zap.Error(err))
+				}
+				if err := db.EnsureNodesSchema(ctx, pool); err != nil {
+					log.Warn("nodes schema ensure failed (non-fatal)", zap.Error(err))
+				}
 			} else {
-				log.Info("DB seeded")
-			}
-
-			// Ensure the notification_channels table exists (idempotent —
-			// works even when goose migrations haven't been run manually).
-			if err := db.EnsureNotificationSchema(ctx, pool); err != nil {
-				log.Warn("notification schema ensure failed (non-fatal)", zap.Error(err))
-			}
-
-			// Ensure the threat_intel_iocs table exists (idempotent).
-			if err := db.EnsureThreatIntelSchema(ctx, pool); err != nil {
-				log.Warn("threat-intel schema ensure failed (non-fatal)", zap.Error(err))
-			}
-
-			// Ensure the nodes table exists (idempotent) — node-health tracking.
-			if err := db.EnsureNodesSchema(ctx, pool); err != nil {
-				log.Warn("nodes schema ensure failed (non-fatal)", zap.Error(err))
+				log.Info("non-superuser DB role — skipping auto-seed/ensure-schema (handled by migrations run as the owner role)")
 			}
 
 			// JWT revocation: consult the shared denylist on every Validate so a
@@ -318,7 +350,7 @@ func run() error {
 	authGroup := router.Group("/api/v1/auth")
 	{
 		authGroup.POST("/login", func(c *gin.Context) { handleLogin(c, jwtSvc, store, hub) })
-		authGroup.POST("/refresh", func(c *gin.Context) { handleRefresh(c, jwtSvc) })
+		authGroup.POST("/refresh", func(c *gin.Context) { handleRefresh(c, jwtSvc, store) })
 		authGroup.GET("/oidc/login", func(c *gin.Context) { handleOIDCLogin(c, jwtSvc, log) })
 		authGroup.GET("/oidc/callback", func(c *gin.Context) { handleOIDCCallback(c, jwtSvc, store, log) })
 	}

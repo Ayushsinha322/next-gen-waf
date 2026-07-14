@@ -77,11 +77,11 @@ type AuditRow struct {
 }
 
 type DashboardStats struct {
-	TotalSites    int `json:"total_sites"`
-	ActiveSites   int `json:"active_sites"`
-	TotalRules    int `json:"total_rules"`
-	EnabledRules  int `json:"enabled_rules"`
-	OpenAlerts    int `json:"open_alerts"`
+	TotalSites     int `json:"total_sites"`
+	ActiveSites    int `json:"active_sites"`
+	TotalRules     int `json:"total_rules"`
+	EnabledRules   int `json:"enabled_rules"`
+	OpenAlerts     int `json:"open_alerts"`
 	CriticalAlerts int `json:"critical_alerts"`
 }
 
@@ -189,11 +189,13 @@ func (s *Store) GetDashboardStats(ctx context.Context, tenantID, userID string) 
 
 	var stats DashboardStats
 
+	// Explicit tenant_id predicates (defense-in-depth): dashboard counts must
+	// not leak other tenants' totals if RLS is inactive for the connecting role.
 	err = tx.QueryRow(ctx,
 		`SELECT
 			COUNT(*) FILTER (WHERE TRUE),
 			COUNT(*) FILTER (WHERE status = 'active')
-		 FROM sites`).Scan(&stats.TotalSites, &stats.ActiveSites)
+		 FROM sites WHERE tenant_id = $1`, tenantID).Scan(&stats.TotalSites, &stats.ActiveSites)
 	if err != nil {
 		return nil, fmt.Errorf("store: sites count: %w", err)
 	}
@@ -202,7 +204,7 @@ func (s *Store) GetDashboardStats(ctx context.Context, tenantID, userID string) 
 		`SELECT
 			COUNT(*) FILTER (WHERE TRUE),
 			COUNT(*) FILTER (WHERE enabled = true)
-		 FROM rules`).Scan(&stats.TotalRules, &stats.EnabledRules)
+		 FROM rules WHERE tenant_id = $1`, tenantID).Scan(&stats.TotalRules, &stats.EnabledRules)
 	if err != nil {
 		return nil, fmt.Errorf("store: rules count: %w", err)
 	}
@@ -211,12 +213,28 @@ func (s *Store) GetDashboardStats(ctx context.Context, tenantID, userID string) 
 		`SELECT
 			COUNT(*) FILTER (WHERE state = 'open'),
 			COUNT(*) FILTER (WHERE state = 'open' AND severity = 'critical')
-		 FROM alerts`).Scan(&stats.OpenAlerts, &stats.CriticalAlerts)
+		 FROM alerts WHERE tenant_id = $1`, tenantID).Scan(&stats.OpenAlerts, &stats.CriticalAlerts)
 	if err != nil {
 		return nil, fmt.Errorf("store: alerts count: %w", err)
 	}
 
 	return &stats, tx.Commit(ctx)
+}
+
+// ConnRoleIsPrivileged reports whether the role the control plane connects as is
+// a Postgres SUPERUSER or has BYPASSRLS — either of which makes FORCE ROW LEVEL
+// SECURITY (the backstop for tenant isolation) a silent no-op. Used for a
+// boot-time safety assertion so we never run multi-tenant on a role that
+// bypasses RLS. Returns the role name for diagnostics.
+func (s *Store) ConnRoleIsPrivileged(ctx context.Context) (privileged bool, role string, err error) {
+	pg, ok := s.pool.(*pgxPool)
+	if !ok {
+		return false, "", fmt.Errorf("store: pool is not a *pgxPool")
+	}
+	err = pg.pool.QueryRow(ctx,
+		`SELECT current_user, rolsuper OR rolbypassrls
+		   FROM pg_roles WHERE rolname = current_user`).Scan(&role, &privileged)
+	return privileged, role, err
 }
 
 // ---------------------------------------------------------------------------

@@ -121,6 +121,13 @@ services:
       SENTINEL_JWT_SECRET: ${SENTINEL_JWT_SECRET}
       # Required by the audit-HMAC fail-fast; keep it out of the committed YAML.
       SENTINEL_AUDIT_HMAC_KEY: ${SENTINEL_AUDIT_HMAC_KEY}
+      # SINGLE-TENANT DEMO POSTURE. This stack connects as the Postgres superuser
+      # ('sentinel'), which bypasses FORCE ROW LEVEL SECURITY. Tenant isolation
+      # here is enforced by the explicit tenant_id predicates in the stores (not
+      # RLS). For MULTI-TENANT production, point SENTINEL_DB_URL at the
+      # non-superuser 'sentinel_app' role (set its password, run migrations as
+      # the owner role) and REMOVE this opt-out so RLS backstops isolation.
+      SENTINEL_ALLOW_SUPERUSER_DB: "1"
       SENTINEL_REST_ADDR: 0.0.0.0:9501
       SENTINEL_GRPC_ADDR: 0.0.0.0:9500
       SENTINEL_AUTOSTART_DATAPLANE: "0"

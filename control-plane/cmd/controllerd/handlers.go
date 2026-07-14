@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -193,7 +194,7 @@ type refreshRequest struct {
 	RefreshToken string `json:"refresh_token" binding:"required"`
 }
 
-func handleRefresh(c *gin.Context, jwtSvc *auth.JWTService) {
+func handleRefresh(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store) {
 	var req refreshRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -207,6 +208,23 @@ func handleRefresh(c *gin.Context, jwtSvc *auth.JWTService) {
 	if claims.AuthMethod != "refresh" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "not a refresh token"})
 		return
+	}
+	// Re-derive privileges from the database rather than trusting the refresh
+	// token's frozen claims: if the user was disabled, deleted, or had their
+	// role changed, that must take effect on the next refresh (bounding stale
+	// access to one access-token lifetime) instead of persisting for the full
+	// refresh window. Skipped only in degraded/no-DB mode (dev/mock).
+	if store != nil {
+		role, _, rerr := store.RefreshUser(c.Request.Context(), claims.TenantID, claims.UserID)
+		if rerr != nil {
+			if errors.Is(rerr, db.ErrUserInactive) {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "session no longer valid"})
+				return
+			}
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "cannot verify session"})
+			return
+		}
+		claims.Role = role
 	}
 	claims.AuthMethod = "refresh_rotation"
 	accessToken, err := jwtSvc.IssueAccessToken(*claims)

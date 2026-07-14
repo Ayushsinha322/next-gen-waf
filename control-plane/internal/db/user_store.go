@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"golang.org/x/crypto/argon2"
 )
 
@@ -76,12 +78,15 @@ func (s *Store) ListUsers(ctx context.Context, tenantID, actorID string) ([]User
 	}
 	defer tx.Rollback(ctx)
 
+	// Explicit tenant_id predicate (defense-in-depth): isolation must not depend
+	// solely on RLS being active for the connecting role.
 	rows, err := tx.Query(ctx, `
 		SELECT id, tenant_id, email, name, role, status,
 		       (mfa_secret IS NOT NULL AND mfa_secret <> '') AS mfa_enabled,
 		       last_login_at, created_at
 		FROM users
-		ORDER BY created_at ASC`)
+		WHERE tenant_id = $1
+		ORDER BY created_at ASC`, tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("list users: %w", err)
 	}
@@ -115,11 +120,14 @@ func (s *Store) UpdateUser(ctx context.Context, tenantID, actorID, userID, role,
 		UPDATE users
 		SET role   = COALESCE(NULLIF($2, ''), role),
 		    status = COALESCE(NULLIF($3, ''), status)
-		WHERE id = $1
+		WHERE id = $1 AND tenant_id = $4
 		RETURNING id`,
-		userID, role, status).Scan(&got)
+		userID, role, status, tenantID).Scan(&got)
 	if err != nil {
-		return fmt.Errorf("user not found")
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("user not found")
+		}
+		return fmt.Errorf("update user: %w", err)
 	}
 	return tx.Commit(ctx)
 }
@@ -133,12 +141,47 @@ func (s *Store) DeleteUser(ctx context.Context, tenantID, actorID, userID string
 	defer tx.Rollback(ctx)
 
 	var got string
-	err = tx.QueryRow(ctx, `DELETE FROM users WHERE id = $1 RETURNING id`, userID).Scan(&got)
+	err = tx.QueryRow(ctx, `DELETE FROM users WHERE id = $1 AND tenant_id = $2 RETURNING id`, userID, tenantID).Scan(&got)
 	if err != nil {
-		return fmt.Errorf("user not found")
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("user not found")
+		}
+		return fmt.Errorf("delete user: %w", err)
 	}
 	return tx.Commit(ctx)
 }
+
+// RefreshUser re-reads a user's CURRENT role and status by id, tenant-scoped, so
+// the refresh path can re-derive privileges from the database instead of
+// trusting a (possibly stale) refresh token's frozen claims. Returns
+// ErrUserInactive if the user is gone or no longer active — the caller must
+// reject the refresh in that case, so disabling/deleting a user actually
+// terminates their session within one access-token lifetime.
+func (s *Store) RefreshUser(ctx context.Context, tenantID, userID string) (role, status string, err error) {
+	tx, err := s.pool.BeginTenant(ctx, tenantID, userID)
+	if err != nil {
+		return "", "", err
+	}
+	defer tx.Rollback(ctx)
+
+	err = tx.QueryRow(ctx,
+		`SELECT role, status FROM users WHERE id = $1 AND tenant_id = $2`,
+		userID, tenantID).Scan(&role, &status)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", "", ErrUserInactive
+		}
+		return "", "", fmt.Errorf("refresh user: %w", err)
+	}
+	if status != "active" {
+		return "", "", ErrUserInactive
+	}
+	return role, status, tx.Commit(ctx)
+}
+
+// ErrUserInactive is returned when a session's user no longer exists or is not
+// active (disabled/deleted) — used to fail the refresh path closed.
+var ErrUserInactive = errors.New("user is inactive or does not exist")
 
 // LookupSSOUser maps a verified SSO (OIDC) email to a provisioned active user's
 // id, tenant, and role — via the cross-tenant carve-out (works under the
@@ -164,10 +207,13 @@ func (s *Store) SetMFASecret(ctx context.Context, tenantID, userID, secret strin
 
 	var got string
 	err = tx.QueryRow(ctx,
-		`UPDATE users SET mfa_secret = NULLIF($2, '') WHERE id = $1 RETURNING id`,
-		userID, secret).Scan(&got)
+		`UPDATE users SET mfa_secret = NULLIF($2, '') WHERE id = $1 AND tenant_id = $3 RETURNING id`,
+		userID, secret, tenantID).Scan(&got)
 	if err != nil {
-		return fmt.Errorf("user not found")
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("user not found")
+		}
+		return fmt.Errorf("set mfa secret: %w", err)
 	}
 	return tx.Commit(ctx)
 }
@@ -181,7 +227,7 @@ func (s *Store) GetMFASecret(ctx context.Context, tenantID, userID string) (stri
 	defer tx.Rollback(ctx)
 
 	var secret *string
-	if err := tx.QueryRow(ctx, `SELECT mfa_secret FROM users WHERE id = $1`, userID).Scan(&secret); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT mfa_secret FROM users WHERE id = $1 AND tenant_id = $2`, userID, tenantID).Scan(&secret); err != nil {
 		return "", err
 	}
 	if err := tx.Commit(ctx); err != nil {

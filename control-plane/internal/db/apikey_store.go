@@ -6,8 +6,11 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // APIKeyRow is an API key as shown in the admin API. It NEVER carries the raw
@@ -101,10 +104,12 @@ func (s *Store) ListAPIKeys(ctx context.Context, tenantID, actorID string) ([]AP
 	}
 	defer tx.Rollback(ctx)
 
+	// Explicit tenant_id predicate (defense-in-depth): do not rely on RLS alone.
 	rows, err := tx.Query(ctx, `
 		SELECT id, tenant_id, name, role, scopes, expires_at, revoked_at, last_used_at, created_at
 		FROM api_keys
-		ORDER BY created_at DESC`)
+		WHERE tenant_id = $1
+		ORDER BY created_at DESC`, tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("list api keys: %w", err)
 	}
@@ -135,9 +140,14 @@ func (s *Store) RevokeAPIKey(ctx context.Context, tenantID, actorID, id string) 
 	defer tx.Rollback(ctx)
 
 	var got string
-	err = tx.QueryRow(ctx, `UPDATE api_keys SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL RETURNING id`, id).Scan(&got)
+	err = tx.QueryRow(ctx, `UPDATE api_keys SET revoked_at = now() WHERE id = $1 AND tenant_id = $2 AND revoked_at IS NULL RETURNING id`, id, tenantID).Scan(&got)
 	if err != nil {
-		return fmt.Errorf("api key not found or already revoked")
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("api key not found or already revoked")
+		}
+		// A real DB/permission/timeout failure must NOT be reported as
+		// "already revoked" — an operator could believe a live key is dead.
+		return fmt.Errorf("revoke api key: %w", err)
 	}
 	return tx.Commit(ctx)
 }
