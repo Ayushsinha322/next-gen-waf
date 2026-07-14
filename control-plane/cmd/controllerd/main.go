@@ -105,8 +105,15 @@ func run() error {
 	// ── JWT ───────────────────────────────────────────────────────────────────
 	jwtCfg := auth.DefaultJWTConfig()
 	jwtCfg.Secret = os.Getenv("SENTINEL_JWT_SECRET")
-	if jwtCfg.Secret == "" {
-		log.Warn("SENTINEL_JWT_SECRET not set — using random key (HA unsafe)")
+	devLogin := os.Getenv("SENTINEL_DEV_LOGIN") == "1" || os.Getenv("SENTINEL_DEV_LOGIN") == "true"
+	if len(jwtCfg.Secret) < 32 {
+		if devLogin {
+			log.Warn("SENTINEL_JWT_SECRET missing/weak — dev-login mode: using a random key (tokens reset on restart, HA-unsafe)")
+		} else {
+			// Fail fast: a random per-process key silently breaks HA (nodes
+			// reject each other's tokens) and invalidates all sessions on restart.
+			return fmt.Errorf("SENTINEL_JWT_SECRET must be set to a strong value (>=32 chars); set SENTINEL_DEV_LOGIN=1 to bypass for local dev")
+		}
 	}
 	jwtSvc, err := auth.NewJWTService(jwtCfg)
 	if err != nil {
@@ -284,8 +291,28 @@ func run() error {
 		authGroup.GET("/oidc/callback", func(c *gin.Context) { handleOIDCCallback(c, jwtSvc, log) })
 	}
 
+	// Machine auth: an X-API-Key header is resolved to Claims via its hash. The
+	// lookup is pre-tenant (SECURITY DEFINER carve-out) so it works under the
+	// non-superuser DB role with FORCE RLS. Bearer JWTs still take precedence.
+	apiKeyResolver := func(ctx context.Context, keyHash string) (*auth.Claims, error) {
+		if store == nil {
+			return nil, fmt.Errorf("db unavailable")
+		}
+		a, err := store.LookupAPIKeyByHash(ctx, keyHash)
+		if err != nil {
+			return nil, err
+		}
+		return &auth.Claims{
+			TenantID:   a.TenantID,
+			UserID:     a.CreatedBy,
+			Role:       a.Role,
+			Scopes:     a.Scopes,
+			AuthMethod: "apikey",
+		}, nil
+	}
+
 	protected := router.Group("/api/v1")
-	protected.Use(auth.GinAuthMiddleware(jwtSvc, false))
+	protected.Use(auth.GinAuthMiddlewareWithAPIKey(jwtSvc, false, apiKeyResolver))
 	{
 		protected.GET("/dashboard/stats", func(c *gin.Context) { handleDashboardStats(c, enforcer, store) })
 		protected.GET("/sites", func(c *gin.Context) { handleListSites(c, enforcer, store) })
@@ -409,13 +436,15 @@ func run() error {
 	router.POST("/api/v1/internal/nodes/heartbeat", func(c *gin.Context) { handleNodeHeartbeat(c, store) })
 
 	admin := router.Group("/api/v1/admin")
-	admin.Use(auth.GinAuthMiddleware(jwtSvc, true))
+	admin.Use(auth.GinAuthMiddlewareWithAPIKey(jwtSvc, true, apiKeyResolver))
 	{
-		admin.GET("/users", func(c *gin.Context) { handleListUsersReal(c, enforcer) })
-		admin.POST("/users", func(c *gin.Context) { handleCreateUserReal(c, enforcer) })
-		admin.GET("/apikeys", func(c *gin.Context) { handleListAPIKeysReal(c, enforcer) })
-		admin.POST("/apikeys", func(c *gin.Context) { handleCreateAPIKeyReal(c, enforcer) })
-		admin.DELETE("/apikeys/:id", func(c *gin.Context) { handleRevokeAPIKey(c, enforcer) })
+		admin.GET("/users", func(c *gin.Context) { handleListUsersReal(c, enforcer, store) })
+		admin.POST("/users", func(c *gin.Context) { handleCreateUserReal(c, enforcer, store) })
+		admin.PATCH("/users/:id", func(c *gin.Context) { handleUpdateUser(c, enforcer, store) })
+		admin.DELETE("/users/:id", func(c *gin.Context) { handleDeleteUser(c, enforcer, store) })
+		admin.GET("/apikeys", func(c *gin.Context) { handleListAPIKeysReal(c, enforcer, store) })
+		admin.POST("/apikeys", func(c *gin.Context) { handleCreateAPIKeyReal(c, enforcer, store) })
+		admin.DELETE("/apikeys/:id", func(c *gin.Context) { handleRevokeAPIKey(c, enforcer, store) })
 	}
 
 	// ── Graceful shutdown ─────────────────────────────────────────────────────

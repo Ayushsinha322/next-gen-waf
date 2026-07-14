@@ -1910,35 +1910,51 @@ func handleMetrics(c *gin.Context, hub *logs.Hub) {
 }
 
 // ---------------------------------------------------------------------------
-// Admin — Users & API Keys (enhanced with mock data)
+// Admin — Users & API Keys (real, DB-backed, tenant-scoped)
 // ---------------------------------------------------------------------------
 
-func handleListUsersReal(c *gin.Context, enf *rbac.Enforcer) {
+// validUserRole guards the 5-role model before it hits the DB CHECK constraint.
+func validUserRole(r string) bool {
+	switch r {
+	case "owner", "admin", "editor", "viewer", "auditor":
+		return true
+	}
+	return false
+}
+
+func handleListUsersReal(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceUser, rbac.ActionList) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{
-		"users": []gin.H{
-			{"id": db.DevAdminID, "email": "admin@sentinel.local", "name": "Admin", "role": "admin", "status": "active", "twofa": true, "last_login": time.Now().Add(-2 * time.Minute)},
-			{"id": "00000000-0000-0000-0000-000000000003", "email": "raj.kumar@sentinel.local", "name": "Raj Kumar", "role": "editor", "status": "active", "twofa": true, "last_login": time.Now().Add(-2 * time.Hour)},
-			{"id": "00000000-0000-0000-0000-000000000004", "email": "priya.dev@sentinel.local", "name": "Priya Dev", "role": "viewer", "status": "active", "twofa": false, "last_login": time.Now().Add(-24 * time.Hour)},
-		},
-		"tenant_id": claims.TenantID,
-	})
+	if store == nil {
+		c.JSON(http.StatusOK, gin.H{"users": []db.UserRow{}, "tenant_id": claims.TenantID})
+		return
+	}
+	users, err := store.ListUsers(c.Request.Context(), claims.TenantID, claims.UserID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"users": users, "tenant_id": claims.TenantID})
 }
 
-func handleCreateUserReal(c *gin.Context, enf *rbac.Enforcer) {
+func handleCreateUserReal(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceUser, rbac.ActionCreate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
 		return
 	}
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
+		return
+	}
 	var req struct {
-		Email string `json:"email" binding:"required"`
-		Name  string `json:"name"`
-		Role  string `json:"role"`
+		Email    string `json:"email" binding:"required,email"`
+		Name     string `json:"name"`
+		Role     string `json:"role"`
+		Password string `json:"password" binding:"required,min=12"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -1947,74 +1963,143 @@ func handleCreateUserReal(c *gin.Context, enf *rbac.Enforcer) {
 	if req.Role == "" {
 		req.Role = "viewer"
 	}
-	c.JSON(http.StatusCreated, gin.H{
-		"user": gin.H{
-			"id":    fmt.Sprintf("user-%d", time.Now().UnixNano()%100000000),
-			"email": req.Email, "name": req.Name, "role": req.Role,
-			"status": "active", "twofa": false, "last_login": nil,
-		},
-		"message": fmt.Sprintf("Invitation sent to %s", req.Email),
-	})
+	if !validUserRole(req.Role) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid role"})
+		return
+	}
+	u, err := store.CreateUser(c.Request.Context(), claims.TenantID, claims.UserID, req.Email, req.Name, req.Role, req.Password)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusCreated, gin.H{"user": u})
 }
 
-func handleListAPIKeysReal(c *gin.Context, enf *rbac.Enforcer) {
+func handleUpdateUser(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 	claims, _ := auth.GetClaims(c.Request.Context())
-	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceAPIKey, rbac.ActionList) {
+	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceUser, rbac.ActionUpdate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{
-		"api_keys": []gin.H{
-			{"id": "key-1", "name": "CI/CD Pipeline", "preview": "sk-live-f87a48c6••••51de", "scope": "read:all write:rules", "created_at": "2024-11-01T00:00:00Z", "expires_at": "2025-11-01T00:00:00Z", "last_used": "2 min ago"},
-			{"id": "key-2", "name": "Monitoring Agent", "preview": "sk-live-a2b3c4d5••••ef90", "scope": "read:all", "created_at": "2024-10-15T00:00:00Z", "expires_at": "2025-10-15T00:00:00Z", "last_used": "5 min ago"},
-			{"id": "key-3", "name": "Backup Script", "preview": "sk-live-9f8e7d6c••••ba01", "scope": "read:logs", "created_at": "2024-09-01T00:00:00Z", "expires_at": "2025-09-01T00:00:00Z", "last_used": "3d ago"},
-		},
-		"tenant_id": claims.TenantID,
-	})
-}
-
-func handleCreateAPIKeyReal(c *gin.Context, enf *rbac.Enforcer) {
-	claims, _ := auth.GetClaims(c.Request.Context())
-	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceAPIKey, rbac.ActionCreate) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
 		return
 	}
 	var req struct {
-		Name  string `json:"name" binding:"required"`
-		Scope string `json:"scope"`
+		Role   string `json:"role"`
+		Status string `json:"status"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	nano := time.Now().UnixNano()
-	randomPart := fmt.Sprintf("%016x", nano)
-	fullKey := "sk-live-" + randomPart
-	preview := fullKey[:14] + "••••" + fullKey[len(fullKey)-4:]
-	scope := req.Scope
-	if scope == "" {
-		scope = "read:all"
+	if req.Role != "" && !validUserRole(req.Role) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid role"})
+		return
+	}
+	if err := store.UpdateUser(c.Request.Context(), claims.TenantID, claims.UserID, c.Param("id"), req.Role, req.Status); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+func handleDeleteUser(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
+	claims, _ := auth.GetClaims(c.Request.Context())
+	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceUser, rbac.ActionDelete) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
+		return
+	}
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
+		return
+	}
+	if c.Param("id") == claims.UserID {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "cannot delete your own account"})
+		return
+	}
+	if err := store.DeleteUser(c.Request.Context(), claims.TenantID, claims.UserID, c.Param("id")); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+func handleListAPIKeysReal(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
+	claims, _ := auth.GetClaims(c.Request.Context())
+	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceAPIKey, rbac.ActionList) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
+		return
+	}
+	if store == nil {
+		c.JSON(http.StatusOK, gin.H{"api_keys": []db.APIKeyRow{}, "tenant_id": claims.TenantID})
+		return
+	}
+	keys, err := store.ListAPIKeys(c.Request.Context(), claims.TenantID, claims.UserID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"api_keys": keys, "tenant_id": claims.TenantID})
+}
+
+func handleCreateAPIKeyReal(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
+	claims, _ := auth.GetClaims(c.Request.Context())
+	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceAPIKey, rbac.ActionCreate) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
+		return
+	}
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
+		return
+	}
+	var req struct {
+		Name        string   `json:"name" binding:"required"`
+		Role        string   `json:"role"`
+		Scopes      []string `json:"scopes"`
+		ExpiresDays int      `json:"expires_days"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.Role == "" {
+		req.Role = "viewer"
+	}
+	if !validUserRole(req.Role) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid role"})
+		return
+	}
+	var expiresAt *time.Time
+	if req.ExpiresDays > 0 {
+		t := time.Now().Add(time.Duration(req.ExpiresDays) * 24 * time.Hour)
+		expiresAt = &t
+	}
+	row, fullKey, err := store.CreateAPIKey(c.Request.Context(), claims.TenantID, claims.UserID, req.Name, req.Role, req.Scopes, expiresAt)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
 	}
 	c.JSON(http.StatusCreated, gin.H{
-		"api_key": gin.H{
-			"id":         fmt.Sprintf("key-%d", nano%100000000),
-			"name":       req.Name,
-			"key":        fullKey,
-			"preview":    preview,
-			"scope":      scope,
-			"created_at": time.Now().UTC(),
-			"expires_at": time.Now().Add(365 * 24 * time.Hour).UTC(),
-		},
-		"warning": "Copy this key now — it will never be shown again.",
+		"api_key": row,
+		"key":     fullKey, // shown exactly once
+		"warning": "Copy this key now — it is stored hashed and will never be shown again.",
 	})
 }
 
-func handleRevokeAPIKey(c *gin.Context, enf *rbac.Enforcer) {
+func handleRevokeAPIKey(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceAPIKey, rbac.ActionDelete) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
 		return
 	}
-	// id := c.Param("id")
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
+		return
+	}
+	if err := store.RevokeAPIKey(c.Request.Context(), claims.TenantID, claims.UserID, c.Param("id")); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"ok": true, "message": "API key revoked"})
 }

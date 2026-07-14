@@ -99,6 +99,71 @@ func GinAuthMiddleware(jwt *JWTService, adminOnly bool) gin.HandlerFunc {
 	}
 }
 
+// APIKeyResolver authenticates an API key by its (sha256) hash, returning
+// synthesized Claims (AuthMethod "apikey") or an error. Wired in main() to the
+// DB (LookupAPIKeyByHash); kept as a func so the auth package needn't import db.
+type APIKeyResolver func(ctx context.Context, keyHash string) (*Claims, error)
+
+// GinAuthMiddlewareWithAPIKey is GinAuthMiddleware plus an X-API-Key fallback:
+// when there is no Bearer token but an X-API-Key header is present, the key is
+// hashed and resolved to machine Claims. Bearer JWTs take precedence and behave
+// exactly as GinAuthMiddleware.
+func GinAuthMiddlewareWithAPIKey(jwt *JWTService, adminOnly bool, resolve APIKeyResolver) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		authHeader := c.GetHeader("Authorization")
+		apiKey := c.GetHeader("X-API-Key")
+
+		// API-key path — only when no Bearer token is presented.
+		if authHeader == "" && apiKey != "" {
+			if resolve == nil {
+				abortWithAuthError(c, ErrTokenInvalid)
+				return
+			}
+			claims, err := resolve(c.Request.Context(), HashAPIKey(apiKey))
+			if err != nil {
+				abortWithAuthError(c, ErrTokenInvalid)
+				return
+			}
+			if adminOnly && claims.Role != "owner" && claims.Role != "admin" {
+				abortWithAuthError(c, errors.New("auth: admin role required"))
+				return
+			}
+			injectClaims(c, claims)
+			c.Next()
+			return
+		}
+
+		// Bearer JWT path (default), identical to GinAuthMiddleware.
+		token, err := BearerToken(authHeader)
+		if err != nil {
+			abortWithAuthError(c, err)
+			return
+		}
+		claims, err := jwt.Validate(token)
+		if err != nil {
+			abortWithAuthError(c, err)
+			return
+		}
+		if claims.AuthMethod == "refresh" {
+			abortWithAuthError(c, ErrTokenInvalid)
+			return
+		}
+		if adminOnly && claims.Role != "owner" && claims.Role != "admin" {
+			abortWithAuthError(c, errors.New("auth: admin role required"))
+			return
+		}
+		injectClaims(c, claims)
+		c.Next()
+	}
+}
+
+// injectClaims puts the claims + tenant id into the request context.
+func injectClaims(c *gin.Context, claims *Claims) {
+	ctx := context.WithValue(c.Request.Context(), ClaimsKey, claims)
+	ctx = context.WithValue(ctx, TenantIDKey, claims.TenantID)
+	c.Request = c.Request.WithContext(ctx)
+}
+
 // GinOptionalAuth validates the token if present but does not abort on missing
 // token.  Useful for public endpoints that behave differently when
 // authenticated.
