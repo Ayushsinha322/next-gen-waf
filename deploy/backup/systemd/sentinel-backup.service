@@ -1,0 +1,22 @@
+# Sentinel WAF — backup oneshot (invoked by sentinel-backup.timer).
+# Install:
+#   sudo cp deploy/backup/systemd/sentinel-backup.* /etc/systemd/system/
+#   sudo mkdir -p /etc/sentinel && sudo cp deploy/backup/systemd/backup.env.example /etc/sentinel/backup.env
+#   sudo $EDITOR /etc/sentinel/backup.env      # set repo path + ONE offsite target
+#   sudo systemctl daemon-reload && sudo systemctl enable --now sentinel-backup.timer
+[Unit]
+Description=Sentinel WAF backup (PostgreSQL + ClickHouse -> offsite)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+# All tunables (repo path, BACKUP_ROOT, RETENTION_DAYS, offsite target) live here.
+# (backup.sh resolves its own paths, so no WorkingDirectory is needed; systemd does
+#  not expand ${VAR} in WorkingDirectory anyway.)
+EnvironmentFile=/etc/sentinel/backup.env
+ExecStart=/bin/bash ${SENTINEL_REPO}/deploy/backup/backup.sh
+# Backups should never wedge the box:
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=1h

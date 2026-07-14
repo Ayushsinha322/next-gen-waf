@@ -1,0 +1,13 @@
+# Sentinel WAF — nightly backup schedule.
+[Unit]
+Description=Nightly Sentinel WAF backup
+
+[Timer]
+# 02:30 local time every day, with jitter so a fleet doesn't stampede offsite.
+OnCalendar=*-*-* 02:30:00
+RandomizedDelaySec=10m
+# If the box was off at 02:30, run at next boot.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
