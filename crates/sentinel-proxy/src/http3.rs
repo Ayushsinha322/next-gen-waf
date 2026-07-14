@@ -26,10 +26,11 @@ use anyhow::{anyhow, Context, Result};
 use bytes::{Buf, Bytes};
 use http::{header, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
+use sentinel_telemetry::inc_load_shed_connections;
 use tokio::sync::watch;
 use tracing::{debug, info};
 
-use crate::{run_pipeline, BoxBody, ServerState};
+use crate::{run_pipeline, ActiveConnGuard, BoxBody, ServerState};
 
 /// The QUIC backend type used throughout. `h3` is generic over the QUIC impl;
 /// `h3-quinn` is our only one, so we pin it here rather than threading `h3::quic`
@@ -111,9 +112,26 @@ pub(crate) async fn serve_quic(
             maybe_incoming = endpoint.accept() => {
                 match maybe_incoming {
                     Some(incoming) => {
+                        // Connection admission control — share the global
+                        // connection limiter with the TCP accept loop so the
+                        // cap is truly process-wide across both transports.
+                        // Over capacity: refuse the QUIC handshake (transport
+                        // close) rather than spawn an unbounded task.
+                        let permit = match Arc::clone(&state.conn_limiter).try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                inc_load_shed_connections();
+                                debug!("HTTP/3 connection admission: at max_connections, refusing");
+                                incoming.refuse();
+                                continue;
+                            }
+                        };
                         let state = Arc::clone(&state);
                         let ds = default_site.clone();
                         tokio::spawn(async move {
+                            // Permit + gauge guard held for the connection's life.
+                            let _permit = permit;
+                            let _active = ActiveConnGuard::new();
                             if let Err(e) = handle_quic_connection(incoming, state, ds).await {
                                 debug!("HTTP/3 connection error: {e}");
                             }
