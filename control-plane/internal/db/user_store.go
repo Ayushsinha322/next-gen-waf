@@ -139,3 +139,42 @@ func (s *Store) DeleteUser(ctx context.Context, tenantID, actorID, userID string
 	}
 	return tx.Commit(ctx)
 }
+
+// SetMFASecret sets (or clears, when secret == "") a user's TOTP secret.
+func (s *Store) SetMFASecret(ctx context.Context, tenantID, userID, secret string) error {
+	tx, err := s.pool.BeginTenant(ctx, tenantID, userID)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var got string
+	err = tx.QueryRow(ctx,
+		`UPDATE users SET mfa_secret = NULLIF($2, '') WHERE id = $1 RETURNING id`,
+		userID, secret).Scan(&got)
+	if err != nil {
+		return fmt.Errorf("user not found")
+	}
+	return tx.Commit(ctx)
+}
+
+// GetMFASecret returns a user's TOTP secret ("" if MFA is not enabled).
+func (s *Store) GetMFASecret(ctx context.Context, tenantID, userID string) (string, error) {
+	tx, err := s.pool.BeginTenant(ctx, tenantID, userID)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback(ctx)
+
+	var secret *string
+	if err := tx.QueryRow(ctx, `SELECT mfa_secret FROM users WHERE id = $1`, userID).Scan(&secret); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", err
+	}
+	if secret == nil {
+		return "", nil
+	}
+	return *secret, nil
+}

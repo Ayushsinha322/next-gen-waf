@@ -341,6 +341,9 @@ func run() error {
 	protected.Use(auth.GinAuthMiddlewareWithAPIKey(jwtSvc, false, apiKeyResolver))
 	{
 		protected.POST("/auth/logout", func(c *gin.Context) { handleLogout(c, jwtSvc, store) })
+		protected.POST("/auth/mfa/enroll", func(c *gin.Context) { handleMFAEnroll(c) })
+		protected.POST("/auth/mfa/confirm", func(c *gin.Context) { handleMFAConfirm(c, store) })
+		protected.POST("/auth/mfa/disable", func(c *gin.Context) { handleMFADisable(c, store) })
 		protected.GET("/dashboard/stats", func(c *gin.Context) { handleDashboardStats(c, enforcer, store) })
 		protected.GET("/sites", func(c *gin.Context) { handleListSites(c, enforcer, store) })
 		protected.GET("/sites/export", func(c *gin.Context) { handleExportSites(c, enforcer, store) })

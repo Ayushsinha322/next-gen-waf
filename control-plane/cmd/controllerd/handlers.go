@@ -36,6 +36,8 @@ var configVersion atomic.Int64
 type loginRequest struct {
 	Email    string `json:"email" binding:"required"`
 	Password string `json:"password" binding:"required"`
+	// MFACode is the 6-digit TOTP, required only when the account has MFA on.
+	MFACode string `json:"mfa_code"`
 }
 
 // devLoginEnabled reports whether the no-database admin/admin123 backdoor is
@@ -106,6 +108,26 @@ func handleLogin(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store, hub *
 			UserID:     userID,
 			Role:       role,
 			AuthMethod: "password",
+		}
+
+		// Second factor: if the account has TOTP enabled, a valid code is
+		// required. An empty code returns mfa_required (so the client prompts,
+		// not counted as a failure); a wrong code is a failed attempt.
+		mfaSecret, mfaErr := store.GetMFASecret(c.Request.Context(), userTenant, userID)
+		if mfaErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "mfa check failed"})
+			return
+		}
+		if mfaSecret != "" {
+			if req.MFACode == "" {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "mfa_required", "mfa_required": true})
+				return
+			}
+			if !auth.VerifyTOTP(mfaSecret, req.MFACode) {
+				loginAttempts.recordFailure(loginKey)
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid mfa code"})
+				return
+			}
 		}
 	} else {
 		// No user database. The built-in admin/admin123 backdoor exists only for
@@ -226,6 +248,92 @@ func handleLogout(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store) {
 		}
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// handleMFAEnroll generates a new TOTP secret + provisioning URI for the caller.
+// The secret is returned but NOT stored yet — the user must prove a working code
+// via /auth/mfa/confirm before MFA is activated (so a mistyped QR can't lock
+// them out).
+func handleMFAEnroll(c *gin.Context) {
+	claims, ok := auth.GetClaims(c.Request.Context())
+	if !ok || claims == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "not authenticated"})
+		return
+	}
+	secret, err := auth.GenerateTOTPSecret()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"secret":      secret,
+		"otpauth_uri": auth.TOTPURI("Sentinel WAF", claims.UserID, secret),
+		"note":        "Add to an authenticator app, then POST {secret, code} to /auth/mfa/confirm to activate.",
+	})
+}
+
+// handleMFAConfirm activates MFA once the user proves a working code.
+func handleMFAConfirm(c *gin.Context, store *db.Store) {
+	claims, ok := auth.GetClaims(c.Request.Context())
+	if !ok || claims == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "not authenticated"})
+		return
+	}
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
+		return
+	}
+	var req struct {
+		Secret string `json:"secret" binding:"required"`
+		Code   string `json:"code" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if !auth.VerifyTOTP(req.Secret, req.Code) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid code"})
+		return
+	}
+	if err := store.SetMFASecret(c.Request.Context(), claims.TenantID, claims.UserID, req.Secret); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "mfa_enabled": true})
+}
+
+// handleMFADisable turns MFA off after verifying a current code.
+func handleMFADisable(c *gin.Context, store *db.Store) {
+	claims, ok := auth.GetClaims(c.Request.Context())
+	if !ok || claims == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "not authenticated"})
+		return
+	}
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
+		return
+	}
+	var req struct {
+		Code string `json:"code" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	secret, err := store.GetMFASecret(c.Request.Context(), claims.TenantID, claims.UserID)
+	if err != nil || secret == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "mfa not enabled"})
+		return
+	}
+	if !auth.VerifyTOTP(secret, req.Code) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid code"})
+		return
+	}
+	if err := store.SetMFASecret(c.Request.Context(), claims.TenantID, claims.UserID, ""); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "mfa_enabled": false})
 }
 
 // oidcStateCookie holds the per-login CSRF state that binds the /login redirect
