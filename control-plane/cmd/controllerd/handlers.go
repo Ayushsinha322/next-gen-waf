@@ -399,7 +399,7 @@ func handleOIDCLogin(c *gin.Context, jwtSvc *auth.JWTService, log *zap.Logger) {
 	c.Redirect(http.StatusFound, authURL)
 }
 
-func handleOIDCCallback(c *gin.Context, jwtSvc *auth.JWTService, log *zap.Logger) {
+func handleOIDCCallback(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store, log *zap.Logger) {
 	cfg, ok := oidcConfigFromEnv()
 	if !ok {
 		c.JSON(http.StatusNotImplemented, gin.H{"error": "OIDC login is not configured"})
@@ -431,10 +431,24 @@ func handleOIDCCallback(c *gin.Context, jwtSvc *auth.JWTService, log *zap.Logger
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "OIDC token exchange failed"})
 		return
 	}
+	// Map the verified identity to a REAL provisioned user (its tenant + role),
+	// instead of minting a fixed dev-tenant editor for anyone who can complete
+	// the OIDC exchange. Unknown identities are rejected — an admin must
+	// provision the user first.
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "user database unavailable"})
+		return
+	}
+	userID, tenantID, role, err := store.LookupSSOUser(c.Request.Context(), userInfo.Email)
+	if err != nil {
+		log.Warn("oidc login for unprovisioned identity", zap.String("email", userInfo.Email))
+		c.JSON(http.StatusForbidden, gin.H{"error": "no account for this identity — ask an admin to provision your user"})
+		return
+	}
 	claims := auth.Claims{
-		TenantID:   db.DevTenantID,
-		UserID:     userInfo.Subject,
-		Role:       "editor",
+		TenantID:   tenantID,
+		UserID:     userID,
+		Role:       role,
 		AuthMethod: "oidc",
 	}
 	pair, err := jwtSvc.IssueTokenPair(claims)

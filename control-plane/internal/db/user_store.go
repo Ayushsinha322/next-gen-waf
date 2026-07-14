@@ -140,6 +140,20 @@ func (s *Store) DeleteUser(ctx context.Context, tenantID, actorID, userID string
 	return tx.Commit(ctx)
 }
 
+// LookupSSOUser maps a verified SSO (OIDC) email to a provisioned active user's
+// id, tenant, and role — via the cross-tenant carve-out (works under the
+// non-superuser role with FORCE RLS). Errors if no active user matches.
+func (s *Store) LookupSSOUser(ctx context.Context, email string) (userID, tenantID, role string, err error) {
+	pg, ok := s.pool.(*pgxPool)
+	if !ok {
+		return "", "", "", fmt.Errorf("store: pool is not a *pgxPool")
+	}
+	err = pg.pool.QueryRow(ctx,
+		`SELECT id, tenant_id, role FROM sentinel_sso_lookup($1)`, email).
+		Scan(&userID, &tenantID, &role)
+	return userID, tenantID, role, err
+}
+
 // SetMFASecret sets (or clears, when secret == "") a user's TOTP secret.
 func (s *Store) SetMFASecret(ctx context.Context, tenantID, userID, secret string) error {
 	tx, err := s.pool.BeginTenant(ctx, tenantID, userID)

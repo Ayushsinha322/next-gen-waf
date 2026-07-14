@@ -115,6 +115,12 @@ func run() error {
 			return fmt.Errorf("SENTINEL_JWT_SECRET must be set to a strong value (>=32 chars); set SENTINEL_DEV_LOGIN=1 to bypass for local dev")
 		}
 	}
+
+	// Audit-log tamper-evidence relies on a real HMAC key — the built-in default
+	// makes the hash chain meaningless. Fail fast in prod (bypass for local dev).
+	if len(os.Getenv("SENTINEL_AUDIT_HMAC_KEY")) < 32 && !devLogin {
+		return fmt.Errorf("SENTINEL_AUDIT_HMAC_KEY must be set to a strong value (>=32 chars); set SENTINEL_DEV_LOGIN=1 to bypass for local dev")
+	}
 	jwtSvc, err := auth.NewJWTService(jwtCfg)
 	if err != nil {
 		return fmt.Errorf("initialising JWT service: %w", err)
@@ -314,7 +320,7 @@ func run() error {
 		authGroup.POST("/login", func(c *gin.Context) { handleLogin(c, jwtSvc, store, hub) })
 		authGroup.POST("/refresh", func(c *gin.Context) { handleRefresh(c, jwtSvc) })
 		authGroup.GET("/oidc/login", func(c *gin.Context) { handleOIDCLogin(c, jwtSvc, log) })
-		authGroup.GET("/oidc/callback", func(c *gin.Context) { handleOIDCCallback(c, jwtSvc, log) })
+		authGroup.GET("/oidc/callback", func(c *gin.Context) { handleOIDCCallback(c, jwtSvc, store, log) })
 	}
 
 	// Machine auth: an X-API-Key header is resolved to Claims via its hash. The
