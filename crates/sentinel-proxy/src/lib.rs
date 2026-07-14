@@ -66,9 +66,13 @@ use sentinel_modules::{
 };
 use sentinel_plugins::PluginRuntime;
 use sentinel_rules::RuleEngine;
-use sentinel_telemetry::{inc_blocked, inc_ebpf_drops, inc_requests, observe_duration};
+use sentinel_telemetry::{
+    dec_active_connections, inc_active_connections, inc_blocked, inc_ebpf_drops,
+    inc_load_shed_connections, inc_load_shed_requests, inc_requests, inc_rule_hits,
+    observe_duration, prometheus_text,
+};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{watch, Semaphore};
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn, Instrument};
 
@@ -324,6 +328,44 @@ struct ServerState {
     /// HTTP-01 ACME challenge tokens: token → key_authorization.
     /// Checked in handle_request before any WAF pipeline work.
     http01_tokens: Arc<DashMap<String, String>>,
+    /// Admission control — bounds concurrent client connections across all
+    /// listeners (TCP + QUIC). Excess connections are rejected at accept so a
+    /// flood cannot exhaust file descriptors or memory. See `serve_listener`.
+    conn_limiter: Arc<Semaphore>,
+    /// Admission control — bounds concurrent in-flight WAF-processed requests
+    /// across all transports (h1/h2/h3). Excess requests shed with 503; this
+    /// specifically caps HTTP/2 & HTTP/3 stream fan-out. See `run_pipeline`.
+    request_limiter: Arc<Semaphore>,
+}
+
+/// Resolve an admission-control limit: an environment variable (if set to a
+/// positive integer) overrides the config value; otherwise the config value is
+/// used. A resolved value of 0 is clamped to 1 (a Semaphore needs ≥1 permit).
+fn resolve_limit(env_key: &str, config_value: usize) -> usize {
+    std::env::var(env_key)
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(config_value)
+        .max(1)
+}
+
+/// RAII guard that keeps the live active-connection gauge in sync with the set
+/// of admitted connections: increments on construction, decrements on drop
+/// (drop runs even if the connection task panics).
+pub(crate) struct ActiveConnGuard;
+
+impl ActiveConnGuard {
+    pub(crate) fn new() -> Self {
+        inc_active_connections();
+        Self
+    }
+}
+
+impl Drop for ActiveConnGuard {
+    fn drop(&mut self) {
+        dec_active_connections();
+    }
 }
 
 /// Upstreams the dedicated management listener reverse-proxies to. The admin
@@ -416,6 +458,21 @@ impl ProxyServer {
             shutdown.changed().await.ok();
             return Ok(());
         }
+
+        // Admission control — global concurrency ceilings so a connection or
+        // request flood sheds gracefully instead of exhausting FDs / memory.
+        // Env vars override the config file (see `LimitsConfig`).
+        let max_connections = resolve_limit("SENTINEL_MAX_CONNECTIONS", cfg.limits.max_connections);
+        let max_inflight_requests = resolve_limit(
+            "SENTINEL_MAX_INFLIGHT_REQUESTS",
+            cfg.limits.max_inflight_requests,
+        );
+        info!(
+            max_connections,
+            max_inflight_requests, "connection admission control enabled"
+        );
+        let conn_limiter = Arc::new(Semaphore::new(max_connections));
+        let request_limiter = Arc::new(Semaphore::new(max_inflight_requests));
 
         let upstream_pool = Arc::new(UpstreamPool::from_config(&cfg));
 
@@ -686,6 +743,8 @@ impl ProxyServer {
             ebpf: Arc::clone(&ebpf),
             cert_manager,
             http01_tokens,
+            conn_limiter,
+            request_limiter,
         });
 
         // --- Background: config hot-reload watcher ---
@@ -1322,6 +1381,19 @@ async fn serve_listener(
         tokio::select! {
             accept = tcp.accept() => {
                 let (stream, peer) = accept?;
+                // Connection admission control: acquire a permit from the global
+                // connection semaphore *before* spawning a task. When the box is
+                // at `max_connections`, the permit is unavailable and the freshly
+                // accepted socket is dropped here (connection reject) — bounding
+                // file descriptors and memory so a flood sheds instead of OOMing.
+                let permit = match Arc::clone(&state.conn_limiter).try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        inc_load_shed_connections();
+                        debug!(peer = %peer, "connection admission: at max_connections, rejecting");
+                        continue;
+                    }
+                };
                 let state = Arc::clone(&state);
                 let acceptor = tls_acceptor.clone();
                 let protos = cfg.protocols();
@@ -1329,6 +1401,11 @@ async fn serve_listener(
                 let mgmt = management.clone();
                 let av = alt_svc.clone();
                 tokio::spawn(async move {
+                    // Permit is held for the connection's lifetime and released
+                    // (freeing a slot) when this task ends; the guard keeps the
+                    // active-connection gauge in sync even on panic.
+                    let _permit = permit;
+                    let _active = ActiveConnGuard::new();
                     if let Err(e) = handle_connection(stream, peer, acceptor, protos, state, ds, mgmt, av).await {
                         debug!(peer = %peer, "connection error: {e}");
                     }
@@ -1520,6 +1597,15 @@ async fn handle_request(
         return Ok(readyz_response(&state));
     }
 
+    // Prometheus metrics — served before any WAF pipeline work so every proxy
+    // pod is scrapeable at GET /metrics (requests/blocked/latency/rule-hits/
+    // eBPF-drops/active-connections/load-shed). Like the health probes above,
+    // this is internal-only (no auth) and expected to be network-restricted;
+    // it is served on every listener, including the management endpoint.
+    if req.method() == http::Method::GET && req.uri().path() == "/metrics" {
+        return Ok(metrics_response());
+    }
+
     // Management listener: this is the dedicated admin-console endpoint. It
     // bypasses the WAF pipeline entirely and reverse-proxies the dashboard +
     // control-plane API (the admin UI is auth-gated by the control plane). Done
@@ -1599,6 +1685,22 @@ pub(crate) async fn run_pipeline(
         inc_blocked();
         return error_response(StatusCode::FORBIDDEN, "Forbidden");
     }
+
+    // Request admission control: acquire a permit from the global in-flight
+    // request semaphore. This is the per-request half of admission control (the
+    // accept loop bounds connections); it specifically caps HTTP/2 and HTTP/3
+    // stream multiplexing, where one connection may open hundreds of concurrent
+    // streams that would otherwise all enter the (expensive) WAF pipeline at
+    // once. Excess sheds with 503 + Retry-After. Health/readiness/metrics and
+    // the management console are handled upstream of this and are never shed.
+    let _req_permit = match Arc::clone(&state.request_limiter).try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            inc_requests();
+            inc_load_shed_requests();
+            return overloaded_response();
+        }
+    };
 
     let t0 = Instant::now();
 
@@ -2784,10 +2886,17 @@ fn eval_rules(ctx: &mut RequestContext, engine: &RuleEngine, phase: Phase, waf: 
         waf.anomaly_threshold
     };
     let before = ctx.anomaly_score;
+    let matches_before = ctx.rule_matches.len();
     engine.evaluate(ctx, phase, threshold);
     let delta = ctx.anomaly_score.saturating_sub(before);
     if delta > 0 {
         *ctx.engine_scores.entry("rules".to_string()).or_insert(0) += delta;
+    }
+    // Metrics: each rule that matched during this phase is one rule-hit event.
+    // `rule_matches` only grows here, so the difference is the new-match count.
+    let new_matches = ctx.rule_matches.len().saturating_sub(matches_before);
+    for _ in 0..new_matches {
+        inc_rule_hits();
     }
 }
 
@@ -4096,6 +4205,34 @@ fn error_response(status: StatusCode, message: &str) -> Response<BoxBody> {
         .unwrap()
 }
 
+/// `GET /metrics` — the global WAF metrics registry rendered in Prometheus text
+/// exposition format. Content-Type follows the Prometheus text format spec so
+/// scrapers parse it without a manual override.
+fn metrics_response() -> Response<BoxBody> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )
+        .body(full_body(Bytes::from(prometheus_text())))
+        .unwrap()
+}
+
+/// Load-shed response returned when the global in-flight request limit is
+/// saturated. `503` + `Retry-After: 1` tells well-behaved clients and upstream
+/// load balancers to back off and retry rather than hammer an overloaded node.
+fn overloaded_response() -> Response<BoxBody> {
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header(header::RETRY_AFTER, "1")
+        .header(header::CONTENT_TYPE, "text/plain")
+        .body(full_body(Bytes::from_static(
+            b"503 Service Unavailable: server at capacity\n",
+        )))
+        .unwrap()
+}
+
 fn log_request(ctx: &RequestContext) {
     let status = ctx.response_status.map(|s| s.as_u16()).unwrap_or(0);
     let rule_ids: Vec<&str> = ctx
@@ -4907,5 +5044,110 @@ mod fusion_tests {
         c.add_engine_score("rules", 1);
         apply_verdict(&mut c, &w);
         assert_eq!(c.decision, WafDecision::Block);
+    }
+}
+
+#[cfg(test)]
+mod admission_control_tests {
+    use super::*;
+
+    // A unique env-var name per assertion keeps these tests independent even
+    // when the test binary runs them on multiple threads (env is process-global).
+
+    #[test]
+    fn resolve_limit_uses_config_when_env_unset() {
+        // Guaranteed-unset key.
+        assert_eq!(
+            resolve_limit("SENTINEL_TEST_ADMISSION_UNSET_XZ", 4096),
+            4096
+        );
+    }
+
+    #[test]
+    fn resolve_limit_env_overrides_config() {
+        let key = "SENTINEL_TEST_ADMISSION_OVERRIDE";
+        std::env::set_var(key, "250");
+        assert_eq!(resolve_limit(key, 4096), 250);
+        std::env::remove_var(key);
+    }
+
+    #[test]
+    fn resolve_limit_ignores_invalid_and_zero_env() {
+        let key = "SENTINEL_TEST_ADMISSION_INVALID";
+        std::env::set_var(key, "not-a-number");
+        assert_eq!(resolve_limit(key, 4096), 4096);
+        std::env::set_var(key, "0"); // 0 permits is invalid → fall back to config
+        assert_eq!(resolve_limit(key, 4096), 4096);
+        std::env::remove_var(key);
+    }
+
+    #[test]
+    fn resolve_limit_clamps_zero_config_to_one() {
+        // A Semaphore needs at least one permit; a misconfigured 0 must not
+        // deadlock every connection.
+        assert_eq!(resolve_limit("SENTINEL_TEST_ADMISSION_UNSET_ZERO", 0), 1);
+    }
+
+    #[test]
+    fn overloaded_response_is_503_with_retry_after() {
+        let resp = overloaded_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers().get(header::RETRY_AFTER).unwrap(),
+            "1",
+            "503 shed responses must tell clients/LBs to back off"
+        );
+    }
+
+    // Proves the semaphore-based admission primitive actually sheds: once every
+    // permit is held, the next acquisition fails (which is exactly what the
+    // accept loop / run_pipeline treat as the shed signal).
+    #[test]
+    fn semaphore_sheds_when_saturated() {
+        let sem = Arc::new(Semaphore::new(2));
+        let p1 = Arc::clone(&sem).try_acquire_owned();
+        let p2 = Arc::clone(&sem).try_acquire_owned();
+        assert!(p1.is_ok() && p2.is_ok(), "first two permits granted");
+        assert!(
+            Arc::clone(&sem).try_acquire_owned().is_err(),
+            "third acquisition must fail → load shed"
+        );
+        drop(p1); // a connection ends → a slot frees
+        assert!(
+            Arc::clone(&sem).try_acquire_owned().is_ok(),
+            "freed slot is reusable"
+        );
+    }
+}
+
+#[cfg(test)]
+mod metrics_endpoint_tests {
+    use super::*;
+    use http_body_util::BodyExt;
+
+    #[tokio::test]
+    async fn metrics_response_serves_prometheus_text() {
+        // Exercise the hot-path counters so the registry has real content.
+        inc_requests();
+        inc_rule_hits();
+        let resp = metrics_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            ct.starts_with("text/plain"),
+            "prometheus text content-type, got {ct}"
+        );
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        // The registry exposes the WAF counters, including the now-wired
+        // rule-hits counter, in Prometheus exposition format.
+        assert!(text.contains("sentinel_requests_total"));
+        assert!(text.contains("sentinel_rule_hits_total"));
+        assert!(text.contains("# TYPE sentinel_requests_total counter"));
     }
 }

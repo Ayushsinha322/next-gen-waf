@@ -4,7 +4,7 @@ use aho_corasick::AhoCorasick;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::dsl::ast::{RuleAction, RulePhase, RuleSeverity, Target, Transform};
+use crate::dsl::ast::{RuleAction, RulePhase, RuleSeverity, SetVar, Target, Transform};
 
 // ---------------------------------------------------------------------------
 // Target specification stored in instructions
@@ -175,6 +175,10 @@ pub struct RuleMeta {
     /// CRS `skipAfter:MARKER` — if this rule fires, the VM jumps forward
     /// to the `Marker` instruction with this name, skipping all rules in between.
     pub skip_after: Option<String>,
+    /// `setvar` mutations applied to the per-request TX store when this rule
+    /// fires (executed by the VM in `fire_rule`).
+    #[serde(default)]
+    pub setvars: Vec<SetVar>,
 }
 
 impl Default for RuleMeta {
@@ -188,6 +192,7 @@ impl Default for RuleMeta {
             tags: Vec::new(),
             phase: RulePhase::RequestBody,
             skip_after: None,
+            setvars: Vec::new(),
         }
     }
 }

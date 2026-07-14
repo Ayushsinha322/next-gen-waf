@@ -320,6 +320,12 @@ struct WafMetrics {
     pub active_connections: Gauge,
     pub rule_hits_total: Counter,
     pub ebpf_drops_total: Counter,
+    /// Connections rejected at accept because the global connection limit was
+    /// saturated (admission control — see `sentinel_proxy` accept loops).
+    pub load_shed_connections_total: Counter,
+    /// Requests shed with 503 because the global in-flight request limit was
+    /// saturated (admission control — bounds HTTP/2 & HTTP/3 stream fan-out).
+    pub load_shed_requests_total: Counter,
     pub registry: MetricsRegistry,
 }
 
@@ -350,6 +356,14 @@ impl WafMetrics {
             "sentinel_ebpf_drops_total",
             "Total number of packets dropped at the kernel XDP layer",
         );
+        let load_shed_connections_total = registry.register_counter(
+            "sentinel_load_shed_connections_total",
+            "Total number of connections rejected at accept due to the connection limit",
+        );
+        let load_shed_requests_total = registry.register_counter(
+            "sentinel_load_shed_requests_total",
+            "Total number of requests shed with 503 due to the in-flight request limit",
+        );
 
         Self {
             requests_total,
@@ -358,6 +372,8 @@ impl WafMetrics {
             active_connections,
             rule_hits_total,
             ebpf_drops_total,
+            load_shed_connections_total,
+            load_shed_requests_total,
             registry,
         }
     }
@@ -387,6 +403,28 @@ pub fn observe_duration(ms: f64) {
 /// Set the absolute number of active proxy connections.
 pub fn set_active_connections(n: i64) {
     WAF_METRICS.active_connections.set(n);
+}
+
+/// Increment the live active-connection gauge (call on connection admission).
+pub fn inc_active_connections() {
+    WAF_METRICS.active_connections.inc();
+}
+
+/// Decrement the live active-connection gauge (call when a connection ends).
+pub fn dec_active_connections() {
+    WAF_METRICS.active_connections.dec();
+}
+
+/// Increment the load-shed counter for a connection rejected at accept because
+/// the global connection limit was saturated.
+pub fn inc_load_shed_connections() {
+    WAF_METRICS.load_shed_connections_total.inc();
+}
+
+/// Increment the load-shed counter for a request shed with 503 because the
+/// global in-flight request limit was saturated.
+pub fn inc_load_shed_requests() {
+    WAF_METRICS.load_shed_requests_total.inc();
 }
 
 /// Increment the rule-hits counter.
@@ -470,5 +508,17 @@ mod tests {
         let text = prometheus_text();
         assert!(text.contains("sentinel_requests_total"));
         assert!(text.contains("sentinel_blocked_total"));
+    }
+
+    #[test]
+    fn load_shed_counters_exposed() {
+        inc_load_shed_connections();
+        inc_load_shed_requests();
+        inc_active_connections();
+        dec_active_connections();
+        let text = prometheus_text();
+        assert!(text.contains("sentinel_load_shed_connections_total"));
+        assert!(text.contains("sentinel_load_shed_requests_total"));
+        assert!(text.contains("sentinel_active_connections"));
     }
 }

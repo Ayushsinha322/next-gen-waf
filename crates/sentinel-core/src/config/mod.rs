@@ -32,9 +32,57 @@ pub struct SentinelConfig {
     pub storage: StorageConfig,
     #[serde(default)]
     pub ebpf: EbpfConfig,
+    /// Global connection/request admission-control limits (DoS load-shedding).
+    #[serde(default)]
+    pub limits: LimitsConfig,
     /// Directory where ACME certs are persisted.
     /// Defaults to `$HOME/.config/sentinel/certs` or `/var/lib/sentinel/certs`.
     pub cert_dir: Option<PathBuf>,
+}
+
+// ---------------------------------------------------------------------------
+// Admission-control limits
+// ---------------------------------------------------------------------------
+
+/// Global concurrency ceilings enforced by the data plane so a connection or
+/// request flood sheds gracefully (connection reject / 503) instead of
+/// exhausting file descriptors or memory. Both are process-wide, spanning every
+/// listener and both transports (TCP h1/h2 and QUIC/h3).
+///
+/// Each field can be overridden at startup by an environment variable, which
+/// takes precedence over the config file: `SENTINEL_MAX_CONNECTIONS` and
+/// `SENTINEL_MAX_INFLIGHT_REQUESTS`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LimitsConfig {
+    /// Maximum concurrent client connections across all listeners. Connections
+    /// accepted beyond this are immediately closed (rejected) at the accept
+    /// loop before any per-connection task is spawned, bounding file-descriptor
+    /// and memory use under a connection flood.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
+    /// Maximum concurrent in-flight WAF-processed requests across all listeners.
+    /// This specifically bounds HTTP/2 and HTTP/3 stream multiplexing, where a
+    /// single connection may open hundreds of concurrent streams. Requests
+    /// beyond this limit receive `503 Service Unavailable` with `Retry-After`.
+    #[serde(default = "default_max_inflight_requests")]
+    pub max_inflight_requests: usize,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: default_max_connections(),
+            max_inflight_requests: default_max_inflight_requests(),
+        }
+    }
+}
+
+fn default_max_connections() -> usize {
+    10_000
+}
+
+fn default_max_inflight_requests() -> usize {
+    8_192
 }
 
 // ---------------------------------------------------------------------------
