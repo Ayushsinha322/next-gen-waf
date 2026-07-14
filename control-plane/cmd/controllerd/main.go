@@ -477,6 +477,16 @@ func run() error {
 		admin.DELETE("/apikeys/:id", func(c *gin.Context) { handleRevokeAPIKey(c, enforcer, store) })
 	}
 
+	// Platform (tenant lifecycle) — provisioning is gated to the platform tenant's
+	// owner/admin (see isPlatformAdmin), distinct from per-tenant admin.
+	platform := router.Group("/api/v1/platform")
+	platform.Use(auth.GinAuthMiddlewareWithAPIKey(jwtSvc, true, apiKeyResolver))
+	{
+		platform.POST("/tenants", func(c *gin.Context) { handleCreateTenant(c, store) })
+		platform.GET("/tenants", func(c *gin.Context) { handleListTenants(c, store) })
+		platform.PATCH("/tenants/:id/status", func(c *gin.Context) { handleSetTenantStatus(c, store) })
+	}
+
 	// ── Graceful shutdown ─────────────────────────────────────────────────────
 
 	httpSrv := &http.Server{Addr: restAddr, Handler: router}
