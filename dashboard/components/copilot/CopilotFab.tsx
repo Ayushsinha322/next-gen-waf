@@ -1,7 +1,7 @@
 "use client";
 import { useState, useRef, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { AI_RESPONSES, GREET, getAIResponse } from "@/lib/aiResponses";
+import { GREET, askCopilot } from "@/lib/copilot";
 import type { ChatMessage } from "@/lib/types";
 import { spring } from "@/lib/animations";
 
@@ -40,15 +40,22 @@ export default function CopilotFab({ variant = "login" }: { variant?: "login" | 
     if (msgsRef.current) msgsRef.current.scrollTop = msgsRef.current.scrollHeight;
   }, [msgs, typing]);
 
-  function sendAI(text: string) {
+  async function sendAI(text: string) {
     const now = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    const history = msgs.map(m => ({ role: (m.who === "ai" ? "assistant" : "user") as "assistant" | "user", content: m.text }));
     setMsgs(p => [...p, { who: "usr", text, time: now }]);
     setTyping(true);
-    setTimeout(() => {
+    try {
+      const reply = await askCopilot(history, text);
       const now2 = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
       setTyping(false);
-      setMsgs(p => [...p, { who: "ai", text: getAIResponse(text), time: now2 }]);
-    }, 900 + Math.random() * 600);
+      setMsgs(p => [...p, { who: "ai", text: reply, time: now2 }]);
+    } catch (err: unknown) {
+      const now2 = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      setTyping(false);
+      const msg = err instanceof Error ? err.message : String(err);
+      setMsgs(p => [...p, { who: "ai", text: `⚠️ ${msg}`, time: now2 }]);
+    }
   }
 
   function sendInput() {
