@@ -1,0 +1,10 @@
+GET http://127.0.0.1:18081/
+GET http://127.0.0.1:18081/?q=hello&page=1
+GET http://127.0.0.1:18081/?category=news&sort=date&limit=20
+GET http://127.0.0.1:18081/index.html?ref=homepage
+GET http://127.0.0.1:18081/?search=weather+forecast&lang=en
+GET http://127.0.0.1:18081/?account=12345&action=view
+GET http://127.0.0.1:18081/?product=widget&qty=3
+GET http://127.0.0.1:18081/?page=2&sort=price
+GET http://127.0.0.1:18081/about.html
+GET http://127.0.0.1:18081/?id=1%27%20OR%20%271%27%3D%271%27%20--%20
