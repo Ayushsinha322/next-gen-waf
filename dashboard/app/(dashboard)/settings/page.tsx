@@ -3,7 +3,7 @@ import { useState, useEffect } from "react";
 import { motion } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
 import Toggle from "@/components/ui/Toggle";
-import { api, type UserRow, type APIKeyRow, type NotificationChannel, type ChannelType, type ChannelConfig, type Severity, type ManagementTLSInfo } from "@/lib/api";
+import { api, type UserRow, type APIKeyRow, type NotificationChannel, type ChannelType, type ChannelConfig, type Severity, type ManagementTLSInfo, type ClusterHealth } from "@/lib/api";
 import { staggerContainer, fadeUp, spring } from "@/lib/animations";
 
 const TABS = ["General","Auth & SSO","API Keys","Users & RBAC","Cluster","Notifications","Management TLS"];
@@ -275,42 +275,94 @@ function UsersTab() {
   );
 }
 
+// Cluster status — 100% live from GET /cluster/health (same source as the full
+// Cluster page). Degrades to an honest placeholder when the control plane is
+// unreachable; nothing here is hard-coded.
 function ClusterTab() {
+  const [health, setHealth] = useState<ClusterHealth | null>(null);
+  const [err, setErr] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function f() {
+      try { const r = await api.cluster.health(); if (!cancelled) { setHealth(r); setErr(false); } }
+      catch { if (!cancelled) setErr(true); }
+    }
+    f();
+    const t = setInterval(f, 10_000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, []);
+
+  const cp = health?.control_plane;
+  const dp = health?.data_plane;
+  const cpNodes = cp?.nodes ?? [];
+  const dpNodes = dp?.nodes ?? [];
+
+  const fmtAgo = (s: number) =>
+    s == null || s < 0 ? "—" : s < 60 ? `${Math.floor(s)}s ago` : s < 3600 ? `${Math.floor(s / 60)}m ago` : s < 86400 ? `${Math.floor(s / 3600)}h ago` : `${Math.floor(s / 86400)}d ago`;
+
+  const headBadge = !health
+    ? <span className="bdg bgr">{err ? "● unreachable" : "loading…"}</span>
+    : cp?.enabled
+      ? <span className={`bdg ${cp.quorum_ok ? "bgg" : "br"}`}><span className="bdr" />Raft · {cp.healthy}/{cp.total} nodes</span>
+      : <span className="bdg bcy">standalone</span>;
+
   return (
     <motion.div className="panel" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}>
       <div className="ph">
         <div className="ptitle">⚡ Cluster Status</div>
-        <span className="bdg bgg"><span className="bdr" />Raft · 3 nodes</span>
+        {headBadge}
       </div>
       <div className="pb">
-        <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:10, marginBottom:16 }}>
-          {([
-            {role:"LEADER",  name:"cp-primary-01", ip:"10.0.0.10:8080", uptime:"14d 6h", term:4, idx:"18,422", cpu:"12%", mem:"284MB", leader:true},
-            {role:"FOLLOWER",name:"cp-replica-02", ip:"10.0.0.11:8080", uptime:"14d 6h", term:4, idx:"18,422", cpu:"8%",  mem:"241MB", leader:false},
-            {role:"FOLLOWER",name:"cp-replica-03", ip:"10.0.0.12:8080", uptime:"14d 6h", term:4, idx:"18,421", cpu:"9%",  mem:"258MB", leader:false},
-          ]).map((n, idx) => (
-            <motion.div key={n.name} className={`nodecard ${n.leader?"leader":""}`} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: idx * 0.08, ...spring }}>
-              <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
-                <div className="sd g" />
-                <span className="ncr" style={n.leader?{background:"rgba(200,0,30,.2)",color:"var(--red-b)",border:"1px solid var(--border)"}:{background:"rgba(0,200,240,.12)",color:"var(--cyan)",border:"1px solid rgba(0,200,240,.3)"}}>{n.role}</span>
-              </div>
-              <div className="ncn">{n.name}</div>
-              <div className="ncs">IP: {n.ip}</div><div className="ncs">Uptime: {n.uptime}</div>
-              <div className="ncs">Term: {n.term} · Log idx: {n.idx}</div>
-              <div className="ncs" style={{color:"var(--green)",marginTop:5}}>CPU: {n.cpu} · Mem: {n.mem}</div>
-            </motion.div>
-          ))}
-        </div>
-        {([
-          ["Quorum","2/3 required · 3/3 online","bgg","✓ HEALTHY"],
-          ["Config Sync","Last push: 34 s ago · 5 data-plane nodes","bgg","✓ IN SYNC"],
-          ["Data-Plane Nodes","dp-us-east-01, dp-us-west-01, dp-eu-01, dp-ap-01, dp-local-01","bcy","5 nodes"],
-        ] as [string,string,string,string][]).map(([t,d,cls,val]) => (
-          <div key={t} className="srow">
-            <div style={{flex:1}}><div className="srt">{t}</div><div className="srd">{d}</div></div>
-            <span className={`bdg ${cls}`}>{val}</span>
+        {!health ? (
+          <div style={{ padding: "26px 12px", textAlign: "center", color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", fontSize: 14 }}>
+            {err ? "Control plane unreachable — no live cluster data to show." : "Loading live cluster health…"}
           </div>
-        ))}
+        ) : (
+          <>
+            {cp?.enabled ? (
+              <div style={{ display: "grid", gridTemplateColumns: `repeat(${Math.min(Math.max(cpNodes.length, 1), 3)},1fr)`, gap: 10, marginBottom: 16 }}>
+                {cpNodes.length === 0 ? (
+                  <div className="srd">No control-plane nodes reporting.</div>
+                ) : cpNodes.map((n, idx) => (
+                  <motion.div key={n.node_id} className={`nodecard ${n.is_leader ? "leader" : ""}`} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: idx * 0.08, ...spring }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+                      <div className={`sd ${n.reachable ? "g" : "r"}`} />
+                      <span className="ncr" style={n.is_leader ? { background: "rgba(200,0,30,.2)", color: "var(--red-b)", border: "1px solid var(--border)" } : { background: "rgba(0,200,240,.12)", color: "var(--cyan)", border: "1px solid rgba(0,200,240,.3)" }}>{n.is_leader ? "LEADER" : n.role.toUpperCase()}</span>
+                      {n.is_self && <span className="bdg bgr" style={{ marginLeft: "auto" }}>this node</span>}
+                    </div>
+                    <div className="ncn">node {n.node_id}</div>
+                    <div className="ncs">Addr: {n.addr || "—"}</div>
+                    <div className="ncs">Term: {cp.term} · {n.reachable ? fmtAgo(n.last_seen_sec) : "unreachable"}</div>
+                  </motion.div>
+                ))}
+              </div>
+            ) : (
+              <div style={{ padding: "18px 12px", textAlign: "center", marginBottom: 14 }}>
+                <div style={{ fontSize: 26, marginBottom: 6 }}>🧩</div>
+                <div style={{ fontSize: 15, fontWeight: 700, color: "var(--text2)", marginBottom: 4 }}>Standalone — HA not enabled</div>
+                <div className="srd">Running a single control-plane node. Add peers to form a Raft quorum for automatic leader failover.</div>
+              </div>
+            )}
+
+            {([
+              cp?.enabled
+                ? ["Quorum", `${cp.quorum_size} required · ${cp.healthy}/${cp.total} online · term ${cp.term}`, cp.quorum_ok ? "bgg" : "br", cp.quorum_ok ? "✓ HEALTHY" : "⚠ AT RISK"]
+                : ["Quorum", "Standalone — single node, no quorum needed", "bcy", "N/A"],
+              ["Protection", health.protection_active ? "Traffic is being inspected and enforced" : "Protection is not fully active", health.protection_active ? "bgg" : "br", health.protection_active ? "✓ ACTIVE" : "⚠ AT RISK"],
+              ["Data-Plane Nodes", dpNodes.length ? dpNodes.map(n => n.id).join(", ") : "No data-plane nodes reporting", dp && dp.total > 0 && dp.healthy === dp.total ? "bgg" : dp && dp.healthy > 0 ? "ba" : "br", `${dp?.total ?? 0} node${(dp?.total ?? 0) === 1 ? "" : "s"}`],
+            ] as [string, string, string, string][]).map(([t, d, cls, val]) => (
+              <div key={t} className="srow">
+                <div style={{ flex: 1, minWidth: 0 }}><div className="srt">{t}</div><div className="srd" style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{d}</div></div>
+                <span className={`bdg ${cls}`}>{val}</span>
+              </div>
+            ))}
+
+            <div style={{ marginTop: 12, fontSize: 12.5, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>
+              Live from <code>GET /cluster/health</code> · refreshes every 10s · full fleet view under <b>Cluster</b>.
+            </div>
+          </>
+        )}
       </div>
     </motion.div>
   );

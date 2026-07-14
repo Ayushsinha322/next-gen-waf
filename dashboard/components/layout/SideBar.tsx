@@ -1,6 +1,8 @@
 "use client";
+import { useState, useEffect } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { motion } from "framer-motion";
+import { api, type ClusterHealth } from "@/lib/api";
 import { navGroupStagger, navItemVariants, spring } from "@/lib/animations";
 
 // ── Inline SVG icons ─────────────────────────────────────────────────────────
@@ -96,15 +98,15 @@ const NAV = [
   { group: "MONITOR", items: [
     { id: "overview", Icon: Icon.Overview, label: "Overview" },
     { id: "traffic",  Icon: Icon.Traffic,  label: "Traffic",  badge: "LIVE", badgeCls: "nb-g" },
-    { id: "alerts",   Icon: Icon.Alerts,   label: "Alerts",   badge: "7",    badgeCls: "nb-r" },
+    { id: "alerts",   Icon: Icon.Alerts,   label: "Alerts" },
     { id: "logs",     Icon: Icon.Logs,     label: "Logs",     badge: "LIVE", badgeCls: "nb-g" },
     { id: "events",   Icon: Icon.Search,   label: "Threat Search" },
   ]},
   { group: "PROTECT", items: [
-    { id: "sites",   Icon: Icon.Sites,   label: "Sites",   badge: "5",     badgeCls: "nb-g" },
-    { id: "rules",   Icon: Icon.Rules,   label: "Rules",   badge: "2,541", badgeCls: "nb-c" },
+    { id: "sites",   Icon: Icon.Sites,   label: "Sites" },
+    { id: "rules",   Icon: Icon.Rules,   label: "Rules" },
     { id: "certificates", Icon: Icon.Certificates, label: "Certificates", badge: "TLS", badgeCls: "nb-g" },
-    { id: "plugins", Icon: Icon.Plugins, label: "Plugins", badge: "3",     badgeCls: "nb-a" },
+    { id: "plugins", Icon: Icon.Plugins, label: "Plugins" },
   ]},
   { group: "INTELLIGENCE", items: [
     { id: "threat-intel", Icon: Icon.ThreatIntel, label: "Threat Intel", badge: "NEW", badgeCls: "nb-c" },
@@ -118,10 +120,77 @@ const NAV = [
   ]},
 ];
 
+type Counts = { sites: number | null; rules: number | null; plugins: number | null; alerts: number | null };
+
 export default function SideBar() {
   const pathname = usePathname();
   const router   = useRouter();
   const current  = pathname.split("/").pop() || "overview";
+
+  // Live nav counts + cluster footer — never hard-coded. Any endpoint that
+  // fails leaves its value null so the badge is simply hidden rather than
+  // showing a stale/fabricated number.
+  const [counts, setCounts] = useState<Counts>({ sites: null, rules: null, plugins: null, alerts: null });
+  const [health, setHealth] = useState<ClusterHealth | null>(null);
+  const [healthErr, setHealthErr] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function load() {
+      const [sites, rules, plugins, alerts] = await Promise.allSettled([
+        api.sites.list(), api.rules.list(), api.plugins.list(), api.alerts.list(),
+      ]);
+      if (cancelled) return;
+      setCounts({
+        sites:   sites.status   === "fulfilled" ? (sites.value.sites?.length     ?? 0) : null,
+        rules:   rules.status   === "fulfilled" ? (rules.value.rules?.length     ?? 0) : null,
+        plugins: plugins.status === "fulfilled" ? (plugins.value.plugins?.length ?? 0) : null,
+        alerts:  alerts.status  === "fulfilled" ? (alerts.value.alerts?.filter(a => a.state === "open").length ?? 0) : null,
+      });
+    }
+    load();
+    const t = setInterval(load, 60_000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function load() {
+      try { const r = await api.cluster.health(); if (!cancelled) { setHealth(r); setHealthErr(false); } }
+      catch { if (!cancelled) setHealthErr(true); }
+    }
+    load();
+    const t = setInterval(load, 15_000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, []);
+
+  // Resolve the live badge for the four count-driven nav items.
+  const liveBadge: Record<string, { value: string; cls: string }> = {};
+  if (counts.sites   != null) liveBadge.sites   = { value: String(counts.sites),         cls: "nb-g" };
+  if (counts.rules   != null) liveBadge.rules   = { value: counts.rules.toLocaleString(), cls: "nb-c" };
+  if (counts.plugins != null) liveBadge.plugins = { value: String(counts.plugins),       cls: "nb-a" };
+  if (counts.alerts  != null && counts.alerts > 0) liveBadge.alerts = { value: String(counts.alerts), cls: "nb-r" };
+
+  // Cluster footer state.
+  const cp = health?.control_plane;
+  const dp = health?.data_plane;
+  const versions = dp ? Array.from(new Set(dp.nodes.filter(n => n.status === "healthy").map(n => n.version).filter(Boolean))) : [];
+  const fleetVersion = versions.length === 1 ? versions[0] : null;
+
+  let footTitle: string, footSub: string, footDot: string;
+  if (!health) {
+    footTitle = "Cluster";
+    footSub   = healthErr ? "control plane unreachable" : "connecting…";
+    footDot   = healthErr ? "r" : "a";
+  } else if (cp?.enabled) {
+    footTitle = cp.leader_id != null ? `node ${cp.leader_id} · leader` : "no leader elected";
+    footSub   = `Raft · ${cp.healthy}/${cp.total} online${fleetVersion ? ` · ${fleetVersion}` : ""}`;
+    footDot   = cp.quorum_ok ? "g" : "r";
+  } else {
+    footTitle = "Standalone";
+    footSub   = `${dp?.total ?? 0} WAF node${(dp?.total ?? 0) === 1 ? "" : "s"}${fleetVersion ? ` · ${fleetVersion}` : ""}`;
+    footDot   = dp && dp.healthy > 0 ? "g" : "r";
+  }
 
   return (
     <motion.nav
@@ -146,14 +215,16 @@ export default function SideBar() {
               >
                 <span className="nv-ico"><item.Icon /></span>
                 <span className="nv-lbl">{item.label}</span>
-                {item.badge && (
-                  <span
-                    className={`nv-b ${item.badgeCls}`}
-                    style={(item as any).badgeStyle}
-                  >
-                    {item.badge}
-                  </span>
-                )}
+                {(() => {
+                  const lb = liveBadge[item.id];
+                  const badgeText = lb ? lb.value : item.badge;
+                  const badgeCls  = lb ? lb.cls : item.badgeCls;
+                  return badgeText ? (
+                    <span className={`nv-b ${badgeCls}`} style={(item as any).badgeStyle}>
+                      {badgeText}
+                    </span>
+                  ) : null;
+                })()}
               </motion.div>
             ))}
           </motion.div>
@@ -172,13 +243,13 @@ export default function SideBar() {
         }}
       >
         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-          <span className="leader-dot" />
+          <span className={`sd ${footDot}`} style={footDot === "g" ? { boxShadow: "0 0 6px var(--green)" } : undefined} />
           <span style={{ fontSize: 14, fontFamily: "'JetBrains Mono',monospace", color: "var(--text2)", fontWeight: 600 }}>
-            cp-primary-01
+            {footTitle}
           </span>
         </div>
         <div style={{ fontSize: 13, fontFamily: "'JetBrains Mono',monospace", color: "var(--text3)", letterSpacing: ".4px" }}>
-          Raft: LEADER · 3 nodes · v3.1.0
+          {footSub}
         </div>
       </motion.div>
     </motion.nav>

@@ -1,7 +1,7 @@
 "use client";
 import { useState, useRef, useEffect } from "react";
 import { motion } from "framer-motion";
-import { GREET } from "@/lib/aiResponses";
+import { GREET, askCopilot } from "@/lib/copilot";
 import { spring } from "@/lib/animations";
 
 function fmt(text: string) {
@@ -36,24 +36,8 @@ export default function CopilotPage() {
     setMsgs(p => [...p, { who:"usr", text, time:now }]);
     setTyping(true);
     try {
-      const history = msgs.map(m => ({ role: m.who === "ai" ? "assistant" : "user", content: m.text }));
-      const res = await fetch("https://ai.enlight.dev/api/chat/completions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${process.env.NEXT_PUBLIC_ENLIGHT_API_KEY}` },
-        body: JSON.stringify({
-          model: "deepseek-r1:8b",
-          messages: [
-            { role: "system", content: "You are Sentinel AI Copilot, an elite cybersecurity assistant integrated into an enterprise Web Application Firewall (WAF). Your job is to analyze SQLi, XSS, and DDoS threats, explain logs, and help write WAF rules. Keep answers concise, technical, and accurate. Do not hallucinate." },
-            ...history,
-            { role: "user", content: text },
-          ],
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(`API ${res.status}: ${data.error?.message ?? JSON.stringify(data)}`);
-      const reply = data.choices?.[0]?.message?.content
-        ?? data.response ?? data.content ?? data.message
-        ?? `⚠️ Unexpected format: ${JSON.stringify(data).slice(0, 300)}`;
+      const history = msgs.map(m => ({ role: (m.who === "ai" ? "assistant" : "user") as "assistant" | "user", content: m.text }));
+      const reply = await askCopilot(history, text);
       const now2 = new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"});
       setTyping(false);
       setMsgs(p => [...p, { who:"ai", text:reply, time:now2 }]);
