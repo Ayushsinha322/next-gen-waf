@@ -68,7 +68,8 @@ use sentinel_plugins::PluginRuntime;
 use sentinel_rules::RuleEngine;
 use sentinel_telemetry::{
     dec_active_connections, inc_active_connections, inc_blocked, inc_ebpf_drops,
-    inc_load_shed_connections, inc_load_shed_requests, inc_requests, observe_duration,
+    inc_load_shed_connections, inc_load_shed_requests, inc_requests, inc_rule_hits,
+    observe_duration, prometheus_text,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Semaphore};
@@ -1596,6 +1597,15 @@ async fn handle_request(
         return Ok(readyz_response(&state));
     }
 
+    // Prometheus metrics — served before any WAF pipeline work so every proxy
+    // pod is scrapeable at GET /metrics (requests/blocked/latency/rule-hits/
+    // eBPF-drops/active-connections/load-shed). Like the health probes above,
+    // this is internal-only (no auth) and expected to be network-restricted;
+    // it is served on every listener, including the management endpoint.
+    if req.method() == http::Method::GET && req.uri().path() == "/metrics" {
+        return Ok(metrics_response());
+    }
+
     // Management listener: this is the dedicated admin-console endpoint. It
     // bypasses the WAF pipeline entirely and reverse-proxies the dashboard +
     // control-plane API (the admin UI is auth-gated by the control plane). Done
@@ -2876,10 +2886,17 @@ fn eval_rules(ctx: &mut RequestContext, engine: &RuleEngine, phase: Phase, waf: 
         waf.anomaly_threshold
     };
     let before = ctx.anomaly_score;
+    let matches_before = ctx.rule_matches.len();
     engine.evaluate(ctx, phase, threshold);
     let delta = ctx.anomaly_score.saturating_sub(before);
     if delta > 0 {
         *ctx.engine_scores.entry("rules".to_string()).or_insert(0) += delta;
+    }
+    // Metrics: each rule that matched during this phase is one rule-hit event.
+    // `rule_matches` only grows here, so the difference is the new-match count.
+    let new_matches = ctx.rule_matches.len().saturating_sub(matches_before);
+    for _ in 0..new_matches {
+        inc_rule_hits();
     }
 }
 
@@ -4188,6 +4205,20 @@ fn error_response(status: StatusCode, message: &str) -> Response<BoxBody> {
         .unwrap()
 }
 
+/// `GET /metrics` — the global WAF metrics registry rendered in Prometheus text
+/// exposition format. Content-Type follows the Prometheus text format spec so
+/// scrapers parse it without a manual override.
+fn metrics_response() -> Response<BoxBody> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )
+        .body(full_body(Bytes::from(prometheus_text())))
+        .unwrap()
+}
+
 /// Load-shed response returned when the global in-flight request limit is
 /// saturated. `503` + `Retry-After: 1` tells well-behaved clients and upstream
 /// load balancers to back off and retry rather than hammer an overloaded node.
@@ -5086,5 +5117,37 @@ mod admission_control_tests {
             Arc::clone(&sem).try_acquire_owned().is_ok(),
             "freed slot is reusable"
         );
+    }
+}
+
+#[cfg(test)]
+mod metrics_endpoint_tests {
+    use super::*;
+    use http_body_util::BodyExt;
+
+    #[tokio::test]
+    async fn metrics_response_serves_prometheus_text() {
+        // Exercise the hot-path counters so the registry has real content.
+        inc_requests();
+        inc_rule_hits();
+        let resp = metrics_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            ct.starts_with("text/plain"),
+            "prometheus text content-type, got {ct}"
+        );
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        // The registry exposes the WAF counters, including the now-wired
+        // rule-hits counter, in Prometheus exposition format.
+        assert!(text.contains("sentinel_requests_total"));
+        assert!(text.contains("sentinel_rule_hits_total"));
+        assert!(text.contains("# TYPE sentinel_requests_total counter"));
     }
 }

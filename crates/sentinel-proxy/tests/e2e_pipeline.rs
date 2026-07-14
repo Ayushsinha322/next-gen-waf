@@ -358,6 +358,37 @@ async fn health_check_endpoint() {
 }
 
 #[tokio::test]
+async fn metrics_endpoint_is_scrapeable() {
+    let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
+    let listen_port = next_port();
+    let cfg = test_config(
+        listen_port,
+        upstream_addr.port(),
+        "REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
+        WafMode::Blocking,
+    );
+    let (shutdown_tx, jh) = start_proxy(cfg).await;
+
+    // Drive one real request first so the counters have moved, then scrape.
+    let _ = send_request(listen_port, "test-site.local", "/", Method::GET, "").await;
+    let (status, body) =
+        send_request(listen_port, "test-site.local", "/metrics", Method::GET, "").await;
+
+    shutdown_proxy(shutdown_tx, jh).await;
+
+    assert_eq!(status, StatusCode::OK, "/metrics should return 200");
+    let text = String::from_utf8(body).expect("metrics body is UTF-8");
+    // Prometheus exposition format with the WAF counters present.
+    assert!(
+        text.contains("# TYPE sentinel_requests_total counter"),
+        "expected prometheus TYPE header, got:\n{text}"
+    );
+    assert!(text.contains("sentinel_requests_total"));
+    assert!(text.contains("sentinel_blocked_total"));
+    assert!(text.contains("sentinel_active_connections"));
+}
+
+#[tokio::test]
 async fn post_body_sqli_is_blocked() {
     let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
     let listen_port = next_port();
