@@ -1,0 +1,8 @@
+# Local full-stack load-test overlay: replace the WAF's published ports (host
+# :80 is occupied on this dev box) with just :8081. `!override` replaces the
+# list instead of compose's default append-merge. Backend + control plane +
+# ClickHouse + ML all run normally.
+services:
+  dataplane:
+    ports: !override
+      - "8081:8080"

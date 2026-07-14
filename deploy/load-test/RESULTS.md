@@ -78,3 +78,86 @@ cd deploy/load-test
 ```
 
 See `README.md` for prerequisites and tunables.
+
+---
+
+# Full-Stack Run (MEASURED) — the "documented next step" from caveat 4
+
+> The section above is an **isolated micro-benchmark** (WAF → nginx, ML off,
+> rate-limit off, no control plane, no ClickHouse). This section runs the **same
+> data-plane binary under the full production pipeline**: ML **on**, ClickHouse
+> logging **on**, control-plane config sync **on**, tenant-tagging **on**, and a
+> **real application backend** (OWASP Juice Shop). Every number below was
+> measured, not projected.
+
+## Environment (as measured)
+
+| Item | Value |
+|---|---|
+| Date | 2026-07-14 |
+| Host | AMD Ryzen 7 7730U · 16 logical cores · 14 GiB RAM (shared dev box) |
+| Stack | `docker compose -f compose.prod.yml -f compose.loadtest.yml` — Postgres + ClickHouse + Redis + control plane + data plane + Juice Shop |
+| Build | `integration/waf-v1-hardening` (all 3 milestone branches merged) |
+| WAF listener | `:8081` (remapped off `:80` via `ports: !override`) |
+| Pipeline | full CRS 4.7 (blocking, PL2) **+ ML enabled + ClickHouse event/traffic logging + control-plane sync + per-request tenant tagging** |
+| Backend | OWASP Juice Shop (Node) at `juiceshop:3000`, real app |
+| Generator | `vegeta` open-loop, `-rate=0 -max-workers=80`, 20 s/scenario, single source IP, `Host: juice.local` |
+
+## Results
+
+| Scenario | What it exercises | Throughput (req/s) | p50 | p95 | p99 | Result codes |
+|---|---|---:|---:|---:|---:|---|
+| **Attack / block** | all-malicious through full pipeline (CRS+ML+CH), early-exit block, no backend | **21,198** | 3.21 ms | 6.59 ms | 8.48 ms | 100% `403` (423,968/423,968) |
+| **Clean end-to-end** | clean GET through WAF → **real Juice Shop app** | **1,168** | 61.4 ms | 100.2 ms | 113.2 ms | 100% `200` (23,373/23,373) |
+
+## What the numbers mean (honestly)
+
+- **Block path sustains ~21,200 req/s at p99 8.5 ms with the *full* pipeline** (ML + ClickHouse
+  logging + tenant tagging all active). This corroborates the isolated bench's **21,531 req/s**
+  block number almost exactly — because blocked requests early-exit before the origin, the ML
+  and logging additions cost near-nothing on the block path. **This is the WAF's real inspection
+  capacity on this box.**
+- **Admission control did not falsely shed.** At 21k req/s sustained, **zero** `503`s — the new
+  connection/request admission limiter (milestone 2) has headroom above this rate and only sheds
+  under heavier load. Clean traffic was **not** rate-limited or repeat-offender-blocked (100% `200`).
+- **Clean end-to-end is backend-bound, not WAF-bound.** 1,168 req/s at p99 113 ms reflects the
+  **Juice Shop Node app**, which is far slower than the nginx origin used in the isolated bench
+  (7,946 req/s there). The WAF is not the bottleneck here — this number characterizes *end-to-end
+  latency in front of a real, heavyweight app*, not the WAF's clean-forwarding ceiling (see the
+  isolated S1 for that).
+
+## Pipeline verified end-to-end (ClickHouse, under load)
+
+Queried directly against the running ClickHouse **after** the run — proves the full pipeline
+executed and the tenant-tagging feature works end-to-end (not just in unit tests):
+
+| Check | Measured |
+|---|---|
+| `waf_events` rows captured under load | **401,015**, every row tagged `tenant = …0001` |
+| `traffic_buckets` rows | **447,349** reqs / **423,973** blocked, tenant column populated on all |
+| Sample event | `rule=942100` (SQLi), `action=BLOCK`, `score=5`, `site=juice.local`, `tenant=…0001` |
+
+(All events carry the single dev tenant because every load-test site belongs to it; this verifies
+the tenant column *flows* data-plane → ClickHouse under load. Cross-tenant *isolation* is covered
+by the RLS/tenant tests, not this throughput run.)
+
+## Caveats (so nobody over-reads this)
+
+1. **Single source IP** — so this cannot measure a realistic mixed 90/10 throughput (same
+   repeat-offender collapse documented in the S2 note above). Clean and block paths were run
+   separately for that reason.
+2. **Shared dev box**, generator + full stack + backend all on the same 16 cores → CPU
+   contention **understates** dedicated hardware. Run on the VM/K8s HA cluster for a certified number.
+3. **Clean throughput is Juice-Shop-bound**, not a WAF ceiling. For WAF clean-path overhead see
+   the isolated S1 above (fast nginx origin).
+
+## Reproduce (full stack)
+
+```bash
+cd deploy/docker
+docker compose -f compose.prod.yml -f compose.loadtest.yml up -d \
+  postgres clickhouse redis migrate controlplane dataplane juiceshop
+# wait for /readyz 200, then:
+vegeta attack -targets=<clean|attack>.txt -header="Host: juice.local" \
+  -rate=0 -max-workers=80 -duration=20s | vegeta report
+```
