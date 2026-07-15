@@ -1834,8 +1834,27 @@ async fn proxy(
         }
     }
 
-    // Correlation engine: add extra score for repeat attackers.
-    let corr_score = state.modules.correlation.score_for_ip(ctx.client_ip);
+    // Correlation engine: add extra score for repeat attackers. Can be disabled
+    // via SENTINEL_DISABLE_CORRELATION (e.g. rule-engine benchmarking) so a
+    // single-source scanner isn't escalated by cross-request block history —
+    // letting a tool like GoTestWAF measure per-request rule detection cleanly.
+    let corr_score = {
+        use std::sync::OnceLock;
+        static DISABLED: OnceLock<bool> = OnceLock::new();
+        let disabled = *DISABLED.get_or_init(|| {
+            matches!(
+                std::env::var("SENTINEL_DISABLE_CORRELATION")
+                    .ok()
+                    .as_deref(),
+                Some("1") | Some("true") | Some("yes") | Some("on")
+            )
+        });
+        if disabled {
+            0
+        } else {
+            state.modules.correlation.score_for_ip(ctx.client_ip)
+        }
+    };
     if corr_score > 0 {
         ctx.add_engine_score("correlation", corr_score);
         ctx.tx_vars

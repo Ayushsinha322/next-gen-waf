@@ -1,0 +1,57 @@
+# Sentinel WAF — Detection Benchmark (MEASURED, fair harness)
+
+> Every number here is measured by `benchmark-detection.sh` (GoTestWAF v0.5.8)
+> against the **all-methods-200 origin**, so it reflects the WAF, not a mock
+> backend. Reproduce with `./benchmark-detection.sh`.
+
+## ⚠️ Why the earlier numbers were wrong (the 405 confound)
+
+Earlier runs used a **static** origin (nginx serving files). Static files only
+allow `GET`, so the origin returned **405** to every benign/attack POST/PUT/etc.
+GoTestWAF cannot classify a 405, so it **drops those from the score**. Effect:
+
+- bypassed **non-GET attacks** disappeared → **attack-detection (TP) INFLATED**
+- allowed **non-GET benign** requests disappeared → **benign-allow (TN) DEFLATED**
+- ~22% of all tests came back "unresolved"
+
+The fair all-methods-200 origin returns 200 for every method+path, so block/pass
+is decided purely by the WAF (403 = blocked). **0% unresolved.**
+
+## True baseline (fair origin) — 2026-07-15
+
+Config: `waf-detection.yaml` (CRS 4.7, PL2, anomaly_threshold **10**, rule 920230
+disabled, ML off, correlation off). Binary includes the CRS transform-coverage
+fixes (commit `7d17fe7`).
+
+| Metric | Confounded (static origin) | **TRUE (fair origin)** |
+|---|---:|---:|
+| Overall | 85.65% | **62.58%** |
+| Attack detection (TP) | 61.47% | **43.41%** (293/675) |
+| Benign allowed (TN) | 81.13% | **92.91%** (131/141) |
+| Unresolved | ~22% | **0%** |
+
+**Reading:** false-positives are already good (**93% benign allowed**). The real
+weakness is **attack detection (43%)**. Per-category (fair origin), the gaps:
+
+| Category | Detection |
+|---|---:|
+| CRLF, LDAP, mail-injection | **0%** (no rules) |
+| SSTI | 12.5% |
+| shell-injection | 18.75% |
+| path-traversal | 25% |
+| SQL-injection (owasp evasion set) | 35.4% |
+| XSS-scripting | 37.5% |
+| NoSQL | 40% |
+
+## Goal & how we get to genuine >90
+
+Overall >90 requires driving **TP 43% → 90%+** while holding **TN ~93%**. Levers
+(in build priority): (1) coverage rules for the 0%/weak categories +
+all-placement inspection; (2) a **retrained ML precision layer** (the only thing
+that raises TP without raising FP — regex alone cannot hit TP≥90 & TN≥90 at once
+on this corpus); (3) per-deployment FP tuning on real traffic.
+
+## Rule for all future benchmarking
+
+**Always** use `benchmark-detection.sh` / an all-methods-200 origin. Never quote
+detection/FP numbers from a static origin — they are distorted in both directions.
