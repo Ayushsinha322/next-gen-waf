@@ -55,7 +55,11 @@ impl PatternRegistry {
         }
         let ac = Arc::new(
             aho_corasick::AhoCorasickBuilder::new()
-                .ascii_case_insensitive(false)
+                // ModSecurity @pm / @pmFromFile are case-INSENSITIVE. Matching
+                // that (was `false`) recovers scanner-UA, LFI os-file, shell,
+                // web-shell, sql-error and other @pmFromFile detections that the
+                // rules do not lowercase first.
+                .ascii_case_insensitive(true)
                 .build(words)
                 .map_err(|e| anyhow::anyhow!("AhoCorasick build: {}", e))?,
         );

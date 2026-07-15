@@ -40,8 +40,13 @@ fn parse_query_params(query: &str) -> Vec<(String, String)> {
         .filter(|kv| !kv.is_empty())
         .map(|kv| {
             let mut parts = kv.splitn(2, '=');
-            let k = percent_decode(parts.next().unwrap_or(""));
-            let v = percent_decode(parts.next().unwrap_or(""));
+            // application/x-www-form-urlencoded + query-string semantics: '+'
+            // encodes a space and must be replaced BEFORE percent-decoding (so a
+            // literal '+' sent as %2B survives). Without this, payloads whose
+            // spaces are '+'-encoded (the Go/GoTestWAF default) reach the rule
+            // operators with literal '+' and evade @rx / @detectSQLi / @detectXSS.
+            let k = percent_decode(&parts.next().unwrap_or("").replace('+', " "));
+            let v = percent_decode(&parts.next().unwrap_or("").replace('+', " "));
             (k, v)
         })
         .collect()
@@ -1183,26 +1188,191 @@ fn apply_single_transform(s: String, t: &Transform) -> String {
         Transform::RemoveCommentsChar => remove_comments_char(s),
         Transform::RemoveComments => remove_sql_comments(s),
         Transform::ReplaceComments => replace_sql_comments(s),
+        Transform::CmdLine => cmdline_transform(&s),
+        Transform::EscapeSeqDecode => escape_seq_decode(s),
+        Transform::Length => s.len().to_string(),
     }
 }
 
+/// ModSecurity `t:cmdLine` — normalize shell command-line obfuscation so the
+/// RCE detection rules can match. Deletes `\ " ' ^`; deletes a space that
+/// precedes `/` or `(`; turns `,` and `;` into spaces; collapses runs of
+/// whitespace to a single space; lowercases. e.g. `c"a"t /e''tc/passwd` → `cat /etc/passwd`.
+fn cmdline_transform(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for c in s.chars() {
+        match c {
+            '\\' | '"' | '\'' | '^' => continue, // deleted
+            ',' | ';' => {
+                if !prev_space {
+                    out.push(' ');
+                    prev_space = true;
+                }
+            }
+            '/' | '(' => {
+                // delete the single space that immediately precedes it
+                if prev_space && out.ends_with(' ') {
+                    out.pop();
+                }
+                out.push(c.to_ascii_lowercase());
+                prev_space = false;
+            }
+            c if c.is_ascii_whitespace() => {
+                if !prev_space {
+                    out.push(' ');
+                    prev_space = true;
+                }
+            }
+            c => {
+                out.push(c.to_ascii_lowercase());
+                prev_space = false;
+            }
+        }
+    }
+    out
+}
+
+/// ModSecurity `t:escapeSeqDecode` — decode ANSI-C escape sequences: `\xHH`,
+/// octal `\NNN` (1–3 digits), and the single-char escapes `\a \b \f \n \r \t
+/// \v \\ \? \' \"`. Unknown escapes are passed through unchanged.
+fn escape_seq_decode(s: String) -> String {
+    if !s.contains('\\') {
+        return s;
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek().copied() {
+            Some('x') | Some('X') => {
+                chars.next();
+                let mut hex = String::new();
+                while hex.len() < 2 && chars.peek().map(|c| c.is_ascii_hexdigit()) == Some(true) {
+                    hex.push(chars.next().unwrap());
+                }
+                match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                    Some(ch) if !hex.is_empty() => out.push(ch),
+                    _ => {
+                        out.push('\\');
+                        out.push('x');
+                        out.push_str(&hex);
+                    }
+                }
+            }
+            Some(d) if ('0'..='7').contains(&d) => {
+                let mut oct = String::new();
+                while oct.len() < 3 && chars.peek().map(|c| ('0'..='7').contains(c)) == Some(true) {
+                    oct.push(chars.next().unwrap());
+                }
+                match u32::from_str_radix(&oct, 8).ok().and_then(char::from_u32) {
+                    Some(ch) => out.push(ch),
+                    None => {
+                        out.push('\\');
+                        out.push_str(&oct);
+                    }
+                }
+            }
+            Some(esc) => {
+                chars.next();
+                let decoded = match esc {
+                    'a' => Some('\u{07}'),
+                    'b' => Some('\u{08}'),
+                    'f' => Some('\u{0C}'),
+                    'n' => Some('\n'),
+                    'r' => Some('\r'),
+                    't' => Some('\t'),
+                    'v' => Some('\u{0B}'),
+                    '\\' => Some('\\'),
+                    '?' => Some('?'),
+                    '\'' => Some('\''),
+                    '"' => Some('"'),
+                    _ => None,
+                };
+                match decoded {
+                    Some(ch) => out.push(ch),
+                    None => {
+                        out.push('\\');
+                        out.push(esc);
+                    }
+                }
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Decode HTML entities like ModSecurity's `t:htmlEntityDecode`: any decimal
+/// `&#DDD;` and hex `&#xHH;`/`&#XHH;` numeric entity (trailing `;` optional),
+/// plus the common named entities. Previously only a fixed ~13-entry table,
+/// which let attackers evade the 39 XSS/SQLi rules that rely on this transform
+/// via arbitrary numeric entities (e.g. `&#40;` → `(`, `&#x61;` → `a`).
 fn decode_html_entities(s: String) -> String {
     if !s.contains('&') {
         return s;
     }
-    s.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&#x27;", "'")
-        .replace("&#39;", "'")
-        .replace("&#x2F;", "/")
-        .replace("&#47;", "/")
-        .replace("&#x3C;", "<")
-        .replace("&#60;", "<")
-        .replace("&#x3E;", ">")
-        .replace("&#62;", ">")
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '&' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        // Numeric entity: &#DDD; (decimal) or &#xHH; / &#XHH; (hex).
+        if i + 2 < chars.len() && chars[i + 1] == '#' {
+            let (is_hex, start) = if chars[i + 2] == 'x' || chars[i + 2] == 'X' {
+                (true, i + 3)
+            } else {
+                (false, i + 2)
+            };
+            let mut j = start;
+            while j < chars.len()
+                && ((is_hex && chars[j].is_ascii_hexdigit())
+                    || (!is_hex && chars[j].is_ascii_digit()))
+            {
+                j += 1;
+            }
+            if j > start {
+                let num: String = chars[start..j].iter().collect();
+                let radix = if is_hex { 16 } else { 10 };
+                if let Some(ch) = u32::from_str_radix(&num, radix)
+                    .ok()
+                    .and_then(char::from_u32)
+                {
+                    out.push(ch);
+                    if j < chars.len() && chars[j] == ';' {
+                        j += 1; // consume optional trailing ';'
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        // Named entities (require the trailing ';').
+        let window: String = chars[i..(i + 6).min(chars.len())].iter().collect();
+        let named: &[(&str, char)] = &[
+            ("&lt;", '<'),
+            ("&gt;", '>'),
+            ("&amp;", '&'),
+            ("&quot;", '"'),
+            ("&apos;", '\''),
+            ("&nbsp;", ' '),
+        ];
+        if let Some((ent, ch)) = named.iter().find(|(ent, _)| window.starts_with(ent)) {
+            out.push(*ch);
+            i += ent.chars().count();
+            continue;
+        }
+        out.push('&');
+        i += 1;
+    }
+    out
 }
 
 fn compress_whitespace(s: String) -> String {

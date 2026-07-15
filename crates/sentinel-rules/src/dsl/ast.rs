@@ -206,6 +206,16 @@ pub enum Transform {
     RemoveCommentsChar,
     RemoveComments,
     ReplaceComments,
+    /// ModSecurity `t:cmdLine` — collapse shell command-line obfuscation
+    /// (strip `\ " ' ^`, spaces before `/` and `(`, `,`/`;` → space, fold
+    /// whitespace, lowercase). Required by the 932 RCE evasion rules.
+    CmdLine,
+    /// ModSecurity `t:escapeSeqDecode` — decode ANSI-C escape sequences
+    /// (`\xHH`, octal `\NNN`, `\a \b \f \n \r \t \v \\ \? \' \"`).
+    EscapeSeqDecode,
+    /// ModSecurity `t:length` — replace the value with its byte length as a
+    /// decimal string, so `@ge`/`@gt` numeric size checks evaluate.
+    Length,
 }
 
 // ---------------------------------------------------------------------------

@@ -260,7 +260,18 @@ fn parse_action_token(token: &str, out: &mut CrsActions) {
         "t:removecommentschar" => out.transforms.push(Transform::RemoveCommentsChar),
         "t:removecomments" => out.transforms.push(Transform::RemoveComments),
         "t:replacecomments" => out.transforms.push(Transform::ReplaceComments),
-        other if other.starts_with("t:") => {} // remaining transforms — no-op
+        "t:cmdline" => out.transforms.push(Transform::CmdLine),
+        "t:escapeseqdecode" => out.transforms.push(Transform::EscapeSeqDecode),
+        "t:length" => out.transforms.push(Transform::Length),
+        // An unsupported transform must NOT silently degrade a rule to matching
+        // against under-normalized input — surface it so coverage gaps are
+        // visible instead of becoming invisible evasion holes.
+        other if other.starts_with("t:") => {
+            tracing::warn!(
+                transform = other,
+                "unsupported CRS transform — dropped; rule will match under-normalized input"
+            );
+        }
         "multimatch" => out.multi_match = true,
         other if other.starts_with("ctl:") => {} // control directives — no-op
         "chain" => {
