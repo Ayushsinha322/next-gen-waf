@@ -182,8 +182,41 @@ impl MlEngine {
         //    feeding this request in).
         let anomaly_score = self.forest.score(fv.as_slice());
 
-        // 2. Payload Classifier attack probability.
-        let payload_attack_score = self.payload_classifier.score(&fv);
+        // 2. Payload attack probability. Prefer the embedded char-n-gram model
+        //    (learns injection structure, generalizes to evasive payloads); it
+        //    scores each attackable value separately (matching its per-value
+        //    training distribution) and takes the max, so an attack in one field
+        //    is not diluted by benign content in others. Falls back to the
+        //    legacy 25-feature classifier if the embedded model failed to load.
+        let payload_attack_score = if models::ngram_classifier::is_loaded() {
+            let mut max_s = 0.0f32;
+            let mut consider = |t: &str| {
+                if let Some(s) = models::ngram_classifier::score_text(t) {
+                    if s > max_s {
+                        max_s = s;
+                    }
+                }
+            };
+            // URL path (GoTestWAF URLPath placement; path-borne injection).
+            consider(ctx.uri.path());
+            // Query param values, percent-decoded (URLParam placement).
+            if let Some(q) = ctx.uri.query() {
+                let decoded = percent_encoding::percent_decode_str(q).decode_utf8_lossy();
+                for kv in decoded.split('&') {
+                    let val = kv.split_once('=').map(|(_, v)| v).unwrap_or(kv);
+                    consider(val);
+                }
+            }
+            // Request body (Body/JSON/form placements).
+            if let Some(body) = ctx.request_body.as_ref() {
+                if let Ok(bs) = std::str::from_utf8(body.as_ref()) {
+                    consider(bs);
+                }
+            }
+            max_s
+        } else {
+            self.payload_classifier.score(&fv)
+        };
 
         // 3. Online learning — poisoning guard: only let *clean-looking*
         //    traffic update the "normal" model. A request that the rule engine
@@ -207,7 +240,15 @@ impl MlEngine {
             .collect();
         drop(registry);
 
-        let combined = anomaly_score.max(payload_attack_score);
+        // When the supervised n-gram model is active it drives the block
+        // decision; the unsupervised Isolation Forest stays informational
+        // (its anomaly_score is reported but not fused into the block signal,
+        // since an unsupervised model on varied benign traffic is FP-prone).
+        let combined = if models::ngram_classifier::is_loaded() {
+            payload_attack_score
+        } else {
+            anomaly_score.max(payload_attack_score)
+        };
 
         let scores = MlScores {
             anomaly_score,

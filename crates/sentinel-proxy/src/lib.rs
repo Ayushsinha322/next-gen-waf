@@ -2781,9 +2781,13 @@ fn phase2_body(
                 .insert("combined".to_string(), ml_scores.combined_score);
 
             if ml_scores.combined_score >= ml_cfg.sensitivity {
-                let delta: u32 =
-                    ((ml_scores.combined_score - ml_cfg.sensitivity) * 10.0).ceil() as u32;
-                let delta = delta.min(8);
+                // The supervised n-gram classifier is high-precision, so a
+                // confident detection (combined >= sensitivity, e.g. 0.9)
+                // contributes a blocking amount of anomaly score on its own
+                // (scaled to reach the block threshold), rather than only a
+                // small additive nudge. Below sensitivity it contributes 0.
+                let delta: u32 = (ml_scores.combined_score * 12.0).round() as u32;
+                let delta = delta.min(12);
                 if delta > 0 {
                     let reason = if ml_scores.anomaly_score >= ml_cfg.sensitivity {
                         format!(

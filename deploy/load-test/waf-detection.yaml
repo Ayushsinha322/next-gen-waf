@@ -65,9 +65,11 @@ sites:
         - rule_id: 920230
           disable: true
       ml:
-        enable: false
+        enable: true
         models: []
-        sensitivity: 0.85
+        # Block threshold for the embedded char-n-gram classifier: a confident
+        # detection (>= 0.9) contributes a blocking anomaly score on its own.
+        sensitivity: 0.9
       bot_detection:
         ja4: false
         challenge: "off"
