@@ -57,6 +57,60 @@ pub fn is_loaded() -> bool {
     MODEL.is_some()
 }
 
+fn b64_val(c: u8) -> Option<u8> {
+    match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'a'..=b'z' => Some(c - b'a' + 26),
+        b'0'..=b'9' => Some(c - b'0' + 52),
+        b'+' | b'-' => Some(62),
+        b'/' | b'_' => Some(63),
+        _ => None,
+    }
+}
+
+/// If `s` is a wholly-Base64 string (standard or URL-safe, padding/whitespace
+/// tolerated) that decodes to mostly-printable text, return the decoded string.
+/// Used to defeat the Base64 encoder axis: attackers Base64-encode a payload so
+/// the raw value looks like gibberish to detectors — decoding it and re-scoring
+/// exposes the attack. Requiring the ENTIRE value to be Base64 + a printable
+/// result keeps false-positives on ordinary values near zero.
+pub fn maybe_base64_decode(s: &str) -> Option<String> {
+    let t: Vec<u8> = s
+        .bytes()
+        .filter(|b| !b.is_ascii_whitespace() && *b != b'=')
+        .collect();
+    if t.len() < 12 {
+        return None; // too short to be a meaningful encoded payload
+    }
+    let mut vals = Vec::with_capacity(t.len());
+    for &b in &t {
+        vals.push(b64_val(b)?); // any non-Base64 char → not Base64, bail
+    }
+    let mut out = Vec::with_capacity(vals.len() * 3 / 4);
+    for chunk in vals.chunks(4) {
+        let mut buf = [0u8; 4];
+        for (i, &v) in chunk.iter().enumerate() {
+            buf[i] = v;
+        }
+        out.push((buf[0] << 2) | (buf[1] >> 4));
+        if chunk.len() >= 3 {
+            out.push((buf[1] << 4) | (buf[2] >> 2));
+        }
+        if chunk.len() >= 4 {
+            out.push((buf[2] << 6) | buf[3]);
+        }
+    }
+    let decoded = String::from_utf8_lossy(&out).into_owned();
+    let printable = decoded
+        .bytes()
+        .filter(|b| b.is_ascii_graphic() || *b == b' ')
+        .count();
+    if decoded.is_empty() || printable * 100 < decoded.len() * 80 {
+        return None; // binary garbage, not a text payload
+    }
+    Some(decoded)
+}
+
 /// Attack probability ∈ [0, 1] for a single field/value string. Returns `None`
 /// if the model failed to load (caller falls back to the legacy classifier).
 ///

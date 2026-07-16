@@ -189,28 +189,39 @@ impl MlEngine {
         //    is not diluted by benign content in others. Falls back to the
         //    legacy 25-feature classifier if the embedded model failed to load.
         let payload_attack_score = if models::ngram_classifier::is_loaded() {
-            let mut max_s = 0.0f32;
-            let mut consider = |t: &str| {
-                if let Some(s) = models::ngram_classifier::score_text(t) {
-                    if s > max_s {
-                        max_s = s;
-                    }
+            // Collect every attackable value as a candidate.
+            let mut candidates: Vec<String> = Vec::new();
+            // URL path segments (URLPath placement; path-borne injection).
+            for seg in ctx.uri.path().split('/') {
+                if !seg.is_empty() {
+                    candidates.push(seg.to_string());
                 }
-            };
-            // URL path (GoTestWAF URLPath placement; path-borne injection).
-            consider(ctx.uri.path());
+            }
             // Query param values, percent-decoded (URLParam placement).
             if let Some(q) = ctx.uri.query() {
                 let decoded = percent_encoding::percent_decode_str(q).decode_utf8_lossy();
                 for kv in decoded.split('&') {
-                    let val = kv.split_once('=').map(|(_, v)| v).unwrap_or(kv);
-                    consider(val);
+                    candidates.push(kv.split_once('=').map(|(_, v)| v).unwrap_or(kv).to_string());
                 }
             }
-            // Request body (Body/JSON/form placements).
+            // Request body (Body/JSON/form/multipart placements).
             if let Some(body) = ctx.request_body.as_ref() {
                 if let Ok(bs) = std::str::from_utf8(body.as_ref()) {
-                    consider(bs);
+                    candidates.push(bs.to_string());
+                }
+            }
+            // Score each candidate raw AND base64-decoded (defeats the Base64
+            // encoder axis), taking the max so an attack in one value/encoding
+            // is not diluted.
+            let mut max_s = 0.0f32;
+            for c in &candidates {
+                if let Some(s) = models::ngram_classifier::score_text(c) {
+                    max_s = max_s.max(s);
+                }
+                if let Some(dec) = models::ngram_classifier::maybe_base64_decode(c) {
+                    if let Some(s) = models::ngram_classifier::score_text(&dec) {
+                        max_s = max_s.max(s);
+                    }
                 }
             }
             max_s

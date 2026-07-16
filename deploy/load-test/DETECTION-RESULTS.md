@@ -59,6 +59,7 @@ on this corpus); (3) per-deployment FP tuning on real traffic.
 | + all-placement libinjection (`placement.conf`) | 44.15% | 91.49% | 62.41% |
 | + coverage signatures (`coverage.conf`: CRLF/SMTP-IMAP/LDAP/SSTI/NoSQL) | **49.33%** | 91.49% | **63.74%** |
 | + ML char-n-gram classifier (embedded, trained on HttpParamsDataset + adversarial-benign) | **57.19%** | 88.65% | **75.63%** |
+| + base64 decode-and-rescore in the ML path (defeats the Base64 encoder axis) | **62.22%** | 87.23% | **76.57%** |
 
 Category gains from coverage: CRLF 0→85.7%, mail(SMTP/IMAP) 0→33.3%, NoSQL 40→50%,
 LDAP 0→33.3%, SSTI 12.5→45.8%. TN held (coverage added 0 false-positives; the
