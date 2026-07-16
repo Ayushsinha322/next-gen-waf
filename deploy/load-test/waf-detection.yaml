@@ -57,6 +57,8 @@ sites:
         - "rules/owasp-crs/rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf"
         - "rules/owasp-crs/rules/REQUEST-943-APPLICATION-ATTACK-SESSION-FIXATION.conf"
         - "rules/owasp-crs/rules/REQUEST-944-APPLICATION-ATTACK-JAVA.conf"
+        - "rules/custom/placement.conf"
+        - "rules/custom/coverage.conf"
       rule_exclusions:
         - rule_id: 932236
           exclude_targets: ["ARGS_NAMES"]

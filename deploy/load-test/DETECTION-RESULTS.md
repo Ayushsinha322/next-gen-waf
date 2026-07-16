@@ -51,6 +51,27 @@ all-placement inspection; (2) a **retrained ML precision layer** (the only thing
 that raises TP without raising FP — regex alone cannot hit TP≥90 & TN≥90 at once
 on this corpus); (3) per-deployment FP tuning on real traffic.
 
+## Progress log (fair origin, measured)
+
+| Build step | TP | TN | Overall |
+|---|---:|---:|---:|
+| True baseline (threshold 10 + 920230 off) | 43.41% | 92.91% | 62.58% |
+| + all-placement libinjection (`placement.conf`) | 44.15% | 91.49% | 62.41% |
+| + coverage signatures (`coverage.conf`: CRLF/SMTP-IMAP/LDAP/SSTI/NoSQL) | **49.33%** | 91.49% | **63.74%** |
+
+Category gains from coverage: CRLF 0→85.7%, mail(SMTP/IMAP) 0→33.3%, NoSQL 40→50%,
+LDAP 0→33.3%, SSTI 12.5→45.8%. TN held (coverage added 0 false-positives; the
+2-request TN dip is from libinjection in `placement.conf` on 2 benign requests).
+
+**Empirically proven ceiling of the rule-only approach on this corpus ≈ 50% TP.**
+The dominant remaining bypass mass is (a) evasive XSS (37.9%, 139 bypassed) + SQLi
+(39.6%, 29 bypassed) that libinjection/CRS regex miss, and (b) the Base64Flat
+encoder axis across all categories. Neither is closable with more signatures —
+they require the **retrained ML classifier + recursive normalization** (Phase 2).
+Also found: several CRS rules silently fail to compile on PCRE→RE2 regex
+incompatibilities (921200=the only LDAP rule, 932170/171 RCE, 933170 PHP) — a
+regex-sanitizer would recover them (custom rules already cover LDAP).
+
 ## Rule for all future benchmarking
 
 **Always** use `benchmark-detection.sh` / an all-methods-200 origin. Never quote
