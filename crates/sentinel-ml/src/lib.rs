@@ -210,18 +210,14 @@ impl MlEngine {
                     candidates.push(bs.to_string());
                 }
             }
-            // Score each candidate raw AND base64-decoded (defeats the Base64
-            // encoder axis), taking the max so an attack in one value/encoding
-            // is not diluted.
+            // Score each candidate over its raw form AND every decoded variant
+            // (Base64, HTML-entity, recursive percent-decode) — recursive
+            // normalization defeats encoder-axis evasion — taking the max so an
+            // attack in any field or encoding is not diluted by benign content.
             let mut max_s = 0.0f32;
             for c in &candidates {
-                if let Some(s) = models::ngram_classifier::score_text(c) {
+                if let Some(s) = models::ngram_classifier::score_all(c) {
                     max_s = max_s.max(s);
-                }
-                if let Some(dec) = models::ngram_classifier::maybe_base64_decode(c) {
-                    if let Some(s) = models::ngram_classifier::score_text(&dec) {
-                        max_s = max_s.max(s);
-                    }
                 }
             }
             max_s

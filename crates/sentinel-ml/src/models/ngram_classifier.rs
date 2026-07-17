@@ -111,6 +111,128 @@ pub fn maybe_base64_decode(s: &str) -> Option<String> {
     Some(decoded)
 }
 
+/// Decode common HTML entities (`&lt;`, `&#60;`, `&#x3c;`) — attackers entity-
+/// encode `<script>`/`'`/`"` to slip past detectors that match on the raw
+/// character. Returns `None` when nothing decoded, so callers only re-score
+/// when a transform actually changed the text.
+fn html_entity_decode(s: &str) -> Option<String> {
+    if !s.contains('&') {
+        return None;
+    }
+    let cs: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    let mut changed = false;
+    while i < cs.len() {
+        if cs[i] == '&' {
+            let limit = 12.min(cs.len() - i - 1);
+            if let Some(semi) = (2..=limit).find(|&j| cs[i + j] == ';') {
+                let ent: String = cs[i + 1..i + semi].iter().collect();
+                if let Some(ch) = decode_entity(&ent) {
+                    out.push(ch);
+                    i += semi + 1;
+                    changed = true;
+                    continue;
+                }
+            }
+        }
+        out.push(cs[i]);
+        i += 1;
+    }
+    if changed {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// One HTML entity (numeric `#60`/`#x3c` or a common named entity) → char.
+fn decode_entity(ent: &str) -> Option<char> {
+    if let Some(num) = ent.strip_prefix('#') {
+        let cp = match num.strip_prefix(['x', 'X']) {
+            Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+            None => num.parse::<u32>().ok()?,
+        };
+        return char::from_u32(cp);
+    }
+    Some(match ent {
+        "lt" => '<',
+        "gt" => '>',
+        "amp" => '&',
+        "quot" => '"',
+        "apos" => '\'',
+        "nbsp" => ' ',
+        "colon" => ':',
+        "lpar" => '(',
+        "rpar" => ')',
+        "sol" => '/',
+        "equals" => '=',
+        "grave" => '`',
+        _ => return None,
+    })
+}
+
+/// Percent-decode repeatedly (up to 3 passes) to unwrap double/triple URL-
+/// encoding (`%253Cscript%253E` → `%3Cscript%3E` → `<script>`). Returns `None`
+/// when the text was not percent-encoded.
+fn recursive_percent_decode(s: &str) -> Option<String> {
+    if !s.contains('%') {
+        return None;
+    }
+    let mut cur = s.to_string();
+    let mut changed = false;
+    for _ in 0..3 {
+        if !cur.contains('%') {
+            break;
+        }
+        let dec = percent_encoding::percent_decode_str(&cur)
+            .decode_utf8_lossy()
+            .into_owned();
+        if dec == cur {
+            break;
+        }
+        cur = dec;
+        changed = true;
+    }
+    if changed {
+        Some(cur)
+    } else {
+        None
+    }
+}
+
+/// Max attack score over the raw text and all of its decoded variants —
+/// Base64, HTML-entity, recursive percent-decode, and percent-then-entity
+/// (mixed encoding). Recursive normalization defeats the encoder-axis
+/// evasions a single-pass detector misses; taking the max means an attack
+/// hidden under any encoding is still caught. Each transform runs only when
+/// its marker byte (`&`, `%`, Base64 shape) is present, so ordinary benign
+/// values pay ~one extra branch.
+pub fn score_all(text: &str) -> Option<f32> {
+    let mut max = score_text(text)?;
+    let mut variants: Vec<String> = Vec::new();
+    if let Some(d) = maybe_base64_decode(text) {
+        variants.push(d);
+    }
+    if let Some(d) = html_entity_decode(text) {
+        variants.push(d);
+    }
+    if let Some(d) = recursive_percent_decode(text) {
+        if let Some(e) = html_entity_decode(&d) {
+            variants.push(e);
+        }
+        variants.push(d);
+    }
+    for v in &variants {
+        if let Some(s) = score_text(v) {
+            if s > max {
+                max = s;
+            }
+        }
+    }
+    Some(max)
+}
+
 /// Attack probability ∈ [0, 1] for a single field/value string. Returns `None`
 /// if the model failed to load (caller falls back to the legacy classifier).
 ///
@@ -168,5 +290,43 @@ mod tests {
     fn xss_scores_high() {
         let s = score_text("<script>alert(document.cookie)</script>").unwrap();
         assert!(s > 0.5, "XSS should score high, got {s}");
+    }
+
+    #[test]
+    fn html_entity_encoded_xss_caught_by_score_all() {
+        // Entity-encoded `<script>alert(1)</script>` — raw form hides the tags.
+        let raw = "&#60;script&#62;alert(1)&#60;/script&#62;";
+        let all = score_all(raw).unwrap();
+        assert!(
+            all > 0.5,
+            "entity-encoded XSS must be caught after normalization, got {all}"
+        );
+    }
+
+    #[test]
+    fn named_entity_decode_works() {
+        assert_eq!(html_entity_decode("&lt;b&gt;").as_deref(), Some("<b>"));
+        assert_eq!(html_entity_decode("no entities here"), None);
+    }
+
+    #[test]
+    fn double_url_encoded_caught_by_score_all() {
+        // `%253Cscript%253E...` → two percent passes → `<script>...`.
+        let raw = "%253Cscript%253Ealert(1)%253C%252Fscript%253E";
+        let all = score_all(raw).unwrap();
+        assert!(
+            all > score_text(raw).unwrap(),
+            "recursive percent-decode must raise the score above the raw form"
+        );
+        assert!(all > 0.5, "double-encoded XSS must be caught, got {all}");
+    }
+
+    #[test]
+    fn recursive_percent_decode_unwraps_double() {
+        assert_eq!(
+            recursive_percent_decode("%253Cscript%253E").as_deref(),
+            Some("<script>")
+        );
+        assert_eq!(recursive_percent_decode("plain text"), None);
     }
 }
