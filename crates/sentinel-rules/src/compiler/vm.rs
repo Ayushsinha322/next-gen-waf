@@ -1153,15 +1153,35 @@ fn apply_transforms(mut s: String, transforms: &[Transform]) -> String {
     s
 }
 
+/// Apply `f` repeatedly (up to `max` passes) until the output stops changing —
+/// unwraps multi-layer encoding (double/triple URL-encoding `%253C` -> `%3C` ->
+/// `<`, nested HTML entities) that single-pass decoding misses. Used only for
+/// decoders that are idempotent once fully decoded, so benign text stabilises
+/// after one pass and is left unchanged. NOT used for base64/hex, where a second
+/// pass can spuriously "decode" already-plaintext into garbage.
+fn to_fixpoint(s: String, max: usize, f: impl Fn(String) -> String) -> String {
+    let mut cur = s;
+    for _ in 0..max {
+        let next = f(cur.clone());
+        if next == cur {
+            break;
+        }
+        cur = next;
+    }
+    cur
+}
+
 /// Apply a single transform step.  Used both by `apply_transforms` and by
 /// the multiMatch loop in the VM.
 fn apply_single_transform(s: String, t: &Transform) -> String {
     match t {
         Transform::Lowercase => s.to_ascii_lowercase(),
-        Transform::UrlDecodeUni => url_decode_uni(&s),
+        // Recursive: defeats double/triple URL-encoding evasion (%253Cscript).
+        Transform::UrlDecodeUni => to_fixpoint(s, 3, |x| url_decode_uni(&x)),
         Transform::RemoveNulls => s.replace('\0', ""),
         Transform::ReplaceNulls => s.replace('\0', " "),
-        Transform::HtmlEntityDecode => decode_html_entities(s),
+        // Recursive: defeats nested HTML-entity encoding (&amp;#60; -> &#60; -> <).
+        Transform::HtmlEntityDecode => to_fixpoint(s, 3, decode_html_entities),
         Transform::RemoveWhitespace => s.chars().filter(|c| !c.is_ascii_whitespace()).collect(),
         Transform::CompressWhitespace => compress_whitespace(s),
         Transform::JsDecode => decode_js_escapes(s),
@@ -1701,6 +1721,30 @@ mod xml_tests {
         assert!(is_xml_content_type("application/rss+xml"));
         assert!(!is_xml_content_type("application/json"));
         assert!(!is_xml_content_type("text/html"));
+    }
+
+    #[test]
+    fn recursive_transforms_unwrap_double_encoding() {
+        // Double URL-encoding: single-pass would leave `%3Cscript`; recursive
+        // decode unwraps it to `<script` so the XSS signature can match.
+        assert_eq!(
+            apply_transforms("%253Cscript".to_string(), &[Transform::UrlDecodeUni]),
+            "<script"
+        );
+        // Nested numeric HTML entity: &#38; -> `&`, then &#60; -> `<`.
+        assert_eq!(
+            apply_transforms("&#38;#60;".to_string(), &[Transform::HtmlEntityDecode]),
+            "<"
+        );
+        // Single-encoding still decodes; benign text stabilises after one pass.
+        assert_eq!(
+            apply_transforms("%3Cb%3E".to_string(), &[Transform::UrlDecodeUni]),
+            "<b>"
+        );
+        assert_eq!(
+            apply_transforms("hello world".to_string(), &[Transform::UrlDecodeUni]),
+            "hello world"
+        );
     }
 
     #[test]
