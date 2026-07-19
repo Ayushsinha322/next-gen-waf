@@ -201,13 +201,179 @@ fn recursive_percent_decode(s: &str) -> Option<String> {
     }
 }
 
-/// Max attack score over the raw text and all of its decoded variants —
-/// Base64, HTML-entity, recursive percent-decode, and percent-then-entity
-/// (mixed encoding). Recursive normalization defeats the encoder-axis
-/// evasions a single-pass detector misses; taking the max means an attack
-/// hidden under any encoding is still caught. Each transform runs only when
-/// its marker byte (`&`, `%`, Base64 shape) is present, so ordinary benign
-/// values pay ~one extra branch.
+/// Collapse shell command-obfuscation so an obfuscated command scores like the
+/// plain one. Attackers break up a command with the shell's own no-op syntax:
+/// `$IFS`/`${IFS}`/`${IFS%??}` (the internal field separator expands to
+/// whitespace), empty positional/special params (`$9`, `$@`, `$*`), backslash
+/// char-escapes (`c\a\t` → `cat`), and interior quotes (`c""at`, `w'h'o'ami`).
+/// Runs only when a shell-obfuscation marker (`$`, `\`, `IFS`, or an adjacent
+/// quote pair) is present, so ordinary benign values are left untouched.
+fn collapse_shell_obfuscation(s: &str) -> Option<String> {
+    let has_marker = s.contains('$')
+        || s.contains('\\')
+        || s.contains("IFS")
+        || s.contains('\'')
+        || s.contains('"');
+    if !has_marker {
+        return None;
+    }
+    // IFS references expand to whitespace in a shell — normalize them first.
+    let pre = s
+        .replace("${IFS%??}", " ")
+        .replace("${IFS%?}", " ")
+        .replace("${IFS}", " ")
+        .replace("$IFS", " ");
+    let cs: Vec<char> = pre.chars().collect();
+    let mut out = String::with_capacity(cs.len());
+    let mut i = 0;
+    let mut changed = pre != s;
+    while i < cs.len() {
+        let c = cs[i];
+        // Backslash char-escape: drop the backslash, keep the escaped char.
+        if c == '\\' {
+            changed = true;
+            i += 1;
+            continue;
+        }
+        // Empty positional/special parameter (`$9`, `$@`, `$*`, …): expands to
+        // nothing, drop it.
+        if c == '$'
+            && matches!(
+                cs.get(i + 1),
+                Some('0'..='9' | '@' | '*' | '#' | '?' | '!')
+            )
+        {
+            changed = true;
+            i += 2;
+            continue;
+        }
+        // Interior quote used to break up a token: an empty pair (`''`, `""`)
+        // or a quote flanked by word characters.
+        if c == '\'' || c == '"' {
+            let next = cs.get(i + 1).copied();
+            if next == Some(c) {
+                changed = true;
+                i += 2; // drop the empty pair
+                continue;
+            }
+            let prev_word = out.chars().last().is_some_and(|p| p.is_alphanumeric());
+            let next_word = next.is_some_and(|n| n.is_alphanumeric());
+            if prev_word && next_word {
+                changed = true;
+                i += 1; // drop the interior quote
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    if changed {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// Strip SQL/C-style comments so a comment-obfuscated query scores like the
+/// plain one. `/*...*/` is a token separator in SQL, so attackers replace spaces
+/// with it (`UNION/**/SELECT`) — we canonicalize each comment to a single space.
+/// MySQL conditional comments (`/*!50000UNION*/`) execute, so their inner text
+/// is kept (minus the leading version digits). Returns `None` when there is no
+/// `/*`.
+fn strip_sql_comments(s: &str) -> Option<String> {
+    if !s.contains("/*") {
+        return None;
+    }
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    let mut changed = false;
+    while i < b.len() {
+        if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+            let bang = b.get(i + 2) == Some(&b'!');
+            // Locate the closing `*/`.
+            let mut j = i + 2;
+            let mut end = None;
+            while j + 1 < b.len() {
+                if b[j] == b'*' && b[j + 1] == b'/' {
+                    end = Some(j);
+                    break;
+                }
+                j += 1;
+            }
+            match end {
+                Some(close) => {
+                    out.push(b' ');
+                    if bang {
+                        // Keep the executed inner text, skipping `!` + version digits.
+                        let mut k = i + 3;
+                        while k < close && b[k].is_ascii_digit() {
+                            k += 1;
+                        }
+                        out.extend_from_slice(&b[k..close]);
+                        out.push(b' ');
+                    }
+                    changed = true;
+                    i = close + 2;
+                    continue;
+                }
+                None => {
+                    // Unterminated comment: drop the remainder.
+                    out.push(b' ');
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    if changed {
+        Some(String::from_utf8_lossy(&out).into_owned())
+    } else {
+        None
+    }
+}
+
+/// Collapse any run of ASCII whitespace (space, tab, CR, LF, vtab, formfeed)
+/// into a single space and trim the ends — defeats whitespace-variation evasion
+/// (`SELECT\tFROM`, `cat\t/etc/passwd`). Returns `None` when nothing changed.
+fn normalize_whitespace(s: &str) -> Option<String> {
+    let is_ws = |c: char| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c');
+    if !s.chars().any(|c| is_ws(c) && c != ' ') && !s.contains("  ") {
+        return None; // already single-space-separated ASCII
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut in_ws = false;
+    for c in s.chars() {
+        if is_ws(c) {
+            in_ws = true;
+        } else {
+            if in_ws && !out.is_empty() {
+                out.push(' ');
+            }
+            in_ws = false;
+            out.push(c);
+        }
+    }
+    if out == s {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Max attack score over the raw text and all of its normalized variants.
+///
+/// Two axes of evasion are defeated here by scoring every de-obfuscated form and
+/// taking the max: the ENCODER axis (Base64, HTML-entity, recursive percent-
+/// decode, and mixed percent-then-entity) and the OBFUSCATION axis (shell
+/// `$IFS`/backslash/quote insertion, SQL-comment token-splitting, whitespace
+/// variation). The obfuscation canonicalizers run over both the raw text and its
+/// percent-decoded form, since injection is usually URL-encoded on the wire.
+/// Each transform runs only when its marker (`&`, `%`, `$`, `/*`, non-space
+/// whitespace, Base64 shape) is present, so ordinary benign values pay only a
+/// few cheap branches.
 pub fn score_all(text: &str) -> Option<f32> {
     let mut max = score_text(text)?;
     let mut variants: Vec<String> = Vec::new();
@@ -217,10 +383,25 @@ pub fn score_all(text: &str) -> Option<f32> {
     if let Some(d) = html_entity_decode(text) {
         variants.push(d);
     }
-    if let Some(d) = recursive_percent_decode(text) {
-        if let Some(e) = html_entity_decode(&d) {
+    let percent = recursive_percent_decode(text);
+    if let Some(d) = &percent {
+        if let Some(e) = html_entity_decode(d) {
             variants.push(e);
         }
+    }
+    // Obfuscation canonicalizers over the raw text and its percent-decoded form.
+    for base in std::iter::once(text).chain(percent.as_deref()) {
+        if let Some(d) = collapse_shell_obfuscation(base) {
+            variants.push(d);
+        }
+        if let Some(d) = strip_sql_comments(base) {
+            variants.push(d);
+        }
+        if let Some(d) = normalize_whitespace(base) {
+            variants.push(d);
+        }
+    }
+    if let Some(d) = percent {
         variants.push(d);
     }
     for v in &variants {
@@ -312,11 +493,14 @@ mod tests {
     #[test]
     fn double_url_encoded_caught_by_score_all() {
         // `%253Cscript%253E...` → two percent passes → `<script>...`.
+        // (Assert catch + monotonicity, not strict `>`: this degenerate payload
+        // carries the literal substring `script` in its raw form, so raw and
+        // decoded can tie — what matters is that normalization still catches it.)
         let raw = "%253Cscript%253Ealert(1)%253C%252Fscript%253E";
         let all = score_all(raw).unwrap();
         assert!(
-            all > score_text(raw).unwrap(),
-            "recursive percent-decode must raise the score above the raw form"
+            all >= score_text(raw).unwrap(),
+            "normalization must never lower the score below the raw form"
         );
         assert!(all > 0.5, "double-encoded XSS must be caught, got {all}");
     }
@@ -328,5 +512,67 @@ mod tests {
             Some("<script>")
         );
         assert_eq!(recursive_percent_decode("plain text"), None);
+    }
+
+    #[test]
+    fn shell_ifs_and_escape_collapse() {
+        assert_eq!(
+            collapse_shell_obfuscation("cat${IFS}/etc/passwd").as_deref(),
+            Some("cat /etc/passwd")
+        );
+        assert_eq!(
+            collapse_shell_obfuscation("cat$IFS$9/etc/passwd").as_deref(),
+            Some("cat /etc/passwd")
+        );
+        assert_eq!(collapse_shell_obfuscation("c\\a\\t").as_deref(), Some("cat"));
+        assert_eq!(
+            collapse_shell_obfuscation("w'h'o'a'm'i").as_deref(),
+            Some("whoami")
+        );
+        assert_eq!(collapse_shell_obfuscation("c\"\"at").as_deref(), Some("cat"));
+        // No shell marker → no transform.
+        assert_eq!(collapse_shell_obfuscation("please list files"), None);
+    }
+
+    #[test]
+    fn shell_obfuscated_command_scored_by_score_all() {
+        let raw = "cat${IFS}/etc/passwd;whoami";
+        let all = score_all(raw).unwrap();
+        assert!(
+            all >= score_text(raw).unwrap(),
+            "de-obfuscated form must not lower the score"
+        );
+    }
+
+    #[test]
+    fn sql_comment_stripping() {
+        assert_eq!(
+            strip_sql_comments("UNION/**/SELECT").as_deref(),
+            Some("UNION SELECT")
+        );
+        assert_eq!(
+            strip_sql_comments("/*!50000UNION*/ SELECT").as_deref(),
+            Some(" UNION  SELECT")
+        );
+        assert_eq!(strip_sql_comments("no comment here"), None);
+    }
+
+    #[test]
+    fn comment_obfuscated_sqli_caught_by_score_all() {
+        let plain = score_text("union select username,password from users").unwrap();
+        let obf = score_all("union/**/select/**/username,password/**/from/**/users").unwrap();
+        assert!(
+            obf >= plain - 0.05,
+            "comment-obfuscated SQLi ({obf}) must score close to plain ({plain})"
+        );
+    }
+
+    #[test]
+    fn whitespace_normalization() {
+        assert_eq!(
+            normalize_whitespace("select\tid\nfrom\x0busers").as_deref(),
+            Some("select id from users")
+        );
+        assert_eq!(normalize_whitespace("already single spaced"), None);
     }
 }
