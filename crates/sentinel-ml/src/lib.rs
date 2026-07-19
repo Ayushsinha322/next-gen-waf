@@ -208,6 +208,18 @@ impl MlEngine {
             if let Some(body) = ctx.request_body.as_ref() {
                 if let Ok(bs) = std::str::from_utf8(body.as_ref()) {
                     candidates.push(bs.to_string());
+                    // Also score each PARSED, DECODED field value. Scoring only the
+                    // whole raw body misses attacks carried in a form/multipart
+                    // field: a URL- or Base64-encoded payload sits inside the
+                    // envelope, so the wholly-encoded field never decodes (its
+                    // marker is diluted by boundaries/`key=`) and slips past. Per-
+                    // field candidates let score_all decode each value on its own.
+                    let ct = ctx
+                        .request_headers
+                        .get(http::header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    body_field_values(bs, ct, &mut candidates);
                 }
             }
             // Score each candidate over its raw form AND every decoded variant
@@ -324,6 +336,48 @@ impl MlEngine {
     }
 }
 
+/// Extract decoded field values from a form-urlencoded or multipart body and
+/// push each as its own ML candidate. Each value is scored independently so a
+/// URL/Base64-encoded payload in one field decodes cleanly (its whole-value
+/// marker is intact) instead of being lost inside the raw body blob. Non-form
+/// bodies (JSON, raw) are already covered by the whole-body candidate.
+fn body_field_values(body: &str, content_type: &str, out: &mut Vec<String>) {
+    let ct = content_type.to_ascii_lowercase();
+    if ct.starts_with("application/x-www-form-urlencoded") {
+        for kv in body.split('&') {
+            let v = kv.split_once('=').map(|(_, v)| v).unwrap_or(kv);
+            let dec = percent_encoding::percent_decode_str(v)
+                .decode_utf8_lossy()
+                .into_owned();
+            if !dec.is_empty() {
+                out.push(dec);
+            }
+        }
+    } else if let Some(pos) = ct.find("multipart/form-data") {
+        // Boundary token from `; boundary=...`.
+        let Some(b) = ct[pos..]
+            .find("boundary=")
+            .map(|i| pos + i + "boundary=".len())
+            .map(|i| content_type[i..].trim().trim_matches('"'))
+        else {
+            return;
+        };
+        if b.is_empty() {
+            return;
+        }
+        let delim = format!("--{b}");
+        for part in body.split(&delim) {
+            // Field value is everything after the part's header block (blank line).
+            if let Some(idx) = part.find("\r\n\r\n").map(|i| i + 4).or_else(|| part.find("\n\n").map(|i| i + 2)) {
+                let val = part[idx..].trim_end_matches(['-', '\r', '\n']);
+                if !val.is_empty() {
+                    out.push(val.to_string());
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -339,6 +393,32 @@ mod tests {
         // Not trained yet — scores neutral.
         assert!(!engine.is_trained());
         assert_eq!(engine.buffer_len(), 0);
+    }
+
+    #[test]
+    fn form_field_values_are_decoded() {
+        let mut out = Vec::new();
+        body_field_values(
+            "a=%3Cscript%3E&b=hello",
+            "application/x-www-form-urlencoded",
+            &mut out,
+        );
+        assert!(out.contains(&"<script>".to_string()), "got {out:?}");
+        assert!(out.contains(&"hello".to_string()));
+    }
+
+    #[test]
+    fn multipart_field_values_extracted() {
+        let b = "X99";
+        let body = format!(
+            "--{b}\r\nContent-Disposition: form-data; name=\"q\"\r\n\r\n<svg onload=alert(1)>\r\n--{b}--\r\n"
+        );
+        let mut out = Vec::new();
+        body_field_values(&body, &format!("multipart/form-data; boundary={b}"), &mut out);
+        assert!(
+            out.iter().any(|v| v.contains("<svg onload=alert(1)>")),
+            "multipart field value not extracted: {out:?}"
+        );
     }
 
     #[test]
