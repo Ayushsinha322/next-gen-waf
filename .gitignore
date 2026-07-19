@@ -79,3 +79,6 @@ features-improvement
 
 # Deploy secrets — never commit
 deploy/docker/.env
+
+# GoTestWAF benchmark output (regenerated per run)
+deploy/load-test/detection-reports/

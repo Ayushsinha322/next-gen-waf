@@ -60,6 +60,17 @@ on this corpus); (3) per-deployment FP tuning on real traffic.
 | + coverage signatures (`coverage.conf`: CRLF/SMTP-IMAP/LDAP/SSTI/NoSQL) | **49.33%** | 91.49% | **63.74%** |
 | + ML char-n-gram classifier (embedded, trained on HttpParamsDataset + adversarial-benign) | **57.19%** | 88.65% | **75.63%** |
 | + base64 decode-and-rescore in the ML path (defeats the Base64 encoder axis) | **62.22%** | 87.23% | **76.57%** |
+| + mutation-augmented model (evasion transforms in training) | 68.08% | 87.23% | 78.11% |
+| + obfuscation canonicalizers ($IFS/comment/whitespace) + per-category-balanced retrain (full-enc benign) + precise cmdi rules (9900207/8) + **ML scoring of parsed form/multipart field values** | **80.30%** | **85.82%** | **80.82%** |
+
+**2026-07-18: crossed 80% (overall 80.82%, App-TP 80.30%, TN 85.82%, API 78.57%).** The decisive
+lever was feeding the ML classifier the *parsed, decoded* form/multipart field values — encoded
+attacks in body fields were previously diluted inside the raw body blob and never decoded, so they
+bypassed. This lifted xss-scripting 68→90%, ss-include 75→100%, and raised sql/ldap/path-traversal/
+shell across the board. TN cost was +4 FP (88.65→85.82) for +12pp App-TP. Category highlights (final):
+xss-scripting 90.2%, ss-include 100%, xml/crlf/xxe/rce-urlparam/urlpath 100%, sqli 60%, shell 56%,
+ldap 58%, nosql 58%, sst 67%, path-traversal 60%. Remaining bypass mass: mail-injection (46%),
+evasive XSS tail (22/224), SQLi/shell obfuscation tail — the next targets beyond 80%.
 
 Category gains from coverage: CRLF 0→85.7%, mail(SMTP/IMAP) 0→33.3%, NoSQL 40→50%,
 LDAP 0→33.3%, SSTI 12.5→45.8%. TN held (coverage added 0 false-positives; the
