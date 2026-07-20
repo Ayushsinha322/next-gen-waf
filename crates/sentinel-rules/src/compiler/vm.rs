@@ -1535,41 +1535,51 @@ fn decode_css_escapes(s: String) -> String {
 /// Strips whitespace first (headers often have line breaks).
 /// Returns the original string unchanged on any decoding error.
 fn base64_decode_transform(s: &str) -> String {
+    // Strip whitespace first (headers often have line breaks).
     let cleaned: String = s.chars().filter(|c| !c.is_ascii_whitespace()).collect();
-    let decode = |c: u8| -> Option<u8> {
-        match c {
-            b'A'..=b'Z' => Some(c - b'A'),
-            b'a'..=b'z' => Some(c - b'a' + 26),
-            b'0'..=b'9' => Some(c - b'0' + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            b'=' => Some(0),
-            _ => None,
-        }
-    };
-    let bytes = cleaned.as_bytes();
-    if bytes.is_empty() || bytes.len() % 4 != 0 {
+    if cleaned.len() < 8 {
         return s.to_owned();
     }
+    // First pass: try to decode the cleaned string as pure Base64.
+    if let Some(decoded) = try_decode_base64(&cleaned) {
+        if let Ok(result) = String::from_utf8(decoded) {
+            return result;
+        }
+    }
+    // Second pass: handle URLPath case where the value starts with '/'
+    // (e.g. "/DQpRVUlUDQo"). The '/' is a valid Base64 character, so the
+    // first pass decodes it as part of the payload and produces garbage.
+    // Stripping the leading '/' exposes the real Base64 payload.
+    if let Some(stripped) = cleaned.strip_prefix('/') {
+        if !stripped.is_empty() {
+            if let Some(decoded) = try_decode_base64(stripped) {
+                if let Ok(result) = String::from_utf8(decoded) {
+                    return result;
+                }
+            }
+        }
+    }
+    s.to_owned()
+}
+
+/// Try to decode a Base64 string (with auto-padding for unpadded input).
+/// Returns None if the string contains non-Base64 characters.
+fn try_decode_base64(input: &str) -> Option<Vec<u8>> {
+    let mut padded = input.to_owned();
+    let rem = padded.len() % 4;
+    if rem != 0 {
+        for _ in 0..(4 - rem) {
+            padded.push('=');
+        }
+    }
+    let bytes = padded.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len() * 3 / 4);
     let mut i = 0;
     while i + 3 < bytes.len() {
-        let b0 = match decode(bytes[i]) {
-            Some(v) => v,
-            None => return s.to_owned(),
-        };
-        let b1 = match decode(bytes[i + 1]) {
-            Some(v) => v,
-            None => return s.to_owned(),
-        };
-        let b2 = match decode(bytes[i + 2]) {
-            Some(v) => v,
-            None => return s.to_owned(),
-        };
-        let b3 = match decode(bytes[i + 3]) {
-            Some(v) => v,
-            None => return s.to_owned(),
-        };
+        let b0 = decode_b64_byte(bytes[i])?;
+        let b1 = decode_b64_byte(bytes[i + 1])?;
+        let b2 = decode_b64_byte(bytes[i + 2])?;
+        let b3 = decode_b64_byte(bytes[i + 3])?;
         out.push((b0 << 2) | (b1 >> 4));
         if bytes[i + 2] != b'=' {
             out.push((b1 << 4) | (b2 >> 2));
@@ -1579,7 +1589,19 @@ fn base64_decode_transform(s: &str) -> String {
         }
         i += 4;
     }
-    String::from_utf8(out).unwrap_or_else(|_| s.to_owned())
+    Some(out)
+}
+
+fn decode_b64_byte(c: u8) -> Option<u8> {
+    match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'a'..=b'z' => Some(c - b'a' + 26),
+        b'0'..=b'9' => Some(c - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        b'=' => Some(0),
+        _ => None,
+    }
 }
 
 /// Decode a hex-encoded string (optional `0x`/`0X` prefix; even-length hex bytes).

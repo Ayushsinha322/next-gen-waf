@@ -2888,11 +2888,34 @@ fn apply_verdict(ctx: &mut RequestContext, waf: &WafConfig) {
         }
         None => {
             if ctx.anomaly_score > 0 && ctx.anomaly_score >= waf.anomaly_threshold {
-                ctx.decision = WafDecision::Block;
-                ctx.block_reason = Some(format!(
-                    "anomaly score {} >= threshold {}",
-                    ctx.anomaly_score, waf.anomaly_threshold
-                ));
+                // ML suppression: when the n-gram classifier is loaded and
+                // scores the payload as benign (< 0.15), suppress CRS-only
+                // blocks. The ML model acts as a precision layer — if it
+                // doesn't see an attack, a CRS-only match is likely a false
+                // positive on benign prose. Only suppress when:
+                // 1. No coverage rule (99002xx) fired
+                // 2. Anomaly score is moderate (< 20, i.e. 2-3 rules)
+                // 3. ML score is low (< 0.15)
+                let has_coverage_match = ctx
+                    .rule_matches
+                    .iter()
+                    .any(|m| m.rule_id.starts_with("99002"));
+                let ml_benign = sentinel_ml::models::ngram_classifier::is_loaded()
+                    && !has_coverage_match
+                    && ctx
+                        .ml_scores
+                        .get("payload_attack")
+                        .copied()
+                        .unwrap_or(1.0)
+                        < 0.15
+                    && ctx.anomaly_score < 20;
+                if !ml_benign {
+                    ctx.decision = WafDecision::Block;
+                    ctx.block_reason = Some(format!(
+                        "anomaly score {} >= threshold {}",
+                        ctx.anomaly_score, waf.anomaly_threshold
+                    ));
+                }
             }
         }
     }

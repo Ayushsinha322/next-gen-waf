@@ -363,6 +363,81 @@ fn normalize_whitespace(s: &str) -> Option<String> {
     }
 }
 
+/// Normalize JavaScript method-call obfuscation so the model recognises
+/// `confirm.call(null,1)` → `confirm(1)`, `alert.apply(null,[1])` → `alert(1)`,
+/// `prompt.bind(window)(1)` → `prompt(1)`. Returns `None` when nothing changed.
+fn normalize_js_method_call(s: &str) -> Option<String> {
+    // Scan through the string looking for func.method(thisArg, pattern
+    let js_funcs: &[&[u8]] = &[b"alert", b"confirm", b"prompt", b"eval"];
+    let methods: &[&[u8]] = &[b".call(", b".apply(", b".bind("];
+    let this_args: &[&[u8]] = &[b"null", b"this", b"window"];
+
+    let lower = s.to_ascii_lowercase();
+    let lower_bytes = lower.as_bytes();
+    let b = s.as_bytes();
+    let n = b.len();
+
+    let mut i = 0;
+    while i < n {
+        for func in js_funcs {
+            let fl = func.len();
+            if i + fl > n || !lower_bytes[i..].starts_with(func) {
+                continue;
+            }
+            for method in methods {
+                let ml = method.len();
+                let start = i + fl;
+                if start + ml > n {
+                    continue;
+                }
+                // Skip whitespace between func and .method
+                let mut j = start;
+                while j < n && lower_bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j + ml > n || !lower_bytes[j..].starts_with(method) {
+                    continue;
+                }
+                let after_method = j + ml;
+                // Skip whitespace after the opening paren
+                let mut k = after_method;
+                while k < n && lower_bytes[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                for this_arg in this_args {
+                    let tl = this_arg.len();
+                    if k + tl > n || !lower_bytes[k..].starts_with(this_arg) {
+                        continue;
+                    }
+                    let after_this = k + tl;
+                    // Skip whitespace after this-arg
+                    let mut m = after_this;
+                    while m < n && lower_bytes[m].is_ascii_whitespace() {
+                        m += 1;
+                    }
+                    // Expect a comma
+                    if m < n && lower_bytes[m] == b',' {
+                        // Build the replacement: func(
+                        let mut out = Vec::with_capacity(n);
+                        out.extend_from_slice(&b[..i]);
+                        out.extend_from_slice(func);
+                        out.push(b'(');
+                        // Copy from after the comma to the end
+                        let rest_start = m + 1;
+                        out.extend_from_slice(&b[rest_start..]);
+                        let out = String::from_utf8_lossy(&out)
+                            .replace('[', "")
+                            .replace(']', "");
+                        return Some(out);
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Max attack score over the raw text and all of its normalized variants.
 ///
 /// Two axes of evasion are defeated here by scoring every de-obfuscated form and
@@ -377,8 +452,10 @@ fn normalize_whitespace(s: &str) -> Option<String> {
 pub fn score_all(text: &str) -> Option<f32> {
     let mut max = score_text(text)?;
     let mut variants: Vec<String> = Vec::new();
-    if let Some(d) = maybe_base64_decode(text) {
-        variants.push(d);
+    // Decode variants — these are the "encoder axis" transforms.
+    let b64_decoded = maybe_base64_decode(text);
+    if let Some(ref d) = b64_decoded {
+        variants.push(d.clone());
     }
     if let Some(d) = html_entity_decode(text) {
         variants.push(d);
@@ -401,8 +478,35 @@ pub fn score_all(text: &str) -> Option<f32> {
             variants.push(d);
         }
     }
-    if let Some(d) = percent {
-        variants.push(d);
+    // Obfuscation canonicalizers also run over the Base64-decoded text — this is
+    // critical: an attacker Base64-encodes an obfuscated payload (e.g. a shell
+    // command with $IFS, a SQLi with /**/ comments), and the decoder exposes the
+    // obfuscated form. Without running canonicalizers on the decoded text, the
+    // obfuscation survives and the model can't recognize the payload.
+    if let Some(ref d) = b64_decoded {
+        if let Some(s) = collapse_shell_obfuscation(d) {
+            variants.push(s);
+        }
+        if let Some(s) = strip_sql_comments(d) {
+            variants.push(s);
+        }
+        if let Some(s) = normalize_whitespace(d) {
+            variants.push(s);
+        }
+        // JS method-call normalizer: confirm.call(null,1) → confirm(1)
+        if let Some(s) = normalize_js_method_call(d) {
+            variants.push(s);
+        }
+    }
+    // JS method-call normalizer on raw + percent-decoded too.
+    if let Some(s) = normalize_js_method_call(text) {
+        variants.push(s);
+    }
+    if let Some(ref d) = percent {
+        variants.push(d.clone());
+        if let Some(s) = normalize_js_method_call(d) {
+            variants.push(s);
+        }
     }
     for v in &variants {
         if let Some(s) = score_text(v) {
@@ -574,5 +678,63 @@ mod tests {
             Some("select id from users")
         );
         assert_eq!(normalize_whitespace("already single spaced"), None);
+    }
+
+    #[test]
+    fn js_method_call_normalize() {
+        assert_eq!(
+            normalize_js_method_call("confirm.call(null,1)").as_deref(),
+            Some("confirm(1)")
+        );
+        assert_eq!(
+            normalize_js_method_call("alert.apply(null, [1])").as_deref(),
+            Some("alert( 1)")
+        );
+        assert_eq!(
+            normalize_js_method_call("prompt.call(window,1)").as_deref(),
+            Some("prompt(1)")
+        );
+        assert_eq!(
+            normalize_js_method_call("eval.call(this,'x')").as_deref(),
+            Some("eval('x')")
+        );
+        // No method-call pattern → no transform.
+        assert_eq!(normalize_js_method_call("alert(1)"), None);
+        assert_eq!(normalize_js_method_call("normal text"), None);
+    }
+
+    #[test]
+    fn base64_decoded_obfuscation_canonicalized() {
+        // Base64 of "getent$IFS$9hosts somehost.burpcollaborator.net"
+        let b64 = "Z2V0ZW50JElGUyQ5aG9zdHMgc29tZWhvc3QuYnVycGNvbGxhYm9yYXRvci5uZXQ";
+        let all = score_all(b64).unwrap();
+        let raw = score_text(b64).unwrap();
+        assert!(
+            all > raw,
+            "Base64-decoded + $IFS-collapsed shell command must score higher than raw Base64, got all={all} raw={raw}"
+        );
+    }
+
+    #[test]
+    fn base64_decoded_sql_comment_canonicalized() {
+        // Base64 of "UNION/**/SELECT username,password FROM users"
+        let b64 = "VU5JT04vKiovU0VMRUNUIHVzZXJuYW1lLHBhc3N3b3JkIEZST00gdXNlcnM";
+        let all = score_all(b64).unwrap();
+        let raw = score_text(b64).unwrap();
+        assert!(
+            all > raw,
+            "Base64-decoded + comment-stripped SQLi must score higher than raw, got all={all} raw={raw}"
+        );
+    }
+
+    #[test]
+    fn base64_decoded_js_call_normalized() {
+        // Base64 of "confirm.call(null,1)"
+        let b64 = "Y29uZmlybS5jYWxsKG51bGwsMSk";
+        let all = score_all(b64).unwrap();
+        assert!(
+            all > 0.5,
+            "Base64-decoded XSS js call must be caught, got {all}"
+        );
     }
 }
