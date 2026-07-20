@@ -1,68 +1,110 @@
-# Raft cluster demo overlay.
+# Raft cluster overlay — turns the single control plane into a 3-node Raft
+# cluster (node ids 1/2/3) over the SAME Postgres, so config writes are
+# replicated and survive a control-plane node failing. (Data-plane HA is a
+# separate concern — see compose.ha.yml.)
 #
-# Turns the single control plane into a 3-node Raft cluster (node ids 1/2/3)
-# sharing the existing Postgres + sites, so the running data plane keeps
-# protecting Juice Shop throughout a leader failover. No image rebuild — the
-# cluster is gated purely on SENTINEL_RAFT_* env, already in the image.
+# HOW WRITES REACH THE LEADER (the important bit): clients talk to ANY control
+# plane node. Reads are served locally from the shared Postgres on every node;
+# mutating requests (POST/PUT/PATCH/DELETE) are transparently forwarded to the
+# elected Raft leader by the control plane itself (leaderForward middleware), so
+# a caller never has to know who the leader is and never sees "not the leader".
+# Kill any node → the survivors elect a new leader and forwarding follows it.
 #
 # Usage (from /opt/sentinel-src):
-#   docker compose -f deploy/docker/compose.prod.yml -f deploy/docker/compose.cluster.yml up -d controlplane cp2 cp3
+#   docker compose -f deploy/docker/compose.prod.yml \
+#                  -f deploy/docker/compose.cluster.yml up -d controlplane cp2 cp3
 #
-# Then drive the failover with demo/cluster-failover-demo.sh.
+# INVARIANT: every member MUST have byte-identical control-plane environment —
+# only the node id, raft address and peer list differ. Otherwise a node that
+# gets elected leader can't perform every duty (writes, cert monitor, alerting).
+# The shared block therefore lives HERE (not only in compose.prod.yml) because
+# cp2/cp3 are brand-new services that do NOT inherit the controlplane service.
+# This is also why a stale compose that omitted SENTINEL_AUDIT_HMAC_KEY /
+# SENTINEL_ALLOW_SUPERUSER_DB crash-looped the cluster after an image rebuild:
+# the binary requires them, so the deploy contract must supply them to ALL nodes.
+
+x-cp-env: &cp-env
+  SENTINEL_DB_URL: ${SENTINEL_DB_URL}
+  SENTINEL_REDIS_URL: redis://redis:6379
+  # ClickHouse reader (Threat Search / recent-blocks) — any node may be leader
+  # and serve these, so all nodes get the creds.
+  SENTINEL_CLICKHOUSE_URL: http://clickhouse:8123
+  SENTINEL_CLICKHOUSE_DB: ${CLICKHOUSE_DB}
+  SENTINEL_CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+  SENTINEL_CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+  SENTINEL_JWT_SECRET: ${SENTINEL_JWT_SECRET}
+  # Required by the audit-HMAC fail-fast (>=32 chars). Boot fatal if unset.
+  SENTINEL_AUDIT_HMAC_KEY: ${SENTINEL_AUDIT_HMAC_KEY}
+  SENTINEL_INTERNAL_SECRET: ${SENTINEL_INTERNAL_SECRET}
+  # Single-tenant demo posture: the stack connects to Postgres as the superuser
+  # role (bypasses FORCE RLS); tenant isolation is via explicit predicates. Boot
+  # fatal without this opt-out. For multi-tenant prod, point SENTINEL_DB_URL at
+  # the non-superuser 'sentinel_app' role and REMOVE this.
+  SENTINEL_ALLOW_SUPERUSER_DB: "1"
+  SENTINEL_REST_ADDR: 0.0.0.0:9501
+  SENTINEL_GRPC_ADDR: 0.0.0.0:9500
+  SENTINEL_AUTOSTART_DATAPLANE: "0"
+  SENTINEL_LOG_DIR: /var/log/sentinel
+  SENTINEL_CORS_ORIGINS: http://172.16.21.71:3000,https://172.16.21.71:9443
+  SENTINEL_DATAPLANE_URL: http://dataplane:8080
+  SENTINEL_ROOT_CA_PATH: /etc/sentinel/root-ca.crt
+  # Shared HMAC that authenticates inter-node Raft RPC. Same on every member.
+  # NO default on purpose: `docker compose config` FAILS if it isn't set in
+  # deploy/docker/.env, so the old insecure committed default can never ship.
+  # Generate with: openssl rand -hex 32
+  SENTINEL_RAFT_SECRET: ${SENTINEL_RAFT_SECRET:?set a strong SENTINEL_RAFT_SECRET in deploy/docker/.env (openssl rand -hex 32)}
 
 services:
-  # Node 1 = the existing control plane, now a Raft member.
+  # Node 1 = the existing control plane (keeps its image/ports/volumes from
+  # compose.prod.yml). Here we fold in the shared env + node-1 raft identity.
   controlplane:
     environment:
+      <<: *cp-env
       SENTINEL_NODE_ID: "1"
       SENTINEL_RAFT_ADDR: controlplane:9600
       SENTINEL_RAFT_PEERS: "2=cp2:9600,3=cp3:9600"
-      SENTINEL_RAFT_SECRET: ${SENTINEL_RAFT_SECRET:-demo-raft-cluster-secret}
 
   cp2:
     image: sentinel/controlplane:latest
+    hostname: cp2
     restart: unless-stopped
     user: "0:0"
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
+      # Match controlplane: don't boot before the schema is migrated (fresh DB
+      # race) and don't gate on ClickHouse health (reader degrades gracefully).
+      migrate: { condition: service_completed_successfully }
+      clickhouse: { condition: service_started }
     environment:
-      SENTINEL_DB_URL: ${SENTINEL_DB_URL}
-      SENTINEL_REDIS_URL: redis://redis:6379
-      SENTINEL_JWT_SECRET: ${SENTINEL_JWT_SECRET}
-      SENTINEL_REST_ADDR: 0.0.0.0:9501
-      SENTINEL_GRPC_ADDR: 0.0.0.0:9500
-      SENTINEL_AUTOSTART_DATAPLANE: "0"
-      SENTINEL_LOG_DIR: /var/log/sentinel
-      SENTINEL_INTERNAL_SECRET: ${SENTINEL_INTERNAL_SECRET}
+      <<: *cp-env
       SENTINEL_NODE_ID: "2"
       SENTINEL_RAFT_ADDR: cp2:9600
       SENTINEL_RAFT_PEERS: "1=controlplane:9600,3=cp3:9600"
-      SENTINEL_RAFT_SECRET: ${SENTINEL_RAFT_SECRET:-demo-raft-cluster-secret}
     volumes:
       - sentinel-logs:/var/log/sentinel
+      # Public Root CA (read-only) so this node can serve CA-download when leader.
+      - /opt/sentinel-pki/root.crt:/etc/sentinel/root-ca.crt:ro
     networks: [sentinel]
 
   cp3:
     image: sentinel/controlplane:latest
+    hostname: cp3
     restart: unless-stopped
     user: "0:0"
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
+      # Match controlplane: don't boot before the schema is migrated (fresh DB
+      # race) and don't gate on ClickHouse health (reader degrades gracefully).
+      migrate: { condition: service_completed_successfully }
+      clickhouse: { condition: service_started }
     environment:
-      SENTINEL_DB_URL: ${SENTINEL_DB_URL}
-      SENTINEL_REDIS_URL: redis://redis:6379
-      SENTINEL_JWT_SECRET: ${SENTINEL_JWT_SECRET}
-      SENTINEL_REST_ADDR: 0.0.0.0:9501
-      SENTINEL_GRPC_ADDR: 0.0.0.0:9500
-      SENTINEL_AUTOSTART_DATAPLANE: "0"
-      SENTINEL_LOG_DIR: /var/log/sentinel
-      SENTINEL_INTERNAL_SECRET: ${SENTINEL_INTERNAL_SECRET}
+      <<: *cp-env
       SENTINEL_NODE_ID: "3"
       SENTINEL_RAFT_ADDR: cp3:9600
       SENTINEL_RAFT_PEERS: "1=controlplane:9600,2=cp2:9600"
-      SENTINEL_RAFT_SECRET: ${SENTINEL_RAFT_SECRET:-demo-raft-cluster-secret}
     volumes:
       - sentinel-logs:/var/log/sentinel
+      - /opt/sentinel-pki/root.crt:/etc/sentinel/root-ca.crt:ro
     networks: [sentinel]

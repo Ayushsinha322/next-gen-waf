@@ -242,13 +242,43 @@ func run() error {
 		log.Info("clickhouse reader disabled — set SENTINEL_CLICKHOUSE_URL to enable event search")
 	}
 
+	// ── RBAC ──────────────────────────────────────────────────────────────────
+	enforcer := rbac.NewEnforcer()
+
+	// ── Raft cluster (optional) ──────────────────────────────────────────────
+	// Activated when SENTINEL_RAFT_ADDR is set.  Single-node bootstrap when
+	// SENTINEL_RAFT_PEERS is empty.  Started BEFORE the singleton background
+	// workers so we can gate them on cluster membership.
+	cl, clErr := startCluster(log)
+	if clErr != nil {
+		// Fatal by design: SENTINEL_RAFT_ADDR was set, so a cluster was INTENDED.
+		// Silently degrading to standalone would turn leader-forwarding into a
+		// no-op cluster-wide and mask a real misconfiguration (a stale secret, a
+		// bad peer list). Fail loud so the operator fixes the deploy, not the WAF.
+		return fmt.Errorf("cluster init failed: %w", clErr)
+	}
+	if cl != nil {
+		defer cl.Stop()
+	}
+
+	// Singleton background duties (alerting, threat-intel, cert & node-health
+	// monitors) MUST run on exactly one node — every control-plane node tails the
+	// SAME shared NDJSON stream and shares one Postgres, so running them on all N
+	// nodes emits N× duplicate alerts/notifications and N× feed fetches. They only
+	// read shared state / poll the data plane, so they need "exactly one runner",
+	// not "the Raft leader" specifically — so we pin them to node 1 (the primary /
+	// API entry point). Standalone (no cluster) always runs them.
+	// NOTE (single-VM limitation): these duties pause if node 1 is down until it
+	// returns; leader-following singletons would need restartable workers.
+	primary := cl == nil || envOrDefault("SENTINEL_NODE_ID", "1") == "1"
+
 	// ── Alert engine ──────────────────────────────────────────────────────────
 	// Turns the live WAF event stream into alerts (spikes, repeat offenders,
 	// critical blocks), persists them, surfaces them on the dashboard via SSE,
 	// and fans them out to configured notification channels. Single-tenant
 	// (dev tenant) because the proxy NDJSON stream is not tenant-tagged.
 	var engine *alerting.Engine
-	if store != nil {
+	if store != nil && primary {
 		engine = alerting.New(store, hub, db.DevTenantID, db.DevAdminID, alertingConfigFromEnv(), log)
 		engine.Start()
 		defer engine.Stop()
@@ -259,7 +289,7 @@ func run() error {
 	// STIX/TAXII) into threat_intel_iocs on an hourly ticker; the Rust data plane
 	// hot-syncs the result via GET /api/v1/internal/threat-intel. Disable with
 	// SENTINEL_THREATINTEL_ENABLED=false (e.g. air-gapped installs).
-	if store != nil {
+	if store != nil && primary {
 		if tiCfg := threatintel.ConfigFromEnv(); tiCfg.Enabled {
 			agg := threatintel.New(store, tiCfg, log)
 			agg.Start(ctx)
@@ -269,24 +299,11 @@ func run() error {
 		}
 	}
 
-	// ── RBAC ──────────────────────────────────────────────────────────────────
-	enforcer := rbac.NewEnforcer()
-
-	// ── Raft cluster (optional) ──────────────────────────────────────────────
-	// Activated when SENTINEL_RAFT_ADDR is set.  Single-node bootstrap when
-	// SENTINEL_RAFT_PEERS is empty.  Disabled entirely otherwise — all writes
-	// proceed unconditionally, preserving pre-cluster behaviour.
-	cl, clErr := startCluster(log)
-	if clErr != nil {
-		log.Warn("cluster init failed — continuing in standalone mode", zap.Error(clErr))
-	} else if cl != nil {
-		defer cl.Stop()
-	}
-
 	// ── Node-health monitor ───────────────────────────────────────────────────
 	// Flips stale data-plane nodes DOWN, watches Raft quorum, and raises alerts
-	// through the engine on transitions. Started after the cluster so it can use
-	// the same cl handle; only when a store + engine exist.
+	// through the engine on transitions. Gated on engine != nil, which is only
+	// true on the primary node — so it never runs (or touches a nil engine) on a
+	// non-primary member.
 	if store != nil && engine != nil {
 		nm := nodehealth.New(store, engine, cl, log)
 		nm.Start()
@@ -376,6 +393,9 @@ func run() error {
 	}
 
 	protected := router.Group("/api/v1")
+	// Leader-forward BEFORE auth: on a follower we proxy mutating requests to the
+	// leader untouched (it authenticates), so any node is a valid write entry point.
+	protected.Use(leaderForward(cl))
 	protected.Use(auth.GinAuthMiddlewareWithAPIKey(jwtSvc, false, apiKeyResolver))
 	{
 		protected.POST("/auth/logout", func(c *gin.Context) { handleLogout(c, jwtSvc, store) })
@@ -504,6 +524,7 @@ func run() error {
 	router.POST("/api/v1/internal/nodes/heartbeat", func(c *gin.Context) { handleNodeHeartbeat(c, store) })
 
 	admin := router.Group("/api/v1/admin")
+	admin.Use(leaderForward(cl))
 	admin.Use(auth.GinAuthMiddlewareWithAPIKey(jwtSvc, true, apiKeyResolver))
 	{
 		admin.GET("/users", func(c *gin.Context) { handleListUsersReal(c, enforcer, store) })
@@ -518,6 +539,7 @@ func run() error {
 	// Platform (tenant lifecycle) — provisioning is gated to the platform tenant's
 	// owner/admin (see isPlatformAdmin), distinct from per-tenant admin.
 	platform := router.Group("/api/v1/platform")
+	platform.Use(leaderForward(cl))
 	platform.Use(auth.GinAuthMiddlewareWithAPIKey(jwtSvc, true, apiKeyResolver))
 	{
 		platform.POST("/tenants", func(c *gin.Context) { handleCreateTenant(c, store) })
@@ -527,7 +549,10 @@ func run() error {
 
 	// ── Graceful shutdown ─────────────────────────────────────────────────────
 
-	httpSrv := &http.Server{Addr: restAddr, Handler: router}
+	// ReadHeaderTimeout bounds slow-header (slowloris) attacks. We deliberately
+	// leave ReadTimeout/WriteTimeout at 0: this server streams Server-Sent Events
+	// (live logs) as long-lived GET responses, and a WriteTimeout would sever them.
+	httpSrv := &http.Server{Addr: restAddr, Handler: router, ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 120 * time.Second}
 
 	go func() {
 		log.Info("REST API listening", zap.String("addr", restAddr))
@@ -749,8 +774,20 @@ func startCluster(log *zap.Logger) (*cluster.Cluster, error) {
 	// network can't forge log entries or spoof votes. Single-node clusters
 	// exchange no RPC, so the secret is optional there.
 	secret := os.Getenv("SENTINEL_RAFT_SECRET")
-	if len(peers) > 0 && secret == "" {
-		return nil, fmt.Errorf("SENTINEL_RAFT_SECRET is required for a multi-node cluster (peers configured)")
+	if len(peers) > 0 {
+		// The secret is the ONLY authenticator on inter-node Raft RPC (votes,
+		// AppendEntries). A weak/known value lets anyone on the cluster network
+		// forge votes and disrupt consensus, so reject the empty case, the
+		// committed demo default, and anything too short to be a real key.
+		const demoDefault = "demo-raft-cluster-secret"
+		switch {
+		case secret == "":
+			return nil, fmt.Errorf("SENTINEL_RAFT_SECRET is required for a multi-node cluster (peers configured)")
+		case secret == demoDefault:
+			return nil, fmt.Errorf("SENTINEL_RAFT_SECRET is set to the insecure committed default %q — generate a strong random value (e.g. openssl rand -hex 32) into the deploy .env", demoDefault)
+		case len(secret) < 32:
+			return nil, fmt.Errorf("SENTINEL_RAFT_SECRET must be >=32 chars for a multi-node cluster; got %d", len(secret))
+		}
 	}
 
 	cfg := cluster.Config{
