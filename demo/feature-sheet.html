@@ -1,0 +1,233 @@
+<style>
+  :root{
+    --bg:#09090b; --bg2:#111114; --card:#141418; --card2:#17171c;
+    --line:rgba(255,255,255,.07); --line2:rgba(34,211,238,.22);
+    --text:#f4f4f5; --text2:#b9b9c3; --text3:#8a8a95;
+    --cyan:#22d3ee; --cyan-dim:rgba(34,211,238,.12); --cyan-glow:rgba(34,211,238,.45);
+    --green:#22d75e; --amber:#f59e0b; --red:#fb7185; --violet:#a78bfa;
+    --mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  .sheet{
+    background:var(--bg); color:var(--text); font-family:var(--sans);
+    line-height:1.5; -webkit-font-smoothing:antialiased; padding:clamp(20px,4vw,48px);
+    background-image:
+      radial-gradient(60% 55% at 82% -5%, rgba(34,211,238,.10), transparent 60%),
+      radial-gradient(50% 45% at 0% 8%, rgba(124,58,237,.10), transparent 55%);
+    min-height:100vh;
+  }
+  .wrap{max-width:1180px;margin:0 auto}
+
+  /* ── Hero ── */
+  .hero{margin-bottom:34px}
+  .eyebrow{
+    font-family:var(--mono); font-size:12px; letter-spacing:3.5px; color:var(--cyan);
+    text-transform:uppercase; display:flex; align-items:center; gap:10px; margin-bottom:14px;
+  }
+  .eyebrow::before{content:"";width:26px;height:1px;background:var(--cyan);opacity:.6}
+  .title{
+    font-family:var(--sans); font-weight:800; letter-spacing:.5px;
+    font-size:clamp(30px,6vw,56px); line-height:1.02; text-wrap:balance;
+  }
+  .title .accent{color:var(--cyan);text-shadow:0 0 26px var(--cyan-glow)}
+  .tagline{color:var(--text2);font-size:clamp(15px,1.8vw,18px);margin-top:14px;max-width:720px}
+
+  /* ── Stat strip ── */
+  .stats{
+    display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px;
+    margin:26px 0 40px;
+  }
+  .stat{
+    background:linear-gradient(160deg,var(--card2),var(--card)); border:1px solid var(--line);
+    border-radius:12px; padding:16px 18px; position:relative; overflow:hidden;
+  }
+  .stat::after{content:"";position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--cyan),transparent)}
+  .stat .n{font-family:var(--mono);font-weight:700;font-size:clamp(22px,3vw,30px);color:var(--text);font-variant-numeric:tabular-nums;line-height:1}
+  .stat .l{font-size:12.5px;color:var(--text3);margin-top:7px;letter-spacing:.2px}
+  .stat.g .n{color:var(--green)} .stat.g::after{background:linear-gradient(90deg,var(--green),transparent)}
+  .stat.a .n{color:var(--amber)} .stat.a::after{background:linear-gradient(90deg,var(--amber),transparent)}
+
+  /* ── Feature grid ── */
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px}
+  .cat{
+    background:var(--card); border:1px solid var(--line); border-radius:14px;
+    padding:20px 20px 18px; position:relative; transition:border-color .2s,transform .2s,box-shadow .2s;
+  }
+  .cat:hover{border-color:var(--line2);transform:translateY(-2px);box-shadow:0 14px 40px rgba(0,0,0,.5)}
+  .cat-hd{display:flex;align-items:center;gap:12px;margin-bottom:14px;padding-bottom:13px;border-bottom:1px solid var(--line)}
+  .cat-ico{
+    width:40px;height:40px;flex-shrink:0;border-radius:10px;display:flex;align-items:center;justify-content:center;
+    font-size:21px;background:var(--cyan-dim);border:1px solid var(--line2);
+  }
+  .cat-nm{font-weight:700;font-size:16px;letter-spacing:.2px}
+  .cat-sub{font-family:var(--mono);font-size:11px;color:var(--text3);letter-spacing:.5px;text-transform:uppercase;margin-top:2px}
+  ul{list-style:none}
+  li{
+    position:relative;padding:5px 0 5px 20px;font-size:14px;color:var(--text2);
+  }
+  li::before{content:"";position:absolute;left:2px;top:12px;width:7px;height:7px;border-radius:2px;background:var(--cyan);opacity:.75;transform:rotate(45deg)}
+  li b{color:var(--text);font-weight:600}
+
+  /* ── Footer ── */
+  .foot{
+    margin-top:34px;padding:22px 24px;border:1px solid var(--line2);border-radius:14px;
+    background:linear-gradient(120deg,rgba(34,211,238,.07),rgba(124,58,237,.06));
+    display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:16px;
+  }
+  .foot .msg{font-size:15px;color:var(--text);max-width:640px}
+  .foot .msg b{color:var(--cyan)}
+  .foot .brand{font-family:var(--mono);font-size:12px;letter-spacing:2px;color:var(--text3);text-transform:uppercase;white-space:nowrap}
+  @media (max-width:520px){.cat-hd{gap:10px}}
+</style>
+
+<div class="sheet">
+  <div class="wrap">
+
+    <header class="hero">
+      <div class="eyebrow">Enterprise Web Application Firewall</div>
+      <h1 class="title">NEXT-GEN ESDS <span class="accent">WAF</span></h1>
+      <p class="tagline">A Rust-powered, ML-augmented web application firewall — OWASP Top&nbsp;10 protection, live threat intelligence, and behavioral defense at sub-millisecond latency, with a full enterprise console.</p>
+    </header>
+
+    <section class="stats" aria-label="Headline numbers">
+      <div class="stat"><div class="n">2,541</div><div class="l">OWASP CRS rules active</div></div>
+      <div class="stat"><div class="n">29,674</div><div class="l">Live threat-intel IOCs</div></div>
+      <div class="stat g"><div class="n">&lt;1&nbsp;ms</div><div class="l">p99 added latency</div></div>
+      <div class="stat g"><div class="n">100%</div><div class="l">OWASP Top 10 blocked (tested)</div></div>
+      <div class="stat a"><div class="n">HTTP/3</div><div class="l">QUIC · h2 · h1</div></div>
+    </section>
+
+    <section class="grid">
+
+      <div class="cat">
+        <div class="cat-hd"><div class="cat-ico">🛡️</div><div><div class="cat-nm">Attack Protection</div><div class="cat-sub">OWASP Top 10</div></div></div>
+        <ul>
+          <li><b>OWASP Core Rule Set</b> — 2,541 rules, tunable paranoia levels</li>
+          <li>SQL injection, XSS, RCE, LFI/RFI</li>
+          <li>SSRF, XXE, path traversal, command injection</li>
+          <li><b>Log4Shell</b> (CVE-2021-44228) &amp; known-CVE probes</li>
+          <li>Virtual patching &amp; per-site rule policies</li>
+        </ul>
+      </div>
+
+      <div class="cat">
+        <div class="cat-hd"><div class="cat-ico">🎯</div><div><div class="cat-nm">Threat Intelligence</div><div class="cat-sub">Live CTI feed</div></div></div>
+        <ul>
+          <li><b>29k+ live IOCs</b> auto-synced hourly</li>
+          <li>Tor exit nodes, abuse.ch Feodo &amp; URLhaus, STIX/TAXII</li>
+          <li>Blocks known-bad sources <b>before</b> rules even run</li>
+          <li>Confidence tiers (block / watch)</li>
+          <li>Manual IOC management from the console</li>
+        </ul>
+      </div>
+
+      <div class="cat">
+        <div class="cat-hd"><div class="cat-ico">🧠</div><div><div class="cat-nm">AI &amp; Machine Learning</div><div class="cat-sub">Behavioral defense</div></div></div>
+        <ul>
+          <li><b>ML anomaly engine</b> — scores traffic beyond signatures</li>
+          <li><b>Behavioral correlation</b> — auto-flags repeat attackers</li>
+          <li>Payload classifier &amp; continuous learning loop</li>
+          <li><b>AI Security Copilot</b> — LLM assistant for analysis &amp; rules</li>
+        </ul>
+      </div>
+
+      <div class="cat">
+        <div class="cat-hd"><div class="cat-ico">🤖</div><div><div class="cat-nm">Bot &amp; Abuse Defense</div><div class="cat-sub">Automated threats</div></div></div>
+        <ul>
+          <li><b>Self-hosted JS Proof-of-Work</b> bot challenge</li>
+          <li>Adaptive rate limiting (per-IP / per-site, Redis)</li>
+          <li>Anti-DDoS connection-rate protection</li>
+          <li>GeoIP country blocking &amp; IP reputation lists</li>
+        </ul>
+      </div>
+
+      <div class="cat">
+        <div class="cat-hd"><div class="cat-ico">⚡</div><div><div class="cat-nm">Performance</div><div class="cat-sub">Rust data plane</div></div></div>
+        <ul>
+          <li><b>Sub-millisecond</b> p99 added latency</li>
+          <li><b>HTTP/3 (QUIC)</b>, HTTP/2 &amp; HTTP/1.1</li>
+          <li>Single high-throughput Rust binary</li>
+          <li>Hot config reload — zero-downtime updates</li>
+        </ul>
+      </div>
+
+      <div class="cat">
+        <div class="cat-hd"><div class="cat-ico">🔐</div><div><div class="cat-nm">TLS &amp; Certificates</div><div class="cat-sub">Full lifecycle</div></div></div>
+        <ul>
+          <li>Per-site <b>SNI</b> certificates</li>
+          <li><b>ACME</b> auto-issuance &amp; renewal (Let's Encrypt)</li>
+          <li>Private-CA &amp; manual cert upload</li>
+          <li>Dedicated, replaceable management-console TLS</li>
+        </ul>
+      </div>
+
+      <div class="cat">
+        <div class="cat-hd"><div class="cat-ico">📊</div><div><div class="cat-nm">Visibility &amp; Analytics</div><div class="cat-sub">Real-time SOC view</div></div></div>
+        <ul>
+          <li>Live traffic dashboard &amp; attack breakdown</li>
+          <li><b>Live log streaming</b> (access / WAF / ML / audit)</li>
+          <li><b>Threat Search</b> — searchable full attack history</li>
+          <li>Prometheus / Grafana metrics export</li>
+        </ul>
+      </div>
+
+      <div class="cat">
+        <div class="cat-hd"><div class="cat-ico">🚨</div><div><div class="cat-nm">Alerting &amp; SOC</div><div class="cat-sub">Incident response</div></div></div>
+        <ul>
+          <li>Attack-spike, repeat-offender &amp; critical-block alerts</li>
+          <li>Channels: <b>Webhook, Slack, Syslog, CEF</b></li>
+          <li>HMAC-signed payloads &amp; severity routing</li>
+          <li>Tamper-evident audit log of every action</li>
+        </ul>
+      </div>
+
+      <div class="cat">
+        <div class="cat-hd"><div class="cat-ico">🏢</div><div><div class="cat-nm">Multi-Tenancy &amp; Access</div><div class="cat-sub">Enterprise-ready</div></div></div>
+        <ul>
+          <li>Multi-site protection from one control plane</li>
+          <li>Per-tenant data isolation (row-level security)</li>
+          <li><b>RBAC</b> — owner / admin / editor / viewer / auditor</li>
+          <li>JWT auth with refresh · SSO / SAML-ready</li>
+        </ul>
+      </div>
+
+      <div class="cat">
+        <div class="cat-hd"><div class="cat-ico">🧩</div><div><div class="cat-nm">Extensibility</div><div class="cat-sub">Customizable</div></div></div>
+        <ul>
+          <li><b>WASM plugin</b> engine for custom logic</li>
+          <li>Custom rules &amp; per-site policy isolation</li>
+          <li><b>eBPF / XDP</b> kernel-level L4 DDoS drops</li>
+          <li>Config-as-code with hot sync</li>
+        </ul>
+      </div>
+
+      <div class="cat">
+        <div class="cat-hd"><div class="cat-ico">☁️</div><div><div class="cat-nm">Deployment &amp; HA</div><div class="cat-sub">Cloud-native</div></div></div>
+        <ul>
+          <li>Docker &amp; <b>Kubernetes</b> native</li>
+          <li>Raft-based clustering &amp; multi-node HA</li>
+          <li>Migrations-as-code, reproducible rollout</li>
+          <li>Runs on-prem, VPC or air-gapped</li>
+        </ul>
+      </div>
+
+      <div class="cat">
+        <div class="cat-hd"><div class="cat-ico">🧭</div><div><div class="cat-nm">Management Console</div><div class="cat-sub">One pane of glass</div></div></div>
+        <ul>
+          <li>Guided <b>site onboarding wizard</b></li>
+          <li>Learning → blocking workflow</li>
+          <li>Rule, certificate &amp; plugin management</li>
+          <li>Out-of-band admin listener (isolated from the WAF)</li>
+        </ul>
+      </div>
+
+    </section>
+
+    <footer class="foot">
+      <div class="msg">Every attack <b>blocked in real time</b>, every decision <b>logged and searchable</b> — signatures, threat intelligence, and behavioral AI working together, at line speed.</div>
+      <div class="brand">Next-Gen ESDS WAF · Enterprise</div>
+    </footer>
+
+  </div>
+</div>
