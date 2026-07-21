@@ -34,6 +34,9 @@ const CLEARANCE_TTL_SECS: u64 = 1800;
 
 const POW_COOKIE: &str = "sentinel_pow";
 const CLEAR_COOKIE: &str = "sentinel_clear";
+/// Cookie the CAPTCHA challenge page stores the provider token in before it
+/// reloads; the server reads it, verifies once (single-use), then expires it.
+pub const CAPTCHA_COOKIE: &str = "sentinel_captcha";
 
 /// What the request handler should do for a Challenge decision.
 pub enum Outcome {
@@ -178,6 +181,22 @@ fn make_clearance_cookie(ip: IpAddr) -> String {
     format!(
         "{CLEAR_COOKIE}={exp_s}.{sig}; Path=/; Max-Age={CLEARANCE_TTL_SECS}; HttpOnly; SameSite=Lax"
     )
+}
+
+/// Issue the same stateless clearance the PoW path grants, for an alternative
+/// challenge front-end (e.g. a verified third-party CAPTCHA solve).
+pub fn clearance_cookie(ip: IpAddr) -> String {
+    make_clearance_cookie(ip)
+}
+
+/// The provider token a CAPTCHA challenge page stored, if present.
+pub fn captcha_token(headers: &HeaderMap) -> Option<String> {
+    cookie(headers, CAPTCHA_COOKIE)
+}
+
+/// Set-Cookie value that clears the single-use CAPTCHA token cookie.
+pub fn expire_captcha_cookie() -> String {
+    format!("{CAPTCHA_COOKIE}=; Path=/; Max-Age=0")
 }
 
 /// Resolve a Challenge decision into a concrete action.

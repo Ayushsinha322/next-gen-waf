@@ -653,6 +653,34 @@ pub struct BotDetectionConfig {
     pub ja4: bool,
     #[serde(default)]
     pub challenge: ChallengeMode,
+    /// Interactive-CAPTCHA provider settings, used when `challenge` selects a
+    /// third-party provider. Only the one matching `challenge` is consulted; the
+    /// site key is public (embedded in the challenge page) and the secret is used
+    /// server-side for token verification (siteverify).
+    #[serde(default)]
+    pub recaptcha: Option<CaptchaProvider>,
+    #[serde(default)]
+    pub hcaptcha: Option<CaptchaProvider>,
+    #[serde(default)]
+    pub turnstile: Option<CaptchaProvider>,
+}
+
+/// Credentials for a third-party CAPTCHA provider (reCAPTCHA / hCaptcha /
+/// Turnstile). `sitekey` is rendered into the challenge page; `secret` is sent
+/// to the provider's siteverify endpoint. `score` is the reCAPTCHA-v3 pass
+/// threshold (0..1) and is ignored by pass/fail providers.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CaptchaProvider {
+    #[serde(default)]
+    pub sitekey: String,
+    #[serde(default)]
+    pub secret: String,
+    #[serde(default = "default_captcha_score")]
+    pub score: f32,
+}
+
+fn default_captcha_score() -> f32 {
+    0.5
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]

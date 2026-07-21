@@ -22,6 +22,7 @@
 //! Phase 6: logging + correlation state update
 //! ```
 
+pub mod captcha;
 pub mod challenge;
 pub mod http3;
 mod jwks;
@@ -50,9 +51,9 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use rustls::ServerConfig;
 use sentinel_core::{
     config::{
-        ChallengeMode, ConfigHandle, DlpAction, DlpConfig, FusionConfig, IpReputationConfig,
-        ListenerConfig, Protocol, SecurityHeadersConfig, SentinelConfig, SiteConfig, WafConfig,
-        WafMode,
+        BotDetectionConfig, ChallengeMode, ConfigHandle, DlpAction, DlpConfig, FusionConfig,
+        IpReputationConfig, ListenerConfig, Protocol, SecurityHeadersConfig, SentinelConfig,
+        SiteConfig, WafConfig, WafMode,
     },
     context::{Phase, RequestContext, WafDecision},
 };
@@ -1967,11 +1968,11 @@ async fn proxy(
     // already holds valid clearance gets `None` here (regardless of which
     // subsystem asked for the challenge) and proceeds to origin — no re-loop.
     if ctx.decision == WafDecision::Challenge {
-        let challenge_mode = site
-            .and_then(|s| s.waf.bot_detection.as_ref())
+        let bot_cfg = site.and_then(|s| s.waf.bot_detection.as_ref());
+        let challenge_mode = bot_cfg
             .map(|b| b.challenge)
             .unwrap_or(ChallengeMode::NativePow);
-        if let Some(resp) = challenge_response(&mut ctx, challenge_mode) {
+        if let Some(resp) = challenge_response(&mut ctx, challenge_mode, bot_cfg).await {
             ctx.response_status = Some(resp.status());
             ctx.advance_phase(Phase::Logging);
             log_request(&ctx);
@@ -2902,12 +2903,7 @@ fn apply_verdict(ctx: &mut RequestContext, waf: &WafConfig) {
                     .any(|m| m.rule_id.starts_with("99002"));
                 let ml_benign = sentinel_ml::models::ngram_classifier::is_loaded()
                     && !has_coverage_match
-                    && ctx
-                        .ml_scores
-                        .get("payload_attack")
-                        .copied()
-                        .unwrap_or(1.0)
-                        < 0.15
+                    && ctx.ml_scores.get("payload_attack").copied().unwrap_or(1.0) < 0.15
                     && ctx.anomaly_score < 20;
                 if !ml_benign {
                     ctx.decision = WafDecision::Block;
@@ -3645,12 +3641,81 @@ fn inject_security_headers(headers: &mut http::HeaderMap, cfg: Option<&SecurityH
 /// stash the clearance cookies on `ctx` and return `None`, letting the request
 /// continue to origin with its method and body intact; the cookies are attached
 /// to the origin response by the caller.
-fn challenge_response(ctx: &mut RequestContext, mode: ChallengeMode) -> Option<Response<BoxBody>> {
-    if matches!(
-        mode,
-        ChallengeMode::Recaptcha | ChallengeMode::Hcaptcha | ChallengeMode::Turnstile
-    ) {
-        warn_unsupported_challenge(mode);
+async fn challenge_response(
+    ctx: &mut RequestContext,
+    mode: ChallengeMode,
+    bot: Option<&BotDetectionConfig>,
+) -> Option<Response<BoxBody>> {
+    // Third-party interactive CAPTCHA path (reCAPTCHA / hCaptcha / Turnstile).
+    // Requires configured provider credentials; otherwise we fall through to the
+    // native Proof-of-Work challenge so the client is never left un-challenged.
+    if let Some(kind) = captcha::CaptchaKind::from_mode(mode) {
+        let provider = bot.and_then(|b| kind.provider(b));
+        match provider {
+            Some(p) if !p.sitekey.is_empty() && !p.secret.is_empty() => {
+                // Already cleared (any subsystem) → don't re-challenge.
+                if challenge::clearance_valid(&ctx.request_headers, ctx.client_ip) {
+                    return None;
+                }
+                // A token from a prior solve → verify it server-side (single-use).
+                if let Some(token) = challenge::captcha_token(&ctx.request_headers) {
+                    let ok = captcha::verify(
+                        kind,
+                        &p.secret,
+                        &token,
+                        &ctx.client_ip.to_string(),
+                        p.score,
+                    )
+                    .await;
+                    if ok {
+                        let set_cookie = challenge::clearance_cookie(ctx.client_ip);
+                        let expire = challenge::expire_captcha_cookie();
+                        let safe = matches!(ctx.method, http::Method::GET | http::Method::HEAD);
+                        if !safe {
+                            ctx.pending_set_cookies.push(set_cookie);
+                            ctx.pending_set_cookies.push(expire);
+                            return None;
+                        }
+                        let location = ctx
+                            .uri
+                            .path_and_query()
+                            .map(|p| p.as_str().to_string())
+                            .unwrap_or_else(|| "/".to_string());
+                        return Some(
+                            Response::builder()
+                                .status(StatusCode::FOUND)
+                                .header(header::LOCATION, location)
+                                .header(header::SET_COOKIE, set_cookie)
+                                .header(header::SET_COOKIE, expire)
+                                .header(header::CACHE_CONTROL, "no-store")
+                                .body(
+                                    Full::new(Bytes::new())
+                                        .map_err(|never: Infallible| match never {})
+                                        .boxed(),
+                                )
+                                .unwrap(),
+                        );
+                    }
+                    // Verification failed → expire the bad token and re-serve.
+                    ctx.pending_set_cookies
+                        .push(challenge::expire_captcha_cookie());
+                }
+                return Some(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                        .header(header::CACHE_CONTROL, "no-store")
+                        .header("X-Sentinel-Challenge", "captcha")
+                        .body(
+                            Full::new(Bytes::from(captcha::interstitial(kind, &p.sitekey)))
+                                .map_err(|never: Infallible| match never {})
+                                .boxed(),
+                        )
+                        .unwrap(),
+                );
+            }
+            _ => warn_captcha_misconfigured(mode),
+        }
     }
     match challenge::resolve(&ctx.request_headers, ctx.client_ip, &ctx.uri) {
         challenge::Outcome::Pass => None,
@@ -3697,9 +3762,10 @@ fn challenge_response(ctx: &mut RequestContext, mode: ChallengeMode) -> Option<R
     }
 }
 
-/// Warn at most once per provider that a configured third-party CAPTCHA mode is
-/// not implemented and native Proof-of-Work is served instead.
-fn warn_unsupported_challenge(mode: ChallengeMode) {
+/// Warn at most once per provider that a third-party CAPTCHA mode is selected
+/// but its site key / secret are missing, so native Proof-of-Work is served
+/// instead (fail-safe — a suspicious client is still challenged).
+fn warn_captcha_misconfigured(mode: ChallengeMode) {
     use std::sync::atomic::{AtomicU8, Ordering};
     static WARNED: AtomicU8 = AtomicU8::new(0);
     let bit = match mode {
@@ -3710,7 +3776,7 @@ fn warn_unsupported_challenge(mode: ChallengeMode) {
     };
     if WARNED.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
         warn!(
-            "challenge mode {:?} is configured but not implemented; serving native Proof-of-Work instead",
+            "challenge mode {:?} selected but sitekey/secret missing; serving native Proof-of-Work instead",
             mode
         );
     }
