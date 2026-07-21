@@ -162,6 +162,29 @@ type SearchFilter struct {
 // ---------------------------------------------------------------------------
 
 // Status reports reachability + table row counts (for the UI empty state).
+// DiskUsage returns the used fraction (0..1) of the disk(s) ClickHouse stores
+// its data on, plus free/total bytes, by summing system.disks. The disk-pressure
+// monitor uses this to page the SOC before the event store fills up (a full
+// ClickHouse degrades Threat Search, not the WAF, but must never fill silently).
+func (c *Client) DiskUsage(ctx context.Context) (usedFrac float64, freeBytes, totalBytes int64, err error) {
+	if !c.enabled {
+		return 0, 0, 0, fmt.Errorf("clickhouse not configured")
+	}
+	var rows []struct {
+		Free  int64 `json:"free"`
+		Total int64 `json:"total"`
+	}
+	if err := c.queryJSON(ctx,
+		"SELECT toInt64(sum(free_space)) AS free, toInt64(sum(total_space)) AS total FROM system.disks", &rows); err != nil {
+		return 0, 0, 0, err
+	}
+	if len(rows) == 0 || rows[0].Total <= 0 {
+		return 0, 0, 0, fmt.Errorf("clickhouse: no disk rows from system.disks")
+	}
+	free, total := rows[0].Free, rows[0].Total
+	return 1 - float64(free)/float64(total), free, total, nil
+}
+
 func (c *Client) Status(ctx context.Context, tenant string) (map[string]any, error) {
 	if !c.enabled {
 		return map[string]any{"configured": false, "reachable": false}, nil

@@ -34,6 +34,10 @@ x-wafnode: &wafnode
     SENTINEL_CLICKHOUSE_DB: ${CLICKHOUSE_DB}
     SENTINEL_CLICKHOUSE_USER: ${CLICKHOUSE_USER}
     SENTINEL_CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+    # Event-store retention (days) — the data plane owns the ClickHouse schema
+    # and applies these on connect (fresh CREATE + ALTER MODIFY TTL on existing).
+    SENTINEL_CLICKHOUSE_EVENT_RETENTION_DAYS: ${SENTINEL_CLICKHOUSE_EVENT_RETENTION_DAYS:-90}
+    SENTINEL_CLICKHOUSE_TRAFFIC_RETENTION_DAYS: ${SENTINEL_CLICKHOUSE_TRAFFIC_RETENTION_DAYS:-30}
     # Management console upstreams — the :9443 admin listener (defined in
     # sentinel.proxy.yaml) reverse-proxies these. Set on every node; only waf1
     # publishes :9443 to the host, so the others' mgmt listener is inert.

@@ -22,6 +22,7 @@ import (
 	chreader "github.com/your-org/sentinel-waf/control-plane/internal/clickhouse"
 	"github.com/your-org/sentinel-waf/control-plane/internal/cluster"
 	"github.com/your-org/sentinel-waf/control-plane/internal/db"
+	"github.com/your-org/sentinel-waf/control-plane/internal/diskmon"
 	controlgrpc "github.com/your-org/sentinel-waf/control-plane/internal/grpc"
 	"github.com/your-org/sentinel-waf/control-plane/internal/logs"
 	"github.com/your-org/sentinel-waf/control-plane/internal/nodehealth"
@@ -319,6 +320,17 @@ func run() error {
 		cm := certmon.New(engine, dataPlaneBaseURL(), os.Getenv("SENTINEL_INTERNAL_SECRET"), log)
 		cm.Start()
 		defer cm.Stop()
+	}
+
+	// ── ClickHouse disk-pressure monitor ──────────────────────────────────────
+	// Pages the SOC (through the same alert channels) before the event store
+	// fills up. A full ClickHouse degrades Threat Search, not the WAF, but must
+	// never fill silently. Threshold via SENTINEL_DISK_ALERT_PCT (default 80).
+	// Gated on engine != nil (primary node) + a configured ClickHouse reader.
+	if store != nil && engine != nil && chClient != nil && chClient.Enabled() {
+		dm := diskmon.New(engine, chClient, log)
+		dm.Start()
+		defer dm.Stop()
 	}
 
 	// ── gRPC ──────────────────────────────────────────────────────────────────

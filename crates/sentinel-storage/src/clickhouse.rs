@@ -98,6 +98,19 @@ pub struct ClickHouseClient {
     password: Option<String>,
 }
 
+/// Reads a retention window (in days) from `var`, clamped to 1..=3650 days,
+/// falling back to `default` when unset or unparseable. Retention is operator
+/// policy (compliance windows differ per customer / product tier), so it is
+/// env-configurable rather than hardcoded — see the
+/// `SENTINEL_CLICKHOUSE_{EVENT,TRAFFIC}_RETENTION_DAYS` variables.
+fn retention_days(var: &str, default: u32) -> u32 {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .map(|d| d.clamp(1, 3650))
+        .unwrap_or(default)
+}
+
 impl ClickHouseClient {
     /// Construct an unauthenticated client (uses the `default` user).
     pub fn new(url: &str, database: &str) -> Self {
@@ -162,6 +175,13 @@ impl ClickHouseClient {
 
     /// Create the database and `traffic_buckets` table if they don't exist.
     pub async fn ensure_schema(&self) -> Result<(), StorageError> {
+        // Operator-configurable retention (in days). Applied to fresh tables via
+        // the CREATE statements below, and to ALREADY-EXISTING tables via
+        // ALTER ... MODIFY TTL at the end of this function (so a retention change
+        // takes effect on restart, not only on first creation).
+        let event_days = retention_days("SENTINEL_CLICKHOUSE_EVENT_RETENTION_DAYS", 90);
+        let traffic_days = retention_days("SENTINEL_CLICKHOUSE_TRAFFIC_RETENTION_DAYS", 30);
+
         self.exec(format!(
             "CREATE DATABASE IF NOT EXISTS {db}",
             db = self.database
@@ -175,9 +195,10 @@ impl ClickHouseClient {
              ENGINE = MergeTree() \
              PARTITION BY toYYYYMM(ts) \
              ORDER BY (tenant, site_id, ts) \
-             TTL ts + INTERVAL 30 DAY \
+             TTL ts + INTERVAL {ttl_days} DAY \
              SETTINGS index_granularity = 8192",
-            db = self.database
+            db = self.database,
+            ttl_days = traffic_days
         ))
         .await?;
 
@@ -193,9 +214,10 @@ impl ClickHouseClient {
              ENGINE = MergeTree() \
              PARTITION BY toYYYYMMDD(ts) \
              ORDER BY (site, ts) \
-             TTL ts + INTERVAL 90 DAY \
+             TTL ts + INTERVAL {ttl_days} DAY \
              SETTINGS index_granularity = 8192",
-            db = self.database
+            db = self.database,
+            ttl_days = event_days
         ))
         .await?;
 
@@ -225,6 +247,24 @@ impl ClickHouseClient {
             "ALTER TABLE {db}.traffic_buckets \
              ADD COLUMN IF NOT EXISTS tenant LowCardinality(String) DEFAULT ''",
             db = self.database
+        ))
+        .await?;
+
+        // Enforce the configured retention on EXISTING tables. CREATE ... IF NOT
+        // EXISTS only sets TTL when it first creates the table, so an operator
+        // changing SENTINEL_CLICKHOUSE_*_RETENTION_DAYS needs MODIFY TTL for it
+        // to apply to the already-created tables. This is a cheap metadata
+        // change; ClickHouse drops expired parts lazily during background merges.
+        self.exec(format!(
+            "ALTER TABLE {db}.waf_events MODIFY TTL ts + INTERVAL {ttl_days} DAY",
+            db = self.database,
+            ttl_days = event_days
+        ))
+        .await?;
+        self.exec(format!(
+            "ALTER TABLE {db}.traffic_buckets MODIFY TTL ts + INTERVAL {ttl_days} DAY",
+            db = self.database,
+            ttl_days = traffic_days
         ))
         .await
     }

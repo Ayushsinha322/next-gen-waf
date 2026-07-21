@@ -48,6 +48,9 @@ x-cp-env: &cp-env
   SENTINEL_CORS_ORIGINS: http://172.16.21.71:3000,https://172.16.21.71:9443
   SENTINEL_DATAPLANE_URL: http://dataplane:8080
   SENTINEL_ROOT_CA_PATH: /etc/sentinel/root-ca.crt
+  # Disk-pressure alert: page the SOC when ClickHouse disk crosses this used-%.
+  SENTINEL_DISK_ALERT_PCT: ${SENTINEL_DISK_ALERT_PCT:-80}
+  SENTINEL_DISK_CHECK_SECS: ${SENTINEL_DISK_CHECK_SECS:-300}
   # Shared HMAC that authenticates inter-node Raft RPC. Same on every member.
   # NO default on purpose: `docker compose config` FAILS if it isn't set in
   # deploy/docker/.env, so the old insecure committed default can never ship.
