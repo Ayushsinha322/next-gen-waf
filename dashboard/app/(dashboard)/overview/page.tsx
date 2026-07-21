@@ -2,10 +2,16 @@
 import { useState, useEffect, useRef } from "react";
 import { motion } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
-import { api, type DashboardStats, type MetricsSnapshot } from "@/lib/api";
+import {
+  api,
+  type DashboardStats, type MetricsSnapshot, type Attacker,
+  type Rule, type MLStats, type ThreatIntelSummary, type ClusterHealth,
+} from "@/lib/api";
 import { staggerContainer, cardVariants, fadeUp, spring } from "@/lib/animations";
 import { PLANS, ACTIVE_PLAN, type PlanKey } from "@/lib/plans";
+import { country } from "@/lib/geo";
 import WorldMap from "@/components/dashboard/WorldMap";
+import ThreatTrend from "@/components/dashboard/ThreatTrend";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -81,9 +87,10 @@ export default function OverviewPage() {
   const [wafStatus, setWafStatus] = useState<{ running: boolean; uptime?: number; sites?: number; upstreams_healthy?: number; upstreams_total?: number; http3?: { enabled: boolean; listener?: string; bind?: string; advertise_port?: number } } | null>(null);
   const [plugins, setPlugins] = useState<number | null>(null);
   const [instances, setInstances] = useState<number | null>(null);
-
-  const chartRef       = useRef<HTMLCanvasElement>(null);
-  const trafficHistory = useRef<{ total: number; blocked: number; ml: number }[]>([]);
+  // Blocked-by-country lives ONLY in ClickHouse (the hub's by_country snapshot
+  // field is never populated), so the world map is fed from the country facet.
+  const [byCountry, setByCountry] = useState<Record<string, number>>({});
+  const [geoLoaded, setGeoLoaded] = useState(false);
 
   // ── DB stats ──
   useEffect(() => {
@@ -117,21 +124,33 @@ export default function OverviewPage() {
     f(); const t = setInterval(f, 30_000); return () => { cancelled = true; clearInterval(t); };
   }, []);
 
+  // ── Blocked-by-country (ClickHouse facet → world map) ──
+  useEffect(() => {
+    let cancelled = false;
+    async function f() {
+      try {
+        const r = await api.events.facets("country", undefined, undefined, 60);
+        if (cancelled) return;
+        const rec: Record<string, number> = {};
+        (r.facets ?? []).forEach(({ key, count }) => { if (key) rec[key.toUpperCase()] = count; });
+        setByCountry(rec);
+        setGeoLoaded(!!r.clickhouse && Object.keys(rec).length > 0);
+      } catch { /* control plane / clickhouse down — map shows honest empty state */ }
+    }
+    f(); const t = setInterval(f, 30_000); return () => { cancelled = true; clearInterval(t); };
+  }, []);
+
   // ── Real metrics (1s) ──
   useEffect(() => {
     let cancelled = false;
     async function f() {
       try {
         const snap = await api.metrics.snapshot();
-        if (!cancelled) {
-          setMetrics(snap);
-          trafficHistory.current = [...trafficHistory.current, { total: snap.total_requests, blocked: snap.blocked_requests, ml: snap.ml_anomalies }].slice(-60);
-          drawTrafficChart();
-        }
+        if (!cancelled) setMetrics(snap);
       } catch { /* control plane may be down */ }
     }
     f(); const t = setInterval(f, 1_000); return () => { cancelled = true; clearInterval(t); };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, []);
 
   // ── Live access-log SSE ──
   useEffect(() => {
@@ -152,45 +171,6 @@ export default function OverviewPage() {
     return () => es.close();
   }, []);
 
-  // ── Traffic chart ──
-  function drawTrafficChart() {
-    const canvas = chartRef.current; if (!canvas) return;
-    const ctx = canvas.getContext("2d"); if (!ctx) return;
-    const hist = trafficHistory.current; if (hist.length < 2) return;
-    const dpr = window.devicePixelRatio || 1;
-    const W = canvas.offsetWidth || 600, H = 160;
-    canvas.width = W * dpr; canvas.height = H * dpr; ctx.scale(dpr, dpr);
-    const traffic = hist.map(d => d.total), threats = hist.map(d => d.blocked);
-    const pts = traffic.length;
-    const pad = { t: 10, b: 30, l: 36, r: 8 };
-    const cW = W - pad.l - pad.r, cH = H - pad.t - pad.b;
-    const maxV = Math.max(...traffic) * 1.1 || 1;
-    const px = (i: number) => pad.l + i * (cW / (pts - 1));
-    const py = (v: number) => pad.t + cH * (1 - v / maxV);
-    for (let i = 0; i <= 4; i++) {
-      const y = pad.t + i * (cH / 4);
-      ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(W - pad.r, y);
-      ctx.strokeStyle = "rgba(128,128,128,0.10)"; ctx.lineWidth = 1; ctx.stroke();
-      ctx.fillStyle = "rgba(128,140,160,0.5)"; ctx.font = "10px Inter,sans-serif"; ctx.textAlign = "right";
-      ctx.fillText(Math.round(maxV * (1 - i / 4) / 1000) + "k", pad.l - 4, y + 4);
-    }
-    ctx.textAlign = "left";
-    ctx.beginPath(); ctx.moveTo(px(0), py(traffic[0]));
-    for (let i = 1; i < pts; i++) ctx.lineTo(px(i), py(traffic[i]));
-    ctx.strokeStyle = "rgba(59,130,246,0.85)"; ctx.lineWidth = 1.5; ctx.stroke();
-    ctx.lineTo(px(pts - 1), pad.t + cH); ctx.lineTo(px(0), pad.t + cH); ctx.closePath();
-    ctx.fillStyle = "rgba(59,130,246,0.08)"; ctx.fill();
-    ctx.beginPath(); ctx.moveTo(px(0), py(threats[0]));
-    for (let i = 1; i < pts; i++) ctx.lineTo(px(i), py(threats[i]));
-    ctx.strokeStyle = "rgba(239,68,68,0.8)"; ctx.lineWidth = 1.5; ctx.stroke();
-    ctx.lineTo(px(pts - 1), pad.t + cH); ctx.lineTo(px(0), pad.t + cH); ctx.closePath();
-    ctx.fillStyle = "rgba(239,68,68,0.07)"; ctx.fill();
-    ctx.fillStyle = "rgba(96,165,250,0.85)"; ctx.fillRect(pad.l, H - 18, 16, 2);
-    ctx.fillStyle = "rgba(128,140,160,0.7)"; ctx.font = "11px Inter,sans-serif"; ctx.fillText("Requests", pad.l + 20, H - 13);
-    ctx.fillStyle = "rgba(239,68,68,0.85)"; ctx.fillRect(pad.l + 100, H - 18, 16, 2);
-    ctx.fillStyle = "rgba(128,140,160,0.7)"; ctx.fillText("Threats", pad.l + 120, H - 13);
-  }
-
   // ── Derived ──
   const rps        = metrics?.rps              ?? 0;
   const p99        = metrics?.p99_latency_ms   ?? 0;
@@ -198,8 +178,6 @@ export default function OverviewPage() {
   const blkCount   = metrics?.blocked_requests ?? 0;
   const uniqueIPs  = metrics?.unique_blocked_ips ?? 0;
   const openAlerts = stats?.open_alerts        ?? 0;
-  const totalRules = stats?.total_rules        ?? 0;
-  const enabledRules = stats?.enabled_rules    ?? totalRules;
   const memUsed    = metrics?.mem_used_bytes   ?? 0;
   const memTotal   = metrics?.mem_total_bytes  ?? 0;
   const memPct     = memTotal > 0 ? (memUsed / memTotal) * 100 : 0;
@@ -225,11 +203,6 @@ export default function OverviewPage() {
   const conic = sTotal > 0
     ? statusSlices.map(s => { const start = (acc / sTotal) * 360; acc += s.v; const end = (acc / sTotal) * 360; return `${s.color} ${start}deg ${end}deg`; }).join(", ")
     : "var(--bg3) 0deg 360deg";
-
-  // Top attacker IPs from live feed.
-  const ipCounts: Record<string, number> = {};
-  feed.forEach(r => { if (r.ip) ipCounts[r.ip] = (ipCounts[r.ip] ?? 0) + 1; });
-  const topIPs = Object.entries(ipCounts).sort((a, b) => b[1] - a[1]).slice(0, 6);
 
   function formatUptime(secs: number): string {
     if (secs < 60) return `${secs}s`;
@@ -321,15 +294,9 @@ export default function OverviewPage() {
         </motion.div>
       </motion.div>
 
-      {/* Traffic chart + Attack breakdown */}
+      {/* Threat detection trend + Attack breakdown */}
       <motion.div variants={fadeUp} style={{ display: "grid", gridTemplateColumns: "1.6fr 1fr", gap: 14 }}>
-        <div className="panel">
-          <div className="ph"><div className="ptitle">Traffic &amp; threat timeline</div><div style={{ display: "flex", gap: 8 }}><span className="panel-badge pb-live">● Live</span><span className="panel-badge pb-info">Last 60s</span></div></div>
-          <div className="pb">
-            <canvas ref={chartRef} height={160} style={{ width: "100%", display: "block" }} />
-            {metrics === null && <div style={{ textAlign: "center", paddingTop: 8, fontSize: 14, fontFamily: "'Share Tech Mono',monospace", color: "var(--text3)" }}>waiting for data plane…</div>}
-          </div>
-        </div>
+        <ThreatTrend />
         <div className="panel">
           <div className="ph"><div className="ptitle">Attack breakdown</div><span className="panel-badge pb-info">Live</span></div>
           <div className="pb">
@@ -352,8 +319,8 @@ export default function OverviewPage() {
       {/* Blocked-by-country map + status distribution */}
       <motion.div variants={fadeUp} style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 14 }}>
         <div className="panel">
-          <div className="ph"><div className="ptitle">Blocked requests by origin</div><span className="panel-badge pb-info">{metrics?.geoip_loaded ? "GeoIP" : "GeoIP off"}</span></div>
-          <div className="pb"><WorldMap data={metrics?.by_country ?? {}} loaded={!!metrics?.geoip_loaded} /></div>
+          <div className="ph"><div className="ptitle">Blocked requests by origin</div><span className="panel-badge pb-info">{geoLoaded ? `GeoIP · ${Object.keys(byCountry).length} countries` : "GeoIP · awaiting events"}</span></div>
+          <div className="pb"><WorldMap data={byCountry} loaded={geoLoaded} /></div>
         </div>
         <div className="panel" style={{ display: "flex", flexDirection: "column" }}>
           <div className="ph"><div className="ptitle">Response status</div><span className="panel-badge pb-info">{sTotal.toLocaleString()} reqs</span></div>
@@ -400,8 +367,17 @@ export default function OverviewPage() {
         </div>
       </motion.div>
 
-      {/* Bottom 3-panel row */}
-      <motion.div variants={fadeUp} style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 14 }}>
+      {/* Threat sources + system health */}
+      <motion.div variants={fadeUp} style={{ display: "grid", gridTemplateColumns: "1.5fr 1fr", gap: 14 }}>
+        <TopAttackers />
+        <SystemHealth
+          wafRunning={wafStatus === null ? null : wafStatus.running}
+          geoCountries={geoLoaded ? Object.keys(byCountry).length : 0}
+        />
+      </motion.div>
+
+      {/* Live event feed + rule-engine health */}
+      <motion.div variants={fadeUp} style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
         <div className="panel">
           <div className="ph"><div className="ptitle">Recent events</div><span className="panel-badge pb-live">Live</span></div>
           <div className="pb">
@@ -420,39 +396,7 @@ export default function OverviewPage() {
           </div>
         </div>
 
-        <div className="panel">
-          <div className="ph"><div className="ptitle">Top attacker IPs</div><span className="panel-badge pb-info">Live feed</span></div>
-          <div className="pb">
-            {topIPs.length === 0 ? (
-              <div style={{ padding: "16px 0", textAlign: "center", fontSize: 13, fontFamily: "'Share Tech Mono',monospace", color: "var(--text3)" }}>No traffic yet</div>
-            ) : topIPs.map(([ip, cnt], idx) => (
-              <motion.div key={ip} className="ip-row" initial={{ opacity: 0, x: -6 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: 0.5 + idx * 0.05 }}>
-                <div className="ip-addr">{ip}</div><div className="ip-count">{cnt} hits</div>
-                <span className="ip-badge ip-blocked">BLOCKED</span>
-              </motion.div>
-            ))}
-          </div>
-        </div>
-
-        <div className="panel">
-          <div className="ph"><div className="ptitle">Rule engine health</div><span className="panel-badge pb-info">{totalRules > 0 ? `${totalRules.toLocaleString()} rules` : "loading…"}</span></div>
-          <div className="pb">
-            {[
-              { name: "OWASP CRS v4 core", on: enabledRules > 0 },
-              { name: "SQL injection suite", on: enabledRules > 0 },
-              { name: "XSS ruleset", on: enabledRules > 0 },
-              { name: "Bot / scanner signatures", on: enabledRules > 0 },
-              { name: "ML anomaly engine", on: !!wafStatus?.running },
-              { name: "Custom site rules", on: totalRules > 0 },
-            ].map((row, idx) => (
-              <motion.div key={row.name} className="rule-row" initial={{ opacity: 0, x: -4 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: 0.5 + idx * 0.05 }}>
-                <div className="rule-name">{row.name}</div>
-                <span className={`rule-st ${row.on ? "rs-on" : "rs-warn"}`}>{row.on ? "Active" : "Off"}</span>
-                <div className="rule-hits">—</div>
-              </motion.div>
-            ))}
-          </div>
-        </div>
+        <RuleEngineHealth metrics={metrics} running={!!wafStatus?.running} />
       </motion.div>
 
       <AlertsPreview />
@@ -495,5 +439,236 @@ function AlertsPreview() {
         )}
       </div>
     </motion.div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Shared: centred info/empty line inside a panel body
+// ---------------------------------------------------------------------------
+function CardMsg({ text }: { text: string }) {
+  return (
+    <div style={{ padding: "22px 8px", textAlign: "center", fontSize: 13, lineHeight: 1.55, fontFamily: "'Share Tech Mono',monospace", color: "var(--text3)" }}>
+      {text}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Top Attacker IPs — real ClickHouse-backed roll-up: IP · country · requests ·
+// blocked, sorted by volume. Rows drill into Threat Search. Honest empty state
+// when the event store isn't configured (there is no per-IP data without it).
+// ---------------------------------------------------------------------------
+function TopAttackers() {
+  const [rows, setRows] = useState<Attacker[] | null>(null);
+  const [ch, setCh]     = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function f() {
+      try {
+        const r = await api.events.topAttackers(8);
+        if (cancelled) return;
+        setRows(r.attackers ?? []);
+        setCh(r.clickhouse);
+      } catch { if (!cancelled) { setRows([]); setCh(true); } }
+    }
+    f(); const t = setInterval(f, 20_000); return () => { cancelled = true; clearInterval(t); };
+  }, []);
+
+  return (
+    <div className="panel">
+      <div className="ph">
+        <div className="ptitle">Top Attacker IPs</div>
+        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+          <span className="panel-badge pb-info">Last 24h</span>
+          <button className="btn bg-btn btn-sm" onClick={() => { window.location.href = "/events"; }}>View All →</button>
+        </div>
+      </div>
+      <div className="tw">
+        {rows === null ? (
+          <CardMsg text="Loading attacker intelligence…" />
+        ) : !ch ? (
+          <CardMsg text="Event store (ClickHouse) not configured — enable it to rank attacker IPs by volume and geography." />
+        ) : rows.length === 0 ? (
+          <CardMsg text="No attacker traffic in the last 24 hours." />
+        ) : (
+          <table>
+            <thead>
+              <tr>
+                <th>IP Address</th>
+                <th>Country</th>
+                <th style={{ textAlign: "right" }}>Requests</th>
+                <th style={{ textAlign: "right" }}>Blocked</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((a, i) => {
+                const c = country(a.country);
+                return (
+                  <motion.tr key={a.ip}
+                    initial={{ opacity: 0, x: -6 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: 0.04 * i }}
+                    onClick={() => { window.location.href = `/events?ip=${encodeURIComponent(a.ip)}`; }}
+                    title="Open in Threat Search">
+                    <td><span style={{ color: "var(--cyan)" }}>{a.ip}</span></td>
+                    <td className="td2">
+                      <span style={{ fontSize: 15, marginRight: 8 }} title={a.country || "unknown"}>{c.flag}</span>
+                      {c.name}
+                    </td>
+                    <td style={{ textAlign: "right" }}>{a.requests.toLocaleString()}</td>
+                    <td style={{ textAlign: "right", color: a.blocked > 0 ? "var(--red-b)" : "var(--text3)", fontWeight: 600 }}>
+                      {a.blocked.toLocaleString()}
+                    </td>
+                  </motion.tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Rule Engine Health — real ruleset load-state from /rules grouped by source,
+// plus real per-category block counts from the metrics hub's attack_breakdown
+// (always-on; no ClickHouse dependency) and the live ML/proxy signals.
+// ---------------------------------------------------------------------------
+function RuleEngineHealth({ metrics, running }: { metrics: MetricsSnapshot | null; running: boolean }) {
+  const [rules, setRules] = useState<Rule[] | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function f() {
+      try { const r = await api.rules.list(); if (!cancelled) setRules(r.rules ?? []); }
+      catch { if (!cancelled) setRules([]); }
+    }
+    f(); const t = setInterval(f, 30_000); return () => { cancelled = true; clearInterval(t); };
+  }, []);
+
+  const loading = rules === null;
+  const rl = rules ?? [];
+  const grp = (pred: (r: Rule) => boolean) => {
+    const g = rl.filter(pred);
+    return { total: g.length, on: g.filter(r => r.enabled).length };
+  };
+  const crs    = grp(r => r.source === "crs");
+  const custom = grp(r => r.source === "custom" || r.source === "ai_generated");
+  const vp     = grp(r => r.source === "virtual_patch");
+  const enabled = rl.filter(r => r.enabled).length;
+
+  const bd = metrics?.attack_breakdown ?? {};
+  const n = (k: string) => bd[k] ?? 0;
+  const crsHits = n("sqli") + n("xss") + n("rfi_lfi") + n("rce") + n("ssrf") + n("protocol");
+  const mlHits  = metrics?.ml_anomalies ?? 0;
+
+  const rows: { name: string; sub: string; on: boolean; loading: boolean; hits: number | null }[] = [
+    { name: "OWASP CRS v4 core",   sub: loading ? "…" : `${crs.on}/${crs.total} rules enabled`,   on: crs.on > 0,            loading, hits: crsHits },
+    { name: "Custom SRL rules",    sub: loading ? "…" : `${custom.on}/${custom.total} rules enabled`, on: custom.on > 0,      loading, hits: null },
+    { name: "Virtual patches",     sub: loading ? "…" : vp.total > 0 ? `${vp.on}/${vp.total} rules enabled` : "none loaded", on: vp.on > 0, loading, hits: null },
+    { name: "ML anomaly engine",   sub: "behavioural scoring",       on: running, loading: false, hits: mlHits },
+    { name: "Bot / scanner defense", sub: "signatures + heuristics", on: crs.on > 0 || running, loading, hits: n("bot") },
+  ];
+
+  return (
+    <div className="panel">
+      <div className="ph">
+        <div className="ptitle">Rule Engine Health</div>
+        <span className="panel-badge pb-info">{loading ? "loading…" : `${enabled}/${rl.length} enabled`}</span>
+      </div>
+      <div className="pb">
+        {rows.map((row, idx) => (
+          <motion.div key={row.name} className="rule-row"
+            initial={{ opacity: 0, x: -4 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: 0.05 * idx }}>
+            <div className="rule-name">
+              {row.name}
+              <span style={{ display: "block", fontSize: 11, fontWeight: 400, marginTop: 2, color: "var(--text3)", fontFamily: "'JetBrains Mono',monospace" }}>{row.sub}</span>
+            </div>
+            <span className={`rule-st ${row.loading ? "rs-warn" : row.on ? "rs-on" : "rs-warn"}`}>
+              {row.loading ? "…" : row.on ? "Active" : "Off"}
+            </span>
+            <div className="rule-hits" title={row.hits == null ? "no per-source counter" : "blocked this session"}>
+              {row.hits == null ? "—" : row.hits.toLocaleString()}
+            </div>
+          </motion.div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// System Health — at-a-glance fleet/engine roll-up from real endpoints.
+// ---------------------------------------------------------------------------
+function titleCase(s: string): string {
+  return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
+}
+
+type HLevel = "g" | "a" | "r" | "gr";
+
+function SystemHealth({ wafRunning, geoCountries }: { wafRunning: boolean | null; geoCountries: number }) {
+  const [health, setHealth]   = useState<ClusterHealth | null>(null);
+  const [ml, setMl]           = useState<MLStats | null>(null);
+  const [ti, setTi]           = useState<ThreatIntelSummary | null>(null);
+  const [plugins, setPlugins] = useState<number | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function f() {
+      try { const h = await api.cluster.health();     if (!cancelled) setHealth(h); } catch { /* */ }
+      try { const m = await api.ml.stats();           if (!cancelled) setMl(m); }     catch { /* */ }
+      try { const t = await api.threatIntel.stats();  if (!cancelled) setTi(t); }     catch { /* */ }
+      try { const p = await api.plugins.list();       if (!cancelled) setPlugins((p.plugins ?? []).length); } catch { /* */ }
+    }
+    f(); const t = setInterval(f, 30_000); return () => { cancelled = true; clearInterval(t); };
+  }, []);
+
+  const dp = health?.data_plane;
+  const mlActive = !!ml && !!ml.model_status && !/off|disabl|error|down/i.test(ml.model_status);
+
+  // Overall summary — data-plane liveness dominates, then the fleet roll-up.
+  const summary: { level: HLevel; text: string } =
+    wafRunning === false ? { level: "r", text: "Data plane offline — traffic unprotected" }
+    : health?.overall === "critical" ? { level: "r", text: "Critical — action required" }
+    : health?.overall === "degraded" ? { level: "a", text: "Degraded — one or more checks failing" }
+    : wafRunning === null && !health   ? { level: "gr", text: "Checking system status…" }
+    : { level: "g", text: "All Systems Operational" };
+
+  const rows: { name: string; level: HLevel; value: string }[] = [
+    dp
+      ? { name: "Data Plane Nodes", value: `${dp.healthy}/${dp.total} healthy`,
+          level: dp.total === 0 ? "gr" : dp.healthy === dp.total ? "g" : dp.healthy > 0 ? "a" : "r" }
+      : { name: "Data Plane Nodes", value: "—", level: "gr" },
+    { name: "ML Engine",         value: ml ? titleCase(ml.model_status || "unknown") : "—", level: mlActive ? "g" : ml ? "a" : "gr" },
+    { name: "Rule Engine",       value: wafRunning === null ? "—" : wafRunning ? "Active" : "Inactive", level: wafRunning === null ? "gr" : wafRunning ? "g" : "r" },
+    { name: "GeoIP Database",    value: geoCountries > 0 ? `Active · ${geoCountries} countries` : "Awaiting events", level: geoCountries > 0 ? "g" : "gr" },
+    { name: "Threat Intel Feeds", value: ti ? (ti.total_active > 0 ? `${ti.total_active.toLocaleString()} indicators` : "No IOCs loaded") : "—", level: ti ? (ti.total_active > 0 ? "g" : "a") : "gr" },
+    { name: "WASM Sandbox",      value: plugins === null ? "—" : plugins > 0 ? `${plugins} plugin${plugins === 1 ? "" : "s"} loaded` : "Idle", level: plugins && plugins > 0 ? "g" : "gr" },
+  ];
+
+  const valColor: Record<HLevel, string> = { g: "var(--green)", a: "var(--amber)", r: "var(--red-b)", gr: "var(--text3)" };
+
+  return (
+    <div className="panel">
+      <div className="ph">
+        <div className="ptitle">System Health</div>
+        <button className="btn bg-btn btn-sm" onClick={() => { window.location.href = "/cluster"; }}>View Details →</button>
+      </div>
+      <div className="pb">
+        <div style={{ display: "flex", alignItems: "center", gap: 9, paddingBottom: 12, marginBottom: 4, borderBottom: "1px solid var(--bg4)" }}>
+          <span className={`sd ${summary.level}`} />
+          <span style={{ fontSize: 14, fontWeight: 600, color: valColor[summary.level] }}>{summary.text}</span>
+        </div>
+        {rows.map((row, idx) => (
+          <motion.div key={row.name}
+            initial={{ opacity: 0, x: -4 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: 0.05 * idx }}
+            style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 0", borderBottom: idx < rows.length - 1 ? "1px solid rgba(255,255,255,.04)" : "none" }}>
+            <span className={`sd ${row.level}`} />
+            <span style={{ flex: 1, fontSize: 13, color: "var(--text2)" }}>{row.name}</span>
+            <span style={{ fontSize: 13, fontFamily: "'JetBrains Mono',monospace", color: valColor[row.level] }}>{row.value}</span>
+          </motion.div>
+        ))}
+      </div>
+    </div>
   );
 }

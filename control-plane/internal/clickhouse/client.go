@@ -142,9 +142,32 @@ type TimelineBucket struct {
 	Blocked int64 `json:"blocked"`
 }
 
+// SeverityBucket is one time bucket of the threat-detection trend, split by
+// severity band. High folds CRITICAL + HIGH together so the chart reads at a
+// glance (matches the four-line High/Medium/Low/Info legend in the UI).
+type SeverityBucket struct {
+	TS     int64 `json:"ts"`
+	High   int64 `json:"high"`
+	Medium int64 `json:"medium"`
+	Low    int64 `json:"low"`
+	Info   int64 `json:"info"`
+}
+
 type Facet struct {
 	Key   string `json:"key"`
 	Count int64  `json:"count"`
+}
+
+// Attacker is one source IP rolled up over the query window: how many WAF events
+// it generated (requests), how many were actively blocked (blocked), its
+// resolved country (best-effort — empty until GeoIP tags it), and when it was
+// last seen. Drives the "Top Attacker IPs" overview card.
+type Attacker struct {
+	IP       string `json:"ip"`
+	Country  string `json:"country"`
+	Requests int64  `json:"requests"`
+	Blocked  int64  `json:"blocked"`
+	LastSeen int64  `json:"last_seen"`
 }
 
 // SearchFilter holds the (already-untrusted) search parameters.
@@ -281,6 +304,30 @@ func (c *Client) Timeline(ctx context.Context, tenant string, from, to int64, bu
 	return out, nil
 }
 
+// SeverityTimeline buckets waf_events by time and severity band for the threat
+// detection trend chart. High folds CRITICAL + HIGH together. Tenant-scoped
+// (isolation boundary), like Timeline/Facets. Severity match is case-insensitive.
+func (c *Client) SeverityTimeline(ctx context.Context, tenant string, from, to int64, bucketSecs int) ([]SeverityBucket, error) {
+	if bucketSecs <= 0 {
+		bucketSecs = 60
+	}
+	where := append(c.timeWhere(from, to), eq("tenant", tenant))
+	sql := fmt.Sprintf(
+		"SELECT toUnixTimestamp(toStartOfInterval(ts, INTERVAL %d SECOND)) AS ts, "+
+			"countIf(upper(severity) IN ('CRITICAL','HIGH')) AS high, "+
+			"countIf(upper(severity) = 'MEDIUM') AS medium, "+
+			"countIf(upper(severity) = 'LOW') AS low, "+
+			"countIf(upper(severity) = 'INFO') AS info "+
+			"FROM %s.waf_events WHERE %s "+
+			"GROUP BY ts ORDER BY ts",
+		bucketSecs, c.db, strings.Join(where, " AND "))
+	var out []SeverityBucket
+	if err := c.queryJSON(ctx, sql, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // Facets returns top values for a column (rule|ip|country|action|site).
 func (c *Client) Facets(ctx context.Context, column, tenant string, from, to int64, limit int) ([]Facet, error) {
 	col, ok := facetColumn(column)
@@ -297,6 +344,34 @@ func (c *Client) Facets(ctx context.Context, column, tenant string, from, to int
 			"GROUP BY key ORDER BY count DESC LIMIT %d",
 		col, c.db, strings.Join(where, " AND "), col, limit)
 	var out []Facet
+	if err := c.queryJSON(ctx, sql, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// TopAttackers rolls up waf_events by source IP over the window, returning the
+// busiest IPs with their total event count, actively-blocked count, resolved
+// country (best-effort — the most recent non-empty value), and last-seen time.
+// Tenant-scoped like Search/Facets — the cross-tenant isolation boundary — so
+// no path can surface another tenant's attackers. Ordered by total events then
+// blocks descending.
+func (c *Client) TopAttackers(ctx context.Context, tenant string, from, to int64, limit int) ([]Attacker, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 10
+	}
+	where := append(c.timeWhere(from, to), eq("tenant", tenant))
+	// argMax(country, ts) picks the country from this IP's most recent event so a
+	// single stale/empty tag can't win; anyIf would ignore recency. Empty codes
+	// simply lose to any tagged row, and the client renders a neutral globe.
+	sql := fmt.Sprintf(
+		"SELECT ip AS ip, argMax(country, ts) AS country, "+
+			"count() AS requests, countIf(action = 'BLOCK') AS blocked, "+
+			"toUnixTimestamp(max(ts)) AS last_seen "+
+			"FROM %s.waf_events WHERE %s AND ip != '' "+
+			"GROUP BY ip ORDER BY requests DESC, blocked DESC LIMIT %d",
+		c.db, strings.Join(where, " AND "), limit)
+	var out []Attacker
 	if err := c.queryJSON(ctx, sql, &out); err != nil {
 		return nil, err
 	}

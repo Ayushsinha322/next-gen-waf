@@ -467,6 +467,8 @@ func run() error {
 		protected.GET("/events/search", func(c *gin.Context) { handleEventsSearch(c, enforcer, chClient) })
 		protected.GET("/events/timeline", func(c *gin.Context) { handleEventsTimeline(c, enforcer, chClient) })
 		protected.GET("/events/facets", func(c *gin.Context) { handleEventsFacets(c, enforcer, chClient) })
+		protected.GET("/events/top-attackers", func(c *gin.Context) { handleTopAttackers(c, enforcer, chClient) })
+		protected.GET("/events/severity-timeline", func(c *gin.Context) { handleSeverityTimeline(c, enforcer, chClient) })
 
 		protected.GET("/geoip/blocked", func(c *gin.Context) { handleListBlockedCountries(c, enforcer, store) })
 		protected.POST("/geoip/block", func(c *gin.Context) { handleBlockCountry(c, enforcer, store, hub, cl) })

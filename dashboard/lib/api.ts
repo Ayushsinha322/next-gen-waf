@@ -204,6 +204,25 @@ export interface WafEvent {
 
 export interface TimelineBucket { ts: number; total: number; blocked: number }
 
+/** One time bucket of the threat-detection trend, split by severity band
+ *  (High folds CRITICAL + HIGH together). */
+export interface SeverityBucket {
+  ts:     number; // unix seconds (bucket start)
+  high:   number;
+  medium: number;
+  low:    number;
+  info:   number;
+}
+
+/** One source IP rolled up over the query window (Top Attacker IPs card). */
+export interface Attacker {
+  ip:        string;
+  country:   string;  // ISO-3166 alpha-2, or "" when GeoIP hasn't tagged it
+  requests:  number;  // total WAF events attributed to this IP
+  blocked:   number;  // subset actively blocked (action = BLOCK)
+  last_seen: number;  // unix seconds
+}
+
 export interface EventQuery {
   site?: string; country?: string; rule?: string; action?: string;
   ip?: string; protocol?: string; q?: string; from?: number; to?: number; limit?: number;
@@ -663,6 +682,17 @@ export const api = {
     facets: (column: string, from?: number, to?: number, limit = 10) =>
       apiFetch<{ facets: { key: string; count: number }[]; column: string; clickhouse: boolean }>(
         `/events/facets?column=${encodeURIComponent(column)}&${eventQS({ from, to })}&limit=${limit}`),
+    /** Top source IPs by WAF-event volume, each with blocked count + country.
+     *  ClickHouse-backed; returns `clickhouse:false` + empty list when the event
+     *  store is not configured. */
+    topAttackers: (limit = 8, from?: number, to?: number) =>
+      apiFetch<{ attackers: Attacker[]; clickhouse: boolean }>(
+        `/events/top-attackers?${eventQS({ from, to, limit })}`),
+    /** Threat-detection trend: waf_events bucketed by time + severity band.
+     *  ClickHouse-backed; empty + `clickhouse:false` when the store is off. */
+    severityTimeline: (from?: number, to?: number, bucket = 60) =>
+      apiFetch<{ buckets: SeverityBucket[]; clickhouse: boolean }>(
+        `/events/severity-timeline?${eventQS({ from, to })}&bucket=${bucket}`),
   },
 
   threatIntel: {
