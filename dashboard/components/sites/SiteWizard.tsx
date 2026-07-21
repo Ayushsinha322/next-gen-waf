@@ -21,6 +21,7 @@ import {
   SiteForm, emptyForm, applyPreset, formToPayload, PRESETS, CRS_CATEGORIES,
   ALL_CRS_KEYS, COUNTRIES, PresetKey, UpstreamServer, normalizeDomain,
   HTTP_METHODS, ACME_PROVIDERS, CustomHeader, certCoversHost,
+  JWT_ALGORITHMS, FUSION_ENGINES, IpFeed,
 } from "@/lib/siteConfig";
 
 /** All names a cert presents (primary domain + SANs), lowercased. */
@@ -170,7 +171,7 @@ function InfoBox({ children, tone = "cyan" }: { children: React.ReactNode; tone?
 
 /* ── steps ───────────────────────────────────────────────────── */
 const EASY_STEPS     = ["Basics", "Front Service", "Reverse Proxy", "Protection", "Review"];
-const ADVANCED_STEPS = ["Basics", "Front Service", "Reverse Proxy", "WAF Rules", "Rate & DDoS", "Antibot", "Geo & IP", "HTTP Headers", "Advanced", "Review"];
+const ADVANCED_STEPS = ["Basics", "Front Service", "Reverse Proxy", "WAF Rules", "API Security", "Rate & DDoS", "Antibot", "Geo & IP", "HTTP Headers", "Advanced", "Review"];
 
 export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: Props) {
   const [adv, setAdv]   = useState(mode === "edit");
@@ -188,7 +189,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
 
   const screen = useMemo(() => {
     if (!adv) return ["basics", "front", "proxy", "protect", "review"][step];
-    return ["basics", "front", "proxy", "rules", "rate", "antibot", "geoip", "headers", "advanced", "review"][step];
+    return ["basics", "front", "proxy", "rules", "apisec", "rate", "antibot", "geoip", "headers", "advanced", "review"][step];
   }, [adv, step]);
 
   function setServer(i: number, patch: Partial<UpstreamServer>) {
@@ -634,6 +635,69 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                   <button className="btn bg-btn btn-xs" type="button" style={{ alignSelf: "flex-start" }} onClick={() => upd({ rule_exclusions: [...form.rule_exclusions, { rule_id: 0, exclude_targets: [] }] })}>＋ Add Exclusion</button>
                 </>)}
 
+                {/* ───────── API SECURITY (advanced) ───────── */}
+                {screen === "apisec" && (<>
+                  <StepHead title="API Security" sub="Edge JWT/OAuth2 enforcement, GraphQL depth/complexity limits and a gRPC firewall — protect APIs, not just web apps." tag="enforced" />
+
+                  {/* JWT / OAuth2 */}
+                  <SectionToggle label="Edge JWT / OAuth2 validation" desc="Verify Bearer tokens (signature · expiry · issuer/audience · scopes) before proxying" on={form.jwt_enabled} set={v => upd({ jwt_enabled: v })} />
+                  {form.jwt_enabled && (<>
+                    <SectionToggle label="Require a valid token" desc="On = reject missing/invalid tokens · Off = verify only when present" on={form.jwt_required} set={v => upd({ jwt_required: v })} />
+                    <Row>
+                      <Field label="Issuer (iss)" hint="Expected token issuer (blank = don't check)"><input className="fin2" value={form.jwt_issuer} placeholder="https://auth.example.com/" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 13 }} onChange={e => upd({ jwt_issuer: e.target.value })} /></Field>
+                      <Field label="Audience (aud)" hint="Expected audience (blank = don't check)"><input className="fin2" value={form.jwt_audience} placeholder="api://my-service" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 13 }} onChange={e => upd({ jwt_audience: e.target.value })} /></Field>
+                    </Row>
+                    <Field label="Allowed Algorithms" hint="Only tokens signed with these algs are accepted">
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                        {JWT_ALGORITHMS.map(a => {
+                          const on = form.jwt_algorithms.includes(a);
+                          return (
+                            <span key={a} onClick={() => upd({ jwt_algorithms: on ? form.jwt_algorithms.filter(x => x !== a) : [...form.jwt_algorithms, a] })}
+                              style={{ cursor: "pointer", padding: "4px 10px", borderRadius: 8, fontSize: 13, fontFamily: "'Share Tech Mono',monospace", background: on ? "rgba(0,230,118,.1)" : "rgba(255,255,255,.03)", border: on ? "1px solid rgba(0,230,118,.35)" : "1px solid rgba(255,255,255,.08)", color: on ? "var(--text)" : "var(--text3)" }}>{a}</span>
+                          );
+                        })}
+                      </div>
+                    </Field>
+                    <GroupLabel>Signing Key <span style={{ textTransform: "none", letterSpacing: 0, color: "var(--text3)" }}>— pick one</span></GroupLabel>
+                    <Field label="JWKS URL" hint="Recommended: keys fetched + cached, rotated by token kid"><input className="fin2" value={form.jwt_jwks_url} placeholder="https://auth.example.com/.well-known/jwks.json" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 13 }} onChange={e => upd({ jwt_jwks_url: e.target.value })} /></Field>
+                    <Row>
+                      <Field label="HS256 Shared Secret" hint="Symmetric — for HS* algorithms"><SecretInput value={form.jwt_hs_secret} set={v => upd({ jwt_hs_secret: v })} /></Field>
+                      <Field label="Scope Claim" hint="Claim carrying scopes (default: scope)"><input className="fin2" value={form.jwt_scope_claim} placeholder="scope" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 13 }} onChange={e => upd({ jwt_scope_claim: e.target.value })} /></Field>
+                    </Row>
+                    <Field label="Public Key (PEM)" hint="Asymmetric static key — for RS*/ES* (blank if using JWKS)"><textarea className="fin2" rows={3} value={form.jwt_public_key_pem} placeholder="-----BEGIN PUBLIC KEY-----" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 13, resize: "vertical" }} onChange={e => upd({ jwt_public_key_pem: e.target.value })} /></Field>
+                    <Field label="Required Scopes" hint="All must be present in the token to pass"><ChipInput values={form.jwt_required_scopes} onChange={v => upd({ jwt_required_scopes: v })} placeholder="read:orders" /></Field>
+                  </>)}
+
+                  {/* GraphQL */}
+                  <GroupLabel>GraphQL Firewall</GroupLabel>
+                  <SectionToggle label="GraphQL protection" desc="Enforce query depth/complexity limits and block introspection" on={form.graphql_enabled} set={v => upd({ graphql_enabled: v })} />
+                  {form.graphql_enabled && (<>
+                    <Row>
+                      <Field label="Max Query Depth" hint="Reject deeply nested queries (DoS)"><input className="fin2" type="number" value={form.graphql_max_depth} onChange={e => upd({ graphql_max_depth: Number(e.target.value) })} /></Field>
+                      <Field label="Max Complexity" hint="Cost budget per query"><input className="fin2" type="number" value={form.graphql_max_complexity} onChange={e => upd({ graphql_max_complexity: Number(e.target.value) })} /></Field>
+                    </Row>
+                    <SectionToggle label="Block introspection" desc="Refuse __schema / __type queries (hide the API surface)" on={form.graphql_block_introspection} set={v => upd({ graphql_block_introspection: v })} />
+                  </>)}
+
+                  {/* gRPC */}
+                  <GroupLabel>gRPC Firewall</GroupLabel>
+                  <SectionToggle label="gRPC protection" desc="Message/frame caps + method allow/deny for application/grpc traffic" on={form.grpc_enabled} set={v => upd({ grpc_enabled: v })} />
+                  {form.grpc_enabled && (<>
+                    <Row cols="1fr 1fr 1fr">
+                      <Field label="Max Message (KB)" hint="Per-message size cap"><input className="fin2" type="number" value={form.grpc_max_message_kb} onChange={e => upd({ grpc_max_message_kb: Number(e.target.value) })} /></Field>
+                      <Field label="Max Frames"><input className="fin2" type="number" value={form.grpc_max_frames} onChange={e => upd({ grpc_max_frames: Number(e.target.value) })} /></Field>
+                      <div style={{ display: "flex", alignItems: "flex-end" }}><SectionToggle label="Block reflection" desc="Hide schema" on={form.grpc_block_reflection} set={v => upd({ grpc_block_reflection: v })} /></div>
+                    </Row>
+                    <Row>
+                      <Field label="Allowed Methods" hint="/pkg.Service/Method — if set, only these pass"><ChipInput values={form.grpc_allowed_methods} onChange={v => upd({ grpc_allowed_methods: v })} placeholder="/orders.OrderService/Get" /></Field>
+                      <Field label="Blocked Methods" hint="Explicitly denied methods"><ChipInput values={form.grpc_blocked_methods} onChange={v => upd({ grpc_blocked_methods: v })} placeholder="/admin.Admin/Wipe" /></Field>
+                    </Row>
+                  </>)}
+
+                  {!form.jwt_enabled && !form.graphql_enabled && !form.grpc_enabled &&
+                    <InfoBox>🔌 These controls run only for matching traffic (Bearer tokens · GraphQL bodies · <span style={{ color: "var(--cyan)" }}>application/grpc</span>) — enabling them never affects ordinary web requests.</InfoBox>}
+                </>)}
+
                 {/* ───────── RATE & DDOS (advanced) ───────── */}
                 {screen === "rate" && (<>
                   <StepHead title="Rate & DDoS" sub="Token-bucket rate limits and connection-rate anti-DDoS." tag="enforced" />
@@ -729,6 +793,22 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     <Field label="Block User-Agents" hint="Substring match"><ChipInput values={form.blacklist_user_agents} onChange={v => upd({ blacklist_user_agents: v })} placeholder="sqlmap" /></Field>
                     <Field label="Block URI Patterns" hint="Substring match"><ChipInput values={form.blacklist_uris} onChange={v => upd({ blacklist_uris: v })} placeholder="/.env" /></Field>
                   </Row>
+                  <GroupLabel>External Threat-Intel Feeds <Tag kind="enforced" /></GroupLabel>
+                  <InfoBox>🌐 Auto-refreshed IP blocklists (AbuseIPDB, Spamhaus DROP, FireHOL, …). Loaded at startup and refreshed on the interval — matched IPs are blocked before rules run.</InfoBox>
+                  {form.ip_feeds.map((feed, i) => (
+                    <div key={i} style={{ display: "grid", gridTemplateColumns: "2.4fr 0.8fr 0.9fr auto", gap: 8, alignItems: "end" }}>
+                      <Field label={`Feed URL #${i + 1}`}><input className="fin2" value={feed.url} placeholder="https://iplists.firehol.org/…/firehol_level1.netset" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 13 }} onChange={e => upd({ ip_feeds: form.ip_feeds.map((x, idx) => idx === i ? { ...x, url: e.target.value } : x) })} /></Field>
+                      <Field label="Refresh" hint="e.g. 1h"><input className="fin2" value={feed.interval} placeholder="1h" onChange={e => upd({ ip_feeds: form.ip_feeds.map((x, idx) => idx === i ? { ...x, interval: e.target.value } : x) })} /></Field>
+                      <Field label="Format">
+                        <select className="fin2 fsel2" value={feed.format} onChange={e => upd({ ip_feeds: form.ip_feeds.map((x, idx) => idx === i ? { ...x, format: e.target.value as IpFeed["format"] } : x) })}>
+                          <option value="cidr">CIDR list</option>
+                          <option value="json">JSON</option>
+                        </select>
+                      </Field>
+                      <button className="btn bg-btn btn-sm" type="button" onClick={() => upd({ ip_feeds: form.ip_feeds.filter((_, idx) => idx !== i) })}>🗑</button>
+                    </div>
+                  ))}
+                  <button className="btn bg-btn btn-xs" type="button" style={{ alignSelf: "flex-start" }} onClick={() => upd({ ip_feeds: [...form.ip_feeds, { url: "", interval: "1h", format: "cidr" }] })}>＋ Add Feed</button>
                 </>)}
 
                 {/* ───────── HTTP HEADERS (advanced) ───────── */}
@@ -777,12 +857,53 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     })}
                   </div>
                   <SectionToggle label="ML Anomaly Detection" desc="Score requests with the bundled ML models" on={form.ml_enabled} set={v => upd({ ml_enabled: v })} />
-                  {form.ml_enabled && (
+                  {form.ml_enabled && (<>
                     <Field label={`ML Sensitivity (${form.ml_sensitivity})`} hint="0 = lenient · 1 = aggressive">
                       <input type="range" min={0} max={1} step={0.05} value={form.ml_sensitivity} onChange={e => upd({ ml_sensitivity: Number(e.target.value) })} style={{ width: "100%" }} />
                     </Field>
-                  )}
+                    <Field label="Specific Models" hint="Blank = all bundled models (isolation-forest, n-gram, logistic). Name models to restrict."><ChipInput values={form.ml_models} onChange={v => upd({ ml_models: v })} placeholder="isolation_forest" /></Field>
+                  </>)}
                   <SectionToggle label="API Discovery" desc="Learn and document API endpoints automatically" on={form.api_discovery} set={v => upd({ api_discovery: v })} />
+
+                  {/* Response DLP */}
+                  <GroupLabel>Response Data-Loss Prevention</GroupLabel>
+                  <SectionToggle label="Response DLP scanning" desc="Detect PII/PAN/SSN/secrets in responses — block, mask, or log" on={form.dlp_enabled} set={v => upd({ dlp_enabled: v })} />
+                  {form.dlp_enabled && (<>
+                    <Field label="On Detection" hint="What to do when sensitive data is found in a response body">
+                      <select className="fin2 fsel2" value={form.dlp_action} onChange={e => upd({ dlp_action: e.target.value as SiteForm["dlp_action"] })}>
+                        <option value="block">Block the response</option>
+                        <option value="mask">Mask / redact in place</option>
+                        <option value="detect">Detect only (log)</option>
+                      </select>
+                    </Field>
+                    <Field label="Extra Patterns" hint="Additional regexes on top of the built-in detectors (cards, SSN, keys)"><ChipInput values={form.dlp_patterns} onChange={v => upd({ dlp_patterns: v })} placeholder="\bMY-SECRET-[0-9]{6}\b" /></Field>
+                  </>)}
+
+                  {/* Weighted verdict fusion */}
+                  <GroupLabel>Weighted Verdict Fusion</GroupLabel>
+                  <SectionToggle label="Weighted fusion + soft LIMIT tier" desc="Combine engine scores with weights; add a 429 LIMIT tier below hard block to cut false positives" on={form.fusion_enabled} set={v => upd({ fusion_enabled: v })} />
+                  {form.fusion_enabled && (<>
+                    <InfoBox>⚖️ Each engine&apos;s anomaly score is multiplied by its weight, summed, then compared to the per-paranoia thresholds. Weight 1.0 = neutral; below the block threshold but above the LIMIT threshold returns a soft <strong style={{ color: "var(--cyan)" }}>{form.fusion_limit_status}</strong>.</InfoBox>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                      {FUSION_ENGINES.map(eng => (
+                        <Field key={eng.key} label={`${eng.label} × weight`} hint={eng.desc}>
+                          <input className="fin2" type="number" step={0.1} value={form.fusion_weights[eng.key] ?? 1}
+                            onChange={e => upd({ fusion_weights: { ...form.fusion_weights, [eng.key]: Number(e.target.value) } })} />
+                        </Field>
+                      ))}
+                    </div>
+                    <Row cols="1fr 1fr">
+                      <Field label="Block thresholds (PL1–PL4)" hint="Hard-block score per paranoia level">
+                        <input className="fin2" value={form.fusion_block_thresholds.join(", ")} style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 13 }}
+                          onChange={e => upd({ fusion_block_thresholds: e.target.value.split(",").map(s => Number(s.trim())).filter(n => Number.isFinite(n)) })} />
+                      </Field>
+                      <Field label="LIMIT thresholds (PL1–PL4)" hint="Soft-limit score per level (blank = no LIMIT tier)">
+                        <input className="fin2" value={form.fusion_limit_thresholds.join(", ")} style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 13 }}
+                          onChange={e => upd({ fusion_limit_thresholds: e.target.value.split(",").map(s => Number(s.trim())).filter(n => Number.isFinite(n)) })} />
+                      </Field>
+                    </Row>
+                    <Field label="LIMIT HTTP Status" hint="Status returned for the soft-limit tier (e.g. 429)"><input className="fin2" type="number" value={form.fusion_limit_status} onChange={e => upd({ fusion_limit_status: Number(e.target.value) })} /></Field>
+                  </>)}
                 </>)}
 
                 {/* ───────── REVIEW ───────── */}
@@ -806,7 +927,12 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                       ["GeoIP", form.geo_mode === "off" ? "off" : `${form.geo_mode} ${form.geo_countries.join(",")}`],
                       ["IP / Blacklist", `${form.ip_allow.length} allow · ${form.ip_block.length} block${form.dnsbl_enabled ? " · DNSBL" : ""}`],
                       ["Headers", `${form.csp ? "CSP " : ""}${form.cors_enabled ? "CORS " : ""}${form.hsts ? "HSTS " : ""}${form.custom_headers.filter(h => h.name).length} custom`],
-                      ["ML", form.ml_enabled ? `on (${form.ml_sensitivity})` : "off"],
+                      ["ML", form.ml_enabled ? `on (${form.ml_sensitivity})${form.ml_models.length ? ` · ${form.ml_models.length} models` : ""}` : "off"],
+                      ["API Auth (JWT)", form.jwt_enabled ? `on${form.jwt_jwks_url ? " · JWKS" : form.jwt_hs_secret ? " · HS" : form.jwt_public_key_pem ? " · PEM" : ""}${form.jwt_required_scopes.length ? ` · ${form.jwt_required_scopes.length} scopes` : ""}` : "off"],
+                      ["GraphQL / gRPC", `${form.graphql_enabled ? `GraphQL(d${form.graphql_max_depth})` : ""}${form.graphql_enabled && form.grpc_enabled ? " · " : ""}${form.grpc_enabled ? "gRPC" : ""}` || "off"],
+                      ["Response DLP", form.dlp_enabled ? form.dlp_action : "off"],
+                      ["Verdict Fusion", form.fusion_enabled ? `on · LIMIT ${form.fusion_limit_status}` : "off"],
+                      ["Threat-intel feeds", form.ip_feeds.filter(x => x.url.trim()).length ? `${form.ip_feeds.filter(x => x.url.trim()).length} feeds` : "off"],
                     ].map(([k, v]) => (
                       <div key={k} style={{ display: "flex", justifyContent: "space-between", padding: "7px 12px", background: "rgba(255,255,255,.02)", borderRadius: 8, fontSize: 13 }}>
                         <span style={{ color: "var(--text3)" }}>{k}</span>
