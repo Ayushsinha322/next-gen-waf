@@ -401,6 +401,77 @@ struct ConfigSyncResponse {
     sites: Vec<SiteConfig>,
 }
 
+/// On-disk snapshot of the last-good synced config (R5). Lets the data plane
+/// keep protecting DB-created sites across a restart that happens DURING a
+/// control-plane / Postgres outage — boot would otherwise see only local YAML
+/// and every UI/DB-created site would vanish. Overwritten by the first
+/// successful config-sync poll.
+#[derive(serde::Deserialize)]
+struct CachedSyncConfig {
+    version: u64,
+    sites: Vec<SiteConfig>,
+}
+
+/// Resolve the config-cache path: `SENTINEL_CONFIG_CACHE_PATH`, else
+/// `$HOME/.config/sentinel/config-cache.json`, else `/var/lib/sentinel/...`.
+fn config_cache_path() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("SENTINEL_CONFIG_CACHE_PATH") {
+        if !p.is_empty() {
+            return std::path::PathBuf::from(p);
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            return std::path::Path::new(&home).join(".config/sentinel/config-cache.json");
+        }
+    }
+    std::path::PathBuf::from("/var/lib/sentinel/config-cache.json")
+}
+
+/// Atomically persist the last-good synced sites (write tmp → fsync → rename, so
+/// a crash mid-write never yields a truncated cache). Errors are logged only,
+/// never propagated into the sync path.
+fn write_cached_sites(path: &std::path::Path, version: u64, sites: &[SiteConfig]) {
+    use std::io::Write as _;
+    let body = match serde_json::to_vec(&serde_json::json!({ "version": version, "sites": sites })) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("config cache: serialize failed: {e}");
+            return;
+        }
+    };
+    if let Some(dir) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            warn!("config cache: mkdir {}: {e}", dir.display());
+            return;
+        }
+    }
+    let tmp = path.with_extension("json.tmp");
+    let res = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&body)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if let Err(e) = res {
+        warn!("config cache: atomic write {}: {e}", path.display());
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Load the last-good cached config, if present and parseable.
+fn load_cached_sites() -> Option<CachedSyncConfig> {
+    let path = config_cache_path();
+    let bytes = std::fs::read(&path).ok()?;
+    match serde_json::from_slice::<CachedSyncConfig>(&bytes) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            warn!("config cache: parse {}: {e}", path.display());
+            None
+        }
+    }
+}
+
 /// Response from the control-plane `/api/v1/internal/threat-intel` endpoint —
 /// IOCs pre-split into block (high-confidence → reject) and watch (→ score)
 /// tiers. See `sentinel_modules::threat_intel`.
@@ -452,6 +523,15 @@ impl ProxyServer {
     /// Bind all configured listeners and start serving.
     /// Returns when the `shutdown` receiver fires.
     pub async fn run(self, mut shutdown: watch::Receiver<bool>) -> anyhow::Result<()> {
+        // R5: replay the last-good synced sites from the on-disk cache before
+        // building the pool/engines, so protection survives a restart during a
+        // control-plane/Postgres outage. The first successful sync poll below
+        // overwrites both the live config and the cache.
+        if let Some(cached) = load_cached_sites() {
+            let n = cached.sites.len();
+            sentinel_core::config::update_sites(&self.config, cached.sites);
+            info!(sites = n, version = cached.version, "restored sites from local config cache");
+        }
         let cfg = self.config.load_full();
 
         if cfg.listeners.is_empty() {
@@ -873,6 +953,9 @@ impl ProxyServer {
                     };
                     if sync.version != last_version {
                         let count = sync.sites.len();
+                        // R5: persist the last-good config before applying, so a
+                        // restart during a control-plane outage keeps these sites.
+                        write_cached_sites(&config_cache_path(), sync.version, &sync.sites);
                         poll_pool.sync_sites(&sync.sites);
                         sentinel_core::config::update_sites(&poll_cfg, sync.sites);
                         last_version = sync.version;
