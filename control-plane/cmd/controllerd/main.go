@@ -369,6 +369,44 @@ func run() error {
 	// ── REST (Gin) ────────────────────────────────────────────────────────────
 	router := api.SetupRouter(api.CORSFromEnv())
 
+	// Real readiness (R10): /health stays a cheap static liveness probe, but a
+	// node with an unreachable DB or no Raft leader (partitioned / mid-election)
+	// must report NotReady so k8s Endpoints + HAProxy stop routing to it. Probes
+	// send no JWT, so this is unauthenticated.
+	router.GET("/readyz", func(c *gin.Context) {
+		ready := true
+		checks := gin.H{}
+		if store == nil {
+			checks["db"] = "unavailable"
+			ready = false
+		} else {
+			ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+			defer cancel()
+			if err := store.Ping(ctx); err != nil {
+				checks["db"] = "unreachable"
+				ready = false
+			} else {
+				checks["db"] = "ok"
+			}
+		}
+		if cl == nil {
+			checks["raft"] = "standalone"
+		} else {
+			st := cl.Status()
+			if st.LeaderID == nil {
+				checks["raft"] = "no-leader"
+				ready = false
+			} else {
+				checks["raft"] = string(st.Role)
+			}
+		}
+		code := http.StatusOK
+		if !ready {
+			code = http.StatusServiceUnavailable
+		}
+		c.JSON(code, gin.H{"ready": ready, "checks": checks})
+	})
+
 	// ── Static dashboard files (served BEFORE API routes) ─────────────────────
 	dashDir := envOrDefault("SENTINEL_DASHBOARD_DIR", "../dashboard")
 	router.StaticFile("/", filepath.Join(dashDir, "login.html"))

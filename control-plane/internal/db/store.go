@@ -161,6 +161,35 @@ func (s *Store) ListAllActiveSites(ctx context.Context) ([]SiteRow, error) {
 	return sites, rows.Err()
 }
 
+// ConfigVersion returns the shared, monotonic config-generation counter. It is
+// bumped by a statement-level trigger on every sites/rules mutation (migration
+// 0012) and read via the SECURITY DEFINER sentinel_config_version() carve-out,
+// so ANY control-plane node returns the same restart-surviving, change-reflecting
+// value regardless of Raft role — this is the data plane's /internal/config
+// freshness signal (fixes R4/R8: the old per-process, leader-only counter).
+func (s *Store) ConfigVersion(ctx context.Context) (int64, error) {
+	pg, ok := s.pool.(*pgxPool)
+	if !ok {
+		return 0, fmt.Errorf("store: pool is not a *pgxPool")
+	}
+	var v int64
+	if err := pg.pool.QueryRow(ctx, `SELECT sentinel_config_version()`).Scan(&v); err != nil {
+		return 0, fmt.Errorf("store: config version: %w", err)
+	}
+	return v, nil
+}
+
+// Ping checks that the database is actually reachable (used by /readyz so a
+// DB-unreachable control-plane node reports NotReady and is pulled from the
+// load-balancer/Service, instead of a static 200 that keeps routing to it).
+func (s *Store) Ping(ctx context.Context) error {
+	pg, ok := s.pool.(*pgxPool)
+	if !ok {
+		return fmt.Errorf("store: pool is not a *pgxPool")
+	}
+	return pg.pool.Ping(ctx)
+}
+
 // checkPassword verifies plaintext against "argon2id$<hexSalt>$<hexHash>".
 func checkPassword(plain, stored string) bool {
 	parts := strings.SplitN(stored, "$", 3)

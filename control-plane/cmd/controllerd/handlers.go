@@ -995,8 +995,16 @@ func handleInternalConfig(c *gin.Context, store *db.Store) {
 		}
 		rustSites = append(rustSites, rs)
 	}
+	// Shared, DB-derived, restart-surviving freshness signal (migration 0012).
+	// On a transient read error (e.g. before the migration applies) fall back to
+	// a strictly-changing value so the data plane re-syncs rather than latching a
+	// stale version — it still receives the correct DB-backed site list above.
+	version, verr := store.ConfigVersion(c.Request.Context())
+	if verr != nil {
+		version = time.Now().UnixNano()
+	}
 	c.JSON(http.StatusOK, gin.H{
-		"version": configVersion.Load(),
+		"version": version,
 		"sites":   rustSites,
 	})
 }
