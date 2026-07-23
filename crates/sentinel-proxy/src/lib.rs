@@ -480,7 +480,7 @@ impl ProxyServer {
         // Spawn active health-check tasks for sites that configure them.
         UpstreamPool::spawn_health_checks(Arc::clone(&upstream_pool), &cfg, shutdown.clone());
 
-        let initial_engines = build_rule_engines(&cfg);
+        let initial_engines = build_rule_engines(&cfg, &RuleEngineMap::new());
         let engines: Arc<ArcSwap<RuleEngineMap>> =
             Arc::new(ArcSwap::new(Arc::new(initial_engines)));
 
@@ -770,7 +770,8 @@ impl ProxyServer {
                             let ptr = Arc::as_ptr(&current) as usize;
                             if ptr != last_ptr {
                                 last_ptr = ptr;
-                                let new_engines = build_rule_engines(&current);
+                                let prev_engines = es.load_full();
+                                let new_engines = build_rule_engines(&current, &prev_engines);
                                 let rule_count: usize =
                                     new_engines.values().map(|e| e.rule_count()).sum();
                                 es.store(Arc::new(new_engines));
@@ -1428,6 +1429,23 @@ async fn serve_listener(
 /// Max time a client may take to send the complete request head before the
 /// HTTP/1 connection is dropped — bounds slowloris header-dribbling.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
+/// Max wall-clock to read a complete request BODY. `HEADER_READ_TIMEOUT` only
+/// covers the head; without a body deadline a trickled/slow POST (slow-body
+/// slowloris) holds its in-flight admission permit indefinitely, and enough of
+/// them shed all traffic. Env override: `SENTINEL_BODY_READ_TIMEOUT_SECS`.
+const BODY_READ_TIMEOUT_SECS: u64 = 30;
+fn body_read_timeout() -> Duration {
+    static T: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        Duration::from_secs(
+            std::env::var("SENTINEL_BODY_READ_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(BODY_READ_TIMEOUT_SECS),
+        )
+    })
+}
 /// Max time allowed for the TLS handshake to complete, so a client that opens a
 /// socket and then stalls the handshake can't pin a worker task indefinitely.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -1757,6 +1775,17 @@ async fn proxy(
 
     // --- Phase 0: Connection ---
     let mut ctx = RequestContext::new(peer.ip(), peer.port());
+    // Resolve the REAL client IP from X-Forwarded-For when the immediate peer is
+    // a trusted proxy (our HAProxy in the shipped HA topology). Without this,
+    // behind the LB every per-IP control (anti-DDoS, IP-reputation, rate-limit,
+    // GeoIP, threat-intel, correlation, XDP auto-ban) and the forensic client_ip
+    // see the proxy's address, collapsing all of them. Trusting XFF from an
+    // UNtrusted peer would let attackers spoof past IP blocks, so this is gated
+    // on SENTINEL_TRUSTED_PROXIES (empty = never trust XFF — the safe default).
+    // Done before Phase-0 checks so they all key off the true client.
+    if let Some(real) = resolve_client_ip(peer.ip(), req.headers()) {
+        ctx.client_ip = real;
+    }
     // JA4 TLS fingerprint computed from the ClientHello during the handshake
     // (None for plaintext/HTTP-3 listeners). Consumed by the bot classifier.
     ctx.tls_fingerprint = tls_fp;
@@ -2037,12 +2066,14 @@ async fn proxy(
             // stream gigabytes into memory before the post-collection check ever
             // ran. `Limited` aborts collection the instant the body exceeds the
             // cap, bounding memory to `max_bytes`.
-            match http_body_util::Limited::new(body, max_bytes as usize)
-                .collect()
-                .await
+            match tokio::time::timeout(
+                body_read_timeout(),
+                http_body_util::Limited::new(body, max_bytes as usize).collect(),
+            )
+            .await
             {
-                Ok(collected) => collected.to_bytes(),
-                Err(e)
+                Ok(Ok(collected)) => collected.to_bytes(),
+                Ok(Err(e))
                     if e.downcast_ref::<http_body_util::LengthLimitError>()
                         .is_some() =>
                 {
@@ -2058,13 +2089,32 @@ async fn proxy(
                         "Request Entity Too Large",
                     ));
                 }
-                Err(e) => return Err(anyhow::anyhow!("collecting request body: {e}")),
+                Ok(Err(e)) => return Err(anyhow::anyhow!("collecting request body: {e}")),
+                Err(_) => {
+                    ctx.decision = WafDecision::Block;
+                    ctx.block_reason = Some("request body read timed out (slow-body)".into());
+                    ctx.advance_phase(Phase::Logging);
+                    log_request(&ctx);
+                    return Ok(error_response(
+                        StatusCode::REQUEST_TIMEOUT,
+                        "Request Timeout",
+                    ));
+                }
             }
         } else {
-            body.collect()
-                .await
-                .context("collecting request body")?
-                .to_bytes()
+            match tokio::time::timeout(body_read_timeout(), body.collect()).await {
+                Ok(r) => r.context("collecting request body")?.to_bytes(),
+                Err(_) => {
+                    ctx.decision = WafDecision::Block;
+                    ctx.block_reason = Some("request body read timed out (slow-body)".into());
+                    ctx.advance_phase(Phase::Logging);
+                    log_request(&ctx);
+                    return Ok(error_response(
+                        StatusCode::REQUEST_TIMEOUT,
+                        "Request Timeout",
+                    ));
+                }
+            }
         };
 
         ctx.request_body = Some(bytes.clone());
@@ -2961,7 +3011,12 @@ fn enforce_mode(ctx: &mut RequestContext, mode: &WafMode) {
 // Module / engine builders
 // ---------------------------------------------------------------------------
 
-fn build_rule_engines(cfg: &SentinelConfig) -> RuleEngineMap {
+/// Build the per-site rule engines. `previous` is the currently-live engine map
+/// (empty at startup): on a rule-compile failure we FAIL SAFE by retaining that
+/// site's last-good engine rather than silently dropping it to zero rules. This
+/// closes the reload fail-open hole where one malformed CRS/SRL push from the
+/// control plane would unprotect a previously-protected site cluster-wide.
+fn build_rule_engines(cfg: &SentinelConfig, previous: &RuleEngineMap) -> RuleEngineMap {
     let mut map = RuleEngineMap::new();
     for site in &cfg.sites {
         if site.waf.mode == WafMode::Off || site.waf.rules.is_empty() {
@@ -2973,7 +3028,15 @@ fn build_rule_engines(cfg: &SentinelConfig) -> RuleEngineMap {
                 map.insert(site.id.clone(), engine);
             }
             Err(e) => {
-                warn!(site = %site.id, "rule engine load failed — site unprotected: {e:#}");
+                // RuleEngine is Arc-backed → clone is cheap.
+                if let Some(prev) = previous.get(&site.id) {
+                    warn!(site = %site.id, rules = prev.rule_count(),
+                        "rule engine reload FAILED — retaining last-good ruleset, new rules rejected: {e:#}");
+                    map.insert(site.id.clone(), prev.clone());
+                } else {
+                    warn!(site = %site.id,
+                        "rule engine load failed and no prior ruleset — site has NO signature protection until the config is fixed: {e:#}");
+                }
             }
         }
     }
@@ -2988,6 +3051,63 @@ fn build_dlp_map(cfg: &SentinelConfig) -> DlpMap {
         }
     }
     map
+}
+
+/// Trusted downstream proxy CIDRs (`SENTINEL_TRUSTED_PROXIES`, comma-separated).
+/// Only when the immediate TCP peer is inside one of these do we believe its
+/// `X-Forwarded-For`. Empty (default) = never trust XFF, so a direct client
+/// cannot spoof its source IP past our per-IP defenses.
+fn trusted_proxies() -> &'static [IpNet] {
+    static P: std::sync::OnceLock<Vec<IpNet>> = std::sync::OnceLock::new();
+    P.get_or_init(|| {
+        std::env::var("SENTINEL_TRUSTED_PROXIES")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|c| parse_block_cidr(c.trim()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+fn is_trusted_proxy(ip: std::net::IpAddr) -> bool {
+    trusted_proxies().iter().any(|n| n.contains(&ip))
+}
+
+/// Resolve the real client IP from `X-Forwarded-For`, but only when `peer` is a
+/// trusted proxy. Walks the XFF list right-to-left (the right-most entry is what
+/// our trusted proxy actually observed) and returns the first address that is
+/// not itself a trusted proxy — so a client-supplied left-most spoof can never
+/// win, and proxy chains resolve correctly. Returns `None` (keep the TCP peer)
+/// when the peer is untrusted or no usable XFF address is present.
+fn resolve_client_ip(
+    peer: std::net::IpAddr,
+    headers: &http::HeaderMap,
+) -> Option<std::net::IpAddr> {
+    resolve_client_ip_with(peer, headers, is_trusted_proxy)
+}
+
+/// Testable core: `is_trusted` decides which addresses are trusted proxies.
+fn resolve_client_ip_with(
+    peer: std::net::IpAddr,
+    headers: &http::HeaderMap,
+    is_trusted: impl Fn(std::net::IpAddr) -> bool,
+) -> Option<std::net::IpAddr> {
+    if !is_trusted(peer) {
+        return None;
+    }
+    let xff = headers.get("x-forwarded-for")?.to_str().ok()?;
+    xff.split(',')
+        .rev()
+        .filter_map(|p| p.trim().parse::<std::net::IpAddr>().ok())
+        .find(|ip| !is_trusted(*ip))
+        .or_else(|| {
+            // All hops trusted → fall back to the left-most parseable address.
+            xff.split(',')
+                .filter_map(|p| p.trim().parse::<std::net::IpAddr>().ok())
+                .next()
+        })
 }
 
 /// Parse a `SENTINEL_XDP_BLOCK` entry — either a bare IP (`1.2.3.4`, treated as
@@ -5268,5 +5388,54 @@ mod metrics_endpoint_tests {
         assert!(text.contains("sentinel_requests_total"));
         assert!(text.contains("sentinel_rule_hits_total"));
         assert!(text.contains("# TYPE sentinel_requests_total counter"));
+    }
+}
+
+#[cfg(test)]
+mod client_ip_tests {
+    use super::*;
+    use std::net::IpAddr;
+
+    fn xff(v: &str) -> http::HeaderMap {
+        let mut h = http::HeaderMap::new();
+        h.insert("x-forwarded-for", v.parse().unwrap());
+        h
+    }
+    // Trust 10.0.0.0/8 as the proxy subnet (stand-in for our HAProxy network).
+    fn trusted(ip: IpAddr) -> bool {
+        matches!(ip, IpAddr::V4(v4) if v4.octets()[0] == 10)
+    }
+
+    #[test]
+    fn untrusted_peer_ignores_xff_no_spoof() {
+        // A direct client that is NOT a trusted proxy cannot spoof its IP.
+        let peer: IpAddr = "203.0.113.9".parse().unwrap();
+        assert_eq!(resolve_client_ip_with(peer, &xff("1.2.3.4"), trusted), None);
+    }
+
+    #[test]
+    fn trusted_proxy_resolves_rightmost_real_client() {
+        // HAProxy (trusted) appends the observed client on the right; a left-most
+        // client-forged entry must lose.
+        let peer: IpAddr = "10.0.0.5".parse().unwrap();
+        let got = resolve_client_ip_with(peer, &xff("6.6.6.6, 45.155.205.233"), trusted);
+        assert_eq!(got, Some("45.155.205.233".parse().unwrap()));
+    }
+
+    #[test]
+    fn walks_past_trusted_hops_to_first_untrusted() {
+        let peer: IpAddr = "10.0.0.5".parse().unwrap();
+        let got = resolve_client_ip_with(peer, &xff("127.0.0.1, 8.8.8.8, 10.0.0.9"), trusted);
+        // right-to-left: 10.0.0.9 trusted (skip) -> 8.8.8.8 untrusted -> win.
+        assert_eq!(got, Some("8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn no_xff_keeps_peer() {
+        let peer: IpAddr = "10.0.0.5".parse().unwrap();
+        assert_eq!(
+            resolve_client_ip_with(peer, &http::HeaderMap::new(), trusted),
+            None
+        );
     }
 }

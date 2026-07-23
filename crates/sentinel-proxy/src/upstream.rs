@@ -62,6 +62,26 @@ const CIRCUIT_OPEN_THRESHOLD: usize = 5;
 /// Seconds an open circuit waits before allowing a single half-open probe.
 const CIRCUIT_HALF_OPEN_SECS: u64 = 30;
 
+/// Default upstream connect timeout (bounds TCP + TLS establishment). Override
+/// with `SENTINEL_UPSTREAM_CONNECT_TIMEOUT_SECS`.
+const UPSTREAM_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// Default overall upstream request timeout (connect + send + first byte +
+/// response headers). Without this a slow/hung origin pins the request task and
+/// its in-flight admission permit forever — enough stalls shed ALL traffic
+/// (fail-closed self-DoS). A timeout is recorded as a circuit-breaker failure.
+/// Override with `SENTINEL_UPSTREAM_TIMEOUT_SECS`.
+const UPSTREAM_TIMEOUT_SECS: u64 = 30;
+
+/// Parse a positive-seconds env override, falling back to `default`.
+fn env_secs(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(default)
+}
+
 // ---------------------------------------------------------------------------
 // Per-server health + circuit-breaker state
 // ---------------------------------------------------------------------------
@@ -229,6 +249,8 @@ pub struct UpstreamPool {
     sites: DashMap<String, Arc<SiteUpstream>>,
     /// Single shared HTTP/HTTPS keep-alive connection pool.
     client: PooledClient,
+    /// Overall per-request upstream timeout (see [`UPSTREAM_TIMEOUT_SECS`]).
+    upstream_timeout: Duration,
 }
 
 impl UpstreamPool {
@@ -249,12 +271,28 @@ impl UpstreamPool {
 
     /// Build the pool from the initial config.
     pub fn from_config(cfg: &SentinelConfig) -> Self {
+        let connect_timeout = Duration::from_secs(env_secs(
+            "SENTINEL_UPSTREAM_CONNECT_TIMEOUT_SECS",
+            UPSTREAM_CONNECT_TIMEOUT_SECS,
+        ));
+        let upstream_timeout = Duration::from_secs(env_secs(
+            "SENTINEL_UPSTREAM_TIMEOUT_SECS",
+            UPSTREAM_TIMEOUT_SECS,
+        ));
+
+        // Own the base HTTP connector so we can bound connect (TCP+TLS) time; the
+        // default builder gives no connect timeout, so an unreachable origin would
+        // hang the connect indefinitely. enforce_http(false) lets https:// URIs
+        // through to the TLS layer.
+        let mut http = HttpConnector::new();
+        http.set_connect_timeout(Some(connect_timeout));
+        http.enforce_http(false);
         let https = hyper_rustls::HttpsConnectorBuilder::new()
             .with_webpki_roots()
             .https_or_http()
             .enable_http1()
             .enable_http2()
-            .build();
+            .wrap_connector(http);
 
         // Keep-alive pool sizing. 32 idle/host is far too low for a reverse
         // proxy: once in-flight concurrency to an upstream exceeds it, the
@@ -276,6 +314,7 @@ impl UpstreamPool {
         let pool = Self {
             sites: DashMap::new(),
             client,
+            upstream_timeout,
         };
 
         for site in &cfg.sites {
@@ -365,11 +404,16 @@ impl UpstreamPool {
             "forwarding to upstream (pooled)"
         );
 
-        let result = self
-            .client
-            .request(req)
-            .await
-            .context("upstream request failed");
+        // Bound the whole request: a hung origin must not pin this task (and its
+        // in-flight admission permit) forever. A timeout is a breaker failure.
+        let result =
+            match tokio::time::timeout(self.upstream_timeout, self.client.request(req)).await {
+                Ok(r) => r.context("upstream request failed"),
+                Err(_) => Err(anyhow::anyhow!(
+                    "upstream request timed out after {:?}",
+                    self.upstream_timeout
+                )),
+            };
 
         if let Some(ref h) = srv_health {
             h.active_conns.fetch_sub(1, Ordering::Relaxed);
