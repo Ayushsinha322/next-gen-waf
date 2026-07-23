@@ -55,6 +55,10 @@ export default function TopBar() {
   const [p99, setP99]   = useState<number | null>(null);
   const [alerts, setAlerts] = useState(0);
   const [theme, setTheme] = useState<"dark" | "light">("dark");
+  // Real fleet health — never hardcode "operational".
+  const [health, setHealth] = useState<{ level: "g" | "a" | "r" | "gr"; text: string }>({
+    level: "gr", text: "Checking status…",
+  });
 
   useEffect(() => {
     const saved = (localStorage.getItem("sentinel-theme") as "dark" | "light") || "dark";
@@ -88,6 +92,33 @@ export default function TopBar() {
     api.alerts.list("open")
       .then(r => setAlerts((r.alerts ?? []).length))
       .catch(() => {});
+  }, []);
+
+  // Poll real cluster health so the status pill reflects reality, not a
+  // hardcoded green. Falls back to the WAF proxy status, then to "unknown".
+  useEffect(() => {
+    let cancelled = false;
+    async function poll() {
+      try {
+        const h = await api.cluster.health();
+        if (cancelled) return;
+        if (h.protection_active === false) { setHealth({ level: "r", text: "Protection inactive" }); return; }
+        setHealth(
+          h.overall === "healthy" ? { level: "g", text: "All systems operational" }
+          : h.overall === "degraded" ? { level: "a", text: "Degraded — check cluster" }
+          : { level: "r", text: "Critical — action required" });
+      } catch {
+        try {
+          const w = await api.waf.status();
+          if (!cancelled) setHealth(w.waf_running
+            ? { level: "g", text: "WAF active" }
+            : { level: "r", text: "WAF proxy down" });
+        } catch { if (!cancelled) setHealth({ level: "gr", text: "Status unavailable" }); }
+      }
+    }
+    poll();
+    const t = setInterval(poll, 15000);
+    return () => { cancelled = true; clearInterval(t); };
   }, []);
 
   const rpsDisplay = rps !== null ? rps.toLocaleString() : "—";
@@ -142,16 +173,24 @@ export default function TopBar() {
           </span>
         </motion.div>
 
-        <div style={{
-          display: "flex", alignItems: "center", gap: 5,
-          padding: "4px 10px", borderRadius: 6,
-          background: "rgba(0,200,122,.06)", border: "1px solid rgba(0,200,122,.18)",
-          fontSize: 14, fontFamily: "'Inter',sans-serif", fontWeight: 500, color: "var(--green)",
-          whiteSpace: "nowrap",
-        }}>
-          <div className="sd g" style={{ width: 5, height: 5 }} />
-          All systems operational
-        </div>
+        {(() => {
+          const c = health.level === "g" ? ["rgba(0,200,122,.06)", "rgba(0,200,122,.18)", "var(--green)"]
+            : health.level === "a" ? ["rgba(255,170,0,.07)", "rgba(255,170,0,.22)", "var(--amber)"]
+            : health.level === "r" ? ["rgba(255,45,85,.07)", "rgba(255,45,85,.24)", "var(--red-b)"]
+            : ["rgba(136,150,184,.07)", "rgba(136,150,184,.2)", "var(--text3)"];
+          return (
+            <div style={{
+              display: "flex", alignItems: "center", gap: 5,
+              padding: "4px 10px", borderRadius: 6,
+              background: c[0], border: `1px solid ${c[1]}`,
+              fontSize: 14, fontFamily: "'Inter',sans-serif", fontWeight: 500, color: c[2],
+              whiteSpace: "nowrap",
+            }} title="Live fleet health">
+              <div className={`sd ${health.level}`} style={{ width: 5, height: 5 }} />
+              {health.text}
+            </div>
+          );
+        })()}
       </div>
 
       <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "0 14px", marginLeft: "auto" }}>

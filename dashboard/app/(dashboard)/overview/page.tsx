@@ -228,7 +228,16 @@ export default function OverviewPage() {
             <div className={`sd ${wafStatus?.running ? "g" : "r"}`} />
             {wafStatus === null ? "WAF status: unknown" : wafStatus.running ? `WAF active · ${wafStatus.sites ?? "?"} sites · uptime ${formatUptime(wafStatus.uptime ?? 0)}` : "WAF proxy NOT running"}
           </motion.div>
-          <motion.button className="btn bg-btn btn-sm" whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }} onClick={() => showToast("Report generated", "s", "📄")}>📄 Export</motion.button>
+          <motion.button className="btn bg-btn btn-sm" whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }} onClick={() => {
+            // Real export of the current overview data (not a fake toast).
+            const snap = { generated_at: new Date().toISOString(), stats, metrics, waf: wafStatus, plugins, instances, by_country: byCountry };
+            const blob = new Blob([JSON.stringify(snap, null, 2)], { type: "application/json" });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url; a.download = `waf-overview-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.json`;
+            document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+            showToast("Overview snapshot exported", "s", "📄");
+          }}>📄 Export</motion.button>
           <motion.button className="btn bp btn-sm" whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }} onClick={() => { api.dashboard.stats().then(r => { setStats(r.stats); showToast("Dashboard refreshed", "i", "🔄"); }).catch(() => showToast("Refresh failed", "e", "⚠️")); }}>🔄 Refresh</motion.button>
         </div>
       </motion.div>

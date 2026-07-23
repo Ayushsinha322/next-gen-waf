@@ -17,7 +17,6 @@ export default function SettingsPage() {
           <div className="sec-title">⚙️ Settings</div>
           <div className="sec-sub">System configuration · Authentication · Team management · Cluster</div>
         </div>
-        <motion.button className="btn bp btn-sm" onClick={() => showToast("Settings saved","s","💾")} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>💾 Save</motion.button>
       </motion.div>
       <motion.div className="tabs" variants={fadeUp}>
         {TABS.map((t,i) => <div key={i} className={`tab ${tab===i?"active":""}`} onClick={() => setTab(i)}>{t}</div>)}
@@ -72,7 +71,7 @@ function AuthTab() {
           <div className="fg2"><label className="flbl2">JWT Issuer</label><input className="fin2" defaultValue="sentinel-waf.corp.io" /></div>
         </div>
         {([
-          ["Microsoft Entra ID (Azure AD)","Tenant: corp.onmicrosoft.com · Client ID configured","ACTIVE"],
+          ["Microsoft Entra ID (Azure AD)","Not configured","Set Up"],
           ["Google Workspace OIDC","Not configured","Set Up"],
           ["Okta Enterprise SSO","Not configured","Set Up"],
           ["SAML 2.0","SP Entity ID: https://sentinel-waf.corp.io/saml/metadata","Configure"],
