@@ -262,75 +262,79 @@ func run() error {
 		defer cl.Stop()
 	}
 
-	// Singleton background duties (alerting, threat-intel, cert & node-health
-	// monitors) MUST run on exactly one node — every control-plane node tails the
-	// SAME shared NDJSON stream and shares one Postgres, so running them on all N
-	// nodes emits N× duplicate alerts/notifications and N× feed fetches. They only
-	// read shared state / poll the data plane, so they need "exactly one runner",
-	// not "the Raft leader" specifically — so we pin them to node 1 (the primary /
-	// API entry point). Standalone (no cluster) always runs them.
-	// NOTE (single-VM limitation): these duties pause if node 1 is down until it
-	// returns; leader-following singletons would need restartable workers.
-	primary := cl == nil || envOrDefault("SENTINEL_NODE_ID", "1") == "1"
-
-	// ── Alert engine ──────────────────────────────────────────────────────────
-	// Turns the live WAF event stream into alerts (spikes, repeat offenders,
-	// critical blocks), persists them, surfaces them on the dashboard via SSE,
-	// and fans them out to configured notification channels. Single-tenant
-	// (dev tenant) because the proxy NDJSON stream is not tenant-tagged.
-	var engine *alerting.Engine
-	if store != nil && primary {
-		engine = alerting.New(store, hub, db.DevTenantID, db.DevAdminID, alertingConfigFromEnv(), log)
-		engine.Start()
-		defer engine.Stop()
-	}
-
-	// ── Threat Intelligence aggregator ────────────────────────────────────────
-	// Ingests open CTI feeds (Tor exit nodes, abuse.ch Feodo/URLhaus, optional
-	// STIX/TAXII) into threat_intel_iocs on an hourly ticker; the Rust data plane
-	// hot-syncs the result via GET /api/v1/internal/threat-intel. Disable with
-	// SENTINEL_THREATINTEL_ENABLED=false (e.g. air-gapped installs).
-	if store != nil && primary {
-		if tiCfg := threatintel.ConfigFromEnv(); tiCfg.Enabled {
-			agg := threatintel.New(store, tiCfg, log)
-			agg.Start(ctx)
-			defer agg.Stop()
-		} else {
-			log.Info("threat-intel aggregator disabled (SENTINEL_THREATINTEL_ENABLED=false)")
+	// Singleton background duties (alerting, threat-intel, cert & node-health,
+	// disk-pressure) MUST run on exactly one node — every control-plane node tails
+	// the SAME shared NDJSON stream and shares one Postgres, so running them on all
+	// N nodes emits N× duplicate alerts/notifications and N× feed fetches. They run
+	// on the current Raft LEADER (R7): a supervisor follows leadership and starts
+	// the whole set on acquire, stops it on loss — so losing node 1 while the
+	// cluster keeps quorum no longer silently kills the alerting/threat-intel/cert
+	// plane. Standalone (no cluster) is always the sole runner.
+	if store != nil {
+		// Construct + start a fresh set of monitors; returns a stop closure. A
+		// fresh set is built on every leadership acquisition (Stop closes each
+		// monitor's channel, so instances are single-use).
+		startMonitors := func() func() {
+			eng := alerting.New(store, hub, db.DevTenantID, db.DevAdminID, alertingConfigFromEnv(), log)
+			eng.Start()
+			stops := []func(){eng.Stop}
+			if tiCfg := threatintel.ConfigFromEnv(); tiCfg.Enabled {
+				agg := threatintel.New(store, tiCfg, log)
+				agg.Start(ctx)
+				stops = append(stops, agg.Stop)
+			} else {
+				log.Info("threat-intel aggregator disabled (SENTINEL_THREATINTEL_ENABLED=false)")
+			}
+			nm := nodehealth.New(store, eng, cl, log)
+			nm.Start()
+			stops = append(stops, nm.Stop)
+			cm := certmon.New(eng, dataPlaneBaseURL(), os.Getenv("SENTINEL_INTERNAL_SECRET"), log)
+			cm.Start()
+			stops = append(stops, cm.Stop)
+			if chClient != nil && chClient.Enabled() {
+				dm := diskmon.New(eng, chClient, log)
+				dm.Start()
+				stops = append(stops, dm.Stop)
+			}
+			log.Info("singleton monitors started (leader)")
+			return func() {
+				for i := len(stops) - 1; i >= 0; i-- {
+					stops[i]()
+				}
+				log.Info("singleton monitors stopped (leadership lost)")
+			}
 		}
-	}
 
-	// ── Node-health monitor ───────────────────────────────────────────────────
-	// Flips stale data-plane nodes DOWN, watches Raft quorum, and raises alerts
-	// through the engine on transitions. Gated on engine != nil, which is only
-	// true on the primary node — so it never runs (or touches a nil engine) on a
-	// non-primary member.
-	if store != nil && engine != nil {
-		nm := nodehealth.New(store, engine, cl, log)
-		nm.Start()
-		defer nm.Stop()
-	}
-
-	// ── Certificate-expiry monitor ────────────────────────────────────────────
-	// Polls the data-plane cert inventory on a slow ticker and raises escalating
-	// cert_expiring alerts before a cert lapses (the data plane auto-renews ACME
-	// certs but never alerts, and does nothing for manual certs). Base URL +
-	// secret are passed in since those helpers live in package main.
-	if store != nil && engine != nil {
-		cm := certmon.New(engine, dataPlaneBaseURL(), os.Getenv("SENTINEL_INTERNAL_SECRET"), log)
-		cm.Start()
-		defer cm.Stop()
-	}
-
-	// ── ClickHouse disk-pressure monitor ──────────────────────────────────────
-	// Pages the SOC (through the same alert channels) before the event store
-	// fills up. A full ClickHouse degrades Threat Search, not the WAF, but must
-	// never fill silently. Threshold via SENTINEL_DISK_ALERT_PCT (default 80).
-	// Gated on engine != nil (primary node) + a configured ClickHouse reader.
-	if store != nil && engine != nil && chClient != nil && chClient.Enabled() {
-		dm := diskmon.New(engine, chClient, log)
-		dm.Start()
-		defer dm.Stop()
+		if cl == nil {
+			// Standalone = always the sole runner; start once, stop on exit.
+			stop := startMonitors()
+			defer stop()
+		} else {
+			// Follow Raft leadership: start the set when this node becomes leader,
+			// stop it when leadership moves elsewhere.
+			go func() {
+				ticker := time.NewTicker(1 * time.Second)
+				defer ticker.Stop()
+				var stop func()
+				for {
+					select {
+					case <-ctx.Done():
+						if stop != nil {
+							stop()
+						}
+						return
+					case <-ticker.C:
+						leader := cl.IsLeader()
+						if leader && stop == nil {
+							stop = startMonitors()
+						} else if !leader && stop != nil {
+							stop()
+							stop = nil
+						}
+					}
+				}
+			}()
+		}
 	}
 
 	// ── gRPC ──────────────────────────────────────────────────────────────────
