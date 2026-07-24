@@ -337,6 +337,13 @@ struct ServerState {
     /// across all transports (h1/h2/h3). Excess requests shed with 503; this
     /// specifically caps HTTP/2 & HTTP/3 stream fan-out. See `run_pipeline`.
     request_limiter: Arc<Semaphore>,
+    /// Set true on SIGTERM so `/readyz` flips to 503 FIRST — the LB/k8s pulls
+    /// this node from rotation before we drain, so new traffic is diverted
+    /// while in-flight requests finish (R6, graceful shutdown).
+    draining: Arc<std::sync::atomic::AtomicBool>,
+    /// Tracks live per-connection tasks so shutdown can wait for in-flight
+    /// requests to finish (bounded) instead of severing them → 502s (R6).
+    conn_tracker: tokio_util::task::TaskTracker,
 }
 
 /// Resolve an admission-control limit: an environment variable (if set to a
@@ -433,7 +440,8 @@ fn config_cache_path() -> std::path::PathBuf {
 /// never propagated into the sync path.
 fn write_cached_sites(path: &std::path::Path, version: u64, sites: &[SiteConfig]) {
     use std::io::Write as _;
-    let body = match serde_json::to_vec(&serde_json::json!({ "version": version, "sites": sites })) {
+    let body = match serde_json::to_vec(&serde_json::json!({ "version": version, "sites": sites }))
+    {
         Ok(b) => b,
         Err(e) => {
             warn!("config cache: serialize failed: {e}");
@@ -530,7 +538,11 @@ impl ProxyServer {
         if let Some(cached) = load_cached_sites() {
             let n = cached.sites.len();
             sentinel_core::config::update_sites(&self.config, cached.sites);
-            info!(sites = n, version = cached.version, "restored sites from local config cache");
+            info!(
+                sites = n,
+                version = cached.version,
+                "restored sites from local config cache"
+            );
         }
         let cfg = self.config.load_full();
 
@@ -826,6 +838,8 @@ impl ProxyServer {
             http01_tokens,
             conn_limiter,
             request_limiter,
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            conn_tracker: tokio_util::task::TaskTracker::new(),
         });
 
         // --- Background: config hot-reload watcher ---
@@ -1295,9 +1309,33 @@ impl ProxyServer {
         }
 
         shutdown.changed().await.ok();
-        info!("shutdown signal received; draining connections");
+        // R6 graceful shutdown: (1) flip readiness so /readyz → 503 and the LB/k8s
+        // pulls this node from rotation (new traffic diverted); (2) stop accepting
+        // new connections (abort the listener accept loops); (3) wait — bounded by
+        // SENTINEL_DRAIN_GRACE_SECS — for in-flight per-connection tasks to finish
+        // before returning, since the runtime is dropped once run() returns and
+        // would otherwise sever them mid-request → 502s on every deploy.
+        state
+            .draining
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        info!("shutdown signal received; draining in-flight connections");
         for h in handles {
             h.abort();
+        }
+        let grace = Duration::from_secs(
+            std::env::var("SENTINEL_DRAIN_GRACE_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(25),
+        );
+        state.conn_tracker.close();
+        match tokio::time::timeout(grace, state.conn_tracker.wait()).await {
+            Ok(_) => info!("all in-flight connections drained"),
+            Err(_) => warn!(
+                grace_secs = grace.as_secs(),
+                "drain grace elapsed; closing remaining connections"
+            ),
         }
         Ok(())
     }
@@ -1485,7 +1523,11 @@ async fn serve_listener(
                 let ds = default_site.clone();
                 let mgmt = management.clone();
                 let av = alt_svc.clone();
-                tokio::spawn(async move {
+                // Spawn on the connection tracker so a graceful shutdown can wait
+                // for this in-flight request to finish (bounded) instead of the
+                // runtime dropping it mid-request → 502 (R6).
+                let tracker = state.conn_tracker.clone();
+                tracker.spawn(async move {
                     // Permit is held for the connection's lifetime and released
                     // (freeing a slot) when this task ends; the guard keeps the
                     // active-connection gauge in sync even on panic.
@@ -4484,16 +4526,22 @@ fn health_response(state: &ServerState) -> Response<BoxBody> {
 // process is up but hasn't synced rules is live-but-not-ready.
 fn readyz_response(state: &ServerState) -> Response<BoxBody> {
     let site_count = state.config.load().sites.len();
-    let ready = site_count > 0;
+    let draining = state.draining.load(std::sync::atomic::Ordering::Relaxed);
+    let ready = site_count > 0 && !draining;
     let (status, body) = if ready {
         (
             StatusCode::OK,
             serde_json::json!({ "status": "ready", "sites": site_count }),
         )
     } else {
+        let reason = if draining {
+            "draining"
+        } else {
+            "config not synced"
+        };
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            serde_json::json!({ "status": "not_ready", "reason": "config not synced", "sites": 0 }),
+            serde_json::json!({ "status": "not_ready", "reason": reason, "sites": site_count }),
         )
     };
     Response::builder()
@@ -5519,6 +5567,47 @@ mod client_ip_tests {
         assert_eq!(
             resolve_client_ip_with(peer, &http::HeaderMap::new(), trusted),
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    // Proves the R6 shutdown drain lets an in-flight request FINISH rather than
+    // being severed by the runtime drop (the old abort() → 502-on-deploy bug).
+    #[tokio::test]
+    async fn conn_tracker_drain_waits_for_inflight() {
+        let tracker = tokio_util::task::TaskTracker::new();
+        let done = Arc::new(AtomicBool::new(false));
+        let d2 = Arc::clone(&done);
+        tracker.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await; // in-flight request
+            d2.store(true, Ordering::SeqCst);
+        });
+        tracker.close();
+        let r = tokio::time::timeout(Duration::from_secs(5), tracker.wait()).await;
+        assert!(r.is_ok(), "drain should complete within grace");
+        assert!(
+            done.load(Ordering::SeqCst),
+            "in-flight request must FINISH, not be severed"
+        );
+    }
+
+    // Proves the drain is BOUNDED — a stuck/idle keep-alive connection can't hang
+    // shutdown forever; the grace timeout closes it.
+    #[tokio::test]
+    async fn conn_tracker_drain_is_bounded() {
+        let tracker = tokio_util::task::TaskTracker::new();
+        tracker.spawn(async { std::future::pending::<()>().await });
+        tracker.close();
+        let r = tokio::time::timeout(Duration::from_millis(150), tracker.wait()).await;
+        assert!(
+            r.is_err(),
+            "drain must be bounded by grace on a stuck connection"
         );
     }
 }

@@ -11,6 +11,7 @@ kernel = ["sentinel-ebpf/kernel"]
 
 [dependencies]
 tokio = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
 tracing = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
