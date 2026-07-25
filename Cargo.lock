@@ -2347,6 +2347,7 @@ name = "sentinel-ml"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "bytes",
  "http",
  "http-body-util",

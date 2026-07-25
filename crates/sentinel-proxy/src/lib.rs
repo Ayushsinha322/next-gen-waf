@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::io::BufReader;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -4638,64 +4638,162 @@ fn log_request(ctx: &RequestContext) {
 // Per-second traffic accumulator → ClickHouse traffic_buckets
 // ---------------------------------------------------------------------------
 
-#[derive(Default)]
+/// Upper bounds (ms) of the per-site latency buckets. Mirrors the telemetry
+/// histogram's bounds so a site's p99 is comparable to the global one.
+const SITE_LAT_BOUNDS: [f64; 15] = [
+    0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10_000.0,
+    30_000.0,
+];
+const SITE_LAT_BUCKETS: usize = SITE_LAT_BOUNDS.len() + 1;
+
+/// Per-(tenant,site) counters for the current rollup window.
+///
+/// Every field is atomic so recording needs no exclusive access. Previously this
+/// struct was plain `u64`/`Vec<f64>` behind ONE process-wide
+/// `Mutex<HashMap<..>>`: with ClickHouse enabled every request serialized through
+/// that single lock, and each also pushed onto a `Vec` (up to 4096 f64s per site)
+/// that had to be sorted on every drain.
 struct SiteAccum {
-    reqs: u64,
-    blocked: u64,
-    lat: Vec<f64>,
+    reqs: AtomicU64,
+    blocked: AtomicU64,
+    /// Latency distribution as fixed buckets — bounded memory, no sorting, and no
+    /// per-site sample cap to distort p99 under load.
+    lat: [AtomicU64; SITE_LAT_BUCKETS],
 }
 
-// Keyed by (tenant, site) so per-tenant traffic never merges across tenants.
-static TRAFFIC_ACC: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<(String, String), SiteAccum>>,
-> = std::sync::OnceLock::new();
+impl SiteAccum {
+    fn new() -> Self {
+        Self {
+            reqs: AtomicU64::new(0),
+            blocked: AtomicU64::new(0),
+            lat: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
 
-fn traffic_acc() -> &'static std::sync::Mutex<std::collections::HashMap<(String, String), SiteAccum>>
-{
-    TRAFFIC_ACC.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    fn record(&self, blocked: bool, latency_ms: f64) {
+        self.reqs.fetch_add(1, Ordering::Relaxed);
+        if blocked {
+            self.blocked.fetch_add(1, Ordering::Relaxed);
+        }
+        if latency_ms > 0.0 {
+            let idx = SITE_LAT_BOUNDS
+                .iter()
+                .position(|b| latency_ms <= *b)
+                .unwrap_or(SITE_LAT_BUCKETS - 1);
+            self.lat[idx].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Atomically take and reset this window's tallies, returning
+    /// `(reqs, blocked, p99_ms)`.
+    fn take(&self) -> (u64, u64, f64) {
+        let reqs = self.reqs.swap(0, Ordering::Relaxed);
+        let blocked = self.blocked.swap(0, Ordering::Relaxed);
+        let counts: [u64; SITE_LAT_BUCKETS] =
+            std::array::from_fn(|i| self.lat[i].swap(0, Ordering::Relaxed));
+
+        let total: u64 = counts.iter().sum();
+        if total == 0 {
+            return (reqs, blocked, 0.0);
+        }
+        // Rank of the p99 observation, matching the previous ceil-based indexing.
+        let target = (((total as f64) * 0.99).ceil() as u64).saturating_sub(1);
+        let mut cumulative = 0u64;
+        for (i, &c) in counts.iter().enumerate() {
+            if c == 0 {
+                continue;
+            }
+            if cumulative + c > target {
+                // Report the bucket's upper bound: for a latency SLO an estimate
+                // must never read lower than the samples it represents.
+                return (
+                    reqs,
+                    blocked,
+                    SITE_LAT_BOUNDS
+                        .get(i)
+                        .copied()
+                        .unwrap_or(*SITE_LAT_BOUNDS.last().unwrap()),
+                );
+            }
+            cumulative += c;
+        }
+        (reqs, blocked, *SITE_LAT_BOUNDS.last().unwrap())
+    }
 }
 
-/// Record one request into the current second's tally. Latency samples are
-/// capped per (tenant,site) to bound memory under floods.
+// Keyed by "tenant\0site" so per-tenant traffic never merges across tenants. A
+// single string key (rather than a (String, String) tuple) lets the hot path look
+// the entry up by &str, so a hit borrows instead of allocating. DashMap shards
+// internally, so concurrent sites touch different locks.
+static TRAFFIC_ACC: std::sync::OnceLock<dashmap::DashMap<String, SiteAccum>> =
+    std::sync::OnceLock::new();
+
+fn traffic_acc() -> &'static dashmap::DashMap<String, SiteAccum> {
+    TRAFFIC_ACC.get_or_init(dashmap::DashMap::new)
+}
+
+thread_local! {
+    /// Scratch buffer for the composite key, so building it allocates once per
+    /// worker thread rather than once per request.
+    static TRAFFIC_KEY_BUF: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Record one request into the current window's tally.
+///
+/// Lock-free with respect to other requests for the same site: only atomic adds,
+/// under a DashMap shard read-guard.
 fn record_traffic(tenant: &str, site: &str, blocked: bool, latency_ms: f64) {
     // No sink → no accumulation (the drainer only runs when ClickHouse is on).
     if !CLICKHOUSE_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    if let Ok(mut m) = traffic_acc().lock() {
-        let e = m.entry((tenant.to_string(), site.to_string())).or_default();
-        e.reqs += 1;
-        if blocked {
-            e.blocked += 1;
+    TRAFFIC_KEY_BUF.with(|buf| {
+        let mut key = buf.borrow_mut();
+        key.clear();
+        key.push_str(tenant);
+        key.push('\0');
+        key.push_str(site);
+
+        // Fast path: entry exists, no allocation and no map mutation.
+        if let Some(acc) = traffic_acc().get(key.as_str()) {
+            acc.record(blocked, latency_ms);
+            return;
         }
-        if latency_ms > 0.0 && e.lat.len() < 4096 {
-            e.lat.push(latency_ms);
-        }
-    }
+        // First request for this site in this process — allocate the owned key once.
+        traffic_acc()
+            .entry(key.clone())
+            .or_insert_with(SiteAccum::new)
+            .record(blocked, latency_ms);
+    });
 }
 
 /// Drain the accumulator into one TrafficRow per site, stamped with `ts`.
+///
+/// Entries are reset in place rather than removed from the map. Removing them
+/// would race with an in-flight `record_traffic` holding a reference to the entry,
+/// silently discarding those requests; swapping each counter to zero cannot lose a
+/// completed increment. The key set is bounded by the number of configured sites,
+/// so retaining entries does not grow without bound.
 fn drain_traffic(ts: i64) -> Vec<sentinel_storage::TrafficRow> {
-    let mut m = match traffic_acc().lock() {
-        Ok(m) => m,
-        Err(_) => return Vec::new(),
-    };
-    let mut out = Vec::with_capacity(m.len());
-    for ((tenant, site), mut a) in m.drain() {
-        a.lat
-            .sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
-        let p99 = if a.lat.is_empty() {
-            0.0
-        } else {
-            let idx = (((a.lat.len() as f64) * 0.99).ceil() as usize).saturating_sub(1);
-            a.lat[idx.min(a.lat.len() - 1)]
+    let acc = traffic_acc();
+    let mut out = Vec::with_capacity(acc.len());
+    for entry in acc.iter() {
+        let (reqs, blocked, p99) = entry.value().take();
+        // Nothing happened for this site in this window — emit no row rather than
+        // a misleading all-zero one.
+        if reqs == 0 {
+            continue;
+        }
+        let (tenant, site) = match entry.key().split_once('\0') {
+            Some((t, s)) => (t.to_string(), s.to_string()),
+            None => continue,
         };
         out.push(sentinel_storage::TrafficRow {
             ts,
             tenant,
             site_id: site,
-            reqs: a.reqs as i64,
-            blocked: a.blocked as i64,
+            reqs: reqs as i64,
+            blocked: blocked as i64,
             p99_ms: p99,
         });
     }
