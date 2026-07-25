@@ -89,7 +89,7 @@ func openDBWithRetry(ctx context.Context, log *zap.Logger, cfg db.Config, maxWai
 		log.Warn("DB not ready yet — retrying",
 			zap.Int("attempt", attempt),
 			zap.Duration("next_retry_in", backoff),
-			zap.Error(err))
+			zap.String("error", safeErr(err)))
 		select {
 		case <-time.After(backoff):
 		case <-ctx.Done():
@@ -154,7 +154,10 @@ func run() error {
 		// instead of dropping straight into degraded mode on the first ping.
 		pool, dbErr = openDBWithRetry(ctx, log, db.Config{URL: dbURL, MaxConns: 20, MinConns: 2}, dbConnectMaxWait())
 		if dbErr != nil {
-			log.Warn("DB unavailable — running in degraded mode (mock data only)", zap.Error(dbErr))
+			// safeErr, not zap.Error: a connect/parse failure can quote the DSN
+			// it choked on, which would put the password in the log.
+			log.Warn("DB unavailable — running in degraded mode (mock data only)",
+				zap.String("error", safeErr(dbErr)))
 		} else {
 			log.Info("DB connected", zap.String("url", maskPassword(dbURL)))
 			store = db.NewStore(pool)
@@ -650,10 +653,6 @@ func envOrDefault(key, def string) string {
 		return v
 	}
 	return def
-}
-
-func maskPassword(dsn string) string {
-	return dsn
 }
 
 // alertingConfigFromEnv builds the alert-engine thresholds from optional env
