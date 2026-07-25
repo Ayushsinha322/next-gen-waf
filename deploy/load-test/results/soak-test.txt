@@ -1,0 +1,27 @@
+── Sentinel WAF soak ─────────────────────────────────────────────────
+date     : 2026-07-25T21:57:44+05:30
+host     : 16 cores · AMD Ryzen 7 7730U with Radeon Graphics
+waf cores: 0-3   generator: 12-15   origin: 8-11
+duration : 30m at a bounded 1200/s (below saturation, on purpose)
+purpose  : prove metrics memory is constant after the histogram fix
+
+start RSS: 42348 kB
+
+Requests      [total, rate, throughput]         2160001, 1200.00, 1200.00
+Duration      [total, attack, wait]             30m0s, 30m0s, 1.236ms
+Latencies     [min, mean, 50, 90, 95, 99, max]  803.151µs, 2.046ms, 1.961ms, 2.685ms, 2.903ms, 3.582ms, 52.326ms
+Success       [ratio]                           100.00%
+Status Codes  [code:count]                      200:2160001  
+
+── Memory ─────────────────────────────────────────────────────────────
+start RSS : 42348 kB
+end   RSS : 70488 kB
+  (excluding first 300s of warmup: 10 of 60 samples dropped)
+  samples   : 50 over 1770s
+  min / max : 70160 / 70488 kB   (spread 328 kB)
+  slope     : +0.74 MiB/hour
+  growth    : +0.47% across the steady-state window
+
+  VERDICT: memory is FLAT. The unbounded histogram leak is gone.
+  threads   : 6 -> 6 (constant)
+  fds       : min 21 max 85, slope -0.0093/s (churn, not a leak)
