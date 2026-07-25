@@ -29,6 +29,14 @@ spec:
   affinity:
     enablePodAntiAffinity: true
     topologyKey: kubernetes.io/hostname
+    # CNPG manages its pods directly, so the 300s default applies here too. The
+    # operator promotes a standby quickly, but the pod on the dead node would
+    # otherwise linger for five minutes before being replaced, leaving the cluster
+    # a replica short (and therefore unable to satisfy minSyncReplicas) far longer
+    # than necessary.
+    tolerations:
+      - { key: node.kubernetes.io/not-ready,   operator: Exists, effect: NoExecute, tolerationSeconds: 20 }
+      - { key: node.kubernetes.io/unreachable, operator: Exists, effect: NoExecute, tolerationSeconds: 20 }
   bootstrap:
     initdb:
       database: sentinel
@@ -45,16 +53,16 @@ spec:
 # cross-fleet shared counter is lost. So a Redis outage degrades gracefully, it
 # doesn't drop protection.
 #
-# For fleet-wide shared limits with HA, run a Redis with automatic failover via
-# an operator (recommended) rather than a single pod, e.g. the Redis Operator:
-#   helm repo add ot-helm https://ot-container-kit.github.io/helm-charts/
-#   helm install redis-operator ot-helm/redis-operator -n sentinel
-# then a RedisReplication (1 master + 2 replicas) + RedisSentinel for failover,
-# exposing a Service named `sentinel-redis` (referenced by the data plane's
-# SENTINEL_REDIS_URL). A single-pod Redis is acceptable ONLY for a pilot.
-#
-# Baseline below: a single-pod `sentinel-redis` so the set applies out of the box.
-# Swap it for the operator (RedisReplication + Sentinel) for true Redis HA.
+# DECISION: a single stateless pod is the right answer here, not Sentinel or a
+# Redis operator. Redis stores only 1-second sliding-window counters with
+# persistence disabled, so there is no data worth replicating and no PVC pinning it
+# to a node — Kubernetes reschedules it freely and an empty cache costs nothing.
+# The real exposure was never replication but the 300s default reschedule delay
+# after a node dies, which is fixed by the tolerations below. Adding Sentinel would
+# mean 6 pods and a Rust client rework (redis 0.24's Sentinel support hands back a
+# non-reconnecting MultiplexedConnection) to shave a window that is already covered
+# by the client's in-memory fallback. See the DO-NOT-RAISE note on replicas below —
+# scaling this Deployment to 2 silently breaks limit accuracy.
 ---
 apiVersion: v1
 kind: Service
@@ -74,15 +82,61 @@ metadata:
   namespace: sentinel
   labels: { app: sentinel, tier: redis }
 spec:
-  replicas: 1                       # single pod baseline — see operator note above for HA
+  # ── DO NOT RAISE THIS TO 2 ───────────────────────────────────────────────────
+  #
+  # This looks like the obvious "make Redis HA" change and it is actively harmful.
+  # Redis is not multi-master: two pods behind one Service are two INDEPENDENT
+  # caches, and the Service round-robins between them. Fleet-wide rate limiting
+  # would then see roughly half of each client's requests in either cache, so a
+  # 100 rps limit would admit ~200 rps — a silent loss of enforcement accuracy
+  # that looks like a redundancy improvement.
+  #
+  # Redis Sentinel was considered and deliberately NOT adopted. Sentinel exists to
+  # replicate DATA and promote a master; here there is no data worth replicating
+  # (persistence is off and the sliding windows are 1 second long), the client
+  # already degrades safely to an in-memory limiter on any Redis error
+  # (crates/sentinel-modules/src/rate_limit/mod.rs), and the Rust client would need
+  # reworking because redis 0.24's Sentinel support returns a non-reconnecting
+  # MultiplexedConnection rather than the ConnectionManager in use. The fast
+  # reschedule configured below addresses the actual exposure instead.
+  #
+  # Redis holds no durable state, so it needs no PVC and is not pinned to a node —
+  # Kubernetes reschedules it freely, and an empty cache after a restart is
+  # harmless.
+  replicas: 1
   selector:
     matchLabels: { app: sentinel, tier: redis }
   template:
     metadata:
       labels: { app: sentinel, tier: redis }
     spec:
+      # ── Fast reschedule after a NODE dies ────────────────────────────────────
+      #
+      # Kubernetes' default tolerations for node.kubernetes.io/not-ready and
+      # /unreachable are 300 SECONDS. Nothing here overrode them, so when a VM
+      # died every pod on it sat un-rescheduled for five minutes — regardless of
+      # replicated storage, PodDisruptionBudgets, or how quickly the node was
+      # detected as gone.
+      #
+      # For Redis that meant five minutes of rate limiting falling back to the
+      # per-node in-memory limiter, so with 3 data-plane pods a 100 rps cap
+      # behaved like ~300 rps for that whole window. This 20s toleration is the
+      # single highest-leverage HA change in this file: it cuts the node-death
+      # recovery window from ~5 minutes to ~30 seconds for every pod that carries
+      # it, which is far more than Redis replication would have bought.
+      #
+      # Do not shorten much below 20s: a brief control-plane hiccup or a node
+      # under momentary memory pressure can mark a healthy node NotReady, and an
+      # over-eager value turns that into needless pod churn.
+      tolerations:
+        - { key: node.kubernetes.io/not-ready,   operator: Exists, effect: NoExecute, tolerationSeconds: 20 }
+        - { key: node.kubernetes.io/unreachable, operator: Exists, effect: NoExecute, tolerationSeconds: 20 }
       containers:
         - name: redis
+          # MUST STAY replicas: 1 — see the note above the Deployment. Redis holds
+          # only 1-second sliding windows with persistence disabled, so there is no
+          # data to replicate; what matters is that a Redis endpoint exists, which
+          # the toleration above restores in ~30s instead of ~5min.
           image: redis:7-alpine
           args: ["redis-server", "--save", "", "--appendonly", "no"]   # ephemeral rate-limit state
           ports:
@@ -98,8 +152,17 @@ spec:
 # ── ClickHouse (searchable event history — Threat Search) ─────────────────────
 # The data plane WRITES traffic + WAF events here; the control plane READS them.
 # Optional: without it, protection is unaffected but /events search is disabled.
-# Single-node StatefulSet baseline; for HA use a replicated ClickHouse (Altinity
-# operator / ClickHouse Keeper cluster) and a networked StorageClass.
+#
+# DECISION: HA for ClickHouse is handled at the STORAGE layer (one replica, on the
+# `sentinel-replicated` StorageClass from 05-storage.yaml), not by ClickHouse Keeper
+# + ReplicatedMergeTree. Keeper-based replication was considered and rejected for
+# this component: it needs 3 Keeper pods, a MergeTree -> ReplicatedMergeTree schema
+# migration and a two-replica write path, all to protect a store whose loss costs
+# only Threat Search queries — protection never reads from ClickHouse. Replicated
+# storage gives no event loss and recovery in roughly a pod reschedule, which is the
+# right trade here. It does require a replicated CSI driver; if none is installed,
+# comment out storageClassName below and event history simply loses node-loss
+# durability (see 05-storage.yaml).
 apiVersion: v1
 kind: Service
 metadata:
@@ -128,6 +191,14 @@ spec:
     metadata:
       labels: { app: sentinel, tier: clickhouse }
     spec:
+      # Replicated storage lets the volume follow the pod to a surviving node, but
+      # only AFTER the pod is rescheduled — which the 300s default delayed by five
+      # minutes, negating most of the benefit. See 30-datastores.yaml Redis note.
+      # Cut the node-death recovery window from the Kubernetes default of 300s to
+      # ~30s. See the full rationale in 30-datastores.yaml (Redis Deployment).
+      tolerations:
+        - { key: node.kubernetes.io/not-ready,   operator: Exists, effect: NoExecute, tolerationSeconds: 20 }
+        - { key: node.kubernetes.io/unreachable, operator: Exists, effect: NoExecute, tolerationSeconds: 20 }
       containers:
         - name: clickhouse
           image: clickhouse/clickhouse-server:24-alpine
@@ -153,4 +224,12 @@ spec:
     - metadata: { name: chdata }
       spec:
         accessModes: [ReadWriteOnce]
+        # Replicated storage (see 05-storage.yaml): ClickHouse runs as a single
+        # replica and does NOT replicate itself, so its data must survive a node
+        # loss at the STORAGE layer. On local-path a node death would strand this
+        # volume and take Threat Search offline until the node returned. If you
+        # have not installed a replicated CSI provider yet, comment this line out
+        # to fall back to the default (local-path) — the WAF still runs; only
+        # event history/Threat Search loses node-loss durability.
+        storageClassName: sentinel-replicated
         resources: { requests: { storage: 20Gi } }

@@ -19,6 +19,7 @@ kind: Kustomization
 
 resources:
   - 00-namespace-config.yaml   # Namespace + proxy ConfigMap + Secret
+  - 05-storage.yaml            # replicated StorageClass (needs OpenEBS/Longhorn installed first)
   - 30-datastores.yaml         # Postgres (CNPG) + Redis + ClickHouse
   - 20-controlplane.yaml       # 3-node Raft control plane
   - 10-dataplane.yaml          # WAF fleet (Deployment ×3 + HPA + PDB)

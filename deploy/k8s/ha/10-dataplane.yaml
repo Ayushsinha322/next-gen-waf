@@ -52,6 +52,11 @@ spec:
           labelSelector:
             matchLabels: { app: sentinel, tier: dataplane }
       terminationGracePeriodSeconds: 30   # drain in-flight connections on shutdown
+      # Cut the node-death recovery window from the Kubernetes default of 300s to
+      # ~30s. See the full rationale in 30-datastores.yaml (Redis Deployment).
+      tolerations:
+        - { key: node.kubernetes.io/not-ready,   operator: Exists, effect: NoExecute, tolerationSeconds: 20 }
+        - { key: node.kubernetes.io/unreachable, operator: Exists, effect: NoExecute, tolerationSeconds: 20 }
       containers:
         - name: dataplane
           image: registry.example.com/sentinel/dataplane:latest   # push your image here

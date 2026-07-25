@@ -1,0 +1,26 @@
+# Single Postgres instance.
+#
+# minSyncReplicas MUST drop to 0. The base sets it to 1, meaning a commit is not
+# acknowledged until a synchronous standby has it — with one instance there is no
+# standby, so every write would block forever. This is the single most important
+# line in this overlay: get it wrong and the control plane appears to hang rather
+# than fail.
+#
+# The tradeoff is explicit: one instance means no automatic failover and no
+# replica-based durability. Recovery is from backup. That is the accepted posture for
+# the 1-VM topology — see README.md.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: sentinel-postgres
+  namespace: sentinel
+spec:
+  instances: 1
+  minSyncReplicas: 0
+  maxSyncReplicas: 0
+  affinity:
+    # Nothing to spread; anti-affinity with one instance would be a no-op at best.
+    enablePodAntiAffinity: false
+    tolerations:
+      - { key: node.kubernetes.io/not-ready,   operator: Exists, effect: NoExecute, tolerationSeconds: 20 }
+      - { key: node.kubernetes.io/unreachable, operator: Exists, effect: NoExecute, tolerationSeconds: 20 }

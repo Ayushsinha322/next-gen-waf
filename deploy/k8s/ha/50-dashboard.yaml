@@ -34,6 +34,11 @@ spec:
     metadata:
       labels: { app: sentinel, tier: dashboard }
     spec:
+      # Cut the node-death recovery window from the Kubernetes default of 300s to
+      # ~30s. See the full rationale in 30-datastores.yaml (Redis Deployment).
+      tolerations:
+        - { key: node.kubernetes.io/not-ready,   operator: Exists, effect: NoExecute, tolerationSeconds: 20 }
+        - { key: node.kubernetes.io/unreachable, operator: Exists, effect: NoExecute, tolerationSeconds: 20 }
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:

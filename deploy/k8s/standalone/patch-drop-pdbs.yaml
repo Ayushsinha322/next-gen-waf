@@ -1,0 +1,25 @@
+# PodDisruptionBudgets removed.
+#
+# At one replica a PDB cannot be satisfied, so instead of protecting availability it
+# makes `kubectl drain` and node upgrades hang forever. On a single node there is no
+# other node to maintain availability with, so the budget has nothing to express.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sentinel-dataplane-pdb
+  namespace: sentinel
+$patch: delete
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sentinel-controlplane-pdb
+  namespace: sentinel
+$patch: delete
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sentinel-dashboard-pdb
+  namespace: sentinel
+$patch: delete

@@ -1,0 +1,46 @@
+# Sentinel WAF — 1-VM STANDALONE (single-node k3s).
+#
+#   kubectl apply -k deploy/k8s/standalone
+#
+# Same hardened build and the same security posture as the 3-VM HA topology — TLS to
+# Postgres, no cleartext management plane, tamper-evident audit log. What it does NOT
+# have is survival of the machine dying. That is the whole difference.
+#
+# This is an OVERLAY on deploy/k8s/ha, not a copy, so security fixes made there
+# reach this topology automatically instead of drifting.
+#
+# The HA base cannot be applied unchanged to one node — it would half-deploy and look
+# broken for reasons that have nothing to do with the WAF:
+#
+#   • The control-plane StatefulSet uses REQUIRED pod anti-affinity, so on one node
+#     exactly one of its 3 pods schedules and the other two stay Pending forever.
+#   • CloudNativePG runs 3 instances with anti-affinity and minSyncReplicas: 1 — on
+#     one node two instances stay Pending and the primary cannot satisfy its
+#     synchronous-replica requirement, so writes block.
+#   • ClickHouse's PVC asks for the `sentinel-replicated` StorageClass (RF=3), which
+#     cannot be provisioned with a single node, so the PVC stays Pending.
+#   • PodDisruptionBudgets with minAvailable: 2 against 1 replica make every voluntary
+#     eviction impossible, so `kubectl drain` and node upgrades hang indefinitely.
+#   • The data-plane HPA has minReplicas: 3 and would immediately scale back up.
+#
+# Every one of those is corrected below.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../ha
+
+patches:
+  # Scale every tier to one replica and remove the constraints that only make sense
+  # with multiple failure domains.
+  - path: patch-single-replica.yaml
+  - path: patch-postgres-single.yaml
+  - path: patch-clickhouse-local-storage.yaml
+  # PodDisruptionBudgets are actively harmful at one replica: they cannot be
+  # satisfied, so they block drains rather than protecting availability. On a single
+  # node there is nothing to protect availability *with*.
+  - path: patch-drop-pdbs.yaml
+  # The autoscaler's floor of 3 would undo the scale-down. Removed rather than
+  # retuned: on one node there is no spare capacity to scale into, and it also
+  # requires metrics-server.
+  - path: patch-drop-hpa.yaml
