@@ -657,6 +657,16 @@ func handleCreateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 	if req.WafPolicy == nil {
 		req.WafPolicy = json.RawMessage(`{"mode":"blocking","paranoia_level":2,"anomaly_threshold":5}`)
 	}
+	// Validate BEFORE committing. An unconvertible site used to be accepted here
+	// and then silently dropped by the data-plane config sync, leaving the site
+	// unprotected while the dashboard still showed it active.
+	if problems := validateSiteConfig(req.Name, req.Domains, req.Upstream, req.WafPolicy); len(problems) > 0 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":    "site configuration is not usable by the data plane",
+			"problems": problems,
+		})
+		return
+	}
 	if !requireLeader(c, cl) {
 		return
 	}
@@ -695,7 +705,7 @@ func handleGetSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 	c.JSON(http.StatusOK, gin.H{"site": site})
 }
 
-func handleUpdateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *leader.Elector) {
+func handleUpdateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *leader.Elector, log *zap.Logger) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceSite, rbac.ActionUpdate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
@@ -711,9 +721,27 @@ func handleUpdateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	// Validate the MERGED result, not just the submitted fields: a patch can be
+	// individually fine yet produce an unusable site when combined with what is
+	// already stored (e.g. replacing a good upstream with an empty one).
+	cur, curErr := store.GetSite(c.Request.Context(), claims.TenantID, siteID)
+	if curErr != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "site not found"})
+		return
+	}
+	name, domains, upstream, waf := mergedSiteForValidation(*cur, req)
+	if problems := validateSiteConfig(name, domains, upstream, waf); len(problems) > 0 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":    "the resulting site configuration is not usable by the data plane",
+			"problems": problems,
+		})
+		return
+	}
 	if !requireLeader(c, cl) {
 		return
 	}
+	// Record an undo point before changing live protection settings.
+	snapshotBeforeMutation(c, store, log, "site.update")
 	site, err := store.UpdateSite(c.Request.Context(), claims.TenantID, claims.UserID, siteID, req)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -730,7 +758,63 @@ func handleUpdateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 	c.JSON(http.StatusOK, gin.H{"site": site})
 }
 
-func handleDeleteSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *leader.Elector) {
+// handleValidateSite is the dry-run endpoint: it reports whether a proposed site
+// configuration would be accepted and usable, without writing anything.
+//
+// This exists so an operator (or Config-as-Code pipeline) can check a change
+// before applying it, instead of discovering at sync time that a site quietly
+// stopped being protected.
+func handleValidateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
+	claims, _ := auth.GetClaims(c.Request.Context())
+	// Dry-run mutates nothing, but it reveals whether a config is viable, so gate
+	// it on the same permission as the write it previews.
+	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceSite, rbac.ActionUpdate) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
+		return
+	}
+
+	var req struct {
+		// SiteID, when set, validates a PATCH against the stored site.
+		SiteID    string          `json:"site_id"`
+		Name      string          `json:"name"`
+		Domains   []string        `json:"domains"`
+		Upstream  json.RawMessage `json:"upstream"`
+		WafPolicy json.RawMessage `json:"waf_policy"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	name, domains, upstream, waf := req.Name, req.Domains, req.Upstream, req.WafPolicy
+	if req.SiteID != "" {
+		if store == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
+			return
+		}
+		cur, err := store.GetSite(c.Request.Context(), claims.TenantID, req.SiteID)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "site not found"})
+			return
+		}
+		patch := db.UpdateSiteRequest{Domains: req.Domains, Upstream: req.Upstream, WafPolicy: req.WafPolicy}
+		if req.Name != "" {
+			patch.Name = &req.Name
+		}
+		name, domains, upstream, waf = mergedSiteForValidation(*cur, patch)
+	}
+
+	problems := validateSiteConfig(name, domains, upstream, waf)
+	// 200 either way: the dry-run itself succeeded. `valid` carries the verdict, so
+	// a client cannot mistake "your config is bad" for "the request failed".
+	c.JSON(http.StatusOK, gin.H{
+		"valid":    len(problems) == 0,
+		"problems": problems,
+		"resolved": gin.H{"name": name, "domains": domains},
+	})
+}
+
+func handleDeleteSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *leader.Elector, log *zap.Logger) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceSite, rbac.ActionDelete) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
@@ -744,6 +828,8 @@ func handleDeleteSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 	if !requireLeader(c, cl) {
 		return
 	}
+	// Record an undo point before removing a site from protection.
+	snapshotBeforeMutation(c, store, log, "site.delete")
 	if err := store.DeleteSite(c.Request.Context(), claims.TenantID, siteID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -994,7 +1080,7 @@ func internalSecretOK(c *gin.Context) bool {
 // REST port must not leak site topology (upstreams, rules) to anyone who can
 // reach it. Returns the sites in a format the proxy deserializes into
 // Vec<SiteConfig>.
-func handleInternalConfig(c *gin.Context, store *db.Store) {
+func handleInternalConfig(c *gin.Context, store *db.Store, log *zap.Logger) {
 	if !internalSecretOK(c) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
 		return
@@ -1011,12 +1097,35 @@ func handleInternalConfig(c *gin.Context, store *db.Store) {
 		return
 	}
 	rustSites := make([]map[string]any, 0, len(sites))
+	// Sites that cannot be converted are REPORTED, not silently skipped.
+	//
+	// This loop used to `continue` on error, so a site with malformed upstream or
+	// waf_policy JSON simply vanished from the config the data plane received: no
+	// error, no log, no alert. The dashboard still listed it as active while it was
+	// no longer protected — a config error that failed open and was invisible.
+	//
+	// Writes are now validated (see validateSiteConfig), so new records cannot get
+	// into this state. This remains the backstop for records written before that
+	// validation existed, and it is deliberately noisy.
+	skipped := make([]map[string]any, 0)
 	for _, s := range sites {
 		if s.Status == "paused" || s.Status == "deleted" {
 			continue
 		}
 		rs, err := siteRowToRustConfig(s)
 		if err != nil {
+			log.Error("CONFIG SYNC: site is UNPROTECTED — its stored configuration cannot be "+
+				"converted for the data plane and is being excluded from the sync",
+				zap.String("site", s.Name),
+				zap.String("site_id", s.ID),
+				zap.String("tenant_id", s.TenantID),
+				zap.Error(err))
+			skipped = append(skipped, map[string]any{
+				"site_id":   s.ID,
+				"name":      s.Name,
+				"tenant_id": s.TenantID,
+				"error":     err.Error(),
+			})
 			continue
 		}
 		rustSites = append(rustSites, rs)
@@ -1029,10 +1138,17 @@ func handleInternalConfig(c *gin.Context, store *db.Store) {
 	if verr != nil {
 		version = time.Now().UnixNano()
 	}
-	c.JSON(http.StatusOK, gin.H{
+	resp := gin.H{
 		"version": version,
 		"sites":   rustSites,
-	})
+	}
+	// Surfaced in the response as well as the log, so the condition is observable
+	// by the data plane and by anyone curling this endpoint — not just by whoever
+	// happens to be reading control-plane logs.
+	if len(skipped) > 0 {
+		resp["skipped_sites"] = skipped
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // handleProxyHealth probes the local WAF proxy's /healthz endpoint and

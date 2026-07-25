@@ -488,10 +488,19 @@ func run() error {
 		protected.GET("/sites/export", func(c *gin.Context) { handleExportSites(c, enforcer, store) })
 		protected.POST("/sites/import", func(c *gin.Context) { handleImportSites(c, enforcer, store, hub, cl) })
 		protected.POST("/sites", func(c *gin.Context) { handleCreateSite(c, enforcer, store, hub, cl) })
+		// Dry run: report whether a proposed site config would be accepted and
+		// usable, without writing. Registered before /sites/:id so "validate" is
+		// not captured as an :id.
+		protected.POST("/sites/validate", func(c *gin.Context) { handleValidateSite(c, enforcer, store) })
+		// Config rollback points: list, and restore one.
+		protected.GET("/config/versions", func(c *gin.Context) { handleListConfigVersions(c, enforcer, store) })
+		protected.POST("/config/versions/:id/rollback", func(c *gin.Context) {
+			handleRollbackConfig(c, enforcer, store, hub, cl, log)
+		})
 		protected.GET("/sites/:id", func(c *gin.Context) { handleGetSite(c, enforcer, store) })
-		protected.PUT("/sites/:id", func(c *gin.Context) { handleUpdateSite(c, enforcer, store, hub, cl) })
-		protected.PATCH("/sites/:id", func(c *gin.Context) { handleUpdateSite(c, enforcer, store, hub, cl) })
-		protected.DELETE("/sites/:id", func(c *gin.Context) { handleDeleteSite(c, enforcer, store, hub, cl) })
+		protected.PUT("/sites/:id", func(c *gin.Context) { handleUpdateSite(c, enforcer, store, hub, cl, log) })
+		protected.PATCH("/sites/:id", func(c *gin.Context) { handleUpdateSite(c, enforcer, store, hub, cl, log) })
+		protected.DELETE("/sites/:id", func(c *gin.Context) { handleDeleteSite(c, enforcer, store, hub, cl, log) })
 		protected.PATCH("/sites/:id/status", func(c *gin.Context) { handleUpdateSiteStatus(c, enforcer, store, hub, cl) })
 		protected.POST("/sites/:id/exclusions", func(c *gin.Context) { handleAddSiteExclusion(c, enforcer, store, hub, cl) })
 		protected.DELETE("/sites/:id/exclusions/:rule_id", func(c *gin.Context) { handleDeleteSiteExclusion(c, enforcer, store, hub, cl) })
@@ -596,7 +605,7 @@ func run() error {
 	// Internal config endpoint — called by the Rust data-plane proxy for site
 	// hot-sync. No JWT: the proxy runs on the same host (or private network).
 	// In production, protect this with mTLS or a network policy.
-	router.GET("/api/v1/internal/config", func(c *gin.Context) { handleInternalConfig(c, store) })
+	router.GET("/api/v1/internal/config", func(c *gin.Context) { handleInternalConfig(c, store, log) })
 
 	// Internal threat-intel endpoint — the data plane hot-syncs the active IOC
 	// set from here (same shared-secret gate as /internal/config).
