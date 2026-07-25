@@ -989,6 +989,13 @@ textarea.fin2 { resize:vertical; min-height:80px; line-height:1.6; }
 .msg2.ai  .mbbl2 { background:rgba(124,58,237,.16); border:1px solid rgba(124,58,237,.28); color:var(--text); border-radius:3px 12px 12px 12px; }
 .msg2.usr .mbbl2 { background:rgba(0,212,255,.12); border:1px solid rgba(0,212,255,.24); color:var(--text); border-radius:12px 3px 12px 12px; }
 
+/* Copilot markdown output (lib/safeMarkdown.ts). These are classes rather than
+   inline style attributes so the injected HTML carries no style of its own. */
+.cp-code { background:rgba(255,255,255,.08); padding:1px 5px; border-radius:3px; font-size:12px; font-family:'JetBrains Mono',monospace; }
+.cp-pre  { background:rgba(0,0,0,.3); padding:8px; border-radius:6px; font-size:12px; margin:5px 0; overflow-x:auto; white-space:pre-wrap; font-family:'JetBrains Mono',monospace; }
+[data-theme='light'] .cp-code { background:rgba(0,0,0,.06); }
+[data-theme='light'] .cp-pre  { background:rgba(0,0,0,.05); }
+
 /* ═══════════════════════════════════════════
    LOGIN PAGE — cyberpunk fortress
 ═══════════════════════════════════════════ */

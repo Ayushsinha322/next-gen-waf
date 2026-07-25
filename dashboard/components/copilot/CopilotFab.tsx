@@ -4,14 +4,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { GREET, askCopilot } from "@/lib/copilot";
 import type { ChatMessage } from "@/lib/types";
 import { spring } from "@/lib/animations";
-
-function formatMsg(text: string) {
-  return text
-    .replace(/\n/g, "<br>")
-    .replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>")
-    .replace(/`(.*?)`/g, '<code style="background:rgba(255,255,255,.08);padding:1px 5px;border-radius:3px;font-size:12px">$1</code>')
-    .replace(/```([\s\S]*?)```/g, '<pre style="background:rgba(0,0,0,.3);padding:8px;border-radius:6px;font-size:12px;margin:5px 0;overflow-x:auto;white-space:pre-wrap">$1</pre>');
-}
+import { renderCopilotMarkdown } from "@/lib/safeMarkdown";
 
 const QUICK_LABELS: Record<string, string> = {
   explain: "Explain the latest alert",
@@ -108,7 +101,7 @@ export default function CopilotFab({ variant = "login" }: { variant?: "login" | 
                 <motion.div key={i} className={`msg ${m.who}`} initial={{ opacity: 0, y: 6, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} transition={{ duration: 0.22 }}>
                   <div className={`mav ${m.who}`}>{m.who === "ai" ? "🤖" : "👤"}</div>
                   <div>
-                    <div className="mbbl" dangerouslySetInnerHTML={{ __html: formatMsg(m.text) }} />
+                    <div className="mbbl" dangerouslySetInnerHTML={{ __html: renderCopilotMarkdown(m.text) }} />
                     <div style={{ fontSize: 10, color: "var(--text3)", marginTop: 3, textAlign: m.who === "usr" ? "right" : "left" }}>{m.time}</div>
                   </div>
                 </motion.div>

@@ -1,16 +1,18 @@
-// Real AI Copilot backend client.
+// Client-side AI Copilot facade.
 //
 // Every answer is generated live by the model behind the enlight LLM gateway
 // (DeepSeek-R1). There are deliberately NO canned responses and NO hard-coded
 // statistics in this module: if the gateway is unreachable or unconfigured the
 // call throws and the UI surfaces the error verbatim, rather than inventing a
 // plausible-looking reply or fabricated metrics.
+//
+// SECURITY: this file runs in the browser, so it holds no credential and knows
+// no external endpoint. It posts to our own /api/copilot, which authenticates
+// the caller and then talks to the gateway server-side. Do not reintroduce a
+// NEXT_PUBLIC_* API key here — Next.js inlines those into the client bundle,
+// which would serve the gateway credential to every browser.
 
 export const COPILOT_MODEL = "deepseek-r1:8b";
-export const COPILOT_ENDPOINT = "https://ai.enlight.dev/api/chat/completions";
-
-const SYSTEM_PROMPT =
-  "You are Sentinel AI Copilot, an elite cybersecurity assistant integrated into an enterprise Web Application Firewall (WAF). Your job is to analyze SQLi, XSS, and DDoS threats, explain logs, and help write WAF rules. Keep answers concise, technical, and accurate. Do not hallucinate.";
 
 // Opening message. Note: the model name below is the real one wired above — no
 // throughput / detection numbers are quoted because none are measured here.
@@ -23,42 +25,25 @@ export interface CopilotTurn {
 }
 
 /**
- * Send the running conversation plus a new user message to the live model and
- * return its reply. Throws on transport or API errors so callers can show the
- * real failure instead of a fabricated answer.
+ * Send the running conversation plus a new user message to the model (via our
+ * server-side proxy) and return its reply. Throws on transport or API errors so
+ * callers can show the real failure instead of a fabricated answer.
  */
 export async function askCopilot(history: CopilotTurn[], text: string): Promise<string> {
-  const key = process.env.NEXT_PUBLIC_ENLIGHT_API_KEY;
-  if (!key) {
-    throw new Error("Copilot is not configured — NEXT_PUBLIC_ENLIGHT_API_KEY is unset.");
-  }
-
-  const res = await fetch(COPILOT_ENDPOINT, {
+  const res = await fetch("/api/copilot", {
     method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
-    body: JSON.stringify({
-      model: COPILOT_MODEL,
-      messages: [{ role: "system", content: SYSTEM_PROMPT }, ...history, { role: "user", content: text }],
-    }),
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ history, text }),
   });
 
   const data: unknown = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const err = data as { error?: { message?: string } };
-    throw new Error(`API ${res.status}: ${err.error?.message ?? JSON.stringify(data)}`);
-  }
+  const d = data as { reply?: string; error?: string };
 
-  const d = data as {
-    choices?: { message?: { content?: string } }[];
-    response?: string;
-    content?: string;
-    message?: string;
-  };
-  return (
-    d.choices?.[0]?.message?.content ??
-    d.response ??
-    d.content ??
-    d.message ??
-    `⚠️ Unexpected response format: ${JSON.stringify(data).slice(0, 300)}`
-  );
+  if (!res.ok) {
+    throw new Error(d.error ?? `Copilot request failed (${res.status})`);
+  }
+  if (typeof d.reply !== "string") {
+    throw new Error(`⚠️ Unexpected response format: ${JSON.stringify(data).slice(0, 300)}`);
+  }
+  return d.reply;
 }

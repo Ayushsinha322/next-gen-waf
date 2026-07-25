@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { headers } from "next/headers";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -7,11 +8,17 @@ export const metadata: Metadata = {
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
+  // Per-request CSP nonce minted in middleware.ts. The inline script below is
+  // the only hand-written one in the app and needs the nonce to execute under
+  // the policy; Next.js nonces the scripts it injects itself.
+  const nonce = headers().get("x-nonce") ?? undefined;
+
   return (
     <html lang="en" suppressHydrationWarning>
       <head>
         {/* FOUC prevention — must be first, blocking, inline */}
         <script
+          nonce={nonce}
           dangerouslySetInnerHTML={{
             __html: `try{var t=localStorage.getItem('sentinel-theme')||'dark';document.documentElement.setAttribute('data-theme',t);}catch(e){}`,
           }}

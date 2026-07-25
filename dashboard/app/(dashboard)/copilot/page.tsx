@@ -3,10 +3,7 @@ import { useState, useRef, useEffect } from "react";
 import { motion } from "framer-motion";
 import { GREET, askCopilot } from "@/lib/copilot";
 import { spring } from "@/lib/animations";
-
-function fmt(text: string) {
-  return text.replace(/\n/g,"<br>").replace(/\*\*(.*?)\*\*/g,"<strong>$1</strong>").replace(/`(.*?)`/g,'<code style="background:rgba(255,255,255,.08);padding:1px 5px;border-radius:3px;font-size:12px">$1</code>').replace(/```([\s\S]*?)```/g,'<pre style="background:rgba(0,0,0,.3);padding:8px;border-radius:6px;font-size:12px;margin:5px 0;overflow-x:auto;white-space:pre-wrap">$1</pre>');
-}
+import { renderCopilotMarkdown } from "@/lib/safeMarkdown";
 
 const CONVOS = ["SQLi on /api/login","Log4Shell probe analysis","False positive CRS-920420","Rate limit tuning","CVE-2024-1234 patch","Bot detector JA4 tune"];
 const QUICK_ACTIONS = [["explain","🔍 Explain Alert"],["rule","📝 Write Rule"],["report","📊 Threat Summary"],["fp","🐛 Fix False Positive"],["patch","⚡ Patch CVE"],["tune","⚙️ Tune ML Threshold"]];
@@ -89,7 +86,7 @@ export default function CopilotPage() {
               <motion.div key={i} className={`msg2 ${m.who}`} initial={{ opacity: 0, y: 8, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} transition={{ duration: 0.25 }}>
                 <div className={`mav2 ${m.who}`}>{m.who==="ai"?"🤖":"👤"}</div>
                 <div>
-                  <div className="mbbl2" dangerouslySetInnerHTML={{__html:fmt(m.text)}} />
+                  <div className="mbbl2" dangerouslySetInnerHTML={{__html:renderCopilotMarkdown(m.text)}} />
                   <div className="mt3">{m.time}</div>
                 </div>
               </motion.div>
