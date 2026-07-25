@@ -411,12 +411,26 @@ func run() error {
 		c.JSON(code, gin.H{"ready": ready, "checks": checks})
 	})
 
-	// ── Static dashboard files (served BEFORE API routes) ─────────────────────
-	dashDir := envOrDefault("SENTINEL_DASHBOARD_DIR", "../dashboard")
-	router.StaticFile("/", filepath.Join(dashDir, "login.html"))
-	router.StaticFile("/login", filepath.Join(dashDir, "login.html"))
-	router.StaticFile("/dashboard", filepath.Join(dashDir, "dashboard.html"))
-	router.StaticFile("/dashboard.html", filepath.Join(dashDir, "dashboard.html"))
+	// ── UI is served by the Next.js dashboard, never from here ────────────────
+	//
+	// The legacy static console (dashboard.html / login.html) used to be served
+	// at "/", "/login", "/dashboard" and "/dashboard.html". It was REMOVED, not
+	// relocated, because it carried an unauthenticated path to full admin
+	// takeover: its live-log view rendered attacker-controlled log fields
+	// (User-Agent, request path) into `innerHTML` with no Content-Security-Policy,
+	// and it kept the access token in `localStorage`. Any client could plant a
+	// payload simply by sending a request through the data plane with a script in
+	// its User-Agent; the payload then executed in the next admin session that
+	// opened the log view and exfiltrated that admin's token.
+	//
+	// The Next.js dashboard is a functional superset and escapes log fields
+	// before highlighting them (see `escHtml` in app/(dashboard)/logs/page.tsx),
+	// so there is nothing to port. In production the data plane's :9443 listener
+	// terminates TLS and routes /api/* here and everything else to Next.js.
+	//
+	// Do not reintroduce server-rendered HTML on the control plane: this process
+	// holds the DB credentials and the token-signing key, so any XSS here is an
+	// immediate full compromise. UI belongs in the dashboard app.
 
 	authGroup := router.Group("/api/v1/auth")
 	{
