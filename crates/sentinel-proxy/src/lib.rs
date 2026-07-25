@@ -1821,9 +1821,33 @@ pub(crate) async fn run_pipeline(
     default_site: Option<String>,
     tls_fp: Option<String>,
 ) -> Response<BoxBody> {
-    // eBPF fast-fail: known-blocked IPs never enter the WAF pipeline.
-    // Runs before body reads, header parsing, or any other work.
-    if state.ebpf.is_blocked(peer.ip()) {
+    // Blocklist fast-fail: known-blocked addresses never enter the WAF pipeline.
+    // Runs before body reads and before any WAF work.
+    //
+    // This checks the TRANSPORT PEER *and* the resolved client IP, and the second half
+    // is not optional. Checking only `peer.ip()` made this control INERT in the shipped
+    // HA topology: behind HAProxy (or any load balancer, CDN, or ingress) every request
+    // arrives with the proxy as its peer, so the blocklist compared the proxy's address
+    // — never the attacker's — and matched nothing. It appeared to work only in the
+    // single-VM demo, where the client happened to be the immediate peer. A feature that
+    // silently does nothing in production is worse than an absent one, because it is
+    // counted as coverage.
+    //
+    // The peer check is retained rather than replaced: it is the only thing that applies
+    // when there is no proxy in front, and it is what the in-kernel XDP program can see
+    // (XDP runs at L3 and has no access to X-Forwarded-For at all — see
+    // crates/sentinel-ebpf, and the deployment note in the DDoS guide about placing
+    // per-source enforcement at the edge where the peer IS the client).
+    //
+    // resolve_client_ip only trusts XFF when the peer is a configured trusted proxy and
+    // walks the chain right-to-left, so a client-supplied header cannot spoof its way
+    // *past* a block, nor forge someone else's address into one.
+    if blocklist_hit(
+        peer.ip(),
+        req.headers(),
+        |ip| state.ebpf.is_blocked(ip),
+        is_trusted_proxy,
+    ) {
         inc_ebpf_drops();
         inc_requests();
         inc_blocked();
@@ -3211,6 +3235,26 @@ fn resolve_client_ip(
     headers: &http::HeaderMap,
 ) -> Option<std::net::IpAddr> {
     resolve_client_ip_with(peer, headers, is_trusted_proxy)
+}
+
+/// Decide whether a request is from a blocklisted address.
+///
+/// Checks the transport peer AND the resolved client IP. Extracted so the decision is
+/// testable without constructing a whole server: the bug this replaced was invisible in
+/// unit terms (the call looked correct) and only wrong in a topology, which is exactly
+/// the sort of thing that needs an explicit test rather than a reading.
+fn blocklist_hit(
+    peer: std::net::IpAddr,
+    headers: &http::HeaderMap,
+    is_blocked: impl Fn(std::net::IpAddr) -> bool,
+    is_trusted: impl Fn(std::net::IpAddr) -> bool + Copy,
+) -> bool {
+    if is_blocked(peer) {
+        return true;
+    }
+    // Only consults XFF when the peer is a trusted proxy, so an untrusted client cannot
+    // use the header to have someone else blocked — or to slip past its own block.
+    resolve_client_ip_with(peer, headers, is_trusted).is_some_and(is_blocked)
 }
 
 /// Testable core: `is_trusted` decides which addresses are trusted proxies.
@@ -5633,6 +5677,94 @@ mod client_ip_tests {
     // Trust 10.0.0.0/8 as the proxy subnet (stand-in for our HAProxy network).
     fn trusted(ip: IpAddr) -> bool {
         matches!(ip, IpAddr::V4(v4) if v4.octets()[0] == 10)
+    }
+
+    // ── Blocklist behind a proxy ──────────────────────────────────────────────
+    //
+    // The regression these guard: the fast-fail checked only the transport peer, so
+    // behind HAProxy it compared the PROXY's address on every request and the blocklist
+    // matched nothing at all. It passed in the single-VM demo purely because the client
+    // was the immediate peer there.
+
+    /// Blocked address arriving DIRECTLY (no proxy) — must still be caught.
+    #[test]
+    fn blocklist_catches_direct_peer() {
+        let attacker: IpAddr = "45.155.205.233".parse().unwrap();
+        let blocked = move |ip: IpAddr| ip == attacker;
+        assert!(blocklist_hit(
+            attacker,
+            &http::HeaderMap::new(),
+            blocked,
+            trusted
+        ));
+    }
+
+    /// THE BUG: blocked client behind a trusted proxy. Before the fix this returned
+    /// false, because only the proxy's address was ever checked.
+    #[test]
+    fn blocklist_catches_client_behind_trusted_proxy() {
+        let proxy: IpAddr = "10.0.0.5".parse().unwrap();
+        let attacker: IpAddr = "45.155.205.233".parse().unwrap();
+        let blocked = move |ip: IpAddr| ip == attacker;
+        assert!(
+            blocklist_hit(proxy, &xff("45.155.205.233"), blocked, trusted),
+            "blocked client was NOT caught behind a proxy — the blocklist is inert in \
+             the shipped HA topology"
+        );
+    }
+
+    /// A proxy chain must still resolve to the real client.
+    #[test]
+    fn blocklist_catches_client_through_a_proxy_chain() {
+        let proxy: IpAddr = "10.0.0.5".parse().unwrap();
+        let attacker: IpAddr = "45.155.205.233".parse().unwrap();
+        let blocked = move |ip: IpAddr| ip == attacker;
+        assert!(blocklist_hit(
+            proxy,
+            &xff("45.155.205.233, 10.0.0.9"),
+            blocked,
+            trusted
+        ));
+    }
+
+    /// An UNTRUSTED peer's XFF must be ignored, so a blocked attacker cannot escape its
+    /// own block by claiming to be someone else.
+    #[test]
+    fn blocked_attacker_cannot_escape_by_forging_xff() {
+        let attacker: IpAddr = "45.155.205.233".parse().unwrap();
+        let blocked = move |ip: IpAddr| ip == attacker;
+        assert!(
+            blocklist_hit(attacker, &xff("8.8.8.8"), blocked, trusted),
+            "a blocked client escaped its block by forging X-Forwarded-For"
+        );
+    }
+
+    /// And the inverse: an untrusted client must not be able to get an innocent third
+    /// party blocked by naming it in XFF.
+    #[test]
+    fn untrusted_xff_cannot_frame_a_third_party() {
+        let visitor: IpAddr = "203.0.113.9".parse().unwrap();
+        let victim: IpAddr = "45.155.205.233".parse().unwrap();
+        let blocked = move |ip: IpAddr| ip == victim;
+        assert!(
+            !blocklist_hit(visitor, &xff("45.155.205.233"), blocked, trusted),
+            "an untrusted client's XFF was honoured — it could have a third party blocked"
+        );
+    }
+
+    /// Clean traffic must pass, from either position.
+    #[test]
+    fn blocklist_passes_clean_traffic() {
+        let proxy: IpAddr = "10.0.0.5".parse().unwrap();
+        let visitor: IpAddr = "203.0.113.9".parse().unwrap();
+        let blocked = |ip: IpAddr| ip == "45.155.205.233".parse::<IpAddr>().unwrap();
+        assert!(!blocklist_hit(
+            visitor,
+            &http::HeaderMap::new(),
+            blocked,
+            trusted
+        ));
+        assert!(!blocklist_hit(proxy, &xff("203.0.113.9"), blocked, trusted));
     }
 
     #[test]
