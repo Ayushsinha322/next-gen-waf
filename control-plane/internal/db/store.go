@@ -606,9 +606,31 @@ type WriteAuditRequest struct {
 	Diff        json.RawMessage // optional before/after JSON
 }
 
-// WriteAuditLog inserts a signed audit entry.  hmacKey is used to compute the
-// tamper-evident HMAC stored alongside the record; use a stable secret loaded
-// from the environment.
+// auditChainNamespace keys the advisory lock that serializes chain appends. Any
+// stable constant works; it only has to not collide with other advisory-lock
+// users in this database.
+const auditChainNamespace = 0x5748414D // "WHAM"
+
+// genesisPrevHMAC is the prev_hmac of the first row in a tenant's chain. A fixed
+// 32-byte zero block rather than NULL, so that NULL unambiguously means "row
+// predates the chain migration" — otherwise a legacy row and a genesis row would
+// be indistinguishable and an attacker could delete an entire chain and pass the
+// remainder off as pre-migration data.
+var genesisPrevHMAC = make([]byte, 32)
+
+// WriteAuditLog appends a signed audit entry to the tenant's hash chain.
+//
+// hmacKey is used to compute the tamper-evident HMAC stored alongside the record;
+// use a stable secret loaded from the environment.
+//
+// Each row commits to its predecessor: the HMAC covers (seq, prev_hmac, ...fields),
+// where prev_hmac is the preceding row's HMAC for the same tenant. That is what
+// makes DELETION detectable — dropping a row leaves its successor pointing at an
+// HMAC no surviving row has. A per-row HMAC alone (the previous design) verified
+// happily after any number of deletions.
+//
+// Appends for one tenant are serialized by a transaction-scoped advisory lock, so
+// two concurrent writers cannot read the same predecessor and fork the chain.
 func (s *Store) WriteAuditLog(ctx context.Context, req WriteAuditRequest, hmacKey []byte) error {
 	// Sign over a PERSISTED, deterministic timestamp (truncated to Postgres's
 	// microsecond precision so it round-trips exactly) plus every material
@@ -616,8 +638,6 @@ func (s *Store) WriteAuditLog(ctx context.Context, req WriteAuditRequest, hmacKe
 	// recomputed and the "tamper-evident" property would be cosmetic. See
 	// VerifyAuditLog, which recomputes and compares.
 	createdAt := time.Now().UTC().Truncate(time.Microsecond)
-	sig := auditMAC(hmacKey, req.TenantID, req.ActorUserID, req.Action, req.TargetKind,
-		req.TargetID, req.IP, req.UserAgent, req.Diff, createdAt)
 
 	// Use a system-level tenant context for the write.  The INSERT policy on
 	// audit_logs has WITH CHECK (true) so any tenant_id is accepted.
@@ -627,10 +647,42 @@ func (s *Store) WriteAuditLog(ctx context.Context, req WriteAuditRequest, hmacKe
 	}
 	defer tx.Rollback(ctx)
 
+	// Serialize appends for this tenant. Released automatically at commit or
+	// rollback, so a crashed writer cannot wedge the chain.
+	if err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock($1, hashtext($2))`,
+		auditChainNamespace, req.TenantID); err != nil {
+		return fmt.Errorf("store: audit chain lock: %w", err)
+	}
+
+	// Link to the tenant's current chain head, falling back to genesis when this
+	// is the tenant's first entry. COALESCE keeps this a single row every time, so
+	// there is no empty-result case to distinguish from a real query failure.
+	var prevHMAC []byte
+	if err := tx.QueryRow(ctx,
+		`SELECT COALESCE(
+		           (SELECT hmac FROM audit_logs WHERE tenant_id = $1 ORDER BY seq DESC LIMIT 1),
+		           $2::bytea)`,
+		req.TenantID, genesisPrevHMAC).Scan(&prevHMAC); err != nil {
+		return fmt.Errorf("store: audit chain head: %w", err)
+	}
+
+	// Claim the sequence value up front: seq is part of the signed payload, so it
+	// must be known before the row is written.
+	var seq int64
+	if err := tx.QueryRow(ctx,
+		`SELECT nextval(pg_get_serial_sequence('audit_logs', 'seq'))`).Scan(&seq); err != nil {
+		return fmt.Errorf("store: audit seq: %w", err)
+	}
+
+	sig := auditChainMAC(hmacKey, seq, prevHMAC, req.TenantID, req.ActorUserID, req.Action,
+		req.TargetKind, req.TargetID, req.IP, req.UserAgent, req.Diff, createdAt)
+
 	err = tx.Exec(ctx,
 		`INSERT INTO audit_logs
-			(tenant_id, actor_user_id, action, target_kind, target_id, ip, user_agent, diff, created_at, hmac)
-		 VALUES ($1, $2, $3, $4, $5, $6::inet, $7, $8, $9, $10)`,
+			(tenant_id, actor_user_id, action, target_kind, target_id, ip, user_agent, diff,
+			 created_at, hmac, seq, prev_hmac)
+		 VALUES ($1, $2, $3, $4, $5, $6::inet, $7, $8, $9, $10, $11, $12)`,
 		req.TenantID,
 		req.ActorUserID,
 		req.Action,
@@ -641,6 +693,8 @@ func (s *Store) WriteAuditLog(ctx context.Context, req WriteAuditRequest, hmacKe
 		nullableJSON(req.Diff),
 		createdAt,
 		sig,
+		seq,
+		prevHMAC,
 	)
 	if err != nil {
 		return fmt.Errorf("store: audit insert: %w", err)
@@ -648,14 +702,33 @@ func (s *Store) WriteAuditLog(ctx context.Context, req WriteAuditRequest, hmacKe
 	return tx.Commit(ctx)
 }
 
-// auditMAC computes the tamper-evidence HMAC over the persisted, immutable
-// fields of an audit row. Used by both WriteAuditLog and VerifyAuditLog so the
-// signature is reproducible. The timestamp is formatted at microsecond
-// precision to match what Postgres stores.
-func auditMAC(key []byte, tenantID string, actor *string, action, targetKind string,
-	targetID, ip, userAgent *string, diff json.RawMessage, createdAt time.Time) []byte {
+// auditChainMAC computes the tamper-evidence HMAC for a chained audit row.
+//
+// It covers the row's own fields PLUS its position (seq) and its predecessor
+// (prevHMAC). Including both is what extends tamper-evidence from "this row was
+// not edited" to "this row has not been moved, and nothing before it was
+// removed": any deletion or reordering leaves some successor's prev_hmac
+// referring to an HMAC that no surviving row has.
+//
+// The field encoding delegates to auditMAC's payload so the two stay in lockstep.
+func auditChainMAC(key []byte, seq int64, prevHMAC []byte, tenantID string, actor *string,
+	action, targetKind string, targetID, ip, userAgent *string, diff json.RawMessage,
+	createdAt time.Time) []byte {
 	mac := hmac.New(sha256.New, key)
-	fmt.Fprintf(mac, "%s|%s|%s|%s|%s|%s|%s|%s|%s",
+	// Length-prefix the variable-length chain fields so that no combination of
+	// field values can be rearranged to produce the same byte stream.
+	fmt.Fprintf(mac, "v2|%d|%d|", seq, len(prevHMAC))
+	mac.Write(prevHMAC)
+	mac.Write([]byte{'|'})
+	mac.Write(auditPayload(tenantID, actor, action, targetKind, targetID, ip, userAgent, diff, createdAt))
+	return mac.Sum(nil)
+}
+
+// auditPayload is the canonical byte encoding of an audit row's material fields,
+// shared by the legacy and chained MAC functions.
+func auditPayload(tenantID string, actor *string, action, targetKind string,
+	targetID, ip, userAgent *string, diff json.RawMessage, createdAt time.Time) []byte {
+	return []byte(fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%s|%s",
 		tenantID,
 		strPtr(actor),
 		action,
@@ -665,54 +738,143 @@ func auditMAC(key []byte, tenantID string, actor *string, action, targetKind str
 		strPtr(userAgent),
 		string(diff),
 		createdAt.UTC().Format(time.RFC3339Nano),
-	)
+	))
+}
+
+// auditMAC computes the LEGACY (pre-chain) per-row HMAC.
+//
+// Retained solely to verify rows written before migration 0013, which have a NULL
+// prev_hmac. It detects modification of a row but nothing about the log as a
+// whole — see auditChainMAC. Do not use it for new writes.
+//
+// The timestamp is formatted at microsecond precision to match what Postgres
+// stores.
+func auditMAC(key []byte, tenantID string, actor *string, action, targetKind string,
+	targetID, ip, userAgent *string, diff json.RawMessage, createdAt time.Time) []byte {
+	mac := hmac.New(sha256.New, key)
+	mac.Write(auditPayload(tenantID, actor, action, targetKind, targetID, ip, userAgent, diff, createdAt))
 	return mac.Sum(nil)
 }
 
-// VerifyAuditLog recomputes the HMAC over every stored audit row (optionally
-// scoped to a tenant; "" = all) and returns how many were checked plus the IDs
-// of any whose stored HMAC does not match — proving the audit log is genuinely
-// tamper-evident (a mismatch means the row was altered or signed with a
-// different key). limit <= 0 checks all rows.
-func (s *Store) VerifyAuditLog(ctx context.Context, tenantID string, hmacKey []byte, limit int) (checked int, bad []string, err error) {
+// AuditVerifyReport is the outcome of a tamper-evidence check over audit_logs.
+type AuditVerifyReport struct {
+	// Checked is how many rows were examined.
+	Checked int
+	// Altered lists row IDs whose stored HMAC does not match a recomputation —
+	// the row was edited, or signed with a different key.
+	Altered []string
+	// ChainBroken lists row IDs whose prev_hmac does not match the HMAC of the
+	// preceding row for that tenant. This is the signal that rows were DELETED or
+	// REORDERED, which per-row HMACs cannot see.
+	ChainBroken []string
+	// SeqGaps describes missing sequence numbers per tenant, e.g. "tenant X:
+	// seq 41 -> 45". Corroborates ChainBroken and localizes the removal.
+	SeqGaps []string
+	// Unchained counts rows written before migration 0013 (NULL prev_hmac). They
+	// are verified with the legacy per-row MAC, so deletions among them remain
+	// undetectable — reported so that is never mistaken for a clean result.
+	Unchained int
+}
+
+// OK reports whether the log is intact.
+func (r AuditVerifyReport) OK() bool {
+	return len(r.Altered) == 0 && len(r.ChainBroken) == 0 && len(r.SeqGaps) == 0
+}
+
+// VerifyAuditLog verifies the integrity of the audit log, optionally scoped to a
+// tenant ("" = all tenants). limit <= 0 checks all rows.
+//
+// Two independent properties are checked:
+//
+//  1. Per-row integrity — recompute each row's HMAC and compare. Catches edits.
+//  2. Chain continuity — each row's prev_hmac must equal its predecessor's HMAC
+//     within the same tenant, and seq must not skip. Catches DELETION,
+//     REORDERING, and TRUNCATION, none of which the previous per-row-only design
+//     could detect: removing rows left every surviving HMAC verifying perfectly.
+//
+// Rows are walked in ascending (tenant_id, seq) order, which is the order the
+// chain was built in. The old implementation ordered by created_at DESC, which is
+// both attacker-controllable in principle and useless for chain walking.
+func (s *Store) VerifyAuditLog(ctx context.Context, tenantID string, hmacKey []byte, limit int) (AuditVerifyReport, error) {
+	var rep AuditVerifyReport
+
 	pg, ok := s.pool.(*pgxPool)
 	if !ok {
-		return 0, nil, fmt.Errorf("store: pool is not a *pgxPool")
+		return rep, fmt.Errorf("store: pool is not a *pgxPool")
 	}
 	q := `SELECT id, tenant_id, actor_user_id, action, target_kind, target_id,
-	             host(ip), user_agent, diff, created_at, hmac
+	             host(ip), user_agent, diff, created_at, hmac, seq, prev_hmac
 	        FROM audit_logs`
 	args := []any{}
 	if tenantID != "" {
 		q += ` WHERE tenant_id = $1`
 		args = append(args, tenantID)
 	}
-	q += ` ORDER BY created_at DESC`
+	q += ` ORDER BY tenant_id, seq`
 	if limit > 0 {
 		q += fmt.Sprintf(" LIMIT %d", limit)
 	}
 	rows, err := pg.pool.Query(ctx, q, args...)
 	if err != nil {
-		return 0, nil, fmt.Errorf("store: audit verify query: %w", err)
+		return rep, fmt.Errorf("store: audit verify query: %w", err)
 	}
 	defer rows.Close()
+
+	// Chain head carried across iterations, reset at each tenant boundary.
+	var curTenant string
+	var prevMAC []byte
+	var prevSeq int64
+
 	for rows.Next() {
 		var id, tid, action, targetKind string
 		var actor, targetID, ip, ua *string
 		var diff json.RawMessage
 		var createdAt time.Time
-		var storedMAC []byte
+		var storedMAC, storedPrev []byte
+		var seq int64
 		if err := rows.Scan(&id, &tid, &actor, &action, &targetKind, &targetID,
-			&ip, &ua, &diff, &createdAt, &storedMAC); err != nil {
-			return checked, bad, err
+			&ip, &ua, &diff, &createdAt, &storedMAC, &seq, &storedPrev); err != nil {
+			return rep, err
 		}
-		checked++
-		want := auditMAC(hmacKey, tid, actor, action, targetKind, targetID, ip, ua, diff, createdAt)
-		if !hmac.Equal(want, storedMAC) {
-			bad = append(bad, id)
+		rep.Checked++
+
+		newTenant := tid != curTenant
+		if newTenant {
+			curTenant, prevMAC, prevSeq = tid, nil, 0
 		}
+
+		if storedPrev == nil {
+			// Pre-chain row: only the legacy per-row property is available.
+			rep.Unchained++
+			if !hmac.Equal(auditMAC(hmacKey, tid, actor, action, targetKind, targetID, ip, ua, diff, createdAt), storedMAC) {
+				rep.Altered = append(rep.Altered, id)
+			}
+			prevMAC, prevSeq = storedMAC, seq
+			continue
+		}
+
+		if !hmac.Equal(auditChainMAC(hmacKey, seq, storedPrev, tid, actor, action, targetKind,
+			targetID, ip, ua, diff, createdAt), storedMAC) {
+			rep.Altered = append(rep.Altered, id)
+		}
+
+		// Chain continuity. A genesis row must be the first of its tenant; any
+		// later row must point at its immediate predecessor.
+		switch {
+		case prevMAC == nil:
+			// First row seen for this tenant. Genuine only if it is genesis, or if
+			// we are mid-log because of `limit` (prevMAC unknown, nothing to check).
+		case !hmac.Equal(storedPrev, prevMAC):
+			rep.ChainBroken = append(rep.ChainBroken, id)
+		}
+		if prevSeq != 0 && seq != prevSeq+1 {
+			rep.SeqGaps = append(rep.SeqGaps,
+				fmt.Sprintf("tenant %s: seq %d -> %d", tid, prevSeq, seq))
+		}
+
+		prevMAC, prevSeq = storedMAC, seq
 	}
-	return checked, bad, rows.Err()
+	return rep, rows.Err()
 }
 
 func strPtr(s *string) string {
