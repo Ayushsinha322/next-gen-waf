@@ -161,20 +161,87 @@ form_benign = [f"{rng.choice(['q','field','data','input','name','value','text'])
                for b in rng.sample(hard+fwaf+adv_ben, min(4000, len(hard)+len(fwaf)+len(adv_ben)))]
 ben = hard + fwaf + hp_ben + adv_ben + enc_benign + enc_full + form_benign
 
-allX = atk + ben
-allY = np.r_[np.ones(len(atk),np.float32), np.zeros(len(ben),np.float32)]
-print(f"train: {len(allX)} ({len(atk)} atk / {len(ben)} benign [{len(hard)} hard + {len(fwaf)} fwaf + {len(hp_ben)} hp + {len(adv_ben)} adv + {len(enc_benign)} enc-part + {len(enc_full)} enc-full + {len(form_benign)} form])", flush=True)
+# ─────────────────────────────────────────────────────────────────────────────
+# HELD-OUT SPLIT.
+#
+# Every metric this script used to print was measured ON ITS OWN TRAINING DATA:
+#   adv_ben = lines(ADV)          -> went into `ben` -> into `allX` (trained on)
+#   test_adv = lines(ADV)[:2000]  -> the FIRST 2000 lines of that same file
+# and the "hard-benign" figure sampled `hard`, which is likewise inside `ben`. The
+# variable was named test_adv, but nothing was held out, so those numbers described
+# memorisation and could not tell you whether the model generalises at all. The
+# gen-XSS/SQLi/CMDi "sanity" recalls have the same defect: they draw from the same
+# generators that produced the training attacks.
+#
+# HOLDOUT (fraction, env var) reserves a stratified slice of BOTH pools before
+# fitting, so the reported numbers are a real generalisation estimate.
+#
+# Default is 0.0 — training on everything — so a plain run still reproduces the
+# shipped model byte for byte. Set HOLDOUT=0.15 to MEASURE; do not ship a model
+# trained on a reduced set without saying so.
+HOLDOUT = float(os.environ.get("HOLDOUT", "0"))
+
+def stratified_split(pool, frac):
+    """Return (train, held) with `held` a random `frac` of `pool`."""
+    if frac <= 0 or len(pool) < 10:
+        return pool, []
+    shuffled = list(pool)
+    rng.shuffle(shuffled)
+    n_held = max(1, int(len(shuffled) * frac))
+    return shuffled[n_held:], shuffled[:n_held]
+
+atk_tr, atk_held = stratified_split(atk, HOLDOUT)
+ben_tr, ben_held = stratified_split(ben, HOLDOUT)
+
+allX = atk_tr + ben_tr
+allY = np.r_[np.ones(len(atk_tr),np.float32), np.zeros(len(ben_tr),np.float32)]
+print(f"train: {len(allX)} ({len(atk_tr)} atk / {len(ben_tr)} benign [{len(hard)} hard + {len(fwaf)} fwaf + {len(hp_ben)} hp + {len(adv_ben)} adv + {len(enc_benign)} enc-part + {len(enc_full)} enc-full + {len(form_benign)} form])", flush=True)
+if HOLDOUT > 0:
+    print(f"HELD OUT: {len(atk_held)} atk / {len(ben_held)} benign ({HOLDOUT:.0%}) — never seen during fit", flush=True)
+else:
+    print("HELD OUT: nothing (HOLDOUT unset) — every metric below is TRAINING-SET performance,", flush=True)
+    print("          i.e. memorisation, NOT a generalisation estimate. Set HOLDOUT=0.15 to measure.", flush=True)
 print(f"featurizing (K={K}, C={C_REG})...", flush=True)
 clf=LogisticRegression(C=C_REG,class_weight="balanced",max_iter=4000,solver="liblinear").fit(matrix(allX), allY)
 
-# quick sanity
-def rec(g): return (clf.predict_proba(matrix(g))[:,1]>=0.9).mean()*100
-print(f"  sanity gen-XSS recall@0.9 = {rec(gen_xss(400)):.1f}%   gen-SQLi = {rec(gen_sqli(400)):.1f}%   gen-CMDi = {rec(gen_cmdi(400)):.1f}%")
-# Test benign recall (should be low)
-def ben_rec(g): return (clf.predict_proba(matrix(g))[:,1]<0.15).mean()*100
-test_adv = lines(ADV)[:2000]
-print(f"  adversarial-benign recall@0.15 = {ben_rec(test_adv):.1f}% (higher is better — means model suppresses FP)")
-print(f"  hard-benign recall@0.15 = {ben_rec(rng.sample(hard, min(1000, len(hard)))):.1f}%")
+# ── Metrics ──────────────────────────────────────────────────────────────────
+# Labelled TRAIN or HELD-OUT so a reader cannot mistake one for the other.
+TAG = "HELD-OUT" if HOLDOUT > 0 else "TRAIN"
+
+def recall_at(g, thr):
+    """Fraction of attack samples scored >= thr (detection rate)."""
+    if not g: return float("nan")
+    return (clf.predict_proba(matrix(g))[:,1] >= thr).mean()*100
+
+def benign_pass_at(g, thr):
+    """Fraction of benign samples scored < thr (correctly NOT flagged)."""
+    if not g: return float("nan")
+    return (clf.predict_proba(matrix(g))[:,1] < thr).mean()*100
+
+if HOLDOUT > 0:
+    tpr = recall_at(atk_held, 0.9)
+    tnr = benign_pass_at(ben_held, 0.15)
+    fpr = 100.0 - tnr
+    print(f"  [{TAG}] attack TPR@0.9      = {tpr:.2f}%")
+    print(f"  [{TAG}] benign TNR@0.15     = {tnr:.2f}%   (FPR = {fpr:.2f}%)")
+    print(f"  [{TAG}] samples             = {len(atk_held)} atk / {len(ben_held)} benign")
+    print()
+    print("  Compare FPR against commercial WAFs (~0.01-0.4%), not against the")
+    print("  training-set figures below — those are not comparable to anything.")
+
+# These remain useful as smoke checks (a broken featuriser shows up here) but are
+# explicitly training-set/in-distribution numbers, so they are labelled as such.
+print(f"  [TRAIN, in-distribution] gen-XSS recall@0.9 = {recall_at(gen_xss(400),0.9):.1f}%"
+      f"   gen-SQLi = {recall_at(gen_sqli(400),0.9):.1f}%"
+      f"   gen-CMDi = {recall_at(gen_cmdi(400),0.9):.1f}%")
+print(f"  [TRAIN] adversarial-benign pass@0.15 = {benign_pass_at(lines(ADV)[:2000],0.15):.1f}%"
+      f"  (this file is IN the training set — not a generalisation number)")
+print(f"  [TRAIN] hard-benign pass@0.15 = {benign_pass_at(rng.sample(hard, min(1000, len(hard))),0.15):.1f}%")
+
+if HOLDOUT > 0:
+    print()
+    print("NOTE: this model was fit on a REDUCED training set because HOLDOUT>0.")
+    print("      Use it to measure, then retrain with HOLDOUT unset to ship.")
 
 # export
 import json, math
