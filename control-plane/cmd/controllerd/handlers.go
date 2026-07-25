@@ -399,6 +399,15 @@ func handleMFADisable(c *gin.Context, store *db.Store) {
 // to its /callback.
 const oidcStateCookie = "sentinel_oidc_state"
 
+// oidcNonceCookie holds the per-login OIDC nonce so the callback can verify that
+// the returned id_token was minted for THIS authorization request.
+//
+// The nonce used to be generated and sent upstream but never persisted, so
+// nothing could compare it on the way back — it was write-only, and
+// authorization-code replay was undetectable. Storing it browser-side in an
+// HttpOnly cookie mirrors how `state` is already handled.
+const oidcNonceCookie = "sentinel_oidc_nonce"
+
 // oidcConfigFromEnv builds the OIDC config from server-side environment ONLY.
 //
 // The issuer is never taken from a request parameter: previously both handlers
@@ -442,19 +451,27 @@ func handleOIDCLogin(c *gin.Context, jwtSvc *auth.JWTService, log *zap.Logger) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start login"})
 		return
 	}
-	nonce, _ := auth.NewNonce()
+	nonce, err := auth.NewNonce()
+	if err != nil {
+		// Fail the login rather than proceeding with an empty nonce: the callback
+		// now requires one, and a blank value would make the replay check
+		// vacuous.
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start login"})
+		return
+	}
 	authURL, err := oidcSvc.AuthURL(c.Request.Context(), state, nonce)
 	if err != nil {
 		log.Error("oidc auth url", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to build auth URL"})
 		return
 	}
-	// Bind `state` to the browser via a short-lived HttpOnly cookie so the
-	// callback can verify it (CSRF / login-fixation protection). SameSite=Lax
-	// lets the cookie ride the top-level redirect back from the IdP.
+	// Bind `state` and `nonce` to the browser via short-lived HttpOnly cookies so
+	// the callback can verify both (CSRF / login-fixation, and id_token replay).
+	// SameSite=Lax lets them ride the top-level redirect back from the IdP.
 	secure := strings.HasPrefix(cfg.RedirectURL, "https://")
 	c.SetSameSite(http.SameSiteLaxMode)
 	c.SetCookie(oidcStateCookie, state, 300, "/", "", secure, true)
+	c.SetCookie(oidcNonceCookie, nonce, 300, "/", "", secure, true)
 	c.Redirect(http.StatusFound, authURL)
 }
 
@@ -478,13 +495,22 @@ func handleOIDCCallback(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid or missing OIDC state"})
 		return
 	}
-	// One-time use: clear the state cookie immediately.
+	// Recover the nonce minted for this login so the id_token can be bound to it.
+	// Absent cookie => this callback does not correspond to a login we started.
+	wantNonce, err := c.Cookie(oidcNonceCookie)
+	if err != nil || wantNonce == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid or missing OIDC nonce"})
+		return
+	}
+
+	// One-time use: clear both cookies immediately.
 	secure := strings.HasPrefix(cfg.RedirectURL, "https://")
 	c.SetSameSite(http.SameSiteLaxMode)
 	c.SetCookie(oidcStateCookie, "", -1, "/", "", secure, true)
+	c.SetCookie(oidcNonceCookie, "", -1, "/", "", secure, true)
 
 	oidcSvc := auth.NewOIDCService(cfg)
-	userInfo, err := oidcSvc.ExchangeToken(c.Request.Context(), code)
+	userInfo, err := oidcSvc.ExchangeToken(c.Request.Context(), code, wantNonce)
 	if err != nil {
 		log.Error("oidc exchange", zap.Error(err))
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "OIDC token exchange failed"})
