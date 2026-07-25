@@ -250,12 +250,34 @@ services:
       # before they reach the proxy. Degrades to software mode if attach fails.
       SENTINEL_XDP_ENABLE: "1"
       SENTINEL_XDP_IFACE: eth0
+      # Client-IP attribution. This node publishes :80/:443 directly, so the transport
+      # peer IS the client and X-Forwarded-For must NOT be trusted — an empty list means
+      # XFF is ignored entirely, which is the safe default. Set it ONLY to the addresses
+      # of a real proxy in front (see compose.ha.yml, where HAProxy is that proxy);
+      # trusting XFF from anywhere would let a client forge its own source address and
+      # both evade a block and frame a third party.
+      SENTINEL_TRUSTED_PROXIES: ${SENTINEL_TRUSTED_PROXIES:-}
+      # Shared-NAT ranges: addresses behind which MANY unrelated users appear as one IP
+      # (corporate NAT, VPN pool, CGNAT). Per-source escalation is wrong for these — one
+      # abusive user would raise every colleague's anomaly score and get the whole office
+      # auto-banned. Listed ranges are exempt from correlation scoring and auto-ban.
+      SENTINEL_SHARED_EGRESS_CIDRS: ${SENTINEL_SHARED_EGRESS_CIDRS:-}
+      # Ceiling on the reputation contribution a single source's recent history can add,
+      # so correlation can nudge a borderline request over the line but can never block
+      # on reputation alone.
+      SENTINEL_CORRELATION_MAX_SCORE: ${SENTINEL_CORRELATION_MAX_SCORE:-4}
+      # Last-good config cache. Must live on a VOLUME: the default ($HOME/.config/...)
+      # is in the container's writable layer, which is discarded on every image upgrade
+      # or `up -d` recreate — exactly when a control-plane outage would leave this node
+      # with no config to fall back on, which is the whole point of the cache.
+      SENTINEL_CONFIG_CACHE_PATH: /var/lib/sentinel/state/config-cache.json
     volumes:
       - ./sentinel.proxy.yaml:/etc/sentinel/sentinel.yaml:ro
       # Kernel BTF so aya can load the BTF-typed BPF maps.
       - /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro
       - sentinel-logs:/var/log/sentinel
       - sentinel-certs:/var/lib/sentinel/certs   # cert repository (persists ACME/uploaded certs)
+      - sentinel-state:/var/lib/sentinel/state   # last-good config cache (survives upgrades)
     ports:
       - "80:8080"               # public WAF entrypoint (HTTP)
       - "443:8443"              # public WAF entrypoint (HTTPS/TCP — h1+h2, SNI cert resolver)
@@ -352,6 +374,10 @@ volumes:
   chdata:
   sentinel-logs:
   sentinel-certs:
+  # Per-node data-plane state that must outlive the container: currently the last-good
+  # config cache. The HA overlay gives each waf node its OWN state volume rather than
+  # sharing this one — see compose.ha.yml.
+  sentinel-state:
   promdata:
   grafanadata:
 

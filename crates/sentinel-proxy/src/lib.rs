@@ -454,7 +454,13 @@ fn write_cached_sites(path: &std::path::Path, version: u64, sites: &[SiteConfig]
             return;
         }
     }
-    let tmp = path.with_extension("json.tmp");
+    // The temp name is PER-PROCESS. A fixed ".json.tmp" is a corruption window as soon
+    // as more than one node shares the cache directory (the HA overlay's waf1/waf2/waf3
+    // if pointed at a shared volume): File::create truncates, so one node can truncate
+    // the tmp another is mid-write on, and either may then rename the partial result
+    // over the last-good cache. Distinct tmp names make each writer's rename atomic
+    // and independent, so the worst case is last-writer-wins on identical content.
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
     let res = (|| -> std::io::Result<()> {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(&body)?;

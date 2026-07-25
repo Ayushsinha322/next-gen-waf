@@ -44,6 +44,26 @@ x-wafnode: &wafnode
     SENTINEL_MGMT_DASHBOARD_UPSTREAM: http://dashboard:3000
     SENTINEL_MGMT_API_UPSTREAM: http://controlplane:9501
     SENTINEL_HTTP3_ADVERTISE_PORT: "443"
+    # ── Client-IP attribution behind the load balancer ────────────────────────
+    # REQUIRED in this topology, and inert-by-omission in a way that is easy to miss.
+    # Every :80 request reaches these nodes from the `lb` container, so the transport
+    # peer is HAProxy, not the client. With no trusted-proxy list the nodes ignore
+    # X-Forwarded-For and treat HAProxy's own container address as the client for
+    # EVERY request — which silently defeats three things at once: the IP blocklist
+    # matches the LB instead of the attacker, per-source rate limits collapse onto a
+    # single key, and correlation attributes every client's history to one address.
+    #
+    # Scoped to the compose network, not 0.0.0.0/0: XFF is only believed when the hop
+    # handing it over is one of our own containers. HAProxy sets the header itself
+    # (`option forwardfor`) and the proxy walks the chain right-to-left, so a client
+    # cannot prepend a forged entry to escape a block or frame someone else.
+    SENTINEL_TRUSTED_PROXIES: ${SENTINEL_TRUSTED_PROXIES:-172.18.0.0/16}
+    # Shared-NAT ranges exempt from per-source escalation and auto-ban — see the
+    # comment in compose.prod.yml. Empty by default; set per deployment.
+    SENTINEL_SHARED_EGRESS_CIDRS: ${SENTINEL_SHARED_EGRESS_CIDRS:-}
+    SENTINEL_CORRELATION_MAX_SCORE: ${SENTINEL_CORRELATION_MAX_SCORE:-4}
+    # Last-good config cache, on a per-node volume (see each service below).
+    SENTINEL_CONFIG_CACHE_PATH: /var/lib/sentinel/state/config-cache.json
   volumes:
     - ./sentinel.proxy.yaml:/etc/sentinel/sentinel.yaml:ro
   networks: [sentinel]
@@ -60,6 +80,7 @@ services:
     volumes:
       - ./sentinel.proxy.yaml:/etc/sentinel/sentinel.yaml:ro
       - sentinel-certs:/var/lib/sentinel/certs   # shared cert repository (ACME/uploaded)
+      - waf1-state:/var/lib/sentinel/state       # this node's last-good config cache
     ports:
       - "9443:9443"          # MANAGEMENT console (HTTPS — admin UI + API)
       - "443:8443"           # public WAF entrypoint (HTTPS/TCP — h1+h2)
@@ -67,9 +88,15 @@ services:
   waf2:
     <<: *wafnode
     hostname: waf2
+    volumes:
+      - ./sentinel.proxy.yaml:/etc/sentinel/sentinel.yaml:ro
+      - waf2-state:/var/lib/sentinel/state
   waf3:
     <<: *wafnode
     hostname: waf3
+    volumes:
+      - ./sentinel.proxy.yaml:/etc/sentinel/sentinel.yaml:ro
+      - waf3-state:/var/lib/sentinel/state
 
   lb:
     image: haproxy:2.9-alpine
@@ -81,3 +108,13 @@ services:
       - "80:80"       # public WAF entrypoint (in front of the fleet)
       - "8404:8404"   # HAProxy health/stats view
     networks: [sentinel]
+
+# One state volume PER NODE, deliberately not shared. The cache writer renames a
+# temp file into place, and while the temp name is process-unique, three nodes
+# writing one directory still means three writers racing to be last on the same
+# target for no benefit — each node's cache is its own recovery state, so keep them
+# independent.
+volumes:
+  waf1-state:
+  waf2-state:
+  waf3-state:
