@@ -303,7 +303,7 @@ function ClusterTab() {
   const headBadge = !health
     ? <span className="bdg bgr">{err ? "● unreachable" : "loading…"}</span>
     : cp?.enabled
-      ? <span className={`bdg ${cp.quorum_ok ? "bgg" : "br"}`}><span className="bdr" />Raft · {cp.healthy}/{cp.total} nodes</span>
+      ? <span className={`bdg ${cp.write_available ? "bgg" : "br"}`}><span className="bdr" />{cp.healthy}/{cp.total} nodes</span>
       : <span className="bdg bcy">standalone</span>;
 
   return (
@@ -332,7 +332,7 @@ function ClusterTab() {
                     </div>
                     <div className="ncn">node {n.node_id}</div>
                     <div className="ncs">Addr: {n.addr || "—"}</div>
-                    <div className="ncs">Term: {cp.term} · {n.reachable ? fmtAgo(n.last_seen_sec) : "unreachable"}</div>
+                    <div className="ncs">{n.reachable ? fmtAgo(n.last_seen_sec) : "unreachable"}</div>
                   </motion.div>
                 ))}
               </div>
@@ -340,14 +340,18 @@ function ClusterTab() {
               <div style={{ padding: "18px 12px", textAlign: "center", marginBottom: 14 }}>
                 <div style={{ fontSize: 26, marginBottom: 6 }}>🧩</div>
                 <div style={{ fontSize: 15, fontWeight: 700, color: "var(--text2)", marginBottom: 4 }}>Standalone — HA not enabled</div>
-                <div className="srd">Running a single control-plane node. Add peers to form a Raft quorum for automatic leader failover.</div>
+                <div className="srd">Running a single control-plane node. Add replicas for spare capacity — write leadership fails over via a Postgres advisory lock, with no quorum to maintain.</div>
               </div>
             )}
 
             {([
+              // No quorum row: leadership is a Postgres advisory lock, so writes
+              // survive on a single node and a control-plane majority is not
+              // required. Reporting "quorum" would describe a constraint that no
+              // longer exists.
               cp?.enabled
-                ? ["Quorum", `${cp.quorum_size} required · ${cp.healthy}/${cp.total} online · term ${cp.term}`, cp.quorum_ok ? "bgg" : "br", cp.quorum_ok ? "✓ HEALTHY" : "⚠ AT RISK"]
-                : ["Quorum", "Standalone — single node, no quorum needed", "bcy", "N/A"],
+                ? ["Write leader", `${cp.leader_id ?? "none elected"} · ${cp.healthy}/${cp.total} nodes online`, cp.write_available ? "bgg" : "br", cp.write_available ? "✓ AVAILABLE" : "⚠ NO LEADER"]
+                : ["Write leader", "Standalone — this node accepts all writes", "bcy", "N/A"],
               ["Protection", health.protection_active ? "Traffic is being inspected and enforced" : "Protection is not fully active", health.protection_active ? "bgg" : "br", health.protection_active ? "✓ ACTIVE" : "⚠ AT RISK"],
               ["Data-Plane Nodes", dpNodes.length ? dpNodes.map(n => n.id).join(", ") : "No data-plane nodes reporting", dp && dp.total > 0 && dp.healthy === dp.total ? "bgg" : dp && dp.healthy > 0 ? "ba" : "br", `${dp?.total ?? 0} node${(dp?.total ?? 0) === 1 ? "" : "s"}`],
             ] as [string, string, string, string][]).map(([t, d, cls, val]) => (

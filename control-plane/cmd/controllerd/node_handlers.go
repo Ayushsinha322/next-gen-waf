@@ -10,8 +10,8 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/your-org/sentinel-waf/control-plane/internal/auth"
-	"github.com/your-org/sentinel-waf/control-plane/internal/cluster"
 	"github.com/your-org/sentinel-waf/control-plane/internal/db"
+	"github.com/your-org/sentinel-waf/control-plane/internal/leader"
 	"github.com/your-org/sentinel-waf/control-plane/internal/rbac"
 )
 
@@ -91,7 +91,7 @@ func maxInt(a, b int) int {
 
 // handleClusterHealth returns a unified data-plane + control-plane health view.
 // JWT-protected; requires site:list (same gate as handleClusterStatus).
-func handleClusterHealth(c *gin.Context, enf *rbac.Enforcer, store *db.Store, cl *cluster.Cluster) {
+func handleClusterHealth(c *gin.Context, enf *rbac.Enforcer, store *db.Store, cl *leader.Elector) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if claims == nil || !enf.Allow(rbac.Role(claims.Role), rbac.ResourceSite, rbac.ActionList) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
@@ -152,96 +152,103 @@ func handleClusterHealth(c *gin.Context, enf *rbac.Enforcer, store *db.Store, cl
 	}
 
 	// ── Control plane ───────────────────────────────────────────────────────
+	//
+	// Membership comes from the shared cluster_members table, which every node
+	// heartbeats into. This is strictly more accurate than the Raft-era view: Raft
+	// tracked peer liveness only leader->follower, so a follower could not observe
+	// its peers and this endpoint had to fall back to "a leader exists, so assume
+	// the rest are up". Now any node reports real per-node liveness.
+	//
+	// There is deliberately no quorum here. Control-plane availability no longer
+	// depends on a control-plane majority — leadership is a Postgres advisory lock,
+	// so a single surviving node still serves writes as long as the database is
+	// reachable. `write_available` reports the thing that actually matters.
 	cpAnyUnreachable := false
 	var controlPlane gin.H
 	if cl == nil {
 		controlPlane = gin.H{
 			"enabled":           false,
 			"role":              "standalone",
-			"total":             0,
-			"healthy":           0,
-			"quorum_size":       0,
-			"quorum_ok":         true,
+			"total":             1,
+			"healthy":           1,
+			"write_available":   true,
 			"leader_id":         nil,
-			"term":              0,
 			"resilience_budget": 0,
 			"nodes":             []gin.H{},
 		}
 	} else {
 		st := cl.Status()
-		hasLeader := st.LeaderID != nil
-		selfIsLeader := hasLeader && *st.LeaderID == st.NodeID
-		// Raft tracks peer liveness only leader->follower, so peer.Reachable is
-		// trustworthy ONLY when this node is the leader. When queried on a
-		// follower we can't see other peers directly — but a present leader
-		// implies a healthy majority (Raft invariant), so report peers as
-		// reachable instead of falsely "down". (Precise per-node CP liveness is
-		// available whenever the dashboard's control plane is the leader.)
-		trustReach := selfIsLeader
-		cpNodes := []gin.H{
-			{
-				"node_id":       uint64(st.NodeID),
-				"role":          string(st.Role),
-				"is_leader":     selfIsLeader,
-				"is_self":       true,
-				"reachable":     true,
-				"last_seen_sec": int64(0),
-				"addr":          "",
-			},
+		members, merr := cl.Members(c.Request.Context())
+		if merr != nil {
+			// Membership is observability, not the authority on leadership; a query
+			// failure must not fail the health endpoint.
+			members = nil
 		}
-		healthy := 1
-		for _, p := range st.Peers {
-			reachable := p.Reachable
-			if !trustReach {
-				reachable = hasLeader
-			}
-			if reachable {
+
+		cpNodes := make([]gin.H, 0, len(members))
+		healthy := 0
+		for _, m := range members {
+			if m.Reachable {
 				healthy++
 			} else {
 				cpAnyUnreachable = true
 			}
-			isLeader := hasLeader && *st.LeaderID == p.NodeID
 			role := "follower"
-			if isLeader {
+			if m.IsLeader {
 				role = "leader"
 			}
 			cpNodes = append(cpNodes, gin.H{
-				"node_id":       uint64(p.NodeID),
+				"node_id":       m.NodeID,
 				"role":          role,
-				"is_leader":     isLeader,
-				"is_self":       false,
-				"reachable":     reachable,
-				"last_seen_sec": p.LastSeenSec,
-				"addr":          p.Addr,
+				"is_leader":     m.IsLeader,
+				"is_self":       m.NodeID == st.NodeID,
+				"reachable":     m.Reachable,
+				"last_seen_sec": m.LastSeenSec,
+				"addr":          m.Advertise,
 			})
 		}
-		total := len(st.Peers) + 1
-		quorumSize := total/2 + 1
+		// Fall back to describing just this node if membership could not be read, so
+		// the view degrades to "what I know" rather than "empty cluster".
+		if len(cpNodes) == 0 {
+			cpNodes = append(cpNodes, gin.H{
+				"node_id":       st.NodeID,
+				"role":          st.Role,
+				"is_leader":     st.Role == "leader",
+				"is_self":       true,
+				"reachable":     true,
+				"last_seen_sec": int64(0),
+				"addr":          st.LeaderAddr,
+			})
+			healthy = 1
+		}
+
 		var leaderID interface{}
-		if hasLeader {
-			leaderID = uint64(*st.LeaderID)
+		if st.LeaderID != "" {
+			leaderID = st.LeaderID
 		}
 		controlPlane = gin.H{
-			"enabled":           true,
-			"role":              string(st.Role),
-			"total":             total,
-			"healthy":           healthy,
-			"quorum_size":       quorumSize,
-			"quorum_ok":         hasLeader && healthy >= quorumSize,
-			"leader_id":         leaderID,
-			"term":              st.Term,
-			"resilience_budget": maxInt(0, healthy-quorumSize),
+			"enabled":         true,
+			"role":            st.Role,
+			"total":           len(cpNodes),
+			"healthy":         healthy,
+			"write_available": st.LeaderID != "",
+			"leader_id":       leaderID,
+			"leader_addr":     st.LeaderAddr,
+			// Every healthy node beyond the one serving writes is spare capacity;
+			// unlike Raft there is no majority to preserve, so the budget is simply
+			// "how many more can I lose and still have a node".
+			"resilience_budget": maxInt(0, healthy-1),
 			"nodes":             cpNodes,
 		}
 	}
 
 	// ── Overall verdict ─────────────────────────────────────────────────────
 	cpEnabled, _ := controlPlane["enabled"].(bool)
-	cpQuorumOK, _ := controlPlane["quorum_ok"].(bool)
+	cpWritable, _ := controlPlane["write_available"].(bool)
 
 	overall := "healthy"
 	switch {
-	case (dpTotal > 0 && dpHealthy == 0) || (cpEnabled && !cpQuorumOK):
+	case (dpTotal > 0 && dpHealthy == 0) || (cpEnabled && !cpWritable):
 		overall = "critical"
 	case dpDown > 0 || dpDegraded > 0 || cpAnyUnreachable:
 		overall = "degraded"

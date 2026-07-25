@@ -1,20 +1,25 @@
-# Control plane — 3-replica Raft cluster (management brain HA).
+# Control plane — 3 replicas, management-brain HA.
 #
-# HA properties:
-#  - StatefulSet, replicas: 3 → Raft quorum survives 1 node failure (2/3 majority).
-#  - headless Service → stable per-pod DNS (sentinel-controlplane-0.<svc> …) that
-#    Raft peers use to find each other.
+# Write leadership is a Postgres session-scoped advisory lock, NOT a control-plane
+# consensus protocol. What that changes here:
+#
+#  - No consensus port, no shared RPC secret, no per-pod persistent volume. The
+#    Raft log lived on a PVC and was never compacted, so it grew until the disk
+#    filled; there is no log any more.
+#  - Losing 2 of 3 replicas no longer refuses writes. The surviving node still
+#    holds (or takes) the lock and serves writes, because availability now depends
+#    on Postgres — which the write needed anyway, and which is itself HA with its
+#    own synchronous quorum under CloudNativePG.
+#  - StatefulSet identity is only used for a stable node NAME and forwarding
+#    address; there is no node numbering or self-excluding peer list to derive.
+#
+# Remaining HA properties:
+#  - StatefulSet, replicas: 3 → spare capacity, and any node can accept writes
+#    (followers transparently forward to the lock holder).
+#  - headless Service → stable per-pod DNS used as the write-forwarding address.
 #  - podAntiAffinity → one replica per node.
-#  - persistent volume per pod → Raft log/term/vote survive a restart.
-#  - PodDisruptionBudget minAvailable: 2 → drains never break quorum.
-#
-# StatefulSet identity: a StatefulSet gives every pod identical env, so NODE_ID
-# and the self-excluding peer list can't be hard-coded. controllerd derives them
-# natively (no entrypoint/shell needed — works in the distroless image): when
-# SENTINEL_NODE_ID is unset it reads SENTINEL_RAFT_POD_NAME (the pod ordinal),
-# SENTINEL_RAFT_REPLICAS, and SENTINEL_RAFT_SERVICE to compute NODE_ID = ordinal+1
-# and SENTINEL_RAFT_PEERS over the headless-Service DNS of the other ordinals.
-# See deriveRaftTopology in control-plane/cmd/controllerd/main.go.
+#  - PodDisruptionBudget minAvailable: 2 → drains keep spare capacity. It no longer
+#    protects a quorum, because there isn't one.
 ---
 apiVersion: v1
 kind: Service
@@ -22,11 +27,12 @@ metadata:
   name: sentinel-controlplane-headless
   namespace: sentinel
 spec:
-  clusterIP: None                 # headless → stable pod DNS for Raft peers
-  publishNotReadyAddresses: true  # peers must resolve each other during election, before "ready"
+  clusterIP: None                 # headless → stable per-pod DNS for write forwarding
+  # Followers forward writes to the leader by its pod DNS, and a node that is not
+  # yet "ready" may already hold the lock, so its address must still resolve.
+  publishNotReadyAddresses: true
   selector: { app: sentinel, tier: controlplane }
   ports:
-    - { name: raft, port: 9600 }
     - { name: rest, port: 9501 }
 ---
 apiVersion: v1
@@ -58,6 +64,10 @@ spec:
     metadata:
       labels: { app: sentinel, tier: controlplane }
     spec:
+      # Must comfortably exceed preStop (8s) plus graceful shutdown, or the kubelet
+      # SIGKILLs mid-drain. The default 30s left no margin once the REST server's
+      # own 10s shutdown timeout is accounted for.
+      terminationGracePeriodSeconds: 45
       affinity:
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -69,7 +79,6 @@ spec:
           image: registry.example.com/sentinel/controlplane:latest
           ports:
             - { name: rest, containerPort: 9501 }
-            - { name: raft, containerPort: 9600 }
           env:
             - { name: SENTINEL_REST_ADDR, value: "0.0.0.0:9501" }
             - { name: SENTINEL_AUTOSTART_DATAPLANE, value: "0" }
@@ -86,38 +95,45 @@ spec:
               valueFrom: { secretKeyRef: { name: sentinel-secrets, key: jwt-secret } }
             - name: SENTINEL_INTERNAL_SECRET
               valueFrom: { secretKeyRef: { name: sentinel-secrets, key: internal-secret } }
-            - name: SENTINEL_RAFT_SECRET
-              valueFrom: { secretKeyRef: { name: sentinel-secrets, key: raft-secret } }
-            # --- Raft identity, derived by controllerd from the pod ordinal ---
-            # NODE_ID and PEERS are NOT set here on purpose: with these three
-            # env vars + the pod name, controllerd computes them itself, e.g.
-            #   sentinel-controlplane-0 → NODE_ID=1,
-            #     PEERS=2=sentinel-controlplane-1.sentinel-controlplane-headless:9600,
-            #           3=sentinel-controlplane-2.sentinel-controlplane-headless:9600
-            - { name: SENTINEL_RAFT_ADDR, value: "0.0.0.0:9600" }
-            - { name: SENTINEL_RAFT_DIR, value: "/var/lib/sentinel/raft" }
-            - { name: SENTINEL_RAFT_REPLICAS, value: "3" }   # MUST match spec.replicas above
-            - { name: SENTINEL_RAFT_SERVICE, value: "sentinel-controlplane-headless" }
-            - { name: SENTINEL_RAFT_PORT, value: "9600" }
-            - name: SENTINEL_RAFT_POD_NAME   # controllerd reads this to derive NODE_ID + PEERS
+            # --- Node identity for write-leader election ---
+            # Leadership is a Postgres advisory lock, so there is no peer list, no
+            # node numbering, no consensus port, and no shared RPC secret to manage.
+            # A node only needs a stable name and an address peers can forward
+            # writes to. SENTINEL_RAFT_* and the raft-secret key are all gone, as is
+            # the persistent volume that held the (never-compacted) Raft log.
+            - name: SENTINEL_NODE_ID
               valueFrom: { fieldRef: { fieldPath: metadata.name } }
-          volumeMounts:
-            - { name: raft-data, mountPath: /var/lib/sentinel/raft }
+            - name: SENTINEL_POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - { name: SENTINEL_HEADLESS_SERVICE, value: "sentinel-controlplane-headless" }
           resources:
             requests: { cpu: "250m", memory: "256Mi" }
             limits:   { cpu: "1",    memory: "512Mi" }
+          # Readiness gates Service endpoints, so it must reflect whether this node
+          # can actually serve: /readyz checks the database and that a write leader
+          # is in view. It was previously pointed at /health, which is a static
+          # always-200 liveness endpoint — so a node with an unreachable database
+          # kept receiving traffic, and the /readyz handler that already existed was
+          # never consulted by anything.
           readinessProbe:
-            httpGet: { path: /health, port: 9501 }
+            httpGet: { path: /readyz, port: 9501 }
             periodSeconds: 5
+            failureThreshold: 2
+          # Liveness stays on the cheap static endpoint. Pointing it at /readyz
+          # would restart a healthy node during a database blip, turning a
+          # dependency outage into a crash loop.
           livenessProbe:
             httpGet: { path: /health, port: 9501 }
             periodSeconds: 10
             failureThreshold: 3
-  volumeClaimTemplates:
-    - metadata: { name: raft-data }
-      spec:
-        accessModes: [ReadWriteOnce]
-        resources: { requests: { storage: 1Gi } }
+          lifecycle:
+            preStop:
+              exec:
+                # Endpoint removal is asynchronous: without this pause the container
+                # can stop while kube-proxy still routes to it, so a rollout drops
+                # in-flight connections. Sleep past propagation, then let the normal
+                # shutdown path resign leadership and drain.
+                command: ["/bin/sh", "-c", "sleep 8"]
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
@@ -125,6 +141,6 @@ metadata:
   name: sentinel-controlplane-pdb
   namespace: sentinel
 spec:
-  minAvailable: 2               # keep Raft quorum during voluntary disruptions
+  minAvailable: 2               # keep spare capacity during voluntary disruptions
   selector:
     matchLabels: { app: sentinel, tier: controlplane }

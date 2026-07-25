@@ -403,8 +403,11 @@ export interface DataPlaneNode {
 
 /** A single control-plane (Raft) node. */
 export interface ControlPlaneNode {
-  node_id:      number;
-  role:         "leader" | "follower" | "candidate" | "unknown";
+  // A stable node name (pod name / hostname), not a Raft integer ID.
+  node_id:      string;
+  // "candidate" no longer occurs: there is no election protocol with candidate
+  // states, only "holds the advisory lock" or "does not".
+  role:         "leader" | "follower" | "unknown";
   is_leader:    boolean;
   is_self:      boolean;
   reachable:    boolean;
@@ -427,13 +430,17 @@ export interface ClusterHealth {
   };
   control_plane: {
     enabled:          boolean;
-    role:             "standalone" | null;
+    // "leader" | "follower" | "standalone".
+    role:             string | null;
     total:            number;
     healthy:          number;
-    quorum_size:      number;
-    quorum_ok:        boolean;
-    leader_id:        number | null;
-    term:             number;
+    // Whether a write leader is in view. This replaced quorum_size/quorum_ok/term:
+    // leadership is a Postgres advisory lock, so writes survive on a single node
+    // and there is no control-plane majority to maintain. Node IDs are now stable
+    // names (pod names), not Raft integers.
+    write_available:  boolean;
+    leader_id:        string | null;
+    leader_addr?:     string;
     resilience_budget: number;
     nodes:            ControlPlaneNode[];
   };

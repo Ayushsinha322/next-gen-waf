@@ -54,7 +54,6 @@ x-cp-env: &cp-env
   # NO default on purpose: `docker compose config` FAILS if it isn't set in
   # deploy/docker/.env, so the old insecure committed default can never ship.
   # Generate with: openssl rand -hex 32
-  SENTINEL_RAFT_SECRET: ${SENTINEL_RAFT_SECRET:?set a strong SENTINEL_RAFT_SECRET in deploy/docker/.env (openssl rand -hex 32)}
 
 services:
   # Node 1 = the existing control plane (keeps its image/ports/volumes from
@@ -63,8 +62,8 @@ services:
     environment:
       <<: *cp-env
       SENTINEL_NODE_ID: "1"
-      SENTINEL_RAFT_ADDR: controlplane:9600
-      SENTINEL_RAFT_PEERS: "2=cp2:9600,3=cp3:9600"
+      # Address the other nodes forward writes to (this node's REST API).
+      SENTINEL_ADVERTISE_ADDR: controlplane:9501
 
   cp2:
     image: sentinel/controlplane:latest
@@ -81,8 +80,8 @@ services:
     environment:
       <<: *cp-env
       SENTINEL_NODE_ID: "2"
-      SENTINEL_RAFT_ADDR: cp2:9600
-      SENTINEL_RAFT_PEERS: "1=controlplane:9600,3=cp3:9600"
+      # Address the other nodes forward writes to (this node's REST API).
+      SENTINEL_ADVERTISE_ADDR: cp2:9501
     volumes:
       - sentinel-logs:/var/log/sentinel
       # Public Root CA (read-only) so this node can serve CA-download when leader.
@@ -104,8 +103,8 @@ services:
     environment:
       <<: *cp-env
       SENTINEL_NODE_ID: "3"
-      SENTINEL_RAFT_ADDR: cp3:9600
-      SENTINEL_RAFT_PEERS: "1=controlplane:9600,2=cp2:9600"
+      # Address the other nodes forward writes to (this node's REST API).
+      SENTINEL_ADVERTISE_ADDR: cp3:9501
     volumes:
       - sentinel-logs:/var/log/sentinel
       - /opt/sentinel-pki/root.crt:/etc/sentinel/root-ca.crt:ro

@@ -19,8 +19,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/your-org/sentinel-waf/control-plane/internal/auth"
-	"github.com/your-org/sentinel-waf/control-plane/internal/cluster"
 	"github.com/your-org/sentinel-waf/control-plane/internal/db"
+	"github.com/your-org/sentinel-waf/control-plane/internal/leader"
 	"github.com/your-org/sentinel-waf/control-plane/internal/logs"
 	"github.com/your-org/sentinel-waf/control-plane/internal/rbac"
 	"go.uber.org/zap"
@@ -636,7 +636,7 @@ func handleListSites(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 	})
 }
 
-func handleCreateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
+func handleCreateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *leader.Elector) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceSite, rbac.ActionCreate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
@@ -657,7 +657,7 @@ func handleCreateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 	if req.WafPolicy == nil {
 		req.WafPolicy = json.RawMessage(`{"mode":"blocking","paranoia_level":2,"anomaly_threshold":5}`)
 	}
-	if !proposeBest(c, cl, cluster.CmdSiteCreate, gin.H{"tenant_id": claims.TenantID, "req": req}) {
+	if !requireLeader(c, cl) {
 		return
 	}
 	site, err := store.CreateSite(c.Request.Context(), claims.TenantID, claims.UserID, req)
@@ -695,7 +695,7 @@ func handleGetSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 	c.JSON(http.StatusOK, gin.H{"site": site})
 }
 
-func handleUpdateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
+func handleUpdateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *leader.Elector) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceSite, rbac.ActionUpdate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
@@ -711,7 +711,7 @@ func handleUpdateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if !proposeBest(c, cl, cluster.CmdSiteUpdate, gin.H{"tenant_id": claims.TenantID, "site_id": siteID, "req": req}) {
+	if !requireLeader(c, cl) {
 		return
 	}
 	site, err := store.UpdateSite(c.Request.Context(), claims.TenantID, claims.UserID, siteID, req)
@@ -730,7 +730,7 @@ func handleUpdateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 	c.JSON(http.StatusOK, gin.H{"site": site})
 }
 
-func handleDeleteSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
+func handleDeleteSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *leader.Elector) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceSite, rbac.ActionDelete) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
@@ -741,7 +741,7 @@ func handleDeleteSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 		return
 	}
 	siteID := c.Param("id")
-	if !proposeBest(c, cl, cluster.CmdSiteDelete, gin.H{"tenant_id": claims.TenantID, "site_id": siteID}) {
+	if !requireLeader(c, cl) {
 		return
 	}
 	if err := store.DeleteSite(c.Request.Context(), claims.TenantID, siteID); err != nil {
@@ -758,7 +758,7 @@ func handleDeleteSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
-func handleUpdateSiteStatus(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
+func handleUpdateSiteStatus(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *leader.Elector) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceSite, rbac.ActionUpdate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
@@ -776,7 +776,7 @@ func handleUpdateSiteStatus(c *gin.Context, enf *rbac.Enforcer, store *db.Store,
 		c.JSON(http.StatusBadRequest, gin.H{"error": "status must be 'active' or 'paused'"})
 		return
 	}
-	if !proposeBest(c, cl, cluster.CmdSiteStatus, gin.H{"tenant_id": claims.TenantID, "site_id": siteID, "status": body.Status}) {
+	if !requireLeader(c, cl) {
 		return
 	}
 	if err := store.UpdateSiteStatus(c.Request.Context(), claims.TenantID, siteID, body.Status); err != nil {
@@ -810,7 +810,7 @@ type ruleExclusionSpec struct {
 //
 // Re-uses the standard site-update path so the change is proposed through the
 // cluster, persisted, and hot-synced to the proxy via configVersion.
-func handleAddSiteExclusion(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
+func handleAddSiteExclusion(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *leader.Elector) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceSite, rbac.ActionUpdate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
@@ -858,7 +858,7 @@ func handleAddSiteExclusion(c *gin.Context, enf *rbac.Enforcer, store *db.Store,
 		return
 	}
 	req := db.UpdateSiteRequest{WafPolicy: newPolicy}
-	if !proposeBest(c, cl, cluster.CmdSiteUpdate, gin.H{"tenant_id": claims.TenantID, "site_id": siteID, "req": req}) {
+	if !requireLeader(c, cl) {
 		return
 	}
 	updated, err := store.UpdateSite(c.Request.Context(), claims.TenantID, claims.UserID, siteID, req)
@@ -879,7 +879,7 @@ func handleAddSiteExclusion(c *gin.Context, enf *rbac.Enforcer, store *db.Store,
 
 // handleDeleteSiteExclusion removes the exclusion for a given rule_id from a
 // site's waf_policy (undo a tuning action / re-enable a rule).
-func handleDeleteSiteExclusion(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
+func handleDeleteSiteExclusion(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *leader.Elector) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceSite, rbac.ActionUpdate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
@@ -920,7 +920,7 @@ func handleDeleteSiteExclusion(c *gin.Context, enf *rbac.Enforcer, store *db.Sto
 		return
 	}
 	req := db.UpdateSiteRequest{WafPolicy: newPolicy}
-	if !proposeBest(c, cl, cluster.CmdSiteUpdate, gin.H{"tenant_id": claims.TenantID, "site_id": siteID, "req": req}) {
+	if !requireLeader(c, cl) {
 		return
 	}
 	updated, err := store.UpdateSite(c.Request.Context(), claims.TenantID, claims.UserID, siteID, req)
@@ -1550,7 +1550,7 @@ func handleListAlerts(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 	c.JSON(http.StatusOK, gin.H{"alerts": []interface{}{}, "tenant_id": claims.TenantID})
 }
 
-func handleAckAlert(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
+func handleAckAlert(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *leader.Elector) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceAlert, rbac.ActionUpdate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
@@ -1561,7 +1561,7 @@ func handleAckAlert(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *lo
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
 		return
 	}
-	if !proposeBest(c, cl, cluster.CmdAlertAck, gin.H{"tenant_id": claims.TenantID, "alert_id": id}) {
+	if !requireLeader(c, cl) {
 		return
 	}
 	if err := store.AckAlert(c.Request.Context(), claims.TenantID, claims.UserID, id); err != nil {
@@ -1578,7 +1578,7 @@ func handleAckAlert(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *lo
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
-func handleResolveAlert(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
+func handleResolveAlert(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *leader.Elector) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceAlert, rbac.ActionUpdate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
@@ -1589,7 +1589,7 @@ func handleResolveAlert(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
 		return
 	}
-	if !proposeBest(c, cl, cluster.CmdAlertResolve, gin.H{"tenant_id": claims.TenantID, "alert_id": id}) {
+	if !requireLeader(c, cl) {
 		return
 	}
 	if err := store.ResolveAlert(c.Request.Context(), claims.TenantID, claims.UserID, id); err != nil {
@@ -1874,7 +1874,7 @@ var _ = fmt.Sprintf
 // Rule CRUD
 // ---------------------------------------------------------------------------
 
-func handleCreateRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
+func handleCreateRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *leader.Elector) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceRule, rbac.ActionCreate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
@@ -1885,7 +1885,7 @@ func handleCreateRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if !proposeBest(c, cl, cluster.CmdRuleCreate, gin.H{"tenant_id": claims.TenantID, "req": req}) {
+	if !requireLeader(c, cl) {
 		return
 	}
 	if store != nil {
@@ -1926,7 +1926,7 @@ func handleCreateRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 	}})
 }
 
-func handleToggleRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
+func handleToggleRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *leader.Elector) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceRule, rbac.ActionUpdate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
@@ -1940,7 +1940,7 @@ func handleToggleRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if !proposeBest(c, cl, cluster.CmdRuleToggle, gin.H{"tenant_id": claims.TenantID, "rule_id": id, "enabled": req.Enabled}) {
+	if !requireLeader(c, cl) {
 		return
 	}
 	if store != nil {
@@ -1965,14 +1965,14 @@ func handleToggleRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 	c.JSON(http.StatusOK, gin.H{"ok": true, "id": id, "enabled": req.Enabled})
 }
 
-func handleDeleteRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
+func handleDeleteRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *leader.Elector) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceRule, rbac.ActionDelete) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
 		return
 	}
 	id := c.Param("id")
-	if !proposeBest(c, cl, cluster.CmdRuleDelete, gin.H{"tenant_id": claims.TenantID, "rule_id": id}) {
+	if !requireLeader(c, cl) {
 		return
 	}
 	if store != nil {

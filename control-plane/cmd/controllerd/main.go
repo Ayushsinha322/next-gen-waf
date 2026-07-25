@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -20,9 +21,9 @@ import (
 	"github.com/your-org/sentinel-waf/control-plane/internal/auth"
 	"github.com/your-org/sentinel-waf/control-plane/internal/certmon"
 	chreader "github.com/your-org/sentinel-waf/control-plane/internal/clickhouse"
-	"github.com/your-org/sentinel-waf/control-plane/internal/cluster"
 	"github.com/your-org/sentinel-waf/control-plane/internal/db"
 	"github.com/your-org/sentinel-waf/control-plane/internal/diskmon"
+	"github.com/your-org/sentinel-waf/control-plane/internal/leader"
 	"github.com/your-org/sentinel-waf/control-plane/internal/logs"
 	"github.com/your-org/sentinel-waf/control-plane/internal/nodehealth"
 	"github.com/your-org/sentinel-waf/control-plane/internal/rbac"
@@ -248,19 +249,19 @@ func run() error {
 	// ── RBAC ──────────────────────────────────────────────────────────────────
 	enforcer := rbac.NewEnforcer()
 
-	// ── Raft cluster (optional) ──────────────────────────────────────────────
-	// Activated when SENTINEL_RAFT_ADDR is set.  Single-node bootstrap when
-	// SENTINEL_RAFT_PEERS is empty.  Started BEFORE the singleton background
-	// workers so we can gate them on cluster membership.
-	cl, clErr := startCluster(log)
+	// ── Write-leader election ────────────────────────────────────────────────
+	// A single Postgres advisory lock decides which node accepts writes and runs
+	// the singleton background workers. Started BEFORE those workers so they can
+	// be gated on leadership. Every node participates whenever a database is
+	// configured; there is no separate cluster to enable, and no quorum that can
+	// be lost independently of Postgres itself.
+	cl, clErr := startElector(pool, log)
 	if clErr != nil {
-		// Fatal by design: SENTINEL_RAFT_ADDR was set, so a cluster was INTENDED.
-		// Silently degrading to standalone would turn leader-forwarding into a
-		// no-op cluster-wide and mask a real misconfiguration (a stale secret, a
-		// bad peer list). Fail loud so the operator fixes the deploy, not the WAF.
-		return fmt.Errorf("cluster init failed: %w", clErr)
+		return fmt.Errorf("leader election init failed: %w", clErr)
 	}
 	if cl != nil {
+		// Resign explicitly on shutdown so a successor takes over immediately
+		// instead of waiting for Postgres to reap the dropped connection.
 		defer cl.Stop()
 	}
 
@@ -287,7 +288,7 @@ func run() error {
 			} else {
 				log.Info("threat-intel aggregator disabled (SENTINEL_THREATINTEL_ENABLED=false)")
 			}
-			nm := nodehealth.New(store, eng, cl, log)
+			nm := nodehealth.New(store, eng, log)
 			nm.Start()
 			stops = append(stops, nm.Stop)
 			cm := certmon.New(eng, dataPlaneBaseURL(), os.Getenv("SENTINEL_INTERNAL_SECRET"), log)
@@ -402,14 +403,18 @@ func run() error {
 			}
 		}
 		if cl == nil {
-			checks["raft"] = "standalone"
+			checks["leader"] = "standalone"
 		} else {
 			st := cl.Status()
-			if st.LeaderID == nil {
-				checks["raft"] = "no-leader"
+			// A node with no leader in view cannot serve writes, so it must not
+			// receive traffic. Note this is NOT a quorum check: leadership depends
+			// only on Postgres, so if the database is reachable a leader exists (or
+			// is about to, within one campaign interval).
+			if st.LeaderID == "" {
+				checks["leader"] = "no-leader"
 				ready = false
 			} else {
-				checks["raft"] = string(st.Role)
+				checks["leader"] = st.Role
 			}
 		}
 		code := http.StatusOK
@@ -761,169 +766,70 @@ func autoStartDataPlane(log *zap.Logger) bool {
 	return true
 }
 
-// startCluster reads SENTINEL_RAFT_* env vars and starts a Raft node if
-// SENTINEL_RAFT_ADDR is set.  Returns (nil, nil) when Raft is disabled (no
-// addr).  Returns (nil, err) on misconfiguration.
+// startElector starts Postgres advisory-lock write-leader election.
 //
-// Env:
+// It replaced startCluster(), which wired up a hand-rolled Raft node from a pile
+// of SENTINEL_RAFT_* variables: a numeric node ID, an explicit peer list, a
+// listen address, a persistent log directory, a dedicated port, and a shared
+// secret that was the sole authenticator on inter-node RPC. All of that is gone.
+// Leadership is a single advisory lock in the database every node already talks
+// to, so there is no second cluster to configure, secure, or lose quorum in.
 //
-//	SENTINEL_NODE_ID      uint64    required if RAFT_ADDR set
-//	SENTINEL_RAFT_ADDR    host:port required to enable
-//	SENTINEL_RAFT_PEERS   "2=host:9602,3=host:9603"  (empty = single-node)
-//	SENTINEL_RAFT_DIR     persistent state dir (default: ./raft-data)
-func startCluster(log *zap.Logger) (*cluster.Cluster, error) {
-	addr := os.Getenv("SENTINEL_RAFT_ADDR")
-	if addr == "" {
-		log.Info("Raft disabled (SENTINEL_RAFT_ADDR not set) — running standalone")
+// Enabled whenever a database is configured. Without one the node is a standalone
+// writer, which is the same behaviour as before when Raft was disabled.
+//
+// Env (all optional):
+//
+//	SENTINEL_NODE_ID           stable identity for logs/status (default: pod name / hostname)
+//	SENTINEL_ADVERTISE_ADDR    host:port peers should forward writes to
+//	SENTINEL_POD_NAME          StatefulSet pod name, used to derive the advertise address
+//	SENTINEL_HEADLESS_SERVICE  headless Service name, used with SENTINEL_POD_NAME
+func startElector(pool db.Pool, log *zap.Logger) (*leader.Elector, error) {
+	if pool == nil {
+		log.Info("leader election disabled (no database) — running standalone")
 		return nil, nil
 	}
-	idStr := os.Getenv("SENTINEL_NODE_ID")
-	peersRaw := os.Getenv("SENTINEL_RAFT_PEERS")
-
-	// Kubernetes StatefulSet mode: a StatefulSet gives every replica identical
-	// env, so NODE_ID/PEERS can't be hard-coded per pod. When NODE_ID isn't set
-	// explicitly but the pod name is available (downward API →
-	// SENTINEL_RAFT_POD_NAME or POD_NAME), derive both from the pod's ordinal:
-	// "sentinel-controlplane-2" + replicas=3 + service=<headless> →
-	// id=3, peers="1=sentinel-controlplane-0.<svc>:9600,2=...-1.<svc>:9600".
-	// This lets the same manifest scale replicas without per-pod config.
-	if idStr == "" {
-		pod := os.Getenv("SENTINEL_RAFT_POD_NAME")
-		if pod == "" {
-			pod = os.Getenv("POD_NAME")
-		}
-		if pod != "" {
-			derivedID, derivedPeers, derr := deriveRaftTopology(
-				pod,
-				os.Getenv("SENTINEL_RAFT_REPLICAS"),
-				os.Getenv("SENTINEL_RAFT_SERVICE"),
-				envOrDefault("SENTINEL_RAFT_PORT", "9600"),
-			)
-			if derr != nil {
-				return nil, fmt.Errorf("deriving Raft topology from pod ordinal: %w", derr)
-			}
-			idStr = strconv.FormatUint(derivedID, 10)
-			if peersRaw == "" {
-				peersRaw = derivedPeers
-			}
-			log.Info("derived Raft topology from pod ordinal (StatefulSet mode)",
-				zap.String("pod", pod),
-				zap.String("node_id", idStr),
-				zap.String("peers", peersRaw))
-		}
-	}
-	if idStr == "" {
-		return nil, fmt.Errorf("SENTINEL_NODE_ID required when SENTINEL_RAFT_ADDR is set " +
-			"(or set SENTINEL_RAFT_POD_NAME/_REPLICAS/_SERVICE for StatefulSet mode)")
-	}
-	id, err := strconv.ParseUint(idStr, 10, 64)
-	if err != nil || id == 0 {
-		return nil, fmt.Errorf("SENTINEL_NODE_ID must be a positive integer: %v", err)
+	lp, ok := pool.(leader.Pool)
+	if !ok {
+		// Only the pgx pool implements advisory locking; a future sqlite backend
+		// would be single-node and needs no election.
+		log.Info("leader election unavailable for this database backend — running standalone")
+		return nil, nil
 	}
 
-	peers := map[cluster.NodeID]string{}
-	if raw := peersRaw; raw != "" {
-		for _, kv := range strings.Split(raw, ",") {
-			kv = strings.TrimSpace(kv)
-			if kv == "" {
-				continue
-			}
-			parts := strings.SplitN(kv, "=", 2)
-			if len(parts) != 2 {
-				return nil, fmt.Errorf("invalid SENTINEL_RAFT_PEERS entry %q (want id=host:port)", kv)
-			}
-			pid, perr := strconv.ParseUint(strings.TrimSpace(parts[0]), 10, 64)
-			if perr != nil || pid == 0 {
-				return nil, fmt.Errorf("invalid peer id in %q", kv)
-			}
-			peers[cluster.NodeID(pid)] = strings.TrimSpace(parts[1])
-		}
-	}
-
-	dataDir := envOrDefault("SENTINEL_RAFT_DIR", filepath.Join(".", "raft-data", idStr))
-
-	// Inter-node RPC must be authenticated with a shared secret. Require it
-	// whenever peers are configured (multi-node) so a node on the cluster
-	// network can't forge log entries or spoof votes. Single-node clusters
-	// exchange no RPC, so the secret is optional there.
-	secret := os.Getenv("SENTINEL_RAFT_SECRET")
-	if len(peers) > 0 {
-		// The secret is the ONLY authenticator on inter-node Raft RPC (votes,
-		// AppendEntries). A weak/known value lets anyone on the cluster network
-		// forge votes and disrupt consensus, so reject the empty case, the
-		// committed demo default, and anything too short to be a real key.
-		const demoDefault = "demo-raft-cluster-secret"
-		switch {
-		case secret == "":
-			return nil, fmt.Errorf("SENTINEL_RAFT_SECRET is required for a multi-node cluster (peers configured)")
-		case secret == demoDefault:
-			return nil, fmt.Errorf("SENTINEL_RAFT_SECRET is set to the insecure committed default %q — generate a strong random value (e.g. openssl rand -hex 32) into the deploy .env", demoDefault)
-		case len(secret) < 32:
-			return nil, fmt.Errorf("SENTINEL_RAFT_SECRET must be >=32 chars for a multi-node cluster; got %d", len(secret))
-		}
-	}
-
-	cfg := cluster.Config{
-		NodeID:     cluster.NodeID(id),
-		ListenAddr: addr,
-		Peers:      peers,
-		DataDir:    dataDir,
-		Secret:     secret,
-		Logger:     log.Named("raft"),
-		Apply: func(cmd cluster.Command) error {
-			// At apply time the leader has already written through Postgres
-			// (DB is shared) and followers re-read state on demand.  This
-			// hook is currently a no-op log entry; future work may stream
-			// applied commands to the data-plane for live mirroring.
-			log.Debug("raft apply",
-				zap.String("kind", string(cmd.Kind)),
-				zap.Int("payload_bytes", len(cmd.Payload)),
-			)
-			return nil
-		},
-	}
-
-	return cluster.Start(cfg)
+	nodeID := leader.NodeID()
+	advertise := electorAdvertiseAddr()
+	e := leader.New(lp, nodeID, advertise, log.Named("leader"))
+	e.Start()
+	log.Info("leader election started (Postgres advisory lock)",
+		zap.String("node_id", nodeID),
+		zap.String("advertise", advertise))
+	return e, nil
 }
 
-// deriveRaftTopology computes this node's Raft ID and peer list from its
-// StatefulSet pod ordinal, so one manifest serves every replica.
+// electorAdvertiseAddr computes the host:port other nodes should forward writes to.
 //
-//	pod="sentinel-controlplane-2", replicas="3", service="sentinel-controlplane-hl", port="9600"
-//	  → id=3, peers="1=sentinel-controlplane-0.sentinel-controlplane-hl:9600,
-//	                 2=sentinel-controlplane-1.sentinel-controlplane-hl:9600"
-//
-// Node IDs are 1-based (ordinal+1) because Raft treats 0 as "no node". Peer
-// addresses use the per-pod stable DNS a headless Service provides
-// (<pod>.<service>), which resolves within the namespace and survives restarts.
-func deriveRaftTopology(pod, replicasStr, service, port string) (uint64, string, error) {
-	dash := strings.LastIndex(pod, "-")
-	if dash < 0 || dash == len(pod)-1 {
-		return 0, "", fmt.Errorf("pod name %q has no ordinal suffix (expected name-N)", pod)
-	}
-	ordinal, err := strconv.Atoi(pod[dash+1:])
-	if err != nil || ordinal < 0 {
-		return 0, "", fmt.Errorf("pod name %q has a non-ordinal suffix %q", pod, pod[dash+1:])
-	}
-	prefix := pod[:dash] // e.g. "sentinel-controlplane"
-
-	replicas, err := strconv.Atoi(replicasStr)
-	if err != nil || replicas < 1 {
-		return 0, "", fmt.Errorf("SENTINEL_RAFT_REPLICAS must be a positive integer, got %q", replicasStr)
-	}
-	if ordinal >= replicas {
-		return 0, "", fmt.Errorf("pod ordinal %d is out of range for %d replicas", ordinal, replicas)
-	}
-	if service == "" {
-		return 0, "", fmt.Errorf("SENTINEL_RAFT_SERVICE (headless service name) is required for StatefulSet mode")
-	}
-
-	var peers []string
-	for i := 0; i < replicas; i++ {
-		if i == ordinal {
-			continue // skip self
+// Prefers an explicit override, then the per-pod stable DNS a headless Service
+// provides (<pod>.<service>), which resolves within the namespace and survives
+// restarts, then the hostname. The port is this node's REST port, because writes
+// are forwarded over REST — unlike the Raft setup, which advertised a separate
+// consensus port that then had to be rewritten to the REST port on every forward.
+func electorAdvertiseAddr() string {
+	port := clusterRESTPort()
+	if v := strings.TrimSpace(os.Getenv("SENTINEL_ADVERTISE_ADDR")); v != "" {
+		if _, _, err := net.SplitHostPort(v); err == nil {
+			return v
 		}
-		peers = append(peers, fmt.Sprintf("%d=%s-%d.%s:%s", i+1, prefix, i, service, port))
+		return net.JoinHostPort(v, port)
 	}
-	return uint64(ordinal + 1), strings.Join(peers, ","), nil
+	pod := strings.TrimSpace(os.Getenv("SENTINEL_POD_NAME"))
+	svc := strings.TrimSpace(os.Getenv("SENTINEL_HEADLESS_SERVICE"))
+	if pod != "" && svc != "" {
+		return net.JoinHostPort(pod+"."+svc, port)
+	}
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "localhost"
+	}
+	return net.JoinHostPort(host, port)
 }

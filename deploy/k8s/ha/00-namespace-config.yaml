@@ -48,7 +48,6 @@ stringData:
   db-url: "postgres://sentinel:CHANGE_ME@sentinel-postgres-rw:5432/sentinel?sslmode=require"
   jwt-secret: "CHANGE_ME_jwt_signing_secret"
   internal-secret: "CHANGE_ME_dataplane_controlplane_shared_secret"
-  raft-secret: "CHANGE_ME_raft_inter_node_secret"
   # ClickHouse password — the data plane (writer) and control plane (reader) both
   # use it for searchable event history. Must match the ClickHouse StatefulSet.
   clickhouse-password: "CHANGE_ME_clickhouse_password"

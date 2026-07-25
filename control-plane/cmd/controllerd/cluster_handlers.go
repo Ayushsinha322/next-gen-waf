@@ -1,9 +1,6 @@
 package main
 
 import (
-	"context"
-	"encoding/json"
-	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -13,7 +10,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/your-org/sentinel-waf/control-plane/internal/cluster"
+	"github.com/your-org/sentinel-waf/control-plane/internal/leader"
 )
 
 // hopByHopHeaders are connection-scoped and must NOT be copied from the leader's
@@ -73,7 +70,7 @@ func clusterRESTPort() string {
 // leader" model (etcd/Consul-style). It must run BEFORE the auth middleware on
 // each group: on a follower we forward the raw request (Authorization header and
 // all) and let the leader authenticate, avoiding double work.
-func leaderForward(cl *cluster.Cluster) gin.HandlerFunc {
+func leaderForward(cl *leader.Elector) gin.HandlerFunc {
 	restPort := clusterRESTPort()
 	return func(c *gin.Context) {
 		if cl == nil {
@@ -94,19 +91,22 @@ func leaderForward(cl *cluster.Cluster) gin.HandlerFunc {
 			return
 		}
 
-		id, raftAddr := cl.LeaderHint()
-		if id == nil || raftAddr == "" {
+		id, advertise, ok := cl.Leader()
+		if !ok || advertise == "" {
 			c.AbortWithStatusJSON(http.StatusServiceUnavailable,
 				gin.H{"error": "no leader elected yet — retry shortly"})
 			return
 		}
-		host, _, err := net.SplitHostPort(raftAddr)
+		// The leader advertises its REST address directly, so there is no longer a
+		// Raft port to rewrite. Fall back to the shared REST port if it advertised
+		// a bare host.
+		host, port, err := net.SplitHostPort(advertise)
 		if err != nil {
-			host = raftAddr
+			host, port = advertise, restPort
 		}
 		target := (&url.URL{
 			Scheme:   "http",
-			Host:     net.JoinHostPort(host, restPort),
+			Host:     net.JoinHostPort(host, port),
 			Path:     c.Request.URL.Path,
 			RawQuery: c.Request.URL.RawQuery,
 		}).String()
@@ -126,7 +126,7 @@ func leaderForward(cl *cluster.Cluster) gin.HandlerFunc {
 		resp, err := leaderForwardClient.Do(req)
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusBadGateway,
-				gin.H{"error": "leader unreachable: " + err.Error(), "leader_id": *id})
+				gin.H{"error": "leader unreachable: " + err.Error(), "leader_id": id})
 			return
 		}
 		defer resp.Body.Close()
@@ -144,87 +144,43 @@ func leaderForward(cl *cluster.Cluster) gin.HandlerFunc {
 	}
 }
 
-// requireLeader returns true if this node is the leader and the request may
-// proceed.  Otherwise it writes a 503 with a Location header pointing at the
-// known leader (if any) so clients/proxies can retry there, and returns false.
+// requireLeader returns true if this node holds write leadership and the request
+// may proceed. Otherwise it writes a retryable 503 naming the current leader (if
+// known) so clients and proxies can retry there, and returns false.
 //
-// When cluster is nil (single-node bootstrap without --enable-cluster), all
-// writes proceed unconditionally — the same behaviour we had pre-Raft.
-func requireLeader(c *gin.Context, cl *cluster.Cluster) bool {
-	if cl == nil {
+// When cl is nil no database is configured, so the node is a standalone writer and
+// all writes proceed.
+//
+// This replaced proposeBest(), which additionally round-tripped a Raft log entry
+// before the handler wrote to Postgres. That entry was pure overhead: the state
+// machine's Apply hook was a no-op, so nothing ever consumed the log, and the real
+// state change went to Postgres immediately afterwards either way. Worse, its
+// commit required control-plane quorum, so losing 2 of 3 nodes refused every write
+// even while Postgres — itself HA with its own synchronous quorum — was healthy
+// and writable. Leadership now comes from a Postgres advisory lock, so write
+// availability depends only on the database the write was going to anyway.
+func requireLeader(c *gin.Context, cl *leader.Elector) bool {
+	if cl == nil || cl.IsLeader() {
 		return true
 	}
-	if cl.IsLeader() {
-		return true
-	}
-	id, addr := cl.LeaderHint()
-	resp := gin.H{"error": "not the leader"}
-	if id != nil {
-		resp["leader_id"] = *id
+	resp := gin.H{"error": "not the write leader"}
+	if id, addr, ok := cl.Leader(); ok {
+		resp["leader_id"] = id
 		resp["leader_addr"] = addr
 		if addr != "" {
 			c.Header("X-Sentinel-Leader", addr)
 		}
+	} else {
+		resp["error"] = "no leader elected yet — retry shortly"
 	}
+	// Retryable: leadership changes are brief and clients should back off, not fail.
+	c.Header("Retry-After", "2")
 	c.JSON(http.StatusServiceUnavailable, resp)
 	return false
 }
 
-// proposeBest tries to replicate a command through Raft.  When the cluster is
-// nil (Raft disabled) it's a no-op success.  On *NotLeaderError it writes the
-// 503 redirect and returns false so the caller can short-circuit.
-func proposeBest(c *gin.Context, cl *cluster.Cluster, kind cluster.CommandKind, payload interface{}) bool {
-	if cl == nil {
-		return true
-	}
-	if !cl.IsLeader() {
-		id, addr := cl.LeaderHint()
-		resp := gin.H{"error": "not the leader"}
-		if id != nil {
-			resp["leader_id"] = *id
-			resp["leader_addr"] = addr
-			if addr != "" {
-				c.Header("X-Sentinel-Leader", addr)
-			}
-		}
-		c.JSON(http.StatusServiceUnavailable, resp)
-		return false
-	}
-
-	raw, err := json.Marshal(payload)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "marshal command: " + err.Error()})
-		return false
-	}
-	// Bound the commit: if quorum is lost (e.g. 2 of 3 nodes down) Propose would
-	// otherwise block until the client disconnects. Fast-fail with a retryable
-	// 503 instead so callers/proxies back off and retry cleanly.
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
-	defer cancel()
-	if err := cl.Propose(ctx, cluster.Command{Kind: kind, Payload: raw}); err != nil {
-		var nle *cluster.NotLeaderError
-		if errors.As(err, &nle) {
-			resp := gin.H{"error": "not the leader"}
-			if nle.LeaderID != nil {
-				resp["leader_id"] = *nle.LeaderID
-				resp["leader_addr"] = nle.LeaderAddr
-			}
-			c.JSON(http.StatusServiceUnavailable, resp)
-			return false
-		}
-		if errors.Is(err, context.DeadlineExceeded) {
-			c.Header("Retry-After", "2")
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "raft commit timed out (quorum unavailable?) — retry shortly"})
-			return false
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "raft propose: " + err.Error()})
-		return false
-	}
-	return true
-}
-
 // handleClusterStatus exposes the Raft state for monitoring.
-func handleClusterStatus(c *gin.Context, cl *cluster.Cluster) {
+func handleClusterStatus(c *gin.Context, cl *leader.Elector) {
 	if cl == nil {
 		c.JSON(http.StatusOK, gin.H{
 			"enabled": false,

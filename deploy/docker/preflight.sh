@@ -29,9 +29,8 @@ check_len(){ # name minlen
 check_len SENTINEL_JWT_SECRET 32
 check_len SENTINEL_AUDIT_HMAC_KEY 32
 check_len SENTINEL_INTERNAL_SECRET 32
-check_len SENTINEL_RAFT_SECRET 32
-if grep -qE '^SENTINEL_RAFT_SECRET=demo-raft-cluster-secret$' "$ENV_FILE"; then
-  red "SENTINEL_RAFT_SECRET is the insecure committed default"
+if grep -qE '^SENTINEL_RAFT_SECRET=' "$ENV_FILE"; then
+  red "SENTINEL_RAFT_SECRET is set but no longer used — leadership is a Postgres advisory lock. Remove it from .env"
 fi
 
 # 2) compose renders (this alone fails if a :? var is unset) — the authoritative
@@ -57,7 +56,7 @@ fi
 if [ -s /tmp/_pf_cfg.yml ]; then
   extract(){ awk "/^  $1:/{f=1} f&&/^  [a-z]/&&!/^  $1:/{f=0} f" /tmp/_pf_cfg.yml \
     | grep -oE 'SENTINEL_[A-Z_]+|CLICKHOUSE_[A-Z_]+' \
-    | grep -vE 'SENTINEL_NODE_ID|SENTINEL_RAFT_ADDR|SENTINEL_RAFT_PEERS' | sort -u; }
+    | grep -vE 'SENTINEL_NODE_ID|SENTINEL_ADVERTISE_ADDR' | sort -u; }
   if diff <(extract controlplane) <(extract cp2) >/dev/null && diff <(extract cp2) <(extract cp3) >/dev/null; then
     ok "control-plane env keys identical across controlplane/cp2/cp3"
   else

@@ -183,9 +183,9 @@ export default function SideBar() {
     footSub   = healthErr ? "control plane unreachable" : "connecting…";
     footDot   = healthErr ? "r" : "a";
   } else if (cp?.enabled) {
-    footTitle = cp.leader_id != null ? `node ${cp.leader_id} · leader` : "no leader elected";
-    footSub   = `Raft · ${cp.healthy}/${cp.total} online${fleetVersion ? ` · ${fleetVersion}` : ""}`;
-    footDot   = cp.quorum_ok ? "g" : "r";
+    footTitle = cp.leader_id != null ? `${cp.leader_id} · leader` : "no leader elected";
+    footSub   = `${cp.healthy}/${cp.total} online${fleetVersion ? ` · ${fleetVersion}` : ""}`;
+    footDot   = cp.write_available ? "g" : "r";
   } else {
     footTitle = "Standalone";
     footSub   = `${dp?.total ?? 0} WAF node${(dp?.total ?? 0) === 1 ? "" : "s"}${fleetVersion ? ` · ${fleetVersion}` : ""}`;

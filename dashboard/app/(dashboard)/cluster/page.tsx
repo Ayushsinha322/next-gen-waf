@@ -1,7 +1,7 @@
 "use client";
 /**
  * Cluster & Node Health — a fleet-wide operational view of the whole
- * deployment: the data-plane WAF fleet, the control-plane (Raft) quorum, and a
+ * deployment: the data-plane WAF fleet, control-plane membership, and a
  * live topology map showing traffic flow from clients through the load balancer
  * and WAF nodes to the origins. Everything degrades silently to placeholders
  * when the control plane is unreachable.
@@ -128,7 +128,7 @@ export default function ClusterPage() {
         <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
           <div className="sec-title">Cluster &amp; Node Health</div>
           <div className="sec-sub">
-            Fleet-wide health of the WAF data plane and control-plane quorum — live topology, failover budget, and node status
+Fleet-wide health of the WAF data plane and control plane — live topology, failover budget, and node status
           </div>
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center", flexShrink: 0 }}>
@@ -170,11 +170,11 @@ export default function ClusterPage() {
               value={dp ? `${dp.healthy}/${dp.total}` : "—"}
               sub={dp ? `${dp.healthy} healthy · ${dp.degraded} degraded · ${dp.down} down` : "waiting…"} />
             <StatFigure
-              accentCls={cp?.enabled ? (cp?.quorum_ok ? "kc" : "ka") : "kp"}
-              accent={cp?.enabled ? (cp?.quorum_ok ? "var(--cyan)" : "var(--red)") : "var(--text3)"}
-              label="Control plane quorum"
+              accentCls={cp?.enabled ? (cp?.write_available ? "kc" : "ka") : "kp"}
+              accent={cp?.enabled ? (cp?.write_available ? "var(--cyan)" : "var(--red)") : "var(--text3)"}
+              label="Control plane"
               value={cp?.enabled ? `${cp.healthy}/${cp.total}` : (cp ? "N/A" : "—")}
-              sub={cp?.enabled ? (cp.quorum_ok ? "quorum OK" : "QUORUM AT RISK") : "standalone"} />
+              sub={cp?.enabled ? (cp.write_available ? "writes available" : "NO WRITE LEADER") : "standalone"} />
             <StatFigure
               accentCls="ka" accent="var(--amber)"
               label="Resilience budget"
@@ -232,9 +232,9 @@ export default function ClusterPage() {
         {/* Control plane */}
         <div className="panel">
           <div className="ph">
-            <div className="ptitle">Control Plane · Raft</div>
+            <div className="ptitle">Control Plane</div>
             {cp?.enabled
-              ? <span className={`panel-badge ${cp.quorum_ok ? "pb-cyan" : "pb-live"}`}>{cp.quorum_ok ? `quorum ${cp.healthy}/${cp.total}` : "QUORUM AT RISK"}</span>
+              ? <span className={`panel-badge ${cp.write_available ? "pb-cyan" : "pb-live"}`}>{cp.write_available ? `${cp.healthy}/${cp.total} online` : "NO WRITE LEADER"}</span>
               : <span className="panel-badge pb-info">standalone</span>}
           </div>
           <div className="pb">
@@ -243,24 +243,31 @@ export default function ClusterPage() {
                 <div style={{ fontSize: 28, marginBottom: 8 }}>🧩</div>
                 <div style={{ fontSize: 15, fontWeight: 700, color: "var(--text2)", marginBottom: 6 }}>Standalone (HA not enabled)</div>
                 <div style={{ fontSize: 14, color: "var(--text3)", fontFamily: MONO, lineHeight: 1.6, maxWidth: 440, margin: "0 auto" }}>
-                  Running a single control-plane node. Add peers to form a Raft quorum for automatic leader failover.
+                  Running a single control-plane node. Add replicas for spare capacity — write leadership
+                  fails over automatically via a Postgres advisory lock, with no quorum to maintain.
                 </div>
               </div>
             ) : (
               <>
-                {/* Quorum meter */}
+                {/* Write availability. There is deliberately no quorum meter:
+                    leadership is a Postgres advisory lock, so a single surviving
+                    node still serves writes and a control-plane majority is not
+                    required. Showing a quorum bar would imply a constraint that
+                    does not exist. */}
                 <div style={{ marginBottom: 14 }}>
                   <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, fontFamily: MONO, marginBottom: 6 }}>
-                    <span style={{ color: "var(--text3)" }}>Quorum ({cp.quorum_size} needed) · term {cp.term}</span>
-                    <span style={{ color: cp.quorum_ok ? "var(--green)" : "var(--red)", fontWeight: 700 }}>
-                      {cp.healthy}/{cp.total} — {cp.quorum_ok ? "QUORUM OK" : "QUORUM AT RISK"}
+                    <span style={{ color: "var(--text3)" }}>
+                      Nodes online{cp.leader_id ? ` · leader ${cp.leader_id}` : ""}
+                    </span>
+                    <span style={{ color: cp.write_available ? "var(--green)" : "var(--red)", fontWeight: 700 }}>
+                      {cp.healthy}/{cp.total} — {cp.write_available ? "WRITES AVAILABLE" : "NO WRITE LEADER"}
                     </span>
                   </div>
                   <div style={{ display: "flex", gap: 4 }}>
                     {Array.from({ length: cp.total }).map((_, i) => (
                       <div key={i} style={{
                         flex: 1, height: 8, borderRadius: 3,
-                        background: i < cp.healthy ? (cp.quorum_ok ? "var(--green)" : "var(--amber)") : "var(--bg4)",
+                        background: i < cp.healthy ? (cp.write_available ? "var(--green)" : "var(--amber)") : "var(--bg4)",
                       }} />
                     ))}
                   </div>

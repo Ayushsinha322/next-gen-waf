@@ -15,7 +15,6 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/your-org/sentinel-waf/control-plane/internal/alerting"
-	"github.com/your-org/sentinel-waf/control-plane/internal/cluster"
 	"github.com/your-org/sentinel-waf/control-plane/internal/db"
 	"github.com/your-org/sentinel-waf/control-plane/internal/notify"
 )
@@ -26,33 +25,34 @@ const (
 	// defaultDownAfter is the staleness window before a data-plane node whose
 	// heartbeats stopped is considered DOWN. Override via SENTINEL_NODE_DOWN_SECS.
 	defaultDownAfter = 30 * time.Second
-	// cpMissThreshold debounces control-plane peer flapping: the Raft peer
-	// reachability window is ~200ms, so require this many consecutive misses
-	// (~30s at tickInterval) before declaring a control-plane node down.
-	cpMissThreshold = 3
 )
 
-// Monitor tracks node health. It is safe to construct with a nil cluster (Raft
-// disabled / standalone) — the control-plane section is simply skipped.
+// Monitor tracks DATA-PLANE node health.
+//
+// It used to also track control-plane peer reachability and Raft quorum. Both
+// concepts disappeared with the Raft implementation: leadership is now a Postgres
+// advisory lock, so control-plane nodes hold no opinion about each other and there
+// is no second quorum to be at risk. Control-plane liveness is observed by the
+// orchestrator's readiness probes against /readyz, which is the layer that can
+// actually act on it by removing the node from Service endpoints.
+//
+// The monitor no longer needs a leader handle either: main.go's supervisor starts
+// this set only on the node holding leadership and stops it when leadership moves,
+// so by construction exactly one instance runs.
 type Monitor struct {
 	store     *db.Store
 	engine    *alerting.Engine
-	cl        *cluster.Cluster
 	log       *zap.Logger
 	downAfter time.Duration
 	done      chan struct{}
 
 	// In-memory transition state (single monitor goroutine — no locking needed).
 	dpPrev map[string]string // data-plane node id -> last effective status
-	cpMiss map[uint64]int    // control-plane node id -> consecutive unreachable ticks
-	cpPrev map[uint64]bool   // control-plane node id -> last-known reachable
-
-	quorumAtRisk bool // last-known quorum state (for recovery edge)
 }
 
 // New builds a Monitor. downAfter comes from SENTINEL_NODE_DOWN_SECS (seconds;
 // default 30s). The Monitor should only be started when store != nil.
-func New(store *db.Store, engine *alerting.Engine, cl *cluster.Cluster, log *zap.Logger) *Monitor {
+func New(store *db.Store, engine *alerting.Engine, log *zap.Logger) *Monitor {
 	downAfter := defaultDownAfter
 	if v := os.Getenv("SENTINEL_NODE_DOWN_SECS"); v != "" {
 		if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
@@ -65,21 +65,17 @@ func New(store *db.Store, engine *alerting.Engine, cl *cluster.Cluster, log *zap
 	return &Monitor{
 		store:     store,
 		engine:    engine,
-		cl:        cl,
 		log:       log,
 		downAfter: downAfter,
 		done:      make(chan struct{}),
 		dpPrev:    make(map[string]string),
-		cpMiss:    make(map[uint64]int),
-		cpPrev:    make(map[uint64]bool),
 	}
 }
 
 // Start launches the health-check loop in its own goroutine.
 func (m *Monitor) Start() {
 	m.log.Info("node-health monitor started",
-		zap.Duration("down_after", m.downAfter),
-		zap.Bool("cluster", m.cl != nil))
+		zap.Duration("down_after", m.downAfter))
 	go m.loop()
 }
 
@@ -103,7 +99,6 @@ func (m *Monitor) loop() {
 
 func (m *Monitor) tick(ctx context.Context) {
 	m.checkDataPlane(ctx)
-	m.checkControlPlane()
 }
 
 // checkDataPlane flips stale nodes to "down" and raises down/recovered alerts on
@@ -176,139 +171,6 @@ func (m *Monitor) raiseDataPlaneRecovered(node db.Node) {
 		Details:  map[string]interface{}{"node": node.ID, "hostname": node.Hostname},
 	})
 	m.log.Info("data-plane node recovered", zap.String("node", node.ID))
-}
-
-// checkControlPlane debounces Raft peer reachability and raises node/quorum
-// alerts. No-op when Raft is disabled.
-func (m *Monitor) checkControlPlane() {
-	if m.cl == nil {
-		return
-	}
-	// Raft tracks peer liveness only leader->follower (a follower never RPCs its
-	// fellow followers, so it sees them as "unreachable"). Only the leader has an
-	// accurate view, so only the leader evaluates control-plane health and raises
-	// cp_node_down / quorum alerts — this also guarantees a single alerter, not
-	// one per follower.
-	if !m.cl.IsLeader() {
-		return
-	}
-	st := m.cl.Status()
-
-	for _, peer := range st.Peers {
-		id := uint64(peer.NodeID)
-		if peer.Reachable {
-			// Recovery edge: raise only if we had previously declared it down.
-			if m.cpMiss[id] >= cpMissThreshold {
-				m.raiseCPRecovered(id)
-			}
-			m.cpMiss[id] = 0
-			m.cpPrev[id] = true
-			continue
-		}
-		m.cpMiss[id]++
-		// Fire exactly once when we cross the debounce threshold.
-		if m.cpMiss[id] == cpMissThreshold {
-			m.raiseCPDown(id, peer.Addr)
-		}
-		m.cpPrev[id] = false
-	}
-
-	// Quorum: self + reachable peers vs the majority needed.
-	total := len(st.Peers) + 1
-	healthy := 1
-	for _, peer := range st.Peers {
-		if peer.Reachable {
-			healthy++
-		}
-	}
-	quorumSize := total/2 + 1
-	if healthy < quorumSize {
-		if !m.quorumAtRisk {
-			m.raiseQuorumAtRisk(healthy, quorumSize, total)
-		}
-		m.quorumAtRisk = true
-	} else {
-		if m.quorumAtRisk {
-			m.raiseQuorumRecovered(healthy, quorumSize, total)
-		}
-		m.quorumAtRisk = false
-	}
-}
-
-func (m *Monitor) raiseCPDown(id uint64, addr string) {
-	if m.store == nil {
-		return
-	}
-	summary := fmt.Sprintf("Control-plane node %d is unreachable", id)
-	m.engine.Raise(fmt.Sprintf("cp_node_down:%d", id), db.CreateAlertRequest{
-		Severity: "critical",
-		Kind:     "cp_node_down",
-		Summary:  summary,
-		Details:  jsonRaw(map[string]any{"node_id": id, "addr": addr}),
-	}, notify.Alert{
-		Severity: "critical",
-		Kind:     "cp_node_down",
-		Summary:  summary,
-		Details:  map[string]interface{}{"node_id": id, "addr": addr},
-	})
-	m.log.Warn("control-plane node unreachable", zap.Uint64("node_id", id))
-}
-
-func (m *Monitor) raiseCPRecovered(id uint64) {
-	if m.store == nil {
-		return
-	}
-	summary := fmt.Sprintf("Control-plane node %d recovered", id)
-	m.engine.Raise(fmt.Sprintf("cp_node_recovered:%d", id), db.CreateAlertRequest{
-		Severity: "info",
-		Kind:     "cp_node_recovered",
-		Summary:  summary,
-		Details:  jsonRaw(map[string]any{"node_id": id}),
-	}, notify.Alert{
-		Severity: "info",
-		Kind:     "cp_node_recovered",
-		Summary:  summary,
-		Details:  map[string]interface{}{"node_id": id},
-	})
-	m.log.Info("control-plane node recovered", zap.Uint64("node_id", id))
-}
-
-func (m *Monitor) raiseQuorumAtRisk(healthy, quorumSize, total int) {
-	if m.store == nil {
-		return
-	}
-	summary := fmt.Sprintf("Control-plane quorum at risk: %d/%d healthy (need %d)", healthy, total, quorumSize)
-	m.engine.Raise("quorum_at_risk", db.CreateAlertRequest{
-		Severity: "critical",
-		Kind:     "quorum_at_risk",
-		Summary:  summary,
-		Details:  jsonRaw(map[string]any{"healthy": healthy, "quorum_size": quorumSize, "total": total}),
-	}, notify.Alert{
-		Severity: "critical",
-		Kind:     "quorum_at_risk",
-		Summary:  summary,
-		Details:  map[string]interface{}{"healthy": healthy, "quorum_size": quorumSize, "total": total},
-	})
-	m.log.Warn("control-plane quorum at risk", zap.Int("healthy", healthy), zap.Int("quorum_size", quorumSize))
-}
-
-func (m *Monitor) raiseQuorumRecovered(healthy, quorumSize, total int) {
-	if m.store == nil {
-		return
-	}
-	summary := fmt.Sprintf("Control-plane quorum restored: %d/%d healthy (need %d)", healthy, total, quorumSize)
-	m.engine.Raise("quorum_recovered", db.CreateAlertRequest{
-		Severity: "info",
-		Kind:     "quorum_recovered",
-		Summary:  summary,
-		Details:  jsonRaw(map[string]any{"healthy": healthy, "quorum_size": quorumSize, "total": total}),
-	}, notify.Alert{
-		Severity: "info",
-		Kind:     "quorum_recovered",
-		Summary:  summary,
-		Details:  map[string]interface{}{"healthy": healthy, "quorum_size": quorumSize, "total": total},
-	})
-	m.log.Info("control-plane quorum restored")
 }
 
 func jsonRaw(m map[string]any) json.RawMessage {

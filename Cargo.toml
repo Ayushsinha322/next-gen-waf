@@ -9,7 +9,6 @@ members = [
     "crates/sentinel-plugins",
     "crates/sentinel-storage",
     "crates/sentinel-telemetry",
-    "crates/sentinel-cluster",
     "crates/sentinel-ebpf",
     "crates/sentinel-cli",
     "crates/sentinel-bin",
