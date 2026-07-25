@@ -42,7 +42,6 @@ spec:
   selector: { app: sentinel, tier: controlplane }
   ports:
     - { name: rest, port: 9501, targetPort: 9501 }
-    - { name: grpc, port: 9500, targetPort: 9500 }
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -70,11 +69,9 @@ spec:
           image: registry.example.com/sentinel/controlplane:latest
           ports:
             - { name: rest, containerPort: 9501 }
-            - { name: grpc, containerPort: 9500 }
             - { name: raft, containerPort: 9600 }
           env:
             - { name: SENTINEL_REST_ADDR, value: "0.0.0.0:9501" }
-            - { name: SENTINEL_GRPC_ADDR, value: "0.0.0.0:9500" }
             - { name: SENTINEL_AUTOSTART_DATAPLANE, value: "0" }
             # ClickHouse reader: powers Threat Search / event history (/events/*).
             # Same DB/creds the data-plane writer uses. Omit to disable search.

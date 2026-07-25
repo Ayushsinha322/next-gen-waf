@@ -6,10 +6,6 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/status"
 )
 
 // Context keys for storing auth info in context.Context.
@@ -198,77 +194,4 @@ func abortWithAuthError(c *gin.Context, err error) {
 		code = 403
 	}
 	c.AbortWithStatusJSON(code, gin.H{"error": err.Error()})
-}
-
-// ---------------------------------------------------------------------------
-// gRPC interceptors
-// ---------------------------------------------------------------------------
-
-// UnaryServerInterceptor returns a gRPC unary interceptor that validates JWT
-// tokens from the "authorization" metadata key.
-func UnaryServerInterceptor(jwt *JWTService) grpc.UnaryServerInterceptor {
-	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-		newCtx, err := authenticateGRPC(ctx, jwt)
-		if err != nil {
-			return nil, err
-		}
-		return handler(newCtx, req)
-	}
-}
-
-// StreamServerInterceptor returns a gRPC stream interceptor that validates JWT
-// tokens.
-func StreamServerInterceptor(jwt *JWTService) grpc.StreamServerInterceptor {
-	return func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-		newCtx, err := authenticateGRPC(ss.Context(), jwt)
-		if err != nil {
-			return err
-		}
-		wrapped := &grpcServerStream{ServerStream: ss, ctx: newCtx}
-		return handler(srv, wrapped)
-	}
-}
-
-func authenticateGRPC(ctx context.Context, jwt *JWTService) (context.Context, error) {
-	md, ok := metadata.FromIncomingContext(ctx)
-	if !ok {
-		return nil, status.Error(codes.Unauthenticated, "missing metadata")
-	}
-
-	values := md.Get("authorization")
-	if len(values) == 0 {
-		return nil, status.Error(codes.Unauthenticated, "missing authorization header")
-	}
-
-	token, err := BearerToken(values[0])
-	if err != nil {
-		return nil, status.Errorf(codes.Unauthenticated, "bad authorization: %v", err)
-	}
-
-	claims, err := jwt.Validate(token)
-	if err != nil {
-		if errors.Is(err, ErrTokenExpired) {
-			return nil, status.Error(codes.Unauthenticated, "token expired")
-		}
-		return nil, status.Errorf(codes.Unauthenticated, "invalid token: %v", err)
-	}
-
-	// Refresh tokens are not access credentials (see GinAuthMiddleware).
-	if claims.AuthMethod == "refresh" {
-		return nil, status.Error(codes.Unauthenticated, "refresh token is not valid for API access")
-	}
-
-	newCtx := context.WithValue(ctx, ClaimsKey, claims)
-	newCtx = context.WithValue(newCtx, TenantIDKey, claims.TenantID)
-	return newCtx, nil
-}
-
-// grpcServerStream wraps grpc.ServerStream to override Context().
-type grpcServerStream struct {
-	grpc.ServerStream
-	ctx context.Context
-}
-
-func (s *grpcServerStream) Context() context.Context {
-	return s.ctx
 }

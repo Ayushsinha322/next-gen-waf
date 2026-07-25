@@ -23,7 +23,6 @@ import (
 	"github.com/your-org/sentinel-waf/control-plane/internal/cluster"
 	"github.com/your-org/sentinel-waf/control-plane/internal/db"
 	"github.com/your-org/sentinel-waf/control-plane/internal/diskmon"
-	controlgrpc "github.com/your-org/sentinel-waf/control-plane/internal/grpc"
 	"github.com/your-org/sentinel-waf/control-plane/internal/logs"
 	"github.com/your-org/sentinel-waf/control-plane/internal/nodehealth"
 	"github.com/your-org/sentinel-waf/control-plane/internal/rbac"
@@ -340,25 +339,20 @@ func run() error {
 		}
 	}
 
-	// ── gRPC ──────────────────────────────────────────────────────────────────
-	grpcAddr := envOrDefault("SENTINEL_GRPC_ADDR", "0.0.0.0:9500")
+	// The data plane receives configuration by polling GET /api/v1/internal/config
+	// over REST (see sync_url in the proxy config). There is deliberately no gRPC
+	// listener: the ConfigService that used to run on :9500 had no client on
+	// either end — no Rust crate depends on tonic and nothing referenced
+	// ConfigService — yet it listened without TLS and registered gRPC server
+	// reflection unconditionally, so it served a full schema dump of the
+	// management API to anyone who could reach the port. It was removed rather
+	// than secured. If config push is ever wanted, add it to the authenticated
+	// REST surface instead of reviving a second protocol.
 	restAddr := envOrDefault("SENTINEL_REST_ADDR", "0.0.0.0:9501")
-
-	grpcSrv, err := controlgrpc.NewServer(grpcAddr, nil, jwtSvc, log)
-	if err != nil {
-		return fmt.Errorf("creating gRPC server: %w", err)
-	}
 
 	// ── Graceful shutdown ─────────────────────────────────────────────────────
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		if err := grpcSrv.Start(); err != nil {
-			log.Error("gRPC server failed", zap.Error(err))
-			sigCh <- syscall.SIGTERM
-		}
-	}()
 
 	// ── Data plane auto-start ─────────────────────────────────────────────────
 	// Try to find and start the Rust proxy binary automatically so the user
@@ -638,7 +632,6 @@ func run() error {
 	sig := <-sigCh
 	log.Info("shutting down", zap.String("signal", sig.String()))
 
-	grpcSrv.Stop()
 	if pool != nil {
 		pool.Close()
 	}

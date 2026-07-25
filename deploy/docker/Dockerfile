@@ -45,7 +45,7 @@ ENTRYPOINT ["/usr/local/bin/sentinel"]
 FROM gcr.io/distroless/static-debian12 AS sentinel-controlplane
 COPY --from=go-builder /out/controllerd /usr/local/bin/controllerd
 COPY --from=go-builder /out/sentinelctl  /usr/local/bin/sentinelctl
-EXPOSE 9500 9501
+EXPOSE 9501
 ENTRYPOINT ["/usr/local/bin/controllerd"]
 
 # ---- DB migrations (goose) ----

@@ -4,7 +4,7 @@
 #   postgres + redis  → control-plane backing stores
 #   clickhouse        → on-prem traffic/event log store (powers Threat Search)
 #   migrate           → one-shot goose DB migrations (runs to completion first)
-#   controlplane      → REST :9501 / gRPC :9500, seeds DB on boot (after migrate)
+#   controlplane      → REST :9501 (internal only), seeds DB on boot (after migrate)
 #   dataplane         → Rust WAF proxy, host :80 -> container :8080
 #   dashboard         → Next.js UI on :3000
 #   juiceshop         → demo upstream to protect (internal only)
@@ -129,7 +129,6 @@ services:
       # the owner role) and REMOVE this opt-out so RLS backstops isolation.
       SENTINEL_ALLOW_SUPERUSER_DB: "1"
       SENTINEL_REST_ADDR: 0.0.0.0:9501
-      SENTINEL_GRPC_ADDR: 0.0.0.0:9500
       SENTINEL_AUTOSTART_DATAPLANE: "0"
       SENTINEL_LOG_DIR: /var/log/sentinel
       # The dashboard's live-log SSE connects cross-origin (:3000 -> :9501) directly

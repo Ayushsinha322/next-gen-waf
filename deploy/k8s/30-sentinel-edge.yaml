@@ -76,7 +76,6 @@ spec:
             - secretRef:    { name: sentinel-secrets }
           ports:
             - { name: rest, containerPort: 9501 }
-            - { name: grpc, containerPort: 9500 }
           volumeMounts:
             - { name: logs, mountPath: /var/log/sentinel }
             - { name: tmp,  mountPath: /tmp }
@@ -149,7 +148,6 @@ spec:
   selector: { app: sentinel-edge }
   ports:
     - { name: rest, port: 9501, targetPort: 9501 }
-    - { name: grpc, port: 9500, targetPort: 9500 }
 ---
 # External WAF entrypoint via MetalLB. One LoadBalancer VIP serves:
 #   :80   public HTTP            → proxy :8080

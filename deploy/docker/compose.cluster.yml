@@ -42,7 +42,6 @@ x-cp-env: &cp-env
   # the non-superuser 'sentinel_app' role and REMOVE this.
   SENTINEL_ALLOW_SUPERUSER_DB: "1"
   SENTINEL_REST_ADDR: 0.0.0.0:9501
-  SENTINEL_GRPC_ADDR: 0.0.0.0:9500
   SENTINEL_AUTOSTART_DATAPLANE: "0"
   SENTINEL_LOG_DIR: /var/log/sentinel
   SENTINEL_CORS_ORIGINS: http://172.16.21.71:3000,https://172.16.21.71:9443

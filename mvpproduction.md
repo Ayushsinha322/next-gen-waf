@@ -64,7 +64,7 @@ Glibc check that informed this: build host is Debian 13 / glibc **2.41**, VM is 
 |---------|-------|---------------|-------|
 | `postgres` | postgres:16-alpine | internal only | control-plane DB; volume `pgdata` |
 | `redis` | redis:7-alpine | internal only | control-plane cache |
-| `controlplane` | `sentinel/controlplane` (Go, distroless static) | **`:9501`** (exposed — browser SSE connects here) | REST `:9501`, gRPC `:9500`; migrates + seeds DB + admin user on boot |
+| `controlplane` | `sentinel/controlplane` (Go, distroless static) | **`:9501`** (exposed — browser SSE connects here) | REST `:9501`; migrates + seeds DB + admin user on boot |
 | `dataplane` | `sentinel/dataplane` (Rust, distroless cc) | **`:80` → container `:8080`** | the WAF; CRS rules baked in; syncs sites from control plane |
 | `dashboard` | `sentinel/dashboard` (Next.js) | **`:3000`** | UI; `CONTROL_PLANE_URL=http://controlplane:9501` |
 | `juiceshop` | bkimminich/juice-shop | internal only | demo upstream to protect (only reachable *through* the WAF) |
