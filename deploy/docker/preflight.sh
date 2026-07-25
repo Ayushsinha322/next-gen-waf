@@ -63,7 +63,7 @@ if [ -s /tmp/_pf_cfg.yml ]; then
   fi
 fi
 
-# 3) env PARITY across the three CP nodes (only node id / raft addr / peers may differ)
+# 3) env PARITY across the three CP nodes (only node id / advertise addr may differ)
 if [ -s /tmp/_pf_cfg.yml ]; then
   extract(){ awk "/^  $1:/{f=1} f&&/^  [a-z]/&&!/^  $1:/{f=0} f" /tmp/_pf_cfg.yml \
     | grep -oE 'SENTINEL_[A-Z_]+|CLICKHOUSE_[A-Z_]+' \
@@ -72,6 +72,43 @@ if [ -s /tmp/_pf_cfg.yml ]; then
     ok "control-plane env keys identical across controlplane/cp2/cp3"
   else
     red "control-plane env key drift across nodes:"; diff <(extract controlplane) <(extract cp2) | sed 's/^/    /' || true
+  fi
+fi
+
+# 3b) MOUNT parity across the CP nodes. Env parity alone is not the deploy contract:
+#     cp2/cp3 inherit nothing from the controlplane service, so a file the binary
+#     reads can be declared on one node and forgotten on the others and every env
+#     check still passes. That is not hypothetical — the DSN's sslrootcert lived at
+#     /etc/sentinel/pki/root.crt, only controlplane mounted it, and cp2/cp3 could not
+#     parse a verify-full DSN at all: both ran with NO DATABASE, held no leadership,
+#     and still showed "Up" in docker ps. Compare destination paths, not sources.
+if [ -s /tmp/_pf_cfg.yml ]; then
+  mounts(){ python3 -c "
+import sys, yaml
+svc = sys.argv[1]
+d = yaml.safe_load(open('/tmp/_pf_cfg.yml'))['services'].get(svc, {})
+for v in d.get('volumes', []) or []:
+    print(v['target'] if isinstance(v, dict) else str(v).split(':')[1])
+" "$1" 2>/dev/null | sort -u; }
+  cp1m="$(mounts controlplane)"; cp2m="$(mounts cp2)"; cp3m="$(mounts cp3)"
+  # controlplane legitimately mounts extras (its own cert dirs); the requirement is
+  # that cp2/cp3 are not MISSING anything controlplane has, and match each other.
+  missing2="$(comm -23 <(echo "$cp1m") <(echo "$cp2m"))"
+  missing3="$(comm -23 <(echo "$cp1m") <(echo "$cp3m"))"
+  if [ -z "$missing2" ] && [ -z "$missing3" ]; then
+    ok "cp2/cp3 mount every path controlplane does"
+  else
+    red "CP mount drift — cp2/cp3 are missing mounts controlplane has:"
+    [ -n "$missing2" ] && echo "$missing2" | sed 's/^/    cp2 missing: /'
+    [ -n "$missing3" ] && echo "$missing3" | sed 's/^/    cp3 missing: /'
+  fi
+  # The one mount that is boot-fatal-by-silence: whatever sslrootcert points at.
+  ca="$(grep -oE 'sslrootcert=[^&"[:space:]]+' "$ENV_FILE" | head -1 | cut -d= -f2)"
+  if [ -n "$ca" ]; then
+    for svc in controlplane cp2 cp3 migrate; do
+      if mounts "$svc" | grep -qx "$ca"; then ok "$svc mounts sslrootcert path $ca"
+      else red "$svc does NOT mount $ca — its verify-full DSN cannot be parsed, so it will run with no database"; fi
+    done
   fi
 fi
 

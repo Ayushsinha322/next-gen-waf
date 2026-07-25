@@ -1,27 +1,32 @@
-# Raft cluster overlay — turns the single control plane into a 3-node Raft
-# cluster (node ids 1/2/3) over the SAME Postgres, so config writes are
-# replicated and survive a control-plane node failing. (Data-plane HA is a
-# separate concern — see compose.ha.yml.)
+# Control-plane cluster overlay — three control-plane nodes (ids 1/2/3) sharing ONE
+# Postgres. (Data-plane HA is a separate concern — see compose.ha.yml.)
 #
-# HOW WRITES REACH THE LEADER (the important bit): clients talk to ANY control
-# plane node. Reads are served locally from the shared Postgres on every node;
-# mutating requests (POST/PUT/PATCH/DELETE) are transparently forwarded to the
-# elected Raft leader by the control plane itself (leaderForward middleware), so
-# a caller never has to know who the leader is and never sees "not the leader".
-# Kill any node → the survivors elect a new leader and forwarding follows it.
+# There is no Raft here any more. Postgres was always the real source of truth, so
+# leadership is a session-scoped Postgres ADVISORY LOCK: whichever node holds it is
+# the single writer and runs the singleton monitors (cert expiry, alerting, disk
+# pressure). Lose the node and its session dies with it, so the lock releases
+# automatically and another node takes over — no quorum, no election protocol, no
+# split brain to reason about. Nodes are otherwise identical and stateless.
+#
+# HOW WRITES REACH THE LEADER: clients talk to ANY node. Reads are served locally
+# from the shared Postgres; mutating requests are transparently forwarded to the
+# lock holder by the control plane itself (leaderForward middleware), so a caller
+# never has to know who leads and never sees "not the leader".
 #
 # Usage (from /opt/sentinel-src):
 #   docker compose -f deploy/docker/compose.prod.yml \
 #                  -f deploy/docker/compose.cluster.yml up -d controlplane cp2 cp3
 #
-# INVARIANT: every member MUST have byte-identical control-plane environment —
-# only the node id, raft address and peer list differ. Otherwise a node that
-# gets elected leader can't perform every duty (writes, cert monitor, alerting).
-# The shared block therefore lives HERE (not only in compose.prod.yml) because
-# cp2/cp3 are brand-new services that do NOT inherit the controlplane service.
-# This is also why a stale compose that omitted SENTINEL_AUDIT_HMAC_KEY /
-# SENTINEL_ALLOW_SUPERUSER_DB crash-looped the cluster after an image rebuild:
-# the binary requires them, so the deploy contract must supply them to ALL nodes.
+# INVARIANT: every member MUST get an identical control-plane deploy contract —
+# only the node id and advertise address may differ. That contract is BOTH the
+# environment AND the volume mounts, and it is the mounts that are easy to forget:
+# cp2/cp3 are brand-new services that do NOT inherit anything from the controlplane
+# service, so every file the binary reads has to be re-declared here. Two real
+# incidents came from breaking this invariant — a stale compose omitting
+# SENTINEL_AUDIT_HMAC_KEY / SENTINEL_ALLOW_SUPERUSER_DB crash-looped the cluster
+# after an image rebuild, and a missing /etc/sentinel/pki/root.crt mount left
+# cp2/cp3 unable to parse a verify-full DSN, so both ran with NO DATABASE while
+# still reporting healthy to docker. preflight.sh now checks mount parity too.
 
 x-cp-env: &cp-env
   SENTINEL_DB_URL: ${SENTINEL_DB_URL}
@@ -86,6 +91,14 @@ services:
       - sentinel-logs:/var/log/sentinel
       # Public Root CA (read-only) so this node can serve CA-download when leader.
       - /opt/sentinel-pki/root.crt:/etc/sentinel/root-ca.crt:ro
+      # SAME CA at the path SENTINEL_DB_URL's sslrootcert names. Two mounts of one
+      # file because they serve different consumers: the path above is what this node
+      # SERVES to clients downloading the CA, this one is what the Postgres client
+      # READS to verify the server. Missing this, the DSN's sslmode=verify-full fails
+      # at config-parse time with "unable to read CA file" — the node never gets a
+      # database at all and silently falls back to running standalone, so it holds no
+      # leadership and serves nothing DB-backed while still looking "up" in docker ps.
+      - /opt/sentinel-pki/root.crt:/etc/sentinel/pki/root.crt:ro
     networks: [sentinel]
 
   cp3:
@@ -108,4 +121,6 @@ services:
     volumes:
       - sentinel-logs:/var/log/sentinel
       - /opt/sentinel-pki/root.crt:/etc/sentinel/root-ca.crt:ro
+      # See cp2: required for the DSN's sslrootcert, not optional.
+      - /opt/sentinel-pki/root.crt:/etc/sentinel/pki/root.crt:ro
     networks: [sentinel]
