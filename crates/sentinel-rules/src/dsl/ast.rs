@@ -239,6 +239,16 @@ pub enum Operator {
     /// (which our importer cannot express directly — it needs capture groups,
     /// dynamic `setvar`, a `TX:/regex/` collection, and `%{}` macro expansion).
     OffDomainUrl,
+    /// SSRF detection (`@ssrfUrl`). Fires when a value contains a URL whose host is an
+    /// internal/loopback/link-local address or a cloud-metadata name, in ANY encoding
+    /// the OS resolver accepts (decimal, hex, octal, short-form, IPv4-mapped IPv6).
+    /// See [`crate::ssrf`]. This is what restores the SSRF coverage lost when
+    /// `@rbl`/`@ipMatch` were compiled to `Never`.
+    SsrfUrl,
+    /// Real `@ipMatch` / `@ipMatchF`: fires when the value parses as an IP inside any
+    /// of the given CIDR ranges. Previously compiled to `Never`, which silently
+    /// disabled every CRS rule that used it.
+    IpMatch(Vec<String>),
     AnomalyScore {
         op: CmpOp,
         threshold: u32,

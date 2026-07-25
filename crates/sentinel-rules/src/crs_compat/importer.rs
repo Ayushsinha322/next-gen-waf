@@ -410,6 +410,23 @@ pub(crate) fn crs_op_to_operator(op_name: &str, pattern: &str) -> Result<Operato
             .parse::<i64>()
             .map(|n| Operator::Ge(n + 1))
             .map_err(|_| anyhow::anyhow!("invalid integer in @gt: {}", pattern)),
+        // @ipMatch is now implemented natively instead of being disabled. The pattern is
+        // a comma- or space-separated list of addresses/CIDRs.
+        "ipmatch" => Ok(Operator::IpMatch(
+            pattern
+                .split([',', ' '])
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+        )),
+        // @rbl looked up a DNS blocklist, which we deliberately do not do on the request
+        // path (an unbounded network round-trip per request). In CRS, @rbl appears in
+        // the SSRF/RFI rules to ask "is this host somewhere it should not be" — which
+        // the native SSRF operator answers locally and more thoroughly, across every
+        // encoding of an internal address. Mapping it here restores the coverage those
+        // rules were written to provide instead of leaving them inert.
+        "rbl" => Ok(Operator::SsrfUrl),
         "validateurlencoding"
         | "validateutf8encoding"
         | "validatebyterange"
@@ -419,10 +436,11 @@ pub(crate) fn crs_op_to_operator(op_name: &str, pattern: &str) -> Result<Operato
         | "verifycpf"
         | "verifyssn"
         | "geolookup"
-        | "ipmatch"
+        // @ipMatchF/@ipMatchFromFile need the referenced file's contents, which the
+        // importer does not read. Left disabled deliberately rather than silently
+        // matching nothing under a name that implies it works.
         | "ipmatchf"
         | "ipmatchfromfile"
-        | "rbl"
         | "fuzzyhash"
         | "inspectfile"
         | "lookup" => {

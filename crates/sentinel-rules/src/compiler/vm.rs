@@ -146,6 +146,30 @@ fn request_host(ctx: &RequestContext) -> String {
 /// relative to `request_host` — i.e. not equal to it and not a subdomain of
 /// it. Reproduces CRS 931130 (off-domain reference / RFI). When the request
 /// has no Host header, any absolute URL counts as off-domain.
+/// True if `value` parses as an IP address contained in any of `cidrs`.
+///
+/// Implements `@ipMatch` / `@ipMatchF`, which the CRS importer previously compiled to
+/// `Operator::Never` — so every rule using them loaded successfully and could never
+/// fire. Accepts a bare address (`10.0.0.1`) or a CIDR (`10.0.0.0/8`) in the rule
+/// argument, and uses the SSRF module's permissive host parser so an attacker cannot
+/// evade an allow/deny list by writing the same address in decimal or hex.
+fn ip_in_any_cidr(value: &str, cidrs: &[String]) -> bool {
+    let Some(ip) = crate::ssrf::parse_host_to_ip(value.trim()) else {
+        return false;
+    };
+    cidrs.iter().any(|spec| {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return false;
+        }
+        match spec.parse::<ipnet::IpNet>() {
+            Ok(net) => net.contains(&ip),
+            // A bare address is a /32 (or /128) — CRS rules write both forms.
+            Err(_) => crate::ssrf::parse_host_to_ip(spec).is_some_and(|other| other == ip),
+        }
+    })
+}
+
 fn contains_off_domain_url(value: &str, request_host: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     let mut search = lower.as_str();
@@ -837,6 +861,28 @@ pub fn evaluate(
                     let host = request_host(ctx);
                     let matched = values.iter().any(|v| contains_off_domain_url(v, &host));
                     debug!(matched, "DetectOffDomainUrl");
+                    stack.push(StackVal::Bool(matched));
+                }
+            }
+
+            Instruction::DetectSsrfUrl => {
+                let values = pop_strings(&mut stack);
+                if values.is_empty() {
+                    stack.push(StackVal::Absent);
+                } else {
+                    let matched = values.iter().any(|v| crate::ssrf::contains_ssrf_url(v));
+                    debug!(matched, "DetectSsrfUrl");
+                    stack.push(StackVal::Bool(matched));
+                }
+            }
+
+            Instruction::IpMatch { cidrs } => {
+                let values = pop_strings(&mut stack);
+                if values.is_empty() {
+                    stack.push(StackVal::Absent);
+                } else {
+                    let matched = values.iter().any(|v| ip_in_any_cidr(v, cidrs));
+                    debug!(matched, "IpMatch");
                     stack.push(StackVal::Bool(matched));
                 }
             }

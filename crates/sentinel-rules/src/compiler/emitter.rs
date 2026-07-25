@@ -105,6 +105,12 @@ pub enum Instruction {
     DetectXss,
     /// Pop `StrVec`, push `Bool(any value is an off-domain URL)`.
     DetectOffDomainUrl,
+    /// Pop `StrVec`, push `Bool(any value contains an SSRF URL)`.
+    DetectSsrfUrl,
+    /// Pop `StrVec`, push `Bool(any value is an IP inside one of these CIDRs)`.
+    IpMatch {
+        cidrs: Vec<String>,
+    },
 
     /// Always push `Bool(false)` — used for intentionally disabled rules.
     Never,

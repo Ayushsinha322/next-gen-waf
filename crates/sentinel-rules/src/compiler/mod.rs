@@ -387,6 +387,14 @@ fn emit_operator_match(
         Operator::OffDomainUrl => {
             instrs.push(Instruction::DetectOffDomainUrl);
         }
+        Operator::SsrfUrl => {
+            instrs.push(Instruction::DetectSsrfUrl);
+        }
+        Operator::IpMatch(cidrs) => {
+            instrs.push(Instruction::IpMatch {
+                cidrs: cidrs.clone(),
+            });
+        }
         Operator::Never => {
             instrs.push(Instruction::Never);
         }

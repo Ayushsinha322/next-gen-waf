@@ -26,6 +26,7 @@ pub mod compiler;
 pub mod crs_compat;
 pub mod dsl;
 pub mod patterns;
+pub mod ssrf;
 
 use std::sync::Arc;
 
