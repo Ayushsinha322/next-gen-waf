@@ -37,6 +37,15 @@ services:
       - ssl_cert_file=/etc/sentinel/pg/server.crt
       - -c
       - ssl_key_file=/etc/sentinel/pg/server.key
+      # ssl=on only makes TLS AVAILABLE. The stock pg_hba ends with a plain
+      # `host all all all scram-sha-256`, so a client that asks for sslmode=disable
+      # still gets a cleartext session — the server holds a good certificate and
+      # declines to insist on it. It also ships `host all all 127.0.0.1/32 trust`,
+      # which authenticates any TCP loopback client with no password at all. Our
+      # own pg_hba is hostssl-only (see pg_hba.conf), so TLS becomes a property the
+      # SERVER enforces rather than a promise each client is trusted to keep.
+      - -c
+      - hba_file=/etc/sentinel/pg/pg_hba.conf
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -47,6 +56,9 @@ services:
       # user, so issue-postgres-cert.sh writes the key 0600 owned by uid 70.
       - /opt/sentinel-pki/pg-server.crt:/etc/sentinel/pg/server.crt:ro
       - /opt/sentinel-pki/pg-server.key:/etc/sentinel/pg/server.key:ro
+      # hostssl-only client auth. Keeps `local ... trust` so the container's own
+      # healthcheck (pg_isready over the unix socket) and `compose exec psql` work.
+      - ./pg_hba.conf:/etc/sentinel/pg/pg_hba.conf:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
