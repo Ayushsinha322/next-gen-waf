@@ -2028,10 +2028,19 @@ async fn proxy(
                 Some("1") | Some("true") | Some("yes") | Some("on")
             )
         });
-        if disabled {
+        if disabled || is_shared_egress(ctx.client_ip) {
+            // Shared egress: the address is not an actor, so its history is not its
+            // fault. See shared_egress_nets().
             0
         } else {
-            state.modules.correlation.score_for_ip(ctx.client_ip)
+            // Capped so reputation can escalate a borderline request but never block a
+            // clean one on its own — the uncapped contribution (8) exceeded the default
+            // threshold (5).
+            state
+                .modules
+                .correlation
+                .score_for_ip(ctx.client_ip)
+                .min(correlation_max_score())
         }
     };
     if corr_score > 0 {
@@ -3279,6 +3288,69 @@ fn resolve_client_ip_with(
         })
 }
 
+/// CIDRs whose addresses are SHARED EGRESS rather than identities.
+///
+/// Configure with `SENTINEL_SHARED_EGRESS_CIDRS` (comma-separated CIDRs or bare IPs),
+/// e.g. a corporate NAT range, a CGNAT block, or a VPN concentrator's public address.
+///
+/// # Why this exists
+///
+/// Every per-IP reputation mechanism here assumes an IP identifies an actor. Behind NAT
+/// that assumption is false — one address is thousands of people — and the mechanisms
+/// then punish bystanders for a neighbour's behaviour:
+///
+///   * The correlation engine adds up to 8 anomaly score for an IP with recent blocks.
+///     With the default `anomaly_threshold` of 5, that alone exceeds the threshold, so a
+///     COMPLETELY CLEAN request from a shared address gets blocked on reputation with no
+///     rule match at all. Reproduced at 500 rps: a target list of 9 clean requests to 1
+///     attack returned 99.4% 403.
+///   * Worse, the XDP auto-ban excludes only PRIVATE ranges, and a corporate NAT egress
+///     address is PUBLIC. After `SENTINEL_XDP_AUTOBAN_BLOCKS` (default 20) blocks, one
+///     person running a scanner gets the entire office's egress IP dropped in-kernel.
+///     That is a hard cutoff for every colleague, not a degradation.
+///
+/// Listing a range here means "this address is not an actor": no correlation escalation
+/// and no auto-ban. Detection is unaffected — an attack from a shared address is still
+/// blocked on its own merits by the rules. What stops is holding the address responsible
+/// for its history.
+fn shared_egress_nets() -> &'static [IpNet] {
+    static NETS: std::sync::OnceLock<Vec<IpNet>> = std::sync::OnceLock::new();
+    NETS.get_or_init(|| {
+        std::env::var("SENTINEL_SHARED_EGRESS_CIDRS")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .filter_map(|s| parse_block_cidr(s.trim()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// Whether `ip` is shared egress and therefore exempt from per-IP reputation.
+fn is_shared_egress(ip: std::net::IpAddr) -> bool {
+    shared_egress_nets().iter().any(|n| n.contains(&ip))
+}
+
+/// Hard cap on the correlation engine's anomaly-score contribution.
+///
+/// Default 4, which is deliberately BELOW the default `anomaly_threshold` of 5 so that
+/// reputation can tip a borderline request over the line but can never, by itself,
+/// block a request that matched no rule. Before this cap the "persistent attacker"
+/// contribution was 8 — larger than the threshold — so reputation alone decided.
+///
+/// If you lower a site's `anomaly_threshold` below 5, lower this to match, or reputation
+/// regains the ability to block clean traffic on its own.
+fn correlation_max_score() -> u32 {
+    static MAX: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("SENTINEL_CORRELATION_MAX_SCORE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(4)
+    })
+}
+
 /// Parse a `SENTINEL_XDP_BLOCK` entry — either a bare IP (`1.2.3.4`, treated as
 /// a /32 or /128) or a CIDR (`10.0.0.0/8`) — into an [`IpNet`].
 fn parse_block_cidr(s: &str) -> Option<IpNet> {
@@ -3373,6 +3445,14 @@ fn xdp_autobanned() -> &'static DashSet<std::net::IpAddr> {
 /// client IPs and bans normally.
 fn autoban_eligible(ip: std::net::IpAddr, include_private: bool) -> bool {
     use std::net::IpAddr;
+    // Shared egress is never auto-banned, regardless of include_private. A corporate NAT
+    // or CGNAT address is PUBLIC, so the private-range carve-out below does not cover it
+    // — without this, one scanner behind an office NAT gets every colleague dropped in
+    // the kernel. This check is first precisely because include_private would otherwise
+    // bypass it.
+    if is_shared_egress(ip) {
+        return false;
+    }
     if include_private {
         return !ip.is_unspecified();
     }
@@ -5687,6 +5767,100 @@ mod client_ip_tests {
     // was the immediate peer there.
 
     /// Blocked address arriving DIRECTLY (no proxy) — must still be caught.
+    // ── Shared-egress exemption (NAT bystander protection) ────────────────────
+    //
+    // These guard two mechanisms that both assume "IP == actor", which is false behind
+    // NAT. Env-var-driven config is process-global and cached in a OnceLock, so these
+    // tests exercise the pure predicates rather than mutating the environment (which
+    // would race across the parallel test runner and be order-dependent).
+
+    /// The correlation contribution must be capped BELOW the default anomaly threshold,
+    /// or reputation alone blocks a request that matched no rule. The uncapped
+    /// "persistent attacker" value was 8 against a default threshold of 5.
+    #[test]
+    fn correlation_cap_cannot_alone_cross_the_default_threshold() {
+        const DEFAULT_ANOMALY_THRESHOLD: u32 = 5;
+        let cap = correlation_max_score();
+        assert!(
+            cap < DEFAULT_ANOMALY_THRESHOLD,
+            "correlation cap {cap} >= default threshold {DEFAULT_ANOMALY_THRESHOLD} — \
+             reputation could block a clean request with zero rule matches"
+        );
+        // And the raw engine value it caps really was above the threshold, which is why
+        // the cap is needed at all.
+        let engine = CorrelationEngine::new();
+        let ip: IpAddr = "203.0.113.50".parse().unwrap();
+        for _ in 0..(engine.escalate_threshold * 3) {
+            engine.record_block(ip);
+        }
+        let raw = engine.score_for_ip(ip);
+        assert!(
+            raw > DEFAULT_ANOMALY_THRESHOLD,
+            "expected the uncapped persistent-attacker score to exceed the threshold \
+             (that is the bug being capped), got {raw}"
+        );
+        assert!(
+            raw.min(cap) < DEFAULT_ANOMALY_THRESHOLD,
+            "cap did not bound the score"
+        );
+    }
+
+    /// A clean request from a shared address must not be blocked because a neighbour
+    /// attacked. This is the office-NAT scenario.
+    #[test]
+    fn shared_egress_predicate_matches_configured_ranges() {
+        let nets: Vec<IpNet> = ["203.0.113.0/24", "198.51.100.7"]
+            .iter()
+            .filter_map(|s| parse_block_cidr(s))
+            .collect();
+        let contains = |ip: &str| {
+            let a: IpAddr = ip.parse().unwrap();
+            nets.iter().any(|n| n.contains(&a))
+        };
+        assert!(contains("203.0.113.1"), "CIDR member not matched");
+        assert!(contains("203.0.113.255"), "CIDR upper bound not matched");
+        assert!(contains("198.51.100.7"), "bare IP not treated as /32");
+        assert!(
+            !contains("203.0.114.1"),
+            "address outside the range matched"
+        );
+        assert!(!contains("198.51.100.8"), "neighbour of a bare IP matched");
+    }
+
+    /// The auto-ban carve-out for private ranges does NOT cover a corporate NAT egress
+    /// address, because that address is public. Without the shared-egress check, one
+    /// scanner gets every colleague dropped in-kernel.
+    #[test]
+    fn public_nat_egress_is_autoban_eligible_without_the_exemption() {
+        // A genuinely ROUTABLE public address. 203.0.113.0/24 would not do: it is RFC
+        // 5737 documentation space, which autoban_eligible already excludes via
+        // is_documentation() — using it would make this test pass for the wrong reason
+        // and hide the very gap it is meant to demonstrate.
+        let office_nat: IpAddr = "103.24.8.122".parse().unwrap();
+        assert!(
+            autoban_eligible(office_nat, false),
+            "a PUBLIC NAT egress address is auto-ban eligible by the private-range rules \
+             alone — which is exactly why the shared-egress list exists"
+        );
+        // Private ranges are still excluded by default, as before.
+        assert!(!autoban_eligible("10.1.2.3".parse().unwrap(), false));
+        assert!(!autoban_eligible("192.168.1.1".parse().unwrap(), false));
+    }
+
+    /// Exempting a range must not weaken detection: an attack from a shared address is
+    /// still blocked on its own merits. Only the *history* is forgiven, and the
+    /// blocklist still applies to the address if an operator adds it explicitly.
+    #[test]
+    fn exempting_shared_egress_does_not_disable_the_blocklist() {
+        let shared: IpAddr = "203.0.113.10".parse().unwrap();
+        let blocked = move |ip: IpAddr| ip == shared;
+        assert!(
+            blocklist_hit(shared, &http::HeaderMap::new(), blocked, trusted),
+            "an explicitly blocklisted address must still be blocked even if it is \
+             shared egress — exemption covers reputation, not explicit policy"
+        );
+    }
+
     #[test]
     fn blocklist_catches_direct_peer() {
         let attacker: IpAddr = "45.155.205.233".parse().unwrap();
