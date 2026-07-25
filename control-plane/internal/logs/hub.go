@@ -20,11 +20,46 @@ import (
 	"time"
 )
 
+// Source identifies where an Entry came from. It exists so that fabricated data
+// can never be mistaken for observed traffic.
+//
+// Previously Entry carried only Kind and Data, so simulator output travelled the
+// exact same path as real data-plane logs and arrived at the dashboard
+// indistinguishable from it — nobody looking at a screen could tell whether an
+// "attack" had actually happened. Every Entry now declares its provenance, and
+// the stream marks it explicitly.
+type Source string
+
+const (
+	// SourceLive is real, observed data (tailed data-plane logs, real alerts,
+	// real audit events). This is the only value ever seen in production.
+	SourceLive Source = "live"
+	// SourceSimulated is fabricated data from the development simulator. It only
+	// exists when SENTINEL_DEV_SIMULATOR=1 is set explicitly.
+	SourceSimulated Source = "simulated"
+)
+
 // Entry is a single log line emitted to subscribers.
 type Entry struct {
 	Kind string          `json:"kind"`
 	Data json.RawMessage `json:"data"`
+	// Source is "live" for observed data and "simulated" for generated data.
+	// Empty is treated as "live" by normalize() so no real emitter can
+	// accidentally omit it, but simulated data must always set it.
+	Source Source `json:"source"`
 }
+
+// normalize defaults an unset Source to live. Called on the publish path so
+// every Entry that reaches a subscriber carries explicit provenance.
+func (e Entry) normalize() Entry {
+	if e.Source == "" {
+		e.Source = SourceLive
+	}
+	return e
+}
+
+// IsSimulated reports whether this entry is fabricated.
+func (e Entry) IsSimulated() bool { return e.Source == SourceSimulated }
 
 // Snapshot holds a point-in-time view of live metrics derived from the
 // event stream.  It is safe to read without locking.
@@ -222,6 +257,9 @@ func (h *Hub) Stop() { close(h.done) }
 // Publish sends an entry to all subscribers and appends to the ring buffer.
 // It also updates live metrics counters.
 func (h *Hub) publish(e Entry) {
+	// Stamp provenance once, here, so it is impossible for an entry to reach a
+	// subscriber or the ring buffer without it.
+	e = e.normalize()
 	h.updateMetrics(e)
 
 	h.mu.Lock()

@@ -36,11 +36,33 @@ const (
 	// DevTenantID is the well-known UUID for the default dev tenant.
 	DevTenantID = "00000000-0000-0000-0000-000000000001"
 	// DevAdminID is the well-known UUID for the default dev admin user.
-	DevAdminID  = "00000000-0000-0000-0000-000000000002"
+	DevAdminID = "00000000-0000-0000-0000-000000000002"
+
+	// DemoFixturesEnvVar must be "1" to insert fabricated demo content.
+	DemoFixturesEnvVar = "SENTINEL_DEV_SEED"
 )
 
-// SeedDev inserts a default tenant, admin user, and sample data if they do
-// not already exist. Safe to call on every startup (idempotent).
+// DemoFixturesEnabled reports whether the operator explicitly asked for
+// fabricated demo content (sample sites, sample rules, invented alerts).
+//
+// This used to be unconditional on every privileged boot, which meant a real
+// deployment came up pre-populated with seven fabricated security alerts —
+// complete with plausible attacker IPs, CRS rule IDs, scores, and a Log4Shell
+// CVE reference — that were indistinguishable in the UI from alerts produced by
+// actual traffic. Worse, the alert INSERT had no conflict handling, so it added
+// another seven on EVERY restart, without bound.
+//
+// Fabricated security findings in a security product are the one thing that can
+// destroy trust outright, so they are now opt-in.
+func DemoFixturesEnabled() bool {
+	return os.Getenv(DemoFixturesEnvVar) == "1"
+}
+
+// SeedDev bootstraps the default tenant and admin user, which every deployment
+// needs in order to log in at all. Safe to call on every startup (idempotent).
+//
+// Fabricated demo content (sample sites, sample rules, sample alerts) is only
+// inserted when DemoFixturesEnabled() — see its doc comment.
 func SeedDev(ctx context.Context, pool Pool) error {
 	// Use a raw pgxPool for seeding because we need to bypass RLS on first
 	// insert (tenant row must exist before the policy can reference it).
@@ -98,7 +120,14 @@ func SeedDev(ctx context.Context, pool Pool) error {
 			adminPw)
 	}
 
-	// ── Sample sites ─────────────────────────────────────────────────────────
+	// Everything below this point is FABRICATED demo content, not configuration a
+	// real deployment needs. Commit the bootstrap rows and stop unless the
+	// operator explicitly opted in.
+	if !DemoFixturesEnabled() {
+		return tx.Commit(ctx)
+	}
+
+	// ── Sample sites (demo only) ─────────────────────────────────────────────
 	type siteSpec struct {
 		name     string
 		domain   string
@@ -183,14 +212,24 @@ func SeedDev(ctx context.Context, pool Pool) error {
 		{"low", "scanner", "Scanner detected: Nikto/2.1.6", "resolved",
 			map[string]any{"ip": "172.16.1.5", "rule": "CRS-913100", "score": 3, "action": "LOGGED", "path": "/robots.txt"}},
 	}
-	for _, a := range alerts {
-		det, _ := json.Marshal(a.details)
-		_, err = tx.Exec(ctx, `
-			INSERT INTO alerts (tenant_id, severity, kind, summary, details, state)
-			VALUES ($1, $2, $3, $4, $5, $6)`,
-			DevTenantID, a.sev, a.kind, a.summary, det, a.state)
-		if err != nil {
-			return fmt.Errorf("seed: alert: %w", err)
+	// Insert only into an empty alert table. Unlike the sites and rules above,
+	// alerts have no natural unique key to conflict on, so this INSERT was
+	// re-running in full on every boot and growing the table without bound.
+	var existingAlerts int
+	if err := tx.QueryRow(ctx,
+		`SELECT count(*) FROM alerts WHERE tenant_id = $1`, DevTenantID).Scan(&existingAlerts); err != nil {
+		return fmt.Errorf("seed: counting existing alerts: %w", err)
+	}
+	if existingAlerts == 0 {
+		for _, a := range alerts {
+			det, _ := json.Marshal(a.details)
+			_, err = tx.Exec(ctx, `
+				INSERT INTO alerts (tenant_id, severity, kind, summary, details, state)
+				VALUES ($1, $2, $3, $4, $5, $6)`,
+				DevTenantID, a.sev, a.kind, a.summary, det, a.state)
+			if err != nil {
+				return fmt.Errorf("seed: alert: %w", err)
+			}
 		}
 	}
 

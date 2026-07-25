@@ -989,6 +989,31 @@ textarea.fin2 { resize:vertical; min-height:80px; line-height:1.6; }
 .msg2.ai  .mbbl2 { background:rgba(124,58,237,.16); border:1px solid rgba(124,58,237,.28); color:var(--text); border-radius:3px 12px 12px 12px; }
 .msg2.usr .mbbl2 { background:rgba(0,212,255,.12); border:1px solid rgba(0,212,255,.24); color:var(--text); border-radius:12px 3px 12px 12px; }
 
+/* ── Simulated-data markers ──────────────────────────────────────────────────
+   Deliberately loud. Fabricated entries must be impossible to mistake for real
+   traffic at a glance, including by someone looking over an operator's shoulder.
+   Do not tone these down. */
+.lgw-simbanner {
+  display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+  margin:0 0 10px; padding:9px 14px; border-radius:6px;
+  background:repeating-linear-gradient(45deg, rgba(245,158,11,.16) 0 12px, rgba(245,158,11,.09) 12px 24px);
+  border:1px solid rgba(245,158,11,.55);
+  color:#fbbf24; font-size:11px; line-height:1.5;
+}
+.lgw-simbanner strong {
+  flex:none; padding:2px 8px; border-radius:3px;
+  background:#f59e0b; color:#1a1205;
+  font-family:'Share Tech Mono',monospace; font-weight:700; letter-spacing:.08em; font-size:10px;
+}
+.lgw-simbanner span { flex:1 1 320px; }
+.ll-sim {
+  flex:none; margin-right:6px; padding:0 5px; border-radius:2px;
+  background:#f59e0b; color:#1a1205;
+  font-family:'Share Tech Mono',monospace; font-weight:700; font-size:8px; letter-spacing:.06em;
+  align-self:center;
+}
+[data-theme='light'] .lgw-simbanner { color:#92400e; }
+
 /* Copilot markdown output (lib/safeMarkdown.ts). These are classes rather than
    inline style attributes so the injected HTML carries no style of its own. */
 .cp-code { background:rgba(255,255,255,.08); padding:1px 5px; border-radius:3px; font-size:12px; font-family:'JetBrains Mono',monospace; }

@@ -91,6 +91,10 @@ function LogsInner() {
   const [connected, setCon] = useState(false);
   const [logs, setLogs]     = useState<LogStore>({ access:[], waf:[], error:[], audit:[], modsec:[], ml:[] });
 
+  // Latches true the moment any fabricated entry arrives, and never resets for
+  // the life of the view — a simulated stream must stay labelled even if live
+  // entries start arriving afterwards.
+  const [sawSimulated, setSawSimulated] = useState(false);
   const pausedRef = useRef(false);
   const lid       = useRef(0);
   const bodyRef   = useRef<HTMLDivElement>(null);
@@ -105,9 +109,15 @@ function LogsInner() {
       es.onmessage = (evt) => {
         if (pausedRef.current) return;
         try {
-          const e: { kind: LogKind; data: Record<string, unknown> } = JSON.parse(evt.data);
+          const e: { kind: LogKind; data: Record<string, unknown>; source?: string } =
+            JSON.parse(evt.data);
           if (!e.kind || !e.data) return;
-          const row: LogRow = { ...e.data, _lid: lid.current++ };
+          // Provenance rides on every entry (control-plane logs.Entry.Source).
+          // Anything not explicitly "live" is treated as fabricated: an unknown or
+          // missing value must never be rendered as observed traffic.
+          const simulated = e.source !== "live";
+          if (simulated) setSawSimulated(true);
+          const row: LogRow = { ...e.data, _lid: lid.current++, _simulated: simulated };
           setLogs(prev => ({ ...prev, [e.kind]: [...prev[e.kind], row].slice(-MAX) }));
         } catch { /* ignore malformed */ }
       };
@@ -178,6 +188,17 @@ function LogsInner() {
           </motion.button>
         </div>
       </div>
+
+      {sawSimulated && (
+        <div className="lgw-simbanner" role="alert">
+          <strong>SIMULATED DATA</strong>
+          <span>
+            This stream contains entries fabricated by the development simulator
+            (SENTINEL_DEV_SIMULATOR=1). They do not represent real traffic, real attacks, or
+            real blocks. Disable the simulator before showing this dashboard to anyone.
+          </span>
+        </div>
+      )}
 
       <div className="lgw-ctrl">
         <div className="lgw-sf-wrap" ref={ddRef}>
@@ -261,6 +282,7 @@ function LogsInner() {
                 transition={{ duration: 0.12, delay: Math.min(i * 0.005, 0.15) }}
               >
                 <div className="ll-n">{i + 1}</div>
+                {r._simulated ? <span className="ll-sim" title="Fabricated by the development simulator — not real traffic">SIMULATED</span> : null}
                 <div className="ll-t" dangerouslySetInnerHTML={{ __html: hl(fmt(kind, r)) }} />
               </motion.div>
             ))

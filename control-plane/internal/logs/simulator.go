@@ -4,14 +4,38 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"os"
 	"time"
 )
 
-// StartSimulator launches a background goroutine that publishes realistic log
-// entries directly into the hub at configurable rates.  Call once after hub
-// construction.  The goroutine exits when the hub is stopped.
-func (h *Hub) StartSimulator() {
+// SimulatorEnvVar must be set to "1" for the simulator to be allowed to run.
+const SimulatorEnvVar = "SENTINEL_DEV_SIMULATOR"
+
+// SimulatorEnabled reports whether the operator has explicitly opted in to
+// fabricated log data.
+//
+// This is an explicit opt-in, not a fallback. The simulator used to start
+// automatically whenever the Rust data-plane binary was missing, so a control
+// plane that simply could not find its proxy would invent attacks — realistic
+// IPs, CVE references, block verdicts — and stream them to the dashboard through
+// the same code path as real traffic. An operator or a client seeing that screen
+// had no way to know none of it happened. Absent data must read as absent, so the
+// default is now to publish nothing.
+func SimulatorEnabled() bool {
+	return os.Getenv(SimulatorEnvVar) == "1"
+}
+
+// StartSimulator launches a background goroutine that publishes FABRICATED log
+// entries into the hub. Every entry it emits is tagged Source=simulated.
+//
+// It is a no-op unless SENTINEL_DEV_SIMULATOR=1. Returns whether it started, so
+// callers can log accurately. The goroutine exits when the hub is stopped.
+func (h *Hub) StartSimulator() bool {
+	if !SimulatorEnabled() {
+		return false
+	}
 	go h.runSimulator()
+	return true
 }
 
 func (h *Hub) runSimulator() {
@@ -55,7 +79,9 @@ func (h *Hub) simPublish(kind string, data map[string]any) {
 	if err != nil {
 		return
 	}
-	h.publish(Entry{Kind: kind, Data: json.RawMessage(raw)})
+	// Every simulated entry is tagged at the source. Nothing this file produces
+	// may ever be presented as observed traffic.
+	h.publish(Entry{Kind: kind, Data: json.RawMessage(raw), Source: SourceSimulated})
 }
 
 // ---------------------------------------------------------------------------

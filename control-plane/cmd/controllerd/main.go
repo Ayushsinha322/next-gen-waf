@@ -357,14 +357,25 @@ func run() error {
 	// ── Data plane auto-start ─────────────────────────────────────────────────
 	// Try to find and start the Rust proxy binary automatically so the user
 	// never has to run a separate command — same behaviour as BunkerWeb/nginx.
-	// Falls back to the simulator when the binary is not built yet.
+	//
+	// When the binary is missing the log stream stays EMPTY. It used to fall back
+	// to the simulator, which fabricated attacks and streamed them to the
+	// dashboard through the same path as real traffic, indistinguishably — a
+	// missing binary silently turned the product into a demo. An empty stream is
+	// the honest signal that nothing is being observed; the simulator is now an
+	// explicit opt-in (SENTINEL_DEV_SIMULATOR=1) for local UI work only.
 	proxyRunning := autoStartDataPlane(log)
-	if !proxyRunning {
-		// No binary found — start simulator so dashboard always shows live data.
-		log.Info("data-plane binary not found — running simulator (build with: cargo build -p sentinel-proxy --bin sentinel-bin)")
-		hub.StartSimulator()
-	} else {
+	switch {
+	case proxyRunning:
 		log.Info("data-plane started — real traffic logs will appear on the dashboard")
+	case hub.StartSimulator():
+		log.Warn("SIMULATOR ENABLED — the dashboard is showing FABRICATED data, not real traffic. "+
+			"Every entry is tagged source=simulated. Never enable this on a system anyone is relying on.",
+			zap.String("disable_by_unsetting", logs.SimulatorEnvVar))
+	default:
+		log.Warn("data-plane binary not found — no traffic will be observed and the log stream will stay EMPTY. " +
+			"Build it with: cargo build -p sentinel-proxy --bin sentinel-bin " +
+			"(for UI development only, set SENTINEL_DEV_SIMULATOR=1 to publish clearly-labelled fake data)")
 	}
 
 	// ── REST (Gin) ────────────────────────────────────────────────────────────
