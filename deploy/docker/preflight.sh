@@ -29,6 +29,17 @@ check_len(){ # name minlen
 check_len SENTINEL_JWT_SECRET 32
 check_len SENTINEL_AUDIT_HMAC_KEY 32
 check_len SENTINEL_INTERNAL_SECRET 32
+# Database TLS: a DSN that says disable/require is a silent downgrade. `require`
+# encrypts but accepts ANY certificate, so it does not stop an interception.
+if grep -qE '^SENTINEL_DB_URL=.*sslmode=(disable|allow|prefer)' "$ENV_FILE"; then
+  red "SENTINEL_DB_URL uses sslmode=disable/allow/prefer — database traffic would be cleartext. Run deploy/docker/issue-postgres-cert.sh and set sslmode=verify-full"
+fi
+if grep -qE '^SENTINEL_DB_URL=.*sslmode=require' "$ENV_FILE"; then
+  red "SENTINEL_DB_URL uses sslmode=require, which encrypts but accepts ANY server certificate. Use sslmode=verify-full with sslrootcert"
+fi
+if grep -qE '^SENTINEL_DB_URL=.*sslmode=verify-full' "$ENV_FILE" && ! grep -qE '^SENTINEL_DB_URL=.*sslrootcert=' "$ENV_FILE"; then
+  red "SENTINEL_DB_URL uses verify-full but sets no sslrootcert — verification will fail unless the CA is in the system trust store"
+fi
 if grep -qE '^SENTINEL_RAFT_SECRET=' "$ENV_FILE"; then
   red "SENTINEL_RAFT_SECRET is set but no longer used — leadership is a Postgres advisory lock. Remove it from .env"
 fi

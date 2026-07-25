@@ -45,7 +45,11 @@ metadata:
   namespace: sentinel
 type: Opaque
 stringData:
-  db-url: "postgres://sentinel:CHANGE_ME@sentinel-postgres-rw:5432/sentinel?sslmode=require"
+  # verify-full, not require: `require` encrypts but accepts ANY certificate, so it
+  # does not prevent interception. CloudNativePG serves TLS by default and publishes
+  # its CA in the <cluster>-ca secret, which 20-controlplane.yaml mounts at the
+  # sslrootcert path below — so full verification costs nothing extra here.
+  db-url: "postgres://sentinel:CHANGE_ME@sentinel-postgres-rw:5432/sentinel?sslmode=verify-full&sslrootcert=/etc/sentinel/pki/ca.crt"
   jwt-secret: "CHANGE_ME_jwt_signing_secret"
   internal-secret: "CHANGE_ME_dataplane_controlplane_shared_secret"
   # ClickHouse password — the data plane (writer) and control plane (reader) both
