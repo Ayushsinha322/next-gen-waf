@@ -1,0 +1,63 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# 2-VM ACTIVE-PASSIVE — overlay for the PASSIVE VM.
+#
+#   docker compose -f compose.prod.yml -f compose.2vm-passive.yml up -d
+#
+# This VM runs:
+#   • Postgres as a streaming STANDBY of the active VM (read-only until promoted)
+#   • the control plane — which contends for the same advisory lock as the active
+#     one, so leadership is automatic; while the active VM holds it, this node
+#     forwards writes there
+#   • the data plane — actively serving traffic (it is stateless)
+#   • the dashboard
+#
+# It does NOT run ClickHouse. Event history lives on the active VM; a second
+# ClickHouse here would be a second independent dataset, not a replica, and
+# ReplicatedMergeTree needs a Keeper quorum that two nodes cannot form. Event history
+# is protected by backup instead — see 2VM-ACTIVE-PASSIVE.md.
+# ═════════════════════════════════════════════════════════════════════════════
+
+services:
+  postgres:
+    # Streaming standby. The entrypoint clones from the primary on first boot and
+    # then follows it; it never re-clones over existing data.
+    entrypoint: ["/usr/local/bin/pg-standby-entrypoint.sh"]
+    environment:
+      SENTINEL_PRIMARY_HOST: ${SENTINEL_PRIMARY_HOST:?set SENTINEL_PRIMARY_HOST in .env (active VM address)}
+      SENTINEL_REPL_USER: ${SENTINEL_REPL_USER:?set SENTINEL_REPL_USER in .env}
+      SENTINEL_REPL_PASSWORD: ${SENTINEL_REPL_PASSWORD:?set SENTINEL_REPL_PASSWORD in .env}
+      SENTINEL_PG_CA: /etc/sentinel/pki/root.crt
+    volumes:
+      - ./pg-standby-entrypoint.sh:/usr/local/bin/pg-standby-entrypoint.sh:ro
+      # CA for the replication connection, which uses sslmode=verify-full. Copy
+      # /opt/sentinel-pki/root.crt from the ACTIVE VM to this one.
+      - /opt/sentinel-pki/root.crt:/etc/sentinel/pki/root.crt:ro
+    healthcheck:
+      # A standby is in recovery, so the default pg_isready check is fine, but accept
+      # the read-only state explicitly rather than treating it as unhealthy.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB} || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 120s   # a first-boot base backup can take a while
+
+  # The control plane and data plane on THIS VM must talk to the PRIMARY's database,
+  # not to the local standby — a standby is read-only, so writes would fail. Point
+  # them at the active VM; after a promotion, flip this to 127.0.0.1/local and
+  # restart (promote-standby.sh prints the exact steps).
+  controlplane:
+    environment:
+      SENTINEL_DB_URL: ${SENTINEL_DB_URL_PRIMARY:?set SENTINEL_DB_URL_PRIMARY in .env — DSN pointing at the ACTIVE VM}
+
+  migrate:
+    # Migrations must run against the primary, and only once per cluster. The active
+    # VM already applies them, so this is a no-op here (goose is idempotent) but it
+    # must still target the primary rather than the read-only standby.
+    environment:
+      GOOSE_DBSTRING: ${SENTINEL_DB_URL_PRIMARY:?set SENTINEL_DB_URL_PRIMARY in .env}
+
+  clickhouse:
+    # Not run on the passive VM — see the header. `replicas: 0` keeps the service
+    # defined (so the compose file stays a clean overlay) without starting it.
+    deploy:
+      replicas: 0
