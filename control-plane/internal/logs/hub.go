@@ -84,8 +84,8 @@ type Snapshot struct {
 	AttackBreakdown map[string]int64 `json:"attack_breakdown"`
 	// ByCountry maps an ISO-3166-1 alpha-2 code to blocked-request count.
 	// Empty until a GeoIP database is loaded (geoip_loaded=false) — never faked.
-	ByCountry    map[string]int64 `json:"by_country"`
-	GeoIPLoaded  bool             `json:"geoip_loaded"`
+	ByCountry   map[string]int64 `json:"by_country"`
+	GeoIPLoaded bool             `json:"geoip_loaded"`
 
 	// Host resource usage (Linux /proc/meminfo; zero when unavailable).
 	MemUsedBytes  uint64 `json:"mem_used_bytes"`
@@ -134,6 +134,11 @@ type Hub struct {
 	mu   sync.RWMutex
 	subs map[chan Entry]struct{}
 	buf  []Entry // ring buffer of last 200 entries
+
+	// Paths already being tailed, so per-node discovery never double-tails a
+	// file (which would duplicate every line into the stream).
+	tailMu sync.Mutex
+	tailed map[string]struct{}
 
 	// Metrics counters (atomic — updated on every publish).
 	totalRequests   atomic.Int64
@@ -207,19 +212,76 @@ func NewHub() *Hub {
 		byCountry:  make(map[string]int64),
 		siteStats:  make(map[string]*SiteStat),
 		learnStats: make(map[string]map[string]*LearningStat),
+		tailed:     make(map[string]struct{}),
 	}
 
 	dir := LogDir()
 
 	kinds := []string{"access", "waf", "error", "audit", "modsec", "ml"}
+
+	// Single-node layout: the data plane writes straight into $SENTINEL_LOG_DIR.
 	for _, kind := range kinds {
-		h.tailKind(kind, filepath.Join(dir, kind+".log"))
+		h.tailOnce(kind, filepath.Join(dir, kind+".log"))
 	}
+
+	// HA layout: each data-plane node writes into its OWN subdirectory
+	// ($SENTINEL_LOG_DIR/<node>/access.log). Per-node directories are required,
+	// not cosmetic — three nodes appending to one file would each hold an open
+	// handle, and the moment one of them rotated access.log the other two would
+	// keep writing into the now-renamed file, so two thirds of the traffic would
+	// silently stop appearing in the live view.
+	//
+	// Node directories appear when their container starts, which can be after
+	// this process, so rescan rather than globbing once at boot.
+	go h.discoverNodeLogs(dir, kinds)
 
 	go h.runBucketSampler()
 	go h.runMemSampler()
 
 	return h
+}
+
+// tailOnce starts a tail for path unless one is already running for it.
+func (h *Hub) tailOnce(kind, path string) {
+	h.tailMu.Lock()
+	if _, dup := h.tailed[path]; dup {
+		h.tailMu.Unlock()
+		return
+	}
+	h.tailed[path] = struct{}{}
+	h.tailMu.Unlock()
+	h.tailKind(kind, path)
+}
+
+// discoverNodeLogs periodically picks up per-node log directories. A tail is
+// cheap (one goroutine polling a path that may not exist yet) and tailOnce
+// dedupes, so rescanning is safe to repeat forever.
+func (h *Hub) discoverNodeLogs(dir string, kinds []string) {
+	scan := func() {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			for _, kind := range kinds {
+				h.tailOnce(kind, filepath.Join(dir, e.Name(), kind+".log"))
+			}
+		}
+	}
+	scan()
+	t := time.NewTicker(15 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-h.done:
+			return
+		case <-t.C:
+			scan()
+		}
+	}
 }
 
 // Subscribe registers a new SSE client and returns its delivery channel.
