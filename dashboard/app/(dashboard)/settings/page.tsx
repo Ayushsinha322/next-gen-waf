@@ -73,63 +73,106 @@ function Note({ children, tone = "info" }: { children: React.ReactNode; tone?: "
 }
 
 function GeneralTab() {
-  const [status, setStatus] = useState<{ waf_running: boolean; uptime_secs?: number; sites?: number; listeners?: string[] } | null>(null);
-  const [err, setErr] = useState(false);
+  const [waf, setWaf] = useState<{ waf_running: boolean; uptime_secs?: number; sites?: number; listeners?: string[]; upstreams_healthy?: number; upstreams_total?: number; http3?: { enabled: boolean; advertise_port?: number } } | null>(null);
+  const [cluster, setCluster] = useState<ClusterHealth | null>(null);
+  const [store, setStore] = useState<{ configured: boolean; reachable: boolean; events?: number; error?: string } | null>(null);
+  const [errs, setErrs] = useState<string[]>([]);
 
   useEffect(() => {
     let alive = true;
-    api.waf.status()
-      .then(r => { if (alive) setStatus(r); })
-      .catch(() => { if (alive) setErr(true); });
+    const note = (what: string) => (e: unknown) => {
+      if (alive) setErrs(p => [...p, `${what}: ${e instanceof Error ? e.message : "failed"}`]);
+    };
+    api.waf.status().then(r => alive && setWaf(r)).catch(note("data plane"));
+    api.cluster.health().then(r => alive && setCluster(r)).catch(note("cluster"));
+    api.events.status().then(r => alive && setStore(r)).catch(note("event store"));
     return () => { alive = false; };
   }, []);
 
   const uptime = (secs?: number) => {
-    if (!secs && secs !== 0) return "—";
+    if (secs === undefined || secs === null) return "—";
     const d = Math.floor(secs / 86400), h = Math.floor((secs % 86400) / 3600), m = Math.floor((secs % 3600) / 60);
     return d > 0 ? `${d}d ${h}h ${m}m` : h > 0 ? `${h}h ${m}m` : `${m}m`;
   };
 
   return (
-    <motion.div className="panel" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}>
-      <div className="pb">
-        <Note>
-          <strong>Protection settings are per site, not global.</strong> WAF mode,
-          paranoia level and anomaly threshold are properties of an individual site
-          and are edited in <strong>Sites → Edit</strong>, where the change is
-          validated and versioned. This tab previously offered global copies of
-          those fields that were never saved anywhere.
-        </Note>
+    <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}
+      style={{ display: "grid", gap: 14 }}>
 
-        <div style={{ fontSize: "var(--fs-h3)", fontWeight: 600, color: "var(--text)", margin: "4px 0 6px" }}>
-          Data plane
-        </div>
-        {err ? (
-          <div style={{ fontSize: "var(--fs-sm)", color: "var(--red)", padding: "8px 0" }}>
-            Could not reach the data plane status endpoint.
+      {errs.length > 0 && (
+        <div className="panel"><div className="pb">
+          <div style={{ fontSize: "var(--fs-sm)", color: "var(--red)" }}>
+            {errs.map((e, i) => <div key={i}>Could not read {e}</div>)}
           </div>
-        ) : (
-          <>
-            <KV label="WAF process" value={status ? (status.waf_running ? "running" : "not running") : "…"} />
-            <KV label="Uptime" value={status ? uptime(status.uptime_secs) : "…"} />
-            <KV label="Protected sites" value={status?.sites ?? "…"} />
-            <KV label="Listeners" value={
-              status?.listeners?.length
-                ? status.listeners.join("  ·  ")
-                : "…"
-            } />
-          </>
-        )}
+        </div></div>
+      )}
 
-        <div style={{ fontSize: "var(--fs-h3)", fontWeight: 600, color: "var(--text)", margin: "18px 0 6px" }}>
-          Deployment-level configuration
+      <div className="panel">
+        <div className="ph"><div className="ptitle">Data plane</div>
+          <span className={`bdg ${waf?.waf_running ? "bgg" : "br"}`}>
+            {waf ? (waf.waf_running ? "RUNNING" : "STOPPED") : "…"}
+          </span>
         </div>
-        <Note tone="warn">
-          Log retention, tracing export and the ML toggle are set where the stack is
-          deployed — environment variables and the data-plane config file — not from
-          this console. There is no tenant-settings API behind this tab, so rather
-          than show inputs that discard what you type, it shows nothing.
-        </Note>
+        <div className="pb">
+          <KV label="Uptime" value={uptime(waf?.uptime_secs)} />
+          <KV label="Protected sites" value={waf?.sites ?? "…"} />
+          <KV label="Upstream health" value={
+            waf ? `${waf.upstreams_healthy ?? 0} / ${waf.upstreams_total ?? 0} healthy` : "…"} />
+          <KV label="Listeners" value={waf?.listeners?.length ? waf.listeners.join("   ") : "…"} />
+          <KV label="HTTP/3 (QUIC)" value={
+            waf?.http3 ? (waf.http3.enabled ? `enabled · advertised :${waf.http3.advertise_port ?? "?"}` : "disabled") : "…"} />
+        </div>
+      </div>
+
+      <div className="panel">
+        <div className="ph"><div className="ptitle">Cluster</div>
+          {cluster && <span className={`bdg ${cluster.overall === "healthy" ? "bgg" : cluster.overall === "degraded" ? "ba" : "br"}`}>
+            {cluster.overall.toUpperCase()}</span>}
+        </div>
+        <div className="pb">
+          <KV label="Protection active" value={cluster ? (cluster.protection_active ? "yes" : "NO") : "…"} />
+          <KV label="Data-plane nodes" value={cluster
+            ? `${cluster.data_plane.healthy} healthy · ${cluster.data_plane.degraded} degraded · ${cluster.data_plane.down} down  (of ${cluster.data_plane.total})`
+            : "…"} />
+          <KV label="Resilience budget" value={cluster ? `${cluster.data_plane.resilience_budget} node(s) may fail` : "…"} />
+          <KV label="Control plane" value={cluster
+            ? (cluster.control_plane.enabled
+                ? `${cluster.control_plane.healthy}/${cluster.control_plane.total} up · this node: ${cluster.control_plane.role ?? "unknown"}`
+                : "single node")
+            : "…"} />
+        </div>
+      </div>
+
+      <div className="panel">
+        <div className="ph"><div className="ptitle">Event store (ClickHouse)</div>
+          {store && <span className={`bdg ${store.configured && store.reachable ? "bgg" : "ba"}`}>
+            {store.configured ? (store.reachable ? "REACHABLE" : "UNREACHABLE") : "NOT CONFIGURED"}</span>}
+        </div>
+        <div className="pb">
+          <KV label="Configured" value={store ? String(store.configured) : "…"} />
+          <KV label="Reachable" value={store ? String(store.reachable) : "…"} />
+          <KV label="Stored events" value={store?.events?.toLocaleString() ?? "—"} />
+          {store?.error && <KV label="Error" value={store.error} />}
+        </div>
+      </div>
+
+      <div className="panel">
+        <div className="ph"><div className="ptitle">Where settings actually live</div></div>
+        <div className="pb">
+          <Note>
+            <strong>Protection settings are per site.</strong> WAF mode, paranoia level,
+            anomaly threshold, rate limits, bot detection and ML sensitivity all belong to
+            an individual site and are edited in <strong>Sites → Edit</strong>, where the
+            change is dry-run validated and a rollback point is written. This tab used to
+            show global copies of those fields that were never saved anywhere.
+          </Note>
+          <Note tone="warn">
+            <strong>Log retention, tracing and the data-plane config file</strong> are set
+            where the stack is deployed, via environment variables and
+            <code style={{ fontFamily: "var(--font-mono)" }}> sentinel.proxy.yaml</code> —
+            there is no tenant-settings API, so this console does not pretend to own them.
+          </Note>
+        </div>
       </div>
     </motion.div>
   );

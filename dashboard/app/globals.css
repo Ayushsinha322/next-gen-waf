@@ -324,6 +324,37 @@ input, select, textarea { font-family:inherit; }
 @keyframes fadeIn   { from{opacity:0} to{opacity:1} }
 @keyframes slideIn  { from{opacity:0;transform:translateX(-12px)} to{opacity:1;transform:translateX(0)} }
 @keyframes secIn    { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
+/* ── Top bar ───────────────────────────────────────────────────────────────
+   RESTORED. These two rules were destroyed collateral damage when the fake
+   "LIVE THREATS" ticker was stripped out: the removal matched rule blocks by
+   selector substring, and it took `.topbar` and `.tb-logo, .tb-logo-area` with
+   the ticker rules they sat among. Their `:hover` variants survived on separate
+   lines, which is why only the LAYOUT broke and nothing looked obviously absent
+   in the stylesheet.
+
+   The symptom: with `.topbar` gone the bar lost position/height/z-index, so its
+   children — the search field, the node badge, the user block, the logout
+   button — reflowed as ordinary inline content and bled over the page heading.
+   With `.tb-logo` gone the brand block lost its `width: var(--sb)` and full
+   height, so the two-line wordmark clipped. */
+.topbar {
+  position:fixed; top:0; left:0; right:0; height:var(--th); z-index:40;
+  background:var(--glass-bar); border-bottom:1px solid var(--border2);
+  backdrop-filter:var(--blur); -webkit-backdrop-filter:var(--blur);
+  display:flex; align-items:center;
+  /* Was a cyan glow (0 1px 20px rgba(0,229,255,.08)). An enterprise console
+     separates the chrome from the canvas with a hairline and a flat shadow, not
+     a coloured bloom. */
+  box-shadow:0 1px 3px rgba(0,0,0,.28);
+}
+.tb-logo, .tb-logo-area {
+  width:var(--sb); flex-shrink:0; display:flex; align-items:center;
+  gap:10px; padding:0 16px; border-right:1px solid var(--border2);
+  height:100%; cursor:pointer; transition:background .2s;
+  /* No overflow:hidden — that is what clipped the second wordmark line when the
+     block lost its width. The wordmark is nowrap, so it cannot leak sideways. */
+  min-width:0;
+}
 .tb-logo:hover, .tb-logo-area:hover { background:rgba(0,212,255,.05); }
 .tb-emb {
   width:32px; height:32px; border-radius:9px;
@@ -332,9 +363,9 @@ input, select, textarea { font-family:inherit; }
   justify-content:center; font-size:17px; box-shadow:0 0 14px var(--cyan-glow);
   animation:glow 3.5s ease-in-out infinite; flex-shrink:0; color:var(--cyan);
 }
-.tb-nm { font-family:var(--font-display); font-weight:900; line-height:1.1; display:flex; flex-direction:column; gap:2px; white-space:nowrap; }
+.tb-nm { font-family:var(--font-display); font-weight:700; line-height:1.1; display:flex; flex-direction:column; gap:2px; white-space:nowrap; }
 .tb-nm .s { color:var(--text); font-size:12px; letter-spacing:0.8px; }
-.tb-nm .w { color:var(--cyan); font-size:15px; letter-spacing:3px; text-shadow:0 0 14px var(--cyan-glow); }
+.tb-nm .w { color:var(--cyan); font-size:15px; letter-spacing:2.4px; }
 [data-theme='light'] .tb-nm .w, [data-theme='light'] #brand-text .w { color:var(--cyan-b); text-shadow:none; }
 .tb-ver { font-size:11px; font-family:var(--font-mono); color:var(--text3); letter-spacing:1.2px; margin-top:3px; }
 .sinp {
@@ -377,7 +408,7 @@ input, select, textarea { font-family:inherit; }
 ═══════════════════════════════════════════ */
 .sidebar {
   position:fixed; top:var(--th); left:0; bottom:var(--bh); width:var(--sb); z-index:30;
-  background:var(--glass-bar); border-right:1px solid var(--cyan-ring);
+  background:var(--glass-bar); border-right:1px solid var(--border2);
   backdrop-filter:var(--blur); -webkit-backdrop-filter:var(--blur);
   display:flex; flex-direction:column;
 }
@@ -1055,7 +1086,7 @@ textarea.fin2 { resize:vertical; min-height:80px; line-height:1.6; }
   box-shadow:0 0 32px var(--red-glow),0 0 64px rgba(255,45,85,.18),inset 0 1px 0 rgba(255,255,255,.1);
   animation:glowRed 3.5s ease-in-out infinite;
 }
-.logo-name { font-family:var(--font-display); font-size:32px; font-weight:900; letter-spacing:5px; line-height:1; margin-bottom:6px; animation:glitch 8s ease-in-out infinite; transform:translateZ(0); }
+.logo-name { font-family:var(--font-display); font-size:32px; font-weight:700; letter-spacing:5px; line-height:1; margin-bottom:6px; animation:glitch 8s ease-in-out infinite; transform:translateZ(0); }
 .logo-name .s { color:var(--text); }
 .logo-name .w { color:var(--red-b); text-shadow:0 0 22px var(--red-glow),0 0 44px rgba(255,45,85,.4); }
 .logo-sub  { font-family:var(--font-mono); font-size:11px; color:var(--text3); letter-spacing:5px; text-transform:uppercase; margin-bottom:10px; }
@@ -1639,7 +1670,7 @@ textarea.fin2 { resize:vertical; min-height:80px; line-height:1.6; }
   display:flex; align-items:center; justify-content:center; flex-shrink:0;
 }
 #brand-text {
-  font-family:var(--font-display); font-size:17px; font-weight:900;
+  font-family:var(--font-display); font-size:17px; font-weight:700;
   letter-spacing:1.2px; color:var(--text); line-height:1; white-space:nowrap;
 }
 #brand-text .w { color:var(--cyan); }

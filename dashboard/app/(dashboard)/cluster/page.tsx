@@ -148,7 +148,7 @@ Fleet-wide health of the WAF data plane and control plane — live topology, fai
           }}>
             <div style={{
               display: "inline-flex", alignItems: "center", gap: 10, alignSelf: "flex-start",
-              padding: "8px 18px", borderRadius: 24, fontFamily: ORB, fontWeight: 800, fontSize: 22, letterSpacing: 1,
+              padding: "8px 18px", borderRadius: 24, fontFamily: ORB, fontWeight: 700, fontSize: 22, letterSpacing: 1,
               color: overallColor(health?.overall),
               background: `color-mix(in srgb, ${overallColor(health?.overall)} 14%, transparent)`,
               border: `1px solid color-mix(in srgb, ${overallColor(health?.overall)} 40%, transparent)`,

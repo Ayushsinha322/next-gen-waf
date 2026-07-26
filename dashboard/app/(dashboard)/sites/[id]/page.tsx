@@ -245,7 +245,7 @@ export default function SiteDetailPage() {
               <span style={{ fontSize: 14, color: "var(--text3)", textTransform: "uppercase", letterSpacing: 1, fontFamily: "var(--font-mono)" }}>{k.lbl}</span>
               <span style={{ fontSize: 15 }}>{k.ico}</span>
             </div>
-            <div style={{ fontSize: 25, fontWeight: 800, color: k.accent, marginTop: 6, fontFamily: "var(--font-display)" }}>{k.val}</div>
+            <div style={{ fontSize: 25, fontWeight: 700, color: k.accent, marginTop: 6, fontFamily: "var(--font-display)" }}>{k.val}</div>
           </motion.div>
         ))}
       </motion.div>

@@ -71,7 +71,7 @@ function Kpi({ icon, label, value, sub, accent }: { icon: string; label: string;
         <div style={{ fontSize: 14, color: "var(--text3)", textTransform: "uppercase", letterSpacing: 1, fontFamily: "var(--font-mono)" }}>{label}</div>
         <span style={{ fontSize: 17, opacity: 0.85 }}>{icon}</span>
       </div>
-      <div style={{ fontSize: 27, fontWeight: 800, color: accent ?? "var(--text)", marginTop: 8, fontFamily: "var(--font-display)", lineHeight: 1 }}>{value}</div>
+      <div style={{ fontSize: 27, fontWeight: 700, color: accent ?? "var(--text)", marginTop: 8, fontFamily: "var(--font-display)", lineHeight: 1 }}>{value}</div>
       {sub && <div style={{ fontSize: 14, color: "var(--text3)", marginTop: 6, fontFamily: "var(--font-mono)" }}>{sub}</div>}
     </motion.div>
   );
@@ -250,7 +250,7 @@ export default function OverviewPage() {
             <div key={k} className="panel" style={{ padding: 18, position: "relative", border: active ? "1px solid var(--cyan-ring)" : undefined, background: active ? "var(--cyan-dim)" : undefined }}>
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                  <span style={{ fontFamily: "var(--font-display)", fontSize: 20, fontWeight: 800, color: p.accent }}>{p.name}</span>
+                  <span style={{ fontFamily: "var(--font-display)", fontSize: 20, fontWeight: 700, color: p.accent }}>{p.name}</span>
                   {active && <span style={{ fontSize: 11, fontWeight: 700, padding: "3px 9px", borderRadius: 20, background: "var(--cyan)", color: "#021018", letterSpacing: 0.5 }}>● CURRENT PLAN</span>}
                 </div>
                 <span style={{ fontSize: 13, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>{p.price}</span>
@@ -339,7 +339,7 @@ export default function OverviewPage() {
             <div style={{ display: "flex", justifyContent: "center" }}>
               <div style={{ width: 172, height: 172, borderRadius: "50%", background: `conic-gradient(${conic})`, position: "relative" }}>
                 <div style={{ position: "absolute", inset: 23, borderRadius: "50%", background: "var(--bg2)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
-                  <div style={{ fontSize: 36, fontWeight: 800, color: "var(--text)", fontFamily: "var(--font-display)", lineHeight: 1 }}>{sTotal > 0 ? `${((s2 / sTotal) * 100).toFixed(0)}%` : "—"}</div>
+                  <div style={{ fontSize: 36, fontWeight: 700, color: "var(--text)", fontFamily: "var(--font-display)", lineHeight: 1 }}>{sTotal > 0 ? `${((s2 / sTotal) * 100).toFixed(0)}%` : "—"}</div>
                   <div style={{ fontSize: 12, color: "var(--text3)", marginTop: 5, letterSpacing: 1, textTransform: "uppercase", fontFamily: "var(--font-mono)" }}>success</div>
                 </div>
               </div>
@@ -363,12 +363,12 @@ export default function OverviewPage() {
             {/* Summary footer */}
             <div style={{ display: "flex", alignItems: "stretch", gap: 12, borderTop: "1px solid var(--bg4)", paddingTop: 16 }}>
               <div style={{ flex: 1, textAlign: "center" }}>
-                <div style={{ fontSize: 21, fontWeight: 800, color: "#22c55e", fontFamily: "var(--font-display)", lineHeight: 1 }}>{sTotal > 0 ? `${(((s2 + s3) / sTotal) * 100).toFixed(1)}%` : "—"}</div>
+                <div style={{ fontSize: 21, fontWeight: 700, color: "#22c55e", fontFamily: "var(--font-display)", lineHeight: 1 }}>{sTotal > 0 ? `${(((s2 + s3) / sTotal) * 100).toFixed(1)}%` : "—"}</div>
                 <div style={{ fontSize: 11, color: "var(--text3)", letterSpacing: 1, textTransform: "uppercase", marginTop: 5, fontFamily: "var(--font-mono)" }}>OK · 2xx/3xx</div>
               </div>
               <div style={{ width: 1, background: "var(--bg4)" }} />
               <div style={{ flex: 1, textAlign: "center" }}>
-                <div style={{ fontSize: 21, fontWeight: 800, color: "#ef4444", fontFamily: "var(--font-display)", lineHeight: 1 }}>{(s4 + s5).toLocaleString()}</div>
+                <div style={{ fontSize: 21, fontWeight: 700, color: "#ef4444", fontFamily: "var(--font-display)", lineHeight: 1 }}>{(s4 + s5).toLocaleString()}</div>
                 <div style={{ fontSize: 11, color: "var(--text3)", letterSpacing: 1, textTransform: "uppercase", marginTop: 5, fontFamily: "var(--font-mono)" }}>Errors · 4xx/5xx</div>
               </div>
             </div>
