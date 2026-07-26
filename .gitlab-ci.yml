@@ -39,15 +39,12 @@ go:
       - .go/pkg/mod/
   variables:
     GOPATH: "$CI_PROJECT_DIR/.go"
+  # No protobuf codegen step: the gRPC listener, api/proto/config.proto and the
+  # generated pkg/proto/ tree were all removed in 71706a7 (the listener was dead
+  # code and served plaintext). Running protoc here failed the job outright with
+  # "Could not make proto path relative: api/proto/config.proto: No such file".
   before_script:
-    - apt-get update && apt-get install -y protobuf-compiler
-    - go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.34.2
-    - go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.4.0
-    - export PATH="$PATH:$(go env GOPATH)/bin"
     - cd control-plane
-    - protoc --go_out=. --go_opt=module=github.com/your-org/sentinel-waf/control-plane
-             --go-grpc_out=. --go-grpc_opt=module=github.com/your-org/sentinel-waf/control-plane
-             api/proto/config.proto
   script:
     - go vet ./...
     - go test ./...
