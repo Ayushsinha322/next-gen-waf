@@ -653,11 +653,34 @@ fn extract_target(spec: &TargetSpec, ctx: &RequestContext) -> Vec<String> {
         TargetSpec::RequestLine => {
             vec![format!("{} {} {:?}", ctx.method, ctx.uri, ctx.http_version)]
         }
-        TargetSpec::RequestBody => ctx
-            .request_body
-            .as_ref()
-            .map(|b| vec![String::from_utf8_lossy(b).into_owned()])
-            .unwrap_or_default(),
+        // For multipart/form-data, yield the PARSED part values rather than the
+        // raw envelope. ModSecurity/CRS deliberately leave REQUEST_BODY empty for
+        // multipart — the parts reach ARGS instead — and handing rules the raw
+        // envelope makes the envelope's own structure look like an attack: the
+        // `\r\n\r\n` separating a part's headers from its value satisfies the
+        // newline operator in command-injection patterns, so any field whose value
+        // begins with a command word false-positives. Measured: a multipart field
+        // holding the ordinary text `nc 8000 controller` was blocked by 9900207,
+        // while the identical value in a urlencoded form passed.
+        //
+        // No coverage is lost. The part values are still inspected — that is what
+        // this returns — and scanning them individually is strictly better for
+        // wholly-encoded payloads, which only decode once separated from the
+        // boundary noise.
+        TargetSpec::RequestBody => {
+            if content_type(ctx).starts_with("multipart/form-data") {
+                multipart_parts(ctx)
+                    .fields
+                    .into_iter()
+                    .map(|(_, v)| v)
+                    .collect()
+            } else {
+                ctx.request_body
+                    .as_ref()
+                    .map(|b| vec![String::from_utf8_lossy(b).into_owned()])
+                    .unwrap_or_default()
+            }
+        }
         TargetSpec::RequestHeadersAll => ctx
             .request_headers
             .values()

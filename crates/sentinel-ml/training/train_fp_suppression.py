@@ -19,11 +19,21 @@ K = int(sys.argv[1]) if len(sys.argv) > 1 else 32768
 OUT = sys.argv[2] if len(sys.argv) > 2 else "payload_ngram_fp_suppress.json"
 NS = [2, 3, 4]; MAXLEN = 512
 C_REG = 0.25  # moderate L2 — balance TP/TN under adversarial benign
-BASE = "/tmp/claude-1000/-home-ayush3750-waf-development"
-OLD = f"{BASE}/24905267-7ca1-4d87-9e75-328eeac4243f/scratchpad/ml-corpus"
-EVA = f"{BASE}/cbcb63a2-92d2-4e2b-ab24-29bdba5eb6c3/scratchpad/evasion-corpus"
-HARD = f"{BASE}/cbcb63a2-92d2-4e2b-ab24-29bdba5eb6c3/scratchpad/hard-benign"
-BEN = f"{BASE}/cbcb63a2-92d2-4e2b-ab24-29bdba5eb6c3/scratchpad/benign-corpus"
+# Corpus root. These used to be four hardcoded /tmp session-scratchpad paths, which
+# meant a single /tmp cleanup made the model unretrainable — recorded as the blocker
+# in front of all model work in Fix 9 (ffbc44a). The corpora now live in a durable
+# directory; override with SENTINEL_CORPUS_DIR if they move again.
+BASE = os.environ.get("SENTINEL_CORPUS_DIR", os.path.expanduser("~/waf-ml-corpora"))
+OLD = f"{BASE}/ml-corpus"
+EVA = f"{BASE}/evasion-corpus"
+HARD = f"{BASE}/hard-benign"
+BEN = f"{BASE}/benign-corpus"
+if not os.path.isdir(OLD):
+    sys.exit(
+        f"corpus root {BASE} is missing {OLD}.\n"
+        f"Extract the archives: (cd {BASE} && for f in *.tar.gz; do tar -xzf $f; done)\n"
+        f"or point SENTINEL_CORPUS_DIR at the corpus root."
+    )
 ADV = "adversarial_benign.txt"
 rng = random.Random(1337)
 FNV=2166136261; PR=16777619; M=0xFFFFFFFF
@@ -138,9 +148,140 @@ def gen_cmdi(n):
         o.add(rng.choice([f"{p}{s}{c}",f"{p} {s} {c}",f"$({c})",f"`{c}`",f"{p};{c};",f"|{c}"]))
     return list(o)
 
+def gen_web_benign(n_url=12000, n_hdr=6000):
+    """Ordinary URLs and HTTP header values — benign traffic the corpus lacked.
+
+    Measured gap that motivated this: the shipped model scored an ordinary
+    Instagram share link 0.9953 and a plain Google search URL 0.6232, i.e. it had
+    learned "URL in a parameter" as an attack signal. Any application that accepts
+    a redirect target, share link, webhook or OAuth callback would false-positive.
+    Likewise a routine `Accept: text/html,application/xhtml+xml,...` scored 0.8970,
+    which blocks header values from being fed to the classifier at all (the score
+    is a max over candidates, so one inflated header would pin every request high
+    and disable FP suppression entirely).
+
+    Both are corpus gaps, not model-capacity limits — exactly the corpus-diversity
+    conclusion Fix 9 reached. Everything here is synthesised from generic web
+    shapes; NO GoTestWAF content, which stays held out.
+    """
+    scheme = ["https://", "http://", "//", ""]
+    host = ["www.instagram.com", "instagram.com", "twitter.com", "x.com", "www.facebook.com",
+            "youtu.be", "www.youtube.com", "open.spotify.com", "www.linkedin.com", "github.com",
+            "www.google.com", "news.ycombinator.com", "medium.com", "www.reddit.com", "t.co",
+            "bit.ly", "example.com", "shop.example.co.uk", "cdn.example.net", "api.example.org",
+            "docs.google.com", "drive.google.com", "www.amazon.in", "flipkart.com", "esds.co.in",
+            "maps.google.com", "wa.me", "t.me", "discord.gg", "stackoverflow.com"]
+    path = ["", "/", "/p/B_uHgI7lY0Z/", "/watch", "/search", "/status/1234567890123456789",
+            "/r/programming/comments/abc123/some_title_here/", "/questions/12345/how-do-i-do-x",
+            "/user/profile", "/product/12345", "/a/b/c/d", "/track/4cOdK2wGLETKBW3PVgPWZS",
+            "/in/some-person-name", "/orgs/acme/repos", "/articles/2024/01/15/title-slug",
+            "/download/file.pdf", "/images/photo_2024.jpg", "/api/v2/items", "/checkout/cart"]
+    keys = ["utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term", "igshid",
+            "fbclid", "gclid", "ref", "si", "v", "q", "oq", "sourceid", "ie", "hl", "page",
+            "sort", "filter", "lang", "session", "from", "next", "redirect_uri", "callback",
+            "returnUrl", "continue", "state", "code", "share_id", "mc_cid", "_ga"]
+    vals = ["ig_web_copy_link", "share", "email", "newsletter", "twitter", "facebook",
+            "1m7xkk7a9v6z4", "IwAR2xY9zQ", "abc123XYZ", "en-US", "en", "1", "2", "10", "desc",
+            "relevance", "true", "false", "dQw4w9WgXcQ", "spring_sale_2024", "cpc", "organic",
+            "GA1.2.1234567890.1234567890", "a1b2c3d4e5f6", "web", "mobile", "utf-8", "chrome"]
+    wrap = ["q", "url", "u", "link", "target", "next", "redirect", "src", "href", "data",
+            "share", "text", "message", "comment", "value", "input", "field", "note"]
+
+    out = set()
+    guard = 0
+    while len(out) < n_url and guard < n_url * 40:
+        guard += 1
+        u = rng.choice(scheme) + rng.choice(host) + rng.choice(path)
+        nq = rng.choice([0, 0, 1, 1, 2, 2, 3, 4])
+        if nq:
+            u += "?" + "&".join(f"{rng.choice(keys)}={rng.choice(vals)}" for _ in range(nq))
+        if rng.random() < 0.18:
+            u += "#" + rng.choice(["top", "section-2", "comments", "L42", "8"])
+        shape = rng.random()
+        if shape < 0.42:
+            out.add(u)                                            # bare URL
+        elif shape < 0.68:
+            out.add(f"{rng.choice(wrap)}={u}")                     # param=URL
+        elif shape < 0.84:
+            out.add(f"{rng.choice(wrap)}={urllib.parse.quote(u, safe='')}")  # encoded
+        else:                                                      # URL trailed by prose
+            out.add(u + rng.choice([
+                "Can I please get the id for the user that I am trying to follow?",
+                " check this out", " thanks!", " see attached", " is this the right one?",
+                " please review", " shared via mobile", " — updated link",
+            ]))
+
+    ua_os = ["Windows NT 10.0; Win64; x64", "Windows NT 6.1; WOW64", "Macintosh; Intel Mac OS X 10_15_7",
+             "X11; Linux x86_64", "iPhone; CPU iPhone OS 17_2 like Mac OS X", "Linux; Android 13; SM-G991B"]
+    ua_eng = ["AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+              "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+              "Gecko/20100101 Firefox/121.0", "AppleWebKit/537.36 (KHTML, like Gecko) Mobile/15E148"]
+    hdrs = [
+        lambda: f"Mozilla/5.0 ({rng.choice(ua_os)}) {rng.choice(ua_eng)}",
+        lambda: rng.choice([
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "application/json, text/plain, */*", "*/*", "application/json;charset=UTF-8",
+            "text/css,*/*;q=0.1", "image/avif,image/webp,image/apng,*/*;q=0.8"]),
+        lambda: rng.choice(["gzip, deflate, br", "gzip, deflate", "br;q=1.0, gzip;q=0.8, *;q=0.1"]),
+        lambda: rng.choice(["en-US,en;q=0.9", "en-GB,en;q=0.9,hi;q=0.8", "fr-FR,fr;q=0.9,en;q=0.8",
+                            "en-US,en;q=0.9,mr;q=0.8,hi;q=0.7"]),
+        lambda: rng.choice(["application/x-www-form-urlencoded", "application/json",
+                            "multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW",
+                            "text/plain;charset=UTF-8", "application/octet-stream"]),
+        lambda: rng.choice(["no-cache", "max-age=0", "no-store, must-revalidate", "public, max-age=31536000"]),
+        lambda: rng.choice(["keep-alive", "close", "upgrade"]),
+        lambda: rng.choice(["XMLHttpRequest", "fetch", "document", "empty", "cors", "same-origin",
+                            "navigate", "?1", "?0", "1"]),
+        lambda: f"Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.{''.join(rng.choice('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789') for _ in range(28))}",
+        lambda: "; ".join(f"{rng.choice(['sessionid','csrftoken','_ga','_gid','PHPSESSID','JSESSIONID','locale','theme','cart'])}="
+                          f"{''.join(rng.choice('abcdef0123456789') for _ in range(rng.choice([8,12,16,24])))}"
+                          for _ in range(rng.choice([1, 2, 3, 4]))),
+        lambda: f"{rng.choice(host)}" + rng.choice(["", ":443", ":8080", ":3000"]),
+        lambda: rng.choice(scheme[:2]) + rng.choice(host) + rng.choice(path),   # Referer / Origin
+    ]
+    hset = set()
+    guard = 0
+    while len(hset) < n_hdr and guard < n_hdr * 40:
+        guard += 1
+        hset.add(rng.choice(hdrs)())
+    return list(out) + list(hset)
+
+
+def gen_url_attacks(n=3000):
+    """URL-SHAPED attacks (RFI / SSRF / protocol smuggling).
+
+    Counterweight to gen_web_benign: teaching the model that ordinary URLs are
+    benign must not collapse into "anything URL-shaped is benign", or RFI and SSRF
+    payloads ride in on the same shape. Pairing both pools keeps the learned
+    boundary on WHAT THE URL POINTS AT — attacker-controlled include, cloud
+    metadata, a non-HTTP scheme handler — rather than on the presence of a URL.
+    """
+    evil_host = ["evil.com", "attacker.example", "169.254.169.254", "127.0.0.1", "localhost",
+                 "0.0.0.0", "[::1]", "metadata.google.internal", "burpcollaborator.net",
+                 "2130706433", "0x7f000001", "attacker.oastify.com"]
+    evil_path = ["/shell.php", "/c99.txt", "/backdoor.txt?", "/latest/meta-data/iam/security-credentials/",
+                 "/computeMetadata/v1/instance/service-accounts/default/token", "/admin", "/etc/passwd",
+                 "/cmd.php?cmd=id", "/r57.php", "/webshell.jsp", "/latest/user-data"]
+    schemes = ["http://", "https://", "//", "file://", "php://filter/convert.base64-encode/resource=",
+               "gopher://", "dict://", "ftp://", "jar:http://", "netdoc://", "expect://"]
+    params = ["url", "path", "include", "page", "file", "src", "dest", "redirect", "uri",
+              "next", "data", "template", "load", "document", "target", "callback"]
+    out = set()
+    guard = 0
+    while len(out) < n and guard < n * 40:
+        guard += 1
+        s = rng.choice(schemes)
+        u = s + rng.choice(evil_host) + rng.choice(evil_path) if s.endswith("//") or s in (
+            "http://", "https://", "//", "jar:http://") else s + rng.choice(
+            ["/etc/passwd", "index.php", "/proc/self/environ", rng.choice(evil_host) + ":11211/_"])
+        out.add(rng.choice([u, f"{rng.choice(params)}={u}",
+                            f"{rng.choice(params)}={urllib.parse.quote(u, safe='')}"]))
+    return list(out)
+
+
 # ---- assemble attacks ----
 print("loading evasion corpus (per-category balanced)...", flush=True)
-base_atk = load_by_category() + gen_xss(3000) + gen_sqli(3000) + gen_cmdi(3000)
+base_atk = load_by_category() + gen_xss(3000) + gen_sqli(3000) + gen_cmdi(3000) + gen_url_attacks(3000)
 base_atk = list(dict.fromkeys([a for a in base_atk if a]))
 atk = augment_attacks(base_atk, per=4)
 print(f"attacks: {len(base_atk)} base -> {len(atk)} mutation-augmented", flush=True)
@@ -153,13 +294,17 @@ hp_ben = [r["payload"] for r in hp_rows if r["label"]=="norm"]
 # Adversarial benign: FP payloads + prose with attack keywords
 adv_ben = lines(ADV)
 print(f"adversarial benign: {len(adv_ben)}", flush=True)
+# Ordinary URLs + HTTP header values (see gen_web_benign for the measured gap).
+web_ben = gen_web_benign()
+print(f"web benign (urls + headers): {len(web_ben)}", flush=True)
 # More encoded-benign
-enc_pool = rng.sample(hard+fwaf+adv_ben, min(8000, len(hard)+len(fwaf)+len(adv_ben)))
+_pool = hard+fwaf+adv_ben+web_ben
+enc_pool = rng.sample(_pool, min(8000, len(_pool)))
 enc_benign = [url_enc_part(b) for b in enc_pool[:4000]]
 enc_full = [url_enc(b) for b in enc_pool]
 form_benign = [f"{rng.choice(['q','field','data','input','name','value','text'])}={url_enc(b)}"
-               for b in rng.sample(hard+fwaf+adv_ben, min(4000, len(hard)+len(fwaf)+len(adv_ben)))]
-ben = hard + fwaf + hp_ben + adv_ben + enc_benign + enc_full + form_benign
+               for b in rng.sample(_pool, min(4000, len(_pool)))]
+ben = hard + fwaf + hp_ben + adv_ben + web_ben + enc_benign + enc_full + form_benign
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELD-OUT SPLIT.
@@ -195,7 +340,7 @@ ben_tr, ben_held = stratified_split(ben, HOLDOUT)
 
 allX = atk_tr + ben_tr
 allY = np.r_[np.ones(len(atk_tr),np.float32), np.zeros(len(ben_tr),np.float32)]
-print(f"train: {len(allX)} ({len(atk_tr)} atk / {len(ben_tr)} benign [{len(hard)} hard + {len(fwaf)} fwaf + {len(hp_ben)} hp + {len(adv_ben)} adv + {len(enc_benign)} enc-part + {len(enc_full)} enc-full + {len(form_benign)} form])", flush=True)
+print(f"train: {len(allX)} ({len(atk_tr)} atk / {len(ben_tr)} benign [{len(hard)} hard + {len(fwaf)} fwaf + {len(hp_ben)} hp + {len(adv_ben)} adv + {len(web_ben)} web + {len(enc_benign)} enc-part + {len(enc_full)} enc-full + {len(form_benign)} form])", flush=True)
 if HOLDOUT > 0:
     print(f"HELD OUT: {len(atk_held)} atk / {len(ben_held)} benign ({HOLDOUT:.0%}) — never seen during fit", flush=True)
 else:

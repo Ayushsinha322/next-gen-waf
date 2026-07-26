@@ -64,6 +64,39 @@ on this corpus); (3) per-deployment FP tuning on real traffic.
 | + obfuscation canonicalizers ($IFS/comment/whitespace) + per-category-balanced retrain (full-enc benign) + precise cmdi rules (9900207/8) + **ML scoring of parsed form/multipart field values** | **80.30%** | **85.82%** | **80.82%** |
 | + FP-suppression model + base64 rule-visibility (commit `1dc69e4`, 2026-07-20) | **99.24%** | 88.65% | **97.15%** |
 | + **make the FP-suppression layer reachable** + calibrate its threshold 0.15→0.5 (2026-07-25) | 98.94% | **96.45%** | **98.85%** |
+| + retrain on benign URLs/headers + score header/cookie values + parsed-multipart REQUEST_BODY (2026-07-26) | **99.09%** | **99.29%** | **99.60%** |
+
+**2026-07-26: 99.60% overall (App-TP 99.09%, TN 99.29%, API 100%) — 1 false positive left of the
+original 16.** TP rose while FP fell, so nothing here was traded. Three changes, each fixing a place
+where a component was judging data it could not actually see:
+
+1. **The classifier had never seen benign URLs or header values.** It scored an ordinary Instagram
+   share link 0.9953 and a plain Google search URL 0.6232 — it had learned "URL in a parameter" as an
+   attack signal, which would false-positive on any redirect, share link, webhook or OAuth callback in
+   production. A routine `Accept: text/html,...` scored 0.8970. Retrained with 18k synthesised benign
+   URLs and header values (`gen_web_benign`), plus 3k URL-shaped RFI/SSRF **attacks**
+   (`gen_url_attacks`) as a counterweight so the boundary stays on *where the URL points*, not on
+   being a URL. Guarded by `crates/sentinel-ml/tests/fp_suppression_calibration.rs`.
+2. **The classifier was never shown headers or cookies** (`evaluate` built candidates from path,
+   query and body only). Since it is consulted as a veto, that made it blind exactly where the
+   all-placement libinjection rules are the only coverage. Adding header/cookie candidates is what
+   made it safe to convert `9900100`/`9900101` from a bare `block` to `setvar:tx.anomaly_score=+10`,
+   which routes them through `apply_verdict` and fixed the `john+or@var.es` FP. **These two changes
+   must not be separated** — doing the rule half alone made `X-Custom: <script>alert(1)</script>`
+   bypass with a 200. Note this ordering is only safe because of change 1: `payload_attack` is a MAX
+   over candidates, so the old model's 0.897 `Accept` header would have pinned every request above
+   the veto cutoff and silently disabled FP suppression everywhere.
+3. **`REQUEST_BODY` handed rules the raw multipart envelope.** The `\r\n\r\n` separating a part's
+   headers from its value satisfies the newline operator in command-injection patterns, so any field
+   whose value began with a command word false-positived — measured, `nc 8000 controller` blocked in
+   multipart while identical text in a urlencoded form passed. ModSecurity/CRS leave `REQUEST_BODY`
+   unpopulated for multipart for this reason; `vm.rs` now yields the parsed part values.
+
+The single remaining FP is `union%20was%20a%20great%20select` as a **URL-encoded multipart** field:
+`score_all` takes a MAX over decoded variants, and the model scores the raw `%20`-laden form ≥0.5 even
+though the decoded text scores 0.058. Fix is more `%20`-encoded benign prose in the corpus, not a code
+change. Remaining 6 TP bypasses: 3 community-xss (entity/double-encoded), 1 community-lfi (overlong
+UTF-8 `%C0%AE`), 1 community-user-agent, 1 Base64Flat SQLi in JSONRequest.
 
 **2026-07-25: 98.85% overall (App-TP 98.94%, TN 96.45%, API 100%).** The remaining false-positive
 gap was never a model weakness — the classifier already scored the adversarial-benign payloads

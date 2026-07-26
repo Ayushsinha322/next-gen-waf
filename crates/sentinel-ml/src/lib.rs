@@ -204,6 +204,35 @@ impl MlEngine {
                     candidates.push(kv.split_once('=').map(|(_, v)| v).unwrap_or(kv).to_string());
                 }
             }
+            // Header values (Header/UserAgent placements) and each cookie value
+            // separately (Cookie placement).
+            //
+            // The classifier must see every value the rules inspect. It is consulted
+            // not only additively but as a precision VETO that can suppress a rule
+            // block, and a veto based on data it never saw is blind: a header-borne
+            // payload scores ~0 ("nothing here looks like an attack") and suppresses
+            // a correct block from the all-placement libinjection rules, which are
+            // the only coverage for arbitrary headers. Measured before this was
+            // added: `X-Custom: <script>alert(1)</script>` bypassed entirely.
+            //
+            // This is only safe because the model was retrained on ordinary header
+            // values. `payload_attack` is a MAX over candidates, so a routine header
+            // scoring high would pin every request above the suppression cutoff and
+            // silently disable FP suppression — the previous model scored a plain
+            // `Accept: text/html,...` at 0.897, which would have done exactly that.
+            for (name, value) in ctx.request_headers.iter() {
+                let Ok(v) = value.to_str() else { continue };
+                if name == http::header::COOKIE {
+                    for c in v.split(';') {
+                        let val = c.split_once('=').map(|(_, x)| x).unwrap_or(c).trim();
+                        if !val.is_empty() {
+                            candidates.push(val.to_string());
+                        }
+                    }
+                } else if !v.is_empty() {
+                    candidates.push(v.to_string());
+                }
+            }
             // Request body (Body/JSON/form/multipart placements).
             if let Some(body) = ctx.request_body.as_ref() {
                 if let Ok(bs) = std::str::from_utf8(body.as_ref()) {
