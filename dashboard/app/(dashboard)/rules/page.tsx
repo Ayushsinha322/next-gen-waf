@@ -155,7 +155,7 @@ export default function RulesPage() {
           </div>
           <div className="tw" style={{ maxHeight:480, overflowY:"auto" }}>
             {loading ? (
-              <div style={{ padding:"24px", textAlign:"center", fontFamily:"'Share Tech Mono',monospace", fontSize: 13, color:"var(--text3)" }}>Loading…</div>
+              <div style={{ padding:"24px", textAlign:"center", fontFamily:"var(--font-mono)", fontSize: 13, color:"var(--text3)" }}>Loading…</div>
             ) : (
               <table>
                 <thead><tr><th>On</th><th>Name</th><th>Phase</th><th>Sev</th><th></th></tr></thead>
@@ -203,7 +203,7 @@ export default function RulesPage() {
                   <input className="fin2" value={PHASE_LABELS[editorRule.phase]??`phase ${editorRule.phase}`} readOnly style={{ opacity:0.6 }} /></div>
               </div>
             ) : (
-              <div style={{ padding:"16px 0", textAlign:"center", fontSize: 13, fontFamily:"'Share Tech Mono',monospace", color:"var(--text3)" }}>
+              <div style={{ padding:"16px 0", textAlign:"center", fontSize: 13, fontFamily:"var(--font-mono)", color:"var(--text3)" }}>
                 ← Click a rule to inspect · or use &ldquo;＋ New Rule&rdquo;
               </div>
             )}

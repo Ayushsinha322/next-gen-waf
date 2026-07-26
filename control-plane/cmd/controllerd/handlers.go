@@ -583,57 +583,31 @@ func handleListSites(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
 		return
 	}
-	if store != nil {
-		sites, err := store.ListSites(c.Request.Context(), claims.TenantID, claims.UserID)
-		if err == nil {
-			if sites == nil {
-				sites = []db.SiteRow{}
-			}
-			c.JSON(http.StatusOK, gin.H{"sites": sites, "tenant_id": claims.TenantID})
-			return
-		}
+	// A site list MUST come from the database or fail loudly.
+	//
+	// This handler used to answer a database outage with five hardcoded sites
+	// (dvwa.local, juice.local, api.acme.com, shop.corp.io, legacy.app.net),
+	// three of them marked "active"/"blocking", returned as 200 OK with the
+	// caller's real tenant_id stamped on them. The client had no way to tell
+	// them from real data, so an operator during a Postgres outage would see
+	// applications they do not own and believe traffic was being filtered for
+	// them. The underlying error was discarded rather than logged.
+	//
+	// Every other site handler here already returns 503 on store failure;
+	// this one now matches. Never invent rows to keep a screen populated.
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
+		return
 	}
-	// Fallback mock sites when DB is unavailable.
-	c.JSON(http.StatusOK, gin.H{
-		"sites": []gin.H{
-			{
-				"id": "00000000-0000-0000-0001-000000000001", "tenant_id": claims.TenantID,
-				"name": "dvwa.local", "domains": []string{"dvwa.local"},
-				"upstream":   gin.H{"servers": []string{"127.0.0.1:80"}, "lb": "round_robin"},
-				"waf_policy": gin.H{"mode": "blocking", "paranoia_level": 2, "anomaly_threshold": 5},
-				"status":     "active", "created_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-01T00:00:00Z",
-			},
-			{
-				"id": "00000000-0000-0000-0001-000000000002", "tenant_id": claims.TenantID,
-				"name": "juice.local", "domains": []string{"juice.local"},
-				"upstream":   gin.H{"servers": []string{"127.0.0.1:3000"}, "lb": "round_robin"},
-				"waf_policy": gin.H{"mode": "blocking", "paranoia_level": 2, "anomaly_threshold": 5},
-				"status":     "active", "created_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-01T00:00:00Z",
-			},
-			{
-				"id": "00000000-0000-0000-0001-000000000003", "tenant_id": claims.TenantID,
-				"name": "api.acme.com", "domains": []string{"api.acme.com"},
-				"upstream":   gin.H{"servers": []string{"127.0.0.1:8080"}, "lb": "round_robin"},
-				"waf_policy": gin.H{"mode": "learning", "paranoia_level": 1, "anomaly_threshold": 10},
-				"status":     "active", "created_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-01T00:00:00Z",
-			},
-			{
-				"id": "00000000-0000-0000-0001-000000000004", "tenant_id": claims.TenantID,
-				"name": "shop.corp.io", "domains": []string{"shop.corp.io"},
-				"upstream":   gin.H{"servers": []string{"127.0.0.1:8443"}, "lb": "round_robin"},
-				"waf_policy": gin.H{"mode": "blocking", "paranoia_level": 3, "anomaly_threshold": 5},
-				"status":     "active", "created_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-01T00:00:00Z",
-			},
-			{
-				"id": "00000000-0000-0000-0001-000000000005", "tenant_id": claims.TenantID,
-				"name": "legacy.app.net", "domains": []string{"legacy.app.net"},
-				"upstream":   gin.H{"servers": []string{"127.0.0.1:8088"}, "lb": "round_robin"},
-				"waf_policy": gin.H{"mode": "off", "paranoia_level": 1, "anomaly_threshold": 50},
-				"status":     "paused", "created_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-01T00:00:00Z",
-			},
-		},
-		"tenant_id": claims.TenantID,
-	})
+	sites, err := store.ListSites(c.Request.Context(), claims.TenantID, claims.UserID)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
+		return
+	}
+	if sites == nil {
+		sites = []db.SiteRow{}
+	}
+	c.JSON(http.StatusOK, gin.H{"sites": sites, "tenant_id": claims.TenantID})
 }
 
 func handleCreateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *leader.Elector) {

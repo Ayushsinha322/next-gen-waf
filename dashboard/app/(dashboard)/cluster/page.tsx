@@ -39,8 +39,8 @@ function fmtUptime(secs: number): string {
   const days = Math.floor(hrs / 24), rh = hrs % 24;
   return rh > 0 ? `${days}d ${rh}h` : `${days}d`;
 }
-const ORB = "'Orbitron',sans-serif";
-const MONO = "'Share Tech Mono',monospace";
+const ORB = "var(--font-display)";
+const MONO = "var(--font-mono)";
 
 // ---------------------------------------------------------------------------
 // Big status KPI figure (Orbitron numbers on a glass card)
@@ -66,7 +66,7 @@ function StageBox({ icon, title, sub, tone }: { icon: string; title: string; sub
       background: "var(--glass-w)", border: `1px solid ${tone ?? "var(--border)"}`,
     }}>
       <span style={{ fontSize: 24, lineHeight: 1 }}>{icon}</span>
-      <div style={{ fontSize: 13, fontWeight: 700, color: "var(--text)", fontFamily: "'Inter',sans-serif", textAlign: "center" }}>{title}</div>
+      <div style={{ fontSize: 13, fontWeight: 700, color: "var(--text)", fontFamily: "var(--font-sans)", textAlign: "center" }}>{title}</div>
       {sub && <div style={{ fontSize: 12, color: "var(--text3)", fontFamily: MONO }}>{sub}</div>}
     </div>
   );

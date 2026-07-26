@@ -314,7 +314,7 @@ function ClusterTab() {
       </div>
       <div className="pb">
         {!health ? (
-          <div style={{ padding: "26px 12px", textAlign: "center", color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", fontSize: 14 }}>
+          <div style={{ padding: "26px 12px", textAlign: "center", color: "var(--text3)", fontFamily: "var(--font-mono)", fontSize: 14 }}>
             {err ? "Control plane unreachable — no live cluster data to show." : "Loading live cluster health…"}
           </div>
         ) : (
@@ -361,7 +361,7 @@ function ClusterTab() {
               </div>
             ))}
 
-            <div style={{ marginTop: 12, fontSize: 12.5, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>
+            <div style={{ marginTop: 12, fontSize: 12.5, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>
               Live from <code>GET /cluster/health</code> · refreshes every 10s · full fleet view under <b>Cluster</b>.
             </div>
           </>
@@ -452,7 +452,7 @@ function NotificationsTab() {
         </motion.button>
       </div>
       <div className="pb">
-        <div style={{ fontSize: 13, color: "var(--text3)", lineHeight: 1.7, marginBottom: 12, fontFamily: "'Share Tech Mono',monospace" }}>
+        <div style={{ fontSize: 13, color: "var(--text3)", lineHeight: 1.7, marginBottom: 12, fontFamily: "var(--font-mono)" }}>
           Alerts (attack spikes, repeat offenders, critical blocks) are delivered to every enabled channel whose minimum severity the alert meets. Webhook payloads are optionally HMAC-SHA256 signed (<code>X-Sentinel-Signature</code>).
         </div>
 
@@ -492,9 +492,9 @@ function NotificationsTab() {
         )}
 
         {loading ? (
-          <div style={{ padding: 24, textAlign: "center", fontSize: 13, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>Loading channels…</div>
+          <div style={{ padding: 24, textAlign: "center", fontSize: 13, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>Loading channels…</div>
         ) : channels.length === 0 ? (
-          <div style={{ padding: 24, textAlign: "center", fontSize: 13, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>No channels configured. Add one to start delivering alerts to your SOC.</div>
+          <div style={{ padding: 24, textAlign: "center", fontSize: 13, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>No channels configured. Add one to start delivering alerts to your SOC.</div>
         ) : channels.map(ch => (
           <div key={ch.id} className="srow">
             <div style={{ flex: 1, minWidth: 0 }}>

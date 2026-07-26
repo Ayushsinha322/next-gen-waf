@@ -194,7 +194,7 @@ export default function TrafficPage() {
           <div className="pb">
             <canvas ref={chartRef} height={110} style={{ width: "100%", display: "block" }} />
             {buckets.length === 0 && (
-              <div style={{ textAlign: "center", paddingTop: 8, fontSize: 14, fontFamily: "'Share Tech Mono',monospace", color: "rgba(100,116,139,0.5)" }}>
+              <div style={{ textAlign: "center", paddingTop: 8, fontSize: 14, fontFamily: "var(--font-mono)", color: "rgba(100,116,139,0.5)" }}>
                 waiting for traffic data…
               </div>
             )}
@@ -208,7 +208,7 @@ export default function TrafficPage() {
           </div>
           <div className="pb">
             {topIPs.length === 0 ? (
-              <div style={{ padding: "16px 0", textAlign: "center", fontSize: 13, fontFamily: "'Share Tech Mono',monospace", color: "rgba(100,116,139,0.5)" }}>
+              <div style={{ padding: "16px 0", textAlign: "center", fontSize: 13, fontFamily: "var(--font-mono)", color: "rgba(100,116,139,0.5)" }}>
                 No traffic yet
               </div>
             ) : (
@@ -252,7 +252,7 @@ export default function TrafficPage() {
         </div>
         <div className="tw" style={{ maxHeight: 380, overflowY: "auto" }}>
           {displayed.length === 0 ? (
-            <div style={{ padding: "24px", textAlign: "center", fontFamily: "'Share Tech Mono',monospace", fontSize: 13, color: "var(--text3)" }}>
+            <div style={{ padding: "24px", textAlign: "center", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--text3)" }}>
               {rows.length === 0 ? "Waiting for live events…" : "No rows match current filters"}
             </div>
           ) : (

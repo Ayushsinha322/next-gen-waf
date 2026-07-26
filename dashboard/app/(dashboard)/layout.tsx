@@ -1,18 +1,34 @@
 "use client";
 import { motion, AnimatePresence } from "framer-motion";
-import BgCanvas from "@/components/canvas/BgCanvas";
 import TopBar from "@/components/layout/TopBar";
 import SideBar from "@/components/layout/SideBar";
-import Ticker from "@/components/layout/Ticker";
 import ToastContainer from "@/components/ui/Toast";
 import ModalContainer from "@/components/ui/Modal";
 import CopilotFab from "@/components/copilot/CopilotFab";
 
+/**
+ * Three things were removed from this layout and none of them should come back.
+ *
+ * 1. `<Ticker>` — a "LIVE THREATS" marquee that looped twelve hardcoded events
+ *    (real-looking source IPs, CVE-2021-44228, a JA4 fingerprint, CRS rule ids)
+ *    on every page. Nothing about it was observed traffic. For a security
+ *    product this is the most damaging class of fabrication there is: it is
+ *    indistinguishable from real telemetry, and a customer who later learns the
+ *    threat feed was a hardcoded array will not believe the detection numbers
+ *    either. Live threat activity belongs on /events, sourced from ClickHouse.
+ *
+ * 2. `<BgCanvas>` — a full-viewport requestAnimationFrame canvas drawing moving
+ *    nodes, matrix rain and radar sweeps behind all 17 pages, composited under
+ *    21 backdrop-blur surfaces. It burned GPU on every page for decoration.
+ *    This was its only mount, so the component has been deleted; the login
+ *    screen keeps its own separate canvas, where a brand moment is fine.
+ *
+ * 3. `.scanlines` — a CRT overlay. Enterprise consoles do not simulate damaged
+ *    hardware.
+ */
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
   return (
     <>
-      <BgCanvas opacity={0.35} />
-      <div className="scanlines" />
       <TopBar />
       <SideBar />
       <main className="content">
@@ -28,7 +44,6 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
           </motion.div>
         </AnimatePresence>
       </main>
-      <Ticker className="ticker-bar" />
       <CopilotFab variant="dashboard" />
       <ToastContainer />
       <ModalContainer />

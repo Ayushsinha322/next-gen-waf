@@ -67,32 +67,32 @@ export default function SitesPage() {
       title: "🚀 Site Deployed — Next Steps",
       body: (
         <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-          <div style={{ padding: "10px 14px", background: "rgba(0,212,255,.08)", border: "1px solid rgba(0,212,255,.25)", borderRadius: "var(--r2)", fontFamily: "'Share Tech Mono',monospace", fontSize: 13, color: "var(--cyan)" }}>
+          <div style={{ padding: "10px 14px", background: "rgba(0,212,255,.08)", border: "1px solid rgba(0,212,255,.25)", borderRadius: "var(--r2)", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--cyan)" }}>
             ✅ Site saved and WAF protection active in ~5 seconds
           </div>
           <div>
-            <div style={{ fontSize: 14, color: "var(--text2)", marginBottom: 6, fontFamily: "'Share Tech Mono',monospace", letterSpacing: 1 }}>STEP 1 — Add to /etc/hosts (run once as root)</div>
+            <div style={{ fontSize: 14, color: "var(--text2)", marginBottom: 6, fontFamily: "var(--font-mono)", letterSpacing: 1 }}>STEP 1 — Add to /etc/hosts (run once as root)</div>
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <code style={{ flex: 1, padding: "8px 12px", background: "rgba(0,0,0,.35)", border: "1px solid rgba(255,255,255,.08)", borderRadius: "var(--r2)", fontFamily: "'Share Tech Mono',monospace", fontSize: 13, color: "var(--text)", userSelect: "all" }}>
+              <code style={{ flex: 1, padding: "8px 12px", background: "rgba(0,0,0,.35)", border: "1px solid rgba(255,255,255,.08)", borderRadius: "var(--r2)", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--text)", userSelect: "all" }}>
                 {hostsEntry}
               </code>
               <button className="btn bg-btn btn-sm" onClick={() => { navigator.clipboard.writeText(`echo '${hostsEntry}' | sudo tee -a /etc/hosts`); showToast("Copied!", "s", "📋"); }}>📋 Copy cmd</button>
             </div>
-            <div style={{ marginTop: 6, fontFamily: "'Share Tech Mono',monospace", fontSize: 14, color: "var(--text3)" }}>
+            <div style={{ marginTop: 6, fontFamily: "var(--font-mono)", fontSize: 14, color: "var(--text3)" }}>
               echo &apos;{hostsEntry}&apos; | sudo tee -a /etc/hosts
             </div>
           </div>
           <div>
-            <div style={{ fontSize: 14, color: "var(--text2)", marginBottom: 6, fontFamily: "'Share Tech Mono',monospace", letterSpacing: 1 }}>STEP 2 — Browse through the WAF proxy (port 9080)</div>
+            <div style={{ fontSize: 14, color: "var(--text2)", marginBottom: 6, fontFamily: "var(--font-mono)", letterSpacing: 1 }}>STEP 2 — Browse through the WAF proxy (port 9080)</div>
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <code style={{ flex: 1, padding: "8px 12px", background: "rgba(0,0,0,.35)", border: "1px solid rgba(255,255,255,.08)", borderRadius: "var(--r2)", fontFamily: "'Share Tech Mono',monospace", fontSize: 13, color: "var(--green)" }}>
+              <code style={{ flex: 1, padding: "8px 12px", background: "rgba(0,0,0,.35)", border: "1px solid rgba(255,255,255,.08)", borderRadius: "var(--r2)", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--green)" }}>
                 {browseURL}
               </code>
               <button className="btn bg-btn btn-sm" onClick={() => { navigator.clipboard.writeText(browseURL); showToast("Copied!", "s", "📋"); }}>📋 Copy</button>
               <a className="btn bp btn-sm" href={browseURL} target="_blank" rel="noreferrer">↗ Open</a>
             </div>
           </div>
-          <div style={{ padding: "10px 14px", background: "rgba(255,165,0,.07)", border: "1px solid rgba(255,165,0,.2)", borderRadius: "var(--r2)", fontFamily: "'Share Tech Mono',monospace", fontSize: 14, color: "rgba(255,200,80,1)", lineHeight: 1.7 }}>
+          <div style={{ padding: "10px 14px", background: "rgba(255,165,0,.07)", border: "1px solid rgba(255,165,0,.2)", borderRadius: "var(--r2)", fontFamily: "var(--font-mono)", fontSize: 14, color: "rgba(255,200,80,1)", lineHeight: 1.7 }}>
             ⚠️ Do NOT browse <span style={{ color: "var(--red-b)" }}>{upstream}</span> directly — that bypasses the WAF and generates no logs.
             <br />Always use <span style={{ color: "var(--green)" }}>{browseURL}</span> to route traffic through the WAF.
           </div>
@@ -163,7 +163,7 @@ export default function SitesPage() {
               const ta = document.getElementById("yaml-import-area") as HTMLTextAreaElement | null;
               if (ta) ta.value = yamlText;
             }} />
-          <textarea id="yaml-import-area" className="fin2" style={{ minHeight: 220, fontFamily: "'Share Tech Mono',monospace", fontSize: 13 }}
+          <textarea id="yaml-import-area" className="fin2" style={{ minHeight: 220, fontFamily: "var(--font-mono)", fontSize: 13 }}
             placeholder={"sites:\n  - name: app\n    domains: [app.example.com]\n    upstream:\n      servers: [{host: 127.0.0.1, port: 8080}]\n    waf_policy:\n      mode: blocking"}
             onChange={e => { yamlText = e.target.value; }} />
         </div>
@@ -221,18 +221,24 @@ export default function SitesPage() {
       </motion.div>
 
       {/* ── Security Lab Sites ────────────────────────────────── */}
-      {(labSites.length > 0 || !loading) && (
+      {/* Only render lab targets that actually exist in the site list. The guard
+          used to be `labSites.length > 0 || !loading`, which rendered the panel
+          whenever loading finished — and the body mapped a hardcoded
+          ["dvwa.local","juice.local"] array rather than real rows, defaulting a
+          missing site to status ACTIVE / mode BLOCKING. So a fresh install with
+          no lab sites showed two protected applications that did not exist. */}
+      {labSites.length > 0 && (
         <motion.div variants={fadeUp}>
-          <div style={{ fontSize: 11, fontFamily: "'Share Tech Mono',monospace", color: "var(--text3)", letterSpacing: 1.5, textTransform: "uppercase", marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
+          <div style={{ fontSize: 11, fontFamily: "var(--font-mono)", color: "var(--text3)", letterSpacing: 1.5, textTransform: "uppercase", marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
             <span>🧪 Security Lab Targets</span>
             <div style={{ flex: 1, height: 1, background: "rgba(255,255,255,.06)" }} />
           </div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-            {(["dvwa.local", "juice.local"] as const).map(name => {
+            {labSites.map(site => {
+              const name = site.name;
               const meta = LAB_META[name];
-              const site = sites.find(s => s.name === name);
-              const mode = site?.waf_policy?.mode?.toUpperCase() ?? "BLOCKING";
-              const isActive = !site || site.status === "active";
+              const mode = site.waf_policy?.mode?.toUpperCase() ?? "—";
+              const isActive = site.status === "active";
               return (
                 <motion.div key={name} className="panel" style={{ border: `1px solid ${meta.accent}` }} variants={cardVariants}>
                   <div className="ph" style={{ background: meta.color }}>
@@ -248,8 +254,8 @@ export default function SitesPage() {
                         transition={spring}
                       >{meta.icon}</motion.div>
                       <div>
-                        <div style={{ fontFamily: "'Orbitron',sans-serif", fontSize: 14, fontWeight: 700, color: "var(--text)", letterSpacing: 1 }}>{meta.full}</div>
-                        <div style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 11, color: "var(--text3)", marginTop: 2 }}>
+                        <div style={{ fontFamily: "var(--font-display)", fontSize: 14, fontWeight: 700, color: "var(--text)", letterSpacing: 1 }}>{meta.full}</div>
+                        <div style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--text3)", marginTop: 2 }}>
                           {name} · port {meta.port}
                         </div>
                       </div>
@@ -265,7 +271,7 @@ export default function SitesPage() {
                     </div>
                   </div>
                   <div className="pb">
-                    <div style={{ fontSize: 14, color: "var(--text2)", lineHeight: 1.6, marginBottom: 12, fontFamily: "'Share Tech Mono',monospace" }}>
+                    <div style={{ fontSize: 14, color: "var(--text2)", lineHeight: 1.6, marginBottom: 12, fontFamily: "var(--font-mono)" }}>
                       {meta.desc}
                     </div>
                     <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
@@ -274,7 +280,7 @@ export default function SitesPage() {
                       <button className="btn bg-btn btn-sm" onClick={() => router.push(`/logs?site=${name}&tab=access`)}>📡 Access Logs</button>
                       <button className="btn bg-btn btn-sm" disabled={!site} onClick={() => site && openEdit(site)} style={!site ? { opacity: 0.5 } : undefined}>✏️ Edit</button>
                     </div>
-                    <div style={{ marginTop: 10, padding: "8px 10px", background: "rgba(0,0,0,.2)", borderRadius: "var(--r2)", fontFamily: "'Share Tech Mono',monospace", fontSize: 11, color: "var(--text3)", display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6 }}>
+                    <div style={{ marginTop: 10, padding: "8px 10px", background: "rgba(0,0,0,.2)", borderRadius: "var(--r2)", fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--text3)", display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6 }}>
                       <div><div style={{ color: "var(--text2)", marginBottom: 2 }}>Upstream</div>127.0.0.1:{meta.port}</div>
                       <div><div style={{ color: "var(--text2)", marginBottom: 2 }}>Paranoia</div>Level {site?.waf_policy?.paranoia_level ?? 2}</div>
                       <div><div style={{ color: "var(--text2)", marginBottom: 2 }}>Threshold</div>{site?.waf_policy?.anomaly_threshold ?? 5} score</div>
@@ -303,9 +309,9 @@ export default function SitesPage() {
         </div>
         <div className="tw">
           {loading ? (
-            <div style={{ padding: "24px", textAlign: "center", fontFamily: "'Share Tech Mono',monospace", fontSize: 13, color: "var(--text3)" }}>Loading sites…</div>
+            <div style={{ padding: "24px", textAlign: "center", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--text3)" }}>Loading sites…</div>
           ) : filtered.length === 0 ? (
-            <div style={{ padding: "24px", textAlign: "center", fontFamily: "'Share Tech Mono',monospace", fontSize: 13, color: "var(--text3)" }}>No sites found</div>
+            <div style={{ padding: "24px", textAlign: "center", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--text3)" }}>No sites found</div>
           ) : (
             <table>
               <thead><tr><th>Status</th><th>Name</th><th>Domains</th><th>Mode</th><th>WAF Policy</th><th>State</th><th>Actions</th></tr></thead>

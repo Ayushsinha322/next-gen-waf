@@ -96,12 +96,12 @@ export default function EventsPage() {
         <motion.div className="panel" variants={fadeUp}><div className="pb" style={{ textAlign: "center", padding: 40 }}>
           <div style={{ fontSize: 34, marginBottom: 10 }}>🗄️</div>
           <div style={{ fontSize: 16, fontWeight: 700, color: "var(--text2)", marginBottom: 6 }}>ClickHouse not configured</div>
-          <div style={{ fontSize: 14, color: "var(--text3)", lineHeight: 1.7, fontFamily: "'Share Tech Mono',monospace", maxWidth: 520, margin: "0 auto" }}>
+          <div style={{ fontSize: 14, color: "var(--text3)", lineHeight: 1.7, fontFamily: "var(--font-mono)", maxWidth: 520, margin: "0 auto" }}>
             Set <span style={{ color: "var(--cyan)" }}>SENTINEL_CLICKHOUSE_URL</span> on the control plane and run the ClickHouse container to enable durable, searchable WAF history. Live events still stream on the <strong>Logs</strong> page.
           </div>
         </div></motion.div>
       ) : status && !status.reachable ? (
-        <motion.div className="panel" variants={fadeUp}><div className="pb" style={{ textAlign: "center", padding: 30, fontSize: 14, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>
+        <motion.div className="panel" variants={fadeUp}><div className="pb" style={{ textAlign: "center", padding: 30, fontSize: 14, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>
           ClickHouse configured but unreachable{status.error ? ` — ${status.error}` : ""}.
         </div></motion.div>
       ) : (
@@ -182,12 +182,12 @@ function FacetCard({ title, facets, onPick }: { title: string; facets: { key: st
     <div className="panel">
       <div className="ph"><div className="ptitle">{title}</div></div>
       <div className="pb" style={{ display: "flex", flexDirection: "column", gap: 7 }}>
-        {facets.length === 0 ? <div style={{ fontSize: 13, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>—</div> :
+        {facets.length === 0 ? <div style={{ fontSize: 13, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>—</div> :
           facets.map(f => (
             <div key={f.key} onClick={() => onPick(f.key)} style={{ cursor: "pointer" }} title="Filter by this">
               <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, marginBottom: 2 }}>
-                <span style={{ color: "var(--text2)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 160, fontFamily: "'Share Tech Mono',monospace" }}>{f.key}</span>
-                <span style={{ color: "var(--text)", fontFamily: "'Share Tech Mono',monospace" }}>{f.count.toLocaleString()}</span>
+                <span style={{ color: "var(--text2)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 160, fontFamily: "var(--font-mono)" }}>{f.key}</span>
+                <span style={{ color: "var(--text)", fontFamily: "var(--font-mono)" }}>{f.count.toLocaleString()}</span>
               </div>
               <div style={{ height: 4, background: "var(--bg3)", borderRadius: 2, overflow: "hidden" }}>
                 <div style={{ height: "100%", width: `${(f.count / max) * 100}%`, background: "rgba(0,229,255,.6)", borderRadius: 2 }} />
@@ -200,5 +200,5 @@ function FacetCard({ title, facets, onPick }: { title: string; facets: { key: st
 }
 
 function Empty({ text }: { text: string }) {
-  return <div style={{ padding: "22px 12px", textAlign: "center", fontSize: 13, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", width: "100%" }}>{text}</div>;
+  return <div style={{ padding: "22px 12px", textAlign: "center", fontSize: 13, color: "var(--text3)", fontFamily: "var(--font-mono)", width: "100%" }}>{text}</div>;
 }

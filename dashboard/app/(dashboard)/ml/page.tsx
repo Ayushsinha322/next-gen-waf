@@ -27,7 +27,7 @@ function ArcGauge({ value, label, color }: { value: number; label: string; color
       {pct > 0 && (
         <path d={`M${s.x},${s.y} A${r},${r} 0 ${large},1 ${e.x},${e.y}`} fill="none" stroke={color} strokeWidth="8" strokeLinecap="round" />
       )}
-      <text x={cx} y={cy - 4} textAnchor="middle" fill="#f1f5f9" fontSize="18" fontFamily="'Share Tech Mono',monospace" fontWeight="700">{displayVal}%</text>
+      <text x={cx} y={cy - 4} textAnchor="middle" fill="#f1f5f9" fontSize="18" fontFamily="var(--font-mono)" fontWeight="700">{displayVal}%</text>
       <text x={cx} y={cy + 14} textAnchor="middle" fill="rgba(148,163,184,.7)" fontSize="9" fontFamily="Inter,sans-serif" letterSpacing=".5">{label}</text>
     </svg>
   );
@@ -90,7 +90,7 @@ export default function MLPage() {
             ML / AI Engine
             {stats && <span className="ml-status-dot" style={{ background: statusColor }} title={stats.model_status} />}
           </div>
-          <div style={{ fontSize: 13, fontFamily: "'Share Tech Mono',monospace", color: "var(--text2)" }}>Auto-refresh: 5 s</div>
+          <div style={{ fontSize: 13, fontFamily: "var(--font-mono)", color: "var(--text2)" }}>Auto-refresh: 5 s</div>
         </div>
       </motion.div>
 

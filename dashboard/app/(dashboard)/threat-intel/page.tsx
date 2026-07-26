@@ -286,7 +286,7 @@ export default function ThreatIntelPage() {
                   {iocs.map((e) => (
                     <tr key={e.id}>
                       <td className="td3"><span className="bdg bcy">{typeLabel(e.type)}</span></td>
-                      <td className="td2" style={{ fontFamily: "'Share Tech Mono',monospace", wordBreak: "break-all" }}>{e.value}</td>
+                      <td className="td2" style={{ fontFamily: "var(--font-mono)", wordBreak: "break-all" }}>{e.value}</td>
                       <td><span className={`bdg ${e.tier === "block" ? "br" : "ba"}`}>{e.tier.toUpperCase()}</span></td>
                       <td className="td3">{e.category || "—"}</td>
                       <td className="td3">{e.source}</td>
@@ -314,7 +314,7 @@ export default function ThreatIntelPage() {
             <div style={{ padding: 28, textAlign: "center" }}>
               <div style={{ fontSize: 30, marginBottom: 8 }}>🛰️</div>
               <div style={{ fontSize: 15, fontWeight: 700, color: "var(--text2)", marginBottom: 6 }}>Block history not available</div>
-              <div style={{ fontSize: 14, color: "var(--text3)", lineHeight: 1.7, fontFamily: "'Share Tech Mono',monospace", maxWidth: 520, margin: "0 auto" }}>
+              <div style={{ fontSize: 14, color: "var(--text3)", lineHeight: 1.7, fontFamily: "var(--font-mono)", maxWidth: 520, margin: "0 auto" }}>
                 Set <span style={{ color: "var(--cyan)" }}>SENTINEL_CLICKHOUSE_URL</span> on the control plane to record and search intel-driven blocks. Enforcement still works without it.
               </div>
             </div>
@@ -329,7 +329,7 @@ export default function ThreatIntelPage() {
                     <td className="td3" style={{ whiteSpace: "nowrap" }}>{fmtTime(b.ts)}</td>
                     <td className="td2">{b.ip}{b.country ? ` (${b.country})` : ""}</td>
                     <td className="td3">{b.site}</td>
-                    <td className="td3" style={{ fontFamily: "'Share Tech Mono',monospace", maxWidth: 240, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{b.path}</td>
+                    <td className="td3" style={{ fontFamily: "var(--font-mono)", maxWidth: 240, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{b.path}</td>
                     <td><span className="bdg br">{b.reason || "threat intel"}</span></td>
                   </tr>
                 ))}
@@ -361,13 +361,13 @@ function Facet({
       <div className="ph"><div className="ptitle">{title}</div></div>
       <div className="pb" style={{ display: "flex", flexDirection: "column", gap: 7 }}>
         {rows.length === 0 ? (
-          <div style={{ fontSize: 13, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>—</div>
+          <div style={{ fontSize: 13, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>—</div>
         ) : (
           rows.map(([k, v]) => (
             <div key={k} onClick={() => onPick?.(k)} style={{ cursor: onPick ? "pointer" : "default" }} title={onPick ? "Filter by this" : undefined}>
               <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, marginBottom: 2 }}>
-                <span style={{ color: "var(--text2)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 160, fontFamily: "'Share Tech Mono',monospace" }}>{render ? render(k) : k}</span>
-                <span style={{ color: "var(--text)", fontFamily: "'Share Tech Mono',monospace" }}>{v.toLocaleString()}</span>
+                <span style={{ color: "var(--text2)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 160, fontFamily: "var(--font-mono)" }}>{render ? render(k) : k}</span>
+                <span style={{ color: "var(--text)", fontFamily: "var(--font-mono)" }}>{v.toLocaleString()}</span>
               </div>
               <div style={{ height: 4, background: "var(--bg3)", borderRadius: 2, overflow: "hidden" }}>
                 <div style={{ height: "100%", width: `${(v / max) * 100}%`, background: "rgba(0,229,255,.6)", borderRadius: 2 }} />
@@ -382,7 +382,7 @@ function Facet({
 
 function Empty({ text }: { text: string }) {
   return (
-    <div style={{ padding: "22px 12px", textAlign: "center", fontSize: 13, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", width: "100%" }}>
+    <div style={{ padding: "22px 12px", textAlign: "center", fontSize: 13, color: "var(--text3)", fontFamily: "var(--font-mono)", width: "100%" }}>
       {text}
     </div>
   );

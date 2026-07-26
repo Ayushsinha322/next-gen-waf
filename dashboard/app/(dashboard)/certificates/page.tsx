@@ -362,12 +362,12 @@ export default function CertificatesPage() {
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
                 <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                   <span className="td3">Certificate (PEM, full chain)</span>
-                  <textarea className="fi2" rows={8} style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 13, resize: "vertical" }}
+                  <textarea className="fi2" rows={8} style={{ fontFamily: "var(--font-mono)", fontSize: 13, resize: "vertical" }}
                     placeholder="-----BEGIN CERTIFICATE-----" value={manualCert} onChange={e => setManualCert(e.target.value)} />
                 </label>
                 <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                   <span className="td3">Private Key (PEM)</span>
-                  <textarea className="fi2" rows={8} style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 13, resize: "vertical" }}
+                  <textarea className="fi2" rows={8} style={{ fontFamily: "var(--font-mono)", fontSize: 13, resize: "vertical" }}
                     placeholder="-----BEGIN PRIVATE KEY-----" value={manualKey} onChange={e => setManualKey(e.target.value)} />
                 </label>
               </div>
@@ -393,9 +393,9 @@ export default function CertificatesPage() {
         </div>
         <div className="tw">
           {loading ? (
-            <div style={{ padding: 24, textAlign: "center", fontFamily: "'Share Tech Mono',monospace", fontSize: 13, color: "var(--text3)" }}>Loading certificates…</div>
+            <div style={{ padding: 24, textAlign: "center", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--text3)" }}>Loading certificates…</div>
           ) : certs.length === 0 ? (
-            <div style={{ padding: 24, textAlign: "center", fontFamily: "'Share Tech Mono',monospace", fontSize: 13, color: "var(--text3)" }}>
+            <div style={{ padding: 24, textAlign: "center", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--text3)" }}>
               No certificates yet — request one with ACME or upload a PEM above.
             </div>
           ) : (

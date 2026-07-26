@@ -1,5 +1,5 @@
 "use client";
-import { useState, useEffect, useRef, Suspense } from "react";
+import { useState, useEffect, useRef, useCallback, Suspense } from "react";
 import { motion } from "framer-motion";
 import { api } from "@/lib/api";
 import { spring } from "@/lib/animations";
@@ -26,11 +26,28 @@ function escHtml(s: string) {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+/** The WAF's own verdict for a row.
+ *
+ * Always prefer the `action` the data plane emits (proxy log_request →
+ * ctx.decision). The viewer used to infer the verdict from the HTTP status,
+ * which is wrong in both directions and misrepresents what the WAF did: an
+ * origin 404 or 500 rendered as BLOCK when the WAF allowed the request through,
+ * and a Challenge or rate-limit rendered as PASS. Status is only a fallback for
+ * older rows that predate the field. */
+function verdict(r: Record<string, unknown>): "BLOCK" | "PASS" | "CHALLENGE" | "LIMIT" {
+  const a = String(r.action ?? r.decision ?? "").toUpperCase();
+  if (a.startsWith("BLOCK") || a === "DENY") return "BLOCK";
+  if (a.startsWith("CHALLENG")) return "CHALLENGE";
+  if (a.startsWith("LIMIT") || a.startsWith("RATE")) return "LIMIT";
+  if (a.startsWith("ALLOW") || a === "PASS" || a === "LOG") return "PASS";
+  return Number(r.status ?? 200) === 403 ? "BLOCK" : "PASS";
+}
+
 function fmt(kind: LogKind, r: Record<string, unknown>): string {
   const ts = String(r.ts ?? "");
   switch (kind) {
     case "access":
-      return `${ts} [${Number(r.status ?? 200) >= 400 ? "BLOCK" : "PASS"}] ${r.ip} ${r.method} ${r.path} ${r.status} proto=${r.protocol ?? "-"} latency=${r.latency}ms bytes=${r.bytes} site=${r.site} ua="${r.ua ?? "-"}"`;
+      return `${ts} [${verdict(r)}] ${r.ip} ${r.method} ${r.path} ${r.status} proto=${r.protocol ?? "-"} latency=${r.latency}ms bytes=${r.bytes} site=${r.site} ua="${r.ua ?? "-"}"`;
     case "waf":
       return `${ts} [${r.action ?? "BLOCK"}] ${r.ip} ${r.method} ${r.path} rule=${r.rule ?? r.rule_id} score=${r.score} sev=${r.sev} attack="${r.attack}" proto=${r.protocol ?? "-"} site=${r.site}`;
     case "error":
@@ -53,6 +70,8 @@ function hl(raw: string): string {
     .replace(/\[(BLOCK|BLOCKED)\]/g,                  '[<span class="hl-blk">$1</span>]')
     .replace(/\[(ERROR|FATAL)\]/g,                    '[<span class="hl-err">$1</span>]')
     .replace(/\[(WARN)\]/g,                           '[<span class="hl-warn">$1</span>]')
+    .replace(/\[(CHALLENGE)\]/g,                      '[<span class="hl-chal">$1</span>]')
+    .replace(/\[(LIMIT)\]/g,                          '[<span class="hl-warn">$1</span>]')
     .replace(/\[(AUDIT|ML|CRS|INFO)\]/g,              '[<span class="hl-info">$1</span>]')
     .replace(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/g,'<span class="hl-ip">$1</span>')
     .replace(/\b(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\b/g, '<span class="hl-method">$1</span>')
@@ -65,7 +84,14 @@ function hl(raw: string): string {
 
 function rowClass(kind: LogKind, r: Record<string, unknown>): string {
   switch (kind) {
-    case "access": return Number(r.status ?? 200) >= 500 ? "ll-err" : Number(r.status ?? 200) >= 400 ? "ll-block" : "ll-pass";
+    case "access": {
+      // Severity follows the WAF verdict first; a 5xx from a healthy origin is
+      // an error worth colouring, but it is not a block.
+      const v = verdict(r);
+      if (v === "BLOCK") return "ll-block";
+      if (v === "CHALLENGE" || v === "LIMIT") return "ll-warn";
+      return Number(r.status ?? 200) >= 500 ? "ll-err" : "ll-pass";
+    }
     case "waf":    return r.sev === "CRITICAL" ? "ll-critical" : (r.action === "BLOCKED" || r.action === "BLOCK") ? "ll-block" : "ll-warn";
     case "error":  return r.lvl === "FATAL" ? "ll-critical" : r.lvl === "ERROR" ? "ll-err" : r.lvl === "WARN" ? "ll-warn" : "ll-info";
     case "audit":  return r.result === "FAILURE" ? "ll-err" : "ll-info";
@@ -95,11 +121,39 @@ function LogsInner() {
   // the life of the view — a simulated stream must stay labelled even if live
   // entries start arriving afterwards.
   const [sawSimulated, setSawSimulated] = useState(false);
+
+  // Pause is BOTH state and ref on purpose. The EventSource handler is created
+  // once (empty dep array) so it closes over the initial render and can only
+  // read the live value through a ref; the button needs state to re-render.
+  // Previously only the ref existed, so the control never repainted and looked
+  // dead. Paused lines are now buffered rather than dropped — a tail you pause
+  // to read a stack trace must not silently lose the lines that arrive while
+  // you are reading, which is the whole reason to pause.
+  const [paused, setPaused] = useState(false);
+  const [buffered, setBuffered] = useState(0);
   const pausedRef = useRef(false);
+  const bufRef    = useRef<Array<{ kind: LogKind; row: LogRow }>>([]);
   const lid       = useRef(0);
   const bodyRef   = useRef<HTMLDivElement>(null);
   const esRef     = useRef<EventSource | null>(null);
   const ddRef     = useRef<HTMLDivElement>(null);
+
+  // Append one row to its bucket.
+  //
+  // The bucket lookup MUST be guarded. LogStore is keyed by the six viewer tabs,
+  // but the control plane publishes onto the same hub with other kinds — the
+  // alerting engine emits Kind:"alert" — and Hub.Subscribe replays its recent
+  // backlog to every new subscriber. The previous code spread prev[e.kind]
+  // unguarded, so one alert anywhere in the backlog threw
+  // "undefined is not iterable" during render and took the whole log viewer
+  // down for anyone who opened it afterwards. Unknown kinds are dropped.
+  const appendRow = useCallback((kind: LogKind, row: LogRow) => {
+    setLogs(prev => {
+      const bucket = prev[kind];
+      if (!bucket) return prev;
+      return { ...prev, [kind]: [...bucket, row].slice(-MAX) };
+    });
+  }, []);
 
   useEffect(() => {
     function connect() {
@@ -107,7 +161,6 @@ function LogsInner() {
       esRef.current = es;
       es.onopen    = () => setCon(true);
       es.onmessage = (evt) => {
-        if (pausedRef.current) return;
         try {
           const e: { kind: LogKind; data: Record<string, unknown>; source?: string } =
             JSON.parse(evt.data);
@@ -118,7 +171,14 @@ function LogsInner() {
           const simulated = e.source !== "live";
           if (simulated) setSawSimulated(true);
           const row: LogRow = { ...e.data, _lid: lid.current++, _simulated: simulated };
-          setLogs(prev => ({ ...prev, [e.kind]: [...prev[e.kind], row].slice(-MAX) }));
+
+          if (pausedRef.current) {
+            bufRef.current.push({ kind: e.kind, row });
+            if (bufRef.current.length > MAX) bufRef.current.shift();
+            setBuffered(bufRef.current.length);
+            return;
+          }
+          appendRow(e.kind, row);
         } catch { /* ignore malformed */ }
       };
       es.onerror = () => { setCon(false); es.close(); setTimeout(connect, 3000); };
@@ -242,13 +302,38 @@ function LogsInner() {
         </div>
 
         <motion.button
-          className={`lgw-btn lgw-pause${pausedRef.current ? " off" : ""}`}
-          onClick={() => { pausedRef.current = !pausedRef.current; }}
+          className={`lgw-btn lgw-pause${paused ? " off" : ""}`}
+          title={paused
+            ? "Paused — new lines are being buffered, click to resume"
+            : "Streaming live — click to pause"}
+          onClick={() => {
+            const next = !paused;
+            setPaused(next);
+            pausedRef.current = next;
+            if (!next && bufRef.current.length) {
+              // Resuming: flush what arrived while paused, in arrival order,
+              // so pausing to read never costs the operator lines.
+              const pending = bufRef.current;
+              bufRef.current = [];
+              setBuffered(0);
+              setLogs(prev => {
+                const next2 = { ...prev };
+                for (const { kind: k, row } of pending) {
+                  const bucket = next2[k];
+                  if (!bucket) continue;
+                  next2[k] = [...bucket, row].slice(-MAX);
+                }
+                return next2;
+              });
+            }
+          }}
           whileHover={{ scale: 1.03 }}
           whileTap={{ scale: 0.97 }}
         >
-          <div className={`lgw-ldot${connected ? "" : " off"}`} />
-          {connected ? "Live" : "Reconnecting"}
+          <div className={`lgw-ldot${connected && !paused ? "" : " off"}`} />
+          {paused
+            ? (buffered > 0 ? `Paused · ${buffered} buffered` : "Paused")
+            : (connected ? "Live" : "Reconnecting")}
         </motion.button>
       </div>
 

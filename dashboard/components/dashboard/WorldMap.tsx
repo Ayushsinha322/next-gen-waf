@@ -195,7 +195,7 @@ export default function WorldMap({
             <button key={i} onClick={fn as () => void} style={{
               width: 26, height: 26, borderRadius: 6, border: "1px solid var(--bg4)",
               background: "var(--bg2)", color: "var(--text2)", cursor: "pointer", fontSize: 15, lineHeight: 1,
-              fontFamily: "'Share Tech Mono',monospace",
+              fontFamily: "var(--font-mono)",
             }}>{label as string}</button>
           ))}
         </div>
@@ -204,7 +204,7 @@ export default function WorldMap({
         <div style={{
           position: "absolute", top: 8, right: 8, padding: "5px 10px", borderRadius: 8,
           background: "var(--bg2)", border: "1px solid var(--bg4)", fontSize: 14,
-          color: "var(--text2)", fontFamily: "'Share Tech Mono',monospace",
+          color: "var(--text2)", fontFamily: "var(--font-mono)",
           opacity: hover ? 1 : 0.45, transition: "opacity .15s", pointerEvents: "none", maxWidth: 200,
         }}>
           {hover ? `${flagFor(hover)} ${nameFor(hover)} · ${(data[hover] ?? 0).toLocaleString()}${blocked.has(hover) ? " · BLOCKED" : ""}` : "Click a country to act"}
@@ -222,7 +222,7 @@ export default function WorldMap({
               <span style={{ fontSize: 18 }}>{menu.flag}</span>
               <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 15, color: "var(--text)", fontWeight: 600 }}>{menu.name}</div>
-                <div style={{ fontSize: 13, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>
+                <div style={{ fontSize: 13, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>
                   {menu.n > 0 ? `${menu.n.toLocaleString()} blocked requests` : "no blocked traffic"}
                 </div>
               </div>
@@ -237,7 +237,7 @@ export default function WorldMap({
               {busy === menu.code ? "…" : blocked.has(menu.code) ? "\u{1F513} Unblock this country" : "\u{1F6AB} Block this country"}
             </button>
             {!loaded && (
-              <div style={{ fontSize: 12, color: "var(--text3)", marginTop: 6, lineHeight: 1.4, fontFamily: "'Share Tech Mono',monospace" }}>
+              <div style={{ fontSize: 12, color: "var(--text3)", marginTop: 6, lineHeight: 1.4, fontFamily: "var(--font-mono)" }}>
                 Stored now — enforces once a GeoLite2-Country.mmdb is in rules/.
               </div>
             )}
@@ -252,7 +252,7 @@ export default function WorldMap({
             background: "linear-gradient(0deg, rgba(4,8,16,.92), transparent)", textAlign: "center", pointerEvents: "none",
           }}>
             <span style={{ fontSize: 18 }}>{"\u{1F30D}"}</span>
-            <span style={{ fontSize: 14, color: "var(--text3)", lineHeight: 1.5, fontFamily: "'Share Tech Mono',monospace" }}>
+            <span style={{ fontSize: 14, color: "var(--text3)", lineHeight: 1.5, fontFamily: "var(--font-mono)" }}>
               GeoIP not loaded — drop a <span style={{ color: "var(--cyan)" }}>GeoLite2-Country.mmdb</span> into <span style={{ color: "var(--cyan)" }}>rules/</span> to map live origins.
             </span>
           </div>
@@ -261,12 +261,12 @@ export default function WorldMap({
 
       {/* ── ranked list ── */}
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-        <div style={{ fontSize: 14, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", letterSpacing: 1, textTransform: "uppercase" }}>
+        <div style={{ fontSize: 14, color: "var(--text3)", fontFamily: "var(--font-mono)", letterSpacing: 1, textTransform: "uppercase" }}>
           Top origins {loaded && totalCountries > 0 ? `(${totalCountries})` : ""}
           {blocked.size > 0 && <span style={{ color: "var(--amber,#ffb020)" }}> · {blocked.size} blocked</span>}
         </div>
         {ranked.length === 0 ? (
-          <div style={{ fontSize: 14, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", padding: "8px 0" }}>
+          <div style={{ fontSize: 14, color: "var(--text3)", fontFamily: "var(--font-mono)", padding: "8px 0" }}>
             {loaded ? "No blocked traffic yet" : "Awaiting GeoIP data"}
           </div>
         ) : ranked.map(([code, n]) => (
@@ -280,7 +280,7 @@ export default function WorldMap({
                 <div style={{ height: "100%", width: `${(n / max) * 100}%`, background: "rgba(255,69,96,.8)", borderRadius: 3 }} />
               </div>
             </div>
-            <span style={{ fontSize: 14, color: "var(--text)", fontFamily: "'Share Tech Mono',monospace" }}>{n.toLocaleString()}</span>
+            <span style={{ fontSize: 14, color: "var(--text)", fontFamily: "var(--font-mono)" }}>{n.toLocaleString()}</span>
           </div>
         ))}
       </div>

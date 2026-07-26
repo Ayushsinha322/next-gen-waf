@@ -49,7 +49,7 @@ function Tag({ kind }: { kind: "enforced" | "stored" }) {
   return (
     <span style={{
       fontSize: 10.5, fontWeight: 700, letterSpacing: 0.5, padding: "2px 7px", borderRadius: 20,
-      fontFamily: "'Share Tech Mono',monospace", textTransform: "uppercase",
+      fontFamily: "var(--font-mono)", textTransform: "uppercase",
       color: enforced ? "var(--green)" : "var(--amber, #ffb020)",
       background: enforced ? "rgba(0,230,118,.1)" : "rgba(255,176,32,.1)",
       border: `1px solid ${enforced ? "rgba(0,230,118,.35)" : "rgba(255,176,32,.35)"}`,
@@ -61,7 +61,7 @@ function StepHead({ title, sub, tag }: { title: string; sub: string; tag?: "enfo
   return (
     <div style={{ marginBottom: 4 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-        <span style={{ fontFamily: "'Orbitron',sans-serif", fontSize: 17, fontWeight: 700, color: "var(--text)" }}>{title}</span>
+        <span style={{ fontFamily: "var(--font-display)", fontSize: 17, fontWeight: 700, color: "var(--text)" }}>{title}</span>
         {tag && <Tag kind={tag} />}
       </div>
       <div style={{ fontSize: 13, color: "var(--text3)", marginTop: 3 }}>{sub}</div>
@@ -87,7 +87,7 @@ function ChipInput({
     <div>
       <div style={{ display: "flex", gap: 8 }}>
         <input className="fin2" placeholder={placeholder} value={draft}
-          style={mono ? { fontFamily: "'Share Tech Mono',monospace" } : undefined}
+          style={mono ? { fontFamily: "var(--font-mono)" } : undefined}
           onChange={e => setDraft(e.target.value)}
           onKeyDown={e => { if (e.key === "Enter") { e.preventDefault(); add(); } }} />
         <button className="btn bg-btn btn-sm" onClick={add} type="button">＋ Add</button>
@@ -98,7 +98,7 @@ function ChipInput({
             <span key={v} style={{
               display: "inline-flex", alignItems: "center", gap: 6, padding: "3px 8px",
               background: "rgba(0,212,255,.1)", border: "1px solid rgba(0,212,255,.28)",
-              borderRadius: 12, fontSize: 14, fontFamily: "'Share Tech Mono',monospace", color: "var(--cyan)",
+              borderRadius: 12, fontSize: 14, fontFamily: "var(--font-mono)", color: "var(--cyan)",
             }}>
               {v}<span style={{ cursor: "pointer", color: "var(--text3)" }} onClick={() => onChange(values.filter(x => x !== v))}>✕</span>
             </span>
@@ -114,7 +114,7 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
     <div className="fg2">
       <label className="flbl2">{label}</label>
       {children}
-      {hint && <div style={{ fontSize: 11, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>{hint}</div>}
+      {hint && <div style={{ fontSize: 11, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>{hint}</div>}
     </div>
   );
 }
@@ -124,7 +124,7 @@ function SecretInput({ value, set, placeholder }: { value: string; set: (v: stri
   return (
     <div style={{ position: "relative" }}>
       <input className="fin2" type={show ? "text" : "password"} value={value} placeholder={placeholder}
-        style={{ fontFamily: "'Share Tech Mono',monospace", paddingRight: 34 }}
+        style={{ fontFamily: "var(--font-mono)", paddingRight: 34 }}
         onChange={e => set(e.target.value)} />
       <span onClick={() => setShow(s => !s)} title={show ? "Hide" : "Reveal"}
         style={{ position: "absolute", right: 10, top: "50%", transform: "translateY(-50%)", cursor: "pointer", color: "var(--text3)", fontSize: 15 }}>
@@ -155,7 +155,7 @@ function SectionToggle({ label, desc, on, set }: { label: string; desc: string; 
 }
 
 function GroupLabel({ children }: { children: React.ReactNode }) {
-  return <div style={{ fontSize: 14, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", letterSpacing: 1, textTransform: "uppercase", marginTop: 4, display: "flex", alignItems: "center", gap: 8 }}>{children}</div>;
+  return <div style={{ fontSize: 14, color: "var(--text3)", fontFamily: "var(--font-mono)", letterSpacing: 1, textTransform: "uppercase", marginTop: 4, display: "flex", alignItems: "center", gap: 8 }}>{children}</div>;
 }
 
 function InfoBox({ children, tone = "cyan" }: { children: React.ReactNode; tone?: "cyan" | "green" | "amber" }) {
@@ -163,7 +163,7 @@ function InfoBox({ children, tone = "cyan" }: { children: React.ReactNode; tone?
           : tone === "amber" ? ["rgba(255,176,32,.07)", "rgba(255,176,32,.25)"]
           : ["rgba(0,212,255,.06)", "rgba(0,212,255,.18)"];
   return (
-    <div style={{ padding: "10px 14px", background: c[0], border: `1px solid ${c[1]}`, borderRadius: "var(--r2)", fontSize: 12.5, color: "var(--text3)", lineHeight: 1.7, fontFamily: "'Share Tech Mono',monospace" }}>
+    <div style={{ padding: "10px 14px", background: c[0], border: `1px solid ${c[1]}`, borderRadius: "var(--r2)", fontSize: 12.5, color: "var(--text3)", lineHeight: 1.7, fontFamily: "var(--font-mono)" }}>
       {children}
     </div>
   );
@@ -283,10 +283,10 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
 
         {/* Sidebar / stepper */}
         <div style={{ width: 256, flexShrink: 0, padding: "22px 18px", display: "flex", flexDirection: "column", background: "linear-gradient(180deg, rgba(0,212,255,.06), rgba(0,0,0,.15))", borderRight: "1px solid rgba(255,255,255,.06)", overflowY: "auto" }}>
-          <div style={{ fontFamily: "'Orbitron',sans-serif", fontWeight: 700, fontSize: 17, color: "var(--text)", letterSpacing: 1 }}>
+          <div style={{ fontFamily: "var(--font-display)", fontWeight: 700, fontSize: 17, color: "var(--text)", letterSpacing: 1 }}>
             {mode === "edit" ? "✏️ Edit Site" : "🌐 New Protected Site"}
           </div>
-          <div style={{ fontSize: 14, color: "var(--text3)", marginTop: 4, fontFamily: "'Share Tech Mono',monospace" }}>
+          <div style={{ fontSize: 14, color: "var(--text3)", marginTop: 4, fontFamily: "var(--font-mono)" }}>
             {mode === "edit" ? form.name : "Reverse proxy + WAF in minutes"}
           </div>
           <div style={{ display: "flex", gap: 4, margin: "16px 0 18px", padding: 3, background: "rgba(0,0,0,.3)", borderRadius: 10 }}>
@@ -294,7 +294,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
               const active = (i === 1) === adv;
               return (
                 <button key={m} type="button" onClick={() => { setAdv(i === 1); setStep(0); }}
-                  style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 13, fontWeight: 700, fontFamily: "'Inter',sans-serif", background: active ? "linear-gradient(135deg,rgba(0,212,255,.9),rgba(0,150,210,.9))" : "transparent", color: active ? "#021018" : "var(--text3)" }}>{m}</button>
+                  style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 13, fontWeight: 700, fontFamily: "var(--font-sans)", background: active ? "linear-gradient(135deg,rgba(0,212,255,.9),rgba(0,150,210,.9))" : "transparent", color: active ? "#021018" : "var(--text3)" }}>{m}</button>
               );
             })}
           </div>
@@ -312,7 +312,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
               );
             })}
           </div>
-          <div style={{ marginTop: "auto", paddingTop: 16, fontSize: 11, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", lineHeight: 1.6 }}>
+          <div style={{ marginTop: "auto", paddingTop: 16, fontSize: 11, color: "var(--text3)", fontFamily: "var(--font-mono)", lineHeight: 1.6 }}>
             💡 Public traffic enters on <span style={{ color: "var(--cyan)" }}>{scheme}://:{frontPort}</span> and is proxied to your upstreams.
           </div>
         </div>
@@ -320,7 +320,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
         {/* Content */}
         <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "16px 22px", borderBottom: "1px solid rgba(255,255,255,.06)" }}>
-            <div style={{ fontFamily: "'Orbitron',sans-serif", fontSize: 16, fontWeight: 700, color: "var(--text)" }}>{steps[step]}</div>
+            <div style={{ fontFamily: "var(--font-display)", fontSize: 16, fontWeight: 700, color: "var(--text)" }}>{steps[step]}</div>
             <button onClick={onClose} style={{ background: "none", border: "none", color: "var(--text3)", fontSize: 20, cursor: "pointer" }}>✕</button>
           </div>
 
@@ -355,7 +355,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                           <div style={{ fontSize: 23 }}>{p.icon}</div>
                           <div style={{ fontWeight: 700, fontSize: 15, color: "var(--text)", marginTop: 6 }}>{p.label}</div>
                           <div style={{ fontSize: 14, color: "var(--text3)", marginTop: 4, lineHeight: 1.5 }}>{p.desc}</div>
-                          <div style={{ fontSize: 11, color: "var(--cyan)", marginTop: 8, fontFamily: "'Share Tech Mono',monospace" }}>PL{p.paranoia_level} · thr {p.anomaly_threshold}</div>
+                          <div style={{ fontSize: 11, color: "var(--cyan)", marginTop: 8, fontFamily: "var(--font-mono)" }}>PL{p.paranoia_level} · thr {p.anomaly_threshold}</div>
                         </div>
                       );
                     })}
@@ -381,7 +381,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     {form.domains.length === 0
                       ? <InfoBox tone="amber">Add a domain in <strong>Basics</strong> to see the public endpoint.</InfoBox>
                       : form.domains.map(d => (
-                        <span key={d} style={{ padding: "5px 11px", borderRadius: 8, background: "rgba(0,212,255,.06)", border: "1px solid rgba(0,212,255,.18)", fontFamily: "'Share Tech Mono',monospace", fontSize: 13, color: "var(--cyan)" }}>
+                        <span key={d} style={{ padding: "5px 11px", borderRadius: 8, background: "rgba(0,212,255,.06)", border: "1px solid rgba(0,212,255,.18)", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--cyan)" }}>
                           {scheme}://{d}<span style={{ color: "var(--text3)" }}> → :{frontPort}</span>
                         </span>
                       ))}
@@ -472,7 +472,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     </Row>
                     {adv && (
                       <Field label="Custom CA Directory URL" hint="Override the ACME directory endpoint (blank = provider default)">
-                        <input className="fin2" value={form.acme_ca_server} placeholder="https://acme-v02.api.letsencrypt.org/directory" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 13 }} onChange={e => upd({ acme_ca_server: e.target.value })} />
+                        <input className="fin2" value={form.acme_ca_server} placeholder="https://acme-v02.api.letsencrypt.org/directory" style={{ fontFamily: "var(--font-mono)", fontSize: 13 }} onChange={e => upd({ acme_ca_server: e.target.value })} />
                       </Field>
                     )}
                     {adv && form.acme_provider === "zerossl" && (<>
@@ -509,15 +509,15 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     </Field>
                     {form.custom_priority === "data" ? (<>
                       <Field label="Certificate (PEM)" hint="Full chain: leaf + intermediates">
-                        <textarea className="fin2" rows={4} value={form.cert_pem} placeholder="-----BEGIN CERTIFICATE-----" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 14, resize: "vertical" }} onChange={e => upd({ cert_pem: e.target.value })} />
+                        <textarea className="fin2" rows={4} value={form.cert_pem} placeholder="-----BEGIN CERTIFICATE-----" style={{ fontFamily: "var(--font-mono)", fontSize: 14, resize: "vertical" }} onChange={e => upd({ cert_pem: e.target.value })} />
                       </Field>
                       <Field label="Private Key (PEM)" hint="Stays on your control plane">
-                        <textarea className="fin2" rows={3} value={form.key_pem} placeholder="-----BEGIN PRIVATE KEY-----" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 14, resize: "vertical" }} onChange={e => upd({ key_pem: e.target.value })} />
+                        <textarea className="fin2" rows={3} value={form.key_pem} placeholder="-----BEGIN PRIVATE KEY-----" style={{ fontFamily: "var(--font-mono)", fontSize: 14, resize: "vertical" }} onChange={e => upd({ key_pem: e.target.value })} />
                       </Field>
                     </>) : (
                       <Row>
-                        <Field label="Certificate Path" hint="On the WAF node"><input className="fin2" value={form.cert_path} placeholder="/etc/ssl/site.crt" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 13 }} onChange={e => upd({ cert_path: e.target.value })} /></Field>
-                        <Field label="Key Path"><input className="fin2" value={form.key_path} placeholder="/etc/ssl/site.key" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 13 }} onChange={e => upd({ key_path: e.target.value })} /></Field>
+                        <Field label="Certificate Path" hint="On the WAF node"><input className="fin2" value={form.cert_path} placeholder="/etc/ssl/site.crt" style={{ fontFamily: "var(--font-mono)", fontSize: 13 }} onChange={e => upd({ cert_path: e.target.value })} /></Field>
+                        <Field label="Key Path"><input className="fin2" value={form.key_path} placeholder="/etc/ssl/site.key" style={{ fontFamily: "var(--font-mono)", fontSize: 13 }} onChange={e => upd({ key_path: e.target.value })} /></Field>
                       </Row>
                     )}
                   </>)}
@@ -644,8 +644,8 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                   {form.jwt_enabled && (<>
                     <SectionToggle label="Require a valid token" desc="On = reject missing/invalid tokens · Off = verify only when present" on={form.jwt_required} set={v => upd({ jwt_required: v })} />
                     <Row>
-                      <Field label="Issuer (iss)" hint="Expected token issuer (blank = don't check)"><input className="fin2" value={form.jwt_issuer} placeholder="https://auth.example.com/" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 13 }} onChange={e => upd({ jwt_issuer: e.target.value })} /></Field>
-                      <Field label="Audience (aud)" hint="Expected audience (blank = don't check)"><input className="fin2" value={form.jwt_audience} placeholder="api://my-service" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 13 }} onChange={e => upd({ jwt_audience: e.target.value })} /></Field>
+                      <Field label="Issuer (iss)" hint="Expected token issuer (blank = don't check)"><input className="fin2" value={form.jwt_issuer} placeholder="https://auth.example.com/" style={{ fontFamily: "var(--font-mono)", fontSize: 13 }} onChange={e => upd({ jwt_issuer: e.target.value })} /></Field>
+                      <Field label="Audience (aud)" hint="Expected audience (blank = don't check)"><input className="fin2" value={form.jwt_audience} placeholder="api://my-service" style={{ fontFamily: "var(--font-mono)", fontSize: 13 }} onChange={e => upd({ jwt_audience: e.target.value })} /></Field>
                     </Row>
                     <Field label="Allowed Algorithms" hint="Only tokens signed with these algs are accepted">
                       <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
@@ -653,18 +653,18 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                           const on = form.jwt_algorithms.includes(a);
                           return (
                             <span key={a} onClick={() => upd({ jwt_algorithms: on ? form.jwt_algorithms.filter(x => x !== a) : [...form.jwt_algorithms, a] })}
-                              style={{ cursor: "pointer", padding: "4px 10px", borderRadius: 8, fontSize: 13, fontFamily: "'Share Tech Mono',monospace", background: on ? "rgba(0,230,118,.1)" : "rgba(255,255,255,.03)", border: on ? "1px solid rgba(0,230,118,.35)" : "1px solid rgba(255,255,255,.08)", color: on ? "var(--text)" : "var(--text3)" }}>{a}</span>
+                              style={{ cursor: "pointer", padding: "4px 10px", borderRadius: 8, fontSize: 13, fontFamily: "var(--font-mono)", background: on ? "rgba(0,230,118,.1)" : "rgba(255,255,255,.03)", border: on ? "1px solid rgba(0,230,118,.35)" : "1px solid rgba(255,255,255,.08)", color: on ? "var(--text)" : "var(--text3)" }}>{a}</span>
                           );
                         })}
                       </div>
                     </Field>
                     <GroupLabel>Signing Key <span style={{ textTransform: "none", letterSpacing: 0, color: "var(--text3)" }}>— pick one</span></GroupLabel>
-                    <Field label="JWKS URL" hint="Recommended: keys fetched + cached, rotated by token kid"><input className="fin2" value={form.jwt_jwks_url} placeholder="https://auth.example.com/.well-known/jwks.json" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 13 }} onChange={e => upd({ jwt_jwks_url: e.target.value })} /></Field>
+                    <Field label="JWKS URL" hint="Recommended: keys fetched + cached, rotated by token kid"><input className="fin2" value={form.jwt_jwks_url} placeholder="https://auth.example.com/.well-known/jwks.json" style={{ fontFamily: "var(--font-mono)", fontSize: 13 }} onChange={e => upd({ jwt_jwks_url: e.target.value })} /></Field>
                     <Row>
                       <Field label="HS256 Shared Secret" hint="Symmetric — for HS* algorithms"><SecretInput value={form.jwt_hs_secret} set={v => upd({ jwt_hs_secret: v })} /></Field>
-                      <Field label="Scope Claim" hint="Claim carrying scopes (default: scope)"><input className="fin2" value={form.jwt_scope_claim} placeholder="scope" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 13 }} onChange={e => upd({ jwt_scope_claim: e.target.value })} /></Field>
+                      <Field label="Scope Claim" hint="Claim carrying scopes (default: scope)"><input className="fin2" value={form.jwt_scope_claim} placeholder="scope" style={{ fontFamily: "var(--font-mono)", fontSize: 13 }} onChange={e => upd({ jwt_scope_claim: e.target.value })} /></Field>
                     </Row>
-                    <Field label="Public Key (PEM)" hint="Asymmetric static key — for RS*/ES* (blank if using JWKS)"><textarea className="fin2" rows={3} value={form.jwt_public_key_pem} placeholder="-----BEGIN PUBLIC KEY-----" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 13, resize: "vertical" }} onChange={e => upd({ jwt_public_key_pem: e.target.value })} /></Field>
+                    <Field label="Public Key (PEM)" hint="Asymmetric static key — for RS*/ES* (blank if using JWKS)"><textarea className="fin2" rows={3} value={form.jwt_public_key_pem} placeholder="-----BEGIN PUBLIC KEY-----" style={{ fontFamily: "var(--font-mono)", fontSize: 13, resize: "vertical" }} onChange={e => upd({ jwt_public_key_pem: e.target.value })} /></Field>
                     <Field label="Required Scopes" hint="All must be present in the token to pass"><ChipInput values={form.jwt_required_scopes} onChange={v => upd({ jwt_required_scopes: v })} placeholder="read:orders" /></Field>
                   </>)}
 
@@ -777,7 +777,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                         const on = form.geo_countries.includes(c.code);
                         return (
                           <span key={c.code} onClick={() => upd({ geo_countries: on ? form.geo_countries.filter(x => x !== c.code) : [...form.geo_countries, c.code] })}
-                            style={{ cursor: "pointer", padding: "4px 9px", borderRadius: 12, fontSize: 14, fontFamily: "'Share Tech Mono',monospace", background: on ? (form.geo_mode === "allow" ? "rgba(0,230,118,.12)" : "rgba(255,45,85,.12)") : "rgba(255,255,255,.03)", border: on ? `1px solid ${form.geo_mode === "allow" ? "rgba(0,230,118,.4)" : "rgba(255,45,85,.4)"}` : "1px solid rgba(255,255,255,.08)", color: on ? "var(--text)" : "var(--text3)" }}>{c.code} {c.name}</span>
+                            style={{ cursor: "pointer", padding: "4px 9px", borderRadius: 12, fontSize: 14, fontFamily: "var(--font-mono)", background: on ? (form.geo_mode === "allow" ? "rgba(0,230,118,.12)" : "rgba(255,45,85,.12)") : "rgba(255,255,255,.03)", border: on ? `1px solid ${form.geo_mode === "allow" ? "rgba(0,230,118,.4)" : "rgba(255,45,85,.4)"}` : "1px solid rgba(255,255,255,.08)", color: on ? "var(--text)" : "var(--text3)" }}>{c.code} {c.name}</span>
                         );
                       })}
                     </div>
@@ -797,7 +797,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                   <InfoBox>🌐 Auto-refreshed IP blocklists (AbuseIPDB, Spamhaus DROP, FireHOL, …). Loaded at startup and refreshed on the interval — matched IPs are blocked before rules run.</InfoBox>
                   {form.ip_feeds.map((feed, i) => (
                     <div key={i} style={{ display: "grid", gridTemplateColumns: "2.4fr 0.8fr 0.9fr auto", gap: 8, alignItems: "end" }}>
-                      <Field label={`Feed URL #${i + 1}`}><input className="fin2" value={feed.url} placeholder="https://iplists.firehol.org/…/firehol_level1.netset" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 13 }} onChange={e => upd({ ip_feeds: form.ip_feeds.map((x, idx) => idx === i ? { ...x, url: e.target.value } : x) })} /></Field>
+                      <Field label={`Feed URL #${i + 1}`}><input className="fin2" value={feed.url} placeholder="https://iplists.firehol.org/…/firehol_level1.netset" style={{ fontFamily: "var(--font-mono)", fontSize: 13 }} onChange={e => upd({ ip_feeds: form.ip_feeds.map((x, idx) => idx === i ? { ...x, url: e.target.value } : x) })} /></Field>
                       <Field label="Refresh" hint="e.g. 1h"><input className="fin2" value={feed.interval} placeholder="1h" onChange={e => upd({ ip_feeds: form.ip_feeds.map((x, idx) => idx === i ? { ...x, interval: e.target.value } : x) })} /></Field>
                       <Field label="Format">
                         <select className="fin2 fsel2" value={feed.format} onChange={e => upd({ ip_feeds: form.ip_feeds.map((x, idx) => idx === i ? { ...x, format: e.target.value as IpFeed["format"] } : x) })}>
@@ -815,18 +815,18 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                 {screen === "headers" && (<>
                   <StepHead title="HTTP Headers" sub="Response security headers. The WAF always injects secure defaults; these override per-site." tag="stored" />
                   <InfoBox>🛡️ Secure defaults (X-Content-Type-Options, X-Frame-Options, X-XSS-Protection) are always applied. The values below override them for this site.</InfoBox>
-                  <Field label="Content-Security-Policy" hint="Leave blank to omit CSP"><input className="fin2" value={form.csp} placeholder="default-src 'self'" style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 13 }} onChange={e => upd({ csp: e.target.value })} /></Field>
+                  <Field label="Content-Security-Policy" hint="Leave blank to omit CSP"><input className="fin2" value={form.csp} placeholder="default-src 'self'" style={{ fontFamily: "var(--font-mono)", fontSize: 13 }} onChange={e => upd({ csp: e.target.value })} /></Field>
                   <Row>
                     <Field label="Referrer-Policy">
                       <select className="fin2 fsel2" value={form.referrer_policy} onChange={e => upd({ referrer_policy: e.target.value })}>
                         {["no-referrer", "no-referrer-when-downgrade", "strict-origin", "strict-origin-when-cross-origin", "same-origin", "origin"].map(v => <option key={v} value={v}>{v}</option>)}
                       </select>
                     </Field>
-                    <Field label="Cookie Flags" hint="Applied to Set-Cookie"><input className="fin2" value={form.cookie_flags} style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 13 }} onChange={e => upd({ cookie_flags: e.target.value })} /></Field>
+                    <Field label="Cookie Flags" hint="Applied to Set-Cookie"><input className="fin2" value={form.cookie_flags} style={{ fontFamily: "var(--font-mono)", fontSize: 13 }} onChange={e => upd({ cookie_flags: e.target.value })} /></Field>
                   </Row>
-                  <Field label="Permissions-Policy"><input className="fin2" value={form.permissions_policy} style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 13 }} onChange={e => upd({ permissions_policy: e.target.value })} /></Field>
+                  <Field label="Permissions-Policy"><input className="fin2" value={form.permissions_policy} style={{ fontFamily: "var(--font-mono)", fontSize: 13 }} onChange={e => upd({ permissions_policy: e.target.value })} /></Field>
                   <SectionToggle label="CORS (Access-Control-Allow-Origin)" desc="Add cross-origin response headers" on={form.cors_enabled} set={v => upd({ cors_enabled: v })} />
-                  {form.cors_enabled && <Field label="Allowed Origins" hint="* or comma-separated origins"><input className="fin2" value={form.cors_origins} style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 13 }} onChange={e => upd({ cors_origins: e.target.value })} /></Field>}
+                  {form.cors_enabled && <Field label="Allowed Origins" hint="* or comma-separated origins"><input className="fin2" value={form.cors_origins} style={{ fontFamily: "var(--font-mono)", fontSize: 13 }} onChange={e => upd({ cors_origins: e.target.value })} /></Field>}
                   <GroupLabel>Custom Headers</GroupLabel>
                   {form.custom_headers.map((h, i) => (
                     <div key={i} style={{ display: "grid", gridTemplateColumns: "1fr 1.5fr auto", gap: 8, alignItems: "end" }}>
@@ -852,7 +852,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     {HTTP_METHODS.map(m => {
                       const on = form.allowed_methods.includes(m);
                       return (
-                        <span key={m} onClick={() => toggleMethod(m)} style={{ cursor: "pointer", padding: "5px 11px", borderRadius: 8, fontSize: 13, fontWeight: 600, fontFamily: "'Share Tech Mono',monospace", background: on ? "rgba(0,230,118,.1)" : "rgba(255,255,255,.03)", border: on ? "1px solid rgba(0,230,118,.35)" : "1px solid rgba(255,255,255,.08)", color: on ? "var(--text)" : "var(--text3)" }}>{m}</span>
+                        <span key={m} onClick={() => toggleMethod(m)} style={{ cursor: "pointer", padding: "5px 11px", borderRadius: 8, fontSize: 13, fontWeight: 600, fontFamily: "var(--font-mono)", background: on ? "rgba(0,230,118,.1)" : "rgba(255,255,255,.03)", border: on ? "1px solid rgba(0,230,118,.35)" : "1px solid rgba(255,255,255,.08)", color: on ? "var(--text)" : "var(--text3)" }}>{m}</span>
                       );
                     })}
                   </div>
@@ -894,11 +894,11 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     </div>
                     <Row cols="1fr 1fr">
                       <Field label="Block thresholds (PL1–PL4)" hint="Hard-block score per paranoia level">
-                        <input className="fin2" value={form.fusion_block_thresholds.join(", ")} style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 13 }}
+                        <input className="fin2" value={form.fusion_block_thresholds.join(", ")} style={{ fontFamily: "var(--font-mono)", fontSize: 13 }}
                           onChange={e => upd({ fusion_block_thresholds: e.target.value.split(",").map(s => Number(s.trim())).filter(n => Number.isFinite(n)) })} />
                       </Field>
                       <Field label="LIMIT thresholds (PL1–PL4)" hint="Soft-limit score per level (blank = no LIMIT tier)">
-                        <input className="fin2" value={form.fusion_limit_thresholds.join(", ")} style={{ fontFamily: "'Share Tech Mono',monospace", fontSize: 13 }}
+                        <input className="fin2" value={form.fusion_limit_thresholds.join(", ")} style={{ fontFamily: "var(--font-mono)", fontSize: 13 }}
                           onChange={e => upd({ fusion_limit_thresholds: e.target.value.split(",").map(s => Number(s.trim())).filter(n => Number.isFinite(n)) })} />
                       </Field>
                     </Row>
@@ -936,7 +936,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     ].map(([k, v]) => (
                       <div key={k} style={{ display: "flex", justifyContent: "space-between", padding: "7px 12px", background: "rgba(255,255,255,.02)", borderRadius: 8, fontSize: 13 }}>
                         <span style={{ color: "var(--text3)" }}>{k}</span>
-                        <span style={{ color: "var(--text)", fontFamily: "'Share Tech Mono',monospace", textAlign: "right", maxWidth: "62%" }}>{v}</span>
+                        <span style={{ color: "var(--text)", fontFamily: "var(--font-mono)", textAlign: "right", maxWidth: "62%" }}>{v}</span>
                       </div>
                     ))}
                   </div>
@@ -947,7 +947,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
 
           {/* Footer */}
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 22px", borderTop: "1px solid rgba(255,255,255,.06)" }}>
-            <div style={{ fontSize: 14, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>Step {step + 1} / {steps.length}</div>
+            <div style={{ fontSize: 14, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>Step {step + 1} / {steps.length}</div>
             <div style={{ display: "flex", gap: 8 }}>
               <button className="btn bg-btn" type="button" onClick={step === 0 ? onClose : back}>{step === 0 ? "Cancel" : "← Back"}</button>
               {step < steps.length - 1 && <button className="btn bg-btn" type="button" onClick={next}>Next →</button>}

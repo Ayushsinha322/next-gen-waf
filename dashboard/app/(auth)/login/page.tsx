@@ -123,7 +123,7 @@ export default function LoginPage() {
         cx!.fillStyle = `rgba(96,165,250,${p})`; cx!.fill();
       });
 
-      cx.font = "9px 'JetBrains Mono',monospace";
+      cx.font = "9px var(--font-mono)";
       for (let idx = streams.length - 1; idx >= 0; idx--) {
         const s = streams[idx];
         s.y += s.spd;

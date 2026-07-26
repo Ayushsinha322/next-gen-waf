@@ -138,9 +138,9 @@ export default function AlertsPage() {
         </div>
         <div className="tw">
           {loading ? (
-            <div style={{padding:"24px",textAlign:"center",fontFamily:"'Share Tech Mono',monospace",fontSize: 13,color:"var(--text3)"}}>Loading alerts…</div>
+            <div style={{padding:"24px",textAlign:"center",fontFamily:"var(--font-mono)",fontSize: 13,color:"var(--text3)"}}>Loading alerts…</div>
           ) : filtered.length === 0 ? (
-            <div style={{padding:"24px",textAlign:"center",fontFamily:"'Share Tech Mono',monospace",fontSize: 13,color:"var(--text3)"}}>No alerts found</div>
+            <div style={{padding:"24px",textAlign:"center",fontFamily:"var(--font-mono)",fontSize: 13,color:"var(--text3)"}}>No alerts found</div>
           ) : (
             <table>
               <thead><tr><th>Severity</th><th>Time</th><th>Kind</th><th>Summary</th><th>State</th><th>Actions</th></tr></thead>

@@ -68,11 +68,11 @@ function Kpi({ icon, label, value, sub, accent }: { icon: string; label: string;
   return (
     <motion.div className="panel" variants={cardVariants} style={{ padding: "14px 16px" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-        <div style={{ fontSize: 14, color: "var(--text3)", textTransform: "uppercase", letterSpacing: 1, fontFamily: "'Share Tech Mono',monospace" }}>{label}</div>
+        <div style={{ fontSize: 14, color: "var(--text3)", textTransform: "uppercase", letterSpacing: 1, fontFamily: "var(--font-mono)" }}>{label}</div>
         <span style={{ fontSize: 17, opacity: 0.85 }}>{icon}</span>
       </div>
-      <div style={{ fontSize: 27, fontWeight: 800, color: accent ?? "var(--text)", marginTop: 8, fontFamily: "'Orbitron',sans-serif", lineHeight: 1 }}>{value}</div>
-      {sub && <div style={{ fontSize: 14, color: "var(--text3)", marginTop: 6, fontFamily: "'Share Tech Mono',monospace" }}>{sub}</div>}
+      <div style={{ fontSize: 27, fontWeight: 800, color: accent ?? "var(--text)", marginTop: 8, fontFamily: "var(--font-display)", lineHeight: 1 }}>{value}</div>
+      {sub && <div style={{ fontSize: 14, color: "var(--text3)", marginTop: 6, fontFamily: "var(--font-mono)" }}>{sub}</div>}
     </motion.div>
   );
 }
@@ -250,10 +250,10 @@ export default function OverviewPage() {
             <div key={k} className="panel" style={{ padding: 18, position: "relative", border: active ? "1px solid var(--cyan-ring)" : undefined, background: active ? "var(--cyan-dim)" : undefined }}>
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                  <span style={{ fontFamily: "'Orbitron',sans-serif", fontSize: 20, fontWeight: 800, color: p.accent }}>{p.name}</span>
+                  <span style={{ fontFamily: "var(--font-display)", fontSize: 20, fontWeight: 800, color: p.accent }}>{p.name}</span>
                   {active && <span style={{ fontSize: 11, fontWeight: 700, padding: "3px 9px", borderRadius: 20, background: "var(--cyan)", color: "#021018", letterSpacing: 0.5 }}>● CURRENT PLAN</span>}
                 </div>
-                <span style={{ fontSize: 13, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>{p.price}</span>
+                <span style={{ fontSize: 13, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>{p.price}</span>
               </div>
               <div style={{ fontSize: 13, color: "var(--text3)", marginTop: 4 }}>{p.tagline}</div>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, margin: "14px 0" }}>
@@ -310,7 +310,7 @@ export default function OverviewPage() {
           <div className="ph"><div className="ptitle">Attack breakdown</div><span className="panel-badge pb-info">Live</span></div>
           <div className="pb">
             {attackRows.length === 0 ? (
-              <div style={{ padding: "20px 0", textAlign: "center", fontSize: 13, fontFamily: "'Share Tech Mono',monospace", color: "var(--text3)" }}>No attacks detected yet</div>
+              <div style={{ padding: "20px 0", textAlign: "center", fontSize: 13, fontFamily: "var(--font-mono)", color: "var(--text3)" }}>No attacks detected yet</div>
             ) : attackRows.map(([key, count], idx) => {
               const meta = ATTACK_META[key];
               return (
@@ -339,8 +339,8 @@ export default function OverviewPage() {
             <div style={{ display: "flex", justifyContent: "center" }}>
               <div style={{ width: 172, height: 172, borderRadius: "50%", background: `conic-gradient(${conic})`, position: "relative" }}>
                 <div style={{ position: "absolute", inset: 23, borderRadius: "50%", background: "var(--bg2)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
-                  <div style={{ fontSize: 36, fontWeight: 800, color: "var(--text)", fontFamily: "'Orbitron',sans-serif", lineHeight: 1 }}>{sTotal > 0 ? `${((s2 / sTotal) * 100).toFixed(0)}%` : "—"}</div>
-                  <div style={{ fontSize: 12, color: "var(--text3)", marginTop: 5, letterSpacing: 1, textTransform: "uppercase", fontFamily: "'Share Tech Mono',monospace" }}>success</div>
+                  <div style={{ fontSize: 36, fontWeight: 800, color: "var(--text)", fontFamily: "var(--font-display)", lineHeight: 1 }}>{sTotal > 0 ? `${((s2 / sTotal) * 100).toFixed(0)}%` : "—"}</div>
+                  <div style={{ fontSize: 12, color: "var(--text3)", marginTop: 5, letterSpacing: 1, textTransform: "uppercase", fontFamily: "var(--font-mono)" }}>success</div>
                 </div>
               </div>
             </div>
@@ -350,12 +350,12 @@ export default function OverviewPage() {
               {statusSlices.map(s => (
                 <div key={s.label} style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 14 }}>
                   <span style={{ width: 10, height: 10, borderRadius: 2, background: s.color, flexShrink: 0 }} />
-                  <span style={{ color: "var(--text2)", width: 30, fontFamily: "'Share Tech Mono',monospace", flexShrink: 0 }}>{s.label}</span>
+                  <span style={{ color: "var(--text2)", width: 30, fontFamily: "var(--font-mono)", flexShrink: 0 }}>{s.label}</span>
                   <div className="atk-bar-bg" style={{ flex: 1 }}>
                     <div className="atk-bar" style={{ width: `${sTotal > 0 ? (s.v / sTotal) * 100 : 0}%`, background: s.color }} />
                   </div>
-                  <span style={{ color: "var(--text)", fontFamily: "'Share Tech Mono',monospace", width: 48, textAlign: "right", flexShrink: 0 }}>{s.v.toLocaleString()}</span>
-                  <span style={{ color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace", width: 38, textAlign: "right", flexShrink: 0 }}>{sTotal > 0 ? `${((s.v / sTotal) * 100).toFixed(0)}%` : "—"}</span>
+                  <span style={{ color: "var(--text)", fontFamily: "var(--font-mono)", width: 48, textAlign: "right", flexShrink: 0 }}>{s.v.toLocaleString()}</span>
+                  <span style={{ color: "var(--text3)", fontFamily: "var(--font-mono)", width: 38, textAlign: "right", flexShrink: 0 }}>{sTotal > 0 ? `${((s.v / sTotal) * 100).toFixed(0)}%` : "—"}</span>
                 </div>
               ))}
             </div>
@@ -363,13 +363,13 @@ export default function OverviewPage() {
             {/* Summary footer */}
             <div style={{ display: "flex", alignItems: "stretch", gap: 12, borderTop: "1px solid var(--bg4)", paddingTop: 16 }}>
               <div style={{ flex: 1, textAlign: "center" }}>
-                <div style={{ fontSize: 21, fontWeight: 800, color: "#22c55e", fontFamily: "'Orbitron',sans-serif", lineHeight: 1 }}>{sTotal > 0 ? `${(((s2 + s3) / sTotal) * 100).toFixed(1)}%` : "—"}</div>
-                <div style={{ fontSize: 11, color: "var(--text3)", letterSpacing: 1, textTransform: "uppercase", marginTop: 5, fontFamily: "'Share Tech Mono',monospace" }}>OK · 2xx/3xx</div>
+                <div style={{ fontSize: 21, fontWeight: 800, color: "#22c55e", fontFamily: "var(--font-display)", lineHeight: 1 }}>{sTotal > 0 ? `${(((s2 + s3) / sTotal) * 100).toFixed(1)}%` : "—"}</div>
+                <div style={{ fontSize: 11, color: "var(--text3)", letterSpacing: 1, textTransform: "uppercase", marginTop: 5, fontFamily: "var(--font-mono)" }}>OK · 2xx/3xx</div>
               </div>
               <div style={{ width: 1, background: "var(--bg4)" }} />
               <div style={{ flex: 1, textAlign: "center" }}>
-                <div style={{ fontSize: 21, fontWeight: 800, color: "#ef4444", fontFamily: "'Orbitron',sans-serif", lineHeight: 1 }}>{(s4 + s5).toLocaleString()}</div>
-                <div style={{ fontSize: 11, color: "var(--text3)", letterSpacing: 1, textTransform: "uppercase", marginTop: 5, fontFamily: "'Share Tech Mono',monospace" }}>Errors · 4xx/5xx</div>
+                <div style={{ fontSize: 21, fontWeight: 800, color: "#ef4444", fontFamily: "var(--font-display)", lineHeight: 1 }}>{(s4 + s5).toLocaleString()}</div>
+                <div style={{ fontSize: 11, color: "var(--text3)", letterSpacing: 1, textTransform: "uppercase", marginTop: 5, fontFamily: "var(--font-mono)" }}>Errors · 4xx/5xx</div>
               </div>
             </div>
           </div>
@@ -391,7 +391,7 @@ export default function OverviewPage() {
           <div className="ph"><div className="ptitle">Recent events</div><span className="panel-badge pb-live">Live</span></div>
           <div className="pb">
             {feed.length === 0 ? (
-              <div style={{ padding: "16px 0", textAlign: "center", fontSize: 13, fontFamily: "'Share Tech Mono',monospace", color: "var(--text3)" }}>Waiting for events…</div>
+              <div style={{ padding: "16px 0", textAlign: "center", fontSize: 13, fontFamily: "var(--font-mono)", color: "var(--text3)" }}>Waiting for events…</div>
             ) : feed.slice(0, 7).map((r, i) => {
               const dotCls = r.st === 403 || r.st === 400 ? "ev-red" : r.st >= 500 || r.latency > 3 ? "ev-amber" : r.m === "POST" || r.m === "PUT" ? "ev-blue" : "ev-green";
               const label = r.st === 403 ? `Blocked — ${r.m} ${r.path}` : r.st >= 500 ? `Error — ${r.m} ${r.path}` : `${r.m} ${r.path}`;
@@ -429,7 +429,7 @@ function AlertsPreview() {
       </div>
       <div className="tw">
         {alerts.length === 0 ? (
-          <div style={{ padding: "16px", fontFamily: "'Share Tech Mono',monospace", fontSize: 13, color: "var(--text3)", textAlign: "center" }}>No open alerts</div>
+          <div style={{ padding: "16px", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--text3)", textAlign: "center" }}>No open alerts</div>
         ) : (
           <table>
             <thead><tr><th>Severity</th><th>Time</th><th>Kind</th><th>Summary</th><th>State</th></tr></thead>
@@ -456,7 +456,7 @@ function AlertsPreview() {
 // ---------------------------------------------------------------------------
 function CardMsg({ text }: { text: string }) {
   return (
-    <div style={{ padding: "22px 8px", textAlign: "center", fontSize: 13, lineHeight: 1.55, fontFamily: "'Share Tech Mono',monospace", color: "var(--text3)" }}>
+    <div style={{ padding: "22px 8px", textAlign: "center", fontSize: 13, lineHeight: 1.55, fontFamily: "var(--font-mono)", color: "var(--text3)" }}>
       {text}
     </div>
   );
@@ -591,7 +591,7 @@ function RuleEngineHealth({ metrics, running }: { metrics: MetricsSnapshot | nul
             initial={{ opacity: 0, x: -4 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: 0.05 * idx }}>
             <div className="rule-name">
               {row.name}
-              <span style={{ display: "block", fontSize: 11, fontWeight: 400, marginTop: 2, color: "var(--text3)", fontFamily: "'JetBrains Mono',monospace" }}>{row.sub}</span>
+              <span style={{ display: "block", fontSize: 11, fontWeight: 400, marginTop: 2, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>{row.sub}</span>
             </div>
             <span className={`rule-st ${row.loading ? "rs-warn" : row.on ? "rs-on" : "rs-warn"}`}>
               {row.loading ? "…" : row.on ? "Active" : "Off"}
@@ -674,7 +674,7 @@ function SystemHealth({ wafRunning, geoCountries }: { wafRunning: boolean | null
             style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 0", borderBottom: idx < rows.length - 1 ? "1px solid rgba(255,255,255,.04)" : "none" }}>
             <span className={`sd ${row.level}`} />
             <span style={{ flex: 1, fontSize: 13, color: "var(--text2)" }}>{row.name}</span>
-            <span style={{ fontSize: 13, fontFamily: "'JetBrains Mono',monospace", color: valColor[row.level] }}>{row.value}</span>
+            <span style={{ fontSize: 13, fontFamily: "var(--font-mono)", color: valColor[row.level] }}>{row.value}</span>
           </motion.div>
         ))}
       </div>

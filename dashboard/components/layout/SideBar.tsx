@@ -244,11 +244,11 @@ export default function SideBar() {
       >
         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
           <span className={`sd ${footDot}`} style={footDot === "g" ? { boxShadow: "0 0 6px var(--green)" } : undefined} />
-          <span style={{ fontSize: 14, fontFamily: "'JetBrains Mono',monospace", color: "var(--text2)", fontWeight: 600 }}>
+          <span style={{ fontSize: 14, fontFamily: "var(--font-mono)", color: "var(--text2)", fontWeight: 600 }}>
             {footTitle}
           </span>
         </div>
-        <div style={{ fontSize: 13, fontFamily: "'JetBrains Mono',monospace", color: "var(--text3)", letterSpacing: ".4px" }}>
+        <div style={{ fontSize: 13, fontFamily: "var(--font-mono)", color: "var(--text3)", letterSpacing: ".4px" }}>
           {footSub}
         </div>
       </motion.div>

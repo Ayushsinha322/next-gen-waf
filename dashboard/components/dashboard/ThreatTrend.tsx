@@ -81,7 +81,7 @@ export default function ThreatTrend() {
           onChange={e => setRangeIdx(Number(e.target.value))}
           style={{
             background: "var(--bg2)", color: "var(--text2)", border: "1px solid var(--bg4)",
-            borderRadius: 8, padding: "4px 10px", fontSize: 13, fontFamily: "'JetBrains Mono',monospace", cursor: "pointer",
+            borderRadius: 8, padding: "4px 10px", fontSize: 13, fontFamily: "var(--font-mono)", cursor: "pointer",
           }}>
           {RANGES.map((r, i) => <option key={r.label} value={i}>{r.label}</option>)}
         </select>
@@ -93,7 +93,7 @@ export default function ThreatTrend() {
           <div key={s.key} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, color: "var(--text2)" }}>
             <span style={{ width: 10, height: 10, borderRadius: 2, background: s.color, boxShadow: `0 0 6px ${s.color}66` }} />
             {s.label}
-            <span style={{ color: "var(--text3)", fontFamily: "'JetBrains Mono',monospace" }}>{totals[i].toLocaleString()}</span>
+            <span style={{ color: "var(--text3)", fontFamily: "var(--font-mono)" }}>{totals[i].toLocaleString()}</span>
           </div>
         ))}
       </div>
@@ -113,7 +113,7 @@ export default function ThreatTrend() {
               return (
                 <g key={i}>
                   <line x1={PAD.l} y1={y} x2={VBW - PAD.r} y2={y} stroke="rgba(128,128,128,.12)" strokeWidth={1} />
-                  <text x={PAD.l - 6} y={y + 3} textAnchor="end" fontSize={10} fill="rgba(128,140,160,.65)" fontFamily="'JetBrains Mono',monospace">
+                  <text x={PAD.l - 6} y={y + 3} textAnchor="end" fontSize={10} fill="rgba(128,140,160,.65)" fontFamily="var(--font-mono)">
                     {yTicks[4 - i]}
                   </text>
                 </g>
@@ -122,7 +122,7 @@ export default function ThreatTrend() {
             {/* x time labels */}
             {xTickIdx.map((idx, k) => (
               <text key={k} x={px(idx)} y={VBH - 8} textAnchor={k === 0 ? "start" : k === xTickIdx.length - 1 ? "end" : "middle"}
-                fontSize={10} fill="rgba(128,140,160,.65)" fontFamily="'JetBrains Mono',monospace">
+                fontSize={10} fill="rgba(128,140,160,.65)" fontFamily="var(--font-mono)">
                 {fmtClock(b[idx].ts)}
               </text>
             ))}
@@ -143,7 +143,7 @@ export default function ThreatTrend() {
 
 function Msg({ text }: { text: string }) {
   return (
-    <div style={{ height: 150, display: "flex", alignItems: "center", justifyContent: "center", textAlign: "center", padding: "0 12px", fontSize: 13, lineHeight: 1.5, fontFamily: "'Share Tech Mono',monospace", color: "var(--text3)" }}>
+    <div style={{ height: 150, display: "flex", alignItems: "center", justifyContent: "center", textAlign: "center", padding: "0 12px", fontSize: 13, lineHeight: 1.5, fontFamily: "var(--font-mono)", color: "var(--text3)" }}>
       {text}
     </div>
   );
