@@ -368,7 +368,11 @@ fn body_field_values(body: &str, content_type: &str, out: &mut Vec<String>) {
         let delim = format!("--{b}");
         for part in body.split(&delim) {
             // Field value is everything after the part's header block (blank line).
-            if let Some(idx) = part.find("\r\n\r\n").map(|i| i + 4).or_else(|| part.find("\n\n").map(|i| i + 2)) {
+            if let Some(idx) = part
+                .find("\r\n\r\n")
+                .map(|i| i + 4)
+                .or_else(|| part.find("\n\n").map(|i| i + 2))
+            {
                 let val = part[idx..].trim_end_matches(['-', '\r', '\n']);
                 if !val.is_empty() {
                     out.push(val.to_string());
@@ -414,7 +418,11 @@ mod tests {
             "--{b}\r\nContent-Disposition: form-data; name=\"q\"\r\n\r\n<svg onload=alert(1)>\r\n--{b}--\r\n"
         );
         let mut out = Vec::new();
-        body_field_values(&body, &format!("multipart/form-data; boundary={b}"), &mut out);
+        body_field_values(
+            &body,
+            &format!("multipart/form-data; boundary={b}"),
+            &mut out,
+        );
         assert!(
             out.iter().any(|v| v.contains("<svg onload=alert(1)>")),
             "multipart field value not extracted: {out:?}"

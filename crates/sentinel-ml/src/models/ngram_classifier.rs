@@ -237,12 +237,7 @@ fn collapse_shell_obfuscation(s: &str) -> Option<String> {
         }
         // Empty positional/special parameter (`$9`, `$@`, `$*`, …): expands to
         // nothing, drop it.
-        if c == '$'
-            && matches!(
-                cs.get(i + 1),
-                Some('0'..='9' | '@' | '*' | '#' | '?' | '!')
-            )
-        {
+        if c == '$' && matches!(cs.get(i + 1), Some('0'..='9' | '@' | '*' | '#' | '?' | '!')) {
             changed = true;
             i += 2;
             continue;
@@ -425,9 +420,7 @@ fn normalize_js_method_call(s: &str) -> Option<String> {
                         // Copy from after the comma to the end
                         let rest_start = m + 1;
                         out.extend_from_slice(&b[rest_start..]);
-                        let out = String::from_utf8_lossy(&out)
-                            .replace('[', "")
-                            .replace(']', "");
+                        let out = String::from_utf8_lossy(&out).replace(['[', ']'], "");
                         return Some(out);
                     }
                 }
@@ -628,12 +621,18 @@ mod tests {
             collapse_shell_obfuscation("cat$IFS$9/etc/passwd").as_deref(),
             Some("cat /etc/passwd")
         );
-        assert_eq!(collapse_shell_obfuscation("c\\a\\t").as_deref(), Some("cat"));
+        assert_eq!(
+            collapse_shell_obfuscation("c\\a\\t").as_deref(),
+            Some("cat")
+        );
         assert_eq!(
             collapse_shell_obfuscation("w'h'o'a'm'i").as_deref(),
             Some("whoami")
         );
-        assert_eq!(collapse_shell_obfuscation("c\"\"at").as_deref(), Some("cat"));
+        assert_eq!(
+            collapse_shell_obfuscation("c\"\"at").as_deref(),
+            Some("cat")
+        );
         // No shell marker → no transform.
         assert_eq!(collapse_shell_obfuscation("please list files"), None);
     }
