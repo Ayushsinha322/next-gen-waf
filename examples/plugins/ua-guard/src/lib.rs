@@ -19,7 +19,7 @@ extern "C" {
     /// Write `len` bytes at `ptr` to the host's structured log.
     fn host_log(ptr: i32, len: i32);
     /// Read a request header into `out_ptr`; returns the true length, or -1 if absent.
-    fn host_get_header(name_ptr: i32, name_len: i32, out_ptr: i32, out_cap: i32) -> i32;
+    fn host_get_req_header(name_ptr: i32, name_len: i32, out_ptr: i32, out_cap: i32) -> i32;
     /// Override the WAF decision: 0=Allow, 1=Block, 2=Challenge.
     fn host_set_decision(decision: i32);
     /// Add to this request's anomaly score.
@@ -93,7 +93,7 @@ pub extern "C" fn evaluate() {
     // Safety: both pointers are into this module's own linear memory and the
     // capacity passed matches the buffer.
     let n = unsafe {
-        host_get_header(
+        host_get_req_header(
             name.as_ptr() as i32,
             name.len() as i32,
             buf.as_mut_ptr() as i32,
