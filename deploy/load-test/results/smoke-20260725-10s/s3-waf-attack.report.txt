@@ -1,0 +1,9 @@
+Requests      [total, rate, throughput]         215886, 21588.15, 0.00
+Duration      [total, attack, wait]             10.001s, 10s, 620.148µs
+Latencies     [min, mean, 50, 90, 95, 99, max]  183.164µs, 2.619ms, 2.46ms, 4.522ms, 5.261ms, 6.839ms, 13.127ms
+Bytes In      [total, mean]                     25258662, 117.00
+Bytes Out     [total, mean]                     0, 0.00
+Success       [ratio]                           0.00%
+Status Codes  [code:count]                      403:215886  
+Error Set:
+403 Forbidden
