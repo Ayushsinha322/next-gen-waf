@@ -1696,18 +1696,9 @@ func handleResolveAlert(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
-// ---------------------------------------------------------------------------
-// Plugins (stub — WASM runtime is Phase 3)
-// ---------------------------------------------------------------------------
-
-func handleListPlugins(c *gin.Context, enf *rbac.Enforcer) {
-	claims, _ := auth.GetClaims(c.Request.Context())
-	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourcePlugin, rbac.ActionList) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"plugins": []interface{}{}, "tenant_id": claims.TenantID})
-}
+// Plugins moved to plugin_handlers.go. The stub that lived here always returned
+// a hardcoded empty list, so the Plugins page stayed empty no matter what was
+// installed — see handleListPluginsReal.
 
 // ---------------------------------------------------------------------------
 // Audit

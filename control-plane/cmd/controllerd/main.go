@@ -202,6 +202,9 @@ func run() error {
 				if err := db.EnsureNodesSchema(ctx, pool); err != nil {
 					log.Warn("nodes schema ensure failed (non-fatal)", zap.Error(err))
 				}
+				if err := db.EnsurePluginSchema(ctx, pool); err != nil {
+					log.Warn("plugin schema ensure failed (non-fatal)", zap.Error(err))
+				}
 			} else {
 				log.Info("non-superuser DB role — skipping auto-seed/ensure-schema (handled by migrations run as the owner role)")
 			}
@@ -519,7 +522,12 @@ func run() error {
 				handleTrafficHistory(c, hub)
 			}
 		})
-		protected.GET("/plugins", func(c *gin.Context) { handleListPlugins(c, enforcer) })
+		// WASM plugins. Upload is a .zip containing sentinel-plugin.toml plus the
+		// module; a freshly uploaded plugin is inactive until explicitly enabled.
+		protected.GET("/plugins", func(c *gin.Context) { handleListPluginsReal(c, enforcer, store) })
+		protected.POST("/plugins", func(c *gin.Context) { handleUploadPlugin(c, enforcer, store) })
+		protected.PATCH("/plugins/:name", func(c *gin.Context) { handleSetPluginEnabled(c, enforcer, store) })
+		protected.DELETE("/plugins/:name", func(c *gin.Context) { handleDeletePlugin(c, enforcer, store) })
 		protected.GET("/alerts", func(c *gin.Context) { handleListAlerts(c, enforcer, store) })
 		protected.POST("/alerts/:id/ack", func(c *gin.Context) { handleAckAlert(c, enforcer, store, hub, cl) })
 		protected.POST("/alerts/:id/resolve", func(c *gin.Context) { handleResolveAlert(c, enforcer, store, hub, cl) })
@@ -614,6 +622,15 @@ func run() error {
 	// Internal node-health heartbeat — data-plane nodes POST their status here
 	// (same shared-secret gate as /internal/config).
 	router.POST("/api/v1/internal/nodes/heartbeat", func(c *gin.Context) { handleNodeHeartbeat(c, store) })
+
+	// Internal plugin distribution (same shared-secret gate as /internal/config).
+	// The listing is a digest — name, version, sha256 — so a node fetches bytes
+	// only for modules it does not already hold. This is how an uploaded plugin
+	// reaches every WAF node in the fleet: plugins were previously loadable only
+	// from a manifest path on a node's own filesystem, which no upload could ever
+	// populate and which a 3-node HA fleet could not share.
+	router.GET("/api/v1/internal/plugins", func(c *gin.Context) { handleInternalPluginList(c, store) })
+	router.GET("/api/v1/internal/plugins/:name/wasm", func(c *gin.Context) { handleInternalPluginWasm(c, store) })
 
 	admin := router.Group("/api/v1/admin")
 	admin.Use(leaderForward(cl))
