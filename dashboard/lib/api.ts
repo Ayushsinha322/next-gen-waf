@@ -41,6 +41,51 @@ async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+/**
+ * Multipart upload with the same auth + one-shot refresh behaviour as apiFetch.
+ *
+ * Separate because apiFetch hardcodes `Content-Type: application/json`. For a
+ * FormData body the header MUST be left unset so the browser can generate the
+ * multipart boundary; setting it by hand produces a body the server cannot parse.
+ *
+ * Also unwraps the server's `{"error": "..."}` payload into the thrown message.
+ * For plugin upload that text IS the user experience — "plugin.wasm is not a
+ * WebAssembly module (missing the \0asm preamble)" tells the uploader exactly
+ * what to fix, and wrapping it in `API /plugins: 400 {...}` would bury it.
+ */
+async function apiUpload<T>(path: string, form: FormData): Promise<T> {
+  const send = async (): Promise<Response> => {
+    const token = getToken();
+    const headers: Record<string, string> = {};
+    if (token) headers["Authorization"] = `Bearer ${token}`;
+    return fetch(`${BASE}${path}`, { method: "POST", body: form, headers });
+  };
+
+  let res = await send();
+  if (res.status === 401) {
+    const refreshed = await refreshToken();
+    if (refreshed) {
+      res = await send();
+    } else {
+      logout();
+      if (typeof window !== "undefined") window.location.href = "/login";
+      throw new Error("Session expired — redirecting to login");
+    }
+  }
+  if (!res.ok) {
+    const raw = await res.text().catch(() => "");
+    let msg = raw || res.statusText;
+    try {
+      const parsed = JSON.parse(raw) as { error?: string };
+      if (parsed.error) msg = parsed.error;
+    } catch {
+      /* not JSON — use the raw text */
+    }
+    throw new Error(msg);
+  }
+  return res.json() as Promise<T>;
+}
+
 // ---------------------------------------------------------------------------
 // Types (mirrors control-plane REST API responses)
 // ---------------------------------------------------------------------------
@@ -172,6 +217,51 @@ export interface SiteStat {
   blocked:    number;
   status_4xx: number;
   status_5xx: number;
+}
+
+/** WAF phases a plugin runs in, from its sentinel-plugin.toml [plugin.hooks]. */
+export interface PluginHooks {
+  request_headers?:  boolean;
+  request_body?:     boolean;
+  response_headers?: boolean;
+  response_body?:    boolean;
+}
+
+/**
+ * Host functions a plugin DECLARES it needs, from [plugin.permissions].
+ *
+ * Declared intent, not enforcement: the runtime does not currently gate host
+ * calls on these flags, so any loaded plugin can call any host function the ABI
+ * exposes. Shown in the UI so an operator can see what a plugin claims it will do
+ * before enabling it — never presented as a sandbox guarantee.
+ */
+export interface PluginPermissions {
+  host_log?:            boolean;
+  host_get_req_header?: boolean;
+  host_set_decision?:   boolean;
+  host_add_score?:      boolean;
+  host_set_header?:     boolean;
+  host_kv_get?:         boolean;
+  host_kv_set?:         boolean;
+  host_http_callout?:   boolean;
+}
+
+/** An installed WASM plugin (module bytes are never sent to the browser). */
+export interface Plugin {
+  id:          string;
+  tenant_id:   string;
+  name:        string;
+  version:     string;
+  description: string;
+  author:      string;
+  hooks:       PluginHooks;
+  permissions: PluginPermissions;
+  sha256:      string;
+  size_bytes:  number;
+  enabled:     boolean;
+  uploaded_by: string;
+  created_at:  string;
+  updated_at:  string;
 }
 
 /** A rule's would-have-blocked aggregation while a site runs in Learning mode. */
@@ -607,7 +697,23 @@ export const api = {
   },
 
   plugins: {
-    list: () => apiFetch<{ plugins: unknown[]; tenant_id: string }>("/plugins"),
+    list: () =>
+      apiFetch<{ plugins: Plugin[]; tenant_id?: string; database?: boolean }>("/plugins"),
+    /** Install (or upgrade) from a .zip containing sentinel-plugin.toml + the module. */
+    upload: (file: File) => {
+      const form = new FormData();
+      form.append("file", file);
+      return apiUpload<{ plugin: Plugin; note?: string }>("/plugins", form);
+    },
+    setEnabled: (name: string, enabled: boolean) =>
+      apiFetch<{ name: string; enabled: boolean; note?: string }>(
+        `/plugins/${encodeURIComponent(name)}`,
+        { method: "PATCH", body: JSON.stringify({ enabled }) },
+      ),
+    remove: (name: string) =>
+      apiFetch<{ deleted: string }>(`/plugins/${encodeURIComponent(name)}`, {
+        method: "DELETE",
+      }),
   },
 
   cluster: {
