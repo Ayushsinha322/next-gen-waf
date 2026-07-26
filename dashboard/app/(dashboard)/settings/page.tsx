@@ -32,29 +32,104 @@ export default function SettingsPage() {
   );
 }
 
+/**
+ * General and Auth & SSO were the two lead tabs of the settings screen and both
+ * were entirely non-functional.
+ *
+ * General had six `defaultValue` inputs and four `<Toggle defaultOn>` with no
+ * state, no handlers and no endpoint behind them: an evaluator could change
+ * "Default WAF Mode" or "Paranoia Level", navigate away, and silently lose it —
+ * or worse, believe they had changed live protection. Those two fields are
+ * per-site policy and are edited in Sites, not here.
+ *
+ * Auth advertised four SSO integrations (Entra, Google Workspace, Okta, SAML 2.0)
+ * whose buttons called showToast, and published a fabricated SP Entity ID at
+ * https://sentinel-waf.corp.io/saml/metadata. In reality the control plane
+ * implements ONE generic OIDC provider — which is what covers Entra, Google and
+ * Okta — configured by environment variable, and no SAML at all.
+ *
+ * Both tabs now report what is true and offer no control that does nothing.
+ */
+function KV({ label, value, mono = true }: { label: string; value: React.ReactNode; mono?: boolean }) {
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "220px 1fr", gap: 12, padding: "9px 0", borderBottom: "1px solid var(--border2)" }}>
+      <div style={{ fontSize: "var(--fs-label)", color: "var(--text3)", textTransform: "uppercase", letterSpacing: "var(--tr-wide)" }}>{label}</div>
+      <div style={{ fontSize: "var(--fs-sm)", color: "var(--text)", fontFamily: mono ? "var(--font-mono)" : undefined, overflowWrap: "anywhere" }}>{value}</div>
+    </div>
+  );
+}
+
+function Note({ children, tone = "info" }: { children: React.ReactNode; tone?: "info" | "warn" }) {
+  const c = tone === "warn"
+    ? ["rgba(255,176,32,.07)", "rgba(255,176,32,.25)"]
+    : ["rgba(0,212,255,.06)", "rgba(0,212,255,.18)"];
+  return (
+    <div style={{
+      padding: "11px 14px", background: c[0], border: `1px solid ${c[1]}`,
+      borderRadius: "var(--r2)", fontSize: "var(--fs-sm)", color: "var(--text2)",
+      lineHeight: 1.65, marginBottom: 14,
+    }}>{children}</div>
+  );
+}
+
 function GeneralTab() {
+  const [status, setStatus] = useState<{ waf_running: boolean; uptime_secs?: number; sites?: number; listeners?: string[] } | null>(null);
+  const [err, setErr] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    api.waf.status()
+      .then(r => { if (alive) setStatus(r); })
+      .catch(() => { if (alive) setErr(true); });
+    return () => { alive = false; };
+  }, []);
+
+  const uptime = (secs?: number) => {
+    if (!secs && secs !== 0) return "—";
+    const d = Math.floor(secs / 86400), h = Math.floor((secs % 86400) / 3600), m = Math.floor((secs % 3600) / 60);
+    return d > 0 ? `${d}d ${h}h ${m}m` : h > 0 ? `${h}h ${m}m` : `${m}m`;
+  };
+
   return (
     <motion.div className="panel" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}>
       <div className="pb">
-        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12, marginBottom:16 }}>
-          <div className="fg2"><label className="flbl2">Tenant Name</label><input className="fin2" defaultValue="Sentinel Security Labs" /></div>
-          <div className="fg2"><label className="flbl2">Admin Email</label><input className="fin2" defaultValue="admin@sentinel.local" type="email" /></div>
-          <div className="fg2"><label className="flbl2">Log Retention</label><select className="fin2 fsel2"><option>30 days</option><option>90 days</option><option>1 year</option></select></div>
-          <div className="fg2"><label className="flbl2">Anomaly Threshold</label><input className="fin2" defaultValue="5" type="number" /></div>
-          <div className="fg2"><label className="flbl2">Default WAF Mode</label><select className="fin2 fsel2"><option>BLOCKING</option><option>LEARNING</option><option>OFF</option></select></div>
-          <div className="fg2"><label className="flbl2">Paranoia Level</label><select className="fin2 fsel2"><option>1 — Default</option><option>2 — Aggressive</option><option>3 — Paranoid</option><option>4 — Ultra</option></select></div>
+        <Note>
+          <strong>Protection settings are per site, not global.</strong> WAF mode,
+          paranoia level and anomaly threshold are properties of an individual site
+          and are edited in <strong>Sites → Edit</strong>, where the change is
+          validated and versioned. This tab previously offered global copies of
+          those fields that were never saved anywhere.
+        </Note>
+
+        <div style={{ fontSize: "var(--fs-h3)", fontWeight: 600, color: "var(--text)", margin: "4px 0 6px" }}>
+          Data plane
         </div>
-        {([
-          ["Enable ML Anomaly Detection","Isolation Forest + Payload Classifier to score requests at Phase 2",true],
-          ["Auto-reload on SIGHUP","Hot-reload config and rules without restarting the proxy daemon",true],
-          ["OpenTelemetry Tracing","Export traces to OTEL collector at http://localhost:4317",true],
-          ["Learning Mode Auto-Promote","Switch site to BLOCKING after 7 days of learning with <0.1% FP",false],
-        ] as [string,string,boolean][]).map(([t,d,on]) => (
-          <div key={t} className="srow">
-            <div style={{flex:1}}><div className="srt">{t}</div><div className="srd">{d}</div></div>
-            <div style={{flexShrink:0}}><Toggle defaultOn={on} /></div>
+        {err ? (
+          <div style={{ fontSize: "var(--fs-sm)", color: "var(--red)", padding: "8px 0" }}>
+            Could not reach the data plane status endpoint.
           </div>
-        ))}
+        ) : (
+          <>
+            <KV label="WAF process" value={status ? (status.waf_running ? "running" : "not running") : "…"} />
+            <KV label="Uptime" value={status ? uptime(status.uptime_secs) : "…"} />
+            <KV label="Protected sites" value={status?.sites ?? "…"} />
+            <KV label="Listeners" value={
+              status?.listeners?.length
+                ? status.listeners.join("  ·  ")
+                : "…"
+            } />
+          </>
+        )}
+
+        <div style={{ fontSize: "var(--fs-h3)", fontWeight: 600, color: "var(--text)", margin: "18px 0 6px" }}>
+          Deployment-level configuration
+        </div>
+        <Note tone="warn">
+          Log retention, tracing export and the ML toggle are set where the stack is
+          deployed — environment variables and the data-plane config file — not from
+          this console. There is no tenant-settings API behind this tab, so rather
+          than show inputs that discard what you type, it shows nothing.
+        </Note>
       </div>
     </motion.div>
   );
@@ -64,23 +139,54 @@ function AuthTab() {
   return (
     <motion.div className="panel" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}>
       <div className="pb">
-        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12, marginBottom:16 }}>
-          <div className="fg2"><label className="flbl2">JWT Secret (HS256)</label><input className="fin2" defaultValue="••••••••••••••••••••••••••••••••" type="password" /></div>
-          <div className="fg2"><label className="flbl2">Access Token TTL</label><select className="fin2 fsel2"><option>15 minutes</option><option>1 hour</option></select></div>
-          <div className="fg2"><label className="flbl2">Refresh Token TTL</label><select className="fin2 fsel2"><option>1 day</option><option>7 days</option></select></div>
-          <div className="fg2"><label className="flbl2">JWT Issuer</label><input className="fin2" defaultValue="sentinel-waf.corp.io" /></div>
+        <div style={{ fontSize: "var(--fs-h3)", fontWeight: 600, color: "var(--text)", margin: "4px 0 6px" }}>
+          Single sign-on
         </div>
-        {([
-          ["Microsoft Entra ID (Azure AD)","Not configured","Set Up"],
-          ["Google Workspace OIDC","Not configured","Set Up"],
-          ["Okta Enterprise SSO","Not configured","Set Up"],
-          ["SAML 2.0","SP Entity ID: https://sentinel-waf.corp.io/saml/metadata","Configure"],
-        ] as [string,string,string][]).map(([t,d,btn]) => (
-          <div key={t} className="srow">
-            <div style={{flex:1}}><div className="srt">{t}</div><div className="srd">{d}</div></div>
-            <motion.button className="btn bg-btn btn-xs" onClick={() => showToast(`${btn} clicked`,"i","🔧")} whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.96 }}>{btn}</motion.button>
-          </div>
-        ))}
+        <Note>
+          Sentinel implements <strong>one generic OpenID Connect provider</strong>,
+          which is what integrates Microsoft Entra ID, Google Workspace, Okta and
+          any other OIDC-compliant IdP. There is no separate connector per vendor,
+          and <strong>SAML 2.0 is not implemented</strong> — this tab used to list
+          four providers and publish a SAML metadata URL that did not exist.
+        </Note>
+
+        <KV label="Mechanism" value="OpenID Connect (Authorization Code)" />
+        <KV label="Login endpoint" value="/api/v1/auth/oidc/login" />
+        <KV label="Callback endpoint" value="/api/v1/auth/oidc/callback" />
+        <KV label="Configured by" value="environment variables on the control plane" />
+
+        <div style={{ fontSize: "var(--fs-h3)", fontWeight: 600, color: "var(--text)", margin: "18px 0 6px" }}>
+          Required environment
+        </div>
+        <div style={{
+          padding: "12px 14px", background: "var(--term-bg)", borderRadius: "var(--r2)",
+          border: "1px solid var(--border2)", fontFamily: "var(--font-mono)",
+          fontSize: "var(--fs-code)", lineHeight: 1.8, color: "var(--term-fg)",
+        }}>
+          <div><span style={{ color: "var(--term-blue)" }}>SENTINEL_OIDC_ISSUER</span>          <span style={{ color: "var(--term-dim)" }}># required, must be https://</span></div>
+          <div><span style={{ color: "var(--term-blue)" }}>SENTINEL_OIDC_CLIENT_SECRET</span>   <span style={{ color: "var(--term-dim)" }}># required</span></div>
+          <div><span style={{ color: "var(--term-blue)" }}>SENTINEL_OIDC_CLIENT_ID</span>       <span style={{ color: "var(--term-dim)" }}># default: sentinel</span></div>
+          <div><span style={{ color: "var(--term-blue)" }}>SENTINEL_OIDC_REDIRECT_URL</span>    <span style={{ color: "var(--term-dim)" }}># must match the IdP</span></div>
+          <div><span style={{ color: "var(--term-blue)" }}>SENTINEL_OIDC_ALLOWED_DOMAINS</span> <span style={{ color: "var(--term-dim)" }}># optional, comma-separated</span></div>
+        </div>
+        <Note tone="warn">
+          SSO <strong>fails closed</strong>: if the issuer is unset, the secret is
+          unset, or the issuer is not HTTPS, OIDC login is disabled entirely rather
+          than falling back to something weaker. Password login with the local user
+          store continues to work either way.
+        </Note>
+
+        <div style={{ fontSize: "var(--fs-h3)", fontWeight: 600, color: "var(--text)", margin: "18px 0 6px" }}>
+          Session tokens
+        </div>
+        <Note>
+          Token lifetimes and the signing secret are control-plane deployment
+          settings and are deliberately not editable from a web console — an
+          attacker with a session here could otherwise mint long-lived credentials
+          or rotate the signing key. Manage users and their roles in{" "}
+          <strong>Users &amp; RBAC</strong>, and machine credentials in{" "}
+          <strong>API Keys</strong>.
+        </Note>
       </div>
     </motion.div>
   );
