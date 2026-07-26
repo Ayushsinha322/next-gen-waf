@@ -408,6 +408,24 @@ struct ConfigSyncResponse {
     sites: Vec<SiteConfig>,
 }
 
+/// Digest of one enabled plugin as advertised by `GET /internal/plugins`.
+///
+/// Deliberately excludes the module bytes: a node compares hashes on every poll
+/// and downloads only what it does not already hold, which is what keeps a 5s
+/// poll cheap for multi-megabyte modules.
+#[derive(serde::Deserialize)]
+struct PluginDigest {
+    name: String,
+    #[allow(dead_code)] // advertised for operators/logs; sync keys off sha256
+    version: String,
+    sha256: String,
+}
+
+#[derive(serde::Deserialize)]
+struct PluginSyncResponse {
+    plugins: Vec<PluginDigest>,
+}
+
 /// On-disk snapshot of the last-good synced config (R5). Lets the data plane
 /// keep protecting DB-created sites across a restart that happens DURING a
 /// control-plane / Postgres outage — boot would otherwise see only local YAML
@@ -981,6 +999,186 @@ impl ProxyServer {
                         last_version = sync.version;
                         info!(version = last_version, sites = count, "sites hot-synced");
                     }
+                }
+            });
+        }
+
+        // --- Background: control-plane plugin sync ---
+        //
+        // Plugins uploaded through the dashboard live in Postgres, not on this
+        // node's filesystem, so they cannot arrive via the config hot-reload path
+        // above: that rebuilds the runtime only when the SITE config pointer
+        // changes, and installing a plugin does not touch site config.
+        //
+        // The control plane advertises a digest (name, version, sha256) and serves
+        // bytes separately, so a poll costs one small JSON response and a module is
+        // downloaded only when its hash is new to this node. That is what makes a
+        // 5s poll affordable for multi-megabyte modules.
+        if let Some(sync_url) = cfg.cluster.sync_url.clone() {
+            let plugin_sync_swap = Arc::clone(&plugin_runtime);
+            let plugin_sync_cfg = Arc::clone(&state.config);
+            let secs = cfg.cluster.sync_interval_secs.max(1);
+            tokio::spawn(async move {
+                use http_body_util::BodyExt as _;
+                use sha2::Digest as _;
+                type EmptyBody = http_body_util::Empty<bytes::Bytes>;
+                let client: Client<_, EmptyBody> =
+                    Client::builder(TokioExecutor::new()).build_http();
+                let internal_secret = std::env::var("SENTINEL_INTERNAL_SECRET")
+                    .ok()
+                    .filter(|s| !s.is_empty());
+                // name → (sha256, bytes). Cached so an unchanged plugin is never
+                // re-downloaded, and so a control-plane outage cannot silently
+                // unload plugins this node already holds.
+                let mut have: std::collections::HashMap<String, (String, Vec<u8>)> =
+                    std::collections::HashMap::new();
+                let mut ticker = tokio::time::interval(Duration::from_secs(secs));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    ticker.tick().await;
+
+                    let list_url = format!("{sync_url}/api/v1/internal/plugins");
+                    let Ok(uri) = list_url.parse::<hyper::Uri>() else {
+                        warn!("plugin sync: bad url: {list_url}");
+                        continue;
+                    };
+                    let mut builder = hyper::Request::builder().method("GET").uri(uri);
+                    if let Some(secret) = &internal_secret {
+                        builder = builder.header("x-sentinel-internal", secret);
+                    }
+                    let Ok(req) = builder.body(http_body_util::Empty::new()) else {
+                        continue;
+                    };
+                    let bytes = match client.request(req).await {
+                        Ok(r) => match r.collect().await {
+                            Ok(b) => b.to_bytes(),
+                            Err(e) => {
+                                warn!("plugin sync body: {e}");
+                                continue;
+                            }
+                        },
+                        Err(e) => {
+                            // Control plane unreachable — keep serving whatever is
+                            // already loaded rather than dropping to zero plugins.
+                            warn!("plugin sync fetch: {e}");
+                            continue;
+                        }
+                    };
+                    let listing: PluginSyncResponse = match serde_json::from_slice(&bytes) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!("plugin sync parse: {e}");
+                            continue;
+                        }
+                    };
+
+                    // Nothing to do when the advertised set matches byte-for-byte
+                    // what is already loaded.
+                    let unchanged = listing.plugins.len() == have.len()
+                        && listing
+                            .plugins
+                            .iter()
+                            .all(|p| have.get(&p.name).is_some_and(|(sha, _)| *sha == p.sha256));
+                    if unchanged {
+                        continue;
+                    }
+
+                    // Fetch anything new or changed. A failure here aborts the whole
+                    // reconcile: applying a partial set would silently run the site
+                    // with some plugins missing, which is worse than retrying in 5s.
+                    let mut next: std::collections::HashMap<String, (String, Vec<u8>)> =
+                        std::collections::HashMap::new();
+                    let mut failed = false;
+                    for p in &listing.plugins {
+                        if let Some((sha, wasm)) = have.get(&p.name).filter(|(s, _)| *s == p.sha256)
+                        {
+                            next.insert(p.name.clone(), (sha.clone(), wasm.clone()));
+                            continue;
+                        }
+                        let wasm_url =
+                            format!("{sync_url}/api/v1/internal/plugins/{}/wasm", p.name);
+                        let Ok(uri) = wasm_url.parse::<hyper::Uri>() else {
+                            warn!(plugin = %p.name, "plugin sync: bad wasm url");
+                            failed = true;
+                            break;
+                        };
+                        let mut b = hyper::Request::builder().method("GET").uri(uri);
+                        if let Some(secret) = &internal_secret {
+                            b = b.header("x-sentinel-internal", secret);
+                        }
+                        let Ok(req) = b.body(http_body_util::Empty::new()) else {
+                            failed = true;
+                            break;
+                        };
+                        let wasm = match client.request(req).await {
+                            Ok(r) if r.status().is_success() => match r.collect().await {
+                                Ok(body) => body.to_bytes().to_vec(),
+                                Err(e) => {
+                                    warn!(plugin = %p.name, "plugin download body: {e}");
+                                    failed = true;
+                                    break;
+                                }
+                            },
+                            Ok(r) => {
+                                warn!(plugin = %p.name, status = %r.status(),
+                                      "plugin download rejected");
+                                failed = true;
+                                break;
+                            }
+                            Err(e) => {
+                                warn!(plugin = %p.name, "plugin download: {e}");
+                                failed = true;
+                                break;
+                            }
+                        };
+                        // Verify the digest before compiling. The control plane is
+                        // trusted, the transport is plain HTTP on a private network,
+                        // and a truncated body would otherwise be compiled and run.
+                        let got = hex::encode(sha2::Sha256::digest(&wasm));
+                        if got != p.sha256 {
+                            warn!(plugin = %p.name, expected = %p.sha256, got = %got,
+                                  "plugin digest mismatch — refusing to load");
+                            failed = true;
+                            break;
+                        }
+                        next.insert(p.name.clone(), (p.sha256.clone(), wasm));
+                    }
+                    if failed {
+                        continue;
+                    }
+
+                    // Rebuild from the local manifest set first so file-configured
+                    // plugins (dev, and site.waf.plugins) are preserved, then layer
+                    // the uploaded ones on top.
+                    let current = plugin_sync_cfg.load_full();
+                    let mut rt = match build_plugin_runtime(&current) {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            warn!("plugin sync: base runtime build failed: {e:#}");
+                            continue;
+                        }
+                    };
+                    let mut loaded = Vec::new();
+                    let mut rejected = 0usize;
+                    for (name, (_, wasm)) in &next {
+                        match rt.load_plugin(name, wasm) {
+                            Ok(()) => loaded.push(name.clone()),
+                            Err(e) => {
+                                // A module that does not compile is skipped rather
+                                // than taking down the whole plugin set.
+                                warn!(plugin = %name, "uploaded plugin failed to compile: {e:#}");
+                                rejected += 1;
+                            }
+                        }
+                    }
+                    plugin_sync_swap.store(Arc::new(rt));
+                    have = next;
+                    loaded.sort();
+                    info!(
+                        plugins = loaded.len(),
+                        rejected, active = %loaded.join(","),
+                        "uploaded plugins synced from control plane"
+                    );
                 }
             });
         }
