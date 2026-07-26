@@ -2092,6 +2092,12 @@ async fn proxy(
     if let Some(s) = &site {
         ctx.site_id = Some(s.id.clone());
         ctx.tenant_id = Some(s.tenant_id.clone());
+        // Stamp the policy that governs this request while the site config is in
+        // scope. Done here rather than passed to log_request because there are 18
+        // log_request call sites, several of which run BEFORE routing (anti-DDoS,
+        // IP reputation, threat intel) and have no site to pass.
+        ctx.enforcement_mode = Some(s.waf.mode.clone());
+        ctx.anomaly_threshold = Some(s.waf.anomaly_threshold);
     }
 
     // Request size limits: URI and header count (Phase 1, before body read).
@@ -2772,10 +2778,15 @@ async fn phase1_headers(
     if ctx.decision == WafDecision::Allow && site.waf.geoip.is_some() {
         let geoip_map = modules.geoip_map.load();
         if let Some(geoip) = geoip_map.get(&site.id) {
-            match geoip.check(ctx.client_ip) {
+            // Resolve the country FIRST and record it whatever the verdict is.
+            // Previously it was only stamped on the Block branch, so every
+            // allowed request logged an empty country and the dashboard map and
+            // country facets saw blocked traffic only — they under-reported by
+            // construction rather than because the data was unavailable.
+            ctx.geo_country = geoip.country(ctx.client_ip);
+            match geoip.classify(ctx.geo_country.as_deref()) {
                 GeoVerdict::Block { country_code } => {
                     ctx.block_reason = Some(format!("country blocked: {country_code}"));
-                    ctx.geo_country = Some(country_code);
                     ctx.decision = WafDecision::Block;
                 }
                 GeoVerdict::Allow | GeoVerdict::Unknown => {}
@@ -5272,6 +5283,220 @@ fn protocol_label(v: http::Version) -> &'static str {
     }
 }
 
+/// Whether to attach the human-readable `message`/`remediation` prose to WAF
+/// events. Default on; set `SENTINEL_LOG_EXPLAIN=0` to drop it.
+///
+/// The escape hatch exists for volume, not correctness: the prose adds roughly
+/// 200-400 bytes to every security event, and the block path sustains >21k
+/// events/s under flood, where that is megabytes per second of extra disk. An
+/// operator riding out an attack can turn it off; the structured fields the
+/// dashboard and ClickHouse consume are unaffected either way.
+fn log_explain_enabled() -> bool {
+    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EN.get_or_init(|| {
+        !matches!(
+            std::env::var("SENTINEL_LOG_EXPLAIN").ok().as_deref(),
+            Some("0") | Some("false") | Some("off")
+        )
+    })
+}
+
+/// Render a rule target (`ARGS:id`, `REQUEST_HEADERS:X-Api-Key`) as English.
+///
+/// The raw ModSecurity-style target is precise but assumes the reader knows the
+/// vocabulary. An operator triaging a false positive at 3 a.m. should not have
+/// to know that `ARGS_NAMES` means the parameter's *name* rather than its value.
+fn humanize_target(target: &str) -> String {
+    let (collection, member) = match target.split_once(':') {
+        Some((c, m)) => (c, Some(m)),
+        None => (target, None),
+    };
+    let named = |what: &str| match member {
+        Some(m) if !m.is_empty() => format!("{what} '{m}'"),
+        _ => what.to_string(),
+    };
+    match collection.to_ascii_uppercase().as_str() {
+        "ARGS" => named("parameter"),
+        "ARGS_NAMES" => named("parameter name"),
+        "ARGS_GET" => named("query-string parameter"),
+        "ARGS_POST" => named("body parameter"),
+        "REQUEST_HEADERS" => named("request header"),
+        "REQUEST_HEADERS_NAMES" => named("request header name"),
+        "REQUEST_COOKIES" => named("cookie"),
+        "REQUEST_COOKIES_NAMES" => named("cookie name"),
+        "REQUEST_URI" | "REQUEST_URI_RAW" => "the request URI".to_string(),
+        "REQUEST_FILENAME" => "the request path".to_string(),
+        "REQUEST_BODY" => "the request body".to_string(),
+        "REQUEST_LINE" => "the request line".to_string(),
+        "REQUEST_METHOD" => "the request method".to_string(),
+        "QUERY_STRING" => "the query string".to_string(),
+        "FILES" | "FILES_NAMES" => named("uploaded file"),
+        "RESPONSE_BODY" => "the response body".to_string(),
+        "RESPONSE_HEADERS" => named("response header"),
+        "XML" => "the XML body".to_string(),
+        "JSON" => "the JSON body".to_string(),
+        // Unknown collection: echo it rather than inventing a description.
+        _ => target.to_string(),
+    }
+}
+
+/// Trim a path/URI for inclusion in prose without destroying its meaning.
+fn truncate_for_prose(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max).collect();
+    format!("{head}… ({} chars total)", s.chars().count())
+}
+
+/// Build the human-readable explanation and remediation hint for a WAF event.
+///
+/// Returns `(message, remediation)`. The message states, in one sentence, what
+/// was decided, what was detected, WHERE in the request, who sent it, and why
+/// the verdict followed. The remediation says what to do about it — which is the
+/// part commercial WAFs typically leave to the operator to work out from a
+/// violation code, and the reason this exists at all.
+fn explain_event(ctx: &RequestContext, action: &str, rule: &str, attack: &str) -> (String, String) {
+    let site = ctx.site_id.as_deref().unwrap_or("unrouted request");
+    let origin = match ctx.geo_country.as_deref() {
+        Some(cc) if !cc.is_empty() => format!("{} ({cc})", ctx.client_ip),
+        _ => ctx.client_ip.to_string(),
+    };
+    let req = format!(
+        "{} {}",
+        ctx.method.as_str(),
+        truncate_for_prose(ctx.uri.path(), 120)
+    );
+    let top = ctx.rule_matches.first();
+    let is_rule_hit = top.is_some();
+
+    // What the WAF did, stated so that a learning-mode record can never be
+    // mistaken for an enforced block — the single most dangerous ambiguity in a
+    // WAF log, because it decides whether the operator thinks traffic was stopped.
+    let verdict = match action {
+        "DETECT" => format!(
+            "Detected but ALLOWED THROUGH — site '{site}' is in learning mode, so this request was \
+             not blocked"
+        ),
+        "BLOCK" => match ctx.decision {
+            WafDecision::Challenge => {
+                format!("Challenged (browser verification required) on '{site}'")
+            }
+            WafDecision::Limit => format!("Throttled (soft-deny) on '{site}'"),
+            _ => format!("BLOCKED on '{site}'"),
+        },
+        _ => format!("Allowed on '{site}'"),
+    };
+
+    // What was found, and where.
+    let finding = match top {
+        Some(m) => format!(
+            "{} in {} (rule {}, severity {:?}, detected during {})",
+            attack,
+            humanize_target(&m.target),
+            m.rule_id,
+            m.severity,
+            m.phase
+        ),
+        None => {
+            let reason = ctx.block_reason.as_deref().unwrap_or("").trim();
+            if reason.is_empty() {
+                attack.to_string()
+            } else {
+                format!("{reason} (recorded as {rule})")
+            }
+        }
+    };
+
+    // Why the verdict followed. Only meaningful for score-driven outcomes; a
+    // rate-limit or GeoIP block has no score and must not pretend to have one.
+    let mut why = String::new();
+    if ctx.anomaly_score > 0 {
+        match ctx.anomaly_threshold {
+            Some(t) => {
+                why = format!(
+                    " Cumulative anomaly score {} against this site's threshold of {}{}.",
+                    ctx.anomaly_score,
+                    t,
+                    if ctx.anomaly_score >= t {
+                        " (threshold reached)"
+                    } else {
+                        " (below threshold)"
+                    }
+                );
+            }
+            None => {
+                why = format!(" Cumulative anomaly score {}.", ctx.anomaly_score);
+            }
+        }
+    }
+    if ctx.threat_intel_hit {
+        why.push_str(" The client IP also matched the live threat-intelligence feed.");
+    }
+
+    let outcome = match ctx.response_status.map(|s| s.as_u16()) {
+        Some(code) if code > 0 => format!(" Responded {} in {:.1} ms.", code, ctx.elapsed_ms()),
+        _ => format!(" Completed in {:.1} ms.", ctx.elapsed_ms()),
+    };
+
+    let message = format!("{verdict}: {finding} from {origin} on {req}.{why}{outcome}");
+
+    // Remediation. Tailored to what actually fired, so it is actionable rather
+    // than a generic "review your policy".
+    let remediation = if action == "PASS" {
+        String::new()
+    } else if is_rule_hit {
+        let m = top.expect("is_rule_hit implies a match");
+        format!(
+            "If this is legitimate traffic, exclude rule {} for {} on site '{}' \
+             (Sites → {} → Learning Report → Disable), or raise the site's anomaly threshold above \
+             {}. Confirm against the source IP and payload before excluding — an exclusion applies \
+             to every future request for that target.",
+            m.rule_id,
+            humanize_target(&m.target),
+            site,
+            site,
+            ctx.anomaly_score.max(1)
+        )
+    } else {
+        match rule {
+            "RATELIMIT" => format!(
+                "If {origin} is a legitimate client, raise the rate limit for site '{site}' or \
+                 allowlist the address. Repeated hits from many addresses instead suggest a \
+                 distributed flood — check the DDoS panel before relaxing the limit."
+            ),
+            "GEOIP" => format!(
+                "If this country should be served, remove it from the GeoIP block list for site \
+                 '{site}'. Note that a VPN or corporate egress can place a legitimate user in an \
+                 unexpected country."
+            ),
+            "BOT" => format!(
+                "If this is a legitimate automated client, allowlist its address or JA4 \
+                 fingerprint for site '{site}'. Well-behaved crawlers should instead be given a \
+                 verified-bot exemption rather than a blanket allow."
+            ),
+            "THREATINTEL" => format!(
+                "The address {origin} appears on a threat-intelligence feed. If you believe this \
+                 is a false attribution, allowlist it for site '{site}' and report the address so \
+                 the feed entry can be reviewed."
+            ),
+            "SMUGGLING" => {
+                "Conflicting Content-Length/Transfer-Encoding framing was rejected. This is almost \
+                 never legitimate client behaviour — investigate the sender before allowlisting \
+                 anything."
+                    .to_string()
+            }
+            _ => format!(
+                "Review the request against site '{site}' policy. If the verdict is wrong, capture \
+                 this record's request_id and use it to correlate with the access log before \
+                 changing policy."
+            ),
+        }
+    };
+
+    (message, remediation)
+}
+
 fn ndjson_log(ctx: &RequestContext) {
     if !ndjson_logging_enabled() {
         return;
@@ -5293,9 +5518,18 @@ fn ndjson_log(ctx: &RequestContext) {
     let site = ctx.site_id.as_deref().unwrap_or("-");
     let tenant = ctx.tenant_id.as_deref().unwrap_or("");
 
+    // request_id is the join key between this line, the matching waf.log security
+    // event, and the tracing output. Without it the two NDJSON streams cannot be
+    // correlated at all — you could see that a block happened and see a request,
+    // and not be able to prove they were the same request.
+    let request_id = ctx.request_id.to_string();
+    let country = ctx.geo_country.as_deref().unwrap_or("");
+
     let access = serde_json::json!({
         "ts":      ts,
+        "request_id": request_id,
         "ip":      ctx.client_ip.to_string(),
+        "country": country,
         "method":  ctx.method.as_str(),
         "path":    ctx.uri.path(),
         "status":  status,
@@ -5330,21 +5564,52 @@ fn ndjson_log(ctx: &RequestContext) {
             None => classify_nonrule_block(ctx.block_reason.as_deref().unwrap_or("")),
         };
 
+        // Which part of the request tripped this, e.g. "ARGS:id". Available on
+        // every RuleMatch and previously dropped on the floor — it is the single
+        // most useful field for triaging a false positive, because it names the
+        // parameter to exclude instead of leaving the operator to guess.
+        let target = top.map(|r| r.target.as_str()).unwrap_or("");
+        let mode = match ctx.enforcement_mode {
+            Some(WafMode::Blocking) => "blocking",
+            Some(WafMode::Learning) => "learning",
+            Some(WafMode::Off) => "off",
+            // Pre-routing rejections (anti-DDoS, IP reputation, threat intel)
+            // are enforced by the node, not by a site policy.
+            None => "node",
+        };
+        let (message, remediation) = if log_explain_enabled() {
+            explain_event(ctx, action, rule, attack)
+        } else {
+            (String::new(), String::new())
+        };
+
         let waf = serde_json::json!({
             "ts":     ts,
+            "request_id": request_id,
             "ip":     ctx.client_ip.to_string(),
+            "country": country,
             "method": ctx.method.as_str(),
             "path":   ctx.uri.path(),
             "rule":   rule,
+            "target": target,
             "score":  ctx.anomaly_score,
+            "threshold": ctx.anomaly_threshold,
             "sev":    sev_str,
             "attack": attack,
             "action": action,
+            "mode":   mode,
             "site":   site,
             "tenant": tenant,
             "protocol": protocol_label(ctx.http_version),
+            "status": status,
+            "latency_ms": format!("{:.2}", ctx.elapsed_ms()),
+            "ua":     ua,
             "msg":    ctx.block_reason.as_deref().unwrap_or(""),
+            "message": message,
+            "remediation": remediation,
             "would_block": ctx.would_block,
+            "threat_intel_hit": ctx.threat_intel_hit,
+            "engine_scores": ctx.engine_scores,
             "ml_scores": ctx.ml_scores,
         });
         enqueue_log("waf.log", waf.to_string());
@@ -6038,5 +6303,153 @@ mod drain_tests {
             r.is_err(),
             "drain must be bounded by grace on a stuck connection"
         );
+    }
+}
+
+#[cfg(test)]
+mod log_explain_tests {
+    use super::*;
+    use sentinel_core::context::{RuleMatch, Severity};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn ctx_with(ip: &str, path: &str) -> RequestContext {
+        let mut ctx = RequestContext::new(ip.parse::<IpAddr>().unwrap(), 44321);
+        ctx.method = http::Method::POST;
+        ctx.uri = path.parse().unwrap();
+        ctx.site_id = Some("juice".to_string());
+        ctx.anomaly_threshold = Some(10);
+        ctx.enforcement_mode = Some(WafMode::Blocking);
+        ctx.response_status = Some(http::StatusCode::FORBIDDEN);
+        ctx
+    }
+
+    fn sqli_match() -> RuleMatch {
+        RuleMatch {
+            rule_id: "942100".to_string(),
+            message: "SQL injection detected".to_string(),
+            severity: Severity::Critical,
+            score: 15,
+            target: "ARGS:username".to_string(),
+            phase: Phase::RequestHeaders,
+        }
+    }
+
+    #[test]
+    fn target_is_rendered_in_english() {
+        assert_eq!(humanize_target("ARGS:id"), "parameter 'id'");
+        assert_eq!(
+            humanize_target("REQUEST_HEADERS:X-Api-Key"),
+            "request header 'X-Api-Key'"
+        );
+        assert_eq!(humanize_target("REQUEST_COOKIES:sid"), "cookie 'sid'");
+        assert_eq!(humanize_target("REQUEST_BODY"), "the request body");
+        assert_eq!(
+            humanize_target("ARGS_NAMES:x"),
+            "parameter name 'x'",
+            "the NAME/value distinction must survive — it changes what you exclude"
+        );
+        // An unrecognised collection is echoed, never invented.
+        assert_eq!(
+            humanize_target("SOME_FUTURE_THING:z"),
+            "SOME_FUTURE_THING:z"
+        );
+    }
+
+    #[test]
+    fn block_message_names_what_where_who_and_why() {
+        let mut ctx = ctx_with("45.155.205.233", "/login");
+        ctx.geo_country = Some("RU".to_string());
+        ctx.decision = WafDecision::Block;
+        ctx.anomaly_score = 15;
+        ctx.rule_matches.push(sqli_match());
+
+        let (msg, rem) = explain_event(&ctx, "BLOCK", "942100", "SQL injection detected");
+
+        assert!(msg.starts_with("BLOCKED on 'juice'"), "got: {msg}");
+        assert!(
+            msg.contains("parameter 'username'"),
+            "WHERE is missing: {msg}"
+        );
+        assert!(msg.contains("rule 942100"), "rule is missing: {msg}");
+        assert!(
+            msg.contains("45.155.205.233 (RU)"),
+            "origin is missing: {msg}"
+        );
+        assert!(msg.contains("POST /login"), "request is missing: {msg}");
+        assert!(
+            msg.contains("score 15 against this site's threshold of 10"),
+            "the score/threshold comparison is the WHY: {msg}"
+        );
+        assert!(msg.contains("threshold reached"), "got: {msg}");
+        assert!(msg.contains("Responded 403"), "outcome is missing: {msg}");
+        // The remediation must name the exact rule AND target to exclude.
+        assert!(rem.contains("exclude rule 942100"), "got: {rem}");
+        assert!(rem.contains("parameter 'username'"), "got: {rem}");
+    }
+
+    /// The most dangerous ambiguity in a WAF log: a learning-mode record that
+    /// reads like an enforced block. An operator who believes traffic was stopped
+    /// when it was not will not investigate.
+    #[test]
+    fn learning_mode_never_reads_as_blocked() {
+        let mut ctx = ctx_with("1.2.3.4", "/search");
+        ctx.enforcement_mode = Some(WafMode::Learning);
+        ctx.decision = WafDecision::Log;
+        ctx.would_block = true;
+        ctx.anomaly_score = 12;
+        ctx.response_status = Some(http::StatusCode::OK);
+        ctx.rule_matches.push(sqli_match());
+
+        let (msg, _) = explain_event(&ctx, "DETECT", "942100", "SQL injection detected");
+
+        assert!(msg.contains("ALLOWED THROUGH"), "got: {msg}");
+        assert!(msg.contains("learning mode"), "got: {msg}");
+        assert!(msg.contains("not blocked"), "got: {msg}");
+        assert!(
+            !msg.contains("BLOCKED on"),
+            "a learning record must never claim a block: {msg}"
+        );
+    }
+
+    /// A rate-limit block carries no rule and no score. The explanation must not
+    /// fabricate a score comparison it does not have.
+    #[test]
+    fn non_rule_block_explains_without_inventing_a_score() {
+        let mut ctx = ctx_with("9.9.9.9", "/api/v1/orders");
+        ctx.decision = WafDecision::Block;
+        ctx.block_reason = Some("rate limit exceeded: 120 req/10s".to_string());
+        ctx.response_status = Some(http::StatusCode::TOO_MANY_REQUESTS);
+
+        let (msg, rem) = explain_event(&ctx, "BLOCK", "RATELIMIT", "Rate limit exceeded");
+
+        assert!(
+            msg.contains("rate limit exceeded: 120 req/10s"),
+            "got: {msg}"
+        );
+        assert!(
+            !msg.contains("anomaly score"),
+            "no score exists for a rate-limit block; it must not be implied: {msg}"
+        );
+        assert!(rem.contains("raise the rate limit"), "got: {rem}");
+    }
+
+    #[test]
+    fn prose_truncation_reports_the_real_length() {
+        let long = "a".repeat(400);
+        let out = truncate_for_prose(&long, 120);
+        assert!(out.contains("400 chars total"), "got: {out}");
+        assert!(out.chars().count() < 160, "still bounded: {}", out.len());
+        // Short input is returned untouched.
+        assert_eq!(truncate_for_prose("/short", 120), "/short");
+    }
+
+    #[test]
+    fn unrouted_request_is_attributed_to_the_node_not_a_site() {
+        let mut ctx = RequestContext::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 1234);
+        ctx.decision = WafDecision::Block;
+        ctx.block_reason = Some("threat intel: known scanner".to_string());
+        let (msg, rem) = explain_event(&ctx, "BLOCK", "THREATINTEL", "threat intel: known scanner");
+        assert!(msg.contains("unrouted request"), "got: {msg}");
+        assert!(rem.contains("threat-intelligence feed"), "got: {rem}");
     }
 }

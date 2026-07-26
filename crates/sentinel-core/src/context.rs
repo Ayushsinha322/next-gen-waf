@@ -120,6 +120,19 @@ pub struct RequestContext {
     pub tenant_id: Option<String>,
     /// ISO-3166-1 alpha-2 country code resolved by the GeoIP module, when known.
     pub geo_country: Option<String>,
+    /// Enforcement mode of the matched site, stamped once at routing time.
+    /// `None` for requests rejected before routing (connection-layer blocks such
+    /// as anti-DDoS, IP reputation and threat intel).
+    ///
+    /// Logging needs this: without it a record cannot say whether a verdict was
+    /// actually *enforced* or merely *observed* in learning mode, and that
+    /// distinction is not recoverable from the other fields — a learning-mode
+    /// downgrade and a genuine pass both end up as a non-Block decision.
+    pub enforcement_mode: Option<crate::config::WafMode>,
+    /// The matched site's anomaly-score threshold, stamped at routing time so a
+    /// score-driven verdict can be reported as "score N of threshold M" rather
+    /// than a bare number the reader has to go look up.
+    pub anomaly_threshold: Option<u32>,
 
     // --- WAF state ---
     pub phase: Phase,
@@ -183,6 +196,8 @@ impl RequestContext {
             site_id: None,
             tenant_id: None,
             geo_country: None,
+            enforcement_mode: None,
+            anomaly_threshold: None,
             phase: Phase::Connection,
             anomaly_score: 0,
             engine_scores: HashMap::new(),
