@@ -1,0 +1,23 @@
+[package]
+name = "ua-guard"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Sentinel WAF example plugin — blocks known scanner User-Agents"
+
+# cdylib is required: the host loads a WebAssembly module, not a Rust rlib.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+
+[profile.release]
+# A plugin is compiled on every data-plane node at load time and its bytes are
+# stored in Postgres and shipped to each node, so size genuinely matters.
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+# The host aborts a trapping plugin and carries on with the request; unwinding
+# across the WASM boundary buys nothing and costs size.
+panic = "abort"

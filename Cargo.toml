@@ -13,6 +13,11 @@ members = [
     "crates/sentinel-cli",
     "crates/sentinel-bin",
 ]
+# Example plugins are separate crates compiled for wasm32-unknown-unknown with
+# crate-type=["cdylib"]. They must not join the workspace: a workspace build
+# would try to build them for the host target, where their `env` host-function
+# imports cannot resolve.
+exclude = ["examples/plugins"]
 
 [workspace.package]
 version = "0.1.0"

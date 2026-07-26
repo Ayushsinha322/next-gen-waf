@@ -1,0 +1,30 @@
+[plugin]
+name = "ua-guard"
+version = "0.1.0"
+description = "Blocks known scanner User-Agents (sqlmap, nikto, nmap, …) and scores generic scripted clients"
+author = "Sentinel WAF"
+wasm = "plugin.wasm"
+
+# Phases this plugin runs in. It only needs request headers, so it costs nothing
+# on the body or response path.
+[plugin.hooks]
+request_headers = true
+request_body = false
+response_headers = false
+response_body = false
+
+# Host functions this plugin declares it needs.
+#
+# NOTE: the runtime does not currently GATE host calls on these flags — see the
+# limitation documented in the plugin sync commit. They are recorded, shown in the
+# UI and written to the audit log as declared intent, so an operator can see what
+# a plugin claims it will do before enabling it.
+[plugin.permissions]
+host_log = true
+host_get_req_header = true
+host_set_decision = true
+host_add_score = true
+host_set_header = false
+host_kv_get = false
+host_kv_set = false
+host_http_callout = false

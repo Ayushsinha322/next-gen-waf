@@ -1,0 +1,5 @@
+# Build output — reproducible via each plugin's build.sh, so the binaries are not
+# committed. `plugin.wasm` is a transient copy made while packaging.
+*/target/
+*.zip
+*/plugin.wasm
