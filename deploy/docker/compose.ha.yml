@@ -24,7 +24,7 @@ x-wafnode: &wafnode
   depends_on:
     controlplane: { condition: service_started }
     redis: { condition: service_healthy }
-  environment:
+  environment: &wafenv
     SENTINEL_CONFIG: /etc/sentinel/sentinel.yaml
     RUST_LOG: info,sentinel=info
     SENTINEL_INTERNAL_SECRET: ${SENTINEL_INTERNAL_SECRET}
@@ -71,6 +71,12 @@ x-wafnode: &wafnode
 services:
   waf1:
     <<: *wafnode
+    environment:
+      <<: *wafenv
+      # Own subdirectory. Three nodes appending to a single access.log each
+      # hold an open handle, so the first rotation orphans the other two
+      # writers and two thirds of traffic disappears from the live view.
+      SENTINEL_LOG_DIR: /var/log/sentinel/waf1
     hostname: waf1
     # waf1 doubles as the management/HTTPS host + the "dataplane" the control
     # plane's cert API points at (SENTINEL_DATAPLANE_URL=http://dataplane:8080).
@@ -78,6 +84,7 @@ services:
       sentinel:
         aliases: [dataplane]
     volumes:
+      - sentinel-logs:/var/log/sentinel   # live-log source the control plane tails
       - ./sentinel.proxy.yaml:/etc/sentinel/sentinel.yaml:ro
       - sentinel-certs:/var/lib/sentinel/certs   # shared cert repository (ACME/uploaded)
       - waf1-state:/var/lib/sentinel/state       # this node's last-good config cache
@@ -87,14 +94,28 @@ services:
       - "443:8443/udp"       # public WAF entrypoint (HTTP/3 over QUIC)
   waf2:
     <<: *wafnode
+    environment:
+      <<: *wafenv
+      # Own subdirectory. Three nodes appending to a single access.log each
+      # hold an open handle, so the first rotation orphans the other two
+      # writers and two thirds of traffic disappears from the live view.
+      SENTINEL_LOG_DIR: /var/log/sentinel/waf2
     hostname: waf2
     volumes:
+      - sentinel-logs:/var/log/sentinel   # live-log source the control plane tails
       - ./sentinel.proxy.yaml:/etc/sentinel/sentinel.yaml:ro
       - waf2-state:/var/lib/sentinel/state
   waf3:
     <<: *wafnode
+    environment:
+      <<: *wafenv
+      # Own subdirectory. Three nodes appending to a single access.log each
+      # hold an open handle, so the first rotation orphans the other two
+      # writers and two thirds of traffic disappears from the live view.
+      SENTINEL_LOG_DIR: /var/log/sentinel/waf3
     hostname: waf3
     volumes:
+      - sentinel-logs:/var/log/sentinel   # live-log source the control plane tails
       - ./sentinel.proxy.yaml:/etc/sentinel/sentinel.yaml:ro
       - waf3-state:/var/lib/sentinel/state
 
