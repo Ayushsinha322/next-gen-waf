@@ -795,6 +795,9 @@ pub fn evaluate(
 
     let mut stack: Vec<StackVal> = Vec::with_capacity(16);
     let mut ip: usize = 0; // instruction pointer
+                           // Per-rule target attribution, reset at every RuleEnd.
+    let mut last_target: Option<String> = None;
+    let mut targets_seen = 0usize;
 
     while ip < program.len() {
         // Early exit: if already decided (Block/Challenge), stop evaluating.
@@ -805,6 +808,17 @@ pub fn evaluate(
         let instr = &program[ip];
         match instr {
             Instruction::LoadTarget(spec) => {
+                // Track which part of the request this rule looked at, so a
+                // security event can name the parameter an operator would exclude.
+                //
+                // Counted, not merely remembered: a rule that evaluates SEVERAL
+                // targets (chains, `ARGS|REQUEST_HEADERS`) offers no way to tell
+                // from here WHICH one the operator matched, and naming the wrong
+                // parameter would send someone to write an exclusion against a
+                // target that never fired. So the label is kept only when the rule
+                // inspected exactly one target, and left empty otherwise.
+                targets_seen += 1;
+                last_target = Some(spec.label());
                 let values = extract_target(spec, ctx);
                 stack.push(StackVal::Strings(values));
             }
@@ -995,9 +1009,16 @@ pub fn evaluate(
 
             Instruction::RuleEnd { rule_id } => {
                 let fired = pop_bool(&mut stack);
+                let matched_target = if targets_seen == 1 {
+                    last_target.take()
+                } else {
+                    None
+                };
+                last_target = None;
+                targets_seen = 0;
                 if fired {
                     if let Some(meta) = ruleset.rule_meta.get(rule_id) {
-                        fire_rule(ctx, meta);
+                        fire_rule(ctx, meta, matched_target);
                         // skipAfter: scan forward for the named Marker and jump to it.
                         // ip += 1 at loop end then steps past the Marker (which is a no-op).
                         if let Some(marker) = &meta.skip_after {
@@ -1040,7 +1061,7 @@ pub fn evaluate(
     ctx.decision.clone()
 }
 
-fn fire_rule(ctx: &mut RequestContext, meta: &RuleMeta) {
+fn fire_rule(ctx: &mut RequestContext, meta: &RuleMeta, matched_target: Option<String>) {
     let phase = rule_phase_to_phase(meta.phase);
 
     match &meta.action {
@@ -1092,7 +1113,7 @@ fn fire_rule(ctx: &mut RequestContext, meta: &RuleMeta) {
             message: meta.message.clone(),
             severity: map_severity(meta.severity),
             score: meta.score_delta.max(0) as u32,
-            target: String::new(),
+            target: matched_target.unwrap_or_default(),
             phase,
         });
     }

@@ -35,6 +35,39 @@ pub enum TargetSpec {
     CountOf(Box<TargetSpec>),
 }
 
+impl TargetSpec {
+    /// ModSecurity-style label for this target, e.g. `ARGS`,
+    /// `REQUEST_HEADERS:User-Agent`.
+    ///
+    /// Used to record WHICH part of a request tripped a rule, so a security event
+    /// can name the parameter to exclude instead of leaving an operator to guess.
+    pub fn label(&self) -> String {
+        match self {
+            TargetSpec::Args => "ARGS".into(),
+            TargetSpec::ArgsNames => "ARGS_NAMES".into(),
+            TargetSpec::RequestBody => "REQUEST_BODY".into(),
+            TargetSpec::RequestUri => "REQUEST_URI".into(),
+            TargetSpec::RequestFilename => "REQUEST_FILENAME".into(),
+            TargetSpec::RequestMethod => "REQUEST_METHOD".into(),
+            TargetSpec::RequestLine => "REQUEST_LINE".into(),
+            TargetSpec::RequestHeadersAll => "REQUEST_HEADERS".into(),
+            TargetSpec::RequestHeader(h) => format!("REQUEST_HEADERS:{h}"),
+            TargetSpec::RequestCookiesAll => "REQUEST_COOKIES".into(),
+            TargetSpec::RequestCookie(c) => format!("REQUEST_COOKIES:{c}"),
+            TargetSpec::ResponseHeadersAll => "RESPONSE_HEADERS".into(),
+            TargetSpec::ResponseHeader(h) => format!("RESPONSE_HEADERS:{h}"),
+            TargetSpec::ResponseBody => "RESPONSE_BODY".into(),
+            TargetSpec::Files => "FILES".into(),
+            TargetSpec::FilesNames => "FILES_NAMES".into(),
+            TargetSpec::FilesCombinedSize => "FILES_COMBINED_SIZE".into(),
+            TargetSpec::RemoteAddr => "REMOTE_ADDR".into(),
+            TargetSpec::Geo => "GEO".into(),
+            TargetSpec::TxVar(v) => format!("TX:{v}"),
+            TargetSpec::CountOf(inner) => format!("&{}", inner.label()),
+        }
+    }
+}
+
 impl From<&Target> for TargetSpec {
     fn from(t: &Target) -> Self {
         match t {

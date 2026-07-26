@@ -866,6 +866,11 @@ impl ProxyServer {
             conn_tracker: tokio_util::task::TaskTracker::new(),
         });
 
+        // Cache of control-plane-uploaded plugin modules, shared by the plugin-sync
+        // task (writer) and the config hot-reload watcher (reader) so that BOTH
+        // rebuild a complete runtime. See build_full_plugin_runtime.
+        let uploaded_plugins: UploadedPlugins = Arc::new(DashMap::new());
+
         // --- Background: config hot-reload watcher ---
         {
             let config_watch = Arc::clone(&self.config);
@@ -873,6 +878,7 @@ impl ProxyServer {
             let dlp_swap = Arc::clone(&dlp_map);
             let modules_ref = Arc::clone(&modules);
             let plugin_swap = Arc::clone(&plugin_runtime);
+            let uploaded_ref = Arc::clone(&uploaded_plugins);
             tokio::spawn(async move {
                 loop {
                     let cw = Arc::clone(&config_watch);
@@ -880,6 +886,7 @@ impl ProxyServer {
                     let ds = Arc::clone(&dlp_swap);
                     let mr = Arc::clone(&modules_ref);
                     let ps = Arc::clone(&plugin_swap);
+                    let up_cache = Arc::clone(&uploaded_ref);
                     let handle = tokio::spawn(async move {
                         let mut last_ptr = Arc::as_ptr(&cw.load_full()) as usize;
                         loop {
@@ -901,10 +908,20 @@ impl ProxyServer {
                                 mr.bot_detector.store(Arc::new(BotDetector::new()));
                                 mr.geoip_map.store(Arc::new(build_geoip_map(&current)));
 
-                                match build_plugin_runtime(&current) {
-                                    Ok(new_pr) => {
+                                // Rebuild through build_full_plugin_runtime so
+                                // uploaded plugins survive a config change. Using
+                                // build_plugin_runtime here unloaded every uploaded
+                                // plugin, and because the sync task skips work when
+                                // the advertised set is unchanged, they never came
+                                // back — the module stayed "enabled" in the UI while
+                                // silently no longer running.
+                                match build_full_plugin_runtime(&current, &up_cache) {
+                                    Ok((new_pr, names, rejected)) => {
                                         ps.store(Arc::new(new_pr));
-                                        info!("plugin runtime hot-reloaded");
+                                        info!(
+                                            uploaded = names.len(),
+                                            rejected, "plugin runtime hot-reloaded"
+                                        );
                                     }
                                     Err(e) => {
                                         warn!("failed to reload plugins — keeping current: {e:#}");
@@ -1017,6 +1034,7 @@ impl ProxyServer {
         if let Some(sync_url) = cfg.cluster.sync_url.clone() {
             let plugin_sync_swap = Arc::clone(&plugin_runtime);
             let plugin_sync_cfg = Arc::clone(&state.config);
+            let sync_cache = Arc::clone(&uploaded_plugins);
             let secs = cfg.cluster.sync_interval_secs.max(1);
             tokio::spawn(async move {
                 use http_body_util::BodyExt as _;
@@ -1072,15 +1090,32 @@ impl ProxyServer {
                         }
                     };
 
-                    // Nothing to do when the advertised set matches byte-for-byte
-                    // what is already loaded.
-                    let unchanged = listing.plugins.len() == have.len()
+                    // Skip only when the advertised set matches the cache AND the
+                    // live runtime actually still holds exactly those plugins.
+                    //
+                    // Checking the runtime is what makes this self-healing. Anything
+                    // that rebuilds the runtime without the uploaded set (a bug, a
+                    // future code path, a failed reload) would otherwise leave the
+                    // plugins permanently unloaded while this task concluded there
+                    // was nothing to do — the module still shown as enabled in the
+                    // UI, no error anywhere, and simply not running.
+                    let cache_current = listing.plugins.len() == have.len()
                         && listing
                             .plugins
                             .iter()
                             .all(|p| have.get(&p.name).is_some_and(|(sha, _)| *sha == p.sha256));
-                    if unchanged {
+                    let live_names = plugin_sync_swap.load().plugin_names();
+                    let runtime_current = listing
+                        .plugins
+                        .iter()
+                        .all(|p| live_names.iter().any(|n| n == &p.name));
+                    if cache_current && runtime_current {
                         continue;
+                    }
+                    if cache_current && !runtime_current {
+                        warn!(
+                            "uploaded plugins missing from the live runtime — reloading from cache"
+                        );
                     }
 
                     // Fetch anything new or changed. A failure here aborts the whole
@@ -1147,33 +1182,26 @@ impl ProxyServer {
                         continue;
                     }
 
-                    // Rebuild from the local manifest set first so file-configured
-                    // plugins (dev, and site.waf.plugins) are preserved, then layer
-                    // the uploaded ones on top.
-                    let current = plugin_sync_cfg.load_full();
-                    let mut rt = match build_plugin_runtime(&current) {
-                        Ok(rt) => rt,
-                        Err(e) => {
-                            warn!("plugin sync: base runtime build failed: {e:#}");
-                            continue;
-                        }
-                    };
-                    let mut loaded = Vec::new();
-                    let mut rejected = 0usize;
-                    for (name, (_, wasm)) in &next {
-                        match rt.load_plugin(name, wasm) {
-                            Ok(()) => loaded.push(name.clone()),
-                            Err(e) => {
-                                // A module that does not compile is skipped rather
-                                // than taking down the whole plugin set.
-                                warn!(plugin = %name, "uploaded plugin failed to compile: {e:#}");
-                                rejected += 1;
-                            }
-                        }
+                    // Publish to the shared cache BEFORE rebuilding, so a concurrent
+                    // config hot-reload also produces a complete runtime.
+                    sync_cache.clear();
+                    for (name, v) in &next {
+                        sync_cache.insert(name.clone(), v.clone());
                     }
+
+                    // Rebuild from the local manifest set plus every uploaded module,
+                    // so file-configured plugins (dev, site.waf.plugins) survive too.
+                    let current = plugin_sync_cfg.load_full();
+                    let (rt, loaded, rejected) =
+                        match build_full_plugin_runtime(&current, &sync_cache) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                warn!("plugin sync: runtime build failed: {e:#}");
+                                continue;
+                            }
+                        };
                     plugin_sync_swap.store(Arc::new(rt));
                     have = next;
-                    loaded.sort();
                     info!(
                         plugins = loaded.len(),
                         rejected, active = %loaded.join(","),
@@ -3951,6 +3979,43 @@ fn build_plugin_runtime(cfg: &SentinelConfig) -> anyhow::Result<PluginRuntime> {
     Ok(rt)
 }
 
+/// Cache of plugins uploaded through the control plane: name → (sha256, module).
+///
+/// Shared between the plugin-sync task (which fills it) and the config hot-reload
+/// watcher (which reads it). Both rebuild the plugin runtime, and a rebuild that
+/// knows only about manifest plugins silently DROPS every uploaded one — so both
+/// must build from the same complete picture.
+type UploadedPlugins = Arc<DashMap<String, (String, Vec<u8>)>>;
+
+/// Build a plugin runtime holding BOTH manifest-configured and uploaded plugins.
+///
+/// Every rebuild must go through here. Calling `build_plugin_runtime` directly and
+/// swapping the result in unloads all uploaded plugins, which is a silent
+/// protection outage: the module is still installed and enabled in the UI, the
+/// node reports no error, and the plugin simply stops running.
+fn build_full_plugin_runtime(
+    cfg: &SentinelConfig,
+    uploaded: &UploadedPlugins,
+) -> anyhow::Result<(PluginRuntime, Vec<String>, usize)> {
+    let mut rt = build_plugin_runtime(cfg)?;
+    let mut loaded = Vec::new();
+    let mut rejected = 0usize;
+    for entry in uploaded.iter() {
+        let (name, (_, wasm)) = (entry.key(), entry.value());
+        match rt.load_plugin(name, wasm) {
+            Ok(()) => loaded.push(name.clone()),
+            Err(e) => {
+                // A module that will not compile is skipped individually rather
+                // than taking the whole plugin set down with it.
+                warn!(plugin = %name, "uploaded plugin failed to compile: {e:#}");
+                rejected += 1;
+            }
+        }
+    }
+    loaded.sort();
+    Ok((rt, loaded, rejected))
+}
+
 // ---------------------------------------------------------------------------
 // IP feed loader helpers
 // ---------------------------------------------------------------------------
@@ -5588,13 +5653,22 @@ fn explain_event(ctx: &RequestContext, action: &str, rule: &str, attack: &str) -
 
     // What was found, and where.
     let finding = match top {
-        Some(m) => format!(
+        // An empty target is normal, not a bug: the rule engine records one only
+        // when a rule inspected exactly ONE part of the request, because naming a
+        // guessed target would send an operator to exclude something that never
+        // fired. Say "in <target>" when it is known and omit the clause when it is
+        // not, rather than emitting "in  (rule …)".
+        Some(m) if !m.target.is_empty() => format!(
             "{} in {} (rule {}, severity {:?}, detected during {})",
             attack,
             humanize_target(&m.target),
             m.rule_id,
             m.severity,
             m.phase
+        ),
+        Some(m) => format!(
+            "{} (rule {}, severity {:?}, detected during {})",
+            attack, m.rule_id, m.severity, m.phase
         ),
         None => {
             let reason = ctx.block_reason.as_deref().unwrap_or("").trim();
@@ -5645,17 +5719,32 @@ fn explain_event(ctx: &RequestContext, action: &str, rule: &str, attack: &str) -
         String::new()
     } else if is_rule_hit {
         let m = top.expect("is_rule_hit implies a match");
-        format!(
-            "If this is legitimate traffic, exclude rule {} for {} on site '{}' \
-             (Sites → {} → Learning Report → Disable), or raise the site's anomaly threshold above \
-             {}. Confirm against the source IP and payload before excluding — an exclusion applies \
-             to every future request for that target.",
-            m.rule_id,
-            humanize_target(&m.target),
-            site,
-            site,
-            ctx.anomaly_score.max(1)
-        )
+        // With a known target the advice can be specific; without one it must not
+        // invent a parameter to exclude.
+        if m.target.is_empty() {
+            format!(
+                "If this is legitimate traffic, disable rule {} for site '{}' (Sites → {} → \
+                 Learning Report → Disable), or raise the site's anomaly threshold above {}. This \
+                 rule inspected more than one part of the request, so the exact field is not \
+                 recorded — check the payload before excluding anything.",
+                m.rule_id,
+                site,
+                site,
+                ctx.anomaly_score.max(1)
+            )
+        } else {
+            format!(
+                "If this is legitimate traffic, exclude rule {} for {} on site '{}' \
+                 (Sites → {} → Learning Report → Disable), or raise the site's anomaly threshold \
+                 above {}. Confirm against the source IP and payload before excluding — an \
+                 exclusion applies to every future request for that target.",
+                m.rule_id,
+                humanize_target(&m.target),
+                site,
+                site,
+                ctx.anomaly_score.max(1)
+            )
+        }
     } else {
         match rule {
             "RATELIMIT" => format!(
