@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net"
 	"net/http"
@@ -1054,6 +1055,26 @@ func internalSecretOK(c *gin.Context) bool {
 // REST port must not leak site topology (upstreams, rules) to anyone who can
 // reach it. Returns the sites in a format the proxy deserializes into
 // Vec<SiteConfig>.
+// siteSetFingerprint derives a stable freshness signal from the site set itself.
+//
+// Used when the DB-derived config counter (migration 0012) is unavailable. FNV-1a
+// over the canonical JSON encoding: encoding/json sorts map keys, so the same set
+// of sites always hashes to the same value, and any real change — a new site, an
+// edited upstream, a policy tweak — changes it. Masked to 63 bits so the value is
+// always positive, since the data plane parses it as an unsigned version.
+func siteSetFingerprint(sites []map[string]any) int64 {
+	b, err := json.Marshal(sites)
+	if err != nil {
+		// Cannot hash what will not marshal. Return a constant rather than a
+		// timestamp: a constant means "no detectable change", which is the safer
+		// failure here — the alternative churns the rule engine forever.
+		return 1
+	}
+	h := fnv.New64a()
+	_, _ = h.Write(b)
+	return int64(h.Sum64() & 0x7fffffffffffffff)
+}
+
 func handleInternalConfig(c *gin.Context, store *db.Store, log *zap.Logger) {
 	if !internalSecretOK(c) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
@@ -1110,7 +1131,21 @@ func handleInternalConfig(c *gin.Context, store *db.Store, log *zap.Logger) {
 	// stale version — it still receives the correct DB-backed site list above.
 	version, verr := store.ConfigVersion(c.Request.Context())
 	if verr != nil {
-		version = time.Now().UnixNano()
+		// The old fallback was time.Now().UnixNano(), reasoning that re-syncing beats
+		// latching a stale version. That is right for a TRANSIENT read error and badly
+		// wrong for a PERMANENT one: where migration 0012 has not been applied,
+		// sentinel_config_version() does not exist, so EVERY poll returned a new
+		// version and every data-plane node re-synced and rebuilt its entire rule
+		// engine — measured at 1,268 rules every 5 seconds, indefinitely, on a
+		// completely idle system.
+		//
+		// A content hash fixes both horns: it changes when, and only when, the site
+		// set actually changes. Propagation stays correct, the churn stops, and it
+		// needs nothing from the database.
+		version = siteSetFingerprint(rustSites)
+		log.Warn("config version unavailable — using a content hash of the site set "+
+			"instead (apply migration 0012 for the shared DB-derived counter)",
+			zap.Error(verr), zap.Int64("fingerprint", version))
 	}
 	resp := gin.H{
 		"version": version,

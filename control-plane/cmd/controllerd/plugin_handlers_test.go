@@ -233,3 +233,32 @@ func TestPluginNameRegex(t *testing.T) {
 		require.False(t, pluginNameRe.MatchString(bad), "should reject %q", bad)
 	}
 }
+
+// The config-version fallback must be STABLE for an unchanged site set. The
+// previous fallback was time.Now().UnixNano(), so every poll looked like a config
+// change and every data-plane node rebuilt its entire rule engine every 5 seconds
+// — 1,268 rules, indefinitely, on an idle system.
+func TestSiteSetFingerprintIsStableAndChangeSensitive(t *testing.T) {
+	sites := []map[string]any{
+		{"id": "juice", "domains": []string{"juice.local"}, "upstream": "10.0.0.1:3000"},
+		{"id": "dvwa", "domains": []string{"dvwa.local"}, "upstream": "10.0.0.2:80"},
+	}
+	first := siteSetFingerprint(sites)
+	require.Equal(t, first, siteSetFingerprint(sites),
+		"an unchanged site set must hash identically — otherwise every poll is a false config change")
+	require.Positive(t, first, "the data plane parses the version as unsigned")
+
+	// A real change must be detected.
+	changed := []map[string]any{
+		{"id": "juice", "domains": []string{"juice.local"}, "upstream": "10.0.0.9:3000"},
+		{"id": "dvwa", "domains": []string{"dvwa.local"}, "upstream": "10.0.0.2:80"},
+	}
+	require.NotEqual(t, first, siteSetFingerprint(changed), "an edited upstream must change the fingerprint")
+
+	// Adding and removing a site both register.
+	require.NotEqual(t, first, siteSetFingerprint(sites[:1]))
+	require.NotEqual(t, first, siteSetFingerprint(append(sites, map[string]any{"id": "new"})))
+
+	// Empty is stable too (a deployment with no sites must not churn).
+	require.Equal(t, siteSetFingerprint(nil), siteSetFingerprint(nil))
+}
