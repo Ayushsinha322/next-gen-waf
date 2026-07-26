@@ -125,16 +125,16 @@ func sendSyslog(ctx context.Context, ch Channel, a Alert) error {
 func sendCEF(ctx context.Context, ch Channel, a Alert) error {
 	// CEF:Version|Vendor|Product|Version|SignatureID|Name|Severity|Extension
 	ext := cefExtension(map[string]string{
-		"src":          a.SourceIP,
-		"cs1Label":     "site",
-		"cs1":          a.Site,
-		"cs2Label":     "rule",
-		"cs2":          a.Rule,
-		"cs3Label":     "kind",
-		"cs3":          a.Kind,
-		"cnt":          itoa(a.Count),
-		"externalId":   a.ID,
-		"rt":           itoa64(a.CreatedAt.UnixMilli()),
+		"src":        a.SourceIP,
+		"cs1Label":   "site",
+		"cs1":        a.Site,
+		"cs2Label":   "rule",
+		"cs2":        a.Rule,
+		"cs3Label":   "kind",
+		"cs3":        a.Kind,
+		"cnt":        itoa(a.Count),
+		"externalId": a.ID,
+		"rt":         itoa64(a.CreatedAt.UnixMilli()),
 	})
 	cef := fmt.Sprintf("CEF:0|Sentinel|WAF|1.0|%s|%s|%d|%s",
 		cefEscapeHeader(nonEmpty(a.Kind, "alert")),
