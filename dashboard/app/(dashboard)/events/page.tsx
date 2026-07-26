@@ -8,7 +8,8 @@
 import { useState, useEffect, useCallback } from "react";
 import { motion } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
-import { api, type WafEvent, type TimelineBucket, type EventQuery } from "@/lib/api";
+import { api, type WafEvent, type TimelineBucket, type EventQuery, type Site } from "@/lib/api";
+import EventDrawer from "@/components/events/EventDrawer";
 import { staggerContainer, fadeUp, cardVariants } from "@/lib/animations";
 
 const RANGES: { label: string; secs: number }[] = [
@@ -29,6 +30,10 @@ export default function EventsPage() {
   const [protocolFacets, setProtocolFacets] = useState<{ key: string; count: number }[]>([]);
   const [loading, setLoading] = useState(true);
   const [rangeSecs, setRangeSecs] = useState(86400);
+  // Row drill-down. Sites are fetched once so the drawer can map an event's
+  // site NAME onto the site ID the exclusion endpoint is keyed by.
+  const [selected, setSelected] = useState<WafEvent | null>(null);
+  const [sites, setSites] = useState<Site[]>([]);
 
   // active filters
   const [q, setQ] = useState("");
@@ -67,6 +72,18 @@ export default function EventsPage() {
   }, [rangeSecs, q, site, rule, action, ip, protocol]);
 
   useEffect(() => { run(); }, [rangeSecs]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Site list for the detail drawer. Events carry a site NAME; the exclusion
+  // endpoint is keyed by site ID, so the drawer needs the mapping. Fetched once
+  // and deliberately non-fatal — a failure here must not break Threat Search,
+  // it only disables the policy action in the drawer.
+  useEffect(() => {
+    let alive = true;
+    api.sites.list()
+      .then(r => { if (alive) setSites(r.sites ?? []); })
+      .catch(() => { /* drawer degrades to read-only */ });
+    return () => { alive = false; };
+  }, []);
 
   const maxBucket = Math.max(1, ...timeline.map(b => b.total));
   const clearFilters = () => { setQ(""); setSite(""); setRule(""); setAction(""); setIp(""); setProtocol(""); run({ q: "", site: "", rule: "", action: "", ip: "", protocol: "" }); };
@@ -150,9 +167,12 @@ export default function EventsPage() {
               <div className="tw" style={{ maxHeight: 520, overflow: "auto" }}>
                 {events.length === 0 ? <Empty text={loading ? "Searching…" : "No events match these filters in this window."} /> : (
                   <table>
-                    <thead><tr><th>Time</th><th>IP</th><th>Site</th><th>Method</th><th>Proto</th><th>Path</th><th>Rule</th><th>Sev</th><th>Action</th><th>Status</th></tr></thead>
+                    <thead><tr><th>Time</th><th>IP</th><th>Site</th><th>Method</th><th>Proto</th><th>Path</th><th>Rule</th><th>Sev</th><th>Action</th><th>Status</th><th aria-label="detail" /></tr></thead>
                     <tbody>{events.map((e, i) => (
-                      <tr key={i}>
+                      <tr key={i}
+                          onClick={() => setSelected(e)}
+                          style={{ cursor: "pointer" }}
+                          title="Open event detail">
                         <td className="td3" style={{ whiteSpace: "nowrap" }}>{fmtTime(e.ts)}</td>
                         <td className="td2">{e.ip}{e.country ? ` (${e.country})` : ""}</td>
                         <td className="td3">{e.site}</td>
@@ -163,6 +183,7 @@ export default function EventsPage() {
                         <td><span className={`bdg ${e.severity === "CRITICAL" ? "br" : e.severity === "HIGH" ? "ba" : "bcy"}`}>{e.severity || "—"}</span></td>
                         <td><span className={`bdg ${e.action === "BLOCK" ? "br" : "ba"}`}>{e.action}</span></td>
                         <td className="td3">{e.status || "—"}</td>
+                        <td className="td3" style={{ color: "var(--text3)" }} aria-hidden>›</td>
                       </tr>
                     ))}</tbody>
                   </table>
@@ -172,6 +193,7 @@ export default function EventsPage() {
           </div>
         </>
       )}
+      <EventDrawer event={selected} sites={sites} onClose={() => setSelected(null)} />
     </motion.div>
   );
 }

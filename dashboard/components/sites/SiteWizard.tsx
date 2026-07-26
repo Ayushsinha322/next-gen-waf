@@ -16,7 +16,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
-import { api, type Certificate } from "@/lib/api";
+import { api, type Certificate, type SiteConfigProblem } from "@/lib/api";
 import {
   SiteForm, emptyForm, applyPreset, formToPayload, PRESETS, CRS_CATEGORIES,
   ALL_CRS_KEYS, COUNTRIES, PresetKey, UpstreamServer, normalizeDomain,
@@ -184,6 +184,12 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
   // (e.g. an enterprise wildcard) without re-uploading per site.
   useEffect(() => { api.certs.list().then(r => setRepoCerts(r.certs ?? [])).catch(() => {}); }, []);
 
+  // Server-side dry run. The control plane exposes POST /sites/validate, which
+  // runs the SAME conversion functions the config sync runs — so a green result
+  // means the site will actually reach the proxy rather than silently vanish at
+  // sync time. It was fully implemented and had never been called by anything.
+  const [problems, setProblems] = useState<SiteConfigProblem[] | null>(null);
+  const [checking, setChecking] = useState(false);
   const steps = adv ? ADVANCED_STEPS : EASY_STEPS;
   const upd = (patch: Partial<SiteForm>) => setForm(f => ({ ...f, ...patch }));
 
@@ -191,6 +197,20 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
     if (!adv) return ["basics", "front", "proxy", "protect", "review"][step];
     return ["basics", "front", "proxy", "rules", "apisec", "rate", "antibot", "geoip", "headers", "advanced", "review"][step];
   }, [adv, step]);
+
+  // Dry-run on entering Review. Non-fatal: if the endpoint is unreachable the
+  // wizard still lets you deploy — this is a pre-flight check, not a gate that
+  // should strand an operator when the control plane is having a bad minute.
+  useEffect(() => {
+    if (screen !== "review") { setProblems(null); return; }
+    let alive = true;
+    setChecking(true);
+    api.sites.validate({ ...formToPayload(form), ...(siteId ? { site_id: siteId } : {}) })
+      .then(r => { if (alive) setProblems(r.problems ?? []); })
+      .catch(() => { if (alive) setProblems(null); })
+      .finally(() => { if (alive) setChecking(false); });
+    return () => { alive = false; };
+  }, [screen]); // eslint-disable-line react-hooks/exhaustive-deps
 
   function setServer(i: number, patch: Partial<UpstreamServer>) {
     upd({ servers: form.servers.map((s, idx) => idx === i ? { ...s, ...patch } : s) });
@@ -268,7 +288,6 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
   const toggleMethod = (m: string) => upd({ allowed_methods: form.allowed_methods.includes(m) ? form.allowed_methods.filter(x => x !== m) : [...form.allowed_methods, m] });
 
   const scheme = form.front_https ? "https" : "http";
-  const frontPort = form.front_https ? 9443 : 9080;
   const primary = form.servers[0] ?? { host: "127.0.0.1", port: 8080, weight: 1, tls: false };
 
   return (
@@ -313,7 +332,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
             })}
           </div>
           <div style={{ marginTop: "auto", paddingTop: 16, fontSize: 11, color: "var(--text3)", fontFamily: "var(--font-mono)", lineHeight: 1.6 }}>
-            💡 Public traffic enters on <span style={{ color: "var(--cyan)" }}>{scheme}://:{frontPort}</span> and is proxied to your upstreams.
+            💡 Public traffic enters on the WAF&rsquo;s <span style={{ color: "var(--cyan)" }}>{scheme}</span> listener and is proxied to your upstreams.
           </div>
         </div>
 
@@ -364,9 +383,25 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
 
                 {/* ───────── FRONT SERVICE (exposure + full TLS) ───────── */}
                 {screen === "front" && (<>
-                  <StepHead title="Front Service" sub="The public, client-facing side of this site: how it's exposed and its TLS certificate." tag="enforced" />
+                  <StepHead title="Front Service" sub="The public, client-facing side of this site: how it's exposed and its TLS certificate." tag="stored" />
 
-                  {/* exposure */}
+                  {/* exposure
+                      These five toggles are STORED, not enforced per site, and the
+                      step is tagged accordingly. Verified: front_https, force_https
+                      and hsts appear nowhere in the control plane's config builder
+                      or in the Rust SiteConfig, and http2/http3 exist only as
+                      LISTENER protocol sets — there is no per-site plumbing for any
+                      of them. The step previously carried "● Enforced", which put a
+                      false claim on two compliance line-items (HTTPS redirect and
+                      HSTS). The TLS certificate block below IS applied. */}
+                  <InfoBox tone="amber">
+                    <strong>Saved with the site, not yet enforced per site.</strong> TLS
+                    termination and the HTTP protocol set are properties of the WAF
+                    <em> listener</em>, shared by every site on this node — these
+                    switches record your intent but do not currently change how this
+                    site is served. The TLS certificate you choose below <em>is</em>
+                    applied. Per-site exposure is on the roadmap.
+                  </InfoBox>
                   <Row cols={adv ? "1fr 1fr" : "1fr 1fr"}>
                     <SectionToggle label="Serve HTTPS" desc="Terminate TLS on the public listener" on={form.front_https} set={v => upd({ front_https: v })} />
                     <SectionToggle label="Force HTTPS redirect" desc="301 plain HTTP → HTTPS" on={form.force_https} set={v => upd({ force_https: v })} />
@@ -382,10 +417,25 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                       ? <InfoBox tone="amber">Add a domain in <strong>Basics</strong> to see the public endpoint.</InfoBox>
                       : form.domains.map(d => (
                         <span key={d} style={{ padding: "5px 11px", borderRadius: 8, background: "rgba(0,212,255,.06)", border: "1px solid rgba(0,212,255,.18)", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--cyan)" }}>
-                          {scheme}://{d}<span style={{ color: "var(--text3)" }}> → :{frontPort}</span>
+                          {scheme}://{d}
                         </span>
                       ))}
                   </div>
+                  {/* This used to append "→ :9443" (or :9080). Both were wrong, and
+                      9443 was actively unsafe advice: it is the MANAGEMENT listener
+                      (role: management in sentinel.proxy.yaml) which bypasses the WAF
+                      pipeline and serves the admin console. Customer traffic is served
+                      by the http/https listeners, and the port a client actually dials
+                      is the PUBLISHED port, which the dashboard cannot know from here —
+                      compose maps 8080→80 and 8443→443. So we show the endpoint the
+                      customer uses and state the listener facts rather than guessing. */}
+                  {form.domains.length > 0 && (
+                    <div style={{ fontSize: "var(--fs-label)", color: "var(--text3)", marginTop: 8, lineHeight: 1.6 }}>
+                      Point this domain&rsquo;s DNS at the WAF node. Traffic is served by the{" "}
+                      <code style={{ fontFamily: "var(--font-mono)" }}>{form.front_https ? "https" : "http"}</code>{" "}
+                      listener — never the management port, which serves this console only.
+                    </div>
+                  )}
 
                   {/* TLS mode */}
                   <GroupLabel>TLS Certificate</GroupLabel>
@@ -910,11 +960,33 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                 {screen === "review" && (
                   <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
                     <StepHead title="Review" sub={`Confirm your configuration, then ${mode === "edit" ? "save changes" : "deploy"}. Protection activates in ~5s.`} />
+                  {checking && (
+                    <InfoBox tone="cyan">Validating this configuration against the data-plane converter…</InfoBox>
+                  )}
+                  {!checking && problems !== null && problems.length === 0 && (
+                    <InfoBox tone="green">
+                      <strong>Configuration valid.</strong> The control plane converted this
+                      site successfully, so it will reach the proxy on the next sync.
+                    </InfoBox>
+                  )}
+                  {!checking && problems !== null && problems.length > 0 && (
+                    <InfoBox tone="amber">
+                      <strong>{problems.length} problem{problems.length > 1 ? "s" : ""} found.</strong>{" "}
+                      This site would not protect anything until they are fixed:
+                      <ul style={{ margin: "8px 0 0", paddingLeft: 18, lineHeight: 1.7 }}>
+                        {problems.map((pr, i) => (
+                          <li key={i}>
+                            <code style={{ fontFamily: "var(--font-mono)" }}>{pr.field}</code> — {pr.problem}
+                          </li>
+                        ))}
+                      </ul>
+                    </InfoBox>
+                  )}
                     {[
                       ["Name", form.name || "—"],
                       ["Domains", form.domains.join(", ") || "—"],
                       ["Mode", form.mode.toUpperCase()],
-                      ["Public", `${scheme}://:${frontPort}${form.force_https ? " · force-https" : ""}${form.http2 ? " · h2" : ""}${form.http3 ? " · h3" : ""}`],
+                      ["Public", `${scheme}${form.force_https || form.http2 || form.http3 ? ` · recorded: ${[form.force_https && "force-https", form.http2 && "h2", form.http3 && "h3"].filter(Boolean).join(" · ")}` : ""}`],
                       ["TLS", form.tls_mode === "off" || !form.front_https ? "off" : form.tls_mode === "auto" ? `auto · ${form.acme_staging ? "staging" : form.acme_provider} · ${form.acme_challenge}${form.acme_wildcard ? " · wildcard" : ""}` : form.tls_mode === "existing" ? `repository · ${form.tls_existing_cert || "—"}` : `custom (${form.custom_priority})`],
                       ["Upstreams", form.servers.map(s => `${s.host}:${s.port}${s.tls ? " (TLS)" : ""}`).join(", ")],
                       ["Load Balancer", form.lb],

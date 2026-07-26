@@ -3,6 +3,7 @@ import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
+import ConfigHistory from "@/components/sites/ConfigHistory";
 import { openModal } from "@/components/ui/Modal";
 import { api, type Site } from "@/lib/api";
 import { staggerContainer, cardVariants, fadeUp, spring } from "@/lib/animations";
@@ -27,6 +28,7 @@ export default function SitesPage() {
   const router = useRouter();
   const [sites, setSites]         = useState<Site[]>([]);
   const [loading, setLoading]     = useState(true);
+  const [showHistory, setShowHistory] = useState(false);
   const [search, setSearch]       = useState("");
   const [modeFilter, setModeFilter] = useState("");
   const [wizard, setWizard]       = useState<{ mode: "create" | "edit"; siteId?: string; initial?: SiteForm } | null>(null);
@@ -62,7 +64,13 @@ export default function SitesPage() {
     const host       = normalizeDomain(domain) || domain;
     const upstream   = upHost ? `${upHost}${upPort ? `:${upPort}` : ""}` : "the upstream";
     const hostsEntry = `127.0.0.1  ${host}`;
-    const browseURL  = `http://${host}:9080/`;
+    // The browse URL used to be hardcoded to :9080, which is not a listener at
+    // all — the data plane binds 8080 (http), 8443 (https) and 9443 (the
+    // management console, which bypasses the WAF pipeline entirely and must
+    // never be handed to a customer as a traffic endpoint). Which port a client
+    // actually dials is the PUBLISHED port, and compose maps 8080→80 and
+    // 8443→443, so the correct instruction is the plain URL.
+    const browseURL  = `http://${host}/`;
     openModal({
       title: "🚀 Site Deployed — Next Steps",
       body: (
@@ -83,7 +91,7 @@ export default function SitesPage() {
             </div>
           </div>
           <div>
-            <div style={{ fontSize: 14, color: "var(--text2)", marginBottom: 6, fontFamily: "var(--font-mono)", letterSpacing: 1 }}>STEP 2 — Browse through the WAF proxy (port 9080)</div>
+            <div style={{ fontSize: 14, color: "var(--text2)", marginBottom: 6, fontFamily: "var(--font-mono)", letterSpacing: 1 }}>STEP 2 — Browse through the WAF (not the origin)</div>
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
               <code style={{ flex: 1, padding: "8px 12px", background: "rgba(0,0,0,.35)", border: "1px solid rgba(255,255,255,.08)", borderRadius: "var(--r2)", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--green)" }}>
                 {browseURL}
@@ -199,6 +207,7 @@ export default function SitesPage() {
         <div style={{ display: "flex", gap: 8 }}>
           <motion.button className="btn bg-btn btn-sm" onClick={loadSites} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>⟳ Refresh</motion.button>
           <motion.button className="btn bg-btn btn-sm" onClick={exportYaml} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }} title="Download all sites as YAML">📤 Export</motion.button>
+          <motion.button className="btn bg-btn btn-sm" onClick={() => setShowHistory(true)} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }} title="Snapshots taken before every site change — restore one to undo a bad edit">🕘 History</motion.button>
           <motion.button className="btn bg-btn btn-sm" onClick={openImport} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }} title="Import sites from YAML">📥 Import</motion.button>
           <motion.button className="btn bp btn-sm" onClick={openCreate} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>＋ Add Site</motion.button>
         </div>
@@ -386,6 +395,17 @@ export default function SitesPage() {
             initial={wizard.initial}
             onClose={() => setWizard(null)}
             onSaved={onWizardSaved}
+          />
+        )}
+      </AnimatePresence>
+
+      {/* Configuration rollback. The snapshots have always been written; this is
+          the first surface that can reach them. */}
+      <AnimatePresence>
+        {showHistory && (
+          <ConfigHistory
+            onClose={() => setShowHistory(false)}
+            onRestored={loadSites}
           />
         )}
       </AnimatePresence>

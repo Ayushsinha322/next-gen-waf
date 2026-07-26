@@ -202,6 +202,23 @@ export interface WafEvent {
   protocol?: string; // h1 | h2 | h3
 }
 
+/** One configuration rollback point (control-plane db.ConfigVersionSummary). */
+export interface ConfigVersionSummary {
+  id:         number;
+  generation: number;
+  reason:     string;   // e.g. "site.update", "site.delete"
+  site_count: number;
+  created_by?: string;
+  created_at: string;   // RFC3339
+}
+
+/** One reason a site configuration would not survive conversion to the
+ *  data-plane shape (control-plane SiteConfigProblem). */
+export interface SiteConfigProblem {
+  field:   string;      // JSON path, e.g. "upstream.servers"
+  problem: string;
+}
+
 export interface TimelineBucket { ts: number; total: number; blocked: number }
 
 /** One time bucket of the threat-detection trend, split by severity band
@@ -486,6 +503,15 @@ export const api = {
       apiFetch<{ ok: boolean; status: string }>(`/sites/${id}/status`, {
         method: "PATCH", body: JSON.stringify({ status }),
       }),
+    /** Dry-run a site configuration.
+     *
+     * Runs the same conversion the config sync runs, so a green result means the
+     * site will actually reach the proxy rather than silently vanish at sync
+     * time. Pass site_id to validate a partial update against the stored site. */
+    validate: (body: Record<string, unknown>) =>
+      apiFetch<{ valid: boolean; problems: SiteConfigProblem[]; resolved: { name: string; domains: string[] } }>(
+        "/sites/validate", { method: "POST", body: JSON.stringify(body) }),
+
     /** Add (or update) a rule exclusion on a site — learning-report tuning.
      *  Omit exclude_targets to disable the whole rule (the common case). */
     addExclusion: (id: string, body: { rule_id: number; exclude_targets?: string[]; disable?: boolean }) =>
@@ -595,6 +621,25 @@ export const api = {
 
   audit: {
     list: () => apiFetch<{ entries: AuditEntry[]; tenant_id: string }>("/audit"),
+  },
+
+  /** Configuration rollback points.
+   *
+   * The control plane has been writing a snapshot before every site mutation
+   * since config_versions landed, and exposing list + rollback endpoints, with
+   * no client ever calling them — the storage cost was already being paid for a
+   * feature nobody could reach. "What happens when a config change breaks
+   * production" is the first question an enterprise buyer asks. */
+  config: {
+    versions: (limit?: number) =>
+      apiFetch<{ versions: ConfigVersionSummary[] }>(
+        `/config/versions${limit ? `?limit=${limit}` : ""}`),
+    /** Restore a snapshot. Returns what it could and could not put back:
+     *  sites created after the snapshot are left alone, sites deleted since are
+     *  not re-created — both surfaced in `skipped` and `note`. */
+    rollback: (id: number) =>
+      apiFetch<{ restored_sites: number; skipped: string[]; version_id: number; note: string }>(
+        `/config/versions/${id}/rollback`, { method: "POST" }),
   },
 
   waf: {
