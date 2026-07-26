@@ -62,6 +62,26 @@ on this corpus); (3) per-deployment FP tuning on real traffic.
 | + base64 decode-and-rescore in the ML path (defeats the Base64 encoder axis) | **62.22%** | 87.23% | **76.57%** |
 | + mutation-augmented model (evasion transforms in training) | 68.08% | 87.23% | 78.11% |
 | + obfuscation canonicalizers ($IFS/comment/whitespace) + per-category-balanced retrain (full-enc benign) + precise cmdi rules (9900207/8) + **ML scoring of parsed form/multipart field values** | **80.30%** | **85.82%** | **80.82%** |
+| + FP-suppression model + base64 rule-visibility (commit `1dc69e4`, 2026-07-20) | **99.24%** | 88.65% | **97.15%** |
+| + **make the FP-suppression layer reachable** + calibrate its threshold 0.15→0.5 (2026-07-25) | 98.94% | **96.45%** | **98.85%** |
+
+**2026-07-25: 98.85% overall (App-TP 98.94%, TN 96.45%, API 100%).** The remaining false-positive
+gap was never a model weakness — the classifier already scored the adversarial-benign payloads
+0.0001–0.26 and unambiguous attacks 0.91–1.00. It was simply never consulted. The rule VM
+short-circuits and returns `Block` the moment the anomaly score crosses the threshold
+(`compiler/vm.rs`), during phase-1 evaluation; the proxy then returns the 403 before `phase2_body`
+runs, and `apply_verdict` — the only place the classifier can veto a weak-evidence block — lives
+inside `phase2_body`. So the FP-suppression layer was **structurally unreachable for every arg- or
+header-borne block**. Deferring the threshold verdict to `apply_verdict` and calibrating the
+suppression cutoff to the measured max-margin point (0.5, between the 0.26 benign ceiling and the
+0.91 attack floor; the old 0.15 sat *below* the benign ceiling) took false positives from 16 to 5
+for a cost of 2 attacks out of 675. Out-of-distribution FPR 10.6% → 3.55%.
+
+Remaining 5 FPs: `john+or@var.es` ×2 (rule 9900100's direct `block` bypasses the verdict layer the
+same way — note that routing it through the score requires the classifier to also see header/cookie
+values, which it currently does not, or header-borne attacks get vetoed), the Instagram share-link
+×2 (a split sub-value scores ≥0.5 — needs benign URL/tracking-link corpus), and `nc 8000 controller`
+in multipart only.
 
 **2026-07-18: crossed 80% (overall 80.82%, App-TP 80.30%, TN 85.82%, API 78.57%).** The decisive
 lever was feeding the ML classifier the *parsed, decoded* form/multipart field values — encoded

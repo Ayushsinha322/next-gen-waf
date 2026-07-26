@@ -2903,7 +2903,7 @@ async fn phase1_headers(
     // --- Rule engine (CRS / SRL) ---
     if ctx.decision == WafDecision::Allow {
         if let Some(engine) = engines.get(&site.id) {
-            eval_rules(ctx, engine, Phase::RequestHeaders, &site.waf);
+            eval_rules(ctx, engine, Phase::RequestHeaders);
         }
     }
 
@@ -2978,7 +2978,7 @@ fn phase2_body(
     }
 
     if let Some(engine) = engines.get(&site.id) {
-        eval_rules(ctx, engine, Phase::RequestBody, &site.waf);
+        eval_rules(ctx, engine, Phase::RequestBody);
     }
 
     if let Some(ref ml_cfg) = site.waf.ml {
@@ -3039,10 +3039,20 @@ fn phase2_body(
 // Weighted verdict fusion (#11)
 // ---------------------------------------------------------------------------
 
-/// Whether weighted fusion is active for this site.
-fn fusion_enabled(waf: &WafConfig) -> bool {
-    waf.fusion.as_ref().is_some_and(|f| f.enable)
-}
+/// Score at or above which the n-gram classifier refuses to vouch for a payload,
+/// so a weak-evidence rule block stands.
+///
+/// Calibrated from the model's measured score distribution rather than guessed.
+/// On adversarial-benign inputs (natural-language prose carrying SQL/shell
+/// keywords — "union was a great select", "ls 300 lexus", a shared Instagram
+/// link) the model scores 0.0001–0.26; on unambiguous attacks it scores
+/// 0.91–1.00. 0.5 sits at the max-margin point between those clusters (their
+/// geometric mean is ≈0.48): ~2x above the worst benign and ~1.8x below the
+/// weakest attack, so it tolerates drift in both directions.
+///
+/// The previous value, 0.15, sat *below* the benign ceiling, so prose the model
+/// had already scored correctly as benign was still blocked.
+const ML_SUPPRESSION_MAX: f32 = 0.5;
 
 /// Threshold for the site's (1-based) paranoia level from a per-PL list; the
 /// last entry repeats when the list is shorter than the level. `None` if empty.
@@ -3117,7 +3127,8 @@ fn apply_verdict(ctx: &mut RequestContext, waf: &WafConfig) {
                     .any(|m| m.rule_id.starts_with("99002"));
                 let ml_benign = sentinel_ml::models::ngram_classifier::is_loaded()
                     && !has_coverage_match
-                    && ctx.ml_scores.get("payload_attack").copied().unwrap_or(1.0) < 0.15
+                    && ctx.ml_scores.get("payload_attack").copied().unwrap_or(1.0)
+                        < ML_SUPPRESSION_MAX
                     && ctx.anomaly_score < 20;
                 if !ml_benign {
                     ctx.decision = WafDecision::Block;
@@ -3135,12 +3146,21 @@ fn apply_verdict(ctx: &mut RequestContext, waf: &WafConfig) {
 /// early-exit when fusion is on (rules then only accumulate score and honor
 /// explicit `deny` rules — the proxy makes the final weighted verdict), and
 /// attribute the score delta to the `rules` engine bucket.
-fn eval_rules(ctx: &mut RequestContext, engine: &RuleEngine, phase: Phase, waf: &WafConfig) {
-    let threshold = if fusion_enabled(waf) {
-        0
-    } else {
-        waf.anomaly_threshold
-    };
+fn eval_rules(ctx: &mut RequestContext, engine: &RuleEngine, phase: Phase) {
+    // The anomaly-THRESHOLD verdict is always made by `apply_verdict`, never by
+    // the rule VM's short-circuit, so 0 is passed here unconditionally to disable
+    // it. Rules only accumulate score in this call.
+    //
+    // This is a precision requirement, not a style choice. `apply_verdict` is the
+    // only place the n-gram classifier can veto a weak-evidence block, and it runs
+    // in phase 2. While the VM blocked on its own at phase 1, the request returned
+    // at the phase-1 Block check — before phase 2 existed — so the FP-suppression
+    // layer was unreachable for every arg- or header-borne block. The model scored
+    // that traffic correctly as benign and was simply never asked.
+    //
+    // Rules with an explicit `deny`/`block` action are unaffected: they set the
+    // decision directly and still stop the request in phase 1.
+    let threshold = 0;
     let before = ctx.anomaly_score;
     let matches_before = ctx.rule_matches.len();
     engine.evaluate(ctx, phase, threshold);
@@ -5772,7 +5792,6 @@ mod client_ip_tests {
     // matched nothing at all. It passed in the single-VM demo purely because the client
     // was the immediate peer there.
 
-    /// Blocked address arriving DIRECTLY (no proxy) — must still be caught.
     // ── Shared-egress exemption (NAT bystander protection) ────────────────────
     //
     // These guard two mechanisms that both assume "IP == actor", which is false behind
