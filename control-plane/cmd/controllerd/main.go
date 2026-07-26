@@ -114,6 +114,14 @@ func run() error {
 	}
 	defer log.Sync()
 
+	// Install it as the global logger. Without this, zap.L() returns a NO-OP
+	// logger and every zap.L() call in the codebase is silently discarded — which
+	// included "audit write failed". A failure to append to the tamper-evident
+	// audit log was therefore invisible: the write failed, the HTTP request
+	// returned 200, and nothing was recorded anywhere. Handlers that hold no
+	// logger reference legitimately use zap.L(); it just has to point somewhere.
+	zap.ReplaceGlobals(log)
+
 	// ── JWT ───────────────────────────────────────────────────────────────────
 	jwtCfg := auth.DefaultJWTConfig()
 	jwtCfg.Secret = os.Getenv("SENTINEL_JWT_SECRET")

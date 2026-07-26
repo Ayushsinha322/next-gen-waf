@@ -171,46 +171,49 @@ SELECT id, tenant_id, name, version, description, author, hooks, permissions,
 // SetPluginEnabled flips a plugin in or out of the request path. Uses RETURNING
 // so a missing plugin is reported as ErrPluginNotFound rather than a silent
 // success — TenantTx.Exec surfaces no rows-affected count.
-func (s *Store) SetPluginEnabled(ctx context.Context, tenantID, userID, name string, enabled bool) error {
+//
+// Returns the plugin's UUID: audit_logs.target_id is a uuid column, so the audit
+// trail cannot be keyed on the name that identifies a plugin everywhere else.
+func (s *Store) SetPluginEnabled(ctx context.Context, tenantID, userID, name string, enabled bool) (string, error) {
 	tx, err := s.pool.BeginTenant(ctx, tenantID, userID)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer tx.Rollback(ctx)
 
-	var got string
+	var id string
 	err = tx.QueryRow(ctx,
 		`UPDATE plugins SET enabled = $3, updated_at = now()
-		  WHERE tenant_id = $1 AND name = $2 RETURNING name`,
-		tenantID, name, enabled).Scan(&got)
+		  WHERE tenant_id = $1 AND name = $2 RETURNING id`,
+		tenantID, name, enabled).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return ErrPluginNotFound
+		return "", ErrPluginNotFound
 	}
 	if err != nil {
-		return fmt.Errorf("store: set plugin enabled: %w", err)
+		return "", fmt.Errorf("store: set plugin enabled: %w", err)
 	}
-	return tx.Commit(ctx)
+	return id, tx.Commit(ctx)
 }
 
-// DeletePlugin removes a plugin entirely.
-func (s *Store) DeletePlugin(ctx context.Context, tenantID, userID, name string) error {
+// DeletePlugin removes a plugin entirely, returning its UUID for the audit trail.
+func (s *Store) DeletePlugin(ctx context.Context, tenantID, userID, name string) (string, error) {
 	tx, err := s.pool.BeginTenant(ctx, tenantID, userID)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer tx.Rollback(ctx)
 
-	var got string
+	var id string
 	err = tx.QueryRow(ctx,
-		`DELETE FROM plugins WHERE tenant_id = $1 AND name = $2 RETURNING name`,
-		tenantID, name).Scan(&got)
+		`DELETE FROM plugins WHERE tenant_id = $1 AND name = $2 RETURNING id`,
+		tenantID, name).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return ErrPluginNotFound
+		return "", ErrPluginNotFound
 	}
 	if err != nil {
-		return fmt.Errorf("store: delete plugin: %w", err)
+		return "", fmt.Errorf("store: delete plugin: %w", err)
 	}
-	return tx.Commit(ctx)
+	return id, tx.Commit(ctx)
 }
 
 // EnabledPlugin is the digest a data-plane node needs in order to decide whether

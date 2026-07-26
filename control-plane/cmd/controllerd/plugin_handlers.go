@@ -355,7 +355,8 @@ func handleUploadPlugin(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 		return
 	}
 
-	auditPlugin(store, claims.TenantID, claims.UserID, c, "plugin.install", row.Name, gin.H{
+	auditPlugin(store, claims.TenantID, claims.UserID, c, "plugin.install", row.ID, gin.H{
+		"name":    row.Name,
 		"version": row.Version,
 		"sha256":  row.SHA256,
 		"size":    row.SizeBytes,
@@ -396,7 +397,7 @@ func handleSetPluginEnabled(c *gin.Context, enf *rbac.Enforcer, store *db.Store)
 		return
 	}
 
-	err := store.SetPluginEnabled(c.Request.Context(), claims.TenantID, claims.UserID, name, *body.Enabled)
+	id, err := store.SetPluginEnabled(c.Request.Context(), claims.TenantID, claims.UserID, name, *body.Enabled)
 	if errors.Is(err, db.ErrPluginNotFound) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "plugin not found"})
 		return
@@ -411,7 +412,8 @@ func handleSetPluginEnabled(c *gin.Context, enf *rbac.Enforcer, store *db.Store)
 	if *body.Enabled {
 		action = "plugin.enable"
 	}
-	auditPlugin(store, claims.TenantID, claims.UserID, c, action, name, gin.H{"enabled": *body.Enabled})
+	auditPlugin(store, claims.TenantID, claims.UserID, c, action, id,
+		gin.H{"name": name, "enabled": *body.Enabled})
 
 	c.JSON(http.StatusOK, gin.H{
 		"name":    name,
@@ -437,7 +439,7 @@ func handleDeletePlugin(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 		return
 	}
 
-	err := store.DeletePlugin(c.Request.Context(), claims.TenantID, claims.UserID, name)
+	id, err := store.DeletePlugin(c.Request.Context(), claims.TenantID, claims.UserID, name)
 	if errors.Is(err, db.ErrPluginNotFound) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "plugin not found"})
 		return
@@ -447,7 +449,7 @@ func handleDeletePlugin(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 		respondStoreError(c, err)
 		return
 	}
-	auditPlugin(store, claims.TenantID, claims.UserID, c, "plugin.delete", name, nil)
+	auditPlugin(store, claims.TenantID, claims.UserID, c, "plugin.delete", id, gin.H{"name": name})
 	c.JSON(http.StatusOK, gin.H{"deleted": name})
 }
 
@@ -512,7 +514,10 @@ func handleInternalPluginWasm(c *gin.Context, store *db.Store) {
 // Detached from the request context for the same reason as the other audit
 // writers: the HTTP response usually returns first, which would cancel the
 // context and silently drop the row.
-func auditPlugin(store *db.Store, tenantID, userID string, c *gin.Context, action, name string, diff any) {
+// pluginID must be the row's UUID, not the plugin name: audit_logs.target_id is a
+// uuid column, so a name silently fails the insert and the mutation vanishes from
+// the tamper-evident trail. The name travels in `diff`, which is jsonb.
+func auditPlugin(store *db.Store, tenantID, userID string, c *gin.Context, action, pluginID string, diff any) {
 	if store == nil {
 		return
 	}
@@ -524,7 +529,7 @@ func auditPlugin(store *db.Store, tenantID, userID string, c *gin.Context, actio
 	}
 	ip := c.ClientIP()
 	ua := c.Request.UserAgent()
-	target := name
+	target := pluginID
 	actor := userID
 	req := db.WriteAuditRequest{
 		TenantID:    tenantID,
