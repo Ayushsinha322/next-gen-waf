@@ -45,7 +45,11 @@ These are the "never actually run" gaps from the readiness audit. Cheap, but the
 ## Phase 2 — Shadow-mode pilot ★ (the real deployment gate)
 
 You cannot flip blocking mode on real traffic until you've measured the **real-traffic** false-positive rate.
-GoTestWAF's 10.64% is an adversarial corpus, not your traffic.
+GoTestWAF's benign corpus is adversarial and synthetic — it is not your traffic. As of 2026-07-26 we score
+99.29% true-negative on it (0.71% FPR), which says the engine is well calibrated and says nothing about
+whether blocking breaks a real login flow.
+
+**Runbook: `deploy/LEARNING-MODE-PILOT.md`. Measurement tool: `deploy/load-test/fpr-report.sh`.**
 
 - [ ] Deploy WAF in **log-only / detection mode** in front of 1–2 real internal ESDS apps (zero user impact).
 - [ ] Run for **1–2 weeks**; capture every "would-block" event on legitimate traffic.
