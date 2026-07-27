@@ -5286,6 +5286,9 @@ fn record_event(ctx: &RequestContext) {
             (r.to_string(), a.to_string())
         }
     };
+    // Cloned before the struct takes ownership of ev_rule/ev_attack.
+    let ev_rule_for_prose = ev_rule.clone();
+    let ev_attack_for_prose = ev_attack.clone();
     let row = sentinel_storage::WafEventRow {
         ts: unix_now(),
         ip: ctx.client_ip.to_string(),
@@ -5303,6 +5306,25 @@ fn record_event(ctx: &RequestContext) {
         score: ctx.anomaly_score,
         status: ctx.response_status.map(|s| s.as_u16()).unwrap_or(0),
         protocol: protocol_label(ctx.http_version).to_string(),
+        // Same correlation id and prose as the NDJSON record, so an event found in
+        // Threat Search weeks later explains itself and can still be tied back to
+        // the request that produced it. Built from the same helper as waf.log —
+        // two renderings of one verdict would eventually disagree.
+        request_id: ctx.request_id.to_string(),
+        target: top.map(|r| r.target.clone()).unwrap_or_default(),
+        mode: match ctx.enforcement_mode {
+            Some(WafMode::Blocking) => "blocking",
+            Some(WafMode::Learning) => "learning",
+            Some(WafMode::Off) => "off",
+            None => "node",
+        }
+        .to_string(),
+        threshold: ctx.anomaly_threshold.unwrap_or(0),
+        explanation: if log_explain_enabled() {
+            explain_event(ctx, action, &ev_rule_for_prose, &ev_attack_for_prose).0
+        } else {
+            String::new()
+        },
     };
     if let Ok(mut buf) = waf_events().lock() {
         if buf.len() < 20_000 {

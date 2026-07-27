@@ -134,6 +134,13 @@ type Event struct {
 	Score    int    `json:"score"`
 	Status   int    `json:"status"`
 	Protocol string `json:"protocol"`
+	// Written since the explain-the-verdict change. Old rows have them empty,
+	// which the UI renders as absent rather than fabricating an explanation.
+	RequestID   string `json:"request_id"`
+	Target      string `json:"target"`
+	Mode        string `json:"mode"`
+	Threshold   int    `json:"threshold"`
+	Explanation string `json:"explanation"`
 }
 
 type TimelineBucket struct {
@@ -261,8 +268,9 @@ func (c *Client) searchWhere(f SearchFilter) []string {
 		// substring match across path / attack / rule
 		q := esc(f.Query)
 		where = append(where, fmt.Sprintf(
-			"(positionCaseInsensitive(path, '%s') > 0 OR positionCaseInsensitive(attack, '%s') > 0 OR rule = '%s')",
-			q, q, q))
+			"(positionCaseInsensitive(path, '%s') > 0 OR positionCaseInsensitive(attack, '%s') > 0 "+
+				"OR positionCaseInsensitive(explanation, '%s') > 0 OR rule = '%s')",
+			q, q, q, q))
 	}
 	return where
 }
@@ -274,7 +282,8 @@ func (c *Client) Search(ctx context.Context, f SearchFilter) ([]Event, error) {
 		limit = 200
 	}
 	sql := fmt.Sprintf(
-		"SELECT toUnixTimestamp(ts) AS ts, ip, country, site, method, path, rule, attack, action, severity, score, status, protocol "+
+		"SELECT toUnixTimestamp(ts) AS ts, ip, country, site, method, path, rule, attack, action, severity, score, status, protocol, "+
+			"request_id, target, mode, threshold, explanation "+
 			"FROM %s.waf_events WHERE %s ORDER BY ts DESC LIMIT %d",
 		c.db, strings.Join(where, " AND "), limit)
 	var out []Event

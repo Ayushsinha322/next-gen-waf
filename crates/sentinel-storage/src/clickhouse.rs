@@ -81,6 +81,25 @@ pub struct WafEventRow {
     /// keeps old rows (persisted before this column existed) deserializable.
     #[serde(default)]
     pub protocol: String,
+    /// Correlation id shared with the NDJSON access/waf logs and the tracing
+    /// span, so a stored event can be tied back to the exact request.
+    #[serde(default)]
+    pub request_id: String,
+    /// Which part of the request tripped the rule (`ARGS:id`). Empty when the
+    /// rule inspected several targets — see the VM's target attribution.
+    #[serde(default)]
+    pub target: String,
+    /// Site enforcement mode at the time: blocking | learning | off | node.
+    /// Without it a stored DETECT cannot be distinguished from a policy that was
+    /// simply not enforcing.
+    #[serde(default)]
+    pub mode: String,
+    /// The site's anomaly threshold, so a stored score means something on its own.
+    #[serde(default)]
+    pub threshold: u32,
+    /// Human-readable explanation of the verdict, as written to waf.log.
+    #[serde(default)]
+    pub explanation: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -210,7 +229,9 @@ impl ClickHouseClient {
               method LowCardinality(String), \
               path String, rule LowCardinality(String), attack String, \
               action LowCardinality(String), severity LowCardinality(String), \
-              score UInt32, status UInt16, protocol LowCardinality(String)) \
+              score UInt32, status UInt16, protocol LowCardinality(String), \
+              request_id String, target String, mode LowCardinality(String), \
+              threshold UInt32, explanation String) \
              ENGINE = MergeTree() \
              PARTITION BY toYYYYMMDD(ts) \
              ORDER BY (site, ts) \
@@ -240,6 +261,25 @@ impl ClickHouseClient {
             db = self.database
         ))
         .await?;
+
+        // Additive online migration: the explain-the-verdict columns. Existing
+        // deployments (the VM's table predates these) get them with empty
+        // defaults; old rows simply have no explanation, which the UI renders as
+        // absent rather than inventing one.
+        for col in [
+            "request_id String",
+            "target String",
+            "mode LowCardinality(String)",
+            "threshold UInt32",
+            "explanation String",
+        ] {
+            self.exec(format!(
+                "ALTER TABLE {db}.waf_events ADD COLUMN IF NOT EXISTS {col} DEFAULT {default}",
+                db = self.database,
+                default = if col.contains("UInt32") { "0" } else { "''" }
+            ))
+            .await?;
+        }
 
         // Additive online migration: per-tenant scoping on traffic_buckets too
         // (empty on pre-existing rows → hidden from every tenant, fail-closed).
@@ -276,7 +316,8 @@ impl ClickHouseClient {
         }
         let mut sql = format!(
             "INSERT INTO {db}.waf_events \
-             (ts, ip, country, site, tenant, method, path, rule, attack, action, severity, score, status, protocol) \
+             (ts, ip, country, site, tenant, method, path, rule, attack, action, severity, score, status, protocol, \
+              request_id, target, mode, threshold, explanation) \
              FORMAT JSONEachRow\n",
             db = self.database
         );
@@ -622,6 +663,11 @@ mod tests {
             score: 5,
             status: 403,
             protocol: "h2".into(),
+            request_id: "11111111-2222-3333-4444-555555555555".into(),
+            target: "ARGS:id".into(),
+            mode: "blocking".into(),
+            threshold: 5,
+            explanation: "BLOCKED on 'TESTSITE.example': SQL injection in parameter 'id'.".into(),
         }
     }
 }

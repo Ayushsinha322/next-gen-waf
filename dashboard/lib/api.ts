@@ -290,6 +290,16 @@ export interface WafEvent {
   score:    number;
   status:   number;
   protocol?: string; // h1 | h2 | h3
+  /** Correlation id shared with the NDJSON access/waf logs. */
+  request_id?: string;
+  /** Which part of the request tripped the rule; empty for multi-target rules. */
+  target?: string;
+  /** blocking | learning | off | node — whether the verdict was ENFORCED. */
+  mode?: string;
+  threshold?: number;
+  /** Plain-English explanation written when the event was recorded. Absent on
+   *  rows stored before the explain-the-verdict change. */
+  explanation?: string;
 }
 
 /** One configuration rollback point (control-plane db.ConfigVersionSummary). */

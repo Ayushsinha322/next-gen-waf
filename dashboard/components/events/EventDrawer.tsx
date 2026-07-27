@@ -118,6 +118,28 @@ export default function EventDrawer({
         </header>
 
         <div style={{ flex: 1, overflowY: "auto", padding: "8px 20px 20px" }}>
+          {/* Lead with the WAF's own explanation. It states what was detected,
+              where, why the verdict followed and whether it was ENFORCED — the
+              questions an operator opens this drawer to answer. Absent on events
+              recorded before the explain-the-verdict change, in which case the
+              structured fields below still tell the story. */}
+          {event.explanation && (
+            <div
+              style={{
+                margin: "12px 0 4px", padding: "12px 14px", borderRadius: 8,
+                border: "1px solid var(--border2)", background: "var(--bg3)",
+                fontSize: "var(--fs-sm)", lineHeight: 1.65, color: "var(--text2)",
+              }}
+            >
+              {event.explanation}
+              {event.mode && event.mode !== "blocking" && (
+                <div style={{ marginTop: 8, color: "var(--amber)" }}>
+                  Site mode at the time: <strong>{event.mode}</strong>
+                  {event.mode === "learning" && " — this request was NOT blocked."}
+                </div>
+              )}
+            </div>
+          )}
           <Row label="Time" mono>{new Date(event.ts * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z")}</Row>
           <Row label="Source IP" mono>{event.ip}{event.country ? ` · ${event.country}` : ""}</Row>
           <Row label="Site" mono>{event.site}</Row>
