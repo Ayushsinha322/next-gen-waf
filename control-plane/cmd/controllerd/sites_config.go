@@ -131,7 +131,7 @@ func handleImportSites(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub 
 			upJSON = json.RawMessage(`{"servers":[],"lb":"round_robin"}`)
 		}
 		if len(ys.WafPolicy) == 0 {
-			wafJSON = json.RawMessage(`{"mode":"blocking","paranoia_level":2,"anomaly_threshold":5}`)
+			wafJSON = json.RawMessage(defaultWafPolicyJSON)
 		}
 
 		if cur, ok := byName[ys.Name]; ok {

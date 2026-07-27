@@ -630,7 +630,7 @@ func handleCreateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 		req.Upstream = json.RawMessage(`{"servers":[],"lb":"round_robin"}`)
 	}
 	if req.WafPolicy == nil {
-		req.WafPolicy = json.RawMessage(`{"mode":"blocking","paranoia_level":2,"anomaly_threshold":5}`)
+		req.WafPolicy = json.RawMessage(defaultWafPolicyJSON)
 	}
 	// Validate BEFORE committing. An unconvertible site used to be accepted here
 	// and then silently dropped by the data-plane config sync, leaving the site
@@ -1483,7 +1483,11 @@ func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
 		p.ParanoiaLevel = 2
 	}
 	if p.AnomalyThreshold == 0 {
-		p.AnomalyThreshold = 5
+		// 10, not 5: requiring two correlated signals instead of one is what the
+		// detection benchmark measured at composite 99.60% / true-negative 99.29%
+		// (deploy/load-test/waf-detection.yaml). At 5 a single weak +5 heuristic
+		// blocks on its own, which is where most benign false-positives came from.
+		p.AnomalyThreshold = 10
 	}
 
 	var rules []string
@@ -1499,35 +1503,41 @@ func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
 		"api_discovery":     p.APIDiscovery,
 	}
 
-	// Rule exclusions — include the well-known 932236 "ARGS_NAMES" / id
-	// suppression by default (avoids the `?id=42` false positive, see CRS
-	// importer notes), even alongside operator-defined exclusions (e.g. one-click
-	// disables from the learning report).
+	// Rule exclusions — the defaults in defaultRuleExclusions are applied to every
+	// site alongside any operator-defined ones (e.g. one-click disables from the
+	// learning report).
 	//
-	// An operator can fully re-enable 932236 by storing an *empty* 932236 entry
-	// (no targets, not disabled): that acts as an opt-out marker — it suppresses
-	// the injected default and is itself dropped (a no-op to the data plane).
-	// `handleDeleteSiteExclusion` leaves this marker when 932236 is removed, so
-	// the default isn't silently re-added on the next build.
+	// An operator can fully re-enable a defaulted rule by storing an *empty* entry
+	// for its id (no targets, not disabled): that acts as an opt-out marker — it
+	// suppresses the injected default and is itself dropped (a no-op to the data
+	// plane). `handleDeleteSiteExclusion` leaves this marker when such an entry is
+	// removed, so the default isn't silently re-added on the next build.
 	ex := []map[string]any{}
-	has932236 := false
-	out := make([]map[string]any, 0, len(ex)+1)
+	seen := make(map[int]bool, len(defaultRuleExclusions))
+	out := make([]map[string]any, 0, len(ex)+len(defaultRuleExclusions))
 	if len(p.RuleExclusions) > 0 {
 		if err := json.Unmarshal(p.RuleExclusions, &ex); err != nil {
 			ex = []map[string]any{}
 		}
 		for _, e := range ex {
-			if ruleIDEquals(e["rule_id"], 932236) {
-				has932236 = true
-				if isEmptyExclusion(e) {
-					continue // opt-out marker — drop it, don't emit to the proxy
+			isDefaulted := false
+			for _, d := range defaultRuleExclusions {
+				if ruleIDEquals(e["rule_id"], d.id) {
+					isDefaulted = true
+					seen[d.id] = true
+					break
 				}
+			}
+			if isDefaulted && isEmptyExclusion(e) {
+				continue // opt-out marker — drop it, don't emit to the proxy
 			}
 			out = append(out, e)
 		}
 	}
-	if !has932236 {
-		out = append(out, map[string]any{"rule_id": 932236, "exclude_targets": []string{"ARGS_NAMES"}})
+	for _, d := range defaultRuleExclusions {
+		if !seen[d.id] {
+			out = append(out, d.entry())
+		}
 	}
 	waf["rule_exclusions"] = out
 
@@ -1590,6 +1600,35 @@ func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
 
 // ruleIDEquals compares a JSON-decoded rule_id (which may be float64, json.Number,
 // or int) against an expected integer.
+// defaultWafPolicyJSON is the policy stored for a site created without one. The
+// threshold matches buildRustWaf's default and the benchmarked configuration —
+// keep the two in step, or a site's stored policy and its effective policy drift.
+const defaultWafPolicyJSON = `{"mode":"blocking","paranoia_level":2,"anomaly_threshold":10}`
+
+// defaultRuleExclusions are the CRS suppressions applied to every site unless the
+// operator explicitly opts out. Both come from measured false-positive work:
+//
+//   - 932236 on ARGS_NAMES — the `?id=42` false positive (see CRS importer notes).
+//   - 920230 disabled outright — "multiple URL encoding detected" is a weak +3
+//     heuristic that dominated benign false-positives. Disabling it is one half of
+//     the tuned configuration measured at composite 99.60% / true-negative 99.29%
+//     (deploy/load-test/waf-detection.yaml); the other half is anomaly_threshold
+//     10, defaulted in buildRustWaf.
+//
+// entry is a constructor, not a shared map: buildRustWaf hands these to the data
+// plane per request, and a shared map would let one site's edit leak into another's.
+var defaultRuleExclusions = []struct {
+	id    int
+	entry func() map[string]any
+}{
+	{932236, func() map[string]any {
+		return map[string]any{"rule_id": 932236, "exclude_targets": []string{"ARGS_NAMES"}}
+	}},
+	{920230, func() map[string]any {
+		return map[string]any{"rule_id": 920230, "disable": true}
+	}},
+}
+
 func ruleIDEquals(v any, want int) bool {
 	switch n := v.(type) {
 	case float64:

@@ -63,7 +63,10 @@ GoTestWAF's 10.64% is an adversarial corpus, not your traffic.
       anomaly scores, health. Confirm they render on the deploy box.
 - [ ] **Alerting**: page on block-rate spikes (possible FP storm or attack), cert expiry, WAF/DB down, ML model
       load failure.
-- [ ] Confirm the **threshold-10 tuned config** (anomaly_threshold 10, rule 920230 disabled) is the deploy default.
+- [x] Confirm the **threshold-10 tuned config** (anomaly_threshold 10, rule 920230 disabled) is the deploy default.
+      Both halves now default in the control plane: `buildRustWaf` defaults `anomaly_threshold` to 10 and injects
+      the 920230 disable via `defaultRuleExclusions`, pinned by `waf_defaults_test.go`. Sites created before this
+      change store an explicit `anomaly_threshold`, which still wins — migrate those rows per-deployment.
 - [ ] Set required env: `SENTINEL_INTERNAL_SECRET`, admin bootstrap password, DB DSN. No `admin123`.
 
 ---

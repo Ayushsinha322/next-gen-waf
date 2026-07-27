@@ -84,7 +84,12 @@ services:
   clickhouse:
     image: clickhouse/clickhouse-server:24-alpine
     restart: unless-stopped
-    mem_limit: 1536m
+    # 1536m is NOT enough: at that limit ClickHouse's own internal-table merges
+    # (system.text_log) get OOM-killed during startup, and the container
+    # crash-loops indefinitely — observed ~24k restarts on the deploy VM
+    # (2026-07-22). 6g is the verified-good floor. Override downward only on a
+    # box where you have confirmed the merges complete.
+    mem_limit: ${CLICKHOUSE_MEM_LIMIT:-6g}
     ulimits:
       nofile: { soft: 262144, hard: 262144 }
     environment:
