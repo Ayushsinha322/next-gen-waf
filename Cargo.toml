@@ -12,6 +12,7 @@ members = [
     "crates/sentinel-ebpf",
     "crates/sentinel-cli",
     "crates/sentinel-bin",
+    "crates/sentinel-srl-validate",
 ]
 # Example plugins are separate crates compiled for wasm32-unknown-unknown with
 # crate-type=["cdylib"]. They must not join the workspace: a workspace build

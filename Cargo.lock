@@ -2478,6 +2478,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sentinel-srl-validate"
+version = "0.1.0"
+dependencies = [
+ "http",
+ "sentinel-core",
+ "sentinel-rules",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "sentinel-storage"
 version = "0.1.0"
 dependencies = [

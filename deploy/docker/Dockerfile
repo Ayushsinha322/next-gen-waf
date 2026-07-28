@@ -20,6 +20,12 @@ COPY crates ./crates
 # include_bytes!, so no BPF toolchain is needed here). At runtime it attaches
 # XDP when the container has CAP_BPF/CAP_NET_ADMIN, else falls back to software.
 RUN cargo build --release --bin sentinel-bin --features kernel
+# srl-validate is the rule DSL validator the CONTROL PLANE executes. It is built
+# here, from the same crates as the data plane, so there is exactly one SRL
+# compiler in the system: a rule that validates in the API is a rule that will
+# run in the proxy. A Go reimplementation would drift, and a network call to a
+# data-plane node would make rule editing impossible during a rolling upgrade.
+RUN cargo build --release --bin sentinel-srl-validate
 
 FROM golang:1.24-alpine AS go-builder
 ENV CGO_ENABLED=0
@@ -42,9 +48,15 @@ EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/sentinel"]
 
 # ---- Control plane (Go) ----
-FROM gcr.io/distroless/static-debian12 AS sentinel-controlplane
+# distroless/cc, not distroless/static: the Go binaries are static but
+# srl-validate is a normal glibc-linked Rust binary, so the runtime needs a libc.
+# The alternative was cross-compiling it against musl, which means carrying a musl
+# toolchain and a second link configuration to save a few megabytes — the data
+# plane already runs on cc.
+FROM gcr.io/distroless/cc-debian12 AS sentinel-controlplane
 COPY --from=go-builder /out/controllerd /usr/local/bin/controllerd
 COPY --from=go-builder /out/sentinelctl  /usr/local/bin/sentinelctl
+COPY --from=rust-builder /src/target/release/sentinel-srl-validate /usr/local/bin/srl-validate
 EXPOSE 9501
 ENTRYPOINT ["/usr/local/bin/controllerd"]
 

@@ -11,7 +11,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -2145,6 +2144,25 @@ func handleCreateRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	// Validate the DSL with the real engine. Unlike an UPDATE there is nothing
+	// live to disarm here, so if the validator itself cannot run we store the rule
+	// and say so — the enforcement-status layer will report it if the data plane
+	// rejects it. An INVALID rule is still refused outright: storing one that can
+	// never run is what made "enabled" meaningless in the first place.
+	var createValidationSkipped bool
+	if strings.TrimSpace(req.DSL) != "" {
+		problem, skipped := rejectInvalidDSL(c.Request.Context(), req.DSL)
+		if problem != "" {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":   "the rule is not valid SRL and was not saved",
+				"detail":  problem,
+				"invalid": true,
+			})
+			return
+		}
+		createValidationSkipped = skipped
+	}
+
 	// A rule scoped to a site the caller cannot see would be created and then
 	// never delivered anywhere — it would sit in the UI looking enabled and do
 	// nothing. Reject it with the reason instead. The tenant-scoped GetSite also
@@ -2174,7 +2192,14 @@ func handleCreateRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 			TargetKind:  "rule",
 			TargetID:    &rule.ID,
 		})
-		c.JSON(http.StatusCreated, gin.H{"rule": rule})
+		resp := gin.H{"rule": rule}
+		if createValidationSkipped {
+			// Honest about what did not happen, rather than implying the rule was
+			// checked. The enforcement status will resolve it within seconds.
+			resp["warning"] = "the rule was stored without validation because the " +
+				"validator was unavailable on this node; check its enforcement status"
+		}
+		c.JSON(http.StatusCreated, resp)
 		return
 	}
 	id := fmt.Sprintf("custom-%d", time.Now().UnixNano()%100000000)
@@ -2281,68 +2306,69 @@ func handleTestRule(c *gin.Context, enf *rbac.Enforcer) {
 		return
 	}
 
-	verdict, matched, detail := testRuleDSL(req.DSL, req.Payload, req.Path)
-	anomalyScore := 0
-	if matched {
-		anomalyScore = 10
+	// Runs the REAL parser, compiler and rule VM via the bundled srl-validate
+	// binary. The previous implementation string-scanned for rx('...') and
+	// compiled a Go regex, so it reported a fabricated verdict for a DSL the
+	// engine would have rejected outright.
+	res, err := validateSRL(c.Request.Context(), srlRequest{
+		DSL:     req.DSL,
+		Payload: req.Payload,
+		Path:    req.Path,
+		Method:  req.Method,
+	})
+	if err != nil {
+		// Say validation could not run. Do NOT invent a verdict — a made-up
+		// answer here is what this endpoint existed to stop being.
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "rule validation is unavailable on this node, so no verdict can " +
+				"be given; the rule was not evaluated",
+			"detail": err.Error(),
+		})
+		return
 	}
+	if !res.Valid {
+		c.JSON(http.StatusOK, gin.H{
+			"valid":   false,
+			"verdict": "INVALID",
+			"matched": false,
+			"detail":  res.Error,
+			"error":   res.Error,
+		})
+		return
+	}
+
+	verdict := "PASS"
+	matched := res.Matched != nil && *res.Matched
+	if matched {
+		verdict = strings.ToUpper(res.Decision)
+	}
+	score := 0
+	if res.Score != nil {
+		score = *res.Score
+	}
+	detail := fmt.Sprintf("compiled %d rule(s)", len(res.Rules))
+	if req.Payload == "" {
+		detail += "; no payload supplied, so nothing was evaluated"
+	} else if matched {
+		detail = fmt.Sprintf("matched rule(s) %s", strings.Join(res.MatchedRuleIDs, ", "))
+	} else {
+		detail += "; the payload did not match"
+	}
+
 	c.JSON(http.StatusOK, gin.H{
-		"verdict":       verdict,
-		"matched":       matched,
-		"detail":        detail,
-		"anomaly_score": anomalyScore,
-		"phases_run":    []string{"request_headers", "request_body"},
+		"valid":            true,
+		"verdict":          verdict,
+		"matched":          matched,
+		"detail":           detail,
+		"anomaly_score":    score,
+		"decision":         res.Decision,
+		"matched_rule_ids": res.MatchedRuleIDs,
+		"rules":            res.Rules,
+		"phases_run":       []string{"request_headers", "request_body", "response_headers", "response_body"},
 	})
 }
 
 // testRuleDSL extracts the rx/contains operator from SRL DSL and tests it
-// against the provided payload.
-func testRuleDSL(dsl, payload, path string) (verdict string, matched bool, detail string) {
-	var pat string
-	for i := 0; i+3 < len(dsl); i++ {
-		if dsl[i:i+3] == "rx(" {
-			start := i + 4
-			end := start
-			for end < len(dsl) && dsl[end] != '\'' {
-				end++
-			}
-			if end > start {
-				pat = dsl[start:end]
-			}
-			break
-		}
-	}
-
-	target := payload
-	if path != "" {
-		target = target + " " + path
-	}
-
-	if pat == "" {
-		return "PASS", false, "No rx() operator found in DSL"
-	}
-
-	cleanPat := pat
-	if len(cleanPat) > 2 && cleanPat[0] == '/' {
-		end := len(cleanPat) - 1
-		for end > 0 && (cleanPat[end] == 'i' || cleanPat[end] == 's' || cleanPat[end] == 'm') {
-			end--
-		}
-		if cleanPat[end] == '/' {
-			cleanPat = cleanPat[1:end]
-		}
-	}
-
-	re, err := regexp.Compile(`(?i)` + cleanPat)
-	if err != nil {
-		return "ERROR", false, fmt.Sprintf("Invalid regex %q: %v", cleanPat, err)
-	}
-
-	if re.MatchString(target) {
-		return "BLOCK", true, fmt.Sprintf("Pattern /%s/ matched in payload", pat)
-	}
-	return "PASS", false, fmt.Sprintf("Pattern /%s/ did not match", pat)
-}
 
 // ---------------------------------------------------------------------------
 // ML Stats

@@ -1,0 +1,16 @@
+[package]
+name = "sentinel-srl-validate"
+version = "0.1.0"
+edition = "2021"
+
+# A tiny stdin/stdout wrapper around the REAL rule engine, bundled into the
+# control-plane image so the Go control plane can validate SRL without owning a
+# second parser. See src/main.rs for why this exists rather than a Go
+# reimplementation.
+
+[dependencies]
+sentinel-core = { path = "../sentinel-core" }
+sentinel-rules = { path = "../sentinel-rules" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+http = { workspace = true }

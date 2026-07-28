@@ -517,7 +517,11 @@ func run() error {
 		protected.DELETE("/sites/:id/exclusions/:rule_id", func(c *gin.Context) { handleDeleteSiteExclusion(c, enforcer, store, hub, cl) })
 		protected.GET("/rules", func(c *gin.Context) { handleListRules(c, enforcer, store) })
 		protected.POST("/rules", func(c *gin.Context) { handleCreateRule(c, enforcer, store, hub, cl) })
-		protected.PATCH("/rules/:id", func(c *gin.Context) { handleToggleRule(c, enforcer, store, hub, cl) })
+		// PATCH is a partial update (dsl, severity, phase, tags, enabled, site_id).
+		// PUT stays mapped to the enable/disable toggle so existing callers of the
+		// old behaviour keep working.
+		protected.PATCH("/rules/:id", func(c *gin.Context) { handleUpdateRule(c, enforcer, store, hub, cl) })
+		protected.PUT("/rules/:id/enabled", func(c *gin.Context) { handleToggleRule(c, enforcer, store, hub, cl) })
 		protected.DELETE("/rules/:id", func(c *gin.Context) { handleDeleteRule(c, enforcer, store, hub, cl) })
 		protected.POST("/rules/test", func(c *gin.Context) { handleTestRule(c, enforcer) })
 		protected.GET("/ml/stats", func(c *gin.Context) {

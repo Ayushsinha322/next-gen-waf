@@ -7,9 +7,12 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"golang.org/x/crypto/argon2"
 )
@@ -1045,3 +1048,86 @@ func (s *Store) ListDeployableRules(ctx context.Context) (map[string][]Deployabl
 	}
 	return out, rows.Err()
 }
+
+// UpdateRuleRequest is a PARTIAL update: a nil field is left alone. Pointers
+// rather than values so "set severity to its zero value" stays distinguishable
+// from "do not touch severity".
+type UpdateRuleRequest struct {
+	DSL      *string   `json:"dsl"`
+	Severity *string   `json:"severity"`
+	Phase    *int      `json:"phase"`
+	Tags     *[]string `json:"tags"`
+	Enabled  *bool     `json:"enabled"`
+	// SiteID rescopes the rule. Send null to make it deployment-wide again; the
+	// distinction between "null" and "absent" is why ClearSiteID exists — JSON
+	// null and a missing key both decode to a nil pointer.
+	SiteID      *string `json:"site_id"`
+	ClearSiteID bool    `json:"clear_site_id"`
+}
+
+// UpdateRule applies a partial update and returns the stored row.
+//
+// Until now the only mutation was ToggleRule, so an operator who typo'd a rule
+// had to delete and recreate it — losing its id, and with it any audit trail
+// pointing at that id.
+//
+// Rows with source 'crs'/'community' are not updatable, matching DeleteRule:
+// they are shipped/demo fixtures, they are excluded from delivery anyway
+// (migration 0017), and letting them be edited would imply they take effect.
+func (s *Store) UpdateRule(ctx context.Context, tenantID, userID, ruleID string,
+	req UpdateRuleRequest) (*RuleRow, error) {
+
+	tx, err := s.pool.BeginTenant(ctx, tenantID, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	// COALESCE keeps every untouched column at its current value, so this is one
+	// statement regardless of how many fields the caller sent.
+	var siteArg any
+	switch {
+	case req.ClearSiteID:
+		siteArg = nil
+	case req.SiteID != nil && strings.TrimSpace(*req.SiteID) != "":
+		siteArg = *req.SiteID
+	default:
+		siteArg = nil
+	}
+
+	var r RuleRow
+	var siteID *string
+	err = tx.QueryRow(ctx,
+		`UPDATE rules SET
+		    dsl      = COALESCE($4, dsl),
+		    severity = COALESCE($5, severity),
+		    phase    = COALESCE($6, phase),
+		    tags     = COALESCE($7, tags),
+		    enabled  = COALESCE($8, enabled),
+		    site_id  = CASE WHEN $9::boolean THEN NULL
+		                    WHEN $10::uuid IS NOT NULL THEN $10::uuid
+		                    ELSE site_id END,
+		    updated_at = NOW()
+		 WHERE id = $1 AND tenant_id = $2 AND source NOT IN ('crs','community')
+		 RETURNING id, tenant_id, name, source, phase, severity, dsl, enabled, tags,
+		           created_at, updated_at, site_id`,
+		ruleID, tenantID, userID, req.DSL, req.Severity, req.Phase, req.Tags,
+		req.Enabled, req.ClearSiteID, siteArg,
+	).Scan(&r.ID, &r.TenantID, &r.Name, &r.Source, &r.Phase, &r.Severity,
+		&r.DSL, &r.Enabled, &r.Tags, &r.CreatedAt, &r.UpdatedAt, &siteID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrRuleNotUpdatable
+		}
+		return nil, fmt.Errorf("store: update rule: %w", err)
+	}
+	if siteID != nil {
+		r.SiteID = *siteID
+	}
+	return &r, tx.Commit(ctx)
+}
+
+// ErrRuleNotUpdatable covers both "no such rule in this tenant" and "this rule's
+// source makes it read-only". They are deliberately one error: distinguishing
+// them would tell a caller whether a rule id exists in another tenant.
+var ErrRuleNotUpdatable = errors.New("rule not found or not updatable")
