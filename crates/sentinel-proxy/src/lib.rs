@@ -2322,8 +2322,22 @@ async fn proxy(
         // scope. Done here rather than passed to log_request because there are 18
         // log_request call sites, several of which run BEFORE routing (anti-DDoS,
         // IP reputation, threat intel) and have no site to pass.
-        ctx.enforcement_mode = Some(s.waf.mode.clone());
-        ctx.anomaly_threshold = Some(s.waf.anomaly_threshold);
+        // Effective policy = the site's policy with any matching path override
+        // applied. Everything downstream reads these two ctx fields rather than
+        // s.waf directly, so an override cannot be honoured in one place and
+        // missed in another — which is how a per-path setting ends up decorative.
+        let ov = match_path_override(&s.waf, ctx.uri.path());
+        ctx.enforcement_mode = Some(
+            ov.and_then(|o| o.mode.clone())
+                .unwrap_or_else(|| s.waf.mode.clone()),
+        );
+        ctx.anomaly_threshold = Some(
+            ov.and_then(|o| o.anomaly_threshold)
+                .unwrap_or(s.waf.anomaly_threshold),
+        );
+        if let Some(o) = ov {
+            ctx.path_override = Some(o.path_prefix.clone());
+        }
     }
 
     // Request size limits: URI and header count (Phase 1, before body read).
@@ -2764,7 +2778,8 @@ async fn proxy(
                                 site_cfg.waf.anomaly_threshold,
                             );
                             // Respect learning mode (downgrade Block → Log).
-                            enforce_mode(&mut ctx, &site_cfg.waf.mode);
+                            let gm = governing_mode(&ctx, &site_cfg.waf.mode);
+                            enforce_mode(&mut ctx, &gm);
                             if ctx.decision == WafDecision::Block {
                                 warn!(
                                     site = %site_cfg.id,
@@ -2790,7 +2805,8 @@ async fn proxy(
                                         ));
                                         // Learning mode downgrades Block → Log —
                                         // must not block or rewrite, only record.
-                                        enforce_mode(&mut ctx, &site_cfg.waf.mode);
+                                        let gm = governing_mode(&ctx, &site_cfg.waf.mode);
+                                        enforce_mode(&mut ctx, &gm);
                                         if ctx.decision == WafDecision::Block {
                                             warn!(
                                                 site = %site_cfg.id,
@@ -3198,7 +3214,8 @@ async fn phase1_headers(
         }
     }
 
-    enforce_mode(ctx, &site.waf.mode);
+    let gm = governing_mode(ctx, &site.waf.mode);
+    enforce_mode(ctx, &gm);
     Ok(())
 }
 
@@ -3268,7 +3285,8 @@ fn phase2_body(
 
     apply_verdict(ctx, &site.waf);
 
-    enforce_mode(ctx, &site.waf.mode);
+    let gm = governing_mode(ctx, &site.waf.mode);
+    enforce_mode(ctx, &gm);
     Ok(())
 }
 
@@ -3323,13 +3341,17 @@ fn apply_verdict(ctx: &mut RequestContext, waf: &WafConfig) {
     if ctx.decision == WafDecision::Block {
         return;
     }
+    // The effective threshold, which a per-path override may have lowered or
+    // raised. Falls back to the site's when nothing was stamped (pre-routing
+    // callers and the unit tests below).
+    let threshold = ctx.anomaly_threshold.unwrap_or(waf.anomaly_threshold);
     match waf.fusion.as_ref().filter(|f| f.enable) {
         Some(f) => {
             let score = fused_score(ctx, f);
             ctx.tx_vars
                 .insert("fused_score".to_string(), score.to_string());
-            let block_t = threshold_for_pl(&f.block_thresholds, waf.paranoia_level)
-                .unwrap_or(waf.anomaly_threshold);
+            let block_t =
+                threshold_for_pl(&f.block_thresholds, waf.paranoia_level).unwrap_or(threshold);
             if score > 0 && score >= block_t {
                 ctx.decision = WafDecision::Block;
                 ctx.block_reason = Some(format!(
@@ -3349,7 +3371,7 @@ fn apply_verdict(ctx: &mut RequestContext, waf: &WafConfig) {
             }
         }
         None => {
-            if ctx.anomaly_score > 0 && ctx.anomaly_score >= waf.anomaly_threshold {
+            if ctx.anomaly_score > 0 && ctx.anomaly_score >= threshold {
                 // ML suppression: when the n-gram classifier is loaded and
                 // scores the payload as benign (< 0.15), suppress CRS-only
                 // blocks. The ML model acts as a precision layer — if it
@@ -3371,7 +3393,7 @@ fn apply_verdict(ctx: &mut RequestContext, waf: &WafConfig) {
                     ctx.decision = WafDecision::Block;
                     ctx.block_reason = Some(format!(
                         "anomaly score {} >= threshold {}",
-                        ctx.anomaly_score, waf.anomaly_threshold
+                        ctx.anomaly_score, threshold
                     ));
                 }
             }
@@ -3413,7 +3435,46 @@ fn eval_rules(ctx: &mut RequestContext, engine: &RuleEngine, phase: Phase) {
     }
 }
 
+/// The per-path override governing `path`, or None. Longest matching prefix wins,
+/// so `/api/v2/` beats `/api/` for a `/api/v2/orders` request regardless of the
+/// order an operator happened to list them in.
+fn match_path_override<'a>(
+    waf: &'a sentinel_core::config::WafConfig,
+    path: &str,
+) -> Option<&'a sentinel_core::config::PathOverride> {
+    waf.path_overrides
+        .iter()
+        .filter(|o| !o.path_prefix.is_empty() && path.starts_with(&o.path_prefix))
+        .max_by_key(|o| o.path_prefix.len())
+}
+
+/// The mode governing this request: the effective one stamped at routing time
+/// (site policy plus any path override), falling back to the site's own mode.
+///
+/// The fallback matters: several call sites run before routing has stamped a
+/// mode, and defaulting to the site policy there is correct — a request that
+/// never matched a path cannot be governed by a path override.
+fn governing_mode(ctx: &RequestContext, site_mode: &WafMode) -> WafMode {
+    ctx.enforcement_mode
+        .clone()
+        .unwrap_or_else(|| site_mode.clone())
+}
+
 fn enforce_mode(ctx: &mut RequestContext, mode: &WafMode) {
+    // `off` for a path means the operator has deliberately taken the WAF out of
+    // the way there (static assets, a health endpoint). Any verdict the rules
+    // reached is discarded rather than downgraded to Log, because unlike learning
+    // mode there is nothing to learn from a path that is not being protected.
+    if *mode == WafMode::Off {
+        if matches!(
+            ctx.decision,
+            WafDecision::Block | WafDecision::Challenge | WafDecision::Limit
+        ) {
+            ctx.decision = WafDecision::Allow;
+            ctx.would_block = false;
+        }
+        return;
+    }
     if *mode == WafMode::Learning
         && matches!(
             ctx.decision,
@@ -5963,6 +6024,9 @@ fn ndjson_log(ctx: &RequestContext) {
             "target": target,
             "score":  ctx.anomaly_score,
             "threshold": ctx.anomaly_threshold,
+            // Present only when a per-path override governed this request, so a
+            // threshold that differs from the site's is self-explaining.
+            "path_override": ctx.path_override,
             "sev":    sev_str,
             "attack": attack,
             "action": action,

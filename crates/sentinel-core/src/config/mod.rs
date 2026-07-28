@@ -482,6 +482,9 @@ pub struct WafConfig {
     /// reload time and keeps exactly one compiler in the system.
     #[serde(default)]
     pub inline_rules: Vec<InlineRule>,
+    /// Per-path policy overrides, longest matching prefix wins. See PathOverride.
+    #[serde(default)]
+    pub path_overrides: Vec<PathOverride>,
     pub ml: Option<MlConfig>,
     pub ip_reputation: Option<IpReputationConfig>,
     pub rate_limit: Option<RateLimitConfig>,
@@ -548,6 +551,43 @@ pub struct CorsConfig {
 pub struct CustomHeader {
     pub name: String,
     pub value: String,
+}
+
+/// Per-path policy override, so one site can enforce different strictness on
+/// different parts of the application.
+///
+/// This is the shape F5 ASM calls URL-level enforcement: an API surface wants a
+/// lower threshold than the marketing pages, a legacy endpoint needs detect-only
+/// while it is being fixed, and static assets want the WAF out of the way.
+/// Without it a site has exactly one policy and the operator must pick a
+/// compromise that is wrong for part of the app — which is how false positives
+/// and under-protection both get baked in.
+///
+/// MATCHING is longest-prefix-wins, not regex, deliberately. An operator reading
+/// `/api/` can predict what it matches; a regex in a security control is a
+/// footgun (ReDoS, and subtly wrong anchoring is easy). Ties cannot happen
+/// because two identical prefixes are the same prefix.
+///
+/// WHAT CAN AND CANNOT BE OVERRIDDEN, and why this is not arbitrary:
+/// `mode` and `anomaly_threshold` are consulted per request, so they can vary by
+/// path. `paranoia_level` and `rule_exclusions` are applied when the rule engine
+/// is COMPILED (see load_site_engine) — the engine physically contains a
+/// different rule set — so overriding them per path would need a separate
+/// compiled engine per override, which is a larger change and multiplies memory
+/// by the number of overrides. They stay site-wide, and the control plane
+/// rejects an attempt to set them here rather than accepting and ignoring it.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PathOverride {
+    /// Path prefix this applies to, e.g. `/api/`. Matched against the request
+    /// path only — never the query string.
+    pub path_prefix: String,
+    /// Enforcement for this path. `off` lets the traffic through regardless of
+    /// what the rules found; `learning` records the verdict without acting.
+    #[serde(default)]
+    pub mode: Option<WafMode>,
+    /// Blocking threshold for this path. Lower is stricter.
+    #[serde(default)]
+    pub anomaly_threshold: Option<u32>,
 }
 
 /// One operator-authored rule, carried as SRL source from the control plane.

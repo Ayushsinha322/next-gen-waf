@@ -754,6 +754,8 @@ fn cmd_site_add(
             // The CLI builds a config from local rule files; operator-authored
             // rules arrive only from the control plane, so there are none here.
             inline_rules: vec![],
+            // Per-path overrides come from the control plane, not a local file.
+            path_overrides: vec![],
             ml: None,
             ip_reputation: None,
             rate_limit: None,

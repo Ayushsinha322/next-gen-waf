@@ -120,6 +120,13 @@ func validateWafPolicyValues(raw json.RawMessage) []SiteConfigProblem {
 		Mode             *string `json:"mode"`
 		ParanoiaLevel    *int    `json:"paranoia_level"`
 		AnomalyThreshold *int    `json:"anomaly_threshold"`
+		PathOverrides    []struct {
+			PathPrefix       string          `json:"path_prefix"`
+			Mode             *string         `json:"mode"`
+			AnomalyThreshold *int            `json:"anomaly_threshold"`
+			ParanoiaLevel    json.RawMessage `json:"paranoia_level"`
+			RuleExclusions   json.RawMessage `json:"rule_exclusions"`
+		} `json:"path_overrides"`
 	}
 	if err := json.Unmarshal(raw, &p); err != nil {
 		return nil // shape errors are already reported by the converter
@@ -140,6 +147,53 @@ func validateWafPolicyValues(raw json.RawMessage) []SiteConfigProblem {
 	if p.AnomalyThreshold != nil && *p.AnomalyThreshold < 1 {
 		add("waf_policy.anomaly_threshold",
 			fmt.Sprintf("must be >= 1, got %d — a threshold of 0 or less blocks every request", *p.AnomalyThreshold))
+	}
+
+	// Per-path overrides. These are rejected rather than silently normalised: an
+	// override an operator believes is protecting /api/ but which the data plane
+	// ignores is the exact failure mode this codebase keeps producing.
+	seen := make(map[string]bool, len(p.PathOverrides))
+	for i, o := range p.PathOverrides {
+		f := func(sub string) string {
+			return fmt.Sprintf("waf_policy.path_overrides[%d].%s", i, sub)
+		}
+		switch {
+		case o.PathPrefix == "":
+			add(f("path_prefix"), "must not be empty — an empty prefix matches every request")
+		case !strings.HasPrefix(o.PathPrefix, "/"):
+			add(f("path_prefix"), fmt.Sprintf("%q must start with '/' — it is matched against the request path", o.PathPrefix))
+		case strings.ContainsAny(o.PathPrefix, "?#"):
+			add(f("path_prefix"), fmt.Sprintf("%q must not contain '?' or '#' — matching is against the path only, never the query string", o.PathPrefix))
+		case seen[o.PathPrefix]:
+			add(f("path_prefix"), fmt.Sprintf("%q is listed more than once", o.PathPrefix))
+		}
+		seen[o.PathPrefix] = true
+
+		if o.Mode != nil {
+			switch *o.Mode {
+			case "blocking", "learning", "off":
+			default:
+				add(f("mode"), fmt.Sprintf("%q is not one of blocking, learning, off", *o.Mode))
+			}
+		}
+		if o.AnomalyThreshold != nil && *o.AnomalyThreshold < 1 {
+			add(f("anomaly_threshold"),
+				fmt.Sprintf("must be >= 1, got %d — a threshold of 0 or less blocks every request", *o.AnomalyThreshold))
+		}
+		if o.Mode == nil && o.AnomalyThreshold == nil {
+			add(f(""), "sets neither mode nor anomaly_threshold, so it would have no effect")
+		}
+		// paranoia_level and rule_exclusions are applied when the rule engine is
+		// COMPILED, not per request, so a per-path value cannot be honoured. Say so
+		// instead of accepting it and quietly doing nothing.
+		if len(o.ParanoiaLevel) > 0 {
+			add(f("paranoia_level"),
+				"cannot be overridden per path — it selects which rules are compiled into the engine, so it is site-wide")
+		}
+		if len(o.RuleExclusions) > 0 {
+			add(f("rule_exclusions"),
+				"cannot be overridden per path — exclusions are applied when the engine is compiled, so they are site-wide")
+		}
 	}
 	return problems
 }

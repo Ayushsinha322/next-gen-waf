@@ -242,3 +242,86 @@ func TestModeOffLoadsNoRules(t *testing.T) {
 		t.Errorf("mode=off loaded %d rule files, want 0", len(rules))
 	}
 }
+
+// Per-path overrides: the passthrough must survive buildRustWaf, and validation
+// must REJECT the two knobs that cannot be honoured per path rather than
+// accepting them and silently ignoring them.
+
+func TestPathOverridesReachTheDataPlane(t *testing.T) {
+	policy := json.RawMessage(`{"mode":"blocking","path_overrides":[
+		{"path_prefix":"/api/","anomaly_threshold":3},
+		{"path_prefix":"/assets/","mode":"off"}
+	]}`)
+	waf, err := buildRustWaf(policy)
+	if err != nil {
+		t.Fatalf("buildRustWaf: %v", err)
+	}
+	ov, ok := waf["path_overrides"].([]map[string]any)
+	if !ok {
+		t.Fatalf("path_overrides has type %T, want []map[string]any", waf["path_overrides"])
+	}
+	if len(ov) != 2 {
+		t.Fatalf("got %d overrides, want 2", len(ov))
+	}
+	if ov[0]["path_prefix"] != "/api/" {
+		t.Errorf("first override prefix = %v, want /api/", ov[0]["path_prefix"])
+	}
+	if ov[1]["mode"] != "off" {
+		t.Errorf("second override mode = %v, want off", ov[1]["mode"])
+	}
+}
+
+func TestNoPathOverridesKeyWhenNoneSet(t *testing.T) {
+	waf, err := buildRustWaf(json.RawMessage(`{"mode":"blocking"}`))
+	if err != nil {
+		t.Fatalf("buildRustWaf: %v", err)
+	}
+	if _, present := waf["path_overrides"]; present {
+		t.Error("path_overrides must be absent, not an empty array, when unset")
+	}
+}
+
+func TestPathOverrideValidationRejectsUnhonourableKnobs(t *testing.T) {
+	cases := []struct {
+		name       string
+		policy     string
+		wantSubstr string
+	}{
+		{"per-path paranoia", `{"path_overrides":[{"path_prefix":"/a/","paranoia_level":3}]}`, "paranoia_level"},
+		{"per-path exclusions", `{"path_overrides":[{"path_prefix":"/a/","rule_exclusions":[{"rule_id":1}]}]}`, "rule_exclusions"},
+		{"empty prefix", `{"path_overrides":[{"path_prefix":"","mode":"off"}]}`, "path_prefix"},
+		{"no leading slash", `{"path_overrides":[{"path_prefix":"api/","mode":"off"}]}`, "path_prefix"},
+		{"query string in prefix", `{"path_overrides":[{"path_prefix":"/a/?x=1","mode":"off"}]}`, "path_prefix"},
+		{"duplicate prefix", `{"path_overrides":[{"path_prefix":"/a/","mode":"off"},{"path_prefix":"/a/","mode":"learning"}]}`, "more than once"},
+		{"bad mode", `{"path_overrides":[{"path_prefix":"/a/","mode":"paranoid"}]}`, "blocking, learning, off"},
+		{"zero threshold", `{"path_overrides":[{"path_prefix":"/a/","anomaly_threshold":0}]}`, "must be >= 1"},
+		{"no effect", `{"path_overrides":[{"path_prefix":"/a/"}]}`, "no effect"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			problems := validateWafPolicyValues(json.RawMessage(tc.policy))
+			if len(problems) == 0 {
+				t.Fatalf("expected a validation problem mentioning %q, got none", tc.wantSubstr)
+			}
+			var all string
+			for _, p := range problems {
+				all += p.Field + " " + p.Problem + "\n"
+			}
+			if !strings.Contains(all, tc.wantSubstr) {
+				t.Errorf("problems did not mention %q:\n%s", tc.wantSubstr, all)
+			}
+		})
+	}
+}
+
+func TestValidPathOverridesPass(t *testing.T) {
+	policy := json.RawMessage(`{"mode":"blocking","anomaly_threshold":10,"path_overrides":[
+		{"path_prefix":"/api/","anomaly_threshold":3},
+		{"path_prefix":"/api/admin/","mode":"blocking","anomaly_threshold":2},
+		{"path_prefix":"/assets/","mode":"off"},
+		{"path_prefix":"/legacy/","mode":"learning"}
+	]}`)
+	if problems := validateWafPolicyValues(policy); len(problems) != 0 {
+		t.Errorf("valid overrides were rejected: %+v", problems)
+	}
+}

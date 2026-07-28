@@ -790,3 +790,224 @@ async fn inline_rule_may_not_shadow_a_shipped_rule_id() {
          refused, not allowed to override it"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Per-path policy overrides.
+//
+// A site used to have exactly one policy, so an operator had to pick a single
+// strictness that was necessarily wrong for part of the application. These pin
+// the three behaviours that make the feature real rather than decorative:
+// a stricter path blocks what the site would allow, a detect-only path lets
+// through what the site would block, and an off path is genuinely exempt.
+// ---------------------------------------------------------------------------
+
+use sentinel_core::config::PathOverride;
+
+/// A site with the CRS SQLi rules, a site-level threshold, and path overrides.
+fn path_override_config(
+    listen_port: u16,
+    upstream_port: u16,
+    site_threshold: u32,
+    overrides: Vec<PathOverride>,
+) -> SentinelConfig {
+    let rule_path = crs_rule_dir().join("REQUEST-942-APPLICATION-ATTACK-SQLI.conf");
+    let mut cfg = test_config(
+        listen_port,
+        upstream_port,
+        "REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
+        WafMode::Blocking,
+    );
+    cfg.sites[0].waf.rules = vec![rule_path.to_string_lossy().to_string()];
+    cfg.sites[0].waf.anomaly_threshold = site_threshold;
+    cfg.sites[0].waf.path_overrides = overrides;
+    cfg
+}
+
+/// A path in learning mode must pass an attack the rest of the site blocks.
+/// This is the "legacy endpoint we are still fixing" case.
+#[tokio::test]
+async fn path_override_learning_lets_attack_through() {
+    let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
+    let listen_port = next_port();
+    let cfg = path_override_config(
+        listen_port,
+        upstream_addr.port(),
+        5,
+        vec![PathOverride {
+            path_prefix: "/legacy/".into(),
+            mode: Some(WafMode::Learning),
+            anomaly_threshold: None,
+        }],
+    );
+    let (shutdown_tx, jh) = start_proxy(cfg).await;
+
+    let attack = "?q=1%27%20OR%201%3D1--";
+    let (on_legacy, _) = send_request(
+        listen_port,
+        "test-site.local",
+        &format!("/legacy/report{attack}"),
+        Method::GET,
+        "",
+    )
+    .await;
+    let (elsewhere, _) = send_request(
+        listen_port,
+        "test-site.local",
+        &format!("/search{attack}"),
+        Method::GET,
+        "",
+    )
+    .await;
+
+    shutdown_proxy(shutdown_tx, jh).await;
+    assert_eq!(
+        on_legacy,
+        StatusCode::OK,
+        "/legacy/ is learning-mode: the attack must be recorded, not blocked"
+    );
+    assert_eq!(
+        elsewhere,
+        StatusCode::FORBIDDEN,
+        "the same attack outside the override must still block"
+    );
+}
+
+/// A path in `off` mode is genuinely exempt — the case for static assets, where
+/// the WAF only costs latency and false positives.
+#[tokio::test]
+async fn path_override_off_exempts_the_path() {
+    let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
+    let listen_port = next_port();
+    let cfg = path_override_config(
+        listen_port,
+        upstream_addr.port(),
+        5,
+        vec![PathOverride {
+            path_prefix: "/assets/".into(),
+            mode: Some(WafMode::Off),
+            anomaly_threshold: None,
+        }],
+    );
+    let (shutdown_tx, jh) = start_proxy(cfg).await;
+
+    let (status, _) = send_request(
+        listen_port,
+        "test-site.local",
+        "/assets/app.js?q=1%27%20OR%201%3D1--",
+        Method::GET,
+        "",
+    )
+    .await;
+
+    shutdown_proxy(shutdown_tx, jh).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an `off` path must pass traffic regardless of what the rules found"
+    );
+}
+
+/// Longest prefix wins, independently of declaration order — otherwise an
+/// operator's policy depends on the order they happened to add rows in, which is
+/// not a property a security control may have.
+#[tokio::test]
+async fn path_override_longest_prefix_wins() {
+    let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
+    let listen_port = next_port();
+    // The SHORTER, more permissive prefix is declared first on purpose.
+    let cfg = path_override_config(
+        listen_port,
+        upstream_addr.port(),
+        5,
+        vec![
+            PathOverride {
+                path_prefix: "/api/".into(),
+                mode: Some(WafMode::Off),
+                anomaly_threshold: None,
+            },
+            PathOverride {
+                path_prefix: "/api/admin/".into(),
+                mode: Some(WafMode::Blocking),
+                anomaly_threshold: None,
+            },
+        ],
+    );
+    let (shutdown_tx, jh) = start_proxy(cfg).await;
+
+    let attack = "?q=1%27%20OR%201%3D1--";
+    let (on_api, _) = send_request(
+        listen_port,
+        "test-site.local",
+        &format!("/api/list{attack}"),
+        Method::GET,
+        "",
+    )
+    .await;
+    let (on_admin, _) = send_request(
+        listen_port,
+        "test-site.local",
+        &format!("/api/admin/users{attack}"),
+        Method::GET,
+        "",
+    )
+    .await;
+
+    shutdown_proxy(shutdown_tx, jh).await;
+    assert_eq!(on_api, StatusCode::OK, "/api/ is off");
+    assert_eq!(
+        on_admin,
+        StatusCode::FORBIDDEN,
+        "/api/admin/ is the longer prefix and must win over /api/ despite being \
+         declared second"
+    );
+}
+
+/// A path may also be made STRICTER than the site. The site threshold is set
+/// high enough that the CRS score for this request does not reach it, while the
+/// override's lower threshold does — so only the override can produce the block.
+#[tokio::test]
+async fn path_override_can_be_stricter_than_the_site() {
+    let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
+    let listen_port = next_port();
+    let cfg = path_override_config(
+        listen_port,
+        upstream_addr.port(),
+        1000, // effectively "never block on score" for the rest of the site
+        vec![PathOverride {
+            path_prefix: "/api/".into(),
+            mode: None,
+            anomaly_threshold: Some(3),
+        }],
+    );
+    let (shutdown_tx, jh) = start_proxy(cfg).await;
+
+    let attack = "?q=1%27%20OR%201%3D1--";
+    let (on_api, _) = send_request(
+        listen_port,
+        "test-site.local",
+        &format!("/api/list{attack}"),
+        Method::GET,
+        "",
+    )
+    .await;
+    let (elsewhere, _) = send_request(
+        listen_port,
+        "test-site.local",
+        &format!("/search{attack}"),
+        Method::GET,
+        "",
+    )
+    .await;
+
+    shutdown_proxy(shutdown_tx, jh).await;
+    assert_eq!(
+        on_api,
+        StatusCode::FORBIDDEN,
+        "/api/ has threshold 3 and must block on the accumulated score"
+    );
+    assert_eq!(
+        elsewhere,
+        StatusCode::OK,
+        "the site threshold of 1000 must still apply outside the override"
+    );
+}

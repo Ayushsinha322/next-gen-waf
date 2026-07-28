@@ -133,6 +133,11 @@ pub struct RequestContext {
     /// score-driven verdict can be reported as "score N of threshold M" rather
     /// than a bare number the reader has to go look up.
     pub anomaly_threshold: Option<u32>,
+    /// `path_prefix` of the per-path override that produced the two fields above,
+    /// when one matched. Recorded so an operator reading an event can tell that a
+    /// non-default threshold or mode came from a path rule rather than wondering
+    /// why this request was judged differently from the rest of the site.
+    pub path_override: Option<String>,
 
     // --- WAF state ---
     pub phase: Phase,
@@ -198,6 +203,7 @@ impl RequestContext {
             geo_country: None,
             enforcement_mode: None,
             anomaly_threshold: None,
+            path_override: None,
             phase: Phase::Connection,
             anomaly_score: 0,
             engine_scores: HashMap::new(),

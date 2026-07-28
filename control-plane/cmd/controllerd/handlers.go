@@ -1509,6 +1509,7 @@ func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
 		APIDiscovery     bool            `json:"api_discovery"`
 		AllowedMethods   []string        `json:"allowed_methods"`
 		SecurityHeaders  json.RawMessage `json:"security_headers"`
+		PathOverrides    json.RawMessage `json:"path_overrides"`
 	}
 	if len(raw) > 0 {
 		if err := json.Unmarshal(raw, &p); err != nil {
@@ -1594,6 +1595,17 @@ func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
 	attachRawObject(waf, "fusion", p.Fusion)
 	attachRawObject(waf, "ml", p.ML)
 	attachRawObject(waf, "ip_reputation", p.IPReputation)
+
+	// Per-path overrides pass through verbatim as an ARRAY (attachRawObject only
+	// handles objects). Validation has already rejected empty prefixes, per-path
+	// paranoia_level and per-path rule_exclusions, so what reaches the data plane
+	// is only what it can actually honour.
+	if len(p.PathOverrides) > 0 {
+		var ov []map[string]any
+		if err := json.Unmarshal(p.PathOverrides, &ov); err == nil && len(ov) > 0 {
+			waf["path_overrides"] = ov
+		}
+	}
 
 	// anti_ddos — only attach when explicitly enabled.
 	if len(p.AntiDdos) > 0 {
