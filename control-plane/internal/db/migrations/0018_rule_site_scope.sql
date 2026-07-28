@@ -17,6 +17,12 @@
 -- a narrow, app-specific rule to every remaining site — the opposite of what its
 -- author asked for, and a false-positive source nobody would think to look for.
 
+-- NOTE on the function: it must be DROPPED before being recreated, not replaced.
+-- CREATE OR REPLACE FUNCTION cannot change a function's return type, and this adds
+-- site_id to the signature 0017 established, so a plain REPLACE fails with
+-- SQLSTATE 42P13. Found by running the migration against a real database, which
+-- is the only way this class of error shows up.
+
 -- +goose Up
 -- +goose StatementBegin
 
@@ -34,7 +40,8 @@ CREATE INDEX IF NOT EXISTS rules_site_idx ON rules(site_id) WHERE site_id IS NOT
 -- Rebuild the carve-out to expose site_id. Same exclusions as 0017: 'crs' and
 -- 'community' rows are demo fixtures that reuse real CRS ids (CRS-942100 is
 -- rx /union|select|insert/ with a blocking action) and must never be delivered.
-CREATE OR REPLACE FUNCTION sentinel_deployable_rules()
+DROP FUNCTION IF EXISTS sentinel_deployable_rules();
+CREATE FUNCTION sentinel_deployable_rules()
 RETURNS TABLE (tenant_id uuid, site_id uuid, name text, dsl text,
                source text, phase int, severity text)
 LANGUAGE sql
@@ -57,7 +64,8 @@ GRANT EXECUTE ON FUNCTION sentinel_deployable_rules() TO sentinel_app;
 -- +goose Down
 -- +goose StatementBegin
 
-CREATE OR REPLACE FUNCTION sentinel_deployable_rules()
+DROP FUNCTION IF EXISTS sentinel_deployable_rules();
+CREATE FUNCTION sentinel_deployable_rules()
 RETURNS TABLE (tenant_id uuid, name text, dsl text, source text, phase int, severity text)
 LANGUAGE sql
 STABLE
