@@ -71,7 +71,9 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-[[ $EUID -eq 0 ]] || die "run as root — this installs keepalived and writes to /etc"
+# --check also needs root: the state it reads lives under /etc/sentinel, which is
+# 0700 because it holds the VRRP password.
+[[ $EUID -eq 0 ]] || die "run as root — this reads /etc/sentinel and manages keepalived"
 [[ -n "$DOCKER_DIR" ]] || die "cannot find deploy/docker next to this script"
 
 # ── validation helpers ───────────────────────────────────────────────────────
@@ -254,9 +256,7 @@ PY
     say  "  ${DIM}and switch both DSNs to verify-full before this carries real traffic —${R}"
     say  "  ${DIM}replication streams the entire database across the network.${R}"
   fi
-  say ""
-  say "  ${B}Copy this file to the SAME path on the slave before running it there:${R}"
-  say "    ${DIM}scp $ENV_FILE root@${PEER_IP}:$ENV_FILE${R}"
+  say "  ${DIM}two files must be copied to the slave — exact commands are printed at the end${R}"
 else
   # The slave CANNOT generate its own secrets. Different JWT/internal/HMAC values
   # would produce two stacks that reject each other's tokens and cannot verify the
@@ -415,5 +415,38 @@ cat <<SUMMARY
 
   Verify        ./install-2vm.sh --check
   Transitions   tail -f /var/log/sentinel-vrrp.log
-  Next VM       run this script there and answer '$( [[ "$ROLE" == master ]] && echo slave || echo master )'
 SUMMARY
+
+if [[ "$ROLE" == "master" ]]; then
+cat <<NEXT
+
+  ${B}Next — set up the slave${R}
+
+  1. Copy BOTH of these to VM 2. Neither is optional:
+
+       scp $ENV_FILE root@${PEER_IP}:$ENV_FILE
+       scp $STATE_DIR/2vm-vrrp-pass root@${PEER_IP}:$STATE_DIR/2vm-vrrp-pass
+
+     ${DIM}.env carries the shared secrets — divergent JWT/internal/audit values give${R}
+     ${DIM}you two stacks that silently distrust each other. The vrrp-pass is how the${R}
+     ${DIM}nodes authenticate; if it differs, each ignores the other's adverts and${R}
+     ${DIM}BOTH become master — two hosts answering on one IP.${R}
+
+  2. On VM 2:  sudo ./install-2vm.sh   →  answer ${B}slave${R}
+
+  3. Then run the failover drill in ./README.md before relying on this.
+NEXT
+else
+cat <<NEXT
+
+  ${B}Both nodes are installed.${R} Confirm the pair actually works:
+
+    ip -4 addr show | grep $VIP        # on BOTH — exactly one must hold it
+    ./install-2vm.sh --check           # on both
+    docker exec sentinel-postgres-1 psql -U sentinel -d sentinel \
+      -c "SELECT pg_is_in_recovery();"   # here: expect 't'
+
+  Then run the failover drill in ./README.md. An untested failover is an
+  assumption, not a capability.
+NEXT
+fi
