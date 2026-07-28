@@ -49,6 +49,32 @@ Confirm the sites are where you think they are before trusting any measurement:
 SELECT name, waf_policy->>'mode' FROM sites ORDER BY name;
 ```
 
+### 1a. Know what learning mode does NOT stop
+
+Learning mode downgrades the verdict of **content inspection** — rules, ML,
+scoring. It does not disable the defences that run *before* the request is routed
+to a site, because at that point there is no site policy to consult yet:
+threat-intel IP/UA blocking, IP reputation, and anti-DDoS admission control all
+still return 403.
+
+Verified on the deploy VM with the site in learning mode: SQLi, XSS and SSTI were
+recorded and passed through (`action=DETECT`, `mode=learning`), while a request
+with a `sqlmap` user-agent was blocked outright (`action=BLOCK`, `mode=node`,
+`rule=THREATINTEL`). The `mode=node` in that row is the tell — no site
+enforcement mode was stamped, because routing had not happened yet.
+
+This is defensible: those layers match on reputation, not on your application's
+content, so they are not the false-positive source a pilot is measuring. But it
+means **"learning mode" is not "nothing blocks"**, and a legitimate user whose
+address or client appears in a threat feed will still be turned away during the
+pilot. `fpr-report.sh` reports actual blocks on a separate line from detections
+for exactly this reason — a non-zero "actually blocked" count while every site is
+in learning mode is that pre-routing layer, not a rule.
+
+If you need a genuinely inert pilot, set `mode: off` on the site instead — but
+then you measure nothing, because `off` discards the verdict rather than recording
+it.
+
 ### 2. Let it run
 
 Two weeks is the target. One week is the minimum, and it must include a full
