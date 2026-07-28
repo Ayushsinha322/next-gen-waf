@@ -3440,7 +3440,15 @@ fn enforce_mode(ctx: &mut RequestContext, mode: &WafMode) {
 fn build_rule_engines(cfg: &SentinelConfig, previous: &RuleEngineMap) -> RuleEngineMap {
     let mut map = RuleEngineMap::new();
     for site in &cfg.sites {
-        if site.waf.mode == WafMode::Off || site.waf.rules.is_empty() {
+        // A site with no rule FILES may still have operator-authored inline rules
+        // from the control plane; skipping on `rules.is_empty()` alone would build
+        // no engine and silently drop them. In practice a site configured through
+        // the dashboard always has CRS files, so this only bites the
+        // inline-rules-only case — which is exactly how a minimal virtual-patch-only
+        // site would be set up.
+        if site.waf.mode == WafMode::Off
+            || (site.waf.rules.is_empty() && site.waf.inline_rules.is_empty())
+        {
             continue;
         }
         match load_site_engine(site) {
@@ -3871,6 +3879,58 @@ fn load_site_engine(site: &SiteConfig) -> anyhow::Result<RuleEngine> {
                 .map_err(|e| anyhow!("SRL parse error in '{path_str}': {e}"))?
         };
         merged.items.extend(file.items);
+    }
+
+    // Operator-authored rules from the control plane's `rules` table.
+    //
+    // Deliberately NOT fatal on a parse error, unlike the file loop above. A rule
+    // file that fails to parse means the shipped ruleset is broken and failing the
+    // whole engine is right — the caller keeps the last-good engine. But these rules
+    // are typed into a web form, so a typo is routine, and letting one bad row take
+    // the site's ENTIRE ruleset offline (including every CRS rule) would turn a
+    // small operator mistake into an outage. Skip the bad rule, keep the rest, and
+    // make the skip loud enough to notice.
+    let file_rule_ids: std::collections::HashSet<u32> = merged
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            RuleItem::Rule(r) => Some(r.id),
+            _ => None,
+        })
+        .collect();
+
+    for inline in &site.waf.inline_rules {
+        let parsed = match sentinel_rules::parse_srl(&inline.dsl) {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(
+                    site = %site.id,
+                    rule = %inline.name,
+                    error = %e,
+                    "CUSTOM RULE NOT ENFORCED: it does not parse. Every other rule for \
+                     this site is unaffected; fix or disable this one."
+                );
+                continue;
+            }
+        };
+        for item in parsed.items {
+            // A custom rule reusing a shipped rule's id would make scoring and
+            // exclusions ambiguous — an exclusion for that id could not say which
+            // rule it meant. Refuse the duplicate rather than silently shadowing.
+            if let RuleItem::Rule(r) = &item {
+                if file_rule_ids.contains(&r.id) {
+                    warn!(
+                        site = %site.id,
+                        rule = %inline.name,
+                        id = r.id,
+                        "CUSTOM RULE NOT ENFORCED: id collides with a rule already \
+                         loaded from the shipped ruleset. Give it an unused id."
+                    );
+                    continue;
+                }
+            }
+            merged.items.push(item);
+        }
     }
 
     // Paranoia level gating.

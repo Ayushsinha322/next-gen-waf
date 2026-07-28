@@ -172,13 +172,67 @@ func SeedDev(ctx context.Context, pool Pool) error {
 		name, source, severity, dsl string
 		phase                       int
 	}
+	// These are DEMO rows, but they are also the examples an operator copies when
+	// writing their first rule, so the DSL must be valid SRL. It previously was
+	// not: every one used a `rule <name> { id: N; op: rx("...") }` shape that the
+	// parser rejects outright — the rule name IS the numeric id, and the operator
+	// form is `operator : rx /pattern/`. Nobody noticed because the rows were never
+	// delivered to the data plane and /rules/test never parsed SRL either.
+	//
+	// The four 'crs' rows are kept deliberately crude AND deliberately excluded
+	// from delivery by sentinel_deployable_rules() (migration 0017): they reuse
+	// real CRS ids and rx /union|select|insert/ would block the word "select".
+	// Real CRS reaches the data plane as files. Only the virtual_patch row below
+	// is representative of something an operator should actually write.
 	rules := []ruleSpec{
-		{"CRS-942100", "crs", "critical", `rule block-sqli { id: 942100; op: rx("union|select|insert"); action: block }`, 2},
-		{"CRS-941140", "crs", "high", `rule block-xss { id: 941140; op: rx("<script"); action: block }`, 2},
-		{"CRS-930100", "crs", "high", `rule block-traversal { id: 930100; op: rx("\.\./"); action: block }`, 1},
-		{"CRS-932100", "crs", "critical", `rule block-cmdinj { id: 932100; op: rx("; ?ls |; ?cat "); action: block }`, 2},
-		{"VP-CVE-2021-44228", "virtual_patch", "critical", `rule block-log4shell { id: 9999900; op: rx("\$\{jndi:"); action: block }`, 1},
-		{"CRS-913100", "crs", "medium", `rule detect-scanner { id: 913100; op: ua_rx("nikto|sqlmap"); action: log }`, 1},
+		{"CRS-942100", "crs", "critical", `rule 942100 {
+    phase    : request_body
+    targets  : ARGS
+    operator : rx /(?i)(union|select|insert)/
+    action   : block
+    severity : critical
+    message  : "demo only — too broad to deploy"
+}`, 2},
+		{"CRS-941140", "crs", "high", `rule 941140 {
+    phase    : request_body
+    targets  : ARGS
+    operator : rx /(?i)<script/
+    action   : block
+    severity : high
+    message  : "demo only"
+}`, 2},
+		{"CRS-930100", "crs", "high", `rule 930100 {
+    phase    : request_body
+    targets  : ARGS
+    operator : rx /\.\.\//
+    action   : block
+    severity : high
+    message  : "demo only"
+}`, 1},
+		{"CRS-932100", "crs", "critical", `rule 932100 {
+    phase    : request_body
+    targets  : ARGS
+    operator : rx /;\s?(ls|cat)\s/
+    action   : block
+    severity : critical
+    message  : "demo only"
+}`, 2},
+		{"VP-CVE-2021-44228", "virtual_patch", "critical", `rule 9999900 {
+    phase    : request_body
+    targets  : ARGS|REQUEST_HEADERS|REQUEST_COOKIES
+    operator : rx /\$\{jndi:/
+    action   : block
+    severity : critical
+    message  : "Log4Shell JNDI lookup (CVE-2021-44228)"
+}`, 1},
+		{"CRS-913100", "crs", "medium", `rule 913100 {
+    phase    : request_headers
+    targets  : REQUEST_HEADERS:User-Agent
+    operator : rx /(?i)(nikto|sqlmap)/
+    action   : log
+    severity : medium
+    message  : "demo only"
+}`, 1},
 	}
 	for _, r := range rules {
 		_, err = tx.Exec(ctx, `

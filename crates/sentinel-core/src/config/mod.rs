@@ -469,6 +469,19 @@ pub struct WafConfig {
     pub fusion: Option<FusionConfig>,
     #[serde(default)]
     pub rules: Vec<String>,
+    /// Operator-authored rules delivered as SRL source by the control plane,
+    /// rather than as a file path like `rules`.
+    ///
+    /// These come from the `rules` table and exist so an operator can virtual-patch
+    /// a zero-day without waiting for a data-plane image rebuild: the control plane
+    /// bumps the config version, the fleet re-fetches, and the rule is live.
+    ///
+    /// Source is shipped instead of compiled bytecode deliberately — bytecode would
+    /// couple the control plane's compiler version to the data plane's and make a
+    /// version skew silently mis-execute rules. Parsing here costs microseconds at
+    /// reload time and keeps exactly one compiler in the system.
+    #[serde(default)]
+    pub inline_rules: Vec<InlineRule>,
     pub ml: Option<MlConfig>,
     pub ip_reputation: Option<IpReputationConfig>,
     pub rate_limit: Option<RateLimitConfig>,
@@ -535,6 +548,17 @@ pub struct CorsConfig {
 pub struct CustomHeader {
     pub name: String,
     pub value: String,
+}
+
+/// One operator-authored rule, carried as SRL source from the control plane.
+///
+/// `name` is for diagnostics only: it is what gets logged when the rule fails to
+/// parse, so an operator can find the offending row in the UI. Rule identity for
+/// scoring and exclusions still comes from the `id:` inside the DSL.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct InlineRule {
+    pub name: String,
+    pub dsl: String,
 }
 
 /// Removes one or more targets from a rule to suppress known false positives.

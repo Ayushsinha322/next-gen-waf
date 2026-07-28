@@ -970,3 +970,48 @@ func (s *Store) DeleteRule(ctx context.Context, tenantID, userID, ruleID string)
 	}
 	return tx.Commit(ctx)
 }
+
+// DeployableRule is one operator-authored rule bound for the data plane.
+type DeployableRule struct {
+	TenantID string
+	Name     string
+	DSL      string
+	Source   string
+	Phase    int
+	Severity string
+}
+
+// ListDeployableRules returns every enabled, operator-authored rule across all
+// tenants, keyed by tenant id.
+//
+// Node-global on purpose: /internal/config serves every tenant's sites from one
+// data plane, so this mirrors ListAllActiveSites and reads through the
+// sentinel_deployable_rules() carve-out (migration 0017) rather than querying
+// `rules` directly — under FORCE RLS a direct query would return no rows and the
+// custom rules would silently stop being enforced.
+//
+// Rows with source 'crs'/'community' are excluded by the function itself; see the
+// migration for why that filter is load-bearing rather than cosmetic.
+func (s *Store) ListDeployableRules(ctx context.Context) (map[string][]DeployableRule, error) {
+	pg, ok := s.pool.(*pgxPool)
+	if !ok {
+		return nil, fmt.Errorf("store: pool is not a *pgxPool")
+	}
+	rows, err := pg.pool.Query(ctx,
+		`SELECT tenant_id, name, dsl, source, phase, severity
+		 FROM sentinel_deployable_rules()`)
+	if err != nil {
+		return nil, fmt.Errorf("store: list deployable rules: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[string][]DeployableRule)
+	for rows.Next() {
+		var r DeployableRule
+		if err := rows.Scan(&r.TenantID, &r.Name, &r.DSL, &r.Source, &r.Phase, &r.Severity); err != nil {
+			return nil, err
+		}
+		out[r.TenantID] = append(out[r.TenantID], r)
+	}
+	return out, rows.Err()
+}
