@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/your-org/sentinel-waf/control-plane/internal/db"
 )
 
 // The tuned detection configuration is a pair: anomaly_threshold 10 AND rule
@@ -323,5 +325,109 @@ func TestValidPathOverridesPass(t *testing.T) {
 	]}`)
 	if problems := validateWafPolicyValues(policy); len(problems) != 0 {
 		t.Errorf("valid overrides were rejected: %+v", problems)
+	}
+}
+
+// Rule scoping. A rule with no site_id is deployment-wide (the virtual-patch
+// case); one with a site_id must reach only that site. Getting this backwards
+// either leaks an app-specific rule across every site or silently drops a
+// virtual patch, so both directions are pinned.
+
+func inlineNames(t *testing.T, rs map[string]any) []string {
+	t.Helper()
+	waf, ok := rs["waf"].(map[string]any)
+	if !ok {
+		t.Fatalf("no waf block")
+	}
+	raw, present := waf["inline_rules"]
+	if !present {
+		return nil
+	}
+	list, ok := raw.([]map[string]any)
+	if !ok {
+		t.Fatalf("inline_rules has type %T", raw)
+	}
+	out := make([]string, 0, len(list))
+	for _, e := range list {
+		out = append(out, e["name"].(string))
+	}
+	return out
+}
+
+func siteScopeFixture(t *testing.T) []db.DeployableRule {
+	t.Helper()
+	return []db.DeployableRule{
+		{Name: "wide-virtual-patch", DSL: "rule 1 { }", SiteID: ""},
+		{Name: "only-site-a", DSL: "rule 2 { }", SiteID: "site-a"},
+		{Name: "only-site-b", DSL: "rule 3 { }", SiteID: "site-b"},
+	}
+}
+
+func TestDeploymentWideRuleReachesEverySite(t *testing.T) {
+	for _, site := range []string{"site-a", "site-b", "site-c"} {
+		rs := map[string]any{"waf": map[string]any{"mode": "blocking"}}
+		attachInlineRules(rs, site, siteScopeFixture(t))
+		names := inlineNames(t, rs)
+		found := false
+		for _, n := range names {
+			if n == "wide-virtual-patch" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("site %s did not receive the deployment-wide rule (got %v)", site, names)
+		}
+	}
+}
+
+func TestSiteScopedRuleReachesOnlyThatSite(t *testing.T) {
+	rsA := map[string]any{"waf": map[string]any{"mode": "blocking"}}
+	attachInlineRules(rsA, "site-a", siteScopeFixture(t))
+	namesA := inlineNames(t, rsA)
+
+	rsB := map[string]any{"waf": map[string]any{"mode": "blocking"}}
+	attachInlineRules(rsB, "site-b", siteScopeFixture(t))
+	namesB := inlineNames(t, rsB)
+
+	has := func(list []string, want string) bool {
+		for _, n := range list {
+			if n == want {
+				return true
+			}
+		}
+		return false
+	}
+	if !has(namesA, "only-site-a") {
+		t.Errorf("site-a missing its own rule: %v", namesA)
+	}
+	if has(namesA, "only-site-b") {
+		t.Errorf("site-a received site-b's rule — scoping leaked: %v", namesA)
+	}
+	if !has(namesB, "only-site-b") {
+		t.Errorf("site-b missing its own rule: %v", namesB)
+	}
+	if has(namesB, "only-site-a") {
+		t.Errorf("site-b received site-a's rule — scoping leaked: %v", namesB)
+	}
+	if len(namesA) != 2 || len(namesB) != 2 {
+		t.Errorf("each site should get exactly 2 rules (wide + own), got a=%v b=%v", namesA, namesB)
+	}
+}
+
+func TestModeOffSiteGetsNoInlineRules(t *testing.T) {
+	rs := map[string]any{"waf": map[string]any{"mode": "off"}}
+	attachInlineRules(rs, "site-a", siteScopeFixture(t))
+	if names := inlineNames(t, rs); len(names) != 0 {
+		t.Errorf("a mode=off site must receive no rules, got %v", names)
+	}
+}
+
+func TestEmptyDSLIsNotDelivered(t *testing.T) {
+	rs := map[string]any{"waf": map[string]any{"mode": "blocking"}}
+	attachInlineRules(rs, "site-a", []db.DeployableRule{
+		{Name: "blank", DSL: "   ", SiteID: ""},
+	})
+	if names := inlineNames(t, rs); len(names) != 0 {
+		t.Errorf("a blank DSL must not be delivered, got %v", names)
 	}
 }

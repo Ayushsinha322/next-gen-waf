@@ -1134,7 +1134,7 @@ func handleInternalConfig(c *gin.Context, store *db.Store, log *zap.Logger) {
 			})
 			continue
 		}
-		attachInlineRules(rs, rulesByTenant[s.TenantID])
+		attachInlineRules(rs, s.ID, rulesByTenant[s.TenantID])
 		rustSites = append(rustSites, rs)
 	}
 	// Shared, DB-derived, restart-surviving freshness signal (migration 0012).
@@ -1665,14 +1665,17 @@ func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
 // upgrade could mis-execute a rule instead of failing visibly. The data plane owns
 // the only compiler.
 //
-// Applied to every site of the tenant, because `rules` has no site_id column. For
-// the one-dedicated-stack-per-customer model that is the right shape — a virtual
-// patch should cover the whole deployment, not one hostname — but it does mean
-// there is no way to scope a custom rule to a single site yet. A nullable
-// rules.site_id is the migration to add when that is needed.
+// A rule with no site_id is deployment-wide, which is the right default for what
+// the feature exists for: a virtual patch for a CVE should cover everything, not
+// one hostname. A rule scoped to a site reaches only that site, because tuning is
+// inherently per-site — a rule written for one application's checkout flow can
+// only cost latency and false-positive risk everywhere else.
+//
+// siteID is the site being configured; pass "" and only deployment-wide rules
+// attach.
 //
 // A site with mode "off" gets nothing: off means off, matching buildRustWaf.
-func attachInlineRules(rs map[string]any, rules []db.DeployableRule) {
+func attachInlineRules(rs map[string]any, siteID string, rules []db.DeployableRule) {
 	if len(rules) == 0 {
 		return
 	}
@@ -1686,6 +1689,10 @@ func attachInlineRules(rs map[string]any, rules []db.DeployableRule) {
 	inline := make([]map[string]any, 0, len(rules))
 	for _, r := range rules {
 		if strings.TrimSpace(r.DSL) == "" {
+			continue
+		}
+		// Deployment-wide (empty SiteID) or scoped to exactly this site.
+		if r.SiteID != "" && r.SiteID != siteID {
 			continue
 		}
 		inline = append(inline, map[string]any{"name": r.Name, "dsl": r.DSL})
@@ -2134,6 +2141,19 @@ func handleCreateRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+	// A rule scoped to a site the caller cannot see would be created and then
+	// never delivered anywhere — it would sit in the UI looking enabled and do
+	// nothing. Reject it with the reason instead. The tenant-scoped GetSite also
+	// stops one tenant scoping a rule onto another tenant's site.
+	if req.SiteID != nil && strings.TrimSpace(*req.SiteID) != "" && store != nil {
+		if _, err := store.GetSite(c.Request.Context(), claims.TenantID, *req.SiteID); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "site_id does not refer to a site in this tenant; omit it for a " +
+					"deployment-wide rule",
+			})
+			return
+		}
 	}
 	if !requireLeader(c, cl) {
 		return

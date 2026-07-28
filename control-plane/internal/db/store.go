@@ -39,8 +39,10 @@ type SiteRow struct {
 }
 
 type RuleRow struct {
-	ID        string    `json:"id"`
-	TenantID  string    `json:"tenant_id"`
+	ID       string `json:"id"`
+	TenantID string `json:"tenant_id"`
+	// SiteID is empty for a deployment-wide rule.
+	SiteID    string    `json:"site_id,omitempty"`
 	Name      string    `json:"name"`
 	Source    string    `json:"source"`
 	Phase     int       `json:"phase"`
@@ -451,7 +453,8 @@ func (s *Store) ListRules(ctx context.Context, tenantID, userID string) ([]RuleR
 
 	// Explicit tenant predicate (defense-in-depth): see ListSites / migration 0003.
 	rows, err := tx.Query(ctx,
-		`SELECT id, tenant_id, name, source, phase, severity, dsl, enabled, tags, created_at, updated_at
+		`SELECT id, tenant_id, name, source, phase, severity, dsl, enabled, tags,
+		        created_at, updated_at, site_id
 		 FROM rules WHERE tenant_id = $1 ORDER BY created_at DESC`, tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("store: list rules: %w", err)
@@ -461,9 +464,14 @@ func (s *Store) ListRules(ctx context.Context, tenantID, userID string) ([]RuleR
 	var rules []RuleRow
 	for rows.Next() {
 		var r RuleRow
+		var siteID *string
 		if err := rows.Scan(&r.ID, &r.TenantID, &r.Name, &r.Source, &r.Phase,
-			&r.Severity, &r.DSL, &r.Enabled, &r.Tags, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			&r.Severity, &r.DSL, &r.Enabled, &r.Tags, &r.CreatedAt, &r.UpdatedAt,
+			&siteID); err != nil {
 			return nil, err
+		}
+		if siteID != nil {
+			r.SiteID = *siteID
 		}
 		rules = append(rules, r)
 	}
@@ -904,6 +912,9 @@ type CreateRuleRequest struct {
 	DSL      string   `json:"dsl"`
 	Tags     []string `json:"tags"`
 	Enabled  *bool    `json:"enabled"`
+	// SiteID scopes the rule to one site. Omit (or send null) for a
+	// deployment-wide rule, which is what a virtual patch wants.
+	SiteID *string `json:"site_id"`
 }
 
 func (s *Store) CreateRule(ctx context.Context, tenantID, userID string, req CreateRuleRequest) (*RuleRow, error) {
@@ -927,14 +938,25 @@ func (s *Store) CreateRule(ctx context.Context, tenantID, userID string, req Cre
 	}
 	defer tx.Rollback(ctx)
 
+	// An empty string is not a valid uuid and is not the same as "no site", so
+	// normalise it to NULL rather than letting the insert fail on a blank field
+	// from a form.
+	if req.SiteID != nil && strings.TrimSpace(*req.SiteID) == "" {
+		req.SiteID = nil
+	}
+
 	var r RuleRow
+	var siteID *string
 	err = tx.QueryRow(ctx,
-		`INSERT INTO rules (tenant_id, name, source, phase, severity, dsl, enabled, tags)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-		 RETURNING id, tenant_id, name, source, phase, severity, dsl, enabled, tags, created_at, updated_at`,
-		tenantID, req.Name, req.Source, req.Phase, req.Severity, req.DSL, enabled, req.Tags,
+		`INSERT INTO rules (tenant_id, name, source, phase, severity, dsl, enabled, tags, site_id)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+		 RETURNING id, tenant_id, name, source, phase, severity, dsl, enabled, tags, created_at, updated_at, site_id`,
+		tenantID, req.Name, req.Source, req.Phase, req.Severity, req.DSL, enabled, req.Tags, req.SiteID,
 	).Scan(&r.ID, &r.TenantID, &r.Name, &r.Source, &r.Phase, &r.Severity,
-		&r.DSL, &r.Enabled, &r.Tags, &r.CreatedAt, &r.UpdatedAt)
+		&r.DSL, &r.Enabled, &r.Tags, &r.CreatedAt, &r.UpdatedAt, &siteID)
+	if siteID != nil {
+		r.SiteID = *siteID
+	}
 	if err != nil {
 		return nil, fmt.Errorf("store: create rule: %w", err)
 	}
@@ -974,6 +996,9 @@ func (s *Store) DeleteRule(ctx context.Context, tenantID, userID, ruleID string)
 // DeployableRule is one operator-authored rule bound for the data plane.
 type DeployableRule struct {
 	TenantID string
+	// SiteID is empty for a deployment-wide rule (the virtual-patch case) and
+	// set when the operator scoped the rule to a single site.
+	SiteID   string
 	Name     string
 	DSL      string
 	Source   string
@@ -998,7 +1023,7 @@ func (s *Store) ListDeployableRules(ctx context.Context) (map[string][]Deployabl
 		return nil, fmt.Errorf("store: pool is not a *pgxPool")
 	}
 	rows, err := pg.pool.Query(ctx,
-		`SELECT tenant_id, name, dsl, source, phase, severity
+		`SELECT tenant_id, site_id, name, dsl, source, phase, severity
 		 FROM sentinel_deployable_rules()`)
 	if err != nil {
 		return nil, fmt.Errorf("store: list deployable rules: %w", err)
@@ -1008,8 +1033,13 @@ func (s *Store) ListDeployableRules(ctx context.Context) (map[string][]Deployabl
 	out := make(map[string][]DeployableRule)
 	for rows.Next() {
 		var r DeployableRule
-		if err := rows.Scan(&r.TenantID, &r.Name, &r.DSL, &r.Source, &r.Phase, &r.Severity); err != nil {
+		var siteID *string
+		if err := rows.Scan(&r.TenantID, &siteID, &r.Name, &r.DSL,
+			&r.Source, &r.Phase, &r.Severity); err != nil {
 			return nil, err
+		}
+		if siteID != nil {
+			r.SiteID = *siteID
 		}
 		out[r.TenantID] = append(out[r.TenantID], r)
 	}
