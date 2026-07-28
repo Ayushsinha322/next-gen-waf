@@ -111,6 +111,18 @@ export interface Site {
   updated_at: string;
 }
 
+/** How the fleet reports a rule, as opposed to what the database stores.
+ *
+ * "enabled" only ever meant "stored". These come from the data plane, which owns
+ * the SRL compiler and is the only component that knows whether a rule actually
+ * compiled — so a rule can be enabled and NOT be protecting anything. */
+export type RuleEnforcement =
+  | "enforced"      // a data-plane node confirms it is compiled and live
+  | "not_enforced"  // a node compiled the config and rejected it
+  | "disabled"      // operator switched it off; nothing to observe
+  | "not_deployed"  // excluded from delivery by design (crs/community)
+  | "unknown";      // no node has reported recently
+
 export interface Rule {
   id:         string;
   tenant_id:  string;
@@ -123,6 +135,15 @@ export interface Rule {
   tags:       string[];
   created_at: string;
   updated_at: string;
+  /** Empty/absent means the rule applies to every site in the deployment. */
+  site_id?:   string;
+  enforcement?:       RuleEnforcement;
+  /** Why it is not enforced — the parse error, verbatim from the compiler. */
+  enforcement_error?: string;
+  /** Why it is not deployed, for states that are correct-by-design. */
+  enforcement_note?:  string;
+  nodes_enforcing?:   number;
+  nodes_reporting?:   number;
 }
 
 export interface Alert {
@@ -445,12 +466,29 @@ export interface APIKeyRow {
   last_used:  string;
 }
 
+/** One rule as the compiler actually understood it. */
+export interface CompiledRuleSummary {
+  id:       number;
+  phase:    string;
+  action:   string;
+  severity: string;
+}
+
 export interface RuleTestResult {
   verdict:       string;
   matched:       boolean;
   detail:        string;
   anomaly_score: number;
   phases_run:    string[];
+  /** false when the DSL does not compile. Absent on responses from a control
+   *  plane older than 2026-07-28, which could not tell valid from invalid. */
+  valid?:            boolean;
+  /** Verdict from the real rule VM: Allow | Block | Limit | Challenge | Log. */
+  decision?:         string;
+  matched_rule_ids?: string[];
+  /** What the DSL compiled to — surfaces a rule that parses but defines nothing. */
+  rules?:            CompiledRuleSummary[];
+  error?:            string;
 }
 
 /** Certificate source as reported by the data plane. */
@@ -643,9 +681,23 @@ export const api = {
     list:   () => apiFetch<{ rules: Rule[]; tenant_id: string }>("/rules"),
     create: (body: Partial<Rule>) =>
       apiFetch<{ rule: Rule }>("/rules", { method: "POST", body: JSON.stringify(body) }),
+    /** Enable/disable only. PATCH is a full partial-update now, so the toggle
+     *  lives on its own route to keep the two intentions apart. */
     toggle: (id: string, enabled: boolean) =>
       apiFetch<{ ok: boolean; id: string; enabled: boolean }>(
-        `/rules/${id}`, { method: "PATCH", body: JSON.stringify({ enabled }) }
+        `/rules/${id}/enabled`, { method: "PUT", body: JSON.stringify({ enabled }) }
+      ),
+    /** Partial update. An omitted field is left alone. A dsl change is validated
+     *  against the real engine and refused if it would not run — so a failed call
+     *  here means the EXISTING rule is still in place, not that it was replaced
+     *  with something broken. */
+    update: (id: string, body: {
+      dsl?: string; severity?: string; phase?: number;
+      tags?: string[]; enabled?: boolean;
+      site_id?: string; clear_site_id?: boolean;
+    }) =>
+      apiFetch<{ rule: Rule; warning?: string }>(
+        `/rules/${id}`, { method: "PATCH", body: JSON.stringify(body) }
       ),
     delete: (id: string) =>
       apiFetch<{ ok: boolean }>(`/rules/${id}`, { method: "DELETE" }),

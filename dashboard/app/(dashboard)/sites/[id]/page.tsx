@@ -13,11 +13,11 @@ import { showToast } from "@/components/ui/Toast";
 import { api, type Site, type Certificate, type SiteStat, type LearningStat } from "@/lib/api";
 import { staggerContainer, cardVariants, fadeUp } from "@/lib/animations";
 import SiteWizard from "@/components/sites/SiteWizard";
-import { siteToForm, type SiteForm, CRS_CATEGORIES } from "@/lib/siteConfig";
+import { siteToForm, type SiteForm, type PathOverride, CRS_CATEGORIES } from "@/lib/siteConfig";
 
 type WafRow = { ts: string; ip: string; rule: string; attack: string; sev: string; action: string };
 type AccessRow = { ts: string; ip: string; method: string; path: string; status: number; latency: number };
-type Tab = "overview" | "waf" | "access" | "learning" | "cert";
+type Tab = "overview" | "waf" | "access" | "learning" | "paths" | "cert";
 
 const MODES = [
   { key: "off",      label: "Off",      desc: "WAF disabled — pass-through",         color: "var(--text3)" },
@@ -45,6 +45,7 @@ export default function SiteDetailPage() {
   const [learn, setLearn] = useState<LearningStat[]>([]);
   const [learnBusy, setLearnBusy] = useState<number | null>(null);
   const [tab, setTab] = useState<Tab>("overview");
+  const [pathBusy, setPathBusy] = useState(false);
   const [busy, setBusy] = useState(false);
   const [editing, setEditing] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -129,6 +130,43 @@ export default function SiteDetailPage() {
       await loadSite();
     } catch (e) { showToast(e instanceof Error ? e.message : "Failed", "e", "⚠️"); }
     finally { setLearnBusy(null); }
+  }
+
+  /** Persist the path-override list.
+   *
+   *  Sent as a merge into the existing waf_policy so nothing else on the site is
+   *  disturbed. Incomplete rows are dropped rather than sent: the API refuses an
+   *  override that sets neither mode nor threshold, and a half-typed row should
+   *  not fail the operator's whole save. */
+  async function savePathOverrides() {
+    if (!site || !form) return;
+    setPathBusy(true);
+    try {
+      const clean = (form.path_overrides ?? [])
+        .filter(o => o.path_prefix.trim() !== "")
+        .map(o => {
+          const out: Record<string, unknown> = { path_prefix: o.path_prefix.trim() };
+          if (o.mode) out.mode = o.mode;
+          if (o.anomaly_threshold !== "" && o.anomaly_threshold !== undefined) {
+            out.anomaly_threshold = Number(o.anomaly_threshold);
+          }
+          return out;
+        })
+        .filter(o => o.mode !== undefined || o.anomaly_threshold !== undefined);
+
+      await api.sites.update(siteId, {
+        waf_policy: { ...(site.waf_policy as object), path_overrides: clean },
+      });
+      showToast(
+        clean.length ? `${clean.length} path override(s) saved` : "Path overrides cleared",
+        "s", "🛣",
+      );
+      await loadSite();
+    } catch (err: unknown) {
+      // The API validates prefixes and rejects per-path paranoia_level /
+      // rule_exclusions, so surface its message rather than a generic failure.
+      showToast(err instanceof Error ? err.message : "Could not save path overrides", "e", "⚠️");
+    } finally { setPathBusy(false); }
   }
 
   async function reEnableRule(ruleId: string) {
@@ -252,7 +290,7 @@ export default function SiteDetailPage() {
 
       {/* Tabs */}
       <motion.div variants={fadeUp} style={{ display: "flex", gap: 4, padding: 4, background: "var(--bg3)", borderRadius: 10, width: "fit-content" }}>
-        {([["overview", "🗂 Overview"], ["waf", "🛡️ WAF Logs"], ["access", "📡 Access Logs"], ["learning", "📚 Learning Report"], ["cert", "🔐 Certificate"]] as [Tab, string][]).map(([k, label]) => (
+        {([["overview", "🗂 Overview"], ["waf", "🛡️ WAF Logs"], ["access", "📡 Access Logs"], ["learning", "📚 Learning Report"], ["paths", "🛣 Path Policy"], ["cert", "🔐 Certificate"]] as [Tab, string][]).map(([k, label]) => (
           <button key={k} onClick={() => setTab(k)} style={{
             padding: "7px 16px", borderRadius: 7, border: "none", cursor: "pointer", fontSize: 14, fontWeight: 600,
             background: tab === k ? "var(--cyan)" : "transparent", color: tab === k ? "#021018" : "var(--text2)",
@@ -277,6 +315,7 @@ export default function SiteDetailPage() {
                 <KV k="Anomaly threshold" v={String(form.anomaly_threshold)} />
                 <KV k="CRS categories" v={`${form.rule_categories.length}/${CRS_CATEGORIES.length} enabled`} />
                 <KV k="Rule exclusions" v={`${form.rule_exclusions.length}`} />
+                <KV k="Path overrides" v={`${(form.path_overrides ?? []).length}`} />
                 <KV k="ML anomaly" v={form.ml_enabled ? `on (${form.ml_sensitivity})` : "off"} />
               </ConfigCard>
               <ConfigCard title="Rate & DDoS">
@@ -429,6 +468,110 @@ export default function SiteDetailPage() {
                   </div>
                 </div>
               )}
+            </div>
+          )}
+
+          {/* PATH POLICY — per-path overrides */}
+          {tab === "paths" && form && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              <div className="panel">
+                <div className="ph">
+                  <div className="ptitle">Per-path policy overrides</div>
+                  <button className="btn bp btn-sm" disabled={pathBusy} onClick={savePathOverrides}>
+                    {pathBusy ? "Saving…" : "💾 Save"}
+                  </button>
+                </div>
+                <div className="pb" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                  <div className="td3" style={{ fontSize: 13, lineHeight: 1.6 }}>
+                    One site normally means one policy, which is necessarily wrong somewhere:
+                    strict enough for an API is too strict for content pages, and static assets
+                    need no inspection at all. These override the site policy
+                    (<span style={{ fontFamily: "var(--font-mono)" }}>mode {form.mode} · threshold {form.anomaly_threshold}</span>)
+                    for requests whose path starts with the given prefix.
+                    <br />
+                    <strong>Longest matching prefix wins</strong>, so
+                    <span style={{ fontFamily: "var(--font-mono)" }}> /api/admin/ </span>
+                    beats <span style={{ fontFamily: "var(--font-mono)" }}>/api/</span> no matter what
+                    order they are listed in. Paranoia level and rule exclusions cannot vary by path —
+                    they decide which rules get compiled into the engine, so they stay site-wide.
+                  </div>
+
+                  {(form.path_overrides ?? []).length === 0 ? (
+                    <Empty text="No overrides — every path uses the site policy." />
+                  ) : (
+                    <div className="tw">
+                      <table>
+                        <thead><tr><th>Path prefix</th><th>Mode</th><th>Threshold</th><th style={{ textAlign: "right" }}></th></tr></thead>
+                        <tbody>
+                          {(form.path_overrides ?? []).map((o, i) => (
+                            <tr key={i}>
+                              <td>
+                                <input className="fin2" style={{ width: "100%", minWidth: 160 }}
+                                  placeholder="/api/" value={o.path_prefix}
+                                  onChange={e => setForm(f => f && ({
+                                    ...f,
+                                    path_overrides: f.path_overrides.map((x, j) =>
+                                      j === i ? { ...x, path_prefix: e.target.value } : x),
+                                  }))} />
+                              </td>
+                              <td>
+                                <select className="fin2 fsel2" value={o.mode ?? ""}
+                                  onChange={e => setForm(f => f && ({
+                                    ...f,
+                                    path_overrides: f.path_overrides.map((x, j) =>
+                                      j === i ? { ...x, mode: e.target.value as PathOverride["mode"] } : x),
+                                  }))}>
+                                  <option value="">(inherit site)</option>
+                                  <option value="blocking">blocking</option>
+                                  <option value="learning">learning — record, do not block</option>
+                                  <option value="off">off — exempt this path</option>
+                                </select>
+                              </td>
+                              <td>
+                                <input className="fin2" type="number" min={1} style={{ width: 90 }}
+                                  placeholder="inherit" value={o.anomaly_threshold ?? ""}
+                                  onChange={e => setForm(f => f && ({
+                                    ...f,
+                                    path_overrides: f.path_overrides.map((x, j) =>
+                                      j === i ? { ...x, anomaly_threshold: e.target.value === "" ? "" : Number(e.target.value) } : x),
+                                  }))} />
+                              </td>
+                              <td style={{ textAlign: "right" }}>
+                                <button className="btn bg-btn btn-xs"
+                                  onClick={() => setForm(f => f && ({
+                                    ...f, path_overrides: f.path_overrides.filter((_, j) => j !== i),
+                                  }))}>🗑 Remove</button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button className="btn bc btn-sm"
+                      onClick={() => setForm(f => f && ({
+                        ...f, path_overrides: [...(f.path_overrides ?? []), { path_prefix: "", mode: "", anomaly_threshold: "" }],
+                      }))}>＋ Add override</button>
+                    <button className="btn bg-btn btn-sm"
+                      title="Common starting point: exempt static assets, watch a legacy path, tighten the API"
+                      onClick={() => setForm(f => f && ({
+                        ...f,
+                        path_overrides: [
+                          { path_prefix: "/assets/", mode: "off",      anomaly_threshold: "" },
+                          { path_prefix: "/static/", mode: "off",      anomaly_threshold: "" },
+                          { path_prefix: "/api/",    mode: "",         anomaly_threshold: 5 },
+                        ],
+                      }))}>Suggest a starting set</button>
+                  </div>
+
+                  <div className="td3" style={{ fontSize: 12 }}>
+                    An override that sets neither mode nor threshold would do nothing and is
+                    dropped on save. Changes take effect on the fleet within seconds — no restart.
+                  </div>
+                </div>
+              </div>
             </div>
           )}
 

@@ -61,6 +61,18 @@ export interface RuleExclusion {
   disable?:        boolean;
 }
 
+/** Per-path policy override. Longest matching prefix wins, so /api/admin/ beats
+ *  /api/ regardless of the order rows were added.
+ *
+ *  Only mode and anomaly_threshold can vary by path: paranoia_level and
+ *  rule_exclusions are applied when the rule engine is COMPILED, so the API
+ *  rejects them here rather than accepting and ignoring them. */
+export interface PathOverride {
+  path_prefix:        string;
+  mode?:              WafMode | "";
+  anomaly_threshold?: number | "";
+}
+
 export interface RateWindow { rps: number; burst: number }
 
 /* ── TLS / Certificates ───────────────────────────────────────── */
@@ -161,6 +173,7 @@ export interface SiteForm {
   anomaly_threshold: number;
   rule_categories:   string[];
   rule_exclusions:   RuleExclusion[];
+  path_overrides:    PathOverride[];
 
   // request limits
   max_body_size_mb: number;
@@ -365,7 +378,7 @@ export function emptyForm(): SiteForm {
     hsts: true, hsts_max_age: 31536000,
 
     mode: "blocking", paranoia_level: 2, anomaly_threshold: 5,
-    rule_categories: [...ALL_CRS_KEYS], rule_exclusions: [],
+    rule_categories: [...ALL_CRS_KEYS], rule_exclusions: [], path_overrides: [],
 
     max_body_size_mb: 10, max_uri_length: 8192, max_header_count: 100,
     allowed_methods: ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"],
@@ -454,6 +467,21 @@ export function formToPayload(f: SiteForm): {
   if (f.proxy_ssl_sni) { proxy.ssl_sni = true; if (f.proxy_ssl_sni_name.trim()) proxy.ssl_sni_name = f.proxy_ssl_sni_name.trim(); }
   upstream.proxy = proxy;
 
+  // Drop incomplete or no-op rows rather than sending them: the API rejects an
+  // override that sets neither mode nor threshold, and a half-filled row in the
+  // UI should not fail the whole save.
+  const path_overrides = (f.path_overrides ?? [])
+    .filter(o => o.path_prefix.trim() !== "")
+    .map(o => {
+      const out: Record<string, unknown> = { path_prefix: o.path_prefix.trim() };
+      if (o.mode) out.mode = o.mode;
+      if (o.anomaly_threshold !== "" && o.anomaly_threshold !== undefined) {
+        out.anomaly_threshold = Number(o.anomaly_threshold);
+      }
+      return out;
+    })
+    .filter(o => o.mode !== undefined || o.anomaly_threshold !== undefined);
+
   const waf_policy: Record<string, unknown> = {
     mode: f.mode,
     paranoia_level: Number(f.paranoia_level) || 2,
@@ -465,6 +493,7 @@ export function formToPayload(f: SiteForm): {
     max_header_count: Number(f.max_header_count) || 100,
     allowed_methods: f.allowed_methods,
     api_discovery: f.api_discovery,
+    ...(path_overrides.length ? { path_overrides } : {}),
     // front-service exposure (informational round-trip; listener is global today)
     frontend: {
       https: f.front_https, force_https: f.force_https,
