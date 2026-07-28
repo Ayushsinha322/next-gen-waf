@@ -1404,6 +1404,12 @@ impl ProxyServer {
                             "upstreams_healthy": pool.healthy,
                             "upstreams_total": pool.total,
                             "http3_enabled": http3_enabled,
+                            // Ground truth for which operator-authored rules are
+                            // actually compiled and running on THIS node. The
+                            // control plane cannot derive this — it has no SRL
+                            // compiler — so without it "enabled" in the UI is an
+                            // assumption rather than a fact.
+                            "inline_rules": inline_rule_diag_snapshot(),
                         }
                     })
                     .to_string();
@@ -3435,6 +3441,72 @@ fn eval_rules(ctx: &mut RequestContext, engine: &RuleEngine, phase: Phase) {
     }
 }
 
+/// Whether one operator-authored rule is actually compiled into a live engine,
+/// and why not when it isn't.
+///
+/// This exists because "enabled" in the control plane has repeatedly meant
+/// "stored", not "running". A rule can be stored, enabled, listed in the UI, and
+/// still not be enforced — it failed to parse, or its id collided with a shipped
+/// rule. The data plane is the only component that knows, because it owns the
+/// compiler, so it reports back and the UI shows the truth instead of an
+/// assumption.
+#[derive(Clone, Debug, serde::Serialize)]
+struct InlineRuleDiag {
+    name: String,
+    enforced: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+static INLINE_RULE_DIAGS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::BTreeMap<String, InlineRuleDiag>>,
+> = std::sync::OnceLock::new();
+
+fn inline_rule_diags(
+) -> &'static std::sync::Mutex<std::collections::BTreeMap<String, InlineRuleDiag>> {
+    INLINE_RULE_DIAGS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+/// Wipe the registry at the start of a full engine rebuild.
+///
+/// Without this a rule the operator has since deleted keeps reporting "enforced"
+/// forever, which is the same lie in the opposite direction.
+fn reset_inline_rule_diags() {
+    if let Ok(mut m) = inline_rule_diags().lock() {
+        m.clear();
+    }
+}
+
+/// Record one rule's outcome. Keyed by name, which is unique per tenant; a rule
+/// shared by several sites either parses everywhere or nowhere, so aggregating by
+/// name loses nothing and keeps the heartbeat small.
+fn record_inline_rule_diag(name: &str, enforced: bool, error: Option<String>) {
+    if let Ok(mut m) = inline_rule_diags().lock() {
+        // A failure anywhere is the interesting outcome, so never let a later
+        // success overwrite a recorded error.
+        if let Some(existing) = m.get(name) {
+            if !existing.enforced && enforced {
+                return;
+            }
+        }
+        m.insert(
+            name.to_string(),
+            InlineRuleDiag {
+                name: name.to_string(),
+                enforced,
+                error,
+            },
+        );
+    }
+}
+
+fn inline_rule_diag_snapshot() -> Vec<InlineRuleDiag> {
+    inline_rule_diags()
+        .lock()
+        .map(|m| m.values().cloned().collect())
+        .unwrap_or_default()
+}
+
 /// The per-path override governing `path`, or None. Longest matching prefix wins,
 /// so `/api/v2/` beats `/api/` for a `/api/v2/orders` request regardless of the
 /// order an operator happened to list them in.
@@ -3499,6 +3571,9 @@ fn enforce_mode(ctx: &mut RequestContext, mode: &WafMode) {
 /// closes the reload fail-open hole where one malformed CRS/SRL push from the
 /// control plane would unprotect a previously-protected site cluster-wide.
 fn build_rule_engines(cfg: &SentinelConfig, previous: &RuleEngineMap) -> RuleEngineMap {
+    // Rebuilt from scratch every reload, so a rule the operator has since deleted
+    // stops claiming to be enforced.
+    reset_inline_rule_diags();
     let mut map = RuleEngineMap::new();
     for site in &cfg.sites {
         // A site with no rule FILES may still have operator-authored inline rules
@@ -3961,6 +4036,7 @@ fn load_site_engine(site: &SiteConfig) -> anyhow::Result<RuleEngine> {
         .collect();
 
     for inline in &site.waf.inline_rules {
+        let mut accepted = 0usize;
         let parsed = match sentinel_rules::parse_srl(&inline.dsl) {
             Ok(f) => f,
             Err(e) => {
@@ -3971,6 +4047,7 @@ fn load_site_engine(site: &SiteConfig) -> anyhow::Result<RuleEngine> {
                     "CUSTOM RULE NOT ENFORCED: it does not parse. Every other rule for \
                      this site is unaffected; fix or disable this one."
                 );
+                record_inline_rule_diag(&inline.name, false, Some(format!("does not parse: {e}")));
                 continue;
             }
         };
@@ -3987,11 +4064,31 @@ fn load_site_engine(site: &SiteConfig) -> anyhow::Result<RuleEngine> {
                         "CUSTOM RULE NOT ENFORCED: id collides with a rule already \
                          loaded from the shipped ruleset. Give it an unused id."
                     );
+                    record_inline_rule_diag(
+                        &inline.name,
+                        false,
+                        Some(format!(
+                            "rule id {} is already used by the shipped ruleset; pick an unused id",
+                            r.id
+                        )),
+                    );
                     continue;
                 }
             }
             merged.items.push(item);
+            accepted += 1;
         }
+        // Reported only when something actually made it into the engine: a DSL
+        // that parses to zero rules is not enforcing anything either.
+        record_inline_rule_diag(
+            &inline.name,
+            accepted > 0,
+            if accepted > 0 {
+                None
+            } else {
+                Some("parsed, but defined no rules".to_string())
+            },
+        );
     }
 
     // Paranoia level gating.
@@ -6884,5 +6981,170 @@ mod log_explain_tests {
         let (msg, rem) = explain_event(&ctx, "BLOCK", "THREATINTEL", "threat intel: known scanner");
         assert!(msg.contains("unrouted request"), "got: {msg}");
         assert!(rem.contains("threat-intelligence feed"), "got: {rem}");
+    }
+}
+
+#[cfg(test)]
+mod inline_rule_diag_tests {
+    use super::*;
+    use sentinel_core::config::{InlineRule, UpstreamConfig};
+
+    /// The diagnostics registry is process-global by design — it mirrors one
+    /// node's live state. Cargo runs tests in threads, so without this they clear
+    /// each other's entries and fail intermittently. Serialise them.
+    static DIAG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn guard() -> std::sync::MutexGuard<'static, ()> {
+        DIAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn site_with(inline: Vec<InlineRule>) -> SiteConfig {
+        SiteConfig {
+            id: "s".into(),
+            tenant_id: String::new(),
+            domains: vec!["s.local".into()],
+            upstream: UpstreamConfig {
+                load_balancer: sentinel_core::config::LoadBalancerStrategy::RoundRobin,
+                servers: vec![],
+                health_check: None,
+            },
+            waf: WafConfig {
+                mode: WafMode::Blocking,
+                rules: vec![],
+                inline_rules: inline,
+                ..Default::default()
+            },
+            plugins: vec![],
+            tls: Default::default(),
+        }
+    }
+
+    fn diag(name: &str) -> Option<InlineRuleDiag> {
+        inline_rule_diag_snapshot()
+            .into_iter()
+            .find(|d| d.name == name)
+    }
+
+    const GOOD: &str = r#"
+rule 9990001 {
+    phase    : request_body
+    targets  : ARGS
+    operator : rx /GOODMARKER/
+    action   : block
+    severity : critical
+    message  : "ok"
+}
+"#;
+
+    /// A rule that compiles must report enforced, and one that does not must
+    /// report the reason. This is the whole contract: the control plane has no
+    /// compiler, so if this is wrong the UI's "enabled" is a guess.
+    #[test]
+    fn records_success_and_failure_with_reasons() {
+        let _g = guard();
+        reset_inline_rule_diags();
+        let site = site_with(vec![
+            InlineRule {
+                name: "good".into(),
+                dsl: GOOD.into(),
+            },
+            InlineRule {
+                name: "bad".into(),
+                dsl: "rule nope { totally invalid (((".into(),
+            },
+        ]);
+        let _ = load_site_engine(&site);
+
+        let good = diag("good").expect("good rule should be reported");
+        assert!(good.enforced, "a rule that compiles must report enforced");
+        assert!(good.error.is_none());
+
+        let bad = diag("bad").expect("bad rule should be reported");
+        assert!(
+            !bad.enforced,
+            "a rule that does not parse must not claim to be enforced"
+        );
+        assert!(
+            bad.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("does not parse"),
+            "the failure must say why, got {:?}",
+            bad.error
+        );
+    }
+
+    /// A rule whose DSL parses but defines nothing is not enforcing anything, and
+    /// reporting it as enforced would be the same false confidence in a subtler form.
+    #[test]
+    fn parsed_but_empty_is_not_enforced() {
+        let _g = guard();
+        reset_inline_rule_diags();
+        let site = site_with(vec![InlineRule {
+            name: "empty".into(),
+            dsl: "# just a comment\n".into(),
+        }]);
+        let _ = load_site_engine(&site);
+
+        let d = diag("empty").expect("should be reported");
+        assert!(
+            !d.enforced,
+            "a DSL defining no rules must not report enforced"
+        );
+        assert!(d.error.as_deref().unwrap_or("").contains("no rules"));
+    }
+
+    /// The registry is rebuilt each reload so a deleted rule stops claiming to run.
+    #[test]
+    fn reset_clears_stale_entries() {
+        let _g = guard();
+        reset_inline_rule_diags();
+        let _ = load_site_engine(&site_with(vec![InlineRule {
+            name: "transient".into(),
+            dsl: GOOD.into(),
+        }]));
+        assert!(diag("transient").is_some(), "precondition");
+
+        reset_inline_rule_diags();
+        assert!(
+            diag("transient").is_none(),
+            "a rule absent from the new config must not keep reporting enforced"
+        );
+    }
+
+    /// Snapshot must serialise to the shape the control plane parses out of the
+    /// heartbeat: a name, an enforced flag, and error only when present.
+    #[test]
+    fn snapshot_serialises_for_the_heartbeat() {
+        let _g = guard();
+        reset_inline_rule_diags();
+        record_inline_rule_diag("ok-rule", true, None);
+        record_inline_rule_diag("bad-rule", false, Some("does not parse: x".into()));
+
+        let json = serde_json::to_string(&inline_rule_diag_snapshot()).expect("serialise");
+        assert!(json.contains(r#""name":"ok-rule""#), "got {json}");
+        assert!(json.contains(r#""enforced":true"#), "got {json}");
+        assert!(
+            json.contains(r#""error":"does not parse: x""#),
+            "got {json}"
+        );
+        // The success entry must not carry a null error field.
+        let ok_part = json.split(r#"{"name":"bad-rule""#).next().unwrap_or("");
+        assert!(
+            !ok_part.contains("error"),
+            "success entry should omit error: {ok_part}"
+        );
+    }
+
+    /// A failure recorded for one site must not be overwritten by another site
+    /// succeeding, or a partially-broken rollout would report as healthy.
+    #[test]
+    fn a_failure_is_not_overwritten_by_a_later_success() {
+        let _g = guard();
+        reset_inline_rule_diags();
+        record_inline_rule_diag("r", false, Some("does not parse".into()));
+        record_inline_rule_diag("r", true, None);
+        let d = diag("r").expect("present");
+        assert!(!d.enforced, "a recorded failure must stick");
     }
 }

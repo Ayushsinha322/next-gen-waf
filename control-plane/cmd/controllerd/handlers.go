@@ -1785,7 +1785,10 @@ func handleListRules(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 			if rules == nil {
 				rules = []db.RuleRow{}
 			}
-			c.JSON(http.StatusOK, gin.H{"rules": rules, "tenant_id": claims.TenantID})
+			c.JSON(http.StatusOK, gin.H{
+				"rules":     annotateRuleEnforcement(c.Request.Context(), store, rules),
+				"tenant_id": claims.TenantID,
+			})
 			return
 		}
 	}
