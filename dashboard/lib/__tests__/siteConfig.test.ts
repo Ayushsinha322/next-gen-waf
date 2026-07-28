@@ -107,3 +107,73 @@ describe("siteToForm — round-trips the new features for editing", () => {
     expect(f.ip_feeds[0].interval).toBe("2h");
   });
 });
+
+/**
+ * Per-path policy overrides, and the round-trip that guards against silent
+ * data loss.
+ *
+ * The first version of this feature shipped with siteToForm not reading
+ * path_overrides back. Because formToPayload emits a WHOLE waf_policy and the
+ * server replaces it, loading a site and saving it for any unrelated reason —
+ * flipping the mode, editing a domain — silently DELETED the operator's per-path
+ * policy. It was found on the deploy VM after a mode change wiped four live
+ * overrides, not by a test, which is why the round-trip is pinned here now.
+ */
+describe("path overrides", () => {
+  function siteWithOverrides(): Site {
+    return {
+      id: "s1", tenant_id: "t1", name: "juice", domains: ["localhost"],
+      upstream: { load_balancer: "round_robin", servers: [{ host: "app", port: 3000, weight: 1, tls: false }] },
+      waf_policy: {
+        mode: "learning", paranoia_level: 2, anomaly_threshold: 10,
+        path_overrides: [
+          { path_prefix: "/assets/", mode: "off" },
+          { path_prefix: "/legacy/", mode: "learning" },
+          { path_prefix: "/rest/", anomaly_threshold: 3 },
+          { path_prefix: "/rest/admin/", anomaly_threshold: 2 },
+        ],
+      },
+      status: "active", created_at: "", updated_at: "",
+    } as unknown as Site;
+  }
+
+  it("survives a load/save round-trip", () => {
+    const out = formToPayload(siteToForm(siteWithOverrides()));
+    const ov = (out.waf_policy as Record<string, unknown>).path_overrides as Record<string, unknown>[];
+    expect(ov, "path_overrides must not be dropped by a round-trip").toHaveLength(4);
+    expect(ov.map(o => o.path_prefix)).toEqual(["/assets/", "/legacy/", "/rest/", "/rest/admin/"]);
+    expect(ov[0].mode).toBe("off");
+    expect(ov[3].anomaly_threshold).toBe(2);
+    // An override that only sets a threshold must not gain a bogus mode.
+    expect(ov[2].mode).toBeUndefined();
+    // ...and one that only sets a mode must not gain a bogus threshold.
+    expect(ov[0].anomaly_threshold).toBeUndefined();
+  });
+
+  it("drops rows that would have no effect, and keeps the key present", () => {
+    const f = siteToForm(siteWithOverrides());
+    f.path_overrides = [
+      { path_prefix: "/a/", mode: "off", anomaly_threshold: "" },
+      { path_prefix: "", mode: "off", anomaly_threshold: "" },          // no prefix
+      { path_prefix: "/b/", mode: "", anomaly_threshold: "" },          // sets nothing
+      { path_prefix: "  /c/  ", mode: "", anomaly_threshold: 4 },       // trimmed
+    ];
+    const ov = (formToPayload(f).waf_policy as Record<string, unknown>).path_overrides as Record<string, unknown>[];
+    expect(ov.map(o => o.path_prefix)).toEqual(["/a/", "/c/"]);
+  });
+
+  it("emits the key even when empty, so clearing is expressible", () => {
+    const f = siteToForm(siteWithOverrides());
+    f.path_overrides = [];
+    const waf = formToPayload(f).waf_policy as Record<string, unknown>;
+    expect("path_overrides" in waf, "an absent key makes 'cleared' indistinguishable from 'forgotten'").toBe(true);
+    expect(waf.path_overrides).toEqual([]);
+  });
+
+  it("a site with no overrides round-trips to an empty list, not undefined", () => {
+    const site = siteWithOverrides();
+    delete (site.waf_policy as Record<string, unknown>).path_overrides;
+    const f = siteToForm(site);
+    expect(f.path_overrides).toEqual([]);
+  });
+});

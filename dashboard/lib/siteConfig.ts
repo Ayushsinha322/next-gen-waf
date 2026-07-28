@@ -493,7 +493,10 @@ export function formToPayload(f: SiteForm): {
     max_header_count: Number(f.max_header_count) || 100,
     allowed_methods: f.allowed_methods,
     api_discovery: f.api_discovery,
-    ...(path_overrides.length ? { path_overrides } : {}),
+    // Always emitted, including when empty: waf_policy is REPLACED wholesale, so
+    // an absent key and an empty list mean the same thing to the server — but
+    // sending it explicitly keeps "cleared on purpose" legible in a request log.
+    path_overrides,
     // front-service exposure (informational round-trip; listener is global today)
     frontend: {
       https: f.front_https, force_https: f.force_https,
@@ -697,6 +700,18 @@ export function siteToForm(site: Site): SiteForm {
   const cats = arr<string>(w.rule_categories);
   f.rule_categories = cats.length ? cats : [...ALL_CRS_KEYS];
   f.rule_exclusions = arr<RuleExclusion>(w.rule_exclusions);
+  // Read back so a round-trip preserves them. Omitting this made loading a site
+  // and saving it — for any reason, e.g. flipping the mode — silently DELETE the
+  // operator's per-path policy, because formToPayload writes a whole waf_policy
+  // and the form had an empty list. Every field in SiteForm must be read here or
+  // it is data the UI quietly discards.
+  // Read as loose records: this is untrusted JSON from the API, not something
+  // already shaped like a PathOverride.
+  f.path_overrides = arr<AnyRec>(w.path_overrides).map(o => ({
+    path_prefix:       String(o.path_prefix ?? ""),
+    mode:              (o.mode as WafMode) ?? "",
+    anomaly_threshold: typeof o.anomaly_threshold === "number" ? o.anomaly_threshold : "",
+  }));
   if (typeof w.max_body_size === "number") f.max_body_size_mb = Math.round((w.max_body_size as number) / (1024 * 1024));
   f.max_uri_length = num(w.max_uri_length, 8192);
   f.max_header_count = num(w.max_header_count, 100);
