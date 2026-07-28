@@ -1097,21 +1097,25 @@ func (s *Store) UpdateRule(ctx context.Context, tenantID, userID, ruleID string,
 
 	var r RuleRow
 	var siteID *string
+	// Every parameter is explicitly cast. Without the casts Postgres cannot infer
+	// a type for a nil pointer inside COALESCE and fails the whole statement with
+	// SQLSTATE 42P18 — and userID must NOT be passed at all, since a parameter the
+	// query never references is exactly what triggered that error here first.
 	err = tx.QueryRow(ctx,
 		`UPDATE rules SET
-		    dsl      = COALESCE($4, dsl),
-		    severity = COALESCE($5, severity),
-		    phase    = COALESCE($6, phase),
-		    tags     = COALESCE($7, tags),
-		    enabled  = COALESCE($8, enabled),
-		    site_id  = CASE WHEN $9::boolean THEN NULL
-		                    WHEN $10::uuid IS NOT NULL THEN $10::uuid
+		    dsl      = COALESCE($3::text,   dsl),
+		    severity = COALESCE($4::text,   severity),
+		    phase    = COALESCE($5::int,    phase),
+		    tags     = COALESCE($6::text[], tags),
+		    enabled  = COALESCE($7::boolean, enabled),
+		    site_id  = CASE WHEN $8::boolean THEN NULL
+		                    WHEN $9::uuid IS NOT NULL THEN $9::uuid
 		                    ELSE site_id END,
 		    updated_at = NOW()
 		 WHERE id = $1 AND tenant_id = $2 AND source NOT IN ('crs','community')
 		 RETURNING id, tenant_id, name, source, phase, severity, dsl, enabled, tags,
 		           created_at, updated_at, site_id`,
-		ruleID, tenantID, userID, req.DSL, req.Severity, req.Phase, req.Tags,
+		ruleID, tenantID, req.DSL, req.Severity, req.Phase, req.Tags,
 		req.Enabled, req.ClearSiteID, siteArg,
 	).Scan(&r.ID, &r.TenantID, &r.Name, &r.Source, &r.Phase, &r.Severity,
 		&r.DSL, &r.Enabled, &r.Tags, &r.CreatedAt, &r.UpdatedAt, &siteID)
