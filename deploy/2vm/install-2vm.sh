@@ -54,6 +54,9 @@ warn() { printf '  %s!%s %s\n' "$YEL" "$R" "$*"; }
 die()  { printf '\n  %s✗ %s%s\n\n' "$RED" "$*" "$R" >&2; exit 1; }
 
 ROLE=""; THIS_IP=""; PEER_IP=""; VIP=""; IFACE=""; VIP_CIDR=""; MODE="install"
+# Skips the role-change confirmation. It never suppresses a VIP conflict — that one
+# is a genuine "two hosts on one address" hazard and stays fatal.
+ASSUME_YES="${ASSUME_YES:-no}"
 VRID="${SENTINEL_VRID:-51}"
 
 while [[ $# -gt 0 ]]; do
@@ -65,6 +68,7 @@ while [[ $# -gt 0 ]]; do
     --iface) IFACE="${2:-}"; shift ;;
     --vrid) VRID="${2:-}"; shift ;;
     --check) MODE="check" ;;
+    --yes|-y) ASSUME_YES=yes ;;
     -h|--help) sed -n '2,40p' "$0" | sed 's/^#\{0,2\} \{0,1\}//'; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -101,9 +105,12 @@ if [[ "$MODE" == "check" ]]; then
   say "  vip:   $(cat "$STATE_DIR/2vm-vip" 2>/dev/null || echo '?')"
   step "keepalived"
   systemctl is-active --quiet keepalived && ok "running" || warn "NOT running"
-  ip -4 addr show | grep -q "$(cat "$STATE_DIR/2vm-vip" 2>/dev/null || echo 'no-vip')" \
-    && ok "this node currently HOLDS the VIP" \
-    || say "  ${DIM}this node does not hold the VIP (normal for the standby)${R}"
+  _vip="$(cat "$STATE_DIR/2vm-vip" 2>/dev/null || echo '')"
+  if [[ -n "$_vip" ]] && ip -4 addr show | grep -qE "inet ${_vip}/"; then
+    ok "this node currently HOLDS the VIP"
+  else
+    say "  ${DIM}this node does not hold the VIP (normal for the standby)${R}"
+  fi
   step "data-plane health (what VRRP tracks)"
   if /usr/local/sbin/sentinel-vrrp-check.sh; then ok "healthy — eligible for the VIP"
   else warn "UNHEALTHY — this node would hand the VIP to its peer"; fi
@@ -113,7 +120,7 @@ if [[ "$MODE" == "check" ]]; then
 fi
 
 # ── 1. role ──────────────────────────────────────────────────────────────────
-step "Step 1 of 6 — which node is this?"
+step "Step 1 of 7 — which node is this?"
 if [[ -z "$ROLE" ]]; then
   say "  ${DIM}master = VM 1. Postgres PRIMARY, ClickHouse, and it prefers to hold the VIP.${R}"
   say "  ${DIM}slave  = VM 2. Postgres streaming STANDBY. Takes the VIP when VM 1 cannot serve.${R}"
@@ -140,12 +147,14 @@ ok "role: ${B}${ROLE}${R}"
 
 if [[ -f "$ROLE_FILE" ]] && [[ "$(cat "$ROLE_FILE")" != "$ROLE" ]]; then
   warn "this VM was previously installed as '$(cat "$ROLE_FILE")'"
-  read -r -p "  Re-install as '$ROLE'? Type YES to continue: " c || true
-  [[ "$c" == "YES" ]] || die "aborted — role unchanged"
+  if [[ "$ASSUME_YES" != "yes" ]]; then
+    read -r -p "  Re-install as '$ROLE'? Type YES to continue: " c || true
+    [[ "$c" == "YES" ]] || die "aborted — role unchanged"
+  fi
 fi
 
 # ── 2. addressing ────────────────────────────────────────────────────────────
-step "Step 2 of 6 — addressing"
+step "Step 2 of 7 — addressing"
 DEF_IFACE="$(ip -4 route show default 2>/dev/null | awk '/default/{print $5; exit}')"
 DEF_IP="$(ip -4 -brief addr show "${DEF_IFACE:-lo}" 2>/dev/null | awk '{print $3}' | cut -d/ -f1 | head -1)"
 DEF_CIDR="$(ip -4 -brief addr show "${DEF_IFACE:-lo}" 2>/dev/null | awk '{print $3}' | cut -d/ -f2 | head -1)"
@@ -162,12 +171,12 @@ valid_ip "$VIP"     || die "'$VIP' is not a valid IPv4 address"
 [[ "$THIS_IP" != "$PEER_IP" ]] || die "this VM and the peer cannot share an address"
 [[ "$VIP" != "$THIS_IP" && "$VIP" != "$PEER_IP" ]] || \
   die "the VIP must be a THIRD address, not either VM's own IP"
-ip -4 -brief addr show | grep -q " ${IFACE} " || die "interface '$IFACE' not found"
+ip -o link show "$IFACE" >/dev/null 2>&1 || die "interface '$IFACE' not found"
 
 ok "iface $IFACE · this $THIS_IP · peer $PEER_IP · vip $VIP/$VIP_CIDR · vrid $VRID"
 
 # ── 3. preflight ─────────────────────────────────────────────────────────────
-step "Step 3 of 6 — preflight"
+step "Step 3 of 7 — preflight"
 
 command -v docker >/dev/null 2>&1 || die "docker is not installed"
 docker compose version >/dev/null 2>&1 || die "the docker compose plugin is not installed"
@@ -184,15 +193,31 @@ fi
 
 # A VIP that is already answering is either a stale install or, worse, an address
 # in use by something else. Taking it would break whatever owns it.
+# A VIP that already answers is either this node (re-install), the PEER holding it
+# (entirely normal — it is why the pair exists), or a stranger using the address.
+# Only the third case is a problem, and the three are distinguishable by MAC: ARP
+# tells us WHO answers, so the second node no longer has to ask a human whether
+# its own partner is allowed to be up.
+mac_of() { ping -c1 -W1 "$1" >/dev/null 2>&1
+  ip neigh show "$1" 2>/dev/null | grep -oE 'lladdr [0-9a-f:]+' | awk '{print $2}'; }
+
 if ping -c1 -W1 "$VIP" >/dev/null 2>&1; then
-  if ip -4 addr show dev "$IFACE" | grep -q "inet $VIP/"; then
+  if ip -4 addr show dev "$IFACE" | grep -qE "inet ${VIP}/"; then
     ok "VIP already held by this node (re-install)"
   else
-    warn "$VIP already answers and is NOT held by this node"
-    say  "  ${DIM}Expected if the peer currently holds it. If nothing should own it yet,${R}"
-    say  "  ${DIM}stop — that address is in use by another host.${R}"
-    read -r -p "  Continue? Type YES: " c || true
-    [[ "$c" == "YES" ]] || die "aborted"
+    VIP_MAC="$(mac_of "$VIP")"; PEER_MAC="$(mac_of "$PEER_IP")"
+    if [[ -n "$VIP_MAC" && "$VIP_MAC" == "$PEER_MAC" ]]; then
+      ok "VIP is held by the peer ($PEER_IP) — expected, that is the active node"
+    else
+      warn "$VIP answers from ${VIP_MAC:-an unknown host}, which is NOT this node or the peer"
+      say  "  ${DIM}Another host is using this address. Continuing would create a duplicate${R}"
+      say  "  ${DIM}IP: two machines answering for $VIP, with traffic split unpredictably.${R}"
+      if [[ "$ASSUME_YES" == "yes" ]]; then
+        die "refusing to continue with a conflicting VIP (remove --yes to override interactively)"
+      fi
+      read -r -p "  Continue anyway? Type YES: " c || true
+      [[ "$c" == "YES" ]] || die "aborted"
+    fi
   fi
 else
   ok "VIP $VIP is free"
@@ -207,7 +232,7 @@ say "  capacity: ${CPUS} vCPU · ${MEM_GB}Gi RAM · ${DISK_GB}G free on /"
 (( DISK_GB >= 80 )) || warn "80G free is the floor; 200G if you build images on this box"
 
 # ── 4. .env ──────────────────────────────────────────────────────────────────
-step "Step 4 of 6 — secrets and configuration"
+step "Step 4 of 7 — secrets and configuration"
 ENV_FILE="$DOCKER_DIR/.env"
 
 if [[ "$ROLE" == "master" ]]; then
@@ -246,6 +271,9 @@ PY
     set_kv SENTINEL_REPL_PASSWORD "$REPLPW"
     set_kv SENTINEL_STANDBY_CIDR "${PEER_IP}/32"
     set_kv SENTINEL_PG_BIND "$THIS_IP"
+    # Written here too so the file is complete if it is later reused after a role
+    # swap; the slave overwrites it with its own peer address.
+    set_kv SENTINEL_PRIMARY_HOST "$THIS_IP"
     set_kv SENTINEL_DB_URL "postgres://sentinel:${PGPW}@postgres:5432/sentinel?sslmode=disable"
     set_kv SENTINEL_DB_URL_PRIMARY "postgres://sentinel:${PGPW}@${THIS_IP}:5432/sentinel?sslmode=disable"
     set_kv SENTINEL_ALLOW_SUPERUSER_DB 1
@@ -282,10 +310,80 @@ else
   grep -qE "^SENTINEL_DB_URL_PRIMARY=.+" "$ENV_FILE" || \
     die "SENTINEL_DB_URL_PRIMARY missing in .env — it must point at the master's Postgres"
   ok "SENTINEL_DB_URL_PRIMARY set (writes go to the master)"
+
+  # SENTINEL_PRIMARY_HOST is what the standby entrypoint clones and streams from.
+  # It is NODE-SPECIFIC — from the slave, the primary is its peer — so it cannot
+  # come from the master's copy of .env and has to be written here. The passive
+  # overlay declares it with no default, so compose refuses to start without it.
+  if grep -qE "^SENTINEL_PRIMARY_HOST=" "$ENV_FILE"; then
+    python3 - "$ENV_FILE" "$PEER_IP" <<'PYEOF'
+import sys, re
+p, v = sys.argv[1], sys.argv[2]
+s = open(p).read()
+s = re.sub(r'^SENTINEL_PRIMARY_HOST=.*$', 'SENTINEL_PRIMARY_HOST=' + v, s, count=1, flags=re.M)
+open(p, 'w').write(s)
+PYEOF
+  else
+    printf 'SENTINEL_PRIMARY_HOST=%s\n' "$PEER_IP" >> "$ENV_FILE"
+  fi
+  chmod 600 "$ENV_FILE"
+  ok "SENTINEL_PRIMARY_HOST=$PEER_IP (the standby streams from here)"
+fi
+
+# ── 4b. Postgres TLS ─────────────────────────────────────────────────────────
+step "Step 5 of 7 — Postgres server certificate"
+
+# compose.prod.yml starts Postgres with ssl=on and mounts
+# /opt/sentinel-pki/pg-server.{crt,key}. Without those files Postgres exits at
+# startup with "could not load server certificate file", the container is marked
+# unhealthy, and every service that depends on it refuses to start — so this is
+# mandatory, not an optional hardening step. (Found the hard way: the first real
+# run of this installer died exactly here.)
+PKI_DIR=/opt/sentinel-pki
+# Docker creates a missing bind-mount source as a DIRECTORY. compose.prod.yml
+# mounts these two paths, so a failed first start leaves directories where the
+# cert and key should be — and `-s` is TRUE for a directory, which is how an
+# absent certificate reported itself as present. Require regular files, and sweep
+# away anything Docker fabricated before issuing.
+for _f in pg-server.crt pg-server.key root.crt; do
+  if [[ -d "$PKI_DIR/$_f" ]]; then
+    rmdir "$PKI_DIR/$_f" 2>/dev/null && warn "removed empty directory Docker created at $PKI_DIR/$_f" \
+      || die "$PKI_DIR/$_f is a non-empty directory — inspect it by hand"
+  fi
+done
+if [[ -f "$PKI_DIR/pg-server.crt" && -s "$PKI_DIR/pg-server.crt" \
+   && -f "$PKI_DIR/pg-server.key" && -s "$PKI_DIR/pg-server.key" ]]; then
+  ok "certificate already present in $PKI_DIR"
+else
+  if [[ "$ROLE" == "slave" ]]; then
+    die \
+"$PKI_DIR/pg-server.crt is missing.
+
+  Copy the PKI directory from the master, so both nodes share ONE trust root:
+
+      rsync -a root@${PEER_IP}:$PKI_DIR/ $PKI_DIR/
+
+  Two independently generated CAs cannot verify each other, so the standby's
+  replication connection to the primary would fail to validate."
+  fi
+  # SANs must cover every name/address a client will dial: the compose service
+  # name, loopback for local psql, BOTH VMs (the standby connects to the primary
+  # by address), and the VIP in case a client follows it.
+  ( cd "$DOCKER_DIR" && \
+    PG_HOSTS="postgres,localhost,$(hostname -s)" \
+    PG_IPS="127.0.0.1,${THIS_IP},${PEER_IP},${VIP}" \
+    ./issue-postgres-cert.sh >/tmp/pgcert.log 2>&1 ) \
+    || { sed -e 's/^/    /' /tmp/pgcert.log | tail -12; die "issue-postgres-cert.sh failed"; }
+  ok "issued — SAN covers postgres, localhost, ${THIS_IP}, ${PEER_IP}, ${VIP}"
+fi
+# Postgres refuses to start if its key is readable beyond its owner (uid 70).
+if [[ "$(stat -c '%a' "$PKI_DIR/pg-server.key")" != "600" ]]; then
+  chmod 600 "$PKI_DIR/pg-server.key"; chown 70:70 "$PKI_DIR/pg-server.key" 2>/dev/null || true
+  ok "tightened key permissions to 0600 uid 70"
 fi
 
 # ── 5. keepalived ────────────────────────────────────────────────────────────
-step "Step 5 of 6 — keepalived (the automatic part)"
+step "Step 6 of 7 — keepalived (the automatic part)"
 
 if ! command -v keepalived >/dev/null 2>&1; then
   say "  installing keepalived…"
@@ -310,8 +408,9 @@ ok "health-check and notify scripts installed"
 # containers are actually serving; the health check then gates it regardless.
 if [[ "$ROLE" == "master" ]]; then
   STATE=MASTER; PRIORITY=150
-  PREEMPT_BLOCK="    # Reclaim the VIP on recovery, but not before this node can serve.
-    preempt_delay 30"
+  # Single line on purpose: sed cannot substitute a replacement containing a
+  # newline, and a multi-line value here silently dropped the setting entirely.
+  PREEMPT_BLOCK="    preempt_delay 30"
 else
   STATE=BACKUP; PRIORITY=100
   # Lower priority means the slave yields to a healthy master rather than holding
@@ -355,10 +454,14 @@ ok "/etc/keepalived/keepalived.conf written (state $STATE, priority $PRIORITY)"
 
 printf '%s\n' "$ROLE" > "$ROLE_FILE"
 printf '%s\n' "$VIP"  > "$STATE_DIR/2vm-vip"
-chmod 644 "$ROLE_FILE" "$STATE_DIR/2vm-vip"
+# The health check sends this as the Host header when it probes a real request. An
+# unmatched Host returns 502 whatever the node's actual health, so the probe must
+# use a name the site claims — and the VIP always is one in this topology.
+printf '%s\n' "$VIP"  > "$STATE_DIR/2vm-probe-host"
+chmod 644 "$ROLE_FILE" "$STATE_DIR/2vm-vip" "$STATE_DIR/2vm-probe-host"
 
 # ── 6. bring the stack up ────────────────────────────────────────────────────
-step "Step 6 of 6 — starting the stack"
+step "Step 7 of 7 — starting the stack"
 OVERLAY="compose.2vm-active.yml"; [[ "$ROLE" == "slave" ]] && OVERLAY="compose.2vm-passive.yml"
 [[ -f "$DOCKER_DIR/$OVERLAY" ]] || die "$DOCKER_DIR/$OVERLAY missing"
 
@@ -377,9 +480,30 @@ for _ in $(seq 1 30); do
   if /usr/local/sbin/sentinel-vrrp-check.sh; then HEALTHY=yes; break; fi
   sleep 2
 done
-if [[ "$HEALTHY" == "yes" ]]; then ok "data plane healthy"
-else warn "data plane not healthy yet — keepalived will not claim the VIP until it is"
-     say "  ${DIM}check: docker compose -p sentinel logs --tail=50 dataplane${R}"
+if [[ "$HEALTHY" == "yes" ]]; then
+  ok "data plane healthy"
+else
+  # Distinguish "nothing configured yet" from "actually broken". On a first
+  # install there are no sites, so the data plane reports "sites":0 and the health
+  # check deliberately refuses — a WAF with no configuration would 502 everything,
+  # and a node that cannot serve must not hold the VIP. That is correct behaviour,
+  # not a fault, but "not healthy" alone reads like a failure and sends the
+  # operator hunting for a bug that is not there.
+  _hz="$(curl -fsS --max-time 3 http://127.0.0.1:80/healthz 2>/dev/null || true)"
+  if [[ "$_hz" == *'"sites":0'* ]]; then
+    warn "no sites configured yet, so the data plane is intentionally not eligible for the VIP"
+    say  "  ${DIM}This is expected on a first install — a WAF with no sites would 502${R}"
+    say  "  ${DIM}every request, so keepalived correctly refuses to send traffic here.${R}"
+    say  "  ${DIM}Add your first site, and the VIP comes up within a few seconds:${R}"
+    say  "  ${DIM}  dashboard  https://${THIS_IP}:9443  (admin@sentinel.local)${R}"
+    say  "  ${DIM}  password   docker logs sentinel-controlplane-1 2>&1 | grep -A2 'GENERATED password'${R}"
+  elif [[ -z "$_hz" ]]; then
+    warn "data plane is not answering on :80 — this one IS a fault"
+    say  "  ${DIM}check: docker compose -p sentinel logs --tail=50 dataplane${R}"
+  else
+    warn "data plane answered but is not reporting healthy"
+    say  "  ${DIM}$_hz${R}"
+  fi
 fi
 
 systemctl enable keepalived >/dev/null 2>&1 || true
@@ -426,11 +550,14 @@ cat <<NEXT
 
        scp $ENV_FILE root@${PEER_IP}:$ENV_FILE
        scp $STATE_DIR/2vm-vrrp-pass root@${PEER_IP}:$STATE_DIR/2vm-vrrp-pass
+       rsync -a $PKI_DIR/ root@${PEER_IP}:$PKI_DIR/
 
      ${DIM}.env carries the shared secrets — divergent JWT/internal/audit values give${R}
      ${DIM}you two stacks that silently distrust each other. The vrrp-pass is how the${R}
      ${DIM}nodes authenticate; if it differs, each ignores the other's adverts and${R}
-     ${DIM}BOTH become master — two hosts answering on one IP.${R}
+     ${DIM}BOTH become master — two hosts answering on one IP. The PKI directory is${R}
+     ${DIM}the shared trust root: two independently generated CAs cannot verify each${R}
+     ${DIM}other, so replication would fail to validate.${R}
 
   2. On VM 2:  sudo ./install-2vm.sh   →  answer ${B}slave${R}
 

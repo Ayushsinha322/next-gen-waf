@@ -20,8 +20,18 @@ vrrp_script chk_dataplane {
     script  "/usr/local/sbin/sentinel-vrrp-check.sh"
     interval 2
     timeout  3
-    rise     2      # two consecutive passes before we are willing to hold the VIP
-    fall     2      # two consecutive failures before we give it up
+    # Deliberately ASYMMETRIC: leave quickly, return cautiously.
+    #
+    # fall 2 (~4s) — a node that cannot serve must stop attracting traffic fast.
+    #
+    # rise 5 (~10s) — a node must be CONTINUOUSLY healthy before it takes the VIP
+    # back. Measured on a real reboot: the origin container's health flapped while
+    # it started, the recovering master saw one brief pass, reclaimed the VIP with
+    # rise 2, and served 502s for ~11 seconds before releasing it again. Requiring
+    # sustained health rides out that startup flapping. This slows only FAILBACK,
+    # never failover — failover is governed by `fall`.
+    rise     5
+    fall     2
     weight   0      # binary: failure removes this node from candidacy entirely
 }
 
@@ -52,6 +62,11 @@ vrrp_instance SENTINEL {
     track_script {
         chk_dataplane
     }
+
+    # How long after keepalived starts before this node may take the VIP from a
+    # peer that currently holds it. On the master it stops a freshly-booted node
+    # snatching the address before its containers can actually serve; the health
+    # check gates it regardless.
 
 __PREEMPT_BLOCK__
     notify /usr/local/sbin/sentinel-vrrp-notify.sh

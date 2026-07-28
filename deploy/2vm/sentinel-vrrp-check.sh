@@ -25,13 +25,49 @@ body=$(curl -fsS --max-time "$TIMEOUT" "$DP_HEALTH" 2>/dev/null) || exit 1
 case "$body" in
   *'"sites":0'*) exit 1 ;;
 esac
+
+# NOT gated on healthz's "upstreams_healthy". Measured on this deployment: it
+# reported 1/1 while real requests returned 502 during startup, and later reported
+# 0/1 while real requests returned 200 — wrong in BOTH directions, and in the second
+# case it locked a perfectly healthy node out of the VIP. The real-request probe
+# below is accurate either way, so the counter adds nothing but false verdicts.
+
 case "$body" in
-  *'"status":"ok"'*) exit 0 ;;
+  *'"status":"ok"'*) : ;;
+  *'"sites":'*)      : ;;   # older builds omit "status"; a parseable body will do
+  *) exit 1 ;;
 esac
 
-# Some builds report health without a status field; a parseable body with at least
-# one site is good enough rather than failing closed on a cosmetic difference.
-case "$body" in
-  *'"sites":'*) exit 0 ;;
-esac
-exit 1
+# ── The authoritative test: actually serve a request ─────────────────────────
+#
+# Everything above is the data plane describing itself, and during startup that
+# description is optimistic. Measured across three reboot tests: healthz reported
+# "status":"ok" with "upstreams_healthy":1 while real requests returned 502,
+# because the origin was still binding and the proxy's circuit breaker was opening
+# and resetting ("all upstream servers have open circuits; forcing reset").
+#
+# Raising `rise` did not fix it — the node genuinely looked healthy by every
+# self-reported measure. The only reliable predictor of "can this node serve" is
+# to make a real request and see.
+#
+# The Host header matters: an unmatched Host returns 502 regardless of health, so
+# the probe has to use a hostname the site actually claims. The installer writes
+# the VIP here, which is always one of the site's domains in this topology.
+PROBE_HOST_FILE="${SENTINEL_VRRP_PROBE_HOST_FILE:-/etc/sentinel/2vm-probe-host}"
+PROBE_HOST="${SENTINEL_VRRP_PROBE_HOST:-}"
+[ -z "$PROBE_HOST" ] && [ -r "$PROBE_HOST_FILE" ] && PROBE_HOST=$(cat "$PROBE_HOST_FILE" 2>/dev/null)
+
+if [ -n "$PROBE_HOST" ] && [ "${SENTINEL_VRRP_PROBE:-1}" = "1" ]; then
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time "$TIMEOUT" \
+           -H "Host: $PROBE_HOST" "http://127.0.0.1:80/" 2>/dev/null || echo 000)
+  case "$code" in
+    502|503|504|000)
+      # The origin is unreachable through this node. Any other code — 200, 301,
+      # 307, 401, even 404 — means the request completed end to end, which is all
+      # this needs to establish. A 403 would mean the WAF blocked our own probe,
+      # which is also proof the pipeline works.
+      exit 1 ;;
+  esac
+fi
+
+exit 0

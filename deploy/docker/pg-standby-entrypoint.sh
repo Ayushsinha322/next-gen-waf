@@ -11,6 +11,22 @@
 # re-cloning could destroy the only surviving copy of the data.
 set -euo pipefail
 
+# compose.prod.yml's `command:` begins with the literal `postgres`, and overriding
+# `entrypoint:` (as compose.2vm-passive.yml does) hands that entire command to this
+# script as "$@". docker-entrypoint.sh expects to be given the binary name itself,
+# so passing both yields `postgres postgres -c ssl=on …` and Postgres rejects its
+# own name:
+#
+#     postgres: invalid argument: "postgres"
+#
+# Normalised HERE, once, rather than at each exec: this script has two exec paths
+# (already-initialised and post-clone) and patching only the second left the
+# common case — every restart of an existing standby — crash-looping while the
+# message pointed at replication rather than argument handling.
+if [[ "${1:-}" == "postgres" ]]; then
+  shift
+fi
+
 : "${SENTINEL_PRIMARY_HOST:?SENTINEL_PRIMARY_HOST is required (active VM address)}"
 : "${SENTINEL_REPL_USER:?SENTINEL_REPL_USER is required}"
 : "${SENTINEL_REPL_PASSWORD:?SENTINEL_REPL_PASSWORD is required}"
