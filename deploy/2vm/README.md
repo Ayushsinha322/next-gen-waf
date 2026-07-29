@@ -32,7 +32,7 @@ flowchart TB
 
     subgraph VM1["VM 1 — MASTER · priority 150"]
         direction TB
-        K1["keepalived<br/>state MASTER"]
+        K1["keepalived<br/>state BACKUP · prio 150<br/><i>wins the election</i>"]
         DP1["Data plane (Rust WAF)<br/>:80 → :8080 · :443 → :8443<br/>mgmt :9443"]
         CP1["Control plane (Go)<br/>:9501 internal"]
         DB1[("Postgres<br/><b>PRIMARY</b>")]
@@ -153,15 +153,32 @@ configuration and was already enforcing it.
 
 ### The master comes back
 
+Measured on a real `reboot` of VM 1, 2026-07-29 (Juice Shop origin):
+
 ```
-t+0s    VM1 boots, containers start
-t+~30s  preempt_delay expires AND its data plane reports healthy
-t+~30s  VM1 reclaims the VIP (priority 150 > 100), traffic returns
+t+0s     reboot issued; keepalived sends a priority-0 advert on shutdown
+t+~10s   VM2 is MASTER and serving — no request dropped (see below)
+t+29s    VM1 finishes booting
+t+70s    keepalived starts checking; check FAILS — containers still warming
+t+178s   check passes at last (origin finally serving), VM1 enters BACKUP
+t+181s   preempt_delay expires, VM1 reclaims the VIP (priority 150 > 100)
 ```
+
+**Failback is bound by how long your origin takes to serve, not by the WAF.**
+The ~108s of failing checks above is the health check doing its job — the origin
+was not ready, so the node was correctly kept out of the VIP. Expect a different
+number with a faster backend; do not quote 184s as a property of the WAF.
 
 `preempt_delay 30` exists so a booting master cannot snatch the VIP before its
 containers are actually able to serve. The health check gates it regardless — a
 node that cannot serve never holds the address.
+
+Both nodes run `state BACKUP` and are separated by priority alone. That is load
+bearing: keepalived **silently discards preempt_delay** on an instance declared
+`state MASTER` (`Warning - preempt delay will not work with initial state MASTER
+- clearing`), which left the master with no preempt delay at all until this was
+fixed. `state` sets only the initial state; the election still hands the VIP to
+priority 150.
 
 ### What the health check actually tests
 

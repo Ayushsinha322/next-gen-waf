@@ -406,8 +406,26 @@ ok "health-check and notify scripts installed"
 # which is the failback behaviour asked for. preempt_delay holds it back for 30s
 # after keepalived starts so a booting master does not snatch the VIP before its
 # containers are actually serving; the health check then gates it regardless.
+#
+# BOTH nodes start as BACKUP, including the master. This is deliberate and it is
+# the only way preempt_delay works. keepalived refuses the combination of
+# `state MASTER` with preempt_delay and drops the setting, logging:
+#
+#     Warning - preempt delay will not work with initial state MASTER - clearing
+#
+# Measured on this deployment 2026-07-29: with state MASTER the master's
+# preempt_delay 30 was silently absent for the whole life of the install, so a
+# rebooting master could reclaim the VIP the instant its check first passed.
+# preempt_delay governs a BACKUP->MASTER *preemption*, so a node that declares
+# itself MASTER at startup has nothing to delay — hence keepalived clearing it.
+#
+# Starting both as BACKUP costs nothing: `state` sets only the INITIAL state, and
+# the election then hands mastership to the higher priority anyway. The one
+# tradeoff is a cold start with both nodes down takes a few advert intervals to
+# elect a master instead of VM 1 claiming instantly — irrelevant here, because
+# `rise 5` plus origin warm-up already dominates that by an order of magnitude.
 if [[ "$ROLE" == "master" ]]; then
-  STATE=MASTER; PRIORITY=150
+  STATE=BACKUP; PRIORITY=150
   # Single line on purpose: sed cannot substitute a replacement containing a
   # newline, and a multi-line value here silently dropped the setting entirely.
   PREEMPT_BLOCK="    preempt_delay 30"
