@@ -645,14 +645,18 @@ impl ProxyServer {
         // (request availability comes first), and K8s gives no cross-pod start
         // ordering, so the writer routinely races a not-yet-ready ClickHouse
         // StatefulSet on cold start. A one-shot connect would leave the writer a
-        // permanent silent no-op until someone restarted the proxy. CLICKHOUSE_ENABLED
-        // gates buffering and is true ONLY while connected, so the in-memory
-        // buffers stay bounded whenever ClickHouse is down.
+        // permanent silent no-op until someone restarted the proxy.
+        //
+        // HISTORY_SINK_ACTIVE gates buffering and is true whenever this task is
+        // RUNNING — not only while connected. Rows the sink cannot take are
+        // written to a bounded disk spool and replayed on reconnect, so an
+        // unreachable ClickHouse costs latency in the audit trail, not content.
+        // Before the spool existed this flag meant "connected", which is exactly
+        // why a node with no reachable ClickHouse recorded nothing at all.
         if storage_backend_cfg.clickhouse_url.is_some() {
             let initial = storage.clickhouse.clone();
-            if initial.is_some() {
-                CLICKHOUSE_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
+            HISTORY_SINK_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+            let spool = open_history_spool();
             let ch_cfg = storage_backend_cfg.clone();
             tokio::spawn(async move {
                 let mut ch: Option<std::sync::Arc<sentinel_storage::ClickHouseClient>> = initial;
@@ -662,6 +666,27 @@ impl ProxyServer {
                 let mut ticks = 0u32;
                 // Seconds remaining until the next reconnect attempt while down.
                 let mut reconnect_in = 0u32;
+                // Cap enforcement walks the directory, so it runs on a slow
+                // cadence rather than every second: every 30 ticks, or sooner if
+                // a burst has appended enough to risk a meaningful overshoot.
+                const CAP_CHECK_TICKS: u32 = 30;
+                const CAP_CHECK_BYTES: u64 = 16 * 1024 * 1024;
+                let mut ticks_since_cap = 0u32;
+                let mut bytes_since_cap = 0u64;
+                // A backlog left by a previous process is replayed on the first
+                // connected tick — that restart-survival is the reason the spool
+                // is on disk instead of simply being a larger memory buffer.
+                if let Some(sp) = spool.as_ref() {
+                    let pending = sp.segments("events").len() + sp.segments("traffic").len();
+                    if pending > 0 {
+                        info!(
+                            segments = pending,
+                            bytes = sp.bytes(),
+                            dir = %sp.dir().display(),
+                            "history spool: backlog found from a previous run — will replay on reconnect"
+                        );
+                    }
+                }
                 loop {
                     ticker.tick().await;
 
@@ -682,10 +707,6 @@ impl ProxyServer {
                                             Ok(()) => {
                                                 info!(url, database = db, "clickhouse connected — waf history writer enabled");
                                                 ch = Some(std::sync::Arc::new(client));
-                                                CLICKHOUSE_ENABLED.store(
-                                                    true,
-                                                    std::sync::atomic::Ordering::Relaxed,
-                                                );
                                             }
                                             Err(e) => {
                                                 warn!(error = %e, "clickhouse reachable but schema init failed — retrying in 10s");
@@ -694,7 +715,7 @@ impl ProxyServer {
                                         }
                                     }
                                     Err(e) => {
-                                        warn!(error = %e, "clickhouse unreachable — waf history writer disabled, retrying in 10s");
+                                        warn!(error = %e, "clickhouse unreachable — spooling waf history to disk, retrying in 10s");
                                         reconnect_in = 10;
                                     }
                                 }
@@ -704,48 +725,97 @@ impl ProxyServer {
                         }
                     }
 
-                    // Always drain to keep buffers bounded; record_* only fills
-                    // them while CLICKHOUSE_ENABLED (i.e. while connected).
+                    // Always drain to keep buffers bounded. record_* fills them
+                    // whenever this task exists, connected or not — what happens
+                    // to rows the sink refuses is decided below, and it is never
+                    // "discard" while a spool is available.
                     buf.extend(drain_traffic(unix_now()));
                     evbuf.extend(drain_events());
                     ticks += 1;
+                    ticks_since_cap += 1;
                     // Both streams flush on the same 5s-or-500-row cadence.
                     let time_due = ticks >= 5;
 
                     if let Some(client) = ch.clone() {
                         let mut conn_lost = false;
-                        if (time_due || buf.len() >= 500) && !buf.is_empty() {
+
+                        // Drain the backlog before this tick's live rows, so
+                        // replayed history lands in roughly the order it
+                        // happened and a long outage's spool actually empties
+                        // instead of being perpetually overtaken.
+                        if let Some(sp) = spool.as_ref() {
+                            if !replay_history_spool(sp, &client).await {
+                                conn_lost = true;
+                            }
+                        }
+
+                        if !conn_lost && (time_due || buf.len() >= 500) && !buf.is_empty() {
                             if let Err(e) = client.insert_traffic_batch(&buf).await {
-                                warn!(error = %e, rows = buf.len(), "clickhouse traffic flush failed — dropping batch, will reconnect");
+                                warn!(error = %e, rows = buf.len(), "clickhouse traffic flush failed — spooling batch, will reconnect");
+                                bytes_since_cap += spool_batch(spool.as_ref(), "traffic", &buf);
                                 conn_lost = true;
                             } else {
                                 debug!(rows = buf.len(), "clickhouse traffic flushed");
                             }
-                            buf.clear(); // bounded: drop after every attempt
+                            buf.clear();
                         }
 
-                        if (time_due || evbuf.len() >= 500) && !evbuf.is_empty() {
+                        if !conn_lost && (time_due || evbuf.len() >= 500) && !evbuf.is_empty() {
                             if let Err(e) = client.insert_events_batch(&evbuf).await {
-                                warn!(error = %e, rows = evbuf.len(), "clickhouse events flush failed — dropping batch, will reconnect");
+                                warn!(error = %e, rows = evbuf.len(), "clickhouse events flush failed — spooling batch, will reconnect");
+                                bytes_since_cap += spool_batch(spool.as_ref(), "events", &evbuf);
                                 conn_lost = true;
                             } else {
                                 debug!(rows = evbuf.len(), "clickhouse events flushed");
                             }
-                            evbuf.clear(); // bounded: drop after every attempt
+                            evbuf.clear();
                         }
 
                         // A failed insert usually means the server/connection went
-                        // away — drop the client so the loop reconnects, and stop
-                        // buffering (CLICKHOUSE_ENABLED=false) until it does.
+                        // away — drop the client so the loop reconnects. Buffering
+                        // deliberately CONTINUES while disconnected now; the spool
+                        // is what keeps that bounded.
                         if conn_lost {
-                            CLICKHOUSE_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+                            // Whatever this tick drained but did not get to
+                            // insert must not evaporate just because the sink
+                            // died mid-tick.
+                            bytes_since_cap += spool_batch(spool.as_ref(), "traffic", &buf);
+                            bytes_since_cap += spool_batch(spool.as_ref(), "events", &evbuf);
+                            buf.clear();
+                            evbuf.clear();
                             ch = None;
                             reconnect_in = 5;
                         }
-                    } else {
-                        // Disconnected: discard anything drained to stay bounded.
+                    } else if time_due || buf.len() >= 500 || evbuf.len() >= 500 {
+                        // Disconnected. This is the path that silently lost every
+                        // event on a node with no reachable ClickHouse: it used to
+                        // clear both buffers unconditionally. Now it persists them.
+                        bytes_since_cap += spool_batch(spool.as_ref(), "traffic", &buf);
+                        bytes_since_cap += spool_batch(spool.as_ref(), "events", &evbuf);
                         buf.clear();
                         evbuf.clear();
+                    }
+
+                    // Keep the spool inside its byte budget. Reported, never
+                    // silent: a spool that quietly discards would recreate the
+                    // very bug it was built to fix.
+                    if let Some(sp) = spool.as_ref() {
+                        if ticks_since_cap >= CAP_CHECK_TICKS || bytes_since_cap >= CAP_CHECK_BYTES
+                        {
+                            ticks_since_cap = 0;
+                            bytes_since_cap = 0;
+                            let dropped = sp.enforce_cap();
+                            if dropped.segments > 0 {
+                                warn!(
+                                    segments = dropped.segments,
+                                    bytes = dropped.bytes,
+                                    max_bytes = sp.max_bytes(),
+                                    "history spool OVER CAP — discarded oldest segments; \
+                                     history for that window is permanently lost. Raise \
+                                     SENTINEL_SPOOL_MAX_BYTES or restore the ClickHouse sink"
+                                );
+                            }
+                        }
                     }
 
                     if time_due {
@@ -753,7 +823,7 @@ impl ProxyServer {
                     }
                 }
             });
-            info!("clickhouse flusher started (1s sample · 5s/500-row flush → traffic_buckets + waf_events; self-healing reconnect)");
+            info!("clickhouse flusher started (1s sample · 5s/500-row flush → traffic_buckets + waf_events; self-healing reconnect; disk-spooled + replayed while the sink is down)");
         }
 
         let modules = Arc::new(ModulesState {
@@ -5385,8 +5455,8 @@ thread_local! {
 /// Lock-free with respect to other requests for the same site: only atomic adds,
 /// under a DashMap shard read-guard.
 fn record_traffic(tenant: &str, site: &str, blocked: bool, latency_ms: f64) {
-    // No sink → no accumulation (the drainer only runs when ClickHouse is on).
-    if !CLICKHOUSE_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+    // No drainer → no accumulation (nothing would ever empty the tally).
+    if !HISTORY_SINK_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
     TRAFFIC_KEY_BUF.with(|buf| {
@@ -5454,10 +5524,18 @@ fn unix_now() -> i64 {
 static WAF_EVENTS: std::sync::OnceLock<std::sync::Mutex<Vec<sentinel_storage::WafEventRow>>> =
     std::sync::OnceLock::new();
 
-/// Set true once the ClickHouse flusher task is running. When ClickHouse is not
+/// Set true once the history flusher task is running. When ClickHouse is not
 /// configured nothing ever drains the buffers, so we must not buffer at all —
 /// otherwise the event buffer grows to its cap and is pinned in memory forever.
-static CLICKHOUSE_ENABLED: std::sync::atomic::AtomicBool =
+///
+/// This tracks "a drainer exists", NOT "the sink is reachable". The distinction
+/// is the whole of the 2026-07-29 event-loss bug: the flag used to be cleared on
+/// disconnect, so a node that could not reach ClickHouse buffered nothing, and
+/// therefore recorded nothing, while still enforcing perfectly. The flusher now
+/// spools what it cannot insert (see `sentinel_storage::Spool`), so buffering
+/// while disconnected is correct and bounded — memory by the 20k cap below, disk
+/// by the spool's own cap.
+static HISTORY_SINK_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 fn waf_events() -> &'static std::sync::Mutex<Vec<sentinel_storage::WafEventRow>> {
@@ -5468,8 +5546,10 @@ fn waf_events() -> &'static std::sync::Mutex<Vec<sentinel_storage::WafEventRow>>
 /// passes are skipped to keep volume sane. Buffer is capped to bound memory if
 /// ClickHouse is down/slow.
 fn record_event(ctx: &RequestContext) {
-    // No sink → no buffering (the drainer only runs when ClickHouse is enabled).
-    if !CLICKHOUSE_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+    // No drainer → no buffering (nothing would ever empty the buffer). Note this
+    // is deliberately NOT gated on the sink being reachable: an unreachable sink
+    // still records, via the flusher's disk spool.
+    if !HISTORY_SINK_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
     let action = match ctx.decision {
@@ -5557,6 +5637,184 @@ fn drain_events() -> Vec<sentinel_storage::WafEventRow> {
         Ok(mut buf) => std::mem::take(&mut *buf),
         Err(_) => Vec::new(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// History spool — durability across a ClickHouse outage
+// ---------------------------------------------------------------------------
+
+/// Resolve the history spool directory. Order: `SENTINEL_SPOOL_DIR` env →
+/// `$HOME/.local/share/sentinel/spool` (dev, needs no root) →
+/// `/var/lib/sentinel/state/spool`.
+///
+/// The compose default points into the `sentinel-state` named volume, already
+/// documented there as "per-node data-plane state that must outlive the
+/// container" — exactly the lifetime a spool needs. Deliberately never `/tmp`:
+/// that is tmpfs on most distros, and a spool that dies with the container
+/// cannot do the one job it exists for.
+fn resolve_spool_dir() -> std::path::PathBuf {
+    if let Ok(d) = std::env::var("SENTINEL_SPOOL_DIR") {
+        if !d.is_empty() {
+            return std::path::PathBuf::from(d);
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            return std::path::PathBuf::from(home).join(".local/share/sentinel/spool");
+        }
+    }
+    std::path::PathBuf::from("/var/lib/sentinel/state/spool")
+}
+
+/// Spool byte ceiling, from `SENTINEL_SPOOL_MAX_BYTES`.
+fn spool_max_bytes() -> u64 {
+    std::env::var("SENTINEL_SPOOL_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(sentinel_storage::spool::DEFAULT_MAX_BYTES)
+}
+
+/// Open the spool. `None` (with a loud warning) when the directory is unusable —
+/// which degrades to the old drop-the-batch behaviour rather than refusing to
+/// boot. Losing history is bad; refusing to serve traffic is worse.
+fn open_history_spool() -> Option<sentinel_storage::Spool> {
+    let dir = resolve_spool_dir();
+    let ds = dir.to_string_lossy().to_string();
+    if ds.starts_with("/tmp") || ds.starts_with("/dev/shm") {
+        warn!(
+            spool_dir = %ds,
+            "history spool directory is on tmpfs (RAM) — spooled history will NOT \
+             survive a restart, which is the point of spooling; set SENTINEL_SPOOL_DIR \
+             to a real-disk path on a persistent volume"
+        );
+    }
+    let max = spool_max_bytes();
+    match sentinel_storage::Spool::open(&dir, max) {
+        Ok(sp) => {
+            info!(spool_dir = %ds, max_bytes = max, "history spool ready");
+            Some(sp)
+        }
+        Err(e) => {
+            warn!(
+                error = %e, spool_dir = %ds,
+                "history spool unavailable — waf history will be DROPPED while \
+                 ClickHouse is unreachable (set SENTINEL_SPOOL_DIR to a writable path)"
+            );
+            None
+        }
+    }
+}
+
+/// Append a batch to the spool, returning bytes written (0 if empty or no spool).
+fn spool_batch<T: serde::Serialize>(
+    spool: Option<&sentinel_storage::Spool>,
+    kind: &str,
+    rows: &[T],
+) -> u64 {
+    if rows.is_empty() {
+        return 0;
+    }
+    let Some(sp) = spool else {
+        warn!(
+            kind,
+            rows = rows.len(),
+            "no history spool — dropping batch (history for these rows is lost)"
+        );
+        return 0;
+    };
+    match sp.append(kind, rows) {
+        Ok(bytes) => {
+            debug!(kind, rows = rows.len(), bytes, "history spooled to disk");
+            bytes
+        }
+        Err(e) => {
+            warn!(error = %e, kind, rows = rows.len(), "history spool write failed — batch lost");
+            0
+        }
+    }
+}
+
+/// Replay spooled segments, oldest first, deleting each only after ClickHouse
+/// accepts it (at-least-once: a crash in that window duplicates rather than
+/// loses, and every row carries `request_id` for de-duplication).
+///
+/// Returns `false` if the SINK failed, so the caller drops the client and
+/// reconnects. Un-replayed segments simply stay on disk for the next attempt.
+async fn replay_history_spool(
+    sp: &sentinel_storage::Spool,
+    client: &sentinel_storage::ClickHouseClient,
+) -> bool {
+    // Bounded per tick so a large backlog can never stall the loop (which also
+    // samples traffic every second) or starve live rows behind an hour of replay.
+    const MAX_SEGMENTS_PER_TICK: usize = 20;
+
+    for path in sp
+        .segments("traffic")
+        .into_iter()
+        .take(MAX_SEGMENTS_PER_TICK)
+    {
+        match sentinel_storage::Spool::load::<sentinel_storage::TrafficRow>(&path) {
+            Ok((rows, skipped)) => {
+                if skipped > 0 {
+                    warn!(path = %path.display(), skipped, "history spool: unparseable traffic lines skipped");
+                }
+                if rows.is_empty() {
+                    sentinel_storage::Spool::remove(&path);
+                    continue;
+                }
+                match client.insert_traffic_batch(&rows).await {
+                    Ok(()) => {
+                        info!(rows = rows.len(), "history spool: replayed traffic batch");
+                        sentinel_storage::Spool::remove(&path);
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "history spool: traffic replay failed — keeping segment, will retry");
+                        return false;
+                    }
+                }
+            }
+            // Unreadable: do NOT delete (the error may be transient and deleting
+            // would destroy the only copy). Skip past it so one bad segment can
+            // never block the rest of the backlog; the cap ages it out eventually.
+            Err(e) => {
+                warn!(error = %e, path = %path.display(), "history spool: segment unreadable — skipping");
+            }
+        }
+    }
+
+    for path in sp
+        .segments("events")
+        .into_iter()
+        .take(MAX_SEGMENTS_PER_TICK)
+    {
+        match sentinel_storage::Spool::load::<sentinel_storage::WafEventRow>(&path) {
+            Ok((rows, skipped)) => {
+                if skipped > 0 {
+                    warn!(path = %path.display(), skipped, "history spool: unparseable event lines skipped");
+                }
+                if rows.is_empty() {
+                    sentinel_storage::Spool::remove(&path);
+                    continue;
+                }
+                match client.insert_events_batch(&rows).await {
+                    Ok(()) => {
+                        info!(rows = rows.len(), "history spool: replayed events batch");
+                        sentinel_storage::Spool::remove(&path);
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "history spool: events replay failed — keeping segment, will retry");
+                        return false;
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, path = %path.display(), "history spool: segment unreadable — skipping");
+            }
+        }
+    }
+
+    true
 }
 
 // ---------------------------------------------------------------------------

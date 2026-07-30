@@ -34,11 +34,13 @@ pub mod clickhouse;
 pub mod error;
 pub mod memory;
 pub mod redis;
+pub mod spool;
 
 pub use clickhouse::{ClickHouseClient, TrafficRow, WafEventRow};
 pub use error::StorageError;
 pub use memory::MemoryStore;
 pub use redis::RedisClient;
+pub use spool::{Dropped, Spool};
 
 use std::sync::Arc;
 use tracing::{info, warn};
