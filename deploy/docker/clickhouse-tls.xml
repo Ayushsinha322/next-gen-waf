@@ -1,0 +1,48 @@
+<?xml version="1.0"?>
+<!--
+  ClickHouse TLS drop-in. Mounted at /etc/clickhouse-server/config.d/ so it
+  overlays the packaged config without replacing it.
+
+  Issued by deploy/docker/issue-clickhouse-cert.sh from the deployment's own Root
+  CA. Both clients verify against that CA via SENTINEL_CLICKHOUSE_CA_FILE:
+    - crates/sentinel-storage/src/clickhouse.rs   (Rust, the writer)
+    - control-plane/internal/clickhouse/client.go (Go, the reader)
+
+  WHY: in the 2-VM topology ClickHouse runs on the active node only, so the
+  passive node writes its event history across the peer link. Plaintext there put
+  the ClickHouse password and every event body (client IPs, paths, attack
+  payloads) on the wire.
+
+  NOTE ON <http_port>: plaintext 8123 is deliberately KEPT here, because the
+  container's own healthcheck and same-host containers use it over the private
+  compose bridge, where it never leaves the host. What changes is that the 2-VM
+  overlay stops PUBLISHING 8123 to the network and publishes 8443 instead — the
+  exposure is removed at the port-publish boundary, not by disabling the port.
+  If you want it gone entirely, set <http_port remove="remove"/> and repoint the
+  healthcheck at https, accepting that every same-host client must then do TLS.
+-->
+<clickhouse>
+    <https_port>8443</https_port>
+
+    <openSSL>
+        <server>
+            <certificateFile>/etc/sentinel/pki/ch-server.crt</certificateFile>
+            <privateKeyFile>/etc/sentinel/pki/ch-server.key</privateKeyFile>
+
+            <!-- No client certificates: both clients authenticate with the
+                 ClickHouse user/password, which TLS now protects. mTLS would be
+                 the stronger posture but needs per-node client certs issued and
+                 rotated, which this deployment does not yet do for anything. -->
+            <verificationMode>none</verificationMode>
+            <loadDefaultCAFile>true</loadDefaultCAFile>
+            <cacheSessions>true</cacheSessions>
+
+            <!-- TLS 1.2 floor. SSLv2/SSLv3/TLS1.0/TLS1.1 are all broken or
+                 deprecated, and nothing in this deployment speaks them: the Rust
+                 client is rustls (1.2+ only) and the Go client sets
+                 MinVersion: tls.VersionTLS12. -->
+            <disableProtocols>sslv2,sslv3,tlsv1,tlsv1_1</disableProtocols>
+            <preferServerCiphers>true</preferServerCiphers>
+        </server>
+    </openSSL>
+</clickhouse>

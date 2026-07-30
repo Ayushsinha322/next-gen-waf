@@ -283,7 +283,7 @@ PY
     # (NOT 0.0.0.0) — this port is plaintext HTTP, so reachability is the only
     # control protecting it until the Rust client can speak TLS.
     set_kv SENTINEL_CH_BIND "$THIS_IP"
-    set_kv SENTINEL_CLICKHOUSE_URL_PRIMARY "http://${THIS_IP}:8123"
+    set_kv SENTINEL_CLICKHOUSE_URL_PRIMARY "https://${THIS_IP}:8443"
     chmod 600 "$ENV_FILE"
     ok "generated .env with fresh secrets"
     warn "sslmode=disable is set for the replication DSNs. Run issue-postgres-cert.sh"
@@ -338,7 +338,7 @@ PYEOF
   # swap or a re-run cannot leave the slave pointing at itself, where there is no
   # ClickHouse and history would silently go nowhere all over again.
   if grep -qE "^SENTINEL_CLICKHOUSE_URL_PRIMARY=" "$ENV_FILE"; then
-    python3 - "$ENV_FILE" "http://${PEER_IP}:8123" <<'PYEOF'
+    python3 - "$ENV_FILE" "https://${PEER_IP}:8443" <<'PYEOF'
 import sys, re
 p, v = sys.argv[1], sys.argv[2]
 s = open(p).read()
@@ -347,11 +347,11 @@ s = re.sub(r'^SENTINEL_CLICKHOUSE_URL_PRIMARY=.*$',
 open(p, 'w').write(s)
 PYEOF
   else
-    printf 'SENTINEL_CLICKHOUSE_URL_PRIMARY=%s\n' "http://${PEER_IP}:8123" >> "$ENV_FILE"
+    printf 'SENTINEL_CLICKHOUSE_URL_PRIMARY=%s\n' "https://${PEER_IP}:8443" >> "$ENV_FILE"
   fi
   chmod 600 "$ENV_FILE"
   ok "SENTINEL_PRIMARY_HOST=$PEER_IP (the standby streams from here)"
-  ok "SENTINEL_CLICKHOUSE_URL_PRIMARY=http://${PEER_IP}:8123 (event history lands there)"
+  ok "SENTINEL_CLICKHOUSE_URL_PRIMARY=https://${PEER_IP}:8443 (event history lands there)"
 fi
 
 # ── 4b. Postgres TLS ─────────────────────────────────────────────────────────
@@ -404,6 +404,45 @@ fi
 if [[ "$(stat -c '%a' "$PKI_DIR/pg-server.key")" != "600" ]]; then
   chmod 600 "$PKI_DIR/pg-server.key"; chown 70:70 "$PKI_DIR/pg-server.key" 2>/dev/null || true
   ok "tightened key permissions to 0600 uid 70"
+fi
+
+# ── 4c. ClickHouse TLS (master only — it is the only node running ClickHouse) ──
+#
+# MANDATORY on the master, not hardening. compose.2vm-active.yml bind-mounts
+# ch-server.{crt,key} and Docker CREATES A MISSING BIND SOURCE AS A DIRECTORY, so
+# without these files ClickHouse gets two directories where certificates should
+# be, fails to load a cert, and the passive node's history has nowhere to go —
+# reintroducing the exact silent-loss bug this replaced. Same trap as the Postgres
+# cert in the first install, where a directory also satisfied `-s`.
+if [[ "$ROLE" == "master" ]]; then
+  step "Step 5b of 7 — ClickHouse server certificate"
+  _ch_ok=no
+  if [[ -f "$PKI_DIR/ch-server.crt" && -s "$PKI_DIR/ch-server.crt" \
+     && -f "$PKI_DIR/ch-server.key" && -s "$PKI_DIR/ch-server.key" ]]; then
+    # -f AND -s: a directory passes -s, which is how an absent cert once reported
+    # itself present.
+    if openssl x509 -in "$PKI_DIR/ch-server.crt" -noout -checkend 0 >/dev/null 2>&1; then
+      ok "existing ClickHouse certificate is present and unexpired"
+      _ch_ok=yes
+    else
+      warn "existing ClickHouse certificate is expired — reissuing"
+    fi
+  fi
+  if [[ "$_ch_ok" != "yes" ]]; then
+    # SANs cover BOTH VMs and the VIP, not just this one: after a role swap the
+    # other node serves ClickHouse, and a cert naming only the original master
+    # then fails verification for no visible reason.
+    ( cd "$DOCKER_DIR" && \
+      CH_HOSTS="clickhouse,sentinel-clickhouse-1,localhost,$(hostname -s)" \
+      CH_IPS="127.0.0.1,${THIS_IP},${PEER_IP},${VIP}" \
+      ./issue-clickhouse-cert.sh >/tmp/chcert.log 2>&1 ) \
+      || { sed -e 's/^/    /' /tmp/chcert.log | tail -12; die "issue-clickhouse-cert.sh failed"; }
+    ok "issued — SAN covers clickhouse, localhost, ${THIS_IP}, ${PEER_IP}, ${VIP}"
+  fi
+  # ClickHouse runs as uid 101 and cannot read a root-owned 0600 key.
+  chmod 600 "$PKI_DIR/ch-server.key"; chmod 644 "$PKI_DIR/ch-server.crt"
+  chown 101:101 "$PKI_DIR/ch-server.key" "$PKI_DIR/ch-server.crt" 2>/dev/null || \
+    warn "could not chown the ClickHouse key to 101:101 — TLS may not come up"
 fi
 
 # ── 5. keepalived ────────────────────────────────────────────────────────────
@@ -523,26 +562,34 @@ if [[ "$ROLE" == "master" ]]; then
   step "Step 6b of 7 — firewalling the published ClickHouse port"
   if command -v iptables >/dev/null 2>&1; then
     _ch_rule_present() {
-      iptables -C DOCKER-USER -i "$IFACE" -p tcp --dport 8123 -s "${PEER_IP}/32" -j RETURN 2>/dev/null
+      iptables -C DOCKER-USER -i "$IFACE" -p tcp --dport 8443 -s "${PEER_IP}/32" -j RETURN 2>/dev/null
     }
     if _ch_rule_present; then
       ok "ClickHouse peer allow-rule already present (idempotent re-run)"
     else
       # Order matters: the peer RETURNs before the catch-all DROP is reached, so
       # insert the DROP first and the allow above it.
-      iptables -I DOCKER-USER 1 -i "$IFACE" -p tcp --dport 8123 -j DROP 2>/dev/null \
-        && iptables -I DOCKER-USER 1 -i "$IFACE" -p tcp --dport 8123 -s "${PEER_IP}/32" -j RETURN 2>/dev/null \
-        && ok "ClickHouse :8123 on $IFACE restricted to ${PEER_IP}/32" \
-        || warn "could not install the ClickHouse firewall rules — restrict :8123 yourself"
+      iptables -I DOCKER-USER 1 -i "$IFACE" -p tcp --dport 8443 -j DROP 2>/dev/null \
+        && iptables -I DOCKER-USER 1 -i "$IFACE" -p tcp --dport 8443 -s "${PEER_IP}/32" -j RETURN 2>/dev/null \
+        && ok "ClickHouse :8443 on $IFACE restricted to ${PEER_IP}/32" \
+        || warn "could not install the ClickHouse firewall rules — restrict :8443 yourself"
     fi
+    # Belt and braces: an older install of this stack published PLAINTEXT 8123 to
+    # the network. Leave a DROP behind so upgrading does not silently keep that
+    # exposure if a stale container is still bound there.
+    iptables -C DOCKER-USER -i "$IFACE" -p tcp --dport 8123 -j DROP 2>/dev/null \
+      || iptables -A DOCKER-USER -i "$IFACE" -p tcp --dport 8123 -j DROP 2>/dev/null \
+      && ok "legacy plaintext :8123 blocked from $IFACE"
     warn "iptables rules are NOT persistent across a reboot on their own"
     say  "  ${DIM}install netfilter-persistent (or re-run this installer) so the${R}"
     say  "  ${DIM}restriction survives: apt-get install -y iptables-persistent${R}"
-    say  "  ${DIM}verify from a THIRD host: curl -m3 http://${THIS_IP}:8123/ping  → must fail${R}"
+    say  "  ${DIM}verify from a THIRD host: curl -mk3 https://${THIS_IP}:8443/ping → must fail${R}"
+    say  "  ${DIM}verify TLS from the peer:  curl --cacert $PKI_DIR/root.crt \\${R}"
+    say  "  ${DIM}                            https://${THIS_IP}:8443/ping → Ok.${R}"
   else
-    warn "iptables not found — :8123 is published and UNFILTERED"
-    say  "  ${DIM}It carries the ClickHouse password in the clear. Restrict it to${R}"
-    say  "  ${DIM}${PEER_IP}/32 with whatever firewall this host uses.${R}"
+    warn "iptables not found — :8443 is published and UNFILTERED"
+    say  "  ${DIM}TLS protects it in transit, but restrict it to ${PEER_IP}/32 anyway${R}"
+    say  "  ${DIM}with whatever firewall this host uses — defence in depth.${R}"
   fi
 fi
 

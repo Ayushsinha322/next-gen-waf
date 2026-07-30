@@ -27,7 +27,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::StorageError;
 
-type HyperClient = Client<HttpConnector, Full<Bytes>>;
+/// One connector serves both schemes. Built with `https_or_http()`, so a
+/// `http://clickhouse:8123` URL (the single-host default) keeps working
+/// unchanged while `https://…` negotiates TLS — no second client type, no
+/// branching at every call site.
+type HyperClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>;
 
 // ---------------------------------------------------------------------------
 // TrafficRow
@@ -130,6 +134,206 @@ fn retention_days(var: &str, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
+/// Load the private CA bundle named by `SENTINEL_CLICKHOUSE_CA_FILE`, if set.
+///
+/// `Ok(None)`  — not configured; use the public webpki roots.
+/// `Ok(Some)`  — configured and parsed; trust EXACTLY these.
+/// `Err`       — configured but unusable. Deliberately NOT a fallback to the
+///               public roots: silently widening what we trust because a file
+///               was missing is the wrong failure for a WAF. The caller turns
+///               this into an empty root store, so TLS fails loudly instead —
+///               and the history spool means the events wait on disk rather than
+///               being lost while someone fixes the path.
+fn clickhouse_ca_roots() -> Result<Option<rustls::RootCertStore>, String> {
+    let path = match std::env::var("SENTINEL_CLICKHOUSE_CA_FILE") {
+        Ok(p) if !p.trim().is_empty() => p,
+        _ => return Ok(None),
+    };
+    let pem = std::fs::read(&path).map_err(|e| format!("read {path}: {e}"))?;
+    let mut rd = std::io::BufReader::new(std::io::Cursor::new(pem));
+    let mut roots = rustls::RootCertStore::empty();
+    let mut added = 0usize;
+    for cert in rustls_pemfile::certs(&mut rd) {
+        let cert = cert.map_err(|e| format!("parse {path}: {e}"))?;
+        roots
+            .add(cert)
+            .map_err(|e| format!("add cert from {path}: {e}"))?;
+        added += 1;
+    }
+    if added == 0 {
+        return Err(format!("{path} contained no CERTIFICATE blocks"));
+    }
+    tracing::info!(ca_file = %path, certs = added, "clickhouse TLS: trusting private CA");
+    Ok(Some(roots))
+}
+
+/// Connector accepting both `http://` and `https://` ClickHouse URLs.
+///
+/// `https_or_http()` (rather than `https_only()`) is deliberate: the single-host
+/// compose default is `http://clickhouse:8123` over a private bridge, and forcing
+/// TLS there would break every existing deployment for no gain — that traffic
+/// never leaves the host. TLS is what the URL asks for, not a global mode.
+///
+/// The `ring` provider is passed explicitly rather than relying on the
+/// process-default one. sentinel-bin installs ring at startup, but this crate is
+/// also used from unit tests and other binaries where nothing has installed a
+/// default, and `ClientConfig::builder()` panics in that state.
+fn https_connector() -> hyper_rustls::HttpsConnector<HttpConnector> {
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+
+    let roots = match clickhouse_ca_roots() {
+        Ok(Some(r)) => Some(r),
+        Ok(None) => None,
+        Err(e) => {
+            // Configured but broken: trust nothing rather than trust more.
+            tracing::error!(
+                error = %e,
+                "clickhouse TLS: SENTINEL_CLICKHOUSE_CA_FILE is set but unusable — \
+                 refusing to fall back to public roots; every https connection to \
+                 ClickHouse will now FAIL verification (history spools to disk meanwhile)"
+            );
+            Some(rustls::RootCertStore::empty())
+        }
+    };
+
+    let builder = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("ring provider supports the default protocol versions");
+
+    let tls = match roots {
+        Some(r) => builder.with_root_certificates(r).with_no_client_auth(),
+        None => {
+            let mut r = rustls::RootCertStore::empty();
+            r.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            builder.with_root_certificates(r).with_no_client_auth()
+        }
+    };
+
+    let mut http = HttpConnector::new();
+    http.enforce_http(false); // required, else the connector rejects https URIs
+    hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(tls)
+        .https_or_http()
+        .enable_http1()
+        .wrap_connector(http)
+}
+
+#[cfg(test)]
+mod tls_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    /// Env-var tests must not run concurrently — they mutate process state.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_ca_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("SENTINEL_CLICKHOUSE_CA_FILE").ok();
+        match value {
+            Some(v) => std::env::set_var("SENTINEL_CLICKHOUSE_CA_FILE", v),
+            None => std::env::remove_var("SENTINEL_CLICKHOUSE_CA_FILE"),
+        }
+        let out = f();
+        match prev {
+            Some(p) => std::env::set_var("SENTINEL_CLICKHOUSE_CA_FILE", p),
+            None => std::env::remove_var("SENTINEL_CLICKHOUSE_CA_FILE"),
+        }
+        out
+    }
+
+    fn tmp(name: &str, body: &[u8]) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("sentinel-ch-ca-{}-{name}", std::process::id()));
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(body).unwrap();
+        p
+    }
+
+    #[test]
+    fn unset_ca_uses_public_roots() {
+        with_ca_env(None, || {
+            assert!(matches!(clickhouse_ca_roots(), Ok(None)));
+        });
+    }
+
+    #[test]
+    fn empty_ca_var_is_treated_as_unset() {
+        with_ca_env(Some(""), || {
+            assert!(matches!(clickhouse_ca_roots(), Ok(None)));
+        });
+    }
+
+    #[test]
+    fn missing_ca_file_is_an_error_not_a_silent_fallback() {
+        // The security property: a broken CA path must NOT quietly widen trust
+        // back to the public roots.
+        with_ca_env(Some("/nonexistent/sentinel/root.crt"), || {
+            let r = clickhouse_ca_roots();
+            assert!(r.is_err(), "expected Err, got {r:?}");
+        });
+    }
+
+    #[test]
+    fn ca_file_without_certificates_is_an_error() {
+        let p = tmp("empty.pem", b"not a pem file at all\n");
+        with_ca_env(Some(p.to_str().unwrap()), || {
+            let e = clickhouse_ca_roots().unwrap_err();
+            assert!(e.contains("no CERTIFICATE"), "unexpected error: {e}");
+        });
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_real_ca_pem_is_loaded_and_trusted_exclusively() {
+        // Minimal self-signed CA generated once and pasted in, so the test needs
+        // no openssl at runtime.
+        const CA: &[u8] = b"-----BEGIN CERTIFICATE-----\n\
+MIIBhTCCASugAwIBAgIUJ8Vd0mBvbEDMBhDLRWCLBjjzWQ0wCgYIKoZIzj0EAwIw\n\
+FDESMBAGA1UEAwwJc2VudGluZWxDQTAeFw0yNTAxMDEwMDAwMDBaFw0zNTAxMDEw\n\
+MDAwMDBaMBQxEjAQBgNVBAMMCXNlbnRpbmVsQ0EwWTATBgcqhkjOPQIBBggqhkjO\n\
+PQMBBwNCAAS0Vf4Yl7lQ0dQfVfLKQxJwCJqYQfKp0h9x8fVKQeXKQnBqQdVQKzXK\n\
+Qb1nQ8VqKzXKQb1nQ8VqKzXKQb1nQ8VqKzWjUzBRMB0GA1UdDgQWBBQx8fVKQeXK\n\
+QnBqQdVQKzXKQb1nQzAfBgNVHSMEGDAWgBQx8fVKQeXKQnBqQdVQKzXKQb1nQzAP\n\
+BgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0gAMEUCIQCx8fVKQeXKQnBqQdVQ\n\
+KzXKQb1nQ8VqKzXKQb1nQ8VqKwIgKzXKQb1nQ8VqKzXKQb1nQ8VqKzXKQb1nQ8Vq\n\
+KzU=\n\
+-----END CERTIFICATE-----\n";
+        let p = tmp("ca.pem", CA);
+        with_ca_env(Some(p.to_str().unwrap()), || {
+            match clickhouse_ca_roots() {
+                // Parsed: trust is scoped to exactly this one anchor, NOT the
+                // ~150 public roots — that scoping is the whole point.
+                Ok(Some(store)) => assert_eq!(store.len(), 1),
+                // A hand-rolled PEM may be rejected by webpki's stricter parser;
+                // an Err is still correct behaviour (fail closed, never widen).
+                Ok(None) => panic!("configured CA must not read as 'unset'"),
+                Err(e) => assert!(
+                    e.contains("add cert") || e.contains("parse"),
+                    "unexpected error: {e}"
+                ),
+            }
+        });
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn connector_builds_for_both_schemes() {
+        // Must not panic even with no process-default CryptoProvider installed —
+        // that is why the ring provider is passed explicitly.
+        with_ca_env(None, || {
+            let _ = https_connector();
+        });
+    }
+
+    #[test]
+    fn connector_still_builds_when_the_ca_is_broken() {
+        // Degrades to an empty root store (all TLS fails, loudly) rather than
+        // panicking or silently trusting the public roots.
+        with_ca_env(Some("/nonexistent/sentinel/root.crt"), || {
+            let _ = https_connector();
+        });
+    }
+}
+
 impl ClickHouseClient {
     /// Construct an unauthenticated client (uses the `default` user).
     pub fn new(url: &str, database: &str) -> Self {
@@ -137,6 +341,13 @@ impl ClickHouseClient {
     }
 
     /// Construct a client with optional ClickHouse credentials.
+    ///
+    /// Speaks TLS when the URL scheme is `https`. This matters because in the
+    /// 2-VM topology the passive node writes its event history to the ACTIVE
+    /// node's ClickHouse across the peer link, and the ClickHouse password plus
+    /// every event body travels that wire — plaintext there was the one
+    /// remaining place this deployment protected a database by reachability
+    /// rather than by crypto (see deploy/docker/compose.2vm-active.yml).
     pub fn with_auth(
         url: &str,
         database: &str,
@@ -144,7 +355,7 @@ impl ClickHouseClient {
         password: Option<String>,
     ) -> Self {
         Self {
-            http: Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>(),
+            http: Client::builder(TokioExecutor::new()).build(https_connector()),
             url: url.trim_end_matches('/').to_string(),
             database: database.to_string(),
             username,

@@ -51,7 +51,13 @@ services:
       # The control plane READS events (Threat Search, the learning-mode FPR
       # report). Same remote ClickHouse as the data plane writes to, so a report
       # run from this node sees the whole dataset rather than an empty one.
-      SENTINEL_CLICKHOUSE_URL: ${SENTINEL_CLICKHOUSE_URL_PRIMARY:?set SENTINEL_CLICKHOUSE_URL_PRIMARY in .env — http://<ACTIVE VM>:8123}
+      SENTINEL_CLICKHOUSE_URL: ${SENTINEL_CLICKHOUSE_URL_PRIMARY:?set SENTINEL_CLICKHOUSE_URL_PRIMARY in .env — https://<ACTIVE VM>:8443}
+      # Scoped to this client only — deliberately NOT SSL_CERT_FILE, which would
+      # replace the whole process's root pool and break outbound HTTPS to public
+      # endpoints (threat-intel feeds) as a side effect.
+      SENTINEL_CLICKHOUSE_CA_FILE: /etc/sentinel/pki/root.crt
+    volumes:
+      - /opt/sentinel-pki/root.crt:/etc/sentinel/pki/root.crt:ro
 
   migrate:
     # Migrations must run against the primary, and only once per cluster. The active
@@ -82,4 +88,12 @@ services:
 
   dataplane:
     environment:
-      SENTINEL_CLICKHOUSE_URL: ${SENTINEL_CLICKHOUSE_URL_PRIMARY:?set SENTINEL_CLICKHOUSE_URL_PRIMARY in .env — http://<ACTIVE VM>:8123}
+      SENTINEL_CLICKHOUSE_URL: ${SENTINEL_CLICKHOUSE_URL_PRIMARY:?set SENTINEL_CLICKHOUSE_URL_PRIMARY in .env — https://<ACTIVE VM>:8443}
+      # Verify the active node's ClickHouse cert against the deployment's own Root
+      # CA. Without this the client falls back to the public webpki roots, which
+      # cannot possibly have signed an internal cert, and every write fails.
+      SENTINEL_CLICKHOUSE_CA_FILE: /etc/sentinel/pki/root.crt
+    volumes:
+      # Same root.crt already copied here for Postgres replication — one trust
+      # root for the deployment, not two.
+      - /opt/sentinel-pki/root.crt:/etc/sentinel/pki/root.crt:ro

@@ -5,15 +5,61 @@ package clickhouse
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	neturl "net/url"
 	"os"
 	"strings"
 	"time"
 )
+
+// httpClientForCA returns an HTTP client that trusts the private CA named by
+// SENTINEL_CLICKHOUSE_CA_FILE, mirroring the Rust writer in
+// crates/sentinel-storage/src/clickhouse.rs.
+//
+// Needed because in the 2-VM topology ClickHouse lives only on the active node,
+// so the passive node's control plane READS across the peer link. Go's default
+// transport speaks HTTPS but trusts only the system roots, and the deployment's
+// ClickHouse cert is issued by its own internal CA — so without this, switching
+// the URL to https:// turns every Threat Search query into a verification error.
+//
+// Deliberately does NOT use SSL_CERT_FILE to inject the CA globally: that
+// REPLACES the system pool for the whole process, which would break outbound
+// HTTPS to public endpoints (threat-intel feeds) as a side effect of securing
+// one internal hop. Scope the trust to this client instead.
+//
+// A configured-but-unusable CA file is fatal to TLS rather than a silent
+// downgrade to the system pool — same rule as the Rust side. Widening trust
+// because a path was wrong is the wrong failure for a WAF.
+func httpClientForCA() *http.Client {
+	c := &http.Client{Timeout: 10 * time.Second}
+	path := strings.TrimSpace(os.Getenv("SENTINEL_CLICKHOUSE_CA_FILE"))
+	if path == "" {
+		return c
+	}
+	pem, err := os.ReadFile(path)
+	if err != nil {
+		log.Printf("[sentinel] clickhouse TLS: cannot read SENTINEL_CLICKHOUSE_CA_FILE %q: %v "+
+			"— refusing to fall back to system roots; https queries will FAIL", path, err)
+		pem = nil
+	}
+	pool := x509.NewCertPool()
+	if len(pem) > 0 && !pool.AppendCertsFromPEM(pem) {
+		log.Printf("[sentinel] clickhouse TLS: %q contained no usable certificates "+
+			"— refusing to fall back to system roots; https queries will FAIL", path)
+	}
+	// An empty pool trusts nothing, so verification fails loudly and visibly.
+	c.Transport = &http.Transport{TLSClientConfig: &tls.Config{
+		RootCAs:    pool,
+		MinVersion: tls.VersionTLS12,
+	}}
+	return c
+}
 
 // Client talks to ClickHouse over its HTTP interface.
 type Client struct {
@@ -37,7 +83,7 @@ func FromEnv() *Client {
 		db:       getenv("SENTINEL_CLICKHOUSE_DB", "sentinel_logs"),
 		user:     getenv("SENTINEL_CLICKHOUSE_USER", "sentinel"),
 		password: getenv("SENTINEL_CLICKHOUSE_PASSWORD", "sentinel_dev"),
-		http:     &http.Client{Timeout: 10 * time.Second},
+		http:     httpClientForCA(),
 	}
 	if raw == "" {
 		return c // disabled

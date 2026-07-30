@@ -101,10 +101,24 @@ services:
       CLICKHOUSE_MAX_SERVER_MEMORY_USAGE_TO_RAM_RATIO: "0.6"
     volumes:
       - chdata:/var/lib/clickhouse
+      # TLS drop-in + leaf, so the HTTPS interface is available for cross-host
+      # clients (the 2-VM passive node). Issued by issue-clickhouse-cert.sh.
+      #
+      # `:ro` and OPTIONAL by design: a single-host deployment that has not run
+      # the issuer has no /opt/sentinel-pki, and Docker would otherwise CREATE
+      # those paths as empty DIRECTORIES — the exact trap that made an absent
+      # cert report itself as present during the first 2-VM install (a directory
+      # satisfies `-s`). Compose cannot express "mount if exists", so these live
+      # in the 2VM overlays where the issuer is a required install step, NOT here.
     healthcheck:
       # /ping needs no auth; busybox wget ships in the alpine image. Use the
       # IPv4 loopback explicitly: this host is IPv4-only and `localhost` resolves
       # to ::1 first, where ClickHouse can't bind (IPv6 disabled) → false-unhealthy.
+      #
+      # Stays on plaintext 8123 over loopback INSIDE the container: that traffic
+      # never touches a network, and pointing it at https would make the health of
+      # the container depend on certificate validity — a cert problem would then
+      # read as "ClickHouse is down" and take dependent services with it.
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8123/ping | grep -q Ok || exit 1"]
       interval: 10s
       timeout: 3s
