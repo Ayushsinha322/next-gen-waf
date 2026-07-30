@@ -58,3 +58,23 @@ services:
       # protected by hostssl + scram-sha-256 and a /32 pg_hba grant, NOT by being
       # unreachable — bind it to the interface the peer uses and firewall the rest.
       - "${SENTINEL_PG_BIND:-0.0.0.0}:5432:5432"
+
+  clickhouse:
+    ports:
+      # ClickHouse lives ONLY on this VM (two nodes cannot form a Keeper quorum),
+      # so the passive VM's data plane has to reach it here or its event history
+      # has nowhere to land. Before this was published, the passive node wrote
+      # nothing at all: measured 2026-07-29, nine attacks blocked with 403 while
+      # it held the VIP and ClickHouse recorded zero of them.
+      #
+      # ⚠️ Unlike Postgres above, this is PLAINTEXT HTTP. The Rust client is
+      # hyper with a bare HttpConnector and no TLS, so it cannot speak ClickHouse's
+      # https_port without adding a TLS connector first (deliberately non-trivial
+      # here: reqwest was avoided to keep icu_* and its Rust >= 1.86 floor out of
+      # the tree). Until that lands, the ClickHouse password and event bodies
+      # cross the peer link in the clear.
+      #
+      # So this one really IS protected by reachability, not by crypto. Bind it to
+      # the peer-facing address only and firewall it to the peer's /32 — the
+      # installer does both. Do not widen it to 0.0.0.0 on an untrusted segment.
+      - "${SENTINEL_CH_BIND:-127.0.0.1}:8123:8123"

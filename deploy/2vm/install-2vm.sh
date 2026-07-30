@@ -278,6 +278,12 @@ PY
     set_kv SENTINEL_DB_URL_PRIMARY "postgres://sentinel:${PGPW}@${THIS_IP}:5432/sentinel?sslmode=disable"
     set_kv SENTINEL_ALLOW_SUPERUSER_DB 1
     set_kv CLICKHOUSE_MEM_LIMIT 6g
+    # ClickHouse runs only here, and the slave's data plane must reach it or its
+    # event history is never recorded at all. Bind to the peer-facing address
+    # (NOT 0.0.0.0) — this port is plaintext HTTP, so reachability is the only
+    # control protecting it until the Rust client can speak TLS.
+    set_kv SENTINEL_CH_BIND "$THIS_IP"
+    set_kv SENTINEL_CLICKHOUSE_URL_PRIMARY "http://${THIS_IP}:8123"
     chmod 600 "$ENV_FILE"
     ok "generated .env with fresh secrets"
     warn "sslmode=disable is set for the replication DSNs. Run issue-postgres-cert.sh"
@@ -326,8 +332,26 @@ PYEOF
   else
     printf 'SENTINEL_PRIMARY_HOST=%s\n' "$PEER_IP" >> "$ENV_FILE"
   fi
+  # Same node-specific reasoning for the remote ClickHouse: this VM has none, so
+  # both its planes must point at the master's. The master writes its own address
+  # here, which is already correct once copied — but rewrite it anyway so a role
+  # swap or a re-run cannot leave the slave pointing at itself, where there is no
+  # ClickHouse and history would silently go nowhere all over again.
+  if grep -qE "^SENTINEL_CLICKHOUSE_URL_PRIMARY=" "$ENV_FILE"; then
+    python3 - "$ENV_FILE" "http://${PEER_IP}:8123" <<'PYEOF'
+import sys, re
+p, v = sys.argv[1], sys.argv[2]
+s = open(p).read()
+s = re.sub(r'^SENTINEL_CLICKHOUSE_URL_PRIMARY=.*$',
+           'SENTINEL_CLICKHOUSE_URL_PRIMARY=' + v, s, count=1, flags=re.M)
+open(p, 'w').write(s)
+PYEOF
+  else
+    printf 'SENTINEL_CLICKHOUSE_URL_PRIMARY=%s\n' "http://${PEER_IP}:8123" >> "$ENV_FILE"
+  fi
   chmod 600 "$ENV_FILE"
   ok "SENTINEL_PRIMARY_HOST=$PEER_IP (the standby streams from here)"
+  ok "SENTINEL_CLICKHOUSE_URL_PRIMARY=http://${PEER_IP}:8123 (event history lands there)"
 fi
 
 # ── 4b. Postgres TLS ─────────────────────────────────────────────────────────
@@ -477,6 +501,50 @@ printf '%s\n' "$VIP"  > "$STATE_DIR/2vm-vip"
 # use a name the site claims — and the VIP always is one in this topology.
 printf '%s\n' "$VIP"  > "$STATE_DIR/2vm-probe-host"
 chmod 644 "$ROLE_FILE" "$STATE_DIR/2vm-vip" "$STATE_DIR/2vm-probe-host"
+
+# ── 5b. restrict the published ClickHouse port to the peer ───────────────────
+#
+# The master publishes ClickHouse so the slave's data plane has somewhere to send
+# event history. That port is plaintext HTTP (the Rust client has no TLS
+# connector), so unlike Postgres next door it is NOT protected by crypto —
+# reachability is the whole control, and binding to the peer-facing address is
+# only half of it.
+#
+# The rule goes in DOCKER-USER, not INPUT and not ufw. Docker publishes ports by
+# DNAT in its own chains, which bypass INPUT entirely and are invisible to ufw —
+# the single most common way an operator believes a container port is firewalled
+# when it is wide open. DOCKER-USER is the documented hook that runs before
+# Docker's own rules.
+#
+# Deliberately narrow: one chain, one port, one interface, allow the peer /32 and
+# drop the rest. Nothing in raw/PREROUTING and no NOTRACK — a previous attempt at
+# network hardening here broke Docker's DNAT that way.
+if [[ "$ROLE" == "master" ]]; then
+  step "Step 6b of 7 — firewalling the published ClickHouse port"
+  if command -v iptables >/dev/null 2>&1; then
+    _ch_rule_present() {
+      iptables -C DOCKER-USER -i "$IFACE" -p tcp --dport 8123 -s "${PEER_IP}/32" -j RETURN 2>/dev/null
+    }
+    if _ch_rule_present; then
+      ok "ClickHouse peer allow-rule already present (idempotent re-run)"
+    else
+      # Order matters: the peer RETURNs before the catch-all DROP is reached, so
+      # insert the DROP first and the allow above it.
+      iptables -I DOCKER-USER 1 -i "$IFACE" -p tcp --dport 8123 -j DROP 2>/dev/null \
+        && iptables -I DOCKER-USER 1 -i "$IFACE" -p tcp --dport 8123 -s "${PEER_IP}/32" -j RETURN 2>/dev/null \
+        && ok "ClickHouse :8123 on $IFACE restricted to ${PEER_IP}/32" \
+        || warn "could not install the ClickHouse firewall rules — restrict :8123 yourself"
+    fi
+    warn "iptables rules are NOT persistent across a reboot on their own"
+    say  "  ${DIM}install netfilter-persistent (or re-run this installer) so the${R}"
+    say  "  ${DIM}restriction survives: apt-get install -y iptables-persistent${R}"
+    say  "  ${DIM}verify from a THIRD host: curl -m3 http://${THIS_IP}:8123/ping  → must fail${R}"
+  else
+    warn "iptables not found — :8123 is published and UNFILTERED"
+    say  "  ${DIM}It carries the ClickHouse password in the clear. Restrict it to${R}"
+    say  "  ${DIM}${PEER_IP}/32 with whatever firewall this host uses.${R}"
+  fi
+fi
 
 # ── 6. bring the stack up ────────────────────────────────────────────────────
 step "Step 7 of 7 — starting the stack"
