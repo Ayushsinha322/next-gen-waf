@@ -561,18 +561,45 @@ chmod 644 "$ROLE_FILE" "$STATE_DIR/2vm-vip" "$STATE_DIR/2vm-probe-host"
 if [[ "$ROLE" == "master" ]]; then
   step "Step 6b of 7 — firewalling the published ClickHouse port"
   if command -v iptables >/dev/null 2>&1; then
+    # MATCH ON THE ORIGINAL DESTINATION PORT, NOT --dport.
+    #
+    # Docker DNATs before the FORWARD chain, so by the time DOCKER-USER sees a
+    # packet its dport is the CONTAINER's port — and two containers here share
+    # container port 8443:
+    #
+    #   ClickHouse   host 8443 -> container 8443    must be peer-only
+    #   data plane   host  443 -> container 8443    must stay open to the world
+    #
+    # A plain `--dport 8443` cannot tell them apart, so it silently blackholes
+    # every client's HTTPS request to the WAF. Measured: it did exactly that on
+    # .88 on 2026-07-30 — https through the VIP went to a connection timeout while
+    # every other check still looked healthy, because the data path was being
+    # dropped in a chain nobody associates with the WAF's own listener.
+    #
+    # `-m conntrack --ctorigdstport` matches the port the CLIENT dialed, which is
+    # the distinction that actually exists.
     _ch_rule_present() {
-      iptables -C DOCKER-USER -i "$IFACE" -p tcp --dport 8443 -s "${PEER_IP}/32" -j RETURN 2>/dev/null
+      iptables -C DOCKER-USER -i "$IFACE" -p tcp -m conntrack \
+        --ctorigdstport 8443 -s "${PEER_IP}/32" -j RETURN 2>/dev/null
     }
     if _ch_rule_present; then
       ok "ClickHouse peer allow-rule already present (idempotent re-run)"
     else
       # Order matters: the peer RETURNs before the catch-all DROP is reached, so
       # insert the DROP first and the allow above it.
-      iptables -I DOCKER-USER 1 -i "$IFACE" -p tcp --dport 8443 -j DROP 2>/dev/null \
-        && iptables -I DOCKER-USER 1 -i "$IFACE" -p tcp --dport 8443 -s "${PEER_IP}/32" -j RETURN 2>/dev/null \
-        && ok "ClickHouse :8443 on $IFACE restricted to ${PEER_IP}/32" \
+      iptables -I DOCKER-USER 1 -i "$IFACE" -p tcp -m conntrack --ctorigdstport 8443 -j DROP 2>/dev/null \
+        && iptables -I DOCKER-USER 1 -i "$IFACE" -p tcp -m conntrack --ctorigdstport 8443 -s "${PEER_IP}/32" -j RETURN 2>/dev/null \
+        && ok "ClickHouse :8443 on $IFACE restricted to ${PEER_IP}/32 (matched pre-DNAT)" \
         || warn "could not install the ClickHouse firewall rules — restrict :8443 yourself"
+      # Prove the data path still works rather than assuming it: this rule pair is
+      # one typo away from a silent HTTPS outage.
+      if ! curl -sk -m5 -o /dev/null "https://${THIS_IP}/" 2>/dev/null; then
+        warn "HTTPS to this node FAILED right after adding the firewall rules"
+        say  "  ${DIM}That is the --dport-vs-ctorigdstport trap. Inspect:${R}"
+        say  "  ${DIM}  iptables -L DOCKER-USER -n --line-numbers${R}"
+      else
+        ok "client HTTPS to this node still works (data path not caught by the rule)"
+      fi
     fi
     # Belt and braces: an older install of this stack published PLAINTEXT 8123 to
     # the network. Leave a DROP behind so upgrading does not silently keep that
