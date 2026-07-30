@@ -673,6 +673,10 @@ impl ProxyServer {
                 const CAP_CHECK_BYTES: u64 = 16 * 1024 * 1024;
                 let mut ticks_since_cap = 0u32;
                 let mut bytes_since_cap = 0u64;
+                // Spool cadence while disconnected — see the disconnected branch
+                // for why it is far slower than the 5s connected flush.
+                const SPOOL_FLUSH_TICKS: u32 = 60;
+                let mut ticks_disconnected = 0u32;
                 // A backlog left by a previous process is replayed on the first
                 // connected tick — that restart-survival is the reason the spool
                 // is on disk instead of simply being a larger memory buffer.
@@ -733,6 +737,9 @@ impl ProxyServer {
                     evbuf.extend(drain_events());
                     ticks += 1;
                     ticks_since_cap += 1;
+                    if ch.is_none() {
+                        ticks_disconnected += 1;
+                    }
                     // Both streams flush on the same 5s-or-500-row cadence.
                     let time_due = ticks >= 5;
 
@@ -786,10 +793,25 @@ impl ProxyServer {
                             ch = None;
                             reconnect_in = 5;
                         }
-                    } else if time_due || buf.len() >= 500 || evbuf.len() >= 500 {
+                    } else if ticks_disconnected >= SPOOL_FLUSH_TICKS
+                        || buf.len() >= 500
+                        || evbuf.len() >= 500
+                    {
                         // Disconnected. This is the path that silently lost every
                         // event on a node with no reachable ClickHouse: it used to
                         // clear both buffers unconditionally. Now it persists them.
+                        //
+                        // Deliberately a SLOWER cadence than the connected flush.
+                        // A node whose sink is permanently unreachable spools
+                        // forever, and at the 5s connected cadence that is ~17k
+                        // tiny files a day — which `enforce_cap`'s directory walk
+                        // then has to traverse every 30s. The passive node in the
+                        // 2-VM topology is exactly that case: its VRRP health
+                        // check probes a real request every 2s, so it always has
+                        // traffic to record. One segment a minute holds the same
+                        // rows in 1/12th the files, and the extra in-memory
+                        // residency is bounded by the same 500-row trigger.
+                        ticks_disconnected = 0;
                         bytes_since_cap += spool_batch(spool.as_ref(), "traffic", &buf);
                         bytes_since_cap += spool_batch(spool.as_ref(), "events", &evbuf);
                         buf.clear();
