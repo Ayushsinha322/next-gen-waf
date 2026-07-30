@@ -21,10 +21,10 @@ pub mod traces;
 pub use logs::{AccessEvent, AuditEvent, ErrorEvent, EventLogger, MlEvent, ModsecEvent, WafEvent};
 
 pub use metrics::{
-    dec_active_connections, inc_active_connections, inc_blocked, inc_ebpf_drops,
-    inc_load_shed_connections, inc_load_shed_requests, inc_requests, inc_rule_hits,
-    observe_duration, prometheus_text, set_active_connections, snapshot, Counter, Gauge, Histogram,
-    MetricLine, MetricsRegistry, MetricsSnapshot,
+    dec_active_connections, history_shed_total, inc_active_connections, inc_blocked,
+    inc_ebpf_drops, inc_history_shed, inc_load_shed_connections, inc_load_shed_requests,
+    inc_requests, inc_rule_hits, observe_duration, prometheus_text, set_active_connections,
+    snapshot, Counter, Gauge, Histogram, MetricLine, MetricsRegistry, MetricsSnapshot,
 };
 
 pub use traces::{start_child_span, start_span, Span, SpanId, TraceId, Tracer, TRACER};

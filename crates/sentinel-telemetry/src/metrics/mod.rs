@@ -457,6 +457,17 @@ struct WafMetrics {
     /// Requests shed with 503 because the global in-flight request limit was
     /// saturated (admission control — bounds HTTP/2 & HTTP/3 stream fan-out).
     pub load_shed_requests_total: Counter,
+    /// Notable WAF events (blocks / learning-mode DETECTs) that were NOT recorded
+    /// because the in-memory history buffer was full.
+    ///
+    /// Unlike the two counters above, this sheds an AUDIT RECORD rather than a
+    /// request: the request itself was still inspected and still enforced. Under a
+    /// sustained flood every blocked request wants an event row, so the buffer's
+    /// 20k cap is reached and the surplus is dropped to protect memory — correct,
+    /// but it means "events in ClickHouse" understates "attacks blocked" exactly
+    /// when the gap matters most. Non-zero here invalidates any attempt to count
+    /// attacks from `waf_events` for that window.
+    pub history_shed_total: Counter,
     pub registry: MetricsRegistry,
 }
 
@@ -495,6 +506,10 @@ impl WafMetrics {
             "sentinel_load_shed_requests_total",
             "Total number of requests shed with 503 due to the in-flight request limit",
         );
+        let history_shed_total = registry.register_counter(
+            "sentinel_history_shed_total",
+            "Total number of WAF events not recorded because the history buffer was full",
+        );
 
         Self {
             requests_total,
@@ -505,6 +520,7 @@ impl WafMetrics {
             ebpf_drops_total,
             load_shed_connections_total,
             load_shed_requests_total,
+            history_shed_total,
             registry,
         }
     }
@@ -556,6 +572,23 @@ pub fn inc_load_shed_connections() {
 /// global in-flight request limit was saturated.
 pub fn inc_load_shed_requests() {
     WAF_METRICS.load_shed_requests_total.inc();
+}
+
+/// Increment the counter of WAF events dropped because the in-memory history
+/// buffer was full, and return the new total.
+///
+/// Returns the total so the caller can log a rate-limited warning without
+/// keeping a second counter of its own — a silent shed is the thing this exists
+/// to prevent, so it should be visible in logs as well as in `/metrics`.
+pub fn inc_history_shed() -> u64 {
+    WAF_METRICS.history_shed_total.inc();
+    WAF_METRICS.history_shed_total.get()
+}
+
+/// Current total of shed history events. Zero means every block/DETECT in this
+/// process's lifetime reached the buffer.
+pub fn history_shed_total() -> u64 {
+    WAF_METRICS.history_shed_total.get()
 }
 
 /// Increment the rule-hits counter.
@@ -651,6 +684,21 @@ mod tests {
         assert!(text.contains("sentinel_load_shed_connections_total"));
         assert!(text.contains("sentinel_load_shed_requests_total"));
         assert!(text.contains("sentinel_active_connections"));
+    }
+
+    #[test]
+    fn history_shed_counter_is_exposed_and_monotonic() {
+        // The counter is global and other tests in this binary may have bumped it,
+        // so assert on the DELTA rather than an absolute value.
+        let before = history_shed_total();
+        let a = inc_history_shed();
+        let b = inc_history_shed();
+        assert_eq!(a, before + 1, "inc must return the new total");
+        assert_eq!(b, before + 2, "counter must be monotonic");
+        assert_eq!(history_shed_total(), before + 2);
+        let text = prometheus_text();
+        assert!(text.contains("sentinel_history_shed_total"));
+        assert!(text.contains("# TYPE sentinel_history_shed_total counter"));
     }
 
     // ── Lock-free histogram ────────────────────────────────────────────────

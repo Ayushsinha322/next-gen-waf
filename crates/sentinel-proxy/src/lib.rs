@@ -68,9 +68,9 @@ use sentinel_modules::{
 use sentinel_plugins::PluginRuntime;
 use sentinel_rules::RuleEngine;
 use sentinel_telemetry::{
-    dec_active_connections, inc_active_connections, inc_blocked, inc_ebpf_drops,
-    inc_load_shed_connections, inc_load_shed_requests, inc_requests, inc_rule_hits,
-    observe_duration, prometheus_text,
+    dec_active_connections, history_shed_total, inc_active_connections, inc_blocked,
+    inc_ebpf_drops, inc_history_shed, inc_load_shed_connections, inc_load_shed_requests,
+    inc_requests, inc_rule_hits, observe_duration, prometheus_text,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Semaphore};
@@ -5237,6 +5237,12 @@ fn health_response(state: &ServerState) -> Response<BoxBody> {
         "sites": site_count,
         "listeners": listeners,
         "http3": http3,
+        // Non-zero means this node enforced blocks it could not record, so
+        // waf_events undercounts attacks for that window. Surfaced here as well as
+        // in /metrics because /healthz is what an operator reads first, and a
+        // silently incomplete audit trail is the failure this counter exists to
+        // make visible.
+        "history_shed": history_shed_total(),
         "upstreams_healthy": pool_stats.healthy,
         "upstreams_total": pool_stats.total,
         "version": env!("CARGO_PKG_VERSION"),
@@ -5560,6 +5566,14 @@ static WAF_EVENTS: std::sync::OnceLock<std::sync::Mutex<Vec<sentinel_storage::Wa
 static HISTORY_SINK_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Cap on buffered-but-unflushed events, bounding memory when the sink is slow
+/// or unreachable. At ~200 bytes a row this is a few MB.
+///
+/// The flusher drains every second, so reaching this means events are arriving
+/// faster than 20k/s sustained — a flood, not normal traffic. Overflow is counted
+/// in `sentinel_history_shed_total`; see `record_event`.
+const EVENT_BUFFER_CAP: usize = 20_000;
+
 fn waf_events() -> &'static std::sync::Mutex<Vec<sentinel_storage::WafEventRow>> {
     WAF_EVENTS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
@@ -5647,8 +5661,30 @@ fn record_event(ctx: &RequestContext) {
         },
     };
     if let Ok(mut buf) = waf_events().lock() {
-        if buf.len() < 20_000 {
+        if buf.len() < EVENT_BUFFER_CAP {
             buf.push(row);
+        } else {
+            // The buffer is full: this block/DETECT is enforced but will never be
+            // recorded. Count it — a silent shed here makes waf_events understate
+            // attacks blocked, precisely during a flood, which is when someone is
+            // most likely to be counting. `sentinel_history_shed_total` is the
+            // metric; the log below is for anyone reading logs rather than scraping.
+            //
+            // The cap is intentional (a flood at 20k rps wants 20k event rows a
+            // second; ClickHouse and the spool must not be driven by attacker
+            // volume) — the defect was never the shedding, only its invisibility.
+            let total = inc_history_shed();
+            // Rate-limited: at 20k/s an unconditional warn! would itself become the
+            // overload. Powers of ten give a loud first signal then decreasing noise.
+            if total == 1 || total.is_power_of_two() || total % 100_000 == 0 {
+                warn!(
+                    shed_total = total,
+                    buffer_cap = EVENT_BUFFER_CAP,
+                    "waf event history buffer FULL — events are being enforced but NOT \
+                     recorded; waf_events undercounts blocks for this window \
+                     (see sentinel_history_shed_total)"
+                );
+            }
         }
     }
 }
@@ -6810,6 +6846,113 @@ mod admission_control_tests {
             Arc::clone(&sem).try_acquire_owned().is_ok(),
             "freed slot is reusable"
         );
+    }
+}
+
+#[cfg(test)]
+mod history_shed_tests {
+    use super::*;
+
+    /// Serialise: the event buffer and the shed counter are process-global.
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn blocking_ctx() -> RequestContext {
+        let mut ctx = RequestContext::new("203.0.113.9".parse().unwrap(), 4444);
+        // record_event only stores NOTABLE requests — a Block here, so the row is
+        // built and the buffer path is genuinely exercised.
+        ctx.decision = WafDecision::Block;
+        ctx.block_reason = Some("test: forced block".to_string());
+        ctx.site_id = Some("shedtest".to_string());
+        ctx
+    }
+
+    #[test]
+    fn events_are_buffered_until_the_cap_then_counted_as_shed() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        HISTORY_SINK_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // Start from a known buffer state.
+        let _ = drain_events();
+        let shed_before = history_shed_total();
+
+        // Fill exactly to the cap: none of these may shed.
+        {
+            let mut buf = waf_events().lock().unwrap();
+            buf.clear();
+            let filler = || sentinel_storage::WafEventRow {
+                ts: 0,
+                ip: String::new(),
+                country: String::new(),
+                site: String::new(),
+                tenant: String::new(),
+                method: String::new(),
+                path: String::new(),
+                rule: String::new(),
+                attack: String::new(),
+                action: String::new(),
+                severity: String::new(),
+                score: 0,
+                status: 0,
+                protocol: String::new(),
+                request_id: String::new(),
+                target: String::new(),
+                mode: String::new(),
+                threshold: 0,
+                explanation: String::new(),
+            };
+            buf.resize_with(EVENT_BUFFER_CAP - 1, filler);
+        }
+
+        // One below the cap → must be accepted, nothing shed.
+        record_event(&blocking_ctx());
+        assert_eq!(
+            waf_events().lock().unwrap().len(),
+            EVENT_BUFFER_CAP,
+            "the last free slot should have been used"
+        );
+        assert_eq!(
+            history_shed_total(),
+            shed_before,
+            "nothing may be shed while the buffer still had room"
+        );
+
+        // Now full → the next three must shed AND be counted, and the buffer must
+        // not grow past the cap (that bound is the reason shedding exists).
+        for _ in 0..3 {
+            record_event(&blocking_ctx());
+        }
+        assert_eq!(
+            waf_events().lock().unwrap().len(),
+            EVENT_BUFFER_CAP,
+            "buffer must stay capped"
+        );
+        assert_eq!(
+            history_shed_total(),
+            shed_before + 3,
+            "every dropped event must be counted — a silent shed is the bug this fixes"
+        );
+
+        // Draining frees space, so recording resumes without further shedding.
+        let drained = drain_events();
+        assert_eq!(drained.len(), EVENT_BUFFER_CAP);
+        record_event(&blocking_ctx());
+        assert_eq!(waf_events().lock().unwrap().len(), 1);
+        assert_eq!(
+            history_shed_total(),
+            shed_before + 3,
+            "no extra shed once the buffer drained"
+        );
+
+        let _ = drain_events();
+    }
+
+    #[test]
+    fn healthz_reports_the_shed_total() {
+        // Cheap guard that the field is actually wired into the payload an operator
+        // reads, not only into /metrics.
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let body = serde_json::json!({ "history_shed": history_shed_total() });
+        assert!(body["history_shed"].is_number());
     }
 }
 

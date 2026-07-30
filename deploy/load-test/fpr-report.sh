@@ -86,6 +86,17 @@ reqs=${reqs:-0}; hard=${hard:-0}; detects=${detects:-0}; blocks=${blocks:-0}
 
 echo "-- Volume ----------------------------------------------------"
 printf "  requests seen        %s\n" "$reqs"
+
+# A non-zero shed means the data plane enforced blocks it could NOT record, so
+# waf_events undercounts and every ratio below is understated. Read from the live
+# node rather than ClickHouse — the whole point is that these never reached it.
+shed=$(curl -s --max-time 3 http://127.0.0.1:80/healthz 2>/dev/null \
+        | python3 -c 'import sys,json;print(json.load(sys.stdin).get("history_shed",0))' 2>/dev/null || echo 0)
+if [ "${shed:-0}" -gt 0 ] 2>/dev/null; then
+  printf "  ⚠️  events SHED       %s   (enforced but never recorded — history buffer full)\n" "$shed"
+  echo   "      waf_events undercounts blocks, so the rate below is UNDERSTATED."
+  echo   "      Usually means a flood: at 20k rps every blocked request wants a row."
+fi
 printf "  would-have-blocked   %s   (action=DETECT, learning mode)\n" "$detects"
 printf "  actually blocked     %s   (action=BLOCK)\n" "$blocks"
 echo
