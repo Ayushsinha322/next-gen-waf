@@ -96,16 +96,58 @@ if [ "$reqs" -eq 0 ]; then
   exit 0
 fi
 
+# ── Is this denominator actually REAL traffic? ────────────────────────────────
+#
+# In the 2-VM topology keepalived's health check issues a REAL request to each
+# node every `interval` seconds, so both nodes manufacture traffic whether or not
+# a user is present: 2 nodes / 2s = ~3600 requests an hour, ~86k a day.
+#
+# Those probes score below threshold (one unvarying benign GET), so they never
+# become detections — they land ONLY in the denominator. That biases the rate
+# DOWNWARD, i.e. toward a false PASS, which is the dangerous direction for a gate.
+# Measured 2026-07-30 on the .88/.89 pair: 364 of 373 requests in the window were
+# the probe, and the report duly announced 0.18% "under the 1% gate" on four
+# self-inflicted test attacks.
+#
+# So say so, loudly, rather than letting a padded denominator read as a pass.
+probe_iv=$(grep -oE '^\s*interval\s+[0-9]+' /etc/keepalived/keepalived.conf 2>/dev/null \
+             | grep -oE '[0-9]+' | head -1)
+probe_est=0
+if [ -n "${probe_iv:-}" ] && [ "${probe_iv:-0}" -gt 0 ]; then
+  # Two nodes in this topology, each probing itself.
+  probe_est=$(( (3600 / probe_iv) * 2 * HOURS ))
+fi
+
 rate=$(ch "SELECT round(($detects / $reqs) * 100, 4)")
 echo "-- Detection rate (UPPER BOUND on false-positive rate) -------"
 printf "  %s%% of real traffic would have been blocked\n" "$rate"
 echo
+
+probe_dominated=no
+if [ "$probe_est" -gt 0 ]; then
+  printf "  ⚠️  Up to %s of those %s requests are keepalived health-check probes\n" "$probe_est" "$reqs"
+  printf "      (2 nodes x every %ss). They never trigger detections, so they inflate\n" "$probe_iv"
+  echo   "      ONLY the denominator — which pushes this rate DOWN, toward a false pass."
+  if [ "$(( probe_est * 2 ))" -ge "$reqs" ]; then
+    probe_dominated=yes
+    echo   "      More than half your denominator is self-generated. This number is NOT"
+    echo   "      yet a false-positive rate for real users."
+  fi
+  echo
+fi
+
 verdict=$(ch "SELECT if($detects / $reqs < 0.01, 'under', 'over')")
-if [ "$verdict" = "under" ]; then
+if [ "$verdict" = "over" ]; then
+  echo "  ❌ Over the 1% gate. Do NOT enable blocking yet — work the table below."
+elif [ "$probe_dominated" = "yes" ]; then
+  echo "  ⏳ NOT A PASS — the gate cannot be judged on this data. The window is"
+  echo "     dominated by synthetic health-check traffic, so the rate is an artefact"
+  echo "     of the probe, not a measurement of your users. Keep learning mode on"
+  echo "     until real traffic has run for a full business cycle (see"
+  echo "     deploy/LEARNING-MODE-PILOT.md step 2), then re-run."
+else
   echo "  ✅ Under the 1% gate. Triage the table below to confirm the remaining"
   echo "     detections are genuine attacks, then blocking mode is defensible."
-else
-  echo "  ❌ Over the 1% gate. Do NOT enable blocking yet — work the table below."
 fi
 echo
 
