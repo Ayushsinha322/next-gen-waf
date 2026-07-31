@@ -124,6 +124,7 @@ appears in a threat feed is still refused during the pilot.
 | Back up | `sudo /opt/sentinel/current/scripts/backup/backup.sh` |
 | Test a restore | `sudo /opt/sentinel/current/scripts/backup/drill.sh` |
 | Upgrade | extract the new package, `sudo ./upgrade.sh` |
+| Roll back | `sudo ./rollback.sh` (or `--list` to see targets) |
 | Remove, keep data | `sudo ./uninstall.sh` |
 | Remove everything | `sudo ./uninstall.sh --purge` |
 
@@ -140,6 +141,7 @@ install.sh          one-command installer
 uninstall.sh        removal (keeps data unless --purge)
 verify.sh           health verification with evidence
 upgrade.sh          in-place upgrade with automatic rollback
+rollback.sh         return to the previous version
 README.md           this file
 bundle/             pre-built images, manifest, checksums
 compose/            deployment topologies
