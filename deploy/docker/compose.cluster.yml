@@ -71,7 +71,7 @@ services:
       SENTINEL_ADVERTISE_ADDR: controlplane:9501
 
   cp2:
-    image: sentinel/controlplane:latest
+    image: ${SENTINEL_IMAGE_PREFIX:-sentinel}/controlplane:${SENTINEL_VERSION:-latest}
     hostname: cp2
     restart: unless-stopped
     user: "0:0"
@@ -102,7 +102,7 @@ services:
     networks: [sentinel]
 
   cp3:
-    image: sentinel/controlplane:latest
+    image: ${SENTINEL_IMAGE_PREFIX:-sentinel}/controlplane:${SENTINEL_VERSION:-latest}
     hostname: cp3
     restart: unless-stopped
     user: "0:0"

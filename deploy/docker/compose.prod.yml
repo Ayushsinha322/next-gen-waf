@@ -134,7 +134,7 @@ services:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
       target: sentinel-migrate
-    image: sentinel/migrate:latest
+    image: ${SENTINEL_IMAGE_PREFIX:-sentinel}/migrate:${SENTINEL_VERSION:-latest}
     restart: "no"
     depends_on:
       postgres: { condition: service_healthy }
@@ -151,7 +151,7 @@ services:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
       target: sentinel-controlplane
-    image: sentinel/controlplane:latest
+    image: ${SENTINEL_IMAGE_PREFIX:-sentinel}/controlplane:${SENTINEL_VERSION:-latest}
     restart: unless-stopped
     # root so it can write the shared NDJSON log volume (hardened via K8s
     # securityContext later). The control-plane hub reads what the proxy writes.
@@ -234,7 +234,7 @@ services:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
       target: sentinel-dataplane
-    image: sentinel/dataplane:latest
+    image: ${SENTINEL_IMAGE_PREFIX:-sentinel}/dataplane:${SENTINEL_VERSION:-latest}
     restart: unless-stopped
     user: "0:0"
     # Kernel XDP needs these to load/attach the BPF program and its maps.
@@ -334,7 +334,7 @@ services:
         # listener (no mixed-content, no CORS). The console's primary URL is now
         # https://172.16.21.71:9443; :3000 remains a cleartext break-glass path.
         NEXT_PUBLIC_CONTROL_PLANE_URL: https://172.16.21.71:9443
-    image: sentinel/dashboard:latest
+    image: ${SENTINEL_IMAGE_PREFIX:-sentinel}/dashboard:${SENTINEL_VERSION:-latest}
     restart: unless-stopped
     depends_on:
       controlplane: { condition: service_started }
@@ -355,7 +355,20 @@ services:
       - "127.0.0.1:3000:3000"
     networks: [sentinel]
 
+  # DEMO TARGET ONLY — OWASP Juice Shop is a DELIBERATELY VULNERABLE application.
+  #
+  # Behind the `demo` profile so it can never start in a customer installation.
+  # It used to start unconditionally, which meant any production deploy silently
+  # ran a knowingly exploitable app on the compose network. It is not published to
+  # a host port, but that is not a reason to ship it.
+  #
+  #   demo / pilot :  docker compose --profile demo ... up -d
+  #   customer     :  docker compose ... up -d          (juiceshop never starts)
+  #
+  # ⚠️ Any site whose upstream is `juiceshop:3000` returns 502 without this
+  # profile — including the .88/.89 pilot pair. Pass --profile demo there.
   juiceshop:
+    profiles: [demo]
     image: bkimminich/juice-shop:latest
     restart: unless-stopped
     mem_limit: 768m

@@ -18,7 +18,7 @@
 #   docker compose -f deploy/docker/compose.prod.yml -f deploy/docker/compose.ha.yml up -d waf1 waf2 waf3 lb
 
 x-wafnode: &wafnode
-  image: sentinel/dataplane:latest
+  image: ${SENTINEL_IMAGE_PREFIX:-sentinel}/dataplane:${SENTINEL_VERSION:-latest}
   restart: unless-stopped
   user: "0:0"
   depends_on:
