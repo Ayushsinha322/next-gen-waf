@@ -9,11 +9,16 @@ members = [
     "crates/sentinel-plugins",
     "crates/sentinel-storage",
     "crates/sentinel-telemetry",
-    "crates/sentinel-cluster",
     "crates/sentinel-ebpf",
     "crates/sentinel-cli",
     "crates/sentinel-bin",
+    "crates/sentinel-srl-validate",
 ]
+# Example plugins are separate crates compiled for wasm32-unknown-unknown with
+# crate-type=["cdylib"]. They must not join the workspace: a workspace build
+# would try to build them for the host target, where their `env` host-function
+# imports cannot resolve.
+exclude = ["examples/plugins"]
 
 [workspace.package]
 version = "0.1.0"
@@ -67,6 +72,10 @@ ring = "0.17"
 sha2 = "0.10"
 hmac = "0.12"
 argon2 = "0.5"
+# Edge JWT validation for customer APIs (bearer-token verification in the data
+# plane). v9 provides DecodingKey::from_secret/from_rsa_pem/from_ec_pem/from_jwk
+# and Validation with iss/aud/exp/nbf/algorithms.
+jsonwebtoken = "9"
 
 # Data structures / utils
 dashmap = "6"

@@ -39,23 +39,22 @@ go:
       - .go/pkg/mod/
   variables:
     GOPATH: "$CI_PROJECT_DIR/.go"
+  # No protobuf codegen step: the gRPC listener, api/proto/config.proto and the
+  # generated pkg/proto/ tree were all removed in 71706a7 (the listener was dead
+  # code and served plaintext). Running protoc here failed the job outright with
+  # "Could not make proto path relative: api/proto/config.proto: No such file".
   before_script:
-    - apt-get update && apt-get install -y protobuf-compiler
-    - go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.34.2
-    - go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.4.0
-    - export PATH="$PATH:$(go env GOPATH)/bin"
     - cd control-plane
-    - protoc --go_out=. --go_opt=module=github.com/your-org/sentinel-waf/control-plane
-             --go-grpc_out=. --go-grpc_opt=module=github.com/your-org/sentinel-waf/control-plane
-             api/proto/config.proto
   script:
     - go vet ./...
     - go test ./...
     - go build ./...
 
 # ── Dashboard ────────────────────────────────────────────────────────────────
+# GATING: type-check + unit tests + production build must all pass. (Was
+# allow_failure with `|| true` on every step — i.e. it could never fail.)
 dashboard:
-  stage: build
+  stage: test
   image: node:20
   tags:
     - k8s-docker
@@ -63,12 +62,14 @@ dashboard:
     key: "node-$CI_COMMIT_REF_SLUG"
     paths:
       - dashboard/node_modules/
-  script:
+  before_script:
     - cd dashboard
-    - npm ci || true
-    - npm run lint || true
-    - npm run build || true
-  allow_failure: true
+    - npm ci
+  script:
+    - npm run typecheck        # tsc --noEmit — must be clean (0 errors)
+    - npm run test             # vitest unit tests
+    - npm run lint || true     # advisory only (style); does not gate
+    - npm run build            # production build must succeed
 
 # ── Secret scanning ──────────────────────────────────────────────────────────
 # GitLab ships native secret detection; enable it instead of the gitleaks action.

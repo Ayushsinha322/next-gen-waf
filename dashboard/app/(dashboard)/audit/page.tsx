@@ -76,9 +76,9 @@ export default function AuditPage() {
         </div>
         <div className="tw">
           {loading ? (
-            <div style={{ padding: 24, textAlign: "center", fontFamily: "'Share Tech Mono',monospace", fontSize: 13, color: "var(--text3)" }}>Loading audit log…</div>
+            <div style={{ padding: 24, textAlign: "center", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--text3)" }}>Loading audit log…</div>
           ) : filtered.length === 0 ? (
-            <div style={{ padding: 24, textAlign: "center", fontFamily: "'Share Tech Mono',monospace", fontSize: 13, color: "var(--text3)" }}>No audit events recorded yet. Administrative actions (site/rule/channel changes, logins) appear here.</div>
+            <div style={{ padding: 24, textAlign: "center", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--text3)" }}>No audit events recorded yet. Administrative actions (site/rule/channel changes, logins) appear here.</div>
           ) : (
             <table>
               <thead><tr><th>Time</th><th>Action</th><th>Target</th><th>Actor</th><th>Source IP</th></tr></thead>

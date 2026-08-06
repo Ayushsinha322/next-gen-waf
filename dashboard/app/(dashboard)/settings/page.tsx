@@ -3,7 +3,7 @@ import { useState, useEffect } from "react";
 import { motion } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
 import Toggle from "@/components/ui/Toggle";
-import { api, type UserRow, type APIKeyRow, type NotificationChannel, type ChannelType, type ChannelConfig, type Severity, type ManagementTLSInfo } from "@/lib/api";
+import { api, type UserRow, type APIKeyRow, type NotificationChannel, type ChannelType, type ChannelConfig, type Severity, type ManagementTLSInfo, type ClusterHealth } from "@/lib/api";
 import { staggerContainer, fadeUp, spring } from "@/lib/animations";
 
 const TABS = ["General","Auth & SSO","API Keys","Users & RBAC","Cluster","Notifications","Management TLS"];
@@ -17,7 +17,6 @@ export default function SettingsPage() {
           <div className="sec-title">⚙️ Settings</div>
           <div className="sec-sub">System configuration · Authentication · Team management · Cluster</div>
         </div>
-        <motion.button className="btn bp btn-sm" onClick={() => showToast("Settings saved","s","💾")} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>💾 Save</motion.button>
       </motion.div>
       <motion.div className="tabs" variants={fadeUp}>
         {TABS.map((t,i) => <div key={i} className={`tab ${tab===i?"active":""}`} onClick={() => setTab(i)}>{t}</div>)}
@@ -33,29 +32,147 @@ export default function SettingsPage() {
   );
 }
 
-function GeneralTab() {
+/**
+ * General and Auth & SSO were the two lead tabs of the settings screen and both
+ * were entirely non-functional.
+ *
+ * General had six `defaultValue` inputs and four `<Toggle defaultOn>` with no
+ * state, no handlers and no endpoint behind them: an evaluator could change
+ * "Default WAF Mode" or "Paranoia Level", navigate away, and silently lose it —
+ * or worse, believe they had changed live protection. Those two fields are
+ * per-site policy and are edited in Sites, not here.
+ *
+ * Auth advertised four SSO integrations (Entra, Google Workspace, Okta, SAML 2.0)
+ * whose buttons called showToast, and published a fabricated SP Entity ID at
+ * https://sentinel-waf.corp.io/saml/metadata. In reality the control plane
+ * implements ONE generic OIDC provider — which is what covers Entra, Google and
+ * Okta — configured by environment variable, and no SAML at all.
+ *
+ * Both tabs now report what is true and offer no control that does nothing.
+ */
+function KV({ label, value, mono = true }: { label: string; value: React.ReactNode; mono?: boolean }) {
   return (
-    <motion.div className="panel" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}>
-      <div className="pb">
-        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12, marginBottom:16 }}>
-          <div className="fg2"><label className="flbl2">Tenant Name</label><input className="fin2" defaultValue="Sentinel Security Labs" /></div>
-          <div className="fg2"><label className="flbl2">Admin Email</label><input className="fin2" defaultValue="admin@sentinel.local" type="email" /></div>
-          <div className="fg2"><label className="flbl2">Log Retention</label><select className="fin2 fsel2"><option>30 days</option><option>90 days</option><option>1 year</option></select></div>
-          <div className="fg2"><label className="flbl2">Anomaly Threshold</label><input className="fin2" defaultValue="5" type="number" /></div>
-          <div className="fg2"><label className="flbl2">Default WAF Mode</label><select className="fin2 fsel2"><option>BLOCKING</option><option>LEARNING</option><option>OFF</option></select></div>
-          <div className="fg2"><label className="flbl2">Paranoia Level</label><select className="fin2 fsel2"><option>1 — Default</option><option>2 — Aggressive</option><option>3 — Paranoid</option><option>4 — Ultra</option></select></div>
-        </div>
-        {([
-          ["Enable ML Anomaly Detection","Isolation Forest + Payload Classifier to score requests at Phase 2",true],
-          ["Auto-reload on SIGHUP","Hot-reload config and rules without restarting the proxy daemon",true],
-          ["OpenTelemetry Tracing","Export traces to OTEL collector at http://localhost:4317",true],
-          ["Learning Mode Auto-Promote","Switch site to BLOCKING after 7 days of learning with <0.1% FP",false],
-        ] as [string,string,boolean][]).map(([t,d,on]) => (
-          <div key={t} className="srow">
-            <div style={{flex:1}}><div className="srt">{t}</div><div className="srd">{d}</div></div>
-            <div style={{flexShrink:0}}><Toggle defaultOn={on} /></div>
+    <div style={{ display: "grid", gridTemplateColumns: "220px 1fr", gap: 12, padding: "9px 0", borderBottom: "1px solid var(--border2)" }}>
+      <div style={{ fontSize: "var(--fs-label)", color: "var(--text3)", textTransform: "uppercase", letterSpacing: "var(--tr-wide)" }}>{label}</div>
+      <div style={{ fontSize: "var(--fs-sm)", color: "var(--text)", fontFamily: mono ? "var(--font-mono)" : undefined, overflowWrap: "anywhere" }}>{value}</div>
+    </div>
+  );
+}
+
+function Note({ children, tone = "info" }: { children: React.ReactNode; tone?: "info" | "warn" }) {
+  const c = tone === "warn"
+    ? ["rgba(255,176,32,.07)", "rgba(255,176,32,.25)"]
+    : ["rgba(0,212,255,.06)", "rgba(0,212,255,.18)"];
+  return (
+    <div style={{
+      padding: "11px 14px", background: c[0], border: `1px solid ${c[1]}`,
+      borderRadius: "var(--r2)", fontSize: "var(--fs-sm)", color: "var(--text2)",
+      lineHeight: 1.65, marginBottom: 14,
+    }}>{children}</div>
+  );
+}
+
+function GeneralTab() {
+  const [waf, setWaf] = useState<{ waf_running: boolean; uptime_secs?: number; sites?: number; listeners?: string[]; upstreams_healthy?: number; upstreams_total?: number; http3?: { enabled: boolean; advertise_port?: number } } | null>(null);
+  const [cluster, setCluster] = useState<ClusterHealth | null>(null);
+  const [store, setStore] = useState<{ configured: boolean; reachable: boolean; events?: number; error?: string } | null>(null);
+  const [errs, setErrs] = useState<string[]>([]);
+
+  useEffect(() => {
+    let alive = true;
+    const note = (what: string) => (e: unknown) => {
+      if (alive) setErrs(p => [...p, `${what}: ${e instanceof Error ? e.message : "failed"}`]);
+    };
+    api.waf.status().then(r => alive && setWaf(r)).catch(note("data plane"));
+    api.cluster.health().then(r => alive && setCluster(r)).catch(note("cluster"));
+    api.events.status().then(r => alive && setStore(r)).catch(note("event store"));
+    return () => { alive = false; };
+  }, []);
+
+  const uptime = (secs?: number) => {
+    if (secs === undefined || secs === null) return "—";
+    const d = Math.floor(secs / 86400), h = Math.floor((secs % 86400) / 3600), m = Math.floor((secs % 3600) / 60);
+    return d > 0 ? `${d}d ${h}h ${m}m` : h > 0 ? `${h}h ${m}m` : `${m}m`;
+  };
+
+  return (
+    <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}
+      style={{ display: "grid", gap: 14 }}>
+
+      {errs.length > 0 && (
+        <div className="panel"><div className="pb">
+          <div style={{ fontSize: "var(--fs-sm)", color: "var(--red)" }}>
+            {errs.map((e, i) => <div key={i}>Could not read {e}</div>)}
           </div>
-        ))}
+        </div></div>
+      )}
+
+      <div className="panel">
+        <div className="ph"><div className="ptitle">Data plane</div>
+          <span className={`bdg ${waf?.waf_running ? "bgg" : "br"}`}>
+            {waf ? (waf.waf_running ? "RUNNING" : "STOPPED") : "…"}
+          </span>
+        </div>
+        <div className="pb">
+          <KV label="Uptime" value={uptime(waf?.uptime_secs)} />
+          <KV label="Protected sites" value={waf?.sites ?? "…"} />
+          <KV label="Upstream health" value={
+            waf ? `${waf.upstreams_healthy ?? 0} / ${waf.upstreams_total ?? 0} healthy` : "…"} />
+          <KV label="Listeners" value={waf?.listeners?.length ? waf.listeners.join("   ") : "…"} />
+          <KV label="HTTP/3 (QUIC)" value={
+            waf?.http3 ? (waf.http3.enabled ? `enabled · advertised :${waf.http3.advertise_port ?? "?"}` : "disabled") : "…"} />
+        </div>
+      </div>
+
+      <div className="panel">
+        <div className="ph"><div className="ptitle">Cluster</div>
+          {cluster && <span className={`bdg ${cluster.overall === "healthy" ? "bgg" : cluster.overall === "degraded" ? "ba" : "br"}`}>
+            {cluster.overall.toUpperCase()}</span>}
+        </div>
+        <div className="pb">
+          <KV label="Protection active" value={cluster ? (cluster.protection_active ? "yes" : "NO") : "…"} />
+          <KV label="Data-plane nodes" value={cluster
+            ? `${cluster.data_plane.healthy} healthy · ${cluster.data_plane.degraded} degraded · ${cluster.data_plane.down} down  (of ${cluster.data_plane.total})`
+            : "…"} />
+          <KV label="Resilience budget" value={cluster ? `${cluster.data_plane.resilience_budget} node(s) may fail` : "…"} />
+          <KV label="Control plane" value={cluster
+            ? (cluster.control_plane.enabled
+                ? `${cluster.control_plane.healthy}/${cluster.control_plane.total} up · this node: ${cluster.control_plane.role ?? "unknown"}`
+                : "single node")
+            : "…"} />
+        </div>
+      </div>
+
+      <div className="panel">
+        <div className="ph"><div className="ptitle">Event store (ClickHouse)</div>
+          {store && <span className={`bdg ${store.configured && store.reachable ? "bgg" : "ba"}`}>
+            {store.configured ? (store.reachable ? "REACHABLE" : "UNREACHABLE") : "NOT CONFIGURED"}</span>}
+        </div>
+        <div className="pb">
+          <KV label="Configured" value={store ? String(store.configured) : "…"} />
+          <KV label="Reachable" value={store ? String(store.reachable) : "…"} />
+          <KV label="Stored events" value={store?.events?.toLocaleString() ?? "—"} />
+          {store?.error && <KV label="Error" value={store.error} />}
+        </div>
+      </div>
+
+      <div className="panel">
+        <div className="ph"><div className="ptitle">Where settings actually live</div></div>
+        <div className="pb">
+          <Note>
+            <strong>Protection settings are per site.</strong> WAF mode, paranoia level,
+            anomaly threshold, rate limits, bot detection and ML sensitivity all belong to
+            an individual site and are edited in <strong>Sites → Edit</strong>, where the
+            change is dry-run validated and a rollback point is written. This tab used to
+            show global copies of those fields that were never saved anywhere.
+          </Note>
+          <Note tone="warn">
+            <strong>Log retention, tracing and the data-plane config file</strong> are set
+            where the stack is deployed, via environment variables and
+            <code style={{ fontFamily: "var(--font-mono)" }}> sentinel.proxy.yaml</code> —
+            there is no tenant-settings API, so this console does not pretend to own them.
+          </Note>
+        </div>
       </div>
     </motion.div>
   );
@@ -65,23 +182,54 @@ function AuthTab() {
   return (
     <motion.div className="panel" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}>
       <div className="pb">
-        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12, marginBottom:16 }}>
-          <div className="fg2"><label className="flbl2">JWT Secret (HS256)</label><input className="fin2" defaultValue="••••••••••••••••••••••••••••••••" type="password" /></div>
-          <div className="fg2"><label className="flbl2">Access Token TTL</label><select className="fin2 fsel2"><option>15 minutes</option><option>1 hour</option></select></div>
-          <div className="fg2"><label className="flbl2">Refresh Token TTL</label><select className="fin2 fsel2"><option>1 day</option><option>7 days</option></select></div>
-          <div className="fg2"><label className="flbl2">JWT Issuer</label><input className="fin2" defaultValue="sentinel-waf.corp.io" /></div>
+        <div style={{ fontSize: "var(--fs-h3)", fontWeight: 600, color: "var(--text)", margin: "4px 0 6px" }}>
+          Single sign-on
         </div>
-        {([
-          ["Microsoft Entra ID (Azure AD)","Tenant: corp.onmicrosoft.com · Client ID configured","ACTIVE"],
-          ["Google Workspace OIDC","Not configured","Set Up"],
-          ["Okta Enterprise SSO","Not configured","Set Up"],
-          ["SAML 2.0","SP Entity ID: https://sentinel-waf.corp.io/saml/metadata","Configure"],
-        ] as [string,string,string][]).map(([t,d,btn]) => (
-          <div key={t} className="srow">
-            <div style={{flex:1}}><div className="srt">{t}</div><div className="srd">{d}</div></div>
-            <motion.button className="btn bg-btn btn-xs" onClick={() => showToast(`${btn} clicked`,"i","🔧")} whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.96 }}>{btn}</motion.button>
-          </div>
-        ))}
+        <Note>
+          Sentinel implements <strong>one generic OpenID Connect provider</strong>,
+          which is what integrates Microsoft Entra ID, Google Workspace, Okta and
+          any other OIDC-compliant IdP. There is no separate connector per vendor,
+          and <strong>SAML 2.0 is not implemented</strong> — this tab used to list
+          four providers and publish a SAML metadata URL that did not exist.
+        </Note>
+
+        <KV label="Mechanism" value="OpenID Connect (Authorization Code)" />
+        <KV label="Login endpoint" value="/api/v1/auth/oidc/login" />
+        <KV label="Callback endpoint" value="/api/v1/auth/oidc/callback" />
+        <KV label="Configured by" value="environment variables on the control plane" />
+
+        <div style={{ fontSize: "var(--fs-h3)", fontWeight: 600, color: "var(--text)", margin: "18px 0 6px" }}>
+          Required environment
+        </div>
+        <div style={{
+          padding: "12px 14px", background: "var(--term-bg)", borderRadius: "var(--r2)",
+          border: "1px solid var(--border2)", fontFamily: "var(--font-mono)",
+          fontSize: "var(--fs-code)", lineHeight: 1.8, color: "var(--term-fg)",
+        }}>
+          <div><span style={{ color: "var(--term-blue)" }}>SENTINEL_OIDC_ISSUER</span>          <span style={{ color: "var(--term-dim)" }}># required, must be https://</span></div>
+          <div><span style={{ color: "var(--term-blue)" }}>SENTINEL_OIDC_CLIENT_SECRET</span>   <span style={{ color: "var(--term-dim)" }}># required</span></div>
+          <div><span style={{ color: "var(--term-blue)" }}>SENTINEL_OIDC_CLIENT_ID</span>       <span style={{ color: "var(--term-dim)" }}># default: sentinel</span></div>
+          <div><span style={{ color: "var(--term-blue)" }}>SENTINEL_OIDC_REDIRECT_URL</span>    <span style={{ color: "var(--term-dim)" }}># must match the IdP</span></div>
+          <div><span style={{ color: "var(--term-blue)" }}>SENTINEL_OIDC_ALLOWED_DOMAINS</span> <span style={{ color: "var(--term-dim)" }}># optional, comma-separated</span></div>
+        </div>
+        <Note tone="warn">
+          SSO <strong>fails closed</strong>: if the issuer is unset, the secret is
+          unset, or the issuer is not HTTPS, OIDC login is disabled entirely rather
+          than falling back to something weaker. Password login with the local user
+          store continues to work either way.
+        </Note>
+
+        <div style={{ fontSize: "var(--fs-h3)", fontWeight: 600, color: "var(--text)", margin: "18px 0 6px" }}>
+          Session tokens
+        </div>
+        <Note>
+          Token lifetimes and the signing secret are control-plane deployment
+          settings and are deliberately not editable from a web console — an
+          attacker with a session here could otherwise mint long-lived credentials
+          or rotate the signing key. Manage users and their roles in{" "}
+          <strong>Users &amp; RBAC</strong>, and machine credentials in{" "}
+          <strong>API Keys</strong>.
+        </Note>
       </div>
     </motion.div>
   );
@@ -275,42 +423,98 @@ function UsersTab() {
   );
 }
 
+// Cluster status — 100% live from GET /cluster/health (same source as the full
+// Cluster page). Degrades to an honest placeholder when the control plane is
+// unreachable; nothing here is hard-coded.
 function ClusterTab() {
+  const [health, setHealth] = useState<ClusterHealth | null>(null);
+  const [err, setErr] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function f() {
+      try { const r = await api.cluster.health(); if (!cancelled) { setHealth(r); setErr(false); } }
+      catch { if (!cancelled) setErr(true); }
+    }
+    f();
+    const t = setInterval(f, 10_000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, []);
+
+  const cp = health?.control_plane;
+  const dp = health?.data_plane;
+  const cpNodes = cp?.nodes ?? [];
+  const dpNodes = dp?.nodes ?? [];
+
+  const fmtAgo = (s: number) =>
+    s == null || s < 0 ? "—" : s < 60 ? `${Math.floor(s)}s ago` : s < 3600 ? `${Math.floor(s / 60)}m ago` : s < 86400 ? `${Math.floor(s / 3600)}h ago` : `${Math.floor(s / 86400)}d ago`;
+
+  const headBadge = !health
+    ? <span className="bdg bgr">{err ? "● unreachable" : "loading…"}</span>
+    : cp?.enabled
+      ? <span className={`bdg ${cp.write_available ? "bgg" : "br"}`}><span className="bdr" />{cp.healthy}/{cp.total} nodes</span>
+      : <span className="bdg bcy">standalone</span>;
+
   return (
     <motion.div className="panel" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}>
       <div className="ph">
         <div className="ptitle">⚡ Cluster Status</div>
-        <span className="bdg bgg"><span className="bdr" />Raft · 3 nodes</span>
+        {headBadge}
       </div>
       <div className="pb">
-        <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:10, marginBottom:16 }}>
-          {([
-            {role:"LEADER",  name:"cp-primary-01", ip:"10.0.0.10:8080", uptime:"14d 6h", term:4, idx:"18,422", cpu:"12%", mem:"284MB", leader:true},
-            {role:"FOLLOWER",name:"cp-replica-02", ip:"10.0.0.11:8080", uptime:"14d 6h", term:4, idx:"18,422", cpu:"8%",  mem:"241MB", leader:false},
-            {role:"FOLLOWER",name:"cp-replica-03", ip:"10.0.0.12:8080", uptime:"14d 6h", term:4, idx:"18,421", cpu:"9%",  mem:"258MB", leader:false},
-          ]).map((n, idx) => (
-            <motion.div key={n.name} className={`nodecard ${n.leader?"leader":""}`} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: idx * 0.08, ...spring }}>
-              <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
-                <div className="sd g" />
-                <span className="ncr" style={n.leader?{background:"rgba(200,0,30,.2)",color:"var(--red-b)",border:"1px solid var(--border)"}:{background:"rgba(0,200,240,.12)",color:"var(--cyan)",border:"1px solid rgba(0,200,240,.3)"}}>{n.role}</span>
-              </div>
-              <div className="ncn">{n.name}</div>
-              <div className="ncs">IP: {n.ip}</div><div className="ncs">Uptime: {n.uptime}</div>
-              <div className="ncs">Term: {n.term} · Log idx: {n.idx}</div>
-              <div className="ncs" style={{color:"var(--green)",marginTop:5}}>CPU: {n.cpu} · Mem: {n.mem}</div>
-            </motion.div>
-          ))}
-        </div>
-        {([
-          ["Quorum","2/3 required · 3/3 online","bgg","✓ HEALTHY"],
-          ["Config Sync","Last push: 34 s ago · 5 data-plane nodes","bgg","✓ IN SYNC"],
-          ["Data-Plane Nodes","dp-us-east-01, dp-us-west-01, dp-eu-01, dp-ap-01, dp-local-01","bcy","5 nodes"],
-        ] as [string,string,string,string][]).map(([t,d,cls,val]) => (
-          <div key={t} className="srow">
-            <div style={{flex:1}}><div className="srt">{t}</div><div className="srd">{d}</div></div>
-            <span className={`bdg ${cls}`}>{val}</span>
+        {!health ? (
+          <div style={{ padding: "26px 12px", textAlign: "center", color: "var(--text3)", fontFamily: "var(--font-mono)", fontSize: 14 }}>
+            {err ? "Control plane unreachable — no live cluster data to show." : "Loading live cluster health…"}
           </div>
-        ))}
+        ) : (
+          <>
+            {cp?.enabled ? (
+              <div style={{ display: "grid", gridTemplateColumns: `repeat(${Math.min(Math.max(cpNodes.length, 1), 3)},1fr)`, gap: 10, marginBottom: 16 }}>
+                {cpNodes.length === 0 ? (
+                  <div className="srd">No control-plane nodes reporting.</div>
+                ) : cpNodes.map((n, idx) => (
+                  <motion.div key={n.node_id} className={`nodecard ${n.is_leader ? "leader" : ""}`} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: idx * 0.08, ...spring }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+                      <div className={`sd ${n.reachable ? "g" : "r"}`} />
+                      <span className="ncr" style={n.is_leader ? { background: "rgba(200,0,30,.2)", color: "var(--red-b)", border: "1px solid var(--border)" } : { background: "rgba(0,200,240,.12)", color: "var(--cyan)", border: "1px solid rgba(0,200,240,.3)" }}>{n.is_leader ? "LEADER" : n.role.toUpperCase()}</span>
+                      {n.is_self && <span className="bdg bgr" style={{ marginLeft: "auto" }}>this node</span>}
+                    </div>
+                    <div className="ncn">node {n.node_id}</div>
+                    <div className="ncs">Addr: {n.addr || "—"}</div>
+                    <div className="ncs">{n.reachable ? fmtAgo(n.last_seen_sec) : "unreachable"}</div>
+                  </motion.div>
+                ))}
+              </div>
+            ) : (
+              <div style={{ padding: "18px 12px", textAlign: "center", marginBottom: 14 }}>
+                <div style={{ fontSize: 26, marginBottom: 6 }}>🧩</div>
+                <div style={{ fontSize: 15, fontWeight: 700, color: "var(--text2)", marginBottom: 4 }}>Standalone — HA not enabled</div>
+                <div className="srd">Running a single control-plane node. Add replicas for spare capacity — write leadership fails over via a Postgres advisory lock, with no quorum to maintain.</div>
+              </div>
+            )}
+
+            {([
+              // No quorum row: leadership is a Postgres advisory lock, so writes
+              // survive on a single node and a control-plane majority is not
+              // required. Reporting "quorum" would describe a constraint that no
+              // longer exists.
+              cp?.enabled
+                ? ["Write leader", `${cp.leader_id ?? "none elected"} · ${cp.healthy}/${cp.total} nodes online`, cp.write_available ? "bgg" : "br", cp.write_available ? "✓ AVAILABLE" : "⚠ NO LEADER"]
+                : ["Write leader", "Standalone — this node accepts all writes", "bcy", "N/A"],
+              ["Protection", health.protection_active ? "Traffic is being inspected and enforced" : "Protection is not fully active", health.protection_active ? "bgg" : "br", health.protection_active ? "✓ ACTIVE" : "⚠ AT RISK"],
+              ["Data-Plane Nodes", dpNodes.length ? dpNodes.map(n => n.id).join(", ") : "No data-plane nodes reporting", dp && dp.total > 0 && dp.healthy === dp.total ? "bgg" : dp && dp.healthy > 0 ? "ba" : "br", `${dp?.total ?? 0} node${(dp?.total ?? 0) === 1 ? "" : "s"}`],
+            ] as [string, string, string, string][]).map(([t, d, cls, val]) => (
+              <div key={t} className="srow">
+                <div style={{ flex: 1, minWidth: 0 }}><div className="srt">{t}</div><div className="srd" style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{d}</div></div>
+                <span className={`bdg ${cls}`}>{val}</span>
+              </div>
+            ))}
+
+            <div style={{ marginTop: 12, fontSize: 12.5, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>
+              Live from <code>GET /cluster/health</code> · refreshes every 10s · full fleet view under <b>Cluster</b>.
+            </div>
+          </>
+        )}
       </div>
     </motion.div>
   );
@@ -397,7 +601,7 @@ function NotificationsTab() {
         </motion.button>
       </div>
       <div className="pb">
-        <div style={{ fontSize: 13, color: "var(--text3)", lineHeight: 1.7, marginBottom: 12, fontFamily: "'Share Tech Mono',monospace" }}>
+        <div style={{ fontSize: 13, color: "var(--text3)", lineHeight: 1.7, marginBottom: 12, fontFamily: "var(--font-mono)" }}>
           Alerts (attack spikes, repeat offenders, critical blocks) are delivered to every enabled channel whose minimum severity the alert meets. Webhook payloads are optionally HMAC-SHA256 signed (<code>X-Sentinel-Signature</code>).
         </div>
 
@@ -437,9 +641,9 @@ function NotificationsTab() {
         )}
 
         {loading ? (
-          <div style={{ padding: 24, textAlign: "center", fontSize: 13, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>Loading channels…</div>
+          <div style={{ padding: 24, textAlign: "center", fontSize: 13, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>Loading channels…</div>
         ) : channels.length === 0 ? (
-          <div style={{ padding: 24, textAlign: "center", fontSize: 13, color: "var(--text3)", fontFamily: "'Share Tech Mono',monospace" }}>No channels configured. Add one to start delivering alerts to your SOC.</div>
+          <div style={{ padding: 24, textAlign: "center", fontSize: 13, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>No channels configured. Add one to start delivering alerts to your SOC.</div>
         ) : channels.map(ch => (
           <div key={ch.id} className="srow">
             <div style={{ flex: 1, minWidth: 0 }}>

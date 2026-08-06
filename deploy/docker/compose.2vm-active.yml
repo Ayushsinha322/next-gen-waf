@@ -1,0 +1,88 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# 2-VM ACTIVE-PASSIVE — overlay for the ACTIVE VM.
+#
+#   docker compose -f compose.prod.yml -f compose.2vm-active.yml up -d
+#
+# Read deploy/docker/2VM-ACTIVE-PASSIVE.md first. Summary of the split:
+#
+#   ACTIVE  VM  → Postgres PRIMARY, ClickHouse, control plane, data plane, dashboard
+#   PASSIVE VM  → Postgres STANDBY (streaming), control plane, data plane, dashboard
+#
+# What is genuinely active-ACTIVE here: the data plane. It is stateless and keeps
+# enforcing its last-synced config, so both VMs serve traffic and a VIP or DNS can
+# point at either.
+#
+# What is automatic: control-plane write leadership. Both VMs run a control plane and
+# both contend for the same Postgres advisory lock, so exactly one accepts writes and
+# the other forwards to it — with no extra machinery and no manual step. This is a
+# direct consequence of retiring Raft: under the old design, a 2-node control plane
+# could not form a quorum and writes were refused outright.
+#
+# What is NOT automatic: Postgres promotion. A majority of 2 is 2, so nothing can
+# safely arbitrate promotion without risking split-brain. That decision is a human or
+# a script — see promote-standby.sh — which is exactly why this topology is called
+# active-PASSIVE rather than HA.
+# ═════════════════════════════════════════════════════════════════════════════
+
+services:
+  postgres:
+    # Primary. Serves the application AND the standby's WAL stream.
+    environment:
+      # Consumed by pg-init-replication.sh on first boot only.
+      SENTINEL_REPL_USER: ${SENTINEL_REPL_USER:?set SENTINEL_REPL_USER in .env}
+      SENTINEL_REPL_PASSWORD: ${SENTINEL_REPL_PASSWORD:?set SENTINEL_REPL_PASSWORD in .env (openssl rand -hex 24)}
+      # Tighten to the passive VM's address. This grants replication, which streams
+      # the entire database — do not widen it to a whole subnet without cause.
+      SENTINEL_STANDBY_CIDR: ${SENTINEL_STANDBY_CIDR:?set SENTINEL_STANDBY_CIDR in .env (e.g. 172.16.21.72/32)}
+    volumes:
+      - ./pg-init-replication.sh:/docker-entrypoint-initdb.d/10-replication.sh:ro
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/etc/sentinel/pg/server.crt
+      - -c
+      - ssl_key_file=/etc/sentinel/pg/server.key
+      # Retain enough WAL that a briefly-disconnected standby can catch up from the
+      # slot rather than needing a full rebuild.
+      - -c
+      - wal_keep_size=1GB
+      # Standbys report their status, which promote-standby.sh checks for replication
+      # lag before promoting.
+      - -c
+      - hot_standby_feedback=on
+    ports:
+      # The standby connects to 5432 from the other VM, so unlike the single-host
+      # posture (where Postgres is never published) this must be reachable. It is
+      # protected by hostssl + scram-sha-256 and a /32 pg_hba grant, NOT by being
+      # unreachable — bind it to the interface the peer uses and firewall the rest.
+      - "${SENTINEL_PG_BIND:-0.0.0.0}:5432:5432"
+
+  clickhouse:
+    volumes:
+      # TLS: drop-in config + the leaf issued by issue-clickhouse-cert.sh. Running
+      # that script is a REQUIRED install step on this node, not hardening — with
+      # the files absent Docker creates the bind-mount sources as empty
+      # DIRECTORIES, ClickHouse fails to load a certificate, and the passive node
+      # silently cannot write history again.
+      - ./clickhouse-tls.xml:/etc/clickhouse-server/config.d/tls.xml:ro
+      - /opt/sentinel-pki/ch-server.crt:/etc/sentinel/pki/ch-server.crt:ro
+      - /opt/sentinel-pki/ch-server.key:/etc/sentinel/pki/ch-server.key:ro
+    ports:
+      # ClickHouse lives ONLY on this VM (two nodes cannot form a Keeper quorum),
+      # so the passive VM's data plane has to reach it here or its event history
+      # has nowhere to land. Before this was published, the passive node wrote
+      # nothing at all: measured 2026-07-29, nine attacks blocked with 403 while
+      # it held the VIP and ClickHouse recorded zero of them.
+      #
+      # HTTPS ONLY across the network. Plaintext 8123 still exists inside the
+      # container for the healthcheck and same-host clients on the compose bridge,
+      # but it is deliberately NOT published — the ClickHouse password and every
+      # event body (client IPs, paths, attack payloads) used to cross the peer link
+      # in the clear on that port.
+      #
+      # Still bound to the peer-facing address rather than 0.0.0.0, and still
+      # firewalled to the peer /32 by the installer. TLS replaces reachability as
+      # the PRIMARY control; it does not make the network controls pointless.
+      - "${SENTINEL_CH_BIND:-127.0.0.1}:8443:8443"

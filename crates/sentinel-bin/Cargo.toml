@@ -8,6 +8,11 @@ license.workspace = true
 name = "sentinel-bin"
 path = "src/main.rs"
 
+[features]
+# Propagates kernel XDP support down to sentinel-ebpf (built with
+# `cargo build --features kernel`). Requires CAP_BPF/CAP_NET_ADMIN at runtime.
+kernel = ["sentinel-proxy/kernel"]
+
 [dependencies]
 tokio = { workspace = true }
 tracing = { workspace = true }

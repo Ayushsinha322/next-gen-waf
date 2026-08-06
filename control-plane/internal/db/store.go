@@ -7,9 +7,12 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"golang.org/x/crypto/argon2"
 )
@@ -39,8 +42,10 @@ type SiteRow struct {
 }
 
 type RuleRow struct {
-	ID        string    `json:"id"`
-	TenantID  string    `json:"tenant_id"`
+	ID       string `json:"id"`
+	TenantID string `json:"tenant_id"`
+	// SiteID is empty for a deployment-wide rule.
+	SiteID    string    `json:"site_id,omitempty"`
 	Name      string    `json:"name"`
 	Source    string    `json:"source"`
 	Phase     int       `json:"phase"`
@@ -77,11 +82,11 @@ type AuditRow struct {
 }
 
 type DashboardStats struct {
-	TotalSites    int `json:"total_sites"`
-	ActiveSites   int `json:"active_sites"`
-	TotalRules    int `json:"total_rules"`
-	EnabledRules  int `json:"enabled_rules"`
-	OpenAlerts    int `json:"open_alerts"`
+	TotalSites     int `json:"total_sites"`
+	ActiveSites    int `json:"active_sites"`
+	TotalRules     int `json:"total_rules"`
+	EnabledRules   int `json:"enabled_rules"`
+	OpenAlerts     int `json:"open_alerts"`
 	CriticalAlerts int `json:"critical_alerts"`
 }
 
@@ -114,6 +119,9 @@ func (s *Store) ValidatePassword(ctx context.Context, tenantID, email, password 
 		`SELECT id, tenant_id, role, password_hash FROM sentinel_auth_lookup($1)`,
 		email).Scan(&userID, &userTenantID, &role, &pwdHash)
 	if err != nil {
+		// User not found: still run argon2 against a dummy hash so the response
+		// time matches the found-but-wrong-password path (no enumeration oracle).
+		checkPassword(password, dummyPasswordHash)
 		return false, "", "", "", nil
 	}
 	tx.Commit(ctx)
@@ -158,6 +166,35 @@ func (s *Store) ListAllActiveSites(ctx context.Context) ([]SiteRow, error) {
 	return sites, rows.Err()
 }
 
+// ConfigVersion returns the shared, monotonic config-generation counter. It is
+// bumped by a statement-level trigger on every sites/rules mutation (migration
+// 0012) and read via the SECURITY DEFINER sentinel_config_version() carve-out,
+// so ANY control-plane node returns the same restart-surviving, change-reflecting
+// value regardless of Raft role — this is the data plane's /internal/config
+// freshness signal (fixes R4/R8: the old per-process, leader-only counter).
+func (s *Store) ConfigVersion(ctx context.Context) (int64, error) {
+	pg, ok := s.pool.(*pgxPool)
+	if !ok {
+		return 0, fmt.Errorf("store: pool is not a *pgxPool")
+	}
+	var v int64
+	if err := pg.pool.QueryRow(ctx, `SELECT sentinel_config_version()`).Scan(&v); err != nil {
+		return 0, fmt.Errorf("store: config version: %w", err)
+	}
+	return v, nil
+}
+
+// Ping checks that the database is actually reachable (used by /readyz so a
+// DB-unreachable control-plane node reports NotReady and is pulled from the
+// load-balancer/Service, instead of a static 200 that keeps routing to it).
+func (s *Store) Ping(ctx context.Context) error {
+	pg, ok := s.pool.(*pgxPool)
+	if !ok {
+		return fmt.Errorf("store: pool is not a *pgxPool")
+	}
+	return pg.pool.Ping(ctx)
+}
+
 // checkPassword verifies plaintext against "argon2id$<hexSalt>$<hexHash>".
 func checkPassword(plain, stored string) bool {
 	parts := strings.SplitN(stored, "$", 3)
@@ -172,9 +209,25 @@ func checkPassword(plain, stored string) bool {
 	if err != nil {
 		return false
 	}
+	// Reject a malformed/corrupted row with an empty salt or hash segment: a
+	// zero-length hash would make argon2 produce a zero-length digest and the
+	// constant-time compare of two empty slices would succeed for ANY password.
+	if len(salt) == 0 || len(expected) == 0 {
+		return false
+	}
 	hash := argon2.IDKey([]byte(plain), salt, 1, 64*1024, 4, uint32(len(expected)))
 	return subtle.ConstantTimeCompare(hash, expected) == 1
 }
+
+// dummyPasswordHash is a valid-format argon2id hash computed once at startup. It
+// is verified against on the user-not-found login path so the response time of a
+// failed login is the same whether or not the email exists — closing the timing
+// side channel that would otherwise enumerate valid accounts.
+var dummyPasswordHash = func() string {
+	salt := []byte("sentinel-dummy16")
+	h := argon2.IDKey([]byte("not-a-real-password"), salt, 1, 64*1024, 4, 32)
+	return "argon2id$" + hex.EncodeToString(salt) + "$" + hex.EncodeToString(h)
+}()
 
 // ---------------------------------------------------------------------------
 // DashboardStats
@@ -189,11 +242,13 @@ func (s *Store) GetDashboardStats(ctx context.Context, tenantID, userID string) 
 
 	var stats DashboardStats
 
+	// Explicit tenant_id predicates (defense-in-depth): dashboard counts must
+	// not leak other tenants' totals if RLS is inactive for the connecting role.
 	err = tx.QueryRow(ctx,
 		`SELECT
 			COUNT(*) FILTER (WHERE TRUE),
 			COUNT(*) FILTER (WHERE status = 'active')
-		 FROM sites`).Scan(&stats.TotalSites, &stats.ActiveSites)
+		 FROM sites WHERE tenant_id = $1`, tenantID).Scan(&stats.TotalSites, &stats.ActiveSites)
 	if err != nil {
 		return nil, fmt.Errorf("store: sites count: %w", err)
 	}
@@ -202,7 +257,7 @@ func (s *Store) GetDashboardStats(ctx context.Context, tenantID, userID string) 
 		`SELECT
 			COUNT(*) FILTER (WHERE TRUE),
 			COUNT(*) FILTER (WHERE enabled = true)
-		 FROM rules`).Scan(&stats.TotalRules, &stats.EnabledRules)
+		 FROM rules WHERE tenant_id = $1`, tenantID).Scan(&stats.TotalRules, &stats.EnabledRules)
 	if err != nil {
 		return nil, fmt.Errorf("store: rules count: %w", err)
 	}
@@ -211,12 +266,28 @@ func (s *Store) GetDashboardStats(ctx context.Context, tenantID, userID string) 
 		`SELECT
 			COUNT(*) FILTER (WHERE state = 'open'),
 			COUNT(*) FILTER (WHERE state = 'open' AND severity = 'critical')
-		 FROM alerts`).Scan(&stats.OpenAlerts, &stats.CriticalAlerts)
+		 FROM alerts WHERE tenant_id = $1`, tenantID).Scan(&stats.OpenAlerts, &stats.CriticalAlerts)
 	if err != nil {
 		return nil, fmt.Errorf("store: alerts count: %w", err)
 	}
 
 	return &stats, tx.Commit(ctx)
+}
+
+// ConnRoleIsPrivileged reports whether the role the control plane connects as is
+// a Postgres SUPERUSER or has BYPASSRLS — either of which makes FORCE ROW LEVEL
+// SECURITY (the backstop for tenant isolation) a silent no-op. Used for a
+// boot-time safety assertion so we never run multi-tenant on a role that
+// bypasses RLS. Returns the role name for diagnostics.
+func (s *Store) ConnRoleIsPrivileged(ctx context.Context) (privileged bool, role string, err error) {
+	pg, ok := s.pool.(*pgxPool)
+	if !ok {
+		return false, "", fmt.Errorf("store: pool is not a *pgxPool")
+	}
+	err = pg.pool.QueryRow(ctx,
+		`SELECT current_user, rolsuper OR rolbypassrls
+		   FROM pg_roles WHERE rolname = current_user`).Scan(&role, &privileged)
+	return privileged, role, err
 }
 
 // ---------------------------------------------------------------------------
@@ -385,7 +456,8 @@ func (s *Store) ListRules(ctx context.Context, tenantID, userID string) ([]RuleR
 
 	// Explicit tenant predicate (defense-in-depth): see ListSites / migration 0003.
 	rows, err := tx.Query(ctx,
-		`SELECT id, tenant_id, name, source, phase, severity, dsl, enabled, tags, created_at, updated_at
+		`SELECT id, tenant_id, name, source, phase, severity, dsl, enabled, tags,
+		        created_at, updated_at, site_id
 		 FROM rules WHERE tenant_id = $1 ORDER BY created_at DESC`, tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("store: list rules: %w", err)
@@ -395,9 +467,14 @@ func (s *Store) ListRules(ctx context.Context, tenantID, userID string) ([]RuleR
 	var rules []RuleRow
 	for rows.Next() {
 		var r RuleRow
+		var siteID *string
 		if err := rows.Scan(&r.ID, &r.TenantID, &r.Name, &r.Source, &r.Phase,
-			&r.Severity, &r.DSL, &r.Enabled, &r.Tags, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			&r.Severity, &r.DSL, &r.Enabled, &r.Tags, &r.CreatedAt, &r.UpdatedAt,
+			&siteID); err != nil {
 			return nil, err
+		}
+		if siteID != nil {
+			r.SiteID = *siteID
 		}
 		rules = append(rules, r)
 	}
@@ -540,22 +617,38 @@ type WriteAuditRequest struct {
 	Diff        json.RawMessage // optional before/after JSON
 }
 
-// WriteAuditLog inserts a signed audit entry.  hmacKey is used to compute the
-// tamper-evident HMAC stored alongside the record; use a stable secret loaded
-// from the environment.
+// auditChainNamespace keys the advisory lock that serializes chain appends. Any
+// stable constant works; it only has to not collide with other advisory-lock
+// users in this database.
+const auditChainNamespace = 0x5748414D // "WHAM"
+
+// genesisPrevHMAC is the prev_hmac of the first row in a tenant's chain. A fixed
+// 32-byte zero block rather than NULL, so that NULL unambiguously means "row
+// predates the chain migration" — otherwise a legacy row and a genesis row would
+// be indistinguishable and an attacker could delete an entire chain and pass the
+// remainder off as pre-migration data.
+var genesisPrevHMAC = make([]byte, 32)
+
+// WriteAuditLog appends a signed audit entry to the tenant's hash chain.
+//
+// hmacKey is used to compute the tamper-evident HMAC stored alongside the record;
+// use a stable secret loaded from the environment.
+//
+// Each row commits to its predecessor: the HMAC covers (seq, prev_hmac, ...fields),
+// where prev_hmac is the preceding row's HMAC for the same tenant. That is what
+// makes DELETION detectable — dropping a row leaves its successor pointing at an
+// HMAC no surviving row has. A per-row HMAC alone (the previous design) verified
+// happily after any number of deletions.
+//
+// Appends for one tenant are serialized by a transaction-scoped advisory lock, so
+// two concurrent writers cannot read the same predecessor and fork the chain.
 func (s *Store) WriteAuditLog(ctx context.Context, req WriteAuditRequest, hmacKey []byte) error {
-	// Compute HMAC over the immutable fields.
-	mac := hmac.New(sha256.New, hmacKey)
-	fmt.Fprintf(mac, "%s|%v|%s|%s|%v|%v|%d",
-		req.TenantID,
-		strPtr(req.ActorUserID),
-		req.Action,
-		req.TargetKind,
-		strPtr(req.TargetID),
-		strPtr(req.IP),
-		time.Now().UnixNano(),
-	)
-	sig := mac.Sum(nil)
+	// Sign over a PERSISTED, deterministic timestamp (truncated to Postgres's
+	// microsecond precision so it round-trips exactly) plus every material
+	// field, and store that same created_at — otherwise the HMAC could never be
+	// recomputed and the "tamper-evident" property would be cosmetic. See
+	// VerifyAuditLog, which recomputes and compares.
+	createdAt := time.Now().UTC().Truncate(time.Microsecond)
 
 	// Use a system-level tenant context for the write.  The INSERT policy on
 	// audit_logs has WITH CHECK (true) so any tenant_id is accepted.
@@ -565,10 +658,42 @@ func (s *Store) WriteAuditLog(ctx context.Context, req WriteAuditRequest, hmacKe
 	}
 	defer tx.Rollback(ctx)
 
+	// Serialize appends for this tenant. Released automatically at commit or
+	// rollback, so a crashed writer cannot wedge the chain.
+	if err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock($1, hashtext($2))`,
+		auditChainNamespace, req.TenantID); err != nil {
+		return fmt.Errorf("store: audit chain lock: %w", err)
+	}
+
+	// Link to the tenant's current chain head, falling back to genesis when this
+	// is the tenant's first entry. COALESCE keeps this a single row every time, so
+	// there is no empty-result case to distinguish from a real query failure.
+	var prevHMAC []byte
+	if err := tx.QueryRow(ctx,
+		`SELECT COALESCE(
+		           (SELECT hmac FROM audit_logs WHERE tenant_id = $1 ORDER BY seq DESC LIMIT 1),
+		           $2::bytea)`,
+		req.TenantID, genesisPrevHMAC).Scan(&prevHMAC); err != nil {
+		return fmt.Errorf("store: audit chain head: %w", err)
+	}
+
+	// Claim the sequence value up front: seq is part of the signed payload, so it
+	// must be known before the row is written.
+	var seq int64
+	if err := tx.QueryRow(ctx,
+		`SELECT nextval(pg_get_serial_sequence('audit_logs', 'seq'))`).Scan(&seq); err != nil {
+		return fmt.Errorf("store: audit seq: %w", err)
+	}
+
+	sig := auditChainMAC(hmacKey, seq, prevHMAC, req.TenantID, req.ActorUserID, req.Action,
+		req.TargetKind, req.TargetID, req.IP, req.UserAgent, req.Diff, createdAt)
+
 	err = tx.Exec(ctx,
 		`INSERT INTO audit_logs
-			(tenant_id, actor_user_id, action, target_kind, target_id, ip, user_agent, diff, hmac)
-		 VALUES ($1, $2, $3, $4, $5, $6::inet, $7, $8, $9)`,
+			(tenant_id, actor_user_id, action, target_kind, target_id, ip, user_agent, diff,
+			 created_at, hmac, seq, prev_hmac)
+		 VALUES ($1, $2, $3, $4, $5, $6::inet, $7, $8, $9, $10, $11, $12)`,
 		req.TenantID,
 		req.ActorUserID,
 		req.Action,
@@ -577,12 +702,190 @@ func (s *Store) WriteAuditLog(ctx context.Context, req WriteAuditRequest, hmacKe
 		req.IP,
 		req.UserAgent,
 		nullableJSON(req.Diff),
+		createdAt,
 		sig,
+		seq,
+		prevHMAC,
 	)
 	if err != nil {
 		return fmt.Errorf("store: audit insert: %w", err)
 	}
 	return tx.Commit(ctx)
+}
+
+// auditChainMAC computes the tamper-evidence HMAC for a chained audit row.
+//
+// It covers the row's own fields PLUS its position (seq) and its predecessor
+// (prevHMAC). Including both is what extends tamper-evidence from "this row was
+// not edited" to "this row has not been moved, and nothing before it was
+// removed": any deletion or reordering leaves some successor's prev_hmac
+// referring to an HMAC that no surviving row has.
+//
+// The field encoding delegates to auditMAC's payload so the two stay in lockstep.
+func auditChainMAC(key []byte, seq int64, prevHMAC []byte, tenantID string, actor *string,
+	action, targetKind string, targetID, ip, userAgent *string, diff json.RawMessage,
+	createdAt time.Time) []byte {
+	mac := hmac.New(sha256.New, key)
+	// Length-prefix the variable-length chain fields so that no combination of
+	// field values can be rearranged to produce the same byte stream.
+	fmt.Fprintf(mac, "v2|%d|%d|", seq, len(prevHMAC))
+	mac.Write(prevHMAC)
+	mac.Write([]byte{'|'})
+	mac.Write(auditPayload(tenantID, actor, action, targetKind, targetID, ip, userAgent, diff, createdAt))
+	return mac.Sum(nil)
+}
+
+// auditPayload is the canonical byte encoding of an audit row's material fields,
+// shared by the legacy and chained MAC functions.
+func auditPayload(tenantID string, actor *string, action, targetKind string,
+	targetID, ip, userAgent *string, diff json.RawMessage, createdAt time.Time) []byte {
+	return []byte(fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%s|%s",
+		tenantID,
+		strPtr(actor),
+		action,
+		targetKind,
+		strPtr(targetID),
+		strPtr(ip),
+		strPtr(userAgent),
+		string(diff),
+		createdAt.UTC().Format(time.RFC3339Nano),
+	))
+}
+
+// auditMAC computes the LEGACY (pre-chain) per-row HMAC.
+//
+// Retained solely to verify rows written before migration 0013, which have a NULL
+// prev_hmac. It detects modification of a row but nothing about the log as a
+// whole — see auditChainMAC. Do not use it for new writes.
+//
+// The timestamp is formatted at microsecond precision to match what Postgres
+// stores.
+func auditMAC(key []byte, tenantID string, actor *string, action, targetKind string,
+	targetID, ip, userAgent *string, diff json.RawMessage, createdAt time.Time) []byte {
+	mac := hmac.New(sha256.New, key)
+	mac.Write(auditPayload(tenantID, actor, action, targetKind, targetID, ip, userAgent, diff, createdAt))
+	return mac.Sum(nil)
+}
+
+// AuditVerifyReport is the outcome of a tamper-evidence check over audit_logs.
+type AuditVerifyReport struct {
+	// Checked is how many rows were examined.
+	Checked int
+	// Altered lists row IDs whose stored HMAC does not match a recomputation —
+	// the row was edited, or signed with a different key.
+	Altered []string
+	// ChainBroken lists row IDs whose prev_hmac does not match the HMAC of the
+	// preceding row for that tenant. This is the signal that rows were DELETED or
+	// REORDERED, which per-row HMACs cannot see.
+	ChainBroken []string
+	// SeqGaps describes missing sequence numbers per tenant, e.g. "tenant X:
+	// seq 41 -> 45". Corroborates ChainBroken and localizes the removal.
+	SeqGaps []string
+	// Unchained counts rows written before migration 0013 (NULL prev_hmac). They
+	// are verified with the legacy per-row MAC, so deletions among them remain
+	// undetectable — reported so that is never mistaken for a clean result.
+	Unchained int
+}
+
+// OK reports whether the log is intact.
+func (r AuditVerifyReport) OK() bool {
+	return len(r.Altered) == 0 && len(r.ChainBroken) == 0 && len(r.SeqGaps) == 0
+}
+
+// VerifyAuditLog verifies the integrity of the audit log, optionally scoped to a
+// tenant ("" = all tenants). limit <= 0 checks all rows.
+//
+// Two independent properties are checked:
+//
+//  1. Per-row integrity — recompute each row's HMAC and compare. Catches edits.
+//  2. Chain continuity — each row's prev_hmac must equal its predecessor's HMAC
+//     within the same tenant, and seq must not skip. Catches DELETION,
+//     REORDERING, and TRUNCATION, none of which the previous per-row-only design
+//     could detect: removing rows left every surviving HMAC verifying perfectly.
+//
+// Rows are walked in ascending (tenant_id, seq) order, which is the order the
+// chain was built in. The old implementation ordered by created_at DESC, which is
+// both attacker-controllable in principle and useless for chain walking.
+func (s *Store) VerifyAuditLog(ctx context.Context, tenantID string, hmacKey []byte, limit int) (AuditVerifyReport, error) {
+	var rep AuditVerifyReport
+
+	pg, ok := s.pool.(*pgxPool)
+	if !ok {
+		return rep, fmt.Errorf("store: pool is not a *pgxPool")
+	}
+	q := `SELECT id, tenant_id, actor_user_id, action, target_kind, target_id,
+	             host(ip), user_agent, diff, created_at, hmac, seq, prev_hmac
+	        FROM audit_logs`
+	args := []any{}
+	if tenantID != "" {
+		q += ` WHERE tenant_id = $1`
+		args = append(args, tenantID)
+	}
+	q += ` ORDER BY tenant_id, seq`
+	if limit > 0 {
+		q += fmt.Sprintf(" LIMIT %d", limit)
+	}
+	rows, err := pg.pool.Query(ctx, q, args...)
+	if err != nil {
+		return rep, fmt.Errorf("store: audit verify query: %w", err)
+	}
+	defer rows.Close()
+
+	// Chain head carried across iterations, reset at each tenant boundary.
+	var curTenant string
+	var prevMAC []byte
+	var prevSeq int64
+
+	for rows.Next() {
+		var id, tid, action, targetKind string
+		var actor, targetID, ip, ua *string
+		var diff json.RawMessage
+		var createdAt time.Time
+		var storedMAC, storedPrev []byte
+		var seq int64
+		if err := rows.Scan(&id, &tid, &actor, &action, &targetKind, &targetID,
+			&ip, &ua, &diff, &createdAt, &storedMAC, &seq, &storedPrev); err != nil {
+			return rep, err
+		}
+		rep.Checked++
+
+		newTenant := tid != curTenant
+		if newTenant {
+			curTenant, prevMAC, prevSeq = tid, nil, 0
+		}
+
+		if storedPrev == nil {
+			// Pre-chain row: only the legacy per-row property is available.
+			rep.Unchained++
+			if !hmac.Equal(auditMAC(hmacKey, tid, actor, action, targetKind, targetID, ip, ua, diff, createdAt), storedMAC) {
+				rep.Altered = append(rep.Altered, id)
+			}
+			prevMAC, prevSeq = storedMAC, seq
+			continue
+		}
+
+		if !hmac.Equal(auditChainMAC(hmacKey, seq, storedPrev, tid, actor, action, targetKind,
+			targetID, ip, ua, diff, createdAt), storedMAC) {
+			rep.Altered = append(rep.Altered, id)
+		}
+
+		// Chain continuity. A genesis row must be the first of its tenant; any
+		// later row must point at its immediate predecessor.
+		switch {
+		case prevMAC == nil:
+			// First row seen for this tenant. Genuine only if it is genesis, or if
+			// we are mid-log because of `limit` (prevMAC unknown, nothing to check).
+		case !hmac.Equal(storedPrev, prevMAC):
+			rep.ChainBroken = append(rep.ChainBroken, id)
+		}
+		if prevSeq != 0 && seq != prevSeq+1 {
+			rep.SeqGaps = append(rep.SeqGaps,
+				fmt.Sprintf("tenant %s: seq %d -> %d", tid, prevSeq, seq))
+		}
+
+		prevMAC, prevSeq = storedMAC, seq
+	}
+	return rep, rows.Err()
 }
 
 func strPtr(s *string) string {
@@ -612,6 +915,9 @@ type CreateRuleRequest struct {
 	DSL      string   `json:"dsl"`
 	Tags     []string `json:"tags"`
 	Enabled  *bool    `json:"enabled"`
+	// SiteID scopes the rule to one site. Omit (or send null) for a
+	// deployment-wide rule, which is what a virtual patch wants.
+	SiteID *string `json:"site_id"`
 }
 
 func (s *Store) CreateRule(ctx context.Context, tenantID, userID string, req CreateRuleRequest) (*RuleRow, error) {
@@ -635,14 +941,25 @@ func (s *Store) CreateRule(ctx context.Context, tenantID, userID string, req Cre
 	}
 	defer tx.Rollback(ctx)
 
+	// An empty string is not a valid uuid and is not the same as "no site", so
+	// normalise it to NULL rather than letting the insert fail on a blank field
+	// from a form.
+	if req.SiteID != nil && strings.TrimSpace(*req.SiteID) == "" {
+		req.SiteID = nil
+	}
+
 	var r RuleRow
+	var siteID *string
 	err = tx.QueryRow(ctx,
-		`INSERT INTO rules (tenant_id, name, source, phase, severity, dsl, enabled, tags)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-		 RETURNING id, tenant_id, name, source, phase, severity, dsl, enabled, tags, created_at, updated_at`,
-		tenantID, req.Name, req.Source, req.Phase, req.Severity, req.DSL, enabled, req.Tags,
+		`INSERT INTO rules (tenant_id, name, source, phase, severity, dsl, enabled, tags, site_id)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+		 RETURNING id, tenant_id, name, source, phase, severity, dsl, enabled, tags, created_at, updated_at, site_id`,
+		tenantID, req.Name, req.Source, req.Phase, req.Severity, req.DSL, enabled, req.Tags, req.SiteID,
 	).Scan(&r.ID, &r.TenantID, &r.Name, &r.Source, &r.Phase, &r.Severity,
-		&r.DSL, &r.Enabled, &r.Tags, &r.CreatedAt, &r.UpdatedAt)
+		&r.DSL, &r.Enabled, &r.Tags, &r.CreatedAt, &r.UpdatedAt, &siteID)
+	if siteID != nil {
+		r.SiteID = *siteID
+	}
 	if err != nil {
 		return nil, fmt.Errorf("store: create rule: %w", err)
 	}
@@ -678,3 +995,143 @@ func (s *Store) DeleteRule(ctx context.Context, tenantID, userID, ruleID string)
 	}
 	return tx.Commit(ctx)
 }
+
+// DeployableRule is one operator-authored rule bound for the data plane.
+type DeployableRule struct {
+	TenantID string
+	// SiteID is empty for a deployment-wide rule (the virtual-patch case) and
+	// set when the operator scoped the rule to a single site.
+	SiteID   string
+	Name     string
+	DSL      string
+	Source   string
+	Phase    int
+	Severity string
+}
+
+// ListDeployableRules returns every enabled, operator-authored rule across all
+// tenants, keyed by tenant id.
+//
+// Node-global on purpose: /internal/config serves every tenant's sites from one
+// data plane, so this mirrors ListAllActiveSites and reads through the
+// sentinel_deployable_rules() carve-out (migration 0017) rather than querying
+// `rules` directly — under FORCE RLS a direct query would return no rows and the
+// custom rules would silently stop being enforced.
+//
+// Rows with source 'crs'/'community' are excluded by the function itself; see the
+// migration for why that filter is load-bearing rather than cosmetic.
+func (s *Store) ListDeployableRules(ctx context.Context) (map[string][]DeployableRule, error) {
+	pg, ok := s.pool.(*pgxPool)
+	if !ok {
+		return nil, fmt.Errorf("store: pool is not a *pgxPool")
+	}
+	rows, err := pg.pool.Query(ctx,
+		`SELECT tenant_id, site_id, name, dsl, source, phase, severity
+		 FROM sentinel_deployable_rules()`)
+	if err != nil {
+		return nil, fmt.Errorf("store: list deployable rules: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[string][]DeployableRule)
+	for rows.Next() {
+		var r DeployableRule
+		var siteID *string
+		if err := rows.Scan(&r.TenantID, &siteID, &r.Name, &r.DSL,
+			&r.Source, &r.Phase, &r.Severity); err != nil {
+			return nil, err
+		}
+		if siteID != nil {
+			r.SiteID = *siteID
+		}
+		out[r.TenantID] = append(out[r.TenantID], r)
+	}
+	return out, rows.Err()
+}
+
+// UpdateRuleRequest is a PARTIAL update: a nil field is left alone. Pointers
+// rather than values so "set severity to its zero value" stays distinguishable
+// from "do not touch severity".
+type UpdateRuleRequest struct {
+	DSL      *string   `json:"dsl"`
+	Severity *string   `json:"severity"`
+	Phase    *int      `json:"phase"`
+	Tags     *[]string `json:"tags"`
+	Enabled  *bool     `json:"enabled"`
+	// SiteID rescopes the rule. Send null to make it deployment-wide again; the
+	// distinction between "null" and "absent" is why ClearSiteID exists — JSON
+	// null and a missing key both decode to a nil pointer.
+	SiteID      *string `json:"site_id"`
+	ClearSiteID bool    `json:"clear_site_id"`
+}
+
+// UpdateRule applies a partial update and returns the stored row.
+//
+// Until now the only mutation was ToggleRule, so an operator who typo'd a rule
+// had to delete and recreate it — losing its id, and with it any audit trail
+// pointing at that id.
+//
+// Rows with source 'crs'/'community' are not updatable, matching DeleteRule:
+// they are shipped/demo fixtures, they are excluded from delivery anyway
+// (migration 0017), and letting them be edited would imply they take effect.
+func (s *Store) UpdateRule(ctx context.Context, tenantID, userID, ruleID string,
+	req UpdateRuleRequest) (*RuleRow, error) {
+
+	tx, err := s.pool.BeginTenant(ctx, tenantID, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	// COALESCE keeps every untouched column at its current value, so this is one
+	// statement regardless of how many fields the caller sent.
+	var siteArg any
+	switch {
+	case req.ClearSiteID:
+		siteArg = nil
+	case req.SiteID != nil && strings.TrimSpace(*req.SiteID) != "":
+		siteArg = *req.SiteID
+	default:
+		siteArg = nil
+	}
+
+	var r RuleRow
+	var siteID *string
+	// Every parameter is explicitly cast. Without the casts Postgres cannot infer
+	// a type for a nil pointer inside COALESCE and fails the whole statement with
+	// SQLSTATE 42P18 — and userID must NOT be passed at all, since a parameter the
+	// query never references is exactly what triggered that error here first.
+	err = tx.QueryRow(ctx,
+		`UPDATE rules SET
+		    dsl      = COALESCE($3::text,   dsl),
+		    severity = COALESCE($4::text,   severity),
+		    phase    = COALESCE($5::int,    phase),
+		    tags     = COALESCE($6::text[], tags),
+		    enabled  = COALESCE($7::boolean, enabled),
+		    site_id  = CASE WHEN $8::boolean THEN NULL
+		                    WHEN $9::uuid IS NOT NULL THEN $9::uuid
+		                    ELSE site_id END,
+		    updated_at = NOW()
+		 WHERE id = $1 AND tenant_id = $2 AND source NOT IN ('crs','community')
+		 RETURNING id, tenant_id, name, source, phase, severity, dsl, enabled, tags,
+		           created_at, updated_at, site_id`,
+		ruleID, tenantID, req.DSL, req.Severity, req.Phase, req.Tags,
+		req.Enabled, req.ClearSiteID, siteArg,
+	).Scan(&r.ID, &r.TenantID, &r.Name, &r.Source, &r.Phase, &r.Severity,
+		&r.DSL, &r.Enabled, &r.Tags, &r.CreatedAt, &r.UpdatedAt, &siteID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrRuleNotUpdatable
+		}
+		return nil, fmt.Errorf("store: update rule: %w", err)
+	}
+	if siteID != nil {
+		r.SiteID = *siteID
+	}
+	return &r, tx.Commit(ctx)
+}
+
+// ErrRuleNotUpdatable covers both "no such rule in this tenant" and "this rule's
+// source makes it read-only". They are deliberately one error: distinguishing
+// them would tell a caller whether a rule id exists in another tenant.
+var ErrRuleNotUpdatable = errors.New("rule not found or not updatable")

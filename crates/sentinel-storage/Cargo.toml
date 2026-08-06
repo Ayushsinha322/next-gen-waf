@@ -26,5 +26,21 @@ hyper-util = { workspace = true }
 http-body-util = { workspace = true }
 bytes = { workspace = true }
 
+# TLS for the ClickHouse connection. Same feature set as sentinel-proxy /
+# sentinel-ml / sentinel-plugins already use, deliberately: `ring` must match the
+# process-default rustls CryptoProvider installed in sentinel-bin, or building a
+# ClientConfig panics at runtime. default-features = false keeps aws-lc-rs and
+# the ring/aws-lc double-backend problem out of the tree.
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "tls12", "webpki-roots"] }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rustls-pki-types = "1"
+# Declared directly (it is already in the tree via hyper-rustls) so the public-root
+# path can be built with the SAME explicit ring provider as the private-CA path.
+# hyper-rustls's own `with_webpki_roots()` calls `ClientConfig::builder()`, which
+# panics when no process-default CryptoProvider has been installed — true in unit
+# tests and any binary that is not sentinel-bin.
+webpki-roots = "1"
+
 [dev-dependencies]
 tokio-test = { workspace = true }

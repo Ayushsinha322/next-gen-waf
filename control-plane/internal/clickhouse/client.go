@@ -5,15 +5,61 @@ package clickhouse
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	neturl "net/url"
 	"os"
 	"strings"
 	"time"
 )
+
+// httpClientForCA returns an HTTP client that trusts the private CA named by
+// SENTINEL_CLICKHOUSE_CA_FILE, mirroring the Rust writer in
+// crates/sentinel-storage/src/clickhouse.rs.
+//
+// Needed because in the 2-VM topology ClickHouse lives only on the active node,
+// so the passive node's control plane READS across the peer link. Go's default
+// transport speaks HTTPS but trusts only the system roots, and the deployment's
+// ClickHouse cert is issued by its own internal CA — so without this, switching
+// the URL to https:// turns every Threat Search query into a verification error.
+//
+// Deliberately does NOT use SSL_CERT_FILE to inject the CA globally: that
+// REPLACES the system pool for the whole process, which would break outbound
+// HTTPS to public endpoints (threat-intel feeds) as a side effect of securing
+// one internal hop. Scope the trust to this client instead.
+//
+// A configured-but-unusable CA file is fatal to TLS rather than a silent
+// downgrade to the system pool — same rule as the Rust side. Widening trust
+// because a path was wrong is the wrong failure for a WAF.
+func httpClientForCA() *http.Client {
+	c := &http.Client{Timeout: 10 * time.Second}
+	path := strings.TrimSpace(os.Getenv("SENTINEL_CLICKHOUSE_CA_FILE"))
+	if path == "" {
+		return c
+	}
+	pem, err := os.ReadFile(path)
+	if err != nil {
+		log.Printf("[sentinel] clickhouse TLS: cannot read SENTINEL_CLICKHOUSE_CA_FILE %q: %v "+
+			"— refusing to fall back to system roots; https queries will FAIL", path, err)
+		pem = nil
+	}
+	pool := x509.NewCertPool()
+	if len(pem) > 0 && !pool.AppendCertsFromPEM(pem) {
+		log.Printf("[sentinel] clickhouse TLS: %q contained no usable certificates "+
+			"— refusing to fall back to system roots; https queries will FAIL", path)
+	}
+	// An empty pool trusts nothing, so verification fails loudly and visibly.
+	c.Transport = &http.Transport{TLSClientConfig: &tls.Config{
+		RootCAs:    pool,
+		MinVersion: tls.VersionTLS12,
+	}}
+	return c
+}
 
 // Client talks to ClickHouse over its HTTP interface.
 type Client struct {
@@ -37,7 +83,7 @@ func FromEnv() *Client {
 		db:       getenv("SENTINEL_CLICKHOUSE_DB", "sentinel_logs"),
 		user:     getenv("SENTINEL_CLICKHOUSE_USER", "sentinel"),
 		password: getenv("SENTINEL_CLICKHOUSE_PASSWORD", "sentinel_dev"),
-		http:     &http.Client{Timeout: 10 * time.Second},
+		http:     httpClientForCA(),
 	}
 	if raw == "" {
 		return c // disabled
@@ -134,6 +180,13 @@ type Event struct {
 	Score    int    `json:"score"`
 	Status   int    `json:"status"`
 	Protocol string `json:"protocol"`
+	// Written since the explain-the-verdict change. Old rows have them empty,
+	// which the UI renders as absent rather than fabricating an explanation.
+	RequestID   string `json:"request_id"`
+	Target      string `json:"target"`
+	Mode        string `json:"mode"`
+	Threshold   int    `json:"threshold"`
+	Explanation string `json:"explanation"`
 }
 
 type TimelineBucket struct {
@@ -142,19 +195,42 @@ type TimelineBucket struct {
 	Blocked int64 `json:"blocked"`
 }
 
+// SeverityBucket is one time bucket of the threat-detection trend, split by
+// severity band. High folds CRITICAL + HIGH together so the chart reads at a
+// glance (matches the four-line High/Medium/Low/Info legend in the UI).
+type SeverityBucket struct {
+	TS     int64 `json:"ts"`
+	High   int64 `json:"high"`
+	Medium int64 `json:"medium"`
+	Low    int64 `json:"low"`
+	Info   int64 `json:"info"`
+}
+
 type Facet struct {
 	Key   string `json:"key"`
 	Count int64  `json:"count"`
+}
+
+// Attacker is one source IP rolled up over the query window: how many WAF events
+// it generated (requests), how many were actively blocked (blocked), its
+// resolved country (best-effort — empty until GeoIP tags it), and when it was
+// last seen. Drives the "Top Attacker IPs" overview card.
+type Attacker struct {
+	IP       string `json:"ip"`
+	Country  string `json:"country"`
+	Requests int64  `json:"requests"`
+	Blocked  int64  `json:"blocked"`
+	LastSeen int64  `json:"last_seen"`
 }
 
 // SearchFilter holds the (already-untrusted) search parameters.
 type SearchFilter struct {
 	// Tenant scopes the query to one tenant's events. It is the security
 	// boundary for Threat Search and is always applied by searchWhere.
-	Tenant                                           string
-	Site, Country, Rule, Action, IP, Protocol, Query string
-	From, To                                         int64
-	Limit                                            int
+	Tenant                                                     string
+	Site, Country, Rule, Action, IP, Protocol, Severity, Query string
+	From, To                                                   int64
+	Limit                                                      int
 }
 
 // ---------------------------------------------------------------------------
@@ -162,6 +238,29 @@ type SearchFilter struct {
 // ---------------------------------------------------------------------------
 
 // Status reports reachability + table row counts (for the UI empty state).
+// DiskUsage returns the used fraction (0..1) of the disk(s) ClickHouse stores
+// its data on, plus free/total bytes, by summing system.disks. The disk-pressure
+// monitor uses this to page the SOC before the event store fills up (a full
+// ClickHouse degrades Threat Search, not the WAF, but must never fill silently).
+func (c *Client) DiskUsage(ctx context.Context) (usedFrac float64, freeBytes, totalBytes int64, err error) {
+	if !c.enabled {
+		return 0, 0, 0, fmt.Errorf("clickhouse not configured")
+	}
+	var rows []struct {
+		Free  int64 `json:"free"`
+		Total int64 `json:"total"`
+	}
+	if err := c.queryJSON(ctx,
+		"SELECT toInt64(sum(free_space)) AS free, toInt64(sum(total_space)) AS total FROM system.disks", &rows); err != nil {
+		return 0, 0, 0, err
+	}
+	if len(rows) == 0 || rows[0].Total <= 0 {
+		return 0, 0, 0, fmt.Errorf("clickhouse: no disk rows from system.disks")
+	}
+	free, total := rows[0].Free, rows[0].Total
+	return 1 - float64(free)/float64(total), free, total, nil
+}
+
 func (c *Client) Status(ctx context.Context, tenant string) (map[string]any, error) {
 	if !c.enabled {
 		return map[string]any{"configured": false, "reachable": false}, nil
@@ -170,10 +269,11 @@ func (c *Client) Status(ctx context.Context, tenant string) (map[string]any, err
 		Events  int64 `json:"events"`
 		Traffic int64 `json:"traffic"`
 	}
-	// Event count is tenant-scoped; traffic_buckets is aggregate (no tenant col).
+	// Both counts are tenant-scoped now (traffic_buckets gained a tenant column).
 	err := c.queryJSON(ctx, fmt.Sprintf(
 		"SELECT (SELECT count() FROM %s.waf_events WHERE tenant = '%s') AS events, "+
-			"(SELECT count() FROM %s.traffic_buckets) AS traffic", c.db, esc(tenant), c.db), &rows)
+			"(SELECT count() FROM %s.traffic_buckets WHERE tenant = '%s') AS traffic",
+		c.db, esc(tenant), c.db, esc(tenant)), &rows)
 	if err != nil {
 		return map[string]any{"configured": true, "reachable": false, "error": err.Error()}, nil
 	}
@@ -210,12 +310,18 @@ func (c *Client) searchWhere(f SearchFilter) []string {
 	if f.Protocol != "" {
 		where = append(where, eq("protocol", strings.ToLower(f.Protocol)))
 	}
+	if f.Severity != "" {
+		// Compared upper-cased on both sides: the data plane has written mixed
+		// case over the life of the table, so a literal match would drop rows.
+		where = append(where, fmt.Sprintf("upper(severity) = '%s'", esc(strings.ToUpper(f.Severity))))
+	}
 	if f.Query != "" {
 		// substring match across path / attack / rule
 		q := esc(f.Query)
 		where = append(where, fmt.Sprintf(
-			"(positionCaseInsensitive(path, '%s') > 0 OR positionCaseInsensitive(attack, '%s') > 0 OR rule = '%s')",
-			q, q, q))
+			"(positionCaseInsensitive(path, '%s') > 0 OR positionCaseInsensitive(attack, '%s') > 0 "+
+				"OR positionCaseInsensitive(explanation, '%s') > 0 OR rule = '%s')",
+			q, q, q, q))
 	}
 	return where
 }
@@ -227,7 +333,8 @@ func (c *Client) Search(ctx context.Context, f SearchFilter) ([]Event, error) {
 		limit = 200
 	}
 	sql := fmt.Sprintf(
-		"SELECT toUnixTimestamp(ts) AS ts, ip, country, site, method, path, rule, attack, action, severity, score, status, protocol "+
+		"SELECT toUnixTimestamp(ts) AS ts, ip, country, site, method, path, rule, attack, action, severity, score, status, protocol, "+
+			"request_id, target, mode, threshold, explanation "+
 			"FROM %s.waf_events WHERE %s ORDER BY ts DESC LIMIT %d",
 		c.db, strings.Join(where, " AND "), limit)
 	var out []Event
@@ -237,18 +344,44 @@ func (c *Client) Search(ctx context.Context, f SearchFilter) ([]Event, error) {
 	return out, nil
 }
 
-// Timeline returns per-bucket total/blocked counts from traffic_buckets.
-func (c *Client) Timeline(ctx context.Context, from, to int64, bucketSecs int) ([]TimelineBucket, error) {
+// Timeline returns per-bucket total/blocked counts from traffic_buckets,
+// scoped to the given tenant.
+func (c *Client) Timeline(ctx context.Context, tenant string, from, to int64, bucketSecs int) ([]TimelineBucket, error) {
 	if bucketSecs <= 0 {
 		bucketSecs = 60
 	}
+	where := append(c.timeWhere(from, to), eq("tenant", tenant))
 	sql := fmt.Sprintf(
 		"SELECT toUnixTimestamp(toStartOfInterval(ts, INTERVAL %d SECOND)) AS ts, "+
 			"sum(reqs) AS total, sum(blocked) AS blocked "+
 			"FROM %s.traffic_buckets WHERE %s "+
 			"GROUP BY ts ORDER BY ts",
-		bucketSecs, c.db, strings.Join(c.timeWhere(from, to), " AND "))
+		bucketSecs, c.db, strings.Join(where, " AND "))
 	var out []TimelineBucket
+	if err := c.queryJSON(ctx, sql, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// SeverityTimeline buckets waf_events by time and severity band for the threat
+// detection trend chart. High folds CRITICAL + HIGH together. Tenant-scoped
+// (isolation boundary), like Timeline/Facets. Severity match is case-insensitive.
+func (c *Client) SeverityTimeline(ctx context.Context, tenant string, from, to int64, bucketSecs int) ([]SeverityBucket, error) {
+	if bucketSecs <= 0 {
+		bucketSecs = 60
+	}
+	where := append(c.timeWhere(from, to), eq("tenant", tenant))
+	sql := fmt.Sprintf(
+		"SELECT toUnixTimestamp(toStartOfInterval(ts, INTERVAL %d SECOND)) AS ts, "+
+			"countIf(upper(severity) IN ('CRITICAL','HIGH')) AS high, "+
+			"countIf(upper(severity) = 'MEDIUM') AS medium, "+
+			"countIf(upper(severity) = 'LOW') AS low, "+
+			"countIf(upper(severity) = 'INFO') AS info "+
+			"FROM %s.waf_events WHERE %s "+
+			"GROUP BY ts ORDER BY ts",
+		bucketSecs, c.db, strings.Join(where, " AND "))
+	var out []SeverityBucket
 	if err := c.queryJSON(ctx, sql, &out); err != nil {
 		return nil, err
 	}
@@ -271,6 +404,34 @@ func (c *Client) Facets(ctx context.Context, column, tenant string, from, to int
 			"GROUP BY key ORDER BY count DESC LIMIT %d",
 		col, c.db, strings.Join(where, " AND "), col, limit)
 	var out []Facet
+	if err := c.queryJSON(ctx, sql, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// TopAttackers rolls up waf_events by source IP over the window, returning the
+// busiest IPs with their total event count, actively-blocked count, resolved
+// country (best-effort — the most recent non-empty value), and last-seen time.
+// Tenant-scoped like Search/Facets — the cross-tenant isolation boundary — so
+// no path can surface another tenant's attackers. Ordered by total events then
+// blocks descending.
+func (c *Client) TopAttackers(ctx context.Context, tenant string, from, to int64, limit int) ([]Attacker, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 10
+	}
+	where := append(c.timeWhere(from, to), eq("tenant", tenant))
+	// argMax(country, ts) picks the country from this IP's most recent event so a
+	// single stale/empty tag can't win; anyIf would ignore recency. Empty codes
+	// simply lose to any tagged row, and the client renders a neutral globe.
+	sql := fmt.Sprintf(
+		"SELECT ip AS ip, argMax(country, ts) AS country, "+
+			"count() AS requests, countIf(action = 'BLOCK') AS blocked, "+
+			"toUnixTimestamp(max(ts)) AS last_seen "+
+			"FROM %s.waf_events WHERE %s AND ip != '' "+
+			"GROUP BY ip ORDER BY requests DESC, blocked DESC LIMIT %d",
+		c.db, strings.Join(where, " AND "), limit)
+	var out []Attacker
 	if err := c.queryJSON(ctx, sql, &out); err != nil {
 		return nil, err
 	}
@@ -305,6 +466,117 @@ func (c *Client) RecentThreatIntelBlocks(ctx context.Context, tenant string, fro
 		return nil, err
 	}
 	return out, nil
+}
+
+// ---------------------------------------------------------------------------
+// Export
+// ---------------------------------------------------------------------------
+
+// exportColumns is the column list handed to a customer. Deliberately spelled
+// out rather than SELECT * so that adding a column to waf_events — which may
+// carry internal or sensitive detail — never silently starts appearing in
+// customer-facing exports. ts is rendered as an ISO-8601 UTC string, not a unix
+// integer: this file is read by a human in a ticket, and a bare epoch is the
+// single most common complaint about exported WAF logs.
+const exportColumns = `formatDateTime(ts, '%Y-%m-%dT%H:%i:%SZ', 'UTC') AS timestamp_utc, ` +
+	`ip, country, site, method, path, rule, attack, action, severity, score, status, ` +
+	`protocol, request_id, target, mode, threshold, explanation`
+
+// ExportFormat maps a requested format onto its ClickHouse FORMAT clause, MIME
+// type and file extension. Whitelisted — the format string reaches SQL.
+type ExportFormat struct {
+	Name      string
+	chFormat  string
+	MediaType string
+	Ext       string
+}
+
+var exportFormats = map[string]ExportFormat{
+	"csv":    {"csv", "CSVWithNames", "text/csv; charset=utf-8", "csv"},
+	"ndjson": {"ndjson", "JSONEachRow", "application/x-ndjson; charset=utf-8", "ndjson"},
+	"json":   {"json", "JSON", "application/json; charset=utf-8", "json"},
+}
+
+// LookupExportFormat resolves a caller-supplied format name.
+func LookupExportFormat(name string) (ExportFormat, bool) {
+	f, ok := exportFormats[strings.ToLower(strings.TrimSpace(name))]
+	return f, ok
+}
+
+// ExportCount returns how many events match the filter.
+//
+// Why the caller counts before streaming: an export is handed to a customer,
+// often during an incident. A file that was silently cut off at a row cap is
+// worse than no file — it reads as a complete record of the window and quietly
+// omits the events that matter. So the caller counts first and refuses an
+// oversized export with the real number, rather than truncating. This is also
+// the row count written to the audit trail.
+func (c *Client) ExportCount(ctx context.Context, f SearchFilter) (int64, error) {
+	var rows []struct {
+		N int64 `json:"n"`
+	}
+	sql := fmt.Sprintf("SELECT count() AS n FROM %s.waf_events WHERE %s",
+		c.db, strings.Join(c.searchWhere(f), " AND "))
+	if err := c.queryJSON(ctx, sql, &rows); err != nil {
+		return 0, err
+	}
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	return rows[0].N, nil
+}
+
+// ExportStream streams matching events in the requested format.
+//
+// The returned reader is the live ClickHouse response body — the caller copies
+// it straight to the HTTP response and MUST Close it. Nothing is buffered in
+// control-plane memory, so a year of events for a busy site costs a constant
+// number of bytes here rather than proportional heap.
+//
+// Ordered ts ASC, unlike Search's newest-first: this is a log file, and a log
+// file that runs backwards is unreadable to whoever receives it.
+func (c *Client) ExportStream(ctx context.Context, f SearchFilter, format ExportFormat) (io.ReadCloser, error) {
+	sql := fmt.Sprintf(
+		"SELECT %s FROM %s.waf_events WHERE %s ORDER BY ts ASC",
+		exportColumns, c.db, strings.Join(c.searchWhere(f), " AND "))
+	if f.Limit > 0 {
+		sql += fmt.Sprintf(" LIMIT %d", f.Limit)
+	}
+	return c.queryStream(ctx,
+		sql+" SETTINGS output_format_json_quote_64bit_integers = 0 FORMAT "+format.chFormat)
+}
+
+// queryStream POSTs raw SQL and returns the undrained response body. Unlike
+// query() it does not read the body into memory; the caller owns closing it.
+func (c *Client) queryStream(ctx context.Context, sql string) (io.ReadCloser, error) {
+	if !c.enabled {
+		return nil, ErrDisabled
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url, strings.NewReader(sql))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "text/plain; charset=utf-8")
+	if c.user != "" {
+		req.Header.Set("X-ClickHouse-User", c.user)
+	}
+	if c.password != "" {
+		req.Header.Set("X-ClickHouse-Key", c.password)
+	}
+	// The shared client's 10s timeout covers the whole body for a streamed
+	// response, which would cut long exports off mid-file. Use a transport-level
+	// clone with no overall deadline; cancellation rides on ctx instead.
+	hc := &http.Client{Transport: c.http.Transport}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+		resp.Body.Close()
+		return nil, fmt.Errorf("clickhouse HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return resp.Body, nil
 }
 
 // ---------------------------------------------------------------------------

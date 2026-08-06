@@ -1,0 +1,57 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Replicated block storage — the piece that makes a pod's DATA survive a whole
+# NODE (VM) dying, not just a pod crash.
+#
+# THE PROBLEM this solves:
+#   k3s ships "local-path" storage by default: a PersistentVolume is just a
+#   directory on ONE node's local disk. A StatefulSet pod with a local-path PVC
+#   is PINNED to that node — if the node/VM dies, the data is stranded and the
+#   pod cannot restart elsewhere. That is fine for components that replicate
+#   THEMSELVES (Postgres via CloudNativePG; our control-plane raft-data, because
+#   Raft keeps 3 copies and Postgres is the source of truth). It is NOT fine for
+#   a single-replica stateful component like ClickHouse.
+#
+# THE FIX: a CSI driver that keeps N copies of each volume on DIFFERENT nodes.
+#   When the node holding a pod dies, a replica of its volume already lives on
+#   another node, so Kubernetes reschedules the pod there and re-attaches the
+#   data. This is the "storage transfers from one VM to the other" the design
+#   calls for. Replication factor 3 needs 3 nodes → one reason HA wants 3 VMs.
+#
+# Install ONE replicated-storage provider on the cluster first (see 3VM-HA-GUIDE.md),
+# then apply this StorageClass. Pick the block that matches what you installed.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Option A: OpenEBS Replicated (Mayastor) — the one discussed ──────────────
+# Install: kubectl apply -f https://openebs.github.io/charts/openebs-operator.yaml
+#          (Mayastor needs 2MiB HugePages + the nvme-tcp kernel module on each node)
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: sentinel-replicated
+  labels: { app: sentinel }
+provisioner: io.openebs.csi-mayastor
+parameters:
+  repl: "3"          # 3 copies, one per node → survives any single node loss
+  protocol: nvmf
+  fsType: ext4
+volumeBindingMode: WaitForFirstConsumer   # place the volume where the pod lands
+reclaimPolicy: Retain                      # keep data if a PVC is deleted by mistake
+allowVolumeExpansion: true
+
+# ── Option B: Longhorn — simpler to install, same idea (drop-in alternative) ──
+# If you install Longhorn instead of OpenEBS, DELETE Option A above and use this:
+#   Install: kubectl apply -f https://raw.githubusercontent.com/longhorn/longhorn/v1.6.2/deploy/longhorn.yaml
+# ---
+# apiVersion: storage.k8s.io/v1
+# kind: StorageClass
+# metadata:
+#   name: sentinel-replicated
+#   labels: { app: sentinel }
+# provisioner: driver.longhorn.io
+# parameters:
+#   numberOfReplicas: "3"
+#   staleReplicaTimeout: "30"
+#   fsType: ext4
+# reclaimPolicy: Retain
+# allowVolumeExpansion: true
+# volumeBindingMode: Immediate

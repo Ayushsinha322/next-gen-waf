@@ -29,7 +29,15 @@ services:
       postgres: { condition: service_healthy }
       redis:    { condition: service_healthy }
     environment:
+      # CLEARTEXT, deliberately: this stack is for CI and one-command local trial
+      # against a throwaway database on the container network, so there is no cert
+      # to issue and nothing durable to intercept. The production path
+      # (compose.prod.yml) serves TLS and uses sslmode=verify-full — do not copy
+      # this DSN there.
       SENTINEL_DB_URL: postgres://sentinel:sentinel_dev@postgres:5432/sentinel?sslmode=disable
+      # Dev stack connects as the Postgres superuser (RLS bypassed) — explicit
+      # opt-out of the multi-tenant boot assertion. Single-tenant dev only.
+      SENTINEL_ALLOW_SUPERUSER_DB: "1"
       SENTINEL_REDIS_URL: redis://redis:6379
       SENTINEL_CLICKHOUSE_URL: http://sentinel:sentinel_dev@clickhouse:8123/sentinel_logs
       SENTINEL_S3_ENDPOINT: http://minio:9000

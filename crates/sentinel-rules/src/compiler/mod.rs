@@ -209,6 +209,7 @@ fn compile_rule(rule: &RuleDef, state: &mut CompilerState) -> Result<(Vec<Instru
         tags: rule.tags.clone(),
         phase: rule.phase,
         skip_after: rule.skip_after.clone(),
+        setvars: rule.setvars.clone(),
     };
 
     emit_condition(
@@ -257,6 +258,7 @@ fn compile_virtual_patch(
         tags: vec![format!("virtual-patch/{}", vp.cve)],
         phase: vp.phase,
         skip_after: None,
+        setvars: Vec::new(),
     };
 
     emit_condition(&vp.targets, &vp.operator, &[], false, state, &mut instrs)?;
@@ -384,6 +386,14 @@ fn emit_operator_match(
         }
         Operator::OffDomainUrl => {
             instrs.push(Instruction::DetectOffDomainUrl);
+        }
+        Operator::SsrfUrl => {
+            instrs.push(Instruction::DetectSsrfUrl);
+        }
+        Operator::IpMatch(cidrs) => {
+            instrs.push(Instruction::IpMatch {
+                cidrs: cidrs.clone(),
+            });
         }
         Operator::Never => {
             instrs.push(Instruction::Never);

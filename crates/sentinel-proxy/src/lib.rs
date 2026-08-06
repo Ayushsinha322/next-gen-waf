@@ -22,8 +22,10 @@
 //! Phase 6: logging + correlation state update
 //! ```
 
+pub mod captcha;
 pub mod challenge;
 pub mod http3;
+mod jwks;
 pub mod tls;
 pub mod upstream;
 pub mod websocket;
@@ -32,40 +34,46 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::io::BufReader;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, Context};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use http::{header, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Body;
 use hyper::body::Incoming;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
-use regex::Regex;
 use rustls::ServerConfig;
 use sentinel_core::{
     config::{
-        ChallengeMode, ConfigHandle, DlpConfig, IpReputationConfig, ListenerConfig, Protocol,
-        SecurityHeadersConfig, SentinelConfig, SiteConfig, WafMode,
+        BotDetectionConfig, ChallengeMode, ConfigHandle, DlpAction, DlpConfig, FusionConfig,
+        IpReputationConfig, ListenerConfig, Protocol, SecurityHeadersConfig, SentinelConfig,
+        SiteConfig, WafConfig, WafMode,
     },
     context::{Phase, RequestContext, WafDecision},
 };
-use sentinel_ebpf::{EbpfConfig, EbpfManager};
+use sentinel_ebpf::{EbpfConfig, EbpfManager, IpNet};
 use sentinel_ml::MlEngine;
 use sentinel_modules::{
-    detect_smuggling, AntiDdos, BotDetector, BotVerdict, DdosVerdict, GeoIp, GeoVerdict,
-    IpReputation, IpVerdict, RateLimiter, RawTier, SmugglingVerdict, ThreatFeed, ThreatVerdict,
+    check_grpc_body, check_grpc_request, detect_smuggling, inspect_graphql, is_grpc, token_header,
+    validate_jwt, AntiDdos, BotDetector, BotSignals, BotTier, DdosVerdict, DlpEngine, GeoIp,
+    GeoVerdict, GraphqlLimits, GrpcLimits, IpReputation, IpVerdict, JwtPolicy, RateLimiter,
+    RawTier, SmugglingVerdict, ThreatFeed, ThreatVerdict,
 };
 use sentinel_plugins::PluginRuntime;
 use sentinel_rules::RuleEngine;
-use sentinel_telemetry::{inc_blocked, inc_ebpf_drops, inc_requests, observe_duration};
+use sentinel_telemetry::{
+    dec_active_connections, history_shed_total, inc_active_connections, inc_blocked,
+    inc_ebpf_drops, inc_history_shed, inc_load_shed_connections, inc_load_shed_requests,
+    inc_requests, inc_rule_hits, observe_duration, prometheus_text,
+};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{watch, Semaphore};
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn, Instrument};
 
@@ -90,102 +98,161 @@ type DlpMap = HashMap<String, DlpScanner>;
 type FeedCache = Arc<ArcSwap<Vec<(String, Vec<String>)>>>;
 
 // ---------------------------------------------------------------------------
+// Response-body buffering
+// ---------------------------------------------------------------------------
+
+/// Largest response prefix buffered for inspection (DLP + response-body rules).
+///
+/// The cap must be enforced *while reading*.  A chunked response carries no
+/// `Content-Length`, so `size_hint()` reports no upper bound — a
+/// collect-then-check would let an origin stream unbounded bytes into memory
+/// before the check ever ran.  This is the response-side twin of the
+/// request-body OOM already closed in phase 2.
+const RESPONSE_SCAN_CAP: usize = 512 * 1024;
+
+/// A body that replays an already-buffered prefix before streaming the rest of
+/// the inner body.
+///
+/// When a response turns out to exceed [`RESPONSE_SCAN_CAP`], its prefix has
+/// already been pulled off the wire and cannot be un-read.  Rather than drop
+/// the response (or buffer the whole thing), the prefix is replayed here and
+/// the remainder streams straight through.
+struct PrefixedBody {
+    prefix: Option<Bytes>,
+    inner: BoxBody,
+}
+
+impl Body for PrefixedBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        // Both fields are `Unpin` — `Option<Bytes>`, and the `Pin<Box<..>>`
+        // inside `BoxBody` — so plain projection is sound.
+        let this = self.get_mut();
+        if let Some(prefix) = this.prefix.take() {
+            if !prefix.is_empty() {
+                return std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(prefix))));
+            }
+        }
+        std::pin::Pin::new(&mut this.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.prefix.as_ref().is_none_or(|p| p.is_empty()) && self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        let pending = self.prefix.as_ref().map_or(0, |p| p.len() as u64);
+        let inner = self.inner.size_hint();
+        let mut hint = hyper::body::SizeHint::new();
+        hint.set_lower(inner.lower().saturating_add(pending));
+        if let Some(upper) = inner.upper() {
+            hint.set_upper(upper.saturating_add(pending));
+        }
+        hint
+    }
+}
+
+/// Outcome of buffering a response body for inspection.
+enum ScanBuffer {
+    /// The whole body fit under the cap and can be scanned / rewritten.
+    Complete(Bytes),
+    /// The body exceeds the cap: the prefix already read off the wire, plus the
+    /// untouched remainder. Inspection is skipped — a partial view cannot be
+    /// scanned soundly, and DLP masking has to rewrite the whole payload.
+    Oversize { prefix: Bytes, rest: BoxBody },
+    /// The origin errored part-way through the body.
+    Error(hyper::Error),
+}
+
+/// Read a response body into memory, but never more than `cap` bytes.
+///
+/// The cap is enforced frame by frame rather than by checking `size_hint()`
+/// first: a chunked response declares no length, so there is no upper bound to
+/// check, and a collect-then-check would already have pulled the whole body
+/// into memory by the time the check ran.
+async fn buffer_for_scan(mut body: BoxBody, cap: usize) -> ScanBuffer {
+    let mut chunks: Vec<Bytes> = Vec::new();
+    let mut buffered = 0usize;
+
+    loop {
+        match body.frame().await {
+            None => return ScanBuffer::Complete(concat_chunks(chunks)),
+            Some(Err(e)) => return ScanBuffer::Error(e),
+            Some(Ok(frame)) => {
+                // Non-data frames (trailers) carry nothing to scan.
+                if let Ok(data) = frame.into_data() {
+                    buffered += data.len();
+                    chunks.push(data);
+                    if buffered > cap {
+                        return ScanBuffer::Oversize {
+                            prefix: concat_chunks(chunks),
+                            rest: body,
+                        };
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Join buffered body chunks into one contiguous `Bytes` without copying the
+/// common single-chunk case.
+fn concat_chunks(chunks: Vec<Bytes>) -> Bytes {
+    if chunks.len() == 1 {
+        return chunks.into_iter().next().unwrap_or_default();
+    }
+    let total: usize = chunks.iter().map(|c| c.len()).sum();
+    let mut buf = bytes::BytesMut::with_capacity(total);
+    for c in &chunks {
+        buf.extend_from_slice(c);
+    }
+    buf.freeze()
+}
+
+// ---------------------------------------------------------------------------
 // DLP scanner — Phase 5 response-body PII / secret detection
 // ---------------------------------------------------------------------------
 
 /// Per-site DLP scanner.  Built once at startup / reload; scans response
-/// bodies for PII and secret patterns.
+/// bodies for PII and secret patterns via the shared [`DlpEngine`] (builtin
+/// card/SSN/AWS/token/key patterns + India PII: PAN, Aadhaar, mobile) and
+/// applies the configured action (block / mask / detect).
 struct DlpScanner {
-    patterns: Vec<(Regex, &'static str)>,
-    user_patterns: Vec<Regex>,
+    engine: DlpEngine,
     enabled: bool,
+    action: DlpAction,
 }
 
 impl DlpScanner {
     fn from_config(cfg: &DlpConfig) -> Self {
-        let builtin: &[(&str, &str)] = &[
-            // Credit / debit card numbers (Luhn-shaped 13-19 digit groups)
-            (
-                r"(?<!\d)(?:4[0-9]{12,15}|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12}|(?:2131|1800|35\d{3})\d{11})(?!\d)",
-                "credit_card",
-            ),
-            // US Social Security Number
-            (
-                r"\b(?!000|666|9\d{2})\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b",
-                "ssn",
-            ),
-            // PEM private key header
-            (
-                r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----",
-                "private_key",
-            ),
-            // AWS access key
-            (r"\bAKIA[0-9A-Z]{16}\b", "aws_access_key"),
-            // AWS secret key (contextual — next to known keyword)
-            (
-                r#"(?i)aws[_\-\s]*secret[_\-\s]*(?:access[_\-\s]*)?key["'\s:=]+[A-Za-z0-9/+]{40}"#,
-                "aws_secret_key",
-            ),
-            // Generic high-entropy API tokens / bearer tokens in JSON
-            (
-                r#"(?i)(?:"|\b)(?:api[_-]?key|access[_-]?token|auth[_-]?token|bearer|secret)["\s]*[:=]+\s*["']?[A-Za-z0-9/+_\-]{32,}"#,
-                "api_token",
-            ),
-            // Password leaked in JSON response
-            (
-                r#""(?:password|passwd|pwd)"\s*:\s*"[^"]{4,}""#,
-                "password_in_json",
-            ),
-            // Generic private-looking 40-char hex string (git-style secrets)
-            (r"\b[0-9a-f]{40}\b", "hex_secret"),
-        ];
-
-        let mut compiled_builtins: Vec<(Regex, &'static str)> = Vec::new();
-        for (pat, label) in builtin {
-            match Regex::new(pat) {
-                Ok(re) => compiled_builtins.push((re, label)),
-                Err(e) => warn!("DLP built-in pattern compile error ({label}): {e}"),
-            }
-        }
-
-        let user_patterns: Vec<Regex> = cfg
-            .patterns
-            .iter()
-            .filter_map(|p| match Regex::new(p) {
-                Ok(re) => Some(re),
-                Err(e) => {
-                    warn!("DLP user pattern compile error ({p}): {e}");
-                    None
-                }
-            })
-            .collect();
-
         Self {
-            patterns: compiled_builtins,
-            user_patterns,
+            engine: DlpEngine::new(&cfg.patterns),
             enabled: cfg.enable,
+            action: cfg.action,
         }
     }
 
-    /// Scan `body` for sensitive data.  Returns the first matched label, or
-    /// `None` if clean.  Only scans the first 512 KiB of a large body.
+    /// Scan `body` for sensitive data — first matched label, or `None` if clean
+    /// (only the first 512 KiB is inspected).
     fn scan(&self, body: &[u8]) -> Option<&'static str> {
         if !self.enabled {
             return None;
         }
-        let cap = body.len().min(512 * 1024);
-        let text = std::str::from_utf8(&body[..cap]).ok()?;
-        for (re, label) in &self.patterns {
-            if re.is_match(text) {
-                return Some(label);
-            }
+        self.engine.scan(body)
+    }
+
+    /// Redact every match in place (length-preserving) and return the sanitized
+    /// body plus the hit labels, or `None` if nothing matched.
+    fn mask(&self, body: &[u8]) -> Option<(Vec<u8>, Vec<String>)> {
+        if !self.enabled {
+            return None;
         }
-        for re in &self.user_patterns {
-            if re.is_match(text) {
-                return Some("user_pattern");
-            }
-        }
-        None
+        self.engine.mask(body)
     }
 }
 
@@ -251,6 +318,19 @@ impl CorrelationEngine {
         } else {
             0
         }
+    }
+
+    /// Number of blocks recorded for `ip` within the current rolling window
+    /// (0 if unknown or the window has expired). Used by the XDP auto-ban.
+    fn block_count_for_ip(&self, ip: IpAddr) -> u32 {
+        let Some(rec) = self.state.get(&ip) else {
+            return 0;
+        };
+        let last = rec.last_block_at.load(Ordering::Relaxed) as u64;
+        if unix_now_secs().saturating_sub(last) > self.window_secs {
+            return 0;
+        }
+        rec.blocks.load(Ordering::Relaxed) as u32
     }
 
     /// Record that `ip` was just blocked.
@@ -341,6 +421,11 @@ struct ModulesState {
     /// patterns) hot-synced from the control plane. Atomically swapped by the
     /// threat-intel poller — updates never block a live request.
     threat_intel: ArcSwap<ThreatFeed>,
+
+    /// Per-endpoint JWKS cache for edge-JWT validation (fetched on demand,
+    /// rotated by `kid`). Persists across config reloads so cached keys are
+    /// not dropped when a site's policy changes.
+    jwks: jwks::JwksCache,
 }
 
 // ---------------------------------------------------------------------------
@@ -361,6 +446,51 @@ struct ServerState {
     /// HTTP-01 ACME challenge tokens: token → key_authorization.
     /// Checked in handle_request before any WAF pipeline work.
     http01_tokens: Arc<DashMap<String, String>>,
+    /// Admission control — bounds concurrent client connections across all
+    /// listeners (TCP + QUIC). Excess connections are rejected at accept so a
+    /// flood cannot exhaust file descriptors or memory. See `serve_listener`.
+    conn_limiter: Arc<Semaphore>,
+    /// Admission control — bounds concurrent in-flight WAF-processed requests
+    /// across all transports (h1/h2/h3). Excess requests shed with 503; this
+    /// specifically caps HTTP/2 & HTTP/3 stream fan-out. See `run_pipeline`.
+    request_limiter: Arc<Semaphore>,
+    /// Set true on SIGTERM so `/readyz` flips to 503 FIRST — the LB/k8s pulls
+    /// this node from rotation before we drain, so new traffic is diverted
+    /// while in-flight requests finish (R6, graceful shutdown).
+    draining: Arc<std::sync::atomic::AtomicBool>,
+    /// Tracks live per-connection tasks so shutdown can wait for in-flight
+    /// requests to finish (bounded) instead of severing them → 502s (R6).
+    conn_tracker: tokio_util::task::TaskTracker,
+}
+
+/// Resolve an admission-control limit: an environment variable (if set to a
+/// positive integer) overrides the config value; otherwise the config value is
+/// used. A resolved value of 0 is clamped to 1 (a Semaphore needs ≥1 permit).
+fn resolve_limit(env_key: &str, config_value: usize) -> usize {
+    std::env::var(env_key)
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(config_value)
+        .max(1)
+}
+
+/// RAII guard that keeps the live active-connection gauge in sync with the set
+/// of admitted connections: increments on construction, decrements on drop
+/// (drop runs even if the connection task panics).
+pub(crate) struct ActiveConnGuard;
+
+impl ActiveConnGuard {
+    pub(crate) fn new() -> Self {
+        inc_active_connections();
+        Self
+    }
+}
+
+impl Drop for ActiveConnGuard {
+    fn drop(&mut self) {
+        dec_active_connections();
+    }
 }
 
 /// Upstreams the dedicated management listener reverse-proxies to. The admin
@@ -393,6 +523,102 @@ impl ManagementUpstreams {
 struct ConfigSyncResponse {
     version: u64,
     sites: Vec<SiteConfig>,
+}
+
+/// Digest of one enabled plugin as advertised by `GET /internal/plugins`.
+///
+/// Deliberately excludes the module bytes: a node compares hashes on every poll
+/// and downloads only what it does not already hold, which is what keeps a 5s
+/// poll cheap for multi-megabyte modules.
+#[derive(serde::Deserialize)]
+struct PluginDigest {
+    name: String,
+    #[allow(dead_code)] // advertised for operators/logs; sync keys off sha256
+    version: String,
+    sha256: String,
+}
+
+#[derive(serde::Deserialize)]
+struct PluginSyncResponse {
+    plugins: Vec<PluginDigest>,
+}
+
+/// On-disk snapshot of the last-good synced config (R5). Lets the data plane
+/// keep protecting DB-created sites across a restart that happens DURING a
+/// control-plane / Postgres outage — boot would otherwise see only local YAML
+/// and every UI/DB-created site would vanish. Overwritten by the first
+/// successful config-sync poll.
+#[derive(serde::Deserialize)]
+struct CachedSyncConfig {
+    version: u64,
+    sites: Vec<SiteConfig>,
+}
+
+/// Resolve the config-cache path: `SENTINEL_CONFIG_CACHE_PATH`, else
+/// `$HOME/.config/sentinel/config-cache.json`, else `/var/lib/sentinel/...`.
+fn config_cache_path() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("SENTINEL_CONFIG_CACHE_PATH") {
+        if !p.is_empty() {
+            return std::path::PathBuf::from(p);
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            return std::path::Path::new(&home).join(".config/sentinel/config-cache.json");
+        }
+    }
+    std::path::PathBuf::from("/var/lib/sentinel/config-cache.json")
+}
+
+/// Atomically persist the last-good synced sites (write tmp → fsync → rename, so
+/// a crash mid-write never yields a truncated cache). Errors are logged only,
+/// never propagated into the sync path.
+fn write_cached_sites(path: &std::path::Path, version: u64, sites: &[SiteConfig]) {
+    use std::io::Write as _;
+    let body = match serde_json::to_vec(&serde_json::json!({ "version": version, "sites": sites }))
+    {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("config cache: serialize failed: {e}");
+            return;
+        }
+    };
+    if let Some(dir) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            warn!("config cache: mkdir {}: {e}", dir.display());
+            return;
+        }
+    }
+    // The temp name is PER-PROCESS. A fixed ".json.tmp" is a corruption window as soon
+    // as more than one node shares the cache directory (the HA overlay's waf1/waf2/waf3
+    // if pointed at a shared volume): File::create truncates, so one node can truncate
+    // the tmp another is mid-write on, and either may then rename the partial result
+    // over the last-good cache. Distinct tmp names make each writer's rename atomic
+    // and independent, so the worst case is last-writer-wins on identical content.
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    let res = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&body)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if let Err(e) = res {
+        warn!("config cache: atomic write {}: {e}", path.display());
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Load the last-good cached config, if present and parseable.
+fn load_cached_sites() -> Option<CachedSyncConfig> {
+    let path = config_cache_path();
+    let bytes = std::fs::read(&path).ok()?;
+    match serde_json::from_slice::<CachedSyncConfig>(&bytes) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            warn!("config cache: parse {}: {e}", path.display());
+            None
+        }
+    }
 }
 
 /// Response from the control-plane `/api/v1/internal/threat-intel` endpoint —
@@ -446,6 +672,19 @@ impl ProxyServer {
     /// Bind all configured listeners and start serving.
     /// Returns when the `shutdown` receiver fires.
     pub async fn run(self, mut shutdown: watch::Receiver<bool>) -> anyhow::Result<()> {
+        // R5: replay the last-good synced sites from the on-disk cache before
+        // building the pool/engines, so protection survives a restart during a
+        // control-plane/Postgres outage. The first successful sync poll below
+        // overwrites both the live config and the cache.
+        if let Some(cached) = load_cached_sites() {
+            let n = cached.sites.len();
+            sentinel_core::config::update_sites(&self.config, cached.sites);
+            info!(
+                sites = n,
+                version = cached.version,
+                "restored sites from local config cache"
+            );
+        }
         let cfg = self.config.load_full();
 
         if cfg.listeners.is_empty() {
@@ -454,12 +693,27 @@ impl ProxyServer {
             return Ok(());
         }
 
+        // Admission control — global concurrency ceilings so a connection or
+        // request flood sheds gracefully instead of exhausting FDs / memory.
+        // Env vars override the config file (see `LimitsConfig`).
+        let max_connections = resolve_limit("SENTINEL_MAX_CONNECTIONS", cfg.limits.max_connections);
+        let max_inflight_requests = resolve_limit(
+            "SENTINEL_MAX_INFLIGHT_REQUESTS",
+            cfg.limits.max_inflight_requests,
+        );
+        info!(
+            max_connections,
+            max_inflight_requests, "connection admission control enabled"
+        );
+        let conn_limiter = Arc::new(Semaphore::new(max_connections));
+        let request_limiter = Arc::new(Semaphore::new(max_inflight_requests));
+
         let upstream_pool = Arc::new(UpstreamPool::from_config(&cfg));
 
         // Spawn active health-check tasks for sites that configure them.
         UpstreamPool::spawn_health_checks(Arc::clone(&upstream_pool), &cfg, shutdown.clone());
 
-        let initial_engines = build_rule_engines(&cfg);
+        let initial_engines = build_rule_engines(&cfg, &RuleEngineMap::new());
         let engines: Arc<ArcSwap<RuleEngineMap>> =
             Arc::new(ArcSwap::new(Arc::new(initial_engines)));
 
@@ -508,14 +762,18 @@ impl ProxyServer {
         // (request availability comes first), and K8s gives no cross-pod start
         // ordering, so the writer routinely races a not-yet-ready ClickHouse
         // StatefulSet on cold start. A one-shot connect would leave the writer a
-        // permanent silent no-op until someone restarted the proxy. CLICKHOUSE_ENABLED
-        // gates buffering and is true ONLY while connected, so the in-memory
-        // buffers stay bounded whenever ClickHouse is down.
+        // permanent silent no-op until someone restarted the proxy.
+        //
+        // HISTORY_SINK_ACTIVE gates buffering and is true whenever this task is
+        // RUNNING — not only while connected. Rows the sink cannot take are
+        // written to a bounded disk spool and replayed on reconnect, so an
+        // unreachable ClickHouse costs latency in the audit trail, not content.
+        // Before the spool existed this flag meant "connected", which is exactly
+        // why a node with no reachable ClickHouse recorded nothing at all.
         if storage_backend_cfg.clickhouse_url.is_some() {
             let initial = storage.clickhouse.clone();
-            if initial.is_some() {
-                CLICKHOUSE_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
+            HISTORY_SINK_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+            let spool = open_history_spool();
             let ch_cfg = storage_backend_cfg.clone();
             tokio::spawn(async move {
                 let mut ch: Option<std::sync::Arc<sentinel_storage::ClickHouseClient>> = initial;
@@ -525,6 +783,31 @@ impl ProxyServer {
                 let mut ticks = 0u32;
                 // Seconds remaining until the next reconnect attempt while down.
                 let mut reconnect_in = 0u32;
+                // Cap enforcement walks the directory, so it runs on a slow
+                // cadence rather than every second: every 30 ticks, or sooner if
+                // a burst has appended enough to risk a meaningful overshoot.
+                const CAP_CHECK_TICKS: u32 = 30;
+                const CAP_CHECK_BYTES: u64 = 16 * 1024 * 1024;
+                let mut ticks_since_cap = 0u32;
+                let mut bytes_since_cap = 0u64;
+                // Spool cadence while disconnected — see the disconnected branch
+                // for why it is far slower than the 5s connected flush.
+                const SPOOL_FLUSH_TICKS: u32 = 60;
+                let mut ticks_disconnected = 0u32;
+                // A backlog left by a previous process is replayed on the first
+                // connected tick — that restart-survival is the reason the spool
+                // is on disk instead of simply being a larger memory buffer.
+                if let Some(sp) = spool.as_ref() {
+                    let pending = sp.segments("events").len() + sp.segments("traffic").len();
+                    if pending > 0 {
+                        info!(
+                            segments = pending,
+                            bytes = sp.bytes(),
+                            dir = %sp.dir().display(),
+                            "history spool: backlog found from a previous run — will replay on reconnect"
+                        );
+                    }
+                }
                 loop {
                     ticker.tick().await;
 
@@ -545,10 +828,6 @@ impl ProxyServer {
                                             Ok(()) => {
                                                 info!(url, database = db, "clickhouse connected — waf history writer enabled");
                                                 ch = Some(std::sync::Arc::new(client));
-                                                CLICKHOUSE_ENABLED.store(
-                                                    true,
-                                                    std::sync::atomic::Ordering::Relaxed,
-                                                );
                                             }
                                             Err(e) => {
                                                 warn!(error = %e, "clickhouse reachable but schema init failed — retrying in 10s");
@@ -557,7 +836,7 @@ impl ProxyServer {
                                         }
                                     }
                                     Err(e) => {
-                                        warn!(error = %e, "clickhouse unreachable — waf history writer disabled, retrying in 10s");
+                                        warn!(error = %e, "clickhouse unreachable — spooling waf history to disk, retrying in 10s");
                                         reconnect_in = 10;
                                     }
                                 }
@@ -567,48 +846,115 @@ impl ProxyServer {
                         }
                     }
 
-                    // Always drain to keep buffers bounded; record_* only fills
-                    // them while CLICKHOUSE_ENABLED (i.e. while connected).
+                    // Always drain to keep buffers bounded. record_* fills them
+                    // whenever this task exists, connected or not — what happens
+                    // to rows the sink refuses is decided below, and it is never
+                    // "discard" while a spool is available.
                     buf.extend(drain_traffic(unix_now()));
                     evbuf.extend(drain_events());
                     ticks += 1;
+                    ticks_since_cap += 1;
+                    if ch.is_none() {
+                        ticks_disconnected += 1;
+                    }
                     // Both streams flush on the same 5s-or-500-row cadence.
                     let time_due = ticks >= 5;
 
                     if let Some(client) = ch.clone() {
                         let mut conn_lost = false;
-                        if (time_due || buf.len() >= 500) && !buf.is_empty() {
+
+                        // Drain the backlog before this tick's live rows, so
+                        // replayed history lands in roughly the order it
+                        // happened and a long outage's spool actually empties
+                        // instead of being perpetually overtaken.
+                        if let Some(sp) = spool.as_ref() {
+                            if !replay_history_spool(sp, &client).await {
+                                conn_lost = true;
+                            }
+                        }
+
+                        if !conn_lost && (time_due || buf.len() >= 500) && !buf.is_empty() {
                             if let Err(e) = client.insert_traffic_batch(&buf).await {
-                                warn!(error = %e, rows = buf.len(), "clickhouse traffic flush failed — dropping batch, will reconnect");
+                                warn!(error = %e, rows = buf.len(), "clickhouse traffic flush failed — spooling batch, will reconnect");
+                                bytes_since_cap += spool_batch(spool.as_ref(), "traffic", &buf);
                                 conn_lost = true;
                             } else {
                                 debug!(rows = buf.len(), "clickhouse traffic flushed");
                             }
-                            buf.clear(); // bounded: drop after every attempt
+                            buf.clear();
                         }
 
-                        if (time_due || evbuf.len() >= 500) && !evbuf.is_empty() {
+                        if !conn_lost && (time_due || evbuf.len() >= 500) && !evbuf.is_empty() {
                             if let Err(e) = client.insert_events_batch(&evbuf).await {
-                                warn!(error = %e, rows = evbuf.len(), "clickhouse events flush failed — dropping batch, will reconnect");
+                                warn!(error = %e, rows = evbuf.len(), "clickhouse events flush failed — spooling batch, will reconnect");
+                                bytes_since_cap += spool_batch(spool.as_ref(), "events", &evbuf);
                                 conn_lost = true;
                             } else {
                                 debug!(rows = evbuf.len(), "clickhouse events flushed");
                             }
-                            evbuf.clear(); // bounded: drop after every attempt
+                            evbuf.clear();
                         }
 
                         // A failed insert usually means the server/connection went
-                        // away — drop the client so the loop reconnects, and stop
-                        // buffering (CLICKHOUSE_ENABLED=false) until it does.
+                        // away — drop the client so the loop reconnects. Buffering
+                        // deliberately CONTINUES while disconnected now; the spool
+                        // is what keeps that bounded.
                         if conn_lost {
-                            CLICKHOUSE_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+                            // Whatever this tick drained but did not get to
+                            // insert must not evaporate just because the sink
+                            // died mid-tick.
+                            bytes_since_cap += spool_batch(spool.as_ref(), "traffic", &buf);
+                            bytes_since_cap += spool_batch(spool.as_ref(), "events", &evbuf);
+                            buf.clear();
+                            evbuf.clear();
                             ch = None;
                             reconnect_in = 5;
                         }
-                    } else {
-                        // Disconnected: discard anything drained to stay bounded.
+                    } else if ticks_disconnected >= SPOOL_FLUSH_TICKS
+                        || buf.len() >= 500
+                        || evbuf.len() >= 500
+                    {
+                        // Disconnected. This is the path that silently lost every
+                        // event on a node with no reachable ClickHouse: it used to
+                        // clear both buffers unconditionally. Now it persists them.
+                        //
+                        // Deliberately a SLOWER cadence than the connected flush.
+                        // A node whose sink is permanently unreachable spools
+                        // forever, and at the 5s connected cadence that is ~17k
+                        // tiny files a day — which `enforce_cap`'s directory walk
+                        // then has to traverse every 30s. The passive node in the
+                        // 2-VM topology is exactly that case: its VRRP health
+                        // check probes a real request every 2s, so it always has
+                        // traffic to record. One segment a minute holds the same
+                        // rows in 1/12th the files, and the extra in-memory
+                        // residency is bounded by the same 500-row trigger.
+                        ticks_disconnected = 0;
+                        bytes_since_cap += spool_batch(spool.as_ref(), "traffic", &buf);
+                        bytes_since_cap += spool_batch(spool.as_ref(), "events", &evbuf);
                         buf.clear();
                         evbuf.clear();
+                    }
+
+                    // Keep the spool inside its byte budget. Reported, never
+                    // silent: a spool that quietly discards would recreate the
+                    // very bug it was built to fix.
+                    if let Some(sp) = spool.as_ref() {
+                        if ticks_since_cap >= CAP_CHECK_TICKS || bytes_since_cap >= CAP_CHECK_BYTES
+                        {
+                            ticks_since_cap = 0;
+                            bytes_since_cap = 0;
+                            let dropped = sp.enforce_cap();
+                            if dropped.segments > 0 {
+                                warn!(
+                                    segments = dropped.segments,
+                                    bytes = dropped.bytes,
+                                    max_bytes = sp.max_bytes(),
+                                    "history spool OVER CAP — discarded oldest segments; \
+                                     history for that window is permanently lost. Raise \
+                                     SENTINEL_SPOOL_MAX_BYTES or restore the ClickHouse sink"
+                                );
+                            }
+                        }
                     }
 
                     if time_due {
@@ -616,7 +962,7 @@ impl ProxyServer {
                     }
                 }
             });
-            info!("clickhouse flusher started (1s sample · 5s/500-row flush → traffic_buckets + waf_events; self-healing reconnect)");
+            info!("clickhouse flusher started (1s sample · 5s/500-row flush → traffic_buckets + waf_events; self-healing reconnect; disk-spooled + replayed while the sink is down)");
         }
 
         let modules = Arc::new(ModulesState {
@@ -628,6 +974,7 @@ impl ProxyServer {
             correlation: CorrelationEngine::new(),
             feed_cache: Arc::clone(&feed_cache),
             threat_intel: ArcSwap::new(Arc::new(ThreatFeed::empty())),
+            jwks: jwks::JwksCache::new(),
         });
 
         let plugin_runtime = build_plugin_runtime(&cfg).unwrap_or_else(|e| {
@@ -655,10 +1002,13 @@ impl ProxyServer {
         };
 
         let ebpf = Arc::new(
-            EbpfManager::new(EbpfConfig::default())
+            EbpfManager::new(build_ebpf_config())
                 .await
                 .context("EbpfManager init")?,
         );
+        // Mirror operator-configured static IP-reputation blocks into the eBPF
+        // blocklist so they're dropped at XDP (or the userspace fast-fail).
+        seed_ebpf_from_ip_reputation(&ebpf, &cfg);
 
         // Certificate manager — loads persisted ACME/manual certs from disk,
         // then runs background renewal every hour.
@@ -716,10 +1066,19 @@ impl ProxyServer {
             modules: Arc::clone(&modules),
             plugin_runtime: Arc::clone(&plugin_runtime),
             ml_engine: Arc::clone(&ml_engine),
-            ebpf,
+            ebpf: Arc::clone(&ebpf),
             cert_manager,
             http01_tokens,
+            conn_limiter,
+            request_limiter,
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            conn_tracker: tokio_util::task::TaskTracker::new(),
         });
+
+        // Cache of control-plane-uploaded plugin modules, shared by the plugin-sync
+        // task (writer) and the config hot-reload watcher (reader) so that BOTH
+        // rebuild a complete runtime. See build_full_plugin_runtime.
+        let uploaded_plugins: UploadedPlugins = Arc::new(DashMap::new());
 
         // --- Background: config hot-reload watcher ---
         {
@@ -728,6 +1087,7 @@ impl ProxyServer {
             let dlp_swap = Arc::clone(&dlp_map);
             let modules_ref = Arc::clone(&modules);
             let plugin_swap = Arc::clone(&plugin_runtime);
+            let uploaded_ref = Arc::clone(&uploaded_plugins);
             tokio::spawn(async move {
                 loop {
                     let cw = Arc::clone(&config_watch);
@@ -735,6 +1095,7 @@ impl ProxyServer {
                     let ds = Arc::clone(&dlp_swap);
                     let mr = Arc::clone(&modules_ref);
                     let ps = Arc::clone(&plugin_swap);
+                    let up_cache = Arc::clone(&uploaded_ref);
                     let handle = tokio::spawn(async move {
                         let mut last_ptr = Arc::as_ptr(&cw.load_full()) as usize;
                         loop {
@@ -743,7 +1104,8 @@ impl ProxyServer {
                             let ptr = Arc::as_ptr(&current) as usize;
                             if ptr != last_ptr {
                                 last_ptr = ptr;
-                                let new_engines = build_rule_engines(&current);
+                                let prev_engines = es.load_full();
+                                let new_engines = build_rule_engines(&current, &prev_engines);
                                 let rule_count: usize =
                                     new_engines.values().map(|e| e.rule_count()).sum();
                                 es.store(Arc::new(new_engines));
@@ -755,10 +1117,20 @@ impl ProxyServer {
                                 mr.bot_detector.store(Arc::new(BotDetector::new()));
                                 mr.geoip_map.store(Arc::new(build_geoip_map(&current)));
 
-                                match build_plugin_runtime(&current) {
-                                    Ok(new_pr) => {
+                                // Rebuild through build_full_plugin_runtime so
+                                // uploaded plugins survive a config change. Using
+                                // build_plugin_runtime here unloaded every uploaded
+                                // plugin, and because the sync task skips work when
+                                // the advertised set is unchanged, they never came
+                                // back — the module stayed "enabled" in the UI while
+                                // silently no longer running.
+                                match build_full_plugin_runtime(&current, &up_cache) {
+                                    Ok((new_pr, names, rejected)) => {
                                         ps.store(Arc::new(new_pr));
-                                        info!("plugin runtime hot-reloaded");
+                                        info!(
+                                            uploaded = names.len(),
+                                            rejected, "plugin runtime hot-reloaded"
+                                        );
                                     }
                                     Err(e) => {
                                         warn!("failed to reload plugins — keeping current: {e:#}");
@@ -845,11 +1217,205 @@ impl ProxyServer {
                     };
                     if sync.version != last_version {
                         let count = sync.sites.len();
+                        // R5: persist the last-good config before applying, so a
+                        // restart during a control-plane outage keeps these sites.
+                        write_cached_sites(&config_cache_path(), sync.version, &sync.sites);
                         poll_pool.sync_sites(&sync.sites);
                         sentinel_core::config::update_sites(&poll_cfg, sync.sites);
                         last_version = sync.version;
                         info!(version = last_version, sites = count, "sites hot-synced");
                     }
+                }
+            });
+        }
+
+        // --- Background: control-plane plugin sync ---
+        //
+        // Plugins uploaded through the dashboard live in Postgres, not on this
+        // node's filesystem, so they cannot arrive via the config hot-reload path
+        // above: that rebuilds the runtime only when the SITE config pointer
+        // changes, and installing a plugin does not touch site config.
+        //
+        // The control plane advertises a digest (name, version, sha256) and serves
+        // bytes separately, so a poll costs one small JSON response and a module is
+        // downloaded only when its hash is new to this node. That is what makes a
+        // 5s poll affordable for multi-megabyte modules.
+        if let Some(sync_url) = cfg.cluster.sync_url.clone() {
+            let plugin_sync_swap = Arc::clone(&plugin_runtime);
+            let plugin_sync_cfg = Arc::clone(&state.config);
+            let sync_cache = Arc::clone(&uploaded_plugins);
+            let secs = cfg.cluster.sync_interval_secs.max(1);
+            tokio::spawn(async move {
+                use http_body_util::BodyExt as _;
+                use sha2::Digest as _;
+                type EmptyBody = http_body_util::Empty<bytes::Bytes>;
+                let client: Client<_, EmptyBody> =
+                    Client::builder(TokioExecutor::new()).build_http();
+                let internal_secret = std::env::var("SENTINEL_INTERNAL_SECRET")
+                    .ok()
+                    .filter(|s| !s.is_empty());
+                // name → (sha256, bytes). Cached so an unchanged plugin is never
+                // re-downloaded, and so a control-plane outage cannot silently
+                // unload plugins this node already holds.
+                let mut have: std::collections::HashMap<String, (String, Vec<u8>)> =
+                    std::collections::HashMap::new();
+                let mut ticker = tokio::time::interval(Duration::from_secs(secs));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    ticker.tick().await;
+
+                    let list_url = format!("{sync_url}/api/v1/internal/plugins");
+                    let Ok(uri) = list_url.parse::<hyper::Uri>() else {
+                        warn!("plugin sync: bad url: {list_url}");
+                        continue;
+                    };
+                    let mut builder = hyper::Request::builder().method("GET").uri(uri);
+                    if let Some(secret) = &internal_secret {
+                        builder = builder.header("x-sentinel-internal", secret);
+                    }
+                    let Ok(req) = builder.body(http_body_util::Empty::new()) else {
+                        continue;
+                    };
+                    let bytes = match client.request(req).await {
+                        Ok(r) => match r.collect().await {
+                            Ok(b) => b.to_bytes(),
+                            Err(e) => {
+                                warn!("plugin sync body: {e}");
+                                continue;
+                            }
+                        },
+                        Err(e) => {
+                            // Control plane unreachable — keep serving whatever is
+                            // already loaded rather than dropping to zero plugins.
+                            warn!("plugin sync fetch: {e}");
+                            continue;
+                        }
+                    };
+                    let listing: PluginSyncResponse = match serde_json::from_slice(&bytes) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!("plugin sync parse: {e}");
+                            continue;
+                        }
+                    };
+
+                    // Skip only when the advertised set matches the cache AND the
+                    // live runtime actually still holds exactly those plugins.
+                    //
+                    // Checking the runtime is what makes this self-healing. Anything
+                    // that rebuilds the runtime without the uploaded set (a bug, a
+                    // future code path, a failed reload) would otherwise leave the
+                    // plugins permanently unloaded while this task concluded there
+                    // was nothing to do — the module still shown as enabled in the
+                    // UI, no error anywhere, and simply not running.
+                    let cache_current = listing.plugins.len() == have.len()
+                        && listing
+                            .plugins
+                            .iter()
+                            .all(|p| have.get(&p.name).is_some_and(|(sha, _)| *sha == p.sha256));
+                    let live_names = plugin_sync_swap.load().plugin_names();
+                    let runtime_current = listing
+                        .plugins
+                        .iter()
+                        .all(|p| live_names.iter().any(|n| n == &p.name));
+                    if cache_current && runtime_current {
+                        continue;
+                    }
+                    if cache_current && !runtime_current {
+                        warn!(
+                            "uploaded plugins missing from the live runtime — reloading from cache"
+                        );
+                    }
+
+                    // Fetch anything new or changed. A failure here aborts the whole
+                    // reconcile: applying a partial set would silently run the site
+                    // with some plugins missing, which is worse than retrying in 5s.
+                    let mut next: std::collections::HashMap<String, (String, Vec<u8>)> =
+                        std::collections::HashMap::new();
+                    let mut failed = false;
+                    for p in &listing.plugins {
+                        if let Some((sha, wasm)) = have.get(&p.name).filter(|(s, _)| *s == p.sha256)
+                        {
+                            next.insert(p.name.clone(), (sha.clone(), wasm.clone()));
+                            continue;
+                        }
+                        let wasm_url =
+                            format!("{sync_url}/api/v1/internal/plugins/{}/wasm", p.name);
+                        let Ok(uri) = wasm_url.parse::<hyper::Uri>() else {
+                            warn!(plugin = %p.name, "plugin sync: bad wasm url");
+                            failed = true;
+                            break;
+                        };
+                        let mut b = hyper::Request::builder().method("GET").uri(uri);
+                        if let Some(secret) = &internal_secret {
+                            b = b.header("x-sentinel-internal", secret);
+                        }
+                        let Ok(req) = b.body(http_body_util::Empty::new()) else {
+                            failed = true;
+                            break;
+                        };
+                        let wasm = match client.request(req).await {
+                            Ok(r) if r.status().is_success() => match r.collect().await {
+                                Ok(body) => body.to_bytes().to_vec(),
+                                Err(e) => {
+                                    warn!(plugin = %p.name, "plugin download body: {e}");
+                                    failed = true;
+                                    break;
+                                }
+                            },
+                            Ok(r) => {
+                                warn!(plugin = %p.name, status = %r.status(),
+                                      "plugin download rejected");
+                                failed = true;
+                                break;
+                            }
+                            Err(e) => {
+                                warn!(plugin = %p.name, "plugin download: {e}");
+                                failed = true;
+                                break;
+                            }
+                        };
+                        // Verify the digest before compiling. The control plane is
+                        // trusted, the transport is plain HTTP on a private network,
+                        // and a truncated body would otherwise be compiled and run.
+                        let got = hex::encode(sha2::Sha256::digest(&wasm));
+                        if got != p.sha256 {
+                            warn!(plugin = %p.name, expected = %p.sha256, got = %got,
+                                  "plugin digest mismatch — refusing to load");
+                            failed = true;
+                            break;
+                        }
+                        next.insert(p.name.clone(), (p.sha256.clone(), wasm));
+                    }
+                    if failed {
+                        continue;
+                    }
+
+                    // Publish to the shared cache BEFORE rebuilding, so a concurrent
+                    // config hot-reload also produces a complete runtime.
+                    sync_cache.clear();
+                    for (name, v) in &next {
+                        sync_cache.insert(name.clone(), v.clone());
+                    }
+
+                    // Rebuild from the local manifest set plus every uploaded module,
+                    // so file-configured plugins (dev, site.waf.plugins) survive too.
+                    let current = plugin_sync_cfg.load_full();
+                    let (rt, loaded, rejected) =
+                        match build_full_plugin_runtime(&current, &sync_cache) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                warn!("plugin sync: runtime build failed: {e:#}");
+                                continue;
+                            }
+                        };
+                    plugin_sync_swap.store(Arc::new(rt));
+                    have = next;
+                    info!(
+                        plugins = loaded.len(),
+                        rejected, active = %loaded.join(","),
+                        "uploaded plugins synced from control plane"
+                    );
                 }
             });
         }
@@ -861,6 +1427,13 @@ impl ProxyServer {
         // live request. Uses the same shared-secret auth as config sync.
         if let Some(sync_url) = cfg.cluster.sync_url.clone() {
             let ti_modules = Arc::clone(&modules);
+            // Optionally offload high-confidence threat-intel IPs to XDP. Off by
+            // default: the block tier is already enforced in userspace, and the
+            // feed can carry 100k+ churny IOCs — enable only to drop them in-kernel.
+            let ti_ebpf = Arc::clone(&ebpf);
+            let seed_ti_xdp = std::env::var("SENTINEL_XDP_SEED_THREATINTEL")
+                .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(false);
             let secs = std::env::var("SENTINEL_TI_SYNC_INTERVAL_SECS")
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
@@ -927,6 +1500,30 @@ impl ProxyServer {
                         }
                     };
                     if sync.version != last_version {
+                        // Mirror block-tier IPs/CIDRs into the eBPF/XDP blocklist
+                        // (insert-only, capped) before the tier is consumed below.
+                        if seed_ti_xdp {
+                            const CAP: usize = 60_000;
+                            let mut n = 0usize;
+                            for ip_s in sync.block.ips.iter().take(CAP) {
+                                if let Ok(ip) = ip_s.parse::<std::net::IpAddr>() {
+                                    ti_ebpf.block_ip(ip);
+                                    n += 1;
+                                }
+                            }
+                            for cidr in sync.block.cidrs.iter().take(CAP.saturating_sub(n)) {
+                                if let Some(net) = parse_block_cidr(cidr) {
+                                    ti_ebpf.block_net(net);
+                                    n += 1;
+                                }
+                            }
+                            if n > 0 {
+                                info!(
+                                    entries = n,
+                                    "seeded eBPF/XDP blocklist from threat-intel block tier"
+                                );
+                            }
+                        }
                         let feed = ThreatFeed::from_parts(
                             sync.version,
                             watch_score,
@@ -941,6 +1538,116 @@ impl ProxyServer {
                             iocs = count,
                             "threat-intel hot-synced"
                         );
+                    }
+                }
+            });
+        }
+
+        // --- Background: control-plane node heartbeat (every 10 s) ---
+        // Mirrors the config-sync loop above: POSTs this node's health to the
+        // control plane so the cluster view knows the data plane is alive and
+        // how it's doing. Same shared-secret auth. Never blocks the proxy: on
+        // any error we warn and keep ticking.
+        if let Some(sync_url) = cfg.cluster.sync_url.clone() {
+            let hb_cfg = Arc::clone(&state.config);
+            let hb_pool = Arc::clone(&state.upstream_pool);
+            // Resolve the node identity once (the configured id defaults to the
+            // literal "auto", which we resolve from env / hostname).
+            let node_id = if cfg.cluster.node_id != "auto" {
+                cfg.cluster.node_id.clone()
+            } else {
+                std::env::var("SENTINEL_NODE_ID")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
+                    .unwrap_or_else(|| "node".to_string())
+            };
+            let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| node_id.clone());
+            tokio::spawn(async move {
+                type JsonBody = http_body_util::Full<bytes::Bytes>;
+                let client: Client<_, JsonBody> =
+                    Client::builder(TokioExecutor::new()).build_http();
+                let internal_secret = std::env::var("SENTINEL_INTERNAL_SECRET")
+                    .ok()
+                    .filter(|s| !s.is_empty());
+                let version = env!("CARGO_PKG_VERSION");
+                let mut ticker = tokio::time::interval(Duration::from_secs(10));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    ticker.tick().await;
+
+                    // Snapshot health for this tick (mirrors health_response()).
+                    let cfg_snap = hb_cfg.load();
+                    let sites = cfg_snap.sites.len();
+                    let listeners: Vec<String> = cfg_snap
+                        .listeners
+                        .iter()
+                        .map(|l| format!("{}:{}", l.name, l.bind))
+                        .collect();
+                    let http3_enabled = cfg_snap.listeners.iter().any(|l| {
+                        l.is_tls() && !l.is_management() && l.protocols().contains(&Protocol::Http3)
+                    });
+                    let pool = hb_pool.stats();
+                    let uptime = START_TIME
+                        .get_or_init(SystemTime::now)
+                        .elapsed()
+                        .unwrap_or_default()
+                        .as_secs();
+                    // Degraded when we have origins configured but none reachable.
+                    let status = if pool.total > 0 && pool.healthy == 0 {
+                        "degraded"
+                    } else {
+                        "healthy"
+                    };
+
+                    let body = serde_json::json!({
+                        "id": node_id,
+                        "hostname": hostname,
+                        "role": "data-plane",
+                        "version": version,
+                        "status": status,
+                        "metadata": {
+                            "uptime_secs": uptime,
+                            "sites": sites,
+                            "listeners": listeners,
+                            "upstreams_healthy": pool.healthy,
+                            "upstreams_total": pool.total,
+                            "http3_enabled": http3_enabled,
+                            // Ground truth for which operator-authored rules are
+                            // actually compiled and running on THIS node. The
+                            // control plane cannot derive this — it has no SRL
+                            // compiler — so without it "enabled" in the UI is an
+                            // assumption rather than a fact.
+                            "inline_rules": inline_rule_diag_snapshot(),
+                        }
+                    })
+                    .to_string();
+
+                    let url = format!("{}/api/v1/internal/nodes/heartbeat", sync_url);
+                    let uri: hyper::Uri = match url.parse() {
+                        Ok(u) => u,
+                        Err(e) => {
+                            warn!("heartbeat: bad url: {e}");
+                            continue;
+                        }
+                    };
+                    let mut builder = hyper::Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json");
+                    if let Some(secret) = &internal_secret {
+                        builder = builder.header("x-sentinel-internal", secret);
+                    }
+                    let req = builder
+                        .body(http_body_util::Full::new(bytes::Bytes::from(body)))
+                        .expect("BUG: building heartbeat request");
+                    match client.request(req).await {
+                        Ok(resp) => {
+                            debug!(status = %resp.status(), "heartbeat posted");
+                        }
+                        Err(e) => {
+                            warn!("heartbeat post: {e}");
+                        }
                     }
                 }
             });
@@ -1049,9 +1756,33 @@ impl ProxyServer {
         }
 
         shutdown.changed().await.ok();
-        info!("shutdown signal received; draining connections");
+        // R6 graceful shutdown: (1) flip readiness so /readyz → 503 and the LB/k8s
+        // pulls this node from rotation (new traffic diverted); (2) stop accepting
+        // new connections (abort the listener accept loops); (3) wait — bounded by
+        // SENTINEL_DRAIN_GRACE_SECS — for in-flight per-connection tasks to finish
+        // before returning, since the runtime is dropped once run() returns and
+        // would otherwise sever them mid-request → 502s on every deploy.
+        state
+            .draining
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        info!("shutdown signal received; draining in-flight connections");
         for h in handles {
             h.abort();
+        }
+        let grace = Duration::from_secs(
+            std::env::var("SENTINEL_DRAIN_GRACE_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(25),
+        );
+        state.conn_tracker.close();
+        match tokio::time::timeout(grace, state.conn_tracker.wait()).await {
+            Ok(_) => info!("all in-flight connections drained"),
+            Err(_) => warn!(
+                grace_secs = grace.as_secs(),
+                "drain grace elapsed; closing remaining connections"
+            ),
         }
         Ok(())
     }
@@ -1220,13 +1951,35 @@ async fn serve_listener(
         tokio::select! {
             accept = tcp.accept() => {
                 let (stream, peer) = accept?;
+                // Connection admission control: acquire a permit from the global
+                // connection semaphore *before* spawning a task. When the box is
+                // at `max_connections`, the permit is unavailable and the freshly
+                // accepted socket is dropped here (connection reject) — bounding
+                // file descriptors and memory so a flood sheds instead of OOMing.
+                let permit = match Arc::clone(&state.conn_limiter).try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        inc_load_shed_connections();
+                        debug!(peer = %peer, "connection admission: at max_connections, rejecting");
+                        continue;
+                    }
+                };
                 let state = Arc::clone(&state);
                 let acceptor = tls_acceptor.clone();
                 let protos = cfg.protocols();
                 let ds = default_site.clone();
                 let mgmt = management.clone();
                 let av = alt_svc.clone();
-                tokio::spawn(async move {
+                // Spawn on the connection tracker so a graceful shutdown can wait
+                // for this in-flight request to finish (bounded) instead of the
+                // runtime dropping it mid-request → 502 (R6).
+                let tracker = state.conn_tracker.clone();
+                tracker.spawn(async move {
+                    // Permit is held for the connection's lifetime and released
+                    // (freeing a slot) when this task ends; the guard keeps the
+                    // active-connection gauge in sync even on panic.
+                    let _permit = permit;
+                    let _active = ActiveConnGuard::new();
                     if let Err(e) = handle_connection(stream, peer, acceptor, protos, state, ds, mgmt, av).await {
                         debug!(peer = %peer, "connection error: {e}");
                     }
@@ -1248,6 +2001,23 @@ async fn serve_listener(
 /// Max time a client may take to send the complete request head before the
 /// HTTP/1 connection is dropped — bounds slowloris header-dribbling.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
+/// Max wall-clock to read a complete request BODY. `HEADER_READ_TIMEOUT` only
+/// covers the head; without a body deadline a trickled/slow POST (slow-body
+/// slowloris) holds its in-flight admission permit indefinitely, and enough of
+/// them shed all traffic. Env override: `SENTINEL_BODY_READ_TIMEOUT_SECS`.
+const BODY_READ_TIMEOUT_SECS: u64 = 30;
+fn body_read_timeout() -> Duration {
+    static T: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        Duration::from_secs(
+            std::env::var("SENTINEL_BODY_READ_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(BODY_READ_TIMEOUT_SECS),
+        )
+    })
+}
 /// Max time allowed for the TLS handshake to complete, so a client that opens a
 /// socket and then stalls the handshake can't pin a worker task indefinitely.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -1271,6 +2041,9 @@ async fn handle_connection(
     stream.set_nodelay(true)?;
 
     if let Some(acceptor) = tls_acceptor {
+        // Fingerprint the TLS ClientHello (JA4) by peeking the socket without
+        // consuming it — rustls then reads the same bytes for the handshake.
+        let tls_fp = peek_ja4(&stream).await;
         let tls = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream))
             .await
             .context("TLS handshake timed out")?
@@ -1278,17 +2051,30 @@ async fn handle_connection(
         let negotiated = tls.get_ref().1.alpn_protocol().map(|p| p.to_vec());
         let io = TokioIo::new(tls);
         if negotiated.as_deref() == Some(b"h2") {
-            serve_http2(io, peer, state, default_site, management, alt_svc).await
+            serve_http2(io, peer, state, default_site, management, alt_svc, tls_fp).await
         } else {
-            serve_http1(io, peer, state, default_site, management, alt_svc).await
+            serve_http1(io, peer, state, default_site, management, alt_svc, tls_fp).await
         }
     } else {
         let io = TokioIo::new(stream);
         if protocols.contains(&Protocol::Http2) && !protocols.contains(&Protocol::Http1) {
-            serve_http2(io, peer, state, default_site, management, alt_svc).await
+            serve_http2(io, peer, state, default_site, management, alt_svc, None).await
         } else {
-            serve_http1(io, peer, state, default_site, management, alt_svc).await
+            serve_http1(io, peer, state, default_site, management, alt_svc, None).await
         }
+    }
+}
+
+/// Peek the TLS ClientHello off the accepted TCP stream WITHOUT consuming it
+/// (`peek` leaves the bytes in the socket buffer for rustls to read during the
+/// handshake) and compute a JA4 fingerprint. Best-effort: returns `None` on a
+/// partial/absent ClientHello or timeout, so it never delays or breaks the
+/// handshake. HTTP/3 (QUIC) connections don't take this path (fingerprint None).
+async fn peek_ja4(stream: &TcpStream) -> Option<String> {
+    let mut buf = [0u8; 4096];
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.peek(&mut buf)).await {
+        Ok(Ok(n)) if n > 0 => sentinel_modules::ja4_from_client_hello(&buf[..n], false),
+        _ => None,
     }
 }
 
@@ -1299,6 +2085,7 @@ async fn serve_http1<T>(
     default_site: Option<String>,
     management: Option<Arc<ManagementUpstreams>>,
     alt_svc: Option<header::HeaderValue>,
+    tls_fp: Option<String>,
 ) -> anyhow::Result<()>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -1315,7 +2102,8 @@ where
                 let ds = default_site.clone();
                 let mgmt = management.clone();
                 let av = alt_svc.clone();
-                async move { with_alt_svc(handle_request(s, peer, req, ds, mgmt).await, av) }
+                let fp = tls_fp.clone();
+                async move { with_alt_svc(handle_request(s, peer, req, ds, mgmt, fp).await, av) }
             }),
         )
         .with_upgrades()
@@ -1330,6 +2118,7 @@ async fn serve_http2<T>(
     default_site: Option<String>,
     management: Option<Arc<ManagementUpstreams>>,
     alt_svc: Option<header::HeaderValue>,
+    tls_fp: Option<String>,
 ) -> anyhow::Result<()>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -1347,7 +2136,8 @@ where
                 let ds = default_site.clone();
                 let mgmt = management.clone();
                 let av = alt_svc.clone();
-                async move { with_alt_svc(handle_request(s, peer, req, ds, mgmt).await, av) }
+                let fp = tls_fp.clone();
+                async move { with_alt_svc(handle_request(s, peer, req, ds, mgmt, fp).await, av) }
             }),
         )
         .await
@@ -1379,12 +2169,32 @@ async fn handle_request(
     req: Request<Incoming>,
     default_site: Option<String>,
     management: Option<Arc<ManagementUpstreams>>,
+    tls_fp: Option<String>,
 ) -> Result<Response<BoxBody>, Infallible> {
     // Health / readiness endpoint — served before any WAF pipeline work.
     // GET /healthz or GET /health returns JSON with proxy uptime, site
     // count, and listener status.  No auth required; internal-only.
     if req.uri().path() == "/healthz" || req.uri().path() == "/health" {
         return Ok(health_response(&state));
+    }
+
+    // Kubernetes READINESS probe. Unlike /healthz (liveness — "the process is
+    // up"), /readyz reports whether this node can actually protect traffic: it
+    // returns 200 only once the WAF config has synced from the control plane
+    // (sites > 0). A freshly-started or rejoining pod reports 503 until its
+    // rules are loaded, so the Service / load balancer won't route to it early
+    // → no 502s on rollout or recovery. No auth required; internal-only.
+    if req.uri().path() == "/readyz" || req.uri().path() == "/ready" {
+        return Ok(readyz_response(&state));
+    }
+
+    // Prometheus metrics — served before any WAF pipeline work so every proxy
+    // pod is scrapeable at GET /metrics (requests/blocked/latency/rule-hits/
+    // eBPF-drops/active-connections/load-shed). Like the health probes above,
+    // this is internal-only (no auth) and expected to be network-restricted;
+    // it is served on every listener, including the management endpoint.
+    if req.method() == http::Method::GET && req.uri().path() == "/metrics" {
+        return Ok(metrics_response());
     }
 
     // Management listener: this is the dedicated admin-console endpoint. It
@@ -1441,7 +2251,7 @@ async fn handle_request(
     // `run_pipeline`, also called by the HTTP/3 adapter in `http3.rs`. `.map()`
     // preserves request extensions, so the WebSocket `OnUpgrade` handle captured
     // by hyper survives the body swap (`CanUpgrade` is generic over the body).
-    Ok(run_pipeline(state, peer, req.map(|b| b.boxed()), default_site).await)
+    Ok(run_pipeline(state, peer, req.map(|b| b.boxed()), default_site, tls_fp).await)
 }
 
 /// Shared request pipeline, transport-agnostic over the request body type.
@@ -1456,15 +2266,56 @@ pub(crate) async fn run_pipeline(
     peer: SocketAddr,
     req: Request<BoxBody>,
     default_site: Option<String>,
+    tls_fp: Option<String>,
 ) -> Response<BoxBody> {
-    // eBPF fast-fail: known-blocked IPs never enter the WAF pipeline.
-    // Runs before body reads, header parsing, or any other work.
-    if state.ebpf.is_blocked(peer.ip()) {
+    // Blocklist fast-fail: known-blocked addresses never enter the WAF pipeline.
+    // Runs before body reads and before any WAF work.
+    //
+    // This checks the TRANSPORT PEER *and* the resolved client IP, and the second half
+    // is not optional. Checking only `peer.ip()` made this control INERT in the shipped
+    // HA topology: behind HAProxy (or any load balancer, CDN, or ingress) every request
+    // arrives with the proxy as its peer, so the blocklist compared the proxy's address
+    // — never the attacker's — and matched nothing. It appeared to work only in the
+    // single-VM demo, where the client happened to be the immediate peer. A feature that
+    // silently does nothing in production is worse than an absent one, because it is
+    // counted as coverage.
+    //
+    // The peer check is retained rather than replaced: it is the only thing that applies
+    // when there is no proxy in front, and it is what the in-kernel XDP program can see
+    // (XDP runs at L3 and has no access to X-Forwarded-For at all — see
+    // crates/sentinel-ebpf, and the deployment note in the DDoS guide about placing
+    // per-source enforcement at the edge where the peer IS the client).
+    //
+    // resolve_client_ip only trusts XFF when the peer is a configured trusted proxy and
+    // walks the chain right-to-left, so a client-supplied header cannot spoof its way
+    // *past* a block, nor forge someone else's address into one.
+    if blocklist_hit(
+        peer.ip(),
+        req.headers(),
+        |ip| state.ebpf.is_blocked(ip),
+        is_trusted_proxy,
+    ) {
         inc_ebpf_drops();
         inc_requests();
         inc_blocked();
         return error_response(StatusCode::FORBIDDEN, "Forbidden");
     }
+
+    // Request admission control: acquire a permit from the global in-flight
+    // request semaphore. This is the per-request half of admission control (the
+    // accept loop bounds connections); it specifically caps HTTP/2 and HTTP/3
+    // stream multiplexing, where one connection may open hundreds of concurrent
+    // streams that would otherwise all enter the (expensive) WAF pipeline at
+    // once. Excess sheds with 503 + Retry-After. Health/readiness/metrics and
+    // the management console are handled upstream of this and are never shed.
+    let _req_permit = match Arc::clone(&state.request_limiter).try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            inc_requests();
+            inc_load_shed_requests();
+            return overloaded_response();
+        }
+    };
 
     let t0 = Instant::now();
 
@@ -1478,7 +2329,7 @@ pub(crate) async fn run_pipeline(
     );
 
     let resp = async move {
-        match proxy(state, peer, req, default_site).await {
+        match proxy(state, peer, req, default_site, tls_fp).await {
             Ok(r) => r,
             Err(e) => {
                 error!("proxy error: {e:#}");
@@ -1505,6 +2356,7 @@ async fn proxy(
     peer: SocketAddr,
     mut req: Request<BoxBody>,
     default_site: Option<String>,
+    tls_fp: Option<String>,
 ) -> anyhow::Result<Response<BoxBody>> {
     let cfg = state.config.load();
     let engine_map = state.engines.load_full();
@@ -1519,13 +2371,27 @@ async fn proxy(
 
     // --- Phase 0: Connection ---
     let mut ctx = RequestContext::new(peer.ip(), peer.port());
+    // Resolve the REAL client IP from X-Forwarded-For when the immediate peer is
+    // a trusted proxy (our HAProxy in the shipped HA topology). Without this,
+    // behind the LB every per-IP control (anti-DDoS, IP-reputation, rate-limit,
+    // GeoIP, threat-intel, correlation, XDP auto-ban) and the forensic client_ip
+    // see the proxy's address, collapsing all of them. Trusting XFF from an
+    // UNtrusted peer would let attackers spoof past IP blocks, so this is gated
+    // on SENTINEL_TRUSTED_PROXIES (empty = never trust XFF — the safe default).
+    // Done before Phase-0 checks so they all key off the true client.
+    if let Some(real) = resolve_client_ip(peer.ip(), req.headers()) {
+        ctx.client_ip = real;
+    }
+    // JA4 TLS fingerprint computed from the ClientHello during the handshake
+    // (None for plaintext/HTTP-3 listeners). Consumed by the bot classifier.
+    ctx.tls_fingerprint = tls_fp;
 
     // Anti-DDoS: connection-rate check.
     match state.modules.anti_ddos.check_connection(ctx.client_ip) {
         DdosVerdict::Block { reason } => {
             ctx.decision = WafDecision::Block;
             ctx.block_reason = Some(reason);
-            state.modules.correlation.record_block(ctx.client_ip);
+            note_block(&state, ctx.client_ip);
             ctx.advance_phase(Phase::Logging);
             log_request(&ctx);
             return Ok(block_response(&ctx));
@@ -1540,7 +2406,7 @@ async fn proxy(
             IpVerdict::Block { reason } => {
                 ctx.decision = WafDecision::Block;
                 ctx.block_reason = Some(format!("IP reputation: {reason}"));
-                state.modules.correlation.record_block(ctx.client_ip);
+                note_block(&state, ctx.client_ip);
                 ctx.advance_phase(Phase::Logging);
                 log_request(&ctx);
                 return Ok(block_response(&ctx));
@@ -1548,7 +2414,7 @@ async fn proxy(
             IpVerdict::Suspect { tags } => {
                 ctx.tx_vars
                     .insert("ip_rep_tags".to_string(), tags.join(","));
-                ctx.anomaly_score = ctx.anomaly_score.saturating_add(2);
+                ctx.add_engine_score("reputation", 2);
             }
             IpVerdict::Allow => {}
         }
@@ -1576,7 +2442,7 @@ async fn proxy(
                     ctx.threat_intel_hit = true;
                     ctx.decision = WafDecision::Block;
                     ctx.block_reason = Some(format!("threat intel: {reason}"));
-                    state.modules.correlation.record_block(ctx.client_ip);
+                    note_block(&state, ctx.client_ip);
                     ctx.advance_phase(Phase::Logging);
                     log_request(&ctx);
                     return Ok(block_response(&ctx));
@@ -1587,17 +2453,45 @@ async fn proxy(
                     // traffic as highly anomalous (see sentinel-ml).
                     ctx.threat_intel_hit = true;
                     ctx.tx_vars.insert("threat_intel".to_string(), tag);
-                    ctx.anomaly_score = ctx.anomaly_score.saturating_add(score);
+                    ctx.add_engine_score("threat_intel", score);
                 }
                 ThreatVerdict::None => {}
             }
         }
     }
 
-    // Correlation engine: add extra score for repeat attackers.
-    let corr_score = state.modules.correlation.score_for_ip(ctx.client_ip);
+    // Correlation engine: add extra score for repeat attackers. Can be disabled
+    // via SENTINEL_DISABLE_CORRELATION (e.g. rule-engine benchmarking) so a
+    // single-source scanner isn't escalated by cross-request block history —
+    // letting a tool like GoTestWAF measure per-request rule detection cleanly.
+    let corr_score = {
+        use std::sync::OnceLock;
+        static DISABLED: OnceLock<bool> = OnceLock::new();
+        let disabled = *DISABLED.get_or_init(|| {
+            matches!(
+                std::env::var("SENTINEL_DISABLE_CORRELATION")
+                    .ok()
+                    .as_deref(),
+                Some("1") | Some("true") | Some("yes") | Some("on")
+            )
+        });
+        if disabled || is_shared_egress(ctx.client_ip) {
+            // Shared egress: the address is not an actor, so its history is not its
+            // fault. See shared_egress_nets().
+            0
+        } else {
+            // Capped so reputation can escalate a borderline request but never block a
+            // clean one on its own — the uncapped contribution (8) exceeded the default
+            // threshold (5).
+            state
+                .modules
+                .correlation
+                .score_for_ip(ctx.client_ip)
+                .min(correlation_max_score())
+        }
+    };
     if corr_score > 0 {
-        ctx.anomaly_score = ctx.anomaly_score.saturating_add(corr_score);
+        ctx.add_engine_score("correlation", corr_score);
         ctx.tx_vars
             .insert("correlation_score".to_string(), corr_score.to_string());
     }
@@ -1639,6 +2533,26 @@ async fn proxy(
     if let Some(s) = &site {
         ctx.site_id = Some(s.id.clone());
         ctx.tenant_id = Some(s.tenant_id.clone());
+        // Stamp the policy that governs this request while the site config is in
+        // scope. Done here rather than passed to log_request because there are 18
+        // log_request call sites, several of which run BEFORE routing (anti-DDoS,
+        // IP reputation, threat intel) and have no site to pass.
+        // Effective policy = the site's policy with any matching path override
+        // applied. Everything downstream reads these two ctx fields rather than
+        // s.waf directly, so an override cannot be honoured in one place and
+        // missed in another — which is how a per-path setting ends up decorative.
+        let ov = match_path_override(&s.waf, ctx.uri.path());
+        ctx.enforcement_mode = Some(
+            ov.and_then(|o| o.mode.clone())
+                .unwrap_or_else(|| s.waf.mode.clone()),
+        );
+        ctx.anomaly_threshold = Some(
+            ov.and_then(|o| o.anomaly_threshold)
+                .unwrap_or(s.waf.anomaly_threshold),
+        );
+        if let Some(o) = ov {
+            ctx.path_override = Some(o.path_prefix.clone());
+        }
     }
 
     // Request size limits: URI and header count (Phase 1, before body read).
@@ -1708,11 +2622,11 @@ async fn proxy(
     // already holds valid clearance gets `None` here (regardless of which
     // subsystem asked for the challenge) and proceeds to origin — no re-loop.
     if ctx.decision == WafDecision::Challenge {
-        let challenge_mode = site
-            .and_then(|s| s.waf.bot_detection.as_ref())
+        let bot_cfg = site.and_then(|s| s.waf.bot_detection.as_ref());
+        let challenge_mode = bot_cfg
             .map(|b| b.challenge)
             .unwrap_or(ChallengeMode::NativePow);
-        if let Some(resp) = challenge_response(&mut ctx, challenge_mode) {
+        if let Some(resp) = challenge_response(&mut ctx, challenge_mode, bot_cfg).await {
             ctx.response_status = Some(resp.status());
             ctx.advance_phase(Phase::Logging);
             log_request(&ctx);
@@ -1723,18 +2637,18 @@ async fn proxy(
     }
 
     if ctx.decision == WafDecision::Block {
-        state.modules.correlation.record_block(ctx.client_ip);
-        let resp = if ctx
-            .block_reason
-            .as_deref()
-            .unwrap_or("")
-            .starts_with("HTTP request smuggling")
-        {
+        note_block(&state, ctx.client_ip);
+        let reason = ctx.block_reason.as_deref().unwrap_or("");
+        let resp = if reason.starts_with("HTTP request smuggling") {
             // RFC 7230 §3.3.3: malformed requests MUST be rejected with 400.
             error_response(
                 StatusCode::BAD_REQUEST,
                 ctx.block_reason.as_deref().unwrap_or("Bad Request"),
             )
+        } else if reason.starts_with("jwt:") {
+            // Authentication failure — 401 Unauthorized. The specific reason is
+            // logged server-side but never leaked to the client.
+            error_response(StatusCode::UNAUTHORIZED, "Unauthorized")
         } else {
             block_response(&ctx)
         };
@@ -1777,12 +2691,14 @@ async fn proxy(
             // stream gigabytes into memory before the post-collection check ever
             // ran. `Limited` aborts collection the instant the body exceeds the
             // cap, bounding memory to `max_bytes`.
-            match http_body_util::Limited::new(body, max_bytes as usize)
-                .collect()
-                .await
+            match tokio::time::timeout(
+                body_read_timeout(),
+                http_body_util::Limited::new(body, max_bytes as usize).collect(),
+            )
+            .await
             {
-                Ok(collected) => collected.to_bytes(),
-                Err(e)
+                Ok(Ok(collected)) => collected.to_bytes(),
+                Ok(Err(e))
                     if e.downcast_ref::<http_body_util::LengthLimitError>()
                         .is_some() =>
                 {
@@ -1798,20 +2714,101 @@ async fn proxy(
                         "Request Entity Too Large",
                     ));
                 }
-                Err(e) => return Err(anyhow::anyhow!("collecting request body: {e}")),
+                Ok(Err(e)) => return Err(anyhow::anyhow!("collecting request body: {e}")),
+                Err(_) => {
+                    ctx.decision = WafDecision::Block;
+                    ctx.block_reason = Some("request body read timed out (slow-body)".into());
+                    ctx.advance_phase(Phase::Logging);
+                    log_request(&ctx);
+                    return Ok(error_response(
+                        StatusCode::REQUEST_TIMEOUT,
+                        "Request Timeout",
+                    ));
+                }
             }
         } else {
-            body.collect()
-                .await
-                .context("collecting request body")?
-                .to_bytes()
+            match tokio::time::timeout(body_read_timeout(), body.collect()).await {
+                Ok(r) => r.context("collecting request body")?.to_bytes(),
+                Err(_) => {
+                    ctx.decision = WafDecision::Block;
+                    ctx.block_reason = Some("request body read timed out (slow-body)".into());
+                    ctx.advance_phase(Phase::Logging);
+                    log_request(&ctx);
+                    return Ok(error_response(
+                        StatusCode::REQUEST_TIMEOUT,
+                        "Request Timeout",
+                    ));
+                }
+            }
         };
 
         ctx.request_body = Some(bytes.clone());
         phase2_body(&mut ctx, site, &engine_map, &state.ml_engine)?;
 
+        // GraphQL firewall — query depth / complexity / introspection on the
+        // body. Gated to GraphQL endpoints so nested REST-JSON bodies aren't
+        // misread as GraphQL queries.
+        if ctx.decision == WafDecision::Allow {
+            if let Some(gql) = site
+                .and_then(|s| s.waf.graphql.as_ref())
+                .filter(|g| g.enable)
+            {
+                let is_graphql = ctx.method == http::Method::POST
+                    && (ctx.uri.path().contains("graphql")
+                        || ctx
+                            .request_headers
+                            .get(http::header::CONTENT_TYPE)
+                            .and_then(|v| v.to_str().ok())
+                            .is_some_and(|ct| ct.contains("application/graphql")));
+                if is_graphql {
+                    let limits = GraphqlLimits {
+                        max_depth: gql.max_depth,
+                        max_complexity: gql.max_complexity,
+                        block_introspection: gql.block_introspection,
+                    };
+                    if let Some(reason) = inspect_graphql(&bytes, &limits) {
+                        ctx.decision = WafDecision::Block;
+                        ctx.block_reason = Some(reason);
+                    }
+                }
+            }
+        }
+
+        // gRPC firewall — message/frame-size limits on the buffered body.
+        if ctx.decision == WafDecision::Allow {
+            if let Some(grpc_cfg) = site.and_then(|s| s.waf.grpc.as_ref()).filter(|g| g.enable) {
+                let is_grpc_ct = ctx
+                    .request_headers
+                    .get(http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(is_grpc);
+                if is_grpc_ct {
+                    let limits = GrpcLimits {
+                        max_message_bytes: grpc_cfg.max_message_bytes,
+                        max_frames: grpc_cfg.max_frames,
+                        block_reflection: grpc_cfg.block_reflection,
+                        allowed_methods: grpc_cfg.allowed_methods.clone(),
+                        blocked_methods: grpc_cfg.blocked_methods.clone(),
+                    };
+                    if let Some(reason) = check_grpc_body(&bytes, &limits) {
+                        ctx.decision = WafDecision::Block;
+                        ctx.block_reason = Some(format!("grpc: {reason}"));
+                    }
+                }
+            }
+        }
+
+        if ctx.decision == WafDecision::Limit {
+            // Soft-deny from weighted fusion — throttle with 429 (configurable),
+            // do not auto-ban (uncertain traffic).
+            let resp = limit_response(&ctx, site);
+            ctx.response_status = Some(resp.status());
+            ctx.advance_phase(Phase::Logging);
+            log_request(&ctx);
+            return Ok(resp);
+        }
         if ctx.decision == WafDecision::Block {
-            state.modules.correlation.record_block(ctx.client_ip);
+            note_block(&state, ctx.client_ip);
             let resp = block_response(&ctx);
             ctx.response_status = Some(resp.status());
             ctx.advance_phase(Phase::Logging);
@@ -1977,83 +2974,146 @@ async fn proxy(
             || ct.contains("javascript")
             || ct.is_empty();
 
-        if is_scannable {
-            // Collect up to 512 KiB for scanning.  Larger responses pass
-            // through uninspected (streaming inspection is a future change).
-            const SCAN_CAP: u64 = 512 * 1024;
-            let upper = resp_body.size_hint().upper().unwrap_or(0);
-            if upper <= SCAN_CAP || upper == u64::MAX {
-                match resp_body.collect().await {
-                    Ok(collected) => {
-                        let bytes = collected.to_bytes();
+        // A response that DECLARES an oversized length streams straight through
+        // — no point buffering to discover what the origin already told us.
+        let declared_oversize = resp_body
+            .size_hint()
+            .upper()
+            .is_some_and(|u| u > RESPONSE_SCAN_CAP as u64);
 
-                        // (1) Response-body rule engine (CRS RESPONSE-* etc.).
-                        if let Some(engine) = resp_engine {
-                            ctx.response_body = Some(bytes.clone());
-                            engine.evaluate(
-                                &mut ctx,
-                                Phase::ResponseBody,
-                                site_cfg.waf.anomaly_threshold,
+        if is_scannable && !declared_oversize {
+            // Box first so the body is `Unpin` for frame-by-frame reads; every
+            // branch below boxes it anyway, so this costs nothing extra.
+            match buffer_for_scan(resp_body.boxed(), RESPONSE_SCAN_CAP).await {
+                ScanBuffer::Error(e) => {
+                    warn!("response-body read error: {e}");
+                    http_body_util::Empty::<Bytes>::new()
+                        .map_err(|never: Infallible| match never {})
+                        .boxed()
+                }
+                ScanBuffer::Oversize { prefix, rest } => {
+                    // Too large to scan: replay what was already read, stream
+                    // the rest. Never silent — an unscanned response is a
+                    // coverage gap the operator has to be able to see.
+                    warn!(
+                        site = %site_cfg.id,
+                        cap_bytes = RESPONSE_SCAN_CAP,
+                        "response exceeds the scan cap — forwarded WITHOUT DLP / response-rule inspection"
+                    );
+                    PrefixedBody {
+                        prefix: Some(prefix),
+                        inner: rest,
+                    }
+                    .boxed()
+                }
+                ScanBuffer::Complete(mut bytes) => {
+                    // (1) Response-body rule engine (CRS RESPONSE-* etc.).
+                    if let Some(engine) = resp_engine {
+                        ctx.response_body = Some(bytes.clone());
+                        engine.evaluate(
+                            &mut ctx,
+                            Phase::ResponseBody,
+                            site_cfg.waf.anomaly_threshold,
+                        );
+                        // Respect learning mode (downgrade Block → Log).
+                        let gm = governing_mode(&ctx, &site_cfg.waf.mode);
+                        enforce_mode(&mut ctx, &gm);
+                        if ctx.decision == WafDecision::Block {
+                            warn!(
+                                site = %site_cfg.id,
+                                client_ip = %ctx.client_ip,
+                                "response-body rule matched — blocking"
                             );
-                            // Respect learning mode (downgrade Block → Log).
-                            enforce_mode(&mut ctx, &site_cfg.waf.mode);
-                            if ctx.decision == WafDecision::Block {
-                                warn!(
-                                    site = %site_cfg.id,
-                                    client_ip = %ctx.client_ip,
-                                    "response-body rule matched — blocking"
-                                );
-                                ctx.advance_phase(Phase::Logging);
-                                log_request(&ctx);
-                                return Ok(block_response(&ctx));
-                            }
+                            ctx.advance_phase(Phase::Logging);
+                            log_request(&ctx);
+                            return Ok(block_response(&ctx));
                         }
+                    }
 
-                        // (2) DLP scan (PII / secret leakage).
-                        if let Some(dlp) = dlp {
-                            if let Some(matched) = dlp.scan(&bytes) {
-                                ctx.decision = WafDecision::Block;
-                                ctx.block_reason =
-                                    Some(format!("DLP: sensitive data pattern matched: {matched}"));
-                                // Respect learning mode (downgrade Block → Log)
-                                // exactly like the response-body rule path above —
-                                // a learning-mode site must not block or rewrite
-                                // the response, only record the would-block.
-                                enforce_mode(&mut ctx, &site_cfg.waf.mode);
-                                if ctx.decision == WafDecision::Block {
+                    // (2) DLP — scan / mask / detect on PII & secret
+                    // leakage, per the site's configured action.
+                    if let Some(dlp) = dlp {
+                        match dlp.action {
+                            // Block the whole response on any match.
+                            DlpAction::Block => {
+                                if let Some(matched) = dlp.scan(&bytes) {
+                                    ctx.decision = WafDecision::Block;
+                                    ctx.block_reason = Some(format!(
+                                        "DLP: sensitive data pattern matched: {matched}"
+                                    ));
+                                    // Learning mode downgrades Block → Log —
+                                    // must not block or rewrite, only record.
+                                    let gm = governing_mode(&ctx, &site_cfg.waf.mode);
+                                    enforce_mode(&mut ctx, &gm);
+                                    if ctx.decision == WafDecision::Block {
+                                        warn!(
+                                            site = %site_cfg.id,
+                                            client_ip = %ctx.client_ip,
+                                            pattern = matched,
+                                            "DLP: sensitive data in response — blocking"
+                                        );
+                                        ctx.advance_phase(Phase::Logging);
+                                        log_request(&ctx);
+                                        return Ok(block_response(&ctx));
+                                    }
                                     warn!(
                                         site = %site_cfg.id,
                                         client_ip = %ctx.client_ip,
                                         pattern = matched,
-                                        "DLP: sensitive data in response — blocking"
+                                        "DLP: sensitive data in response — would block (learning mode)"
                                     );
-                                    ctx.advance_phase(Phase::Logging);
-                                    log_request(&ctx);
-                                    return Ok(block_response(&ctx));
                                 }
-                                warn!(
-                                    site = %site_cfg.id,
-                                    client_ip = %ctx.client_ip,
-                                    pattern = matched,
-                                    "DLP: sensitive data in response — would block (learning mode)"
-                                );
+                            }
+                            // Redact matched data in place (length-preserving)
+                            // and forward the sanitized response.
+                            DlpAction::Mask => {
+                                if site_cfg.waf.mode == WafMode::Learning {
+                                    // Observe only — never rewrite in learning mode.
+                                    if let Some(matched) = dlp.scan(&bytes) {
+                                        ctx.tx_vars.insert(
+                                            "dlp_would_mask".to_string(),
+                                            matched.to_string(),
+                                        );
+                                        warn!(
+                                            site = %site_cfg.id,
+                                            client_ip = %ctx.client_ip,
+                                            pattern = matched,
+                                            "DLP: sensitive data in response — would mask (learning mode)"
+                                        );
+                                    }
+                                } else if let Some((masked, hits)) = dlp.mask(&bytes) {
+                                    let hits_str = hits.join(", ");
+                                    ctx.tx_vars
+                                        .insert("dlp_masked".to_string(), hits_str.clone());
+                                    warn!(
+                                        site = %site_cfg.id,
+                                        client_ip = %ctx.client_ip,
+                                        hits = %hits_str,
+                                        "DLP: masked sensitive data in response"
+                                    );
+                                    bytes = Bytes::from(masked);
+                                }
+                            }
+                            // Log the finding but forward unchanged.
+                            DlpAction::Detect => {
+                                if let Some(matched) = dlp.scan(&bytes) {
+                                    ctx.tx_vars
+                                        .insert("dlp_detected".to_string(), matched.to_string());
+                                    warn!(
+                                        site = %site_cfg.id,
+                                        client_ip = %ctx.client_ip,
+                                        pattern = matched,
+                                        "DLP: sensitive data in response — detected (forwarded unchanged)"
+                                    );
+                                }
                             }
                         }
+                    }
 
-                        Full::new(bytes)
-                            .map_err(|never: Infallible| match never {})
-                            .boxed()
-                    }
-                    Err(e) => {
-                        warn!("response-body collection error: {e}");
-                        http_body_util::Empty::<Bytes>::new()
-                            .map_err(|never: Infallible| match never {})
-                            .boxed()
-                    }
+                    Full::new(bytes)
+                        .map_err(|never: Infallible| match never {})
+                        .boxed()
                 }
-            } else {
-                // Response too large to buffer — pass through uninspected.
-                resp_body.boxed()
             }
         } else {
             resp_body.boxed()
@@ -2131,31 +3191,53 @@ async fn phase1_headers(
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
             let bot_det = modules.bot_detector.load();
-            let verdict = bot_det.classify(ua, ctx.tls_fingerprint.as_deref());
-
-            match &verdict {
-                BotVerdict::KnownAttacker(tool) => {
+            // Weighted 0-100 bot score fusing JA4, UA patterns, browser-header
+            // presence, and repeat-offender velocity → tiered response.
+            let sig = BotSignals {
+                user_agent: ua,
+                ja4: ctx.tls_fingerprint.as_deref(),
+                has_accept: ctx.request_headers.contains_key(http::header::ACCEPT),
+                has_accept_language: ctx
+                    .request_headers
+                    .contains_key(http::header::ACCEPT_LANGUAGE),
+                recent_block_score: modules.correlation.score_for_ip(ctx.client_ip),
+            };
+            let bs = bot_det.score(&sig);
+            ctx.tx_vars
+                .insert("bot_score".to_string(), bs.score.to_string());
+            if bs.verified_good_bot {
+                ctx.tx_vars.insert("bot_good".to_string(), "1".to_string());
+            }
+            let challenge_enabled = bot_cfg.challenge != ChallengeMode::Off;
+            // Skip a challenge if the client already solved one (valid, unexpired
+            // clearance cookie bound to its IP).
+            let has_clearance =
+                crate::challenge::clearance_valid(&ctx.request_headers, ctx.client_ip);
+            match bs.tier {
+                BotTier::Block => {
                     ctx.decision = WafDecision::Block;
-                    ctx.block_reason = Some(format!("known attack tool: {tool}"));
+                    ctx.block_reason = Some(format!(
+                        "bot score {} ({})",
+                        bs.score,
+                        bs.reasons.join(", ")
+                    ));
                 }
-                BotVerdict::SuspiciousBot => {
-                    ctx.tx_vars
-                        .insert("bot_suspicious".to_string(), "1".to_string());
-                    ctx.anomaly_score = ctx.anomaly_score.saturating_add(2);
-                    // Skip the challenge entirely if the client already solved one
-                    // (valid, unexpired clearance cookie bound to its IP).
-                    if bot_cfg.challenge != ChallengeMode::Off
-                        && !crate::challenge::clearance_valid(&ctx.request_headers, ctx.client_ip)
-                    {
-                        ctx.decision = WafDecision::Challenge;
-                        ctx.block_reason =
-                            Some("suspicious bot UA — browser challenge required".to_string());
+                BotTier::Captcha | BotTier::JsChallenge if challenge_enabled && !has_clearance => {
+                    ctx.decision = WafDecision::Challenge;
+                    ctx.block_reason = Some(format!(
+                        "bot score {} — browser challenge required ({})",
+                        bs.score,
+                        bs.reasons.join(", ")
+                    ));
+                }
+                BotTier::Captcha | BotTier::JsChallenge => {
+                    ctx.add_engine_score("bot", (bs.score / 10) as u32);
+                }
+                BotTier::Allow => {
+                    if bs.score >= 15 {
+                        ctx.add_engine_score("bot", 2);
                     }
                 }
-                BotVerdict::GoodBot(name) => {
-                    ctx.tx_vars.insert("bot_good".to_string(), name.clone());
-                }
-                _ => {}
             }
         }
     }
@@ -2164,10 +3246,15 @@ async fn phase1_headers(
     if ctx.decision == WafDecision::Allow && site.waf.geoip.is_some() {
         let geoip_map = modules.geoip_map.load();
         if let Some(geoip) = geoip_map.get(&site.id) {
-            match geoip.check(ctx.client_ip) {
+            // Resolve the country FIRST and record it whatever the verdict is.
+            // Previously it was only stamped on the Block branch, so every
+            // allowed request logged an empty country and the dashboard map and
+            // country facets saw blocked traffic only — they under-reported by
+            // construction rather than because the data was unavailable.
+            ctx.geo_country = geoip.country(ctx.client_ip);
+            match geoip.classify(ctx.geo_country.as_deref()) {
                 GeoVerdict::Block { country_code } => {
                     ctx.block_reason = Some(format!("country blocked: {country_code}"));
-                    ctx.geo_country = Some(country_code);
                     ctx.decision = WafDecision::Block;
                 }
                 GeoVerdict::Allow | GeoVerdict::Unknown => {}
@@ -2175,10 +3262,127 @@ async fn phase1_headers(
         }
     }
 
+    // --- Edge JWT (bearer-token) validation ---
+    // Verifies signature + expiry + issuer/audience/scopes against a fixed
+    // algorithm allow-list before the request reaches origin. Key material is
+    // a static HS256 secret, a static public-key PEM, or an IdP's JWKS endpoint
+    // (fetched + cached, rotated by `kid`). Reasons are prefixed "jwt:" so the
+    // block renderer returns 401 (not the generic 403) without leaking the
+    // reason to clients. A *present* token that fails validation is always
+    // rejected; `required` only governs whether a *missing* token is allowed.
+    if ctx.decision == WafDecision::Allow {
+        if let Some(ref jwt_cfg) = site.waf.jwt {
+            if jwt_cfg.enable {
+                let bearer = ctx
+                    .request_headers
+                    .get(http::header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| {
+                        s.strip_prefix("Bearer ")
+                            .or_else(|| s.strip_prefix("bearer "))
+                    })
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty());
+                match bearer {
+                    None => {
+                        if jwt_cfg.required {
+                            ctx.decision = WafDecision::Block;
+                            ctx.block_reason = Some("jwt: missing bearer token".to_string());
+                        }
+                    }
+                    Some(token) => {
+                        let policy = JwtPolicy {
+                            algorithms: jwt_cfg.algorithms.clone(),
+                            issuer: jwt_cfg.issuer.clone(),
+                            audience: jwt_cfg.audience.clone(),
+                            required_scopes: jwt_cfg.required_scopes.clone(),
+                            scope_claim: jwt_cfg.scope_claim.clone(),
+                        };
+                        // Select key material in priority order: static HS
+                        // secret → static public PEM → JWKS endpoint. A public
+                        // PEM is parsed as EC when the policy lists an ES*
+                        // algorithm, otherwise as RSA.
+                        let result: Result<(), String> = if let Some(secret) =
+                            jwt_cfg.hs_secret.as_deref()
+                        {
+                            let key = jsonwebtoken::DecodingKey::from_secret(secret.as_bytes());
+                            validate_jwt(token, &key, &policy)
+                        } else if let Some(pem) = jwt_cfg.public_key_pem.as_deref() {
+                            let is_ec = jwt_cfg.algorithms.iter().any(|a| a.starts_with("ES"));
+                            let built = if is_ec {
+                                jsonwebtoken::DecodingKey::from_ec_pem(pem.as_bytes())
+                            } else {
+                                jsonwebtoken::DecodingKey::from_rsa_pem(pem.as_bytes())
+                            };
+                            match built {
+                                Ok(key) => validate_jwt(token, &key, &policy),
+                                Err(_) => Err("misconfigured public key".to_string()),
+                            }
+                        } else if let Some(url) = jwt_cfg.jwks_url.as_deref() {
+                            // JWKS: pick the key by the token's `kid`. An
+                            // unknown `kid` forces a cache refresh (rotation).
+                            match token_header(token) {
+                                Some((Some(kid), _alg)) => {
+                                    let keys = modules.jwks.keys(url, Some(kid.as_str())).await;
+                                    match keys.get(&kid) {
+                                        Some(key) => validate_jwt(token, key, &policy),
+                                        None => Err(format!("unknown key id: {kid}")),
+                                    }
+                                }
+                                Some((None, _)) => {
+                                    Err("token header missing kid (required for JWKS)".to_string())
+                                }
+                                None => Err("malformed token header".to_string()),
+                            }
+                        } else {
+                            Err("no verification key configured".to_string())
+                        };
+                        // A token was presented; if it does not validate, reject
+                        // regardless of `required` (WafMode::Learning still
+                        // downgrades Block → Log via enforce_mode below).
+                        if let Err(reason) = result {
+                            ctx.decision = WafDecision::Block;
+                            ctx.block_reason = Some(format!("jwt: {reason}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // --- gRPC firewall (method / reflection gate) ---
+    // Path-level checks on gRPC traffic before the body is buffered: per-method
+    // allow/deny and server-reflection blocking. Frame/size limits run later in
+    // phase2 once the body is available.
+    if ctx.decision == WafDecision::Allow {
+        if let Some(ref grpc_cfg) = site.waf.grpc {
+            if grpc_cfg.enable {
+                let is_grpc_ct = ctx
+                    .request_headers
+                    .get(http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(is_grpc);
+                if is_grpc_ct {
+                    let limits = GrpcLimits {
+                        max_message_bytes: grpc_cfg.max_message_bytes,
+                        max_frames: grpc_cfg.max_frames,
+                        block_reflection: grpc_cfg.block_reflection,
+                        allowed_methods: grpc_cfg.allowed_methods.clone(),
+                        blocked_methods: grpc_cfg.blocked_methods.clone(),
+                    };
+                    if let Some(reason) = check_grpc_request(ctx.uri.path(), &limits) {
+                        ctx.decision = WafDecision::Block;
+                        ctx.block_reason = Some(format!("grpc: {reason}"));
+                    }
+                }
+            }
+        }
+    }
+
     // --- Rule engine (CRS / SRL) ---
     if ctx.decision == WafDecision::Allow {
         if let Some(engine) = engines.get(&site.id) {
-            engine.evaluate(ctx, Phase::RequestHeaders, site.waf.anomaly_threshold);
+            eval_rules(ctx, engine, Phase::RequestHeaders);
         }
     }
 
@@ -2187,7 +3391,7 @@ async fn phase1_headers(
         for plugin_name in &plugin_runtime.plugin_names() {
             let result = plugin_runtime.evaluate_plugin(plugin_name, ctx).await;
             if result.anomaly_score_delta > 0 {
-                ctx.anomaly_score = ctx.anomaly_score.saturating_add(result.anomaly_score_delta);
+                ctx.add_engine_score("plugin", result.anomaly_score_delta);
             }
             match result.decision {
                 WafDecision::Block => {
@@ -2212,9 +3416,7 @@ async fn phase1_headers(
                         .await;
                     let result2 = plugin_runtime.evaluate_plugin(plugin_name, ctx).await;
                     if result2.anomaly_score_delta > 0 {
-                        ctx.anomaly_score = ctx
-                            .anomaly_score
-                            .saturating_add(result2.anomaly_score_delta);
+                        ctx.add_engine_score("plugin", result2.anomaly_score_delta);
                     }
                     match result2.decision {
                         WafDecision::Block => {
@@ -2238,7 +3440,8 @@ async fn phase1_headers(
         }
     }
 
-    enforce_mode(ctx, &site.waf.mode);
+    let gm = governing_mode(ctx, &site.waf.mode);
+    enforce_mode(ctx, &gm);
     Ok(())
 }
 
@@ -2255,7 +3458,7 @@ fn phase2_body(
     }
 
     if let Some(engine) = engines.get(&site.id) {
-        engine.evaluate(ctx, Phase::RequestBody, site.waf.anomaly_threshold);
+        eval_rules(ctx, engine, Phase::RequestBody);
     }
 
     if let Some(ref ml_cfg) = site.waf.ml {
@@ -2273,9 +3476,13 @@ fn phase2_body(
                 .insert("combined".to_string(), ml_scores.combined_score);
 
             if ml_scores.combined_score >= ml_cfg.sensitivity {
-                let delta: u32 =
-                    ((ml_scores.combined_score - ml_cfg.sensitivity) * 10.0).ceil() as u32;
-                let delta = delta.min(8);
+                // The supervised n-gram classifier is high-precision, so a
+                // confident detection (combined >= sensitivity, e.g. 0.9)
+                // contributes a blocking amount of anomaly score on its own
+                // (scaled to reach the block threshold), rather than only a
+                // small additive nudge. Below sensitivity it contributes 0.
+                let delta: u32 = (ml_scores.combined_score * 12.0).round() as u32;
+                let delta = delta.min(12);
                 if delta > 0 {
                     let reason = if ml_scores.anomaly_score >= ml_cfg.sensitivity {
                         format!(
@@ -2288,7 +3495,7 @@ fn phase2_body(
                             ml_scores.combined_score, ml_cfg.sensitivity
                         )
                     };
-                    ctx.anomaly_score = ctx.anomaly_score.saturating_add(delta);
+                    ctx.add_engine_score("ml", delta);
                     ctx.rule_matches.push(sentinel_core::context::RuleMatch {
                         rule_id: "ML-ANOMALY".to_string(),
                         message: reason,
@@ -2302,24 +3509,269 @@ fn phase2_body(
         }
     }
 
-    if ctx.decision != WafDecision::Block
-        && ctx.anomaly_score > 0
-        && ctx.anomaly_score >= site.waf.anomaly_threshold
-    {
-        ctx.decision = WafDecision::Block;
-        ctx.block_reason = Some(format!(
-            "anomaly score {} >= threshold {}",
-            ctx.anomaly_score, site.waf.anomaly_threshold
-        ));
-    }
+    apply_verdict(ctx, &site.waf);
 
-    enforce_mode(ctx, &site.waf.mode);
+    let gm = governing_mode(ctx, &site.waf.mode);
+    enforce_mode(ctx, &gm);
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Weighted verdict fusion (#11)
+// ---------------------------------------------------------------------------
+
+/// Score at or above which the n-gram classifier refuses to vouch for a payload,
+/// so a weak-evidence rule block stands.
+///
+/// Calibrated from the model's measured score distribution rather than guessed.
+/// On adversarial-benign inputs (natural-language prose carrying SQL/shell
+/// keywords — "union was a great select", "ls 300 lexus", a shared Instagram
+/// link) the model scores 0.0001–0.26; on unambiguous attacks it scores
+/// 0.91–1.00. 0.5 sits at the max-margin point between those clusters (their
+/// geometric mean is ≈0.48): ~2x above the worst benign and ~1.8x below the
+/// weakest attack, so it tolerates drift in both directions.
+///
+/// The previous value, 0.15, sat *below* the benign ceiling, so prose the model
+/// had already scored correctly as benign was still blocked.
+const ML_SUPPRESSION_MAX: f32 = 0.5;
+
+/// Threshold for the site's (1-based) paranoia level from a per-PL list; the
+/// last entry repeats when the list is shorter than the level. `None` if empty.
+fn threshold_for_pl(list: &[u32], pl: u8) -> Option<u32> {
+    if list.is_empty() {
+        return None;
+    }
+    let idx = (pl.max(1) as usize - 1).min(list.len() - 1);
+    Some(list[idx])
+}
+
+/// Weighted fused score: Σ weight[engine]·bucket[engine], plus any anomaly
+/// score not attributed to an engine (counted at weight 1, so no contribution
+/// is ever silently dropped).
+fn fused_score(ctx: &RequestContext, f: &FusionConfig) -> u32 {
+    let mut weighted = 0f32;
+    let mut bucketed: u32 = 0;
+    for (engine, raw) in &ctx.engine_scores {
+        let w = f.weights.get(engine).copied().unwrap_or(1.0).max(0.0);
+        weighted += w * (*raw as f32);
+        bucketed = bucketed.saturating_add(*raw);
+    }
+    let remainder = ctx.anomaly_score.saturating_sub(bucketed);
+    (weighted.round().max(0.0) as u32).saturating_add(remainder)
+}
+
+/// Final verdict fusion. With fusion enabled: weighted score vs per-paranoia
+/// block/limit thresholds (→ Block / Limit / Allow). Otherwise the legacy flat
+/// `anomaly_threshold`. An explicit Block from an earlier phase is preserved.
+fn apply_verdict(ctx: &mut RequestContext, waf: &WafConfig) {
+    if ctx.decision == WafDecision::Block {
+        return;
+    }
+    // The effective threshold, which a per-path override may have lowered or
+    // raised. Falls back to the site's when nothing was stamped (pre-routing
+    // callers and the unit tests below).
+    let threshold = ctx.anomaly_threshold.unwrap_or(waf.anomaly_threshold);
+    match waf.fusion.as_ref().filter(|f| f.enable) {
+        Some(f) => {
+            let score = fused_score(ctx, f);
+            ctx.tx_vars
+                .insert("fused_score".to_string(), score.to_string());
+            let block_t =
+                threshold_for_pl(&f.block_thresholds, waf.paranoia_level).unwrap_or(threshold);
+            if score > 0 && score >= block_t {
+                ctx.decision = WafDecision::Block;
+                ctx.block_reason = Some(format!(
+                    "fused anomaly score {score} >= block threshold {block_t} (PL{})",
+                    waf.paranoia_level
+                ));
+            } else if ctx.decision == WafDecision::Allow {
+                if let Some(limit_t) = threshold_for_pl(&f.limit_thresholds, waf.paranoia_level) {
+                    if score > 0 && score >= limit_t {
+                        ctx.decision = WafDecision::Limit;
+                        ctx.block_reason = Some(format!(
+                            "fused anomaly score {score} >= limit threshold {limit_t} (PL{})",
+                            waf.paranoia_level
+                        ));
+                    }
+                }
+            }
+        }
+        None => {
+            if ctx.anomaly_score > 0 && ctx.anomaly_score >= threshold {
+                // ML suppression: when the n-gram classifier is loaded and
+                // scores the payload as benign (< 0.15), suppress CRS-only
+                // blocks. The ML model acts as a precision layer — if it
+                // doesn't see an attack, a CRS-only match is likely a false
+                // positive on benign prose. Only suppress when:
+                // 1. No coverage rule (99002xx) fired
+                // 2. Anomaly score is moderate (< 20, i.e. 2-3 rules)
+                // 3. ML score is low (< 0.15)
+                let has_coverage_match = ctx
+                    .rule_matches
+                    .iter()
+                    .any(|m| m.rule_id.starts_with("99002"));
+                let ml_benign = sentinel_ml::models::ngram_classifier::is_loaded()
+                    && !has_coverage_match
+                    && ctx.ml_scores.get("payload_attack").copied().unwrap_or(1.0)
+                        < ML_SUPPRESSION_MAX
+                    && ctx.anomaly_score < 20;
+                if !ml_benign {
+                    ctx.decision = WafDecision::Block;
+                    ctx.block_reason = Some(format!(
+                        "anomaly score {} >= threshold {}",
+                        ctx.anomaly_score, threshold
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Run the rule engine for `phase`, disabling its internal flat-threshold
+/// early-exit when fusion is on (rules then only accumulate score and honor
+/// explicit `deny` rules — the proxy makes the final weighted verdict), and
+/// attribute the score delta to the `rules` engine bucket.
+fn eval_rules(ctx: &mut RequestContext, engine: &RuleEngine, phase: Phase) {
+    // The anomaly-THRESHOLD verdict is always made by `apply_verdict`, never by
+    // the rule VM's short-circuit, so 0 is passed here unconditionally to disable
+    // it. Rules only accumulate score in this call.
+    //
+    // This is a precision requirement, not a style choice. `apply_verdict` is the
+    // only place the n-gram classifier can veto a weak-evidence block, and it runs
+    // in phase 2. While the VM blocked on its own at phase 1, the request returned
+    // at the phase-1 Block check — before phase 2 existed — so the FP-suppression
+    // layer was unreachable for every arg- or header-borne block. The model scored
+    // that traffic correctly as benign and was simply never asked.
+    //
+    // Rules with an explicit `deny`/`block` action are unaffected: they set the
+    // decision directly and still stop the request in phase 1.
+    let threshold = 0;
+    let before = ctx.anomaly_score;
+    let matches_before = ctx.rule_matches.len();
+    engine.evaluate(ctx, phase, threshold);
+    let delta = ctx.anomaly_score.saturating_sub(before);
+    if delta > 0 {
+        *ctx.engine_scores.entry("rules".to_string()).or_insert(0) += delta;
+    }
+    // Metrics: each rule that matched during this phase is one rule-hit event.
+    // `rule_matches` only grows here, so the difference is the new-match count.
+    let new_matches = ctx.rule_matches.len().saturating_sub(matches_before);
+    for _ in 0..new_matches {
+        inc_rule_hits();
+    }
+}
+
+/// Whether one operator-authored rule is actually compiled into a live engine,
+/// and why not when it isn't.
+///
+/// This exists because "enabled" in the control plane has repeatedly meant
+/// "stored", not "running". A rule can be stored, enabled, listed in the UI, and
+/// still not be enforced — it failed to parse, or its id collided with a shipped
+/// rule. The data plane is the only component that knows, because it owns the
+/// compiler, so it reports back and the UI shows the truth instead of an
+/// assumption.
+#[derive(Clone, Debug, serde::Serialize)]
+struct InlineRuleDiag {
+    name: String,
+    enforced: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+static INLINE_RULE_DIAGS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::BTreeMap<String, InlineRuleDiag>>,
+> = std::sync::OnceLock::new();
+
+fn inline_rule_diags(
+) -> &'static std::sync::Mutex<std::collections::BTreeMap<String, InlineRuleDiag>> {
+    INLINE_RULE_DIAGS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+/// Wipe the registry at the start of a full engine rebuild.
+///
+/// Without this a rule the operator has since deleted keeps reporting "enforced"
+/// forever, which is the same lie in the opposite direction.
+fn reset_inline_rule_diags() {
+    if let Ok(mut m) = inline_rule_diags().lock() {
+        m.clear();
+    }
+}
+
+/// Record one rule's outcome. Keyed by name, which is unique per tenant; a rule
+/// shared by several sites either parses everywhere or nowhere, so aggregating by
+/// name loses nothing and keeps the heartbeat small.
+fn record_inline_rule_diag(name: &str, enforced: bool, error: Option<String>) {
+    if let Ok(mut m) = inline_rule_diags().lock() {
+        // A failure anywhere is the interesting outcome, so never let a later
+        // success overwrite a recorded error.
+        if let Some(existing) = m.get(name) {
+            if !existing.enforced && enforced {
+                return;
+            }
+        }
+        m.insert(
+            name.to_string(),
+            InlineRuleDiag {
+                name: name.to_string(),
+                enforced,
+                error,
+            },
+        );
+    }
+}
+
+fn inline_rule_diag_snapshot() -> Vec<InlineRuleDiag> {
+    inline_rule_diags()
+        .lock()
+        .map(|m| m.values().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// The per-path override governing `path`, or None. Longest matching prefix wins,
+/// so `/api/v2/` beats `/api/` for a `/api/v2/orders` request regardless of the
+/// order an operator happened to list them in.
+fn match_path_override<'a>(
+    waf: &'a sentinel_core::config::WafConfig,
+    path: &str,
+) -> Option<&'a sentinel_core::config::PathOverride> {
+    waf.path_overrides
+        .iter()
+        .filter(|o| !o.path_prefix.is_empty() && path.starts_with(&o.path_prefix))
+        .max_by_key(|o| o.path_prefix.len())
+}
+
+/// The mode governing this request: the effective one stamped at routing time
+/// (site policy plus any path override), falling back to the site's own mode.
+///
+/// The fallback matters: several call sites run before routing has stamped a
+/// mode, and defaulting to the site policy there is correct — a request that
+/// never matched a path cannot be governed by a path override.
+fn governing_mode(ctx: &RequestContext, site_mode: &WafMode) -> WafMode {
+    ctx.enforcement_mode
+        .clone()
+        .unwrap_or_else(|| site_mode.clone())
+}
+
 fn enforce_mode(ctx: &mut RequestContext, mode: &WafMode) {
+    // `off` for a path means the operator has deliberately taken the WAF out of
+    // the way there (static assets, a health endpoint). Any verdict the rules
+    // reached is discarded rather than downgraded to Log, because unlike learning
+    // mode there is nothing to learn from a path that is not being protected.
+    if *mode == WafMode::Off {
+        if matches!(
+            ctx.decision,
+            WafDecision::Block | WafDecision::Challenge | WafDecision::Limit
+        ) {
+            ctx.decision = WafDecision::Allow;
+            ctx.would_block = false;
+        }
+        return;
+    }
     if *mode == WafMode::Learning
-        && (ctx.decision == WafDecision::Block || ctx.decision == WafDecision::Challenge)
+        && matches!(
+            ctx.decision,
+            WafDecision::Block | WafDecision::Challenge | WafDecision::Limit
+        )
     {
         ctx.decision = WafDecision::Log;
         // Record the would-have-blocked signal for the learning report. We keep
@@ -2333,10 +3785,26 @@ fn enforce_mode(ctx: &mut RequestContext, mode: &WafMode) {
 // Module / engine builders
 // ---------------------------------------------------------------------------
 
-fn build_rule_engines(cfg: &SentinelConfig) -> RuleEngineMap {
+/// Build the per-site rule engines. `previous` is the currently-live engine map
+/// (empty at startup): on a rule-compile failure we FAIL SAFE by retaining that
+/// site's last-good engine rather than silently dropping it to zero rules. This
+/// closes the reload fail-open hole where one malformed CRS/SRL push from the
+/// control plane would unprotect a previously-protected site cluster-wide.
+fn build_rule_engines(cfg: &SentinelConfig, previous: &RuleEngineMap) -> RuleEngineMap {
+    // Rebuilt from scratch every reload, so a rule the operator has since deleted
+    // stops claiming to be enforced.
+    reset_inline_rule_diags();
     let mut map = RuleEngineMap::new();
     for site in &cfg.sites {
-        if site.waf.mode == WafMode::Off || site.waf.rules.is_empty() {
+        // A site with no rule FILES may still have operator-authored inline rules
+        // from the control plane; skipping on `rules.is_empty()` alone would build
+        // no engine and silently drop them. In practice a site configured through
+        // the dashboard always has CRS files, so this only bites the
+        // inline-rules-only case — which is exactly how a minimal virtual-patch-only
+        // site would be set up.
+        if site.waf.mode == WafMode::Off
+            || (site.waf.rules.is_empty() && site.waf.inline_rules.is_empty())
+        {
             continue;
         }
         match load_site_engine(site) {
@@ -2345,7 +3813,15 @@ fn build_rule_engines(cfg: &SentinelConfig) -> RuleEngineMap {
                 map.insert(site.id.clone(), engine);
             }
             Err(e) => {
-                warn!(site = %site.id, "rule engine load failed — site unprotected: {e:#}");
+                // RuleEngine is Arc-backed → clone is cheap.
+                if let Some(prev) = previous.get(&site.id) {
+                    warn!(site = %site.id, rules = prev.rule_count(),
+                        "rule engine reload FAILED — retaining last-good ruleset, new rules rejected: {e:#}");
+                    map.insert(site.id.clone(), prev.clone());
+                } else {
+                    warn!(site = %site.id,
+                        "rule engine load failed and no prior ruleset — site has NO signature protection until the config is fixed: {e:#}");
+                }
             }
         }
     }
@@ -2360,6 +3836,314 @@ fn build_dlp_map(cfg: &SentinelConfig) -> DlpMap {
         }
     }
     map
+}
+
+/// Trusted downstream proxy CIDRs (`SENTINEL_TRUSTED_PROXIES`, comma-separated).
+/// Only when the immediate TCP peer is inside one of these do we believe its
+/// `X-Forwarded-For`. Empty (default) = never trust XFF, so a direct client
+/// cannot spoof its source IP past our per-IP defenses.
+fn trusted_proxies() -> &'static [IpNet] {
+    static P: std::sync::OnceLock<Vec<IpNet>> = std::sync::OnceLock::new();
+    P.get_or_init(|| {
+        std::env::var("SENTINEL_TRUSTED_PROXIES")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|c| parse_block_cidr(c.trim()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+fn is_trusted_proxy(ip: std::net::IpAddr) -> bool {
+    trusted_proxies().iter().any(|n| n.contains(&ip))
+}
+
+/// Resolve the real client IP from `X-Forwarded-For`, but only when `peer` is a
+/// trusted proxy. Walks the XFF list right-to-left (the right-most entry is what
+/// our trusted proxy actually observed) and returns the first address that is
+/// not itself a trusted proxy — so a client-supplied left-most spoof can never
+/// win, and proxy chains resolve correctly. Returns `None` (keep the TCP peer)
+/// when the peer is untrusted or no usable XFF address is present.
+fn resolve_client_ip(
+    peer: std::net::IpAddr,
+    headers: &http::HeaderMap,
+) -> Option<std::net::IpAddr> {
+    resolve_client_ip_with(peer, headers, is_trusted_proxy)
+}
+
+/// Decide whether a request is from a blocklisted address.
+///
+/// Checks the transport peer AND the resolved client IP. Extracted so the decision is
+/// testable without constructing a whole server: the bug this replaced was invisible in
+/// unit terms (the call looked correct) and only wrong in a topology, which is exactly
+/// the sort of thing that needs an explicit test rather than a reading.
+fn blocklist_hit(
+    peer: std::net::IpAddr,
+    headers: &http::HeaderMap,
+    is_blocked: impl Fn(std::net::IpAddr) -> bool,
+    is_trusted: impl Fn(std::net::IpAddr) -> bool + Copy,
+) -> bool {
+    if is_blocked(peer) {
+        return true;
+    }
+    // Only consults XFF when the peer is a trusted proxy, so an untrusted client cannot
+    // use the header to have someone else blocked — or to slip past its own block.
+    resolve_client_ip_with(peer, headers, is_trusted).is_some_and(is_blocked)
+}
+
+/// Testable core: `is_trusted` decides which addresses are trusted proxies.
+fn resolve_client_ip_with(
+    peer: std::net::IpAddr,
+    headers: &http::HeaderMap,
+    is_trusted: impl Fn(std::net::IpAddr) -> bool,
+) -> Option<std::net::IpAddr> {
+    if !is_trusted(peer) {
+        return None;
+    }
+    let xff = headers.get("x-forwarded-for")?.to_str().ok()?;
+    xff.split(',')
+        .rev()
+        .filter_map(|p| p.trim().parse::<std::net::IpAddr>().ok())
+        .find(|ip| !is_trusted(*ip))
+        .or_else(|| {
+            // All hops trusted → fall back to the left-most parseable address.
+            xff.split(',')
+                .filter_map(|p| p.trim().parse::<std::net::IpAddr>().ok())
+                .next()
+        })
+}
+
+/// CIDRs whose addresses are SHARED EGRESS rather than identities.
+///
+/// Configure with `SENTINEL_SHARED_EGRESS_CIDRS` (comma-separated CIDRs or bare IPs),
+/// e.g. a corporate NAT range, a CGNAT block, or a VPN concentrator's public address.
+///
+/// # Why this exists
+///
+/// Every per-IP reputation mechanism here assumes an IP identifies an actor. Behind NAT
+/// that assumption is false — one address is thousands of people — and the mechanisms
+/// then punish bystanders for a neighbour's behaviour:
+///
+///   * The correlation engine adds up to 8 anomaly score for an IP with recent blocks.
+///     With the default `anomaly_threshold` of 5, that alone exceeds the threshold, so a
+///     COMPLETELY CLEAN request from a shared address gets blocked on reputation with no
+///     rule match at all. Reproduced at 500 rps: a target list of 9 clean requests to 1
+///     attack returned 99.4% 403.
+///   * Worse, the XDP auto-ban excludes only PRIVATE ranges, and a corporate NAT egress
+///     address is PUBLIC. After `SENTINEL_XDP_AUTOBAN_BLOCKS` (default 20) blocks, one
+///     person running a scanner gets the entire office's egress IP dropped in-kernel.
+///     That is a hard cutoff for every colleague, not a degradation.
+///
+/// Listing a range here means "this address is not an actor": no correlation escalation
+/// and no auto-ban. Detection is unaffected — an attack from a shared address is still
+/// blocked on its own merits by the rules. What stops is holding the address responsible
+/// for its history.
+fn shared_egress_nets() -> &'static [IpNet] {
+    static NETS: std::sync::OnceLock<Vec<IpNet>> = std::sync::OnceLock::new();
+    NETS.get_or_init(|| {
+        std::env::var("SENTINEL_SHARED_EGRESS_CIDRS")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .filter_map(|s| parse_block_cidr(s.trim()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// Whether `ip` is shared egress and therefore exempt from per-IP reputation.
+fn is_shared_egress(ip: std::net::IpAddr) -> bool {
+    shared_egress_nets().iter().any(|n| n.contains(&ip))
+}
+
+/// Hard cap on the correlation engine's anomaly-score contribution.
+///
+/// Default 4, which is deliberately BELOW the default `anomaly_threshold` of 5 so that
+/// reputation can tip a borderline request over the line but can never, by itself,
+/// block a request that matched no rule. Before this cap the "persistent attacker"
+/// contribution was 8 — larger than the threshold — so reputation alone decided.
+///
+/// If you lower a site's `anomaly_threshold` below 5, lower this to match, or reputation
+/// regains the ability to block clean traffic on its own.
+fn correlation_max_score() -> u32 {
+    static MAX: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("SENTINEL_CORRELATION_MAX_SCORE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(4)
+    })
+}
+
+/// Parse a `SENTINEL_XDP_BLOCK` entry — either a bare IP (`1.2.3.4`, treated as
+/// a /32 or /128) or a CIDR (`10.0.0.0/8`) — into an [`IpNet`].
+fn parse_block_cidr(s: &str) -> Option<IpNet> {
+    let (addr_str, pfx) = match s.split_once('/') {
+        Some((a, p)) => (a, Some(p.trim().parse::<u8>().ok()?)),
+        None => (s, None),
+    };
+    let addr: std::net::IpAddr = addr_str.trim().parse().ok()?;
+    let prefix = pfx.unwrap_or(if addr.is_ipv4() { 32 } else { 128 });
+    Some(IpNet::new(addr, prefix))
+}
+
+/// Build the eBPF/XDP configuration from the environment. Kernel XDP is
+/// opt-in and needs CAP_BPF/CAP_NET_ADMIN plus the `kernel` build feature;
+/// otherwise the manager runs the userspace software fast-fail:
+///   `SENTINEL_XDP_ENABLE=1`                    — attempt kernel XDP attach
+///   `SENTINEL_XDP_IFACE=eth0`                  — interface to attach to
+///   `SENTINEL_XDP_BLOCK=1.2.3.4,10.0.0.0/8`    — seed CIDRs to drop at XDP
+fn build_ebpf_config() -> EbpfConfig {
+    let enable_kernel = std::env::var("SENTINEL_XDP_ENABLE")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    let interface = std::env::var("SENTINEL_XDP_IFACE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "eth0".to_string());
+    let blocklist: Vec<IpNet> = std::env::var("SENTINEL_XDP_BLOCK")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(parse_block_cidr)
+        .collect();
+    if enable_kernel || !blocklist.is_empty() {
+        info!(
+            interface = %interface,
+            enable_kernel,
+            seed_entries = blocklist.len(),
+            "eBPF/XDP config from environment"
+        );
+    }
+    EbpfConfig {
+        interface,
+        blocklist,
+        enable_kernel,
+        stats_interval_secs: 5,
+    }
+}
+
+/// XDP auto-ban policy: when a source IP is blocked by the WAF often enough
+/// within the correlation window, add it to the eBPF blocklist so its packets
+/// are dropped in-kernel (or by the userspace fast-fail in software mode).
+#[derive(Clone, Copy)]
+struct AutoBanConfig {
+    enabled: bool,
+    threshold_blocks: u32,
+    include_private: bool,
+}
+
+/// Read the auto-ban policy from the environment (once):
+///   `SENTINEL_XDP_AUTOBAN=0`                 — disable (default on)
+///   `SENTINEL_XDP_AUTOBAN_BLOCKS=20`         — blocks-in-window before banning
+///   `SENTINEL_XDP_AUTOBAN_INCLUDE_PRIVATE=1` — also ban RFC1918/loopback (test only)
+fn autoban_config() -> AutoBanConfig {
+    static CFG: std::sync::OnceLock<AutoBanConfig> = std::sync::OnceLock::new();
+    *CFG.get_or_init(|| {
+        let threshold = std::env::var("SENTINEL_XDP_AUTOBAN_BLOCKS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        let enabled = std::env::var("SENTINEL_XDP_AUTOBAN")
+            .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(true)
+            && threshold != Some(0);
+        AutoBanConfig {
+            enabled,
+            threshold_blocks: threshold.unwrap_or(20).max(1),
+            include_private: std::env::var("SENTINEL_XDP_AUTOBAN_INCLUDE_PRIVATE")
+                .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(false),
+        }
+    })
+}
+
+/// IPs already pushed to the eBPF blocklist by the auto-ban, so we ban + log
+/// each offender once instead of on every subsequent block.
+fn xdp_autobanned() -> &'static DashSet<std::net::IpAddr> {
+    static SET: std::sync::OnceLock<DashSet<std::net::IpAddr>> = std::sync::OnceLock::new();
+    SET.get_or_init(DashSet::new)
+}
+
+/// Whether an IP is eligible for auto-ban. Private/loopback/link-local/etc. are
+/// excluded by default so the single-node demo (where every client appears as
+/// the docker gateway) never bans itself; a real edge deployment sees public
+/// client IPs and bans normally.
+fn autoban_eligible(ip: std::net::IpAddr, include_private: bool) -> bool {
+    use std::net::IpAddr;
+    // Shared egress is never auto-banned, regardless of include_private. A corporate NAT
+    // or CGNAT address is PUBLIC, so the private-range carve-out below does not cover it
+    // — without this, one scanner behind an office NAT gets every colleague dropped in
+    // the kernel. This check is first precisely because include_private would otherwise
+    // bypass it.
+    if is_shared_egress(ip) {
+        return false;
+    }
+    if include_private {
+        return !ip.is_unspecified();
+    }
+    match ip {
+        IpAddr::V4(v4) => {
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_unspecified()
+                || v4.is_documentation())
+        }
+        IpAddr::V6(v6) => {
+            let seg0 = v6.segments()[0];
+            let unique_local = (seg0 & 0xfe00) == 0xfc00; // fc00::/7
+            let link_local = (seg0 & 0xffc0) == 0xfe80; // fe80::/10
+            !(v6.is_loopback() || v6.is_unspecified() || unique_local || link_local)
+        }
+    }
+}
+
+/// Record a WAF block against `ip` and, if it has crossed the auto-ban
+/// threshold, push it to the eBPF/XDP blocklist (idempotent; logged once).
+fn note_block(state: &ServerState, ip: std::net::IpAddr) {
+    state.modules.correlation.record_block(ip);
+    let ab = autoban_config();
+    if !ab.enabled || !autoban_eligible(ip, ab.include_private) {
+        return;
+    }
+    if state.modules.correlation.block_count_for_ip(ip) >= ab.threshold_blocks
+        && xdp_autobanned().insert(ip)
+    {
+        state.ebpf.block_ip(ip);
+        warn!(
+            %ip,
+            threshold = ab.threshold_blocks,
+            mode = %state.ebpf.mode(),
+            "auto-banned repeat offender — added to eBPF/XDP blocklist"
+        );
+    }
+}
+
+/// Seed the eBPF blocklist from operator-configured IP-reputation block CIDRs
+/// (`waf.ip_reputation.block`). These are static, curated, low-volume bans, so
+/// mirroring them into XDP drops those sources in-kernel from the first packet.
+fn seed_ebpf_from_ip_reputation(ebpf: &EbpfManager, cfg: &SentinelConfig) {
+    let mut seeded = 0usize;
+    for site in &cfg.sites {
+        let Some(rep) = site.waf.ip_reputation.as_ref() else {
+            continue;
+        };
+        for cidr in &rep.block {
+            if let Some(net) = parse_block_cidr(cidr) {
+                ebpf.block_net(net);
+                seeded += 1;
+            }
+        }
+    }
+    if seeded > 0 {
+        info!(
+            entries = seeded,
+            "seeded eBPF blocklist from ip_reputation.block"
+        );
+    }
 }
 
 fn build_ip_reputation(cfg: &SentinelConfig, feed_cidrs: &[(String, Vec<String>)]) -> IpReputation {
@@ -2451,6 +4235,80 @@ fn load_site_engine(site: &SiteConfig) -> anyhow::Result<RuleEngine> {
                 .map_err(|e| anyhow!("SRL parse error in '{path_str}': {e}"))?
         };
         merged.items.extend(file.items);
+    }
+
+    // Operator-authored rules from the control plane's `rules` table.
+    //
+    // Deliberately NOT fatal on a parse error, unlike the file loop above. A rule
+    // file that fails to parse means the shipped ruleset is broken and failing the
+    // whole engine is right — the caller keeps the last-good engine. But these rules
+    // are typed into a web form, so a typo is routine, and letting one bad row take
+    // the site's ENTIRE ruleset offline (including every CRS rule) would turn a
+    // small operator mistake into an outage. Skip the bad rule, keep the rest, and
+    // make the skip loud enough to notice.
+    let file_rule_ids: std::collections::HashSet<u32> = merged
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            RuleItem::Rule(r) => Some(r.id),
+            _ => None,
+        })
+        .collect();
+
+    for inline in &site.waf.inline_rules {
+        let mut accepted = 0usize;
+        let parsed = match sentinel_rules::parse_srl(&inline.dsl) {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(
+                    site = %site.id,
+                    rule = %inline.name,
+                    error = %e,
+                    "CUSTOM RULE NOT ENFORCED: it does not parse. Every other rule for \
+                     this site is unaffected; fix or disable this one."
+                );
+                record_inline_rule_diag(&inline.name, false, Some(format!("does not parse: {e}")));
+                continue;
+            }
+        };
+        for item in parsed.items {
+            // A custom rule reusing a shipped rule's id would make scoring and
+            // exclusions ambiguous — an exclusion for that id could not say which
+            // rule it meant. Refuse the duplicate rather than silently shadowing.
+            if let RuleItem::Rule(r) = &item {
+                if file_rule_ids.contains(&r.id) {
+                    warn!(
+                        site = %site.id,
+                        rule = %inline.name,
+                        id = r.id,
+                        "CUSTOM RULE NOT ENFORCED: id collides with a rule already \
+                         loaded from the shipped ruleset. Give it an unused id."
+                    );
+                    record_inline_rule_diag(
+                        &inline.name,
+                        false,
+                        Some(format!(
+                            "rule id {} is already used by the shipped ruleset; pick an unused id",
+                            r.id
+                        )),
+                    );
+                    continue;
+                }
+            }
+            merged.items.push(item);
+            accepted += 1;
+        }
+        // Reported only when something actually made it into the engine: a DSL
+        // that parses to zero rules is not enforcing anything either.
+        record_inline_rule_diag(
+            &inline.name,
+            accepted > 0,
+            if accepted > 0 {
+                None
+            } else {
+                Some("parsed, but defined no rules".to_string())
+            },
+        );
     }
 
     // Paranoia level gating.
@@ -2557,6 +4415,43 @@ fn build_plugin_runtime(cfg: &SentinelConfig) -> anyhow::Result<PluginRuntime> {
         info!(loaded, failed, "plugin runtime built");
     }
     Ok(rt)
+}
+
+/// Cache of plugins uploaded through the control plane: name → (sha256, module).
+///
+/// Shared between the plugin-sync task (which fills it) and the config hot-reload
+/// watcher (which reads it). Both rebuild the plugin runtime, and a rebuild that
+/// knows only about manifest plugins silently DROPS every uploaded one — so both
+/// must build from the same complete picture.
+type UploadedPlugins = Arc<DashMap<String, (String, Vec<u8>)>>;
+
+/// Build a plugin runtime holding BOTH manifest-configured and uploaded plugins.
+///
+/// Every rebuild must go through here. Calling `build_plugin_runtime` directly and
+/// swapping the result in unloads all uploaded plugins, which is a silent
+/// protection outage: the module is still installed and enabled in the UI, the
+/// node reports no error, and the plugin simply stops running.
+fn build_full_plugin_runtime(
+    cfg: &SentinelConfig,
+    uploaded: &UploadedPlugins,
+) -> anyhow::Result<(PluginRuntime, Vec<String>, usize)> {
+    let mut rt = build_plugin_runtime(cfg)?;
+    let mut loaded = Vec::new();
+    let mut rejected = 0usize;
+    for entry in uploaded.iter() {
+        let (name, (_, wasm)) = (entry.key(), entry.value());
+        match rt.load_plugin(name, wasm) {
+            Ok(()) => loaded.push(name.clone()),
+            Err(e) => {
+                // A module that will not compile is skipped individually rather
+                // than taking the whole plugin set down with it.
+                warn!(plugin = %name, "uploaded plugin failed to compile: {e:#}");
+                rejected += 1;
+            }
+        }
+    }
+    loaded.sort();
+    Ok((rt, loaded, rejected))
 }
 
 // ---------------------------------------------------------------------------
@@ -2853,12 +4748,81 @@ fn inject_security_headers(headers: &mut http::HeaderMap, cfg: Option<&SecurityH
 /// stash the clearance cookies on `ctx` and return `None`, letting the request
 /// continue to origin with its method and body intact; the cookies are attached
 /// to the origin response by the caller.
-fn challenge_response(ctx: &mut RequestContext, mode: ChallengeMode) -> Option<Response<BoxBody>> {
-    if matches!(
-        mode,
-        ChallengeMode::Recaptcha | ChallengeMode::Hcaptcha | ChallengeMode::Turnstile
-    ) {
-        warn_unsupported_challenge(mode);
+async fn challenge_response(
+    ctx: &mut RequestContext,
+    mode: ChallengeMode,
+    bot: Option<&BotDetectionConfig>,
+) -> Option<Response<BoxBody>> {
+    // Third-party interactive CAPTCHA path (reCAPTCHA / hCaptcha / Turnstile).
+    // Requires configured provider credentials; otherwise we fall through to the
+    // native Proof-of-Work challenge so the client is never left un-challenged.
+    if let Some(kind) = captcha::CaptchaKind::from_mode(mode) {
+        let provider = bot.and_then(|b| kind.provider(b));
+        match provider {
+            Some(p) if !p.sitekey.is_empty() && !p.secret.is_empty() => {
+                // Already cleared (any subsystem) → don't re-challenge.
+                if challenge::clearance_valid(&ctx.request_headers, ctx.client_ip) {
+                    return None;
+                }
+                // A token from a prior solve → verify it server-side (single-use).
+                if let Some(token) = challenge::captcha_token(&ctx.request_headers) {
+                    let ok = captcha::verify(
+                        kind,
+                        &p.secret,
+                        &token,
+                        &ctx.client_ip.to_string(),
+                        p.score,
+                    )
+                    .await;
+                    if ok {
+                        let set_cookie = challenge::clearance_cookie(ctx.client_ip);
+                        let expire = challenge::expire_captcha_cookie();
+                        let safe = matches!(ctx.method, http::Method::GET | http::Method::HEAD);
+                        if !safe {
+                            ctx.pending_set_cookies.push(set_cookie);
+                            ctx.pending_set_cookies.push(expire);
+                            return None;
+                        }
+                        let location = ctx
+                            .uri
+                            .path_and_query()
+                            .map(|p| p.as_str().to_string())
+                            .unwrap_or_else(|| "/".to_string());
+                        return Some(
+                            Response::builder()
+                                .status(StatusCode::FOUND)
+                                .header(header::LOCATION, location)
+                                .header(header::SET_COOKIE, set_cookie)
+                                .header(header::SET_COOKIE, expire)
+                                .header(header::CACHE_CONTROL, "no-store")
+                                .body(
+                                    Full::new(Bytes::new())
+                                        .map_err(|never: Infallible| match never {})
+                                        .boxed(),
+                                )
+                                .unwrap(),
+                        );
+                    }
+                    // Verification failed → expire the bad token and re-serve.
+                    ctx.pending_set_cookies
+                        .push(challenge::expire_captcha_cookie());
+                }
+                return Some(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                        .header(header::CACHE_CONTROL, "no-store")
+                        .header("X-Sentinel-Challenge", "captcha")
+                        .body(
+                            Full::new(Bytes::from(captcha::interstitial(kind, &p.sitekey)))
+                                .map_err(|never: Infallible| match never {})
+                                .boxed(),
+                        )
+                        .unwrap(),
+                );
+            }
+            _ => warn_captcha_misconfigured(mode),
+        }
     }
     match challenge::resolve(&ctx.request_headers, ctx.client_ip, &ctx.uri) {
         challenge::Outcome::Pass => None,
@@ -2905,9 +4869,10 @@ fn challenge_response(ctx: &mut RequestContext, mode: ChallengeMode) -> Option<R
     }
 }
 
-/// Warn at most once per provider that a configured third-party CAPTCHA mode is
-/// not implemented and native Proof-of-Work is served instead.
-fn warn_unsupported_challenge(mode: ChallengeMode) {
+/// Warn at most once per provider that a third-party CAPTCHA mode is selected
+/// but its site key / secret are missing, so native Proof-of-Work is served
+/// instead (fail-safe — a suspicious client is still challenged).
+fn warn_captcha_misconfigured(mode: ChallengeMode) {
     use std::sync::atomic::{AtomicU8, Ordering};
     static WARNED: AtomicU8 = AtomicU8::new(0);
     let bit = match mode {
@@ -2918,10 +4883,24 @@ fn warn_unsupported_challenge(mode: ChallengeMode) {
     };
     if WARNED.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
         warn!(
-            "challenge mode {:?} is configured but not implemented; serving native Proof-of-Work instead",
+            "challenge mode {:?} selected but sitekey/secret missing; serving native Proof-of-Work instead",
             mode
         );
     }
+}
+
+/// Response for a LIMIT verdict (weighted fusion soft-deny). Uses the site's
+/// configured `limit_status` (default 429 Too Many Requests).
+fn limit_response(ctx: &RequestContext, site: Option<&SiteConfig>) -> Response<BoxBody> {
+    let status = site
+        .and_then(|s| s.waf.fusion.as_ref())
+        .and_then(|f| StatusCode::from_u16(f.limit_status).ok())
+        .unwrap_or(StatusCode::TOO_MANY_REQUESTS);
+    let reason = ctx
+        .block_reason
+        .as_deref()
+        .unwrap_or("Request rate-limited by Sentinel WAF");
+    error_response(status, reason)
 }
 
 fn block_response(ctx: &RequestContext) -> Response<BoxBody> {
@@ -3386,6 +5365,12 @@ fn health_response(state: &ServerState) -> Response<BoxBody> {
         "sites": site_count,
         "listeners": listeners,
         "http3": http3,
+        // Non-zero means this node enforced blocks it could not record, so
+        // waf_events undercounts attacks for that window. Surfaced here as well as
+        // in /metrics because /healthz is what an operator reads first, and a
+        // silently incomplete audit trail is the failure this counter exists to
+        // make visible.
+        "history_shed": history_shed_total(),
         "upstreams_healthy": pool_stats.healthy,
         "upstreams_total": pool_stats.total,
         "version": env!("CARGO_PKG_VERSION"),
@@ -3400,6 +5385,37 @@ fn health_response(state: &ServerState) -> Response<BoxBody> {
                 .map_err(|never: Infallible| match never {})
                 .boxed(),
         )
+        .unwrap()
+}
+
+// Kubernetes readiness: 200 only when the WAF config has synced (sites > 0),
+// otherwise 503. Cheap and self-contained (no upstream hit) so kubelet can poll
+// it every second. Distinct from /healthz, which is liveness — a node whose
+// process is up but hasn't synced rules is live-but-not-ready.
+fn readyz_response(state: &ServerState) -> Response<BoxBody> {
+    let site_count = state.config.load().sites.len();
+    let draining = state.draining.load(std::sync::atomic::Ordering::Relaxed);
+    let ready = site_count > 0 && !draining;
+    let (status, body) = if ready {
+        (
+            StatusCode::OK,
+            serde_json::json!({ "status": "ready", "sites": site_count }),
+        )
+    } else {
+        let reason = if draining {
+            "draining"
+        } else {
+            "config not synced"
+        };
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({ "status": "not_ready", "reason": reason, "sites": site_count }),
+        )
+    };
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(full_body(Bytes::from(body.to_string())))
         .unwrap()
 }
 
@@ -3420,6 +5436,34 @@ fn error_response(status: StatusCode, message: &str) -> Response<BoxBody> {
         .unwrap()
 }
 
+/// `GET /metrics` — the global WAF metrics registry rendered in Prometheus text
+/// exposition format. Content-Type follows the Prometheus text format spec so
+/// scrapers parse it without a manual override.
+fn metrics_response() -> Response<BoxBody> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )
+        .body(full_body(Bytes::from(prometheus_text())))
+        .unwrap()
+}
+
+/// Load-shed response returned when the global in-flight request limit is
+/// saturated. `503` + `Retry-After: 1` tells well-behaved clients and upstream
+/// load balancers to back off and retry rather than hammer an overloaded node.
+fn overloaded_response() -> Response<BoxBody> {
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header(header::RETRY_AFTER, "1")
+        .header(header::CONTENT_TYPE, "text/plain")
+        .body(full_body(Bytes::from_static(
+            b"503 Service Unavailable: server at capacity\n",
+        )))
+        .unwrap()
+}
+
 fn log_request(ctx: &RequestContext) {
     let status = ctx.response_status.map(|s| s.as_u16()).unwrap_or(0);
     let rule_ids: Vec<&str> = ctx
@@ -3436,6 +5480,7 @@ fn log_request(ctx: &RequestContext) {
         site = ctx.site_id.as_deref().unwrap_or("-"),
         status,
         latency_ms = ctx.elapsed_ms(),
+        ja4 = ctx.tls_fingerprint.as_deref().unwrap_or("-"),
         anomaly_score = ctx.anomaly_score,
         rule_matches = ctx.rule_matches.len(),
         rule_ids = rule_ids.join(","),
@@ -3449,6 +5494,7 @@ fn log_request(ctx: &RequestContext) {
     // flusher, when ClickHouse is configured). Cheap; no-op when CH is off.
     let blocked = matches!(ctx.decision, WafDecision::Block | WafDecision::Challenge);
     record_traffic(
+        ctx.tenant_id.as_deref().unwrap_or(""),
         ctx.site_id.as_deref().unwrap_or("-"),
         blocked,
         ctx.elapsed_ms(),
@@ -3460,61 +5506,162 @@ fn log_request(ctx: &RequestContext) {
 // Per-second traffic accumulator → ClickHouse traffic_buckets
 // ---------------------------------------------------------------------------
 
-#[derive(Default)]
+/// Upper bounds (ms) of the per-site latency buckets. Mirrors the telemetry
+/// histogram's bounds so a site's p99 is comparable to the global one.
+const SITE_LAT_BOUNDS: [f64; 15] = [
+    0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10_000.0,
+    30_000.0,
+];
+const SITE_LAT_BUCKETS: usize = SITE_LAT_BOUNDS.len() + 1;
+
+/// Per-(tenant,site) counters for the current rollup window.
+///
+/// Every field is atomic so recording needs no exclusive access. Previously this
+/// struct was plain `u64`/`Vec<f64>` behind ONE process-wide
+/// `Mutex<HashMap<..>>`: with ClickHouse enabled every request serialized through
+/// that single lock, and each also pushed onto a `Vec` (up to 4096 f64s per site)
+/// that had to be sorted on every drain.
 struct SiteAccum {
-    reqs: u64,
-    blocked: u64,
-    lat: Vec<f64>,
+    reqs: AtomicU64,
+    blocked: AtomicU64,
+    /// Latency distribution as fixed buckets — bounded memory, no sorting, and no
+    /// per-site sample cap to distort p99 under load.
+    lat: [AtomicU64; SITE_LAT_BUCKETS],
 }
 
-static TRAFFIC_ACC: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, SiteAccum>>,
-> = std::sync::OnceLock::new();
+impl SiteAccum {
+    fn new() -> Self {
+        Self {
+            reqs: AtomicU64::new(0),
+            blocked: AtomicU64::new(0),
+            lat: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
 
-fn traffic_acc() -> &'static std::sync::Mutex<std::collections::HashMap<String, SiteAccum>> {
-    TRAFFIC_ACC.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    fn record(&self, blocked: bool, latency_ms: f64) {
+        self.reqs.fetch_add(1, Ordering::Relaxed);
+        if blocked {
+            self.blocked.fetch_add(1, Ordering::Relaxed);
+        }
+        if latency_ms > 0.0 {
+            let idx = SITE_LAT_BOUNDS
+                .iter()
+                .position(|b| latency_ms <= *b)
+                .unwrap_or(SITE_LAT_BUCKETS - 1);
+            self.lat[idx].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Atomically take and reset this window's tallies, returning
+    /// `(reqs, blocked, p99_ms)`.
+    fn take(&self) -> (u64, u64, f64) {
+        let reqs = self.reqs.swap(0, Ordering::Relaxed);
+        let blocked = self.blocked.swap(0, Ordering::Relaxed);
+        let counts: [u64; SITE_LAT_BUCKETS] =
+            std::array::from_fn(|i| self.lat[i].swap(0, Ordering::Relaxed));
+
+        let total: u64 = counts.iter().sum();
+        if total == 0 {
+            return (reqs, blocked, 0.0);
+        }
+        // Rank of the p99 observation, matching the previous ceil-based indexing.
+        let target = (((total as f64) * 0.99).ceil() as u64).saturating_sub(1);
+        let mut cumulative = 0u64;
+        for (i, &c) in counts.iter().enumerate() {
+            if c == 0 {
+                continue;
+            }
+            if cumulative + c > target {
+                // Report the bucket's upper bound: for a latency SLO an estimate
+                // must never read lower than the samples it represents.
+                return (
+                    reqs,
+                    blocked,
+                    SITE_LAT_BOUNDS
+                        .get(i)
+                        .copied()
+                        .unwrap_or(*SITE_LAT_BOUNDS.last().unwrap()),
+                );
+            }
+            cumulative += c;
+        }
+        (reqs, blocked, *SITE_LAT_BOUNDS.last().unwrap())
+    }
 }
 
-/// Record one request into the current second's tally. Latency samples are
-/// capped per-site to bound memory under floods.
-fn record_traffic(site: &str, blocked: bool, latency_ms: f64) {
-    // No sink → no accumulation (the drainer only runs when ClickHouse is on).
-    if !CLICKHOUSE_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+// Keyed by "tenant\0site" so per-tenant traffic never merges across tenants. A
+// single string key (rather than a (String, String) tuple) lets the hot path look
+// the entry up by &str, so a hit borrows instead of allocating. DashMap shards
+// internally, so concurrent sites touch different locks.
+static TRAFFIC_ACC: std::sync::OnceLock<dashmap::DashMap<String, SiteAccum>> =
+    std::sync::OnceLock::new();
+
+fn traffic_acc() -> &'static dashmap::DashMap<String, SiteAccum> {
+    TRAFFIC_ACC.get_or_init(dashmap::DashMap::new)
+}
+
+thread_local! {
+    /// Scratch buffer for the composite key, so building it allocates once per
+    /// worker thread rather than once per request.
+    static TRAFFIC_KEY_BUF: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Record one request into the current window's tally.
+///
+/// Lock-free with respect to other requests for the same site: only atomic adds,
+/// under a DashMap shard read-guard.
+fn record_traffic(tenant: &str, site: &str, blocked: bool, latency_ms: f64) {
+    // No drainer → no accumulation (nothing would ever empty the tally).
+    if !HISTORY_SINK_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    if let Ok(mut m) = traffic_acc().lock() {
-        let e = m.entry(site.to_string()).or_default();
-        e.reqs += 1;
-        if blocked {
-            e.blocked += 1;
+    TRAFFIC_KEY_BUF.with(|buf| {
+        let mut key = buf.borrow_mut();
+        key.clear();
+        key.push_str(tenant);
+        key.push('\0');
+        key.push_str(site);
+
+        // Fast path: entry exists, no allocation and no map mutation.
+        if let Some(acc) = traffic_acc().get(key.as_str()) {
+            acc.record(blocked, latency_ms);
+            return;
         }
-        if latency_ms > 0.0 && e.lat.len() < 4096 {
-            e.lat.push(latency_ms);
-        }
-    }
+        // First request for this site in this process — allocate the owned key once.
+        traffic_acc()
+            .entry(key.clone())
+            .or_insert_with(SiteAccum::new)
+            .record(blocked, latency_ms);
+    });
 }
 
 /// Drain the accumulator into one TrafficRow per site, stamped with `ts`.
+///
+/// Entries are reset in place rather than removed from the map. Removing them
+/// would race with an in-flight `record_traffic` holding a reference to the entry,
+/// silently discarding those requests; swapping each counter to zero cannot lose a
+/// completed increment. The key set is bounded by the number of configured sites,
+/// so retaining entries does not grow without bound.
 fn drain_traffic(ts: i64) -> Vec<sentinel_storage::TrafficRow> {
-    let mut m = match traffic_acc().lock() {
-        Ok(m) => m,
-        Err(_) => return Vec::new(),
-    };
-    let mut out = Vec::with_capacity(m.len());
-    for (site, mut a) in m.drain() {
-        a.lat
-            .sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
-        let p99 = if a.lat.is_empty() {
-            0.0
-        } else {
-            let idx = (((a.lat.len() as f64) * 0.99).ceil() as usize).saturating_sub(1);
-            a.lat[idx.min(a.lat.len() - 1)]
+    let acc = traffic_acc();
+    let mut out = Vec::with_capacity(acc.len());
+    for entry in acc.iter() {
+        let (reqs, blocked, p99) = entry.value().take();
+        // Nothing happened for this site in this window — emit no row rather than
+        // a misleading all-zero one.
+        if reqs == 0 {
+            continue;
+        }
+        let (tenant, site) = match entry.key().split_once('\0') {
+            Some((t, s)) => (t.to_string(), s.to_string()),
+            None => continue,
         };
         out.push(sentinel_storage::TrafficRow {
             ts,
+            tenant,
             site_id: site,
-            reqs: a.reqs as i64,
-            blocked: a.blocked as i64,
+            reqs: reqs as i64,
+            blocked: blocked as i64,
             p99_ms: p99,
         });
     }
@@ -3533,11 +5680,27 @@ fn unix_now() -> i64 {
 static WAF_EVENTS: std::sync::OnceLock<std::sync::Mutex<Vec<sentinel_storage::WafEventRow>>> =
     std::sync::OnceLock::new();
 
-/// Set true once the ClickHouse flusher task is running. When ClickHouse is not
+/// Set true once the history flusher task is running. When ClickHouse is not
 /// configured nothing ever drains the buffers, so we must not buffer at all —
 /// otherwise the event buffer grows to its cap and is pinned in memory forever.
-static CLICKHOUSE_ENABLED: std::sync::atomic::AtomicBool =
+///
+/// This tracks "a drainer exists", NOT "the sink is reachable". The distinction
+/// is the whole of the 2026-07-29 event-loss bug: the flag used to be cleared on
+/// disconnect, so a node that could not reach ClickHouse buffered nothing, and
+/// therefore recorded nothing, while still enforcing perfectly. The flusher now
+/// spools what it cannot insert (see `sentinel_storage::Spool`), so buffering
+/// while disconnected is correct and bounded — memory by the 20k cap below, disk
+/// by the spool's own cap.
+static HISTORY_SINK_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Cap on buffered-but-unflushed events, bounding memory when the sink is slow
+/// or unreachable. At ~200 bytes a row this is a few MB.
+///
+/// The flusher drains every second, so reaching this means events are arriving
+/// faster than 20k/s sustained — a flood, not normal traffic. Overflow is counted
+/// in `sentinel_history_shed_total`; see `record_event`.
+const EVENT_BUFFER_CAP: usize = 20_000;
 
 fn waf_events() -> &'static std::sync::Mutex<Vec<sentinel_storage::WafEventRow>> {
     WAF_EVENTS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
@@ -3547,8 +5710,10 @@ fn waf_events() -> &'static std::sync::Mutex<Vec<sentinel_storage::WafEventRow>>
 /// passes are skipped to keep volume sane. Buffer is capped to bound memory if
 /// ClickHouse is down/slow.
 fn record_event(ctx: &RequestContext) {
-    // No sink → no buffering (the drainer only runs when ClickHouse is enabled).
-    if !CLICKHOUSE_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+    // No drainer → no buffering (nothing would ever empty the buffer). Note this
+    // is deliberately NOT gated on the sink being reachable: an unreachable sink
+    // still records, via the flusher's disk spool.
+    if !HISTORY_SINK_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
     let action = match ctx.decision {
@@ -3583,6 +5748,9 @@ fn record_event(ctx: &RequestContext) {
             (r.to_string(), a.to_string())
         }
     };
+    // Cloned before the struct takes ownership of ev_rule/ev_attack.
+    let ev_rule_for_prose = ev_rule.clone();
+    let ev_attack_for_prose = ev_attack.clone();
     let row = sentinel_storage::WafEventRow {
         ts: unix_now(),
         ip: ctx.client_ip.to_string(),
@@ -3600,10 +5768,51 @@ fn record_event(ctx: &RequestContext) {
         score: ctx.anomaly_score,
         status: ctx.response_status.map(|s| s.as_u16()).unwrap_or(0),
         protocol: protocol_label(ctx.http_version).to_string(),
+        // Same correlation id and prose as the NDJSON record, so an event found in
+        // Threat Search weeks later explains itself and can still be tied back to
+        // the request that produced it. Built from the same helper as waf.log —
+        // two renderings of one verdict would eventually disagree.
+        request_id: ctx.request_id.to_string(),
+        target: top.map(|r| r.target.clone()).unwrap_or_default(),
+        mode: match ctx.enforcement_mode {
+            Some(WafMode::Blocking) => "blocking",
+            Some(WafMode::Learning) => "learning",
+            Some(WafMode::Off) => "off",
+            None => "node",
+        }
+        .to_string(),
+        threshold: ctx.anomaly_threshold.unwrap_or(0),
+        explanation: if log_explain_enabled() {
+            explain_event(ctx, action, &ev_rule_for_prose, &ev_attack_for_prose).0
+        } else {
+            String::new()
+        },
     };
     if let Ok(mut buf) = waf_events().lock() {
-        if buf.len() < 20_000 {
+        if buf.len() < EVENT_BUFFER_CAP {
             buf.push(row);
+        } else {
+            // The buffer is full: this block/DETECT is enforced but will never be
+            // recorded. Count it — a silent shed here makes waf_events understate
+            // attacks blocked, precisely during a flood, which is when someone is
+            // most likely to be counting. `sentinel_history_shed_total` is the
+            // metric; the log below is for anyone reading logs rather than scraping.
+            //
+            // The cap is intentional (a flood at 20k rps wants 20k event rows a
+            // second; ClickHouse and the spool must not be driven by attacker
+            // volume) — the defect was never the shedding, only its invisibility.
+            let total = inc_history_shed();
+            // Rate-limited: at 20k/s an unconditional warn! would itself become the
+            // overload. Powers of ten give a loud first signal then decreasing noise.
+            if total == 1 || total.is_power_of_two() || total % 100_000 == 0 {
+                warn!(
+                    shed_total = total,
+                    buffer_cap = EVENT_BUFFER_CAP,
+                    "waf event history buffer FULL — events are being enforced but NOT \
+                     recorded; waf_events undercounts blocks for this window \
+                     (see sentinel_history_shed_total)"
+                );
+            }
         }
     }
 }
@@ -3614,6 +5823,184 @@ fn drain_events() -> Vec<sentinel_storage::WafEventRow> {
         Ok(mut buf) => std::mem::take(&mut *buf),
         Err(_) => Vec::new(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// History spool — durability across a ClickHouse outage
+// ---------------------------------------------------------------------------
+
+/// Resolve the history spool directory. Order: `SENTINEL_SPOOL_DIR` env →
+/// `$HOME/.local/share/sentinel/spool` (dev, needs no root) →
+/// `/var/lib/sentinel/state/spool`.
+///
+/// The compose default points into the `sentinel-state` named volume, already
+/// documented there as "per-node data-plane state that must outlive the
+/// container" — exactly the lifetime a spool needs. Deliberately never `/tmp`:
+/// that is tmpfs on most distros, and a spool that dies with the container
+/// cannot do the one job it exists for.
+fn resolve_spool_dir() -> std::path::PathBuf {
+    if let Ok(d) = std::env::var("SENTINEL_SPOOL_DIR") {
+        if !d.is_empty() {
+            return std::path::PathBuf::from(d);
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            return std::path::PathBuf::from(home).join(".local/share/sentinel/spool");
+        }
+    }
+    std::path::PathBuf::from("/var/lib/sentinel/state/spool")
+}
+
+/// Spool byte ceiling, from `SENTINEL_SPOOL_MAX_BYTES`.
+fn spool_max_bytes() -> u64 {
+    std::env::var("SENTINEL_SPOOL_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(sentinel_storage::spool::DEFAULT_MAX_BYTES)
+}
+
+/// Open the spool. `None` (with a loud warning) when the directory is unusable —
+/// which degrades to the old drop-the-batch behaviour rather than refusing to
+/// boot. Losing history is bad; refusing to serve traffic is worse.
+fn open_history_spool() -> Option<sentinel_storage::Spool> {
+    let dir = resolve_spool_dir();
+    let ds = dir.to_string_lossy().to_string();
+    if ds.starts_with("/tmp") || ds.starts_with("/dev/shm") {
+        warn!(
+            spool_dir = %ds,
+            "history spool directory is on tmpfs (RAM) — spooled history will NOT \
+             survive a restart, which is the point of spooling; set SENTINEL_SPOOL_DIR \
+             to a real-disk path on a persistent volume"
+        );
+    }
+    let max = spool_max_bytes();
+    match sentinel_storage::Spool::open(&dir, max) {
+        Ok(sp) => {
+            info!(spool_dir = %ds, max_bytes = max, "history spool ready");
+            Some(sp)
+        }
+        Err(e) => {
+            warn!(
+                error = %e, spool_dir = %ds,
+                "history spool unavailable — waf history will be DROPPED while \
+                 ClickHouse is unreachable (set SENTINEL_SPOOL_DIR to a writable path)"
+            );
+            None
+        }
+    }
+}
+
+/// Append a batch to the spool, returning bytes written (0 if empty or no spool).
+fn spool_batch<T: serde::Serialize>(
+    spool: Option<&sentinel_storage::Spool>,
+    kind: &str,
+    rows: &[T],
+) -> u64 {
+    if rows.is_empty() {
+        return 0;
+    }
+    let Some(sp) = spool else {
+        warn!(
+            kind,
+            rows = rows.len(),
+            "no history spool — dropping batch (history for these rows is lost)"
+        );
+        return 0;
+    };
+    match sp.append(kind, rows) {
+        Ok(bytes) => {
+            debug!(kind, rows = rows.len(), bytes, "history spooled to disk");
+            bytes
+        }
+        Err(e) => {
+            warn!(error = %e, kind, rows = rows.len(), "history spool write failed — batch lost");
+            0
+        }
+    }
+}
+
+/// Replay spooled segments, oldest first, deleting each only after ClickHouse
+/// accepts it (at-least-once: a crash in that window duplicates rather than
+/// loses, and every row carries `request_id` for de-duplication).
+///
+/// Returns `false` if the SINK failed, so the caller drops the client and
+/// reconnects. Un-replayed segments simply stay on disk for the next attempt.
+async fn replay_history_spool(
+    sp: &sentinel_storage::Spool,
+    client: &sentinel_storage::ClickHouseClient,
+) -> bool {
+    // Bounded per tick so a large backlog can never stall the loop (which also
+    // samples traffic every second) or starve live rows behind an hour of replay.
+    const MAX_SEGMENTS_PER_TICK: usize = 20;
+
+    for path in sp
+        .segments("traffic")
+        .into_iter()
+        .take(MAX_SEGMENTS_PER_TICK)
+    {
+        match sentinel_storage::Spool::load::<sentinel_storage::TrafficRow>(&path) {
+            Ok((rows, skipped)) => {
+                if skipped > 0 {
+                    warn!(path = %path.display(), skipped, "history spool: unparseable traffic lines skipped");
+                }
+                if rows.is_empty() {
+                    sentinel_storage::Spool::remove(&path);
+                    continue;
+                }
+                match client.insert_traffic_batch(&rows).await {
+                    Ok(()) => {
+                        info!(rows = rows.len(), "history spool: replayed traffic batch");
+                        sentinel_storage::Spool::remove(&path);
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "history spool: traffic replay failed — keeping segment, will retry");
+                        return false;
+                    }
+                }
+            }
+            // Unreadable: do NOT delete (the error may be transient and deleting
+            // would destroy the only copy). Skip past it so one bad segment can
+            // never block the rest of the backlog; the cap ages it out eventually.
+            Err(e) => {
+                warn!(error = %e, path = %path.display(), "history spool: segment unreadable — skipping");
+            }
+        }
+    }
+
+    for path in sp
+        .segments("events")
+        .into_iter()
+        .take(MAX_SEGMENTS_PER_TICK)
+    {
+        match sentinel_storage::Spool::load::<sentinel_storage::WafEventRow>(&path) {
+            Ok((rows, skipped)) => {
+                if skipped > 0 {
+                    warn!(path = %path.display(), skipped, "history spool: unparseable event lines skipped");
+                }
+                if rows.is_empty() {
+                    sentinel_storage::Spool::remove(&path);
+                    continue;
+                }
+                match client.insert_events_batch(&rows).await {
+                    Ok(()) => {
+                        info!(rows = rows.len(), "history spool: replayed events batch");
+                        sentinel_storage::Spool::remove(&path);
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "history spool: events replay failed — keeping segment, will retry");
+                        return false;
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, path = %path.display(), "history spool: segment unreadable — skipping");
+            }
+        }
+    }
+
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -3843,6 +6230,244 @@ fn protocol_label(v: http::Version) -> &'static str {
     }
 }
 
+/// Whether to attach the human-readable `message`/`remediation` prose to WAF
+/// events. Default on; set `SENTINEL_LOG_EXPLAIN=0` to drop it.
+///
+/// The escape hatch exists for volume, not correctness: the prose adds roughly
+/// 200-400 bytes to every security event, and the block path sustains >21k
+/// events/s under flood, where that is megabytes per second of extra disk. An
+/// operator riding out an attack can turn it off; the structured fields the
+/// dashboard and ClickHouse consume are unaffected either way.
+fn log_explain_enabled() -> bool {
+    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EN.get_or_init(|| {
+        !matches!(
+            std::env::var("SENTINEL_LOG_EXPLAIN").ok().as_deref(),
+            Some("0") | Some("false") | Some("off")
+        )
+    })
+}
+
+/// Render a rule target (`ARGS:id`, `REQUEST_HEADERS:X-Api-Key`) as English.
+///
+/// The raw ModSecurity-style target is precise but assumes the reader knows the
+/// vocabulary. An operator triaging a false positive at 3 a.m. should not have
+/// to know that `ARGS_NAMES` means the parameter's *name* rather than its value.
+fn humanize_target(target: &str) -> String {
+    let (collection, member) = match target.split_once(':') {
+        Some((c, m)) => (c, Some(m)),
+        None => (target, None),
+    };
+    let named = |what: &str| match member {
+        Some(m) if !m.is_empty() => format!("{what} '{m}'"),
+        _ => what.to_string(),
+    };
+    match collection.to_ascii_uppercase().as_str() {
+        "ARGS" => named("parameter"),
+        "ARGS_NAMES" => named("parameter name"),
+        "ARGS_GET" => named("query-string parameter"),
+        "ARGS_POST" => named("body parameter"),
+        "REQUEST_HEADERS" => named("request header"),
+        "REQUEST_HEADERS_NAMES" => named("request header name"),
+        "REQUEST_COOKIES" => named("cookie"),
+        "REQUEST_COOKIES_NAMES" => named("cookie name"),
+        "REQUEST_URI" | "REQUEST_URI_RAW" => "the request URI".to_string(),
+        "REQUEST_FILENAME" => "the request path".to_string(),
+        "REQUEST_BODY" => "the request body".to_string(),
+        "REQUEST_LINE" => "the request line".to_string(),
+        "REQUEST_METHOD" => "the request method".to_string(),
+        "QUERY_STRING" => "the query string".to_string(),
+        "FILES" | "FILES_NAMES" => named("uploaded file"),
+        "RESPONSE_BODY" => "the response body".to_string(),
+        "RESPONSE_HEADERS" => named("response header"),
+        "XML" => "the XML body".to_string(),
+        "JSON" => "the JSON body".to_string(),
+        // Unknown collection: echo it rather than inventing a description.
+        _ => target.to_string(),
+    }
+}
+
+/// Trim a path/URI for inclusion in prose without destroying its meaning.
+fn truncate_for_prose(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max).collect();
+    format!("{head}… ({} chars total)", s.chars().count())
+}
+
+/// Build the human-readable explanation and remediation hint for a WAF event.
+///
+/// Returns `(message, remediation)`. The message states, in one sentence, what
+/// was decided, what was detected, WHERE in the request, who sent it, and why
+/// the verdict followed. The remediation says what to do about it — which is the
+/// part commercial WAFs typically leave to the operator to work out from a
+/// violation code, and the reason this exists at all.
+fn explain_event(ctx: &RequestContext, action: &str, rule: &str, attack: &str) -> (String, String) {
+    let site = ctx.site_id.as_deref().unwrap_or("unrouted request");
+    let origin = match ctx.geo_country.as_deref() {
+        Some(cc) if !cc.is_empty() => format!("{} ({cc})", ctx.client_ip),
+        _ => ctx.client_ip.to_string(),
+    };
+    let req = format!(
+        "{} {}",
+        ctx.method.as_str(),
+        truncate_for_prose(ctx.uri.path(), 120)
+    );
+    let top = ctx.rule_matches.first();
+    let is_rule_hit = top.is_some();
+
+    // What the WAF did, stated so that a learning-mode record can never be
+    // mistaken for an enforced block — the single most dangerous ambiguity in a
+    // WAF log, because it decides whether the operator thinks traffic was stopped.
+    let verdict = match action {
+        "DETECT" => format!(
+            "Detected but ALLOWED THROUGH — site '{site}' is in learning mode, so this request was \
+             not blocked"
+        ),
+        "BLOCK" => match ctx.decision {
+            WafDecision::Challenge => {
+                format!("Challenged (browser verification required) on '{site}'")
+            }
+            WafDecision::Limit => format!("Throttled (soft-deny) on '{site}'"),
+            _ => format!("BLOCKED on '{site}'"),
+        },
+        _ => format!("Allowed on '{site}'"),
+    };
+
+    // What was found, and where.
+    let finding = match top {
+        // An empty target is normal, not a bug: the rule engine records one only
+        // when a rule inspected exactly ONE part of the request, because naming a
+        // guessed target would send an operator to exclude something that never
+        // fired. Say "in <target>" when it is known and omit the clause when it is
+        // not, rather than emitting "in  (rule …)".
+        Some(m) if !m.target.is_empty() => format!(
+            "{} in {} (rule {}, severity {:?}, detected during {})",
+            attack,
+            humanize_target(&m.target),
+            m.rule_id,
+            m.severity,
+            m.phase
+        ),
+        Some(m) => format!(
+            "{} (rule {}, severity {:?}, detected during {})",
+            attack, m.rule_id, m.severity, m.phase
+        ),
+        None => {
+            let reason = ctx.block_reason.as_deref().unwrap_or("").trim();
+            if reason.is_empty() {
+                attack.to_string()
+            } else {
+                format!("{reason} (recorded as {rule})")
+            }
+        }
+    };
+
+    // Why the verdict followed. Only meaningful for score-driven outcomes; a
+    // rate-limit or GeoIP block has no score and must not pretend to have one.
+    let mut why = String::new();
+    if ctx.anomaly_score > 0 {
+        match ctx.anomaly_threshold {
+            Some(t) => {
+                why = format!(
+                    " Cumulative anomaly score {} against this site's threshold of {}{}.",
+                    ctx.anomaly_score,
+                    t,
+                    if ctx.anomaly_score >= t {
+                        " (threshold reached)"
+                    } else {
+                        " (below threshold)"
+                    }
+                );
+            }
+            None => {
+                why = format!(" Cumulative anomaly score {}.", ctx.anomaly_score);
+            }
+        }
+    }
+    if ctx.threat_intel_hit {
+        why.push_str(" The client IP also matched the live threat-intelligence feed.");
+    }
+
+    let outcome = match ctx.response_status.map(|s| s.as_u16()) {
+        Some(code) if code > 0 => format!(" Responded {} in {:.1} ms.", code, ctx.elapsed_ms()),
+        _ => format!(" Completed in {:.1} ms.", ctx.elapsed_ms()),
+    };
+
+    let message = format!("{verdict}: {finding} from {origin} on {req}.{why}{outcome}");
+
+    // Remediation. Tailored to what actually fired, so it is actionable rather
+    // than a generic "review your policy".
+    let remediation = if action == "PASS" {
+        String::new()
+    } else if is_rule_hit {
+        let m = top.expect("is_rule_hit implies a match");
+        // With a known target the advice can be specific; without one it must not
+        // invent a parameter to exclude.
+        if m.target.is_empty() {
+            format!(
+                "If this is legitimate traffic, disable rule {} for site '{}' (Sites → {} → \
+                 Learning Report → Disable), or raise the site's anomaly threshold above {}. This \
+                 rule inspected more than one part of the request, so the exact field is not \
+                 recorded — check the payload before excluding anything.",
+                m.rule_id,
+                site,
+                site,
+                ctx.anomaly_score.max(1)
+            )
+        } else {
+            format!(
+                "If this is legitimate traffic, exclude rule {} for {} on site '{}' \
+                 (Sites → {} → Learning Report → Disable), or raise the site's anomaly threshold \
+                 above {}. Confirm against the source IP and payload before excluding — an \
+                 exclusion applies to every future request for that target.",
+                m.rule_id,
+                humanize_target(&m.target),
+                site,
+                site,
+                ctx.anomaly_score.max(1)
+            )
+        }
+    } else {
+        match rule {
+            "RATELIMIT" => format!(
+                "If {origin} is a legitimate client, raise the rate limit for site '{site}' or \
+                 allowlist the address. Repeated hits from many addresses instead suggest a \
+                 distributed flood — check the DDoS panel before relaxing the limit."
+            ),
+            "GEOIP" => format!(
+                "If this country should be served, remove it from the GeoIP block list for site \
+                 '{site}'. Note that a VPN or corporate egress can place a legitimate user in an \
+                 unexpected country."
+            ),
+            "BOT" => format!(
+                "If this is a legitimate automated client, allowlist its address or JA4 \
+                 fingerprint for site '{site}'. Well-behaved crawlers should instead be given a \
+                 verified-bot exemption rather than a blanket allow."
+            ),
+            "THREATINTEL" => format!(
+                "The address {origin} appears on a threat-intelligence feed. If you believe this \
+                 is a false attribution, allowlist it for site '{site}' and report the address so \
+                 the feed entry can be reviewed."
+            ),
+            "SMUGGLING" => {
+                "Conflicting Content-Length/Transfer-Encoding framing was rejected. This is almost \
+                 never legitimate client behaviour — investigate the sender before allowlisting \
+                 anything."
+                    .to_string()
+            }
+            _ => format!(
+                "Review the request against site '{site}' policy. If the verdict is wrong, capture \
+                 this record's request_id and use it to correlate with the access log before \
+                 changing policy."
+            ),
+        }
+    };
+
+    (message, remediation)
+}
+
 fn ndjson_log(ctx: &RequestContext) {
     if !ndjson_logging_enabled() {
         return;
@@ -3862,16 +6487,27 @@ fn ndjson_log(ctx: &RequestContext) {
         _ => "PASS",
     };
     let site = ctx.site_id.as_deref().unwrap_or("-");
+    let tenant = ctx.tenant_id.as_deref().unwrap_or("");
+
+    // request_id is the join key between this line, the matching waf.log security
+    // event, and the tracing output. Without it the two NDJSON streams cannot be
+    // correlated at all — you could see that a block happened and see a request,
+    // and not be able to prove they were the same request.
+    let request_id = ctx.request_id.to_string();
+    let country = ctx.geo_country.as_deref().unwrap_or("");
 
     let access = serde_json::json!({
         "ts":      ts,
+        "request_id": request_id,
         "ip":      ctx.client_ip.to_string(),
+        "country": country,
         "method":  ctx.method.as_str(),
         "path":    ctx.uri.path(),
         "status":  status,
         "latency": format!("{:.2}", ctx.elapsed_ms()),
         "bytes":    ctx.bytes_sent,
         "site":     site,
+        "tenant":   tenant,
         "protocol": protocol_label(ctx.http_version),
         "ua":       ua,
         "action":   action,
@@ -3899,20 +6535,55 @@ fn ndjson_log(ctx: &RequestContext) {
             None => classify_nonrule_block(ctx.block_reason.as_deref().unwrap_or("")),
         };
 
+        // Which part of the request tripped this, e.g. "ARGS:id". Available on
+        // every RuleMatch and previously dropped on the floor — it is the single
+        // most useful field for triaging a false positive, because it names the
+        // parameter to exclude instead of leaving the operator to guess.
+        let target = top.map(|r| r.target.as_str()).unwrap_or("");
+        let mode = match ctx.enforcement_mode {
+            Some(WafMode::Blocking) => "blocking",
+            Some(WafMode::Learning) => "learning",
+            Some(WafMode::Off) => "off",
+            // Pre-routing rejections (anti-DDoS, IP reputation, threat intel)
+            // are enforced by the node, not by a site policy.
+            None => "node",
+        };
+        let (message, remediation) = if log_explain_enabled() {
+            explain_event(ctx, action, rule, attack)
+        } else {
+            (String::new(), String::new())
+        };
+
         let waf = serde_json::json!({
             "ts":     ts,
+            "request_id": request_id,
             "ip":     ctx.client_ip.to_string(),
+            "country": country,
             "method": ctx.method.as_str(),
             "path":   ctx.uri.path(),
             "rule":   rule,
+            "target": target,
             "score":  ctx.anomaly_score,
+            "threshold": ctx.anomaly_threshold,
+            // Present only when a per-path override governed this request, so a
+            // threshold that differs from the site's is self-explaining.
+            "path_override": ctx.path_override,
             "sev":    sev_str,
             "attack": attack,
             "action": action,
+            "mode":   mode,
             "site":   site,
+            "tenant": tenant,
             "protocol": protocol_label(ctx.http_version),
+            "status": status,
+            "latency_ms": format!("{:.2}", ctx.elapsed_ms()),
+            "ua":     ua,
             "msg":    ctx.block_reason.as_deref().unwrap_or(""),
+            "message": message,
+            "remediation": remediation,
             "would_block": ctx.would_block,
+            "threat_intel_hit": ctx.threat_intel_hit,
+            "engine_scores": ctx.engine_scores,
             "ml_scores": ctx.ml_scores,
         });
         enqueue_log("waf.log", waf.to_string());
@@ -4107,6 +6778,1069 @@ mod threat_intel_contract_tests {
                 "/"
             ),
             ThreatVerdict::None
+        );
+    }
+}
+
+#[cfg(test)]
+mod fusion_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn waf(pl: u8, threshold: u32, fusion: Option<FusionConfig>) -> WafConfig {
+        WafConfig {
+            paranoia_level: pl,
+            anomaly_threshold: threshold,
+            fusion,
+            ..WafConfig::default()
+        }
+    }
+    fn ctx() -> RequestContext {
+        RequestContext::new("203.0.113.7".parse().unwrap(), 1234)
+    }
+    fn fusion(
+        enable: bool,
+        weights: &[(&str, f32)],
+        block: Vec<u32>,
+        limit: Vec<u32>,
+    ) -> FusionConfig {
+        FusionConfig {
+            enable,
+            weights: weights
+                .iter()
+                .map(|(k, v)| (k.to_string(), *v))
+                .collect::<HashMap<_, _>>(),
+            block_thresholds: block,
+            limit_thresholds: limit,
+            limit_status: 429,
+        }
+    }
+
+    #[test]
+    fn threshold_for_pl_indexes_and_repeats_last() {
+        let l = [10u32, 8, 6, 4];
+        assert_eq!(threshold_for_pl(&l, 1), Some(10));
+        assert_eq!(threshold_for_pl(&l, 2), Some(8));
+        assert_eq!(threshold_for_pl(&l, 4), Some(4));
+        assert_eq!(threshold_for_pl(&l, 9), Some(4)); // repeats last
+        assert_eq!(threshold_for_pl(&l, 0), Some(10)); // clamps to PL1
+        assert_eq!(threshold_for_pl(&[], 2), None);
+    }
+
+    #[test]
+    fn fused_score_applies_weights_and_counts_remainder() {
+        let f = fusion(true, &[("bot", 3.0)], vec![100], vec![50]);
+        let mut c = ctx();
+        c.add_engine_score("bot", 3); // weighted 3*3 = 9
+        c.add_engine_score("rules", 2); // weight 1 = 2
+        c.anomaly_score = c.anomaly_score.saturating_add(5); // unbucketed remainder @ weight 1
+        assert_eq!(fused_score(&c, &f), 16); // 9 + 2 + 5
+    }
+
+    #[test]
+    fn legacy_flat_threshold_when_fusion_absent() {
+        let w = waf(2, 5, None);
+        let mut c = ctx();
+        c.add_engine_score("rules", 5);
+        apply_verdict(&mut c, &w);
+        assert_eq!(c.decision, WafDecision::Block);
+    }
+
+    #[test]
+    fn fusion_block_limit_allow_bands() {
+        let f = fusion(true, &[], vec![10, 8, 6, 4], vec![5, 4, 3, 2]); // PL2 → block 8, limit 4
+        let w = waf(2, 100, Some(f));
+        let mut c = ctx();
+        c.add_engine_score("rules", 9);
+        apply_verdict(&mut c, &w);
+        assert_eq!(c.decision, WafDecision::Block);
+
+        let mut c = ctx();
+        c.add_engine_score("rules", 5);
+        apply_verdict(&mut c, &w);
+        assert_eq!(c.decision, WafDecision::Limit);
+
+        let mut c = ctx();
+        c.add_engine_score("rules", 3);
+        apply_verdict(&mut c, &w);
+        assert_eq!(c.decision, WafDecision::Allow);
+    }
+
+    #[test]
+    fn weights_change_the_verdict() {
+        let mut c = ctx();
+        c.add_engine_score("bot", 4);
+        apply_verdict(
+            &mut c,
+            &waf(
+                1,
+                100,
+                Some(fusion(true, &[("bot", 1.0)], vec![10], vec![])),
+            ),
+        );
+        assert_eq!(c.decision, WafDecision::Allow); // 4 < 10
+
+        let mut c2 = ctx();
+        c2.add_engine_score("bot", 4);
+        apply_verdict(
+            &mut c2,
+            &waf(
+                1,
+                100,
+                Some(fusion(true, &[("bot", 3.0)], vec![10], vec![])),
+            ),
+        );
+        assert_eq!(c2.decision, WafDecision::Block); // 12 >= 10
+    }
+
+    #[test]
+    fn existing_block_is_preserved() {
+        let w = waf(2, 100, Some(fusion(true, &[], vec![10], vec![5])));
+        let mut c = ctx();
+        c.decision = WafDecision::Block;
+        c.add_engine_score("rules", 1);
+        apply_verdict(&mut c, &w);
+        assert_eq!(c.decision, WafDecision::Block);
+    }
+}
+
+#[cfg(test)]
+mod admission_control_tests {
+    use super::*;
+
+    // A unique env-var name per assertion keeps these tests independent even
+    // when the test binary runs them on multiple threads (env is process-global).
+
+    #[test]
+    fn resolve_limit_uses_config_when_env_unset() {
+        // Guaranteed-unset key.
+        assert_eq!(
+            resolve_limit("SENTINEL_TEST_ADMISSION_UNSET_XZ", 4096),
+            4096
+        );
+    }
+
+    #[test]
+    fn resolve_limit_env_overrides_config() {
+        let key = "SENTINEL_TEST_ADMISSION_OVERRIDE";
+        std::env::set_var(key, "250");
+        assert_eq!(resolve_limit(key, 4096), 250);
+        std::env::remove_var(key);
+    }
+
+    #[test]
+    fn resolve_limit_ignores_invalid_and_zero_env() {
+        let key = "SENTINEL_TEST_ADMISSION_INVALID";
+        std::env::set_var(key, "not-a-number");
+        assert_eq!(resolve_limit(key, 4096), 4096);
+        std::env::set_var(key, "0"); // 0 permits is invalid → fall back to config
+        assert_eq!(resolve_limit(key, 4096), 4096);
+        std::env::remove_var(key);
+    }
+
+    #[test]
+    fn resolve_limit_clamps_zero_config_to_one() {
+        // A Semaphore needs at least one permit; a misconfigured 0 must not
+        // deadlock every connection.
+        assert_eq!(resolve_limit("SENTINEL_TEST_ADMISSION_UNSET_ZERO", 0), 1);
+    }
+
+    #[test]
+    fn overloaded_response_is_503_with_retry_after() {
+        let resp = overloaded_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers().get(header::RETRY_AFTER).unwrap(),
+            "1",
+            "503 shed responses must tell clients/LBs to back off"
+        );
+    }
+
+    // Proves the semaphore-based admission primitive actually sheds: once every
+    // permit is held, the next acquisition fails (which is exactly what the
+    // accept loop / run_pipeline treat as the shed signal).
+    #[test]
+    fn semaphore_sheds_when_saturated() {
+        let sem = Arc::new(Semaphore::new(2));
+        let p1 = Arc::clone(&sem).try_acquire_owned();
+        let p2 = Arc::clone(&sem).try_acquire_owned();
+        assert!(p1.is_ok() && p2.is_ok(), "first two permits granted");
+        assert!(
+            Arc::clone(&sem).try_acquire_owned().is_err(),
+            "third acquisition must fail → load shed"
+        );
+        drop(p1); // a connection ends → a slot frees
+        assert!(
+            Arc::clone(&sem).try_acquire_owned().is_ok(),
+            "freed slot is reusable"
+        );
+    }
+}
+
+#[cfg(test)]
+mod history_shed_tests {
+    use super::*;
+
+    /// Serialise: the event buffer and the shed counter are process-global.
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn blocking_ctx() -> RequestContext {
+        let mut ctx = RequestContext::new("203.0.113.9".parse().unwrap(), 4444);
+        // record_event only stores NOTABLE requests — a Block here, so the row is
+        // built and the buffer path is genuinely exercised.
+        ctx.decision = WafDecision::Block;
+        ctx.block_reason = Some("test: forced block".to_string());
+        ctx.site_id = Some("shedtest".to_string());
+        ctx
+    }
+
+    #[test]
+    fn events_are_buffered_until_the_cap_then_counted_as_shed() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        HISTORY_SINK_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // Start from a known buffer state.
+        let _ = drain_events();
+        let shed_before = history_shed_total();
+
+        // Fill exactly to the cap: none of these may shed.
+        {
+            let mut buf = waf_events().lock().unwrap();
+            buf.clear();
+            let filler = || sentinel_storage::WafEventRow {
+                ts: 0,
+                ip: String::new(),
+                country: String::new(),
+                site: String::new(),
+                tenant: String::new(),
+                method: String::new(),
+                path: String::new(),
+                rule: String::new(),
+                attack: String::new(),
+                action: String::new(),
+                severity: String::new(),
+                score: 0,
+                status: 0,
+                protocol: String::new(),
+                request_id: String::new(),
+                target: String::new(),
+                mode: String::new(),
+                threshold: 0,
+                explanation: String::new(),
+            };
+            buf.resize_with(EVENT_BUFFER_CAP - 1, filler);
+        }
+
+        // One below the cap → must be accepted, nothing shed.
+        record_event(&blocking_ctx());
+        assert_eq!(
+            waf_events().lock().unwrap().len(),
+            EVENT_BUFFER_CAP,
+            "the last free slot should have been used"
+        );
+        assert_eq!(
+            history_shed_total(),
+            shed_before,
+            "nothing may be shed while the buffer still had room"
+        );
+
+        // Now full → the next three must shed AND be counted, and the buffer must
+        // not grow past the cap (that bound is the reason shedding exists).
+        for _ in 0..3 {
+            record_event(&blocking_ctx());
+        }
+        assert_eq!(
+            waf_events().lock().unwrap().len(),
+            EVENT_BUFFER_CAP,
+            "buffer must stay capped"
+        );
+        assert_eq!(
+            history_shed_total(),
+            shed_before + 3,
+            "every dropped event must be counted — a silent shed is the bug this fixes"
+        );
+
+        // Draining frees space, so recording resumes without further shedding.
+        let drained = drain_events();
+        assert_eq!(drained.len(), EVENT_BUFFER_CAP);
+        record_event(&blocking_ctx());
+        assert_eq!(waf_events().lock().unwrap().len(), 1);
+        assert_eq!(
+            history_shed_total(),
+            shed_before + 3,
+            "no extra shed once the buffer drained"
+        );
+
+        let _ = drain_events();
+    }
+
+    #[test]
+    fn healthz_reports_the_shed_total() {
+        // Cheap guard that the field is actually wired into the payload an operator
+        // reads, not only into /metrics.
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let body = serde_json::json!({ "history_shed": history_shed_total() });
+        assert!(body["history_shed"].is_number());
+    }
+}
+
+#[cfg(test)]
+mod metrics_endpoint_tests {
+    use super::*;
+    use http_body_util::BodyExt;
+
+    #[tokio::test]
+    async fn metrics_response_serves_prometheus_text() {
+        // Exercise the hot-path counters so the registry has real content.
+        inc_requests();
+        inc_rule_hits();
+        let resp = metrics_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            ct.starts_with("text/plain"),
+            "prometheus text content-type, got {ct}"
+        );
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        // The registry exposes the WAF counters, including the now-wired
+        // rule-hits counter, in Prometheus exposition format.
+        assert!(text.contains("sentinel_requests_total"));
+        assert!(text.contains("sentinel_rule_hits_total"));
+        assert!(text.contains("# TYPE sentinel_requests_total counter"));
+    }
+}
+
+#[cfg(test)]
+mod client_ip_tests {
+    use super::*;
+    use std::net::IpAddr;
+
+    fn xff(v: &str) -> http::HeaderMap {
+        let mut h = http::HeaderMap::new();
+        h.insert("x-forwarded-for", v.parse().unwrap());
+        h
+    }
+    // Trust 10.0.0.0/8 as the proxy subnet (stand-in for our HAProxy network).
+    fn trusted(ip: IpAddr) -> bool {
+        matches!(ip, IpAddr::V4(v4) if v4.octets()[0] == 10)
+    }
+
+    // ── Blocklist behind a proxy ──────────────────────────────────────────────
+    //
+    // The regression these guard: the fast-fail checked only the transport peer, so
+    // behind HAProxy it compared the PROXY's address on every request and the blocklist
+    // matched nothing at all. It passed in the single-VM demo purely because the client
+    // was the immediate peer there.
+
+    // ── Shared-egress exemption (NAT bystander protection) ────────────────────
+    //
+    // These guard two mechanisms that both assume "IP == actor", which is false behind
+    // NAT. Env-var-driven config is process-global and cached in a OnceLock, so these
+    // tests exercise the pure predicates rather than mutating the environment (which
+    // would race across the parallel test runner and be order-dependent).
+
+    /// The correlation contribution must be capped BELOW the default anomaly threshold,
+    /// or reputation alone blocks a request that matched no rule. The uncapped
+    /// "persistent attacker" value was 8 against a default threshold of 5.
+    #[test]
+    fn correlation_cap_cannot_alone_cross_the_default_threshold() {
+        const DEFAULT_ANOMALY_THRESHOLD: u32 = 5;
+        let cap = correlation_max_score();
+        assert!(
+            cap < DEFAULT_ANOMALY_THRESHOLD,
+            "correlation cap {cap} >= default threshold {DEFAULT_ANOMALY_THRESHOLD} — \
+             reputation could block a clean request with zero rule matches"
+        );
+        // And the raw engine value it caps really was above the threshold, which is why
+        // the cap is needed at all.
+        let engine = CorrelationEngine::new();
+        let ip: IpAddr = "203.0.113.50".parse().unwrap();
+        for _ in 0..(engine.escalate_threshold * 3) {
+            engine.record_block(ip);
+        }
+        let raw = engine.score_for_ip(ip);
+        assert!(
+            raw > DEFAULT_ANOMALY_THRESHOLD,
+            "expected the uncapped persistent-attacker score to exceed the threshold \
+             (that is the bug being capped), got {raw}"
+        );
+        assert!(
+            raw.min(cap) < DEFAULT_ANOMALY_THRESHOLD,
+            "cap did not bound the score"
+        );
+    }
+
+    /// A clean request from a shared address must not be blocked because a neighbour
+    /// attacked. This is the office-NAT scenario.
+    #[test]
+    fn shared_egress_predicate_matches_configured_ranges() {
+        let nets: Vec<IpNet> = ["203.0.113.0/24", "198.51.100.7"]
+            .iter()
+            .filter_map(|s| parse_block_cidr(s))
+            .collect();
+        let contains = |ip: &str| {
+            let a: IpAddr = ip.parse().unwrap();
+            nets.iter().any(|n| n.contains(&a))
+        };
+        assert!(contains("203.0.113.1"), "CIDR member not matched");
+        assert!(contains("203.0.113.255"), "CIDR upper bound not matched");
+        assert!(contains("198.51.100.7"), "bare IP not treated as /32");
+        assert!(
+            !contains("203.0.114.1"),
+            "address outside the range matched"
+        );
+        assert!(!contains("198.51.100.8"), "neighbour of a bare IP matched");
+    }
+
+    /// The auto-ban carve-out for private ranges does NOT cover a corporate NAT egress
+    /// address, because that address is public. Without the shared-egress check, one
+    /// scanner gets every colleague dropped in-kernel.
+    #[test]
+    fn public_nat_egress_is_autoban_eligible_without_the_exemption() {
+        // A genuinely ROUTABLE public address. 203.0.113.0/24 would not do: it is RFC
+        // 5737 documentation space, which autoban_eligible already excludes via
+        // is_documentation() — using it would make this test pass for the wrong reason
+        // and hide the very gap it is meant to demonstrate.
+        let office_nat: IpAddr = "103.24.8.122".parse().unwrap();
+        assert!(
+            autoban_eligible(office_nat, false),
+            "a PUBLIC NAT egress address is auto-ban eligible by the private-range rules \
+             alone — which is exactly why the shared-egress list exists"
+        );
+        // Private ranges are still excluded by default, as before.
+        assert!(!autoban_eligible("10.1.2.3".parse().unwrap(), false));
+        assert!(!autoban_eligible("192.168.1.1".parse().unwrap(), false));
+    }
+
+    /// Exempting a range must not weaken detection: an attack from a shared address is
+    /// still blocked on its own merits. Only the *history* is forgiven, and the
+    /// blocklist still applies to the address if an operator adds it explicitly.
+    #[test]
+    fn exempting_shared_egress_does_not_disable_the_blocklist() {
+        let shared: IpAddr = "203.0.113.10".parse().unwrap();
+        let blocked = move |ip: IpAddr| ip == shared;
+        assert!(
+            blocklist_hit(shared, &http::HeaderMap::new(), blocked, trusted),
+            "an explicitly blocklisted address must still be blocked even if it is \
+             shared egress — exemption covers reputation, not explicit policy"
+        );
+    }
+
+    #[test]
+    fn blocklist_catches_direct_peer() {
+        let attacker: IpAddr = "45.155.205.233".parse().unwrap();
+        let blocked = move |ip: IpAddr| ip == attacker;
+        assert!(blocklist_hit(
+            attacker,
+            &http::HeaderMap::new(),
+            blocked,
+            trusted
+        ));
+    }
+
+    /// THE BUG: blocked client behind a trusted proxy. Before the fix this returned
+    /// false, because only the proxy's address was ever checked.
+    #[test]
+    fn blocklist_catches_client_behind_trusted_proxy() {
+        let proxy: IpAddr = "10.0.0.5".parse().unwrap();
+        let attacker: IpAddr = "45.155.205.233".parse().unwrap();
+        let blocked = move |ip: IpAddr| ip == attacker;
+        assert!(
+            blocklist_hit(proxy, &xff("45.155.205.233"), blocked, trusted),
+            "blocked client was NOT caught behind a proxy — the blocklist is inert in \
+             the shipped HA topology"
+        );
+    }
+
+    /// A proxy chain must still resolve to the real client.
+    #[test]
+    fn blocklist_catches_client_through_a_proxy_chain() {
+        let proxy: IpAddr = "10.0.0.5".parse().unwrap();
+        let attacker: IpAddr = "45.155.205.233".parse().unwrap();
+        let blocked = move |ip: IpAddr| ip == attacker;
+        assert!(blocklist_hit(
+            proxy,
+            &xff("45.155.205.233, 10.0.0.9"),
+            blocked,
+            trusted
+        ));
+    }
+
+    /// An UNTRUSTED peer's XFF must be ignored, so a blocked attacker cannot escape its
+    /// own block by claiming to be someone else.
+    #[test]
+    fn blocked_attacker_cannot_escape_by_forging_xff() {
+        let attacker: IpAddr = "45.155.205.233".parse().unwrap();
+        let blocked = move |ip: IpAddr| ip == attacker;
+        assert!(
+            blocklist_hit(attacker, &xff("8.8.8.8"), blocked, trusted),
+            "a blocked client escaped its block by forging X-Forwarded-For"
+        );
+    }
+
+    /// And the inverse: an untrusted client must not be able to get an innocent third
+    /// party blocked by naming it in XFF.
+    #[test]
+    fn untrusted_xff_cannot_frame_a_third_party() {
+        let visitor: IpAddr = "203.0.113.9".parse().unwrap();
+        let victim: IpAddr = "45.155.205.233".parse().unwrap();
+        let blocked = move |ip: IpAddr| ip == victim;
+        assert!(
+            !blocklist_hit(visitor, &xff("45.155.205.233"), blocked, trusted),
+            "an untrusted client's XFF was honoured — it could have a third party blocked"
+        );
+    }
+
+    /// Clean traffic must pass, from either position.
+    #[test]
+    fn blocklist_passes_clean_traffic() {
+        let proxy: IpAddr = "10.0.0.5".parse().unwrap();
+        let visitor: IpAddr = "203.0.113.9".parse().unwrap();
+        let blocked = |ip: IpAddr| ip == "45.155.205.233".parse::<IpAddr>().unwrap();
+        assert!(!blocklist_hit(
+            visitor,
+            &http::HeaderMap::new(),
+            blocked,
+            trusted
+        ));
+        assert!(!blocklist_hit(proxy, &xff("203.0.113.9"), blocked, trusted));
+    }
+
+    #[test]
+    fn untrusted_peer_ignores_xff_no_spoof() {
+        // A direct client that is NOT a trusted proxy cannot spoof its IP.
+        let peer: IpAddr = "203.0.113.9".parse().unwrap();
+        assert_eq!(resolve_client_ip_with(peer, &xff("1.2.3.4"), trusted), None);
+    }
+
+    #[test]
+    fn trusted_proxy_resolves_rightmost_real_client() {
+        // HAProxy (trusted) appends the observed client on the right; a left-most
+        // client-forged entry must lose.
+        let peer: IpAddr = "10.0.0.5".parse().unwrap();
+        let got = resolve_client_ip_with(peer, &xff("6.6.6.6, 45.155.205.233"), trusted);
+        assert_eq!(got, Some("45.155.205.233".parse().unwrap()));
+    }
+
+    #[test]
+    fn walks_past_trusted_hops_to_first_untrusted() {
+        let peer: IpAddr = "10.0.0.5".parse().unwrap();
+        let got = resolve_client_ip_with(peer, &xff("127.0.0.1, 8.8.8.8, 10.0.0.9"), trusted);
+        // right-to-left: 10.0.0.9 trusted (skip) -> 8.8.8.8 untrusted -> win.
+        assert_eq!(got, Some("8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn no_xff_keeps_peer() {
+        let peer: IpAddr = "10.0.0.5".parse().unwrap();
+        assert_eq!(
+            resolve_client_ip_with(peer, &http::HeaderMap::new(), trusted),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    // Proves the R6 shutdown drain lets an in-flight request FINISH rather than
+    // being severed by the runtime drop (the old abort() → 502-on-deploy bug).
+    #[tokio::test]
+    async fn conn_tracker_drain_waits_for_inflight() {
+        let tracker = tokio_util::task::TaskTracker::new();
+        let done = Arc::new(AtomicBool::new(false));
+        let d2 = Arc::clone(&done);
+        tracker.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await; // in-flight request
+            d2.store(true, Ordering::SeqCst);
+        });
+        tracker.close();
+        let r = tokio::time::timeout(Duration::from_secs(5), tracker.wait()).await;
+        assert!(r.is_ok(), "drain should complete within grace");
+        assert!(
+            done.load(Ordering::SeqCst),
+            "in-flight request must FINISH, not be severed"
+        );
+    }
+
+    // Proves the drain is BOUNDED — a stuck/idle keep-alive connection can't hang
+    // shutdown forever; the grace timeout closes it.
+    #[tokio::test]
+    async fn conn_tracker_drain_is_bounded() {
+        let tracker = tokio_util::task::TaskTracker::new();
+        tracker.spawn(async { std::future::pending::<()>().await });
+        tracker.close();
+        let r = tokio::time::timeout(Duration::from_millis(150), tracker.wait()).await;
+        assert!(
+            r.is_err(),
+            "drain must be bounded by grace on a stuck connection"
+        );
+    }
+}
+
+#[cfg(test)]
+mod log_explain_tests {
+    use super::*;
+    use sentinel_core::context::{RuleMatch, Severity};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn ctx_with(ip: &str, path: &str) -> RequestContext {
+        let mut ctx = RequestContext::new(ip.parse::<IpAddr>().unwrap(), 44321);
+        ctx.method = http::Method::POST;
+        ctx.uri = path.parse().unwrap();
+        ctx.site_id = Some("juice".to_string());
+        ctx.anomaly_threshold = Some(10);
+        ctx.enforcement_mode = Some(WafMode::Blocking);
+        ctx.response_status = Some(http::StatusCode::FORBIDDEN);
+        ctx
+    }
+
+    fn sqli_match() -> RuleMatch {
+        RuleMatch {
+            rule_id: "942100".to_string(),
+            message: "SQL injection detected".to_string(),
+            severity: Severity::Critical,
+            score: 15,
+            target: "ARGS:username".to_string(),
+            phase: Phase::RequestHeaders,
+        }
+    }
+
+    #[test]
+    fn target_is_rendered_in_english() {
+        assert_eq!(humanize_target("ARGS:id"), "parameter 'id'");
+        assert_eq!(
+            humanize_target("REQUEST_HEADERS:X-Api-Key"),
+            "request header 'X-Api-Key'"
+        );
+        assert_eq!(humanize_target("REQUEST_COOKIES:sid"), "cookie 'sid'");
+        assert_eq!(humanize_target("REQUEST_BODY"), "the request body");
+        assert_eq!(
+            humanize_target("ARGS_NAMES:x"),
+            "parameter name 'x'",
+            "the NAME/value distinction must survive — it changes what you exclude"
+        );
+        // An unrecognised collection is echoed, never invented.
+        assert_eq!(
+            humanize_target("SOME_FUTURE_THING:z"),
+            "SOME_FUTURE_THING:z"
+        );
+    }
+
+    #[test]
+    fn block_message_names_what_where_who_and_why() {
+        let mut ctx = ctx_with("45.155.205.233", "/login");
+        ctx.geo_country = Some("RU".to_string());
+        ctx.decision = WafDecision::Block;
+        ctx.anomaly_score = 15;
+        ctx.rule_matches.push(sqli_match());
+
+        let (msg, rem) = explain_event(&ctx, "BLOCK", "942100", "SQL injection detected");
+
+        assert!(msg.starts_with("BLOCKED on 'juice'"), "got: {msg}");
+        assert!(
+            msg.contains("parameter 'username'"),
+            "WHERE is missing: {msg}"
+        );
+        assert!(msg.contains("rule 942100"), "rule is missing: {msg}");
+        assert!(
+            msg.contains("45.155.205.233 (RU)"),
+            "origin is missing: {msg}"
+        );
+        assert!(msg.contains("POST /login"), "request is missing: {msg}");
+        assert!(
+            msg.contains("score 15 against this site's threshold of 10"),
+            "the score/threshold comparison is the WHY: {msg}"
+        );
+        assert!(msg.contains("threshold reached"), "got: {msg}");
+        assert!(msg.contains("Responded 403"), "outcome is missing: {msg}");
+        // The remediation must name the exact rule AND target to exclude.
+        assert!(rem.contains("exclude rule 942100"), "got: {rem}");
+        assert!(rem.contains("parameter 'username'"), "got: {rem}");
+    }
+
+    /// The most dangerous ambiguity in a WAF log: a learning-mode record that
+    /// reads like an enforced block. An operator who believes traffic was stopped
+    /// when it was not will not investigate.
+    #[test]
+    fn learning_mode_never_reads_as_blocked() {
+        let mut ctx = ctx_with("1.2.3.4", "/search");
+        ctx.enforcement_mode = Some(WafMode::Learning);
+        ctx.decision = WafDecision::Log;
+        ctx.would_block = true;
+        ctx.anomaly_score = 12;
+        ctx.response_status = Some(http::StatusCode::OK);
+        ctx.rule_matches.push(sqli_match());
+
+        let (msg, _) = explain_event(&ctx, "DETECT", "942100", "SQL injection detected");
+
+        assert!(msg.contains("ALLOWED THROUGH"), "got: {msg}");
+        assert!(msg.contains("learning mode"), "got: {msg}");
+        assert!(msg.contains("not blocked"), "got: {msg}");
+        assert!(
+            !msg.contains("BLOCKED on"),
+            "a learning record must never claim a block: {msg}"
+        );
+    }
+
+    /// A rate-limit block carries no rule and no score. The explanation must not
+    /// fabricate a score comparison it does not have.
+    #[test]
+    fn non_rule_block_explains_without_inventing_a_score() {
+        let mut ctx = ctx_with("9.9.9.9", "/api/v1/orders");
+        ctx.decision = WafDecision::Block;
+        ctx.block_reason = Some("rate limit exceeded: 120 req/10s".to_string());
+        ctx.response_status = Some(http::StatusCode::TOO_MANY_REQUESTS);
+
+        let (msg, rem) = explain_event(&ctx, "BLOCK", "RATELIMIT", "Rate limit exceeded");
+
+        assert!(
+            msg.contains("rate limit exceeded: 120 req/10s"),
+            "got: {msg}"
+        );
+        assert!(
+            !msg.contains("anomaly score"),
+            "no score exists for a rate-limit block; it must not be implied: {msg}"
+        );
+        assert!(rem.contains("raise the rate limit"), "got: {rem}");
+    }
+
+    #[test]
+    fn prose_truncation_reports_the_real_length() {
+        let long = "a".repeat(400);
+        let out = truncate_for_prose(&long, 120);
+        assert!(out.contains("400 chars total"), "got: {out}");
+        assert!(out.chars().count() < 160, "still bounded: {}", out.len());
+        // Short input is returned untouched.
+        assert_eq!(truncate_for_prose("/short", 120), "/short");
+    }
+
+    #[test]
+    fn unrouted_request_is_attributed_to_the_node_not_a_site() {
+        let mut ctx = RequestContext::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 1234);
+        ctx.decision = WafDecision::Block;
+        ctx.block_reason = Some("threat intel: known scanner".to_string());
+        let (msg, rem) = explain_event(&ctx, "BLOCK", "THREATINTEL", "threat intel: known scanner");
+        assert!(msg.contains("unrouted request"), "got: {msg}");
+        assert!(rem.contains("threat-intelligence feed"), "got: {rem}");
+    }
+}
+
+#[cfg(test)]
+mod inline_rule_diag_tests {
+    use super::*;
+    use sentinel_core::config::{InlineRule, UpstreamConfig};
+
+    /// The diagnostics registry is process-global by design — it mirrors one
+    /// node's live state. Cargo runs tests in threads, so without this they clear
+    /// each other's entries and fail intermittently. Serialise them.
+    static DIAG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn guard() -> std::sync::MutexGuard<'static, ()> {
+        DIAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn site_with(inline: Vec<InlineRule>) -> SiteConfig {
+        SiteConfig {
+            id: "s".into(),
+            tenant_id: String::new(),
+            domains: vec!["s.local".into()],
+            upstream: UpstreamConfig {
+                load_balancer: sentinel_core::config::LoadBalancerStrategy::RoundRobin,
+                servers: vec![],
+                health_check: None,
+                timeout_secs: None,
+            },
+            waf: WafConfig {
+                mode: WafMode::Blocking,
+                rules: vec![],
+                inline_rules: inline,
+                ..Default::default()
+            },
+            plugins: vec![],
+            tls: Default::default(),
+        }
+    }
+
+    fn diag(name: &str) -> Option<InlineRuleDiag> {
+        inline_rule_diag_snapshot()
+            .into_iter()
+            .find(|d| d.name == name)
+    }
+
+    const GOOD: &str = r#"
+rule 9990001 {
+    phase    : request_body
+    targets  : ARGS
+    operator : rx /GOODMARKER/
+    action   : block
+    severity : critical
+    message  : "ok"
+}
+"#;
+
+    /// A rule that compiles must report enforced, and one that does not must
+    /// report the reason. This is the whole contract: the control plane has no
+    /// compiler, so if this is wrong the UI's "enabled" is a guess.
+    #[test]
+    fn records_success_and_failure_with_reasons() {
+        let _g = guard();
+        reset_inline_rule_diags();
+        let site = site_with(vec![
+            InlineRule {
+                name: "good".into(),
+                dsl: GOOD.into(),
+            },
+            InlineRule {
+                name: "bad".into(),
+                dsl: "rule nope { totally invalid (((".into(),
+            },
+        ]);
+        let _ = load_site_engine(&site);
+
+        let good = diag("good").expect("good rule should be reported");
+        assert!(good.enforced, "a rule that compiles must report enforced");
+        assert!(good.error.is_none());
+
+        let bad = diag("bad").expect("bad rule should be reported");
+        assert!(
+            !bad.enforced,
+            "a rule that does not parse must not claim to be enforced"
+        );
+        assert!(
+            bad.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("does not parse"),
+            "the failure must say why, got {:?}",
+            bad.error
+        );
+    }
+
+    /// A rule whose DSL parses but defines nothing is not enforcing anything, and
+    /// reporting it as enforced would be the same false confidence in a subtler form.
+    #[test]
+    fn parsed_but_empty_is_not_enforced() {
+        let _g = guard();
+        reset_inline_rule_diags();
+        let site = site_with(vec![InlineRule {
+            name: "empty".into(),
+            dsl: "# just a comment\n".into(),
+        }]);
+        let _ = load_site_engine(&site);
+
+        let d = diag("empty").expect("should be reported");
+        assert!(
+            !d.enforced,
+            "a DSL defining no rules must not report enforced"
+        );
+        assert!(d.error.as_deref().unwrap_or("").contains("no rules"));
+    }
+
+    /// The registry is rebuilt each reload so a deleted rule stops claiming to run.
+    #[test]
+    fn reset_clears_stale_entries() {
+        let _g = guard();
+        reset_inline_rule_diags();
+        let _ = load_site_engine(&site_with(vec![InlineRule {
+            name: "transient".into(),
+            dsl: GOOD.into(),
+        }]));
+        assert!(diag("transient").is_some(), "precondition");
+
+        reset_inline_rule_diags();
+        assert!(
+            diag("transient").is_none(),
+            "a rule absent from the new config must not keep reporting enforced"
+        );
+    }
+
+    /// Snapshot must serialise to the shape the control plane parses out of the
+    /// heartbeat: a name, an enforced flag, and error only when present.
+    #[test]
+    fn snapshot_serialises_for_the_heartbeat() {
+        let _g = guard();
+        reset_inline_rule_diags();
+        record_inline_rule_diag("ok-rule", true, None);
+        record_inline_rule_diag("bad-rule", false, Some("does not parse: x".into()));
+
+        let json = serde_json::to_string(&inline_rule_diag_snapshot()).expect("serialise");
+        assert!(json.contains(r#""name":"ok-rule""#), "got {json}");
+        assert!(json.contains(r#""enforced":true"#), "got {json}");
+        assert!(
+            json.contains(r#""error":"does not parse: x""#),
+            "got {json}"
+        );
+        // The success entry must not carry a null error field.
+        let ok_part = json.split(r#"{"name":"bad-rule""#).next().unwrap_or("");
+        assert!(
+            !ok_part.contains("error"),
+            "success entry should omit error: {ok_part}"
+        );
+    }
+
+    /// A failure recorded for one site must not be overwritten by another site
+    /// succeeding, or a partially-broken rollout would report as healthy.
+    #[test]
+    fn a_failure_is_not_overwritten_by_a_later_success() {
+        let _g = guard();
+        reset_inline_rule_diags();
+        record_inline_rule_diag("r", false, Some("does not parse".into()));
+        record_inline_rule_diag("r", true, None);
+        let d = diag("r").expect("present");
+        assert!(!d.enforced, "a recorded failure must stick");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Response-body scan buffering
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod response_scan_tests {
+    use super::*;
+
+    /// A body that yields its chunks one frame at a time and — crucially —
+    /// keeps the DEFAULT `size_hint()` of `(0, None)`.  That is exactly what a
+    /// `Transfer-Encoding: chunked` response looks like, and it is the shape
+    /// that used to slip past the size check.
+    struct ChunkedTestBody {
+        chunks: std::collections::VecDeque<Bytes>,
+    }
+
+    impl Body for ChunkedTestBody {
+        type Data = Bytes;
+        type Error = hyper::Error;
+
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+            let this = self.get_mut();
+            std::task::Poll::Ready(
+                this.chunks
+                    .pop_front()
+                    .map(|b| Ok(hyper::body::Frame::data(b))),
+            )
+        }
+    }
+
+    fn chunked_body(chunks: Vec<Bytes>) -> BoxBody {
+        ChunkedTestBody {
+            chunks: chunks.into(),
+        }
+        .boxed()
+    }
+
+    #[test]
+    fn the_test_body_declares_no_length_like_a_chunked_response() {
+        let b = chunked_body(vec![Bytes::from_static(b"x")]);
+        assert_eq!(b.size_hint().upper(), None, "fixture must be unbounded");
+    }
+
+    async fn drain(body: BoxBody) -> Bytes {
+        body.collect().await.expect("drain body").to_bytes()
+    }
+
+    #[tokio::test]
+    async fn body_under_the_cap_is_returned_whole_for_scanning() {
+        let b = chunked_body(vec![
+            Bytes::from_static(b"hello "),
+            Bytes::from_static(b"world"),
+        ]);
+        match buffer_for_scan(b, 1024).await {
+            ScanBuffer::Complete(bytes) => assert_eq!(&bytes[..], b"hello world"),
+            _ => panic!("expected Complete"),
+        }
+    }
+
+    /// THE REGRESSION TEST. A chunked body reports no size hint, so the old
+    /// `size_hint().upper().unwrap_or(0)` check read `0`, passed the `<= cap`
+    /// test, and collected the entire response into memory with no limit.
+    /// Buffering must now stop at the cap.
+    #[tokio::test]
+    async fn oversized_chunked_body_stops_buffering_at_the_cap() {
+        let cap = 4096;
+        // 64 chunks x 1 KiB = 64 KiB, far past the cap, with NO declared length.
+        let chunks: Vec<Bytes> = (0..64).map(|_| Bytes::from(vec![b'A'; 1024])).collect();
+        let total: usize = chunks.iter().map(|c| c.len()).sum();
+
+        match buffer_for_scan(chunked_body(chunks), cap).await {
+            ScanBuffer::Oversize { prefix, rest } => {
+                // Bounded: only the cap (plus at most one straddling chunk) is
+                // ever held in memory — not the whole 64 KiB.
+                assert!(
+                    prefix.len() <= cap + 1024,
+                    "buffered {} bytes for a {cap}-byte cap",
+                    prefix.len()
+                );
+                // And nothing is lost: prefix + remainder == the original body.
+                let rest = drain(rest).await;
+                assert_eq!(prefix.len() + rest.len(), total, "bytes lost or duplicated");
+            }
+            _ => panic!("expected Oversize"),
+        }
+    }
+
+    /// A response that is forwarded uninspected must reach the client
+    /// byte-for-byte — the prefix already pulled off the wire is replayed, not
+    /// dropped and not sent twice.
+    #[tokio::test]
+    async fn prefixed_body_replays_the_prefix_then_streams_the_rest() {
+        let original: Vec<Bytes> = (0..32)
+            .map(|i| Bytes::from(vec![b'a' + (i % 26) as u8; 512]))
+            .collect();
+        let expected: Vec<u8> = original.iter().flat_map(|c| c.to_vec()).collect();
+
+        let ScanBuffer::Oversize { prefix, rest } =
+            buffer_for_scan(chunked_body(original), 2048).await
+        else {
+            panic!("expected Oversize");
+        };
+
+        let forwarded = drain(
+            PrefixedBody {
+                prefix: Some(prefix),
+                inner: rest,
+            }
+            .boxed(),
+        )
+        .await;
+        assert_eq!(&forwarded[..], &expected[..]);
+    }
+
+    #[tokio::test]
+    async fn prefixed_body_with_no_prefix_just_streams_the_inner_body() {
+        let body = PrefixedBody {
+            prefix: None,
+            inner: chunked_body(vec![Bytes::from_static(b"abc")]),
+        };
+        assert_eq!(&drain(body.boxed()).await[..], b"abc");
+    }
+
+    #[test]
+    fn concat_chunks_handles_empty_single_and_many() {
+        assert_eq!(concat_chunks(vec![]).len(), 0);
+        assert_eq!(
+            &concat_chunks(vec![Bytes::from_static(b"solo")])[..],
+            b"solo"
+        );
+        assert_eq!(
+            &concat_chunks(vec![
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"b"),
+                Bytes::from_static(b"c"),
+            ])[..],
+            b"abc"
         );
     }
 }

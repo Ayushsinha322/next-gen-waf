@@ -61,6 +61,18 @@ export interface RuleExclusion {
   disable?:        boolean;
 }
 
+/** Per-path policy override. Longest matching prefix wins, so /api/admin/ beats
+ *  /api/ regardless of the order rows were added.
+ *
+ *  Only mode and anomaly_threshold can vary by path: paranoia_level and
+ *  rule_exclusions are applied when the rule engine is COMPILED, so the API
+ *  rejects them here rather than accepting and ignoring them. */
+export interface PathOverride {
+  path_prefix:        string;
+  mode?:              WafMode | "";
+  anomaly_threshold?: number | "";
+}
+
 export interface RateWindow { rps: number; burst: number }
 
 /* ── TLS / Certificates ───────────────────────────────────────── */
@@ -95,6 +107,12 @@ export type CustomCertPriority = "data" | "file";
 
 /* ── Custom response header ───────────────────────────────────── */
 export interface CustomHeader { name: string; value: string }
+
+/* ── External IP-reputation feed (ip_reputation.feeds) ─────────── */
+export interface IpFeed { url: string; interval: string; format: "cidr" | "json" }
+
+/* ── DLP action (response data-loss prevention) ───────────────── */
+export type DlpAction = "block" | "mask" | "detect";
 
 /* ── Full form state ───────────────────────────────────────────── */
 export interface SiteForm {
@@ -155,6 +173,7 @@ export interface SiteForm {
   anomaly_threshold: number;
   rule_categories:   string[];
   rule_exclusions:   RuleExclusion[];
+  path_overrides:    PathOverride[];
 
   // request limits
   max_body_size_mb: number;
@@ -204,7 +223,49 @@ export interface SiteForm {
   // ml + advanced
   ml_enabled:     boolean;
   ml_sensitivity: number;
+  ml_models:      string[];   // specific bundled models ([] = all)
   api_discovery:  boolean;
+
+  // api security — edge JWT / OAuth2 validation (waf_policy.jwt)
+  jwt_enabled:         boolean;
+  jwt_required:        boolean;   // reject missing/invalid token vs. verify-if-present
+  jwt_issuer:          string;
+  jwt_audience:        string;
+  jwt_algorithms:      string[];  // e.g. ["RS256"]
+  jwt_hs_secret:       string;    // HS256 shared secret
+  jwt_public_key_pem:  string;    // RSA/EC public key PEM
+  jwt_jwks_url:        string;    // JWKS endpoint (rotated by kid)
+  jwt_required_scopes: string[];
+  jwt_scope_claim:     string;    // default "scope"
+
+  // api security — GraphQL firewall (waf_policy.graphql)
+  graphql_enabled:             boolean;
+  graphql_max_depth:           number;
+  graphql_max_complexity:      number;
+  graphql_block_introspection: boolean;
+
+  // api security — gRPC firewall (waf_policy.grpc)
+  grpc_enabled:          boolean;
+  grpc_max_message_kb:   number;   // UI in KB → bytes on emit
+  grpc_max_frames:       number;
+  grpc_block_reflection: boolean;
+  grpc_allowed_methods:  string[];
+  grpc_blocked_methods:  string[];
+
+  // response data-loss prevention (waf_policy.dlp)
+  dlp_enabled:  boolean;
+  dlp_action:   DlpAction;
+  dlp_patterns: string[];   // extra regexes on top of built-ins ([] = built-ins only)
+
+  // weighted verdict fusion (waf_policy.fusion)
+  fusion_enabled:          boolean;
+  fusion_weights:          Record<string, number>;  // engine → weight
+  fusion_block_thresholds: number[];  // per paranoia level PL1..PL4
+  fusion_limit_thresholds: number[];  // soft-LIMIT tier per PL ([] disables)
+  fusion_limit_status:     number;    // HTTP status for a LIMIT verdict
+
+  // external ip-reputation feeds (waf_policy.ip_reputation.feeds)
+  ip_feeds: IpFeed[];
 }
 
 /* ── OWASP CRS categories (UI-friendly toggles) ───────────────────
@@ -230,6 +291,18 @@ export const ALL_CRS_KEYS = CRS_CATEGORIES.map(c => c.key);
 
 /* ── HTTP methods (for method enforcement) ────────────────────── */
 export const HTTP_METHODS = ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE", "CONNECT", "TRACE"];
+
+/* ── JWT signature algorithms (edge JWT / OAuth2 validation) ───── */
+export const JWT_ALGORITHMS = ["RS256", "RS384", "RS512", "ES256", "ES384", "HS256", "HS384", "HS512"];
+
+/* ── Weighted-fusion engines (engine → weight multiplier) ─────────
+ * Mirrors the recognised engines in FusionConfig (Rust). Weight 1.0 = neutral. */
+export const FUSION_ENGINES: { key: string; label: string; desc: string }[] = [
+  { key: "rules",        label: "Signature rules", desc: "OWASP CRS + custom DSL score" },
+  { key: "ml",           label: "ML anomaly",      desc: "Behavioural model score" },
+  { key: "bot",          label: "Bot detection",   desc: "JA4 + heuristic bot score" },
+  { key: "threat_intel", label: "Threat intel",    desc: "IOC / reputation match" },
+];
 
 /* ── ACME / Let's Encrypt providers ───────────────────────────── */
 export const ACME_PROVIDERS: { key: AcmeProvider; label: string; desc: string }[] = [
@@ -305,7 +378,7 @@ export function emptyForm(): SiteForm {
     hsts: true, hsts_max_age: 31536000,
 
     mode: "blocking", paranoia_level: 2, anomaly_threshold: 5,
-    rule_categories: [...ALL_CRS_KEYS], rule_exclusions: [],
+    rule_categories: [...ALL_CRS_KEYS], rule_exclusions: [], path_overrides: [],
 
     max_body_size_mb: 10, max_uri_length: 8192, max_header_count: 100,
     allowed_methods: ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"],
@@ -329,8 +402,27 @@ export function emptyForm(): SiteForm {
     cors_enabled: false, cors_origins: "*", cookie_flags: "* HttpOnly SameSite=Lax",
     custom_headers: [],
 
-    ml_enabled: false, ml_sensitivity: 0.85,
+    ml_enabled: false, ml_sensitivity: 0.85, ml_models: [],
     api_discovery: false,
+
+    jwt_enabled: false, jwt_required: true, jwt_issuer: "", jwt_audience: "",
+    jwt_algorithms: ["RS256"], jwt_hs_secret: "", jwt_public_key_pem: "",
+    jwt_jwks_url: "", jwt_required_scopes: [], jwt_scope_claim: "scope",
+
+    graphql_enabled: false, graphql_max_depth: 10, graphql_max_complexity: 1000,
+    graphql_block_introspection: true,
+
+    grpc_enabled: false, grpc_max_message_kb: 4096, grpc_max_frames: 512,
+    grpc_block_reflection: true, grpc_allowed_methods: [], grpc_blocked_methods: [],
+
+    dlp_enabled: false, dlp_action: "block", dlp_patterns: [],
+
+    fusion_enabled: false,
+    fusion_weights: { rules: 1, ml: 1, bot: 1, threat_intel: 1 },
+    fusion_block_thresholds: [7, 5, 4, 3], fusion_limit_thresholds: [4, 3, 2, 2],
+    fusion_limit_status: 429,
+
+    ip_feeds: [],
   };
 }
 
@@ -347,6 +439,20 @@ export function applyPreset(form: SiteForm, preset: PresetKey): SiteForm {
     bot_ja4: p.bot_ja4,
     rule_categories: [...ALL_CRS_KEYS],
   };
+}
+
+/** Parse a duration like "60s" / "2m" / "90" (bare = seconds) into whole
+ *  seconds. Returns 0 for anything unparseable, which callers read as
+ *  "unset — use the deployment default". */
+export function durationToSecs(v: string): number {
+  const m = /^(\d+)\s*(s|m|h)?$/i.exec((v ?? "").trim());
+  if (!m) return 0;
+  const n = Number(m[1]);
+  switch ((m[2] ?? "s").toLowerCase()) {
+    case "m": return n * 60;
+    case "h": return n * 3600;
+    default:  return n;
+  }
 }
 
 /* ── Form → API payload ───────────────────────────────────────── */
@@ -375,6 +481,28 @@ export function formToPayload(f: SiteForm): {
   if (f.proxy_ssl_sni) { proxy.ssl_sni = true; if (f.proxy_ssl_sni_name.trim()) proxy.ssl_sni_name = f.proxy_ssl_sni_name.trim(); }
   upstream.proxy = proxy;
 
+  // How long the origin may take to return response headers. This is the only
+  // consumer of the Read Timeout field that the data plane actually enforces —
+  // `upstream.proxy.read_timeout` was never read by it, so the control looked
+  // live but did nothing. 0 / unparseable = fall back to the node default.
+  const readTimeoutSecs = durationToSecs(f.proxy_read_timeout);
+  if (readTimeoutSecs > 0) upstream.timeout_secs = readTimeoutSecs;
+
+  // Drop incomplete or no-op rows rather than sending them: the API rejects an
+  // override that sets neither mode nor threshold, and a half-filled row in the
+  // UI should not fail the whole save.
+  const path_overrides = (f.path_overrides ?? [])
+    .filter(o => o.path_prefix.trim() !== "")
+    .map(o => {
+      const out: Record<string, unknown> = { path_prefix: o.path_prefix.trim() };
+      if (o.mode) out.mode = o.mode;
+      if (o.anomaly_threshold !== "" && o.anomaly_threshold !== undefined) {
+        out.anomaly_threshold = Number(o.anomaly_threshold);
+      }
+      return out;
+    })
+    .filter(o => o.mode !== undefined || o.anomaly_threshold !== undefined);
+
   const waf_policy: Record<string, unknown> = {
     mode: f.mode,
     paranoia_level: Number(f.paranoia_level) || 2,
@@ -386,6 +514,10 @@ export function formToPayload(f: SiteForm): {
     max_header_count: Number(f.max_header_count) || 100,
     allowed_methods: f.allowed_methods,
     api_discovery: f.api_discovery,
+    // Always emitted, including when empty: waf_policy is REPLACED wholesale, so
+    // an absent key and an empty list mean the same thing to the server — but
+    // sending it explicitly keeps "cleared on purpose" legible in a request log.
+    path_overrides,
     // front-service exposure (informational round-trip; listener is global today)
     frontend: {
       https: f.front_https, force_https: f.force_https,
@@ -439,9 +571,13 @@ export function formToPayload(f: SiteForm): {
       : { block_countries: f.geo_countries, allow_countries: [] };
   }
   // IP reputation + blacklist sources (passed through verbatim to the data plane).
+  const ipFeeds = f.ip_feeds
+    .filter(x => x.url.trim())
+    .map(x => ({ url: x.url.trim(), interval: x.interval.trim() || "1h", format: x.format || "cidr" }));
   if (f.ip_allow.length > 0 || f.ip_block.length > 0 || f.dnsbl_enabled ||
-      f.blacklist_user_agents.length > 0 || f.blacklist_uris.length > 0) {
+      f.blacklist_user_agents.length > 0 || f.blacklist_uris.length > 0 || ipFeeds.length > 0) {
     const ipr: Record<string, unknown> = { allow: f.ip_allow, block: f.ip_block };
+    if (ipFeeds.length) ipr.feeds = ipFeeds;
     if (f.dnsbl_enabled) ipr.dnsbl = { enabled: true, servers: f.dnsbl_servers };
     if (f.blacklist_user_agents.length) ipr.block_user_agents = f.blacklist_user_agents;
     if (f.blacklist_uris.length) ipr.block_uris = f.blacklist_uris;
@@ -461,7 +597,76 @@ export function formToPayload(f: SiteForm): {
   if (Object.keys(headers).length) waf_policy.security_headers = headers;
 
   if (f.ml_enabled) {
-    waf_policy.ml = { enable: true, models: [], sensitivity: Number(f.ml_sensitivity) || 0.85 };
+    waf_policy.ml = {
+      enable: true,
+      models: f.ml_models.map(m => m.trim()).filter(Boolean),
+      sensitivity: Number(f.ml_sensitivity) || 0.85,
+    };
+  }
+
+  // ── Edge JWT / OAuth2 validation (waf_policy.jwt) ──
+  if (f.jwt_enabled) {
+    const jwt: Record<string, unknown> = {
+      enable: true,
+      required: f.jwt_required,
+      algorithms: f.jwt_algorithms.length ? f.jwt_algorithms : ["RS256"],
+      required_scopes: f.jwt_required_scopes,
+      scope_claim: f.jwt_scope_claim.trim() || "scope",
+    };
+    if (f.jwt_issuer.trim()) jwt.issuer = f.jwt_issuer.trim();
+    if (f.jwt_audience.trim()) jwt.audience = f.jwt_audience.trim();
+    if (f.jwt_hs_secret.trim()) jwt.hs_secret = f.jwt_hs_secret.trim();
+    if (f.jwt_public_key_pem.trim()) jwt.public_key_pem = f.jwt_public_key_pem.trim();
+    if (f.jwt_jwks_url.trim()) jwt.jwks_url = f.jwt_jwks_url.trim();
+    waf_policy.jwt = jwt;
+  }
+
+  // ── GraphQL firewall (waf_policy.graphql) ──
+  if (f.graphql_enabled) {
+    waf_policy.graphql = {
+      enable: true,
+      max_depth: Number(f.graphql_max_depth) || 10,
+      max_complexity: Number(f.graphql_max_complexity) || 1000,
+      block_introspection: f.graphql_block_introspection,
+    };
+  }
+
+  // ── gRPC firewall (waf_policy.grpc) ──
+  if (f.grpc_enabled) {
+    waf_policy.grpc = {
+      enable: true,
+      max_message_bytes: (Number(f.grpc_max_message_kb) || 4096) * 1024,
+      max_frames: Number(f.grpc_max_frames) || 512,
+      block_reflection: f.grpc_block_reflection,
+      allowed_methods: f.grpc_allowed_methods,
+      blocked_methods: f.grpc_blocked_methods,
+    };
+  }
+
+  // ── Response data-loss prevention (waf_policy.dlp) ──
+  if (f.dlp_enabled) {
+    waf_policy.dlp = {
+      enable: true,
+      action: f.dlp_action,
+      patterns: f.dlp_patterns.map(p => p.trim()).filter(Boolean),
+    };
+  }
+
+  // ── Weighted verdict fusion (waf_policy.fusion) ──
+  if (f.fusion_enabled) {
+    // Drop neutral (1.0) weights so the payload only carries operator intent.
+    const weights: Record<string, number> = {};
+    for (const [k, v] of Object.entries(f.fusion_weights)) {
+      const n = Number(v);
+      if (Number.isFinite(n) && n !== 1) weights[k] = n;
+    }
+    waf_policy.fusion = {
+      enable: true,
+      weights,
+      block_thresholds: f.fusion_block_thresholds.map(n => Number(n) || 0),
+      limit_thresholds: f.fusion_limit_thresholds.map(n => Number(n) || 0),
+      limit_status: Number(f.fusion_limit_status) || 429,
+    };
   }
 
   return { name: f.name.trim(), domains: f.domains, upstream, waf_policy };
@@ -508,6 +713,12 @@ export function siteToForm(site: Site): SiteForm {
     f.proxy_ssl_sni = bool(proxy.ssl_sni);
     f.proxy_ssl_sni_name = str(proxy.ssl_sni_name);
   }
+  // `timeout_secs` is the value the data plane actually enforces, so it wins
+  // over the legacy `proxy.read_timeout` display string when both are present.
+  const timeoutSecs = Number(up.timeout_secs);
+  if (Number.isFinite(timeoutSecs) && timeoutSecs > 0) {
+    f.proxy_read_timeout = `${timeoutSecs}s`;
+  }
 
   const w = (site.waf_policy ?? {}) as AnyRec;
   f.mode = (w.mode as WafMode) ?? "blocking";
@@ -516,6 +727,18 @@ export function siteToForm(site: Site): SiteForm {
   const cats = arr<string>(w.rule_categories);
   f.rule_categories = cats.length ? cats : [...ALL_CRS_KEYS];
   f.rule_exclusions = arr<RuleExclusion>(w.rule_exclusions);
+  // Read back so a round-trip preserves them. Omitting this made loading a site
+  // and saving it — for any reason, e.g. flipping the mode — silently DELETE the
+  // operator's per-path policy, because formToPayload writes a whole waf_policy
+  // and the form had an empty list. Every field in SiteForm must be read here or
+  // it is data the UI quietly discards.
+  // Read as loose records: this is untrusted JSON from the API, not something
+  // already shaped like a PathOverride.
+  f.path_overrides = arr<AnyRec>(w.path_overrides).map(o => ({
+    path_prefix:       String(o.path_prefix ?? ""),
+    mode:              (o.mode as WafMode) ?? "",
+    anomaly_threshold: typeof o.anomaly_threshold === "number" ? o.anomaly_threshold : "",
+  }));
   if (typeof w.max_body_size === "number") f.max_body_size_mb = Math.round((w.max_body_size as number) / (1024 * 1024));
   f.max_uri_length = num(w.max_uri_length, 8192);
   f.max_header_count = num(w.max_header_count, 100);
@@ -600,6 +823,10 @@ export function siteToForm(site: Site): SiteForm {
     if (dnsbl && dnsbl.enabled) { f.dnsbl_enabled = true; f.dnsbl_servers = arr<string>(dnsbl.servers); }
     f.blacklist_user_agents = arr<string>(ipr.block_user_agents);
     f.blacklist_uris = arr<string>(ipr.block_uris);
+    f.ip_feeds = arr<AnyRec>(ipr.feeds).map(x => ({
+      url: str(x.url), interval: str(x.interval, "1h"),
+      format: (x.format === "json" ? "json" : "cidr") as IpFeed["format"],
+    }));
   }
 
   const sh = w.security_headers as AnyRec | undefined;
@@ -617,7 +844,61 @@ export function siteToForm(site: Site): SiteForm {
   }
 
   const ml = w.ml as AnyRec | undefined;
-  if (ml && ml.enable) { f.ml_enabled = true; f.ml_sensitivity = num(ml.sensitivity, 0.85); }
+  if (ml && ml.enable) { f.ml_enabled = true; f.ml_sensitivity = num(ml.sensitivity, 0.85); f.ml_models = arr<string>(ml.models); }
+
+  const jwt = w.jwt as AnyRec | undefined;
+  if (jwt && jwt.enable) {
+    f.jwt_enabled = true;
+    f.jwt_required = jwt.required === undefined ? true : bool(jwt.required);
+    f.jwt_issuer = str(jwt.issuer);
+    f.jwt_audience = str(jwt.audience);
+    const algs = arr<string>(jwt.algorithms);
+    if (algs.length) f.jwt_algorithms = algs;
+    f.jwt_hs_secret = str(jwt.hs_secret);
+    f.jwt_public_key_pem = str(jwt.public_key_pem);
+    f.jwt_jwks_url = str(jwt.jwks_url);
+    f.jwt_required_scopes = arr<string>(jwt.required_scopes);
+    f.jwt_scope_claim = str(jwt.scope_claim, "scope");
+  }
+
+  const gql = w.graphql as AnyRec | undefined;
+  if (gql && gql.enable) {
+    f.graphql_enabled = true;
+    f.graphql_max_depth = num(gql.max_depth, 10);
+    f.graphql_max_complexity = num(gql.max_complexity, 1000);
+    f.graphql_block_introspection = gql.block_introspection === undefined ? true : bool(gql.block_introspection);
+  }
+
+  const grpc = w.grpc as AnyRec | undefined;
+  if (grpc && grpc.enable) {
+    f.grpc_enabled = true;
+    f.grpc_max_message_kb = Math.round(num(grpc.max_message_bytes, 4 * 1024 * 1024) / 1024);
+    f.grpc_max_frames = num(grpc.max_frames, 512);
+    f.grpc_block_reflection = grpc.block_reflection === undefined ? true : bool(grpc.block_reflection);
+    f.grpc_allowed_methods = arr<string>(grpc.allowed_methods);
+    f.grpc_blocked_methods = arr<string>(grpc.blocked_methods);
+  }
+
+  const dlp = w.dlp as AnyRec | undefined;
+  if (dlp && dlp.enable) {
+    f.dlp_enabled = true;
+    f.dlp_action = (dlp.action === "mask" || dlp.action === "detect") ? dlp.action : "block";
+    f.dlp_patterns = arr<string>(dlp.patterns);
+  }
+
+  const fusion = w.fusion as AnyRec | undefined;
+  if (fusion && fusion.enable) {
+    f.fusion_enabled = true;
+    const wts = (fusion.weights as Record<string, unknown>) ?? {};
+    const merged = { ...f.fusion_weights };
+    for (const [k, v] of Object.entries(wts)) merged[k] = num(v, 1);
+    f.fusion_weights = merged;
+    const bt = arr<number>(fusion.block_thresholds);
+    if (bt.length) f.fusion_block_thresholds = bt;
+    const lt = arr<number>(fusion.limit_thresholds);
+    if (lt.length) f.fusion_limit_thresholds = lt;
+    f.fusion_limit_status = num(fusion.limit_status, 429);
+  }
 
   f.preset = "custom";
   return f;

@@ -12,15 +12,46 @@ function SevBadge({ sev }: { sev: string }) {
   return <span className={`bdg ${cls}`}>{sev.slice(0, 3).toUpperCase()}</span>;
 }
 
-const BLANK_DSL = `rule my-custom-rule {
-  id: 9000100
-  phase: request_body
-  target: ARGS | REQUEST_URI | REQUEST_BODY
-  operator: rx('/(union|select|insert|update|delete|drop)/i')
-  action: block
-  severity: critical
-  msg: "Custom SQL Injection Detection"
-  anomaly_score: 10
+/** Whether the rule is actually RUNNING, as reported by the data plane.
+ *
+ * This column exists because the toggle beside it only ever showed what the
+ * database stored. A rule whose DSL does not compile stays "enabled" forever
+ * while protecting nothing, and this page was the one place an operator would
+ * look and be misled. */
+function EnforcementBadge({ r }: { r: Rule }) {
+  const st = r.enforcement;
+  if (!st) return <span className="td3" title="This control plane does not report enforcement">—</span>;
+
+  const map: Record<string, { cls: string; label: string; tip: string }> = {
+    enforced: {
+      cls: "bgr", label: "LIVE",
+      tip: `Compiled and enforcing on ${r.nodes_enforcing ?? "?"} node(s)`,
+    },
+    not_enforced: {
+      cls: "br blink", label: "BROKEN",
+      tip: r.enforcement_error || "The data plane could not compile this rule",
+    },
+    disabled:     { cls: "bgr", label: "OFF",     tip: "Switched off by an operator" },
+    not_deployed: { cls: "bcy", label: "N/A",     tip: r.enforcement_note || "Not delivered to the data plane" },
+    unknown:      { cls: "ba",  label: "UNKNOWN", tip: r.enforcement_note || "No node has reported recently" },
+  };
+  const m = map[st] ?? { cls: "ba", label: st.toUpperCase(), tip: st };
+  return <span className={`bdg ${m.cls}`} title={m.tip}>{m.label}</span>;
+}
+
+// Valid SRL. The previous template was not: it used `rule <name> {` with a
+// separate `id:` field, singular `target:`, and `operator: rx('...')`. None of
+// that parses — the rule's NAME is its numeric id and the operator form is
+// `rx /pattern/`. Every operator who clicked "New Rule" started from DSL that
+// could never compile, which is why the template is now the same shape the
+// engine's own rule files use.
+const BLANK_DSL = `rule 9000100 {
+  phase    : request_body
+  targets  : ARGS|REQUEST_HEADERS|REQUEST_COOKIES
+  operator : rx /(?i)(union\\s+select|drop\\s+table)/
+  action   : block
+  severity : critical
+  message  : "Custom SQL injection detection"
 }`;
 
 export default function RulesPage() {
@@ -40,11 +71,19 @@ export default function RulesPage() {
   const [saving, setSaving]           = useState(false);
   const [showModal, setShowModal]     = useState(false);
 
-  useEffect(() => {
+  const refresh = () =>
     api.rules.list()
       .then(r => setRules(r.rules ?? []))
-      .catch(() => showToast("Failed to load rules", "e", "⚠️"))
-      .finally(() => setLoading(false));
+      .catch(() => showToast("Failed to load rules", "e", "⚠️"));
+
+  useEffect(() => { refresh().finally(() => setLoading(false)); }, []);
+
+  // Enforcement comes from data-plane heartbeats, so it lags a change by a few
+  // seconds. Poll while the page is open rather than leaving a stale "BROKEN"
+  // badge on a rule the operator has just fixed.
+  useEffect(() => {
+    const t = setInterval(() => { void refresh(); }, 15000);
+    return () => clearInterval(t);
   }, []);
 
   const tabs = [
@@ -90,6 +129,9 @@ export default function RulesPage() {
     setTestResult(null);
   }
 
+  const editorReadOnly =
+    editorRule?.source === "crs" || editorRule?.source === "community";
+
   async function createRule() {
     if (!editorName.trim()) { showToast("Rule name is required", "w", "⚠️"); return; }
     setSaving(true);
@@ -107,6 +149,34 @@ export default function RulesPage() {
     } finally { setSaving(false); }
   }
 
+  /** Persist an edited rule. The textarea has always been editable and there was
+   *  no way to save it, so an operator's only route to fixing a typo was delete
+   *  and recreate — which changes the rule id and orphans its audit history.
+   *
+   *  A rejected save leaves the EXISTING rule in place: the API validates the new
+   *  DSL against the real engine before replacing anything, so a 400 here means
+   *  nothing changed rather than a working rule having been overwritten. */
+  async function saveRule() {
+    if (!editorRule) return;
+    if (editorRule.source === "crs" || editorRule.source === "community") {
+      showToast("Shipped CRS/community rules are read-only", "w", "⚠️"); return;
+    }
+    setSaving(true);
+    try {
+      const res = await api.rules.update(editorRule.id, {
+        dsl: editorDSL, severity: editorSev, phase: editorPhase,
+      });
+      setRules(prev => prev.map(x => x.id === res.rule.id ? res.rule : x));
+      setEditorRule(res.rule);
+      showToast(res.warning ?? `Rule "${res.rule.name}" saved`, res.warning ? "w" : "s", "💾");
+      // Enforcement is reported by the data plane after it re-fetches config, so
+      // the badge is stale for a few seconds; pull it once it has had time.
+      setTimeout(() => { void refresh(); }, 12000);
+    } catch (err: unknown) {
+      showToast(err instanceof Error ? err.message : "Save failed — the rule was not changed", "e", "⚠️");
+    } finally { setSaving(false); }
+  }
+
   async function runTest() {
     const dsl = editorDSL.trim();
     if (!dsl) { showToast("No DSL to test", "w", "⚠️"); return; }
@@ -114,7 +184,12 @@ export default function RulesPage() {
     try {
       const res = await api.rules.test(dsl, testPayload, "POST", "/test");
       setTestResult(res);
-    } catch { showToast("Test failed — check rule syntax", "e", "⚠️"); }
+    } catch (err: unknown) {
+      // An invalid rule comes back 200 with valid:false, so reaching here means
+      // the request itself failed — most often the validator is unavailable on
+      // this node. Blaming the operator's syntax would misattribute it.
+      showToast(err instanceof Error ? err.message : "Could not run the test", "e", "⚠️");
+    }
     finally { setTestLoading(false); }
   }
 
@@ -155,10 +230,10 @@ export default function RulesPage() {
           </div>
           <div className="tw" style={{ maxHeight:480, overflowY:"auto" }}>
             {loading ? (
-              <div style={{ padding:"24px", textAlign:"center", fontFamily:"'Share Tech Mono',monospace", fontSize: 13, color:"var(--text3)" }}>Loading…</div>
+              <div style={{ padding:"24px", textAlign:"center", fontFamily:"var(--font-mono)", fontSize: 13, color:"var(--text3)" }}>Loading…</div>
             ) : (
               <table>
-                <thead><tr><th>On</th><th>Name</th><th>Phase</th><th>Sev</th><th></th></tr></thead>
+                <thead><tr><th>On</th><th>Name</th><th>Running</th><th>Phase</th><th>Sev</th><th></th></tr></thead>
                 <tbody>
                   {displayed.map(r => (
                     <motion.tr key={r.id} initial={{ opacity: 0, x: -6 }} animate={{ opacity: 1, x: 0 }} transition={{ duration: 0.2 }}
@@ -167,7 +242,14 @@ export default function RulesPage() {
                       <td onClick={e => { e.stopPropagation(); toggleRule(r); }}>
                         <div className={`tog ${r.enabled?"on":""}`} />
                       </td>
-                      <td><span style={{ color:"var(--cyan)", fontSize: 14 }}>{r.name}</span></td>
+                      <td>
+                        <span style={{ color:"var(--cyan)", fontSize: 14 }}>{r.name}</span>
+                        {r.site_id && (
+                          <span className="td3" style={{ fontSize: 11, marginLeft: 6 }}
+                            title="Scoped to a single site; deployment-wide rules show no tag">site</span>
+                        )}
+                      </td>
+                      <td><EnforcementBadge r={r} /></td>
                       <td className="td3">{PHASE_LABELS[r.phase]??`ph${r.phase}`}</td>
                       <td><SevBadge sev={r.severity} /></td>
                       <td>
@@ -203,17 +285,49 @@ export default function RulesPage() {
                   <input className="fin2" value={PHASE_LABELS[editorRule.phase]??`phase ${editorRule.phase}`} readOnly style={{ opacity:0.6 }} /></div>
               </div>
             ) : (
-              <div style={{ padding:"16px 0", textAlign:"center", fontSize: 13, fontFamily:"'Share Tech Mono',monospace", color:"var(--text3)" }}>
+              <div style={{ padding:"16px 0", textAlign:"center", fontSize: 13, fontFamily:"var(--font-mono)", color:"var(--text3)" }}>
                 ← Click a rule to inspect · or use &ldquo;＋ New Rule&rdquo;
+              </div>
+            )}
+
+            {editorRule && editorRule.enforcement === "not_enforced" && (
+              <div className="code-block" style={{ whiteSpace:"pre-wrap", borderLeft:"3px solid var(--red-b)" }}>
+                <span style={{ color:"var(--red-b)" }}>● NOT ENFORCED</span> — this rule is
+                stored and enabled but the data plane could not compile it, so it is
+                protecting nothing.{"\n"}
+                {editorRule.enforcement_error || "no reason reported"}
+              </div>
+            )}
+
+            {editorRule && !editorReadOnly && (
+              <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 }}>
+                <div className="fg2"><label className="flbl2">Severity</label>
+                  <select className="fin2 fsel2" value={editorSev} onChange={e=>setEditorSev(e.target.value)}>
+                    <option value="critical">Critical</option><option value="high">High</option>
+                    <option value="medium">Medium</option><option value="low">Low</option><option value="info">Info</option>
+                  </select></div>
+                <div className="fg2"><label className="flbl2">Phase</label>
+                  <select className="fin2 fsel2" value={editorPhase} onChange={e=>setEditorPhase(Number(e.target.value))}>
+                    {PHASE_LABELS.map((l,i) => <option key={i} value={i}>{i} — {l}</option>)}
+                  </select></div>
               </div>
             )}
 
             {editorRule && (
               <div className="fg2">
-                <label className="flbl2">SRL DSL</label>
+                <label className="flbl2">
+                  SRL DSL {editorReadOnly && <span className="td3">(shipped rule — read-only)</span>}
+                </label>
                 <textarea className="rule-ta" value={editorDSL} onChange={e => setEditorDSL(e.target.value)}
-                  readOnly={editorRule.source==="crs"||editorRule.source==="community"} />
+                  readOnly={editorReadOnly} />
               </div>
+            )}
+
+            {editorRule && !editorReadOnly && (
+              <motion.button className="btn bp" onClick={saveRule} disabled={saving}
+                whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.98 }}>
+                {saving ? "Saving…" : "💾 Save Changes"}
+              </motion.button>
             )}
 
             <div className="fg2">
@@ -227,10 +341,26 @@ export default function RulesPage() {
 
             {testResult && (
               <motion.div className="code-block" style={{ whiteSpace:"pre-wrap" }} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}>
-                <span style={{ color: testResult.verdict==="BLOCK" ? "var(--red-b)" : testResult.verdict==="ERROR" ? "var(--amber)" : "var(--green)" }}>
-                  ● {testResult.verdict}
+                <span style={{ color:
+                  testResult.valid === false ? "var(--red-b)"
+                  : testResult.verdict === "BLOCK" ? "var(--red-b)"
+                  : testResult.verdict === "ERROR" ? "var(--amber)"
+                  : "var(--green)" }}>
+                  ● {testResult.valid === false ? "DOES NOT COMPILE" : testResult.verdict}
                 </span>{" "}— {testResult.detail}{"\n"}
-                Score: {testResult.anomaly_score} · Phases: {testResult.phases_run.join(", ")}
+                {testResult.valid !== false && (
+                  <>
+                    Score: {testResult.anomaly_score}
+                    {testResult.decision ? ` · Decision: ${testResult.decision}` : ""}
+                    {testResult.matched_rule_ids?.length
+                      ? ` · Matched: ${testResult.matched_rule_ids.join(", ")}`
+                      : ""}
+                    {"\n"}
+                    {testResult.rules?.length
+                      ? `Compiled: ${testResult.rules.map(x => `${x.id} (${x.phase}, ${x.action})`).join("; ")}`
+                      : ""}
+                  </>
+                )}
               </motion.div>
             )}
           </div>

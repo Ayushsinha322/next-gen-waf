@@ -4,7 +4,7 @@
 #   postgres + redis  → control-plane backing stores
 #   clickhouse        → on-prem traffic/event log store (powers Threat Search)
 #   migrate           → one-shot goose DB migrations (runs to completion first)
-#   controlplane      → REST :9501 / gRPC :9500, seeds DB on boot (after migrate)
+#   controlplane      → REST :9501 (internal only), seeds DB on boot (after migrate)
 #   dataplane         → Rust WAF proxy, host :80 -> container :8080
 #   dashboard         → Next.js UI on :3000
 #   juiceshop         → demo upstream to protect (internal only)
@@ -20,12 +20,45 @@ services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    # TLS is served, not optional. Without these flags the server offers no TLS at
+    # all, so every client DSN had to say sslmode=disable and all database traffic —
+    # session tokens, API-key hashes, audit rows, tenant config, and the handshake
+    # credentials — crossed the network in cleartext.
+    #
+    # Certificates come from the internal Root CA via:
+    #     sudo deploy/docker/issue-postgres-cert.sh
+    # Its SAN includes "postgres" (this service name), which is what lets clients
+    # use sslmode=verify-full rather than merely encrypting without verifying.
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/etc/sentinel/pg/server.crt
+      - -c
+      - ssl_key_file=/etc/sentinel/pg/server.key
+      # ssl=on only makes TLS AVAILABLE. The stock pg_hba ends with a plain
+      # `host all all all scram-sha-256`, so a client that asks for sslmode=disable
+      # still gets a cleartext session — the server holds a good certificate and
+      # declines to insist on it. It also ships `host all all 127.0.0.1/32 trust`,
+      # which authenticates any TCP loopback client with no password at all. Our
+      # own pg_hba is hostssl-only (see pg_hba.conf), so TLS becomes a property the
+      # SERVER enforces rather than a promise each client is trusted to keep.
+      - -c
+      - hba_file=/etc/sentinel/pg/pg_hba.conf
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
     volumes:
       - pgdata:/var/lib/postgresql/data
+      # Read-only. Postgres refuses to start if its key is readable beyond its own
+      # user, so issue-postgres-cert.sh writes the key 0600 owned by uid 70.
+      - /opt/sentinel-pki/pg-server.crt:/etc/sentinel/pg/server.crt:ro
+      - /opt/sentinel-pki/pg-server.key:/etc/sentinel/pg/server.key:ro
+      # hostssl-only client auth. Keeps `local ... trust` so the container's own
+      # healthcheck (pg_isready over the unix socket) and `compose exec psql` work.
+      - ./pg_hba.conf:/etc/sentinel/pg/pg_hba.conf:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
@@ -51,7 +84,12 @@ services:
   clickhouse:
     image: clickhouse/clickhouse-server:24-alpine
     restart: unless-stopped
-    mem_limit: 1536m
+    # 1536m is NOT enough: at that limit ClickHouse's own internal-table merges
+    # (system.text_log) get OOM-killed during startup, and the container
+    # crash-loops indefinitely — observed ~24k restarts on the deploy VM
+    # (2026-07-22). 6g is the verified-good floor. Override downward only on a
+    # box where you have confirmed the merges complete.
+    mem_limit: ${CLICKHOUSE_MEM_LIMIT:-6g}
     ulimits:
       nofile: { soft: 262144, hard: 262144 }
     environment:
@@ -63,10 +101,24 @@ services:
       CLICKHOUSE_MAX_SERVER_MEMORY_USAGE_TO_RAM_RATIO: "0.6"
     volumes:
       - chdata:/var/lib/clickhouse
+      # TLS drop-in + leaf, so the HTTPS interface is available for cross-host
+      # clients (the 2-VM passive node). Issued by issue-clickhouse-cert.sh.
+      #
+      # `:ro` and OPTIONAL by design: a single-host deployment that has not run
+      # the issuer has no /opt/sentinel-pki, and Docker would otherwise CREATE
+      # those paths as empty DIRECTORIES — the exact trap that made an absent
+      # cert report itself as present during the first 2-VM install (a directory
+      # satisfies `-s`). Compose cannot express "mount if exists", so these live
+      # in the 2VM overlays where the issuer is a required install step, NOT here.
     healthcheck:
       # /ping needs no auth; busybox wget ships in the alpine image. Use the
       # IPv4 loopback explicitly: this host is IPv4-only and `localhost` resolves
       # to ::1 first, where ClickHouse can't bind (IPv6 disabled) → false-unhealthy.
+      #
+      # Stays on plaintext 8123 over loopback INSIDE the container: that traffic
+      # never touches a network, and pointing it at https would make the health of
+      # the container depend on certificate validity — a cert problem would then
+      # read as "ClickHouse is down" and take dependent services with it.
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8123/ping | grep -q Ok || exit 1"]
       interval: 10s
       timeout: 3s
@@ -82,13 +134,16 @@ services:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
       target: sentinel-migrate
-    image: sentinel/migrate:latest
+    image: ${SENTINEL_IMAGE_PREFIX:-sentinel}/migrate:${SENTINEL_VERSION:-latest}
     restart: "no"
     depends_on:
       postgres: { condition: service_healthy }
     environment:
       # goose reads GOOSE_DBSTRING; the SENTINEL_DB_URL DSN form works as-is.
       GOOSE_DBSTRING: ${SENTINEL_DB_URL}
+    volumes:
+      # CA the DSN's sslrootcert points at, so migrations verify the server too.
+      - /opt/sentinel-pki/root.crt:/etc/sentinel/pki/root.crt:ro
     networks: [sentinel]
 
   controlplane:
@@ -96,7 +151,7 @@ services:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
       target: sentinel-controlplane
-    image: sentinel/controlplane:latest
+    image: ${SENTINEL_IMAGE_PREFIX:-sentinel}/controlplane:${SENTINEL_VERSION:-latest}
     restart: unless-stopped
     # root so it can write the shared NDJSON log volume (hardened via K8s
     # securityContext later). The control-plane hub reads what the proxy writes.
@@ -119,13 +174,25 @@ services:
       SENTINEL_CLICKHOUSE_USER: ${CLICKHOUSE_USER}
       SENTINEL_CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
       SENTINEL_JWT_SECRET: ${SENTINEL_JWT_SECRET}
+      # Required by the audit-HMAC fail-fast; keep it out of the committed YAML.
+      SENTINEL_AUDIT_HMAC_KEY: ${SENTINEL_AUDIT_HMAC_KEY}
+      # SINGLE-TENANT DEMO POSTURE. This stack connects as the Postgres superuser
+      # ('sentinel'), which bypasses FORCE ROW LEVEL SECURITY. Tenant isolation
+      # here is enforced by the explicit tenant_id predicates in the stores (not
+      # RLS). For MULTI-TENANT production, point SENTINEL_DB_URL at the
+      # non-superuser 'sentinel_app' role (set its password, run migrations as
+      # the owner role) and REMOVE this opt-out so RLS backstops isolation.
+      SENTINEL_ALLOW_SUPERUSER_DB: "1"
       SENTINEL_REST_ADDR: 0.0.0.0:9501
-      SENTINEL_GRPC_ADDR: 0.0.0.0:9500
       SENTINEL_AUTOSTART_DATAPLANE: "0"
       SENTINEL_LOG_DIR: /var/log/sentinel
-      # The dashboard's live-log SSE connects cross-origin (:3000 -> :9501) directly
-      # to the control plane; without the dashboard origin allow-listed the browser
-      # blocks the EventSource. (REST is same-origin via the Next proxy, unaffected.)
+      # Origins allowed to call the control plane from a browser. In the intended
+      # posture the console is served from https://<host>:9443 and the live-log
+      # EventSource targets that same origin, so no cross-origin request happens
+      # at all. The :3000 entry only matters for the loopback break-glass path; if
+      # you reach the UI through an SSH tunnel, its origin is http://127.0.0.1:3000
+      # and you must add that here for SSE to connect. Left out by default rather
+      # than pre-allow-listed, so the normal deployment carries no extra origin.
       SENTINEL_CORS_ORIGINS: http://172.16.21.71:3000,https://172.16.21.71:9443
       # Cert repository: control plane proxies cert uploads/list to the data
       # plane's internal API, authenticated with a shared secret (cross-container).
@@ -140,12 +207,26 @@ services:
       # Private-CA root cert generated by deploy/docker/issue-ip-cert.sh (lives on
       # the host at /opt/sentinel-pki/root.crt). Read-only; public cert only.
       - /opt/sentinel-pki/root.crt:/etc/sentinel/root-ca.crt:ro
-    ports:
-      # Exposed so the browser's SSE log stream can connect to the control plane
-      # directly (the Next.js proxy buffers SSE). REST still goes via the dashboard.
-      # /api/v1/internal/config is now gated by SENTINEL_INTERNAL_SECRET (the data
-      # plane sends X-Sentinel-Internal); it no longer leaks site config unauthed.
-      - "9501:9501"
+      # Same CA at the path the DSN's sslrootcert references, for Postgres TLS
+      # verification. Mounted separately from root-ca.crt above (which the
+      # dashboard offers for download) so the two purposes stay legible.
+      - /opt/sentinel-pki/root.crt:/etc/sentinel/pki/root.crt:ro
+    # DELIBERATELY NO PUBLISHED PORTS. The control plane speaks cleartext HTTP
+    # (it terminates no TLS of its own), holds the DB credentials and the
+    # token-signing key, and serves the whole management API. Publishing :9501 to
+    # the host put that API on the network in the clear and bypassed the TLS
+    # front on :9443 entirely — anyone who could reach the host could read and
+    # write management state, and any admin JWT on that path crossed the network
+    # unencrypted.
+    #
+    # The comment that used to justify the publish (browser SSE needs a direct
+    # connection because the Next.js proxy buffers) is stale: the dashboard's
+    # NEXT_PUBLIC_CONTROL_PLANE_URL already points at https://<host>:9443, and the
+    # data plane's management listener reverse-proxies /api/* to the control plane
+    # while streaming bodies in both directions, so SSE is unbuffered there
+    # (see handle_management_request in crates/sentinel-proxy/src/lib.rs).
+    #
+    # The service stays reachable to its peers over the internal compose network.
     networks: [sentinel]
 
   dataplane:
@@ -153,9 +234,19 @@ services:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
       target: sentinel-dataplane
-    image: sentinel/dataplane:latest
+    image: ${SENTINEL_IMAGE_PREFIX:-sentinel}/dataplane:${SENTINEL_VERSION:-latest}
     restart: unless-stopped
     user: "0:0"
+    # Kernel XDP needs these to load/attach the BPF program and its maps.
+    # Without them the data plane simply falls back to the userspace software
+    # fast-fail, so the stack still boots on hosts that don't allow XDP.
+    cap_add:
+      - NET_ADMIN
+      - BPF
+      - SYS_RESOURCE
+      - PERFMON
+    ulimits:
+      memlock: -1
     depends_on:
       controlplane: { condition: service_started }
       # service_started, not _healthy: the WAF must boot regardless of ClickHouse.
@@ -179,6 +270,13 @@ services:
       SENTINEL_CLICKHOUSE_DB: ${CLICKHOUSE_DB}
       SENTINEL_CLICKHOUSE_USER: ${CLICKHOUSE_USER}
       SENTINEL_CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      # History spool. Rows ClickHouse cannot accept are written here and replayed
+      # on reconnect, so an outage DELAYS the audit trail instead of erasing it.
+      # It must sit on the sentinel-state volume: the spool exists to outlive the
+      # container, and a path inside the image would be destroyed by the very
+      # `--force-recreate` an operator runs to fix the outage.
+      SENTINEL_SPOOL_DIR: /var/lib/sentinel/state/spool
+      SENTINEL_SPOOL_MAX_BYTES: ${SENTINEL_SPOOL_MAX_BYTES:-268435456}
       # Upstreams the dedicated management listener (:9443) reverse-proxies to.
       SENTINEL_MGMT_DASHBOARD_UPSTREAM: http://dashboard:3000
       SENTINEL_MGMT_API_UPSTREAM: http://controlplane:9501
@@ -186,10 +284,38 @@ services:
       # published on host :443, so advertise h3 on :443 in the Alt-Svc header
       # (else browsers try to reach h3 on :8443 and fail to upgrade).
       SENTINEL_HTTP3_ADVERTISE_PORT: "443"
+      # Kernel XDP fast-path: drop blocked source IPs in the NIC/driver path
+      # before they reach the proxy. Degrades to software mode if attach fails.
+      SENTINEL_XDP_ENABLE: "1"
+      SENTINEL_XDP_IFACE: eth0
+      # Client-IP attribution. This node publishes :80/:443 directly, so the transport
+      # peer IS the client and X-Forwarded-For must NOT be trusted — an empty list means
+      # XFF is ignored entirely, which is the safe default. Set it ONLY to the addresses
+      # of a real proxy in front (see compose.ha.yml, where HAProxy is that proxy);
+      # trusting XFF from anywhere would let a client forge its own source address and
+      # both evade a block and frame a third party.
+      SENTINEL_TRUSTED_PROXIES: ${SENTINEL_TRUSTED_PROXIES:-}
+      # Shared-NAT ranges: addresses behind which MANY unrelated users appear as one IP
+      # (corporate NAT, VPN pool, CGNAT). Per-source escalation is wrong for these — one
+      # abusive user would raise every colleague's anomaly score and get the whole office
+      # auto-banned. Listed ranges are exempt from correlation scoring and auto-ban.
+      SENTINEL_SHARED_EGRESS_CIDRS: ${SENTINEL_SHARED_EGRESS_CIDRS:-}
+      # Ceiling on the reputation contribution a single source's recent history can add,
+      # so correlation can nudge a borderline request over the line but can never block
+      # on reputation alone.
+      SENTINEL_CORRELATION_MAX_SCORE: ${SENTINEL_CORRELATION_MAX_SCORE:-4}
+      # Last-good config cache. Must live on a VOLUME: the default ($HOME/.config/...)
+      # is in the container's writable layer, which is discarded on every image upgrade
+      # or `up -d` recreate — exactly when a control-plane outage would leave this node
+      # with no config to fall back on, which is the whole point of the cache.
+      SENTINEL_CONFIG_CACHE_PATH: /var/lib/sentinel/state/config-cache.json
     volumes:
       - ./sentinel.proxy.yaml:/etc/sentinel/sentinel.yaml:ro
+      # Kernel BTF so aya can load the BTF-typed BPF maps.
+      - /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro
       - sentinel-logs:/var/log/sentinel
       - sentinel-certs:/var/lib/sentinel/certs   # cert repository (persists ACME/uploaded certs)
+      - sentinel-state:/var/lib/sentinel/state   # last-good config cache (survives upgrades)
     ports:
       - "80:8080"               # public WAF entrypoint (HTTP)
       - "443:8443"              # public WAF entrypoint (HTTPS/TCP — h1+h2, SNI cert resolver)
@@ -208,7 +334,7 @@ services:
         # listener (no mixed-content, no CORS). The console's primary URL is now
         # https://172.16.21.71:9443; :3000 remains a cleartext break-glass path.
         NEXT_PUBLIC_CONTROL_PLANE_URL: https://172.16.21.71:9443
-    image: sentinel/dashboard:latest
+    image: ${SENTINEL_IMAGE_PREFIX:-sentinel}/dashboard:${SENTINEL_VERSION:-latest}
     restart: unless-stopped
     depends_on:
       controlplane: { condition: service_started }
@@ -220,10 +346,29 @@ services:
       PORT: "3000"
       NODE_ENV: production
     ports:
-      - "3000:3000"
+      # Loopback-only. This is the cleartext break-glass path to the UI; the
+      # primary console is https://<host>:9443 through the data plane's
+      # management listener. Published on all interfaces it was a plaintext login
+      # form for an admin console — credentials and the session JWT would cross
+      # the network unencrypted. Reach it with an SSH tunnel when needed:
+      #   ssh -L 3000:127.0.0.1:3000 <host>
+      - "127.0.0.1:3000:3000"
     networks: [sentinel]
 
+  # DEMO TARGET ONLY — OWASP Juice Shop is a DELIBERATELY VULNERABLE application.
+  #
+  # Behind the `demo` profile so it can never start in a customer installation.
+  # It used to start unconditionally, which meant any production deploy silently
+  # ran a knowingly exploitable app on the compose network. It is not published to
+  # a host port, but that is not a reason to ship it.
+  #
+  #   demo / pilot :  docker compose --profile demo ... up -d
+  #   customer     :  docker compose ... up -d          (juiceshop never starts)
+  #
+  # ⚠️ Any site whose upstream is `juiceshop:3000` returns 502 without this
+  # profile — including the .88/.89 pilot pair. Pass --profile demo there.
   juiceshop:
+    profiles: [demo]
     image: bkimminich/juice-shop:latest
     restart: unless-stopped
     mem_limit: 768m
@@ -254,7 +399,13 @@ services:
     image: grafana/grafana:11.2.0
     restart: unless-stopped
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      # Required, with no fallback. This used to default to literal "admin",
+      # which — combined with the port being published on every interface —
+      # shipped a reachable Grafana admin console with admin/admin on any deploy
+      # whose operator had not heard of this variable (it was not in
+      # .env.example). `:?` makes `docker compose up` fail with this message
+      # instead of silently standing up a default-credentialed console.
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in deploy/docker/.env (openssl rand -base64 24)}
       GF_AUTH_ANONYMOUS_ENABLED: "false"
       GF_USERS_ALLOW_SIGN_UP: "false"
     volumes:
@@ -263,7 +414,10 @@ services:
     depends_on:
       prometheus: { condition: service_started }
     ports:
-      - "3001:3000"
+      # Loopback-only: Grafana is an operator surface with its own login and no
+      # TLS here. Reach it with an SSH tunnel:
+      #   ssh -L 3001:127.0.0.1:3001 <host>
+      - "127.0.0.1:3001:3000"
     networks: [sentinel]
 
 volumes:
@@ -271,6 +425,10 @@ volumes:
   chdata:
   sentinel-logs:
   sentinel-certs:
+  # Per-node data-plane state that must outlive the container: currently the last-good
+  # config cache. The HA overlay gives each waf node its OWN state volume rather than
+  # sharing this one — see compose.ha.yml.
+  sentinel-state:
   promdata:
   grafanadata:
 

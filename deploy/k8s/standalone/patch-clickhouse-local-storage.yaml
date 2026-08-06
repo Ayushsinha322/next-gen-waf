@@ -1,0 +1,23 @@
+# ClickHouse falls back to the cluster's default StorageClass (k3s: local-path).
+#
+# The base requests `sentinel-replicated` (RF=3), which cannot be provisioned on a
+# single node — the PVC would sit Pending forever and Threat Search would never come
+# up, with no obvious explanation.
+#
+# volumeClaimTemplates is immutable on an existing StatefulSet, so this only applies
+# to a fresh install. If you are converting an existing deployment, delete the
+# StatefulSet with --cascade=orphan first.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sentinel-clickhouse
+  namespace: sentinel
+spec:
+  volumeClaimTemplates:
+    - metadata:
+        name: chdata
+      spec:
+        accessModes: [ReadWriteOnce]
+        # Explicitly empty → use the cluster default rather than sentinel-replicated.
+        storageClassName: ""
+        resources: { requests: { storage: 20Gi } }

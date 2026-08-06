@@ -182,8 +182,89 @@ impl MlEngine {
         //    feeding this request in).
         let anomaly_score = self.forest.score(fv.as_slice());
 
-        // 2. Payload Classifier attack probability.
-        let payload_attack_score = self.payload_classifier.score(&fv);
+        // 2. Payload attack probability. Prefer the embedded char-n-gram model
+        //    (learns injection structure, generalizes to evasive payloads); it
+        //    scores each attackable value separately (matching its per-value
+        //    training distribution) and takes the max, so an attack in one field
+        //    is not diluted by benign content in others. Falls back to the
+        //    legacy 25-feature classifier if the embedded model failed to load.
+        let payload_attack_score = if models::ngram_classifier::is_loaded() {
+            // Collect every attackable value as a candidate.
+            let mut candidates: Vec<String> = Vec::new();
+            // URL path segments (URLPath placement; path-borne injection).
+            for seg in ctx.uri.path().split('/') {
+                if !seg.is_empty() {
+                    candidates.push(seg.to_string());
+                }
+            }
+            // Query param values, percent-decoded (URLParam placement).
+            if let Some(q) = ctx.uri.query() {
+                let decoded = percent_encoding::percent_decode_str(q).decode_utf8_lossy();
+                for kv in decoded.split('&') {
+                    candidates.push(kv.split_once('=').map(|(_, v)| v).unwrap_or(kv).to_string());
+                }
+            }
+            // Header values (Header/UserAgent placements) and each cookie value
+            // separately (Cookie placement).
+            //
+            // The classifier must see every value the rules inspect. It is consulted
+            // not only additively but as a precision VETO that can suppress a rule
+            // block, and a veto based on data it never saw is blind: a header-borne
+            // payload scores ~0 ("nothing here looks like an attack") and suppresses
+            // a correct block from the all-placement libinjection rules, which are
+            // the only coverage for arbitrary headers. Measured before this was
+            // added: `X-Custom: <script>alert(1)</script>` bypassed entirely.
+            //
+            // This is only safe because the model was retrained on ordinary header
+            // values. `payload_attack` is a MAX over candidates, so a routine header
+            // scoring high would pin every request above the suppression cutoff and
+            // silently disable FP suppression — the previous model scored a plain
+            // `Accept: text/html,...` at 0.897, which would have done exactly that.
+            for (name, value) in ctx.request_headers.iter() {
+                let Ok(v) = value.to_str() else { continue };
+                if name == http::header::COOKIE {
+                    for c in v.split(';') {
+                        let val = c.split_once('=').map(|(_, x)| x).unwrap_or(c).trim();
+                        if !val.is_empty() {
+                            candidates.push(val.to_string());
+                        }
+                    }
+                } else if !v.is_empty() {
+                    candidates.push(v.to_string());
+                }
+            }
+            // Request body (Body/JSON/form/multipart placements).
+            if let Some(body) = ctx.request_body.as_ref() {
+                if let Ok(bs) = std::str::from_utf8(body.as_ref()) {
+                    candidates.push(bs.to_string());
+                    // Also score each PARSED, DECODED field value. Scoring only the
+                    // whole raw body misses attacks carried in a form/multipart
+                    // field: a URL- or Base64-encoded payload sits inside the
+                    // envelope, so the wholly-encoded field never decodes (its
+                    // marker is diluted by boundaries/`key=`) and slips past. Per-
+                    // field candidates let score_all decode each value on its own.
+                    let ct = ctx
+                        .request_headers
+                        .get(http::header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    body_field_values(bs, ct, &mut candidates);
+                }
+            }
+            // Score each candidate over its raw form AND every decoded variant
+            // (Base64, HTML-entity, recursive percent-decode) — recursive
+            // normalization defeats encoder-axis evasion — taking the max so an
+            // attack in any field or encoding is not diluted by benign content.
+            let mut max_s = 0.0f32;
+            for c in &candidates {
+                if let Some(s) = models::ngram_classifier::score_all(c) {
+                    max_s = max_s.max(s);
+                }
+            }
+            max_s
+        } else {
+            self.payload_classifier.score(&fv)
+        };
 
         // 3. Online learning — poisoning guard: only let *clean-looking*
         //    traffic update the "normal" model. A request that the rule engine
@@ -207,7 +288,15 @@ impl MlEngine {
             .collect();
         drop(registry);
 
-        let combined = anomaly_score.max(payload_attack_score);
+        // When the supervised n-gram model is active it drives the block
+        // decision; the unsupervised Isolation Forest stays informational
+        // (its anomaly_score is reported but not fused into the block signal,
+        // since an unsupervised model on varied benign traffic is FP-prone).
+        let combined = if models::ngram_classifier::is_loaded() {
+            payload_attack_score
+        } else {
+            anomaly_score.max(payload_attack_score)
+        };
 
         let scores = MlScores {
             anomaly_score,
@@ -276,6 +365,52 @@ impl MlEngine {
     }
 }
 
+/// Extract decoded field values from a form-urlencoded or multipart body and
+/// push each as its own ML candidate. Each value is scored independently so a
+/// URL/Base64-encoded payload in one field decodes cleanly (its whole-value
+/// marker is intact) instead of being lost inside the raw body blob. Non-form
+/// bodies (JSON, raw) are already covered by the whole-body candidate.
+fn body_field_values(body: &str, content_type: &str, out: &mut Vec<String>) {
+    let ct = content_type.to_ascii_lowercase();
+    if ct.starts_with("application/x-www-form-urlencoded") {
+        for kv in body.split('&') {
+            let v = kv.split_once('=').map(|(_, v)| v).unwrap_or(kv);
+            let dec = percent_encoding::percent_decode_str(v)
+                .decode_utf8_lossy()
+                .into_owned();
+            if !dec.is_empty() {
+                out.push(dec);
+            }
+        }
+    } else if let Some(pos) = ct.find("multipart/form-data") {
+        // Boundary token from `; boundary=...`.
+        let Some(b) = ct[pos..]
+            .find("boundary=")
+            .map(|i| pos + i + "boundary=".len())
+            .map(|i| content_type[i..].trim().trim_matches('"'))
+        else {
+            return;
+        };
+        if b.is_empty() {
+            return;
+        }
+        let delim = format!("--{b}");
+        for part in body.split(&delim) {
+            // Field value is everything after the part's header block (blank line).
+            if let Some(idx) = part
+                .find("\r\n\r\n")
+                .map(|i| i + 4)
+                .or_else(|| part.find("\n\n").map(|i| i + 2))
+            {
+                let val = part[idx..].trim_end_matches(['-', '\r', '\n']);
+                if !val.is_empty() {
+                    out.push(val.to_string());
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -291,6 +426,36 @@ mod tests {
         // Not trained yet — scores neutral.
         assert!(!engine.is_trained());
         assert_eq!(engine.buffer_len(), 0);
+    }
+
+    #[test]
+    fn form_field_values_are_decoded() {
+        let mut out = Vec::new();
+        body_field_values(
+            "a=%3Cscript%3E&b=hello",
+            "application/x-www-form-urlencoded",
+            &mut out,
+        );
+        assert!(out.contains(&"<script>".to_string()), "got {out:?}");
+        assert!(out.contains(&"hello".to_string()));
+    }
+
+    #[test]
+    fn multipart_field_values_extracted() {
+        let b = "X99";
+        let body = format!(
+            "--{b}\r\nContent-Disposition: form-data; name=\"q\"\r\n\r\n<svg onload=alert(1)>\r\n--{b}--\r\n"
+        );
+        let mut out = Vec::new();
+        body_field_values(
+            &body,
+            &format!("multipart/form-data; boundary={b}"),
+            &mut out,
+        );
+        assert!(
+            out.iter().any(|v| v.contains("<svg onload=alert(1)>")),
+            "multipart field value not extracted: {out:?}"
+        );
     }
 
     #[test]

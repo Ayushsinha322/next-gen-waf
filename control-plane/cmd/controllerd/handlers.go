@@ -4,21 +4,23 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net"
 	"net/http"
 	"os"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/your-org/sentinel-waf/control-plane/internal/auth"
-	"github.com/your-org/sentinel-waf/control-plane/internal/cluster"
 	"github.com/your-org/sentinel-waf/control-plane/internal/db"
+	"github.com/your-org/sentinel-waf/control-plane/internal/leader"
 	"github.com/your-org/sentinel-waf/control-plane/internal/logs"
 	"github.com/your-org/sentinel-waf/control-plane/internal/rbac"
 	"go.uber.org/zap"
@@ -36,6 +38,8 @@ var configVersion atomic.Int64
 type loginRequest struct {
 	Email    string `json:"email" binding:"required"`
 	Password string `json:"password" binding:"required"`
+	// MFACode is the 6-digit TOTP, required only when the account has MFA on.
+	MFACode string `json:"mfa_code"`
 }
 
 // devLoginEnabled reports whether the no-database admin/admin123 backdoor is
@@ -71,6 +75,27 @@ func handleLogin(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store, hub *
 		return
 	}
 
+	// Brute-force lockout: reject early if either the account OR the source IP
+	// is currently locked out (per-account guards password guessing; per-IP
+	// guards credential stuffing across many accounts from one source).
+	loginKey := strings.ToLower(strings.TrimSpace(req.Email))
+	ipKey := "ip:" + c.ClientIP()
+	if locked, wait := loginAttempts.locked(loginKey); locked {
+		c.Header("Retry-After", fmt.Sprintf("%d", int(wait.Seconds())+1))
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "too many failed attempts; try again later"})
+		return
+	}
+	if locked, wait := ipLoginAttempts.locked(ipKey); locked {
+		c.Header("Retry-After", fmt.Sprintf("%d", int(wait.Seconds())+1))
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "too many failed attempts; try again later"})
+		return
+	}
+	// recordFail notes a failure against both the account and the source IP.
+	recordFail := func() {
+		loginAttempts.recordFailure(loginKey)
+		ipLoginAttempts.recordFailure(ipKey)
+	}
+
 	// Validate credentials.  When a DB pool is available we check the users
 	// table; otherwise fall back to the hardcoded dev backdoor.
 	var claims auth.Claims
@@ -80,6 +105,7 @@ func handleLogin(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store, hub *
 			db.DevTenantID, req.Email, req.Password)
 		if err != nil || !ok {
 			loginResult = "FAILURE"
+			recordFail()
 			writeAuditEntry(c, store, hub, &db.WriteAuditRequest{
 				TenantID:   db.DevTenantID,
 				Action:     "user.login",
@@ -97,6 +123,39 @@ func handleLogin(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store, hub *
 			Role:       role,
 			AuthMethod: "password",
 		}
+
+		// Second factor: if the account has TOTP enabled, a valid code is
+		// required. An empty code returns mfa_required (so the client prompts,
+		// not counted as a failure); a wrong code is a failed attempt.
+		mfaSecret, mfaErr := store.GetMFASecret(c.Request.Context(), userTenant, userID)
+		if mfaErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "mfa check failed"})
+			return
+		}
+		if mfaSecret != "" {
+			if req.MFACode == "" {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "mfa_required", "mfa_required": true})
+				return
+			}
+			ok, step := auth.VerifyTOTPStep(mfaSecret, req.MFACode)
+			if !ok {
+				recordFail()
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid mfa code"})
+				return
+			}
+			// Burn the step so an observed code can't be replayed within the
+			// ±1 skew window (RFC 6238 §5.2).
+			consumed, cerr := store.ConsumeMFAStep(c.Request.Context(), userTenant, userID, step)
+			if cerr != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "mfa verification failed"})
+				return
+			}
+			if !consumed {
+				recordFail()
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "mfa code already used"})
+				return
+			}
+		}
 	} else {
 		// No user database. The built-in admin/admin123 backdoor exists only for
 		// local development and must be explicitly enabled — otherwise a
@@ -109,6 +168,7 @@ func handleLogin(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store, hub *
 			return
 		}
 		if req.Email != "admin@sentinel.local" || req.Password != "admin123" {
+			recordFail()
 			writeAuditEntry(c, nil, hub, &db.WriteAuditRequest{
 				TenantID:   db.DevTenantID,
 				Action:     "user.login",
@@ -124,6 +184,8 @@ func handleLogin(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store, hub *
 			AuthMethod: "password",
 		}
 	}
+
+	loginAttempts.recordSuccess(loginKey)
 
 	pair, err := jwtSvc.IssueTokenPair(claims)
 	if err != nil {
@@ -158,7 +220,7 @@ type refreshRequest struct {
 	RefreshToken string `json:"refresh_token" binding:"required"`
 }
 
-func handleRefresh(c *gin.Context, jwtSvc *auth.JWTService) {
+func handleRefresh(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store) {
 	var req refreshRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -173,6 +235,23 @@ func handleRefresh(c *gin.Context, jwtSvc *auth.JWTService) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "not a refresh token"})
 		return
 	}
+	// Re-derive privileges from the database rather than trusting the refresh
+	// token's frozen claims: if the user was disabled, deleted, or had their
+	// role changed, that must take effect on the next refresh (bounding stale
+	// access to one access-token lifetime) instead of persisting for the full
+	// refresh window. Skipped only in degraded/no-DB mode (dev/mock).
+	if store != nil {
+		role, _, rerr := store.RefreshUser(c.Request.Context(), claims.TenantID, claims.UserID)
+		if rerr != nil {
+			if errors.Is(rerr, db.ErrUserInactive) {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "session no longer valid"})
+				return
+			}
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "cannot verify session"})
+			return
+		}
+		claims.Role = role
+	}
 	claims.AuthMethod = "refresh_rotation"
 	accessToken, err := jwtSvc.IssueAccessToken(*claims)
 	if err != nil {
@@ -182,9 +261,152 @@ func handleRefresh(c *gin.Context, jwtSvc *auth.JWTService) {
 	c.JSON(http.StatusOK, gin.H{"access_token": accessToken, "token_type": "Bearer"})
 }
 
+// handleLogout revokes the caller's current access token (and, if supplied, the
+// refresh token) by adding their jti to the shared denylist — so the session is
+// dead across the whole HA cluster, not just this node. Mounted on the
+// authenticated (protected) group so the access-token claims are available.
+func handleLogout(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store) {
+	claims, ok := auth.GetClaims(c.Request.Context())
+	if !ok || claims == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "not authenticated"})
+		return
+	}
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
+		return
+	}
+	// Revoke the current access token.
+	if claims.ID != "" && claims.ExpiresAt != nil {
+		if err := store.RevokeToken(c.Request.Context(), claims.ID, claims.ExpiresAt.Time); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "logout failed"})
+			return
+		}
+	}
+	// Revoke the PAIRED refresh token server-side using the rjti embedded in the
+	// access token — so logout kills the session without the client having to
+	// resend the refresh token. Retain the denylist entry past the refresh TTL.
+	if claims.RefreshJTI != "" {
+		_ = store.RevokeToken(c.Request.Context(), claims.RefreshJTI, time.Now().Add(jwtSvc.RefreshTTL()))
+	}
+	// Best-effort: also honor an explicitly-supplied refresh token (older tokens
+	// issued before rjti binding, or belt-and-suspenders).
+	var body struct {
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := c.ShouldBindJSON(&body); err == nil && body.RefreshToken != "" {
+		if rc, err := jwtSvc.Validate(body.RefreshToken); err == nil && rc.ID != "" && rc.ExpiresAt != nil {
+			_ = store.RevokeToken(c.Request.Context(), rc.ID, rc.ExpiresAt.Time)
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// handleMFAEnroll generates a new TOTP secret + provisioning URI for the caller.
+// The secret is returned but NOT stored yet — the user must prove a working code
+// via /auth/mfa/confirm before MFA is activated (so a mistyped QR can't lock
+// them out).
+func handleMFAEnroll(c *gin.Context) {
+	claims, ok := auth.GetClaims(c.Request.Context())
+	if !ok || claims == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "not authenticated"})
+		return
+	}
+	secret, err := auth.GenerateTOTPSecret()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"secret":      secret,
+		"otpauth_uri": auth.TOTPURI("Sentinel WAF", claims.UserID, secret),
+		"note":        "Add to an authenticator app, then POST {secret, code} to /auth/mfa/confirm to activate.",
+	})
+}
+
+// handleMFAConfirm activates MFA once the user proves a working code.
+func handleMFAConfirm(c *gin.Context, store *db.Store) {
+	claims, ok := auth.GetClaims(c.Request.Context())
+	if !ok || claims == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "not authenticated"})
+		return
+	}
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
+		return
+	}
+	// Step-up: refuse to overwrite an already-enrolled secret via confirm. To
+	// rotate MFA the user must first disable it (which requires a CURRENT code),
+	// so a stolen access token cannot silently replace the second factor and
+	// lock the real user out.
+	if cur, cerr := store.GetMFASecret(c.Request.Context(), claims.TenantID, claims.UserID); cerr == nil && cur != "" {
+		c.JSON(http.StatusConflict, gin.H{"error": "mfa already enabled; disable it first (requires a current code)"})
+		return
+	}
+	var req struct {
+		Secret string `json:"secret" binding:"required"`
+		Code   string `json:"code" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if !auth.VerifyTOTP(req.Secret, req.Code) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid code"})
+		return
+	}
+	if err := store.SetMFASecret(c.Request.Context(), claims.TenantID, claims.UserID, req.Secret); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "mfa_enabled": true})
+}
+
+// handleMFADisable turns MFA off after verifying a current code.
+func handleMFADisable(c *gin.Context, store *db.Store) {
+	claims, ok := auth.GetClaims(c.Request.Context())
+	if !ok || claims == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "not authenticated"})
+		return
+	}
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
+		return
+	}
+	var req struct {
+		Code string `json:"code" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	secret, err := store.GetMFASecret(c.Request.Context(), claims.TenantID, claims.UserID)
+	if err != nil || secret == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "mfa not enabled"})
+		return
+	}
+	if !auth.VerifyTOTP(secret, req.Code) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid code"})
+		return
+	}
+	if err := store.SetMFASecret(c.Request.Context(), claims.TenantID, claims.UserID, ""); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "mfa_enabled": false})
+}
+
 // oidcStateCookie holds the per-login CSRF state that binds the /login redirect
 // to its /callback.
 const oidcStateCookie = "sentinel_oidc_state"
+
+// oidcNonceCookie holds the per-login OIDC nonce so the callback can verify that
+// the returned id_token was minted for THIS authorization request.
+//
+// The nonce used to be generated and sent upstream but never persisted, so
+// nothing could compare it on the way back — it was write-only, and
+// authorization-code replay was undetectable. Storing it browser-side in an
+// HttpOnly cookie mirrors how `state` is already handled.
+const oidcNonceCookie = "sentinel_oidc_nonce"
 
 // oidcConfigFromEnv builds the OIDC config from server-side environment ONLY.
 //
@@ -229,23 +451,31 @@ func handleOIDCLogin(c *gin.Context, jwtSvc *auth.JWTService, log *zap.Logger) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start login"})
 		return
 	}
-	nonce, _ := auth.NewNonce()
+	nonce, err := auth.NewNonce()
+	if err != nil {
+		// Fail the login rather than proceeding with an empty nonce: the callback
+		// now requires one, and a blank value would make the replay check
+		// vacuous.
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start login"})
+		return
+	}
 	authURL, err := oidcSvc.AuthURL(c.Request.Context(), state, nonce)
 	if err != nil {
 		log.Error("oidc auth url", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to build auth URL"})
 		return
 	}
-	// Bind `state` to the browser via a short-lived HttpOnly cookie so the
-	// callback can verify it (CSRF / login-fixation protection). SameSite=Lax
-	// lets the cookie ride the top-level redirect back from the IdP.
+	// Bind `state` and `nonce` to the browser via short-lived HttpOnly cookies so
+	// the callback can verify both (CSRF / login-fixation, and id_token replay).
+	// SameSite=Lax lets them ride the top-level redirect back from the IdP.
 	secure := strings.HasPrefix(cfg.RedirectURL, "https://")
 	c.SetSameSite(http.SameSiteLaxMode)
 	c.SetCookie(oidcStateCookie, state, 300, "/", "", secure, true)
+	c.SetCookie(oidcNonceCookie, nonce, 300, "/", "", secure, true)
 	c.Redirect(http.StatusFound, authURL)
 }
 
-func handleOIDCCallback(c *gin.Context, jwtSvc *auth.JWTService, log *zap.Logger) {
+func handleOIDCCallback(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store, log *zap.Logger) {
 	cfg, ok := oidcConfigFromEnv()
 	if !ok {
 		c.JSON(http.StatusNotImplemented, gin.H{"error": "OIDC login is not configured"})
@@ -265,22 +495,45 @@ func handleOIDCCallback(c *gin.Context, jwtSvc *auth.JWTService, log *zap.Logger
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid or missing OIDC state"})
 		return
 	}
-	// One-time use: clear the state cookie immediately.
+	// Recover the nonce minted for this login so the id_token can be bound to it.
+	// Absent cookie => this callback does not correspond to a login we started.
+	wantNonce, err := c.Cookie(oidcNonceCookie)
+	if err != nil || wantNonce == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid or missing OIDC nonce"})
+		return
+	}
+
+	// One-time use: clear both cookies immediately.
 	secure := strings.HasPrefix(cfg.RedirectURL, "https://")
 	c.SetSameSite(http.SameSiteLaxMode)
 	c.SetCookie(oidcStateCookie, "", -1, "/", "", secure, true)
+	c.SetCookie(oidcNonceCookie, "", -1, "/", "", secure, true)
 
 	oidcSvc := auth.NewOIDCService(cfg)
-	userInfo, err := oidcSvc.ExchangeToken(c.Request.Context(), code)
+	userInfo, err := oidcSvc.ExchangeToken(c.Request.Context(), code, wantNonce)
 	if err != nil {
 		log.Error("oidc exchange", zap.Error(err))
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "OIDC token exchange failed"})
 		return
 	}
+	// Map the verified identity to a REAL provisioned user (its tenant + role),
+	// instead of minting a fixed dev-tenant editor for anyone who can complete
+	// the OIDC exchange. Unknown identities are rejected — an admin must
+	// provision the user first.
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "user database unavailable"})
+		return
+	}
+	userID, tenantID, role, err := store.LookupSSOUser(c.Request.Context(), userInfo.Email)
+	if err != nil {
+		log.Warn("oidc login for unprovisioned identity", zap.String("email", userInfo.Email))
+		c.JSON(http.StatusForbidden, gin.H{"error": "no account for this identity — ask an admin to provision your user"})
+		return
+	}
 	claims := auth.Claims{
-		TenantID:   db.DevTenantID,
-		UserID:     userInfo.Subject,
-		Role:       "editor",
+		TenantID:   tenantID,
+		UserID:     userID,
+		Role:       role,
 		AuthMethod: "oidc",
 	}
 	pair, err := jwtSvc.IssueTokenPair(claims)
@@ -330,60 +583,34 @@ func handleListSites(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
 		return
 	}
-	if store != nil {
-		sites, err := store.ListSites(c.Request.Context(), claims.TenantID, claims.UserID)
-		if err == nil {
-			if sites == nil {
-				sites = []db.SiteRow{}
-			}
-			c.JSON(http.StatusOK, gin.H{"sites": sites, "tenant_id": claims.TenantID})
-			return
-		}
+	// A site list MUST come from the database or fail loudly.
+	//
+	// This handler used to answer a database outage with five hardcoded sites
+	// (dvwa.local, juice.local, api.acme.com, shop.corp.io, legacy.app.net),
+	// three of them marked "active"/"blocking", returned as 200 OK with the
+	// caller's real tenant_id stamped on them. The client had no way to tell
+	// them from real data, so an operator during a Postgres outage would see
+	// applications they do not own and believe traffic was being filtered for
+	// them. The underlying error was discarded rather than logged.
+	//
+	// Every other site handler here already returns 503 on store failure;
+	// this one now matches. Never invent rows to keep a screen populated.
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
+		return
 	}
-	// Fallback mock sites when DB is unavailable.
-	c.JSON(http.StatusOK, gin.H{
-		"sites": []gin.H{
-			{
-				"id": "00000000-0000-0000-0001-000000000001", "tenant_id": claims.TenantID,
-				"name": "dvwa.local", "domains": []string{"dvwa.local"},
-				"upstream":   gin.H{"servers": []string{"127.0.0.1:80"}, "lb": "round_robin"},
-				"waf_policy": gin.H{"mode": "blocking", "paranoia_level": 2, "anomaly_threshold": 5},
-				"status": "active", "created_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-01T00:00:00Z",
-			},
-			{
-				"id": "00000000-0000-0000-0001-000000000002", "tenant_id": claims.TenantID,
-				"name": "juice.local", "domains": []string{"juice.local"},
-				"upstream":   gin.H{"servers": []string{"127.0.0.1:3000"}, "lb": "round_robin"},
-				"waf_policy": gin.H{"mode": "blocking", "paranoia_level": 2, "anomaly_threshold": 5},
-				"status": "active", "created_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-01T00:00:00Z",
-			},
-			{
-				"id": "00000000-0000-0000-0001-000000000003", "tenant_id": claims.TenantID,
-				"name": "api.acme.com", "domains": []string{"api.acme.com"},
-				"upstream":   gin.H{"servers": []string{"127.0.0.1:8080"}, "lb": "round_robin"},
-				"waf_policy": gin.H{"mode": "learning", "paranoia_level": 1, "anomaly_threshold": 10},
-				"status": "active", "created_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-01T00:00:00Z",
-			},
-			{
-				"id": "00000000-0000-0000-0001-000000000004", "tenant_id": claims.TenantID,
-				"name": "shop.corp.io", "domains": []string{"shop.corp.io"},
-				"upstream":   gin.H{"servers": []string{"127.0.0.1:8443"}, "lb": "round_robin"},
-				"waf_policy": gin.H{"mode": "blocking", "paranoia_level": 3, "anomaly_threshold": 5},
-				"status": "active", "created_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-01T00:00:00Z",
-			},
-			{
-				"id": "00000000-0000-0000-0001-000000000005", "tenant_id": claims.TenantID,
-				"name": "legacy.app.net", "domains": []string{"legacy.app.net"},
-				"upstream":   gin.H{"servers": []string{"127.0.0.1:8088"}, "lb": "round_robin"},
-				"waf_policy": gin.H{"mode": "off", "paranoia_level": 1, "anomaly_threshold": 50},
-				"status": "paused", "created_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-01T00:00:00Z",
-			},
-		},
-		"tenant_id": claims.TenantID,
-	})
+	sites, err := store.ListSites(c.Request.Context(), claims.TenantID, claims.UserID)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
+		return
+	}
+	if sites == nil {
+		sites = []db.SiteRow{}
+	}
+	c.JSON(http.StatusOK, gin.H{"sites": sites, "tenant_id": claims.TenantID})
 }
 
-func handleCreateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
+func handleCreateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *leader.Elector) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceSite, rbac.ActionCreate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
@@ -402,9 +629,19 @@ func handleCreateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 		req.Upstream = json.RawMessage(`{"servers":[],"lb":"round_robin"}`)
 	}
 	if req.WafPolicy == nil {
-		req.WafPolicy = json.RawMessage(`{"mode":"blocking","paranoia_level":2,"anomaly_threshold":5}`)
+		req.WafPolicy = json.RawMessage(defaultWafPolicyJSON)
 	}
-	if !proposeBest(c, cl, cluster.CmdSiteCreate, gin.H{"tenant_id": claims.TenantID, "req": req}) {
+	// Validate BEFORE committing. An unconvertible site used to be accepted here
+	// and then silently dropped by the data-plane config sync, leaving the site
+	// unprotected while the dashboard still showed it active.
+	if problems := validateSiteConfig(req.Name, req.Domains, req.Upstream, req.WafPolicy); len(problems) > 0 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":    "site configuration is not usable by the data plane",
+			"problems": problems,
+		})
+		return
+	}
+	if !requireLeader(c, cl) {
 		return
 	}
 	site, err := store.CreateSite(c.Request.Context(), claims.TenantID, claims.UserID, req)
@@ -442,7 +679,7 @@ func handleGetSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 	c.JSON(http.StatusOK, gin.H{"site": site})
 }
 
-func handleUpdateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
+func handleUpdateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *leader.Elector, log *zap.Logger) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceSite, rbac.ActionUpdate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
@@ -458,9 +695,27 @@ func handleUpdateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if !proposeBest(c, cl, cluster.CmdSiteUpdate, gin.H{"tenant_id": claims.TenantID, "site_id": siteID, "req": req}) {
+	// Validate the MERGED result, not just the submitted fields: a patch can be
+	// individually fine yet produce an unusable site when combined with what is
+	// already stored (e.g. replacing a good upstream with an empty one).
+	cur, curErr := store.GetSite(c.Request.Context(), claims.TenantID, siteID)
+	if curErr != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "site not found"})
 		return
 	}
+	name, domains, upstream, waf := mergedSiteForValidation(*cur, req)
+	if problems := validateSiteConfig(name, domains, upstream, waf); len(problems) > 0 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":    "the resulting site configuration is not usable by the data plane",
+			"problems": problems,
+		})
+		return
+	}
+	if !requireLeader(c, cl) {
+		return
+	}
+	// Record an undo point before changing live protection settings.
+	snapshotBeforeMutation(c, store, log, "site.update")
 	site, err := store.UpdateSite(c.Request.Context(), claims.TenantID, claims.UserID, siteID, req)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -477,7 +732,63 @@ func handleUpdateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 	c.JSON(http.StatusOK, gin.H{"site": site})
 }
 
-func handleDeleteSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
+// handleValidateSite is the dry-run endpoint: it reports whether a proposed site
+// configuration would be accepted and usable, without writing anything.
+//
+// This exists so an operator (or Config-as-Code pipeline) can check a change
+// before applying it, instead of discovering at sync time that a site quietly
+// stopped being protected.
+func handleValidateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
+	claims, _ := auth.GetClaims(c.Request.Context())
+	// Dry-run mutates nothing, but it reveals whether a config is viable, so gate
+	// it on the same permission as the write it previews.
+	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceSite, rbac.ActionUpdate) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
+		return
+	}
+
+	var req struct {
+		// SiteID, when set, validates a PATCH against the stored site.
+		SiteID    string          `json:"site_id"`
+		Name      string          `json:"name"`
+		Domains   []string        `json:"domains"`
+		Upstream  json.RawMessage `json:"upstream"`
+		WafPolicy json.RawMessage `json:"waf_policy"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	name, domains, upstream, waf := req.Name, req.Domains, req.Upstream, req.WafPolicy
+	if req.SiteID != "" {
+		if store == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
+			return
+		}
+		cur, err := store.GetSite(c.Request.Context(), claims.TenantID, req.SiteID)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "site not found"})
+			return
+		}
+		patch := db.UpdateSiteRequest{Domains: req.Domains, Upstream: req.Upstream, WafPolicy: req.WafPolicy}
+		if req.Name != "" {
+			patch.Name = &req.Name
+		}
+		name, domains, upstream, waf = mergedSiteForValidation(*cur, patch)
+	}
+
+	problems := validateSiteConfig(name, domains, upstream, waf)
+	// 200 either way: the dry-run itself succeeded. `valid` carries the verdict, so
+	// a client cannot mistake "your config is bad" for "the request failed".
+	c.JSON(http.StatusOK, gin.H{
+		"valid":    len(problems) == 0,
+		"problems": problems,
+		"resolved": gin.H{"name": name, "domains": domains},
+	})
+}
+
+func handleDeleteSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *leader.Elector, log *zap.Logger) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceSite, rbac.ActionDelete) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
@@ -488,9 +799,11 @@ func handleDeleteSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 		return
 	}
 	siteID := c.Param("id")
-	if !proposeBest(c, cl, cluster.CmdSiteDelete, gin.H{"tenant_id": claims.TenantID, "site_id": siteID}) {
+	if !requireLeader(c, cl) {
 		return
 	}
+	// Record an undo point before removing a site from protection.
+	snapshotBeforeMutation(c, store, log, "site.delete")
 	if err := store.DeleteSite(c.Request.Context(), claims.TenantID, siteID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -505,7 +818,7 @@ func handleDeleteSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
-func handleUpdateSiteStatus(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
+func handleUpdateSiteStatus(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *leader.Elector) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceSite, rbac.ActionUpdate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
@@ -523,7 +836,7 @@ func handleUpdateSiteStatus(c *gin.Context, enf *rbac.Enforcer, store *db.Store,
 		c.JSON(http.StatusBadRequest, gin.H{"error": "status must be 'active' or 'paused'"})
 		return
 	}
-	if !proposeBest(c, cl, cluster.CmdSiteStatus, gin.H{"tenant_id": claims.TenantID, "site_id": siteID, "status": body.Status}) {
+	if !requireLeader(c, cl) {
 		return
 	}
 	if err := store.UpdateSiteStatus(c.Request.Context(), claims.TenantID, siteID, body.Status); err != nil {
@@ -557,7 +870,7 @@ type ruleExclusionSpec struct {
 //
 // Re-uses the standard site-update path so the change is proposed through the
 // cluster, persisted, and hot-synced to the proxy via configVersion.
-func handleAddSiteExclusion(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
+func handleAddSiteExclusion(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *leader.Elector) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceSite, rbac.ActionUpdate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
@@ -605,7 +918,7 @@ func handleAddSiteExclusion(c *gin.Context, enf *rbac.Enforcer, store *db.Store,
 		return
 	}
 	req := db.UpdateSiteRequest{WafPolicy: newPolicy}
-	if !proposeBest(c, cl, cluster.CmdSiteUpdate, gin.H{"tenant_id": claims.TenantID, "site_id": siteID, "req": req}) {
+	if !requireLeader(c, cl) {
 		return
 	}
 	updated, err := store.UpdateSite(c.Request.Context(), claims.TenantID, claims.UserID, siteID, req)
@@ -626,7 +939,7 @@ func handleAddSiteExclusion(c *gin.Context, enf *rbac.Enforcer, store *db.Store,
 
 // handleDeleteSiteExclusion removes the exclusion for a given rule_id from a
 // site's waf_policy (undo a tuning action / re-enable a rule).
-func handleDeleteSiteExclusion(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
+func handleDeleteSiteExclusion(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *leader.Elector) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceSite, rbac.ActionUpdate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
@@ -667,7 +980,7 @@ func handleDeleteSiteExclusion(c *gin.Context, enf *rbac.Enforcer, store *db.Sto
 		return
 	}
 	req := db.UpdateSiteRequest{WafPolicy: newPolicy}
-	if !proposeBest(c, cl, cluster.CmdSiteUpdate, gin.H{"tenant_id": claims.TenantID, "site_id": siteID, "req": req}) {
+	if !requireLeader(c, cl) {
 		return
 	}
 	updated, err := store.UpdateSite(c.Request.Context(), claims.TenantID, claims.UserID, siteID, req)
@@ -741,7 +1054,27 @@ func internalSecretOK(c *gin.Context) bool {
 // REST port must not leak site topology (upstreams, rules) to anyone who can
 // reach it. Returns the sites in a format the proxy deserializes into
 // Vec<SiteConfig>.
-func handleInternalConfig(c *gin.Context, store *db.Store) {
+// siteSetFingerprint derives a stable freshness signal from the site set itself.
+//
+// Used when the DB-derived config counter (migration 0012) is unavailable. FNV-1a
+// over the canonical JSON encoding: encoding/json sorts map keys, so the same set
+// of sites always hashes to the same value, and any real change — a new site, an
+// edited upstream, a policy tweak — changes it. Masked to 63 bits so the value is
+// always positive, since the data plane parses it as an unsigned version.
+func siteSetFingerprint(sites []map[string]any) int64 {
+	b, err := json.Marshal(sites)
+	if err != nil {
+		// Cannot hash what will not marshal. Return a constant rather than a
+		// timestamp: a constant means "no detectable change", which is the safer
+		// failure here — the alternative churns the rule engine forever.
+		return 1
+	}
+	h := fnv.New64a()
+	_, _ = h.Write(b)
+	return int64(h.Sum64() & 0x7fffffffffffffff)
+}
+
+func handleInternalConfig(c *gin.Context, store *db.Store, log *zap.Logger) {
 	if !internalSecretOK(c) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
 		return
@@ -757,21 +1090,85 @@ func handleInternalConfig(c *gin.Context, store *db.Store) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	// Operator-authored rules, attached per site below. A failure here must NOT
+	// fail the whole sync: sites would stop being configured at all, which is a
+	// far worse outcome than custom rules being briefly absent. Log loudly and
+	// continue with an empty set.
+	rulesByTenant, err := store.ListDeployableRules(c.Request.Context())
+	if err != nil {
+		log.Error("CONFIG SYNC: custom rules could not be read and are NOT being "+
+			"enforced this cycle; site policies are unaffected", zap.Error(err))
+		rulesByTenant = map[string][]db.DeployableRule{}
+	}
+
 	rustSites := make([]map[string]any, 0, len(sites))
+	// Sites that cannot be converted are REPORTED, not silently skipped.
+	//
+	// This loop used to `continue` on error, so a site with malformed upstream or
+	// waf_policy JSON simply vanished from the config the data plane received: no
+	// error, no log, no alert. The dashboard still listed it as active while it was
+	// no longer protected — a config error that failed open and was invisible.
+	//
+	// Writes are now validated (see validateSiteConfig), so new records cannot get
+	// into this state. This remains the backstop for records written before that
+	// validation existed, and it is deliberately noisy.
+	skipped := make([]map[string]any, 0)
 	for _, s := range sites {
 		if s.Status == "paused" || s.Status == "deleted" {
 			continue
 		}
 		rs, err := siteRowToRustConfig(s)
 		if err != nil {
+			log.Error("CONFIG SYNC: site is UNPROTECTED — its stored configuration cannot be "+
+				"converted for the data plane and is being excluded from the sync",
+				zap.String("site", s.Name),
+				zap.String("site_id", s.ID),
+				zap.String("tenant_id", s.TenantID),
+				zap.Error(err))
+			skipped = append(skipped, map[string]any{
+				"site_id":   s.ID,
+				"name":      s.Name,
+				"tenant_id": s.TenantID,
+				"error":     err.Error(),
+			})
 			continue
 		}
+		attachInlineRules(rs, s.ID, rulesByTenant[s.TenantID])
 		rustSites = append(rustSites, rs)
 	}
-	c.JSON(http.StatusOK, gin.H{
-		"version": configVersion.Load(),
+	// Shared, DB-derived, restart-surviving freshness signal (migration 0012).
+	// On a transient read error (e.g. before the migration applies) fall back to
+	// a strictly-changing value so the data plane re-syncs rather than latching a
+	// stale version — it still receives the correct DB-backed site list above.
+	version, verr := store.ConfigVersion(c.Request.Context())
+	if verr != nil {
+		// The old fallback was time.Now().UnixNano(), reasoning that re-syncing beats
+		// latching a stale version. That is right for a TRANSIENT read error and badly
+		// wrong for a PERMANENT one: where migration 0012 has not been applied,
+		// sentinel_config_version() does not exist, so EVERY poll returned a new
+		// version and every data-plane node re-synced and rebuilt its entire rule
+		// engine — measured at 1,268 rules every 5 seconds, indefinitely, on a
+		// completely idle system.
+		//
+		// A content hash fixes both horns: it changes when, and only when, the site
+		// set actually changes. Propagation stays correct, the churn stops, and it
+		// needs nothing from the database.
+		version = siteSetFingerprint(rustSites)
+		log.Warn("config version unavailable — using a content hash of the site set "+
+			"instead (apply migration 0012 for the shared DB-derived counter)",
+			zap.Error(verr), zap.Int64("fingerprint", version))
+	}
+	resp := gin.H{
+		"version": version,
 		"sites":   rustSites,
-	})
+	}
+	// Surfaced in the response as well as the log, so the condition is observable
+	// by the data plane and by anyone curling this endpoint — not just by whoever
+	// happens to be reading control-plane logs.
+	if len(skipped) > 0 {
+		resp["skipped_sites"] = skipped
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // handleProxyHealth probes the local WAF proxy's /healthz endpoint and
@@ -794,6 +1191,34 @@ func handleProxyHealth(c *gin.Context) {
 	}
 	body["waf_running"] = true
 	c.JSON(http.StatusOK, body)
+}
+
+// sentinelRuleFiles are OUR OWN rule files, loaded for every site whose mode is
+// not "off", in addition to whichever CRS categories the operator selected.
+//
+// They are deliberately NOT entries in crsCategoryFiles: that map models "which
+// class of attack do you want covered", and these files are not a class of attack.
+// They are cross-cutting precision and visibility supplements that the measured
+// configuration treats as baseline:
+//
+//   - placement.conf (9900100-9900101) runs libinjection across EVERY injection
+//     point — arbitrary headers, any cookie, the URL path — which stock CRS does
+//     not. Without it, custom-header XSS and header SQLi return 200.
+//   - coverage.conf (9900200-9900215) covers the classes CRS 4.x measures near
+//     zero on (CRLF, SMTP/IMAP, LDAP, SSTI, NoSQL) and, critically, carries the
+//     t:base64Decode transform chains. 66 of 72 bypasses in the 2026-07-19
+//     analysis were Base64-encoded: on the wire a Base64 payload is opaque, so
+//     rules go blind and no amount of category selection helps.
+//
+// These 18 rules are what took App-TP from 80.30% to 99.09%; the published
+// composite of 99.60% is not achievable without them. deploy/load-test/
+// waf-detection.yaml lists them explicitly, but nothing generated BY THE CONTROL
+// PLANE could load them, so every site created through the API or dashboard ran
+// stock CRS only — confirmed on the deploy VM, where no 99xxxxx rule had fired
+// once across the entire waf_events history.
+var sentinelRuleFiles = []string{
+	"rules/custom/placement.conf",
+	"rules/custom/coverage.conf",
 }
 
 // crsCategoryFiles maps the UI-friendly OWASP CRS category keys exposed in the
@@ -862,12 +1287,12 @@ func siteRowToRustConfig(s db.SiteRow) (map[string]any, error) {
 		return nil, err
 	}
 	return map[string]any{
-		"id":        s.Name, // proxy matches by site ID — use name (e.g., "dvwa.local")
+		"id":        s.Name,     // proxy matches by site ID — use name (e.g., "dvwa.local")
 		"tenant_id": s.TenantID, // propagated so per-request telemetry is tenant-scoped
 		"domains":   s.Domains,
-		"upstream": upstream,
-		"waf":      waf,
-		"plugins":  []any{},
+		"upstream":  upstream,
+		"waf":       waf,
+		"plugins":   []any{},
 		// Per-site TLS intent (the dashboard nests it under waf_policy.tls) lifted
 		// to the top-level Rust SiteConfig.tls, so the data plane honors per-site
 		// cert mode (ACME auto-issuance/renewal, manual cert paths). Serving certs
@@ -982,6 +1407,7 @@ func buildRustUpstream(raw json.RawMessage) (map[string]any, error) {
 		LB           string          `json:"lb"`
 		LoadBalancer string          `json:"load_balancer"`
 		HealthCheck  json.RawMessage `json:"health_check"`
+		TimeoutSecs  *uint64         `json:"timeout_secs"`
 	}
 	if len(raw) > 0 {
 		if err := json.Unmarshal(raw, &generic); err != nil {
@@ -1053,8 +1479,25 @@ func buildRustUpstream(raw json.RawMessage) (map[string]any, error) {
 			upstream["health_check"] = hc
 		}
 	}
+
+	// Per-site response-header timeout. Omitted when unset or 0 so the Rust
+	// side falls back to the deployment default rather than being handed a
+	// value nobody chose. Bounded because an unbounded wait would pin a
+	// request task (and its admission permit) on a hung origin.
+	if generic.TimeoutSecs != nil && *generic.TimeoutSecs > 0 {
+		secs := *generic.TimeoutSecs
+		if secs > maxUpstreamTimeoutSecs {
+			secs = maxUpstreamTimeoutSecs
+		}
+		upstream["timeout_secs"] = secs
+	}
 	return upstream, nil
 }
+
+// maxUpstreamTimeoutSecs caps the per-site upstream timeout at 10 minutes.
+// Slow report/export endpoints are the reason the knob exists; anything longer
+// than this is an application bug, not a WAF setting.
+const maxUpstreamTimeoutSecs uint64 = 600
 
 // buildRustWaf accepts the legacy minimal blob and the rich dashboard blob and
 // produces the Rust WafConfig JSON. Unknown/empty sections are omitted so the
@@ -1068,6 +1511,11 @@ func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
 		RuleExclusions   json.RawMessage `json:"rule_exclusions"`
 		RateLimit        json.RawMessage `json:"rate_limit"`
 		BotDetection     json.RawMessage `json:"bot_detection"`
+		Graphql          json.RawMessage `json:"graphql"`
+		Jwt              json.RawMessage `json:"jwt"`
+		Grpc             json.RawMessage `json:"grpc"`
+		Dlp              json.RawMessage `json:"dlp"`
+		Fusion           json.RawMessage `json:"fusion"`
 		AntiDdos         json.RawMessage `json:"anti_ddos"`
 		GeoIP            json.RawMessage `json:"geoip"`
 		ML               json.RawMessage `json:"ml"`
@@ -1078,6 +1526,7 @@ func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
 		APIDiscovery     bool            `json:"api_discovery"`
 		AllowedMethods   []string        `json:"allowed_methods"`
 		SecurityHeaders  json.RawMessage `json:"security_headers"`
+		PathOverrides    json.RawMessage `json:"path_overrides"`
 	}
 	if len(raw) > 0 {
 		if err := json.Unmarshal(raw, &p); err != nil {
@@ -1092,12 +1541,20 @@ func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
 		p.ParanoiaLevel = 2
 	}
 	if p.AnomalyThreshold == 0 {
-		p.AnomalyThreshold = 5
+		// 10, not 5: requiring two correlated signals instead of one is what the
+		// detection benchmark measured at composite 99.60% / true-negative 99.29%
+		// (deploy/load-test/waf-detection.yaml). At 5 a single weak +5 heuristic
+		// blocks on its own, which is where most benign false-positives came from.
+		p.AnomalyThreshold = 10
 	}
 
 	var rules []string
 	if p.Mode != "off" {
 		rules = crsFilesForCategories(p.RuleCategories)
+		// Appended, not prepended: CRS sets up tx.anomaly_score and friends, and
+		// our rules contribute to that score, so they must be evaluated after the
+		// CRS files that establish it.
+		rules = append(rules, sentinelRuleFiles...)
 	}
 
 	waf := map[string]any{
@@ -1108,42 +1565,64 @@ func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
 		"api_discovery":     p.APIDiscovery,
 	}
 
-	// Rule exclusions — include the well-known 932236 "ARGS_NAMES" / id
-	// suppression by default (avoids the `?id=42` false positive, see CRS
-	// importer notes), even alongside operator-defined exclusions (e.g. one-click
-	// disables from the learning report).
+	// Rule exclusions — the defaults in defaultRuleExclusions are applied to every
+	// site alongside any operator-defined ones (e.g. one-click disables from the
+	// learning report).
 	//
-	// An operator can fully re-enable 932236 by storing an *empty* 932236 entry
-	// (no targets, not disabled): that acts as an opt-out marker — it suppresses
-	// the injected default and is itself dropped (a no-op to the data plane).
-	// `handleDeleteSiteExclusion` leaves this marker when 932236 is removed, so
-	// the default isn't silently re-added on the next build.
+	// An operator can fully re-enable a defaulted rule by storing an *empty* entry
+	// for its id (no targets, not disabled): that acts as an opt-out marker — it
+	// suppresses the injected default and is itself dropped (a no-op to the data
+	// plane). `handleDeleteSiteExclusion` leaves this marker when such an entry is
+	// removed, so the default isn't silently re-added on the next build.
 	ex := []map[string]any{}
-	has932236 := false
-	out := make([]map[string]any, 0, len(ex)+1)
+	seen := make(map[int]bool, len(defaultRuleExclusions))
+	out := make([]map[string]any, 0, len(ex)+len(defaultRuleExclusions))
 	if len(p.RuleExclusions) > 0 {
 		if err := json.Unmarshal(p.RuleExclusions, &ex); err != nil {
 			ex = []map[string]any{}
 		}
 		for _, e := range ex {
-			if ruleIDEquals(e["rule_id"], 932236) {
-				has932236 = true
-				if isEmptyExclusion(e) {
-					continue // opt-out marker — drop it, don't emit to the proxy
+			isDefaulted := false
+			for _, d := range defaultRuleExclusions {
+				if ruleIDEquals(e["rule_id"], d.id) {
+					isDefaulted = true
+					seen[d.id] = true
+					break
 				}
+			}
+			if isDefaulted && isEmptyExclusion(e) {
+				continue // opt-out marker — drop it, don't emit to the proxy
 			}
 			out = append(out, e)
 		}
 	}
-	if !has932236 {
-		out = append(out, map[string]any{"rule_id": 932236, "exclude_targets": []string{"ARGS_NAMES"}})
+	for _, d := range defaultRuleExclusions {
+		if !seen[d.id] {
+			out = append(out, d.entry())
+		}
 	}
 	waf["rule_exclusions"] = out
 
 	attachRawObject(waf, "rate_limit", p.RateLimit)
 	attachRawObject(waf, "bot_detection", p.BotDetection)
+	attachRawObject(waf, "graphql", p.Graphql)
+	attachRawObject(waf, "jwt", p.Jwt)
+	attachRawObject(waf, "grpc", p.Grpc)
+	attachRawObject(waf, "dlp", p.Dlp)
+	attachRawObject(waf, "fusion", p.Fusion)
 	attachRawObject(waf, "ml", p.ML)
 	attachRawObject(waf, "ip_reputation", p.IPReputation)
+
+	// Per-path overrides pass through verbatim as an ARRAY (attachRawObject only
+	// handles objects). Validation has already rejected empty prefixes, per-path
+	// paranoia_level and per-path rule_exclusions, so what reaches the data plane
+	// is only what it can actually honour.
+	if len(p.PathOverrides) > 0 {
+		var ov []map[string]any
+		if err := json.Unmarshal(p.PathOverrides, &ov); err == nil && len(ov) > 0 {
+			waf["path_overrides"] = ov
+		}
+	}
 
 	// anti_ddos — only attach when explicitly enabled.
 	if len(p.AntiDdos) > 0 {
@@ -1194,6 +1673,81 @@ func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
 
 // ruleIDEquals compares a JSON-decoded rule_id (which may be float64, json.Number,
 // or int) against an expected integer.
+// attachInlineRules puts a tenant's operator-authored rules into the site's waf
+// block as `inline_rules`, which the data plane parses as SRL alongside its
+// file-based ruleset (see load_site_engine).
+//
+// Source rather than compiled bytecode: shipping bytecode would tie the control
+// plane's compiler version to the data plane's, so a version skew during a rolling
+// upgrade could mis-execute a rule instead of failing visibly. The data plane owns
+// the only compiler.
+//
+// A rule with no site_id is deployment-wide, which is the right default for what
+// the feature exists for: a virtual patch for a CVE should cover everything, not
+// one hostname. A rule scoped to a site reaches only that site, because tuning is
+// inherently per-site — a rule written for one application's checkout flow can
+// only cost latency and false-positive risk everywhere else.
+//
+// siteID is the site being configured; pass "" and only deployment-wide rules
+// attach.
+//
+// A site with mode "off" gets nothing: off means off, matching buildRustWaf.
+func attachInlineRules(rs map[string]any, siteID string, rules []db.DeployableRule) {
+	if len(rules) == 0 {
+		return
+	}
+	waf, ok := rs["waf"].(map[string]any)
+	if !ok {
+		return
+	}
+	if mode, _ := waf["mode"].(string); mode == "off" {
+		return
+	}
+	inline := make([]map[string]any, 0, len(rules))
+	for _, r := range rules {
+		if strings.TrimSpace(r.DSL) == "" {
+			continue
+		}
+		// Deployment-wide (empty SiteID) or scoped to exactly this site.
+		if r.SiteID != "" && r.SiteID != siteID {
+			continue
+		}
+		inline = append(inline, map[string]any{"name": r.Name, "dsl": r.DSL})
+	}
+	if len(inline) > 0 {
+		waf["inline_rules"] = inline
+	}
+}
+
+// defaultWafPolicyJSON is the policy stored for a site created without one. The
+// threshold matches buildRustWaf's default and the benchmarked configuration —
+// keep the two in step, or a site's stored policy and its effective policy drift.
+const defaultWafPolicyJSON = `{"mode":"blocking","paranoia_level":2,"anomaly_threshold":10}`
+
+// defaultRuleExclusions are the CRS suppressions applied to every site unless the
+// operator explicitly opts out. Both come from measured false-positive work:
+//
+//   - 932236 on ARGS_NAMES — the `?id=42` false positive (see CRS importer notes).
+//   - 920230 disabled outright — "multiple URL encoding detected" is a weak +3
+//     heuristic that dominated benign false-positives. Disabling it is one half of
+//     the tuned configuration measured at composite 99.60% / true-negative 99.29%
+//     (deploy/load-test/waf-detection.yaml); the other half is anomaly_threshold
+//     10, defaulted in buildRustWaf.
+//
+// entry is a constructor, not a shared map: buildRustWaf hands these to the data
+// plane per request, and a shared map would let one site's edit leak into another's.
+var defaultRuleExclusions = []struct {
+	id    int
+	entry func() map[string]any
+}{
+	{932236, func() map[string]any {
+		return map[string]any{"rule_id": 932236, "exclude_targets": []string{"ARGS_NAMES"}}
+	}},
+	{920230, func() map[string]any {
+		return map[string]any{"rule_id": 920230, "disable": true}
+	}},
+}
+
 func ruleIDEquals(v any, want int) bool {
 	switch n := v.(type) {
 	case float64:
@@ -1248,7 +1802,10 @@ func handleListRules(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 			if rules == nil {
 				rules = []db.RuleRow{}
 			}
-			c.JSON(http.StatusOK, gin.H{"rules": rules, "tenant_id": claims.TenantID})
+			c.JSON(http.StatusOK, gin.H{
+				"rules":     annotateRuleEnforcement(c.Request.Context(), store, rules),
+				"tenant_id": claims.TenantID,
+			})
 			return
 		}
 	}
@@ -1279,7 +1836,7 @@ func handleListAlerts(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 	c.JSON(http.StatusOK, gin.H{"alerts": []interface{}{}, "tenant_id": claims.TenantID})
 }
 
-func handleAckAlert(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
+func handleAckAlert(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *leader.Elector) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceAlert, rbac.ActionUpdate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
@@ -1290,7 +1847,7 @@ func handleAckAlert(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *lo
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
 		return
 	}
-	if !proposeBest(c, cl, cluster.CmdAlertAck, gin.H{"tenant_id": claims.TenantID, "alert_id": id}) {
+	if !requireLeader(c, cl) {
 		return
 	}
 	if err := store.AckAlert(c.Request.Context(), claims.TenantID, claims.UserID, id); err != nil {
@@ -1307,7 +1864,7 @@ func handleAckAlert(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *lo
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
-func handleResolveAlert(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
+func handleResolveAlert(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *leader.Elector) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceAlert, rbac.ActionUpdate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
@@ -1318,7 +1875,7 @@ func handleResolveAlert(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
 		return
 	}
-	if !proposeBest(c, cl, cluster.CmdAlertResolve, gin.H{"tenant_id": claims.TenantID, "alert_id": id}) {
+	if !requireLeader(c, cl) {
 		return
 	}
 	if err := store.ResolveAlert(c.Request.Context(), claims.TenantID, claims.UserID, id); err != nil {
@@ -1335,18 +1892,9 @@ func handleResolveAlert(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
-// ---------------------------------------------------------------------------
-// Plugins (stub — WASM runtime is Phase 3)
-// ---------------------------------------------------------------------------
-
-func handleListPlugins(c *gin.Context, enf *rbac.Enforcer) {
-	claims, _ := auth.GetClaims(c.Request.Context())
-	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourcePlugin, rbac.ActionList) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"plugins": []interface{}{}, "tenant_id": claims.TenantID})
-}
+// Plugins moved to plugin_handlers.go. The stub that lived here always returned
+// a hardcoded empty list, so the Plugins page stayed empty no matter what was
+// installed — see handleListPluginsReal.
 
 // ---------------------------------------------------------------------------
 // Audit
@@ -1603,7 +2151,7 @@ var _ = fmt.Sprintf
 // Rule CRUD
 // ---------------------------------------------------------------------------
 
-func handleCreateRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
+func handleCreateRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *leader.Elector) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceRule, rbac.ActionCreate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
@@ -1614,7 +2162,39 @@ func handleCreateRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if !proposeBest(c, cl, cluster.CmdRuleCreate, gin.H{"tenant_id": claims.TenantID, "req": req}) {
+	// Validate the DSL with the real engine. Unlike an UPDATE there is nothing
+	// live to disarm here, so if the validator itself cannot run we store the rule
+	// and say so — the enforcement-status layer will report it if the data plane
+	// rejects it. An INVALID rule is still refused outright: storing one that can
+	// never run is what made "enabled" meaningless in the first place.
+	var createValidationSkipped bool
+	if strings.TrimSpace(req.DSL) != "" {
+		problem, skipped := rejectInvalidDSL(c.Request.Context(), req.DSL)
+		if problem != "" {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":   "the rule is not valid SRL and was not saved",
+				"detail":  problem,
+				"invalid": true,
+			})
+			return
+		}
+		createValidationSkipped = skipped
+	}
+
+	// A rule scoped to a site the caller cannot see would be created and then
+	// never delivered anywhere — it would sit in the UI looking enabled and do
+	// nothing. Reject it with the reason instead. The tenant-scoped GetSite also
+	// stops one tenant scoping a rule onto another tenant's site.
+	if req.SiteID != nil && strings.TrimSpace(*req.SiteID) != "" && store != nil {
+		if _, err := store.GetSite(c.Request.Context(), claims.TenantID, *req.SiteID); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "site_id does not refer to a site in this tenant; omit it for a " +
+					"deployment-wide rule",
+			})
+			return
+		}
+	}
+	if !requireLeader(c, cl) {
 		return
 	}
 	if store != nil {
@@ -1630,20 +2210,39 @@ func handleCreateRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 			TargetKind:  "rule",
 			TargetID:    &rule.ID,
 		})
-		c.JSON(http.StatusCreated, gin.H{"rule": rule})
+		resp := gin.H{"rule": rule}
+		if createValidationSkipped {
+			// Honest about what did not happen, rather than implying the rule was
+			// checked. The enforcement status will resolve it within seconds.
+			resp["warning"] = "the rule was stored without validation because the " +
+				"validator was unavailable on this node; check its enforcement status"
+		}
+		c.JSON(http.StatusCreated, resp)
 		return
 	}
 	id := fmt.Sprintf("custom-%d", time.Now().UnixNano()%100000000)
 	c.JSON(http.StatusCreated, gin.H{"rule": gin.H{
 		"id": id, "tenant_id": claims.TenantID,
-		"name": req.Name, "source": func() string { if req.Source != "" { return req.Source } else { return "custom" } }(),
-		"phase": req.Phase, "severity": func() string { if req.Severity != "" { return req.Severity } else { return "medium" } }(),
+		"name": req.Name, "source": func() string {
+			if req.Source != "" {
+				return req.Source
+			} else {
+				return "custom"
+			}
+		}(),
+		"phase": req.Phase, "severity": func() string {
+			if req.Severity != "" {
+				return req.Severity
+			} else {
+				return "medium"
+			}
+		}(),
 		"dsl": req.DSL, "enabled": true, "tags": req.Tags,
 		"created_at": time.Now(), "updated_at": time.Now(),
 	}})
 }
 
-func handleToggleRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
+func handleToggleRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *leader.Elector) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceRule, rbac.ActionUpdate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
@@ -1657,7 +2256,7 @@ func handleToggleRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if !proposeBest(c, cl, cluster.CmdRuleToggle, gin.H{"tenant_id": claims.TenantID, "rule_id": id, "enabled": req.Enabled}) {
+	if !requireLeader(c, cl) {
 		return
 	}
 	if store != nil {
@@ -1669,21 +2268,27 @@ func handleToggleRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 	writeAuditEntry(c, store, hub, &db.WriteAuditRequest{
 		TenantID:    claims.TenantID,
 		ActorUserID: &claims.UserID,
-		Action:      fmt.Sprintf("rule.%s", func() string { if req.Enabled { return "enable" } else { return "disable" } }()),
-		TargetKind:  "rule",
-		TargetID:    &id,
+		Action: fmt.Sprintf("rule.%s", func() string {
+			if req.Enabled {
+				return "enable"
+			} else {
+				return "disable"
+			}
+		}()),
+		TargetKind: "rule",
+		TargetID:   &id,
 	})
 	c.JSON(http.StatusOK, gin.H{"ok": true, "id": id, "enabled": req.Enabled})
 }
 
-func handleDeleteRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
+func handleDeleteRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *leader.Elector) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceRule, rbac.ActionDelete) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
 		return
 	}
 	id := c.Param("id")
-	if !proposeBest(c, cl, cluster.CmdRuleDelete, gin.H{"tenant_id": claims.TenantID, "rule_id": id}) {
+	if !requireLeader(c, cl) {
 		return
 	}
 	if store != nil {
@@ -1719,68 +2324,69 @@ func handleTestRule(c *gin.Context, enf *rbac.Enforcer) {
 		return
 	}
 
-	verdict, matched, detail := testRuleDSL(req.DSL, req.Payload, req.Path)
-	anomalyScore := 0
-	if matched {
-		anomalyScore = 10
+	// Runs the REAL parser, compiler and rule VM via the bundled srl-validate
+	// binary. The previous implementation string-scanned for rx('...') and
+	// compiled a Go regex, so it reported a fabricated verdict for a DSL the
+	// engine would have rejected outright.
+	res, err := validateSRL(c.Request.Context(), srlRequest{
+		DSL:     req.DSL,
+		Payload: req.Payload,
+		Path:    req.Path,
+		Method:  req.Method,
+	})
+	if err != nil {
+		// Say validation could not run. Do NOT invent a verdict — a made-up
+		// answer here is what this endpoint existed to stop being.
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "rule validation is unavailable on this node, so no verdict can " +
+				"be given; the rule was not evaluated",
+			"detail": err.Error(),
+		})
+		return
 	}
+	if !res.Valid {
+		c.JSON(http.StatusOK, gin.H{
+			"valid":   false,
+			"verdict": "INVALID",
+			"matched": false,
+			"detail":  res.Error,
+			"error":   res.Error,
+		})
+		return
+	}
+
+	verdict := "PASS"
+	matched := res.Matched != nil && *res.Matched
+	if matched {
+		verdict = strings.ToUpper(res.Decision)
+	}
+	score := 0
+	if res.Score != nil {
+		score = *res.Score
+	}
+	detail := fmt.Sprintf("compiled %d rule(s)", len(res.Rules))
+	if req.Payload == "" {
+		detail += "; no payload supplied, so nothing was evaluated"
+	} else if matched {
+		detail = fmt.Sprintf("matched rule(s) %s", strings.Join(res.MatchedRuleIDs, ", "))
+	} else {
+		detail += "; the payload did not match"
+	}
+
 	c.JSON(http.StatusOK, gin.H{
-		"verdict":       verdict,
-		"matched":       matched,
-		"detail":        detail,
-		"anomaly_score": anomalyScore,
-		"phases_run":    []string{"request_headers", "request_body"},
+		"valid":            true,
+		"verdict":          verdict,
+		"matched":          matched,
+		"detail":           detail,
+		"anomaly_score":    score,
+		"decision":         res.Decision,
+		"matched_rule_ids": res.MatchedRuleIDs,
+		"rules":            res.Rules,
+		"phases_run":       []string{"request_headers", "request_body", "response_headers", "response_body"},
 	})
 }
 
 // testRuleDSL extracts the rx/contains operator from SRL DSL and tests it
-// against the provided payload.
-func testRuleDSL(dsl, payload, path string) (verdict string, matched bool, detail string) {
-	var pat string
-	for i := 0; i+3 < len(dsl); i++ {
-		if dsl[i:i+3] == "rx(" {
-			start := i + 4
-			end := start
-			for end < len(dsl) && dsl[end] != '\'' {
-				end++
-			}
-			if end > start {
-				pat = dsl[start:end]
-			}
-			break
-		}
-	}
-
-	target := payload
-	if path != "" {
-		target = target + " " + path
-	}
-
-	if pat == "" {
-		return "PASS", false, "No rx() operator found in DSL"
-	}
-
-	cleanPat := pat
-	if len(cleanPat) > 2 && cleanPat[0] == '/' {
-		end := len(cleanPat) - 1
-		for end > 0 && (cleanPat[end] == 'i' || cleanPat[end] == 's' || cleanPat[end] == 'm') {
-			end--
-		}
-		if cleanPat[end] == '/' {
-			cleanPat = cleanPat[1:end]
-		}
-	}
-
-	re, err := regexp.Compile(`(?i)` + cleanPat)
-	if err != nil {
-		return "ERROR", false, fmt.Sprintf("Invalid regex %q: %v", cleanPat, err)
-	}
-
-	if re.MatchString(target) {
-		return "BLOCK", true, fmt.Sprintf("Pattern /%s/ matched in payload", pat)
-	}
-	return "PASS", false, fmt.Sprintf("Pattern /%s/ did not match", pat)
-}
 
 // ---------------------------------------------------------------------------
 // ML Stats
@@ -1882,35 +2488,69 @@ func handleMetrics(c *gin.Context, hub *logs.Hub) {
 }
 
 // ---------------------------------------------------------------------------
-// Admin — Users & API Keys (enhanced with mock data)
+// Admin — Users & API Keys (real, DB-backed, tenant-scoped)
 // ---------------------------------------------------------------------------
 
-func handleListUsersReal(c *gin.Context, enf *rbac.Enforcer) {
+// validUserRole guards the 5-role model before it hits the DB CHECK constraint.
+func validUserRole(r string) bool {
+	switch r {
+	case "owner", "admin", "editor", "viewer", "auditor":
+		return true
+	}
+	return false
+}
+
+// respondStoreError maps a store/DB error to a sanitized client response so raw
+// driver/schema detail (table names, constraints, SQLSTATE) never leaks to the
+// caller: a unique-constraint violation becomes 409, a generic "not found"
+// becomes 404, and anything else a generic 500. The raw error is intentionally
+// not echoed.
+func respondStoreError(c *gin.Context, err error) {
+	var pgErr *pgconn.PgError
+	switch {
+	case errors.As(err, &pgErr) && pgErr.Code == "23505":
+		c.JSON(http.StatusConflict, gin.H{"error": "already exists"})
+	case err != nil && strings.Contains(err.Error(), "not found"):
+		// Store not-found messages are fixed, safe strings (no user input).
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+	default:
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+	}
+}
+
+func handleListUsersReal(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceUser, rbac.ActionList) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{
-		"users": []gin.H{
-			{"id": db.DevAdminID, "email": "admin@sentinel.local", "name": "Admin", "role": "admin", "status": "active", "twofa": true, "last_login": time.Now().Add(-2 * time.Minute)},
-			{"id": "00000000-0000-0000-0000-000000000003", "email": "raj.kumar@sentinel.local", "name": "Raj Kumar", "role": "editor", "status": "active", "twofa": true, "last_login": time.Now().Add(-2 * time.Hour)},
-			{"id": "00000000-0000-0000-0000-000000000004", "email": "priya.dev@sentinel.local", "name": "Priya Dev", "role": "viewer", "status": "active", "twofa": false, "last_login": time.Now().Add(-24 * time.Hour)},
-		},
-		"tenant_id": claims.TenantID,
-	})
+	if store == nil {
+		c.JSON(http.StatusOK, gin.H{"users": []db.UserRow{}, "tenant_id": claims.TenantID})
+		return
+	}
+	users, err := store.ListUsers(c.Request.Context(), claims.TenantID, claims.UserID)
+	if err != nil {
+		respondStoreError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"users": users, "tenant_id": claims.TenantID})
 }
 
-func handleCreateUserReal(c *gin.Context, enf *rbac.Enforcer) {
+func handleCreateUserReal(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceUser, rbac.ActionCreate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
 		return
 	}
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
+		return
+	}
 	var req struct {
-		Email string `json:"email" binding:"required"`
-		Name  string `json:"name"`
-		Role  string `json:"role"`
+		Email    string `json:"email" binding:"required,email"`
+		Name     string `json:"name"`
+		Role     string `json:"role"`
+		Password string `json:"password" binding:"required,min=12"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -1919,74 +2559,143 @@ func handleCreateUserReal(c *gin.Context, enf *rbac.Enforcer) {
 	if req.Role == "" {
 		req.Role = "viewer"
 	}
-	c.JSON(http.StatusCreated, gin.H{
-		"user": gin.H{
-			"id": fmt.Sprintf("user-%d", time.Now().UnixNano()%100000000),
-			"email": req.Email, "name": req.Name, "role": req.Role,
-			"status": "active", "twofa": false, "last_login": nil,
-		},
-		"message": fmt.Sprintf("Invitation sent to %s", req.Email),
-	})
+	if !validUserRole(req.Role) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid role"})
+		return
+	}
+	u, err := store.CreateUser(c.Request.Context(), claims.TenantID, claims.UserID, req.Email, req.Name, req.Role, req.Password)
+	if err != nil {
+		respondStoreError(c, err)
+		return
+	}
+	c.JSON(http.StatusCreated, gin.H{"user": u})
 }
 
-func handleListAPIKeysReal(c *gin.Context, enf *rbac.Enforcer) {
+func handleUpdateUser(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 	claims, _ := auth.GetClaims(c.Request.Context())
-	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceAPIKey, rbac.ActionList) {
+	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceUser, rbac.ActionUpdate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{
-		"api_keys": []gin.H{
-			{"id": "key-1", "name": "CI/CD Pipeline", "preview": "sk-live-f87a48c6••••51de", "scope": "read:all write:rules", "created_at": "2024-11-01T00:00:00Z", "expires_at": "2025-11-01T00:00:00Z", "last_used": "2 min ago"},
-			{"id": "key-2", "name": "Monitoring Agent", "preview": "sk-live-a2b3c4d5••••ef90", "scope": "read:all", "created_at": "2024-10-15T00:00:00Z", "expires_at": "2025-10-15T00:00:00Z", "last_used": "5 min ago"},
-			{"id": "key-3", "name": "Backup Script", "preview": "sk-live-9f8e7d6c••••ba01", "scope": "read:logs", "created_at": "2024-09-01T00:00:00Z", "expires_at": "2025-09-01T00:00:00Z", "last_used": "3d ago"},
-		},
-		"tenant_id": claims.TenantID,
-	})
-}
-
-func handleCreateAPIKeyReal(c *gin.Context, enf *rbac.Enforcer) {
-	claims, _ := auth.GetClaims(c.Request.Context())
-	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceAPIKey, rbac.ActionCreate) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
 		return
 	}
 	var req struct {
-		Name    string `json:"name" binding:"required"`
-		Scope   string `json:"scope"`
+		Role   string `json:"role"`
+		Status string `json:"status"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	nano := time.Now().UnixNano()
-	randomPart := fmt.Sprintf("%016x", nano)
-	fullKey := "sk-live-" + randomPart
-	preview := fullKey[:14] + "••••" + fullKey[len(fullKey)-4:]
-	scope := req.Scope
-	if scope == "" {
-		scope = "read:all"
+	if req.Role != "" && !validUserRole(req.Role) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid role"})
+		return
+	}
+	if err := store.UpdateUser(c.Request.Context(), claims.TenantID, claims.UserID, c.Param("id"), req.Role, req.Status); err != nil {
+		respondStoreError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+func handleDeleteUser(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
+	claims, _ := auth.GetClaims(c.Request.Context())
+	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceUser, rbac.ActionDelete) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
+		return
+	}
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
+		return
+	}
+	if c.Param("id") == claims.UserID {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "cannot delete your own account"})
+		return
+	}
+	if err := store.DeleteUser(c.Request.Context(), claims.TenantID, claims.UserID, c.Param("id")); err != nil {
+		respondStoreError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+func handleListAPIKeysReal(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
+	claims, _ := auth.GetClaims(c.Request.Context())
+	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceAPIKey, rbac.ActionList) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
+		return
+	}
+	if store == nil {
+		c.JSON(http.StatusOK, gin.H{"api_keys": []db.APIKeyRow{}, "tenant_id": claims.TenantID})
+		return
+	}
+	keys, err := store.ListAPIKeys(c.Request.Context(), claims.TenantID, claims.UserID)
+	if err != nil {
+		respondStoreError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"api_keys": keys, "tenant_id": claims.TenantID})
+}
+
+func handleCreateAPIKeyReal(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
+	claims, _ := auth.GetClaims(c.Request.Context())
+	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceAPIKey, rbac.ActionCreate) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
+		return
+	}
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
+		return
+	}
+	var req struct {
+		Name        string   `json:"name" binding:"required"`
+		Role        string   `json:"role"`
+		Scopes      []string `json:"scopes"`
+		ExpiresDays int      `json:"expires_days"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.Role == "" {
+		req.Role = "viewer"
+	}
+	if !validUserRole(req.Role) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid role"})
+		return
+	}
+	var expiresAt *time.Time
+	if req.ExpiresDays > 0 {
+		t := time.Now().Add(time.Duration(req.ExpiresDays) * 24 * time.Hour)
+		expiresAt = &t
+	}
+	row, fullKey, err := store.CreateAPIKey(c.Request.Context(), claims.TenantID, claims.UserID, req.Name, req.Role, req.Scopes, expiresAt)
+	if err != nil {
+		respondStoreError(c, err)
+		return
 	}
 	c.JSON(http.StatusCreated, gin.H{
-		"api_key": gin.H{
-			"id":         fmt.Sprintf("key-%d", nano%100000000),
-			"name":       req.Name,
-			"key":        fullKey,
-			"preview":    preview,
-			"scope":      scope,
-			"created_at": time.Now().UTC(),
-			"expires_at": time.Now().Add(365 * 24 * time.Hour).UTC(),
-		},
-		"warning": "Copy this key now — it will never be shown again.",
+		"api_key": row,
+		"key":     fullKey, // shown exactly once
+		"warning": "Copy this key now — it is stored hashed and will never be shown again.",
 	})
 }
 
-func handleRevokeAPIKey(c *gin.Context, enf *rbac.Enforcer) {
+func handleRevokeAPIKey(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceAPIKey, rbac.ActionDelete) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
 		return
 	}
-	// id := c.Param("id")
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
+		return
+	}
+	if err := store.RevokeAPIKey(c.Request.Context(), claims.TenantID, claims.UserID, c.Param("id")); err != nil {
+		respondStoreError(c, err)
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"ok": true, "message": "API key revoked"})
 }

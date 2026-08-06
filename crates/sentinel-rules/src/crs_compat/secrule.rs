@@ -1,4 +1,4 @@
-use crate::dsl::ast::{RulePhase, RuleSeverity, Transform};
+use crate::dsl::ast::{RulePhase, RuleSeverity, SetVar, SetVarOp, Transform};
 
 // ---------------------------------------------------------------------------
 // Parsed CRS action attributes
@@ -17,6 +17,11 @@ pub struct CrsActions {
     pub severity: Option<RuleSeverity>,
     pub tags: Vec<String>,
     pub score_delta: Option<i32>,
+    /// All `setvar` mutations targeting the per-request TX store, in declaration
+    /// order. Unlike `score_delta` (which only tracks anomaly-score deltas for
+    /// the fast blocking path), this preserves *every* `tx.*` write so category
+    /// scores and correlation state are available to later rules.
+    pub setvars: Vec<SetVar>,
     /// Whether this rule has a `chain` action (next SecRule is a chain member).
     pub chain: bool,
     /// Ordered list of transformations to apply to target values before matching.
@@ -161,9 +166,19 @@ fn parse_action_token(token: &str, out: &mut CrsActions) {
     }
     // setvar:tx.anomaly_score=+5 or setvar:tx.anomaly_score=+%{tx.critical_anomaly_score}
     if let Some(rest) = token.strip_prefix("setvar:") {
-        if let Some(delta) = parse_setvar_score_delta(rest.trim()) {
+        let rest = rest.trim();
+        // Keep the fast anomaly-score path (drives ctx.anomaly_score directly).
+        if let Some(delta) = parse_setvar_score_delta(rest) {
             // Sum all anomaly-score deltas in the rule (CRS v4 has exactly one per rule).
             out.score_delta = Some(out.score_delta.unwrap_or(0) + delta);
+        }
+        // Preserve the full TX-store mutation (arbitrary tx.* vars, macros, etc.)
+        // so it executes at match time and is readable by later rules. Anomaly
+        // score is intentionally recorded in BOTH: score_delta feeds the blocking
+        // gate, the TX copy feeds TX:ANOMALY_SCORE reads — they don't interfere
+        // (different fields).
+        if let Some(sv) = parse_setvar(rest) {
+            out.setvars.push(sv);
         }
         return;
     }
@@ -245,7 +260,18 @@ fn parse_action_token(token: &str, out: &mut CrsActions) {
         "t:removecommentschar" => out.transforms.push(Transform::RemoveCommentsChar),
         "t:removecomments" => out.transforms.push(Transform::RemoveComments),
         "t:replacecomments" => out.transforms.push(Transform::ReplaceComments),
-        other if other.starts_with("t:") => {} // remaining transforms — no-op
+        "t:cmdline" => out.transforms.push(Transform::CmdLine),
+        "t:escapeseqdecode" => out.transforms.push(Transform::EscapeSeqDecode),
+        "t:length" => out.transforms.push(Transform::Length),
+        // An unsupported transform must NOT silently degrade a rule to matching
+        // against under-normalized input — surface it so coverage gaps are
+        // visible instead of becoming invisible evasion holes.
+        other if other.starts_with("t:") => {
+            tracing::warn!(
+                transform = other,
+                "unsupported CRS transform — dropped; rule will match under-normalized input"
+            );
+        }
         "multimatch" => out.multi_match = true,
         other if other.starts_with("ctl:") => {} // control directives — no-op
         "chain" => {
@@ -316,6 +342,56 @@ fn parse_setvar_score_delta(s: &str) -> Option<i32> {
     None
 }
 
+/// Parse a full CRS `setvar` argument into a [`SetVar`] targeting the
+/// per-request TX store.
+///
+/// Handles the CRS forms:
+/// - `!tx.name`        → [`SetVarOp::Unset`]
+/// - `tx.name=value`   → [`SetVarOp::Set`] (value may contain `%{...}` macros)
+/// - `tx.name=+expr`   → [`SetVarOp::Add`] (numeric increment)
+/// - `tx.name=-expr`   → [`SetVarOp::Sub`] (numeric decrement)
+///
+/// Only `tx.*` variables are modelled — other ModSecurity collections
+/// (`ip.`, `session.`, `global.`) have no per-request store here, so they
+/// return `None` and are dropped. The variable name is uppercased and stripped
+/// of its `tx.` prefix to match the `TX:` read convention (see `token_to_target`).
+fn parse_setvar(s: &str) -> Option<SetVar> {
+    let s = s.trim().trim_matches('\'').trim_matches('"').trim();
+
+    // Unset form: `!tx.name`
+    if let Some(name) = s.strip_prefix('!') {
+        return Some(SetVar {
+            name: tx_key(name)?,
+            op: SetVarOp::Unset,
+        });
+    }
+
+    let (lhs, rhs) = s.split_once('=')?;
+    let name = tx_key(lhs)?;
+    let rhs = rhs.trim();
+
+    let op = if let Some(rest) = rhs.strip_prefix('+') {
+        SetVarOp::Add(rest.trim().to_owned())
+    } else if let Some(rest) = rhs.strip_prefix('-') {
+        SetVarOp::Sub(rest.trim().to_owned())
+    } else {
+        SetVarOp::Set(rhs.to_owned())
+    };
+
+    Some(SetVar { name, op })
+}
+
+/// Normalise a setvar LHS like `tx.sql_injection_score` into the uppercase
+/// store key `SQL_INJECTION_SCORE`. Returns `None` for non-`tx.` collections.
+fn tx_key(name: &str) -> Option<String> {
+    let lower = name.trim().to_ascii_lowercase();
+    let rest = lower.strip_prefix("tx.")?;
+    if rest.is_empty() {
+        return None;
+    }
+    Some(rest.to_ascii_uppercase())
+}
+
 fn parse_crs_severity(s: &str) -> Option<RuleSeverity> {
     match s.to_uppercase().as_str() {
         "CRITICAL" => Some(RuleSeverity::Critical),
@@ -373,5 +449,63 @@ mod tests {
     fn test_parse_crs_actions_setvar() {
         let actions = parse_crs_actions("id:942100,phase:2,pass,setvar:tx.anomaly_score=+5");
         assert_eq!(actions.score_delta, Some(5));
+        // The anomaly-score setvar is ALSO captured in the TX-store list so it is
+        // readable via TX:ANOMALY_SCORE, without affecting the score_delta path.
+        assert_eq!(
+            actions.setvars,
+            vec![SetVar {
+                name: "ANOMALY_SCORE".to_owned(),
+                op: SetVarOp::Add("5".to_owned()),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_parse_setvar_category_score_not_counted_as_anomaly() {
+        // A category-score setvar must be preserved in the TX store but NOT
+        // treated as an anomaly-score delta (that would double-count).
+        let actions = parse_crs_actions("id:942100,phase:2,pass,setvar:tx.sql_injection_score=+5");
+        assert_eq!(actions.score_delta, None);
+        assert_eq!(
+            actions.setvars,
+            vec![SetVar {
+                name: "SQL_INJECTION_SCORE".to_owned(),
+                op: SetVarOp::Add("5".to_owned()),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_parse_setvar_all_forms() {
+        assert_eq!(
+            parse_setvar("tx.foo=+%{tx.critical_anomaly_score}"),
+            Some(SetVar {
+                name: "FOO".to_owned(),
+                op: SetVarOp::Add("%{tx.critical_anomaly_score}".to_owned()),
+            })
+        );
+        assert_eq!(
+            parse_setvar("tx.bar=-2"),
+            Some(SetVar {
+                name: "BAR".to_owned(),
+                op: SetVarOp::Sub("2".to_owned()),
+            })
+        );
+        assert_eq!(
+            parse_setvar("tx.msg=blocked"),
+            Some(SetVar {
+                name: "MSG".to_owned(),
+                op: SetVarOp::Set("blocked".to_owned()),
+            })
+        );
+        assert_eq!(
+            parse_setvar("!tx.foo"),
+            Some(SetVar {
+                name: "FOO".to_owned(),
+                op: SetVarOp::Unset,
+            })
+        );
+        // Non-tx collections are not modelled → dropped.
+        assert_eq!(parse_setvar("ip.reput_block_flag=1"), None);
     }
 }

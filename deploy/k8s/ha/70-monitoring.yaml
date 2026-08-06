@@ -1,0 +1,57 @@
+# Observability wiring for the Prometheus Operator (kube-prometheus-stack).
+# OPTIONAL + applied SEPARATELY — these use CRDs (monitoring.coreos.com/v1) that
+# only exist once the Prometheus Operator is installed, so they are NOT in
+# kustomization.yaml. Apply after the operator:
+#   kubectl apply -f 70-monitoring.yaml
+#
+# IMPORTANT: /metrics is exposed by the CONTROL PLANE only (port 9501, same as
+# the REST API). The Rust data plane does not expose an HTTP /metrics endpoint,
+# so there is nothing to scrape on the data-plane pods.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: sentinel-controlplane
+  namespace: sentinel
+  labels: { app: sentinel, tier: controlplane }
+spec:
+  selector:
+    matchLabels: { app: sentinel, tier: controlplane }
+  endpoints:
+    - port: rest            # the 'rest' port (9501) on the sentinel-controlplane Service
+      path: /metrics
+      interval: 30s
+      # If SENTINEL_METRICS_TOKEN is set on the control plane, scraping is Bearer-
+      # gated — uncomment and point at a Secret holding the token:
+      # bearerTokenSecret: { name: sentinel-secrets, key: metrics-token }
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: sentinel-alerts
+  namespace: sentinel
+  labels: { app: sentinel, role: alert-rules }
+spec:
+  groups:
+    - name: sentinel.rules
+      rules:
+        - alert: SentinelDataPlaneFleetDegraded
+          expr: kube_deployment_status_replicas_available{namespace="sentinel",deployment="sentinel-dataplane"} < 2
+          for: 2m
+          labels: { severity: critical }
+          annotations:
+            summary: "WAF data-plane fleet below 2 healthy replicas"
+            description: "Fewer than 2 sentinel-dataplane pods are available — protection capacity/HA is degraded."
+        - alert: SentinelControlPlaneQuorumRisk
+          expr: kube_statefulset_status_replicas_ready{namespace="sentinel",statefulset="sentinel-controlplane"} < 2
+          for: 1m
+          labels: { severity: critical }
+          annotations:
+            summary: "Control-plane Raft quorum at risk"
+            description: "Fewer than 2 of 3 control-plane pods are ready — losing one more breaks quorum."
+        - alert: SentinelControlPlaneDown
+          expr: up{job="sentinel-controlplane"} == 0
+          for: 2m
+          labels: { severity: critical }
+          annotations:
+            summary: "Control-plane /metrics scrape is down"
+            description: "Prometheus cannot scrape the control plane — it may be down or unreachable."

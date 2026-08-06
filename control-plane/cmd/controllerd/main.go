@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -18,11 +19,13 @@ import (
 	"github.com/your-org/sentinel-waf/control-plane/internal/alerting"
 	"github.com/your-org/sentinel-waf/control-plane/internal/api"
 	"github.com/your-org/sentinel-waf/control-plane/internal/auth"
+	"github.com/your-org/sentinel-waf/control-plane/internal/certmon"
 	chreader "github.com/your-org/sentinel-waf/control-plane/internal/clickhouse"
-	"github.com/your-org/sentinel-waf/control-plane/internal/cluster"
 	"github.com/your-org/sentinel-waf/control-plane/internal/db"
-	controlgrpc "github.com/your-org/sentinel-waf/control-plane/internal/grpc"
+	"github.com/your-org/sentinel-waf/control-plane/internal/diskmon"
+	"github.com/your-org/sentinel-waf/control-plane/internal/leader"
 	"github.com/your-org/sentinel-waf/control-plane/internal/logs"
+	"github.com/your-org/sentinel-waf/control-plane/internal/nodehealth"
 	"github.com/your-org/sentinel-waf/control-plane/internal/rbac"
 	"github.com/your-org/sentinel-waf/control-plane/internal/threatintel"
 	"go.uber.org/zap"
@@ -47,6 +50,17 @@ func dbConnectMaxWait() time.Duration {
 		}
 	}
 	return 60 * time.Second
+}
+
+// allowSuperuserDB reports whether the operator has explicitly opted in to
+// running the control plane on a Postgres superuser/BYPASSRLS role. This is only
+// safe for single-tenant dev/demo, where RLS is not the tenant boundary.
+func allowSuperuserDB() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("SENTINEL_ALLOW_SUPERUSER_DB"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 // openDBWithRetry repeatedly attempts to open the DB pool until it succeeds or
@@ -75,7 +89,7 @@ func openDBWithRetry(ctx context.Context, log *zap.Logger, cfg db.Config, maxWai
 		log.Warn("DB not ready yet — retrying",
 			zap.Int("attempt", attempt),
 			zap.Duration("next_retry_in", backoff),
-			zap.Error(err))
+			zap.String("error", safeErr(err)))
 		select {
 		case <-time.After(backoff):
 		case <-ctx.Done():
@@ -100,11 +114,32 @@ func run() error {
 	}
 	defer log.Sync()
 
+	// Install it as the global logger. Without this, zap.L() returns a NO-OP
+	// logger and every zap.L() call in the codebase is silently discarded — which
+	// included "audit write failed". A failure to append to the tamper-evident
+	// audit log was therefore invisible: the write failed, the HTTP request
+	// returned 200, and nothing was recorded anywhere. Handlers that hold no
+	// logger reference legitimately use zap.L(); it just has to point somewhere.
+	zap.ReplaceGlobals(log)
+
 	// ── JWT ───────────────────────────────────────────────────────────────────
 	jwtCfg := auth.DefaultJWTConfig()
 	jwtCfg.Secret = os.Getenv("SENTINEL_JWT_SECRET")
-	if jwtCfg.Secret == "" {
-		log.Warn("SENTINEL_JWT_SECRET not set — using random key (HA unsafe)")
+	devLogin := os.Getenv("SENTINEL_DEV_LOGIN") == "1" || os.Getenv("SENTINEL_DEV_LOGIN") == "true"
+	if len(jwtCfg.Secret) < 32 {
+		if devLogin {
+			log.Warn("SENTINEL_JWT_SECRET missing/weak — dev-login mode: using a random key (tokens reset on restart, HA-unsafe)")
+		} else {
+			// Fail fast: a random per-process key silently breaks HA (nodes
+			// reject each other's tokens) and invalidates all sessions on restart.
+			return fmt.Errorf("SENTINEL_JWT_SECRET must be set to a strong value (>=32 chars); set SENTINEL_DEV_LOGIN=1 to bypass for local dev")
+		}
+	}
+
+	// Audit-log tamper-evidence relies on a real HMAC key — the built-in default
+	// makes the hash chain meaningless. Fail fast in prod (bypass for local dev).
+	if len(os.Getenv("SENTINEL_AUDIT_HMAC_KEY")) < 32 && !devLogin {
+		return fmt.Errorf("SENTINEL_AUDIT_HMAC_KEY must be set to a strong value (>=32 chars); set SENTINEL_DEV_LOGIN=1 to bypass for local dev")
 	}
 	jwtSvc, err := auth.NewJWTService(jwtCfg)
 	if err != nil {
@@ -127,28 +162,89 @@ func run() error {
 		// instead of dropping straight into degraded mode on the first ping.
 		pool, dbErr = openDBWithRetry(ctx, log, db.Config{URL: dbURL, MaxConns: 20, MinConns: 2}, dbConnectMaxWait())
 		if dbErr != nil {
-			log.Warn("DB unavailable — running in degraded mode (mock data only)", zap.Error(dbErr))
+			// safeErr, not zap.Error: a connect/parse failure can quote the DSN
+			// it choked on, which would put the password in the log.
+			log.Warn("DB unavailable — running in degraded mode (mock data only)",
+				zap.String("error", safeErr(dbErr)))
 		} else {
 			log.Info("DB connected", zap.String("url", maskPassword(dbURL)))
 			store = db.NewStore(pool)
 
-			// Seed dev data (idempotent).
-			if err := db.SeedDev(ctx, pool); err != nil {
-				log.Warn("DB seed failed (non-fatal)", zap.Error(err))
+			// Tenant isolation ultimately rests on FORCE ROW LEVEL SECURITY,
+			// which Postgres SILENTLY IGNORES for superusers and BYPASSRLS
+			// roles. Refuse to boot as such a role so RLS is never a no-op in
+			// multi-tenant use. The explicit tenant_id predicates in the stores
+			// are the first line of defense; this assertion is the backstop.
+			// SENTINEL_ALLOW_SUPERUSER_DB=1 is an explicit, logged opt-out for
+			// single-tenant dev/demo (where RLS is not the isolation boundary).
+			privileged, role, perr := store.ConnRoleIsPrivileged(ctx)
+			if perr != nil {
+				log.Warn("could not verify DB role privileges", zap.Error(perr))
+			} else if privileged {
+				if allowSuperuserDB() {
+					log.Warn("DB role BYPASSES row-level security — tenant isolation relies on explicit predicates only. DO NOT use this role for multi-tenant production.",
+						zap.String("db_role", role))
+				} else {
+					log.Fatal("refusing to start: control plane connects to Postgres as a SUPERUSER/BYPASSRLS role, which nullifies FORCE ROW LEVEL SECURITY (tenant isolation). Point SENTINEL_DB_URL at the non-superuser 'sentinel_app' role, or set SENTINEL_ALLOW_SUPERUSER_DB=1 for single-tenant dev/demo.",
+						zap.String("db_role", role))
+				}
+			}
+
+			// Auto-seed and idempotent schema-ensure require CREATE / cross-
+			// tenant INSERT privileges the non-superuser sentinel_app role does
+			// not have — in that posture the migrate step (run as the owner
+			// role) is responsible for schema + seed. Only run these when
+			// connected as a privileged/dev role.
+			if privileged {
+				if err := db.SeedDev(ctx, pool); err != nil {
+					log.Warn("DB seed failed (non-fatal)", zap.Error(err))
+				} else {
+					log.Info("DB seeded")
+				}
+				if err := db.EnsureNotificationSchema(ctx, pool); err != nil {
+					log.Warn("notification schema ensure failed (non-fatal)", zap.Error(err))
+				}
+				if err := db.EnsureThreatIntelSchema(ctx, pool); err != nil {
+					log.Warn("threat-intel schema ensure failed (non-fatal)", zap.Error(err))
+				}
+				if err := db.EnsureNodesSchema(ctx, pool); err != nil {
+					log.Warn("nodes schema ensure failed (non-fatal)", zap.Error(err))
+				}
+				if err := db.EnsurePluginSchema(ctx, pool); err != nil {
+					log.Warn("plugin schema ensure failed (non-fatal)", zap.Error(err))
+				}
+				if err := db.EnsureLogProfileSchema(ctx, pool); err != nil {
+					log.Warn("log profile schema ensure failed (non-fatal)", zap.Error(err))
+				}
 			} else {
-				log.Info("DB seeded")
+				log.Info("non-superuser DB role — skipping auto-seed/ensure-schema (handled by migrations run as the owner role)")
 			}
 
-			// Ensure the notification_channels table exists (idempotent —
-			// works even when goose migrations haven't been run manually).
-			if err := db.EnsureNotificationSchema(ctx, pool); err != nil {
-				log.Warn("notification schema ensure failed (non-fatal)", zap.Error(err))
-			}
-
-			// Ensure the threat_intel_iocs table exists (idempotent).
-			if err := db.EnsureThreatIntelSchema(ctx, pool); err != nil {
-				log.Warn("threat-intel schema ensure failed (non-fatal)", zap.Error(err))
-			}
+			// JWT revocation: consult the shared denylist on every Validate so a
+			// logout kills the session cluster-wide. Fail OPEN on a DB error (a
+			// blip must not lock everyone out). Prune expired rows hourly.
+			jwtSvc.SetRevocationChecker(func(jti string) bool {
+				revoked, err := store.IsTokenRevoked(context.Background(), jti)
+				if err != nil {
+					log.Warn("token revocation check failed (fail-open)", zap.Error(err))
+					return false
+				}
+				return revoked
+			})
+			go func() {
+				t := time.NewTicker(time.Hour)
+				defer t.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-t.C:
+						if _, err := store.CleanupExpiredRevokedTokens(context.Background()); err != nil {
+							log.Warn("revoked-token cleanup failed", zap.Error(err))
+						}
+					}
+				}
+			}()
 		}
 	}
 
@@ -164,115 +260,271 @@ func run() error {
 		log.Info("clickhouse reader disabled — set SENTINEL_CLICKHOUSE_URL to enable event search")
 	}
 
-	// ── Alert engine ──────────────────────────────────────────────────────────
-	// Turns the live WAF event stream into alerts (spikes, repeat offenders,
-	// critical blocks), persists them, surfaces them on the dashboard via SSE,
-	// and fans them out to configured notification channels. Single-tenant
-	// (dev tenant) because the proxy NDJSON stream is not tenant-tagged.
-	if store != nil {
-		engine := alerting.New(store, hub, db.DevTenantID, db.DevAdminID, alertingConfigFromEnv(), log)
-		engine.Start()
-		defer engine.Stop()
-	}
-
-	// ── Threat Intelligence aggregator ────────────────────────────────────────
-	// Ingests open CTI feeds (Tor exit nodes, abuse.ch Feodo/URLhaus, optional
-	// STIX/TAXII) into threat_intel_iocs on an hourly ticker; the Rust data plane
-	// hot-syncs the result via GET /api/v1/internal/threat-intel. Disable with
-	// SENTINEL_THREATINTEL_ENABLED=false (e.g. air-gapped installs).
-	if store != nil {
-		if tiCfg := threatintel.ConfigFromEnv(); tiCfg.Enabled {
-			agg := threatintel.New(store, tiCfg, log)
-			agg.Start(ctx)
-			defer agg.Stop()
-		} else {
-			log.Info("threat-intel aggregator disabled (SENTINEL_THREATINTEL_ENABLED=false)")
-		}
-	}
-
 	// ── RBAC ──────────────────────────────────────────────────────────────────
 	enforcer := rbac.NewEnforcer()
 
-	// ── Raft cluster (optional) ──────────────────────────────────────────────
-	// Activated when SENTINEL_RAFT_ADDR is set.  Single-node bootstrap when
-	// SENTINEL_RAFT_PEERS is empty.  Disabled entirely otherwise — all writes
-	// proceed unconditionally, preserving pre-cluster behaviour.
-	cl, clErr := startCluster(log)
+	// ── Write-leader election ────────────────────────────────────────────────
+	// A single Postgres advisory lock decides which node accepts writes and runs
+	// the singleton background workers. Started BEFORE those workers so they can
+	// be gated on leadership. Every node participates whenever a database is
+	// configured; there is no separate cluster to enable, and no quorum that can
+	// be lost independently of Postgres itself.
+	cl, clErr := startElector(pool, log)
 	if clErr != nil {
-		log.Warn("cluster init failed — continuing in standalone mode", zap.Error(clErr))
-	} else if cl != nil {
+		return fmt.Errorf("leader election init failed: %w", clErr)
+	}
+	if cl != nil {
+		// Resign explicitly on shutdown so a successor takes over immediately
+		// instead of waiting for Postgres to reap the dropped connection.
 		defer cl.Stop()
 	}
 
-	// ── gRPC ──────────────────────────────────────────────────────────────────
-	grpcAddr := envOrDefault("SENTINEL_GRPC_ADDR", "0.0.0.0:9500")
-	restAddr := envOrDefault("SENTINEL_REST_ADDR", "0.0.0.0:9501")
+	// Singleton background duties (alerting, threat-intel, cert & node-health,
+	// disk-pressure) MUST run on exactly one node — every control-plane node tails
+	// the SAME shared NDJSON stream and shares one Postgres, so running them on all
+	// N nodes emits N× duplicate alerts/notifications and N× feed fetches. They run
+	// on the current Raft LEADER (R7): a supervisor follows leadership and starts
+	// the whole set on acquire, stops it on loss — so losing node 1 while the
+	// cluster keeps quorum no longer silently kills the alerting/threat-intel/cert
+	// plane. Standalone (no cluster) is always the sole runner.
+	if store != nil {
+		// Construct + start a fresh set of monitors; returns a stop closure. A
+		// fresh set is built on every leadership acquisition (Stop closes each
+		// monitor's channel, so instances are single-use).
+		startMonitors := func() func() {
+			eng := alerting.New(store, hub, db.DevTenantID, db.DevAdminID, alertingConfigFromEnv(), log)
+			eng.Start()
+			stops := []func(){eng.Stop}
+			if tiCfg := threatintel.ConfigFromEnv(); tiCfg.Enabled {
+				agg := threatintel.New(store, tiCfg, log)
+				agg.Start(ctx)
+				stops = append(stops, agg.Stop)
+			} else {
+				log.Info("threat-intel aggregator disabled (SENTINEL_THREATINTEL_ENABLED=false)")
+			}
+			nm := nodehealth.New(store, eng, log)
+			nm.Start()
+			stops = append(stops, nm.Stop)
+			cm := certmon.New(eng, dataPlaneBaseURL(), os.Getenv("SENTINEL_INTERNAL_SECRET"), log)
+			cm.Start()
+			stops = append(stops, cm.Stop)
+			if chClient != nil && chClient.Enabled() {
+				dm := diskmon.New(eng, chClient, log)
+				dm.Start()
+				stops = append(stops, dm.Stop)
+			}
+			log.Info("singleton monitors started (leader)")
+			return func() {
+				for i := len(stops) - 1; i >= 0; i-- {
+					stops[i]()
+				}
+				log.Info("singleton monitors stopped (leadership lost)")
+			}
+		}
 
-	grpcSrv, err := controlgrpc.NewServer(grpcAddr, nil, jwtSvc, log)
-	if err != nil {
-		return fmt.Errorf("creating gRPC server: %w", err)
+		if cl == nil {
+			// Standalone = always the sole runner; start once, stop on exit.
+			stop := startMonitors()
+			defer stop()
+		} else {
+			// Follow Raft leadership: start the set when this node becomes leader,
+			// stop it when leadership moves elsewhere.
+			go func() {
+				ticker := time.NewTicker(1 * time.Second)
+				defer ticker.Stop()
+				var stop func()
+				for {
+					select {
+					case <-ctx.Done():
+						if stop != nil {
+							stop()
+						}
+						return
+					case <-ticker.C:
+						leader := cl.IsLeader()
+						if leader && stop == nil {
+							stop = startMonitors()
+						} else if !leader && stop != nil {
+							stop()
+							stop = nil
+						}
+					}
+				}
+			}()
+		}
 	}
+
+	// The data plane receives configuration by polling GET /api/v1/internal/config
+	// over REST (see sync_url in the proxy config). There is deliberately no gRPC
+	// listener: the ConfigService that used to run on :9500 had no client on
+	// either end — no Rust crate depends on tonic and nothing referenced
+	// ConfigService — yet it listened without TLS and registered gRPC server
+	// reflection unconditionally, so it served a full schema dump of the
+	// management API to anyone who could reach the port. It was removed rather
+	// than secured. If config push is ever wanted, add it to the authenticated
+	// REST surface instead of reviving a second protocol.
+	restAddr := envOrDefault("SENTINEL_REST_ADDR", "0.0.0.0:9501")
 
 	// ── Graceful shutdown ─────────────────────────────────────────────────────
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	go func() {
-		if err := grpcSrv.Start(); err != nil {
-			log.Error("gRPC server failed", zap.Error(err))
-			sigCh <- syscall.SIGTERM
-		}
-	}()
-
 	// ── Data plane auto-start ─────────────────────────────────────────────────
 	// Try to find and start the Rust proxy binary automatically so the user
 	// never has to run a separate command — same behaviour as BunkerWeb/nginx.
-	// Falls back to the simulator when the binary is not built yet.
+	//
+	// When the binary is missing the log stream stays EMPTY. It used to fall back
+	// to the simulator, which fabricated attacks and streamed them to the
+	// dashboard through the same path as real traffic, indistinguishably — a
+	// missing binary silently turned the product into a demo. An empty stream is
+	// the honest signal that nothing is being observed; the simulator is now an
+	// explicit opt-in (SENTINEL_DEV_SIMULATOR=1) for local UI work only.
 	proxyRunning := autoStartDataPlane(log)
-	if !proxyRunning {
-		// No binary found — start simulator so dashboard always shows live data.
-		log.Info("data-plane binary not found — running simulator (build with: cargo build -p sentinel-proxy --bin sentinel-bin)")
-		hub.StartSimulator()
-	} else {
+	switch {
+	case proxyRunning:
 		log.Info("data-plane started — real traffic logs will appear on the dashboard")
+	case hub.StartSimulator():
+		log.Warn("SIMULATOR ENABLED — the dashboard is showing FABRICATED data, not real traffic. "+
+			"Every entry is tagged source=simulated. Never enable this on a system anyone is relying on.",
+			zap.String("disable_by_unsetting", logs.SimulatorEnvVar))
+	default:
+		log.Warn("data-plane binary not found — no traffic will be observed and the log stream will stay EMPTY. " +
+			"Build it with: cargo build -p sentinel-proxy --bin sentinel-bin " +
+			"(for UI development only, set SENTINEL_DEV_SIMULATOR=1 to publish clearly-labelled fake data)")
 	}
 
 	// ── REST (Gin) ────────────────────────────────────────────────────────────
 	router := api.SetupRouter(api.CORSFromEnv())
 
-	// ── Static dashboard files (served BEFORE API routes) ─────────────────────
-	dashDir := envOrDefault("SENTINEL_DASHBOARD_DIR", "../dashboard")
-	router.StaticFile("/", filepath.Join(dashDir, "login.html"))
-	router.StaticFile("/login", filepath.Join(dashDir, "login.html"))
-	router.StaticFile("/dashboard", filepath.Join(dashDir, "dashboard.html"))
-	router.StaticFile("/dashboard.html", filepath.Join(dashDir, "dashboard.html"))
+	// Real readiness (R10): /health stays a cheap static liveness probe, but a
+	// node with an unreachable DB or no Raft leader (partitioned / mid-election)
+	// must report NotReady so k8s Endpoints + HAProxy stop routing to it. Probes
+	// send no JWT, so this is unauthenticated.
+	router.GET("/readyz", func(c *gin.Context) {
+		ready := true
+		checks := gin.H{}
+		if store == nil {
+			checks["db"] = "unavailable"
+			ready = false
+		} else {
+			ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+			defer cancel()
+			if err := store.Ping(ctx); err != nil {
+				checks["db"] = "unreachable"
+				ready = false
+			} else {
+				checks["db"] = "ok"
+			}
+		}
+		if cl == nil {
+			checks["leader"] = "standalone"
+		} else {
+			st := cl.Status()
+			// A node with no leader in view cannot serve writes, so it must not
+			// receive traffic. Note this is NOT a quorum check: leadership depends
+			// only on Postgres, so if the database is reachable a leader exists (or
+			// is about to, within one campaign interval).
+			if st.LeaderID == "" {
+				checks["leader"] = "no-leader"
+				ready = false
+			} else {
+				checks["leader"] = st.Role
+			}
+		}
+		code := http.StatusOK
+		if !ready {
+			code = http.StatusServiceUnavailable
+		}
+		c.JSON(code, gin.H{"ready": ready, "checks": checks})
+	})
+
+	// ── UI is served by the Next.js dashboard, never from here ────────────────
+	//
+	// The legacy static console (dashboard.html / login.html) used to be served
+	// at "/", "/login", "/dashboard" and "/dashboard.html". It was REMOVED, not
+	// relocated, because it carried an unauthenticated path to full admin
+	// takeover: its live-log view rendered attacker-controlled log fields
+	// (User-Agent, request path) into `innerHTML` with no Content-Security-Policy,
+	// and it kept the access token in `localStorage`. Any client could plant a
+	// payload simply by sending a request through the data plane with a script in
+	// its User-Agent; the payload then executed in the next admin session that
+	// opened the log view and exfiltrated that admin's token.
+	//
+	// The Next.js dashboard is a functional superset and escapes log fields
+	// before highlighting them (see `escHtml` in app/(dashboard)/logs/page.tsx),
+	// so there is nothing to port. In production the data plane's :9443 listener
+	// terminates TLS and routes /api/* here and everything else to Next.js.
+	//
+	// Do not reintroduce server-rendered HTML on the control plane: this process
+	// holds the DB credentials and the token-signing key, so any XSS here is an
+	// immediate full compromise. UI belongs in the dashboard app.
 
 	authGroup := router.Group("/api/v1/auth")
 	{
 		authGroup.POST("/login", func(c *gin.Context) { handleLogin(c, jwtSvc, store, hub) })
-		authGroup.POST("/refresh", func(c *gin.Context) { handleRefresh(c, jwtSvc) })
+		authGroup.POST("/refresh", func(c *gin.Context) { handleRefresh(c, jwtSvc, store) })
 		authGroup.GET("/oidc/login", func(c *gin.Context) { handleOIDCLogin(c, jwtSvc, log) })
-		authGroup.GET("/oidc/callback", func(c *gin.Context) { handleOIDCCallback(c, jwtSvc, log) })
+		authGroup.GET("/oidc/callback", func(c *gin.Context) { handleOIDCCallback(c, jwtSvc, store, log) })
+	}
+
+	// Machine auth: an X-API-Key header is resolved to Claims via its hash. The
+	// lookup is pre-tenant (SECURITY DEFINER carve-out) so it works under the
+	// non-superuser DB role with FORCE RLS. Bearer JWTs still take precedence.
+	apiKeyResolver := func(ctx context.Context, keyHash string) (*auth.Claims, error) {
+		if store == nil {
+			return nil, fmt.Errorf("db unavailable")
+		}
+		a, err := store.LookupAPIKeyByHash(ctx, keyHash)
+		if err != nil {
+			return nil, err
+		}
+		return &auth.Claims{
+			TenantID:   a.TenantID,
+			UserID:     a.CreatedBy,
+			Role:       a.Role,
+			Scopes:     a.Scopes,
+			AuthMethod: "apikey",
+		}, nil
 	}
 
 	protected := router.Group("/api/v1")
-	protected.Use(auth.GinAuthMiddleware(jwtSvc, false))
+	// Leader-forward BEFORE auth: on a follower we proxy mutating requests to the
+	// leader untouched (it authenticates), so any node is a valid write entry point.
+	protected.Use(leaderForward(cl))
+	protected.Use(auth.GinAuthMiddlewareWithAPIKey(jwtSvc, false, apiKeyResolver))
 	{
+		protected.POST("/auth/logout", func(c *gin.Context) { handleLogout(c, jwtSvc, store) })
+		protected.POST("/auth/mfa/enroll", func(c *gin.Context) { handleMFAEnroll(c) })
+		protected.POST("/auth/mfa/confirm", func(c *gin.Context) { handleMFAConfirm(c, store) })
+		protected.POST("/auth/mfa/disable", func(c *gin.Context) { handleMFADisable(c, store) })
 		protected.GET("/dashboard/stats", func(c *gin.Context) { handleDashboardStats(c, enforcer, store) })
 		protected.GET("/sites", func(c *gin.Context) { handleListSites(c, enforcer, store) })
 		protected.GET("/sites/export", func(c *gin.Context) { handleExportSites(c, enforcer, store) })
 		protected.POST("/sites/import", func(c *gin.Context) { handleImportSites(c, enforcer, store, hub, cl) })
 		protected.POST("/sites", func(c *gin.Context) { handleCreateSite(c, enforcer, store, hub, cl) })
+		// Dry run: report whether a proposed site config would be accepted and
+		// usable, without writing. Registered before /sites/:id so "validate" is
+		// not captured as an :id.
+		protected.POST("/sites/validate", func(c *gin.Context) { handleValidateSite(c, enforcer, store) })
+		// Config rollback points: list, and restore one.
+		protected.GET("/config/versions", func(c *gin.Context) { handleListConfigVersions(c, enforcer, store) })
+		protected.POST("/config/versions/:id/rollback", func(c *gin.Context) {
+			handleRollbackConfig(c, enforcer, store, hub, cl, log)
+		})
 		protected.GET("/sites/:id", func(c *gin.Context) { handleGetSite(c, enforcer, store) })
-		protected.PUT("/sites/:id", func(c *gin.Context) { handleUpdateSite(c, enforcer, store, hub, cl) })
-		protected.PATCH("/sites/:id", func(c *gin.Context) { handleUpdateSite(c, enforcer, store, hub, cl) })
-		protected.DELETE("/sites/:id", func(c *gin.Context) { handleDeleteSite(c, enforcer, store, hub, cl) })
+		protected.PUT("/sites/:id", func(c *gin.Context) { handleUpdateSite(c, enforcer, store, hub, cl, log) })
+		protected.PATCH("/sites/:id", func(c *gin.Context) { handleUpdateSite(c, enforcer, store, hub, cl, log) })
+		protected.DELETE("/sites/:id", func(c *gin.Context) { handleDeleteSite(c, enforcer, store, hub, cl, log) })
 		protected.PATCH("/sites/:id/status", func(c *gin.Context) { handleUpdateSiteStatus(c, enforcer, store, hub, cl) })
 		protected.POST("/sites/:id/exclusions", func(c *gin.Context) { handleAddSiteExclusion(c, enforcer, store, hub, cl) })
 		protected.DELETE("/sites/:id/exclusions/:rule_id", func(c *gin.Context) { handleDeleteSiteExclusion(c, enforcer, store, hub, cl) })
 		protected.GET("/rules", func(c *gin.Context) { handleListRules(c, enforcer, store) })
 		protected.POST("/rules", func(c *gin.Context) { handleCreateRule(c, enforcer, store, hub, cl) })
-		protected.PATCH("/rules/:id", func(c *gin.Context) { handleToggleRule(c, enforcer, store, hub, cl) })
+		// PATCH is a partial update (dsl, severity, phase, tags, enabled, site_id).
+		// PUT stays mapped to the enable/disable toggle so existing callers of the
+		// old behaviour keep working.
+		protected.PATCH("/rules/:id", func(c *gin.Context) { handleUpdateRule(c, enforcer, store, hub, cl) })
+		protected.PUT("/rules/:id/enabled", func(c *gin.Context) { handleToggleRule(c, enforcer, store, hub, cl) })
 		protected.DELETE("/rules/:id", func(c *gin.Context) { handleDeleteRule(c, enforcer, store, hub, cl) })
 		protected.POST("/rules/test", func(c *gin.Context) { handleTestRule(c, enforcer) })
 		protected.GET("/ml/stats", func(c *gin.Context) {
@@ -285,7 +537,12 @@ func run() error {
 				handleTrafficHistory(c, hub)
 			}
 		})
-		protected.GET("/plugins", func(c *gin.Context) { handleListPlugins(c, enforcer) })
+		// WASM plugins. Upload is a .zip containing sentinel-plugin.toml plus the
+		// module; a freshly uploaded plugin is inactive until explicitly enabled.
+		protected.GET("/plugins", func(c *gin.Context) { handleListPluginsReal(c, enforcer, store) })
+		protected.POST("/plugins", func(c *gin.Context) { handleUploadPlugin(c, enforcer, store) })
+		protected.PATCH("/plugins/:name", func(c *gin.Context) { handleSetPluginEnabled(c, enforcer, store) })
+		protected.DELETE("/plugins/:name", func(c *gin.Context) { handleDeletePlugin(c, enforcer, store) })
 		protected.GET("/alerts", func(c *gin.Context) { handleListAlerts(c, enforcer, store) })
 		protected.POST("/alerts/:id/ack", func(c *gin.Context) { handleAckAlert(c, enforcer, store, hub, cl) })
 		protected.POST("/alerts/:id/resolve", func(c *gin.Context) { handleResolveAlert(c, enforcer, store, hub, cl) })
@@ -311,6 +568,18 @@ func run() error {
 		protected.GET("/events/search", func(c *gin.Context) { handleEventsSearch(c, enforcer, chClient) })
 		protected.GET("/events/timeline", func(c *gin.Context) { handleEventsTimeline(c, enforcer, chClient) })
 		protected.GET("/events/facets", func(c *gin.Context) { handleEventsFacets(c, enforcer, chClient) })
+		protected.GET("/events/top-attackers", func(c *gin.Context) { handleTopAttackers(c, enforcer, chClient) })
+		protected.GET("/events/severity-timeline", func(c *gin.Context) { handleSeverityTimeline(c, enforcer, chClient) })
+		// Ad-hoc export of the current Threat Search view.
+		protected.GET("/events/export", func(c *gin.Context) { handleExportEvents(c, enforcer, store, chClient, hub) })
+
+		// Log profiles — saved per-application log views, and the export that
+		// turns one into a file to hand a customer.
+		protected.GET("/logs/profiles", func(c *gin.Context) { handleListLogProfiles(c, enforcer, store) })
+		protected.POST("/logs/profiles", func(c *gin.Context) { handleCreateLogProfile(c, enforcer, store, hub) })
+		protected.PUT("/logs/profiles/:id", func(c *gin.Context) { handleUpdateLogProfile(c, enforcer, store, hub) })
+		protected.DELETE("/logs/profiles/:id", func(c *gin.Context) { handleDeleteLogProfile(c, enforcer, store, hub) })
+		protected.GET("/logs/profiles/:id/export", func(c *gin.Context) { handleExportLogProfile(c, enforcer, store, chClient, hub) })
 
 		protected.GET("/geoip/blocked", func(c *gin.Context) { handleListBlockedCountries(c, enforcer, store) })
 		protected.POST("/geoip/block", func(c *gin.Context) { handleBlockCountry(c, enforcer, store, hub, cl) })
@@ -336,6 +605,7 @@ func run() error {
 				handleClusterStatus(c, cl)
 			}
 		})
+		protected.GET("/cluster/health", func(c *gin.Context) { handleClusterHealth(c, enforcer, store, cl) })
 		protected.GET("/waf/status", func(c *gin.Context) {
 			if requirePerm(c, enforcer, rbac.ResourceSite, rbac.ActionList) {
 				handleProxyHealth(c)
@@ -368,25 +638,55 @@ func run() error {
 	// Internal config endpoint — called by the Rust data-plane proxy for site
 	// hot-sync. No JWT: the proxy runs on the same host (or private network).
 	// In production, protect this with mTLS or a network policy.
-	router.GET("/api/v1/internal/config", func(c *gin.Context) { handleInternalConfig(c, store) })
+	router.GET("/api/v1/internal/config", func(c *gin.Context) { handleInternalConfig(c, store, log) })
 
 	// Internal threat-intel endpoint — the data plane hot-syncs the active IOC
 	// set from here (same shared-secret gate as /internal/config).
 	router.GET("/api/v1/internal/threat-intel", func(c *gin.Context) { handleInternalThreatIntel(c, store) })
 
+	// Internal node-health heartbeat — data-plane nodes POST their status here
+	// (same shared-secret gate as /internal/config).
+	router.POST("/api/v1/internal/nodes/heartbeat", func(c *gin.Context) { handleNodeHeartbeat(c, store) })
+
+	// Internal plugin distribution (same shared-secret gate as /internal/config).
+	// The listing is a digest — name, version, sha256 — so a node fetches bytes
+	// only for modules it does not already hold. This is how an uploaded plugin
+	// reaches every WAF node in the fleet: plugins were previously loadable only
+	// from a manifest path on a node's own filesystem, which no upload could ever
+	// populate and which a 3-node HA fleet could not share.
+	router.GET("/api/v1/internal/plugins", func(c *gin.Context) { handleInternalPluginList(c, store) })
+	router.GET("/api/v1/internal/plugins/:name/wasm", func(c *gin.Context) { handleInternalPluginWasm(c, store) })
+
 	admin := router.Group("/api/v1/admin")
-	admin.Use(auth.GinAuthMiddleware(jwtSvc, true))
+	admin.Use(leaderForward(cl))
+	admin.Use(auth.GinAuthMiddlewareWithAPIKey(jwtSvc, true, apiKeyResolver))
 	{
-		admin.GET("/users", func(c *gin.Context) { handleListUsersReal(c, enforcer) })
-		admin.POST("/users", func(c *gin.Context) { handleCreateUserReal(c, enforcer) })
-		admin.GET("/apikeys", func(c *gin.Context) { handleListAPIKeysReal(c, enforcer) })
-		admin.POST("/apikeys", func(c *gin.Context) { handleCreateAPIKeyReal(c, enforcer) })
-		admin.DELETE("/apikeys/:id", func(c *gin.Context) { handleRevokeAPIKey(c, enforcer) })
+		admin.GET("/users", func(c *gin.Context) { handleListUsersReal(c, enforcer, store) })
+		admin.POST("/users", func(c *gin.Context) { handleCreateUserReal(c, enforcer, store) })
+		admin.PATCH("/users/:id", func(c *gin.Context) { handleUpdateUser(c, enforcer, store) })
+		admin.DELETE("/users/:id", func(c *gin.Context) { handleDeleteUser(c, enforcer, store) })
+		admin.GET("/apikeys", func(c *gin.Context) { handleListAPIKeysReal(c, enforcer, store) })
+		admin.POST("/apikeys", func(c *gin.Context) { handleCreateAPIKeyReal(c, enforcer, store) })
+		admin.DELETE("/apikeys/:id", func(c *gin.Context) { handleRevokeAPIKey(c, enforcer, store) })
+	}
+
+	// Platform (tenant lifecycle) — provisioning is gated to the platform tenant's
+	// owner/admin (see isPlatformAdmin), distinct from per-tenant admin.
+	platform := router.Group("/api/v1/platform")
+	platform.Use(leaderForward(cl))
+	platform.Use(auth.GinAuthMiddlewareWithAPIKey(jwtSvc, true, apiKeyResolver))
+	{
+		platform.POST("/tenants", func(c *gin.Context) { handleCreateTenant(c, store) })
+		platform.GET("/tenants", func(c *gin.Context) { handleListTenants(c, store) })
+		platform.PATCH("/tenants/:id/status", func(c *gin.Context) { handleSetTenantStatus(c, store) })
 	}
 
 	// ── Graceful shutdown ─────────────────────────────────────────────────────
 
-	httpSrv := &http.Server{Addr: restAddr, Handler: router}
+	// ReadHeaderTimeout bounds slow-header (slowloris) attacks. We deliberately
+	// leave ReadTimeout/WriteTimeout at 0: this server streams Server-Sent Events
+	// (live logs) as long-lived GET responses, and a WriteTimeout would sever them.
+	httpSrv := &http.Server{Addr: restAddr, Handler: router, ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 120 * time.Second}
 
 	go func() {
 		log.Info("REST API listening", zap.String("addr", restAddr))
@@ -399,7 +699,6 @@ func run() error {
 	sig := <-sigCh
 	log.Info("shutting down", zap.String("signal", sig.String()))
 
-	grpcSrv.Stop()
 	if pool != nil {
 		pool.Close()
 	}
@@ -414,10 +713,6 @@ func envOrDefault(key, def string) string {
 		return v
 	}
 	return def
-}
-
-func maskPassword(dsn string) string {
-	return dsn
 }
 
 // alertingConfigFromEnv builds the alert-engine thresholds from optional env
@@ -522,80 +817,70 @@ func autoStartDataPlane(log *zap.Logger) bool {
 	return true
 }
 
-// startCluster reads SENTINEL_RAFT_* env vars and starts a Raft node if
-// SENTINEL_RAFT_ADDR is set.  Returns (nil, nil) when Raft is disabled (no
-// addr).  Returns (nil, err) on misconfiguration.
+// startElector starts Postgres advisory-lock write-leader election.
 //
-// Env:
+// It replaced startCluster(), which wired up a hand-rolled Raft node from a pile
+// of SENTINEL_RAFT_* variables: a numeric node ID, an explicit peer list, a
+// listen address, a persistent log directory, a dedicated port, and a shared
+// secret that was the sole authenticator on inter-node RPC. All of that is gone.
+// Leadership is a single advisory lock in the database every node already talks
+// to, so there is no second cluster to configure, secure, or lose quorum in.
 //
-//	SENTINEL_NODE_ID      uint64    required if RAFT_ADDR set
-//	SENTINEL_RAFT_ADDR    host:port required to enable
-//	SENTINEL_RAFT_PEERS   "2=host:9602,3=host:9603"  (empty = single-node)
-//	SENTINEL_RAFT_DIR     persistent state dir (default: ./raft-data)
-func startCluster(log *zap.Logger) (*cluster.Cluster, error) {
-	addr := os.Getenv("SENTINEL_RAFT_ADDR")
-	if addr == "" {
-		log.Info("Raft disabled (SENTINEL_RAFT_ADDR not set) — running standalone")
+// Enabled whenever a database is configured. Without one the node is a standalone
+// writer, which is the same behaviour as before when Raft was disabled.
+//
+// Env (all optional):
+//
+//	SENTINEL_NODE_ID           stable identity for logs/status (default: pod name / hostname)
+//	SENTINEL_ADVERTISE_ADDR    host:port peers should forward writes to
+//	SENTINEL_POD_NAME          StatefulSet pod name, used to derive the advertise address
+//	SENTINEL_HEADLESS_SERVICE  headless Service name, used with SENTINEL_POD_NAME
+func startElector(pool db.Pool, log *zap.Logger) (*leader.Elector, error) {
+	if pool == nil {
+		log.Info("leader election disabled (no database) — running standalone")
 		return nil, nil
 	}
-	idStr := os.Getenv("SENTINEL_NODE_ID")
-	if idStr == "" {
-		return nil, fmt.Errorf("SENTINEL_NODE_ID required when SENTINEL_RAFT_ADDR is set")
-	}
-	id, err := strconv.ParseUint(idStr, 10, 64)
-	if err != nil || id == 0 {
-		return nil, fmt.Errorf("SENTINEL_NODE_ID must be a positive integer: %v", err)
+	lp, ok := pool.(leader.Pool)
+	if !ok {
+		// Only the pgx pool implements advisory locking; a future sqlite backend
+		// would be single-node and needs no election.
+		log.Info("leader election unavailable for this database backend — running standalone")
+		return nil, nil
 	}
 
-	peers := map[cluster.NodeID]string{}
-	if raw := os.Getenv("SENTINEL_RAFT_PEERS"); raw != "" {
-		for _, kv := range strings.Split(raw, ",") {
-			kv = strings.TrimSpace(kv)
-			if kv == "" {
-				continue
-			}
-			parts := strings.SplitN(kv, "=", 2)
-			if len(parts) != 2 {
-				return nil, fmt.Errorf("invalid SENTINEL_RAFT_PEERS entry %q (want id=host:port)", kv)
-			}
-			pid, perr := strconv.ParseUint(strings.TrimSpace(parts[0]), 10, 64)
-			if perr != nil || pid == 0 {
-				return nil, fmt.Errorf("invalid peer id in %q", kv)
-			}
-			peers[cluster.NodeID(pid)] = strings.TrimSpace(parts[1])
+	nodeID := leader.NodeID()
+	advertise := electorAdvertiseAddr()
+	e := leader.New(lp, nodeID, advertise, log.Named("leader"))
+	e.Start()
+	log.Info("leader election started (Postgres advisory lock)",
+		zap.String("node_id", nodeID),
+		zap.String("advertise", advertise))
+	return e, nil
+}
+
+// electorAdvertiseAddr computes the host:port other nodes should forward writes to.
+//
+// Prefers an explicit override, then the per-pod stable DNS a headless Service
+// provides (<pod>.<service>), which resolves within the namespace and survives
+// restarts, then the hostname. The port is this node's REST port, because writes
+// are forwarded over REST — unlike the Raft setup, which advertised a separate
+// consensus port that then had to be rewritten to the REST port on every forward.
+func electorAdvertiseAddr() string {
+	port := clusterRESTPort()
+	if v := strings.TrimSpace(os.Getenv("SENTINEL_ADVERTISE_ADDR")); v != "" {
+		if _, _, err := net.SplitHostPort(v); err == nil {
+			return v
 		}
+		return net.JoinHostPort(v, port)
 	}
-
-	dataDir := envOrDefault("SENTINEL_RAFT_DIR", filepath.Join(".", "raft-data", idStr))
-
-	// Inter-node RPC must be authenticated with a shared secret. Require it
-	// whenever peers are configured (multi-node) so a node on the cluster
-	// network can't forge log entries or spoof votes. Single-node clusters
-	// exchange no RPC, so the secret is optional there.
-	secret := os.Getenv("SENTINEL_RAFT_SECRET")
-	if len(peers) > 0 && secret == "" {
-		return nil, fmt.Errorf("SENTINEL_RAFT_SECRET is required for a multi-node cluster (peers configured)")
+	pod := strings.TrimSpace(os.Getenv("SENTINEL_POD_NAME"))
+	svc := strings.TrimSpace(os.Getenv("SENTINEL_HEADLESS_SERVICE"))
+	if pod != "" && svc != "" {
+		return net.JoinHostPort(pod+"."+svc, port)
 	}
-
-	cfg := cluster.Config{
-		NodeID:     cluster.NodeID(id),
-		ListenAddr: addr,
-		Peers:      peers,
-		DataDir:    dataDir,
-		Secret:     secret,
-		Logger:     log.Named("raft"),
-		Apply: func(cmd cluster.Command) error {
-			// At apply time the leader has already written through Postgres
-			// (DB is shared) and followers re-read state on demand.  This
-			// hook is currently a no-op log entry; future work may stream
-			// applied commands to the data-plane for live mirroring.
-			log.Debug("raft apply",
-				zap.String("kind", string(cmd.Kind)),
-				zap.Int("payload_bytes", len(cmd.Payload)),
-			)
-			return nil
-		},
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "localhost"
 	}
-
-	return cluster.Start(cfg)
+	return net.JoinHostPort(host, port)
 }

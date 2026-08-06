@@ -745,12 +745,19 @@ fn cmd_site_add(
             load_balancer: LoadBalancerStrategy::RoundRobin,
             servers: parsed_upstreams,
             health_check: None,
+            // Deployment default; per-site overrides come from the control plane.
+            timeout_secs: None,
         },
         waf: WafConfig {
             mode: waf_mode.clone(),
             paranoia_level: 1,
             anomaly_threshold: threshold,
             rules,
+            // The CLI builds a config from local rule files; operator-authored
+            // rules arrive only from the control plane, so there are none here.
+            inline_rules: vec![],
+            // Per-path overrides come from the control plane, not a local file.
+            path_overrides: vec![],
             ml: None,
             ip_reputation: None,
             rate_limit: None,
@@ -758,6 +765,9 @@ fn cmd_site_add(
             dlp: None,
             api_discovery: false,
             graphql: None,
+            jwt: None,
+            grpc: None,
+            fusion: None,
             anti_ddos: None,
             geoip: None,
             plugins: vec![],

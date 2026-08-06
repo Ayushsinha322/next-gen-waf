@@ -2,7 +2,7 @@ use sentinel_core::context::{Phase, RequestContext, RuleMatch, Severity, WafDeci
 use tracing::{debug, warn};
 
 use super::emitter::{CompiledRuleSet, Instruction, RuleMeta, TargetSpec};
-use crate::dsl::ast::{RuleAction, RulePhase, RuleSeverity, Transform};
+use crate::dsl::ast::{RuleAction, RulePhase, RuleSeverity, SetVar, SetVarOp, Transform};
 
 fn rule_phase_to_phase(rp: RulePhase) -> Phase {
     match rp {
@@ -40,8 +40,13 @@ fn parse_query_params(query: &str) -> Vec<(String, String)> {
         .filter(|kv| !kv.is_empty())
         .map(|kv| {
             let mut parts = kv.splitn(2, '=');
-            let k = percent_decode(parts.next().unwrap_or(""));
-            let v = percent_decode(parts.next().unwrap_or(""));
+            // application/x-www-form-urlencoded + query-string semantics: '+'
+            // encodes a space and must be replaced BEFORE percent-decoding (so a
+            // literal '+' sent as %2B survives). Without this, payloads whose
+            // spaces are '+'-encoded (the Go/GoTestWAF default) reach the rule
+            // operators with literal '+' and evade @rx / @detectSQLi / @detectXSS.
+            let k = percent_decode(&parts.next().unwrap_or("").replace('+', " "));
+            let v = percent_decode(&parts.next().unwrap_or("").replace('+', " "));
             (k, v)
         })
         .collect()
@@ -141,6 +146,30 @@ fn request_host(ctx: &RequestContext) -> String {
 /// relative to `request_host` — i.e. not equal to it and not a subdomain of
 /// it. Reproduces CRS 931130 (off-domain reference / RFI). When the request
 /// has no Host header, any absolute URL counts as off-domain.
+/// True if `value` parses as an IP address contained in any of `cidrs`.
+///
+/// Implements `@ipMatch` / `@ipMatchF`, which the CRS importer previously compiled to
+/// `Operator::Never` — so every rule using them loaded successfully and could never
+/// fire. Accepts a bare address (`10.0.0.1`) or a CIDR (`10.0.0.0/8`) in the rule
+/// argument, and uses the SSRF module's permissive host parser so an attacker cannot
+/// evade an allow/deny list by writing the same address in decimal or hex.
+fn ip_in_any_cidr(value: &str, cidrs: &[String]) -> bool {
+    let Some(ip) = crate::ssrf::parse_host_to_ip(value.trim()) else {
+        return false;
+    };
+    cidrs.iter().any(|spec| {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return false;
+        }
+        match spec.parse::<ipnet::IpNet>() {
+            Ok(net) => net.contains(&ip),
+            // A bare address is a /32 (or /128) — CRS rules write both forms.
+            Err(_) => crate::ssrf::parse_host_to_ip(spec).is_some_and(|other| other == ip),
+        }
+    })
+}
+
 fn contains_off_domain_url(value: &str, request_host: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     let mut search = lower.as_str();
@@ -409,9 +438,194 @@ fn body_args(ctx: &RequestContext) -> Vec<(String, String)> {
         // injection delivered through a multipart body is inspected the same
         // way.  File parts are surfaced via the FILES* targets, not ARGS.
         multipart_parts(ctx).fields
+    } else if is_xml_content_type(&ct) {
+        // XML / SOAP bodies: surface element text, attribute values, and CDATA
+        // into ARGS so payloads delivered inside XML reach the same operators
+        // as form/JSON parameters (SOAP APIs are a common injection vector).
+        parse_xml_args(body)
     } else {
         Vec::new()
     }
+}
+
+/// True for XML and SOAP content types — `text/xml`, `application/xml`,
+/// `application/soap+xml`, and any `…+xml` suffix (e.g. `application/rss+xml`).
+fn is_xml_content_type(ct: &str) -> bool {
+    ct.starts_with("text/xml")
+        || ct.starts_with("application/xml")
+        || ct.starts_with("application/soap+xml")
+        || ct.contains("+xml")
+}
+
+/// Flatten an XML/SOAP body into ModSecurity-style `(name, value)` pairs.
+///
+/// This is a detection-oriented extractor, **not** a validating parser: it
+/// surfaces every element's text content (keyed by the element's local name),
+/// every attribute value (keyed by the attribute name), and every CDATA section
+/// — decoding the standard XML entities — so injection delivered inside XML
+/// reaches the ARGS operators. Comments, processing instructions, DOCTYPE
+/// declarations, namespaces, and DTDs are ignored. Malformed input fails open
+/// (extracts what it can). Byte offsets only ever land on ASCII delimiters
+/// (`<`, `>`, `]]>`, …), so all `&str` slicing stays on char boundaries.
+fn parse_xml_args(body: &[u8]) -> Vec<(String, String)> {
+    let text = String::from_utf8_lossy(body);
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut cur_elem = String::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            // Text node — runs up to the next tag.
+            let end = text[i..].find('<').map(|p| i + p).unwrap_or(bytes.len());
+            let chunk = &text[i..end];
+            if !chunk.trim().is_empty() {
+                out.push((cur_elem.clone(), decode_xml_entities(chunk)));
+            }
+            i = end;
+            continue;
+        }
+
+        // A markup construct beginning at `<`.
+        if text[i..].starts_with("<!--") {
+            match text[i + 4..].find("-->") {
+                Some(rel) => i += 4 + rel + 3,
+                None => break,
+            }
+        } else if text[i..].starts_with("<![CDATA[") {
+            let start = i + 9;
+            match text[start..].find("]]>") {
+                Some(rel) => {
+                    let content = &text[start..start + rel];
+                    if !content.trim().is_empty() {
+                        out.push((cur_elem.clone(), content.to_owned()));
+                    }
+                    i = start + rel + 3;
+                }
+                None => break,
+            }
+        } else if text[i..].starts_with("<?") || text[i..].starts_with("<!") {
+            // Processing instruction / DOCTYPE / declaration — skip to `>`.
+            match text[i..].find('>') {
+                Some(rel) => i += rel + 1,
+                None => break,
+            }
+        } else {
+            // Element start or end tag.
+            let Some(rel) = text[i + 1..].find('>') else {
+                break;
+            };
+            let inner = text[i + 1..i + 1 + rel].trim();
+            i = i + 1 + rel + 1;
+            if let Some(_close) = inner.strip_prefix('/') {
+                // Closing tag — the element's text context ends.
+                cur_elem.clear();
+            } else {
+                // Opening or self-closing tag: `name attr="v" .../`.
+                let body_str = inner.trim_end_matches('/').trim();
+                let name_end = body_str.find(char::is_whitespace).unwrap_or(body_str.len());
+                cur_elem = local_name(&body_str[..name_end]);
+                extract_xml_attributes(&body_str[name_end..], &mut out);
+            }
+        }
+    }
+
+    out
+}
+
+/// The local part of a possibly namespace-prefixed XML name
+/// (`soap:Envelope` → `Envelope`).
+fn local_name(raw: &str) -> String {
+    raw.rsplit(':').next().unwrap_or(raw).to_owned()
+}
+
+/// Extract `name="value"` / `name='value'` attribute pairs from the portion of
+/// a start tag after the element name, decoding XML entities in each value.
+fn extract_xml_attributes(attrs: &str, out: &mut Vec<(String, String)>) {
+    let chars: Vec<char> = attrs.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+    while i < n {
+        while i < n && chars[i].is_whitespace() {
+            i += 1;
+        }
+        let name_start = i;
+        while i < n && chars[i] != '=' && !chars[i].is_whitespace() {
+            i += 1;
+        }
+        let name: String = chars[name_start..i].iter().collect();
+        while i < n && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i < n && chars[i] == '=' {
+            i += 1;
+            while i < n && chars[i].is_whitespace() {
+                i += 1;
+            }
+            if i < n && (chars[i] == '"' || chars[i] == '\'') {
+                let quote = chars[i];
+                i += 1;
+                let val_start = i;
+                while i < n && chars[i] != quote {
+                    i += 1;
+                }
+                let val: String = chars[val_start..i].iter().collect();
+                if i < n {
+                    i += 1; // consume the closing quote
+                }
+                if !name.is_empty() {
+                    out.push((name, decode_xml_entities(&val)));
+                }
+            }
+        }
+    }
+}
+
+/// Decode the five predefined XML entities plus numeric character references
+/// (`&#NN;` / `&#xHH;`). Unknown entities are left verbatim.
+fn decode_xml_entities(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_owned();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(pos) = rest.find('&') {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos..];
+        let Some(semi) = after.find(';') else {
+            out.push('&');
+            rest = &after[1..];
+            continue;
+        };
+        let entity = &after[1..semi];
+        let decoded = match entity {
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "amp" => Some('&'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            _ => entity.strip_prefix('#').and_then(|num| {
+                let cp = match num.strip_prefix(['x', 'X']) {
+                    Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                    None => num.parse::<u32>().ok(),
+                };
+                cp.and_then(char::from_u32)
+            }),
+        };
+        match decoded {
+            Some(c) => {
+                out.push(c);
+                rest = &after[semi + 1..];
+            }
+            None => {
+                // Not a recognised entity — keep the literal `&` and continue.
+                out.push('&');
+                rest = &after[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn extract_target(spec: &TargetSpec, ctx: &RequestContext) -> Vec<String> {
@@ -439,11 +653,34 @@ fn extract_target(spec: &TargetSpec, ctx: &RequestContext) -> Vec<String> {
         TargetSpec::RequestLine => {
             vec![format!("{} {} {:?}", ctx.method, ctx.uri, ctx.http_version)]
         }
-        TargetSpec::RequestBody => ctx
-            .request_body
-            .as_ref()
-            .map(|b| vec![String::from_utf8_lossy(b).into_owned()])
-            .unwrap_or_default(),
+        // For multipart/form-data, yield the PARSED part values rather than the
+        // raw envelope. ModSecurity/CRS deliberately leave REQUEST_BODY empty for
+        // multipart — the parts reach ARGS instead — and handing rules the raw
+        // envelope makes the envelope's own structure look like an attack: the
+        // `\r\n\r\n` separating a part's headers from its value satisfies the
+        // newline operator in command-injection patterns, so any field whose value
+        // begins with a command word false-positives. Measured: a multipart field
+        // holding the ordinary text `nc 8000 controller` was blocked by 9900207,
+        // while the identical value in a urlencoded form passed.
+        //
+        // No coverage is lost. The part values are still inspected — that is what
+        // this returns — and scanning them individually is strictly better for
+        // wholly-encoded payloads, which only decode once separated from the
+        // boundary noise.
+        TargetSpec::RequestBody => {
+            if content_type(ctx).starts_with("multipart/form-data") {
+                multipart_parts(ctx)
+                    .fields
+                    .into_iter()
+                    .map(|(_, v)| v)
+                    .collect()
+            } else {
+                ctx.request_body
+                    .as_ref()
+                    .map(|b| vec![String::from_utf8_lossy(b).into_owned()])
+                    .unwrap_or_default()
+            }
+        }
         TargetSpec::RequestHeadersAll => ctx
             .request_headers
             .values()
@@ -558,6 +795,9 @@ pub fn evaluate(
 
     let mut stack: Vec<StackVal> = Vec::with_capacity(16);
     let mut ip: usize = 0; // instruction pointer
+                           // Per-rule target attribution, reset at every RuleEnd.
+    let mut last_target: Option<String> = None;
+    let mut targets_seen = 0usize;
 
     while ip < program.len() {
         // Early exit: if already decided (Block/Challenge), stop evaluating.
@@ -568,6 +808,17 @@ pub fn evaluate(
         let instr = &program[ip];
         match instr {
             Instruction::LoadTarget(spec) => {
+                // Track which part of the request this rule looked at, so a
+                // security event can name the parameter an operator would exclude.
+                //
+                // Counted, not merely remembered: a rule that evaluates SEVERAL
+                // targets (chains, `ARGS|REQUEST_HEADERS`) offers no way to tell
+                // from here WHICH one the operator matched, and naming the wrong
+                // parameter would send someone to write an exclusion against a
+                // target that never fired. So the label is kept only when the rule
+                // inspected exactly one target, and left empty otherwise.
+                targets_seen += 1;
+                last_target = Some(spec.label());
                 let values = extract_target(spec, ctx);
                 stack.push(StackVal::Strings(values));
             }
@@ -647,6 +898,28 @@ pub fn evaluate(
                     let host = request_host(ctx);
                     let matched = values.iter().any(|v| contains_off_domain_url(v, &host));
                     debug!(matched, "DetectOffDomainUrl");
+                    stack.push(StackVal::Bool(matched));
+                }
+            }
+
+            Instruction::DetectSsrfUrl => {
+                let values = pop_strings(&mut stack);
+                if values.is_empty() {
+                    stack.push(StackVal::Absent);
+                } else {
+                    let matched = values.iter().any(|v| crate::ssrf::contains_ssrf_url(v));
+                    debug!(matched, "DetectSsrfUrl");
+                    stack.push(StackVal::Bool(matched));
+                }
+            }
+
+            Instruction::IpMatch { cidrs } => {
+                let values = pop_strings(&mut stack);
+                if values.is_empty() {
+                    stack.push(StackVal::Absent);
+                } else {
+                    let matched = values.iter().any(|v| ip_in_any_cidr(v, cidrs));
+                    debug!(matched, "IpMatch");
                     stack.push(StackVal::Bool(matched));
                 }
             }
@@ -736,9 +1009,16 @@ pub fn evaluate(
 
             Instruction::RuleEnd { rule_id } => {
                 let fired = pop_bool(&mut stack);
+                let matched_target = if targets_seen == 1 {
+                    last_target.take()
+                } else {
+                    None
+                };
+                last_target = None;
+                targets_seen = 0;
                 if fired {
                     if let Some(meta) = ruleset.rule_meta.get(rule_id) {
-                        fire_rule(ctx, meta);
+                        fire_rule(ctx, meta, matched_target);
                         // skipAfter: scan forward for the named Marker and jump to it.
                         // ip += 1 at loop end then steps past the Marker (which is a no-op).
                         if let Some(marker) = &meta.skip_after {
@@ -781,7 +1061,7 @@ pub fn evaluate(
     ctx.decision.clone()
 }
 
-fn fire_rule(ctx: &mut RequestContext, meta: &RuleMeta) {
+fn fire_rule(ctx: &mut RequestContext, meta: &RuleMeta, matched_target: Option<String>) {
     let phase = rule_phase_to_phase(meta.phase);
 
     match &meta.action {
@@ -813,6 +1093,14 @@ fn fire_rule(ctx: &mut RequestContext, meta: &RuleMeta) {
         ctx.anomaly_score = ctx.anomaly_score.saturating_add(meta.score_delta as u32);
     }
 
+    // Apply setvar mutations to the per-request TX store. Runs whenever the rule
+    // fires — including "silent" score-gate rules below — so category scores
+    // (tx.sql_injection_score, …) and correlation state accumulate for later
+    // rules to read via `TX:` targets.
+    for sv in &meta.setvars {
+        apply_setvar(ctx, sv);
+    }
+
     // Only record in rule_matches when the rule has observable effect.
     // CRS paranoia-level skip-gates (pass, no score, no message) are silent.
     let is_silent = meta.message.is_empty()
@@ -825,7 +1113,7 @@ fn fire_rule(ctx: &mut RequestContext, meta: &RuleMeta) {
             message: meta.message.clone(),
             severity: map_severity(meta.severity),
             score: meta.score_delta.max(0) as u32,
-            target: String::new(),
+            target: matched_target.unwrap_or_default(),
             phase,
         });
     }
@@ -836,6 +1124,111 @@ fn fire_rule(ctx: &mut RequestContext, meta: &RuleMeta) {
         score_delta = meta.score_delta,
         "rule fired"
     );
+}
+
+// ---------------------------------------------------------------------------
+// setvar — per-request TX variable mutation
+// ---------------------------------------------------------------------------
+
+/// Apply one `setvar` mutation to the per-request TX store (`ctx.tx_vars`).
+///
+/// `Add`/`Sub` treat the current value and the (macro-expanded) operand as
+/// integers, defaulting a missing/non-numeric value to 0 — matching CRS
+/// category-score accumulation. `Set` stores the macro-expanded string as-is.
+fn apply_setvar(ctx: &mut RequestContext, sv: &SetVar) {
+    match &sv.op {
+        SetVarOp::Unset => {
+            ctx.tx_vars.remove(&sv.name);
+        }
+        SetVarOp::Set(val) => {
+            let expanded = expand_tx_macros(val, ctx);
+            ctx.tx_vars.insert(sv.name.clone(), expanded);
+        }
+        SetVarOp::Add(expr) => {
+            let delta = expand_tx_macros(expr, ctx)
+                .trim()
+                .parse::<i64>()
+                .unwrap_or(0);
+            let cur = tx_var_i64(ctx, &sv.name);
+            ctx.tx_vars
+                .insert(sv.name.clone(), cur.saturating_add(delta).to_string());
+        }
+        SetVarOp::Sub(expr) => {
+            let delta = expand_tx_macros(expr, ctx)
+                .trim()
+                .parse::<i64>()
+                .unwrap_or(0);
+            let cur = tx_var_i64(ctx, &sv.name);
+            ctx.tx_vars
+                .insert(sv.name.clone(), cur.saturating_sub(delta).to_string());
+        }
+    }
+}
+
+/// Read a TX variable as an integer, treating missing/non-numeric as 0.
+fn tx_var_i64(ctx: &RequestContext, name: &str) -> i64 {
+    ctx.tx_vars
+        .get(name)
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+/// Expand `%{...}` macros in a setvar value against the current TX store and the
+/// CRS numeric constants. A macro that resolves to nothing expands to an empty
+/// string (which is treated as 0 in the numeric `Add`/`Sub` context). UTF-8 safe.
+fn expand_tx_macros(input: &str, ctx: &RequestContext) -> String {
+    if !input.contains("%{") {
+        return input.to_owned();
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find("%{") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        match after.find('}') {
+            Some(end) => {
+                out.push_str(&resolve_macro(&after[..end], ctx));
+                rest = &after[end + 1..];
+            }
+            None => {
+                // Unterminated `%{` — emit the literal remainder verbatim.
+                out.push_str(&rest[start..]);
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Resolve a single macro body such as `tx.critical_anomaly_score`. Only `tx.*`
+/// references (and their CRS numeric-constant fallbacks) are modelled; any other
+/// collection resolves to an empty string.
+fn resolve_macro(inner: &str, ctx: &RequestContext) -> String {
+    let lower = inner.trim().to_ascii_lowercase();
+    match lower.strip_prefix("tx.") {
+        Some(var) => {
+            let key = var.to_ascii_uppercase();
+            ctx.tx_vars
+                .get(&key)
+                .cloned()
+                .or_else(|| crs_constant(&key).map(str::to_owned))
+                .unwrap_or_default()
+        }
+        None => String::new(),
+    }
+}
+
+/// CRS numeric constants normally seeded by `crs-setup.conf`. Referenced by
+/// category-score setvars like `setvar:tx.sql_injection_score=+%{tx.critical_anomaly_score}`.
+fn crs_constant(key_upper: &str) -> Option<&'static str> {
+    match key_upper {
+        "CRITICAL_ANOMALY_SCORE" => Some("5"),
+        "ERROR_ANOMALY_SCORE" => Some("4"),
+        "WARNING_ANOMALY_SCORE" => Some("3"),
+        "NOTICE_ANOMALY_SCORE" => Some("2"),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -850,15 +1243,35 @@ fn apply_transforms(mut s: String, transforms: &[Transform]) -> String {
     s
 }
 
+/// Apply `f` repeatedly (up to `max` passes) until the output stops changing —
+/// unwraps multi-layer encoding (double/triple URL-encoding `%253C` -> `%3C` ->
+/// `<`, nested HTML entities) that single-pass decoding misses. Used only for
+/// decoders that are idempotent once fully decoded, so benign text stabilises
+/// after one pass and is left unchanged. NOT used for base64/hex, where a second
+/// pass can spuriously "decode" already-plaintext into garbage.
+fn to_fixpoint(s: String, max: usize, f: impl Fn(String) -> String) -> String {
+    let mut cur = s;
+    for _ in 0..max {
+        let next = f(cur.clone());
+        if next == cur {
+            break;
+        }
+        cur = next;
+    }
+    cur
+}
+
 /// Apply a single transform step.  Used both by `apply_transforms` and by
 /// the multiMatch loop in the VM.
 fn apply_single_transform(s: String, t: &Transform) -> String {
     match t {
         Transform::Lowercase => s.to_ascii_lowercase(),
-        Transform::UrlDecodeUni => url_decode_uni(&s),
+        // Recursive: defeats double/triple URL-encoding evasion (%253Cscript).
+        Transform::UrlDecodeUni => to_fixpoint(s, 3, |x| url_decode_uni(&x)),
         Transform::RemoveNulls => s.replace('\0', ""),
         Transform::ReplaceNulls => s.replace('\0', " "),
-        Transform::HtmlEntityDecode => decode_html_entities(s),
+        // Recursive: defeats nested HTML-entity encoding (&amp;#60; -> &#60; -> <).
+        Transform::HtmlEntityDecode => to_fixpoint(s, 3, decode_html_entities),
         Transform::RemoveWhitespace => s.chars().filter(|c| !c.is_ascii_whitespace()).collect(),
         Transform::CompressWhitespace => compress_whitespace(s),
         Transform::JsDecode => decode_js_escapes(s),
@@ -885,26 +1298,191 @@ fn apply_single_transform(s: String, t: &Transform) -> String {
         Transform::RemoveCommentsChar => remove_comments_char(s),
         Transform::RemoveComments => remove_sql_comments(s),
         Transform::ReplaceComments => replace_sql_comments(s),
+        Transform::CmdLine => cmdline_transform(&s),
+        Transform::EscapeSeqDecode => escape_seq_decode(s),
+        Transform::Length => s.len().to_string(),
     }
 }
 
+/// ModSecurity `t:cmdLine` — normalize shell command-line obfuscation so the
+/// RCE detection rules can match. Deletes `\ " ' ^`; deletes a space that
+/// precedes `/` or `(`; turns `,` and `;` into spaces; collapses runs of
+/// whitespace to a single space; lowercases. e.g. `c"a"t /e''tc/passwd` → `cat /etc/passwd`.
+fn cmdline_transform(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for c in s.chars() {
+        match c {
+            '\\' | '"' | '\'' | '^' => continue, // deleted
+            ',' | ';' => {
+                if !prev_space {
+                    out.push(' ');
+                    prev_space = true;
+                }
+            }
+            '/' | '(' => {
+                // delete the single space that immediately precedes it
+                if prev_space && out.ends_with(' ') {
+                    out.pop();
+                }
+                out.push(c.to_ascii_lowercase());
+                prev_space = false;
+            }
+            c if c.is_ascii_whitespace() => {
+                if !prev_space {
+                    out.push(' ');
+                    prev_space = true;
+                }
+            }
+            c => {
+                out.push(c.to_ascii_lowercase());
+                prev_space = false;
+            }
+        }
+    }
+    out
+}
+
+/// ModSecurity `t:escapeSeqDecode` — decode ANSI-C escape sequences: `\xHH`,
+/// octal `\NNN` (1–3 digits), and the single-char escapes `\a \b \f \n \r \t
+/// \v \\ \? \' \"`. Unknown escapes are passed through unchanged.
+fn escape_seq_decode(s: String) -> String {
+    if !s.contains('\\') {
+        return s;
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek().copied() {
+            Some('x') | Some('X') => {
+                chars.next();
+                let mut hex = String::new();
+                while hex.len() < 2 && chars.peek().map(|c| c.is_ascii_hexdigit()) == Some(true) {
+                    hex.push(chars.next().unwrap());
+                }
+                match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                    Some(ch) if !hex.is_empty() => out.push(ch),
+                    _ => {
+                        out.push('\\');
+                        out.push('x');
+                        out.push_str(&hex);
+                    }
+                }
+            }
+            Some(d) if ('0'..='7').contains(&d) => {
+                let mut oct = String::new();
+                while oct.len() < 3 && chars.peek().map(|c| ('0'..='7').contains(c)) == Some(true) {
+                    oct.push(chars.next().unwrap());
+                }
+                match u32::from_str_radix(&oct, 8).ok().and_then(char::from_u32) {
+                    Some(ch) => out.push(ch),
+                    None => {
+                        out.push('\\');
+                        out.push_str(&oct);
+                    }
+                }
+            }
+            Some(esc) => {
+                chars.next();
+                let decoded = match esc {
+                    'a' => Some('\u{07}'),
+                    'b' => Some('\u{08}'),
+                    'f' => Some('\u{0C}'),
+                    'n' => Some('\n'),
+                    'r' => Some('\r'),
+                    't' => Some('\t'),
+                    'v' => Some('\u{0B}'),
+                    '\\' => Some('\\'),
+                    '?' => Some('?'),
+                    '\'' => Some('\''),
+                    '"' => Some('"'),
+                    _ => None,
+                };
+                match decoded {
+                    Some(ch) => out.push(ch),
+                    None => {
+                        out.push('\\');
+                        out.push(esc);
+                    }
+                }
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Decode HTML entities like ModSecurity's `t:htmlEntityDecode`: any decimal
+/// `&#DDD;` and hex `&#xHH;`/`&#XHH;` numeric entity (trailing `;` optional),
+/// plus the common named entities. Previously only a fixed ~13-entry table,
+/// which let attackers evade the 39 XSS/SQLi rules that rely on this transform
+/// via arbitrary numeric entities (e.g. `&#40;` → `(`, `&#x61;` → `a`).
 fn decode_html_entities(s: String) -> String {
     if !s.contains('&') {
         return s;
     }
-    s.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&#x27;", "'")
-        .replace("&#39;", "'")
-        .replace("&#x2F;", "/")
-        .replace("&#47;", "/")
-        .replace("&#x3C;", "<")
-        .replace("&#60;", "<")
-        .replace("&#x3E;", ">")
-        .replace("&#62;", ">")
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '&' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        // Numeric entity: &#DDD; (decimal) or &#xHH; / &#XHH; (hex).
+        if i + 2 < chars.len() && chars[i + 1] == '#' {
+            let (is_hex, start) = if chars[i + 2] == 'x' || chars[i + 2] == 'X' {
+                (true, i + 3)
+            } else {
+                (false, i + 2)
+            };
+            let mut j = start;
+            while j < chars.len()
+                && ((is_hex && chars[j].is_ascii_hexdigit())
+                    || (!is_hex && chars[j].is_ascii_digit()))
+            {
+                j += 1;
+            }
+            if j > start {
+                let num: String = chars[start..j].iter().collect();
+                let radix = if is_hex { 16 } else { 10 };
+                if let Some(ch) = u32::from_str_radix(&num, radix)
+                    .ok()
+                    .and_then(char::from_u32)
+                {
+                    out.push(ch);
+                    if j < chars.len() && chars[j] == ';' {
+                        j += 1; // consume optional trailing ';'
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        // Named entities (require the trailing ';').
+        let window: String = chars[i..(i + 6).min(chars.len())].iter().collect();
+        let named: &[(&str, char)] = &[
+            ("&lt;", '<'),
+            ("&gt;", '>'),
+            ("&amp;", '&'),
+            ("&quot;", '"'),
+            ("&apos;", '\''),
+            ("&nbsp;", ' '),
+        ];
+        if let Some((ent, ch)) = named.iter().find(|(ent, _)| window.starts_with(ent)) {
+            out.push(*ch);
+            i += ent.chars().count();
+            continue;
+        }
+        out.push('&');
+        i += 1;
+    }
+    out
 }
 
 fn compress_whitespace(s: String) -> String {
@@ -1047,41 +1625,51 @@ fn decode_css_escapes(s: String) -> String {
 /// Strips whitespace first (headers often have line breaks).
 /// Returns the original string unchanged on any decoding error.
 fn base64_decode_transform(s: &str) -> String {
+    // Strip whitespace first (headers often have line breaks).
     let cleaned: String = s.chars().filter(|c| !c.is_ascii_whitespace()).collect();
-    let decode = |c: u8| -> Option<u8> {
-        match c {
-            b'A'..=b'Z' => Some(c - b'A'),
-            b'a'..=b'z' => Some(c - b'a' + 26),
-            b'0'..=b'9' => Some(c - b'0' + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            b'=' => Some(0),
-            _ => None,
-        }
-    };
-    let bytes = cleaned.as_bytes();
-    if bytes.is_empty() || bytes.len() % 4 != 0 {
+    if cleaned.len() < 8 {
         return s.to_owned();
     }
+    // First pass: try to decode the cleaned string as pure Base64.
+    if let Some(decoded) = try_decode_base64(&cleaned) {
+        if let Ok(result) = String::from_utf8(decoded) {
+            return result;
+        }
+    }
+    // Second pass: handle URLPath case where the value starts with '/'
+    // (e.g. "/DQpRVUlUDQo"). The '/' is a valid Base64 character, so the
+    // first pass decodes it as part of the payload and produces garbage.
+    // Stripping the leading '/' exposes the real Base64 payload.
+    if let Some(stripped) = cleaned.strip_prefix('/') {
+        if !stripped.is_empty() {
+            if let Some(decoded) = try_decode_base64(stripped) {
+                if let Ok(result) = String::from_utf8(decoded) {
+                    return result;
+                }
+            }
+        }
+    }
+    s.to_owned()
+}
+
+/// Try to decode a Base64 string (with auto-padding for unpadded input).
+/// Returns None if the string contains non-Base64 characters.
+fn try_decode_base64(input: &str) -> Option<Vec<u8>> {
+    let mut padded = input.to_owned();
+    let rem = padded.len() % 4;
+    if rem != 0 {
+        for _ in 0..(4 - rem) {
+            padded.push('=');
+        }
+    }
+    let bytes = padded.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len() * 3 / 4);
     let mut i = 0;
     while i + 3 < bytes.len() {
-        let b0 = match decode(bytes[i]) {
-            Some(v) => v,
-            None => return s.to_owned(),
-        };
-        let b1 = match decode(bytes[i + 1]) {
-            Some(v) => v,
-            None => return s.to_owned(),
-        };
-        let b2 = match decode(bytes[i + 2]) {
-            Some(v) => v,
-            None => return s.to_owned(),
-        };
-        let b3 = match decode(bytes[i + 3]) {
-            Some(v) => v,
-            None => return s.to_owned(),
-        };
+        let b0 = decode_b64_byte(bytes[i])?;
+        let b1 = decode_b64_byte(bytes[i + 1])?;
+        let b2 = decode_b64_byte(bytes[i + 2])?;
+        let b3 = decode_b64_byte(bytes[i + 3])?;
         out.push((b0 << 2) | (b1 >> 4));
         if bytes[i + 2] != b'=' {
             out.push((b1 << 4) | (b2 >> 2));
@@ -1091,7 +1679,19 @@ fn base64_decode_transform(s: &str) -> String {
         }
         i += 4;
     }
-    String::from_utf8(out).unwrap_or_else(|_| s.to_owned())
+    Some(out)
+}
+
+fn decode_b64_byte(c: u8) -> Option<u8> {
+    match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'a'..=b'z' => Some(c - b'a' + 26),
+        b'0'..=b'9' => Some(c - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        b'=' => Some(0),
+        _ => None,
+    }
 }
 
 /// Decode a hex-encoded string (optional `0x`/`0X` prefix; even-length hex bytes).
@@ -1214,5 +1814,120 @@ fn pop_numeric_f64(stack: &mut Vec<StackVal>) -> f64 {
             warn!("VM: stack underflow on pop_numeric");
             0.0
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// XML / SOAP body extraction tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod xml_tests {
+    use super::*;
+
+    #[test]
+    fn xml_content_type_detection() {
+        assert!(is_xml_content_type("text/xml"));
+        assert!(is_xml_content_type("application/xml; charset=utf-8"));
+        assert!(is_xml_content_type("application/soap+xml; action=\"x\""));
+        assert!(is_xml_content_type("application/rss+xml"));
+        assert!(!is_xml_content_type("application/json"));
+        assert!(!is_xml_content_type("text/html"));
+    }
+
+    #[test]
+    fn recursive_transforms_unwrap_double_encoding() {
+        // Double URL-encoding: single-pass would leave `%3Cscript`; recursive
+        // decode unwraps it to `<script` so the XSS signature can match.
+        assert_eq!(
+            apply_transforms("%253Cscript".to_string(), &[Transform::UrlDecodeUni]),
+            "<script"
+        );
+        // Nested numeric HTML entity: &#38; -> `&`, then &#60; -> `<`.
+        assert_eq!(
+            apply_transforms("&#38;#60;".to_string(), &[Transform::HtmlEntityDecode]),
+            "<"
+        );
+        // Single-encoding still decodes; benign text stabilises after one pass.
+        assert_eq!(
+            apply_transforms("%3Cb%3E".to_string(), &[Transform::UrlDecodeUni]),
+            "<b>"
+        );
+        assert_eq!(
+            apply_transforms("hello world".to_string(), &[Transform::UrlDecodeUni]),
+            "hello world"
+        );
+    }
+
+    #[test]
+    fn xml_extracts_element_text_and_attributes() {
+        let body = br#"<order id="42"><item cat="books">' OR 1=1--</item></order>"#;
+        let pairs = parse_xml_args(body);
+        assert!(
+            pairs.iter().any(|(k, v)| k == "id" && v == "42"),
+            "attribute value must be surfaced: {pairs:?}"
+        );
+        assert!(pairs.iter().any(|(k, v)| k == "cat" && v == "books"));
+        assert!(
+            pairs.iter().any(|(k, v)| k == "item" && v == "' OR 1=1--"),
+            "element text keyed by local element name: {pairs:?}"
+        );
+    }
+
+    #[test]
+    fn xml_decodes_entities_and_cdata() {
+        let body = br#"<a>&lt;script&gt;</a><b><![CDATA[<xss>alert(1)</xss>]]></b>"#;
+        let pairs = parse_xml_args(body);
+        assert!(
+            pairs.iter().any(|(_, v)| v == "<script>"),
+            "entities decoded: {pairs:?}"
+        );
+        assert!(
+            pairs.iter().any(|(_, v)| v == "<xss>alert(1)</xss>"),
+            "CDATA content surfaced raw: {pairs:?}"
+        );
+    }
+
+    #[test]
+    fn xml_strips_namespace_prefixes_soap() {
+        let body =
+            br#"<soap:Envelope><soap:Body><q>select * from users</q></soap:Body></soap:Envelope>"#;
+        let pairs = parse_xml_args(body);
+        assert!(
+            pairs
+                .iter()
+                .any(|(k, v)| k == "q" && v == "select * from users"),
+            "namespace prefix stripped to local name: {pairs:?}"
+        );
+    }
+
+    #[test]
+    fn xml_ignores_comments_pi_and_doctype() {
+        let body = br#"<?xml version="1.0"?><!DOCTYPE x><!-- <injected> --><root>data</root>"#;
+        let pairs = parse_xml_args(body);
+        assert!(pairs.iter().any(|(k, v)| k == "root" && v == "data"));
+        assert!(
+            !pairs.iter().any(|(_, v)| v.contains("injected")),
+            "comment content must not leak into ARGS: {pairs:?}"
+        );
+    }
+
+    #[test]
+    fn xml_entity_decoding_numeric_and_unknown() {
+        assert_eq!(decode_xml_entities("&#60;&#x3E;"), "<>");
+        assert_eq!(decode_xml_entities("a &amp; b"), "a & b");
+        assert_eq!(decode_xml_entities("no entities here"), "no entities here");
+        // Unknown entities are preserved verbatim (fail open, don't drop data).
+        assert_eq!(decode_xml_entities("&bogus;x"), "&bogus;x");
+    }
+
+    #[test]
+    fn xml_malformed_fails_open() {
+        // Unterminated tag / truncated body must not panic and should still
+        // surface whatever text it can.
+        let pairs = parse_xml_args(b"<a>hello");
+        assert!(pairs.iter().any(|(k, v)| k == "a" && v == "hello"));
+        let _ = parse_xml_args(b"<a href=\"unterminated");
+        let _ = parse_xml_args(b"<![CDATA[unterminated");
     }
 }

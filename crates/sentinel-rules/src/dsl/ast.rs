@@ -48,6 +48,42 @@ pub struct RuleDef {
     /// against the fully-transformed value.  Mirrors ModSecurity `multiMatch`.
     #[serde(default)]
     pub multi_match: bool,
+    /// `setvar` mutations applied to the per-request TX store when this rule
+    /// fires. Lets category-score and correlation rules accumulate state
+    /// (e.g. `tx.sql_injection_score`) that later rules read via `TX:` targets.
+    #[serde(default)]
+    pub setvars: Vec<SetVar>,
+}
+
+// ---------------------------------------------------------------------------
+// setvar — per-request TX variable mutation
+// ---------------------------------------------------------------------------
+
+/// A single `setvar` operation attached to a rule, executed when the rule fires
+/// (all its conditions match), mutating the per-request TX variable store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetVar {
+    /// TX variable name, UPPERCASED and WITHOUT the `tx.` prefix. This matches
+    /// the key convention used when reading `TX:` targets (see the CRS importer
+    /// and `TargetSpec::TxVar`), so a value written here is readable by a later
+    /// rule's `TX:NAME` target.
+    pub name: String,
+    pub op: SetVarOp,
+}
+
+/// The mutation a [`SetVar`] applies. Values may contain `%{...}` macros, which
+/// are expanded against the current TX store (and CRS numeric constants) at the
+/// moment the rule fires.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SetVarOp {
+    /// `setvar:!tx.name` — remove the variable.
+    Unset,
+    /// `setvar:tx.name=value` — set to a (possibly macro-expanded) string.
+    Set(String),
+    /// `setvar:tx.name=+expr` — numeric increment by the expanded expression.
+    Add(String),
+    /// `setvar:tx.name=-expr` — numeric decrement by the expanded expression.
+    Sub(String),
 }
 
 /// A single chained condition from a CRS `chain` SecRule.
@@ -73,6 +109,7 @@ impl Default for RuleDef {
             transforms: Vec::new(),
             skip_after: None,
             multi_match: false,
+            setvars: Vec::new(),
         }
     }
 }
@@ -169,6 +206,16 @@ pub enum Transform {
     RemoveCommentsChar,
     RemoveComments,
     ReplaceComments,
+    /// ModSecurity `t:cmdLine` — collapse shell command-line obfuscation
+    /// (strip `\ " ' ^`, spaces before `/` and `(`, `,`/`;` → space, fold
+    /// whitespace, lowercase). Required by the 932 RCE evasion rules.
+    CmdLine,
+    /// ModSecurity `t:escapeSeqDecode` — decode ANSI-C escape sequences
+    /// (`\xHH`, octal `\NNN`, `\a \b \f \n \r \t \v \\ \? \' \"`).
+    EscapeSeqDecode,
+    /// ModSecurity `t:length` — replace the value with its byte length as a
+    /// decimal string, so `@ge`/`@gt` numeric size checks evaluate.
+    Length,
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +239,16 @@ pub enum Operator {
     /// (which our importer cannot express directly — it needs capture groups,
     /// dynamic `setvar`, a `TX:/regex/` collection, and `%{}` macro expansion).
     OffDomainUrl,
+    /// SSRF detection (`@ssrfUrl`). Fires when a value contains a URL whose host is an
+    /// internal/loopback/link-local address or a cloud-metadata name, in ANY encoding
+    /// the OS resolver accepts (decimal, hex, octal, short-form, IPv4-mapped IPv6).
+    /// See [`crate::ssrf`]. This is what restores the SSRF coverage lost when
+    /// `@rbl`/`@ipMatch` were compiled to `Never`.
+    SsrfUrl,
+    /// Real `@ipMatch` / `@ipMatchF`: fires when the value parses as an IP inside any
+    /// of the given CIDR ranges. Previously compiled to `Never`, which silently
+    /// disabled every CRS rule that used it.
+    IpMatch(Vec<String>),
     AnomalyScore {
         op: CmpOp,
         threshold: u32,

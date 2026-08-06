@@ -1,0 +1,9 @@
+# Autoscaler removed: its minReplicas is 3, which would immediately undo the
+# scale-down above. It also requires metrics-server, which a minimal single-node
+# install may not have. On one node there is no spare capacity to scale into.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: sentinel-dataplane-hpa
+  namespace: sentinel
+$patch: delete

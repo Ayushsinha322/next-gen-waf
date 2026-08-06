@@ -9,8 +9,8 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/your-org/sentinel-waf/control-plane/internal/auth"
-	"github.com/your-org/sentinel-waf/control-plane/internal/cluster"
 	"github.com/your-org/sentinel-waf/control-plane/internal/db"
+	"github.com/your-org/sentinel-waf/control-plane/internal/leader"
 	"github.com/your-org/sentinel-waf/control-plane/internal/logs"
 	"github.com/your-org/sentinel-waf/control-plane/internal/rbac"
 )
@@ -45,16 +45,16 @@ func handleListBlockedCountries(c *gin.Context, enf *rbac.Enforcer, store *db.St
 }
 
 // handleBlockCountry adds a country code to every active site's geoip block list.
-func handleBlockCountry(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
+func handleBlockCountry(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *leader.Elector) {
 	geoipMutate(c, enf, store, hub, cl, true)
 }
 
 // handleUnblockCountry removes a country code from every site's geoip block list.
-func handleUnblockCountry(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
+func handleUnblockCountry(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *leader.Elector) {
 	geoipMutate(c, enf, store, hub, cl, false)
 }
 
-func geoipMutate(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster, block bool) {
+func geoipMutate(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *leader.Elector, block bool) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceSite, rbac.ActionUpdate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
@@ -115,8 +115,7 @@ func geoipMutate(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.
 		}
 		// Replicate through Raft before the local write, identical to every
 		// other site mutation (handlers.go / sites_config.go).
-		if !proposeBest(c, cl, cluster.CmdSiteUpdate,
-			gin.H{"tenant_id": claims.TenantID, "site_id": s.ID, "req": db.UpdateSiteRequest{WafPolicy: newPolicy}}) {
+		if !requireLeader(c, cl) {
 			return
 		}
 		if _, err := store.UpdateSite(c.Request.Context(), claims.TenantID, claims.UserID, s.ID,

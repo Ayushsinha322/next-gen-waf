@@ -88,6 +88,7 @@ pub(crate) fn add_host_functions(linker: &mut Linker<PluginContext>) -> anyhow::
     linker.func_wrap("env", "host_log", host_log)?;
     linker.func_wrap("env", "host_get_req_header", host_get_req_header)?;
     linker.func_wrap("env", "host_set_decision", host_set_decision)?;
+    linker.func_wrap("env", "host_get_decision", host_get_decision)?;
     linker.func_wrap("env", "host_add_score", host_add_score)?;
     linker.func_wrap("env", "host_set_header", host_set_header)?;
     linker.func_wrap("env", "host_kv_get", host_kv_get)?;
@@ -166,6 +167,30 @@ fn host_set_decision(mut caller: Caller<'_, PluginContext>, code: i32) {
         decision = ?ctx.decision,
         "plugin set decision"
     );
+}
+
+/// `host_get_decision() -> i32`
+///
+/// Read the decision currently set for this invocation:
+///   `0` = Allow, `1` = Block, `2` = Challenge, `3` = Log.
+///
+/// This reflects what the PLUGIN has set so far in this invocation, which starts
+/// at Allow — plugins only run while the request is still Allow, so it is a
+/// read-back of your own decision rather than a view of the whole pipeline's
+/// verdict. Useful for a plugin whose logic is split across several checks.
+///
+/// It was documented in the SDK but never registered with the linker, so any
+/// plugin that imported it failed to instantiate with "unknown import".
+fn host_get_decision(caller: Caller<'_, PluginContext>) -> i32 {
+    match caller.data().decision {
+        WafDecision::Allow => 0,
+        WafDecision::Block => 1,
+        WafDecision::Challenge => 2,
+        WafDecision::Log => 3,
+        // Limit has no ABI code; report it as Block, the nearest deny semantics a
+        // plugin can act on, rather than silently claiming Allow.
+        WafDecision::Limit => 1,
+    }
 }
 
 /// `host_add_score(delta: i32)`
@@ -473,5 +498,48 @@ mod tests {
         assert_eq!(kv.get("rate_limit_key").unwrap().value().as_str(), "99");
 
         assert!(kv.get("nonexistent").is_none());
+    }
+}
+
+#[cfg(test)]
+mod sdk_contract_tests {
+    /// Every host function the SDK documents MUST be registered with the linker.
+    ///
+    /// The SDK tells plugin authors to copy its import block verbatim, so a name
+    /// documented there and absent from `add_host_functions` produces a module that
+    /// fails to instantiate at the first request with "unknown import: `env::X` has
+    /// not been defined". That is precisely what shipped: `host_get_header` (the
+    /// real name is `host_get_req_header`) and `host_get_decision` (never
+    /// registered) were both documented, so every plugin written against the SDK
+    /// was dead on arrival — which is why no plugin had ever run.
+    ///
+    /// This test compares the two lists textually rather than by linking a guest,
+    /// so it fails the moment the docs and the linker drift apart again.
+    #[test]
+    fn sdk_documents_only_functions_the_host_registers() {
+        let sdk = include_str!("sdk.rs");
+        let abi = include_str!("abi.rs");
+
+        // Names the SDK declares in its `extern "C"` import block.
+        let documented: Vec<&str> = sdk
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("pub fn host_"))
+            .filter_map(|rest| rest.split('(').next())
+            .map(str::trim)
+            .collect();
+        assert!(
+            documented.len() >= 8,
+            "expected to find the SDK import block; found {documented:?}"
+        );
+
+        for name in documented {
+            let registered = format!("\"host_{name}\"");
+            assert!(
+                abi.contains(&registered),
+                "SDK documents host_{name} but add_host_functions never registers {registered}; \
+                 a plugin copied from the SDK would fail to instantiate with \
+                 \"unknown import: `env::host_{name}` has not been defined\""
+            );
+        }
     }
 }

@@ -36,11 +36,33 @@ const (
 	// DevTenantID is the well-known UUID for the default dev tenant.
 	DevTenantID = "00000000-0000-0000-0000-000000000001"
 	// DevAdminID is the well-known UUID for the default dev admin user.
-	DevAdminID  = "00000000-0000-0000-0000-000000000002"
+	DevAdminID = "00000000-0000-0000-0000-000000000002"
+
+	// DemoFixturesEnvVar must be "1" to insert fabricated demo content.
+	DemoFixturesEnvVar = "SENTINEL_DEV_SEED"
 )
 
-// SeedDev inserts a default tenant, admin user, and sample data if they do
-// not already exist. Safe to call on every startup (idempotent).
+// DemoFixturesEnabled reports whether the operator explicitly asked for
+// fabricated demo content (sample sites, sample rules, invented alerts).
+//
+// This used to be unconditional on every privileged boot, which meant a real
+// deployment came up pre-populated with seven fabricated security alerts —
+// complete with plausible attacker IPs, CRS rule IDs, scores, and a Log4Shell
+// CVE reference — that were indistinguishable in the UI from alerts produced by
+// actual traffic. Worse, the alert INSERT had no conflict handling, so it added
+// another seven on EVERY restart, without bound.
+//
+// Fabricated security findings in a security product are the one thing that can
+// destroy trust outright, so they are now opt-in.
+func DemoFixturesEnabled() bool {
+	return os.Getenv(DemoFixturesEnvVar) == "1"
+}
+
+// SeedDev bootstraps the default tenant and admin user, which every deployment
+// needs in order to log in at all. Safe to call on every startup (idempotent).
+//
+// Fabricated demo content (sample sites, sample rules, sample alerts) is only
+// inserted when DemoFixturesEnabled() — see its doc comment.
 func SeedDev(ctx context.Context, pool Pool) error {
 	// Use a raw pgxPool for seeding because we need to bypass RLS on first
 	// insert (tenant row must exist before the policy can reference it).
@@ -98,7 +120,14 @@ func SeedDev(ctx context.Context, pool Pool) error {
 			adminPw)
 	}
 
-	// ── Sample sites ─────────────────────────────────────────────────────────
+	// Everything below this point is FABRICATED demo content, not configuration a
+	// real deployment needs. Commit the bootstrap rows and stop unless the
+	// operator explicitly opted in.
+	if !DemoFixturesEnabled() {
+		return tx.Commit(ctx)
+	}
+
+	// ── Sample sites (demo only) ─────────────────────────────────────────────
 	type siteSpec struct {
 		name     string
 		domain   string
@@ -143,13 +172,67 @@ func SeedDev(ctx context.Context, pool Pool) error {
 		name, source, severity, dsl string
 		phase                       int
 	}
+	// These are DEMO rows, but they are also the examples an operator copies when
+	// writing their first rule, so the DSL must be valid SRL. It previously was
+	// not: every one used a `rule <name> { id: N; op: rx("...") }` shape that the
+	// parser rejects outright — the rule name IS the numeric id, and the operator
+	// form is `operator : rx /pattern/`. Nobody noticed because the rows were never
+	// delivered to the data plane and /rules/test never parsed SRL either.
+	//
+	// The four 'crs' rows are kept deliberately crude AND deliberately excluded
+	// from delivery by sentinel_deployable_rules() (migration 0017): they reuse
+	// real CRS ids and rx /union|select|insert/ would block the word "select".
+	// Real CRS reaches the data plane as files. Only the virtual_patch row below
+	// is representative of something an operator should actually write.
 	rules := []ruleSpec{
-		{"CRS-942100", "crs", "critical", `rule block-sqli { id: 942100; op: rx("union|select|insert"); action: block }`, 2},
-		{"CRS-941140", "crs", "high", `rule block-xss { id: 941140; op: rx("<script"); action: block }`, 2},
-		{"CRS-930100", "crs", "high", `rule block-traversal { id: 930100; op: rx("\.\./"); action: block }`, 1},
-		{"CRS-932100", "crs", "critical", `rule block-cmdinj { id: 932100; op: rx("; ?ls |; ?cat "); action: block }`, 2},
-		{"VP-CVE-2021-44228", "virtual_patch", "critical", `rule block-log4shell { id: 9999900; op: rx("\$\{jndi:"); action: block }`, 1},
-		{"CRS-913100", "crs", "medium", `rule detect-scanner { id: 913100; op: ua_rx("nikto|sqlmap"); action: log }`, 1},
+		{"CRS-942100", "crs", "critical", `rule 942100 {
+    phase    : request_body
+    targets  : ARGS
+    operator : rx /(?i)(union|select|insert)/
+    action   : block
+    severity : critical
+    message  : "demo only — too broad to deploy"
+}`, 2},
+		{"CRS-941140", "crs", "high", `rule 941140 {
+    phase    : request_body
+    targets  : ARGS
+    operator : rx /(?i)<script/
+    action   : block
+    severity : high
+    message  : "demo only"
+}`, 2},
+		{"CRS-930100", "crs", "high", `rule 930100 {
+    phase    : request_body
+    targets  : ARGS
+    operator : rx /\.\.\//
+    action   : block
+    severity : high
+    message  : "demo only"
+}`, 1},
+		{"CRS-932100", "crs", "critical", `rule 932100 {
+    phase    : request_body
+    targets  : ARGS
+    operator : rx /;\s?(ls|cat)\s/
+    action   : block
+    severity : critical
+    message  : "demo only"
+}`, 2},
+		{"VP-CVE-2021-44228", "virtual_patch", "critical", `rule 9999900 {
+    phase    : request_body
+    targets  : ARGS|REQUEST_HEADERS|REQUEST_COOKIES
+    operator : rx /\$\{jndi:/
+    action   : block
+    severity : critical
+    message  : "Log4Shell JNDI lookup (CVE-2021-44228)"
+}`, 1},
+		{"CRS-913100", "crs", "medium", `rule 913100 {
+    phase    : request_headers
+    targets  : REQUEST_HEADERS:User-Agent
+    operator : rx /(?i)(nikto|sqlmap)/
+    action   : log
+    severity : medium
+    message  : "demo only"
+}`, 1},
 	}
 	for _, r := range rules {
 		_, err = tx.Exec(ctx, `
@@ -183,14 +266,24 @@ func SeedDev(ctx context.Context, pool Pool) error {
 		{"low", "scanner", "Scanner detected: Nikto/2.1.6", "resolved",
 			map[string]any{"ip": "172.16.1.5", "rule": "CRS-913100", "score": 3, "action": "LOGGED", "path": "/robots.txt"}},
 	}
-	for _, a := range alerts {
-		det, _ := json.Marshal(a.details)
-		_, err = tx.Exec(ctx, `
-			INSERT INTO alerts (tenant_id, severity, kind, summary, details, state)
-			VALUES ($1, $2, $3, $4, $5, $6)`,
-			DevTenantID, a.sev, a.kind, a.summary, det, a.state)
-		if err != nil {
-			return fmt.Errorf("seed: alert: %w", err)
+	// Insert only into an empty alert table. Unlike the sites and rules above,
+	// alerts have no natural unique key to conflict on, so this INSERT was
+	// re-running in full on every boot and growing the table without bound.
+	var existingAlerts int
+	if err := tx.QueryRow(ctx,
+		`SELECT count(*) FROM alerts WHERE tenant_id = $1`, DevTenantID).Scan(&existingAlerts); err != nil {
+		return fmt.Errorf("seed: counting existing alerts: %w", err)
+	}
+	if existingAlerts == 0 {
+		for _, a := range alerts {
+			det, _ := json.Marshal(a.details)
+			_, err = tx.Exec(ctx, `
+				INSERT INTO alerts (tenant_id, severity, kind, summary, details, state)
+				VALUES ($1, $2, $3, $4, $5, $6)`,
+				DevTenantID, a.sev, a.kind, a.summary, det, a.state)
+			if err != nil {
+				return fmt.Errorf("seed: alert: %w", err)
+			}
 		}
 	}
 

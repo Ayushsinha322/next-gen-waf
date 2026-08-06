@@ -20,11 +20,11 @@ import (
 
 // Config holds DB connection settings.
 type Config struct {
-	URL             string // postgres://user:pass@host:5432/sentinel?sslmode=verify-full
-	MaxConns        int32
-	MinConns        int32
-	StatementCache  bool
-	IsolationLevel  string // "shared" (RLS) | "schema" | "dedicated"
+	URL            string // postgres://user:pass@host:5432/sentinel?sslmode=verify-full
+	MaxConns       int32
+	MinConns       int32
+	StatementCache bool
+	IsolationLevel string // "shared" (RLS) | "schema" | "dedicated"
 }
 
 // Pool is the abstract connection pool interface so we can swap pgx for sqlite
@@ -55,5 +55,3 @@ type Rows interface {
 type Row interface {
 	Scan(dest ...any) error
 }
-
-

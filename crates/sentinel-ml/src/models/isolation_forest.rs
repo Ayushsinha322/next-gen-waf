@@ -16,7 +16,11 @@
 
 use std::time::Instant;
 
-use parking_lot::RwLock;
+use arc_swap::ArcSwap;
+use parking_lot::Mutex;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomOrdering};
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Simple non-cryptographic RNG with seedable state
@@ -259,21 +263,37 @@ impl IsolationForest {
 /// Ring buffer of recent request feature vectors.  Periodically retrains
 /// the [`IsolationForest`] so the model adapts to the site's traffic profile.
 ///
-/// # Thread safety
-/// The internal forest is under an [`RwLock`] — reads (scoring) are
-/// contention-free after a brief shared lock; writes (retraining) hold an
-/// exclusive lock but are infrequent.
+/// # Thread safety and hot-path cost
+///
+/// Scoring is lock-free: the trained forest lives in an [`ArcSwap`], so a scoring
+/// request loads a pointer and never blocks — not even while a retrain is running.
+/// Observing takes a short mutex to push into a bounded ring buffer, which is O(1).
+///
+/// This replaces a design that was expensive on the request path in three separate
+/// ways, all of them paid by every clean request:
+///
+///  1. `observe()` took the **write** half of the `RwLock`, so recording a sample
+///     blocked all concurrent scoring and serialized observers against each other.
+///  2. The ring buffer was a `Vec` evicted with `remove(0)` — an O(n) memmove of
+///     the entire buffer (≥1024 feature vectors) on every request once full.
+///  3. Retraining ran **inline while still holding that write lock**, so one
+///     unlucky request in every `retrain_every` stalled every other request in
+///     flight for the duration of a full forest build.
+///
+/// Now the triggering request still performs the training itself, but it does so
+/// after releasing the buffer lock and writes the result with a single atomic
+/// pointer swap — so it delays only itself, never other requests.
 pub struct IncrementalForest {
-    inner: RwLock<ForestState>,
+    /// Current forest. Read lock-free by `score()`; replaced wholesale on retrain.
+    forest: ArcSwap<IsolationForest>,
+    /// Recent observations. `VecDeque` so eviction is O(1) rather than O(n).
+    buffer: Mutex<VecDeque<Vec<f32>>>,
+    generation: AtomicU64,
+    samples_since_train: AtomicUsize,
+    /// Guards against two requests retraining concurrently; the loser skips.
+    retraining: AtomicBool,
     buffer_capacity: usize,
     retrain_every: usize,
-}
-
-struct ForestState {
-    forest: IsolationForest,
-    buffer: Vec<Vec<f32>>,
-    generation: u64,
-    samples_since_train: usize,
 }
 
 impl IncrementalForest {
@@ -283,37 +303,49 @@ impl IncrementalForest {
     /// * `retrain_every`: retrain after this many new vectors (min 64).
     pub fn new(buffer_capacity: usize, retrain_every: usize) -> Self {
         let retrain = retrain_every.max(64);
+        let capacity = buffer_capacity.max(1024);
         Self {
-            inner: RwLock::new(ForestState {
-                forest: IsolationForest::train(&[]),
-                buffer: Vec::with_capacity(buffer_capacity),
-                generation: 0,
-                samples_since_train: 0,
-            }),
-            buffer_capacity: buffer_capacity.max(1024),
+            forest: ArcSwap::from_pointee(IsolationForest::train(&[])),
+            buffer: Mutex::new(VecDeque::with_capacity(capacity)),
+            generation: AtomicU64::new(0),
+            samples_since_train: AtomicUsize::new(0),
+            retraining: AtomicBool::new(false),
+            buffer_capacity: capacity,
             retrain_every: retrain,
         }
     }
 
-    /// Feed one new feature vector.  Returns `true` if the forest was
-    /// retrained as a result.
+    /// Feed one new feature vector. Returns `true` if this call retrained the
+    /// forest.
+    ///
+    /// The buffer lock is held only for the O(1) push; any training happens after
+    /// it is released, and publishing the result is a single atomic swap.
     pub fn observe(&self, features: &[f32]) -> bool {
-        let mut state = self.inner.write();
-        // Ring-buffer push.
-        if state.buffer.len() >= self.buffer_capacity {
-            state.buffer.remove(0);
-        }
-        state.buffer.push(features.to_vec());
-        state.samples_since_train += 1;
+        let snapshot = {
+            let mut buf = self.buffer.lock();
+            if buf.len() >= self.buffer_capacity {
+                buf.pop_front();
+            }
+            buf.push_back(features.to_vec());
 
-        if state.buffer.len() >= 64 && state.samples_since_train >= self.retrain_every {
-            state.forest = IsolationForest::train(&state.buffer);
-            state.generation += 1;
-            state.samples_since_train = 0;
-            true
-        } else {
-            false
-        }
+            let seen = self.samples_since_train.fetch_add(1, AtomOrdering::Relaxed) + 1;
+            if buf.len() < 64 || seen < self.retrain_every {
+                return false;
+            }
+            // Only one retrain at a time; a concurrent observer just keeps going.
+            if self.retraining.swap(true, AtomOrdering::Acquire) {
+                return false;
+            }
+            // Copy out under the lock, then train outside it.
+            buf.iter().cloned().collect::<Vec<_>>()
+        };
+
+        self.samples_since_train.store(0, AtomOrdering::Relaxed);
+        let trained = IsolationForest::train(&snapshot);
+        self.forest.store(Arc::new(trained));
+        self.generation.fetch_add(1, AtomOrdering::Relaxed);
+        self.retraining.store(false, AtomOrdering::Release);
+        true
     }
 
     /// Seed the forest with known-normal vectors and train immediately.
@@ -327,46 +359,51 @@ impl IncrementalForest {
         if vectors.is_empty() {
             return;
         }
-        let mut state = self.inner.write();
-        for v in vectors {
-            if state.buffer.len() >= self.buffer_capacity {
-                state.buffer.remove(0);
+        let snapshot = {
+            let mut buf = self.buffer.lock();
+            for v in vectors {
+                if buf.len() >= self.buffer_capacity {
+                    buf.pop_front();
+                }
+                buf.push_back(v.clone());
             }
-            state.buffer.push(v.clone());
-        }
-        if state.buffer.len() >= 8 {
-            state.forest = IsolationForest::train(&state.buffer);
-            state.generation += 1;
-            state.samples_since_train = 0;
-        }
+            if buf.len() < 8 {
+                return;
+            }
+            buf.iter().cloned().collect::<Vec<_>>()
+        };
+
+        let trained = IsolationForest::train(&snapshot);
+        self.forest.store(Arc::new(trained));
+        self.generation.fetch_add(1, AtomOrdering::Relaxed);
+        self.samples_since_train.store(0, AtomOrdering::Relaxed);
     }
 
     /// Score a feature vector against the current forest.
     ///
-    /// Returns 0.5 (neutral) if the forest has insufficient data.
+    /// Lock-free. Returns 0.5 (neutral) if the forest has insufficient data.
     pub fn score(&self, features: &[f32]) -> f32 {
-        let state = self.inner.read();
-        state.forest.score(features)
+        self.forest.load().score(features)
     }
 
     /// Number of training samples currently buffered.
     pub fn buffer_len(&self) -> usize {
-        self.inner.read().buffer.len()
+        self.buffer.lock().len()
     }
 
     /// Training generation counter (monotonically increasing).
     pub fn generation(&self) -> u64 {
-        self.inner.read().generation
+        self.generation.load(AtomOrdering::Relaxed)
     }
 
     /// Whether the forest has been trained at least once.
     pub fn is_trained(&self) -> bool {
-        self.inner.read().forest.is_trained()
+        self.forest.load().is_trained()
     }
 
     /// Number of trees (0 if untrained).
     pub fn tree_count(&self) -> usize {
-        self.inner.read().forest.tree_count()
+        self.forest.load().tree_count()
     }
 }
 
@@ -498,5 +535,106 @@ mod tests {
     fn random_jitter(center: f32, spread: f32) -> f32 {
         let t = (std::time::Instant::now().elapsed().subsec_nanos() % 1024) as f32 / 1024.0;
         center + (t - 0.5) * spread
+    }
+
+    // ── Hot-path cost properties ──────────────────────────────────────────
+
+    #[test]
+    fn buffer_stays_bounded_under_sustained_load() {
+        // Eviction is O(1) via VecDeque::pop_front; the previous Vec::remove(0)
+        // memmoved the whole buffer on every request once full.
+        let capacity = 1024; // new() clamps below this
+        let inc = IncrementalForest::new(capacity, 64);
+        for i in 0..(capacity * 3) {
+            inc.observe(&[i as f32 / 100.0, 0.25]);
+        }
+        assert!(
+            inc.buffer_len() <= capacity,
+            "buffer grew past capacity: {}",
+            inc.buffer_len()
+        );
+        assert!(inc.generation() >= 1, "never retrained");
+    }
+
+    #[test]
+    fn scoring_never_blocks_and_stays_valid_during_retraining() {
+        // The point of ArcSwap: readers must keep making progress while a retrain
+        // is in flight. Under the old RwLock, observe() held the write half and
+        // trained inline, so every scorer stalled for the whole forest build.
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc as StdArc;
+
+        let inc = StdArc::new(IncrementalForest::new(2048, 64));
+        inc.seed(
+            &(0..128)
+                .map(|i| vec![i as f32 / 128.0, 0.5])
+                .collect::<Vec<_>>(),
+        );
+
+        let stop = StdArc::new(AtomicBool::new(false));
+        let scores = StdArc::new(AtomicUsize::new(0));
+
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let inc = StdArc::clone(&inc);
+                let stop = StdArc::clone(&stop);
+                let scores = StdArc::clone(&scores);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let s = inc.score(&[0.42, 0.5]);
+                        assert!(
+                            (0.0..=1.0).contains(&s) && !s.is_nan(),
+                            "score out of range during retrain: {s}"
+                        );
+                        scores.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect();
+
+        // Drive many retrains while the readers hammer score().
+        let writer = {
+            let inc = StdArc::clone(&inc);
+            std::thread::spawn(move || {
+                for i in 0..2_000 {
+                    inc.observe(&[(i % 128) as f32 / 128.0, 0.5]);
+                }
+            })
+        };
+        writer.join().expect("writer panicked");
+        stop.store(true, Ordering::Relaxed);
+        for r in readers {
+            r.join().expect("reader panicked");
+        }
+
+        assert!(inc.generation() >= 2, "expected several retrains");
+        assert!(
+            scores.load(Ordering::Relaxed) > 0,
+            "readers made no progress — scoring was blocked"
+        );
+    }
+
+    #[test]
+    fn concurrent_observers_do_not_corrupt_state() {
+        use std::sync::Arc as StdArc;
+        let inc = StdArc::new(IncrementalForest::new(1024, 64));
+        let writers: Vec<_> = (0..8)
+            .map(|w| {
+                let inc = StdArc::clone(&inc);
+                std::thread::spawn(move || {
+                    for i in 0..500 {
+                        inc.observe(&[(w * 500 + i) as f32 / 4000.0, 0.5]);
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().expect("writer panicked");
+        }
+        assert!(inc.buffer_len() <= 1024);
+        assert!(inc.is_trained(), "forest never became trained");
+        // A valid score proves the swapped-in forest is intact.
+        let s = inc.score(&[0.5, 0.5]);
+        assert!((0.0..=1.0).contains(&s) && !s.is_nan(), "invalid score {s}");
     }
 }

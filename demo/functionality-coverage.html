@@ -1,0 +1,312 @@
+<style>
+  :root{
+    --bg:#f7f8fa; --panel:#ffffff; --ink:#1a1a1f; --ink2:#4b5563; --ink3:#6b7280;
+    --line:#e5e7eb; --line2:#eef0f3; --accent:#0e7490; --accent2:#0891b2;
+    --ok:#059669; --okbg:#ecfdf5; --okbd:#a7f3d0;
+    --part:#b45309; --partbg:#fffbeb; --partbd:#fde68a;
+    --road:#1d4ed8; --roadbg:#eff6ff; --roadbd:#bfdbfe;
+    --team:#7c3aed; --teambg:#f5f3ff; --teambd:#ddd6fe;
+    --na:#6b7280; --nabg:#f3f4f6; --nabd:#e5e7eb;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#0b0c0f; --panel:#141519; --ink:#f3f4f6; --ink2:#c2c6cf; --ink3:#9aa0ab;
+      --line:#26282e; --line2:#1d1f24; --accent:#22d3ee; --accent2:#67e8f9;
+      --ok:#34d399; --okbg:rgba(16,185,129,.12); --okbd:rgba(16,185,129,.3);
+      --part:#fbbf24; --partbg:rgba(245,158,11,.12); --partbd:rgba(245,158,11,.3);
+      --road:#60a5fa; --roadbg:rgba(37,99,235,.14); --roadbd:rgba(59,130,246,.32);
+      --team:#a78bfa; --teambg:rgba(124,58,237,.14); --teambd:rgba(124,58,237,.32);
+      --na:#9aa0ab; --nabg:rgba(255,255,255,.05); --nabd:rgba(255,255,255,.1);
+    }
+  }
+  :root[data-theme="light"]{
+    --bg:#f7f8fa; --panel:#ffffff; --ink:#1a1a1f; --ink2:#4b5563; --ink3:#6b7280;
+    --line:#e5e7eb; --line2:#eef0f3; --accent:#0e7490; --accent2:#0891b2;
+    --ok:#059669; --okbg:#ecfdf5; --okbd:#a7f3d0; --part:#b45309; --partbg:#fffbeb; --partbd:#fde68a;
+    --road:#1d4ed8; --roadbg:#eff6ff; --roadbd:#bfdbfe; --team:#7c3aed; --teambg:#f5f3ff; --teambd:#ddd6fe;
+    --na:#6b7280; --nabg:#f3f4f6; --nabd:#e5e7eb;
+  }
+  :root[data-theme="dark"]{
+    --bg:#0b0c0f; --panel:#141519; --ink:#f3f4f6; --ink2:#c2c6cf; --ink3:#9aa0ab;
+    --line:#26282e; --line2:#1d1f24; --accent:#22d3ee; --accent2:#67e8f9;
+    --ok:#34d399; --okbg:rgba(16,185,129,.12); --okbd:rgba(16,185,129,.3);
+    --part:#fbbf24; --partbg:rgba(245,158,11,.12); --partbd:rgba(245,158,11,.3);
+    --road:#60a5fa; --roadbg:rgba(37,99,235,.14); --roadbd:rgba(59,130,246,.32);
+    --team:#a78bfa; --teambg:rgba(124,58,237,.14); --teambd:rgba(124,58,237,.32);
+    --na:#9aa0ab; --nabg:rgba(255,255,255,.05); --nabd:rgba(255,255,255,.1);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  .doc{background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.55;
+       -webkit-font-smoothing:antialiased;padding:clamp(18px,4vw,44px)}
+  .wrap{max-width:1060px;margin:0 auto}
+
+  header.hd{border-bottom:2px solid var(--accent);padding-bottom:18px;margin-bottom:22px}
+  .ey{font-family:var(--mono);font-size:12px;letter-spacing:2.5px;text-transform:uppercase;color:var(--accent);margin-bottom:8px}
+  h1{font-size:clamp(22px,3.4vw,30px);font-weight:800;letter-spacing:-.2px;line-height:1.15;text-wrap:balance}
+  .sub{color:var(--ink2);margin-top:8px;font-size:15px;max-width:760px}
+  .meta{font-family:var(--mono);font-size:11.5px;color:var(--ink3);margin-top:10px}
+
+  .lead{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--accent);
+        border-radius:10px;padding:16px 18px;margin:20px 0;font-size:14.5px;color:var(--ink2)}
+  .lead b{color:var(--ink)}
+
+  /* summary cards */
+  .sum{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:18px 0 8px}
+  .sc{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 15px}
+  .sc .n{font-family:var(--mono);font-weight:700;font-size:26px;line-height:1;font-variant-numeric:tabular-nums}
+  .sc .l{font-size:12.5px;color:var(--ink3);margin-top:6px}
+  .sc.ok .n{color:var(--ok)} .sc.part .n{color:var(--part)} .sc.road .n{color:var(--road)}
+  .sc.team .n{color:var(--team)} .sc.na .n{color:var(--na)}
+
+  /* legend */
+  .legend{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0 26px}
+  .pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;
+        padding:3px 10px;border-radius:999px;border:1px solid;white-space:nowrap;font-family:var(--mono);letter-spacing:.3px}
+  .p-ok{color:var(--ok);background:var(--okbg);border-color:var(--okbd)}
+  .p-part{color:var(--part);background:var(--partbg);border-color:var(--partbd)}
+  .p-road{color:var(--road);background:var(--roadbg);border-color:var(--roadbd)}
+  .p-team{color:var(--team);background:var(--teambg);border-color:var(--teambd)}
+  .p-na{color:var(--na);background:var(--nabg);border-color:var(--nabd)}
+
+  section.dom{margin:24px 0}
+  h2{font-size:17px;font-weight:750;margin-bottom:2px;display:flex;align-items:center;gap:9px}
+  h2 .ico{font-size:18px}
+  .dsub{font-size:13px;color:var(--ink3);margin-bottom:12px}
+
+  .tbl-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:10px;background:var(--panel)}
+  table{width:100%;border-collapse:collapse;font-size:13.5px;min-width:640px}
+  th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--ink3);
+     font-weight:700;padding:10px 14px;border-bottom:1px solid var(--line);background:var(--line2)}
+  td{padding:10px 14px;border-bottom:1px solid var(--line2);vertical-align:top}
+  tr:last-child td{border-bottom:none}
+  td.fn{font-weight:600;color:var(--ink);width:32%}
+  td.st{width:20%;white-space:nowrap}
+  td.nt{color:var(--ink2);font-size:13px}
+
+  .box{border-radius:10px;padding:16px 18px;margin:16px 0;border:1px solid}
+  .box h3{font-size:15px;margin-bottom:8px;display:flex;align-items:center;gap:8px}
+  .box.team{background:var(--teambg);border-color:var(--teambd)}
+  .box.team h3{color:var(--team)}
+  .box.na{background:var(--nabg);border-color:var(--nabd)}
+  .box.na h3{color:var(--ink)}
+  .box ul{margin:6px 0 0 2px;list-style:none}
+  .box li{padding:5px 0 5px 18px;position:relative;font-size:13.5px;color:var(--ink2)}
+  .box li::before{content:"›";position:absolute;left:2px;color:var(--accent);font-weight:700}
+  .box li b{color:var(--ink)}
+
+  footer{margin-top:30px;padding-top:16px;border-top:1px solid var(--line);font-size:12.5px;color:var(--ink3);
+         display:flex;flex-wrap:wrap;justify-content:space-between;gap:10px}
+  .disc{font-size:12px;color:var(--ink3);margin-top:8px;font-style:italic}
+</style>
+
+<div class="doc"><div class="wrap">
+
+  <header class="hd">
+    <div class="ey">Functionality Coverage Assessment</div>
+    <h1>Next-Gen ESDS WAF — Coverage vs. Enlight Pratihar (WAAP) Specification</h1>
+    <p class="sub">This document maps every functionality in the Enlight Pratihar HLD/LLD against what our shipped WAF delivers today, what is on our committed 7-phase roadmap, and what depends on other internal teams. Assessed against the live codebase.</p>
+    <div class="meta">Prepared by: WAF Engineering · Basis: Pratihar HLD v1.0 + LLD v1.0 vs. Next-Gen ESDS WAF (Phases 0–6) · Status: honest engineering assessment</div>
+  </header>
+
+  <div class="lead">
+    <b>Executive summary.</b> The Pratihar documents describe a full Web-Application-and-API-Protection (WAAP) <b>platform vision</b>. Against that vision, our WAF today: the <b>core protection engine, TLS/proxy layer, rate-limiting, ML anomaly detection, multi-tenant control plane and observability are available and working now</b>. The remaining items are almost entirely <b>already on our committed roadmap (Phase 6–7)</b> — API security (OpenAPI/GraphQL/gRPC), outbound DLP, post-quantum TLS, positive-security ML and compliance report packs are planned features, not missing capabilities. The <b>Hansa / Garud / Jatayoo ecosystem integrations</b> depend on those (internal ESDS) product teams, and a set of items — long-term archival, regulatory report packs, Kafka bus and the microservice split — are <b>out of scope for the WAF engine</b>: they belong to the compliance, storage or reporting layers, not the firewall itself (and are not missing security features).
+  </div>
+
+  <div class="sum">
+    <div class="sc ok"><div class="n">42</div><div class="l">Available now</div></div>
+    <div class="sc part"><div class="n">15</div><div class="l">Partial (usable, enhancing)</div></div>
+    <div class="sc road"><div class="n">34</div><div class="l">On roadmap (Phase 6–7)</div></div>
+    <div class="sc team"><div class="n">3</div><div class="l">Needs internal team</div></div>
+    <div class="sc na"><div class="n">6</div><div class="l">Not required / out of scope</div></div>
+  </div>
+
+  <div class="legend">
+    <span class="pill p-ok">● AVAILABLE — shipped &amp; working today</span>
+    <span class="pill p-part">● PARTIAL — usable now, enhancement planned</span>
+    <span class="pill p-road">● ROADMAP — committed Phase 6 / Phase 7</span>
+    <span class="pill p-team">● NEEDS TEAM — depends on internal ESDS product</span>
+    <span class="pill p-na">● NOT REQUIRED — out of scope for the WAF engine</span>
+  </div>
+
+  <!-- 1 -->
+  <section class="dom">
+    <h2><span class="ico">🌐</span>1 · Traffic Ingestion &amp; Delivery (Reverse Proxy)</h2>
+    <div class="dsub">The L7 data-plane that terminates and forwards traffic.</div>
+    <div class="tbl-wrap"><table>
+      <tr><th>Functionality</th><th>Status</th><th>Notes</th></tr>
+      <tr><td class="fn">L7 reverse proxy — HTTP/1.1, HTTP/2, WebSocket</td><td class="st"><span class="pill p-ok">AVAILABLE</span></td><td class="nt">Full proxy with keep-alive upstream pooling &amp; buffering.</td></tr>
+      <tr><td class="fn">HTTP/3 (QUIC)</td><td class="st"><span class="pill p-ok">AVAILABLE</span></td><td class="nt">Live &amp; verified; same WAF pipeline &amp; cert store as TCP.</td></tr>
+      <tr><td class="fn">TLS 1.2 / 1.3 termination + SNI multi-tenant routing</td><td class="st"><span class="pill p-ok">AVAILABLE</span></td><td class="nt">rustls, ALPN h2/h1; per-domain cert selection by SNI.</td></tr>
+      <tr><td class="fn">Origin health checks + failover + circuit breaker</td><td class="st"><span class="pill p-ok">AVAILABLE</span></td><td class="nt">Active + passive checks, half-open recovery.</td></tr>
+      <tr><td class="fn">Load balancing (round-robin, least-conn, IP-hash)</td><td class="st"><span class="pill p-part">PARTIAL</span></td><td class="nt">Weighted + consistent-hash ring pending.</td></tr>
+      <tr><td class="fn">Post-quantum TLS (hybrid X25519 + Kyber)</td><td class="st"><span class="pill p-road">ROADMAP P6</span></td><td class="nt">Config hooks present; handshake wiring in Phase 6.</td></tr>
+      <tr><td class="fn">Mutual TLS to origin (client-cert to upstream)</td><td class="st"><span class="pill p-road">ROADMAP</span></td><td class="nt">Origin server-cert validated today; client-cert to upstream planned.</td></tr>
+      <tr><td class="fn">Static-asset caching &amp; response compression</td><td class="st"><span class="pill p-road">ROADMAP</span></td><td class="nt">Marked optional in the spec; low priority.</td></tr>
+    </table></div>
+  </section>
+
+  <!-- 2 -->
+  <section class="dom">
+    <h2><span class="ico">🛡️</span>2 · Detection &amp; Prevention Engines</h2>
+    <div class="dsub">Signature, anomaly and protocol defenses — the heart of the WAF.</div>
+    <div class="tbl-wrap"><table>
+      <tr><th>Functionality</th><th>Status</th><th>Notes</th></tr>
+      <tr><td class="fn">OWASP CRS signature engine (SecLang/ModSecurity-compatible)</td><td class="st"><span class="pill p-ok">AVAILABLE</span></td><td class="nt">2,541 rules, compiled to a bytecode VM; runs live.</td></tr>
+      <tr><td class="fn">SQLi / XSS detection (libinjection)</td><td class="st"><span class="pill p-ok">AVAILABLE</span></td><td class="nt">Dedicated detectors beyond regex.</td></tr>
+      <tr><td class="fn">Input normalization / transformations</td><td class="st"><span class="pill p-ok">AVAILABLE</span></td><td class="nt">Full CRS transform pipeline.</td></tr>
+      <tr><td class="fn">HTTP request-smuggling / desync defense</td><td class="st"><span class="pill p-ok">AVAILABLE</span></td><td class="nt">CL.TE / TE.CL / TE.TE rejection.</td></tr>
+      <tr><td class="fn">RFC validation, size / method / header limits</td><td class="st"><span class="pill p-ok">AVAILABLE</span></td><td class="nt">Enforced with correct status codes.</td></tr>
+      <tr><td class="fn">Anomaly-scoring + hard-block modes</td><td class="st"><span class="pill p-ok">AVAILABLE</span></td><td class="nt">Collaborative scoring and immediate block.</td></tr>
+      <tr><td class="fn">ML anomaly detection (Isolation Forest) + payload classifier</td><td class="st"><span class="pill p-ok">AVAILABLE</span></td><td class="nt">Global anomaly + attack classifier, wired to the pipeline.</td></tr>
+      <tr><td class="fn">Paranoia levels &amp; verdict fusion (Allow/Block/Challenge/Log)</td><td class="st"><span class="pill p-part">PARTIAL</span></td><td class="nt">PL rule-gating + 4 verdicts; per-PL thresholds &amp; a LIMIT verdict pending.</td></tr>
+      <tr><td class="fn">Virtual patching (CVE-mapped rules)</td><td class="st"><span class="pill p-part">PARTIAL</span></td><td class="nt">Mechanism present; per-CVE pack workflow + signed emergency fast-channel on roadmap.</td></tr>
+      <tr><td class="fn">Positive-security model (per-app learned parameters, ONNX) + drift detection</td><td class="st"><span class="pill p-road">ROADMAP</span></td><td class="nt">Per-route ML baselining is planned; ONNX runtime already integrated.</td></tr>
+      <tr><td class="fn">ESDS / India-specific threat-research signature packs</td><td class="st"><span class="pill p-road">ROADMAP</span></td><td class="nt">Engine ready; content authoring needs ESDS threat-research input.</td></tr>
+    </table></div>
+  </section>
+
+  <!-- 3 -->
+  <section class="dom">
+    <h2><span class="ico">🤖</span>3 · Bot &amp; Abuse Management</h2>
+    <div class="dsub">Automated-threat and abuse defense.</div>
+    <div class="tbl-wrap"><table>
+      <tr><th>Functionality</th><th>Status</th><th>Notes</th></tr>
+      <tr><td class="fn">IP reputation (allow / block / suspect + feed ingestion)</td><td class="st"><span class="pill p-ok">AVAILABLE</span></td><td class="nt">CIDR-based, allowlist precedence.</td></tr>
+      <tr><td class="fn">Distributed rate limiting (Redis sliding window + local fallback)</td><td class="st"><span class="pill p-ok">AVAILABLE</span></td><td class="nt">Atomic LUA sliding window; degrades to in-memory.</td></tr>
+      <tr><td class="fn">Self-hosted JS Proof-of-Work challenge (HMAC clearance cookie)</td><td class="st"><span class="pill p-ok">AVAILABLE</span></td><td class="nt">Sovereignty-friendly; no foreign dependency.</td></tr>
+      <tr><td class="fn">L4 anti-DDoS (eBPF/XDP kernel drops)</td><td class="st"><span class="pill p-ok">AVAILABLE</span></td><td class="nt">Kernel-level SYN/flood mitigation module.</td></tr>
+      <tr><td class="fn">JA3 / JA4 TLS fingerprinting</td><td class="st"><span class="pill p-part">PARTIAL</span></td><td class="nt">Config &amp; matching present; fingerprint-extraction pipeline to be completed.</td></tr>
+      <tr><td class="fn">CAPTCHA tiers &amp; multi-dimensional rate-limit keys (session/JWT/API-key/geo)</td><td class="st"><span class="pill p-part">PARTIAL</span></td><td class="nt">Native PoW + IP/site keys today; self-hosted CAPTCHA + richer keys planned.</td></tr>
+      <tr><td class="fn">Weighted bot scoring, header/Markov heuristics, ASN reputation, good-bot verify</td><td class="st"><span class="pill p-road">ROADMAP</span></td><td class="nt">Behavioral-biometric scoring model in the plan.</td></tr>
+      <tr><td class="fn">Named abuse playbooks (credential-stuffing, OTP-bombing, scraping…)</td><td class="st"><span class="pill p-road">ROADMAP</span></td><td class="nt">Covered indirectly today via rate-limit + scanner blocking.</td></tr>
+    </table></div>
+  </section>
+
+  <!-- 4 -->
+  <section class="dom">
+    <h2><span class="ico">🔌</span>4 · API Security (WAAP)</h2>
+    <div class="dsub">The dedicated API-protection layer — GraphQL + edge JWT are live; JWKS + gRPC land in v1.0.</div>
+    <div class="tbl-wrap"><table>
+      <tr><th>Functionality</th><th>Status</th><th>Notes</th></tr>
+      <tr><td class="fn">Secure response-header injection &amp; hop-by-hop stripping</td><td class="st"><span class="pill p-ok">AVAILABLE</span></td><td class="nt">Per-site configurable.</td></tr>
+      <tr><td class="fn">JSON/XML structural limits (size, header count)</td><td class="st"><span class="pill p-part">PARTIAL</span></td><td class="nt">Byte/header limits enforced; deep JSON-depth / XXE structural guard pending.</td></tr>
+      <tr><td class="fn">GraphQL firewall (query depth / complexity / introspection block)</td><td class="st"><span class="pill p-ok">AVAILABLE</span></td><td class="nt">Deployed + verified live (2026-07-09): deep query &amp; introspection → 403, shallow → 200.</td></tr>
+      <tr><td class="fn">Edge JWT / OAuth2 validation on customer traffic (sig · exp · iss/aud · scopes)</td><td class="st"><span class="pill p-ok">AVAILABLE</span></td><td class="nt">Deployed + verified live (2026-07-09): fixed algorithm allow-list, <code>alg:none</code>/alg-confusion-proof. Static keys today.</td></tr>
+      <tr><td class="fn">JWKS rotation — fetch/cache IdP keys, select by <code>kid</code></td><td class="st"><span class="pill p-part">v1.0 — building</span></td><td class="nt">Parsing built + tested; data-plane async cache in progress (Auth0/Keycloak/Entra/Okta).</td></tr>
+      <tr><td class="fn">gRPC firewall (message/frame-size limits, per-method allow/deny, reflection block)</td><td class="st"><span class="pill p-part">v1.0 — building</span></td><td class="nt">Detects <code>application/grpc(+web)</code>; deep proto introspection is v1.1.</td></tr>
+      <tr><td class="fn">OpenAPI schema import &amp; enforcement · API auto-discovery</td><td class="st"><span class="pill p-road">v1.1 (next release)</span></td><td class="nt">Folds into positive-security ML.</td></tr>
+      <tr><td class="fn">BOLA / IDOR access-pattern anomaly detection</td><td class="st"><span class="pill p-road">v1.1 (next release)</span></td><td class="nt">Needs per-app object-ownership model; pairs with positive-security &amp; API discovery.</td></tr>
+      <tr><td class="fn">Response-path DLP / PII masking (card, Aadhaar, PAN, mobile)</td><td class="st"><span class="pill p-road">ROADMAP P6</span></td><td class="nt">"Outbound DLP" is an explicit Phase 6 deliverable (detection exists; masking action pending).</td></tr>
+    </table></div>
+  </section>
+
+  <!-- 5 -->
+  <section class="dom">
+    <h2><span class="ico">💥</span>5 · Layer-7 DDoS Protection</h2>
+    <div class="tbl-wrap"><table>
+      <tr><th>Functionality</th><th>Status</th><th>Notes</th></tr>
+      <tr><td class="fn">Connection-rate admission control (per-IP sliding window + temp block)</td><td class="st"><span class="pill p-ok">AVAILABLE</span></td><td class="nt">Fixed-threshold admission at ingress.</td></tr>
+      <tr><td class="fn">Slow-attack (Slowloris) policing</td><td class="st"><span class="pill p-part">PARTIAL</span></td><td class="nt">Header-dribble &amp; H2 flood bounded; slow-body (RUDY) byte-rate pending.</td></tr>
+      <tr><td class="fn">Adaptive RPS baselining (EWMA) &amp; graduated "storm mode" auto-mitigation</td><td class="st"><span class="pill p-road">ROADMAP</span></td><td class="nt">Adaptive throttling on the plan; JS-challenge escalation primitive already exists.</td></tr>
+    </table></div>
+  </section>
+
+  <!-- 6 -->
+  <section class="dom">
+    <h2><span class="ico">🔐</span>6 · TLS &amp; Certificate Management</h2>
+    <div class="tbl-wrap"><table>
+      <tr><th>Functionality</th><th>Status</th><th>Notes</th></tr>
+      <tr><td class="fn">ACME auto-issuance &amp; renewal (HTTP-01, TLS-ALPN-01)</td><td class="st"><span class="pill p-ok">AVAILABLE</span></td><td class="nt">Verified against LE staging; DNS-01 pending.</td></tr>
+      <tr><td class="fn">Per-site certs, hot rotation (zero-downtime), manual upload + validation</td><td class="st"><span class="pill p-ok">AVAILABLE</span></td><td class="nt">Hot-swap on next handshake.</td></tr>
+      <tr><td class="fn">Dedicated management-console TLS (replaceable device cert)</td><td class="st"><span class="pill p-ok">AVAILABLE</span></td><td class="nt">Isolated admin listener.</td></tr>
+      <tr><td class="fn">Private CA (self-signed + downloadable root CA)</td><td class="st"><span class="pill p-part">PARTIAL</span></td><td class="nt">Enterprise-CA enrolment (SCEP/EST, CCA-India) pending.</td></tr>
+      <tr><td class="fn">HSM / Vault private-key custody</td><td class="st"><span class="pill p-road">ROADMAP · LOW</span></td><td class="nt">Enterprise-deployment option for high-assurance environments; default is secured on-disk keys (0600, atomic writes).</td></tr>
+      <tr><td class="fn">OCSP stapling</td><td class="st"><span class="pill p-road">ROADMAP</span></td><td class="nt">Minor add.</td></tr>
+    </table></div>
+  </section>
+
+  <!-- 7 -->
+  <section class="dom">
+    <h2><span class="ico">🗄️</span>7 · Control Plane, Data Model &amp; Governance</h2>
+    <div class="tbl-wrap"><table>
+      <tr><th>Functionality</th><th>Status</th><th>Notes</th></tr>
+      <tr><td class="fn">PostgreSQL data model (tenants, sites, rules, users, API keys, ML profiles)</td><td class="st"><span class="pill p-ok">AVAILABLE</span></td><td class="nt">Complete core schema.</td></tr>
+      <tr><td class="fn">Hard multi-tenant isolation (row-level security)</td><td class="st"><span class="pill p-ok">AVAILABLE</span></td><td class="nt">FORCE RLS + non-superuser role.</td></tr>
+      <tr><td class="fn">RBAC (5 roles, resource×action) + JWT / OIDC / machine API keys</td><td class="st"><span class="pill p-ok">AVAILABLE</span></td><td class="nt">Exceeds the spec's 4-role model.</td></tr>
+      <tr><td class="fn">Append-only, HMAC-chained tamper-evident audit log</td><td class="st"><span class="pill p-ok">AVAILABLE</span></td><td class="nt">Durable, broadly wired.</td></tr>
+      <tr><td class="fn">Config hot-sync to edge + Management REST API (/api/v1)</td><td class="st"><span class="pill p-ok">AVAILABLE</span></td><td class="nt">Changes reach edges well within the &lt;30s target.</td></tr>
+      <tr><td class="fn">SAML SSO + enforced admin MFA · hierarchical policy inheritance</td><td class="st"><span class="pill p-part">PARTIAL</span></td><td class="nt">OIDC live; SAML/MFA enforcement &amp; global→app policy inheritance planned.</td></tr>
+      <tr><td class="fn">HA control plane — Raft active/active, degrade to last-known-good</td><td class="st"><span class="pill p-part">PARTIAL</span></td><td class="nt">Raft module present; multi-node active-active hardening in Phase 7.</td></tr>
+      <tr><td class="fn">Policy publish pipeline (draft→shadow→sign→rollback) + ETag concurrency</td><td class="st"><span class="pill p-road">ROADMAP</span></td><td class="nt">Config validation/dry-run exists; signed-bundle staging pipeline planned.</td></tr>
+      <tr><td class="fn">Microservice decomposition (7 separate services)</td><td class="st"><span class="pill p-na">NOT REQUIRED</span></td><td class="nt">Delivered as one control-plane binary — same functions, simpler ops; can split for scale later.</td></tr>
+    </table></div>
+  </section>
+
+  <!-- 8 -->
+  <section class="dom">
+    <h2><span class="ico">📈</span>8 · Event Pipeline, Storage &amp; Observability</h2>
+    <div class="tbl-wrap"><table>
+      <tr><th>Functionality</th><th>Status</th><th>Notes</th></tr>
+      <tr><td class="fn">ClickHouse event storage (90-day hot) + Threat Search (searchable history)</td><td class="st"><span class="pill p-ok">AVAILABLE</span></td><td class="nt">90-day tier matches spec; tenant-scoped search.</td></tr>
+      <tr><td class="fn">Live security-event / log streaming to console</td><td class="st"><span class="pill p-ok">AVAILABLE</span></td><td class="nt">Real-time SSE log viewer.</td></tr>
+      <tr><td class="fn">Real-time dashboard (traffic, attack breakdown, KPIs)</td><td class="st"><span class="pill p-ok">AVAILABLE</span></td><td class="nt">15-route enterprise console.</td></tr>
+      <tr><td class="fn">Prometheus metrics + Grafana dashboards</td><td class="st"><span class="pill p-ok">AVAILABLE</span></td><td class="nt">Metrics export + provisioned Grafana.</td></tr>
+      <tr><td class="fn">Alerting engine (attack-spike, repeat-offender, critical) + AI Copilot</td><td class="st"><span class="pill p-ok">AVAILABLE</span></td><td class="nt">LLM assistant supports in-country (Ollama) models.</td></tr>
+      <tr><td class="fn">Alert channels (Slack, Webhook live; Email, SMS, Teams planned) · role-tuned views</td><td class="st"><span class="pill p-part">PARTIAL</span></td><td class="nt">Channel fan-out framework in place.</td></tr>
+      <tr><td class="fn">Enriched event envelope (asn, ja4, trace_id) for APM/SIEM correlation</td><td class="st"><span class="pill p-road">ROADMAP</span></td><td class="nt">Core fields present today. (7-year archival &amp; Kafka bus → see "Not required".)</td></tr>
+    </table></div>
+  </section>
+
+  <!-- 9 -->
+  <section class="dom">
+    <h2><span class="ico">🚀</span>9 · Deployment, HA/DR &amp; Compliance</h2>
+    <div class="tbl-wrap"><table>
+      <tr><th>Functionality</th><th>Status</th><th>Notes</th></tr>
+      <tr><td class="fn">Docker + single-node on-prem deployment · India-resident (self-hosted)</td><td class="st"><span class="pill p-ok">AVAILABLE</span></td><td class="nt">Live in production.</td></tr>
+      <tr><td class="fn">Kubernetes deployment (manifests)</td><td class="st"><span class="pill p-part">PARTIAL</span></td><td class="nt">Raw manifests today; Helm chart + operator = Phase 7.</td></tr>
+      <tr><td class="fn">Sub-millisecond p99 added latency</td><td class="st"><span class="pill p-ok">AVAILABLE</span></td><td class="nt">Verified.</td></tr>
+      <tr><td class="fn">SaaS PoP fleet · dedicated hardened OVA (packaging)</td><td class="st"><span class="pill p-road">ROADMAP P7</span></td><td class="nt">Productization phase.</td></tr>
+      <tr><td class="fn">Global active-active cluster</td><td class="st"><span class="pill p-road">ROADMAP · LOW</span></td><td class="nt">Future scalability enhancement; Raft-based HA already present, single/multi-node works today.</td></tr>
+      <tr><td class="fn">1M RPS/cluster · 99.99% multi-DC availability · fail-open/closed per tenant</td><td class="st"><span class="pill p-road">ROADMAP P7</span></td><td class="nt">Performance certification is a Phase 7 exit criterion.</td></tr>
+      <tr><td class="fn">SOC2 / PCI-DSS / ISO 27001 readiness</td><td class="st"><span class="pill p-road">ROADMAP P7</span></td><td class="nt">On the Phase 7 hardening list.</td></tr>
+      <tr><td class="fn">180-day retention + DPDP per-tenant encryption keys</td><td class="st"><span class="pill p-road">ROADMAP</span></td><td class="nt">Data-protection controls. (CERT-In/RBI/PCI report packs → see "Not required".)</td></tr>
+    </table></div>
+  </section>
+
+  <!-- Need from teams -->
+  <div class="box team">
+    <h3>🔗 What we would need from other internal (ESDS) teams</h3>
+    <p style="font-size:13.5px;color:var(--ink2);margin-bottom:4px">These are integrations with <b>other Enlight products</b>, not WAF features. We can integrate on demand once the counterpart teams expose their contracts — today we already forward events in standard CEF/Syslog/Webhook formats, which is enough for basic interop.</p>
+    <ul>
+      <li><b>Enlight Hansa</b> (SIEM/SOAR) — native CEF/JSON forwarding + bidirectional block-list (SOAR) push with signed service token. <i>Needs Hansa's ingest + block-list API.</i></li>
+      <li><b>Enlight Garud</b> (APM) — WAF-overhead latency correlation via <span style="font-family:var(--mono)">traceparent</span> propagation. <i>Needs Garud's trace contract.</i></li>
+      <li><b>Enlight Jatayoo</b> — web-to-database attack-chain correlation. <i>Needs Jatayoo's correlation interface.</i></li>
+    </ul>
+  </div>
+
+  <!-- Not required -->
+  <section class="dom">
+    <h2><span class="ico">⚪</span>Not Required / Out of Scope for the WAF Engine</h2>
+    <div class="dsub">These are compliance-layer, storage, deployment or scalability concerns — <b>not missing security features</b>. The WAF supplies the data/evidence they build on.</div>
+    <div class="tbl-wrap"><table>
+      <tr><th>Functionality (from Pratihar)</th><th>Why it's out of scope for the WAF engine</th></tr>
+      <tr><td class="fn">7-year event archive</td><td class="nt">Long-term retention belongs to the storage / SIEM layer. The WAF keeps 90-day hot, searchable history and streams events out for archival.</td></tr>
+      <tr><td class="fn">CERT-In incident-report generator</td><td class="nt">A compliance / reporting module (or SIEM) generates regulator packs from the WAF's audit evidence &amp; event data — not a firewall-engine function.</td></tr>
+      <tr><td class="fn">RBI report templates</td><td class="nt">Compliance report pack (reporting layer).</td></tr>
+      <tr><td class="fn">PCI report templates</td><td class="nt">Compliance report pack (reporting layer).</td></tr>
+      <tr><td class="fn">Kafka event bus</td><td class="nt">The direct proxy → ClickHouse pipeline already delivers searchable history + live streaming. Kafka only adds hyperscale multi-consumer fan-out; can be added later without product change.</td></tr>
+      <tr><td class="fn">7-service microservice split</td><td class="nt">One hardened control-plane binary delivers the same functions with simpler, more secure operations; can be decomposed for independent scaling when volume demands.</td></tr>
+    </table></div>
+    <p class="disc" style="margin-top:10px">Compliance note: for regulated (BFSI) customers, long-term archival and CERT-In / RBI / PCI <b>reporting</b> remain contractual obligations — they are delivered by the platform's <b>compliance / SIEM layer (e.g. Enlight Hansa) and external storage</b>, built on the tamper-evident audit trail and event data the WAF produces. The obligation is met at the platform level; it simply isn't the firewall engine's job.</p>
+  </section>
+
+  <p class="disc">Assessment is against the current codebase; a few items the internal roadmap listed as "done" (e.g., JA4 fingerprint extraction, per-app positive-security ML, SAML/MFA enforcement) are shown here as <b>Partial / Roadmap</b> because the shipped code does not yet fully implement them — stated conservatively so the assessment holds up to technical review.</p>
+
+  <footer>
+    <span>Next-Gen ESDS WAF · Functionality Coverage vs. Enlight Pratihar WAAP</span>
+    <span>Confidential — ESDS Software Solution Ltd.</span>
+  </footer>
+
+</div></div>

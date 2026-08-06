@@ -7,6 +7,9 @@ REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO_ROOT/control-plane"
 
 export SENTINEL_DB_URL="${SENTINEL_DB_URL:-postgres://sentinel:sentinel_dev@localhost:5432/sentinel?sslmode=disable}"
+# Native dev connects as the Postgres superuser (RLS bypassed) — opt out of the
+# multi-tenant boot assertion. Single-tenant dev only; never set in prod.
+export SENTINEL_ALLOW_SUPERUSER_DB="${SENTINEL_ALLOW_SUPERUSER_DB:-1}"
 export SENTINEL_REDIS_URL="${SENTINEL_REDIS_URL:-redis://localhost:6379}"
 export SENTINEL_CLICKHOUSE_URL="${SENTINEL_CLICKHOUSE_URL:-http://sentinel:sentinel_dev@localhost:8123/sentinel_logs}"
 export SENTINEL_S3_ENDPOINT="${SENTINEL_S3_ENDPOINT:-http://localhost:9002}"

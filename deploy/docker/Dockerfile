@@ -16,7 +16,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev clang cmake protobuf-compiler && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN cargo build --release --bin sentinel-bin
+# --features kernel enables aya-based XDP (the committed BPF ELF is embedded via
+# include_bytes!, so no BPF toolchain is needed here). At runtime it attaches
+# XDP when the container has CAP_BPF/CAP_NET_ADMIN, else falls back to software.
+RUN cargo build --release --bin sentinel-bin --features kernel
+
+# ---- SRL validator (Rust), for the control plane ----
+# The rule DSL is compiled in Rust and the control plane is Go, so the control
+# plane executes this binary rather than owning a second parser: one compiler
+# means a rule that validates in the API is a rule that will run in the proxy.
+#
+# Its OWN stage on purpose. Built alongside sentinel-bin in the rust-builder
+# stage above, it made the control-plane image depend on the whole data-plane
+# build — turning a ~1 minute CP build into ~12 minutes on every crate change.
+# This stage compiles only sentinel-core + sentinel-rules and their deps, and
+# Docker skips it entirely when building the data plane.
+FROM rust:1.85-slim-bookworm AS srl-builder
+WORKDIR /src
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config clang && rm -rf /var/lib/apt/lists/*
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN cargo build --release --bin sentinel-srl-validate
 
 FROM golang:1.24-alpine AS go-builder
 ENV CGO_ENABLED=0
@@ -39,10 +60,16 @@ EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/sentinel"]
 
 # ---- Control plane (Go) ----
-FROM gcr.io/distroless/static-debian12 AS sentinel-controlplane
+# distroless/cc, not distroless/static: the Go binaries are static but
+# srl-validate is a normal glibc-linked Rust binary, so the runtime needs a libc.
+# The alternative was cross-compiling it against musl, which means carrying a musl
+# toolchain and a second link configuration to save a few megabytes — the data
+# plane already runs on cc.
+FROM gcr.io/distroless/cc-debian12 AS sentinel-controlplane
 COPY --from=go-builder /out/controllerd /usr/local/bin/controllerd
 COPY --from=go-builder /out/sentinelctl  /usr/local/bin/sentinelctl
-EXPOSE 9500 9501
+COPY --from=srl-builder /src/target/release/sentinel-srl-validate /usr/local/bin/srl-validate
+EXPOSE 9501
 ENTRYPOINT ["/usr/local/bin/controllerd"]
 
 # ---- DB migrations (goose) ----

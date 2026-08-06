@@ -1,0 +1,73 @@
+# Managed by deploy/2vm/install-2vm.sh — edits are overwritten on re-run.
+#
+# VRRP moves a single virtual IP between the two VMs. Only the holder answers on
+# the VIP, so there is no traffic split-brain: VRRP itself arbitrates that, unlike
+# database promotion which cannot be arbitrated safely by two nodes.
+
+global_defs {
+    router_id __ROUTER_ID__
+    enable_script_security
+    script_user root
+}
+
+# Health of the thing that actually serves traffic.
+#
+# Tracking the host alone is not enough: a VM whose kernel is fine but whose WAF
+# container has died would keep the VIP and blackhole every request. This asks the
+# data plane directly, so the VIP follows the ability to serve rather than the
+# ability to boot.
+vrrp_script chk_dataplane {
+    script  "/usr/local/sbin/sentinel-vrrp-check.sh"
+    interval 2
+    timeout  3
+    # Deliberately ASYMMETRIC: leave quickly, return cautiously.
+    #
+    # fall 2 (~4s) — a node that cannot serve must stop attracting traffic fast.
+    #
+    # rise 5 (~10s) — a node must be CONTINUOUSLY healthy before it takes the VIP
+    # back. Measured on a real reboot: the origin container's health flapped while
+    # it started, the recovering master saw one brief pass, reclaimed the VIP with
+    # rise 2, and served 502s for ~11 seconds before releasing it again. Requiring
+    # sustained health rides out that startup flapping. This slows only FAILBACK,
+    # never failover — failover is governed by `fall`.
+    rise     5
+    fall     2
+    weight   0      # binary: failure removes this node from candidacy entirely
+}
+
+vrrp_instance SENTINEL {
+    state           __STATE__
+    interface       __IFACE__
+    virtual_router_id __VRID__
+    priority        __PRIORITY__
+
+    # Unicast rather than multicast. Multicast VRRP is silently dropped by a lot of
+    # switching and virtualisation (and by most cloud fabrics), which shows up as
+    # BOTH nodes believing they are master. Naming the peer explicitly avoids
+    # depending on multicast being forwarded.
+    unicast_src_ip  __THIS_IP__
+    unicast_peer {
+        __PEER_IP__
+    }
+
+    authentication {
+        auth_type PASS
+        auth_pass __VRRP_PASS__
+    }
+
+    virtual_ipaddress {
+        __VIP__/__VIP_CIDR__ dev __IFACE__
+    }
+
+    track_script {
+        chk_dataplane
+    }
+
+    # How long after keepalived starts before this node may take the VIP from a
+    # peer that currently holds it. On the master it stops a freshly-booted node
+    # snatching the address before its containers can actually serve; the health
+    # check gates it regardless.
+
+__PREEMPT_BLOCK__
+    notify /usr/local/sbin/sentinel-vrrp-notify.sh
+}

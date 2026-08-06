@@ -6,8 +6,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/your-org/sentinel-waf/control-plane/internal/auth"
-	"github.com/your-org/sentinel-waf/control-plane/internal/cluster"
 	"github.com/your-org/sentinel-waf/control-plane/internal/db"
+	"github.com/your-org/sentinel-waf/control-plane/internal/leader"
 	"github.com/your-org/sentinel-waf/control-plane/internal/logs"
 	"github.com/your-org/sentinel-waf/control-plane/internal/rbac"
 	"gopkg.in/yaml.v3"
@@ -79,7 +79,7 @@ type importSitesRequest struct {
 // handleImportSites upserts sites from a YAML/JSON document. Existing sites are
 // matched by name and updated; new names are created. This is the write-side of
 // Config-as-Code, giving admins full parity between the UI and a config file.
-func handleImportSites(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *cluster.Cluster) {
+func handleImportSites(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *leader.Elector) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceSite, rbac.ActionUpdate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
@@ -131,7 +131,7 @@ func handleImportSites(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub 
 			upJSON = json.RawMessage(`{"servers":[],"lb":"round_robin"}`)
 		}
 		if len(ys.WafPolicy) == 0 {
-			wafJSON = json.RawMessage(`{"mode":"blocking","paranoia_level":2,"anomaly_threshold":5}`)
+			wafJSON = json.RawMessage(defaultWafPolicyJSON)
 		}
 
 		if cur, ok := byName[ys.Name]; ok {
@@ -142,7 +142,7 @@ func handleImportSites(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub 
 				Upstream:  upJSON,
 				WafPolicy: wafJSON,
 			}
-			if !proposeBest(c, cl, cluster.CmdSiteUpdate, gin.H{"tenant_id": claims.TenantID, "site_id": cur.ID, "req": ureq}) {
+			if !requireLeader(c, cl) {
 				return
 			}
 			if _, err := store.UpdateSite(c.Request.Context(), claims.TenantID, claims.UserID, cur.ID, ureq); err != nil {
@@ -157,7 +157,7 @@ func handleImportSites(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub 
 				Upstream:  upJSON,
 				WafPolicy: wafJSON,
 			}
-			if !proposeBest(c, cl, cluster.CmdSiteCreate, gin.H{"tenant_id": claims.TenantID, "req": creq}) {
+			if !requireLeader(c, cl) {
 				return
 			}
 			site, err := store.CreateSite(c.Request.Context(), claims.TenantID, claims.UserID, creq)

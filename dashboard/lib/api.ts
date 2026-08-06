@@ -41,6 +41,51 @@ async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+/**
+ * Multipart upload with the same auth + one-shot refresh behaviour as apiFetch.
+ *
+ * Separate because apiFetch hardcodes `Content-Type: application/json`. For a
+ * FormData body the header MUST be left unset so the browser can generate the
+ * multipart boundary; setting it by hand produces a body the server cannot parse.
+ *
+ * Also unwraps the server's `{"error": "..."}` payload into the thrown message.
+ * For plugin upload that text IS the user experience — "plugin.wasm is not a
+ * WebAssembly module (missing the \0asm preamble)" tells the uploader exactly
+ * what to fix, and wrapping it in `API /plugins: 400 {...}` would bury it.
+ */
+async function apiUpload<T>(path: string, form: FormData): Promise<T> {
+  const send = async (): Promise<Response> => {
+    const token = getToken();
+    const headers: Record<string, string> = {};
+    if (token) headers["Authorization"] = `Bearer ${token}`;
+    return fetch(`${BASE}${path}`, { method: "POST", body: form, headers });
+  };
+
+  let res = await send();
+  if (res.status === 401) {
+    const refreshed = await refreshToken();
+    if (refreshed) {
+      res = await send();
+    } else {
+      logout();
+      if (typeof window !== "undefined") window.location.href = "/login";
+      throw new Error("Session expired — redirecting to login");
+    }
+  }
+  if (!res.ok) {
+    const raw = await res.text().catch(() => "");
+    let msg = raw || res.statusText;
+    try {
+      const parsed = JSON.parse(raw) as { error?: string };
+      if (parsed.error) msg = parsed.error;
+    } catch {
+      /* not JSON — use the raw text */
+    }
+    throw new Error(msg);
+  }
+  return res.json() as Promise<T>;
+}
+
 // ---------------------------------------------------------------------------
 // Types (mirrors control-plane REST API responses)
 // ---------------------------------------------------------------------------
@@ -66,6 +111,18 @@ export interface Site {
   updated_at: string;
 }
 
+/** How the fleet reports a rule, as opposed to what the database stores.
+ *
+ * "enabled" only ever meant "stored". These come from the data plane, which owns
+ * the SRL compiler and is the only component that knows whether a rule actually
+ * compiled — so a rule can be enabled and NOT be protecting anything. */
+export type RuleEnforcement =
+  | "enforced"      // a data-plane node confirms it is compiled and live
+  | "not_enforced"  // a node compiled the config and rejected it
+  | "disabled"      // operator switched it off; nothing to observe
+  | "not_deployed"  // excluded from delivery by design (crs/community)
+  | "unknown";      // no node has reported recently
+
 export interface Rule {
   id:         string;
   tenant_id:  string;
@@ -78,6 +135,15 @@ export interface Rule {
   tags:       string[];
   created_at: string;
   updated_at: string;
+  /** Empty/absent means the rule applies to every site in the deployment. */
+  site_id?:   string;
+  enforcement?:       RuleEnforcement;
+  /** Why it is not enforced — the parse error, verbatim from the compiler. */
+  enforcement_error?: string;
+  /** Why it is not deployed, for states that are correct-by-design. */
+  enforcement_note?:  string;
+  nodes_enforcing?:   number;
+  nodes_reporting?:   number;
 }
 
 export interface Alert {
@@ -174,6 +240,51 @@ export interface SiteStat {
   status_5xx: number;
 }
 
+/** WAF phases a plugin runs in, from its sentinel-plugin.toml [plugin.hooks]. */
+export interface PluginHooks {
+  request_headers?:  boolean;
+  request_body?:     boolean;
+  response_headers?: boolean;
+  response_body?:    boolean;
+}
+
+/**
+ * Host functions a plugin DECLARES it needs, from [plugin.permissions].
+ *
+ * Declared intent, not enforcement: the runtime does not currently gate host
+ * calls on these flags, so any loaded plugin can call any host function the ABI
+ * exposes. Shown in the UI so an operator can see what a plugin claims it will do
+ * before enabling it — never presented as a sandbox guarantee.
+ */
+export interface PluginPermissions {
+  host_log?:            boolean;
+  host_get_req_header?: boolean;
+  host_set_decision?:   boolean;
+  host_add_score?:      boolean;
+  host_set_header?:     boolean;
+  host_kv_get?:         boolean;
+  host_kv_set?:         boolean;
+  host_http_callout?:   boolean;
+}
+
+/** An installed WASM plugin (module bytes are never sent to the browser). */
+export interface Plugin {
+  id:          string;
+  tenant_id:   string;
+  name:        string;
+  version:     string;
+  description: string;
+  author:      string;
+  hooks:       PluginHooks;
+  permissions: PluginPermissions;
+  sha256:      string;
+  size_bytes:  number;
+  enabled:     boolean;
+  uploaded_by: string;
+  created_at:  string;
+  updated_at:  string;
+}
+
 /** A rule's would-have-blocked aggregation while a site runs in Learning mode. */
 export interface LearningStat {
   rule_id:   string;
@@ -200,13 +311,107 @@ export interface WafEvent {
   score:    number;
   status:   number;
   protocol?: string; // h1 | h2 | h3
+  /** Correlation id shared with the NDJSON access/waf logs. */
+  request_id?: string;
+  /** Which part of the request tripped the rule; empty for multi-target rules. */
+  target?: string;
+  /** blocking | learning | off | node — whether the verdict was ENFORCED. */
+  mode?: string;
+  threshold?: number;
+  /** Plain-English explanation written when the event was recorded. Absent on
+   *  rows stored before the explain-the-verdict change. */
+  explanation?: string;
+}
+
+/** One configuration rollback point (control-plane db.ConfigVersionSummary). */
+export interface ConfigVersionSummary {
+  id:         number;
+  generation: number;
+  reason:     string;   // e.g. "site.update", "site.delete"
+  site_count: number;
+  created_by?: string;
+  created_at: string;   // RFC3339
+}
+
+/** One reason a site configuration would not survive conversion to the
+ *  data-plane shape (control-plane SiteConfigProblem). */
+export interface SiteConfigProblem {
+  field:   string;      // JSON path, e.g. "upstream.servers"
+  problem: string;
 }
 
 export interface TimelineBucket { ts: number; total: number; blocked: number }
 
+/** One time bucket of the threat-detection trend, split by severity band
+ *  (High folds CRITICAL + HIGH together). */
+export interface SeverityBucket {
+  ts:     number; // unix seconds (bucket start)
+  high:   number;
+  medium: number;
+  low:    number;
+  info:   number;
+}
+
+/** One source IP rolled up over the query window (Top Attacker IPs card). */
+export interface Attacker {
+  ip:        string;
+  country:   string;  // ISO-3166 alpha-2, or "" when GeoIP hasn't tagged it
+  requests:  number;  // total WAF events attributed to this IP
+  blocked:   number;  // subset actively blocked (action = BLOCK)
+  last_seen: number;  // unix seconds
+}
+
 export interface EventQuery {
   site?: string; country?: string; rule?: string; action?: string;
-  ip?: string; protocol?: string; q?: string; from?: number; to?: number; limit?: number;
+  ip?: string; protocol?: string; severity?: string; q?: string;
+  from?: number; to?: number; limit?: number;
+  // Query-param bag: also indexable so it can be fed to eventQS().
+  [key: string]: string | number | undefined;
+}
+
+// --- Log profiles ------------------------------------------------------------
+// A saved, named log view scoped to one web application. Exists for the support
+// workflow "the customer wants their app's logs for 3 August": the filters are
+// saved once per application, and only the date changes call to call.
+
+export type ExportFormat = "csv" | "ndjson" | "json";
+
+export interface LogProfile {
+  id: string;
+  tenant_id: string;
+  name: string;
+  description: string;
+  site: string;
+  rule: string;
+  action: string;
+  ip: string;
+  country: string;
+  protocol: string;
+  severity: string;
+  q: string;
+  /** Window the UI pre-selects when the profile is opened (seconds). */
+  default_range_secs: number;
+  default_format: ExportFormat;
+  created_by?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Create/update payload. Every field but `name` is optional so a PATCH-style
+ *  update can leave stored filters untouched. */
+export interface LogProfileInput {
+  name: string;
+  description?: string;
+  site?: string;
+  rule?: string;
+  action?: string;
+  ip?: string;
+  country?: string;
+  protocol?: string;
+  severity?: string;
+  q?: string;
+  default_range_secs?: number;
+  default_format?: ExportFormat;
 }
 
 // --- Threat Intelligence -----------------------------------------------------
@@ -248,6 +453,8 @@ export interface IOCPage { items: IOC[]; total: number; limit: number; offset: n
 /** Filters for the IOC browse table (all optional). */
 export interface IOCQuery {
   q?: string; type?: string; tier?: string; source?: string; limit?: number; offset?: number;
+  // Query-param bag: also indexable so it can be fed to eventQS().
+  [key: string]: string | number | undefined;
 }
 
 /** A recent threat-intel-driven enforcement hit (from ClickHouse waf_events). */
@@ -305,12 +512,29 @@ export interface APIKeyRow {
   last_used:  string;
 }
 
+/** One rule as the compiler actually understood it. */
+export interface CompiledRuleSummary {
+  id:       number;
+  phase:    string;
+  action:   string;
+  severity: string;
+}
+
 export interface RuleTestResult {
   verdict:       string;
   matched:       boolean;
   detail:        string;
   anomaly_score: number;
   phases_run:    string[];
+  /** false when the DSL does not compile. Absent on responses from a control
+   *  plane older than 2026-07-28, which could not tell valid from invalid. */
+  valid?:            boolean;
+  /** Verdict from the real rule VM: Allow | Block | Limit | Challenge | Log. */
+  decision?:         string;
+  matched_rule_ids?: string[];
+  /** What the DSL compiled to — surfaces a rule that parses but defines nothing. */
+  rules?:            CompiledRuleSummary[];
+  error?:            string;
 }
 
 /** Certificate source as reported by the data plane. */
@@ -359,17 +583,140 @@ export interface CertValidationResult {
   warnings:       string[];
 }
 
+// --- Cluster & Node Health ---------------------------------------------------
+// Mirrors GET /cluster/health: a fleet-wide roll-up of every data-plane node
+// plus the control-plane (Raft) quorum, used by the Cluster health dashboard.
+
+/** A single data-plane (WAF) node in the fleet. */
+export interface DataPlaneNode {
+  id:               string;
+  hostname:         string;
+  role:             string;
+  version:          string;
+  status:           "healthy" | "degraded" | "down";
+  last_seen:        number; // unix seconds
+  seconds_since_seen: number;
+  uptime_secs:      number;
+  sites:            number;
+  upstreams_healthy: number;
+  upstreams_total:  number;
+}
+
+/** A single control-plane (Raft) node. */
+export interface ControlPlaneNode {
+  // A stable node name (pod name / hostname), not a Raft integer ID.
+  node_id:      string;
+  // "candidate" no longer occurs: there is no election protocol with candidate
+  // states, only "holds the advisory lock" or "does not".
+  role:         "leader" | "follower" | "unknown";
+  is_leader:    boolean;
+  is_self:      boolean;
+  reachable:    boolean;
+  last_seen_sec: number;
+  addr:         string;
+}
+
+/** Fleet-wide health roll-up (data plane + control plane). */
+export interface ClusterHealth {
+  generated_at:      number; // unix seconds
+  overall:           "healthy" | "degraded" | "critical";
+  protection_active: boolean;
+  data_plane: {
+    total:            number;
+    healthy:          number;
+    degraded:         number;
+    down:             number;
+    resilience_budget: number;
+    nodes:            DataPlaneNode[];
+  };
+  control_plane: {
+    enabled:          boolean;
+    // "leader" | "follower" | "standalone".
+    role:             string | null;
+    total:            number;
+    healthy:          number;
+    // Whether a write leader is in view. This replaced quorum_size/quorum_ok/term:
+    // leadership is a Postgres advisory lock, so writes survive on a single node
+    // and there is no control-plane majority to maintain. Node IDs are now stable
+    // names (pod names), not Raft integers.
+    write_available:  boolean;
+    leader_id:        string | null;
+    leader_addr?:     string;
+    resilience_budget: number;
+    nodes:            ControlPlaneNode[];
+  };
+}
+
 // ---------------------------------------------------------------------------
 // API methods
 // ---------------------------------------------------------------------------
 
 /** Build a query string from a filter object, dropping empty values. */
-function eventQS(f: Record<string, string | number | undefined>): string {
+export function eventQS(f: Record<string, unknown>): string {
   const p = new URLSearchParams();
   for (const [k, v] of Object.entries(f)) {
     if (v !== undefined && v !== null && v !== "") p.set(k, String(v));
   }
   return p.toString();
+}
+
+/** Pull the filename out of a Content-Disposition header.
+ *
+ *  The server names the file after the application and the exact window it
+ *  covers, so preserving that name matters: the commonest support failure with
+ *  exported logs is nobody being able to tell, later, what period a file held.
+ *  Falls back to the caller's name if the header is missing or unparseable. */
+function filenameFromDisposition(header: string | null, fallback: string): string {
+  if (!header) return fallback;
+  const m = /filename\*?=(?:UTF-8'')?"?([^\";]+)"?/i.exec(header);
+  return m?.[1] ? decodeURIComponent(m[1]) : fallback;
+}
+
+/** Download a server-generated export and hand it to the browser.
+ *
+ *  Deliberately not apiFetch: the success path is a file body plus headers, the
+ *  failure path is JSON, and the server streams the full match set rather than
+ *  the page the UI happens to be showing — so the operator gets every event in
+ *  the window, not the 300 rows on screen.
+ *
+ *  Returns the row count the server reported so the caller can tell the operator
+ *  exactly what they are about to hand a customer. */
+async function downloadExport(path: string, fallbackName: string): Promise<{ filename: string; rows: number }> {
+  const token = getToken();
+  const headers: Record<string, string> = {};
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+
+  let res = await fetch(`${BASE}${path}`, { headers });
+  if (res.status === 401) {
+    const refreshed = await refreshToken();
+    if (!refreshed) {
+      logout();
+      if (typeof window !== "undefined") window.location.href = "/login";
+      throw new Error("Session expired — redirecting to login");
+    }
+    const newToken = getToken();
+    if (newToken) headers["Authorization"] = `Bearer ${newToken}`;
+    res = await fetch(`${BASE}${path}`, { headers });
+  }
+  if (!res.ok) {
+    // Errors on this endpoint are JSON and carry the actionable detail — the
+    // real row count when an export is refused as too large, for instance.
+    const data = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new Error(data.error || `export failed: ${res.status}`);
+  }
+
+  const filename = filenameFromDisposition(res.headers.get("Content-Disposition"), fallbackName);
+  const rows = Number(res.headers.get("X-Sentinel-Export-Rows") ?? 0);
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  return { filename, rows };
 }
 
 export const api = {
@@ -399,6 +746,15 @@ export const api = {
       apiFetch<{ ok: boolean; status: string }>(`/sites/${id}/status`, {
         method: "PATCH", body: JSON.stringify({ status }),
       }),
+    /** Dry-run a site configuration.
+     *
+     * Runs the same conversion the config sync runs, so a green result means the
+     * site will actually reach the proxy rather than silently vanish at sync
+     * time. Pass site_id to validate a partial update against the stored site. */
+    validate: (body: Record<string, unknown>) =>
+      apiFetch<{ valid: boolean; problems: SiteConfigProblem[]; resolved: { name: string; domains: string[] } }>(
+        "/sites/validate", { method: "POST", body: JSON.stringify(body) }),
+
     /** Add (or update) a rule exclusion on a site — learning-report tuning.
      *  Omit exclude_targets to disable the whole rule (the common case). */
     addExclusion: (id: string, body: { rule_id: number; exclude_targets?: string[]; disable?: boolean }) =>
@@ -430,9 +786,23 @@ export const api = {
     list:   () => apiFetch<{ rules: Rule[]; tenant_id: string }>("/rules"),
     create: (body: Partial<Rule>) =>
       apiFetch<{ rule: Rule }>("/rules", { method: "POST", body: JSON.stringify(body) }),
+    /** Enable/disable only. PATCH is a full partial-update now, so the toggle
+     *  lives on its own route to keep the two intentions apart. */
     toggle: (id: string, enabled: boolean) =>
       apiFetch<{ ok: boolean; id: string; enabled: boolean }>(
-        `/rules/${id}`, { method: "PATCH", body: JSON.stringify({ enabled }) }
+        `/rules/${id}/enabled`, { method: "PUT", body: JSON.stringify({ enabled }) }
+      ),
+    /** Partial update. An omitted field is left alone. A dsl change is validated
+     *  against the real engine and refused if it would not run — so a failed call
+     *  here means the EXISTING rule is still in place, not that it was replaced
+     *  with something broken. */
+    update: (id: string, body: {
+      dsl?: string; severity?: string; phase?: number;
+      tags?: string[]; enabled?: boolean;
+      site_id?: string; clear_site_id?: boolean;
+    }) =>
+      apiFetch<{ rule: Rule; warning?: string }>(
+        `/rules/${id}`, { method: "PATCH", body: JSON.stringify(body) }
       ),
     delete: (id: string) =>
       apiFetch<{ ok: boolean }>(`/rules/${id}`, { method: "DELETE" }),
@@ -494,7 +864,23 @@ export const api = {
   },
 
   plugins: {
-    list: () => apiFetch<{ plugins: unknown[]; tenant_id: string }>("/plugins"),
+    list: () =>
+      apiFetch<{ plugins: Plugin[]; tenant_id?: string; database?: boolean }>("/plugins"),
+    /** Install (or upgrade) from a .zip containing sentinel-plugin.toml + the module. */
+    upload: (file: File) => {
+      const form = new FormData();
+      form.append("file", file);
+      return apiUpload<{ plugin: Plugin; note?: string }>("/plugins", form);
+    },
+    setEnabled: (name: string, enabled: boolean) =>
+      apiFetch<{ name: string; enabled: boolean; note?: string }>(
+        `/plugins/${encodeURIComponent(name)}`,
+        { method: "PATCH", body: JSON.stringify({ enabled }) },
+      ),
+    remove: (name: string) =>
+      apiFetch<{ deleted: string }>(`/plugins/${encodeURIComponent(name)}`, {
+        method: "DELETE",
+      }),
   },
 
   cluster: {
@@ -502,10 +888,31 @@ export const api = {
       apiFetch<{ enabled: boolean; leader?: string; status?: { node_id?: string; state?: string; peers?: unknown[] } }>(
         "/cluster/status"
       ),
+    /** Fleet-wide health roll-up: data-plane nodes + control-plane (Raft) quorum. */
+    health: () => apiFetch<ClusterHealth>("/cluster/health"),
   },
 
   audit: {
     list: () => apiFetch<{ entries: AuditEntry[]; tenant_id: string }>("/audit"),
+  },
+
+  /** Configuration rollback points.
+   *
+   * The control plane has been writing a snapshot before every site mutation
+   * since config_versions landed, and exposing list + rollback endpoints, with
+   * no client ever calling them — the storage cost was already being paid for a
+   * feature nobody could reach. "What happens when a config change breaks
+   * production" is the first question an enterprise buyer asks. */
+  config: {
+    versions: (limit?: number) =>
+      apiFetch<{ versions: ConfigVersionSummary[] }>(
+        `/config/versions${limit ? `?limit=${limit}` : ""}`),
+    /** Restore a snapshot. Returns what it could and could not put back:
+     *  sites created after the snapshot are left alone, sites deleted since are
+     *  not re-created — both surfaced in `skipped` and `note`. */
+    rollback: (id: number) =>
+      apiFetch<{ restored_sites: number; skipped: string[]; version_id: number; note: string }>(
+        `/config/versions/${id}/rollback`, { method: "POST" }),
   },
 
   waf: {
@@ -600,6 +1007,40 @@ export const api = {
     facets: (column: string, from?: number, to?: number, limit = 10) =>
       apiFetch<{ facets: { key: string; count: number }[]; column: string; clickhouse: boolean }>(
         `/events/facets?column=${encodeURIComponent(column)}&${eventQS({ from, to })}&limit=${limit}`),
+    /** Top source IPs by WAF-event volume, each with blocked count + country.
+     *  ClickHouse-backed; returns `clickhouse:false` + empty list when the event
+     *  store is not configured. */
+    topAttackers: (limit = 8, from?: number, to?: number) =>
+      apiFetch<{ attackers: Attacker[]; clickhouse: boolean }>(
+        `/events/top-attackers?${eventQS({ from, to, limit })}`),
+    /** Threat-detection trend: waf_events bucketed by time + severity band.
+     *  ClickHouse-backed; empty + `clickhouse:false` when the store is off. */
+    severityTimeline: (from?: number, to?: number, bucket = 60) =>
+      apiFetch<{ buckets: SeverityBucket[]; clickhouse: boolean }>(
+        `/events/severity-timeline?${eventQS({ from, to })}&bucket=${bucket}`),
+    /** Download the current ad-hoc view as a file. Streams the FULL match set
+     *  from the server, not the rows the table happens to have loaded. */
+    exportDownload: (f: EventQuery, format: ExportFormat = "csv") =>
+      downloadExport(`/events/export?${eventQS({ ...f, format })}`, `waf-events.${format}`),
+  },
+
+  /** Saved per-application log views + the export handed to a customer. */
+  logProfiles: {
+    list: () => apiFetch<{ profiles: LogProfile[] }>("/logs/profiles"),
+    create: (body: LogProfileInput) =>
+      apiFetch<{ profile: LogProfile }>("/logs/profiles", { method: "POST", body: JSON.stringify(body) }),
+    update: (id: string, body: LogProfileInput) =>
+      apiFetch<{ profile: LogProfile }>(`/logs/profiles/${encodeURIComponent(id)}`, {
+        method: "PUT", body: JSON.stringify(body),
+      }),
+    remove: (id: string) =>
+      apiFetch<{ deleted: boolean }>(`/logs/profiles/${encodeURIComponent(id)}`, { method: "DELETE" }),
+    /** Export a saved profile over an explicit window. The profile supplies
+     *  WHICH events, from/to supply WHEN — that split is the point. */
+    exportDownload: (id: string, from: number, to: number, format: ExportFormat) =>
+      downloadExport(
+        `/logs/profiles/${encodeURIComponent(id)}/export?${eventQS({ from, to, format })}`,
+        `waf-events.${format}`),
   },
 
   threatIntel: {

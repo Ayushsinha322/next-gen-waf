@@ -1,0 +1,170 @@
+# =============================================================================
+# Sentinel WAF — Kubernetes backup CronJobs (namespace: sentinel)
+#
+#   pg-backup      02:30  pg_dump (custom format)        -> PVC /backup/postgres/
+#   ch-backup      02:45  per-table schema + Native data -> PVC /backup/clickhouse/
+#   offsite-sync   03:15  rclone copy PVC                -> offsite, then prune >14d
+#
+# Reuses the cluster's existing config: ConfigMap `sentinel-env`
+# (POSTGRES_DB/USER, CLICKHOUSE_DB/USER) and Secret `sentinel-secrets`
+# (POSTGRES_PASSWORD, CLICKHOUSE_PASSWORD). Services `postgres` / `clickhouse`.
+#
+# Apply:  kubectl apply -f deploy/backup/k8s-backup-cronjob.yaml
+# Restore in k8s: `kubectl exec` into the postgres/clickhouse pod and run the
+# same pg_restore / INSERT ... FORMAT Native steps as RUNBOOK.md, reading the
+# dump from the sentinel-backup PVC (mount it in a throwaway pod).
+# =============================================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sentinel-backup
+  namespace: sentinel
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 20Gi
+---
+# rclone remote config. Replace the stub with a real rclone.conf (base64 or
+# stringData) BEFORE relying on offsite. `kubectl create secret generic
+# sentinel-backup-rclone --from-file=rclone.conf=~/.config/rclone/rclone.conf -n sentinel`
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sentinel-backup-rclone
+  namespace: sentinel
+type: Opaque
+stringData:
+  rclone.conf: |
+    # [offsite]
+    # type = s3
+    # provider = ...
+    # access_key_id = ...
+    # secret_access_key = ...
+  remote-path: "offsite:sentinel-backups"   # <rclone-remote>:<bucket/path>
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: pg-backup
+  namespace: sentinel
+spec:
+  schedule: "30 2 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: Never
+          securityContext: { runAsUser: 999, fsGroup: 999 }
+          containers:
+            - name: pg-backup
+              image: postgres:16-alpine
+              env:
+                - { name: POSTGRES_USER, valueFrom: { configMapKeyRef: { name: sentinel-env, key: POSTGRES_USER } } }
+                - { name: POSTGRES_DB,   valueFrom: { configMapKeyRef: { name: sentinel-env, key: POSTGRES_DB } } }
+                - { name: PGPASSWORD,    valueFrom: { secretKeyRef:   { name: sentinel-secrets, key: POSTGRES_PASSWORD } } }
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  TS=$(date -u +%Y%m%dT%H%M%SZ)
+                  OUT=/backup/postgres; mkdir -p "$OUT"
+                  echo "pg_dump -> $OUT/$TS.dump"
+                  pg_dump -h postgres -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc -f "$OUT/$TS.dump"
+                  test -s "$OUT/$TS.dump"
+                  ln -sf "$TS.dump" "$OUT/latest.dump"
+                  echo "OK"
+              volumeMounts:
+                - { name: backup, mountPath: /backup }
+          volumes:
+            - name: backup
+              persistentVolumeClaim: { claimName: sentinel-backup }
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ch-backup
+  namespace: sentinel
+spec:
+  schedule: "45 2 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: ch-backup
+              image: clickhouse/clickhouse-server:24-alpine
+              env:
+                - { name: CLICKHOUSE_USER, valueFrom: { configMapKeyRef: { name: sentinel-env, key: CLICKHOUSE_USER } } }
+                - { name: CLICKHOUSE_DB,   valueFrom: { configMapKeyRef: { name: sentinel-env, key: CLICKHOUSE_DB } } }
+                - { name: CLICKHOUSE_PASSWORD, valueFrom: { secretKeyRef: { name: sentinel-secrets, key: CLICKHOUSE_PASSWORD } } }
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  TS=$(date -u +%Y%m%dT%H%M%SZ)
+                  OUT=/backup/clickhouse/$TS; mkdir -p "$OUT"
+                  CC="clickhouse-client --host clickhouse -u $CLICKHOUSE_USER --password $CLICKHOUSE_PASSWORD"
+                  TABLES=$($CC --param_db="$CLICKHOUSE_DB" -q "SELECT name FROM system.tables WHERE database={db:String} AND engine NOT LIKE '%View%' AND engine NOT LIKE '%Dictionary%' ORDER BY name FORMAT TabSeparated")
+                  echo "$TABLES" > "$OUT/TABLES.txt"
+                  for t in $TABLES; do
+                    [ -n "$t" ] || continue
+                    echo "  table $t"
+                    $CC -q "SHOW CREATE TABLE $CLICKHOUSE_DB.\`$t\`" | sed 's/\\n/\n/g' > "$OUT/$t.schema.sql"
+                    $CC -q "SELECT * FROM $CLICKHOUSE_DB.\`$t\` FORMAT Native" | gzip > "$OUT/$t.native.gz"
+                  done
+                  ln -sfn "$TS" /backup/clickhouse/latest
+                  echo "OK"
+              volumeMounts:
+                - { name: backup, mountPath: /backup }
+          volumes:
+            - name: backup
+              persistentVolumeClaim: { claimName: sentinel-backup }
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: offsite-sync
+  namespace: sentinel
+spec:
+  schedule: "15 3 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: offsite-sync
+              image: rclone/rclone:latest
+              env:
+                - { name: REMOTE, valueFrom: { secretKeyRef: { name: sentinel-backup-rclone, key: remote-path } } }
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  echo "rclone copy /backup -> $REMOTE"
+                  rclone --config /cfg/rclone.conf copy --checksum /backup "$REMOTE"
+                  echo "pruning local backups older than 14 days"
+                  find /backup -mindepth 2 -maxdepth 2 -mtime +14 -exec rm -rf {} + 2>/dev/null || true
+                  echo "OK"
+              volumeMounts:
+                - { name: backup, mountPath: /backup }
+                - { name: rclone-cfg, mountPath: /cfg, readOnly: true }
+          volumes:
+            - name: backup
+              persistentVolumeClaim: { claimName: sentinel-backup }
+            - name: rclone-cfg
+              secret: { secretName: sentinel-backup-rclone, items: [ { key: rclone.conf, path: rclone.conf } ] }

@@ -1,0 +1,43 @@
+=== s0-baseline-origin ===
+Requests      [total, rate, throughput]         338345, 16916.55, 16915.93
+Duration      [total, attack, wait]             20.002s, 20.001s, 731.287µs
+Latencies     [min, mean, 50, 90, 95, 99, max]  233.73µs, 3.255ms, 3.007ms, 5.596ms, 6.427ms, 8.216ms, 33.973ms
+Bytes In      [total, mean]                     303157120, 896.00
+Bytes Out     [total, mean]                     0, 0.00
+Success       [ratio]                           100.00%
+Status Codes  [code:count]                      200:338345  
+Error Set:
+
+=== s1-waf-clean ===
+Requests      [total, rate, throughput]         158937, 7946.15, 7944.67
+Duration      [total, attack, wait]             20.005s, 20.002s, 3.713ms
+Latencies     [min, mean, 50, 90, 95, 99, max]  967.112µs, 7.237ms, 6.941ms, 10.918ms, 12.222ms, 15.02ms, 43.98ms
+Bytes In      [total, mean]                     142407552, 896.00
+Bytes Out     [total, mean]                     0, 0.00
+Success       [ratio]                           100.00%
+Status Codes  [code:count]                      200:158937  
+Error Set:
+
+=== s2-waf-mixed ===
+Requests      [total, rate, throughput]         451478, 22574.09, 1.50
+Duration      [total, attack, wait]             20.001s, 20s, 1.372ms
+Latencies     [min, mean, 50, 90, 95, 99, max]  179.127µs, 2.525ms, 2.337ms, 4.401ms, 5.108ms, 6.535ms, 12.276ms
+Bytes In      [total, mean]                     52846393, 117.05
+Bytes Out     [total, mean]                     0, 0.00
+Success       [ratio]                           0.01%
+Status Codes  [code:count]                      200:30  403:451445  404:3  
+Error Set:
+403 Forbidden
+404 Not Found
+
+=== s3-waf-attack ===
+Requests      [total, rate, throughput]         430612, 21530.74, 0.00
+Duration      [total, attack, wait]             20s, 20s, 554.643µs
+Latencies     [min, mean, 50, 90, 95, 99, max]  189.697µs, 2.663ms, 2.465ms, 4.62ms, 5.326ms, 6.761ms, 12.602ms
+Bytes In      [total, mean]                     50381604, 117.00
+Bytes Out     [total, mean]                     0, 0.00
+Success       [ratio]                           0.00%
+Status Codes  [code:count]                      403:430612  
+Error Set:
+403 Forbidden
+

@@ -107,6 +107,43 @@ static PATTERNS: Lazy<CompiledPatterns> = Lazy::new(|| CompiledPatterns {
         .collect(),
 });
 
+impl CompiledPatterns {
+    /// Return the display name of the first matching known-attacker pattern.
+    fn match_attacker(&self, user_agent: &str) -> Option<String> {
+        self.attackers
+            .iter()
+            .find(|(re, _)| re.is_match(user_agent))
+            .map(|(_, name)| name.clone())
+    }
+
+    /// Return the display name of the first matching known-good bot pattern.
+    fn match_good_bot(&self, user_agent: &str) -> Option<String> {
+        self.good_bots
+            .iter()
+            .find(|(re, _)| re.is_match(user_agent))
+            .map(|(_, name)| name.clone())
+    }
+}
+
+/// Generic "bot-like" lexical hints in a User-Agent string.
+///
+/// Shared by [`BotDetector::classify`] and [`BotDetector::score`] so the
+/// substring list lives in exactly one place.
+fn is_botlike_ua(user_agent: &str) -> bool {
+    let ua_lower = user_agent.to_ascii_lowercase();
+    ua_lower.contains("bot")
+        || ua_lower.contains("spider")
+        || ua_lower.contains("crawler")
+        || ua_lower.contains("scraper")
+        || ua_lower.contains("fetcher")
+        || ua_lower.contains("scanner")
+        || ua_lower.contains("wget")
+        || ua_lower.contains("libwww")
+        || ua_lower.contains("python-urllib")
+        || ua_lower.contains("java/")
+        || ua_lower.contains("go-http-client")
+}
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -125,6 +162,73 @@ pub enum BotVerdict {
     SuspiciousBot,
     /// Request requires a browser challenge (CAPTCHA / PoW) before forwarding.
     Challenge,
+}
+
+// ---------------------------------------------------------------------------
+// Weighted bot score (issue #8)
+// ---------------------------------------------------------------------------
+
+/// Per-request signals fed into the weighted [`BotDetector::score`] model.
+///
+/// The struct borrows its string fields so the caller can build it cheaply
+/// from the parsed request headers without allocating.
+pub struct BotSignals<'a> {
+    /// Value of the `User-Agent` header (may be empty).
+    pub user_agent: &'a str,
+    /// JA4 TLS fingerprint captured during the handshake, if available.
+    pub ja4: Option<&'a str>,
+    /// Whether the request carried an `Accept` header.
+    pub has_accept: bool,
+    /// Whether the request carried an `Accept-Language` header (browsers always
+    /// send it; most bots do not).
+    pub has_accept_language: bool,
+    /// Correlation-engine repeat-offender bonus (expected 0 / 3 / 8).
+    pub recent_block_score: u32,
+}
+
+/// Enforcement tier derived from the weighted bot score.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BotTier {
+    /// Forward the request untouched.
+    Allow,
+    /// Serve a transparent JavaScript proof-of-work challenge.
+    JsChallenge,
+    /// Serve an interactive CAPTCHA challenge.
+    Captcha,
+    /// Hard-block the request.
+    Block,
+}
+
+/// Result of the weighted bot-scoring model.
+///
+/// `score` is a saturating 0–100 value; `tier` is derived from it. `reasons`
+/// holds one short string per signal that fired, for logging / audit.
+pub struct BotScore {
+    /// Weighted bot score, capped at 100.
+    pub score: u8,
+    /// Enforcement tier derived from `score`.
+    pub tier: BotTier,
+    /// True only for a good-bot whose claim has been positively verified
+    /// (e.g. via reverse DNS). Currently always false — see [`BotDetector::score`].
+    pub verified_good_bot: bool,
+    /// One short reason string per signal that contributed.
+    pub reasons: Vec<String>,
+}
+
+/// Map a saturated 0–100 bot score to its enforcement tier.
+///
+/// Thresholds (inclusive lower bounds): ≥ 70 → `Block`, 40–69 → `Captcha`,
+/// 25–39 → `JsChallenge`, else `Allow`.
+fn tier_for_score(score: u8) -> BotTier {
+    if score >= 70 {
+        BotTier::Block
+    } else if score >= 40 {
+        BotTier::Captcha
+    } else if score >= 25 {
+        BotTier::JsChallenge
+    } else {
+        BotTier::Allow
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -177,17 +281,13 @@ impl BotDetector {
         }
 
         // 2. Known attack tools (UA-based).
-        for (re, name) in &patterns.attackers {
-            if re.is_match(user_agent) {
-                return BotVerdict::KnownAttacker(name.clone());
-            }
+        if let Some(name) = patterns.match_attacker(user_agent) {
+            return BotVerdict::KnownAttacker(name);
         }
 
         // 3. Known-good search crawlers.
-        for (re, name) in &patterns.good_bots {
-            if re.is_match(user_agent) {
-                return BotVerdict::GoodBot(name.clone());
-            }
+        if let Some(name) = patterns.match_good_bot(user_agent) {
+            return BotVerdict::GoodBot(name);
         }
 
         // 4. Empty or whitespace-only UA — almost certainly a bot or scanner.
@@ -196,23 +296,107 @@ impl BotDetector {
         }
 
         // 5. Generic bot-like lexical hints in the UA string.
-        let ua_lower = user_agent.to_ascii_lowercase();
-        if ua_lower.contains("bot")
-            || ua_lower.contains("spider")
-            || ua_lower.contains("crawler")
-            || ua_lower.contains("scraper")
-            || ua_lower.contains("fetcher")
-            || ua_lower.contains("scanner")
-            || ua_lower.contains("wget")
-            || ua_lower.contains("libwww")
-            || ua_lower.contains("python-urllib")
-            || ua_lower.contains("java/")
-            || ua_lower.contains("go-http-client")
-        {
+        if is_botlike_ua(user_agent) {
             return BotVerdict::SuspiciousBot;
         }
 
         BotVerdict::Human
+    }
+
+    /// Weighted 0–100 bot score with an enforcement tier (issue #8).
+    ///
+    /// Unlike [`classify`](Self::classify) — which returns a single categorical
+    /// verdict — this combines several independent signals additively so a
+    /// borderline request accumulates evidence before being challenged. The
+    /// score saturates at 100 and each contributing signal pushes a short
+    /// reason string.
+    ///
+    /// Signals and weights:
+    /// * good-bot UA **with a non-malicious JA4** → early return, score 0,
+    ///   tier `Allow` (unverified). A good-bot UA riding a *malicious* JA4 does
+    ///   NOT short-circuit and instead falls through to full scoring below;
+    /// * malicious JA4 → +45;
+    /// * known-attacker UA → +40, else empty UA → +30, else bot-like UA → +20;
+    /// * missing both `Accept` and `Accept-Language` → +20, else missing
+    ///   `Accept-Language` only → +8;
+    /// * repeat offender (`recent_block_score` ≥ 8 → +20, ≥ 3 → +10).
+    ///
+    /// Tier thresholds: ≥ 70 `Block`, 40–69 `Captcha`, 25–39 `JsChallenge`,
+    /// else `Allow`.
+    pub fn score(&self, sig: &BotSignals) -> BotScore {
+        let patterns = &*PATTERNS;
+
+        // A malicious JA4 fingerprint cannot be spoofed by the UA, so resolve
+        // it up front — it must override any good-bot UA claim (this mirrors
+        // the JA4-first precedence in `classify`). Looked up once, reused below.
+        let bad_ja4_tool: Option<&String> = sig.ja4.and_then(|fp| self.malicious_ja4.get(fp));
+
+        // Good-bot UA is allowed outright — but ONLY when its TLS fingerprint
+        // is not on the malicious list. A spoofed "Googlebot" UA riding a
+        // known-bad JA4 (e.g. sqlmap's TLS stack) must NOT short-circuit here;
+        // it falls through to full scoring. `verified_good_bot` stays false
+        // because we have not yet confirmed the claim.
+        //
+        // TODO(issue #8 follow-up): reverse-DNS verify the good-bot claim
+        // (PTR + forward-confirmed A/AAAA) before trusting it, and set
+        // `verified_good_bot: true` only on success.
+        if bad_ja4_tool.is_none() && patterns.match_good_bot(sig.user_agent).is_some() {
+            return BotScore {
+                score: 0,
+                tier: BotTier::Allow,
+                verified_good_bot: false,
+                reasons: vec!["good-bot-ua (unverified)".to_string()],
+            };
+        }
+
+        let mut score: u32 = 0;
+        let mut reasons: Vec<String> = Vec::new();
+
+        // Malicious JA4 fingerprint (additive; cannot be spoofed via the UA).
+        if let Some(tool) = bad_ja4_tool {
+            score += 45;
+            reasons.push(format!("ja4-bad:{tool}"));
+        }
+
+        // UA classification — mutually exclusive categories, highest first.
+        if let Some(name) = patterns.match_attacker(sig.user_agent) {
+            score += 40;
+            reasons.push(format!("attacker-ua:{name}"));
+        } else if sig.user_agent.trim().is_empty() {
+            score += 30;
+            reasons.push("empty-ua".to_string());
+        } else if is_botlike_ua(sig.user_agent) {
+            score += 20;
+            reasons.push("botlike-ua".to_string());
+        }
+
+        // Browser-header heuristics.
+        if !sig.has_accept && !sig.has_accept_language {
+            score += 20;
+            reasons.push("no-browser-headers".to_string());
+        } else if !sig.has_accept_language {
+            score += 8;
+            reasons.push("no-accept-language".to_string());
+        }
+
+        // Correlation-engine repeat-offender bonus.
+        if sig.recent_block_score >= 8 {
+            score += 20;
+            reasons.push("repeat-offender".to_string());
+        } else if sig.recent_block_score >= 3 {
+            score += 10;
+            reasons.push("repeat-offender".to_string());
+        }
+
+        let score = score.min(100) as u8;
+        let tier = tier_for_score(score);
+
+        BotScore {
+            score,
+            tier,
+            verified_good_bot: false,
+            reasons,
+        }
     }
 
     /// Convenience: should this verdict result in a hard block?
@@ -346,5 +530,177 @@ mod tests {
             det().classify(ua, None),
             BotVerdict::KnownAttacker(_)
         ));
+    }
+
+    // -- Weighted bot score (issue #8) --------------------------------------
+
+    #[test]
+    fn score_real_browser_allows() {
+        let sig = BotSignals {
+            user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                         (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            ja4: None,
+            has_accept: true,
+            has_accept_language: true,
+            recent_block_score: 0,
+        };
+        let r = det().score(&sig);
+        assert_eq!(r.score, 0, "reasons: {:?}", r.reasons);
+        assert_eq!(r.tier, BotTier::Allow);
+        assert!(!r.verified_good_bot);
+    }
+
+    #[test]
+    fn score_sqlmap_ja4_blocks() {
+        // Real sqlmap request: bad JA4 (+45) + attacker UA (+40) + no
+        // browser headers (+20) → saturates → Block.
+        let sig = BotSignals {
+            user_agent: "sqlmap/1.8.3#stable (https://sqlmap.org)",
+            ja4: Some("t13d1715h2_4b8e96bdf8c2_0c5ec3ea4b74"),
+            has_accept: false,
+            has_accept_language: false,
+            recent_block_score: 0,
+        };
+        let r = det().score(&sig);
+        assert!(r.score >= 45, "score was {} ({:?})", r.score, r.reasons);
+        assert_eq!(r.tier, BotTier::Block);
+        assert!(r.reasons.iter().any(|s| s.starts_with("ja4-bad:")));
+    }
+
+    #[test]
+    fn score_empty_ua_missing_headers_challenges() {
+        // empty-ua (+30) + no-browser-headers (+20) = 50 → Captcha.
+        let sig = BotSignals {
+            user_agent: "   ",
+            ja4: None,
+            has_accept: false,
+            has_accept_language: false,
+            recent_block_score: 0,
+        };
+        let r = det().score(&sig);
+        assert!(
+            matches!(r.tier, BotTier::Captcha | BotTier::Block),
+            "tier was {:?} (score {})",
+            r.tier,
+            r.score
+        );
+    }
+
+    #[test]
+    fn score_good_bot_allows() {
+        let sig = BotSignals {
+            user_agent: "Mozilla/5.0 (compatible; Googlebot/2.1; \
+                         +http://www.google.com/bot.html)",
+            ja4: None,
+            has_accept: false,
+            has_accept_language: false,
+            recent_block_score: 8,
+        };
+        let r = det().score(&sig);
+        // Early return wins over every other signal.
+        assert_eq!(r.score, 0);
+        assert_eq!(r.tier, BotTier::Allow);
+        assert!(!r.verified_good_bot);
+        assert_eq!(r.reasons, vec!["good-bot-ua (unverified)".to_string()]);
+    }
+
+    #[test]
+    fn score_borderline_botlike_only_stays_allow() {
+        // Only the bot-like UA hit (+20); browser headers present, no repeat.
+        // 20 < 25, so the JsChallenge tier must NOT trigger.
+        let sig = BotSignals {
+            user_agent: "MyCoolScraper/1.0",
+            ja4: None,
+            has_accept: true,
+            has_accept_language: true,
+            recent_block_score: 0,
+        };
+        let r = det().score(&sig);
+        assert_eq!(r.score, 20, "reasons: {:?}", r.reasons);
+        assert_eq!(r.tier, BotTier::Allow);
+        assert!(r.reasons.iter().any(|s| s == "botlike-ua"));
+    }
+
+    #[test]
+    fn tier_boundaries_exact_edges() {
+        // Directly exercise every threshold edge in the spec:
+        // >=70 Block, 40..=69 Captcha, 25..=39 JsChallenge, else Allow.
+        use BotTier::*;
+        assert_eq!(tier_for_score(0), Allow);
+        assert_eq!(tier_for_score(24), Allow); // upper edge of Allow
+        assert_eq!(tier_for_score(25), JsChallenge); // lower edge of JsChallenge
+        assert_eq!(tier_for_score(39), JsChallenge); // upper edge of JsChallenge
+        assert_eq!(tier_for_score(40), Captcha); // lower edge of Captcha
+        assert_eq!(tier_for_score(69), Captcha); // upper edge of Captcha
+        assert_eq!(tier_for_score(70), Block); // lower edge of Block
+        assert_eq!(tier_for_score(100), Block); // saturated
+    }
+
+    #[test]
+    fn score_spoofed_good_bot_bad_ja4_not_allowed() {
+        // Attacker spoofs a Googlebot UA but rides sqlmap's TLS stack. The
+        // unspoofable malicious JA4 must override the good-bot UA claim, so the
+        // request must NOT be allowed (regression for the good-bot early-return
+        // precedence bug).
+        let sig = BotSignals {
+            user_agent: "Mozilla/5.0 (compatible; Googlebot/2.1; \
+                         +http://www.google.com/bot.html)",
+            ja4: Some("t13d1715h2_4b8e96bdf8c2_0c5ec3ea4b74"),
+            has_accept: true,
+            has_accept_language: true,
+            recent_block_score: 0,
+        };
+        let r = det().score(&sig);
+        assert_ne!(
+            r.tier,
+            BotTier::Allow,
+            "spoofed good-bot UA with a malicious JA4 must not be allowed (score {}, reasons {:?})",
+            r.score,
+            r.reasons
+        );
+        assert!(
+            r.reasons.iter().any(|s| s.starts_with("ja4-bad:")),
+            "expected ja4-bad reason, got {:?}",
+            r.reasons
+        );
+    }
+
+    #[test]
+    fn score_tier_boundaries() {
+        // Exercise every threshold edge directly through the tier mapping by
+        // constructing scores via known signal combinations.
+
+        // 25 → JsChallenge: empty-ua (30) alone is 30 (JsChallenge band 25..=39).
+        let js = det().score(&BotSignals {
+            user_agent: "",
+            ja4: None,
+            has_accept: true, // present → no header bonus
+            has_accept_language: true,
+            recent_block_score: 0,
+        });
+        assert_eq!(js.score, 30);
+        assert_eq!(js.tier, BotTier::JsChallenge);
+
+        // 40 → Captcha: attacker-ua (40) alone.
+        let cap = det().score(&BotSignals {
+            user_agent: "sqlmap/1.8",
+            ja4: None,
+            has_accept: true,
+            has_accept_language: true,
+            recent_block_score: 0,
+        });
+        assert_eq!(cap.score, 40);
+        assert_eq!(cap.tier, BotTier::Captcha);
+
+        // 70 → Block: attacker-ua (40) + no-browser-headers (20) + repeat (10).
+        let block = det().score(&BotSignals {
+            user_agent: "nikto/2.1.6",
+            ja4: None,
+            has_accept: false,
+            has_accept_language: false,
+            recent_block_score: 3,
+        });
+        assert_eq!(block.score, 70);
+        assert_eq!(block.tier, BotTier::Block);
     }
 }

@@ -93,12 +93,57 @@ impl Gauge {
     }
 }
 
-/// A histogram that records `f64` samples and can compute percentiles.
+/// Upper bounds (inclusive, "le") of the latency buckets, in milliseconds.
+///
+/// Chosen to span a WAF's realistic range: sub-millisecond fast paths through to
+/// multi-second upstream stalls. Everything above the last bound lands in the
+/// overflow bucket.
+const HISTOGRAM_BOUNDS: [f64; 15] = [
+    0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10_000.0,
+    30_000.0,
+];
+
+/// Number of counters: one per bound plus an overflow bucket for +Inf.
+const HISTOGRAM_BUCKETS: usize = HISTOGRAM_BOUNDS.len() + 1;
+
+/// Fixed-point scale for the running sum. `sum` has to be atomic and there is no
+/// stable `AtomicF64`, so observations are accumulated as micro-units of the
+/// recorded value (milliseconds here) and converted back on read.
+const SUM_SCALE: f64 = 1_000.0;
+
+struct HistogramInner {
+    buckets: [AtomicU64; HISTOGRAM_BUCKETS],
+    count: AtomicU64,
+    /// Sum of observations in micro-units (see [`SUM_SCALE`]).
+    sum_scaled: AtomicU64,
+}
+
+/// A lock-free histogram over fixed buckets, with percentile estimation.
+///
+/// The previous implementation kept every observation in a `Mutex<Vec<f64>>`. That
+/// had three separate problems, all on the hot path:
+///
+///  1. Every single request took a process-wide mutex just to record its latency,
+///     serializing all worker threads through one cache line and capping
+///     multi-core scaling regardless of core count.
+///  2. The `Vec` was never drained, so it grew without bound for the lifetime of
+///     the process — an unbounded memory leak proportional to total requests
+///     served.
+///  3. `percentile()` sorted that ever-growing `Vec` **while holding the lock**,
+///     and a single `/metrics` scrape called it three times plus `count()` and
+///     `sum()` — five lock acquisitions and three full sorts, each O(n log n) in
+///     total requests ever served, blocking every request in flight.
+///
+/// Recording is now a couple of relaxed atomic adds into a fixed-size array, so
+/// memory is constant and threads never block each other. Percentiles are
+/// estimated by interpolating within the bucket that contains the target rank —
+/// the same approach as Prometheus `histogram_quantile`, accurate to the bucket
+/// width rather than exact.
 #[derive(Clone)]
 pub struct Histogram {
     name: String,
     help: String,
-    samples: Arc<Mutex<Vec<f64>>>,
+    inner: Arc<HistogramInner>,
 }
 
 impl Histogram {
@@ -106,40 +151,103 @@ impl Histogram {
         Self {
             name: name.into(),
             help: help.into(),
-            samples: Arc::new(Mutex::new(Vec::new())),
+            inner: Arc::new(HistogramInner {
+                buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+                count: AtomicU64::new(0),
+                sum_scaled: AtomicU64::new(0),
+            }),
         }
     }
 
-    /// Record a single observation.
-    pub fn observe(&self, value: f64) {
-        let mut s = self.samples.lock().expect("histogram poisoned");
-        s.push(value);
+    /// Index of the bucket a value falls into.
+    fn bucket_of(value: f64) -> usize {
+        // NaN would compare false against every bound; treat it as overflow rather
+        // than silently landing in bucket 0 and skewing low percentiles.
+        if value.is_nan() {
+            return HISTOGRAM_BUCKETS - 1;
+        }
+        for (i, bound) in HISTOGRAM_BOUNDS.iter().enumerate() {
+            if value <= *bound {
+                return i;
+            }
+        }
+        HISTOGRAM_BUCKETS - 1
     }
 
-    /// Compute the given percentile (0.0 – 100.0) over all observed samples.
-    /// Returns `None` if no samples have been recorded.
+    /// Record a single observation. Wait-free: two relaxed atomic adds.
+    pub fn observe(&self, value: f64) {
+        self.inner.buckets[Self::bucket_of(value)].fetch_add(1, Ordering::Relaxed);
+        self.inner.count.fetch_add(1, Ordering::Relaxed);
+        // Negative values would wrap the unsigned accumulator; clamp at zero. A
+        // duration is never negative, and a bogus one must not corrupt the sum.
+        let scaled = (value.max(0.0) * SUM_SCALE) as u64;
+        self.inner.sum_scaled.fetch_add(scaled, Ordering::Relaxed);
+    }
+
+    /// Estimate the given percentile (0.0 – 100.0) over all observations.
+    ///
+    /// Returns `None` if nothing has been recorded. The result is interpolated
+    /// within the containing bucket, so it is an estimate bounded by that bucket's
+    /// width — not an exact order statistic.
     pub fn percentile(&self, p: f64) -> Option<f64> {
-        let mut s = self.samples.lock().expect("histogram poisoned");
-        if s.is_empty() {
+        let total = self.inner.count.load(Ordering::Relaxed);
+        if total == 0 {
             return None;
         }
-        s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let idx = ((p / 100.0) * (s.len() as f64 - 1.0)).round() as usize;
-        Some(s[idx])
+        let counts: [u64; HISTOGRAM_BUCKETS] =
+            std::array::from_fn(|i| self.inner.buckets[i].load(Ordering::Relaxed));
+
+        // Rank of the target observation, 0-based, matching the previous
+        // implementation's indexing so callers see comparable values.
+        let target = ((p.clamp(0.0, 100.0) / 100.0) * (total as f64 - 1.0)).round() as u64;
+
+        let mut cumulative = 0u64;
+        for (i, &c) in counts.iter().enumerate() {
+            if c == 0 {
+                continue;
+            }
+            if cumulative + c > target {
+                let lower = if i == 0 { 0.0 } else { HISTOGRAM_BOUNDS[i - 1] };
+                // Overflow bucket is unbounded above; report its lower edge, the
+                // only defensible value without retaining raw samples.
+                let upper = match HISTOGRAM_BOUNDS.get(i) {
+                    Some(&u) => u,
+                    None => return Some(lower),
+                };
+                // Linear interpolation across the bucket by position within it.
+                let within = (target - cumulative) as f64 / c as f64;
+                return Some(lower + (upper - lower) * within);
+            }
+            cumulative += c;
+        }
+        // Unreachable while count > 0, but degrade to the top bound rather than
+        // panicking if a concurrent update makes the walk fall through.
+        Some(*HISTOGRAM_BOUNDS.last().unwrap_or(&0.0))
     }
 
     /// Number of observations.
     pub fn count(&self) -> usize {
-        self.samples.lock().expect("histogram poisoned").len()
+        self.inner.count.load(Ordering::Relaxed) as usize
     }
 
     /// Sum of all observations.
     pub fn sum(&self) -> f64 {
-        self.samples
-            .lock()
-            .expect("histogram poisoned")
-            .iter()
-            .sum()
+        self.inner.sum_scaled.load(Ordering::Relaxed) as f64 / SUM_SCALE
+    }
+
+    /// Cumulative bucket counts as `(upper_bound, cumulative_count)` pairs, with
+    /// `f64::INFINITY` for the overflow bucket. This is the real Prometheus
+    /// histogram representation, exposed so `/metrics` can emit `_bucket` lines
+    /// instead of only summary quantiles.
+    pub fn buckets(&self) -> Vec<(f64, u64)> {
+        let mut out = Vec::with_capacity(HISTOGRAM_BUCKETS);
+        let mut cumulative = 0u64;
+        for i in 0..HISTOGRAM_BUCKETS {
+            cumulative += self.inner.buckets[i].load(Ordering::Relaxed);
+            let bound = HISTOGRAM_BOUNDS.get(i).copied().unwrap_or(f64::INFINITY);
+            out.push((bound, cumulative));
+        }
+        out
     }
 }
 
@@ -256,6 +364,29 @@ impl MetricsRegistry {
                 });
             }
 
+            // Emit real cumulative buckets alongside the summary quantiles. The
+            // quantiles above are computed per-process and cannot be averaged
+            // across nodes; `_bucket` lines let Prometheus derive correct
+            // fleet-wide quantiles with histogram_quantile().
+            for (bound, cumulative) in h.buckets() {
+                let mut labels = HashMap::new();
+                labels.insert(
+                    "le".to_owned(),
+                    if bound.is_infinite() {
+                        "+Inf".to_owned()
+                    } else {
+                        format!("{bound}")
+                    },
+                );
+                lines.push(MetricLine {
+                    name: format!("{}_bucket", h.name),
+                    kind: "histogram",
+                    help: h.help.clone(),
+                    value: cumulative.to_string(),
+                    labels,
+                });
+            }
+
             // Also emit _count and _sum.
             lines.push(MetricLine {
                 name: format!("{}_count", h.name),
@@ -320,6 +451,23 @@ struct WafMetrics {
     pub active_connections: Gauge,
     pub rule_hits_total: Counter,
     pub ebpf_drops_total: Counter,
+    /// Connections rejected at accept because the global connection limit was
+    /// saturated (admission control — see `sentinel_proxy` accept loops).
+    pub load_shed_connections_total: Counter,
+    /// Requests shed with 503 because the global in-flight request limit was
+    /// saturated (admission control — bounds HTTP/2 & HTTP/3 stream fan-out).
+    pub load_shed_requests_total: Counter,
+    /// Notable WAF events (blocks / learning-mode DETECTs) that were NOT recorded
+    /// because the in-memory history buffer was full.
+    ///
+    /// Unlike the two counters above, this sheds an AUDIT RECORD rather than a
+    /// request: the request itself was still inspected and still enforced. Under a
+    /// sustained flood every blocked request wants an event row, so the buffer's
+    /// 20k cap is reached and the surplus is dropped to protect memory — correct,
+    /// but it means "events in ClickHouse" understates "attacks blocked" exactly
+    /// when the gap matters most. Non-zero here invalidates any attempt to count
+    /// attacks from `waf_events` for that window.
+    pub history_shed_total: Counter,
     pub registry: MetricsRegistry,
 }
 
@@ -350,6 +498,18 @@ impl WafMetrics {
             "sentinel_ebpf_drops_total",
             "Total number of packets dropped at the kernel XDP layer",
         );
+        let load_shed_connections_total = registry.register_counter(
+            "sentinel_load_shed_connections_total",
+            "Total number of connections rejected at accept due to the connection limit",
+        );
+        let load_shed_requests_total = registry.register_counter(
+            "sentinel_load_shed_requests_total",
+            "Total number of requests shed with 503 due to the in-flight request limit",
+        );
+        let history_shed_total = registry.register_counter(
+            "sentinel_history_shed_total",
+            "Total number of WAF events not recorded because the history buffer was full",
+        );
 
         Self {
             requests_total,
@@ -358,6 +518,9 @@ impl WafMetrics {
             active_connections,
             rule_hits_total,
             ebpf_drops_total,
+            load_shed_connections_total,
+            load_shed_requests_total,
+            history_shed_total,
             registry,
         }
     }
@@ -387,6 +550,45 @@ pub fn observe_duration(ms: f64) {
 /// Set the absolute number of active proxy connections.
 pub fn set_active_connections(n: i64) {
     WAF_METRICS.active_connections.set(n);
+}
+
+/// Increment the live active-connection gauge (call on connection admission).
+pub fn inc_active_connections() {
+    WAF_METRICS.active_connections.inc();
+}
+
+/// Decrement the live active-connection gauge (call when a connection ends).
+pub fn dec_active_connections() {
+    WAF_METRICS.active_connections.dec();
+}
+
+/// Increment the load-shed counter for a connection rejected at accept because
+/// the global connection limit was saturated.
+pub fn inc_load_shed_connections() {
+    WAF_METRICS.load_shed_connections_total.inc();
+}
+
+/// Increment the load-shed counter for a request shed with 503 because the
+/// global in-flight request limit was saturated.
+pub fn inc_load_shed_requests() {
+    WAF_METRICS.load_shed_requests_total.inc();
+}
+
+/// Increment the counter of WAF events dropped because the in-memory history
+/// buffer was full, and return the new total.
+///
+/// Returns the total so the caller can log a rate-limited warning without
+/// keeping a second counter of its own — a silent shed is the thing this exists
+/// to prevent, so it should be visible in logs as well as in `/metrics`.
+pub fn inc_history_shed() -> u64 {
+    WAF_METRICS.history_shed_total.inc();
+    WAF_METRICS.history_shed_total.get()
+}
+
+/// Current total of shed history events. Zero means every block/DETECT in this
+/// process's lifetime reached the buffer.
+pub fn history_shed_total() -> u64 {
+    WAF_METRICS.history_shed_total.get()
 }
 
 /// Increment the rule-hits counter.
@@ -470,5 +672,173 @@ mod tests {
         let text = prometheus_text();
         assert!(text.contains("sentinel_requests_total"));
         assert!(text.contains("sentinel_blocked_total"));
+    }
+
+    #[test]
+    fn load_shed_counters_exposed() {
+        inc_load_shed_connections();
+        inc_load_shed_requests();
+        inc_active_connections();
+        dec_active_connections();
+        let text = prometheus_text();
+        assert!(text.contains("sentinel_load_shed_connections_total"));
+        assert!(text.contains("sentinel_load_shed_requests_total"));
+        assert!(text.contains("sentinel_active_connections"));
+    }
+
+    #[test]
+    fn history_shed_counter_is_exposed_and_monotonic() {
+        // The counter is global and other tests in this binary may have bumped it,
+        // so assert on the DELTA rather than an absolute value.
+        let before = history_shed_total();
+        let a = inc_history_shed();
+        let b = inc_history_shed();
+        assert_eq!(a, before + 1, "inc must return the new total");
+        assert_eq!(b, before + 2, "counter must be monotonic");
+        assert_eq!(history_shed_total(), before + 2);
+        let text = prometheus_text();
+        assert!(text.contains("sentinel_history_shed_total"));
+        assert!(text.contains("# TYPE sentinel_history_shed_total counter"));
+    }
+
+    // ── Lock-free histogram ────────────────────────────────────────────────
+
+    #[test]
+    fn histogram_memory_is_constant_regardless_of_volume() {
+        // The property the old Mutex<Vec<f64>> implementation lacked: it retained
+        // every observation forever, so memory grew with total requests served.
+        let r = MetricsRegistry::new();
+        let h = r.register_histogram("mem", "constant memory");
+        let before = std::mem::size_of_val(&*h.inner);
+        for i in 0..500_000 {
+            h.observe((i % 1000) as f64);
+        }
+        assert_eq!(h.count(), 500_000);
+        assert_eq!(
+            std::mem::size_of_val(&*h.inner),
+            before,
+            "histogram allocated per observation — the leak is back"
+        );
+    }
+
+    #[test]
+    fn histogram_percentiles_are_monotonic_and_bounded() {
+        let r = MetricsRegistry::new();
+        let h = r.register_histogram("p", "percentiles");
+        for i in 1..=1000 {
+            h.observe(i as f64 / 10.0); // 0.1 .. 100.0
+        }
+        let p50 = h.percentile(50.0).unwrap();
+        let p90 = h.percentile(90.0).unwrap();
+        let p99 = h.percentile(99.0).unwrap();
+        assert!(
+            p50 <= p90 && p90 <= p99,
+            "percentiles not monotonic: {p50} {p90} {p99}"
+        );
+        // Estimates are bucket-bounded, so assert the containing bucket rather
+        // than an exact order statistic.
+        assert!((25.0..=50.0).contains(&p50), "p50 {p50} outside its bucket");
+        assert!(
+            (50.0..=100.0).contains(&p90),
+            "p90 {p90} outside its bucket"
+        );
+        assert!(
+            (50.0..=100.0).contains(&p99),
+            "p99 {p99} outside its bucket"
+        );
+    }
+
+    #[test]
+    fn histogram_empty_and_edges() {
+        let r = MetricsRegistry::new();
+        let h = r.register_histogram("edges", "edges");
+        assert_eq!(h.percentile(50.0), None, "empty histogram must report None");
+        assert_eq!(h.count(), 0);
+        assert_eq!(h.sum(), 0.0);
+
+        // Values beyond the top bound land in the overflow bucket and must not
+        // panic or be reported below it.
+        h.observe(1_000_000.0);
+        assert_eq!(h.count(), 1);
+        assert!(h.percentile(99.0).unwrap() >= 30_000.0);
+
+        // NaN must not be treated as the smallest value (which would drag low
+        // percentiles down); it is counted as overflow.
+        h.observe(f64::NAN);
+        assert_eq!(h.count(), 2);
+        assert!(h.percentile(50.0).unwrap() >= 30_000.0);
+    }
+
+    #[test]
+    fn histogram_sum_tracks_observations() {
+        let r = MetricsRegistry::new();
+        let h = r.register_histogram("sum", "sum");
+        for _ in 0..1000 {
+            h.observe(1.5);
+        }
+        assert!((h.sum() - 1500.0).abs() < 1.0, "sum = {}", h.sum());
+
+        // A negative observation must not wrap the unsigned accumulator.
+        h.observe(-5.0);
+        assert!(
+            h.sum() >= 1499.0,
+            "negative value corrupted the sum: {}",
+            h.sum()
+        );
+    }
+
+    #[test]
+    fn histogram_buckets_are_cumulative_and_exposed() {
+        let r = MetricsRegistry::new();
+        let h = r.register_histogram("hist_buckets", "buckets");
+        for v in [0.4, 0.9, 3.0, 40.0, 90_000.0] {
+            h.observe(v);
+        }
+        let buckets = h.buckets();
+        // Cumulative counts must be non-decreasing and end at the total.
+        let mut prev = 0u64;
+        for (_, c) in &buckets {
+            assert!(*c >= prev, "bucket counts not cumulative");
+            prev = *c;
+        }
+        assert_eq!(prev, 5, "final cumulative bucket must equal total count");
+        assert!(
+            buckets.last().unwrap().0.is_infinite(),
+            "missing +Inf bucket"
+        );
+
+        let text = r.prometheus_text();
+        assert!(
+            text.contains("hist_buckets_bucket"),
+            "no _bucket lines emitted"
+        );
+        assert!(text.contains(r#"le="+Inf""#), "no +Inf bucket line");
+    }
+
+    #[test]
+    fn histogram_observe_is_thread_safe_without_a_lock() {
+        // Concurrent recording from many threads must not lose or double-count.
+        // This is the access pattern that previously serialized on one mutex.
+        let r = MetricsRegistry::new();
+        let h = r.register_histogram("concurrent", "concurrent");
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let h = h.clone();
+                std::thread::spawn(move || {
+                    for i in 0..10_000 {
+                        h.observe((i % 100) as f64);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("worker panicked");
+        }
+        assert_eq!(h.count(), 80_000);
+        assert_eq!(
+            h.buckets().last().unwrap().1,
+            80_000,
+            "bucket counts disagree with total — lost updates"
+        );
     }
 }

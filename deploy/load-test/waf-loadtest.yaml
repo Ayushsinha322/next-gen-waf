@@ -1,0 +1,71 @@
+# Sentinel WAF — load-test configuration
+#
+# Purpose: a controlled, reproducible target for measuring the REAL end-to-end
+# throughput/latency the WAF data plane adds, in front of a fast static origin.
+#
+#   load generator ──▶ WAF :18081 ──▶ origin :18080 (nginx static)
+#
+# Deliberately isolated from a live deployment:
+#   * one listener, one site (default_site so the Host header is irrelevant)
+#   * full OWASP CRS 4.7 attack ruleset (13 files), blocking mode, PL2
+#   * ML OFF and NO rate-limit — so we measure the rule engine + proxy path,
+#     not a rate limiter throttling the generator (single source IP)
+#   * logging at warn/stdout only, no control-plane sync, no ClickHouse
+#
+# Rule paths are relative to the Sentinel repo root (where rules/ lives); run
+# the WAF with CWD = repo root, or use run-loadtest.sh which handles this.
+
+cluster:
+  name: sentinel-loadtest
+  node_id: auto
+
+listeners:
+  - name: waf
+    bind: "0.0.0.0:18081"
+    protocol: http1
+    default_site: loadtest
+
+sites:
+  - id: loadtest
+    domains: ["loadtest.local", "localhost", "127.0.0.1"]
+    upstream:
+      load_balancer: round_robin
+      servers:
+        - { host: "127.0.0.1", port: 18080, weight: 1 }
+    waf:
+      mode: blocking
+      paranoia_level: 2
+      anomaly_threshold: 5
+      rules:
+        - "rules/owasp-crs/rules/REQUEST-911-METHOD-ENFORCEMENT.conf"
+        - "rules/owasp-crs/rules/REQUEST-913-SCANNER-DETECTION.conf"
+        - "rules/owasp-crs/rules/REQUEST-920-PROTOCOL-ENFORCEMENT.conf"
+        - "rules/owasp-crs/rules/REQUEST-921-PROTOCOL-ATTACK.conf"
+        - "rules/owasp-crs/rules/REQUEST-930-APPLICATION-ATTACK-LFI.conf"
+        - "rules/owasp-crs/rules/REQUEST-931-APPLICATION-ATTACK-RFI.conf"
+        - "rules/owasp-crs/rules/REQUEST-932-APPLICATION-ATTACK-RCE.conf"
+        - "rules/owasp-crs/rules/REQUEST-933-APPLICATION-ATTACK-PHP.conf"
+        - "rules/owasp-crs/rules/REQUEST-934-APPLICATION-ATTACK-GENERIC.conf"
+        - "rules/owasp-crs/rules/REQUEST-941-APPLICATION-ATTACK-XSS.conf"
+        - "rules/owasp-crs/rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf"
+        - "rules/owasp-crs/rules/REQUEST-943-APPLICATION-ATTACK-SESSION-FIXATION.conf"
+        - "rules/owasp-crs/rules/REQUEST-944-APPLICATION-ATTACK-JAVA.conf"
+      rule_exclusions:
+        - rule_id: 932236
+          exclude_targets: ["ARGS_NAMES"]
+      ml:
+        enable: false
+        models: []
+        sensitivity: 0.85
+      bot_detection:
+        ja4: false
+        challenge: "off"
+
+logging:
+  level: warn
+  format: json
+  outputs:
+    - type: stdout
+
+storage:
+  cache: { backend: memory, size: 64MB }

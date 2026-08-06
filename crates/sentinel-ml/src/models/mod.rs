@@ -9,4 +9,5 @@
 pub mod corpus;
 pub mod isolation_forest;
 pub mod logistic;
+pub mod ngram_classifier;
 pub mod payload_classifier;

@@ -3,8 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
 	"github.com/your-org/sentinel-waf/control-plane/internal/db"
+	"os"
 )
 
 func main() {
@@ -14,10 +14,14 @@ func main() {
 		os.Exit(1)
 	}
 	pool, err := db.Open(context.Background(), db.Config{URL: dbURL, MaxConns: 5, MinConns: 1})
-	if err != nil { fmt.Println("connect:", err); os.Exit(1) }
+	if err != nil {
+		fmt.Println("connect:", err)
+		os.Exit(1)
+	}
 	defer pool.Close()
 	if err := db.SeedDev(context.Background(), pool); err != nil {
-		fmt.Println("seed:", err); os.Exit(1)
+		fmt.Println("seed:", err)
+		os.Exit(1)
 	}
 	fmt.Println("OK")
 }

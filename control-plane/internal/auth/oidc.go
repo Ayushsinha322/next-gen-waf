@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -56,11 +57,14 @@ type OIDCUserInfo struct {
 
 // OIDCService handles OpenID Connect provider integration.
 type OIDCService struct {
-	cfg      OIDCConfig
-	client   *http.Client
-	mu       sync.RWMutex
-	disco    *OIDCDiscovery
-	discoAt  time.Time
+	cfg     OIDCConfig
+	client  *http.Client
+	mu      sync.RWMutex
+	disco   *OIDCDiscovery
+	discoAt time.Time
+	// keys caches the provider's JWKS for ID-token signature verification
+	// (see oidc_idtoken.go).
+	keys keyCache
 }
 
 // NewOIDCService creates an OIDC service for the given provider config.
@@ -105,6 +109,17 @@ func (s *OIDCService) Discovery(ctx context.Context) (*OIDCDiscovery, error) {
 		return nil, fmt.Errorf("oidc: decoding discovery: %w", err)
 	}
 
+	// The discovery document must claim the issuer we actually configured.
+	// Without this an open redirect or DNS/proxy takeover on the well-known URL
+	// could hand us a document pointing at an attacker's token and JWKS
+	// endpoints, and every downstream `iss` check would then validate against
+	// the attacker's own value. Compare ignoring a trailing slash, which
+	// providers vary on.
+	if strings.TrimRight(disco.Issuer, "/") != strings.TrimRight(s.cfg.ProviderURL, "/") {
+		return nil, fmt.Errorf("oidc: discovery issuer %q does not match configured provider %q",
+			disco.Issuer, s.cfg.ProviderURL)
+	}
+
 	s.mu.Lock()
 	s.disco = &disco
 	s.discoAt = time.Now()
@@ -138,7 +153,12 @@ func (s *OIDCService) AuthURL(ctx context.Context, state, nonce string) (string,
 }
 
 // ExchangeToken exchanges an authorization code for tokens and user info.
-func (s *OIDCService) ExchangeToken(ctx context.Context, code string) (*OIDCUserInfo, error) {
+//
+// wantNonce is the nonce minted for this login (see AuthURL); the ID token must
+// carry it back or the exchange is rejected as a possible replay. Identity is
+// only accepted once the ID token verifies AND the UserInfo response agrees with
+// it on `sub`.
+func (s *OIDCService) ExchangeToken(ctx context.Context, code, wantNonce string) (*OIDCUserInfo, error) {
 	disco, err := s.Discovery(ctx)
 	if err != nil {
 		return nil, err
@@ -184,6 +204,15 @@ func (s *OIDCService) ExchangeToken(ctx context.Context, code string) (*OIDCUser
 		return nil, fmt.Errorf("oidc: no access_token in response")
 	}
 
+	// Verify the ID token BEFORE trusting anything else in this exchange. This is
+	// the only artifact cryptographically bound to our client_id and to this
+	// specific authorization request (via nonce); the access token and UserInfo
+	// response carry no such binding on their own.
+	idClaims, err := s.VerifyIDToken(ctx, disco, tokenResp.IDToken, wantNonce)
+	if err != nil {
+		return nil, err
+	}
+
 	// Fetch user info.
 	userReq, err := http.NewRequestWithContext(ctx, http.MethodGet, disco.UserInfoEndpoint, nil)
 	if err != nil {
@@ -206,6 +235,24 @@ func (s *OIDCService) ExchangeToken(ctx context.Context, code string) (*OIDCUser
 		return nil, fmt.Errorf("oidc: decoding userinfo: %w", err)
 	}
 	info.Provider = s.cfg.ProviderURL
+
+	// OIDC Core 5.3.2: the UserInfo `sub` MUST exactly match the ID token `sub`,
+	// and if it does not, the UserInfo values MUST NOT be used. Skipping this is
+	// what would let a UserInfo response describing a different principal (a
+	// substituted or mixed-up response) decide who is logging in, even though the
+	// ID token verified correctly.
+	if subtle.ConstantTimeCompare([]byte(info.Subject), []byte(idClaims.Subject)) != 1 {
+		return nil, fmt.Errorf("oidc: userinfo sub does not match id_token sub")
+	}
+
+	// Prefer the signed email claim when the provider supplies one; UserInfo is
+	// unsigned, and the email drives user lookup and the domain allow-list below.
+	if idClaims.Email != "" {
+		info.Email = idClaims.Email
+	}
+	if info.Email == "" {
+		return nil, fmt.Errorf("oidc: no email in id_token or userinfo")
+	}
 
 	// Domain allow-list check.
 	if len(s.cfg.AllowedDomains) > 0 {

@@ -1,0 +1,71 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sentinel
+---
+# Data-plane proxy config. sync_url → the control-plane Service: every WAF pod
+# pulls its site/rule config from the control-plane cluster. Also defines the
+# :9443 management/admin console listener (reverse-proxies the dashboard + API).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sentinel-proxy-config
+  namespace: sentinel
+data:
+  sentinel.yaml: |
+    listeners:
+      - name: http
+        bind: "0.0.0.0:8080"
+        protocol: [http1, http2]
+      - name: https
+        bind: "0.0.0.0:8443"
+        protocol: [http1, http2, http3]
+        tls: {}
+      # Management/admin console (HTTPS). Bypasses the WAF pipeline and reverse-
+      # proxies the admin UI: /api/* → control plane, everything else → dashboard.
+      # Presents a self-signed management cert (replaceable via Settings). The
+      # upstreams come from SENTINEL_MGMT_*_UPSTREAM on the data-plane Deployment.
+      - name: management
+        bind: "0.0.0.0:9443"
+        protocol: [http1, http2]
+        tls: {}
+        role: management
+    cluster:
+      # Pull config from the HA control-plane Service (K8s load-balances across
+      # the 3 control-plane pods, so a reader survives any single pod failure).
+      sync_url: "http://sentinel-controlplane:9501"
+    sites: []   # control plane is authoritative; sites are hot-synced
+---
+# Secrets — REPLACE these with real values (or use an external secrets manager /
+# sealed-secrets). stringData is plaintext for readability; kubectl base64s it.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sentinel-secrets
+  namespace: sentinel
+type: Opaque
+stringData:
+  # verify-full, not require: `require` encrypts but accepts ANY certificate, so it
+  # does not prevent interception. CloudNativePG serves TLS by default and publishes
+  # its CA in the <cluster>-ca secret, which 20-controlplane.yaml mounts at the
+  # sslrootcert path below — so full verification costs nothing extra here.
+  db-url: "postgres://sentinel:CHANGE_ME@sentinel-postgres-rw:5432/sentinel?sslmode=verify-full&sslrootcert=/etc/sentinel/pki/ca.crt"
+  jwt-secret: "CHANGE_ME_jwt_signing_secret"
+  internal-secret: "CHANGE_ME_dataplane_controlplane_shared_secret"
+  # ClickHouse password — the data plane (writer) and control plane (reader) both
+  # use it for searchable event history. Must match the ClickHouse StatefulSet.
+  clickhouse-password: "CHANGE_ME_clickhouse_password"
+---
+# CloudNativePG bootstrap credentials for the `sentinel` DB role. The Cluster in
+# 30-datastores.yaml references this via bootstrap.initdb.secret, so CNPG uses it
+# rather than generating one — it MUST exist or the primary never finishes
+# bootstrap. The password here MUST equal the password in db-url above.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sentinel-postgres-app
+  namespace: sentinel
+type: kubernetes.io/basic-auth
+stringData:
+  username: "sentinel"
+  password: "CHANGE_ME"   # ← must match the password in sentinel-secrets/db-url

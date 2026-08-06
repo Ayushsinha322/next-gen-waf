@@ -49,6 +49,10 @@ pub enum WafDecision {
     Allow,
     /// Block request with an error response; do not forward.
     Block,
+    /// Soft-deny: throttle / limit the client (a 429 by default) instead of a
+    /// hard block. Set by weighted verdict fusion for suspicious-but-uncertain
+    /// traffic whose fused score is in the limit band (below the block band).
+    Limit,
     /// Issue a browser challenge (CAPTCHA / PoW) before forwarding.
     Challenge,
     /// Allow but log (learning mode).
@@ -116,10 +120,32 @@ pub struct RequestContext {
     pub tenant_id: Option<String>,
     /// ISO-3166-1 alpha-2 country code resolved by the GeoIP module, when known.
     pub geo_country: Option<String>,
+    /// Enforcement mode of the matched site, stamped once at routing time.
+    /// `None` for requests rejected before routing (connection-layer blocks such
+    /// as anti-DDoS, IP reputation and threat intel).
+    ///
+    /// Logging needs this: without it a record cannot say whether a verdict was
+    /// actually *enforced* or merely *observed* in learning mode, and that
+    /// distinction is not recoverable from the other fields — a learning-mode
+    /// downgrade and a genuine pass both end up as a non-Block decision.
+    pub enforcement_mode: Option<crate::config::WafMode>,
+    /// The matched site's anomaly-score threshold, stamped at routing time so a
+    /// score-driven verdict can be reported as "score N of threshold M" rather
+    /// than a bare number the reader has to go look up.
+    pub anomaly_threshold: Option<u32>,
+    /// `path_prefix` of the per-path override that produced the two fields above,
+    /// when one matched. Recorded so an operator reading an event can tell that a
+    /// non-default threshold or mode came from a path rule rather than wondering
+    /// why this request was judged differently from the rest of the site.
+    pub path_override: Option<String>,
 
     // --- WAF state ---
     pub phase: Phase,
     pub anomaly_score: u32,
+    /// Per-engine anomaly contributions (engine name → points), recorded
+    /// alongside `anomaly_score` so weighted verdict fusion can apply per-engine
+    /// weights and explain which engines drove the verdict.
+    pub engine_scores: HashMap<String, u32>,
     pub rule_matches: Vec<RuleMatch>,
     /// Per-model ML classifier scores (model name → [0.0, 1.0]).
     pub ml_scores: HashMap<String, f32>,
@@ -175,8 +201,12 @@ impl RequestContext {
             site_id: None,
             tenant_id: None,
             geo_country: None,
+            enforcement_mode: None,
+            anomaly_threshold: None,
+            path_override: None,
             phase: Phase::Connection,
             anomaly_score: 0,
+            engine_scores: HashMap::new(),
             rule_matches: Vec::new(),
             ml_scores: HashMap::new(),
             tx_vars: HashMap::new(),
@@ -204,6 +234,18 @@ impl RequestContext {
     pub fn add_finding(&mut self, rule_match: RuleMatch) {
         self.anomaly_score = self.anomaly_score.saturating_add(rule_match.score);
         self.rule_matches.push(rule_match);
+    }
+
+    /// Add `points` to the total anomaly score and attribute them to `engine`
+    /// (for weighted verdict fusion + explainability). Use this instead of
+    /// mutating `anomaly_score` directly so the per-engine breakdown stays
+    /// accurate.
+    pub fn add_engine_score(&mut self, engine: &str, points: u32) {
+        if points == 0 {
+            return;
+        }
+        self.anomaly_score = self.anomaly_score.saturating_add(points);
+        *self.engine_scores.entry(engine.to_string()).or_insert(0) += points;
     }
 
     /// Check if this request should be blocked given the configured threshold.

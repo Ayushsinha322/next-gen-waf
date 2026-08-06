@@ -1,0 +1,5 @@
+# vegeta raw binary result streams — huge (100s of MB), regenerable from run-loadtest.sh
+results/*.bin
+# WAF stdout during the run — large; keep only the parsed reports
+results/waf.log
+results/.targets.*.txt

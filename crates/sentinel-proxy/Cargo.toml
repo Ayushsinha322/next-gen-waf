@@ -4,8 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Enable real kernel XDP (aya-based) in sentinel-ebpf. Off by default; the
+# data plane falls back to the userspace software fast-fail without it.
+kernel = ["sentinel-ebpf/kernel"]
+
 [dependencies]
 tokio = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
 tracing = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
@@ -32,6 +38,7 @@ rcgen = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
 ring = { workspace = true }
+jsonwebtoken = { workspace = true }
 sentinel-core = { path = "../sentinel-core" }
 sentinel-rules = { path = "../sentinel-rules" }
 sentinel-modules = { path = "../sentinel-modules" }

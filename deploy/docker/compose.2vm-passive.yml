@@ -1,0 +1,99 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# 2-VM ACTIVE-PASSIVE — overlay for the PASSIVE VM.
+#
+#   docker compose -f compose.prod.yml -f compose.2vm-passive.yml up -d
+#
+# This VM runs:
+#   • Postgres as a streaming STANDBY of the active VM (read-only until promoted)
+#   • the control plane — which contends for the same advisory lock as the active
+#     one, so leadership is automatic; while the active VM holds it, this node
+#     forwards writes there
+#   • the data plane — actively serving traffic (it is stateless)
+#   • the dashboard
+#
+# It does NOT run ClickHouse. Event history lives on the active VM; a second
+# ClickHouse here would be a second independent dataset, not a replica, and
+# ReplicatedMergeTree needs a Keeper quorum that two nodes cannot form. Event history
+# is protected by backup instead — see 2VM-ACTIVE-PASSIVE.md.
+# ═════════════════════════════════════════════════════════════════════════════
+
+services:
+  postgres:
+    # Streaming standby. The entrypoint clones from the primary on first boot and
+    # then follows it; it never re-clones over existing data.
+    entrypoint: ["/usr/local/bin/pg-standby-entrypoint.sh"]
+    environment:
+      SENTINEL_PRIMARY_HOST: ${SENTINEL_PRIMARY_HOST:?set SENTINEL_PRIMARY_HOST in .env (active VM address)}
+      SENTINEL_REPL_USER: ${SENTINEL_REPL_USER:?set SENTINEL_REPL_USER in .env}
+      SENTINEL_REPL_PASSWORD: ${SENTINEL_REPL_PASSWORD:?set SENTINEL_REPL_PASSWORD in .env}
+      SENTINEL_PG_CA: /etc/sentinel/pki/root.crt
+    volumes:
+      - ./pg-standby-entrypoint.sh:/usr/local/bin/pg-standby-entrypoint.sh:ro
+      # CA for the replication connection, which uses sslmode=verify-full. Copy
+      # /opt/sentinel-pki/root.crt from the ACTIVE VM to this one.
+      - /opt/sentinel-pki/root.crt:/etc/sentinel/pki/root.crt:ro
+    healthcheck:
+      # A standby is in recovery, so the default pg_isready check is fine, but accept
+      # the read-only state explicitly rather than treating it as unhealthy.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB} || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 120s   # a first-boot base backup can take a while
+
+  # The control plane and data plane on THIS VM must talk to the PRIMARY's database,
+  # not to the local standby — a standby is read-only, so writes would fail. Point
+  # them at the active VM; after a promotion, flip this to 127.0.0.1/local and
+  # restart (promote-standby.sh prints the exact steps).
+  controlplane:
+    environment:
+      SENTINEL_DB_URL: ${SENTINEL_DB_URL_PRIMARY:?set SENTINEL_DB_URL_PRIMARY in .env — DSN pointing at the ACTIVE VM}
+      # The control plane READS events (Threat Search, the learning-mode FPR
+      # report). Same remote ClickHouse as the data plane writes to, so a report
+      # run from this node sees the whole dataset rather than an empty one.
+      SENTINEL_CLICKHOUSE_URL: ${SENTINEL_CLICKHOUSE_URL_PRIMARY:?set SENTINEL_CLICKHOUSE_URL_PRIMARY in .env — https://<ACTIVE VM>:8443}
+      # Scoped to this client only — deliberately NOT SSL_CERT_FILE, which would
+      # replace the whole process's root pool and break outbound HTTPS to public
+      # endpoints (threat-intel feeds) as a side effect.
+      SENTINEL_CLICKHOUSE_CA_FILE: /etc/sentinel/pki/root.crt
+    volumes:
+      - /opt/sentinel-pki/root.crt:/etc/sentinel/pki/root.crt:ro
+
+  migrate:
+    # Migrations must run against the primary, and only once per cluster. The active
+    # VM already applies them, so this is a no-op here (goose is idempotent) but it
+    # must still target the primary rather than the read-only standby.
+    environment:
+      GOOSE_DBSTRING: ${SENTINEL_DB_URL_PRIMARY:?set SENTINEL_DB_URL_PRIMARY in .env}
+
+  # This VM has no ClickHouse, so both planes must reach the ACTIVE VM's. Without
+  # this the data plane resolves nothing for `clickhouse:8123` and its event
+  # history is simply never recorded — measured 2026-07-29, nine attacks blocked
+  # with 403 while this node held the VIP and ClickHouse held zero of them.
+  #
+  # Pointed at the master's REAL address, never the VIP: the VIP follows traffic,
+  # so during a failover it resolves to THIS node, which has no ClickHouse — the
+  # writer would then be chasing itself. ClickHouse does not move.
+  #
+  # While the master is down its ClickHouse is unreachable, which is precisely the
+  # window this node is serving. The data plane spools that history to disk and
+  # replays it when the master returns (SENTINEL_SPOOL_DIR), so a failover delays
+  # the audit trail instead of punching a hole in it. The spool is what makes
+  # depending on a remote sink safe at all.
+  clickhouse:
+    # Not run on the passive VM — see the header. `replicas: 0` keeps the service
+    # defined (so the compose file stays a clean overlay) without starting it.
+    deploy:
+      replicas: 0
+
+  dataplane:
+    environment:
+      SENTINEL_CLICKHOUSE_URL: ${SENTINEL_CLICKHOUSE_URL_PRIMARY:?set SENTINEL_CLICKHOUSE_URL_PRIMARY in .env — https://<ACTIVE VM>:8443}
+      # Verify the active node's ClickHouse cert against the deployment's own Root
+      # CA. Without this the client falls back to the public webpki roots, which
+      # cannot possibly have signed an internal cert, and every write fails.
+      SENTINEL_CLICKHOUSE_CA_FILE: /etc/sentinel/pki/root.crt
+    volumes:
+      # Same root.crt already copied here for Postgres replication — one trust
+      # root for the deployment, not two.
+      - /opt/sentinel-pki/root.crt:/etc/sentinel/pki/root.crt:ro

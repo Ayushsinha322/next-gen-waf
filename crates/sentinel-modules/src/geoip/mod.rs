@@ -99,26 +99,30 @@ impl GeoIp {
 
     /// Look up the country for `ip` and apply block/allow rules.
     pub fn check(&self, ip: IpAddr) -> GeoVerdict {
-        let reader = match &self.reader {
-            Some(r) => r,
-            None => return GeoVerdict::Unknown,
-        };
+        self.classify(self.country(ip).as_deref())
+    }
 
-        let country_code: Option<String> = {
-            match reader.lookup::<geoip2::Country>(ip) {
-                Ok(result) => result
-                    .country
-                    .and_then(|c| c.iso_code)
-                    .map(|code| code.to_uppercase()),
-                Err(maxminddb::MaxMindDBError::AddressNotFoundError(_)) => None,
-                Err(e) => {
-                    tracing::debug!("GeoIP lookup failed for {ip}: {e}");
-                    None
-                }
+    /// Resolve an IP's ISO-3166-1 alpha-2 country code, independent of policy.
+    ///
+    /// [`check`](Self::check) answers "may this country in?", and its `Allow`
+    /// variant deliberately carries no country — so a caller that wants to
+    /// *record* where a request came from (logging, analytics, the dashboard map)
+    /// cannot obtain it from a verdict at all. Exposing the lookup separately
+    /// lets the request logger attribute allowed traffic, not just blocked
+    /// traffic, without duplicating the mmdb read.
+    pub fn country(&self, ip: IpAddr) -> Option<String> {
+        let reader = self.reader.as_ref()?;
+        match reader.lookup::<geoip2::Country>(ip) {
+            Ok(result) => result
+                .country
+                .and_then(|c| c.iso_code)
+                .map(|code| code.to_uppercase()),
+            Err(maxminddb::MaxMindDBError::AddressNotFoundError(_)) => None,
+            Err(e) => {
+                tracing::debug!("GeoIP lookup failed for {ip}: {e}");
+                None
             }
-        };
-
-        self.classify(country_code.as_deref())
+        }
     }
 
     /// Apply country policy to a known country code (or `None` for unknown).

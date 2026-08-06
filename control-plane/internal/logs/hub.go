@@ -20,11 +20,46 @@ import (
 	"time"
 )
 
+// Source identifies where an Entry came from. It exists so that fabricated data
+// can never be mistaken for observed traffic.
+//
+// Previously Entry carried only Kind and Data, so simulator output travelled the
+// exact same path as real data-plane logs and arrived at the dashboard
+// indistinguishable from it — nobody looking at a screen could tell whether an
+// "attack" had actually happened. Every Entry now declares its provenance, and
+// the stream marks it explicitly.
+type Source string
+
+const (
+	// SourceLive is real, observed data (tailed data-plane logs, real alerts,
+	// real audit events). This is the only value ever seen in production.
+	SourceLive Source = "live"
+	// SourceSimulated is fabricated data from the development simulator. It only
+	// exists when SENTINEL_DEV_SIMULATOR=1 is set explicitly.
+	SourceSimulated Source = "simulated"
+)
+
 // Entry is a single log line emitted to subscribers.
 type Entry struct {
 	Kind string          `json:"kind"`
 	Data json.RawMessage `json:"data"`
+	// Source is "live" for observed data and "simulated" for generated data.
+	// Empty is treated as "live" by normalize() so no real emitter can
+	// accidentally omit it, but simulated data must always set it.
+	Source Source `json:"source"`
 }
+
+// normalize defaults an unset Source to live. Called on the publish path so
+// every Entry that reaches a subscriber carries explicit provenance.
+func (e Entry) normalize() Entry {
+	if e.Source == "" {
+		e.Source = SourceLive
+	}
+	return e
+}
+
+// IsSimulated reports whether this entry is fabricated.
+func (e Entry) IsSimulated() bool { return e.Source == SourceSimulated }
 
 // Snapshot holds a point-in-time view of live metrics derived from the
 // event stream.  It is safe to read without locking.
@@ -49,8 +84,8 @@ type Snapshot struct {
 	AttackBreakdown map[string]int64 `json:"attack_breakdown"`
 	// ByCountry maps an ISO-3166-1 alpha-2 code to blocked-request count.
 	// Empty until a GeoIP database is loaded (geoip_loaded=false) — never faked.
-	ByCountry    map[string]int64 `json:"by_country"`
-	GeoIPLoaded  bool             `json:"geoip_loaded"`
+	ByCountry   map[string]int64 `json:"by_country"`
+	GeoIPLoaded bool             `json:"geoip_loaded"`
 
 	// Host resource usage (Linux /proc/meminfo; zero when unavailable).
 	MemUsedBytes  uint64 `json:"mem_used_bytes"`
@@ -99,6 +134,11 @@ type Hub struct {
 	mu   sync.RWMutex
 	subs map[chan Entry]struct{}
 	buf  []Entry // ring buffer of last 200 entries
+
+	// Paths already being tailed, so per-node discovery never double-tails a
+	// file (which would duplicate every line into the stream).
+	tailMu sync.Mutex
+	tailed map[string]struct{}
 
 	// Metrics counters (atomic — updated on every publish).
 	totalRequests   atomic.Int64
@@ -172,19 +212,76 @@ func NewHub() *Hub {
 		byCountry:  make(map[string]int64),
 		siteStats:  make(map[string]*SiteStat),
 		learnStats: make(map[string]map[string]*LearningStat),
+		tailed:     make(map[string]struct{}),
 	}
 
 	dir := LogDir()
 
 	kinds := []string{"access", "waf", "error", "audit", "modsec", "ml"}
+
+	// Single-node layout: the data plane writes straight into $SENTINEL_LOG_DIR.
 	for _, kind := range kinds {
-		h.tailKind(kind, filepath.Join(dir, kind+".log"))
+		h.tailOnce(kind, filepath.Join(dir, kind+".log"))
 	}
+
+	// HA layout: each data-plane node writes into its OWN subdirectory
+	// ($SENTINEL_LOG_DIR/<node>/access.log). Per-node directories are required,
+	// not cosmetic — three nodes appending to one file would each hold an open
+	// handle, and the moment one of them rotated access.log the other two would
+	// keep writing into the now-renamed file, so two thirds of the traffic would
+	// silently stop appearing in the live view.
+	//
+	// Node directories appear when their container starts, which can be after
+	// this process, so rescan rather than globbing once at boot.
+	go h.discoverNodeLogs(dir, kinds)
 
 	go h.runBucketSampler()
 	go h.runMemSampler()
 
 	return h
+}
+
+// tailOnce starts a tail for path unless one is already running for it.
+func (h *Hub) tailOnce(kind, path string) {
+	h.tailMu.Lock()
+	if _, dup := h.tailed[path]; dup {
+		h.tailMu.Unlock()
+		return
+	}
+	h.tailed[path] = struct{}{}
+	h.tailMu.Unlock()
+	h.tailKind(kind, path)
+}
+
+// discoverNodeLogs periodically picks up per-node log directories. A tail is
+// cheap (one goroutine polling a path that may not exist yet) and tailOnce
+// dedupes, so rescanning is safe to repeat forever.
+func (h *Hub) discoverNodeLogs(dir string, kinds []string) {
+	scan := func() {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			for _, kind := range kinds {
+				h.tailOnce(kind, filepath.Join(dir, e.Name(), kind+".log"))
+			}
+		}
+	}
+	scan()
+	t := time.NewTicker(15 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-h.done:
+			return
+		case <-t.C:
+			scan()
+		}
+	}
 }
 
 // Subscribe registers a new SSE client and returns its delivery channel.
@@ -222,6 +319,9 @@ func (h *Hub) Stop() { close(h.done) }
 // Publish sends an entry to all subscribers and appends to the ring buffer.
 // It also updates live metrics counters.
 func (h *Hub) publish(e Entry) {
+	// Stamp provenance once, here, so it is impossible for an entry to reach a
+	// subscriber or the ring buffer without it.
+	e = e.normalize()
 	h.updateMetrics(e)
 
 	h.mu.Lock()

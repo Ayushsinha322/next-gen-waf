@@ -52,6 +52,7 @@ const (
 	ResourceNotification  = "notification"   // notification channels (webhook/syslog/cef)
 	ResourceManagementTLS = "management_tls" // management-console TLS certificate
 	ResourceThreatIntel   = "threat_intel"   // threat-intelligence IOC corpus (node-global)
+	ResourceLogProfile    = "log_profile"    // saved log views + bulk log export
 )
 
 // Action verbs.
@@ -116,6 +117,12 @@ var rolePermissions = map[Role]map[string]struct{}{
 		perm(ResourceAudit, ActionDownload):       {},
 		perm(ResourceManagementTLS, ActionRead):   {},
 		perm(ResourceManagementTLS, ActionUpdate): {},
+		perm(ResourceLogProfile, ActionCreate):    {},
+		perm(ResourceLogProfile, ActionRead):      {},
+		perm(ResourceLogProfile, ActionUpdate):    {},
+		perm(ResourceLogProfile, ActionDelete):    {},
+		perm(ResourceLogProfile, ActionList):      {},
+		perm(ResourceLogProfile, ActionDownload):  {},
 	},
 	RoleAdmin: {
 		perm(ResourceUser, ActionCreate):          {},
@@ -164,6 +171,12 @@ var rolePermissions = map[Role]map[string]struct{}{
 		perm(ResourceAudit, ActionDownload):       {},
 		perm(ResourceManagementTLS, ActionRead):   {},
 		perm(ResourceManagementTLS, ActionUpdate): {},
+		perm(ResourceLogProfile, ActionCreate):    {},
+		perm(ResourceLogProfile, ActionRead):      {},
+		perm(ResourceLogProfile, ActionUpdate):    {},
+		perm(ResourceLogProfile, ActionDelete):    {},
+		perm(ResourceLogProfile, ActionList):      {},
+		perm(ResourceLogProfile, ActionDownload):  {},
 	},
 	RoleEditor: {
 		perm(ResourceSite, ActionCreate):        {},
@@ -194,6 +207,14 @@ var rolePermissions = map[Role]map[string]struct{}{
 		perm(ResourceThreatIntel, ActionList):   {},
 		perm(ResourceAudit, ActionRead):         {},
 		perm(ResourceManagementTLS, ActionRead): {},
+		// Editors run the customer-facing log requests, so they both curate the
+		// saved views and produce the export handed over.
+		perm(ResourceLogProfile, ActionCreate):   {},
+		perm(ResourceLogProfile, ActionRead):     {},
+		perm(ResourceLogProfile, ActionUpdate):   {},
+		perm(ResourceLogProfile, ActionDelete):   {},
+		perm(ResourceLogProfile, ActionList):     {},
+		perm(ResourceLogProfile, ActionDownload): {},
 	},
 	RoleViewer: {
 		perm(ResourceSite, ActionRead):          {},
@@ -213,6 +234,11 @@ var rolePermissions = map[Role]map[string]struct{}{
 		perm(ResourceThreatIntel, ActionRead):   {},
 		perm(ResourceThreatIntel, ActionList):   {},
 		perm(ResourceManagementTLS, ActionRead): {},
+		// Viewers may open a saved view on screen but deliberately cannot
+		// download one: an export is a bulk extract of customer traffic data
+		// leaving the platform, which is a higher bar than reading a page of it.
+		perm(ResourceLogProfile, ActionRead): {},
+		perm(ResourceLogProfile, ActionList): {},
 	},
 	RoleAuditor: {
 		perm(ResourceSite, ActionRead):          {},
@@ -234,6 +260,11 @@ var rolePermissions = map[Role]map[string]struct{}{
 		perm(ResourceAudit, ActionRead):         {},
 		perm(ResourceAudit, ActionDownload):     {},
 		perm(ResourceManagementTLS, ActionRead): {},
+		// Auditors already hold audit_log.download; extracting event history for
+		// an investigation or a regulator is the same class of read.
+		perm(ResourceLogProfile, ActionRead):     {},
+		perm(ResourceLogProfile, ActionList):     {},
+		perm(ResourceLogProfile, ActionDownload): {},
 	},
 }
 

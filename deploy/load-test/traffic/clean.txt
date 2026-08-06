@@ -1,0 +1,5 @@
+GET http://127.0.0.1:18081/
+GET http://127.0.0.1:18081/?q=hello&page=1
+GET http://127.0.0.1:18081/?category=news&sort=date&limit=20
+GET http://127.0.0.1:18081/index.html?ref=homepage
+GET http://127.0.0.1:18081/?search=weather+forecast&lang=en

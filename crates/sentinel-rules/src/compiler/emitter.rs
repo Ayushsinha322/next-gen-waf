@@ -4,7 +4,7 @@ use aho_corasick::AhoCorasick;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::dsl::ast::{RuleAction, RulePhase, RuleSeverity, Target, Transform};
+use crate::dsl::ast::{RuleAction, RulePhase, RuleSeverity, SetVar, Target, Transform};
 
 // ---------------------------------------------------------------------------
 // Target specification stored in instructions
@@ -33,6 +33,39 @@ pub enum TargetSpec {
     Geo,
     TxVar(String),
     CountOf(Box<TargetSpec>),
+}
+
+impl TargetSpec {
+    /// ModSecurity-style label for this target, e.g. `ARGS`,
+    /// `REQUEST_HEADERS:User-Agent`.
+    ///
+    /// Used to record WHICH part of a request tripped a rule, so a security event
+    /// can name the parameter to exclude instead of leaving an operator to guess.
+    pub fn label(&self) -> String {
+        match self {
+            TargetSpec::Args => "ARGS".into(),
+            TargetSpec::ArgsNames => "ARGS_NAMES".into(),
+            TargetSpec::RequestBody => "REQUEST_BODY".into(),
+            TargetSpec::RequestUri => "REQUEST_URI".into(),
+            TargetSpec::RequestFilename => "REQUEST_FILENAME".into(),
+            TargetSpec::RequestMethod => "REQUEST_METHOD".into(),
+            TargetSpec::RequestLine => "REQUEST_LINE".into(),
+            TargetSpec::RequestHeadersAll => "REQUEST_HEADERS".into(),
+            TargetSpec::RequestHeader(h) => format!("REQUEST_HEADERS:{h}"),
+            TargetSpec::RequestCookiesAll => "REQUEST_COOKIES".into(),
+            TargetSpec::RequestCookie(c) => format!("REQUEST_COOKIES:{c}"),
+            TargetSpec::ResponseHeadersAll => "RESPONSE_HEADERS".into(),
+            TargetSpec::ResponseHeader(h) => format!("RESPONSE_HEADERS:{h}"),
+            TargetSpec::ResponseBody => "RESPONSE_BODY".into(),
+            TargetSpec::Files => "FILES".into(),
+            TargetSpec::FilesNames => "FILES_NAMES".into(),
+            TargetSpec::FilesCombinedSize => "FILES_COMBINED_SIZE".into(),
+            TargetSpec::RemoteAddr => "REMOTE_ADDR".into(),
+            TargetSpec::Geo => "GEO".into(),
+            TargetSpec::TxVar(v) => format!("TX:{v}"),
+            TargetSpec::CountOf(inner) => format!("&{}", inner.label()),
+        }
+    }
 }
 
 impl From<&Target> for TargetSpec {
@@ -105,6 +138,12 @@ pub enum Instruction {
     DetectXss,
     /// Pop `StrVec`, push `Bool(any value is an off-domain URL)`.
     DetectOffDomainUrl,
+    /// Pop `StrVec`, push `Bool(any value contains an SSRF URL)`.
+    DetectSsrfUrl,
+    /// Pop `StrVec`, push `Bool(any value is an IP inside one of these CIDRs)`.
+    IpMatch {
+        cidrs: Vec<String>,
+    },
 
     /// Always push `Bool(false)` — used for intentionally disabled rules.
     Never,
@@ -175,6 +214,10 @@ pub struct RuleMeta {
     /// CRS `skipAfter:MARKER` — if this rule fires, the VM jumps forward
     /// to the `Marker` instruction with this name, skipping all rules in between.
     pub skip_after: Option<String>,
+    /// `setvar` mutations applied to the per-request TX store when this rule
+    /// fires (executed by the VM in `fire_rule`).
+    #[serde(default)]
+    pub setvars: Vec<SetVar>,
 }
 
 impl Default for RuleMeta {
@@ -188,6 +231,7 @@ impl Default for RuleMeta {
             tags: Vec::new(),
             phase: RulePhase::RequestBody,
             skip_after: None,
+            setvars: Vec::new(),
         }
     }
 }

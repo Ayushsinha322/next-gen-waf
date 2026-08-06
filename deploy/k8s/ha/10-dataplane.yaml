@@ -1,0 +1,149 @@
+# WAF data plane — the active-active fleet, HA by construction.
+#
+# HA properties:
+#  - replicas: 3 → active-active fleet (like the compose demo, but each pod on a
+#    different node so a NODE failure loses only one).
+#  - podAntiAffinity (required) → the scheduler REFUSES to co-locate two WAF pods
+#    on the same node, so a node outage never takes more than one replica.
+#  - topologySpreadConstraints → also spread across availability zones.
+#  - readiness/liveness probes → liveness (/healthz) restarts dead pods; readiness
+#    + startup (/readyz) hold traffic off a pod until its WAF config has synced
+#    (sites>0), so rollouts and rejoins never 502.
+#  - PodDisruptionBudget → voluntary disruptions (drains/upgrades) keep >=2 up.
+#  - HorizontalPodAutoscaler → scale the fleet with load.
+#
+# The data plane is stateless (config synced from the control plane, shared
+# rate-limit state in Redis), so scaling is just more replicas.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinel-dataplane
+  namespace: sentinel
+  labels: { app: sentinel, tier: dataplane }
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: sentinel, tier: dataplane }
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }   # zero-downtime rollouts
+  template:
+    metadata:
+      labels: { app: sentinel, tier: dataplane }
+    spec:
+      # Strongly prefer one WAF pod per node (a node loss then costs ≤1 replica),
+      # but PREFERRED not required — so the HPA can scale past the node count and
+      # a rolling update's surge pod can still schedule. topologySpread below adds
+      # even zone distribution. (Use required only if nodes ≥ maxReplicas+1.)
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels: { app: sentinel, tier: dataplane }
+                topologyKey: kubernetes.io/hostname
+      # Also spread evenly across availability zones.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app: sentinel, tier: dataplane }
+      terminationGracePeriodSeconds: 30   # drain in-flight connections on shutdown
+      # Cut the node-death recovery window from the Kubernetes default of 300s to
+      # ~30s. See the full rationale in 30-datastores.yaml (Redis Deployment).
+      tolerations:
+        - { key: node.kubernetes.io/not-ready,   operator: Exists, effect: NoExecute, tolerationSeconds: 20 }
+        - { key: node.kubernetes.io/unreachable, operator: Exists, effect: NoExecute, tolerationSeconds: 20 }
+      containers:
+        - name: dataplane
+          image: registry.example.com/sentinel/dataplane:latest   # push your image here
+          args: []   # kernel XDP needs a privileged securityContext + hostNetwork; omitted here (software mode)
+          ports:
+            - { name: http, containerPort: 8080 }
+            - { name: https, containerPort: 8443 }
+            - { name: mgmt, containerPort: 9443 }   # admin console (reverse-proxied)
+          env:
+            - { name: SENTINEL_CONFIG, value: /etc/sentinel/sentinel.yaml }
+            - { name: RUST_LOG, value: "info,sentinel=info" }
+            # Shared rate-limit state so limits are fleet-wide (points at the HA Redis).
+            - { name: SENTINEL_REDIS_URL, value: "redis://sentinel-redis:6379" }
+            # ClickHouse writer: the data plane bulk-inserts traffic + WAF events
+            # (creates the schema on first connect). Powers Threat Search history.
+            - { name: SENTINEL_CLICKHOUSE_URL, value: "http://sentinel-clickhouse:8123" }
+            - { name: SENTINEL_CLICKHOUSE_DB, value: "sentinel_logs" }
+            - { name: SENTINEL_CLICKHOUSE_USER, value: "sentinel" }
+            - name: SENTINEL_CLICKHOUSE_PASSWORD
+              valueFrom: { secretKeyRef: { name: sentinel-secrets, key: clickhouse-password } }
+            # Management console upstreams — the :9443 listener reverse-proxies these.
+            - { name: SENTINEL_MGMT_DASHBOARD_UPSTREAM, value: "http://sentinel-dashboard:3000" }
+            - { name: SENTINEL_MGMT_API_UPSTREAM, value: "http://sentinel-controlplane:9501" }
+            - name: SENTINEL_INTERNAL_SECRET
+              valueFrom: { secretKeyRef: { name: sentinel-secrets, key: internal-secret } }
+          volumeMounts:
+            - { name: config, mountPath: /etc/sentinel }
+          resources:
+            requests: { cpu: "500m", memory: "256Mi" }
+            limits:   { cpu: "2",    memory: "1Gi" }
+          # Liveness: /healthz = "process is up". Restart the pod if it's dead.
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 5
+            failureThreshold: 3
+          # Readiness: /readyz = "config synced, can actually protect" (200 only
+          # when sites>0). The Service won't route to a pod until it's ready, so
+          # a rejoining or freshly-rolled pod never serves traffic before its
+          # rules load → no 502s on rollout/recovery.
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8080 }
+            periodSeconds: 3
+            failureThreshold: 2
+          # Startup: /healthz (process-up), NOT /readyz. /readyz returns 503 until
+          # the first config sync (sites>0), which on a cold cluster can exceed the
+          # startup window (CNPG bootstrap + control-plane seed + sync) and would
+          # CrashLoop the whole fleet. Readiness (/readyz) still holds traffic off
+          # until rules load — it removes the pod from the Service, it doesn't kill it.
+          startupProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 2
+            failureThreshold: 30   # ~60s grace for the process to bind :8080
+      volumes:
+        - name: config
+          configMap: { name: sentinel-proxy-config }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sentinel-dataplane
+  namespace: sentinel
+  labels: { app: sentinel, tier: dataplane }
+spec:
+  selector: { app: sentinel, tier: dataplane }
+  ports:
+    - { name: http, port: 80, targetPort: 8080 }
+    - { name: https, port: 443, targetPort: 8443 }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sentinel-dataplane-pdb
+  namespace: sentinel
+spec:
+  minAvailable: 2               # never let voluntary disruptions drop below 2 WAF nodes
+  selector:
+    matchLabels: { app: sentinel, tier: dataplane }
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: sentinel-dataplane-hpa
+  namespace: sentinel
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: sentinel-dataplane }
+  minReplicas: 3
+  maxReplicas: 12
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 65 } }

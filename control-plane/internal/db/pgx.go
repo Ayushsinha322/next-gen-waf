@@ -120,7 +120,7 @@ type pgxRows struct {
 	rows pgx.Rows
 }
 
-func (r *pgxRows) Next() bool  { return r.rows.Next() }
-func (r *pgxRows) Close()      { r.rows.Close() }
-func (r *pgxRows) Err() error  { return r.rows.Err() }
+func (r *pgxRows) Next() bool             { return r.rows.Next() }
+func (r *pgxRows) Close()                 { r.rows.Close() }
+func (r *pgxRows) Err() error             { return r.rows.Err() }
 func (r *pgxRows) Scan(dest ...any) error { return r.rows.Scan(dest...) }

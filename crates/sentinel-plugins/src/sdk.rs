@@ -18,7 +18,7 @@
 //!
 //! #[no_mangle]
 //! pub extern "C" fn evaluate() {
-//!     let ua = get_header("user-agent").unwrap_or_default();
+//!     let ua = get_req_header("user-agent").unwrap_or_default();
 //!     if ua.contains("sqlmap") {
 //!         set_decision(Decision::Block);
 //!         add_score(50);
@@ -78,8 +78,18 @@ macro_rules! import_host_functions {
             /// Get the value of request header `name` (ptr+len).
             /// Writes the value into `out_ptr` (max `out_cap` bytes) and returns actual length.
             /// Returns -1 if the header is absent.
-            pub fn host_get_header(name_ptr: i32, name_len: i32, out_ptr: i32, out_cap: i32)
-                -> i32;
+            ///
+            /// NOTE the name: `host_get_req_header`, matching what the host
+            /// registers in `abi.rs`. This block was previously written as
+            /// `host_get_header`, which the host does not define — every plugin
+            /// copied from this SDK failed to instantiate with
+            /// "unknown import: `env::host_get_header` has not been defined".
+            pub fn host_get_req_header(
+                name_ptr: i32,
+                name_len: i32,
+                out_ptr: i32,
+                out_cap: i32,
+            ) -> i32;
 
             /// Overwrite or add a response header.
             pub fn host_set_header(name_ptr: i32, name_len: i32, val_ptr: i32, val_len: i32);

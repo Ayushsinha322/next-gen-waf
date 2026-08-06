@@ -260,6 +260,7 @@ fn secrule_directive_to_rule_with_actions(
         transforms: actions.transforms.clone(),
         skip_after: actions.skip_after.clone(),
         multi_match: actions.multi_match,
+        setvars: actions.setvars.clone(),
     }))
 }
 
@@ -330,7 +331,13 @@ fn token_to_target(tok: &str) -> Option<Target> {
         "FILES_COMBINED_SIZE" => Some(Target::FilesCombinedSize),
         // No on-disk temp files in a streaming proxy; per-file sizes unmodeled.
         "FILES_TMPNAMES" | "FILES_SIZES" | "FILES_TMP_CONTENT" => None,
-        "XML" | "MULTIPART_FILENAME" | "MULTIPART_NAME" => None,
+        // XML/SOAP bodies are flattened into ARGS by the VM (element text,
+        // attribute values, CDATA), so an `XML`/`XML:/xpath` target maps to
+        // ARGS. The XPath sub-selector is dropped — we inspect the whole
+        // flattened body rather than evaluating XPath, which is enough to catch
+        // injection payloads carried inside XML.
+        "XML" => Some(Target::Args),
+        "MULTIPART_FILENAME" | "MULTIPART_NAME" => None,
         other => {
             warn!(
                 target = other,
@@ -403,6 +410,23 @@ pub(crate) fn crs_op_to_operator(op_name: &str, pattern: &str) -> Result<Operato
             .parse::<i64>()
             .map(|n| Operator::Ge(n + 1))
             .map_err(|_| anyhow::anyhow!("invalid integer in @gt: {}", pattern)),
+        // @ipMatch is now implemented natively instead of being disabled. The pattern is
+        // a comma- or space-separated list of addresses/CIDRs.
+        "ipmatch" => Ok(Operator::IpMatch(
+            pattern
+                .split([',', ' '])
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+        )),
+        // @rbl looked up a DNS blocklist, which we deliberately do not do on the request
+        // path (an unbounded network round-trip per request). In CRS, @rbl appears in
+        // the SSRF/RFI rules to ask "is this host somewhere it should not be" — which
+        // the native SSRF operator answers locally and more thoroughly, across every
+        // encoding of an internal address. Mapping it here restores the coverage those
+        // rules were written to provide instead of leaving them inert.
+        "rbl" => Ok(Operator::SsrfUrl),
         "validateurlencoding"
         | "validateutf8encoding"
         | "validatebyterange"
@@ -412,10 +436,11 @@ pub(crate) fn crs_op_to_operator(op_name: &str, pattern: &str) -> Result<Operato
         | "verifycpf"
         | "verifyssn"
         | "geolookup"
-        | "ipmatch"
+        // @ipMatchF/@ipMatchFromFile need the referenced file's contents, which the
+        // importer does not read. Left disabled deliberately rather than silently
+        // matching nothing under a name that implies it works.
         | "ipmatchf"
         | "ipmatchfromfile"
-        | "rbl"
         | "fuzzyhash"
         | "inspectfile"
         | "lookup" => {

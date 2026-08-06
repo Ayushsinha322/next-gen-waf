@@ -32,9 +32,57 @@ pub struct SentinelConfig {
     pub storage: StorageConfig,
     #[serde(default)]
     pub ebpf: EbpfConfig,
+    /// Global connection/request admission-control limits (DoS load-shedding).
+    #[serde(default)]
+    pub limits: LimitsConfig,
     /// Directory where ACME certs are persisted.
     /// Defaults to `$HOME/.config/sentinel/certs` or `/var/lib/sentinel/certs`.
     pub cert_dir: Option<PathBuf>,
+}
+
+// ---------------------------------------------------------------------------
+// Admission-control limits
+// ---------------------------------------------------------------------------
+
+/// Global concurrency ceilings enforced by the data plane so a connection or
+/// request flood sheds gracefully (connection reject / 503) instead of
+/// exhausting file descriptors or memory. Both are process-wide, spanning every
+/// listener and both transports (TCP h1/h2 and QUIC/h3).
+///
+/// Each field can be overridden at startup by an environment variable, which
+/// takes precedence over the config file: `SENTINEL_MAX_CONNECTIONS` and
+/// `SENTINEL_MAX_INFLIGHT_REQUESTS`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LimitsConfig {
+    /// Maximum concurrent client connections across all listeners. Connections
+    /// accepted beyond this are immediately closed (rejected) at the accept
+    /// loop before any per-connection task is spawned, bounding file-descriptor
+    /// and memory use under a connection flood.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
+    /// Maximum concurrent in-flight WAF-processed requests across all listeners.
+    /// This specifically bounds HTTP/2 and HTTP/3 stream multiplexing, where a
+    /// single connection may open hundreds of concurrent streams. Requests
+    /// beyond this limit receive `503 Service Unavailable` with `Retry-After`.
+    #[serde(default = "default_max_inflight_requests")]
+    pub max_inflight_requests: usize,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: default_max_connections(),
+            max_inflight_requests: default_max_inflight_requests(),
+        }
+    }
+}
+
+fn default_max_connections() -> usize {
+    10_000
+}
+
+fn default_max_inflight_requests() -> usize {
+    8_192
 }
 
 // ---------------------------------------------------------------------------
@@ -308,6 +356,17 @@ pub struct UpstreamConfig {
     pub load_balancer: LoadBalancerStrategy,
     pub servers: Vec<UpstreamServer>,
     pub health_check: Option<HealthCheckConfig>,
+    /// How long this site's origin may take to return response *headers*
+    /// (connect + send + first byte).  It does NOT bound the response body, so
+    /// long downloads and Server-Sent Events streams are unaffected.
+    ///
+    /// Raise it for apps with slow synchronous endpoints (report generation,
+    /// bulk export, some payment-gateway callbacks) that would otherwise 504.
+    /// `None` or `0` falls back to the deployment-wide default
+    /// (`SENTINEL_UPSTREAM_TIMEOUT_SECS`, 30s) — one slow app should not force
+    /// every other site on the node to wait as long.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -369,6 +428,45 @@ fn default_timeout() -> String {
 // WAF
 // ---------------------------------------------------------------------------
 
+/// Weighted verdict fusion: combine per-engine anomaly contributions with
+/// configurable weights, then decide the verdict against per-paranoia-level
+/// thresholds — with a soft LIMIT tier below the hard BLOCK tier. When `enable`
+/// is false the WAF uses the legacy flat `anomaly_threshold`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FusionConfig {
+    #[serde(default)]
+    pub enable: bool,
+    /// Per-engine weight multipliers (engine name → weight). Engines not listed
+    /// default to 1.0. Recognised engines: `rules`, `ml`, `bot`, `threat_intel`,
+    /// `reputation`, `correlation`, `plugin`.
+    #[serde(default)]
+    pub weights: HashMap<String, f32>,
+    /// Hard-block threshold per paranoia level (index 0 = PL1 … 3 = PL4). If the
+    /// list is shorter than the site's paranoia level, the last entry is used.
+    #[serde(default = "default_block_thresholds")]
+    pub block_thresholds: Vec<u32>,
+    /// Soft-LIMIT threshold per paranoia level (must be below block). Empty
+    /// disables the LIMIT tier (fused verdict is only ever Allow or Block).
+    #[serde(default = "default_limit_thresholds")]
+    pub limit_thresholds: Vec<u32>,
+    /// HTTP status returned for a LIMIT verdict.
+    #[serde(default = "default_limit_status")]
+    pub limit_status: u16,
+}
+
+fn default_block_thresholds() -> Vec<u32> {
+    // Stricter (lower) at higher paranoia levels — PL1..PL4.
+    vec![7, 5, 4, 3]
+}
+
+fn default_limit_thresholds() -> Vec<u32> {
+    vec![4, 3, 2, 2]
+}
+
+fn default_limit_status() -> u16 {
+    429
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WafConfig {
     #[serde(default)]
@@ -377,8 +475,27 @@ pub struct WafConfig {
     pub paranoia_level: u8,
     #[serde(default = "default_threshold")]
     pub anomaly_threshold: u32,
+    /// Weighted verdict fusion (per-engine weights + LIMIT tier + per-paranoia
+    /// thresholds). When absent/disabled the flat `anomaly_threshold` is used.
+    pub fusion: Option<FusionConfig>,
     #[serde(default)]
     pub rules: Vec<String>,
+    /// Operator-authored rules delivered as SRL source by the control plane,
+    /// rather than as a file path like `rules`.
+    ///
+    /// These come from the `rules` table and exist so an operator can virtual-patch
+    /// a zero-day without waiting for a data-plane image rebuild: the control plane
+    /// bumps the config version, the fleet re-fetches, and the rule is live.
+    ///
+    /// Source is shipped instead of compiled bytecode deliberately — bytecode would
+    /// couple the control plane's compiler version to the data plane's and make a
+    /// version skew silently mis-execute rules. Parsing here costs microseconds at
+    /// reload time and keeps exactly one compiler in the system.
+    #[serde(default)]
+    pub inline_rules: Vec<InlineRule>,
+    /// Per-path policy overrides, longest matching prefix wins. See PathOverride.
+    #[serde(default)]
+    pub path_overrides: Vec<PathOverride>,
     pub ml: Option<MlConfig>,
     pub ip_reputation: Option<IpReputationConfig>,
     pub rate_limit: Option<RateLimitConfig>,
@@ -387,6 +504,8 @@ pub struct WafConfig {
     #[serde(default)]
     pub api_discovery: bool,
     pub graphql: Option<GraphqlConfig>,
+    pub jwt: Option<JwtConfig>,
+    pub grpc: Option<GrpcConfig>,
     pub anti_ddos: Option<AntiDdosConfig>,
     pub geoip: Option<GeoIpConfig>,
     /// Paths to plugin manifests (`sentinel-plugin.toml` files).
@@ -443,6 +562,54 @@ pub struct CorsConfig {
 pub struct CustomHeader {
     pub name: String,
     pub value: String,
+}
+
+/// Per-path policy override, so one site can enforce different strictness on
+/// different parts of the application.
+///
+/// This is the shape F5 ASM calls URL-level enforcement: an API surface wants a
+/// lower threshold than the marketing pages, a legacy endpoint needs detect-only
+/// while it is being fixed, and static assets want the WAF out of the way.
+/// Without it a site has exactly one policy and the operator must pick a
+/// compromise that is wrong for part of the app — which is how false positives
+/// and under-protection both get baked in.
+///
+/// MATCHING is longest-prefix-wins, not regex, deliberately. An operator reading
+/// `/api/` can predict what it matches; a regex in a security control is a
+/// footgun (ReDoS, and subtly wrong anchoring is easy). Ties cannot happen
+/// because two identical prefixes are the same prefix.
+///
+/// WHAT CAN AND CANNOT BE OVERRIDDEN, and why this is not arbitrary:
+/// `mode` and `anomaly_threshold` are consulted per request, so they can vary by
+/// path. `paranoia_level` and `rule_exclusions` are applied when the rule engine
+/// is COMPILED (see load_site_engine) — the engine physically contains a
+/// different rule set — so overriding them per path would need a separate
+/// compiled engine per override, which is a larger change and multiplies memory
+/// by the number of overrides. They stay site-wide, and the control plane
+/// rejects an attempt to set them here rather than accepting and ignoring it.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PathOverride {
+    /// Path prefix this applies to, e.g. `/api/`. Matched against the request
+    /// path only — never the query string.
+    pub path_prefix: String,
+    /// Enforcement for this path. `off` lets the traffic through regardless of
+    /// what the rules found; `learning` records the verdict without acting.
+    #[serde(default)]
+    pub mode: Option<WafMode>,
+    /// Blocking threshold for this path. Lower is stricter.
+    #[serde(default)]
+    pub anomaly_threshold: Option<u32>,
+}
+
+/// One operator-authored rule, carried as SRL source from the control plane.
+///
+/// `name` is for diagnostics only: it is what gets logged when the rule fails to
+/// parse, so an operator can find the offending row in the UI. Rule identity for
+/// scoring and exclusions still comes from the `id:` inside the DSL.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct InlineRule {
+    pub name: String,
+    pub dsl: String,
 }
 
 /// Removes one or more targets from a rule to suppress known false positives.
@@ -561,6 +728,34 @@ pub struct BotDetectionConfig {
     pub ja4: bool,
     #[serde(default)]
     pub challenge: ChallengeMode,
+    /// Interactive-CAPTCHA provider settings, used when `challenge` selects a
+    /// third-party provider. Only the one matching `challenge` is consulted; the
+    /// site key is public (embedded in the challenge page) and the secret is used
+    /// server-side for token verification (siteverify).
+    #[serde(default)]
+    pub recaptcha: Option<CaptchaProvider>,
+    #[serde(default)]
+    pub hcaptcha: Option<CaptchaProvider>,
+    #[serde(default)]
+    pub turnstile: Option<CaptchaProvider>,
+}
+
+/// Credentials for a third-party CAPTCHA provider (reCAPTCHA / hCaptcha /
+/// Turnstile). `sitekey` is rendered into the challenge page; `secret` is sent
+/// to the provider's siteverify endpoint. `score` is the reCAPTCHA-v3 pass
+/// threshold (0..1) and is ignored by pass/fail providers.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CaptchaProvider {
+    #[serde(default)]
+    pub sitekey: String,
+    #[serde(default)]
+    pub secret: String,
+    #[serde(default = "default_captcha_score")]
+    pub score: f32,
+}
+
+fn default_captcha_score() -> f32 {
+    0.5
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -577,12 +772,29 @@ pub enum ChallengeMode {
     Turnstile,
 }
 
+/// What the DLP scanner does when it finds sensitive data in a response body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DlpAction {
+    /// Block the entire response (default — backward compatible).
+    #[default]
+    Block,
+    /// Redact the matched data in place and forward the sanitized response.
+    Mask,
+    /// Log the finding but forward the response unchanged.
+    Detect,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DlpConfig {
     #[serde(default)]
     pub enable: bool,
     #[serde(default)]
     pub patterns: Vec<String>,
+    /// Response action when sensitive data is found: `block` (default), `mask`,
+    /// or `detect` (log-only).
+    #[serde(default)]
+    pub action: DlpAction,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -593,6 +805,87 @@ pub struct GraphqlConfig {
     pub max_depth: u32,
     #[serde(default = "default_gql_complexity")]
     pub max_complexity: u32,
+    /// Block introspection queries (`__schema` / `__type`). Defaults to `true`
+    /// so schema disclosure is refused unless an operator opts out.
+    #[serde(default = "default_true")]
+    pub block_introspection: bool,
+}
+
+/// Per-site edge JWT / OAuth2 validation for protected customer APIs. When
+/// `enable` is set, the WAF verifies the client's `Authorization: Bearer` token
+/// (signature + expiry + issuer/audience + required scopes) before forwarding.
+/// Key material comes from a static HS256 secret, a public-key PEM, or a JWKS
+/// endpoint (fetched + cached, rotated by `kid`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JwtConfig {
+    #[serde(default)]
+    pub enable: bool,
+    /// Reject requests whose token is missing or invalid. When false, a token
+    /// is verified if present but a missing token is allowed through.
+    #[serde(default = "default_true")]
+    pub required: bool,
+    #[serde(default)]
+    pub issuer: Option<String>,
+    #[serde(default)]
+    pub audience: Option<String>,
+    #[serde(default = "default_jwt_algorithms")]
+    pub algorithms: Vec<String>,
+    /// HS256 shared secret (symmetric).
+    #[serde(default)]
+    pub hs_secret: Option<String>,
+    /// RSA / EC public key in PEM form (asymmetric static key).
+    #[serde(default)]
+    pub public_key_pem: Option<String>,
+    /// JWKS endpoint URL — keys fetched + cached, selected by token `kid`.
+    #[serde(default)]
+    pub jwks_url: Option<String>,
+    /// All of these scopes must be present in the token to pass.
+    #[serde(default)]
+    pub required_scopes: Vec<String>,
+    /// Claim carrying scopes (space-delimited string or array). Default `scope`.
+    #[serde(default = "default_scope_claim")]
+    pub scope_claim: String,
+}
+
+fn default_jwt_algorithms() -> Vec<String> {
+    vec!["RS256".to_string()]
+}
+
+fn default_scope_claim() -> String {
+    "scope".to_string()
+}
+
+/// gRPC firewall — protocol-aware limits for `application/grpc(+web)` traffic.
+/// Enforces message/frame size caps, per-method allow/deny lists, and blocks
+/// server-reflection. Applied only to requests whose content-type is gRPC.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrpcConfig {
+    #[serde(default)]
+    pub enable: bool,
+    /// Per-message size cap in bytes (anti-DoS). Default 4 MiB.
+    #[serde(default = "default_grpc_max_message")]
+    pub max_message_bytes: usize,
+    /// Max message frames allowed in one request body. Default 512.
+    #[serde(default = "default_grpc_max_frames")]
+    pub max_frames: usize,
+    /// Block gRPC server-reflection services (schema disclosure). Default true.
+    #[serde(default = "default_true")]
+    pub block_reflection: bool,
+    /// If non-empty, only these `/package.Service/Method` paths (or `/svc/`
+    /// prefixes ending in `/`) are allowed; all others are blocked.
+    #[serde(default)]
+    pub allowed_methods: Vec<String>,
+    /// These `/package.Service/Method` paths (or `/svc/` prefixes) are blocked.
+    #[serde(default)]
+    pub blocked_methods: Vec<String>,
+}
+
+fn default_grpc_max_message() -> usize {
+    4 * 1024 * 1024
+}
+
+fn default_grpc_max_frames() -> usize {
+    512
 }
 
 fn default_gql_depth() -> u32 {
@@ -601,6 +894,10 @@ fn default_gql_depth() -> u32 {
 
 fn default_gql_complexity() -> u32 {
     1000
+}
+
+fn default_true() -> bool {
+    true
 }
 
 // ---------------------------------------------------------------------------

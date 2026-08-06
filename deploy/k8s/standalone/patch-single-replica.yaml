@@ -1,0 +1,40 @@
+# One replica per tier, and no spreading constraints — there is only one node to
+# spread across.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sentinel-controlplane
+  namespace: sentinel
+spec:
+  replicas: 1
+  template:
+    spec:
+      # Dropped, not relaxed. The base uses REQUIRED anti-affinity to guarantee one
+      # control-plane replica per node; with a single replica on a single node there
+      # is nothing to separate, and leaving it would only risk the pod being
+      # unschedulable. (null removes the field under strategic-merge semantics.)
+      affinity: null
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinel-dataplane
+  namespace: sentinel
+spec:
+  replicas: 1
+  template:
+    spec:
+      affinity: null
+      # Zone spreading is meaningless on one node.
+      topologySpreadConstraints: null
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinel-dashboard
+  namespace: sentinel
+spec:
+  replicas: 1
+  template:
+    spec:
+      affinity: null

