@@ -213,6 +213,9 @@ func run() error {
 				if err := db.EnsurePluginSchema(ctx, pool); err != nil {
 					log.Warn("plugin schema ensure failed (non-fatal)", zap.Error(err))
 				}
+				if err := db.EnsureLogProfileSchema(ctx, pool); err != nil {
+					log.Warn("log profile schema ensure failed (non-fatal)", zap.Error(err))
+				}
 			} else {
 				log.Info("non-superuser DB role — skipping auto-seed/ensure-schema (handled by migrations run as the owner role)")
 			}
@@ -567,6 +570,16 @@ func run() error {
 		protected.GET("/events/facets", func(c *gin.Context) { handleEventsFacets(c, enforcer, chClient) })
 		protected.GET("/events/top-attackers", func(c *gin.Context) { handleTopAttackers(c, enforcer, chClient) })
 		protected.GET("/events/severity-timeline", func(c *gin.Context) { handleSeverityTimeline(c, enforcer, chClient) })
+		// Ad-hoc export of the current Threat Search view.
+		protected.GET("/events/export", func(c *gin.Context) { handleExportEvents(c, enforcer, store, chClient, hub) })
+
+		// Log profiles — saved per-application log views, and the export that
+		// turns one into a file to hand a customer.
+		protected.GET("/logs/profiles", func(c *gin.Context) { handleListLogProfiles(c, enforcer, store) })
+		protected.POST("/logs/profiles", func(c *gin.Context) { handleCreateLogProfile(c, enforcer, store, hub) })
+		protected.PUT("/logs/profiles/:id", func(c *gin.Context) { handleUpdateLogProfile(c, enforcer, store, hub) })
+		protected.DELETE("/logs/profiles/:id", func(c *gin.Context) { handleDeleteLogProfile(c, enforcer, store, hub) })
+		protected.GET("/logs/profiles/:id/export", func(c *gin.Context) { handleExportLogProfile(c, enforcer, store, chClient, hub) })
 
 		protected.GET("/geoip/blocked", func(c *gin.Context) { handleListBlockedCountries(c, enforcer, store) })
 		protected.POST("/geoip/block", func(c *gin.Context) { handleBlockCountry(c, enforcer, store, hub, cl) })

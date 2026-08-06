@@ -8,8 +8,9 @@
 import { useState, useEffect, useCallback } from "react";
 import { motion } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
-import { api, type WafEvent, type TimelineBucket, type EventQuery, type Site } from "@/lib/api";
+import { api, type WafEvent, type TimelineBucket, type EventQuery, type Site, type LogProfile } from "@/lib/api";
 import EventDrawer from "@/components/events/EventDrawer";
+import LogProfilePanel, { type ProfileFilters } from "@/components/events/LogProfilePanel";
 import { staggerContainer, fadeUp, cardVariants } from "@/lib/animations";
 
 const RANGES: { label: string; secs: number }[] = [
@@ -20,6 +21,20 @@ const RANGES: { label: string; secs: number }[] = [
 ];
 
 function fmtTime(ts: number) { return new Date(ts * 1000).toLocaleString(); }
+
+/** Format a unix timestamp for a <input type="datetime-local">, which wants
+ *  local wall-clock with no zone suffix. */
+function toLocalInput(ts: number): string {
+  const d = new Date(ts * 1000);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/** Seconds since epoch for a datetime-local value, interpreted as local time —
+ *  the operator types the customer's date in their own clock. */
+function fromLocalInput(v: string): number {
+  return Math.floor(new Date(v).getTime() / 1000);
+}
 
 export default function EventsPage() {
   const [status, setStatus] = useState<{ configured: boolean; reachable: boolean; events?: number; error?: string } | null>(null);
@@ -35,6 +50,24 @@ export default function EventsPage() {
   const [selected, setSelected] = useState<WafEvent | null>(null);
   const [sites, setSites] = useState<Site[]>([]);
 
+  // Time window. "relative" is the rolling last-N presets; "absolute" is the
+  // explicit From/To a customer asks for ("logs for 3 August"), which the
+  // presets cannot express at all.
+  const [mode, setMode] = useState<"relative" | "absolute">("relative");
+  const [absFrom, setAbsFrom] = useState("");
+  const [absTo, setAbsTo] = useState("");
+  // The window the results on screen actually cover. Export reuses it so the
+  // file the customer receives matches the preview the operator just checked.
+  const [win, setWin] = useState<{ from: number; to: number }>(() => {
+    const to = Math.floor(Date.now() / 1000) + 60;
+    return { from: to - 86400 - 60, to };
+  });
+
+  // Saved per-application views.
+  const [profiles, setProfiles] = useState<LogProfile[]>([]);
+  const [activeProfileId, setActiveProfileId] = useState("");
+  const [exporting, setExporting] = useState(false);
+
   // active filters
   const [q, setQ] = useState("");
   const [site, setSite] = useState("");
@@ -42,22 +75,38 @@ export default function EventsPage() {
   const [action, setAction] = useState("");
   const [ip, setIp] = useState("");
   const [protocol, setProtocol] = useState("");
+  const [severity, setSeverity] = useState("");
+  // No filter-bar control of its own — a profile can still carry one, and it is
+  // applied to the query and shown as an active-filter chip.
+  const [country, setCountry] = useState("");
 
   // `override` lets callers search with a value they just set this render —
   // `setRule(k); run()` would otherwise search with the *previous* rule because
   // state updates and this captured closure both lag a render behind.
   const run = useCallback(async (override?: Partial<EventQuery>) => {
+    let from: number, to: number;
+    if (mode === "absolute" && absFrom && absTo) {
+      from = fromLocalInput(absFrom);
+      to = fromLocalInput(absTo);
+      if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) {
+        showToast("'To' must be after 'From'", "e", "⚠️");
+        return;
+      }
+    } else {
+      to = Math.floor(Date.now() / 1000) + 60;
+      from = to - rangeSecs - 60;
+    }
     setLoading(true);
-    const to = Math.floor(Date.now() / 1000) + 60;
-    const from = to - rangeSecs - 60;
-    const filter: EventQuery = { from, to, limit: 300, q, site, rule, action, ip, protocol, ...override };
+    setWin({ from, to });
+    const spanSecs = to - from;
+    const filter: EventQuery = { from, to, limit: 300, q, site, rule, action, ip, protocol, severity, country, ...override };
     try {
       const st = await api.events.status();
       setStatus(st);
       if (!st.configured || !st.reachable) { setLoading(false); return; }
       const [s, t, rf, ipf, pf] = await Promise.all([
         api.events.search(filter),
-        api.events.timeline(from, to, rangeSecs > 86400 ? 3600 : 60),
+        api.events.timeline(from, to, spanSecs > 86400 ? 3600 : 60),
         api.events.facets("rule", from, to, 8),
         api.events.facets("ip", from, to, 8),
         api.events.facets("protocol", from, to, 8),
@@ -69,9 +118,40 @@ export default function EventsPage() {
       setProtocolFacets(pf.facets ?? []);
     } catch (e) { showToast(e instanceof Error ? e.message : "Search failed", "e", "⚠️"); }
     finally { setLoading(false); }
-  }, [rangeSecs, q, site, rule, action, ip, protocol]);
+  }, [mode, absFrom, absTo, rangeSecs, q, site, rule, action, ip, protocol, severity, country]);
 
-  useEffect(() => { run(); }, [rangeSecs]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Re-run whenever the window changes — a preset click, or a complete
+  // From/To pair. Filter edits still wait for Search, so typing an IP does not
+  // fire a query per keystroke.
+  useEffect(() => {
+    if (mode === "absolute" && !(absFrom && absTo)) return;
+    run();
+  }, [rangeSecs, mode, absFrom, absTo]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const loadProfiles = useCallback(() => {
+    api.logProfiles.list()
+      .then(r => setProfiles(r.profiles ?? []))
+      // Non-fatal: Threat Search itself must keep working without saved views.
+      .catch(() => { /* leaves the picker empty */ });
+  }, []);
+
+  useEffect(() => { loadProfiles(); }, [loadProfiles]);
+
+  /** Apply a saved view: its filters, its site, and its default window. */
+  function loadProfile(p: LogProfile | null) {
+    setActiveProfileId(p?.id ?? "");
+    if (!p) return;
+    setSite(p.site); setRule(p.rule); setAction(p.action); setIp(p.ip);
+    setCountry(p.country); setProtocol(p.protocol); setSeverity(p.severity); setQ(p.q);
+    // Opening a profile puts you on its default rolling window; the operator
+    // then narrows to the date the customer actually asked for.
+    setMode("relative");
+    setRangeSecs(p.default_range_secs);
+    run({
+      site: p.site, rule: p.rule, action: p.action, ip: p.ip,
+      country: p.country, protocol: p.protocol, severity: p.severity, q: p.q,
+    });
+  }
 
   // Site list for the detail drawer. Events carry a site NAME; the exclusion
   // endpoint is keyed by site ID, so the drawer needs the mapping. Fetched once
@@ -86,8 +166,18 @@ export default function EventsPage() {
   }, []);
 
   const maxBucket = Math.max(1, ...timeline.map(b => b.total));
-  const clearFilters = () => { setQ(""); setSite(""); setRule(""); setAction(""); setIp(""); setProtocol(""); run({ q: "", site: "", rule: "", action: "", ip: "", protocol: "" }); };
-  const activeFilters = [["site", site], ["rule", rule], ["action", action], ["ip", ip], ["protocol", protocol], ["q", q]].filter(([, v]) => v) as [string, string][];
+  const clearFilters = () => {
+    setQ(""); setSite(""); setRule(""); setAction(""); setIp(""); setProtocol("");
+    setSeverity(""); setCountry("");
+    // Clearing the filters detaches from the saved view — leaving the profile
+    // selected while its filters are gone would misreport what is on screen.
+    setActiveProfileId("");
+    run({ q: "", site: "", rule: "", action: "", ip: "", protocol: "", severity: "", country: "" });
+  };
+  const activeFilters = [["site", site], ["rule", rule], ["action", action], ["ip", ip],
+    ["protocol", protocol], ["severity", severity], ["country", country], ["q", q]]
+    .filter(([, v]) => v) as [string, string][];
+  const filters: ProfileFilters = { site, rule, action, ip, country, protocol, severity, q };
 
   return (
     <motion.div className="sec" variants={staggerContainer} initial="hidden" animate="visible">
@@ -100,13 +190,61 @@ export default function EventsPage() {
         </div>
         <div style={{ display: "flex", gap: 4, padding: 4, background: "var(--bg3)", borderRadius: 10 }}>
           {RANGES.map(r => (
-            <button key={r.label} onClick={() => setRangeSecs(r.secs)} style={{
+            <button key={r.label} onClick={() => { setMode("relative"); setRangeSecs(r.secs); }} style={{
               padding: "6px 14px", borderRadius: 7, border: "none", cursor: "pointer", fontSize: 14, fontWeight: 600,
-              background: rangeSecs === r.secs ? "var(--cyan)" : "transparent", color: rangeSecs === r.secs ? "#021018" : "var(--text2)",
+              background: mode === "relative" && rangeSecs === r.secs ? "var(--cyan)" : "transparent",
+              color: mode === "relative" && rangeSecs === r.secs ? "#021018" : "var(--text2)",
             }}>{r.label}</button>
           ))}
+          <button
+            onClick={() => {
+              // Seed the pickers from the window already on screen so switching
+              // to Custom never blanks the view.
+              if (!absFrom) setAbsFrom(toLocalInput(win.from));
+              if (!absTo) setAbsTo(toLocalInput(win.to));
+              setMode("absolute");
+            }}
+            title="Pick exact dates — for when a customer asks for a specific day"
+            style={{
+              padding: "6px 14px", borderRadius: 7, border: "none", cursor: "pointer", fontSize: 14, fontWeight: 600,
+              background: mode === "absolute" ? "var(--cyan)" : "transparent",
+              color: mode === "absolute" ? "#021018" : "var(--text2)",
+            }}>Custom</button>
         </div>
       </motion.div>
+
+      {mode === "absolute" && (
+        <motion.div className="panel" variants={fadeUp}>
+          <div className="pb" style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end" }}>
+            <div className="fg2">
+              <label className="flbl2">Whole day</label>
+              <input
+                className="fi2" type="date"
+                title="The common ask — pick one date and get midnight to midnight"
+                onChange={e => {
+                  if (!e.target.value) return;
+                  setAbsFrom(`${e.target.value}T00:00`);
+                  const next = new Date(`${e.target.value}T00:00`);
+                  next.setDate(next.getDate() + 1);
+                  setAbsTo(toLocalInput(Math.floor(next.getTime() / 1000)));
+                }}
+              />
+            </div>
+            <div className="fg2">
+              <label className="flbl2">From</label>
+              <input className="fi2" type="datetime-local" value={absFrom} onChange={e => setAbsFrom(e.target.value)} />
+            </div>
+            <div className="fg2">
+              <label className="flbl2">To</label>
+              <input className="fi2" type="datetime-local" value={absTo} onChange={e => setAbsTo(e.target.value)} />
+            </div>
+            <div style={{ fontSize: 12, color: "var(--text3)", paddingBottom: 6, maxWidth: 320 }}>
+              Times are your local clock. Timestamps inside the exported file are
+              UTC, and its name states the window it covers.
+            </div>
+          </div>
+        </motion.div>
+      )}
 
       {/* not-configured state */}
       {status && !status.configured ? (
@@ -123,6 +261,22 @@ export default function EventsPage() {
         </div></motion.div>
       ) : (
         <>
+          {/* saved per-application views + the export handed to a customer */}
+          <motion.div variants={fadeUp}>
+            <LogProfilePanel
+              profiles={profiles}
+              sites={sites}
+              activeId={activeProfileId}
+              filters={filters}
+              from={win.from}
+              to={win.to}
+              busy={loading || exporting}
+              onLoad={loadProfile}
+              onChanged={loadProfiles}
+              onExporting={setExporting}
+            />
+          </motion.div>
+
           {/* filter bar */}
           <motion.div className="panel" variants={fadeUp}><div className="pb" style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
             <input className="fi2" placeholder="🔍 search path / attack / rule…" style={{ flex: 1, minWidth: 200 }} value={q}
@@ -135,6 +289,10 @@ export default function EventsPage() {
             </select>
             <select className="fsel" value={action} onChange={e => setAction(e.target.value)}>
               <option value="">All actions</option><option value="BLOCK">BLOCK</option><option value="DETECT">DETECT</option>
+            </select>
+            <select className="fsel" value={severity} onChange={e => { setSeverity(e.target.value); run({ severity: e.target.value }); }}>
+              <option value="">All severities</option>
+              {["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"].map(s => <option key={s} value={s}>{s}</option>)}
             </select>
             <button className="btn bc btn-sm" onClick={() => run()}>Search</button>
             {activeFilters.length > 0 && <button className="btn bg-btn btn-sm" onClick={clearFilters}>✕ Clear</button>}

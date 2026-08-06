@@ -227,10 +227,10 @@ type Attacker struct {
 type SearchFilter struct {
 	// Tenant scopes the query to one tenant's events. It is the security
 	// boundary for Threat Search and is always applied by searchWhere.
-	Tenant                                           string
-	Site, Country, Rule, Action, IP, Protocol, Query string
-	From, To                                         int64
-	Limit                                            int
+	Tenant                                                     string
+	Site, Country, Rule, Action, IP, Protocol, Severity, Query string
+	From, To                                                   int64
+	Limit                                                      int
 }
 
 // ---------------------------------------------------------------------------
@@ -309,6 +309,11 @@ func (c *Client) searchWhere(f SearchFilter) []string {
 	}
 	if f.Protocol != "" {
 		where = append(where, eq("protocol", strings.ToLower(f.Protocol)))
+	}
+	if f.Severity != "" {
+		// Compared upper-cased on both sides: the data plane has written mixed
+		// case over the life of the table, so a literal match would drop rows.
+		where = append(where, fmt.Sprintf("upper(severity) = '%s'", esc(strings.ToUpper(f.Severity))))
 	}
 	if f.Query != "" {
 		// substring match across path / attack / rule
@@ -461,6 +466,117 @@ func (c *Client) RecentThreatIntelBlocks(ctx context.Context, tenant string, fro
 		return nil, err
 	}
 	return out, nil
+}
+
+// ---------------------------------------------------------------------------
+// Export
+// ---------------------------------------------------------------------------
+
+// exportColumns is the column list handed to a customer. Deliberately spelled
+// out rather than SELECT * so that adding a column to waf_events — which may
+// carry internal or sensitive detail — never silently starts appearing in
+// customer-facing exports. ts is rendered as an ISO-8601 UTC string, not a unix
+// integer: this file is read by a human in a ticket, and a bare epoch is the
+// single most common complaint about exported WAF logs.
+const exportColumns = `formatDateTime(ts, '%Y-%m-%dT%H:%i:%SZ', 'UTC') AS timestamp_utc, ` +
+	`ip, country, site, method, path, rule, attack, action, severity, score, status, ` +
+	`protocol, request_id, target, mode, threshold, explanation`
+
+// ExportFormat maps a requested format onto its ClickHouse FORMAT clause, MIME
+// type and file extension. Whitelisted — the format string reaches SQL.
+type ExportFormat struct {
+	Name      string
+	chFormat  string
+	MediaType string
+	Ext       string
+}
+
+var exportFormats = map[string]ExportFormat{
+	"csv":    {"csv", "CSVWithNames", "text/csv; charset=utf-8", "csv"},
+	"ndjson": {"ndjson", "JSONEachRow", "application/x-ndjson; charset=utf-8", "ndjson"},
+	"json":   {"json", "JSON", "application/json; charset=utf-8", "json"},
+}
+
+// LookupExportFormat resolves a caller-supplied format name.
+func LookupExportFormat(name string) (ExportFormat, bool) {
+	f, ok := exportFormats[strings.ToLower(strings.TrimSpace(name))]
+	return f, ok
+}
+
+// ExportCount returns how many events match the filter.
+//
+// Why the caller counts before streaming: an export is handed to a customer,
+// often during an incident. A file that was silently cut off at a row cap is
+// worse than no file — it reads as a complete record of the window and quietly
+// omits the events that matter. So the caller counts first and refuses an
+// oversized export with the real number, rather than truncating. This is also
+// the row count written to the audit trail.
+func (c *Client) ExportCount(ctx context.Context, f SearchFilter) (int64, error) {
+	var rows []struct {
+		N int64 `json:"n"`
+	}
+	sql := fmt.Sprintf("SELECT count() AS n FROM %s.waf_events WHERE %s",
+		c.db, strings.Join(c.searchWhere(f), " AND "))
+	if err := c.queryJSON(ctx, sql, &rows); err != nil {
+		return 0, err
+	}
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	return rows[0].N, nil
+}
+
+// ExportStream streams matching events in the requested format.
+//
+// The returned reader is the live ClickHouse response body — the caller copies
+// it straight to the HTTP response and MUST Close it. Nothing is buffered in
+// control-plane memory, so a year of events for a busy site costs a constant
+// number of bytes here rather than proportional heap.
+//
+// Ordered ts ASC, unlike Search's newest-first: this is a log file, and a log
+// file that runs backwards is unreadable to whoever receives it.
+func (c *Client) ExportStream(ctx context.Context, f SearchFilter, format ExportFormat) (io.ReadCloser, error) {
+	sql := fmt.Sprintf(
+		"SELECT %s FROM %s.waf_events WHERE %s ORDER BY ts ASC",
+		exportColumns, c.db, strings.Join(c.searchWhere(f), " AND "))
+	if f.Limit > 0 {
+		sql += fmt.Sprintf(" LIMIT %d", f.Limit)
+	}
+	return c.queryStream(ctx,
+		sql+" SETTINGS output_format_json_quote_64bit_integers = 0 FORMAT "+format.chFormat)
+}
+
+// queryStream POSTs raw SQL and returns the undrained response body. Unlike
+// query() it does not read the body into memory; the caller owns closing it.
+func (c *Client) queryStream(ctx context.Context, sql string) (io.ReadCloser, error) {
+	if !c.enabled {
+		return nil, ErrDisabled
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url, strings.NewReader(sql))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "text/plain; charset=utf-8")
+	if c.user != "" {
+		req.Header.Set("X-ClickHouse-User", c.user)
+	}
+	if c.password != "" {
+		req.Header.Set("X-ClickHouse-Key", c.password)
+	}
+	// The shared client's 10s timeout covers the whole body for a streamed
+	// response, which would cut long exports off mid-file. Use a transport-level
+	// clone with no overall deadline; cancellation rides on ctx instead.
+	hc := &http.Client{Transport: c.http.Transport}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+		resp.Body.Close()
+		return nil, fmt.Errorf("clickhouse HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return resp.Body, nil
 }
 
 // ---------------------------------------------------------------------------

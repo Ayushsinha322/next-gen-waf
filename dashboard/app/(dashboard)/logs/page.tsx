@@ -1,5 +1,6 @@
 "use client";
 import { useState, useEffect, useRef, useCallback, Suspense } from "react";
+import Link from "next/link";
 import { motion } from "framer-motion";
 import { api } from "@/lib/api";
 import { spring } from "@/lib/animations";
@@ -229,6 +230,13 @@ function LogsInner() {
       <div className="lgw-hd">
         <div className="lgw-bc">/ <span>Operations</span> / <span>Logs</span></div>
         <div className="lgw-acts">
+          {/* This page is a live tail: in-memory, capped, and gone on refresh.
+              An operator arriving here to answer "send me my logs for 3 August"
+              is in the wrong place, and nothing else on screen says so. */}
+          <Link href="/events" className="lgw-btn" title="Saved per-application log views and downloadable history">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+            Log Profiles &amp; history
+          </Link>
           <motion.button className="lgw-btn" onClick={copyAll} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
             Copy

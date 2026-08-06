@@ -363,9 +363,55 @@ export interface Attacker {
 
 export interface EventQuery {
   site?: string; country?: string; rule?: string; action?: string;
-  ip?: string; protocol?: string; q?: string; from?: number; to?: number; limit?: number;
+  ip?: string; protocol?: string; severity?: string; q?: string;
+  from?: number; to?: number; limit?: number;
   // Query-param bag: also indexable so it can be fed to eventQS().
   [key: string]: string | number | undefined;
+}
+
+// --- Log profiles ------------------------------------------------------------
+// A saved, named log view scoped to one web application. Exists for the support
+// workflow "the customer wants their app's logs for 3 August": the filters are
+// saved once per application, and only the date changes call to call.
+
+export type ExportFormat = "csv" | "ndjson" | "json";
+
+export interface LogProfile {
+  id: string;
+  tenant_id: string;
+  name: string;
+  description: string;
+  site: string;
+  rule: string;
+  action: string;
+  ip: string;
+  country: string;
+  protocol: string;
+  severity: string;
+  q: string;
+  /** Window the UI pre-selects when the profile is opened (seconds). */
+  default_range_secs: number;
+  default_format: ExportFormat;
+  created_by?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Create/update payload. Every field but `name` is optional so a PATCH-style
+ *  update can leave stored filters untouched. */
+export interface LogProfileInput {
+  name: string;
+  description?: string;
+  site?: string;
+  rule?: string;
+  action?: string;
+  ip?: string;
+  country?: string;
+  protocol?: string;
+  severity?: string;
+  q?: string;
+  default_range_secs?: number;
+  default_format?: ExportFormat;
 }
 
 // --- Threat Intelligence -----------------------------------------------------
@@ -612,6 +658,65 @@ export function eventQS(f: Record<string, unknown>): string {
     if (v !== undefined && v !== null && v !== "") p.set(k, String(v));
   }
   return p.toString();
+}
+
+/** Pull the filename out of a Content-Disposition header.
+ *
+ *  The server names the file after the application and the exact window it
+ *  covers, so preserving that name matters: the commonest support failure with
+ *  exported logs is nobody being able to tell, later, what period a file held.
+ *  Falls back to the caller's name if the header is missing or unparseable. */
+function filenameFromDisposition(header: string | null, fallback: string): string {
+  if (!header) return fallback;
+  const m = /filename\*?=(?:UTF-8'')?"?([^\";]+)"?/i.exec(header);
+  return m?.[1] ? decodeURIComponent(m[1]) : fallback;
+}
+
+/** Download a server-generated export and hand it to the browser.
+ *
+ *  Deliberately not apiFetch: the success path is a file body plus headers, the
+ *  failure path is JSON, and the server streams the full match set rather than
+ *  the page the UI happens to be showing — so the operator gets every event in
+ *  the window, not the 300 rows on screen.
+ *
+ *  Returns the row count the server reported so the caller can tell the operator
+ *  exactly what they are about to hand a customer. */
+async function downloadExport(path: string, fallbackName: string): Promise<{ filename: string; rows: number }> {
+  const token = getToken();
+  const headers: Record<string, string> = {};
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+
+  let res = await fetch(`${BASE}${path}`, { headers });
+  if (res.status === 401) {
+    const refreshed = await refreshToken();
+    if (!refreshed) {
+      logout();
+      if (typeof window !== "undefined") window.location.href = "/login";
+      throw new Error("Session expired — redirecting to login");
+    }
+    const newToken = getToken();
+    if (newToken) headers["Authorization"] = `Bearer ${newToken}`;
+    res = await fetch(`${BASE}${path}`, { headers });
+  }
+  if (!res.ok) {
+    // Errors on this endpoint are JSON and carry the actionable detail — the
+    // real row count when an export is refused as too large, for instance.
+    const data = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new Error(data.error || `export failed: ${res.status}`);
+  }
+
+  const filename = filenameFromDisposition(res.headers.get("Content-Disposition"), fallbackName);
+  const rows = Number(res.headers.get("X-Sentinel-Export-Rows") ?? 0);
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  return { filename, rows };
 }
 
 export const api = {
@@ -913,6 +1018,29 @@ export const api = {
     severityTimeline: (from?: number, to?: number, bucket = 60) =>
       apiFetch<{ buckets: SeverityBucket[]; clickhouse: boolean }>(
         `/events/severity-timeline?${eventQS({ from, to })}&bucket=${bucket}`),
+    /** Download the current ad-hoc view as a file. Streams the FULL match set
+     *  from the server, not the rows the table happens to have loaded. */
+    exportDownload: (f: EventQuery, format: ExportFormat = "csv") =>
+      downloadExport(`/events/export?${eventQS({ ...f, format })}`, `waf-events.${format}`),
+  },
+
+  /** Saved per-application log views + the export handed to a customer. */
+  logProfiles: {
+    list: () => apiFetch<{ profiles: LogProfile[] }>("/logs/profiles"),
+    create: (body: LogProfileInput) =>
+      apiFetch<{ profile: LogProfile }>("/logs/profiles", { method: "POST", body: JSON.stringify(body) }),
+    update: (id: string, body: LogProfileInput) =>
+      apiFetch<{ profile: LogProfile }>(`/logs/profiles/${encodeURIComponent(id)}`, {
+        method: "PUT", body: JSON.stringify(body),
+      }),
+    remove: (id: string) =>
+      apiFetch<{ deleted: boolean }>(`/logs/profiles/${encodeURIComponent(id)}`, { method: "DELETE" }),
+    /** Export a saved profile over an explicit window. The profile supplies
+     *  WHICH events, from/to supply WHEN — that split is the point. */
+    exportDownload: (id: string, from: number, to: number, format: ExportFormat) =>
+      downloadExport(
+        `/logs/profiles/${encodeURIComponent(id)}/export?${eventQS({ from, to, format })}`,
+        `waf-events.${format}`),
   },
 
   threatIntel: {
