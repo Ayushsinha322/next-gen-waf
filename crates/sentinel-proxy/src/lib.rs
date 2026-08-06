@@ -98,6 +98,123 @@ type DlpMap = HashMap<String, DlpScanner>;
 type FeedCache = Arc<ArcSwap<Vec<(String, Vec<String>)>>>;
 
 // ---------------------------------------------------------------------------
+// Response-body buffering
+// ---------------------------------------------------------------------------
+
+/// Largest response prefix buffered for inspection (DLP + response-body rules).
+///
+/// The cap must be enforced *while reading*.  A chunked response carries no
+/// `Content-Length`, so `size_hint()` reports no upper bound — a
+/// collect-then-check would let an origin stream unbounded bytes into memory
+/// before the check ever ran.  This is the response-side twin of the
+/// request-body OOM already closed in phase 2.
+const RESPONSE_SCAN_CAP: usize = 512 * 1024;
+
+/// A body that replays an already-buffered prefix before streaming the rest of
+/// the inner body.
+///
+/// When a response turns out to exceed [`RESPONSE_SCAN_CAP`], its prefix has
+/// already been pulled off the wire and cannot be un-read.  Rather than drop
+/// the response (or buffer the whole thing), the prefix is replayed here and
+/// the remainder streams straight through.
+struct PrefixedBody {
+    prefix: Option<Bytes>,
+    inner: BoxBody,
+}
+
+impl Body for PrefixedBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        // Both fields are `Unpin` — `Option<Bytes>`, and the `Pin<Box<..>>`
+        // inside `BoxBody` — so plain projection is sound.
+        let this = self.get_mut();
+        if let Some(prefix) = this.prefix.take() {
+            if !prefix.is_empty() {
+                return std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(prefix))));
+            }
+        }
+        std::pin::Pin::new(&mut this.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.prefix.as_ref().is_none_or(|p| p.is_empty()) && self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        let pending = self.prefix.as_ref().map_or(0, |p| p.len() as u64);
+        let inner = self.inner.size_hint();
+        let mut hint = hyper::body::SizeHint::new();
+        hint.set_lower(inner.lower().saturating_add(pending));
+        if let Some(upper) = inner.upper() {
+            hint.set_upper(upper.saturating_add(pending));
+        }
+        hint
+    }
+}
+
+/// Outcome of buffering a response body for inspection.
+enum ScanBuffer {
+    /// The whole body fit under the cap and can be scanned / rewritten.
+    Complete(Bytes),
+    /// The body exceeds the cap: the prefix already read off the wire, plus the
+    /// untouched remainder. Inspection is skipped — a partial view cannot be
+    /// scanned soundly, and DLP masking has to rewrite the whole payload.
+    Oversize { prefix: Bytes, rest: BoxBody },
+    /// The origin errored part-way through the body.
+    Error(hyper::Error),
+}
+
+/// Read a response body into memory, but never more than `cap` bytes.
+///
+/// The cap is enforced frame by frame rather than by checking `size_hint()`
+/// first: a chunked response declares no length, so there is no upper bound to
+/// check, and a collect-then-check would already have pulled the whole body
+/// into memory by the time the check ran.
+async fn buffer_for_scan(mut body: BoxBody, cap: usize) -> ScanBuffer {
+    let mut chunks: Vec<Bytes> = Vec::new();
+    let mut buffered = 0usize;
+
+    loop {
+        match body.frame().await {
+            None => return ScanBuffer::Complete(concat_chunks(chunks)),
+            Some(Err(e)) => return ScanBuffer::Error(e),
+            Some(Ok(frame)) => {
+                // Non-data frames (trailers) carry nothing to scan.
+                if let Ok(data) = frame.into_data() {
+                    buffered += data.len();
+                    chunks.push(data);
+                    if buffered > cap {
+                        return ScanBuffer::Oversize {
+                            prefix: concat_chunks(chunks),
+                            rest: body,
+                        };
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Join buffered body chunks into one contiguous `Bytes` without copying the
+/// common single-chunk case.
+fn concat_chunks(chunks: Vec<Bytes>) -> Bytes {
+    if chunks.len() == 1 {
+        return chunks.into_iter().next().unwrap_or_default();
+    }
+    let total: usize = chunks.iter().map(|c| c.len()).sum();
+    let mut buf = bytes::BytesMut::with_capacity(total);
+    for c in &chunks {
+        buf.extend_from_slice(c);
+    }
+    buf.freeze()
+}
+
+// ---------------------------------------------------------------------------
 // DLP scanner — Phase 5 response-body PII / secret detection
 // ---------------------------------------------------------------------------
 
@@ -2857,135 +2974,146 @@ async fn proxy(
             || ct.contains("javascript")
             || ct.is_empty();
 
-        if is_scannable {
-            // Collect up to 512 KiB for scanning.  Larger responses pass
-            // through uninspected (streaming inspection is a future change).
-            const SCAN_CAP: u64 = 512 * 1024;
-            let upper = resp_body.size_hint().upper().unwrap_or(0);
-            if upper <= SCAN_CAP || upper == u64::MAX {
-                match resp_body.collect().await {
-                    Ok(collected) => {
-                        let mut bytes = collected.to_bytes();
+        // A response that DECLARES an oversized length streams straight through
+        // — no point buffering to discover what the origin already told us.
+        let declared_oversize = resp_body
+            .size_hint()
+            .upper()
+            .is_some_and(|u| u > RESPONSE_SCAN_CAP as u64);
 
-                        // (1) Response-body rule engine (CRS RESPONSE-* etc.).
-                        if let Some(engine) = resp_engine {
-                            ctx.response_body = Some(bytes.clone());
-                            engine.evaluate(
-                                &mut ctx,
-                                Phase::ResponseBody,
-                                site_cfg.waf.anomaly_threshold,
+        if is_scannable && !declared_oversize {
+            // Box first so the body is `Unpin` for frame-by-frame reads; every
+            // branch below boxes it anyway, so this costs nothing extra.
+            match buffer_for_scan(resp_body.boxed(), RESPONSE_SCAN_CAP).await {
+                ScanBuffer::Error(e) => {
+                    warn!("response-body read error: {e}");
+                    http_body_util::Empty::<Bytes>::new()
+                        .map_err(|never: Infallible| match never {})
+                        .boxed()
+                }
+                ScanBuffer::Oversize { prefix, rest } => {
+                    // Too large to scan: replay what was already read, stream
+                    // the rest. Never silent — an unscanned response is a
+                    // coverage gap the operator has to be able to see.
+                    warn!(
+                        site = %site_cfg.id,
+                        cap_bytes = RESPONSE_SCAN_CAP,
+                        "response exceeds the scan cap — forwarded WITHOUT DLP / response-rule inspection"
+                    );
+                    PrefixedBody {
+                        prefix: Some(prefix),
+                        inner: rest,
+                    }
+                    .boxed()
+                }
+                ScanBuffer::Complete(mut bytes) => {
+                    // (1) Response-body rule engine (CRS RESPONSE-* etc.).
+                    if let Some(engine) = resp_engine {
+                        ctx.response_body = Some(bytes.clone());
+                        engine.evaluate(
+                            &mut ctx,
+                            Phase::ResponseBody,
+                            site_cfg.waf.anomaly_threshold,
+                        );
+                        // Respect learning mode (downgrade Block → Log).
+                        let gm = governing_mode(&ctx, &site_cfg.waf.mode);
+                        enforce_mode(&mut ctx, &gm);
+                        if ctx.decision == WafDecision::Block {
+                            warn!(
+                                site = %site_cfg.id,
+                                client_ip = %ctx.client_ip,
+                                "response-body rule matched — blocking"
                             );
-                            // Respect learning mode (downgrade Block → Log).
-                            let gm = governing_mode(&ctx, &site_cfg.waf.mode);
-                            enforce_mode(&mut ctx, &gm);
-                            if ctx.decision == WafDecision::Block {
-                                warn!(
-                                    site = %site_cfg.id,
-                                    client_ip = %ctx.client_ip,
-                                    "response-body rule matched — blocking"
-                                );
-                                ctx.advance_phase(Phase::Logging);
-                                log_request(&ctx);
-                                return Ok(block_response(&ctx));
-                            }
+                            ctx.advance_phase(Phase::Logging);
+                            log_request(&ctx);
+                            return Ok(block_response(&ctx));
                         }
+                    }
 
-                        // (2) DLP — scan / mask / detect on PII & secret
-                        // leakage, per the site's configured action.
-                        if let Some(dlp) = dlp {
-                            match dlp.action {
-                                // Block the whole response on any match.
-                                DlpAction::Block => {
-                                    if let Some(matched) = dlp.scan(&bytes) {
-                                        ctx.decision = WafDecision::Block;
-                                        ctx.block_reason = Some(format!(
-                                            "DLP: sensitive data pattern matched: {matched}"
-                                        ));
-                                        // Learning mode downgrades Block → Log —
-                                        // must not block or rewrite, only record.
-                                        let gm = governing_mode(&ctx, &site_cfg.waf.mode);
-                                        enforce_mode(&mut ctx, &gm);
-                                        if ctx.decision == WafDecision::Block {
-                                            warn!(
-                                                site = %site_cfg.id,
-                                                client_ip = %ctx.client_ip,
-                                                pattern = matched,
-                                                "DLP: sensitive data in response — blocking"
-                                            );
-                                            ctx.advance_phase(Phase::Logging);
-                                            log_request(&ctx);
-                                            return Ok(block_response(&ctx));
-                                        }
+                    // (2) DLP — scan / mask / detect on PII & secret
+                    // leakage, per the site's configured action.
+                    if let Some(dlp) = dlp {
+                        match dlp.action {
+                            // Block the whole response on any match.
+                            DlpAction::Block => {
+                                if let Some(matched) = dlp.scan(&bytes) {
+                                    ctx.decision = WafDecision::Block;
+                                    ctx.block_reason = Some(format!(
+                                        "DLP: sensitive data pattern matched: {matched}"
+                                    ));
+                                    // Learning mode downgrades Block → Log —
+                                    // must not block or rewrite, only record.
+                                    let gm = governing_mode(&ctx, &site_cfg.waf.mode);
+                                    enforce_mode(&mut ctx, &gm);
+                                    if ctx.decision == WafDecision::Block {
                                         warn!(
                                             site = %site_cfg.id,
                                             client_ip = %ctx.client_ip,
                                             pattern = matched,
-                                            "DLP: sensitive data in response — would block (learning mode)"
+                                            "DLP: sensitive data in response — blocking"
                                         );
+                                        ctx.advance_phase(Phase::Logging);
+                                        log_request(&ctx);
+                                        return Ok(block_response(&ctx));
                                     }
+                                    warn!(
+                                        site = %site_cfg.id,
+                                        client_ip = %ctx.client_ip,
+                                        pattern = matched,
+                                        "DLP: sensitive data in response — would block (learning mode)"
+                                    );
                                 }
-                                // Redact matched data in place (length-preserving)
-                                // and forward the sanitized response.
-                                DlpAction::Mask => {
-                                    if site_cfg.waf.mode == WafMode::Learning {
-                                        // Observe only — never rewrite in learning mode.
-                                        if let Some(matched) = dlp.scan(&bytes) {
-                                            ctx.tx_vars.insert(
-                                                "dlp_would_mask".to_string(),
-                                                matched.to_string(),
-                                            );
-                                            warn!(
-                                                site = %site_cfg.id,
-                                                client_ip = %ctx.client_ip,
-                                                pattern = matched,
-                                                "DLP: sensitive data in response — would mask (learning mode)"
-                                            );
-                                        }
-                                    } else if let Some((masked, hits)) = dlp.mask(&bytes) {
-                                        let hits_str = hits.join(", ");
-                                        ctx.tx_vars
-                                            .insert("dlp_masked".to_string(), hits_str.clone());
-                                        warn!(
-                                            site = %site_cfg.id,
-                                            client_ip = %ctx.client_ip,
-                                            hits = %hits_str,
-                                            "DLP: masked sensitive data in response"
-                                        );
-                                        bytes = Bytes::from(masked);
-                                    }
-                                }
-                                // Log the finding but forward unchanged.
-                                DlpAction::Detect => {
+                            }
+                            // Redact matched data in place (length-preserving)
+                            // and forward the sanitized response.
+                            DlpAction::Mask => {
+                                if site_cfg.waf.mode == WafMode::Learning {
+                                    // Observe only — never rewrite in learning mode.
                                     if let Some(matched) = dlp.scan(&bytes) {
                                         ctx.tx_vars.insert(
-                                            "dlp_detected".to_string(),
+                                            "dlp_would_mask".to_string(),
                                             matched.to_string(),
                                         );
                                         warn!(
                                             site = %site_cfg.id,
                                             client_ip = %ctx.client_ip,
                                             pattern = matched,
-                                            "DLP: sensitive data in response — detected (forwarded unchanged)"
+                                            "DLP: sensitive data in response — would mask (learning mode)"
                                         );
                                     }
+                                } else if let Some((masked, hits)) = dlp.mask(&bytes) {
+                                    let hits_str = hits.join(", ");
+                                    ctx.tx_vars
+                                        .insert("dlp_masked".to_string(), hits_str.clone());
+                                    warn!(
+                                        site = %site_cfg.id,
+                                        client_ip = %ctx.client_ip,
+                                        hits = %hits_str,
+                                        "DLP: masked sensitive data in response"
+                                    );
+                                    bytes = Bytes::from(masked);
+                                }
+                            }
+                            // Log the finding but forward unchanged.
+                            DlpAction::Detect => {
+                                if let Some(matched) = dlp.scan(&bytes) {
+                                    ctx.tx_vars
+                                        .insert("dlp_detected".to_string(), matched.to_string());
+                                    warn!(
+                                        site = %site_cfg.id,
+                                        client_ip = %ctx.client_ip,
+                                        pattern = matched,
+                                        "DLP: sensitive data in response — detected (forwarded unchanged)"
+                                    );
                                 }
                             }
                         }
+                    }
 
-                        Full::new(bytes)
-                            .map_err(|never: Infallible| match never {})
-                            .boxed()
-                    }
-                    Err(e) => {
-                        warn!("response-body collection error: {e}");
-                        http_body_util::Empty::<Bytes>::new()
-                            .map_err(|never: Infallible| match never {})
-                            .boxed()
-                    }
+                    Full::new(bytes)
+                        .map_err(|never: Infallible| match never {})
+                        .boxed()
                 }
-            } else {
-                // Response too large to buffer — pass through uninspected.
-                resp_body.boxed()
             }
         } else {
             resp_body.boxed()
@@ -7430,6 +7558,7 @@ mod inline_rule_diag_tests {
                 load_balancer: sentinel_core::config::LoadBalancerStrategy::RoundRobin,
                 servers: vec![],
                 health_check: None,
+                timeout_secs: None,
             },
             waf: WafConfig {
                 mode: WafMode::Blocking,
@@ -7569,5 +7698,149 @@ rule 9990001 {
         record_inline_rule_diag("r", true, None);
         let d = diag("r").expect("present");
         assert!(!d.enforced, "a recorded failure must stick");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Response-body scan buffering
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod response_scan_tests {
+    use super::*;
+
+    /// A body that yields its chunks one frame at a time and — crucially —
+    /// keeps the DEFAULT `size_hint()` of `(0, None)`.  That is exactly what a
+    /// `Transfer-Encoding: chunked` response looks like, and it is the shape
+    /// that used to slip past the size check.
+    struct ChunkedTestBody {
+        chunks: std::collections::VecDeque<Bytes>,
+    }
+
+    impl Body for ChunkedTestBody {
+        type Data = Bytes;
+        type Error = hyper::Error;
+
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+            let this = self.get_mut();
+            std::task::Poll::Ready(
+                this.chunks
+                    .pop_front()
+                    .map(|b| Ok(hyper::body::Frame::data(b))),
+            )
+        }
+    }
+
+    fn chunked_body(chunks: Vec<Bytes>) -> BoxBody {
+        ChunkedTestBody {
+            chunks: chunks.into(),
+        }
+        .boxed()
+    }
+
+    #[test]
+    fn the_test_body_declares_no_length_like_a_chunked_response() {
+        let b = chunked_body(vec![Bytes::from_static(b"x")]);
+        assert_eq!(b.size_hint().upper(), None, "fixture must be unbounded");
+    }
+
+    async fn drain(body: BoxBody) -> Bytes {
+        body.collect().await.expect("drain body").to_bytes()
+    }
+
+    #[tokio::test]
+    async fn body_under_the_cap_is_returned_whole_for_scanning() {
+        let b = chunked_body(vec![
+            Bytes::from_static(b"hello "),
+            Bytes::from_static(b"world"),
+        ]);
+        match buffer_for_scan(b, 1024).await {
+            ScanBuffer::Complete(bytes) => assert_eq!(&bytes[..], b"hello world"),
+            _ => panic!("expected Complete"),
+        }
+    }
+
+    /// THE REGRESSION TEST. A chunked body reports no size hint, so the old
+    /// `size_hint().upper().unwrap_or(0)` check read `0`, passed the `<= cap`
+    /// test, and collected the entire response into memory with no limit.
+    /// Buffering must now stop at the cap.
+    #[tokio::test]
+    async fn oversized_chunked_body_stops_buffering_at_the_cap() {
+        let cap = 4096;
+        // 64 chunks x 1 KiB = 64 KiB, far past the cap, with NO declared length.
+        let chunks: Vec<Bytes> = (0..64).map(|_| Bytes::from(vec![b'A'; 1024])).collect();
+        let total: usize = chunks.iter().map(|c| c.len()).sum();
+
+        match buffer_for_scan(chunked_body(chunks), cap).await {
+            ScanBuffer::Oversize { prefix, rest } => {
+                // Bounded: only the cap (plus at most one straddling chunk) is
+                // ever held in memory — not the whole 64 KiB.
+                assert!(
+                    prefix.len() <= cap + 1024,
+                    "buffered {} bytes for a {cap}-byte cap",
+                    prefix.len()
+                );
+                // And nothing is lost: prefix + remainder == the original body.
+                let rest = drain(rest).await;
+                assert_eq!(prefix.len() + rest.len(), total, "bytes lost or duplicated");
+            }
+            _ => panic!("expected Oversize"),
+        }
+    }
+
+    /// A response that is forwarded uninspected must reach the client
+    /// byte-for-byte — the prefix already pulled off the wire is replayed, not
+    /// dropped and not sent twice.
+    #[tokio::test]
+    async fn prefixed_body_replays_the_prefix_then_streams_the_rest() {
+        let original: Vec<Bytes> = (0..32)
+            .map(|i| Bytes::from(vec![b'a' + (i % 26) as u8; 512]))
+            .collect();
+        let expected: Vec<u8> = original.iter().flat_map(|c| c.to_vec()).collect();
+
+        let ScanBuffer::Oversize { prefix, rest } =
+            buffer_for_scan(chunked_body(original), 2048).await
+        else {
+            panic!("expected Oversize");
+        };
+
+        let forwarded = drain(
+            PrefixedBody {
+                prefix: Some(prefix),
+                inner: rest,
+            }
+            .boxed(),
+        )
+        .await;
+        assert_eq!(&forwarded[..], &expected[..]);
+    }
+
+    #[tokio::test]
+    async fn prefixed_body_with_no_prefix_just_streams_the_inner_body() {
+        let body = PrefixedBody {
+            prefix: None,
+            inner: chunked_body(vec![Bytes::from_static(b"abc")]),
+        };
+        assert_eq!(&drain(body.boxed()).await[..], b"abc");
+    }
+
+    #[test]
+    fn concat_chunks_handles_empty_single_and_many() {
+        assert_eq!(concat_chunks(vec![]).len(), 0);
+        assert_eq!(
+            &concat_chunks(vec![Bytes::from_static(b"solo")])[..],
+            b"solo"
+        );
+        assert_eq!(
+            &concat_chunks(vec![
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"b"),
+                Bytes::from_static(b"c"),
+            ])[..],
+            b"abc"
+        );
     }
 }

@@ -356,6 +356,17 @@ pub struct UpstreamConfig {
     pub load_balancer: LoadBalancerStrategy,
     pub servers: Vec<UpstreamServer>,
     pub health_check: Option<HealthCheckConfig>,
+    /// How long this site's origin may take to return response *headers*
+    /// (connect + send + first byte).  It does NOT bound the response body, so
+    /// long downloads and Server-Sent Events streams are unaffected.
+    ///
+    /// Raise it for apps with slow synchronous endpoints (report generation,
+    /// bulk export, some payment-gateway callbacks) that would otherwise 504.
+    /// `None` or `0` falls back to the deployment-wide default
+    /// (`SENTINEL_UPSTREAM_TIMEOUT_SECS`, 30s) — one slow app should not force
+    /// every other site on the node to wait as long.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]

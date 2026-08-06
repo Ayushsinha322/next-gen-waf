@@ -745,6 +745,8 @@ fn cmd_site_add(
             load_balancer: LoadBalancerStrategy::RoundRobin,
             servers: parsed_upstreams,
             health_check: None,
+            // Deployment default; per-site overrides come from the control plane.
+            timeout_secs: None,
         },
         waf: WafConfig {
             mode: waf_mode.clone(),

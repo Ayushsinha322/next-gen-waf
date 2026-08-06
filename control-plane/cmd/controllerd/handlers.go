@@ -1407,6 +1407,7 @@ func buildRustUpstream(raw json.RawMessage) (map[string]any, error) {
 		LB           string          `json:"lb"`
 		LoadBalancer string          `json:"load_balancer"`
 		HealthCheck  json.RawMessage `json:"health_check"`
+		TimeoutSecs  *uint64         `json:"timeout_secs"`
 	}
 	if len(raw) > 0 {
 		if err := json.Unmarshal(raw, &generic); err != nil {
@@ -1478,8 +1479,25 @@ func buildRustUpstream(raw json.RawMessage) (map[string]any, error) {
 			upstream["health_check"] = hc
 		}
 	}
+
+	// Per-site response-header timeout. Omitted when unset or 0 so the Rust
+	// side falls back to the deployment default rather than being handed a
+	// value nobody chose. Bounded because an unbounded wait would pin a
+	// request task (and its admission permit) on a hung origin.
+	if generic.TimeoutSecs != nil && *generic.TimeoutSecs > 0 {
+		secs := *generic.TimeoutSecs
+		if secs > maxUpstreamTimeoutSecs {
+			secs = maxUpstreamTimeoutSecs
+		}
+		upstream["timeout_secs"] = secs
+	}
 	return upstream, nil
 }
+
+// maxUpstreamTimeoutSecs caps the per-site upstream timeout at 10 minutes.
+// Slow report/export endpoints are the reason the knob exists; anything longer
+// than this is an application bug, not a WAF setting.
+const maxUpstreamTimeoutSecs uint64 = 600
 
 // buildRustWaf accepts the legacy minimal blob and the rich dashboard blob and
 // produces the Rust WafConfig JSON. Unknown/empty sections are omitted so the

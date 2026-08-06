@@ -77,6 +77,7 @@ fn test_config(
                     tls: false,
                 }],
                 health_check: None,
+                timeout_secs: None,
             },
             waf: WafConfig {
                 mode,
@@ -118,6 +119,7 @@ fn ml_only_config(listen_port: u16, upstream_port: u16, sensitivity: f32) -> Sen
                     tls: false,
                 }],
                 health_check: None,
+                timeout_secs: None,
             },
             waf: WafConfig {
                 mode: WafMode::Blocking,
@@ -656,6 +658,7 @@ fn inline_only_config(
                     tls: false,
                 }],
                 health_check: None,
+                timeout_secs: None,
             },
             waf: WafConfig {
                 mode: WafMode::Blocking,

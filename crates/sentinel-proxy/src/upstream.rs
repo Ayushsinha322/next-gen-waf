@@ -160,10 +160,24 @@ pub(crate) struct SiteUpstream {
     servers: Vec<Arc<ServerHealth>>,
     cursor: AtomicUsize,
     strategy: LoadBalancerStrategy,
+    /// Per-site override for the response-header timeout.  `None` = use the
+    /// deployment-wide default.  See [`UpstreamConfig::timeout_secs`].
+    timeout: Option<Duration>,
+}
+
+/// Interpret a per-site `timeout_secs` setting.  Absent or `0` means "no
+/// override" — never "no timeout", which would let a hung origin pin a request
+/// task (and its admission permit) forever.
+fn site_timeout(secs: Option<u64>) -> Option<Duration> {
+    secs.filter(|&s| s > 0).map(Duration::from_secs)
 }
 
 impl SiteUpstream {
-    fn new(servers: Vec<UpstreamServer>, strategy: LoadBalancerStrategy) -> Self {
+    fn new(
+        servers: Vec<UpstreamServer>,
+        strategy: LoadBalancerStrategy,
+        timeout: Option<Duration>,
+    ) -> Self {
         Self {
             servers: servers
                 .into_iter()
@@ -171,6 +185,7 @@ impl SiteUpstream {
                 .collect(),
             cursor: AtomicUsize::new(0),
             strategy,
+            timeout,
         }
     }
 
@@ -323,6 +338,7 @@ impl UpstreamPool {
                 Arc::new(SiteUpstream::new(
                     site.upstream.servers.clone(),
                     site.upstream.load_balancer.clone(),
+                    site_timeout(site.upstream.timeout_secs),
                 )),
             );
         }
@@ -387,13 +403,19 @@ impl UpstreamPool {
         req: Request<BoxBody<Bytes, hyper::Error>>,
     ) -> anyhow::Result<http::Response<hyper::body::Incoming>> {
         // Locate the ServerHealth for this specific server so we can track
-        // active connections and circuit-breaker state.
-        let srv_health: Option<Arc<ServerHealth>> = self.sites.get(site_id).and_then(|site| {
-            site.servers
-                .iter()
-                .find(|h| h.server.host == server_host && h.server.port == server_port)
-                .cloned()
-        });
+        // active connections and circuit-breaker state, and pick up the site's
+        // timeout override in the same lookup.
+        let (srv_health, timeout): (Option<Arc<ServerHealth>>, Duration) =
+            match self.sites.get(site_id) {
+                Some(site) => (
+                    site.servers
+                        .iter()
+                        .find(|h| h.server.host == server_host && h.server.port == server_port)
+                        .cloned(),
+                    site.timeout.unwrap_or(self.upstream_timeout),
+                ),
+                None => (None, self.upstream_timeout),
+            };
 
         if let Some(ref h) = srv_health {
             h.active_conns.fetch_add(1, Ordering::Relaxed);
@@ -404,16 +426,17 @@ impl UpstreamPool {
             "forwarding to upstream (pooled)"
         );
 
-        // Bound the whole request: a hung origin must not pin this task (and its
-        // in-flight admission permit) forever. A timeout is a breaker failure.
-        let result =
-            match tokio::time::timeout(self.upstream_timeout, self.client.request(req)).await {
-                Ok(r) => r.context("upstream request failed"),
-                Err(_) => Err(anyhow::anyhow!(
-                    "upstream request timed out after {:?}",
-                    self.upstream_timeout
-                )),
-            };
+        // Bound time-to-response-headers: a hung origin must not pin this task
+        // (and its in-flight admission permit) forever. `client.request()`
+        // resolves once headers arrive, so this does NOT cut long downloads or
+        // SSE streams. A timeout is a breaker failure.
+        let result = match tokio::time::timeout(timeout, self.client.request(req)).await {
+            Ok(r) => r.context("upstream request failed"),
+            Err(_) => Err(anyhow::anyhow!(
+                "upstream request timed out after {:?}",
+                timeout
+            )),
+        };
 
         if let Some(ref h) = srv_health {
             h.active_conns.fetch_sub(1, Ordering::Relaxed);
@@ -438,6 +461,7 @@ impl UpstreamPool {
 
         for site in sites {
             let strategy = site.upstream.load_balancer.clone();
+            let timeout = site_timeout(site.upstream.timeout_secs);
             let new_upstream = if let Some(existing) = self.sites.get(&site.id) {
                 // Preserve health state for servers that carry over.
                 let new_servers: Vec<Arc<ServerHealth>> = site
@@ -459,9 +483,14 @@ impl UpstreamPool {
                     servers: new_servers,
                     cursor: AtomicUsize::new(existing.cursor.load(Ordering::Relaxed)),
                     strategy,
+                    timeout,
                 })
             } else {
-                Arc::new(SiteUpstream::new(site.upstream.servers.clone(), strategy))
+                Arc::new(SiteUpstream::new(
+                    site.upstream.servers.clone(),
+                    strategy,
+                    timeout,
+                ))
             };
 
             self.sites.insert(site.id.clone(), new_upstream);
@@ -616,4 +645,41 @@ fn unix_now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    /// `timeout_secs` is an OVERRIDE, not an on/off switch. Absent or zero must
+    /// fall back to the deployment default — never to "wait forever", which
+    /// would let a hung origin pin a request task and its admission permit.
+    #[test]
+    fn absent_or_zero_timeout_means_use_the_default() {
+        assert_eq!(site_timeout(None), None);
+        assert_eq!(site_timeout(Some(0)), None);
+    }
+
+    #[test]
+    fn positive_timeout_overrides_the_default() {
+        assert_eq!(site_timeout(Some(1)), Some(Duration::from_secs(1)));
+        assert_eq!(site_timeout(Some(180)), Some(Duration::from_secs(180)));
+    }
+
+    /// A site that sets no override resolves to the pool-wide timeout, and a
+    /// site that sets one resolves to its own — the resolution `send_request`
+    /// performs per request.
+    #[test]
+    fn resolution_prefers_the_site_value() {
+        let default = Duration::from_secs(30);
+        let slow = SiteUpstream::new(
+            vec![],
+            LoadBalancerStrategy::RoundRobin,
+            site_timeout(Some(180)),
+        );
+        let plain = SiteUpstream::new(vec![], LoadBalancerStrategy::RoundRobin, site_timeout(None));
+
+        assert_eq!(slow.timeout.unwrap_or(default), Duration::from_secs(180));
+        assert_eq!(plain.timeout.unwrap_or(default), default);
+    }
 }

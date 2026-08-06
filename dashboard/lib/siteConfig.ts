@@ -441,6 +441,20 @@ export function applyPreset(form: SiteForm, preset: PresetKey): SiteForm {
   };
 }
 
+/** Parse a duration like "60s" / "2m" / "90" (bare = seconds) into whole
+ *  seconds. Returns 0 for anything unparseable, which callers read as
+ *  "unset — use the deployment default". */
+export function durationToSecs(v: string): number {
+  const m = /^(\d+)\s*(s|m|h)?$/i.exec((v ?? "").trim());
+  if (!m) return 0;
+  const n = Number(m[1]);
+  switch ((m[2] ?? "s").toLowerCase()) {
+    case "m": return n * 60;
+    case "h": return n * 3600;
+    default:  return n;
+  }
+}
+
 /* ── Form → API payload ───────────────────────────────────────── */
 export function formToPayload(f: SiteForm): {
   name: string; domains: string[]; upstream: object; waf_policy: object;
@@ -466,6 +480,13 @@ export function formToPayload(f: SiteForm): {
   if (f.proxy_host_header.trim()) proxy.host_header = f.proxy_host_header.trim();
   if (f.proxy_ssl_sni) { proxy.ssl_sni = true; if (f.proxy_ssl_sni_name.trim()) proxy.ssl_sni_name = f.proxy_ssl_sni_name.trim(); }
   upstream.proxy = proxy;
+
+  // How long the origin may take to return response headers. This is the only
+  // consumer of the Read Timeout field that the data plane actually enforces —
+  // `upstream.proxy.read_timeout` was never read by it, so the control looked
+  // live but did nothing. 0 / unparseable = fall back to the node default.
+  const readTimeoutSecs = durationToSecs(f.proxy_read_timeout);
+  if (readTimeoutSecs > 0) upstream.timeout_secs = readTimeoutSecs;
 
   // Drop incomplete or no-op rows rather than sending them: the API rejects an
   // override that sets neither mode nor threshold, and a half-filled row in the
@@ -691,6 +712,12 @@ export function siteToForm(site: Site): SiteForm {
     f.proxy_host_header = str(proxy.host_header);
     f.proxy_ssl_sni = bool(proxy.ssl_sni);
     f.proxy_ssl_sni_name = str(proxy.ssl_sni_name);
+  }
+  // `timeout_secs` is the value the data plane actually enforces, so it wins
+  // over the legacy `proxy.read_timeout` display string when both are present.
+  const timeoutSecs = Number(up.timeout_secs);
+  if (Number.isFinite(timeoutSecs) && timeoutSecs > 0) {
+    f.proxy_read_timeout = `${timeoutSecs}s`;
   }
 
   const w = (site.waf_policy ?? {}) as AnyRec;
