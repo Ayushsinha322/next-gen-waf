@@ -138,6 +138,13 @@ pub struct RequestContext {
     /// non-default threshold or mode came from a path rule rather than wondering
     /// why this request was judged differently from the rest of the site.
     pub path_override: Option<String>,
+    /// The matched site's block-page policy, stamped at routing time for the same
+    /// reason as the two fields above: a block can be issued from call sites that
+    /// have no site config in scope (connection-layer rejections such as
+    /// anti-DDoS, IP reputation and threat intel all fire before routing). `None`
+    /// means "no site matched, or the site customised nothing" and renders the
+    /// built-in default page.
+    pub block_page: Option<crate::config::BlockPageConfig>,
 
     // --- WAF state ---
     pub phase: Phase,
@@ -204,6 +211,7 @@ impl RequestContext {
             enforcement_mode: None,
             anomaly_threshold: None,
             path_override: None,
+            block_page: None,
             phase: Phase::Connection,
             anomaly_score: 0,
             engine_scores: HashMap::new(),

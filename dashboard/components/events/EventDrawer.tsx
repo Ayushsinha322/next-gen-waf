@@ -148,6 +148,23 @@ export default function EventDrawer({
           <Row label="Response" mono>{event.status || "—"}</Row>
           <Row label="Matched rule" mono>{event.rule || "—"}</Row>
           <Row label="Anomaly score" mono>{event.score}</Row>
+          {/* The Support ID the visitor was shown. Click-to-copy because the
+              operator reads it back to the customer to confirm they are talking
+              about the same request. Older rows predate the field. */}
+          <Row label="Support ID" mono>
+            {event.request_id ? (
+              <span
+                title="Click to copy — this is the ID shown on the block page"
+                style={{ cursor: "pointer", userSelect: "all" }}
+                onClick={() => {
+                  navigator.clipboard.writeText(event.request_id).then(
+                    () => showToast("Support ID copied", "s", "📋"),
+                    () => {},
+                  );
+                }}
+              >{event.request_id}</span>
+            ) : "—"}
+          </Row>
 
           <div style={{
             marginTop: 16, padding: "10px 12px", borderRadius: "var(--r2)",

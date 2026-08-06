@@ -531,6 +531,63 @@ pub struct WafConfig {
     /// Per-site response/security header policy (overrides the proxy defaults
     /// and injects operator-defined headers).
     pub security_headers: Option<SecurityHeadersConfig>,
+    /// What a blocked visitor sees. Absent = the built-in default page.
+    pub block_page: Option<BlockPageConfig>,
+}
+
+/// Per-site customisation of the page a blocked visitor receives.
+///
+/// The page exists to turn a dead end into a support path: it shows the Support
+/// ID (the request id, which is the join key across access.log, waf.log and the
+/// ClickHouse event store), so a caller can quote one string and the operator
+/// can find the exact request that was blocked.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockPageConfig {
+    /// Serve the branded HTML page to browsers. When false, blocked browsers get
+    /// the same minimal JSON an API client gets.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Heading shown to the visitor (default: "Request blocked").
+    pub title: Option<String>,
+    /// Body text. Keep it about what the visitor should DO, not about what the
+    /// WAF detected.
+    pub message: Option<String>,
+    /// Who to contact — an email, phone number or URL. Rendered as a link when
+    /// it parses as a mailto:/tel:/http(s) target, otherwise as plain text.
+    pub contact: Option<String>,
+    /// Absolute https:// (or site-relative) logo URL. Other schemes are dropped
+    /// rather than rendered — see sanitize_logo_url.
+    pub logo_url: Option<String>,
+    /// Include the detection reason in the response.
+    ///
+    /// Defaults to FALSE, and that default is a security decision rather than a
+    /// cosmetic one. `block_reason` names the control that fired ("IP
+    /// reputation: …", "threat intel: …", a rule id and its target), which hands
+    /// an attacker a free oracle: they can permute a payload and read back
+    /// exactly which engine caught it and when it stopped catching it. F5 and
+    /// Imperva return a support id and nothing else for the same reason. Enable
+    /// only on an internal or staging site where the audience is your own
+    /// developers debugging a false positive.
+    #[serde(default)]
+    pub show_reason: bool,
+}
+
+/// Hand-written rather than derived so the Rust default matches the serde
+/// default. `#[derive(Default)]` would set `enabled: false` while
+/// `#[serde(default = "default_true")]` sets it true, so a config built in code
+/// would silently disable the block page while the identical config parsed from
+/// YAML enabled it — the kind of disagreement nothing warns you about.
+impl Default for BlockPageConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            title: None,
+            message: None,
+            contact: None,
+            logo_url: None,
+            show_reason: false,
+        }
+    }
 }
 
 /// Operator-configurable response headers, applied on top of the proxy's secure

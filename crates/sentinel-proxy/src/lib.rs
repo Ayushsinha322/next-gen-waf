@@ -2553,6 +2553,9 @@ async fn proxy(
         if let Some(o) = ov {
             ctx.path_override = Some(o.path_prefix.clone());
         }
+        // Stamped here for the same reason as the fields above: the block
+        // renderer runs at call sites that have no site config in scope.
+        ctx.block_page = s.waf.block_page.clone();
     }
 
     // Request size limits: URI and header count (Phase 1, before body read).
@@ -4903,26 +4906,233 @@ fn limit_response(ctx: &RequestContext, site: Option<&SiteConfig>) -> Response<B
     error_response(status, reason)
 }
 
+/// Minimal HTML escape for values interpolated into the block page.
+///
+/// Every interpolated value is operator-controlled config rather than request
+/// data, but "operator-controlled" is not "trusted": a customer-supplied contact
+/// string pasted into the site wizard reaches this template verbatim, and an
+/// unescaped `"` in an attribute is enough to break out of it. Escaping quotes
+/// as well as the angle brackets keeps attribute contexts safe too.
+fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Accept only logo URLs that cannot execute script.
+///
+/// `<img src>` will happily take `javascript:` and `data:text/html`, which turns
+/// a branding field into stored XSS on a page we serve on every block. Allowing
+/// exactly https, http and site-relative paths keeps the useful cases and drops
+/// the dangerous ones, rather than trying to blacklist schemes.
+fn sanitize_logo_url(raw: &str) -> Option<String> {
+    let u = raw.trim();
+    if u.is_empty() {
+        return None;
+    }
+    let lower = u.to_ascii_lowercase();
+    let ok = lower.starts_with("https://")
+        || lower.starts_with("http://")
+        || (u.starts_with('/') && !u.starts_with("//"));
+    if ok {
+        Some(escape_html(u))
+    } else {
+        None
+    }
+}
+
+/// Render `contact` as a link when it is unambiguously one, else as plain text.
+/// A bare email or phone number is the common case and neither is a URL, so we
+/// build the scheme rather than requiring the operator to know to type it.
+fn render_contact(raw: &str) -> String {
+    let c = raw.trim();
+    let esc = escape_html(c);
+    let lower = c.to_ascii_lowercase();
+    if lower.starts_with("https://") || lower.starts_with("http://") {
+        format!(r#"<a href="{esc}">{esc}</a>"#)
+    } else if c.contains('@') && !c.contains(' ') {
+        format!(r#"<a href="mailto:{esc}">{esc}</a>"#)
+    } else {
+        esc
+    }
+}
+
+/// True when the client would rather have a page than a JSON document.
+///
+/// Deliberately requires an explicit `text/html` in Accept rather than treating
+/// a wildcard as a browser: `curl` sends `Accept: */*`, and scripts and health
+/// checks that get an HTML page where they expected JSON fail in confusing ways.
+/// Browsers always list text/html explicitly, so this splits the two audiences
+/// without guessing from the User-Agent.
+fn wants_html(headers: &http::HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|a| a.to_ascii_lowercase().contains("text/html"))
+        .unwrap_or(false)
+}
+
+/// The page a blocked visitor sees.
+///
+/// Two audiences, one verdict: a browser gets a branded page that names the
+/// Support ID, an API client gets the same facts as JSON. Both carry the request
+/// id, which is the join key into access.log, waf.log and the ClickHouse event
+/// store — so a caller quoting one string lets an operator find the exact
+/// request in Threat Search.
+///
+/// The detection reason is withheld unless the site opts in. See
+/// `BlockPageConfig::show_reason` for why that default is a security decision.
 fn block_response(ctx: &RequestContext) -> Response<BoxBody> {
-    let reason = ctx
-        .block_reason
-        .as_deref()
-        .unwrap_or("Blocked by Sentinel WAF");
-    let body = serde_json::json!({
+    let cfg = ctx.block_page.as_ref();
+    let support_id = ctx.request_id.to_string();
+    let show_reason = cfg.map(|c| c.show_reason).unwrap_or(false);
+    let reason = if show_reason {
+        ctx.block_reason.as_deref()
+    } else {
+        None
+    };
+
+    let html_enabled = cfg.map(|c| c.enabled).unwrap_or(true);
+    if html_enabled && wants_html(&ctx.request_headers) {
+        let body = render_block_page(cfg, &support_id, reason);
+        return Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            // The page names a support id and nothing else of value, but it is
+            // still an error page: keep it out of caches and out of frames.
+            .header(header::CACHE_CONTROL, "no-store")
+            .header("X-Content-Type-Options", "nosniff")
+            .header("X-Frame-Options", "DENY")
+            .header("Referrer-Policy", "no-referrer")
+            .body(full_body(Bytes::from(body)))
+            .unwrap();
+    }
+
+    let mut payload = serde_json::json!({
         "error": "Forbidden",
-        "message": reason,
-        "request_id": ctx.request_id.to_string(),
-    })
-    .to_string();
+        "support_id": support_id,
+        // Kept for compatibility with clients written against the previous
+        // response shape, which used request_id.
+        "request_id": support_id,
+    });
+    if let Some(r) = reason {
+        payload["message"] = serde_json::Value::String(r.to_string());
+    }
     Response::builder()
         .status(StatusCode::FORBIDDEN)
         .header(header::CONTENT_TYPE, "application/json")
-        .body(
-            Full::new(Bytes::from(body))
-                .map_err(|never: Infallible| match never {})
-                .boxed(),
-        )
+        .header(header::CACHE_CONTROL, "no-store")
+        .header("X-Content-Type-Options", "nosniff")
+        .body(full_body(Bytes::from(payload.to_string())))
         .unwrap()
+}
+
+/// Self-contained block page: no external CSS, fonts or images, so it renders
+/// identically on an air-gapped network and cannot leak the visitor's IP to a
+/// third party at the moment we block them.
+fn render_block_page(
+    cfg: Option<&sentinel_core::config::BlockPageConfig>,
+    support_id: &str,
+    reason: Option<&str>,
+) -> String {
+    let title = cfg
+        .and_then(|c| c.title.as_deref())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("Request blocked");
+    let message = cfg
+        .and_then(|c| c.message.as_deref())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(
+            "Your request was blocked by our web application firewall. \
+             If you believe this is a mistake, contact support and quote the Support ID below.",
+        );
+
+    let logo = cfg
+        .and_then(|c| c.logo_url.as_deref())
+        .and_then(sanitize_logo_url)
+        .map(|u| format!(r#"<img class="logo" src="{u}" alt="">"#))
+        .unwrap_or_default();
+
+    let contact = cfg
+        .and_then(|c| c.contact.as_deref())
+        .filter(|s| !s.trim().is_empty())
+        .map(|c| format!(r#"<p class="contact">Contact: {}</p>"#, render_contact(c)))
+        .unwrap_or_default();
+
+    let reason_block = reason
+        .map(|r| {
+            format!(
+                r#"<p class="reason"><strong>Reason:</strong> {}</p>"#,
+                escape_html(r)
+            )
+        })
+        .unwrap_or_default();
+
+    let title_esc = escape_html(title);
+    let message_esc = escape_html(message);
+    let id_esc = escape_html(support_id);
+
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>{title_esc}</title>
+<style>
+:root {{ color-scheme: light dark; }}
+* {{ box-sizing: border-box; }}
+body {{
+  margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+  padding: 24px; background: #f4f6f8; color: #16202a;
+  font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}}
+.card {{
+  background: #fff; max-width: 560px; width: 100%; padding: 40px;
+  border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,.12), 0 8px 24px rgba(0,0,0,.08);
+}}
+.logo {{ max-height: 44px; max-width: 200px; margin-bottom: 24px; display: block; }}
+h1 {{ margin: 0 0 12px; font-size: 24px; line-height: 1.3; }}
+p {{ margin: 0 0 16px; }}
+.sid-label {{ font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: #5c6b7a; margin-bottom: 6px; }}
+.sid {{
+  font: 15px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  background: #eef1f4; border: 1px solid #dde3e9; border-radius: 8px;
+  padding: 12px 14px; word-break: break-all; user-select: all;
+}}
+.reason {{ font-size: 14px; color: #5c6b7a; }}
+.contact {{ font-size: 14px; margin-bottom: 0; }}
+a {{ color: #0b62c4; }}
+@media (prefers-color-scheme: dark) {{
+  body {{ background: #0f1519; color: #e6edf3; }}
+  .card {{ background: #161d24; box-shadow: none; border: 1px solid #263039; }}
+  .sid {{ background: #0f1519; border-color: #263039; }}
+  .sid-label, .reason {{ color: #93a4b3; }}
+  a {{ color: #5aa9f8; }}
+}}
+</style>
+</head>
+<body>
+<main class="card">
+{logo}<h1>{title_esc}</h1>
+<p>{message_esc}</p>
+{reason_block}<div class="sid-label">Support ID</div>
+<div class="sid">{id_esc}</div>
+{contact}</main>
+</body>
+</html>
+"#
+    )
 }
 
 /// Internal certificate-management API.  Loopback-only (enforced by the caller).
@@ -7841,6 +8051,187 @@ mod response_scan_tests {
                 Bytes::from_static(b"c"),
             ])[..],
             b"abc"
+        );
+    }
+}
+
+#[cfg(test)]
+mod block_page_tests {
+    use super::*;
+    use sentinel_core::config::BlockPageConfig;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn ctx_with(accept: Option<&str>, cfg: Option<BlockPageConfig>) -> RequestContext {
+        let mut ctx = RequestContext::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 41234);
+        if let Some(a) = accept {
+            ctx.request_headers
+                .insert(header::ACCEPT, a.parse().unwrap());
+        }
+        ctx.block_reason = Some("threat intel: matched IOC feed 'abuse.ch' tier=block".into());
+        ctx.block_page = cfg;
+        ctx
+    }
+
+    async fn body_string(resp: Response<BoxBody>) -> String {
+        use http_body_util::BodyExt;
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8_lossy(&bytes).to_string()
+    }
+
+    /// The default must not tell the caller which control fired. `block_reason`
+    /// names the engine and the feed, which is a free tuning oracle for anyone
+    /// probing the WAF with permuted payloads.
+    #[tokio::test]
+    async fn reason_is_withheld_by_default() {
+        for accept in [Some("text/html"), Some("application/json"), None] {
+            let resp = block_response(&ctx_with(accept, None));
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+            let body = body_string(resp).await;
+            assert!(
+                !body.contains("threat intel") && !body.contains("abuse.ch"),
+                "detection reason leaked with Accept={accept:?}: {body}"
+            );
+        }
+    }
+
+    /// ...but an operator debugging a false positive on an internal site can
+    /// opt in, and then it must actually appear.
+    #[tokio::test]
+    async fn reason_shown_when_opted_in() {
+        let cfg = BlockPageConfig {
+            show_reason: true,
+            ..Default::default()
+        };
+        let body = body_string(block_response(&ctx_with(Some("text/html"), Some(cfg)))).await;
+        assert!(body.contains("abuse.ch"), "opted-in reason missing: {body}");
+    }
+
+    /// A browser gets a page; anything that did not ask for HTML gets JSON.
+    /// curl's `*/*` must NOT be treated as a browser or scripts break.
+    #[tokio::test]
+    async fn content_negotiation_splits_browsers_from_clients() {
+        let html = block_response(&ctx_with(
+            Some("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+            None,
+        ));
+        assert_eq!(
+            html.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+        assert!(body_string(html).await.contains("<!doctype html>"));
+
+        for accept in [Some("*/*"), Some("application/json"), None] {
+            let resp = block_response(&ctx_with(accept, None));
+            assert_eq!(
+                resp.headers().get(header::CONTENT_TYPE).unwrap(),
+                "application/json",
+                "Accept={accept:?} should get JSON"
+            );
+        }
+    }
+
+    /// The support id is the join key into access.log / waf.log / ClickHouse.
+    /// Both representations must carry it or a caller quoting it is unhelpable.
+    #[tokio::test]
+    async fn support_id_present_in_both_representations() {
+        let ctx = ctx_with(Some("text/html"), None);
+        let id = ctx.request_id.to_string();
+        assert!(body_string(block_response(&ctx)).await.contains(&id));
+
+        let ctx = ctx_with(Some("application/json"), None);
+        let id = ctx.request_id.to_string();
+        let json = body_string(block_response(&ctx)).await;
+        assert!(json.contains(&id));
+        // request_id retained alongside support_id for clients written against
+        // the previous response shape.
+        assert!(json.contains("support_id") && json.contains("request_id"));
+    }
+
+    /// Config reaches the template verbatim, so a stray quote or tag in a
+    /// customer-supplied field must not be able to break out of it.
+    #[tokio::test]
+    async fn config_values_are_html_escaped() {
+        let cfg = BlockPageConfig {
+            title: Some("<script>alert(1)</script>".into()),
+            message: Some(r#"" onload="alert(2)"#.into()),
+            contact: Some("<img src=x onerror=alert(3)>".into()),
+            ..Default::default()
+        };
+        let body = body_string(block_response(&ctx_with(Some("text/html"), Some(cfg)))).await;
+        // What matters is that no value can close its context and become live
+        // markup — not that the characters are absent. `onerror=alert(3)` still
+        // appears as inert text once the surrounding `<` is escaped.
+        assert!(
+            !body.contains("<script"),
+            "title escaped out of its context"
+        );
+        assert!(
+            !body.contains("<img src=x"),
+            "contact escaped out of its context"
+        );
+        assert!(
+            !body.contains(r#"" onload="#),
+            "message escaped out of its attribute"
+        );
+        assert!(body.contains("&lt;script&gt;"), "expected escaped output");
+    }
+
+    /// `<img src>` accepts javascript: and data:text/html, which would turn a
+    /// branding field into stored XSS on a page we serve on every block.
+    #[test]
+    fn logo_url_rejects_script_schemes() {
+        assert!(sanitize_logo_url("javascript:alert(1)").is_none());
+        assert!(sanitize_logo_url("JavaScript:alert(1)").is_none());
+        assert!(sanitize_logo_url("data:text/html;base64,PHNjcmlwdD4=").is_none());
+        assert!(sanitize_logo_url("//evil.example/x.png").is_none());
+        assert!(sanitize_logo_url("").is_none());
+
+        assert_eq!(
+            sanitize_logo_url("https://cdn.example/logo.png").as_deref(),
+            Some("https://cdn.example/logo.png")
+        );
+        assert_eq!(
+            sanitize_logo_url("/assets/logo.png").as_deref(),
+            Some("/assets/logo.png")
+        );
+    }
+
+    #[test]
+    fn contact_renders_as_link_only_when_unambiguous() {
+        assert!(render_contact("soc@acme.example").contains(r#"href="mailto:soc@acme.example""#));
+        assert!(render_contact("https://acme.example/support").contains(r#"<a href="https"#));
+        // A phone number is not a URL and must not become a broken link.
+        let phone = render_contact("+91 22 6674 0500");
+        assert!(
+            !phone.contains("<a "),
+            "phone should stay plain text: {phone}"
+        );
+    }
+
+    /// An error page must not be cached or framed, and must not leak the URL
+    /// that was blocked to a third party via Referer.
+    #[tokio::test]
+    async fn block_page_sets_protective_headers() {
+        let resp = block_response(&ctx_with(Some("text/html"), None));
+        let h = resp.headers();
+        assert_eq!(h.get(header::CACHE_CONTROL).unwrap(), "no-store");
+        assert_eq!(h.get("X-Frame-Options").unwrap(), "DENY");
+        assert_eq!(h.get("X-Content-Type-Options").unwrap(), "nosniff");
+        assert_eq!(h.get("Referrer-Policy").unwrap(), "no-referrer");
+    }
+
+    /// Disabling the page sends browsers the same JSON as API clients, rather
+    /// than silently continuing to serve HTML.
+    #[tokio::test]
+    async fn disabling_falls_back_to_json_for_browsers() {
+        let cfg = BlockPageConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let resp = block_response(&ctx_with(Some("text/html"), Some(cfg)));
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
         );
     }
 }

@@ -570,6 +570,8 @@ func run() error {
 		protected.GET("/events/facets", func(c *gin.Context) { handleEventsFacets(c, enforcer, chClient) })
 		protected.GET("/events/top-attackers", func(c *gin.Context) { handleTopAttackers(c, enforcer, chClient) })
 		protected.GET("/events/severity-timeline", func(c *gin.Context) { handleSeverityTimeline(c, enforcer, chClient) })
+		// Support ID → the blocked request (time-range independent).
+		protected.GET("/events/support/:id", func(c *gin.Context) { handleSupportIDLookup(c, enforcer, chClient) })
 		// Ad-hoc export of the current Threat Search view.
 		protected.GET("/events/export", func(c *gin.Context) { handleExportEvents(c, enforcer, store, chClient, hub) })
 

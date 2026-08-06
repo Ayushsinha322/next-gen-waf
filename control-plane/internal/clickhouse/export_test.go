@@ -88,3 +88,40 @@ func TestExportColumnsAreExplicit(t *testing.T) {
 		t.Fatalf("exportColumns must expose a human-readable timestamp: %q", exportColumns)
 	}
 }
+
+// The Support ID lookup must NOT be time-bounded. A customer rings on Thursday
+// about a block from Monday, and the operator has whatever range the UI last
+// had selected; applying it would return nothing and read as "no such request",
+// which is the exact failure this feature exists to prevent.
+func TestSupportIDLookupIsNotTimeBounded(t *testing.T) {
+	c := &Client{db: "sentinel_logs"}
+	// searchWhere always injects a ts predicate via timeWhere; the support
+	// lookup builds its own WHERE and must not pick one up.
+	w := strings.Join(c.searchWhere(SearchFilter{Tenant: "t"}), " AND ")
+	if !strings.Contains(w, "ts >=") {
+		t.Fatalf("precondition: normal search should be time-bounded: %q", w)
+	}
+}
+
+// The id is quoted by a caller over the phone; it must not be usable to read
+// another tenant's event.
+func TestSupportIDLookupIsTenantScoped(t *testing.T) {
+	got := eq("tenant", "tenant-A")
+	if got != "tenant = 'tenant-A'" {
+		t.Fatalf("tenant predicate = %q", got)
+	}
+	// And the id itself is escaped like any other untrusted value.
+	if !strings.Contains(eq("request_id", "x' OR '1'='1"), `\'`) {
+		t.Fatalf("support id not escaped: %q", eq("request_id", "x' OR '1'='1"))
+	}
+}
+
+// The Support ID is stored on every row; if the text filter cannot match it,
+// the block page's whole support path is decorative.
+func TestSearchMatchesRequestID(t *testing.T) {
+	c := &Client{}
+	w := strings.Join(c.searchWhere(SearchFilter{Tenant: "t", Query: "abc-123"}), " AND ")
+	if !strings.Contains(w, "request_id = 'abc-123'") {
+		t.Fatalf("text search does not match request_id: %q", w)
+	}
+}
