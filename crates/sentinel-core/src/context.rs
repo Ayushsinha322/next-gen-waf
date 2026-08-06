@@ -145,6 +145,17 @@ pub struct RequestContext {
     /// means "no site matched, or the site customised nothing" and renders the
     /// built-in default page.
     pub block_page: Option<crate::config::BlockPageConfig>,
+    /// Whether the client asked for HTML, decided once at Phase 0.
+    ///
+    /// Stamped this early because the connection-layer rejections (anti-DDoS, IP
+    /// reputation, threat intel) all answer BEFORE `request_headers` is
+    /// populated — that happens only after `into_parts()`, downstream of a Host
+    /// synthesis step that site matching depends on and so cannot be hoisted.
+    /// Reading the header map at block time therefore saw it empty and served
+    /// JSON to browsers, which is precisely the audience a threat-intel block
+    /// hits. A bool costs one header lookup instead of a second HeaderMap clone
+    /// on every request.
+    pub client_accepts_html: bool,
 
     // --- WAF state ---
     pub phase: Phase,
@@ -212,6 +223,7 @@ impl RequestContext {
             anomaly_threshold: None,
             path_override: None,
             block_page: None,
+            client_accepts_html: false,
             phase: Phase::Connection,
             anomaly_score: 0,
             engine_scores: HashMap::new(),

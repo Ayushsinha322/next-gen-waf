@@ -2385,6 +2385,11 @@ async fn proxy(
     // JA4 TLS fingerprint computed from the ClientHello during the handshake
     // (None for plaintext/HTTP-3 listeners). Consumed by the bot classifier.
     ctx.tls_fingerprint = tls_fp;
+    // Decide the block-page representation NOW, while the request is still
+    // whole. The connection-layer rejections below answer before
+    // ctx.request_headers is populated, so block_response cannot recover this
+    // later — see RequestContext::client_accepts_html.
+    ctx.client_accepts_html = wants_html(req.headers());
 
     // Anti-DDoS: connection-rate check.
     match state.modules.anti_ddos.check_connection(ctx.client_ip) {
@@ -5002,7 +5007,7 @@ fn block_response(ctx: &RequestContext) -> Response<BoxBody> {
     };
 
     let html_enabled = cfg.map(|c| c.enabled).unwrap_or(true);
-    if html_enabled && wants_html(&ctx.request_headers) {
+    if html_enabled && ctx.client_accepts_html {
         let body = render_block_page(cfg, &support_id, reason);
         return Response::builder()
             .status(StatusCode::FORBIDDEN)
@@ -8064,8 +8069,12 @@ mod block_page_tests {
     fn ctx_with(accept: Option<&str>, cfg: Option<BlockPageConfig>) -> RequestContext {
         let mut ctx = RequestContext::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 41234);
         if let Some(a) = accept {
-            ctx.request_headers
-                .insert(header::ACCEPT, a.parse().unwrap());
+            let mut h = http::HeaderMap::new();
+            h.insert(header::ACCEPT, a.parse().unwrap());
+            // Mirrors the real Phase-0 stamping, so these tests exercise the
+            // same decision path the proxy uses rather than a parallel one.
+            ctx.client_accepts_html = wants_html(&h);
+            ctx.request_headers = h;
         }
         ctx.block_reason = Some("threat intel: matched IOC feed 'abuse.ch' tier=block".into());
         ctx.block_page = cfg;
@@ -8229,6 +8238,70 @@ mod block_page_tests {
             ..Default::default()
         };
         let resp = block_response(&ctx_with(Some("text/html"), Some(cfg)));
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+    }
+}
+
+#[cfg(test)]
+mod block_page_connection_layer_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    /// Regression: the connection-layer rejections (anti-DDoS, IP reputation,
+    /// threat intel) answer BEFORE ctx.request_headers is populated — that
+    /// assignment happens after into_parts(), downstream of a Host-synthesis
+    /// step site matching depends on, so it cannot simply be hoisted.
+    ///
+    /// The first cut read the header map inside block_response, which was
+    /// therefore EMPTY on those paths: every browser blocked by threat intel
+    /// got JSON, which is exactly the audience the page exists for. Caught on
+    /// the deploy VM, not by the original unit tests, because those only
+    /// exercised the post-routing path where the headers happen to be set.
+    ///
+    /// The flag is now stamped at Phase 0, so a context with NO request_headers
+    /// still renders HTML when the client asked for it.
+    #[tokio::test]
+    async fn connection_layer_block_still_renders_html_for_browsers() {
+        use http_body_util::BodyExt;
+
+        let mut ctx = RequestContext::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)), 5555);
+        ctx.block_reason = Some("threat intel: matched IOC feed".into());
+        // Exactly the connection-layer shape: flag set at Phase 0, headers never
+        // populated because the request was rejected before into_parts().
+        ctx.client_accepts_html = true;
+        assert!(
+            ctx.request_headers.is_empty(),
+            "fixture must model the pre-into_parts() state"
+        );
+
+        let resp = block_response(&ctx);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8",
+            "a browser blocked at the connection layer must still get the page"
+        );
+        let body = String::from_utf8_lossy(&resp.into_body().collect().await.unwrap().to_bytes())
+            .to_string();
+        assert!(
+            body.contains("Support ID"),
+            "page must carry the Support ID"
+        );
+        assert!(
+            !body.contains("threat intel"),
+            "reason must stay withheld on this path too"
+        );
+    }
+
+    /// The mirror case: no Accept negotiation happened, so a scripted client
+    /// blocked at the connection layer still gets JSON.
+    #[tokio::test]
+    async fn connection_layer_block_gives_json_to_non_browsers() {
+        let mut ctx = RequestContext::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)), 5555);
+        ctx.client_accepts_html = false;
+        let resp = block_response(&ctx);
         assert_eq!(
             resp.headers().get(header::CONTENT_TYPE).unwrap(),
             "application/json"
