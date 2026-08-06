@@ -63,6 +63,11 @@ export default function EventsPage() {
     return { from: to - 86400 - 60, to };
   });
 
+  // Support ID lookup — the operator's entry point when a customer calls
+  // quoting the id from a block page.
+  const [supportId, setSupportId] = useState("");
+  const [lookingUp, setLookingUp] = useState(false);
+
   // Saved per-application views.
   const [profiles, setProfiles] = useState<LogProfile[]>([]);
   const [activeProfileId, setActiveProfileId] = useState("");
@@ -127,6 +132,32 @@ export default function EventsPage() {
     if (mode === "absolute" && !(absFrom && absTo)) return;
     run();
   }, [rangeSecs, mode, absFrom, absTo]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /** Look up a Support ID. Replaces the results table with the single matching
+   *  request and opens it, since that is the only thing the operator wants. */
+  async function lookupSupportId() {
+    const id = supportId.trim();
+    if (!id) return;
+    setLookingUp(true);
+    try {
+      const r = await api.events.bySupportID(id);
+      const found = r.events ?? [];
+      setEvents(found);
+      // Detach from any saved view: the table no longer reflects its filters.
+      setActiveProfileId("");
+      if (found.length === 0) {
+        showToast(
+          "No request found with that Support ID — check it was copied in full, or that the event store still retains that date",
+          "e", "🔍");
+      } else {
+        setSelected(found[0]);
+      }
+    } catch (e) {
+      showToast(e instanceof Error ? e.message : "Lookup failed", "e", "⚠️");
+    } finally {
+      setLookingUp(false);
+    }
+  }
 
   const loadProfiles = useCallback(() => {
     api.logProfiles.list()
@@ -261,6 +292,31 @@ export default function EventsPage() {
         </div></motion.div>
       ) : (
         <>
+          {/* Support ID lookup — deliberately above the filters and outside the
+              time range, because it answers a phone call rather than a search. */}
+          <motion.div className="panel" variants={fadeUp}>
+            <div className="ph">
+              <div className="ptitle">🎫 Support ID lookup</div>
+              <span className="panel-badge">ignores time range</span>
+            </div>
+            <div className="pb" style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+              <input
+                className="fi2"
+                style={{ flex: 1, minWidth: 320, fontFamily: "var(--font-mono)" }}
+                placeholder="Paste the Support ID from the customer's block page…"
+                value={supportId}
+                onChange={e => setSupportId(e.target.value)}
+                onKeyDown={e => e.key === "Enter" && lookupSupportId()}
+              />
+              <button className="btn bc btn-sm" onClick={lookupSupportId} disabled={lookingUp || !supportId.trim()}>
+                {lookingUp ? "Looking up…" : "Find request"}
+              </button>
+              {supportId && (
+                <button className="btn bg-btn btn-sm" onClick={() => { setSupportId(""); run(); }}>✕ Clear</button>
+              )}
+            </div>
+          </motion.div>
+
           {/* saved per-application views + the export handed to a customer */}
           <motion.div variants={fadeUp}>
             <LogProfilePanel

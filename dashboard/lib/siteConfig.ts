@@ -220,6 +220,16 @@ export interface SiteForm {
   cookie_flags:      string;
   custom_headers:    CustomHeader[];
 
+  // block page — what a blocked visitor sees, and the Support ID they quote
+  block_page_enabled: boolean;
+  block_page_title:   string;
+  block_page_message: string;
+  block_page_contact: string;
+  block_page_logo:    string;
+  /** Off by default: the reason names which control fired, which is an attacker
+   *  tuning oracle. Only for internal/staging sites. */
+  block_page_show_reason: boolean;
+
   // ml + advanced
   ml_enabled:     boolean;
   ml_sensitivity: number;
@@ -401,6 +411,9 @@ export function emptyForm(): SiteForm {
     permissions_policy: "geolocation=(), microphone=(), camera=()",
     cors_enabled: false, cors_origins: "*", cookie_flags: "* HttpOnly SameSite=Lax",
     custom_headers: [],
+
+    block_page_enabled: true, block_page_title: "", block_page_message: "",
+    block_page_contact: "", block_page_logo: "", block_page_show_reason: false,
 
     ml_enabled: false, ml_sensitivity: 0.85, ml_models: [],
     api_discovery: false,
@@ -595,6 +608,23 @@ export function formToPayload(f: SiteForm): {
   const custom = f.custom_headers.filter(h => h.name.trim());
   if (custom.length) headers.custom = custom.map(h => ({ name: h.name.trim(), value: h.value }));
   if (Object.keys(headers).length) waf_policy.security_headers = headers;
+
+  // Block page. Emitted whenever it differs from the built-in default, so an
+  // untouched site stays absent from the config rather than carrying a block of
+  // empty strings the data plane would have to treat as "unset" anyway.
+  const bp: Record<string, unknown> = {};
+  if (!f.block_page_enabled) bp.enabled = false;
+  if (f.block_page_title.trim()) bp.title = f.block_page_title.trim();
+  if (f.block_page_message.trim()) bp.message = f.block_page_message.trim();
+  if (f.block_page_contact.trim()) bp.contact = f.block_page_contact.trim();
+  if (f.block_page_logo.trim()) bp.logo_url = f.block_page_logo.trim();
+  if (f.block_page_show_reason) bp.show_reason = true;
+  if (Object.keys(bp).length) {
+    // `enabled` defaults true in the data plane; send it explicitly so a config
+    // that sets only, say, a title does not read as enabled:false anywhere.
+    if (bp.enabled === undefined) bp.enabled = true;
+    waf_policy.block_page = bp;
+  }
 
   if (f.ml_enabled) {
     waf_policy.ml = {
@@ -841,6 +871,19 @@ export function siteToForm(site: Site): SiteForm {
     if (hsts) { f.hsts = bool(hsts.enabled); f.hsts_max_age = num(hsts.max_age, 31536000); }
     else { f.hsts = false; }
     f.custom_headers = arr<AnyRec>(sh.custom).map(h => ({ name: str(h.name), value: str(h.value) }));
+  }
+
+  const bp = w.block_page as AnyRec | undefined;
+  if (bp) {
+    // Absent `enabled` means the data-plane default (true), not false — the
+    // wizard must round-trip a config that only set a title without silently
+    // switching the page off.
+    f.block_page_enabled = bp.enabled === undefined ? true : bool(bp.enabled);
+    f.block_page_title = str(bp.title);
+    f.block_page_message = str(bp.message);
+    f.block_page_contact = str(bp.contact);
+    f.block_page_logo = str(bp.logo_url);
+    f.block_page_show_reason = bool(bp.show_reason);
   }
 
   const ml = w.ml as AnyRec | undefined;

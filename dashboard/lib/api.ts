@@ -1018,6 +1018,12 @@ export const api = {
     severityTimeline: (from?: number, to?: number, bucket = 60) =>
       apiFetch<{ buckets: SeverityBucket[]; clickhouse: boolean }>(
         `/events/severity-timeline?${eventQS({ from, to })}&bucket=${bucket}`),
+    /** Resolve a Support ID (from a block page) to the request that produced it.
+     *  Ignores the selected time range on purpose — a customer often calls days
+     *  after the block, and applying the UI's window would read as "not found". */
+    bySupportID: (id: string) =>
+      apiFetch<{ events: WafEvent[]; clickhouse: boolean }>(
+        `/events/support/${encodeURIComponent(id.trim())}`),
     /** Download the current ad-hoc view as a file. Streams the FULL match set
      *  from the server, not the rows the table happens to have loaded. */
     exportDownload: (f: EventQuery, format: ExportFormat = "csv") =>

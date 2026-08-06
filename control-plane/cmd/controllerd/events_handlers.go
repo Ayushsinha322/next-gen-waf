@@ -59,6 +59,32 @@ func handleEventsSearch(c *gin.Context, enf *rbac.Enforcer, ch *clickhouse.Clien
 	c.JSON(http.StatusOK, gin.H{"events": events, "clickhouse": true})
 }
 
+// handleSupportIDLookup resolves a Support ID quoted by a customer back to the
+// blocked request: GET /events/support/:id
+//
+// Separate from /events/search because it must ignore the UI's selected time
+// range — see clickhouse.FindBySupportID.
+func handleSupportIDLookup(c *gin.Context, enf *rbac.Enforcer, ch *clickhouse.Client) {
+	claims, _ := auth.GetClaims(c.Request.Context())
+	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceAlert, rbac.ActionList) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
+		return
+	}
+	if !ch.Enabled() {
+		c.JSON(http.StatusOK, gin.H{"events": []any{}, "clickhouse": false})
+		return
+	}
+	events, err := ch.FindBySupportID(c.Request.Context(), claims.TenantID, c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	if events == nil {
+		events = []clickhouse.Event{}
+	}
+	c.JSON(http.StatusOK, gin.H{"events": events, "clickhouse": true})
+}
+
 func handleEventsTimeline(c *gin.Context, enf *rbac.Enforcer, ch *clickhouse.Client) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceAlert, rbac.ActionList) {

@@ -316,12 +316,22 @@ func (c *Client) searchWhere(f SearchFilter) []string {
 		where = append(where, fmt.Sprintf("upper(severity) = '%s'", esc(strings.ToUpper(f.Severity))))
 	}
 	if f.Query != "" {
-		// substring match across path / attack / rule
+		// Substring match across path / attack / rule, plus an exact match on
+		// request_id.
+		//
+		// request_id is here because it is the Support ID printed on the block
+		// page: a customer calls quoting one string, and the operator pastes it
+		// into this box expecting the request. Without this clause the id is
+		// stored on every row and findable by nothing, which makes the whole
+		// support path decorative. Exact match rather than substring — an id is
+		// either the one you want or it is not, and a substring scan over a
+		// high-cardinality column is the expensive way to learn that.
 		q := esc(f.Query)
 		where = append(where, fmt.Sprintf(
 			"(positionCaseInsensitive(path, '%s') > 0 OR positionCaseInsensitive(attack, '%s') > 0 "+
-				"OR positionCaseInsensitive(explanation, '%s') > 0 OR rule = '%s')",
-			q, q, q, q))
+				"OR positionCaseInsensitive(explanation, '%s') > 0 OR rule = '%s' "+
+				"OR request_id = '%s')",
+			q, q, q, q, q))
 	}
 	return where
 }
@@ -337,6 +347,35 @@ func (c *Client) Search(ctx context.Context, f SearchFilter) ([]Event, error) {
 			"request_id, target, mode, threshold, explanation "+
 			"FROM %s.waf_events WHERE %s ORDER BY ts DESC LIMIT %d",
 		c.db, strings.Join(where, " AND "), limit)
+	var out []Event
+	if err := c.queryJSON(ctx, sql, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// FindBySupportID resolves the Support ID printed on a block page back to the
+// request that produced it.
+//
+// Deliberately NOT time-bounded, unlike every other query here. A customer
+// rings on Thursday about a block that happened on Monday, and the operator has
+// whatever range the UI last had selected — usually 24 hours. Applying that
+// window would return nothing and read as "no such request", which is the exact
+// failure this feature exists to prevent. Retention already bounds how far back
+// this can reach; the id is a UUID, so the match is a point lookup either way.
+//
+// Still tenant-scoped: the id is quoted by a caller over the phone and must not
+// be usable to read another tenant's event.
+func (c *Client) FindBySupportID(ctx context.Context, tenant, supportID string) ([]Event, error) {
+	id := strings.TrimSpace(supportID)
+	if id == "" {
+		return []Event{}, nil
+	}
+	sql := fmt.Sprintf(
+		"SELECT toUnixTimestamp(ts) AS ts, ip, country, site, method, path, rule, attack, action, severity, score, status, protocol, "+
+			"request_id, target, mode, threshold, explanation "+
+			"FROM %s.waf_events WHERE %s AND %s ORDER BY ts DESC LIMIT 25",
+		c.db, eq("tenant", tenant), eq("request_id", id))
 	var out []Event
 	if err := c.queryJSON(ctx, sql, &out); err != nil {
 		return nil, err

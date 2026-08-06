@@ -777,6 +777,7 @@ fn cmd_site_add(
             max_header_count: 100,
             allowed_methods: Default::default(),
             security_headers: Default::default(),
+            block_page: Default::default(),
         },
         plugins: vec![],
         tls: Default::default(),

@@ -886,6 +886,26 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     </div>
                   ))}
                   <button className="btn bg-btn btn-xs" type="button" style={{ alignSelf: "flex-start" }} onClick={() => upd({ custom_headers: [...form.custom_headers, { name: "", value: "" }] })}>＋ Add Header</button>
+
+                  <GroupLabel>Block Page</GroupLabel>
+                  <InfoBox>🚧 What a blocked visitor sees. The page shows a <strong>Support ID</strong> — paste it into Threat Search to find the exact request, however long ago it was blocked. API clients (anything not asking for HTML) keep getting JSON.</InfoBox>
+                  <SectionToggle label="Branded block page" desc="Serve an HTML page to browsers instead of raw JSON" on={form.block_page_enabled} set={v => upd({ block_page_enabled: v })} />
+                  {form.block_page_enabled && (<>
+                    <Field label="Heading" hint="Default: “Request blocked”"><input className="fin2" value={form.block_page_title} placeholder="Request blocked" onChange={e => upd({ block_page_title: e.target.value })} /></Field>
+                    <Field label="Message" hint="Tell the visitor what to DO — not what was detected">
+                      <input className="fin2" value={form.block_page_message} placeholder="If you believe this is a mistake, contact support and quote the Support ID below." onChange={e => upd({ block_page_message: e.target.value })} />
+                    </Field>
+                    <Row>
+                      <Field label="Contact" hint="Email, phone or URL — linked automatically"><input className="fin2" value={form.block_page_contact} placeholder="soc@example.com" onChange={e => upd({ block_page_contact: e.target.value })} /></Field>
+                      <Field label="Logo URL" hint="https:// or a site-relative /path"><input className="fin2" value={form.block_page_logo} placeholder="https://cdn.example.com/logo.png" onChange={e => upd({ block_page_logo: e.target.value })} /></Field>
+                    </Row>
+                  </>)}
+                  <SectionToggle
+                    label="Show detection reason to the visitor"
+                    desc="⚠️ Leave OFF in production. The reason names which control fired (rule, threat-intel feed, IP reputation), letting an attacker permute payloads and read back exactly what caught them. Internal/staging sites only."
+                    on={form.block_page_show_reason}
+                    set={v => upd({ block_page_show_reason: v })}
+                  />
                 </>)}
 
                 {/* ───────── ADVANCED ───────── */}
