@@ -643,6 +643,16 @@ func attackCategory(rule string) string {
 		return "bot"
 	case "ANOMALY":
 		return "anomaly"
+	// Connection-layer blocks. Previously the data plane had no label for these
+	// and emitted ANOMALY, so threat-intel and IP-reputation blocks were
+	// miscounted as scoring-engine blocks in every rollup built on this
+	// function. Kept in step with classify_nonrule_block in the proxy.
+	case "THREATINTEL":
+		return "threat_intel"
+	case "IPREP":
+		return "ip_reputation"
+	case "DDOS":
+		return "ddos"
 	}
 	if len(rule) < 3 {
 		return "other"

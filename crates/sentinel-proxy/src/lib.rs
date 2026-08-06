@@ -2391,6 +2391,32 @@ async fn proxy(
     // later — see RequestContext::client_accepts_html.
     ctx.client_accepts_html = wants_html(req.headers());
 
+    // Attribute the request to a site/tenant BEFORE the connection-layer checks
+    // below, which reject and log without ever reaching routing.
+    //
+    // Without this their events are written with an EMPTY tenant, and every
+    // read path is tenant-scoped — so the Support ID printed on a threat-intel
+    // block page resolved to nothing when an operator pasted it into Threat
+    // Search. That is the one journey the Support ID exists for, failing for
+    // precisely the strangers most likely to be shown a block page.
+    //
+    // Attribution only: the authoritative routing below re-stamps both fields
+    // and additionally honours the listener's default_site, which this cheap
+    // Host lookup deliberately does not attempt. A wrong guess here cannot
+    // change enforcement, only which tenant owns the log line — and no guess
+    // at all guarantees the line is owned by nobody.
+    if let Some(h) = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(|h| h.split(':').next().unwrap_or(h))
+    {
+        if let Some(s) = cfg.sites.iter().find(|s| site_matches(s, h)) {
+            ctx.site_id = Some(s.id.clone());
+            ctx.tenant_id = Some(s.tenant_id.clone());
+        }
+    }
+
     // Anti-DDoS: connection-rate check.
     match state.modules.anti_ddos.check_connection(ctx.client_ip) {
         DdosVerdict::Block { reason } => {
@@ -6817,6 +6843,22 @@ fn classify_nonrule_block(reason: &str) -> (&'static str, &'static str) {
         ("RATELIMIT", "Rate limit exceeded")
     } else if r.contains("smuggling") {
         ("SMUGGLING", "HTTP request smuggling")
+    // The three connection-layer reasons below were missing, so all of them
+    // fell through to ANOMALY and were logged as "anomaly threshold exceeded"
+    // with score=0 — a self-contradiction (0 cannot exceed a threshold of 10)
+    // that told an operator the scoring engine had blocked a request the
+    // scoring engine never even saw. ClickHouse recorded them correctly, so
+    // the two sinks disagreed about the same event.
+    //
+    // Ordered before the `bot` arm on purpose: a threat-intel reason can name a
+    // feed containing the word "bot" ("bot-net IOC feed"), which would
+    // otherwise steal the match.
+    } else if r.contains("threat intel") {
+        ("THREATINTEL", "Threat intelligence match")
+    } else if r.contains("ip reputation") || r.contains("reputation") {
+        ("IPREP", "IP reputation block")
+    } else if r.contains("ddos") {
+        ("DDOS", "DDoS mitigation")
     } else if r.contains("bot") || r.contains("challenge") {
         ("BOT", "Bot challenge")
     } else {
@@ -8305,6 +8347,64 @@ mod block_page_connection_layer_tests {
         assert_eq!(
             resp.headers().get(header::CONTENT_TYPE).unwrap(),
             "application/json"
+        );
+    }
+}
+
+#[cfg(test)]
+mod nonrule_block_classification_tests {
+    use super::*;
+
+    /// Threat-intel, IP-reputation and DDoS blocks used to fall through to
+    /// ANOMALY, producing log lines that read "anomaly threshold exceeded" with
+    /// score=0 — blaming the scoring engine for a decision it never made, and
+    /// disagreeing with ClickHouse about the same event.
+    #[test]
+    fn connection_layer_reasons_get_their_own_labels() {
+        // Exactly the strings the proxy builds at the block sites.
+        assert_eq!(
+            classify_nonrule_block("threat intel: matched IOC feed 'abuse.ch' tier=block").0,
+            "THREATINTEL"
+        );
+        assert_eq!(
+            classify_nonrule_block("IP reputation: listed by dnsbl").0,
+            "IPREP"
+        );
+        assert_eq!(
+            classify_nonrule_block("DDoS mitigation: 1.2.3.4 is temporarily blocked").0,
+            "DDOS"
+        );
+    }
+
+    /// A threat-intel reason can legitimately contain the word "bot" (feeds are
+    /// named things like "bot-net IOCs"). The threat-intel arm must win, or the
+    /// fix simply moves the mislabelling somewhere less obvious.
+    #[test]
+    fn threat_intel_wins_over_a_bot_shaped_feed_name() {
+        let (rule, _) = classify_nonrule_block("threat intel: matched bot-net IOC feed");
+        assert_eq!(rule, "THREATINTEL", "feed name must not steal the match");
+    }
+
+    /// The arms that already worked must keep working.
+    #[test]
+    fn existing_labels_unchanged() {
+        assert_eq!(classify_nonrule_block("country blocked: CN").0, "GEOIP");
+        assert_eq!(classify_nonrule_block("rate limit exceeded").0, "RATELIMIT");
+        assert_eq!(
+            classify_nonrule_block("HTTP request smuggling detected").0,
+            "SMUGGLING"
+        );
+        assert_eq!(classify_nonrule_block("bot challenge failed").0, "BOT");
+    }
+
+    /// Anything unrecognised still reports ANOMALY. Documented rather than
+    /// endorsed: this default is why the bug was silent, so a NEW block reason
+    /// added later will misreport the same way until it gets an arm here.
+    #[test]
+    fn unknown_reason_still_falls_back_to_anomaly() {
+        assert_eq!(
+            classify_nonrule_block("something nobody has classified yet").0,
+            "ANOMALY"
         );
     }
 }
