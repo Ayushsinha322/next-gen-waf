@@ -11,8 +11,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -1117,6 +1119,10 @@ func handleInternalConfig(c *gin.Context, store *db.Store, log *zap.Logger) {
 		if s.Status == "paused" || s.Status == "deleted" {
 			continue
 		}
+		// Surface silently-dropped policy keys here rather than at write time:
+		// this is the point where the config is built FOR the data plane, so it
+		// also covers sites stored before a key was added or removed.
+		warnUnknownWafPolicyKeys(s.Name, s.WafPolicy, log)
 		rs, err := siteRowToRustConfig(s)
 		if err != nil {
 			log.Error("CONFIG SYNC: site is UNPROTECTED — its stored configuration cannot be "+
@@ -1502,6 +1508,84 @@ const maxUpstreamTimeoutSecs uint64 = 600
 // buildRustWaf accepts the legacy minimal blob and the rich dashboard blob and
 // produces the Rust WafConfig JSON. Unknown/empty sections are omitted so the
 // Rust defaults apply.
+// knownWafPolicyKeys is every waf_policy key the platform does something with.
+//
+// It exists because buildRustWaf is an allowlist: a key it does not name is
+// stored, echoed back to the dashboard, and silently dropped on the way to the
+// data plane. block_page shipped that way — the wizard offered branding, the
+// API persisted it, the site page redisplayed it, and blocked visitors kept
+// getting the default page, with nothing anywhere reporting a fault. Nothing
+// failed, so it went unnoticed until someone looked at what a visitor actually
+// received.
+//
+// Anything absent here is reported once per site at WARN. Keep it in step when
+// adding a field — a new key is either forwarded, or it is inert and the log
+// should say so.
+var knownWafPolicyKeys = map[string]struct{}{
+	// Forwarded to the data plane by buildRustWaf.
+	"mode": {}, "paranoia_level": {}, "anomaly_threshold": {},
+	"rule_categories": {}, "rule_exclusions": {}, "path_overrides": {},
+	"max_body_size": {}, "max_uri_length": {}, "max_header_count": {},
+	"allowed_methods": {}, "api_discovery": {}, "security_headers": {},
+	"rate_limit": {}, "anti_ddos": {}, "bot_detection": {}, "geoip": {},
+	"ip_reputation": {}, "ml": {}, "jwt": {}, "graphql": {}, "grpc": {},
+	"dlp": {}, "fusion": {}, "block_page": {},
+	// Consumed by buildRustSiteTLS into the top-level SiteConfig.tls rather
+	// than by buildRustWaf, so its absence from the struct above is correct.
+	"tls": {},
+	// Deliberately stored-only: TLS termination and the HTTP protocol set are
+	// properties of the WAF *listener*, shared by every site on a node, so
+	// there is no per-site plumbing to forward these to. The wizard's Front
+	// Service step is tagged "stored" and says so to the operator.
+	"frontend": {},
+}
+
+// warnedUnknownWafKeys dedupes the warning below. /internal/config is polled
+// every 5s by every data-plane node, so warning per call would bury the signal
+// under thousands of identical lines a day. Once per (site, key-set) per
+// process is enough to be seen after a deploy — and a control-plane restart
+// re-reports, which is exactly when someone is looking.
+var warnedUnknownWafKeys sync.Map
+
+// unknownWafPolicyKeys returns the waf_policy keys nothing will act on, sorted
+// so the output is stable and diffable.
+func unknownWafPolicyKeys(raw json.RawMessage) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	var all map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &all); err != nil {
+		// Malformed policy is buildRustWaf's error to report, not ours.
+		return nil
+	}
+	var unknown []string
+	for k := range all {
+		if _, ok := knownWafPolicyKeys[k]; !ok {
+			unknown = append(unknown, k)
+		}
+	}
+	sort.Strings(unknown)
+	return unknown
+}
+
+// warnUnknownWafPolicyKeys reports, once per site per process, any waf_policy
+// key that reaches neither the data plane nor a known stored-only path.
+func warnUnknownWafPolicyKeys(site string, raw json.RawMessage, log *zap.Logger) {
+	unknown := unknownWafPolicyKeys(raw)
+	if len(unknown) == 0 || log == nil {
+		return
+	}
+	key := site + "\x00" + strings.Join(unknown, ",")
+	if _, seen := warnedUnknownWafKeys.LoadOrStore(key, struct{}{}); seen {
+		return
+	}
+	log.Warn("waf_policy contains keys nothing acts on — they are stored and "+
+		"returned to the dashboard but NEVER reach the data plane, so any setting "+
+		"they represent is inert; add them to buildRustWaf or to knownWafPolicyKeys",
+		zap.String("site", site),
+		zap.Strings("ignored_keys", unknown))
+}
+
 func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
 	var p struct {
 		Mode             string          `json:"mode"`
