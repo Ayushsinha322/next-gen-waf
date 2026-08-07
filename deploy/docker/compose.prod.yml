@@ -335,11 +335,21 @@ services:
       dockerfile: ../deploy/docker/Dockerfile.dashboard
       args:
         CONTROL_PLANE_URL: http://controlplane:9501             # server-side REST proxy (internal)
-        # Client-side SSE/REST base. Points at the secure MANAGEMENT console
-        # (:9443) so live logs stream same-origin through the WAF's own mgmt
-        # listener (no mixed-content, no CORS). The console's primary URL is now
-        # https://172.16.21.71:9443; :3000 remains a cleartext break-glass path.
-        NEXT_PUBLIC_CONTROL_PLANE_URL: https://172.16.21.71:9443
+        # NEXT_PUBLIC_CONTROL_PLANE_URL is deliberately NOT set.
+        #
+        # It is inlined by Next at BUILD time, so setting it bakes one
+        # deployment's address into the image — the dashboard then only works on
+        # the box it was built for, which is wrong for a shippable product. It
+        # also broke the live-log stream the moment :9443 became loopback-only,
+        # because the browser was still told to reach a host IP that no longer
+        # answers.
+        #
+        # Unset, the SSE stream is same-origin (see api.ts logs.streamURL). The
+        # management console proxies /api/* straight to the control plane, so it
+        # reaches the Go server unbuffered and works under any origin: SSH
+        # tunnel, the host itself, a management VLAN, or a hostname later.
+        # Set it ONLY for an origin that does not proxy /api — e.g. the
+        # cleartext :3000 break-glass path, where Next.js rewrites buffer SSE.
     image: ${SENTINEL_IMAGE_PREFIX:-sentinel}/dashboard:${SENTINEL_VERSION:-latest}
     restart: unless-stopped
     depends_on:
@@ -347,8 +357,10 @@ services:
     environment:
       # Server-side Next.js REST rewrite -> internal control plane.
       CONTROL_PLANE_URL: http://controlplane:9501
-      # Client-side SSE base (baked at build; mirrored here for clarity).
-      NEXT_PUBLIC_CONTROL_PLANE_URL: https://172.16.21.71:9443
+      # NEXT_PUBLIC_CONTROL_PLANE_URL intentionally absent — see the build args
+      # above. Setting it here would be inert anyway (Next inlines NEXT_PUBLIC_*
+      # at build time, so a runtime value is never read) while looking as though
+      # it configured something.
       PORT: "3000"
       NODE_ENV: production
     ports:

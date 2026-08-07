@@ -10,9 +10,20 @@ COPY . .
 # Next.js bakes BOTH the rewrite() destination AND NEXT_PUBLIC_* client vars at
 # BUILD time. Two distinct URLs:
 #   CONTROL_PLANE_URL            → server-side REST proxy, internal hostname (portable)
-#   NEXT_PUBLIC_CONTROL_PLANE_URL → client-side SSE log stream, must be BROWSER-reachable
+#   NEXT_PUBLIC_CONTROL_PLANE_URL → client-side SSE log stream override
+#
+# The SSE default is EMPTY on purpose, which makes the stream same-origin (see
+# dashboard/lib/api.ts logs.streamURL). The old default was
+# http://controlplane:9501 — a DOCKER-INTERNAL hostname that a browser can never
+# resolve, so any build that forgot to pass the arg produced an image whose live
+# log tail could not work anywhere. Empty is both the safe default and the
+# correct one: the management console proxies /api/* to the control plane, so a
+# relative URL reaches it unbuffered from whatever origin the console is on.
+#
+# Set it only for an origin that does NOT proxy /api — e.g. the cleartext :3000
+# break-glass path, where Next's rewrite buffers SSE.
 ARG CONTROL_PLANE_URL=http://controlplane:9501
-ARG NEXT_PUBLIC_CONTROL_PLANE_URL=http://controlplane:9501
+ARG NEXT_PUBLIC_CONTROL_PLANE_URL=
 ENV CONTROL_PLANE_URL=${CONTROL_PLANE_URL}
 ENV NEXT_PUBLIC_CONTROL_PLANE_URL=${NEXT_PUBLIC_CONTROL_PLANE_URL}
 RUN npm run build

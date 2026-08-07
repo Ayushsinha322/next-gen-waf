@@ -45,7 +45,6 @@ docker build -f deploy/docker/Dockerfile --target sentinel-migrate      -t $REG/
 # Next.js dashboard — bake the external console URL (used by the live-log SSE)
 docker build -f deploy/docker/Dockerfile.dashboard \
   --build-arg CONTROL_PLANE_URL=http://sentinel-controlplane:9501 \
-  --build-arg NEXT_PUBLIC_CONTROL_PLANE_URL=https://$VIP:9443 \
   -t $REG/dashboard:$TAG dashboard
 
 docker push $REG/dataplane:$TAG
@@ -225,7 +224,7 @@ kubectl -n sentinel logs -l tier=controlplane --tail=20 | grep -i "becoming lead
 | Control-plane pods crash / degraded, "relation does not exist" | migrate Job didn't run before the control plane — run step 5c, then `kubectl -n sentinel rollout restart statefulset/sentinel-controlplane` |
 | Data-plane pods CrashLoop on boot | image pull error, or a bad `sentinel-proxy-config` edit (keep `protocol:`, not `protocols:`) |
 | HPA shows `<unknown>` targets | metrics-server not installed (step 2c) |
-| Dashboard loads but live logs / console URL wrong | the dashboard image was built with the wrong `NEXT_PUBLIC_CONTROL_PLANE_URL` — rebuild with `https://$VIP:9443` |
+| Dashboard loads but live logs stall | the SSE stream is same-origin; if the console is reached on a path that does NOT proxy `/api` to the control plane (e.g. the cleartext `:3000` break-glass), Next's rewrite buffers SSE — reach the console on `:9443` instead |
 | ImagePullBackOff | registry not reachable / images not pushed / add `imagePullSecrets` for a private registry |
 
 ---

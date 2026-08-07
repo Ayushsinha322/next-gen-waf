@@ -74,7 +74,6 @@ docker build -f deploy/docker/Dockerfile --target sentinel-controlplane -t senti
 docker build -f deploy/docker/Dockerfile --target sentinel-migrate      -t sentinel/migrate:latest .
 docker build -f deploy/docker/Dockerfile.dashboard \
   --build-arg CONTROL_PLANE_URL=http://controlplane:9501 \
-  --build-arg NEXT_PUBLIC_CONTROL_PLANE_URL=https://$VIP:9443 \
   -t sentinel/dashboard:latest dashboard
 ```
 

@@ -1091,18 +1091,35 @@ export const api = {
   },
 
   /** Returns the EventSource URL for the log stream (SSE).
-   *  The token is appended as a query param because EventSource cannot set headers.
-   *  We bypass the Next.js production proxy (which buffers SSE) by pointing
-   *  directly at the Go control plane. NEXT_PUBLIC_CONTROL_PLANE_URL must be
-   *  set at build time, e.g. NEXT_PUBLIC_CONTROL_PLANE_URL=http://localhost:9501 */
+   *
+   *  SAME-ORIGIN BY DEFAULT, and that is the important property. The management
+   *  console (:9443) reverse-proxies `/api/*` straight to the control plane —
+   *  Next.js is not in that path — so a relative URL reaches the Go server
+   *  unbuffered, which is the reason this used to be absolute.
+   *
+   *  Being relative makes the stream work under ANY origin the console is
+   *  reached by: an SSH tunnel (https://127.0.0.1:9443), the host itself, a
+   *  management VLAN address, or a real hostname later. The previous absolute
+   *  form baked ONE deployment's IP into the image at build time
+   *  (NEXT_PUBLIC_* is inlined by Next at build, not read at runtime), so the
+   *  dashboard image only worked on the box it was built for — and it broke
+   *  outright once :9443 was bound to loopback, because the browser was still
+   *  told to reach a host-IP that no longer answers.
+   *
+   *  The token rides as a query param because EventSource cannot set headers.
+   *
+   *  Override only if the console is served from an origin that does NOT proxy
+   *  /api to the control plane — notably the cleartext :3000 break-glass path,
+   *  where Next.js rewrites DO buffer SSE. Set NEXT_PUBLIC_CONTROL_PLANE_URL to
+   *  a browser-reachable control-plane base in that case. */
   logs: {
     streamURL: (kind?: string): string => {
       const token = getToken() ?? "";
       const params = new URLSearchParams({ token });
       if (kind) params.set("kind", kind);
-      const goBase =
-        process.env.NEXT_PUBLIC_CONTROL_PLANE_URL ?? "http://localhost:9501";
-      return `${goBase}/api/v1/logs/stream?${params}`;
+      const override = process.env.NEXT_PUBLIC_CONTROL_PLANE_URL?.trim();
+      const base = override ? override.replace(/\/+$/, "") : "";
+      return `${base}/api/v1/logs/stream?${params}`;
     },
   },
 };

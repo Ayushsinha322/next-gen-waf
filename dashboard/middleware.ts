@@ -41,9 +41,11 @@ function isValidJWT(token: string): boolean {
 function buildCSP(nonce: string): string {
   const isDev = process.env.NODE_ENV !== "production";
 
-  // The log stream is a cross-origin EventSource straight to the Go control
-  // plane (see lib/api.ts logs.streamURL) because the Next proxy buffers SSE, so
-  // connect-src has to allow that origin explicitly.
+  // The log stream is SAME-ORIGIN by default (see lib/api.ts logs.streamURL),
+  // so 'self' already covers it and connect-src stays as tight as possible.
+  // This only widens when NEXT_PUBLIC_CONTROL_PLANE_URL is explicitly set to
+  // point the stream at a different origin — the :3000 break-glass path, where
+  // Next's rewrite buffers SSE. Unset (the normal case) → no extra origin.
   const controlPlane = process.env.NEXT_PUBLIC_CONTROL_PLANE_URL ?? "";
   let controlPlaneOrigin = "";
   try {

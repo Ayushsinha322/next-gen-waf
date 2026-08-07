@@ -57,7 +57,10 @@ spec:
             # Server-side REST proxy target (Next.js rewrites /api/v1 → here).
             - { name: CONTROL_PLANE_URL, value: "http://sentinel-controlplane:9501" }
             # Mirrors the build-time value; effective only when the image is built with it.
-            - { name: NEXT_PUBLIC_CONTROL_PLANE_URL, value: "https://172.16.21.80:9443" }
+            # NEXT_PUBLIC_CONTROL_PLANE_URL deliberately unset: the SSE log
+            # stream is same-origin (see dashboard/lib/api.ts), so no cluster
+            # IP needs baking into the image. Setting it here is inert anyway —
+            # Next inlines NEXT_PUBLIC_* at BUILD time, never at runtime.
             - { name: PORT, value: "3000" }
             - { name: NODE_ENV, value: "production" }
           readinessProbe:
