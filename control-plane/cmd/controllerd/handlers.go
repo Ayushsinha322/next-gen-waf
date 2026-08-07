@@ -1527,6 +1527,13 @@ func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
 		AllowedMethods   []string        `json:"allowed_methods"`
 		SecurityHeaders  json.RawMessage `json:"security_headers"`
 		PathOverrides    json.RawMessage `json:"path_overrides"`
+		// Every field here is an ALLOWLIST entry: a waf_policy key absent from
+		// this struct is stored in the database, echoed back to the dashboard,
+		// and silently dropped on the way to the data plane. block_page was
+		// exactly that — the wizard offered branding, the API persisted it, the
+		// site detail page redisplayed it, and the visitor still got the default
+		// page, with nothing anywhere reporting a problem.
+		BlockPage json.RawMessage `json:"block_page"`
 	}
 	if len(raw) > 0 {
 		if err := json.Unmarshal(raw, &p); err != nil {
@@ -1612,6 +1619,7 @@ func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
 	attachRawObject(waf, "fusion", p.Fusion)
 	attachRawObject(waf, "ml", p.ML)
 	attachRawObject(waf, "ip_reputation", p.IPReputation)
+	attachRawObject(waf, "block_page", p.BlockPage)
 
 	// Per-path overrides pass through verbatim as an ARRAY (attachRawObject only
 	// handles objects). Validation has already rejected empty prefixes, per-path
