@@ -25,8 +25,15 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 SYSCTL_SRC="$HERE/99-sentinel-ddos.conf"
 SYSCTL_DST=/etc/sysctl.d/99-sentinel-ddos.conf
 
-# Public WAF ports. Keep in sync with compose.prod.yml / the k8s Services.
-WAF_PORTS="${WAF_PORTS:-80,443,9443}"
+# Public WAF ports — the ones that face untrusted traffic and therefore need the
+# conntrack bypass. Keep in sync with compose.prod.yml / the k8s Services.
+#
+# 9443 is deliberately NOT here. The management console is bound to 127.0.0.1
+# (see compose.prod.yml / compose.ha.yml), so it never carries the flood this
+# NOTRACK rule exists to survive — and applying conntrack bypass to an admin
+# port would be a odd thing to find later. If you are adding a port here, ask
+# first whether it should be internet-facing at all.
+WAF_PORTS="${WAF_PORTS:-80,443}"
 
 run() {
   if [[ $DRY_RUN -eq 1 ]]; then
