@@ -7825,6 +7825,7 @@ mod inline_rule_diag_tests {
             },
             plugins: vec![],
             tls: Default::default(),
+            origin: Default::default(),
         }
     }
 

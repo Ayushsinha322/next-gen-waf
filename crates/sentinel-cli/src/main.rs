@@ -781,6 +781,9 @@ fn cmd_site_add(
         },
         plugins: vec![],
         tls: Default::default(),
+        // The CLI writes into the on-disk YAML, so this site is file-declared
+        // and must survive control-plane syncs.
+        origin: sentinel_core::config::SiteOrigin::File,
     };
 
     cfg.sites.push(site);

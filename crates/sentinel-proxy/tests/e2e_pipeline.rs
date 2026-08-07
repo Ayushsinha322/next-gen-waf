@@ -88,6 +88,7 @@ fn test_config(
             },
             plugins: vec![],
             tls: Default::default(),
+            origin: Default::default(),
         }],
         ..Default::default()
     }
@@ -135,6 +136,7 @@ fn ml_only_config(listen_port: u16, upstream_port: u16, sensitivity: f32) -> Sen
             },
             plugins: vec![],
             tls: Default::default(),
+            origin: Default::default(),
         }],
         ..Default::default()
     }
@@ -670,6 +672,7 @@ fn inline_only_config(
             },
             plugins: vec![],
             tls: Default::default(),
+            origin: Default::default(),
         }],
         ..Default::default()
     }

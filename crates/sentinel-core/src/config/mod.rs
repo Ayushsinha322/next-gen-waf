@@ -270,6 +270,32 @@ pub struct SiteConfig {
     /// Per-site TLS certificate configuration.
     #[serde(default)]
     pub tls: SiteTlsConfig,
+    /// Where this site came from. See SiteOrigin — without it a deleted site
+    /// cannot be told apart from a file-declared one and is never evicted.
+    #[serde(default)]
+    pub origin: SiteOrigin,
+}
+
+/// Whether a site was declared on disk or delivered by the control plane.
+///
+/// This exists because `update_sites` has to answer one question on every sync:
+/// a site is in the running config but NOT in what the control plane just sent —
+/// keep it or drop it? Both a file-declared site and a site the operator has
+/// just DELETED look identical from that angle, and the merge used to keep both,
+/// so a deleted site was re-added on every poll and served until the process
+/// restarted. Provenance is the missing fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SiteOrigin {
+    /// Declared in the on-disk YAML config. The control plane does not know
+    /// about these, so they survive every sync. This is the default precisely
+    /// so a hand-written config file needs no new key.
+    #[default]
+    File,
+    /// Delivered by the control plane (or restored from its on-disk cache).
+    /// The control plane is authoritative for these, so each sync replaces the
+    /// whole set — which is what makes a delete take effect.
+    ControlPlane,
 }
 
 // ---------------------------------------------------------------------------
@@ -1239,16 +1265,42 @@ impl ConfigLoader {
 /// replacement).  File-based sites that the DB does *not* mention are preserved
 /// as bootstrap entries.  This avoids the "DB deletes your YAML sites" problem
 /// while still letting the UI add/update/delete sites at runtime.
-pub fn update_sites(handle: &ConfigHandle, db_sites: Vec<SiteConfig>) {
+pub fn update_sites(handle: &ConfigHandle, mut db_sites: Vec<SiteConfig>) {
     let current = handle.load_full();
 
-    // Build a lookup of file-based sites that exist BEFORE the merge.
+    // Everything arriving here came from the control plane (a live sync, or its
+    // on-disk cache replayed at boot), so stamp it rather than trusting the
+    // payload — the control plane does not send an origin field.
+    for s in &mut db_sites {
+        s.origin = SiteOrigin::ControlPlane;
+    }
+
+    // Keep ONLY the file-declared sites. Selecting by origin rather than by
+    // "absent from db_sites" is the whole fix: the old predicate kept any site
+    // the control plane had stopped sending, which is exactly what a DELETED
+    // site looks like. It was therefore re-added on every 5s poll and kept
+    // being served — with correct config everywhere else, so nothing looked
+    // wrong — until the process was restarted.
     let mut file_sites: Vec<SiteConfig> = current
         .sites
         .iter()
-        .filter(|s| !db_sites.iter().any(|ds| ds.id == s.id))
+        .filter(|s| s.origin == SiteOrigin::File)
         .cloned()
         .collect();
+
+    let dropped = current
+        .sites
+        .iter()
+        .filter(|s| {
+            s.origin == SiteOrigin::ControlPlane && !db_sites.iter().any(|ds| ds.id == s.id)
+        })
+        .map(|s| s.id.as_str())
+        .collect::<Vec<_>>();
+    if !dropped.is_empty() {
+        // Worth a line at INFO: a site vanishing from the fleet is a change an
+        // operator should be able to find in the log afterwards.
+        info!(sites = ?dropped, "sites removed by control plane — no longer served");
+    }
 
     let mut merged = db_sites;
     merged.append(&mut file_sites);
@@ -1318,5 +1370,132 @@ tls:
         let l: ListenerConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(l.protocols(), vec![Protocol::Http1, Protocol::Http2]);
         assert!(l.is_tls());
+    }
+}
+
+#[cfg(test)]
+mod site_eviction_tests {
+    use super::*;
+
+    /// Built through serde rather than a struct literal so these tests also
+    /// exercise the deserialization the real sync path uses.
+    fn site(id: &str, origin: SiteOrigin) -> SiteConfig {
+        let yaml = format!(
+            r#"
+id: {id}
+domains: ["{id}.example"]
+upstream:
+  servers:
+    - {{ host: "127.0.0.1", port: 8080 }}
+"#
+        );
+        let mut s: SiteConfig = serde_yaml::from_str(&yaml).expect("parse test site");
+        s.origin = origin;
+        s
+    }
+
+    fn handle_with(sites: Vec<SiteConfig>) -> ConfigHandle {
+        let cfg = SentinelConfig {
+            sites,
+            ..SentinelConfig::default()
+        };
+        Arc::new(ArcSwap::from(Arc::new(cfg)))
+    }
+
+    fn ids(h: &ConfigHandle) -> Vec<String> {
+        let mut v: Vec<String> = h.load_full().sites.iter().map(|s| s.id.clone()).collect();
+        v.sort();
+        v
+    }
+
+    /// The bug: a site deleted in the dashboard kept being SERVED. The merge
+    /// retained anything the control plane had stopped sending, which is
+    /// indistinguishable from a file-declared site — so the deleted site was
+    /// re-added on every 5s poll and only disappeared when the process
+    /// restarted. Found on the deploy VM: rule count stayed at 670 (two sites)
+    /// and the deleted host still answered 403, while the control plane and
+    /// database both correctly listed one site.
+    #[test]
+    fn control_plane_delete_evicts_the_site() {
+        let h = handle_with(vec![
+            site("keep-me", SiteOrigin::ControlPlane),
+            site("deleted-site", SiteOrigin::ControlPlane),
+        ]);
+
+        // Next sync: the control plane no longer mentions deleted-site.
+        update_sites(&h, vec![site("keep-me", SiteOrigin::ControlPlane)]);
+
+        assert_eq!(
+            ids(&h),
+            vec!["keep-me".to_string()],
+            "a site the control plane stopped sending must stop being served"
+        );
+    }
+
+    /// The reason the old predicate existed: the control plane knows nothing
+    /// about sites declared in the on-disk YAML, so a sync must never delete
+    /// them. Evicting by origin has to preserve that.
+    #[test]
+    fn file_declared_sites_survive_every_sync() {
+        let h = handle_with(vec![
+            site("from-yaml", SiteOrigin::File),
+            site("from-db", SiteOrigin::ControlPlane),
+        ]);
+
+        // A sync that mentions neither of them.
+        update_sites(&h, vec![site("brand-new", SiteOrigin::ControlPlane)]);
+
+        assert_eq!(
+            ids(&h),
+            vec!["brand-new".to_string(), "from-yaml".to_string()],
+            "file sites stay; control-plane sites are replaced wholesale"
+        );
+    }
+
+    /// Incoming sites are stamped rather than trusted: the control plane's JSON
+    /// carries no origin field, so without stamping they would deserialize as
+    /// File (the default) and become un-evictable on the very next sync.
+    #[test]
+    fn incoming_sites_are_stamped_control_plane() {
+        let h = handle_with(vec![]);
+        // Deliberately pass the serde default, as a real payload would.
+        update_sites(&h, vec![site("from-cp", SiteOrigin::File)]);
+
+        let stored = h.load_full();
+        assert_eq!(stored.sites[0].origin, SiteOrigin::ControlPlane);
+
+        // And prove it is now evictable — the property the stamping buys.
+        update_sites(&h, vec![]);
+        assert!(
+            ids(&h).is_empty(),
+            "a stamped control-plane site must be removable on a later sync"
+        );
+    }
+
+    /// An empty payload is a legitimate "this tenant has no sites", not a
+    /// signal to keep the previous set. It must not resurrect anything.
+    #[test]
+    fn empty_payload_clears_control_plane_sites_but_not_file_sites() {
+        let h = handle_with(vec![
+            site("yaml-one", SiteOrigin::File),
+            site("db-one", SiteOrigin::ControlPlane),
+        ]);
+        update_sites(&h, vec![]);
+        assert_eq!(ids(&h), vec!["yaml-one".to_string()]);
+    }
+
+    /// A YAML-declared site with no `origin` key must default to File, or a
+    /// hand-written config would start being deleted by control-plane syncs.
+    #[test]
+    fn yaml_without_origin_key_defaults_to_file() {
+        let yaml = r#"
+id: legacy-site
+domains: ["legacy.example"]
+upstream:
+  servers:
+    - { host: "127.0.0.1", port: 8080 }
+"#;
+        let s: SiteConfig = serde_yaml::from_str(yaml).expect("parse site");
+        assert_eq!(s.origin, SiteOrigin::File);
     }
 }
