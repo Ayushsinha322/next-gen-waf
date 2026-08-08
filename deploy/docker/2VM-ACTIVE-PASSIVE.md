@@ -1,4 +1,17 @@
-# 2‑VM active‑passive deployment (Docker Compose)
+# 2‑VM active‑passive deployment (Docker Compose) — manual reference
+
+> **Installing? Use [`../ACTIVE-PASSIVE.md`](../ACTIVE-PASSIVE.md) instead.**
+>
+> That is the supported procedure: `install-2vm.sh` does all of the below, plus
+> keepalived and a virtual IP, and validates each step as it goes. This document
+> describes the **manual compose path** — no VIP, no automatic traffic failover —
+> and exists as a reference for understanding what the installer does and for
+> recovering a deployment by hand.
+>
+> Note one deliberate difference: the installer generates the replication DSNs with
+> `sslmode=disable` and prints a warning telling you to issue certificates and
+> switch them to `verify-full`. The `verify-full` DSNs shown below are the target
+> state, not what a fresh scripted install produces.
 
 Two machines. Traffic is served by **both**; the database has a primary on one and a
 streaming standby on the other; promotion is **scripted, not automatic**.

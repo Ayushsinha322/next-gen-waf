@@ -189,11 +189,21 @@ services:
       # Origins allowed to call the control plane from a browser. In the intended
       # posture the console is served from https://<host>:9443 and the live-log
       # EventSource targets that same origin, so no cross-origin request happens
-      # at all. The :3000 entry only matters for the loopback break-glass path; if
-      # you reach the UI through an SSH tunnel, its origin is http://127.0.0.1:3000
-      # and you must add that here for SSE to connect. Left out by default rather
-      # than pre-allow-listed, so the normal deployment carries no extra origin.
-      SENTINEL_CORS_ORIGINS: http://172.16.21.71:3000,https://172.16.21.71:9443
+      # at all and this list is not consulted.
+      #
+      # It previously read `http://172.16.21.71:3000,https://172.16.21.71:9443` —
+      # one developer's VM address, shipped to every customer, directly
+      # contradicting the comment above it that said no origin was pre-allowed.
+      # Anywhere but that VM it allow-listed a host that does not exist while
+      # OVERRIDING the built-in defaults, since a non-empty value replaces them
+      # wholesale.
+      #
+      # The default below names only loopback, which is what both documented
+      # access paths actually resolve to: the SSH tunnel (https://127.0.0.1:9443)
+      # and the cleartext break-glass UI (http://127.0.0.1:3000). Note that
+      # browsers treat 127.0.0.1 and localhost as DIFFERENT origins — if you reach
+      # the console by hostname, add that origin here explicitly.
+      SENTINEL_CORS_ORIGINS: ${SENTINEL_CORS_ORIGINS:-https://127.0.0.1:9443,http://127.0.0.1:3000}
       # Cert repository: control plane proxies cert uploads/list to the data
       # plane's internal API, authenticated with a shared secret (cross-container).
       SENTINEL_DATAPLANE_URL: http://dataplane:8080
@@ -277,6 +287,16 @@ services:
       # `--force-recreate` an operator runs to fix the outage.
       SENTINEL_SPOOL_DIR: /var/lib/sentinel/state/spool
       SENTINEL_SPOOL_MAX_BYTES: ${SENTINEL_SPOOL_MAX_BYTES:-268435456}
+      # Event-log retention. The installer writes both of these into .env and
+      # .env.example documents them as THE compliance knob ("raise for compliance,
+      # e.g. 365"), and the data plane really does read them
+      # (sentinel-storage/src/clickhouse.rs — applied to existing tables via
+      # ALTER ... MODIFY TTL on restart). They were simply never passed into the
+      # container: an operator asked for 365-day retention by an auditor could edit
+      # .env, recreate the stack, watch it come up clean, and still be silently
+      # running the built-in 90-day default.
+      SENTINEL_CLICKHOUSE_EVENT_RETENTION_DAYS: ${SENTINEL_CLICKHOUSE_EVENT_RETENTION_DAYS:-90}
+      SENTINEL_CLICKHOUSE_TRAFFIC_RETENTION_DAYS: ${SENTINEL_CLICKHOUSE_TRAFFIC_RETENTION_DAYS:-30}
       # Upstreams the dedicated management listener (:9443) reverse-proxies to.
       SENTINEL_MGMT_DASHBOARD_UPSTREAM: http://dashboard:3000
       SENTINEL_MGMT_API_UPSTREAM: http://controlplane:9501

@@ -6,7 +6,31 @@
 
 # --- Locations ---------------------------------------------------------------
 BK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-COMPOSE_FILE="${COMPOSE_FILE:-$(cd "$BK_DIR/../docker" && pwd)/compose.prod.yml}"
+
+# Resolve compose.prod.yml across the three trees these scripts actually run from.
+#
+# This was hardcoded to "$BK_DIR/../docker" — the REPO layout. In the customer
+# bundle the backup scripts live at scripts/backup/, so that resolved to
+# scripts/docker, which does not exist; the `cd` failed, the command substitution
+# produced an empty string, and COMPOSE_FILE became the literal "/compose.prod.yml".
+# Every backup, restore and drill on a customer install was therefore broken —
+# including the pre-upgrade backup that upgrade.sh takes before touching anything.
+if [[ -z "${COMPOSE_FILE:-}" ]]; then
+  for _cand in \
+      "$BK_DIR/../docker/compose.prod.yml" \
+      "$BK_DIR/../../compose/compose.prod.yml" \
+      "/opt/sentinel/current/compose.prod.yml"; do
+    if [[ -f "$_cand" ]]; then
+      COMPOSE_FILE="$(cd "$(dirname "$_cand")" && pwd)/compose.prod.yml"
+      break
+    fi
+  done
+fi
+if [[ -z "${COMPOSE_FILE:-}" || ! -f "$COMPOSE_FILE" ]]; then
+  printf 'ERROR: cannot locate compose.prod.yml (looked beside %s, in ../../compose, and /opt/sentinel/current).\n' "$BK_DIR" >&2
+  printf '       Set COMPOSE_FILE=/path/to/compose.prod.yml and re-run.\n' >&2
+  exit 1
+fi
 ENV_FILE="${ENV_FILE:-$(dirname "$COMPOSE_FILE")/.env}"
 BACKUP_ROOT="${BACKUP_ROOT:-/var/backups/sentinel}"   # where dumps land locally
 RETENTION_DAYS="${RETENTION_DAYS:-14}"                 # local prune horizon

@@ -81,13 +81,24 @@ If your site has no egress, either:
 
 ## After installing
 
-The installer prints the dashboard URL and a one-time administrator password.
+The installer prints a one-time administrator password and how to reach the console.
 
-1. **Log in and change the password.** It is written in plain text in
-   `/var/log/sentinel/install.log`.
-2. **Add your first protected site.** Until one exists the WAF returns 502 to
+1. **Log in and change the password.** It is **not** in `/var/log/sentinel/install.log`
+   — the control plane prints it once, to its own container log. If you missed it:
+
+   ```bash
+   docker logs sentinel-controlplane-1 2>&1 | grep -A1 'GENERATED password'
+   ```
+
+2. **The console is loopback-only, on purpose.** `https://<host>:9443` will not
+   connect from your workstation. Tunnel to it:
+
+   ```bash
+   ssh -L 9443:127.0.0.1:9443 root@<host>     # then open https://127.0.0.1:9443
+   ```
+3. **Add your first protected site.** Until one exists the WAF returns 502 to
    everything — correct, because there is no upstream to forward to.
-3. **Leave new sites in LEARNING mode.**
+4. **Leave new sites in LEARNING mode.**
 
 ### Why learning mode matters
 

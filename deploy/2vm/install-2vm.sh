@@ -36,9 +36,64 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DOCKER_DIR="$(cd "$SCRIPT_DIR/../docker" 2>/dev/null && pwd || echo "")"
 ROLE_FILE=/etc/sentinel/2vm-role
 STATE_DIR=/etc/sentinel
+
+# ── where things live ────────────────────────────────────────────────────────
+#
+# This script is run from three trees that do NOT have the same shape:
+#
+#   repo checkout     deploy/2vm/install-2vm.sh
+#                     compose files, helper scripts and .env.example all sit
+#                     together in deploy/docker/
+#
+#   customer bundle   scripts/2vm/install-2vm.sh
+#                     compose/ , scripts/ and configs/ are THREE SEPARATE dirs
+#
+#   installed tree    /opt/sentinel/current/
+#                     compose at the root, helpers under scripts/
+#
+# The original code resolved a single DOCKER_DIR="$SCRIPT_DIR/../docker" and died
+# if it was absent. In the customer bundle that path resolves to scripts/docker,
+# which build-bundle.sh never creates — so the shipped active/passive installer
+# aborted on its first check, before doing anything, with a message about a repo
+# directory the customer does not have. Resolve the three ROLES independently
+# rather than assuming one directory fills all of them.
+#
+#   COMPOSE_DIR    compose.prod.yml + the 2vm overlays. docker compose runs here
+#                  and .env lives beside them.
+#   HELPER_DIR     issue-postgres-cert.sh, issue-clickhouse-cert.sh,
+#                  promote-standby.sh
+#   ENV_EXAMPLE    template that a fresh .env is seeded from
+#   BUNDLE_IMAGES  images.tar.gz, when we were run out of a bundle
+COMPOSE_DIR="${SENTINEL_COMPOSE_DIR:-}"
+HELPER_DIR="${SENTINEL_HELPER_DIR:-}"
+ENV_EXAMPLE=""
+BUNDLE_IMAGES=""
+BUNDLE_ROOT=""
+LAYOUT="unknown"
+
+if [[ -z "$COMPOSE_DIR" ]]; then
+  if [[ -f "$SCRIPT_DIR/../docker/compose.prod.yml" ]]; then
+    LAYOUT="repo"
+    COMPOSE_DIR="$(cd "$SCRIPT_DIR/../docker" && pwd)"
+    HELPER_DIR="$COMPOSE_DIR"
+    ENV_EXAMPLE="$COMPOSE_DIR/.env.example"
+  elif [[ -f "$SCRIPT_DIR/../../compose/compose.prod.yml" ]]; then
+    LAYOUT="bundle"
+    BUNDLE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+    COMPOSE_DIR="$BUNDLE_ROOT/compose"
+    HELPER_DIR="$BUNDLE_ROOT/scripts"
+    ENV_EXAMPLE="$BUNDLE_ROOT/configs/env.example"
+    [[ -f "$BUNDLE_ROOT/bundle/images.tar.gz" ]] && BUNDLE_IMAGES="$BUNDLE_ROOT/bundle/images.tar.gz"
+  elif [[ -f /opt/sentinel/current/compose.prod.yml ]]; then
+    LAYOUT="installed"
+    COMPOSE_DIR=/opt/sentinel/current
+    HELPER_DIR=/opt/sentinel/current/scripts
+    ENV_EXAMPLE=/opt/sentinel/current/env.example
+  fi
+fi
+[[ -n "$HELPER_DIR" ]] || HELPER_DIR="$COMPOSE_DIR"
 
 if [[ -t 1 ]]; then
   B=$'\e[1m'; R=$'\e[0m'; DIM=$'\e[2m'
@@ -53,11 +108,50 @@ ok()   { printf '  %s✓%s %s\n' "$GRN" "$R" "$*"; }
 warn() { printf '  %s!%s %s\n' "$YEL" "$R" "$*"; }
 die()  { printf '\n  %s✗ %s%s\n\n' "$RED" "$*" "$R" >&2; exit 1; }
 
+# env_set KEY VALUE — set a key in $ENV_FILE, replacing in place or appending.
+#
+# One helper for all three callers (master secrets, the slave's node-specific
+# rewrites, and image pinning), because they were three near-identical copies and
+# two of them shelled out to python3 with NO error guard. On a minimal Ubuntu
+# image, which does not ship python3, those silently did nothing: the key kept its
+# .env.example placeholder, the install reported success, and the failure only
+# surfaced later as an inexplicable authentication or replication error.
+#
+# The value is escaped before it reaches sed. This is not paranoia: in a sed
+# replacement `&` expands to THE ENTIRE MATCHED TEXT, so a Postgres DSN written the
+# way this file's own warning recommends —
+#     ...?sslmode=verify-full&sslrootcert=/etc/sentinel/pki/root.crt
+# — would silently expand to the whole `KEY=oldvalue` line in the middle of the new
+# value, producing a corrupt DSN that looks plausible in the file. `\` and the `|`
+# delimiter are escaped for the same reason.
+env_set() {
+  local k="$1" v="$2" esc
+  [[ -n "${ENV_FILE:-}" ]] || die "env_set called before ENV_FILE was set (internal error)"
+  esc="$(printf '%s' "$v" | sed -e 's/[\\&|]/\\&/g')"
+  if grep -qE "^${k}=" "$ENV_FILE"; then
+    sed -i "s|^${k}=.*|${k}=${esc}|" "$ENV_FILE" || die "could not update $k in $ENV_FILE"
+  else
+    printf '%s=%s\n' "$k" "$v" >> "$ENV_FILE" || die "could not append $k to $ENV_FILE"
+  fi
+}
+
 ROLE=""; THIS_IP=""; PEER_IP=""; VIP=""; IFACE=""; VIP_CIDR=""; MODE="install"
+# Hostname the VRRP health check sends as the Host header when it probes a real
+# request. It MUST be a name one of your sites claims, or the data plane answers
+# 502 (no matching site) and the node is judged unable to serve. Defaults to the
+# VIP, which is only correct if a site actually lists the VIP as a domain.
+PROBE_HOST=""
 # Skips the role-change confirmation. It never suppresses a VIP conflict — that one
 # is a genuine "two hosts on one address" hazard and stays fatal.
 ASSUME_YES="${ASSUME_YES:-no}"
 VRID="${SENTINEL_VRID:-51}"
+# Set when a post-start check finds a genuine fault. The script used to print the
+# full success summary and exit 0 even on the branch whose own message says "this
+# one IS a fault" — so any automation wrapping it recorded a clean install.
+INSTALL_FAULT=no
+# Set when the ClickHouse firewall data-path check has to be deferred because
+# nothing was listening on :443 at the time the rules were installed.
+CH_FW_VERIFY=no
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -67,6 +161,7 @@ while [[ $# -gt 0 ]]; do
     --vip)  VIP="${2:-}"; shift ;;
     --iface) IFACE="${2:-}"; shift ;;
     --vrid) VRID="${2:-}"; shift ;;
+    --probe-host) PROBE_HOST="${2:-}"; shift ;;
     --check) MODE="check" ;;
     --yes|-y) ASSUME_YES=yes ;;
     -h|--help) sed -n '2,40p' "$0" | sed 's/^#\{0,2\} \{0,1\}//'; exit 0 ;;
@@ -78,7 +173,16 @@ done
 # --check also needs root: the state it reads lives under /etc/sentinel, which is
 # 0700 because it holds the VRRP password.
 [[ $EUID -eq 0 ]] || die "run as root — this reads /etc/sentinel and manages keepalived"
-[[ -n "$DOCKER_DIR" ]] || die "cannot find deploy/docker next to this script"
+[[ -n "$COMPOSE_DIR" && -f "$COMPOSE_DIR/compose.prod.yml" ]] || die \
+"cannot locate compose.prod.yml.
+
+  Looked in, relative to this script ($SCRIPT_DIR):
+    ../docker/compose.prod.yml        (repo checkout)
+    ../../compose/compose.prod.yml    (customer bundle)
+    /opt/sentinel/current/compose.prod.yml   (installed tree)
+
+  If your layout differs, point at it explicitly:
+    SENTINEL_COMPOSE_DIR=/path/to/compose $0 ..."
 
 # ── validation helpers ───────────────────────────────────────────────────────
 valid_ip() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
@@ -100,27 +204,67 @@ ask() { # ask VAR "prompt" "default"
 step "Sentinel WAF — 2-VM active/passive"
 
 if [[ "$MODE" == "check" ]]; then
+  # --check used to print its findings and exit 0 unconditionally: a node with
+  # keepalived dead and the data plane down still "passed", so it could not be used
+  # in a script, a monitor, or a go-live gate. It now reports the same information
+  # AND returns a status that reflects it.
   [[ -f "$ROLE_FILE" ]] || die "no install found ($ROLE_FILE missing)"
-  say "  role:  $(cat "$ROLE_FILE")"
-  say "  vip:   $(cat "$STATE_DIR/2vm-vip" 2>/dev/null || echo '?')"
-  step "keepalived"
-  systemctl is-active --quiet keepalived && ok "running" || warn "NOT running"
+  CHECK_FAIL=0
   _vip="$(cat "$STATE_DIR/2vm-vip" 2>/dev/null || echo '')"
+  _probe="$(cat "$STATE_DIR/2vm-probe-host" 2>/dev/null || echo '')"
+  say "  role:   $(cat "$ROLE_FILE")"
+  say "  vip:    ${_vip:-?}"
+  say "  probe:  ${_probe:-?}   ${DIM}(a site must claim this name, or health always fails)${R}"
+  if [[ -f "$STATE_DIR/2vm-vrrp-pass" ]]; then
+    say "  vrrp:   $(sha256sum < "$STATE_DIR/2vm-vrrp-pass" | cut -c1-12)   ${DIM}(must be IDENTICAL on the peer)${R}"
+  else
+    warn "VRRP password file missing — keepalived cannot authenticate with the peer"
+    CHECK_FAIL=1
+  fi
+
+  step "keepalived"
+  if systemctl is-active --quiet keepalived; then
+    ok "running"
+  else
+    warn "NOT running — this node can neither take nor hold the VIP"
+    CHECK_FAIL=1
+  fi
+
+  step "containers"
+  for _c in dataplane controlplane postgres; do
+    _st="$(docker inspect -f '{{.State.Status}}' "sentinel-${_c}-1" 2>/dev/null || echo absent)"
+    if [[ "$_st" == "running" ]]; then ok "sentinel-${_c}-1 running"
+    else warn "sentinel-${_c}-1 is ${_st}"; CHECK_FAIL=1; fi
+  done
+
+  step "VIP"
   if [[ -n "$_vip" ]] && ip -4 addr show | grep -qE "inet ${_vip}/"; then
     ok "this node currently HOLDS the VIP"
+    say "  ${DIM}Run --check on the peer too: exactly ONE node may hold it. Both holding${R}"
+    say "  ${DIM}it means VRRP authentication is failing — compare the vrrp fingerprint.${R}"
   else
     say "  ${DIM}this node does not hold the VIP (normal for the standby)${R}"
   fi
+
   step "data-plane health (what VRRP tracks)"
-  if /usr/local/sbin/sentinel-vrrp-check.sh; then ok "healthy — eligible for the VIP"
-  else warn "UNHEALTHY — this node would hand the VIP to its peer"; fi
+  if /usr/local/sbin/sentinel-vrrp-check.sh; then
+    ok "healthy — eligible for the VIP"
+  else
+    warn "UNHEALTHY — this node would hand the VIP to its peer"
+    CHECK_FAIL=1
+  fi
+
   step "recent VRRP transitions"
   tail -n 8 /var/log/sentinel-vrrp.log 2>/dev/null | sed 's/^/  /' || say "  (none logged yet)"
-  exit 0
+
+  echo
+  if [[ $CHECK_FAIL -eq 0 ]]; then ok "all checks passed on this node"
+  else warn "one or more checks FAILED on this node"; fi
+  exit "$CHECK_FAIL"
 fi
 
 # ── 1. role ──────────────────────────────────────────────────────────────────
-step "Step 1 of 7 — which node is this?"
+step "Step 1 of 8 — which node is this?"
 if [[ -z "$ROLE" ]]; then
   say "  ${DIM}master = VM 1. Postgres PRIMARY, ClickHouse, and it prefers to hold the VIP.${R}"
   say "  ${DIM}slave  = VM 2. Postgres streaming STANDBY. Takes the VIP when VM 1 cannot serve.${R}"
@@ -154,7 +298,7 @@ if [[ -f "$ROLE_FILE" ]] && [[ "$(cat "$ROLE_FILE")" != "$ROLE" ]]; then
 fi
 
 # ── 2. addressing ────────────────────────────────────────────────────────────
-step "Step 2 of 7 — addressing"
+step "Step 2 of 8 — addressing"
 DEF_IFACE="$(ip -4 route show default 2>/dev/null | awk '/default/{print $5; exit}')"
 DEF_IP="$(ip -4 -brief addr show "${DEF_IFACE:-lo}" 2>/dev/null | awk '{print $3}' | cut -d/ -f1 | head -1)"
 DEF_CIDR="$(ip -4 -brief addr show "${DEF_IFACE:-lo}" 2>/dev/null | awk '{print $3}' | cut -d/ -f2 | head -1)"
@@ -176,7 +320,7 @@ ip -o link show "$IFACE" >/dev/null 2>&1 || die "interface '$IFACE' not found"
 ok "iface $IFACE · this $THIS_IP · peer $PEER_IP · vip $VIP/$VIP_CIDR · vrid $VRID"
 
 # ── 3. preflight ─────────────────────────────────────────────────────────────
-step "Step 3 of 7 — preflight"
+step "Step 3 of 8 — preflight"
 
 command -v docker >/dev/null 2>&1 || die "docker is not installed"
 docker compose version >/dev/null 2>&1 || die "the docker compose plugin is not installed"
@@ -232,30 +376,18 @@ say "  capacity: ${CPUS} vCPU · ${MEM_GB}Gi RAM · ${DISK_GB}G free on /"
 (( DISK_GB >= 80 )) || warn "80G free is the floor; 200G if you build images on this box"
 
 # ── 4. .env ──────────────────────────────────────────────────────────────────
-step "Step 4 of 7 — secrets and configuration"
-ENV_FILE="$DOCKER_DIR/.env"
+step "Step 4 of 8 — secrets and configuration"
+ENV_FILE="$COMPOSE_DIR/.env"
 
 if [[ "$ROLE" == "master" ]]; then
   if [[ -f "$ENV_FILE" ]]; then
     ok ".env already present — leaving it alone"
   else
-    [[ -f "$DOCKER_DIR/.env.example" ]] || die ".env.example missing; cannot generate .env"
-    cp "$DOCKER_DIR/.env.example" "$ENV_FILE"
+    [[ -n "$ENV_EXAMPLE" && -f "$ENV_EXAMPLE" ]] \
+      || die "the .env template is missing (looked for ${ENV_EXAMPLE:-<unresolved>}); cannot generate .env"
+    cp "$ENV_EXAMPLE" "$ENV_FILE"
     gen() { openssl rand -hex 32; }
-    set_kv() { # set_kv KEY VALUE — replace or append, never duplicate
-      local k="$1" v="$2"
-      if grep -qE "^${k}=" "$ENV_FILE"; then
-        python3 - "$ENV_FILE" "$k" "$v" <<'PY'
-import sys,re
-p,k,v=sys.argv[1],sys.argv[2],sys.argv[3]
-s=open(p).read()
-s=re.sub(r'^%s=.*$' % re.escape(k), k+'='+v.replace('\\','\\\\'), s, count=1, flags=re.M)
-open(p,'w').write(s)
-PY
-      else
-        printf '%s=%s\n' "$k" "$v" >> "$ENV_FILE"
-      fi
-    }
+    set_kv() { env_set "$@"; }   # see env_set near the top
     PGPW="$(gen)"; REPLPW="$(gen)"; CHPW="$(gen)"
     set_kv POSTGRES_USER sentinel
     set_kv POSTGRES_DB sentinel
@@ -321,41 +453,20 @@ else
   # It is NODE-SPECIFIC — from the slave, the primary is its peer — so it cannot
   # come from the master's copy of .env and has to be written here. The passive
   # overlay declares it with no default, so compose refuses to start without it.
-  if grep -qE "^SENTINEL_PRIMARY_HOST=" "$ENV_FILE"; then
-    python3 - "$ENV_FILE" "$PEER_IP" <<'PYEOF'
-import sys, re
-p, v = sys.argv[1], sys.argv[2]
-s = open(p).read()
-s = re.sub(r'^SENTINEL_PRIMARY_HOST=.*$', 'SENTINEL_PRIMARY_HOST=' + v, s, count=1, flags=re.M)
-open(p, 'w').write(s)
-PYEOF
-  else
-    printf 'SENTINEL_PRIMARY_HOST=%s\n' "$PEER_IP" >> "$ENV_FILE"
-  fi
+  env_set SENTINEL_PRIMARY_HOST "$PEER_IP"
   # Same node-specific reasoning for the remote ClickHouse: this VM has none, so
   # both its planes must point at the master's. The master writes its own address
   # here, which is already correct once copied — but rewrite it anyway so a role
   # swap or a re-run cannot leave the slave pointing at itself, where there is no
   # ClickHouse and history would silently go nowhere all over again.
-  if grep -qE "^SENTINEL_CLICKHOUSE_URL_PRIMARY=" "$ENV_FILE"; then
-    python3 - "$ENV_FILE" "https://${PEER_IP}:8443" <<'PYEOF'
-import sys, re
-p, v = sys.argv[1], sys.argv[2]
-s = open(p).read()
-s = re.sub(r'^SENTINEL_CLICKHOUSE_URL_PRIMARY=.*$',
-           'SENTINEL_CLICKHOUSE_URL_PRIMARY=' + v, s, count=1, flags=re.M)
-open(p, 'w').write(s)
-PYEOF
-  else
-    printf 'SENTINEL_CLICKHOUSE_URL_PRIMARY=%s\n' "https://${PEER_IP}:8443" >> "$ENV_FILE"
-  fi
+  env_set SENTINEL_CLICKHOUSE_URL_PRIMARY "https://${PEER_IP}:8443"
   chmod 600 "$ENV_FILE"
   ok "SENTINEL_PRIMARY_HOST=$PEER_IP (the standby streams from here)"
   ok "SENTINEL_CLICKHOUSE_URL_PRIMARY=https://${PEER_IP}:8443 (event history lands there)"
 fi
 
 # ── 4b. Postgres TLS ─────────────────────────────────────────────────────────
-step "Step 5 of 7 — Postgres server certificate"
+step "Step 5 of 8 — Postgres server certificate"
 
 # compose.prod.yml starts Postgres with ssl=on and mounts
 # /opt/sentinel-pki/pg-server.{crt,key}. Without those files Postgres exits at
@@ -393,7 +504,7 @@ else
   # SANs must cover every name/address a client will dial: the compose service
   # name, loopback for local psql, BOTH VMs (the standby connects to the primary
   # by address), and the VIP in case a client follows it.
-  ( cd "$DOCKER_DIR" && \
+  ( cd "$HELPER_DIR" && \
     PG_HOSTS="postgres,localhost,$(hostname -s)" \
     PG_IPS="127.0.0.1,${THIS_IP},${PEER_IP},${VIP}" \
     ./issue-postgres-cert.sh >/tmp/pgcert.log 2>&1 ) \
@@ -415,7 +526,7 @@ fi
 # reintroducing the exact silent-loss bug this replaced. Same trap as the Postgres
 # cert in the first install, where a directory also satisfied `-s`.
 if [[ "$ROLE" == "master" ]]; then
-  step "Step 5b of 7 — ClickHouse server certificate"
+  step "Step 5b of 8 — ClickHouse server certificate"
   _ch_ok=no
   if [[ -f "$PKI_DIR/ch-server.crt" && -s "$PKI_DIR/ch-server.crt" \
      && -f "$PKI_DIR/ch-server.key" && -s "$PKI_DIR/ch-server.key" ]]; then
@@ -432,7 +543,7 @@ if [[ "$ROLE" == "master" ]]; then
     # SANs cover BOTH VMs and the VIP, not just this one: after a role swap the
     # other node serves ClickHouse, and a cert naming only the original master
     # then fails verification for no visible reason.
-    ( cd "$DOCKER_DIR" && \
+    ( cd "$HELPER_DIR" && \
       CH_HOSTS="clickhouse,sentinel-clickhouse-1,localhost,$(hostname -s)" \
       CH_IPS="127.0.0.1,${THIS_IP},${PEER_IP},${VIP}" \
       ./issue-clickhouse-cert.sh >/tmp/chcert.log 2>&1 ) \
@@ -446,7 +557,7 @@ if [[ "$ROLE" == "master" ]]; then
 fi
 
 # ── 5. keepalived ────────────────────────────────────────────────────────────
-step "Step 6 of 7 — keepalived (the automatic part)"
+step "Step 6 of 8 — keepalived (the automatic part)"
 
 if ! command -v keepalived >/dev/null 2>&1; then
   say "  installing keepalived…"
@@ -503,17 +614,41 @@ VRRP_PASS_FILE="$STATE_DIR/2vm-vrrp-pass"
 install -d -m 0700 "$STATE_DIR"
 if [[ -f "$VRRP_PASS_FILE" ]]; then
   VRRP_PASS="$(cat "$VRRP_PASS_FILE")"
+  ok "VRRP authentication password loaded from $VRRP_PASS_FILE"
+elif [[ "$ROLE" == "slave" ]]; then
+  # Generating one here IS the split-brain bug. keepalived discards every advert
+  # authenticated with a different password ("receive an invalid passwd!"), so each
+  # node sees no master, both transition BACKUP->MASTER, and BOTH add the VIP. Two
+  # hosts then answer for the traffic address on one L2 segment and ARP decides who
+  # gets each client — while the installer exits 0, prints "Both nodes are
+  # installed", and --check on each node reports it holds the VIP.
+  #
+  # A missing .env twenty lines up is already a hard die with copy instructions.
+  # This file is no less load-bearing and used to get only a warning — one that was
+  # printed whether or not the copy had been done, so it carried no signal at all.
+  die "$VRRP_PASS_FILE is missing.
+
+  Copy it from the master FIRST — the slave must not invent its own:
+
+      scp root@${PEER_IP}:$VRRP_PASS_FILE $VRRP_PASS_FILE
+
+  Both nodes must authenticate VRRP with the SAME password. If they differ, each
+  node ignores the other's adverts, both become MASTER, and two hosts answer on
+  $VIP with traffic split unpredictably between them."
 else
   # VRRP PASS auth is 8 characters maximum; longer values are silently truncated,
   # which would make the two nodes disagree and both become master.
   VRRP_PASS="$(openssl rand -hex 8 | cut -c1-8)"
   printf '%s' "$VRRP_PASS" > "$VRRP_PASS_FILE"; chmod 600 "$VRRP_PASS_FILE"
+  ok "VRRP authentication password generated — it must be copied to the slave"
 fi
-if [[ "$ROLE" == "slave" ]]; then
-  warn "VRRP auth password for this node: ${B}${VRRP_PASS}${R}"
-  say  "  ${DIM}It must MATCH the master's (/etc/sentinel/2vm-vrrp-pass there). If it does${R}"
-  say  "  ${DIM}not, copy the master's value into $VRRP_PASS_FILE and re-run.${R}"
-fi
+# Print a fingerprint on BOTH roles so the two can be compared without moving the
+# secret around or trusting that the copy worked. Mismatched passwords are the
+# split-brain case and nothing else in this install detects them.
+VRRP_FP="$(printf '%s' "$VRRP_PASS" | sha256sum | cut -c1-12)"
+say "  ${DIM}VRRP password fingerprint: ${VRRP_FP}${R}"
+say "  ${DIM}It must be IDENTICAL on both nodes. Compare with, on the peer:${R}"
+say "  ${DIM}  sha256sum < $VRRP_PASS_FILE | cut -c1-12${R}"
 
 [[ -f /etc/keepalived/keepalived.conf ]] && \
   cp -a /etc/keepalived/keepalived.conf "/etc/keepalived/keepalived.conf.bak.$(date +%s)"
@@ -538,8 +673,36 @@ printf '%s\n' "$VIP"  > "$STATE_DIR/2vm-vip"
 # The health check sends this as the Host header when it probes a real request. An
 # unmatched Host returns 502 whatever the node's actual health, so the probe must
 # use a name the site claims — and the VIP always is one in this topology.
-printf '%s\n' "$VIP"  > "$STATE_DIR/2vm-probe-host"
-chmod 644 "$ROLE_FILE" "$STATE_DIR/2vm-vip" "$STATE_DIR/2vm-probe-host"
+# The health check probes a real request with this as the Host header, and treats
+# 502 as "cannot serve". Site matching is exact-or-wildcard against the site's
+# declared domains, with no default-site fallback — so if this name is not one a
+# site claims, the data plane answers 502 no matter how healthy it is, BOTH nodes
+# go FAULT, and the VIP is never claimed by anyone. The product then serves nothing
+# on its advertised address while every component is fine.
+#
+# The VIP is only a sensible default when a site actually lists the VIP as a
+# domain. An operator who serves app.example.com and points DNS at the VIP needs
+# --probe-host app.example.com.
+#
+# Do NOT clobber an existing value on re-run: this line was unconditional, so an
+# operator who diagnosed the 502 and corrected the file by hand had the fix
+# silently overwritten the next time the installer ran.
+PROBE_HOST_FILE="$STATE_DIR/2vm-probe-host"
+if [[ -n "$PROBE_HOST" ]]; then
+  printf '%s\n' "$PROBE_HOST" > "$PROBE_HOST_FILE"
+  ok "health-check probe host: $PROBE_HOST"
+elif [[ -f "$PROBE_HOST_FILE" ]]; then
+  ok "health-check probe host: $(cat "$PROBE_HOST_FILE") (existing, left alone)"
+else
+  printf '%s\n' "$VIP" > "$PROBE_HOST_FILE"
+  warn "health-check probe host defaulted to the VIP ($VIP)"
+  say  "  ${DIM}This only works if one of your sites lists $VIP as a domain. If your${R}"
+  say  "  ${DIM}site is named e.g. app.example.com, re-run with:${R}"
+  say  "  ${DIM}  --probe-host app.example.com${R}"
+  say  "  ${DIM}otherwise the probe gets a 502, BOTH nodes are judged unhealthy, and${R}"
+  say  "  ${DIM}the VIP never comes up.${R}"
+fi
+chmod 644 "$ROLE_FILE" "$STATE_DIR/2vm-vip" "$PROBE_HOST_FILE"
 
 # ── 5b. restrict the published ClickHouse port to the peer ───────────────────
 #
@@ -559,7 +722,7 @@ chmod 644 "$ROLE_FILE" "$STATE_DIR/2vm-vip" "$STATE_DIR/2vm-probe-host"
 # drop the rest. Nothing in raw/PREROUTING and no NOTRACK — a previous attempt at
 # network hardening here broke Docker's DNAT that way.
 if [[ "$ROLE" == "master" ]]; then
-  step "Step 6b of 7 — firewalling the published ClickHouse port"
+  step "Step 6b of 8 — firewalling the published ClickHouse port"
   if command -v iptables >/dev/null 2>&1; then
     # MATCH ON THE ORIGINAL DESTINATION PORT, NOT --dport.
     #
@@ -593,12 +756,22 @@ if [[ "$ROLE" == "master" ]]; then
         || warn "could not install the ClickHouse firewall rules — restrict :8443 yourself"
       # Prove the data path still works rather than assuming it: this rule pair is
       # one typo away from a silent HTTPS outage.
-      if ! curl -sk -m5 -o /dev/null "https://${THIS_IP}/" 2>/dev/null; then
-        warn "HTTPS to this node FAILED right after adding the firewall rules"
-        say  "  ${DIM}That is the --dport-vs-ctorigdstport trap. Inspect:${R}"
-        say  "  ${DIM}  iptables -L DOCKER-USER -n --line-numbers${R}"
+      #
+      # But this step runs BEFORE the stack is started, so on a first install
+      # nothing is listening on :443 yet and the probe failed every time — printing
+      # a scary warning about an iptables trap that was not happening. Only probe
+      # when there is something to probe; otherwise defer it until after `up`.
+      if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE '[:.]443$'; then
+        if ! curl -sk -m5 -o /dev/null "https://${THIS_IP}/" 2>/dev/null; then
+          warn "HTTPS to this node FAILED right after adding the firewall rules"
+          say  "  ${DIM}That is the --dport-vs-ctorigdstport trap. Inspect:${R}"
+          say  "  ${DIM}  iptables -L DOCKER-USER -n --line-numbers${R}"
+        else
+          ok "client HTTPS to this node still works (data path not caught by the rule)"
+        fi
       else
-        ok "client HTTPS to this node still works (data path not caught by the rule)"
+        CH_FW_VERIFY=yes
+        say "  ${DIM}nothing listening on :443 yet — data-path check deferred until the stack is up${R}"
       fi
     fi
     # Belt and braces: an older install of this stack published PLAINTEXT 8123 to
@@ -621,17 +794,85 @@ if [[ "$ROLE" == "master" ]]; then
 fi
 
 # ── 6. bring the stack up ────────────────────────────────────────────────────
-step "Step 7 of 7 — starting the stack"
+# ── 6c. container images ─────────────────────────────────────────────────────
+#
+# compose.prod.yml asks for ${SENTINEL_IMAGE_PREFIX:-sentinel}/<svc>:${SENTINEL_VERSION:-latest}
+# AND carries a build: stanza for the same services. Those two facts combine
+# badly: when the requested tag is absent, `docker compose up` does not fail — it
+# quietly falls back to BUILDING from context ../.., which exists in a repo
+# checkout and does not exist in a customer bundle. There it dies partway through
+# `up`, with containers already created.
+#
+# .env.example sets neither variable, so a bundle install resolved :latest while
+# the bundle ships :1.0.0. The images were sitting on disk under a tag nobody
+# asked for. Pin the tag, load the bundle's images if they are not loaded yet, and
+# refuse to reach `up` without them rather than letting compose improvise a build.
+step "Step 7 of 8 — container images"
+
+IMG_PREFIX="$(sed -n 's/^SENTINEL_IMAGE_PREFIX=//p' "$ENV_FILE" 2>/dev/null | head -1)"
+IMG_PREFIX="${IMG_PREFIX:-sentinel}"
+IMG_VERSION="$(sed -n 's/^SENTINEL_VERSION=//p' "$ENV_FILE" 2>/dev/null | head -1)"
+if [[ -z "$IMG_VERSION" ]]; then
+  if [[ -n "$BUNDLE_ROOT" && -f "$BUNDLE_ROOT/bundle/manifest.json" ]]; then
+    IMG_VERSION="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+                     "$BUNDLE_ROOT/bundle/manifest.json" | head -1)"
+  elif [[ -f "$SCRIPT_DIR/../../VERSION" ]]; then
+    IMG_VERSION="$(tr -d '[:space:]' < "$SCRIPT_DIR/../../VERSION")"
+  fi
+fi
+IMG_VERSION="${IMG_VERSION:-latest}"
+
+# Pin both into .env so compose, the slave's copied .env, and any later re-run all
+# agree on one tag. Without this the answer depends on who last exported what.
+env_set SENTINEL_IMAGE_PREFIX "$IMG_PREFIX"
+env_set SENTINEL_VERSION      "$IMG_VERSION"
+ok "images pinned to ${IMG_PREFIX}/<service>:${IMG_VERSION}"
+
+img_missing() {
+  local out=() svc
+  for svc in dataplane controlplane dashboard migrate; do
+    docker image inspect "${IMG_PREFIX}/${svc}:${IMG_VERSION}" >/dev/null 2>&1 || out+=("$svc")
+  done
+  printf '%s\n' "${out[@]:-}"
+}
+MISSING="$(img_missing | tr -d '\n' | tr -s ' ')"
+if [[ -n "${MISSING// /}" && -n "$BUNDLE_IMAGES" ]]; then
+  say "  loading images from the bundle — pre-built, about a minute…"
+  docker load -i "$BUNDLE_IMAGES" >>/tmp/2vm-load.log 2>&1 \
+    || die "docker load failed for $BUNDLE_IMAGES — see /tmp/2vm-load.log"
+  MISSING="$(img_missing | tr -d '\n' | tr -s ' ')"
+fi
+if [[ -n "${MISSING// /}" ]]; then
+  die "missing container images at tag '${IMG_VERSION}': ${MISSING}
+
+  The stack cannot start without them, and compose would otherwise try to BUILD
+  them from source that is not present here.
+
+  From a customer bundle:  the images ship in bundle/images.tar.gz — run this
+                           script from inside the extracted bundle so it can find
+                           and load them.
+  From a repo checkout:    build them first —
+                             cd $COMPOSE_DIR
+                             SENTINEL_VERSION=$IMG_VERSION docker compose \\
+                               -f compose.prod.yml build dataplane controlplane dashboard migrate
+  Already loaded elsewhere: docker images | grep ${IMG_PREFIX}/
+                           then re-run with the tag you actually have:
+                             SENTINEL_VERSION=<tag> $0 --role $ROLE ..."
+fi
+ok "all four images present at ${IMG_VERSION}"
+
+# ── 6d. bring the stack up ───────────────────────────────────────────────────
+step "Step 8 of 8 — starting the stack"
 OVERLAY="compose.2vm-active.yml"; [[ "$ROLE" == "slave" ]] && OVERLAY="compose.2vm-passive.yml"
-[[ -f "$DOCKER_DIR/$OVERLAY" ]] || die "$DOCKER_DIR/$OVERLAY missing"
+[[ -f "$COMPOSE_DIR/$OVERLAY" ]] || die "$COMPOSE_DIR/$OVERLAY missing"
 
 C=(docker compose -p sentinel -f compose.prod.yml -f "$OVERLAY")
-say "  ${DIM}cd $DOCKER_DIR && ${C[*]} up -d${R}"
-( cd "$DOCKER_DIR" && "${C[@]}" config >/dev/null ) \
+say "  ${DIM}cd $COMPOSE_DIR && ${C[*]} up -d${R}"
+( cd "$COMPOSE_DIR" && "${C[@]}" config >/dev/null ) \
   || die "compose config is invalid — fix .env before starting (nothing was started)"
 ok "compose config resolves"
 
-( cd "$DOCKER_DIR" && "${C[@]}" up -d ) || die "compose up failed"
+( cd "$COMPOSE_DIR" && "${C[@]}" up -d ) || die "compose up failed"
 ok "containers started"
 
 say "  waiting for the data plane to report healthy…"
@@ -650,19 +891,52 @@ else
   # not a fault, but "not healthy" alone reads like a failure and sends the
   # operator hunting for a bug that is not there.
   _hz="$(curl -fsS --max-time 3 http://127.0.0.1:80/healthz 2>/dev/null || true)"
+  _probe="$(cat "$PROBE_HOST_FILE" 2>/dev/null || echo "$VIP")"
   if [[ "$_hz" == *'"sites":0'* ]]; then
     warn "no sites configured yet, so the data plane is intentionally not eligible for the VIP"
     say  "  ${DIM}This is expected on a first install — a WAF with no sites would 502${R}"
     say  "  ${DIM}every request, so keepalived correctly refuses to send traffic here.${R}"
-    say  "  ${DIM}Add your first site, and the VIP comes up within a few seconds:${R}"
-    say  "  ${DIM}  dashboard  https://${THIS_IP}:9443  (admin@sentinel.local)${R}"
-    say  "  ${DIM}  password   docker logs sentinel-controlplane-1 2>&1 | grep -A2 'GENERATED password'${R}"
+    say  "  ${DIM}Add your first site, and the VIP comes up within a few seconds.${R}"
+    say  "  ${DIM}Console is loopback-only: ssh -L 9443:127.0.0.1:9443 root@${THIS_IP}${R}"
+    say  "  ${DIM}then https://127.0.0.1:9443  (admin@sentinel.local)${R}"
+    say  "  ${DIM}password: docker logs sentinel-controlplane-1 2>&1 | grep -A1 'GENERATED password'${R}"
   elif [[ -z "$_hz" ]]; then
     warn "data plane is not answering on :80 — this one IS a fault"
     say  "  ${DIM}check: docker compose -p sentinel logs --tail=50 dataplane${R}"
+    INSTALL_FAULT=yes
   else
-    warn "data plane answered but is not reporting healthy"
-    say  "  ${DIM}$_hz${R}"
+    # Sites exist but the probe still fails. The overwhelmingly likely cause is that
+    # the probe Host matches no site, which is indistinguishable from a dead origin
+    # at the HTTP layer — both are 502 — so say so explicitly rather than leaving
+    # the operator to guess. Getting this wrong means NEITHER node takes the VIP.
+    _code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
+               -H "Host: $_probe" http://127.0.0.1:80/ 2>/dev/null || echo 000)"
+    warn "data plane is up with sites configured, but the health probe fails (HTTP $_code)"
+    say  "  ${DIM}The probe sends 'Host: $_probe'. If no site claims that name, the${R}"
+    say  "  ${DIM}data plane answers 502 however healthy it is — and then NEITHER node${R}"
+    say  "  ${DIM}will ever take the VIP.${R}"
+    say  "  ${DIM}Fix by pointing the probe at a hostname one of your sites declares:${R}"
+    say  "  ${DIM}  $0 --role $ROLE --this $THIS_IP --peer $PEER_IP --vip $VIP \\${R}"
+    say  "  ${DIM}      --probe-host <a domain your site claims>${R}"
+    say  "  ${DIM}Otherwise check the origin: docker compose -p sentinel logs --tail=50 dataplane${R}"
+    INSTALL_FAULT=yes
+  fi
+fi
+
+# The deferred half of the ClickHouse firewall check (see Step 6b). Now that the
+# data plane is listening, prove the DOCKER-USER rules did not swallow client
+# HTTPS — the failure mode that took https through the VIP down on .88 while every
+# other check still looked healthy.
+if [[ "$CH_FW_VERIFY" == "yes" ]]; then
+  step "verifying the ClickHouse firewall did not catch the data path"
+  if curl -sk -m5 -o /dev/null "https://${THIS_IP}/" 2>/dev/null; then
+    ok "client HTTPS to this node works — the rules match only ClickHouse"
+  else
+    warn "HTTPS to this node FAILS with the firewall rules in place"
+    say  "  ${DIM}This is the --dport-vs-ctorigdstport trap: a rule intended for${R}"
+    say  "  ${DIM}ClickHouse:8443 is swallowing client traffic to the WAF on :443.${R}"
+    say  "  ${DIM}  iptables -L DOCKER-USER -n --line-numbers${R}"
+    INSTALL_FAULT=yes
   fi
 fi
 
@@ -692,7 +966,7 @@ cat <<SUMMARY
     Postgres stays a read-only standby on the slave. Traffic keeps being served
     and protected; CONFIG CHANGES are refused until you decide to promote:
 
-        $DOCKER_DIR/promote-standby.sh
+        $HELPER_DIR/promote-standby.sh
 
     That is deliberate. Two nodes cannot tell "peer is dead" from "peer is
     unreachable", and guessing wrong gives you two primaries with divergent data.
@@ -733,7 +1007,15 @@ cat <<NEXT
     docker exec sentinel-postgres-1 psql -U sentinel -d sentinel \
       -c "SELECT pg_is_in_recovery();"   # here: expect 't'
 
-  Then run the failover drill in ./README.md. An untested failover is an
+  Then run the failover drill in ../ACTIVE-PASSIVE.md. An untested failover is an
   assumption, not a capability.
 NEXT
+fi
+
+# Exit code must reflect what the checks actually found. Printing "Done" and
+# exiting 0 after reporting a fault is how a broken node gets signed off.
+if [[ "$INSTALL_FAULT" == "yes" ]]; then
+  printf '\n  %s✗ Completed with a FAILING data-plane check — see the warning above.%s\n' "$RED" "$R" >&2
+  printf '  %sThe stack is installed; this node is NOT currently eligible for the VIP.%s\n\n' "$DIM" "$R" >&2
+  exit 1
 fi

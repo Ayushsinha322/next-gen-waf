@@ -58,10 +58,13 @@ step "Data plane"
 HZ=$(curl -fsS --max-time 5 http://127.0.0.1:80/healthz 2>/dev/null)
 if [[ -n "$HZ" ]]; then
   pass "/healthz answering"
-  SITES=$(printf '%s' "$HZ" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("sites",0))' 2>/dev/null || echo 0)
+  # sed, not python3 — this script is shipped to hosts that may not have python3,
+  # where `|| echo 0` silently reported "no sites" on a correctly configured WAF
+  # and skipped the enforcement test below entirely.
+  SITES=$(printf '%s' "$HZ" | sed -n 's/.*"sites"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)
   if [[ "${SITES:-0}" -gt 0 ]]; then pass "$SITES protected site(s) loaded"
   else soft "no sites configured yet — the WAF returns 502 to everything until one exists (expected on a fresh install)"; fi
-  SHED=$(printf '%s' "$HZ" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("history_shed",0))' 2>/dev/null || echo 0)
+  SHED=$(printf '%s' "$HZ" | sed -n 's/.*"history_shed"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)
   if [[ "${SHED:-0}" -eq 0 ]]; then pass "no shed events (every block was recorded)"
   else soft "$SHED events enforced but NOT recorded — event history undercounts blocks for that window"; fi
 else
@@ -75,16 +78,38 @@ for p in 80 443 9443; do
 done
 
 step "Enforcement"
+# ENFORCE_VERIFIED gates what the closing summary is allowed to claim. Previously
+# EVERY outcome here was a pass or a soft warning — including a WAF that answered
+# 200 to SQL injection, which was reported as "LEARNING mode … Correct during a
+# pilot" without anything having checked the site's mode. A WAF failing open and a
+# WAF deliberately in learning mode are indistinguishable to this test, and the
+# script asserted the reassuring one. It then printed "All checks passed".
+ENFORCE_VERIFIED=no
 if [[ "${SITES:-0}" -gt 0 ]]; then
-  HOSTHDR=$(grep -oP '^SENTINEL_WAF_HOSTNAME=\K.*' "$ENV_FILE" 2>/dev/null || echo localhost)
+  # SENTINEL_WAF_HOSTNAME is the console's name, which need not be a name any
+  # protected SITE declares — and site matching is exact against the site's own
+  # domains. Allow the operator to name the right one.
+  HOSTHDR="${SENTINEL_VERIFY_HOST:-}"
+  [[ -n "$HOSTHDR" ]] || HOSTHDR=$(sed -n 's/^SENTINEL_WAF_HOSTNAME=//p' "$ENV_FILE" 2>/dev/null | head -1)
+  HOSTHDR="${HOSTHDR:-localhost}"
   b=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 -H "Host: $HOSTHDR" "http://127.0.0.1/" 2>/dev/null)
   a=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 -H "Host: $HOSTHDR" "http://127.0.0.1/?id=1%27+OR+1%3D1--" 2>/dev/null)
-  [[ "$b" == "200" ]] && pass "legitimate request -> $b" || soft "legitimate request -> $b (check the upstream is reachable)"
-  case "$a" in
-    403) pass "SQL injection -> 403 (blocking mode)" ;;
-    200) soft "SQL injection -> 200 — the site is in LEARNING mode: recorded, not blocked. Correct during a pilot." ;;
-    *)   soft "SQL injection -> $a" ;;
-  esac
+
+  if [[ "$b" == "502" ]]; then
+    # The probe Host matched no site, so neither request reached the engine and
+    # NOTHING about enforcement was measured. Saying so is the whole point.
+    soft "enforcement NOT measured — 'Host: $HOSTHDR' matches no configured site (502)"
+    printf '        %sre-run with a hostname one of your sites declares:%s\n' "$DIM" "$R"
+    printf '        %s  SENTINEL_VERIFY_HOST=app.example.com sudo ./verify.sh%s\n' "$DIM" "$R"
+  else
+    [[ "$b" == "200" ]] && pass "legitimate request -> $b" \
+      || soft "legitimate request -> $b (check the upstream is reachable)"
+    case "$a" in
+      403) pass "SQL injection -> 403 — blocking is ENFORCED"; ENFORCE_VERIFIED=yes ;;
+      200) soft "SQL injection -> 200 — NOT blocked. Expected in learning mode; a fault in blocking mode. This script cannot tell which, so enforcement is unverified." ;;
+      *)   soft "SQL injection -> $a — inconclusive, enforcement unverified" ;;
+    esac
+  fi
 else
   soft "enforcement not tested — no site configured"
 fi
@@ -110,4 +135,11 @@ if [[ $FAIL -gt 0 ]]; then
   printf '    cat /var/log/sentinel/install.log\n\n'
   exit 1
 fi
-printf '  %sAll checks passed.%s'"$([[ $WARN -gt 0 ]] && echo ' Review the warnings above.')"'\n\n' "$GRN" "$R"
+printf '  %sAll checks passed.%s'"$([[ $WARN -gt 0 ]] && echo ' Review the warnings above.')"'\n' "$GRN" "$R"
+# Do not let a green run imply more than was measured. Without a 403 to a real
+# injection, everything above proves the stack is RUNNING — not that it BLOCKS.
+if [[ "${ENFORCE_VERIFIED:-no}" != "yes" ]]; then
+  printf '  %sNote: enforcement was NOT verified — this run proved the stack is running,%s\n' "$YEL" "$R"
+  printf '  %snot that it blocks anything. Configure a site and re-run to measure that.%s\n' "$YEL" "$R"
+fi
+printf '\n'

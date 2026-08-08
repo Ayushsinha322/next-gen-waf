@@ -1,5 +1,17 @@
 # Next-Gen ESDS WAF — 2-VM active/passive deployment
 
+> **The canonical install procedure is [`../ACTIVE-PASSIVE.md`](../ACTIVE-PASSIVE.md).**
+> This document remains as background on the design. An audit found four places
+> where it no longer matches the installer — corrected there, and listed here so
+> nobody follows the stale version:
+>
+> | This document says | Actually |
+> |---|---|
+> | Copy **two** files to the slave | **Three**. `install-2vm.sh` refuses to install a slave without `/opt/sentinel-pki/` as well — two independently generated CAs cannot verify each other |
+> | (no image step) | The installer now hard-aborts at Step 7 of 8 if the container images are absent. From a bundle it loads them; from a repo checkout you must build them first |
+> | `:9443` is reachable via the VIP | The management console is published **loopback-only**. Reach it with `ssh -L 9443:127.0.0.1:9443` |
+> | (nothing about the probe host) | The VRRP health check probes a real request with `Host: <VIP>`. If no site claims that name the data plane answers 502, **both** nodes are judged unhealthy, and the VIP never comes up. Use `--probe-host <a domain your site declares>` |
+
 One virtual IP, two VMs, automatic traffic failover and failback.
 
 Clients talk to a single address. Whichever VM can actually serve traffic holds

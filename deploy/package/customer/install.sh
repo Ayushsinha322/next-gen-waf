@@ -30,10 +30,12 @@ PKI_DIR=/opt/sentinel-pki
 
 NONINTERACTIVE=no
 DRY_RUN=no
+FORCE=no
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --non-interactive) NONINTERACTIVE=yes ;;
     --dry-run) DRY_RUN=yes ;;
+    --force) FORCE=yes ;;
     -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -57,16 +59,39 @@ step() { printf '\n%s%s==> %s%s\n' "$B" "$CYN" "$*" "$R"; log "STEP $*"; }
 ok()   { printf '  %s✓%s %s\n' "$GRN" "$R" "$*"; log "OK $*"; }
 warn() { printf '  %s!%s %s\n' "$YEL" "$R" "$*"; log "WARN $*"; }
 fail() { printf '  %s✗%s %s\n' "$RED" "$R" "$*"; log "FAIL $*"; }
+# Every gate runs before the first change, so "Nothing was installed" is true for
+# most aborts — but it was printed UNCONDITIONALLY, including after images were
+# loaded, /opt was written and containers were started. An operator told nothing had
+# happened has no reason to clean up, and the next run then trips the
+# already-installed guard for reasons they were explicitly told did not exist.
+# CHANGED flips at the first mutation; the message follows the truth.
+CHANGED=no
+cleanup_hint() {
+  if [[ "$CHANGED" == "yes" ]]; then
+    printf '  %sThis host HAS been modified — images loaded, %s written, containers possibly started.%s\n' \
+      "$YEL" "$STATE_DIR" "$R" >&2
+    printf '  %sInspect:  docker compose -p sentinel ps%s\n' "$DIM" "$R" >&2
+    printf '  %sClean up: sudo ./uninstall.sh%s\n' "$DIM" "$R" >&2
+  else
+    printf '  %sNothing was installed.%s\n' "$DIM" "$R" >&2
+  fi
+  [[ "$LOG_OK" == "yes" ]] && printf '  %sFull log: %s%s\n' "$DIM" "$LOG" "$R" >&2
+  printf '\n' >&2
+}
 die()  {
   printf '\n  %s✗ INSTALLATION ABORTED%s\n    %s\n\n' "$RED" "$R" "$*" >&2
   log "ABORT $*"
-  if [[ "$LOG_OK" == "yes" ]]; then
-    printf '  %sNothing was installed. Full log: %s%s\n\n' "$DIM" "$LOG" "$R" >&2
-  else
-    printf '  %sNothing was installed.%s\n\n' "$DIM" "$R" >&2
-  fi
+  cleanup_hint
   exit 1
 }
+# Ctrl-C left no message at all, and no indication of what had already happened.
+on_signal() {
+  printf '\n\n  %s✗ INTERRUPTED%s\n\n' "$RED" "$R" >&2
+  log "ABORT interrupted by signal"
+  cleanup_hint
+  exit 130
+}
+trap on_signal INT TERM
 
 # Minimum requirements. Below these the product does not work reliably —
 # ClickHouse alone is memory-limited to 6 GB and crash-loops under ~2 GB.
@@ -91,13 +116,56 @@ say "install started $(date -u +%Y-%m-%dT%H:%M:%SZ) (log: $LOG)"
 step "Step 1 of 10 — package"
 [[ $EUID -eq 0 ]] || die "run with sudo — the installer writes /opt, /etc and manages Docker"
 
-VERSION="unknown"
-if [[ -f "$HERE/bundle/manifest.json" ]]; then
-  VERSION=$(python3 -c "import json;print(json.load(open('$HERE/bundle/manifest.json'))['version'])" 2>/dev/null || echo unknown)
-  ok "package: Next-Gen ESDSWAF v$VERSION"
-else
-  die "bundle/manifest.json missing — this does not look like a complete ESDSWAF package"
+# An existing installation makes every later gate misleading. Our own containers
+# hold 80/443/9443, so the port check reported "something else is listening" and
+# advised stopping nginx — on a host where the only listener was this product.
+# Detect it here, where we can say something true, and route the operator to the
+# tool that actually does what they want.
+if [[ -f "$STATE_DIR/version" || -f "$INSTALL_DIR/.env" ]]; then
+  EXISTING="$(cat "$STATE_DIR/version" 2>/dev/null || echo 'unknown version')"
+  if [[ "$FORCE" == "yes" ]]; then
+    warn "existing installation detected ($EXISTING) — continuing because --force was given"
+    warn "existing secrets in $INSTALL_DIR/.env will be KEPT, not regenerated"
+  elif [[ "$DRY_RUN" == "yes" ]]; then
+    warn "an installation is already present ($EXISTING) — a real run would stop here"
+  else
+    die "Next-Gen ESDSWAF $EXISTING is already installed on this host.
+
+    This installer will not modify an existing deployment: regenerating secrets
+    against a database that already exists would lock you out of your own data.
+
+      upgrade to this version    sudo ./upgrade.sh
+      remove it completely       sudo ./uninstall.sh    then re-run this installer
+      see what is running        docker compose -p sentinel ps
+
+    If the previous attempt failed partway and you want to continue over it:
+      sudo ./install.sh --force        (keeps the existing .env and certificates)"
+  fi
 fi
+
+# manifest.json is read with sed, not python3, ON PURPOSE. Ubuntu cloud and
+# minimal images ship without python3, and the previous version shelled out to it
+# with `|| echo unknown` — so on such a host VERSION silently became the literal
+# string "unknown", the install continued, and it died five steps later looking for
+# an image tagged `sentinel/dataplane:unknown`. The operator got a missing-image
+# error that said nothing about the real cause. The manifest is written by
+# build-bundle.sh one key per line, so a line-oriented parse is exact here.
+manifest_str() { # manifest_str KEY — value of a top-level string key
+  sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" \
+    "$HERE/bundle/manifest.json" 2>/dev/null | head -1
+}
+manifest_bool() { # manifest_bool KEY — true/false of a top-level boolean key
+  sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p" \
+    "$HERE/bundle/manifest.json" 2>/dev/null | head -1
+}
+
+[[ -f "$HERE/bundle/manifest.json" ]] \
+  || die "bundle/manifest.json missing — this does not look like a complete ESDSWAF package"
+VERSION="$(manifest_str version)"
+[[ -n "$VERSION" ]] \
+  || die "could not read the version from bundle/manifest.json — the package is malformed.
+    Re-download it; do not attempt to install this copy."
+ok "package: Next-Gen ESDSWAF v$VERSION"
 
 [[ -f "$HERE/SHA256SUMS" ]] || die "SHA256SUMS missing — cannot verify package integrity"
 say "  verifying every shipped file against SHA256SUMS…"
@@ -195,20 +263,27 @@ fi
 # This bundle ships only the four ESDSWAF images; Postgres, Redis, ClickHouse,
 # Prometheus and Grafana are pulled from Docker Hub. Check that NOW rather than
 # failing halfway through `up -d`.
-NEEDS_NET=$(python3 -c "import json;print(json.load(open('$HERE/bundle/manifest.json')).get('requires_internet',True))" 2>/dev/null || echo True)
-if [[ "$NEEDS_NET" == "True" ]]; then
+manifest_list() { # manifest_list KEY — the quoted strings of a top-level array
+  awk -v k="\"$1\"" '
+    index($0, k) { inlist = 1; next }
+    inlist && /\]/ { exit }
+    inlist && match($0, /"[^"]+"/) { print "      - " substr($0, RSTART + 1, RLENGTH - 2) }
+  ' "$HERE/bundle/manifest.json" 2>/dev/null
+}
+# Default to "needs the internet" when the key is unreadable: assuming an offline
+# bundle we do not have turns a clear preflight abort into a failure partway
+# through `up`, which is much harder to diagnose.
+NEEDS_NET="$(manifest_bool requires_internet)"
+if [[ "$NEEDS_NET" != "false" ]]; then
+  PULL_COUNT="$(manifest_list pulled_from_registry | wc -l)"
   if timeout 12 docker pull hello-world >/dev/null 2>&1; then
-    ok "Docker registry reachable (5 third-party images will be pulled)"
+    ok "Docker registry reachable (${PULL_COUNT:-5} third-party images will be pulled)"
     docker rmi hello-world >/dev/null 2>&1 || true
   else
     die "cannot reach the Docker registry, and this package needs it.
 
     This bundle contains the four ESDSWAF images only. These are pulled:
-$(python3 -c "
-import json
-for i in json.load(open('$HERE/bundle/manifest.json')).get('pulled_from_registry',[]):
-    print('      - '+i)
-" 2>/dev/null)
+$(manifest_list pulled_from_registry)
 
     Either allow egress to registry-1.docker.io, configure a registry mirror
     in /etc/docker/daemon.json, or ask ESDS for the fully offline bundle
@@ -229,20 +304,39 @@ ask() { # ask VAR PROMPT DEFAULT
   printf -v "$__v" '%s' "$__a"
 }
 
+# `route get 1.1.1.1` returns nothing on a host with no default route — common on
+# exactly the isolated management networks this product is installed into. The
+# default then became empty, and in --non-interactive mode `ask` accepts the empty
+# default silently: the install proceeded with no hostname and an admin address of
+# literally "admin@". Fall back to the first configured address, and refuse to
+# continue with nothing.
 DEF_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')
+[[ -n "$DEF_IP" ]] || DEF_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 ask WAF_HOSTNAME "Hostname clients will use (e.g. waf.company.com)" "${DEF_IP:-}"
+[[ -n "$WAF_HOSTNAME" ]] || die "no hostname given, and this host has no address to fall back to.
+    Re-run with an explicit value:
+      sudo WAF_HOSTNAME=waf.company.com ./install.sh --non-interactive"
 ask ADMIN_EMAIL  "Administrator email" "admin@${WAF_HOSTNAME}"
 
+# This used to be a question — "1) I will supply my own certificate / 2) Self-signed"
+# — whose answer was read into TLS_CHOICE, defaulted, and then never referenced
+# again anywhere in the script. Both answers produced identical behaviour. Asking
+# an operator to make a decision the installer discards is worse than not asking:
+# someone who chose 1 reasonably believed the installer was waiting for their
+# certificate. State what actually happens instead.
 if [[ "$NONINTERACTIVE" != "yes" ]]; then
   say ""
-  say "  TLS certificate for $WAF_HOSTNAME:"
-  say "    1) I will supply my own certificate  ${DIM}(recommended)${R}"
-  say "    2) Self-signed, for evaluation only"
-  say "    ${DIM}Let's Encrypt is configured after install — it needs inbound port 80${R}"
-  say "    ${DIM}from the internet, which many on-premise networks do not permit.${R}"
-  read -r -p "  Choice [1]: " TLS_CHOICE || true
+  say "  ${B}TLS${R}"
+  say "    This installer issues a certificate from an internal CA it generates"
+  say "    here, valid for ${DEF_IP:-this host}${WAF_HOSTNAME:+ and $WAF_HOSTNAME}."
+  say "    ${DIM}Clients that import /opt/sentinel-pki/root.crt get a green lock;${R}"
+  say "    ${DIM}others see the usual untrusted-issuer warning.${R}"
+  say ""
+  say "    ${DIM}To use a publicly-trusted certificate instead, upload it in the${R}"
+  say "    ${DIM}console after install (Certificates → Upload). Let's Encrypt needs${R}"
+  say "    ${DIM}inbound port 80 from the internet, which many on-premise networks${R}"
+  say "    ${DIM}do not permit — check before promising it to a customer.${R}"
 fi
-TLS_CHOICE="${TLS_CHOICE:-1}"
 
 if [[ "$NONINTERACTIVE" != "yes" ]]; then
   say ""
@@ -260,7 +354,11 @@ if [[ "$TOPOLOGY" == "2" ]]; then
   say ""
   say "    sudo ./scripts/2vm/install-2vm.sh --role master --this <ip> --peer <ip> --vip <ip>"
   say ""
-  say "  See section 5 of docs/ for the full sequence. Nothing has been changed."
+  say "  Run it on the MASTER first and let it finish: it prints the three artifacts"
+  say "  that must be copied to the second node before that node can be installed."
+  say ""
+  say "  Full procedure: ${B}docs/ACTIVE-PASSIVE.md${R} in this bundle."
+  say "  Nothing has been changed on this host."
   exit 0
 fi
 
@@ -270,6 +368,8 @@ ok "admin:    $ADMIN_EMAIL"
 # ── Step 6 — load images ─────────────────────────────────────────────────────
 step "Step 6 of 10 — loading images"
 say "  ${DIM}pre-built: no compilation, about a minute${R}"
+# First mutation of the host. Everything above this line is a check.
+CHANGED=yes
 docker load -i "$HERE/bundle/images.tar.gz" >>"$LOG" 2>&1 \
   || die "docker load failed — see $LOG"
 for svc in dataplane controlplane dashboard migrate; do
@@ -280,9 +380,18 @@ ok "four images loaded at version $VERSION"
 
 # ── Step 7 — install tree and secrets ────────────────────────────────────────
 step "Step 7 of 10 — configuration and secrets"
-mkdir -p "$INSTALL_DIR" "$PKI_DIR"
-cp -r "$HERE/compose/." "$INSTALL_DIR/"
-cp -r "$HERE/scripts"   "$INSTALL_DIR/scripts"
+# These four were unguarded. This script runs without `set -e` (errors are handled
+# explicitly), so a failed mkdir or cp did not stop anything: the install carried
+# on and reported success over an install tree that was empty or half-written.
+mkdir -p "$INSTALL_DIR" "$PKI_DIR" "$INSTALL_DIR/scripts" \
+  || die "could not create the install tree under $STATE_DIR — check free space and permissions"
+cp -r "$HERE/compose/." "$INSTALL_DIR/" \
+  || die "could not copy the compose files into $INSTALL_DIR"
+# The trailing "/." copies the CONTENTS. Without it, a second run over an existing
+# tree lands them in $INSTALL_DIR/scripts/scripts, and every path printed later
+# points at a directory that does not contain what it claims to.
+cp -r "$HERE/scripts/." "$INSTALL_DIR/scripts/" \
+  || die "could not copy the operational scripts into $INSTALL_DIR/scripts"
 chmod +x "$INSTALL_DIR"/scripts/*.sh "$INSTALL_DIR"/scripts/2vm/*.sh 2>/dev/null || true
 
 gen() { openssl rand -hex 32; }
@@ -327,10 +436,35 @@ fi
 
 # ── Step 8 — internal TLS (mandatory: Postgres will not start without) ───────
 step "Step 8 of 10 — internal certificates"
-if [[ -f "$PKI_DIR/pg-server.crt" && -s "$PKI_DIR/pg-server.crt" ]]; then
-  ok "certificates already present"
+
+# The two certificates are gated SEPARATELY. A single `if pg-server.crt exists`
+# guard covered both, so any re-run over an existing Postgres certificate skipped
+# issuing the data plane's default certificate entirely — leaving :443 with
+# whatever was there before, or nothing.
+CERT_VOL_DEFAULT=/var/lib/docker/volumes/sentinel_sentinel-certs/_data/default
+
+# Default TLS certificate presented on :443 to clients that send no SNI.
+#
+# This call previously passed NO environment, so issue-ip-cert.sh fell back to its
+# hardcoded default of 172.16.21.71 — an ESDS development VM. Every customer host
+# therefore served HTTPS with a certificate for a machine on another network, and
+# because the failure was `|| warn` the install still reported success. Pass the
+# real address and the hostname the operator just gave us, and treat failure as
+# fatal: a WAF with no usable certificate on :443 is not an installed WAF.
+if [[ -f "$CERT_VOL_DEFAULT/cert.pem" && -s "$CERT_VOL_DEFAULT/cert.pem" ]]; then
+  ok "default TLS certificate already present"
 else
-  ( cd "$INSTALL_DIR/scripts" && ./issue-ip-cert.sh >>"$LOG" 2>&1 ) || warn "issue-ip-cert.sh reported an error (see $LOG)"
+  ( cd "$INSTALL_DIR/scripts" && \
+      WAF_IP="${DEF_IP:-127.0.0.1}" WAF_HOSTNAME="$WAF_HOSTNAME" \
+      ./issue-ip-cert.sh >>"$LOG" 2>&1 ) \
+    || die "could not issue the default TLS certificate — see $LOG.
+    The data plane would have no certificate to present on :443."
+  ok "default TLS certificate issued for ${DEF_IP:-127.0.0.1}${WAF_HOSTNAME:+ / $WAF_HOSTNAME}"
+fi
+
+if [[ -f "$PKI_DIR/pg-server.crt" && -s "$PKI_DIR/pg-server.crt" ]]; then
+  ok "Postgres certificate already present"
+else
   ( cd "$INSTALL_DIR/scripts" && PG_HOSTS="postgres,localhost,$(hostname -s)" PG_IPS="127.0.0.1,${DEF_IP:-127.0.0.1}" \
       ./issue-postgres-cert.sh >>"$LOG" 2>&1 ) \
     || die "could not issue the Postgres certificate — see $LOG.
@@ -362,10 +496,45 @@ health_fail=0
 hc "Postgres"      docker exec sentinel-postgres-1 pg_isready -U sentinel -d sentinel || health_fail=1
 hc "Redis"         docker exec sentinel-redis-1 redis-cli ping                        || health_fail=1
 hc "ClickHouse"    bash -c "docker exec sentinel-clickhouse-1 wget -qO- http://127.0.0.1:8123/ping | grep -q Ok" || health_fail=1
-hc "Control plane" docker exec sentinel-controlplane-1 /controllerd --version          || true
+# These two replace `docker exec ... /controllerd --version || true`, which could
+# not fail for two separate reasons: `--version` only proved the BINARY was in the
+# image (true even for a container crash-looping on a bad DSN), and the `|| true`
+# discarded the verdict anyway. The installer could therefore report a successful
+# install with no working control plane — i.e. no console, which is the whole
+# management interface.
+hc "Control plane" bash -c 'test "$(docker inspect -f "{{.State.Status}}" sentinel-controlplane-1 2>/dev/null)" = running' || health_fail=1
 hc "Data plane"    bash -c "curl -fsS --max-time 3 http://127.0.0.1:80/healthz >/dev/null" || health_fail=1
+# :443 was never probed by any check, which is how a default certificate issued for
+# the wrong network shipped unnoticed. No -f here on purpose: with no sites yet the
+# WAF correctly answers 502, and a 502 still proves the TLS handshake completed and
+# a certificate was served. Only a handshake or connection failure fails this.
+hc "TLS on :443"   bash -c 'curl -sk --max-time 5 -o /dev/null https://127.0.0.1:443/' || health_fail=1
+# End-to-end: the management listener answering proves the data plane's console
+# is up AND proxying to the control plane. It is the first thing the operator will
+# touch, so failing here now beats them discovering it themselves.
+hc "Console :9443" bash -c 'curl -sk --max-time 5 -o /dev/null -w "%{http_code}" https://127.0.0.1:9443/ | grep -qE "^[234]"' || health_fail=1
 
-ADMIN_PW=$(docker logs sentinel-controlplane-1 2>&1 | grep -A2 "GENERATED password" | tail -1 | tr -d ' ' || true)
+# The generated password is the SECOND line of the seed banner emitted by
+# control-plane/internal/db/seed.go:
+#
+#     [sentinel] Seeded initial admin '...' with a GENERATED password:
+#     [sentinel]     <48 hex chars>
+#     [sentinel] Log in and change it immediately. Set SENTINEL_BOOTSTRAP_...
+#
+# `grep -A2 | tail -1` took the THIRD line — the advisory sentence — and printed it
+# to the operator as the password. Because that string is non-empty it also
+# defeated the `${ADMIN_PW:-<hint>}` fallback further down, so they were not even
+# told where to look. Every fresh install ended with a green success banner and an
+# unusable credential.
+#
+# Take the second line, strip only the log prefix (`tr -d ' '` would have glued
+# "[sentinel]" onto the value), and REQUIRE the result to look like what seed.go
+# actually generates — 24 random bytes, hex-encoded. Anything else is treated as a
+# failed scrape so the fallback hint fires instead of printing garbage.
+ADMIN_PW=$(docker logs sentinel-controlplane-1 2>&1 \
+  | grep -A1 'GENERATED password' | tail -1 \
+  | sed -n 's/^\[sentinel\][[:space:]]*//p' | tr -d '[:space:]' || true)
+[[ "$ADMIN_PW" =~ ^[0-9a-f]{48}$ ]] || ADMIN_PW=""
 
 if [[ $health_fail -ne 0 ]]; then
   printf '\n  %s✗ Installation completed with FAILING health checks%s\n' "$RED" "$R"
@@ -382,11 +551,27 @@ cat <<FINAL
   ${GRN}${B}Installation successful${R}
 
     Version        Next-Gen ESDSWAF v$VERSION
-    Dashboard      ${B}https://${WAF_HOSTNAME}:9443${R}
     Username       admin@sentinel.local
-    Password       ${B}${ADMIN_PW:-see: docker logs sentinel-controlplane-1 | grep -A2 GENERATED}${R}
+    Password       ${B}${ADMIN_PW:-NOT CAPTURED — recover it with the command below}${R}
 
-  ${YEL}Change that password at first login — it is written in the log above.${R}
+  ${YEL}Change this password at first login.${R}
+  ${DIM}It is NOT in $LOG. The control plane prints it once, to its container log:${R}
+    ${DIM}docker logs sentinel-controlplane-1 2>&1 | grep -A1 'GENERATED password'${R}
+
+  ${B}Reaching the console${R}
+
+    The management console is bound to ${B}127.0.0.1 only${R}, deliberately: it is a
+    security appliance's admin UI, and on 0.0.0.0 it would be exposed to whatever
+    network this host sits on — and to the internet the moment the host gets a
+    public IP. So it is NOT reachable at https://${WAF_HOSTNAME}:9443 from your
+    laptop, and that is the intended behaviour, not a fault.
+
+    From this host          ${B}https://127.0.0.1:9443${R}
+    From your workstation   ${B}ssh -L 9443:127.0.0.1:9443 ${SUDO_USER:-root}@${DEF_IP:-<this-host>}${R}
+                            then open ${B}https://127.0.0.1:9443${R}
+
+    ${DIM}Ports 80 and 443 ARE published on all interfaces — that is the WAF's${R}
+    ${DIM}traffic path, and it is what your protected sites are served on.${R}
 
   ${B}Next steps${R}
     1. Add your first protected site in the dashboard.
@@ -397,7 +582,7 @@ cat <<FINAL
        WAF would wrongly block YOUR users. Learning mode records what it
        would have blocked without blocking it.
     3. After a full business cycle, measure and then enable blocking:
-         $INSTALL_DIR/scripts/backup/../fpr-report.sh 168
+         $INSTALL_DIR/scripts/fpr-report.sh 168
        See section 7 of the deployment guide.
     4. Configure backups: $INSTALL_DIR/scripts/backup/backup.sh
 

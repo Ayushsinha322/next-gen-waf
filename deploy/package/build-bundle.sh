@@ -108,6 +108,15 @@ cp deploy/docker/compose.cluster.yml       "$STAGE/compose/"
 cp deploy/docker/pg_hba.conf               "$STAGE/compose/"
 cp deploy/docker/sentinel.proxy.yaml       "$STAGE/compose/" 2>/dev/null || true
 cp deploy/docker/clickhouse-tls.xml        "$STAGE/compose/"
+# These two are bind-mounted by the 2vm overlays as ./pg-init-replication.sh and
+# ./pg-standby-entrypoint.sh — RELATIVE TO THE COMPOSE FILE. They were staged only
+# into scripts/, so in the bundle Docker found nothing at those paths and created
+# DIRECTORIES in their place: the primary's replication role/slot/pg_hba entry were
+# never created, and the standby's entrypoint was a directory. Both failures are
+# silent at `up` time and surface later as "replication just isn't running".
+cp deploy/docker/pg-init-replication.sh    "$STAGE/compose/"
+cp deploy/docker/pg-standby-entrypoint.sh  "$STAGE/compose/"
+chmod +x "$STAGE/compose/pg-init-replication.sh" "$STAGE/compose/pg-standby-entrypoint.sh"
 cp deploy/docker/prometheus.yml            "$STAGE/compose/" 2>/dev/null || true
 cp -r deploy/docker/grafana                "$STAGE/compose/" 2>/dev/null || true
 
@@ -118,12 +127,24 @@ for s in preflight.sh verify-deploy.sh promote-standby.sh \
   cp "deploy/docker/$s" "$STAGE/scripts/" 2>/dev/null || warn "missing script: $s"
 done
 cp -r deploy/backup "$STAGE/scripts/backup" 2>/dev/null || warn "no backup scripts"
+# install.sh's closing message tells the operator to run this before enabling
+# blocking mode, so it has to be IN the bundle. It lives under deploy/load-test/
+# rather than deploy/docker/, so the fixed list above never picked it up and the
+# instruction pointed at a file the customer did not have.
+cp deploy/load-test/fpr-report.sh "$STAGE/scripts/" 2>/dev/null \
+  || warn "missing script: fpr-report.sh (install.sh references it after install)"
 mkdir -p "$STAGE/scripts/2vm"
 cp deploy/2vm/install-2vm.sh deploy/2vm/keepalived.conf.tmpl \
    deploy/2vm/sentinel-vrrp-check.sh deploy/2vm/sentinel-vrrp-notify.sh \
    "$STAGE/scripts/2vm/" 2>/dev/null || warn "2vm assets incomplete"
 
 cp deploy/docker/.env.example "$STAGE/configs/env.example"
+# The two installation guides ship WITH the bundle. An operator who has the archive
+# but not the repo otherwise has no written procedure — and the active/passive one
+# in particular is a two-machine sequence that cannot be guessed from --help.
+for d in STANDALONE.md ACTIVE-PASSIVE.md; do
+  cp "deploy/$d" "$STAGE/docs/" 2>/dev/null || warn "missing guide: deploy/$d"
+done
 [[ -f docs/WAFDocuments/Next-Gen-ESDSWAF-Deployment-Guide.pdf ]] \
   && cp docs/WAFDocuments/Next-Gen-ESDSWAF-Deployment-Guide.pdf "$STAGE/docs/" \
   || warn "deployment guide PDF not found — bundle ships without docs"
