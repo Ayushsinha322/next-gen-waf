@@ -34,10 +34,23 @@ cd "$REPO_ROOT"
 
 VERSION="${1:-$(cat VERSION 2>/dev/null || echo 0.0.0)}"
 PRODUCT="ESDSWAF"
-STAGE="dist/${PRODUCT}-v${VERSION}"
-ARCHIVE="dist/${PRODUCT}-v${VERSION}.tar.gz"
 BUNDLE_THIRD_PARTY="${BUNDLE_THIRD_PARTY:-0}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
+
+# The extracted DIRECTORY keeps the plain name, so `cd ESDSWAF-v<version>` is the
+# same instruction for both variants. Only the ARCHIVE carries the suffix.
+#
+# Both variants used to be written to the identical filename, so building one
+# silently overwrote the other — and since they have different checksums, an
+# operator holding the older .sha256 would get a mismatch that reads as tampering.
+# Name them apart at the point of creation instead of relying on whoever runs this
+# to remember to rename the output.
+STAGE="dist/${PRODUCT}-v${VERSION}"
+if [[ "$BUNDLE_THIRD_PARTY" == "1" ]]; then
+  ARCHIVE="dist/${PRODUCT}-v${VERSION}-offline.tar.gz"
+else
+  ARCHIVE="dist/${PRODUCT}-v${VERSION}-online.tar.gz"
+fi
 
 # The four images we build and ship.
 OWN_IMAGES=(dataplane controlplane dashboard migrate)
@@ -49,6 +62,9 @@ THIRD_PARTY=(
   "clickhouse/clickhouse-server:24-alpine"
   "prom/prometheus:v2.54.1"
   "grafana/grafana:11.2.0"
+  # Used only by compose.ha.yml, which is shipped — so it belongs in the list a
+  # customer pre-seeds a registry mirror from, and in the offline bundle.
+  "haproxy:2.9-alpine"
 )
 
 if [[ -t 1 ]]; then B=$'\e[1m'; R=$'\e[0m'; G=$'\e[92m'; Y=$'\e[93m'; C=$'\e[96m'
@@ -108,7 +124,21 @@ cp deploy/docker/compose.cluster.yml       "$STAGE/compose/"
 cp deploy/docker/pg_hba.conf               "$STAGE/compose/"
 cp deploy/docker/sentinel.proxy.yaml       "$STAGE/compose/" 2>/dev/null || true
 cp deploy/docker/clickhouse-tls.xml        "$STAGE/compose/"
+# These two are bind-mounted by the 2vm overlays as ./pg-init-replication.sh and
+# ./pg-standby-entrypoint.sh — RELATIVE TO THE COMPOSE FILE. They were staged only
+# into scripts/, so in the bundle Docker found nothing at those paths and created
+# DIRECTORIES in their place: the primary's replication role/slot/pg_hba entry were
+# never created, and the standby's entrypoint was a directory. Both failures are
+# silent at `up` time and surface later as "replication just isn't running".
+cp deploy/docker/pg-init-replication.sh    "$STAGE/compose/"
+cp deploy/docker/pg-standby-entrypoint.sh  "$STAGE/compose/"
+chmod +x "$STAGE/compose/pg-init-replication.sh" "$STAGE/compose/pg-standby-entrypoint.sh"
 cp deploy/docker/prometheus.yml            "$STAGE/compose/" 2>/dev/null || true
+# compose.ha.yml is shipped and bind-mounts ./haproxy.cfg; without it Docker would
+# create a directory there and HAProxy would fail to start. (haproxy:2.9-alpine is
+# listed in THIRD_PARTY below for the same reason.)
+cp deploy/docker/haproxy.cfg               "$STAGE/compose/" 2>/dev/null \
+  || warn "missing haproxy.cfg — compose.ha.yml would fail to start"
 cp -r deploy/docker/grafana                "$STAGE/compose/" 2>/dev/null || true
 
 # Operational scripts the customer legitimately needs.
@@ -118,12 +148,24 @@ for s in preflight.sh verify-deploy.sh promote-standby.sh \
   cp "deploy/docker/$s" "$STAGE/scripts/" 2>/dev/null || warn "missing script: $s"
 done
 cp -r deploy/backup "$STAGE/scripts/backup" 2>/dev/null || warn "no backup scripts"
+# install.sh's closing message tells the operator to run this before enabling
+# blocking mode, so it has to be IN the bundle. It lives under deploy/load-test/
+# rather than deploy/docker/, so the fixed list above never picked it up and the
+# instruction pointed at a file the customer did not have.
+cp deploy/load-test/fpr-report.sh "$STAGE/scripts/" 2>/dev/null \
+  || warn "missing script: fpr-report.sh (install.sh references it after install)"
 mkdir -p "$STAGE/scripts/2vm"
 cp deploy/2vm/install-2vm.sh deploy/2vm/keepalived.conf.tmpl \
    deploy/2vm/sentinel-vrrp-check.sh deploy/2vm/sentinel-vrrp-notify.sh \
    "$STAGE/scripts/2vm/" 2>/dev/null || warn "2vm assets incomplete"
 
 cp deploy/docker/.env.example "$STAGE/configs/env.example"
+# The two installation guides ship WITH the bundle. An operator who has the archive
+# but not the repo otherwise has no written procedure — and the active/passive one
+# in particular is a two-machine sequence that cannot be guessed from --help.
+for d in STANDALONE.md ACTIVE-PASSIVE.md; do
+  cp "deploy/$d" "$STAGE/docs/" 2>/dev/null || warn "missing guide: deploy/$d"
+done
 [[ -f docs/WAFDocuments/Next-Gen-ESDSWAF-Deployment-Guide.pdf ]] \
   && cp docs/WAFDocuments/Next-Gen-ESDSWAF-Deployment-Guide.pdf "$STAGE/docs/" \
   || warn "deployment guide PDF not found — bundle ships without docs"
@@ -203,7 +245,16 @@ done
 
 mkdir -p dist
 tar -czf "$ARCHIVE" -C dist "$(basename "$STAGE")"
-sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
+# Generate the checksum from INSIDE dist/, so the file records a bare filename.
+#
+# `sha256sum "$ARCHIVE"` recorded the path as "dist/ESDSWAF-v<v>.tar.gz". The
+# customer receives only the two files and, per the README, runs
+#     sha256sum -c ESDSWAF-v<v>.tar.gz.sha256
+# in whatever directory they landed in — where there is no dist/ subdirectory. So
+# the FIRST command of the install procedure failed on a perfectly good bundle,
+# reporting "FAILED open or read". For a security product that reads as tampering,
+# which is the worst possible false alarm.
+( cd dist && sha256sum "$(basename "$ARCHIVE")" > "$(basename "$ARCHIVE").sha256" )
 ok "$ARCHIVE — $(du -h "$ARCHIVE" | cut -f1)"
 
 cat <<SUMMARY
@@ -215,12 +266,12 @@ cat <<SUMMARY
     version   $VERSION
     commit    $(git rev-parse --short HEAD 2>/dev/null || echo unknown)
     offline   $([[ "$BUNDLE_THIRD_PARTY" == "1" ]] && echo "yes (all images bundled)" \
-                 || echo "NO — customer needs Docker Hub for 5 third-party images")
+                 || echo "NO — customer needs Docker Hub for ${#THIRD_PARTY[@]} third-party images")
 
   Send the customer BOTH files. They verify before extracting:
 
-      sha256sum -c ${PRODUCT}-v${VERSION}.tar.gz.sha256
-      tar -xzf ${PRODUCT}-v${VERSION}.tar.gz
+      sha256sum -c $(basename "$ARCHIVE").sha256
+      tar -xzf $(basename "$ARCHIVE")
       cd ${PRODUCT}-v${VERSION} && sudo ./install.sh
 
 SUMMARY

@@ -3,28 +3,42 @@
 **Product:** Next-Gen ESDSWAF
 **Vendor:** ESDS Software Solution Ltd — SIG-CyberSec
 
+## Full guides — in this package
+
+| Deploying | Read |
+|---|---|
+| **One VM** (evaluation, pilot, most deployments) | [`docs/STANDALONE.md`](docs/STANDALONE.md) |
+| **Two VMs**, virtual IP, automatic traffic failover | [`docs/ACTIVE-PASSIVE.md`](docs/ACTIVE-PASSIVE.md) |
+
+This page is the short version of the standalone path. The two-VM deployment is a
+two-machine sequence with artifacts that must be copied between the nodes in a
+specific order — follow `docs/ACTIVE-PASSIVE.md` for it, not this page.
+
 ---
 
 ## Install
 
 ```bash
 # 1. Verify the archive you received (do this BEFORE extracting)
-sha256sum -c ESDSWAF-v<version>.tar.gz.sha256
+BUNDLE=ESDSWAF-v<version>-offline.tar.gz    # or whichever archive you received
+sha256sum -c "$BUNDLE.sha256"               # must print: OK
 
 # 2. Extract
-tar -xzf ESDSWAF-v<version>.tar.gz
+tar -xzf "$BUNDLE"
 cd ESDSWAF-v<version>
 
 # 3. Install
 sudo ./install.sh
 ```
 
-The installer asks for three things — the hostname clients will use, an
-administrator email, and the topology. **Every password and key is generated for
-you** with `openssl rand`; you are never asked to invent a secret.
+The installer asks for two things — the hostname clients will use and an
+administrator email. **Every password and key is generated for you** with
+`openssl rand`; you are never asked to invent a secret.
 
-It aborts *before* changing anything if the host does not meet requirements, so
-there is no half-installed state to clean up.
+Every requirement is checked *before* anything is changed, so a host that does not
+qualify is rejected rather than half-installed. If a later step fails, the abort
+message tells you whether the host was modified and how to clean up; `--force`
+resumes over a previous incomplete attempt.
 
 Want to check the host first without installing anything?
 
@@ -81,13 +95,24 @@ If your site has no egress, either:
 
 ## After installing
 
-The installer prints the dashboard URL and a one-time administrator password.
+The installer prints a one-time administrator password and how to reach the console.
 
-1. **Log in and change the password.** It is written in plain text in
-   `/var/log/sentinel/install.log`.
-2. **Add your first protected site.** Until one exists the WAF returns 502 to
+1. **Log in and change the password.** It is **not** in `/var/log/sentinel/install.log`
+   — the control plane prints it once, to its own container log. If you missed it:
+
+   ```bash
+   docker logs sentinel-controlplane-1 2>&1 | grep -A1 'GENERATED password'
+   ```
+
+2. **The console is loopback-only, on purpose.** `https://<host>:9443` will not
+   connect from your workstation. Tunnel to it:
+
+   ```bash
+   ssh -L 9443:127.0.0.1:9443 root@<host>     # then open https://127.0.0.1:9443
+   ```
+3. **Add your first protected site.** Until one exists the WAF returns 502 to
    everything — correct, because there is no upstream to forward to.
-3. **Leave new sites in LEARNING mode.**
+4. **Leave new sites in LEARNING mode.**
 
 ### Why learning mode matters
 

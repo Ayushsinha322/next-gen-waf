@@ -14,9 +14,33 @@ set -euo pipefail
 
 PKI_DIR=/opt/sentinel-pki
 CERT_VOL_DATA=/var/lib/docker/volumes/sentinel_sentinel-certs/_data
-WAF_IP="${WAF_IP:-172.16.21.71}"
+# WAF_IP is REQUIRED. It used to default to 172.16.21.71 — an ESDS development VM —
+# so every customer install that did not set it (which was all of them: install.sh
+# called this script with no environment at all) succeeded, exited 0, and staged a
+# "default" certificate whose only SAN was a machine on someone else's network.
+# The SNI resolver serves that cert to every client arriving without SNI, i.e. every
+# browser visiting https://<the customer's address>/ — so HTTPS was broken on every
+# host, in a way importing root.crt could not fix, while the installer reported
+# success. Refusing to guess is the only safe default for a certificate subject.
+WAF_IP="${WAF_IP:?WAF_IP must be set — refusing to issue a certificate for a guessed address}"
+# Optional: when the operator has a hostname, add it as a DNS SAN so the same
+# default cert is valid for both https://<ip>/ and https://<hostname>/.
+WAF_HOSTNAME="${WAF_HOSTNAME:-}"
 LEAF_DAYS="${LEAF_DAYS:-825}"
 CA_DAYS="${CA_DAYS:-3650}"
+
+# A hostname that is just the IP again adds nothing and would produce a bogus
+# DNS: entry for a numeric name.
+if [[ "$WAF_HOSTNAME" == "$WAF_IP" ]]; then WAF_HOSTNAME=""; fi
+if [[ -n "$WAF_HOSTNAME" ]]; then
+  SAN_LINE="subjectAltName=IP:${WAF_IP},DNS:${WAF_HOSTNAME}"
+  SAN_JSON="\"${WAF_IP}\", \"${WAF_HOSTNAME}\""
+  LEAF_CN="$WAF_HOSTNAME"
+else
+  SAN_LINE="subjectAltName=IP:${WAF_IP}"
+  SAN_JSON="\"${WAF_IP}\""
+  LEAF_CN="$WAF_IP"
+fi
 
 ORG="ESDS Software Solution Ltd"
 OU="SIG-CyberSec"
@@ -41,17 +65,17 @@ else
 fi
 
 # ---- 2. Leaf cert for the bare IP --------------------------------------------
-echo "[*] Issuing leaf cert for IP:${WAF_IP} (${LEAF_DAYS}d)..."
+echo "[*] Issuing leaf cert for ${SAN_LINE#subjectAltName=} (${LEAF_DAYS}d)..."
 openssl ecparam -name prime256v1 -genkey -noout -out leaf.key
 openssl req -new -key leaf.key \
-  -subj "/C=${COUNTRY}/O=${ORG}/OU=${OU}/CN=${WAF_IP}" \
+  -subj "/C=${COUNTRY}/O=${ORG}/OU=${OU}/CN=${LEAF_CN}" \
   -out leaf.csr
 
 cat > leaf.ext <<EXT
 basicConstraints=critical,CA:FALSE
 keyUsage=critical,digitalSignature,keyEncipherment
 extendedKeyUsage=serverAuth
-subjectAltName=IP:${WAF_IP}
+${SAN_LINE}
 subjectKeyIdentifier=hash
 authorityKeyIdentifier=keyid,issuer
 EXT
@@ -70,8 +94,8 @@ FP=$(openssl x509 -in leaf.crt -noout -fingerprint -sha256 | sed 's/.*=//; s/://
 cat > meta.json <<JSON
 {
   "domain": "default",
-  "name": "Sentinel Internal CA - IP cert (${WAF_IP})",
-  "san": ["${WAF_IP}"],
+  "name": "Sentinel Internal CA - default cert (${LEAF_CN})",
+  "san": [${SAN_JSON}],
   "issued_at": ${ISSUED},
   "expires_at": ${EXPIRES},
   "fingerprint": "${FP}",
