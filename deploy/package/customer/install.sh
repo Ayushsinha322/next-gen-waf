@@ -31,11 +31,13 @@ PKI_DIR=/opt/sentinel-pki
 NONINTERACTIVE=no
 DRY_RUN=no
 FORCE=no
+ALLOW_UNDERSIZED=no
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --non-interactive) NONINTERACTIVE=yes ;;
     --dry-run) DRY_RUN=yes ;;
     --force) FORCE=yes ;;
+    --allow-undersized) ALLOW_UNDERSIZED=yes ;;
     -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -216,14 +218,42 @@ chk "CPU"  "$VCPU"    "$MIN_VCPU"    "vCPU"
 chk "RAM"  "$RAM_GB"  "$MIN_RAM_GB"  "GB"
 chk "Disk" "$DISK_GB" "$MIN_DISK_GB" "GB free on /opt"
 if [[ $hw_fail -eq 1 ]]; then
-  die "hardware below minimum specification.
+  # An evaluation VM a few GB under spec is a real and common case — a 100 GB disk
+  # reports ~98 GB free once formatted, which failed a 100 GB gate by 2%. Refusing
+  # outright forces the operator to either resize or edit the installer, and
+  # editing it breaks its own SHA256SUMS check. Offer an explicit, logged override
+  # instead, and be specific about what each shortfall actually costs — the two are
+  # nothing alike.
+  if [[ "$ALLOW_UNDERSIZED" == "yes" ]]; then
+    warn "PROCEEDING UNDER SPEC because --allow-undersized was given"
+    [[ "$VCPU"    -lt "$MIN_VCPU" ]] && \
+      warn "  CPU ${VCPU} < ${MIN_VCPU}: throughput will be well below published figures"
+    [[ "$DISK_GB" -lt "$MIN_DISK_GB" ]] && \
+      warn "  Disk ${DISK_GB}GB < ${MIN_DISK_GB}GB: fine to start, but event history fills
+       the disk sooner. Lower SENTINEL_CLICKHOUSE_*_RETENTION_DAYS accordingly."
+    if [[ "$RAM_GB" -lt "$MIN_RAM_GB" ]]; then
+      warn "  RAM ${RAM_GB}GB < ${MIN_RAM_GB}GB: THIS ONE ACTUALLY BREAKS THINGS."
+      warn "       ClickHouse is capped at 6GB and crash-loops with under ~2GB free."
+      warn "       Expect a stack that installs cleanly and then restarts forever."
+    fi
+    say ""
+    say "  ${DIM}This is acceptable for an evaluation. It is not a supported${R}"
+    say "  ${DIM}production configuration, and the shortfall is recorded in $LOG.${R}"
+    log "UNDERSIZED override: cpu=$VCPU ram=$RAM_GB disk=$DISK_GB"
+  else
+    die "hardware below minimum specification.
 
-    Required: ${MIN_VCPU} vCPU, 16 GB RAM, ${MIN_DISK_GB} GB free disk
+    Required: ${MIN_VCPU} vCPU, ${MIN_RAM_GB}+ GB RAM, ${MIN_DISK_GB} GB free disk on /opt
     Detected: ${VCPU} vCPU, ${RAM_GB} GB RAM, ${DISK_GB} GB free
 
-    RAM is the hard one: ClickHouse is limited to 6 GB and crash-loops
-    indefinitely with less than about 2 GB available to it. Resize the VM
-    and re-run this installer."
+    RAM is the one that genuinely breaks: ClickHouse is limited to 6 GB and
+    crash-loops indefinitely with less than about 2 GB available to it. Disk and
+    CPU shortfalls degrade rather than break.
+
+    Resize the VM and re-run — or, for an EVALUATION only, proceed anyway:
+
+        sudo ./install.sh --allow-undersized"
+  fi
 fi
 
 # ── Step 4 — Docker, ports, clock, connectivity ──────────────────────────────
