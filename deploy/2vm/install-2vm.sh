@@ -995,7 +995,8 @@ cat <<NEXT
 
   2. On VM 2:  sudo ./install-2vm.sh   →  answer ${B}slave${R}
 
-  3. Then run the failover drill in ./README.md before relying on this.
+  3. Then run the failover drill in ACTIVE-PASSIVE.md before relying on this.
+     ${DIM}(docs/ inside the installation bundle, deploy/ in a source checkout)${R}
 NEXT
 else
 cat <<NEXT
@@ -1007,8 +1008,9 @@ cat <<NEXT
     docker exec sentinel-postgres-1 psql -U sentinel -d sentinel \
       -c "SELECT pg_is_in_recovery();"   # here: expect 't'
 
-  Then run the failover drill in ../ACTIVE-PASSIVE.md. An untested failover is an
-  assumption, not a capability.
+  Then run the failover drill in ACTIVE-PASSIVE.md — docs/ inside the installation
+  bundle, deploy/ in a source checkout. An untested failover is an assumption,
+  not a capability.
 NEXT
 fi
 

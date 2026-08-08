@@ -49,6 +49,9 @@ THIRD_PARTY=(
   "clickhouse/clickhouse-server:24-alpine"
   "prom/prometheus:v2.54.1"
   "grafana/grafana:11.2.0"
+  # Used only by compose.ha.yml, which is shipped — so it belongs in the list a
+  # customer pre-seeds a registry mirror from, and in the offline bundle.
+  "haproxy:2.9-alpine"
 )
 
 if [[ -t 1 ]]; then B=$'\e[1m'; R=$'\e[0m'; G=$'\e[92m'; Y=$'\e[93m'; C=$'\e[96m'
@@ -118,6 +121,11 @@ cp deploy/docker/pg-init-replication.sh    "$STAGE/compose/"
 cp deploy/docker/pg-standby-entrypoint.sh  "$STAGE/compose/"
 chmod +x "$STAGE/compose/pg-init-replication.sh" "$STAGE/compose/pg-standby-entrypoint.sh"
 cp deploy/docker/prometheus.yml            "$STAGE/compose/" 2>/dev/null || true
+# compose.ha.yml is shipped and bind-mounts ./haproxy.cfg; without it Docker would
+# create a directory there and HAProxy would fail to start. (haproxy:2.9-alpine is
+# listed in THIRD_PARTY below for the same reason.)
+cp deploy/docker/haproxy.cfg               "$STAGE/compose/" 2>/dev/null \
+  || warn "missing haproxy.cfg — compose.ha.yml would fail to start"
 cp -r deploy/docker/grafana                "$STAGE/compose/" 2>/dev/null || true
 
 # Operational scripts the customer legitimately needs.
@@ -224,7 +232,16 @@ done
 
 mkdir -p dist
 tar -czf "$ARCHIVE" -C dist "$(basename "$STAGE")"
-sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
+# Generate the checksum from INSIDE dist/, so the file records a bare filename.
+#
+# `sha256sum "$ARCHIVE"` recorded the path as "dist/ESDSWAF-v<v>.tar.gz". The
+# customer receives only the two files and, per the README, runs
+#     sha256sum -c ESDSWAF-v<v>.tar.gz.sha256
+# in whatever directory they landed in — where there is no dist/ subdirectory. So
+# the FIRST command of the install procedure failed on a perfectly good bundle,
+# reporting "FAILED open or read". For a security product that reads as tampering,
+# which is the worst possible false alarm.
+( cd dist && sha256sum "$(basename "$ARCHIVE")" > "$(basename "$ARCHIVE").sha256" )
 ok "$ARCHIVE — $(du -h "$ARCHIVE" | cut -f1)"
 
 cat <<SUMMARY
@@ -236,7 +253,7 @@ cat <<SUMMARY
     version   $VERSION
     commit    $(git rev-parse --short HEAD 2>/dev/null || echo unknown)
     offline   $([[ "$BUNDLE_THIRD_PARTY" == "1" ]] && echo "yes (all images bundled)" \
-                 || echo "NO — customer needs Docker Hub for 5 third-party images")
+                 || echo "NO — customer needs Docker Hub for ${#THIRD_PARTY[@]} third-party images")
 
   Send the customer BOTH files. They verify before extracting:
 

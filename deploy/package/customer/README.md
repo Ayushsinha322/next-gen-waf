@@ -3,6 +3,17 @@
 **Product:** Next-Gen ESDSWAF
 **Vendor:** ESDS Software Solution Ltd — SIG-CyberSec
 
+## Full guides — in this package
+
+| Deploying | Read |
+|---|---|
+| **One VM** (evaluation, pilot, most deployments) | [`docs/STANDALONE.md`](docs/STANDALONE.md) |
+| **Two VMs**, virtual IP, automatic traffic failover | [`docs/ACTIVE-PASSIVE.md`](docs/ACTIVE-PASSIVE.md) |
+
+This page is the short version of the standalone path. The two-VM deployment is a
+two-machine sequence with artifacts that must be copied between the nodes in a
+specific order — follow `docs/ACTIVE-PASSIVE.md` for it, not this page.
+
 ---
 
 ## Install
@@ -19,12 +30,14 @@ cd ESDSWAF-v<version>
 sudo ./install.sh
 ```
 
-The installer asks for three things — the hostname clients will use, an
-administrator email, and the topology. **Every password and key is generated for
-you** with `openssl rand`; you are never asked to invent a secret.
+The installer asks for two things — the hostname clients will use and an
+administrator email. **Every password and key is generated for you** with
+`openssl rand`; you are never asked to invent a secret.
 
-It aborts *before* changing anything if the host does not meet requirements, so
-there is no half-installed state to clean up.
+Every requirement is checked *before* anything is changed, so a host that does not
+qualify is rejected rather than half-installed. If a later step fails, the abort
+message tells you whether the host was modified and how to clean up; `--force`
+resumes over a previous incomplete attempt.
 
 Want to check the host first without installing anything?
 
