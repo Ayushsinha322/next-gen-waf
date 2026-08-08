@@ -7,15 +7,28 @@ This is the right topology for an evaluation, a pilot, a demo, or any site that 
 tolerate the WAF being down while the VM reboots. If you need the WAF to survive
 losing a machine, use [ACTIVE-PASSIVE.md](ACTIVE-PASSIVE.md) instead.
 
-**You need two files**, which ESDS supplies:
+**You need two files**, which ESDS supplies — the archive and its checksum:
 
 ```
-ESDSWAF-v1.0.0.tar.gz
-ESDSWAF-v1.0.0.tar.gz.sha256
+ESDSWAF-v1.0.0-<variant>.tar.gz
+ESDSWAF-v1.0.0-<variant>.tar.gz.sha256
 ```
 
 You do **not** need the source code, a compiler, or a build machine. The images are
 pre-built and load in about a minute.
+
+There are two variants. Check which one you were given — the installer reads it
+from the bundle and behaves accordingly, so you cannot use the wrong one by
+mistake:
+
+| Variant | Size | Needs Docker Hub at install? |
+|---|---|---|
+| `-offline` | ~2 GB | **No.** All nine images travel inside the bundle |
+| `-online` | ~250 MB | **Yes.** Five supporting images are pulled during install |
+
+If the VM has no outbound internet — which is normal for a management network —
+you want the **offline** bundle. The online one will abort in preflight with a
+clear message rather than failing halfway through.
 
 **Time:** about 10 minutes.
 
@@ -57,13 +70,18 @@ systemctl enable --now docker
 ### 2.1 Verify, then extract
 
 ```bash
-sha256sum -c ESDSWAF-v1.0.0.tar.gz.sha256
-tar -xzf ESDSWAF-v1.0.0.tar.gz
+BUNDLE=ESDSWAF-v1.0.0-offline.tar.gz      # or whichever file you received
+
+sha256sum -c "$BUNDLE.sha256"             # must print: OK
+tar -xzf "$BUNDLE"
 cd ESDSWAF-v1.0.0
 ```
 
-Verify first, extract second. The installer separately checks every shipped file
-against `SHA256SUMS` and refuses to run on a package that does not match.
+Verify first, extract second. If `sha256sum -c` does not print `OK`, stop — the
+transfer was truncated or the file was altered. Do not install it.
+
+The installer separately checks every shipped file against `SHA256SUMS` and
+refuses to run on a package that does not match.
 
 ### 2.2 Check the host without touching it
 
@@ -279,12 +297,18 @@ cd /path/to/waf-development
 | `BUNDLE_THIRD_PARTY=1` | Bundle all nine images — fully offline, ~2 GB, no Docker Hub needed at install |
 | `SKIP_BUILD=1` | Reuse images already built locally (iterating on the script only) |
 
-Output lands in `dist/`. Send the customer **both** files:
+Output lands in `dist/` as `ESDSWAF-v<version>.tar.gz` plus its `.sha256`. Rename
+both to carry the variant before sending, and regenerate the checksum from inside
+`dist/` so it records a bare filename:
 
+```bash
+cd dist
+mv ESDSWAF-v1.0.0.tar.gz ESDSWAF-v1.0.0-offline.tar.gz     # or -online
+sha256sum ESDSWAF-v1.0.0-offline.tar.gz > ESDSWAF-v1.0.0-offline.tar.gz.sha256
 ```
-dist/ESDSWAF-v1.0.0.tar.gz
-dist/ESDSWAF-v1.0.0.tar.gz.sha256
-```
+
+Send the customer **both** files. The checksum file is 90 bytes and is the only way
+they can tell a truncated 2 GB transfer from a good one.
 
 The standard bundle ships the four ESDSWAF images; `postgres`, `redis`,
 `clickhouse-server`, `prometheus` and `grafana` are pulled from Docker Hub at

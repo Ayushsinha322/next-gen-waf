@@ -34,10 +34,23 @@ cd "$REPO_ROOT"
 
 VERSION="${1:-$(cat VERSION 2>/dev/null || echo 0.0.0)}"
 PRODUCT="ESDSWAF"
-STAGE="dist/${PRODUCT}-v${VERSION}"
-ARCHIVE="dist/${PRODUCT}-v${VERSION}.tar.gz"
 BUNDLE_THIRD_PARTY="${BUNDLE_THIRD_PARTY:-0}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
+
+# The extracted DIRECTORY keeps the plain name, so `cd ESDSWAF-v<version>` is the
+# same instruction for both variants. Only the ARCHIVE carries the suffix.
+#
+# Both variants used to be written to the identical filename, so building one
+# silently overwrote the other — and since they have different checksums, an
+# operator holding the older .sha256 would get a mismatch that reads as tampering.
+# Name them apart at the point of creation instead of relying on whoever runs this
+# to remember to rename the output.
+STAGE="dist/${PRODUCT}-v${VERSION}"
+if [[ "$BUNDLE_THIRD_PARTY" == "1" ]]; then
+  ARCHIVE="dist/${PRODUCT}-v${VERSION}-offline.tar.gz"
+else
+  ARCHIVE="dist/${PRODUCT}-v${VERSION}-online.tar.gz"
+fi
 
 # The four images we build and ship.
 OWN_IMAGES=(dataplane controlplane dashboard migrate)
@@ -257,8 +270,8 @@ cat <<SUMMARY
 
   Send the customer BOTH files. They verify before extracting:
 
-      sha256sum -c ${PRODUCT}-v${VERSION}.tar.gz.sha256
-      tar -xzf ${PRODUCT}-v${VERSION}.tar.gz
+      sha256sum -c $(basename "$ARCHIVE").sha256
+      tar -xzf $(basename "$ARCHIVE")
       cd ${PRODUCT}-v${VERSION} && sudo ./install.sh
 
 SUMMARY

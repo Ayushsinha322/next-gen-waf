@@ -20,10 +20,11 @@ specific order — follow `docs/ACTIVE-PASSIVE.md` for it, not this page.
 
 ```bash
 # 1. Verify the archive you received (do this BEFORE extracting)
-sha256sum -c ESDSWAF-v<version>.tar.gz.sha256
+BUNDLE=ESDSWAF-v<version>-offline.tar.gz    # or whichever archive you received
+sha256sum -c "$BUNDLE.sha256"               # must print: OK
 
 # 2. Extract
-tar -xzf ESDSWAF-v<version>.tar.gz
+tar -xzf "$BUNDLE"
 cd ESDSWAF-v<version>
 
 # 3. Install
