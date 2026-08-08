@@ -375,7 +375,11 @@ if [[ "$NONINTERACTIVE" != "yes" ]]; then
   say ""
   say "  ${B}TLS${R}"
   say "    This installer issues a certificate from an internal CA it generates"
-  say "    here, valid for ${DEF_IP:-this host}${WAF_HOSTNAME:+ and $WAF_HOSTNAME}."
+  # Printed "valid for 172.16.21.95 and 172.16.21.95" when the operator answered
+  # the hostname prompt with the host's own IP — which is the common case on an
+  # internal deployment with no DNS name. issue-ip-cert.sh already drops the
+  # duplicate before it reaches the SAN; only the message repeated it.
+  say "    here, valid for ${DEF_IP:-this host}$([[ -n "$WAF_HOSTNAME" && "$WAF_HOSTNAME" != "$DEF_IP" ]] && printf ' and %s' "$WAF_HOSTNAME")."
   say "    ${DIM}Clients that import /opt/sentinel-pki/root.crt get a green lock;${R}"
   say "    ${DIM}others see the usual untrusted-issuer warning.${R}"
   say ""
@@ -506,7 +510,7 @@ else
       ./issue-ip-cert.sh >>"$LOG" 2>&1 ) \
     || die "could not issue the default TLS certificate — see $LOG.
     The data plane would have no certificate to present on :443."
-  ok "default TLS certificate issued for ${DEF_IP:-127.0.0.1}${WAF_HOSTNAME:+ / $WAF_HOSTNAME}"
+  ok "default TLS certificate issued for ${DEF_IP:-127.0.0.1}$([[ -n "$WAF_HOSTNAME" && "$WAF_HOSTNAME" != "$DEF_IP" ]] && printf ' / %s' "$WAF_HOSTNAME")"
 fi
 
 if [[ -f "$PKI_DIR/pg-server.crt" && -s "$PKI_DIR/pg-server.crt" ]]; then
