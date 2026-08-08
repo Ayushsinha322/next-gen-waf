@@ -3,6 +3,15 @@
 Everything needed to get the WAF running on a fresh VM. No source code, no
 compiler, no build machine.
 
+> ### 👉 First time? Read [**INSTALL-WALKTHROUGH.md**](INSTALL-WALKTHROUGH.md)
+>
+> A complete step-by-step guide — empty VM to a WAF blocking a real attack, with
+> every command spelled out and no prior knowledge of this product assumed. It was
+> written by following it on a real machine, so its troubleshooting section lists
+> problems that actually happen rather than ones that might.
+>
+> This page is the condensed reference for people who have done it before.
+
 ## Download
 
 **In a browser** (easiest — no token needed once you are logged into GitLab):
