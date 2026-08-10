@@ -19,39 +19,66 @@ stages:
 # cap, they run in parallel, and a failure now says WHICH kind of failure it was —
 # a lint/test regression (rust-check) or a release-only compilation problem
 # (rust-build). They share a cache key, so the second job starts warm.
-rust-check:
-  stage: test
+# Shared Rust CI settings.
+#
+# THE DEBUG-INFO SETTINGS ARE LOAD-BEARING, NOT TIDINESS. Every Rust job on this
+# project was failing, and the runner logs gave the reason:
+#
+#   The node was low on resource: ephemeral-storage.
+#   Container build was using 27060609 [KiB, ~27 GB]
+#
+# The workspace sets `[profile.dev] debug = true`, and `cargo test` and
+# `cargo clippy --all-targets` both build with that profile. Locally that produces
+# a 113 GB target/ directory, 108 GB of it under target/debug. On the Kubernetes
+# runner it filled the node's ephemeral storage, which then presented as three
+# different-looking failures — evicted pods (runner_system_failure), jobs stalling
+# into job_execution_timeout, and `etcdserver: request timed out` from a cluster
+# under disk pressure. One cause, three symptoms, none of them obviously "disk".
+#
+# Measured on this workspace, building sentinel-rules alone:
+#     with debug info     482 MB
+#     without debug info  187 MB     (-61%)
+#
+# Set via environment rather than by editing [profile.dev], deliberately: a
+# developer running cargo locally still gets debug symbols and a usable debugger.
+# Only CI, which never opens a debugger, builds without them.
+.rust-base: &rust-base
   image: rust:1.85
   tags:
     - k8s-docker
   variables:
     CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+    # No debug info in CI — see above.
+    CARGO_PROFILE_DEV_DEBUG: "0"
+    CARGO_PROFILE_TEST_DEBUG: "0"
+    # Incremental artifacts are large and worthless in CI: every job starts from
+    # a restored cache and never rebuilds the same crate twice in one run.
+    CARGO_INCREMENTAL: "0"
   cache:
     key: "rust-$CI_COMMIT_REF_SLUG"
     paths:
       - .cargo/
       - target/
+
+rust-check:
+  <<: *rust-base
+  stage: test
   before_script:
     - rustup component add rustfmt clippy
   script:
     - cargo fmt --all -- --check
     - cargo clippy --workspace --all-targets -- -D warnings
     - cargo test --workspace
+    # Surface the footprint so the next disk problem is diagnosable from the log
+    # rather than from a Kubernetes eviction event.
+    - du -sh target .cargo 2>/dev/null || true
 
 rust-build:
+  <<: *rust-base
   stage: build
-  image: rust:1.85
-  tags:
-    - k8s-docker
-  variables:
-    CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
-  cache:
-    key: "rust-$CI_COMMIT_REF_SLUG"
-    paths:
-      - .cargo/
-      - target/
   script:
     - cargo build --workspace --release
+    - du -sh target 2>/dev/null || true
 
 # ── Go control plane ─────────────────────────────────────────────────────────
 go:
