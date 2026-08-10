@@ -57,6 +57,32 @@ sect() { printf '\n%s== %s%s\n' "$B" "$*" "$R"; }
 
 printf '\n%sBundle contract check%s — %s\n' "$B" "$R" "$STAGE"
 
+# Refuse to validate a STALE tree.
+#
+# Found the hard way: a STAGE_ONLY run failed (it could not delete a root-owned
+# dist/ left behind by a container), and this script then happily validated the
+# PREVIOUS staging output and reported "contract holds". The tree it checked was
+# real, its checksums verified, every assertion passed — and none of it described
+# the code being tested.
+#
+# In CI this cannot cause a false pass, because the job runs staging and checking
+# as separate steps and fails on the first non-zero exit. But a checker that can
+# silently describe output nobody just produced is the same defect class this file
+# exists to catch, so it refuses rather than relying on the caller.
+# deploy/ci/ is excluded: it is the CHECKER, not bundle content. Including it made
+# the guard flag itself the moment this file was edited — a guard whose own
+# maintenance trips it gets deleted by the next person, which is worse than having
+# none. Compare only against what build-bundle.sh actually stages.
+STALE=$(find deploy -path deploy/ci -prune -o \
+          \( -name '*.sh' -o -name '*.yml' -o -name '*.yaml' -o -name '*.conf' -o -name '*.md' \) \
+          -newer "$STAGE/SHA256SUMS" -print 2>/dev/null | head -3)
+if [[ -n "$STALE" ]]; then
+  printf '  %s✗ STALE: bundle sources are newer than the staged tree:%s\n' "$RED" "$R" >&2
+  printf '%s\n' "$STALE" | sed 's/^/      /' >&2
+  printf '    Re-run: STAGE_ONLY=1 ./deploy/package/build-bundle.sh\n\n' >&2
+  exit 2
+fi
+
 # ── 1. layout ────────────────────────────────────────────────────────────────
 sect "Tree layout"
 for d in bundle compose configs scripts docs scripts/2vm; do
