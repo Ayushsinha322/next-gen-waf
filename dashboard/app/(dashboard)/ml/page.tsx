@@ -64,8 +64,6 @@ export default function MLPage() {
           setStats(res);
           setLoading(false);
           anomHist.current = [...anomHist.current, res.anomalies_detected].slice(-40);
-          tpHist.current   = [...tpHist.current,   res.true_positives_today].slice(-40);
-          fpHist.current   = [...fpHist.current,   res.false_positives_today].slice(-40);
         }
       } catch {
         if (!cancelled) { setLoading(false); setError(true); }
@@ -76,7 +74,10 @@ export default function MLPage() {
     return () => { cancelled = true; clearInterval(t); };
   }, []);
 
-  const statusColor = stats?.model_status === "active" ? "#22c55e" : "#f59e0b";
+  // Green only when ML is genuinely enabled everywhere; amber otherwise. The old
+  // check compared against the constant "active" the API always returned, so the
+  // dot was green on installs where ML was disabled on every site.
+  const statusColor = stats?.model_status === "enabled" ? "#22c55e" : "#f59e0b";
 
   return (
     <motion.div className="ml-page" variants={staggerContainer} initial="hidden" animate="visible">
@@ -103,8 +104,6 @@ export default function MLPage() {
             {[
               { v: stats.total_analyzed.toLocaleString(), l: "Requests Analyzed", c: "#60a5fa", d: anomHist.current },
               { v: stats.anomalies_detected.toLocaleString(), l: "Anomalies Detected", c: "#f87171", d: anomHist.current, cls: "r" },
-              { v: stats.true_positives_today.toLocaleString(), l: "True Positives Today", c: "#4ade80", d: tpHist.current, cls: "g" },
-              { v: stats.false_positives_today.toLocaleString(), l: "False Positives Today", c: "#fb923c", d: fpHist.current, cls: "a" },
             ].map((k, i) => (
               <motion.div key={i} className="ml-kpi" variants={cardVariants}>
                 <div className={`ml-kpi-v ${k.cls || ""}`}>{k.v}</div>
@@ -116,63 +115,47 @@ export default function MLPage() {
               <div className="ml-kpi-v" style={{ color: "#a78bfa" }}>{stats.block_rate.toFixed(2)}%</div>
               <div className="ml-kpi-l">Block Rate</div>
             </motion.div>
-            <motion.div className="ml-kpi" variants={cardVariants}>
-              <div className="ml-kpi-v" style={{ color: "#38bdf8" }}>{(stats.fp_rate * 100).toFixed(3)}%</div>
-              <div className="ml-kpi-l">FP Rate</div>
-            </motion.div>
           </motion.div>
 
-          <motion.div className="ml-gauges" variants={fadeUp}>
-            <div className="ml-gauge-card">
-              <div className="ml-gc-lbl">Precision</div>
-              <ArcGauge value={stats.precision} label="PRECISION" color="#a78bfa" />
-              <div className="ml-gc-sub">True positives / (TP + FP)</div>
-            </div>
-            <div className="ml-gauge-card">
-              <div className="ml-gc-lbl">Recall</div>
-              <ArcGauge value={stats.recall} label="RECALL" color="#38bdf8" />
-              <div className="ml-gc-sub">True positives / (TP + FN)</div>
-            </div>
-            <div className="ml-gauge-card">
-              <div className="ml-gc-lbl">F1 Score</div>
-              <ArcGauge
-                value={(2 * stats.precision * stats.recall) / (stats.precision + stats.recall || 1)}
-                label="F1 SCORE"
-                color="#4ade80"
-              />
-              <div className="ml-gc-sub">Harmonic mean P & R</div>
-            </div>
-          </motion.div>
+          {/*
+            This block replaces three ArcGauges that displayed Precision, Recall
+            and F1 from hardcoded API literals (0.953 / 0.891), refreshed every 5s
+            so they read as live measurement. They are not measurable without
+            labelled ground truth. Saying so is the feature.
+          */}
+          {!stats.quality_measured && (
+            <motion.div className="ml-gauge-card" variants={fadeUp} style={{ padding: "18px 20px" }}>
+              <div className="ml-gc-lbl">Model accuracy — not measured</div>
+              <div className="ml-gc-sub" style={{ marginTop: 8, lineHeight: 1.6, textAlign: "left" }}>
+                {stats.quality_note}
+              </div>
+            </motion.div>
+          )}
 
           <motion.div className="ml-sec-hd" variants={fadeUp}>
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#a78bfa" strokeWidth="1.5"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
             Active Models
           </motion.div>
           <motion.div className="ml-models" variants={staggerContainer} initial="hidden" animate="visible">
+            {/*
+              Previously listed three models — payload-classifier, anomaly-detector
+              and bot-classifier — with invented versions, precision/recall bars and
+              latencies. Only one classifier ships; the other two had no model file
+              anywhere in the repo. The API now returns the real one, and the bars
+              are gone because the model carries weights, not accuracy figures.
+            */}
             {stats.models.map((m, idx) => (
               <motion.div key={m.name} className="ml-model" variants={cardVariants} custom={idx}>
                 <div className="ml-model-hd">
                   <div>
                     <div className="ml-model-nm">{m.name}</div>
-                    <div className="ml-model-ver">v{m.version} · updated {m.last_updated}</div>
+                    <div className="ml-model-ver">{m.kind}</div>
                   </div>
-                  <span className={`ml-model-st ${m.status === "active" ? "on" : "off"}`}>{m.status}</span>
-                </div>
-                <div className="ml-model-bars">
-                  <div className="ml-bar-row">
-                    <span className="ml-bar-lbl">Precision</span>
-                    <div className="ml-bar-track"><div className="ml-bar-fill" style={{ width: `${m.precision * 100}%`, background: "#a78bfa" }} /></div>
-                    <span className="ml-bar-val">{(m.precision * 100).toFixed(1)}%</span>
-                  </div>
-                  <div className="ml-bar-row">
-                    <span className="ml-bar-lbl">Recall</span>
-                    <div className="ml-bar-track"><div className="ml-bar-fill" style={{ width: `${m.recall * 100}%`, background: "#38bdf8" }} /></div>
-                    <span className="ml-bar-val">{(m.recall * 100).toFixed(1)}%</span>
-                  </div>
+                  <span className={`ml-model-st ${m.status === "loaded" ? "on" : "off"}`}>{m.status}</span>
                 </div>
                 <div className="ml-model-ft">
-                  <span className="ml-chip">⚡ {m.latency_ms} ms avg</span>
-                  <span className="ml-chip g">● {m.status}</span>
+                  <span className="ml-chip">{m.buckets.toLocaleString()} feature buckets</span>
+                  <span className="ml-chip">{m.metrics_note}</span>
                 </div>
               </motion.div>
             ))}
@@ -187,8 +170,13 @@ export default function MLPage() {
               <table className="ml-tbl">
                 <thead><tr><th>Metric</th><th>Today</th><th>Status</th></tr></thead>
                 <tbody>
-                  <tr><td>True Positives</td><td className="g">{stats.true_positives_today.toLocaleString()}</td><td><span className="ml-tag g">GOOD</span></td></tr>
-                  <tr><td>False Positives</td><td className="a">{stats.false_positives_today.toLocaleString()}</td><td><span className="ml-tag a">{stats.false_positives_today > 5 ? "REVIEW" : "OK"}</span></td></tr>
+                  {/*
+                    "True Positives" and "False Positives" rows removed. TP was the
+                    raw anomaly count relabelled as correct; FP was anomalies x the
+                    hardcoded 0.003. Neither is knowable without triaged ground
+                    truth, and presenting them in a table headed "Today" made them
+                    look like a daily measurement.
+                  */}
                   <tr><td>Anomalies Detected</td><td className="r">{stats.anomalies_detected.toLocaleString()}</td><td><span className={`ml-tag ${stats.anomalies_detected > 100 ? "r" : "a"}`}>{stats.anomalies_detected > 100 ? "HIGH" : "NORMAL"}</span></td></tr>
                   <tr><td>Block Rate</td><td style={{ color: "#a78bfa" }}>{stats.block_rate.toFixed(2)}%</td><td><span className="ml-tag p">INFO</span></td></tr>
                 </tbody>

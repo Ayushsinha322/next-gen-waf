@@ -52,9 +52,26 @@ pub fn optimize(file: &RuleFile) -> OptimizationHints {
 }
 
 /// Build an Aho-Corasick automaton from a word list.
+///
+/// CASE-INSENSITIVE, matching ModSecurity's `@pm` / `@pmFromFile` semantics.
+///
+/// This was `false`, and the consequence was severe and silent. CRS ships word
+/// lists whose entries are written in their natural casing — `Invoke-Expression`,
+/// `Add-Computer`, `Net.WebClient` — and matches them against input that rules do
+/// NOT lowercase first. With case-sensitive matching, rule 932120's 421-entry
+/// PowerShell list was ~99.8% dead: 420 of its 421 entries contain an uppercase
+/// character, so `IEX(New-Object Net.WebClient).DownloadString(...)` scored zero.
+///
+/// A fix for this was written and committed (7d17fe7, "@pm / @pmFromFile made
+/// case-INSENSITIVE") — but it was applied to `patterns::PatternRegistry::ac_set`,
+/// which had no callers anywhere in the workspace. The live path is here, and it
+/// kept the old behaviour. The dead module has since been deleted so the fix
+/// cannot land in the wrong place again.
+///
+/// Guarded by `tests/pm_case_insensitive.rs`.
 pub fn build_ac(words: &[String]) -> anyhow::Result<AhoCorasick> {
     AhoCorasickBuilder::new()
-        .ascii_case_insensitive(false)
+        .ascii_case_insensitive(true)
         .build(words)
         .map_err(|e| anyhow::anyhow!("AhoCorasick build error: {}", e))
 }

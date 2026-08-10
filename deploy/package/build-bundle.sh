@@ -36,6 +36,16 @@ VERSION="${1:-$(cat VERSION 2>/dev/null || echo 0.0.0)}"
 PRODUCT="ESDSWAF"
 BUNDLE_THIRD_PARTY="${BUNDLE_THIRD_PARTY:-0}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
+# STAGE_ONLY=1 lays out the customer tree and stops — no image build, no
+# `docker save`, no archive. It exists so CI can validate the BUNDLE CONTRACT
+# (that every path the installers, compose overlays and helper scripts reference
+# is actually staged) on a runner with no Docker and no 15-minute Rust build.
+#
+# Every fatal packaging bug found on 2026-08-08 — install-2vm.sh resolving a
+# repo-only ../docker path, pg-init-replication.sh staged where the compose
+# overlay could not bind-mount it, fpr-report.sh referenced but never shipped —
+# was a contract violation visible in the staged tree alone. None needed an image.
+STAGE_ONLY="${STAGE_ONLY:-0}"
 
 # The extracted DIRECTORY keeps the plain name, so `cd ESDSWAF-v<version>` is the
 # same instruction for both variants. Only the ARCHIVE carries the suffix.
@@ -75,14 +85,18 @@ ok()   { printf '  %s✓%s %s\n' "$G" "$R" "$*"; }
 warn() { printf '  %s!%s %s\n' "$Y" "$R" "$*"; }
 die()  { printf '\n  %s✗ %s%s\n\n' $'\e[91m' "$*" "$R" >&2; exit 1; }
 
-command -v docker >/dev/null 2>&1 || die "docker is required"
-docker compose version >/dev/null 2>&1 || die "the docker compose plugin is required"
+if [[ "$STAGE_ONLY" != "1" ]]; then
+  command -v docker >/dev/null 2>&1 || die "docker is required"
+  docker compose version >/dev/null 2>&1 || die "the docker compose plugin is required"
+fi
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "version must be MAJOR.MINOR.PATCH, got '$VERSION'"
 
 step "Building ${PRODUCT} v${VERSION}"
 
 # ── 1. build the four images at the version tag ──────────────────────────────
-if [[ "$SKIP_BUILD" == "1" ]]; then
+if [[ "$STAGE_ONLY" == "1" ]]; then
+  warn "STAGE_ONLY=1 — laying out the tree only; no images, no archive"
+elif [[ "$SKIP_BUILD" == "1" ]]; then
   warn "SKIP_BUILD=1 — reusing local images (only for iterating on this script)"
 else
   step "Step 1 of 6 — building images (this is the slow part: Rust release + LTO)"
@@ -102,10 +116,12 @@ else
 fi
 
 # Fail loudly rather than shipping a bundle with a missing or stale image.
-for svc in "${OWN_IMAGES[@]}"; do
-  docker image inspect "sentinel/${svc}:${VERSION}" >/dev/null 2>&1 \
-    || die "sentinel/${svc}:${VERSION} not present — build did not produce it"
-done
+if [[ "$STAGE_ONLY" != "1" ]]; then
+  for svc in "${OWN_IMAGES[@]}"; do
+    docker image inspect "sentinel/${svc}:${VERSION}" >/dev/null 2>&1 \
+      || die "sentinel/${svc}:${VERSION} not present — build did not produce it"
+  done
+fi
 
 # ── 2. stage the tree ────────────────────────────────────────────────────────
 step "Step 2 of 6 — staging the customer tree"
@@ -182,8 +198,16 @@ if [[ "$BUNDLE_THIRD_PARTY" == "1" ]]; then
     EXPORT+=("$img")
   done
 fi
-docker save "${EXPORT[@]}" | gzip -6 > "$STAGE/bundle/images.tar.gz"
-ok "images.tar.gz — $(du -h "$STAGE/bundle/images.tar.gz" | cut -f1) ($(printf '%s\n' "${EXPORT[@]}" | wc -l) images)"
+if [[ "$STAGE_ONLY" == "1" ]]; then
+  # A placeholder keeps the tree SHAPE identical so the contract check sees the
+  # same layout a real bundle has. It is never shipped: STAGE_ONLY stops before
+  # the archive is built.
+  : > "$STAGE/bundle/images.tar.gz"
+  ok "images.tar.gz — placeholder (STAGE_ONLY)"
+else
+  docker save "${EXPORT[@]}" | gzip -6 > "$STAGE/bundle/images.tar.gz"
+  ok "images.tar.gz — $(du -h "$STAGE/bundle/images.tar.gz" | cut -f1) ($(printf '%s\n' "${EXPORT[@]}" | wc -l) images)"
+fi
 
 # ── 4. manifest ──────────────────────────────────────────────────────────────
 step "Step 4 of 6 — manifest"
@@ -197,8 +221,10 @@ step "Step 4 of 6 — manifest"
   printf '  "bundled_images": [\n'
   local_first=1
   for svc in "${OWN_IMAGES[@]}"; do
-    id=$(docker image inspect "sentinel/${svc}:${VERSION}" --format '{{.Id}}' 2>/dev/null || echo unknown)
-    sz=$(docker image inspect "sentinel/${svc}:${VERSION}" --format '{{.Size}}' 2>/dev/null || echo 0)
+    if [[ "$STAGE_ONLY" == "1" ]]; then id="stage-only"; sz=0; else
+      id=$(docker image inspect "sentinel/${svc}:${VERSION}" --format '{{.Id}}' 2>/dev/null || echo unknown)
+      sz=$(docker image inspect "sentinel/${svc}:${VERSION}" --format '{{.Size}}' 2>/dev/null || echo 0)
+    fi
     [[ $local_first -eq 1 ]] && local_first=0 || printf ',\n'
     printf '    { "repository": "sentinel/%s", "tag": "%s", "id": "%s", "size_bytes": %s }' \
       "$svc" "$VERSION" "$id" "$sz"
@@ -216,9 +242,22 @@ step "Step 4 of 6 — manifest"
   printf '  "minimum_hardware": { "vcpu": 4, "ram_gb": 16, "disk_gb": 100 }\n'
   printf '}\n'
 } > "$STAGE/bundle/manifest.json"
-python3 -c "import json,sys; json.load(open('$STAGE/bundle/manifest.json'))" \
-  || die "manifest.json is not valid JSON"
-ok "manifest.json"
+# Validate with the SAME line-oriented parser install.sh uses, not python3.
+#
+# Two reasons. First, python3 is absent from minimal images — this line failed the
+# CI job on alpine, and it is the identical dependency that made install.sh read a
+# literal "unknown" version on Ubuntu images without python3. Second, and more
+# usefully: `json.load` proves the file is valid JSON, which is NOT the property
+# that matters here. What matters is that install.sh's sed parser can read the
+# keys it needs. A manifest can be perfectly valid JSON and still be unreadable by
+# the installer if it is reformatted onto one line. Validate the real contract.
+_mv=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$STAGE/bundle/manifest.json" | head -1)
+_mi=$(sed -n 's/.*"requires_internet"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p' "$STAGE/bundle/manifest.json" | head -1)
+[[ "$_mv" == "$VERSION" ]] \
+  || die "manifest.json: install.sh's parser reads version '$_mv', expected '$VERSION'"
+[[ -n "$_mi" ]] \
+  || die "manifest.json: install.sh's parser cannot read requires_internet — offline detection would break"
+ok "manifest.json (readable by the installer's own parser)"
 
 # ── 5. checksums over EVERYTHING, not just the image tarball ─────────────────
 step "Step 5 of 6 — checksums"
@@ -242,6 +281,11 @@ done
 # Re-checksum: the installer files were added after the first pass.
 ( cd "$STAGE" && find . -type f ! -name SHA256SUMS -print0 \
     | sort -z | xargs -0 sha256sum > SHA256SUMS )
+
+if [[ "$STAGE_ONLY" == "1" ]]; then
+  ok "staged tree ready at $STAGE (STAGE_ONLY — no archive built)"
+  exit 0
+fi
 
 mkdir -p dist
 tar -czf "$ARCHIVE" -C dist "$(basename "$STAGE")"

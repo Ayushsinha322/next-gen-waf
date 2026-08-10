@@ -21,6 +21,18 @@ x-wafnode: &wafnode
   image: ${SENTINEL_IMAGE_PREFIX:-sentinel}/dataplane:${SENTINEL_VERSION:-latest}
   restart: unless-stopped
   user: "0:0"
+  # File descriptors — see the longer note on the `dataplane` service in
+  # compose.prod.yml. Every node here accepts up to max_connections (default
+  # 10,000) and needs a second descriptor per proxied connection, so saturation
+  # wants 20,000+.
+  #
+  # This anchor had NO ulimits, so the fix applied to compose.prod.yml's single
+  # `dataplane` service never reached waf1/waf2/waf3 — i.e. it was missing from
+  # precisely the multi-node topology most likely to carry concurrent load. On a
+  # host whose Docker default is the traditional 1024, accept(2) starts returning
+  # EMFILE at roughly 500 concurrent connections per node.
+  ulimits:
+    nofile: { soft: 65536, hard: 65536 }
   depends_on:
     controlplane: { condition: service_started }
     redis: { condition: service_healthy }

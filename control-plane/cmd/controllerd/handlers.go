@@ -2484,7 +2484,27 @@ func handleTestRule(c *gin.Context, enf *rbac.Enforcer) {
 // ML Stats
 // ---------------------------------------------------------------------------
 
-func handleMLStats(c *gin.Context, hub *logs.Hub) {
+// handleMLStats reports what is MEASURED about the classifier, and explicitly
+// reports that quality metrics are not measured rather than inventing them.
+//
+// This endpoint previously returned hardcoded literals — precision 0.953, recall
+// 0.891, fp_rate 0.003 — plus three "Active Models" with invented versions,
+// per-model precision/recall, latencies and last_updated dates. The dashboard
+// rendered them as live gauges labelled "True positives / (TP + FP)", refreshed
+// every 5 seconds, so they read as measurement. Two of the three models did not
+// exist in any form: ml-models/bot-classifier and ml-models/anomaly are empty
+// directories. `true_positives_today` was set to the raw ML anomaly count, which
+// asserts every ML detection was correct — the precise claim nobody can make
+// without ground truth.
+//
+// Precision, recall and false-positive rate CANNOT be computed here, and the
+// reason is structural, not a missing feature: they require labelled ground truth
+// — knowing which requests were genuinely attacks. The product does not have that
+// and cannot until the learning-mode pilot produces triaged real traffic (see
+// deploy/LEARNING-MODE-PILOT.md and scripts/fpr-report.sh). Until then the honest
+// answer is "not measured", and a WAF that fabricates its own accuracy figures is
+// worse than one that admits it has not measured them.
+func handleMLStats(c *gin.Context, hub *logs.Hub, store *db.Store) {
 	snap := hub.GetSnapshot()
 	total := snap.TotalRequests
 	blocked := snap.BlockedRequests
@@ -2494,26 +2514,70 @@ func handleMLStats(c *gin.Context, hub *logs.Hub) {
 	if total > 0 {
 		blockRate = float64(blocked) / float64(total) * 100
 	}
-	fpRate := 0.0
-	if ml > 10 {
-		fpRate = 0.003
+
+	// model_status used to be the constant string "active". That was doubly
+	// wrong: it asserted a state nobody checked, and the state it asserted is
+	// false by default — the Rust config defaults ml.enable to false and the site
+	// wizard creates sites with ML off, so a stock install runs rules-only.
+	// Report the real enablement count instead, which is both true and the thing
+	// an operator actually needs to know.
+	mlSites, totalSites := 0, 0
+	if store != nil {
+		if claims, ok := auth.GetClaims(c.Request.Context()); ok {
+			if sites, err := store.ListSites(c.Request.Context(), claims.TenantID, claims.UserID); err == nil {
+				totalSites = len(sites)
+				for _, s := range sites {
+					var p struct {
+						ML struct {
+							Enable bool `json:"enable"`
+						} `json:"ml"`
+					}
+					if json.Unmarshal(s.WafPolicy, &p) == nil && p.ML.Enable {
+						mlSites++
+					}
+				}
+			}
+		}
+	}
+	modelStatus := "disabled on all sites"
+	switch {
+	case totalSites == 0:
+		modelStatus = "no sites configured"
+	case mlSites == totalSites:
+		modelStatus = "enabled"
+	case mlSites > 0:
+		modelStatus = fmt.Sprintf("enabled on %d of %d sites", mlSites, totalSites)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"precision":          0.953,
-		"recall":             0.891,
-		"fp_rate":            fpRate,
+		// ── Measured. These come from the live hub snapshot. ──
 		"total_analyzed":     total,
 		"anomalies_detected": ml,
 		"block_rate":         blockRate,
-		"model_status":       "active",
+
+		// ── Real enablement state, derived from stored site policy. ──
+		"model_status":     modelStatus,
+		"ml_enabled_sites": mlSites,
+		"total_sites":      totalSites,
+
+		// ── Not measured, and why. The dashboard renders this instead of gauges. ──
+		"quality_measured": false,
+		"quality_note": "Precision, recall and false-positive rate require labelled ground truth " +
+			"and have not been measured on this deployment. Run a learning-mode pilot on real " +
+			"traffic, then scripts/fpr-report.sh, to obtain them.",
+
+		// ── The one classifier that actually ships. ──
+		// Reported without accuracy figures on purpose: the model file carries
+		// architecture and weights, not quality metrics.
 		"models": []gin.H{
-			{"name": "payload-classifier", "version": "2.1.0", "precision": 0.953, "recall": 0.891, "status": "active", "latency_ms": 1.4, "last_updated": "2025-05-10"},
-			{"name": "anomaly-detector", "version": "1.8.0", "precision": 0.921, "recall": 0.874, "status": "active", "latency_ms": 0.8, "last_updated": "2025-05-08"},
-			{"name": "bot-classifier", "version": "1.5.2", "precision": 0.967, "recall": 0.843, "status": "active", "latency_ms": 0.6, "last_updated": "2025-05-12"},
+			{
+				"name":         "payload-ngram",
+				"kind":         "hashed char n-gram logistic regression",
+				"buckets":      32768,
+				"status":       "loaded",
+				"metrics_note": "accuracy not measured on this deployment",
+			},
 		},
-		"false_positives_today": int64(float64(ml) * fpRate),
-		"true_positives_today":  ml,
 	})
 }
 

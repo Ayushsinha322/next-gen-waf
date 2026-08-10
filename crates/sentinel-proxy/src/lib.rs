@@ -493,6 +493,74 @@ impl Drop for ActiveConnGuard {
     }
 }
 
+// ---------------------------------------------------------------------------
+// accept(2) failure handling
+// ---------------------------------------------------------------------------
+
+/// Smallest pause after a resource-exhaustion accept failure.
+const ACCEPT_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_millis(10);
+/// Ceiling for the pause. One second is long enough to stop a hot spin and short
+/// enough that the listener recovers promptly once descriptors free up.
+const ACCEPT_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// What an `accept()` error means for the listener as a whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AcceptRecovery {
+    /// One connection failed; the listener is healthy. Continue immediately.
+    Retry,
+    /// The process is out of a resource (descriptors, buffers). Continuing
+    /// immediately would busy-spin, because the listening socket stays readable
+    /// until the resource frees. Pause, then continue.
+    Backoff,
+    /// The listening socket itself is unusable. Nothing will improve by retrying.
+    Fatal,
+}
+
+/// Classify an `accept()` error.
+///
+/// The bias here is deliberately toward SURVIVING. An unrecognised error is
+/// treated as `Backoff`, not `Fatal`: an unknown errno that we pause and retry on
+/// costs a few milliseconds if it really was fatal, whereas an unknown errno that
+/// we exit on takes the WAF off the network. Only errors that mean the listening
+/// descriptor is definitively broken are fatal.
+pub(crate) fn classify_accept_error(e: &std::io::Error) -> AcceptRecovery {
+    use std::io::ErrorKind;
+
+    // Per-connection failures: the peer went away between SYN and accept, or the
+    // call was interrupted. The listener is fine.
+    match e.kind() {
+        ErrorKind::ConnectionAborted
+        | ErrorKind::ConnectionReset
+        | ErrorKind::ConnectionRefused
+        | ErrorKind::Interrupted
+        | ErrorKind::NotConnected
+        | ErrorKind::BrokenPipe
+        | ErrorKind::TimedOut
+        | ErrorKind::WouldBlock => return AcceptRecovery::Retry,
+        ErrorKind::OutOfMemory => return AcceptRecovery::Backoff,
+        _ => {}
+    }
+
+    // Rust maps descriptor exhaustion to ErrorKind::Uncategorized, which is not
+    // matchable on stable, so go to the errno.
+    match e.raw_os_error() {
+        // Out of file descriptors, process-wide or system-wide; out of kernel
+        // buffers or memory. All transient, all recoverable, all must NOT spin.
+        Some(libc::EMFILE) | Some(libc::ENFILE) | Some(libc::ENOBUFS) | Some(libc::ENOMEM) => {
+            AcceptRecovery::Backoff
+        }
+
+        // The listening descriptor is gone, is not a socket, or is misconfigured.
+        // Retrying cannot fix any of these.
+        Some(libc::EBADF) | Some(libc::ENOTSOCK) | Some(libc::EINVAL) => AcceptRecovery::Fatal,
+
+        // Everything else — including protocol-level errors that some kernels
+        // surface here (EPROTO, EHOSTDOWN, ENETDOWN, ENONET) — is treated as
+        // transient. See the doc comment on why the default is to survive.
+        _ => AcceptRecovery::Backoff,
+    }
+}
+
 /// Upstreams the dedicated management listener reverse-proxies to. The admin
 /// console is served by the WAF's own engine (no third-party proxy): requests
 /// to `/api/*` go to the control plane, everything else to the dashboard.
@@ -1947,10 +2015,61 @@ async fn serve_listener(
         None
     };
 
+    // Grows on consecutive resource-exhaustion failures, resets on any successful
+    // accept, so a transient descriptor shortage does not leave the listener slow
+    // once it clears.
+    let mut accept_backoff = ACCEPT_BACKOFF_MIN;
+
     loop {
         tokio::select! {
             accept = tcp.accept() => {
-                let (stream, peer) = accept?;
+                // An accept() error must not kill the listener.
+                //
+                // This was `let (stream, peer) = accept?;` — a single error of any
+                // kind propagated out of the loop and the listener was gone for the
+                // life of the process. The supervising task only logged it, so the
+                // WAF stopped accepting traffic while every health check that looks
+                // at process liveness still reported healthy.
+                //
+                // The errors that reach here are overwhelmingly NOT fatal:
+                //   * ECONNABORTED — the client sent RST between SYN and accept.
+                //     Entirely routine on a public listener; a port scan produces
+                //     a stream of them, so this alone was a remote listener kill.
+                //   * EMFILE / ENFILE — out of file descriptors. Reachable at the
+                //     default max_connections of 10,000 against a container that
+                //     sets no nofile limit.
+                //   * ENOBUFS / ENOMEM — transient kernel memory pressure.
+                //
+                // Retrying EMFILE immediately would spin a core at 100%: the
+                // listening socket stays readable, so the loop would busy-wait
+                // until a descriptor frees. Hence backoff on resource exhaustion,
+                // reset on the next successful accept.
+                let (stream, peer) = match accept {
+                    Ok(pair) => {
+                        accept_backoff = ACCEPT_BACKOFF_MIN;
+                        pair
+                    }
+                    Err(e) => match classify_accept_error(&e) {
+                        AcceptRecovery::Retry => {
+                            debug!(listener = %cfg.name, error = %e,
+                                   "accept failed for one connection; listener continues");
+                            continue;
+                        }
+                        AcceptRecovery::Backoff => {
+                            warn!(listener = %cfg.name, error = %e,
+                                  backoff_ms = accept_backoff.as_millis() as u64,
+                                  "accept failed due to resource exhaustion; backing off");
+                            tokio::time::sleep(accept_backoff).await;
+                            accept_backoff = (accept_backoff * 2).min(ACCEPT_BACKOFF_MAX);
+                            continue;
+                        }
+                        AcceptRecovery::Fatal => {
+                            error!(listener = %cfg.name, error = %e,
+                                   "listening socket is unusable; listener stopping");
+                            return Err(e.into());
+                        }
+                    },
+                };
                 // Connection admission control: acquire a permit from the global
                 // connection semaphore *before* spawning a task. When the box is
                 // at `max_connections`, the permit is unavailable and the freshly
@@ -8407,5 +8526,115 @@ mod nonrule_block_classification_tests {
             classify_nonrule_block("something nobody has classified yet").0,
             "ANOMALY"
         );
+    }
+}
+
+#[cfg(test)]
+mod accept_error_tests {
+    use super::*;
+    use std::io::{Error, ErrorKind};
+
+    fn errno(code: i32) -> Error {
+        Error::from_raw_os_error(code)
+    }
+
+    /// The listener used to die on the FIRST accept() error of any kind, because
+    /// the loop did `let (stream, peer) = accept?;`. ECONNABORTED is the one that
+    /// makes that a remote denial of service rather than a rare accident: it is
+    /// what the kernel returns when a client sends RST between SYN and accept, so
+    /// an ordinary port scan produced a stream of them. Anyone who could reach the
+    /// WAF could take its listener off the network, while the process stayed alive
+    /// and every liveness check kept reporting healthy.
+    #[test]
+    fn routine_peer_failures_never_kill_the_listener() {
+        for kind in [
+            ErrorKind::ConnectionAborted,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionRefused,
+            ErrorKind::Interrupted,
+            ErrorKind::NotConnected,
+            ErrorKind::BrokenPipe,
+            ErrorKind::TimedOut,
+            ErrorKind::WouldBlock,
+        ] {
+            assert_eq!(
+                classify_accept_error(&Error::new(kind, "test")),
+                AcceptRecovery::Retry,
+                "{kind:?} is a per-connection failure and must not stop the listener"
+            );
+        }
+        // The same thing arriving as a raw errno rather than a typed ErrorKind.
+        assert_eq!(
+            classify_accept_error(&errno(libc::ECONNABORTED)),
+            AcceptRecovery::Retry,
+            "ECONNABORTED by errno must also be per-connection"
+        );
+    }
+
+    /// Descriptor exhaustion must back off rather than retry hot. The listening
+    /// socket stays readable while there are no descriptors to accept onto, so a
+    /// bare `continue` here burns a core at 100% until the pressure clears —
+    /// turning a capacity problem into a CPU outage. Reachable in the shipped
+    /// configuration: max_connections defaults to 10,000 and the dataplane
+    /// container sets no nofile limit.
+    #[test]
+    fn resource_exhaustion_backs_off_instead_of_spinning() {
+        for code in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+            assert_eq!(
+                classify_accept_error(&errno(code)),
+                AcceptRecovery::Backoff,
+                "errno {code} is transient resource exhaustion: pause, do not spin, do not exit"
+            );
+        }
+        assert_eq!(
+            classify_accept_error(&Error::new(ErrorKind::OutOfMemory, "test")),
+            AcceptRecovery::Backoff
+        );
+    }
+
+    /// Only a genuinely unusable listening descriptor is fatal.
+    #[test]
+    fn a_broken_listening_socket_is_fatal() {
+        for code in [libc::EBADF, libc::ENOTSOCK, libc::EINVAL] {
+            assert_eq!(
+                classify_accept_error(&errno(code)),
+                AcceptRecovery::Fatal,
+                "errno {code} means the listening socket cannot work; retrying is pointless"
+            );
+        }
+    }
+
+    /// The default must be to SURVIVE. An unknown errno we pause on costs
+    /// milliseconds if it really was unrecoverable; an unknown errno we exit on
+    /// takes the WAF off the network. Kernels differ in what they surface from
+    /// accept(), so this bias is load-bearing, not decorative.
+    #[test]
+    fn unknown_errors_survive_rather_than_kill_the_listener() {
+        for code in [libc::EPROTO, libc::ENETDOWN, libc::EHOSTDOWN, 424_242] {
+            assert_ne!(
+                classify_accept_error(&errno(code)),
+                AcceptRecovery::Fatal,
+                "errno {code} is not known-fatal, so it must not stop the listener"
+            );
+        }
+    }
+
+    /// Backoff must be bounded on both ends: long enough to stop a hot spin,
+    /// short enough that the listener recovers promptly once descriptors free.
+    #[test]
+    fn backoff_bounds_are_sane() {
+        assert!(ACCEPT_BACKOFF_MIN >= std::time::Duration::from_millis(1));
+        assert!(ACCEPT_BACKOFF_MIN < ACCEPT_BACKOFF_MAX);
+        assert!(ACCEPT_BACKOFF_MAX <= std::time::Duration::from_secs(5));
+
+        // Doubling from MIN must reach MAX in a small number of steps — the loop
+        // caps with .min(MAX), so this just pins the growth curve.
+        let mut d = ACCEPT_BACKOFF_MIN;
+        let mut steps = 0;
+        while d < ACCEPT_BACKOFF_MAX {
+            d = (d * 2).min(ACCEPT_BACKOFF_MAX);
+            steps += 1;
+            assert!(steps < 16, "backoff should reach its ceiling quickly");
+        }
     }
 }
