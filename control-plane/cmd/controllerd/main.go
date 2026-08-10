@@ -529,7 +529,7 @@ func run() error {
 		protected.POST("/rules/test", func(c *gin.Context) { handleTestRule(c, enforcer) })
 		protected.GET("/ml/stats", func(c *gin.Context) {
 			if requirePerm(c, enforcer, rbac.ResourceSite, rbac.ActionList) {
-				handleMLStats(c, hub)
+				handleMLStats(c, hub, store)
 			}
 		})
 		protected.GET("/traffic/history", func(c *gin.Context) {

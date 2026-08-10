@@ -470,26 +470,31 @@ export interface RuleExclusion {
 }
 
 export interface MLModel {
-  name:         string;
-  version:      string;
-  precision:    number;
-  recall:       number;
-  status:       string;
-  latency_ms:   number;
-  last_updated: string;
+  name:          string;
+  kind:          string;
+  buckets:       number;
+  status:        string;
+  metrics_note:  string;
 }
 
+// Deliberately carries NO precision/recall/fp_rate/true_positives fields.
+//
+// The API used to return them as hardcoded literals (0.953/0.891/0.003) with
+// three invented models, and this page rendered them as live gauges. They are
+// not computable without labelled ground truth, so the contract now reports
+// `quality_measured: false` and the UI says so instead of drawing a number.
 export interface MLStats {
-  precision:             number;
-  recall:                number;
-  fp_rate:               number;
-  total_analyzed:        number;
-  anomalies_detected:    number;
-  block_rate:            number;
-  model_status:          string;
-  models:                MLModel[];
-  false_positives_today: number;
-  true_positives_today:  number;
+  total_analyzed:      number;
+  anomalies_detected:  number;
+  block_rate:          number;
+  // Real enablement state ("enabled", "disabled on all sites",
+  // "enabled on N of M sites", "no sites configured") — not the old constant "active".
+  model_status:        string;
+  ml_enabled_sites:    number;
+  total_sites:         number;
+  quality_measured:    boolean;
+  quality_note:        string;
+  models:              MLModel[];
 }
 
 export interface UserRow {

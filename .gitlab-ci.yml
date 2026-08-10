@@ -71,6 +71,48 @@ dashboard:
     - npm run lint || true     # advisory only (style); does not gate
     - npm run build            # production build must succeed
 
+# ── Deploy / operational shell ───────────────────────────────────────────────
+# GATING. Until now the entire operational surface — installer, upgrade, rollback,
+# backup, restore, drill, the 2VM HA installer, ~5,200 lines of shell that runs as
+# root on customer machines — was never linted, never syntax-checked and never
+# executed by any pipeline. An audit on 2026-08-08 found 54 defects in it, 9 fatal,
+# with CI green throughout. CI was green because it was not looking.
+#
+# Two things run here, in increasing order of value:
+#   1. syntax + shellcheck — catches the mechanical class (unquoted expansions,
+#      subshell variable loss, the `cmd | tail` exit-code trap).
+#   2. the BUNDLE CONTRACT check — stages the real customer tree with no Docker
+#      and asserts every path the shipped scripts and compose overlays reference
+#      actually exists. Every fatal packaging bug from that audit was visible in
+#      the staged tree alone; this job would have caught all of them.
+deploy-shell:
+  stage: test
+  image: alpine:3.20
+  tags:
+    - k8s-docker
+  before_script:
+    - apk add --no-cache bash shellcheck git coreutils findutils grep sed
+  script:
+    # 1. Every shell file must parse. Cheap, absolute, no exceptions.
+    - |
+      bash -c '
+      set -e
+      fail=0
+      while read -r f; do
+        bash -n "$f" || { echo "SYNTAX ERROR: $f"; fail=1; }
+      done < <(find deploy -name "*.sh" -type f)
+      [ $fail -eq 0 ] || exit 1
+      echo "all deploy shell parses"'
+    # 2. shellcheck. GATES on errors; warnings are reported but advisory, because
+    #    this is a large pre-existing body of shell and a wall of style warnings
+    #    on day one would just get the job disabled. Tighten to -S warning once
+    #    the backlog is worked down.
+    - shellcheck -S error $(find deploy -name '*.sh' -type f) || exit 1
+    - shellcheck -S warning $(find deploy -name '*.sh' -type f) || true
+    # 3. The contract check — the one that catches shipping-breaking bugs.
+    - STAGE_ONLY=1 ./deploy/package/build-bundle.sh
+    - ./deploy/ci/check-bundle-contract.sh
+
 # ── Secret scanning ──────────────────────────────────────────────────────────
 # GitLab ships native secret detection; enable it instead of the gitleaks action.
 include:
