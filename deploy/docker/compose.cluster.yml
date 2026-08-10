@@ -49,7 +49,13 @@ x-cp-env: &cp-env
   SENTINEL_REST_ADDR: 0.0.0.0:9501
   SENTINEL_AUTOSTART_DATAPLANE: "0"
   SENTINEL_LOG_DIR: /var/log/sentinel
-  SENTINEL_CORS_ORIGINS: http://172.16.21.71:3000,https://172.16.21.71:9443
+  # Same fix as compose.prod.yml: this read `http://172.16.21.71:3000,
+  # https://172.16.21.71:9443` — one developer's VM address, shipped to every
+  # customer. Anywhere but that box it allow-listed a host that does not exist
+  # while OVERRIDING the built-in defaults, since a non-empty value replaces them
+  # wholesale. Missed on the first pass because compose.prod.yml was fixed and
+  # this overlay was not; grep the whole deploy/ tree, not one file.
+  SENTINEL_CORS_ORIGINS: ${SENTINEL_CORS_ORIGINS:-https://127.0.0.1:9443,http://127.0.0.1:3000}
   SENTINEL_DATAPLANE_URL: http://dataplane:8080
   SENTINEL_ROOT_CA_PATH: /etc/sentinel/root-ca.crt
   # Disk-pressure alert: page the SOC when ClickHouse disk crosses this used-%.
