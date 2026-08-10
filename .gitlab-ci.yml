@@ -58,11 +58,33 @@ stages:
     # Incremental artifacts are large and worthless in CI: every job starts from
     # a restored cache and never rebuilds the same crate twice in one run.
     CARGO_INCREMENTAL: "0"
+  # CACHE ONLY .cargo/, NOT target/.
+  #
+  # The key is bumped to v2, which is how you clear a GitLab runner cache from the
+  # repository — a new key means the old archive is simply never restored. (The
+  # "Clear runner caches" button in the UI does the same thing by incrementing an
+  # internal cache index; there is no API v4 endpoint for it.)
+  #
+  # Dropping target/ is the substantive change. It was 13 GB, and that is the
+  # archive behind both of today's scheduling failures:
+  #
+  #   * restoring it consumed the node's ephemeral storage before a compiler ran
+  #   * the PersistentVolume holding it is pinned to one node, producing
+  #     "1 node(s) had volume node affinity conflict" — no pod could schedule at
+  #     all, which is why even secret_detection failed
+  #
+  # .cargo/ stays: 347 MB, and it saves re-downloading every crate from the
+  # registry, which is the part of a cold build that depends on the network rather
+  # than the CPU.
+  #
+  # The cost is honest: every Rust job now compiles from scratch. rust-lint took
+  # 3305s that way and finished well inside its 2h timeout. A cache that cannot be
+  # restored without evicting the pod is not saving time anyway — it was costing
+  # the entire pipeline.
   cache:
-    key: "rust-$CI_COMMIT_REF_SLUG"
+    key: "rust-v2-$CI_COMMIT_REF_SLUG"
     paths:
       - .cargo/
-      - target/
 
 # Three Rust jobs, each ONE workspace compilation, run one at a time (see the
 # stages block at the top of this file for why they must not overlap).
