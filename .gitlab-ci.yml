@@ -60,22 +60,46 @@ stages:
       - .cargo/
       - target/
 
-rust-check:
+# Three Rust jobs, not one. Each is ONE workspace compilation.
+#
+# The original single `rust` job did fmt + clippy --all-targets + test + release
+# build: four passes, and it hit the runner's 3600s cap. Splitting it in two left
+# `rust-check` still doing clippy AND test — two full compilations of a 44k-line
+# workspace — and it timed out again at 3602s, mid-test-run.
+#
+# The disk fix in .rust-base was still worth it and did work: that run showed ZERO
+# ephemeral-storage warnings and zero evictions, where previously the pod was
+# killed outright. Storage and duration were two separate problems wearing the same
+# red X.
+#
+# An explicit `timeout` is set as well. Splitting should be sufficient on a warm
+# cache; the timeout is the margin for a cold one, so a first build on a new branch
+# does not fail for being honestly slow.
+rust-lint:
   <<: *rust-base
   stage: test
+  timeout: 2h
   before_script:
     - rustup component add rustfmt clippy
   script:
     - cargo fmt --all -- --check
     - cargo clippy --workspace --all-targets -- -D warnings
-    - cargo test --workspace
     # Surface the footprint so the next disk problem is diagnosable from the log
     # rather than from a Kubernetes eviction event.
     - du -sh target .cargo 2>/dev/null || true
 
+rust-test:
+  <<: *rust-base
+  stage: test
+  timeout: 2h
+  script:
+    - cargo test --workspace
+    - du -sh target 2>/dev/null || true
+
 rust-build:
   <<: *rust-base
   stage: build
+  timeout: 2h
   script:
     - cargo build --workspace --release
     - du -sh target 2>/dev/null || true
