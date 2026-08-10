@@ -7,7 +7,19 @@ stages:
   - security
 
 # ── Rust data plane ──────────────────────────────────────────────────────────
-rust:
+# SPLIT INTO TWO JOBS, deliberately.
+#
+# This was one `rust` job running fmt + clippy --all-targets + test --workspace +
+# build --release — effectively three full compilations of a 44k-line workspace
+# with LTO. It hit the runner's 3600s job cap and failed with
+# job_execution_timeout, which reads as a red pipeline caused by the code when it
+# is really the job being too big to fit.
+#
+# Splitting is better than raising the timeout: each half finishes well inside the
+# cap, they run in parallel, and a failure now says WHICH kind of failure it was —
+# a lint/test regression (rust-check) or a release-only compilation problem
+# (rust-build). They share a cache key, so the second job starts warm.
+rust-check:
   stage: test
   image: rust:1.85
   tags:
@@ -25,6 +37,20 @@ rust:
     - cargo fmt --all -- --check
     - cargo clippy --workspace --all-targets -- -D warnings
     - cargo test --workspace
+
+rust-build:
+  stage: build
+  image: rust:1.85
+  tags:
+    - k8s-docker
+  variables:
+    CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+  cache:
+    key: "rust-$CI_COMMIT_REF_SLUG"
+    paths:
+      - .cargo/
+      - target/
+  script:
     - cargo build --workspace --release
 
 # ── Go control plane ─────────────────────────────────────────────────────────
