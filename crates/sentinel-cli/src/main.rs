@@ -748,6 +748,10 @@ fn cmd_site_add(
             // Deployment default; per-site overrides come from the control plane.
             timeout_secs: None,
             websocket: false,
+            host_header: None,
+            keepalive: true,
+            connect_timeout_secs: None,
+            sni_name: None,
         },
         waf: WafConfig {
             mode: waf_mode.clone(),

@@ -407,6 +407,51 @@ pub struct UpstreamConfig {
     /// alternative default would silently re-open the hole on every legacy config.
     #[serde(default)]
     pub websocket: bool,
+    /// `Host` header to send to the origin, replacing the client's.  `None` or
+    /// empty passes the client's `Host` through, which is the default and what
+    /// most origins want.
+    ///
+    /// Set it for an origin that virtual-hosts on an internal name rather than
+    /// the public one. It affects ONLY the upstream request: site matching,
+    /// WAF evaluation and logging all continue to use the host the client sent,
+    /// so overriding this cannot move a request to a different site's policy.
+    #[serde(default)]
+    pub host_header: Option<String>,
+    /// Whether upstream connections may be pooled and reused between requests.
+    ///
+    /// Defaults to **true** — reuse is what a reverse proxy should do, and
+    /// disabling it means a fresh TCP (and TLS) handshake per request. Set it
+    /// false only for an origin that mishandles reused connections; the cost is
+    /// latency and TIME_WAIT pressure.
+    #[serde(default = "default_true")]
+    pub keepalive: bool,
+    /// How long TCP (plus TLS, for an HTTPS origin) may take to establish.
+    ///
+    /// `None` or `0` uses the deployment-wide default
+    /// (`SENTINEL_UPSTREAM_CONNECT_TIMEOUT_SECS`). This is a narrower bound than
+    /// [`Self::timeout_secs`], which covers connect *and* send *and* first byte:
+    /// a low connect timeout fails fast on an unreachable origin without
+    /// shortening the budget of one that is merely slow to answer.
+    ///
+    /// Connect timeout is a property of the connector, not of a request, so each
+    /// distinct value in use costs one additional connection pool on the node.
+    /// Values are clamped and de-duplicated for that reason.
+    #[serde(default)]
+    pub connect_timeout_secs: Option<u64>,
+    /// SNI server name to present to an HTTPS origin, when it must differ from
+    /// the address being connected to.
+    ///
+    /// `None` presents the upstream host, which is correct almost always. Two
+    /// cases need an override: an origin behind a shared load balancer that
+    /// selects certificate or vhost by SNI, and an origin addressed by bare IP —
+    /// TLS forbids an IP literal as a server name, so rustls sends **no SNI at
+    /// all** and such an origin answers with its default vhost or rejects the
+    /// handshake.
+    ///
+    /// Ignored for a plaintext origin (`tls: false`), where there is no
+    /// handshake to put a name in.
+    #[serde(default)]
+    pub sni_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]

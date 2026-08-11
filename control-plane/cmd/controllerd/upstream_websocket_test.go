@@ -96,7 +96,8 @@ func TestBuildRustUpstreamForwardsOnlyImplementedKeys(t *testing.T) {
 
 	implemented := map[string]bool{
 		"servers": true, "load_balancer": true, "health_check": true,
-		"timeout_secs": true, "websocket": true,
+		"timeout_secs": true, "websocket": true, "keepalive": true,
+		"host_header": true, "connect_timeout_secs": true, "sni_name": true,
 	}
 	for k := range up {
 		if !implemented[k] {
@@ -105,14 +106,121 @@ func TestBuildRustUpstreamForwardsOnlyImplementedKeys(t *testing.T) {
 		}
 	}
 
-	// And the inert ones must not have leaked through under their own names.
+	// Raw dashboard-side spellings must NOT leak through. The data plane reads
+	// `connect_timeout_secs` and `sni_name`; forwarding `connect_timeout` ("5s") or
+	// `ssl_sni_name` under their UI names would deserialize to nothing and be inert
+	// again, which is exactly the bug being closed.
 	for _, k := range []string{
-		"keepalive", "connect_timeout", "read_timeout",
-		"host_header", "ssl_sni", "ssl_sni_name", "proxy",
+		"connect_timeout", "read_timeout", "ssl_sni", "ssl_sni_name", "proxy",
 	} {
 		if _, present := up[k]; present {
-			t.Errorf("%q reached the data-plane config but nothing reads it — "+
-				"either implement it or leave it out", k)
+			t.Errorf("%q reached the data-plane config under its UI name, which "+
+				"nothing reads — translate it or leave it out", k)
 		}
+	}
+}
+
+// The four controls that used to be stored-and-dropped must now arrive, in the
+// spelling the Rust side deserializes.
+func TestBuildRustUpstreamCarriesTheFormerlyInertControls(t *testing.T) {
+	up, err := buildRustUpstream(json.RawMessage(`{
+		"servers":["10.0.0.5:8443"],
+		"connect_timeout_secs":5,
+		"proxy":{"keepalive":false,"host_header":"app.internal",
+		         "ssl_sni":true,"ssl_sni_name":"backend.example.com"}
+	}`))
+	if err != nil {
+		t.Fatalf("buildRustUpstream: %v", err)
+	}
+	for k, want := range map[string]any{
+		"keepalive":            false,
+		"host_header":          "app.internal",
+		"connect_timeout_secs": uint64(5),
+		"sni_name":             "backend.example.com",
+	} {
+		got, ok := up[k]
+		if !ok {
+			t.Errorf("%q was dropped — the data plane cannot honour it", k)
+			continue
+		}
+		if got != want {
+			t.Errorf("%s = %v (%T), want %v (%T)", k, got, got, want, want)
+		}
+	}
+}
+
+// Keep-alive defaults to TRUE when absent, unlike websocket. A legacy config that
+// never mentioned it was getting connection reuse; reading silence as "off" would
+// add a TCP+TLS handshake to every request on every existing site.
+func TestBuildRustUpstreamKeepaliveDefaultsOnForLegacyConfig(t *testing.T) {
+	for name, raw := range map[string]string{
+		"no proxy block": `{"servers":["10.0.0.5:8080"]}`,
+		"empty proxy":    `{"servers":["10.0.0.5:8080"],"proxy":{}}`,
+		"other keys":     `{"servers":["10.0.0.5:8080"],"proxy":{"websocket":true}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			up, err := buildRustUpstream(json.RawMessage(raw))
+			if err != nil {
+				t.Fatalf("buildRustUpstream: %v", err)
+			}
+			if up["keepalive"] != true {
+				t.Fatalf("keepalive = %v, want true for a config that never set it",
+					up["keepalive"])
+			}
+		})
+	}
+}
+
+// A blank host_header is "not set", not "send an empty Host" — some origins
+// reject an empty Host outright.
+func TestBuildRustUpstreamOmitsBlankHostHeader(t *testing.T) {
+	for name, raw := range map[string]string{
+		"empty":      `{"servers":["10.0.0.5:8080"],"proxy":{"host_header":""}}`,
+		"whitespace": `{"servers":["10.0.0.5:8080"],"proxy":{"host_header":"   "}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			up, err := buildRustUpstream(json.RawMessage(raw))
+			if err != nil {
+				t.Fatalf("buildRustUpstream: %v", err)
+			}
+			if _, present := up["host_header"]; present {
+				t.Fatal("a blank host_header must be omitted, not forwarded")
+			}
+		})
+	}
+}
+
+// SNI needs BOTH the toggle and a name. Either alone is not an intent to
+// override, and forwarding half of it would present something nobody chose.
+func TestBuildRustUpstreamSniRequiresToggleAndName(t *testing.T) {
+	for name, raw := range map[string]string{
+		"name without toggle": `{"servers":["10.0.0.5:8443"],"proxy":{"ssl_sni_name":"b.example.com"}}`,
+		"toggle without name": `{"servers":["10.0.0.5:8443"],"proxy":{"ssl_sni":true}}`,
+		"toggle off":          `{"servers":["10.0.0.5:8443"],"proxy":{"ssl_sni":false,"ssl_sni_name":"b.example.com"}}`,
+		"blank name":          `{"servers":["10.0.0.5:8443"],"proxy":{"ssl_sni":true,"ssl_sni_name":"  "}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			up, err := buildRustUpstream(json.RawMessage(raw))
+			if err != nil {
+				t.Fatalf("buildRustUpstream: %v", err)
+			}
+			if _, present := up["sni_name"]; present {
+				t.Fatalf("sni_name must not be forwarded for %q", name)
+			}
+		})
+	}
+}
+
+// Clamped at the API edge as well as in the data plane, so a bad value is
+// rejected where it is entered rather than relying on the far side.
+func TestBuildRustUpstreamClampsAbsurdConnectTimeout(t *testing.T) {
+	up, err := buildRustUpstream(json.RawMessage(
+		`{"servers":["10.0.0.5:8080"],"connect_timeout_secs":99999}`))
+	if err != nil {
+		t.Fatalf("buildRustUpstream: %v", err)
+	}
+	if up["connect_timeout_secs"] != maxUpstreamConnectTimeoutSecs {
+		t.Fatalf("connect_timeout_secs = %v, want clamp to %d",
+			up["connect_timeout_secs"], maxUpstreamConnectTimeoutSecs)
 	}
 }

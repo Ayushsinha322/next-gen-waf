@@ -501,6 +501,12 @@ export function formToPayload(f: SiteForm): {
   const readTimeoutSecs = durationToSecs(f.proxy_read_timeout);
   if (readTimeoutSecs > 0) upstream.timeout_secs = readTimeoutSecs;
 
+  // Connect timeout follows the same shape as Read Timeout above: the duration
+  // string in `proxy` is what the operator types, and this promoted seconds value
+  // is what the data plane reads. 0 / unparseable = node default.
+  const connectTimeoutSecs = durationToSecs(f.proxy_connect_timeout);
+  if (connectTimeoutSecs > 0) upstream.connect_timeout_secs = connectTimeoutSecs;
+
   // Drop incomplete or no-op rows rather than sending them: the API rejects an
   // override that sets neither mode nor threshold, and a half-filled row in the
   // UI should not fail the whole save.
