@@ -377,12 +377,30 @@ services:
       - "443:8443"              # public WAF entrypoint (HTTPS/TCP — h1+h2, SNI cert resolver)
       - "443:8443/udp"          # public WAF entrypoint (HTTP/3 over QUIC — same cert resolver)
       # MANAGEMENT console (HTTPS — admin UI + API, replaceable mgmt cert),
-      # LOOPBACK-ONLY ON PURPOSE. On 0.0.0.0 this is a security appliance's admin
-      # UI exposed to whatever network the host sits on — and to the internet the
-      # moment the host gets a public IP. Reach it with an SSH tunnel:
+      # LOOPBACK-ONLY BY DEFAULT, ON PURPOSE. On 0.0.0.0 this is a security
+      # appliance's admin UI exposed to whatever network the host sits on — and to
+      # the internet the moment the host gets a public IP. Reach it with a tunnel:
       #   ssh -L 9443:127.0.0.1:9443 root@<host>   then https://127.0.0.1:9443
-      # Do not "fix" this back to 9443:9443.
-      - "127.0.0.1:9443:9443"
+      #
+      # Do NOT change this line to expose the console. The default must stay
+      # loopback so a new deployment is never accidentally exposed. If an operator
+      # genuinely wants it on the network (internal lab, jump-host-free demo box),
+      # that is a per-deployment decision made explicitly in .env, not a source
+      # edit that ships to everyone:
+      #   SENTINEL_MGMT_BIND=0.0.0.0:      # in deploy/docker/.env
+      #
+      # Use 0.0.0.0:, NOT a single interface address like `10.0.0.5:`. Docker would
+      # then publish only that address, the 127.0.0.1 listener would vanish, and
+      # deploy/fleet/fleet.sh — which health-checks through
+      # `https://127.0.0.1:9443/healthz` — would report a healthy node as failing.
+      # 0.0.0.0 includes loopback; narrow the exposure with a host firewall, which
+      # does not take loopback away.
+      #
+      # Whoever sets it also owns the consequences: add the matching origin to
+      # SENTINEL_CORS_ORIGINS (or the UI breaks on CORS), and put a real host
+      # firewall in front, because the mgmt cert is a self-signed rcgen cert with
+      # no IP SAN and authenticates nothing to the browser.
+      - "${SENTINEL_MGMT_BIND:-127.0.0.1:}9443:9443"
     networks: [sentinel]
 
   dashboard:
