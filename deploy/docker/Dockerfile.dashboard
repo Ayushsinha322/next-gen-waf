@@ -29,6 +29,16 @@ ENV NEXT_PUBLIC_CONTROL_PLANE_URL=${NEXT_PUBLIC_CONTROL_PLANE_URL}
 RUN npm run build
 
 FROM node:20-alpine AS runner
+# Build provenance — see the long note in deploy/docker/Dockerfile. Re-declared
+# here because an ARG is scoped to the stage that names it.
+ARG GIT_SHA=unknown
+ARG BUILD_DATE=unknown
+ARG VERSION=0.0.0
+LABEL org.opencontainers.image.title="Next-Gen ESDSWAF dashboard" \
+      org.opencontainers.image.revision="$GIT_SHA" \
+      org.opencontainers.image.created="$BUILD_DATE" \
+      org.opencontainers.image.version="$VERSION" \
+      org.opencontainers.image.source="https://git.enlight.dev/research-lab/SIG-CyberSec/sentinel-waf"
 WORKDIR /app
 ENV NODE_ENV=production
 RUN addgroup -g 1001 -S nodejs && adduser -S nextjs -u 1001

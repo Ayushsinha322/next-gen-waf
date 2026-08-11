@@ -9,7 +9,31 @@
 # binary it produces runs on the distroless cc-debian12 runtime (also 2.36).
 # Do NOT switch the builder to a trixie-based image (glibc 2.41) — the binary
 # would then fail to start on the older runtime.
+#
+# ── BUILD PROVENANCE ─────────────────────────────────────────────────────────
+# GIT_SHA/BUILD_DATE/VERSION are stamped into OCI labels on every final stage so
+# that "which commit is this image?" is a one-line query:
+#
+#   docker image inspect sentinel/dataplane:latest \
+#     --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'
+#
+# This exists because of a real incident (2026-08-10/11). Images were built on a
+# workstation and shipped to three VMs as `docker save` tarballs, but nothing
+# synced the source, so /opt/sentinel-src sat 21 commits behind what was running.
+# Every cheap way to ask what a box was running gave the WRONG answer: the source
+# tree said 21 commits stale, the compose files said current. Establishing the
+# truth meant `docker cp`-ing the binary out of a distroless image and grepping it
+# for a string only the new build contained — forensics, to answer a question a
+# label answers instantly.
+#
+# Unset args default to "unknown" rather than failing the build: a local
+# `docker build` for debugging should not need git. It is deploy/fleet/fleet.sh
+# that refuses to SHIP an image whose revision is unknown.
 # =====================================================
+ARG GIT_SHA=unknown
+ARG BUILD_DATE=unknown
+ARG VERSION=0.0.0
+
 FROM rust:1.85-slim-bookworm AS rust-builder
 WORKDIR /src
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -48,6 +72,17 @@ RUN go build -ldflags="-s -w" -o /out/controllerd ./cmd/controllerd \
 
 # ---- Data plane (Rust proxy) ----
 FROM gcr.io/distroless/cc-debian12 AS sentinel-dataplane
+# Re-declared inside the stage: an ARG before the first FROM is global but is NOT
+# in scope in any stage until named again. Omitting these is the classic way to
+# ship labels that silently read "unknown".
+ARG GIT_SHA
+ARG BUILD_DATE
+ARG VERSION
+LABEL org.opencontainers.image.title="Next-Gen ESDSWAF data plane" \
+      org.opencontainers.image.revision="$GIT_SHA" \
+      org.opencontainers.image.created="$BUILD_DATE" \
+      org.opencontainers.image.version="$VERSION" \
+      org.opencontainers.image.source="https://git.enlight.dev/research-lab/SIG-CyberSec/sentinel-waf"
 WORKDIR /opt/sentinel
 COPY --from=rust-builder /src/target/release/sentinel-bin /usr/local/bin/sentinel
 # CRS + custom rule packs. The proxy resolves the config's relative rule paths
@@ -66,6 +101,14 @@ ENTRYPOINT ["/usr/local/bin/sentinel"]
 # toolchain and a second link configuration to save a few megabytes — the data
 # plane already runs on cc.
 FROM gcr.io/distroless/cc-debian12 AS sentinel-controlplane
+ARG GIT_SHA
+ARG BUILD_DATE
+ARG VERSION
+LABEL org.opencontainers.image.title="Next-Gen ESDSWAF control plane" \
+      org.opencontainers.image.revision="$GIT_SHA" \
+      org.opencontainers.image.created="$BUILD_DATE" \
+      org.opencontainers.image.version="$VERSION" \
+      org.opencontainers.image.source="https://git.enlight.dev/research-lab/SIG-CyberSec/sentinel-waf"
 COPY --from=go-builder /out/controllerd /usr/local/bin/controllerd
 COPY --from=go-builder /out/sentinelctl  /usr/local/bin/sentinelctl
 COPY --from=srl-builder /src/target/release/sentinel-srl-validate /usr/local/bin/srl-validate
@@ -85,6 +128,14 @@ ENV CGO_ENABLED=0
 RUN go install -tags='no_sqlite3' github.com/pressly/goose/v3/cmd/goose@v3.22.1
 
 FROM alpine:3.20 AS sentinel-migrate
+ARG GIT_SHA
+ARG BUILD_DATE
+ARG VERSION
+LABEL org.opencontainers.image.title="Next-Gen ESDSWAF migrations" \
+      org.opencontainers.image.revision="$GIT_SHA" \
+      org.opencontainers.image.created="$BUILD_DATE" \
+      org.opencontainers.image.version="$VERSION" \
+      org.opencontainers.image.source="https://git.enlight.dev/research-lab/SIG-CyberSec/sentinel-waf"
 RUN apk add --no-cache ca-certificates
 COPY --from=goose-builder /go/bin/goose /usr/local/bin/goose
 COPY control-plane/internal/db/migrations /migrations
