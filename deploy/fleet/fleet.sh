@@ -401,7 +401,12 @@ if [ -n "\$dp" ]; then
 fi
 hostname_probe=\$(cat /etc/sentinel/2vm-probe-host 2>/dev/null || echo localhost)
 echo "HTTP \$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 -H "Host: \$hostname_probe" http://127.0.0.1/ 2>/dev/null)"
-echo "HEALTH \$(curl -sk --max-time 8 https://127.0.0.1:9443/healthz 2>/dev/null | head -c 200)"
+# Extract the field on the node rather than shipping a truncated prefix back.
+# This read \`| head -c 200\` and produced a FALSE FAIL on the HA box, whose
+# healthz lists three listeners and so pushes "status" to byte 196 — the cut
+# landed mid-field and the grep below missed a node that was perfectly healthy.
+# A check must not depend on how long an unrelated part of the payload is.
+echo "HEALTH \$(curl -sk --max-time 8 https://127.0.0.1:9443/healthz 2>/dev/null | grep -o '"status":"[a-z]*"' | head -1)"
 REMOTE
     ) || true
 
