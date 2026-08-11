@@ -650,34 +650,28 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                         <Field label="Timeout"><input className="fin2" value={form.health.timeout} onChange={e => upd({ health: { ...form.health, timeout: e.target.value } })} /></Field>
                       </div>
                     )}
-                    {/* Every control in this group except Read Timeout is dropped by
-                        buildRustUpstream() in the control plane, which forwards only
-                        servers / load_balancer / health_check / timeout_secs. They were
-                        stored, echoed back, and never enforced — so they are disabled
-                        rather than left looking live. Re-enable one only together with
-                        the code that reads it. */}
-                    <GroupLabel>Proxy Options</GroupLabel>
+                    {/* Every control in this group is now read by the data plane. The
+                        `Enforced` tag says so, and it is a claim: buildRustUpstream()
+                        in the control plane is an allowlist, so a control added here
+                        without a forwarding entry AND data-plane code to read it is
+                        stored, echoed back, and silently dropped. Mark such a control
+                        `unavailable` rather than leaving it looking live. */}
+                    <GroupLabel>Proxy Options <Tag kind="enforced" /></GroupLabel>
                     <Row>
-                      <Field label="Custom Host Header" hint="Override Host sent upstream (blank = pass-through)"
-                             unavailable="Not implemented — the data plane always passes the original Host through.">
-                        <input className="fin2" value={form.proxy_host_header} placeholder="app.internal" disabled readOnly />
+                      <Field label="Custom Host Header" hint="Override Host sent upstream (blank = pass-through)">
+                        <input className="fin2" value={form.proxy_host_header} placeholder="app.internal" onChange={e => upd({ proxy_host_header: e.target.value })} />
                       </Field>
-                      <Field label="SSL SNI Name" hint="Sent when upstream uses TLS"
-                             unavailable="Not implemented — upstream SNI follows the server host.">
-                        <input className="fin2" value={form.proxy_ssl_sni_name} placeholder="backend.example.com" disabled readOnly />
+                      <Field label="SSL SNI Name" hint="Presented to an HTTPS origin; required when addressing it by IP">
+                        <input className="fin2" value={form.proxy_ssl_sni_name} placeholder="backend.example.com" onChange={e => upd({ proxy_ssl_sni_name: e.target.value, proxy_ssl_sni: !!e.target.value })} title="The origin's certificate must be valid for this name — it is used both as the SNI sent and as the name the certificate is verified against, so a wrong value fails the handshake rather than connecting insecurely. Only applies to a server with TLS enabled." />
                       </Field>
                     </Row>
                     <Row>
                       <SectionToggle label="WebSocket / Upgrade" desc="Allow Connection: Upgrade passthrough" on={form.proxy_websocket} set={v => upd({ proxy_websocket: v })} />
-                      <SectionToggle label="Upstream Keep-Alive" desc="Reuse upstream connections"
-                                     on={form.proxy_keepalive} set={v => upd({ proxy_keepalive: v })}
-                                     unavailable="Not implemented — upstream keep-alive is always on." />
+                      <SectionToggle label="Upstream Keep-Alive" desc="Reuse upstream connections (off = a new connection per request)"
+                                     on={form.proxy_keepalive} set={v => upd({ proxy_keepalive: v })} />
                     </Row>
                     <Row>
-                      <Field label="Connect Timeout"
-                             unavailable="Not implemented per-site — set SENTINEL_UPSTREAM_CONNECT_TIMEOUT_SECS on the node.">
-                        <input className="fin2" value={form.proxy_connect_timeout} disabled readOnly />
-                      </Field>
+                      <Field label="Connect Timeout"><input className="fin2" value={form.proxy_connect_timeout} onChange={e => upd({ proxy_connect_timeout: e.target.value })} title="How long TCP (plus TLS) to the origin may take, e.g. 5s. Narrower than Read Timeout: it fails fast on an unreachable origin without shortening the budget of one that is merely slow. Blank = node default. Capped at 60s." /></Field>
                       <Field label="Read Timeout"><input className="fin2" value={form.proxy_read_timeout} onChange={e => upd({ proxy_read_timeout: e.target.value })} title="How long the origin may take to return response headers (e.g. 60s, 5m). Raise it for slow report/export endpoints. It does not limit download or SSE stream duration. Blank = node default (30s)." /></Field>
                     </Row>
                   </>)}

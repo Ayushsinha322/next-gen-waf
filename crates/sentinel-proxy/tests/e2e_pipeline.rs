@@ -79,6 +79,10 @@ fn test_config(
                 health_check: None,
                 timeout_secs: None,
                 websocket: false,
+                host_header: None,
+                keepalive: true,
+                connect_timeout_secs: None,
+                sni_name: None,
             },
             waf: WafConfig {
                 mode,
@@ -123,6 +127,10 @@ fn ml_only_config(listen_port: u16, upstream_port: u16, sensitivity: f32) -> Sen
                 health_check: None,
                 timeout_secs: None,
                 websocket: false,
+                host_header: None,
+                keepalive: true,
+                connect_timeout_secs: None,
+                sni_name: None,
             },
             waf: WafConfig {
                 mode: WafMode::Blocking,
@@ -664,6 +672,10 @@ fn inline_only_config(
                 health_check: None,
                 timeout_secs: None,
                 websocket: false,
+                host_header: None,
+                keepalive: true,
+                connect_timeout_secs: None,
+                sni_name: None,
             },
             waf: WafConfig {
                 mode: WafMode::Blocking,
@@ -1249,4 +1261,208 @@ async fn generated_control_plane_config_parses_and_gates_correctly() {
     let enabled = from_go.replace("\"websocket\":false", "\"websocket\":true");
     let parsed: UpstreamConfig = serde_json::from_str(&enabled).unwrap();
     assert!(parsed.websocket, "websocket=true must enable the relay");
+}
+
+// ============================================================================
+// Per-site proxy options: host_header and keepalive
+//
+// These were part of the same inert `upstream.proxy` block as `websocket`: the
+// dashboard sent them, the control plane stored and echoed them, and nothing read
+// them. Each assertion below is on what the ORIGIN received, because that is the
+// only evidence that distinguishes an implemented control from a stored one.
+// ============================================================================
+
+/// Mock origin that echoes back the request headers it received, so a test can
+/// assert on what actually crossed the wire rather than on proxy internals.
+async fn start_header_echo_upstream() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind echo upstream");
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(c) => c,
+                Err(_) => break,
+            };
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let svc = hyper::service::service_fn(|req: Request<Incoming>| async move {
+                    let host = req
+                        .headers()
+                        .get(header::HOST)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("<none>")
+                        .to_string();
+                    let conn = req
+                        .headers()
+                        .get(header::CONNECTION)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("<none>")
+                        .to_string();
+                    Ok::<_, std::convert::Infallible>(
+                        http::Response::builder()
+                            .status(StatusCode::OK)
+                            .header(header::CONTENT_TYPE, "text/plain")
+                            .body(format!("host={host} connection={conn}"))
+                            .unwrap(),
+                    )
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(io, svc)
+                    .await;
+            });
+        }
+    });
+    (addr, handle)
+}
+
+fn proxy_opts_config(
+    listen_port: u16,
+    upstream_port: u16,
+    host_header: Option<&str>,
+    keepalive: bool,
+) -> SentinelConfig {
+    let mut cfg = test_config(
+        listen_port,
+        upstream_port,
+        "REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
+        WafMode::Blocking,
+    );
+    cfg.sites[0].upstream.host_header = host_header.map(str::to_string);
+    cfg.sites[0].upstream.keepalive = keepalive;
+    cfg
+}
+
+#[tokio::test]
+async fn host_header_override_reaches_the_origin() {
+    let (up_addr, _up) = start_header_echo_upstream().await;
+    let port = next_port();
+    let (tx, jh) = start_proxy(proxy_opts_config(
+        port,
+        up_addr.port(),
+        Some("app.internal"),
+        true,
+    ))
+    .await;
+
+    let (status, body) = send_request(port, "test-site.local", "/", Method::GET, "").await;
+    let body = String::from_utf8_lossy(&body);
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("host=app.internal"),
+        "the origin must receive the overridden Host, got: {body:?}"
+    );
+    shutdown_proxy(tx, jh).await;
+}
+
+/// Absent override must pass the client's Host through unchanged — the default
+/// behaviour, which most origins depend on.
+#[tokio::test]
+async fn without_an_override_the_client_host_is_passed_through() {
+    let (up_addr, _up) = start_header_echo_upstream().await;
+    let port = next_port();
+    let (tx, jh) = start_proxy(proxy_opts_config(port, up_addr.port(), None, true)).await;
+
+    let (_, body) = send_request(port, "test-site.local", "/", Method::GET, "").await;
+    let body = String::from_utf8_lossy(&body);
+
+    assert!(
+        body.contains("host=test-site.local"),
+        "no override must forward the client's Host, got: {body:?}"
+    );
+    shutdown_proxy(tx, jh).await;
+}
+
+/// An override that is present but blank/whitespace must be treated as "not set"
+/// rather than sent as an empty Host, which some origins reject outright.
+#[tokio::test]
+async fn a_blank_host_header_override_is_ignored() {
+    let (up_addr, _up) = start_header_echo_upstream().await;
+    let port = next_port();
+    let (tx, jh) = start_proxy(proxy_opts_config(port, up_addr.port(), Some("   "), true)).await;
+
+    let (_, body) = send_request(port, "test-site.local", "/", Method::GET, "").await;
+    let body = String::from_utf8_lossy(&body);
+
+    assert!(
+        body.contains("host=test-site.local"),
+        "a blank override must fall back to the client's Host, got: {body:?}"
+    );
+    shutdown_proxy(tx, jh).await;
+}
+
+/// keepalive:false must send `Connection: close` so the origin retires the
+/// connection instead of it being returned to the pool.
+#[tokio::test]
+async fn keepalive_disabled_sends_connection_close_to_the_origin() {
+    let (up_addr, _up) = start_header_echo_upstream().await;
+    let port = next_port();
+    let (tx, jh) = start_proxy(proxy_opts_config(port, up_addr.port(), None, false)).await;
+
+    let (status, body) = send_request(port, "test-site.local", "/", Method::GET, "").await;
+    let body = String::from_utf8_lossy(&body);
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "disabling keep-alive must still proxy"
+    );
+    assert!(
+        body.contains("connection=close"),
+        "keepalive:false must send Connection: close, got: {body:?}"
+    );
+    shutdown_proxy(tx, jh).await;
+}
+
+/// The default (keepalive:true) must NOT send `Connection: close` — otherwise
+/// every site would silently lose connection reuse.
+#[tokio::test]
+async fn keepalive_enabled_does_not_send_connection_close() {
+    let (up_addr, _up) = start_header_echo_upstream().await;
+    let port = next_port();
+    let (tx, jh) = start_proxy(proxy_opts_config(port, up_addr.port(), None, true)).await;
+
+    let (_, body) = send_request(port, "test-site.local", "/", Method::GET, "").await;
+    let body = String::from_utf8_lossy(&body);
+
+    assert!(
+        !body.contains("connection=close"),
+        "keep-alive is the default and must not be disabled, got: {body:?}"
+    );
+    shutdown_proxy(tx, jh).await;
+}
+
+/// The Host override must apply ONLY to the upstream request. Site matching runs
+/// on the host the client sent, so a request whose Host matches no site must
+/// still fail to match — an override that leaked into routing would let one site
+/// borrow another's policy.
+#[tokio::test]
+async fn host_header_override_does_not_affect_site_matching() {
+    let (up_addr, _up) = start_header_echo_upstream().await;
+    let port = next_port();
+    let (tx, jh) = start_proxy(proxy_opts_config(
+        port,
+        up_addr.port(),
+        Some("app.internal"),
+        true,
+    ))
+    .await;
+
+    // Still routed by the CLIENT's host, and attacks are still evaluated.
+    let (status, _) = send_request(
+        port,
+        "test-site.local",
+        "/?q=1%27%20OR%20%271%27%3D%271",
+        Method::GET,
+        "",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "WAF evaluation must be unaffected by a Host override"
+    );
+    shutdown_proxy(tx, jh).await;
 }

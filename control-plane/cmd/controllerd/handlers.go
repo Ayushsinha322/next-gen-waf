@@ -1414,13 +1414,21 @@ func buildRustUpstream(raw json.RawMessage) (map[string]any, error) {
 		LoadBalancer string          `json:"load_balancer"`
 		HealthCheck  json.RawMessage `json:"health_check"`
 		TimeoutSecs  *uint64         `json:"timeout_secs"`
+		// Promoted alongside timeout_secs: the operator types a duration string in
+		// `proxy.connect_timeout`, the dashboard converts it, and this is the value
+		// the data plane reads.
+		ConnectTimeoutSecs *uint64 `json:"connect_timeout_secs"`
 		// The dashboard nests reverse-proxy options under `proxy`. Only the keys
-		// named here reach the data plane; the rest of the object is stored and
-		// echoed back but enforces nothing, which is why those controls are
-		// disabled in the site wizard. Add a key here only alongside the data-plane
-		// code that reads it.
+		// named here reach the data plane; anything else in the object is stored and
+		// echoed back but enforces nothing. Add a key here only alongside the
+		// data-plane code that reads it — a forwarded key with no reader is the
+		// silently-inert defect this allowlist exists to make visible.
 		Proxy struct {
-			Websocket *bool `json:"websocket"`
+			Websocket  *bool   `json:"websocket"`
+			Keepalive  *bool   `json:"keepalive"`
+			HostHeader *string `json:"host_header"`
+			SSLSni     *bool   `json:"ssl_sni"`
+			SSLSniName *string `json:"ssl_sni_name"`
 		} `json:"proxy"`
 	}
 	if len(raw) > 0 {
@@ -1514,8 +1522,49 @@ func buildRustUpstream(raw json.RawMessage) (map[string]any, error) {
 	// that fail-open behaviour alive for every pre-existing site.
 	upstream["websocket"] = generic.Proxy.Websocket != nil && *generic.Proxy.Websocket
 
+	// Upstream keep-alive. Defaults to TRUE when absent — the opposite of
+	// websocket above, and deliberately so: connection reuse is what a reverse
+	// proxy should do, and a legacy config that never mentioned it was getting
+	// reuse. Treating silence as "off" here would quietly add a TCP (and TLS)
+	// handshake to every request on every existing site.
+	upstream["keepalive"] = generic.Proxy.Keepalive == nil || *generic.Proxy.Keepalive
+
+	// Host header override. Omitted when blank so the data plane's "None" means
+	// pass the client's Host through, rather than "send an empty Host".
+	if generic.Proxy.HostHeader != nil {
+		if hh := strings.TrimSpace(*generic.Proxy.HostHeader); hh != "" {
+			upstream["host_header"] = hh
+		}
+	}
+
+	// Per-site connect timeout, clamped here as well as in the data plane so the
+	// API rejects nonsense at the edge rather than relying on the far side.
+	if generic.ConnectTimeoutSecs != nil && *generic.ConnectTimeoutSecs > 0 {
+		secs := *generic.ConnectTimeoutSecs
+		if secs > maxUpstreamConnectTimeoutSecs {
+			secs = maxUpstreamConnectTimeoutSecs
+		}
+		upstream["connect_timeout_secs"] = secs
+	}
+
+	// SNI override for an HTTPS origin. Requires BOTH the toggle and a name: a
+	// name with the toggle off is not an intent to override, and the toggle on
+	// with no name has nothing to present. Only forwarded when it would do
+	// something, since an empty override is indistinguishable from none.
+	if generic.Proxy.SSLSni != nil && *generic.Proxy.SSLSni && generic.Proxy.SSLSniName != nil {
+		if sni := strings.TrimSpace(*generic.Proxy.SSLSniName); sni != "" {
+			upstream["sni_name"] = sni
+		}
+	}
+
 	return upstream, nil
 }
+
+// maxUpstreamConnectTimeoutSecs mirrors MAX_SITE_CONNECT_TIMEOUT_SECS in
+// crates/sentinel-proxy/src/upstream.rs. A connect timeout longer than this
+// defeats the purpose of having one — it pins a request task on an unreachable
+// origin for minutes.
+const maxUpstreamConnectTimeoutSecs uint64 = 60
 
 // maxUpstreamTimeoutSecs caps the per-site upstream timeout at 10 minutes.
 // Slow report/export endpoints are the reason the knob exists; anything longer

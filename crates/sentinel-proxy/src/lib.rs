@@ -3035,6 +3035,47 @@ async fn proxy(
     }
     inject_forwarding_headers(&mut parts.headers, peer.ip())?;
 
+    // Per-site `Host` override for an origin that virtual-hosts on an internal
+    // name. Applied HERE, at the last step before the request leaves us, and
+    // deliberately not earlier: site matching, WAF evaluation and logging have
+    // already run against the host the client actually sent, so this cannot move
+    // a request onto another site's policy or hide the real host from the log.
+    if let Some(hh) = site_cfg
+        .upstream
+        .host_header
+        .as_deref()
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+    {
+        match header::HeaderValue::from_str(hh) {
+            Ok(hv) => {
+                parts.headers.insert(header::HOST, hv);
+            }
+            // A header value that cannot be constructed would otherwise panic or
+            // silently fall through; pass the client's Host and say so.
+            Err(e) => warn!(
+                site = %site_cfg.id, host_header = %hh,
+                "invalid upstream host_header, forwarding the client's Host instead: {e}"
+            ),
+        }
+    }
+
+    // Per-site keep-alive. `Connection: close` is the per-request lever, so this
+    // needs no second connection pool: hyper honours it and retires the
+    // connection after the response instead of returning it to the pool. Legal
+    // because we always forward as HTTP/1.1 (below) — the header is meaningless
+    // in HTTP/2 and would be a protocol error there.
+    //
+    // Skipped entirely for an upgrade: the whole point of a 101 is that the
+    // connection persists, and `Connection: close` contradicts `Connection:
+    // Upgrade` in the same request.
+    if !site_cfg.upstream.keepalive && !ws_allowed {
+        parts.headers.insert(
+            header::CONNECTION,
+            header::HeaderValue::from_static("close"),
+        );
+    }
+
     parts.uri = upstream_uri;
     // Forward to the upstream as HTTP/1.1 regardless of the client's protocol.
     // An h2 client request still carries version=HTTP/2, which the HTTP/1.1
@@ -7976,6 +8017,10 @@ mod inline_rule_diag_tests {
                 health_check: None,
                 timeout_secs: None,
                 websocket: false,
+                host_header: None,
+                keepalive: true,
+                connect_timeout_secs: None,
+                sni_name: None,
             },
             waf: WafConfig {
                 mode: WafMode::Blocking,
