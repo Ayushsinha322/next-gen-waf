@@ -388,6 +388,14 @@ services:
       # that is a per-deployment decision made explicitly in .env, not a source
       # edit that ships to everyone:
       #   SENTINEL_MGMT_BIND=0.0.0.0:      # in deploy/docker/.env
+      #
+      # Use 0.0.0.0:, NOT a single interface address like `10.0.0.5:`. Docker would
+      # then publish only that address, the 127.0.0.1 listener would vanish, and
+      # deploy/fleet/fleet.sh — which health-checks through
+      # `https://127.0.0.1:9443/healthz` — would report a healthy node as failing.
+      # 0.0.0.0 includes loopback; narrow the exposure with a host firewall, which
+      # does not take loopback away.
+      #
       # Whoever sets it also owns the consequences: add the matching origin to
       # SENTINEL_CORS_ORIGINS (or the UI breaks on CORS), and put a real host
       # firewall in front, because the mgmt cert is a self-signed rcgen cert with
