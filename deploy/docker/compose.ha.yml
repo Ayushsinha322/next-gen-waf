@@ -101,14 +101,24 @@ services:
       - sentinel-certs:/var/lib/sentinel/certs   # shared cert repository (ACME/uploaded)
       - waf1-state:/var/lib/sentinel/state       # this node's last-good config cache
     ports:
-      # MANAGEMENT console (HTTPS — admin UI + API), LOOPBACK-ONLY ON PURPOSE.
+      # MANAGEMENT console (HTTPS — admin UI + API), LOOPBACK-ONLY BY DEFAULT.
       # Published on 0.0.0.0 this is the admin UI of a security appliance facing
       # whatever network the host sits on — and the moment the host gets a public
       # IP, facing the internet. Reach it with an SSH tunnel:
       #   ssh -L 9443:127.0.0.1:9443 root@<host>   then https://127.0.0.1:9443
-      # Do not "fix" this back to 9443:9443. If a management VLAN is available,
-      # bind to that interface's address instead — never 0.0.0.0.
-      - "127.0.0.1:9443:9443"
+      #
+      # Do NOT edit this line to expose it. The knob is per-deployment, in .env:
+      #   SENTINEL_MGMT_BIND=172.16.21.71:     # a specific interface address
+      # Prefer a specific address over 0.0.0.0: it cannot follow the host onto an
+      # interface added later. Whoever sets it must also add the matching origin to
+      # SENTINEL_CORS_ORIGINS, and should front it with a host firewall — the mgmt
+      # cert is a self-signed rcgen cert with no IP SAN, so it authenticates
+      # nothing to the browser.
+      #
+      # This must stay in lockstep with the same port line in compose.prod.yml:
+      # `ports` entries MERGE across -f layers, so parameterising only one of them
+      # leaves the other still binding loopback and yields two conflicting entries.
+      - "${SENTINEL_MGMT_BIND:-127.0.0.1:}9443:9443"
       - "443:8443"           # public WAF entrypoint (HTTPS/TCP — h1+h2)
       - "443:8443/udp"       # public WAF entrypoint (HTTP/3 over QUIC)
   waf2:
