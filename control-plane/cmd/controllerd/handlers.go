@@ -1414,6 +1414,14 @@ func buildRustUpstream(raw json.RawMessage) (map[string]any, error) {
 		LoadBalancer string          `json:"load_balancer"`
 		HealthCheck  json.RawMessage `json:"health_check"`
 		TimeoutSecs  *uint64         `json:"timeout_secs"`
+		// The dashboard nests reverse-proxy options under `proxy`. Only the keys
+		// named here reach the data plane; the rest of the object is stored and
+		// echoed back but enforces nothing, which is why those controls are
+		// disabled in the site wizard. Add a key here only alongside the data-plane
+		// code that reads it.
+		Proxy struct {
+			Websocket *bool `json:"websocket"`
+		} `json:"proxy"`
 	}
 	if len(raw) > 0 {
 		if err := json.Unmarshal(raw, &generic); err != nil {
@@ -1497,6 +1505,15 @@ func buildRustUpstream(raw json.RawMessage) (map[string]any, error) {
 		}
 		upstream["timeout_secs"] = secs
 	}
+
+	// WebSocket upgrades, off unless the site asks for them. Always emitted, even
+	// when false, so the value the data plane enforces is the one the operator
+	// chose rather than a default inferred from an absent key. A config that never
+	// mentioned WebSockets resolves to false: this gate replaces an ungated relay
+	// that upgraded on any origin 101, so treating silence as "allowed" would keep
+	// that fail-open behaviour alive for every pre-existing site.
+	upstream["websocket"] = generic.Proxy.Websocket != nil && *generic.Proxy.Websocket
+
 	return upstream, nil
 }
 

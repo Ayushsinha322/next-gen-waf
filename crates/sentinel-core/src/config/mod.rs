@@ -393,6 +393,20 @@ pub struct UpstreamConfig {
     /// every other site on the node to wait as long.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// Whether this site may negotiate a WebSocket upgrade, i.e. a request
+    /// carrying both `Connection: Upgrade` and `Upgrade: websocket`.  When false
+    /// the proxy strips the upgrade headers, so the origin answers as a plain HTTP
+    /// request and no relay is established.
+    ///
+    /// **Defaults to `false`, deliberately.** This used to be ungated: the relay
+    /// fired on any `101` from the origin, so a site whose config said
+    /// `websocket: false` still got a full bidirectional relay — a security
+    /// control that failed open. A config that does not mention WebSockets is now
+    /// read as "not asked for" rather than "allowed", which means enabling them is
+    /// an explicit act. Sites that need WebSockets must set this to true; the
+    /// alternative default would silently re-open the hole on every legacy config.
+    #[serde(default)]
+    pub websocket: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]

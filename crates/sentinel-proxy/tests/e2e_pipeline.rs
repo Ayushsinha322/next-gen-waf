@@ -78,6 +78,7 @@ fn test_config(
                 }],
                 health_check: None,
                 timeout_secs: None,
+                websocket: false,
             },
             waf: WafConfig {
                 mode,
@@ -121,6 +122,7 @@ fn ml_only_config(listen_port: u16, upstream_port: u16, sensitivity: f32) -> Sen
                 }],
                 health_check: None,
                 timeout_secs: None,
+                websocket: false,
             },
             waf: WafConfig {
                 mode: WafMode::Blocking,
@@ -661,6 +663,7 @@ fn inline_only_config(
                 }],
                 health_check: None,
                 timeout_secs: None,
+                websocket: false,
             },
             waf: WafConfig {
                 mode: WafMode::Blocking,
@@ -1016,4 +1019,234 @@ async fn path_override_can_be_stricter_than_the_site() {
         StatusCode::OK,
         "the site threshold of 1000 must still apply outside the override"
     );
+}
+
+// ============================================================================
+// WebSocket gating (site.upstream.websocket)
+//
+// The relay used to be ungated: it fired on any 101 from the origin, so a site
+// configured with `websocket: false` still got a full bidirectional relay — a
+// security control that failed open. These tests pin both directions on the
+// wire, not on internal state.
+// ============================================================================
+
+/// Mock origin that completes a WebSocket handshake when it is asked to, and
+/// otherwise answers as a plain HTTP server.
+///
+/// The 200 body reports whether ANY `sec-websocket-*` header arrived, which is
+/// how the disabled test proves the proxy scrubbed the handshake rather than
+/// merely that the origin declined it.
+async fn start_ws_mock_upstream() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ws mock upstream");
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = match listener.accept().await {
+                Ok(c) => c,
+                Err(_) => break,
+            };
+            tokio::spawn(async move {
+                // Read just the header block; these requests carry no body.
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) => return,
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf).to_ascii_lowercase();
+                let asked_to_upgrade =
+                    head.contains("upgrade: websocket") && head.contains("connection: upgrade");
+                let saw_ws_headers = head.contains("sec-websocket-");
+
+                let resp = if asked_to_upgrade {
+                    // Fixed accept value: these tests assert on the status line,
+                    // never on a real WebSocket handshake completing.
+                    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                     Connection: Upgrade\r\n\
+                     Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
+                        .to_string()
+                } else {
+                    let body = format!("plain-http ws_headers={saw_ws_headers}");
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                };
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+    (addr, handle)
+}
+
+/// Send a WebSocket handshake over a raw socket and return
+/// (status line, body-ish remainder). Raw TCP on purpose: a hyper client would
+/// interpret the upgrade for us, and the point is to see what went over the wire.
+async fn send_ws_handshake(listen_port: u16, host: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", listen_port))
+        .await
+        .expect("connect to proxy");
+    let req = format!(
+        "GET /socket.io/?transport=websocket HTTP/1.1\r\nHost: {host}\r\n\
+         Upgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         Sec-WebSocket-Version: 13\r\n\r\n"
+    );
+    tcp.write_all(req.as_bytes())
+        .await
+        .expect("write handshake");
+    tcp.flush().await.unwrap();
+
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 2048];
+    // Read until the peer stops sending or we have the head plus any body.
+    for _ in 0..8 {
+        match tokio::time::timeout(std::time::Duration::from_millis(600), tcp.read(&mut chunk))
+            .await
+        {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") && buf.len() > 40 {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    String::from_utf8_lossy(&buf).to_string()
+}
+
+fn ws_test_config(listen_port: u16, upstream_port: u16, websocket: bool) -> SentinelConfig {
+    let mut cfg = test_config(
+        listen_port,
+        upstream_port,
+        "REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
+        WafMode::Blocking,
+    );
+    cfg.sites[0].upstream.websocket = websocket;
+    cfg
+}
+
+#[tokio::test]
+async fn websocket_upgrade_allowed_when_site_enables_it() {
+    let (up_addr, _up) = start_ws_mock_upstream().await;
+    let port = next_port();
+    let (tx, jh) = start_proxy(ws_test_config(port, up_addr.port(), true)).await;
+
+    let resp = send_ws_handshake(port, "test-site.local").await;
+
+    assert!(
+        resp.starts_with("HTTP/1.1 101"),
+        "websocket:true must negotiate the upgrade, got: {:?}",
+        resp.lines().next()
+    );
+    shutdown_proxy(tx, jh).await;
+}
+
+#[tokio::test]
+async fn websocket_upgrade_refused_when_site_disables_it() {
+    let (up_addr, _up) = start_ws_mock_upstream().await;
+    let port = next_port();
+    let (tx, jh) = start_proxy(ws_test_config(port, up_addr.port(), false)).await;
+
+    let resp = send_ws_handshake(port, "test-site.local").await;
+
+    // Not a 101, and specifically NOT a dangling upgrade: the client gets a real
+    // HTTP response it can act on.
+    assert!(
+        !resp.contains("101 Switching Protocols"),
+        "websocket:false must not upgrade, got: {:?}",
+        resp.lines().next()
+    );
+    assert!(
+        resp.starts_with("HTTP/1.1 200"),
+        "expected the origin's plain HTTP answer, got: {:?}",
+        resp.lines().next()
+    );
+    // The origin must not even have seen the handshake headers.
+    assert!(
+        resp.contains("ws_headers=false"),
+        "Sec-WebSocket-* headers leaked to the origin: {resp:?}"
+    );
+    shutdown_proxy(tx, jh).await;
+}
+
+#[tokio::test]
+async fn websocket_disabled_is_the_default_for_legacy_config() {
+    // A config that never mentions WebSockets must deserialize to false. The old
+    // relay upgraded on any origin 101, so defaulting to true here would silently
+    // re-open that on every pre-existing site.
+    let json = r#"{
+        "load_balancer": "round_robin",
+        "servers": [{"host": "127.0.0.1", "port": 8080, "weight": 1, "tls": false}]
+    }"#;
+    let parsed: UpstreamConfig = serde_json::from_str(json).expect("legacy upstream must parse");
+    assert!(
+        !parsed.websocket,
+        "absent `websocket` must default to false, not allow upgrades"
+    );
+}
+
+#[tokio::test]
+async fn non_websocket_traffic_unaffected_by_the_gate() {
+    // Regression: ordinary proxying must be untouched with the gate closed.
+    let (up_addr, _up) = start_ws_mock_upstream().await;
+    let port = next_port();
+    let (tx, jh) = start_proxy(ws_test_config(port, up_addr.port(), false)).await;
+
+    let (status, body) = send_request(port, "test-site.local", "/", Method::GET, "").await;
+
+    assert_eq!(status, StatusCode::OK, "plain GET must still be proxied");
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        body.contains("plain-http"),
+        "expected the origin's response, got: {body:?}"
+    );
+    shutdown_proxy(tx, jh).await;
+}
+
+/// Cross-language contract check. This is the EXACT JSON that
+/// `buildRustUpstream` in the Go control plane emits for the live "Juice Shop"
+/// site, captured from its real stored config. The two sides are compiled and
+/// tested separately, so nothing else stops the producer and the consumer of
+/// this payload from drifting apart — which is precisely how `upstream.proxy`
+/// came to be sent for months and never read.
+#[tokio::test]
+async fn generated_control_plane_config_parses_and_gates_correctly() {
+    let from_go = r#"{"load_balancer":"round_robin","servers":[{"host":"juiceshop","port":3000,"tls":false,"weight":1}],"timeout_secs":60,"websocket":false}"#;
+
+    let parsed: UpstreamConfig = serde_json::from_str(from_go)
+        .expect("the control plane's generated upstream config must deserialize");
+
+    assert!(
+        !parsed.websocket,
+        "proxy.websocket=false must arrive as websocket=false and gate the relay"
+    );
+    // The timeout path must be untouched by the WebSocket work.
+    assert_eq!(parsed.timeout_secs, Some(60), "timeout_secs must survive");
+    assert_eq!(parsed.servers.len(), 1);
+    assert_eq!(parsed.servers[0].host, "juiceshop");
+
+    // And the enabled form, same shape.
+    let enabled = from_go.replace("\"websocket\":false", "\"websocket\":true");
+    let parsed: UpstreamConfig = serde_json::from_str(&enabled).unwrap();
+    assert!(parsed.websocket, "websocket=true must enable the relay");
 }
