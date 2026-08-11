@@ -1,0 +1,15 @@
+Keeps dashboard/public/ in git.
+
+deploy/docker/Dockerfile.dashboard does an unconditional
+`COPY --from=builder /app/public ./public`, so the Docker build FAILS outright
+when this directory does not exist:
+
+    failed to compute cache key: "/app/public": not found
+
+Next.js does not create it, and it held no tracked files, so it existed only on
+machines where someone had made it by hand. Every image so far was built on such
+a machine; a clean clone could not build the dashboard at all.
+
+It also could not survive a deploy: deploy/fleet/fleet.sh rsyncs `dashboard`
+with --delete, so shipping from a tree without this directory would have removed
+it from the node as well, breaking any later rebuild there too.
