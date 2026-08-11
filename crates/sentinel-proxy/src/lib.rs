@@ -3003,10 +3003,35 @@ async fn proxy(
 
     // For WebSocket upgrades, preserve the Upgrade and Connection headers so
     // the upstream's HTTP/1.1 upgrade handshake succeeds.
-    if is_ws {
+    //
+    // Gated on the site's `upstream.websocket`. Refusal happens HERE, before the
+    // request leaves us, rather than at the 101 below: strip the upgrade headers
+    // and the origin never switches protocols, so it answers as a plain HTTP
+    // request and the client gets a real response. Refusing after a 101 would be
+    // too late — the origin would already have switched, and a 101 we decline to
+    // relay leaves the client holding a connection that never carries a byte.
+    let ws_allowed = is_ws && site_cfg.upstream.websocket;
+    if ws_allowed {
         strip_hop_by_hop_except_upgrade(&mut parts.headers);
     } else {
         strip_hop_by_hop(&mut parts.headers);
+        // strip_hop_by_hop removes Connection and Upgrade, but Sec-WebSocket-*
+        // are not hop-by-hop and would survive. Drop them too so the origin sees
+        // no trace of a handshake it must not complete.
+        if is_ws {
+            for h in [
+                "sec-websocket-key",
+                "sec-websocket-version",
+                "sec-websocket-extensions",
+                "sec-websocket-protocol",
+            ] {
+                parts.headers.remove(h);
+            }
+            debug!(
+                site = %site_cfg.id,
+                "WebSocket upgrade refused: upstream.websocket is false; forwarding as plain HTTP"
+            );
+        }
     }
     inject_forwarding_headers(&mut parts.headers, peer.ip())?;
 
@@ -3040,6 +3065,21 @@ async fn proxy(
     // If the upstream accepted the upgrade (101 Switching Protocols), wire up
     // the bidirectional relay with WAF frame inspection and return immediately.
     if resp_parts.status == StatusCode::SWITCHING_PROTOCOLS {
+        // Belt-and-braces: we stripped the handshake headers above when the site
+        // disallows WebSockets, so a compliant origin cannot reach here with a 101.
+        // If one does anyway, refuse rather than relay — passing the 101 back
+        // without a relay would hand the client a permanently silent connection,
+        // and relaying would defeat the setting outright.
+        if !ws_allowed {
+            warn!(
+                site = %site_cfg.id,
+                "origin returned 101 though upstream.websocket is false and the \
+                 handshake headers were stripped — refusing to relay"
+            );
+            return Err(anyhow::anyhow!(
+                "upstream switched protocols for a site with WebSockets disabled"
+            ));
+        }
         if let Some(client_upgrade_fut) = ws_upgrade {
             let upstream_upgrade_fut = hyper::upgrade::on(Response::from_parts(
                 resp_parts.clone(),
@@ -7935,6 +7975,7 @@ mod inline_rule_diag_tests {
                 servers: vec![],
                 health_check: None,
                 timeout_secs: None,
+                websocket: false,
             },
             waf: WafConfig {
                 mode: WafMode::Blocking,

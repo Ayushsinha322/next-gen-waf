@@ -747,6 +747,7 @@ fn cmd_site_add(
             health_check: None,
             // Deployment default; per-site overrides come from the control plane.
             timeout_secs: None,
+            websocket: false,
         },
         waf: WafConfig {
             mode: waf_mode.clone(),

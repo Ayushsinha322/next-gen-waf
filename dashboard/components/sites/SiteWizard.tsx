@@ -44,16 +44,24 @@ function Sw({ on, set }: { on: boolean; set: (v: boolean) => void }) {
   return <div className={`tog ${on ? "on" : ""}`} onClick={() => set(!on)} style={{ cursor: "pointer" }} />;
 }
 
-function Tag({ kind }: { kind: "enforced" | "stored" }) {
-  const enforced = kind === "enforced";
+// Three states, and the difference between them matters to whoever is configuring
+// a site:
+//   enforced    the data plane reads this and acts on it
+//   stored      persisted and readable back, but nothing enforces it yet
+//   unavailable not wired up at all — the control is disabled so no one can set a
+//               value that would look saved and silently do nothing
+function Tag({ kind }: { kind: "enforced" | "stored" | "unavailable" }) {
+  const palette = {
+    enforced:    { fg: "var(--green)",            bg: "rgba(0,230,118,.1)",  bd: "rgba(0,230,118,.35)",  text: "● Enforced" },
+    stored:      { fg: "var(--amber, #ffb020)",   bg: "rgba(255,176,32,.1)", bd: "rgba(255,176,32,.35)", text: "◐ Stored" },
+    unavailable: { fg: "var(--text3)",            bg: "rgba(255,255,255,.04)", bd: "rgba(255,255,255,.14)", text: "○ Unavailable" },
+  }[kind];
   return (
     <span style={{
       fontSize: 10.5, fontWeight: 700, letterSpacing: 0.5, padding: "2px 7px", borderRadius: 20,
       fontFamily: "var(--font-mono)", textTransform: "uppercase",
-      color: enforced ? "var(--green)" : "var(--amber, #ffb020)",
-      background: enforced ? "rgba(0,230,118,.1)" : "rgba(255,176,32,.1)",
-      border: `1px solid ${enforced ? "rgba(0,230,118,.35)" : "rgba(255,176,32,.35)"}`,
-    }}>{enforced ? "● Enforced" : "◐ Stored"}</span>
+      color: palette.fg, background: palette.bg, border: `1px solid ${palette.bd}`,
+    }}>{palette.text}</span>
   );
 }
 
@@ -109,12 +117,23 @@ function ChipInput({
   );
 }
 
-function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
+// `unavailable` dims the field and appends the reason to the hint. It does NOT
+// disable the child input by itself — pass `disabled` to that too, so a value
+// cannot be typed into a control that nothing reads.
+function Field({ label, hint, children, unavailable }: {
+  label: string; hint?: string; children: React.ReactNode; unavailable?: string;
+}) {
   return (
-    <div className="fg2">
-      <label className="flbl2">{label}</label>
+    <div className="fg2" style={unavailable ? { opacity: 0.55 } : undefined}>
+      <label className="flbl2">
+        {label}
+        {unavailable && <> <Tag kind="unavailable" /></>}
+      </label>
       {children}
       {hint && <div style={{ fontSize: 11, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>{hint}</div>}
+      {unavailable && (
+        <div style={{ fontSize: 11, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>{unavailable}</div>
+      )}
     </div>
   );
 }
@@ -138,18 +157,28 @@ function Row({ children, cols = "1fr 1fr" }: { children: React.ReactNode; cols?:
   return <div style={{ display: "grid", gridTemplateColumns: cols, gap: 12 }}>{children}</div>;
 }
 
-function SectionToggle({ label, desc, on, set }: { label: string; desc: string; on: boolean; set: (v: boolean) => void }) {
+// `unavailable` renders the toggle inert: dimmed, labelled, and `set` is dropped
+// so flipping it cannot record an intent nothing acts on.
+function SectionToggle({ label, desc, on, set, unavailable }: {
+  label: string; desc: string; on: boolean; set: (v: boolean) => void; unavailable?: string;
+}) {
   return (
     <div style={{
       display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12,
       padding: "10px 14px", background: "rgba(255,255,255,.03)",
       border: "1px solid rgba(255,255,255,.07)", borderRadius: "var(--r2)",
+      opacity: unavailable ? 0.55 : 1,
     }}>
       <div>
-        <div style={{ fontSize: 14, fontWeight: 600, color: "var(--text)" }}>{label}</div>
-        <div style={{ fontSize: 14, color: "var(--text3)", marginTop: 2 }}>{desc}</div>
+        <div style={{ fontSize: 14, fontWeight: 600, color: "var(--text)" }}>
+          {label}
+          {unavailable && <> <Tag kind="unavailable" /></>}
+        </div>
+        <div style={{ fontSize: 14, color: "var(--text3)", marginTop: 2 }}>
+          {unavailable || desc}
+        </div>
       </div>
-      <Sw on={on} set={set} />
+      <Sw on={unavailable ? false : on} set={unavailable ? () => {} : set} />
     </div>
   );
 }
@@ -621,17 +650,34 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                         <Field label="Timeout"><input className="fin2" value={form.health.timeout} onChange={e => upd({ health: { ...form.health, timeout: e.target.value } })} /></Field>
                       </div>
                     )}
-                    <GroupLabel>Proxy Options <Tag kind="stored" /></GroupLabel>
+                    {/* Every control in this group except Read Timeout is dropped by
+                        buildRustUpstream() in the control plane, which forwards only
+                        servers / load_balancer / health_check / timeout_secs. They were
+                        stored, echoed back, and never enforced — so they are disabled
+                        rather than left looking live. Re-enable one only together with
+                        the code that reads it. */}
+                    <GroupLabel>Proxy Options</GroupLabel>
                     <Row>
-                      <Field label="Custom Host Header" hint="Override Host sent upstream (blank = pass-through)"><input className="fin2" value={form.proxy_host_header} placeholder="app.internal" onChange={e => upd({ proxy_host_header: e.target.value })} /></Field>
-                      <Field label="SSL SNI Name" hint="Sent when upstream uses TLS"><input className="fin2" value={form.proxy_ssl_sni_name} placeholder="backend.example.com" onChange={e => upd({ proxy_ssl_sni_name: e.target.value, proxy_ssl_sni: !!e.target.value })} /></Field>
+                      <Field label="Custom Host Header" hint="Override Host sent upstream (blank = pass-through)"
+                             unavailable="Not implemented — the data plane always passes the original Host through.">
+                        <input className="fin2" value={form.proxy_host_header} placeholder="app.internal" disabled readOnly />
+                      </Field>
+                      <Field label="SSL SNI Name" hint="Sent when upstream uses TLS"
+                             unavailable="Not implemented — upstream SNI follows the server host.">
+                        <input className="fin2" value={form.proxy_ssl_sni_name} placeholder="backend.example.com" disabled readOnly />
+                      </Field>
                     </Row>
                     <Row>
                       <SectionToggle label="WebSocket / Upgrade" desc="Allow Connection: Upgrade passthrough" on={form.proxy_websocket} set={v => upd({ proxy_websocket: v })} />
-                      <SectionToggle label="Upstream Keep-Alive" desc="Reuse upstream connections" on={form.proxy_keepalive} set={v => upd({ proxy_keepalive: v })} />
+                      <SectionToggle label="Upstream Keep-Alive" desc="Reuse upstream connections"
+                                     on={form.proxy_keepalive} set={v => upd({ proxy_keepalive: v })}
+                                     unavailable="Not implemented — upstream keep-alive is always on." />
                     </Row>
                     <Row>
-                      <Field label="Connect Timeout"><input className="fin2" value={form.proxy_connect_timeout} onChange={e => upd({ proxy_connect_timeout: e.target.value })} /></Field>
+                      <Field label="Connect Timeout"
+                             unavailable="Not implemented per-site — set SENTINEL_UPSTREAM_CONNECT_TIMEOUT_SECS on the node.">
+                        <input className="fin2" value={form.proxy_connect_timeout} disabled readOnly />
+                      </Field>
                       <Field label="Read Timeout"><input className="fin2" value={form.proxy_read_timeout} onChange={e => upd({ proxy_read_timeout: e.target.value })} title="How long the origin may take to return response headers (e.g. 60s, 5m). Raise it for slow report/export endpoints. It does not limit download or SSE stream duration. Blank = node default (30s)." /></Field>
                     </Row>
                   </>)}
