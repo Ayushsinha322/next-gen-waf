@@ -46,6 +46,35 @@ sites:
         path: /healthz
         interval: 5s
         timeout: 2s
+      # How long the origin may take to return response HEADERS. Omit for the
+      # node default (SENTINEL_UPSTREAM_TIMEOUT_SECS). Capped at 600s by the API.
+      timeout_secs: 60
+      # TCP + TLS setup only — fails fast on an unreachable origin without
+      # shortening the budget of one that is merely slow. Omit for the node
+      # default (10s, SENTINEL_UPSTREAM_CONNECT_TIMEOUT_SECS); clamped to 1..60.
+      # A node honours at most 8 DISTINCT values, since each needs its own
+      # connection pool; a site past the cap falls back to the node default and
+      # logs that it did.
+      connect_timeout_secs: 5
+      # WebSocket upgrades, off unless asked for. With this false the proxy strips
+      # Upgrade/Connection/Sec-WebSocket-* before the request leaves it, so the
+      # origin never switches protocols. Silence means false: this gate replaced
+      # an ungated relay, so inheriting "allowed" would keep that fail-open alive.
+      websocket: false
+      # Pool and reuse upstream connections. Defaults to TRUE when absent — the
+      # opposite of websocket, deliberately: false sends `Connection: close` and
+      # costs a fresh TCP (plus TLS) handshake per request.
+      keepalive: true
+      # Replace `Host` on the UPSTREAM request only; site matching, WAF evaluation
+      # and logging still see the host the client sent. Omit to pass it through.
+      # host_header: "internal.example.com"
+      # SNI presented to an HTTPS origin when it differs from the address dialled
+      # — required when the origin is addressed by IP, since TLS forbids an IP
+      # literal as a server name. This is also what the origin's certificate is
+      # verified against. Two sites sharing one origin host:port cannot hold
+      # different names; the clash is warned and the last site loaded wins. On a
+      # plaintext server (tls: false) it is ignored — there is no handshake.
+      # sni_name: "app.internal"
     waf:
       mode: blocking                # off | learning | blocking
       paranoia_level: 2             # 1..4 (CRS-style)

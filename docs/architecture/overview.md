@@ -41,6 +41,17 @@ This separation lets us use the right language for each job and lets us scale th
 
 Every phase is a hook list; rules and WASM plugins register against phases.
 
+Phase 3 also applies the **per-site upstream controls** — the WebSocket upgrade
+gate (`upstream.websocket`, off by default: the upgrade headers are stripped
+before the request reaches the origin, so it never switches protocols), the
+`Host` override, upstream keep-alive, the connect timeout, and the SNI presented
+to an HTTPS origin. The first three are per *request* and cheap. The last two are
+per *client*: they live in the connector rather than the request, so each distinct
+value costs its own hyper client and idle-connection pool — a node honours 8
+distinct connect timeouts before falling back to its default, and an SNI override
+is keyed by upstream authority, which two sites sharing one origin cannot
+disagree about.
+
 ## 3. Why Rust + Go (not pure Go, not pure Rust)
 
 - **Pure Rust:** great perf, but slower iteration on REST/admin code, smaller hiring pool.

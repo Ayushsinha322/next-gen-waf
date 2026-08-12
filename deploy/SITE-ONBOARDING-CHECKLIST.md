@@ -33,12 +33,13 @@ every app, and nothing warns you when they aren't — the app just returns 413, 
 | 1.12 | Is there PII in **responses** that must be masked (DLP)? | |
 | 1.13 | Who owns the app, and who do we call at 2am? | |
 | 1.14 | Maintenance window for the cutover | |
+| 1.15 | If the origin is **HTTPS** (1.2): what name is on its certificate, and does it vhost on a name the client never sends? | |
 
 ---
 
 ## 2. Settings that must be chosen, not defaulted
 
-These four are the ones that break apps. Set them in the site wizard
+These five are the ones that break apps. Set them in the site wizard
 (**Sites → New Site**) or in the API `upstream` / `waf_policy` blocks.
 
 ### 2.1 Max Body — default **10 MB**
@@ -74,6 +75,20 @@ redirect returns 403 and nobody can sign in.
 ### 2.4 Max Headers — default **100**
 Raise to **200** for apps behind corporate SSO that accumulate many cookies.
 
+### 2.5 WebSocket — default **off**
+From answer 1.8. Upgrades are refused unless the site turns on **WebSocket /
+Upgrade** (wizard → *Reverse Proxy → Proxy Options*, or `upstream.proxy.websocket:
+true`). With the gate closed the WAF strips `Upgrade`, `Connection` and the
+`Sec-WebSocket-*` headers **before the request leaves it**, so the origin never
+switches protocols and the client gets an ordinary HTTP response rather than a
+socket that opens and then goes silent.
+
+This was ungated until August 2026: the relay fired on any `101` from the origin
+and the toggle enforced nothing, so a site set to `false` still got a full
+bidirectional relay. **A site that uses WebSockets and never set the flag will
+stop upgrading.** Set it to `true` at cutover and prove it with 4.7 — a chat or
+live-dashboard feature is exactly the kind of thing a homepage check misses.
+
 ### Also check
 
 - **Load balancing** (1.3, 1.10): default is round-robin. Choose **IP hash** if
@@ -84,6 +99,40 @@ Raise to **200** for apps behind corporate SSO that accumulate many cookies.
   origin is only detected reactively by the circuit breaker, after real users
   have already hit errors.
 - **Origin TLS** (1.2): set `tls: true` per server for an HTTPS origin.
+- **Origin SNI** (1.15), `proxy.ssl_sni` + `proxy.ssl_sni_name`: the server name
+  presented to an HTTPS origin when it differs from the address dialled.
+  **Required when the origin is addressed by IP** — TLS forbids an IP literal as
+  a server name, so without it the origin gets a handshake with no SNI and a
+  vhosted or SNI-strict origin answers with the wrong certificate, or refuses.
+  Both keys are needed: a name with the toggle off is not forwarded at all. The
+  name is also what the origin's certificate is **verified against**, so a wrong
+  value fails the handshake loudly instead of reaching the wrong vhost quietly.
+  Two sites pointing at the *same* origin host:port cannot hold different names —
+  SNI is resolved from the destination address, which cannot tell them apart. The
+  clash is logged as a warning and the **last site loaded wins**, so give them one
+  name or give the origins distinct addresses. Setting it on a plaintext server
+  (`tls: false`) is ignored and warned: there is no handshake to put a name in.
+- **Host header** (1.15, `proxy.host_header`): replaces `Host` on the request
+  sent upstream — for an origin that vhosts on a name the client never uses. Blank
+  passes the client's `Host` through, which is what most origins want. It applies
+  **only** to the upstream request: site matching, WAF evaluation and the logs all
+  still see the host the client actually sent.
+- **Upstream keep-alive** (`proxy.keepalive`): on by default, and should stay on.
+  Off sends `Connection: close` and costs a fresh TCP — plus TLS — handshake on
+  every single request. Turn it off only for an origin that mishandles pooled
+  connections. It is skipped for a WebSocket upgrade, where it would contradict
+  `Connection: Upgrade`.
+- **Connect Timeout** (`proxy.connect_timeout`): **10 s** node-wide, and the
+  wizard pre-fills **5 s** on a new site. Per-site, clamped to **1–60 s** at both
+  the API and the data plane. This bounds TCP + TLS setup only —
+  it fails fast on an unreachable origin without shortening the budget of one
+  that is merely slow (that is Read Timeout, 2.2). A node honours at most **8
+  distinct** per-site values, because each needs its own connection pool; a site
+  beyond the cap falls back to the node default and logs that it did. Pick from a
+  small set of values rather than a bespoke one per site.
+  > Only applied when the site is **saved through the wizard** — the seconds value
+  > the data plane reads is promoted from the duration string on save. Sites
+  > created before this shipped keep the node default until someone re-saves them.
 - **DLP** (1.12): off by default. Turning it on makes the WAF buffer response
   bodies up to 512 KB. Larger responses are forwarded **uninspected** and a
   warning is logged — check the logs, don't assume full coverage.
@@ -132,7 +181,14 @@ curl -sk -o /dev/null -w '%{http_code} in %{time_total}s\n' https://$HOST/<slow-
 
 # 4.6  SSO login works end to end (1.7) — do the real login, in a browser
 
-# 4.7  WebSocket connects and stays up (1.8) — exercise the real feature
+# 4.7  WebSocket connects and stays up (1.8) — requires proxy.websocket: true (2.5).
+#      Wire check that the upgrade is not being stripped on the way out:
+curl -isk -N --max-time 5 -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+     -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+     https://$HOST/<ws-path> | head -1        # expect HTTP/1.1 101 Switching Protocols
+#      With the gate closed you get an ordinary response (200/404) instead — that is
+#      the refusal, not a failure. Then exercise the real feature: a 101 proves the
+#      handshake, not that frames flow.
 
 # 4.8  Large download completes and the byte count matches (1.11)
 curl -sk -o /tmp/dl.bin -w '%{size_download}\n' https://$HOST/<large-file>
@@ -185,7 +241,12 @@ If the app breaks after cutover:
 | Origin(s) | |
 | Max body (MB) | |
 | Read timeout (s) | |
+| Connect timeout (s) | |
 | Max URI / headers | |
+| WebSocket | on / off |
+| Host header override | |
+| Origin SNI name | |
+| Upstream keep-alive | on / off |
 | LB strategy | |
 | Health check path | |
 | DLP | on / off |
