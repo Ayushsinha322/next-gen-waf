@@ -121,8 +121,19 @@ fi
 # self-inflicted test attacks.
 #
 # So say so, loudly, rather than letting a padded denominator read as a pass.
-probe_iv=$(grep -oE '^\s*interval\s+[0-9]+' /etc/keepalived/keepalived.conf 2>/dev/null \
-             | grep -oE '[0-9]+' | head -1)
+# Absence of keepalived is an EXPECTED state, not an error: the standalone and
+# 3-node-cluster topologies have no /etc/keepalived/keepalived.conf at all. Under
+# `set -euo pipefail` the bare grep pipeline below used to exit non-zero there,
+# which killed the whole report at this assignment — silently, right after the
+# volume block, so it read as "the report ended" rather than "the report died".
+# The gate tool failing closed on the very topology being piloted is worse than
+# no probe estimate, so the lookup is guarded and its absence simply means "no
+# self-generated probes to warn about".
+probe_iv=""
+if [ -r /etc/keepalived/keepalived.conf ]; then
+  probe_iv=$(grep -oE '^[[:space:]]*interval[[:space:]]+[0-9]+' /etc/keepalived/keepalived.conf 2>/dev/null \
+               | grep -oE '[0-9]+' | head -1 || true)
+fi
 probe_est=0
 if [ -n "${probe_iv:-}" ] && [ "${probe_iv:-0}" -gt 0 ]; then
   # Two nodes in this topology, each probing itself.

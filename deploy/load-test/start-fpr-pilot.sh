@@ -141,7 +141,10 @@ declare -A NEW_POLICY
 declare -A SITE_JSON
 
 for id in "${SITES[@]}"; do
-  SITE=$(api GET "/sites/$id")
+  # GET /sites/:id wraps the object as {"site":{…}} while GET /sites returns a
+  # bare array. Unwrap both shapes rather than assuming one — an unwrap that is
+  # wrong reads as "site not found", which is indistinguishable from a bad id.
+  SITE=$(api GET "/sites/$id" | jq -c '.site // .')
   NAME=$(jq -r '.name // .id // empty' <<<"$SITE")
   [ -n "$NAME" ] || die "site '$id' not found via the API — check the id with: $0 --help"
   SITE_JSON[$id]="$SITE"
@@ -225,7 +228,7 @@ for id in "${SITES[@]}"; do
   echo "  ─ $NAME"
 
   # (a) the operator's own path
-  A=$(api GET "/sites/$id" | jq -r '.waf_policy.mode // "unset"')
+  A=$(api GET "/sites/$id" | jq -r '(.site // .) | .waf_policy.mode // "unset"')
   if [ "$A" = "learning" ]; then green "      ✓ API read-back: learning"
   else red "      ✗ API read-back: $A"; FAILED=1; fi
 
