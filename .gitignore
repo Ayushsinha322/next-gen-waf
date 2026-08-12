@@ -82,3 +82,6 @@ deploy/docker/.env
 
 # GoTestWAF benchmark output (regenerated per run)
 deploy/load-test/detection-reports/
+
+# local credential scratch — never commit
+pswdwaf
