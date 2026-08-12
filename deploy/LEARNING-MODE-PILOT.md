@@ -33,6 +33,23 @@ genuine attacks.**
 `WafMode::Learning` is the enum default, but be explicit per site — an omitted
 mode is easy to misread as intent.
 
+**Use the script rather than a hand-written PATCH:**
+
+```bash
+SENTINEL_ADMIN_PASSWORD=… ./deploy/load-test/start-fpr-pilot.sh <site-id> [<site-id>…]
+#                                                                --dry-run to preview
+```
+
+It reads each site's current policy and sends it back **whole** with only `mode`
+replaced (a partial `waf_policy` risks dropping sub-objects such as `ml`), records
+the pre-pilot traffic baseline so you can see what was already in the denominator,
+warns when a site is not on the benchmarked threshold-10 posture or is reachable
+by bare IP, and then verifies the flip **three ways** — API read-back, the stored
+row, and a live SQLi on the wire that must now return 200. It exits non-zero if
+those three disagree, because storage is not retrieval and neither is enforcement.
+
+The equivalent by hand, if you must:
+
 ```
 PATCH /api/v1/sites/<id>
 { "waf_policy": { "mode": "learning", "paranoia_level": 2, "anomaly_threshold": 10 } }
