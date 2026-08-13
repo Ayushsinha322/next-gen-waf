@@ -3,7 +3,20 @@
 **Product:** Next-Gen ESDSWAF
 **Vendor:** ESDS Software Solution Ltd — SIG-CyberSec
 
-## Full guides — in this package
+## Operator manual — in this package
+
+**If you are new to this product, start here.** Five short documents written for
+operations, not for developers: [`docs/manual/`](docs/manual/README.md)
+
+| I want to… | Read |
+|---|---|
+| Install on a fresh VM, step by step | [`docs/manual/INSTALL.md`](docs/manual/INSTALL.md) |
+| Put a website behind the WAF | [`docs/manual/SITE-ONBOARDING.md`](docs/manual/SITE-ONBOARDING.md) |
+| Run it day to day — users, certificates, backups, upgrades | [`docs/manual/ADMIN-GUIDE.md`](docs/manual/ADMIN-GUIDE.md) |
+| Fix something broken | [`docs/manual/TROUBLESHOOTING.md`](docs/manual/TROUBLESHOOTING.md) |
+| Undo something | [`docs/manual/ROLLBACK.md`](docs/manual/ROLLBACK.md) |
+
+## Deployment references — in this package
 
 | Deploying | Read |
 |---|---|

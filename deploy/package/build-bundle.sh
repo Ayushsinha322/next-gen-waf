@@ -182,6 +182,18 @@ cp deploy/docker/.env.example "$STAGE/configs/env.example"
 for d in STANDALONE.md ACTIVE-PASSIVE.md; do
   cp "deploy/$d" "$STAGE/docs/" 2>/dev/null || warn "missing guide: deploy/$d"
 done
+# The operator manual. The two guides above are installation procedures; these are
+# the documents someone RUNS the product from — and the audience is explicitly not
+# the developer. They live in their own subdirectory with their filenames intact:
+# the five pages cross-link each other by relative name, so flattening or renaming
+# them into docs/ would ship a manual whose every internal link is broken.
+# Copied by name, not by glob, so a renamed or deleted page warns here rather than
+# going missing silently.
+mkdir -p "$STAGE/docs/manual"
+for d in README.md INSTALL.md ADMIN-GUIDE.md SITE-ONBOARDING.md TROUBLESHOOTING.md ROLLBACK.md; do
+  cp "deploy/manual/$d" "$STAGE/docs/manual/$d" 2>/dev/null \
+    || warn "missing manual page: deploy/manual/$d"
+done
 [[ -f docs/WAFDocuments/Next-Gen-ESDSWAF-Deployment-Guide.pdf ]] \
   && cp docs/WAFDocuments/Next-Gen-ESDSWAF-Deployment-Guide.pdf "$STAGE/docs/" \
   || warn "deployment guide PDF not found — bundle ships without docs"
