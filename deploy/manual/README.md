@@ -1,17 +1,35 @@
 # Next-Gen ESDSWAF — Operator Manual
 
-Five documents. **Start with the one that matches what you are doing right now.**
+## Installing? You need exactly one document
 
-| I want to… | Read | Time |
-|---|---|---|
-| Install the WAF on a fresh VM | **[INSTALL.md](INSTALL.md)** | 30 min |
-| Put a website behind the WAF | **[SITE-ONBOARDING.md](SITE-ONBOARDING.md)** | 20 min + a learning period |
-| Run it day to day — users, certificates, backups, upgrades | **[ADMIN-GUIDE.md](ADMIN-GUIDE.md)** | reference |
-| Fix something that is broken | **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** | reference |
-| Undo something | **[ROLLBACK.md](ROLLBACK.md)** | reference |
+### 👉 **[INSTALL-WALKTHROUGH.md](../vm-deploy/INSTALL-WALKTHROUGH.md)**
 
-You do not need to read these in order, and you do not need to know how the WAF
-works internally to use them.
+Empty VM → download → install → dashboard open → a real attack blocked. **One
+file, start to finish, nothing to cross-reference.** Every command can be copied
+and pasted, and it was written by following it on a real machine.
+
+Do not read anything else on this page until you have finished it.
+
+---
+
+## Afterwards — running the thing
+
+These four are **reference**, not reading. Open the one that matches the question
+you have:
+
+| I want to… | Read |
+|---|---|
+| Put a real customer website behind the WAF, properly | **[SITE-ONBOARDING.md](SITE-ONBOARDING.md)** |
+| Run it day to day — users, certificates, backups, upgrades | **[ADMIN-GUIDE.md](ADMIN-GUIDE.md)** |
+| Fix something that is broken | **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** |
+| Undo something | **[ROLLBACK.md](ROLLBACK.md)** |
+
+> **Why is site onboarding covered twice?** The walkthrough adds a *test* site in
+> five minutes, to prove the WAF works. SITE-ONBOARDING.md is for a **real
+> customer application** — what to ask the app owner first, the settings that
+> break real apps, the certificate, the DNS cutover, and the gate you must pass
+> before switching on blocking. Use the walkthrough to learn the product; use
+> SITE-ONBOARDING.md when someone is depending on it.
 
 ---
 
@@ -19,7 +37,8 @@ works internally to use them.
 
 ```
 Fresh VM  →  Install  →  Login  →  Add website  →  Backend  →  TLS  →  DNS  →  Test  →  Monitor
-└──────────── INSTALL.md ────────┘  └──────────────── SITE-ONBOARDING.md ────────────────────┘
+└─────── INSTALL-WALKTHROUGH.md ───────┘
+                                   └────────────── SITE-ONBOARDING.md ──────────────────┘
 ```
 
 ## What the WAF actually is

@@ -23,7 +23,7 @@ mistake:
 
 | Variant | Size | Needs Docker Hub at install? |
 |---|---|---|
-| `-offline` | ~2 GB | **No.** All nine images travel inside the bundle |
+| `-offline` | 733 MB (published as 4 parts) | **No.** All ten images travel inside the bundle |
 | `-online` | ~250 MB | **Yes.** Five supporting images are pulled during install |
 
 If the VM has no outbound internet — which is normal for a management network —
@@ -294,7 +294,7 @@ cd /path/to/waf-development
 
 | Variant | Effect |
 |---|---|
-| `BUNDLE_THIRD_PARTY=1` | Bundle all nine images — fully offline, ~2 GB, no Docker Hub needed at install |
+| `BUNDLE_THIRD_PARTY=1` | Bundle all ten images — fully offline, 733 MB, no Docker Hub needed at install |
 | `SKIP_BUILD=1` | Reuse images already built locally (iterating on the script only) |
 
 Output lands in `dist/` as `ESDSWAF-v<version>.tar.gz` plus its `.sha256`. Rename

@@ -30,7 +30,7 @@ section tells you what to check, in order, cheapest check first.
 | Login works but SSO login fails | [§5](#5-403-on-legitimate-traffic-false-positive) |
 | Live chat / live dashboard stopped working | [§12](#12-websockets-stopped-working) |
 | Application logs show the WAF's IP, not visitors' | [§13](#13-origin-sees-the-wrong-client-ip) |
-| Everything returns 502 on a brand-new install | Normal — no sites yet. [INSTALL.md](INSTALL.md) §4 |
+| Everything returns 502 on a brand-new install | Normal — no sites yet. [INSTALL-WALKTHROUGH.md](../vm-deploy/INSTALL-WALKTHROUGH.md) §4 |
 
 ---
 

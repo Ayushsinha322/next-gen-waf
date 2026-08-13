@@ -25,7 +25,7 @@
 # The consequence must be stated wherever the bundle is described: THE INSTALL IS
 # NOT AIR-GAPPED. install.sh therefore checks Docker Hub reachability in preflight
 # and aborts early with a clear message rather than dying halfway through. For a
-# genuinely offline site, run with BUNDLE_THIRD_PARTY=1 to include all nine.
+# genuinely offline site, run with BUNDLE_THIRD_PARTY=1 to include all ten.
 # =============================================================================
 set -euo pipefail
 
@@ -190,10 +190,20 @@ done
 # Copied by name, not by glob, so a renamed or deleted page warns here rather than
 # going missing silently.
 mkdir -p "$STAGE/docs/manual"
-for d in README.md INSTALL.md ADMIN-GUIDE.md SITE-ONBOARDING.md TROUBLESHOOTING.md ROLLBACK.md; do
+for d in README.md ADMIN-GUIDE.md SITE-ONBOARDING.md TROUBLESHOOTING.md ROLLBACK.md; do
   cp "deploy/manual/$d" "$STAGE/docs/manual/$d" 2>/dev/null \
     || warn "missing manual page: deploy/manual/$d"
 done
+# The install walkthrough — the ONE document a first-time operator reads, and the
+# only one that covers download-to-dashboard without cross-referencing anything.
+# It goes to docs/vm-deploy/ rather than docs/ because the manual pages link to it
+# as ../vm-deploy/INSTALL-WALKTHROUGH.md: that relative path then resolves
+# identically in the repo (deploy/manual → deploy/vm-deploy) and in the bundle
+# (docs/manual → docs/vm-deploy), so the same link works in both places instead of
+# being right in one and broken in the other.
+mkdir -p "$STAGE/docs/vm-deploy"
+cp deploy/vm-deploy/INSTALL-WALKTHROUGH.md "$STAGE/docs/vm-deploy/" 2>/dev/null \
+  || warn "missing guide: deploy/vm-deploy/INSTALL-WALKTHROUGH.md"
 [[ -f docs/WAFDocuments/Next-Gen-ESDSWAF-Deployment-Guide.pdf ]] \
   && cp docs/WAFDocuments/Next-Gen-ESDSWAF-Deployment-Guide.pdf "$STAGE/docs/" \
   || warn "deployment guide PDF not found — bundle ships without docs"

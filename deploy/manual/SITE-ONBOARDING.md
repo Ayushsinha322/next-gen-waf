@@ -86,7 +86,7 @@ ssh -L 9443:127.0.0.1:9443 root@<waf-vm-ip>      # run on your own machine
 ```
 
 Then browse to **https://127.0.0.1:9443** and log in. (Full explanation of why
-the tunnel is needed: [INSTALL.md](INSTALL.md) §3.)
+the tunnel is needed: [INSTALL-WALKTHROUGH.md](../vm-deploy/INSTALL-WALKTHROUGH.md) §3.)
 
 ---
 

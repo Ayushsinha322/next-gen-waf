@@ -1,7 +1,7 @@
 # Next-Gen ESDSWAF — Administrator Guide
 
 **Who this is for:** whoever runs the WAF day to day — SOC, NOC, or the platform
-team. It assumes the WAF is installed ([INSTALL.md](INSTALL.md)) and covers
+team. It assumes the WAF is installed ([INSTALL-WALKTHROUGH.md](../vm-deploy/INSTALL-WALKTHROUGH.md)) and covers
 operating it: users, certificates, backups, upgrades, health, and who is
 responsible for what.
 
@@ -66,7 +66,7 @@ Then **https://127.0.0.1:9443**.
 The console is bound to loopback deliberately — it is an admin interface for a
 security appliance, and exposing it on a network interface would expose it to
 everything that network touches, including the internet if the host is ever given
-a public IP. Full explanation in [INSTALL.md](INSTALL.md) §3.
+a public IP. Full explanation in [INSTALL-WALKTHROUGH.md](../vm-deploy/INSTALL-WALKTHROUGH.md) §3.
 
 There is also a plain-HTTP break-glass UI on `127.0.0.1:3000` and Grafana on
 `127.0.0.1:3001`, both loopback-only, both reachable the same way (`ssh -L
@@ -348,7 +348,7 @@ from Events or from the block page, the site name, the time, and
 
 ## Related
 
-- [INSTALL.md](INSTALL.md) — installing on a fresh VM
+- [INSTALL-WALKTHROUGH.md](../vm-deploy/INSTALL-WALKTHROUGH.md) — installing on a fresh VM
 - [SITE-ONBOARDING.md](SITE-ONBOARDING.md) — putting a website behind the WAF
 - [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — symptom to cause to fix
 - [ROLLBACK.md](ROLLBACK.md) — undoing things, at every level
