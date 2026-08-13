@@ -117,8 +117,12 @@ green "  ✓ authenticated as $EMAIL"
 if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "$UP_HOST"; then
   green "  ✓ origin container matching '$UP_HOST' is running"
 else
-  die "no running container matches '$UP_HOST'. Start it first:
-       cd /opt/sentinel-src/deploy/docker && docker compose --profile ghost -f compose.prod.yml up -d ghost
+  die "no running container matches '$UP_HOST'. Start it first, using the SAME
+     -f chain the stack is running (docker inspect sentinel-waf1-1 --format
+     '{{index .Config.Labels \"com.docker.compose.project.config_files\"}}'):
+       cd /opt/sentinel-src/deploy/docker && docker compose \\
+         -f compose.prod.yml -f compose.cluster.yml -f compose.ha.yml \\
+         --profile ghost up -d ghost-db ghost
      Without it every request to $DOMAIN returns 502."
 fi
 

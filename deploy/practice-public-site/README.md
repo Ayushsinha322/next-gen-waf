@@ -104,10 +104,21 @@ the **public** `https://` URL, not the container address. Wrong here fails
 quietly: the page renders, then stylesheets 404 or the login bounces in a
 redirect loop, because Ghost is sending the browser somewhere it cannot reach.
 
+**Use the same `-f` chain the running stack was brought up with**, or compose is
+looking at a different project than the one that exists. On `.71` that is three
+files, not one — the box runs the clustered/HA topology (`waf1-3`, `cp2-3`, `lb`).
+Confirm rather than assume, because the consequence of getting it wrong is
+operating on the wrong set of services:
+
 ```bash
 cd /opt/sentinel-src/deploy/docker
-docker compose -f compose.prod.yml --profile ghost up -d ghost-db ghost
-docker compose -f compose.prod.yml logs -f ghost   # wait for "Ghost is running"
+docker inspect sentinel-waf1-1 \
+  --format '{{index .Config.Labels "com.docker.compose.project.config_files"}}'
+# → compose.prod.yml,compose.cluster.yml,compose.ha.yml   (as of 2026-08-13)
+
+C="-f compose.prod.yml -f compose.cluster.yml -f compose.ha.yml"
+docker compose $C --profile ghost up -d ghost-db ghost
+docker compose $C logs -f ghost      # wait for "Ghost is running"
 ```
 
 The box has 16 GB and the WAF stack already claims most of it; these two add
@@ -292,7 +303,11 @@ measurement — that is what the 16.67% from the .71 rehearsal was.
 # site first, so nothing routes to a dead origin
 curl -sk -X DELETE https://127.0.0.1:9443/api/v1/sites/<id> -H "Authorization: Bearer $TOKEN"
 cd /opt/sentinel-src/deploy/docker
-docker compose -f compose.prod.yml --profile ghost down
+C="-f compose.prod.yml -f compose.cluster.yml -f compose.ha.yml"
+# `rm -sf` the two services BY NAME. Do NOT use `docker compose down` here: down
+# acts on the whole project, so it would stop the data plane, control plane and
+# ClickHouse along with Ghost — taking the WAF off the air to remove a blog.
+docker compose $C --profile ghost rm -sf ghost ghost-db
 # Only if you want the content gone. Find the real names rather than guessing the
 # compose project prefix: docker volume ls | grep ghost
 docker volume ls --format '{{.Name}}' | grep ghost | xargs -r docker volume rm
