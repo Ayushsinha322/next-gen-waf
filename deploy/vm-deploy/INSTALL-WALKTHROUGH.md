@@ -279,13 +279,43 @@ If you lose it:
 docker logs sentinel-controlplane-1 2>&1 | grep -A1 'GENERATED password'
 ```
 
-Check everything came up:
+### 6.6 Check it really worked
+
+```bash
+./verify.sh
+```
+
+This is read-only and safe to run at any time. It prints **PASS** or **FAIL** for
+each area — containers, backing stores, database schema, data plane, listeners,
+enforcement, certificates — along with the evidence it used. All PASS means the
+install is genuinely good, not just "no red text appeared".
+
+You can also look directly:
 
 ```bash
 docker compose -p sentinel ps
 ```
 
-All eight rows should say `Up`.
+All eight rows should say `Up`. (A ninth, `migrate`, runs the database setup once
+and then exits — it is *supposed* to be gone.)
+
+### 6.7 ⚠️ Do not delete this folder
+
+You are in `/root/waf/ESDSWAF-v1.0.0`. **Keep it.**
+
+`verify.sh`, `upgrade.sh`, `rollback.sh` and `uninstall.sh` live **only** here. The
+installer copies the compose files and the operational `scripts/` into
+`/opt/sentinel/current`, but not those four. Delete this folder and you cannot
+verify, upgrade, roll back or cleanly uninstall until you download all 733 MB
+again.
+
+Move it somewhere permanent and write the path down:
+
+```bash
+cd / && mv /root/waf/ESDSWAF-v1.0.0 /opt/ && cd /opt/ESDSWAF-v1.0.0
+```
+
+From now on, "run `./verify.sh`" means: `cd /opt/ESDSWAF-v1.0.0` first.
 
 ---
 
@@ -345,11 +375,25 @@ setup, works even with no internet:
 | Field | Value |
 |---|---|
 | Name | `test-site` |
+| **Security Mode** | **`Learning`** — set this explicitly, see below |
 | Domain | `test.local` |
 | Upstream host | `grafana` |
 | Upstream port | `3000` |
 
 Click save.
+
+> ### Set Security Mode to `Learning` yourself — do not trust the default
+>
+> The dropdown may already say `Blocking`. **Change it to `Learning`.**
+>
+> This matters for the next part: in Learning mode the WAF *identifies* an attack
+> and records it without blocking, which is what lets you see the difference
+> between the two modes in Part 9. Set it deliberately and you know which state
+> you are in, rather than guessing from what the form happened to pre-select.
+>
+> It is also the right habit for real sites. A new site's false-positive rate
+> against *your* traffic is unknown until it has seen some, so Learning first is
+> the rule, not the exception.
 
 ### What these fields mean
 
@@ -388,6 +432,13 @@ Expected result:
 normal: 200
 sqli:   200
 ```
+
+### Got `sqli: 403` instead?
+
+Then the site is in **Blocking** mode, not Learning — the mode dropdown in Part 8
+was left on `Blocking`. Nothing is broken: you have just proved the blocking half
+first. Set the site to **Learning**, re-run the command to see `200`, and then
+carry on — the point is to see *both* modes and understand the difference.
 
 ### "The attack returned 200 — did it fail?"
 
@@ -488,3 +539,16 @@ cat /var/log/sentinel/install.log
 - **Download page:** https://git.enlight.dev/research-lab/SIG-CyberSec/sentinel-waf/-/packages
 - **Full standalone guide:** `docs/STANDALONE.md` (inside the bundle)
 - **Two-VM high availability:** `docs/ACTIVE-PASSIVE.md` (inside the bundle)
+
+### Once this walkthrough is done — the operator manual
+
+You have finished the only document you needed to get running. These four are
+**reference**, for when you have a specific question. Open the one that matches it;
+there is no need to read them through.
+
+| Question | Document |
+|---|---|
+| How do I put a **real customer** website behind the WAF? | [`../manual/SITE-ONBOARDING.md`](../manual/SITE-ONBOARDING.md) — what to ask the app owner, the settings that break real apps, certificates, the DNS cutover, and the gate to pass before blocking |
+| How do I run this day to day? | [`../manual/ADMIN-GUIDE.md`](../manual/ADMIN-GUIDE.md) — users and roles, certificates, backups, upgrades, monitoring, who owns what |
+| Something is broken | [`../manual/TROUBLESHOOTING.md`](../manual/TROUBLESHOOTING.md) — symptom → cause → fix |
+| How do I undo something? | [`../manual/ROLLBACK.md`](../manual/ROLLBACK.md) — every level of undo, and what each one costs |

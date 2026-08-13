@@ -259,4 +259,9 @@ If the app breaks after cutover:
 
 - [LEARNING-MODE-PILOT.md](./LEARNING-MODE-PILOT.md) — the go-live gate in detail
 - [DEPLOYMENT-CHECKLIST.md](./DEPLOYMENT-CHECKLIST.md) — platform install, not per-app
+- [practice-public-site/](./practice-public-site/) — this checklist executed rather
+  than read, for a real site on a publicly reachable address. Read its
+  `pre-exposure-audit.sh` before putting **any** WAF host on a public address:
+  site matching is by Host header alone, so a public address makes every site on
+  the node reachable by whoever guesses a domain, not just the one you onboarded
 - [../OPERATIONS.md](../OPERATIONS.md) — day-to-day operation of the box

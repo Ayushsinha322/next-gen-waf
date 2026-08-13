@@ -3,7 +3,29 @@
 **Product:** Next-Gen ESDSWAF
 **Vendor:** ESDS Software Solution Ltd — SIG-CyberSec
 
-## Full guides — in this package
+## New to this product? One document, start to finish
+
+### 👉 [`docs/vm-deploy/INSTALL-WALKTHROUGH.md`](docs/vm-deploy/INSTALL-WALKTHROUGH.md)
+
+Empty VM → install → console open → a real attack blocked. Every command can be
+copied and pasted, no prior knowledge of this product assumed, and nothing to
+cross-reference while you work. It was written by following it on a real machine.
+
+The rest of this page is the condensed version for people who have done it before.
+
+## Operator manual — for after you are running
+
+Reference, not reading. Open the one that matches your question:
+[`docs/manual/`](docs/manual/README.md)
+
+| I want to… | Read |
+|---|---|
+| Put a **real customer** website behind the WAF | [`docs/manual/SITE-ONBOARDING.md`](docs/manual/SITE-ONBOARDING.md) |
+| Run it day to day — users, certificates, backups, upgrades | [`docs/manual/ADMIN-GUIDE.md`](docs/manual/ADMIN-GUIDE.md) |
+| Fix something broken | [`docs/manual/TROUBLESHOOTING.md`](docs/manual/TROUBLESHOOTING.md) |
+| Undo something | [`docs/manual/ROLLBACK.md`](docs/manual/ROLLBACK.md) |
+
+## Deployment references — in this package
 
 | Deploying | Read |
 |---|---|
@@ -71,7 +93,7 @@ than before. Support will be added once genuinely tested.
 
 ### Network access
 
-This package contains the four ESDSWAF images. Five supporting images are pulled
+This package contains the four ESDSWAF images. Six supporting images are pulled
 from Docker Hub on first install:
 
 ```
@@ -80,6 +102,7 @@ redis:7-alpine
 clickhouse/clickhouse-server:24-alpine
 prom/prometheus:v2.54.1
 grafana/grafana:11.2.0
+haproxy:2.9-alpine                  # only used by the two-VM / HA topology
 ```
 
 So **the install is not fully offline.** The installer checks registry
@@ -88,8 +111,8 @@ reachability up front and tells you plainly if it cannot get there.
 If your site has no egress, either:
 
 - configure a registry mirror in `/etc/docker/daemon.json`, or
-- pre-pull those five images onto the host, or
-- **ask ESDS for the fully offline bundle**, which contains all nine images.
+- pre-pull those six images onto the host, or
+- **ask ESDS for the fully offline bundle**, which contains all ten images.
 
 ---
 
