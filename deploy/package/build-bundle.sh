@@ -158,7 +158,21 @@ cp deploy/docker/haproxy.cfg               "$STAGE/compose/" 2>/dev/null \
 cp -r deploy/docker/grafana                "$STAGE/compose/" 2>/dev/null || true
 
 # Operational scripts the customer legitimately needs.
-for s in preflight.sh verify-deploy.sh promote-standby.sh \
+#
+# verify-deploy.sh is NOT one of them and was removed from this list. It is an
+# internal check for the ESDS 3-node HA cluster: it `cd`s to /opt/sentinel-src
+# (install.sh creates /opt/sentinel/current and never that path) under `set -uo
+# pipefail` with no `-e`, so the failed cd does not stop it; it then expects the
+# services cp2/cp3/waf1/waf2/waf3/lb/juiceshop, none of which exist in a
+# standalone install, and probes with a hardcoded `Host: 172.16.21.71`. Run on a
+# perfectly healthy customer install it printed roughly fourteen red FAILs,
+# including "benign GET / -> 502" and "SQLi -> 502 (expected 403)".
+#
+# It shipped beside preflight.sh and the cert issuers, under a header reading
+# "Post-deploy verification", so an operator troubleshooting an install would
+# reasonably run it — and then either believe their install was broken or stop
+# trusting verification output altogether. verify.sh is the customer tool.
+for s in preflight.sh promote-standby.sh \
          issue-ip-cert.sh issue-postgres-cert.sh issue-clickhouse-cert.sh \
          pg-init-replication.sh pg-standby-entrypoint.sh; do
   cp "deploy/docker/$s" "$STAGE/scripts/" 2>/dev/null || warn "missing script: $s"

@@ -560,23 +560,46 @@ health_fail=0
 hc "Postgres"      docker exec sentinel-postgres-1 pg_isready -U sentinel -d sentinel || health_fail=1
 hc "Redis"         docker exec sentinel-redis-1 redis-cli ping                        || health_fail=1
 hc "ClickHouse"    bash -c "docker exec sentinel-clickhouse-1 wget -qO- http://127.0.0.1:8123/ping | grep -q Ok" || health_fail=1
-# These two replace `docker exec ... /controllerd --version || true`, which could
-# not fail for two separate reasons: `--version` only proved the BINARY was in the
+# These replace `docker exec ... /controllerd --version || true`, which could not
+# fail for two separate reasons: `--version` only proved the BINARY was in the
 # image (true even for a container crash-looping on a bad DSN), and the `|| true`
 # discarded the verdict anyway. The installer could therefore report a successful
 # install with no working control plane — i.e. no console, which is the whole
 # management interface.
-hc "Control plane" bash -c 'test "$(docker inspect -f "{{.State.Status}}" sentinel-controlplane-1 2>/dev/null)" = running' || health_fail=1
+#
+# `State.Status = running` was the next attempt and is still not enough. When the
+# control plane cannot reach Postgres it does not exit: it logs one WARN ("DB
+# unavailable — running in degraded mode") and serves forever with a nil store.
+# The container reports `running` permanently, so this check passes on an install
+# whose every login returns 503. It also passes on a crash-looping container
+# caught in one of its brief running windows — compose sets `restart:
+# unless-stopped` and defines no healthcheck for this service.
+#
+# /readyz calls store.Ping and reports db ok|unavailable|unreachable. It is the
+# only endpoint that distinguishes the two. (/health is a hardcoded 200 that never
+# touches the database.) 9501 is unpublished and the image is distroless, so probe
+# it from a container that has a shell on the same network.
+hc "Control plane → DB" bash -c '
+  docker exec sentinel-clickhouse-1 wget -qO- --timeout=5 http://controlplane:9501/readyz 2>/dev/null \
+    | grep -q "\"db\"[[:space:]]*:[[:space:]]*\"ok\""' || health_fail=1
 hc "Data plane"    bash -c "curl -fsS --max-time 3 http://127.0.0.1:80/healthz >/dev/null" || health_fail=1
 # :443 was never probed by any check, which is how a default certificate issued for
 # the wrong network shipped unnoticed. No -f here on purpose: with no sites yet the
 # WAF correctly answers 502, and a 502 still proves the TLS handshake completed and
 # a certificate was served. Only a handshake or connection failure fails this.
 hc "TLS on :443"   bash -c 'curl -sk --max-time 5 -o /dev/null https://127.0.0.1:443/' || health_fail=1
-# End-to-end: the management listener answering proves the data plane's console
-# is up AND proxying to the control plane. It is the first thing the operator will
-# touch, so failing here now beats them discovering it themselves.
-hc "Console :9443" bash -c 'curl -sk --max-time 5 -o /dev/null -w "%{http_code}" https://127.0.0.1:9443/ | grep -qE "^[234]"' || health_fail=1
+# End-to-end: the management listener answering. It is the first thing the
+# operator will touch, so failing here now beats them discovering it themselves.
+#
+# The path matters. `/` does NOT reach the control plane: the management listener
+# routes only /api/* there and everything else to the dashboard (see the `base`
+# selection in crates/sentinel-proxy/src/lib.rs), so `/` was answered by Next.js
+# redirecting to /login — a 307 that matched `^[234]` while proving nothing about
+# the control plane, contrary to what this comment used to claim. Probe an /api
+# path so the request actually traverses proxy → control plane. 401 is the
+# expected unauthenticated answer and is a pass; what is being tested is that
+# something on the far side spoke HTTP at all.
+hc "Console :9443" bash -c 'curl -sk --max-time 5 -o /dev/null -w "%{http_code}" https://127.0.0.1:9443/api/v1/sites | grep -qE "^[24]"' || health_fail=1
 
 # The generated password is the SECOND line of the seed banner emitted by
 # control-plane/internal/db/seed.go:

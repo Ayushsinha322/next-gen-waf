@@ -48,6 +48,46 @@ docker exec sentinel-redis-1 redis-cli ping 2>/dev/null | grep -q PONG \
 docker exec sentinel-clickhouse-1 wget -qO- http://127.0.0.1:8123/ping 2>/dev/null | grep -q Ok \
   && pass "ClickHouse responding" || bad "ClickHouse not responding"
 
+step "Control plane → database"
+# THE FAILURE THIS EXISTS TO CATCH IS SILENT AND PERMANENT.
+#
+# If the control plane cannot reach Postgres within its 60s startup window it does
+# NOT exit. It logs one WARN — "DB unavailable — running in degraded mode (mock
+# data only)" — and serves forever with a nil store, never retrying. Every check
+# above still passes: the container status is `running`, Postgres itself is
+# healthy, and a fresh install legitimately has no sites. The script would print
+# "All checks passed", and the operator's first login would return 503
+# "authentication unavailable: no user database configured".
+#
+# Triggers seen in practice: Postgres slower than 60s after a host reboot (Docker's
+# restart policy does not re-apply depends_on ordering), a regenerated pg-server.crt
+# against the sslmode=verify-full DSN, or a plain Postgres restart.
+#
+# /readyz is the ONLY endpoint that reports this: it calls store.Ping and returns
+# db ok|unavailable|unreachable. Do NOT use /health — it is a hardcoded
+# `{"status":"ok"}` that never touches the database.
+#
+# 9501 is not published to the host, and the control-plane image is distroless
+# with no shell, so probe from a container that has one and shares the network —
+# the same trick used for the ClickHouse check above.
+RDY=$(docker exec sentinel-clickhouse-1 wget -qO- --timeout=5 http://controlplane:9501/readyz 2>/dev/null)
+if [[ -z "$RDY" ]]; then
+  bad "control plane /readyz did not answer — it is not serving, or not on the sentinel network"
+elif printf '%s' "$RDY" | grep -q '"db"[[:space:]]*:[[:space:]]*"ok"'; then
+  pass "control plane is connected to its database"
+else
+  bad "control plane is running WITHOUT a database — every login will return 503
+       $RDY
+       It will not reconnect on its own. Restart it after Postgres is healthy:
+         docker restart sentinel-controlplane-1"
+fi
+# Belt and braces: the warning is logged once at startup and is the only trace if
+# the container is later restarted into a good state while the pool stays nil.
+if docker logs sentinel-controlplane-1 2>&1 | grep -qE 'degraded mode|running standalone'; then
+  bad "control plane logged degraded mode at startup — it has NO database
+       docker logs sentinel-controlplane-1 2>&1 | grep -E 'degraded mode|running standalone'"
+fi
+
 step "Database schema"
 n=$(docker exec sentinel-postgres-1 psql -U sentinel -d sentinel -tAc \
       "select count(*) from information_schema.tables where table_schema='public';" 2>/dev/null | tr -dc '0-9')
