@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Next-Gen ESDSWAF — Competitive Capability Assessment</title>
+<title>SwarajKavach — Competitive Capability Assessment</title>
 <style>
   @page { size: A4; margin: 14mm 12mm 16mm 12mm; }
 
@@ -27,8 +27,9 @@
     margin:0 0 14px;
   }
   .band .eyebrow{ font-size:7.6pt; letter-spacing:.16em; text-transform:uppercase; opacity:.72; }
-  .band h1{ margin:5px 0 3px; font-size:19pt; line-height:1.18; font-weight:650; letter-spacing:-.2px; }
-  .band .sub{ font-size:9.6pt; opacity:.86; }
+  .band h1{ margin:5px 0 1px; font-size:23pt; line-height:1.1; font-weight:680; letter-spacing:-.4px; }
+  .band .prod{ font-size:12pt; font-weight:600; opacity:.95; margin-bottom:4px; letter-spacing:-.1px; }
+  .band .sub{ font-size:9.4pt; opacity:.84; }
   .band .meta{
     margin-top:11px; padding-top:9px; border-top:1px solid rgba(255,255,255,.2);
     display:flex; gap:26px; font-size:8.2pt; opacity:.85; flex-wrap:wrap;
@@ -37,7 +38,7 @@
 
   /* ---------- structure ---------- */
   h2{
-    font-size:11.4pt; margin:22px 0 8px; padding-bottom:5px;
+    font-size:11.4pt; margin:17px 0 7px; padding-bottom:5px;
     border-bottom:2px solid var(--brand); color:var(--brand);
     letter-spacing:-.1px; font-weight:650;
   }
@@ -57,7 +58,7 @@
   /* ---------- callouts ---------- */
   .note{
     background:var(--band); border-left:3px solid var(--brand-2);
-    padding:9px 11px; margin:10px 0 12px; font-size:8.8pt; color:var(--ink-2);
+    padding:8px 11px; margin:9px 0 10px; font-size:8.8pt; color:var(--ink-2);
   }
   .note.warn{ border-left-color:var(--warn); background:#fdf8ee; }
   .note .t{ font-weight:650; color:var(--ink); display:block; margin-bottom:2px; }
@@ -69,7 +70,8 @@
     background:var(--brand); color:#fff; font-weight:600; font-size:7.8pt;
     letter-spacing:.03em; text-transform:uppercase; padding:6px;
   }
-  tbody tr:nth-child(even){ background:#fafbfc; }
+  /* No zebra striping — every data row is the same colour. */
+  tbody tr{ background:#fff; }
   .grp td{
     background:var(--band) !important; font-weight:650; font-size:8pt;
     color:var(--brand); text-transform:uppercase; letter-spacing:.05em; padding:5px 6px;
@@ -140,7 +142,7 @@
   h2{ page-break-after:avoid; }
 
   footer{
-    margin-top:20px; padding-top:8px; border-top:1px solid var(--line);
+    margin-top:11px; padding-top:6px; border-top:1px solid var(--line);
     font-size:7.6pt; color:var(--ink-3);
   }
 </style>
@@ -149,7 +151,8 @@
 
 <div class="band">
   <div class="eyebrow">ESDS Software Solution Ltd &nbsp;·&nbsp; Internal — prepared for CTO review</div>
-  <h1>Next-Gen ESDSWAF<br>Competitive Capability Assessment</h1>
+  <h1>SwarajKavach</h1>
+  <div class="prod">Next-Gen ESDSWAF &nbsp;·&nbsp; Competitive Capability Assessment</div>
   <div class="sub">Where we stand against the market leaders, what ships today, and what the roadmap closes</div>
   <div class="meta">
     <div><b>Release</b> &nbsp;v1.0.0 (offline bundle)</div>
@@ -159,10 +162,11 @@
 </div>
 
 <p class="lede">
-  This document compares Next-Gen ESDSWAF against the five vendors that appear on every
-  industry shortlist. It is written to be checkable: every capability claimed for ESDSWAF
-  is marked by whether it <b>ships and has been tested</b>, is <b>partial</b>, or is
-  <b>roadmap</b>. Nothing is listed as delivered on the strength of a design document.
+  This document compares <b>SwarajKavach</b> — the Next-Gen ESDSWAF platform — against the
+  five vendors that appear on every industry shortlist. It is written to be checkable:
+  every capability claimed for ESDSWAF is marked by whether it <b>ships and has been
+  tested</b>, is <b>partial</b>, or is <b>roadmap</b>. Nothing is listed as delivered on
+  the strength of a design document.
 </p>
 
 <div class="note warn">
@@ -649,7 +653,7 @@
   has since been the focus of two build phases.
 </p>
 
-<h2 class="pb"><span class="n">5</span>Roadmap — what closes, and what does not</h2>
+<h2><span class="n">5</span>Roadmap — what closes, and what does not</h2>
 
 <p class="lede">
   Most gaps in §4 are scheduled. Two are not, and saying so is what makes the rest
@@ -758,8 +762,9 @@
   active. Failover: two independent probes at 0.3 s intervals, each response validated on
   status code and byte count. Test counts measured 13 August 2026.
   <br><br>
-  Next-Gen ESDSWAF v1.0.0 &nbsp;·&nbsp; ESDS Software Solution Ltd &nbsp;·&nbsp; Internal —
-  not for external distribution without review of the competitor columns.
+  <b>SwarajKavach</b> &nbsp;·&nbsp; Next-Gen ESDSWAF v1.0.0 &nbsp;·&nbsp; ESDS Software
+  Solution Ltd &nbsp;·&nbsp; Internal — not for external distribution without review of
+  the competitor columns.
 </footer>
 
 </body>
