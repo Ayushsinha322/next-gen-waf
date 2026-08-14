@@ -79,12 +79,15 @@
   td.c, th.c{ text-align:center; }
   /* NB: this column class must NOT be called "note" — it would collide with the
      .note callout rule and Chrome paints a <col> border-left under collapse. */
-  col.cap{ width:25%; }
-  col.us{ width:11%; }
+  col.cap{ width:24%; }
+  col.us{ width:12%; }
   col.v{ width:7%; }
   col.ev{ width:29%; }
   .us-col{ background:#f0f6f3 !important; font-weight:600; }
-  thead th.us-col{ background:var(--accent); }
+  /* The body tint carries !important, so the header cell needs it too or the
+     white header text lands on the pale tint and becomes unreadable. Header
+     stays the same blue as every other column; the tint below marks our column. */
+  thead th.us-col{ background:var(--brand) !important; border-bottom:2.5px solid var(--accent); }
   .why{ font-size:7.4pt; color:var(--ink-3); line-height:1.38; }
 
   /* ---------- marks ---------- */
@@ -219,13 +222,13 @@
   <thead>
     <tr>
       <th>Capability</th>
-      <th class="c us-col">ESDSWAF</th>
+      <th class="c us-col">Swaraj<wbr>Kavach</th>
       <th class="c">Cloud&shy;flare</th>
       <th class="c">Akamai</th>
       <th class="c">Imperva</th>
       <th class="c">F5</th>
       <th class="c">AWS WAF</th>
-      <th>ESDSWAF evidence / note</th>
+      <th>SwarajKavach evidence / note</th>
     </tr>
   </thead>
   <tbody>
@@ -535,7 +538,7 @@
   Competitor marks reflect publicly documented capabilities as of August 2026 and are
   directional for internal planning. They are not contract-grade and should be
   re-verified against current vendor documentation before any customer-facing use. The
-  ESDSWAF column is the one verified against source code and test output.
+  SwarajKavach column is the one verified against source code and test output.
 </div>
 
 <h2><span class="n">3</span>Measured proof</h2>
@@ -755,7 +758,7 @@
 </div>
 
 <footer>
-  <b>Verification method.</b> The ESDSWAF column was compiled by inspecting the source
+  <b>Verification method.</b> The SwarajKavach column was compiled by inspecting the source
   tree, test output and measured benchmark results — not from prior decks or roadmap
   documents, both of which were found to overstate several capabilities. Detection figures:
   GoTestWAF v0.5.8 against an all-methods origin. Performance: single node, full pipeline
