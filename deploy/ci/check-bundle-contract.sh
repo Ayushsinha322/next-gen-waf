@@ -88,7 +88,7 @@ sect "Tree layout"
 for d in bundle compose configs scripts docs scripts/2vm; do
   [[ -d "$STAGE/$d" ]] && pass "$d/" || fail "$d/ missing"
 done
-for f in install.sh uninstall.sh verify.sh upgrade.sh rollback.sh README.md SHA256SUMS; do
+for f in install.sh uninstall.sh verify.sh first-site.sh upgrade.sh rollback.sh README.md SHA256SUMS; do
   [[ -f "$STAGE/$f" ]] && pass "$f" || fail "$f missing"
 done
 
