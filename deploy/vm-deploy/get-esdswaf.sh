@@ -20,7 +20,7 @@ set -uo pipefail
 GITLAB_HOST="${GITLAB_HOST:-git.enlight.dev}"
 PROJECT_ID="${PROJECT_ID:-1301}"
 PKG_NAME="esdswaf"
-VERSION="${ESDSWAF_VERSION:-1.0.0}"
+VERSION="${ESDSWAF_VERSION:-1.0.1}"
 VARIANT="offline"
 
 while [[ $# -gt 0 ]]; do
