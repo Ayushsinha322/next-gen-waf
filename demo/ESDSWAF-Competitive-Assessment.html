@@ -1,0 +1,766 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Next-Gen ESDSWAF — Competitive Capability Assessment</title>
+<style>
+  @page { size: A4; margin: 14mm 12mm 16mm 12mm; }
+
+  :root{
+    --ink:#14181f; --ink-2:#3d4654; --ink-3:#6b7686;
+    --line:#d8dee7; --line-2:#eef1f5;
+    --brand:#0b2545; --brand-2:#13457e; --accent:#0d7d5a;
+    --warn:#8a5a00; --bad:#9b2226;
+    --band:#f5f7fa;
+  }
+
+  *{ box-sizing:border-box; }
+  html{ -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+  body{
+    margin:0; font-family:"Segoe UI",-apple-system,Roboto,Helvetica,Arial,sans-serif;
+    color:var(--ink); font-size:9.4pt; line-height:1.5;
+  }
+
+  /* ---------- cover band ---------- */
+  .band{
+    background:var(--brand); color:#fff; padding:15px 17px 13px;
+    margin:0 0 14px;
+  }
+  .band .eyebrow{ font-size:7.6pt; letter-spacing:.16em; text-transform:uppercase; opacity:.72; }
+  .band h1{ margin:5px 0 3px; font-size:19pt; line-height:1.18; font-weight:650; letter-spacing:-.2px; }
+  .band .sub{ font-size:9.6pt; opacity:.86; }
+  .band .meta{
+    margin-top:11px; padding-top:9px; border-top:1px solid rgba(255,255,255,.2);
+    display:flex; gap:26px; font-size:8.2pt; opacity:.85; flex-wrap:wrap;
+  }
+  .band .meta b{ font-weight:600; opacity:1; }
+
+  /* ---------- structure ---------- */
+  h2{
+    font-size:11.4pt; margin:22px 0 8px; padding-bottom:5px;
+    border-bottom:2px solid var(--brand); color:var(--brand);
+    letter-spacing:-.1px; font-weight:650;
+  }
+  h2 .n{
+    display:inline-block; min-width:19px; height:19px; line-height:19px; text-align:center;
+    background:var(--brand); color:#fff; border-radius:3px; font-size:8.4pt;
+    margin-right:7px; font-weight:600; vertical-align:1px;
+  }
+  h3{ font-size:9.6pt; margin:15px 0 6px; color:var(--brand-2); font-weight:650; }
+  p{ margin:0 0 8px; }
+  .lede{ font-size:9.8pt; color:var(--ink-2); }
+  ul{ margin:0 0 9px; padding-left:16px; }
+  li{ margin-bottom:3.5px; }
+  b,strong{ font-weight:640; }
+  code{ font-family:"Cascadia Mono",Consolas,monospace; font-size:8.4pt; background:var(--line-2); padding:.5px 3px; border-radius:2px; }
+
+  /* ---------- callouts ---------- */
+  .note{
+    background:var(--band); border-left:3px solid var(--brand-2);
+    padding:9px 11px; margin:10px 0 12px; font-size:8.8pt; color:var(--ink-2);
+  }
+  .note.warn{ border-left-color:var(--warn); background:#fdf8ee; }
+  .note .t{ font-weight:650; color:var(--ink); display:block; margin-bottom:2px; }
+
+  /* ---------- tables ---------- */
+  table{ width:100%; table-layout:fixed; border-collapse:collapse; margin:8px 0 12px; font-size:8.5pt; }
+  th,td{ border:1px solid var(--line); padding:4px 5px; text-align:left; vertical-align:top; word-wrap:break-word; }
+  thead th{
+    background:var(--brand); color:#fff; font-weight:600; font-size:7.8pt;
+    letter-spacing:.03em; text-transform:uppercase; padding:6px;
+  }
+  tbody tr:nth-child(even){ background:#fafbfc; }
+  .grp td{
+    background:var(--band) !important; font-weight:650; font-size:8pt;
+    color:var(--brand); text-transform:uppercase; letter-spacing:.05em; padding:5px 6px;
+  }
+  td.c, th.c{ text-align:center; }
+  /* NB: this column class must NOT be called "note" — it would collide with the
+     .note callout rule and Chrome paints a <col> border-left under collapse. */
+  col.cap{ width:25%; }
+  col.us{ width:11%; }
+  col.v{ width:7%; }
+  col.ev{ width:29%; }
+  .us-col{ background:#f0f6f3 !important; font-weight:600; }
+  thead th.us-col{ background:var(--accent); }
+  .why{ font-size:7.4pt; color:var(--ink-3); line-height:1.38; }
+
+  /* ---------- marks ---------- */
+  /* Marks are drawn with CSS, not glyphs: the half-filled character was
+     illegible at this size in print. font-size:0 hides the fallback glyph. */
+  .m{
+    display:inline-block; width:9.5px; height:9.5px; border-radius:50%;
+    font-size:0; line-height:0; vertical-align:middle; box-sizing:border-box;
+  }
+  .m-y{ background:var(--accent); }                                   /* shipped */
+  .m-p{                                                               /* partial  */
+    border:1.2px solid var(--warn);
+    background:linear-gradient(90deg,var(--warn) 0 50%,#fff 50% 100%);
+  }
+  .m-r{ border:1.5px solid var(--brand-2); background:#fff; }         /* roadmap  */
+  .m-n{                                                               /* none     */
+    border:1.2px solid #c3c9d3;
+    background:linear-gradient(45deg,transparent 43%,#c3c9d3 43%,#c3c9d3 57%,transparent 57%);
+  }
+
+  .legend{ display:flex; gap:15px; flex-wrap:wrap; font-size:8.2pt; margin:6px 0 12px; color:var(--ink-2); }
+  .legend span b{ margin-right:4px; }
+
+  /* ---------- metric cards ---------- */
+  /* Grid, not flex: flex items refuse to shrink below min-content and were
+     overflowing the print margin, clipping the third card. */
+  /* 2px inset: at exactly 100% the last column's right border lands on the
+     print clip edge and Chrome drops it. */
+  .cards{
+    display:grid; grid-template-columns:repeat(3,minmax(0,1fr));
+    gap:8px; margin:10px 0 12px; width:calc(100% - 2px);
+  }
+  .card{
+    min-width:0; border:1px solid var(--line);
+    border-top:3px solid var(--accent); padding:8px 10px; background:#fff;
+  }
+  .card .k{ font-size:15pt; font-weight:680; color:var(--brand); line-height:1.1; letter-spacing:-.4px; }
+  .card .l{ font-size:7.8pt; text-transform:uppercase; letter-spacing:.07em; color:var(--ink-3); margin-top:2px; }
+  .card .s{ font-size:7.7pt; color:var(--ink-2); margin-top:4px; line-height:1.35; }
+
+  /* ---------- two-col ---------- */
+  .two{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; width:calc(100% - 2px); }
+  .two > div{ min-width:0; }
+  .box{ border:1px solid var(--line); padding:9px 11px; }
+  .box.good{ border-top:3px solid var(--accent); }
+  .box.bad{ border-top:3px solid var(--bad); }
+  .box h4{ margin:0 0 6px; font-size:9pt; color:var(--brand); font-weight:650; }
+  .box ul{ padding-left:15px; margin:0; font-size:8.4pt; }
+
+  /* ---------- print control ---------- */
+  .pb{ page-break-before:always; }
+  .cards, .two{ page-break-inside:avoid; }
+  tr{ page-break-inside:avoid; }
+  thead{ display:table-header-group; }
+  h2{ page-break-after:avoid; }
+
+  footer{
+    margin-top:20px; padding-top:8px; border-top:1px solid var(--line);
+    font-size:7.6pt; color:var(--ink-3);
+  }
+</style>
+</head>
+<body>
+
+<div class="band">
+  <div class="eyebrow">ESDS Software Solution Ltd &nbsp;·&nbsp; Internal — prepared for CTO review</div>
+  <h1>Next-Gen ESDSWAF<br>Competitive Capability Assessment</h1>
+  <div class="sub">Where we stand against the market leaders, what ships today, and what the roadmap closes</div>
+  <div class="meta">
+    <div><b>Release</b> &nbsp;v1.0.0 (offline bundle)</div>
+    <div><b>Assessment date</b> &nbsp;14 August 2026</div>
+    <div><b>Engine</b> &nbsp;Rust data plane · Go control plane</div>
+  </div>
+</div>
+
+<p class="lede">
+  This document compares Next-Gen ESDSWAF against the five vendors that appear on every
+  industry shortlist. It is written to be checkable: every capability claimed for ESDSWAF
+  is marked by whether it <b>ships and has been tested</b>, is <b>partial</b>, or is
+  <b>roadmap</b>. Nothing is listed as delivered on the strength of a design document.
+</p>
+
+<div class="note warn">
+  <span class="t">Why the marks matter</span>
+  An internal audit on 13 August 2026 checked our own customer deck against the source
+  tree and found six capabilities claimed as shipped that the code did not support. All six
+  were corrected. This assessment applies the same standard from the outset — which is why
+  several rows below are deliberately less flattering than earlier material.
+</div>
+
+<h2><span class="n">1</span>Market position — the comparison that is actually ours to win</h2>
+
+<p>
+  The five recognised leaders are <b>Cloudflare</b>, <b>Akamai</b> and <b>Imperva</b>
+  (Gartner Leaders in the Cloud WAAP Magic Quadrant), with <b>AWS WAF</b> as a Challenger
+  and <b>F5</b> holding regulated enterprise. The market is <b>fragmented — no vendor
+  exceeds 15% share</b>, so there is no dominant incumbent to displace.
+</p>
+
+<p>
+  Four of those five are global anycast edge platforms. Competing with them on edge
+  footprint would mean building a multi-terabit CDN, and any comparison framed that way is
+  one we lose on capital, not on engineering. <b>The segment ESDSWAF addresses is the one
+  they structurally cannot serve:</b>
+</p>
+
+<ul>
+  <li><b>Data that must remain on-premise and in-country</b> — the binding constraint for Indian BFSI, government and healthcare, and the reason F5 and Fortinet still hold regulated verticals.</li>
+  <li><b>Delivered by the hosting provider</b> — the customer's workload is already in an ESDS datacenter. That is a distribution advantage none of the five have with our customers.</li>
+  <li><b>Single-tenant and customer-dedicated</b> — dedicated inspection, not a shared multi-tenant edge.</li>
+  <li><b>Fully air-gapped operation</b> — installs and runs with no outbound internet dependency.</li>
+</ul>
+
+<p>
+  Our real competitive set is therefore <b>F5</b> and <b>Imperva</b>, plus in India
+  <b>Indusface AppTrana</b>, <b>HaltDOS</b> and our own <b>eNlight Pratihar</b>.
+</p>
+
+<h2><span class="n">2</span>Capability comparison</h2>
+
+<div class="legend">
+  <span><b class="m m-y">●</b> Ships today, tested</span>
+  <span><b class="m m-p">◐</b> Partial or opt-in</span>
+  <span><b class="m m-r">○</b> On roadmap, not shipped</span>
+  <span><b class="m m-n">✕</b> Not offered</span>
+</div>
+
+<table>
+  <colgroup><col class="cap"><col class="us"><col class="v"><col class="v"><col class="v"><col class="v"><col class="v"><col class="ev"></colgroup>
+  <thead>
+    <tr>
+      <th>Capability</th>
+      <th class="c us-col">ESDSWAF</th>
+      <th class="c">Cloud&shy;flare</th>
+      <th class="c">Akamai</th>
+      <th class="c">Imperva</th>
+      <th class="c">F5</th>
+      <th class="c">AWS WAF</th>
+      <th>ESDSWAF evidence / note</th>
+    </tr>
+  </thead>
+  <tbody>
+
+    <tr class="grp"><td colspan="8">Core request inspection</td></tr>
+    <tr>
+      <td>OWASP CRS signature engine</td>
+      <td class="c us-col"><span class="m m-y">●</span></td>
+      <td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td>
+      <td class="why">Compiled to a bytecode rule VM, not interpreted per request</td>
+    </tr>
+    <tr>
+      <td>Dedicated SQLi / XSS parser</td>
+      <td class="c us-col"><span class="m m-y">●</span></td>
+      <td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td>
+      <td class="why">libinjection, plus ML n-gram classifier layered on top</td>
+    </tr>
+    <tr>
+      <td>Request-smuggling / protocol abuse</td>
+      <td class="c us-col"><span class="m m-y">●</span></td>
+      <td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-p">◐</span></td>
+      <td class="why">Enforced at parse time in the Rust data plane</td>
+    </tr>
+    <tr>
+      <td>ML anomaly detection</td>
+      <td class="c us-col"><span class="m m-y">●</span></td>
+      <td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-p">◐</span></td><td class="c"><span class="m m-p">◐</span></td>
+      <td class="why">Isolation Forest + char-n-gram classifier + FP-suppression model, all embedded</td>
+    </tr>
+    <tr>
+      <td>Weighted multi-engine verdict fusion</td>
+      <td class="c us-col"><span class="m m-y">●</span></td>
+      <td class="c"><span class="m m-p">◐</span></td><td class="c"><span class="m m-p">◐</span></td><td class="c"><span class="m m-p">◐</span></td><td class="c"><span class="m m-n">✕</span></td><td class="c"><span class="m m-n">✕</span></td>
+      <td class="why">7 scoring engines fused per paranoia level; adds a 429 soft-deny tier between allow and block</td>
+    </tr>
+    <tr>
+      <td>Positive security / entity auto-learning</td>
+      <td class="c us-col"><span class="m m-r">○</span></td>
+      <td class="c"><span class="m m-p">◐</span></td><td class="c"><span class="m m-p">◐</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-n">✕</span></td>
+      <td class="why"><b>Gap.</b> F5's core differentiator. Ours is a configuration toggle only — v1.1</td>
+    </tr>
+
+    <tr class="grp"><td colspan="8">Bot &amp; client identity</td></tr>
+    <tr>
+      <td>JA3 / JA4 TLS fingerprinting</td>
+      <td class="c us-col"><span class="m m-y">●</span></td>
+      <td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-p">◐</span></td><td class="c"><span class="m m-n">✕</span></td>
+      <td class="why">Real JA4 from a non-destructive ClientHello peek; live values observed</td>
+    </tr>
+    <tr>
+      <td>Weighted bot scoring with tiered response</td>
+      <td class="c us-col"><span class="m m-y">●</span></td>
+      <td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-p">◐</span></td><td class="c"><span class="m m-p">◐</span></td>
+      <td class="why">0–100 score from JA4 + headers + UA + repeat-offender velocity → allow / JS challenge / CAPTCHA / block</td>
+    </tr>
+    <tr>
+      <td>JS proof-of-work challenge</td>
+      <td class="c us-col"><span class="m m-y">●</span></td>
+      <td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-n">✕</span></td><td class="c"><span class="m m-n">✕</span></td>
+      <td class="why">—</td>
+    </tr>
+    <tr>
+      <td>Third-party CAPTCHA integration</td>
+      <td class="c us-col"><span class="m m-y">●</span></td>
+      <td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-p">◐</span></td><td class="c"><span class="m m-p">◐</span></td><td class="c"><span class="m m-n">✕</span></td><td class="c"><span class="m m-n">✕</span></td>
+      <td class="why">reCAPTCHA / hCaptcha / Turnstile server-side siteverify</td>
+    </tr>
+    <tr>
+      <td>Verified good-bot allow-listing (rDNS)</td>
+      <td class="c us-col"><span class="m m-r">○</span></td>
+      <td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-p">◐</span></td><td class="c"><span class="m m-n">✕</span></td>
+      <td class="why"><b>Gap.</b> Reverse-DNS verification deferred — tracked as issue #8</td>
+    </tr>
+
+    <tr class="grp"><td colspan="8">API protection (WAAP)</td></tr>
+    <tr>
+      <td>GraphQL firewall</td>
+      <td class="c us-col"><span class="m m-y">●</span></td>
+      <td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-p">◐</span></td><td class="c"><span class="m m-p">◐</span></td>
+      <td class="why">Depth + complexity limits, introspection block</td>
+    </tr>
+    <tr>
+      <td>Edge JWT / OAuth2 validation</td>
+      <td class="c us-col"><span class="m m-y">●</span></td>
+      <td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-p">◐</span></td>
+      <td class="why">Signature, exp, iss, aud, scopes; fixed alg allow-list, proof against alg&nbsp;confusion and alg:none</td>
+    </tr>
+    <tr>
+      <td>JWKS with key rotation</td>
+      <td class="c us-col"><span class="m m-y">●</span></td>
+      <td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-p">◐</span></td><td class="c"><span class="m m-n">✕</span></td>
+      <td class="why">Key-by-kid, 300s TTL, refresh on unknown kid, stale-while-error</td>
+    </tr>
+    <tr>
+      <td>gRPC firewall</td>
+      <td class="c us-col"><span class="m m-y">●</span></td>
+      <td class="c"><span class="m m-p">◐</span></td><td class="c"><span class="m m-p">◐</span></td><td class="c"><span class="m m-p">◐</span></td><td class="c"><span class="m m-p">◐</span></td><td class="c"><span class="m m-n">✕</span></td>
+      <td class="why">Per-method allow/deny, reflection block, message and frame size caps</td>
+    </tr>
+    <tr>
+      <td>API auto-discovery from traffic</td>
+      <td class="c us-col"><span class="m m-r">○</span></td>
+      <td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-p">◐</span></td>
+      <td class="why"><b>Gap.</b> Toggle only today — v1.1</td>
+    </tr>
+    <tr>
+      <td>OpenAPI schema enforcement · BOLA/IDOR</td>
+      <td class="c us-col"><span class="m m-r">○</span></td>
+      <td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-n">✕</span></td>
+      <td class="why"><b>Gap.</b> v1.1</td>
+    </tr>
+
+    <tr class="grp"><td colspan="8">Availability &amp; volumetric defence</td></tr>
+    <tr>
+      <td>Global anycast multi-Tbps DDoS scrubbing</td>
+      <td class="c us-col"><span class="m m-n">✕</span></td>
+      <td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-p">◐</span></td><td class="c"><span class="m m-y">●</span></td>
+      <td class="why"><b>Structural, not a roadmap item</b> — see §5. Requires a CDN, not a WAF</td>
+    </tr>
+    <tr>
+      <td>Kernel-level L4 drop (eBPF / XDP)</td>
+      <td class="c us-col"><span class="m m-p">◐</span></td>
+      <td class="c"><span class="m m-n">✕</span></td><td class="c"><span class="m m-n">✕</span></td><td class="c"><span class="m m-n">✕</span></td><td class="c"><span class="m m-n">✕</span></td><td class="c"><span class="m m-n">✕</span></td>
+      <td class="why"><b>Only vendor with anything in this row.</b> Opt-in build feature; verified in-kernel on Linux 6.8 with in-kernel drop counters. Falls back to software mode if attach fails</td>
+    </tr>
+    <tr>
+      <td>L7 rate limiting</td>
+      <td class="c us-col"><span class="m m-y">●</span></td>
+      <td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td>
+      <td class="why">Redis-backed, distributed across nodes</td>
+    </tr>
+    <tr>
+      <td>Adaptive L7 DDoS (EWMA / storm detection)</td>
+      <td class="c us-col"><span class="m m-r">○</span></td>
+      <td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-p">◐</span></td><td class="c"><span class="m m-p">◐</span></td>
+      <td class="why"><b>Gap.</b> Post-v1.1</td>
+    </tr>
+    <tr>
+      <td>Admission control under overload</td>
+      <td class="c us-col"><span class="m m-y">●</span></td>
+      <td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td>
+      <td class="why">Measured: zero false shedding at 21k req/s sustained</td>
+    </tr>
+
+    <tr class="grp"><td colspan="8">Data protection &amp; threat intelligence</td></tr>
+    <tr>
+      <td>Outbound DLP on responses</td>
+      <td class="c us-col"><span class="m m-y">●</span></td>
+      <td class="c"><span class="m m-p">◐</span></td><td class="c"><span class="m m-n">✕</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-p">◐</span></td><td class="c"><span class="m m-n">✕</span></td>
+      <td class="why">block / mask / detect, length-preserving masking</td>
+    </tr>
+    <tr>
+      <td>India-specific PII detection</td>
+      <td class="c us-col"><span class="m m-y">●</span></td>
+      <td class="c"><span class="m m-n">✕</span></td><td class="c"><span class="m m-n">✕</span></td><td class="c"><span class="m m-p">◐</span></td><td class="c"><span class="m m-n">✕</span></td><td class="c"><span class="m m-n">✕</span></td>
+      <td class="why"><b>Differentiator.</b> PAN, Aadhaar and Indian mobile patterns built in</td>
+    </tr>
+    <tr>
+      <td>Threat-intelligence feed ingestion</td>
+      <td class="c us-col"><span class="m m-y">●</span></td>
+      <td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-p">◐</span></td>
+      <td class="why">Aggregator + data-plane enforcer; can seed the kernel blocklist directly</td>
+    </tr>
+    <tr>
+      <td>Vendor threat-research team &amp; managed rule updates</td>
+      <td class="c us-col"><span class="m m-p">◐</span></td>
+      <td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td>
+      <td class="why"><b>Gap of kind, not code.</b> We track upstream CRS; we do not staff a research team</td>
+    </tr>
+
+    <tr class="grp"><td colspan="8">Deployment model — where the difference is structural</td></tr>
+    <tr>
+      <td>On-premise, single-tenant, customer-dedicated</td>
+      <td class="c us-col"><span class="m m-y">●</span></td>
+      <td class="c"><span class="m m-n">✕</span></td><td class="c"><span class="m m-n">✕</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-n">✕</span></td>
+      <td class="why">—</td>
+    </tr>
+    <tr>
+      <td>Fully air-gapped install, no outbound dependency</td>
+      <td class="c us-col"><span class="m m-y">●</span></td>
+      <td class="c"><span class="m m-n">✕</span></td><td class="c"><span class="m m-n">✕</span></td><td class="c"><span class="m m-p">◐</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-n">✕</span></td>
+      <td class="why">733 MB offline bundle, SHA256-verified, 10-step installer with dry-run</td>
+    </tr>
+    <tr>
+      <td>Traffic and logs never leave the customer datacenter</td>
+      <td class="c us-col"><span class="m m-y">●</span></td>
+      <td class="c"><span class="m m-n">✕</span></td><td class="c"><span class="m m-n">✕</span></td><td class="c"><span class="m m-p">◐</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-n">✕</span></td>
+      <td class="why"><b>The core commercial argument</b> for regulated Indian workloads</td>
+    </tr>
+    <tr>
+      <td>HA — active/passive pair with VIP failover</td>
+      <td class="c us-col"><span class="m m-y">●</span></td>
+      <td class="c">—</td><td class="c">—</td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c">—</td>
+      <td class="why">Measured failover — see §3. Postgres promotion is deliberately manual: two nodes cannot form a quorum</td>
+    </tr>
+    <tr>
+      <td>Clustered control plane (Raft)</td>
+      <td class="c us-col"><span class="m m-y">●</span></td>
+      <td class="c">—</td><td class="c">—</td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c">—</td>
+      <td class="why">3-node Raft; any node accepts writes via leader forwarding</td>
+    </tr>
+    <tr>
+      <td>Site onboarding without restart</td>
+      <td class="c us-col"><span class="m m-y">●</span></td>
+      <td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-p">◐</span></td><td class="c"><span class="m m-p">◐</span></td><td class="c"><span class="m m-y">●</span></td>
+      <td class="why">Live in seconds, no impact to other sites. F5 requires policy + virtual-server attach</td>
+    </tr>
+
+    <tr class="grp"><td colspan="8">Extensibility &amp; operations</td></tr>
+    <tr>
+      <td>Sandboxed plugins in any language (WASM)</td>
+      <td class="c us-col"><span class="m m-y">●</span></td>
+      <td class="c"><span class="m m-p">◐</span></td><td class="c"><span class="m m-n">✕</span></td><td class="c"><span class="m m-n">✕</span></td><td class="c"><span class="m m-p">◐</span></td><td class="c"><span class="m m-n">✕</span></td>
+      <td class="why"><b>Differentiator.</b> Hot-swappable. F5 has TCL iRules — powerful but not sandboxed</td>
+    </tr>
+    <tr>
+      <td>Per-rule enforcement status observed from the data plane</td>
+      <td class="c us-col"><span class="m m-y">●</span></td>
+      <td class="c"><span class="m m-n">✕</span></td><td class="c"><span class="m m-n">✕</span></td><td class="c"><span class="m m-n">✕</span></td><td class="c"><span class="m m-n">✕</span></td><td class="c"><span class="m m-n">✕</span></td>
+      <td class="why"><b>No competitor offers this.</b> The console reports whether each rule is <i>actually enforced</i> on every node — an observation, not an inference</td>
+    </tr>
+    <tr>
+      <td>Per-path policy overrides</td>
+      <td class="c us-col"><span class="m m-y">●</span></td>
+      <td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-p">◐</span></td>
+      <td class="why">Longest-prefix-wins, so policy never depends on row order</td>
+    </tr>
+    <tr>
+      <td>Learning mode with false-positive-rate reporting</td>
+      <td class="c us-col"><span class="m m-y">●</span></td>
+      <td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-p">◐</span></td>
+      <td class="why">Built-in <code>fpr-report.sh</code> with an explicit go-live gate</td>
+    </tr>
+    <tr>
+      <td>AI copilot that drafts rules from your own traffic</td>
+      <td class="c us-col"><span class="m m-y">●</span></td>
+      <td class="c"><span class="m m-p">◐</span></td><td class="c"><span class="m m-p">◐</span></td><td class="c"><span class="m m-p">◐</span></td><td class="c"><span class="m m-n">✕</span></td><td class="c"><span class="m m-n">✕</span></td>
+      <td class="why">—</td>
+    </tr>
+    <tr>
+      <td>Customer-facing rule authoring UI</td>
+      <td class="c us-col"><span class="m m-r">○</span></td>
+      <td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td>
+      <td class="why"><b>Gap — deliberately withheld.</b> The validator does not yet parse our real rule grammar, so exposing it would teach customers invalid syntax</td>
+    </tr>
+    <tr>
+      <td>Response action variety</td>
+      <td class="c us-col"><span class="m m-p">◐</span></td>
+      <td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td>
+      <td class="why"><b>Gap.</b> 5 actions. HaltDOS offers 13 — no tarpit, custom response or redirect yet</td>
+    </tr>
+    <tr>
+      <td>HTTP/2 · HTTP/3 (QUIC)</td>
+      <td class="c us-col"><span class="m m-y">●</span></td>
+      <td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-p">◐</span></td><td class="c"><span class="m m-y">●</span></td>
+      <td class="why">quinn + h3, reuses the SNI cert resolver, Alt-Svc advertisement</td>
+    </tr>
+    <tr>
+      <td>Post-quantum TLS (hybrid X25519 + Kyber)</td>
+      <td class="c us-col"><span class="m m-r">○</span></td>
+      <td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-p">◐</span></td><td class="c"><span class="m m-n">✕</span></td><td class="c"><span class="m m-n">✕</span></td><td class="c"><span class="m m-p">◐</span></td>
+      <td class="why"><b>Gap.</b> Roadmap — previously mis-stated as shipped in internal material</td>
+    </tr>
+
+    <tr class="grp"><td colspan="8">Assurance &amp; compliance</td></tr>
+    <tr>
+      <td>Independent third-party security audit</td>
+      <td class="c us-col"><span class="m m-r">○</span></td>
+      <td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td>
+      <td class="why"><b>Gap.</b> Phase 7. Not a feature — a procurement blocker</td>
+    </tr>
+    <tr>
+      <td>External red-team engagement</td>
+      <td class="c us-col"><span class="m m-r">○</span></td>
+      <td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td>
+      <td class="why"><b>Gap.</b> Phase 7</td>
+    </tr>
+    <tr>
+      <td>SOC 2 / PCI-DSS / ISO 27001 attestation</td>
+      <td class="c us-col"><span class="m m-r">○</span></td>
+      <td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td>
+      <td class="why"><b>Gap.</b> ESDS holds certifications; the product needs its own readiness pack</td>
+    </tr>
+    <tr>
+      <td>Measured real-traffic false-positive rate</td>
+      <td class="c us-col"><span class="m m-r">○</span></td>
+      <td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td>
+      <td class="why"><b>The most important open gap — see §6</b></td>
+    </tr>
+    <tr>
+      <td>Auth: local · OIDC/SSO · MFA (TOTP) · API keys · RBAC</td>
+      <td class="c us-col"><span class="m m-y">●</span></td>
+      <td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td>
+      <td class="why">5 RBAC roles, multi-tenant with database-enforced row-level security</td>
+    </tr>
+    <tr>
+      <td>SAML · LDAP / Active Directory</td>
+      <td class="c us-col"><span class="m m-r">○</span></td>
+      <td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td>
+      <td class="why"><b>Gap.</b> Not implemented — previously mis-stated as shipped. Post-v1.1</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="note">
+  <span class="t">On the competitor columns</span>
+  Competitor marks reflect publicly documented capabilities as of August 2026 and are
+  directional for internal planning. They are not contract-grade and should be
+  re-verified against current vendor documentation before any customer-facing use. The
+  ESDSWAF column is the one verified against source code and test output.
+</div>
+
+<h2><span class="n">3</span>Measured proof</h2>
+
+<p class="lede">
+  These are measured figures, not targets. Detection is measured with GoTestWAF v0.5.8
+  against a fair all-methods origin; performance on a single node with the full pipeline
+  active.
+</p>
+
+<div class="cards">
+  <div class="card">
+    <div class="k">99.60%</div>
+    <div class="l">Composite detection score</div>
+    <div class="s">App true-positive 99.09% · benign-allow 99.29% · API 100%. One false positive remaining of the original sixteen.</div>
+  </div>
+  <div class="card">
+    <div class="k">21,200<span style="font-size:9pt"> req/s</span></div>
+    <div class="l">Block path, p99 8.5 ms</div>
+    <div class="s">Full pipeline: ML, ClickHouse logging and tenant tagging all active. Zero false shedding at sustained load.</div>
+  </div>
+  <div class="card">
+    <div class="k">7,950<span style="font-size:9pt"> req/s</span></div>
+    <div class="l">Clean pass-through, p99 15 ms</div>
+    <div class="s">Full CRS loaded. Baseline direct-to-origin on the same hardware is 16,917 req/s — the origin round-trip dominates.</div>
+  </div>
+  <div class="card">
+    <div class="k">100%</div>
+    <div class="l">Requests served through a master reboot</div>
+    <div class="s">Zero failed of 1,279 requests during a full VM reboot of the active node. Worst single request 1.055 s, still a complete 200.</div>
+  </div>
+  <div class="card">
+    <div class="k">3.5 s</div>
+    <div class="l">VIP failover on process kill</div>
+    <div class="s">98.81% success — 13 of 1,090 requests failed. Failback zero-loss, VIP restored in ~17 s.</div>
+  </div>
+  <div class="card">
+    <div class="k">888</div>
+    <div class="l">Automated tests, zero failures</div>
+    <div class="s">691 Rust and 197 Go, measured 13 August 2026.</div>
+  </div>
+</div>
+
+<h3>How the detection figure was reached — and why the path matters</h3>
+
+<p>
+  The detection score was not achieved by tuning thresholds. It came from finding four
+  places where a component was judging data it could not see. That history is worth a CTO's
+  attention because it is the difference between a number that holds and one that collapses
+  on a new corpus.
+</p>
+
+<table>
+  <colgroup><col style="width:52%"><col class="c"><col class="c"><col class="c"></colgroup>
+  <thead>
+    <tr><th>Build step</th><th class="c">App TP</th><th class="c">Benign allowed</th><th class="c">Composite</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Rule signatures only — the empirical ceiling of a regex-only approach</td><td class="c">43.4%</td><td class="c">92.9%</td><td class="c">61.5%</td></tr>
+    <tr><td>+ coverage signatures (CRLF, SMTP/IMAP, LDAP, SSTI, NoSQL)</td><td class="c">49.3%</td><td class="c">91.5%</td><td class="c">63.7%</td></tr>
+    <tr><td>+ embedded ML char-n-gram classifier</td><td class="c">57.2%</td><td class="c">88.7%</td><td class="c">75.6%</td></tr>
+    <tr><td>+ FP-suppression model and base64 rule visibility</td><td class="c">99.2%</td><td class="c">88.7%</td><td class="c">97.2%</td></tr>
+    <tr style="background:#f0f6f3"><td><b>+ score header/cookie values and parsed-multipart bodies</b></td><td class="c"><b>99.09%</b></td><td class="c"><b>99.29%</b></td><td class="c"><b>99.60%</b></td></tr>
+  </tbody>
+</table>
+
+<p>
+  Note the last row: <b>true positives rose while false positives fell.</b> Nothing was
+  traded off. The recurring root cause each time was a component unable to see the data it
+  was asked to judge — reachability, not model quality.
+</p>
+
+<div class="note warn">
+  <span class="t">Two numbers to retire from internal material</span>
+  Earlier roadmap documents quote <b>&gt;500,000 req/s at p99 &lt;1 ms</b>. Those are
+  design targets and sit roughly 25× above what has been measured. Please treat the
+  figures on this page as the only quotable performance numbers.
+</div>
+
+<h2><span class="n">4</span>Honest scorecard</h2>
+
+<div class="two">
+  <div class="box good">
+    <h4>Where we genuinely lead</h4>
+    <ul>
+      <li><b>Onboarding speed</b> — API or YAML, live in seconds, zero restart. F5 needs policy plus virtual-server attach; HaltDOS is console-driven.</li>
+      <li><b>Truthful enforcement status</b> — the console reports which rules are actually running on each node. No competitor offers this.</li>
+      <li><b>Measured evasion resistance</b> — 99.09% app true-positive. Neither F5 nor HaltDOS publishes a comparable figure.</li>
+      <li><b>Modern API security in one policy</b> — GraphQL, JWKS and gRPC together.</li>
+      <li><b>Sandboxed WASM plugins</b> in any language, hot-swappable.</li>
+      <li><b>Kernel XDP offload</b> — the only vendor with anything in that row.</li>
+      <li><b>India PII in DLP</b> — PAN and Aadhaar built in.</li>
+      <li><b>Air-gapped single-tenant deployment</b> with data residency by construction.</li>
+    </ul>
+  </div>
+  <div class="box bad">
+    <h4>Where we trail — do not claim parity</h4>
+    <ul>
+      <li><b>No positive-security / entity-learning model.</b> This is F5's core differentiator and our API discovery is a toggle only.</li>
+      <li><b>5 response actions vs HaltDOS's 13</b> — no tarpit, custom response or redirect.</li>
+      <li><b>Fewer authorable rule categories</b> than HaltDOS.</li>
+      <li><b>Rule authoring UI withheld</b> — the validator does not parse our real grammar yet.</li>
+      <li><b>No global scrubbing network</b> — and no roadmap to one.</li>
+      <li><b>No third-party audit, red team or compliance attestation.</b> A procurement blocker independent of engineering quality.</li>
+      <li><b>No vendor threat-research team.</b></li>
+      <li><b>Real-traffic false-positive rate unmeasured.</b> See §6.</li>
+    </ul>
+  </div>
+</div>
+
+<p style="margin-top:10px">
+  For reference, a coverage audit against the <b>eNlight Pratihar WAAP</b> reference
+  specification assessed <b>35 covered, 36 partial, 43 gaps</b> across roughly 114
+  functionalities. The core engine scored strongly; API security was the weakest domain and
+  has since been the focus of two build phases.
+</p>
+
+<h2 class="pb"><span class="n">5</span>Roadmap — what closes, and what does not</h2>
+
+<p class="lede">
+  Most gaps in §4 are scheduled. Two are not, and saying so is what makes the rest
+  credible.
+</p>
+
+<h3>Phases that close identified gaps</h3>
+
+<table>
+  <colgroup><col style="width:13%"><col style="width:31%"><col style="width:38%"><col style="width:18%"></colgroup>
+  <thead>
+    <tr><th>Release</th><th>Theme</th><th>Closes</th><th class="c">Gap addressed</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><b>v1.0 GA</b><br><span class="why">Phase 7</span></td>
+      <td>Production hardening &amp; assurance</td>
+      <td>Continuous fuzzing of rule, HTTP and WASM parsers · third-party security audit · external red team · performance certification · Helm chart and Kubernetes operator · Terraform modules · SOC 2 / PCI-DSS / ISO 27001 readiness pack · documentation site</td>
+      <td class="c">Audit · red team · compliance</td>
+    </tr>
+    <tr>
+      <td><b>v1.1</b></td>
+      <td>API security depth</td>
+      <td>API auto-discovery generating an OpenAPI spec from observed traffic · OpenAPI schema enforcement · BOLA / IDOR detection · gRPC deep-protobuf introspection · verified good-bot allow-listing by reverse DNS</td>
+      <td class="c">API discovery · schema · good bots</td>
+    </tr>
+    <tr>
+      <td><b>v1.1</b></td>
+      <td>Operator surface</td>
+      <td>Rule authoring UI backed by the real grammar validator · expanded response actions (tarpit, custom response, redirect) · additional authorable rule categories</td>
+      <td class="c">Response actions · authoring</td>
+    </tr>
+    <tr>
+      <td><b>Post v1.1</b></td>
+      <td>Learning &amp; adaptive defence</td>
+      <td>Positive-security model with per-endpoint learning and drift detection · adaptive L7 DDoS with EWMA and storm detection · SAML SSO · enforced administrator MFA · LDAP / Active Directory</td>
+      <td class="c">Positive security · L7 DDoS · SAML</td>
+    </tr>
+    <tr>
+      <td><b>Post v1.1</b></td>
+      <td>Cryptography &amp; zero trust</td>
+      <td>Post-quantum TLS (hybrid X25519 + Kyber768) · zero-trust mTLS via SPIFFE/SPIRE · subresource integrity monitoring · HSM / Vault key custody</td>
+      <td class="c">PQ-TLS</td>
+    </tr>
+    <tr>
+      <td><b>Post v1.1</b></td>
+      <td>Scale-out</td>
+      <td>Multi-cluster federation with cross-region threat-intelligence sharing · global active-active clustering · clientless WebVPN reverse proxy with SSO and WebAuthn</td>
+      <td class="c">Multi-region</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>Two gaps the roadmap does not close — deliberately</h3>
+
+<table>
+  <colgroup><col style="width:26%"><col style="width:74%"></colgroup>
+  <thead><tr><th>Gap</th><th>Why it stays open, and why that is the right decision</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><b>Global anycast multi-Tbps DDoS scrubbing</b></td>
+      <td>This is a CDN business, not a WAF feature. Closing it means building and operating global points of presence — a capital programme measured in hundreds of crores, competing directly with Cloudflare and Akamai on their strongest ground. The correct architecture is to sit <i>behind</i> volumetric scrubbing, whether that is an upstream provider or ESDS network capacity, and to be the best inspection layer available on-premise. <b>Positioning ESDSWAF against Cloudflare on this row invites the one comparison we cannot win.</b></td>
+    </tr>
+    <tr>
+      <td><b>Vendor threat-research team</b></td>
+      <td>A staffing and operating-model decision, not an engineering task. We consume upstream OWASP CRS and commercial threat-intelligence feeds. Matching Imperva or Akamai here means funding a standing research function — a business case worth making on its own merits, not something a release closes.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2><span class="n">6</span>The gap that matters most — and it is not a feature</h2>
+
+<p>
+  Every detection figure in §3 comes from a <b>synthetic corpus</b>. GoTestWAF measures
+  whether we catch known attack classes and whether we pass its benign samples. It cannot
+  tell us how often this WAF would wrongly block <i>a real customer's real users</i>.
+</p>
+
+<p>
+  <b>That number has never been measured.</b> No amount of detection accuracy substitutes
+  for it, because the failure mode it predicts — legitimate users blocked during business
+  hours — is the one that loses accounts.
+</p>
+
+<p>The product is built around this honestly rather than around it:</p>
+
+<ul>
+  <li>Every new site is onboarded in <b>learning mode</b>, which records what it would have blocked without blocking it.</li>
+  <li><code>fpr-report.sh</code> measures the rate over a chosen window, and the operator manual instructs reading the <i>denominator</i>, not just the percentage.</li>
+  <li>A documented <b>four-point go-live gate</b> must pass before any site is switched to blocking: a full business cycle in learning mode, a measured rate under 1% on real traffic, every recurring detection classified, and application-owner sign-off.</li>
+</ul>
+
+<div class="note">
+  <span class="t">Recommendation</span>
+  The fastest way to close this gap is to put a real ESDS property behind the WAF in
+  learning mode and let it accumulate genuine traffic. That produces the one number the
+  product cannot currently quote — and it is worth more commercially than any feature that
+  could be delivered in the same period.
+</div>
+
+<footer>
+  <b>Verification method.</b> The ESDSWAF column was compiled by inspecting the source
+  tree, test output and measured benchmark results — not from prior decks or roadmap
+  documents, both of which were found to overstate several capabilities. Detection figures:
+  GoTestWAF v0.5.8 against an all-methods origin. Performance: single node, full pipeline
+  active. Failover: two independent probes at 0.3 s intervals, each response validated on
+  status code and byte count. Test counts measured 13 August 2026.
+  <br><br>
+  Next-Gen ESDSWAF v1.0.0 &nbsp;·&nbsp; ESDS Software Solution Ltd &nbsp;·&nbsp; Internal —
+  not for external distribution without review of the competitor columns.
+</footer>
+
+</body>
+</html>
