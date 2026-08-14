@@ -337,8 +337,19 @@ export const PRESETS: Record<Exclude<PresetKey, "custom">, {
   },
   balanced: {
     label: "Balanced", icon: "🔵",
-    desc: "Recommended. Stronger detection with sensible thresholds.",
-    paranoia_level: 2, anomaly_threshold: 5,
+    desc: "Recommended. The benchmarked default configuration.",
+    // PL2 / threshold 10 — deliberately identical to defaultWafPolicyJSON in
+    // control-plane/cmd/controllerd/handlers.go, whose comment reads "keep the
+    // two in step, or a site's stored policy and its effective policy drift".
+    //
+    // This was threshold 5, so the preset the operator manual recommends
+    // produced a site that was HALF the benchmarked threshold — and at 5 a
+    // single weak +5 heuristic blocks on its own, which is where most benign
+    // false-positives came from. It also made fpr-report.sh lie: its triage
+    // advice tells the operator "the threshold is already at the benchmarked
+    // value of 10" and warns them off lowering it, which was false for every
+    // site this wizard had ever created.
+    paranoia_level: 2, anomaly_threshold: 10,
     rl_per_ip: { rps: 100, burst: 50 }, bot_ja4: false,
   },
   strict: {
