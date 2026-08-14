@@ -194,7 +194,10 @@ deploy-shell:
   tags:
     - k8s-docker
   before_script:
-    - apk add --no-cache bash shellcheck git coreutils findutils grep sed
+    # docker-cli-compose is here for check-compose-parses-clean.sh. `docker
+    # compose config` only parses and interpolates — it never contacts a daemon —
+    # so this needs no docker-in-docker and no privileged runner.
+    - apk add --no-cache bash shellcheck git coreutils findutils grep sed docker-cli-compose
   script:
     # 1. Every shell file must parse. Cheap, absolute, no exceptions.
     - |
@@ -212,7 +215,17 @@ deploy-shell:
     #    the backlog is worked down.
     - shellcheck -S error $(find deploy -name '*.sh' -type f) || exit 1
     - shellcheck -S warning $(find deploy -name '*.sh' -type f) || true
-    # 3. The contract check — the one that catches shipping-breaking bugs.
+    # 3. Every compose file must parse with the environment its own installer
+    #    generates. This is not style — it caught a release blocker: a practice
+    #    Ghost origin sat in compose.prod.yml behind `profiles: [ghost]`, and
+    #    because compose interpolates a file BEFORE filtering by profile, its
+    #    `${GHOST_DB_PASSWORD:?...}` guard failed every customer `docker compose
+    #    up`. install.sh generates seven secrets, none of them GHOST_*, so a
+    #    fresh install aborted at its last step — after images were loaded and
+    #    /opt/sentinel written — with an error about a blog's database.
+    #    Nothing caught it because CI never invoked compose at all.
+    - ./deploy/ci/check-compose-parses-clean.sh
+    # 4. The contract check — the one that catches shipping-breaking bugs.
     - STAGE_ONLY=1 ./deploy/package/build-bundle.sh
     - ./deploy/ci/check-bundle-contract.sh
 

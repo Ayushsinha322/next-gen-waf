@@ -85,12 +85,22 @@ you do not have to hardcode or remember to change.
 
 ### 1.2 The origin
 
-Ghost, added to `deploy/docker/compose.prod.yml` behind a `ghost` profile,
-alongside the existing `demo` profile that gates Juice Shop. It never starts in a
-customer install.
+Ghost, in its own overlay file `deploy/docker/compose.ghost.yml`, behind a
+`ghost` profile. It never starts — and is never even *parsed* — in a customer
+install, because the overlay is only loaded by whoever passes `-f
+compose.ghost.yml`.
+
+> **It used to live in `compose.prod.yml` behind the profile alone, and that was
+> a release blocker.** Compose interpolates a whole file before it filters by
+> profile, so the `:?` guards below fired on every command against
+> `compose.prod.yml` — including `install.sh` on a customer VM, which generates
+> seven secrets and none of them `GHOST_*`. Installs aborted at the final step
+> complaining about a blog's database password. Profiles gate what *starts*, not
+> what is *parsed*; an overlay gates both. `deploy/ci/check-compose-parses-clean.sh`
+> now fails the build if a service like this reappears in an operator-facing file.
 
 Three variables in `deploy/docker/.env`, all required — compose refuses to render
-without them rather than starting a half-configured public site:
+the overlay without them rather than starting a half-configured public site:
 
 ```bash
 GHOST_PUBLIC_URL=https://esdswaf-demo.duckdns.org
@@ -116,7 +126,7 @@ docker inspect sentinel-waf1-1 \
   --format '{{index .Config.Labels "com.docker.compose.project.config_files"}}'
 # → compose.prod.yml,compose.cluster.yml,compose.ha.yml   (as of 2026-08-13)
 
-C="-f compose.prod.yml -f compose.cluster.yml -f compose.ha.yml"
+C="-f compose.prod.yml -f compose.cluster.yml -f compose.ha.yml -f compose.ghost.yml"
 docker compose $C --profile ghost up -d ghost-db ghost
 docker compose $C logs -f ghost      # wait for "Ghost is running"
 ```
@@ -303,7 +313,7 @@ measurement — that is what the 16.67% from the .71 rehearsal was.
 # site first, so nothing routes to a dead origin
 curl -sk -X DELETE https://127.0.0.1:9443/api/v1/sites/<id> -H "Authorization: Bearer $TOKEN"
 cd /opt/sentinel-src/deploy/docker
-C="-f compose.prod.yml -f compose.cluster.yml -f compose.ha.yml"
+C="-f compose.prod.yml -f compose.cluster.yml -f compose.ha.yml -f compose.ghost.yml"
 # `rm -sf` the two services BY NAME. Do NOT use `docker compose down` here: down
 # acts on the whole project, so it would stop the data plane, control plane and
 # ClickHouse along with Ghost — taking the WAF off the air to remove a blog.
