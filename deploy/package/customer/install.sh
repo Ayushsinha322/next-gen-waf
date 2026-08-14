@@ -471,6 +471,19 @@ SENTINEL_JWT_SECRET=$(gen)
 SENTINEL_AUDIT_HMAC_KEY=$(gen)
 SENTINEL_INTERNAL_SECRET=$(gen)
 SENTINEL_ALLOW_SUPERUSER_DB=1
+
+# The initial console password. seed.go honours this; left unset it invents a
+# random one and prints it to the control plane's STDERR exactly once.
+#
+# That default is a lockout waiting to happen, and this file is the fix. There
+# is NO password-change endpoint in the product — /api/v1/admin/users/:id
+# accepts role and status only — so this single credential is the only way into
+# the console, permanently. Sourced from a container log it dies with the
+# container: any upgrade, rollback, or `docker compose up --force-recreate`
+# destroys the one copy and locks the operator out of their own WAF with no
+# recovery path. Generating it here puts it in the same 0600 file as every
+# other secret, the one the installer already tells you to back up.
+SENTINEL_BOOTSTRAP_ADMIN_PASSWORD=$(gen)
 GRAFANA_ADMIN_PASSWORD=$(openssl rand -base64 24 | tr -d '\n/+=' | cut -c1-24)
 
 SENTINEL_CLICKHOUSE_EVENT_RETENTION_DAYS=90
@@ -582,10 +595,25 @@ hc "Console :9443" bash -c 'curl -sk --max-time 5 -o /dev/null -w "%{http_code}"
 # "[sentinel]" onto the value), and REQUIRE the result to look like what seed.go
 # actually generates — 24 random bytes, hex-encoded. Anything else is treated as a
 # failed scrape so the fallback hint fires instead of printing garbage.
-ADMIN_PW=$(docker logs sentinel-controlplane-1 2>&1 \
-  | grep -A1 'GENERATED password' | tail -1 \
-  | sed -n 's/^\[sentinel\][[:space:]]*//p' | tr -d '[:space:]' || true)
-[[ "$ADMIN_PW" =~ ^[0-9a-f]{48}$ ]] || ADMIN_PW=""
+#
+# THE SCRAPE IS NOW THE FALLBACK, NOT THE SOURCE. Step 7 generates
+# SENTINEL_BOOTSTRAP_ADMIN_PASSWORD into $ENV_FILE and compose passes it to the
+# control plane, so the credential is known before the container ever starts and
+# survives every recreate. Reading it back from the file we just wrote is both
+# authoritative and immune to log rotation, log drivers that discard stderr, and
+# the container being restarted before this line runs.
+#
+# The log scrape is kept only for the --force path over an install predating
+# this change, where the .env has no bootstrap value and the log is genuinely
+# the only copy.
+ADMIN_PW=$(sed -n 's/^SENTINEL_BOOTSTRAP_ADMIN_PASSWORD=//p' "$ENV_FILE" 2>/dev/null | head -1)
+if [[ ! "$ADMIN_PW" =~ ^[0-9a-f]{64}$ ]]; then
+  ADMIN_PW=$(docker logs sentinel-controlplane-1 2>&1 \
+    | grep -A1 'GENERATED password' | tail -1 \
+    | sed -n 's/^\[sentinel\][[:space:]]*//p' | tr -d '[:space:]' || true)
+  # seed.go's generated form is 24 random bytes hex-encoded; ours is 32.
+  [[ "$ADMIN_PW" =~ ^[0-9a-f]{48}$ ]] || ADMIN_PW=""
+fi
 
 if [[ $health_fail -ne 0 ]]; then
   printf '\n  %s✗ Installation completed with FAILING health checks%s\n' "$RED" "$R"
@@ -605,9 +633,16 @@ cat <<FINAL
     Username       admin@sentinel.local
     Password       ${B}${ADMIN_PW:-NOT CAPTURED — recover it with the command below}${R}
 
-  ${YEL}Change this password at first login.${R}
-  ${DIM}It is NOT in $LOG. The control plane prints it once, to its container log:${R}
-    ${DIM}docker logs sentinel-controlplane-1 2>&1 | grep -A1 'GENERATED password'${R}
+  ${YEL}${B}WRITE THIS PASSWORD DOWN NOW. It cannot be changed later.${R}
+  ${YEL}This build has no password-change screen and no password-reset endpoint${R}
+  ${YEL}— /api/v1/admin/users/:id accepts role and status only. This credential${R}
+  ${YEL}is the only way into the console for the life of the installation.${R}
+
+  ${DIM}It is stored in $ENV_FILE (mode 0600) as${R}
+  ${DIM}SENTINEL_BOOTSTRAP_ADMIN_PASSWORD, so it survives container recreates and${R}
+  ${DIM}is included in a backup of that file. Recover it at any time with:${R}
+    ${DIM}sudo grep SENTINEL_BOOTSTRAP_ADMIN_PASSWORD $ENV_FILE${R}
+  ${DIM}Lose that file without a backup and there is no way back in.${R}
 
   ${B}Reaching the console${R}
 

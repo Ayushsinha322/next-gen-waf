@@ -194,6 +194,14 @@ services:
       SENTINEL_CLICKHOUSE_USER: ${CLICKHOUSE_USER}
       SENTINEL_CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
       SENTINEL_JWT_SECRET: ${SENTINEL_JWT_SECRET}
+      # Initial console password, read by seed.go on first boot only (the INSERT
+      # is ON CONFLICT DO NOTHING, so later boots never re-apply it). Unset, the
+      # seeder invents a random password and prints it to this container's stderr
+      # once — which dies with the container, and there is no password-change
+      # endpoint to recover through. install.sh generates this into its .env so
+      # the credential outlives any recreate. Empty default keeps the file
+      # parseable for anyone running compose by hand.
+      SENTINEL_BOOTSTRAP_ADMIN_PASSWORD: ${SENTINEL_BOOTSTRAP_ADMIN_PASSWORD:-}
       # Required by the audit-HMAC fail-fast; keep it out of the committed YAML.
       SENTINEL_AUDIT_HMAC_KEY: ${SENTINEL_AUDIT_HMAC_KEY}
       # SINGLE-TENANT DEMO POSTURE. This stack connects as the Postgres superuser

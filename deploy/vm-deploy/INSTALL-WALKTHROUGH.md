@@ -351,8 +351,23 @@ Enter the root password. **Leave this window open** — closing it closes the tu
 - You will see a **certificate warning**. This is expected — the WAF issued its own
   certificate. Click **Advanced** → **Proceed to 127.0.0.1 (unsafe)**.
 - Log in with `admin@sentinel.local` and the password from Part 6.
-- **Change the password immediately.** The one you were given is written in your
-  terminal history.
+
+> ### ⚠️ That password cannot be changed. Record it now.
+>
+> This build has no password-change screen and no reset endpoint — the user API
+> accepts `role` and `status` only. The password the installer printed is the
+> **only** way into this console, permanently.
+>
+> It is saved in `/opt/sentinel/current/.env` (mode `0600`), which survives
+> upgrades and container recreates. Read it back at any time with:
+>
+> ```bash
+> sudo grep SENTINEL_BOOTSTRAP_ADMIN_PASSWORD /opt/sentinel/current/.env
+> ```
+>
+> **Back that file up today.** It also holds every other secret for the
+> deployment. Lose it without a backup and the installation must be rebuilt from
+> scratch.
 
 ### If you see "500 Internal Server Error"
 
