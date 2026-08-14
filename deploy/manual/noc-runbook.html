@@ -1,0 +1,657 @@
+<title>ESDSWAF NOC Runbook</title>
+<style>
+  /* ── tokens: light is the base, both dark paths redefine only these ───── */
+  :root {
+    --ground:      #FCFCFB;
+    --surface:     #F4F5F4;
+    --surface-2:   #EAECEB;
+    --hair:        #D9DDDC;
+    --hair-strong: #BFC6C4;
+    --ink:         #141A19;
+    --ink-2:       #454F4D;
+    --ink-3:       #6B7573;
+
+    --accent:      #0E6E6B;
+    --accent-ink:  #0A5250;
+    --accent-wash: #E2EFEE;
+
+    --danger:      #B3261E;
+    --danger-wash: #FBE9E7;
+    --warn:        #8A6100;
+    --warn-wash:   #FAF0DC;
+    --ok:          #1B6B3A;
+    --ok-wash:     #E5F2E9;
+
+    --code-bg:     #F2F4F3;
+    --code-ink:    #1B2422;
+
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, "Cascadia Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+
+    --measure: 68ch;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:      #0E1211;
+      --surface:     #171D1C;
+      --surface-2:   #202826;
+      --hair:        #2B3533;
+      --hair-strong: #3D4A47;
+      --ink:         #E6ECEA;
+      --ink-2:       #B0BBB8;
+      --ink-3:       #7E8B88;
+
+      --accent:      #3FB8AE;
+      --accent-ink:  #6ED3CA;
+      --accent-wash: #142A28;
+
+      --danger:      #FF7A70;
+      --danger-wash: #2C1512;
+      --warn:        #E8AE4C;
+      --warn-wash:   #2A2010;
+      --ok:          #54C97E;
+      --ok-wash:     #12271A;
+
+      --code-bg:     #131918;
+      --code-ink:    #D7E0DE;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground:      #0E1211;
+    --surface:     #171D1C;
+    --surface-2:   #202826;
+    --hair:        #2B3533;
+    --hair-strong: #3D4A47;
+    --ink:         #E6ECEA;
+    --ink-2:       #B0BBB8;
+    --ink-3:       #7E8B88;
+
+    --accent:      #3FB8AE;
+    --accent-ink:  #6ED3CA;
+    --accent-wash: #142A28;
+
+    --danger:      #FF7A70;
+    --danger-wash: #2C1512;
+    --warn:        #E8AE4C;
+    --warn-wash:   #2A2010;
+    --ok:          #54C97E;
+    --ok-wash:     #12271A;
+
+    --code-bg:     #131918;
+    --code-ink:    #D7E0DE;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.62;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap {
+    max-width: 78ch;
+    margin: 0 auto;
+    padding: 4rem 1.5rem 6rem;
+  }
+
+  /* ── masthead ──────────────────────────────────────────────────────────── */
+  .masthead { border-bottom: 2px solid var(--ink); padding-bottom: 1.75rem; margin-bottom: 2.5rem; }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: .7rem;
+    letter-spacing: .16em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 .9rem;
+  }
+  h1 {
+    font-family: var(--mono);
+    font-size: clamp(1.9rem, 5vw, 2.7rem);
+    font-weight: 600;
+    letter-spacing: -.02em;
+    line-height: 1.1;
+    text-wrap: balance;
+    margin: 0 0 .8rem;
+  }
+  .standfirst { font-size: 1.06rem; color: var(--ink-2); max-width: var(--measure); margin: 0; }
+
+  .provenance {
+    margin-top: 1.6rem;
+    padding: .85rem 1rem;
+    background: var(--surface);
+    border-left: 3px solid var(--accent);
+    font-size: .87rem;
+    color: var(--ink-2);
+    font-family: var(--mono);
+    line-height: 1.5;
+  }
+
+  /* ── sections ──────────────────────────────────────────────────────────── */
+  section { margin-top: 3.5rem; scroll-margin-top: 2rem; }
+  h2 {
+    font-family: var(--mono);
+    font-size: 1.32rem;
+    font-weight: 600;
+    letter-spacing: -.01em;
+    line-height: 1.25;
+    text-wrap: balance;
+    margin: 0 0 1.1rem;
+    padding-bottom: .55rem;
+    border-bottom: 1px solid var(--hair-strong);
+    display: flex;
+    gap: .85rem;
+    align-items: baseline;
+  }
+  h2 .num {
+    color: var(--accent);
+    font-size: .85rem;
+    font-variant-numeric: tabular-nums;
+    flex: none;
+  }
+  h3 {
+    font-family: var(--mono);
+    font-size: 1rem;
+    font-weight: 600;
+    margin: 2rem 0 .7rem;
+    color: var(--ink);
+  }
+  p, ul, ol { max-width: var(--measure); }
+  p { margin: 0 0 1rem; }
+  ul, ol { margin: 0 0 1rem; padding-left: 1.3rem; }
+  li { margin-bottom: .45rem; }
+  strong { font-weight: 650; }
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:focus-visible, code:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  /* ── code ──────────────────────────────────────────────────────────────── */
+  code {
+    font-family: var(--mono);
+    font-size: .875em;
+    background: var(--code-bg);
+    color: var(--code-ink);
+    padding: .12em .38em;
+    border-radius: 3px;
+    border: 1px solid var(--hair);
+  }
+  pre {
+    background: var(--code-bg);
+    color: var(--code-ink);
+    border: 1px solid var(--hair);
+    border-left: 3px solid var(--hair-strong);
+    padding: .95rem 1.1rem;
+    overflow-x: auto;
+    font-family: var(--mono);
+    font-size: .84rem;
+    line-height: 1.6;
+    margin: 0 0 1.2rem;
+  }
+  pre code { background: none; border: none; padding: 0; font-size: 1em; }
+
+  /* ── tables ────────────────────────────────────────────────────────────── */
+  .tw { overflow-x: auto; margin: 0 0 1.4rem; border: 1px solid var(--hair); }
+  table { border-collapse: collapse; width: 100%; font-size: .9rem; min-width: 32rem; }
+  th, td { text-align: left; padding: .6rem .8rem; border-bottom: 1px solid var(--hair); vertical-align: top; }
+  th {
+    background: var(--surface-2);
+    font-family: var(--mono);
+    font-size: .72rem;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--ink-2);
+    font-weight: 600;
+  }
+  tr:last-child td { border-bottom: none; }
+  td code { font-size: .82em; }
+
+  /* ── callouts: severity encoded in stripe + chip ───────────────────────── */
+  .note {
+    display: grid;
+    gap: .5rem;
+    padding: 1rem 1.15rem;
+    margin: 0 0 1.4rem;
+    border-left: 4px solid var(--hair-strong);
+    background: var(--surface);
+    max-width: var(--measure);
+  }
+  .note > :last-child { margin-bottom: 0; }
+  .note .chip {
+    font-family: var(--mono);
+    font-size: .68rem;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    font-weight: 700;
+    color: var(--ink-3);
+  }
+  .note.warn   { border-left-color: var(--warn);   background: var(--warn-wash); }
+  .note.warn .chip { color: var(--warn); }
+  .note.ok     { border-left-color: var(--ok);     background: var(--ok-wash); }
+  .note.ok .chip { color: var(--ok); }
+  .note.danger { border-left-color: var(--danger); background: var(--danger-wash); }
+  .note.danger .chip { color: var(--danger); }
+
+  .critical {
+    border: 2px solid var(--danger);
+    border-left-width: 6px;
+    background: var(--danger-wash);
+    padding: 1.3rem 1.4rem;
+    margin: 1.5rem 0;
+    max-width: var(--measure);
+  }
+  .critical h3 { margin-top: 0; color: var(--danger); font-size: 1.05rem; }
+  .critical > :last-child { margin-bottom: 0; }
+
+  /* ── the traffic path figure ───────────────────────────────────────────── */
+  .flow {
+    display: flex;
+    align-items: center;
+    gap: .55rem;
+    flex-wrap: wrap;
+    padding: 1.2rem;
+    background: var(--surface);
+    border: 1px solid var(--hair);
+    margin: 0 0 1.4rem;
+    font-family: var(--mono);
+    font-size: .82rem;
+  }
+  .flow .node {
+    padding: .5rem .8rem;
+    background: var(--ground);
+    border: 1px solid var(--hair-strong);
+  }
+  .flow .node.waf { border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
+  .flow .arrow { color: var(--ink-3); }
+  .flow .stop { color: var(--danger); font-size: .78rem; width: 100%; padding-left: .3rem; }
+
+  .lede { font-size: 1.02rem; color: var(--ink-2); }
+  .footnote { font-size: .85rem; color: var(--ink-3); font-family: var(--mono); }
+  hr { border: none; border-top: 1px solid var(--hair); margin: 3rem 0 0; }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+</style>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <p class="eyebrow">ESDS Software Solution · Next-Gen ESDSWAF v1.0.1</p>
+    <h1>NOC Runbook</h1>
+    <p class="standfirst">
+      Bare virtual machine to a protected website, for an engineer who has never
+      seen this product and will have nobody to ask on the day.
+    </p>
+    <p class="provenance">
+      Every command here was executed on a fresh Ubuntu 24.04 VM (172.16.21.101)
+      on 2026-08-14, in this order. Every quoted output is the real one. Where a
+      step has a trap, it is a trap that actually occurred.
+    </p>
+  </header>
+
+  <!-- 0 ------------------------------------------------------------------ -->
+  <section id="s0">
+    <h2><span class="num">00</span> What you are deploying</h2>
+    <p class="lede">
+      A reverse-proxy security gateway. It sits in front of a website. Visitors
+      reach the WAF, the WAF inspects the request, and only acceptable requests
+      reach the real server.
+    </p>
+
+    <div class="flow">
+      <span class="node">Visitor</span>
+      <span class="arrow">→</span>
+      <span class="node waf">ESDSWAF</span>
+      <span class="arrow">→</span>
+      <span class="node">Origin server</span>
+      <span class="stop">↳ attacks stopped at the WAF</span>
+    </div>
+
+    <p>Two addresses matter, and confusing them is the usual first mistake.</p>
+    <div class="tw"><table>
+      <thead><tr><th>Address</th><th>What it is</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Hostname visitors type</strong></td>
+          <td><code>portal.example.com</code> — the WAF matches sites by <strong>Host header alone</strong>, so this must be exact.</td>
+        </tr>
+        <tr>
+          <td><strong>The origin</strong></td>
+          <td><code>10.20.30.40:8080</code> — where the application runs today. Must be reachable <em>from the WAF host</em>.</td>
+        </tr>
+      </tbody>
+    </table></div>
+  </section>
+
+  <!-- 1 ------------------------------------------------------------------ -->
+  <section id="s1">
+    <h2><span class="num">01</span> Before you start — the VM</h2>
+    <div class="tw"><table>
+      <thead><tr><th>Requirement</th><th>Why, and what happens if you ignore it</th></tr></thead>
+      <tbody>
+        <tr><td>Ubuntu 22.04 or 24.04</td><td>The installer refuses anything else</td></tr>
+        <tr><td><strong>4 vCPU</strong></td><td>Checked and enforced</td></tr>
+        <tr><td><strong>16 GB RAM</strong></td><td>ClickHouse alone is allocated 6 GB. Below this it restarts forever — you get a broken WAF, not a slower one</td></tr>
+        <tr><td><strong>110 GB disk on <code>/opt</code></strong></td><td>Ask for 110, not 100: a “100 GB” disk formats to ~98 GB, and the installer requires 100 GB free <strong>on <code>/opt</code></strong></td></tr>
+        <tr><td>Ports <strong>80, 443, 9443</strong> free</td><td>The WAF binds all three. Anything else listening (nginx, apache) aborts the install</td></tr>
+        <tr><td>Root or sudo</td><td>—</td></tr>
+      </tbody>
+    </table></div>
+
+    <div class="note warn">
+      <span class="chip">Trap</span>
+      <p>The disk check reads <code>/opt</code>, not <code>/</code>. On the test VM <code>/</code> had
+      98 GB free (which would fail) while <code>/opt</code> was a separate 110 GB volume with
+      103 GB free (which passed). If <code>/opt</code> is not a separate mount, size the root
+      disk accordingly.</p>
+    </div>
+
+    <p>Internet access is optional, but it decides which package you need.</p>
+    <div class="tw"><table>
+      <thead><tr><th>VM can reach Docker Hub</th><th>Use</th><th>Size</th></tr></thead>
+      <tbody>
+        <tr><td>Yes</td><td><code>ESDSWAF-v1.0.1-online.tar.gz</code></td><td><strong>99 MB</strong>, one file</td></tr>
+        <tr><td>No (management network)</td><td><code>ESDSWAF-v1.0.1-offline.tar.gz</code></td><td>584 MB, 3 parts</td></tr>
+      </tbody>
+    </table></div>
+
+    <pre><code>curl -sS -o /dev/null -w '%{http_code}\n' https://registry-1.docker.io/v2/</code></pre>
+    <p><code>401</code> means reachable — that is the normal unauthenticated answer.
+    No response means you need the offline bundle.</p>
+  </section>
+
+  <!-- 2 ------------------------------------------------------------------ -->
+  <section id="s2">
+    <h2><span class="num">02</span> Install Docker</h2>
+    <p>Skip if <code>docker --version</code> already works.</p>
+    <pre><code>curl -fsSL https://get.docker.com | sh
+systemctl enable --now docker</code></pre>
+    <p>Verify — <strong>both</strong> must answer:</p>
+    <pre><code>docker --version          # Docker version 29.7.2, build a7dcaa6
+docker compose version    # Docker Compose version v5.4.0</code></pre>
+  </section>
+
+  <!-- 3 ------------------------------------------------------------------ -->
+  <section id="s3">
+    <h2><span class="num">03</span> Get the package onto the VM</h2>
+    <p>Either copy it across with <code>scp</code>, or download it from GitLab —
+    <strong>Deploy → Package Registry → esdswaf</strong>. You need both the archive
+    and its <code>.sha256</code>.</p>
+    <pre><code>cd /root
+sha256sum -c ESDSWAF-v1.0.1-online.tar.gz.sha256    # must print: OK
+tar -xzf ESDSWAF-v1.0.1-online.tar.gz
+cd ESDSWAF-v1.0.1</code></pre>
+
+    <div class="note warn">
+      <span class="chip">Do not skip</span>
+      <p>Verify the checksum. A truncated download fails later, during image
+      loading, in a way that looks like a product fault.</p>
+    </div>
+
+    <p>If you were given the <strong>offline</strong> bundle in parts, reassemble first —
+    the result is byte-identical and the checksum proves it:</p>
+    <pre><code>cat ESDSWAF-v1.0.1-offline.tar.gz.part-* &gt; ESDSWAF-v1.0.1-offline.tar.gz
+sha256sum -c ESDSWAF-v1.0.1-offline.tar.gz.sha256</code></pre>
+  </section>
+
+  <!-- 4 ------------------------------------------------------------------ -->
+  <section id="s4">
+    <h2><span class="num">04</span> Dry run first</h2>
+    <pre><code>./install.sh --dry-run</code></pre>
+    <p>Runs every check and <strong>changes nothing</strong>. Real output from the test VM:</p>
+    <pre><code>==&gt; Step 3 of 10 — hardware
+  ✓ CPU: 8 vCPU (minimum 4)
+  ✓ RAM: 15 GB (minimum 15)
+  ✓ Disk: 103 GB free on /opt (minimum 100)
+
+==&gt; Step 4 of 10 — prerequisites
+  ✓ Docker 29.7.2
+  ✓ ports free: 80 443 9443
+  ✓ clock synchronised
+  ✓ Docker registry reachable (6 third-party images will be pulled)
+
+  ✓ --dry-run: all checks passed, nothing changed</code></pre>
+    <p>If this fails, fix it before continuing. The dry run is free; a failed real
+    install is not.</p>
+  </section>
+
+  <!-- 5 ------------------------------------------------------------------ -->
+  <section id="s5">
+    <h2><span class="num">05</span> Install</h2>
+    <pre><code>sudo ./install.sh</code></pre>
+    <p>It asks three things: the hostname clients will use, an administrator email,
+    and the topology — choose <strong>1, standalone</strong>. Every password, key and
+    certificate is generated for you. You are never asked to invent a secret.</p>
+    <p>Unattended:</p>
+    <pre><code>sudo WAF_HOSTNAME=172.16.21.101 ADMIN_EMAIL=you@esds.co.in \
+     ./install.sh --non-interactive</code></pre>
+    <p>Ten steps, roughly six minutes. It ends with:</p>
+    <pre><code>  Installation successful
+
+    Version        Next-Gen ESDSWAF v1.0.1
+    Username       admin@sentinel.local
+    Password       6c1a48cb969314feb230ce64072348d3afba849a67c59f0534ac480437a7786b</code></pre>
+
+    <div class="critical">
+      <h3>The single most important thing in this document</h3>
+      <p><strong>That password cannot be changed. Ever.</strong></p>
+      <p>This build has no password-change screen and no reset endpoint — the user
+      API accepts <code>role</code> and <code>status</code> only. That credential is the only way
+      into the console for the life of the installation.</p>
+      <p>It is saved for you in <code>/opt/sentinel/current/.env</code> (mode <code>0600</code>), so it
+      survives container recreates, upgrades and rollbacks:</p>
+      <pre><code>sudo grep SENTINEL_BOOTSTRAP_ADMIN_PASSWORD /opt/sentinel/current/.env</code></pre>
+      <p><strong>Back that file up today, somewhere outside this VM.</strong> It holds every
+      secret for the deployment. Lose it and the installation must be rebuilt from
+      scratch.</p>
+      <p><strong>Create a second administrator now</strong> — Settings → Team Members →
+      <strong>Add User</strong>. It is your only redundancy. No email is sent: you set the
+      password (minimum 12 characters) and pass it on yourself, and it cannot be
+      changed later either.</p>
+    </div>
+  </section>
+
+  <!-- 6 ------------------------------------------------------------------ -->
+  <section id="s6">
+    <h2><span class="num">06</span> Verify</h2>
+    <pre><code>sudo ./verify.sh</code></pre>
+    <p>Real output on a fresh install:</p>
+    <pre><code>  18 passed, 0 failed, 2 warnings
+
+  All checks passed. Review the warnings above.
+  Note: enforcement was NOT verified — this run proved the stack is running,
+  not that it blocks anything.</code></pre>
+
+    <div class="note ok">
+      <span class="chip">Expected</span>
+      <p>Both warnings are correct before you add a site: <em>no sites configured yet</em>
+      and <em>enforcement not tested</em>. A <strong>502 from the WAF before the first site exists
+      is right, not broken</strong> — there is no upstream to forward to yet.</p>
+    </div>
+
+    <p><code>0 failed</code> is the number that matters. If <strong>Control plane → database</strong>
+    fails, stop: the control plane runs without a database rather than exiting, and
+    every login returns 503 while <code>docker ps</code> looks perfectly healthy.</p>
+  </section>
+
+  <!-- 7 ------------------------------------------------------------------ -->
+  <section id="s7">
+    <h2><span class="num">07</span> Reach the console</h2>
+    <p>The console is <strong>bound to 127.0.0.1 only, deliberately</strong>. It is a security
+    appliance's admin UI; on <code>0.0.0.0</code> it would be exposed to the whole office
+    network. <code>https://&lt;vm-ip&gt;:9443</code> <strong>will not work, and that is correct.</strong></p>
+    <pre><code>ssh -L 9443:127.0.0.1:9443 root@172.16.21.101</code></pre>
+    <p>Then open <strong>https://127.0.0.1:9443</strong></p>
+    <ul>
+      <li>Expect a <strong>certificate warning</strong> — the WAF issued its own. Advanced → Proceed.</li>
+      <li>Log in with <code>admin@sentinel.local</code> and the password from step 05.</li>
+      <li>A <strong>500</strong> on first load is usually a cached error: hard-reload
+        (<code>Ctrl+Shift+R</code>) or use an incognito window.</li>
+    </ul>
+    <p>Ports <strong>80 and 443 are</strong> published on all interfaces — that is the traffic path.</p>
+  </section>
+
+  <!-- 8 ------------------------------------------------------------------ -->
+  <section id="s8">
+    <h2><span class="num">08</span> Put a site behind the WAF</h2>
+    <p>The fastest correct way, on the VM:</p>
+    <pre><code>sudo ./first-site.sh</code></pre>
+    <p>It asks for the visitor hostname, origin address and origin port; checks the
+    origin is reachable <em>from inside the WAF's network</em>; validates the config
+    against the data plane before storing it; confirms the data plane actually
+    loaded it; then proves the WAF inspected a live attack. Real output:</p>
+    <pre><code>==&gt; Confirming the data plane loaded it
+  ✓ data plane loaded it — now serving 4 site(s), was 3
+
+==&gt; Proving the WAF inspects traffic for this site
+  ✓ normal request -&gt; 302 (the origin answered; a redirect counts)
+
+==&gt; Confirming the rule engine inspected it
+  ✓ attack request -&gt; 302, and the WAF recorded it:
+      rule 942100  score 30/10  SQL Injection Attack Detected via libinjection</code></pre>
+    <p>Use <code>--dry-run</code> to see exactly what it would create without creating it.</p>
+
+    <h3>Doing it in the dashboard instead</h3>
+    <p><strong>Sites → New Site.</strong> Two things will catch you out.</p>
+
+    <div class="note warn">
+      <span class="chip">Trap 1 — the wizard will not save</span>
+      <p><strong>Turn OFF “Serve HTTPS” on the Front Service step</strong> (or pick 🚫 No
+      certificate) unless the hostname is publicly resolvable. New sites default to
+      automatic Let's Encrypt certificates, and the wizard silently refuses to save
+      without a contact email — a red toast reading <em>“An email is required for
+      automatic certificates”</em>. Let's Encrypt cannot issue for an internal name
+      regardless.</p>
+    </div>
+
+    <div class="note warn">
+      <span class="chip">Trap 2 — you cannot switch later</span>
+      <p><strong>Use Advanced mode if the application needs anything non-default.</strong> Easy
+      mode's Reverse Proxy step has exactly three controls: host, port, upstream
+      HTTPS. Body size, timeouts, URI/header limits, allowed methods, WebSocket,
+      health check and origin SNI are all Advanced-only, and switching an existing
+      site is not offered. Decide up front.</p>
+    </div>
+
+    <h3>Four limits that will break real applications</h3>
+    <p>These reject in <strong>every</strong> mode, including learning:</p>
+    <div class="tw"><table>
+      <thead><tr><th>Limit</th><th>Default</th><th>Rejects</th><th>Raise it for</th></tr></thead>
+      <tbody>
+        <tr><td>Max body size</td><td>20 MB</td><td><strong>413</strong></td><td>document / KYC upload portals</td></tr>
+        <tr><td>Max URI length</td><td>8192</td><td><strong>414</strong></td><td>SAML / OIDC redirect logins</td></tr>
+        <tr><td>Max header count</td><td>100</td><td><strong>431</strong></td><td>corporate SSO with many cookies</td></tr>
+        <tr><td>Allowed methods</td><td>GET HEAD POST PUT PATCH DELETE OPTIONS</td><td><strong>405</strong></td><td>WebDAV, some REST clients</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+
+  <!-- 9 ------------------------------------------------------------------ -->
+  <section id="s9">
+    <h2><span class="num">09</span> Leave it in LEARNING mode</h2>
+    <p><strong>Do not switch a customer site to blocking on day one.</strong> Every detection
+    figure this product publishes comes from a synthetic corpus. Nobody has measured
+    how often it would wrongly block <em>that customer's</em> users.</p>
+
+    <p>Learning mode detects, scores and records — and lets the request through:</p>
+    <pre><code>rule_ids "942100,942180,942330,942390,9900100"
+decision "Log"   block_reason "anomaly score 30 &gt;= threshold 10"   status 200</code></pre>
+    <p>Blocking mode, same request:</p>
+    <pre><code>sqli: 403    xss: 403    traversal: 403    normal: 200</code></pre>
+
+    <h3>Going live</h3>
+    <ol>
+      <li>Run for a full business cycle — 1 to 2 weeks, including month-end if traffic changes then.</li>
+      <li>Measure: <code>/opt/sentinel/current/scripts/fpr-report.sh 168</code></li>
+      <li>Only when that is clean, switch to blocking, then confirm:
+        <pre><code>SENTINEL_VERIFY_HOST=portal.example.com sudo ./verify.sh</code></pre>
+        It must say <strong>SQL injection → 403 — blocking is ENFORCED</strong>.</li>
+    </ol>
+
+    <div class="note danger">
+      <span class="chip">Known defect</span>
+      <p>A newly created site is <strong>matchable before it is inspected</strong>. Rule engines
+      are rebuilt on a 5-second poll and then compiled; until that lands the site
+      proxies traffic with <code>rule_matches=0</code>. Never conclude “it does not block”
+      from a test in the first ~10 seconds, and <strong>do not create a site directly in
+      blocking mode</strong> — it fails open through that window.</p>
+    </div>
+  </section>
+
+  <!-- 10 ----------------------------------------------------------------- -->
+  <section id="s10">
+    <h2><span class="num">10</span> Day to day</h2>
+    <div class="tw"><table>
+      <thead><tr><th>Task</th><th>Command</th></tr></thead>
+      <tbody>
+        <tr><td>Health check</td><td><code>sudo ./verify.sh</code></td></tr>
+        <tr><td>Health + enforcement</td><td><code>SENTINEL_VERIFY_HOST=&lt;site-domain&gt; sudo ./verify.sh</code></td></tr>
+        <tr><td>What is running</td><td><code>docker compose -p sentinel ps</code></td></tr>
+        <tr><td>Service logs</td><td><code>docker compose -p sentinel logs --tail 100 &lt;service&gt;</code></td></tr>
+        <tr><td>Live traffic decisions</td><td><code>docker logs sentinel-dataplane-1 --tail 50</code></td></tr>
+        <tr><td>Backup</td><td><code>/opt/sentinel/current/scripts/backup/backup.sh</code></td></tr>
+        <tr><td>False-positive report</td><td><code>/opt/sentinel/current/scripts/fpr-report.sh 168</code></td></tr>
+      </tbody>
+    </table></div>
+    <div class="note danger">
+      <span class="chip">Back this up</span>
+      <p><code>/opt/sentinel/current/.env</code>, separately and off-box. It is the only copy
+      of the admin password and of every generated secret.</p>
+    </div>
+  </section>
+
+  <!-- 11 ----------------------------------------------------------------- -->
+  <section id="s11">
+    <h2><span class="num">11</span> When something is wrong</h2>
+    <div class="tw"><table>
+      <thead><tr><th>Symptom</th><th>Cause</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td><strong>502 on every request</strong></td><td>No site configured yet</td><td>Expected. Add a site</td></tr>
+        <tr><td><strong>502 on one site</strong></td><td>Origin unreachable from the WAF host, or Host header does not match exactly</td><td><code>docker exec sentinel-clickhouse-1 nc -z &lt;origin&gt; &lt;port&gt;</code></td></tr>
+        <tr><td><strong>Login returns 503</strong></td><td>Control plane has no database</td><td><code>sudo ./verify.sh</code>, then <code>docker restart sentinel-controlplane-1</code> once Postgres is healthy</td></tr>
+        <tr><td><strong><code>https://&lt;vm-ip&gt;:9443</code> refuses</strong></td><td>Correct — console is loopback-only</td><td>Use the SSH tunnel in 07</td></tr>
+        <tr><td><strong>Console shows 500</strong></td><td>Cached error from startup</td><td>Hard reload, or incognito</td></tr>
+        <tr><td><strong>Wizard will not save</strong></td><td>ACME email required by default</td><td>Turn off Serve HTTPS (08)</td></tr>
+        <tr><td><strong>Attack returns 200</strong></td><td>Site is in learning mode</td><td>Correct. Check the event was <em>recorded</em></td></tr>
+        <tr><td><strong>HTTPS origin always 502</strong></td><td>Origin certificate not publicly trusted</td><td>Not supported — use plain HTTP to the origin on a trusted segment</td></tr>
+        <tr><td><strong>Lost the admin password</strong></td><td>—</td><td><code>sudo grep SENTINEL_BOOTSTRAP_ADMIN_PASSWORD /opt/sentinel/current/.env</code>. If the file is gone, rebuild</td></tr>
+      </tbody>
+    </table></div>
+    <p class="footnote">Send /var/log/sentinel/install.log with any support request.</p>
+  </section>
+
+  <!-- 12 ----------------------------------------------------------------- -->
+  <section id="s12">
+    <h2><span class="num">12</span> Removing it</h2>
+    <pre><code>sudo ./uninstall.sh          # keeps data volumes, .env and certificates
+sudo ./uninstall.sh --purge  # destroys everything, including the database</code></pre>
+    <p>After a plain uninstall the data survives, so reinstalling must reuse the
+    existing secrets:</p>
+    <pre><code>sudo ./install.sh --force</code></pre>
+    <p><code>--force</code> is <strong>required</strong> because the <code>.env</code> deliberately survived — a
+    plain <code>install.sh</code> stops rather than regenerate secrets against a database
+    that already exists, which would lock you out of your own data.</p>
+  </section>
+
+  <!-- limits ------------------------------------------------------------- -->
+  <section id="limits">
+    <h2><span class="num">§</span> Known limitations in v1.0.1</h2>
+    <p>State these up front rather than letting a customer discover them.</p>
+    <div class="tw"><table>
+      <thead><tr><th>Limitation</th><th>Consequence</th></tr></thead>
+      <tbody>
+        <tr><td><strong>No password change or reset</strong></td><td>The seeded admin password is permanent. Back up <code>.env</code></td></tr>
+        <tr><td><strong>“Force HTTPS” does nothing</strong></td><td>Front Service switches are recorded, not enforced. There is no per-site HTTP→HTTPS redirect. Control it at the network edge</td></tr>
+        <tr><td><strong>HTTPS origins need a public certificate</strong></td><td>Internal-CA and self-signed origin certificates are not supported</td></tr>
+        <tr><td><strong>Learning mode does not relax the 4 request limits</strong></td><td>413 / 414 / 431 / 405 reject even in learning</td></tr>
+        <tr><td><strong>New sites are unprotected for a few seconds</strong></td><td>Rule engines load on a 5s poll after the site goes live</td></tr>
+        <tr><td><strong>HTTP/2, HTTP/3 and TLS toggles are per-host</strong></td><td>Listener-level, configured once for the host, not per site</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+
+  <hr>
+</div>
