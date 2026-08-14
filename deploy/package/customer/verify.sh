@@ -142,8 +142,16 @@ if [[ "${SITES:-0}" -gt 0 ]]; then
     printf '        %sre-run with a hostname one of your sites declares:%s\n' "$DIM" "$R"
     printf '        %s  SENTINEL_VERIFY_HOST=app.example.com sudo ./verify.sh%s\n' "$DIM" "$R"
   else
-    [[ "$b" == "200" ]] && pass "legitimate request -> $b" \
-      || soft "legitimate request -> $b (check the upstream is reachable)"
+    # Any 2xx or 3xx proves the request reached the origin and the origin
+    # answered — which is all this probe is for. Requiring exactly 200 raised
+    # "check the upstream is reachable" against perfectly healthy origins: a
+    # 302 is what Grafana, and any app that redirects `/` to a login page or to
+    # https, returns on the path probed here. That false alarm landed on the
+    # operator's FIRST verification run, next to real findings.
+    case "$b" in
+      2??|3??) pass "legitimate request -> $b (origin answered)" ;;
+      *)       soft "legitimate request -> $b (check the upstream is reachable)" ;;
+    esac
     case "$a" in
       403) pass "SQL injection -> 403 — blocking is ENFORCED"; ENFORCE_VERIFIED=yes ;;
       200) soft "SQL injection -> 200 — NOT blocked. Expected in learning mode; a fault in blocking mode. This script cannot tell which, so enforcement is unverified." ;;

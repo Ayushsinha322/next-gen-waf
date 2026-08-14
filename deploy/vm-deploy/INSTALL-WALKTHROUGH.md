@@ -382,20 +382,40 @@ server is actually fine. It almost always is.
 
 # Part 8 — Put a website behind the WAF
 
-In the control panel, go to **Sites → Add Site** and fill in four fields.
+In the control panel, go to **Sites → Add Site**.
 
 For a first test, use the monitoring dashboard that is already installed — no extra
-setup, works even with no internet:
+setup, works even with no internet.
+
+**Step 1 — Basics**
 
 | Field | Value |
 |---|---|
 | Name | `test-site` |
 | **Security Mode** | **`Learning`** — set this explicitly, see below |
 | Domain | `test.local` |
+
+**Step 2 — Front Service: turn OFF "Serve HTTPS"** (or choose the **🚫 No
+certificate** TLS card).
+
+> **Do not skip this step — the wizard will not save without it.** New sites
+> default to automatic certificates via Let's Encrypt. Leave that on and clicking
+> save does nothing except show a red toast reading *"An email is required for
+> automatic certificates (Front Service)"*. Supplying an email does not help
+> either: Let's Encrypt cannot issue a certificate for `test.local`, a name that
+> does not exist on the public internet. This test site is plain HTTP.
+>
+> The same applies to any real internal-only hostname later — automatic
+> certificates need a publicly resolvable name.
+
+**Step 3 — Reverse Proxy**
+
+| Field | Value |
+|---|---|
 | Upstream host | `grafana` |
 | Upstream port | `3000` |
 
-Click save.
+Leave the remaining steps at their defaults and click save.
 
 > ### Set Security Mode to `Learning` yourself — do not trust the default
 >
@@ -435,10 +455,10 @@ broken.
 
 ```bash
 # 1. A normal, harmless request
-curl -s -o /dev/null -w 'normal: %{http_code}\n' -H 'Host: test.local' http://127.0.0.1/
+curl -s -o /dev/null -w 'normal: %{http_code}\n' -H 'Host: test.local' http://127.0.0.1/login
 
 # 2. A SQL injection attack
-curl -s -o /dev/null -w 'sqli:   %{http_code}\n' -H 'Host: test.local' "http://127.0.0.1/?id=1%27+OR+1%3D1--"
+curl -s -o /dev/null -w 'sqli:   %{http_code}\n' -H 'Host: test.local' "http://127.0.0.1/login?id=1%27+OR+1%3D1--"
 ```
 
 Expected result:
@@ -447,6 +467,13 @@ Expected result:
 normal: 200
 sqli:   200
 ```
+
+> **Why `/login` and not `/`?** Grafana redirects `/` to its login page, so `/`
+> answers **302**, not 200 — which would make both numbers above read `302` and
+> leave you unable to tell a working WAF from a broken one. `/login` is the same
+> upstream, reached the same way, and answers 200. If you do test `/` and see
+> `302`, nothing is wrong: a 302 from the origin still proves the request was
+> proxied through the WAF.
 
 ### Got `sqli: 403` instead?
 
