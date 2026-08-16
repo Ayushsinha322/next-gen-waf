@@ -93,9 +93,25 @@ done
 
 # ── does this version already exist? ─────────────────────────────────────────
 step "Checking the registry"
-existing="$(curl -sS -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
-  "$GITLAB/api/v4/projects/$PROJECT_ID/packages?package_name=esdswaf" 2>/dev/null \
-  | grep -o "\"version\":\"$VERSION\"" | head -1)"
+# An UNREACHABLE registry must not read as an EMPTY one. Curl returning nothing
+# because the VPN dropped looks identical to "this version is not published" if
+# you only inspect the body, and the consequence is publishing a duplicate over a
+# version that already exists — which is exactly how 1.0.0 ended up with three
+# overlapping uploads. Gate on the HTTP status, not on the text.
+reg_body="$(mktemp)"
+reg_code="$(curl -sS -o "$reg_body" -w '%{http_code}' --connect-timeout 15 --max-time 60 \
+  -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+  "$GITLAB/api/v4/projects/$PROJECT_ID/packages?package_name=esdswaf" 2>/dev/null)"
+case "$reg_code" in
+  200) ;;
+  000) rm -f "$reg_body"; die "cannot reach $GITLAB — check the VPN.
+    Refusing to publish without knowing what is already in the registry." ;;
+  401|403) rm -f "$reg_body"; die "GitLab rejected the token ($reg_code).
+    Uploading needs a token with the 'api' scope; 'read_api' is not enough." ;;
+  *) rm -f "$reg_body"; die "unexpected response from the registry: HTTP $reg_code" ;;
+esac
+existing="$(grep -o "\"version\":\"$VERSION\"" "$reg_body" | head -1)"
+rm -f "$reg_body"
 if [[ -n "$existing" ]]; then
   if [[ "$REPLACE" == "yes" ]]; then
     warn "v$VERSION already published — uploading anyway (--replace)"
