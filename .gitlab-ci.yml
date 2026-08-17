@@ -370,29 +370,28 @@ publish-images:
 dind-smoke:
   stage: test
   image: docker:27-cli
-  services:
-    - name: docker:27-dind
-      alias: docker
-  # ai-docs (runner 51), not k8s-docker (runner 45): runner 45's Kubernetes node
-  # pool cannot schedule a pod at all — 1 node unreachable, 1 excluded by the
-  # runner's node affinity — so every job there fails at prepare environment.
+  # NO `services: docker:dind`, deliberately. On the ai-docs runner (51, a docker
+  # executor) the dind service failed with
+  #     can't create unix socket /var/run/docker.sock: device or resource busy
+  # which says the runner already mounts the host's docker socket into the job
+  # container — so a nested daemon is both unnecessary and in the way. This probes
+  # whether the mounted socket is usable directly.
   tags:
     - ai-docs
   needs: []
-  variables:
-    DOCKER_TLS_CERTDIR: "/certs"
-    DOCKER_HOST: tcp://docker:2376
-    DOCKER_TLS_VERIFY: "1"
-    DOCKER_CERT_PATH: "/certs/client"
   rules:
     - if: $CI_COMMIT_BRANCH
       when: manual
       allow_failure: true
   script:
-    - docker version
-    - df -h /var/lib/docker | tail -1
+    - echo "── socket present? ──"; ls -l /var/run/docker.sock || echo "no socket mounted"
+    - echo "── daemon reachable? ──"; docker version
+    - echo "── disk available to builds ──"; df -h /var/lib/docker 2>/dev/null | tail -1 || df -h / | tail -1
+    - echo "── can it build? ──"
     - printf 'FROM alpine:3.20\nRUN echo built-in-ci > /ok\n' > /tmp/Dockerfile
     - docker build -t dind-smoke:test -f /tmp/Dockerfile /tmp
     - docker run --rm dind-smoke:test cat /ok
+    - echo "── Harbor credentials ──"
     - echo "$HARBOR_TOKEN" | docker login hub.enlight.dev --username "$HARBOR_USER" --password-stdin
     - docker logout hub.enlight.dev
+    - docker image rm dind-smoke:test || true
