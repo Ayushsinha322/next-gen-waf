@@ -280,16 +280,16 @@ secret_detection:
 publish-images:
   stage: publish
   image: docker:27-cli
-  services:
-    - name: docker:27-dind
-      alias: docker
+  # ai-docs (runner 51), a DOCKER executor whose host socket is mounted into the
+  # job — measured, not assumed. Runner 45 (k8s-docker) cannot schedule a pod at
+  # all: one node unreachable, the other excluded by node affinity.
+  #
+  # No `services: docker:dind`. It fails here with "can't create unix socket
+  # /var/run/docker.sock: device or resource busy" precisely because the host
+  # socket is already mounted, and a nested daemon fights that mount.
   tags:
-    - k8s-docker
+    - ai-docs
   variables:
-    DOCKER_TLS_CERTDIR: "/certs"
-    DOCKER_HOST: tcp://docker:2376
-    DOCKER_TLS_VERIFY: "1"
-    DOCKER_CERT_PATH: "/certs/client"
     # BuildKit builds only the stages a --target actually depends on, which is
     # what keeps `migrate` from dragging in a Rust compiler.
     DOCKER_BUILDKIT: "1"
@@ -330,6 +330,20 @@ publish-images:
         echo "  Add them as masked CI/CD variables. HARBOR_USER is the Harbor"
         echo "  robot account name (robot\$something); HARBOR_TOKEN is its secret."
         exit 1; }
+    - |
+      # Reachability before credentials. As of 2026-08-17 this runner's host cannot
+      # reach 172.16.23.2:443 at all — DNS resolves and a route exists, but TCP
+      # times out, i.e. a firewall drops it. Docker Hub and GitLab are both fine
+      # from here. Saying so plainly beats "docker login timed out".
+      if ! wget -q -T 12 -O /dev/null --no-check-certificate "https://$HARBOR/v2/" 2>/dev/null; then
+        case "$(wget -S -T 12 -O /dev/null "https://$HARBOR/v2/" 2>&1 | head -1)" in
+          *401*|*200*) : ;;   # 401 is the registry's normal unauthenticated answer
+          *) echo "✗ cannot reach https://$HARBOR from this runner."
+             echo "  DNS and routing are fine; TCP 443 to the registry is dropped."
+             echo "  Infra must allow this runner host -> 172.16.23.2:443."
+             exit 1 ;;
+        esac
+      fi
     - echo "$HARBOR_TOKEN" | docker login "$HARBOR" --username "$HARBOR_USER" --password-stdin
   script:
     - . ./build.env
@@ -348,11 +362,15 @@ publish-images:
         [ -n "$target" ] && set -- "$@" --target "$target"
         docker build "$@" "$context" || return 1
         docker push "$ref" || return 1
-        # Free the builder cache before the next image. Without this the second
-        # Rust build lands on a node already holding the first one's artefacts.
+        # DO NOT prune here. This is the HOST daemon, shared with every other
+        # project that uses this runner — `docker builder prune -af` would delete
+        # their build caches too. The earlier draft did exactly that, written for
+        # the 29 GB Kubernetes node this job no longer runs on; the ai-docs host
+        # reports 475 GB free, so there is nothing to reclaim and every reason not
+        # to reach into a shared daemon. Only our own tag is dropped, and only
+        # because it is already safely in the registry.
         docker image rm "$ref" >/dev/null 2>&1 || true
-        docker builder prune -af >/dev/null 2>&1 || true
-        df -h /var/lib/docker 2>/dev/null | tail -1 || true
+        df -h /var/lib/docker 2>/dev/null | tail -1 || df -h / | tail -1 || true
       }
       build_push sentinel-dataplane    dataplane    . deploy/docker/Dockerfile
       build_push sentinel-controlplane controlplane . deploy/docker/Dockerfile
@@ -362,35 +380,3 @@ publish-images:
     # Never leave a usable credential in a runner's docker config.
     - docker logout hub.enlight.dev >/dev/null 2>&1 || true
   timeout: 90m
-
-# TEMPORARY — delete once the Harbor pipeline has run green once.
-# Answers one question the rest of this file cannot: does this Kubernetes runner
-# permit docker-in-docker at all? `needs: []` detaches it from the stage order so
-# it starts immediately instead of waiting ~2h behind the Rust jobs.
-dind-smoke:
-  stage: test
-  image: docker:27-cli
-  tags:
-    - ai-docs
-  needs: []
-  rules:
-    - if: $CI_COMMIT_BRANCH
-      when: manual
-      allow_failure: true
-  script:
-    # Established already on this runner: the host docker socket is mounted and
-    # usable, `docker build` and `docker run` work, 475 GB is free, and Docker Hub
-    # is reachable. The one failure was `docker login hub.enlight.dev` timing out.
-    # This narrows WHERE that breaks so the fix can be asked for precisely.
-    - apk add --no-cache curl bind-tools >/dev/null 2>&1 || apk add --no-cache curl >/dev/null 2>&1
-    - echo "── DNS ──"
-    - nslookup hub.enlight.dev 2>&1 | tail -4 || echo "  no resolver for it"
-    - echo "── route ──"
-    - ip route get 172.16.23.2 2>&1 | head -2 || echo "  no route"
-    - echo "── TCP 443 to the name ──"
-    - curl -sS -o /dev/null -m 12 -w "  hub.enlight.dev:443 -> %{http_code} in %{time_total}s\n" https://hub.enlight.dev/v2/ || echo "  FAILED to connect by name"
-    - echo "── TCP 443 to the IP ──"
-    - curl -sS -o /dev/null -m 12 -k -w "  172.16.23.2:443 -> %{http_code} in %{time_total}s\n" https://172.16.23.2/v2/ || echo "  FAILED to connect by IP"
-    - echo "── what CAN it reach, for contrast ──"
-    - curl -sS -o /dev/null -m 12 -w "  registry-1.docker.io -> %{http_code}\n" https://registry-1.docker.io/v2/ || echo "  docker hub unreachable too"
-    - curl -sS -o /dev/null -m 12 -w "  git.enlight.dev      -> %{http_code}\n" https://git.enlight.dev/ || echo "  gitlab unreachable from the runner"
