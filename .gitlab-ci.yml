@@ -370,12 +370,6 @@ publish-images:
 dind-smoke:
   stage: test
   image: docker:27-cli
-  # NO `services: docker:dind`, deliberately. On the ai-docs runner (51, a docker
-  # executor) the dind service failed with
-  #     can't create unix socket /var/run/docker.sock: device or resource busy
-  # which says the runner already mounts the host's docker socket into the job
-  # container — so a nested daemon is both unnecessary and in the way. This probes
-  # whether the mounted socket is usable directly.
   tags:
     - ai-docs
   needs: []
@@ -384,14 +378,19 @@ dind-smoke:
       when: manual
       allow_failure: true
   script:
-    - echo "── socket present? ──"; ls -l /var/run/docker.sock || echo "no socket mounted"
-    - echo "── daemon reachable? ──"; docker version
-    - echo "── disk available to builds ──"; df -h /var/lib/docker 2>/dev/null | tail -1 || df -h / | tail -1
-    - echo "── can it build? ──"
-    - printf 'FROM alpine:3.20\nRUN echo built-in-ci > /ok\n' > /tmp/Dockerfile
-    - docker build -t dind-smoke:test -f /tmp/Dockerfile /tmp
-    - docker run --rm dind-smoke:test cat /ok
-    - echo "── Harbor credentials ──"
-    - echo "$HARBOR_TOKEN" | docker login hub.enlight.dev --username "$HARBOR_USER" --password-stdin
-    - docker logout hub.enlight.dev
-    - docker image rm dind-smoke:test || true
+    # Established already on this runner: the host docker socket is mounted and
+    # usable, `docker build` and `docker run` work, 475 GB is free, and Docker Hub
+    # is reachable. The one failure was `docker login hub.enlight.dev` timing out.
+    # This narrows WHERE that breaks so the fix can be asked for precisely.
+    - apk add --no-cache curl bind-tools >/dev/null 2>&1 || apk add --no-cache curl >/dev/null 2>&1
+    - echo "── DNS ──"
+    - nslookup hub.enlight.dev 2>&1 | tail -4 || echo "  no resolver for it"
+    - echo "── route ──"
+    - ip route get 172.16.23.2 2>&1 | head -2 || echo "  no route"
+    - echo "── TCP 443 to the name ──"
+    - curl -sS -o /dev/null -m 12 -w "  hub.enlight.dev:443 -> %{http_code} in %{time_total}s\n" https://hub.enlight.dev/v2/ || echo "  FAILED to connect by name"
+    - echo "── TCP 443 to the IP ──"
+    - curl -sS -o /dev/null -m 12 -k -w "  172.16.23.2:443 -> %{http_code} in %{time_total}s\n" https://172.16.23.2/v2/ || echo "  FAILED to connect by IP"
+    - echo "── what CAN it reach, for contrast ──"
+    - curl -sS -o /dev/null -m 12 -w "  registry-1.docker.io -> %{http_code}\n" https://registry-1.docker.io/v2/ || echo "  docker hub unreachable too"
+    - curl -sS -o /dev/null -m 12 -w "  git.enlight.dev      -> %{http_code}\n" https://git.enlight.dev/ || echo "  gitlab unreachable from the runner"
