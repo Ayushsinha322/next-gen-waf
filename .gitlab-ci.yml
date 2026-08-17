@@ -362,3 +362,34 @@ publish-images:
     # Never leave a usable credential in a runner's docker config.
     - docker logout hub.enlight.dev >/dev/null 2>&1 || true
   timeout: 90m
+
+# TEMPORARY — delete once the Harbor pipeline has run green once.
+# Answers one question the rest of this file cannot: does this Kubernetes runner
+# permit docker-in-docker at all? `needs: []` detaches it from the stage order so
+# it starts immediately instead of waiting ~2h behind the Rust jobs.
+dind-smoke:
+  stage: test
+  image: docker:27-cli
+  services:
+    - name: docker:27-dind
+      alias: docker
+  tags:
+    - k8s-docker
+  needs: []
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_VERIFY: "1"
+    DOCKER_CERT_PATH: "/certs/client"
+  rules:
+    - if: $CI_COMMIT_BRANCH
+      when: manual
+      allow_failure: true
+  script:
+    - docker version
+    - df -h /var/lib/docker | tail -1
+    - printf 'FROM alpine:3.20\nRUN echo built-in-ci > /ok\n' > /tmp/Dockerfile
+    - docker build -t dind-smoke:test -f /tmp/Dockerfile /tmp
+    - docker run --rm dind-smoke:test cat /ok
+    - echo "$HARBOR_TOKEN" | docker login hub.enlight.dev --username "$HARBOR_USER" --password-stdin
+    - docker logout hub.enlight.dev
