@@ -373,8 +373,11 @@ dind-smoke:
   services:
     - name: docker:27-dind
       alias: docker
+  # ai-docs (runner 51), not k8s-docker (runner 45): runner 45's Kubernetes node
+  # pool cannot schedule a pod at all — 1 node unreachable, 1 excluded by the
+  # runner's node affinity — so every job there fails at prepare environment.
   tags:
-    - k8s-docker
+    - ai-docs
   needs: []
   variables:
     DOCKER_TLS_CERTDIR: "/certs"
