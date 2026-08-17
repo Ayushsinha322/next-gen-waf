@@ -21,6 +21,7 @@ stages:
   - rust-test   # rust-test alone — one 13 GB target at a time
   - build       # rust-build alone
   - security
+  - publish     # tags only — build the four images and push them to Harbor
 
 # ── Rust data plane ──────────────────────────────────────────────────────────
 # Shared Rust CI settings.
@@ -237,3 +238,127 @@ include:
 secret_detection:
   tags:
     - k8s-docker
+
+# ── Container images → Harbor ────────────────────────────────────────────────
+# Builds the four product images and pushes them to the ESDS Harbor registry, so
+# a release comes from a commit instead of from whoever's laptop last ran
+# build-bundle.sh. That was a real failure, not a hypothetical one: a bundle
+# published on 2026-08-16 turned out to have been built two commits earlier and
+# was shipping a stale copy of the very install walkthrough it contained.
+#
+#     hub.enlight.dev/swaraj-kavach/{dataplane,controlplane,dashboard,migrate}
+#
+# The project is PUBLIC, so a customer VM pulls with no credentials at all — no
+# docker login, no token to distribute. Verified from 172.16.21.101 with an empty
+# docker config. Credentials here are only for PUSHING.
+#
+# WHY ONE JOB THAT BUILDS SEQUENTIALLY, NOT FOUR PARALLEL JOBS
+#
+# The same disk ceiling that forced the Rust jobs into separate stages applies
+# here, and more sharply. Eviction happens at ~29 GB of ephemeral storage ON THE
+# NODE, not per pod, so splitting into parallel jobs would not divide the
+# problem — it would multiply it. And two of the four targets pull in a Rust
+# compilation:
+#
+#     sentinel-dataplane     <- rust-builder    (the proxy: heavy)
+#     sentinel-controlplane  <- go-builder + srl-builder  (srl-builder is Rust)
+#     sentinel-migrate       <- goose-builder   (light)
+#     dashboard              separate Dockerfile, Node build
+#
+# So the images are built one at a time, heaviest first, with the builder cache
+# pruned between each. Peak disk is one Rust build rather than two.
+#
+# TAGS ONLY. This job does not run on branch pushes — it is minutes of compile
+# for an artefact nobody consumes until a release exists. Push a tag to publish:
+#
+#     git tag v1.0.1 && git push origin v1.0.1
+#
+# It is also available manually on a branch, so the pipeline can be exercised
+# without inventing a tag. A manual run publishes to a branch-named tag
+# (e.g. :uat, :testing), never to a version number — a test build must never be
+# mistakable for the release.
+publish-images:
+  stage: publish
+  image: docker:27-cli
+  services:
+    - name: docker:27-dind
+      alias: docker
+  tags:
+    - k8s-docker
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_VERIFY: "1"
+    DOCKER_CERT_PATH: "/certs/client"
+    # BuildKit builds only the stages a --target actually depends on, which is
+    # what keeps `migrate` from dragging in a Rust compiler.
+    DOCKER_BUILDKIT: "1"
+    HARBOR: hub.enlight.dev
+    HARBOR_PROJECT: swaraj-kavach
+  rules:
+    # A version tag publishes the real release.
+    - if: $CI_COMMIT_TAG
+      when: on_success
+    # Any branch can publish a throwaway, on purpose, by hand.
+    - if: $CI_COMMIT_BRANCH
+      when: manual
+      allow_failure: true
+  before_script:
+    - apk add --no-cache git
+    - |
+      # The image tag. On a git tag, v1.0.1 -> 1.0.1 and it MUST match the
+      # VERSION file: a release whose images say one version and whose bundle
+      # manifest says another is worse than a failed pipeline.
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        IMAGE_TAG="${CI_COMMIT_TAG#v}"
+        FILE_VERSION="$(cat VERSION 2>/dev/null || echo missing)"
+        if [ "$IMAGE_TAG" != "$FILE_VERSION" ]; then
+          echo "✗ tag '$CI_COMMIT_TAG' implies version '$IMAGE_TAG' but VERSION says '$FILE_VERSION'"
+          echo "  Bump VERSION and re-tag, or tag the commit that matches."
+          exit 1
+        fi
+      else
+        # Branch build: publish under the branch name, slashes flattened.
+        IMAGE_TAG="$(echo "$CI_COMMIT_BRANCH" | tr '/' '-')"
+        echo "! manual branch build — publishing :$IMAGE_TAG, not a version"
+      fi
+      echo "IMAGE_TAG=$IMAGE_TAG" > build.env
+      echo "  image tag: $IMAGE_TAG"
+    - |
+      [ -n "$HARBOR_USER" ] && [ -n "$HARBOR_TOKEN" ] || {
+        echo "✗ HARBOR_USER / HARBOR_TOKEN are not set."
+        echo "  Add them as masked CI/CD variables. HARBOR_USER is the Harbor"
+        echo "  robot account name (robot\$something); HARBOR_TOKEN is its secret."
+        exit 1; }
+    - echo "$HARBOR_TOKEN" | docker login "$HARBOR" --username "$HARBOR_USER" --password-stdin
+  script:
+    - . ./build.env
+    - export BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    - |
+      # Heaviest first: if the node is going to run out of disk, find out on the
+      # build that costs the most rather than after three cheap successes.
+      build_push() {
+        target="$1"; name="$2"; context="$3"; dockerfile="$4"
+        ref="$HARBOR/$HARBOR_PROJECT/$name:$IMAGE_TAG"
+        echo "── $name ─────────────────────────────────────────────"
+        set -- --build-arg "GIT_SHA=$CI_COMMIT_SHORT_SHA" \
+               --build-arg "BUILD_DATE=$BUILD_DATE" \
+               --build-arg "VERSION=$IMAGE_TAG" \
+               -f "$dockerfile" -t "$ref"
+        [ -n "$target" ] && set -- "$@" --target "$target"
+        docker build "$@" "$context" || return 1
+        docker push "$ref" || return 1
+        # Free the builder cache before the next image. Without this the second
+        # Rust build lands on a node already holding the first one's artefacts.
+        docker image rm "$ref" >/dev/null 2>&1 || true
+        docker builder prune -af >/dev/null 2>&1 || true
+        df -h /var/lib/docker 2>/dev/null | tail -1 || true
+      }
+      build_push sentinel-dataplane    dataplane    . deploy/docker/Dockerfile
+      build_push sentinel-controlplane controlplane . deploy/docker/Dockerfile
+      build_push ""                    dashboard    dashboard deploy/docker/Dockerfile.dashboard
+      build_push sentinel-migrate      migrate      . deploy/docker/Dockerfile
+  after_script:
+    # Never leave a usable credential in a runner's docker config.
+    - docker logout hub.enlight.dev >/dev/null 2>&1 || true
+  timeout: 90m
