@@ -38,38 +38,54 @@ tells you the next command. It does not need root and installs nothing.
 
 ## Which bundle?
 
-| Bundle | Size | Files | Needs internet on the VM? |
+| Bundle | Size | Files | What the VM must reach |
 |---|---|---|---|
-| **`-online`** | **99 MB** | **one** | **Yes.** Six third-party images are pulled from Docker Hub during install |
-| `-offline` | 584 MB | 3 parts | **No.** All ten container images are inside |
+| **`-registry`** | **316 KB** | **one** | `hub.enlight.dev` only. Ships no images — the installer pulls all ten from Harbor |
+| `-online` | 99 MB | one | Docker Hub. Ships our four; the other six are pulled |
+| `-offline` | 584 MB | 3 parts | nothing. All ten images are inside |
 
-**Pick by whether the VM can reach Docker Hub**, not by preference:
+**Pick by what the VM can reach, not by preference:**
 
 ```bash
-curl -sS -o /dev/null -w '%{http_code}\n' https://registry-1.docker.io/v2/
+curl -sS -o /dev/null -w 'harbor:     %{http_code}\n' https://hub.enlight.dev/v2/
+curl -sS -o /dev/null -w 'dockerhub:  %{http_code}\n' https://registry-1.docker.io/v2/
 ```
 
-`401` means it can — use `-online`. Anything else (timeout, `000`) means a closed
-network, so you need `-offline`. The installer reads which variant it is from the
-bundle manifest, so you cannot use the wrong one by accident: it fails early and
-clearly rather than halfway through.
+`401` means reachable — a registry's normal unauthenticated answer. A timeout or
+`000` means blocked.
 
-> **The online bundle used to be 248 MB and the offline one 733 MB in four parts.**
-> The dashboard image accounted for 779 MB of the images — almost entirely build
-> tooling (TypeScript, ESLint, Tailwind, the webpack cache) that never runs in
-> production. Switching it to a traced standalone build took that image to 157 MB,
-> which is what brought the online bundle to 99 MB — **under this GitLab's ~250 MB
-> upload cap, so it is now a single file with no reassembly step.**
+**Prefer `-registry` for anything ESDS-internal.** No credentials are needed: the
+Harbor project is readable inside the ESDS network. Verified by installing on a VM
+with Docker Hub blackholed — all eight containers came from Harbor and the result
+was indistinguishable from a tarball install.
+
+**`-offline` is the one that travels.** A customer datacentre cannot reach Harbor
+whether or not it has internet, because Harbor is on `172.16.23.2` — an internal
+address that does not route from outside ESDS. That is a structural fact about the
+network, not an "air-gapped edge case", and it is why the offline bundle is not
+going away.
+
+The installer reads which variant it is from the package manifest, so you cannot
+use the wrong one by accident — it aborts in preflight with a clear message rather
+than failing halfway through.
+
+> **These sizes used to be 248 MB and 733 MB in four parts.** The dashboard image
+> accounted for 779 MB of the images, almost entirely build tooling (TypeScript,
+> ESLint, Tailwind, the webpack cache) that never runs in production. A traced
+> standalone build took it to 157 MB, which brought the online bundle under this
+> GitLab's ~250 MB upload cap so it became a single file. Registry mode then
+> removed the images from the download altogether.
 >
-> The offline bundle still needs splitting: 584 MB of it is the six third-party
-> images (ClickHouse, Grafana, Postgres, Prometheus, Redis, HAProxy), which we do not
-> build and cannot shrink. `get-esdswaf.sh` reassembles them automatically; by hand it
-> is one `cat`. The joined file is byte-identical and the checksum proves it.
+> The offline bundle still needs splitting: most of it is the six third-party
+> images (ClickHouse, Grafana, Postgres, Prometheus, Redis, HAProxy), which we do
+> not build and cannot shrink. `get-esdswaf.sh` reassembles the parts
+> automatically; by hand it is one `cat`, and the checksum proves the join is
+> lossless.
 
 ## Install
 
 ```bash
-cd ESDSWAF-v1.0.1
+cd ESDSWAF-v1.0.2
 sudo ./install.sh --dry-run     # every check, changes nothing
 sudo ./install.sh               # ~6 minutes
 sudo ./verify.sh                # proves the result
@@ -130,34 +146,34 @@ losing it means rebuilding the installation. Create a second administrator
 Every file is at the same base URL:
 
 ```
-https://git.enlight.dev/api/v4/projects/1301/packages/generic/esdswaf/1.0.1/
+https://git.enlight.dev/api/v4/projects/1301/packages/generic/esdswaf/1.0.2/
 ```
 
 Online bundle:
 
 ```bash
 TOKEN=glpat-xxxxxxxxxxxx
-BASE=https://git.enlight.dev/api/v4/projects/1301/packages/generic/esdswaf/1.0.1
+BASE=https://git.enlight.dev/api/v4/projects/1301/packages/generic/esdswaf/1.0.2
 
-curl -fL -H "PRIVATE-TOKEN: $TOKEN" -O $BASE/ESDSWAF-v1.0.1-online.tar.gz
-curl -fL -H "PRIVATE-TOKEN: $TOKEN" -O $BASE/ESDSWAF-v1.0.1-online.tar.gz.sha256
-sha256sum -c ESDSWAF-v1.0.1-online.tar.gz.sha256      # must print OK
-tar -xzf ESDSWAF-v1.0.1-online.tar.gz
+curl -fL -H "PRIVATE-TOKEN: $TOKEN" -O $BASE/ESDSWAF-v1.0.2-online.tar.gz
+curl -fL -H "PRIVATE-TOKEN: $TOKEN" -O $BASE/ESDSWAF-v1.0.2-online.tar.gz.sha256
+sha256sum -c ESDSWAF-v1.0.2-online.tar.gz.sha256      # must print OK
+tar -xzf ESDSWAF-v1.0.2-online.tar.gz
 ```
 
-Offline bundle (three parts at v1.0.1, reassembled with `cat`). **Check the package
+Offline bundle (three parts at v1.0.2, reassembled with `cat`). **Check the package
 registry for the actual part count before copying this** — it follows the archive
 size, so a future release may have more or fewer:
 
 ```bash
 for i in 00 01 02; do
-  curl -fL -H "PRIVATE-TOKEN: $TOKEN" -O $BASE/ESDSWAF-v1.0.1-offline.tar.gz.part-$i
+  curl -fL -H "PRIVATE-TOKEN: $TOKEN" -O $BASE/ESDSWAF-v1.0.2-offline.tar.gz.part-$i
 done
-curl -fL -H "PRIVATE-TOKEN: $TOKEN" -O $BASE/ESDSWAF-v1.0.1-offline.tar.gz.sha256
+curl -fL -H "PRIVATE-TOKEN: $TOKEN" -O $BASE/ESDSWAF-v1.0.2-offline.tar.gz.sha256
 
-cat ESDSWAF-v1.0.1-offline.tar.gz.part-* > ESDSWAF-v1.0.1-offline.tar.gz
-sha256sum -c ESDSWAF-v1.0.1-offline.tar.gz.sha256     # must print OK
-tar -xzf ESDSWAF-v1.0.1-offline.tar.gz
+cat ESDSWAF-v1.0.2-offline.tar.gz.part-* > ESDSWAF-v1.0.2-offline.tar.gz
+sha256sum -c ESDSWAF-v1.0.2-offline.tar.gz.sha256     # must print OK
+tar -xzf ESDSWAF-v1.0.2-offline.tar.gz
 ```
 
 **If `sha256sum -c` does not print `OK`, stop.** The transfer was truncated or the
@@ -167,19 +183,19 @@ file was altered. Delete it and download again; do not install it.
 
 ```bash
 # 1. Build
-BUNDLE_THIRD_PARTY=1 ./deploy/package/build-bundle.sh 1.0.1   # offline
-./deploy/package/build-bundle.sh 1.0.1                        # online
+BUNDLE_THIRD_PARTY=1 ./deploy/package/build-bundle.sh 1.0.2   # offline
+./deploy/package/build-bundle.sh 1.0.2                        # online
 
 # 2. Split the offline one — this GitLab rejects uploads over ~250 MB
 cd dist
-split -b 240M -d -a 2 ESDSWAF-v1.0.1-offline.tar.gz ESDSWAF-v1.0.1-offline.tar.gz.part-
+split -b 240M -d -a 2 ESDSWAF-v1.0.2-offline.tar.gz ESDSWAF-v1.0.2-offline.tar.gz.part-
 
 # 3. Upload every file
 TOKEN=glpat-xxxxxxxxxxxx
-BASE=https://git.enlight.dev/api/v4/projects/1301/packages/generic/esdswaf/1.0.1
-for f in ESDSWAF-v1.0.1-online.tar.gz \
-         ESDSWAF-v1.0.1-*.sha256 \
-         ESDSWAF-v1.0.1-offline.tar.gz.part-*; do
+BASE=https://git.enlight.dev/api/v4/projects/1301/packages/generic/esdswaf/1.0.2
+for f in ESDSWAF-v1.0.2-online.tar.gz \
+         ESDSWAF-v1.0.2-*.sha256 \
+         ESDSWAF-v1.0.2-offline.tar.gz.part-*; do
   curl --header "PRIVATE-TOKEN: $TOKEN" --upload-file "$f" "$BASE/$f"
 done
 ```

@@ -47,21 +47,30 @@ Two addresses matter and confusing them is the usual first mistake:
 > (which would fail) while `/opt` was a separate 110 GB volume with 103 GB free
 > (which passed). If `/opt` is not separate, size the root disk accordingly.
 
-**Internet access is optional but changes which package you need:**
-
-| Your VM can reach Docker Hub | Use | Size |
-|---|---|---|
-| Yes | `ESDSWAF-v1.0.1-online.tar.gz` | **99 MB**, one file |
-| No (management network) | `ESDSWAF-v1.0.1-offline.tar.gz` | 584 MB, split into 3 parts |
-
-Check with:
+**Which package you need depends on what the VM can reach.** Check both:
 
 ```bash
-curl -sS -o /dev/null -w '%{http_code}\n' https://registry-1.docker.io/v2/
+curl -sS -o /dev/null -w 'harbor:     %{http_code}\n' https://hub.enlight.dev/v2/
+curl -sS -o /dev/null -w 'dockerhub:  %{http_code}\n' https://registry-1.docker.io/v2/
 ```
 
-`401` means reachable (that is the normal unauthenticated answer). No response
-means you need the offline bundle.
+`401` means reachable — that is a registry's normal unauthenticated answer. A
+timeout or `000` means blocked.
+
+| Harbor | Docker Hub | Use | Size |
+|---|---|---|---|
+| `401` | either | **`ESDSWAF-v1.0.2-registry.tar.gz`** | **316 KB**, one file |
+| unreachable | `401` | `ESDSWAF-v1.0.2-online.tar.gz` | 99 MB, one file |
+| unreachable | unreachable | `ESDSWAF-v1.0.2-offline.tar.gz` | 584 MB, 3 parts |
+
+**Prefer `-registry`** for any ESDS-internal VM. It ships no container images; the
+installer pulls all ten from Harbor, needing no credentials because that project is
+readable within the ESDS network. Verified on a VM with Docker Hub blackholed: all
+eight containers came from Harbor and the install was indistinguishable from the
+tarball one.
+
+`-offline` is for a customer datacentre, which cannot reach Harbor regardless of
+internet access — it sits on `172.16.23.2`, which does not route from outside ESDS.
 
 ---
 
@@ -93,9 +102,9 @@ You need **both** the archive and its `.sha256`.
 
 ```bash
 cd /root
-sha256sum -c ESDSWAF-v1.0.1-online.tar.gz.sha256    # must print: OK
-tar -xzf ESDSWAF-v1.0.1-online.tar.gz
-cd ESDSWAF-v1.0.1
+sha256sum -c ESDSWAF-v1.0.2-online.tar.gz.sha256    # must print: OK
+tar -xzf ESDSWAF-v1.0.2-online.tar.gz
+cd ESDSWAF-v1.0.2
 ```
 
 **Do not skip the checksum.** A truncated download fails later, during image
@@ -104,8 +113,8 @@ loading, in a way that looks like a product fault.
 > If you were given the **offline** bundle in parts, reassemble first — the
 > result is byte-identical and the checksum proves it:
 > ```bash
-> cat ESDSWAF-v1.0.1-offline.tar.gz.part-* > ESDSWAF-v1.0.1-offline.tar.gz
-> sha256sum -c ESDSWAF-v1.0.1-offline.tar.gz.sha256
+> cat ESDSWAF-v1.0.2-offline.tar.gz.part-* > ESDSWAF-v1.0.2-offline.tar.gz
+> sha256sum -c ESDSWAF-v1.0.2-offline.tar.gz.sha256
 > ```
 
 ---
@@ -159,7 +168,7 @@ Ten steps, roughly six minutes. It ends with:
 ```
   Installation successful
 
-    Version        Next-Gen ESDSWAF v1.0.1
+    Version        Next-Gen ESDSWAF v1.0.2
     Username       admin@sentinel.local
     Password       6c1a48cb969314feb230ce64072348d3afba849a67c59f0534ac480437a7786b
 ```
@@ -392,7 +401,7 @@ already exists, which would lock you out of your own data.
 
 ---
 
-## Known limitations in v1.0.1
+## Known limitations in v1.0.2
 
 State these up front rather than letting a customer discover them:
 

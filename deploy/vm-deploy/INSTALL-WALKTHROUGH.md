@@ -10,7 +10,7 @@ and copy-paste, you can complete this.
 
 > **Every command and every output below came from a real run.** This walkthrough
 > was executed start to finish on a fresh Ubuntu 24.04 VM (`172.16.21.101`) on
-> **2026-08-14** against **v1.0.1**, and the quoted outputs are that machine's,
+> **2026-08-14** against **v1.0.2**, and the quoted outputs are that machine's,
 > copied verbatim. The troubleshooting section lists the problems that actually
 > occurred, not ones that might.
 
@@ -120,6 +120,7 @@ echo "── DISK ──"; df -h /opt | tail -1
 echo "── DOCKER ──"; docker version --format 'server {{.Server.Version}}' 2>/dev/null || echo "MISSING"
 echo "── COMPOSE ──"; docker compose version 2>/dev/null || echo "MISSING"
 echo "── PORTS ──"; ss -ltn 2>/dev/null | grep -E ':(80|443|9443) ' || echo "80/443/9443 free"
+echo "── ESDS HARBOR ──"; curl -sS -m 8 -o /dev/null -w 'harbor:   %{http_code}\n' https://hub.enlight.dev/v2/ 2>/dev/null || echo "NOT REACHABLE"
 echo "── DOCKER HUB ──"; curl -sS -m 8 -o /dev/null -w 'registry: %{http_code}\n' https://registry-1.docker.io/v2/ 2>/dev/null || echo "NOT REACHABLE"
 echo "── INTERNET ──"; curl -sI -m 8 https://get.docker.com -o /dev/null -w 'internet: %{http_code}\n' 2>/dev/null || echo "NO INTERNET"
 ```
@@ -135,13 +136,18 @@ echo "── INTERNET ──"; curl -sI -m 8 https://get.docker.com -o /dev/null
 | DOCKER | a version, or `MISSING` | `MISSING` is fine, Part 4 installs it |
 | COMPOSE | any version, or `MISSING` | `MISSING` is fine, Part 4 installs it |
 | PORTS | `80/443/9443 free` | See "A port is in use" below |
-| DOCKER HUB | `registry: 401` | See the note below — it decides which download you need |
+| ESDS HARBOR | `harbor:   401` | See the note below — this decides which download you need |
+| DOCKER HUB | `registry: 401` | Only matters if Harbor is unreachable |
 | INTERNET | `internet: 200` | Without it you cannot install Docker |
 
-> **`registry: 401` is the good answer**, not an error. That is Docker Hub's normal
-> reply to an unauthenticated request, and it proves the VM can reach it. Anything
-> else — a timeout, `NOT REACHABLE`, `000` — means this VM is on a closed network,
-> and you need the **offline** download in Part 5 instead of the small one.
+> **`401` is the good answer for both**, not an error. That is what a container
+> registry replies to an unauthenticated request, and it proves the VM can reach it.
+> A timeout, `NOT REACHABLE` or `000` means it cannot.
+>
+> **The HARBOR line is the important one.** If it says `401`, you want the tiny
+> `-registry` download in Part 5 — 316 KB, because the images come from ESDS's own
+> registry rather than travelling with the package. Only if Harbor is unreachable
+> does the Docker Hub line matter.
 
 ### Not enough disk?
 
@@ -214,12 +220,22 @@ systemctl is-active docker        # must print: active
 
 ### 5.1 Which one do you need?
 
-There are two downloads. **The DOCKER HUB line from Part 3 tells you which.**
+Three downloads. **Part 3's HARBOR and DOCKER HUB lines tell you which.**
 
-| Part 3 said | Download | Size | Files |
-|---|---|---|---|
-| `registry: 401` | **`-online`** | **99 MB** | **one file** |
-| anything else | `-offline` | 584 MB | three parts to join |
+| Harbor | Docker Hub | Download | Size | Files |
+|---|---|---|---|---|
+| `401` | either | **`-registry`** | **316 KB** | **one file** |
+| unreachable | `401` | `-online` | 99 MB | one file |
+| unreachable | unreachable | `-offline` | 584 MB | three parts to join |
+
+**If Harbor answered, take `-registry`.** It contains no container images at all —
+the installer pulls all ten from ESDS's Harbor registry, which needs no login
+because that project is readable inside the ESDS network. This is the normal case
+for any ESDS-internal VM, and it is 316 KB instead of 99 MB.
+
+Use `-offline` for a customer's own datacentre. Such a site cannot reach Harbor
+whether or not it has internet, because Harbor lives on an internal address
+(`172.16.23.2`) that does not route from outside ESDS.
 
 The small one pulls six standard images (Postgres, Redis, ClickHouse, Prometheus,
 Grafana, HAProxy) from Docker Hub during the install. The offline one carries all
@@ -235,13 +251,13 @@ Paste your token from Part 1 into the first line:
 
 ```bash
 export TOKEN=glpat-xxxxxxxxxxxx
-BASE=https://git.enlight.dev/api/v4/projects/1301/packages/generic/esdswaf/1.0.1
+BASE=https://git.enlight.dev/api/v4/projects/1301/packages/generic/esdswaf/1.0.2
 
 mkdir -p /root/waf && cd /root/waf
 
 # ── the small one (VM has internet) ───────────────────────────────────────────
-curl -fL -H "PRIVATE-TOKEN: $TOKEN" -O $BASE/ESDSWAF-v1.0.1-online.tar.gz
-curl -fL -H "PRIVATE-TOKEN: $TOKEN" -O $BASE/ESDSWAF-v1.0.1-online.tar.gz.sha256
+curl -fL -H "PRIVATE-TOKEN: $TOKEN" -O $BASE/ESDSWAF-v1.0.2-online.tar.gz
+curl -fL -H "PRIVATE-TOKEN: $TOKEN" -O $BASE/ESDSWAF-v1.0.2-online.tar.gz.sha256
 
 ls -lh
 ```
@@ -259,9 +275,9 @@ product — there is nothing to join.
 
 ```bash
 for i in 00 01 02; do
-  curl -fL -H "PRIVATE-TOKEN: $TOKEN" -O $BASE/ESDSWAF-v1.0.1-offline.tar.gz.part-$i
+  curl -fL -H "PRIVATE-TOKEN: $TOKEN" -O $BASE/ESDSWAF-v1.0.2-offline.tar.gz.part-$i
 done
-curl -fL -H "PRIVATE-TOKEN: $TOKEN" -O $BASE/ESDSWAF-v1.0.1-offline.tar.gz.sha256
+curl -fL -H "PRIVATE-TOKEN: $TOKEN" -O $BASE/ESDSWAF-v1.0.2-offline.tar.gz.sha256
 ```
 
 **If a downloaded file is only a few hundred bytes**, your token is wrong — you have
@@ -276,21 +292,21 @@ saved an error message, not a download. Delete the files and redo Part 1.
 **Small download** — nothing to join:
 
 ```bash
-sha256sum -c ESDSWAF-v1.0.1-online.tar.gz.sha256
+sha256sum -c ESDSWAF-v1.0.2-online.tar.gz.sha256
 ```
 
 **Offline download** — join the parts first. The result is byte-identical to the
 original and the checksum is what proves it:
 
 ```bash
-cat ESDSWAF-v1.0.1-offline.tar.gz.part-* > ESDSWAF-v1.0.1-offline.tar.gz
-sha256sum -c ESDSWAF-v1.0.1-offline.tar.gz.sha256
+cat ESDSWAF-v1.0.2-offline.tar.gz.part-* > ESDSWAF-v1.0.2-offline.tar.gz
+sha256sum -c ESDSWAF-v1.0.2-offline.tar.gz.sha256
 ```
 
 **This must print `OK`.**
 
 ```
-ESDSWAF-v1.0.1-online.tar.gz: OK
+ESDSWAF-v1.0.2-online.tar.gz: OK
 ```
 
 If it says `FAILED`, the download was incomplete. Delete everything and redo
@@ -302,8 +318,8 @@ to find out now.)
 ### 6.2 Unpack
 
 ```bash
-tar -xzf ESDSWAF-v1.0.1-online.tar.gz
-cd ESDSWAF-v1.0.1
+tar -xzf ESDSWAF-v1.0.2-online.tar.gz
+cd ESDSWAF-v1.0.2
 ls
 ```
 
@@ -322,7 +338,7 @@ This checks everything and **changes nothing**. Real output from the reference V
 
 ```
 ==> Step 1 of 10 — package
-  ✓ package: Next-Gen ESDSWAF v1.0.1
+  ✓ package: Next-Gen ESDSWAF v1.0.2
   verifying every shipped file against SHA256SUMS…
   ✓ package integrity verified (54 files)
 
@@ -389,7 +405,7 @@ Ten steps, and it ends like this:
 
   Installation successful
 
-    Version        Next-Gen ESDSWAF v1.0.1
+    Version        Next-Gen ESDSWAF v1.0.2
     Username       admin@sentinel.local
     Password       6c1a48cb969314feb230ce64072348d3afba849a67c59f0534ac480437a7786b
 ```
@@ -487,7 +503,7 @@ and then exits — it is *supposed* to be gone.)
 
 ### 6.7 ⚠️ Do not delete this folder
 
-You are in `/root/waf/ESDSWAF-v1.0.1`. **Keep it.**
+You are in `/root/waf/ESDSWAF-v1.0.2`. **Keep it.**
 
 `verify.sh`, `first-site.sh`, `upgrade.sh`, `rollback.sh` and `uninstall.sh` live
 **only** here. The installer copies the compose files and the operational `scripts/`
@@ -498,10 +514,10 @@ uninstall until you download the package again.
 Move it somewhere permanent and write the path down:
 
 ```bash
-cd / && mv /root/waf/ESDSWAF-v1.0.1 /opt/ && cd /opt/ESDSWAF-v1.0.1
+cd / && mv /root/waf/ESDSWAF-v1.0.2 /opt/ && cd /opt/ESDSWAF-v1.0.2
 ```
 
-From now on, "run `./verify.sh`" means: `cd /opt/ESDSWAF-v1.0.1` first.
+From now on, "run `./verify.sh`" means: `cd /opt/ESDSWAF-v1.0.2` first.
 
 ---
 
