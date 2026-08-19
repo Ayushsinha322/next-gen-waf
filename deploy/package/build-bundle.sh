@@ -228,7 +228,7 @@ done
 # Copied by name, not by glob, so a renamed or deleted page warns here rather than
 # going missing silently.
 mkdir -p "$STAGE/docs/manual"
-for d in README.md NOC-RUNBOOK.md ADMIN-GUIDE.md SITE-ONBOARDING.md TROUBLESHOOTING.md ROLLBACK.md; do
+for d in README.md USER-MANUAL.md NOC-RUNBOOK.md ADMIN-GUIDE.md SITE-ONBOARDING.md TROUBLESHOOTING.md ROLLBACK.md; do
   cp "deploy/manual/$d" "$STAGE/docs/manual/$d" 2>/dev/null \
     || warn "missing manual page: deploy/manual/$d"
 done
