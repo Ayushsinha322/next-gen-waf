@@ -279,7 +279,7 @@
 <div class="wrap">
 
   <header class="masthead">
-    <p class="eyebrow">ESDS Software Solution · Next-Gen ESDSWAF v1.0.1</p>
+    <p class="eyebrow">ESDS Software Solution · Next-Gen ESDSWAF v1.0.2</p>
     <h1>NOC Runbook</h1>
     <p class="standfirst">
       Bare virtual machine to a protected website, for an engineer who has never
@@ -349,18 +349,37 @@
       disk accordingly.</p>
     </div>
 
-    <p>Internet access is optional, but it decides which package you need.</p>
+    <p><strong>Which package you need depends on what the VM can reach.</strong> Check both:</p>
+
+    <pre><code>curl -sS -o /dev/null -w 'harbor:     %{http_code}\n' https://hub.enlight.dev/v2/
+curl -sS -o /dev/null -w 'dockerhub:  %{http_code}\n' https://registry-1.docker.io/v2/</code></pre>
+
     <div class="tw"><table>
-      <thead><tr><th>VM can reach Docker Hub</th><th>Use</th><th>Size</th></tr></thead>
+      <thead><tr><th>Harbor</th><th>Docker Hub</th><th>Use</th><th>Size</th></tr></thead>
       <tbody>
-        <tr><td>Yes</td><td><code>ESDSWAF-v1.0.1-online.tar.gz</code></td><td><strong>99 MB</strong>, one file</td></tr>
-        <tr><td>No (management network)</td><td><code>ESDSWAF-v1.0.1-offline.tar.gz</code></td><td>584 MB, 3 parts</td></tr>
+        <tr><td><code>401</code></td><td>either</td><td><strong><code>ESDSWAF-v1.0.2-registry.tar.gz</code></strong></td><td><strong>316 KB</strong>, one file</td></tr>
+        <tr><td>unreachable</td><td><code>401</code></td><td><code>ESDSWAF-v1.0.2-online.tar.gz</code></td><td>99 MB, one file</td></tr>
+        <tr><td>unreachable</td><td>unreachable</td><td><code>ESDSWAF-v1.0.2-offline.tar.gz</code></td><td>584 MB, 3 parts</td></tr>
       </tbody>
     </table></div>
 
-    <pre><code>curl -sS -o /dev/null -w '%{http_code}\n' https://registry-1.docker.io/v2/</code></pre>
-    <p><code>401</code> means reachable — that is the normal unauthenticated answer.
-    No response means you need the offline bundle.</p>
+    <div class="note ok">
+      <span class="chip">Prefer this</span>
+      <p><strong><code>-registry</code> for any ESDS-internal VM.</strong> It ships no
+      container images at all — the installer pulls all ten from Harbor, needing no
+      credentials because that project is readable inside the ESDS network. Verified on
+      a VM with Docker Hub blackholed: all eight containers came from Harbor and the
+      install was indistinguishable from the tarball one.</p>
+    </div>
+
+    <div class="note">
+      <span class="chip">401 is correct</span>
+      <p><code>401</code> is a registry's normal answer to an unauthenticated request and
+      proves the VM can reach it. A timeout or <code>000</code> means blocked.
+      <code>-offline</code> is for a customer datacentre, which cannot reach Harbor
+      whether or not it has internet — Harbor sits on <code>172.16.23.2</code>, which
+      does not route from outside ESDS.</p>
+    </div>
   </section>
 
   <!-- 2 ------------------------------------------------------------------ -->
@@ -381,9 +400,9 @@ docker compose version    # Docker Compose version v5.4.0</code></pre>
     <strong>Deploy → Package Registry → esdswaf</strong>. You need both the archive
     and its <code>.sha256</code>.</p>
     <pre><code>cd /root
-sha256sum -c ESDSWAF-v1.0.1-online.tar.gz.sha256    # must print: OK
-tar -xzf ESDSWAF-v1.0.1-online.tar.gz
-cd ESDSWAF-v1.0.1</code></pre>
+sha256sum -c ESDSWAF-v1.0.2-online.tar.gz.sha256    # must print: OK
+tar -xzf ESDSWAF-v1.0.2-online.tar.gz
+cd ESDSWAF-v1.0.2</code></pre>
 
     <div class="note warn">
       <span class="chip">Do not skip</span>
@@ -393,8 +412,8 @@ cd ESDSWAF-v1.0.1</code></pre>
 
     <p>If you were given the <strong>offline</strong> bundle in parts, reassemble first —
     the result is byte-identical and the checksum proves it:</p>
-    <pre><code>cat ESDSWAF-v1.0.1-offline.tar.gz.part-* &gt; ESDSWAF-v1.0.1-offline.tar.gz
-sha256sum -c ESDSWAF-v1.0.1-offline.tar.gz.sha256</code></pre>
+    <pre><code>cat ESDSWAF-v1.0.2-offline.tar.gz.part-* &gt; ESDSWAF-v1.0.2-offline.tar.gz
+sha256sum -c ESDSWAF-v1.0.2-offline.tar.gz.sha256</code></pre>
   </section>
 
   <!-- 4 ------------------------------------------------------------------ -->
@@ -431,7 +450,7 @@ sha256sum -c ESDSWAF-v1.0.1-offline.tar.gz.sha256</code></pre>
     <p>Ten steps, roughly six minutes. It ends with:</p>
     <pre><code>  Installation successful
 
-    Version        Next-Gen ESDSWAF v1.0.1
+    Version        Next-Gen ESDSWAF v1.0.2
     Username       admin@sentinel.local
     Password       6c1a48cb969314feb230ce64072348d3afba849a67c59f0534ac480437a7786b</code></pre>
 
@@ -638,7 +657,7 @@ sudo ./uninstall.sh --purge  # destroys everything, including the database</code
 
   <!-- limits ------------------------------------------------------------- -->
   <section id="limits">
-    <h2><span class="num">§</span> Known limitations in v1.0.1</h2>
+    <h2><span class="num">§</span> Known limitations in v1.0.2</h2>
     <p>State these up front rather than letting a customer discover them.</p>
     <div class="tw"><table>
       <thead><tr><th>Limitation</th><th>Consequence</th></tr></thead>
