@@ -64,22 +64,27 @@ die()  { printf '\n  %s✗ %s%s\n\n' "$RED" "$*" "$R" >&2; exit 1; }
 [[ -n "${GITLAB_TOKEN:-}" ]] || die "set GITLAB_TOKEN (a token with api scope — read_api is not enough to upload)"
 
 BASE="$GITLAB/api/v4/projects/$PROJECT_ID/packages/generic/esdswaf/$VERSION"
+REGISTRY="ESDSWAF-v${VERSION}-registry.tar.gz"
 ONLINE="ESDSWAF-v${VERSION}-online.tar.gz"
 OFFLINE="ESDSWAF-v${VERSION}-offline.tar.gz"
 
 step "Bundles for v$VERSION"
-[[ -f "$ONLINE"  ]] || die "$ONLINE not found in dist/ — run build-bundle.sh $VERSION"
-[[ -f "$OFFLINE" ]] || warn "$OFFLINE not found — publishing the online bundle only"
-for f in "$ONLINE" "$OFFLINE"; do
-  [[ -f "$f" ]] && ok "$f ($(du -h "$f" | cut -f1))"
+# The registry variant is the one to prefer where the target can reach Harbor, so
+# it is listed first and its absence is worth a word — but none of the three is
+# mandatory: publishing only what was built beats refusing to publish anything.
+found=0
+for f in "$REGISTRY" "$ONLINE" "$OFFLINE"; do
+  if [[ -f "$f" ]]; then ok "$f ($(du -h "$f" | cut -f1))"; found=$((found+1))
+  else warn "$f not built — it will not be published"; fi
 done
+(( found > 0 )) || die "no bundles found in dist/ for v$VERSION — run build-bundle.sh $VERSION"
 
 # ── the bundles must agree with the source they claim to come from ───────────
 # A bundle built before the last commit to the installer is the failure this
 # catches: it looks fine, installs fine, and ships yesterday's fixes.
 step "Provenance"
 HEAD_SHA="$(git -C "$REPO_ROOT" rev-parse --short HEAD)"
-for f in "$ONLINE" "$OFFLINE"; do
+for f in "$REGISTRY" "$ONLINE" "$OFFLINE"; do
   [[ -f "$f" ]] || continue
   built="$(tar -xzOf "$f" --wildcards '*/bundle/manifest.json' 2>/dev/null \
            | sed -n 's/.*"built_from_commit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
@@ -127,20 +132,26 @@ fi
 
 # ── checksums, generated HERE so they record bare filenames ──────────────────
 step "Checksums"
-for f in "$ONLINE" "$OFFLINE"; do
+for f in "$REGISTRY" "$ONLINE" "$OFFLINE"; do
   [[ -f "$f" ]] || continue
   sha256sum "$f" > "$f.sha256"
   ok "$f.sha256 — $(cut -c1-16 < "$f.sha256")…"
 done
 # Prove they verify from this directory, which is where the customer runs them.
-for f in "$ONLINE" "$OFFLINE"; do
+for f in "$REGISTRY" "$ONLINE" "$OFFLINE"; do
   [[ -f "$f" ]] || continue
   sha256sum -c "$f.sha256" >/dev/null 2>&1 || die "$f.sha256 does not verify against $f"
 done
-ok "both checksums verify"
+ok "every checksum verifies"
 
 # ── split the offline archive ────────────────────────────────────────────────
-UPLOADS=("$ONLINE" "$ONLINE.sha256")
+UPLOADS=()
+for f in "$REGISTRY" "$ONLINE"; do
+  # Neither needs splitting: the registry bundle is ~316 KB and the online one
+  # ~99 MB, both comfortably under this GitLab's ~250 MB cap. Only the offline
+  # bundle does, and that is handled below.
+  [[ -f "$f" ]] && UPLOADS+=("$f" "$f.sha256")
+done
 if [[ -f "$OFFLINE" ]]; then
   step "Splitting the offline archive (GitLab rejects uploads over ~250 MB)"
   rm -f "$OFFLINE.part-"*
@@ -186,8 +197,10 @@ done
 (( fail == 0 )) || die "one or more uploads failed — the published set is INCOMPLETE"
 
 step "Verifying what the registry actually serves"
-served=$(curl -sS -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "$BASE/$ONLINE.sha256" 2>/dev/null)
-local_sum=$(cat "$ONLINE.sha256")
+# Check back whichever variant is the preferred one that actually got built.
+VERIFY_FILE="$REGISTRY"; [[ -f "$VERIFY_FILE" ]] || VERIFY_FILE="$ONLINE"
+served=$(curl -sS -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "$BASE/$VERIFY_FILE.sha256" 2>/dev/null)
+local_sum=$(cat "$VERIFY_FILE.sha256")
 if [[ "$served" == "$local_sum" ]]; then
   ok "the registry serves the checksum we just built"
 else
