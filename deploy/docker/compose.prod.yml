@@ -27,6 +27,23 @@ name: sentinel
 # The values come from the environment so an ordinary `docker compose build`
 # still works with no setup — it just stamps "unknown", which deploy/fleet/fleet.sh
 # refuses to ship. See the header of deploy/docker/Dockerfile for why this exists.
+# THIRD-PARTY IMAGE PREFIX
+#
+# Empty by default, which means these come from Docker Hub exactly as before.
+# Set it and they come from a mirror instead:
+#
+#     SENTINEL_THIRDPARTY_PREFIX=hub.enlight.dev/swaraj-kavach/
+#
+# The trailing slash is part of the value. That exists so a registry-mode install
+# needs ONE reachable host rather than two: an ESDS management-network VM can
+# reach hub.enlight.dev (172.16.23.2) but usually cannot reach Docker Hub, and
+# without this the four product images would pull from the mirror while Postgres,
+# Redis, ClickHouse, Prometheus and Grafana still tried the internet and hung.
+#
+# Harbor repository names may contain slashes (observed on this Harbor:
+# base-images/anilrevgade/centos-apache-php), so clickhouse/clickhouse-server
+# prefixes correctly without renaming.
+
 x-build-provenance: &build-provenance
   GIT_SHA: ${SENTINEL_GIT_SHA:-unknown}
   BUILD_DATE: ${SENTINEL_BUILD_DATE:-unknown}
@@ -34,7 +51,7 @@ x-build-provenance: &build-provenance
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: ${SENTINEL_THIRDPARTY_PREFIX:-}postgres:16-alpine
     restart: unless-stopped
     # TLS is served, not optional. Without these flags the server offers no TLS at
     # all, so every client DSN had to say sslmode=disable and all database traffic —
@@ -83,7 +100,7 @@ services:
     networks: [sentinel]
 
   redis:
-    image: redis:7-alpine
+    image: ${SENTINEL_THIRDPARTY_PREFIX:-}redis:7-alpine
     restart: unless-stopped
     command: ["redis-server", "--save", "", "--appendonly", "no"]
     healthcheck:
@@ -98,7 +115,7 @@ services:
   # Search" (/events) page. Internal-only — no host port is published; both
   # planes reach it over the docker network at clickhouse:8123.
   clickhouse:
-    image: clickhouse/clickhouse-server:24-alpine
+    image: ${SENTINEL_THIRDPARTY_PREFIX:-}clickhouse/clickhouse-server:24-alpine
     restart: unless-stopped
     # 1536m is NOT enough: at that limit ClickHouse's own internal-table merges
     # (system.text_log) get OOM-killed during startup, and the container
@@ -496,7 +513,7 @@ services:
   # aggregated WAF metrics); Grafana ships a provisioned datasource + the
   # "Sentinel WAF — Overview" dashboard. Grafana UI on host :3001.
   prometheus:
-    image: prom/prometheus:v2.54.1
+    image: ${SENTINEL_THIRDPARTY_PREFIX:-}prom/prometheus:v2.54.1
     restart: unless-stopped
     command:
       - --config.file=/etc/prometheus/prometheus.yml
@@ -514,7 +531,7 @@ services:
     networks: [sentinel]
 
   grafana:
-    image: grafana/grafana:11.2.0
+    image: ${SENTINEL_THIRDPARTY_PREFIX:-}grafana/grafana:11.2.0
     restart: unless-stopped
     environment:
       # Required, with no fallback. This used to default to literal "admin",

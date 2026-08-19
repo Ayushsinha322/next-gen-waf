@@ -168,6 +168,28 @@ BUNDLE_VERSION="$(manifest_str version)"
   || die "could not read the version from bundle/manifest.json — the package is malformed.
     Re-download it; do not attempt to install this copy."
 ok "package: Next-Gen ESDSWAF v$BUNDLE_VERSION"
+# Where the container images come from. "registry" ships none and pulls them;
+# anything else (or an unreadable key, which is every bundle built before this
+# existed) means they are inside bundle/images.tar.gz.
+#
+# Taken from the NAMED manifest field rather than inferred from whether
+# images.tar.gz exists: a truncated download would otherwise look exactly like a
+# registry bundle and skip loading images it was supposed to contain.
+IMAGE_SOURCE="$(manifest_str image_source)"
+[[ "$IMAGE_SOURCE" == "registry" ]] || IMAGE_SOURCE=bundled
+if [[ "$IMAGE_SOURCE" == "registry" ]]; then
+  REGISTRY_PREFIX="$(manifest_str registry_prefix)"
+  THIRDPARTY_PREFIX="$(manifest_str thirdparty_prefix)"
+  [[ -n "$REGISTRY_PREFIX" ]] \
+    || die "this package says image_source=registry but names no registry_prefix.
+    bundle/manifest.json is malformed — ask ESDS for a rebuilt package."
+  ok "images come from $REGISTRY_PREFIX (nothing to load)"
+else
+  [[ -s "$HERE/bundle/images.tar.gz" ]] \
+    || die "bundle/images.tar.gz is missing or empty, and this package does not
+    say image_source=registry. The download is incomplete — verify the checksum
+    and download it again."
+fi
 
 [[ -f "$HERE/SHA256SUMS" ]] || die "SHA256SUMS missing — cannot verify package integrity"
 say "  verifying every shipped file against SHA256SUMS…"
@@ -321,7 +343,31 @@ manifest_list() { # manifest_list KEY — the quoted strings of a top-level arra
 # bundle we do not have turns a clear preflight abort into a failure partway
 # through `up`, which is much harder to diagnose.
 NEEDS_NET="$(manifest_bool requires_internet)"
-if [[ "$NEEDS_NET" != "false" ]]; then
+if [[ "$IMAGE_SOURCE" == "registry" ]]; then
+  # Registry mode needs ONE host, and it is not Docker Hub. Probing Docker Hub
+  # here would pass on a VM that cannot reach Harbor at all, and the install would
+  # then die during `compose pull` with the host already modified.
+  REG_HOST="${REGISTRY_PREFIX%%/*}"
+  if timeout 15 docker pull "$REGISTRY_PREFIX/migrate:$BUNDLE_VERSION" >/dev/null 2>&1; then
+    ok "registry reachable — all ten images will be pulled from $REG_HOST"
+    docker image rm "$REGISTRY_PREFIX/migrate:$BUNDLE_VERSION" >/dev/null 2>&1 || true
+  else
+    die "cannot pull from $REG_HOST, and this package contains no images.
+
+    Tried:  docker pull $REGISTRY_PREFIX/migrate:$BUNDLE_VERSION
+
+    Check in this order:
+      1. does the name resolve?      getent hosts $REG_HOST
+      2. is TCP 443 open to it?      curl -sS -o /dev/null -w '%{http_code}\\n' https://$REG_HOST/v2/
+         401 is the correct answer here. A TIMEOUT means a firewall is dropping
+         it, which is a network request to make, not something to retry.
+      3. is the image tag published?  it must exist at version $BUNDLE_VERSION
+
+    If this host cannot reach the registry at all, ask ESDS for the air-gapped
+    bundle (ESDSWAF-v${BUNDLE_VERSION}-offline.tar.gz), which contains all ten
+    images and needs no network."
+  fi
+elif [[ "$NEEDS_NET" != "false" ]]; then
   PULL_COUNT="$(manifest_list pulled_from_registry | wc -l)"
   if timeout 12 docker pull hello-world >/dev/null 2>&1; then
     ok "Docker registry reachable (${PULL_COUNT:-5} third-party images will be pulled)"
@@ -417,17 +463,30 @@ ok "hostname: $WAF_HOSTNAME"
 ok "admin:    $ADMIN_EMAIL"
 
 # ── Step 6 — load images ─────────────────────────────────────────────────────
-step "Step 6 of 10 — loading images"
-say "  ${DIM}pre-built: no compilation, about a minute${R}"
+step "Step 6 of 10 — obtaining images"
 # First mutation of the host. Everything above this line is a check.
 CHANGED=yes
-docker load -i "$HERE/bundle/images.tar.gz" >>"$LOG" 2>&1 \
-  || die "docker load failed — see $LOG"
-for svc in dataplane controlplane dashboard migrate; do
-  docker image inspect "sentinel/${svc}:${BUNDLE_VERSION}" >/dev/null 2>&1 \
-    || die "image sentinel/${svc}:${BUNDLE_VERSION} missing after load — package is incomplete"
-done
-ok "four images loaded at version $BUNDLE_VERSION"
+if [[ "$IMAGE_SOURCE" == "registry" ]]; then
+  say "  ${DIM}pulling from $REGISTRY_PREFIX — nothing was shipped in this package${R}"
+  # Pulled by explicit name here rather than via `compose pull`, because compose
+  # needs the generated .env (written in Step 7) to interpolate the prefix, and a
+  # failure at this point should name the image that could not be fetched.
+  for svc in dataplane controlplane dashboard migrate; do
+    docker pull "$REGISTRY_PREFIX/${svc}:${BUNDLE_VERSION}" >>"$LOG" 2>&1 \
+      || die "could not pull $REGISTRY_PREFIX/${svc}:${BUNDLE_VERSION} — see $LOG"
+    say "    ${DIM}pulled ${svc}${R}"
+  done
+  ok "four images pulled at version $BUNDLE_VERSION"
+else
+  say "  ${DIM}pre-built: no compilation, about a minute${R}"
+  docker load -i "$HERE/bundle/images.tar.gz" >>"$LOG" 2>&1 \
+    || die "docker load failed — see $LOG"
+  for svc in dataplane controlplane dashboard migrate; do
+    docker image inspect "sentinel/${svc}:${BUNDLE_VERSION}" >/dev/null 2>&1 \
+      || die "image sentinel/${svc}:${BUNDLE_VERSION} missing after load — package is incomplete"
+  done
+  ok "four images loaded at version $BUNDLE_VERSION"
+fi
 
 # ── Step 7 — install tree and secrets ────────────────────────────────────────
 step "Step 7 of 10 — configuration and secrets"
@@ -455,7 +514,12 @@ else
 # Generated by the ESDSWAF installer on $(date -u +%Y-%m-%dT%H:%M:%SZ)
 # Contains every secret for this deployment. Back it up; never share it.
 SENTINEL_VERSION=$BUNDLE_VERSION
-SENTINEL_IMAGE_PREFIX=sentinel
+SENTINEL_IMAGE_PREFIX=${REGISTRY_PREFIX:-sentinel}
+# Where Postgres/Redis/ClickHouse/Prometheus/Grafana/HAProxy come from. Empty means
+# Docker Hub. In registry mode it is set so the whole deployment pulls from one
+# host — otherwise our four images would come from the mirror while the other six
+# still reached for the internet and hung on a closed network.
+SENTINEL_THIRDPARTY_PREFIX=${THIRDPARTY_PREFIX:-}
 
 POSTGRES_USER=sentinel
 POSTGRES_DB=sentinel
