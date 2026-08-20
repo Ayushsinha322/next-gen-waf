@@ -318,6 +318,13 @@ fn token_to_target(tok: &str) -> Option<Target> {
                 .map(|s| s.trim_matches('\'').to_owned()),
         )),
         "REQUEST_COOKIES" => Some(Target::RequestCookies(sub.map(str::to_owned))),
+        // The single highest-yield token in the importer: 129 CRS rules inspect
+        // cookie NAMES and were all skipped before this existed.
+        "REQUEST_COOKIES_NAMES" => Some(Target::RequestCookiesNames),
+        "REQUEST_HEADERS_NAMES" => Some(Target::RequestHeadersNames),
+        "ARGS_GET" => Some(Target::ArgsGet),
+        "ARGS_GET_NAMES" => Some(Target::ArgsGetNames),
+        "QUERY_STRING" => Some(Target::QueryString),
         "RESPONSE_HEADERS" => Some(Target::ResponseHeaders(sub.map(str::to_owned))),
         "RESPONSE_BODY" => Some(Target::ResponseBody),
         "REMOTE_ADDR" => Some(Target::RemoteAddr),

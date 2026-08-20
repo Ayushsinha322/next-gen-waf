@@ -160,6 +160,26 @@ pub enum Target {
     RequestMethod,
     RequestLine,
     RequestCookies(Option<String>),
+    /// Cookie NAMES rather than their values. ModSecurity
+    /// `REQUEST_COOKIES_NAMES`.
+    ///
+    /// This one variant unblocked 129 CRS rules — by far the largest single
+    /// coverage gap in the importer. Session-fixation, cookie-injection and
+    /// several protocol-enforcement rules all inspect the name side, and without
+    /// it every one of them was skipped at import with "unknown target token".
+    RequestCookiesNames,
+    /// Header NAMES rather than their values. ModSecurity
+    /// `REQUEST_HEADERS_NAMES`.
+    RequestHeadersNames,
+    /// Query-string parameters only, excluding the body. ModSecurity `ARGS_GET`.
+    /// `Args` is the union of query and body; some CRS rules need the query side
+    /// alone, and scoring a body parameter against a query-only rule is a false
+    /// positive waiting to happen.
+    ArgsGet,
+    /// Names of query-string parameters only. ModSecurity `ARGS_GET_NAMES`.
+    ArgsGetNames,
+    /// The raw, undecoded query string. ModSecurity `QUERY_STRING`.
+    QueryString,
     ResponseHeaders(Option<String>),
     ResponseBody,
     /// Uploaded files' original filenames (the `filename=` attribute of
