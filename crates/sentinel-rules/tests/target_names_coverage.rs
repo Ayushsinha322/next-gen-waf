@@ -224,3 +224,152 @@ fn a_session_fixation_attempt_in_a_cookie_name_is_still_caught() {
          a quiet ruleset is not the same as a working one"
     );
 }
+
+// ── @pmFromFile: phrases must survive intact ────────────────────────────────
+//
+// The importer used to expand `@pmFromFile x.data` into `@pm phrase1 phrase2 …`
+// in the source text and then split that on whitespace. Two consequences, and
+// fixing only the first would have been worse than fixing neither:
+//
+//   1. A phrase containing a double quote terminated the enclosing operator
+//      string, so the entire FILE failed to import. Three shipped CRS files were
+//      lost that way (RESPONSE-952/953/955).
+//   2. Multi-word phrases were shattered into single words. 1,782 of the 1,853
+//      phrases in php-errors.data contain a space, so enabling those files
+//      without fixing this would have made rules match the bare word "be" or
+//      "error" against every response body.
+
+#[test]
+fn pmfromfile_preserves_multi_word_phrases() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("phrases.data"),
+        "# a comment line, ignored\nFatal error: Uncaught\nsingleword\n",
+    )
+    .unwrap();
+
+    let src = r#"SecRule RESPONSE_BODY "@pmFromFile phrases.data" "id:900500,phase:4,deny,t:none""#;
+    let file = sentinel_rules::import_secrule_conf_dir(src, Some(dir.path())).expect("must import");
+
+    let ops: Vec<_> = file
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            sentinel_rules::dsl::ast::RuleItem::Rule(r) => Some(&r.operator),
+            _ => None,
+        })
+        .collect();
+    match ops.first().expect("one rule") {
+        sentinel_rules::dsl::ast::Operator::ContainsWord(ws) => {
+            assert!(
+                ws.iter().any(|w| w == "Fatal error: Uncaught"),
+                "the multi-word phrase must survive as ONE entry, got {ws:?}"
+            );
+            assert!(
+                !ws.iter().any(|w| w == "Fatal"),
+                "phrases must NOT be split on whitespace — that is what made these \
+                 rules match single common words. Got {ws:?}"
+            );
+            assert_eq!(ws.len(), 2, "comment lines must be skipped, got {ws:?}");
+        }
+        other => panic!("expected ContainsWord, got {other:?}"),
+    }
+}
+
+#[test]
+fn pmfromfile_survives_a_quote_in_a_phrase() {
+    // The exact shape that killed RESPONSE-952/953/955.
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("quoted.data"),
+        "API is restricted by \"\nis not a valid backing value for enum \"\n",
+    )
+    .unwrap();
+
+    let src = r#"SecRule RESPONSE_BODY "@pmFromFile quoted.data" "id:900501,phase:4,deny,t:none""#;
+    let file = sentinel_rules::import_secrule_conf_dir(src, Some(dir.path()))
+        .expect("a quote inside a phrase must not break the import");
+    assert_eq!(
+        file.items.len(),
+        1,
+        "the rule must survive, not be dropped with the rest of its file"
+    );
+}
+
+#[test]
+fn pmfromfile_without_a_data_dir_is_disabled_not_matching_the_filename() {
+    // Guards a latent trap: with no data_dir the old code would have handed the
+    // operator the literal string "x.data", producing a rule that matches the
+    // FILENAME in traffic. Never is the honest outcome.
+    let src = r#"SecRule ARGS "@pmFromFile x.data" "id:900502,phase:2,deny,t:none""#;
+    let file = sentinel_rules::import_secrule_conf_dir(src, None).expect("import");
+    for item in &file.items {
+        if let sentinel_rules::dsl::ast::RuleItem::Rule(r) = item {
+            assert!(
+                matches!(r.operator, sentinel_rules::dsl::ast::Operator::Never),
+                "expected Never, got {:?}",
+                r.operator
+            );
+        }
+    }
+}
+
+// ── FP guard for the three newly-importable RESPONSE-* files ────────────────
+//
+// RESPONSE-952/953/955 had never imported, so their rules have never run against
+// anything. They inspect RESPONSE_BODY for data-leakage and web-shell phrases,
+// which makes them the highest false-positive risk in the ruleset: an ordinary
+// page that happens to contain a phrase from php-errors.data would be flagged.
+
+#[test]
+fn ordinary_html_does_not_trip_the_response_body_leakage_rules() {
+    let eng = common::load_crs_engines(&[
+        "RESPONSE-952-DATA-LEAKAGES-JAVA.conf",
+        "RESPONSE-953-DATA-LEAKAGES-PHP.conf",
+        "RESPONSE-955-WEB-SHELLS.conf",
+    ]);
+
+    let mut ctx = make_get_ctx("http://example.com/");
+    common::set_paranoia(&mut ctx, 2);
+    ctx.response_body = Some(
+        b"<!doctype html><html><head><title>Order confirmation</title></head><body>\
+          <h1>Thank you</h1><p>Your order has been placed and will be dispatched \
+          shortly. If there is a problem we will email you. Errors in your address \
+          can be corrected from your account page.</p>\
+          <footer>&copy; Example Ltd</footer></body></html>"
+            .to_vec()
+            .into(),
+    );
+
+    // common::eval() hardcodes the REQUEST phases and ignores its phase
+    // argument, so response-body rules must be driven explicitly.
+    eng.evaluate(&mut ctx, Phase::ResponseBody, 0);
+    assert_eq!(
+        ctx.anomaly_score, 0,
+        "ordinary HTML must not score against the response-body leakage rules. \
+         Matched: {:?}",
+        ctx.rule_matches
+    );
+}
+
+#[test]
+fn a_real_php_error_leak_is_detected() {
+    // The other half: prove the newly-enabled rules are not merely quiet.
+    let eng = common::load_crs_engines(&["RESPONSE-953-DATA-LEAKAGES-PHP.conf"]);
+    let mut ctx = make_get_ctx("http://example.com/");
+    common::set_paranoia(&mut ctx, 2);
+    ctx.response_body = Some(
+        b"<br /><b>Fatal error</b>:  Uncaught Error: Call to a member function \
+          query() on null in /var/www/html/inc/db.php:42"
+            .to_vec()
+            .into(),
+    );
+    // common::eval() hardcodes the REQUEST phases and ignores its phase
+    // argument, so response-body rules must be driven explicitly.
+    eng.evaluate(&mut ctx, Phase::ResponseBody, 0);
+    assert!(
+        ctx.anomaly_score > 0 || !ctx.rule_matches.is_empty(),
+        "a genuine PHP fatal-error leak must be detected — otherwise these three \
+         files were enabled for nothing"
+    );
+}

@@ -1,6 +1,4 @@
 use anyhow::Result;
-use once_cell::sync::Lazy;
-use regex::Regex;
 use tracing::warn;
 
 use super::secrule::{
@@ -38,7 +36,11 @@ pub fn import_secrule_conf_dir(
     data_dir: Option<&std::path::Path>,
 ) -> Result<RuleFile> {
     let collapsed = collapse_continuations(source);
-    let expanded = expand_pmfromfile(&collapsed, data_dir);
+    // No @pmFromFile pre-expansion any more: the operator mapper reads the data
+    // file itself. Substituting phrases into the source text broke on any phrase
+    // containing a quote and shattered every multi-word phrase — see
+    // crs_op_to_operator for the full account.
+    let expanded = collapsed;
     let cleaned = comment_unknown_directives(&expanded);
 
     let parsed = crate::dsl::parser::parse_rule_file(&cleaned)?;
@@ -60,7 +62,7 @@ pub fn import_secrule_conf_dir(
                     // This directive is a chain member — add its condition.
                     let targets = parse_crs_target_str(&dir.targets);
                     let (op_name, op_pat) = parse_crs_operator(&dir.operator);
-                    match crs_op_to_operator(&op_name, &op_pat) {
+                    match crs_op_to_operator(&op_name, &op_pat, data_dir) {
                         Ok(operator) => {
                             // Chain members may have empty targets (bare operator
                             // that applies to the previously matched value) — we
@@ -89,6 +91,7 @@ pub fn import_secrule_conf_dir(
                         &dir.targets,
                         &dir.operator,
                         &actions,
+                        data_dir,
                     ) {
                         Ok(Some(rule)) => {
                             if is_chain {
@@ -128,65 +131,6 @@ pub fn import_secrule_conf(source: &str) -> Result<RuleFile> {
 }
 
 // ---------------------------------------------------------------------------
-// @pmFromFile expansion
-// ---------------------------------------------------------------------------
-
-static PMFROMFILE_RE: Lazy<Regex> = Lazy::new(|| {
-    // Match @pmFromFile followed by a filename; stop before whitespace or quotes
-    // so we don't accidentally consume the surrounding CRS operator string delimiters.
-    Regex::new(r#"(?i)@pmFromFile\s+([^\s"']+)"#).expect("pmFromFile regex")
-});
-
-/// Replace every `@pmFromFile filename` occurrence with `@pm word1 word2 …`
-/// by reading the word list from `data_dir/filename`.
-///
-/// If `data_dir` is `None` or the file cannot be read, the occurrence is
-/// replaced with an impossible sentinel string so the rule loads but never
-/// fires (logged as a warning).
-fn expand_pmfromfile(source: &str, data_dir: Option<&std::path::Path>) -> String {
-    PMFROMFILE_RE
-        .replace_all(source, |caps: &regex::Captures| {
-            let filename = &caps[1];
-
-            let Some(dir) = data_dir else {
-                warn!(
-                    filename,
-                    "@pmFromFile: no data_dir provided — rule will not match"
-                );
-                return "@pm __sentinel_pmfromfile_missing__".to_owned();
-            };
-
-            let path = dir.join(filename);
-            match std::fs::read_to_string(&path) {
-                Ok(content) => {
-                    let words: Vec<&str> = content
-                        .lines()
-                        .map(str::trim)
-                        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                        .collect();
-                    if words.is_empty() {
-                        warn!(
-                            file = %path.display(),
-                            "@pmFromFile: word list is empty — rule will not match"
-                        );
-                        "@pm __sentinel_pmfromfile_empty__".to_owned()
-                    } else {
-                        format!("@pm {}", words.join(" "))
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        file = %path.display(),
-                        "@pmFromFile: cannot read word list ({e}) — rule will not match"
-                    );
-                    "@pm __sentinel_pmfromfile_missing__".to_owned()
-                }
-            }
-        })
-        .into_owned()
-}
-
-// ---------------------------------------------------------------------------
 // Rule conversion helpers
 // ---------------------------------------------------------------------------
 
@@ -195,6 +139,7 @@ fn secrule_directive_to_rule_with_actions(
     targets_str: &str,
     operator_str: &str,
     actions: &CrsActions,
+    data_dir: Option<&std::path::Path>,
 ) -> Result<Option<RuleDef>> {
     let rule_id = match actions.id {
         Some(id) => id,
@@ -220,7 +165,7 @@ fn secrule_directive_to_rule_with_actions(
     }
 
     let (op_name, op_pattern) = parse_crs_operator(operator_str);
-    let operator = crs_op_to_operator(&op_name, &op_pattern)?;
+    let operator = crs_op_to_operator(&op_name, &op_pattern, data_dir)?;
 
     let rule_action = match actions.action {
         CrsAction::Block | CrsAction::Deny => {
@@ -265,13 +210,16 @@ fn secrule_directive_to_rule_with_actions(
 }
 
 /// Public helper — kept for tests that pass actions as a raw string.
+///
+/// No `data_dir`, so a `@pmFromFile` reaching this path compiles to
+/// `Operator::Never` rather than to a rule matching the literal filename.
 pub fn secrule_directive_to_rule(
     targets_str: &str,
     operator_str: &str,
     actions_str: &str,
 ) -> Result<Option<RuleDef>> {
     let actions = parse_crs_actions(actions_str);
-    secrule_directive_to_rule_with_actions(targets_str, operator_str, &actions)
+    secrule_directive_to_rule_with_actions(targets_str, operator_str, &actions, None)
 }
 
 fn parse_crs_target_str(s: &str) -> Vec<TargetExpr> {
@@ -360,7 +308,36 @@ fn token_to_target(tok: &str) -> Option<Target> {
     }
 }
 
-pub(crate) fn crs_op_to_operator(op_name: &str, pattern: &str) -> Result<Operator> {
+/// `data_dir` resolves `@pmFromFile filename.data`.
+///
+/// WHY THE FILE IS READ HERE AND NOT SUBSTITUTED INTO THE SOURCE TEXT
+///
+/// It used to be expanded textually before parsing — `@pmFromFile x.data` was
+/// rewritten to `@pm phrase1 phrase2 …` and the operator arm then split that on
+/// whitespace. That produced two defects, and fixing either alone makes things
+/// worse:
+///
+///   * A phrase containing a double quote terminated the enclosing operator
+///     string, so the WHOLE FILE failed to import. Three shipped CRS files were
+///     lost this way — RESPONSE-952 (Java data leakage), RESPONSE-953 (PHP data
+///     leakage) and RESPONSE-955 (web shells) — because their data files contain
+///     1, 173 and 11 quotes respectively.
+///
+///   * Joining phrases with spaces and splitting on whitespace SHATTERED
+///     multi-word phrases. 1,782 of the 1,853 phrases in php-errors.data contain
+///     a space, so a rule meant to match "Fatal error: Uncaught" would instead
+///     match the bare word "be" or "error" anywhere in a response body.
+///
+/// Fixing only the quoting would therefore have enabled three files whose rules
+/// match single common English words against every response — a far worse outcome
+/// than leaving them disabled. Reading the file at operator-construction time
+/// removes both defects at once: no quoting to get wrong, and one phrase per line
+/// preserved exactly as CRS wrote it.
+pub(crate) fn crs_op_to_operator(
+    op_name: &str,
+    pattern: &str,
+    data_dir: Option<&std::path::Path>,
+) -> Result<Operator> {
     if pattern.contains("%{") {
         warn!(
             op = op_name,
@@ -370,15 +347,50 @@ pub(crate) fn crs_op_to_operator(op_name: &str, pattern: &str) -> Result<Operato
     }
 
     if let Some(inner_name) = op_name.strip_prefix('!') {
-        let inner = crs_op_to_operator(inner_name, pattern)?;
+        let inner = crs_op_to_operator(inner_name, pattern, data_dir)?;
         return Ok(Operator::Not(Box::new(inner)));
     }
 
     match op_name {
         "rx" => Ok(Operator::Rx(pattern.to_owned())),
-        "pm" | "pmfromfile" => {
+        // Inline @pm IS whitespace-separated words — that is its documented
+        // meaning in a rule file, so splitting here is correct.
+        "pm" => {
             let words: Vec<String> = pattern.split_whitespace().map(String::from).collect();
             Ok(Operator::ContainsWord(words))
+        }
+        // @pmFromFile is one PHRASE PER LINE, and phrases contain spaces.
+        "pmfromfile" => {
+            let filename = pattern.trim();
+            let Some(dir) = data_dir else {
+                warn!(
+                    filename,
+                    "@pmFromFile: no data_dir provided — rule disabled rather than \
+                     left matching the literal filename"
+                );
+                return Ok(Operator::Never);
+            };
+            let path = dir.join(filename);
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    let phrases: Vec<String> = content
+                        .lines()
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                        .map(String::from)
+                        .collect();
+                    if phrases.is_empty() {
+                        warn!(file = %path.display(), "@pmFromFile: empty word list — rule disabled");
+                        Ok(Operator::Never)
+                    } else {
+                        Ok(Operator::ContainsWord(phrases))
+                    }
+                }
+                Err(e) => {
+                    warn!(file = %path.display(), "@pmFromFile: cannot read ({e}) — rule disabled");
+                    Ok(Operator::Never)
+                }
+            }
         }
         "contains" => Ok(Operator::ContainsWord(vec![pattern.to_owned()])),
         "beginswith" => Ok(Operator::Rx(format!("^{}", regex::escape(pattern)))),
@@ -622,7 +634,15 @@ SecRule ARGS "@rx baz" "t:none"
     }
 
     #[test]
-    fn pmfromfile_without_dir_produces_empty_words() {
+    fn pmfromfile_without_dir_is_disabled_not_matching_a_placeholder() {
+        // Contract CHANGED deliberately. This used to assert that a placeholder
+        // word was injected so "the AC set still compiles" — which left a rule
+        // that matches the literal string `__sentinel_pmfromfile_missing__`. It
+        // compiles, it counts towards the rule total, and it can never fire on
+        // real traffic: an inert rule wearing a working rule's clothes.
+        //
+        // Operator::Never says the same thing honestly, and is what the coverage
+        // census then reports.
         let src = r#"SecRule ARGS "@pmFromFile scanners.data" "id:300,phase:2,block""#;
         let rf = import_secrule_conf(src).expect("import");
         let rules: Vec<_> = rf
@@ -637,12 +657,12 @@ SecRule ARGS "@rx baz" "t:none"
             })
             .collect();
         assert_eq!(rules.len(), 1, "rule should still be emitted");
-        if let Operator::ContainsWord(words) = &rules[0].operator {
-            // The placeholder word is injected so the AC set still compiles.
-            assert!(!words.is_empty());
-        } else {
-            panic!("expected ContainsWord operator");
-        }
+        assert!(
+            matches!(rules[0].operator, Operator::Never),
+            "with no data_dir the rule must be disabled, not matching a \
+             placeholder. Got {:?}",
+            rules[0].operator
+        );
     }
 
     #[test]
