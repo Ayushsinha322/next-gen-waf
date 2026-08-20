@@ -281,7 +281,14 @@ export interface SiteForm {
 /* ── OWASP CRS categories (UI-friendly toggles) ───────────────────
  * Keys mirror crsCategoryFiles in the control-plane handlers.
  */
-export const CRS_CATEGORIES: { key: string; label: string; desc: string; core?: boolean }[] = [
+export type CrsCategory = { key: string; label: string; desc: string; core?: boolean };
+
+/* Request-phase families. These are the default set: an empty stored selection
+ * means "all of these", and the Go control plane's crsFilesForCategories agrees.
+ * Keep the keys identical to crsCategoryFiles in handlers.go — a key the Go map
+ * does not name is accepted by the API, echoed back here, and silently dropped
+ * before it reaches the data plane. */
+export const CRS_REQUEST_CATEGORIES: CrsCategory[] = [
   { key: "sqli",            label: "SQL Injection",       desc: "SQLi payloads in args, body, headers, cookies" },
   { key: "xss",             label: "Cross-Site Scripting",desc: "Reflected / stored / DOM XSS vectors" },
   { key: "rce",             label: "Remote Code Exec",    desc: "Unix/Windows command injection" },
@@ -297,7 +304,35 @@ export const CRS_CATEGORIES: { key: string; label: string; desc: string; core?: 
   { key: "session",         label: "Session Fixation",    desc: "Session fixation protection" },
 ];
 
-export const ALL_CRS_KEYS = CRS_CATEGORIES.map(c => c.key);
+/* Response-phase families — data-leakage and web-shell detection in the response
+ * BODY, not the request. The engine and the proxy have always supported these;
+ * until now the control plane had no key for them, so the rules shipped in the
+ * image and no site configuration could load them.
+ *
+ * Deliberately NOT part of ALL_CRS_KEYS, so they are never enabled implicitly.
+ * Two reasons, both visible to the operator in the UI note:
+ *   - enabling any of them makes the proxy BUFFER every text-ish response for
+ *     the site (up to the scan cap) instead of streaming it through;
+ *   - these rules carry `block` directly rather than adding to the anomaly
+ *     score, so ONE match blocks the response — the anomaly threshold does not
+ *     moderate them. A page that legitimately prints an ORA- code or a MySQL
+ *     error will be blocked. */
+export const CRS_RESPONSE_CATEGORIES: CrsCategory[] = [
+  { key: "leak_sql",     label: "SQL Error Leakage",   desc: "Database errors disclosed in responses (MySQL, Oracle, MSSQL, DB2)" },
+  { key: "leak_php",     label: "PHP Error Leakage",   desc: "PHP warnings, stack traces and source disclosure" },
+  { key: "leak_java",    label: "Java Error Leakage",  desc: "Java exceptions and stack traces in responses" },
+  { key: "leak_iis",     label: "IIS Error Leakage",   desc: "IIS / ASP.NET error pages and path disclosure" },
+  { key: "leak_generic", label: "Generic Leakage",     desc: "Directory listings and other generic disclosure" },
+  { key: "web_shells",   label: "Web Shell Detection", desc: "Responses served by known web shells (c99, r57, etc.)" },
+];
+
+/* Kept as the combined list for read-only summaries. */
+export const CRS_CATEGORIES: CrsCategory[] = [...CRS_REQUEST_CATEGORIES, ...CRS_RESPONSE_CATEGORIES];
+
+/* The default selection — request families only. Response families are opt-in;
+ * see CRS_RESPONSE_CATEGORIES. */
+export const ALL_CRS_KEYS = CRS_REQUEST_CATEGORIES.map(c => c.key);
+export const ALL_CRS_RESPONSE_KEYS = CRS_RESPONSE_CATEGORIES.map(c => c.key);
 
 /* ── HTTP methods (for method enforcement) ────────────────────── */
 export const HTTP_METHODS = ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE", "CONNECT", "TRACE"];

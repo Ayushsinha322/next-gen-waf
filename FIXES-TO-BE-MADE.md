@@ -17,6 +17,42 @@ correct, and never actually ran.
 
 ### 0. Twelve of the 25 shipped CRS files can never reach the data plane
 
+> **FIXED 2026-08-20**, verified on the running WAF at `172.16.21.101`
+> (`controlplane:1.0.4-test`). Six RESPONSE-* families are now selectable per
+> site; the other six files stay unwired **on purpose** and the reasons are now
+> recorded in code (`crsUnwiredFiles`) instead of nowhere.
+>
+> Measured before and after on the same site, same policy, nothing else changed —
+> an origin that leaks `You have an error in your SQL syntax`:
+>
+> | | rules loaded | leak page | clean page |
+> |---|---|---|---|
+> | before (`1.0.3-test`) | 120 | **HTTP 200, leak reached the client** | 200 |
+> | after (`1.0.4-test`)  | 181 | **HTTP 403, leak withheld** | 200 |
+>
+> `+61` is exactly `leak_sql` (26) + `web_shells` (35). The data plane logged
+> `response-body rule matched — blocking`. Before the fix the API had **accepted
+> and echoed back** `["sqli","xss","leak_sql","web_shells"]` while shipping the
+> data plane only the two request files — stored, echoed, dropped.
+>
+> **No behaviour change for existing sites**, which is why response families are
+> opt-in rather than part of "all categories": the site with no explicit
+> selection still loads 340 rules, still answers 302/403, and still does not
+> buffer responses. `verify.sh`: 21 passed, 0 failed, 0 warnings.
+>
+> Guards added so this class cannot recur silently:
+> `control-plane/cmd/controllerd/crs_wiring_test.go` fails if any shipped `.conf`
+> is neither wired nor explicitly excused, or if a category key exists in the map
+> but not the load order (the accepted-then-dropped shape). Both were
+> negative-tested by breaking them.
+> `crates/sentinel-rules/tests/response_body_families.rs` pins that each wired
+> family imports rules, detects a real disclosure **and blocks**, does not fire on
+> ordinary pages, and — the subtle one — that detection depends on the proxy
+> seeding `DETECTION_PARANOIA_LEVEL`. Every RESPONSE-* file opens with a
+> `@lt 1 … skipAfter` gate, so deleting that one proxy line would silently switch
+> response inspection off with every other test still green.
+
+
 **Found while verifying the CRS work on the running WAF, and it is larger than the
 importer bugs it was found behind.**
 
@@ -52,8 +88,24 @@ unavailable, which matters for any upload endpoint.
 **Fix:** add the missing files to the control plane's rule-file map and expose the
 response-body families in the site policy. The data plane already supports
 `Phase::ResponseBody` — `tests/target_names_coverage.rs` drives it directly — so
-this is wiring, not new engine work. Until it lands, the `@pmFromFile` repair below
-delivers nothing in production, because all three files it fixed are `RESPONSE-*`.
+this was wiring, not new engine work.
+
+**This also activates the `@pmFromFile` repair below.** All three files that fix
+rescued are `RESPONSE-*`; two of them (`RESPONSE-952`, `RESPONSE-953`) are now
+wired as `leak_java` and `leak_php`, so that work reaches production for the
+first time. `RESPONSE-955` (web shells) is wired as `web_shells`.
+
+**Deliberately still unwired** — recorded in `crsUnwiredFiles` with reasons:
+`REQUEST-901` (would set CRS's `inbound_anomaly_score_threshold=5` and
+`blocking_paranoia_level=1`, fighting the site's tuned 10 / PL2),
+`REQUEST-949` + `RESPONSE-959` (CRS's anomaly evaluators — redundant, because the
+importer maps every `tx.inbound_anomaly_score_plN` delta onto the rule score so
+the VM already blocks at the site's threshold; loading them would add a second
+deny path at CRS's defaults of 5 and 4), `RESPONSE-980` (reports on aggregates
+only 949/959 produce), and `REQUEST-905` (2 importable rules, both Apache-pinger
+exceptions whose payload is `ctl:ruleRemoveByTag=OWASP_CRS`; `ctl:` is a
+documented no-op so they are inert — zero benefit, and a loopback-shaped hole the
+day `ctl:` is implemented).
 
 
 ### 1. About half the OWASP CRS ruleset never loads
@@ -156,6 +208,34 @@ identity provider to attack.
 **Still to verify:** end-to-end against a running control plane. The deployment on
 `.101` predates the route, so this is checked as compiling and type-clean, not as
 observed working.
+
+### 0b. `REQUEST-922-MULTIPART-ATTACK` imports 0 of its 6 rules
+
+Found while wiring the above. All four of its `SecRule`s target
+`MULTIPART_PART_HEADERS`, which the engine does not implement, so the file
+imports **nothing**. It is therefore *not* wired to a category: offering a
+"Multipart Attacks" toggle that detects nothing would be worse than not offering
+it.
+
+This is an **engine gap, not a wiring gap** — it needs `MULTIPART_PART_HEADERS`
+as a target (alongside the existing multipart handling), then a category key.
+Multipart attack rules matter for any file-upload endpoint, so this is real
+missing coverage rather than a cosmetic hole.
+
+### 0c. `sentinel-cli` still defaults to a rule list including 901 and 949
+
+`crates/sentinel-cli/src/main.rs` `default_crs_files()` lists 15 files including
+`REQUEST-901-INITIALIZATION.conf` and `REQUEST-949-BLOCKING-EVALUATION.conf`,
+whose comment still asserts "949 evaluates the anomaly score". A site created
+through the CLI therefore gets CRS's own blocking evaluator at threshold **5**,
+while a site created through the API/dashboard blocks at the site's tuned **10**.
+
+Not urgent and deliberately left alone in this change: `sentinel-cli` is **not
+shipped** in the customer bundle or any image, and `first-site.sh` onboards
+through the API, so no deployed installation is affected. It should be aligned
+before the CLI is ever handed to an operator, so the two paths cannot produce
+sites that enforce differently.
+
 
 ## P1 — Product defects that will reach a customer
 

@@ -19,6 +19,7 @@ import { showToast } from "@/components/ui/Toast";
 import { api, type Certificate, type SiteConfigProblem } from "@/lib/api";
 import {
   SiteForm, emptyForm, applyPreset, formToPayload, PRESETS, CRS_CATEGORIES,
+  CRS_REQUEST_CATEGORIES, CRS_RESPONSE_CATEGORIES, ALL_CRS_RESPONSE_KEYS, type CrsCategory,
   ALL_CRS_KEYS, COUNTRIES, PresetKey, UpstreamServer, normalizeDomain,
   HTTP_METHODS, ACME_PROVIDERS, CustomHeader, certCoversHost,
   JWT_ALGORITHMS, FUSION_ENGINES, IpFeed,
@@ -185,6 +186,20 @@ function SectionToggle({ label, desc, on, set, unavailable }: {
 
 function GroupLabel({ children }: { children: React.ReactNode }) {
   return <div style={{ fontSize: 14, color: "var(--text3)", fontFamily: "var(--font-mono)", letterSpacing: 1, textTransform: "uppercase", marginTop: 4, display: "flex", alignItems: "center", gap: 8 }}>{children}</div>;
+}
+
+/* One selectable CRS category tile. Extracted so the request and response
+ * groups render identically — they differ only in which list they map over. */
+function CatTile({ c, on, onClick }: { c: CrsCategory; on: boolean; onClick: () => void }) {
+  return (
+    <div onClick={onClick} style={{ cursor: "pointer", padding: "8px 11px", borderRadius: 8, display: "flex", justifyContent: "space-between", gap: 8, background: on ? "rgba(0,230,118,.07)" : "rgba(255,255,255,.02)", border: on ? "1px solid rgba(0,230,118,.3)" : "1px solid rgba(255,255,255,.07)" }}>
+      <div>
+        <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text)" }}>{c.label}</div>
+        <div style={{ fontSize: 11, color: "var(--text3)", marginTop: 2 }}>{c.desc}</div>
+      </div>
+      <div style={{ fontSize: 15, color: on ? "var(--green)" : "var(--text3)" }}>{on ? "✓" : "○"}</div>
+    </div>
+  );
 }
 
 function InfoBox({ children, tone = "cyan" }: { children: React.ReactNode; tone?: "cyan" | "green" | "amber" }) {
@@ -697,11 +712,32 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     <Field label="Anomaly Threshold"><input className="fin2" type="number" value={form.anomaly_threshold} onChange={e => upd({ anomaly_threshold: Number(e.target.value) })} /></Field>
                   </Row>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                    <GroupLabel>OWASP CRS Categories ({form.rule_categories.length}/{CRS_CATEGORIES.length})</GroupLabel>
+                    <GroupLabel>Request Inspection ({form.rule_categories.filter(k => !ALL_CRS_RESPONSE_KEYS.includes(k)).length}/{CRS_REQUEST_CATEGORIES.length})</GroupLabel>
                     <div style={{ display: "flex", gap: 6 }}>
-                      <button className="btn bg-btn btn-xs" type="button" onClick={() => upd({ rule_categories: [...ALL_CRS_KEYS] })}>All</button>
-                      <button className="btn bg-btn btn-xs" type="button" onClick={() => upd({ rule_categories: CRS_CATEGORIES.filter(c => c.core).map(c => c.key) })}>Core only</button>
+                      <button className="btn bg-btn btn-xs" type="button" onClick={() => upd({ rule_categories: [...ALL_CRS_KEYS, ...form.rule_categories.filter(k => ALL_CRS_RESPONSE_KEYS.includes(k))] })}>All</button>
+                      <button className="btn bg-btn btn-xs" type="button" onClick={() => upd({ rule_categories: [...CRS_REQUEST_CATEGORIES.filter(c => c.core).map(c => c.key), ...form.rule_categories.filter(k => ALL_CRS_RESPONSE_KEYS.includes(k))] })}>Core only</button>
                     </div>
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                    {CRS_REQUEST_CATEGORIES.map(c => <CatTile key={c.key} c={c} on={form.rule_categories.includes(c.key)} onClick={() => toggleCat(c.key)} />)}
+                  </div>
+
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <GroupLabel>Response Inspection ({form.rule_categories.filter(k => ALL_CRS_RESPONSE_KEYS.includes(k)).length}/{CRS_RESPONSE_CATEGORIES.length})</GroupLabel>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <button className="btn bg-btn btn-xs" type="button" onClick={() => upd({ rule_categories: [...form.rule_categories.filter(k => !ALL_CRS_RESPONSE_KEYS.includes(k)), ...ALL_CRS_RESPONSE_KEYS] })}>All</button>
+                      <button className="btn bg-btn btn-xs" type="button" onClick={() => upd({ rule_categories: form.rule_categories.filter(k => !ALL_CRS_RESPONSE_KEYS.includes(k)) })}>None</button>
+                    </div>
+                  </div>
+                  <div style={{ fontSize: 11, color: "var(--text3)", lineHeight: 1.5, padding: "2px 0 4px" }}>
+                    Off by default. These inspect what your <strong>origin sends back</strong>, catching database
+                    errors, stack traces and web shells before they reach a visitor. Two costs to know about:
+                    responses are <strong>buffered</strong> instead of streamed, and a single match blocks the
+                    response — the anomaly threshold does not apply. Enable in learning mode first if a page
+                    legitimately prints error text.
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                    {CRS_RESPONSE_CATEGORIES.map(c => <CatTile key={c.key} c={c} on={form.rule_categories.includes(c.key)} onClick={() => toggleCat(c.key)} />)}
                   </div>
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
                     {CRS_CATEGORIES.map(c => {
