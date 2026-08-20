@@ -172,6 +172,20 @@ genuine session-fixation attempt is still caught. A quiet ruleset is not a worki
 one — without the second assertion the first could be satisfied by rules that match
 nothing, which is precisely the state these 129 were in.
 
+### Scope decision — API schema validation is a separate project
+
+**Decided by Ayush on 2026-08-20:** item 14 is *not* part of this audit
+remediation and is not a deployment blocker. It is a **new product capability**
+(OpenAPI/JSON-Schema import, per-endpoint request/response validation, drift
+detection, a schema store and its UI), not a defect in something we already
+claim. Nothing shipping today advertises it, so there is no false claim to
+correct — unlike the SSO button, which had to be fixed because the UI asserted a
+capability that did not exist.
+
+It stays on this register only so the competitive gap remains visible. Do not
+treat it as unfinished remediation work, and do not start it inside a
+deploy-hardening branch.
+
 ### 2. Kernel XDP fails to load on every boot
 
 | | |
@@ -189,6 +203,16 @@ bytes) — so `aya 0.13` is rejecting something about how it was built.
 **Fix:** rebuild the BPF object against the aya version in use and re-verify
 attach, **or** stop shipping `--features kernel` and describe the DDoS path
 honestly as userspace. Either is acceptable; shipping a failing load is not.
+
+> **STATUS 2026-08-20: still open, untouched.** Nothing has changed in
+> `crates/sentinel-ebpf/` since `dcb89ba` (2026-07-11), which is the commit that
+> introduced the object that fails to load. The WAF is running in `software` mode
+> on every deployment, including `.101` at `1.0.4-test`.
+>
+> This one is a genuine **defect**, not a missing feature: the product ships a
+> code path that fails on every boot and falls back silently apart from one WARN.
+> Whichever of the two fixes is chosen, the outcome must be that the log no
+> longer reports a failed load.
 
 ### 3. The login page has a decoy SSO button
 
@@ -273,7 +297,7 @@ Not defects. Stated so nobody promises them.
 
 | # | Gap | Who has it | Why it matters |
 |---|---|---|---|
-| 14 | **API schema validation** (OpenAPI import + enforcement) | F5, Imperva | The most-asked-about API security feature. Absent entirely |
+| 14 | **API schema validation** (OpenAPI import + enforcement) | F5, Imperva | The most-asked-about API security feature. Absent entirely. **Scoped OUT of this remediation as a separate product/feature project — Ayush, 2026-08-20.** See the note below the table |
 | 15 | **Positive-security / entity-learning model** | F5 (core differentiator) | Our API discovery is a toggle, not a learned baseline |
 | 16 | **Bot defence: JS challenges, device fingerprinting** | F5, HaltDOS | We have JA4 + heuristics, which is real but narrower |
 | 17 | **Compliance reporting** (PCI DSS packs) | F5, Imperva, HaltDOS | Procurement asks for it by name |
