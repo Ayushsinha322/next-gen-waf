@@ -356,9 +356,9 @@
     </tr>
     <tr>
       <td>Kernel-level L4 drop (eBPF / XDP)</td>
-      <td class="c us-col"><span class="m m-p">◐</span></td>
+      <td class="c us-col"><span class="m m-y">●</span></td>
       <td class="c"><span class="m m-n">✕</span></td><td class="c"><span class="m m-n">✕</span></td><td class="c"><span class="m m-n">✕</span></td><td class="c"><span class="m m-n">✕</span></td><td class="c"><span class="m m-n">✕</span></td>
-      <td class="why"><b>Built, not currently attaching.</b> Re-verified 2026-08-20 on Linux 6.8.0-55 with CAP_BPF/CAP_NET_ADMIN granted and BTF present: the embedded BPF ELF fails to parse (<i>error parsing ELF data</i>) and every boot degrades to software mode. Graceful, but the kernel path is not in service</td>
+      <td class="why"><b>In service.</b> This row read <i>&ldquo;built, not currently attaching&rdquo;</i> earlier on 2026-08-20; the load failure was fixed the same day and re-verified on the same host (Linux 6.8.0-55). Evidence is kernel-side, not our own logs: <code>ip link show eth0</code> reports <code>prog/xdp id&nbsp;… name sentinel_xdp … jited</code> attached in <b>native</b> mode, <code>bpftool</code> shows the program JIT-compiled to 477&nbsp;B with its three maps, and the per-CPU PASS counter advances with live traffic. A seeded blocklist entry appears in the in-kernel LPM trie, confirming the userspace&rarr;kernel write path. Degrades gracefully to software mode where XDP is unavailable, and <code>/healthz</code> now reports which mode is live</td>
     </tr>
     <tr>
       <td>L7 rate limiting</td>
