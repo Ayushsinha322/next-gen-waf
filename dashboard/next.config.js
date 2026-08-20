@@ -2,6 +2,21 @@
 const nextConfig = {
   eslint: { ignoreDuringBuilds: true },
   typescript: { ignoreBuildErrors: true },
+  // Emit .next/standalone — a self-contained server with ONLY the node_modules
+  // that dependency tracing proves are reachable at runtime.
+  //
+  // Without this the runtime image has to carry the builder's entire
+  // node_modules (588 MB: TypeScript, ESLint, Tailwind, the Next compiler,
+  // vitest — none of which run in production) plus .next/cache (133 MB of
+  // webpack artefacts). That put the dashboard image at 779 MB against 46-55 MB
+  // for the three Rust/Go images, and it alone pushed the offline bundle past
+  // the ~250 MB cap this GitLab enforces on uploads, forcing the release to be
+  // split into four parts and reassembled by hand on the target VM.
+  //
+  // Standalone changes the runner stage contract: copy .next/standalone (which
+  // contains server.js and the traced deps), .next/static and public — never
+  // node_modules — and start with `node server.js`, not `npm start`.
+  output: "standalone",
   // Prevents stale webpack chunk errors ("Cannot find module './NNN.js'")
   // by assigning stable deterministic chunk IDs based on content hash.
   webpack: (config, { dev, isServer }) => {

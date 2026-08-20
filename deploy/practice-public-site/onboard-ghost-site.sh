@@ -122,7 +122,7 @@ else
      '{{index .Config.Labels \"com.docker.compose.project.config_files\"}}'):
        cd /opt/sentinel-src/deploy/docker && docker compose \\
          -f compose.prod.yml -f compose.cluster.yml -f compose.ha.yml \\
-         --profile ghost up -d ghost-db ghost
+         -f compose.ghost.yml --profile ghost up -d ghost-db ghost
      Without it every request to $DOMAIN returns 502."
 fi
 

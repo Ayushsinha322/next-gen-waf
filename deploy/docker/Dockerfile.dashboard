@@ -42,10 +42,40 @@ LABEL org.opencontainers.image.title="Next-Gen ESDSWAF dashboard" \
 WORKDIR /app
 ENV NODE_ENV=production
 RUN addgroup -g 1001 -S nodejs && adduser -S nextjs -u 1001
-COPY --from=builder --chown=nextjs:nodejs /app/.next ./.next
+
+# Standalone runtime — see `output: "standalone"` in dashboard/next.config.js.
+#
+# This stage used to copy the whole builder tree: /app/.next (136 MB, of which
+# 133 MB is .next/cache — webpack build artefacts that are never read at
+# runtime) and /app/node_modules (588 MB, containing TypeScript, ESLint,
+# Tailwind, vitest and the Next compiler). The result was a 779 MB image next to
+# 46-55 MB for dataplane/controlplane/migrate, and it was single-handedly
+# responsible for the offline bundle needing a four-part split to clear this
+# GitLab's ~250 MB upload cap.
+#
+# Next traces the modules the server actually reaches and emits them under
+# .next/standalone. Three directories are all the runtime needs:
+#
+#   .next/standalone -> server.js + the traced subset of node_modules
+#   .next/static     -> hashed client chunks, served at /_next/static
+#   public           -> static assets served from /
+#
+# .next/static is NOT inside standalone and is NOT optional: omit it and the
+# app returns HTML whose every script and stylesheet 404s — a blank page with a
+# 200 status, which looks like an application bug rather than a packaging one.
+COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
+COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
 COPY --from=builder --chown=nextjs:nodejs /app/public ./public
-COPY --from=builder --chown=nextjs:nodejs /app/package.json ./package.json
-COPY --from=builder --chown=nextjs:nodejs /app/node_modules ./node_modules
+
 USER nextjs
 EXPOSE 3000
-CMD ["npm", "start"]
+# Bind all interfaces. The standalone server defaults HOSTNAME to localhost in
+# some Next builds, which inside a container means nothing outside it can
+# connect — the published port and the compose-network name both dead-end on a
+# container that is running and healthy-looking.
+ENV PORT=3000 \
+    HOSTNAME=0.0.0.0
+# `npm start` runs `next start`, which standalone output does not support (and
+# npm is not even present in the traced tree). The server is a plain node entry
+# point now.
+CMD ["node", "server.js"]

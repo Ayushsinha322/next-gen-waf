@@ -56,11 +56,6 @@ STAGE_ONLY="${STAGE_ONLY:-0}"
 # Name them apart at the point of creation instead of relying on whoever runs this
 # to remember to rename the output.
 STAGE="dist/${PRODUCT}-v${VERSION}"
-if [[ "$BUNDLE_THIRD_PARTY" == "1" ]]; then
-  ARCHIVE="dist/${PRODUCT}-v${VERSION}-offline.tar.gz"
-else
-  ARCHIVE="dist/${PRODUCT}-v${VERSION}-online.tar.gz"
-fi
 
 # The four images we build and ship.
 OWN_IMAGES=(dataplane controlplane dashboard migrate)
@@ -84,6 +79,35 @@ step() { printf '\n%s%s==> %s%s\n' "$B" "$C" "$*" "$R"; }
 ok()   { printf '  %s✓%s %s\n' "$G" "$R" "$*"; }
 warn() { printf '  %s!%s %s\n' "$Y" "$R" "$*"; }
 die()  { printf '\n  %s✗ %s%s\n\n' $'\e[91m' "$*" "$R" >&2; exit 1; }
+
+# THREE VARIANTS, and the difference is only where the container images come from.
+#
+#   registry  ~400 KB   ships NO images. The installer pulls all ten from Harbor.
+#                       For any VM that can reach hub.enlight.dev — which is every
+#                       ESDS-internal deployment. This is the one to prefer.
+#   online     ~99 MB   ships our four images; the other six come from Docker Hub.
+#   offline   ~584 MB   ships all ten. The only variant that travels to a customer
+#                       site, because Harbor is on an unroutable private address.
+#
+# Registry mode is not merely "online without the images": it also pins the
+# third-party prefix at Harbor, so the install needs ONE reachable host instead
+# of Harbor plus the internet.
+BUNDLE_IMAGES="${BUNDLE_IMAGES:-bundled}"
+REGISTRY_PREFIX="${REGISTRY_PREFIX:-hub.enlight.dev/swaraj-kavach}"
+case "$BUNDLE_IMAGES" in
+  registry)
+    [[ "$BUNDLE_THIRD_PARTY" == "1" ]] \
+      && die "BUNDLE_IMAGES=registry and BUNDLE_THIRD_PARTY=1 contradict each other:
+    one ships no images, the other ships all ten. Pick one."
+    ARCHIVE="dist/${PRODUCT}-v${VERSION}-registry.tar.gz" ;;
+  bundled)
+    if [[ "$BUNDLE_THIRD_PARTY" == "1" ]]; then
+      ARCHIVE="dist/${PRODUCT}-v${VERSION}-offline.tar.gz"
+    else
+      ARCHIVE="dist/${PRODUCT}-v${VERSION}-online.tar.gz"
+    fi ;;
+  *) die "BUNDLE_IMAGES must be 'bundled' or 'registry', got '$BUNDLE_IMAGES'" ;;
+esac
 
 if [[ "$STAGE_ONLY" != "1" ]]; then
   command -v docker >/dev/null 2>&1 || die "docker is required"
@@ -158,7 +182,21 @@ cp deploy/docker/haproxy.cfg               "$STAGE/compose/" 2>/dev/null \
 cp -r deploy/docker/grafana                "$STAGE/compose/" 2>/dev/null || true
 
 # Operational scripts the customer legitimately needs.
-for s in preflight.sh verify-deploy.sh promote-standby.sh \
+#
+# verify-deploy.sh is NOT one of them and was removed from this list. It is an
+# internal check for the ESDS 3-node HA cluster: it `cd`s to /opt/sentinel-src
+# (install.sh creates /opt/sentinel/current and never that path) under `set -uo
+# pipefail` with no `-e`, so the failed cd does not stop it; it then expects the
+# services cp2/cp3/waf1/waf2/waf3/lb/juiceshop, none of which exist in a
+# standalone install, and probes with a hardcoded `Host: 172.16.21.71`. Run on a
+# perfectly healthy customer install it printed roughly fourteen red FAILs,
+# including "benign GET / -> 502" and "SQLi -> 502 (expected 403)".
+#
+# It shipped beside preflight.sh and the cert issuers, under a header reading
+# "Post-deploy verification", so an operator troubleshooting an install would
+# reasonably run it — and then either believe their install was broken or stop
+# trusting verification output altogether. verify.sh is the customer tool.
+for s in preflight.sh promote-standby.sh \
          issue-ip-cert.sh issue-postgres-cert.sh issue-clickhouse-cert.sh \
          pg-init-replication.sh pg-standby-entrypoint.sh; do
   cp "deploy/docker/$s" "$STAGE/scripts/" 2>/dev/null || warn "missing script: $s"
@@ -190,7 +228,7 @@ done
 # Copied by name, not by glob, so a renamed or deleted page warns here rather than
 # going missing silently.
 mkdir -p "$STAGE/docs/manual"
-for d in README.md ADMIN-GUIDE.md SITE-ONBOARDING.md TROUBLESHOOTING.md ROLLBACK.md; do
+for d in README.md USER-MANUAL.md NOC-RUNBOOK.md ADMIN-GUIDE.md SITE-ONBOARDING.md TROUBLESHOOTING.md ROLLBACK.md; do
   cp "deploy/manual/$d" "$STAGE/docs/manual/$d" 2>/dev/null \
     || warn "missing manual page: deploy/manual/$d"
 done
@@ -220,7 +258,13 @@ if [[ "$BUNDLE_THIRD_PARTY" == "1" ]]; then
     EXPORT+=("$img")
   done
 fi
-if [[ "$STAGE_ONLY" == "1" ]]; then
+if [[ "$BUNDLE_IMAGES" == "registry" ]]; then
+  # No images.tar.gz AT ALL — not an empty one. An empty archive would be handed
+  # to `docker load`, which fails obscurely; its absence is what tells install.sh
+  # unambiguously that this is a registry bundle, alongside the manifest field.
+  rm -f "$STAGE/bundle/images.tar.gz"
+  ok "no images shipped — the installer pulls from $REGISTRY_PREFIX"
+elif [[ "$STAGE_ONLY" == "1" ]]; then
   # A placeholder keeps the tree SHAPE identical so the contract check sees the
   # same layout a real bundle has. It is never shipped: STAGE_ONLY stops before
   # the archive is built.
@@ -240,9 +284,22 @@ step "Step 4 of 6 — manifest"
   printf '  "built_utc": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   printf '  "built_from_commit": "%s",\n' "$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
   printf '  "air_gapped": %s,\n' "$([[ "$BUNDLE_THIRD_PARTY" == "1" ]] && echo true || echo false)"
+  # image_source is what install.sh branches on. Named rather than inferred from
+  # the presence of a file, so a truncated download cannot silently look like a
+  # registry bundle and skip loading images it was supposed to contain.
+  printf '  "image_source": "%s",\n' "$BUNDLE_IMAGES"
+  if [[ "$BUNDLE_IMAGES" == "registry" ]]; then
+    printf '  "registry_prefix": "%s",\n' "$REGISTRY_PREFIX"
+    printf '  "thirdparty_prefix": "%s/",\n' "$REGISTRY_PREFIX"
+  fi
+  # In registry mode nothing is bundled, so this list is EMPTY rather than
+  # describing four images the archive does not contain. The expected tags are
+  # already implied by registry_prefix + version; a manifest that itemises
+  # payload it does not carry is the same defect class as a doc describing a
+  # feature that was never built.
   printf '  "bundled_images": [\n'
   local_first=1
-  for svc in "${OWN_IMAGES[@]}"; do
+  for svc in $([[ "$BUNDLE_IMAGES" == "registry" ]] || printf '%s ' "${OWN_IMAGES[@]}"); do
     if [[ "$STAGE_ONLY" == "1" ]]; then id="stage-only"; sz=0; else
       id=$(docker image inspect "sentinel/${svc}:${VERSION}" --format '{{.Id}}' 2>/dev/null || echo unknown)
       sz=$(docker image inspect "sentinel/${svc}:${VERSION}" --format '{{.Size}}' 2>/dev/null || echo 0)
@@ -292,7 +349,7 @@ ok "SHA256SUMS — $(wc -l < "$STAGE/SHA256SUMS") files"
 
 # ── 6. installer entry points + archive ──────────────────────────────────────
 step "Step 6 of 6 — installer and archive"
-for f in install.sh uninstall.sh verify.sh upgrade.sh rollback.sh README.md; do
+for f in install.sh uninstall.sh verify.sh first-site.sh upgrade.sh rollback.sh README.md; do
   if [[ -f "deploy/package/customer/$f" ]]; then
     cp "deploy/package/customer/$f" "$STAGE/$f"
     [[ "$f" == *.sh ]] && chmod +x "$STAGE/$f"
@@ -331,8 +388,11 @@ cat <<SUMMARY
     sha256    $(cut -d' ' -f1 < "$ARCHIVE.sha256")
     version   $VERSION
     commit    $(git rev-parse --short HEAD 2>/dev/null || echo unknown)
-    offline   $([[ "$BUNDLE_THIRD_PARTY" == "1" ]] && echo "yes (all images bundled)" \
-                 || echo "NO — customer needs Docker Hub for ${#THIRD_PARTY[@]} third-party images")
+    images    $(case "$BUNDLE_IMAGES:$BUNDLE_THIRD_PARTY" in
+                  registry:*) echo "pulled from $REGISTRY_PREFIX — one host, no internet needed" ;;
+                  *:1)        echo "all $(( ${#OWN_IMAGES[@]} + ${#THIRD_PARTY[@]} )) inside the archive — air-gapped" ;;
+                  *)          echo "${#OWN_IMAGES[@]} inside; ${#THIRD_PARTY[@]} pulled from Docker Hub (needs internet)" ;;
+                esac)
 
   Send the customer BOTH files. They verify before extracting:
 

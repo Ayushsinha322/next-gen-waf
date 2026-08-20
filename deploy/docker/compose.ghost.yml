@@ -1,0 +1,103 @@
+# =============================================================================
+#  PUBLIC-EDGE PRACTICE ORIGIN — overlay, never part of a customer install
+# =============================================================================
+#
+#  A real, benign application to put behind the WAF on a publicly reachable
+#  address. See deploy/practice-public-site/ for the whole rehearsal.
+#
+#      docker compose -f compose.prod.yml -f compose.ghost.yml \
+#                     --profile ghost up -d ghost-db ghost
+#
+#  WHY THIS IS A SEPARATE FILE AND NOT A PROFILE IN compose.prod.yml
+#
+#  It was in compose.prod.yml, behind `profiles: [ghost]`, and that was not
+#  enough. Compose interpolates every variable in a file BEFORE it filters by
+#  profile, so the `${GHOST_DB_PASSWORD:?...}` guards below fired on every
+#  command against the file — including `docker compose up` on a customer
+#  install that has no interest in a blog. install.sh generates seven secrets
+#  and none of them are GHOST_*, so a fresh install aborted at the final step
+#  with "required variable GHOST_DB_PASSWORD is missing a value", after images
+#  were loaded and /opt/sentinel was written. Profiles gate what STARTS, not
+#  what is PARSED.
+#
+#  The `:?` guards are correct here and are deliberately kept: for the practice
+#  run these values must be set deliberately, and a default password on an
+#  internet-facing origin is worse than a failed command. Isolating the file is
+#  what makes strictness affordable — it can only fail the people who ask for it.
+#
+#  Ghost, not Juice Shop, and the difference is the whole point: this box sits on
+#  172.16.21.0/24, and site matching is by Host header alone (site_matches() in
+#  crates/sentinel-proxy/src/lib.rs:4787), so a public address forwarded to this
+#  host makes EVERY site on it reachable by whoever guesses the Host. A
+#  deliberately vulnerable origin then becomes an internal-network foothold that
+#  the WAF is the only thing standing in front of — and the WAF's real-traffic
+#  error rate is precisely the unknown we are trying to measure, so it cannot
+#  also be the assumption. Run pre-exposure-audit.sh before any NAT rule opens.
+#
+#  Ghost earns its place as a measurement target: admin logins, rich-text POST
+#  bodies, image uploads, member signups and a JSON admin API are where false
+#  positives actually live. A static page exercises none of it.
+#
+#  Upstream for the site is `ghost:2368`. A site pointing there returns 502
+#  unless this overlay is passed AND --profile ghost is set.
+# =============================================================================
+
+services:
+  ghost:
+    profiles: [ghost]
+    # Pin to a digest before exposing it publicly: this is an internet-facing app
+    # and `5-alpine` moves under you, so a redeploy can change what is exposed
+    # without a config change. `docker image inspect ghost:5-alpine -f
+    # '{{index .RepoDigests 0}}'` and paste the result here.
+    image: ghost:5-alpine
+    restart: unless-stopped
+    mem_limit: 512m
+    environment:
+      # Ghost builds every absolute URL — canonical links, redirects, asset paths,
+      # password-reset mails — from this one value, and it must be the PUBLIC
+      # https URL, not the container or the origin address. Wrong here does not
+      # fail loudly: the site renders, then styles 404 or logins bounce in a
+      # redirect loop, because Ghost sends the browser somewhere it cannot reach.
+      url: ${GHOST_PUBLIC_URL:?set GHOST_PUBLIC_URL in deploy/docker/.env, e.g. https://esdswaf-demo.duckdns.org}
+      database__client: mysql
+      database__connection__host: ghost-db
+      database__connection__user: ghost
+      database__connection__password: ${GHOST_DB_PASSWORD:?set GHOST_DB_PASSWORD in deploy/docker/.env}
+      database__connection__database: ghost
+      NODE_ENV: production
+    volumes:
+      - ghostdata:/var/lib/ghost/content
+    # No `ports:`. The WAF is the only public listener on this host; publishing
+    # 2368 would let a client reach the origin directly and bypass inspection
+    # entirely, which would also make any FPR number measured here meaningless.
+    networks: [sentinel]
+    depends_on:
+      ghost-db:
+        condition: service_healthy
+
+  ghost-db:
+    profiles: [ghost]
+    image: mysql:8.4
+    restart: unless-stopped
+    mem_limit: 512m
+    environment:
+      MYSQL_ROOT_PASSWORD: ${GHOST_DB_ROOT_PASSWORD:?set GHOST_DB_ROOT_PASSWORD in deploy/docker/.env}
+      MYSQL_DATABASE: ghost
+      MYSQL_USER: ghost
+      MYSQL_PASSWORD: ${GHOST_DB_PASSWORD:?set GHOST_DB_PASSWORD in deploy/docker/.env}
+    # Ghost's migrations run at boot and fail hard against a MySQL that is still
+    # initialising, leaving a half-migrated schema. depends_on alone waits for the
+    # container, not for the server, so the healthcheck is what makes it correct.
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p$$MYSQL_ROOT_PASSWORD"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    volumes:
+      - ghostdbdata:/var/lib/mysql
+    networks: [sentinel]
+
+volumes:
+  ghostdata:
+  ghostdbdata:

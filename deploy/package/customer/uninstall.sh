@@ -54,10 +54,25 @@ if [[ "$PURGE" == "yes" ]]; then
   rm -rf "$STATE_DIR" "$PKI_DIR"
   printf '  %s✓%s data volumes, configuration and certificate authority destroyed\n' "$GRN" "$R"
 else
+  # The install marker goes even though the data stays. Every container has just
+  # been removed, so leaving it behind states that a version is installed when
+  # none is running — and `upgrade.sh` and the version banner both read it.
+  #
+  # The .env deliberately REMAINS (that is the point of a non-purge uninstall), so
+  # install.sh's guard still fires on its `-f "$INSTALL_DIR/.env"` arm. That is
+  # correct: regenerating secrets against surviving volumes would lock the
+  # operator out of their own data. The reinstall path is therefore --force, and
+  # this message now says so. It used to promise "re-running install.sh reuses
+  # both", which aborted with "already installed — remove it completely: sudo
+  # ./uninstall.sh", i.e. the command they had just run.
+  rm -f "$STATE_DIR/version"
   printf '  %s✓%s data volumes KEPT: %s\n' "$GRN" "$R" "$(printf '%s ' "${VOLUMES[@]}")"
   printf '      configuration kept at %s/.env\n' "$INSTALL_DIR"
-  printf '      re-running install.sh reuses both — your sites and history return\n'
-  printf '      to destroy everything: sudo ./uninstall.sh --purge\n'
+  printf '      your sites and history return when you reinstall — reuse them with:\n'
+  printf '        %ssudo ./install.sh --force%s\n' "$B" "$R"
+  printf '      (--force is required BECAUSE the .env survived; a plain install.sh\n'
+  printf '       stops rather than regenerate secrets against the existing database)\n'
+  printf '      to destroy everything instead: sudo ./uninstall.sh --purge\n'
 fi
 
 # Images are left in place on purpose: they are large, and a reinstall or a

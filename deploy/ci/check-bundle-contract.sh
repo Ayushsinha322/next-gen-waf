@@ -39,7 +39,11 @@ set -uo pipefail
 
 STAGE="${1:-}"
 if [[ -z "$STAGE" ]]; then
-  STAGE=$(ls -d dist/ESDSWAF-v*/ 2>/dev/null | head -1)
+  # NEWEST staged tree, not alphabetically first. `ls | head -1` picked the OLDEST
+  # once dist/ held more than one version, so this validated a tree from a previous
+  # release and reported it as stale — a confusing failure that looked like a bug in
+  # the staging step rather than in this selection.
+  STAGE=$(ls -dt dist/ESDSWAF-v*/ 2>/dev/null | head -1)
   STAGE="${STAGE%/}"
 fi
 [[ -n "$STAGE" && -d "$STAGE" ]] || {
@@ -88,7 +92,7 @@ sect "Tree layout"
 for d in bundle compose configs scripts docs scripts/2vm; do
   [[ -d "$STAGE/$d" ]] && pass "$d/" || fail "$d/ missing"
 done
-for f in install.sh uninstall.sh verify.sh upgrade.sh rollback.sh README.md SHA256SUMS; do
+for f in install.sh uninstall.sh verify.sh first-site.sh upgrade.sh rollback.sh README.md SHA256SUMS; do
   [[ -f "$STAGE/$f" ]] && pass "$f" || fail "$f missing"
 done
 
@@ -168,6 +172,17 @@ sect "Operator documentation ships with the bundle"
 for d in STANDALONE.md ACTIVE-PASSIVE.md; do
   [[ -f "$STAGE/docs/$d" ]] && pass "docs/$d" || fail "docs/$d missing"
 done
+# The pages an operator actually runs the product from. Checked by name because
+# these are the ones referenced from install.sh's closing message, from each
+# other, and from the walkthrough — a missing one is a dead link in a document
+# someone is reading at 2am, not a cosmetic gap.
+for d in README.md USER-MANUAL.md NOC-RUNBOOK.md ADMIN-GUIDE.md SITE-ONBOARDING.md TROUBLESHOOTING.md ROLLBACK.md; do
+  [[ -f "$STAGE/docs/manual/$d" ]] && pass "docs/manual/$d" || fail "docs/manual/$d missing"
+done
+# The one document a first-time operator reads end to end.
+[[ -f "$STAGE/docs/vm-deploy/INSTALL-WALKTHROUGH.md" ]] \
+  && pass "docs/vm-deploy/INSTALL-WALKTHROUGH.md" \
+  || fail "docs/vm-deploy/INSTALL-WALKTHROUGH.md missing"
 
 # ── 7. manifest is parseable by install.sh's own sed parser ──────────────────
 # install.sh deliberately does not use python3; if the manifest shape drifts the

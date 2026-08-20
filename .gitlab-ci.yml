@@ -21,6 +21,7 @@ stages:
   - rust-test   # rust-test alone — one 13 GB target at a time
   - build       # rust-build alone
   - security
+  - publish     # tags only — build the four images and push them to Harbor
 
 # ── Rust data plane ──────────────────────────────────────────────────────────
 # Shared Rust CI settings.
@@ -194,7 +195,10 @@ deploy-shell:
   tags:
     - k8s-docker
   before_script:
-    - apk add --no-cache bash shellcheck git coreutils findutils grep sed
+    # docker-cli-compose is here for check-compose-parses-clean.sh. `docker
+    # compose config` only parses and interpolates — it never contacts a daemon —
+    # so this needs no docker-in-docker and no privileged runner.
+    - apk add --no-cache bash shellcheck git coreutils findutils grep sed docker-cli-compose
   script:
     # 1. Every shell file must parse. Cheap, absolute, no exceptions.
     - |
@@ -212,7 +216,17 @@ deploy-shell:
     #    the backlog is worked down.
     - shellcheck -S error $(find deploy -name '*.sh' -type f) || exit 1
     - shellcheck -S warning $(find deploy -name '*.sh' -type f) || true
-    # 3. The contract check — the one that catches shipping-breaking bugs.
+    # 3. Every compose file must parse with the environment its own installer
+    #    generates. This is not style — it caught a release blocker: a practice
+    #    Ghost origin sat in compose.prod.yml behind `profiles: [ghost]`, and
+    #    because compose interpolates a file BEFORE filtering by profile, its
+    #    `${GHOST_DB_PASSWORD:?...}` guard failed every customer `docker compose
+    #    up`. install.sh generates seven secrets, none of them GHOST_*, so a
+    #    fresh install aborted at its last step — after images were loaded and
+    #    /opt/sentinel written — with an error about a blog's database.
+    #    Nothing caught it because CI never invoked compose at all.
+    - ./deploy/ci/check-compose-parses-clean.sh
+    # 4. The contract check — the one that catches shipping-breaking bugs.
     - STAGE_ONLY=1 ./deploy/package/build-bundle.sh
     - ./deploy/ci/check-bundle-contract.sh
 
@@ -224,3 +238,262 @@ include:
 secret_detection:
   tags:
     - k8s-docker
+
+# ── Container images → Harbor ────────────────────────────────────────────────
+# Builds the four product images and pushes them to the ESDS Harbor registry, so
+# a release comes from a commit instead of from whoever's laptop last ran
+# build-bundle.sh. That was a real failure, not a hypothetical one: a bundle
+# published on 2026-08-16 turned out to have been built two commits earlier and
+# was shipping a stale copy of the very install walkthrough it contained.
+#
+#     hub.enlight.dev/swaraj-kavach/{dataplane,controlplane,dashboard,migrate}
+#
+# The project is PUBLIC, so a customer VM pulls with no credentials at all — no
+# docker login, no token to distribute. Verified from 172.16.21.101 with an empty
+# docker config. Credentials here are only for PUSHING.
+#
+# WHY ONE JOB THAT BUILDS SEQUENTIALLY, NOT FOUR PARALLEL JOBS
+#
+# The same disk ceiling that forced the Rust jobs into separate stages applies
+# here, and more sharply. Eviction happens at ~29 GB of ephemeral storage ON THE
+# NODE, not per pod, so splitting into parallel jobs would not divide the
+# problem — it would multiply it. And two of the four targets pull in a Rust
+# compilation:
+#
+#     sentinel-dataplane     <- rust-builder    (the proxy: heavy)
+#     sentinel-controlplane  <- go-builder + srl-builder  (srl-builder is Rust)
+#     sentinel-migrate       <- goose-builder   (light)
+#     dashboard              separate Dockerfile, Node build
+#
+# So the images are built one at a time, heaviest first, with the builder cache
+# pruned between each. Peak disk is one Rust build rather than two.
+#
+# TAGS ONLY. This job does not run on branch pushes — it is minutes of compile
+# for an artefact nobody consumes until a release exists. Push a tag to publish:
+#
+#     git tag v1.0.1 && git push origin v1.0.1
+#
+# It is also available manually on a branch, so the pipeline can be exercised
+# without inventing a tag. A manual run publishes to a branch-named tag
+# (e.g. :uat, :testing), never to a version number — a test build must never be
+# mistakable for the release.
+publish-images:
+  stage: publish
+  image: docker:27-cli
+  # ai-docs (runner 51), a DOCKER executor whose host socket is mounted into the
+  # job — measured, not assumed. Runner 45 (k8s-docker) cannot schedule a pod at
+  # all: one node unreachable, the other excluded by node affinity.
+  #
+  # No `services: docker:dind`. It fails here with "can't create unix socket
+  # /var/run/docker.sock: device or resource busy" precisely because the host
+  # socket is already mounted, and a nested daemon fights that mount.
+  tags:
+    - ai-docs
+  variables:
+    # BuildKit builds only the stages a --target actually depends on, which is
+    # what keeps `migrate` from dragging in a Rust compiler.
+    DOCKER_BUILDKIT: "1"
+    HARBOR: hub.enlight.dev
+    HARBOR_PROJECT: swaraj-kavach
+  rules:
+    # A version tag publishes the real release.
+    - if: $CI_COMMIT_TAG
+      when: on_success
+    # Any branch can publish a throwaway, on purpose, by hand.
+    - if: $CI_COMMIT_BRANCH
+      when: manual
+      allow_failure: true
+  before_script:
+    - apk add --no-cache git
+    - |
+      # The image tag. On a git tag, v1.0.1 -> 1.0.1 and it MUST match the
+      # VERSION file: a release whose images say one version and whose bundle
+      # manifest says another is worse than a failed pipeline.
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        IMAGE_TAG="${CI_COMMIT_TAG#v}"
+        FILE_VERSION="$(cat VERSION 2>/dev/null || echo missing)"
+        if [ "$IMAGE_TAG" != "$FILE_VERSION" ]; then
+          echo "✗ tag '$CI_COMMIT_TAG' implies version '$IMAGE_TAG' but VERSION says '$FILE_VERSION'"
+          echo "  Bump VERSION and re-tag, or tag the commit that matches."
+          exit 1
+        fi
+      else
+        # Branch build: publish under the branch name, slashes flattened.
+        IMAGE_TAG="$(echo "$CI_COMMIT_BRANCH" | tr '/' '-')"
+        echo "! manual branch build — publishing :$IMAGE_TAG, not a version"
+      fi
+      echo "IMAGE_TAG=$IMAGE_TAG" > build.env
+      echo "  image tag: $IMAGE_TAG"
+    - |
+      [ -n "$HARBOR_USER" ] && [ -n "$HARBOR_TOKEN" ] || {
+        echo "✗ HARBOR_USER / HARBOR_TOKEN are not set."
+        echo "  Add them as masked CI/CD variables. HARBOR_USER is the Harbor"
+        echo "  robot account name (robot\$something); HARBOR_TOKEN is its secret."
+        exit 1; }
+    - |
+      # Reachability before credentials. As of 2026-08-17 this runner's host cannot
+      # reach 172.16.23.2:443 at all — DNS resolves and a route exists, but TCP
+      # times out, i.e. a firewall drops it. Docker Hub and GitLab are both fine
+      # from here. Saying so plainly beats "docker login timed out".
+      if ! wget -q -T 12 -O /dev/null --no-check-certificate "https://$HARBOR/v2/" 2>/dev/null; then
+        case "$(wget -S -T 12 -O /dev/null "https://$HARBOR/v2/" 2>&1 | head -1)" in
+          *401*|*200*) : ;;   # 401 is the registry's normal unauthenticated answer
+          *) echo "✗ cannot reach https://$HARBOR from this runner."
+             echo "  DNS and routing are fine; TCP 443 to the registry is dropped."
+             echo "  Infra must allow this runner host -> 172.16.23.2:443."
+             exit 1 ;;
+        esac
+      fi
+    - echo "$HARBOR_TOKEN" | docker login "$HARBOR" --username "$HARBOR_USER" --password-stdin
+  script:
+    - . ./build.env
+    - export BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    - |
+      # Heaviest first: if the node is going to run out of disk, find out on the
+      # build that costs the most rather than after three cheap successes.
+      build_push() {
+        target="$1"; name="$2"; context="$3"; dockerfile="$4"
+        ref="$HARBOR/$HARBOR_PROJECT/$name:$IMAGE_TAG"
+        echo "── $name ─────────────────────────────────────────────"
+        set -- --build-arg "GIT_SHA=$CI_COMMIT_SHORT_SHA" \
+               --build-arg "BUILD_DATE=$BUILD_DATE" \
+               --build-arg "VERSION=$IMAGE_TAG" \
+               -f "$dockerfile" -t "$ref"
+        [ -n "$target" ] && set -- "$@" --target "$target"
+        docker build "$@" "$context" || return 1
+        docker push "$ref" || return 1
+        # DO NOT prune here. This is the HOST daemon, shared with every other
+        # project that uses this runner — `docker builder prune -af` would delete
+        # their build caches too. The earlier draft did exactly that, written for
+        # the 29 GB Kubernetes node this job no longer runs on; the ai-docs host
+        # reports 475 GB free, so there is nothing to reclaim and every reason not
+        # to reach into a shared daemon. Only our own tag is dropped, and only
+        # because it is already safely in the registry.
+        docker image rm "$ref" >/dev/null 2>&1 || true
+        df -h /var/lib/docker 2>/dev/null | tail -1 || df -h / | tail -1 || true
+      }
+      build_push sentinel-dataplane    dataplane    . deploy/docker/Dockerfile
+      build_push sentinel-controlplane controlplane . deploy/docker/Dockerfile
+      build_push ""                    dashboard    dashboard deploy/docker/Dockerfile.dashboard
+      build_push sentinel-migrate      migrate      . deploy/docker/Dockerfile
+  after_script:
+    # Never leave a usable credential in a runner's docker config.
+    - docker logout hub.enlight.dev >/dev/null 2>&1 || true
+  timeout: 90m
+
+# ── The release itself ───────────────────────────────────────────────────────
+# A version tag is the release event. `git push origin v1.0.1` produces a proper
+# GitLab Release — a versioned, immutable entry under Deploy → Releases with notes
+# and labelled download links — instead of a loose file in a generic package
+# bucket that nobody can tell apart from the previous one.
+#
+# That ambiguity is not hypothetical. The registry currently holds 1.0.0 and 1.0.1
+# side by side, and 1.0.0 still contains the compose defect that aborts an install
+# at step 9 of 10, after /opt has been written. "Take the newest one" is not an
+# instruction anybody should be relying on during a deployment. A Release page
+# names exactly one.
+#
+# Uses the API rather than the `release:` keyword deliberately: `release:` needs
+# the release-cli image from registry.gitlab.com, and the only working runner here
+# has already shown it cannot reach every registry (172.16.23.2 is firewalled off).
+# curl against GitLab's own API needs nothing this runner has not already proven.
+#
+# IT DEPENDS ON publish-images ON PURPOSE. A Release that advertises image tags
+# which were never pushed is worse than no Release: it is a documented lie that
+# somebody will follow at 2am. If the images cannot be published the release does
+# not happen. NOTE that until infra allows this runner to reach 172.16.23.2:443,
+# that means tagging produces no release — which is the correct failure, and the
+# reason to chase that firewall rule.
+release:
+  stage: publish
+  image: alpine:3.20
+  tags:
+    - ai-docs
+  needs:
+    - publish-images
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: on_success
+  before_script:
+    - apk add --no-cache curl jq git >/dev/null
+  script:
+    - |
+      VERSION="${CI_COMMIT_TAG#v}"
+      PKG="$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/esdswaf/$VERSION"
+      HARBOR_REPO="hub.enlight.dev/swaraj-kavach"
+      PREV="$(git tag --sort=-v:refname | sed -n 2p)"
+      if [ -n "$PREV" ]; then
+        CHANGES="$(git log --no-merges --pretty='- %s' "$PREV..$CI_COMMIT_TAG" | head -40)"
+        RANGE="Changes since $PREV"
+      else
+        CHANGES="$(git log --no-merges --pretty='- %s' -20)"
+        RANGE="Recent changes"
+      fi
+      # Heredoc, not a shell string: these notes contain backticks, pipes and
+      # quotes, and assembling them with echo produced mangled markdown. The
+      # backticks are backslash-escaped because <<NOTES is unquoted (values like
+      # $VERSION must still expand), so an unescaped ` would be read as command
+      # substitution. YAML's | block already strips this file's indentation before
+      # the shell sees it, so the heredoc body arrives at column 0 and needs no
+      # de-indenting — an earlier draft carried a `sed 's/^      //'` here that was
+      # a no-op, and would have started eating real content the moment anyone
+      # re-indented the job.
+      cat > notes.md <<NOTES
+      ## Install
+
+      **On a VM that can reach \`hub.enlight.dev\`** — no image download, no checksum:
+
+      \`\`\`bash
+      SENTINEL_IMAGE_PREFIX=$HARBOR_REPO
+      SENTINEL_VERSION=$VERSION
+      docker compose pull && docker compose up -d
+      \`\`\`
+
+      **On a closed network** — everything inside one archive:
+
+      \`\`\`bash
+      sha256sum -c ESDSWAF-v$VERSION-offline.tar.gz.sha256
+      tar -xzf ESDSWAF-v$VERSION-offline.tar.gz
+      cd ESDSWAF-v$VERSION && sudo ./install.sh
+      \`\`\`
+
+      Start here: **docs/manual/NOC-RUNBOOK.md** inside the archive, or
+      \`docs/vm-deploy/INSTALL-WALKTHROUGH.md\` for a first install.
+
+      ## Container images
+
+      | image | tag |
+      |---|---|
+      | \`$HARBOR_REPO/dataplane\` | \`$VERSION\` |
+      | \`$HARBOR_REPO/controlplane\` | \`$VERSION\` |
+      | \`$HARBOR_REPO/dashboard\` | \`$VERSION\` |
+      | \`$HARBOR_REPO/migrate\` | \`$VERSION\` |
+
+      Built from \`$CI_COMMIT_SHORT_SHA\` by pipeline $CI_PIPELINE_ID.
+
+      ## $RANGE
+
+      $CHANGES
+      NOTES
+      jq -n --arg tag "$CI_COMMIT_TAG" \
+            --arg name "Next-Gen ESDSWAF $CI_COMMIT_TAG" \
+            --arg desc "$(cat notes.md)" \
+            --arg on "$PKG/ESDSWAF-v$VERSION-online.tar.gz" \
+            --arg ons "$PKG/ESDSWAF-v$VERSION-online.tar.gz.sha256" \
+            --arg off "$PKG/ESDSWAF-v$VERSION-offline.tar.gz.sha256" \
+        '{tag_name:$tag, name:$name, description:$desc,
+          assets:{links:[
+            {name:"Installer bundle (online) — small, pulls images from Harbor", url:$on,  link_type:"package"},
+            {name:"Installer bundle (online) — SHA256",                          url:$ons, link_type:"other"},
+            {name:"Air-gapped bundle — SHA256 (parts are in the package registry)", url:$off, link_type:"other"}
+          ]}}' > release.json
+      code=$(curl -sS -o resp.json -w '%{http_code}' \
+        --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+        --header "Content-Type: application/json" \
+        --data @release.json \
+        "$CI_API_V4_URL/projects/$CI_PROJECT_ID/releases")
+      case "$code" in
+        201) echo "✓ release $CI_COMMIT_TAG created" ;;
+        409) echo "! release $CI_COMMIT_TAG already exists — leaving it alone" ;;
+        *)   echo "✗ HTTP $code"; cat resp.json; exit 1 ;;
+      esac
