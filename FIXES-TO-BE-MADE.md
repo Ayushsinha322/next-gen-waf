@@ -3,7 +3,8 @@
 **Register of known defects and gaps in Next-Gen ESDSWAF.** Every entry states how
 it was found and what evidence supports it, so nothing here rests on an opinion.
 
-**Last verified:** 2026-08-20 (with a same-day progress update), against v1.0.2 running on `172.16.21.101`
+**Last verified:** 2026-08-20, then re-verified against the running WAF on
+`172.16.21.101` after deploying revision `0a60ee4`, against v1.0.2 running on `172.16.21.101`
 (registry-mode install, 20 h uptime, 8/8 containers, zero restarts).
 
 **Rule for this file:** an item leaves it when the fix is *verified*, not when the
@@ -14,9 +15,54 @@ correct, and never actually ran.
 
 ## P0 — Contradicts a claim we make
 
+### 0. Twelve of the 25 shipped CRS files can never reach the data plane
+
+**Found while verifying the CRS work on the running WAF, and it is larger than the
+importer bugs it was found behind.**
+
+The control plane offers the data plane a curated list of **13 `REQUEST-*` files**
+(`handlers.go`, the rule-file map). The image ships **25**. The other 12 — **222
+rules** — are unreachable regardless of site configuration, because nothing can
+select them:
+
+| File | Rules |
+|---|---|
+| `RESPONSE-955-WEB-SHELLS.conf` | 35 |
+| `REQUEST-901-INITIALIZATION.conf` | 29 |
+| `REQUEST-949-BLOCKING-EVALUATION.conf` | 28 |
+| `RESPONSE-959-BLOCKING-EVALUATION.conf` | 28 |
+| `RESPONSE-951-DATA-LEAKAGES-SQL.conf` | 26 |
+| `RESPONSE-980-CORRELATION.conf` | 21 |
+| `RESPONSE-953-DATA-LEAKAGES-PHP.conf` | 13 |
+| `RESPONSE-954-DATA-LEAKAGES-IIS.conf` | 13 |
+| `RESPONSE-950-DATA-LEAKAGES.conf` | 12 |
+| `RESPONSE-952-DATA-LEAKAGES-JAVA.conf` | 11 |
+| `REQUEST-922-MULTIPART-ATTACK.conf` | 4 |
+| `REQUEST-905-COMMON-EXCEPTIONS.conf` | 2 |
+
+**Seven of them are `RESPONSE-*`, so this product currently has no response-body
+inspection capability at all.** Data-leakage detection (SQL, Java, PHP, IIS) and
+web-shell detection are shipped, compiled, tested — and unreachable. `verify.sh`
+cannot see it, the console cannot enable it, and the site wizard offers no control
+for it.
+
+`REQUEST-922-MULTIPART-ATTACK` being absent also means multipart attack rules are
+unavailable, which matters for any upload endpoint.
+
+**Fix:** add the missing files to the control plane's rule-file map and expose the
+response-body families in the site policy. The data plane already supports
+`Phase::ResponseBody` — `tests/target_names_coverage.rs` drives it directly — so
+this is wiring, not new engine work. Until it lands, the `@pmFromFile` repair below
+delivers nothing in production, because all three files it fixed are `RESPONSE-*`.
+
+
 ### 1. About half the OWASP CRS ruleset never loads
 
-> **PARTIALLY FIXED 2026-08-20 — 137 rules recovered** (commit `e412183`).
+> **PARTIALLY FIXED 2026-08-20** (commits `e412183`, `0a60ee4`). **Corrected
+> claim:** the commit message said "137 rules recovered". That was wrong — see
+> below. The measured production effect is **+6 rules loading (334 → 340)** plus
+> restored inspection of cookie names, header names and query-only args inside
+> ~129 rules that were already loading blind to them.
 > `REQUEST_COOKIES_NAMES`, `REQUEST_HEADERS_NAMES`, `ARGS_GET`, `ARGS_GET_NAMES`
 > and `QUERY_STRING` are implemented. Rules blocked by unsupported target tokens:
 > **149 → 12.** The operators and `%{}` interpolation remain.
@@ -37,11 +83,23 @@ own:
    coverage. It is not: `compiler/analysis.rs` only warns, and the rule still loads
    and compiles.
 
+3. **"137 rules recovered" counted rules that REFERENCE an unsupported token, not
+   rules that were dropped.** A CRS rule lists many targets — 942100 has eight —
+   and the importer only discards a rule when *every* target is unsupported (36
+   warnings), skipping just the unknown one otherwise. So those 129 cookie-name
+   rules were already running; they were simply blind to cookie names.
+
+   The value is real but it is **coverage inside existing rules, not more rules**.
+   Proven on the running WAF: a SQL injection placed in a COOKIE NAME, with a
+   clean URI, now scores 30 and returns 403 against rules
+   `942100,942180,942330,942390,9900100`. Before the fix that request was invisible.
+   A benign cookie name (`PHPSESSID`, `lang`) still scores 0.
+
 The real picture, measured statically:
 
 | Cause | Rules blocked | Status |
 |---|---|---|
-| Unsupported target tokens | 149 | **12 left** — fixed 2026-08-20 |
+| Unsupported target tokens | 149 *referenced*, 6 *dropped* | **fixed 2026-08-20** |
 | `%{...}` interpolation in the pattern | 27 | open |
 | `@pm` | 8 | open — cheap, phrase match |
 | `@validateByteRange` | 5 | open |
