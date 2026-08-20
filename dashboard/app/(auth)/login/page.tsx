@@ -24,6 +24,20 @@ export default function LoginPage() {
   const [email, setEmail]           = useState("");
   const [password, setPassword]     = useState("");
   const [loginError, setLoginError] = useState("");
+  // null = not asked yet, false = not configured, true = usable. The button
+  // renders ONLY on true: /oidc/login answers 501 when the issuer and client
+  // secret are unset, and a button that returns a JSON error would be the same
+  // defect as the one it replaced.
+  const [ssoReady, setSsoReady]     = useState<boolean | null>(null);
+
+  useEffect(() => {
+    let live = true;
+    fetch("/api/v1/auth/oidc/status")
+      .then(r => (r.ok ? r.json() : { configured: false }))
+      .then(d => { if (live) setSsoReady(Boolean(d?.configured)); })
+      .catch(() => { if (live) setSsoReady(false); });
+    return () => { live = false; };
+  }, []);
   const [btnState, setBtnState]     = useState<BtnState>("idle");
 
   // ── UI state ─────────────────────────────────────────────────────────────
@@ -374,22 +388,34 @@ export default function LoginPage() {
             {btnState === "success" && "✓ Access granted"}
           </motion.button>
 
-          {/* Divider */}
-          <div className="div-row">
+          {/* Only shown when there is in fact something else to continue with. */}
+            {ssoReady && (
+              <div className="div-row">
             <div className="div-line" />
             <div className="div-text">or continue with</div>
             <div className="div-line" />
           </div>
+            )}
 
-          {/* SAML / LDAP */}
-          <motion.button id="sso-btn" onClick={doLogin} whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.98 }}>
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-              <circle cx="12" cy="12" r="10" stroke="#94a3b8" strokeWidth="1.5" />
-              <path d="M2 12h20M12 2a15.3 15.3 0 010 20M12 2a15.3 15.3 0 000 20"
-                stroke="#94a3b8" strokeWidth="1.5" fill="none" />
-            </svg>
-            Sign in with SAML / LDAP
-          </motion.button>
+          {/* Single sign-on. OIDC is the only SSO this control plane implements — there
+              is no SAML and no LDAP anywhere in it. This button previously read
+              "Sign in with SAML / LDAP" and called the password handler. */}
+          {ssoReady && (
+            <motion.button
+              id="sso-btn"
+              type="button"
+              onClick={() => { window.location.href = "/api/v1/auth/oidc/login"; }}
+              whileHover={{ scale: 1.02 }}
+              whileTap={{ scale: 0.98 }}
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <circle cx="12" cy="12" r="10" stroke="#94a3b8" strokeWidth="1.5" />
+                <path d="M2 12h20M12 2a15.3 15.3 0 010 20M12 2a15.3 15.3 0 000 20"
+                  stroke="#94a3b8" strokeWidth="1.5" fill="none" />
+              </svg>
+              Sign in with single sign-on
+            </motion.button>
+          )}
 
           <div id="form-footer">
             Protected by Next-Gen ESDS WAF · AES-256 encrypted<br />

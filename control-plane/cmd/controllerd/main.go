@@ -463,6 +463,11 @@ func run() error {
 	{
 		authGroup.POST("/login", func(c *gin.Context) { handleLogin(c, jwtSvc, store, hub) })
 		authGroup.POST("/refresh", func(c *gin.Context) { handleRefresh(c, jwtSvc, store) })
+		// Unauthenticated on purpose: the login page must ask this BEFORE anyone
+		// has logged in. It reveals only whether SSO is available — which the
+		// login form would reveal anyway by having a button — and never the
+		// issuer, client id or secret.
+		authGroup.GET("/oidc/status", handleOIDCStatus)
 		authGroup.GET("/oidc/login", func(c *gin.Context) { handleOIDCLogin(c, jwtSvc, log) })
 		authGroup.GET("/oidc/callback", func(c *gin.Context) { handleOIDCCallback(c, jwtSvc, store, log) })
 	}

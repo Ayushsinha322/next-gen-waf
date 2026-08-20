@@ -441,6 +441,23 @@ func oidcConfigFromEnv() (auth.OIDCConfig, bool) {
 	return cfg, true
 }
 
+// handleOIDCStatus reports whether OIDC single sign-on is usable on this
+// deployment. It exists so the login page can show an SSO button only when
+// pressing it would work.
+//
+// It was added because the login page shipped a button reading "Sign in with
+// SAML / LDAP" whose onClick was the ordinary password handler. Neither SAML nor
+// LDAP exists anywhere in this control plane, while OIDC — which does — had no
+// button at all. A security product advertising an authentication method it does
+// not implement is worse than one that offers fewer.
+//
+// Returns only a boolean. Never the issuer, client id, secret or redirect URL:
+// those would tell an unauthenticated caller which identity provider to attack.
+func handleOIDCStatus(c *gin.Context) {
+	_, ok := oidcConfigFromEnv()
+	c.JSON(http.StatusOK, gin.H{"configured": ok})
+}
+
 func handleOIDCLogin(c *gin.Context, jwtSvc *auth.JWTService, log *zap.Logger) {
 	cfg, ok := oidcConfigFromEnv()
 	if !ok {
