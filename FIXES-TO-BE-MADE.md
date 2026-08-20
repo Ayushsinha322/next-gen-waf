@@ -229,6 +229,37 @@ bytes).
 > Negative-tested: reverting to a bare `include_bytes!` makes it fail and name its
 > own cause.
 >
+> **Three further defects found while verifying this, all fixed here.** Making
+> kernel XDP load turned out to be necessary but not sufficient:
+>
+> 1. **`EbpfManager::start()` was never called** — anywhere. The stats task that
+>    reads the per-CPU BPF map back into userspace never ran, so
+>    `stats_interval_secs` was dead config. Packets dropped by XDP in the driver
+>    path never reach userspace, so `xdp_drop` would have read **0 forever while
+>    the kernel was dropping traffic**. Measured before the fix: kernel map 1202,
+>    reported 21 (the reported figure was a userspace per-connection count, ~1 per
+>    HTTP request against ~8.7 packets). After: kernel 470, reported 467 — the
+>    poll-interval lag, which is correct.
+> 2. **The eBPF mode was not observable at all.** `/healthz` had no eBPF field and
+>    the counters went nowhere, so the only evidence of six weeks of silent
+>    software-mode fallback was one WARN at container startup. `/healthz` now
+>    reports `mode`, `kernel_requested`, `interface` and the counters, and
+>    `verify.sh` asserts it — requested-but-software is a WARN rather than a FAIL,
+>    because falling back on hosts that cannot do XDP is deliberate and failing
+>    verification there would be a false alarm. The point is that the degradation
+>    is now visible instead of silent.
+> 3. **Three documented XDP knobs were never plumbed into the container.**
+>    `compose.prod.yml` passed only `SENTINEL_XDP_ENABLE` and
+>    `SENTINEL_XDP_IFACE`, so `SENTINEL_XDP_BLOCK`, `SENTINEL_XDP_AUTOBAN` and
+>    `SENTINEL_XDP_AUTOBAN_BLOCKS` did nothing and said nothing when set — the
+>    same stored-echoed-dropped shape as the CRS categories. Auto-ban is **on by
+>    default**, so until now an operator whose traffic tripped the threshold had
+>    no switch. Now plumbed and verified: seeding `203.0.113.7` (RFC 5737
+>    TEST-NET-3) produced `seed_entries: 1` and the in-kernel LPM entry
+>    `{prefixlen: 32, addr: 0x077100CB}`, proving the userspace→kernel write path
+>    the auto-ban depends on. `SENTINEL_XDP_AUTOBAN_INCLUDE_PRIVATE` is
+>    deliberately left unplumbed — see below.
+>
 > **Note on blast radius, checked before enabling this.** `SENTINEL_XDP_ENABLE=1`
 > is already set in the shipped compose, so this fix turns a dead code path into a
 > live in-kernel drop on every deployment. XDP drops below the socket, so a

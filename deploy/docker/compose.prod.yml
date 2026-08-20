@@ -369,6 +369,29 @@ services:
       # before they reach the proxy. Degrades to software mode if attach fails.
       SENTINEL_XDP_ENABLE: "1"
       SENTINEL_XDP_IFACE: eth0
+      # The remaining XDP knobs the data plane reads. Without these lines they
+      # are unreachable: setting SENTINEL_XDP_BLOCK in .env changed nothing and
+      # reported nothing, because the variable never entered the container.
+      #
+      #   SENTINEL_XDP_BLOCK           comma-separated IPs/CIDRs to drop at XDP
+      #                                from startup (e.g. "1.2.3.4,10.0.0.0/8")
+      #   SENTINEL_XDP_AUTOBAN         "0" disables auto-ban (default on)
+      #   SENTINEL_XDP_AUTOBAN_BLOCKS  WAF blocks in-window before a source IP
+      #                                is pushed to the kernel blocklist (20)
+      #
+      # Auto-ban being on by default with no way to tune or disable it from the
+      # shipped configuration is why these matter: an operator whose traffic
+      # trips the threshold needs a switch, not a rebuild.
+      #
+      # SENTINEL_XDP_AUTOBAN_INCLUDE_PRIVATE is deliberately NOT plumbed. It
+      # lets private/loopback addresses be auto-banned, and on a single-node
+      # install every client appears as the Docker gateway — so it would allow
+      # black-holing the whole deployment in-kernel, below the socket, from a
+      # one-line .env edit. It stays a test-only knob, settable only by someone
+      # editing this file on purpose.
+      SENTINEL_XDP_BLOCK: ${SENTINEL_XDP_BLOCK:-}
+      SENTINEL_XDP_AUTOBAN: ${SENTINEL_XDP_AUTOBAN:-1}
+      SENTINEL_XDP_AUTOBAN_BLOCKS: ${SENTINEL_XDP_AUTOBAN_BLOCKS:-20}
       # Client-IP attribution. This node publishes :80/:443 directly, so the transport
       # peer IS the client and X-Forwarded-For must NOT be trusted — an empty list means
       # XFF is ignored entirely, which is the safe default. Set it ONLY to the addresses

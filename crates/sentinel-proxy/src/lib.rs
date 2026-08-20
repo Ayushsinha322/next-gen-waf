@@ -1078,6 +1078,20 @@ impl ProxyServer {
         // blocklist so they're dropped at XDP (or the userspace fast-fail).
         seed_ebpf_from_ip_reputation(&ebpf, &cfg);
 
+        // Start the stats task. Without this call `stats_interval_secs` is dead
+        // config and, in KERNEL mode, the counters never reflect reality:
+        // packets dropped by XDP in the driver path never reach userspace, so
+        // `is_blocked()` cannot see them and `xdp_drop` stays 0 forever while
+        // the kernel is dropping traffic. This task is the only thing that
+        // reads the per-CPU BPF map back into the counters that /healthz and
+        // /metrics report.
+        //
+        // In software mode it is nearly free and changes nothing: the kernel
+        // branch is skipped and the userspace per-connection counts stand.
+        if let Err(e) = ebpf.start().await {
+            warn!(error = %e, "eBPF stats task failed to start — kernel XDP counters will not update");
+        }
+
         // Certificate manager — loads persisted ACME/manual certs from disk,
         // then runs background renewal every hour.
         let cert_dir = cfg.cert_dir.clone().unwrap_or_else(|| {
