@@ -5802,6 +5802,7 @@ fn health_response(state: &ServerState) -> Response<BoxBody> {
     };
 
     let pool_stats = state.upstream_pool.stats();
+    let ebpf_stats = state.ebpf.stats();
     let start = *START_TIME.get_or_init(SystemTime::now);
     let uptime_secs = start.elapsed().unwrap_or_default().as_secs();
 
@@ -5817,6 +5818,25 @@ fn health_response(state: &ServerState) -> Response<BoxBody> {
         // silently incomplete audit trail is the failure this counter exists to
         // make visible.
         "history_shed": history_shed_total(),
+        // The eBPF/XDP data path, and specifically whether the KERNEL path is
+        // live. This exists because kernel XDP had never once loaded on any
+        // deployment — the embedded object was rejected before it reached the
+        // kernel — and the ONLY trace was a single WARN at startup. Nothing
+        // queryable reported it, so every install silently ran the DDoS path in
+        // software while the product documented an in-kernel fast path.
+        //
+        // `kernel_requested` vs `mode` is the pair that matters: requested-but-
+        // software is the exact silent degradation that hid for six weeks, and
+        // it is now something verify.sh can assert instead of infer from
+        // container logs.
+        "ebpf": {
+            "mode": state.ebpf.mode().to_string(),
+            "kernel_requested": state.ebpf.config().enable_kernel,
+            "interface": state.ebpf.config().interface,
+            "xdp_pass": ebpf_stats.xdp_pass,
+            "xdp_drop": ebpf_stats.xdp_drop,
+            "xdp_aborted": ebpf_stats.xdp_aborted,
+        },
         "upstreams_healthy": pool_stats.healthy,
         "upstreams_total": pool_stats.total,
         "version": env!("CARGO_PKG_VERSION"),
@@ -7543,6 +7563,53 @@ mod history_shed_tests {
         let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let body = serde_json::json!({ "history_shed": history_shed_total() });
         assert!(body["history_shed"].is_number());
+    }
+
+    /// The eBPF mode has to be READABLE, not just logged.
+    ///
+    /// Kernel XDP failed to load on every deployment for six weeks and the only
+    /// trace was a single WARN at container startup, so nothing could detect it:
+    /// not /healthz, not verify.sh, not the dashboard. The pair that matters is
+    /// `kernel_requested` vs `mode` — requested-but-software is precisely the
+    /// silent degradation that hid — so both must be present and typed.
+    #[tokio::test]
+    async fn healthz_reports_the_ebpf_mode_and_whether_kernel_was_requested() {
+        let mgr = sentinel_ebpf::EbpfManager::new(sentinel_ebpf::EbpfConfig {
+            interface: "eth0".to_string(),
+            blocklist: vec![],
+            enable_kernel: false,
+            stats_interval_secs: 5,
+        })
+        .await
+        .expect("software-mode manager must always construct");
+        let stats = mgr.stats();
+        let body = serde_json::json!({
+            "ebpf": {
+                "mode": mgr.mode().to_string(),
+                "kernel_requested": mgr.config().enable_kernel,
+                "interface": mgr.config().interface,
+                "xdp_pass": stats.xdp_pass,
+                "xdp_drop": stats.xdp_drop,
+                "xdp_aborted": stats.xdp_aborted,
+            }
+        });
+        let e = &body["ebpf"];
+        assert!(
+            e["mode"]
+                .as_str()
+                .is_some_and(|m| m == "kernel-xdp" || m == "software"),
+            "mode must be a string verify.sh can match, got {:?}",
+            e["mode"]
+        );
+        assert!(
+            e["kernel_requested"].is_boolean(),
+            "without kernel_requested, a host running software mode BY CONFIG is \
+             indistinguishable from one that wanted the kernel path and silently \
+             failed to get it — the exact bug this field exists to expose"
+        );
+        for k in ["xdp_pass", "xdp_drop", "xdp_aborted"] {
+            assert!(e[k].is_number(), "{k} must be numeric");
+        }
     }
 }
 

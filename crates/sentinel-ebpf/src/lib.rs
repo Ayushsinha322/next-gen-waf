@@ -344,6 +344,14 @@ fn lpm_v4_key_data(ip: std::net::Ipv4Addr) -> u32 {
 // and mirrors the blocklist into the kernel LPM-trie maps. Every operation is
 // panic-free: any error degrades to the userspace software path.
 
+/// Test-only accessor for the embedded XDP object, so the integration test can
+/// assert the alignment the loader depends on. Not part of the public API.
+#[cfg(feature = "kernel")]
+#[doc(hidden)]
+pub fn xdp_object_bytes_for_test() -> &'static [u8] {
+    kernel_xdp::xdp_program_bytes()
+}
+
 #[cfg(feature = "kernel")]
 mod kernel_xdp {
     use super::{lpm_v4_key_data, EbpfError, IpNet, Result};
@@ -356,9 +364,38 @@ mod kernel_xdp {
     use aya::Ebpf;
     use tracing::{info, warn};
 
+    /// Wrapper that forces 8-byte alignment on the embedded object.
+    ///
+    /// THIS ALIGNMENT IS LOAD-BEARING. `include_bytes!` expands to a plain byte
+    /// array and carries **no alignment guarantee**, so the linker may place it
+    /// at any address. aya parses the ELF via the `object` crate, whose ELF64
+    /// header is read as a `Pod` requiring 8-byte alignment; on an odd address
+    /// it returns `Invalid ELF header size or alignment`, which aya then
+    /// flattens into the opaque `error parsing ELF data`.
+    ///
+    /// Because the outcome is decided by the final link layout, the *same* .o
+    /// parses in one binary and fails in another — which is exactly what made
+    /// this so misleading. The object was always structurally valid (correct
+    /// magic, machine 0xf7, relocatable, BTF present) and rebuilding it changed
+    /// nothing; in the shipped data-plane binary the bytes simply landed
+    /// unaligned, so kernel XDP had never once loaded on any deployment and
+    /// every install silently ran the DDoS path in software mode.
+    ///
+    /// Do not replace this with a bare `include_bytes!`.
+    #[repr(align(8))]
+    struct Aligned<T: ?Sized>(T);
+
     /// The compiled XDP object file, committed to the repo and embedded at
     /// build time so no BPF toolchain is required at runtime.
-    const XDP_PROGRAM_BYTES: &[u8] = include_bytes!("bpf/sentinel_xdp.o");
+    ///
+    /// The length comes from the macro itself so the two can never drift.
+    static XDP_OBJECT: Aligned<[u8; include_bytes!("bpf/sentinel_xdp.o").len()]> =
+        Aligned(*include_bytes!("bpf/sentinel_xdp.o"));
+
+    /// Alignment-guaranteed view of the embedded object.
+    pub(crate) fn xdp_program_bytes() -> &'static [u8] {
+        &XDP_OBJECT.0
+    }
 
     /// The program/function name (matches `SEC("xdp") int sentinel_xdp(...)`).
     const PROGRAM_NAME: &str = "sentinel_xdp";
@@ -384,7 +421,7 @@ mod kernel_xdp {
         /// caller falls back to software mode. Tries native (driver) XDP first,
         /// then retries in generic/SKB mode which is required on veth / Docker.
         pub fn try_attach(iface: &str) -> Option<Self> {
-            let mut ebpf = match Ebpf::load(XDP_PROGRAM_BYTES) {
+            let mut ebpf = match Ebpf::load(xdp_program_bytes()) {
                 Ok(e) => e,
                 Err(e) => {
                     warn!(iface, error = %e, "kernel XDP: failed to load ELF");

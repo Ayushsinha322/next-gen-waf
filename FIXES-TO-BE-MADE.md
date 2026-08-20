@@ -198,21 +198,49 @@ deploy-hardening branch.
 (`CAP_BPF`, `CAP_NET_ADMIN`, `CAP_PERFMON`, `CAP_SYS_RESOURCE`), `enable_kernel:
 true`, BTF present (6,068,679 bytes), kernel 6.8.0-55. The committed `.o` is a
 structurally valid BPF ELF (correct magic, machine `0xf7`, relocatable, 13,208
-bytes) — so `aya 0.13` is rejecting something about how it was built.
+bytes).
 
-**Fix:** rebuild the BPF object against the aya version in use and re-verify
-attach, **or** stop shipping `--features kernel` and describe the DDoS path
-honestly as userspace. Either is acceptable; shipping a failing load is not.
-
-> **STATUS 2026-08-20: still open, untouched.** Nothing has changed in
-> `crates/sentinel-ebpf/` since `dcb89ba` (2026-07-11), which is the commit that
-> introduced the object that fails to load. The WAF is running in `software` mode
-> on every deployment, including `.101` at `1.0.4-test`.
+> **FIXED 2026-08-20.** The object was never the problem, and the fix previously
+> proposed here — *"rebuild the BPF object against the aya version in use"* — was
+> **wrong**. It was tested: a fresh rebuild with clang 19.1.7 fails identically,
+> and the original committed object works untouched once the real cause is fixed.
+> The `.o` in git is byte-identical to what it always was.
 >
-> This one is a genuine **defect**, not a missing feature: the product ships a
-> code path that fails on every boot and falls back silently apart from one WARN.
-> Whichever of the two fixes is chosen, the outcome must be that the log no
-> longer reports a failed load.
+> **Root cause: `include_bytes!` carries no alignment guarantee.** It expands to a
+> plain byte array, so the linker may place it at any address. aya parses the ELF
+> through the `object` crate, which reads the ELF64 header as a `Pod` requiring
+> 8-byte alignment; on an odd address it returns `Invalid ELF header size or
+> alignment`, which aya flattens into the opaque `error parsing ELF data`.
+>
+> Because the outcome is decided by the final link layout, the *same* object
+> parses in one binary and fails in another. That is why it looked like a
+> toolchain problem, and why it reproduced 100% of the time within any one build
+> while resisting every explanation about clang, BTF, capabilities and kernel
+> version. Demonstrated directly: with the identical `.o`, the aya-path test
+> binary failed to parse while a second test binary parsed it fine.
+>
+> **The fix** is a `#[repr(align(8))]` wrapper around the embedded bytes in
+> `crates/sentinel-ebpf/src/lib.rs`, so alignment is guaranteed regardless of
+> layout. The array length comes from the macro itself, so the two cannot drift.
+>
+> **Guard:** `crates/sentinel-ebpf/tests/xdp_object_parses.rs` asserts the
+> embedded bytes are 8-byte aligned *and* that aya parses them, failing only on a
+> parse error so it still runs unprivileged in CI (map creation needs CAP_BPF).
+> Negative-tested: reverting to a bare `include_bytes!` makes it fail and name its
+> own cause.
+>
+> **Note on blast radius, checked before enabling this.** `SENTINEL_XDP_ENABLE=1`
+> is already set in the shipped compose, so this fix turns a dead code path into a
+> live in-kernel drop on every deployment. XDP drops below the socket, so a
+> wrongly-banned address is far harder to diagnose than a userspace 403 — and on a
+> single-node install every client appears as the Docker gateway. That footgun is
+> already handled: `autoban_eligible` excludes private, loopback and link-local by
+> default, `is_shared_egress` excludes NAT/CGNAT ranges first regardless, and the
+> `SENTINEL_XDP_AUTOBAN_INCLUDE_PRIVATE` escape hatch is documented test-only and
+> is **not set anywhere in `deploy/`**. The BPF program itself fails open, passing
+> any packet it cannot parse and dropping only explicit blocklist hits.
+
+
 
 ### 3. The login page has a decoy SSO button
 
