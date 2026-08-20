@@ -235,6 +235,12 @@
 
     <tr class="grp"><td colspan="8">Core request inspection</td></tr>
     <tr>
+        <td>Unmodified ModSecurity/CRS rule compatibility</td>
+        <td class="c us-col"><span class="m m-p">◐</span></td>
+        <td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td>
+        <td class="why"><b>Measured 2026-08-20: 334 of 679 shipped SecRule directives load.</b> 38 are correctly excluded by paranoia-level gating; the remainder are dropped by the Rust importer — unsupported target tokens (656 warnings), <code>action:score</code> without a score field (436), <code>%{}</code> interpolation (56), and the <code>validateByteRange</code> / <code>validateUrlEncoding</code> operators. Detection still measures 99.09% app-TP because libinjection and the ML layer cover the same classes, but a ModSecurity-based competitor runs the ruleset unmodified and can say so. <b>Highest-value engineering item — see the fixes register</b></td>
+      </tr>
+      <tr>
       <td>OWASP CRS signature engine</td>
       <td class="c us-col"><span class="m m-y">●</span></td>
       <td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td><td class="c"><span class="m m-y">●</span></td>
@@ -352,7 +358,7 @@
       <td>Kernel-level L4 drop (eBPF / XDP)</td>
       <td class="c us-col"><span class="m m-p">◐</span></td>
       <td class="c"><span class="m m-n">✕</span></td><td class="c"><span class="m m-n">✕</span></td><td class="c"><span class="m m-n">✕</span></td><td class="c"><span class="m m-n">✕</span></td><td class="c"><span class="m m-n">✕</span></td>
-      <td class="why"><b>Only vendor with anything in this row.</b> Opt-in build feature; verified in-kernel on Linux 6.8 with in-kernel drop counters. Falls back to software mode if attach fails</td>
+      <td class="why"><b>Built, not currently attaching.</b> Re-verified 2026-08-20 on Linux 6.8.0-55 with CAP_BPF/CAP_NET_ADMIN granted and BTF present: the embedded BPF ELF fails to parse (<i>error parsing ELF data</i>) and every boot degrades to software mode. Graceful, but the kernel path is not in service</td>
     </tr>
     <tr>
       <td>L7 rate limiting</td>
@@ -563,7 +569,7 @@
   <div class="card">
     <div class="k">7,950<span style="font-size:9pt"> req/s</span></div>
     <div class="l">Clean pass-through, p99 15 ms</div>
-    <div class="s">Full CRS loaded. Baseline direct-to-origin on the same hardware is 16,917 req/s — the origin round-trip dominates.</div>
+    <div class="s">Measured with the ruleset as it actually loads (see CRS coverage in the matrix). Baseline direct-to-origin on the same hardware is 16,917 req/s — the origin round-trip dominates.</div>
   </div>
   <div class="card">
     <div class="k">100%</div>
@@ -629,15 +635,16 @@
       <li><b>Measured evasion resistance</b> — 99.09% app true-positive. Neither F5 nor HaltDOS publishes a comparable figure.</li>
       <li><b>Modern API security in one policy</b> — GraphQL, JWKS and gRPC together.</li>
       <li><b>Sandboxed WASM plugins</b> in any language, hot-swappable.</li>
-      <li><b>Kernel XDP offload</b> — the only vendor with anything in that row.</li>
       <li><b>India PII in DLP</b> — PAN and Aadhaar built in.</li>
       <li><b>Air-gapped single-tenant deployment</b> with data residency by construction.</li>
     </ul>
   </div>
   <div class="box bad">
     <h4>Where we trail — do not claim parity</h4>
+      <p style="font-size:8.5pt;margin:0 0 6px">Every item below, plus the operational defects behind them, is tracked with evidence in <code>FIXES-TO-BE-MADE.md</code> at the repository root.</p>
     <ul>
-      <li><b>No positive-security / entity-learning model.</b> This is F5's core differentiator and our API discovery is a toggle only.</li>
+      <li><b>Partial CRS rule compatibility.</b> About half the shipped ruleset loads; ModSecurity-based products (BunkerWeb, and anything on libmodsecurity) run it whole. Our detection score is higher than theirs, but the coverage claim is not ours to make yet.</li>
+        <li><b>No positive-security / entity-learning model.</b> This is F5's core differentiator and our API discovery is a toggle only.</li>
       <li><b>5 response actions vs HaltDOS's 13</b> — no tarpit, custom response or redirect.</li>
       <li><b>Fewer authorable rule categories</b> than HaltDOS.</li>
       <li><b>Rule authoring UI withheld</b> — the validator does not parse our real grammar yet.</li>
