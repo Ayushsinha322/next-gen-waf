@@ -118,14 +118,21 @@ If your site has no egress, either:
 
 ## After installing
 
-The installer prints a one-time administrator password and how to reach the console.
+The installer prints the administrator password and how to reach the console.
 
-1. **Log in and change the password.** It is **not** in `/var/log/sentinel/install.log`
-   — the control plane prints it once, to its own container log. If you missed it:
+1. **Record the password. It cannot be changed.** This build ships no
+   password-change screen and no reset endpoint — `/api/v1/admin/users/:id`
+   accepts `role` and `status` only. This credential is the only way into the
+   console for the life of the installation.
+
+   The installer generates it into `/opt/sentinel/current/.env` (mode `0600`), so
+   unlike a container log it survives upgrades, rollbacks and recreates:
 
    ```bash
-   docker logs sentinel-controlplane-1 2>&1 | grep -A1 'GENERATED password'
+   sudo grep SENTINEL_BOOTSTRAP_ADMIN_PASSWORD /opt/sentinel/current/.env
    ```
+
+   Back that file up. Lose it without a backup and there is no way back in.
 
 2. **The console is loopback-only, on purpose.** `https://<host>:9443` will not
    connect from your workstation. Tunnel to it:

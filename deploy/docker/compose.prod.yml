@@ -27,6 +27,23 @@ name: sentinel
 # The values come from the environment so an ordinary `docker compose build`
 # still works with no setup — it just stamps "unknown", which deploy/fleet/fleet.sh
 # refuses to ship. See the header of deploy/docker/Dockerfile for why this exists.
+# THIRD-PARTY IMAGE PREFIX
+#
+# Empty by default, which means these come from Docker Hub exactly as before.
+# Set it and they come from a mirror instead:
+#
+#     SENTINEL_THIRDPARTY_PREFIX=hub.enlight.dev/swaraj-kavach/
+#
+# The trailing slash is part of the value. That exists so a registry-mode install
+# needs ONE reachable host rather than two: an ESDS management-network VM can
+# reach hub.enlight.dev (172.16.23.2) but usually cannot reach Docker Hub, and
+# without this the four product images would pull from the mirror while Postgres,
+# Redis, ClickHouse, Prometheus and Grafana still tried the internet and hung.
+#
+# Harbor repository names may contain slashes (observed on this Harbor:
+# base-images/anilrevgade/centos-apache-php), so clickhouse/clickhouse-server
+# prefixes correctly without renaming.
+
 x-build-provenance: &build-provenance
   GIT_SHA: ${SENTINEL_GIT_SHA:-unknown}
   BUILD_DATE: ${SENTINEL_BUILD_DATE:-unknown}
@@ -34,7 +51,7 @@ x-build-provenance: &build-provenance
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: ${SENTINEL_THIRDPARTY_PREFIX:-}postgres:16-alpine
     restart: unless-stopped
     # TLS is served, not optional. Without these flags the server offers no TLS at
     # all, so every client DSN had to say sslmode=disable and all database traffic —
@@ -83,7 +100,7 @@ services:
     networks: [sentinel]
 
   redis:
-    image: redis:7-alpine
+    image: ${SENTINEL_THIRDPARTY_PREFIX:-}redis:7-alpine
     restart: unless-stopped
     command: ["redis-server", "--save", "", "--appendonly", "no"]
     healthcheck:
@@ -98,7 +115,7 @@ services:
   # Search" (/events) page. Internal-only — no host port is published; both
   # planes reach it over the docker network at clickhouse:8123.
   clickhouse:
-    image: clickhouse/clickhouse-server:24-alpine
+    image: ${SENTINEL_THIRDPARTY_PREFIX:-}clickhouse/clickhouse-server:24-alpine
     restart: unless-stopped
     # 1536m is NOT enough: at that limit ClickHouse's own internal-table merges
     # (system.text_log) get OOM-killed during startup, and the container
@@ -194,6 +211,14 @@ services:
       SENTINEL_CLICKHOUSE_USER: ${CLICKHOUSE_USER}
       SENTINEL_CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
       SENTINEL_JWT_SECRET: ${SENTINEL_JWT_SECRET}
+      # Initial console password, read by seed.go on first boot only (the INSERT
+      # is ON CONFLICT DO NOTHING, so later boots never re-apply it). Unset, the
+      # seeder invents a random password and prints it to this container's stderr
+      # once — which dies with the container, and there is no password-change
+      # endpoint to recover through. install.sh generates this into its .env so
+      # the credential outlives any recreate. Empty default keeps the file
+      # parseable for anyone running compose by hand.
+      SENTINEL_BOOTSTRAP_ADMIN_PASSWORD: ${SENTINEL_BOOTSTRAP_ADMIN_PASSWORD:-}
       # Required by the audit-HMAC fail-fast; keep it out of the committed YAML.
       SENTINEL_AUDIT_HMAC_KEY: ${SENTINEL_AUDIT_HMAC_KEY}
       # SINGLE-TENANT DEMO POSTURE. This stack connects as the Postgres superuser
@@ -467,87 +492,28 @@ services:
     mem_limit: 768m
     networks: [sentinel]
 
-  # PUBLIC-EDGE PRACTICE ORIGIN — a real, benign application to put behind the
-  # WAF on a publicly reachable address. See deploy/practice-public-site/.
+  # PUBLIC-EDGE PRACTICE ORIGIN (ghost, ghost-db) LIVES IN compose.ghost.yml.
   #
-  # Ghost, not Juice Shop, and the difference is the whole point: this box sits on
-  # 172.16.21.0/24, and site matching is by Host header alone (site_matches() in
-  # crates/sentinel-proxy/src/lib.rs:4787), so a public address forwarded to this
-  # host makes EVERY site on it reachable by whoever guesses the Host. A
-  # deliberately vulnerable origin then becomes an internal-network foothold that
-  # the WAF is the only thing standing in front of — and the WAF's real-traffic
-  # error rate is precisely the unknown we are trying to measure, so it cannot
-  # also be the assumption. Run pre-exposure-audit.sh before any NAT rule opens.
+  # It used to live here behind `profiles: [ghost]`, and that was not enough.
+  # Compose interpolates every variable in a file BEFORE filtering by profile,
+  # so the `${GHOST_DB_PASSWORD:?...}` guards fired on EVERY command against
+  # this file — including a customer `docker compose up` with no interest in a
+  # blog. install.sh generates seven secrets and none of them are GHOST_*, so a
+  # fresh install aborted at the final step with "required variable
+  # GHOST_DB_PASSWORD is missing a value", after images were loaded and
+  # /opt/sentinel written. Profiles gate what STARTS, not what is PARSED.
   #
-  # Ghost earns its place as a measurement target: admin logins, rich-text POST
-  # bodies, image uploads, member signups and a JSON admin API are where false
-  # positives actually live. A static page exercises none of it.
+  # This file must stay parseable with a completely empty environment. That is
+  # enforced by deploy/ci/check-compose-parses-clean.sh, not by good intentions.
   #
-  #   practice :  docker compose --profile ghost ... up -d
-  #   customer :  docker compose ... up -d          (neither service starts)
-  #
-  # Upstream for the site is `ghost:2368`. As with juiceshop above, a site
-  # pointing there returns 502 unless this profile is passed.
-  ghost:
-    profiles: [ghost]
-    # Pin to a digest before exposing it publicly: this is an internet-facing app
-    # and `5-alpine` moves under you, so a redeploy can change what is exposed
-    # without a config change. `docker image inspect ghost:5-alpine -f
-    # '{{index .RepoDigests 0}}'` and paste the result here.
-    image: ghost:5-alpine
-    restart: unless-stopped
-    mem_limit: 512m
-    environment:
-      # Ghost builds every absolute URL — canonical links, redirects, asset paths,
-      # password-reset mails — from this one value, and it must be the PUBLIC
-      # https URL, not the container or the origin address. Wrong here does not
-      # fail loudly: the site renders, then styles 404 or logins bounce in a
-      # redirect loop, because Ghost sends the browser somewhere it cannot reach.
-      url: ${GHOST_PUBLIC_URL:?set GHOST_PUBLIC_URL in deploy/docker/.env, e.g. https://esdswaf-demo.duckdns.org}
-      database__client: mysql
-      database__connection__host: ghost-db
-      database__connection__user: ghost
-      database__connection__password: ${GHOST_DB_PASSWORD:?set GHOST_DB_PASSWORD in deploy/docker/.env}
-      database__connection__database: ghost
-      NODE_ENV: production
-    volumes:
-      - ghostdata:/var/lib/ghost/content
-    # No `ports:`. The WAF is the only public listener on this host; publishing
-    # 2368 would let a client reach the origin directly and bypass inspection
-    # entirely, which would also make any FPR number measured here meaningless.
-    networks: [sentinel]
-    depends_on:
-      ghost-db:
-        condition: service_healthy
-
-  ghost-db:
-    profiles: [ghost]
-    image: mysql:8.4
-    restart: unless-stopped
-    mem_limit: 512m
-    environment:
-      MYSQL_ROOT_PASSWORD: ${GHOST_DB_ROOT_PASSWORD:?set GHOST_DB_ROOT_PASSWORD in deploy/docker/.env}
-      MYSQL_DATABASE: ghost
-      MYSQL_USER: ghost
-      MYSQL_PASSWORD: ${GHOST_DB_PASSWORD:?set GHOST_DB_PASSWORD in deploy/docker/.env}
-    # Ghost's migrations run at boot and fail hard against a MySQL that is still
-    # initialising, leaving a half-migrated schema. depends_on alone waits for the
-    # container, not for the server, so the healthcheck is what makes it correct.
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p$$MYSQL_ROOT_PASSWORD"]
-      interval: 5s
-      timeout: 5s
-      retries: 20
-      start_period: 30s
-    volumes:
-      - ghostdbdata:/var/lib/mysql
-    networks: [sentinel]
+  #   practice :  docker compose -f compose.prod.yml -f compose.ghost.yml \
+  #                              --profile ghost up -d ghost-db ghost
 
   # Metrics stack. Prometheus scrapes the control plane's /metrics (real
   # aggregated WAF metrics); Grafana ships a provisioned datasource + the
   # "Sentinel WAF — Overview" dashboard. Grafana UI on host :3001.
   prometheus:
-    image: prom/prometheus:v2.54.1
+    image: ${SENTINEL_THIRDPARTY_PREFIX:-}prom/prometheus:v2.54.1
     restart: unless-stopped
     command:
       - --config.file=/etc/prometheus/prometheus.yml
@@ -565,7 +531,7 @@ services:
     networks: [sentinel]
 
   grafana:
-    image: grafana/grafana:11.2.0
+    image: ${SENTINEL_THIRDPARTY_PREFIX:-}grafana/grafana:11.2.0
     restart: unless-stopped
     environment:
       # Required, with no fallback. This used to default to literal "admin",
@@ -600,10 +566,9 @@ volumes:
   sentinel-state:
   promdata:
   grafanadata:
-  # Practice-origin state (`ghost` profile). Separate volumes so tearing the
-  # practice site down never touches WAF data.
-  ghostdata:
-  ghostdbdata:
+  # ghostdata / ghostdbdata are declared in compose.ghost.yml, alongside the
+  # services that use them. Separate volumes so tearing the practice site down
+  # never touches WAF data.
 
 networks:
   sentinel:

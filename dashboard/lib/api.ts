@@ -829,7 +829,12 @@ export const api = {
   admin: {
     users: {
       list:   () => apiFetch<{ users: UserRow[]; tenant_id: string }>("/admin/users"),
-      create: (body: { email: string; name: string; role: string }) =>
+      // `password` is REQUIRED by the API — handleCreateUserReal binds it with
+      // `binding:"required,min=12"`. It was missing from this signature, so every
+      // "Invite User" request was rejected 400 before it reached the database.
+      // Nothing sends mail in this product; creating a user means setting their
+      // password here and telling them out of band.
+      create: (body: { email: string; name: string; role: string; password: string }) =>
         apiFetch<{ user: UserRow; message: string }>("/admin/users", { method: "POST", body: JSON.stringify(body) }),
     },
     apikeys: {

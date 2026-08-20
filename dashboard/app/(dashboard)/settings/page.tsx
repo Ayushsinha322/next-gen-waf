@@ -338,6 +338,7 @@ function UsersTab() {
   const [invEmail, setInvEmail] = useState("");
   const [invName, setInvName]   = useState("");
   const [invRole, setInvRole]   = useState("viewer");
+  const [invPass, setInvPass]   = useState("");
   const [inviting, setInviting] = useState(false);
 
   useEffect(() => {
@@ -347,15 +348,29 @@ function UsersTab() {
       .finally(() => setLoading(false));
   }, []);
 
+  // Creates a user directly. Nothing in this product sends email, so there is no
+  // invitation to accept — the password is set here and communicated out of band.
+  //
+  // This used to POST {email,name,role} with no password. The API binds password
+  // as `required,min=12`, so every attempt was rejected 400 and the catch below
+  // reported a flat "Failed to invite user", hiding the reason. Creating a second
+  // administrator was therefore impossible, which matters more than it looks:
+  // there is no password-change or reset endpoint either, so the seeded admin is
+  // the only account, and a second admin is the only redundancy available.
   async function invite() {
     if (!invEmail.trim()) { showToast("Email required","w","⚠️"); return; }
+    if (invPass.length < 12) { showToast("Password must be at least 12 characters","w","⚠️"); return; }
     setInviting(true);
     try {
-      const res = await api.admin.users.create({ email:invEmail, name:invName, role:invRole });
+      const res = await api.admin.users.create({ email:invEmail, name:invName, role:invRole, password:invPass });
       setUsers(prev => [res.user, ...prev]);
-      setShowInvite(false); setInvEmail(""); setInvName("");
-      showToast(res.message,"s","📧");
-    } catch { showToast("Failed to invite user","e","⚠️"); }
+      setShowInvite(false); setInvEmail(""); setInvName(""); setInvPass("");
+      showToast(res.message ?? "User created","s","✅");
+    } catch (e) {
+      // Surface what the API actually said. A generic message here is what let a
+      // permanently-failing form look like an intermittent glitch.
+      showToast(e instanceof Error ? e.message : "Failed to create user","e","⚠️");
+    }
     finally { setInviting(false); }
   }
 
@@ -378,23 +393,33 @@ function UsersTab() {
       <div className="ph">
         <div className="ptitle">👥 Team Members</div>
         <motion.button className="btn bp btn-sm" onClick={() => setShowInvite(s=>!s)} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
-          {showInvite ? "✕ Cancel" : "＋ Invite User"}
+          {showInvite ? "✕ Cancel" : "＋ Add User"}
         </motion.button>
       </div>
       {showInvite && (
         <div className="pb" style={{ borderBottom:"1px solid rgba(255,255,255,.06)", paddingBottom:14 }}>
-          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:12 }}>
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr 1fr", gap:12 }}>
             <div className="fg2"><label className="flbl2">Email *</label>
               <input className="fin2" placeholder="user@company.com" value={invEmail} onChange={e=>setInvEmail(e.target.value)} type="email" /></div>
             <div className="fg2"><label className="flbl2">Full Name</label>
               <input className="fin2" placeholder="Jane Smith" value={invName} onChange={e=>setInvName(e.target.value)} /></div>
+            <div className="fg2"><label className="flbl2">Password *</label>
+              <input className="fin2" placeholder="min 12 characters" value={invPass} onChange={e=>setInvPass(e.target.value)} type="password" autoComplete="new-password" /></div>
             <div className="fg2"><label className="flbl2">Role</label>
               <select className="fin2 fsel2" value={invRole} onChange={e=>setInvRole(e.target.value)}>
                 <option value="viewer">Viewer</option><option value="editor">Editor</option><option value="admin">Admin</option>
               </select></div>
           </div>
+          {/* No mail is sent anywhere in this product, and the password cannot be
+              changed afterwards — there is no reset endpoint — so the operator has
+              to be told both facts at the point of use rather than discovering
+              them later. */}
+          <div style={{marginTop:8, fontSize:12, color:"var(--text3)"}}>
+            No email is sent. Give the user these credentials directly — passwords
+            cannot be changed after the account is created.
+          </div>
           <motion.button className="btn bp btn-sm" style={{marginTop:10}} onClick={invite} disabled={inviting} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
-            {inviting ? "Sending…" : "📧 Send Invite"}
+            {inviting ? "Creating…" : "✅ Create User"}
           </motion.button>
         </div>
       )}

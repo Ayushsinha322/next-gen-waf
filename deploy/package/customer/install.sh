@@ -168,6 +168,28 @@ BUNDLE_VERSION="$(manifest_str version)"
   || die "could not read the version from bundle/manifest.json — the package is malformed.
     Re-download it; do not attempt to install this copy."
 ok "package: Next-Gen ESDSWAF v$BUNDLE_VERSION"
+# Where the container images come from. "registry" ships none and pulls them;
+# anything else (or an unreadable key, which is every bundle built before this
+# existed) means they are inside bundle/images.tar.gz.
+#
+# Taken from the NAMED manifest field rather than inferred from whether
+# images.tar.gz exists: a truncated download would otherwise look exactly like a
+# registry bundle and skip loading images it was supposed to contain.
+IMAGE_SOURCE="$(manifest_str image_source)"
+[[ "$IMAGE_SOURCE" == "registry" ]] || IMAGE_SOURCE=bundled
+if [[ "$IMAGE_SOURCE" == "registry" ]]; then
+  REGISTRY_PREFIX="$(manifest_str registry_prefix)"
+  THIRDPARTY_PREFIX="$(manifest_str thirdparty_prefix)"
+  [[ -n "$REGISTRY_PREFIX" ]] \
+    || die "this package says image_source=registry but names no registry_prefix.
+    bundle/manifest.json is malformed — ask ESDS for a rebuilt package."
+  ok "images come from $REGISTRY_PREFIX (nothing to load)"
+else
+  [[ -s "$HERE/bundle/images.tar.gz" ]] \
+    || die "bundle/images.tar.gz is missing or empty, and this package does not
+    say image_source=registry. The download is incomplete — verify the checksum
+    and download it again."
+fi
 
 [[ -f "$HERE/SHA256SUMS" ]] || die "SHA256SUMS missing — cannot verify package integrity"
 say "  verifying every shipped file against SHA256SUMS…"
@@ -321,7 +343,31 @@ manifest_list() { # manifest_list KEY — the quoted strings of a top-level arra
 # bundle we do not have turns a clear preflight abort into a failure partway
 # through `up`, which is much harder to diagnose.
 NEEDS_NET="$(manifest_bool requires_internet)"
-if [[ "$NEEDS_NET" != "false" ]]; then
+if [[ "$IMAGE_SOURCE" == "registry" ]]; then
+  # Registry mode needs ONE host, and it is not Docker Hub. Probing Docker Hub
+  # here would pass on a VM that cannot reach Harbor at all, and the install would
+  # then die during `compose pull` with the host already modified.
+  REG_HOST="${REGISTRY_PREFIX%%/*}"
+  if timeout 15 docker pull "$REGISTRY_PREFIX/migrate:$BUNDLE_VERSION" >/dev/null 2>&1; then
+    ok "registry reachable — all ten images will be pulled from $REG_HOST"
+    docker image rm "$REGISTRY_PREFIX/migrate:$BUNDLE_VERSION" >/dev/null 2>&1 || true
+  else
+    die "cannot pull from $REG_HOST, and this package contains no images.
+
+    Tried:  docker pull $REGISTRY_PREFIX/migrate:$BUNDLE_VERSION
+
+    Check in this order:
+      1. does the name resolve?      getent hosts $REG_HOST
+      2. is TCP 443 open to it?      curl -sS -o /dev/null -w '%{http_code}\\n' https://$REG_HOST/v2/
+         401 is the correct answer here. A TIMEOUT means a firewall is dropping
+         it, which is a network request to make, not something to retry.
+      3. is the image tag published?  it must exist at version $BUNDLE_VERSION
+
+    If this host cannot reach the registry at all, ask ESDS for the air-gapped
+    bundle (ESDSWAF-v${BUNDLE_VERSION}-offline.tar.gz), which contains all ten
+    images and needs no network."
+  fi
+elif [[ "$NEEDS_NET" != "false" ]]; then
   PULL_COUNT="$(manifest_list pulled_from_registry | wc -l)"
   if timeout 12 docker pull hello-world >/dev/null 2>&1; then
     ok "Docker registry reachable (${PULL_COUNT:-5} third-party images will be pulled)"
@@ -417,17 +463,30 @@ ok "hostname: $WAF_HOSTNAME"
 ok "admin:    $ADMIN_EMAIL"
 
 # ── Step 6 — load images ─────────────────────────────────────────────────────
-step "Step 6 of 10 — loading images"
-say "  ${DIM}pre-built: no compilation, about a minute${R}"
+step "Step 6 of 10 — obtaining images"
 # First mutation of the host. Everything above this line is a check.
 CHANGED=yes
-docker load -i "$HERE/bundle/images.tar.gz" >>"$LOG" 2>&1 \
-  || die "docker load failed — see $LOG"
-for svc in dataplane controlplane dashboard migrate; do
-  docker image inspect "sentinel/${svc}:${BUNDLE_VERSION}" >/dev/null 2>&1 \
-    || die "image sentinel/${svc}:${BUNDLE_VERSION} missing after load — package is incomplete"
-done
-ok "four images loaded at version $BUNDLE_VERSION"
+if [[ "$IMAGE_SOURCE" == "registry" ]]; then
+  say "  ${DIM}pulling from $REGISTRY_PREFIX — nothing was shipped in this package${R}"
+  # Pulled by explicit name here rather than via `compose pull`, because compose
+  # needs the generated .env (written in Step 7) to interpolate the prefix, and a
+  # failure at this point should name the image that could not be fetched.
+  for svc in dataplane controlplane dashboard migrate; do
+    docker pull "$REGISTRY_PREFIX/${svc}:${BUNDLE_VERSION}" >>"$LOG" 2>&1 \
+      || die "could not pull $REGISTRY_PREFIX/${svc}:${BUNDLE_VERSION} — see $LOG"
+    say "    ${DIM}pulled ${svc}${R}"
+  done
+  ok "four images pulled at version $BUNDLE_VERSION"
+else
+  say "  ${DIM}pre-built: no compilation, about a minute${R}"
+  docker load -i "$HERE/bundle/images.tar.gz" >>"$LOG" 2>&1 \
+    || die "docker load failed — see $LOG"
+  for svc in dataplane controlplane dashboard migrate; do
+    docker image inspect "sentinel/${svc}:${BUNDLE_VERSION}" >/dev/null 2>&1 \
+      || die "image sentinel/${svc}:${BUNDLE_VERSION} missing after load — package is incomplete"
+  done
+  ok "four images loaded at version $BUNDLE_VERSION"
+fi
 
 # ── Step 7 — install tree and secrets ────────────────────────────────────────
 step "Step 7 of 10 — configuration and secrets"
@@ -455,7 +514,12 @@ else
 # Generated by the ESDSWAF installer on $(date -u +%Y-%m-%dT%H:%M:%SZ)
 # Contains every secret for this deployment. Back it up; never share it.
 SENTINEL_VERSION=$BUNDLE_VERSION
-SENTINEL_IMAGE_PREFIX=sentinel
+SENTINEL_IMAGE_PREFIX=${REGISTRY_PREFIX:-sentinel}
+# Where Postgres/Redis/ClickHouse/Prometheus/Grafana/HAProxy come from. Empty means
+# Docker Hub. In registry mode it is set so the whole deployment pulls from one
+# host — otherwise our four images would come from the mirror while the other six
+# still reached for the internet and hung on a closed network.
+SENTINEL_THIRDPARTY_PREFIX=${THIRDPARTY_PREFIX:-}
 
 POSTGRES_USER=sentinel
 POSTGRES_DB=sentinel
@@ -471,6 +535,19 @@ SENTINEL_JWT_SECRET=$(gen)
 SENTINEL_AUDIT_HMAC_KEY=$(gen)
 SENTINEL_INTERNAL_SECRET=$(gen)
 SENTINEL_ALLOW_SUPERUSER_DB=1
+
+# The initial console password. seed.go honours this; left unset it invents a
+# random one and prints it to the control plane's STDERR exactly once.
+#
+# That default is a lockout waiting to happen, and this file is the fix. There
+# is NO password-change endpoint in the product — /api/v1/admin/users/:id
+# accepts role and status only — so this single credential is the only way into
+# the console, permanently. Sourced from a container log it dies with the
+# container: any upgrade, rollback, or `docker compose up --force-recreate`
+# destroys the one copy and locks the operator out of their own WAF with no
+# recovery path. Generating it here puts it in the same 0600 file as every
+# other secret, the one the installer already tells you to back up.
+SENTINEL_BOOTSTRAP_ADMIN_PASSWORD=$(gen)
 GRAFANA_ADMIN_PASSWORD=$(openssl rand -base64 24 | tr -d '\n/+=' | cut -c1-24)
 
 SENTINEL_CLICKHOUSE_EVENT_RETENTION_DAYS=90
@@ -547,23 +624,46 @@ health_fail=0
 hc "Postgres"      docker exec sentinel-postgres-1 pg_isready -U sentinel -d sentinel || health_fail=1
 hc "Redis"         docker exec sentinel-redis-1 redis-cli ping                        || health_fail=1
 hc "ClickHouse"    bash -c "docker exec sentinel-clickhouse-1 wget -qO- http://127.0.0.1:8123/ping | grep -q Ok" || health_fail=1
-# These two replace `docker exec ... /controllerd --version || true`, which could
-# not fail for two separate reasons: `--version` only proved the BINARY was in the
+# These replace `docker exec ... /controllerd --version || true`, which could not
+# fail for two separate reasons: `--version` only proved the BINARY was in the
 # image (true even for a container crash-looping on a bad DSN), and the `|| true`
 # discarded the verdict anyway. The installer could therefore report a successful
 # install with no working control plane — i.e. no console, which is the whole
 # management interface.
-hc "Control plane" bash -c 'test "$(docker inspect -f "{{.State.Status}}" sentinel-controlplane-1 2>/dev/null)" = running' || health_fail=1
+#
+# `State.Status = running` was the next attempt and is still not enough. When the
+# control plane cannot reach Postgres it does not exit: it logs one WARN ("DB
+# unavailable — running in degraded mode") and serves forever with a nil store.
+# The container reports `running` permanently, so this check passes on an install
+# whose every login returns 503. It also passes on a crash-looping container
+# caught in one of its brief running windows — compose sets `restart:
+# unless-stopped` and defines no healthcheck for this service.
+#
+# /readyz calls store.Ping and reports db ok|unavailable|unreachable. It is the
+# only endpoint that distinguishes the two. (/health is a hardcoded 200 that never
+# touches the database.) 9501 is unpublished and the image is distroless, so probe
+# it from a container that has a shell on the same network.
+hc "Control plane → DB" bash -c '
+  docker exec sentinel-clickhouse-1 wget -qO- --timeout=5 http://controlplane:9501/readyz 2>/dev/null \
+    | grep -q "\"db\"[[:space:]]*:[[:space:]]*\"ok\""' || health_fail=1
 hc "Data plane"    bash -c "curl -fsS --max-time 3 http://127.0.0.1:80/healthz >/dev/null" || health_fail=1
 # :443 was never probed by any check, which is how a default certificate issued for
 # the wrong network shipped unnoticed. No -f here on purpose: with no sites yet the
 # WAF correctly answers 502, and a 502 still proves the TLS handshake completed and
 # a certificate was served. Only a handshake or connection failure fails this.
 hc "TLS on :443"   bash -c 'curl -sk --max-time 5 -o /dev/null https://127.0.0.1:443/' || health_fail=1
-# End-to-end: the management listener answering proves the data plane's console
-# is up AND proxying to the control plane. It is the first thing the operator will
-# touch, so failing here now beats them discovering it themselves.
-hc "Console :9443" bash -c 'curl -sk --max-time 5 -o /dev/null -w "%{http_code}" https://127.0.0.1:9443/ | grep -qE "^[234]"' || health_fail=1
+# End-to-end: the management listener answering. It is the first thing the
+# operator will touch, so failing here now beats them discovering it themselves.
+#
+# The path matters. `/` does NOT reach the control plane: the management listener
+# routes only /api/* there and everything else to the dashboard (see the `base`
+# selection in crates/sentinel-proxy/src/lib.rs), so `/` was answered by Next.js
+# redirecting to /login — a 307 that matched `^[234]` while proving nothing about
+# the control plane, contrary to what this comment used to claim. Probe an /api
+# path so the request actually traverses proxy → control plane. 401 is the
+# expected unauthenticated answer and is a pass; what is being tested is that
+# something on the far side spoke HTTP at all.
+hc "Console :9443" bash -c 'curl -sk --max-time 5 -o /dev/null -w "%{http_code}" https://127.0.0.1:9443/api/v1/sites | grep -qE "^[24]"' || health_fail=1
 
 # The generated password is the SECOND line of the seed banner emitted by
 # control-plane/internal/db/seed.go:
@@ -582,10 +682,25 @@ hc "Console :9443" bash -c 'curl -sk --max-time 5 -o /dev/null -w "%{http_code}"
 # "[sentinel]" onto the value), and REQUIRE the result to look like what seed.go
 # actually generates — 24 random bytes, hex-encoded. Anything else is treated as a
 # failed scrape so the fallback hint fires instead of printing garbage.
-ADMIN_PW=$(docker logs sentinel-controlplane-1 2>&1 \
-  | grep -A1 'GENERATED password' | tail -1 \
-  | sed -n 's/^\[sentinel\][[:space:]]*//p' | tr -d '[:space:]' || true)
-[[ "$ADMIN_PW" =~ ^[0-9a-f]{48}$ ]] || ADMIN_PW=""
+#
+# THE SCRAPE IS NOW THE FALLBACK, NOT THE SOURCE. Step 7 generates
+# SENTINEL_BOOTSTRAP_ADMIN_PASSWORD into $ENV_FILE and compose passes it to the
+# control plane, so the credential is known before the container ever starts and
+# survives every recreate. Reading it back from the file we just wrote is both
+# authoritative and immune to log rotation, log drivers that discard stderr, and
+# the container being restarted before this line runs.
+#
+# The log scrape is kept only for the --force path over an install predating
+# this change, where the .env has no bootstrap value and the log is genuinely
+# the only copy.
+ADMIN_PW=$(sed -n 's/^SENTINEL_BOOTSTRAP_ADMIN_PASSWORD=//p' "$ENV_FILE" 2>/dev/null | head -1)
+if [[ ! "$ADMIN_PW" =~ ^[0-9a-f]{64}$ ]]; then
+  ADMIN_PW=$(docker logs sentinel-controlplane-1 2>&1 \
+    | grep -A1 'GENERATED password' | tail -1 \
+    | sed -n 's/^\[sentinel\][[:space:]]*//p' | tr -d '[:space:]' || true)
+  # seed.go's generated form is 24 random bytes hex-encoded; ours is 32.
+  [[ "$ADMIN_PW" =~ ^[0-9a-f]{48}$ ]] || ADMIN_PW=""
+fi
 
 if [[ $health_fail -ne 0 ]]; then
   printf '\n  %s✗ Installation completed with FAILING health checks%s\n' "$RED" "$R"
@@ -605,9 +720,16 @@ cat <<FINAL
     Username       admin@sentinel.local
     Password       ${B}${ADMIN_PW:-NOT CAPTURED — recover it with the command below}${R}
 
-  ${YEL}Change this password at first login.${R}
-  ${DIM}It is NOT in $LOG. The control plane prints it once, to its container log:${R}
-    ${DIM}docker logs sentinel-controlplane-1 2>&1 | grep -A1 'GENERATED password'${R}
+  ${YEL}${B}WRITE THIS PASSWORD DOWN NOW. It cannot be changed later.${R}
+  ${YEL}This build has no password-change screen and no password-reset endpoint${R}
+  ${YEL}— /api/v1/admin/users/:id accepts role and status only. This credential${R}
+  ${YEL}is the only way into the console for the life of the installation.${R}
+
+  ${DIM}It is stored in $ENV_FILE (mode 0600) as${R}
+  ${DIM}SENTINEL_BOOTSTRAP_ADMIN_PASSWORD, so it survives container recreates and${R}
+  ${DIM}is included in a backup of that file. Recover it at any time with:${R}
+    ${DIM}sudo grep SENTINEL_BOOTSTRAP_ADMIN_PASSWORD $ENV_FILE${R}
+  ${DIM}Lose that file without a backup and there is no way back in.${R}
 
   ${B}Reaching the console${R}
 

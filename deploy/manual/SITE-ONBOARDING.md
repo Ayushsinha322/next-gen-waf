@@ -94,16 +94,25 @@ the tunnel is needed: [INSTALL-WALKTHROUGH.md](../vm-deploy/INSTALL-WALKTHROUGH.
 
 Go to **Sites → New Site**. A wizard opens.
 
-It has two modes. **Easy mode has 5 steps and is the right choice for almost
-every site:**
+It has two modes. **Easy mode has 5 steps:**
 
 ```
 Basics  →  Front Service  →  Reverse Proxy  →  Protection  →  Review
 ```
 
-Advanced mode has 11 steps and exposes API security, rate limiting, anti-bot,
-geo/IP filtering, custom headers and machine-learning tuning. Ignore it until you
-need something specific.
+Advanced mode has 11 steps and adds Request Limits, Proxy Options, API security,
+rate limiting, anti-bot, geo/IP filtering, custom headers and ML tuning.
+
+> ### Choose the mode from §1, before you start
+>
+> Easy mode is genuinely enough for a plain website on default limits. It is
+> **not** enough for most real applications, and the settings it omits are
+> exactly the ones that break them — body size, timeouts, URI and header limits,
+> allowed methods, WebSocket, health checks, origin SNI.
+>
+> **Use Advanced mode if any of §1 lines 4–8 is not the default.** Switching an
+> existing Easy-mode site is not offered; you would recreate it. Deciding once,
+> here, costs nothing.
 
 You will notice small tags on the settings:
 
@@ -132,13 +141,36 @@ They are there so you are never guessing which is which. Trust them.
 > during business hours.
 >
 > Learning mode inspects everything and records exactly what it *would* have
-> blocked — without blocking it. You get the full picture with none of the risk.
-> After a couple of weeks you will know, with numbers, whether blocking is safe.
-> §8 covers the switch.
+> blocked — without blocking it. After a couple of weeks you will know, with
+> numbers, whether blocking is safe. §8 covers the switch.
 >
 > Learning mode is **not** "protection off". Some defences still act — bad
 > scanners are still rejected. It is the *rule engine* that reports instead of
 > blocks.
+
+> ### ⚠️ Learning mode does NOT relax the four request limits
+>
+> This is the one place where "records instead of blocks" is not true, and it
+> bites during business hours on a site everyone believes is in a safe
+> observation period.
+>
+> Learning mode downgrades **rule, bot and rate-limit** verdicts to log-only.
+> The four *request limits* are checked earlier, before the rule engine runs,
+> and they reject outright in **every mode except Off**:
+>
+> | Limit | Rejects with | Typical real-user trigger |
+> |---|---|---|
+> | Max body size | **413** | a large file or image upload |
+> | Max URI length | **414** | a SAML/OIDC redirect carrying a long token |
+> | Max header count | **431** | a corporate SSO session with many cookies |
+> | Allowed methods | **405** | `PUT`/`PATCH`/`DELETE` from a REST or WebDAV client |
+>
+> **Size these four from §1 before the site takes real traffic** — not at the
+> §8 go-live gate. A 413 in week one of a Learning-mode pilot is a genuine
+> outage for that user, and it will not appear in the false-positive report,
+> because the request never reached the rule engine that report is built from.
+
+
 
 **Do not put a bare IP address in the Domains list** if you can avoid it. One of
 the standard rule sets flags every request whose host is a numeric IP, so every
@@ -149,27 +181,79 @@ see real problems. Use a DNS name.
 
 This is the **visitor-facing** side.
 
-| Setting | Recommended |
-|---|---|
-| **HTTPS** | On |
-| **Force HTTPS** | On — visitors on `http://` get redirected to `https://` |
-| **HTTP/2** | On |
-| **HTTP/3** | Off unless you specifically want it |
-| **TLS / certificate** | Leave as is for now — §5 handles certificates properly |
+> **These four switches record intent. They do not change traffic.** The whole
+> Front Service block is stored on the site record and is never sent to the data
+> plane — the control plane classifies `frontend` as deliberately stored-only,
+> because these are listener-level properties and the listeners are configured
+> once for the host, not per site. The wizard shows an amber note saying so; this
+> table used to contradict it.
+
+| Setting | Recommended | Effect |
+|---|---|---|
+| **HTTPS** | On | ◐ Recorded only. The host's `:443` listener already serves every site |
+| **Force HTTPS** | On | ◐ **Recorded only — there is no HTTP→HTTPS redirect today.** See the warning below |
+| **HTTP/2** | On | ◐ Recorded only. Negotiated by the listener for all sites |
+| **HTTP/3** | Off unless you specifically want it | ◐ Recorded only. Enabled host-wide, not per site |
+| **TLS / certificate** | Leave as is for now | §5 handles certificates properly — that part *is* per-site and does take effect |
+
+> ### ⚠️ "Force HTTPS" does not force HTTPS
+>
+> There is no per-site HTTP→HTTPS redirect in this build. With **Force HTTPS on**,
+> a visitor who types `http://your-site` is served the site **in full over
+> unencrypted HTTP on port 80** — and §6 tells the network team to NAT public
+> `:80` through to the WAF, so that path is open by default.
+>
+> If plain HTTP must not serve this site, the control is at the network edge, not
+> in this wizard: **ask the network team not to NAT public `:80`.** Note that
+> doing so also disables ACME `http-01` certificate issuance and renewal (§5), so
+> use DNS-01 or a manually supplied certificate instead.
+>
+> Do not record "HTTPS enforced" on the §9 handover sheet on the strength of this
+> toggle.
 
 ### Step 3 — Reverse Proxy (the backend)
 
 This is where you enter the **origin server** from §1.
 
+> ### ⚠️ Easy mode does not show most of this step
+>
+> In **Easy** mode the Reverse Proxy screen has exactly three controls:
+> **Application Host**, **Port**, and **Upstream uses HTTPS**. Health check path,
+> both timeouts, WebSocket, Host-header override and Origin SNI render only in
+> **Advanced**; and Max body size / Max URI length / Max header count / Allowed
+> methods are not on this screen at all — they live on the **Advanced → Request
+> Limits** step.
+>
+> **If §1 told you to change any of them, create the site in Advanced mode.**
+> There is no way to reach them later from an Easy-mode site without switching.
+>
+> | What you need | Easy mode | Where it actually is |
+> |---|---|---|
+> | Host, Port, origin HTTPS | ✅ on this screen | — |
+> | Health check path | ❌ | Advanced → Reverse Proxy |
+> | Read / connect timeout | ❌ | Advanced → Reverse Proxy → Proxy Options |
+> | WebSocket, Host override, Origin SNI | ❌ | Advanced → Reverse Proxy → Proxy Options |
+> | Max body / URI / headers, Allowed methods | ❌ | Advanced → Request Limits |
+> | Security template (Essential/Balanced/Strict) | on **Basics**, not here | Basics → Security Template |
+
 | Field | What to enter |
 |---|---|
 | **Host** | Origin IP or hostname — e.g. `10.20.30.40`. IP only, **no port here** |
 | **Port** | e.g. `443` or `8080` |
-| **TLS** | **On if the origin is HTTPS.** Off for plain HTTP |
-| **Health check path** | From §1 line 4, e.g. `/healthz` or `/` |
+| **TLS** | **On if the origin is HTTPS.** Off for plain HTTP — but see the origin-certificate limit below |
+| **Health check path** | From §1 line 4, e.g. `/healthz` or `/` — **Advanced mode only** |
 
-Then the settings that actually break applications. Defaults are fine for a
-normal website — change them only when §1 told you to:
+> **An HTTPS origin must present a publicly trusted certificate.** The upstream
+> connector verifies origin certificates against the public root store with no
+> override, so an origin using an internal-CA or self-signed certificate fails
+> the handshake on every request and returns **502 forever** — with every item on
+> the §2 troubleshooting checklist passing. There is no setting for this today.
+> Until there is, reach such an origin over plain **HTTP on a trusted network
+> segment** instead.
+
+Then the settings that actually break applications — **all of them Advanced
+mode**. Defaults are fine for a normal website; change them only when §1 told
+you to:
 
 | Setting | Default | Change it when |
 |---|---|---|

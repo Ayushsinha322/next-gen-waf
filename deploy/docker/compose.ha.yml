@@ -160,7 +160,7 @@ services:
       - waf3-state:/var/lib/sentinel/state
 
   lb:
-    image: haproxy:2.9-alpine
+    image: ${SENTINEL_THIRDPARTY_PREFIX:-}haproxy:2.9-alpine
     restart: unless-stopped
     depends_on: [waf1, waf2, waf3]
     volumes:
