@@ -3,7 +3,7 @@
 **Register of known defects and gaps in Next-Gen ESDSWAF.** Every entry states how
 it was found and what evidence supports it, so nothing here rests on an opinion.
 
-**Last verified:** 2026-08-20, against v1.0.2 running on `172.16.21.101`
+**Last verified:** 2026-08-20 (with a same-day progress update), against v1.0.2 running on `172.16.21.101`
 (registry-mode install, 20 h uptime, 8/8 containers, zero restarts).
 
 **Rule for this file:** an item leaves it when the fix is *verified*, not when the
@@ -16,34 +16,51 @@ correct, and never actually ran.
 
 ### 1. About half the OWASP CRS ruleset never loads
 
+> **PARTIALLY FIXED 2026-08-20 — 137 rules recovered** (commit `e412183`).
+> `REQUEST_COOKIES_NAMES`, `REQUEST_HEADERS_NAMES`, `ARGS_GET`, `ARGS_GET_NAMES`
+> and `QUERY_STRING` are implemented. Rules blocked by unsupported target tokens:
+> **149 → 12.** The operators and `%{}` interpolation remain.
+
 | | |
 |---|---|
-| **Evidence** | 679 SecRule directives ship; the engine reports `rules=334`. 1,264 import warnings on every boot |
-| **Where** | `crates/sentinel-rules/` — the CRS importer |
-| **Impact** | "We run OWASP CRS" does not survive someone reading the logs. ModSecurity-based competitors (BunkerWeb, anything on libmodsecurity) run it unmodified |
+| **Where** | `crates/sentinel-rules/src/crs_compat/importer.rs`, `compiler/vm.rs` |
+| **Impact** | "We run OWASP CRS" still needs qualifying until the remainder lands |
 
-The warnings, by cause:
+**Two corrections to the first version of this entry**, both overstatements of my
+own:
 
-```
-656x  CRS importer: unknown target token, skipping
-436x  rule has action:score but no score field
- 56x  pattern contains %{...} interpolation — rule disabled
- 36x  skipping rule — all targets unsupported
- 24x  unsupported operator 'validatebyterange' — rule disabled
- 12x  unsupported operator 'validateurlencoding' — rule disabled
-```
+1. It cited "1,264 import warnings" as if that were 1,264 lost rules. It is not —
+   the importer re-runs on every config reload, so the log count is inflated
+   roughly fourfold. **Static analysis of the shipped ruleset is the reliable
+   measure**, not warning counts.
+2. It counted *"rule has `action:score` but no score field"* (436 warnings) as lost
+   coverage. It is not: `compiler/analysis.rs` only warns, and the rule still loads
+   and compiles.
 
-38 of the shortfall are *correctly* excluded by paranoia-level gating. The rest are
-importer limitations.
+The real picture, measured statically:
 
-**Mitigating fact, which must not become an excuse:** measured detection is still
-99.09% app true-positive, because libinjection and the ML layer cover the same
-attack classes. The gap is in *coverage claims and novel-attack surface*, not in
-benchmarked detection.
+| Cause | Rules blocked | Status |
+|---|---|---|
+| Unsupported target tokens | 149 | **12 left** — fixed 2026-08-20 |
+| `%{...}` interpolation in the pattern | 27 | open |
+| `@pm` | 8 | open — cheap, phrase match |
+| `@validateByteRange` | 5 | open |
+| `@streq` | 3 | open — cheap, string equality |
+| `@validateUrlEncoding` | 3 | open |
+| `@validateUtf8Encoding` | 1 | open |
 
-**Fix:** implement the missing target tokens and the two operators; handle
-`action:score` without an explicit score; support `%{}` interpolation. Weeks of
-work, and the highest-value weeks available.
+**Next, in yield order:** `@pm` and `@streq` (11 rules, both straightforward),
+then `%{}` interpolation (27 rules — needs variable expansion at match time, so
+genuinely harder), then the six niche tokens (12 rules), then the three
+`validate*` operators (9 rules).
+
+**Regression guards added with the fix.** Switching on 129 rules that had never
+executed is exactly how a false-positive incident starts, so
+`tests/target_names_coverage.rs` asserts both directions: ordinary session cookies
+(`PHPSESSID`, `_ga`, `cookie_consent`, `csrftoken`, `lang`) score **zero**, and a
+genuine session-fixation attempt is still caught. A quiet ruleset is not a working
+one — without the second assertion the first could be satisfied by rules that match
+nothing, which is precisely the state these 129 were in.
 
 ### 2. Kernel XDP fails to load on every boot
 
@@ -65,19 +82,22 @@ honestly as userspace. Either is acceptable; shipping a failing load is not.
 
 ### 3. The login page has a decoy SSO button
 
-| | |
-|---|---|
-| **Evidence** | `dashboard/app/(auth)/login/page.tsx:385` — button reads "Sign in with SAML / LDAP", `onClick={doLogin}` |
-| **Impact** | Clicking it performs an ordinary password login. There is no SAML and no LDAP in the control plane |
+> **FIXED 2026-08-20** (commit `5b84adf`).
 
-Worse, the inverse is also true: **OIDC *is* implemented** — `/api/v1/auth/oidc/login`,
-`/oidc/callback`, real discovery in `control-plane/internal/auth/oidc.go` — and has
-no button at all.
+The button now starts an OIDC login, and renders **only when OIDC is actually
+configured** — gated on a new `GET /api/v1/auth/oidc/status`. `handleOIDCLogin`
+answers 501 when unconfigured, so an always-visible button would have been the same
+defect wearing a different label. The "or continue with" divider is gated on the
+same condition, since a divider with nothing after it is just a line.
 
-**Fix:** delete the SAML/LDAP button, add one for OIDC. An afternoon, and it
-removes a credibility landmine from every demo.
+The status endpoint is unauthenticated by necessity — the login page must ask
+before anyone has logged in — and returns only a boolean. Never the issuer, client
+id, secret or redirect URL: those would tell an unauthenticated caller which
+identity provider to attack.
 
----
+**Still to verify:** end-to-end against a running control plane. The deployment on
+`.101` predates the route, so this is checked as compiling and type-clean, not as
+observed working.
 
 ## P1 — Product defects that will reach a customer
 
