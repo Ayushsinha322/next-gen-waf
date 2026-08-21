@@ -94,9 +94,25 @@ rsync -az --delete \
   -e "ssh -i ~/.ssh/sentinel_deploy" \
   --exclude 'target/' --exclude '.git/' --exclude '**/node_modules/' \
   --exclude 'dashboard/.next/' --exclude '*.tsbuildinfo' --exclude '.sentinel-deploy/' \
+  --exclude 'deploy/docker/.env' \
   ./ root@172.16.21.71:/opt/sentinel-src/
 ```
-> `deploy/docker/.env` is NOT excluded — it must ship for compose interpolation.
+> **`deploy/docker/.env` MUST be excluded.** This line previously said the opposite
+> — "it must ship for compose interpolation" — which was true when the VM was first
+> built and became actively dangerous once the VM's env diverged from the repo's.
+>
+> Measured on 2026-08-21 before an update: shipping the local `.env` would have
+> **deleted three keys the VM has** — `GRAFANA_ADMIN_PASSWORD`,
+> `SENTINEL_CORS_ORIGINS` (which this very document says is *required* or the
+> dashboard log stream silently dies) and `SENTINEL_MGMT_BIND` — and **changed two
+> values**: `SENTINEL_AUDIT_HMAC_KEY`, which would invalidate the audit-log hash
+> chain, and `SENTINEL_DB_URL`, which can break database access outright.
+>
+> The VM's `.env` is the authoritative copy. It holds generated secrets and
+> deployment-specific settings that no repo checkout knows about. Compose reads it
+> from the VM via `--env-file .env`, so nothing needs to ship. Before any update,
+> diff the two by key and by value-hash rather than assuming they match; back the
+> file up first (`cp .env /root/pre-update-$(date +%F)/env.backup`).
 
 ### 5c. Build images on the VM (~10–20 min, Rust release is the long pole)
 ```bash
