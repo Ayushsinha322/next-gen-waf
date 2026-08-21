@@ -1269,10 +1269,17 @@ var crsCategoryFiles = map[string]string{
 	// detected nothing. That target — and regex capture, which two of the rules
 	// chain on — now exist, so all four import.
 	//
-	// Default-on with the other request families, unlike the response ones: these
-	// rules only run on multipart requests, and they CONTRIBUTE to the anomaly
-	// score rather than blocking outright, so a lone match is +5 against a
-	// threshold of 10 and cannot block on its own.
+	// Default-on with the other request families, but with one carve-out. 922120
+	// (deprecated Content-Transfer-Encoding) and 922130 (out-of-range bytes in a
+	// part header name) CONTRIBUTE +5 to the anomaly score, so neither can block
+	// on its own against a threshold of 10 — measured clean against ordinary
+	// uploads.
+	//
+	// 922110 is different and is DISABLED BY DEFAULT in defaultRuleExclusions: it
+	// carries `block` on its chain starter, so it hard-blocks a single match with
+	// no threshold to moderate it, and CRS's allowed-charset list holds only four
+	// entries. Measured: us-ascii, utf-16, shift_jis and euc-kr are all blocked
+	// outright. See the exclusion entry for the reasoning and how to enable it.
 	"multipart": "rules/owasp-crs/rules/REQUEST-922-MULTIPART-ATTACK.conf",
 
 	// RESPONSE-* families. The image has always shipped these files and the data
@@ -2008,6 +2015,49 @@ var defaultRuleExclusions = []struct {
 	}},
 	{920230, func() map[string]any {
 		return map[string]any{"rule_id": 920230, "disable": true}
+	}},
+	// 922110 — "Illegal MIME Multipart Header content-type: charset parameter".
+	//
+	// Disabled by default because it HARD-BLOCKS on a single match: `block` sits
+	// on the chain starter, so unlike its neighbours in 922 it does not add to the
+	// anomaly score and the site threshold cannot moderate it. CRS's allowed list
+	// is only utf-8, iso-8859-1, iso-8859-15 and windows-1252, and anything else
+	// in a part's Content-Type is refused.
+	//
+	// Measured against the shipped rule: us-ascii (an RFC-standard charset),
+	// utf-16, shift_jis and euc-kr are ALL blocked outright. Any customer serving
+	// Japanese or Korean content, or a client that spells out us-ascii, would have
+	// ordinary uploads rejected — and rejected hard, with no learning-mode score
+	// to warn first.
+	//
+	// The other two 922 rules stay active, so multipart part-header protection is
+	// still on by default; this drops only the charset POLICY check. An operator
+	// who wants it back adds an empty exclusion entry for 922110, which suppresses
+	// this default (see buildRustWaf).
+	{922110, func() map[string]any {
+		return map[string]any{"rule_id": 922110, "disable": true}
+	}},
+	// 922100 — "Multipart content type global _charset_ definition is not allowed".
+	//
+	// Disabled as a TRIPWIRE, not because it misbehaves today. It imports with
+	// action=Block and is currently inert: its chain starter sets
+	// tx.922100_charset, and the chained condition reads that var before the
+	// setvar has run, so the chained target has no values and the rule cannot
+	// match. Inert is why it has never caused trouble.
+	//
+	// The trap is what happens when someone implements per-chain-link setvar
+	// execution. The chained condition is
+	// `!@within %{tx.allowed_request_content_type_charset}`, and the importer maps
+	// @within to a literal word set — an unexpanded `%{...}` can never match, so
+	// NEGATED it is always true. The moment the chain starts working, this rule
+	// hard-blocks EVERY request carrying a `_charset_` form field, including a
+	// perfectly legitimate `_charset_=utf-8`.
+	//
+	// Enabling it therefore requires BOTH per-chain-link setvars and `%{}`
+	// interpolation in operator patterns. Whoever does the first will find this
+	// entry, which is the point.
+	{922100, func() map[string]any {
+		return map[string]any{"rule_id": 922100, "disable": true}
 	}},
 }
 

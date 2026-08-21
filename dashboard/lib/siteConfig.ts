@@ -302,7 +302,7 @@ export const CRS_REQUEST_CATEGORIES: CrsCategory[] = [
   { key: "method",          label: "Method Enforcement",  desc: "Allowed HTTP methods", core: true },
   { key: "scanner",         label: "Scanner Detection",   desc: "Block nikto, sqlmap, nmap, etc.", core: true },
   { key: "session",         label: "Session Fixation",    desc: "Session fixation protection" },
-  { key: "multipart",       label: "Multipart Attacks",   desc: "Malformed upload part headers, deprecated transfer encodings" },
+  { key: "multipart",       label: "Multipart Attacks",   desc: "Malformed upload part headers, deprecated transfer encodings. The stricter charset-policy rule (922110) ships disabled — it refuses us-ascii, utf-16, shift_jis and euc-kr" },
 ];
 
 /* Response-phase families — data-leakage and web-shell detection in the response

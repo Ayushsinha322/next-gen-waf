@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"sort"
@@ -158,5 +159,60 @@ func TestSelectedResponseFamilyIsDelivered(t *testing.T) {
 	}
 	if len(files) != 3 {
 		t.Errorf("expected exactly the 3 selected files, got %d: %v", len(files), files)
+	}
+}
+
+// 922110 must ship DISABLED. It is the one rule in the multipart family that
+// hard-blocks a single match — `block` on its chain starter, no anomaly-score
+// contribution — and CRS's allowed-charset list is only four entries wide.
+// Measured against the shipped rule, us-ascii, utf-16, shift_jis and euc-kr are
+// all refused outright, so leaving it enabled would reject ordinary uploads from
+// any customer serving Japanese or Korean content.
+//
+// The other two 922 rules stay active, so this test also guards against someone
+// "fixing" the false positive by disabling the whole multipart category.
+func TestMultipartCharsetPolicyRuleIsDisabledByDefault(t *testing.T) {
+	waf, err := buildRustWaf(json.RawMessage(`{"mode":"blocking"}`))
+	if err != nil {
+		t.Fatalf("buildRustWaf: %v", err)
+	}
+	ex, _ := waf["rule_exclusions"].([]map[string]any)
+	found := false
+	for _, e := range ex {
+		if ruleIDEquals(e["rule_id"], 922110) {
+			if dis, _ := e["disable"].(bool); dis {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Errorf("922110 must be disabled by default — it hard-blocks any part "+
+			"Content-Type charset outside CRS's four-entry allow list "+
+			"(us-ascii, utf-16, shift_jis, euc-kr all refused). Got %v", ex)
+	}
+
+	// 922100 is the same shape and is disabled as a tripwire: it is inert today
+	// only because its chained condition reads a TX var its starter has not set
+	// yet. Implement per-chain-link setvars without also implementing `%{}`
+	// interpolation and it hard-blocks every `_charset_` form field, because
+	// `!@within %{...}` on an unexpanded macro is always true.
+	found100 := false
+	for _, e := range ex {
+		if ruleIDEquals(e["rule_id"], 922100) {
+			if dis, _ := e["disable"].(bool); dis {
+				found100 = true
+			}
+		}
+	}
+	if !found100 {
+		t.Errorf("922100 must be disabled by default as a tripwire; got %v", ex)
+	}
+
+	// And the category itself must still be delivered, with its safe rules.
+	files := crsFilesForCategories(nil)
+	joined := strings.Join(files, " ")
+	if !strings.Contains(joined, "REQUEST-922-MULTIPART-ATTACK.conf") {
+		t.Errorf("the multipart family must still load by default (922120/922130 "+
+			"are score-contributing and measured clean); got %v", files)
 	}
 }

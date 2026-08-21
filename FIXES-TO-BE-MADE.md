@@ -332,6 +332,30 @@ observed working.
 > Guards: `crates/sentinel-rules/tests/multipart_and_files.rs` (+6 tests, real
 > CRS file, both polarities, FP guard). Negative-tested by disabling capture —
 > 922110 goes inert and the test names the cause.
+>
+> **Correction, caught by verifying on the VM rather than in tests.** I first
+> wired `multipart` default-on with the justification that these rules only
+> *contribute* to the anomaly score and so cannot block alone. That was wrong for
+> **922110**, which carries `block` on its chain starter and hard-blocks a single
+> match with no threshold to moderate it — and CRS's allowed-charset list holds
+> only four entries. Measured on the shipped rule: **us-ascii (RFC-standard),
+> utf-16, shift_jis and euc-kr are all refused outright.** Any customer serving
+> Japanese or Korean content would have had ordinary uploads rejected, hard, with
+> no learning-mode warning first.
+>
+> 922110 is now disabled by default via `defaultRuleExclusions`, and **922100 is
+> disabled as a tripwire**: it is inert today only because its chained condition
+> reads a TX var its starter has not set yet, but it also carries `block`, and its
+> condition is `!@within %{...}` on an unexpanded macro — always true. Whoever
+> implements per-chain-link setvars without also implementing `%{}` interpolation
+> would turn it into a hard block on every `_charset_` form field.
+>
+> Final posture, verified live on `.101`: both hard-blocking rules off, both
+> score-contributing rules on. us-ascii/utf-16/shift_jis/euc-kr → **302**;
+> Content-Transfer-Encoding → 302 but recorded (score 5, rule 922120); bare-LF
+> header smuggling → 302 but recorded (score 5, rule 922130); the two together →
+> **403** at score 10. Exactly the "two correlated signals, not one weak
+> heuristic" design the threshold of 10 exists for.
 
 #### Superseded description
 
