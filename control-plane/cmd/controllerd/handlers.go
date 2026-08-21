@@ -2018,46 +2018,24 @@ var defaultRuleExclusions = []struct {
 	}},
 	// 922110 — "Illegal MIME Multipart Header content-type: charset parameter".
 	//
-	// Disabled by default because it HARD-BLOCKS on a single match: `block` sits
-	// on the chain starter, so unlike its neighbours in 922 it does not add to the
-	// anomaly score and the site threshold cannot moderate it. CRS's allowed list
-	// is only utf-8, iso-8859-1, iso-8859-15 and windows-1252, and anything else
-	// in a part's Content-Type is refused.
+	// It no longer HARD-blocks: chained rules now inherit their inner link's
+	// anomaly-score contribution, so this is a +5 like its neighbours rather than
+	// an unconditional refusal. It stays disabled for the reason that survives
+	// that fix — CRS's allowed list holds only utf-8, iso-8859-1, iso-8859-15 and
+	// windows-1252, and everything else in a part's Content-Type scores.
 	//
 	// Measured against the shipped rule: us-ascii (an RFC-standard charset),
-	// utf-16, shift_jis and euc-kr are ALL blocked outright. Any customer serving
-	// Japanese or Korean content, or a client that spells out us-ascii, would have
-	// ordinary uploads rejected — and rejected hard, with no learning-mode score
-	// to warn first.
+	// utf-16, shift_jis and euc-kr all match. A customer serving Japanese or
+	// Korean content would therefore carry a standing +5 on every upload, needing
+	// only one more weak signal to cross a threshold of 10 — a half-blocked site
+	// that looks intermittent rather than misconfigured.
 	//
-	// The other two 922 rules stay active, so multipart part-header protection is
-	// still on by default; this drops only the charset POLICY check. An operator
-	// who wants it back adds an empty exclusion entry for 922110, which suppresses
-	// this default (see buildRustWaf).
+	// This is a charset POLICY check, not an attack signature. The other two 922
+	// rules stay active, so multipart part-header protection is still on by
+	// default. An operator who wants the policy adds an empty exclusion entry for
+	// 922110, which suppresses this default (see buildRustWaf).
 	{922110, func() map[string]any {
 		return map[string]any{"rule_id": 922110, "disable": true}
-	}},
-	// 922100 — "Multipart content type global _charset_ definition is not allowed".
-	//
-	// Disabled as a TRIPWIRE, not because it misbehaves today. It imports with
-	// action=Block and is currently inert: its chain starter sets
-	// tx.922100_charset, and the chained condition reads that var before the
-	// setvar has run, so the chained target has no values and the rule cannot
-	// match. Inert is why it has never caused trouble.
-	//
-	// The trap is what happens when someone implements per-chain-link setvar
-	// execution. The chained condition is
-	// `!@within %{tx.allowed_request_content_type_charset}`, and the importer maps
-	// @within to a literal word set — an unexpanded `%{...}` can never match, so
-	// NEGATED it is always true. The moment the chain starts working, this rule
-	// hard-blocks EVERY request carrying a `_charset_` form field, including a
-	// perfectly legitimate `_charset_=utf-8`.
-	//
-	// Enabling it therefore requires BOTH per-chain-link setvars and `%{}`
-	// interpolation in operator patterns. Whoever does the first will find this
-	// entry, which is the point.
-	{922100, func() map[string]any {
-		return map[string]any{"rule_id": 922100, "disable": true}
 	}},
 }
 

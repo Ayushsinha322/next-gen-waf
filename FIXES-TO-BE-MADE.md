@@ -386,6 +386,65 @@ before the CLI is ever handed to an operator, so the two paths cannot produce
 sites that enforce differently.
 
 
+### `%{}` interpolation in operator patterns — FIXED 2026-08-21
+
+Any operator whose pattern held a `%{...}` macro compiled to `Operator::Never`.
+**20 reachable rules** were silently disabled by that, including the
+session-fixation off-domain-referer check and the SQL tautology check.
+
+It stayed unimplemented because the naive version is dangerous, not because it is
+hard. CRS carries rules of the form
+
+    SecRule REQUEST_METHOD "!@within %{tx.allowed_methods}"
+
+whose policy list is seeded by `REQUEST-901-INITIALIZATION` — which this product
+deliberately does not load. Expand an unset list to `""` and every method is "not
+within" it: the rule becomes **deny-all**. The same shape appears for allowed
+content types, allowed HTTP versions, and every `@gt %{tx.max_*}` limit, where a
+non-numeric bound read as `0` fires on any request at all.
+
+**The contract:** an unresolvable macro yields `Absent`, never `false`.
+`Not(Absent)` is `false` while `Not(false)` is `true`, so `Absent` is the only
+value that cannot be flipped into a block. A strict resolver (`None` for
+missing/empty, distinct from the lenient one used for `setvar`) supplies that.
+Negation is applied only to *supported* comparisons for the same reason — an
+unsupported macro operator still becomes `Never`, never `Not(Never)`, because
+`Never` pushes `false` and negating it would mean "block everything".
+
+Scope: `@ge @gt @lt @streq @within @endsWith`. No shipped rule uses a macro inside
+`@rx`/`@pm`, so no per-request regex compilation was needed.
+
+**Root cause found underneath it.** Two of the newly-reachable rules turned out to
+*hard-block* on a single match. CRS puts `block` on a chain starter and the score
+`setvar` on an inner link, and only the starter's actions were consulted — so the
+rule looked like "block, no score" and no site threshold could moderate it.
+Measured: **943110 blocked any visitor arriving from a Google search** (or from
+`example.com` to `www.example.com`) whenever the URL carried a session-ish
+parameter, and **942130 blocked query strings as ordinary as `filter=status=status`
+or `tab=tab`**. Chained rules now inherit their inner link's score contribution,
+so these score `+5` and let the threshold decide. A starter that really is
+disruptive with no score anywhere in the chain (949110's `deny`) still blocks.
+
+That fix also retired the 922100 tripwire recorded above — the hard-block it
+guarded against is now structurally impossible — and downgraded 922110 from a hard
+block to a `+5`. 922110 stays disabled for the reason that survives: CRS's
+allowed-charset list holds four entries, so a customer serving Japanese or Korean
+content would carry a standing `+5` on every upload.
+
+Verified: `filter=status=status` and a Google referral score 5 and **pass**; a real
+tautology reaches 10 with libinjection corroborating and **blocks**. Guards in
+`crates/sentinel-rules/tests/operator_macro_interpolation.rs` (7 tests), including
+the deny-all case — negative-tested by making the resolver lenient, which fails it.
+
+**Deliberately NOT seeded**, so these rules stay inert rather than becoming a
+second enforcement path: `tx.allowed_methods`, `tx.max_num_args`, `tx.arg_length`,
+`tx.total_arg_length`, `tx.max_file_size`, `tx.combined_file_sizes` — the proxy
+already enforces the equivalents natively with proper status codes (405/413/414/431)
+rather than a 403. And `tx.allowed_request_content_type(_charset)` /
+`tx.allowed_http_versions`, which are policy choices whose failure mode is
+deny-all; leaving them unset keeps today's behaviour exactly.
+
+
 ## P1 — Product defects that will reach a customer
 
 Found in the 2026-08-14 audit. All are *documented* in the manual; none are fixed.

@@ -375,6 +375,10 @@ fn emit_operator_match(
                 threshold: *n as f64,
             });
         }
+        Operator::Interpolated { cmp, raw } => {
+            let raw_id = state.intern_literal(raw.clone());
+            instrs.push(Instruction::MatchInterpolated { cmp: *cmp, raw_id });
+        }
         Operator::Exists => {
             instrs.push(Instruction::Exists);
         }

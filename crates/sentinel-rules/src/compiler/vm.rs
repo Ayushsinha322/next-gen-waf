@@ -2,7 +2,9 @@ use sentinel_core::context::{Phase, RequestContext, RuleMatch, Severity, WafDeci
 use tracing::{debug, warn};
 
 use super::emitter::{CompiledRuleSet, Instruction, RuleMeta, TargetSpec};
-use crate::dsl::ast::{RuleAction, RulePhase, RuleSeverity, SetVar, SetVarOp, Transform};
+use crate::dsl::ast::{
+    InterpCmp, RuleAction, RulePhase, RuleSeverity, SetVar, SetVarOp, Transform,
+};
 
 fn rule_phase_to_phase(rp: RulePhase) -> Phase {
     match rp {
@@ -954,6 +956,63 @@ pub fn evaluate(
                 }
             }
 
+            Instruction::MatchInterpolated { cmp, raw_id } => {
+                let values = pop_strings(&mut stack);
+                let raw = &ruleset.literals[*raw_id];
+                match expand_operator_macros(raw, ctx) {
+                    // A macro we cannot resolve makes the comparison meaningless.
+                    // Push Absent, NOT Bool(false): `Not(Absent)` is false, so a
+                    // negated policy check (`!@within %{tx.allowed_methods}`)
+                    // degrades to "did not fire" instead of "deny everything".
+                    None => {
+                        debug!(raw = %raw, "MatchInterpolated: unresolved macro — absent");
+                        stack.push(StackVal::Absent);
+                    }
+                    Some(pat) if values.is_empty() => {
+                        let _ = pat;
+                        stack.push(StackVal::Absent);
+                    }
+                    Some(pat) => {
+                        // `None` here means "cannot be decided", and is pushed as
+                        // Absent for the same reason as an unresolved macro.
+                        let verdict: Option<bool> = match cmp {
+                            InterpCmp::Streq => Some(values.iter().any(|v| *v == pat)),
+                            // ModSecurity @within: the VALUE sits inside the
+                            // pattern. CRS depends on this with pipe-delimited
+                            // lists like `|utf-8| |iso-8859-1|`.
+                            InterpCmp::Within => {
+                                Some(values.iter().any(|v| pat.contains(v.as_str())))
+                            }
+                            InterpCmp::EndsWith => Some(values.iter().any(|v| v.ends_with(&pat))),
+                            // A non-numeric bound is undecidable, NOT zero.
+                            // Treating it as 0 would make `@gt %{tx.max_num_args}`
+                            // fire on any request carrying a single argument.
+                            InterpCmp::Ge | InterpCmp::Gt | InterpCmp::Lt => {
+                                pat.trim().parse::<f64>().ok().map(|bound| {
+                                    values.iter().any(|v| {
+                                        v.trim().parse::<f64>().is_ok_and(|n| match cmp {
+                                            InterpCmp::Ge => n >= bound,
+                                            InterpCmp::Gt => n > bound,
+                                            _ => n < bound,
+                                        })
+                                    })
+                                })
+                            }
+                        };
+                        match verdict {
+                            Some(matched) => {
+                                debug!(pat = %pat, matched, "MatchInterpolated");
+                                stack.push(StackVal::Bool(matched));
+                            }
+                            None => {
+                                debug!(pat = %pat, "MatchInterpolated: undecidable bound — absent");
+                                stack.push(StackVal::Absent);
+                            }
+                        }
+                    }
+                }
+            }
+
             Instruction::MatchEq { literal_id } => {
                 let values = pop_strings(&mut stack);
                 if values.is_empty() {
@@ -1324,6 +1383,52 @@ fn resolve_macro(inner: &str, ctx: &RequestContext) -> String {
         }
         None => String::new(),
     }
+}
+
+/// Expand `%{...}` macros in an OPERATOR pattern, returning `None` if any of
+/// them cannot be resolved to a non-empty value.
+///
+/// Deliberately stricter than [`expand_tx_macros`], which is for `setvar` values
+/// and resolves the unknown to `""`. An empty expansion is harmless in a setvar
+/// and catastrophic in an operator: CRS has rules of the form
+/// `REQUEST_METHOD "!@within %{tx.allowed_methods}"`, and an empty allow-list
+/// means every method is "not within" it — i.e. deny every request. Returning
+/// `None` lets the VM push `Absent`, which `Not` keeps false.
+fn expand_operator_macros(raw: &str, ctx: &RequestContext) -> Option<String> {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(start) = rest.find("%{") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let end = after.find('}')?; // unterminated macro — refuse to guess
+        out.push_str(&resolve_operator_macro(&after[..end], ctx)?);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+/// Resolve one macro body for an operator pattern. `None` means "not available",
+/// which is different from "empty" — see [`expand_operator_macros`].
+fn resolve_operator_macro(inner: &str, ctx: &RequestContext) -> Option<String> {
+    let lower = inner.trim().to_ascii_lowercase();
+    // `tx.NAME`, including the numeric capture slots `tx.1`..`tx.9`.
+    if let Some(var) = lower.strip_prefix("tx.") {
+        let key = var.to_ascii_uppercase();
+        let v = ctx
+            .tx_vars
+            .get(&key)
+            .cloned()
+            .or_else(|| crs_constant(&key).map(str::to_owned))?;
+        return (!v.is_empty()).then_some(v);
+    }
+    // `request_headers.NAME` — used by the RFI and session-fixation rules to
+    // compare a candidate host against the request's own Host.
+    if let Some(name) = lower.strip_prefix("request_headers.") {
+        let v = ctx.request_headers.get(name)?.to_str().ok()?.to_owned();
+        return (!v.is_empty()).then_some(v);
+    }
+    None
 }
 
 /// CRS numeric constants normally seeded by `crs-setup.conf`. Referenced by
