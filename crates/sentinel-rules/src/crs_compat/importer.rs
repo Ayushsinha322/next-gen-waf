@@ -5,8 +5,8 @@ use super::secrule::{
     parse_crs_actions, parse_crs_operator, split_crs_targets, CrsAction, CrsActions,
 };
 use crate::dsl::ast::{
-    ChainCondition, Directive, Operator, RuleAction, RuleDef, RuleFile, RuleItem, RulePhase,
-    Target, TargetCombinator, TargetExpr,
+    ChainCondition, Directive, InterpCmp, Operator, RuleAction, RuleDef, RuleFile, RuleItem,
+    RulePhase, Target, TargetCombinator, TargetExpr,
 };
 
 // ---------------------------------------------------------------------------
@@ -70,6 +70,38 @@ pub fn import_secrule_conf_dir(
                             pending
                                 .chain_conditions
                                 .push(ChainCondition { targets, operator });
+
+                            // Inherit the chain CHILD's anomaly-score
+                            // contribution.
+                            //
+                            // CRS routinely puts `block` on the chain starter and
+                            // the `setvar:tx.inbound_anomaly_score_plN=+...` on an
+                            // inner link. Only the starter's actions were consulted
+                            // for the action decision, and a child's actions are
+                            // otherwise discarded here — so such a rule looked like
+                            // "block, no score" and compiled to a HARD BLOCK that
+                            // no site threshold could moderate.
+                            //
+                            // Measured consequences of that, before this fix:
+                            // 943110 blocked any visitor arriving from a Google
+                            // search (or from `example.com` to `www.example.com`)
+                            // whenever the URL carried a session-ish parameter, and
+                            // 942130 blocked query strings as ordinary as
+                            // `filter=status=status` or `tab=tab`. Both are
+                            // anomaly-scoring rules in CRS; neither is supposed to
+                            // block on its own.
+                            //
+                            // A starter that really is disruptive with no score
+                            // anywhere in the chain (949110's `deny`, say) has no
+                            // child delta to inherit and stays Block.
+                            if pending.score_delta.is_none() {
+                                if let Some(delta) = actions.score_delta {
+                                    pending.score_delta = Some(delta);
+                                    if matches!(pending.action, RuleAction::Block) {
+                                        pending.action = RuleAction::Score;
+                                    }
+                                }
+                            }
                         }
                         Err(e) => {
                             warn!("CRS importer: skipping chain condition: {e}");
@@ -345,17 +377,66 @@ fn token_to_target(tok: &str) -> Option<Target> {
 /// than leaving them disabled. Reading the file at operator-construction time
 /// removes both defects at once: no quoting to get wrong, and one phrase per line
 /// preserved exactly as CRS wrote it.
+/// Map a ModSecurity operator name to the interpolated comparison that models
+/// it, or `None` when a `%{...}` pattern cannot be supported for that operator.
+///
+/// Intentionally narrow: `@rx`/`@pm` would need a regex or automaton rebuilt per
+/// request, and no shipped CRS rule uses a macro with either.
+fn interp_cmp_for(op: &str) -> Option<InterpCmp> {
+    Some(match op {
+        "ge" => InterpCmp::Ge,
+        "gt" => InterpCmp::Gt,
+        "lt" => InterpCmp::Lt,
+        "streq" => InterpCmp::Streq,
+        "within" => InterpCmp::Within,
+        "endswith" | "endsWith" => InterpCmp::EndsWith,
+        _ => return None,
+    })
+}
+
 pub(crate) fn crs_op_to_operator(
     op_name: &str,
     pattern: &str,
     data_dir: Option<&std::path::Path>,
 ) -> Result<Operator> {
+    // `%{...}` patterns cannot be compiled to a fixed pattern; they are expanded
+    // per request instead (Operator::Interpolated).
+    //
+    // The negation handling below is deliberate and load-bearing. A SUPPORTED
+    // comparison is safe to wrap in `Not`, because an unresolvable macro yields
+    // `Absent` and `Not(Absent)` is `false`. An UNSUPPORTED one falls back to
+    // `Never`, which must NOT be negated: `Never` pushes `false`, so `Not(Never)`
+    // would be *always true* — turning a rule like
+    // `!@rx %{something}` into "block everything". That is why this check stays
+    // ahead of the generic `!` strip further down.
     if pattern.contains("%{") {
-        warn!(
-            op = op_name,
-            pattern, "CRS importer: pattern contains `%{{...}}` interpolation — rule disabled"
-        );
-        return Ok(Operator::Never);
+        let (negated, base) = match op_name.strip_prefix('!') {
+            Some(b) => (true, b),
+            None => (false, op_name),
+        };
+        return Ok(match interp_cmp_for(base) {
+            Some(cmp) => {
+                let op = Operator::Interpolated {
+                    cmp,
+                    raw: pattern.to_owned(),
+                };
+                if negated {
+                    Operator::Not(Box::new(op))
+                } else {
+                    op
+                }
+            }
+            None => {
+                warn!(
+                    op = op_name,
+                    pattern,
+                    "CRS importer: `%{{...}}` interpolation is not supported for this \
+                     operator — rule disabled"
+                );
+                // Never, NOT Not(Never) — see above.
+                Operator::Never
+            }
+        });
     }
 
     if let Some(inner_name) = op_name.strip_prefix('!') {

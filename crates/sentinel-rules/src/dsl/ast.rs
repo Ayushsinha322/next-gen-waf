@@ -294,8 +294,44 @@ pub enum Operator {
         rps: u32,
         burst: u32,
     },
+    /// An operator whose pattern holds `%{...}` macros, so it cannot be compiled
+    /// to a fixed pattern and must be expanded per request.
+    ///
+    /// Only cheap comparisons are modelled — no shipped CRS rule uses a macro
+    /// inside `@rx`/`@pm`, which would need per-request regex compilation.
+    ///
+    /// **Unresolvable macros yield `Absent`, not `false`.** That is the safety
+    /// property the whole feature rests on: several CRS rules read
+    /// `!@within %{tx.allowed_methods}` and friends, and if an unset policy list
+    /// expanded to `""` the negation would make them deny every request. `Absent`
+    /// survives `Not` as `false` (see the VM's `Instruction::Not`), so an
+    /// unresolved macro can only ever mean "this rule did not fire".
+    Interpolated {
+        cmp: InterpCmp,
+        raw: String,
+    },
     Not(Box<Operator>),
     Never,
+}
+
+/// The comparisons that support an interpolated pattern. Mirrors the ModSecurity
+/// operators CRS actually uses with `%{...}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InterpCmp {
+    /// `@ge` — numeric value >= expanded pattern.
+    Ge,
+    /// `@gt` — numeric value > expanded pattern.
+    Gt,
+    /// `@lt` — numeric value < expanded pattern.
+    Lt,
+    /// `@streq` — value equals the expanded pattern exactly.
+    Streq,
+    /// `@within` — ModSecurity semantics: the VALUE is a substring of the
+    /// expanded pattern. CRS relies on this with pipe-delimited lists such as
+    /// `|utf-8| |iso-8859-1|`, so it is a substring test, not word membership.
+    Within,
+    /// `@endsWith` — value ends with the expanded pattern.
+    EndsWith,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

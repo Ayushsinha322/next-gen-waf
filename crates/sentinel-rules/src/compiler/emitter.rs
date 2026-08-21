@@ -4,7 +4,7 @@ use aho_corasick::AhoCorasick;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::dsl::ast::{RuleAction, RulePhase, RuleSeverity, SetVar, Target, Transform};
+use crate::dsl::ast::{InterpCmp, RuleAction, RulePhase, RuleSeverity, SetVar, Target, Transform};
 
 // ---------------------------------------------------------------------------
 // Target specification stored in instructions
@@ -135,6 +135,17 @@ pub enum Instruction {
     /// Pop `StrVec`, apply regex `patterns[pattern_id]`, push `Bool(any_match)`.
     MatchRx {
         pattern_id: usize,
+    },
+
+    /// Pop `StrVec`, expand the `%{...}` macros in `literals[raw_id]` against the
+    /// request, then compare each value with `cmp`.
+    ///
+    /// Pushes `Absent` — never `Bool(false)` — when a macro cannot be resolved, so
+    /// that a negated form such as `!@within %{tx.allowed_methods}` degrades to
+    /// "did not fire" rather than "deny everything".
+    MatchInterpolated {
+        cmp: InterpCmp,
+        raw_id: usize,
     },
 
     /// Pop `StrVec`, apply Aho-Corasick set `ac_sets[set_id]`, push `Bool(any_match)`.

@@ -191,23 +191,6 @@ func TestMultipartCharsetPolicyRuleIsDisabledByDefault(t *testing.T) {
 			"(us-ascii, utf-16, shift_jis, euc-kr all refused). Got %v", ex)
 	}
 
-	// 922100 is the same shape and is disabled as a tripwire: it is inert today
-	// only because its chained condition reads a TX var its starter has not set
-	// yet. Implement per-chain-link setvars without also implementing `%{}`
-	// interpolation and it hard-blocks every `_charset_` form field, because
-	// `!@within %{...}` on an unexpanded macro is always true.
-	found100 := false
-	for _, e := range ex {
-		if ruleIDEquals(e["rule_id"], 922100) {
-			if dis, _ := e["disable"].(bool); dis {
-				found100 = true
-			}
-		}
-	}
-	if !found100 {
-		t.Errorf("922100 must be disabled by default as a tripwire; got %v", ex)
-	}
-
 	// And the category itself must still be delivered, with its safe rules.
 	files := crsFilesForCategories(nil)
 	joined := strings.Join(files, " ")
