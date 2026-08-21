@@ -693,6 +693,40 @@ fn extract_target(spec: &TargetSpec, ctx: &RequestContext) -> Vec<String> {
             .and_then(|v| v.to_str().ok())
             .map(|v| vec![v.to_owned()])
             .unwrap_or_default(),
+        // Cookie NAMES. Session-fixation and cookie-injection rules match on the
+        // name side, so returning values here would silently never fire them.
+        TargetSpec::RequestCookiesNames => {
+            if let Some(cookie_hdr) = ctx.request_headers.get("cookie") {
+                if let Ok(s) = cookie_hdr.to_str() {
+                    return parse_cookies(s).into_iter().map(|(k, _)| k).collect();
+                }
+            }
+            vec![]
+        }
+        // Header NAMES. HeaderMap keys are already lowercased by hyper, which
+        // matches CRS expectations — its header-name patterns are written
+        // case-insensitively.
+        TargetSpec::RequestHeadersNames => ctx
+            .request_headers
+            .keys()
+            .map(|k| k.as_str().to_owned())
+            .collect(),
+        // ARGS_GET is the query string ONLY. Deliberately not `Args`: a rule
+        // written for the query side would otherwise also score body parameters,
+        // which is how a query-only restriction turns into a false positive on a
+        // legitimate POST.
+        TargetSpec::ArgsGet => parse_query_params(ctx.uri.query().unwrap_or(""))
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect(),
+        TargetSpec::ArgsGetNames => parse_query_params(ctx.uri.query().unwrap_or(""))
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect(),
+        // The raw, still-encoded query string. CRS uses this for rules that must
+        // see the encoding itself — double-encoding and separator abuse — so it
+        // must NOT be decoded here.
+        TargetSpec::QueryString => vec![ctx.uri.query().unwrap_or("").to_owned()],
         TargetSpec::RequestCookiesAll => {
             if let Some(cookie_hdr) = ctx.request_headers.get("cookie") {
                 if let Ok(s) = cookie_hdr.to_str() {

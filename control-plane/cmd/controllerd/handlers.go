@@ -441,6 +441,23 @@ func oidcConfigFromEnv() (auth.OIDCConfig, bool) {
 	return cfg, true
 }
 
+// handleOIDCStatus reports whether OIDC single sign-on is usable on this
+// deployment. It exists so the login page can show an SSO button only when
+// pressing it would work.
+//
+// It was added because the login page shipped a button reading "Sign in with
+// SAML / LDAP" whose onClick was the ordinary password handler. Neither SAML nor
+// LDAP exists anywhere in this control plane, while OIDC — which does — had no
+// button at all. A security product advertising an authentication method it does
+// not implement is worse than one that offers fewer.
+//
+// Returns only a boolean. Never the issuer, client id, secret or redirect URL:
+// those would tell an unauthenticated caller which identity provider to attack.
+func handleOIDCStatus(c *gin.Context) {
+	_, ok := oidcConfigFromEnv()
+	c.JSON(http.StatusOK, gin.H{"configured": ok})
+}
+
 func handleOIDCLogin(c *gin.Context, jwtSvc *auth.JWTService, log *zap.Logger) {
 	cfg, ok := oidcConfigFromEnv()
 	if !ok {
@@ -1245,12 +1262,87 @@ var crsCategoryFiles = map[string]string{
 	"sqli":            "rules/owasp-crs/rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
 	"session":         "rules/owasp-crs/rules/REQUEST-943-APPLICATION-ATTACK-SESSION-FIXATION.conf",
 	"java":            "rules/owasp-crs/rules/REQUEST-944-APPLICATION-ATTACK-JAVA.conf",
+
+	// RESPONSE-* families. The image has always shipped these files and the data
+	// plane has always been able to run them — phase1_headers seeds
+	// DETECTION_PARANOIA_LEVEL, the response path buffers scannable bodies up to
+	// RESPONSE_SCAN_CAP and calls evaluate(Phase::ResponseBody) — but nothing in
+	// the control plane could NAME them, so no site configuration could reach
+	// them. 108 importable rules of data-leakage and web-shell detection were
+	// shipped, compiled and unreachable.
+	//
+	// They are opt-in (see crsResponseCategories) because unlike the request
+	// families they are NOT free: enabling one makes the proxy buffer every
+	// text-ish response for that site, and these rules carry `block` directly
+	// rather than contributing to the anomaly score, so a single match blocks
+	// with no threshold to moderate it.
+	"leak_generic": "rules/owasp-crs/rules/RESPONSE-950-DATA-LEAKAGES.conf",
+	"leak_sql":     "rules/owasp-crs/rules/RESPONSE-951-DATA-LEAKAGES-SQL.conf",
+	"leak_java":    "rules/owasp-crs/rules/RESPONSE-952-DATA-LEAKAGES-JAVA.conf",
+	"leak_php":     "rules/owasp-crs/rules/RESPONSE-953-DATA-LEAKAGES-PHP.conf",
+	"leak_iis":     "rules/owasp-crs/rules/RESPONSE-954-DATA-LEAKAGES-IIS.conf",
+	"web_shells":   "rules/owasp-crs/rules/RESPONSE-955-WEB-SHELLS.conf",
+}
+
+// crsResponseCategories are the response-body families. Membership here means
+// "never enabled implicitly": crsFilesForCategories omits them when a site names
+// no categories at all, so the thousands of existing sites whose stored policy
+// predates these keys keep byte-identical behaviour instead of silently
+// acquiring response buffering and single-match response blocking.
+var crsResponseCategories = map[string]bool{
+	"leak_generic": true,
+	"leak_sql":     true,
+	"leak_java":    true,
+	"leak_php":     true,
+	"leak_iis":     true,
+	"web_shells":   true,
+}
+
+// crsUnwiredFiles records the CRS files this product ships but deliberately does
+// NOT offer, so that "why is RESPONSE-959 not in the map?" has an answer in the
+// code rather than in someone's memory. Each entry is a decision, not an
+// oversight, and crs_wiring_test.go asserts this list stays exhaustive.
+//
+//	REQUEST-901-INITIALIZATION   26 rules. Seeds tx.* constants the VM already
+//	    resolves natively. Loading it would ALSO set
+//	    tx.inbound_anomaly_score_threshold=5 and tx.blocking_paranoia_level=1,
+//	    fighting the site's own tuned threshold (default 10) and paranoia level
+//	    (default 2). The 10-not-5 choice is what measured TN 99.29%.
+//	REQUEST-949 / RESPONSE-959   26 rules each. CRS's anomaly-mode blocking
+//	    evaluators. Redundant: the importer maps every
+//	    tx.inbound_anomaly_score_plN delta straight onto the rule's score, so
+//	    the VM accumulates the total itself and blocks against the site's
+//	    configured anomaly_threshold. Loading these would add a SECOND deny path
+//	    at CRS's defaults (inbound 5, outbound 4) beside the tuned one.
+//	RESPONSE-980-CORRELATION     19 rules. Reports on the
+//	    blocking_/detection_ aggregates that only 949/959 produce.
+//	REQUEST-905-COMMON-EXCEPTIONS 2 importable rules, both Apache-pinger
+//	    exceptions whose payload is ctl:ruleRemoveByTag=OWASP_CRS. `ctl:` is an
+//	    explicit no-op in the importer, so they are inert today — zero benefit,
+//	    and a loopback-shaped hole the day ctl: is implemented.
+//	REQUEST-922-MULTIPART-ATTACK  0 importable rules. All four SecRules target
+//	    MULTIPART_PART_HEADERS, which the engine does not implement, so wiring
+//	    it would advertise multipart coverage that detects nothing. Tracked as
+//	    an engine gap, not a wiring gap.
+var crsUnwiredFiles = []string{
+	"rules/owasp-crs/rules/REQUEST-901-INITIALIZATION.conf",
+	"rules/owasp-crs/rules/REQUEST-905-COMMON-EXCEPTIONS.conf",
+	"rules/owasp-crs/rules/REQUEST-922-MULTIPART-ATTACK.conf",
+	"rules/owasp-crs/rules/REQUEST-949-BLOCKING-EVALUATION.conf",
+	"rules/owasp-crs/rules/RESPONSE-959-BLOCKING-EVALUATION.conf",
+	"rules/owasp-crs/rules/RESPONSE-980-CORRELATION.conf",
 }
 
 // crsCategoryOrder is the canonical load order for the categories above.
+// Response families sort last, matching CRS's own numbering. Ordering across
+// phases is presentational rather than semantic — the compiler builds a separate
+// instruction program per phase (ruleset.phase_programs), so a RESPONSE file
+// listed before a REQUEST one cannot change evaluation — but keeping CRS order
+// means a site's rule list reads the way the upstream project documents it.
 var crsCategoryOrder = []string{
 	"method", "scanner", "protocol", "protocol_attack", "lfi", "rfi", "rce",
 	"php", "generic", "xss", "sqli", "session", "java",
+	"leak_generic", "leak_sql", "leak_java", "leak_php", "leak_iis", "web_shells",
 }
 
 // crsFilesForCategories returns the concrete .conf files for a set of UI
@@ -1258,8 +1350,14 @@ var crsCategoryOrder = []string{
 // "all categories" so existing sites keep full protection.
 func crsFilesForCategories(cats []string) []string {
 	if len(cats) == 0 {
+		// "All categories" means all REQUEST categories. Response families are
+		// opt-in and must never arrive by default — a stored policy written
+		// before these keys existed has to keep behaving exactly as it did.
 		files := make([]string, 0, len(crsCategoryOrder))
 		for _, k := range crsCategoryOrder {
+			if crsResponseCategories[k] {
+				continue
+			}
 			files = append(files, crsCategoryFiles[k])
 		}
 		return files

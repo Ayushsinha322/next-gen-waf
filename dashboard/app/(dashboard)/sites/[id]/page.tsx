@@ -13,7 +13,7 @@ import { showToast } from "@/components/ui/Toast";
 import { api, type Site, type Certificate, type SiteStat, type LearningStat } from "@/lib/api";
 import { staggerContainer, cardVariants, fadeUp } from "@/lib/animations";
 import SiteWizard from "@/components/sites/SiteWizard";
-import { siteToForm, type SiteForm, type PathOverride, CRS_CATEGORIES } from "@/lib/siteConfig";
+import { siteToForm, type SiteForm, type PathOverride, CRS_REQUEST_CATEGORIES, ALL_CRS_RESPONSE_KEYS } from "@/lib/siteConfig";
 
 type WafRow = { ts: string; ip: string; rule: string; attack: string; sev: string; action: string };
 type AccessRow = { ts: string; ip: string; method: string; path: string; status: number; latency: number };
@@ -313,7 +313,11 @@ export default function SiteDetailPage() {
               <ConfigCard title="WAF Rules">
                 <KV k="Paranoia level" v={`PL${form.paranoia_level}`} />
                 <KV k="Anomaly threshold" v={String(form.anomaly_threshold)} />
-                <KV k="CRS categories" v={`${form.rule_categories.length}/${CRS_CATEGORIES.length} enabled`} />
+                <KV k="Request inspection" v={`${form.rule_categories.filter(k => !ALL_CRS_RESPONSE_KEYS.includes(k)).length}/${CRS_REQUEST_CATEGORIES.length} categories`} />
+                <KV k="Response inspection" v={(() => {
+                  const n = form.rule_categories.filter(k => ALL_CRS_RESPONSE_KEYS.includes(k)).length;
+                  return n === 0 ? "off" : `${n}/${ALL_CRS_RESPONSE_KEYS.length} categories`;
+                })()} />
                 <KV k="Rule exclusions" v={`${form.rule_exclusions.length}`} />
                 <KV k="Path overrides" v={`${(form.path_overrides ?? []).length}`} />
                 <KV k="ML anomaly" v={form.ml_enabled ? `on (${form.ml_sensitivity})` : "off"} />

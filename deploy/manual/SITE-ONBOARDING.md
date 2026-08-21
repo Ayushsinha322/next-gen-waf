@@ -279,6 +279,48 @@ Three templates:
 **Start with Essential or Balanced.** You can tighten later once you have real
 numbers; you cannot un-block a customer's users retroactively.
 
+#### Request inspection — on by default
+
+Thirteen OWASP CRS categories covering what arrives *from* the visitor: SQL
+injection, XSS, command execution, file inclusion, protocol abuse and so on. A new
+site gets all of them. Leave it that way unless you have a measured reason not to.
+
+#### Response inspection — off by default, and worth turning on
+
+Six more categories inspect what your **origin sends back**, and they catch a
+different class of problem: the application disclosing its own internals.
+
+| Category | Catches |
+|---|---|
+| SQL Error Leakage | MySQL / Oracle / MSSQL / DB2 errors printed to the page |
+| PHP Error Leakage | PHP warnings, stack traces, source disclosure |
+| Java Error Leakage | Java exceptions and stack traces |
+| IIS Error Leakage | ASP.NET error pages and filesystem paths |
+| Generic Leakage | Directory listings and similar disclosure |
+| Web Shell Detection | Pages served by known web shells (r57, c99, WSO) |
+
+This matters because a leaked `You have an error in your SQL syntax` is how an
+attacker learns which database you run and that your input is reaching it. The
+request-side rules cannot see any of it — by the time the origin answers, the
+request already passed.
+
+**Two costs, and they are the reason it is off by default:**
+
+1. **Responses are buffered, not streamed** for that site — held until scanned,
+   up to the scan cap. Large text responses feel slightly slower. Binary and
+   media responses are skipped, so downloads and video are unaffected.
+2. **A single match blocks the response.** Unlike request rules, these do not add
+   to an anomaly score that the threshold moderates — one hit is a decision. A
+   page that *legitimately* prints database error text will be blocked.
+
+So: **turn it on in Learning mode first**, exactly as you would for a new site,
+and read the report before you let it block. Applications that deliberately show
+stack traces to logged-in developers are the usual surprise.
+
+If a response is too large to scan, the WAF forwards it and records
+`response exceeds the scan cap` in the data-plane log rather than pretending it
+inspected it. Treat that line as a coverage gap you can see.
+
 ### Step 5 — Review
 
 Read the summary. Check the domains and the backend address once more, then save.

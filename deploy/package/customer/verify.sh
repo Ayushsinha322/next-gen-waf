@@ -107,6 +107,37 @@ if [[ -n "$HZ" ]]; then
   SHED=$(printf '%s' "$HZ" | sed -n 's/.*"history_shed"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)
   if [[ "${SHED:-0}" -eq 0 ]]; then pass "no shed events (every block was recorded)"
   else soft "$SHED events enforced but NOT recorded — event history undercounts blocks for that window"; fi
+
+  # eBPF/XDP data path. Until 2026-08-20 the kernel program had NEVER loaded on
+  # any deployment — the embedded ELF was rejected before it reached the kernel —
+  # and the only trace anywhere was one WARN line at container startup. Nothing
+  # was queryable, so nobody knew. /healthz now reports it, and this is the check
+  # that reads it.
+  #
+  # Requested-but-software is a WARN, not a FAIL, on purpose: the fast-fail to
+  # userspace is deliberate so the stack still boots on hosts and kernels that do
+  # not permit XDP, and failing verification on those hosts would be a false
+  # alarm. The point is that the degradation is now VISIBLE instead of silent.
+  EB=${HZ#*\"ebpf\"}
+  XMODE=$(printf '%s' "$EB" | sed -n 's/.*"mode"[[:space:]]*:[[:space:]]*"\([a-z-]*\)".*/\1/p' | head -1)
+  XWANT=$(printf '%s' "$EB" | sed -n 's/.*"kernel_requested"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p' | head -1)
+  XDROP=$(printf '%s' "$EB" | sed -n 's/.*"xdp_drop"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)
+  case "${XMODE:-}" in
+    kernel-xdp)
+      pass "eBPF running in the kernel (XDP attached; ${XDROP:-0} packets dropped in-kernel)" ;;
+    software)
+      if [[ "$XWANT" == "true" ]]; then
+        soft "kernel XDP was REQUESTED but the data path is userspace-only.
+       The stack is protected, but DDoS packets are dropped in userspace rather
+       than in the NIC/driver path, so the published in-kernel figures do not
+       apply to this host. Cause is logged once at startup:
+         docker logs sentinel-dataplane-1 2>&1 | grep -i xdp"
+      else
+        pass "eBPF in software mode (kernel XDP not requested)"
+      fi ;;
+    *)
+      soft "could not read the eBPF mode from /healthz — build predates the field" ;;
+  esac
 else
   bad "/healthz not answering on :80"
 fi
