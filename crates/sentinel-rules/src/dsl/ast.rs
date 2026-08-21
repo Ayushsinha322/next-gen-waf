@@ -191,6 +191,17 @@ pub enum Target {
     /// Total byte size of all uploaded file contents. ModSecurity
     /// `FILES_COMBINED_SIZE`.
     FilesCombinedSize,
+    /// Header lines of `multipart/form-data` body parts. ModSecurity
+    /// `MULTIPART_PART_HEADERS`.
+    ///
+    /// These are headers that arrive in the BODY, not the request headers — one
+    /// value per header line of every part, verbatim as `name: value`, which is
+    /// what CRS 922 matches against (`^content-type\s*:`, and a byte-range check
+    /// on the name). `None` iterates every part's header lines; `Some(part)`
+    /// selects only the lines belonging to the part with that form-field name,
+    /// which is how `&MULTIPART_PART_HEADERS:_charset_` asks "is there a
+    /// `_charset_` field at all".
+    MultipartPartHeaders(Option<String>),
     RemoteAddr,
     Geo,
     TxVar(String),

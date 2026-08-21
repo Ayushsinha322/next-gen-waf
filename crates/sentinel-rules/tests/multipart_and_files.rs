@@ -267,3 +267,188 @@ fn form_field_alongside_file_still_feeds_args() {
         "a malicious form field must feed ARGS even when a file part is present"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 3. MULTIPART_PART_HEADERS → REQUEST-922-MULTIPART-ATTACK
+// ---------------------------------------------------------------------------
+//
+// The whole of REQUEST-922 targets `MULTIPART_PART_HEADERS` and nothing else, so
+// until that target existed the file imported ZERO of its rules. It shipped in
+// the image, compiled, and could not be selected by any site configuration —
+// wiring it to a category would have advertised multipart protection that
+// detected nothing.
+//
+// These headers arrive in the BODY, not the request headers, which is why CRS
+// runs them in phase 2.
+
+/// Load the real shipped 922 file, plus the paranoia seed the proxy provides.
+fn crs_922_ctx(body: &str) -> (RuleEngine, RequestContext) {
+    let eng = load_crs_engines(&["REQUEST-922-MULTIPART-ATTACK.conf"]);
+    let mut ctx = multipart_ctx("/upload", body, false);
+    // phase1_headers seeds this in the proxy; CRS files self-skip without it.
+    ctx.tx_vars
+        .insert("DETECTION_PARANOIA_LEVEL".to_string(), "2".to_string());
+    (eng, ctx)
+}
+
+fn eval_922(body: &str) -> RequestContext {
+    let (eng, mut ctx) = crs_922_ctx(body);
+    eng.evaluate(&mut ctx, Phase::RequestBody, 10);
+    ctx
+}
+
+fn fired(ctx: &RequestContext) -> Vec<String> {
+    ctx.rule_matches.iter().map(|m| m.rule_id.clone()).collect()
+}
+
+/// The file must actually contribute rules. A category toggle backed by an empty
+/// rule file is worse than no toggle: the operator pays the cost and gets nothing.
+#[test]
+fn crs_922_imports_all_four_rules() {
+    let eng = load_crs_engines(&["REQUEST-922-MULTIPART-ATTACK.conf"]);
+    assert_eq!(
+        eng.rule_count(),
+        4,
+        "REQUEST-922 declares four rules and all four must import. This file \
+         imported ZERO until MULTIPART_PART_HEADERS existed, because every one \
+         of its SecRules targets that collection and nothing else."
+    );
+}
+
+/// Content-Transfer-Encoding was deprecated by RFC 7578 and is a known
+/// multipart-parser-confusion vector (922120).
+#[test]
+fn content_transfer_encoding_in_a_part_is_detected() {
+    let body = build_body(&[(
+        "Content-Disposition: form-data; name=\"f\"; filename=\"a.txt\"\r\n\
+         Content-Type: text/plain\r\n\
+         Content-Transfer-Encoding: base64",
+        "aGVsbG8=",
+    )]);
+    let ctx = eval_922(&body);
+    assert!(
+        fired(&ctx).contains(&"922120".to_string()),
+        "Content-Transfer-Encoding must be flagged; fired {:?}",
+        fired(&ctx)
+    );
+}
+
+/// A byte outside \x21-\x7E in a part header name (922130). The payload below
+/// uses a BARE LF to smuggle a second header past a parser that only splits on
+/// CRLF — which is precisely the confusion this rule detects, so the raw \n must
+/// survive parsing rather than being normalised away.
+#[test]
+fn out_of_range_byte_in_a_part_header_name_is_detected() {
+    let body = format!(
+        "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"f\"\r\nX-A:\nEvil:1\r\n\r\nv\r\n--{BOUNDARY}--\r\n"
+    );
+    let ctx = eval_922(&body);
+    assert!(
+        fired(&ctx).contains(&"922130".to_string()),
+        "a bare LF smuggling a second part header must be flagged; fired {:?}",
+        fired(&ctx)
+    );
+}
+
+/// 922110 rejects a part Content-Type whose charset is not on the allowed list.
+/// This rule is `capture` + a chained condition on `TX:1`, so it is also the
+/// regression test for capture groups reaching a chained rule at all.
+#[test]
+fn disallowed_charset_in_a_part_content_type_is_detected() {
+    let body = build_body(&[(
+        "Content-Disposition: form-data; name=\"f\"; filename=\"a.txt\"\r\n\
+         Content-Type: text/plain; charset=utf-7",
+        "x",
+    )]);
+    let ctx = eval_922(&body);
+    assert!(
+        fired(&ctx).contains(&"922110".to_string()),
+        "charset=utf-7 must be flagged. If this regressed, check that regex \
+         capture groups still populate TX:1 — the chained condition reads it, \
+         and an empty TX:1 makes the rule silently inert rather than noisy. \
+         Fired {:?}",
+        fired(&ctx)
+    );
+}
+
+/// The other half of 922110: a normal charset must not trip it. Without capture
+/// working, TX:1 is empty and this test passes for the WRONG reason, which is
+/// why the positive case above is asserted alongside it.
+#[test]
+fn allowed_charset_in_a_part_content_type_is_clean() {
+    for charset in ["utf-8", "iso-8859-1", "windows-1252"] {
+        let body = build_body(&[(
+            &format!(
+                "Content-Disposition: form-data; name=\"f\"; filename=\"a.txt\"\r\n\
+                 Content-Type: text/plain; charset={charset}"
+            ),
+            "x",
+        )]);
+        let ctx = eval_922(&body);
+        assert_eq!(
+            ctx.decision,
+            WafDecision::Allow,
+            "charset={charset} is on the CRS allowed list and must not be \
+             blocked; fired {:?}",
+            fired(&ctx)
+        );
+    }
+}
+
+/// False-positive guard. These rules had never executed against anything, and
+/// they run on EVERY multipart request — every file upload in the product —
+/// so an over-eager match here breaks ordinary uploads.
+#[test]
+fn ordinary_uploads_and_forms_are_not_flagged_by_922() {
+    let cases: Vec<(&str, String)> = vec![
+        (
+            "plain text upload",
+            build_body(&[(
+                "Content-Disposition: form-data; name=\"file\"; filename=\"report.txt\"\r\n\
+                 Content-Type: text/plain",
+                "quarterly numbers\r\nline two",
+            )]),
+        ),
+        (
+            "image upload beside two form fields",
+            build_body(&[
+                ("Content-Disposition: form-data; name=\"title\"", "Holiday photo"),
+                ("Content-Disposition: form-data; name=\"tags\"", "beach,sunset"),
+                (
+                    "Content-Disposition: form-data; name=\"img\"; filename=\"p.jpg\"\r\n\
+                     Content-Type: image/jpeg",
+                    "\u{FFFD}\u{FFFD}\u{FFFD}JFIF binary-ish",
+                ),
+            ]),
+        ),
+        (
+            "field with no content-type at all",
+            build_body(&[("Content-Disposition: form-data; name=\"comment\"", "looks good")]),
+        ),
+        (
+            "filename containing spaces and dots",
+            build_body(&[(
+                "Content-Disposition: form-data; name=\"f\"; filename=\"my report v2.final.pdf\"\r\n\
+                 Content-Type: application/pdf",
+                "%PDF-1.7",
+            )]),
+        ),
+    ];
+    for (label, body) in cases {
+        let ctx = eval_922(&body);
+        assert_eq!(
+            ctx.decision,
+            WafDecision::Allow,
+            "{label}: an ordinary multipart request was blocked by the 922 \
+             family — this would break real uploads. Fired {:?}",
+            fired(&ctx)
+        );
+        assert_eq!(
+            ctx.anomaly_score,
+            0,
+            "{label}: scored {} against 922 with no attack present; fired {:?}",
+            ctx.anomaly_score,
+            fired(&ctx)
+        );
+    }
+}
