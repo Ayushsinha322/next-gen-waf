@@ -265,6 +265,15 @@ struct MultipartParts {
     /// Combined byte size of every file part's content. ModSec
     /// `FILES_COMBINED_SIZE`.
     combined_size: usize,
+    /// Every part's header lines as `(part_name, header_line)`. ModSec
+    /// `MULTIPART_PART_HEADERS`.
+    ///
+    /// One entry per header LINE, kept verbatim (not lowercased, not trimmed),
+    /// because CRS 922 inspects these bytes directly: 922130 looks for bytes
+    /// outside `\x21-\x7E` in a header name, so normalising here would erase the
+    /// very anomaly it hunts for. `part_name` is the form-field name from
+    /// Content-Disposition, or empty when the part declares none.
+    part_headers: Vec<(String, String)>,
 }
 
 /// Locate the first occurrence of `needle` within `haystack`.
@@ -361,6 +370,19 @@ fn parse_one_part(part: &[u8], out: &mut MultipartParts) {
             name = disposition_param(line, "name");
             filename = disposition_param(line, "filename");
             break;
+        }
+    }
+
+    // Record the header lines for MULTIPART_PART_HEADERS.
+    //
+    // Split on CRLF only, deliberately. A bare LF used as a header separator is
+    // itself the smuggling trick rule 922130 exists to catch: keeping such a
+    // line intact leaves the raw \n inside the value, where the rule's
+    // out-of-range byte class matches it. Splitting on \n too would hide it.
+    let part_label = name.clone().unwrap_or_default();
+    for line in headers.split("\r\n") {
+        if !line.is_empty() {
+            out.part_headers.push((part_label.clone(), line.to_owned()));
         }
     }
     match filename {
@@ -769,6 +791,20 @@ fn extract_target(spec: &TargetSpec, ctx: &RequestContext) -> Vec<String> {
             .as_ref()
             .map(|b| vec![String::from_utf8_lossy(b).into_owned()])
             .unwrap_or_default(),
+        TargetSpec::MultipartPartHeadersAll => multipart_parts(ctx)
+            .part_headers
+            .into_iter()
+            .map(|(_, line)| line)
+            .collect(),
+        // Selecting by PART name, not header name — see the importer note. Used
+        // as `&MULTIPART_PART_HEADERS:_charset_`, where a non-zero count means
+        // the request carried a `_charset_` form field.
+        TargetSpec::MultipartPartHeader(part) => multipart_parts(ctx)
+            .part_headers
+            .into_iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case(part))
+            .map(|(_, line)| line)
+            .collect(),
         TargetSpec::Files => multipart_parts(ctx).filenames,
         TargetSpec::FilesNames => multipart_parts(ctx).field_names,
         TargetSpec::FilesCombinedSize => vec![multipart_parts(ctx).combined_size.to_string()],
@@ -863,7 +899,44 @@ pub fn evaluate(
                     stack.push(StackVal::Absent);
                 } else {
                     let regex = &ruleset.patterns[*pattern_id];
-                    let matched = values.iter().any(|s| regex.is_match(s));
+                    // Regex capture groups populate TX.0 (whole match) and
+                    // TX.1..TX.9 (groups), which is what a CHAINED condition
+                    // reads: `SecRule TX:1 "!@rx ..."`.
+                    //
+                    // Without this, every capture-then-chain rule was inert —
+                    // not false-positive, silently inert, because TX:1 yielded
+                    // no values and a target with no values cannot match even
+                    // when the condition is negated. 14 shipped rules across
+                    // 922 (multipart), 942 (SQLi), 932 (RCE), 933 (PHP), 920
+                    // (protocol) and 943 (session fixation) are built this way.
+                    //
+                    // Deviation from ModSecurity, deliberate: it populates these
+                    // only for rules carrying the `capture` action, whereas this
+                    // populates whenever the pattern HAS groups. The importer
+                    // treats `capture` as a no-op, and threading the flag through
+                    // the AST, compiler and instruction set would change nothing
+                    // observable — no shipped rule writes a bare `tx.<digit>`
+                    // (checked: the only digit-ish names are `tx.922100_charset`
+                    // and friends), and nothing reads TX:N unless it captured.
+                    // It also makes `logdata:'%{TX.0}'` report the text that
+                    // actually matched instead of an empty string.
+                    let matched = if regex.captures_len() > 1 {
+                        let mut hit = false;
+                        for s in &values {
+                            if let Some(caps) = regex.captures(s) {
+                                for (i, g) in caps.iter().enumerate().take(10) {
+                                    if let Some(m) = g {
+                                        ctx.tx_vars.insert(i.to_string(), m.as_str().to_owned());
+                                    }
+                                }
+                                hit = true;
+                                break; // first match wins, as ModSecurity does
+                            }
+                        }
+                        hit
+                    } else {
+                        values.iter().any(|s| regex.is_match(s))
+                    };
                     debug!(pattern = %regex.as_str(), matched, "MatchRx");
                     stack.push(StackVal::Bool(matched));
                 }

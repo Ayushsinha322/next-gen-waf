@@ -294,6 +294,48 @@ observed working.
 
 ### 0b. `REQUEST-922-MULTIPART-ATTACK` imports 0 of its 6 rules
 
+> **FIXED 2026-08-21.** All four SecRules now import, three of them enforce, and
+> the file is wired as the `multipart` category (default-on with the other
+> request families). Two engine gaps had to be closed, not one:
+>
+> 1. **`MULTIPART_PART_HEADERS` did not exist.** Added as a target with a
+>    part-name sub-selector, backed by the existing multipart parser: one value
+>    per part header LINE, kept verbatim. Verbatim matters — rule 922130 hunts
+>    for bytes outside `\x21-\x7E` in a header name, so lowercasing or trimming
+>    here would erase the anomaly. The bare-LF header-smuggling payload is
+>    detected precisely because the raw `\n` survives parsing.
+> 2. **`capture` was an explicit no-op**, so regex groups never reached `TX:1`.
+>    Rules 922100 and 922110 are `capture` + a chained condition on `TX:1`, and a
+>    target with no values cannot match *even negated* — so they were silently
+>    inert rather than noisy. This affected **14 rules across six shipped files**,
+>    not just multipart: 942 (SQLi), 932 (RCE), 933 (PHP), 920 (protocol) and 943
+>    (session fixation) all use the same shape. Fixing it also makes
+>    `logdata:'%{TX.0}'` report the text that actually matched.
+>
+> Measured against the real shipped file with real multipart bodies:
+> `charset=utf-7` → **blocked**; `utf-8`/`iso-8859-1`/`windows-1252` → clean;
+> `Content-Transfer-Encoding` → flagged; a bare LF smuggling a second part header
+> → flagged. Four ordinary upload shapes (text, image beside form fields, a field
+> with no content-type, a filename with spaces and dots) all score **0** — these
+> rules run on every multipart request in the product, so that guard matters more
+> than the detections.
+>
+> **922100 remains deliberately inert, and that is the safe state.** It needs two
+> further things: per-chain-link `setvar` execution (its chain2 reads a TX var its
+> chain1 sets) *and* `%{}` expansion in operator patterns (`!@within
+> %{tx.allowed_request_content_type_charset}`). Delivering only the first would
+> make it fire on **every** `_charset_` field including a legitimate `utf-8`,
+> because the unexpanded macro can never match and the condition is negated. A
+> false positive on ordinary forms is worse than a missing policy check, so it
+> stays off until the `%{}` interpolation item below is done.
+>
+> Guards: `crates/sentinel-rules/tests/multipart_and_files.rs` (+6 tests, real
+> CRS file, both polarities, FP guard). Negative-tested by disabling capture —
+> 922110 goes inert and the test names the cause.
+
+#### Superseded description
+
+
 Found while wiring the above. All four of its `SecRule`s target
 `MULTIPART_PART_HEADERS`, which the engine does not implement, so the file
 imports **nothing**. It is therefore *not* wired to a category: offering a

@@ -292,7 +292,19 @@ fn token_to_target(tok: &str) -> Option<Target> {
         // flattened body rather than evaluating XPath, which is enough to catch
         // injection payloads carried inside XML.
         "XML" => Some(Target::Args),
-        "MULTIPART_FILENAME" | "MULTIPART_NAME" => None,
+        // Headers that arrive in the BODY, one value per part header line. The
+        // whole of REQUEST-922-MULTIPART-ATTACK targets this and nothing else,
+        // so without it that file imported zero rules and the multipart attack
+        // family was unreachable no matter how a site was configured.
+        //
+        // The sub-selector is a PART name (the form field), not a header name:
+        // `&MULTIPART_PART_HEADERS:_charset_` asks whether a `_charset_` field
+        // was submitted at all, which is what rule 922100 gates on.
+        "MULTIPART_PART_HEADERS" => Some(Target::MultipartPartHeaders(
+            sub.map(|s| s.trim_matches('\'').to_ascii_lowercase()),
+        )),
+        "MULTIPART_FILENAME" => Some(Target::Files),
+        "MULTIPART_NAME" => Some(Target::FilesNames),
         other => {
             warn!(
                 target = other,

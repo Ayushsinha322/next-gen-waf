@@ -1262,6 +1262,18 @@ var crsCategoryFiles = map[string]string{
 	"sqli":            "rules/owasp-crs/rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
 	"session":         "rules/owasp-crs/rules/REQUEST-943-APPLICATION-ATTACK-SESSION-FIXATION.conf",
 	"java":            "rules/owasp-crs/rules/REQUEST-944-APPLICATION-ATTACK-JAVA.conf",
+	// Multipart body-part header attacks. This file sat in crsUnwiredFiles until
+	// 2026-08-21 for a reason that no longer holds: every one of its SecRules
+	// targets MULTIPART_PART_HEADERS, which the engine did not implement, so it
+	// imported ZERO rules and a toggle would have advertised protection that
+	// detected nothing. That target — and regex capture, which two of the rules
+	// chain on — now exist, so all four import.
+	//
+	// Default-on with the other request families, unlike the response ones: these
+	// rules only run on multipart requests, and they CONTRIBUTE to the anomaly
+	// score rather than blocking outright, so a lone match is +5 against a
+	// threshold of 10 and cannot block on its own.
+	"multipart": "rules/owasp-crs/rules/REQUEST-922-MULTIPART-ATTACK.conf",
 
 	// RESPONSE-* families. The image has always shipped these files and the data
 	// plane has always been able to run them — phase1_headers seeds
@@ -1320,14 +1332,9 @@ var crsResponseCategories = map[string]bool{
 //	    exceptions whose payload is ctl:ruleRemoveByTag=OWASP_CRS. `ctl:` is an
 //	    explicit no-op in the importer, so they are inert today — zero benefit,
 //	    and a loopback-shaped hole the day ctl: is implemented.
-//	REQUEST-922-MULTIPART-ATTACK  0 importable rules. All four SecRules target
-//	    MULTIPART_PART_HEADERS, which the engine does not implement, so wiring
-//	    it would advertise multipart coverage that detects nothing. Tracked as
-//	    an engine gap, not a wiring gap.
 var crsUnwiredFiles = []string{
 	"rules/owasp-crs/rules/REQUEST-901-INITIALIZATION.conf",
 	"rules/owasp-crs/rules/REQUEST-905-COMMON-EXCEPTIONS.conf",
-	"rules/owasp-crs/rules/REQUEST-922-MULTIPART-ATTACK.conf",
 	"rules/owasp-crs/rules/REQUEST-949-BLOCKING-EVALUATION.conf",
 	"rules/owasp-crs/rules/RESPONSE-959-BLOCKING-EVALUATION.conf",
 	"rules/owasp-crs/rules/RESPONSE-980-CORRELATION.conf",
@@ -1340,8 +1347,8 @@ var crsUnwiredFiles = []string{
 // listed before a REQUEST one cannot change evaluation — but keeping CRS order
 // means a site's rule list reads the way the upstream project documents it.
 var crsCategoryOrder = []string{
-	"method", "scanner", "protocol", "protocol_attack", "lfi", "rfi", "rce",
-	"php", "generic", "xss", "sqli", "session", "java",
+	"method", "scanner", "protocol", "protocol_attack", "multipart", "lfi",
+	"rfi", "rce", "php", "generic", "xss", "sqli", "session", "java",
 	"leak_generic", "leak_sql", "leak_java", "leak_php", "leak_iis", "web_shells",
 }
 

@@ -4463,6 +4463,8 @@ fn target_name(t: &sentinel_rules::dsl::ast::Target) -> String {
         Target::Files => "FILES".into(),
         Target::FilesNames => "FILES_NAMES".into(),
         Target::FilesCombinedSize => "FILES_COMBINED_SIZE".into(),
+        Target::MultipartPartHeaders(None) => "MULTIPART_PART_HEADERS".into(),
+        Target::MultipartPartHeaders(Some(p)) => format!("MULTIPART_PART_HEADERS:{p}"),
         Target::RemoteAddr => "REMOTE_ADDR".into(),
         Target::Geo => "GEO".into(),
         Target::TxVar(v) => format!("TX:{v}"),
