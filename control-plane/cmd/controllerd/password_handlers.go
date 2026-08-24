@@ -51,12 +51,19 @@ var (
 // sessionEpochs answers "is a token minted at time T for user U still valid?"
 // without a database round trip on every authenticated request.
 //
-// It is authoritative on the node that performed the reset (updated inline) and
-// eventually consistent elsewhere, refreshed from the database on a timer by
-// main(). That is a deliberate trade: the alternative is a query per request, on
-// a path that already does one for the jti denylist. Refresh tokens do not rely
+// It is authoritative on the node that EXECUTED the write and eventually
+// consistent elsewhere, refreshed from the database on a timer by main().
+//
+// In a cluster that distinction is sharper than it first looks. Mutating
+// requests are leader-forwarded, so when a user changes their password against
+// a follower the write — and the inline cache update — happen on the LEADER.
+// The follower the user is actually talking to learns about it only on its next
+// refresh. Measured on the 3-node deployment: the leader rejected the old access
+// token immediately while both followers served it until the tick.
+//
+// Hence sessionEpochRefreshInterval below is short. Refresh tokens never depend
 // on this at all — handleRefresh re-reads the row, so the long-lived credential
-// is always checked against the database itself.
+// is checked against the database itself on every use, on every node.
 type sessionEpochCache struct {
 	mu sync.RWMutex
 	m  map[string]time.Time
@@ -106,6 +113,16 @@ func (s *sessionEpochCache) replace(fresh map[string]time.Time) {
 
 var sessionEpochs = newSessionEpochCache()
 
+// sessionEpochRefreshInterval bounds how long a follower can keep honouring an
+// access token that a password change on the leader already invalidated.
+//
+// The query behind it is `WHERE sessions_valid_from IS NOT NULL`, so it returns
+// only accounts that have ever been reset — a handful of rows on a real
+// deployment, not the user table. That is cheap enough to run often, and running
+// it often is the whole point: at the previous 30s this window was the largest
+// remaining gap in "a password change signs you out everywhere".
+const sessionEpochRefreshInterval = 5 * time.Second
+
 // startSessionEpochRefresh keeps the cache in step with other cluster nodes.
 func startSessionEpochRefresh(ctx context.Context, store *db.Store, log *zap.Logger) {
 	if store == nil {
@@ -123,7 +140,7 @@ func startSessionEpochRefresh(ctx context.Context, store *db.Store, log *zap.Log
 	}
 	load()
 	go func() {
-		t := time.NewTicker(30 * time.Second)
+		t := time.NewTicker(sessionEpochRefreshInterval)
 		defer t.Stop()
 		for {
 			select {
