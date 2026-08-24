@@ -539,14 +539,16 @@ SENTINEL_ALLOW_SUPERUSER_DB=1
 # The initial console password. seed.go honours this; left unset it invents a
 # random one and prints it to the control plane's STDERR exactly once.
 #
-# That default is a lockout waiting to happen, and this file is the fix. There
-# is NO password-change endpoint in the product — /api/v1/admin/users/:id
-# accepts role and status only — so this single credential is the only way into
-# the console, permanently. Sourced from a container log it dies with the
-# container: any upgrade, rollback, or `docker compose up --force-recreate`
-# destroys the one copy and locks the operator out of their own WAF with no
-# recovery path. Generating it here puts it in the same 0600 file as every
-# other secret, the one the installer already tells you to back up.
+# That default is a lockout waiting to happen, and this file is the fix. Sourced
+# from a container log it dies with the container: any upgrade, rollback, or
+# `docker compose up --force-recreate` destroys the one copy. Generating it here
+# puts it in the same 0600 file as every other secret, the one the installer
+# already tells you to back up.
+#
+# The console now also has a real recovery path (Forgot password → emailed
+# link, and Settings → Users → Send reset link for an administrator), but that
+# path needs the SMTP block below to be filled in. Until it is, THIS value is
+# still the only way in — so back this file up either way.
 SENTINEL_BOOTSTRAP_ADMIN_PASSWORD=$(gen)
 GRAFANA_ADMIN_PASSWORD=$(openssl rand -base64 24 | tr -d '\n/+=' | cut -c1-24)
 
@@ -557,6 +559,38 @@ SENTINEL_SPOOL_MAX_BYTES=268435456
 
 SENTINEL_WAF_HOSTNAME=$WAF_HOSTNAME
 SENTINEL_ADMIN_EMAIL=$ADMIN_EMAIL
+
+# ── Outbound mail — REQUIRED for password recovery ───────────────────────────
+# Left blank the console still works, but "Forgot password?" cannot deliver a
+# link and an administrator cannot mail one either. Fill these in with your own
+# relay and re-run: docker compose -f compose.prod.yml up -d controlplane
+#
+# Nothing here has a default value on purpose. A shipped relay or sender address
+# would route one customer's password-reset links through someone else's mail
+# infrastructure.
+#
+#   SENTINEL_SMTP_SECURITY: starttls (default) | tls (implicit, usually :465)
+#                           | none (unauthenticated internal relay only)
+# Verify it from the console: Settings → Users → Send test email.
+SENTINEL_SMTP_HOST=
+SENTINEL_SMTP_PORT=587
+SENTINEL_SMTP_USERNAME=
+SENTINEL_SMTP_PASSWORD=
+SENTINEL_SMTP_FROM=
+SENTINEL_SMTP_FROM_NAME=Next-Gen ESDSWAF
+SENTINEL_SMTP_SECURITY=starttls
+SENTINEL_SMTP_INSECURE_SKIP_VERIFY=0
+
+# Browser-reachable console origin that reset links point at, e.g.
+# https://waf.example.com:9443 — no trailing slash. Reset links cannot be built
+# without it. It is NOT derived from the request's Host header, because the
+# forgot-password endpoint is unauthenticated and trusting that header would let
+# a caller aim someone else's reset link at a server they control.
+SENTINEL_PUBLIC_URL=https://$WAF_HOSTNAME:9443
+
+# Security contact copied on every completed password reset. Defaults to the
+# administrator address collected above.
+SENTINEL_SECURITY_NOTIFY_EMAIL=$ADMIN_EMAIL
 ENVEOF
   chmod 600 "$ENV_FILE"
   ok "secrets generated (7 values, openssl rand) — $ENV_FILE, mode 0600"

@@ -231,6 +231,36 @@ func run() error {
 				}
 				return revoked
 			})
+
+			// Session cut-off: a password reset invalidates every token minted
+			// before it. The denylist above cannot express that — it needs a jti,
+			// and nothing records the jtis an account currently holds — so this
+			// second check answers "was this issued before the credentials
+			// changed?" from an in-process map. Unlike revocation it fails CLOSED
+			// on a stale cache only in the safe direction: an entry that has not
+			// propagated yet simply keeps allowing tokens for up to one refresh
+			// interval, while refresh tokens are checked against the database on
+			// every use.
+			jwtSvc.SetSessionGuard(sessionEpochs.valid)
+			startSessionEpochRefresh(context.Background(), store, log)
+
+			// Reclaim spent and expired reset tokens alongside the existing
+			// revoked-token prune, so a busy deployment does not accumulate
+			// dead single-use rows forever.
+			go func() {
+				t := time.NewTicker(time.Hour)
+				defer t.Stop()
+				for {
+					<-t.C
+					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					if n, err := store.CleanupExpiredResetTokens(ctx); err != nil {
+						log.Warn("reset-token cleanup failed", zap.Error(err))
+					} else if n > 0 {
+						log.Info("pruned expired password reset tokens", zap.Int64("rows", n))
+					}
+					cancel()
+				}
+			}()
 			go func() {
 				t := time.NewTicker(time.Hour)
 				defer t.Stop()
@@ -467,6 +497,11 @@ func run() error {
 		// has logged in. It reveals only whether SSO is available — which the
 		// login form would reveal anyway by having a button — and never the
 		// issuer, client id or secret.
+		// Password recovery. Unauthenticated by necessity — the caller is someone
+		// who cannot log in. Both endpoints are rate-limited and neither reveals
+		// whether an account exists; see password_handlers.go.
+		authGroup.POST("/password/forgot", func(c *gin.Context) { handleForgotPassword(c, store, hub, log) })
+		authGroup.POST("/password/reset", func(c *gin.Context) { handleResetPassword(c, store, hub, log) })
 		authGroup.GET("/oidc/status", handleOIDCStatus)
 		authGroup.GET("/oidc/login", func(c *gin.Context) { handleOIDCLogin(c, jwtSvc, log) })
 		authGroup.GET("/oidc/callback", func(c *gin.Context) { handleOIDCCallback(c, jwtSvc, store, log) })
@@ -499,6 +534,9 @@ func run() error {
 	protected.Use(auth.GinAuthMiddlewareWithAPIKey(jwtSvc, false, apiKeyResolver))
 	{
 		protected.POST("/auth/logout", func(c *gin.Context) { handleLogout(c, jwtSvc, store) })
+		// Self-service rotation for a signed-in user. Requires the current
+		// password, so a borrowed session cannot be turned into ownership.
+		protected.POST("/auth/password/change", func(c *gin.Context) { handleChangePassword(c, store, hub, log) })
 		protected.POST("/auth/mfa/enroll", func(c *gin.Context) { handleMFAEnroll(c) })
 		protected.POST("/auth/mfa/confirm", func(c *gin.Context) { handleMFAConfirm(c, store) })
 		protected.POST("/auth/mfa/disable", func(c *gin.Context) { handleMFADisable(c, store) })
@@ -669,12 +707,20 @@ func run() error {
 	admin.Use(auth.GinAuthMiddlewareWithAPIKey(jwtSvc, true, apiKeyResolver))
 	{
 		admin.GET("/users", func(c *gin.Context) { handleListUsersReal(c, enforcer, store) })
-		admin.POST("/users", func(c *gin.Context) { handleCreateUserReal(c, enforcer, store) })
-		admin.PATCH("/users/:id", func(c *gin.Context) { handleUpdateUser(c, enforcer, store) })
-		admin.DELETE("/users/:id", func(c *gin.Context) { handleDeleteUser(c, enforcer, store) })
+		admin.POST("/users", func(c *gin.Context) { handleCreateUserReal(c, enforcer, store, hub) })
+		admin.PATCH("/users/:id", func(c *gin.Context) { handleUpdateUser(c, enforcer, store, hub) })
+		admin.DELETE("/users/:id", func(c *gin.Context) { handleDeleteUser(c, enforcer, store, hub) })
+		// Operator-initiated recovery: mails the user a link. It never sets or
+		// returns a password, so an administrator cannot learn a colleague's
+		// credentials and act as them afterwards.
+		admin.POST("/users/:id/reset-password", func(c *gin.Context) {
+			handleAdminResetPassword(c, enforcer, store, hub, log)
+		})
+		admin.GET("/mail", func(c *gin.Context) { handleMailStatus(c, enforcer) })
+		admin.POST("/mail/test", func(c *gin.Context) { handleMailTest(c, enforcer, store, hub, log) })
 		admin.GET("/apikeys", func(c *gin.Context) { handleListAPIKeysReal(c, enforcer, store) })
-		admin.POST("/apikeys", func(c *gin.Context) { handleCreateAPIKeyReal(c, enforcer, store) })
-		admin.DELETE("/apikeys/:id", func(c *gin.Context) { handleRevokeAPIKey(c, enforcer, store) })
+		admin.POST("/apikeys", func(c *gin.Context) { handleCreateAPIKeyReal(c, enforcer, store, hub) })
+		admin.DELETE("/apikeys/:id", func(c *gin.Context) { handleRevokeAPIKey(c, enforcer, store, hub) })
 	}
 
 	// Platform (tenant lifecycle) — provisioning is gated to the platform tenant's

@@ -66,6 +66,14 @@ func (s *Store) CreateAPIKey(ctx context.Context, tenantID, actorID, name, role 
 	if role == "" {
 		role = "viewer"
 	}
+	// api_keys.scopes is NOT NULL DEFAULT '{}', and pgx encodes a nil []string as
+	// NULL rather than omitting the column — so a request that simply left
+	// "scopes" out failed the not-null constraint and surfaced as a bare 500.
+	// That is every key the dashboard has ever tried to create: its client sends
+	// `scope` (singular, optional) and never `scopes`.
+	if scopes == nil {
+		scopes = []string{}
+	}
 	full, err := generateAPIKey()
 	if err != nil {
 		return APIKeyRow{}, "", err

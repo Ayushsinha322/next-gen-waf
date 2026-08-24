@@ -179,6 +179,32 @@ func (s *Store) RefreshUser(ctx context.Context, tenantID, userID string) (role,
 	return role, status, tx.Commit(ctx)
 }
 
+// SessionCutoff returns the session cut-off for a user, or the zero time when
+// the account has never had its sessions invalidated. Used by the refresh path
+// to reject a refresh token minted before a password change.
+func (s *Store) SessionCutoff(ctx context.Context, tenantID, userID string) (time.Time, error) {
+	tx, err := s.pool.BeginTenant(ctx, tenantID, userID)
+	if err != nil {
+		return time.Time{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	var validFrom *time.Time
+	if err := tx.QueryRow(ctx,
+		`SELECT sessions_valid_from FROM users WHERE id = $1 AND tenant_id = $2`,
+		userID, tenantID).Scan(&validFrom); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return time.Time{}, ErrUserInactive
+		}
+		return time.Time{}, fmt.Errorf("session cutoff: %w", err)
+	}
+	tx.Commit(ctx)
+	if validFrom == nil {
+		return time.Time{}, nil
+	}
+	return *validFrom, nil
+}
+
 // ErrUserInactive is returned when a session's user no longer exists or is not
 // active (disabled/deleted) — used to fail the refresh path closed.
 var ErrUserInactive = errors.New("user is inactive or does not exist")

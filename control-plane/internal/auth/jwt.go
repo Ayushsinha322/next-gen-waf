@@ -85,6 +85,10 @@ type JWTService struct {
 	// forced sign-out). Injected from main() so the auth package needn't import
 	// db. Called on every Validate, so it should be cheap.
 	revoked func(jti string) bool
+	// sessionOK, if set, reports whether a token issued at a given time for a
+	// given user is still within that account's valid session window. See
+	// SetSessionGuard.
+	sessionOK func(userID string, issuedAt time.Time) bool
 }
 
 // SetRevocationChecker wires a jti-denylist check into Validate. Every token
@@ -92,6 +96,21 @@ type JWTService struct {
 // check here covers them all.
 func (s *JWTService) SetRevocationChecker(f func(jti string) bool) {
 	s.revoked = f
+}
+
+// SetSessionGuard wires a per-user session cut-off into Validate.
+//
+// The denylist above can only revoke tokens whose jti is known, which is fine
+// for logout (the caller presents the token) and useless for "sign this account
+// out everywhere" after a password reset — nothing records the jtis a user is
+// currently holding. This guard answers the question the reset flow actually
+// asks: was this token issued before the account's credentials changed?
+//
+// f reports whether a token issued at issuedAt for userID is still acceptable.
+// It is called on every Validate, so the implementation must be cheap — the
+// control plane backs it with an in-process map, not a query.
+func (s *JWTService) SetSessionGuard(f func(userID string, issuedAt time.Time) bool) {
+	s.sessionOK = f
 }
 
 // NewJWTService creates a JWTService. If cfg.Secret is empty, a random 256-bit
@@ -222,6 +241,14 @@ func (s *JWTService) Validate(tokenString string) (*Claims, error) {
 	// they all funnel through Validate.
 	if s.revoked != nil && claims.ID != "" && s.revoked(claims.ID) {
 		return nil, ErrTokenInvalid
+	}
+	// Session cut-off (password reset / forced sign-out of an account). Tokens
+	// minted before the account's cut-off are rejected even though they are
+	// correctly signed and unexpired.
+	if s.sessionOK != nil && claims.UserID != "" && claims.IssuedAt != nil {
+		if !s.sessionOK(claims.UserID, claims.IssuedAt.Time) {
+			return nil, ErrTokenInvalid
+		}
 	}
 	return claims, nil
 }

@@ -221,6 +221,38 @@ services:
       SENTINEL_BOOTSTRAP_ADMIN_PASSWORD: ${SENTINEL_BOOTSTRAP_ADMIN_PASSWORD:-}
       # Required by the audit-HMAC fail-fast; keep it out of the committed YAML.
       SENTINEL_AUDIT_HMAC_KEY: ${SENTINEL_AUDIT_HMAC_KEY}
+
+      # ── Outbound mail (password reset) ────────────────────────────────────
+      # Password recovery is the ONLY way back into the console for a user who
+      # has forgotten their password, and it is delivered by email — so with no
+      # relay configured, self-service reset silently does nothing (the API still
+      # answers with its deliberate non-committal message, because telling an
+      # anonymous caller about your mail setup is itself a leak). The settings
+      # screen reports the real state, and Settings → Users can send a test.
+      #
+      # Every value is empty by default. Nothing here may ever gain a baked-in
+      # default: a hardcoded relay or sender would mail one deployment's password
+      # links through another organisation's infrastructure.
+      SENTINEL_SMTP_HOST: ${SENTINEL_SMTP_HOST:-}
+      SENTINEL_SMTP_PORT: ${SENTINEL_SMTP_PORT:-587}
+      SENTINEL_SMTP_USERNAME: ${SENTINEL_SMTP_USERNAME:-}
+      SENTINEL_SMTP_PASSWORD: ${SENTINEL_SMTP_PASSWORD:-}
+      SENTINEL_SMTP_FROM: ${SENTINEL_SMTP_FROM:-}
+      SENTINEL_SMTP_FROM_NAME: ${SENTINEL_SMTP_FROM_NAME:-Next-Gen ESDSWAF}
+      # starttls (default) | tls (implicit, usually :465) | none (unauthenticated
+      # local relay only — the mailer refuses to send credentials in the clear).
+      SENTINEL_SMTP_SECURITY: ${SENTINEL_SMTP_SECURITY:-starttls}
+      SENTINEL_SMTP_INSECURE_SKIP_VERIFY: ${SENTINEL_SMTP_INSECURE_SKIP_VERIFY:-0}
+      # Where a reset link points. MUST be the browser-reachable console origin.
+      # It is configuration rather than something derived from the Host header on
+      # purpose: the forgot-password endpoint is unauthenticated, so trusting the
+      # request's own host would let a caller aim a victim's reset link at a
+      # server they control.
+      SENTINEL_PUBLIC_URL: ${SENTINEL_PUBLIC_URL:-}
+      # Security contact notified whenever a console password is reset. Falls
+      # back to SENTINEL_ADMIN_EMAIL, which install.sh already collects.
+      SENTINEL_ADMIN_EMAIL: ${SENTINEL_ADMIN_EMAIL:-}
+      SENTINEL_SECURITY_NOTIFY_EMAIL: ${SENTINEL_SECURITY_NOTIFY_EMAIL:-}
       # SINGLE-TENANT DEMO POSTURE. This stack connects as the Postgres superuser
       # ('sentinel'), which bypasses FORCE ROW LEVEL SECURITY. Tenant isolation
       # here is enforced by the explicit tenant_id predicates in the stores (not

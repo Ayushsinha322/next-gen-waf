@@ -253,6 +253,21 @@ func handleRefresh(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store) {
 			return
 		}
 		claims.Role = role
+
+		// Session cut-off, read from the database rather than the in-process
+		// cache. The refresh token lives for days against the access token's
+		// minutes, so it is the credential a password reset most needs to kill —
+		// and checking it here makes "signed out everywhere" true on every node
+		// immediately, without waiting for cache propagation.
+		if cutoff, cerr := store.SessionCutoff(c.Request.Context(), claims.TenantID, claims.UserID); cerr == nil {
+			if !cutoff.IsZero() && claims.IssuedAt != nil &&
+				claims.IssuedAt.Time.Before(cutoff.Truncate(time.Second)) {
+				c.JSON(http.StatusUnauthorized, gin.H{
+					"error": "session ended by a password change — please sign in again",
+				})
+				return
+			}
+		}
 	}
 	claims.AuthMethod = "refresh_rotation"
 	accessToken, err := jwtSvc.IssueAccessToken(*claims)
@@ -2891,7 +2906,7 @@ func handleListUsersReal(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 	c.JSON(http.StatusOK, gin.H{"users": users, "tenant_id": claims.TenantID})
 }
 
-func handleCreateUserReal(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
+func handleCreateUserReal(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceUser, rbac.ActionCreate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
@@ -2923,10 +2938,26 @@ func handleCreateUserReal(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 		respondStoreError(c, err)
 		return
 	}
+
+	// Creating an account is a privileged security action and belongs in the
+	// tamper-evident trail. The diff records who was created and with what role;
+	// it must never carry the password, which is why only these fields are named.
+	actorID := claims.UserID
+	newID := u.ID
+	diff, _ := json.Marshal(map[string]any{"email": u.Email, "role": u.Role})
+	writeAuditEntry(c, store, hub, &db.WriteAuditRequest{
+		TenantID:    claims.TenantID,
+		ActorUserID: &actorID,
+		Action:      "user.create",
+		TargetKind:  "user",
+		TargetID:    &newID,
+		Diff:        diff,
+	})
+
 	c.JSON(http.StatusCreated, gin.H{"user": u})
 }
 
-func handleUpdateUser(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
+func handleUpdateUser(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceUser, rbac.ActionUpdate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
@@ -2952,10 +2983,32 @@ func handleUpdateUser(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 		respondStoreError(c, err)
 		return
 	}
+
+	// Role escalation is the single most valuable action an attacker can take
+	// with a stolen admin session, and it was previously invisible. The diff
+	// records what was requested; empty fields mean "left unchanged".
+	actorID := claims.UserID
+	targetID := c.Param("id")
+	diff, _ := json.Marshal(map[string]any{"role": req.Role, "status": req.Status})
+	writeAuditEntry(c, store, hub, &db.WriteAuditRequest{
+		TenantID:    claims.TenantID,
+		ActorUserID: &actorID,
+		Action:      "user.update",
+		TargetKind:  "user",
+		TargetID:    &targetID,
+		Diff:        diff,
+	})
+
+	// A disabled account must stop being able to act immediately rather than at
+	// the end of its current access token's life.
+	if strings.EqualFold(req.Status, "disabled") || strings.EqualFold(req.Status, "suspended") {
+		sessionEpochs.set(targetID, time.Now().UTC())
+	}
+
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
-func handleDeleteUser(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
+func handleDeleteUser(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceUser, rbac.ActionDelete) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
@@ -2973,6 +3026,21 @@ func handleDeleteUser(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 		respondStoreError(c, err)
 		return
 	}
+
+	// Deleting the account removes the row an audit entry would point at, so the
+	// trail is the only remaining record that it ever existed — which is exactly
+	// why "create, act, delete" left no trace before this.
+	actorID := claims.UserID
+	targetID := c.Param("id")
+	writeAuditEntry(c, store, hub, &db.WriteAuditRequest{
+		TenantID:    claims.TenantID,
+		ActorUserID: &actorID,
+		Action:      "user.delete",
+		TargetKind:  "user",
+		TargetID:    &targetID,
+	})
+	sessionEpochs.set(targetID, time.Now().UTC())
+
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -2994,7 +3062,7 @@ func handleListAPIKeysReal(c *gin.Context, enf *rbac.Enforcer, store *db.Store) 
 	c.JSON(http.StatusOK, gin.H{"api_keys": keys, "tenant_id": claims.TenantID})
 }
 
-func handleCreateAPIKeyReal(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
+func handleCreateAPIKeyReal(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceAPIKey, rbac.ActionCreate) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
@@ -3031,6 +3099,23 @@ func handleCreateAPIKeyReal(c *gin.Context, enf *rbac.Enforcer, store *db.Store)
 		respondStoreError(c, err)
 		return
 	}
+
+	// Minting a key is issuing a second, longer-lived credential — an admin-role
+	// key is equivalent to an admin account. The diff records the name and the
+	// privileges granted, never the key itself (which is returned to the caller
+	// once and stored only as a hash).
+	actorID := claims.UserID
+	keyID := row.ID
+	diff, _ := json.Marshal(map[string]any{"name": row.Name, "role": row.Role, "scopes": req.Scopes})
+	writeAuditEntry(c, store, hub, &db.WriteAuditRequest{
+		TenantID:    claims.TenantID,
+		ActorUserID: &actorID,
+		Action:      "apikey.create",
+		TargetKind:  "apikey",
+		TargetID:    &keyID,
+		Diff:        diff,
+	})
+
 	c.JSON(http.StatusCreated, gin.H{
 		"api_key": row,
 		"key":     fullKey, // shown exactly once
@@ -3038,7 +3123,7 @@ func handleCreateAPIKeyReal(c *gin.Context, enf *rbac.Enforcer, store *db.Store)
 	})
 }
 
-func handleRevokeAPIKey(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
+func handleRevokeAPIKey(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub) {
 	claims, _ := auth.GetClaims(c.Request.Context())
 	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceAPIKey, rbac.ActionDelete) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
@@ -3052,5 +3137,16 @@ func handleRevokeAPIKey(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 		respondStoreError(c, err)
 		return
 	}
+
+	actorID := claims.UserID
+	keyID := c.Param("id")
+	writeAuditEntry(c, store, hub, &db.WriteAuditRequest{
+		TenantID:    claims.TenantID,
+		ActorUserID: &actorID,
+		Action:      "apikey.delete",
+		TargetKind:  "apikey",
+		TargetID:    &keyID,
+	})
+
 	c.JSON(http.StatusOK, gin.H{"ok": true, "message": "API key revoked"})
 }

@@ -42,6 +42,35 @@ async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
 }
 
 /**
+ * Fetch for endpoints that are reachable WITHOUT a session.
+ *
+ * apiFetch is wrong for these in two ways. It attaches whatever token is in
+ * localStorage — and the people using password recovery are exactly the ones
+ * whose stored token is stale — and it treats the resulting 401 as an expired
+ * session, so it calls logout() and redirects to /login. The effect was that a
+ * locked-out user with an old token could never reach the reset form: the page
+ * bounced them to the login screen they could not get past.
+ *
+ * This sends no credentials, follows no refresh path, and surfaces the server's
+ * own error text so the caller can show something useful.
+ */
+async function publicFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, {
+    ...init,
+    headers: { "Content-Type": "application/json", ...(init.headers as Record<string, string>) },
+  });
+  if (!res.ok) {
+    let message = res.statusText;
+    try {
+      const body = await res.json();
+      if (body && typeof body.error === "string") message = body.error;
+    } catch { /* non-JSON error body — fall back to the status text */ }
+    throw new Error(message);
+  }
+  return res.json() as Promise<T>;
+}
+
+/**
  * Multipart upload with the same auth + one-shot refresh behaviour as apiFetch.
  *
  * Separate because apiFetch hardcodes `Content-Type: application/json`. For a
@@ -731,6 +760,49 @@ export const api = {
         "/auth/login",
         { method: "POST", body: JSON.stringify({ email, password }) }
       ),
+
+    /** Start a self-service password reset.
+     *
+     * Always resolves with the same message whether or not the address has an
+     * account — the backend deliberately gives no signal, and the UI must not
+     * invent one by branching on anything here. */
+    forgotPassword: (email: string) =>
+      publicFetch<{ ok: boolean; message: string }>("/auth/password/forgot", {
+        method: "POST", body: JSON.stringify({ email }),
+      }),
+
+    /** Redeem a reset link and set the new password. */
+    resetPassword: (token: string, password: string) =>
+      publicFetch<{ ok: boolean; message: string }>("/auth/password/reset", {
+        method: "POST", body: JSON.stringify({ token, password }),
+      }),
+
+    /** Rotate your own password. Requires the current one; on success every
+     *  session — including this one — has been signed out, which is why the
+     *  response carries reauth_required. */
+    changePassword: (current_password: string, new_password: string) =>
+      apiFetch<{ ok: boolean; reauth_required: boolean; message: string }>(
+        "/auth/password/change",
+        { method: "POST", body: JSON.stringify({ current_password, new_password }) }
+      ),
+  },
+
+  mail: {
+    /** SMTP status for the settings screen. The password is reported only as
+     *  password_set — the value is never sent to the browser. */
+    status: () =>
+      apiFetch<{ mail: {
+        configured: boolean; password_reset_ready: boolean;
+        host: string; port: number; security: string; from: string;
+        from_name: string; username: string; password_set: boolean;
+        skip_verify: boolean; notify_email: string; public_url: string;
+        auth_required: boolean; public_url_hint?: string;
+      } }>("/admin/mail"),
+
+    sendTest: (to?: string) =>
+      apiFetch<{ ok: boolean; message: string }>("/admin/mail/test", {
+        method: "POST", body: JSON.stringify(to ? { to } : {}),
+      }),
   },
 
   dashboard: {
@@ -832,14 +904,25 @@ export const api = {
       // `password` is REQUIRED by the API — handleCreateUserReal binds it with
       // `binding:"required,min=12"`. It was missing from this signature, so every
       // "Invite User" request was rejected 400 before it reached the database.
-      // Nothing sends mail in this product; creating a user means setting their
-      // password here and telling them out of band.
       create: (body: { email: string; name: string; role: string; password: string }) =>
         apiFetch<{ user: UserRow; message: string }>("/admin/users", { method: "POST", body: JSON.stringify(body) }),
+
+      /** Email the user a reset link.
+       *
+       * Returns only a confirmation message. There is deliberately no password
+       * in the response: an administrator who could read a colleague's new
+       * password could then act as them, and the audit trail would show the
+       * colleague. */
+      sendResetLink: (id: string) =>
+        apiFetch<{ ok: boolean; message: string }>(`/admin/users/${id}/reset-password`, { method: "POST" }),
     },
     apikeys: {
       list:   () => apiFetch<{ api_keys: APIKeyRow[]; tenant_id: string }>("/admin/apikeys"),
-      create: (body: { name: string; scope?: string }) =>
+      // The API reads `scopes` (a string array) and `role`. This previously
+      // declared `scope` — singular, and a name the backend never looks at — so
+      // the field was silently dropped and every key was created with whatever
+      // the server defaulted to.
+      create: (body: { name: string; role?: string; scopes?: string[] }) =>
         apiFetch<{ api_key: APIKeyRow & { key: string }; warning: string }>(
           "/admin/apikeys", { method: "POST", body: JSON.stringify(body) }
         ),

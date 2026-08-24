@@ -364,7 +364,7 @@ export default function LoginPage() {
               <input type="checkbox" defaultChecked />
               Remember this device
             </label>
-            <a id="forgot" href="#">Forgot password?</a>
+            <a id="forgot" href="/forgot-password">Forgot password?</a>
           </div>
 
           {/* Error */}
