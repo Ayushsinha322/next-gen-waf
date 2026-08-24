@@ -58,6 +58,34 @@ x-cp-env: &cp-env
   SENTINEL_CORS_ORIGINS: ${SENTINEL_CORS_ORIGINS:-https://127.0.0.1:9443,http://127.0.0.1:3000}
   SENTINEL_DATAPLANE_URL: http://dataplane:8080
   SENTINEL_ROOT_CA_PATH: /etc/sentinel/root-ca.crt
+
+  # ── Outbound mail (password reset) ──────────────────────────────────────
+  # Every node needs these, not just the one defined in compose.prod.yml.
+  # Leader-forwarding means ANY control plane accepts an API call, so a
+  # forgot-password request can land on cp2 or cp3 — and a node without this
+  # block would answer "SMTP is not configured" while its siblings send mail.
+  # That is the same "fixed the service, missed the topology" shape the
+  # SENTINEL_CORS_ORIGINS note above records, and it was reproduced here: the
+  # first pass added these to compose.prod.yml only, and cp2/cp3 came up with
+  # zero SMTP variables.
+  #
+  # Blank by default and never given a baked-in value — a shipped relay or
+  # sender would route one deployment's password-reset links through another
+  # organisation's mail infrastructure.
+  SENTINEL_SMTP_HOST: ${SENTINEL_SMTP_HOST:-}
+  SENTINEL_SMTP_PORT: ${SENTINEL_SMTP_PORT:-587}
+  SENTINEL_SMTP_USERNAME: ${SENTINEL_SMTP_USERNAME:-}
+  SENTINEL_SMTP_PASSWORD: ${SENTINEL_SMTP_PASSWORD:-}
+  SENTINEL_SMTP_FROM: ${SENTINEL_SMTP_FROM:-}
+  SENTINEL_SMTP_FROM_NAME: ${SENTINEL_SMTP_FROM_NAME:-Next-Gen ESDSWAF}
+  SENTINEL_SMTP_SECURITY: ${SENTINEL_SMTP_SECURITY:-starttls}
+  SENTINEL_SMTP_INSECURE_SKIP_VERIFY: ${SENTINEL_SMTP_INSECURE_SKIP_VERIFY:-0}
+  # Reset links are built from this, never from the request's Host header: the
+  # forgot-password endpoint is unauthenticated, so trusting that header would
+  # let a caller aim a victim's link at a server they control.
+  SENTINEL_PUBLIC_URL: ${SENTINEL_PUBLIC_URL:-}
+  SENTINEL_ADMIN_EMAIL: ${SENTINEL_ADMIN_EMAIL:-}
+  SENTINEL_SECURITY_NOTIFY_EMAIL: ${SENTINEL_SECURITY_NOTIFY_EMAIL:-}
   # Disk-pressure alert: page the SOC when ClickHouse disk crosses this used-%.
   SENTINEL_DISK_ALERT_PCT: ${SENTINEL_DISK_ALERT_PCT:-80}
   SENTINEL_DISK_CHECK_SECS: ${SENTINEL_DISK_CHECK_SECS:-300}
