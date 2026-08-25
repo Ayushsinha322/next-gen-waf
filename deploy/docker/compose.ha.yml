@@ -81,6 +81,24 @@ x-wafnode: &wafnode
   networks: [sentinel]
 
 services:
+  # This fleet REPLACES compose.prod.yml's single `dataplane` service — but
+  # merging an overlay does not remove a service, it only adds to it, so that
+  # base service survived into every HA deployment. It was never disabled, only
+  # avoided: the usage line above passes an explicit `up -d waf1 waf2 waf3 lb`,
+  # and the whole topology depends on the operator remembering to.
+  #
+  # A plain `docker compose up -d` — the command anyone handed this box will
+  # reach for first — therefore tries to start a FOURTH data plane that fights
+  # waf1 for :443 and :9443 and HAProxy for :80. Verified by dry-run on the
+  # 3-node deployment, where `sentinel-dataplane-1` has never existed precisely
+  # because nobody has ever run the obvious command.
+  #
+  # A profile is the removal compose does not otherwise offer: the service stays
+  # defined (so `--profile single-node` can still bring it up deliberately) and
+  # is excluded from every default `up`.
+  dataplane:
+    profiles: ["single-node"]
+
   waf1:
     <<: *wafnode
     environment:
