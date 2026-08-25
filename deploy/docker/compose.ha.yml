@@ -21,17 +21,35 @@ x-wafnode: &wafnode
   image: ${SENTINEL_IMAGE_PREFIX:-sentinel}/dataplane:${SENTINEL_VERSION:-latest}
   restart: unless-stopped
   user: "0:0"
-  # File descriptors — see the longer note on the `dataplane` service in
-  # compose.prod.yml. Every node here accepts up to max_connections (default
-  # 10,000) and needs a second descriptor per proxied connection, so saturation
-  # wants 20,000+.
+  # Kernel XDP needs these to load and attach the BPF program and its maps.
+  # Their absence is why every node in this fleet reported
+  # `ebpf.mode=software, kernel_requested=false` while the standalone
+  # `dataplane` service in compose.prod.yml ran kernel-xdp on the SAME image —
+  # the binary is always built `--features kernel`, so the only difference was
+  # what the topology granted it. It degrades to the userspace software path
+  # instead of failing, which is exactly why it went unnoticed.
   #
-  # This anchor had NO ulimits, so the fix applied to compose.prod.yml's single
-  # `dataplane` service never reached waf1/waf2/waf3 — i.e. it was missing from
-  # precisely the multi-node topology most likely to carry concurrent load. On a
-  # host whose Docker default is the traditional 1024, accept(2) starts returning
-  # EMFILE at roughly 500 concurrent connections per node.
+  # Third instance of the omission the ulimits note below already records: a fix
+  # lands on compose.prod.yml's single service and never reaches waf1/waf2/waf3.
+  cap_add:
+    - NET_ADMIN
+    - BPF
+    - SYS_RESOURCE
+    - PERFMON
   ulimits:
+    # Locked memory for BPF maps. Unlimited, matching the standalone service:
+    # map creation fails outright below the default 64 KB.
+    memlock: -1
+    # File descriptors — see the longer note on the `dataplane` service in
+    # compose.prod.yml. Every node here accepts up to max_connections (default
+    # 10,000) and needs a second descriptor per proxied connection, so saturation
+    # wants 20,000+.
+    #
+    # This anchor had NO ulimits, so the fix applied to compose.prod.yml's single
+    # `dataplane` service never reached waf1/waf2/waf3 — i.e. it was missing from
+    # precisely the multi-node topology most likely to carry concurrent load. On a
+    # host whose Docker default is the traditional 1024, accept(2) starts returning
+    # EMFILE at roughly 500 concurrent connections per node.
     nofile: { soft: 65536, hard: 65536 }
   depends_on:
     controlplane: { condition: service_started }
@@ -76,6 +94,33 @@ x-wafnode: &wafnode
     SENTINEL_CORRELATION_MAX_SCORE: ${SENTINEL_CORRELATION_MAX_SCORE:-4}
     # Last-good config cache, on a per-node volume (see each service below).
     SENTINEL_CONFIG_CACHE_PATH: /var/lib/sentinel/state/config-cache.json
+    # ── Kernel XDP fast path ────────────────────────────────────────────────
+    # Drops blocked source IPs in the NIC/driver path before they reach the
+    # proxy; degrades to software mode if the attach fails, so this is safe on
+    # hosts that do not permit XDP.
+    #
+    # Effectiveness differs by port in THIS topology, which is worth knowing
+    # before reading the counters: :443 is published by waf1 directly, so the
+    # transport peer is the client and XDP sees its packets. :80 arrives from
+    # HAProxy, so every packet's source is the LB — a banned client IP never
+    # matches at the XDP layer there, and is still stopped in the proxy.
+    #
+    # Auto-ban is safe behind the LB for two independent reasons: the nodes
+    # resolve the real client through SENTINEL_TRUSTED_PROXIES above rather than
+    # banning the transport peer, and private addresses are excluded from
+    # auto-ban (SENTINEL_XDP_AUTOBAN_INCLUDE_PRIVATE is deliberately not
+    # plumbed), so HAProxy's own container address can never be black-holed.
+    SENTINEL_XDP_ENABLE: ${SENTINEL_XDP_ENABLE:-1}
+    SENTINEL_XDP_IFACE: ${SENTINEL_XDP_IFACE:-eth0}
+    SENTINEL_XDP_BLOCK: ${SENTINEL_XDP_BLOCK:-}
+    SENTINEL_XDP_AUTOBAN: ${SENTINEL_XDP_AUTOBAN:-1}
+    SENTINEL_XDP_AUTOBAN_BLOCKS: ${SENTINEL_XDP_AUTOBAN_BLOCKS:-20}
+  # NOTE: every waf service below declares its own `volumes:` (each needs its own
+  # state volume), and a service-level key REPLACES the anchor's rather than
+  # merging into it. So anything added here is inert for all three nodes. The BTF
+  # mount kernel XDP needs is therefore repeated per service, not set here —
+  # putting it here would look configured and do nothing, which is the failure
+  # mode this file has already hit twice.
   volumes:
     - ./sentinel.proxy.yaml:/etc/sentinel/sentinel.yaml:ro
   networks: [sentinel]
@@ -116,6 +161,9 @@ services:
     volumes:
       - sentinel-logs:/var/log/sentinel   # live-log source the control plane tails
       - ./sentinel.proxy.yaml:/etc/sentinel/sentinel.yaml:ro
+      # Kernel BTF so aya can load the BTF-typed BPF maps. Repeated per
+      # service because a service-level `volumes:` replaces the anchor's.
+      - /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro
       - sentinel-certs:/var/lib/sentinel/certs   # shared cert repository (ACME/uploaded)
       - waf1-state:/var/lib/sentinel/state       # this node's last-good config cache
     ports:
@@ -162,6 +210,9 @@ services:
     volumes:
       - sentinel-logs:/var/log/sentinel   # live-log source the control plane tails
       - ./sentinel.proxy.yaml:/etc/sentinel/sentinel.yaml:ro
+      # Kernel BTF so aya can load the BTF-typed BPF maps. Repeated per
+      # service because a service-level `volumes:` replaces the anchor's.
+      - /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro
       - waf2-state:/var/lib/sentinel/state
   waf3:
     <<: *wafnode
@@ -175,6 +226,9 @@ services:
     volumes:
       - sentinel-logs:/var/log/sentinel   # live-log source the control plane tails
       - ./sentinel.proxy.yaml:/etc/sentinel/sentinel.yaml:ro
+      # Kernel BTF so aya can load the BTF-typed BPF maps. Repeated per
+      # service because a service-level `volumes:` replaces the anchor's.
+      - /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro
       - waf3-state:/var/lib/sentinel/state
 
   lb:
