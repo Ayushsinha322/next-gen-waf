@@ -1,7 +1,11 @@
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 
-const PUBLIC_PATHS = ["/login", "/api/"];
+// Password recovery has to be reachable by someone who cannot sign in, so these
+// two routes are public alongside the login page. They carry no data of their
+// own: /forgot-password only submits an address, and /reset-password is useless
+// without a token the server independently validates.
+const PUBLIC_PATHS = ["/login", "/forgot-password", "/reset-password", "/api/"];
 
 function isValidJWT(token: string): boolean {
   // A JWT has exactly 3 base64url segments separated by dots.

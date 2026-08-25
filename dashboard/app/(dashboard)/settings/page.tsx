@@ -5,6 +5,7 @@ import { showToast } from "@/components/ui/Toast";
 import Toggle from "@/components/ui/Toggle";
 import { api, type UserRow, type APIKeyRow, type NotificationChannel, type ChannelType, type ChannelConfig, type Severity, type ManagementTLSInfo, type ClusterHealth } from "@/lib/api";
 import { staggerContainer, fadeUp, spring } from "@/lib/animations";
+import { logout } from "@/lib/auth";
 
 const TABS = ["General","Auth & SSO","API Keys","Users & RBAC","Cluster","Notifications","Management TLS"];
 
@@ -255,7 +256,12 @@ function APIKeysTab() {
     if (!newName.trim()) { showToast("Key name required","w","⚠️"); return; }
     setCreating(true);
     try {
-      const res = await api.admin.apikeys.create({ name: newName, scope: newScope });
+      // The API takes `scopes` as an array and a separate `role`. The picker
+      // offers space-separated scope strings ("read:all write:rules"), so split
+      // them; a key that can write needs more than the default viewer role.
+      const scopes = newScope.split(/\s+/).filter(Boolean);
+      const role = scopes.some(s => s.startsWith("write:")) ? "editor" : "viewer";
+      const res = await api.admin.apikeys.create({ name: newName, role, scopes });
       setRevealKey(res.api_key.key);
       setKeys(prev => [res.api_key as unknown as APIKeyRow, ...prev]);
       setNewName(""); setNewScope("read:all");
@@ -340,23 +346,44 @@ function UsersTab() {
   const [invRole, setInvRole]   = useState("viewer");
   const [invPass, setInvPass]   = useState("");
   const [inviting, setInviting] = useState(false);
+  // id of the user whose reset link is currently being sent
+  const [resetting, setResetting] = useState<string | null>(null);
+  // null = not yet known. The reset button is only disabled once we KNOW mail is
+  // unconfigured, so a slow status call never blocks a working action.
+  const [mailReady, setMailReady] = useState<boolean | null>(null);
+  const [mailHost, setMailHost]   = useState("");
 
   useEffect(() => {
     api.admin.users.list()
       .then(r => setUsers(r.users ?? []))
       .catch(() => showToast("Failed to load users","e","⚠️"))
       .finally(() => setLoading(false));
+    api.mail.status()
+      .then(r => { setMailReady(r.mail.password_reset_ready); setMailHost(r.mail.host); })
+      .catch(() => setMailReady(null));
   }, []);
 
-  // Creates a user directly. Nothing in this product sends email, so there is no
-  // invitation to accept — the password is set here and communicated out of band.
+  async function sendReset(id: string, email: string) {
+    setResetting(id);
+    try {
+      const res = await api.admin.users.sendResetLink(id);
+      showToast(res.message ?? `Reset link sent to ${email}`, "s", "✉️");
+    } catch (e) {
+      // The API says exactly what is wrong (SMTP unset, no public URL, relay
+      // refused). Passing it through is the difference between an operator
+      // fixing it in a minute and filing a bug.
+      showToast(e instanceof Error ? e.message : "Could not send reset link", "e", "⚠️");
+    } finally { setResetting(null); }
+  }
+
+  // Creates a user with an initial password. The account holder can change it
+  // themselves afterwards (Your password, below), and an administrator can mail
+  // them a reset link — so this password is a starting credential, not a
+  // permanent one as it used to be.
   //
   // This used to POST {email,name,role} with no password. The API binds password
   // as `required,min=12`, so every attempt was rejected 400 and the catch below
-  // reported a flat "Failed to invite user", hiding the reason. Creating a second
-  // administrator was therefore impossible, which matters more than it looks:
-  // there is no password-change or reset endpoint either, so the seeded admin is
-  // the only account, and a second admin is the only redundancy available.
+  // reported a flat "Failed to invite user", hiding the reason.
   async function invite() {
     if (!invEmail.trim()) { showToast("Email required","w","⚠️"); return; }
     if (invPass.length < 12) { showToast("Password must be at least 12 characters","w","⚠️"); return; }
@@ -389,6 +416,27 @@ function UsersTab() {
   }
 
   return (
+    <>
+    <ChangePasswordCard />
+
+    {/* Password recovery depends entirely on outbound mail, so its real state
+        belongs here rather than being discovered when someone is locked out. */}
+    {mailReady === false && (
+      <Note tone="warn">
+        <strong>Password recovery is unavailable.</strong> No SMTP relay is configured,
+        so &ldquo;Forgot password?&rdquo; cannot deliver a link and the reset buttons below
+        are disabled. Set <code>SENTINEL_SMTP_HOST</code>, <code>SENTINEL_SMTP_FROM</code> and{" "}
+        <code>SENTINEL_PUBLIC_URL</code> in the deployment&apos;s <code>.env</code>, then
+        recreate the control plane.
+      </Note>
+    )}
+    {mailReady === true && (
+      <Note>
+        Password recovery is active — mail relays through <code>{mailHost}</code>. Users
+        can reset from the sign-in page, and you can email any account a single-use link below.
+      </Note>
+    )}
+
     <motion.div className="panel" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}>
       <div className="ph">
         <div className="ptitle">👥 Team Members</div>
@@ -410,13 +458,14 @@ function UsersTab() {
                 <option value="viewer">Viewer</option><option value="editor">Editor</option><option value="admin">Admin</option>
               </select></div>
           </div>
-          {/* No mail is sent anywhere in this product, and the password cannot be
-              changed afterwards — there is no reset endpoint — so the operator has
-              to be told both facts at the point of use rather than discovering
-              them later. */}
+          {/* Creating an account still sends nothing — the operator hands over the
+              first password. What changed is that it is no longer permanent, so
+              say what the user can do next instead of warning that they are stuck
+              with it. */}
           <div style={{marginTop:8, fontSize:12, color:"var(--text3)"}}>
-            No email is sent. Give the user these credentials directly — passwords
-            cannot be changed after the account is created.
+            No email is sent when the account is created — give the user this first
+            password directly. They can change it themselves after signing in, and
+            you can email them a reset link from the table below.
           </div>
           <motion.button className="btn bp btn-sm" style={{marginTop:10}} onClick={invite} disabled={inviting} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
             {inviting ? "Creating…" : "✅ Create User"}
@@ -428,7 +477,7 @@ function UsersTab() {
           <div style={{padding:"16px",textAlign:"center",fontSize: 13,color:"var(--text3)"}}>Loading…</div>
         ) : (
           <table>
-            <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>2FA</th><th>Last Login</th><th>Status</th></tr></thead>
+            <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>2FA</th><th>Last Login</th><th>Status</th><th>Password</th></tr></thead>
             <tbody>
               {users.map((u, idx) => (
                 <motion.tr key={u.id} initial={{ opacity: 0, x: -6 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: idx * 0.02 }}>
@@ -438,11 +487,87 @@ function UsersTab() {
                   <td><span className={`bdg ${u.twofa?"bgg":"bgr"}`}>{u.twofa?"✓ TOTP":"✗ None"}</span></td>
                   <td className="td3">{fmtLogin(u.last_login)}</td>
                   <td><span className={`bdg ${u.status==="active"?"bgg":"bgr"}`}>{u.status.toUpperCase()}</span></td>
+                  <td>
+                    <button
+                      className="btn btn-sm"
+                      disabled={resetting === u.id || mailReady === false}
+                      title={mailReady === false
+                        ? "SMTP is not configured on this deployment, so no reset email can be sent"
+                        : `Email ${u.email} a single-use reset link`}
+                      onClick={() => sendReset(u.id, u.email)}
+                    >
+                      {resetting === u.id ? "Sending…" : "✉️ Send reset link"}
+                    </button>
+                  </td>
                 </motion.tr>
               ))}
             </tbody>
           </table>
         )}
+      </div>
+    </motion.div>
+    </>
+  );
+}
+
+/**
+ * Rotate your own password.
+ *
+ * The current password is required — the API enforces it, and this form does not
+ * try to be cleverer than that. On success every session is signed out, this one
+ * included, so the user is sent back to the login page rather than left holding
+ * a token that will start returning 401 a moment later.
+ */
+function ChangePasswordCard() {
+  const [cur, setCur] = useState("");
+  const [next, setNext] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const tooShort = next.length > 0 && next.length < 12;
+  const mismatch = confirm.length > 0 && next !== confirm;
+  const ready = cur && next && !tooShort && !mismatch && !busy;
+
+  async function submit() {
+    if (!ready) return;
+    setBusy(true);
+    try {
+      const res = await api.auth.changePassword(cur, next);
+      showToast(res.message ?? "Password updated", "s", "🔐");
+      setCur(""); setNext(""); setConfirm("");
+      // Every session just died, including this tab's. Send the user to sign in
+      // again instead of letting the next request fail mysteriously.
+      setTimeout(() => { logout(); window.location.href = "/login"; }, 1600);
+    } catch (e) {
+      showToast(e instanceof Error ? e.message : "Could not change password", "e", "⚠️");
+    } finally { setBusy(false); }
+  }
+
+  return (
+    <motion.div className="panel" style={{ marginBottom: 14 }}
+      initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}>
+      <div className="ph"><div className="ptitle">🔐 Your password</div></div>
+      <div className="pb">
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
+          <div className="fg2"><label className="flbl2">Current password *</label>
+            <input className="fin2" type="password" autoComplete="current-password"
+              value={cur} onChange={e => setCur(e.target.value)} /></div>
+          <div className="fg2"><label className="flbl2">New password *</label>
+            <input className="fin2" type="password" autoComplete="new-password"
+              placeholder="min 12 characters" value={next} onChange={e => setNext(e.target.value)} /></div>
+          <div className="fg2"><label className="flbl2">Confirm new password *</label>
+            <input className="fin2" type="password" autoComplete="new-password"
+              value={confirm} onChange={e => setConfirm(e.target.value)} /></div>
+        </div>
+        <div style={{ marginTop: 8, fontSize: 12, color: "var(--text3)" }}>
+          {tooShort ? "Use at least 12 characters."
+            : mismatch ? "Both new-password entries must match."
+            : "Changing your password signs out every session, including this one."}
+        </div>
+        <motion.button className="btn bp btn-sm" style={{ marginTop: 10 }} onClick={submit}
+          disabled={!ready} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
+          {busy ? "Updating…" : "🔐 Change password"}
+        </motion.button>
       </div>
     </motion.div>
   );

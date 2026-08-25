@@ -13,6 +13,74 @@ correct, and never actually ran.
 
 ---
 
+## FIXED 2026-08-24 — the two P0s from the launch-readiness audit
+
+Both were found by auditing the running deployment rather than the source, and
+both are verified against `172.16.21.101` with the flow actually executed, not
+by reading the code back.
+
+### P0-1. There was no way to change a password — anywhere in the product
+
+`PATCH /api/v1/admin/users/:id` accepted `role` and `status` only. No endpoint,
+no UI, no CLI. The seeder printed *"Log in and change it immediately"* for a
+capability that did not exist, and the login page linked "Forgot password?" at
+`#`. An administrator set every user's password and therefore knew it
+permanently; a leaked credential could never be rotated.
+
+**Now:** a full recovery flow — `POST /auth/password/forgot`, `POST
+/auth/password/reset`, authenticated `POST /auth/password/change`, and
+`POST /admin/users/:id/reset-password` for an operator-initiated reset that
+mails the user a link and **never returns or displays a password**, so an
+administrator cannot learn a colleague's credentials and then act as them.
+
+Verified end to end against the running deployment, over a real SMTP
+conversation with a capture relay:
+
+| Property | Evidence |
+|---|---|
+| Token is 32 bytes of `crypto/rand` | 43-char base64url in the delivered mail |
+| Only a hash is stored | `sha256(token)` matched the stored `token_hash`; the raw token appears nowhere in the database |
+| Single use | second redemption → `400 invalid or has expired` |
+| Expiry enforced | backdated `expires_at` → rejected, password unchanged |
+| Superseded on re-request | the earlier link stops working when a new one is issued |
+| Old password dies | `401` |
+| New password works | `200` |
+| Sessions invalidated | pre-reset **access** token → `401`, pre-reset **refresh** token → `401`, fresh login → `200` |
+| No account enumeration | byte-identical `200` body for a real address, an unknown address and a rate-limited caller; mail sent only for the real one |
+| Rate limited | 6 requests → 6 × `200`, **3** emails, 3 `password.reset.rate_limited` log lines |
+| Nothing secret in logs | 0 occurrences of the token, the old password or the new one |
+| Audited | `user.password.reset_requested` (even for unknown addresses) and `user.password.reset` |
+| A weak password does not burn the link | rejected `400`, token still `used_at IS NULL` |
+
+Mail is configured entirely from the environment (`SENTINEL_SMTP_*`,
+`SENTINEL_PUBLIC_URL`, `SENTINEL_SECURITY_NOTIFY_EMAIL`). **No relay, sender or
+credential is hardcoded** — a baked-in default would route one deployment's
+reset links through another organisation's infrastructure. `SENTINEL_PUBLIC_URL`
+is required rather than derived from the `Host` header, because the
+forgot-password endpoint is unauthenticated and trusting that header would let a
+caller aim a victim's reset link at a server they control.
+
+### P0-2. Privileged user changes left no audit trail
+
+`CreateUser`, `UpdateUser`, `DeleteUser` and API-key creation wrote no audit row.
+Creating a user produced only the subsequent `user.login`; the string
+`"user.create"` existed **only in a test fixture**. Role escalation by a stolen
+admin session was invisible, which undercut the point of the hash chain.
+
+**Now** emitted and verified on the running system: `user.create`, `user.update`
+(with the role diff), `user.delete`, `apikey.create` (name/role/scopes, never key
+material), `apikey.delete`. The chain still verifies: **73 rows, 0 broken links**.
+
+### Found while fixing the above — API keys could never be created from the console
+
+`POST /admin/apikeys` returned a bare `500` whenever `scopes` was omitted: pgx
+encodes a nil `[]string` as `NULL` and the column is `NOT NULL`. The dashboard
+sent `scope` (singular) — a field the API never reads — so **every** key the
+console ever tried to create failed. Fixed on both sides; creation with and
+without scopes now returns `201`.
+
+---
+
 ## P0 — Contradicts a claim we make
 
 ### 0. Twelve of the 25 shipped CRS files can never reach the data plane
