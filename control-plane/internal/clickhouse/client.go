@@ -462,6 +462,92 @@ func (c *Client) Facets(ctx context.Context, column, tenant string, from, to int
 	return out, nil
 }
 
+// LearningStat is one rule's would-have-blocked aggregate, reconstructed from
+// the stored DETECT events. Field names match logs.LearningStat so the two
+// sources are interchangeable to an API consumer.
+type LearningStat struct {
+	RuleID   string   `json:"rule_id"`
+	Category string   `json:"category"`
+	Severity string   `json:"severity"`
+	Message  string   `json:"message"`
+	Count    int64    `json:"count"`
+	LastSeen string   `json:"last_seen"`
+	Samples  []string `json:"samples"`
+}
+
+// LearningStats rebuilds the learning report from stored events rather than
+// from process memory.
+//
+// The in-memory aggregate in logs.Hub is fed by TAILING waf.log from its end
+// (see tailKind), so a control-plane restart silently reset the report to
+// empty — and that report is the evidence an operator uses to decide a site is
+// safe to flip from learning to blocking. The DETECT rows were always durable
+// in ClickHouse; nothing read them back. This does.
+//
+// Tenant-scoped, like every other read here. The in-memory path had no tenant
+// predicate at all, so on a multi-site deployment the report mixed sites the
+// caller may not own.
+//
+// `site` is optional ("" = every site in the tenant). from/to are optional
+// (0 = no bound): unlike Search this deliberately does NOT default to the last
+// 24 hours, because a learning window runs for a business cycle and a silently
+// truncated report would understate what a rule would block — the exact error
+// that makes a flip-to-blocking decision unsafe.
+func (c *Client) LearningStats(ctx context.Context, tenant, site string, from, to int64, sampleCap int) ([]LearningStat, error) {
+	var out []LearningStat
+	if err := c.queryJSON(ctx, c.learningSQL(tenant, site, from, to, sampleCap), &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// learningWhere builds the predicates for the learning report. Split out so a
+// test can assert the tenant boundary and the absence of a default time bound
+// without needing a live ClickHouse.
+func (c *Client) learningWhere(tenant, site string, from, to int64) []string {
+	where := []string{
+		eq("tenant", tenant),
+		// action='DETECT' is exactly what the data plane writes for a
+		// would-have-blocked request (see enforce_mode / record_event).
+		eq("action", "DETECT"),
+		"rule != ''",
+		"rule != '-'",
+	}
+	if site != "" {
+		where = append(where, eq("site", site))
+	}
+	// Bounds only when asked. Deliberately NOT c.timeWhere, which defaults to
+	// the last 24 hours — a learning window runs for a business cycle, and a
+	// silently truncated report understates what a rule would block, which is
+	// the one error that makes a flip-to-blocking decision unsafe.
+	if from > 0 {
+		where = append(where, fmt.Sprintf("ts >= toDateTime(%d)", from))
+	}
+	if to > 0 {
+		where = append(where, fmt.Sprintf("ts <= toDateTime(%d)", to))
+	}
+	return where
+}
+
+func (c *Client) learningSQL(tenant, site string, from, to int64, sampleCap int) string {
+	if sampleCap <= 0 || sampleCap > 20 {
+		sampleCap = 5
+	}
+	// argMax over ts for severity/message: the hub's in-memory version let the
+	// most recent non-empty value win, and matching that keeps the two sources
+	// from disagreeing about the same rule.
+	return fmt.Sprintf(
+		"SELECT rule AS rule_id, "+
+			"argMax(severity, ts) AS severity, "+
+			"argMax(attack, ts) AS message, "+
+			"count() AS count, "+
+			"formatDateTime(max(ts), '%%Y-%%m-%%dT%%H:%%i:%%SZ', 'UTC') AS last_seen, "+
+			"groupUniqArray(%d)(path) AS samples "+
+			"FROM %s.waf_events WHERE %s "+
+			"GROUP BY rule ORDER BY count DESC LIMIT 500",
+		sampleCap, c.db, strings.Join(c.learningWhere(tenant, site, from, to), " AND "))
+}
+
 // TopAttackers rolls up waf_events by source IP over the window, returning the
 // busiest IPs with their total event count, actively-blocked count, resolved
 // country (best-effort — the most recent non-empty value), and last-seen time.

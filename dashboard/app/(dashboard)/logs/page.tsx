@@ -5,19 +5,21 @@ import { motion } from "framer-motion";
 import { api } from "@/lib/api";
 import { spring } from "@/lib/animations";
 
-type LogKind = "access" | "waf" | "error" | "audit" | "modsec" | "ml";
+type LogKind = "access" | "waf" | "error" | "audit";
 interface LogRow { _lid: number; [k: string]: unknown; }
 type LogStore = Record<LogKind, LogRow[]>;
 
 interface LogFile { id: LogKind; label: string; group: string; }
 
+// modsec.log and ml.log are NOT offered: nothing writes them. They came from
+// sentinel-telemetry's EventLogger, which had no callers and was removed in
+// 2026-08, so selecting either showed an empty pane forever — which reads as
+// "the WAF has stopped logging", not as "this file does not exist".
 const LOG_FILES: LogFile[] = [
   { id: "access", label: "access.log",       group: "WAF Logs"     },
   { id: "waf",    label: "waf.log",          group: "WAF Logs"     },
   { id: "error",  label: "error.log",        group: "WAF Logs"     },
   { id: "audit",  label: "audit.log",        group: "System Logs"  },
-  { id: "modsec", label: "modsec.log",       group: "System Logs"  },
-  { id: "ml",     label: "ml.log",           group: "Intelligence" },
 ];
 
 const MAX = 500;
@@ -55,10 +57,6 @@ function fmt(kind: LogKind, r: Record<string, unknown>): string {
       return `${ts} [${r.lvl ?? "ERROR"}] component=${r.subsystem ?? r.component} code=${r.code ?? "-"} msg="${r.msg}"`;
     case "audit":
       return `${ts} [AUDIT] user=${r.user} action=${r.action} resource=${r.resource} ip=${r.ip} result=${r.result} session=${r.session}`;
-    case "modsec":
-      return `${ts} [CRS] txid=${r.txId} phase=${r.phase} rule=${r.ruleId ?? r.rule_id} sev=${r.sev} ip=${r.ip} uri=${r.uri ?? r.path} action=${r.action} msg="${r.msg}" site=${r.site}`;
-    case "ml":
-      return `${ts} [ML] model=${r.model} ip=${r.ip} path=${r.path} verdict=${r.verdict} conf=${r.conf}% latency=${r.latency}ms site=${r.site}`;
     default:
       return JSON.stringify(r);
   }
@@ -96,8 +94,6 @@ function rowClass(kind: LogKind, r: Record<string, unknown>): string {
     case "waf":    return r.sev === "CRITICAL" ? "ll-critical" : (r.action === "BLOCKED" || r.action === "BLOCK") ? "ll-block" : "ll-warn";
     case "error":  return r.lvl === "FATAL" ? "ll-critical" : r.lvl === "ERROR" ? "ll-err" : r.lvl === "WARN" ? "ll-warn" : "ll-info";
     case "audit":  return r.result === "FAILURE" ? "ll-err" : "ll-info";
-    case "modsec": return r.action === "blocked" ? "ll-block" : parseInt(String(r.sev)) <= 2 ? "ll-critical" : "ll-warn";
-    case "ml":     return /BLOCK|INJECT|CRITICAL/.test(String(r.verdict ?? "")) ? "ll-critical" : /ANOMALY|SUSPECT/.test(String(r.verdict ?? "")) ? "ll-warn" : "ll-info";
     default:       return "ll-info";
   }
 }
@@ -116,7 +112,7 @@ function LogsInner() {
   const [follow, setFollow] = useState(true);
   const [search, setSearch] = useState("");
   const [connected, setCon] = useState(false);
-  const [logs, setLogs]     = useState<LogStore>({ access:[], waf:[], error:[], audit:[], modsec:[], ml:[] });
+  const [logs, setLogs]     = useState<LogStore>({ access:[], waf:[], error:[], audit:[] });
 
   // Latches true the moment any fabricated entry arrives, and never resets for
   // the life of the view — a simulated stream must stay labelled even if live

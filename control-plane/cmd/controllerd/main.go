@@ -641,7 +641,7 @@ func run() error {
 		})
 		protected.GET("/metrics/learning", func(c *gin.Context) {
 			if requirePerm(c, enforcer, rbac.ResourceSite, rbac.ActionList) {
-				handleLearningReport(c, hub)
+				handleLearningReport(c, chClient, hub)
 			}
 		})
 		protected.GET("/audit", func(c *gin.Context) { handleListAudit(c, enforcer, store) })

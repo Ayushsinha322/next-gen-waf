@@ -21,6 +21,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/your-org/sentinel-waf/control-plane/internal/auth"
+	chreader "github.com/your-org/sentinel-waf/control-plane/internal/clickhouse"
 	"github.com/your-org/sentinel-waf/control-plane/internal/db"
 	"github.com/your-org/sentinel-waf/control-plane/internal/leader"
 	"github.com/your-org/sentinel-waf/control-plane/internal/logs"
@@ -2373,10 +2374,64 @@ func handleSiteMetrics(c *gin.Context, hub *logs.Hub) {
 
 // handleLearningReport returns the would-have-blocked aggregation for the WAF
 // learning workflow. Optional ?site=<label> scopes it to one site; omitted =
-// across all sites. The "rules" array is sorted by detection count desc.
-func handleLearningReport(c *gin.Context, hub *logs.Hub) {
+// across all sites. Optional ?from=&to= (unix seconds) bound the window. The
+// "rules" array is sorted by detection count desc.
+//
+// Served from ClickHouse when it is configured, because the in-memory
+// aggregate in logs.Hub is fed by tailing waf.log FROM ITS END: a control-plane
+// restart reset the report to empty, and this report is the evidence an
+// operator uses to decide a site is safe to flip out of learning mode. The
+// stored path is also tenant-scoped, which the in-memory one is not.
+//
+// `source` is reported so a reader can tell durable evidence from
+// since-restart-only evidence instead of having to assume.
+func handleLearningReport(c *gin.Context, ch *chreader.Client, hub *logs.Hub) {
+	claims, _ := auth.GetClaims(c.Request.Context())
 	site := c.Query("site")
-	c.JSON(http.StatusOK, gin.H{"site": site, "rules": hub.GetLearningStats(site)})
+
+	if ch != nil && ch.Enabled() {
+		rules, err := ch.LearningStats(
+			c.Request.Context(),
+			claims.TenantID, // isolation boundary — never from client input
+			site,
+			atoi64(c.Query("from")),
+			atoi64(c.Query("to")),
+			0,
+		)
+		if err == nil {
+			// Categories are derived here rather than stored, so both sources
+			// classify through the same function.
+			for i := range rules {
+				rules[i].Category = logs.AttackCategory(rules[i].RuleID)
+			}
+			if rules == nil {
+				rules = []chreader.LearningStat{}
+			}
+			c.JSON(http.StatusOK, gin.H{
+				"site": site, "rules": rules, "source": "clickhouse", "durable": true,
+			})
+			return
+		}
+		// Fall through to the in-memory aggregate, but say so: reporting a
+		// since-restart view as if it were the full record is how an operator
+		// flips a site to blocking on evidence that was quietly incomplete.
+		zap.L().Warn("learning report: clickhouse query failed, serving in-memory aggregate",
+			zap.Error(err))
+		c.JSON(http.StatusOK, gin.H{
+			"site": site, "rules": hub.GetLearningStats(site),
+			"source": "memory", "durable": false,
+			"warning": "event store unreachable — this covers only the period since the " +
+				"control plane last restarted, and is not scoped to your tenant",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"site": site, "rules": hub.GetLearningStats(site),
+		"source": "memory", "durable": false,
+		"warning": "no event store configured — this covers only the period since the " +
+			"control plane last restarted",
+	})
 }
 
 // ---------------------------------------------------------------------------

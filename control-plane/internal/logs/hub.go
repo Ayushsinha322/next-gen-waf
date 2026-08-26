@@ -3,7 +3,7 @@
 // connected dashboard clients.
 //
 // Log directory: $SENTINEL_LOG_DIR (default /tmp/sentinel-logs).
-// One file per kind: access.log, waf.log, error.log, audit.log, modsec.log, ml.log
+// One file per kind: access.log, waf.log, error.log, audit.log
 // Each file contains one JSON object per line (NDJSON).
 package logs
 
@@ -217,7 +217,14 @@ func NewHub() *Hub {
 
 	dir := LogDir()
 
-	kinds := []string{"access", "waf", "error", "audit", "modsec", "ml"}
+	// modsec.log and ml.log are deliberately absent: NOTHING writes them.
+	// They were produced only by sentinel-telemetry's EventLogger, which had no
+	// callers and was removed in 2026-08. Tailing them cost a goroutine polling a
+	// never-existing path every 200ms — per kind, per node directory, so six
+	// pointless tailers on a three-node layout — and offered the operator two
+	// permanently-empty views in the console's file picker. Re-add a kind only
+	// alongside something that writes it.
+	kinds := []string{"access", "waf", "error", "audit"}
 
 	// Single-node layout: the data plane writes straight into $SENTINEL_LOG_DIR.
 	for _, kind := range kinds {
@@ -629,6 +636,13 @@ func (h *Hub) updateMetrics(e Entry) {
 //	944 Java.
 //
 // Unknown / native rule IDs fall through to "other".
+// AttackCategory maps a rule id (or one of the data plane's synthetic non-rule
+// labels) onto a coarse attack category. Exported because the learning report
+// is now also built from stored ClickHouse events, which carry the rule id but
+// not the category — both paths must classify identically or the same rule
+// would appear under different categories depending on which source served it.
+func AttackCategory(rule string) string { return attackCategory(rule) }
+
 func attackCategory(rule string) string {
 	// Synthetic labels the data plane emits for non-rule blocks (see
 	// classify_nonrule_block in the proxy).

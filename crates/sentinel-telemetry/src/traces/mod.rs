@@ -3,7 +3,7 @@
 //! Provides [`TraceId`], [`SpanId`], [`Span`], and [`Tracer`] with a global
 //! [`TRACER`] singleton.  When a span is finished via [`Span::finish`] it
 //! emits a structured `tracing` event so that any installed subscriber
-//! (including the JSON one from `sentinel-telemetry::logs`) picks it up.
+//! (the proxy's JSON tracing subscriber) picks it up.
 //!
 //! # Example
 //!
