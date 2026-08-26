@@ -8,7 +8,7 @@
 #      export GITLAB_TOKEN=<your GitLab personal access token>
 #      ./get-esdswaf.sh                 # offline bundle (default, always works)
 #      ./get-esdswaf.sh --online        # smaller, needs Docker Hub at install time
-#      ./get-esdswaf.sh --version 1.0.2
+#      ./get-esdswaf.sh --version 1.1.0
 #
 #  Then:  cd ESDSWAF-v<version> && sudo ./install.sh
 #
@@ -20,7 +20,7 @@ set -uo pipefail
 GITLAB_HOST="${GITLAB_HOST:-git.enlight.dev}"
 PROJECT_ID="${PROJECT_ID:-1301}"
 PKG_NAME="esdswaf"
-VERSION="${ESDSWAF_VERSION:-1.0.2}"
+VERSION="${ESDSWAF_VERSION:-1.1.0}"
 VARIANT="offline"
 
 while [[ $# -gt 0 ]]; do
