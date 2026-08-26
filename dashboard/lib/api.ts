@@ -333,6 +333,12 @@ export interface WafEvent {
   site:     string;
   method:   string;
   path:     string;
+  /** Query string (capped by the data plane). Empty/absent on older rows. */
+  query?:   string;
+  /** Referer header — for SPA traffic, which screen fired the request. */
+  referer?: string;
+  /** The text the rule actually matched (credential targets arrive redacted). */
+  matched?: string;
   rule:     string;
   attack:   string;
   action:   string;  // BLOCK | DETECT

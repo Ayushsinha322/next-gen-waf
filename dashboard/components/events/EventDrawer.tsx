@@ -143,7 +143,8 @@ export default function EventDrawer({
           <Row label="Time" mono>{new Date(event.ts * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z")}</Row>
           <Row label="Source IP" mono>{event.ip}{event.country ? ` · ${event.country}` : ""}</Row>
           <Row label="Site" mono>{event.site}</Row>
-          <Row label="Request" mono>{event.method} {event.path}</Row>
+          <Row label="Request" mono>{event.method} {event.path}{event.query ? `?${event.query}` : ""}</Row>
+          {event.referer && <Row label="Referer" mono>{event.referer}</Row>}
           <Row label="Protocol" mono>{event.protocol || "—"}</Row>
           <Row label="Response" mono>{event.status || "—"}</Row>
           <Row label="Matched rule" mono>{event.rule || "—"}</Row>
@@ -166,16 +167,35 @@ export default function EventDrawer({
             ) : "—"}
           </Row>
 
-          <div style={{
-            marginTop: 16, padding: "10px 12px", borderRadius: "var(--r2)",
-            background: "var(--bg3)", border: "1px solid var(--border2)",
-            fontSize: "var(--fs-label)", color: "var(--text3)", lineHeight: 1.6,
-          }}>
-            The matched field and matched value are not recorded for this event.
-            The event store keeps the rule that fired and its attack class, but not
-            the specific variable or payload fragment that triggered it — so this
-            view can tell you which rule matched, not which byte did.
-          </div>
+          {/* The payload the rule matched — what lets an operator judge a false
+              positive from this drawer alone. Absent on rows written before the
+              column existed, or when the operator produced no capturable text;
+              credential-bearing targets arrive already redacted by the data
+              plane, so a raw password can never render here. */}
+          {event.matched ? (
+            <div style={{
+              marginTop: 16, padding: "10px 12px", borderRadius: "var(--r2)",
+              background: "var(--bg3)", border: "1px solid var(--border2)",
+            }}>
+              <div style={{ fontSize: "var(--fs-label)", color: "var(--text3)", textTransform: "uppercase", letterSpacing: "var(--tr-wide)", marginBottom: 6 }}>
+                Matched payload{event.target ? ` — ${event.target}` : ""}
+              </div>
+              <code style={{
+                fontFamily: "var(--font-mono)", fontSize: "var(--fs-sm)",
+                color: "var(--text)", wordBreak: "break-all", whiteSpace: "pre-wrap",
+              }}>{event.matched}</code>
+            </div>
+          ) : (
+            <div style={{
+              marginTop: 16, padding: "10px 12px", borderRadius: "var(--r2)",
+              background: "var(--bg3)", border: "1px solid var(--border2)",
+              fontSize: "var(--fs-label)", color: "var(--text3)", lineHeight: 1.6,
+            }}>
+              No matched payload was recorded for this event — either it predates
+              payload capture, or the operator that fired produced no capturable
+              text (numeric comparisons, validators, classifier verdicts).
+            </div>
+          )}
 
           <div style={{ marginTop: 20 }}>
             <div style={{ fontSize: "var(--fs-label)", color: "var(--text3)", textTransform: "uppercase", letterSpacing: "var(--tr-wide)", marginBottom: 10 }}>

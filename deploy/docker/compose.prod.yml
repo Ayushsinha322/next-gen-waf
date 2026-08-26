@@ -359,6 +359,11 @@ services:
     environment:
       SENTINEL_CONFIG: /etc/sentinel/sentinel.yaml
       SENTINEL_LOG_DIR: /var/log/sentinel
+      # NDJSON log rotation ceiling: MAX_MB x (KEEP + 1) x 2 streams
+      # (access.log + waf.log) — 1.2 GB at these defaults. Lower both on a small
+      # disk; the logs volume is not otherwise bounded.
+      SENTINEL_LOG_MAX_MB: ${SENTINEL_LOG_MAX_MB:-100}
+      SENTINEL_LOG_KEEP: ${SENTINEL_LOG_KEEP:-5}
       RUST_LOG: info,sentinel=info
       # Shared secret so the control plane can reach the loopback-only cert API.
       SENTINEL_INTERNAL_SECRET: ${SENTINEL_INTERNAL_SECRET}

@@ -72,6 +72,19 @@ pub struct WafEventRow {
     pub tenant: String,
     pub method: String,
     pub path: String,
+    /// The request's query string, capped at write time. Kept separate from
+    /// `path` so per-path grouping keeps its cardinality. Empty when the
+    /// request had none (or the row predates the column).
+    #[serde(default)]
+    pub query: String,
+    /// Referer header — for SPA traffic, the only field naming which screen of
+    /// the app fired the request. Empty when absent.
+    #[serde(default)]
+    pub referer: String,
+    /// The text the top rule actually matched (capped, credential targets
+    /// redacted at the source). Empty when nothing capturable matched.
+    #[serde(default)]
+    pub matched: String,
     /// Top matched rule ID (empty if none).
     pub rule: String,
     /// Attack class / rule message.
@@ -438,7 +451,8 @@ impl ClickHouseClient {
              (ts DateTime, ip String, country LowCardinality(String), \
               site LowCardinality(String), tenant LowCardinality(String), \
               method LowCardinality(String), \
-              path String, rule LowCardinality(String), attack String, \
+              path String, query String, referer String, matched String, \
+              rule LowCardinality(String), attack String, \
               action LowCardinality(String), severity LowCardinality(String), \
               score UInt32, status UInt16, protocol LowCardinality(String), \
               request_id String, target String, mode LowCardinality(String), \
@@ -483,6 +497,12 @@ impl ClickHouseClient {
             "mode LowCardinality(String)",
             "threshold UInt32",
             "explanation String",
+            // Forensic-triage columns (2026-08): the query string, the page the
+            // request came from, and the text the rule matched. Empty on rows
+            // written before they existed — the UI renders that as absent.
+            "query String",
+            "referer String",
+            "matched String",
         ] {
             self.exec(format!(
                 "ALTER TABLE {db}.waf_events ADD COLUMN IF NOT EXISTS {col} DEFAULT {default}",
@@ -527,7 +547,8 @@ impl ClickHouseClient {
         }
         let mut sql = format!(
             "INSERT INTO {db}.waf_events \
-             (ts, ip, country, site, tenant, method, path, rule, attack, action, severity, score, status, protocol, \
+             (ts, ip, country, site, tenant, method, path, query, referer, matched, \
+              rule, attack, action, severity, score, status, protocol, \
               request_id, target, mode, threshold, explanation) \
              FORMAT JSONEachRow\n",
             db = self.database
@@ -866,7 +887,10 @@ mod tests {
             site: site.into(),
             tenant: "tenant-test".into(),
             method: "GET".into(),
-            path: "/?id=1 UNION SELECT".into(),
+            path: "/".into(),
+            query: "id=1 UNION SELECT".into(),
+            referer: String::new(),
+            matched: "1 UNION SELECT".into(),
             rule: rule.into(),
             attack: "SQL injection".into(),
             action: "BLOCK".into(),

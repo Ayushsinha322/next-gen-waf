@@ -2389,11 +2389,11 @@ async fn handle_request(
 
 /// Shared request pipeline, transport-agnostic over the request body type.
 ///
-/// Runs the eBPF fast-fail, sets up the tracing span, drives the WAF pipeline
-/// (`proxy`), and records metrics. Called by the TCP handler (`handle_request`,
-/// after its health/management/ACME routing boxes the `Incoming` body) and by
-/// the HTTP/3 adapter (`crate::http3`), which builds a `BoxBody` from the QUIC
-/// request stream. Never returns an error — upstream failures become responses.
+/// Sets up the tracing span, drives the WAF pipeline (`proxy`), and records
+/// metrics. Called by the TCP handler (`handle_request`, after its
+/// health/management/ACME routing boxes the `Incoming` body) and by the HTTP/3
+/// adapter (`crate::http3`), which builds a `BoxBody` from the QUIC request
+/// stream. Never returns an error — upstream failures become responses.
 pub(crate) async fn run_pipeline(
     state: Arc<ServerState>,
     peer: SocketAddr,
@@ -2401,8 +2401,17 @@ pub(crate) async fn run_pipeline(
     default_site: Option<String>,
     tls_fp: Option<String>,
 ) -> Response<BoxBody> {
-    // Blocklist fast-fail: known-blocked addresses never enter the WAF pipeline.
-    // Runs before body reads and before any WAF work.
+    // The blocklist fast-fail used to live HERE, ahead of context creation, and
+    // that placement is why it recorded nothing: it returned a bare 403 without
+    // an access-log line, a waf.log event, a ClickHouse row, or a Support ID.
+    // Every other block in this proxy is visible; these were not — and the
+    // threat-intel block tier and the XDP auto-ban both feed this same
+    // blocklist, so the blocks most worth seeing were the invisible ones, while
+    // /metrics still counted them (so the counters could not be reconciled with
+    // any event). It now runs inside `proxy`, immediately after Phase 0 stamps
+    // identity and attribution — still before any body read or rule work, and
+    // by then TLS and HTTP parsing are already paid for, so the marginal cost
+    // is a log line, not a pipeline.
     //
     // This checks the TRANSPORT PEER *and* the resolved client IP, and the second half
     // is not optional. Checking only `peer.ip()` made this control INERT in the shipped
@@ -2422,18 +2431,6 @@ pub(crate) async fn run_pipeline(
     // resolve_client_ip only trusts XFF when the peer is a configured trusted proxy and
     // walks the chain right-to-left, so a client-supplied header cannot spoof its way
     // *past* a block, nor forge someone else's address into one.
-    if blocklist_hit(
-        peer.ip(),
-        req.headers(),
-        |ip| state.ebpf.is_blocked(ip),
-        is_trusted_proxy,
-    ) {
-        inc_ebpf_drops();
-        inc_requests();
-        inc_blocked();
-        return error_response(StatusCode::FORBIDDEN, "Forbidden");
-    }
-
     // Request admission control: acquire a permit from the global in-flight
     // request semaphore. This is the per-request half of admission control (the
     // accept loop bounds connections); it specifically caps HTTP/2 and HTTP/3
@@ -2523,6 +2520,22 @@ async fn proxy(
     // ctx.request_headers is populated, so block_response cannot recover this
     // later — see RequestContext::client_accepts_html.
     ctx.client_accepts_html = wants_html(req.headers());
+    // Stamp the request line + the log-relevant headers NOW, for the same
+    // reason: the connection-layer rejections below (anti-DDoS, IP reputation,
+    // threat intel) log and answer before Phase 1 populates the context, so
+    // every one of their events read as `GET / ua="-"` regardless of what was
+    // actually requested — and those are exactly the blocks a stranger holds a
+    // Support ID for. Method/URI/version are cheap clones; the full header map
+    // is deliberately NOT cloned here (that still happens exactly once, after
+    // into_parts) — only the two headers logging reads are copied.
+    ctx.http_version = req.version();
+    ctx.method = req.method().clone();
+    ctx.uri = req.uri().clone();
+    for h in [header::USER_AGENT, header::REFERER] {
+        if let Some(v) = req.headers().get(&h) {
+            ctx.request_headers.insert(h, v.clone());
+        }
+    }
 
     // Attribute the request to a site/tenant BEFORE the connection-layer checks
     // below, which reject and log without ever reaching routing.
@@ -2550,15 +2563,59 @@ async fn proxy(
         }
     }
 
+    // Blocklist fast-fail: known-blocked addresses never enter the WAF pipeline.
+    // First check after attribution, so nothing else runs for a blocked source.
+    //
+    // This checks the TRANSPORT PEER *and* the resolved client IP, and the second half
+    // is not optional. Checking only `peer.ip()` made this control INERT in the shipped
+    // HA topology: behind HAProxy (or any load balancer, CDN, or ingress) every request
+    // arrives with the proxy as its peer, so the blocklist compared the proxy's address
+    // — never the attacker's — and matched nothing. It appeared to work only in the
+    // single-VM demo, where the client happened to be the immediate peer. A feature that
+    // silently does nothing in production is worse than an absent one, because it is
+    // counted as coverage.
+    //
+    // The peer check is retained rather than replaced: it is the only thing that applies
+    // when there is no proxy in front, and it is what the in-kernel XDP program can see
+    // (XDP runs at L3 and has no access to X-Forwarded-For at all — see
+    // crates/sentinel-ebpf, and the deployment note in the DDoS guide about placing
+    // per-source enforcement at the edge where the peer IS the client).
+    //
+    // resolve_client_ip only trusts XFF when the peer is a configured trusted proxy and
+    // walks the chain right-to-left, so a client-supplied header cannot spoof its way
+    // *past* a block, nor forge someone else's address into one.
+    // `req.headers()` rather than `ctx.request_headers`: Phase 0 copies only the
+    // two headers logging reads, and this needs the X-Forwarded-For chain. The
+    // full map is still intact here — `into_parts()` runs at Phase 1.
+    if blocklist_hit(
+        peer.ip(),
+        req.headers(),
+        |ip| state.ebpf.is_blocked(ip),
+        is_trusted_proxy,
+    ) {
+        inc_ebpf_drops();
+        ctx.decision = WafDecision::Block;
+        // Named so `classify_nonrule_block` files it under IPREP rather than
+        // inventing an "anomaly threshold exceeded" verdict for a score of 0.
+        ctx.block_reason = Some("ip reputation: source is on the node blocklist".into());
+        let resp = block_response(&ctx);
+        stamp_response(&mut ctx, &resp);
+        ctx.advance_phase(Phase::Logging);
+        log_request(&ctx);
+        return Ok(resp);
+    }
+
     // Anti-DDoS: connection-rate check.
     match state.modules.anti_ddos.check_connection(ctx.client_ip) {
         DdosVerdict::Block { reason } => {
             ctx.decision = WafDecision::Block;
             ctx.block_reason = Some(reason);
             note_block(&state, ctx.client_ip);
+            let resp = block_response(&ctx);
+            stamp_response(&mut ctx, &resp);
             ctx.advance_phase(Phase::Logging);
             log_request(&ctx);
-            return Ok(block_response(&ctx));
+            return Ok(resp);
         }
         DdosVerdict::Allow => {}
     }
@@ -2571,9 +2628,11 @@ async fn proxy(
                 ctx.decision = WafDecision::Block;
                 ctx.block_reason = Some(format!("IP reputation: {reason}"));
                 note_block(&state, ctx.client_ip);
+                let resp = block_response(&ctx);
+                stamp_response(&mut ctx, &resp);
                 ctx.advance_phase(Phase::Logging);
                 log_request(&ctx);
-                return Ok(block_response(&ctx));
+                return Ok(resp);
             }
             IpVerdict::Suspect { tags } => {
                 ctx.tx_vars
@@ -2607,9 +2666,11 @@ async fn proxy(
                     ctx.decision = WafDecision::Block;
                     ctx.block_reason = Some(format!("threat intel: {reason}"));
                     note_block(&state, ctx.client_ip);
+                    let resp = block_response(&ctx);
+                    stamp_response(&mut ctx, &resp);
                     ctx.advance_phase(Phase::Logging);
                     log_request(&ctx);
-                    return Ok(block_response(&ctx));
+                    return Ok(resp);
                 }
                 ThreatVerdict::Score { score, tag } => {
                     // Feed the ML "learning" loop: this flag becomes a strongly-
@@ -2734,9 +2795,11 @@ async fn proxy(
                         "URI too long: {} bytes (limit {})",
                         uri_len, s.waf.max_uri_length
                     ));
+                    let resp = error_response(StatusCode::URI_TOO_LONG, "URI Too Long");
+                    stamp_response(&mut ctx, &resp);
                     ctx.advance_phase(Phase::Logging);
                     log_request(&ctx);
-                    return Ok(error_response(StatusCode::URI_TOO_LONG, "URI Too Long"));
+                    return Ok(resp);
                 }
             }
             // Request header count limit.
@@ -2748,12 +2811,14 @@ async fn proxy(
                         "too many headers: {} (limit {})",
                         hcount, s.waf.max_header_count
                     ));
-                    ctx.advance_phase(Phase::Logging);
-                    log_request(&ctx);
-                    return Ok(error_response(
+                    let resp = error_response(
                         StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
                         "Too Many Headers",
-                    ));
+                    );
+                    stamp_response(&mut ctx, &resp);
+                    ctx.advance_phase(Phase::Logging);
+                    log_request(&ctx);
+                    return Ok(resp);
                 }
             }
             // HTTP method allow-list (empty = allow all). Case-insensitive.
@@ -2767,12 +2832,11 @@ async fn proxy(
                 {
                     ctx.decision = WafDecision::Block;
                     ctx.block_reason = Some(format!("method not allowed: {m}"));
+                    let resp = error_response(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed");
+                    stamp_response(&mut ctx, &resp);
                     ctx.advance_phase(Phase::Logging);
                     log_request(&ctx);
-                    return Ok(error_response(
-                        StatusCode::METHOD_NOT_ALLOWED,
-                        "Method Not Allowed",
-                    ));
+                    return Ok(resp);
                 }
             }
         }
@@ -2794,7 +2858,7 @@ async fn proxy(
             .map(|b| b.challenge)
             .unwrap_or(ChallengeMode::NativePow);
         if let Some(resp) = challenge_response(&mut ctx, challenge_mode, bot_cfg).await {
-            ctx.response_status = Some(resp.status());
+            stamp_response(&mut ctx, &resp);
             ctx.advance_phase(Phase::Logging);
             log_request(&ctx);
             return Ok(resp);
@@ -2819,7 +2883,7 @@ async fn proxy(
         } else {
             block_response(&ctx)
         };
-        ctx.response_status = Some(resp.status());
+        stamp_response(&mut ctx, &resp);
         ctx.advance_phase(Phase::Logging);
         log_request(&ctx);
         return Ok(resp);
@@ -2846,12 +2910,12 @@ async fn proxy(
                     "request body too large (limit {} bytes)",
                     max_bytes
                 ));
+                let resp =
+                    error_response(StatusCode::PAYLOAD_TOO_LARGE, "Request Entity Too Large");
+                stamp_response(&mut ctx, &resp);
                 ctx.advance_phase(Phase::Logging);
                 log_request(&ctx);
-                return Ok(error_response(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "Request Entity Too Large",
-                ));
+                return Ok(resp);
             }
             // Enforce the cap WHILE streaming. For `Transfer-Encoding: chunked`
             // bodies size_hint is None (→0), so without this an attacker could
@@ -2874,23 +2938,22 @@ async fn proxy(
                         "request body too large (limit {} bytes)",
                         max_bytes
                     ));
+                    let resp =
+                        error_response(StatusCode::PAYLOAD_TOO_LARGE, "Request Entity Too Large");
+                    stamp_response(&mut ctx, &resp);
                     ctx.advance_phase(Phase::Logging);
                     log_request(&ctx);
-                    return Ok(error_response(
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        "Request Entity Too Large",
-                    ));
+                    return Ok(resp);
                 }
                 Ok(Err(e)) => return Err(anyhow::anyhow!("collecting request body: {e}")),
                 Err(_) => {
                     ctx.decision = WafDecision::Block;
                     ctx.block_reason = Some("request body read timed out (slow-body)".into());
+                    let resp = error_response(StatusCode::REQUEST_TIMEOUT, "Request Timeout");
+                    stamp_response(&mut ctx, &resp);
                     ctx.advance_phase(Phase::Logging);
                     log_request(&ctx);
-                    return Ok(error_response(
-                        StatusCode::REQUEST_TIMEOUT,
-                        "Request Timeout",
-                    ));
+                    return Ok(resp);
                 }
             }
         } else {
@@ -2899,12 +2962,11 @@ async fn proxy(
                 Err(_) => {
                     ctx.decision = WafDecision::Block;
                     ctx.block_reason = Some("request body read timed out (slow-body)".into());
+                    let resp = error_response(StatusCode::REQUEST_TIMEOUT, "Request Timeout");
+                    stamp_response(&mut ctx, &resp);
                     ctx.advance_phase(Phase::Logging);
                     log_request(&ctx);
-                    return Ok(error_response(
-                        StatusCode::REQUEST_TIMEOUT,
-                        "Request Timeout",
-                    ));
+                    return Ok(resp);
                 }
             }
         };
@@ -2969,7 +3031,7 @@ async fn proxy(
             // Soft-deny from weighted fusion — throttle with 429 (configurable),
             // do not auto-ban (uncertain traffic).
             let resp = limit_response(&ctx, site);
-            ctx.response_status = Some(resp.status());
+            stamp_response(&mut ctx, &resp);
             ctx.advance_phase(Phase::Logging);
             log_request(&ctx);
             return Ok(resp);
@@ -2977,7 +3039,7 @@ async fn proxy(
         if ctx.decision == WafDecision::Block {
             note_block(&state, ctx.client_ip);
             let resp = block_response(&ctx);
-            ctx.response_status = Some(resp.status());
+            stamp_response(&mut ctx, &resp);
             ctx.advance_phase(Phase::Logging);
             log_request(&ctx);
             return Ok(resp);
@@ -3272,9 +3334,11 @@ async fn proxy(
                                 client_ip = %ctx.client_ip,
                                 "response-body rule matched — blocking"
                             );
+                            let resp = block_response(&ctx);
+                            stamp_response(&mut ctx, &resp);
                             ctx.advance_phase(Phase::Logging);
                             log_request(&ctx);
-                            return Ok(block_response(&ctx));
+                            return Ok(resp);
                         }
                     }
 
@@ -3300,9 +3364,11 @@ async fn proxy(
                                             pattern = matched,
                                             "DLP: sensitive data in response — blocking"
                                         );
+                                        let resp = block_response(&ctx);
+                                        stamp_response(&mut ctx, &resp);
                                         ctx.advance_phase(Phase::Logging);
                                         log_request(&ctx);
-                                        return Ok(block_response(&ctx));
+                                        return Ok(resp);
                                     }
                                     warn!(
                                         site = %site_cfg.id,
@@ -3371,6 +3437,21 @@ async fn proxy(
     };
 
     // --- Phase 6: Logging ---
+    // Response size for the access log: exact when the body was buffered for
+    // inspection (Full has an exact size hint), otherwise the origin's declared
+    // Content-Length. A chunked stream with no declared length stays 0 — the
+    // log line is written before the stream completes, and a wrong number is
+    // worse than an absent one.
+    ctx.bytes_sent = hyper::body::Body::size_hint(&final_body)
+        .exact()
+        .or_else(|| {
+            resp_parts
+                .headers
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse().ok())
+        })
+        .unwrap_or(0);
     ctx.advance_phase(Phase::Logging);
     log_request(&ctx);
 
@@ -3751,6 +3832,8 @@ fn phase2_body(
                         score: delta,
                         target: "ML".to_string(),
                         phase: Phase::RequestBody,
+                        // A classifier verdict has no single matched substring.
+                        matched_value: String::new(),
                     });
                 }
             }
@@ -5910,6 +5993,72 @@ fn full_body(bytes: Bytes) -> BoxBody {
         .boxed()
 }
 
+/// Stamp the outgoing response's status and body size onto the context BEFORE
+/// `log_request`. Every rejection path used to return without doing this, so a
+/// large class of blocks (size/method limits, pre-routing rejections, DLP)
+/// logged `status=0, bytes=0` — corrupting the 4xx/5xx counters and making
+/// `status` an unreliable filter in Threat Search.
+fn stamp_response(ctx: &mut RequestContext, resp: &Response<BoxBody>) {
+    ctx.response_status = Some(resp.status());
+    if let Some(sz) = hyper::body::Body::size_hint(resp.body()).exact() {
+        ctx.bytes_sent = sz;
+    }
+}
+
+/// Truncate `s` to `max` bytes on a char boundary, marking that it was cut.
+/// Log lines are written per request, so an unbounded field is an amplification
+/// vector: a URI flood would have each rejected request write a multi-kilobyte
+/// line, filling the disk faster than the traffic itself.
+fn cap_field(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
+/// The request's query string for logging. Logged alongside (not inside)
+/// `path`: facets, the learning report and per-path aggregation all group by
+/// `path`, and appending queries there would explode cardinality. Empty when
+/// the request had none.
+fn capped_query(uri: &http::Uri) -> String {
+    cap_field(uri.query().unwrap_or(""), 2048)
+}
+
+/// The request path for logging. Capped for the reason in `cap_field`: the
+/// URI-too-long rejection logs the very path that was rejected for being long.
+fn capped_path(uri: &http::Uri) -> String {
+    cap_field(uri.path(), 1024)
+}
+
+/// The matched text of a rule hit, for logging.
+///
+/// The primary credential guard is in the rule VM, which redacts by consulting
+/// the request's own parameters BEFORE the value is ever stored on the
+/// `RuleMatch` (see `value_from_sensitive_field`). This is the second layer,
+/// covering the case that check cannot see: a rule whose target is a named
+/// header or cookie, where the value never appears as a request parameter at
+/// all. Two cheap checks in different places beats one, because the cost of a
+/// miss here is a live credential written into a log an operator then pastes
+/// into a ticket.
+fn redacted_matched(m: &sentinel_core::context::RuleMatch) -> String {
+    if m.matched_value.is_empty() {
+        return String::new();
+    }
+    let t = m.target.to_ascii_lowercase();
+    const SENSITIVE: [&str; 10] = [
+        "password", "passwd", "pwd", "secret", "token", "auth", "cookie", "session", "apikey",
+        "api_key",
+    ];
+    if SENSITIVE.iter().any(|s| t.contains(s)) {
+        return format!("[redacted:{}]", m.target);
+    }
+    m.matched_value.clone()
+}
+
 fn error_response(status: StatusCode, message: &str) -> Response<BoxBody> {
     Response::builder()
         .status(status)
@@ -6240,7 +6389,15 @@ fn record_event(ctx: &RequestContext) {
         site: ctx.site_id.clone().unwrap_or_else(|| "-".to_string()),
         tenant: ctx.tenant_id.clone().unwrap_or_default(),
         method: ctx.method.as_str().to_string(),
-        path: ctx.uri.path().to_string(),
+        path: capped_path(&ctx.uri),
+        query: capped_query(&ctx.uri),
+        referer: ctx
+            .request_headers
+            .get(http::header::REFERER)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string(),
+        matched: top.map(redacted_matched).unwrap_or_default(),
         rule: ev_rule,
         attack: ev_attack,
         action: action.to_string(),
@@ -6977,6 +7134,17 @@ fn ndjson_log(ctx: &RequestContext) {
     // and not be able to prove they were the same request.
     let request_id = ctx.request_id.to_string();
     let country = ctx.geo_country.as_deref().unwrap_or("");
+    // Kept separate from `path` (not appended) because facets, the learning
+    // report and per-path aggregation group by path — appending queries there
+    // would explode cardinality. Capped: a hostile query must not bloat a line.
+    let query = capped_query(&ctx.uri);
+    // The page the request was triggered from. For SPA traffic this is the only
+    // field that names which screen of the app fired the API call.
+    let referer = ctx
+        .request_headers
+        .get(http::header::REFERER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-");
 
     let access = serde_json::json!({
         "ts":      ts,
@@ -6984,7 +7152,8 @@ fn ndjson_log(ctx: &RequestContext) {
         "ip":      ctx.client_ip.to_string(),
         "country": country,
         "method":  ctx.method.as_str(),
-        "path":    ctx.uri.path(),
+        "path":    capped_path(&ctx.uri),
+        "query":   query,
         "status":  status,
         "latency": format!("{:.2}", ctx.elapsed_ms()),
         "bytes":    ctx.bytes_sent,
@@ -6992,6 +7161,7 @@ fn ndjson_log(ctx: &RequestContext) {
         "tenant":   tenant,
         "protocol": protocol_label(ctx.http_version),
         "ua":       ua,
+        "referer":  referer,
         "action":   action,
         "score":    ctx.anomaly_score,
     });
@@ -7036,15 +7206,22 @@ fn ndjson_log(ctx: &RequestContext) {
             (String::new(), String::new())
         };
 
+        // The text the top rule actually matched — the field that lets an
+        // operator judge a false positive from the log line alone. Redacted
+        // when it came from a credential-bearing target.
+        let matched = top.map(redacted_matched).unwrap_or_default();
+
         let waf = serde_json::json!({
             "ts":     ts,
             "request_id": request_id,
             "ip":     ctx.client_ip.to_string(),
             "country": country,
             "method": ctx.method.as_str(),
-            "path":   ctx.uri.path(),
+            "path":   capped_path(&ctx.uri),
+            "query":  query,
             "rule":   rule,
             "target": target,
+            "matched": matched,
             "score":  ctx.anomaly_score,
             "threshold": ctx.anomaly_threshold,
             // Present only when a per-path override governed this request, so a
@@ -7060,6 +7237,7 @@ fn ndjson_log(ctx: &RequestContext) {
             "status": status,
             "latency_ms": format!("{:.2}", ctx.elapsed_ms()),
             "ua":     ua,
+            "referer": referer,
             "msg":    ctx.block_reason.as_deref().unwrap_or(""),
             "message": message,
             "remediation": remediation,
@@ -7513,6 +7691,9 @@ mod history_shed_tests {
                 tenant: String::new(),
                 method: String::new(),
                 path: String::new(),
+                query: String::new(),
+                referer: String::new(),
+                matched: String::new(),
                 rule: String::new(),
                 attack: String::new(),
                 action: String::new(),
@@ -7957,7 +8138,55 @@ mod log_explain_tests {
             score: 15,
             target: "ARGS:username".to_string(),
             phase: Phase::RequestHeaders,
+            matched_value: "' OR 1=1--".to_string(),
         }
+    }
+
+    #[test]
+    fn matched_payload_survives_to_logs_unless_credential_bearing() {
+        // Forensic value: an attack payload in an ordinary parameter is kept.
+        let m = sqli_match();
+        assert_eq!(redacted_matched(&m), "' OR 1=1--");
+
+        // A hit in a credential-bearing target must NEVER write the value —
+        // a false positive there would put a user's password in the log.
+        for target in [
+            "ARGS:password",
+            "ARGS:current_pwd",
+            "REQUEST_HEADERS:Authorization",
+            "REQUEST_COOKIES:session_id",
+            "ARGS:api_key",
+        ] {
+            let mut m = sqli_match();
+            m.target = target.to_string();
+            let out = redacted_matched(&m);
+            assert!(
+                out.starts_with("[redacted:"),
+                "{target} must redact, got {out:?}"
+            );
+            assert!(!out.contains("OR 1=1"), "{target} leaked the value");
+        }
+
+        // No capturable text → stays empty, never invented.
+        let mut m = sqli_match();
+        m.matched_value = String::new();
+        assert_eq!(redacted_matched(&m), "");
+    }
+
+    #[test]
+    fn query_is_logged_capped_and_separately_from_path() {
+        let uri: http::Uri = "/search?q=1%27+UNION+SELECT".parse().unwrap();
+        assert_eq!(capped_query(&uri), "q=1%27+UNION+SELECT");
+
+        let bare: http::Uri = "/search".parse().unwrap();
+        assert_eq!(capped_query(&bare), "");
+
+        // A hostile megabyte query must not bloat a log line.
+        let huge = format!("/x?p={}", "a".repeat(10_000));
+        let uri: http::Uri = huge.parse().unwrap();
+        let q = capped_query(&uri);
+        assert!(q.chars().count() <= 2050, "got {} chars", q.chars().count());
+        assert!(q.ends_with('…'));
     }
 
     #[test]
@@ -8642,6 +8871,50 @@ mod block_page_connection_layer_tests {
             resp.headers().get(header::CONTENT_TYPE).unwrap(),
             "application/json"
         );
+    }
+
+    /// Regression: every rejection path used to `return Ok(error_response(...))`
+    /// without recording what it returned, so the size/method limits, the
+    /// pre-routing rejections and the DLP block all logged `status=0, bytes=0`.
+    /// That corrupted the 4xx/5xx counters and made `status` an unusable filter
+    /// in Threat Search — an always-zero column teaches operators to distrust
+    /// the whole line.
+    #[test]
+    fn stamped_rejections_record_their_real_status_and_size() {
+        for (expected, resp) in [
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                error_response(StatusCode::PAYLOAD_TOO_LARGE, "Request Entity Too Large"),
+            ),
+            (
+                StatusCode::METHOD_NOT_ALLOWED,
+                error_response(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed"),
+            ),
+            (
+                StatusCode::URI_TOO_LONG,
+                error_response(StatusCode::URI_TOO_LONG, "URI Too Long"),
+            ),
+        ] {
+            let mut ctx = RequestContext::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1234);
+            stamp_response(&mut ctx, &resp);
+            assert_eq!(
+                ctx.response_status,
+                Some(expected),
+                "status must reach the log, not default to 0"
+            );
+            assert!(
+                ctx.bytes_sent > 0,
+                "a rejection with a body must not log bytes=0"
+            );
+        }
+
+        // The block page too — this is the path a stranger with a Support ID hit.
+        let mut ctx = RequestContext::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)), 5555);
+        ctx.block_reason = Some("threat intel: matched IOC feed".into());
+        let resp = block_response(&ctx);
+        stamp_response(&mut ctx, &resp);
+        assert_eq!(ctx.response_status, Some(StatusCode::FORBIDDEN));
+        assert!(ctx.bytes_sent > 0);
     }
 }
 

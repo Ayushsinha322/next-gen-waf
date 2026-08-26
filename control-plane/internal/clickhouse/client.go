@@ -167,12 +167,19 @@ func (c *Client) queryJSON(ctx context.Context, sql string, dst any) error {
 // ---------------------------------------------------------------------------
 
 type Event struct {
-	TS       int64  `json:"ts"`
-	IP       string `json:"ip"`
-	Country  string `json:"country"`
-	Site     string `json:"site"`
-	Method   string `json:"method"`
-	Path     string `json:"path"`
+	TS      int64  `json:"ts"`
+	IP      string `json:"ip"`
+	Country string `json:"country"`
+	Site    string `json:"site"`
+	Method  string `json:"method"`
+	Path    string `json:"path"`
+	// Forensic-triage fields (2026-08): the query string, the page the request
+	// was fired from, and the text the rule matched (credential targets are
+	// redacted by the data plane before the row is ever written). Empty on rows
+	// that predate the columns — the UI renders that as absent.
+	Query    string `json:"query"`
+	Referer  string `json:"referer"`
+	Matched  string `json:"matched"`
 	Rule     string `json:"rule"`
 	Attack   string `json:"attack"`
 	Action   string `json:"action"`
@@ -327,11 +334,15 @@ func (c *Client) searchWhere(f SearchFilter) []string {
 		// either the one you want or it is not, and a substring scan over a
 		// high-cardinality column is the expensive way to learn that.
 		q := esc(f.Query)
+		// query and matched are searched too: "find every event containing
+		// UNION SELECT" is the canonical SOC hunt, and the payload lives in
+		// those two columns, not in path.
 		where = append(where, fmt.Sprintf(
 			"(positionCaseInsensitive(path, '%s') > 0 OR positionCaseInsensitive(attack, '%s') > 0 "+
-				"OR positionCaseInsensitive(explanation, '%s') > 0 OR rule = '%s' "+
-				"OR request_id = '%s')",
-			q, q, q, q, q))
+				"OR positionCaseInsensitive(explanation, '%s') > 0 "+
+				"OR positionCaseInsensitive(query, '%s') > 0 OR positionCaseInsensitive(matched, '%s') > 0 "+
+				"OR rule = '%s' OR request_id = '%s')",
+			q, q, q, q, q, q, q))
 	}
 	return where
 }
@@ -343,7 +354,8 @@ func (c *Client) Search(ctx context.Context, f SearchFilter) ([]Event, error) {
 		limit = 200
 	}
 	sql := fmt.Sprintf(
-		"SELECT toUnixTimestamp(ts) AS ts, ip, country, site, method, path, rule, attack, action, severity, score, status, protocol, "+
+		"SELECT toUnixTimestamp(ts) AS ts, ip, country, site, method, path, query, referer, matched, "+
+			"rule, attack, action, severity, score, status, protocol, "+
 			"request_id, target, mode, threshold, explanation "+
 			"FROM %s.waf_events WHERE %s ORDER BY ts DESC LIMIT %d",
 		c.db, strings.Join(where, " AND "), limit)
@@ -372,7 +384,8 @@ func (c *Client) FindBySupportID(ctx context.Context, tenant, supportID string) 
 		return []Event{}, nil
 	}
 	sql := fmt.Sprintf(
-		"SELECT toUnixTimestamp(ts) AS ts, ip, country, site, method, path, rule, attack, action, severity, score, status, protocol, "+
+		"SELECT toUnixTimestamp(ts) AS ts, ip, country, site, method, path, query, referer, matched, "+
+			"rule, attack, action, severity, score, status, protocol, "+
 			"request_id, target, mode, threshold, explanation "+
 			"FROM %s.waf_events WHERE %s AND %s ORDER BY ts DESC LIMIT 25",
 		c.db, eq("tenant", tenant), eq("request_id", id))
@@ -518,7 +531,7 @@ func (c *Client) RecentThreatIntelBlocks(ctx context.Context, tenant string, fro
 // integer: this file is read by a human in a ticket, and a bare epoch is the
 // single most common complaint about exported WAF logs.
 const exportColumns = `formatDateTime(ts, '%Y-%m-%dT%H:%i:%SZ', 'UTC') AS timestamp_utc, ` +
-	`ip, country, site, method, path, rule, attack, action, severity, score, status, ` +
+	`ip, country, site, method, path, query, referer, matched, rule, attack, action, severity, score, status, ` +
 	`protocol, request_id, target, mode, threshold, explanation`
 
 // ExportFormat maps a requested format onto its ClickHouse FORMAT clause, MIME
