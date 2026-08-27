@@ -64,11 +64,41 @@ func TestDefaultWafPolicyMatchesBuildDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildRustWaf(nil): %v", err)
 	}
-	for _, k := range []string{"mode", "paranoia_level", "anomaly_threshold"} {
+	// Detection posture must agree: that pair (threshold 10 + the default
+	// exclusions) is the benchmarked configuration, and a site whose stored
+	// policy says one thing while the data plane is handed another is the exact
+	// drift e7b3249 existed to stop.
+	for _, k := range []string{"paranoia_level", "anomaly_threshold"} {
 		if stored[k] != built[k] {
 			t.Errorf("%s: stored default %v != build default %v — the two have drifted",
 				k, stored[k], built[k])
 		}
+	}
+
+	// Mode is DELIBERATELY different, and the difference is not drift — the two
+	// values answer different questions:
+	//
+	//   defaultWafPolicyJSON  what to STORE for a brand-new site created with no
+	//                         policy. Learning, because a caller who sent no
+	//                         policy has not decided one, and enforcing against
+	//                         an unmeasured false-positive rate blocks real
+	//                         users on someone else's application.
+	//   buildRustWaf(nil)     how to INTERPRET a stored row that has no policy
+	//                         at all — a legacy or hand-inserted row. Blocking,
+	//                         because such a site has been enforcing all along
+	//                         and silently switching it to observe-only would
+	//                         disable protection nobody asked to disable.
+	//
+	// Fail-safe therefore points in opposite directions for the two cases. This
+	// asserts both, so neither can be "tidied" into the other by someone who
+	// reads only one of them.
+	if stored["mode"] != "learning" {
+		t.Errorf("a new site created with no policy must be stored as learning, got %v",
+			stored["mode"])
+	}
+	if built["mode"] != "blocking" {
+		t.Errorf("a stored row with NO policy must still be interpreted as blocking "+
+			"(it has been enforcing; do not silently disable it), got %v", built["mode"])
 	}
 }
 

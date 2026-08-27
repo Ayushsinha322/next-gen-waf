@@ -2203,7 +2203,21 @@ func attachInlineRules(rs map[string]any, siteID string, rules []db.DeployableRu
 // defaultWafPolicyJSON is the policy stored for a site created without one. The
 // threshold matches buildRustWaf's default and the benchmarked configuration —
 // keep the two in step, or a site's stored policy and its effective policy drift.
-const defaultWafPolicyJSON = `{"mode":"blocking","paranoia_level":2,"anomaly_threshold":10}`
+//
+// Mode is LEARNING, not blocking. A caller who sends no policy at all is by
+// definition a caller who has not decided one, and for a WAF the unsafe default
+// is the enforcing one: it blocks real users against a false-positive rate
+// nobody has measured for that application. Learning records exactly the same
+// detections and blocks nothing, so the cost of this default being wrong is a
+// site that observes for a while; the cost of the other default being wrong is
+// an outage on someone else's application.
+//
+// This also removes the last disagreement between the three creation paths. The
+// wizard defaults to learning, first-site.sh sends learning explicitly, and this
+// — the raw API path — used to enforce. Three sources of a site's initial
+// posture that did not agree is how the console and the CLI ended up shipping
+// opposite behaviour for the same action.
+const defaultWafPolicyJSON = `{"mode":"learning","paranoia_level":2,"anomaly_threshold":10}`
 
 // defaultRuleExclusions are the CRS suppressions applied to every site unless the
 // operator explicitly opts out. Both come from measured false-positive work:
