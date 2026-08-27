@@ -261,6 +261,11 @@ export interface MetricsSnapshot {
   p99_latency_ms:    number;
   /** Samples behind that p99. 0 = no measurement, NOT a fast one. */
   p99_samples?:      number;
+  /** p99 of the WAF's OWN processing time (end-to-end minus the wait on the
+   *  origin). This is what the badge shows: a slow or long-polling upstream
+   *  cannot distort it. */
+  p99_waf_ms?:       number;
+  p99_waf_samples?:  number;
   total_requests:    number;
   blocked_requests:  number;
   ml_anomalies:      number;

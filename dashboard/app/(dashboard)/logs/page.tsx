@@ -29,6 +29,13 @@ function escHtml(s: string) {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+/** Path with its query string rejoined, for display only. */
+function withQuery(r: Record<string, unknown>): string {
+  const path = String(r.path ?? "");
+  const q = String(r.query ?? "");
+  return q ? `${path}?${q}` : path;
+}
+
 /** The WAF's own verdict for a row.
  *
  * Always prefer the `action` the data plane emits (proxy log_request →
@@ -49,10 +56,18 @@ function verdict(r: Record<string, unknown>): "BLOCK" | "PASS" | "CHALLENGE" | "
 function fmt(kind: LogKind, r: Record<string, unknown>): string {
   const ts = String(r.ts ?? "");
   switch (kind) {
+    // The query string is appended to the path here, not shown as a separate
+    // field: on this page a reader wants the URL as requested. It is stored
+    // separately (so per-path aggregation keeps its cardinality) and rejoined
+    // only for display. Without it a blocked `/rest/products/search` gave no
+    // hint of the `?q=1' UNION SELECT…` that made it an attack.
     case "access":
-      return `${ts} [${verdict(r)}] ${r.ip} ${r.method} ${r.path} ${r.status} proto=${r.protocol ?? "-"} latency=${r.latency}ms bytes=${r.bytes} site=${r.site} ua="${r.ua ?? "-"}"`;
+      return `${ts} [${verdict(r)}] ${r.ip} ${r.method} ${withQuery(r)} ${r.status} proto=${r.protocol ?? "-"} latency=${r.latency}ms waf=${r.waf_ms ?? "-"}ms bytes=${r.bytes} site=${r.site} ua="${r.ua ?? "-"}"${r.referer && r.referer !== "-" ? ` referer="${r.referer}"` : ""}`;
+    // `matched` is the payload the rule actually fired on — the field that lets
+    // a false positive be judged without reproducing the request. Credential
+    // targets arrive already redacted by the data plane.
     case "waf":
-      return `${ts} [${r.action ?? "BLOCK"}] ${r.ip} ${r.method} ${r.path} rule=${r.rule ?? r.rule_id} score=${r.score} sev=${r.sev} attack="${r.attack}" proto=${r.protocol ?? "-"} site=${r.site}`;
+      return `${ts} [${r.action ?? "BLOCK"}] ${r.ip} ${r.method} ${withQuery(r)} rule=${r.rule ?? r.rule_id} score=${r.score} sev=${r.sev} attack="${r.attack}"${r.matched ? ` matched="${r.matched}"` : ""}${r.target ? ` target=${r.target}` : ""} proto=${r.protocol ?? "-"} site=${r.site}`;
     case "error":
       return `${ts} [${r.lvl ?? "ERROR"}] component=${r.subsystem ?? r.component} code=${r.code ?? "-"} msg="${r.msg}"`;
     case "audit":

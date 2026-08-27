@@ -133,3 +133,70 @@ func TestLatencyIsSampledFromTheStringTheProxyActuallyWrites(t *testing.T) {
 		t.Fatalf("unparseable latency must not become a 0 sample, got %d", got)
 	}
 }
+
+// The console's latency badge read "24387.9ms" on a healthy deployment. The
+// metric was correct and the display was honest — but the NUMBER was dominated
+// by Juice Shop's socket.io long-poll, which holds a request open ~25s. A WAF
+// status badge showing 24 seconds reads as "the WAF is broken" when nothing is.
+//
+// So the badge now reports the WAF's OWN processing time, which a slow or
+// long-polling origin cannot inflate, and WebSocket relays are excluded from
+// both rings because what they measure is connection lifetime, not latency.
+func TestWafOwnTimeIsSampledAndSlowOriginsCannotInflateIt(t *testing.T) {
+	h := newTestHub()
+	h.latBuf = make([]float64, 0, 8)
+	h.wafLatBuf = make([]float64, 0, 8)
+
+	// A long-poll: 24s end-to-end, but the WAF only spent 1.2ms on it.
+	h.updateMetrics(Entry{Kind: "access", Data: []byte(
+		`{"latency":"24387.85","waf_ms":"1.20","status":200}`)})
+	// An ordinary request.
+	h.updateMetrics(Entry{Kind: "access", Data: []byte(
+		`{"latency":"15.51","waf_ms":"2.10","status":304}`)})
+
+	if got := h.computeP99(); got < 100 {
+		t.Fatalf("end-to-end p99 should still include the slow origin (it is real), got %v", got)
+	}
+	if got := h.computeP99Waf(); got > 10 {
+		t.Fatalf("WAF p99 must not be inflated by a slow origin, got %v", got)
+	}
+	if h.latWafSamples() != 2 {
+		t.Fatalf("both requests should contribute WAF samples, got %d", h.latWafSamples())
+	}
+
+	// A WebSocket relay measures how long the connection LIVED. Excluded from
+	// both rings — clamping would silently invent a value instead.
+	h2 := newTestHub()
+	h2.latBuf = make([]float64, 0, 8)
+	h2.wafLatBuf = make([]float64, 0, 8)
+	h2.updateMetrics(Entry{Kind: "access", Data: []byte(
+		`{"latency":"3600000.00","waf_ms":"3600000.00","status":101}`)})
+	if h2.latSamples() != 0 || h2.latWafSamples() != 0 {
+		t.Fatalf("a 101 upgrade must not be sampled: e2e=%d waf=%d",
+			h2.latSamples(), h2.latWafSamples())
+	}
+
+	// A cheap pass can legitimately cost ~0ms of WAF time; that must record,
+	// unlike end-to-end where 0 only ever meant "not parsed".
+	h3 := newTestHub()
+	h3.latBuf = make([]float64, 0, 8)
+	h3.wafLatBuf = make([]float64, 0, 8)
+	h3.updateMetrics(Entry{Kind: "access", Data: []byte(
+		`{"latency":"5.00","waf_ms":"0.00","status":200}`)})
+	if h3.latWafSamples() != 1 {
+		t.Fatalf("a near-zero WAF time is a real measurement and must record, got %d", h3.latWafSamples())
+	}
+
+	// An access line with no waf_ms at all (a data plane older than this field)
+	// must not fabricate a sample.
+	h4 := newTestHub()
+	h4.latBuf = make([]float64, 0, 8)
+	h4.wafLatBuf = make([]float64, 0, 8)
+	h4.updateMetrics(Entry{Kind: "access", Data: []byte(`{"latency":"5.00","status":200}`)})
+	if h4.latWafSamples() != 0 {
+		t.Fatalf("absent waf_ms must not become a sample, got %d", h4.latWafSamples())
+	}
+	if h4.latSamples() != 1 {
+		t.Fatalf("end-to-end must still be sampled from an older data plane, got %d", h4.latSamples())
+	}
+}

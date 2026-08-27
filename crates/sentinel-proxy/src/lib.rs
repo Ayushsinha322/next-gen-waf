@@ -7174,6 +7174,20 @@ fn explain_event(ctx: &RequestContext, action: &str, rule: &str, attack: &str) -
     (message, remediation)
 }
 
+/// The WAF's own processing time in milliseconds: total elapsed minus the time
+/// spent waiting for the origin.
+///
+/// Blocked requests never reach an upstream, so their whole elapsed time IS the
+/// WAF's — which is correct, and is also the number an operator wants when
+/// asking what enforcement costs. Saturating at 0 because the two clocks are
+/// sampled at different points and a few microseconds of skew must not produce
+/// a negative latency.
+fn waf_own_ms(ctx: &RequestContext) -> f64 {
+    let total = ctx.elapsed_ms();
+    let upstream = ctx.upstream_latency_us.unwrap_or(0) as f64 / 1000.0;
+    (total - upstream).max(0.0)
+}
+
 fn ndjson_log(ctx: &RequestContext) {
     if !ndjson_logging_enabled() {
         return;
@@ -7223,6 +7237,15 @@ fn ndjson_log(ctx: &RequestContext) {
         "query":   query,
         "status":  status,
         "latency": format!("{:.2}", ctx.elapsed_ms()),
+        // The WAF's OWN time: end-to-end minus the wait on the origin.
+        //
+        // `latency` is honest but answers a different question than a reader of
+        // a WAF status bar assumes. A long-poll or a slow origin dominates it —
+        // Juice Shop's socket.io holds a request open ~25s, which alone drove
+        // the console's p99 badge to "24387.9ms" and reads as "the WAF is
+        // broken" when nothing is. This field is immune to that: it is what the
+        // WAF added, so a slow upstream cannot inflate it.
+        "waf_ms": format!("{:.2}", waf_own_ms(ctx)),
         "bytes":    ctx.bytes_sent,
         "site":     site,
         "tenant":   tenant,

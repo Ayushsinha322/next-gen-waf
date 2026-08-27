@@ -57,6 +57,10 @@ export default function TopBar() {
   // plane's latency ring is fed by tailing access.log from its end, so it is
   // empty after a restart until traffic arrives.
   const [p99n, setP99n] = useState<number>(0);
+  // The WAF's own processing time. This is what the badge shows — see the
+  // tooltip below for why end-to-end is the wrong number for this spot.
+  const [waf, setWaf]   = useState<number | null>(null);
+  const [wafn, setWafn] = useState<number>(0);
   const [alerts, setAlerts] = useState(0);
   const [theme, setTheme] = useState<"dark" | "light">("dark");
   // Real fleet health — never hardcode "operational".
@@ -85,6 +89,8 @@ export default function TopBar() {
           setRps(snap.rps ?? 0);
           setP99(snap.p99_latency_ms ?? 0);
           setP99n(snap.p99_samples ?? 0);
+          setWaf(snap.p99_waf_ms ?? null);
+          setWafn(snap.p99_waf_samples ?? 0);
         }
       } catch { /* control plane may be offline */ }
     }
@@ -131,9 +137,14 @@ export default function TopBar() {
   // SAMPLES, so the absence of any measurement rendered as the best possible
   // number. That is why the bar could read "p99 <1ms" while the Logs page showed
   // 7-18ms latencies on the same requests. No samples now reads as "—".
-  const p99Display = p99 === null || p99n === 0
-    ? "—"
-    : p99 < 0.1 ? "<0.1ms" : p99.toFixed(1) + "ms";
+  const fmtMs = (v: number) => (v < 0.1 ? "<0.1ms" : v.toFixed(1) + "ms");
+  // End-to-end, kept for the tooltip: it is the real user-facing number, but it
+  // is dominated by whatever the origin does. A single socket.io long-poll
+  // (~25s) put "24387.9ms" in this badge, which reads as a broken WAF.
+  const e2eDisplay = p99 === null || p99n === 0 ? "no samples yet" : fmtMs(p99);
+  // The badge itself reports what the WAF costs, which is the claim this spot
+  // is actually making about the product.
+  const wafDisplay = waf === null || wafn === 0 ? "—" : fmtMs(waf);
 
   return (
     <motion.header
@@ -180,11 +191,12 @@ export default function TopBar() {
           <span>{rpsDisplay} req/s</span>
           <span style={{ color: "var(--text3)" }}>·</span>
           <span
-            title={p99n === 0
+            title={wafn === 0
               ? "No latency samples yet — the control plane reads them from the data plane's access log, which starts empty after a restart."
-              : `End-to-end request latency (upstream included), p99 of the last ${p99n} logged requests`}
-            style={{ color: p99n === 0 ? "var(--text3)" : (p99 !== null && p99 > 5 ? "var(--amber)" : "var(--green)") }}>
-            p99 {p99Display}
+              : `WAF processing time, p99 of the last ${wafn} requests (excludes WebSocket relays). ` +
+                `End-to-end p99 including the origin: ${e2eDisplay}.`}
+            style={{ color: wafn === 0 ? "var(--text3)" : (waf !== null && waf > 5 ? "var(--amber)" : "var(--green)") }}>
+            waf p99 {wafDisplay}
           </span>
         </motion.div>
 

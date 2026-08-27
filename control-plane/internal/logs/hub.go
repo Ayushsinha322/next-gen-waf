@@ -70,6 +70,14 @@ type Snapshot struct {
 	// elapsed_ms, upstream time included), taken as the p99 of the most recent
 	// samples read from access.log.
 	P99LatencyMs float64 `json:"p99_latency_ms"`
+	// P99WafMs is the p99 of the WAF's OWN processing time (end-to-end minus the
+	// wait on the origin). This is what the console's badge shows, because a
+	// slow or long-polling origin cannot distort it: Juice Shop's socket.io
+	// holds a request ~25s, which alone drove the badge to 24387.9ms and read as
+	// "the WAF is broken" when nothing was.
+	P99WafMs float64 `json:"p99_waf_ms"`
+	// P99WafSamples is how many samples P99WafMs came from. 0 = no measurement.
+	P99WafSamples int `json:"p99_waf_samples"`
 	// P99Samples is how many samples that p99 was computed from. 0 means NO
 	// MEASUREMENT, which is not the same as a fast one: the latency ring is fed
 	// by tailing access.log from its end, so it is empty after a restart until
@@ -190,6 +198,11 @@ type Hub struct {
 	// Latency ring for p99 (last 1000 values from access logs).
 	latMu  sync.Mutex
 	latBuf []float64
+	// wafLatBuf holds the WAF's OWN processing time (end-to-end minus the wait
+	// on the origin). Separate ring because it answers the question the console's
+	// badge actually implies — what the WAF costs — and a slow or long-polling
+	// origin cannot distort it.
+	wafLatBuf []float64
 
 	// Per-second traffic history (last 120 buckets = 2 minutes).
 	histMu  sync.RWMutex
@@ -218,6 +231,7 @@ func NewHub() *Hub {
 		subs:       make(map[chan Entry]struct{}),
 		done:       make(chan struct{}),
 		latBuf:     make([]float64, 0, 1000),
+		wafLatBuf:  make([]float64, 0, 1000),
 		blockedIPs: make(map[string]struct{}),
 		attackCats: make(map[string]int64),
 		byCountry:  make(map[string]int64),
@@ -392,6 +406,8 @@ func (h *Hub) GetSnapshot() Snapshot {
 		RPS:              rps,
 		P99LatencyMs:     p99,
 		P99Samples:       h.latSamples(),
+		P99WafMs:         h.computeP99Waf(),
+		P99WafSamples:    h.latWafSamples(),
 		TotalRequests:    h.totalRequests.Load(),
 		BlockedRequests:  h.blockedRequests.Load(),
 		MLAnomalies:      h.mlAnomalies.Load(),
@@ -505,6 +521,22 @@ func (h *Hub) GetLearningStats(site string) []LearningStat {
 // Metrics helpers
 // ---------------------------------------------------------------------------
 
+// numericField coerces a JSON value that may be a number or a numeric string.
+// The data plane writes latencies as strings (`format!("{:.2}", …)`); older and
+// future writers may use numbers. Returns -1 when the value is absent or
+// unparseable, so a caller can tell "no measurement" from a genuine zero.
+func numericField(v interface{}) float64 {
+	switch t := v.(type) {
+	case float64:
+		return t
+	case string:
+		if f, err := strconv.ParseFloat(t, 64); err == nil {
+			return f
+		}
+	}
+	return -1
+}
+
 func (h *Hub) updateMetrics(e Entry) {
 	switch e.Kind {
 	case "access":
@@ -520,6 +552,7 @@ func (h *Hub) updateMetrics(e Entry) {
 		// Extract latency, status class and block action from the data.
 		var row struct {
 			Latency interface{} `json:"latency"`
+			WafMs   interface{} `json:"waf_ms"`
 			Status  int         `json:"status"`
 			Action  string      `json:"action"`
 			IP      string      `json:"ip"`
@@ -546,11 +579,27 @@ func (h *Hub) updateMetrics(e Entry) {
 					ms = f
 				}
 			}
-			if ms > 0 {
+			wafMs := numericField(row.WafMs)
+			// A 101 is a WebSocket relay, not a request: what gets measured is
+			// how long the connection LIVED, which can be hours and says
+			// nothing about latency. Excluded from both rings rather than
+			// clamped, because a clamp would silently invent a value.
+			if row.Status != 101 {
 				h.latMu.Lock()
-				h.latBuf = append(h.latBuf, ms)
-				if len(h.latBuf) > 1000 {
-					h.latBuf = h.latBuf[len(h.latBuf)-1000:]
+				if ms > 0 {
+					h.latBuf = append(h.latBuf, ms)
+					if len(h.latBuf) > 1000 {
+						h.latBuf = h.latBuf[len(h.latBuf)-1000:]
+					}
+				}
+				// waf_ms can legitimately be ~0 for a cheap pass, so this ring
+				// admits >= 0 — unlike end-to-end latency, where 0 only ever
+				// meant "not parsed".
+				if wafMs >= 0 && row.WafMs != nil {
+					h.wafLatBuf = append(h.wafLatBuf, wafMs)
+					if len(h.wafLatBuf) > 1000 {
+						h.wafLatBuf = h.wafLatBuf[len(h.wafLatBuf)-1000:]
+					}
 				}
 				h.latMu.Unlock()
 			}
@@ -804,6 +853,22 @@ func (h *Hub) computeRPS() float64 {
 	return math.Round(float64(n)/10.0*10) / 10
 }
 
+// latWafSamples reports how many WAF-own-time samples are held.
+func (h *Hub) latWafSamples() int {
+	h.latMu.Lock()
+	defer h.latMu.Unlock()
+	return len(h.wafLatBuf)
+}
+
+// computeP99Waf is the p99 of the WAF's own processing time.
+func (h *Hub) computeP99Waf() float64 {
+	h.latMu.Lock()
+	cp := make([]float64, len(h.wafLatBuf))
+	copy(cp, h.wafLatBuf)
+	h.latMu.Unlock()
+	return p99Of(cp)
+}
+
 // latSamples reports how many latency samples the p99 is based on.
 func (h *Hub) latSamples() int {
 	h.latMu.Lock()
@@ -822,6 +887,16 @@ func (h *Hub) computeP99() float64 {
 	copy(cp, h.latBuf)
 	h.latMu.Unlock()
 
+	return p99Of(cp)
+}
+
+// p99Of is the 99th percentile of an unsorted sample, rounded to one decimal.
+// Shared by both latency rings so they cannot drift apart in how they compute it.
+func p99Of(cp []float64) float64 {
+	n := len(cp)
+	if n == 0 {
+		return 0
+	}
 	sort.Float64s(cp)
 	idx := int(math.Ceil(float64(n)*0.99)) - 1
 	if idx < 0 {
