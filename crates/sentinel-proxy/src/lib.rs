@@ -26,6 +26,9 @@ pub mod captcha;
 pub mod challenge;
 pub mod http3;
 mod jwks;
+/// Continuous security-event feed to a SIEM (see the module docs for why the
+/// alert path could not serve this purpose).
+pub mod siem;
 pub mod tls;
 pub mod upstream;
 pub mod websocket;
@@ -6077,8 +6080,38 @@ fn metrics_response() -> Response<BoxBody> {
             header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )
-        .body(full_body(Bytes::from(prometheus_text())))
+        .body(full_body(Bytes::from(
+            prometheus_text() + &siem_metrics_text(),
+        )))
         .unwrap()
+}
+
+/// SIEM-feed counters, appended to the scrape.
+///
+/// Emitted only when the feed is configured: exporting a permanently-zero
+/// `dropped` series for the majority of deployments that have no SIEM would
+/// invite an alert rule that can never fire, which is worse than no series.
+///
+/// `dropped` is the one that matters. A gap in a security feed is invisible from
+/// the SIEM end — the reader sees a quiet period and believes it was quiet.
+fn siem_metrics_text() -> String {
+    if siem_config().is_none() {
+        return String::new();
+    }
+    format!(
+        "# HELP sentinel_siem_events_sent_total Security events written to the SIEM feed\n\
+         # TYPE sentinel_siem_events_sent_total counter\n\
+         sentinel_siem_events_sent_total {}\n\
+         # HELP sentinel_siem_events_dropped_total Security events dropped because the SIEM feed queue was full\n\
+         # TYPE sentinel_siem_events_dropped_total counter\n\
+         sentinel_siem_events_dropped_total {}\n\
+         # HELP sentinel_siem_connect_failures_total Failed attempts to connect to the SIEM collector\n\
+         # TYPE sentinel_siem_connect_failures_total counter\n\
+         sentinel_siem_connect_failures_total {}\n",
+        siem::sent_total(),
+        siem::dropped_total(),
+        siem::connect_failures_total(),
+    )
 }
 
 /// Load-shed response returned when the global in-flight request limit is
@@ -6341,11 +6374,21 @@ fn waf_events() -> &'static std::sync::Mutex<Vec<sentinel_storage::WafEventRow>>
 /// passes are skipped to keep volume sane. Buffer is capped to bound memory if
 /// ClickHouse is down/slow.
 fn record_event(ctx: &RequestContext) {
-    // No drainer → no buffering (nothing would ever empty the buffer). Note this
-    // is deliberately NOT gated on the sink being reachable: an unreachable sink
-    // still records, via the flusher's disk spool.
-    if !HISTORY_SINK_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
-        return;
+    // Two INDEPENDENT consumers: the ClickHouse buffer (the durable record) and
+    // the SIEM feed. Either may be absent, and neither may gate the other.
+    //
+    // The first cut hooked the SIEM feed after this early return, which coupled
+    // it to ClickHouse: a SIEM-only deployment forwarded nothing, and a
+    // ClickHouse outage would have silently stopped the security feed too.
+    // Caught by running it against a real collector with no ClickHouse
+    // configured — the code was correct-looking and delivered zero events.
+    //
+    // The ClickHouse gate is on having a DRAINER, not on reachability: an
+    // unreachable sink still records, via the flusher's disk spool.
+    let history_active = HISTORY_SINK_ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
+    let siem_cfg = siem_config();
+    if !history_active && siem_cfg.is_none() {
+        return; // nothing consumes events in this deployment
     }
     let action = match ctx.decision {
         WafDecision::Block | WafDecision::Challenge => "BLOCK",
@@ -6427,6 +6470,16 @@ fn record_event(ctx: &RequestContext) {
             String::new()
         },
     };
+    // Forward to the SIEM first: it is a non-blocking try_send on its own
+    // bounded queue, so it cannot delay the lock below, and a full ClickHouse
+    // buffer must not stop the feed any more than a dead SIEM may stop the
+    // durable record.
+    if let Some(cfg) = siem_cfg {
+        siem::record(cfg.format, cfg.facility, &cfg.hostname, &row);
+    }
+    if !history_active {
+        return; // SIEM-only deployment: nothing to buffer
+    }
     if let Ok(mut buf) = waf_events().lock() {
         if buf.len() < EVENT_BUFFER_CAP {
             buf.push(row);
@@ -6454,6 +6507,14 @@ fn record_event(ctx: &RequestContext) {
             }
         }
     }
+}
+
+/// The SIEM feed's configuration, resolved once. `None` when the feed is not
+/// configured, which is the default.
+fn siem_config() -> Option<&'static siem::SiemConfig> {
+    static CFG: std::sync::OnceLock<Option<siem::SiemConfig>> = std::sync::OnceLock::new();
+    CFG.get_or_init(|| siem::SiemConfig::from_env().map(siem::start))
+        .as_ref()
 }
 
 /// Drain up to all buffered events for flushing.

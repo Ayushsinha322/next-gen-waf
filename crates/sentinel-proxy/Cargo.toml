@@ -28,6 +28,8 @@ bytes = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
+# Public trust anchors for the SIEM feed when no private CA is configured.
+webpki-roots = "1"
 # HTTP/3 (QUIC transport + h3 protocol layer)
 quinn = { workspace = true }
 h3 = { workspace = true }
