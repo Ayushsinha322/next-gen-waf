@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -530,8 +531,20 @@ func (h *Hub) updateMetrics(e Entry) {
 			case float64:
 				ms = v
 			case string:
-				// parse "1.2" → 1.2
-				json.Unmarshal(json.RawMessage(`"`+v+`"`), &ms) //nolint
+				// The data plane writes latency as a STRING —
+				// `format!("{:.2}", ...)` in the proxy's access.log — so this is
+				// the branch that actually runs in production.
+				//
+				// It used to do json.Unmarshal(`"1.2"`, &float64), which cannot
+				// succeed: that is a JSON string, not a number, and the error
+				// was discarded. So `ms` stayed 0, no sample was ever recorded,
+				// and p99 has read 0 on every deployment since the field became
+				// a string. The UI then rendered 0 as "<1ms", which is how the
+				// top bar could claim sub-millisecond p99 while the Logs page
+				// showed 7-18ms on the same requests.
+				if f, err := strconv.ParseFloat(v, 64); err == nil {
+					ms = f
+				}
 			}
 			if ms > 0 {
 				h.latMu.Lock()

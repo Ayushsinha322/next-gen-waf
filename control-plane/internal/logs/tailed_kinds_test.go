@@ -95,3 +95,41 @@ func TestSimulatorOnlyPublishesDisplayableKinds(t *testing.T) {
 		t.Fatal("simulator produced nothing — the assertion above never ran")
 	}
 }
+
+// p99 read 0 on every deployment because the access-log `latency` field is a
+// STRING (`format!("{:.2}", …)` in the proxy) and the hub tried to
+// json.Unmarshal it into a float64 — which cannot succeed, and the error was
+// discarded. The UI then rendered 0 as "<1ms", so the top bar advertised
+// sub-millisecond p99 while the Logs page showed 7-18ms for the same requests.
+func TestLatencyIsSampledFromTheStringTheProxyActuallyWrites(t *testing.T) {
+	h := newTestHub()
+	h.latBuf = make([]float64, 0, 8)
+
+	// Exactly the shape the data plane emits.
+	for _, lat := range []string{"7.08", "18.82", "2.94"} {
+		h.updateMetrics(Entry{Kind: "access", Data: []byte(`{"latency":"` + lat + `","status":200}`)})
+	}
+	if got := h.latSamples(); got != 3 {
+		t.Fatalf("string latencies must be sampled, got %d samples", got)
+	}
+	if p := h.computeP99(); p < 7.0 {
+		t.Fatalf("p99 should reflect the samples, got %v", p)
+	}
+
+	// A numeric latency (any future writer) must keep working.
+	h2 := newTestHub()
+	h2.latBuf = make([]float64, 0, 8)
+	h2.updateMetrics(Entry{Kind: "access", Data: []byte(`{"latency":12.5,"status":200}`)})
+	if got := h2.latSamples(); got != 1 {
+		t.Fatalf("numeric latency must still be sampled, got %d", got)
+	}
+
+	// Garbage must be ignored rather than recorded as 0, which would drag the
+	// percentile down and understate real latency.
+	h3 := newTestHub()
+	h3.latBuf = make([]float64, 0, 8)
+	h3.updateMetrics(Entry{Kind: "access", Data: []byte(`{"latency":"n/a","status":200}`)})
+	if got := h3.latSamples(); got != 0 {
+		t.Fatalf("unparseable latency must not become a 0 sample, got %d", got)
+	}
+}
