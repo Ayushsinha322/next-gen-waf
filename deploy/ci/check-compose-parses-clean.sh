@@ -212,44 +212,75 @@ check_passive_sink() {
   fi
   rm -f "$envf"
 
-  local report
-  report=$(printf '%s' "$rendered" | python3 -c '
-import sys, yaml
-d = yaml.safe_load(sys.stdin) or {}
-dp = (d.get("services") or {}).get("dataplane") or {}
-env = dp.get("environment") or {}
-url = str(env.get("SENTINEL_CLICKHOUSE_URL", ""))
-problems = []
-if not url:
-    problems.append("SENTINEL_CLICKHOUSE_URL is unset — events go nowhere")
-if any(h in url for h in ("localhost", "127.0.0.1", "@clickhouse:", "//clickhouse:")):
-    problems.append("sink points at a LOCAL ClickHouse this VM does not run: %s" % url)
-if not env.get("SENTINEL_CLICKHOUSE_CA_FILE"):
-    problems.append("no SENTINEL_CLICKHOUSE_CA_FILE — an internal cert cannot verify")
-spool = str(env.get("SENTINEL_SPOOL_DIR", ""))
-if not spool:
-    problems.append("no SENTINEL_SPOOL_DIR — a primary outage loses events instead of delaying them")
-else:
-    mounted = False
-    for v in dp.get("volumes") or []:
-        tgt = v.get("target", "") if isinstance(v, dict) else str(v).split(":")[1:2]
-        tgt = tgt if isinstance(tgt, str) else (tgt[0] if tgt else "")
-        if tgt and spool.startswith(tgt):
-            mounted = True
-            break
-    if not mounted:
-        problems.append("spool %s is not on a mounted volume — a restart discards it" % spool)
-print("\n".join(problems))
-' 2>&1)
+  # Extract just the `dataplane:` service block from the rendered config.
+  #
+  # Deliberately awk + grep, with no python and no yaml library: this runs in the
+  # deploy-shell job, an alpine image carrying only bash/shellcheck/git/
+  # coreutils/findutils/grep/sed/docker-cli-compose. An earlier version of this
+  # check shelled out to python3 and turned the whole job red with
+  # "python3: command not found" — a guard that cannot run where it is supposed
+  # to run is worse than no guard, and making it skip when its interpreter is
+  # missing would have been worse still (silently green).
+  #
+  # Services sit at two-space indent in `docker compose config` output and their
+  # keys at four, so the block ends at the next two-space key.
+  local dp
+  dp=$(printf '%s\n' "$rendered" | awk '
+    /^  dataplane:[[:space:]]*$/ { inblk = 1; next }
+    inblk && /^  [^ ]/          { inblk = 0 }
+    inblk                        { print }
+  ')
 
-  if [[ -z "$report" ]]; then
+  if [[ -z "$dp" ]]; then
+    printf '  %s✗%s no dataplane service in the rendered passive overlay\n' "$RED" "$R"
+    fail=$((fail + 1)); return
+  fi
+
+  # value_of <KEY> — the rendered value of one environment key, unquoted.
+  value_of() {
+    printf '%s\n' "$dp" \
+      | grep -E "^      $1:" \
+      | head -1 \
+      | sed -e "s/^      $1:[[:space:]]*//" -e 's/^"//' -e 's/"$//'
+  }
+
+  local problems=()
+  local url ca spool
+  url=$(value_of SENTINEL_CLICKHOUSE_URL)
+  ca=$(value_of SENTINEL_CLICKHOUSE_CA_FILE)
+  spool=$(value_of SENTINEL_SPOOL_DIR)
+
+  if [[ -z "$url" ]]; then
+    problems+=("SENTINEL_CLICKHOUSE_URL is unset — events go nowhere")
+  elif printf '%s' "$url" | grep -qE 'localhost|127\.0\.0\.1|//clickhouse:|@clickhouse:'; then
+    problems+=("sink points at a LOCAL ClickHouse this VM does not run: $url")
+  fi
+  [[ -n "$ca" ]] || problems+=("no SENTINEL_CLICKHOUSE_CA_FILE — an internal cert cannot verify")
+
+  if [[ -z "$spool" ]]; then
+    problems+=("no SENTINEL_SPOOL_DIR — a primary outage loses events instead of delaying them")
+  else
+    # The spool must land on a mounted volume, or a container restart discards
+    # whatever was waiting to be replayed. Compose renders each mount as a
+    # `target:` line inside the service's `volumes:` list.
+    local mounted=0 tgt
+    while IFS= read -r tgt; do
+      [[ -n "$tgt" ]] || continue
+      case "$spool" in
+        "$tgt"|"$tgt"/*) mounted=1; break;;
+      esac
+    done < <(printf '%s\n' "$dp" | grep -E '^[[:space:]]+target:' | sed -e 's/^[[:space:]]*target:[[:space:]]*//' -e 's/^"//' -e 's/"$//')
+    (( mounted )) || problems+=("spool $spool is not on a mounted volume — a restart discards it")
+  fi
+
+  if (( ${#problems[@]} == 0 )); then
     printf '  %s✓%s passive dataplane writes to the primary, over the internal CA, with a persisted spool\n' "$GRN" "$R"
   else
-    while IFS= read -r line; do
-      [[ -n "$line" ]] || continue
-      printf '  %s✗%s %s\n' "$RED" "$R" "$line"
+    local msg
+    for msg in "${problems[@]}"; do
+      printf '  %s✗%s %s\n' "$RED" "$R" "$msg"
       fail=$((fail + 1))
-    done <<< "$report"
+    done
   fi
 }
 check_passive_sink
