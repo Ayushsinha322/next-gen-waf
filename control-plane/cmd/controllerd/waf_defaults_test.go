@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
+	"os"
 	"strings"
 	"testing"
 
@@ -429,5 +431,61 @@ func TestEmptyDSLIsNotDelivered(t *testing.T) {
 	})
 	if names := inlineNames(t, rs); len(names) != 0 {
 		t.Errorf("a blank DSL must not be delivered, got %v", names)
+	}
+}
+
+// The console's wizard is a THIRD source of a site's initial posture, alongside
+// defaultWafPolicyJSON here and first-site.sh. It has drifted twice: the form
+// held anomaly_threshold 5 while the pre-selected "Balanced" tile advertised 10
+// (applyPreset only runs on click), so every wizard-created site ran half the
+// benchmarked threshold — and it defaulted to blocking while every document and
+// the CLI said learning-first.
+//
+// This reads the actual TypeScript and fails if the two sources disagree. A
+// comment asking future readers to "keep the two in step" did not prevent the
+// drift; a test does.
+func TestWizardDefaultsMatchControlPlaneDefaults(t *testing.T) {
+	src, err := os.ReadFile("../../../dashboard/lib/siteConfig.ts")
+	if err != nil {
+		t.Skipf("dashboard sources not present: %v", err)
+	}
+	text := string(src)
+
+	// 1. The wizard must not hardcode a threshold in emptyForm — it must derive
+	//    it from the preset, which is what makes drift impossible rather than
+	//    merely corrected.
+	if !strings.Contains(text, "anomaly_threshold: PRESETS.balanced.anomaly_threshold") {
+		t.Error("emptyForm() should derive anomaly_threshold from PRESETS.balanced, " +
+			"not restate it — a literal is how the form and the selected preset " +
+			"drifted apart before")
+	}
+
+	// 2. The balanced preset's threshold must equal this package's default.
+	var wafDefault struct {
+		Mode      string `json:"mode"`
+		Threshold int    `json:"anomaly_threshold"`
+		Paranoia  int    `json:"paranoia_level"`
+	}
+	if err := json.Unmarshal([]byte(defaultWafPolicyJSON), &wafDefault); err != nil {
+		t.Fatalf("defaultWafPolicyJSON does not parse: %v", err)
+	}
+	want := fmt.Sprintf("anomaly_threshold: %d", wafDefault.Threshold)
+	if !strings.Contains(text, want) {
+		t.Errorf("PRESETS.balanced must use the control plane's threshold (%q not found in siteConfig.ts)", want)
+	}
+
+	// 3. A new site must default to learning. Enforcing on day one blocks real
+	//    users against a false-positive rate nobody has measured, and it is the
+	//    opposite of what first-site.sh and the runbook do.
+	if !strings.Contains(text, `mode: "learning"`) {
+		t.Error(`emptyForm() must default mode to "learning" — the CLI path and every ` +
+			`operator document soak first and enforce afterwards`)
+	}
+
+	// 4. The old fallback installed threshold 5 when the field was left empty,
+	//    which reintroduced the un-benchmarked posture through the back door.
+	if strings.Contains(text, "Number(f.anomaly_threshold) || 5") {
+		t.Error("formToPayload still falls back to threshold 5; an empty field must " +
+			"fall back to the benchmarked default")
 	}
 }

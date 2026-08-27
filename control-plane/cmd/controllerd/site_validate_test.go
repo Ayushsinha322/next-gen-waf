@@ -249,3 +249,68 @@ func TestValidateSiteRowUsesStoredFields(t *testing.T) {
 		t.Errorf("a good row was flagged: %s", fields(problems))
 	}
 }
+
+// Nothing ever checked whether a hostname was already claimed. The data plane
+// routes purely by Host header, so two sites listing "portal.example.com" both
+// matched and whichever the node loaded last won — silently, with no error at
+// create time and no way to see from the console which policy was in force. On
+// a shared internal node hosting several applications, an operator could point a
+// new site at a hostname an existing site already protected and quietly replace
+// its policy.
+func TestDomainConflictsAcrossSites(t *testing.T) {
+	existing := []db.SiteRow{
+		{ID: "site-a", Name: "portal", Domains: []string{"portal.example.com", "www.portal.example.com"}},
+		{ID: "site-b", Name: "api", Domains: []string{"api.example.com"}},
+	}
+
+	// A fresh site claiming a taken hostname must be reported, and the message
+	// must name the site that already owns it — "conflict" alone leaves the
+	// operator hunting.
+	got := domainConflicts(existing, []string{"new.example.com", "api.example.com"}, "")
+	if len(got) != 1 {
+		t.Fatalf("expected exactly one conflict, got %d: %+v", len(got), got)
+	}
+	if !strings.Contains(got[0].Problem, `"api"`) {
+		t.Errorf("conflict must name the owning site, got %q", got[0].Problem)
+	}
+	if got[0].Field != "domains[1]" {
+		t.Errorf("conflict must point at the offending index, got %q", got[0].Field)
+	}
+
+	// Host matching is case-insensitive, so a different case is the same claim.
+	if got := domainConflicts(existing, []string{"API.Example.COM"}, ""); len(got) != 1 {
+		t.Errorf("case-differing domain must still conflict, got %+v", got)
+	}
+
+	// An UPDATE must be able to keep its own domains without conflicting with
+	// itself, or no site could ever be edited.
+	if got := domainConflicts(existing, []string{"portal.example.com"}, "site-a"); len(got) != 0 {
+		t.Errorf("a site must not conflict with itself: %+v", got)
+	}
+	// ...but it must still conflict with OTHER sites.
+	if got := domainConflicts(existing, []string{"api.example.com"}, "site-a"); len(got) != 1 {
+		t.Errorf("an update must still conflict with another site: %+v", got)
+	}
+
+	// No false positives on genuinely new hostnames.
+	if got := domainConflicts(existing, []string{"fresh.example.com"}, ""); len(got) != 0 {
+		t.Errorf("unclaimed domain must not conflict: %+v", got)
+	}
+}
+
+// A site listing the same hostname twice is a mistake worth catching at the
+// source, before it reaches the store.
+func TestDuplicateDomainsWithinOneRequest(t *testing.T) {
+	problems := validateSiteConfig("app", []string{"a.example.com", "A.example.com"},
+		json.RawMessage(`{"servers":[{"host":"10.0.0.1","port":8080}]}`),
+		json.RawMessage(`{"mode":"learning","anomaly_threshold":10,"paranoia_level":2}`))
+	found := false
+	for _, p := range problems {
+		if strings.Contains(p.Problem, "already listed") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("a repeated domain must be reported: %+v", problems)
+	}
+}

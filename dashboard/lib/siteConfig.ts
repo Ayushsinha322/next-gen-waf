@@ -434,7 +434,21 @@ export function emptyForm(): SiteForm {
     custom_priority: "data", cert_pem: "", key_pem: "", cert_path: "", key_path: "",
     hsts: true, hsts_max_age: 31536000,
 
-    mode: "blocking", paranoia_level: 2, anomaly_threshold: 5,
+    // Learning, not blocking. A site is created for an application whose
+    // false-positive rate nobody has measured yet, and the runbook, the
+    // onboarding checklist and first-site.sh all say the same thing: soak in
+    // learning, measure, tune, then enforce per-site. This wizard was the one
+    // path that did the opposite, so the console and the CLI shipped opposite
+    // postures for the same action.
+    mode: "learning",
+    // Taken from the preset that is pre-SELECTED above rather than written out
+    // again. applyPreset only runs when an operator CLICKS a tile, so a literal
+    // here meant the Balanced tile rendered as active advertising "PL2 · thr 10"
+    // while the form actually held 5 — half the benchmarked threshold, on every
+    // site this wizard had ever created. Deriving it makes that drift
+    // impossible rather than merely fixed.
+    paranoia_level: PRESETS.balanced.paranoia_level,
+    anomaly_threshold: PRESETS.balanced.anomaly_threshold,
     rule_categories: [...ALL_CRS_KEYS], rule_exclusions: [], path_overrides: [],
 
     max_body_size_mb: 10, max_uri_length: 8192, max_header_count: 100,
@@ -572,7 +586,9 @@ export function formToPayload(f: SiteForm): {
   const waf_policy: Record<string, unknown> = {
     mode: f.mode,
     paranoia_level: Number(f.paranoia_level) || 2,
-    anomaly_threshold: Number(f.anomaly_threshold) || 5,
+    // Falls back to the benchmarked default, not to 5. An empty field must not
+    // silently install a posture nobody validated.
+    anomaly_threshold: Number(f.anomaly_threshold) || PRESETS.balanced.anomaly_threshold,
     rule_categories: f.rule_categories,
     rule_exclusions: f.rule_exclusions,
     max_body_size: Math.round((Number(f.max_body_size_mb) || 10) * 1024 * 1024),

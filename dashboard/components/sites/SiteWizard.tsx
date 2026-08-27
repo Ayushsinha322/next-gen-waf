@@ -398,14 +398,34 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     <Field label="Site Name" hint="Internal identifier (e.g. shop-prod)">
                       <input className="fin2" placeholder="my-app" value={form.name} onChange={e => upd({ name: e.target.value })} />
                     </Field>
-                    <Field label="Security Mode" hint="Learning logs only; Blocking enforces">
+                    {/* Learning is listed FIRST and is the default. A new site
+                        protects an application whose false-positive rate nobody
+                        has measured, so enforcing on day one blocks real users
+                        on evidence that does not exist yet. The runbook, the
+                        onboarding checklist and first-site.sh all say soak in
+                        learning first; this control used to say the opposite by
+                        defaulting to Blocking with no warning at all. */}
+                    <Field label="Security Mode" hint="Learning observes and records; Blocking enforces">
                       <select className="fin2 fsel2" value={form.mode} onChange={e => upd({ mode: e.target.value as SiteForm["mode"] })}>
+                        <option value="learning">Learning (recommended for a new site)</option>
                         <option value="blocking">Blocking</option>
-                        <option value="learning">Learning</option>
                         <option value="off">Off</option>
                       </select>
                     </Field>
                   </Row>
+                  {form.mode === "blocking" && (
+                    <div style={{
+                      margin: "4px 0 10px", padding: "10px 12px", borderRadius: 8,
+                      border: "1px solid var(--amber)", background: "rgba(255,170,0,.07)",
+                      fontSize: "var(--fs-sm)", lineHeight: 1.6, color: "var(--text2)",
+                    }}>
+                      ⚠ <strong>Blocking enforces immediately.</strong> This application&rsquo;s
+                      false-positive rate has not been measured, so legitimate requests may be
+                      rejected from the moment you deploy. The recommended sequence is Learning →
+                      review the would-have-blocked report → exclude the false positives → then
+                      switch to Blocking. You can change mode later without a restart.
+                    </div>
+                  )}
                   <Field label="Server Names / Domains" hint="Bare hostnames only (no http:// or port). Press Enter to add.">
                     <ChipInput values={form.domains} onChange={v => upd({ domains: v })} placeholder="app.example.com" transform={normalizeDomain} />
                   </Field>

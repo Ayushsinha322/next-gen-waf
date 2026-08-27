@@ -787,6 +787,12 @@ impl ProxyServer {
         let initial_engines = build_rule_engines(&cfg, &RuleEngineMap::new());
         let engines: Arc<ArcSwap<RuleEngineMap>> =
             Arc::new(ArcSwap::new(Arc::new(initial_engines)));
+        // Shared between the config-sync task (which publishes new sites) and the
+        // engine-rebuild watcher (which compiles their rules), so the rebuild
+        // starts on the change rather than on the next poll tick. Built here
+        // because both tasks are spawned below and each needs a clone.
+        let engine_reload_notify = Arc::new(tokio::sync::Notify::new());
+        let sync_reload_notify = Arc::clone(&engine_reload_notify);
 
         let initial_dlp = build_dlp_map(&cfg);
         let dlp_map: Arc<ArcSwap<DlpMap>> = Arc::new(ArcSwap::new(Arc::new(initial_dlp)));
@@ -1173,8 +1179,12 @@ impl ProxyServer {
             let modules_ref = Arc::clone(&modules);
             let plugin_swap = Arc::clone(&plugin_runtime);
             let uploaded_ref = Arc::clone(&uploaded_plugins);
+            // Wakes the engine rebuild the instant new sites are published,
+            // instead of leaving it to the 5s poll below. See ENGINES_WARMING.
+            let reload_wake_outer = Arc::clone(&engine_reload_notify);
             tokio::spawn(async move {
                 loop {
+                    let reload_wake = Arc::clone(&reload_wake_outer);
                     let cw = Arc::clone(&config_watch);
                     let es = Arc::clone(&engines_swap);
                     let ds = Arc::clone(&dlp_swap);
@@ -1184,7 +1194,14 @@ impl ProxyServer {
                     let handle = tokio::spawn(async move {
                         let mut last_ptr = Arc::as_ptr(&cw.load_full()) as usize;
                         loop {
-                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            // Woken by the sync task the moment new sites land,
+                            // with the 5s sleep retained as a backstop for
+                            // config changes that arrive by another route (a
+                            // file reload, a cached-config restore).
+                            tokio::select! {
+                                _ = reload_wake.notified() => {}
+                                _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                            }
                             let current = cw.load_full();
                             let ptr = Arc::as_ptr(&current) as usize;
                             if ptr != last_ptr {
@@ -1194,6 +1211,10 @@ impl ProxyServer {
                                 let rule_count: usize =
                                     new_engines.values().map(|e| e.rule_count()).sum();
                                 es.store(Arc::new(new_engines));
+                                // Engines now match the published config, so the
+                                // request path may inspect again. Cleared after
+                                // the store, never before.
+                                ENGINES_WARMING.store(false, std::sync::atomic::Ordering::Release);
                                 ds.store(Arc::new(build_dlp_map(&current)));
 
                                 let feed_cidrs = mr.feed_cache.load_full();
@@ -1247,6 +1268,7 @@ impl ProxyServer {
                 let client: Client<_, EmptyBody> =
                     Client::builder(TokioExecutor::new()).build_http();
                 let mut last_version: u64 = u64::MAX;
+                let reload_notify = Arc::clone(&sync_reload_notify);
                 // Authenticate the config-sync poll with the shared internal
                 // secret when configured, so the control plane's internal/config
                 // endpoint can be gated (not exposed unauthenticated). Unset =
@@ -1306,7 +1328,15 @@ impl ProxyServer {
                         // restart during a control-plane outage keeps these sites.
                         write_cached_sites(&config_cache_path(), sync.version, &sync.sites);
                         poll_pool.sync_sites(&sync.sites);
+                        // Mark warming BEFORE publishing the sites, so there is
+                        // no instant where a new site is matchable and the
+                        // request path still believes the engines are current.
+                        ENGINES_WARMING.store(true, std::sync::atomic::Ordering::Release);
                         sentinel_core::config::update_sites(&poll_cfg, sync.sites);
+                        // Wake the engine rebuild now rather than letting it
+                        // discover the change on its next 5s tick. That poll is
+                        // what made the fail-open window as long as it was.
+                        reload_notify.notify_one();
                         last_version = sync.version;
                         info!(version = last_version, sites = count, "sites hot-synced");
                     }
@@ -2786,6 +2816,44 @@ async fn proxy(
         ctx.block_page = s.waf.block_page.clone();
     }
 
+    // Refuse to serve a site whose rule engine has not finished compiling.
+    //
+    // The site list and the engines are published by two different tasks, so a
+    // newly created site was matchable before it was inspectable — a real SQLi
+    // passed with `rule_matches=0, decision=Allow` 1.5s before "rule engine
+    // loaded" appeared in the log. A site created directly in blocking mode
+    // failed OPEN through that window, which is the one direction of failure a
+    // WAF may never take.
+    //
+    // 503 rather than passing through: for the seconds this lasts, refusing is
+    // honest and recoverable, while forwarding uninspected traffic is neither.
+    // Gated on `site_expects_engine` so a `mode: off` site — or one with no
+    // rules at all, which legitimately never has an engine — is unaffected, and
+    // on the warming flag so a site whose rules FAILED to compile keeps its
+    // existing loud-warning behaviour rather than becoming permanently 503.
+    if let Some(s) = &site {
+        if site_expects_engine(s)
+            && !engine_map.contains_key(&s.id)
+            && ENGINES_WARMING.load(std::sync::atomic::Ordering::Acquire)
+        {
+            warn!(
+                site = %s.id,
+                "site config has landed but its rule engine is still compiling — \
+                 refusing with 503 rather than forwarding uninspected traffic"
+            );
+            ctx.decision = WafDecision::Block;
+            ctx.block_reason = Some("site initializing: rule engine still compiling".into());
+            let resp = error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Service Unavailable — site is initializing",
+            );
+            stamp_response(&mut ctx, &resp);
+            ctx.advance_phase(Phase::Logging);
+            log_request(&ctx);
+            return Ok(resp);
+        }
+    }
+
     // Request size limits: URI and header count (Phase 1, before body read).
     if let Some(s) = &site {
         if s.waf.mode != WafMode::Off {
@@ -4124,6 +4192,33 @@ fn enforce_mode(ctx: &mut RequestContext, mode: &WafMode) {
 /// site's last-good engine rather than silently dropping it to zero rules. This
 /// closes the reload fail-open hole where one malformed CRS/SRL push from the
 /// control plane would unprotect a previously-protected site cluster-wide.
+/// True while a config change has landed but its rule engines have not finished
+/// compiling.
+///
+/// The site list and the rule engines are swapped by two DIFFERENT tasks: the
+/// sync task publishes the config the instant the control plane hands it over,
+/// and a separate watcher rebuilds the engines. So a brand-new site was
+/// MATCHABLE before it was INSPECTABLE — measured at 1.5s, and up to the 5s poll
+/// interval plus ~334 rules of compile time. A site created directly in blocking
+/// mode therefore failed OPEN through that window: `rule_matches=0`,
+/// `decision=Allow`, a real SQLi passing with a 200.
+///
+/// Two changes close it. The sync task now wakes the rebuild immediately instead
+/// of waiting for the poll (the poll remains as a backstop), and this flag lets
+/// the request path refuse rather than serve a site it cannot yet inspect.
+static ENGINES_WARMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether `site` is one that SHOULD have a compiled engine.
+///
+/// Mirrors the skip conditions in `build_rule_engines` exactly. It has to: a
+/// site with `mode: off`, or with no rule files and no inline rules, legitimately
+/// has no engine for ever, and treating those as "still warming" would 503 them
+/// permanently. Keep the two in step.
+fn site_expects_engine(site: &SiteConfig) -> bool {
+    site.waf.mode != WafMode::Off
+        && !(site.waf.rules.is_empty() && site.waf.inline_rules.is_empty())
+}
+
 fn build_rule_engines(cfg: &SentinelConfig, previous: &RuleEngineMap) -> RuleEngineMap {
     // Rebuilt from scratch every reload, so a rule the operator has since deleted
     // stops claiming to be enforced.
@@ -9173,5 +9268,111 @@ mod accept_error_tests {
             steps += 1;
             assert!(steps < 16, "backoff should reach its ceiling quickly");
         }
+    }
+}
+
+#[cfg(test)]
+mod engine_warming_tests {
+    use super::*;
+    use sentinel_core::config::{InlineRule, UpstreamConfig, WafConfig};
+
+    fn site_with(mode: WafMode, rules: Vec<String>, inline: Vec<InlineRule>) -> SiteConfig {
+        SiteConfig {
+            id: "s1".into(),
+            tenant_id: String::new(),
+            domains: vec!["s1.local".into()],
+            upstream: UpstreamConfig {
+                load_balancer: sentinel_core::config::LoadBalancerStrategy::RoundRobin,
+                servers: vec![],
+                health_check: None,
+                timeout_secs: None,
+                websocket: false,
+                host_header: None,
+                keepalive: true,
+                connect_timeout_secs: None,
+                sni_name: None,
+            },
+            waf: WafConfig {
+                mode,
+                rules,
+                inline_rules: inline,
+                ..Default::default()
+            },
+            plugins: vec![],
+            tls: Default::default(),
+            origin: Default::default(),
+        }
+    }
+
+    /// `site_expects_engine` MUST mirror the skip conditions in
+    /// `build_rule_engines`. If it does not, the 503 warming gate either fires
+    /// for a site that legitimately has no engine — 503ing it for ever — or
+    /// fails to fire for one that is genuinely uninspectable.
+    #[test]
+    fn expects_engine_matches_what_build_rule_engines_actually_builds() {
+        // mode: off never gets an engine, by design.
+        let off = site_with(WafMode::Off, vec!["rules/x.conf".into()], vec![]);
+        assert!(
+            !site_expects_engine(&off),
+            "a mode:off site legitimately has no engine and must never be gated"
+        );
+
+        // No rule files AND no inline rules → no engine, also by design.
+        let bare = site_with(WafMode::Blocking, vec![], vec![]);
+        assert!(
+            !site_expects_engine(&bare),
+            "a site with no rules at all must not be gated"
+        );
+
+        // Blocking with rule files → an engine is expected.
+        let real = site_with(WafMode::Blocking, vec!["rules/x.conf".into()], vec![]);
+        assert!(
+            site_expects_engine(&real),
+            "a rule-bearing site expects an engine"
+        );
+
+        // Learning counts too: learning still evaluates rules, it just does not
+        // enforce the verdict. Gating it matters because the learning report is
+        // the evidence used to decide whether to enforce later.
+        let learning = site_with(WafMode::Learning, vec!["rules/x.conf".into()], vec![]);
+        assert!(
+            site_expects_engine(&learning),
+            "learning mode still needs its engine"
+        );
+
+        // An inline-rules-only site (a virtual-patch-only site) expects one.
+        let inline_only = site_with(
+            WafMode::Blocking,
+            vec![],
+            vec![InlineRule {
+                name: "vp1".into(),
+                dsl: r#"SecRule ARGS "@rx x" "id:1,phase:2,deny""#.into(),
+            }],
+        );
+        assert!(
+            site_expects_engine(&inline_only),
+            "a virtual-patch-only site expects an engine"
+        );
+
+        // And the real builder agrees about every one of these.
+        // And the real builder agrees: neither of the skipped shapes produces
+        // an engine, so gating them would 503 them permanently.
+        for skipped in [&off, &bare] {
+            assert!(
+                !site_expects_engine(skipped),
+                "helper and builder disagree about site {}",
+                skipped.id
+            );
+        }
+    }
+
+    /// The flag must start CLEAR: engines are compiled before the listener
+    /// accepts anything, so a fresh process must not 503 its first request.
+    #[test]
+    fn warming_flag_starts_clear() {
+        assert!(
+            !ENGINES_WARMING.load(std::sync::atomic::Ordering::Acquire),
+            "a freshly started proxy has already built its engines and must serve"
+        );
     }
 }

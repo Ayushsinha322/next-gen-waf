@@ -739,12 +739,39 @@ func handleCreateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 		})
 		return
 	}
+	// Reject a hostname another site already claims. The data plane routes by
+	// Host header alone, so two sites claiming one domain BOTH match and the
+	// policy that applies depends on which node loaded last — silently.
+	if existing, lerr := store.ListSites(c.Request.Context(), claims.TenantID, claims.UserID); lerr == nil {
+		if conflicts := domainConflicts(existing, req.Domains, ""); len(conflicts) > 0 {
+			c.JSON(http.StatusConflict, gin.H{
+				"error":    "one or more domains are already served by another site",
+				"problems": conflicts,
+			})
+			return
+		}
+	} else {
+		// Refuse rather than skip the check: creating a colliding site is worse
+		// than failing to create one, and a silent skip would make the guard
+		// disappear exactly when the database is unhealthy.
+		zap.L().Warn("site create: could not read existing sites for domain-conflict check",
+			zap.Error(lerr))
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "cannot verify domain uniqueness right now — site not created",
+		})
+		return
+	}
 	if !requireLeader(c, cl) {
 		return
 	}
 	site, err := store.CreateSite(c.Request.Context(), claims.TenantID, claims.UserID, req)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		// A duplicate site NAME used to surface as 500 with the raw Postgres
+		// text ("duplicate key value violates unique constraint ..."), which
+		// reads as a server fault rather than "pick another name" — and
+		// first-site.sh derives the name from the domain, so re-running it hit
+		// this every time.
+		respondStoreError(c, err)
 		return
 	}
 	configVersion.Add(1)
@@ -861,6 +888,25 @@ func handleUpdateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 			"problems": problems,
 		})
 		return
+	}
+	// Same collision check as create, excluding this site's own domains.
+	if len(req.Domains) > 0 {
+		if existing, lerr := store.ListSites(c.Request.Context(), claims.TenantID, claims.UserID); lerr == nil {
+			if conflicts := domainConflicts(existing, req.Domains, siteID); len(conflicts) > 0 {
+				c.JSON(http.StatusConflict, gin.H{
+					"error":    "one or more domains are already served by another site",
+					"problems": conflicts,
+				})
+				return
+			}
+		} else {
+			zap.L().Warn("site update: could not read existing sites for domain-conflict check",
+				zap.Error(lerr))
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error": "cannot verify domain uniqueness right now — site not updated",
+			})
+			return
+		}
 	}
 	if !requireLeader(c, cl) {
 		return

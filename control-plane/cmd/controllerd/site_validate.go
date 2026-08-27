@@ -56,6 +56,7 @@ func validateSiteConfig(name string, domains []string, upstream, wafPolicy json.
 	if len(domains) == 0 {
 		add("domains", "at least one domain is required, or no traffic can route to this site")
 	}
+	seen := make(map[string]int, len(domains))
 	for i, d := range domains {
 		d = strings.TrimSpace(d)
 		switch {
@@ -63,6 +64,16 @@ func validateSiteConfig(name string, domains []string, upstream, wafPolicy json.
 			add(fmt.Sprintf("domains[%d]", i), "must not be empty")
 		case strings.ContainsAny(d, " /\\?#"):
 			add(fmt.Sprintf("domains[%d]", i), fmt.Sprintf("%q is not a bare hostname (no scheme, path, or spaces)", d))
+		default:
+			// Host matching is case-insensitive, so "App.example.com" and
+			// "app.example.com" are the same claim.
+			key := strings.ToLower(d)
+			if first, dup := seen[key]; dup {
+				add(fmt.Sprintf("domains[%d]", i),
+					fmt.Sprintf("%q is already listed at domains[%d]", d, first))
+			} else {
+				seen[key] = i
+			}
 		}
 	}
 
@@ -244,4 +255,47 @@ func mergedSiteForValidation(cur db.SiteRow, req db.UpdateSiteRequest) (string, 
 		waf = req.WafPolicy
 	}
 	return name, domains, upstream, waf
+}
+
+// domainConflicts reports domains already claimed by another site in the tenant.
+//
+// Nothing checked this. The data plane routes purely by Host header, so two
+// sites claiming "portal.example.com" both matched and whichever the node
+// happened to load last won — silently, with no error at create time and no way
+// to tell from the console which policy was in force. On a shared internal node
+// onboarding several applications that is the highest-consequence missing
+// validation in the product: an operator can point a new site at a hostname an
+// existing site already protects and quietly replace its policy.
+//
+// excludeSiteID lets an UPDATE keep its own domains without reporting itself.
+// Comparison is case-insensitive because Host matching is.
+func domainConflicts(existing []db.SiteRow, domains []string, excludeSiteID string) []SiteConfigProblem {
+	claimed := make(map[string]string) // lowercase domain -> owning site name
+	for _, row := range existing {
+		if row.ID == excludeSiteID {
+			continue
+		}
+		for _, d := range row.Domains {
+			if d = strings.TrimSpace(d); d != "" {
+				claimed[strings.ToLower(d)] = row.Name
+			}
+		}
+	}
+	var problems []SiteConfigProblem
+	for i, d := range domains {
+		d = strings.TrimSpace(d)
+		if d == "" {
+			continue
+		}
+		if owner, taken := claimed[strings.ToLower(d)]; taken {
+			problems = append(problems, SiteConfigProblem{
+				Field: fmt.Sprintf("domains[%d]", i),
+				Problem: fmt.Sprintf(
+					"%q is already served by site %q — the data plane routes by Host header, "+
+						"so both sites would match and the policy actually applied would depend "+
+						"on which node loaded last", d, owner),
+			})
+		}
+	}
+	return problems
 }
