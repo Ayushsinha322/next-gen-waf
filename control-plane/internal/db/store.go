@@ -846,6 +846,35 @@ func auditChainMAC(key []byte, seq int64, prevHMAC []byte, tenantID string, acto
 	return mac.Sum(nil)
 }
 
+// canonicalJSON renders `raw` in a form that survives a round trip through
+// Postgres.
+//
+// `diff` is stored as JSONB, which does NOT preserve the input bytes: it
+// reorders keys, drops insignificant whitespace and renormalises numbers. The
+// MAC used to cover `string(diff)` — the bytes Go happened to marshal — so
+// every row that carried a diff was signed over one byte string and verified
+// against a different one, and reported as ALTERED for ever. Measured on the
+// live deployment: 17 of 17 rows with a diff failed verification while every
+// chain link was intact.
+//
+// Re-marshalling through Go's encoder makes both sides agree, because
+// json.Marshal emits map keys in sorted order. Input that is not valid JSON is
+// signed as-is rather than silently becoming empty.
+func canonicalJSON(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return string(raw)
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return string(raw)
+	}
+	return string(b)
+}
+
 // auditPayload is the canonical byte encoding of an audit row's material fields,
 // shared by the legacy and chained MAC functions.
 func auditPayload(tenantID string, actor *string, action, targetKind string,
@@ -858,7 +887,19 @@ func auditPayload(tenantID string, actor *string, action, targetKind string,
 		strPtr(targetID),
 		strPtr(ip),
 		strPtr(userAgent),
-		string(diff),
+		canonicalJSON(diff),
+		createdAt.UTC().Format(time.RFC3339Nano),
+	))
+}
+
+// auditPayloadRaw is auditPayload's pre-canonicalisation encoding, retained
+// ONLY so verification can still accept rows signed before canonicalJSON
+// existed. Never used for a new write.
+func auditPayloadRaw(tenantID string, actor *string, action, targetKind string,
+	targetID, ip, userAgent *string, diff json.RawMessage, createdAt time.Time) []byte {
+	return []byte(fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%s|%s",
+		tenantID, strPtr(actor), action, targetKind, strPtr(targetID),
+		strPtr(ip), strPtr(userAgent), string(diff),
 		createdAt.UTC().Format(time.RFC3339Nano),
 	))
 }
@@ -968,15 +1009,20 @@ func (s *Store) VerifyAuditLog(ctx context.Context, tenantID string, hmacKey []b
 		if storedPrev == nil {
 			// Pre-chain row: only the legacy per-row property is available.
 			rep.Unchained++
-			if !hmac.Equal(auditMAC(hmacKey, tid, actor, action, targetKind, targetID, ip, ua, diff, createdAt), storedMAC) {
+			if !auditRowVerifies(storedMAC,
+				auditMAC(hmacKey, tid, actor, action, targetKind, targetID, ip, ua, diff, createdAt),
+				auditMACRaw(hmacKey, tid, actor, action, targetKind, targetID, ip, ua, diff, createdAt)) {
 				rep.Altered = append(rep.Altered, id)
 			}
 			prevMAC, prevSeq = storedMAC, seq
 			continue
 		}
 
-		if !hmac.Equal(auditChainMAC(hmacKey, seq, storedPrev, tid, actor, action, targetKind,
-			targetID, ip, ua, diff, createdAt), storedMAC) {
+		if !auditRowVerifies(storedMAC,
+			auditChainMAC(hmacKey, seq, storedPrev, tid, actor, action, targetKind,
+				targetID, ip, ua, diff, createdAt),
+			auditChainMACRaw(hmacKey, seq, storedPrev, tid, actor, action, targetKind,
+				targetID, ip, ua, diff, createdAt)) {
 			rep.Altered = append(rep.Altered, id)
 		}
 
@@ -997,6 +1043,34 @@ func (s *Store) VerifyAuditLog(ctx context.Context, tenantID string, hmacKey []b
 		prevMAC, prevSeq = storedMAC, seq
 	}
 	return rep, rows.Err()
+}
+
+// auditChainMACRaw / auditMACRaw recompute a row's MAC using the ORIGINAL
+// pre-canonicalisation diff encoding. Verification accepts either form, so a
+// row written before canonicalJSON existed is not reported as tampered merely
+// because the signing rule improved. Both forms use the same key, so accepting
+// the legacy one weakens nothing — it is a representation, not a credential.
+func auditChainMACRaw(key []byte, seq int64, prevHMAC []byte, tenantID string, actor *string,
+	action, targetKind string, targetID, ip, userAgent *string, diff json.RawMessage,
+	createdAt time.Time) []byte {
+	mac := hmac.New(sha256.New, key)
+	fmt.Fprintf(mac, "v2|%d|%d|", seq, len(prevHMAC))
+	mac.Write(prevHMAC)
+	mac.Write([]byte{'|'})
+	mac.Write(auditPayloadRaw(tenantID, actor, action, targetKind, targetID, ip, userAgent, diff, createdAt))
+	return mac.Sum(nil)
+}
+
+func auditMACRaw(key []byte, tenantID string, actor *string, action, targetKind string,
+	targetID, ip, userAgent *string, diff json.RawMessage, createdAt time.Time) []byte {
+	mac := hmac.New(sha256.New, key)
+	mac.Write(auditPayloadRaw(tenantID, actor, action, targetKind, targetID, ip, userAgent, diff, createdAt))
+	return mac.Sum(nil)
+}
+
+// auditRowVerifies reports whether `stored` matches either accepted encoding.
+func auditRowVerifies(stored, canonical, legacy []byte) bool {
+	return hmac.Equal(canonical, stored) || hmac.Equal(legacy, stored)
 }
 
 func strPtr(s *string) string {

@@ -104,11 +104,35 @@ func openDBWithRetry(ctx context.Context, log *zap.Logger, cfg db.Config, maxWai
 	}
 }
 
+// buildLogger returns the control-plane logger for the requested format.
+//
+// JSON is the DEFAULT. This used to be zap.NewDevelopmentConfig() with
+// CapitalColorLevelEncoder — console encoding with ANSI escape sequences
+// embedded in every line. That is unreadable in journald, unparseable by any
+// log shipper, and inconsistent with the data plane, which has always emitted
+// JSON. A WAF whose control plane cannot be ingested by the customer's own log
+// stack is a WAF whose control-plane events are invisible.
+//
+// SENTINEL_LOG_FORMAT=console (or "dev"/"text") restores the human-readable
+// coloured output for local work.
+func buildLogger(format string) (*zap.Logger, error) {
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "console", "dev", "development", "text":
+		cfg := zap.NewDevelopmentConfig()
+		cfg.EncoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
+		return cfg.Build()
+	default:
+		cfg := zap.NewProductionConfig()
+		// ISO-8601 rather than epoch floats: these lines are read by people in
+		// tickets as often as by machines.
+		cfg.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
+		return cfg.Build()
+	}
+}
+
 func run() error {
 	// ── Logger ────────────────────────────────────────────────────────────────
-	logCfg := zap.NewDevelopmentConfig()
-	logCfg.EncoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
-	log, err := logCfg.Build()
+	log, err := buildLogger(os.Getenv("SENTINEL_LOG_FORMAT"))
 	if err != nil {
 		return fmt.Errorf("building logger: %w", err)
 	}

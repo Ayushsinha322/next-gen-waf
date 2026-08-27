@@ -33,8 +33,9 @@ pub mod traces;
 pub use metrics::{
     dec_active_connections, history_shed_total, inc_active_connections, inc_blocked,
     inc_ebpf_drops, inc_history_shed, inc_load_shed_connections, inc_load_shed_requests,
-    inc_requests, inc_rule_hits, observe_duration, prometheus_text, set_active_connections,
-    snapshot, Counter, Gauge, Histogram, MetricLine, MetricsRegistry, MetricsSnapshot,
+    inc_log_lines_dropped, inc_requests, inc_rule_hits, log_lines_dropped_total, observe_duration,
+    prometheus_text, set_active_connections, snapshot, Counter, Gauge, Histogram, MetricLine,
+    MetricsRegistry, MetricsSnapshot,
 };
 
 pub use traces::{start_child_span, start_span, Span, SpanId, TraceId, Tracer, TRACER};

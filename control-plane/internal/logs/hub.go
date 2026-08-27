@@ -64,14 +64,24 @@ func (e Entry) IsSimulated() bool { return e.Source == SourceSimulated }
 // Snapshot holds a point-in-time view of live metrics derived from the
 // event stream.  It is safe to read without locking.
 type Snapshot struct {
-	RPS              float64 `json:"rps"`
-	P99LatencyMs     float64 `json:"p99_latency_ms"`
-	TotalRequests    int64   `json:"total_requests"`
-	BlockedRequests  int64   `json:"blocked_requests"`
-	MLAnomalies      int64   `json:"ml_anomalies"`
-	ErrorCount       int64   `json:"error_count"`
-	EbpfDrops        int64   `json:"ebpf_drops"`
-	ConnectedClients int     `json:"connected_clients"`
+	RPS float64 `json:"rps"`
+	// P99LatencyMs is END-TO-END request latency (the data plane's own
+	// elapsed_ms, upstream time included), taken as the p99 of the most recent
+	// samples read from access.log.
+	P99LatencyMs float64 `json:"p99_latency_ms"`
+	// P99Samples is how many samples that p99 was computed from. 0 means NO
+	// MEASUREMENT, which is not the same as a fast one: the latency ring is fed
+	// by tailing access.log from its end, so it is empty after a restart until
+	// traffic arrives. Without this the UI could not tell "no data" from
+	// "sub-millisecond" and rendered the absence of measurement as the best
+	// possible value.
+	P99Samples       int   `json:"p99_samples"`
+	TotalRequests    int64 `json:"total_requests"`
+	BlockedRequests  int64 `json:"blocked_requests"`
+	MLAnomalies      int64 `json:"ml_anomalies"`
+	ErrorCount       int64 `json:"error_count"`
+	EbpfDrops        int64 `json:"ebpf_drops"`
+	ConnectedClients int   `json:"connected_clients"`
 
 	// Derived aggregates (all real — computed from the proxy NDJSON stream).
 	UniqueBlockedIPs int64 `json:"unique_blocked_ips"`
@@ -380,6 +390,7 @@ func (h *Hub) GetSnapshot() Snapshot {
 	return Snapshot{
 		RPS:              rps,
 		P99LatencyMs:     p99,
+		P99Samples:       h.latSamples(),
 		TotalRequests:    h.totalRequests.Load(),
 		BlockedRequests:  h.blockedRequests.Load(),
 		MLAnomalies:      h.mlAnomalies.Load(),
@@ -778,6 +789,13 @@ func (h *Hub) computeRPS() float64 {
 	}
 	// RPS = events in last 10 s / 10
 	return math.Round(float64(n)/10.0*10) / 10
+}
+
+// latSamples reports how many latency samples the p99 is based on.
+func (h *Hub) latSamples() int {
+	h.latMu.Lock()
+	defer h.latMu.Unlock()
+	return len(h.latBuf)
 }
 
 func (h *Hub) computeP99() float64 {

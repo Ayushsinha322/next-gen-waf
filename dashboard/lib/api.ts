@@ -257,7 +257,10 @@ export interface AuditVerifyResult {
 
 export interface MetricsSnapshot {
   rps:               number;
+  /** End-to-end request latency (upstream included), p99 of recent samples. */
   p99_latency_ms:    number;
+  /** Samples behind that p99. 0 = no measurement, NOT a fast one. */
+  p99_samples?:      number;
   total_requests:    number;
   blocked_requests:  number;
   ml_anomalies:      number;

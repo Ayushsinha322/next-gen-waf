@@ -70,7 +70,7 @@ use sentinel_rules::RuleEngine;
 use sentinel_telemetry::{
     dec_active_connections, history_shed_total, inc_active_connections, inc_blocked,
     inc_ebpf_drops, inc_history_shed, inc_load_shed_connections, inc_load_shed_requests,
-    inc_requests, inc_rule_hits, observe_duration, prometheus_text,
+    inc_log_lines_dropped, inc_requests, inc_rule_hits, observe_duration, prometheus_text,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Semaphore};
@@ -6699,6 +6699,12 @@ fn log_sender() -> &'static std::sync::mpsc::SyncSender<LogRecord> {
 fn enqueue_log(name: &'static str, line: String) {
     if log_sender().try_send(LogRecord { name, line }).is_err() {
         LOG_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Also count it in /metrics. The local atomic drives the writer's
+        // rate-limited warning; this makes the loss ALERTABLE. Log loss happens
+        // under load, which is exactly when someone is relying on the logs, and
+        // a number only present in a log line cannot page anyone — ClickHouse
+        // shedding has been scrapeable for months while this was not.
+        inc_log_lines_dropped();
     }
 }
 

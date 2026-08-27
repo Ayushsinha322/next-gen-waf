@@ -261,6 +261,8 @@ services:
       # the owner role) and REMOVE this opt-out so RLS backstops isolation.
       SENTINEL_ALLOW_SUPERUSER_DB: "1"
       SENTINEL_REST_ADDR: 0.0.0.0:9501
+      # JSON by default so these lines are ingestable; `console` for local work.
+      SENTINEL_LOG_FORMAT: ${SENTINEL_LOG_FORMAT:-json}
       SENTINEL_AUTOSTART_DATAPLANE: "0"
       SENTINEL_LOG_DIR: /var/log/sentinel
       # Origins allowed to call the control plane from a browser. In the intended
