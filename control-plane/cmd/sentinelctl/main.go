@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -361,38 +362,130 @@ func cmdAlertsResolve(args []string) {
 func cmdAuditList(args []string) {
 	fs := flag.NewFlagSet("audit list", flag.ExitOnError)
 	limit := fs.Int("limit", 50, "max entries to show")
+	action := fs.String("action", "", "exact action, e.g. user.login")
+	prefix := fs.String("action-prefix", "", "action family, e.g. site.")
+	result := fs.String("result", "", "SUCCESS or FAILURE")
 	fs.Parse(args)
 
 	c := newClient()
 	if c.token == "" {
 		die("not authenticated — run: sentinelctl login --email E --password P")
 	}
-	data, status, err := c.get("/api/v1/audit?limit=" + strconv.Itoa(*limit))
+	q := "/api/v1/audit?limit=" + strconv.Itoa(*limit)
+	if *action != "" {
+		q += "&action=" + neturl.QueryEscape(*action)
+	}
+	if *prefix != "" {
+		q += "&action_prefix=" + neturl.QueryEscape(*prefix)
+	}
+	if *result != "" {
+		q += "&result=" + neturl.QueryEscape(*result)
+	}
+	data, status, err := c.get(q)
 	if err != nil {
 		die("audit request failed: %v", err)
 	}
 	mustOK(data, status, "audit list")
 
+	// The field is "entries". This read "audit_entries", a key the API has never
+	// returned, so the command printed "0 audit entry/entries" against a
+	// populated audit log — a silent zero, which reads as "nothing happened".
 	var resp struct {
-		AuditEntries []map[string]any `json:"audit_entries"`
+		Entries []map[string]any `json:"entries"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
 		die("parsing audit response: %v", err)
 	}
 
 	tw := newTable()
-	fmt.Fprintln(tw, "ID\tACTOR\tACTION\tRESOURCE\tCREATED")
-	fmt.Fprintln(tw, "--\t-----\t------\t--------\t-------")
-	for _, e := range resp.AuditEntries {
-		id := strVal(e, "id")
+	fmt.Fprintln(tw, "SEQ	RESULT	ACTOR	ACTION	TARGET	IP	CREATED")
+	fmt.Fprintln(tw, "---	------	-----	------	------	--	-------")
+	for _, e := range resp.Entries {
 		actor := strVal(e, "actor_email")
-		action := strVal(e, "action")
-		resource := strVal(e, "resource_type") + "/" + strVal(e, "resource_id")
-		created := strVal(e, "created_at")
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", id, actor, action, resource, created)
+		if actor == "" {
+			// Fall back to the UUID, then to an explicit marker — never blank,
+			// which would read as "no actor" rather than "actor not resolved".
+			if actor = strVal(e, "actor_user_id"); actor == "" {
+				actor = "system"
+			}
+		}
+		target := strVal(e, "target_kind")
+		if id := strVal(e, "target_id"); id != "" {
+			target += "/" + id
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			strVal(e, "seq"), strVal(e, "result"), actor, strVal(e, "action"),
+			target, strVal(e, "ip"), strVal(e, "created_at"))
 	}
 	tw.Flush()
-	fmt.Printf("\n%d audit entry/entries\n", len(resp.AuditEntries))
+	fmt.Printf("\n%d audit entry/entries\n", len(resp.Entries))
+}
+
+// cmdAuditVerify recomputes the audit hash chain. This is the operator-facing
+// half of making "tamper-evident" a claim that can be checked rather than
+// asserted — the verifier existed but nothing could reach it.
+//
+// Exits NON-ZERO when the chain does not verify, so it can be used in a cron or
+// a compliance script without parsing the output.
+func cmdAuditVerify(args []string) {
+	fs := flag.NewFlagSet("audit verify", flag.ExitOnError)
+	limit := fs.Int("limit", 0, "max rows to check (0 = all)")
+	fs.Parse(args)
+
+	c := newClient()
+	if c.token == "" {
+		die("not authenticated — run: sentinelctl login --email E --password P")
+	}
+	q := "/api/v1/audit/verify"
+	if *limit > 0 {
+		q += "?limit=" + strconv.Itoa(*limit)
+	}
+	data, status, err := c.get(q)
+	if err != nil {
+		die("audit verify request failed: %v", err)
+	}
+	// 409 is the deliberate signal for "ran fine, chain is broken" — it carries
+	// the report, so it must not be treated as a transport failure.
+	if status != 200 && status != 409 {
+		mustOK(data, status, "audit verify")
+	}
+
+	var rep struct {
+		Verified      bool     `json:"verified"`
+		Checked       int      `json:"checked"`
+		Altered       []string `json:"altered"`
+		ChainBroken   []string `json:"chain_broken"`
+		SeqGaps       []string `json:"seq_gaps"`
+		UnchainedRows int      `json:"unchained_rows"`
+		Error         string   `json:"error"`
+	}
+	if err := json.Unmarshal(data, &rep); err != nil {
+		die("parsing verify response: %v", err)
+	}
+	if rep.Error != "" {
+		die("%s", rep.Error)
+	}
+
+	fmt.Printf("rows checked:   %d\n", rep.Checked)
+	if rep.UnchainedRows > 0 {
+		fmt.Printf("pre-chain rows: %d (verified individually; deletions among these are undetectable)\n",
+			rep.UnchainedRows)
+	}
+	if rep.Verified {
+		fmt.Println("chain verified: every row's HMAC recomputes, none missing or reordered")
+		return
+	}
+	fmt.Println("CHAIN DID NOT VERIFY")
+	for _, id := range rep.Altered {
+		fmt.Printf("  altered:      %s\n", id)
+	}
+	for _, id := range rep.ChainBroken {
+		fmt.Printf("  chain broken: %s\n", id)
+	}
+	for _, g := range rep.SeqGaps {
+		fmt.Printf("  missing rows: %s\n", g)
+	}
+	os.Exit(1)
 }
 
 // stats -----------------------------------------------------------------------
@@ -687,6 +780,8 @@ Commands:
             ack   <id>               Acknowledge an alert
             resolve <id>             Resolve an alert
   audit     list [--limit 50]        List audit log entries
+            [--action A] [--action-prefix P] [--result SUCCESS|FAILURE]
+  audit     verify [--limit N]       Recompute the audit hash chain (exit 1 if broken)
   stats                              Show dashboard statistics
   test      --target URL             Fire OWASP attack suite through the WAF proxy
             --host H                 Host header (default: dvwa.local)
@@ -758,13 +853,15 @@ func main() {
 
 	case "audit":
 		if len(rest) == 0 {
-			die("usage: sentinelctl audit list")
+			die("usage: sentinelctl audit list|verify")
 		}
 		switch rest[0] {
 		case "list":
 			cmdAuditList(rest[1:])
+		case "verify":
+			cmdAuditVerify(rest[1:])
 		default:
-			die("unknown audit subcommand %q — try: list", rest[0])
+			die("unknown audit subcommand %q — try: list, verify", rest[0])
 		}
 
 	case "stats":

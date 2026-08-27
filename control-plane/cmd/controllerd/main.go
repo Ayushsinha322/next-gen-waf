@@ -104,11 +104,35 @@ func openDBWithRetry(ctx context.Context, log *zap.Logger, cfg db.Config, maxWai
 	}
 }
 
+// buildLogger returns the control-plane logger for the requested format.
+//
+// JSON is the DEFAULT. This used to be zap.NewDevelopmentConfig() with
+// CapitalColorLevelEncoder — console encoding with ANSI escape sequences
+// embedded in every line. That is unreadable in journald, unparseable by any
+// log shipper, and inconsistent with the data plane, which has always emitted
+// JSON. A WAF whose control plane cannot be ingested by the customer's own log
+// stack is a WAF whose control-plane events are invisible.
+//
+// SENTINEL_LOG_FORMAT=console (or "dev"/"text") restores the human-readable
+// coloured output for local work.
+func buildLogger(format string) (*zap.Logger, error) {
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "console", "dev", "development", "text":
+		cfg := zap.NewDevelopmentConfig()
+		cfg.EncoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
+		return cfg.Build()
+	default:
+		cfg := zap.NewProductionConfig()
+		// ISO-8601 rather than epoch floats: these lines are read by people in
+		// tickets as often as by machines.
+		cfg.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
+		return cfg.Build()
+	}
+}
+
 func run() error {
 	// ── Logger ────────────────────────────────────────────────────────────────
-	logCfg := zap.NewDevelopmentConfig()
-	logCfg.EncoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
-	log, err := logCfg.Build()
+	log, err := buildLogger(os.Getenv("SENTINEL_LOG_FORMAT"))
 	if err != nil {
 		return fmt.Errorf("building logger: %w", err)
 	}
@@ -533,7 +557,7 @@ func run() error {
 	protected.Use(leaderForward(cl))
 	protected.Use(auth.GinAuthMiddlewareWithAPIKey(jwtSvc, false, apiKeyResolver))
 	{
-		protected.POST("/auth/logout", func(c *gin.Context) { handleLogout(c, jwtSvc, store) })
+		protected.POST("/auth/logout", func(c *gin.Context) { handleLogout(c, jwtSvc, store, hub) })
 		// Self-service rotation for a signed-in user. Requires the current
 		// password, so a borrowed session cannot be turned into ownership.
 		protected.POST("/auth/password/change", func(c *gin.Context) { handleChangePassword(c, store, hub, log) })
@@ -641,10 +665,12 @@ func run() error {
 		})
 		protected.GET("/metrics/learning", func(c *gin.Context) {
 			if requirePerm(c, enforcer, rbac.ResourceSite, rbac.ActionList) {
-				handleLearningReport(c, hub)
+				handleLearningReport(c, chClient, hub)
 			}
 		})
 		protected.GET("/audit", func(c *gin.Context) { handleListAudit(c, enforcer, store) })
+		// Makes the "tamper-evident" claim exercisable. See handleVerifyAudit.
+		protected.GET("/audit/verify", func(c *gin.Context) { handleVerifyAudit(c, enforcer, store) })
 		protected.GET("/cluster/status", func(c *gin.Context) {
 			if requirePerm(c, enforcer, rbac.ResourceSite, rbac.ActionList) {
 				handleClusterStatus(c, cl)

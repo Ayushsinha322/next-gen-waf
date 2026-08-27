@@ -848,6 +848,95 @@ fn map_severity(s: RuleSeverity) -> Severity {
     }
 }
 
+/// Field names whose VALUES must never be written to a log or an event.
+///
+/// Substring match, so `current_password`, `x-auth-token` and `card_cvv` are all
+/// covered without enumerating every spelling an application might use.
+fn is_sensitive_field_name(name: &str) -> bool {
+    const SENSITIVE: [&str; 15] = [
+        "password",
+        "passwd",
+        "pwd",
+        "secret",
+        "token",
+        "auth",
+        "session",
+        "cookie",
+        "apikey",
+        "api_key",
+        "credential",
+        "otp",
+        "cvv",
+        "cardnumber",
+        "card_number",
+    ];
+    let n = name.to_ascii_lowercase();
+    SENSITIVE.iter().any(|s| n.contains(s))
+}
+
+/// The values of every sensitively-named field in this request.
+///
+/// Collected ONCE per `evaluate` call (per phase) and cached by the caller:
+/// `body_args` re-parses the body — JSON included — so calling this per fired
+/// rule would turn a 30-rule attack request into 30 body parses on the hot
+/// path. The list is normally empty, and short when it is not.
+fn collect_sensitive_values(ctx: &RequestContext) -> Vec<String> {
+    let query_pairs = ctx.uri.query().map(parse_query_params).unwrap_or_default();
+    // body_args already normalises form / JSON / multipart / XML bodies into
+    // (name, value) pairs, so this covers a JSON login API as well as a form.
+    query_pairs
+        .into_iter()
+        .chain(body_args(ctx))
+        .filter(|(name, value)| !value.is_empty() && is_sensitive_field_name(name))
+        .map(|(_, value)| value)
+        .collect()
+}
+
+/// True when `value` is the value of a sensitively-named request field.
+///
+/// A rule firing on a password field is usually a FALSE POSITIVE — real
+/// passwords contain quotes, `OR`, and SQL keywords — and capturing the payload
+/// there would write a live credential into the log an operator then pastes
+/// into a ticket. The target label cannot answer this: CRS rules are
+/// multi-target and `TargetSpec::Args` labels as bare `ARGS`, never
+/// `ARGS:password`. So the request's own fields are consulted instead, and the
+/// check happens at capture time — the value never reaches `RuleMatch`, so no
+/// downstream consumer can leak what it never received.
+fn value_is_sensitive(sensitive_values: &[String], value: &str) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    // Either direction: transforms may have trimmed or decoded the value before
+    // the operator saw it, so the captured text can be a substring of the field
+    // — or, after decoding, contain it.
+    sensitive_values
+        .iter()
+        .any(|field_value| field_value.contains(value) || value.contains(field_value.as_str()))
+}
+
+/// Cap and sanitize a matched value for retention on the `RuleMatch`.
+///
+/// 256 chars is enough to judge a false positive (the CRS's own `logdata`
+/// convention truncates similarly); control characters are stripped so a
+/// payload cannot smuggle newlines/ANSI into an NDJSON line or a terminal.
+/// Truncation walks back to a char boundary — a payload is untrusted input
+/// and a mid-codepoint slice would panic.
+fn cap_matched(s: &str) -> String {
+    const MAX: usize = 256;
+    let cleaned: String = s
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if cleaned.len() <= MAX {
+        return cleaned;
+    }
+    let mut end = MAX;
+    while end > 0 && !cleaned.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &cleaned[..end])
+}
+
 // ---------------------------------------------------------------------------
 // VM evaluator
 // ---------------------------------------------------------------------------
@@ -870,6 +959,17 @@ pub fn evaluate(
                            // Per-rule target attribution, reset at every RuleEnd.
     let mut last_target: Option<String> = None;
     let mut targets_seen = 0usize;
+    // Sensitive field values for credential redaction, computed at most once per
+    // phase on the first fired rule that captured anything — see
+    // `collect_sensitive_values`. Stays `None` for the overwhelmingly common
+    // case of a request where no rule fires at all.
+    let mut sensitive_values: Option<Vec<String>> = None;
+    // The text the most recent Match* instruction of the CURRENT rule matched,
+    // reset at every RuleEnd alongside the target attribution. Every match
+    // instruction that can name its text writes here (Some on hit, None on
+    // miss), so a stale value from an earlier rule can never be attributed to
+    // a later one.
+    let mut last_matched: Option<String> = None;
 
     while ip < program.len() {
         // Early exit: if already decided (Block/Challenge), stop evaluating.
@@ -931,13 +1031,26 @@ pub fn evaluate(
                                         ctx.tx_vars.insert(i.to_string(), m.as_str().to_owned());
                                     }
                                 }
+                                last_matched = caps.get(0).map(|m| cap_matched(m.as_str()));
                                 hit = true;
                                 break; // first match wins, as ModSecurity does
                             }
                         }
                         hit
                     } else {
-                        values.iter().any(|s| regex.is_match(s))
+                        // `find` instead of `is_match` so the matched text can be
+                        // named on the eventual security event; same lazy-DFA
+                        // path, and it still stops at the first matching value.
+                        let mut hit = false;
+                        last_matched = None;
+                        for s in &values {
+                            if let Some(m) = regex.find(s) {
+                                last_matched = Some(cap_matched(m.as_str()));
+                                hit = true;
+                                break;
+                            }
+                        }
+                        hit
                     };
                     debug!(pattern = %regex.as_str(), matched, "MatchRx");
                     stack.push(StackVal::Bool(matched));
@@ -950,7 +1063,11 @@ pub fn evaluate(
                     stack.push(StackVal::Absent);
                 } else {
                     let ac = &ruleset.ac_sets[*set_id];
-                    let matched = values.iter().any(|s| ac.is_match(s));
+                    // The AC set cannot cheaply name WHICH pattern hit, but the
+                    // value that contained it is what an operator needs to see.
+                    let hit_value = values.iter().find(|s| ac.is_match(s));
+                    let matched = hit_value.is_some();
+                    last_matched = hit_value.map(|s| cap_matched(s));
                     debug!(set_id, matched, "MatchMulti");
                     stack.push(StackVal::Bool(matched));
                 }
@@ -1019,7 +1136,9 @@ pub fn evaluate(
                     stack.push(StackVal::Absent);
                 } else {
                     let literal = &ruleset.literals[*literal_id];
-                    let matched = values.iter().any(|s| s == literal);
+                    let hit = values.iter().find(|s| *s == literal);
+                    let matched = hit.is_some();
+                    last_matched = hit.map(|s| cap_matched(s));
                     stack.push(StackVal::Bool(matched));
                 }
             }
@@ -1030,14 +1149,21 @@ pub fn evaluate(
                 stack.push(StackVal::Bool(exists));
             }
 
+            // The libinjection operators below name the whole offending VALUE
+            // rather than a substring — libinjection reports a verdict, not a
+            // span. These two back rules 942100 and 941100, the most-fired
+            // rules in the product, so leaving them uninstrumented would have
+            // left payload capture blind exactly where it matters most.
             Instruction::DetectSqli => {
                 let values = pop_strings(&mut stack);
                 if values.is_empty() {
                     stack.push(StackVal::Absent);
                 } else {
-                    let matched = values
+                    let hit = values
                         .iter()
-                        .any(|s| libinjectionrs::detect_sqli(s.as_bytes()).is_injection());
+                        .find(|s| libinjectionrs::detect_sqli(s.as_bytes()).is_injection());
+                    let matched = hit.is_some();
+                    last_matched = hit.map(|s| cap_matched(s));
                     debug!(matched, "DetectSqli");
                     stack.push(StackVal::Bool(matched));
                 }
@@ -1048,9 +1174,11 @@ pub fn evaluate(
                 if values.is_empty() {
                     stack.push(StackVal::Absent);
                 } else {
-                    let matched = values
+                    let hit = values
                         .iter()
-                        .any(|s| libinjectionrs::detect_xss(s.as_bytes()).is_injection());
+                        .find(|s| libinjectionrs::detect_xss(s.as_bytes()).is_injection());
+                    let matched = hit.is_some();
+                    last_matched = hit.map(|s| cap_matched(s));
                     debug!(matched, "DetectXss");
                     stack.push(StackVal::Bool(matched));
                 }
@@ -1062,7 +1190,9 @@ pub fn evaluate(
                     stack.push(StackVal::Absent);
                 } else {
                     let host = request_host(ctx);
-                    let matched = values.iter().any(|v| contains_off_domain_url(v, &host));
+                    let hit = values.iter().find(|v| contains_off_domain_url(v, &host));
+                    let matched = hit.is_some();
+                    last_matched = hit.map(|s| cap_matched(s));
                     debug!(matched, "DetectOffDomainUrl");
                     stack.push(StackVal::Bool(matched));
                 }
@@ -1073,7 +1203,9 @@ pub fn evaluate(
                 if values.is_empty() {
                     stack.push(StackVal::Absent);
                 } else {
-                    let matched = values.iter().any(|v| crate::ssrf::contains_ssrf_url(v));
+                    let hit = values.iter().find(|v| crate::ssrf::contains_ssrf_url(v));
+                    let matched = hit.is_some();
+                    last_matched = hit.map(|s| cap_matched(s));
                     debug!(matched, "DetectSsrfUrl");
                     stack.push(StackVal::Bool(matched));
                 }
@@ -1084,7 +1216,9 @@ pub fn evaluate(
                 if values.is_empty() {
                     stack.push(StackVal::Absent);
                 } else {
-                    let matched = values.iter().any(|v| ip_in_any_cidr(v, cidrs));
+                    let hit = values.iter().find(|v| ip_in_any_cidr(v, cidrs));
+                    let matched = hit.is_some();
+                    last_matched = hit.map(|s| cap_matched(s));
                     debug!(matched, "IpMatch");
                     stack.push(StackVal::Bool(matched));
                 }
@@ -1182,9 +1316,21 @@ pub fn evaluate(
                 };
                 last_target = None;
                 targets_seen = 0;
+                let matched_value = last_matched.take();
                 if fired {
                     if let Some(meta) = ruleset.rule_meta.get(rule_id) {
-                        fire_rule(ctx, meta, matched_target);
+                        // Redact at capture time, so a credential never enters
+                        // RuleMatch and no consumer can leak what it never got.
+                        let matched_value = matched_value.map(|v| {
+                            let sensitive = sensitive_values
+                                .get_or_insert_with(|| collect_sensitive_values(ctx));
+                            if value_is_sensitive(sensitive, &v) {
+                                "[redacted: sensitive field]".to_string()
+                            } else {
+                                v
+                            }
+                        });
+                        fire_rule(ctx, meta, matched_target, matched_value);
                         // skipAfter: scan forward for the named Marker and jump to it.
                         // ip += 1 at loop end then steps past the Marker (which is a no-op).
                         if let Some(marker) = &meta.skip_after {
@@ -1227,7 +1373,12 @@ pub fn evaluate(
     ctx.decision.clone()
 }
 
-fn fire_rule(ctx: &mut RequestContext, meta: &RuleMeta, matched_target: Option<String>) {
+fn fire_rule(
+    ctx: &mut RequestContext,
+    meta: &RuleMeta,
+    matched_target: Option<String>,
+    matched_value: Option<String>,
+) {
     let phase = rule_phase_to_phase(meta.phase);
 
     match &meta.action {
@@ -1281,6 +1432,7 @@ fn fire_rule(ctx: &mut RequestContext, meta: &RuleMeta, matched_target: Option<S
             score: meta.score_delta.max(0) as u32,
             target: matched_target.unwrap_or_default(),
             phase,
+            matched_value: matched_value.unwrap_or_default(),
         });
     }
 

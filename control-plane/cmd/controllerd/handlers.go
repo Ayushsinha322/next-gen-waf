@@ -21,6 +21,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/your-org/sentinel-waf/control-plane/internal/auth"
+	chreader "github.com/your-org/sentinel-waf/control-plane/internal/clickhouse"
 	"github.com/your-org/sentinel-waf/control-plane/internal/db"
 	"github.com/your-org/sentinel-waf/control-plane/internal/leader"
 	"github.com/your-org/sentinel-waf/control-plane/internal/logs"
@@ -101,19 +102,29 @@ func handleLogin(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store, hub *
 	// Validate credentials.  When a DB pool is available we check the users
 	// table; otherwise fall back to the hardcoded dev backdoor.
 	var claims auth.Claims
-	var loginResult = "SUCCESS"
+	var loginResult = auditSuccess
 	if store != nil {
 		ok, userID, userTenant, role, err := store.ValidatePassword(c.Request.Context(),
 			db.DevTenantID, req.Email, req.Password)
 		if err != nil || !ok {
-			loginResult = "FAILURE"
+			loginResult = auditFailure
 			recordFail()
+			// Record the OUTCOME and the attempted email. Previously the
+			// computed FAILURE was assigned and then discarded (`_ =
+			// loginResult`), and the attempted address was not stored at all —
+			// so a failed login was byte-identical in shape to a success apart
+			// from a nil actor, and "was this account being brute-forced?"
+			// could not be answered from the audit log at all. The email is the
+			// identifier under attack; the password is never recorded.
 			writeAuditEntry(c, store, hub, &db.WriteAuditRequest{
 				TenantID:   db.DevTenantID,
 				Action:     "user.login",
 				TargetKind: "user",
+				Diff: auditDiff(auditFailure, map[string]any{
+					"email":  loginKey,
+					"reason": "invalid_credentials",
+				}),
 			})
-			_ = loginResult
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid email or password"})
 			return
 		}
@@ -142,6 +153,21 @@ func handleLogin(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store, hub *
 			ok, step := auth.VerifyTOTPStep(mfaSecret, req.MFACode)
 			if !ok {
 				recordFail()
+				// A wrong second factor means someone holds the password but
+				// not the device — the single strongest signal of a real
+				// compromise in this product, and it wrote no audit row at all.
+				// The code itself is a credential and is never recorded.
+				writeAuditEntry(c, store, hub, &db.WriteAuditRequest{
+					TenantID:    userTenant,
+					ActorUserID: &userID,
+					Action:      "user.mfa.verify",
+					TargetKind:  "user",
+					TargetID:    &userID,
+					Diff: auditDiff(auditFailure, map[string]any{
+						"email":  loginKey,
+						"reason": "invalid_totp_code",
+					}),
+				})
 				c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid mfa code"})
 				return
 			}
@@ -154,6 +180,20 @@ func handleLogin(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store, hub *
 			}
 			if !consumed {
 				recordFail()
+				// A replayed code means the code was OBSERVED — shoulder-surfed,
+				// phished, or captured. Distinct reason from a wrong code so
+				// triage can tell the two apart.
+				writeAuditEntry(c, store, hub, &db.WriteAuditRequest{
+					TenantID:    userTenant,
+					ActorUserID: &userID,
+					Action:      "user.mfa.verify",
+					TargetKind:  "user",
+					TargetID:    &userID,
+					Diff: auditDiff(auditFailure, map[string]any{
+						"email":  loginKey,
+						"reason": "totp_code_replayed",
+					}),
+				})
 				c.JSON(http.StatusUnauthorized, gin.H{"error": "mfa code already used"})
 				return
 			}
@@ -175,6 +215,10 @@ func handleLogin(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store, hub *
 				TenantID:   db.DevTenantID,
 				Action:     "user.login",
 				TargetKind: "user",
+				Diff: auditDiff(auditFailure, map[string]any{
+					"email":  loginKey,
+					"reason": "invalid_credentials",
+				}),
 			})
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid email or password"})
 			return
@@ -203,6 +247,13 @@ func handleLogin(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store, hub *
 		Action:      "user.login",
 		TargetKind:  "user",
 		TargetID:    &userID,
+		// Stated, not implied. A reader filtering `diff->>'result'` must get
+		// every login, not only the failures.
+		Diff: auditDiff(loginResult, map[string]any{
+			"email":       loginKey,
+			"auth_method": claims.AuthMethod,
+			"mfa":         claims.AuthMethod == "password" && req.MFACode != "",
+		}),
 	})
 
 	c.JSON(http.StatusOK, gin.H{
@@ -282,7 +333,7 @@ func handleRefresh(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store) {
 // refresh token) by adding their jti to the shared denylist — so the session is
 // dead across the whole HA cluster, not just this node. Mounted on the
 // authenticated (protected) group so the access-token claims are available.
-func handleLogout(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store) {
+func handleLogout(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store, hub *logs.Hub) {
 	claims, ok := auth.GetClaims(c.Request.Context())
 	if !ok || claims == nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "not authenticated"})
@@ -315,6 +366,19 @@ func handleLogout(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store) {
 			_ = store.RevokeToken(c.Request.Context(), rc.ID, rc.ExpiresAt.Time)
 		}
 	}
+	// Sessions ended with no record at all: the audit trail showed logins and
+	// never the logouts, so a session's span could not be reconstructed and an
+	// account still "logged in" from the log's point of view might have been
+	// closed hours earlier. Cheap to record and needed to bound an incident.
+	logoutUser := claims.UserID
+	writeAuditEntry(c, store, hub, &db.WriteAuditRequest{
+		TenantID:    claims.TenantID,
+		ActorUserID: &logoutUser,
+		Action:      "user.logout",
+		TargetKind:  "user",
+		TargetID:    &logoutUser,
+		Diff:        auditDiff(auditSuccess, nil),
+	})
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -690,6 +754,10 @@ func handleCreateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 		Action:      "site.create",
 		TargetKind:  "site",
 		TargetID:    &site.ID,
+		// The posture a site is BORN with is as security-relevant as any later
+		// change — a site created directly in blocking mode, or at a threshold
+		// nobody benchmarked, is a decision worth being able to trace.
+		Diff: auditDiff(auditSuccess, map[string]any{"created": siteEnforcementFacts(site)}),
 	})
 	c.JSON(http.StatusCreated, gin.H{"site": site})
 }
@@ -711,6 +779,55 @@ func handleGetSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"site": site})
+}
+
+// siteEnforcementFacts pulls the fields that decide whether, and how hard, a
+// site is protected: enforcement mode, lifecycle status, anomaly threshold and
+// paranoia level. These are the settings whose change an auditor actually needs
+// to see — "site X was updated" cannot distinguish a renamed label from
+// protection being switched off.
+func siteEnforcementFacts(row *db.SiteRow) map[string]any {
+	if row == nil {
+		return nil
+	}
+	out := map[string]any{"status": row.Status, "name": row.Name}
+	var policy struct {
+		Mode             *string `json:"mode"`
+		AnomalyThreshold *int    `json:"anomaly_threshold"`
+		ParanoiaLevel    *int    `json:"paranoia_level"`
+	}
+	if len(row.WafPolicy) > 0 && json.Unmarshal(row.WafPolicy, &policy) == nil {
+		if policy.Mode != nil {
+			out["mode"] = *policy.Mode
+		}
+		if policy.AnomalyThreshold != nil {
+			out["anomaly_threshold"] = *policy.AnomalyThreshold
+		}
+		if policy.ParanoiaLevel != nil {
+			out["paranoia_level"] = *policy.ParanoiaLevel
+		}
+	}
+	return out
+}
+
+// siteChangeDiff renders a before/after pair, keeping ONLY the fields that
+// actually changed so the diff reads as a change record rather than a snapshot.
+// Returns a diff carrying just the outcome when nothing material moved (a
+// domain or upstream edit, say) — the mutation is still recorded, it simply had
+// no enforcement effect worth highlighting.
+func siteChangeDiff(before, after *db.SiteRow) json.RawMessage {
+	b, a := siteEnforcementFacts(before), siteEnforcementFacts(after)
+	changed := map[string]any{}
+	for k, av := range a {
+		bv, had := b[k]
+		if !had || fmt.Sprint(bv) != fmt.Sprint(av) {
+			changed[k] = map[string]any{"from": bv, "to": av}
+		}
+	}
+	if len(changed) == 0 {
+		return auditDiff(auditSuccess, nil)
+	}
+	return auditDiff(auditSuccess, map[string]any{"changed": changed})
 }
 
 func handleUpdateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *leader.Elector, log *zap.Logger) {
@@ -762,6 +879,11 @@ func handleUpdateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 		Action:      "site.update",
 		TargetKind:  "site",
 		TargetID:    &siteID,
+		// `cur` was already read above to validate the merged result, so a real
+		// before/after costs nothing. Without it, flipping a site from blocking
+		// to off — disabling protection outright — recorded only THAT the site
+		// was updated.
+		Diff: siteChangeDiff(cur, site),
 	})
 	c.JSON(http.StatusOK, gin.H{"site": site})
 }
@@ -836,6 +958,11 @@ func handleDeleteSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 	if !requireLeader(c, cl) {
 		return
 	}
+	// Read what is about to disappear. After the delete this is unrecoverable
+	// from the row itself, so an audit entry naming only the site's UUID would
+	// leave "which application stopped being protected, and how was it
+	// configured?" answerable only from a database backup.
+	doomed, _ := store.GetSite(c.Request.Context(), claims.TenantID, siteID)
 	// Record an undo point before removing a site from protection.
 	snapshotBeforeMutation(c, store, log, "site.delete")
 	if err := store.DeleteSite(c.Request.Context(), claims.TenantID, siteID); err != nil {
@@ -843,11 +970,20 @@ func handleDeleteSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 		return
 	}
 	configVersion.Add(1)
+	delDiff := auditDiff(auditSuccess, nil)
+	if doomed != nil {
+		delDiff = auditDiff(auditSuccess, map[string]any{
+			"deleted": siteEnforcementFacts(doomed),
+			"domains": doomed.Domains,
+		})
+	}
 	writeAuditEntry(c, store, hub, &db.WriteAuditRequest{
-		TenantID:   claims.TenantID,
-		Action:     "site.delete",
-		TargetKind: "site",
-		TargetID:   &siteID,
+		TenantID:    claims.TenantID,
+		ActorUserID: &claims.UserID,
+		Action:      "site.delete",
+		TargetKind:  "site",
+		TargetID:    &siteID,
+		Diff:        delDiff,
 	})
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
@@ -873,16 +1009,30 @@ func handleUpdateSiteStatus(c *gin.Context, enf *rbac.Enforcer, store *db.Store,
 	if !requireLeader(c, cl) {
 		return
 	}
+	prior, _ := store.GetSite(c.Request.Context(), claims.TenantID, siteID)
 	if err := store.UpdateSiteStatus(c.Request.Context(), claims.TenantID, siteID, body.Status); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	configVersion.Add(1)
+	statusFrom := any(nil)
+	if prior != nil {
+		statusFrom = prior.Status
+	}
 	writeAuditEntry(c, store, hub, &db.WriteAuditRequest{
-		TenantID:   claims.TenantID,
-		Action:     "site.status." + body.Status,
-		TargetKind: "site",
-		TargetID:   &siteID,
+		TenantID:    claims.TenantID,
+		ActorUserID: &claims.UserID,
+		Action:      "site.status." + body.Status,
+		TargetKind:  "site",
+		TargetID:    &siteID,
+		// Pausing a site stops it being protected. The action name carried the
+		// destination but not the origin, so a repeated pause and a real
+		// transition were indistinguishable.
+		Diff: auditDiff(auditSuccess, map[string]any{
+			"changed": map[string]any{
+				"status": map[string]any{"from": statusFrom, "to": body.Status},
+			},
+		}),
 	})
 	c.JSON(http.StatusOK, gin.H{"ok": true, "status": body.Status})
 }
@@ -2212,17 +2362,117 @@ func handleListAudit(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
 		return
 	}
-	if store != nil {
-		entries, err := store.ListAuditLogs(c.Request.Context(), claims.TenantID, claims.UserID, 100)
-		if err == nil {
-			if entries == nil {
-				entries = []db.AuditRow{}
-			}
-			c.JSON(http.StatusOK, gin.H{"entries": entries, "tenant_id": claims.TenantID})
-			return
-		}
+	// An empty list and a broken audit store must never look the same. This
+	// returned 200 with `entries: []` on a DB error, so an audit-store outage
+	// rendered in the console as "no admin activity" — the most reassuring
+	// possible display of the least reassuring possible state, and precisely
+	// what an attacker who could break the store would want shown.
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "audit log unavailable: no database configured",
+		})
+		return
 	}
-	c.JSON(http.StatusOK, gin.H{"entries": []interface{}{}, "tenant_id": claims.TenantID})
+
+	limit := int(atoi64(c.Query("limit")))
+	if limit <= 0 {
+		limit = 100
+	}
+	filter := db.AuditFilter{
+		Action:       c.Query("action"),
+		ActionPrefix: c.Query("action_prefix"),
+		Result:       strings.ToUpper(strings.TrimSpace(c.Query("result"))),
+		From:         atoi64(c.Query("from")),
+		To:           atoi64(c.Query("to")),
+		BeforeSeq:    atoi64(c.Query("before_seq")),
+		Limit:        limit,
+	}
+	if filter.Result != "" && filter.Result != auditSuccess && filter.Result != auditFailure {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "result must be SUCCESS or FAILURE",
+		})
+		return
+	}
+
+	entries, err := store.ListAuditLogsFiltered(c.Request.Context(), claims.TenantID, claims.UserID, filter)
+	if err != nil {
+		zap.L().Warn("audit list failed", zap.Error(err))
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "audit log unavailable: could not read the audit store",
+		})
+		return
+	}
+	if entries == nil {
+		entries = []db.AuditRow{}
+	}
+	// Keyset cursor: the caller pages by passing this back as before_seq. Only
+	// present when the page was full, so an empty tail is not mistaken for
+	// "more available".
+	var nextCursor int64
+	if len(entries) == limit {
+		nextCursor = entries[len(entries)-1].Seq
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"entries":         entries,
+		"tenant_id":       claims.TenantID,
+		"next_before_seq": nextCursor,
+	})
+}
+
+// handleVerifyAudit recomputes the audit hash chain and reports the result.
+//
+// The verifier has existed since the chain was built but was reachable from
+// NOTHING — no route, no CLI subcommand, no job — while the console advertised
+// the trail as "tamper-evident ... compliance-grade". An auditor asking "prove
+// the chain verifies" could not be answered from the product at all. A
+// tamper-evidence claim that cannot be exercised is a claim, not a control.
+//
+// Restricted to the audit-read permission and scoped to the caller's tenant.
+func handleVerifyAudit(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
+	claims, _ := auth.GetClaims(c.Request.Context())
+	if !enf.Allow(rbac.Role(claims.Role), rbac.ResourceAudit, rbac.ActionRead) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
+		return
+	}
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "audit log unavailable: no database configured",
+		})
+		return
+	}
+	limit := int(atoi64(c.Query("limit")))
+	rep, err := store.VerifyAuditLog(c.Request.Context(), claims.TenantID, auditHMACKey(), limit)
+	if err != nil {
+		zap.L().Warn("audit verify failed", zap.Error(err))
+		// Never report "verified" because verification could not run.
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error":    "could not verify the audit chain",
+			"verified": false,
+		})
+		return
+	}
+	verified := len(rep.Altered) == 0 && len(rep.ChainBroken) == 0 && len(rep.SeqGaps) == 0
+	status := http.StatusOK
+	if !verified {
+		// A failed verification is not a successful request about a bad chain —
+		// it is an integrity alarm, and it must not be a quiet 200 that a
+		// dashboard renders as a tick.
+		status = http.StatusConflict
+	}
+	c.JSON(status, gin.H{
+		"verified":     verified,
+		"checked":      rep.Checked,
+		"altered":      rep.Altered,
+		"chain_broken": rep.ChainBroken,
+		"seq_gaps":     rep.SeqGaps,
+		// Rows predating the chain migration are verified with the legacy
+		// per-row MAC, so deletions among them cannot be detected. Surfaced so
+		// a clean result over legacy rows is never read as a full guarantee.
+		"unchained_rows": rep.Unchained,
+		"note": "verified=true means every chained row's HMAC recomputes and no row is " +
+			"missing or reordered. unchained_rows predate the hash chain and can only be " +
+			"checked individually.",
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -2373,15 +2623,121 @@ func handleSiteMetrics(c *gin.Context, hub *logs.Hub) {
 
 // handleLearningReport returns the would-have-blocked aggregation for the WAF
 // learning workflow. Optional ?site=<label> scopes it to one site; omitted =
-// across all sites. The "rules" array is sorted by detection count desc.
-func handleLearningReport(c *gin.Context, hub *logs.Hub) {
+// across all sites. Optional ?from=&to= (unix seconds) bound the window. The
+// "rules" array is sorted by detection count desc.
+//
+// Served from ClickHouse when it is configured, because the in-memory
+// aggregate in logs.Hub is fed by tailing waf.log FROM ITS END: a control-plane
+// restart reset the report to empty, and this report is the evidence an
+// operator uses to decide a site is safe to flip out of learning mode. The
+// stored path is also tenant-scoped, which the in-memory one is not.
+//
+// `source` is reported so a reader can tell durable evidence from
+// since-restart-only evidence instead of having to assume.
+func handleLearningReport(c *gin.Context, ch *chreader.Client, hub *logs.Hub) {
+	claims, _ := auth.GetClaims(c.Request.Context())
 	site := c.Query("site")
-	c.JSON(http.StatusOK, gin.H{"site": site, "rules": hub.GetLearningStats(site)})
+
+	if ch != nil && ch.Enabled() {
+		rules, err := ch.LearningStats(
+			c.Request.Context(),
+			claims.TenantID, // isolation boundary — never from client input
+			site,
+			atoi64(c.Query("from")),
+			atoi64(c.Query("to")),
+			0,
+		)
+		if err == nil {
+			// Categories are derived here rather than stored, so both sources
+			// classify through the same function.
+			for i := range rules {
+				rules[i].Category = logs.AttackCategory(rules[i].RuleID)
+			}
+			if rules == nil {
+				rules = []chreader.LearningStat{}
+			}
+			c.JSON(http.StatusOK, gin.H{
+				"site": site, "rules": rules, "source": "clickhouse", "durable": true,
+			})
+			return
+		}
+		// Fall through to the in-memory aggregate, but say so: reporting a
+		// since-restart view as if it were the full record is how an operator
+		// flips a site to blocking on evidence that was quietly incomplete.
+		zap.L().Warn("learning report: clickhouse query failed, serving in-memory aggregate",
+			zap.Error(err))
+		c.JSON(http.StatusOK, gin.H{
+			"site": site, "rules": hub.GetLearningStats(site),
+			"source": "memory", "durable": false,
+			"warning": "event store unreachable — this covers only the period since the " +
+				"control plane last restarted, and is not scoped to your tenant",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"site": site, "rules": hub.GetLearningStats(site),
+		"source": "memory", "durable": false,
+		"warning": "no event store configured — this covers only the period since the " +
+			"control plane last restarted",
+	})
 }
 
 // ---------------------------------------------------------------------------
 // Audit helper (fire-and-forget)
 // ---------------------------------------------------------------------------
+
+// Audit outcome values recorded inside `diff`.
+const (
+	auditSuccess = "SUCCESS"
+	auditFailure = "FAILURE"
+)
+
+// auditDiff builds the `diff` payload for an audit row, always stamping an
+// explicit outcome.
+//
+// The outcome lives in `diff` rather than in a column of its own on purpose.
+// `diff` is already covered by the chain HMAC (see auditPayload), so a
+// FAILURE cannot be flipped to SUCCESS in the database without breaking
+// verification. A new top-level column would either have to join the signed
+// payload — invalidating the HMAC of every row written before it existed — or
+// stay unsigned, which would leave the single most security-relevant field in
+// the table freely editable. Signed-inside-diff needs no migration and no
+// chain version bump, and stays queryable via `diff->>'result'`.
+//
+// Never put a password, token, or secret in here.
+func auditDiff(result string, fields map[string]any) json.RawMessage {
+	m := map[string]any{"result": result}
+	for k, v := range fields {
+		if k == "result" {
+			continue
+		}
+		m[k] = v
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		// A diff that will not marshal must not silently become "no diff" —
+		// that would record a failure as an ordinary success.
+		return json.RawMessage(`{"result":"` + result + `","diff_error":"marshal failed"}`)
+	}
+	return json.RawMessage(b)
+}
+
+// auditResultOf reads the outcome back out of a diff so the live stream reports
+// what actually happened. Absent = SUCCESS, matching the many call sites that
+// only audit their happy path.
+func auditResultOf(diff json.RawMessage) string {
+	if len(diff) == 0 {
+		return auditSuccess
+	}
+	var probe struct {
+		Result string `json:"result"`
+	}
+	if err := json.Unmarshal(diff, &probe); err != nil || probe.Result == "" {
+		return auditSuccess
+	}
+	return probe.Result
+}
 
 // writeAuditEntry writes an audit record to the DB (if available) and also
 // publishes the entry into the live SSE stream so the dashboard updates in
@@ -2402,14 +2758,27 @@ func writeAuditEntry(c *gin.Context, store *db.Store, hub *logs.Hub, req *db.Wri
 	if req.TargetID != nil && *req.TargetID != "" {
 		resource = req.TargetKind + ":" + *req.TargetID
 	}
-	session := fmt.Sprintf("s-%d", time.Now().UnixNano()%100000)
+	// Group entries by the session that produced them, using the refresh-token
+	// jti the access token carries (rjti) — it is stable for the life of a
+	// login and survives token refresh. The previous value was
+	// fmt.Sprintf("s-%d", time.Now().UnixNano()%100000): a fresh pseudo-random
+	// string per ENTRY, so it looked like a session id, sorted like one, and
+	// grouped nothing. Absent (e.g. on the login request itself, which has no
+	// token yet) it is reported as "-" rather than invented.
+	session := "-"
+	if claims, ok := auth.GetClaims(c.Request.Context()); ok && claims != nil && claims.RefreshJTI != "" {
+		session = claims.RefreshJTI
+	}
+	// The real outcome, not a hardcoded one. This stream fed the console's audit
+	// view with "result":"SUCCESS" on every entry — including the failed logins
+	// that are the whole point of watching it.
 	auditData, _ := json.Marshal(map[string]interface{}{
 		"ts":       time.Now().UTC().Format("2006-01-02 15:04:05"),
 		"user":     actorEmail,
 		"action":   req.Action,
 		"resource": resource,
 		"ip":       clientIP,
-		"result":   "SUCCESS",
+		"result":   auditResultOf(req.Diff),
 		"session":  session,
 	})
 	hub.PublishDirect(logs.Entry{Kind: "audit", Data: json.RawMessage(auditData)})
@@ -2430,13 +2799,35 @@ func writeAuditEntry(c *gin.Context, store *db.Store, hub *logs.Hub, req *db.Wri
 	}
 }
 
-// auditHMACKey returns the HMAC key from the environment or a dev default.
+// devAuditHMACKey is the LAST-RESORT key used only when the operator has
+// explicitly opted into dev-login mode. Production cannot reach it: run() in
+// main.go refuses to start unless SENTINEL_AUDIT_HMAC_KEY is >= 32 chars or
+// SENTINEL_DEV_LOGIN is set — the same fail-fast shape as SENTINEL_JWT_SECRET.
+//
+// It stays a named constant rather than an inline literal so that the one place
+// a known key can be used is greppable, and so the dev/prod boundary is stated
+// where the key is read rather than only where the process boots.
+const devAuditHMACKey = "sentinel-dev-audit-hmac-key-change-in-prod"
+
+// auditHMACKey returns the audit-chain HMAC key.
+//
+// With a known key the chain is not tamper-evident at all: anyone able to write
+// to the database can forge a row and re-sign the chain past it. Hence the boot
+// assertion in main.go. Reaching the dev key here therefore means dev-login mode
+// was requested deliberately; log it once so it can never be a silent posture.
 func auditHMACKey() []byte {
 	if k := os.Getenv("SENTINEL_AUDIT_HMAC_KEY"); k != "" {
 		return []byte(k)
 	}
-	return []byte("sentinel-dev-audit-hmac-key-change-in-prod")
+	warnDevAuditKeyOnce.Do(func() {
+		zap.L().Warn("SENTINEL_AUDIT_HMAC_KEY is unset — signing the audit chain with the " +
+			"PUBLIC dev key. The audit log is NOT tamper-evident in this state; it is " +
+			"reachable only in dev-login mode and must never be used for a real deployment.")
+	})
+	return []byte(devAuditHMACKey)
 }
+
+var warnDevAuditKeyOnce sync.Once
 
 // ---------------------------------------------------------------------------
 // Helpers

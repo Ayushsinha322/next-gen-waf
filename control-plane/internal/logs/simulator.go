@@ -42,15 +42,11 @@ func (h *Hub) runSimulator() {
 	accessT := time.NewTicker(280 * time.Millisecond)
 	wafT := time.NewTicker(1800 * time.Millisecond)
 	errorT := time.NewTicker(6500 * time.Millisecond)
-	modsecT := time.NewTicker(3200 * time.Millisecond)
-	mlT := time.NewTicker(5000 * time.Millisecond)
 	auditT := time.NewTicker(12 * time.Second)
 	defer func() {
 		accessT.Stop()
 		wafT.Stop()
 		errorT.Stop()
-		modsecT.Stop()
-		mlT.Stop()
 		auditT.Stop()
 	}()
 
@@ -64,10 +60,6 @@ func (h *Hub) runSimulator() {
 			h.simPublish("waf", simWAF())
 		case <-errorT.C:
 			h.simPublish("error", simError())
-		case <-modsecT.C:
-			h.simPublish("modsec", simModsec())
-		case <-mlT.C:
-			h.simPublish("ml", simML())
 		case <-auditT.C:
 			h.simPublish("audit", simAudit())
 		}
@@ -293,57 +285,6 @@ func simError() map[string]any {
 		"msg":       simErrorMsgs[rand.Intn(len(simErrorMsgs))],
 		"subsystem": simSubsystems[rand.Intn(len(simSubsystems))],
 		"site":      simSites[rand.Intn(len(simSites))],
-	}
-}
-
-func simModsec() map[string]any {
-	rule := simRules[rand.Intn(len(simRules))]
-	msg := simModsecMsgs[rand.Intn(len(simModsecMsgs))]
-	cat := simModsecCats[rand.Intn(len(simModsecCats))]
-	phases := []int{1, 2, 2, 3}
-	action := "blocked"
-	if rand.Float32() > 0.7 {
-		action = "logged"
-	}
-	txID := fmt.Sprintf("tx-%08x", rand.Int63n(0xffffffff))
-	return map[string]any{
-		"ts":     now(),
-		"txId":   txID,
-		"ruleId": rule,
-		"msg":    msg,
-		"sev":    fmt.Sprintf("%d", rand.Intn(4)+1),
-		"cat":    cat,
-		"phase":  phases[rand.Intn(len(phases))],
-		"ip":     simIPs[rand.Intn(len(simIPs))],
-		"uri":    simPaths[rand.Intn(len(simPaths))],
-		"site":   simSites[rand.Intn(len(simSites))],
-		"action": action,
-	}
-}
-
-func simML() map[string]any {
-	verdict := simMLVerdicts[rand.Intn(len(simMLVerdicts))]
-	model := simMLModels[rand.Intn(len(simMLModels))]
-	label := simMLLabels[rand.Intn(len(simMLLabels))]
-	score := rand.Float64()
-	if verdict == "BENIGN" {
-		score = rand.Float64() * 0.3
-	} else {
-		score = 0.6 + rand.Float64()*0.4
-	}
-	features := 12 + rand.Intn(40)
-	latency := fmt.Sprintf("%.2f", 0.1+rand.Float64()*2.8)
-	return map[string]any{
-		"ts":       now(),
-		"verdict":  verdict,
-		"model":    model,
-		"conf":     fmt.Sprintf("%.1f", score*100),
-		"label":    label,
-		"ip":       simIPs[rand.Intn(len(simIPs))],
-		"path":     simPaths[rand.Intn(len(simPaths))],
-		"site":     simSites[rand.Intn(len(simSites))],
-		"features": features,
-		"latency":  latency,
 	}
 }
 

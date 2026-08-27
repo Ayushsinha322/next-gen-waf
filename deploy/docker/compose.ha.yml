@@ -68,6 +68,19 @@ x-wafnode: &wafnode
     # and applies these on connect (fresh CREATE + ALTER MODIFY TTL on existing).
     SENTINEL_CLICKHOUSE_EVENT_RETENTION_DAYS: ${SENTINEL_CLICKHOUSE_EVENT_RETENTION_DAYS:-90}
     SENTINEL_CLICKHOUSE_TRAFFIC_RETENTION_DAYS: ${SENTINEL_CLICKHOUSE_TRAFFIC_RETENTION_DAYS:-30}
+    # NDJSON log rotation. On the anchor, NOT on a node: three data planes each
+    # need the same ceiling, and setting it on one is how a limit ends up
+    # applying to a third of the fleet. On-disk bound per node is
+    # MAX_MB x (KEEP + 1) x 2 streams — 1.2 GB at these defaults.
+    SENTINEL_LOG_MAX_MB: ${SENTINEL_LOG_MAX_MB:-100}
+    SENTINEL_LOG_KEEP: ${SENTINEL_LOG_KEEP:-5}
+    # Continuous SIEM feed — off unless SENTINEL_SIEM_TARGET is set. See
+    # .env.example for why this is not the same as a syslog alert channel.
+    SENTINEL_SIEM_TARGET: ${SENTINEL_SIEM_TARGET:-}
+    SENTINEL_SIEM_PROTOCOL: ${SENTINEL_SIEM_PROTOCOL:-tcp}
+    SENTINEL_SIEM_FORMAT: ${SENTINEL_SIEM_FORMAT:-cef}
+    SENTINEL_SIEM_CA_FILE: ${SENTINEL_SIEM_CA_FILE:-}
+    SENTINEL_SIEM_QUEUE: ${SENTINEL_SIEM_QUEUE:-10000}
     # Management console upstreams — the :9443 admin listener (defined in
     # sentinel.proxy.yaml) reverse-proxies these. Set on every node; only waf1
     # publishes :9443 to the host, so the others' mgmt listener is inert.

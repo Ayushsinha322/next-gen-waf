@@ -43,6 +43,10 @@ func handleEventsSearch(c *gin.Context, enf *rbac.Enforcer, ch *clickhouse.Clien
 		Action:   c.Query("action"),
 		IP:       c.Query("ip"),
 		Protocol: c.Query("protocol"),
+		// The UI has always sent this; it was silently dropped here, so a
+		// CRITICAL-only search returned unfiltered results — and a different
+		// set than the export, which did honour it.
+		Severity: c.Query("severity"),
 		Query:    c.Query("q"),
 		From:     atoi64(c.Query("from")),
 		To:       atoi64(c.Query("to")),

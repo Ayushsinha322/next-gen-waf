@@ -53,6 +53,10 @@ export default function TopBar() {
   const router = useRouter();
   const [rps, setRps]   = useState<number | null>(null);
   const [p99, setP99]   = useState<number | null>(null);
+  // How many samples the p99 came from. 0 means NO MEASUREMENT — the control
+  // plane's latency ring is fed by tailing access.log from its end, so it is
+  // empty after a restart until traffic arrives.
+  const [p99n, setP99n] = useState<number>(0);
   const [alerts, setAlerts] = useState(0);
   const [theme, setTheme] = useState<"dark" | "light">("dark");
   // Real fleet health — never hardcode "operational".
@@ -80,6 +84,7 @@ export default function TopBar() {
         if (!cancelled) {
           setRps(snap.rps ?? 0);
           setP99(snap.p99_latency_ms ?? 0);
+          setP99n(snap.p99_samples ?? 0);
         }
       } catch { /* control plane may be offline */ }
     }
@@ -122,7 +127,13 @@ export default function TopBar() {
   }, []);
 
   const rpsDisplay = rps !== null ? rps.toLocaleString() : "—";
-  const p99Display = p99 !== null ? (p99 > 0 ? p99.toFixed(1) + "ms" : "<1ms") : "—";
+  // "<1ms" used to be shown whenever p99 was 0 — and p99 is 0 when there are NO
+  // SAMPLES, so the absence of any measurement rendered as the best possible
+  // number. That is why the bar could read "p99 <1ms" while the Logs page showed
+  // 7-18ms latencies on the same requests. No samples now reads as "—".
+  const p99Display = p99 === null || p99n === 0
+    ? "—"
+    : p99 < 0.1 ? "<0.1ms" : p99.toFixed(1) + "ms";
 
   return (
     <motion.header
@@ -168,7 +179,11 @@ export default function TopBar() {
           <span className="tb-dot" />
           <span>{rpsDisplay} req/s</span>
           <span style={{ color: "var(--text3)" }}>·</span>
-          <span style={{ color: p99 !== null && p99 > 5 ? "var(--amber)" : "var(--green)" }}>
+          <span
+            title={p99n === 0
+              ? "No latency samples yet — the control plane reads them from the data plane's access log, which starts empty after a restart."
+              : `End-to-end request latency (upstream included), p99 of the last ${p99n} logged requests`}
+            style={{ color: p99n === 0 ? "var(--text3)" : (p99 !== null && p99 > 5 ? "var(--amber)" : "var(--green)") }}>
             p99 {p99Display}
           </span>
         </motion.div>

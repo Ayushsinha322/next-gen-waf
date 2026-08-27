@@ -72,6 +72,12 @@ pub struct RuleMatch {
     /// Which part of the request triggered the match (e.g. `"ARGS:id"`).
     pub target: String,
     pub phase: Phase,
+    /// The text that actually matched (capped, control-chars stripped). Empty
+    /// when the operator produced no capturable text (numeric comparisons,
+    /// validators) — logging must render that as absent, never invent one.
+    /// This is what lets an operator judge a false positive from the event
+    /// alone instead of reproducing the request to learn what the rule saw.
+    pub matched_value: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -314,6 +320,7 @@ mod tests {
             score: 5,
             target: "ARGS:id".to_string(),
             phase: Phase::RequestBody,
+            matched_value: "' OR 1=1--".to_string(),
         });
         ctx.add_finding(RuleMatch {
             rule_id: "941100".to_string(),
@@ -322,6 +329,7 @@ mod tests {
             score: 3,
             target: "ARGS:q".to_string(),
             phase: Phase::RequestHeaders,
+            matched_value: String::new(),
         });
         assert_eq!(ctx.anomaly_score, 8);
         assert!(ctx.exceeds_threshold(5));

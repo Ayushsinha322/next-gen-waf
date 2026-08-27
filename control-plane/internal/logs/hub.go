@@ -3,7 +3,7 @@
 // connected dashboard clients.
 //
 // Log directory: $SENTINEL_LOG_DIR (default /tmp/sentinel-logs).
-// One file per kind: access.log, waf.log, error.log, audit.log, modsec.log, ml.log
+// One file per kind: access.log, waf.log, error.log, audit.log
 // Each file contains one JSON object per line (NDJSON).
 package logs
 
@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -64,14 +65,24 @@ func (e Entry) IsSimulated() bool { return e.Source == SourceSimulated }
 // Snapshot holds a point-in-time view of live metrics derived from the
 // event stream.  It is safe to read without locking.
 type Snapshot struct {
-	RPS              float64 `json:"rps"`
-	P99LatencyMs     float64 `json:"p99_latency_ms"`
-	TotalRequests    int64   `json:"total_requests"`
-	BlockedRequests  int64   `json:"blocked_requests"`
-	MLAnomalies      int64   `json:"ml_anomalies"`
-	ErrorCount       int64   `json:"error_count"`
-	EbpfDrops        int64   `json:"ebpf_drops"`
-	ConnectedClients int     `json:"connected_clients"`
+	RPS float64 `json:"rps"`
+	// P99LatencyMs is END-TO-END request latency (the data plane's own
+	// elapsed_ms, upstream time included), taken as the p99 of the most recent
+	// samples read from access.log.
+	P99LatencyMs float64 `json:"p99_latency_ms"`
+	// P99Samples is how many samples that p99 was computed from. 0 means NO
+	// MEASUREMENT, which is not the same as a fast one: the latency ring is fed
+	// by tailing access.log from its end, so it is empty after a restart until
+	// traffic arrives. Without this the UI could not tell "no data" from
+	// "sub-millisecond" and rendered the absence of measurement as the best
+	// possible value.
+	P99Samples       int   `json:"p99_samples"`
+	TotalRequests    int64 `json:"total_requests"`
+	BlockedRequests  int64 `json:"blocked_requests"`
+	MLAnomalies      int64 `json:"ml_anomalies"`
+	ErrorCount       int64 `json:"error_count"`
+	EbpfDrops        int64 `json:"ebpf_drops"`
+	ConnectedClients int   `json:"connected_clients"`
 
 	// Derived aggregates (all real — computed from the proxy NDJSON stream).
 	UniqueBlockedIPs int64 `json:"unique_blocked_ips"`
@@ -217,7 +228,14 @@ func NewHub() *Hub {
 
 	dir := LogDir()
 
-	kinds := []string{"access", "waf", "error", "audit", "modsec", "ml"}
+	// modsec.log and ml.log are deliberately absent: NOTHING writes them.
+	// They were produced only by sentinel-telemetry's EventLogger, which had no
+	// callers and was removed in 2026-08. Tailing them cost a goroutine polling a
+	// never-existing path every 200ms — per kind, per node directory, so six
+	// pointless tailers on a three-node layout — and offered the operator two
+	// permanently-empty views in the console's file picker. Re-add a kind only
+	// alongside something that writes it.
+	kinds := []string{"access", "waf", "error", "audit"}
 
 	// Single-node layout: the data plane writes straight into $SENTINEL_LOG_DIR.
 	for _, kind := range kinds {
@@ -373,6 +391,7 @@ func (h *Hub) GetSnapshot() Snapshot {
 	return Snapshot{
 		RPS:              rps,
 		P99LatencyMs:     p99,
+		P99Samples:       h.latSamples(),
 		TotalRequests:    h.totalRequests.Load(),
 		BlockedRequests:  h.blockedRequests.Load(),
 		MLAnomalies:      h.mlAnomalies.Load(),
@@ -512,8 +531,20 @@ func (h *Hub) updateMetrics(e Entry) {
 			case float64:
 				ms = v
 			case string:
-				// parse "1.2" → 1.2
-				json.Unmarshal(json.RawMessage(`"`+v+`"`), &ms) //nolint
+				// The data plane writes latency as a STRING —
+				// `format!("{:.2}", ...)` in the proxy's access.log — so this is
+				// the branch that actually runs in production.
+				//
+				// It used to do json.Unmarshal(`"1.2"`, &float64), which cannot
+				// succeed: that is a JSON string, not a number, and the error
+				// was discarded. So `ms` stayed 0, no sample was ever recorded,
+				// and p99 has read 0 on every deployment since the field became
+				// a string. The UI then rendered 0 as "<1ms", which is how the
+				// top bar could claim sub-millisecond p99 while the Logs page
+				// showed 7-18ms on the same requests.
+				if f, err := strconv.ParseFloat(v, 64); err == nil {
+					ms = f
+				}
 			}
 			if ms > 0 {
 				h.latMu.Lock()
@@ -629,6 +660,13 @@ func (h *Hub) updateMetrics(e Entry) {
 //	944 Java.
 //
 // Unknown / native rule IDs fall through to "other".
+// AttackCategory maps a rule id (or one of the data plane's synthetic non-rule
+// labels) onto a coarse attack category. Exported because the learning report
+// is now also built from stored ClickHouse events, which carry the rule id but
+// not the category — both paths must classify identically or the same rule
+// would appear under different categories depending on which source served it.
+func AttackCategory(rule string) string { return attackCategory(rule) }
+
 func attackCategory(rule string) string {
 	// Synthetic labels the data plane emits for non-rule blocks (see
 	// classify_nonrule_block in the proxy).
@@ -764,6 +802,13 @@ func (h *Hub) computeRPS() float64 {
 	}
 	// RPS = events in last 10 s / 10
 	return math.Round(float64(n)/10.0*10) / 10
+}
+
+// latSamples reports how many latency samples the p99 is based on.
+func (h *Hub) latSamples() int {
+	h.latMu.Lock()
+	defer h.latMu.Unlock()
+	return len(h.latBuf)
 }
 
 func (h *Hub) computeP99() float64 {

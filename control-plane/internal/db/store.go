@@ -79,6 +79,43 @@ type AuditRow struct {
 	TargetID    *string   `json:"target_id,omitempty"`
 	IP          *string   `json:"ip,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`
+
+	// Fields below were recorded at write time but never returned, so the
+	// before/after data the writers carefully captured was invisible to every
+	// reader — and the compliance view showed "who" as a bare UUID.
+	//
+	// Seq is the chain position: it is what makes a gap visible, and it is the
+	// pagination cursor (created_at is not unique).
+	Seq int64 `json:"seq"`
+	// ActorEmail is resolved from users; nil for system actions or a deleted
+	// user. The UUID is kept alongside it — an email can be reassigned.
+	ActorEmail *string `json:"actor_email,omitempty"`
+	UserAgent  *string `json:"user_agent,omitempty"`
+	// Diff carries the before/after payload AND the outcome (`result`), which
+	// is signed by the chain HMAC. See auditDiff in the handlers.
+	Diff json.RawMessage `json:"diff,omitempty"`
+	// Result is lifted out of Diff for convenience so a caller does not have to
+	// parse JSON to answer "did this succeed?".
+	Result string `json:"result,omitempty"`
+}
+
+// AuditFilter narrows an audit query server-side. Previously the API returned a
+// hardcoded newest-100 and the console filtered those in the browser, so any
+// question older than the last hundred entries was unanswerable — including
+// every question an auditor actually asks ("show me all failed logins last
+// week").
+type AuditFilter struct {
+	// Action matches exactly; ActionPrefix matches a family ("site." matches
+	// site.create/update/delete/status.*). Both are optional.
+	Action       string
+	ActionPrefix string
+	// Result filters on the signed outcome inside diff (SUCCESS / FAILURE).
+	Result string
+	// From/To bound created_at (unix seconds, 0 = unbounded).
+	From, To int64
+	// BeforeSeq pages backwards: return rows with seq < BeforeSeq. 0 = newest.
+	BeforeSeq int64
+	Limit     int
 }
 
 type DashboardStats struct {
@@ -565,20 +602,77 @@ func (s *Store) ResolveAlert(ctx context.Context, tenantID, userID, alertID stri
 // ---------------------------------------------------------------------------
 
 func (s *Store) ListAuditLogs(ctx context.Context, tenantID, userID string, limit int) ([]AuditRow, error) {
+	return s.ListAuditLogsFiltered(ctx, tenantID, userID, AuditFilter{Limit: limit})
+}
+
+// ListAuditLogsFiltered reads the audit trail with server-side filtering and
+// keyset pagination, newest first.
+//
+// The tenant predicate is EXPLICIT rather than left to row-level security. RLS
+// is the backstop, but the shipped single-tenant posture runs the control plane
+// on a role that bypasses it (SENTINEL_ALLOW_SUPERUSER_DB=1), so a query that
+// relies on RLS alone is unscoped in exactly the deployment we ship.
+func (s *Store) ListAuditLogsFiltered(ctx context.Context, tenantID, userID string, f AuditFilter) ([]AuditRow, error) {
 	tx, err := s.pool.BeginTenant(ctx, tenantID, userID)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
 
+	limit := f.Limit
 	if limit <= 0 {
 		limit = 100
 	}
+	if limit > 1000 {
+		limit = 1000
+	}
 
-	rows, err := tx.Query(ctx,
-		`SELECT id, tenant_id, actor_user_id, action, target_kind, target_id, ip::text, created_at
-		 FROM audit_logs ORDER BY created_at DESC LIMIT $1`,
-		limit)
+	where := []string{"a.tenant_id = $1"}
+	args := []any{tenantID}
+	add := func(clause string, val any) {
+		args = append(args, val)
+		where = append(where, fmt.Sprintf(clause, len(args)))
+	}
+	if f.Action != "" {
+		add("a.action = $%d", f.Action)
+	}
+	if f.ActionPrefix != "" {
+		// Literal prefix: escape LIKE metacharacters so a caller cannot turn a
+		// filter into a scan of everything.
+		esc := strings.NewReplacer("\\", "\\\\", "%", "\\%", "_", "\\_").Replace(f.ActionPrefix)
+		add("a.action LIKE $%d", esc+"%")
+	}
+	if f.Result != "" {
+		add("COALESCE(a.diff->>'result', 'SUCCESS') = $%d", f.Result)
+	}
+	if f.From > 0 {
+		add("a.created_at >= to_timestamp($%d)", f.From)
+	}
+	if f.To > 0 {
+		add("a.created_at <= to_timestamp($%d)", f.To)
+	}
+	if f.BeforeSeq > 0 {
+		add("a.seq < $%d", f.BeforeSeq)
+	}
+	args = append(args, limit)
+
+	// LEFT JOIN, not JOIN: a system action has no actor and a deleted user's row
+	// is gone (actor_user_id is ON DELETE SET NULL), and neither may drop the
+	// audit entry from the result — an audit trail that hides entries whose
+	// actor was deleted is worse than useless.
+	//
+	// Ordered by seq, not created_at: created_at is not unique under
+	// concurrent writes, so it cannot page deterministically.
+	sql := fmt.Sprintf(
+		`SELECT a.id, a.tenant_id, a.actor_user_id, a.action, a.target_kind, a.target_id,
+		        a.ip::text, a.created_at, COALESCE(a.seq, 0), u.email, a.user_agent, a.diff
+		 FROM audit_logs a
+		 LEFT JOIN users u ON u.id = a.actor_user_id
+		 WHERE %s
+		 ORDER BY a.seq DESC
+		 LIMIT $%d`, strings.Join(where, " AND "), len(args))
+
+	rows, err := tx.Query(ctx, sql, args...)
 	if err != nil {
 		return nil, fmt.Errorf("store: list audit: %w", err)
 	}
@@ -587,9 +681,26 @@ func (s *Store) ListAuditLogs(ctx context.Context, tenantID, userID string, limi
 	var entries []AuditRow
 	for rows.Next() {
 		var r AuditRow
+		var diff []byte
 		if err := rows.Scan(&r.ID, &r.TenantID, &r.ActorUserID, &r.Action,
-			&r.TargetKind, &r.TargetID, &r.IP, &r.CreatedAt); err != nil {
+			&r.TargetKind, &r.TargetID, &r.IP, &r.CreatedAt, &r.Seq,
+			&r.ActorEmail, &r.UserAgent, &diff); err != nil {
 			return nil, err
+		}
+		if len(diff) > 0 {
+			r.Diff = json.RawMessage(diff)
+			var probe struct {
+				Result string `json:"result"`
+			}
+			if json.Unmarshal(diff, &probe) == nil && probe.Result != "" {
+				r.Result = probe.Result
+			}
+		}
+		if r.Result == "" {
+			// Rows written before outcomes were recorded, and every handler
+			// that only audits its happy path. Reported as SUCCESS because
+			// that is what those call sites mean, never as unknown.
+			r.Result = "SUCCESS"
 		}
 		entries = append(entries, r)
 	}
@@ -735,6 +846,35 @@ func auditChainMAC(key []byte, seq int64, prevHMAC []byte, tenantID string, acto
 	return mac.Sum(nil)
 }
 
+// canonicalJSON renders `raw` in a form that survives a round trip through
+// Postgres.
+//
+// `diff` is stored as JSONB, which does NOT preserve the input bytes: it
+// reorders keys, drops insignificant whitespace and renormalises numbers. The
+// MAC used to cover `string(diff)` — the bytes Go happened to marshal — so
+// every row that carried a diff was signed over one byte string and verified
+// against a different one, and reported as ALTERED for ever. Measured on the
+// live deployment: 17 of 17 rows with a diff failed verification while every
+// chain link was intact.
+//
+// Re-marshalling through Go's encoder makes both sides agree, because
+// json.Marshal emits map keys in sorted order. Input that is not valid JSON is
+// signed as-is rather than silently becoming empty.
+func canonicalJSON(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return string(raw)
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return string(raw)
+	}
+	return string(b)
+}
+
 // auditPayload is the canonical byte encoding of an audit row's material fields,
 // shared by the legacy and chained MAC functions.
 func auditPayload(tenantID string, actor *string, action, targetKind string,
@@ -747,7 +887,19 @@ func auditPayload(tenantID string, actor *string, action, targetKind string,
 		strPtr(targetID),
 		strPtr(ip),
 		strPtr(userAgent),
-		string(diff),
+		canonicalJSON(diff),
+		createdAt.UTC().Format(time.RFC3339Nano),
+	))
+}
+
+// auditPayloadRaw is auditPayload's pre-canonicalisation encoding, retained
+// ONLY so verification can still accept rows signed before canonicalJSON
+// existed. Never used for a new write.
+func auditPayloadRaw(tenantID string, actor *string, action, targetKind string,
+	targetID, ip, userAgent *string, diff json.RawMessage, createdAt time.Time) []byte {
+	return []byte(fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%s|%s",
+		tenantID, strPtr(actor), action, targetKind, strPtr(targetID),
+		strPtr(ip), strPtr(userAgent), string(diff),
 		createdAt.UTC().Format(time.RFC3339Nano),
 	))
 }
@@ -857,15 +1009,20 @@ func (s *Store) VerifyAuditLog(ctx context.Context, tenantID string, hmacKey []b
 		if storedPrev == nil {
 			// Pre-chain row: only the legacy per-row property is available.
 			rep.Unchained++
-			if !hmac.Equal(auditMAC(hmacKey, tid, actor, action, targetKind, targetID, ip, ua, diff, createdAt), storedMAC) {
+			if !auditRowVerifies(storedMAC,
+				auditMAC(hmacKey, tid, actor, action, targetKind, targetID, ip, ua, diff, createdAt),
+				auditMACRaw(hmacKey, tid, actor, action, targetKind, targetID, ip, ua, diff, createdAt)) {
 				rep.Altered = append(rep.Altered, id)
 			}
 			prevMAC, prevSeq = storedMAC, seq
 			continue
 		}
 
-		if !hmac.Equal(auditChainMAC(hmacKey, seq, storedPrev, tid, actor, action, targetKind,
-			targetID, ip, ua, diff, createdAt), storedMAC) {
+		if !auditRowVerifies(storedMAC,
+			auditChainMAC(hmacKey, seq, storedPrev, tid, actor, action, targetKind,
+				targetID, ip, ua, diff, createdAt),
+			auditChainMACRaw(hmacKey, seq, storedPrev, tid, actor, action, targetKind,
+				targetID, ip, ua, diff, createdAt)) {
 			rep.Altered = append(rep.Altered, id)
 		}
 
@@ -886,6 +1043,34 @@ func (s *Store) VerifyAuditLog(ctx context.Context, tenantID string, hmacKey []b
 		prevMAC, prevSeq = storedMAC, seq
 	}
 	return rep, rows.Err()
+}
+
+// auditChainMACRaw / auditMACRaw recompute a row's MAC using the ORIGINAL
+// pre-canonicalisation diff encoding. Verification accepts either form, so a
+// row written before canonicalJSON existed is not reported as tampered merely
+// because the signing rule improved. Both forms use the same key, so accepting
+// the legacy one weakens nothing — it is a representation, not a credential.
+func auditChainMACRaw(key []byte, seq int64, prevHMAC []byte, tenantID string, actor *string,
+	action, targetKind string, targetID, ip, userAgent *string, diff json.RawMessage,
+	createdAt time.Time) []byte {
+	mac := hmac.New(sha256.New, key)
+	fmt.Fprintf(mac, "v2|%d|%d|", seq, len(prevHMAC))
+	mac.Write(prevHMAC)
+	mac.Write([]byte{'|'})
+	mac.Write(auditPayloadRaw(tenantID, actor, action, targetKind, targetID, ip, userAgent, diff, createdAt))
+	return mac.Sum(nil)
+}
+
+func auditMACRaw(key []byte, tenantID string, actor *string, action, targetKind string,
+	targetID, ip, userAgent *string, diff json.RawMessage, createdAt time.Time) []byte {
+	mac := hmac.New(sha256.New, key)
+	mac.Write(auditPayloadRaw(tenantID, actor, action, targetKind, targetID, ip, userAgent, diff, createdAt))
+	return mac.Sum(nil)
+}
+
+// auditRowVerifies reports whether `stored` matches either accepted encoding.
+func auditRowVerifies(stored, canonical, legacy []byte) bool {
+	return hmac.Equal(canonical, stored) || hmac.Equal(legacy, stored)
 }
 
 func strPtr(s *string) string {

@@ -261,6 +261,8 @@ services:
       # the owner role) and REMOVE this opt-out so RLS backstops isolation.
       SENTINEL_ALLOW_SUPERUSER_DB: "1"
       SENTINEL_REST_ADDR: 0.0.0.0:9501
+      # JSON by default so these lines are ingestable; `console` for local work.
+      SENTINEL_LOG_FORMAT: ${SENTINEL_LOG_FORMAT:-json}
       SENTINEL_AUTOSTART_DATAPLANE: "0"
       SENTINEL_LOG_DIR: /var/log/sentinel
       # Origins allowed to call the control plane from a browser. In the intended
@@ -359,6 +361,11 @@ services:
     environment:
       SENTINEL_CONFIG: /etc/sentinel/sentinel.yaml
       SENTINEL_LOG_DIR: /var/log/sentinel
+      # NDJSON log rotation ceiling: MAX_MB x (KEEP + 1) x 2 streams
+      # (access.log + waf.log) — 1.2 GB at these defaults. Lower both on a small
+      # disk; the logs volume is not otherwise bounded.
+      SENTINEL_LOG_MAX_MB: ${SENTINEL_LOG_MAX_MB:-100}
+      SENTINEL_LOG_KEEP: ${SENTINEL_LOG_KEEP:-5}
       RUST_LOG: info,sentinel=info
       # Shared secret so the control plane can reach the loopback-only cert API.
       SENTINEL_INTERNAL_SECRET: ${SENTINEL_INTERNAL_SECRET}
@@ -379,6 +386,13 @@ services:
       # container, and a path inside the image would be destroyed by the very
       # `--force-recreate` an operator runs to fix the outage.
       SENTINEL_SPOOL_DIR: /var/lib/sentinel/state/spool
+      # Continuous SIEM feed — off unless SENTINEL_SIEM_TARGET is set. See
+      # .env.example for why this is not the same as a syslog alert channel.
+      SENTINEL_SIEM_TARGET: ${SENTINEL_SIEM_TARGET:-}
+      SENTINEL_SIEM_PROTOCOL: ${SENTINEL_SIEM_PROTOCOL:-tcp}
+      SENTINEL_SIEM_FORMAT: ${SENTINEL_SIEM_FORMAT:-cef}
+      SENTINEL_SIEM_CA_FILE: ${SENTINEL_SIEM_CA_FILE:-}
+      SENTINEL_SIEM_QUEUE: ${SENTINEL_SIEM_QUEUE:-10000}
       SENTINEL_SPOOL_MAX_BYTES: ${SENTINEL_SPOOL_MAX_BYTES:-268435456}
       # Event-log retention. The installer writes both of these into .env and
       # .env.example documents them as THE compliance knob ("raise for compliance,

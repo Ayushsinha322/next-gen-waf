@@ -1,32 +1,41 @@
-//! sentinel-telemetry — structured event logging and observability for the
-//! Sentinel WAF data plane.
+//! sentinel-telemetry — metrics and tracing for the Sentinel WAF data plane.
 //!
 //! # Quick start
 //!
 //! ```rust,no_run
-//! use sentinel_telemetry::logs::{EventLogger, AccessEvent};
+//! use sentinel_telemetry::{inc_requests, prometheus_text};
 //!
-//! let logger = EventLogger::from_env().expect("event logger init");
-//! logger.log_access(AccessEvent::new(
-//!     "api.acme.com", "GET", "/api/v1/health", "10.0.0.1",
-//!     200, 512, 1.2, "sentinel-proxy/1.0",
-//! ));
+//! inc_requests();
+//! let scrape = prometheus_text();
+//! assert!(scrape.contains("sentinel_requests_total"));
 //! ```
+//!
+//! # What used to live here
+//!
+//! This crate also carried `logs` (an `EventLogger` writing access/waf/modsec/ml
+//! NDJSON) and `audit` (a second HMAC-chained audit log). Both were removed in
+//! 2026-08: neither had a single caller anywhere in the workspace, and both had
+//! DRIFTED from the implementations that are real — the proxy writes access.log
+//! and waf.log itself (`crates/sentinel-proxy`, with request_id/tenant/mode and
+//! RFC-3339 timestamps), and the audit chain lives in the control plane
+//! (`control-plane/internal/db`, append-only enforced by Postgres grants).
+//!
+//! The removed `WafEvent` had no `request_id`, no `tenant` and no `mode`, spelled
+//! severity `sev`, and stamped second-precision timestamps with no timezone —
+//! so wiring up the "obvious" logger would have silently broken Support-ID
+//! correlation while looking like an improvement. Dead code that appears
+//! load-bearing is a trap, not an asset; if this functionality is ever wanted
+//! again, extend the writer that ships.
 
-pub mod audit;
-pub mod logs;
 pub mod metrics;
 pub mod traces;
-
-pub use logs::{AccessEvent, AuditEvent, ErrorEvent, EventLogger, MlEvent, ModsecEvent, WafEvent};
 
 pub use metrics::{
     dec_active_connections, history_shed_total, inc_active_connections, inc_blocked,
     inc_ebpf_drops, inc_history_shed, inc_load_shed_connections, inc_load_shed_requests,
-    inc_requests, inc_rule_hits, observe_duration, prometheus_text, set_active_connections,
-    snapshot, Counter, Gauge, Histogram, MetricLine, MetricsRegistry, MetricsSnapshot,
+    inc_log_lines_dropped, inc_requests, inc_rule_hits, log_lines_dropped_total, observe_duration,
+    prometheus_text, set_active_connections, snapshot, Counter, Gauge, Histogram, MetricLine,
+    MetricsRegistry, MetricsSnapshot,
 };
 
 pub use traces::{start_child_span, start_span, Span, SpanId, TraceId, Tracer, TRACER};
-
-pub use audit::{AuditEntry, AuditLogger};

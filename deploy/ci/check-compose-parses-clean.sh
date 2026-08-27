@@ -177,6 +177,83 @@ else
   printf '  %s✓%s compose.prod.yml declares no practice-origin services\n' "$GRN" "$R"
 fi
 
+# ── the passive node must have somewhere to put its events ───────────────────
+# Measured on 2026-07-29: the passive VM held the VIP, blocked nine attacks with
+# 403, and ClickHouse held ZERO of them. That VM runs no ClickHouse, so with the
+# inherited `clickhouse:8123` the writer resolved nothing and the history was
+# simply never recorded — the SOC console goes blind after a failover, and the
+# FPR pilot gets a silent hole in exactly the window it is measuring.
+#
+# Four properties make it safe, and all four are invisible in a diff of one
+# file, so assert them against the RENDERED config rather than by reading YAML:
+#   1. the sink points at the primary's REAL address — never localhost, never
+#      the VIP (the VIP follows traffic, so during a failover it resolves to
+#      THIS node and the writer would be chasing itself),
+#   2. the internal CA is trusted, or every HTTPS write fails verification,
+#   3. a spool directory is set, so a primary outage DELAYS the audit trail
+#      instead of punching a hole in it,
+#   4. the spool lands on a PERSISTED volume, or a container restart discards
+#      whatever was waiting to be replayed.
+printf '\n%s%s==> the passive node has a durable event sink%s\n\n' "$B" "$YEL" "$R"
+
+check_passive_sink() {
+  local envf; envf="$(mktemp)"
+  synth_env "$envf" "${IVARS[@]}" "${HVARS[@]}"
+  # Give the sink URL a concrete host: the generic placeholder would pass the
+  # "not localhost" assertion for the wrong reason.
+  sed -i 's#^SENTINEL_CLICKHOUSE_URL_PRIMARY=.*#SENTINEL_CLICKHOUSE_URL_PRIMARY=https://10.9.9.9:8443#' "$envf"
+
+  local rendered
+  if ! rendered=$(env -i PATH="$PATH" HOME="$HOME" docker compose --env-file "$envf" \
+        -f deploy/docker/compose.prod.yml -f deploy/docker/compose.2vm-passive.yml \
+        config 2>/dev/null); then
+    printf '  %s✗%s could not render the passive overlay\n' "$RED" "$R"
+    fail=$((fail + 1)); rm -f "$envf"; return
+  fi
+  rm -f "$envf"
+
+  local report
+  report=$(printf '%s' "$rendered" | python3 -c '
+import sys, yaml
+d = yaml.safe_load(sys.stdin) or {}
+dp = (d.get("services") or {}).get("dataplane") or {}
+env = dp.get("environment") or {}
+url = str(env.get("SENTINEL_CLICKHOUSE_URL", ""))
+problems = []
+if not url:
+    problems.append("SENTINEL_CLICKHOUSE_URL is unset — events go nowhere")
+if any(h in url for h in ("localhost", "127.0.0.1", "@clickhouse:", "//clickhouse:")):
+    problems.append("sink points at a LOCAL ClickHouse this VM does not run: %s" % url)
+if not env.get("SENTINEL_CLICKHOUSE_CA_FILE"):
+    problems.append("no SENTINEL_CLICKHOUSE_CA_FILE — an internal cert cannot verify")
+spool = str(env.get("SENTINEL_SPOOL_DIR", ""))
+if not spool:
+    problems.append("no SENTINEL_SPOOL_DIR — a primary outage loses events instead of delaying them")
+else:
+    mounted = False
+    for v in dp.get("volumes") or []:
+        tgt = v.get("target", "") if isinstance(v, dict) else str(v).split(":")[1:2]
+        tgt = tgt if isinstance(tgt, str) else (tgt[0] if tgt else "")
+        if tgt and spool.startswith(tgt):
+            mounted = True
+            break
+    if not mounted:
+        problems.append("spool %s is not on a mounted volume — a restart discards it" % spool)
+print("\n".join(problems))
+' 2>&1)
+
+  if [[ -z "$report" ]]; then
+    printf '  %s✓%s passive dataplane writes to the primary, over the internal CA, with a persisted spool\n' "$GRN" "$R"
+  else
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      printf '  %s✗%s %s\n' "$RED" "$R" "$line"
+      fail=$((fail + 1))
+    done <<< "$report"
+  fi
+}
+check_passive_sink
+
 printf '\n'
 if (( fail )); then
   printf '  %s✗ %d compose problem(s) — an install or a release build would abort%s\n\n' "$RED" "$fail" "$R"

@@ -468,6 +468,7 @@ struct WafMetrics {
     /// when the gap matters most. Non-zero here invalidates any attempt to count
     /// attacks from `waf_events` for that window.
     pub history_shed_total: Counter,
+    pub log_lines_dropped_total: Counter,
     pub registry: MetricsRegistry,
 }
 
@@ -510,6 +511,10 @@ impl WafMetrics {
             "sentinel_history_shed_total",
             "Total number of WAF events not recorded because the history buffer was full",
         );
+        let log_lines_dropped_total = registry.register_counter(
+            "sentinel_log_lines_dropped_total",
+            "Total number of NDJSON access/waf log lines dropped because the writer queue was full",
+        );
 
         Self {
             requests_total,
@@ -521,6 +526,7 @@ impl WafMetrics {
             load_shed_connections_total,
             load_shed_requests_total,
             history_shed_total,
+            log_lines_dropped_total,
             registry,
         }
     }
@@ -589,6 +595,25 @@ pub fn inc_history_shed() -> u64 {
 /// process's lifetime reached the buffer.
 pub fn history_shed_total() -> u64 {
     WAF_METRICS.history_shed_total.get()
+}
+
+/// Record one NDJSON log line dropped because the writer queue was full, and
+/// return the new total.
+///
+/// ClickHouse shedding has always been scrapeable (`sentinel_history_shed_total`)
+/// but access/waf log loss was reported only through a rate-limited `warn!`, so
+/// it could not be alerted on — and log loss under load is precisely when
+/// someone is relying on the logs. Same shape as inc_history_shed: returns the
+/// total so the caller needs no counter of its own.
+pub fn inc_log_lines_dropped() -> u64 {
+    WAF_METRICS.log_lines_dropped_total.inc();
+    WAF_METRICS.log_lines_dropped_total.get()
+}
+
+/// Current total of dropped NDJSON log lines. Zero means every access/waf line
+/// this process produced reached its file.
+pub fn log_lines_dropped_total() -> u64 {
+    WAF_METRICS.log_lines_dropped_total.get()
 }
 
 /// Increment the rule-hits counter.
