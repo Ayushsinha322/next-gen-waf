@@ -533,7 +533,7 @@ func run() error {
 	protected.Use(leaderForward(cl))
 	protected.Use(auth.GinAuthMiddlewareWithAPIKey(jwtSvc, false, apiKeyResolver))
 	{
-		protected.POST("/auth/logout", func(c *gin.Context) { handleLogout(c, jwtSvc, store) })
+		protected.POST("/auth/logout", func(c *gin.Context) { handleLogout(c, jwtSvc, store, hub) })
 		// Self-service rotation for a signed-in user. Requires the current
 		// password, so a borrowed session cannot be turned into ownership.
 		protected.POST("/auth/password/change", func(c *gin.Context) { handleChangePassword(c, store, hub, log) })
@@ -645,6 +645,8 @@ func run() error {
 			}
 		})
 		protected.GET("/audit", func(c *gin.Context) { handleListAudit(c, enforcer, store) })
+		// Makes the "tamper-evident" claim exercisable. See handleVerifyAudit.
+		protected.GET("/audit/verify", func(c *gin.Context) { handleVerifyAudit(c, enforcer, store) })
 		protected.GET("/cluster/status", func(c *gin.Context) {
 			if requirePerm(c, enforcer, rbac.ResourceSite, rbac.ActionList) {
 				handleClusterStatus(c, cl)

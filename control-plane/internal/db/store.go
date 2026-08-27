@@ -79,6 +79,43 @@ type AuditRow struct {
 	TargetID    *string   `json:"target_id,omitempty"`
 	IP          *string   `json:"ip,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`
+
+	// Fields below were recorded at write time but never returned, so the
+	// before/after data the writers carefully captured was invisible to every
+	// reader — and the compliance view showed "who" as a bare UUID.
+	//
+	// Seq is the chain position: it is what makes a gap visible, and it is the
+	// pagination cursor (created_at is not unique).
+	Seq int64 `json:"seq"`
+	// ActorEmail is resolved from users; nil for system actions or a deleted
+	// user. The UUID is kept alongside it — an email can be reassigned.
+	ActorEmail *string `json:"actor_email,omitempty"`
+	UserAgent  *string `json:"user_agent,omitempty"`
+	// Diff carries the before/after payload AND the outcome (`result`), which
+	// is signed by the chain HMAC. See auditDiff in the handlers.
+	Diff json.RawMessage `json:"diff,omitempty"`
+	// Result is lifted out of Diff for convenience so a caller does not have to
+	// parse JSON to answer "did this succeed?".
+	Result string `json:"result,omitempty"`
+}
+
+// AuditFilter narrows an audit query server-side. Previously the API returned a
+// hardcoded newest-100 and the console filtered those in the browser, so any
+// question older than the last hundred entries was unanswerable — including
+// every question an auditor actually asks ("show me all failed logins last
+// week").
+type AuditFilter struct {
+	// Action matches exactly; ActionPrefix matches a family ("site." matches
+	// site.create/update/delete/status.*). Both are optional.
+	Action       string
+	ActionPrefix string
+	// Result filters on the signed outcome inside diff (SUCCESS / FAILURE).
+	Result string
+	// From/To bound created_at (unix seconds, 0 = unbounded).
+	From, To int64
+	// BeforeSeq pages backwards: return rows with seq < BeforeSeq. 0 = newest.
+	BeforeSeq int64
+	Limit     int
 }
 
 type DashboardStats struct {
@@ -565,20 +602,77 @@ func (s *Store) ResolveAlert(ctx context.Context, tenantID, userID, alertID stri
 // ---------------------------------------------------------------------------
 
 func (s *Store) ListAuditLogs(ctx context.Context, tenantID, userID string, limit int) ([]AuditRow, error) {
+	return s.ListAuditLogsFiltered(ctx, tenantID, userID, AuditFilter{Limit: limit})
+}
+
+// ListAuditLogsFiltered reads the audit trail with server-side filtering and
+// keyset pagination, newest first.
+//
+// The tenant predicate is EXPLICIT rather than left to row-level security. RLS
+// is the backstop, but the shipped single-tenant posture runs the control plane
+// on a role that bypasses it (SENTINEL_ALLOW_SUPERUSER_DB=1), so a query that
+// relies on RLS alone is unscoped in exactly the deployment we ship.
+func (s *Store) ListAuditLogsFiltered(ctx context.Context, tenantID, userID string, f AuditFilter) ([]AuditRow, error) {
 	tx, err := s.pool.BeginTenant(ctx, tenantID, userID)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
 
+	limit := f.Limit
 	if limit <= 0 {
 		limit = 100
 	}
+	if limit > 1000 {
+		limit = 1000
+	}
 
-	rows, err := tx.Query(ctx,
-		`SELECT id, tenant_id, actor_user_id, action, target_kind, target_id, ip::text, created_at
-		 FROM audit_logs ORDER BY created_at DESC LIMIT $1`,
-		limit)
+	where := []string{"a.tenant_id = $1"}
+	args := []any{tenantID}
+	add := func(clause string, val any) {
+		args = append(args, val)
+		where = append(where, fmt.Sprintf(clause, len(args)))
+	}
+	if f.Action != "" {
+		add("a.action = $%d", f.Action)
+	}
+	if f.ActionPrefix != "" {
+		// Literal prefix: escape LIKE metacharacters so a caller cannot turn a
+		// filter into a scan of everything.
+		esc := strings.NewReplacer("\\", "\\\\", "%", "\\%", "_", "\\_").Replace(f.ActionPrefix)
+		add("a.action LIKE $%d", esc+"%")
+	}
+	if f.Result != "" {
+		add("COALESCE(a.diff->>'result', 'SUCCESS') = $%d", f.Result)
+	}
+	if f.From > 0 {
+		add("a.created_at >= to_timestamp($%d)", f.From)
+	}
+	if f.To > 0 {
+		add("a.created_at <= to_timestamp($%d)", f.To)
+	}
+	if f.BeforeSeq > 0 {
+		add("a.seq < $%d", f.BeforeSeq)
+	}
+	args = append(args, limit)
+
+	// LEFT JOIN, not JOIN: a system action has no actor and a deleted user's row
+	// is gone (actor_user_id is ON DELETE SET NULL), and neither may drop the
+	// audit entry from the result — an audit trail that hides entries whose
+	// actor was deleted is worse than useless.
+	//
+	// Ordered by seq, not created_at: created_at is not unique under
+	// concurrent writes, so it cannot page deterministically.
+	sql := fmt.Sprintf(
+		`SELECT a.id, a.tenant_id, a.actor_user_id, a.action, a.target_kind, a.target_id,
+		        a.ip::text, a.created_at, COALESCE(a.seq, 0), u.email, a.user_agent, a.diff
+		 FROM audit_logs a
+		 LEFT JOIN users u ON u.id = a.actor_user_id
+		 WHERE %s
+		 ORDER BY a.seq DESC
+		 LIMIT $%d`, strings.Join(where, " AND "), len(args))
+
+	rows, err := tx.Query(ctx, sql, args...)
 	if err != nil {
 		return nil, fmt.Errorf("store: list audit: %w", err)
 	}
@@ -587,9 +681,26 @@ func (s *Store) ListAuditLogs(ctx context.Context, tenantID, userID string, limi
 	var entries []AuditRow
 	for rows.Next() {
 		var r AuditRow
+		var diff []byte
 		if err := rows.Scan(&r.ID, &r.TenantID, &r.ActorUserID, &r.Action,
-			&r.TargetKind, &r.TargetID, &r.IP, &r.CreatedAt); err != nil {
+			&r.TargetKind, &r.TargetID, &r.IP, &r.CreatedAt, &r.Seq,
+			&r.ActorEmail, &r.UserAgent, &diff); err != nil {
 			return nil, err
+		}
+		if len(diff) > 0 {
+			r.Diff = json.RawMessage(diff)
+			var probe struct {
+				Result string `json:"result"`
+			}
+			if json.Unmarshal(diff, &probe) == nil && probe.Result != "" {
+				r.Result = probe.Result
+			}
+		}
+		if r.Result == "" {
+			// Rows written before outcomes were recorded, and every handler
+			// that only audits its happy path. Reported as SUCCESS because
+			// that is what those call sites mean, never as unknown.
+			r.Result = "SUCCESS"
 		}
 		entries = append(entries, r)
 	}

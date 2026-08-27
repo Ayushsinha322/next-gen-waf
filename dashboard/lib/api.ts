@@ -230,6 +230,29 @@ export interface AuditEntry {
   target_id:     string | null;
   ip:            string | null;
   created_at:    string;
+  /** Chain position. Also the pagination cursor (created_at is not unique). */
+  seq?:          number;
+  /** Resolved from users; absent for system actions or a deleted actor. */
+  actor_email?:  string | null;
+  user_agent?:   string | null;
+  /** Signed before/after payload, and the outcome. */
+  diff?:         unknown;
+  /** SUCCESS | FAILURE, lifted out of diff by the API. */
+  result?:       string;
+}
+
+/** Result of recomputing the audit hash chain. `verified` is the only field
+ *  that may be used to make a compliance claim, and it is false whenever the
+ *  check could not complete. */
+export interface AuditVerifyResult {
+  verified:       boolean;
+  checked:        number;
+  altered:        string[];
+  chain_broken:   string[];
+  seq_gaps:       string[];
+  unchained_rows: number;
+  note?:          string;
+  error?:         string;
 }
 
 export interface MetricsSnapshot {
@@ -992,7 +1015,21 @@ export const api = {
   },
 
   audit: {
-    list: () => apiFetch<{ entries: AuditEntry[]; tenant_id: string }>("/audit"),
+    /** Server-side filtered. Passing nothing preserves the previous behaviour
+     *  (newest 100), so existing callers are unaffected. */
+    list: (p: { limit?: number; action?: string; action_prefix?: string;
+                result?: "SUCCESS" | "FAILURE"; from?: number; to?: number;
+                before_seq?: number } = {}) => {
+      const q = new URLSearchParams();
+      Object.entries(p).forEach(([k, v]) => { if (v !== undefined && v !== "") q.set(k, String(v)); });
+      const qs = q.toString();
+      return apiFetch<{ entries: AuditEntry[]; tenant_id: string; next_before_seq: number }>(
+        "/audit" + (qs ? `?${qs}` : ""));
+    },
+    /** Recompute the hash chain. Returns 409 with a populated report when the
+     *  chain does not verify, which apiFetch surfaces as a thrown error — so
+     *  callers must treat a throw as "not verified", never as "unknown". */
+    verify: () => apiFetch<AuditVerifyResult>("/audit/verify"),
   },
 
   /** Configuration rollback points.
