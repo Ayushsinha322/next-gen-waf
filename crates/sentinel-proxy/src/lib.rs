@@ -2861,53 +2861,58 @@ async fn proxy(
             if s.waf.max_uri_length > 0 {
                 let uri_len = ctx.uri.to_string().len() as u32;
                 if uri_len > s.waf.max_uri_length {
-                    ctx.decision = WafDecision::Block;
-                    ctx.block_reason = Some(format!(
-                        "URI too long: {} bytes (limit {})",
-                        uri_len, s.waf.max_uri_length
-                    ));
-                    let resp = error_response(StatusCode::URI_TOO_LONG, "URI Too Long");
-                    stamp_response(&mut ctx, &resp);
-                    ctx.advance_phase(Phase::Logging);
-                    log_request(&ctx);
-                    return Ok(resp);
+                    if let Some(resp) = enforce_request_limit(
+                        &mut ctx,
+                        s,
+                        format!(
+                            "URI too long: {} bytes (limit {})",
+                            uri_len, s.waf.max_uri_length
+                        ),
+                        StatusCode::URI_TOO_LONG,
+                        "URI Too Long",
+                    ) {
+                        return Ok(resp);
+                    }
                 }
             }
             // Request header count limit.
             if s.waf.max_header_count > 0 {
                 let hcount = ctx.request_headers.len() as u32;
                 if hcount > s.waf.max_header_count {
-                    ctx.decision = WafDecision::Block;
-                    ctx.block_reason = Some(format!(
-                        "too many headers: {} (limit {})",
-                        hcount, s.waf.max_header_count
-                    ));
-                    let resp = error_response(
+                    if let Some(resp) = enforce_request_limit(
+                        &mut ctx,
+                        s,
+                        format!(
+                            "too many headers: {} (limit {})",
+                            hcount, s.waf.max_header_count
+                        ),
                         StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
                         "Too Many Headers",
-                    );
-                    stamp_response(&mut ctx, &resp);
-                    ctx.advance_phase(Phase::Logging);
-                    log_request(&ctx);
-                    return Ok(resp);
+                    ) {
+                        return Ok(resp);
+                    }
                 }
             }
             // HTTP method allow-list (empty = allow all). Case-insensitive.
             if !s.waf.allowed_methods.is_empty() {
-                let m = ctx.method.as_str();
+                // Owned, not a borrow of ctx: enforce_request_limit needs
+                // &mut ctx and the method string is still wanted for the message.
+                let m = ctx.method.as_str().to_owned();
                 if !s
                     .waf
                     .allowed_methods
                     .iter()
-                    .any(|a| a.eq_ignore_ascii_case(m))
+                    .any(|a| a.eq_ignore_ascii_case(&m))
                 {
-                    ctx.decision = WafDecision::Block;
-                    ctx.block_reason = Some(format!("method not allowed: {m}"));
-                    let resp = error_response(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed");
-                    stamp_response(&mut ctx, &resp);
-                    ctx.advance_phase(Phase::Logging);
-                    log_request(&ctx);
-                    return Ok(resp);
+                    if let Some(resp) = enforce_request_limit(
+                        &mut ctx,
+                        s,
+                        format!("method not allowed: {m}"),
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "Method Not Allowed",
+                    ) {
+                        return Ok(resp);
+                    }
                 }
             }
         }
@@ -2967,64 +2972,86 @@ async fn proxy(
 
     let boxed_body: BoxBody = if should_inspect_body {
         let max_bytes = site.map(|s| s.waf.max_body_size).unwrap_or(0);
+        // should_inspect_body is only true when a site matched.
+        let site_ref = site.expect("should_inspect_body implies a matched site");
+        // Set when the body must be forwarded WITHOUT inspection: learning mode
+        // met an oversize body, so the request has to keep working while the
+        // would-block is recorded. A partial view cannot be scanned soundly, so
+        // the choice is inspect-all or inspect-none — never inspect-a-prefix.
+        let mut forward_uninspected: Option<BoxBody> = None;
 
-        // Enforce max body size.  We check size_hint for an early reject (no
-        // data read), then verify again after buffering for chunked bodies that
-        // lack a Content-Length header.
         let bytes = if max_bytes > 0 {
-            // Cheap early reject when the client declares an oversized
-            // Content-Length (no body bytes read yet).
+            // Cheap early path when the client DECLARES an oversized
+            // Content-Length: no body bytes have been read yet, so in learning
+            // mode the whole body can be handed straight through untouched.
             let upper = body.size_hint().upper().unwrap_or(0);
             if upper > max_bytes {
-                ctx.decision = WafDecision::Block;
-                ctx.block_reason = Some(format!(
-                    "request body too large (limit {} bytes)",
-                    max_bytes
-                ));
-                let resp =
-                    error_response(StatusCode::PAYLOAD_TOO_LARGE, "Request Entity Too Large");
-                stamp_response(&mut ctx, &resp);
-                ctx.advance_phase(Phase::Logging);
-                log_request(&ctx);
-                return Ok(resp);
-            }
-            // Enforce the cap WHILE streaming. For `Transfer-Encoding: chunked`
-            // bodies size_hint is None (→0), so without this an attacker could
-            // stream gigabytes into memory before the post-collection check ever
-            // ran. `Limited` aborts collection the instant the body exceeds the
-            // cap, bounding memory to `max_bytes`.
-            match tokio::time::timeout(
-                body_read_timeout(),
-                http_body_util::Limited::new(body, max_bytes as usize).collect(),
-            )
-            .await
-            {
-                Ok(Ok(collected)) => collected.to_bytes(),
-                Ok(Err(e))
-                    if e.downcast_ref::<http_body_util::LengthLimitError>()
-                        .is_some() =>
-                {
-                    ctx.decision = WafDecision::Block;
-                    ctx.block_reason = Some(format!(
-                        "request body too large (limit {} bytes)",
-                        max_bytes
-                    ));
-                    let resp =
-                        error_response(StatusCode::PAYLOAD_TOO_LARGE, "Request Entity Too Large");
-                    stamp_response(&mut ctx, &resp);
-                    ctx.advance_phase(Phase::Logging);
-                    log_request(&ctx);
+                if let Some(resp) = enforce_request_limit(
+                    &mut ctx,
+                    site_ref,
+                    format!("request body too large (limit {} bytes)", max_bytes),
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "Request Entity Too Large",
+                ) {
                     return Ok(resp);
                 }
-                Ok(Err(e)) => return Err(anyhow::anyhow!("collecting request body: {e}")),
-                Err(_) => {
-                    ctx.decision = WafDecision::Block;
-                    ctx.block_reason = Some("request body read timed out (slow-body)".into());
-                    let resp = error_response(StatusCode::REQUEST_TIMEOUT, "Request Timeout");
-                    stamp_response(&mut ctx, &resp);
-                    ctx.advance_phase(Phase::Logging);
-                    log_request(&ctx);
-                    return Ok(resp);
+                forward_uninspected = Some(body);
+                Bytes::new()
+            } else {
+                // Enforce the cap WHILE streaming. For `Transfer-Encoding:
+                // chunked` bodies size_hint is None (→0), so without this an
+                // attacker could stream gigabytes into memory before any
+                // post-collection check ran. buffer_for_scan stops at the first
+                // frame that crosses the cap, bounding memory the same way
+                // `Limited` did, and — unlike `Limited` — hands back the prefix
+                // plus the untouched remainder so learning mode can forward the
+                // request instead of failing it.
+                match tokio::time::timeout(
+                    body_read_timeout(),
+                    buffer_for_scan(body, max_bytes as usize),
+                )
+                .await
+                {
+                    Ok(ScanBuffer::Complete(b)) => b,
+                    Ok(ScanBuffer::Oversize { prefix, rest }) => {
+                        if let Some(resp) = enforce_request_limit(
+                            &mut ctx,
+                            site_ref,
+                            format!("request body too large (limit {} bytes)", max_bytes),
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            "Request Entity Too Large",
+                        ) {
+                            return Ok(resp);
+                        }
+                        // Replay what was already read off the wire, then stream
+                        // the rest — byte-for-byte, uninspected.
+                        forward_uninspected = Some(
+                            PrefixedBody {
+                                prefix: Some(prefix),
+                                inner: rest,
+                            }
+                            .boxed(),
+                        );
+                        Bytes::new()
+                    }
+                    Ok(ScanBuffer::Error(e)) => {
+                        return Err(anyhow::anyhow!("collecting request body: {e}"))
+                    }
+                    Err(_) => {
+                        // A slow-body timeout is NOT a policy limit being
+                        // exceeded — it is the client failing to send. Learning
+                        // mode downgrades policy verdicts; it cannot conjure a
+                        // body that never arrived, and forwarding a stalled
+                        // stream would only stall the origin too. So this
+                        // rejects in every mode.
+                        ctx.decision = WafDecision::Block;
+                        ctx.block_reason = Some("request body read timed out (slow-body)".into());
+                        let resp = error_response(StatusCode::REQUEST_TIMEOUT, "Request Timeout");
+                        stamp_response(&mut ctx, &resp);
+                        ctx.advance_phase(Phase::Logging);
+                        log_request(&ctx);
+                        return Ok(resp);
+                    }
                 }
             }
         } else {
@@ -3042,83 +3069,98 @@ async fn proxy(
             }
         };
 
-        ctx.request_body = Some(bytes.clone());
-        phase2_body(&mut ctx, site, &engine_map, &state.ml_engine)?;
+        // Oversize under learning mode: forward untouched and skip every
+        // body-phase inspection. Loudly, because an uninspected request is a
+        // real coverage gap and must never be silent — the same rule the
+        // response side already follows for an oversize response.
+        if let Some(passthrough) = forward_uninspected {
+            warn!(
+                site = %site_ref.id,
+                limit_bytes = max_bytes,
+                "request body exceeds the limit — forwarded WITHOUT body inspection \
+                 (learning mode); recorded as would-block"
+            );
+            passthrough
+        } else {
+            ctx.request_body = Some(bytes.clone());
+            phase2_body(&mut ctx, site, &engine_map, &state.ml_engine)?;
 
-        // GraphQL firewall — query depth / complexity / introspection on the
-        // body. Gated to GraphQL endpoints so nested REST-JSON bodies aren't
-        // misread as GraphQL queries.
-        if ctx.decision == WafDecision::Allow {
-            if let Some(gql) = site
-                .and_then(|s| s.waf.graphql.as_ref())
-                .filter(|g| g.enable)
-            {
-                let is_graphql = ctx.method == http::Method::POST
-                    && (ctx.uri.path().contains("graphql")
-                        || ctx
-                            .request_headers
-                            .get(http::header::CONTENT_TYPE)
-                            .and_then(|v| v.to_str().ok())
-                            .is_some_and(|ct| ct.contains("application/graphql")));
-                if is_graphql {
-                    let limits = GraphqlLimits {
-                        max_depth: gql.max_depth,
-                        max_complexity: gql.max_complexity,
-                        block_introspection: gql.block_introspection,
-                    };
-                    if let Some(reason) = inspect_graphql(&bytes, &limits) {
-                        ctx.decision = WafDecision::Block;
-                        ctx.block_reason = Some(reason);
+            // GraphQL firewall — query depth / complexity / introspection on the
+            // body. Gated to GraphQL endpoints so nested REST-JSON bodies aren't
+            // misread as GraphQL queries.
+            if ctx.decision == WafDecision::Allow {
+                if let Some(gql) = site
+                    .and_then(|s| s.waf.graphql.as_ref())
+                    .filter(|g| g.enable)
+                {
+                    let is_graphql = ctx.method == http::Method::POST
+                        && (ctx.uri.path().contains("graphql")
+                            || ctx
+                                .request_headers
+                                .get(http::header::CONTENT_TYPE)
+                                .and_then(|v| v.to_str().ok())
+                                .is_some_and(|ct| ct.contains("application/graphql")));
+                    if is_graphql {
+                        let limits = GraphqlLimits {
+                            max_depth: gql.max_depth,
+                            max_complexity: gql.max_complexity,
+                            block_introspection: gql.block_introspection,
+                        };
+                        if let Some(reason) = inspect_graphql(&bytes, &limits) {
+                            ctx.decision = WafDecision::Block;
+                            ctx.block_reason = Some(reason);
+                        }
                     }
                 }
             }
-        }
 
-        // gRPC firewall — message/frame-size limits on the buffered body.
-        if ctx.decision == WafDecision::Allow {
-            if let Some(grpc_cfg) = site.and_then(|s| s.waf.grpc.as_ref()).filter(|g| g.enable) {
-                let is_grpc_ct = ctx
-                    .request_headers
-                    .get(http::header::CONTENT_TYPE)
-                    .and_then(|v| v.to_str().ok())
-                    .is_some_and(is_grpc);
-                if is_grpc_ct {
-                    let limits = GrpcLimits {
-                        max_message_bytes: grpc_cfg.max_message_bytes,
-                        max_frames: grpc_cfg.max_frames,
-                        block_reflection: grpc_cfg.block_reflection,
-                        allowed_methods: grpc_cfg.allowed_methods.clone(),
-                        blocked_methods: grpc_cfg.blocked_methods.clone(),
-                    };
-                    if let Some(reason) = check_grpc_body(&bytes, &limits) {
-                        ctx.decision = WafDecision::Block;
-                        ctx.block_reason = Some(format!("grpc: {reason}"));
+            // gRPC firewall — message/frame-size limits on the buffered body.
+            if ctx.decision == WafDecision::Allow {
+                if let Some(grpc_cfg) = site.and_then(|s| s.waf.grpc.as_ref()).filter(|g| g.enable)
+                {
+                    let is_grpc_ct = ctx
+                        .request_headers
+                        .get(http::header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .is_some_and(is_grpc);
+                    if is_grpc_ct {
+                        let limits = GrpcLimits {
+                            max_message_bytes: grpc_cfg.max_message_bytes,
+                            max_frames: grpc_cfg.max_frames,
+                            block_reflection: grpc_cfg.block_reflection,
+                            allowed_methods: grpc_cfg.allowed_methods.clone(),
+                            blocked_methods: grpc_cfg.blocked_methods.clone(),
+                        };
+                        if let Some(reason) = check_grpc_body(&bytes, &limits) {
+                            ctx.decision = WafDecision::Block;
+                            ctx.block_reason = Some(format!("grpc: {reason}"));
+                        }
                     }
                 }
             }
-        }
 
-        if ctx.decision == WafDecision::Limit {
-            // Soft-deny from weighted fusion — throttle with 429 (configurable),
-            // do not auto-ban (uncertain traffic).
-            let resp = limit_response(&ctx, site);
-            stamp_response(&mut ctx, &resp);
-            ctx.advance_phase(Phase::Logging);
-            log_request(&ctx);
-            return Ok(resp);
-        }
-        if ctx.decision == WafDecision::Block {
-            note_block(&state, ctx.client_ip);
-            let resp = block_response(&ctx);
-            stamp_response(&mut ctx, &resp);
-            ctx.advance_phase(Phase::Logging);
-            log_request(&ctx);
-            return Ok(resp);
-        }
+            if ctx.decision == WafDecision::Limit {
+                // Soft-deny from weighted fusion — throttle with 429 (configurable),
+                // do not auto-ban (uncertain traffic).
+                let resp = limit_response(&ctx, site);
+                stamp_response(&mut ctx, &resp);
+                ctx.advance_phase(Phase::Logging);
+                log_request(&ctx);
+                return Ok(resp);
+            }
+            if ctx.decision == WafDecision::Block {
+                note_block(&state, ctx.client_ip);
+                let resp = block_response(&ctx);
+                stamp_response(&mut ctx, &resp);
+                ctx.advance_phase(Phase::Logging);
+                log_request(&ctx);
+                return Ok(resp);
+            }
 
-        Full::new(bytes)
-            .map_err(|never: Infallible| match never {})
-            .boxed()
+            Full::new(bytes)
+                .map_err(|never: Infallible| match never {})
+                .boxed()
+        }
     } else {
         // Already a `BoxBody` (TCP: boxed `Incoming`; h3: buffered QUIC body).
         body
@@ -4217,6 +4259,51 @@ static ENGINES_WARMING: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 fn site_expects_engine(site: &SiteConfig) -> bool {
     site.waf.mode != WafMode::Off
         && !(site.waf.rules.is_empty() && site.waf.inline_rules.is_empty())
+}
+
+/// Apply a request-limit rejection through the site's enforcement mode.
+///
+/// Returns `Some(response)` when the request must actually be rejected, and
+/// `None` when the site is in learning mode — in which case the would-block is
+/// recorded (so it reaches the learning report and the FPR triage) and the
+/// request continues.
+///
+/// This exists because the four request limits — URI length, header count,
+/// method allow-list and body size — used to `return Ok(error_response(...))`
+/// directly, before `phase1_headers` and therefore before `enforce_mode`, which
+/// is the ONLY place learning mode downgrades a Block to a Log. So they rejected
+/// with 413/414/431/405 during a soak an operator had been told was safe to run
+/// against production traffic. The four defaults most likely to bite are exactly
+/// these (10 MB body, 8192 URI, 100 headers, 7 methods), so a learning window on
+/// a real application — an upload portal, a git push, a SAML redirect longer than
+/// 8192 bytes — broke real users while claiming only to be observing them.
+fn enforce_request_limit(
+    ctx: &mut RequestContext,
+    site: &SiteConfig,
+    reason: String,
+    status: StatusCode,
+    body: &'static str,
+) -> Option<Response<BoxBody>> {
+    ctx.decision = WafDecision::Block;
+    ctx.block_reason = Some(reason);
+    let gm = governing_mode(ctx, &site.waf.mode);
+    enforce_mode(ctx, &gm);
+    if ctx.decision == WafDecision::Block {
+        let resp = error_response(status, body);
+        stamp_response(ctx, &resp);
+        ctx.advance_phase(Phase::Logging);
+        log_request(ctx);
+        return Some(resp);
+    }
+    // Learning (or a path override set to learning/off): recorded, not rejected.
+    // `would_block` is what puts it in the learning report, which is the whole
+    // point of running the soak.
+    warn!(
+        site = %site.id,
+        reason = ctx.block_reason.as_deref().unwrap_or(""),
+        "request limit exceeded — NOT rejected (learning mode); recorded as would-block"
+    );
+    None
 }
 
 fn build_rule_engines(cfg: &SentinelConfig, previous: &RuleEngineMap) -> RuleEngineMap {
