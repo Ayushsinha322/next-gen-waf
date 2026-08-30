@@ -400,3 +400,29 @@ fn an_ordinary_cookie_keeps_its_payload_while_a_session_cookie_does_not() {
         );
     }
 }
+
+/// What a CHAINED rule records. Chains are `AND`: every link must match, so
+/// unlike a multi-target `OR` there is a real choice about which link's text to
+/// keep. Pinned so the answer is a decision rather than an accident.
+#[test]
+fn a_chained_rule_records_a_link_that_actually_matched() {
+    let engine = engine_from(
+        "SecRule REQUEST_FILENAME \"@rx /admin\" \"id:900111,phase:2,deny,msg:'chain',chain\"\n    SecRule ARGS \"@detectSQLi\"",
+    );
+    let mut ctx = common::make_get_ctx("/admin?q=1%27%20UNION%20SELECT%20pw%20FROM%20users--");
+    eval(&engine, &mut ctx, Phase::RequestBody);
+    let m = ctx
+        .rule_matches
+        .iter()
+        .find(|m| m.rule_id == "900111")
+        .expect("the chained rule must fire");
+    // Never empty — that is what the pre-fix code produced. And specifically
+    // the DETECTION link, not the `/admin` precondition: an operator triaging
+    // this needs the payload, and "/admin" is true but useless.
+    assert!(!m.matched_value.is_empty(), "a chain recorded nothing");
+    assert!(
+        m.matched_value.to_uppercase().contains("UNION"),
+        "a chain recorded the precondition instead of the detection: {:?}",
+        m.matched_value
+    );
+}

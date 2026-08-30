@@ -979,21 +979,31 @@ fn cap_matched(s: &str) -> String {
 
 /// Record the text a match instruction matched, for the rule being evaluated.
 ///
-/// Only ever records a HIT, and only the FIRST one. A single rule commonly
-/// inspects several targets — CRS 942100 is
-/// `ARGS|ARGS_NAMES|REQUEST_COOKIES|REQUEST_HEADERS|XML:/*` — and the compiler
+/// Only ever records a HIT — that is the whole point. A single rule commonly
+/// inspects several targets (CRS 942100 is
+/// `ARGS|ARGS_NAMES|REQUEST_COOKIES|REQUEST_HEADERS|XML:/*`) and the compiler
 /// emits one match instruction per target. Assigning the result directly meant a
 /// later target that did NOT match overwrote the value an earlier one DID match
-/// with `None`, so multi-target rules (that is, most of CRS) routinely recorded
-/// an empty payload on a real detection.
+/// with `None`, so multi-target rules — most of CRS — routinely recorded an
+/// empty payload on a real detection.
+///
+/// The LAST genuine hit wins, which matters for `chain`. A chain is an AND of
+/// several links, and CRS writes the cheap precondition first and the real
+/// detection last:
+///
+/// ```text
+/// SecRule REQUEST_FILENAME "@rx /admin" "chain"
+///   SecRule ARGS "@detectSQLi"
+/// ```
+///
+/// Keeping the first hit records `/admin` — true, and useless. The operator
+/// needs the payload from the link that actually detected something.
 ///
 /// `last_matched` is cleared at every `RuleEnd`, so a value can never be
 /// attributed to a later rule.
 fn record_match<S: AsRef<str>>(last_matched: &mut Option<String>, hit: Option<S>) {
-    if last_matched.is_none() {
-        if let Some(v) = hit {
-            *last_matched = Some(cap_matched(v.as_ref()));
-        }
+    if let Some(v) = hit {
+        *last_matched = Some(cap_matched(v.as_ref()));
     }
 }
 
