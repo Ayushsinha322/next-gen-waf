@@ -24,6 +24,12 @@
 //! It is therefore not a guarantee. An application that puts a session id in a
 //! parameter called `s` defeats it. It removes the overwhelmingly common cases —
 //! the ones that appear in every framework's login, reset and OAuth flows.
+//!
+//! Two names are deliberately ambiguous and resolved toward redaction: `state`
+//! is an OAuth CSRF token but also a postal address field, and `code` is an
+//! authorization code but also a discount code. Both are redacted. The address
+//! reading is personal data whose forensic value is near zero, and the OAuth
+//! reading is a live credential — so the cost of being wrong is lopsided.
 
 /// Substrings that mark a field name as carrying a credential.
 ///
@@ -62,6 +68,26 @@ const SENSITIVE_NAME_PARTS: [&str; 22] = [
 /// `country_code`, `postcode` and `zipcode`.
 const SENSITIVE_NAME_EXACT: [&str; 5] = ["code", "state", "nonce", "sig", "jwt"];
 
+/// Names that match a sensitive substring but are NOT credentials, checked
+/// first and winning over everything else.
+///
+/// `auth` is matched as a substring so `x-auth-token` and `auth_key` are
+/// covered without enumerating spellings — and that also swallows `author`,
+/// which blog and CMS software uses constantly. Worse, `?author=1` is
+/// WordPress user enumeration: an attack an operator specifically needs to
+/// SEE. Redacting it would hide the payload while the alert still fired.
+///
+/// Note `authorization` also begins "author", so this cannot be a prefix rule;
+/// the names are listed exactly.
+const NOT_SENSITIVE_EXACT: [&str; 6] = [
+    "author",
+    "authors",
+    "author_id",
+    "authorid",
+    "author_name",
+    "authorship",
+];
+
 /// The text substituted for a redacted value. Deliberately not empty: a reader
 /// must be able to tell "this field was present and withheld" from "this field
 /// was absent", because the difference matters when reconstructing a request.
@@ -74,6 +100,10 @@ pub const REDACTED: &str = "[redacted]";
 pub fn is_sensitive_field_name(name: &str) -> bool {
     let n = name.trim().to_ascii_lowercase();
     if n.is_empty() {
+        return false;
+    }
+    // Exceptions win: a name here is never a credential, however it matches.
+    if NOT_SENSITIVE_EXACT.contains(&n.as_str()) {
         return false;
     }
     if SENSITIVE_NAME_EXACT.contains(&n.as_str()) {
@@ -269,6 +299,33 @@ mod tests {
             "",
         ] {
             assert!(!is_sensitive_field_name(n), "{n} must NOT be redacted");
+        }
+    }
+
+    #[test]
+    fn author_is_not_a_credential_but_authorization_is() {
+        // "auth" is matched as a SUBSTRING so that `x-auth-token` and
+        // `auth_key` are covered — which also catches `author`. Blog and CMS
+        // software uses `?author=` constantly, and WordPress author enumeration
+        // (`?author=1`) is itself an attack an operator needs to SEE.
+        for n in [
+            "author",
+            "Authors",
+            "author_id",
+            "author_name",
+            "authorship",
+        ] {
+            assert!(!is_sensitive_field_name(n), "{n} must NOT be redacted");
+        }
+        // The real ones still are — note `authorization` also starts "author".
+        for n in [
+            "authorization",
+            "Authorisation",
+            "auth",
+            "x-auth-token",
+            "auth_key",
+        ] {
+            assert!(is_sensitive_field_name(n), "{n} SHOULD be redacted");
         }
     }
 
