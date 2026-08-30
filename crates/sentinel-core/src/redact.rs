@@ -145,23 +145,38 @@ pub fn redact_query(query: &str) -> String {
 /// there in the query. The path is kept because "which screen was this request
 /// made from" is the reason the field is logged at all.
 pub fn redact_url_query(url: &str) -> String {
-    match url.split_once('?') {
-        None => url.to_string(),
-        Some((head, tail)) => {
-            // Keep any fragment intact and out of the redaction pass: it never
-            // reaches a server and is not ours to rewrite.
-            let (q, frag) = match tail.split_once('#') {
-                Some((q, f)) => (q, Some(f)),
-                None => (tail, None),
-            };
-            let mut out = format!("{head}?{}", redact_query(q));
-            if let Some(f) = frag {
-                out.push('#');
-                out.push_str(f);
+    // Split the FRAGMENT off first. Splitting on `?` first looks equivalent and
+    // is not: in `…/page?a=1#/reset?token=x` the first `?` belongs to the real
+    // query, so the fragment — and the token in it — never reached the
+    // redaction pass at all.
+    let (before_frag, frag) = match url.split_once('#') {
+        Some((b, f)) => (b, Some(f)),
+        None => (url, None),
+    };
+
+    let mut out = match before_frag.split_once('?') {
+        Some((head, q)) => format!("{head}?{}", redact_query(q)),
+        None => before_frag.to_string(),
+    };
+
+    if let Some(f) = frag {
+        out.push('#');
+        // The fragment IS redacted, contrary to the usual reasoning that it
+        // never reaches a server. A single-page app keeps its route there, and
+        // a reset link in an SPA looks exactly like `#/reset?token=…`. Browsers
+        // strip the fragment from `Referer`, but we are not entitled to assume
+        // the client is a browser — and whatever did arrive here is about to be
+        // written to disk, to a 90-day store, and to the SIEM.
+        match f.split_once('?') {
+            Some((route, q)) => {
+                out.push_str(route);
+                out.push('?');
+                out.push_str(&redact_query(q));
             }
-            out
+            None => out.push_str(f),
         }
     }
+    out
 }
 
 /// Minimal percent-decode for comparing a parameter NAME against the list.
@@ -332,8 +347,20 @@ mod tests {
             redact_url_query("https://app.example/home"),
             "https://app.example/home"
         );
-        // Fragment preserved and not rewritten — it never reaches a server.
-        let f = redact_url_query("https://app/#/search?token=x");
+        // An SPA keeps its route — and its single-use token — in the FRAGMENT:
+        // `#/reset?token=...`. A browser strips the fragment from Referer, but
+        // we are not entitled to assume the client is a browser, and whatever
+        // arrived here is about to be written down.
+        let f = redact_url_query("https://app/#/reset?token=fragsecret&lang=en");
         assert!(f.contains('#'), "{f}");
+        assert!(!f.contains("fragsecret"), "{f}");
+        assert!(f.contains("lang=en"), "{f}");
+
+        // Both at once: a real query AND a fragment route with its own query.
+        // Splitting on `?` before `#` made the fragment invisible to redaction.
+        let b = redact_url_query("https://app/page?api_key=qsecret#/reset?token=fsecret");
+        assert!(!b.contains("qsecret"), "{b}");
+        assert!(!b.contains("fsecret"), "{b}");
+        assert!(b.contains("/page?") && b.contains("#/reset?"), "{b}");
     }
 }
