@@ -848,31 +848,11 @@ fn map_severity(s: RuleSeverity) -> Severity {
     }
 }
 
-/// Field names whose VALUES must never be written to a log or an event.
-///
-/// Substring match, so `current_password`, `x-auth-token` and `card_cvv` are all
-/// covered without enumerating every spelling an application might use.
-fn is_sensitive_field_name(name: &str) -> bool {
-    const SENSITIVE: [&str; 15] = [
-        "password",
-        "passwd",
-        "pwd",
-        "secret",
-        "token",
-        "auth",
-        "session",
-        "cookie",
-        "apikey",
-        "api_key",
-        "credential",
-        "otp",
-        "cvv",
-        "cardnumber",
-        "card_number",
-    ];
-    let n = name.to_ascii_lowercase();
-    SENSITIVE.iter().any(|s| n.contains(s))
-}
+/// Re-exported so this module reads naturally; the list itself lives in
+/// `sentinel-core` because the proxy's access-log redaction must use exactly the
+/// same one. Two lists that must agree are a list that will drift — and the gap
+/// between them was a real leak (cookies were covered by neither).
+use sentinel_core::redact::is_sensitive_field_name;
 
 /// The values of every sensitively-named field in this request.
 ///
@@ -882,11 +862,55 @@ fn is_sensitive_field_name(name: &str) -> bool {
 /// path. The list is normally empty, and short when it is not.
 fn collect_sensitive_values(ctx: &RequestContext) -> Vec<String> {
     let query_pairs = ctx.uri.query().map(parse_query_params).unwrap_or_default();
-    // body_args already normalises form / JSON / multipart / XML bodies into
-    // (name, value) pairs, so this covers a JSON login API as well as a form.
-    query_pairs
+
+    // Cookies and headers were MISSING here, and that was the hole. CRS 942100
+    // (SQLi via libinjection) is multi-target and includes REQUEST_COOKIES, and
+    // a multi-target rule leaves `RuleMatch.target` empty — so the proxy's
+    // second, target-based redaction pass could not catch it either. A session
+    // JWT that tripped libinjection was therefore written verbatim to waf.log,
+    // to ClickHouse under a 90-day TTL, and out to the SIEM.
+    let mut pairs: Vec<(String, String)> = query_pairs;
+    pairs.extend(body_args(ctx));
+
+    // Every cookie, judged by its OWN name: `session=` is a credential,
+    // `theme=` is not.
+    if let Some(raw) = ctx
+        .request_headers
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+    {
+        for c in raw.split(';') {
+            if let Some((k, v)) = c.split_once('=') {
+                pairs.push((k.trim().to_string(), v.trim().to_string()));
+            }
+        }
+    }
+
+    // Header values, keyed by header name — Authorization, X-Api-Key and
+    // friends. Cheap: a request carries a few dozen headers at most, and this
+    // runs once per phase, not once per rule.
+    for (name, value) in ctx.request_headers.iter() {
+        // `Cookie` is deliberately EXCLUDED, even though its name reads as
+        // sensitive. Its value is the whole cookie jar, so treating it as one
+        // secret makes every cookie-borne match a substring of a sensitive
+        // value — and a live test caught exactly that: a SQLi payload injected
+        // into an ordinary `theme=` cookie was redacted, destroying the detail
+        // an operator needs to act on a real cookie-injection attack.
+        //
+        // Nothing is lost by skipping it. Each cookie was added individually
+        // above, so a rule matching the WHOLE header still redacts: the match
+        // text contains the `session=` value, and `value_is_sensitive` compares
+        // in both directions.
+        if name.as_str().eq_ignore_ascii_case("cookie") {
+            continue;
+        }
+        if let Ok(v) = value.to_str() {
+            pairs.push((name.as_str().to_string(), v.to_string()));
+        }
+    }
+
+    pairs
         .into_iter()
-        .chain(body_args(ctx))
         .filter(|(name, value)| !value.is_empty() && is_sensitive_field_name(name))
         .map(|(_, value)| value)
         .collect()
@@ -906,12 +930,28 @@ fn value_is_sensitive(sensitive_values: &[String], value: &str) -> bool {
     if value.is_empty() {
         return false;
     }
-    // Either direction: transforms may have trimmed or decoded the value before
-    // the operator saw it, so the captured text can be a substring of the field
-    // — or, after decoding, contain it.
-    sensitive_values
-        .iter()
-        .any(|field_value| field_value.contains(value) || value.contains(field_value.as_str()))
+    sensitive_values.iter().any(|field_value| {
+        // An exact match is a credential at any length: the operator matched
+        // this field's whole value.
+        if field_value == value {
+            return true;
+        }
+        // Substring matching in EITHER direction, because a transform may have
+        // trimmed or decoded the value before the operator saw it — but only
+        // for a field value long enough to identify one specific secret.
+        //
+        // Without this floor the check is catastrophic in the FALSE-POSITIVE
+        // direction. Sensitive fields are now collected from every cookie and
+        // header, and short ones are commonplace: `X-Auth-Version: 1`,
+        // `authed=1`, `otp=123456`. A one-character field value makes
+        // `value.contains("1")` true for nearly every attack payload, and the
+        // log silently degrades to `[redacted]` on every line — losing exactly
+        // the forensic detail this capture exists to provide. Redacting too
+        // much is not the safe direction; it is a different failure.
+        const MIN_IDENTIFYING_LEN: usize = 8;
+        field_value.len() >= MIN_IDENTIFYING_LEN
+            && (field_value.contains(value) || value.contains(field_value.as_str()))
+    })
 }
 
 /// Cap and sanitize a matched value for retention on the `RuleMatch`.
@@ -935,6 +975,26 @@ fn cap_matched(s: &str) -> String {
         end -= 1;
     }
     format!("{}…", &cleaned[..end])
+}
+
+/// Record the text a match instruction matched, for the rule being evaluated.
+///
+/// Only ever records a HIT, and only the FIRST one. A single rule commonly
+/// inspects several targets — CRS 942100 is
+/// `ARGS|ARGS_NAMES|REQUEST_COOKIES|REQUEST_HEADERS|XML:/*` — and the compiler
+/// emits one match instruction per target. Assigning the result directly meant a
+/// later target that did NOT match overwrote the value an earlier one DID match
+/// with `None`, so multi-target rules (that is, most of CRS) routinely recorded
+/// an empty payload on a real detection.
+///
+/// `last_matched` is cleared at every `RuleEnd`, so a value can never be
+/// attributed to a later rule.
+fn record_match<S: AsRef<str>>(last_matched: &mut Option<String>, hit: Option<S>) {
+    if last_matched.is_none() {
+        if let Some(v) = hit {
+            *last_matched = Some(cap_matched(v.as_ref()));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1031,7 +1091,7 @@ pub fn evaluate(
                                         ctx.tx_vars.insert(i.to_string(), m.as_str().to_owned());
                                     }
                                 }
-                                last_matched = caps.get(0).map(|m| cap_matched(m.as_str()));
+                                record_match(&mut last_matched, caps.get(0).map(|m| m.as_str()));
                                 hit = true;
                                 break; // first match wins, as ModSecurity does
                             }
@@ -1042,10 +1102,9 @@ pub fn evaluate(
                         // named on the eventual security event; same lazy-DFA
                         // path, and it still stops at the first matching value.
                         let mut hit = false;
-                        last_matched = None;
                         for s in &values {
                             if let Some(m) = regex.find(s) {
-                                last_matched = Some(cap_matched(m.as_str()));
+                                record_match(&mut last_matched, Some(m.as_str()));
                                 hit = true;
                                 break;
                             }
@@ -1067,7 +1126,7 @@ pub fn evaluate(
                     // value that contained it is what an operator needs to see.
                     let hit_value = values.iter().find(|s| ac.is_match(s));
                     let matched = hit_value.is_some();
-                    last_matched = hit_value.map(|s| cap_matched(s));
+                    record_match(&mut last_matched, hit_value);
                     debug!(set_id, matched, "MatchMulti");
                     stack.push(StackVal::Bool(matched));
                 }
@@ -1138,7 +1197,7 @@ pub fn evaluate(
                     let literal = &ruleset.literals[*literal_id];
                     let hit = values.iter().find(|s| *s == literal);
                     let matched = hit.is_some();
-                    last_matched = hit.map(|s| cap_matched(s));
+                    record_match(&mut last_matched, hit);
                     stack.push(StackVal::Bool(matched));
                 }
             }
@@ -1163,7 +1222,7 @@ pub fn evaluate(
                         .iter()
                         .find(|s| libinjectionrs::detect_sqli(s.as_bytes()).is_injection());
                     let matched = hit.is_some();
-                    last_matched = hit.map(|s| cap_matched(s));
+                    record_match(&mut last_matched, hit);
                     debug!(matched, "DetectSqli");
                     stack.push(StackVal::Bool(matched));
                 }
@@ -1178,7 +1237,7 @@ pub fn evaluate(
                         .iter()
                         .find(|s| libinjectionrs::detect_xss(s.as_bytes()).is_injection());
                     let matched = hit.is_some();
-                    last_matched = hit.map(|s| cap_matched(s));
+                    record_match(&mut last_matched, hit);
                     debug!(matched, "DetectXss");
                     stack.push(StackVal::Bool(matched));
                 }
@@ -1192,7 +1251,7 @@ pub fn evaluate(
                     let host = request_host(ctx);
                     let hit = values.iter().find(|v| contains_off_domain_url(v, &host));
                     let matched = hit.is_some();
-                    last_matched = hit.map(|s| cap_matched(s));
+                    record_match(&mut last_matched, hit);
                     debug!(matched, "DetectOffDomainUrl");
                     stack.push(StackVal::Bool(matched));
                 }
@@ -1205,7 +1264,7 @@ pub fn evaluate(
                 } else {
                     let hit = values.iter().find(|v| crate::ssrf::contains_ssrf_url(v));
                     let matched = hit.is_some();
-                    last_matched = hit.map(|s| cap_matched(s));
+                    record_match(&mut last_matched, hit);
                     debug!(matched, "DetectSsrfUrl");
                     stack.push(StackVal::Bool(matched));
                 }
@@ -1218,7 +1277,7 @@ pub fn evaluate(
                 } else {
                     let hit = values.iter().find(|v| ip_in_any_cidr(v, cidrs));
                     let matched = hit.is_some();
-                    last_matched = hit.map(|s| cap_matched(s));
+                    record_match(&mut last_matched, hit);
                     debug!(matched, "IpMatch");
                     stack.push(StackVal::Bool(matched));
                 }
