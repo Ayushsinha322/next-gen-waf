@@ -6210,7 +6210,18 @@ fn cap_field(s: &str, max: usize) -> String {
 /// `path`, and appending queries there would explode cardinality. Empty when
 /// the request had none.
 fn capped_query(uri: &http::Uri) -> String {
-    cap_field(uri.query().unwrap_or(""), 2048)
+    // Redact BEFORE capping. The other order would truncate mid-secret and leave
+    // a usable prefix in the log — and for a JWT the header and payload are the
+    // first two segments, so a prefix is not harmless.
+    //
+    // This is on the logging path of EVERY request: `query` goes into
+    // access.log, into waf_events (90-day retention) and out to the SIEM. A
+    // password-reset `?token=`, an OAuth `?code=`, an `?api_key=` would
+    // otherwise be written verbatim to all three.
+    cap_field(
+        &sentinel_core::redact::redact_query(uri.query().unwrap_or("")),
+        2048,
+    )
 }
 
 /// The request path for logging. Capped for the reason in `cap_field`: the
@@ -6616,12 +6627,15 @@ fn record_event(ctx: &RequestContext) {
         method: ctx.method.as_str().to_string(),
         path: capped_path(&ctx.uri),
         query: capped_query(&ctx.uri),
-        referer: ctx
-            .request_headers
-            .get(http::header::REFERER)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .to_string(),
+        // Same redaction as the access line: this row lands in ClickHouse under
+        // a 90-day TTL and is forwarded to the SIEM, so it outlives and travels
+        // further than the log file does.
+        referer: sentinel_core::redact::redact_url_query(
+            ctx.request_headers
+                .get(http::header::REFERER)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default(),
+        ),
         matched: top.map(redacted_matched).unwrap_or_default(),
         rule: ev_rule,
         attack: ev_attack,
@@ -7403,11 +7417,17 @@ fn ndjson_log(ctx: &RequestContext) {
     let query = capped_query(&ctx.uri);
     // The page the request was triggered from. For SPA traffic this is the only
     // field that names which screen of the app fired the API call.
-    let referer = ctx
+    // Redacted for the same reason as the query string, and more sharply: a
+    // password-reset page sends its own URL — token and all — as the Referer of
+    // every asset it loads, so the credential arrives on requests that have
+    // nothing to do with the reset.
+    let referer_raw = ctx
         .request_headers
         .get(http::header::REFERER)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("-");
+    let referer_owned = sentinel_core::redact::redact_url_query(referer_raw);
+    let referer = referer_owned.as_str();
 
     let access = serde_json::json!({
         "ts":      ts,

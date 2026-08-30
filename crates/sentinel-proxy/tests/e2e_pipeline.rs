@@ -205,12 +205,48 @@ async fn start_proxy(
     tokio::task::JoinHandle<anyhow::Result<()>>,
 ) {
     install_crypto();
+    // Capture the bind addresses before the config is moved into the server.
+    let binds: Vec<String> = cfg.listeners.iter().map(|l| l.bind.clone()).collect();
     let handle = config_handle(cfg);
     let proxy = ProxyServer::new(handle);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let jh = tokio::spawn(async move { proxy.run(shutdown_rx).await });
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    for bind in &binds {
+        wait_until_accepting(bind).await;
+    }
     (shutdown_tx, jh)
+}
+
+/// Block until the proxy actually accepts connections on `bind`.
+///
+/// This was `sleep(300ms)` and hope. Every one of this file's ~29 tests goes
+/// through `start_proxy`, and on a loaded CI runner 300 ms is not always enough
+/// for the listener to finish binding — the test's own connect then fails with
+/// ConnectionRefused and the suite goes red having found nothing. That happened
+/// to pipeline 29924.
+///
+/// A CI that fails at random is worse than a slow one: it teaches everybody to
+/// re-run the job instead of reading it, and then a real failure looks like the
+/// usual noise. So this waits for the actual condition rather than guessing a
+/// duration — and it is FASTER in the normal case, because the listener is
+/// typically ready in a few milliseconds rather than 300.
+///
+/// Probing by connecting rather than by trying to bind the address ourselves:
+/// binding would race the proxy for the port and could make it fail to start.
+async fn wait_until_accepting(bind: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut delay = std::time::Duration::from_millis(2);
+    loop {
+        if tokio::net::TcpStream::connect(bind).await.is_ok() {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "proxy never accepted a connection on {bind} within 10s"
+        );
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(std::time::Duration::from_millis(50));
+    }
 }
 
 async fn shutdown_proxy(tx: watch::Sender<bool>, jh: tokio::task::JoinHandle<anyhow::Result<()>>) {
