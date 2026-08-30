@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+#
+# pilot-status.sh — how is the FPR pilot going, right now?
+#
+# A quick look between the start (start-fpr-pilot.sh) and the verdict
+# (fpr-report.sh / fpr-analyse.py). It answers the three questions that decide
+# whether the window is worth anything:
+#
+#   1. Is real traffic arriving, and from how many distinct people?
+#   2. Is it arriving CLEANLY, i.e. by hostname rather than by IP address?
+#      Rule 920350 fires on every request whose Host header is a bare IP, so a
+#      single forgotten browser tab pointed at the IP quietly adds thousands of
+#      contaminating requests (Juice Shop's /socket.io/ polls every ~25s, which
+#      is ~3,500 requests a day from ONE tab).
+#   3. What has actually been detected, and does its spread look like a false
+#      positive (many clients, many paths) or a real attack (concentrated)?
+#
+# It deliberately does NOT print a pass/fail. Judging the window is
+# fpr-analyse.py's job, and it refuses samples it cannot stand behind. This is a
+# progress check, not a verdict — reading an early number as a result is the
+# mistake this whole pilot exists to avoid.
+#
+# Usage:  ./pilot-status.sh [HOURS]     (default: since the window opened)
+
+set -uo pipefail
+HOURS="${1:-}"
+LOGDIR="${SENTINEL_LOG_VOLUME:-/var/lib/docker/volumes/sentinel_sentinel-logs/_data}"
+MARKER_CANDIDATES=(
+  /var/lib/docker/volumes/sentinel_sentinel-state/_data/fpr-pilot.start
+  /var/lib/sentinel/fpr-pilot.start
+)
+
+# The marker is written as key=value lines (started_at=...), not a bare
+# timestamp. Extract the ISO instant, or every log comparison silently excludes
+# everything: "2026-08-30T..." sorts BEFORE "started_at=..." as a string, so a
+# naive read produced a confident, wrong "0 requests".
+START=""
+for m in "${MARKER_CANDIDATES[@]}"; do
+  [[ -r "$m" ]] || continue
+  START="$(grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z' "$m" 2>/dev/null | head -1)"
+  [[ -n "$START" ]] && break
+done
+
+export PILOT_START="$START" PILOT_HOURS="$HOURS" PILOT_LOGDIR="$LOGDIR"
+python3 - <<'PY'
+import json, glob, os, datetime, collections
+
+logdir = os.environ["PILOT_LOGDIR"]
+start  = (os.environ.get("PILOT_START") or "").strip()
+hours  = (os.environ.get("PILOT_HOURS") or "").strip()
+now    = datetime.datetime.now(datetime.UTC)
+
+if hours:
+    cut = (now - datetime.timedelta(hours=float(hours))).strftime("%Y-%m-%dT%H:%M:%SZ")
+    label = f"last {hours}h"
+elif start:
+    cut, label = start, f"since the window opened ({start})"
+else:
+    cut = (now - datetime.timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    label = "last 24h (no window marker found)"
+
+# Requests whose Host was a bare IP are exactly those where 920350 fired.
+ip_host = set()
+ip_recent = []
+detections = collections.defaultdict(lambda: {"n": 0, "ips": set(), "paths": set(), "wb": 0})
+for f in glob.glob(logdir + "/waf*/waf.log"):
+    for line in open(f, errors="replace"):
+        line = line.strip()
+        if not line.startswith("{"): continue
+        try: d = json.loads(line)
+        except: continue
+        if d.get("ts", "") < cut: continue
+        if d.get("rule") == "920350":
+            ip_host.add(d.get("request_id"))
+            ip_recent.append(d.get("ts", ""))
+            continue                      # the artefact, not a finding
+        r = detections[d.get("rule") or "-"]
+        r["n"] += 1
+        r["ips"].add(d.get("ip")); r["paths"].add(d.get("path"))
+        if d.get("would_block") or d.get("action") == "BLOCK":
+            r["wb"] += 1
+
+clean = viaip = tools = 0
+people = collections.Counter()
+for f in glob.glob(logdir + "/waf*/access.log"):
+    for line in open(f, errors="replace"):
+        line = line.strip()
+        if not line.startswith("{"): continue
+        try: d = json.loads(line)
+        except: continue
+        if d.get("ts", "") < cut: continue
+        ua = d.get("ua") or ""
+        if "Mozilla" not in ua:
+            tools += 1
+            continue
+        if d.get("request_id") in ip_host:
+            viaip += 1
+        else:
+            clean += 1
+            people[d.get("ip")] += 1
+
+total = clean + viaip
+print()
+print("  FPR PILOT — PROGRESS  (%s)" % label)
+print("  " + "=" * 66)
+print("  real browser requests        %d" % total)
+print("    reaching it by HOSTNAME    %d   <- usable" % clean)
+# Say whether the IP traffic is CURRENT or historical. Early in a window it is
+# usually the tail from before people switched, and calling that "a tab is still
+# open" sends someone hunting for a tab that was already closed.
+recent_ip = sum(1 for t in ip_recent if t >= (now - datetime.timedelta(minutes=10))
+                .strftime("%Y-%m-%dT%H:%M:%SZ"))
+if viaip == 0:
+    ip_note = ""
+elif recent_ip == 0:
+    ip_note = "<- all historical (none in the last 10 min); subtract from the sample"
+else:
+    ip_note = "<- %d in the LAST 10 MIN: a tab is still open on the IP" % recent_ip
+print("    reaching it by IP address  %d   %s" % (viaip, ip_note))
+print("  tool/other requests excluded %d" % tools)
+print("  distinct people (clean)      %d" % len(people))
+print()
+
+if start:
+    try:
+        opened = datetime.datetime.strptime(start, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.UTC)
+        age = now - opened
+        d_, h_ = age.days, age.seconds // 3600
+        print("  window age                   %dd %dh" % (d_, h_))
+        if age < datetime.timedelta(days=7):
+            print("  >> TOO EARLY. One week minimum, two weeks target, and it must")
+            print("     include a weekday peak and a weekend. False positives hide in")
+            print("     traffic you see rarely.")
+    except ValueError:
+        pass
+print()
+
+print("  DETECTIONS (rule 920350 excluded — it is the bare-IP artefact)")
+print("  " + "-" * 66)
+if not detections:
+    print("    none — no rule other than the artefact has fired")
+else:
+    print("    %-10s %6s %8s %9s  %s" % ("rule", "hits", "uniq_ip", "uniq_path", "reading"))
+    for rule, v in sorted(detections.items(), key=lambda kv: -kv[1]["n"]):
+        systematic = len(v["ips"]) >= 3 and len(v["paths"]) >= 5
+        note = "systematic -> likely FALSE POSITIVE" if systematic else "concentrated -> likely a real attack"
+        print("    %-10s %6d %8d %9d  %s" % (rule, v["n"], len(v["ips"]), len(v["paths"]), note))
+        if v["wb"]:
+            print("    %-10s %6s would have BLOCKED %d of these" % ("", "", v["wb"]))
+print()
+print("  This is a progress check, not a verdict. Run fpr-analyse.py for that —")
+print("  it refuses samples it cannot stand behind.")
+print()
+PY
