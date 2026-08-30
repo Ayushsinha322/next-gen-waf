@@ -106,11 +106,19 @@ pub fn redact_query(query: &str) -> String {
         return query.to_string();
     }
 
-    let mut out = String::with_capacity(query.len());
-    for (i, pair) in query.split('&').enumerate() {
-        if i > 0 {
-            out.push('&');
-        }
+    // Walk the pairs honouring BOTH separators, and put back the one that
+    // actually arrived. The check above splits on `&` and `;`; if this loop
+    // split on `&` alone, then `a=1;token=x` would be recognised as sensitive
+    // and then walked as a SINGLE pair named "a" — passed through with the
+    // credential still in it. Splitting on both is not optional once the
+    // detection does.
+    let mut out = String::with_capacity(query.len() + REDACTED.len());
+    let mut rest = query;
+    loop {
+        let (pair, sep, tail) = match rest.find(['&', ';']) {
+            Some(i) => (&rest[..i], Some(&rest[i..i + 1]), &rest[i + 1..]),
+            None => (rest, None, ""),
+        };
         match pair.split_once('=') {
             Some((name, _value)) if is_sensitive_field_name(&percent_decode_lossy(name)) => {
                 out.push_str(name);
@@ -118,6 +126,13 @@ pub fn redact_query(query: &str) -> String {
                 out.push_str(REDACTED);
             }
             _ => out.push_str(pair),
+        }
+        match sep {
+            Some(s) => {
+                out.push_str(s);
+                rest = tail;
+            }
+            None => break,
         }
     }
     out
@@ -276,6 +291,22 @@ mod tests {
         let out = redact_query("%74oken=supersecret&q=1");
         assert!(!out.contains("supersecret"), "{out}");
         assert!(out.contains("q=1"), "{out}");
+    }
+
+    #[test]
+    fn a_semicolon_separated_query_is_redacted_too() {
+        // Legacy but real: PHP's arg_separator and older HTML guidance both
+        // allow `;`. The presence CHECK split on `;`, but the rewrite loop split
+        // only on `&`, so `a=1;token=x` was detected as sensitive, then walked
+        // as a single pair named "a" and passed through untouched — the exact
+        // shape the function exists to stop.
+        let out = redact_query("a=1;token=supersecret");
+        assert!(!out.contains("supersecret"), "{out}");
+        assert!(out.contains("a=1"), "{out}");
+        let out = redact_query("token=supersecret;a=1");
+        assert!(!out.contains("supersecret"), "{out}");
+        // Separators are preserved as they arrived.
+        assert!(out.contains(';'), "{out}");
     }
 
     #[test]
