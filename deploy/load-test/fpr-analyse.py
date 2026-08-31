@@ -42,11 +42,17 @@ real attack. Spread is evidence; a rule name is not.
 
 CONTAMINATION DETECTION
 
-It flags the two shapes that have polluted this project's data before: source
+It flags the shapes that have polluted this project's data before: source
 addresses that cannot route to the host (a load generator spoofing
-X-Forwarded-For), and near-uniform per-path request counts (a scripted sweep
-rather than a human). Both are reported rather than silently filtered, because
-the operator has to know the sample was mixed.
+X-Forwarded-For), near-uniform per-path request counts (a scripted sweep rather
+than a human), and User-Agent ROTATION — many distinct browser UAs from one
+address, which is a scanner wearing a browser's clothes. That last one matters
+because nothing else catches it: the address is a genuine client on the right
+network and every individual UA is a real browser string. A self-written scanner
+put 509 such requests into a live pilot window against ~245 genuine ones.
+
+All are reported rather than silently filtered, because the operator has to know
+the sample was mixed.
 """
 
 import argparse
@@ -99,8 +105,96 @@ def is_tool(ua):
     return any(t in ua for t in TOOL_UA)
 
 
+# A scanner that rotates browser User-Agents is invisible to every other check:
+# the address is a real client on the right network and each individual UA is a
+# real browser string. It shows up only in aggregate — and only if you measure
+# it over a SHORT window.
+#
+# Counting distinct UAs per address over the whole log does not work, and the
+# first version of this did exactly that and was wrong. Measured across five
+# weeks of real logs:
+#
+#   10.212.134.32   13 UAs in 30 MINUTES   -> a scanner
+#   10.212.134.11    6 UAs over 35 DAYS    -> a person, whose browser updated
+#
+# Both cross any flat "distinct UAs" threshold. Only the rate separates them, so
+# the count is taken within a bucket: many identities in one sitting is a
+# scanner, a few identities across a month is somebody's laptop.
+UA_ROTATION_WINDOW_SECONDS = 600
+UA_ROTATION_MIN_UAS = 5
+# ...and only if the address is genuinely busy, so a shared NAT egress with a
+# handful of quiet users is never swept up.
+UA_ROTATION_MIN_REQUESTS = 50
+
+
+def _bucket(ts):
+    """Coarse time bucket for a log timestamp, or None if unparseable."""
+    # "2026-08-31T05:04:13Z" -> integer bucket index.
+    try:
+        h = int(ts[11:13]); m = int(ts[14:16]); s = int(ts[17:19])
+        day = ts[:10]
+    except (ValueError, IndexError):
+        return None
+    return (day, (h * 3600 + m * 60 + s) // UA_ROTATION_WINDOW_SECONDS)
+
+
+def scanner_addresses(rows):
+    """Addresses whose traffic is automated, judged by behaviour not identity.
+
+    Found the hard way: a self-written scanner hit .71 with 509 requests and 13
+    distinct browser UAs from a single R&D VPN address, 430 of them inside one
+    minute. Every request looked real — right network, real browser UA — so the
+    FPR denominator would have been majority scanner while reporting itself
+    clean.
+
+    Excluding a real person is the worse error of the two, because it silently
+    shrinks the very denominator this tool exists to protect. Hence the window.
+    """
+    per_ip_bucket_uas = collections.defaultdict(lambda: collections.defaultdict(set))
+    per_ip_n = collections.Counter()
+    for d in rows:
+        ip = d.get("ip") or ""
+        if not ip:
+            continue
+        per_ip_n[ip] += 1
+        b = _bucket(d.get("ts") or "")
+        if b is not None:
+            per_ip_bucket_uas[ip][b].add((d.get("ua") or "")[:64])
+
+    scanners = set()
+    for ip, buckets in per_ip_bucket_uas.items():
+        if per_ip_n[ip] < UA_ROTATION_MIN_REQUESTS:
+            continue
+        busiest = max((len(u) for u in buckets.values()), default=0)
+        if busiest >= UA_ROTATION_MIN_UAS:
+            scanners.add(ip)
+    return scanners
+
+
+def candidate_real(rows, client_net):
+    """Rows that every other signal would have accepted as genuine traffic.
+
+    UA-rotation is judged only over these. Judging it over the whole log let the
+    old spoofed-XFF load test — 100+ synthetic public addresses — dominate the
+    result and drown the one address that was actually a scanner.
+    """
+    out = []
+    for d in rows:
+        ip = d.get("ip") or ""
+        ua = d.get("ua") or ""
+        if ip in LOCAL_HINTS or is_tool(ua):
+            continue
+        if client_net and not ip.startswith(client_net):
+            continue
+        if "Mozilla" not in ua:
+            continue
+        out.append(d)
+    return out
+
+
 def classify(rows, client_net):
-    """Split rows into real / tool / local / off-net, and say why."""
+    """Split rows into real / tool / local / off-net / scanner, and say why."""
+    scanners = scanner_addresses(candidate_real(rows, client_net))
     buckets = collections.defaultdict(list)
     for d in rows:
         ip = d.get("ip") or ""
@@ -113,6 +207,11 @@ def classify(rows, client_net):
             buckets["offnet"].append(d)
         elif "Mozilla" not in ua:
             buckets["no_browser_ua"].append(d)
+        elif ip in scanners:
+            # Checked LAST, so it only ever reclassifies traffic that would
+            # otherwise have counted as real. Everything an existing signal
+            # already explains keeps its own, more specific label.
+            buckets["scanner"].append(d)
         else:
             buckets["real"].append(d)
     return buckets
@@ -140,7 +239,9 @@ def main():
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
-    acc = classify(load(args.access_log), args.client_net)
+    acc_rows = load(args.access_log)
+    scanners = scanner_addresses(candidate_real(acc_rows, args.client_net))
+    acc = classify(acc_rows, args.client_net)
     waf_rows = load(args.waf_log)
     real_keys = {(d.get("request_id") or "") for d in acc["real"]}
 
@@ -154,7 +255,7 @@ def main():
         if rid and real_keys:
             return rid in real_keys
         ip, ua = d.get("ip") or "", d.get("ua") or ""
-        if ip in LOCAL_HINTS or is_tool(ua):
+        if ip in LOCAL_HINTS or is_tool(ua) or ip in scanners:
             return False
         if args.client_net and not ip.startswith(args.client_net):
             return False
@@ -194,6 +295,15 @@ def main():
             warnings.append(
                 f"only {denom} of {total} requests are real "
                 f"({100.0*denom/total:.0f}%) — the rest is tooling or off-net")
+        if acc["scanner"]:
+            shown = sorted(scanners)[:4]
+            more = f" (+{len(scanners) - len(shown)} more)" if len(scanners) > len(shown) else ""
+            warnings.append(
+                f"{len(acc['scanner'])} requests from {len(scanners)} address(es) were "
+                f"EXCLUDED as automated: {', '.join(shown)}{more} — each presented "
+                f"{UA_ROTATION_MIN_UAS}+ distinct browser User-Agents inside "
+                f"{UA_ROTATION_WINDOW_SECONDS // 60} minutes, which a person does not do. "
+                f"A scanner wearing a browser's clothes.")
         public = [ip for ip in ips if not routable_to_private_host(ip)]
         if public:
             warnings.append(
@@ -234,6 +344,7 @@ def main():
     print(f"  requests seen                {total}")
     print(f"  of those, judged REAL        {denom}   <- the denominator")
     for k, label in (("tool", "tooling/self-generated"), ("local", "from the host itself"),
+                     ("scanner", "automated (UA rotation)"),
                      ("offnet", "outside --client-net"), ("no_browser_ua", "no browser UA")):
         if acc[k]:
             print(f"    excluded: {label:<24} {len(acc[k])}")

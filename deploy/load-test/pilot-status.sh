@@ -74,7 +74,55 @@ def self_generated(d):
     ua = (d.get("ua") or "").lower()
     if any(t in ua for t in TOOL_UA):
         return True
-    return (d.get("ip") or "") in LOCAL_IPS
+    if (d.get("ip") or "") in LOCAL_IPS:
+        return True
+    return (d.get("ip") or "") in SCANNER_IPS
+
+
+def find_scanner_ips(paths):
+    """Addresses rotating browser User-Agents inside a short window.
+
+    Same rule as fpr-analyse.py, and same reason for the window: measured over a
+    whole log, a person whose browser updated across five weeks (6 UAs) looks
+    identical to a scanner that used 13 in half an hour. Only the rate tells
+    them apart, and wrongly excluding a person shrinks the denominator this
+    whole exercise depends on.
+    """
+    per = collections.defaultdict(lambda: collections.defaultdict(set))
+    n = collections.Counter()
+    for f in paths:
+        for line in open(f, errors="replace"):
+            line = line.strip()
+            if not line.startswith("{"): continue
+            try: d = json.loads(line)
+            except: continue
+            ip = d.get("ip") or ""
+            ts = d.get("ts") or ""
+            ua = d.get("ua") or ""
+            # Judge rotation ONLY over traffic that would otherwise count as a
+            # real person. Without this pre-filter the old spoofed-XFF load test
+            # (100+ synthetic public addresses) dominates, and a teammate whose
+            # own curl runs share their address gets flagged alongside their
+            # browser. Both happened; both were wrong.
+            if not ip or len(ts) < 19: continue
+            # Only within the window being reported. Scanning the whole log
+            # dragged in a load test from weeks ago — 100+ spoofed X-Forwarded-For
+            # addresses — and listed them as if they were in this pilot.
+            if ts < cut: continue
+            if ip in LOCAL_IPS: continue
+            if any(t in ua.lower() for t in TOOL_UA): continue
+            if "Mozilla" not in ua: continue
+            n[ip] += 1
+            try:
+                b = (ts[:10], (int(ts[11:13])*3600 + int(ts[14:16])*60 + int(ts[17:19])) // 600)
+            except ValueError:
+                continue
+            per[ip][b].add((d.get("ua") or "")[:64])
+    return {ip for ip, buckets in per.items()
+            if n[ip] >= 50 and max((len(u) for u in buckets.values()), default=0) >= 5}
+
+
+SCANNER_IPS = find_scanner_ips(glob.glob(logdir + "/waf*/access.log"))
 
 # Requests whose Host was a bare IP are exactly those where 920350 fired.
 ip_host = set()
@@ -111,7 +159,7 @@ for f in glob.glob(logdir + "/waf*/access.log"):
         except: continue
         if d.get("ts", "") < cut: continue
         ua = d.get("ua") or ""
-        if "Mozilla" not in ua:
+        if "Mozilla" not in ua or (d.get("ip") or "") in SCANNER_IPS:
             tools += 1
             continue
         if d.get("request_id") in ip_host:
@@ -140,6 +188,11 @@ else:
 print("    reaching it by IP address  %d   %s" % (viaip, ip_note))
 print("  tool/other requests excluded %d" % tools)
 print("  distinct people (clean)      %d" % len(people))
+if SCANNER_IPS:
+    shown = sorted(SCANNER_IPS)[:4]
+    more = " (+%d more)" % (len(SCANNER_IPS) - len(shown)) if len(SCANNER_IPS) > len(shown) else ""
+    print("  automated (UA rotation)      %s%s   <- excluded, not people"
+          % (", ".join(shown), more))
 print()
 
 if start:
