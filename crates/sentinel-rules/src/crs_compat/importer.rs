@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tracing::warn;
 
 use super::secrule::{
@@ -292,6 +292,8 @@ fn token_to_target(tok: &str) -> Option<Target> {
         "REQUEST_URI" | "REQUEST_URI_RAW" => Some(Target::RequestUri),
         "REQUEST_FILENAME" | "REQUEST_BASENAME" => Some(Target::RequestFilename),
         "REQUEST_METHOD" => Some(Target::RequestMethod),
+        "REQUEST_PROTOCOL" => Some(Target::RequestProtocol),
+        "REQBODY_PROCESSOR" => Some(Target::ReqbodyProcessor),
         "REQUEST_LINE" => Some(Target::RequestLine),
         "REQUEST_HEADERS" => Some(Target::RequestHeaders(
             sub.map(str::to_lowercase)
@@ -392,6 +394,49 @@ fn interp_cmp_for(op: &str) -> Option<InterpCmp> {
         "endswith" | "endsWith" => InterpCmp::EndsWith,
         _ => return None,
     })
+}
+
+/// Parse a `@validateByteRange` spec: comma-separated single bytes and
+/// inclusive ranges, e.g. `1-255` or `9,10,13,32-126,128-255`.
+///
+/// ModSecurity's semantics: the spec lists the bytes that are ALLOWED, and the
+/// operator fires when a value contains anything else. Parsing is strict — a
+/// malformed spec must fail loudly at import rather than quietly widen or narrow
+/// what the rule permits, because either direction is wrong in a way nobody
+/// would notice: too wide and 920270 stops catching NUL bytes, too narrow and it
+/// fires on ordinary text.
+fn parse_byte_ranges(spec: &str) -> Result<Vec<(u8, u8)>> {
+    let mut out = Vec::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (lo, hi) = match part.split_once('-') {
+            Some((a, b)) => (
+                a.trim()
+                    .parse::<u8>()
+                    .with_context(|| format!("bad low byte {a:?}"))?,
+                b.trim()
+                    .parse::<u8>()
+                    .with_context(|| format!("bad high byte {b:?}"))?,
+            ),
+            None => {
+                let v = part
+                    .parse::<u8>()
+                    .with_context(|| format!("bad byte {part:?}"))?;
+                (v, v)
+            }
+        };
+        if lo > hi {
+            anyhow::bail!("inverted range {lo}-{hi}");
+        }
+        out.push((lo, hi));
+    }
+    if out.is_empty() {
+        anyhow::bail!("no byte ranges given");
+    }
+    Ok(out)
 }
 
 pub(crate) fn crs_op_to_operator(
@@ -524,6 +569,15 @@ pub(crate) fn crs_op_to_operator(
             .map_err(|_| anyhow::anyhow!("invalid integer in @gt: {}", pattern)),
         // @ipMatch is now implemented natively instead of being disabled. The pattern is
         // a comma- or space-separated list of addresses/CIDRs.
+        // @validateByteRange is now implemented instead of being disabled. It
+        // restores 920270 (null byte) and 920271 (non-printable characters),
+        // both of which previously loaded as `Never` — present in the ruleset,
+        // incapable of matching.
+        "validatebyterange" => {
+            let ranges = parse_byte_ranges(pattern)
+                .with_context(|| format!("invalid @validateByteRange spec: {pattern}"))?;
+            Ok(Operator::ValidateByteRange(ranges))
+        }
         "ipmatch" => Ok(Operator::IpMatch(
             pattern
                 .split([',', ' '])
@@ -541,7 +595,6 @@ pub(crate) fn crs_op_to_operator(
         "rbl" => Ok(Operator::SsrfUrl),
         "validateurlencoding"
         | "validateutf8encoding"
-        | "validatebyterange"
         | "validateschema"
         | "validatedtd"
         | "verifycc"

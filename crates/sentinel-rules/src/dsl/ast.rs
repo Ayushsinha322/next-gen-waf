@@ -159,6 +159,23 @@ pub enum Target {
     RequestFilename,
     RequestMethod,
     RequestLine,
+    /// The request's HTTP version as ModSecurity spells it — `HTTP/1.1`,
+    /// `HTTP/2.0`. ModSecurity `REQUEST_PROTOCOL`.
+    ///
+    /// Without it CRS 920430 ("HTTP protocol version is not allowed by policy")
+    /// and 920180 ("POST without Content-Length or Transfer-Encoding") were both
+    /// dropped at import — the importer had no token for their only target, so
+    /// the rules were not merely inert, they were absent.
+    RequestProtocol,
+    /// Which body parser handled the request body: `JSON`, `XML`, `MULTIPART`,
+    /// `URLENCODED`, or empty when there is no body. ModSecurity
+    /// `REQBODY_PROCESSOR`.
+    ///
+    /// Needed by CRS 920540, whose chain looks for `\uXXXX` escapes everywhere
+    /// EXCEPT in a JSON body — where they are ordinary, legal syntax. Without
+    /// the gate the rule would either be absent (it was) or fire on every JSON
+    /// request that contains a unicode escape.
+    ReqbodyProcessor,
     RequestCookies(Option<String>),
     /// Cookie NAMES rather than their values. ModSecurity
     /// `REQUEST_COOKIES_NAMES`.
@@ -280,6 +297,15 @@ pub enum Operator {
     /// of the given CIDR ranges. Previously compiled to `Never`, which silently
     /// disabled every CRS rule that used it.
     IpMatch(Vec<String>),
+    /// `@validateByteRange` — fires when a value contains ANY byte outside the
+    /// permitted set. Ranges are inclusive, given as ModSecurity writes them:
+    /// `1-255` or `9,10,13,32-126,128-255`.
+    ///
+    /// Restores CRS 920270 (null byte in request) and 920271 (non-printable
+    /// characters). Both were compiled to `Never` — they loaded, reported as
+    /// present, and could never match. A NUL byte in a URI is a classic parser
+    /// -confusion primitive, so this is not a cosmetic gap.
+    ValidateByteRange(Vec<(u8, u8)>),
     AnomalyScore {
         op: CmpOp,
         threshold: u32,

@@ -109,6 +109,17 @@ pub fn make_post_ctx(uri: &str, body: &str) -> RequestContext {
         http::header::CONTENT_TYPE,
         "application/x-www-form-urlencoded".parse().unwrap(),
     );
+    // Content-Length too, because a real HTTP/1.1 POST with a body always has
+    // it (or Transfer-Encoding) — RFC 7230 requires one and hyper will not
+    // deliver a body without either. Omitting it made this fixture MALFORMED,
+    // which CRS 920180 "POST without Content-Length or Transfer-Encoding"
+    // correctly flags. That rule was absent until REQUEST_PROTOCOL existed, so
+    // the gap in the fixture went unnoticed; it showed up the moment the rule
+    // started working.
+    ctx.request_headers.insert(
+        http::header::CONTENT_LENGTH,
+        body.len().to_string().parse().unwrap(),
+    );
     apply_baseline_headers(&mut ctx);
     apply_crs_setup(&mut ctx);
     ctx

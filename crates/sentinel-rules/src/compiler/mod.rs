@@ -514,6 +514,11 @@ fn emit_operator_match(
                 cidrs: cidrs.clone(),
             });
         }
+        Operator::ValidateByteRange(ranges) => {
+            instrs.push(Instruction::ValidateByteRange {
+                ranges: ranges.clone(),
+            });
+        }
         Operator::Never => {
             instrs.push(Instruction::Never);
         }

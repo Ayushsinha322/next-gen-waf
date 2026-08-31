@@ -677,6 +677,39 @@ fn extract_target(spec: &TargetSpec, ctx: &RequestContext) -> Vec<String> {
         TargetSpec::RequestLine => {
             vec![format!("{} {} {:?}", ctx.method, ctx.uri, ctx.http_version)]
         }
+        // ModSecurity spells the version `HTTP/1.1`, `HTTP/2.0`, and CRS
+        // compares against that exact text: 920180 uses
+        // `!@within HTTP/2 HTTP/2.0 HTTP/3 HTTP/3.0` and 920430 checks
+        // `%{tx.allowed_http_versions}`. `Version`'s Debug form is already that
+        // spelling, which is why `RequestLine` above uses it too.
+        TargetSpec::RequestProtocol => vec![format!("{:?}", ctx.http_version)],
+        // Which parser handled the body, named as ModSecurity names it.
+        //
+        // Derived from Content-Type rather than stored on the context, because
+        // that is exactly how the choice is made in the first place — see
+        // `body_args`, which dispatches on the same header. Keeping one source
+        // of that decision means the two cannot disagree about whether a body
+        // was JSON.
+        TargetSpec::ReqbodyProcessor => {
+            let ct = content_type(ctx);
+            let processor = if ct.starts_with("application/json") || ct.contains("+json") {
+                "JSON"
+            } else if is_xml_content_type(&ct) {
+                "XML"
+            } else if ct.starts_with("multipart/form-data") {
+                "MULTIPART"
+            } else if ct.starts_with("application/x-www-form-urlencoded") {
+                "URLENCODED"
+            } else {
+                // ModSecurity leaves it unset when no processor ran. Returning a
+                // single empty string rather than an empty vec matters: an empty
+                // vec makes the operator return `Absent` and the rule cannot
+                // evaluate, so `!@streq JSON` would never fire on a bodiless
+                // request — which is precisely when CRS 920540 wants it to.
+                ""
+            };
+            vec![processor.to_owned()]
+        }
         // For multipart/form-data, yield the PARSED part values rather than the
         // raw envelope. ModSecurity/CRS deliberately leave REQUEST_BODY empty for
         // multipart — the parts reach ARGS instead — and handing rules the raw
@@ -1289,6 +1322,26 @@ pub fn evaluate(
                     let matched = hit.is_some();
                     record_match(&mut last_matched, hit);
                     debug!(matched, "IpMatch");
+                    stack.push(StackVal::Bool(matched));
+                }
+            }
+
+            Instruction::ValidateByteRange { ranges } => {
+                let values = pop_strings(&mut stack);
+                if values.is_empty() {
+                    stack.push(StackVal::Absent);
+                } else {
+                    // The spec lists the ALLOWED bytes; the operator fires on
+                    // anything outside it. Compared over bytes, not chars: the
+                    // whole point of 920270 is a NUL, and 920271 catches control
+                    // characters — neither survives a lossy char conversion.
+                    let hit = values.iter().find(|v| {
+                        v.bytes()
+                            .any(|b| !ranges.iter().any(|(lo, hi)| b >= *lo && b <= *hi))
+                    });
+                    let matched = hit.is_some();
+                    record_match(&mut last_matched, hit);
+                    debug!(matched, "ValidateByteRange");
                     stack.push(StackVal::Bool(matched));
                 }
             }
