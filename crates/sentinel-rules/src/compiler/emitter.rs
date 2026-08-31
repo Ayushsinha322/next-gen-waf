@@ -19,6 +19,8 @@ pub enum TargetSpec {
     RequestFilename,
     RequestMethod,
     RequestLine,
+    RequestProtocol,
+    ReqbodyProcessor,
     RequestHeadersAll,
     RequestHeader(String),
     RequestCookiesAll,
@@ -56,6 +58,8 @@ impl TargetSpec {
             TargetSpec::RequestUri => "REQUEST_URI".into(),
             TargetSpec::RequestFilename => "REQUEST_FILENAME".into(),
             TargetSpec::RequestMethod => "REQUEST_METHOD".into(),
+            TargetSpec::RequestProtocol => "REQUEST_PROTOCOL".into(),
+            TargetSpec::ReqbodyProcessor => "REQBODY_PROCESSOR".into(),
             TargetSpec::RequestLine => "REQUEST_LINE".into(),
             TargetSpec::RequestHeadersAll => "REQUEST_HEADERS".into(),
             TargetSpec::RequestHeader(h) => format!("REQUEST_HEADERS:{h}"),
@@ -96,6 +100,8 @@ impl From<&Target> for TargetSpec {
             Target::RequestUri => TargetSpec::RequestUri,
             Target::RequestFilename => TargetSpec::RequestFilename,
             Target::RequestMethod => TargetSpec::RequestMethod,
+            Target::RequestProtocol => TargetSpec::RequestProtocol,
+            Target::ReqbodyProcessor => TargetSpec::ReqbodyProcessor,
             Target::RequestLine => TargetSpec::RequestLine,
             Target::RequestHeaders(None) => TargetSpec::RequestHeadersAll,
             Target::RequestHeaders(Some(h)) => TargetSpec::RequestHeader(h.clone()),
@@ -175,6 +181,12 @@ pub enum Instruction {
     /// Pop `StrVec`, push `Bool(any value is an IP inside one of these CIDRs)`.
     IpMatch {
         cidrs: Vec<String>,
+    },
+
+    /// Pop `StrVec`, push `Bool(any value has a byte OUTSIDE these ranges)`.
+    /// Inclusive ranges, as `@validateByteRange` gives them.
+    ValidateByteRange {
+        ranges: Vec<(u8, u8)>,
     },
 
     /// Always push `Bool(false)` — used for intentionally disabled rules.

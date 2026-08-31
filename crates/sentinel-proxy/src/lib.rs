@@ -4716,6 +4716,8 @@ fn target_name(t: &sentinel_rules::dsl::ast::Target) -> String {
         Target::RequestFilename => "REQUEST_FILENAME".into(),
         Target::RequestMethod => "REQUEST_METHOD".into(),
         Target::RequestLine => "REQUEST_LINE".into(),
+        Target::RequestProtocol => "REQUEST_PROTOCOL".into(),
+        Target::ReqbodyProcessor => "REQBODY_PROCESSOR".into(),
         Target::RequestHeaders(None) => "REQUEST_HEADERS".into(),
         Target::RequestHeaders(Some(h)) => format!("REQUEST_HEADERS:{h}"),
         Target::RequestCookies(None) => "REQUEST_COOKIES".into(),
