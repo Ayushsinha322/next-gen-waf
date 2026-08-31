@@ -38,3 +38,28 @@ SQLi payload that must survive.
 
 Both produced a confident, wrong result before being fixed — which is the same
 failure the tools in `../load-test/` exist to prevent for the FPR pilot.
+
+## Answering the false-positive question honestly
+
+`fp-recheck.sh` is READ-ONLY on purpose. The battery in
+`verify-protocol-rules.sh` sends probes, so re-running it hourly to answer "did
+the new rules false-positive?" would pollute the very sample the answer depends
+on — and that sample is a live FPR pilot window.
+
+It exits **2 = INCONCLUSIVE** below 100 real human requests rather than 0. This
+is the point: "nothing fired" over an empty sample is not evidence, it is a
+guard that cannot fail. That mistake has been made in this repo before — a
+report once read "0.1824%, under the gate" when 364 of 373 requests were
+keepalived's own health check.
+
+`fp-watch.sh` polls it and records a verdict once, when the sample is finally
+big enough. Detached, so a VPN drop cannot interrupt it, and it writes
+`TIMED OUT ... Not a pass` rather than a pass if nobody browses enough.
+
+### Two shell traps hit while writing these
+
+`pkill -f fp-watch.sh` run over SSH kills the SSH session itself, because the
+remote command line contains that string. Same for `pgrep -cf` — it counts
+itself and reports 1 for a process that is not running. Match on
+`/proc/<pid>/cmdline` and exclude `$$` instead. Both produced a confidently
+wrong answer here: "watcher running: 1" when it had never started.
