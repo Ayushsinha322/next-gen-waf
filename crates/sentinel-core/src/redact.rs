@@ -25,18 +25,28 @@
 //! parameter called `s` defeats it. It removes the overwhelmingly common cases —
 //! the ones that appear in every framework's login, reset and OAuth flows.
 //!
-//! Two names are deliberately ambiguous and resolved toward redaction: `state`
-//! is an OAuth CSRF token but also a postal address field, and `code` is an
-//! authorization code but also a discount code. Both are redacted. The address
-//! reading is personal data whose forensic value is near zero, and the OAuth
-//! reading is a live credential — so the cost of being wrong is lopsided.
+//! Three names are deliberately ambiguous and resolved toward redaction:
+//! `state` is an OAuth CSRF token but also a postal address field, `code` is an
+//! authorization code but also a discount code, and `pin` is an authentication
+//! PIN but also, in India, a postal code. All are redacted. Each benign reading
+//! is personal data of near-zero forensic value while each sensitive reading is
+//! a live credential, so the cost of being wrong is lopsided.
+//!
+//! # Keeping the list honest
+//!
+//! The list is checked against real framework defaults by
+//! `tests/name_survey.rs`, which is where `PHPSESSID` and `connect.sid` were
+//! caught: `session` as a substring looks like it covers session cookies and
+//! does not, because neither name contains "session". Add to that survey before
+//! adding here — it asserts in BOTH directions, since a list that redacts
+//! everything is as useless as one that redacts nothing.
 
 /// Substrings that mark a field name as carrying a credential.
 ///
 /// Substring matching is intentional: it covers `current_password`,
 /// `x-auth-token`, `csrf_token` and `card_cvv` without anyone having to
 /// enumerate every spelling an application might invent.
-const SENSITIVE_NAME_PARTS: [&str; 22] = [
+const SENSITIVE_NAME_PARTS: [&str; 38] = [
     "password",
     "passwd",
     "pwd",
@@ -61,12 +71,52 @@ const SENSITIVE_NAME_PARTS: [&str; 22] = [
     "id_token",
     "client_secret",
     "assertion",
+    "oauth",
+    // Framework session cookies. `session` as a substring looks like it covers
+    // these and does not: PHP's `PHPSESSID` and Express's `connect.sid` contain
+    // no "session" at all, and between them they are most of the web. Found by
+    // surveying the list against real framework defaults after real traffic on
+    // .71 showed a live socket.io `sid` passing through unredacted.
+    "phpsessid",
+    "sessid",
+    "connect.sid",
+    "wordpress_logged_in",
+    // CSRF tokens. Stealing one is not session theft, but it is the second half
+    // of an attack, and they appear in query strings constantly.
+    "csrf",
+    "xsrf",
+    // SAML / federated SSO. The assertion IS the authentication.
+    "saml",
+    "relaystate",
+    "bearer",
+    // Long-lived secrets that are not session material but are just as bad in a
+    // log that keeps 90 days.
+    "private_key",
+    "privatekey",
+    "license_key",
+    "licensekey",
+    "recovery_code",
+    "recoverycode",
 ];
 
 /// Exact field names that are credentials but whose names are too short or too
 /// generic to match safely as substrings. `code` would otherwise redact
-/// `country_code`, `postcode` and `zipcode`.
-const SENSITIVE_NAME_EXACT: [&str; 5] = ["code", "state", "nonce", "sig", "jwt"];
+/// `country_code`, `postcode` and `zipcode`; `ticket` would redact every
+/// helpdesk `ticket_id`; `pass` would redact `passenger_name`.
+const SENSITIVE_NAME_EXACT: [&str; 11] = [
+    "code", "state", "nonce", "sig", "jwt",  // OAuth / OIDC / signing
+    "sid",  // socket.io and generic session id — seen live on .71
+    "pass", // a field called exactly "pass" is a password
+    "pin",  // see the module note: PIN vs Indian postal PIN code
+    "mfa", "sso", "ticket", // CAS service ticket
+];
+
+/// Names whose PREFIX marks them sensitive.
+///
+/// Exists for Drupal, whose session cookies are `SESS<hash>` and `SSESS<hash>`.
+/// Matching "ssess" as a substring would redact `assessment`, `assessor` and
+/// `reassessment` — ordinary enterprise field names — so the position matters.
+const SENSITIVE_NAME_PREFIX: [&str; 2] = ["ssess", "sess"];
 
 /// Names that match a sensitive substring but are NOT credentials, checked
 /// first and winning over everything else.
@@ -107,6 +157,9 @@ pub fn is_sensitive_field_name(name: &str) -> bool {
         return false;
     }
     if SENSITIVE_NAME_EXACT.contains(&n.as_str()) {
+        return true;
+    }
+    if SENSITIVE_NAME_PREFIX.iter().any(|p| n.starts_with(p)) {
         return true;
     }
     SENSITIVE_NAME_PARTS.iter().any(|s| n.contains(s))
