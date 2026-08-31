@@ -519,3 +519,52 @@ func TestWizardDefaultsMatchControlPlaneDefaults(t *testing.T) {
 			"fall back to the benchmarked default")
 	}
 }
+
+// A site created with no policy must ship with the recon paths locked down.
+//
+// The default anomaly threshold of 10 means no single CRS rule ever blocks: a
+// CRITICAL detection scores 5. Observed live on .71 — a scanner requesting
+// /.git/config, /.env and /.env.production fired rule 930130 for a score of 5
+// each and was passed straight to the origin. These prefixes carry no
+// legitimate traffic, so they get a lower threshold rather than the whole site.
+func TestDefaultPolicyLocksDownReconPaths(t *testing.T) {
+	stored, err := buildRustWaf(json.RawMessage(defaultWafPolicyJSON))
+	if err != nil {
+		t.Fatalf("buildRustWaf(defaultWafPolicyJSON): %v", err)
+	}
+	raw, ok := stored["path_overrides"]
+	if !ok {
+		t.Fatal("default policy has no path_overrides — recon paths are not covered. " +
+			"buildRustWaf is an ALLOWLIST: a key it does not name is stored, echoed " +
+			"back and silently dropped, so this must be asserted, not assumed.")
+	}
+	ov, ok := raw.([]map[string]any)
+	if !ok {
+		t.Fatalf("path_overrides has type %T, want []map[string]any", raw)
+	}
+
+	got := map[string]bool{}
+	for _, o := range ov {
+		p, _ := o["path_prefix"].(string)
+		got[p] = true
+		if th, ok := o["anomaly_threshold"]; !ok {
+			t.Errorf("override %q sets no anomaly_threshold, so it does nothing", p)
+		} else if n, ok := th.(int); ok && n > 5 {
+			t.Errorf("override %q threshold %d is not stricter than a CRITICAL rule's 5", p, n)
+		}
+	}
+	for _, want := range []string{"/.git", "/.env", "/.svn", "/.aws", "/.ssh", "/.htpasswd"} {
+		if !got[want] {
+			t.Errorf("default policy does not lock down %q", want)
+		}
+	}
+
+	// /.well-known/ is legitimate and load-bearing: ACME HTTP-01 challenges are
+	// served from it. A blanket "/." prefix would break certificate issuance,
+	// which is why these are enumerated.
+	for p := range got {
+		if strings.HasPrefix("/.well-known/acme-challenge/x", p) {
+			t.Errorf("override %q also covers /.well-known/ — that would break ACME", p)
+		}
+	}
+}

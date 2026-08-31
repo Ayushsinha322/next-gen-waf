@@ -2217,7 +2217,36 @@ func attachInlineRules(rs map[string]any, siteID string, rules []db.DeployableRu
 // — the raw API path — used to enforce. Three sources of a site's initial
 // posture that did not agree is how the console and the CLI ended up shipping
 // opposite behaviour for the same action.
-const defaultWafPolicyJSON = `{"mode":"learning","paranoia_level":2,"anomaly_threshold":10}`
+// The path overrides exist because a threshold of 10 means NO SINGLE rule ever
+// blocks. CRS scores a CRITICAL detection at 5, so enforcement needs two
+// independent findings — a deliberately permissive posture that keeps the
+// false-positive rate low on ordinary traffic.
+//
+// It also means recon walks straight through. Measured on .71 on 2026-08-31,
+// against a scanner probing the demo site: requests for `/.git/config`,
+// `/.git/HEAD`, `/.env`, `/.env.production` and `/.env.backup` each fired rule
+// 930130 "Restricted File Access Attempt" for a score of 5 — and were passed
+// to the origin, `would_block=false`. A leaked `.git` directory or `.env` file
+// is a full compromise, and it is one of the most-probed things on the public
+// internet.
+//
+// These prefixes carry no legitimate traffic, so the threshold is lowered for
+// them alone rather than globally. The global default is left at 10: the only
+// real-traffic sample available is 96% one path, which is not enough to justify
+// changing the posture for every site — that is what the FPR pilot is for.
+//
+// `/.well-known/` is deliberately NOT here. It is legitimate and load-bearing:
+// ACME HTTP-01 challenges live there, so blocking it would break certificate
+// issuance. That is why these are specific prefixes and not a blanket `/.`.
+const defaultWafPolicyJSON = `{"mode":"learning","paranoia_level":2,"anomaly_threshold":10,` +
+	`"path_overrides":[` +
+	`{"path_prefix":"/.git","anomaly_threshold":5},` +
+	`{"path_prefix":"/.env","anomaly_threshold":5},` +
+	`{"path_prefix":"/.svn","anomaly_threshold":5},` +
+	`{"path_prefix":"/.aws","anomaly_threshold":5},` +
+	`{"path_prefix":"/.ssh","anomaly_threshold":5},` +
+	`{"path_prefix":"/.htpasswd","anomaly_threshold":5}` +
+	`]}`
 
 // defaultRuleExclusions are the CRS suppressions applied to every site unless the
 // operator explicitly opts out. Both come from measured false-positive work:
