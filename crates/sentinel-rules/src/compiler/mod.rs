@@ -18,6 +18,107 @@ use optimizer::build_ac;
 // Compiler state
 // ---------------------------------------------------------------------------
 
+/// Translate the PCRE constructs that `regex` rejects but ModSecurity accepts.
+///
+/// CRS is written for PCRE. Two of its habits are hard errors for the `regex`
+/// crate, and a rule that fails to compile is SKIPPED — it logs a warning at
+/// startup and then simply is not there. Six shipped CRS rules were silently
+/// absent on .71 because of this, found by reading the data plane's own logs:
+///
+/// | rule            | what was missing              |
+/// |-----------------|-------------------------------|
+/// | 921200          | LDAP injection                |
+/// | 932170, 932171  | Shellshock                    |
+/// | 933170, 933180  | PHP object / code injection   |
+/// | 941380          | AngularJS template XSS        |
+///
+/// The two constructs:
+///
+/// 1. **A literal `{` that does not begin a quantifier.** PCRE treats `{` as
+///    literal when it cannot read a repetition after it, so `{{.*?}}` (Angular
+///    templates) and `^\(\s*\)\s+{` (Shellshock) are fine there and rejected
+///    here. Braces inside a character class are already literal in both.
+///
+/// 2. **`\<` and `\>` inside a character class.** PCRE tolerates a needless
+///    backslash on any punctuation; `regex` accepts every one of them EXCEPT
+///    these two. That is the whole of 921200's failure — determined by probing
+///    the crate rather than guessed.
+///
+/// Applied only to a pattern that has ALREADY failed to compile, so it cannot
+/// alter the behaviour of a rule that works.
+fn pcre_compat(pattern: &str) -> String {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = String::with_capacity(pattern.len() + 8);
+    let mut i = 0;
+    let mut in_class = false;
+    // A `]` in the first position of a class is a literal `]`, not the close.
+    let mut class_start = 0usize;
+
+    while i < chars.len() {
+        let c = chars[i];
+
+        // An escape always consumes two characters, so it cannot be mistaken
+        // for a class delimiter or a quantifier brace.
+        if c == '\\' && i + 1 < chars.len() {
+            let next = chars[i + 1];
+            if in_class && (next == '<' || next == '>') {
+                out.push(next); // drop the backslash `regex` refuses
+            } else {
+                out.push('\\');
+                out.push(next);
+            }
+            i += 2;
+            continue;
+        }
+
+        match c {
+            '[' if !in_class => {
+                in_class = true;
+                class_start = i;
+                out.push(c);
+            }
+            ']' if in_class => {
+                // `[]]` and `[^]]`: a `]` here is content, not the terminator.
+                let first = i == class_start + 1
+                    || (i == class_start + 2 && chars.get(class_start + 1) == Some(&'^'));
+                if !first {
+                    in_class = false;
+                }
+                out.push(c);
+            }
+            '{' if !in_class && !starts_quantifier(&chars, i) => {
+                out.push_str("\\{");
+            }
+            // A stray `}` needs no escaping — `regex` already reads it as a
+            // literal — so it is left exactly as written.
+            _ => out.push(c),
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Whether the `{` at `i` opens a valid repetition: `{n}`, `{n,}` or `{n,m}`.
+///
+/// Anything else — `{`, `{{`, `{,3}`, `{.*}` — is a literal brace to PCRE.
+fn starts_quantifier(chars: &[char], i: usize) -> bool {
+    let mut j = i + 1;
+    let digits_start = j;
+    while j < chars.len() && chars[j].is_ascii_digit() {
+        j += 1;
+    }
+    if j == digits_start {
+        return false; // `{` must be followed by at least one digit
+    }
+    if chars.get(j) == Some(&',') {
+        j += 1;
+        while j < chars.len() && chars[j].is_ascii_digit() {
+            j += 1;
+        }
+    }
+    chars.get(j) == Some(&'}')
+}
+
 struct CompilerState {
     patterns: Vec<Regex>,
     ac_set_words: Vec<Vec<String>>,
@@ -42,7 +143,21 @@ impl CompilerState {
         if let Some(idx) = self.patterns.iter().position(|r| r.as_str() == pattern) {
             return Ok(idx);
         }
-        let re = Regex::new(pattern).with_context(|| format!("invalid regex: {pattern}"))?;
+        let re = match Regex::new(pattern) {
+            Ok(re) => re,
+            Err(_) => {
+                // The pattern is PCRE, written for ModSecurity. A handful of
+                // constructs PCRE accepts are hard errors here — see
+                // `pcre_compat`. Repair is attempted ONLY after a genuine
+                // failure, so a pattern that already compiles is used exactly
+                // as written and this can never change a working rule.
+                let repaired = pcre_compat(pattern);
+                if let Some(idx) = self.patterns.iter().position(|r| r.as_str() == repaired) {
+                    return Ok(idx);
+                }
+                Regex::new(&repaired).with_context(|| format!("invalid regex: {pattern}"))?
+            }
+        };
         let idx = self.patterns.len();
         self.patterns.push(re);
         Ok(idx)
