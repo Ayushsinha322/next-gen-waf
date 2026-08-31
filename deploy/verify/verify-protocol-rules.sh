@@ -37,11 +37,33 @@ DROPPED=$(docker logs sentinel-waf1-1 2>&1 | grep -c 'skipping rule (compile err
 IMPSKIP=$(docker logs sentinel-waf1-1 2>&1 | grep -c 'all targets unsupported')
 [ "$DROPPED" = "0" ] && ok "0 rules dropped on compile" || bad "$DROPPED dropped"
 [ "$IMPSKIP" = "0" ] && ok "0 rules skipped for unsupported targets (was 3)" || bad "$IMPSKIP importer skips remain"
-if docker logs sentinel-waf1-1 2>&1 | grep -q 'disabled_rule_ids":"\[\]'; then
-  ok "no rule loaded-but-inert (was 2: 920270, 920271)"
+# The engine logs "rule coverage gap" ONLY when there is a gap, so its absence
+# is the success case. An earlier version of this check looked for the literal
+# string `disabled_rule_ids":"[]"` and therefore failed when the gap closed
+# completely — the line it was reading had stopped being emitted at all.
+#
+# Absence only means something if the engine logged anything, so the ruleset
+# load is confirmed first. Otherwise "no gap reported" would also be true of a
+# container that never started.
+LOADED=$(docker logs sentinel-waf1-1 2>&1 | grep -o '"message":"rule engine loaded","site":"[^"]*","rules":[0-9]*' | tail -1)
+if [ -z "$LOADED" ]; then
+  bad "the engine never reported loading a ruleset — cannot judge coverage"
 else
-  docker logs sentinel-waf1-1 2>&1 | grep -o 'disabled_rule_ids":"[^"]*"' | tail -1
-  bad "some rules are still inert"
+  echo "  engine reports: $LOADED"
+  GAP=$(docker logs sentinel-waf1-1 2>&1 | grep 'rule coverage gap' | tail -1)
+  if [ -z "$GAP" ]; then
+    ok "engine reports NO coverage gap at all (was dropped=6, then disabled=2)"
+  else
+    # A gap remains. Fail only if it names a rule this change claims to fix;
+    # other operators (validateUrlEncoding) were never in scope.
+    STILL=$(echo "$GAP" | grep -oE '920180|920430|920540|920270|920271' | sort -u | tr '\n' ' ')
+    if [ -n "$STILL" ]; then
+      bad "rules this change should have fixed are still not enforced: $STILL"
+    else
+      echo "  residual gap, none of the five: $(echo "$GAP" | grep -o 'disabled_rule_ids":"[^"]*"')"
+      ok "none of the five rules is dropped or inert"
+    fi
+  fi
 fi
 
 echo
