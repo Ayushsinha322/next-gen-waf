@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 // ---------------------------------------------------------------------------
 // Handle type — shared cheap clone passed everywhere
@@ -570,7 +570,7 @@ fn default_limit_status() -> u16 {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WafConfig {
-    #[serde(default)]
+    #[serde(default = "default_waf_mode")]
     pub mode: WafMode,
     #[serde(default = "default_paranoia")]
     pub paranoia_level: u8,
@@ -805,12 +805,43 @@ fn default_threshold() -> u32 {
     5
 }
 
+/// Returns the mode used when a site's config carries no `mode` at all, and says
+/// so loudly.
+///
+/// `Blocking`, deliberately. The control plane already reached this conclusion
+/// for the same case — `buildRustWaf(nil)` yields `"blocking"`, reasoned in
+/// `waf_defaults_test.go` as "such a site has been enforcing all along and
+/// silently switching it to observe-only would disable protection nobody asked to
+/// disable". This side used to answer `Learning`, so the two layers of the same
+/// product disagreed about the same missing field, and the data plane had the
+/// final say. Any path that drops the key — notably `buildRustWaf` being an
+/// allowlist, which stores and echoes back a policy key it does not name while
+/// never forwarding it — turned enforcement off while the console kept showing a
+/// policy. That is the fail-OPEN direction for a security control.
+///
+/// The ERROR cannot name the site: serde defaults run with no surrounding
+/// context. It is still worth emitting, because reaching it at all means the
+/// control plane did not send a mode, and the operator needs to know the data
+/// plane chose one for them.
+fn default_waf_mode() -> WafMode {
+    error!(
+        "site config has no `mode` — defaulting to BLOCKING. The control plane should always \
+         send one; if this appears, a policy key was dropped between the control plane and the \
+         data plane. Set the site's mode explicitly to silence this."
+    );
+    WafMode::Blocking
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum WafMode {
     Off,
-    #[default]
     Learning,
+    /// Default for an ABSENT mode — fail closed. See [`default_waf_mode`] for why
+    /// this is `Blocking` and not `Learning`, and note that a brand-new site
+    /// created through the API is still STORED as `learning` by the control
+    /// plane; that is a different question from how to read a row with no mode.
+    #[default]
     Blocking,
 }
 
@@ -1712,5 +1743,56 @@ sites: []
         let mut cfg: SentinelConfig = serde_yaml::from_str(yaml).expect("parse");
         super::apply_proxy_protocol_env(&mut cfg, Some("https, https-alt".into()));
         assert!(cfg.listeners.iter().all(|l| l.proxy_protocol));
+    }
+
+    // -----------------------------------------------------------------------
+    // WafMode: an ABSENT mode must fail CLOSED
+    // -----------------------------------------------------------------------
+
+    /// A site policy that carries no `mode` must be read as `Blocking`.
+    ///
+    /// The control plane already decided this for the identical case —
+    /// `buildRustWaf(nil)` yields `"blocking"`, and `waf_defaults_test.go`
+    /// reasons it as "such a site has been enforcing all along and silently
+    /// switching it to observe-only would disable protection nobody asked to
+    /// disable". This side answered `Learning`, so the two layers disagreed and
+    /// the data plane won: any path that dropped the key turned enforcement off
+    /// while the console still displayed a policy.
+    #[test]
+    fn a_waf_policy_with_no_mode_defaults_to_blocking() {
+        let waf: WafConfig = serde_yaml::from_str("paranoia_level: 2").expect("parse");
+        assert_eq!(
+            waf.mode,
+            WafMode::Blocking,
+            "an absent mode must fail CLOSED. Defaulting to Learning means a dropped \
+             policy key silently stops enforcing while the console shows a policy."
+        );
+    }
+
+    /// The derived `Default` and the serde default must agree. They are reached by
+    /// different paths — `WafConfig::default()` uses the enum's `#[default]`,
+    /// deserialization uses `default_waf_mode()` — and a WAF whose two defaults
+    /// disagree enforces differently depending on how its config was built.
+    #[test]
+    fn derived_and_serde_defaults_agree() {
+        assert_eq!(WafMode::default(), WafMode::Blocking);
+        assert_eq!(WafConfig::default().mode, WafMode::Blocking);
+        let deserialized: WafConfig = serde_yaml::from_str("{}").expect("parse");
+        assert_eq!(deserialized.mode, WafConfig::default().mode);
+    }
+
+    /// Failing closed must not override an operator who explicitly asked to
+    /// observe. Learning mode is how a false-positive pilot runs, so breaking it
+    /// would break the FPR workflow.
+    #[test]
+    fn an_explicit_mode_is_always_honoured() {
+        for (yaml, want) in [
+            ("mode: learning", WafMode::Learning),
+            ("mode: blocking", WafMode::Blocking),
+            ("mode: off", WafMode::Off),
+        ] {
+            let waf: WafConfig = serde_yaml::from_str(yaml).expect("parse");
+            assert_eq!(waf.mode, want, "{yaml} was not honoured");
+        }
     }
 }

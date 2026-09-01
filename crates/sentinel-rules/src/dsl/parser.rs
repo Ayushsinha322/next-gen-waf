@@ -201,8 +201,14 @@ fn phase_name(input: &str) -> IResult<&str, RulePhase> {
 
 fn target_name(input: &str) -> IResult<&str, Target> {
     alt((
-        value(Target::Args, tag("ARGS")),
+        // ARGS family — longest tags FIRST, for the same reason as the FILES
+        // family below. `tag("ARGS")` matches the prefix of `ARGS_NAMES` and
+        // `ARGS_COMBINED_SIZE`, so with the short tag leading, a hand-written
+        // `ARGS_NAMES` silently compiled to `ARGS` — inspecting values where the
+        // author asked for names.
+        value(Target::ArgsCombinedSize, tag("ARGS_COMBINED_SIZE")),
         value(Target::ArgsNames, tag("ARGS_NAMES")),
+        value(Target::Args, tag("ARGS")),
         value(Target::RequestBody, tag("REQUEST_BODY")),
         value(Target::RequestUri, tag("REQUEST_URI")),
         value(Target::RequestLine, tag("REQUEST_LINE")),

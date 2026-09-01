@@ -54,6 +54,65 @@ fn parse_query_params(query: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// `@validateUrlEncoding`: does this value contain malformed percent-encoding?
+///
+/// A `%` must be followed by exactly two hex digits. Anything else — a stray
+/// `%`, `%zz`, or a `%` cut short by the end of the value — is what ModSecurity
+/// calls URL-encoding abuse, and it matters because the WAF and the origin may
+/// resolve the same bytes differently.
+///
+/// Scanned over BYTES: a multi-byte character cannot be a hex digit, and going
+/// through `chars()` would only cost work.
+fn has_invalid_url_encoding(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            // Two bytes must FOLLOW index i, so the last valid start is len-3.
+            if i + 2 >= b.len() {
+                return true; // truncated: "…%" or "…%A"
+            }
+            if !b[i + 1].is_ascii_hexdigit() || !b[i + 2].is_ascii_hexdigit() {
+                return true;
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// `@validateUtf8Encoding`: do this value's percent-escapes decode to something
+/// that is not valid UTF-8?
+///
+/// Catches overlong forms (`%c0%af` for `/`, `%e0%80%80` for NUL), surrogate
+/// halves (`%ed%a0%80`), truncated sequences and out-of-range lead bytes. These
+/// are decoder-differential attacks: a filter comparing decoded ASCII sees
+/// nothing, while the origin's decoder yields the dangerous character.
+///
+/// ⚠️ Two-part check, and the second part is a deliberate approximation.
+/// `parse_query_params` decodes with `decode_utf8_lossy`, so by the time an
+/// `ARGS` value reaches an operator its invalid bytes have ALREADY been replaced
+/// by U+FFFD and the originals are unrecoverable. Validating only the escapes
+/// (part 1) would therefore make this operator inert for the exact targets CRS
+/// 920250 names — the "present but cannot fire" failure this change exists to
+/// remove. So a residual U+FFFD is treated as evidence of that lossy decode.
+///
+/// The cost is a narrow false positive: a client that legitimately sends U+FFFD
+/// (valid UTF-8: `EF BF BD`) is indistinguishable from one whose bytes were
+/// mangled. Accepted because 920250 is WARNING severity, contributes 3 to an
+/// anomaly score rather than blocking alone, and is gated off by CRS default.
+fn has_invalid_utf8_encoding(s: &str) -> bool {
+    if s.as_bytes().contains(&b'%') {
+        let raw: Vec<u8> = percent_encoding::percent_decode_str(s).collect();
+        if std::str::from_utf8(&raw).is_err() {
+            return true;
+        }
+    }
+    s.contains('\u{FFFD}')
+}
+
 fn percent_decode(s: &str) -> String {
     percent_encoding::percent_decode_str(s)
         .decode_utf8_lossy()
@@ -843,6 +902,18 @@ fn extract_target(spec: &TargetSpec, ctx: &RequestContext) -> Vec<String> {
         TargetSpec::Files => multipart_parts(ctx).filenames,
         TargetSpec::FilesNames => multipart_parts(ctx).field_names,
         TargetSpec::FilesCombinedSize => vec![multipart_parts(ctx).combined_size.to_string()],
+        TargetSpec::ArgsCombinedSize => {
+            // ModSecurity counts BOTH sides of every argument: the name and the
+            // value. Counting values alone would under-report a request that
+            // smuggles its payload into parameter names, which is exactly the
+            // shape 920390 exists to bound.
+            let total: usize = parse_query_params(ctx.uri.query().unwrap_or(""))
+                .iter()
+                .chain(body_args(ctx).iter())
+                .map(|(k, v)| k.len() + v.len())
+                .sum();
+            vec![total.to_string()]
+        }
         TargetSpec::RemoteAddr => vec![ctx.client_ip.to_string()],
         TargetSpec::Geo => vec![], // TODO: GeoIP in Phase 2
         TargetSpec::TxVar(name) => ctx
@@ -1342,6 +1413,32 @@ pub fn evaluate(
                     let matched = hit.is_some();
                     record_match(&mut last_matched, hit);
                     debug!(matched, "ValidateByteRange");
+                    stack.push(StackVal::Bool(matched));
+                }
+            }
+
+            Instruction::ValidateUrlEncoding => {
+                let values = pop_strings(&mut stack);
+                if values.is_empty() {
+                    stack.push(StackVal::Absent);
+                } else {
+                    let hit = values.iter().find(|v| has_invalid_url_encoding(v));
+                    let matched = hit.is_some();
+                    record_match(&mut last_matched, hit);
+                    debug!(matched, "ValidateUrlEncoding");
+                    stack.push(StackVal::Bool(matched));
+                }
+            }
+
+            Instruction::ValidateUtf8Encoding => {
+                let values = pop_strings(&mut stack);
+                if values.is_empty() {
+                    stack.push(StackVal::Absent);
+                } else {
+                    let hit = values.iter().find(|v| has_invalid_utf8_encoding(v));
+                    let matched = hit.is_some();
+                    record_match(&mut last_matched, hit);
+                    debug!(matched, "ValidateUtf8Encoding");
                     stack.push(StackVal::Bool(matched));
                 }
             }
@@ -2415,5 +2512,114 @@ mod xml_tests {
         assert!(pairs.iter().any(|(k, v)| k == "a" && v == "hello"));
         let _ = parse_xml_args(b"<a href=\"unterminated");
         let _ = parse_xml_args(b"<![CDATA[unterminated");
+    }
+}
+
+/// `@validateUrlEncoding` and `@validateUtf8Encoding`.
+///
+/// Both back CRS rules that were compiled to `Never` — present in the ruleset,
+/// counted as loaded, unable to match. The malformed cases below are the reason
+/// the operators exist; the well-formed ones guard the other direction, because a
+/// protocol validator that fires on ordinary traffic is worse than a missing one.
+#[cfg(test)]
+mod encoding_validator_tests {
+    use super::*;
+
+    #[test]
+    fn url_encoding_validator_accepts_well_formed_input() {
+        for ok in [
+            "",
+            "plain",
+            "%41",
+            "%41%42%43",
+            "a%2Fb",
+            "%ff",
+            "%FF",
+            "no-percent-at-all/path?x=1",
+            // '+' is a space in form encoding, not an escape, and is not abuse.
+            "a+b",
+        ] {
+            assert!(
+                !has_invalid_url_encoding(ok),
+                "{ok:?} is valid percent-encoding but was flagged"
+            );
+        }
+    }
+
+    #[test]
+    fn url_encoding_validator_rejects_malformed_input() {
+        for bad in [
+            "%",              // bare percent
+            "%2",             // one hex digit then end
+            "%zz",            // non-hex
+            "%2z",            // second digit non-hex
+            "%z2",            // first digit non-hex
+            "a%",             // truncated at end of a longer value
+            "a%4",            // truncated at end of a longer value
+            "ok%41%",         // valid escape followed by a bare percent
+            "%%3cscript%%3e", // doubled percent, the classic evasion shape
+        ] {
+            assert!(
+                has_invalid_url_encoding(bad),
+                "{bad:?} is malformed percent-encoding and should have been flagged"
+            );
+        }
+    }
+
+    #[test]
+    fn utf8_validator_rejects_overlong_and_surrogate_forms() {
+        // These are the sequences the operator exists for: each decodes to a
+        // character a naive ASCII comparison never sees.
+        for bad in [
+            "%c0%af",       // overlong '/'
+            "%e0%80%80",    // overlong NUL
+            "%ed%a0%80",    // UTF-16 surrogate half
+            "%f0%80%80%80", // overlong, 4-byte form
+            "%ff",          // invalid lead byte
+            "%c3",          // truncated 2-byte sequence
+            "/etc%c0%afpasswd",
+        ] {
+            assert!(
+                has_invalid_utf8_encoding(bad),
+                "{bad:?} decodes to invalid UTF-8 and should have been flagged"
+            );
+        }
+    }
+
+    #[test]
+    fn utf8_validator_accepts_valid_encodings() {
+        for ok in [
+            "",
+            "plain-ascii",
+            "%41%42",
+            "%c3%a9",       // é, correctly encoded
+            "%e2%82%ac",    // €
+            "%f0%9f%92%a9", // 4-byte emoji
+            "café",         // already-decoded valid UTF-8
+            "%zz",          // malformed ESCAPE, not malformed UTF-8 — 920220's job
+        ] {
+            assert!(
+                !has_invalid_utf8_encoding(ok),
+                "{ok:?} is valid UTF-8 but was flagged"
+            );
+        }
+    }
+
+    /// The documented approximation, asserted so it stays deliberate: a value
+    /// that already went through `decode_utf8_lossy` keeps only U+FFFD, and that
+    /// residue is what makes the operator work on `ARGS` at all.
+    #[test]
+    fn utf8_validator_treats_lossy_decode_residue_as_invalid() {
+        let lossy = percent_decode("%e0%80%80");
+        assert!(
+            lossy.contains('\u{FFFD}'),
+            "expected the lossy decoder to leave U+FFFD, got {lossy:?}"
+        );
+        assert!(
+            has_invalid_utf8_encoding(&lossy),
+            "an ARGS value whose bytes were already destroyed by the lossy decoder \
+             must still be detectable, or the operator is inert for the targets \
+             CRS 920250 names"
+        );
     }
 }

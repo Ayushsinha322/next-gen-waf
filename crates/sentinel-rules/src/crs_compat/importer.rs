@@ -60,9 +60,14 @@ pub fn import_secrule_conf_dir(
 
                 if let Some(ref mut pending) = pending_chain {
                     // This directive is a chain member — add its condition.
-                    let targets = parse_crs_target_str(&dir.targets);
+                    // A chain MEMBER usually carries no id of its own, so attribute
+                    // it to the chain STARTER — the rule an operator would have to
+                    // look up, and the one that goes silent if this link cannot
+                    // compile.
+                    let chain_id = actions.id.or(Some(pending.id));
+                    let targets = parse_crs_target_str(&dir.targets, chain_id);
                     let (op_name, op_pat) = parse_crs_operator(&dir.operator);
-                    match crs_op_to_operator(&op_name, &op_pat, data_dir) {
+                    match crs_op_to_operator(&op_name, &op_pat, data_dir, chain_id) {
                         Ok(operator) => {
                             // Chain members may have empty targets (bare operator
                             // that applies to the previously matched value) — we
@@ -186,7 +191,7 @@ fn secrule_directive_to_rule_with_actions(
 
     let phase = actions.phase.unwrap_or(RulePhase::RequestBody);
 
-    let targets = parse_crs_target_str(targets_str);
+    let targets = parse_crs_target_str(targets_str, Some(rule_id));
     if targets.is_empty() {
         warn!(
             rule_id,
@@ -197,7 +202,7 @@ fn secrule_directive_to_rule_with_actions(
     }
 
     let (op_name, op_pattern) = parse_crs_operator(operator_str);
-    let operator = crs_op_to_operator(&op_name, &op_pattern, data_dir)?;
+    let operator = crs_op_to_operator(&op_name, &op_pattern, data_dir, Some(rule_id))?;
 
     let rule_action = match actions.action {
         CrsAction::Block | CrsAction::Deny => {
@@ -254,11 +259,11 @@ pub fn secrule_directive_to_rule(
     secrule_directive_to_rule_with_actions(targets_str, operator_str, &actions, None)
 }
 
-fn parse_crs_target_str(s: &str) -> Vec<TargetExpr> {
+fn parse_crs_target_str(s: &str, rule_id: Option<u32>) -> Vec<TargetExpr> {
     let mut out: Vec<TargetExpr> = split_crs_targets(s)
         .into_iter()
         .filter_map(|tok| {
-            token_to_target(&tok).map(|target| TargetExpr {
+            token_to_target(&tok, rule_id).map(|target| TargetExpr {
                 target,
                 combinator: Some(TargetCombinator::Or),
             })
@@ -270,7 +275,7 @@ fn parse_crs_target_str(s: &str) -> Vec<TargetExpr> {
     out
 }
 
-fn token_to_target(tok: &str) -> Option<Target> {
+fn token_to_target(tok: &str, rule_id: Option<u32>) -> Option<Target> {
     let tok = tok.trim();
     if let Some(rest) = tok.strip_prefix('!') {
         let _ = rest;
@@ -318,6 +323,7 @@ fn token_to_target(tok: &str) -> Option<Target> {
         "FILES" => Some(Target::Files),
         "FILES_NAMES" => Some(Target::FilesNames),
         "FILES_COMBINED_SIZE" => Some(Target::FilesCombinedSize),
+        "ARGS_COMBINED_SIZE" => Some(Target::ArgsCombinedSize),
         // No on-disk temp files in a streaming proxy; per-file sizes unmodeled.
         "FILES_TMPNAMES" | "FILES_SIZES" | "FILES_TMP_CONTENT" => None,
         // XML/SOAP bodies are flattened into ARGS by the VM (element text,
@@ -341,6 +347,7 @@ fn token_to_target(tok: &str) -> Option<Target> {
         "MULTIPART_NAME" => Some(Target::FilesNames),
         other => {
             warn!(
+                rule_id,
                 target = other,
                 "CRS importer: unknown target token, skipping"
             );
@@ -391,7 +398,9 @@ fn interp_cmp_for(op: &str) -> Option<InterpCmp> {
         "lt" => InterpCmp::Lt,
         "streq" => InterpCmp::Streq,
         "within" => InterpCmp::Within,
-        "endswith" | "endsWith" => InterpCmp::EndsWith,
+        // Lowercase only — see the note on `unconditionalmatch`. The camelCase
+        // alternate was dead, not harmful, because the lowercase arm precedes it.
+        "endswith" => InterpCmp::EndsWith,
         _ => return None,
     })
 }
@@ -439,10 +448,16 @@ fn parse_byte_ranges(spec: &str) -> Result<Vec<(u8, u8)>> {
     Ok(out)
 }
 
+/// `rule_id` is carried purely so the "disabled" and "unknown" warnings can name
+/// the rule they silenced. Without it the log said only which OPERATOR was
+/// unsupported, leaving an operator to grep the CRS sources by hand to learn what
+/// coverage they had actually lost — which is why four disabled rules sat
+/// unnoticed for months.
 pub(crate) fn crs_op_to_operator(
     op_name: &str,
     pattern: &str,
     data_dir: Option<&std::path::Path>,
+    rule_id: Option<u32>,
 ) -> Result<Operator> {
     // `%{...}` patterns cannot be compiled to a fixed pattern; they are expanded
     // per request instead (Operator::Interpolated).
@@ -473,6 +488,7 @@ pub(crate) fn crs_op_to_operator(
             }
             None => {
                 warn!(
+                    rule_id,
                     op = op_name,
                     pattern,
                     "CRS importer: `%{{...}}` interpolation is not supported for this \
@@ -485,7 +501,7 @@ pub(crate) fn crs_op_to_operator(
     }
 
     if let Some(inner_name) = op_name.strip_prefix('!') {
-        let inner = crs_op_to_operator(inner_name, pattern, data_dir)?;
+        let inner = crs_op_to_operator(inner_name, pattern, data_dir, rule_id)?;
         return Ok(Operator::Not(Box::new(inner)));
     }
 
@@ -557,8 +573,14 @@ pub(crate) fn crs_op_to_operator(
             let words: Vec<String> = pattern.split_whitespace().map(String::from).collect();
             Ok(Operator::ContainsWord(words))
         }
-        "exists" | "unconditionalMatch" => Ok(Operator::Exists),
-        "noMatch" => Ok(Operator::Not(Box::new(Operator::Exists))),
+        // `parse_crs_operator` lowercases the operator name, so these arms MUST be
+        // spelled in lowercase. They were written in ModSecurity's camelCase and
+        // were therefore unreachable: `@unconditionalMatch` fell through to the
+        // catch-all and compiled to `Never`, which is the entire reason CRS 901320
+        // could not fire. `@noMatch` had the same defect but appears nowhere in
+        // shipped CRS, so it cost nothing — yet.
+        "exists" | "unconditionalmatch" => Ok(Operator::Exists),
+        "nomatch" => Ok(Operator::Not(Box::new(Operator::Exists))),
         // Real libinjection-based detection (tokenising SQLi/XSS analysis),
         // replacing the previous coarse regex approximations.
         "detectsqli" => Ok(Operator::DetectSqli),
@@ -593,9 +615,14 @@ pub(crate) fn crs_op_to_operator(
         // encoding of an internal address. Mapping it here restores the coverage those
         // rules were written to provide instead of leaving them inert.
         "rbl" => Ok(Operator::SsrfUrl),
-        "validateurlencoding"
-        | "validateutf8encoding"
-        | "validateschema"
+        // Both encoding validators are now implemented instead of disabled. They
+        // backed CRS 920220/920240 (URL encoding abuse) and 920250 (UTF-8
+        // encoding abuse); each sat in a chain CHILD, so compiling the child to
+        // `Never` made the whole chain unable to fire while the parent rule still
+        // counted as loaded.
+        "validateurlencoding" => Ok(Operator::ValidateUrlEncoding),
+        "validateutf8encoding" => Ok(Operator::ValidateUtf8Encoding),
+        "validateschema"
         | "validatedtd"
         | "verifycc"
         | "verifycpf"
@@ -610,6 +637,7 @@ pub(crate) fn crs_op_to_operator(
         | "inspectfile"
         | "lookup" => {
             warn!(
+                rule_id,
                 op = op_name,
                 "CRS importer: unsupported operator '{op_name}' — rule disabled"
             );
@@ -617,6 +645,7 @@ pub(crate) fn crs_op_to_operator(
         }
         other => {
             warn!(
+                rule_id,
                 op = other,
                 "CRS importer: unknown operator '{other}' — rule disabled"
             );

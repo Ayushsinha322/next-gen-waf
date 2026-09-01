@@ -36,6 +36,7 @@ pub enum TargetSpec {
     Files,
     FilesNames,
     FilesCombinedSize,
+    ArgsCombinedSize,
     MultipartPartHeadersAll,
     MultipartPartHeader(String),
     RemoteAddr,
@@ -76,6 +77,7 @@ impl TargetSpec {
             TargetSpec::Files => "FILES".into(),
             TargetSpec::FilesNames => "FILES_NAMES".into(),
             TargetSpec::FilesCombinedSize => "FILES_COMBINED_SIZE".into(),
+            TargetSpec::ArgsCombinedSize => "ARGS_COMBINED_SIZE".into(),
             TargetSpec::MultipartPartHeadersAll => "MULTIPART_PART_HEADERS".into(),
             TargetSpec::MultipartPartHeader(p) => format!("MULTIPART_PART_HEADERS:{p}"),
             TargetSpec::RemoteAddr => "REMOTE_ADDR".into(),
@@ -113,6 +115,7 @@ impl From<&Target> for TargetSpec {
             Target::Files => TargetSpec::Files,
             Target::FilesNames => TargetSpec::FilesNames,
             Target::FilesCombinedSize => TargetSpec::FilesCombinedSize,
+            Target::ArgsCombinedSize => TargetSpec::ArgsCombinedSize,
             Target::MultipartPartHeaders(None) => TargetSpec::MultipartPartHeadersAll,
             Target::MultipartPartHeaders(Some(p)) => TargetSpec::MultipartPartHeader(p.clone()),
             Target::RemoteAddr => TargetSpec::RemoteAddr,
@@ -188,6 +191,14 @@ pub enum Instruction {
     ValidateByteRange {
         ranges: Vec<(u8, u8)>,
     },
+
+    /// Pop `StrVec`, push `Bool(any value contains malformed percent-encoding)`.
+    /// `@validateUrlEncoding`.
+    ValidateUrlEncoding,
+
+    /// Pop `StrVec`, push `Bool(any value's percent-escapes decode to invalid
+    /// UTF-8)`. `@validateUtf8Encoding`.
+    ValidateUtf8Encoding,
 
     /// Always push `Bool(false)` — used for intentionally disabled rules.
     Never,
