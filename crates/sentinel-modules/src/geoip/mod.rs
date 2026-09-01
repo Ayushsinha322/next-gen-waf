@@ -297,3 +297,146 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod synthetic_db_tests {
+    use super::*;
+    use std::net::IpAddr;
+    use std::path::PathBuf;
+
+    /// A SYNTHETIC database, built by `tools/mkgeoip-testdb` using MaxMind's
+    /// Apache-2.0 writer and containing no MaxMind data — only RFC 5737
+    /// documentation ranges and RFC 1918 private space mapped to arbitrary
+    /// country codes.
+    ///
+    /// It exists because the enforcement path had NO test: a real GeoLite2 file
+    /// cannot be committed (MaxMind requires an account and forbids
+    /// redistribution), so "country blocking blocks" was an assumption for the
+    /// entire life of the feature. It is useless for real geolocation and
+    /// sufficient to prove the path.
+    fn test_db() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/GeoLite2-Country-test.mmdb")
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().expect("test ip")
+    }
+
+    #[test]
+    fn the_reader_loads_the_database_and_resolves_countries() {
+        let geo = GeoIp::from_path(test_db(), vec![], vec![]);
+        assert!(
+            geo.is_active() || geo.country(ip("203.0.113.5")).is_some(),
+            "the database did not load — a fixture that cannot be read proves nothing"
+        );
+        assert_eq!(geo.country(ip("203.0.113.5")).as_deref(), Some("CN"));
+        assert_eq!(geo.country(ip("198.51.100.7")).as_deref(), Some("RU"));
+        assert_eq!(geo.country(ip("192.0.2.9")).as_deref(), Some("US"));
+        // An address outside every mapped range must be Unknown, not a guess.
+        assert_eq!(geo.country(ip("8.8.8.8")), None);
+    }
+
+    /// The claim the product makes and never tested: a configured country block
+    /// actually blocks.
+    #[test]
+    fn a_blocked_country_is_blocked_and_others_are_not() {
+        let geo = GeoIp::from_path(test_db(), vec!["CN".into(), "RU".into()], vec![]);
+        assert!(geo.is_active(), "database + rules should be active");
+
+        assert!(
+            matches!(geo.check(ip("203.0.113.5")), GeoVerdict::Block { .. }),
+            "CN is on the block list and must be blocked"
+        );
+        assert!(
+            matches!(geo.check(ip("198.51.100.7")), GeoVerdict::Block { .. }),
+            "RU is on the block list and must be blocked"
+        );
+        assert!(
+            matches!(geo.check(ip("192.0.2.9")), GeoVerdict::Allow),
+            "US is not on the block list and must pass"
+        );
+        // Unknown must NOT be treated as blocked — that would turn a lookup miss
+        // into an outage for anyone the database does not cover.
+        assert!(matches!(geo.check(ip("8.8.8.8")), GeoVerdict::Unknown));
+    }
+
+    /// Allow-only mode is the stricter posture and inverts the default.
+    #[test]
+    fn allow_only_mode_rejects_everything_else() {
+        let geo = GeoIp::from_path(test_db(), vec![], vec!["US".into()]);
+        assert!(geo.is_active());
+        assert!(
+            matches!(geo.check(ip("192.0.2.9")), GeoVerdict::Allow),
+            "US is allowed"
+        );
+        assert!(
+            matches!(geo.check(ip("203.0.113.5")), GeoVerdict::Block { .. }),
+            "CN is not on the allow list and must be blocked"
+        );
+    }
+
+    /// Case-insensitivity, because an operator will type "cn".
+    #[test]
+    fn country_codes_are_case_insensitive() {
+        let geo = GeoIp::from_path(test_db(), vec!["cn".into()], vec![]);
+        assert!(matches!(
+            geo.check(ip("203.0.113.5")),
+            GeoVerdict::Block { .. }
+        ));
+    }
+
+    /// The inert case, against the SAME code path — rules configured, database
+    /// absent. This is what every deployment has actually been running.
+    #[test]
+    fn rules_without_a_database_are_inert_and_say_so() {
+        let geo = GeoIp::from_path(
+            "/nonexistent/GeoLite2-Country.mmdb",
+            vec!["CN".into()],
+            vec![],
+        );
+        assert!(
+            !geo.is_active(),
+            "no database means not active, however many rules are configured"
+        );
+        assert_eq!(geo.country(ip("203.0.113.5")), None);
+        assert!(
+            matches!(geo.check(ip("203.0.113.5")), GeoVerdict::Unknown),
+            "a blocked country passes when there is no database — the defect this reports"
+        );
+    }
+}
+
+#[cfg(test)]
+mod fixture_guard {
+    use std::path::PathBuf;
+
+    /// The enforcement tests above are only meaningful if the fixture is present
+    /// AND non-trivial. A missing file made four of them fail loudly the first
+    /// time, which was the right outcome — but a TRUNCATED or empty file could
+    /// plausibly load and resolve nothing, and then the tests would pass while
+    /// asserting nothing. Pin the shape.
+    #[test]
+    fn the_synthetic_fixture_is_present_and_plausible() {
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/GeoLite2-Country-test.mmdb");
+        let meta = std::fs::metadata(&p).unwrap_or_else(|e| {
+            panic!(
+                "GeoIP test fixture missing at {}: {e}. Rebuild it with \
+                 tools/mkgeoip-testdb — without it the country-blocking tests \
+                 prove nothing.",
+                p.display()
+            )
+        });
+        assert!(
+            meta.len() > 512,
+            "fixture is {} bytes — too small to contain the 5 networks it should",
+            meta.len()
+        );
+        let bytes = std::fs::read(&p).expect("read fixture");
+        // Every mmdb ends with this marker followed by the metadata section.
+        assert!(
+            bytes.windows(14).any(|w| w == b"\xab\xcd\xefMaxMind.com"),
+            "fixture has no MaxMind metadata marker — not a valid mmdb"
+        );
+    }
+}

@@ -92,3 +92,6 @@ __pycache__/
 
 # GeoIP database — operator-supplied, MaxMind licence forbids redistribution
 deploy/docker/geoip/*.mmdb
+
+# built helper binary; the SOURCE and the generated fixture are committed
+tools/mkgeoip-testdb/mkgeoip-testdb
