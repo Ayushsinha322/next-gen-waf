@@ -2520,13 +2520,10 @@ pub(crate) async fn run_pipeline(
     );
 
     let resp = async move {
-        match proxy(state, peer, req, default_site, tls_fp).await {
-            Ok(r) => r,
-            Err(e) => {
-                error!("proxy error: {e:#}");
-                error_response(StatusCode::BAD_GATEWAY, "Bad Gateway")
-            }
-        }
+        // `proxy` logs its own failures and always yields a response — see the
+        // note on it. The Ok/Err match that used to live here is exactly how 502s
+        // came to be unlogged.
+        proxy(state, peer, req, default_site, tls_fp).await
     }
     .instrument(span)
     .await;
@@ -2542,7 +2539,55 @@ pub(crate) async fn run_pipeline(
     resp
 }
 
+/// Handle one request, returning a response and NEVER an error.
+///
+/// Wraps `proxy_inner` so that a failure inside the pipeline is still a LOGGED
+/// request. Previously `proxy` returned `Result` and its caller answered a bare
+/// 502 with no access-log line, no waf.log entry and no ClickHouse row — while
+/// `inc_requests()` still fired, so /metrics could never be reconciled with the
+/// event store. Origin-down and no-matching-site were both completely invisible
+/// in the WAF's own logs: a NOC watching this product could not see that the
+/// thing behind it had stopped answering.
+///
+/// Same bug class as the unlogged blocklist blocks fixed in 598bcc4. That one was
+/// fixed and this instance was missed, which is why the fix is structural here —
+/// the context now lives OUTSIDE the fallible work, so there is no path that can
+/// return a response without one.
 async fn proxy(
+    state: Arc<ServerState>,
+    peer: SocketAddr,
+    req: Request<BoxBody>,
+    default_site: Option<String>,
+    tls_fp: Option<String>,
+) -> Response<BoxBody> {
+    // Created here, not inside the fallible body, so every exit has a context to
+    // log from.
+    let mut ctx = RequestContext::new(peer.ip(), peer.port());
+    match proxy_inner(&mut ctx, state, peer, req, default_site, tls_fp).await {
+        Ok(r) => r,
+        Err(e) => {
+            // The error text is the operator's only clue about WHY the gateway
+            // failed — origin refused, no site matched, body unreadable — so it
+            // goes on the log line rather than only into a tracing event that
+            // nothing aggregates.
+            error!(
+                request_id = %ctx.request_id,
+                client_ip = %ctx.client_ip,
+                "proxy error: {e:#}"
+            );
+            let resp = error_response(StatusCode::BAD_GATEWAY, "Bad Gateway");
+            stamp_response(&mut ctx, &resp);
+            ctx.gateway_error = Some(cap_field(&format!("{e:#}"), 512));
+            ctx.advance_phase(Phase::Logging);
+            log_request(&ctx);
+            resp
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn proxy_inner(
+    ctx: &mut RequestContext,
     state: Arc<ServerState>,
     peer: SocketAddr,
     mut req: Request<BoxBody>,
@@ -2561,7 +2606,8 @@ async fn proxy(
     };
 
     // --- Phase 0: Connection ---
-    let mut ctx = RequestContext::new(peer.ip(), peer.port());
+    // ctx is owned by `proxy` above so that a failure anywhere below is still a
+    // logged request rather than a silent 502.
     // Resolve the REAL client IP from X-Forwarded-For when the immediate peer is
     // a trusted proxy (our HAProxy in the shipped HA topology). Without this,
     // behind the LB every per-IP control (anti-DDoS, IP-reputation, rate-limit,
@@ -2659,10 +2705,10 @@ async fn proxy(
         // Named so `classify_nonrule_block` files it under IPREP rather than
         // inventing an "anomaly threshold exceeded" verdict for a score of 0.
         ctx.block_reason = Some("ip reputation: source is on the node blocklist".into());
-        let resp = block_response(&ctx);
-        stamp_response(&mut ctx, &resp);
+        let resp = block_response(ctx);
+        stamp_response(ctx, &resp);
         ctx.advance_phase(Phase::Logging);
-        log_request(&ctx);
+        log_request(ctx);
         return Ok(resp);
     }
 
@@ -2672,10 +2718,10 @@ async fn proxy(
             ctx.decision = WafDecision::Block;
             ctx.block_reason = Some(reason);
             note_block(&state, ctx.client_ip);
-            let resp = block_response(&ctx);
-            stamp_response(&mut ctx, &resp);
+            let resp = block_response(ctx);
+            stamp_response(ctx, &resp);
             ctx.advance_phase(Phase::Logging);
-            log_request(&ctx);
+            log_request(ctx);
             return Ok(resp);
         }
         DdosVerdict::Allow => {}
@@ -2689,10 +2735,10 @@ async fn proxy(
                 ctx.decision = WafDecision::Block;
                 ctx.block_reason = Some(format!("IP reputation: {reason}"));
                 note_block(&state, ctx.client_ip);
-                let resp = block_response(&ctx);
-                stamp_response(&mut ctx, &resp);
+                let resp = block_response(ctx);
+                stamp_response(ctx, &resp);
                 ctx.advance_phase(Phase::Logging);
-                log_request(&ctx);
+                log_request(ctx);
                 return Ok(resp);
             }
             IpVerdict::Suspect { tags } => {
@@ -2727,10 +2773,10 @@ async fn proxy(
                     ctx.decision = WafDecision::Block;
                     ctx.block_reason = Some(format!("threat intel: {reason}"));
                     note_block(&state, ctx.client_ip);
-                    let resp = block_response(&ctx);
-                    stamp_response(&mut ctx, &resp);
+                    let resp = block_response(ctx);
+                    stamp_response(ctx, &resp);
                     ctx.advance_phase(Phase::Logging);
-                    log_request(&ctx);
+                    log_request(ctx);
                     return Ok(resp);
                 }
                 ThreatVerdict::Score { score, tag } => {
@@ -2875,9 +2921,9 @@ async fn proxy(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Service Unavailable — site is initializing",
             );
-            stamp_response(&mut ctx, &resp);
+            stamp_response(ctx, &resp);
             ctx.advance_phase(Phase::Logging);
-            log_request(&ctx);
+            log_request(ctx);
             return Ok(resp);
         }
     }
@@ -2890,7 +2936,7 @@ async fn proxy(
                 let uri_len = ctx.uri.to_string().len() as u32;
                 if uri_len > s.waf.max_uri_length {
                     if let Some(resp) = enforce_request_limit(
-                        &mut ctx,
+                        ctx,
                         s,
                         format!(
                             "URI too long: {} bytes (limit {})",
@@ -2908,7 +2954,7 @@ async fn proxy(
                 let hcount = ctx.request_headers.len() as u32;
                 if hcount > s.waf.max_header_count {
                     if let Some(resp) = enforce_request_limit(
-                        &mut ctx,
+                        ctx,
                         s,
                         format!(
                             "too many headers: {} (limit {})",
@@ -2933,7 +2979,7 @@ async fn proxy(
                     .any(|a| a.eq_ignore_ascii_case(&m))
                 {
                     if let Some(resp) = enforce_request_limit(
-                        &mut ctx,
+                        ctx,
                         s,
                         format!("method not allowed: {m}"),
                         StatusCode::METHOD_NOT_ALLOWED,
@@ -2949,7 +2995,7 @@ async fn proxy(
     // WAF phase 1: rate limit → bot → GeoIP → rule engine → plugins.
     {
         let pr = state.plugin_runtime.load();
-        phase1_headers(&mut ctx, site, &engine_map, &state.modules, &pr).await?;
+        phase1_headers(ctx, site, &engine_map, &state.modules, &pr).await?;
     }
 
     // Browser challenge (Proof-of-Work) — serve an interstitial or, if the
@@ -2961,10 +3007,10 @@ async fn proxy(
         let challenge_mode = bot_cfg
             .map(|b| b.challenge)
             .unwrap_or(ChallengeMode::NativePow);
-        if let Some(resp) = challenge_response(&mut ctx, challenge_mode, bot_cfg).await {
-            stamp_response(&mut ctx, &resp);
+        if let Some(resp) = challenge_response(ctx, challenge_mode, bot_cfg).await {
+            stamp_response(ctx, &resp);
             ctx.advance_phase(Phase::Logging);
-            log_request(&ctx);
+            log_request(ctx);
             return Ok(resp);
         }
         // Cleared (or an in-line grant for an unsafe method) — proceed to origin.
@@ -2985,11 +3031,11 @@ async fn proxy(
             // logged server-side but never leaked to the client.
             error_response(StatusCode::UNAUTHORIZED, "Unauthorized")
         } else {
-            block_response(&ctx)
+            block_response(ctx)
         };
-        stamp_response(&mut ctx, &resp);
+        stamp_response(ctx, &resp);
         ctx.advance_phase(Phase::Logging);
-        log_request(&ctx);
+        log_request(ctx);
         return Ok(resp);
     }
 
@@ -3015,7 +3061,7 @@ async fn proxy(
             let upper = body.size_hint().upper().unwrap_or(0);
             if upper > max_bytes {
                 if let Some(resp) = enforce_request_limit(
-                    &mut ctx,
+                    ctx,
                     site_ref,
                     format!("request body too large (limit {} bytes)", max_bytes),
                     StatusCode::PAYLOAD_TOO_LARGE,
@@ -3043,7 +3089,7 @@ async fn proxy(
                     Ok(ScanBuffer::Complete(b)) => b,
                     Ok(ScanBuffer::Oversize { prefix, rest }) => {
                         if let Some(resp) = enforce_request_limit(
-                            &mut ctx,
+                            ctx,
                             site_ref,
                             format!("request body too large (limit {} bytes)", max_bytes),
                             StatusCode::PAYLOAD_TOO_LARGE,
@@ -3075,9 +3121,9 @@ async fn proxy(
                         ctx.decision = WafDecision::Block;
                         ctx.block_reason = Some("request body read timed out (slow-body)".into());
                         let resp = error_response(StatusCode::REQUEST_TIMEOUT, "Request Timeout");
-                        stamp_response(&mut ctx, &resp);
+                        stamp_response(ctx, &resp);
                         ctx.advance_phase(Phase::Logging);
-                        log_request(&ctx);
+                        log_request(ctx);
                         return Ok(resp);
                     }
                 }
@@ -3089,9 +3135,9 @@ async fn proxy(
                     ctx.decision = WafDecision::Block;
                     ctx.block_reason = Some("request body read timed out (slow-body)".into());
                     let resp = error_response(StatusCode::REQUEST_TIMEOUT, "Request Timeout");
-                    stamp_response(&mut ctx, &resp);
+                    stamp_response(ctx, &resp);
                     ctx.advance_phase(Phase::Logging);
-                    log_request(&ctx);
+                    log_request(ctx);
                     return Ok(resp);
                 }
             }
@@ -3111,7 +3157,7 @@ async fn proxy(
             passthrough
         } else {
             ctx.request_body = Some(bytes.clone());
-            phase2_body(&mut ctx, site, &engine_map, &state.ml_engine)?;
+            phase2_body(ctx, site, &engine_map, &state.ml_engine)?;
 
             // GraphQL firewall — query depth / complexity / introspection on the
             // body. Gated to GraphQL endpoints so nested REST-JSON bodies aren't
@@ -3170,18 +3216,18 @@ async fn proxy(
             if ctx.decision == WafDecision::Limit {
                 // Soft-deny from weighted fusion — throttle with 429 (configurable),
                 // do not auto-ban (uncertain traffic).
-                let resp = limit_response(&ctx, site);
-                stamp_response(&mut ctx, &resp);
+                let resp = limit_response(ctx, site);
+                stamp_response(ctx, &resp);
                 ctx.advance_phase(Phase::Logging);
-                log_request(&ctx);
+                log_request(ctx);
                 return Ok(resp);
             }
             if ctx.decision == WafDecision::Block {
                 note_block(&state, ctx.client_ip);
-                let resp = block_response(&ctx);
-                stamp_response(&mut ctx, &resp);
+                let resp = block_response(ctx);
+                stamp_response(ctx, &resp);
                 ctx.advance_phase(Phase::Logging);
-                log_request(&ctx);
+                log_request(ctx);
                 return Ok(resp);
             }
 
@@ -3347,7 +3393,7 @@ async fn proxy(
             let site_id = site_cfg.id.clone();
             let ws_engine = engine_map.get(&site_id).cloned().map(Arc::new);
             ctx.advance_phase(Phase::Logging);
-            log_request(&ctx);
+            log_request(ctx);
 
             // Spawn background relay after returning 101 to the client.
             tokio::spawn(async move {
@@ -3461,24 +3507,20 @@ async fn proxy(
                     // (1) Response-body rule engine (CRS RESPONSE-* etc.).
                     if let Some(engine) = resp_engine {
                         ctx.response_body = Some(bytes.clone());
-                        engine.evaluate(
-                            &mut ctx,
-                            Phase::ResponseBody,
-                            site_cfg.waf.anomaly_threshold,
-                        );
+                        engine.evaluate(ctx, Phase::ResponseBody, site_cfg.waf.anomaly_threshold);
                         // Respect learning mode (downgrade Block → Log).
-                        let gm = governing_mode(&ctx, &site_cfg.waf.mode);
-                        enforce_mode(&mut ctx, &gm);
+                        let gm = governing_mode(ctx, &site_cfg.waf.mode);
+                        enforce_mode(ctx, &gm);
                         if ctx.decision == WafDecision::Block {
                             warn!(
                                 site = %site_cfg.id,
                                 client_ip = %ctx.client_ip,
                                 "response-body rule matched — blocking"
                             );
-                            let resp = block_response(&ctx);
-                            stamp_response(&mut ctx, &resp);
+                            let resp = block_response(ctx);
+                            stamp_response(ctx, &resp);
                             ctx.advance_phase(Phase::Logging);
-                            log_request(&ctx);
+                            log_request(ctx);
                             return Ok(resp);
                         }
                     }
@@ -3496,8 +3538,8 @@ async fn proxy(
                                     ));
                                     // Learning mode downgrades Block → Log —
                                     // must not block or rewrite, only record.
-                                    let gm = governing_mode(&ctx, &site_cfg.waf.mode);
-                                    enforce_mode(&mut ctx, &gm);
+                                    let gm = governing_mode(ctx, &site_cfg.waf.mode);
+                                    enforce_mode(ctx, &gm);
                                     if ctx.decision == WafDecision::Block {
                                         warn!(
                                             site = %site_cfg.id,
@@ -3505,10 +3547,10 @@ async fn proxy(
                                             pattern = matched,
                                             "DLP: sensitive data in response — blocking"
                                         );
-                                        let resp = block_response(&ctx);
-                                        stamp_response(&mut ctx, &resp);
+                                        let resp = block_response(ctx);
+                                        stamp_response(ctx, &resp);
                                         ctx.advance_phase(Phase::Logging);
-                                        log_request(&ctx);
+                                        log_request(ctx);
                                         return Ok(resp);
                                     }
                                     warn!(
@@ -3594,7 +3636,7 @@ async fn proxy(
         })
         .unwrap_or(0);
     ctx.advance_phase(Phase::Logging);
-    log_request(&ctx);
+    log_request(ctx);
 
     Ok(Response::from_parts(resp_parts, final_body))
 }
@@ -4755,6 +4797,57 @@ fn build_geoip_map(cfg: &SentinelConfig) -> GeoIpMap {
         }
     }
     map
+}
+
+/// What country filtering is CONFIGURED versus what is actually ENFORCED.
+///
+/// These differ silently, and that is the whole reason this exists. `GeoIp`
+/// degrades to a no-op when the MaxMind database is absent — it logs once at
+/// startup and then answers `Unknown` for every address, so a site configured to
+/// block `["CN","RU"]` blocks nothing while the console reports the policy as
+/// set. No `.mmdb` has ever shipped in any bundle and no compose file passed a
+/// path, so on every deployment to date this control has been inert.
+///
+/// `GeoIp::is_active()` already computed the truth and NOTHING called it outside
+/// a unit test. The signal existed and was thrown away.
+///
+/// Same shape, and same remedy, as the `ebpf` block below: kernel XDP silently
+/// ran in software for six weeks with a single startup WARN as the only trace,
+/// until /healthz was made to say so.
+fn geoip_status(cfg: &SentinelConfig, map: &GeoIpMap) -> serde_json::Value {
+    let mut configured = 0usize;
+    let mut active = 0usize;
+    let mut inert: Vec<serde_json::Value> = Vec::new();
+    for site in &cfg.sites {
+        let Some(gc) = site.waf.geoip.as_ref() else {
+            continue;
+        };
+        // A geoip block with no country rules is configuration, not enforcement.
+        if gc.block_countries.is_empty() && gc.allow_countries.is_empty() {
+            continue;
+        }
+        configured += 1;
+        if map.get(&site.id).is_some_and(|g| g.is_active()) {
+            active += 1;
+        } else {
+            inert.push(serde_json::json!({
+                "site": site.id,
+                "db_path": gc.db_path,
+                "db_present": std::path::Path::new(&gc.db_path).exists(),
+                "block_countries": gc.block_countries,
+                "allow_countries": gc.allow_countries,
+            }));
+        }
+    }
+    serde_json::json!({
+        // Sites whose policy asks for country filtering.
+        "configured": configured,
+        // Sites where it is actually enforceable (database loaded AND rules set).
+        "active": active,
+        // The gap, named. Non-empty means the product is showing a control it is
+        // not applying — read this before trusting a country block.
+        "inert": inert,
+    })
 }
 
 fn build_anti_ddos(cfg: &SentinelConfig) -> AntiDdos {
@@ -6185,6 +6278,10 @@ fn health_response(state: &ServerState) -> Response<BoxBody> {
             "xdp_drop": ebpf_stats.xdp_drop,
             "xdp_aborted": ebpf_stats.xdp_aborted,
         },
+        // Country filtering: what is CONFIGURED vs what is ENFORCED. `inert` is
+        // the field that matters — non-empty means a site's country policy is
+        // displayed and not applied, because no MaxMind database is present.
+        "geoip": geoip_status(&state.config.load(), &state.modules.geoip_map.load()),
         "upstreams_healthy": pool_stats.healthy,
         "upstreams_total": pool_stats.total,
         "version": env!("CARGO_PKG_VERSION"),
@@ -7464,6 +7561,11 @@ fn ndjson_log(ctx: &RequestContext) {
         // Learning mode: the request passed through, but a rule *would* have
         // blocked it. Marked distinctly so the learning report can aggregate it.
         _ if ctx.would_block => "DETECT",
+        // The request never reached an origin. Distinct from PASS, which is what
+        // it used to say: a 502 logged as "action":"PASS" tells an operator the
+        // request was served when it was not, and makes gateway failures
+        // unfindable by filtering on action.
+        _ if ctx.gateway_error.is_some() => "ERROR",
         _ => "PASS",
     };
     let site = ctx.site_id.as_deref().unwrap_or("-");
@@ -7528,7 +7630,15 @@ fn ndjson_log(ctx: &RequestContext) {
     // case covers GeoIP / rate-limit / bot-challenge / smuggling blocks that were
     // downgraded to Log in learning mode and carry no rule match — without it the
     // learning report (which consumes only waf.log) undercounts would-have-blocks.
-    if !ctx.rule_matches.is_empty() || matches!(ctx.decision, WafDecision::Block) || ctx.would_block
+    // Gateway errors are included: they carry no rule match and are not a Block,
+    // so they fell through this gate and their reason lived ONLY in the tracing
+    // output — which is the container-log correlation this stream exists to
+    // avoid. An operator filtering waf.log for why the origin stopped answering
+    // found nothing.
+    if !ctx.rule_matches.is_empty()
+        || matches!(ctx.decision, WafDecision::Block)
+        || ctx.would_block
+        || ctx.gateway_error.is_some()
     {
         let top = ctx.rule_matches.first();
         let sev_str = top
@@ -7540,6 +7650,10 @@ fn ndjson_log(ctx: &RequestContext) {
         // report can categorize them instead of collapsing them into "-"/"other".
         let (rule, attack): (&str, &str) = match top {
             Some(r) => (r.rule_id.as_str(), r.message.as_str()),
+            // A gateway failure is an availability event, not an attack. Given
+            // its own stable label so it is queryable without polluting the
+            // attack breakdown with "the origin is down".
+            None if ctx.gateway_error.is_some() => ("GATEWAY", "Upstream or routing failure"),
             None => classify_nonrule_block(ctx.block_reason.as_deref().unwrap_or("")),
         };
 
@@ -7594,7 +7708,12 @@ fn ndjson_log(ctx: &RequestContext) {
             "latency_ms": format!("{:.2}", ctx.elapsed_ms()),
             "ua":     ua,
             "referer": referer,
-            "msg":    ctx.block_reason.as_deref().unwrap_or(""),
+            // For a gateway error this is the ONLY place the cause is recorded
+            // in a structured stream: origin refused vs no site matched vs
+            // unreadable body.
+            "msg":    ctx.gateway_error.as_deref()
+                          .or(ctx.block_reason.as_deref())
+                          .unwrap_or(""),
             "message": message,
             "remediation": remediation,
             "would_block": ctx.would_block,
@@ -9526,6 +9645,134 @@ mod accept_error_tests {
             steps += 1;
             assert!(steps < 16, "backoff should reach its ceiling quickly");
         }
+    }
+}
+
+#[cfg(test)]
+mod geoip_honesty_tests {
+    use super::*;
+    use sentinel_core::config::{GeoIpConfig, SentinelConfig, SiteConfig, UpstreamConfig};
+
+    /// SiteConfig has no `Default`, so this mirrors `site_with` in the inline-rule
+    /// tests above rather than inventing a second shape.
+    fn bare_site(id: &str) -> SiteConfig {
+        SiteConfig {
+            id: id.into(),
+            tenant_id: String::new(),
+            domains: vec![format!("{id}.local")],
+            upstream: UpstreamConfig {
+                load_balancer: sentinel_core::config::LoadBalancerStrategy::RoundRobin,
+                servers: vec![],
+                health_check: None,
+                timeout_secs: None,
+                websocket: false,
+                host_header: None,
+                keepalive: true,
+                connect_timeout_secs: None,
+                sni_name: None,
+            },
+            waf: WafConfig {
+                mode: WafMode::Blocking,
+                ..Default::default()
+            },
+            plugins: vec![],
+            tls: Default::default(),
+            origin: Default::default(),
+        }
+    }
+
+    fn site_with_geoip(id: &str, db: &str, block: Vec<&str>) -> SiteConfig {
+        let mut s = bare_site(id);
+        s.waf.geoip = Some(GeoIpConfig {
+            db_path: db.into(),
+            block_countries: block.into_iter().map(String::from).collect(),
+            allow_countries: vec![],
+        });
+        s
+    }
+
+    /// The defect this pins: a site configured to block countries, with no
+    /// MaxMind database anywhere, reported nothing at all. `GeoIp` degrades to a
+    /// no-op that answers Unknown for every address, so the block passed all
+    /// traffic while the console showed the policy as set. No `.mmdb` has ever
+    /// shipped in any bundle, so this was every deployment.
+    #[test]
+    fn a_country_block_with_no_database_is_reported_as_inert() {
+        let cfg = SentinelConfig {
+            sites: vec![site_with_geoip(
+                "shop",
+                "/nonexistent/GeoLite2-Country.mmdb",
+                vec!["CN", "RU"],
+            )],
+            ..Default::default()
+        };
+        let map = build_geoip_map(&cfg);
+        let st = geoip_status(&cfg, &map);
+
+        assert_eq!(st["configured"], 1, "the policy asks for country filtering");
+        assert_eq!(
+            st["active"], 0,
+            "it cannot be enforced without a database and must not be counted as active"
+        );
+        let inert = st["inert"].as_array().expect("inert array");
+        assert_eq!(inert.len(), 1, "the gap must be named, not merely counted");
+        assert_eq!(inert[0]["site"], "shop");
+        assert_eq!(
+            inert[0]["db_present"], false,
+            "the report must say the database is missing — that is the actionable part"
+        );
+    }
+
+    /// A geoip block with no country rules is configuration, not a claim of
+    /// enforcement, and must not be reported as an unmet one — otherwise the
+    /// field cries wolf and stops being read.
+    #[test]
+    fn geoip_configured_with_no_countries_is_not_counted() {
+        let cfg = SentinelConfig {
+            sites: vec![site_with_geoip("shop", "/nonexistent.mmdb", vec![])],
+            ..Default::default()
+        };
+        let st = geoip_status(&cfg, &build_geoip_map(&cfg));
+        assert_eq!(st["configured"], 0);
+        assert_eq!(st["inert"].as_array().unwrap().len(), 0);
+    }
+
+    /// A site with no geoip block at all contributes nothing.
+    #[test]
+    fn a_site_without_geoip_is_absent_from_the_report() {
+        let cfg = SentinelConfig {
+            sites: vec![bare_site("plain")],
+            ..Default::default()
+        };
+        let st = geoip_status(&cfg, &build_geoip_map(&cfg));
+        assert_eq!(st["configured"], 0);
+        assert_eq!(st["active"], 0);
+        assert_eq!(st["inert"].as_array().unwrap().len(), 0);
+    }
+
+    /// Several sites, mixed state — the counts must not collapse into a single
+    /// boolean, because "some sites enforce and some do not" is the situation an
+    /// operator actually has to act on.
+    #[test]
+    fn multiple_configured_sites_are_each_accounted_for() {
+        let cfg = SentinelConfig {
+            sites: vec![
+                site_with_geoip("a", "/nope-a.mmdb", vec!["CN"]),
+                site_with_geoip("b", "/nope-b.mmdb", vec!["RU"]),
+                bare_site("c"),
+            ],
+            ..Default::default()
+        };
+        let st = geoip_status(&cfg, &build_geoip_map(&cfg));
+        assert_eq!(st["configured"], 2);
+        assert_eq!(st["active"], 0);
+        let names: Vec<&str> = st["inert"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["site"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["a", "b"]);
     }
 }
 

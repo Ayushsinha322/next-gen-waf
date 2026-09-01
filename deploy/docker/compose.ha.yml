@@ -222,6 +222,10 @@ services:
       # service because a service-level `volumes:` replaces the anchor's.
       - /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro
       - sentinel-certs:/var/lib/sentinel/certs   # shared cert repository (ACME/uploaded)
+      # Operator-supplied GeoIP database, read-only. Empty by default — see
+      # geoip/README.md. When absent the WAF logs an ERROR and reports the gap at
+      # /healthz -> geoip.inert rather than pretending country rules apply.
+      - ${SENTINEL_GEOIP_DIR:-./geoip}:/var/lib/sentinel/geoip:ro
       - waf1-state:/var/lib/sentinel/state       # this node's last-good config cache
     ports:
       # MANAGEMENT console (HTTPS — admin UI + API), LOOPBACK-ONLY BY DEFAULT.
@@ -288,6 +292,10 @@ services:
       # uploads still land on waf1 alone — the control plane's cert API points at
       # the `dataplane` alias, which waf1 owns.
       - sentinel-certs:/var/lib/sentinel/certs
+      # Operator-supplied GeoIP database, read-only. Empty by default — see
+      # geoip/README.md. When absent the WAF logs an ERROR and reports the gap at
+      # /healthz -> geoip.inert rather than pretending country rules apply.
+      - ${SENTINEL_GEOIP_DIR:-./geoip}:/var/lib/sentinel/geoip:ro
       - waf2-state:/var/lib/sentinel/state
   waf3:
     <<: *wafnode
@@ -316,6 +324,10 @@ services:
       # uploads still land on waf1 alone — the control plane's cert API points at
       # the `dataplane` alias, which waf1 owns.
       - sentinel-certs:/var/lib/sentinel/certs
+      # Operator-supplied GeoIP database, read-only. Empty by default — see
+      # geoip/README.md. When absent the WAF logs an ERROR and reports the gap at
+      # /healthz -> geoip.inert rather than pretending country rules apply.
+      - ${SENTINEL_GEOIP_DIR:-./geoip}:/var/lib/sentinel/geoip:ro
       - waf3-state:/var/lib/sentinel/state
 
   lb:

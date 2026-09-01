@@ -1505,3 +1505,63 @@ async fn host_header_override_does_not_affect_site_matching() {
     );
     shutdown_proxy(tx, jh).await;
 }
+
+/// A gateway failure must still be a RESPONSE, not a dropped connection — and
+/// (verified live, since the log file is written by a process-wide writer that a
+/// test cannot redirect without racing) it must now be logged.
+///
+/// The defect: `proxy` returned `Result` and its caller answered a bare 502 with
+/// no access-log line, no waf.log entry and no ClickHouse row, while
+/// `inc_requests()` still fired — so /metrics could never be reconciled with the
+/// event store, and origin-down was invisible in the WAF's own logs. `proxy` now
+/// owns the request context OUTSIDE the fallible work, so the type system leaves
+/// no path that returns a response without one.
+#[tokio::test]
+async fn a_dead_upstream_yields_a_logged_502_not_a_dropped_connection() {
+    // A port nothing is listening on. Deliberately not a port we bound and
+    // closed — that can be reused by the OS between bind and connect.
+    let dead_port = next_port();
+    let port = next_port();
+    let (tx, jh) = start_proxy(test_config(
+        port,
+        dead_port,
+        "REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
+        WafMode::Blocking,
+    ))
+    .await;
+
+    let (status, _body) = send_request(port, "test-site.local", "/anything", Method::GET, "").await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_GATEWAY,
+        "a dead origin must produce 502, not a hang or a closed connection"
+    );
+    shutdown_proxy(tx, jh).await;
+}
+
+/// A request whose Host matches no site is the OTHER unlogged-502 path, and the
+/// one seen on .71: `no matching site for host`. Correct routing behaviour, but
+/// it was equally invisible.
+#[tokio::test]
+async fn an_unmatched_host_yields_502_rather_than_silence() {
+    let (up_addr, _up) = start_mock_upstream().await;
+    let port = next_port();
+    let mut cfg = test_config(
+        port,
+        up_addr.port(),
+        "REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
+        WafMode::Blocking,
+    );
+    // Remove the catch-all so an unknown Host really matches nothing.
+    cfg.listeners[0].default_site = None;
+    let (tx, jh) = start_proxy(cfg).await;
+
+    let (status, _b) = send_request(port, "nobody.invalid", "/", Method::GET, "").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_GATEWAY,
+        "an unmatched Host must get a real response the client can act on"
+    );
+    shutdown_proxy(tx, jh).await;
+}

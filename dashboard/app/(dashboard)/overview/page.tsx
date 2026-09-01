@@ -84,7 +84,7 @@ export default function OverviewPage() {
   const [stats, setStats]     = useState<DashboardStats | null>(null);
   const [metrics, setMetrics] = useState<MetricsSnapshot | null>(null);
   const [feed, setFeed]       = useState<FeedRow[]>([]);
-  const [wafStatus, setWafStatus] = useState<{ running: boolean; uptime?: number; sites?: number; upstreams_healthy?: number; upstreams_total?: number; http3?: { enabled: boolean; listener?: string; bind?: string; advertise_port?: number } } | null>(null);
+  const [wafStatus, setWafStatus] = useState<{ running: boolean; uptime?: number; sites?: number; upstreams_healthy?: number; upstreams_total?: number; http3?: { enabled: boolean; listener?: string; bind?: string; advertise_port?: number }; geoip?: { configured: number; active: number; inert: { site: string; db_path: string; db_present: boolean }[] } } | null>(null);
   const [plugins, setPlugins] = useState<number | null>(null);
   const [instances, setInstances] = useState<number | null>(null);
   // Blocked-by-country lives ONLY in ClickHouse (the hub's by_country snapshot
@@ -381,7 +381,7 @@ export default function OverviewPage() {
         <TopAttackers />
         <SystemHealth
           wafRunning={wafStatus === null ? null : wafStatus.running}
-          geoCountries={geoLoaded ? Object.keys(byCountry).length : 0}
+          geoip={wafStatus?.geoip}
         />
       </motion.div>
 
@@ -615,7 +615,9 @@ function titleCase(s: string): string {
 
 type HLevel = "g" | "a" | "r" | "gr";
 
-function SystemHealth({ wafRunning, geoCountries }: { wafRunning: boolean | null; geoCountries: number }) {
+type GeoIpStatus = { configured: number; active: number; inert: { site: string; db_path: string; db_present: boolean }[] };
+
+function SystemHealth({ wafRunning, geoip }: { wafRunning: boolean | null; geoip?: GeoIpStatus }) {
   const [health, setHealth]   = useState<ClusterHealth | null>(null);
   const [ml, setMl]           = useState<MLStats | null>(null);
   const [ti, setTi]           = useState<ThreatIntelSummary | null>(null);
@@ -643,6 +645,22 @@ function SystemHealth({ wafRunning, geoCountries }: { wafRunning: boolean | null
     : wafRunning === null && !health   ? { level: "gr", text: "Checking system status…" }
     : { level: "g", text: "All Systems Operational" };
 
+  // Resolved before the array so the ternaries stay readable.
+  const gi = geoip;
+  const geoInert = gi?.inert?.length ?? 0;
+  const geo: { name: string; value: string; level: HLevel } =
+    !gi
+      ? { name: "GeoIP Database", value: "—", level: "gr" }
+      : geoInert > 0
+        // Configured and NOT enforced. Red, and it says why — a missing database
+        // is an operator action, not a transient state.
+        ? { name: "GeoIP Database",
+            value: `NOT enforced · no database · ${geoInert} site${geoInert === 1 ? "" : "s"}`,
+            level: "r" }
+        : gi.active > 0
+          ? { name: "GeoIP Database", value: `Active · ${gi.active} site${gi.active === 1 ? "" : "s"}`, level: "g" }
+          : { name: "GeoIP Database", value: "Not configured", level: "gr" };
+
   const rows: { name: string; level: HLevel; value: string }[] = [
     dp
       ? { name: "Data Plane Nodes", value: `${dp.healthy}/${dp.total} healthy`,
@@ -650,7 +668,14 @@ function SystemHealth({ wafRunning, geoCountries }: { wafRunning: boolean | null
       : { name: "Data Plane Nodes", value: "—", level: "gr" },
     { name: "ML Engine",         value: ml ? titleCase(ml.model_status || "unknown") : "—", level: mlActive ? "g" : ml ? "a" : "gr" },
     { name: "Rule Engine",       value: wafRunning === null ? "—" : wafRunning ? "Active" : "Inactive", level: wafRunning === null ? "gr" : wafRunning ? "g" : "r" },
-    { name: "GeoIP Database",    value: geoCountries > 0 ? `Active · ${geoCountries} countries` : "Awaiting events", level: geoCountries > 0 ? "g" : "gr" },
+    // GeoIP state comes from the DATA PLANE (/waf/status -> /healthz), not from
+    // how many countries happen to appear in recent events. Inferring it from
+    // event data was actively misleading: with no MaxMind database the WAF
+    // resolves every address to Unknown, so no country ever appears, and this row
+    // read "Awaiting events" — which sounds like normal startup rather than a
+    // configured control that is not running. `inert` is the data plane naming
+    // the sites whose country policy is displayed and not applied.
+    geo,
     { name: "Threat Intel Feeds", value: ti ? (ti.total_active > 0 ? `${ti.total_active.toLocaleString()} indicators` : "No IOCs loaded") : "—", level: ti ? (ti.total_active > 0 ? "g" : "a") : "gr" },
     { name: "WASM Sandbox",      value: plugins === null ? "—" : plugins > 0 ? `${plugins} plugin${plugins === 1 ? "" : "s"} loaded` : "Idle", level: plugins && plugins > 0 ? "g" : "gr" },
   ];

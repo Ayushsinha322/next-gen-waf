@@ -178,6 +178,18 @@ pub struct RequestContext {
     pub decision: WafDecision,
     /// Human-readable reason for a Block/Challenge decision.
     pub block_reason: Option<String>,
+    /// Set when the request could not be served at all — origin refused, no site
+    /// matched, body unreadable — i.e. the paths that answer 502.
+    ///
+    /// Explicit rather than reusing `block_reason`, because a gateway failure is
+    /// NOT a WAF decision: `classify_nonrule_block` would try to turn it into a
+    /// rule/attack label and the dashboard's attack breakdown would gain a
+    /// category for "the origin is down", which is an availability event, not an
+    /// attack.
+    ///
+    /// Exists because these requests used to produce no log record whatsoever
+    /// while `inc_requests()` still counted them.
+    pub gateway_error: Option<String>,
     /// True when the WAF *would* have blocked/challenged this request but the
     /// site is in Learning mode, so the decision was downgraded to Log. Drives
     /// the learning report (would-have-blocked aggregation) without affecting
@@ -238,6 +250,7 @@ impl RequestContext {
             tx_vars: HashMap::new(),
             decision: WafDecision::Allow,
             block_reason: None,
+            gateway_error: None,
             would_block: false,
             threat_intel_hit: false,
             upstream_addr: None,
