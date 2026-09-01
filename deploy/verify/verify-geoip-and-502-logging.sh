@@ -50,13 +50,38 @@ echo "    request with an unmatched Host returned: $CODE"
 [ "$CODE" = "502" ] && ok "still answers 502 (correct routing behaviour)" || bad "expected 502, got $CODE"
 sleep 4
 if grep -qh "$MARK" $LOGDIR/waf*/access.log 2>/dev/null; then
-  ok "the 502 IS logged now — it was completely invisible before"
-  grep -h "$MARK" $LOGDIR/waf*/access.log 2>/dev/null | tail -1 | python3 -c "
+  ok "the 502 IS logged in access.log — it was completely invisible before"
+  ACC=$(grep -h "$MARK" $LOGDIR/waf*/access.log 2>/dev/null | tail -1)
+  echo "$ACC" | python3 -c "
 import sys, json
 d = json.loads(sys.stdin.readline())
-print('    status=%s path=%s ip=%s' % (d.get('status'), d.get('path'), d.get('ip')))
-print('    msg=%s' % (d.get('msg') or '<none>')[:110])
+print('    access: status=%s action=%s site=%s' % (d.get('status'), d.get('action'), d.get('site')))
+" 
+  # The first live run of this check caught two things the unit tests could not:
+  # action said PASS on a 502, and there was no waf.log line at all, so the
+  # failure REASON existed only in container logs.
+  ACT=$(echo "$ACC" | python3 -c "import sys,json;print(json.loads(sys.stdin.readline()).get('action'))")
+  [ "$ACT" = "ERROR" ] \
+    && ok "action=ERROR, not PASS — a 502 no longer claims the request was served" \
+    || bad "action=$ACT on a 502 — filtering by action cannot find gateway failures"
+
+  RID=$(echo "$ACC" | python3 -c "import sys,json;print(json.loads(sys.stdin.readline())['request_id'])")
+  if grep -qh "$RID" $LOGDIR/waf*/waf.log 2>/dev/null; then
+    ok "a matching waf.log line exists (joined by request_id)"
+    grep -h "$RID" $LOGDIR/waf*/waf.log 2>/dev/null | tail -1 | python3 -c "
+import sys, json
+d = json.loads(sys.stdin.readline())
+print('    waf.log: rule=%s attack=%s' % (d.get('rule'), d.get('attack')))
+print('    reason : %s' % (d.get('msg') or '<none>')[:110])
 "
+    REASON=$(grep -h "$RID" $LOGDIR/waf*/waf.log 2>/dev/null | tail -1 \
+             | python3 -c "import sys,json;print(json.loads(sys.stdin.readline()).get('msg') or '')")
+    [ -n "$REASON" ] \
+      && ok "the CAUSE is on a structured record, not only in container logs" \
+      || bad "waf.log line has no reason — an operator still has to read container logs"
+  else
+    bad "no waf.log line for the 502 — the reason lives only in container logs"
+  fi
 else
   bad "the 502 left NO access-log line — still invisible"
 fi

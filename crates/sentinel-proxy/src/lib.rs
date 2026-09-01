@@ -2577,7 +2577,7 @@ async fn proxy(
             );
             let resp = error_response(StatusCode::BAD_GATEWAY, "Bad Gateway");
             stamp_response(&mut ctx, &resp);
-            ctx.block_reason = Some(cap_field(&format!("gateway error: {e:#}"), 512));
+            ctx.gateway_error = Some(cap_field(&format!("{e:#}"), 512));
             ctx.advance_phase(Phase::Logging);
             log_request(&ctx);
             resp
@@ -7561,6 +7561,11 @@ fn ndjson_log(ctx: &RequestContext) {
         // Learning mode: the request passed through, but a rule *would* have
         // blocked it. Marked distinctly so the learning report can aggregate it.
         _ if ctx.would_block => "DETECT",
+        // The request never reached an origin. Distinct from PASS, which is what
+        // it used to say: a 502 logged as "action":"PASS" tells an operator the
+        // request was served when it was not, and makes gateway failures
+        // unfindable by filtering on action.
+        _ if ctx.gateway_error.is_some() => "ERROR",
         _ => "PASS",
     };
     let site = ctx.site_id.as_deref().unwrap_or("-");
@@ -7625,7 +7630,15 @@ fn ndjson_log(ctx: &RequestContext) {
     // case covers GeoIP / rate-limit / bot-challenge / smuggling blocks that were
     // downgraded to Log in learning mode and carry no rule match — without it the
     // learning report (which consumes only waf.log) undercounts would-have-blocks.
-    if !ctx.rule_matches.is_empty() || matches!(ctx.decision, WafDecision::Block) || ctx.would_block
+    // Gateway errors are included: they carry no rule match and are not a Block,
+    // so they fell through this gate and their reason lived ONLY in the tracing
+    // output — which is the container-log correlation this stream exists to
+    // avoid. An operator filtering waf.log for why the origin stopped answering
+    // found nothing.
+    if !ctx.rule_matches.is_empty()
+        || matches!(ctx.decision, WafDecision::Block)
+        || ctx.would_block
+        || ctx.gateway_error.is_some()
     {
         let top = ctx.rule_matches.first();
         let sev_str = top
@@ -7637,6 +7650,10 @@ fn ndjson_log(ctx: &RequestContext) {
         // report can categorize them instead of collapsing them into "-"/"other".
         let (rule, attack): (&str, &str) = match top {
             Some(r) => (r.rule_id.as_str(), r.message.as_str()),
+            // A gateway failure is an availability event, not an attack. Given
+            // its own stable label so it is queryable without polluting the
+            // attack breakdown with "the origin is down".
+            None if ctx.gateway_error.is_some() => ("GATEWAY", "Upstream or routing failure"),
             None => classify_nonrule_block(ctx.block_reason.as_deref().unwrap_or("")),
         };
 
@@ -7691,7 +7708,12 @@ fn ndjson_log(ctx: &RequestContext) {
             "latency_ms": format!("{:.2}", ctx.elapsed_ms()),
             "ua":     ua,
             "referer": referer,
-            "msg":    ctx.block_reason.as_deref().unwrap_or(""),
+            // For a gateway error this is the ONLY place the cause is recorded
+            // in a structured stream: origin refused vs no site matched vs
+            // unreadable body.
+            "msg":    ctx.gateway_error.as_deref()
+                          .or(ctx.block_reason.as_deref())
+                          .unwrap_or(""),
             "message": message,
             "remediation": remediation,
             "would_block": ctx.would_block,
