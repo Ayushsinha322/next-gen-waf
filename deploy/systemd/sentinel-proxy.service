@@ -27,7 +27,13 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 Environment=SENTINEL_CONFIG=/etc/sentinel/sentinel.yaml
 Environment=SENTINEL_LOG_DIR=/var/log/sentinel
-Environment=RUST_LOG=info,sentinel=debug
+# `sentinel=debug` did the OPPOSITE of what it looks like: it silenced the whole
+# sentinel-modules crate (geoip, bot_detect, dlp, jwt_auth, anti_ddos,
+# rate_limit, ip_reputation, threat_intel, smuggling, tls_fingerprint, graphql,
+# grpc) instead of raising its level, because `sentinel` is not a module-path
+# prefix of `sentinel_modules`. Someone asking for more logging got none.
+# For a per-crate level, name the crate exactly: sentinel_modules=debug.
+Environment=RUST_LOG=info
 Environment=RUST_BACKTRACE=1
 
 # Bind to privileged ports (80/443) without root via ambient capabilities

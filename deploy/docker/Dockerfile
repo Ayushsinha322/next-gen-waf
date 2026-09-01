@@ -90,7 +90,16 @@ COPY --from=rust-builder /src/target/release/sentinel-bin /usr/local/bin/sentine
 COPY rules ./rules
 ENV SENTINEL_CONFIG=/etc/sentinel/sentinel.yaml \
     SENTINEL_LOG_DIR=/var/log/sentinel \
-    RUST_LOG=info,sentinel=info
+    # Just `info`. A `sentinel=info` directive here silently disabled every log
+    # line from the sentinel-modules crate — geoip, bot_detect, dlp, jwt_auth,
+    # anti_ddos, rate_limit, ip_reputation, threat_intel, smuggling,
+    # tls_fingerprint, graphql, grpc. Twelve subsystems, invisible on every
+    # deployment, which is why GeoIP's "database not found" warning went
+    # unnoticed for months. Proven on .71 by toggling only this value.
+    #
+    # This is the IMAGE default, so it is the value anyone running the container
+    # without compose inherits — the place a fix is most easily missed.
+    RUST_LOG=info
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/sentinel"]
 

@@ -334,6 +334,16 @@ mod synthetic_db_tests {
         assert_eq!(geo.country(ip("192.0.2.9")).as_deref(), Some("US"));
         // An address outside every mapped range must be Unknown, not a guess.
         assert_eq!(geo.country(ip("8.8.8.8")), None);
+        // The private ranges too. The live test on .71 mapped the compose bridge
+        // to CN and then did NOT block, and this is the assertion that was
+        // missing to tell "fixture does not cover it" from "enforcement is
+        // broken" — the unit tests only ever checked the documentation ranges.
+        assert_eq!(
+            geo.country(ip("172.18.0.1")).as_deref(),
+            Some("CN"),
+            "the compose bridge range must resolve, or a live test using it proves nothing"
+        );
+        assert_eq!(geo.country(ip("10.1.2.3")).as_deref(), Some("GB"));
     }
 
     /// The claim the product makes and never tested: a configured country block

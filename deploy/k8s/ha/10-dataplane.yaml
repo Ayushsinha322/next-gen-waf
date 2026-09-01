@@ -67,7 +67,10 @@ spec:
             - { name: mgmt, containerPort: 9443 }   # admin console (reverse-proxied)
           env:
             - { name: SENTINEL_CONFIG, value: /etc/sentinel/sentinel.yaml }
-            - { name: RUST_LOG, value: "info,sentinel=info" }
+            # `sentinel=info` silently disabled ALL sentinel-modules logging
+            # (geoip, bot, dlp, jwt, ddos, rate-limit, threat-intel, ...). Proven
+            # on .71: removing it makes the lines appear. See compose.ha.yml.
+            - { name: RUST_LOG, value: "info" }
             # Shared rate-limit state so limits are fleet-wide (points at the HA Redis).
             - { name: SENTINEL_REDIS_URL, value: "redis://sentinel-redis:6379" }
             # ClickHouse writer: the data plane bulk-inserts traffic + WAF events

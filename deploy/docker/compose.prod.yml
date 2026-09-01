@@ -377,7 +377,28 @@ services:
       # disk; the logs volume is not otherwise bounded.
       SENTINEL_LOG_MAX_MB: ${SENTINEL_LOG_MAX_MB:-100}
       SENTINEL_LOG_KEEP: ${SENTINEL_LOG_KEEP:-5}
-      RUST_LOG: info,sentinel=info
+      # RUST_LOG is deliberately just `info`, with NO per-crate directive.
+      #
+      # It was `info,sentinel=info`, and that `sentinel=info` SILENTLY DISABLED every
+      # log line from the `sentinel-modules` crate. Proven on .71 by changing only this
+      # value and restarting one node: with the directive, zero sentinel_modules lines
+      # in the container's entire lifetime; without it, the GeoIP lines appear
+      # immediately.
+      #
+      # The directive looked redundant with the global `info` and was worse than
+      # redundant. `sentinel` is not a module-path prefix of `sentinel_modules`, so the
+      # targeted directive does not match it, and its presence stops the bare level
+      # applying as the default for that target.
+      #
+      # What was lost: sentinel-modules is geoip, bot_detect, dlp, jwt_auth, anti_ddos,
+      # rate_limit, ip_reputation, threat_intel, smuggling, tls_fingerprint, graphql and
+      # grpc — TWELVE subsystems whose warnings and errors were invisible on every
+      # deployment. It is why the GeoIP "database not found" warning went unnoticed for
+      # months: it was being emitted and filtered.
+      #
+      # If a per-crate level is ever wanted, name the crate exactly
+      # (`sentinel_modules=debug`), and check the output before believing it.
+      RUST_LOG: info
       # Shared secret so the control plane can reach the loopback-only cert API.
       SENTINEL_INTERNAL_SECRET: ${SENTINEL_INTERNAL_SECRET}
       # NOTE: SENTINEL_REDIS_URL is intentionally NOT set here. This is a single

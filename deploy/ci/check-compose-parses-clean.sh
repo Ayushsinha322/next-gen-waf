@@ -386,6 +386,42 @@ check_https_is_ha() {
 }
 check_https_is_ha
 
+# ── RUST_LOG must not carry a `sentinel=` directive ──────────────────────────
+#
+# `RUST_LOG=info,sentinel=info` silently disabled EVERY log line from the
+# sentinel-modules crate: geoip, bot_detect, dlp, jwt_auth, anti_ddos,
+# rate_limit, ip_reputation, threat_intel, smuggling, tls_fingerprint, graphql,
+# grpc. Twelve subsystems, invisible on every deployment. `sentinel` is not a
+# module-path prefix of `sentinel_modules`, so the targeted directive never
+# matched it and its presence stopped the bare `info` applying as the default.
+#
+# Proven on .71 by toggling only this value and restarting one node: with the
+# directive, zero sentinel_modules lines in the container's whole lifetime;
+# without it, the GeoIP lines appear immediately. It is also why GeoIP's
+# "database not found" warning went unnoticed for months — emitted and filtered.
+#
+# grep, not compose rendering: this must also catch the Dockerfile ENV and the
+# k8s manifests, which are the copies a fix is most easily missed in.
+check_rust_log_directives() {
+  printf '\n%s==> RUST_LOG does not silence a crate%s\n\n' "$B" "$R"
+  local hits
+  # --exclude-dir=ci, and the directive must appear AFTER RUST_LOG on the line.
+  # Without both, this check matched ITS OWN message text and reported the guard
+  # as the violation — the same self-match that made `pkill -f` kill its own SSH
+  # session and `pgrep -cf` report a process that was not running.
+  hits=$(grep -rn --exclude-dir=ci "RUST_LOG" deploy/ 2>/dev/null \
+         | grep -v '^[^:]*:[0-9]*:[[:space:]]*#' \
+         | grep -E "RUST_LOG.*sentinel[a-z_]*=" || true)
+  if [[ -z "$hits" ]]; then
+    printf '  %s✓%s no per-crate sentinel=* directive in any RUST_LOG\n' "$GRN" "$R"
+  else
+    printf '  %s✗%s RUST_LOG carries a sentinel=* directive — this silences sentinel-modules entirely:\n' "$RED" "$R"
+    printf '      %s\n' "$hits"
+    fail=$((fail + 1))
+  fi
+}
+check_rust_log_directives
+
 printf '\n'
 if (( fail )); then
   printf '  %s✗ %d compose problem(s) — an install or a release build would abort%s\n\n' "$RED" "$fail" "$R"
