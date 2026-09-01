@@ -89,3 +89,6 @@ pswdwaf
 # Python bytecode caches (e.g. left by `python -m py_compile`)
 __pycache__/
 *.pyc
+
+# GeoIP database — operator-supplied, MaxMind licence forbids redistribution
+deploy/docker/geoip/*.mmdb

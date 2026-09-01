@@ -4757,6 +4757,57 @@ fn build_geoip_map(cfg: &SentinelConfig) -> GeoIpMap {
     map
 }
 
+/// What country filtering is CONFIGURED versus what is actually ENFORCED.
+///
+/// These differ silently, and that is the whole reason this exists. `GeoIp`
+/// degrades to a no-op when the MaxMind database is absent — it logs once at
+/// startup and then answers `Unknown` for every address, so a site configured to
+/// block `["CN","RU"]` blocks nothing while the console reports the policy as
+/// set. No `.mmdb` has ever shipped in any bundle and no compose file passed a
+/// path, so on every deployment to date this control has been inert.
+///
+/// `GeoIp::is_active()` already computed the truth and NOTHING called it outside
+/// a unit test. The signal existed and was thrown away.
+///
+/// Same shape, and same remedy, as the `ebpf` block below: kernel XDP silently
+/// ran in software for six weeks with a single startup WARN as the only trace,
+/// until /healthz was made to say so.
+fn geoip_status(cfg: &SentinelConfig, map: &GeoIpMap) -> serde_json::Value {
+    let mut configured = 0usize;
+    let mut active = 0usize;
+    let mut inert: Vec<serde_json::Value> = Vec::new();
+    for site in &cfg.sites {
+        let Some(gc) = site.waf.geoip.as_ref() else {
+            continue;
+        };
+        // A geoip block with no country rules is configuration, not enforcement.
+        if gc.block_countries.is_empty() && gc.allow_countries.is_empty() {
+            continue;
+        }
+        configured += 1;
+        if map.get(&site.id).is_some_and(|g| g.is_active()) {
+            active += 1;
+        } else {
+            inert.push(serde_json::json!({
+                "site": site.id,
+                "db_path": gc.db_path,
+                "db_present": std::path::Path::new(&gc.db_path).exists(),
+                "block_countries": gc.block_countries,
+                "allow_countries": gc.allow_countries,
+            }));
+        }
+    }
+    serde_json::json!({
+        // Sites whose policy asks for country filtering.
+        "configured": configured,
+        // Sites where it is actually enforceable (database loaded AND rules set).
+        "active": active,
+        // The gap, named. Non-empty means the product is showing a control it is
+        // not applying — read this before trusting a country block.
+        "inert": inert,
+    })
+}
+
 fn build_anti_ddos(cfg: &SentinelConfig) -> AntiDdos {
     for site in &cfg.sites {
         if let Some(ref dd) = site.waf.anti_ddos {
@@ -6185,6 +6236,10 @@ fn health_response(state: &ServerState) -> Response<BoxBody> {
             "xdp_drop": ebpf_stats.xdp_drop,
             "xdp_aborted": ebpf_stats.xdp_aborted,
         },
+        // Country filtering: what is CONFIGURED vs what is ENFORCED. `inert` is
+        // the field that matters — non-empty means a site's country policy is
+        // displayed and not applied, because no MaxMind database is present.
+        "geoip": geoip_status(&state.config.load(), &state.modules.geoip_map.load()),
         "upstreams_healthy": pool_stats.healthy,
         "upstreams_total": pool_stats.total,
         "version": env!("CARGO_PKG_VERSION"),
@@ -9526,6 +9581,134 @@ mod accept_error_tests {
             steps += 1;
             assert!(steps < 16, "backoff should reach its ceiling quickly");
         }
+    }
+}
+
+#[cfg(test)]
+mod geoip_honesty_tests {
+    use super::*;
+    use sentinel_core::config::{GeoIpConfig, SentinelConfig, SiteConfig, UpstreamConfig};
+
+    /// SiteConfig has no `Default`, so this mirrors `site_with` in the inline-rule
+    /// tests above rather than inventing a second shape.
+    fn bare_site(id: &str) -> SiteConfig {
+        SiteConfig {
+            id: id.into(),
+            tenant_id: String::new(),
+            domains: vec![format!("{id}.local")],
+            upstream: UpstreamConfig {
+                load_balancer: sentinel_core::config::LoadBalancerStrategy::RoundRobin,
+                servers: vec![],
+                health_check: None,
+                timeout_secs: None,
+                websocket: false,
+                host_header: None,
+                keepalive: true,
+                connect_timeout_secs: None,
+                sni_name: None,
+            },
+            waf: WafConfig {
+                mode: WafMode::Blocking,
+                ..Default::default()
+            },
+            plugins: vec![],
+            tls: Default::default(),
+            origin: Default::default(),
+        }
+    }
+
+    fn site_with_geoip(id: &str, db: &str, block: Vec<&str>) -> SiteConfig {
+        let mut s = bare_site(id);
+        s.waf.geoip = Some(GeoIpConfig {
+            db_path: db.into(),
+            block_countries: block.into_iter().map(String::from).collect(),
+            allow_countries: vec![],
+        });
+        s
+    }
+
+    /// The defect this pins: a site configured to block countries, with no
+    /// MaxMind database anywhere, reported nothing at all. `GeoIp` degrades to a
+    /// no-op that answers Unknown for every address, so the block passed all
+    /// traffic while the console showed the policy as set. No `.mmdb` has ever
+    /// shipped in any bundle, so this was every deployment.
+    #[test]
+    fn a_country_block_with_no_database_is_reported_as_inert() {
+        let cfg = SentinelConfig {
+            sites: vec![site_with_geoip(
+                "shop",
+                "/nonexistent/GeoLite2-Country.mmdb",
+                vec!["CN", "RU"],
+            )],
+            ..Default::default()
+        };
+        let map = build_geoip_map(&cfg);
+        let st = geoip_status(&cfg, &map);
+
+        assert_eq!(st["configured"], 1, "the policy asks for country filtering");
+        assert_eq!(
+            st["active"], 0,
+            "it cannot be enforced without a database and must not be counted as active"
+        );
+        let inert = st["inert"].as_array().expect("inert array");
+        assert_eq!(inert.len(), 1, "the gap must be named, not merely counted");
+        assert_eq!(inert[0]["site"], "shop");
+        assert_eq!(
+            inert[0]["db_present"], false,
+            "the report must say the database is missing — that is the actionable part"
+        );
+    }
+
+    /// A geoip block with no country rules is configuration, not a claim of
+    /// enforcement, and must not be reported as an unmet one — otherwise the
+    /// field cries wolf and stops being read.
+    #[test]
+    fn geoip_configured_with_no_countries_is_not_counted() {
+        let cfg = SentinelConfig {
+            sites: vec![site_with_geoip("shop", "/nonexistent.mmdb", vec![])],
+            ..Default::default()
+        };
+        let st = geoip_status(&cfg, &build_geoip_map(&cfg));
+        assert_eq!(st["configured"], 0);
+        assert_eq!(st["inert"].as_array().unwrap().len(), 0);
+    }
+
+    /// A site with no geoip block at all contributes nothing.
+    #[test]
+    fn a_site_without_geoip_is_absent_from_the_report() {
+        let cfg = SentinelConfig {
+            sites: vec![bare_site("plain")],
+            ..Default::default()
+        };
+        let st = geoip_status(&cfg, &build_geoip_map(&cfg));
+        assert_eq!(st["configured"], 0);
+        assert_eq!(st["active"], 0);
+        assert_eq!(st["inert"].as_array().unwrap().len(), 0);
+    }
+
+    /// Several sites, mixed state — the counts must not collapse into a single
+    /// boolean, because "some sites enforce and some do not" is the situation an
+    /// operator actually has to act on.
+    #[test]
+    fn multiple_configured_sites_are_each_accounted_for() {
+        let cfg = SentinelConfig {
+            sites: vec![
+                site_with_geoip("a", "/nope-a.mmdb", vec!["CN"]),
+                site_with_geoip("b", "/nope-b.mmdb", vec!["RU"]),
+                bare_site("c"),
+            ],
+            ..Default::default()
+        };
+        let st = geoip_status(&cfg, &build_geoip_map(&cfg));
+        assert_eq!(st["configured"], 2);
+        assert_eq!(st["active"], 0);
+        let names: Vec<&str> = st["inert"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["site"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["a", "b"]);
     }
 }
 

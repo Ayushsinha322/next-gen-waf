@@ -14,7 +14,7 @@ use std::net::IpAddr;
 use std::path::Path;
 
 use maxminddb::{geoip2, Reader};
-use tracing::{info, warn};
+use tracing::{error, info};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -63,8 +63,16 @@ impl GeoIp {
 
     /// Load a MaxMind GeoLite2-Country `.mmdb` database.
     ///
-    /// If the file doesn't exist or can't be read, logs a warning and falls
-    /// back to `disabled()` — the proxy continues to start normally.
+    /// If the file cannot be read this falls back to `disabled()` and the proxy
+    /// still starts. That is deliberate — one missing data file should not take a
+    /// WAF down — but it is also how this control stayed invisible: `disabled()`
+    /// answers `Unknown` for every address, so a site set to block `["CN","RU"]`
+    /// blocks nothing while the console still shows the policy.
+    ///
+    /// So the failure is logged at ERROR, not WARN, and it names the
+    /// consequence. `is_active()` reports the same fact in a queryable form and
+    /// `/healthz` publishes it under `geoip.inert` — a single startup line is not
+    /// enough, which is the lesson kernel XDP already taught here.
     pub fn from_path(
         db_path: impl AsRef<Path>,
         block_countries: Vec<String>,
@@ -77,9 +85,13 @@ impl GeoIp {
                 Some(r)
             }
             Err(e) => {
-                warn!(
+                error!(
                     path = %path.display(),
-                    "GeoIP database not found or unreadable ({e}) — country filtering disabled"
+                    "GeoIP database not found or unreadable ({e}) — COUNTRY FILTERING IS NOT \
+                     ENFORCED for this site. Every address resolves to Unknown, so configured \
+                     block/allow country rules pass all traffic. Supply a MaxMind \
+                     GeoLite2-Country.mmdb and point SENTINEL_GEOIP_DB / waf_policy.geoip.db_path \
+                     at it. Queryable at /healthz -> geoip.inert."
                 );
                 None
             }
