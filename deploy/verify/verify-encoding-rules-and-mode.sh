@@ -30,9 +30,17 @@ note() { printf "  \033[33mNOTE\033[0m  %s\n" "$1"; }
 M="encv$$"
 probe() { curl -sk -o /dev/null -w '%{http_code}' --max-time 8 -H "Host: $H" "https://127.0.0.1$1&m=$M"; }
 # Was rule $1 recorded for any request carrying our marker?
+#
+# `|| true`, NOT `|| echo 0`: grep -c already prints 0 when it finds nothing, and
+# exits 1 while doing so. The `|| echo 0` this replaces therefore emitted BOTH
+# lines, so the caller received "0\n0", every [ -eq ] comparison died with
+# "integer expression expected", and the && chain reported a FALSE FAILURE saying
+# an encoding rule had fired on ordinary traffic. The probe data on the line above
+# it said 0. A verifier that cries wolf gets ignored, which is worse than one that
+# is merely absent.
 recorded() {
   grep -h "$M" "$LOGDIR"/waf*/waf.log 2>/dev/null \
-    | grep -c "\"rule\":\"$1\"" 2>/dev/null || echo 0
+    | grep -c "\"rule\":\"$1\"" || true
 }
 
 echo "=== 1. the importer no longer warns about rules that are fine ==="
