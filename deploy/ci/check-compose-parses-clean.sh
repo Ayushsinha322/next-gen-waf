@@ -315,51 +315,63 @@ check_https_is_ha() {
   fi
   rm -f "$envf"
 
-  local n_443
-  n_443=$(printf '%s\n' "$rendered" | python3 -c '
-import sys, yaml
-d = yaml.safe_load(sys.stdin) or {}
-owners = []
-for name, svc in (d.get("services") or {}).items():
-    for p in (svc.get("ports") or []):
-        if isinstance(p, dict) and str(p.get("published")) == "443" \
-           and p.get("protocol", "tcp") == "tcp":
-            owners.append(name)
-print(",".join(sorted(owners)))
-')
-  if [[ "$n_443" != "lb" ]]; then
-    problems+=("host 443/tcp is bound by [${n_443:-nothing}], want exactly [lb] — HTTPS is single-homed unless the balancer owns it")
+  # awk + grep ONLY — no python, no yaml library. This job runs in an alpine
+  # image with bash/shellcheck/git/coreutils/findutils/grep/sed/docker-cli-compose
+  # and nothing else. The note on check_passive_sink above records this exact
+  # lesson, and the first version of THIS check ignored it and turned the job red
+  # with "python3: command not found". Twice is a pattern, so it is written here
+  # too, next to the code that would repeat it.
+  #
+  # Rendered shapes being matched (verified against real output, not assumed):
+  #     ports:                       volumes:                environment:
+  #       - mode: ingress              - type: volume          KEY: value
+  #         target: 443                  source: sentinel-certs
+  #         published: "443"             target: /var/lib/sentinel/certs
+  #         protocol: tcp
+
+  # 1. Exactly one service may publish host 443/tcp, and it must be the balancer.
+  #    A port entry spans several lines, so published+protocol are paired per
+  #    entry rather than grepped independently — otherwise 443/udp on waf1 would
+  #    satisfy a naive "published 443 and protocol tcp somewhere in this service".
+  local owners
+  #    Evaluated at the END of each port entry, not on the `published:` line.
+  #    `protocol:` is rendered AFTER `published:`, so testing early sees the
+  #    default "tcp" and mistakes waf1's 443/UDP for a TCP binding — which is
+  #    exactly what the first version of this awk did.
+  owners=$(printf '%s\n' "$rendered" | awk '
+    function flush() {
+      if (have && pub == "443" && proto == "tcp") print svc
+      have = 0; pub = ""; proto = "tcp"
+    }
+    /^  [^ ]+:[[:space:]]*$/          { flush(); svc = $1; sub(/:$/, "", svc); inports = 0 }
+    /^    ports:[[:space:]]*$/        { flush(); inports = 1; next }
+    inports && /^    [^ ]/            { flush(); inports = 0 }
+    inports && /^      - /            { flush(); have = 1 }
+    inports && /published:/           { pub = $2; gsub(/"/, "", pub) }
+    inports && /protocol:/            { proto = $2 }
+    END                               { flush() }
+  ' | sort -u | tr '\n' ' ' | sed 's/ $//')
+  if [[ "$owners" != "lb" ]]; then
+    problems+=("host 443/tcp is bound by [${owners:-nothing}], want exactly [lb] — HTTPS is single-homed unless the balancer owns it")
   fi
 
-  local missing_certs missing_pp
-  missing_certs=$(printf '%s\n' "$rendered" | python3 -c '
-import sys, yaml
-d = yaml.safe_load(sys.stdin) or {}
-bad = []
-for name, svc in (d.get("services") or {}).items():
-    if not name.startswith("waf"):
-        continue
-    tgts = [v.get("target") for v in (svc.get("volumes") or []) if isinstance(v, dict)]
-    if "/var/lib/sentinel/certs" not in tgts:
-        bad.append(name)
-print(",".join(sorted(bad)))
-')
+  # 2. + 3. Every waf node needs the shared cert volume and the PROXY-protocol
+  #    listener name. Without the first it serves its own self-signed cert;
+  #    without the second every HTTPS client looks like the balancer.
+  local svc missing_certs="" missing_pp="" blk
+  for svc in $(printf '%s\n' "$rendered" | grep -oE '^  waf[0-9]+:' | tr -d ' :'); do
+    blk=$(printf '%s\n' "$rendered" | awk -v s="  $svc:" '
+      $0 == s        { inblk = 1; next }
+      inblk && /^  [^ ]/ { inblk = 0 }
+      inblk          { print }
+    ')
+    printf '%s\n' "$blk" | grep -qE '^        target: /var/lib/sentinel/certs[[:space:]]*$' \
+      || missing_certs="$missing_certs $svc"
+    printf '%s\n' "$blk" | grep -qE '^      SENTINEL_PROXY_PROTOCOL_LISTENERS:.*https' \
+      || missing_pp="$missing_pp $svc"
+  done
+  missing_certs="${missing_certs# }"; missing_pp="${missing_pp# }"
   [[ -n "$missing_certs" ]] && problems+=("[$missing_certs] do not mount the shared cert volume — they would serve their own self-signed cert")
-
-  missing_pp=$(printf '%s\n' "$rendered" | python3 -c '
-import sys, yaml
-d = yaml.safe_load(sys.stdin) or {}
-bad = []
-for name, svc in (d.get("services") or {}).items():
-    if not name.startswith("waf"):
-        continue
-    env = svc.get("environment") or {}
-    if isinstance(env, list):
-        env = dict(e.split("=", 1) for e in env if "=" in e)
-    if "https" not in (env.get("SENTINEL_PROXY_PROTOCOL_LISTENERS") or ""):
-        bad.append(name)
-print(",".join(sorted(bad)))
-')
   [[ -n "$missing_pp" ]] && problems+=("[$missing_pp] do not expect PROXY protocol on https — every HTTPS client would look like the load balancer")
 
   if (( ${#problems[@]} == 0 )); then
