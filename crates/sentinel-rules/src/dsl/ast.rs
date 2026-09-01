@@ -208,6 +208,14 @@ pub enum Target {
     /// Total byte size of all uploaded file contents. ModSecurity
     /// `FILES_COMBINED_SIZE`.
     FilesCombinedSize,
+    /// Combined byte length of every request argument — each name PLUS its
+    /// value, query string and body together. ModSecurity `ARGS_COMBINED_SIZE`.
+    ///
+    /// Sole target of CRS 920390 ("Total arguments size exceeded"). Its absence
+    /// was reported at import as "unknown target token, skipping", which — since
+    /// it is the only target of that chain link — disabled the rule. The sibling
+    /// `FILES_COMBINED_SIZE` was already present; this one was simply missed.
+    ArgsCombinedSize,
     /// Header lines of `multipart/form-data` body parts. ModSecurity
     /// `MULTIPART_PART_HEADERS`.
     ///
@@ -306,6 +314,34 @@ pub enum Operator {
     /// present, and could never match. A NUL byte in a URI is a classic parser
     /// -confusion primitive, so this is not a cosmetic gap.
     ValidateByteRange(Vec<(u8, u8)>),
+    /// `@validateUrlEncoding` — fires when a value contains MALFORMED
+    /// percent-encoding: a `%` not followed by exactly two hex digits, or a `%`
+    /// truncated by the end of the value.
+    ///
+    /// Restores CRS 920220 and 920240 ("URL Encoding Abuse Attack Attempt"),
+    /// which were compiled to `Never`. Malformed encoding is a classic
+    /// parser-differential primitive: the WAF and the origin disagree about what
+    /// the bytes mean, and the payload is only visible to one of them.
+    ///
+    /// Note it must see the RAW value. CRS applies it to `REQUEST_URI_RAW`
+    /// captures and `REQUEST_BODY`, never to already-decoded `ARGS` — after
+    /// decoding there is no `%` left to judge.
+    ValidateUrlEncoding,
+    /// `@validateUtf8Encoding` — fires when a value's percent-escapes decode to
+    /// a byte sequence that is not valid UTF-8: overlong forms (`%c0%af`,
+    /// `%e0%80%80`), surrogates (`%ed%a0%80`), truncated sequences, or bytes
+    /// above the valid range.
+    ///
+    /// Restores CRS 920250 ("UTF8 Encoding Abuse Attack Attempt"). Overlong
+    /// encodings are how `../` gets past a filter that only compares decoded
+    /// ASCII.
+    ///
+    /// ⚠️ CRS gates 920250 behind `tx.crs_validate_utf8_encoding`, which its own
+    /// REQUEST-901-INITIALIZATION sets to 0 unless the operator opts in. So this
+    /// operator being implemented does NOT by itself make 920250 fire — see the
+    /// test `utf8_rule_920250_is_gated_off_by_crs_default`, which exists so that
+    /// fact stays visible instead of being rediscovered as a bug.
+    ValidateUtf8Encoding,
     AnomalyScore {
         op: CmpOp,
         threshold: u32,

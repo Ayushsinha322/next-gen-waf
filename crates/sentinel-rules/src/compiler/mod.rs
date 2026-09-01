@@ -234,7 +234,22 @@ pub fn compile(file: RuleFile) -> Result<CompiledRuleSet> {
                         // A rule imported with an unsupported operator compiles
                         // but can never match — record it as a coverage gap so
                         // it isn't silently counted as "loaded protection".
-                        if matches!(rule.operator, Operator::Never) {
+                        //
+                        // CHAIN CONDITIONS COUNT. Chain links are ANDed, so a
+                        // single `Never` anywhere in the chain makes the whole
+                        // rule unable to fire, exactly as a `Never` at the top
+                        // level would. Testing only `rule.operator` was why this
+                        // report read "zero coverage gap" while CRS 920220,
+                        // 920221, 920240 and 920250 could not fire: every one of
+                        // them carries its unsupported operator in a chain CHILD.
+                        // The only trace was one importer WARN naming the operator
+                        // but not the rule, and that WARN was invisible for months
+                        // behind a RUST_LOG filter that excluded the crate.
+                        let never_in_chain = rule
+                            .chain_conditions
+                            .iter()
+                            .any(|c| matches!(c.operator, Operator::Never));
+                        if matches!(rule.operator, Operator::Never) || never_in_chain {
                             disabled.push(rule_id);
                         }
                     }
@@ -518,6 +533,12 @@ fn emit_operator_match(
             instrs.push(Instruction::ValidateByteRange {
                 ranges: ranges.clone(),
             });
+        }
+        Operator::ValidateUrlEncoding => {
+            instrs.push(Instruction::ValidateUrlEncoding);
+        }
+        Operator::ValidateUtf8Encoding => {
+            instrs.push(Instruction::ValidateUtf8Encoding);
         }
         Operator::Never => {
             instrs.push(Instruction::Never);
