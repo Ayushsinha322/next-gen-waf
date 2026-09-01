@@ -63,6 +63,7 @@ fn test_config(
             tls: None,
             default_site: Some("test-site".into()),
             role: Default::default(),
+            proxy_protocol: false,
         }],
         sites: vec![SiteConfig {
             id: "test-site".into(),
@@ -111,6 +112,7 @@ fn ml_only_config(listen_port: u16, upstream_port: u16, sensitivity: f32) -> Sen
             tls: None,
             default_site: Some("test-site".into()),
             role: Default::default(),
+            proxy_protocol: false,
         }],
         sites: vec![SiteConfig {
             id: "test-site".into(),
@@ -692,6 +694,7 @@ fn inline_only_config(
             tls: None,
             default_site: Some("test-site".into()),
             role: Default::default(),
+            proxy_protocol: false,
         }],
         sites: vec![SiteConfig {
             id: "test-site".into(),

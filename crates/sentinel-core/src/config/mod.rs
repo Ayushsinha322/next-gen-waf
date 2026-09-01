@@ -192,6 +192,22 @@ pub struct ListenerConfig {
     /// (path `/api/*` → control plane, everything else → dashboard).
     #[serde(default)]
     pub role: ListenerRole,
+    /// Expect an HAProxy PROXY protocol header before the first byte of TLS.
+    ///
+    /// Needed when this listener sits behind a TCP-mode load balancer, which is
+    /// the only way to give HTTPS real high availability on a single host: only
+    /// one process can bind :443, so the LB must front the fleet — and it cannot
+    /// inject `X-Forwarded-For` without parsing HTTP, which it must not do,
+    /// because TLS terminates here (SNI certs, ACME, JA4).
+    ///
+    /// Without it every HTTPS client appears to be the load balancer, which
+    /// quietly defeats the IP blocklist, per-source rate limits, correlation and
+    /// XDP auto-ban all at once.
+    ///
+    /// The header is self-asserted, so it is only believed from a peer already
+    /// inside `SENTINEL_TRUSTED_PROXIES` — the same boundary that gates XFF.
+    #[serde(default)]
+    pub proxy_protocol: bool,
 }
 
 /// What a listener is for. Mirrors the F5 "management interface vs data plane"
@@ -1378,9 +1394,65 @@ pub fn update_sites(handle: &ConfigHandle, mut db_sites: Vec<SiteConfig>) {
 fn read_config_file(path: &Path) -> anyhow::Result<SentinelConfig> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading config file: {}", path.display()))?;
-    let cfg: SentinelConfig = serde_yaml::from_str(&raw)
+    let mut cfg: SentinelConfig = serde_yaml::from_str(&raw)
         .with_context(|| format!("parsing config file: {}", path.display()))?;
+    apply_proxy_protocol_env(
+        &mut cfg,
+        std::env::var("SENTINEL_PROXY_PROTOCOL_LISTENERS").ok(),
+    );
     Ok(cfg)
+}
+
+/// Turn on PROXY protocol for the listeners named in
+/// `SENTINEL_PROXY_PROTOCOL_LISTENERS` (comma-separated listener names).
+///
+/// It is an env override rather than a line in the YAML because ONE
+/// `sentinel.proxy.yaml` serves both topologies, and the correct value differs:
+///
+///   single node (compose.prod.yml)  :443 is published straight to the container,
+///                                   so the client IS the peer. Expecting a PROXY
+///                                   header here would refuse every real client.
+///   HA fleet (compose.ha.yml)       :443 is fronted by HAProxy in TCP mode, so
+///                                   the header is the only way to know the client.
+///
+/// Named listeners rather than a global boolean, because "which listener" is
+/// load-bearing: the management console publishes to loopback directly and must
+/// never expect a header, and `:80` is proxied in HTTP mode where HAProxy injects
+/// `X-Forwarded-For` instead. A blanket flag would break both.
+///
+/// Unknown names are reported rather than ignored — a typo here fails open
+/// (the listener quietly keeps trusting the transport peer, so every HTTPS
+/// client becomes the load balancer), which is exactly the class of silent
+/// misconfiguration this codebase keeps paying for.
+pub(crate) fn apply_proxy_protocol_env(cfg: &mut SentinelConfig, spec: Option<String>) {
+    let Some(spec) = spec else { return };
+    let wanted: Vec<&str> = spec
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if wanted.is_empty() {
+        return;
+    }
+    for name in &wanted {
+        let mut hit = false;
+        for l in cfg.listeners.iter_mut() {
+            if l.name == *name {
+                l.proxy_protocol = true;
+                hit = true;
+            }
+        }
+        if !hit {
+            tracing::warn!(
+                listener = %name,
+                known = ?cfg.listeners.iter().map(|l| &l.name).collect::<Vec<_>>(),
+                "SENTINEL_PROXY_PROTOCOL_LISTENERS names a listener that does not \
+                 exist — that listener will keep treating the load balancer as the \
+                 client, so the IP blocklist, rate limits and correlation will all \
+                 collapse onto one address"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1556,5 +1628,89 @@ upstream:
 "#;
         let s: SiteConfig = serde_yaml::from_str(yaml).expect("parse site");
         assert_eq!(s.origin, SiteOrigin::File);
+    }
+    /// One `sentinel.proxy.yaml` serves both the single-node and the HA
+    /// topology, and the correct PROXY-protocol setting is OPPOSITE in each:
+    /// direct :443 must not expect a header, LB-fronted :443 must.
+    #[test]
+    fn proxy_protocol_env_targets_named_listeners_only() {
+        let yaml = r#"
+server: { name: t }
+listeners:
+  - name: http
+    bind: "0.0.0.0:8080"
+    protocol: http1
+  - name: https
+    bind: "0.0.0.0:8443"
+    protocol: [http1, http2]
+    tls: {}
+  - name: management
+    bind: "0.0.0.0:9443"
+    protocol: [http1]
+    tls: {}
+    role: management
+sites: []
+"#;
+        let mut cfg: SentinelConfig = serde_yaml::from_str(yaml).expect("parse");
+        // Default: nobody expects a header. This is what keeps the single-node
+        // deployment working from the same file.
+        assert!(cfg.listeners.iter().all(|l| !l.proxy_protocol));
+
+        super::apply_proxy_protocol_env(&mut cfg, Some("https".into()));
+        let by = |n: &str| cfg.listeners.iter().find(|l| l.name == n).unwrap();
+        assert!(
+            by("https").proxy_protocol,
+            "the LB-fronted listener must expect it"
+        );
+        assert!(
+            !by("http").proxy_protocol,
+            ":80 is proxied in HTTP mode where HAProxy injects XFF instead"
+        );
+        assert!(
+            !by("management").proxy_protocol,
+            "the admin console publishes to loopback directly — expecting a header \
+             there would lock the operator out of their own box"
+        );
+    }
+
+    #[test]
+    fn proxy_protocol_env_unset_or_empty_changes_nothing() {
+        let yaml = r#"
+server: { name: t }
+listeners:
+  - name: https
+    bind: "0.0.0.0:8443"
+    protocol: [http1]
+    tls: {}
+sites: []
+"#;
+        for spec in [None, Some(String::new()), Some("  ,  ".into())] {
+            let mut cfg: SentinelConfig = serde_yaml::from_str(yaml).expect("parse");
+            super::apply_proxy_protocol_env(&mut cfg, spec.clone());
+            assert!(
+                !cfg.listeners[0].proxy_protocol,
+                "spec {spec:?} must leave the default alone"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_protocol_env_accepts_several_listeners() {
+        let yaml = r#"
+server: { name: t }
+listeners:
+  - name: https
+    bind: "0.0.0.0:8443"
+    protocol: [http1]
+    tls: {}
+  - name: https-alt
+    bind: "0.0.0.0:9444"
+    protocol: [http1]
+    tls: {}
+sites: []
+"#;
+        let mut cfg: SentinelConfig = serde_yaml::from_str(yaml).expect("parse");
+        super::apply_proxy_protocol_env(&mut cfg, Some("https, https-alt".into()));
+        assert!(cfg.listeners.iter().all(|l| l.proxy_protocol));
     }
 }

@@ -468,6 +468,7 @@ fn cmd_init(cfg_path: &Path, bind: &str) -> Result<()> {
             tls: None,
             default_site: None,
             role: Default::default(),
+            proxy_protocol: false,
         }],
         sites: vec![],
         logging: LoggingConfig {

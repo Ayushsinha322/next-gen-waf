@@ -285,6 +285,107 @@ check_passive_sink() {
 }
 check_passive_sink
 
+# ── HTTPS must be highly available, not single-homed ─────────────────────────
+#
+# The defect this pins: waf1 published :443 directly, so HTTPS ran on ONE node
+# while compose.ha.yml's header promised "kill any node → zero downtime". True
+# for :80 only. Killing waf1, or merely rolling it during an upgrade, took HTTPS
+# down — and nothing checked, which is why it survived for months. Rolling
+# restarts appeared clean because they curled ~12s after each roll, well after
+# the window had closed.
+#
+# Three properties, each of which independently breaks HTTPS HA if lost:
+#   1. exactly ONE service binds host 443/tcp, and it is the load balancer
+#   2. every waf node mounts the SHARED cert volume — otherwise a node serves
+#      its own self-signed cert and clients see a different certificate
+#      depending on which node they land on
+#   3. every waf node expects PROXY protocol on its https listener — otherwise
+#      every HTTPS client looks like the balancer and the IP blocklist,
+#      per-source rate limits, correlation and auto-ban all collapse silently
+check_https_is_ha() {
+  printf '\n%s==> HTTPS survives losing a node%s\n\n' "$B" "$R"
+  local envf; envf="$(mktemp)"
+  synth_env "$envf" "${IVARS[@]}" "${HVARS[@]}"
+  local rendered problems=()
+  if ! rendered=$(env -i PATH="$PATH" HOME="$HOME" docker compose --env-file "$envf" \
+        -f deploy/docker/compose.prod.yml -f deploy/docker/compose.cluster.yml \
+        -f deploy/docker/compose.ha.yml config 2>/dev/null); then
+    printf '  %s✗%s could not render the HA topology\n' "$RED" "$R"
+    fail=$((fail + 1)); rm -f "$envf"; return
+  fi
+  rm -f "$envf"
+
+  # awk + grep ONLY — no python, no yaml library. This job runs in an alpine
+  # image with bash/shellcheck/git/coreutils/findutils/grep/sed/docker-cli-compose
+  # and nothing else. The note on check_passive_sink above records this exact
+  # lesson, and the first version of THIS check ignored it and turned the job red
+  # with "python3: command not found". Twice is a pattern, so it is written here
+  # too, next to the code that would repeat it.
+  #
+  # Rendered shapes being matched (verified against real output, not assumed):
+  #     ports:                       volumes:                environment:
+  #       - mode: ingress              - type: volume          KEY: value
+  #         target: 443                  source: sentinel-certs
+  #         published: "443"             target: /var/lib/sentinel/certs
+  #         protocol: tcp
+
+  # 1. Exactly one service may publish host 443/tcp, and it must be the balancer.
+  #    A port entry spans several lines, so published+protocol are paired per
+  #    entry rather than grepped independently — otherwise 443/udp on waf1 would
+  #    satisfy a naive "published 443 and protocol tcp somewhere in this service".
+  local owners
+  #    Evaluated at the END of each port entry, not on the `published:` line.
+  #    `protocol:` is rendered AFTER `published:`, so testing early sees the
+  #    default "tcp" and mistakes waf1's 443/UDP for a TCP binding — which is
+  #    exactly what the first version of this awk did.
+  owners=$(printf '%s\n' "$rendered" | awk '
+    function flush() {
+      if (have && pub == "443" && proto == "tcp") print svc
+      have = 0; pub = ""; proto = "tcp"
+    }
+    /^  [^ ]+:[[:space:]]*$/          { flush(); svc = $1; sub(/:$/, "", svc); inports = 0 }
+    /^    ports:[[:space:]]*$/        { flush(); inports = 1; next }
+    inports && /^    [^ ]/            { flush(); inports = 0 }
+    inports && /^      - /            { flush(); have = 1 }
+    inports && /published:/           { pub = $2; gsub(/"/, "", pub) }
+    inports && /protocol:/            { proto = $2 }
+    END                               { flush() }
+  ' | sort -u | tr '\n' ' ' | sed 's/ $//')
+  if [[ "$owners" != "lb" ]]; then
+    problems+=("host 443/tcp is bound by [${owners:-nothing}], want exactly [lb] — HTTPS is single-homed unless the balancer owns it")
+  fi
+
+  # 2. + 3. Every waf node needs the shared cert volume and the PROXY-protocol
+  #    listener name. Without the first it serves its own self-signed cert;
+  #    without the second every HTTPS client looks like the balancer.
+  local svc missing_certs="" missing_pp="" blk
+  for svc in $(printf '%s\n' "$rendered" | grep -oE '^  waf[0-9]+:' | tr -d ' :'); do
+    blk=$(printf '%s\n' "$rendered" | awk -v s="  $svc:" '
+      $0 == s        { inblk = 1; next }
+      inblk && /^  [^ ]/ { inblk = 0 }
+      inblk          { print }
+    ')
+    printf '%s\n' "$blk" | grep -qE '^        target: /var/lib/sentinel/certs[[:space:]]*$' \
+      || missing_certs="$missing_certs $svc"
+    printf '%s\n' "$blk" | grep -qE '^      SENTINEL_PROXY_PROTOCOL_LISTENERS:.*https' \
+      || missing_pp="$missing_pp $svc"
+  done
+  missing_certs="${missing_certs# }"; missing_pp="${missing_pp# }"
+  [[ -n "$missing_certs" ]] && problems+=("[$missing_certs] do not mount the shared cert volume — they would serve their own self-signed cert")
+  [[ -n "$missing_pp" ]] && problems+=("[$missing_pp] do not expect PROXY protocol on https — every HTTPS client would look like the load balancer")
+
+  if (( ${#problems[@]} == 0 )); then
+    printf '  %s✓%s only the balancer owns 443/tcp; every node has the shared certs and expects PROXY protocol\n' "$GRN" "$R"
+  else
+    local msg
+    for msg in "${problems[@]}"; do
+      printf '  %s✗%s %s\n' "$RED" "$R" "$msg"
+      fail=$((fail + 1))
+    done
+  fi
+}
+check_https_is_ha
+
 printf '\n'
 if (( fail )); then
   printf '  %s✗ %d compose problem(s) — an install or a release build would abort%s\n\n' "$RED" "$fail" "$R"

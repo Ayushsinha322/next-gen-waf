@@ -171,6 +171,124 @@ impl CertStore {
         Ok(count)
     }
 
+    /// Return the shared self-signed cert for `domain`, creating it once if no
+    /// node has yet.
+    ///
+    /// The point is convergence across a fleet. `cert_dir` is a volume shared by
+    /// every node, so the FIRST node to need a name writes the cert and the
+    /// others adopt it. Without this each node generated its own in memory and a
+    /// client got a different certificate per request — harmless-looking on a
+    /// single node, and a fresh browser warning on every other request once
+    /// HAProxy started spreading :443 across three.
+    ///
+    /// Create-if-absent, never overwrite. Overwriting would mean every restart
+    /// replaced the cert and the fleet would flap between them — the same bug in
+    /// slow motion. `create_new` makes the claim atomic at the filesystem level,
+    /// so a race has exactly one winner and the losers adopt the winner's cert
+    /// rather than keeping their own.
+    ///
+    /// Returns `None` only if the name cannot be served at all; a store that
+    /// cannot be written (read-only volume, no permissions) still yields a
+    /// working in-memory cert, because refusing TLS would be worse than an
+    /// inconsistent cert.
+    pub fn self_signed_shared(&self, domain: &str) -> Option<Arc<CertifiedKey>> {
+        // Someone — possibly this process, at boot — already has it.
+        if let Some(e) = self.live.get(domain) {
+            return Some(Arc::clone(&e.key));
+        }
+
+        let dir = self.cert_dir.join(domain_to_dirname(domain));
+        let cert_file = dir.join("cert.pem");
+        let key_file = dir.join("key.pem");
+
+        // Another node may have written it since this process started.
+        if cert_file.exists() && key_file.exists() {
+            if let Ok(ck) = load_pem_files(&cert_file, &key_file) {
+                self.remember_self_signed(domain, Arc::clone(&ck));
+                tracing::debug!(domain, "adopted the fleet's shared self-signed cert");
+                return Some(ck);
+            }
+        }
+
+        let (cert_pem, key_pem) = generate_self_signed_pem(domain).ok()?;
+
+        // Try to claim the name. Losing the race is the normal case on a busy
+        // fleet and is not an error.
+        match self.claim_self_signed(&dir, &cert_file, &key_file, domain, &cert_pem, &key_pem) {
+            Ok(()) => tracing::info!(domain, "generated the fleet's shared self-signed cert"),
+            Err(e) => tracing::debug!(domain, "did not claim the self-signed cert: {e}"),
+        }
+
+        // Re-read regardless of who won, so every node ends up serving the same
+        // bytes. Only fall back to our own copy if the store is unusable.
+        let ck = load_pem_files(&cert_file, &key_file)
+            .or_else(|_| load_pem_bytes(cert_pem.as_bytes(), key_pem.as_bytes()))
+            .ok()?;
+        self.remember_self_signed(domain, Arc::clone(&ck));
+        Some(ck)
+    }
+
+    /// Write the cert files only if absent, atomically claiming the name.
+    fn claim_self_signed(
+        &self,
+        dir: &Path,
+        cert_file: &Path,
+        key_file: &Path,
+        domain: &str,
+        cert_pem: &str,
+        key_pem: &str,
+    ) -> Result<()> {
+        std::fs::create_dir_all(dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
+        // create_new is the whole mechanism: it fails if the file exists, so the
+        // first writer wins and nobody clobbers a cert already in use.
+        write_new(key_file, key_pem.as_bytes(), 0o600)?;
+        write_new(cert_file, cert_pem.as_bytes(), 0o644)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let meta = CertMeta {
+            domain: domain.to_string(),
+            name: String::new(),
+            san: vec![domain.to_string(), format!("*.{domain}")],
+            issued_at: now,
+            expires_at: 0,
+            fingerprint: String::new(),
+            source: CertSource::SelfSigned,
+            issuer: String::new(),
+            key_type: String::new(),
+        };
+        // Best-effort: the cert is usable without metadata, and the loader
+        // synthesises a default when meta.json is missing.
+        let _ = write_new(
+            &dir.join("meta.json"),
+            serde_json::to_string_pretty(&meta)?.as_bytes(),
+            0o644,
+        );
+        Ok(())
+    }
+
+    fn remember_self_signed(&self, domain: &str, ck: Arc<CertifiedKey>) {
+        let meta = CertMeta {
+            domain: domain.to_string(),
+            name: String::new(),
+            san: vec![domain.to_string(), format!("*.{domain}")],
+            issued_at: 0,
+            expires_at: 0,
+            fingerprint: String::new(),
+            source: CertSource::SelfSigned,
+            issuer: String::new(),
+            key_type: String::new(),
+        };
+        self.live
+            .insert(domain.to_string(), Arc::new(CertEntry { key: ck, meta }));
+    }
+
     /// Install a cert from PEM strings (from ACME or manual upload).
     /// Hot-swaps immediately — no restart required.
     pub fn install(
@@ -455,13 +573,24 @@ impl ResolvesServerCert for SentinelCertResolver {
             return Some(ck);
         }
 
-        // 3. Cached self-signed fallback
-        let mut fb = self.fallback.lock().expect("fallback lock");
-        if let Some(ck) = fb.get(sni) {
-            return Some(Arc::clone(ck));
+        // 3. Self-signed fallback, SHARED across the fleet.
+        //
+        // Was a per-process in-memory cache, which meant three nodes served
+        // three different certificates for the same name — invisible while one
+        // node owned :443, and a browser warning on every other request once the
+        // load balancer began spreading it. Now the first node to need a name
+        // persists the cert to the shared volume and the others adopt it.
+        {
+            let fb = self.fallback.lock().expect("fallback lock");
+            if let Some(ck) = fb.get(sni) {
+                return Some(Arc::clone(ck));
+            }
         }
-        let ck = generate_self_signed(sni).ok()?;
-        fb.insert(sni.to_string(), Arc::clone(&ck));
+        let ck = self.store.self_signed_shared(sni)?;
+        self.fallback
+            .lock()
+            .expect("fallback lock")
+            .insert(sni.to_string(), Arc::clone(&ck));
         Some(ck)
     }
 }
@@ -469,6 +598,24 @@ impl ResolvesServerCert for SentinelCertResolver {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Generate a self-signed cert for `domain` and return it as PEM.
+///
+/// Exists so the fallback cert can be PERSISTED. Before this, the fallback was
+/// generated per process and held only in memory, which is invisible on one node
+/// and wrong on three: each node invented its own certificate for the same name,
+/// so a client was served a different cert depending on which node the load
+/// balancer picked. Measured on .71 the moment HTTPS moved behind the LB — 12
+/// handshakes returned exactly 3 distinct certificates, 4 each.
+pub fn generate_self_signed_pem(domain: &str) -> Result<(String, String)> {
+    let names = vec![domain.to_string(), format!("*.{domain}")];
+    let cert =
+        rcgen::generate_simple_self_signed(names).context("rcgen generate_simple_self_signed")?;
+    Ok((
+        cert.serialize_pem().context("serialize cert PEM")?,
+        cert.serialize_private_key_pem(),
+    ))
+}
 
 pub fn generate_self_signed(domain: &str) -> Result<Arc<CertifiedKey>> {
     let names = vec![domain.to_string(), format!("*.{domain}")];
@@ -546,6 +693,31 @@ fn domain_to_dirname(domain: &str) -> String {
 /// on the same filesystem). Prevents a crash/partial write from leaving a
 /// truncated cert or key, and never leaves a private key world-readable. The
 /// temp file is removed on any failure.
+/// Write `bytes` to `path` ONLY if it does not exist, at `mode`.
+///
+/// The failure is the feature: on a shared cert volume this is how a fleet of
+/// nodes agrees on one self-signed certificate without coordinating. `create_new`
+/// is atomic in the kernel, so exactly one node succeeds and the rest read what
+/// it wrote instead of overwriting each other on every restart.
+fn write_new(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(mode);
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    let mut f = opts
+        .open(path)
+        .with_context(|| format!("claiming {}", path.display()))?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    Ok(())
+}
+
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     let tmp = path.with_extension("tmp");
@@ -594,6 +766,18 @@ mod tests {
             std::env::temp_dir().join(format!("sentinel-certtest-{}-{}", std::process::id(), n));
         let _ = std::fs::remove_dir_all(&dir);
         CertStore::new(dir)
+    }
+
+    /// A fresh directory two stores can share — i.e. two containers with the
+    /// same volume mounted. Uses the same scheme as `tmp_store` above rather
+    /// than adding a `tempfile` dev-dependency this crate does not have.
+    fn tmp_dir() -> std::path::PathBuf {
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("sentinel-certshare-{}-{}", std::process::id(), n));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create shared cert dir");
+        dir
     }
 
     fn self_signed_pem(cn: &str) -> (String, String) {
@@ -659,5 +843,89 @@ mod tests {
             .is_err());
         // Nothing installed on failure.
         assert!(store.get_meta(MANAGEMENT_CERT_KEY).is_none());
+    }
+    /// Two nodes sharing a cert volume must serve the SAME self-signed cert.
+    ///
+    /// This is the whole point. Before it, the fallback lived in a per-process
+    /// HashMap: on .71, once HAProxy spread :443 across three nodes, 12
+    /// handshakes returned 3 distinct certificates — a fresh browser warning on
+    /// every other request.
+    #[test]
+    fn two_nodes_sharing_a_volume_converge_on_one_self_signed_cert() {
+        let dir = tmp_dir();
+        // Two independent stores over ONE directory — exactly two containers
+        // with the same volume mounted.
+        let a = CertStore::new(dir.clone());
+        let b = CertStore::new(dir.clone());
+
+        let ka = a
+            .self_signed_shared("shop.example.com")
+            .expect("node A cert");
+        let kb = b
+            .self_signed_shared("shop.example.com")
+            .expect("node B cert");
+
+        assert_eq!(
+            ka.end_entity_cert().unwrap().as_ref(),
+            kb.end_entity_cert().unwrap().as_ref(),
+            "two nodes served different certificates for the same name"
+        );
+        assert!(
+            dir.join("shop.example.com").join("cert.pem").exists(),
+            "the cert was not persisted, so a third node would invent its own"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A restart must not replace a cert already in use. Overwriting would make
+    /// the fleet flap between certificates on every recreate — the same defect,
+    /// just slower.
+    #[test]
+    fn a_second_call_does_not_overwrite_the_persisted_cert() {
+        let dir = tmp_dir();
+        let first = CertStore::new(dir.clone())
+            .self_signed_shared("api.example.com")
+            .expect("first");
+        let pem_before = std::fs::read(dir.join("api.example.com").join("cert.pem")).unwrap();
+
+        // A fresh process over the same volume.
+        let second = CertStore::new(dir.clone())
+            .self_signed_shared("api.example.com")
+            .expect("second");
+        let pem_after = std::fs::read(dir.join("api.example.com").join("cert.pem")).unwrap();
+
+        assert_eq!(pem_before, pem_after, "the on-disk cert was rewritten");
+        assert_eq!(
+            first.end_entity_cert().unwrap().as_ref(),
+            second.end_entity_cert().unwrap().as_ref(),
+            "a restart changed the served certificate"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Distinct names still get distinct certs — the sharing must be per-name,
+    /// not one cert for everything.
+    #[test]
+    fn different_names_get_different_certs() {
+        let dir = tmp_dir();
+        let st = CertStore::new(dir.clone());
+        let one = st.self_signed_shared("a.example.com").unwrap();
+        let two = st.self_signed_shared("b.example.com").unwrap();
+        assert_ne!(
+            one.end_entity_cert().unwrap().as_ref(),
+            two.end_entity_cert().unwrap().as_ref()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unwritable store must still yield a working cert. Refusing TLS because
+    /// a volume is read-only would be a worse failure than an inconsistent cert.
+    #[test]
+    fn an_unwritable_store_still_serves_tls() {
+        let s = CertStore::new(std::path::PathBuf::from("/proc/nonexistent-cert-dir"));
+        assert!(
+            s.self_signed_shared("x.example.com").is_some(),
+            "a read-only or missing cert dir must not take HTTPS down"
+        );
     }
 }
