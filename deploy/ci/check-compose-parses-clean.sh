@@ -285,6 +285,95 @@ check_passive_sink() {
 }
 check_passive_sink
 
+# ── HTTPS must be highly available, not single-homed ─────────────────────────
+#
+# The defect this pins: waf1 published :443 directly, so HTTPS ran on ONE node
+# while compose.ha.yml's header promised "kill any node → zero downtime". True
+# for :80 only. Killing waf1, or merely rolling it during an upgrade, took HTTPS
+# down — and nothing checked, which is why it survived for months. Rolling
+# restarts appeared clean because they curled ~12s after each roll, well after
+# the window had closed.
+#
+# Three properties, each of which independently breaks HTTPS HA if lost:
+#   1. exactly ONE service binds host 443/tcp, and it is the load balancer
+#   2. every waf node mounts the SHARED cert volume — otherwise a node serves
+#      its own self-signed cert and clients see a different certificate
+#      depending on which node they land on
+#   3. every waf node expects PROXY protocol on its https listener — otherwise
+#      every HTTPS client looks like the balancer and the IP blocklist,
+#      per-source rate limits, correlation and auto-ban all collapse silently
+check_https_is_ha() {
+  printf '\n%s==> HTTPS survives losing a node%s\n\n' "$B" "$R"
+  local envf; envf="$(mktemp)"
+  synth_env "$envf" "${IVARS[@]}" "${HVARS[@]}"
+  local rendered problems=()
+  if ! rendered=$(env -i PATH="$PATH" HOME="$HOME" docker compose --env-file "$envf" \
+        -f deploy/docker/compose.prod.yml -f deploy/docker/compose.cluster.yml \
+        -f deploy/docker/compose.ha.yml config 2>/dev/null); then
+    printf '  %s✗%s could not render the HA topology\n' "$RED" "$R"
+    fail=$((fail + 1)); rm -f "$envf"; return
+  fi
+  rm -f "$envf"
+
+  local n_443
+  n_443=$(printf '%s\n' "$rendered" | python3 -c '
+import sys, yaml
+d = yaml.safe_load(sys.stdin) or {}
+owners = []
+for name, svc in (d.get("services") or {}).items():
+    for p in (svc.get("ports") or []):
+        if isinstance(p, dict) and str(p.get("published")) == "443" \
+           and p.get("protocol", "tcp") == "tcp":
+            owners.append(name)
+print(",".join(sorted(owners)))
+')
+  if [[ "$n_443" != "lb" ]]; then
+    problems+=("host 443/tcp is bound by [${n_443:-nothing}], want exactly [lb] — HTTPS is single-homed unless the balancer owns it")
+  fi
+
+  local missing_certs missing_pp
+  missing_certs=$(printf '%s\n' "$rendered" | python3 -c '
+import sys, yaml
+d = yaml.safe_load(sys.stdin) or {}
+bad = []
+for name, svc in (d.get("services") or {}).items():
+    if not name.startswith("waf"):
+        continue
+    tgts = [v.get("target") for v in (svc.get("volumes") or []) if isinstance(v, dict)]
+    if "/var/lib/sentinel/certs" not in tgts:
+        bad.append(name)
+print(",".join(sorted(bad)))
+')
+  [[ -n "$missing_certs" ]] && problems+=("[$missing_certs] do not mount the shared cert volume — they would serve their own self-signed cert")
+
+  missing_pp=$(printf '%s\n' "$rendered" | python3 -c '
+import sys, yaml
+d = yaml.safe_load(sys.stdin) or {}
+bad = []
+for name, svc in (d.get("services") or {}).items():
+    if not name.startswith("waf"):
+        continue
+    env = svc.get("environment") or {}
+    if isinstance(env, list):
+        env = dict(e.split("=", 1) for e in env if "=" in e)
+    if "https" not in (env.get("SENTINEL_PROXY_PROTOCOL_LISTENERS") or ""):
+        bad.append(name)
+print(",".join(sorted(bad)))
+')
+  [[ -n "$missing_pp" ]] && problems+=("[$missing_pp] do not expect PROXY protocol on https — every HTTPS client would look like the load balancer")
+
+  if (( ${#problems[@]} == 0 )); then
+    printf '  %s✓%s only the balancer owns 443/tcp; every node has the shared certs and expects PROXY protocol\n' "$GRN" "$R"
+  else
+    local msg
+    for msg in "${problems[@]}"; do
+      printf '  %s✗%s %s\n' "$RED" "$R" "$msg"
+      fail=$((fail + 1))
+    done
+  fi
+}
+check_https_is_ha
+
 printf '\n'
 if (( fail )); then
   printf '  %s✗ %d compose problem(s) — an install or a release build would abort%s\n\n' "$RED" "$fail" "$R"

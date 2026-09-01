@@ -26,6 +26,7 @@ pub mod captcha;
 pub mod challenge;
 pub mod http3;
 mod jwks;
+pub mod proxy_protocol;
 /// Continuous security-event feed to a SIEM (see the module docs for why the
 /// alert path could not serve this purpose).
 pub mod siem;
@@ -2136,6 +2137,7 @@ async fn serve_listener(
                 let ds = default_site.clone();
                 let mgmt = management.clone();
                 let av = alt_svc.clone();
+                let pp = cfg.proxy_protocol;
                 // Spawn on the connection tracker so a graceful shutdown can wait
                 // for this in-flight request to finish (bounded) instead of the
                 // runtime dropping it mid-request → 502 (R6).
@@ -2146,7 +2148,7 @@ async fn serve_listener(
                     // active-connection gauge in sync even on panic.
                     let _permit = permit;
                     let _active = ActiveConnGuard::new();
-                    if let Err(e) = handle_connection(stream, peer, acceptor, protos, state, ds, mgmt, av).await {
+                    if let Err(e) = handle_connection(stream, peer, acceptor, protos, state, ds, mgmt, av, pp).await {
                         debug!(peer = %peer, "connection error: {e}");
                     }
                 });
@@ -2194,8 +2196,9 @@ const H2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const H2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[allow(clippy::too_many_arguments)] // connection handler threads through per-listener state
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
-    stream: TcpStream,
+    mut stream: TcpStream,
     peer: SocketAddr,
     tls_acceptor: Option<TlsAcceptor>,
     protocols: Vec<Protocol>,
@@ -2203,8 +2206,33 @@ async fn handle_connection(
     default_site: Option<String>,
     management: Option<Arc<ManagementUpstreams>>,
     alt_svc: Option<header::HeaderValue>,
+    proxy_protocol: bool,
 ) -> anyhow::Result<()> {
     stream.set_nodelay(true)?;
+
+    // PROXY protocol, when this listener is behind a TCP-mode load balancer.
+    //
+    // Consumed BEFORE the JA4 peek and the TLS handshake, because the
+    // ClientHello follows it immediately on the same socket and both rustls and
+    // `peek_ja4` read from the front.
+    //
+    // The header is plaintext and self-asserted, so it is believed only from a
+    // peer that is already a trusted proxy. A connection from anywhere else is
+    // REFUSED rather than served as raw traffic: this listener exists to
+    // establish the client's identity, and a direct connection to it is either a
+    // misconfiguration or someone trying to claim an address they do not have.
+    let peer = if proxy_protocol {
+        if !proxy_header_allowed(peer.ip(), is_trusted_proxy) {
+            anyhow::bail!(
+                "PROXY protocol listener refused a connection from untrusted peer \
+                 {peer} (not in SENTINEL_TRUSTED_PROXIES)"
+            );
+        }
+        let said = proxy_protocol::read_header(&mut stream, HANDSHAKE_TIMEOUT).await?;
+        effective_peer(peer, said)
+    } else {
+        peer
+    };
 
     if let Some(acceptor) = tls_acceptor {
         // Fingerprint the TLS ClientHello (JA4) by peeking the socket without
@@ -4387,6 +4415,40 @@ fn resolve_client_ip(
     headers: &http::HeaderMap,
 ) -> Option<std::net::IpAddr> {
     resolve_client_ip_with(peer, headers, is_trusted_proxy)
+}
+
+/// May a PROXY protocol header from this transport peer be believed?
+///
+/// The header is plaintext and self-asserted: anyone able to reach the listener
+/// directly could claim any source address, which would let them slip past an IP
+/// block or pin an attack on someone else. So it is honoured only from a peer
+/// that is already a trusted proxy — the SAME `SENTINEL_TRUSTED_PROXIES`
+/// boundary that gates `X-Forwarded-For`. Two lists that must agree is one list
+/// too many.
+///
+/// `is_trusted` is injected so this is testable without a process-wide env var,
+/// matching `blocklist_hit` below: the bug worth guarding against is not a wrong
+/// expression, it is a right expression wired to the wrong topology.
+fn proxy_header_allowed(
+    peer: std::net::IpAddr,
+    is_trusted: impl Fn(std::net::IpAddr) -> bool,
+) -> bool {
+    is_trusted(peer)
+}
+
+/// The address the pipeline should treat as the client, given what a PROXY
+/// header said.
+///
+/// `LOCAL`/`UNKNOWN` keeps the transport peer. That case is the balancer
+/// speaking on its own behalf — a health check, overwhelmingly — and HAProxy
+/// checks `/healthz` every 300ms in this topology. Reading it as an address
+/// would stamp every one of those with a bogus client, and on a quiet box that
+/// is most of the "traffic" in the log.
+fn effective_peer(transport: SocketAddr, said: proxy_protocol::Peer) -> SocketAddr {
+    match said {
+        proxy_protocol::Peer::Proxied(real) => real,
+        proxy_protocol::Peer::Local => transport,
+    }
 }
 
 /// Decide whether a request is from a blocklisted address.
@@ -8337,6 +8399,93 @@ mod client_ip_tests {
         // A direct client that is NOT a trusted proxy cannot spoof its IP.
         let peer: IpAddr = "203.0.113.9".parse().unwrap();
         assert_eq!(resolve_client_ip_with(peer, &xff("1.2.3.4"), trusted), None);
+    }
+
+    // ── PROXY protocol ──────────────────────────────────────────────────────
+    // The header is how HTTPS keeps a real client address once the fleet sits
+    // behind a TCP-mode load balancer. It is also plaintext and self-asserted,
+    // so the trust gate is the whole security of it.
+
+    /// A header from an untrusted peer must NOT be believed. Without this, anyone
+    /// who can reach the listener directly prepends a PROXY header and becomes
+    /// whatever address they like — walking past an IP block, or pinning their
+    /// attack on a colleague.
+    #[test]
+    fn a_proxy_header_is_only_believed_from_a_trusted_peer() {
+        let lb: IpAddr = "172.18.0.15".parse().unwrap();
+        let stranger: IpAddr = "203.0.113.9".parse().unwrap();
+        let trusted = |ip: IpAddr| ip == lb;
+
+        assert!(
+            proxy_header_allowed(lb, trusted),
+            "the load balancer's header must be honoured or HTTPS loses client IPs"
+        );
+        assert!(
+            !proxy_header_allowed(stranger, trusted),
+            "a direct client must not be able to assert its own source address"
+        );
+    }
+
+    /// With no trusted proxies configured — the default — nothing is believed.
+    /// Fail closed: a listener accidentally marked proxy_protocol on a
+    /// directly-exposed port must refuse rather than accept spoofable headers.
+    #[test]
+    fn with_no_trusted_proxies_no_header_is_believed() {
+        let none = |_: IpAddr| false;
+        for ip in ["127.0.0.1", "172.18.0.15", "203.0.113.9"] {
+            assert!(!proxy_header_allowed(ip.parse().unwrap(), none));
+        }
+    }
+
+    #[test]
+    fn a_proxied_header_replaces_the_transport_peer() {
+        let transport: SocketAddr = "172.18.0.15:41234".parse().unwrap();
+        let real: SocketAddr = "203.0.113.9:51000".parse().unwrap();
+        assert_eq!(
+            effective_peer(transport, crate::proxy_protocol::Peer::Proxied(real)),
+            real,
+            "the client address from the header is the one the pipeline must use"
+        );
+    }
+
+    /// LOCAL is the balancer's own connection — a health check. Keeping the
+    /// transport peer matters more than it looks: HAProxy probes /healthz every
+    /// 300ms, so on a quiet box these are most of the connections, and turning
+    /// each into a bogus client address would poison the log and the FPR sample
+    /// at once.
+    #[test]
+    fn a_local_header_keeps_the_transport_peer() {
+        let transport: SocketAddr = "172.18.0.15:41234".parse().unwrap();
+        assert_eq!(
+            effective_peer(transport, crate::proxy_protocol::Peer::Local),
+            transport
+        );
+    }
+
+    /// The end-to-end point of the whole feature: a blocked client stays blocked
+    /// when it arrives through the balancer. Before PROXY protocol the peer was
+    /// the LB, so this returned false and the block was inert for HTTPS — the
+    /// same shape as the blocklist bug fixed in 598bcc4, one layer down.
+    #[test]
+    fn a_blocklisted_client_is_still_caught_when_it_arrives_via_the_balancer() {
+        let lb: SocketAddr = "172.18.0.15:41234".parse().unwrap();
+        let attacker: SocketAddr = "203.0.113.9:51000".parse().unwrap();
+        let is_blocked = |ip: IpAddr| ip == attacker.ip();
+        let is_trusted = |ip: IpAddr| ip == lb.ip();
+        let headers = http::HeaderMap::new();
+
+        // What the WAF saw BEFORE this change: the balancer.
+        assert!(
+            !blocklist_hit(lb.ip(), &headers, is_blocked, is_trusted),
+            "sanity: the balancer itself is not blocklisted"
+        );
+        // What it sees now, after the header is applied.
+        let peer = effective_peer(lb, crate::proxy_protocol::Peer::Proxied(attacker));
+        assert!(
+            blocklist_hit(peer.ip(), &headers, is_blocked, is_trusted),
+            "a blocklisted client must not be able to reach the origin by coming \
+             through the load balancer"
+        );
     }
 
     #[test]

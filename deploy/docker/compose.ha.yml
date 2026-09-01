@@ -3,16 +3,38 @@
 # An active-active fleet of 3 stateless WAF nodes behind an HAProxy load
 # balancer. Every node inspects independently (rules/DLP/JWT/etc. from the same
 # control-plane config); Redis holds shared rate-limit state so limits are
-# fleet-wide. Kill any node → HAProxy routes around it in ~1s with zero
-# downtime. Add more nodes by adding waf4/waf5… — horizontal scale.
+# fleet-wide. Add more nodes by adding waf4/waf5… — horizontal scale.
+#
+# Kill any node → HAProxy routes around it in ~1s, on BOTH :80 and :443.
+#
+# The :443 half of that sentence was untrue until now, and it is worth recording
+# why. waf1 published :443 directly, so HTTPS ran on exactly one node: killing
+# waf1 — or merely rolling it during an upgrade — took HTTPS down, which is the
+# protocol every real client uses. The old header claimed zero downtime anyway,
+# and rolling-restart checks did not catch it because they curled ~12s after
+# each roll, long after the outage window had closed.
+#
+# :443/tcp is now fronted by HAProxy in `mode tcp` (see haproxy.cfg). TLS still
+# terminates on the WAF nodes — that is where the SNI cert resolver, ACME,
+# hot-reload and the JA4 fingerprint live — so HAProxy passes bytes through and
+# carries the client address in a PROXY protocol v2 header instead of
+# X-Forwarded-For, which it cannot add without parsing HTTP.
+#
+# STILL SINGLE-HOMED, deliberately: :443/udp (HTTP/3 over QUIC) stays on waf1,
+# because HAProxy 2.9 cannot pass QUIC through in tcp mode. HTTP/3 is therefore
+# best-effort — if waf1 is down, clients get no UDP answer and fall back to TCP,
+# which is fully HA. Alt-Svc still advertises :443, and reaching waf1 over UDP
+# while TCP load-balances is safe because the nodes are stateless and share the
+# cert volume.
 #
 # Each node sets `hostname:` so it reports a friendly id (waf1/waf2/waf3) in its
 # heartbeat — that id shows on the Cluster & Node Health page and matches the
 # HAProxy backend server names.
 #
-# waf1 additionally hosts the management console (:9443) + public HTTPS (:443)
-# and answers to the `dataplane` network alias, so the admin UI and the control
-# plane's cert API keep working when this fleet replaces the single node.
+# waf1 additionally hosts the management console (:9443) and :443/udp for
+# HTTP/3, and answers to the `dataplane` network alias, so the admin UI and the
+# control plane's cert API keep working when this fleet replaces the single node.
+# Public HTTPS over TCP is NOT waf1's any more — HAProxy owns :443/tcp.
 #
 # Usage (from /opt/sentinel-src):
 #   docker compose -f deploy/docker/compose.prod.yml -f deploy/docker/compose.ha.yml up -d waf1 waf2 waf3 lb
@@ -87,6 +109,17 @@ x-wafnode: &wafnode
     SENTINEL_MGMT_DASHBOARD_UPSTREAM: http://dashboard:3000
     SENTINEL_MGMT_API_UPSTREAM: http://controlplane:9501
     SENTINEL_HTTP3_ADVERTISE_PORT: "443"
+    # The `https` listener sits behind HAProxy in tcp mode, so the transport peer
+    # is the balancer and the real client arrives in a PROXY protocol header.
+    # Named per listener rather than a global flag: `:80` is proxied in HTTP mode
+    # (HAProxy injects X-Forwarded-For instead) and the management console is
+    # published straight to loopback, so neither may expect a header.
+    #
+    # Set HERE and not in sentinel.proxy.yaml because one config file serves both
+    # topologies and the correct value is opposite in each: the single-node
+    # compose.prod.yml publishes :443 directly, where expecting a header would
+    # refuse every real client.
+    SENTINEL_PROXY_PROTOCOL_LISTENERS: https
     # ── Client-IP attribution behind the load balancer ────────────────────────
     # REQUIRED in this topology, and inert-by-omission in a way that is easy to miss.
     # Every :80 request reaches these nodes from the `lb` container, so the transport
@@ -113,10 +146,21 @@ x-wafnode: &wafnode
     # hosts that do not permit XDP.
     #
     # Effectiveness differs by port in THIS topology, which is worth knowing
-    # before reading the counters: :443 is published by waf1 directly, so the
-    # transport peer is the client and XDP sees its packets. :80 arrives from
-    # HAProxy, so every packet's source is the LB — a banned client IP never
-    # matches at the XDP layer there, and is still stopped in the proxy.
+    # before reading the counters. Since :443/tcp moved behind HAProxy, BOTH
+    # TCP entrypoints arrive from the LB, so every packet's source is the LB
+    # container and a banned client IP never matches at the XDP layer on either
+    # — it is still stopped in the proxy, one layer up, using the address from
+    # X-Forwarded-For (:80) or the PROXY header (:443).
+    #
+    # This note previously said :443 was published by waf1 directly and that XDP
+    # therefore saw real client packets. That was true and is not any more. The
+    # only entrypoint where the transport peer IS the client is :443/udp
+    # (HTTP/3), which waf1 still publishes.
+    #
+    # The practical consequence: XDP is a DDoS shock absorber for the UDP path
+    # and for anything reaching a node directly, NOT for load-balanced TCP.
+    # Per-source packet-level enforcement for TCP belongs at the edge, which
+    # here means HAProxy's stick-tables (see haproxy.cfg).
     #
     # Auto-ban is safe behind the LB for two independent reasons: the nodes
     # resolve the real client through SENTINEL_TRUSTED_PROXIES above rather than
@@ -209,8 +253,14 @@ services:
       # `ports` entries MERGE across -f layers, so parameterising only one of them
       # leaves the other still binding loopback and yields two conflicting entries.
       - "${SENTINEL_MGMT_BIND:-127.0.0.1:}9443:9443"
-      - "443:8443"           # public WAF entrypoint (HTTPS/TCP — h1+h2)
-      - "443:8443/udp"       # public WAF entrypoint (HTTP/3 over QUIC)
+      # :443/tcp is NOT published here any more — HAProxy owns it so that HTTPS
+      # survives losing this node. Publishing it from a single container is what
+      # made HTTPS single-homed.
+      #
+      # :443/udp stays, because HAProxy 2.9 cannot pass QUIC through. Docker
+      # allows this: tcp/443 (on the lb) and udp/443 (here) are distinct
+      # bindings. HTTP/3 is consequently best-effort — see the header.
+      - "443:8443/udp"       # HTTP/3 over QUIC — waf1 only, best-effort
   waf2:
     <<: *wafnode
     environment:
@@ -226,6 +276,18 @@ services:
       # Kernel BTF so aya can load the BTF-typed BPF maps. Repeated per
       # service because a service-level `volumes:` replaces the anchor's.
       - /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro
+      # The SAME cert repository waf1 uses. Mandatory now that HAProxy spreads
+      # :443 across all three: without it this node would auto-generate its own
+      # self-signed cert per SNI name, so a client would be served a different
+      # certificate depending on which node it happened to land on — a fresh
+      # browser warning on every other request, and any pinning broken.
+      #
+      # Read-write to match waf1 rather than :ro, because a node that meets a new
+      # site first has to be able to write the generated cert. Concurrent writes
+      # are safe: cert_store installs via atomic rename. ACME and operator
+      # uploads still land on waf1 alone — the control plane's cert API points at
+      # the `dataplane` alias, which waf1 owns.
+      - sentinel-certs:/var/lib/sentinel/certs
       - waf2-state:/var/lib/sentinel/state
   waf3:
     <<: *wafnode
@@ -242,6 +304,18 @@ services:
       # Kernel BTF so aya can load the BTF-typed BPF maps. Repeated per
       # service because a service-level `volumes:` replaces the anchor's.
       - /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro
+      # The SAME cert repository waf1 uses. Mandatory now that HAProxy spreads
+      # :443 across all three: without it this node would auto-generate its own
+      # self-signed cert per SNI name, so a client would be served a different
+      # certificate depending on which node it happened to land on — a fresh
+      # browser warning on every other request, and any pinning broken.
+      #
+      # Read-write to match waf1 rather than :ro, because a node that meets a new
+      # site first has to be able to write the generated cert. Concurrent writes
+      # are safe: cert_store installs via atomic rename. ACME and operator
+      # uploads still land on waf1 alone — the control plane's cert API points at
+      # the `dataplane` alias, which waf1 owns.
+      - sentinel-certs:/var/lib/sentinel/certs
       - waf3-state:/var/lib/sentinel/state
 
   lb:
@@ -252,6 +326,9 @@ services:
       - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     ports:
       - "80:80"       # public WAF entrypoint (in front of the fleet)
+      # HTTPS in front of the fleet, tcp passthrough. This is what makes losing
+      # a node survivable for HTTPS rather than only for cleartext.
+      - "443:443"
       # HAProxy health/stats view — LOOPBACK-ONLY. It discloses backend names,
       # health and per-node traffic, which is reconnaissance for anyone probing
       # the edge. Tunnel to it the same way as :9443.
