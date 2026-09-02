@@ -33,10 +33,30 @@ fn install_crypto() {
 use tokio::sync::watch;
 
 // Each test needs a unique listen port to avoid bind conflicts.
-static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(42080);
+static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
 
+/// Hand out a listen port that is unlikely to be taken by anything else.
+///
+/// ⚠️ This was a fixed counter from 42080, and that is inside Linux's default
+/// ephemeral port range (32768–60999). So the kernel was free to hand one of our
+/// ports to any unrelated outbound connection on the machine — a `cargo` fetch, a
+/// sibling CI job, an `apk add` — for the moment we wanted to bind it. The proxy
+/// then failed to bind with EADDRINUSE and the harness reported "proxy never
+/// accepted a connection", which reads as a slow or broken proxy and sent me
+/// looking at CPU contention. Pipeline 30209 failed exactly this way on port
+/// 42084, and the test it blamed was unrelated to the change under test.
+///
+/// Two things fix it: a base BELOW the ephemeral range, and a per-process offset
+/// so two test binaries on one runner do not share a block.
 fn next_port() -> u16 {
-    NEXT_PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    static BASE: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    let base = *BASE.get_or_init(|| {
+        // 20000..30000 in 100-port blocks: below the ephemeral range, above the
+        // well-known/registered ports this project uses (80, 443, 3000, 8080,
+        // 9443, 9501). ~40 ports are needed per process.
+        20_000 + (std::process::id() as u16 % 100) * 100
+    });
+    base + NEXT_PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
 }
 
 fn config_handle(cfg: SentinelConfig) -> ConfigHandle {
@@ -200,6 +220,24 @@ async fn start_mock_upstream() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     (addr, handle)
 }
 
+/// Caps how many proxies may be STARTING at once.
+///
+/// Not a style choice — it fixes a thundering herd that turned this suite red on
+/// findings that did not exist. Every test here spawns its own proxy, and each
+/// startup compiles a CRS rule file, which is the expensive part. `cargo test`
+/// runs the tests concurrently, so all ~34 startups landed simultaneously and
+/// competed for the same cores; on a CI runner one listener lost the race badly
+/// enough to miss even a 30 s bind budget, and the test that reported the failure
+/// was an unrelated one that happened to be scheduled last (pipeline 30209,
+/// `e2e_rce_attack_is_blocked`).
+///
+/// Raising the timeout again would only move the threshold. Limiting concurrent
+/// STARTUPS removes the contention itself: tests still run in parallel, they just
+/// take turns paying the CRS-compile cost. The permit is held until the listener
+/// is actually accepting, so a queued test waits for a real slot rather than
+/// piling on.
+static PROXY_START_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
 async fn start_proxy(
     cfg: SentinelConfig,
 ) -> (
@@ -212,10 +250,18 @@ async fn start_proxy(
     let handle = config_handle(cfg);
     let proxy = ProxyServer::new(handle);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let jh = tokio::spawn(async move { proxy.run(shutdown_rx).await });
+    // Held across spawn AND the bind wait: the point is to bound how many CRS
+    // compiles are in flight, and that work happens inside `run` before the
+    // listener binds.
+    let permit = PROXY_START_SLOTS
+        .acquire()
+        .await
+        .expect("PROXY_START_SLOTS is never closed");
+    let mut jh = tokio::spawn(async move { proxy.run(shutdown_rx).await });
     for bind in &binds {
-        wait_until_accepting(bind).await;
+        jh = wait_until_accepting(bind, jh).await;
     }
+    drop(permit);
     (shutdown_tx, jh)
 }
 
@@ -250,16 +296,38 @@ async fn start_proxy(
 /// milliseconds. Only a genuinely stuck proxy pays the full budget.
 const PROXY_BIND_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
-async fn wait_until_accepting(bind: &str) {
+/// Takes the proxy's join handle and gives it back, so a proxy that DIED can be
+/// reported with its own error instead of as a timeout.
+///
+/// Without this, a bind failure (EADDRINUSE, a permissions problem, a bad config)
+/// looked identical to a slow start: the loop simply span until the budget
+/// expired and blamed the proxy for being slow. That cost a whole diagnosis cycle
+/// on pipeline 30209 — the message said "never accepted a connection" and the
+/// actual cause was a port collision that `run` had already returned as an error
+/// nobody read.
+async fn wait_until_accepting(
+    bind: &str,
+    jh: tokio::task::JoinHandle<anyhow::Result<()>>,
+) -> tokio::task::JoinHandle<anyhow::Result<()>> {
     let deadline = std::time::Instant::now() + PROXY_BIND_BUDGET;
     let mut delay = std::time::Duration::from_millis(2);
     loop {
         if tokio::net::TcpStream::connect(bind).await.is_ok() {
-            return;
+            return jh;
+        }
+        // The proxy exited rather than bound: surface ITS error, which names the
+        // real problem.
+        if jh.is_finished() {
+            match jh.await {
+                Ok(Ok(())) => panic!("proxy on {bind} exited cleanly before accepting"),
+                Ok(Err(e)) => panic!("proxy on {bind} failed to start: {e:#}"),
+                Err(e) => panic!("proxy task on {bind} panicked: {e}"),
+            }
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "proxy never accepted a connection on {bind} within {PROXY_BIND_BUDGET:?}"
+            "proxy never accepted a connection on {bind} within {PROXY_BIND_BUDGET:?} \
+             (task still running, so this is genuinely slow rather than failed)"
         );
         tokio::time::sleep(delay).await;
         delay = (delay * 2).min(std::time::Duration::from_millis(50));
@@ -1730,4 +1798,61 @@ async fn a_learning_site_records_a_graphql_violation_instead_of_blocking_it() {
         body.starts_with(b"upstream-ok:"),
         "the request must actually reach the origin in learning mode"
     );
+}
+
+/// Records what actually happens when a listener cannot bind: the PROCESS STAYS
+/// UP and only an `error!` marks it.
+///
+/// `serve_listener`'s failure is handled inside its own spawned task
+/// (`lib.rs:1960` — `if let Err(e) = serve_listener(..).await { error!(..) }`),
+/// so `ProxyServer::run` neither returns nor stops. A WAF whose `:443` listener
+/// lost its port therefore keeps running, keeps answering `/healthz` with 200,
+/// and serves nothing on that endpoint — while an LB health check against `:80`
+/// passes. That is the configured-but-inert shape at the listener level, and it
+/// is only visible at all because RUST_LOG no longer filters this crate out.
+///
+/// Written as a behaviour record rather than a fix: making a failed listener
+/// fatal, or surfacing it in `/healthz`, is a product decision, not a test
+/// change. This test exists so the next person meets the fact deliberately
+/// instead of spending a cycle on it — as happened with pipeline 30209, where a
+/// port collision presented as "the proxy is slow".
+///
+/// Uses an unparseable bind address rather than a privileged port, because CI
+/// containers frequently run as root and would happily bind port 1.
+#[tokio::test]
+async fn a_listener_that_cannot_bind_does_not_stop_the_proxy() {
+    let (up_addr, _up) = start_mock_upstream().await;
+    let port = next_port();
+    let mut cfg = test_config(
+        port,
+        up_addr.port(),
+        "REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
+        WafMode::Blocking,
+    );
+    cfg.listeners[0].bind = "999.999.999.999:8080".into();
+
+    // Deliberately NOT via `start_proxy`: that would wait out the whole bind
+    // budget, adding 30s to every run of this binary to record one fact.
+    install_crypto();
+    let handle = config_handle(cfg);
+    let proxy = ProxyServer::new(handle);
+    let (tx, rx) = watch::channel(false);
+    let jh = tokio::spawn(async move { proxy.run(rx).await });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    assert!(
+        !jh.is_finished(),
+        "a listener that cannot bind is expected NOT to stop the proxy — if this now \
+         fails, someone has made a listener failure fatal, which is a real improvement: \
+         update this test and note it, do not revert it"
+    );
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err(),
+        "nothing should be listening on {port} — the listener failed to bind"
+    );
+
+    let _ = tx.send(true);
+    let _ = jh.await;
 }

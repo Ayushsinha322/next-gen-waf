@@ -61,6 +61,7 @@ pub struct GraphqlLimits {
 /// it), so this guard fails open rather than rejecting traffic it cannot read.
 pub fn inspect(body: &[u8], limits: &GraphqlLimits) -> Option<String> {
     // Bound the work: only the first MAX_SCAN_BYTES are ever examined.
+    let truncated = body.len() > MAX_SCAN_BYTES;
     let capped = &body[..body.len().min(MAX_SCAN_BYTES)];
 
     // Decode as UTF-8. If truncation split a multi-byte char at the cap
@@ -77,7 +78,50 @@ pub fn inspect(body: &[u8], limits: &GraphqlLimits) -> Option<String> {
         }
     };
 
-    for query in extract_queries(text) {
+    let (queries, from_envelope) = extract_queries(text, truncated);
+
+    // ⚠️ Truncation must not degrade to "allow".
+    //
+    // The cap is 256 KiB while the proxy's default `max_body_size` is 10 MiB, so
+    // a body between the two is accepted and only its prefix is scanned. When the
+    // envelope is cut off, `try_extract_json_queries` finds no `"query"` field,
+    // `extract_queries` falls back to treating the truncated prefix as a raw
+    // GraphQL document, and the prefix — sitting inside one JSON string — has
+    // depth 1. So every limit passed.
+    //
+    // Measured before this guard: a depth-6 query reported
+    // "query depth 6 exceeds max 3" on its own, and returned None when preceded
+    // by 257 KiB of padding in the same JSON object. That is a one-line bypass of
+    // the entire GraphQL firewall.
+    //
+    // Scoped to exactly the shape that was proven exploitable, for two reasons.
+    //
+    // `!from_envelope`: if the `"query"` field WAS readable inside the cap then
+    // the actual query was inspected and the unread tail is variables — a much
+    // weaker risk, and flagging it would reject legitimate large-variable
+    // mutations.
+    //
+    // `looks_like_json_or_query`: the body must at least begin like a JSON
+    // envelope or a GraphQL document. Without this the guard would fire on
+    // GraphQL MULTIPART FILE UPLOADS — the caller's `is_graphql` gate matches on
+    // the URL path, so a `multipart/form-data` upload to /graphql arrives here
+    // with megabytes of file bytes that legitimately are not a query. That is a
+    // real false positive on a common pattern, and it is why this check is not
+    // simply "body too large".
+    let looks_like_json_or_query = {
+        let t = text.trim_start();
+        t.starts_with('{') || t.starts_with('[')
+    };
+    if truncated && looks_like_json_or_query && !from_envelope {
+        return Some(format!(
+            "graphql: body is {} bytes, past the {} byte inspection limit, and no query field \
+             was found within the part that could be read — the query cannot be inspected",
+            body.len(),
+            MAX_SCAN_BYTES
+        ));
+    }
+
+    for query in queries {
         if let Some(reason) = inspect_query(query.as_ref(), limits) {
             return Some(reason);
         }
@@ -87,20 +131,63 @@ pub fn inspect(body: &[u8], limits: &GraphqlLimits) -> Option<String> {
 
 /// Extract the GraphQL query string(s) from a request body.
 ///
-/// Returns owned/borrowed query texts. Falls back to the whole body when the
-/// input is not a JSON envelope carrying a string `"query"` field.
-fn extract_queries(text: &str) -> Vec<std::borrow::Cow<'_, str>> {
+/// Returns the query texts and whether they came from a JSON transport envelope.
+///
+/// The bool matters to the caller: `false` means the fallback fired and the whole
+/// input is being treated as one raw GraphQL document. That is correct for a
+/// genuine `application/graphql` body, and it is also what happens when a JSON
+/// envelope was truncated — which is how a padded body slipped past every limit.
+/// `inspect` needs to tell those apart.
+fn extract_queries(text: &str, truncated: bool) -> (Vec<std::borrow::Cow<'_, str>>, bool) {
     let trimmed = text.trim_start();
     // A raw GraphQL document also starts with `{`, but it is not valid JSON
     // (unquoted keys), so JSON parsing will fail and we fall through.
     if trimmed.starts_with('{') || trimmed.starts_with('[') {
         if let Some(queries) = try_extract_json_queries(text) {
             if !queries.is_empty() {
-                return queries.into_iter().map(std::borrow::Cow::Owned).collect();
+                return (
+                    queries.into_iter().map(std::borrow::Cow::Owned).collect(),
+                    true,
+                );
+            }
+        }
+        // A truncated body can NEVER satisfy the strict parse above, which
+        // requires the document to end cleanly (`p.i == p.b.len()`) so a raw
+        // GraphQL doc is not half-read as JSON. Without this salvage pass every
+        // body over the cap would be reported as un-inspectable, including the
+        // ordinary case of a modest query followed by a large `variables` blob —
+        // turning a bypass fix into a false positive on legitimate mutations.
+        //
+        // So: parse as far as the data allows and keep whatever `"query"` fields
+        // were complete. If the query was readable, we really did inspect it.
+        if truncated {
+            let salvaged = salvage_json_queries(text);
+            if !salvaged.is_empty() {
+                return (
+                    salvaged.into_iter().map(std::borrow::Cow::Owned).collect(),
+                    true,
+                );
             }
         }
     }
-    vec![std::borrow::Cow::Borrowed(text)]
+    (vec![std::borrow::Cow::Borrowed(text)], false)
+}
+
+/// Collect every complete string `"query"` field from a possibly-truncated JSON
+/// document, ignoring the fact that the document does not end.
+///
+/// Deliberately discards the parse result: a cut-off document always fails, and
+/// what matters is whether a query field was fully readable before the bytes ran
+/// out. Bounded by the same [`MAX_JSON_DEPTH`] as the strict parser.
+fn salvage_json_queries(text: &str) -> Vec<String> {
+    let mut p = JsonParser {
+        b: text.as_bytes(),
+        i: 0,
+        out: Vec::new(),
+    };
+    p.skip_ws();
+    let _ = p.parse_value(0);
+    p.out
 }
 
 // ---------------------------------------------------------------------------
@@ -641,5 +728,105 @@ mod tests {
         let _ = inspect(b"{ a(x: \"unterminated", &limits);
         let _ = inspect(b"\"\"\"unterminated block", &limits);
         let _ = inspect(b"{{{{{{{{{{", &limits);
+    }
+
+    // --- truncation must not degrade to "allow" ---------------------------
+
+    /// The bypass, pinned. The proxy's default `max_body_size` is 10 MiB while
+    /// this scanner caps at 256 KiB, so a body between the two is accepted and
+    /// only its prefix is read. Padding the JSON so the `"query"` field falls
+    /// past the cap used to defeat every limit at once.
+    #[test]
+    fn a_query_pushed_past_the_scan_cap_is_not_silently_allowed() {
+        let limits = GraphqlLimits {
+            max_depth: 3,
+            max_complexity: 1000,
+            block_introspection: true,
+        };
+        let deep = "{ a { b { c { d { e { f } } } } } }";
+
+        // Control: the same query, unpadded, is caught on depth.
+        let small = format!(r#"{{"query":"{deep}"}}"#);
+        let caught = inspect(small.as_bytes(), &limits);
+        assert!(
+            caught.is_some_and(|r| r.contains("depth")),
+            "the control query must be caught, or this test proves nothing"
+        );
+
+        // The bypass: identical query, preceded by padding past the cap.
+        let pad = "a".repeat(MAX_SCAN_BYTES + 1024);
+        let padded = format!(r#"{{"pad":"{pad}","query":"{deep}"}}"#);
+        assert!(
+            padded.len() > MAX_SCAN_BYTES,
+            "the fixture must actually exceed the cap"
+        );
+        let verdict = inspect(padded.as_bytes(), &limits);
+        assert!(
+            verdict.is_some(),
+            "a body whose query sits beyond the inspection cap must NOT be reported \
+             clean — it is un-inspected, not innocent. This returned None before the \
+             fix, which bypassed depth, complexity and introspection in one line."
+        );
+    }
+
+    /// The false positive the truncation guard must NOT cause.
+    ///
+    /// The caller's `is_graphql` gate matches on the URL path, so a GraphQL
+    /// multipart file upload (graphql-multipart-request-spec) reaches `inspect`
+    /// with megabytes of file bytes that are legitimately not a query. A guard
+    /// phrased as "body too large" would reject every such upload.
+    #[test]
+    fn a_multipart_upload_body_is_not_flagged_as_uninspectable() {
+        let limits = GraphqlLimits {
+            max_depth: 3,
+            max_complexity: 1000,
+            block_introspection: true,
+        };
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            b"--boundary123\r\nContent-Disposition: form-data; name=\"operations\"\r\n\r\n",
+        );
+        body.extend_from_slice(br#"{"query":"mutation($f: Upload!){ upload(file: $f) { id } }"}"#);
+        body.extend_from_slice(b"\r\n--boundary123\r\n");
+        // A file payload comfortably past the scan cap.
+        body.extend_from_slice(&vec![b'\x89'; MAX_SCAN_BYTES + 4096]);
+        assert_eq!(
+            inspect(&body, &limits),
+            None,
+            "a multipart upload must not be reported as un-inspectable: it does not begin \
+             like a JSON envelope or a GraphQL document, and rejecting it would break a \
+             standard GraphQL upload"
+        );
+    }
+
+    /// The other direction, so the guard above cannot be "fixed" by rejecting
+    /// every large body. A big body whose query IS visible within the cap has
+    /// been genuinely inspected; the unread tail is variables. Rejecting those
+    /// would break legitimate large mutations.
+    #[test]
+    fn a_large_body_whose_query_is_readable_is_still_judged_on_the_query() {
+        let limits = GraphqlLimits {
+            max_depth: 3,
+            max_complexity: 1000,
+            block_introspection: true,
+        };
+        // `query` first, then padding in a later field.
+        let pad = "a".repeat(MAX_SCAN_BYTES + 1024);
+        let ok_body = format!(r#"{{"query":"{{ a {{ b }} }}","variables":{{"blob":"{pad}"}}}}"#);
+        assert!(ok_body.len() > MAX_SCAN_BYTES);
+        assert_eq!(
+            inspect(ok_body.as_bytes(), &limits),
+            None,
+            "a shallow query is clean even in a large body — the truncation guard must \
+             not fire when the query itself was read"
+        );
+
+        // And a violating query in the same shape is still caught on its merits.
+        let deep = "{ a { b { c { d { e { f } } } } } }";
+        let bad_body = format!(r#"{{"query":"{deep}","variables":{{"blob":"{pad}"}}}}"#);
+        assert!(
+            inspect(bad_body.as_bytes(), &limits).is_some_and(|r| r.contains("depth")),
+            "the reason must still name the real violation, not the truncation"
+        );
     }
 }
