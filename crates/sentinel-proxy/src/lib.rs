@@ -1566,6 +1566,7 @@ impl ProxyServer {
                 .ok()
                 .and_then(|s| s.parse::<u32>().ok())
                 .unwrap_or(3);
+            TI_POLLER_STARTED.store(true, std::sync::atomic::Ordering::Relaxed);
             tokio::spawn(async move {
                 use http_body_util::BodyExt as _;
                 type EmptyBody = http_body_util::Empty<bytes::Bytes>;
@@ -1574,6 +1575,16 @@ impl ProxyServer {
                 let internal_secret = std::env::var("SENTINEL_INTERNAL_SECRET")
                     .ok()
                     .filter(|s| !s.is_empty());
+                // `internal_secret_set` is the field that separates "running"
+                // from "running and being refused with 403 forever".
+                info!(
+                    sync_url = %sync_url,
+                    interval_secs = secs,
+                    watch_score,
+                    xdp_seed = seed_ti_xdp,
+                    internal_secret_set = internal_secret.is_some(),
+                    "threat-intel poller started"
+                );
                 let mut last_version: i64 = i64::MIN;
                 let mut ticker = tokio::time::interval(Duration::from_secs(secs));
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1601,6 +1612,14 @@ impl ProxyServer {
                             continue;
                         }
                     };
+                    // Inspect the STATUS before parsing the body. It never was:
+                    // a 403 (secret mismatch) or 503 (control plane without a
+                    // database) fell straight into `serde_json::from_slice`, and
+                    // this node's IOC set stayed frozen at whatever it last held
+                    // — or at empty — with the only trace being a parse warning
+                    // that named a JSON error rather than the refusal.
+                    let status = resp.status().as_u16();
+                    TI_LAST_STATUS.store(status, std::sync::atomic::Ordering::Relaxed);
                     let bytes = match resp.collect().await {
                         Ok(b) => b.to_bytes(),
                         Err(e) => {
@@ -1608,6 +1627,20 @@ impl ProxyServer {
                             continue;
                         }
                     };
+                    if !(200..300).contains(&status) {
+                        let held = ti_modules.threat_intel.load().entry_count();
+                        warn!(
+                            status,
+                            held_indicators = held,
+                            snippet = %String::from_utf8_lossy(&bytes).chars().take(120).collect::<String>(),
+                            "threat-intel sync REFUSED by the control plane — this node's IOC set \
+                             is FROZEN and will not update. 403 means the shared secret does not \
+                             match: set SENTINEL_INTERNAL_SECRET identically on the control plane \
+                             and every data-plane node. 503 means the control plane has no \
+                             database. Queryable at /healthz -> threat_intel.poller."
+                        );
+                        continue;
+                    }
                     let sync: ThreatIntelSyncResponse = match serde_json::from_slice(&bytes) {
                         Ok(s) => s,
                         Err(e) => {
@@ -1653,16 +1686,69 @@ impl ProxyServer {
                             sync.watch.into(),
                         );
                         let count = feed.entry_count();
+                        // Captured BEFORE the store, or an empty install cannot
+                        // be told from a first install.
+                        let previous = ti_modules.threat_intel.load().entry_count();
                         last_version = sync.version;
                         ti_modules.threat_intel.store(Arc::new(feed));
-                        info!(
-                            version = last_version,
-                            iocs = count,
-                            "threat-intel hot-synced"
-                        );
+                        // One `info!("hot-synced")` used to cover every outcome,
+                        // so replacing 200,000 indicators with zero logged
+                        // exactly like a healthy sync.
+                        match ti_sync_outcome(previous, count, status) {
+                            TiSyncOutcome::Synced { count } => info!(
+                                version = last_version,
+                                iocs = count,
+                                previous_iocs = previous,
+                                "threat-intel hot-synced"
+                            ),
+                            TiSyncOutcome::EmptyRegression { previous } => warn!(
+                                version = last_version,
+                                previous_iocs = previous,
+                                "threat-intel feed synced EMPTY — global IOC enforcement is now OFF \
+                                 on this node, replacing a feed that held {previous} indicators. \
+                                 check() now returns None for every request. Check the aggregator \
+                                 on the control-plane leader (SENTINEL_THREATINTEL_ENABLED, feed \
+                                 URLs, threat_intel_iocs.expires_at). \
+                                 Queryable at /healthz -> threat_intel.active."
+                            ),
+                            TiSyncOutcome::EmptyFirst => info!(
+                                version = last_version,
+                                "threat-intel feed is empty — no IOC enforcement on this node yet; \
+                                 the control-plane corpus has no active indicators"
+                            ),
+                            // Unreachable: a non-2xx `continue`s above. Kept so
+                            // the match is exhaustive rather than silently
+                            // collapsing a future outcome into "synced".
+                            TiSyncOutcome::Rejected { status } => warn!(
+                                status,
+                                "threat-intel sync reached the install path with a non-2xx status"
+                            ),
+                        }
                     }
                 }
             });
+        } else {
+            // The `else` this loop never had. Without a sync URL the poller is
+            // never spawned, so every request is served against the
+            // `ThreatFeed::empty()` installed at construction: `check()`
+            // short-circuits and every malicious IP, CIDR, Tor exit, botnet C2,
+            // malicious domain and scanner user-agent in the control-plane
+            // corpus is ignored.
+            //
+            // WARN and not ERROR deliberately: `cluster.sync_url` also drives
+            // config sync and the heartbeat, so a node without one is a
+            // standalone, file-configured deployment where no threat intel was
+            // ever expected. Crying ERROR at that shape would be the 216-line
+            // mistake again. What must not happen is SILENCE — this failure
+            // otherwise looks exactly like a world with no attackers.
+            warn!(
+                config_key = "cluster.sync_url",
+                "threat-intel poller NOT started — global IOC enforcement is OFF on this node. \
+                 The feed stays empty, so check() returns None for every request. If this node is \
+                 meant to be part of a cluster, set cluster.sync_url (e.g. \
+                 http://controlplane:9501); if it is deliberately standalone, this is expected. \
+                 Queryable at /healthz -> threat_intel.poller."
+            );
         }
 
         // --- Background: control-plane node heartbeat (every 10 s) ---
@@ -4439,6 +4525,103 @@ fn enforce_mode(ctx: &mut RequestContext, mode: &WafMode) {
 /// the request path refuse rather than serve a site it cannot yet inspect.
 static ENGINES_WARMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+// --- Threat-intel poller state, for /healthz -------------------------------
+//
+// The poller is spawned only when `cluster.sync_url` is set, and there was no
+// `else`: without it the node served every request against the
+// `ThreatFeed::empty()` installed at construction. `check()` short-circuits on
+// an empty feed, `/healthz` had no `threat_intel` key at all, and the heartbeat
+// carried nothing — so every malicious IP, CIDR, Tor exit, C2 and scanner UA in
+// the control-plane corpus was ignored, with NO observable symptom. Unlike
+// config sync or the heartbeat, this failure looks exactly like a world with no
+// attackers.
+static TI_POLLER_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// HTTP status of the most recent sync attempt; 0 = no attempt has completed.
+/// A 403 here means the shared secret does not match and this node's IOC set is
+/// frozen — which previously produced no log line at all, because the status was
+/// never inspected before the body was parsed.
+static TI_LAST_STATUS: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+/// What the poller should do with a completed fetch, extracted so it can be
+/// tested without a control plane.
+///
+/// The old code had one `info!("threat-intel hot-synced")` for every outcome, so
+/// installing 0 indicators over 200,000 logged identically to a healthy sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TiSyncOutcome {
+    /// Non-2xx: nothing is installed and the existing feed is frozen.
+    Rejected {
+        status: u16,
+    },
+    /// An empty corpus replaced a populated feed — enforcement just went off.
+    EmptyRegression {
+        previous: usize,
+    },
+    /// Empty, and nothing was there before. Not a regression, not a success.
+    EmptyFirst,
+    Synced {
+        count: usize,
+    },
+}
+
+fn ti_sync_outcome(previous: usize, new_count: usize, status: u16) -> TiSyncOutcome {
+    if !(200..300).contains(&status) {
+        return TiSyncOutcome::Rejected { status };
+    }
+    if new_count == 0 {
+        return if previous > 0 {
+            TiSyncOutcome::EmptyRegression { previous }
+        } else {
+            TiSyncOutcome::EmptyFirst
+        };
+    }
+    TiSyncOutcome::Synced { count: new_count }
+}
+
+/// Is global IOC enforcement actually on, and if not, why not?
+///
+/// `active` is the field that matters: `configured` merely means a sync URL
+/// exists. Mirrors `geoip_status`'s shape, and reaches the console for free
+/// because `/waf/status` proxies `/healthz` verbatim.
+fn threat_intel_status(cfg: &SentinelConfig, feed: &ThreatFeed) -> serde_json::Value {
+    use std::sync::atomic::Ordering;
+    let configured = cfg.cluster.sync_url.is_some();
+    let started = TI_POLLER_STARTED.load(Ordering::Relaxed);
+    let last_status = TI_LAST_STATUS.load(Ordering::Relaxed);
+    let entries = feed.entry_count();
+    let poller = if !configured {
+        "not_configured"
+    } else if !started {
+        "not_started"
+    } else if last_status == 0 {
+        "starting"
+    } else if (200..300).contains(&last_status) {
+        "running"
+    } else {
+        "rejected"
+    };
+    serde_json::json!({
+        "configured": configured,
+        "poller": poller,
+        "last_sync_status": last_status,
+        "version": feed.version(),
+        "entries": entries,
+        // The single honest summary: are IOCs being enforced on this node?
+        "active": entries > 0,
+        "inert_reason": if entries > 0 {
+            serde_json::Value::Null
+        } else if !configured {
+            serde_json::json!("no cluster.sync_url — this node never fetches the IOC corpus")
+        } else if poller == "rejected" {
+            serde_json::json!(format!(
+                "control plane refused the sync with HTTP {last_status} (403 = SENTINEL_INTERNAL_SECRET mismatch)"
+            ))
+        } else {
+            serde_json::json!("the control-plane corpus returned no active indicators")
+        },
+    })
+}
+
 /// Whether `site` is one that SHOULD have a compiled engine.
 ///
 /// Mirrors the skip conditions in `build_rule_engines` exactly. It has to: a
@@ -6402,6 +6585,14 @@ fn health_response(state: &ServerState) -> Response<BoxBody> {
         // the field that matters — non-empty means a site's country policy is
         // displayed and not applied, because no MaxMind database is present.
         "geoip": geoip_status(&state.config.load(), &state.modules.geoip_map.load()),
+        // Global IOC enforcement: is it on, and if not, why not? `active` is the
+        // honest summary; `configured` only means a sync URL exists. There was no
+        // `threat_intel` key here at all, which is how a node serving every
+        // request against an empty feed looked identical to a healthy one.
+        "threat_intel": threat_intel_status(
+            &state.config.load(),
+            &state.modules.threat_intel.load(),
+        ),
         // Module reachability. Seven subsystems had no logging at all, and their
         // entry points are per-request pure functions on attacker-controlled
         // input, so they cannot be given log lines. These counters answer the one
@@ -10030,6 +10221,83 @@ mod engine_warming_tests {
         assert!(
             !ENGINES_WARMING.load(std::sync::atomic::Ordering::Acquire),
             "a freshly started proxy has already built its engines and must serve"
+        );
+    }
+}
+
+#[cfg(test)]
+mod threat_intel_visibility_tests {
+    use super::*;
+
+    /// The four outcomes the old single `info!("hot-synced")` collapsed into one.
+    ///
+    /// Extracted as a pure function precisely so this is testable: the log text
+    /// itself is not assertable here (the subscriber is process-wide), and the
+    /// decision is the part that was wrong — installing 0 indicators over 200,000
+    /// logged exactly like a healthy sync.
+    #[test]
+    fn an_empty_feed_replacing_a_populated_one_is_not_a_success() {
+        assert_eq!(
+            ti_sync_outcome(200_000, 0, 200),
+            TiSyncOutcome::EmptyRegression { previous: 200_000 },
+            "enforcement just went off; this must never read as 'hot-synced'"
+        );
+        assert_eq!(
+            ti_sync_outcome(0, 0, 200),
+            TiSyncOutcome::EmptyFirst,
+            "a first sync that is empty is not a regression — warning here would cry wolf \
+             on every fresh deployment"
+        );
+        assert_eq!(
+            ti_sync_outcome(10, 50_000, 200),
+            TiSyncOutcome::Synced { count: 50_000 }
+        );
+    }
+
+    /// A refusal must never be treated as data. The status was not inspected at
+    /// all, so a 403 body went into `serde_json::from_slice` and the only trace
+    /// was a parse error naming JSON rather than the refusal.
+    #[test]
+    fn a_non_2xx_status_is_a_refusal_whatever_the_body_said() {
+        for status in [301u16, 400, 401, 403, 500, 503] {
+            assert_eq!(
+                ti_sync_outcome(1_000, 5_000, status),
+                TiSyncOutcome::Rejected { status },
+                "HTTP {status} must be reported as a refusal, not installed"
+            );
+        }
+    }
+
+    /// `/healthz` must say IOC enforcement is off, and why, for each way it can
+    /// be off. Before this there was no `threat_intel` key at all, so a node
+    /// enforcing nothing looked exactly like a healthy one.
+    #[test]
+    fn healthz_reports_why_ioc_enforcement_is_inactive() {
+        let mut cfg = SentinelConfig::default();
+        let feed = ThreatFeed::empty();
+
+        // 1. No sync URL — the shape that has no observable symptom.
+        cfg.cluster.sync_url = None;
+        let s = threat_intel_status(&cfg, &feed);
+        assert_eq!(s["configured"], false);
+        assert_eq!(s["active"], false);
+        assert_eq!(s["poller"], "not_configured");
+        assert!(
+            s["inert_reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("cluster.sync_url")),
+            "the reason must name the config key that fixes it, got {:?}",
+            s["inert_reason"]
+        );
+
+        // 2. Configured, but the poller has not been spawned.
+        cfg.cluster.sync_url = Some("http://controlplane:9501".into());
+        let s = threat_intel_status(&cfg, &feed);
+        assert_eq!(s["configured"], true);
+        assert_eq!(s["active"], false);
+        assert_eq!(
+            s["poller"], "not_started",
+            "configured-but-not-running must be distinguishable from not-configured"
         );
     }
 }
