@@ -6623,7 +6623,18 @@ fn health_response(state: &ServerState) -> Response<BoxBody> {
                 "attempts": ja4_attempts_total(),
                 "success": ja4_success_total(),
             },
-            "bot": { "good_bot_allowed_unverified": bot_good_bot_allowed_total() },
+            "bot": {
+                "good_bot_allowed_unverified": bot_good_bot_allowed_total(),
+                // Sizes, because they are smaller than the feature name suggests
+                // and nothing reported them. The JA4 table is a static built-in
+                // whose own comment calls it "for demonstration", and the proxy
+                // re-creates the detector with `new()` on every config reload —
+                // so any fingerprint added at runtime is discarded. A JA4
+                // blocklist that is quietly this small should be readable.
+                "ja4_fingerprints": state.modules.bot_detector.load().ja4_fingerprint_count(),
+                "attacker_ua_patterns": state.modules.bot_detector.load().attacker_pattern_count(),
+                "good_bot_ua_patterns": state.modules.bot_detector.load().good_bot_pattern_count(),
+            },
         },
         "upstreams_healthy": pool_stats.healthy,
         "upstreams_total": pool_stats.total,

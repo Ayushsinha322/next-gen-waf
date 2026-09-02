@@ -235,8 +235,23 @@ async fn start_proxy(
 ///
 /// Probing by connecting rather than by trying to bind the address ourselves:
 /// binding would race the proxy for the port and could make it fail to start.
+/// Wait for a freshly started proxy to bind.
+///
+/// The budget is generous on purpose. Every test in this binary spawns its own
+/// proxy AND mock upstream, `cargo test` runs them concurrently, and each proxy
+/// compiles a CRS rule file at startup — so the wall-clock cost of binding scales
+/// with how many tests exist, not with how much work any one of them does. At 34
+/// tests a 10s budget produced intermittent "never accepted a connection"
+/// failures on two unrelated tests under load, which is a red CI run reporting a
+/// bug that is not there.
+///
+/// Raising it costs nothing on the happy path: this is a poll loop that returns
+/// the instant the port accepts, so a healthy proxy still proceeds in
+/// milliseconds. Only a genuinely stuck proxy pays the full budget.
+const PROXY_BIND_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
 async fn wait_until_accepting(bind: &str) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + PROXY_BIND_BUDGET;
     let mut delay = std::time::Duration::from_millis(2);
     loop {
         if tokio::net::TcpStream::connect(bind).await.is_ok() {
@@ -244,7 +259,7 @@ async fn wait_until_accepting(bind: &str) {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "proxy never accepted a connection on {bind} within 10s"
+            "proxy never accepted a connection on {bind} within {PROXY_BIND_BUDGET:?}"
         );
         tokio::time::sleep(delay).await;
         delay = (delay * 2).min(std::time::Duration::from_millis(50));

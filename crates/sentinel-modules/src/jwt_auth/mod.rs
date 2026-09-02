@@ -232,26 +232,88 @@ pub fn validate(token: &str, key: &DecodingKey, policy: &JwtPolicy) -> Result<()
     Ok(())
 }
 
-/// Parse a JWKS document into a `kid -> DecodingKey` map (RSA and EC keys).
+/// What happened while parsing a JWKS document, alongside the keys.
 ///
-/// Keys without a `kid`, and keys this build cannot turn into a
-/// [`DecodingKey`] (unsupported type, malformed parameters), are skipped. A
-/// document that is not valid JWKS JSON yields an empty map. Never panics.
-pub fn decoding_keys_from_jwks(jwks_json: &[u8]) -> HashMap<String, DecodingKey> {
+/// The bare-map version of this function discarded every one of these facts, and
+/// each of them is a total authentication outage that looks identical from the
+/// outside: every token comes back "unknown key id".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JwksParse {
+    /// Keys usable for verification, by `kid`.
+    pub usable: usize,
+    /// Keys present in the document.
+    pub total: usize,
+    /// Keys dropped because they carry no `kid` — unusable here, since key
+    /// selection is by `kid`.
+    pub skipped_no_kid: usize,
+    /// Keys whose parameters this build cannot turn into a `DecodingKey`.
+    pub skipped_unusable: usize,
+    /// Symmetric (`oct`) keys. Worth naming separately: `DecodingKey::from_jwk`
+    /// accepts them as HMAC verification keys, so if the algorithm allow-list
+    /// includes any HS\*, anyone who can GET the public JWKS can mint accepted
+    /// tokens.
+    pub symmetric: usize,
+    /// The whole document failed to deserialize. NOT the same as "no usable
+    /// keys": `jsonwebtoken`'s `AlgorithmParameters` is `#[serde(untagged)]`, so
+    /// ONE key with an unsupported `kty` or curve fails the entire document and
+    /// collapses the key set to zero. An IdP publishing one extra key it happens
+    /// not to model is therefore a full outage for every site on that endpoint.
+    pub parse_error: Option<String>,
+}
+
+/// Parse a JWKS document into a `kid -> DecodingKey` map, reporting what was
+/// dropped and why.
+///
+/// Prefer this over [`decoding_keys_from_jwks`] anywhere the result can be
+/// logged: an empty map has at least four distinct causes with four different
+/// fixes, and the bare map cannot tell them apart.
+pub fn decoding_keys_from_jwks_diag(jwks_json: &[u8]) -> (HashMap<String, DecodingKey>, JwksParse) {
     let mut out = HashMap::new();
+    let mut diag = JwksParse::default();
     let set: jsonwebtoken::jwk::JwkSet = match serde_json::from_slice(jwks_json) {
         Ok(s) => s,
-        Err(_) => return out,
+        Err(e) => {
+            diag.parse_error = Some(e.to_string());
+            return (out, diag);
+        }
     };
+    diag.total = set.keys.len();
     for jwk in &set.keys {
+        if matches!(
+            jwk.algorithm,
+            jsonwebtoken::jwk::AlgorithmParameters::OctetKey(_)
+        ) {
+            diag.symmetric += 1;
+        }
         let Some(kid) = jwk.common.key_id.clone() else {
+            diag.skipped_no_kid += 1;
             continue;
         };
-        if let Ok(key) = DecodingKey::from_jwk(jwk) {
-            out.insert(kid, key);
+        match DecodingKey::from_jwk(jwk) {
+            Ok(key) => {
+                out.insert(kid, key);
+            }
+            Err(_) => diag.skipped_unusable += 1,
         }
     }
-    out
+    diag.usable = out.len();
+    (out, diag)
+}
+
+/// Parse a JWKS document into a `kid -> DecodingKey` map (RSA and EC keys).
+///
+/// Keys without a `kid` are skipped, as are keys this build cannot turn into a
+/// [`DecodingKey`]. Never panics.
+///
+/// ⚠️ An empty result has FOUR causes and this signature cannot distinguish
+/// them: the document did not deserialize at all, every key lacked a `kid`, no
+/// key was usable, or the document was legitimately empty. Note in particular
+/// that `AlgorithmParameters` is `#[serde(untagged)]`, so a single key with an
+/// unsupported `kty` fails the WHOLE document rather than being skipped — the
+/// previous wording of this comment claimed otherwise. Use
+/// [`decoding_keys_from_jwks_diag`] when the outcome will be reported.
+pub fn decoding_keys_from_jwks(jwks_json: &[u8]) -> HashMap<String, DecodingKey> {
+    decoding_keys_from_jwks_diag(jwks_json).0
 }
 
 /// Extract `(kid, alg)` from a token's header without verifying it.
@@ -313,6 +375,79 @@ koEda5KI9GGGrxKxXH83O31wE/gUUzRcJ1IHjfrwr/97SZ3nXnMGctVGJOTvtXqZ
 
     // A JWKS carrying the RSA public key above under kid "test-key-1".
     const JWKS_ONE_RSA: &str = r#"{"keys":[{"kty":"RSA","use":"sig","kid":"test-key-1","alg":"RS256","n":"xaD317IDxcJBNfI-KdEoFPJmyNoC5JY845FOFdWpuD0lYPVZ9NdW1dnEs2GdJiUGEyGKCCoo9XjKgYxmFmvLNjYe8-c_FrhdYBlwmI9abxpcvicUpuqm7ZmkSFhh2o5twKRT8WVCQFHGH_R2vwisqFq0r-tUJtPDZSPVLLSBsw2Wnlum_nIp7VmaNosxuaw5BNW07Y5ZEqfvwYgr1Z90koEda5KI9GGGrxKxXH83O31wE_gUUzRcJ1IHjfrwr_97SZ3nXnMGctVGJOTvtXqZ0_RZYhFrLSpcymKgnSIkk4bAd8KbBxN78H7PQc5ZPwokGTNqjaokB5rZp3WWPZPb8Q","e":"AQAB"}]}"#;
+
+    // --- JWKS diagnostics -------------------------------------------------
+    //
+    // An empty key map is a TOTAL authentication outage: every token comes back
+    // "unknown key id". It has four distinct causes with four different fixes,
+    // and the bare-map signature discarded all of them.
+
+    /// The one that turns an IdP's routine key addition into an outage.
+    ///
+    /// `AlgorithmParameters` is `#[serde(untagged)]`, so a single key with a
+    /// `kty` this build does not model fails the WHOLE document — the valid RSA
+    /// key beside it is lost too. The old doc comment claimed such keys were
+    /// "skipped"; they are not.
+    #[test]
+    fn one_unmodellable_key_collapses_the_entire_key_set() {
+        let mixed = r#"{"keys":[
+          {"kty":"RSA","use":"sig","kid":"good","alg":"RS256","n":"xaD317IDxcJBNfI-KdEoFPJmyNoC5JY845FOFdWpuD0lYPVZ9NdW1dnEs2GdJiUGEyGKCCoo9XjKgYxmFmvLNjYe8-c_FrhdYBlwmI9abxpcvicUpuqm7ZmkSFhh2o5twKRT8WVCQFHGH_R2vwisqFq0r-tUJtPDZSPVLLSBsw2Wnlum_nIp7VmaNosxuaw5BNW07Y5ZEqfvwYgr1Z90koEda5KI9GGGrxKxXH83O31wE_gUUzRcJ1IHjfrwr_97SZ3nXnMGctVGJOTvtXqZ0_RZYhFrLSpcymKgnSIkk4bAd8KbBxN78H7PQc5ZPwokGTNqjaokB5rZp3WWPZPb8Q","e":"AQAB"},
+          {"kty":"UNKNOWN-KTY","kid":"weird","alg":"XX999"}
+        ]}"#;
+        let (keys, diag) = decoding_keys_from_jwks_diag(mixed.as_bytes());
+        assert!(
+            keys.is_empty(),
+            "documented behaviour: the untagged enum makes this all-or-nothing"
+        );
+        assert!(
+            diag.parse_error.is_some(),
+            "the cause MUST be reported — an empty map alone cannot be told from a \
+             legitimately empty JWKS, and the two have completely different fixes"
+        );
+    }
+
+    /// A key with no `kid` is unusable here (selection is by `kid`) and must be
+    /// counted rather than vanishing.
+    #[test]
+    fn keys_without_a_kid_are_counted_not_silently_dropped() {
+        let no_kid = r#"{"keys":[{"kty":"RSA","use":"sig","alg":"RS256","n":"xaD317IDxcJBNfI-KdEoFPJmyNoC5JY845FOFdWpuD0lYPVZ9NdW1dnEs2GdJiUGEyGKCCoo9XjKgYxmFmvLNjYe8-c_FrhdYBlwmI9abxpcvicUpuqm7ZmkSFhh2o5twKRT8WVCQFHGH_R2vwisqFq0r-tUJtPDZSPVLLSBsw2Wnlum_nIp7VmaNosxuaw5BNW07Y5ZEqfvwYgr1Z90koEda5KI9GGGrxKxXH83O31wE_gUUzRcJ1IHjfrwr_97SZ3nXnMGctVGJOTvtXqZ0_RZYhFrLSpcymKgnSIkk4bAd8KbBxN78H7PQc5ZPwokGTNqjaokB5rZp3WWPZPb8Q","e":"AQAB"}]}"#;
+        let (keys, diag) = decoding_keys_from_jwks_diag(no_kid.as_bytes());
+        assert!(keys.is_empty());
+        assert_eq!(diag.total, 1);
+        assert_eq!(diag.skipped_no_kid, 1);
+        assert!(
+            diag.parse_error.is_none(),
+            "this parsed fine; it is just unusable"
+        );
+    }
+
+    /// A healthy document reports itself as healthy, so the diagnostics cannot
+    /// pass by always claiming a fault.
+    #[test]
+    fn a_good_jwks_reports_no_faults() {
+        let (keys, diag) = decoding_keys_from_jwks_diag(JWKS_ONE_RSA.as_bytes());
+        assert_eq!(keys.len(), 1);
+        assert_eq!(diag.usable, 1);
+        assert_eq!(diag.total, 1);
+        assert_eq!(diag.skipped_no_kid, 0);
+        assert_eq!(diag.skipped_unusable, 0);
+        assert_eq!(diag.symmetric, 0);
+        assert!(diag.parse_error.is_none());
+    }
+
+    /// A symmetric key in a PUBLIC key set is a token-forgery risk if any HS*
+    /// algorithm is allow-listed, because `DecodingKey::from_jwk` accepts it as
+    /// an HMAC verification key. It must be counted so it can be reported.
+    #[test]
+    fn symmetric_keys_are_counted_because_they_are_a_forgery_risk() {
+        let oct = r#"{"keys":[{"kty":"oct","kid":"shared","alg":"HS256","k":"c3VwZXItc2VjcmV0LXRlc3QtaG1hYy1rZXktMDEyMzQ1Njc4OQ"}]}"#;
+        let (_keys, diag) = decoding_keys_from_jwks_diag(oct.as_bytes());
+        assert_eq!(
+            diag.symmetric, 1,
+            "an oct key in a public JWKS means anyone who can read it can mint tokens \
+             accepted by any site whose allow-list includes HS*"
+        );
+    }
 
     const SECRET: &[u8] = b"super-secret-test-hmac-key-0123456789";
     const ISSUER: &str = "https://issuer.example";

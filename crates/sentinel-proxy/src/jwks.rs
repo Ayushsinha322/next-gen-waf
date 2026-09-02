@@ -20,9 +20,9 @@ use hyper::{Request, Uri};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use jsonwebtoken::DecodingKey;
-use sentinel_modules::decoding_keys_from_jwks;
+use sentinel_modules::decoding_keys_from_jwks_diag;
 use tokio::sync::RwLock;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 /// How long a fetched key set is treated as fresh before a re-fetch.
 const JWKS_TTL: Duration = Duration::from_secs(300);
@@ -35,6 +35,20 @@ const JWKS_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// live request never blocks a refresh (and vice versa).
 type KeyMap = Arc<HashMap<String, DecodingKey>>;
 
+/// The parts of a JWKS parse outcome that decide whether to log again.
+///
+/// Named rather than a tuple because the whole point is that these five facts
+/// mean five different outages; a `(bool, usize, usize, usize, usize)` at the
+/// latch site would be unreadable at exactly the moment someone is debugging one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct JwksDiagState {
+    parse_failed: bool,
+    usable: usize,
+    skipped_no_kid: usize,
+    skipped_unusable: usize,
+    symmetric: usize,
+}
+
 struct CachedJwks {
     keys: KeyMap,
     fetched: Instant,
@@ -43,12 +57,18 @@ struct CachedJwks {
 /// Thread-safe, per-URL JWKS cache with stale-while-error fallback.
 pub(crate) struct JwksCache {
     entries: RwLock<HashMap<String, CachedJwks>>,
+    /// Last reported parse outcome per URL, so the diagnostics below are emitted
+    /// on a CHANGE of state rather than once per request. `fetch` runs on the
+    /// request path — an unknown `kid` forces one — so an unlatched log line here
+    /// would turn an IdP incident into a log flood.
+    last_diag: std::sync::Mutex<HashMap<String, JwksDiagState>>,
 }
 
 impl JwksCache {
     pub(crate) fn new() -> Self {
         Self {
             entries: RwLock::new(HashMap::new()),
+            last_diag: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -71,7 +91,7 @@ impl JwksCache {
         }
         // Slow path: (re)fetch. Concurrent requests may race here; that is fine
         // — each observes a valid map and the last writer wins the cache slot.
-        match Self::fetch(url).await {
+        match self.fetch(url).await {
             Ok(fetched) => {
                 let keys: KeyMap = Arc::new(fetched);
                 let mut guard = self.entries.write().await;
@@ -96,7 +116,7 @@ impl JwksCache {
     }
 
     /// GET the JWKS document over HTTPS and parse it into decoding keys.
-    async fn fetch(url: &str) -> anyhow::Result<HashMap<String, DecodingKey>> {
+    async fn fetch(&self, url: &str) -> anyhow::Result<HashMap<String, DecodingKey>> {
         let https = hyper_rustls::HttpsConnectorBuilder::new()
             .with_webpki_roots()
             .https_or_http()
@@ -137,8 +157,79 @@ impl JwksCache {
             .map_err(|e| anyhow::anyhow!("reading JWKS body (>{JWKS_MAX_BYTES} bytes?): {e}"))?
             .to_bytes();
 
-        let keys = decoding_keys_from_jwks(&body);
+        let (keys, diag) = decoding_keys_from_jwks_diag(&body);
         debug!(jwks_url = url, keys = keys.len(), "fetched JWKS");
+
+        // LATCHED, per URL, on a change of outcome. This runs on the request
+        // path — an unknown `kid` forces a fetch — so an unlatched warn! here
+        // would emit one line per request during an IdP incident, which is both
+        // a log flood and the exact anti-pattern the rate_limit module's
+        // per-request warn! already demonstrates.
+        //
+        // Every branch below is a TOTAL authentication outage that looks
+        // identical from outside (every token comes back "unknown key id"), with
+        // a different fix. Distinguishing them is the whole point.
+        let state = JwksDiagState {
+            parse_failed: diag.parse_error.is_some(),
+            usable: diag.usable,
+            skipped_no_kid: diag.skipped_no_kid,
+            skipped_unusable: diag.skipped_unusable,
+            symmetric: diag.symmetric,
+        };
+        let changed = {
+            let mut last = self.last_diag.lock().unwrap_or_else(|e| e.into_inner());
+            last.get(url) != Some(&state) && {
+                last.insert(url.to_string(), state);
+                true
+            }
+        };
+        if changed {
+            if let Some(ref e) = diag.parse_error {
+                error!(
+                    jwks_url = url,
+                    error = %e,
+                    "JWKS document did not parse — ZERO verification keys, so EVERY bearer \
+                     token for every site using this endpoint is rejected. jsonwebtoken models \
+                     the key set as an untagged enum, so ONE key with an unsupported kty or \
+                     curve fails the WHOLE document rather than being skipped: an IdP that \
+                     publishes one extra key it happens not to model is a full outage. Compare \
+                     the endpoint's key types against the algorithms this build supports."
+                );
+            } else if diag.usable == 0 {
+                error!(
+                    jwks_url = url,
+                    keys_in_document = diag.total,
+                    skipped_no_kid = diag.skipped_no_kid,
+                    skipped_unusable = diag.skipped_unusable,
+                    "JWKS parsed but yielded NO usable verification keys — every bearer token \
+                     for every site using this endpoint is rejected. Key selection is by `kid`, \
+                     so a key without one cannot be used no matter how valid it is."
+                );
+            } else {
+                if diag.skipped_no_kid > 0 || diag.skipped_unusable > 0 {
+                    warn!(
+                        jwks_url = url,
+                        usable = diag.usable,
+                        skipped_no_kid = diag.skipped_no_kid,
+                        skipped_unusable = diag.skipped_unusable,
+                        "JWKS keys skipped — tokens signed with those keys will be rejected \
+                         while tokens signed with the usable ones succeed, which presents as \
+                         intermittent auth failure rather than an outage"
+                    );
+                }
+                if diag.symmetric > 0 {
+                    error!(
+                        jwks_url = url,
+                        symmetric_keys = diag.symmetric,
+                        "JWKS contains symmetric (oct) keys, which are accepted as HMAC \
+                         verification keys. If the site's algorithm allow-list includes any \
+                         HS*, ANYONE WHO CAN READ THIS PUBLIC JWKS CAN MINT ACCEPTED TOKENS. \
+                         Restrict waf_policy.jwt.algorithms to the asymmetric family the IdP \
+                         actually signs with (RS*/PS*/ES*)."
+                    );
+                }
+            }
+        }
         Ok(keys)
     }
 }

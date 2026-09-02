@@ -34,7 +34,10 @@ pub use grpc::{
     check_body as check_grpc_body, check_request as check_grpc_request, is_grpc, GrpcLimits,
 };
 pub use ip_reputation::{IpReputation, IpVerdict};
-pub use jwt_auth::{decoding_keys_from_jwks, token_header, validate as validate_jwt, JwtPolicy};
+pub use jwt_auth::{
+    decoding_keys_from_jwks, decoding_keys_from_jwks_diag, token_header, validate as validate_jwt,
+    JwksParse, JwtPolicy,
+};
 pub use rate_limit::RateLimiter;
 pub use smuggling::{detect as detect_smuggling, SmugglingVerdict};
 pub use threat_intel::{RawTier, ThreatFeed, ThreatVerdict};
