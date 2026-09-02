@@ -29,17 +29,76 @@ ok()   { printf "  \033[32mPASS\033[0m  %s\n" "$1"; pass=$((pass+1)); }
 bad()  { printf "  \033[31mFAIL\033[0m  %s\n" "$1"; fail=$((fail+1)); }
 note() { printf "  \033[33mNOTE\033[0m  %s\n" "$1"; }
 
-# /healthz is served on the management port, per node.
-HZ="https://127.0.0.1:9443/healthz"
-hz() { curl -sk --max-time 8 "$HZ" 2>/dev/null; }
-# Read a dotted path out of /healthz without python (kept awk/grep-only so this
-# is safe to lift into the alpine CI image, which has no python3).
-hzval() { hz | tr ',' '\n' | grep -m1 "\"$1\"" | grep -oE '[0-9]+$'; }
+# ⚠️ COUNTERS ARE PER-NODE, AND TRAFFIC LOAD-BALANCES ACROSS THREE.
+#
+# The first version of this script read /healthz from waf1 (the only node
+# publishing :9443) and probed through the LB on :443. The probe landed on waf2
+# or waf3, incremented THEIR counter, and the check reported "the request skipped
+# Phase 1 entirely" — a false alarm about a client-selectable bypass, which is
+# about the worst thing a verifier can cry wolf about. Same trap as the earlier
+# GeoIP verification on this box.
+#
+# So: read every node directly on its container address and SUM. Each waf
+# container serves /healthz on 8080 internally and the host can reach the docker
+# network.
+#
+# python3 is used for parsing because the values are nested JSON and a
+# comma-split grep silently mis-read `}`-terminated numbers and booleans as
+# missing. That is safe here: the deploy-shell CI job only lints deploy/**/*.sh
+# (bash -n plus a static check), it does not EXECUTE them, and this script runs
+# on the WAF host where python3 is present. Do not lift this into a script CI
+# actually runs.
+#
+# (And note a line comment must never START with the word that names that static
+# checker: it is read as an inline directive, and an unparseable one is an ERROR
+# that fails the lint job. Caught by running the linter in the CI image, which is
+# the whole reason for doing that before pushing.)
+node_ips() {
+  for n in waf1 waf2 waf3; do
+    docker inspect "sentinel-$n-1" \
+      --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' 2>/dev/null \
+      | awk '{print $1}'
+  done
+}
+
+# hzsum <dotted.path>  -> sum of that numeric field across all nodes
+hzsum() {
+  local path="$1" total=0 v
+  for ip in $(node_ips); do
+    v=$(curl -s --max-time 6 "http://$ip:8080/healthz" 2>/dev/null \
+        | PATHSPEC="$path" python3 -c "
+import sys, json, os
+try: d = json.load(sys.stdin)
+except Exception: print(0); raise SystemExit
+for k in os.environ['PATHSPEC'].split('.'):
+    d = (d or {}).get(k) if isinstance(d, dict) else None
+print(d if isinstance(d, (int, float)) else 0)
+" 2>/dev/null)
+    total=$(( total + ${v:-0} ))
+  done
+  echo "$total"
+}
+
+# hzfield <dotted.path> -> the field from waf1, rendered as JSON (any type)
+hzfield() {
+  local path="$1"
+  curl -sk --max-time 8 "https://127.0.0.1:9443/healthz" 2>/dev/null \
+    | PATHSPEC="$path" python3 -c "
+import sys, json, os
+try: d = json.load(sys.stdin)
+except Exception: print(''); raise SystemExit
+for k in os.environ['PATHSPEC'].split('.'):
+    d = (d or {}).get(k) if isinstance(d, dict) else None
+print('' if d is None else (d if isinstance(d, str) else json.dumps(d)))
+" 2>/dev/null
+}
+
+hz() { curl -sk --max-time 8 "https://127.0.0.1:9443/healthz" 2>/dev/null; }
 
 echo "=== 0. is /healthz reachable, and does it carry the new keys? ==="
 BODY=$(hz)
 if [ -z "$BODY" ]; then
-  bad "/healthz not reachable at $HZ — cannot judge module visibility"
+  bad "/healthz not reachable on waf1:9443 — cannot judge module visibility"
 else
   for key in threat_intel modules smuggling graphql ja4 good_bot_allowed_unverified; do
     case "$BODY" in
@@ -52,19 +111,17 @@ fi
 echo
 echo "=== 1. THE DECIDING CHECK — a long URI must NOT exempt a request ==="
 echo "    (smuggling.evaluated must advance for a request whose URI exceeds the limit)"
-BEFORE=$(hzval evaluated)
+BEFORE=$(hzsum modules.smuggling.evaluated)
 LONG=$(head -c 9000 /dev/zero | tr '\0' 'a')
 CODE=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 -H "Host: $H" \
   "https://127.0.0.1/?pad=$LONG")
 sleep 2
-AFTER=$(hzval evaluated)
-echo "    over-long-URI request -> HTTP $CODE ; smuggling.evaluated ${BEFORE:-?} -> ${AFTER:-?}"
-if [ -z "$BEFORE" ] || [ -z "$AFTER" ]; then
-  bad "could not read smuggling.evaluated from /healthz"
-elif [ "$AFTER" -gt "$BEFORE" ]; then
+AFTER=$(hzsum modules.smuggling.evaluated)
+echo "    over-long-URI request -> HTTP $CODE ; smuggling.evaluated (all nodes) $BEFORE -> $AFTER"
+if [ "$AFTER" -gt "$BEFORE" ]; then
   ok "desync detection RAN on an over-long-URI request — the bypass is closed"
 else
-  bad "smuggling.evaluated did not advance: the request skipped Phase 1 entirely, \
+  bad "smuggling.evaluated did not advance across ANY node: the request skipped Phase 1, \
 which is a client-selectable protection bypass. Do not leave this deployed."
 fi
 
@@ -87,56 +144,94 @@ esac
 
 echo
 echo "=== 3. the real desync primitive must STILL be blocked ==="
-# CL+TE ambiguity is what the module exists for. Sent over a raw socket because
-# curl refuses to emit both headers.
-RAW=$(printf 'GET / HTTP/1.1\r\nHost: %s\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n' "$H" \
-      | timeout 8 openssl s_client -quiet -connect 127.0.0.1:443 -servername "$H" 2>/dev/null | head -1)
-echo "    CL+TE request -> ${RAW:-<no response>}"
-case "$RAW" in
-  *400*) ok "CL/TE ambiguity is still rejected" ;;
-  "")    note "no response captured — openssl may be unavailable; check manually" ;;
-  *)     bad "CL+TE was NOT rejected: $RAW" ;;
-esac
+# CL+TE ambiguity is what this module actually exists for, and the check that
+# matters most: the header-byte arm was just deliberately loosened, so the
+# framing arm has to be shown still working.
+#
+# Asserted on the COUNTER, not on the response text. A CL+TE request is malformed
+# at the protocol level and the connection is closed without a body a raw socket
+# can reliably read back — the first version of this check reported
+# "<no response>" and could not tell "blocked" from "openssl missing". The
+# counter is unambiguous, and splitting framing from header rejections is exactly
+# why those are two counters.
+FRAME_BEFORE=$(hzsum modules.smuggling.rejected_framing)
+{ printf 'GET / HTTP/1.1\r\nHost: %s\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n' "$H"; sleep 2; } \
+  | timeout 10 openssl s_client -quiet -connect 127.0.0.1:443 -servername "$H" >/dev/null 2>&1
+sleep 2
+FRAME_AFTER=$(hzsum modules.smuggling.rejected_framing)
+echo "    CL+TE probe: rejected_framing (all nodes) $FRAME_BEFORE -> $FRAME_AFTER"
+if [ "${FRAME_AFTER:-0}" -gt "${FRAME_BEFORE:-0}" ]; then
+  ok "CL/TE ambiguity is still rejected by the framing checks"
+else
+  bad "the CL+TE probe did not increment rejected_framing — real desync detection may \
+have been lost when the header-byte arm was loosened. This is the regression that \
+matters; do not leave it unresolved."
+fi
+HDR=$(hzsum modules.smuggling.rejected_header)
+note "rejected_header total is $HDR — before the fix this arm fired on any non-ASCII \
+header byte, so a non-trivial number here on real traffic would mean the false positive \
+is back"
 
 echo
 echo "=== 4. is global IOC enforcement on, and does it say so? ==="
-POLLER=$(hz | tr ',' '\n' | grep -m1 '"poller"' | sed 's/.*: *//;s/"//g')
-ACTIVE=$(hz | tr ',' '\n' | grep -m1 '"active"' | sed 's/.*: *//;s/[^a-z]//g')
-ENTRIES=$(hz | tr ',' '\n' | grep -m1 '"entries"' | grep -oE '[0-9]+$')
+POLLER=$(hzfield threat_intel.poller)
+ACTIVE=$(hzfield threat_intel.active)
+ENTRIES=$(hzfield threat_intel.entries)
+REASON=$(hzfield threat_intel.inert_reason)
 echo "    threat_intel: poller=${POLLER:-?} active=${ACTIVE:-?} entries=${ENTRIES:-?}"
 if [ -n "$POLLER" ]; then
   ok "threat-intel state is reportable (was absent from /healthz entirely)"
-  [ "$ACTIVE" = "true" ] \
-    && ok "IOCs are being enforced ($ENTRIES indicators)" \
-    || note "IOC enforcement is OFF — read threat_intel.inert_reason; that is the \
-point of the field, not necessarily a fault on this box"
+  if [ "$ACTIVE" = "true" ]; then
+    ok "IOCs are being enforced ($ENTRIES indicators)"
+  else
+    note "IOC enforcement is OFF: ${REASON:-no reason given} — the field exists so this \
+is answerable, which it was not before"
+  fi
 else
   bad "no threat_intel.poller in /healthz"
 fi
 
 echo
 echo "=== 5. module reachability, the question their silence hid ==="
-for k in evaluated inspected attempts; do
-  v=$(hzval "$k"); printf "    %-12s %s\n" "$k" "${v:-?}"
-done
-JA4A=$(hz | tr ',' '\n' | grep -m1 '"attempts"' | grep -oE '[0-9]+$')
-JA4S=$(hz | tr ',' '\n' | grep -m1 '"success"' | grep -oE '[0-9]+$')
-echo "    ja4: attempts=${JA4A:-?} success=${JA4S:-?}"
-if [ -n "$JA4A" ] && [ -n "$JA4S" ] && [ "$JA4A" -gt 0 ]; then
-  if [ "$JA4S" -lt "$JA4A" ]; then
-    note "$((JA4A - JA4S)) of $JA4A TLS handshakes yielded no JA4 — that shortfall \
-silently disables every JA4-dependent control for those connections"
+SM=$(hzsum modules.smuggling.evaluated)
+GQ=$(hzsum modules.graphql.inspected)
+GR=$(hzsum modules.grpc.inspected)
+JA=$(hzsum modules.ja4.attempts)
+JS=$(hzsum modules.ja4.success)
+GB=$(hzsum modules.bot.good_bot_allowed_unverified)
+BJ=$(hzfield modules.bot.ja4_fingerprints)
+AP=$(hzfield modules.bot.attacker_ua_patterns)
+printf "    fleet totals: smuggling.evaluated=%s graphql.inspected=%s grpc.inspected=%s\n" "$SM" "$GQ" "$GR"
+printf "    ja4: %s/%s handshakes fingerprinted   good-bot allowed (unverified)=%s\n" "$JS" "$JA" "$GB"
+printf "    bot tables: ja4_fingerprints=%s attacker_ua_patterns=%s\n" "${BJ:-?}" "${AP:-?}"
+
+[ "${SM:-0}" -gt 0 ] \
+  && ok "desync detection is demonstrably running across the fleet" \
+  || bad "smuggling.evaluated is 0 fleet-wide — the control never runs"
+
+if [ -n "$BJ" ] && [ "$BJ" -gt 0 ]; then
+  note "the JA4 blocklist holds $BJ fingerprints — a static built-in demo table, and \
+runtime additions are discarded on config reload. Readable now; still a product gap."
+else
+  bad "modules.bot.ja4_fingerprints missing or zero"
+fi
+
+if [ "${JA:-0}" -gt 0 ]; then
+  if [ "${JS:-0}" -lt "${JA:-0}" ]; then
+    note "$(( JA - JS )) of $JA TLS handshakes produced NO JA4 fingerprint. Every \
+JA4-dependent control (bot scoring's malicious-JA4 signal, JA4 blocklists) is inert for \
+those connections. This ratio was uncomputable before these counters existed."
   else
     ok "every TLS handshake yielded a JA4 fingerprint"
   fi
 else
-  note "no JA4 attempts recorded yet (plaintext traffic only, or an old image)"
+  note "no JA4 attempts recorded (plaintext traffic only)"
 fi
-BOTJA4=$(hz | tr ',' '\n' | grep -m1 '"ja4_fingerprints"' | grep -oE '[0-9]+$')
-[ -n "$BOTJA4" ] \
-  && note "bot JA4 table holds ${BOTJA4} fingerprints — a static built-in demo set; \
-runtime additions are discarded on config reload" \
-  || bad "modules.bot.ja4_fingerprints missing"
+
+[ "${GQ:-0}" -eq 0 ] \
+  && note "graphql.inspected is 0 — expected on this box (no GraphQL site configured); \
+on a site that HAS graphql enabled, a persistent 0 means the endpoint gate does not match" \
+  || ok "the GraphQL firewall has inspected $GQ bodies"
 
 echo
 echo "=== 6. existing protection is unchanged ==="
