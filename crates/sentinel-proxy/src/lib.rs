@@ -76,11 +76,11 @@ use sentinel_telemetry::{
     graphql_inspected_total, grpc_inspected_total, history_shed_total, inc_active_connections,
     inc_blocked, inc_ebpf_drops, inc_history_shed, inc_load_shed_connections,
     inc_load_shed_requests, inc_log_lines_dropped, inc_requests, inc_rule_hits, ja4_attempts_total,
-    ja4_success_total, note_good_bot_allowed, note_graphql_blocked, note_graphql_inspected,
-    note_grpc_inspected, note_ja4_attempt, note_ja4_success, note_smuggling_evaluated,
-    note_smuggling_rejected_framing, note_smuggling_rejected_header, observe_duration,
-    prometheus_text, smuggling_evaluated_total, smuggling_rejected_framing_total,
-    smuggling_rejected_header_total,
+    ja4_no_hello_total, ja4_success_total, note_good_bot_allowed, note_graphql_blocked,
+    note_graphql_inspected, note_grpc_inspected, note_ja4_attempt, note_ja4_no_hello,
+    note_ja4_success, note_smuggling_evaluated, note_smuggling_rejected_framing,
+    note_smuggling_rejected_header, observe_duration, prometheus_text, smuggling_evaluated_total,
+    smuggling_rejected_framing_total, smuggling_rejected_header_total,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Semaphore};
@@ -2330,16 +2330,30 @@ async fn handle_connection(
         // Fingerprint the TLS ClientHello (JA4) by peeking the socket without
         // consuming it — rustls then reads the same bytes for the handshake.
         //
-        // Counted per connection, not per request, and the pair is what matters:
-        // a `None` fingerprint silently disables every JA4-dependent control
-        // downstream (bot scoring's malicious-JA4 signal, JA4 blocklists), and
-        // there was no way to tell a deployment where JA4 works from one where it
-        // never produces a fingerprint. attempts - success is that coverage loss.
-        note_ja4_attempt();
-        let tls_fp = peek_ja4(&stream).await;
-        if tls_fp.is_some() {
-            note_ja4_success();
-        }
+        // Counted per connection, in three buckets, because two of them mean
+        // completely different things and lumping them together made the number
+        // unreadable: a live fleet reported 977 "attempts" against 11 requests
+        // actually served, because every TCP probe that never spoke TLS counted
+        // as a failed fingerprint.
+        //
+        // Now `attempts` counts only connections that actually presented a TLS
+        // handshake record, so `success / attempts` is real coverage, and
+        // `no_hello` carries the probes.
+        let tls_fp = match peek_ja4(&stream).await {
+            Ja4Peek::Fingerprint(fp) => {
+                note_ja4_attempt();
+                note_ja4_success();
+                Some(fp)
+            }
+            Ja4Peek::HandshakeButNoFingerprint => {
+                note_ja4_attempt();
+                None
+            }
+            Ja4Peek::NoHandshake => {
+                note_ja4_no_hello();
+                None
+            }
+        };
         let tls = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream))
             .await
             .context("TLS handshake timed out")?
@@ -2366,11 +2380,82 @@ async fn handle_connection(
 /// handshake) and compute a JA4 fingerprint. Best-effort: returns `None` on a
 /// partial/absent ClientHello or timeout, so it never delays or breaks the
 /// handshake. HTTP/3 (QUIC) connections don't take this path (fingerprint None).
-async fn peek_ja4(stream: &TcpStream) -> Option<String> {
-    let mut buf = [0u8; 4096];
-    match tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.peek(&mut buf)).await {
-        Ok(Ok(n)) if n > 0 => sentinel_modules::ja4_from_client_hello(&buf[..n], false),
-        _ => None,
+/// How long to wait for a complete ClientHello to arrive before giving up on the
+/// fingerprint.
+///
+/// Deliberately far shorter than `HANDSHAKE_TIMEOUT` (15s): a real client sends
+/// its ClientHello immediately after connect, so anything not fully arrived
+/// within this window is a probe or a stalled peer. Waiting the full handshake
+/// timeout would pin a task per abandoned connection — a cheap DoS — for a
+/// fingerprint we are about to fail to produce anyway. TLS itself still gets the
+/// full `HANDSHAKE_TIMEOUT`; this bounds only the fingerprint attempt.
+const JA4_PEEK_BUDGET: Duration = Duration::from_millis(250);
+
+/// What the JA4 peek concluded, so the caller can count the three outcomes apart.
+enum Ja4Peek {
+    /// A fingerprint.
+    Fingerprint(String),
+    /// A TLS handshake record was seen but no fingerprint could be produced
+    /// (fragmented across records, or malformed).
+    HandshakeButNoFingerprint,
+    /// The connection never sent a TLS handshake record: a TCP probe, a port
+    /// scan, an abandoned connection. NOT a fingerprinting failure, and counting
+    /// it as one is what made the coverage ratio unreadable — a live fleet showed
+    /// 977 "attempts" against 11 requests actually served.
+    NoHandshake,
+}
+
+/// Fingerprint the TLS ClientHello by peeking the socket, without consuming it.
+///
+/// ⚠️ The retry loop is the point. `TcpStream::peek` returns as soon as ANY bytes
+/// are readable, so a single peek routinely sees a PARTIAL ClientHello — and
+/// `parse_client_hello` returns `None` for a truncated record exactly as it does
+/// for a malformed one. Modern post-quantum hellos run well past one segment, so
+/// this silently dropped roughly half of all fingerprints on a live fleet
+/// (508/977), and every JA4-dependent control — bot scoring's malicious-JA4
+/// signal, JA4 blocklists — was inert for those connections while reporting
+/// nothing.
+///
+/// Re-peeking is safe and idempotent precisely because `peek` does not consume:
+/// rustls still reads the same bytes for the real handshake afterwards. The
+/// buffer is 16 KiB, the TLS record maximum, because 4096 was itself too small
+/// for a large hello.
+async fn peek_ja4(stream: &TcpStream) -> Ja4Peek {
+    let mut buf = vec![0u8; 16 * 1024];
+    let deadline = tokio::time::Instant::now() + JA4_PEEK_BUDGET;
+    let mut saw_handshake = false;
+    loop {
+        let n = match tokio::time::timeout_at(deadline, stream.peek(&mut buf)).await {
+            Ok(Ok(n)) if n > 0 => n,
+            // Timed out, EOF, or a read error.
+            _ => {
+                return if saw_handshake {
+                    Ja4Peek::HandshakeButNoFingerprint
+                } else {
+                    Ja4Peek::NoHandshake
+                }
+            }
+        };
+        match sentinel_modules::client_hello_needed_len(&buf[..n]) {
+            Ok(need) => {
+                saw_handshake = true;
+                if n >= need {
+                    return match sentinel_modules::ja4_from_client_hello(&buf[..n], false) {
+                        Some(fp) => Ja4Peek::Fingerprint(fp),
+                        None => Ja4Peek::HandshakeButNoFingerprint,
+                    };
+                }
+                // Incomplete: more of the record is still in flight. `peek`
+                // leaves the data queued, so it would return the same bytes
+                // immediately — sleep briefly rather than spin.
+                if tokio::time::Instant::now() >= deadline {
+                    return Ja4Peek::HandshakeButNoFingerprint;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            // Definitively not a TLS handshake — waiting cannot help.
+            Err(_) => return Ja4Peek::NoHandshake,
+        }
     }
 }
 
@@ -6619,9 +6704,15 @@ fn health_response(state: &ServerState) -> Response<BoxBody> {
                 "blocked": graphql_blocked_total(),
             },
             "grpc": { "inspected": grpc_inspected_total() },
+            // `attempts` counts only connections that actually presented a TLS
+            // handshake record, so success/attempts is real fingerprint
+            // coverage. `no_hello` carries TCP probes and abandoned connections,
+            // which used to be lumped into attempts and made the ratio
+            // meaningless (977 "attempts" against 11 requests served).
             "ja4": {
                 "attempts": ja4_attempts_total(),
                 "success": ja4_success_total(),
+                "no_hello": ja4_no_hello_total(),
             },
             "bot": {
                 "good_bot_allowed_unverified": bot_good_bot_allowed_total(),

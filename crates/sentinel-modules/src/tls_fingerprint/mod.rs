@@ -204,6 +204,52 @@ fn is_grease(v: u16) -> bool {
 
 /// Strip a 5-byte TLS record header (`0x16` handshake) if it precedes the
 /// ClientHello handshake byte (`0x01`); otherwise return the input unchanged.
+/// How many bytes a buffered TLS handshake record needs in total, so a caller
+/// peeking a socket can tell "not arrived yet" from "not a ClientHello".
+///
+/// Returns:
+///   - `Ok(need)` — this looks like a TLS handshake record and `need` bytes are
+///     required in total (record header + body). Keep reading until the buffer
+///     holds that many.
+///   - `Err(NotHandshake)` — the first bytes are definitively not a TLS
+///     handshake record, so waiting for more will never help.
+///
+/// This exists because [`parse_client_hello`] cannot distinguish those two: it
+/// returns `None` for both, and a caller peeking a live socket then has no way to
+/// know whether to retry. A single `peek` returns as soon as ANY bytes are
+/// readable, so on a ClientHello split across TCP segments — the normal case for
+/// modern post-quantum hellos, which run past 1500 bytes — it sees a truncated
+/// record and the fingerprint is silently lost. Measured on a live fleet:
+/// 508 fingerprints from 977 handshakes, a ~50/50 split that is the signature of
+/// a segment-boundary race rather than any property of the clients.
+pub fn client_hello_needed_len(raw: &[u8]) -> Result<usize, NotHandshake> {
+    // Need the 5-byte record header to say anything at all.
+    if raw.len() < 5 {
+        // A handshake record starts with 0x16; if we already have that byte and
+        // it is wrong, do not wait.
+        return match raw.first() {
+            Some(&0x16) | None => Ok(5),
+            Some(_) => Err(NotHandshake),
+        };
+    }
+    if raw[0] != 0x16 {
+        return Err(NotHandshake);
+    }
+    let record_len = u16::from_be_bytes([raw[3], raw[4]]) as usize;
+    // A ClientHello record of zero length, or one larger than the TLS maximum,
+    // is not something to keep waiting for.
+    if record_len == 0 || record_len > 16_384 {
+        return Err(NotHandshake);
+    }
+    Ok(5 + record_len)
+}
+
+/// The first bytes on the connection are not a TLS handshake record — a plain
+/// TCP probe, a port scan, an abandoned connection, or a different protocol.
+/// Distinct from "incomplete" so a caller does not wait on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotHandshake;
+
 fn strip_record_header(raw: &[u8]) -> &[u8] {
     if raw.first() == Some(&0x16) && raw.get(5) == Some(&0x01) {
         // content_type(1) + legacy_version(2) + length(2) = 5 bytes.
@@ -535,5 +581,118 @@ mod tests {
             "QUIC fingerprint must start with 'q': {s}"
         );
         assert!(s.starts_with("q13d"), "got {s}");
+    }
+}
+
+/// The segment-boundary race that silently halved JA4 coverage.
+///
+/// `TcpStream::peek` returns as soon as ANY bytes are readable, and
+/// `parse_client_hello` returns `None` for a truncated record exactly as it does
+/// for a malformed one — so the proxy could not tell "wait for more" from "give
+/// up", and gave up. `client_hello_needed_len` is the missing distinction.
+#[cfg(test)]
+mod completeness_tests {
+    use super::*;
+
+    /// A realistic ClientHello: one record, body longer than a single small
+    /// segment, so the split case below is not contrived.
+    fn client_hello() -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]); // legacy_version TLS 1.2
+        body.extend_from_slice(&[0xAB; 32]); // random
+        body.push(0); // session_id_len
+        body.extend_from_slice(&[0x00, 0x04]); // cipher suites, 2 entries
+        body.extend_from_slice(&[0x13, 0x01, 0x13, 0x02]);
+        body.push(1); // compression methods
+        body.push(0);
+        // One large extension (a stand-in for a post-quantum key share), so the
+        // hello spans well past a small segment.
+        let mut exts = Vec::new();
+        exts.extend_from_slice(&[0x00, 0x2b]); // supported_versions
+        exts.extend_from_slice(&[0x00, 0x03]);
+        exts.extend_from_slice(&[0x02, 0x03, 0x04]);
+        exts.extend_from_slice(&[0x00, 0x33]); // key_share
+        let big = vec![0x42u8; 1200];
+        exts.extend_from_slice(&(big.len() as u16).to_be_bytes());
+        exts.extend_from_slice(&big);
+        body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        body.extend_from_slice(&exts);
+
+        let mut hs = vec![0x01]; // ClientHello
+        let bl = body.len();
+        hs.extend_from_slice(&[(bl >> 16) as u8, (bl >> 8) as u8, bl as u8]);
+        hs.extend_from_slice(&body);
+
+        let mut rec = vec![0x16, 0x03, 0x01];
+        rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+        rec.extend_from_slice(&hs);
+        rec
+    }
+
+    #[test]
+    fn a_complete_hello_reports_its_own_length_and_fingerprints() {
+        let hello = client_hello();
+        assert!(hello.len() > 1200, "fixture must exceed one small segment");
+        assert_eq!(client_hello_needed_len(&hello), Ok(hello.len()));
+        assert!(
+            ja4_from_client_hello(&hello, false).is_some(),
+            "the fixture must be a parseable ClientHello, or the split test below \
+             proves nothing"
+        );
+    }
+
+    /// THE BUG: a first peek that catches only the first segment.
+    #[test]
+    fn a_split_hello_is_reported_incomplete_rather_than_unparseable() {
+        let hello = client_hello();
+        for cut in [1, 4, 5, 6, 64, 300, 1000, hello.len() - 1] {
+            let partial = &hello[..cut];
+            // The old code's only signal: indistinguishable from garbage.
+            assert!(
+                ja4_from_client_hello(partial, false).is_none(),
+                "a truncated hello cannot be fingerprinted (cut={cut})"
+            );
+            // The new signal: keep waiting, and here is how much is needed.
+            match client_hello_needed_len(partial) {
+                Ok(need) => assert!(
+                    need > cut,
+                    "cut={cut}: needed_len must exceed what has arrived, got {need}"
+                ),
+                Err(_) => panic!(
+                    "cut={cut}: a partial TLS handshake record must be reported as \
+                     INCOMPLETE, not as 'not a handshake' — that is the whole \
+                     distinction, and getting it wrong drops the fingerprint"
+                ),
+            }
+        }
+    }
+
+    /// The other direction: a connection that is not TLS at all must be rejected
+    /// immediately, not waited on. Otherwise every port scan holds a task for the
+    /// peek budget.
+    #[test]
+    fn non_tls_traffic_is_rejected_without_waiting() {
+        for (label, bytes) in [
+            ("http", &b"GET / HTTP/1.1\r\n"[..]),
+            ("ssh", &b"SSH-2.0-OpenSSH_9.6"[..]),
+            ("single wrong byte", &b"\x47"[..]),
+            // A handshake byte but an impossible record length.
+            ("zero-length record", &b"\x16\x03\x01\x00\x00"[..]),
+            ("oversized record", &b"\x16\x03\x01\xff\xff"[..]),
+        ] {
+            assert_eq!(
+                client_hello_needed_len(bytes),
+                Err(NotHandshake),
+                "{label} must be rejected immediately"
+            );
+        }
+    }
+
+    /// An empty buffer, or a lone 0x16, is "keep reading" — we cannot yet tell.
+    #[test]
+    fn too_few_bytes_to_judge_means_keep_reading() {
+        assert_eq!(client_hello_needed_len(&[]), Ok(5));
+        assert_eq!(client_hello_needed_len(&[0x16]), Ok(5));
+        assert_eq!(client_hello_needed_len(&[0x16, 0x03]), Ok(5));
     }
 }

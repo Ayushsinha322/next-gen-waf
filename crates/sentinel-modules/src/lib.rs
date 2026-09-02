@@ -41,4 +41,7 @@ pub use jwt_auth::{
 pub use rate_limit::RateLimiter;
 pub use smuggling::{detect as detect_smuggling, SmugglingVerdict};
 pub use threat_intel::{RawTier, ThreatFeed, ThreatVerdict};
-pub use tls_fingerprint::{ja4, ja4_from_client_hello, parse_client_hello, ClientHelloInfo};
+pub use tls_fingerprint::{
+    client_hello_needed_len, ja4, ja4_from_client_hello, parse_client_hello, ClientHelloInfo,
+    NotHandshake,
+};
