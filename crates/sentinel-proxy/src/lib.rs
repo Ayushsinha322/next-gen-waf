@@ -72,9 +72,15 @@ use sentinel_modules::{
 use sentinel_plugins::PluginRuntime;
 use sentinel_rules::RuleEngine;
 use sentinel_telemetry::{
-    dec_active_connections, history_shed_total, inc_active_connections, inc_blocked,
-    inc_ebpf_drops, inc_history_shed, inc_load_shed_connections, inc_load_shed_requests,
-    inc_log_lines_dropped, inc_requests, inc_rule_hits, observe_duration, prometheus_text,
+    bot_good_bot_allowed_total, dec_active_connections, graphql_blocked_total,
+    graphql_inspected_total, grpc_inspected_total, history_shed_total, inc_active_connections,
+    inc_blocked, inc_ebpf_drops, inc_history_shed, inc_load_shed_connections,
+    inc_load_shed_requests, inc_log_lines_dropped, inc_requests, inc_rule_hits, ja4_attempts_total,
+    ja4_success_total, note_good_bot_allowed, note_graphql_blocked, note_graphql_inspected,
+    note_grpc_inspected, note_ja4_attempt, note_ja4_success, note_smuggling_evaluated,
+    note_smuggling_rejected_framing, note_smuggling_rejected_header, observe_duration,
+    prometheus_text, smuggling_evaluated_total, smuggling_rejected_framing_total,
+    smuggling_rejected_header_total,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Semaphore};
@@ -2237,7 +2243,17 @@ async fn handle_connection(
     if let Some(acceptor) = tls_acceptor {
         // Fingerprint the TLS ClientHello (JA4) by peeking the socket without
         // consuming it — rustls then reads the same bytes for the handshake.
+        //
+        // Counted per connection, not per request, and the pair is what matters:
+        // a `None` fingerprint silently disables every JA4-dependent control
+        // downstream (bot scoring's malicious-JA4 signal, JA4 blocklists), and
+        // there was no way to tell a deployment where JA4 works from one where it
+        // never produces a fingerprint. attempts - success is that coverage loss.
+        note_ja4_attempt();
         let tls_fp = peek_ja4(&stream).await;
+        if tls_fp.is_some() {
+            note_ja4_success();
+        }
         let tls = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream))
             .await
             .context("TLS handshake timed out")?
@@ -3021,11 +3037,16 @@ async fn proxy_inner(
         note_block(&state, ctx.client_ip);
         let reason = ctx.block_reason.as_deref().unwrap_or("");
         let resp = if reason.starts_with("HTTP request smuggling") {
-            // RFC 7230 §3.3.3: malformed requests MUST be rejected with 400.
-            error_response(
-                StatusCode::BAD_REQUEST,
-                ctx.block_reason.as_deref().unwrap_or("Bad Request"),
-            )
+            // RFC 7230 §3.3.3: malformed framing MUST be rejected with 400. The
+            // STATUS is what the RFC requires; disclosing WHY is not, and the
+            // reason names the exact header and the exact check that fired —
+            // which is free reconnaissance for tuning a desync attempt against
+            // this deployment. It also bypassed `BlockPageConfig::show_reason`
+            // (default false, a deliberate decision) and shipped no Support ID.
+            //
+            // The `jwt:` arm immediately below already did this correctly, with a
+            // comment saying so; this arm simply had not been brought into line.
+            error_response(StatusCode::BAD_REQUEST, "Bad Request")
         } else if reason.starts_with("jwt:") {
             // Authentication failure — 401 Unauthorized. The specific reason is
             // logged server-side but never leaked to the client.
@@ -3162,7 +3183,7 @@ async fn proxy_inner(
             // GraphQL firewall — query depth / complexity / introspection on the
             // body. Gated to GraphQL endpoints so nested REST-JSON bodies aren't
             // misread as GraphQL queries.
-            if ctx.decision == WafDecision::Allow {
+            if still_evaluating(ctx) {
                 if let Some(gql) = site
                     .and_then(|s| s.waf.graphql.as_ref())
                     .filter(|g| g.enable)
@@ -3175,12 +3196,20 @@ async fn proxy_inner(
                                 .and_then(|v| v.to_str().ok())
                                 .is_some_and(|ct| ct.contains("application/graphql")));
                     if is_graphql {
+                        // The endpoint gate above is a case-sensitive
+                        // `contains("graphql")` on POST only. A site serving
+                        // `/GraphQL`, or accepting GET, is silently never
+                        // inspected — and nothing said so. `configured > 0` with
+                        // `inspected == 0` after real traffic is the only way
+                        // that mismatch is discoverable.
+                        note_graphql_inspected();
                         let limits = GraphqlLimits {
                             max_depth: gql.max_depth,
                             max_complexity: gql.max_complexity,
                             block_introspection: gql.block_introspection,
                         };
                         if let Some(reason) = inspect_graphql(&bytes, &limits) {
+                            note_graphql_blocked();
                             ctx.decision = WafDecision::Block;
                             ctx.block_reason = Some(reason);
                         }
@@ -3189,7 +3218,7 @@ async fn proxy_inner(
             }
 
             // gRPC firewall — message/frame-size limits on the buffered body.
-            if ctx.decision == WafDecision::Allow {
+            if still_evaluating(ctx) {
                 if let Some(grpc_cfg) = site.and_then(|s| s.waf.grpc.as_ref()).filter(|g| g.enable)
                 {
                     let is_grpc_ct = ctx
@@ -3198,6 +3227,10 @@ async fn proxy_inner(
                         .and_then(|v| v.to_str().ok())
                         .is_some_and(is_grpc);
                     if is_grpc_ct {
+                        // Same reachability question as GraphQL: gated on a
+                        // Content-Type match, so a transport or content-type
+                        // mismatch shows up here as a permanent zero.
+                        note_grpc_inspected();
                         let limits = GrpcLimits {
                             max_message_bytes: grpc_cfg.max_message_bytes,
                             max_frames: grpc_cfg.max_frames,
@@ -3211,6 +3244,23 @@ async fn proxy_inner(
                         }
                     }
                 }
+            }
+
+            // The GraphQL and gRPC-body verdicts above are the only two that are
+            // reached AFTER `phase2_body` has already applied `enforce_mode`
+            // internally, so they were the two verdicts a site's mode could not
+            // govern in either direction: on a learning site they hard-blocked
+            // while setting no `would_block` (so the learning report held no
+            // evidence for the block it had just served), and a per-path
+            // `mode: off` could not switch them off at all.
+            //
+            // Re-applying the mode here rather than moving the checks into
+            // `phase2_body`: both need the buffered `bytes` and the site's
+            // GraphQL/gRPC config, which live in this scope. `enforce_mode` does
+            // nothing when the decision is already non-terminal.
+            if let Some(s) = site {
+                let gm = governing_mode(ctx, &s.waf.mode);
+                enforce_mode(ctx, &gm);
             }
 
             if ctx.decision == WafDecision::Limit {
@@ -3666,9 +3716,24 @@ async fn phase1_headers(
     // --- HTTP request smuggling / desync detection ---
     // Runs before any other Phase 1 checks — a smuggling attempt invalidates
     // the entire request. Reject with 400 Bad Request.
-    if ctx.decision == WafDecision::Allow {
+    if still_evaluating(ctx) {
+        // Counted, not logged: this runs on every request and its input is
+        // attacker-controlled, so a log line here would be both a throughput
+        // problem and a flood primitive. The counter answers the question the
+        // absence of a log could not — "did desync detection run at all?" — which
+        // is exactly what the phase-1 gate bug made unanswerable.
+        note_smuggling_evaluated();
         match detect_smuggling(&ctx.request_headers) {
             SmugglingVerdict::Reject { reason } => {
+                // Split so a wave of rejections can be attributed without
+                // reading log lines: framing is the real desync primitive, the
+                // header tripwire is the one that used to fire on ordinary
+                // non-ASCII header values.
+                if reason.contains("in header '") {
+                    note_smuggling_rejected_header();
+                } else {
+                    note_smuggling_rejected_framing();
+                }
                 ctx.decision = WafDecision::Block;
                 ctx.block_reason = Some(reason);
             }
@@ -3676,12 +3741,27 @@ async fn phase1_headers(
         }
     }
 
+    // Apply the site's mode to the smuggling verdict BEFORE the early return.
+    //
+    // Returning early is deliberate and kept — a desynced request should not be
+    // scored by anything downstream. But this return sat AHEAD of the only
+    // `enforce_mode` call in this function (at the end of phase 1), so a
+    // smuggling verdict was the one verdict learning mode could not downgrade: a
+    // site configured purely to observe answered 400 and set no `would_block`, so
+    // the rejection never even reached the learning report. Verified live.
+    //
+    // `enforce_mode` is idempotent for an already-downgraded decision, so the
+    // call at the end of phase 1 remains correct.
     if ctx.decision == WafDecision::Block {
-        return Ok(());
+        let gm = governing_mode(ctx, &site.waf.mode);
+        enforce_mode(ctx, &gm);
+        if ctx.decision == WafDecision::Block {
+            return Ok(());
+        }
     }
 
     // --- Rate limiting ---
-    if ctx.decision == WafDecision::Allow {
+    if still_evaluating(ctx) {
         if let Some(ref rl_cfg) = site.waf.rate_limit {
             if modules
                 .rate_limiter
@@ -3695,7 +3775,7 @@ async fn phase1_headers(
     }
 
     // --- Bot detection ---
-    if ctx.decision == WafDecision::Allow {
+    if still_evaluating(ctx) {
         if let Some(ref bot_cfg) = site.waf.bot_detection {
             let ua = ctx
                 .request_headers
@@ -3715,6 +3795,19 @@ async fn phase1_headers(
                 recent_block_score: modules.correlation.score_for_ip(ctx.client_ip),
             };
             let bs = bot_det.score(&sig);
+            // Counted here rather than inside the module, which has no telemetry
+            // dependency and should not gain one for a single counter.
+            //
+            // This puts a number on an unauthenticated trust decision: the
+            // good-bot branch returns score 0 / tier Allow for any User-Agent
+            // matching one of the 14 good-bot patterns, and reverse-DNS
+            // confirmation is still a TODO (`verified_good_bot` is hardcoded
+            // false). So anyone may claim to be Googlebot and skip bot scoring
+            // entirely. Until that verification exists, the least we can do is
+            // report how often it happens.
+            if bs.reasons.iter().any(|r| r.starts_with("good-bot-ua")) {
+                note_good_bot_allowed();
+            }
             ctx.tx_vars
                 .insert("bot_score".to_string(), bs.score.to_string());
             if bs.verified_good_bot {
@@ -3755,7 +3848,7 @@ async fn phase1_headers(
     }
 
     // --- GeoIP ---
-    if ctx.decision == WafDecision::Allow && site.waf.geoip.is_some() {
+    if still_evaluating(ctx) && site.waf.geoip.is_some() {
         let geoip_map = modules.geoip_map.load();
         if let Some(geoip) = geoip_map.get(&site.id) {
             // Resolve the country FIRST and record it whatever the verdict is.
@@ -3782,7 +3875,7 @@ async fn phase1_headers(
     // block renderer returns 401 (not the generic 403) without leaking the
     // reason to clients. A *present* token that fails validation is always
     // rejected; `required` only governs whether a *missing* token is allowed.
-    if ctx.decision == WafDecision::Allow {
+    if still_evaluating(ctx) {
         if let Some(ref jwt_cfg) = site.waf.jwt {
             if jwt_cfg.enable {
                 let bearer = ctx
@@ -3866,7 +3959,7 @@ async fn phase1_headers(
     // Path-level checks on gRPC traffic before the body is buffered: per-method
     // allow/deny and server-reflection blocking. Frame/size limits run later in
     // phase2 once the body is available.
-    if ctx.decision == WafDecision::Allow {
+    if still_evaluating(ctx) {
         if let Some(ref grpc_cfg) = site.waf.grpc {
             if grpc_cfg.enable {
                 let is_grpc_ct = ctx
@@ -3892,14 +3985,14 @@ async fn phase1_headers(
     }
 
     // --- Rule engine (CRS / SRL) ---
-    if ctx.decision == WafDecision::Allow {
+    if still_evaluating(ctx) {
         if let Some(engine) = engines.get(&site.id) {
             eval_rules(ctx, engine, Phase::RequestHeaders);
         }
     }
 
     // --- WASM plugins ---
-    if ctx.decision == WafDecision::Allow {
+    if still_evaluating(ctx) {
         for plugin_name in &plugin_runtime.plugin_names() {
             let result = plugin_runtime.evaluate_plugin(plugin_name, ctx).await;
             if result.anomaly_score_delta > 0 {
@@ -4264,6 +4357,32 @@ fn governing_mode(ctx: &RequestContext, site_mode: &WafMode) -> WafMode {
     ctx.enforcement_mode
         .clone()
         .unwrap_or_else(|| site_mode.clone())
+}
+
+/// Is this request still being evaluated, or has a terminal block already been
+/// reached?
+///
+/// ⚠️ This is deliberately `!= Block` and NOT `== Allow`, and the difference was a
+/// protection bypass.
+///
+/// `enforce_request_limit` runs in `proxy_inner` BEFORE `phase1_headers`, and on
+/// a learning-mode site `enforce_mode` rewrites its `Block` to `WafDecision::Log`
+/// so the request is recorded rather than rejected — which is correct. But every
+/// phase-1 check was then gated on `ctx.decision == WafDecision::Allow`, and
+/// `Log != Allow`. So one over-long URI (default `max_uri_length` 8192), one
+/// excess header, one disallowed method or one over-large body silently switched
+/// OFF smuggling detection, bot scoring, GeoIP, rate limiting, edge JWT, the gRPC
+/// gate, the rule engine and the WASM plugins — for that request, at the client's
+/// choosing.
+///
+/// Verified live on a learning-mode site before the fix: a request whose only
+/// fault was a non-ASCII header value returned 400 (smuggling), and the SAME
+/// request with a 9000-byte URI returned 200 with no smuggling record at all.
+///
+/// `Challenge` and `Limit` are also non-terminal here: a challenged or throttled
+/// request has not been refused, so there is no reason to stop inspecting it.
+fn still_evaluating(ctx: &RequestContext) -> bool {
+    ctx.decision != WafDecision::Block
 }
 
 fn enforce_mode(ctx: &mut RequestContext, mode: &WafMode) {
@@ -6283,6 +6402,38 @@ fn health_response(state: &ServerState) -> Response<BoxBody> {
         // the field that matters — non-empty means a site's country policy is
         // displayed and not applied, because no MaxMind database is present.
         "geoip": geoip_status(&state.config.load(), &state.modules.geoip_map.load()),
+        // Module reachability. Seven subsystems had no logging at all, and their
+        // entry points are per-request pure functions on attacker-controlled
+        // input, so they cannot be given log lines. These counters answer the one
+        // question their silence made unanswerable: did the control RUN?
+        //
+        // Read them as zeroes and ratios, not totals:
+        //   smuggling.evaluated == 0 with traffic  -> desync detection never ran
+        //   graphql.inspected == 0 while configured -> the endpoint gate does not
+        //     match this app's path (case-sensitive `contains("graphql")`, POST
+        //     only), so the firewall is configured and inspecting nothing
+        //   grpc.inspected == 0 while configured   -> same, for Content-Type
+        //   ja4.success / ja4.attempts             -> fingerprint coverage; a
+        //     shortfall silently disables every JA4-dependent control
+        //   bot.good_bot_allowed                   -> requests trusted purely on
+        //     a User-Agent claim; reverse-DNS verification is still a TODO
+        "modules": {
+            "smuggling": {
+                "evaluated": smuggling_evaluated_total(),
+                "rejected_framing": smuggling_rejected_framing_total(),
+                "rejected_header": smuggling_rejected_header_total(),
+            },
+            "graphql": {
+                "inspected": graphql_inspected_total(),
+                "blocked": graphql_blocked_total(),
+            },
+            "grpc": { "inspected": grpc_inspected_total() },
+            "ja4": {
+                "attempts": ja4_attempts_total(),
+                "success": ja4_success_total(),
+            },
+            "bot": { "good_bot_allowed_unverified": bot_good_bot_allowed_total() },
+        },
         "upstreams_healthy": pool_stats.healthy,
         "upstreams_total": pool_stats.total,
         "version": env!("CARGO_PKG_VERSION"),

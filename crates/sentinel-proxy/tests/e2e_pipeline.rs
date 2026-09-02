@@ -1565,3 +1565,154 @@ async fn an_unmatched_host_yields_502_rather_than_silence() {
     );
     shutdown_proxy(tx, jh).await;
 }
+
+// ---------------------------------------------------------------------------
+// A client must not be able to opt itself out of Phase-1 protection
+// ---------------------------------------------------------------------------
+
+/// `enforce_request_limit` runs BEFORE `phase1_headers`, and on a learning-mode
+/// site it downgrades its own `Block` to `WafDecision::Log` so the request is
+/// recorded rather than rejected. Every phase-1 and body check was then gated on
+/// `ctx.decision == WafDecision::Allow` — and `Log != Allow`. So one over-long
+/// URI switched OFF smuggling detection, bot scoring, GeoIP, rate limiting, edge
+/// JWT, the gRPC gate, the rule engine, the WASM plugins and the GraphQL firewall
+/// for that request, at the client's choosing.
+///
+/// Proven live on .71 before the fix: a request whose only fault was a non-ASCII
+/// header value returned 400, and the SAME request with a 9000-byte URI returned
+/// 200 with no smuggling record at all.
+///
+/// This asserts through `graphql.inspected` on `/healthz` rather than through the
+/// response status, because in learning mode the status is 200 either way — the
+/// bypass is invisible from outside. `graphql.inspected` is the right witness
+/// because it is a process-global counter that NO other test in this binary
+/// touches, so the delta is attributable to this request alone; asserting on
+/// `smuggling.evaluated` would pass even with the fix reverted, since every other
+/// concurrent test increments it.
+#[tokio::test]
+async fn an_over_long_uri_does_not_exempt_a_request_from_inspection() {
+    let (up_addr, _up) = start_mock_upstream().await;
+    let port = next_port();
+    let mut cfg = test_config(
+        port,
+        up_addr.port(),
+        "REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
+        // Learning is the mode that exposes the bug, and the mode every site
+        // created through the API is stored in.
+        WafMode::Learning,
+    );
+    cfg.sites[0].waf.graphql = Some(sentinel_core::config::GraphqlConfig {
+        enable: true,
+        max_depth: 3,
+        max_complexity: 1000,
+        block_introspection: true,
+    });
+    // Set explicitly: `WafConfig::default()` leaves this 0 (disabled), while the
+    // serde default a real deployment gets is 8192. The bug needs an ACTIVE limit.
+    cfg.sites[0].waf.max_uri_length = 8192;
+    let limit = cfg.sites[0].waf.max_uri_length;
+
+    let (tx, jh) = start_proxy(cfg).await;
+
+    let read_inspected = |body: &[u8]| -> u64 {
+        let v: serde_json::Value = serde_json::from_slice(body).expect("healthz json");
+        v["modules"]["graphql"]["inspected"]
+            .as_u64()
+            .expect("modules.graphql.inspected must be published")
+    };
+
+    let (_, before) = send_request(port, "test-site.local", "/healthz", Method::GET, "").await;
+    let before = read_inspected(&before);
+
+    // A GraphQL POST whose URI is padded past max_uri_length. The body is a
+    // perfectly ordinary query — this test is about whether the firewall RAN,
+    // not about whether it found anything.
+    let pad = "a".repeat((limit as usize) + 512);
+    let (status, _) = send_request(
+        port,
+        "test-site.local",
+        &format!("/graphql?pad={pad}"),
+        Method::POST,
+        r#"{"query":"{ me { name } }"}"#,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "learning mode must still forward the request; it records, it does not reject"
+    );
+
+    let (_, after) = send_request(port, "test-site.local", "/healthz", Method::GET, "").await;
+    let after = read_inspected(&after);
+
+    shutdown_proxy(tx, jh).await;
+
+    assert!(
+        after > before,
+        "the GraphQL firewall did not inspect a request whose URI exceeded \
+         max_uri_length ({before} -> {after}). The request was downgraded to Log by \
+         learning mode, and a check gated on `== Allow` therefore skipped it — which \
+         is a client-selectable protection bypass, not a limit."
+    );
+}
+
+/// The GraphQL and gRPC-body checks are the only two verdicts reached AFTER
+/// `phase2_body` has already applied `enforce_mode`, so they were the two a
+/// site's mode could not govern: on a learning site they hard-blocked while
+/// setting no `would_block`, so the learning report held no evidence for the
+/// block it had just served — and a per-path `mode: off` could not disable them.
+///
+/// A soak an operator was told was non-disruptive would therefore return 403 to
+/// real GraphQL clients whose queries were merely deep.
+#[tokio::test]
+async fn a_learning_site_records_a_graphql_violation_instead_of_blocking_it() {
+    let (up_addr, _up) = start_mock_upstream().await;
+    let port = next_port();
+    let mut cfg = test_config(
+        port,
+        up_addr.port(),
+        "REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
+        WafMode::Learning,
+    );
+    cfg.sites[0].waf.graphql = Some(sentinel_core::config::GraphqlConfig {
+        enable: true,
+        max_depth: 2,
+        max_complexity: 1000,
+        block_introspection: true,
+    });
+    let (tx, jh) = start_proxy(cfg).await;
+
+    // Depth 5, comfortably past max_depth 2.
+    let (status, body) = send_request(
+        port,
+        "test-site.local",
+        "/graphql",
+        Method::POST,
+        r#"{"query":"{ a { b { c { d { e } } } } }"}"#,
+    )
+    .await;
+
+    // Confirm the firewall really did fire, so a 200 cannot be mistaken for the
+    // rule simply not matching.
+    let (_, health) = send_request(port, "test-site.local", "/healthz", Method::GET, "").await;
+    let v: serde_json::Value = serde_json::from_slice(&health).expect("healthz json");
+    let blocked = v["modules"]["graphql"]["blocked"].as_u64().unwrap_or(0);
+
+    shutdown_proxy(tx, jh).await;
+
+    assert!(
+        blocked > 0,
+        "the GraphQL firewall did not flag a depth-5 query against max_depth 2, so \
+         this test proves nothing about mode handling"
+    );
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a learning-mode site must RECORD a GraphQL violation and forward the request, \
+         not reject it. Blocking here means the verdict bypassed enforce_mode."
+    );
+    assert!(
+        body.starts_with(b"upstream-ok:"),
+        "the request must actually reach the origin in learning mode"
+    );
+}

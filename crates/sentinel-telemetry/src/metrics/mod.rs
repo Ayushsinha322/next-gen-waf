@@ -469,6 +469,48 @@ struct WafMetrics {
     /// attacks from `waf_events` for that window.
     pub history_shed_total: Counter,
     pub log_lines_dropped_total: Counter,
+
+    // ---- Module reachability -------------------------------------------------
+    //
+    // Seven module subsystems (bot_detect, jwt_auth, graphql, grpc, smuggling,
+    // threat_intel, tls_fingerprint) contained ZERO log statements of any level —
+    // ~4,200 lines of security code that could not report its own state. They
+    // cannot simply be given log lines: every one of their entry points is a pure
+    // function called ONCE PER REQUEST on attacker-controlled input, so an
+    // info!/warn! there is both a throughput problem and a log-flood primitive.
+    //
+    // A counter is the correct production-visible surface for that shape. Each of
+    // these answers exactly one question that was previously unanswerable: "did
+    // this control actually run?" — as distinct from "did it find anything?".
+    // `configured > 0` alongside `inspected == 0` after real traffic is the only
+    // way an endpoint-matching or transport mismatch is discoverable at all.
+    /// Requests on which desync detection actually ran. Distinguishes "ran and
+    /// found nothing" from "never called" — which is not academic: a phase-1 gate
+    /// bug meant an over-long URI skipped this check entirely.
+    pub smuggling_evaluated_total: Counter,
+    /// Desync rejections, split so the framing detections can be told apart from
+    /// the header-byte tripwire. Answers "are all of our smuggling blocks
+    /// actually one false positive?" without a per-request log line.
+    pub smuggling_rejected_framing_total: Counter,
+    pub smuggling_rejected_header_total: Counter,
+    /// Bodies the GraphQL firewall actually inspected, and blocked. The endpoint
+    /// gate is a case-sensitive `contains("graphql")` on POST only, so a site
+    /// serving `/GraphQL` or using GET is silently never inspected.
+    pub graphql_inspected_total: Counter,
+    pub graphql_blocked_total: Counter,
+    /// Bodies the gRPC firewall actually inspected, gated on a Content-Type
+    /// match; a transport or content-type mismatch shows up here as a zero.
+    pub grpc_inspected_total: Counter,
+    /// JA4 fingerprinting attempts vs successes. The ratio is the coverage number
+    /// nobody could compute: a None fingerprint silently disables every
+    /// JA4-dependent control downstream, and HTTP/3 supplies none at all.
+    pub ja4_attempts_total: Counter,
+    pub ja4_success_total: Counter,
+    /// Requests allowed by the good-bot User-Agent allowlist. Reverse-DNS
+    /// verification is still a TODO, so this counts unauthenticated trust —
+    /// anyone may claim to be Googlebot.
+    pub bot_good_bot_allowed_total: Counter,
+
     pub registry: MetricsRegistry,
 }
 
@@ -516,6 +558,43 @@ impl WafMetrics {
             "Total number of NDJSON access/waf log lines dropped because the writer queue was full",
         );
 
+        let smuggling_evaluated_total = registry.register_counter(
+            "sentinel_smuggling_evaluated_total",
+            "Requests on which HTTP desync detection actually ran (distinguishes ran-and-clean from never-called)",
+        );
+        let smuggling_rejected_framing_total = registry.register_counter(
+            "sentinel_smuggling_rejected_framing_total",
+            "Desync rejections from Content-Length / Transfer-Encoding framing checks",
+        );
+        let smuggling_rejected_header_total = registry.register_counter(
+            "sentinel_smuggling_rejected_header_total",
+            "Desync rejections from the header-byte tripwire (CR/LF or NUL in a header value)",
+        );
+        let graphql_inspected_total = registry.register_counter(
+            "sentinel_graphql_inspected_total",
+            "Request bodies the GraphQL firewall actually inspected",
+        );
+        let graphql_blocked_total = registry.register_counter(
+            "sentinel_graphql_blocked_total",
+            "Request bodies the GraphQL firewall rejected on depth / complexity / introspection",
+        );
+        let grpc_inspected_total = registry.register_counter(
+            "sentinel_grpc_inspected_total",
+            "Request bodies the gRPC firewall actually inspected",
+        );
+        let ja4_attempts_total = registry.register_counter(
+            "sentinel_ja4_attempts_total",
+            "TLS ClientHello peeks attempted for JA4 fingerprinting",
+        );
+        let ja4_success_total = registry.register_counter(
+            "sentinel_ja4_success_total",
+            "TLS ClientHello peeks that yielded a JA4 fingerprint (attempts minus this is silent JA4 coverage loss)",
+        );
+        let bot_good_bot_allowed_total = registry.register_counter(
+            "sentinel_bot_good_bot_allowed_total",
+            "Requests allowed by the good-bot User-Agent allowlist, which is NOT reverse-DNS verified",
+        );
+
         Self {
             requests_total,
             blocked_total,
@@ -527,6 +606,15 @@ impl WafMetrics {
             load_shed_requests_total,
             history_shed_total,
             log_lines_dropped_total,
+            smuggling_evaluated_total,
+            smuggling_rejected_framing_total,
+            smuggling_rejected_header_total,
+            graphql_inspected_total,
+            graphql_blocked_total,
+            grpc_inspected_total,
+            ja4_attempts_total,
+            ja4_success_total,
+            bot_good_bot_allowed_total,
             registry,
         }
     }
@@ -595,6 +683,90 @@ pub fn inc_history_shed() -> u64 {
 /// process's lifetime reached the buffer.
 pub fn history_shed_total() -> u64 {
     WAF_METRICS.history_shed_total.get()
+}
+
+// ---- Module reachability counters ------------------------------------------
+//
+// One increment/read pair per question, in the `history_shed_total` mould. Each
+// increment site sits INSIDE the branch that was already taken, so none of these
+// adds work to a request that was not already doing it.
+//
+// Read them as ratios and as zeroes, not as totals: `graphql_inspected_total`
+// stuck at 0 while a site has GraphQL configured is the finding, and
+// `ja4_success_total / ja4_attempts_total` is fingerprint coverage.
+
+/// Desync detection ran on one request.
+pub fn note_smuggling_evaluated() {
+    WAF_METRICS.smuggling_evaluated_total.inc();
+}
+pub fn smuggling_evaluated_total() -> u64 {
+    WAF_METRICS.smuggling_evaluated_total.get()
+}
+
+/// A desync rejection from the CL/TE framing checks — the real primitive.
+pub fn note_smuggling_rejected_framing() {
+    WAF_METRICS.smuggling_rejected_framing_total.inc();
+}
+pub fn smuggling_rejected_framing_total() -> u64 {
+    WAF_METRICS.smuggling_rejected_framing_total.get()
+}
+
+/// A desync rejection from the header-byte tripwire.
+pub fn note_smuggling_rejected_header() {
+    WAF_METRICS.smuggling_rejected_header_total.inc();
+}
+pub fn smuggling_rejected_header_total() -> u64 {
+    WAF_METRICS.smuggling_rejected_header_total.get()
+}
+
+/// The GraphQL firewall inspected one body.
+pub fn note_graphql_inspected() {
+    WAF_METRICS.graphql_inspected_total.inc();
+}
+pub fn graphql_inspected_total() -> u64 {
+    WAF_METRICS.graphql_inspected_total.get()
+}
+
+/// The GraphQL firewall rejected one body.
+pub fn note_graphql_blocked() {
+    WAF_METRICS.graphql_blocked_total.inc();
+}
+pub fn graphql_blocked_total() -> u64 {
+    WAF_METRICS.graphql_blocked_total.get()
+}
+
+/// The gRPC firewall inspected one body.
+pub fn note_grpc_inspected() {
+    WAF_METRICS.grpc_inspected_total.inc();
+}
+pub fn grpc_inspected_total() -> u64 {
+    WAF_METRICS.grpc_inspected_total.get()
+}
+
+/// A JA4 fingerprint was attempted, and whether it produced one. Call the
+/// attempt unconditionally at the peek site and the success only on `Some`, so
+/// the difference is real coverage loss rather than an absent code path.
+pub fn note_ja4_attempt() {
+    WAF_METRICS.ja4_attempts_total.inc();
+}
+pub fn note_ja4_success() {
+    WAF_METRICS.ja4_success_total.inc();
+}
+pub fn ja4_attempts_total() -> u64 {
+    WAF_METRICS.ja4_attempts_total.get()
+}
+pub fn ja4_success_total() -> u64 {
+    WAF_METRICS.ja4_success_total.get()
+}
+
+/// A request was allowed because its User-Agent claimed to be a known good bot.
+/// Unverified: reverse-DNS confirmation is still a TODO, so this is a count of
+/// unauthenticated trust.
+pub fn note_good_bot_allowed() {
+    WAF_METRICS.bot_good_bot_allowed_total.inc();
+}
+pub fn bot_good_bot_allowed_total() -> u64 {
+    WAF_METRICS.bot_good_bot_allowed_total.get()
 }
 
 /// Record one NDJSON log line dropped because the writer queue was full, and
