@@ -2429,6 +2429,7 @@ dependencies = [
  "jsonwebtoken",
  "libc",
  "quinn",
+ "quinn-proto",
  "rcgen",
  "regex",
  "ring",

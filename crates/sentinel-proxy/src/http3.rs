@@ -72,7 +72,14 @@ pub fn quic_server_config(mut rustls_config: rustls::ServerConfig) -> Result<qui
     rustls_config.alpn_protocols = vec![ALPN_H3.to_vec()];
     let quic = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config)
         .map_err(|e| anyhow!("rustls ServerConfig is not QUIC-compatible: {e}"))?;
-    Ok(quinn::ServerConfig::with_crypto(Arc::new(quic)))
+    // Wrapped so every QUIC session is fingerprinted — see `ja4_quic`. Without
+    // this wrapper h3 clients reach the pipeline with no JA4 at all, which makes
+    // the malicious-JA4 bot signal and the JA4 blocklist inert for h3 while they
+    // stay active for TCP. `ja4_quic::fingerprint_for` logs at ERROR if it ever
+    // finds the wrapper missing.
+    Ok(quinn::ServerConfig::with_crypto(Arc::new(
+        crate::ja4_quic::Ja4ServerConfig::new(Arc::new(quic)),
+    )))
 }
 
 /// Build a QUIC server config that serves certificates from the live
@@ -165,7 +172,18 @@ async fn handle_quic_connection(
         .await
         .context("QUIC handshake failed")?;
     let peer = conn.remote_address();
-    debug!(%peer, "HTTP/3 connection established");
+    // Must happen BEFORE `conn` is moved into h3_quinn below: the fingerprint
+    // rides in the connection's own TLS session, so there is no side table to
+    // consult afterwards.
+    let (tls_fp, ja4_outcome) = crate::ja4_quic::fingerprint_for(&conn);
+    sentinel_telemetry::note_ja4_h3(tls_fp.is_some());
+    if tls_fp.is_none() {
+        // Not an error on its own — a refused hello is a legitimate outcome —
+        // but the REASON must be recoverable, or "h3 has no fingerprint" is
+        // once again a fact with no explanation.
+        debug!(%peer, outcome = ja4_outcome.as_str(), "no h3 JA4 fingerprint");
+    }
+    debug!(%peer, ja4 = tls_fp.as_deref().unwrap_or("-"), "HTTP/3 connection established");
 
     let mut h3_conn: h3::server::Connection<H3Conn, Bytes> = h3::server::builder()
         .build(h3_quinn::Connection::new(conn))
@@ -178,8 +196,12 @@ async fn handle_quic_connection(
             Ok(Some(resolver)) => {
                 let state = Arc::clone(&state);
                 let ds = default_site.clone();
+                // Cloned per request: one connection's fingerprint serves every
+                // request multiplexed over it, exactly as on a keep-alive TCP
+                // connection.
+                let fp = tls_fp.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_h3_request(resolver, state, ds, peer).await {
+                    if let Err(e) = handle_h3_request(resolver, state, ds, peer, fp).await {
                         debug!("HTTP/3 request error: {e}");
                     }
                 });
@@ -208,6 +230,7 @@ async fn handle_h3_request(
     state: Arc<ServerState>,
     default_site: Option<String>,
     peer: SocketAddr,
+    tls_fp: Option<String>,
 ) -> Result<()> {
     let (req, mut stream) = resolver
         .resolve_request()
@@ -244,9 +267,11 @@ async fn handle_h3_request(
         .boxed();
     let pipeline_req = Request::from_parts(parts, body);
 
-    // Run the full WAF pipeline — identical to the TCP path. JA4 for QUIC/h3
-    // is not yet wired (None); the TCP path supplies the fingerprint today.
-    let resp = run_pipeline(state, peer, pipeline_req, default_site, None).await;
+    // Run the full WAF pipeline — identical to the TCP path, JA4 included: the
+    // fingerprint was extracted from this connection's TLS session at accept
+    // time (see `ja4_quic`) and reaches `ctx.tls_fingerprint` exactly as the TCP
+    // path's peeked fingerprint does.
+    let resp = run_pipeline(state, peer, pipeline_req, default_site, tls_fp).await;
 
     // Relay the response over the QUIC stream: headers first, then body.
     let (mut resp_parts, resp_body) = resp.into_parts();
