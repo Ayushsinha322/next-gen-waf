@@ -506,6 +506,11 @@ struct WafMetrics {
     /// JA4-dependent control downstream, and HTTP/3 supplies none at all.
     pub ja4_attempts_total: Counter,
     pub ja4_success_total: Counter,
+    /// Connections that never presented a TLS handshake record at all — TCP
+    /// probes, port scans, abandoned connections. Kept OUT of
+    /// `ja4_attempts_total` so `success / attempts` is real coverage rather than
+    /// a number dominated by traffic that was never a TLS client.
+    pub ja4_no_hello_total: Counter,
     /// Requests allowed by the good-bot User-Agent allowlist. Reverse-DNS
     /// verification is still a TODO, so this counts unauthenticated trust —
     /// anyone may claim to be Googlebot.
@@ -590,6 +595,10 @@ impl WafMetrics {
             "sentinel_ja4_success_total",
             "TLS ClientHello peeks that yielded a JA4 fingerprint (attempts minus this is silent JA4 coverage loss)",
         );
+        let ja4_no_hello_total = registry.register_counter(
+            "sentinel_ja4_no_hello_total",
+            "Connections that never sent a TLS handshake record (probes/scans), excluded from ja4_attempts_total",
+        );
         let bot_good_bot_allowed_total = registry.register_counter(
             "sentinel_bot_good_bot_allowed_total",
             "Requests allowed by the good-bot User-Agent allowlist, which is NOT reverse-DNS verified",
@@ -614,6 +623,7 @@ impl WafMetrics {
             grpc_inspected_total,
             ja4_attempts_total,
             ja4_success_total,
+            ja4_no_hello_total,
             bot_good_bot_allowed_total,
             registry,
         }
@@ -757,6 +767,14 @@ pub fn ja4_attempts_total() -> u64 {
 }
 pub fn ja4_success_total() -> u64 {
     WAF_METRICS.ja4_success_total.get()
+}
+
+/// A connection that never spoke TLS. Not a fingerprinting failure.
+pub fn note_ja4_no_hello() {
+    WAF_METRICS.ja4_no_hello_total.inc();
+}
+pub fn ja4_no_hello_total() -> u64 {
+    WAF_METRICS.ja4_no_hello_total.get()
 }
 
 /// A request was allowed because its User-Agent claimed to be a known good bot.
