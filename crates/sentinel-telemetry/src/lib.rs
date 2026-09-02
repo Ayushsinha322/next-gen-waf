@@ -31,11 +31,16 @@ pub mod metrics;
 pub mod traces;
 
 pub use metrics::{
-    dec_active_connections, history_shed_total, inc_active_connections, inc_blocked,
-    inc_ebpf_drops, inc_history_shed, inc_load_shed_connections, inc_load_shed_requests,
-    inc_log_lines_dropped, inc_requests, inc_rule_hits, log_lines_dropped_total, observe_duration,
-    prometheus_text, set_active_connections, snapshot, Counter, Gauge, Histogram, MetricLine,
-    MetricsRegistry, MetricsSnapshot,
+    bot_good_bot_allowed_total, dec_active_connections, graphql_blocked_total,
+    graphql_inspected_total, grpc_inspected_total, history_shed_total, inc_active_connections,
+    inc_blocked, inc_ebpf_drops, inc_history_shed, inc_load_shed_connections,
+    inc_load_shed_requests, inc_log_lines_dropped, inc_requests, inc_rule_hits, ja4_attempts_total,
+    ja4_success_total, log_lines_dropped_total, note_good_bot_allowed, note_graphql_blocked,
+    note_graphql_inspected, note_grpc_inspected, note_ja4_attempt, note_ja4_success,
+    note_smuggling_evaluated, note_smuggling_rejected_framing, note_smuggling_rejected_header,
+    observe_duration, prometheus_text, set_active_connections, smuggling_evaluated_total,
+    smuggling_rejected_framing_total, smuggling_rejected_header_total, snapshot, Counter, Gauge,
+    Histogram, MetricLine, MetricsRegistry, MetricsSnapshot,
 };
 
 pub use traces::{start_child_span, start_span, Span, SpanId, TraceId, Tracer, TRACER};

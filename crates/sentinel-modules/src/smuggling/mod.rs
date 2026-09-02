@@ -178,8 +178,17 @@ fn check_duplicate_te_headers(headers: &http::HeaderMap) -> Option<SmugglingVerd
     // lookup). The `get_all()` method returns all values for that normalized
     // key. If we see > 1 TE value, reject — this is the TE.TE attack vector.
     //
-    // This check is redundant with `check_te_obfuscation` which already
-    // detects multiple values, but we keep it as a belt-and-suspenders.
+    // ⚠️ NOT redundant with `check_te_obfuscation`, despite looking it — do not
+    // "simplify" this away.
+    //
+    // That check builds its list with `.filter_map(|v| v.to_str().ok())`, and
+    // `to_str` accepts only visible ASCII. A second `Transfer-Encoding` header
+    // whose value carries one byte above 0x7F is therefore DROPPED from its list,
+    // `te_values.len() > 1` is false, and it returns Clean. This check counts the
+    // RAW headers and is the only thing that catches that pair — which is the
+    // TE.TE primitive with one line of obfuscation added.
+    //
+    // The ordering in `detect` is load-bearing for the same reason.
     if headers
         .get_all(http::header::TRANSFER_ENCODING)
         .iter()
@@ -198,24 +207,59 @@ fn check_duplicate_te_headers(headers: &http::HeaderMap) -> Option<SmugglingVerd
 /// An attacker may inject `\r\nGET /admin HTTP/1.1\r\nHost: ...` inside a
 /// header value. If a back-end parses the raw byte-stream naively, the
 /// injected fragment becomes the next request.
+/// Byte classes that must never appear inside a header value, named for the log.
+///
+/// ⚠️ **Reachability, stated plainly so this is not mistaken for an active
+/// control.** `http::HeaderValue`'s constructors reject CR, LF and NUL — even
+/// `from_maybe_shared_unchecked` asserts it — so for any request parsed by hyper
+/// or h3 this predicate CANNOT fire; the type invariant already guarantees what
+/// it checks. It is retained as a tripwire for a future transport or raw-bytes
+/// path that might bypass that constructor, and it is tested directly rather than
+/// through a `HeaderMap`, because a `HeaderMap` cannot be made to hold these
+/// bytes at all.
+///
+/// `check_header_injection` therefore returning `Clean` for every real request is
+/// the expected steady state. What actually catches desync attempts is the
+/// Content-Length / Transfer-Encoding family above it.
+pub(crate) fn hostile_value_byte(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.contains(&b'\r') || bytes.contains(&b'\n') {
+        return Some("CR/LF injection");
+    }
+    if bytes.contains(&0) {
+        return Some("NUL byte");
+    }
+    None
+}
+
 fn check_header_injection(headers: &http::HeaderMap) -> Option<SmugglingVerdict> {
     for (name, value) in headers.iter() {
-        let val_str = match value.to_str() {
-            Ok(s) => s,
-            Err(_) => {
-                // Non-UTF-8 header value — could be a binary smuggling attempt.
-                return Some(SmugglingVerdict::Reject {
-                    reason: format!("HTTP request smuggling: invalid UTF-8 in header '{}'", name),
-                });
-            }
-        };
-
-        // CR or LF in a header value is always suspicious.
-        if val_str.contains('\r') || val_str.contains('\n') {
+        // Scan the RAW BYTES rather than `value.to_str()`.
+        //
+        // `HeaderValue::to_str` accepts only *visible ASCII*, so it errors on any
+        // byte above 0x7F — which RFC 7230 calls obs-text and which httparse
+        // forwards rather than rejecting. This function used to treat that error
+        // as proof of smuggling. Both halves of that were wrong:
+        //
+        //   FALSE POSITIVE — a header value that is perfectly good UTF-8, such as
+        //   a Referer, cookie or filename carrying an accented character, was
+        //   rejected as a desync attempt and reported as "invalid UTF-8" (it was
+        //   valid UTF-8; it simply was not ASCII). Verified live: `X-Note: café`
+        //   as the ONLY fault returned 400 on a site configured to observe, and
+        //   this was the one arm of this function a normal client could reach.
+        //
+        //   MISSED DETECTION — returning early meant the injection scan below
+        //   never examined such a value at all, so `\r\nGET /admin HTTP/1.1`
+        //   hidden in a value that also carried one high byte went unexamined.
+        //
+        // Scanning bytes fixes both directions: a high byte is no longer
+        // suspicious on its own, and CR/LF is caught wherever it hides.
+        //
+        if let Some(class) = hostile_value_byte(value.as_bytes()) {
             return Some(SmugglingVerdict::Reject {
                 reason: format!(
-                    "HTTP request smuggling: CR/LF injection in header '{}'",
-                    name
+                    "HTTP request smuggling: {} in header '{}'",
+                    class,
+                    name.as_str()
                 ),
             });
         }
@@ -614,5 +658,120 @@ mod tests {
             }
             _ => panic!("expected Reject for multiple TE headers"),
         }
+    }
+
+    // --- non-ASCII header values are NOT smuggling -------------------------
+    //
+    // `HeaderValue::to_str` accepts only visible ASCII, and this module used to
+    // read that error as proof of a desync attempt. It was the one arm of
+    // `check_header_injection` an ordinary client could reach, and it fired on
+    // any accented character in any header — verified live, where `X-Note: café`
+    // as the sole fault produced a 400 on a site configured only to observe.
+
+    /// A header value that is valid UTF-8 but not ASCII must be Clean.
+    #[test]
+    fn a_utf8_header_value_is_not_smuggling() {
+        for (label, raw) in [
+            ("accented", "café".as_bytes()),
+            ("cyrillic", "Привет".as_bytes()),
+            ("cjk", "日本語".as_bytes()),
+            ("emoji", "🙂".as_bytes()),
+            // U+00A0 NBSP — a single high byte, the minimal reproduction.
+            ("nbsp", "\u{00A0}".as_bytes()),
+        ] {
+            let mut map = HeaderMap::new();
+            map.insert(HOST, "example.com".parse().unwrap());
+            map.insert(
+                http::HeaderName::from_static("x-note"),
+                http::HeaderValue::from_bytes(raw).expect("http accepts obs-text in a value"),
+            );
+            assert_eq!(
+                detect(&map),
+                SmugglingVerdict::Clean,
+                "{label}: a non-ASCII header value is not a desync attempt, and rejecting \
+                 it broke real clients while reporting 'invalid UTF-8' about text that was \
+                 valid UTF-8"
+            );
+        }
+    }
+
+    /// The tripwire itself, tested on raw bytes.
+    ///
+    /// It cannot be tested through a `HeaderMap`: `HeaderValue` rejects CR, LF and
+    /// NUL in every constructor, including `from_maybe_shared_unchecked`, which
+    /// asserts. That is exactly why the predicate is a separate pure function —
+    /// the thing it guards against is unreachable through the type today, and a
+    /// test that went through `detect` would be asserting on the `http` crate's
+    /// invariant rather than on our code.
+    #[test]
+    fn the_hostile_byte_tripwire_still_catches_crlf_and_nul() {
+        for (label, raw, want) in [
+            (
+                "bare crlf",
+                &b"x\r\nGET /admin HTTP/1.1"[..],
+                "CR/LF injection",
+            ),
+            ("lf only", &b"x\nGET /admin HTTP/1.1"[..], "CR/LF injection"),
+            // The case the old early-return could never see: a high byte AND an
+            // injected request line in the same value. Under the old code the
+            // non-ASCII check short-circuited and this was never examined.
+            (
+                "high byte + crlf",
+                &b"caf\xc3\xa9\r\nGET /admin HTTP/1.1"[..],
+                "CR/LF injection",
+            ),
+            ("nul", &b"abc\x00def"[..], "NUL byte"),
+        ] {
+            assert_eq!(
+                hostile_value_byte(raw),
+                Some(want),
+                "{label} must be caught by the tripwire"
+            );
+        }
+        // And the bytes that provoked the false positive are not hostile.
+        for ok in ["café", "Привет", "日本語", "\u{00A0}", "ordinary"] {
+            assert_eq!(
+                hostile_value_byte(ok.as_bytes()),
+                None,
+                "{ok:?} is a legitimate header value"
+            );
+        }
+    }
+
+    /// Pins the reason `check_duplicate_te_headers` is not redundant.
+    ///
+    /// `check_te_obfuscation` filters its value list through `to_str().ok()`, so a
+    /// second Transfer-Encoding header carrying a byte above 0x7F vanishes from
+    /// that list and it returns Clean. Only the raw header count catches the
+    /// pair. If someone deletes the "redundant" check, this test is what stops
+    /// the hole from shipping.
+    #[test]
+    fn an_obfuscated_second_te_header_is_still_caught() {
+        let mut map = HeaderMap::new();
+        map.insert(HOST, "example.com".parse().unwrap());
+        map.append(TRANSFER_ENCODING, "chunked".parse().unwrap());
+        map.append(
+            TRANSFER_ENCODING,
+            http::HeaderValue::from_bytes("ident\u{00A0}ty".as_bytes()).unwrap(),
+        );
+        assert!(
+            matches!(detect(&map), SmugglingVerdict::Reject { .. }),
+            "two Transfer-Encoding headers must be rejected even when one carries a \
+             non-ASCII byte that hides it from the to_str()-filtered check"
+        );
+    }
+
+    /// The framing checks are untouched by the byte-scan change.
+    #[test]
+    fn cl_te_conflict_is_still_rejected() {
+        let headers = headers_from_pairs(&[
+            ("host", "example.com"),
+            ("content-length", "5"),
+            ("transfer-encoding", "chunked"),
+        ]);
+        assert!(
+            matches!(detect(&headers), SmugglingVerdict::Reject { .. }),
+            "CL+TE ambiguity is the actual smuggling primitive and must stay blocked"
+        );
     }
 }

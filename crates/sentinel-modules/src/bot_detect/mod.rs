@@ -16,6 +16,7 @@ use std::collections::HashMap;
 
 use once_cell::sync::Lazy;
 use regex::Regex;
+use tracing::info;
 
 // ---------------------------------------------------------------------------
 // Static pattern tables
@@ -96,15 +97,42 @@ struct CompiledPatterns {
     attackers: Vec<(Regex, String)>,
 }
 
+/// Compile one table, reporting any pattern that does not build.
+///
+/// `error!` and not `warn!`: these patterns are compiled into the shipped
+/// binary, so a failure here is not something an operator can fix from config —
+/// it is a defect in the build, and the consequence is that the named tool's
+/// signature is simply not detected while the module reports itself as working.
+/// That is the same test the geoip module applies when choosing ERROR over WARN.
+///
+/// `filter_map(...ok())` silently dropped these, and because `PATTERNS` is a
+/// `Lazy` forced by the FIRST REQUEST rather than at construction, even a log
+/// line here would previously have been emitted mid-traffic (or, under a target
+/// filter that excluded this crate, never).
+fn compile_table(table: &[(&str, &str)], kind: &'static str) -> Vec<(Regex, String)> {
+    table
+        .iter()
+        .filter_map(|(pat, name)| match Regex::new(pat) {
+            Ok(re) => Some((re, name.to_string())),
+            Err(e) => {
+                tracing::error!(
+                    kind,
+                    name = %name,
+                    pattern = %pat,
+                    error = %e,
+                    "bot_detect: BUILT-IN pattern failed to compile — this signature IS NOT \
+                     DETECTED and cannot be fixed from configuration; it is a defect in the \
+                     shipped binary. Counts are queryable at /healthz -> modules.bot."
+                );
+                None
+            }
+        })
+        .collect()
+}
+
 static PATTERNS: Lazy<CompiledPatterns> = Lazy::new(|| CompiledPatterns {
-    good_bots: GOOD_BOT_PATTERNS
-        .iter()
-        .filter_map(|(pat, name)| Regex::new(pat).ok().map(|re| (re, name.to_string())))
-        .collect(),
-    attackers: ATTACKER_PATTERNS
-        .iter()
-        .filter_map(|(pat, name)| Regex::new(pat).ok().map(|re| (re, name.to_string())))
-        .collect(),
+    good_bots: compile_table(GOOD_BOT_PATTERNS, "good_bot"),
+    attackers: compile_table(ATTACKER_PATTERNS, "attacker"),
 });
 
 impl CompiledPatterns {
@@ -252,11 +280,46 @@ impl Default for BotDetector {
 impl BotDetector {
     /// Build a detector with the built-in static JA4 table.
     pub fn new() -> Self {
-        let malicious_ja4 = MALICIOUS_JA4_TABLE
+        let malicious_ja4: std::collections::HashMap<String, String> = MALICIOUS_JA4_TABLE
             .iter()
             .map(|(fp, name)| (fp.to_string(), name.to_string()))
             .collect();
+        // Force the pattern tables HERE rather than leaving them to the first
+        // request. Without this, `compile_table`'s error! for a built-in pattern
+        // that does not build would be emitted mid-traffic — or never, if the
+        // very first request arrived before a subscriber was installed. A defect
+        // in the shipped binary should be visible at boot.
+        Lazy::force(&PATTERNS);
+        info!(
+            malicious_ja4 = malicious_ja4.len(),
+            attacker_patterns = PATTERNS.attackers.len(),
+            good_bot_patterns = PATTERNS.good_bots.len(),
+            "bot detection initialised"
+        );
         Self { malicious_ja4 }
+    }
+
+    /// How many JA4 fingerprints this detector will match against.
+    ///
+    /// Exposed because the number is smaller than the feature suggests: it is a
+    /// static built-in table, `add_malicious_ja4` is the only way to extend it,
+    /// and the proxy re-creates the detector with `new()` on every config
+    /// reload — so anything added at runtime is discarded. A JA4-based block
+    /// list that is quietly this small is worth being able to read.
+    pub fn ja4_fingerprint_count(&self) -> usize {
+        self.malicious_ja4.len()
+    }
+
+    /// Attacker UA signatures that actually compiled. A shortfall against
+    /// `ATTACKER_PATTERNS.len()` means a built-in signature is not detected.
+    pub fn attacker_pattern_count(&self) -> usize {
+        PATTERNS.attackers.len()
+    }
+
+    /// Good-bot UA patterns that actually compiled. Note these are an
+    /// UNAUTHENTICATED allowlist — see `score`.
+    pub fn good_bot_pattern_count(&self) -> usize {
+        PATTERNS.good_bots.len()
     }
 
     /// Add an extra JA4 fingerprint to block (e.g. from a threat-intel feed).
@@ -702,5 +765,71 @@ mod tests {
         });
         assert_eq!(block.score, 70);
         assert_eq!(block.tier, BotTier::Block);
+    }
+}
+
+#[cfg(test)]
+mod observability_tests {
+    use super::*;
+
+    /// Every built-in pattern must compile. `compile_table` drops any that does
+    /// not (now with an `error!`), so a shortfall here means a shipped signature
+    /// is silently not detected — which is precisely what the old
+    /// `filter_map(...ok())` allowed with no trace at all.
+    #[test]
+    fn every_builtin_pattern_compiles() {
+        let det = BotDetector::new();
+        assert_eq!(
+            det.attacker_pattern_count(),
+            ATTACKER_PATTERNS.len(),
+            "an attacker signature failed to compile and was dropped — that tool is not \
+             detected, and it cannot be fixed from configuration"
+        );
+        assert_eq!(
+            det.good_bot_pattern_count(),
+            GOOD_BOT_PATTERNS.len(),
+            "a good-bot pattern failed to compile"
+        );
+    }
+
+    /// Pins how small the JA4 table actually is, so the number cannot quietly
+    /// drift and so the gap between "JA4 bot blocking" as a feature name and a
+    /// 4-entry built-in demo table stays on the record.
+    ///
+    /// If a real feed is ever wired in, this assertion should be changed
+    /// deliberately — not deleted.
+    #[test]
+    fn the_ja4_table_is_a_small_builtin_demo_set() {
+        let det = BotDetector::new();
+        assert_eq!(
+            det.ja4_fingerprint_count(),
+            MALICIOUS_JA4_TABLE.len(),
+            "new() must expose exactly the built-in table"
+        );
+        assert!(
+            det.ja4_fingerprint_count() < 10,
+            "still the demo table ({}). If a threat-intel feed now populates this, update \
+             this test on purpose and note that the proxy re-creates the detector with \
+             new() on every config reload, which discards add_malicious_ja4 additions.",
+            det.ja4_fingerprint_count()
+        );
+    }
+
+    /// Runtime additions do not survive what the proxy actually does on reload.
+    /// Documents the limitation rather than asserting it is fine.
+    #[test]
+    fn runtime_ja4_additions_are_lost_on_reconstruction() {
+        let mut det = BotDetector::new();
+        let base = det.ja4_fingerprint_count();
+        det.add_malicious_ja4("t13d000000_aaaaaaaaaaaa_bbbbbbbbbbbb", "test-tool");
+        assert_eq!(det.ja4_fingerprint_count(), base + 1);
+        // What the proxy does on every config change.
+        let fresh = BotDetector::new();
+        assert_eq!(
+            fresh.ja4_fingerprint_count(),
+            base,
+            "a fingerprint added at runtime is discarded by the next reload; any feed \
+             integration must repopulate after reconstruction"
+        );
     }
 }

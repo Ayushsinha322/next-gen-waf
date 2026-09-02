@@ -72,9 +72,15 @@ use sentinel_modules::{
 use sentinel_plugins::PluginRuntime;
 use sentinel_rules::RuleEngine;
 use sentinel_telemetry::{
-    dec_active_connections, history_shed_total, inc_active_connections, inc_blocked,
-    inc_ebpf_drops, inc_history_shed, inc_load_shed_connections, inc_load_shed_requests,
-    inc_log_lines_dropped, inc_requests, inc_rule_hits, observe_duration, prometheus_text,
+    bot_good_bot_allowed_total, dec_active_connections, graphql_blocked_total,
+    graphql_inspected_total, grpc_inspected_total, history_shed_total, inc_active_connections,
+    inc_blocked, inc_ebpf_drops, inc_history_shed, inc_load_shed_connections,
+    inc_load_shed_requests, inc_log_lines_dropped, inc_requests, inc_rule_hits, ja4_attempts_total,
+    ja4_success_total, note_good_bot_allowed, note_graphql_blocked, note_graphql_inspected,
+    note_grpc_inspected, note_ja4_attempt, note_ja4_success, note_smuggling_evaluated,
+    note_smuggling_rejected_framing, note_smuggling_rejected_header, observe_duration,
+    prometheus_text, smuggling_evaluated_total, smuggling_rejected_framing_total,
+    smuggling_rejected_header_total,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Semaphore};
@@ -1560,6 +1566,7 @@ impl ProxyServer {
                 .ok()
                 .and_then(|s| s.parse::<u32>().ok())
                 .unwrap_or(3);
+            TI_POLLER_STARTED.store(true, std::sync::atomic::Ordering::Relaxed);
             tokio::spawn(async move {
                 use http_body_util::BodyExt as _;
                 type EmptyBody = http_body_util::Empty<bytes::Bytes>;
@@ -1568,6 +1575,16 @@ impl ProxyServer {
                 let internal_secret = std::env::var("SENTINEL_INTERNAL_SECRET")
                     .ok()
                     .filter(|s| !s.is_empty());
+                // `internal_secret_set` is the field that separates "running"
+                // from "running and being refused with 403 forever".
+                info!(
+                    sync_url = %sync_url,
+                    interval_secs = secs,
+                    watch_score,
+                    xdp_seed = seed_ti_xdp,
+                    internal_secret_set = internal_secret.is_some(),
+                    "threat-intel poller started"
+                );
                 let mut last_version: i64 = i64::MIN;
                 let mut ticker = tokio::time::interval(Duration::from_secs(secs));
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1595,6 +1612,14 @@ impl ProxyServer {
                             continue;
                         }
                     };
+                    // Inspect the STATUS before parsing the body. It never was:
+                    // a 403 (secret mismatch) or 503 (control plane without a
+                    // database) fell straight into `serde_json::from_slice`, and
+                    // this node's IOC set stayed frozen at whatever it last held
+                    // — or at empty — with the only trace being a parse warning
+                    // that named a JSON error rather than the refusal.
+                    let status = resp.status().as_u16();
+                    TI_LAST_STATUS.store(status, std::sync::atomic::Ordering::Relaxed);
                     let bytes = match resp.collect().await {
                         Ok(b) => b.to_bytes(),
                         Err(e) => {
@@ -1602,6 +1627,20 @@ impl ProxyServer {
                             continue;
                         }
                     };
+                    if !(200..300).contains(&status) {
+                        let held = ti_modules.threat_intel.load().entry_count();
+                        warn!(
+                            status,
+                            held_indicators = held,
+                            snippet = %String::from_utf8_lossy(&bytes).chars().take(120).collect::<String>(),
+                            "threat-intel sync REFUSED by the control plane — this node's IOC set \
+                             is FROZEN and will not update. 403 means the shared secret does not \
+                             match: set SENTINEL_INTERNAL_SECRET identically on the control plane \
+                             and every data-plane node. 503 means the control plane has no \
+                             database. Queryable at /healthz -> threat_intel.poller."
+                        );
+                        continue;
+                    }
                     let sync: ThreatIntelSyncResponse = match serde_json::from_slice(&bytes) {
                         Ok(s) => s,
                         Err(e) => {
@@ -1647,16 +1686,69 @@ impl ProxyServer {
                             sync.watch.into(),
                         );
                         let count = feed.entry_count();
+                        // Captured BEFORE the store, or an empty install cannot
+                        // be told from a first install.
+                        let previous = ti_modules.threat_intel.load().entry_count();
                         last_version = sync.version;
                         ti_modules.threat_intel.store(Arc::new(feed));
-                        info!(
-                            version = last_version,
-                            iocs = count,
-                            "threat-intel hot-synced"
-                        );
+                        // One `info!("hot-synced")` used to cover every outcome,
+                        // so replacing 200,000 indicators with zero logged
+                        // exactly like a healthy sync.
+                        match ti_sync_outcome(previous, count, status) {
+                            TiSyncOutcome::Synced { count } => info!(
+                                version = last_version,
+                                iocs = count,
+                                previous_iocs = previous,
+                                "threat-intel hot-synced"
+                            ),
+                            TiSyncOutcome::EmptyRegression { previous } => warn!(
+                                version = last_version,
+                                previous_iocs = previous,
+                                "threat-intel feed synced EMPTY — global IOC enforcement is now OFF \
+                                 on this node, replacing a feed that held {previous} indicators. \
+                                 check() now returns None for every request. Check the aggregator \
+                                 on the control-plane leader (SENTINEL_THREATINTEL_ENABLED, feed \
+                                 URLs, threat_intel_iocs.expires_at). \
+                                 Queryable at /healthz -> threat_intel.active."
+                            ),
+                            TiSyncOutcome::EmptyFirst => info!(
+                                version = last_version,
+                                "threat-intel feed is empty — no IOC enforcement on this node yet; \
+                                 the control-plane corpus has no active indicators"
+                            ),
+                            // Unreachable: a non-2xx `continue`s above. Kept so
+                            // the match is exhaustive rather than silently
+                            // collapsing a future outcome into "synced".
+                            TiSyncOutcome::Rejected { status } => warn!(
+                                status,
+                                "threat-intel sync reached the install path with a non-2xx status"
+                            ),
+                        }
                     }
                 }
             });
+        } else {
+            // The `else` this loop never had. Without a sync URL the poller is
+            // never spawned, so every request is served against the
+            // `ThreatFeed::empty()` installed at construction: `check()`
+            // short-circuits and every malicious IP, CIDR, Tor exit, botnet C2,
+            // malicious domain and scanner user-agent in the control-plane
+            // corpus is ignored.
+            //
+            // WARN and not ERROR deliberately: `cluster.sync_url` also drives
+            // config sync and the heartbeat, so a node without one is a
+            // standalone, file-configured deployment where no threat intel was
+            // ever expected. Crying ERROR at that shape would be the 216-line
+            // mistake again. What must not happen is SILENCE — this failure
+            // otherwise looks exactly like a world with no attackers.
+            warn!(
+                config_key = "cluster.sync_url",
+                "threat-intel poller NOT started — global IOC enforcement is OFF on this node. \
+                 The feed stays empty, so check() returns None for every request. If this node is \
+                 meant to be part of a cluster, set cluster.sync_url (e.g. \
+                 http://controlplane:9501); if it is deliberately standalone, this is expected. \
+                 Queryable at /healthz -> threat_intel.poller."
+            );
         }
 
         // --- Background: control-plane node heartbeat (every 10 s) ---
@@ -2237,7 +2329,17 @@ async fn handle_connection(
     if let Some(acceptor) = tls_acceptor {
         // Fingerprint the TLS ClientHello (JA4) by peeking the socket without
         // consuming it — rustls then reads the same bytes for the handshake.
+        //
+        // Counted per connection, not per request, and the pair is what matters:
+        // a `None` fingerprint silently disables every JA4-dependent control
+        // downstream (bot scoring's malicious-JA4 signal, JA4 blocklists), and
+        // there was no way to tell a deployment where JA4 works from one where it
+        // never produces a fingerprint. attempts - success is that coverage loss.
+        note_ja4_attempt();
         let tls_fp = peek_ja4(&stream).await;
+        if tls_fp.is_some() {
+            note_ja4_success();
+        }
         let tls = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream))
             .await
             .context("TLS handshake timed out")?
@@ -3021,11 +3123,16 @@ async fn proxy_inner(
         note_block(&state, ctx.client_ip);
         let reason = ctx.block_reason.as_deref().unwrap_or("");
         let resp = if reason.starts_with("HTTP request smuggling") {
-            // RFC 7230 §3.3.3: malformed requests MUST be rejected with 400.
-            error_response(
-                StatusCode::BAD_REQUEST,
-                ctx.block_reason.as_deref().unwrap_or("Bad Request"),
-            )
+            // RFC 7230 §3.3.3: malformed framing MUST be rejected with 400. The
+            // STATUS is what the RFC requires; disclosing WHY is not, and the
+            // reason names the exact header and the exact check that fired —
+            // which is free reconnaissance for tuning a desync attempt against
+            // this deployment. It also bypassed `BlockPageConfig::show_reason`
+            // (default false, a deliberate decision) and shipped no Support ID.
+            //
+            // The `jwt:` arm immediately below already did this correctly, with a
+            // comment saying so; this arm simply had not been brought into line.
+            error_response(StatusCode::BAD_REQUEST, "Bad Request")
         } else if reason.starts_with("jwt:") {
             // Authentication failure — 401 Unauthorized. The specific reason is
             // logged server-side but never leaked to the client.
@@ -3162,7 +3269,7 @@ async fn proxy_inner(
             // GraphQL firewall — query depth / complexity / introspection on the
             // body. Gated to GraphQL endpoints so nested REST-JSON bodies aren't
             // misread as GraphQL queries.
-            if ctx.decision == WafDecision::Allow {
+            if still_evaluating(ctx) {
                 if let Some(gql) = site
                     .and_then(|s| s.waf.graphql.as_ref())
                     .filter(|g| g.enable)
@@ -3175,12 +3282,20 @@ async fn proxy_inner(
                                 .and_then(|v| v.to_str().ok())
                                 .is_some_and(|ct| ct.contains("application/graphql")));
                     if is_graphql {
+                        // The endpoint gate above is a case-sensitive
+                        // `contains("graphql")` on POST only. A site serving
+                        // `/GraphQL`, or accepting GET, is silently never
+                        // inspected — and nothing said so. `configured > 0` with
+                        // `inspected == 0` after real traffic is the only way
+                        // that mismatch is discoverable.
+                        note_graphql_inspected();
                         let limits = GraphqlLimits {
                             max_depth: gql.max_depth,
                             max_complexity: gql.max_complexity,
                             block_introspection: gql.block_introspection,
                         };
                         if let Some(reason) = inspect_graphql(&bytes, &limits) {
+                            note_graphql_blocked();
                             ctx.decision = WafDecision::Block;
                             ctx.block_reason = Some(reason);
                         }
@@ -3189,7 +3304,7 @@ async fn proxy_inner(
             }
 
             // gRPC firewall — message/frame-size limits on the buffered body.
-            if ctx.decision == WafDecision::Allow {
+            if still_evaluating(ctx) {
                 if let Some(grpc_cfg) = site.and_then(|s| s.waf.grpc.as_ref()).filter(|g| g.enable)
                 {
                     let is_grpc_ct = ctx
@@ -3198,6 +3313,10 @@ async fn proxy_inner(
                         .and_then(|v| v.to_str().ok())
                         .is_some_and(is_grpc);
                     if is_grpc_ct {
+                        // Same reachability question as GraphQL: gated on a
+                        // Content-Type match, so a transport or content-type
+                        // mismatch shows up here as a permanent zero.
+                        note_grpc_inspected();
                         let limits = GrpcLimits {
                             max_message_bytes: grpc_cfg.max_message_bytes,
                             max_frames: grpc_cfg.max_frames,
@@ -3211,6 +3330,23 @@ async fn proxy_inner(
                         }
                     }
                 }
+            }
+
+            // The GraphQL and gRPC-body verdicts above are the only two that are
+            // reached AFTER `phase2_body` has already applied `enforce_mode`
+            // internally, so they were the two verdicts a site's mode could not
+            // govern in either direction: on a learning site they hard-blocked
+            // while setting no `would_block` (so the learning report held no
+            // evidence for the block it had just served), and a per-path
+            // `mode: off` could not switch them off at all.
+            //
+            // Re-applying the mode here rather than moving the checks into
+            // `phase2_body`: both need the buffered `bytes` and the site's
+            // GraphQL/gRPC config, which live in this scope. `enforce_mode` does
+            // nothing when the decision is already non-terminal.
+            if let Some(s) = site {
+                let gm = governing_mode(ctx, &s.waf.mode);
+                enforce_mode(ctx, &gm);
             }
 
             if ctx.decision == WafDecision::Limit {
@@ -3666,9 +3802,24 @@ async fn phase1_headers(
     // --- HTTP request smuggling / desync detection ---
     // Runs before any other Phase 1 checks — a smuggling attempt invalidates
     // the entire request. Reject with 400 Bad Request.
-    if ctx.decision == WafDecision::Allow {
+    if still_evaluating(ctx) {
+        // Counted, not logged: this runs on every request and its input is
+        // attacker-controlled, so a log line here would be both a throughput
+        // problem and a flood primitive. The counter answers the question the
+        // absence of a log could not — "did desync detection run at all?" — which
+        // is exactly what the phase-1 gate bug made unanswerable.
+        note_smuggling_evaluated();
         match detect_smuggling(&ctx.request_headers) {
             SmugglingVerdict::Reject { reason } => {
+                // Split so a wave of rejections can be attributed without
+                // reading log lines: framing is the real desync primitive, the
+                // header tripwire is the one that used to fire on ordinary
+                // non-ASCII header values.
+                if reason.contains("in header '") {
+                    note_smuggling_rejected_header();
+                } else {
+                    note_smuggling_rejected_framing();
+                }
                 ctx.decision = WafDecision::Block;
                 ctx.block_reason = Some(reason);
             }
@@ -3676,12 +3827,27 @@ async fn phase1_headers(
         }
     }
 
+    // Apply the site's mode to the smuggling verdict BEFORE the early return.
+    //
+    // Returning early is deliberate and kept — a desynced request should not be
+    // scored by anything downstream. But this return sat AHEAD of the only
+    // `enforce_mode` call in this function (at the end of phase 1), so a
+    // smuggling verdict was the one verdict learning mode could not downgrade: a
+    // site configured purely to observe answered 400 and set no `would_block`, so
+    // the rejection never even reached the learning report. Verified live.
+    //
+    // `enforce_mode` is idempotent for an already-downgraded decision, so the
+    // call at the end of phase 1 remains correct.
     if ctx.decision == WafDecision::Block {
-        return Ok(());
+        let gm = governing_mode(ctx, &site.waf.mode);
+        enforce_mode(ctx, &gm);
+        if ctx.decision == WafDecision::Block {
+            return Ok(());
+        }
     }
 
     // --- Rate limiting ---
-    if ctx.decision == WafDecision::Allow {
+    if still_evaluating(ctx) {
         if let Some(ref rl_cfg) = site.waf.rate_limit {
             if modules
                 .rate_limiter
@@ -3695,7 +3861,7 @@ async fn phase1_headers(
     }
 
     // --- Bot detection ---
-    if ctx.decision == WafDecision::Allow {
+    if still_evaluating(ctx) {
         if let Some(ref bot_cfg) = site.waf.bot_detection {
             let ua = ctx
                 .request_headers
@@ -3715,6 +3881,19 @@ async fn phase1_headers(
                 recent_block_score: modules.correlation.score_for_ip(ctx.client_ip),
             };
             let bs = bot_det.score(&sig);
+            // Counted here rather than inside the module, which has no telemetry
+            // dependency and should not gain one for a single counter.
+            //
+            // This puts a number on an unauthenticated trust decision: the
+            // good-bot branch returns score 0 / tier Allow for any User-Agent
+            // matching one of the 14 good-bot patterns, and reverse-DNS
+            // confirmation is still a TODO (`verified_good_bot` is hardcoded
+            // false). So anyone may claim to be Googlebot and skip bot scoring
+            // entirely. Until that verification exists, the least we can do is
+            // report how often it happens.
+            if bs.reasons.iter().any(|r| r.starts_with("good-bot-ua")) {
+                note_good_bot_allowed();
+            }
             ctx.tx_vars
                 .insert("bot_score".to_string(), bs.score.to_string());
             if bs.verified_good_bot {
@@ -3755,7 +3934,7 @@ async fn phase1_headers(
     }
 
     // --- GeoIP ---
-    if ctx.decision == WafDecision::Allow && site.waf.geoip.is_some() {
+    if still_evaluating(ctx) && site.waf.geoip.is_some() {
         let geoip_map = modules.geoip_map.load();
         if let Some(geoip) = geoip_map.get(&site.id) {
             // Resolve the country FIRST and record it whatever the verdict is.
@@ -3782,7 +3961,7 @@ async fn phase1_headers(
     // block renderer returns 401 (not the generic 403) without leaking the
     // reason to clients. A *present* token that fails validation is always
     // rejected; `required` only governs whether a *missing* token is allowed.
-    if ctx.decision == WafDecision::Allow {
+    if still_evaluating(ctx) {
         if let Some(ref jwt_cfg) = site.waf.jwt {
             if jwt_cfg.enable {
                 let bearer = ctx
@@ -3866,7 +4045,7 @@ async fn phase1_headers(
     // Path-level checks on gRPC traffic before the body is buffered: per-method
     // allow/deny and server-reflection blocking. Frame/size limits run later in
     // phase2 once the body is available.
-    if ctx.decision == WafDecision::Allow {
+    if still_evaluating(ctx) {
         if let Some(ref grpc_cfg) = site.waf.grpc {
             if grpc_cfg.enable {
                 let is_grpc_ct = ctx
@@ -3892,14 +4071,14 @@ async fn phase1_headers(
     }
 
     // --- Rule engine (CRS / SRL) ---
-    if ctx.decision == WafDecision::Allow {
+    if still_evaluating(ctx) {
         if let Some(engine) = engines.get(&site.id) {
             eval_rules(ctx, engine, Phase::RequestHeaders);
         }
     }
 
     // --- WASM plugins ---
-    if ctx.decision == WafDecision::Allow {
+    if still_evaluating(ctx) {
         for plugin_name in &plugin_runtime.plugin_names() {
             let result = plugin_runtime.evaluate_plugin(plugin_name, ctx).await;
             if result.anomaly_score_delta > 0 {
@@ -4266,6 +4445,32 @@ fn governing_mode(ctx: &RequestContext, site_mode: &WafMode) -> WafMode {
         .unwrap_or_else(|| site_mode.clone())
 }
 
+/// Is this request still being evaluated, or has a terminal block already been
+/// reached?
+///
+/// ⚠️ This is deliberately `!= Block` and NOT `== Allow`, and the difference was a
+/// protection bypass.
+///
+/// `enforce_request_limit` runs in `proxy_inner` BEFORE `phase1_headers`, and on
+/// a learning-mode site `enforce_mode` rewrites its `Block` to `WafDecision::Log`
+/// so the request is recorded rather than rejected — which is correct. But every
+/// phase-1 check was then gated on `ctx.decision == WafDecision::Allow`, and
+/// `Log != Allow`. So one over-long URI (default `max_uri_length` 8192), one
+/// excess header, one disallowed method or one over-large body silently switched
+/// OFF smuggling detection, bot scoring, GeoIP, rate limiting, edge JWT, the gRPC
+/// gate, the rule engine and the WASM plugins — for that request, at the client's
+/// choosing.
+///
+/// Verified live on a learning-mode site before the fix: a request whose only
+/// fault was a non-ASCII header value returned 400 (smuggling), and the SAME
+/// request with a 9000-byte URI returned 200 with no smuggling record at all.
+///
+/// `Challenge` and `Limit` are also non-terminal here: a challenged or throttled
+/// request has not been refused, so there is no reason to stop inspecting it.
+fn still_evaluating(ctx: &RequestContext) -> bool {
+    ctx.decision != WafDecision::Block
+}
+
 fn enforce_mode(ctx: &mut RequestContext, mode: &WafMode) {
     // `off` for a path means the operator has deliberately taken the WAF out of
     // the way there (static assets, a health endpoint). Any verdict the rules
@@ -4319,6 +4524,103 @@ fn enforce_mode(ctx: &mut RequestContext, mode: &WafMode) {
 /// of waiting for the poll (the poll remains as a backstop), and this flag lets
 /// the request path refuse rather than serve a site it cannot yet inspect.
 static ENGINES_WARMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+// --- Threat-intel poller state, for /healthz -------------------------------
+//
+// The poller is spawned only when `cluster.sync_url` is set, and there was no
+// `else`: without it the node served every request against the
+// `ThreatFeed::empty()` installed at construction. `check()` short-circuits on
+// an empty feed, `/healthz` had no `threat_intel` key at all, and the heartbeat
+// carried nothing — so every malicious IP, CIDR, Tor exit, C2 and scanner UA in
+// the control-plane corpus was ignored, with NO observable symptom. Unlike
+// config sync or the heartbeat, this failure looks exactly like a world with no
+// attackers.
+static TI_POLLER_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// HTTP status of the most recent sync attempt; 0 = no attempt has completed.
+/// A 403 here means the shared secret does not match and this node's IOC set is
+/// frozen — which previously produced no log line at all, because the status was
+/// never inspected before the body was parsed.
+static TI_LAST_STATUS: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+/// What the poller should do with a completed fetch, extracted so it can be
+/// tested without a control plane.
+///
+/// The old code had one `info!("threat-intel hot-synced")` for every outcome, so
+/// installing 0 indicators over 200,000 logged identically to a healthy sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TiSyncOutcome {
+    /// Non-2xx: nothing is installed and the existing feed is frozen.
+    Rejected {
+        status: u16,
+    },
+    /// An empty corpus replaced a populated feed — enforcement just went off.
+    EmptyRegression {
+        previous: usize,
+    },
+    /// Empty, and nothing was there before. Not a regression, not a success.
+    EmptyFirst,
+    Synced {
+        count: usize,
+    },
+}
+
+fn ti_sync_outcome(previous: usize, new_count: usize, status: u16) -> TiSyncOutcome {
+    if !(200..300).contains(&status) {
+        return TiSyncOutcome::Rejected { status };
+    }
+    if new_count == 0 {
+        return if previous > 0 {
+            TiSyncOutcome::EmptyRegression { previous }
+        } else {
+            TiSyncOutcome::EmptyFirst
+        };
+    }
+    TiSyncOutcome::Synced { count: new_count }
+}
+
+/// Is global IOC enforcement actually on, and if not, why not?
+///
+/// `active` is the field that matters: `configured` merely means a sync URL
+/// exists. Mirrors `geoip_status`'s shape, and reaches the console for free
+/// because `/waf/status` proxies `/healthz` verbatim.
+fn threat_intel_status(cfg: &SentinelConfig, feed: &ThreatFeed) -> serde_json::Value {
+    use std::sync::atomic::Ordering;
+    let configured = cfg.cluster.sync_url.is_some();
+    let started = TI_POLLER_STARTED.load(Ordering::Relaxed);
+    let last_status = TI_LAST_STATUS.load(Ordering::Relaxed);
+    let entries = feed.entry_count();
+    let poller = if !configured {
+        "not_configured"
+    } else if !started {
+        "not_started"
+    } else if last_status == 0 {
+        "starting"
+    } else if (200..300).contains(&last_status) {
+        "running"
+    } else {
+        "rejected"
+    };
+    serde_json::json!({
+        "configured": configured,
+        "poller": poller,
+        "last_sync_status": last_status,
+        "version": feed.version(),
+        "entries": entries,
+        // The single honest summary: are IOCs being enforced on this node?
+        "active": entries > 0,
+        "inert_reason": if entries > 0 {
+            serde_json::Value::Null
+        } else if !configured {
+            serde_json::json!("no cluster.sync_url — this node never fetches the IOC corpus")
+        } else if poller == "rejected" {
+            serde_json::json!(format!(
+                "control plane refused the sync with HTTP {last_status} (403 = SENTINEL_INTERNAL_SECRET mismatch)"
+            ))
+        } else {
+            serde_json::json!("the control-plane corpus returned no active indicators")
+        },
+    })
+}
 
 /// Whether `site` is one that SHOULD have a compiled engine.
 ///
@@ -6283,6 +6585,57 @@ fn health_response(state: &ServerState) -> Response<BoxBody> {
         // the field that matters — non-empty means a site's country policy is
         // displayed and not applied, because no MaxMind database is present.
         "geoip": geoip_status(&state.config.load(), &state.modules.geoip_map.load()),
+        // Global IOC enforcement: is it on, and if not, why not? `active` is the
+        // honest summary; `configured` only means a sync URL exists. There was no
+        // `threat_intel` key here at all, which is how a node serving every
+        // request against an empty feed looked identical to a healthy one.
+        "threat_intel": threat_intel_status(
+            &state.config.load(),
+            &state.modules.threat_intel.load(),
+        ),
+        // Module reachability. Seven subsystems had no logging at all, and their
+        // entry points are per-request pure functions on attacker-controlled
+        // input, so they cannot be given log lines. These counters answer the one
+        // question their silence made unanswerable: did the control RUN?
+        //
+        // Read them as zeroes and ratios, not totals:
+        //   smuggling.evaluated == 0 with traffic  -> desync detection never ran
+        //   graphql.inspected == 0 while configured -> the endpoint gate does not
+        //     match this app's path (case-sensitive `contains("graphql")`, POST
+        //     only), so the firewall is configured and inspecting nothing
+        //   grpc.inspected == 0 while configured   -> same, for Content-Type
+        //   ja4.success / ja4.attempts             -> fingerprint coverage; a
+        //     shortfall silently disables every JA4-dependent control
+        //   bot.good_bot_allowed                   -> requests trusted purely on
+        //     a User-Agent claim; reverse-DNS verification is still a TODO
+        "modules": {
+            "smuggling": {
+                "evaluated": smuggling_evaluated_total(),
+                "rejected_framing": smuggling_rejected_framing_total(),
+                "rejected_header": smuggling_rejected_header_total(),
+            },
+            "graphql": {
+                "inspected": graphql_inspected_total(),
+                "blocked": graphql_blocked_total(),
+            },
+            "grpc": { "inspected": grpc_inspected_total() },
+            "ja4": {
+                "attempts": ja4_attempts_total(),
+                "success": ja4_success_total(),
+            },
+            "bot": {
+                "good_bot_allowed_unverified": bot_good_bot_allowed_total(),
+                // Sizes, because they are smaller than the feature name suggests
+                // and nothing reported them. The JA4 table is a static built-in
+                // whose own comment calls it "for demonstration", and the proxy
+                // re-creates the detector with `new()` on every config reload —
+                // so any fingerprint added at runtime is discarded. A JA4
+                // blocklist that is quietly this small should be readable.
+                "ja4_fingerprints": state.modules.bot_detector.load().ja4_fingerprint_count(),
+                "attacker_ua_patterns": state.modules.bot_detector.load().attacker_pattern_count(),
+                "good_bot_ua_patterns": state.modules.bot_detector.load().good_bot_pattern_count(),
+            },
+        },
         "upstreams_healthy": pool_stats.healthy,
         "upstreams_total": pool_stats.total,
         "version": env!("CARGO_PKG_VERSION"),
@@ -9879,6 +10232,83 @@ mod engine_warming_tests {
         assert!(
             !ENGINES_WARMING.load(std::sync::atomic::Ordering::Acquire),
             "a freshly started proxy has already built its engines and must serve"
+        );
+    }
+}
+
+#[cfg(test)]
+mod threat_intel_visibility_tests {
+    use super::*;
+
+    /// The four outcomes the old single `info!("hot-synced")` collapsed into one.
+    ///
+    /// Extracted as a pure function precisely so this is testable: the log text
+    /// itself is not assertable here (the subscriber is process-wide), and the
+    /// decision is the part that was wrong — installing 0 indicators over 200,000
+    /// logged exactly like a healthy sync.
+    #[test]
+    fn an_empty_feed_replacing_a_populated_one_is_not_a_success() {
+        assert_eq!(
+            ti_sync_outcome(200_000, 0, 200),
+            TiSyncOutcome::EmptyRegression { previous: 200_000 },
+            "enforcement just went off; this must never read as 'hot-synced'"
+        );
+        assert_eq!(
+            ti_sync_outcome(0, 0, 200),
+            TiSyncOutcome::EmptyFirst,
+            "a first sync that is empty is not a regression — warning here would cry wolf \
+             on every fresh deployment"
+        );
+        assert_eq!(
+            ti_sync_outcome(10, 50_000, 200),
+            TiSyncOutcome::Synced { count: 50_000 }
+        );
+    }
+
+    /// A refusal must never be treated as data. The status was not inspected at
+    /// all, so a 403 body went into `serde_json::from_slice` and the only trace
+    /// was a parse error naming JSON rather than the refusal.
+    #[test]
+    fn a_non_2xx_status_is_a_refusal_whatever_the_body_said() {
+        for status in [301u16, 400, 401, 403, 500, 503] {
+            assert_eq!(
+                ti_sync_outcome(1_000, 5_000, status),
+                TiSyncOutcome::Rejected { status },
+                "HTTP {status} must be reported as a refusal, not installed"
+            );
+        }
+    }
+
+    /// `/healthz` must say IOC enforcement is off, and why, for each way it can
+    /// be off. Before this there was no `threat_intel` key at all, so a node
+    /// enforcing nothing looked exactly like a healthy one.
+    #[test]
+    fn healthz_reports_why_ioc_enforcement_is_inactive() {
+        let mut cfg = SentinelConfig::default();
+        let feed = ThreatFeed::empty();
+
+        // 1. No sync URL — the shape that has no observable symptom.
+        cfg.cluster.sync_url = None;
+        let s = threat_intel_status(&cfg, &feed);
+        assert_eq!(s["configured"], false);
+        assert_eq!(s["active"], false);
+        assert_eq!(s["poller"], "not_configured");
+        assert!(
+            s["inert_reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("cluster.sync_url")),
+            "the reason must name the config key that fixes it, got {:?}",
+            s["inert_reason"]
+        );
+
+        // 2. Configured, but the poller has not been spawned.
+        cfg.cluster.sync_url = Some("http://controlplane:9501".into());
+        let s = threat_intel_status(&cfg, &feed);
+        assert_eq!(s["configured"], true);
+        assert_eq!(s["active"], false);
+        assert_eq!(
+            s["poller"], "not_started",
+            "configured-but-not-running must be distinguishable from not-configured"
         );
     }
 }

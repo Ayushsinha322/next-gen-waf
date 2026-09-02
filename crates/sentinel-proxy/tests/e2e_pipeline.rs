@@ -33,10 +33,30 @@ fn install_crypto() {
 use tokio::sync::watch;
 
 // Each test needs a unique listen port to avoid bind conflicts.
-static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(42080);
+static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
 
+/// Hand out a listen port that is unlikely to be taken by anything else.
+///
+/// ⚠️ This was a fixed counter from 42080, and that is inside Linux's default
+/// ephemeral port range (32768–60999). So the kernel was free to hand one of our
+/// ports to any unrelated outbound connection on the machine — a `cargo` fetch, a
+/// sibling CI job, an `apk add` — for the moment we wanted to bind it. The proxy
+/// then failed to bind with EADDRINUSE and the harness reported "proxy never
+/// accepted a connection", which reads as a slow or broken proxy and sent me
+/// looking at CPU contention. Pipeline 30209 failed exactly this way on port
+/// 42084, and the test it blamed was unrelated to the change under test.
+///
+/// Two things fix it: a base BELOW the ephemeral range, and a per-process offset
+/// so two test binaries on one runner do not share a block.
 fn next_port() -> u16 {
-    NEXT_PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    static BASE: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    let base = *BASE.get_or_init(|| {
+        // 20000..30000 in 100-port blocks: below the ephemeral range, above the
+        // well-known/registered ports this project uses (80, 443, 3000, 8080,
+        // 9443, 9501). ~40 ports are needed per process.
+        20_000 + (std::process::id() as u16 % 100) * 100
+    });
+    base + NEXT_PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
 }
 
 fn config_handle(cfg: SentinelConfig) -> ConfigHandle {
@@ -200,6 +220,24 @@ async fn start_mock_upstream() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     (addr, handle)
 }
 
+/// Caps how many proxies may be STARTING at once.
+///
+/// Not a style choice — it fixes a thundering herd that turned this suite red on
+/// findings that did not exist. Every test here spawns its own proxy, and each
+/// startup compiles a CRS rule file, which is the expensive part. `cargo test`
+/// runs the tests concurrently, so all ~34 startups landed simultaneously and
+/// competed for the same cores; on a CI runner one listener lost the race badly
+/// enough to miss even a 30 s bind budget, and the test that reported the failure
+/// was an unrelated one that happened to be scheduled last (pipeline 30209,
+/// `e2e_rce_attack_is_blocked`).
+///
+/// Raising the timeout again would only move the threshold. Limiting concurrent
+/// STARTUPS removes the contention itself: tests still run in parallel, they just
+/// take turns paying the CRS-compile cost. The permit is held until the listener
+/// is actually accepting, so a queued test waits for a real slot rather than
+/// piling on.
+static PROXY_START_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
 async fn start_proxy(
     cfg: SentinelConfig,
 ) -> (
@@ -212,10 +250,18 @@ async fn start_proxy(
     let handle = config_handle(cfg);
     let proxy = ProxyServer::new(handle);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let jh = tokio::spawn(async move { proxy.run(shutdown_rx).await });
+    // Held across spawn AND the bind wait: the point is to bound how many CRS
+    // compiles are in flight, and that work happens inside `run` before the
+    // listener binds.
+    let permit = PROXY_START_SLOTS
+        .acquire()
+        .await
+        .expect("PROXY_START_SLOTS is never closed");
+    let mut jh = tokio::spawn(async move { proxy.run(shutdown_rx).await });
     for bind in &binds {
-        wait_until_accepting(bind).await;
+        jh = wait_until_accepting(bind, jh).await;
     }
+    drop(permit);
     (shutdown_tx, jh)
 }
 
@@ -235,16 +281,53 @@ async fn start_proxy(
 ///
 /// Probing by connecting rather than by trying to bind the address ourselves:
 /// binding would race the proxy for the port and could make it fail to start.
-async fn wait_until_accepting(bind: &str) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+/// Wait for a freshly started proxy to bind.
+///
+/// The budget is generous on purpose. Every test in this binary spawns its own
+/// proxy AND mock upstream, `cargo test` runs them concurrently, and each proxy
+/// compiles a CRS rule file at startup — so the wall-clock cost of binding scales
+/// with how many tests exist, not with how much work any one of them does. At 34
+/// tests a 10s budget produced intermittent "never accepted a connection"
+/// failures on two unrelated tests under load, which is a red CI run reporting a
+/// bug that is not there.
+///
+/// Raising it costs nothing on the happy path: this is a poll loop that returns
+/// the instant the port accepts, so a healthy proxy still proceeds in
+/// milliseconds. Only a genuinely stuck proxy pays the full budget.
+const PROXY_BIND_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Takes the proxy's join handle and gives it back, so a proxy that DIED can be
+/// reported with its own error instead of as a timeout.
+///
+/// Without this, a bind failure (EADDRINUSE, a permissions problem, a bad config)
+/// looked identical to a slow start: the loop simply span until the budget
+/// expired and blamed the proxy for being slow. That cost a whole diagnosis cycle
+/// on pipeline 30209 — the message said "never accepted a connection" and the
+/// actual cause was a port collision that `run` had already returned as an error
+/// nobody read.
+async fn wait_until_accepting(
+    bind: &str,
+    jh: tokio::task::JoinHandle<anyhow::Result<()>>,
+) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+    let deadline = std::time::Instant::now() + PROXY_BIND_BUDGET;
     let mut delay = std::time::Duration::from_millis(2);
     loop {
         if tokio::net::TcpStream::connect(bind).await.is_ok() {
-            return;
+            return jh;
+        }
+        // The proxy exited rather than bound: surface ITS error, which names the
+        // real problem.
+        if jh.is_finished() {
+            match jh.await {
+                Ok(Ok(())) => panic!("proxy on {bind} exited cleanly before accepting"),
+                Ok(Err(e)) => panic!("proxy on {bind} failed to start: {e:#}"),
+                Err(e) => panic!("proxy task on {bind} panicked: {e}"),
+            }
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "proxy never accepted a connection on {bind} within 10s"
+            "proxy never accepted a connection on {bind} within {PROXY_BIND_BUDGET:?} \
+             (task still running, so this is genuinely slow rather than failed)"
         );
         tokio::time::sleep(delay).await;
         delay = (delay * 2).min(std::time::Duration::from_millis(50));
@@ -1564,4 +1647,212 @@ async fn an_unmatched_host_yields_502_rather_than_silence() {
         "an unmatched Host must get a real response the client can act on"
     );
     shutdown_proxy(tx, jh).await;
+}
+
+// ---------------------------------------------------------------------------
+// A client must not be able to opt itself out of Phase-1 protection
+// ---------------------------------------------------------------------------
+
+/// `enforce_request_limit` runs BEFORE `phase1_headers`, and on a learning-mode
+/// site it downgrades its own `Block` to `WafDecision::Log` so the request is
+/// recorded rather than rejected. Every phase-1 and body check was then gated on
+/// `ctx.decision == WafDecision::Allow` — and `Log != Allow`. So one over-long
+/// URI switched OFF smuggling detection, bot scoring, GeoIP, rate limiting, edge
+/// JWT, the gRPC gate, the rule engine, the WASM plugins and the GraphQL firewall
+/// for that request, at the client's choosing.
+///
+/// Proven live on .71 before the fix: a request whose only fault was a non-ASCII
+/// header value returned 400, and the SAME request with a 9000-byte URI returned
+/// 200 with no smuggling record at all.
+///
+/// This asserts through `graphql.inspected` on `/healthz` rather than through the
+/// response status, because in learning mode the status is 200 either way — the
+/// bypass is invisible from outside. `graphql.inspected` is the right witness
+/// because it is a process-global counter that NO other test in this binary
+/// touches, so the delta is attributable to this request alone; asserting on
+/// `smuggling.evaluated` would pass even with the fix reverted, since every other
+/// concurrent test increments it.
+#[tokio::test]
+async fn an_over_long_uri_does_not_exempt_a_request_from_inspection() {
+    let (up_addr, _up) = start_mock_upstream().await;
+    let port = next_port();
+    let mut cfg = test_config(
+        port,
+        up_addr.port(),
+        "REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
+        // Learning is the mode that exposes the bug, and the mode every site
+        // created through the API is stored in.
+        WafMode::Learning,
+    );
+    cfg.sites[0].waf.graphql = Some(sentinel_core::config::GraphqlConfig {
+        enable: true,
+        max_depth: 3,
+        max_complexity: 1000,
+        block_introspection: true,
+    });
+    // Set explicitly: `WafConfig::default()` leaves this 0 (disabled), while the
+    // serde default a real deployment gets is 8192. The bug needs an ACTIVE limit.
+    cfg.sites[0].waf.max_uri_length = 8192;
+    let limit = cfg.sites[0].waf.max_uri_length;
+
+    let (tx, jh) = start_proxy(cfg).await;
+
+    let read_inspected = |body: &[u8]| -> u64 {
+        let v: serde_json::Value = serde_json::from_slice(body).expect("healthz json");
+        v["modules"]["graphql"]["inspected"]
+            .as_u64()
+            .expect("modules.graphql.inspected must be published")
+    };
+
+    let (_, before) = send_request(port, "test-site.local", "/healthz", Method::GET, "").await;
+    let before = read_inspected(&before);
+
+    // A GraphQL POST whose URI is padded past max_uri_length. The body is a
+    // perfectly ordinary query — this test is about whether the firewall RAN,
+    // not about whether it found anything.
+    let pad = "a".repeat((limit as usize) + 512);
+    let (status, _) = send_request(
+        port,
+        "test-site.local",
+        &format!("/graphql?pad={pad}"),
+        Method::POST,
+        r#"{"query":"{ me { name } }"}"#,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "learning mode must still forward the request; it records, it does not reject"
+    );
+
+    let (_, after) = send_request(port, "test-site.local", "/healthz", Method::GET, "").await;
+    let after = read_inspected(&after);
+
+    shutdown_proxy(tx, jh).await;
+
+    assert!(
+        after > before,
+        "the GraphQL firewall did not inspect a request whose URI exceeded \
+         max_uri_length ({before} -> {after}). The request was downgraded to Log by \
+         learning mode, and a check gated on `== Allow` therefore skipped it — which \
+         is a client-selectable protection bypass, not a limit."
+    );
+}
+
+/// The GraphQL and gRPC-body checks are the only two verdicts reached AFTER
+/// `phase2_body` has already applied `enforce_mode`, so they were the two a
+/// site's mode could not govern: on a learning site they hard-blocked while
+/// setting no `would_block`, so the learning report held no evidence for the
+/// block it had just served — and a per-path `mode: off` could not disable them.
+///
+/// A soak an operator was told was non-disruptive would therefore return 403 to
+/// real GraphQL clients whose queries were merely deep.
+#[tokio::test]
+async fn a_learning_site_records_a_graphql_violation_instead_of_blocking_it() {
+    let (up_addr, _up) = start_mock_upstream().await;
+    let port = next_port();
+    let mut cfg = test_config(
+        port,
+        up_addr.port(),
+        "REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
+        WafMode::Learning,
+    );
+    cfg.sites[0].waf.graphql = Some(sentinel_core::config::GraphqlConfig {
+        enable: true,
+        max_depth: 2,
+        max_complexity: 1000,
+        block_introspection: true,
+    });
+    let (tx, jh) = start_proxy(cfg).await;
+
+    // Depth 5, comfortably past max_depth 2.
+    let (status, body) = send_request(
+        port,
+        "test-site.local",
+        "/graphql",
+        Method::POST,
+        r#"{"query":"{ a { b { c { d { e } } } } }"}"#,
+    )
+    .await;
+
+    // Confirm the firewall really did fire, so a 200 cannot be mistaken for the
+    // rule simply not matching.
+    let (_, health) = send_request(port, "test-site.local", "/healthz", Method::GET, "").await;
+    let v: serde_json::Value = serde_json::from_slice(&health).expect("healthz json");
+    let blocked = v["modules"]["graphql"]["blocked"].as_u64().unwrap_or(0);
+
+    shutdown_proxy(tx, jh).await;
+
+    assert!(
+        blocked > 0,
+        "the GraphQL firewall did not flag a depth-5 query against max_depth 2, so \
+         this test proves nothing about mode handling"
+    );
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a learning-mode site must RECORD a GraphQL violation and forward the request, \
+         not reject it. Blocking here means the verdict bypassed enforce_mode."
+    );
+    assert!(
+        body.starts_with(b"upstream-ok:"),
+        "the request must actually reach the origin in learning mode"
+    );
+}
+
+/// Records what actually happens when a listener cannot bind: the PROCESS STAYS
+/// UP and only an `error!` marks it.
+///
+/// `serve_listener`'s failure is handled inside its own spawned task
+/// (`lib.rs:1960` — `if let Err(e) = serve_listener(..).await { error!(..) }`),
+/// so `ProxyServer::run` neither returns nor stops. A WAF whose `:443` listener
+/// lost its port therefore keeps running, keeps answering `/healthz` with 200,
+/// and serves nothing on that endpoint — while an LB health check against `:80`
+/// passes. That is the configured-but-inert shape at the listener level, and it
+/// is only visible at all because RUST_LOG no longer filters this crate out.
+///
+/// Written as a behaviour record rather than a fix: making a failed listener
+/// fatal, or surfacing it in `/healthz`, is a product decision, not a test
+/// change. This test exists so the next person meets the fact deliberately
+/// instead of spending a cycle on it — as happened with pipeline 30209, where a
+/// port collision presented as "the proxy is slow".
+///
+/// Uses an unparseable bind address rather than a privileged port, because CI
+/// containers frequently run as root and would happily bind port 1.
+#[tokio::test]
+async fn a_listener_that_cannot_bind_does_not_stop_the_proxy() {
+    let (up_addr, _up) = start_mock_upstream().await;
+    let port = next_port();
+    let mut cfg = test_config(
+        port,
+        up_addr.port(),
+        "REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
+        WafMode::Blocking,
+    );
+    cfg.listeners[0].bind = "999.999.999.999:8080".into();
+
+    // Deliberately NOT via `start_proxy`: that would wait out the whole bind
+    // budget, adding 30s to every run of this binary to record one fact.
+    install_crypto();
+    let handle = config_handle(cfg);
+    let proxy = ProxyServer::new(handle);
+    let (tx, rx) = watch::channel(false);
+    let jh = tokio::spawn(async move { proxy.run(rx).await });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    assert!(
+        !jh.is_finished(),
+        "a listener that cannot bind is expected NOT to stop the proxy — if this now \
+         fails, someone has made a listener failure fatal, which is a real improvement: \
+         update this test and note it, do not revert it"
+    );
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err(),
+        "nothing should be listening on {port} — the listener failed to bind"
+    );
+
+    let _ = tx.send(true);
+    let _ = jh.await;
 }

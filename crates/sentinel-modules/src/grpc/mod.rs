@@ -171,7 +171,19 @@ pub fn check_body(body: &[u8], limits: &GrpcLimits) -> Option<String> {
         ]) as usize;
 
         // Oversized message: block even if the body is truncated (DoS signal).
-        if len > limits.max_message_bytes {
+        //
+        // ⚠️ `0 = unlimited`, matching the three sibling limits in the SAME config
+        // struct — `max_body_size`, `max_uri_length` and `max_header_count` all
+        // document "0 = unlimited" and are all guarded with `> 0` in the proxy.
+        // These two were the sole inversion: with a strict `>` and no guard,
+        // `max_message_bytes: 0` blocked EVERY gRPC message (a 5-byte frame
+        // reported "message size 5 exceeds max 0") and `max_frames: 0` blocked
+        // every body at the first frame. An operator setting 0 to mean unlimited,
+        // as the neighbouring keys do, took their entire gRPC API offline.
+        //
+        // The serde defaults do not save it: they apply only to an ABSENT key, so
+        // an explicit 0 from YAML or the API survives untouched.
+        if limits.max_message_bytes > 0 && len > limits.max_message_bytes {
             return Some(format!(
                 "message size {} exceeds max {}",
                 len, limits.max_message_bytes
@@ -180,7 +192,7 @@ pub fn check_body(body: &[u8], limits: &GrpcLimits) -> Option<String> {
 
         // Count the frame; an excess frame count is a DoS signal.
         frame_count += 1;
-        if frame_count > limits.max_frames {
+        if limits.max_frames > 0 && frame_count > limits.max_frames {
             return Some(format!("frame count exceeds max {}", limits.max_frames));
         }
 
@@ -521,6 +533,68 @@ mod tests {
         assert_eq!(
             check_body(&body, &l).as_deref(),
             Some("frame count exceeds max 3")
+        );
+    }
+
+    /// `0` must mean unlimited, as it does for every sibling limit in the same
+    /// config struct — not "block everything gRPC".
+    ///
+    /// Measured before the fix: an entirely ordinary 5-byte frame returned
+    /// `Some("message size 5 exceeds max 0")` with `max_message_bytes: 0`, and
+    /// `Some("frame count exceeds max 0")` with `max_frames: 0`. Since
+    /// `max_body_size`, `max_uri_length` and `max_header_count` all document
+    /// "0 = unlimited", an operator following that convention took their whole
+    /// gRPC API offline. Serde defaults do not help: they apply only to an absent
+    /// key, so an explicit 0 from YAML or the API survives.
+    #[test]
+    fn a_zero_limit_means_unlimited_not_block_everything() {
+        // flag byte + 4-byte big-endian length + payload
+        let mut body = vec![0u8];
+        body.extend_from_slice(&5u32.to_be_bytes());
+        body.extend_from_slice(b"hello");
+
+        let base = GrpcLimits {
+            max_message_bytes: 4 * 1024 * 1024,
+            max_frames: 512,
+            block_reflection: true,
+            allowed_methods: vec![],
+            blocked_methods: vec![],
+        };
+        assert_eq!(
+            check_body(&body, &base),
+            None,
+            "control: a sane config allows this frame"
+        );
+
+        let zero_msg = GrpcLimits {
+            max_message_bytes: 0,
+            ..base.clone()
+        };
+        assert_eq!(
+            check_body(&body, &zero_msg),
+            None,
+            "max_message_bytes: 0 must mean unlimited; blocking here takes every gRPC \
+             call offline for an operator following the convention of the sibling keys"
+        );
+
+        let zero_frames = GrpcLimits {
+            max_frames: 0,
+            ..base.clone()
+        };
+        assert_eq!(
+            check_body(&body, &zero_frames),
+            None,
+            "max_frames: 0 must mean unlimited"
+        );
+
+        // And a real limit still bites, so this did not simply disable the checks.
+        let tight = GrpcLimits {
+            max_message_bytes: 4,
+            ..base.clone()
+        };
+        assert!(
+            check_body(&body, &tight).is_some_and(|r| r.contains("exceeds max 4")),
+            "a configured non-zero cap must still be enforced"
         );
     }
 }
