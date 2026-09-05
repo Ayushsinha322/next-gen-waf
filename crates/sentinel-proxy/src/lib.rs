@@ -7272,6 +7272,10 @@ fn record_event(ctx: &RequestContext) {
         // two renderings of one verdict would eventually disagree.
         request_id: ctx.request_id.to_string(),
         target: top.map(|r| r.target.clone()).unwrap_or_default(),
+        // The fingerprint that fed bot scoring and the JA4 blocklist for THIS
+        // request. It was never recorded, so "why was this client scored as
+        // sqlmap" was unanswerable from the row.
+        ja4: ctx.tls_fingerprint.clone().unwrap_or_default(),
         mode: match ctx.enforcement_mode {
             Some(WafMode::Blocking) => "blocking",
             Some(WafMode::Learning) => "learning",
@@ -8077,6 +8081,10 @@ fn ndjson_log(ctx: &RequestContext) {
         "site":     site,
         "tenant":   tenant,
         "protocol": protocol_label(ctx.http_version),
+        // JA4 TLS fingerprint (t… TCP, q… QUIC), "-" for plaintext or none. Not
+        // PII — a hash of TLS parameters — so no redaction. Drives bot scoring
+        // and the JA4 blocklist; was never on the record.
+        "ja4":      ctx.tls_fingerprint.as_deref().unwrap_or("-"),
         "ua":       ua,
         "referer":  referer,
         "action":   action,
@@ -8163,6 +8171,7 @@ fn ndjson_log(ctx: &RequestContext) {
             "site":   site,
             "tenant": tenant,
             "protocol": protocol_label(ctx.http_version),
+            "ja4":    ctx.tls_fingerprint.as_deref().unwrap_or("-"),
             "status": status,
             "latency_ms": format!("{:.2}", ctx.elapsed_ms()),
             "ua":     ua,
@@ -8604,6 +8613,45 @@ mod history_shed_tests {
         ctx
     }
 
+    /// The fingerprint that drove a bot verdict must land on the stored row.
+    ///
+    /// `ctx.tls_fingerprint` fed bot scoring and the JA4 blocklist for months
+    /// while never being recorded, so a JA4-caused block could not be explained
+    /// from ClickHouse, the SIEM, or the log. This is the guard for the one site
+    /// that builds the row from a live request context.
+    #[test]
+    fn the_stored_event_carries_the_request_ja4() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        HISTORY_SINK_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = drain_events();
+
+        let mut ctx = blocking_ctx();
+        ctx.tls_fingerprint = Some("q13d0310h3_55b375c5d22e_ba51bb2a78a2".to_string());
+        record_event(&ctx);
+
+        let rows = drain_events();
+        let row = rows
+            .iter()
+            .find(|r| r.site == "shedtest")
+            .expect("the forced block must have produced a row");
+        assert_eq!(
+            row.ja4, "q13d0310h3_55b375c5d22e_ba51bb2a78a2",
+            "the row must carry the exact fingerprint from the request context"
+        );
+
+        // And a plaintext request stores an empty string, not a placeholder that
+        // a downstream filter could mistake for a real fingerprint.
+        let plain = blocking_ctx();
+        record_event(&plain);
+        let rows = drain_events();
+        assert!(
+            rows.iter()
+                .any(|r| r.site == "shedtest" && r.ja4.is_empty()),
+            "no fingerprint must be stored as empty"
+        );
+        HISTORY_SINK_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
     #[test]
     fn events_are_buffered_until_the_cap_then_counted_as_shed() {
         let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -8640,6 +8688,7 @@ mod history_shed_tests {
                 mode: String::new(),
                 threshold: 0,
                 explanation: String::new(),
+                ja4: String::new(),
             };
             buf.resize_with(EVENT_BUFFER_CAP - 1, filler);
         }

@@ -266,11 +266,14 @@ fn cef_line(r: &WafEventRow) -> String {
     // Custom slots, labelled so a parser can name them. `mode` is here because
     // a DETECT in learning mode and a DETECT that failed open look identical
     // without it.
-    let cs: [(&str, &str, &str); 4] = [
+    let cs: [(&str, &str, &str); 5] = [
         ("cs1", "mode", &r.mode),
         ("cs2", "query", &r.query),
         ("cs3", "matched", &r.matched),
         ("cs4", "target", &r.target),
+        // The TLS fingerprint behind a JA4-driven bot verdict. cs5 of CEF's six
+        // custom-string slots; cs6 stays free.
+        ("cs5", "ja4", &r.ja4),
     ];
     for (slot, label, val) in cs {
         if !val.is_empty() {
@@ -309,6 +312,7 @@ fn json_line(r: &WafEventRow) -> String {
         "protocol": r.protocol,
         "request_id": r.request_id,
         "explanation": r.explanation,
+        "ja4": r.ja4,
     })
     .to_string()
 }
@@ -504,6 +508,7 @@ mod tests {
             mode: "learning".into(),
             threshold: 10,
             explanation: "would have blocked".into(),
+            ja4: "t13d1516h2_8daaf6152771_02713d6af862".into(),
         }
     }
 
@@ -518,6 +523,35 @@ mod tests {
         let js = json_line(&row());
         assert!(js.contains("\"action\":\"DETECT\""));
         assert!(js.contains("\"mode\":\"learning\""));
+    }
+
+    /// The fingerprint behind a JA4-driven bot verdict must reach the SIEM in
+    /// BOTH formats — it is the field that lets a SOC answer "why was this client
+    /// scored as sqlmap" without access to the WAF's own logs.
+    #[test]
+    fn both_formats_carry_the_ja4_fingerprint() {
+        let r = row();
+        let cef = cef_line(&r);
+        assert!(
+            cef.contains("cs5Label=ja4"),
+            "CEF must label the slot: {cef}"
+        );
+        assert!(
+            cef.contains("cs5=t13d1516h2_8daaf6152771_02713d6af862"),
+            "CEF must carry the value: {cef}"
+        );
+        let json = json_line(&r);
+        assert!(
+            json.contains(r#""ja4":"t13d1516h2_8daaf6152771_02713d6af862""#),
+            "JSON feed must carry ja4 under a stable key: {json}"
+        );
+        // And an absent fingerprint must not invent a slot.
+        let mut bare = row();
+        bare.ja4 = String::new();
+        assert!(
+            !cef_line(&bare).contains("cs5"),
+            "no fingerprint, no cs5 slot"
+        );
     }
 
     #[test]

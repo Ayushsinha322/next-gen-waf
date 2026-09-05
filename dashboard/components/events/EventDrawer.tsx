@@ -146,6 +146,10 @@ export default function EventDrawer({
           <Row label="Request" mono>{event.method} {event.path}{event.query ? `?${event.query}` : ""}</Row>
           {event.referer && <Row label="Referer" mono>{event.referer}</Row>}
           <Row label="Protocol" mono>{event.protocol || "—"}</Row>
+          {/* The TLS fingerprint behind a bot verdict. Shown only when present:
+              plaintext requests and rows older than the column have none, and a
+              placeholder here would read as "the WAF failed to fingerprint". */}
+          {event.ja4 && <Row label="JA4" mono>{event.ja4}</Row>}
           <Row label="Response" mono>{event.status || "—"}</Row>
           <Row label="Matched rule" mono>{event.rule || "—"}</Row>
           <Row label="Anomaly score" mono>{event.score}</Row>
