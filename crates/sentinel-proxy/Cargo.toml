@@ -14,6 +14,7 @@ kernel = ["sentinel-ebpf/kernel"]
 # listener can tell "this one connection died" from "we are out of file
 # descriptors" from "the listening socket is broken". See classify_accept_error.
 libc = { workspace = true }
+async-trait = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true, features = ["rt"] }
 tracing = { workspace = true }

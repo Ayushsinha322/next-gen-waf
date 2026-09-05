@@ -40,6 +40,50 @@ static GOOD_BOT_PATTERNS: &[(&str, &str)] = &[
     (r"(?i)\bcoccocbot\b", "CocCocBot"),
 ];
 
+/// Reverse-DNS domains each good bot's operator PUBLISHES for verification,
+/// keyed by the display name in `GOOD_BOT_PATTERNS`. A PTR record for the client
+/// IP must end in one of these AND forward-resolve back to that IP (the check the
+/// operators themselves document, e.g. Google's "Verifying Googlebot").
+///
+/// Crawlers ABSENT from this table cannot be verified by PTR — their operators
+/// publish IP lists or nothing at all. They therefore never earn the allowlist:
+/// unverifiable means "scored like any other client", which is the fail-closed
+/// direction. Add an entry only with the operator's own documentation in hand.
+static GOOD_BOT_VERIFY_DOMAINS: &[(&str, &[&str])] = &[
+    ("Googlebot", &["googlebot.com", "google.com"]),
+    ("Bingbot", &["search.msn.com"]),
+    ("Yahoo Slurp", &["crawl.yahoo.net"]),
+    ("Baiduspider", &["baidu.com", "baidu.jp"]),
+    ("YandexBot", &["yandex.ru", "yandex.net", "yandex.com"]),
+    ("Applebot", &["applebot.apple.com"]),
+    ("PetalBot", &["petalsearch.com"]),
+    ("CocCocBot", &["coccoc.com"]),
+    // DuckDuckBot, FacebookBot, Twitterbot, LinkedInBot, SEMrushBot, AhrefsBot:
+    // no published PTR domain — deliberately absent, so never allowlisted.
+];
+
+/// The good-bot display name a User-Agent claims, if any. Lets the caller decide
+/// whether a verification lookup is even warranted before scoring.
+pub fn good_bot_name(user_agent: &str) -> Option<&'static str> {
+    Lazy::force(&PATTERNS);
+    GOOD_BOT_PATTERNS
+        .iter()
+        .zip(PATTERNS.good_bots.iter())
+        .find(|((_, _), (re, _))| re.is_match(user_agent))
+        .map(|((_, name), _)| *name)
+}
+
+/// Domains a verified PTR for `name` must end in. Empty for crawlers whose
+/// operators publish no PTR domain — those can never be verified, and the
+/// caller must treat them as unverified.
+pub fn good_bot_verify_domains(name: &str) -> &'static [&'static str] {
+    GOOD_BOT_VERIFY_DOMAINS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, d)| *d)
+        .unwrap_or(&[])
+}
+
 /// `(regex_pattern, display_name)` pairs for known attack / scanner tools.
 /// Any match → `BotVerdict::KnownAttacker`.
 static ATTACKER_PATTERNS: &[(&str, &str)] = &[
@@ -212,6 +256,22 @@ pub struct BotSignals<'a> {
     pub has_accept_language: bool,
     /// Correlation-engine repeat-offender bonus (expected 0 / 3 / 8).
     pub recent_block_score: u32,
+    /// Result of verifying a good-bot User-Agent claim against the crawler's
+    /// published reverse-DNS domain, forward-confirmed. Supplied by the caller,
+    /// which owns DNS I/O; this module stays pure.
+    ///
+    ///   `Some(true)`  — PTR is in the crawler's domain AND resolves back to the
+    ///                  client IP. The only value that earns the allowlist.
+    ///   `None`        — not yet known (first sight of this IP, lookup pending or
+    ///                  failed, or a crawler with no published PTR domain). No
+    ///                  bypass, no penalty: scored like any other client.
+    ///   `Some(false)` — the claim was checked and is FALSE: PTR outside the
+    ///                  domain, or a PTR that does not resolve back. Lying about
+    ///                  identity is itself a strong bot signal.
+    ///
+    /// Before this field existed the UA match alone granted `score: 0`, so any
+    /// client could opt out of bot scoring with one header.
+    pub good_bot_verified: Option<bool>,
 }
 
 /// Enforcement tier derived from the weighted bot score.
@@ -394,21 +454,33 @@ impl BotDetector {
         // the JA4-first precedence in `classify`). Looked up once, reused below.
         let bad_ja4_tool: Option<&String> = sig.ja4.and_then(|fp| self.malicious_ja4.get(fp));
 
-        // Good-bot UA is allowed outright — but ONLY when its TLS fingerprint
-        // is not on the malicious list. A spoofed "Googlebot" UA riding a
-        // known-bad JA4 (e.g. sqlmap's TLS stack) must NOT short-circuit here;
-        // it falls through to full scoring. `verified_good_bot` stays false
-        // because we have not yet confirmed the claim.
+        // A good-bot User-Agent earns the allowlist ONLY when the caller has
+        // verified the claim (PTR in the crawler's published domain, forward-
+        // confirmed) AND the TLS fingerprint is not on the malicious list. The
+        // UA alone used to be enough — `score: 0` for anyone who typed
+        // "Googlebot" into a header — which made bot scoring opt-out.
         //
-        // TODO(issue #8 follow-up): reverse-DNS verify the good-bot claim
-        // (PTR + forward-confirmed A/AAAA) before trusting it, and set
-        // `verified_good_bot: true` only on success.
-        if bad_ja4_tool.is_none() && patterns.match_good_bot(sig.user_agent).is_some() {
+        // Three outcomes, deliberately distinct:
+        //   verified       -> allow, and say so (`verified_good_bot: true`)
+        //   unknown (None) -> no bypass, NO penalty; fall through to normal
+        //                     scoring. First sight of a real crawler IP, a
+        //                     pending or failed lookup, or an unverifiable
+        //                     crawler must not be punished for being unproven.
+        //   spoofed        -> no bypass AND a penalty. Claiming an identity the
+        //                     PTR contradicts is a deliberate act.
+        let claimed_good_bot = patterns.match_good_bot(sig.user_agent);
+        if bad_ja4_tool.is_none()
+            && claimed_good_bot.is_some()
+            && sig.good_bot_verified == Some(true)
+        {
             return BotScore {
                 score: 0,
                 tier: BotTier::Allow,
-                verified_good_bot: false,
-                reasons: vec!["good-bot-ua (unverified)".to_string()],
+                verified_good_bot: true,
+                reasons: vec![format!(
+                    "good-bot-ua:{} (verified by reverse DNS)",
+                    claimed_good_bot.as_deref().unwrap_or("?")
+                )],
             };
         }
 
@@ -428,12 +500,38 @@ impl BotDetector {
         } else if sig.user_agent.trim().is_empty() {
             score += 30;
             reasons.push("empty-ua".to_string());
-        } else if is_botlike_ua(sig.user_agent) {
+        } else if is_botlike_ua(sig.user_agent)
+            // An UNVERIFIED good-bot claim is neither trusted nor punished, so it
+            // must not pick up the generic bot-word bump either: the word is the
+            // claim. Without this, a genuine Googlebot's FIRST request from each
+            // new address (before the lookup lands) scored ~28 and drew a JS
+            // challenge it cannot solve — an SEO regression, one per crawler IP.
+            // A DISPROVEN claim keeps the bump: then the bot-word is just true.
+            && !(claimed_good_bot.is_some() && sig.good_bot_verified.is_none())
+        {
             score += 20;
             reasons.push("botlike-ua".to_string());
         }
 
         // Browser-header heuristics.
+        // The good-bot claim, when it did not earn the allowlist above.
+        if let Some(name) = claimed_good_bot.as_deref() {
+            match sig.good_bot_verified {
+                // Checked and contradicted: PTR outside the domain, or a PTR that
+                // does not resolve back. +35 alone lands in JsChallenge (25..40),
+                // never Block — so a mistaken verifier cannot 403 a client by
+                // itself; it takes other bot signals on top to reach Captcha/Block.
+                Some(false) => {
+                    score += 35;
+                    reasons.push(format!("good-bot-ua:{name} claim REJECTED (spoofed)"));
+                }
+                // Unproven, not disproven. Recorded so the operator can see how
+                // much traffic claims an identity it never substantiates.
+                None => reasons.push(format!("good-bot-ua:{name} claim unverified")),
+                Some(true) => {} // unreachable: handled above unless a bad JA4 intervened
+            }
+        }
+
         if !sig.has_accept && !sig.has_accept_language {
             score += 20;
             reasons.push("no-browser-headers".to_string());
@@ -606,6 +704,7 @@ mod tests {
             has_accept: true,
             has_accept_language: true,
             recent_block_score: 0,
+            good_bot_verified: None,
         };
         let r = det().score(&sig);
         assert_eq!(r.score, 0, "reasons: {:?}", r.reasons);
@@ -623,6 +722,7 @@ mod tests {
             has_accept: false,
             has_accept_language: false,
             recent_block_score: 0,
+            good_bot_verified: None,
         };
         let r = det().score(&sig);
         assert!(r.score >= 45, "score was {} ({:?})", r.score, r.reasons);
@@ -639,6 +739,7 @@ mod tests {
             has_accept: false,
             has_accept_language: false,
             recent_block_score: 0,
+            good_bot_verified: None,
         };
         let r = det().score(&sig);
         assert!(
@@ -649,22 +750,165 @@ mod tests {
         );
     }
 
-    #[test]
-    fn score_good_bot_allows() {
-        let sig = BotSignals {
-            user_agent: "Mozilla/5.0 (compatible; Googlebot/2.1; \
-                         +http://www.google.com/bot.html)",
+    const GOOGLEBOT_UA: &str =
+        "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
+
+    fn googlebot_sig(verified: Option<bool>) -> BotSignals<'static> {
+        BotSignals {
+            user_agent: GOOGLEBOT_UA,
             ja4: None,
             has_accept: false,
             has_accept_language: false,
             recent_block_score: 8,
-        };
-        let r = det().score(&sig);
-        // Early return wins over every other signal.
+            good_bot_verified: verified,
+        }
+    }
+
+    /// A VERIFIED crawler earns the allowlist — and says so.
+    #[test]
+    fn a_verified_good_bot_is_allowed_and_marked_verified() {
+        let r = det().score(&googlebot_sig(Some(true)));
         assert_eq!(r.score, 0);
         assert_eq!(r.tier, BotTier::Allow);
+        assert!(
+            r.verified_good_bot,
+            "the verified flag is what sets tx bot_good=1"
+        );
+        assert!(
+            r.reasons[0].contains("verified by reverse DNS"),
+            "{:?}",
+            r.reasons
+        );
+    }
+
+    /// THE FIX: a good-bot UA on its own no longer earns anything. Unverified is
+    /// scored like any other client — here the same signals that made the old
+    /// test "win over everything" now count (no browser headers, repeat offender).
+    #[test]
+    fn an_unverified_good_bot_claim_gets_no_bypass_and_no_penalty() {
+        let r = det().score(&googlebot_sig(None));
+        assert!(r.score > 0, "the UA alone must not zero the score any more");
         assert!(!r.verified_good_bot);
-        assert_eq!(r.reasons, vec!["good-bot-ua (unverified)".to_string()]);
+        assert!(
+            r.reasons.iter().any(|x| x.contains("claim unverified")),
+            "the unproven claim must be recorded: {:?}",
+            r.reasons
+        );
+        // No penalty for merely being unproven: same score as the identical
+        // request without the claim, apart from the recorded reason.
+        let plain = det().score(&BotSignals {
+            user_agent: "Mozilla/5.0 (X11; Linux) SomeFetcher/1.0",
+            ..googlebot_sig(None)
+        });
+        assert!(
+            r.score <= plain.score,
+            "unknown must carry no penalty at all (claim={} plain={})",
+            r.score,
+            plain.score
+        );
+        assert!(
+            !r.reasons.iter().any(|x| x == "botlike-ua"),
+            "{:?}",
+            r.reasons
+        );
+    }
+
+    /// THE SEO-SAFETY GUARD. A genuine crawler's first request from a new
+    /// address arrives before its lookup has landed, i.e. as `None`. Googlebot
+    /// sends Accept but typically no Accept-Language, and never solves a JS
+    /// challenge — so this exact shape must score below the JsChallenge tier
+    /// (25). Suppressing the generic bot-word bump for an unverified claim is
+    /// what keeps it there.
+    #[test]
+    fn a_crawlers_first_sight_is_never_challenged() {
+        let first_sight = det().score(&BotSignals {
+            has_accept: true,
+            has_accept_language: false,
+            recent_block_score: 0,
+            ..googlebot_sig(None)
+        });
+        assert!(
+            first_sight.score < 25,
+            "first-sight Googlebot scored {} ({:?}) — it would be JS-challenged before \
+             verification could land, once per crawler IP",
+            first_sight.score,
+            first_sight.reasons
+        );
+        assert_eq!(first_sight.tier, BotTier::Allow);
+        assert!(
+            !first_sight.verified_good_bot,
+            "allowed on merit, not on the claim"
+        );
+        assert!(!first_sight.reasons.iter().any(|r| r == "botlike-ua"));
+    }
+
+    /// A DISPROVEN claim is penalised — but never to Block on its own.
+    #[test]
+    fn a_spoofed_good_bot_claim_is_penalised_but_cannot_block_alone() {
+        // Browser headers present, no repeat offences: the lie (+35) plus the
+        // now-earned bot-word bump (+20) — a contradicted claim IS a bot.
+        let only_the_lie = det().score(&BotSignals {
+            has_accept: true,
+            has_accept_language: true,
+            recent_block_score: 0,
+            ..googlebot_sig(Some(false))
+        });
+        assert_eq!(only_the_lie.score, 55, "{:?}", only_the_lie.reasons);
+        assert_eq!(
+            only_the_lie.tier,
+            BotTier::Captcha,
+            "a disproven claim on its own is challenged, never blocked: a mistaken \
+             verifier must not be able to 403 a client by itself"
+        );
+        assert!(only_the_lie
+            .reasons
+            .iter()
+            .any(|x| x.contains("REJECTED (spoofed)")));
+
+        // Stacked with the usual bot signals it reaches Block, as it should.
+        let stacked = det().score(&googlebot_sig(Some(false)));
+        assert!(
+            stacked.score >= 70,
+            "spoof + no headers + repeat offender: {}",
+            stacked.score
+        );
+        assert_eq!(stacked.tier, BotTier::Block);
+    }
+
+    /// Precedence is unchanged: a malicious JA4 beats even a verified claim.
+    #[test]
+    fn a_bad_ja4_still_beats_a_verified_good_bot_claim() {
+        let (fp, _) = MALICIOUS_JA4_TABLE[0];
+        let r = det().score(&BotSignals {
+            ja4: Some(fp),
+            ..googlebot_sig(Some(true))
+        });
+        assert!(!r.verified_good_bot);
+        assert!(r.score >= 45, "{:?}", r.reasons);
+    }
+
+    #[test]
+    fn good_bot_name_and_verification_domains() {
+        assert_eq!(good_bot_name(GOOGLEBOT_UA), Some("Googlebot"));
+        assert_eq!(
+            good_bot_name("Mozilla/5.0 (compatible; bingbot/2.0)"),
+            Some("Bingbot")
+        );
+        assert_eq!(good_bot_name("curl/8.5"), None);
+        assert_eq!(
+            good_bot_verify_domains("Googlebot"),
+            &["googlebot.com", "google.com"]
+        );
+        // No published PTR domain => can never be verified => never allowlisted.
+        assert!(good_bot_verify_domains("DuckDuckBot").is_empty());
+        assert!(good_bot_verify_domains("Twitterbot").is_empty());
+        // Every name in the domain table must be a real pattern name (typo guard).
+        for (name, _) in GOOD_BOT_VERIFY_DOMAINS {
+            assert!(
+                GOOD_BOT_PATTERNS.iter().any(|(_, n)| n == name),
+                "{name} in GOOD_BOT_VERIFY_DOMAINS matches no GOOD_BOT_PATTERNS entry"
+            );
+        }
     }
 
     #[test]
@@ -677,6 +921,7 @@ mod tests {
             has_accept: true,
             has_accept_language: true,
             recent_block_score: 0,
+            good_bot_verified: None,
         };
         let r = det().score(&sig);
         assert_eq!(r.score, 20, "reasons: {:?}", r.reasons);
@@ -712,6 +957,7 @@ mod tests {
             has_accept: true,
             has_accept_language: true,
             recent_block_score: 0,
+            good_bot_verified: None,
         };
         let r = det().score(&sig);
         assert_ne!(
@@ -740,6 +986,7 @@ mod tests {
             has_accept: true, // present → no header bonus
             has_accept_language: true,
             recent_block_score: 0,
+            good_bot_verified: None,
         });
         assert_eq!(js.score, 30);
         assert_eq!(js.tier, BotTier::JsChallenge);
@@ -751,6 +998,7 @@ mod tests {
             has_accept: true,
             has_accept_language: true,
             recent_block_score: 0,
+            good_bot_verified: None,
         });
         assert_eq!(cap.score, 40);
         assert_eq!(cap.tier, BotTier::Captcha);
@@ -762,6 +1010,7 @@ mod tests {
             has_accept: false,
             has_accept_language: false,
             recent_block_score: 3,
+            good_bot_verified: None,
         });
         assert_eq!(block.score, 70);
         assert_eq!(block.tier, BotTier::Block);

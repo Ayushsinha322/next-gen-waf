@@ -24,6 +24,7 @@
 
 pub mod captcha;
 pub mod challenge;
+pub(crate) mod goodbot;
 pub mod http3;
 pub(crate) mod ja4_quic;
 mod jwks;
@@ -416,6 +417,10 @@ struct ModulesState {
 
     /// Bot / UA / JA4 classifier — rebuilt on reload (stateless).
     bot_detector: ArcSwap<BotDetector>,
+
+    /// Reverse-DNS verifier for good-bot User-Agent claims. State (the per-IP
+    /// cache) is preserved across reloads: a verified crawler stays verified.
+    goodbot: Arc<goodbot::GoodBotVerifier>,
 
     /// Per-site GeoIP country filters — rebuilt on reload.
     geoip_map: ArcSwap<GeoIpMap>,
@@ -1055,6 +1060,7 @@ impl ProxyServer {
             ip_rep: ArcSwap::new(Arc::new(build_ip_reputation(&cfg, &[]))),
             rate_limiter: RateLimiter::with_redis(storage.redis.clone()),
             bot_detector: ArcSwap::new(Arc::new(BotDetector::new())),
+            goodbot: goodbot::GoodBotVerifier::new(),
             geoip_map: ArcSwap::new(Arc::new(build_geoip_map(&cfg))),
             anti_ddos: build_anti_ddos(&cfg),
             correlation: CorrelationEngine::new(),
@@ -3966,6 +3972,15 @@ async fn phase1_headers(
                     .request_headers
                     .contains_key(http::header::ACCEPT_LANGUAGE),
                 recent_block_score: modules.correlation.score_for_ip(ctx.client_ip),
+                // A good-bot User-Agent earns the allowlist only once its claim
+                // is verified by reverse DNS (PTR in the operator's published
+                // domain, forward-confirmed). `check` never awaits: it answers
+                // from the per-IP cache and, on a miss, starts a bounded
+                // background lookup and answers "unknown" — no bypass, no
+                // penalty. The UA alone used to be enough, which made bot
+                // scoring opt-out.
+                good_bot_verified: sentinel_modules::good_bot_name(ua)
+                    .and_then(|crawler| modules.goodbot.check(ctx.client_ip, crawler)),
             };
             let bs = bot_det.score(&sig);
             // Counted here rather than inside the module, which has no telemetry
@@ -3978,7 +3993,18 @@ async fn phase1_headers(
             // false). So anyone may claim to be Googlebot and skip bot scoring
             // entirely. Until that verification exists, the least we can do is
             // report how often it happens.
-            if bs.reasons.iter().any(|r| r.starts_with("good-bot-ua")) {
+            // Counts allowlist GRANTS, which `verified_good_bot` marks and only
+            // the verified early return can set.
+            //
+            // ⚠️ It first counted "Allow + unverified + a good-bot reason", which
+            // read as "the bypass happened" — and was wrong: after the fix, an
+            // UNVERIFIED claim legitimately lands in Allow on merit (that is the
+            // SEO-safety property, since a real crawler's first request from each
+            // new address arrives before its lookup lands). Live on .71 that
+            // condition fired on exactly the correct behaviour, three times, and
+            // looked like the bypass surviving. Count the grant itself, which is
+            // unambiguous.
+            if bs.verified_good_bot {
                 note_good_bot_allowed();
             }
             ctx.tx_vars
@@ -6729,7 +6755,16 @@ fn health_response(state: &ServerState) -> Response<BoxBody> {
                 },
             },
             "bot": {
-                "good_bot_allowed_unverified": bot_good_bot_allowed_total(),
+                // Allowlist grants. Only a claim VERIFIED by reverse DNS can
+                // produce one, so from an address whose PTR cannot substantiate
+                // the claim this stays 0 — which is the live assertion that the
+                // User-Agent alone no longer buys a free pass.
+                "good_bot_allowlisted": bot_good_bot_allowed_total(),
+                // Reverse-DNS verification of good-bot claims: lookups made,
+                // verified (allowlisted), rejected (PTR contradicts the claim —
+                // penalised), unverifiable (no PTR / resolver failure / operator
+                // publishes no PTR domain — scored normally).
+                "good_bot": state.modules.goodbot.status(),
                 // Sizes, because they are smaller than the feature name suggests
                 // and nothing reported them. The JA4 table is a static built-in
                 // whose own comment calls it "for demonstration", and the proxy
