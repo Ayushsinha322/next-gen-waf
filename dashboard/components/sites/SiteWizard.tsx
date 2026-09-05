@@ -654,7 +654,22 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                         <input className="fin2" type="number" value={primary.port} placeholder="8080" onChange={e => setServer(0, { port: Number(e.target.value) })} />
                       </Field>
                     </Row>
-                    <SectionToggle label="Upstream uses HTTPS" desc="The app behind the WAF serves TLS" on={primary.tls} set={v => setServer(0, { tls: v })} />
+                    <SectionToggle label="Upstream uses HTTPS" desc="The app behind the WAF serves TLS — its certificate must be verifiable" on={primary.tls} set={v => setServer(0, { tls: v })} />
+                    {/* The origin connector verifies the origin's certificate against
+                        the public roots plus any CA in SENTINEL_UPSTREAM_CA_FILE. It
+                        used to be the public roots ONLY, with no override and nothing
+                        in this UI saying so, so an internal-CA backend — the ordinary
+                        enterprise case — 502'd for ever with no explanation. */}
+                    {primary.tls && (
+                      <InfoBox tone="amber">
+                        <strong>The origin's certificate is verified.</strong> If it is
+                        signed by an internal or corporate CA rather than a public one,
+                        point <code>SENTINEL_UPSTREAM_CA_FILE</code> at that CA's PEM
+                        bundle on each WAF node — otherwise the handshake fails and this
+                        site returns <strong>502</strong>. A self-signed origin
+                        certificate must likewise have its own certificate in that file.
+                      </InfoBox>
+                    )}
                     <InfoBox>✅ Traffic to <strong style={{ color: "var(--cyan)" }}>{scheme}://{form.domains[0] || "your-domain"}</strong> will be proxied to <strong style={{ color: "var(--cyan)" }}>{primary.tls ? "https" : "http"}://{primary.host || "host"}:{primary.port || "port"}</strong>. Need load balancing or health checks? Switch to <strong>Advanced</strong>.</InfoBox>
                   </>) : (<>
                     <Field label="Load Balancing" hint="Strategy across upstream servers">

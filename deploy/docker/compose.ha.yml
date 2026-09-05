@@ -77,6 +77,11 @@ x-wafnode: &wafnode
     controlplane: { condition: service_started }
     redis: { condition: service_healthy }
   environment: &wafenv
+    # CA bundle used to verify ORIGIN certificates, in ADDITION to the public
+    # roots. Empty = public roots only, which is what every deployment had before
+    # this existed — and why an internal-CA backend 502'd with no explanation.
+    # See origin-ca/README.md.
+    SENTINEL_UPSTREAM_CA_FILE: ${SENTINEL_UPSTREAM_CA_FILE:-}
     SENTINEL_CONFIG: /etc/sentinel/sentinel.yaml
     # RUST_LOG is deliberately just `info`, with NO per-crate directive.
     #
@@ -247,6 +252,11 @@ services:
       # geoip/README.md. When absent the WAF logs an ERROR and reports the gap at
       # /healthz -> geoip.inert rather than pretending country rules apply.
       - ${SENTINEL_GEOIP_DIR:-./geoip}:/var/lib/sentinel/geoip:ro
+      # Operator-supplied CA for ORIGIN certificate verification, read-only.
+      # Empty by default — see origin-ca/README.md. Without it the only anchors
+      # are the public roots, so an origin behind an internal/corporate CA fails
+      # verification and the site 502s.
+      - ${SENTINEL_ORIGIN_CA_DIR:-./origin-ca}:/etc/sentinel/origin-ca:ro
       - waf1-state:/var/lib/sentinel/state       # this node's last-good config cache
     ports:
       # MANAGEMENT console (HTTPS — admin UI + API), LOOPBACK-ONLY BY DEFAULT.
@@ -317,6 +327,11 @@ services:
       # geoip/README.md. When absent the WAF logs an ERROR and reports the gap at
       # /healthz -> geoip.inert rather than pretending country rules apply.
       - ${SENTINEL_GEOIP_DIR:-./geoip}:/var/lib/sentinel/geoip:ro
+      # Operator-supplied CA for ORIGIN certificate verification, read-only.
+      # Empty by default — see origin-ca/README.md. Without it the only anchors
+      # are the public roots, so an origin behind an internal/corporate CA fails
+      # verification and the site 502s.
+      - ${SENTINEL_ORIGIN_CA_DIR:-./origin-ca}:/etc/sentinel/origin-ca:ro
       - waf2-state:/var/lib/sentinel/state
   waf3:
     <<: *wafnode
@@ -349,6 +364,11 @@ services:
       # geoip/README.md. When absent the WAF logs an ERROR and reports the gap at
       # /healthz -> geoip.inert rather than pretending country rules apply.
       - ${SENTINEL_GEOIP_DIR:-./geoip}:/var/lib/sentinel/geoip:ro
+      # Operator-supplied CA for ORIGIN certificate verification, read-only.
+      # Empty by default — see origin-ca/README.md. Without it the only anchors
+      # are the public roots, so an origin behind an internal/corporate CA fails
+      # verification and the site 502s.
+      - ${SENTINEL_ORIGIN_CA_DIR:-./origin-ca}:/etc/sentinel/origin-ca:ro
       - waf3-state:/var/lib/sentinel/state
 
   lb:
