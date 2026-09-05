@@ -50,7 +50,7 @@ use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::TokioExecutor;
 use sentinel_core::config::{LoadBalancerStrategy, SentinelConfig, UpstreamServer};
 use tokio::sync::watch;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 // ---------------------------------------------------------------------------
 // Circuit-breaker tunables
@@ -322,6 +322,119 @@ fn resolve_sni(
 ///
 /// Factored out because there is now more than one: the node default plus one per
 /// distinct per-site connect timeout. Everything except the connect timeout —
+/// Extra trust anchors for ORIGIN connections, from `SENTINEL_UPSTREAM_CA_FILE`.
+///
+/// `Ok(vec![])` — not configured.
+/// `Ok(certs)`  — parsed; these are ADDED to the public roots.
+/// `Err`        — configured but unusable; the caller logs and keeps the public
+///                roots (see the note on additive semantics below).
+///
+/// # Why this exists
+///
+/// The connector trusted the webpki roots and nothing else, with no override, so
+/// an origin whose certificate chains to a corporate/internal CA — the ordinary
+/// enterprise case for the application a WAF sits in front of — failed
+/// verification and 502'd for ever. Nothing in the UI said so: the wizard's
+/// "Upstream uses HTTPS" toggle warned about SNI and never mentioned the CA.
+///
+/// # Why ADDITIVE, unlike the ClickHouse and SIEM loaders
+///
+/// Those two talk to exactly ONE peer, so a configured CA REPLACES the public
+/// roots and narrows trust to that peer — and there, failing to load it and
+/// falling back genuinely widens trust, which is why they fail closed.
+///
+/// A WAF fronts MANY origins, and a deployment can legitimately mix internal-CA
+/// and public-CA backends. Replacing the roots the moment one internal CA is
+/// configured would silently break every public-CA origin that was working. So
+/// the file ADDS anchors.
+///
+/// That flips the error case, and deliberately: because the baseline is the
+/// public roots, failing to load the extra CA leaves trust exactly where the
+/// operator already had it. It does not widen anything — it fails to widen. The
+/// internal-CA origins keep 502ing, which is the symptom the operator is already
+/// chasing, and the ERROR log now names the cause. Emptying the root store here
+/// would instead take down every HTTPS origin on the node over a typo in an env
+/// var, turning a config error into a total outage.
+fn upstream_ca_certs() -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, String> {
+    let path = match std::env::var("SENTINEL_UPSTREAM_CA_FILE") {
+        Ok(p) if !p.trim().is_empty() => p,
+        _ => return Ok(vec![]),
+    };
+    let pem = std::fs::read(&path).map_err(|e| format!("read {path}: {e}"))?;
+    let mut rd = std::io::BufReader::new(std::io::Cursor::new(pem));
+    let mut certs = Vec::new();
+    for cert in rustls_pemfile::certs(&mut rd) {
+        certs.push(cert.map_err(|e| format!("parse {path}: {e}"))?);
+    }
+    if certs.is_empty() {
+        return Err(format!("{path} contained no CERTIFICATE blocks"));
+    }
+    Ok(certs)
+}
+
+/// The rustls config every upstream connector uses: public roots, plus any
+/// private CA the operator has configured.
+///
+/// The `ring` provider is passed explicitly rather than relying on the
+/// process-default. sentinel-bin installs it at startup, but this code also runs
+/// from unit tests where nothing has, and `ClientConfig::builder()` panics in
+/// that state — the same reasoning as the ClickHouse connector.
+fn upstream_tls_config() -> rustls::ClientConfig {
+    rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("ring provider supports the default protocol versions")
+    .with_root_certificates(upstream_roots())
+    .with_no_client_auth()
+}
+
+/// The trust anchors for origin connections: the public roots, plus any private
+/// CA. Split out from `upstream_tls_config` because `rustls::ClientConfig` does
+/// not expose its root store, so this is the only way to assert what is actually
+/// trusted — and what is trusted is the whole point of this code.
+fn upstream_roots() -> rustls::RootCertStore {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let public = roots.len();
+
+    match upstream_ca_certs() {
+        Ok(certs) if !certs.is_empty() => {
+            let mut added = 0usize;
+            for c in certs {
+                match roots.add(c) {
+                    Ok(()) => added += 1,
+                    // One bad anchor in a bundle must not discard the good ones.
+                    Err(e) => {
+                        warn!(error = %e, "upstream TLS: skipping an unusable certificate in SENTINEL_UPSTREAM_CA_FILE")
+                    }
+                }
+            }
+            if added == 0 {
+                error!(
+                    "upstream TLS: SENTINEL_UPSTREAM_CA_FILE parsed but NO certificate in it was \
+                     usable as a trust anchor — origins behind that CA will keep failing \
+                     verification (502)"
+                );
+            } else {
+                info!(
+                    certs = added,
+                    public_roots = public,
+                    "upstream TLS: trusting a private CA for origin connections, in addition to the public roots"
+                );
+            }
+        }
+        Ok(_) => {}
+        Err(e) => error!(
+            error = %e,
+            "upstream TLS: SENTINEL_UPSTREAM_CA_FILE is set but unusable — origins whose \
+             certificate chains to that CA will FAIL verification and 502. Trust is unchanged \
+             (the public roots), so public-CA origins keep working; fix the path or the file."
+        ),
+    }
+    roots
+}
+
 /// TLS roots, ALPN, idle sizing, the SNI resolver — must stay identical between
 /// them, and it does so by construction here rather than by two call sites being
 /// kept in step.
@@ -343,7 +456,7 @@ fn build_client(connect_timeout: Duration, sni_overrides: Arc<SniRegistry>) -> P
     // sni_name the origin's certificate does not cover fails the handshake
     // rather than silently connecting, so a wrong value is loud.
     let https = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_webpki_roots()
+        .with_tls_config(upstream_tls_config())
         .https_or_http()
         .with_server_name_resolver(move |uri: &http::Uri| resolve_sni(&sni_overrides, uri))
         .enable_http1()
@@ -1132,5 +1245,144 @@ mod sni_tests {
             )],
         );
         assert!(reg.is_empty(), "an invalid sni_name must not be registered");
+    }
+}
+
+#[cfg(test)]
+mod upstream_ca_tests {
+    use super::*;
+
+    /// `SENTINEL_UPSTREAM_CA_FILE` is process-wide, so these tests must not run
+    /// concurrently with each other.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_ca_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("SENTINEL_UPSTREAM_CA_FILE").ok();
+        match value {
+            Some(v) => std::env::set_var("SENTINEL_UPSTREAM_CA_FILE", v),
+            None => std::env::remove_var("SENTINEL_UPSTREAM_CA_FILE"),
+        }
+        let out = f();
+        match prev {
+            Some(p) => std::env::set_var("SENTINEL_UPSTREAM_CA_FILE", p),
+            None => std::env::remove_var("SENTINEL_UPSTREAM_CA_FILE"),
+        }
+        out
+    }
+
+    fn tmp(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "sentinel-upstream-ca-{}-{name}",
+            std::process::id()
+        ));
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    /// A genuine CA (basicConstraints CA:TRUE), so `RootCertStore::add` accepts
+    /// it as a trust anchor. A self-signed leaf may be rejected, which would make
+    /// the additive assertion below vacuous.
+    fn real_ca_pem() -> String {
+        let mut params = rcgen::CertificateParams::new(vec!["sentinel-test-ca".to_string()]);
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        rcgen::Certificate::from_params(params)
+            .unwrap()
+            .serialize_pem()
+            .unwrap()
+    }
+
+    fn public_root_count() -> usize {
+        let mut r = rustls::RootCertStore::empty();
+        r.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        r.len()
+    }
+
+    #[test]
+    fn unset_and_empty_both_mean_no_private_ca() {
+        with_ca_env(None, || assert_eq!(upstream_ca_certs().unwrap().len(), 0));
+        with_ca_env(Some(""), || {
+            assert_eq!(upstream_ca_certs().unwrap().len(), 0)
+        });
+        with_ca_env(Some("   "), || {
+            assert_eq!(upstream_ca_certs().unwrap().len(), 0)
+        });
+    }
+
+    #[test]
+    fn a_missing_ca_file_is_an_error_not_a_silent_success() {
+        with_ca_env(Some("/nonexistent/sentinel/origin-ca.pem"), || {
+            assert!(upstream_ca_certs().is_err(), "a bad path must be reported");
+        });
+    }
+
+    #[test]
+    fn a_file_with_no_certificates_is_an_error() {
+        let p = tmp("empty.pem", b"this is not a certificate\n");
+        with_ca_env(Some(p.to_str().unwrap()), || {
+            let e = upstream_ca_certs().unwrap_err();
+            assert!(e.contains("no CERTIFICATE"), "unexpected error: {e}");
+        });
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// THE SEMANTIC THAT MATTERS. Unlike the ClickHouse and SIEM loaders — which
+    /// talk to one peer and REPLACE the public roots — a WAF fronts many origins,
+    /// and a deployment can mix internal-CA and public-CA backends. Configuring
+    /// an internal CA must ADD an anchor, never swap the set, or every public-CA
+    /// origin that was working would break the moment one internal CA is added.
+    #[test]
+    fn a_private_ca_is_added_to_the_public_roots_not_substituted_for_them() {
+        let pem = real_ca_pem();
+        let p = tmp("ca.pem", pem.as_bytes());
+        let public = public_root_count();
+        assert!(public > 100, "expected the webpki bundle, got {public}");
+
+        with_ca_env(Some(p.to_str().unwrap()), || {
+            let certs = upstream_ca_certs().expect("a real CA PEM must parse");
+            assert_eq!(certs.len(), 1);
+
+            let mut roots = rustls::RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            roots.add(certs.into_iter().next().unwrap()).unwrap();
+            assert_eq!(
+                roots.len(),
+                public + 1,
+                "the private CA must be an ADDITIONAL anchor; replacing the public \
+                 roots would break every public-CA origin already working"
+            );
+        });
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The fail-SAFE contract, and the one place this deliberately differs from
+    /// the ClickHouse loader. There, a broken CA file empties the root store so
+    /// TLS fails loudly, because trust would otherwise WIDEN back to the public
+    /// roots. Here the public roots are the baseline, so failing to load the
+    /// extra CA widens nothing — it fails to widen. Emptying the store instead
+    /// would take every HTTPS origin on the node down over a typo in an env var.
+    #[test]
+    fn a_broken_ca_file_leaves_the_public_roots_intact() {
+        let public = public_root_count();
+        with_ca_env(Some("/nonexistent/sentinel/origin-ca.pem"), || {
+            assert_eq!(
+                upstream_roots().len(),
+                public,
+                "a broken CA path must leave trust exactly where it was — neither \
+                 widened, nor emptied into a node-wide origin outage"
+            );
+        });
+    }
+
+    #[test]
+    fn a_configured_ca_reaches_the_tls_config_the_connector_uses() {
+        let pem = real_ca_pem();
+        let p = tmp("wired.pem", pem.as_bytes());
+        let public = public_root_count();
+        with_ca_env(Some(p.to_str().unwrap()), || {
+            // Guards the wiring, not just the loader: build_client calls this.
+            assert_eq!(upstream_roots().len(), public + 1);
+        });
+        let _ = std::fs::remove_file(&p);
     }
 }

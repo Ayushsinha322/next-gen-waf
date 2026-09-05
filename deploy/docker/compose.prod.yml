@@ -491,6 +491,9 @@ services:
       # or `up -d` recreate — exactly when a control-plane outage would leave this node
       # with no config to fall back on, which is the whole point of the cache.
       SENTINEL_CONFIG_CACHE_PATH: /var/lib/sentinel/state/config-cache.json
+      # CA bundle for ORIGIN certificate verification, added to the public
+      # roots. Empty = public roots only. See origin-ca/README.md.
+      SENTINEL_UPSTREAM_CA_FILE: ${SENTINEL_UPSTREAM_CA_FILE:-}
     volumes:
       - ./sentinel.proxy.yaml:/etc/sentinel/sentinel.yaml:ro
       # Kernel BTF so aya can load the BTF-typed BPF maps.
@@ -500,6 +503,11 @@ services:
       # geoip/README.md. When absent the WAF logs an ERROR and reports the gap at
       # /healthz -> geoip.inert rather than pretending country rules apply.
       - ${SENTINEL_GEOIP_DIR:-./geoip}:/var/lib/sentinel/geoip:ro
+      # Operator-supplied CA for ORIGIN certificate verification, read-only.
+      # Empty by default — see origin-ca/README.md. Without it the only anchors
+      # are the public roots, so an origin behind an internal/corporate CA fails
+      # verification and the site 502s.
+      - ${SENTINEL_ORIGIN_CA_DIR:-./origin-ca}:/etc/sentinel/origin-ca:ro
       - sentinel-certs:/var/lib/sentinel/certs   # cert repository (persists ACME/uploaded certs)
       - sentinel-state:/var/lib/sentinel/state   # last-good config cache (survives upgrades)
     ports:
