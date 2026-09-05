@@ -103,7 +103,10 @@ echo "    control plane image: $CPIMG"
 # fails and this degrades to a NOTE rather than a false verdict.
 TOKEN="${CP_TOKEN:-}"
 if [ -z "$TOKEN" ]; then
-  AEMAIL=$(envof sentinel-controlplane-1 SENTINEL_ADMIN_EMAIL)
+  # SENTINEL_ADMIN_EMAIL is frequently EMPTY in the container env (it was on .71,
+  # and an earlier check masked the empty value as "<set>"). The seeder's default
+  # identity is admin@sentinel.local (control-plane/internal/db/seed.go).
+  AEMAIL=$(envof sentinel-controlplane-1 SENTINEL_ADMIN_EMAIL); AEMAIL=${AEMAIL:-admin@sentinel.local}
   APW=$(envof sentinel-controlplane-1 SENTINEL_BOOTSTRAP_ADMIN_PASSWORD)
   if [ -n "$AEMAIL" ] && [ -n "$APW" ]; then
     TOKEN=$(AEMAIL="$AEMAIL" APW="$APW" python3 -c "import json,os,sys; print(json.dumps({'email':os.environ['AEMAIL'],'password':os.environ['APW']}))" \
