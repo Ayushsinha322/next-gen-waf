@@ -3993,13 +3993,18 @@ async fn phase1_headers(
             // false). So anyone may claim to be Googlebot and skip bot scoring
             // entirely. Until that verification exists, the least we can do is
             // report how often it happens.
-            // Regression tripwire, not a statistic any more: with verification
-            // in place, an ALLOW on a good-bot claim that is NOT verified cannot
-            // happen. If this ever increments, the bypass is back.
-            if bs.tier == BotTier::Allow
-                && !bs.verified_good_bot
-                && bs.reasons.iter().any(|r| r.starts_with("good-bot-ua"))
-            {
+            // Counts allowlist GRANTS, which `verified_good_bot` marks and only
+            // the verified early return can set.
+            //
+            // ⚠️ It first counted "Allow + unverified + a good-bot reason", which
+            // read as "the bypass happened" — and was wrong: after the fix, an
+            // UNVERIFIED claim legitimately lands in Allow on merit (that is the
+            // SEO-safety property, since a real crawler's first request from each
+            // new address arrives before its lookup lands). Live on .71 that
+            // condition fired on exactly the correct behaviour, three times, and
+            // looked like the bypass surviving. Count the grant itself, which is
+            // unambiguous.
+            if bs.verified_good_bot {
                 note_good_bot_allowed();
             }
             ctx.tx_vars
@@ -6750,10 +6755,11 @@ fn health_response(state: &ServerState) -> Response<BoxBody> {
                 },
             },
             "bot": {
-                // Must stay 0: an allowlist granted to an UNVERIFIED good-bot
-                // claim is the bypass this counter used to measure and now
-                // detects as a regression.
-                "good_bot_allowed_unverified": bot_good_bot_allowed_total(),
+                // Allowlist grants. Only a claim VERIFIED by reverse DNS can
+                // produce one, so from an address whose PTR cannot substantiate
+                // the claim this stays 0 — which is the live assertion that the
+                // User-Agent alone no longer buys a free pass.
+                "good_bot_allowlisted": bot_good_bot_allowed_total(),
                 // Reverse-DNS verification of good-bot claims: lookups made,
                 // verified (allowlisted), rejected (PTR contradicts the claim —
                 // penalised), unverifiable (no PTR / resolver failure / operator

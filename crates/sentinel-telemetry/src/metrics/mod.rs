@@ -521,9 +521,14 @@ struct WafMetrics {
     /// h3 connections that completed a handshake and yielded no fingerprint —
     /// including the case where the decorator is not installed at all.
     pub ja4_h3_absent_total: Counter,
-    /// Requests allowed by the good-bot User-Agent allowlist. Reverse-DNS
-    /// verification is still a TODO, so this counts unauthenticated trust —
-    /// anyone may claim to be Googlebot.
+    /// Requests granted the good-bot allowlist — i.e. a crawler claim that was
+    /// VERIFIED by reverse DNS (PTR in the operator's published domain,
+    /// forward-confirmed) and therefore scored 0.
+    ///
+    /// It used to count unauthenticated trust, because the User-Agent alone was
+    /// enough. Now the grant is impossible without verification, so this is the
+    /// number of crawlers actually proven — and from an address that cannot
+    /// verify, it must stay 0.
     pub bot_good_bot_allowed_total: Counter,
 
     pub registry: MetricsRegistry,
@@ -622,8 +627,8 @@ impl WafMetrics {
             "HTTP/3 connections with no fingerprint (includes the decorator not being installed)",
         );
         let bot_good_bot_allowed_total = registry.register_counter(
-            "sentinel_bot_good_bot_allowed_total",
-            "Requests allowed by the good-bot User-Agent allowlist, which is NOT reverse-DNS verified",
+            "sentinel_bot_good_bot_allowlisted_total",
+            "Requests granted the good-bot allowlist after reverse-DNS verification (PTR in the operator's domain, forward-confirmed)",
         );
 
         Self {
@@ -822,9 +827,7 @@ pub fn ja4_h3_absent_total() -> u64 {
     WAF_METRICS.ja4_h3_absent_total.get()
 }
 
-/// A request was allowed because its User-Agent claimed to be a known good bot.
-/// Unverified: reverse-DNS confirmation is still a TODO, so this is a count of
-/// unauthenticated trust.
+/// The good-bot allowlist was granted — only reachable for a VERIFIED claim.
 pub fn note_good_bot_allowed() {
     WAF_METRICS.bot_good_bot_allowed_total.inc();
 }
