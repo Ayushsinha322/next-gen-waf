@@ -38,11 +38,35 @@ print(d if isinstance(d,(int,float)) else 0)" 2>/dev/null); t=$((t+${v:-0})); do
 LOGDIR="${SENTINEL_LOG_VOLUME:-/var/lib/docker/volumes/sentinel_sentinel-logs/_data}"
 action_for() { grep -h "$1" "$LOGDIR"/waf*/access.log 2>/dev/null | tail -1 | python3 -c "import sys,json; l=sys.stdin.readline(); print(json.loads(l).get('action','<none>') if l.strip() else '<no record>')" 2>/dev/null; }
 
-echo "=== 0. the verifier is present ==="
+echo "=== 0. prerequisites ==="
 case "$(hz)" in
   *'"good_bot"'*) ok "/healthz carries modules.bot.good_bot" ;;
   *) bad "/healthz has no modules.bot.good_bot — the running image predates this change"; echo "=== RESULT: $pass passed, $fail failed ==="; exit 1 ;;
 esac
+
+# ⚠️ THE VACUOUS-PASS GUARD. The whole bot block is wrapped in
+# `if let Some(ref bot_cfg) = site.waf.bot_detection`, so with the key absent
+# from the site policy NOTHING below runs and every counter stays 0 — which a
+# naive "the tripwire did not advance" check would report as a PASS. That was
+# not hypothetical: on .71 `bot_detection` was null in the live config, bot
+# scoring had never run on the only site, and a first attempt at a "before"
+# baseline read 0 and proved nothing. Refuse to judge rather than pass vacuously.
+CPIP=$(docker inspect sentinel-controlplane-1 --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' 2>/dev/null | awk '{print $1}')
+SEC=$(docker inspect sentinel-waf1-1 --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | grep '^SENTINEL_INTERNAL_SECRET=' | cut -d= -f2-)
+BD=$(curl -s --max-time 10 -H "x-sentinel-internal: $SEC" "http://$CPIP:9501/api/v1/internal/config" 2>/dev/null \
+  | python3 -c "
+import sys, json
+try: d = json.load(sys.stdin)
+except Exception: print(''); raise SystemExit
+print(','.join(s.get('id','?') for s in d.get('sites', []) if (s.get('waf') or {}).get('bot_detection')))
+" 2>/dev/null)
+if [ -n "$BD" ]; then
+  ok "bot_detection is configured on: $BD"
+else
+  bad "NO site has bot_detection configured — the bot block never runs, so every check \
+below would pass on an empty result. Enable it before trusting this battery."
+  echo "=== RESULT: $pass passed, $fail failed ==="; exit 1
+fi
 
 echo
 echo "=== 1. THE DECIDING CHECK — a Googlebot UA from an unverifiable address gets NO free pass ==="
