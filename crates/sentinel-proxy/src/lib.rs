@@ -1226,10 +1226,11 @@ impl ProxyServer {
                                 let rule_count: usize =
                                     new_engines.values().map(|e| e.rule_count()).sum();
                                 es.store(Arc::new(new_engines));
-                                // Engines now match the published config, so the
-                                // request path may inspect again. Cleared after
-                                // the store, never before.
-                                ENGINES_WARMING.store(false, std::sync::atomic::Ordering::Release);
+                                // Engines now match the config we built FROM — but
+                                // only clear the flag if that is still the config
+                                // being served. Cleared after the store, never
+                                // before, and never for a superseded config.
+                                clear_warming_if_current(&cw, ptr, &ENGINES_WARMING);
                                 ds.store(Arc::new(build_dlp_map(&current)));
 
                                 let feed_cidrs = mr.feed_cache.load_full();
@@ -4741,6 +4742,53 @@ fn threat_intel_status(cfg: &SentinelConfig, feed: &ThreatFeed) -> serde_json::V
 /// site with `mode: off`, or with no rule files and no inline rules, legitimately
 /// has no engine for ever, and treating those as "still warming" would 503 them
 /// permanently. Keep the two in step.
+/// Declare the compiled engines current — but only if the config has not moved
+/// on while they were being built.
+///
+/// `build_rule_engines` compiles the whole corpus (347 rules on .71) and takes
+/// long enough for another sync to land mid-build. Clearing the flag
+/// unconditionally after the store announces "engines are current" for a config
+/// that is ALREADY superseded, so a site introduced by the newer sync is
+/// matchable with no engine and no warming flag — the exact fail-open the flag
+/// exists to prevent, reopened by a second config change instead of a first.
+///
+/// Leaving the flag set is the safe direction: the rebuild loop has already been
+/// notified and clears it on the very next pass, which costs a few hundred more
+/// milliseconds of 503 rather than a window of uninspected traffic.
+///
+/// No ABA hazard on the pointer compare: the caller still holds the `Arc` it
+/// built from, so that allocation cannot be freed and its address cannot be
+/// reused by the newer config.
+///
+/// Takes the flag rather than touching the global so it is testable without
+/// racing the other tests in this process.
+fn clear_warming_if_current(
+    cw: &ConfigHandle,
+    built_from: usize,
+    flag: &std::sync::atomic::AtomicBool,
+) -> bool {
+    let still_current = Arc::as_ptr(&cw.load_full()) as usize == built_from;
+    if still_current {
+        flag.store(false, std::sync::atomic::Ordering::Release);
+    }
+    still_current
+}
+
+/// Sites that are matchable but have NO compiled rule engine.
+///
+/// While `ENGINES_WARMING` is set this is the transient reload state and those
+/// requests are refused with 503. Once it clears, anything still listed here is
+/// a site whose rules FAILED to compile and which is now being served with no
+/// signature protection at all — a standing fail-open that only a config fix
+/// clears, and which was previously visible in nothing but one log line.
+fn unprotected_sites(cfg: &SentinelConfig, engines: &RuleEngineMap) -> Vec<String> {
+    cfg.sites
+        .iter()
+        .filter(|s| site_expects_engine(s) && !engines.contains_key(&s.id))
+        .map(|s| s.id.clone())
+        .collect()
+}
+
 fn site_expects_engine(site: &SiteConfig) -> bool {
     site.waf.mode != WafMode::Off
         && !(site.waf.rules.is_empty() && site.waf.inline_rules.is_empty())
@@ -4820,8 +4868,17 @@ fn build_rule_engines(cfg: &SentinelConfig, previous: &RuleEngineMap) -> RuleEng
                         "rule engine reload FAILED — retaining last-good ruleset, new rules rejected: {e:#}");
                     map.insert(site.id.clone(), prev.clone());
                 } else {
-                    warn!(site = %site.id,
-                        "rule engine load failed and no prior ruleset — site has NO signature protection until the config is fixed: {e:#}");
+                    // ERROR, not WARN: unlike the retain-last-good branch above,
+                    // this site has no ruleset at ALL and is about to be served
+                    // uninspected for as long as the config stays broken. Once
+                    // ENGINES_WARMING clears it stops being 503'd and starts
+                    // passing traffic, so the only thing standing between a
+                    // blocking-mode site and zero signature protection is this
+                    // line and the /healthz field it feeds.
+                    error!(site = %site.id,
+                        "rule engine load failed and no prior ruleset — site has NO signature protection \
+                         and WILL be served uninspected once warming clears; listed in \
+                         /healthz inspection.sites_without_engine until the config is fixed: {e:#}");
                 }
             }
         }
@@ -6667,6 +6724,16 @@ fn health_response(state: &ServerState) -> Response<BoxBody> {
         "status": "ok",
         "uptime_secs": uptime_secs,
         "sites": site_count,
+        // Inspection coverage. `engines_warming` true means a reload is in
+        // flight and sites without an engine are being refused with 503 rather
+        // than forwarded uninspected. `sites_without_engine` non-empty while
+        // warming is FALSE is the alarming case: those sites are matchable,
+        // being served, and have no signature protection because their rules
+        // failed to compile.
+        "inspection": {
+            "engines_warming": ENGINES_WARMING.load(std::sync::atomic::Ordering::Acquire),
+            "sites_without_engine": unprotected_sites(&cfg, &state.engines.load_full()),
+        },
         "listeners": listeners,
         "http3": http3,
         // Non-zero means this node enforced blocks it could not record, so
@@ -10421,6 +10488,92 @@ mod engine_warming_tests {
         assert!(
             !ENGINES_WARMING.load(std::sync::atomic::Ordering::Acquire),
             "a freshly started proxy has already built its engines and must serve"
+        );
+    }
+
+    fn handle_with(sites: Vec<SiteConfig>) -> ConfigHandle {
+        Arc::new(ArcSwap::new(Arc::new(SentinelConfig {
+            sites,
+            ..Default::default()
+        })))
+    }
+
+    /// THE RACE. A second sync landing WHILE the engines are being built must not
+    /// let the finishing build declare the engines current — the config it built
+    /// from is already superseded, and the site the newer sync introduced has no
+    /// engine. Clearing the flag here reopens the exact fail-open it exists to
+    /// prevent, one config change later than the bug that was originally fixed.
+    #[test]
+    fn a_config_change_during_the_build_must_not_clear_warming() {
+        let cw = handle_with(vec![site_with(
+            WafMode::Blocking,
+            vec!["rules/x.conf".into()],
+            vec![],
+        )]);
+        // The pointer the (slow) build started from.
+        let built_from = Arc::as_ptr(&cw.load_full()) as usize;
+
+        // A second sync lands mid-build, publishing a NEW site.
+        let mut newer = site_with(WafMode::Blocking, vec!["rules/y.conf".into()], vec![]);
+        newer.id = "site-added-during-build".into();
+        cw.store(Arc::new(SentinelConfig {
+            sites: vec![
+                site_with(WafMode::Blocking, vec!["rules/x.conf".into()], vec![]),
+                newer,
+            ],
+            ..Default::default()
+        }));
+
+        let flag = std::sync::atomic::AtomicBool::new(true);
+        let cleared = clear_warming_if_current(&cw, built_from, &flag);
+        assert!(!cleared, "the build was for a superseded config");
+        assert!(
+            flag.load(std::sync::atomic::Ordering::Acquire),
+            "warming must STAY set: the newly published site has no engine yet, and \
+             clearing here would make it matchable and uninspected"
+        );
+    }
+
+    /// The ordinary path still clears, or every reload would 503 for ever.
+    #[test]
+    fn an_untouched_config_clears_warming() {
+        let cw = handle_with(vec![site_with(
+            WafMode::Blocking,
+            vec!["rules/x.conf".into()],
+            vec![],
+        )]);
+        let built_from = Arc::as_ptr(&cw.load_full()) as usize;
+        let flag = std::sync::atomic::AtomicBool::new(true);
+        assert!(clear_warming_if_current(&cw, built_from, &flag));
+        assert!(
+            !flag.load(std::sync::atomic::Ordering::Acquire),
+            "an unchanged config must resume inspection"
+        );
+    }
+
+    /// A site whose rules failed to compile has NO engine and — once warming
+    /// clears — is served uninspected. It used to be visible in one log line
+    /// only; it must be enumerable.
+    #[test]
+    fn a_site_with_no_engine_is_reported_as_unprotected() {
+        let mut broken = site_with(WafMode::Blocking, vec!["rules/bad.conf".into()], vec![]);
+        broken.id = "rules-failed-to-compile".into();
+        let off = site_with(WafMode::Off, vec!["rules/x.conf".into()], vec![]);
+        let mut bare = site_with(WafMode::Blocking, vec![], vec![]);
+        bare.id = "no-rules-at-all".into();
+
+        let cfg = SentinelConfig {
+            sites: vec![broken, off, bare],
+            ..Default::default()
+        };
+        let empty = RuleEngineMap::new();
+        let listed = unprotected_sites(&cfg, &empty);
+
+        assert_eq!(
+            listed,
+            vec!["rules-failed-to-compile".to_string()],
+            "only a site that EXPECTS an engine and lacks one is unprotected; \
+             mode:off and no-rules sites legitimately have none"
         );
     }
 }
