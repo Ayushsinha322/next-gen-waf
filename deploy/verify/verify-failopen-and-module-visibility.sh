@@ -100,7 +100,7 @@ BODY=$(hz)
 if [ -z "$BODY" ]; then
   bad "/healthz not reachable on waf1:9443 — cannot judge module visibility"
 else
-  for key in threat_intel modules smuggling graphql ja4 good_bot_allowed_unverified; do
+  for key in threat_intel modules smuggling graphql ja4 good_bot_allowlisted; do
     case "$BODY" in
       *"\"$key\""*) ok "/healthz carries \"$key\"" ;;
       *) bad "/healthz is missing \"$key\" — the running image predates this change" ;;
@@ -198,7 +198,7 @@ GQ=$(hzsum modules.graphql.inspected)
 GR=$(hzsum modules.grpc.inspected)
 JA=$(hzsum modules.ja4.attempts)
 JS=$(hzsum modules.ja4.success)
-GB=$(hzsum modules.bot.good_bot_allowed_unverified)
+GB=$(hzsum modules.bot.good_bot_allowlisted)
 BJ=$(hzfield modules.bot.ja4_fingerprints)
 AP=$(hzfield modules.bot.attacker_ua_patterns)
 printf "    fleet totals: smuggling.evaluated=%s graphql.inspected=%s grpc.inspected=%s\n" "$SM" "$GQ" "$GR"
