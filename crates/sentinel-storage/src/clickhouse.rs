@@ -117,11 +117,29 @@ pub struct WafEventRow {
     /// Human-readable explanation of the verdict, as written to waf.log.
     #[serde(default)]
     pub explanation: String,
+    /// JA4 TLS fingerprint of the client (`t…` over TCP, `q…` over QUIC), or
+    /// empty for plaintext / no fingerprint. This is the value that drove the
+    /// malicious-JA4 bot signal and the JA4 blocklist — without it on the row, a
+    /// JA4-based block cannot be audited after the fact. `#[serde(default)]`
+    /// keeps rows written before the column existed deserializable.
+    #[serde(default)]
+    pub ja4: String,
 }
 
 // ---------------------------------------------------------------------------
 // ClickHouseClient
 // ---------------------------------------------------------------------------
+
+/// Every column the event INSERT names — and it MUST list every serialised
+/// field of [`WafEventRow`], because the body is `FORMAT JSONEachRow` from
+/// `serde_json::to_string(row)` and ClickHouse rejects a JSON key that is not
+/// in the column list (`input_format_skip_unknown_fields` is off). A struct
+/// field added without a matching entry here therefore fails EVERY event
+/// insert at runtime while compiling clean. `every_serialised_field_is_an_insert_column`
+/// pins the two together.
+const WAF_EVENT_COLUMNS: &str = "ts, ip, country, site, tenant, method, path, query, \
+    referer, matched, rule, attack, action, severity, score, status, protocol, \
+    request_id, target, mode, threshold, explanation, ja4";
 
 pub struct ClickHouseClient {
     http: HyperClient,
@@ -456,7 +474,7 @@ impl ClickHouseClient {
               action LowCardinality(String), severity LowCardinality(String), \
               score UInt32, status UInt16, protocol LowCardinality(String), \
               request_id String, target String, mode LowCardinality(String), \
-              threshold UInt32, explanation String) \
+              threshold UInt32, explanation String, ja4 LowCardinality(String)) \
              ENGINE = MergeTree() \
              PARTITION BY toYYYYMMDD(ts) \
              ORDER BY (site, ts) \
@@ -503,6 +521,11 @@ impl ClickHouseClient {
             "query String",
             "referer String",
             "matched String",
+            // The client's JA4 (2026-09): the fingerprint that drives bot scoring
+            // and the JA4 blocklist was never stored, so a block it caused could
+            // not be explained from the row. LowCardinality: a fleet sees a few
+            // thousand distinct fingerprints, not one per request.
+            "ja4 LowCardinality(String)",
         ] {
             self.exec(format!(
                 "ALTER TABLE {db}.waf_events ADD COLUMN IF NOT EXISTS {col} DEFAULT {default}",
@@ -546,12 +569,9 @@ impl ClickHouseClient {
             return Ok(());
         }
         let mut sql = format!(
-            "INSERT INTO {db}.waf_events \
-             (ts, ip, country, site, tenant, method, path, query, referer, matched, \
-              rule, attack, action, severity, score, status, protocol, \
-              request_id, target, mode, threshold, explanation) \
-             FORMAT JSONEachRow\n",
-            db = self.database
+            "INSERT INTO {db}.waf_events ({cols}) FORMAT JSONEachRow\n",
+            db = self.database,
+            cols = WAF_EVENT_COLUMNS,
         );
         for row in rows {
             sql.push_str(&serde_json::to_string(row)?);
@@ -587,7 +607,7 @@ impl ClickHouseClient {
         }
         let sql = format!(
             "SELECT toUnixTimestamp(ts) AS ts, ip, country, site, method, path, \
-             rule, attack, action, severity, score, status, protocol \
+             rule, attack, action, severity, score, status, protocol, ja4 \
              FROM {db}.waf_events WHERE {where_} \
              ORDER BY ts DESC LIMIT {limit} \
              SETTINGS output_format_json_quote_64bit_integers = 0 \
@@ -903,6 +923,67 @@ mod tests {
             mode: "blocking".into(),
             threshold: 5,
             explanation: "BLOCKED on 'TESTSITE.example': SQL injection in parameter 'id'.".into(),
+            ja4: String::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod insert_column_pinning {
+    use super::*;
+
+    /// A `WafEventRow` field with no INSERT column fails every event insert at
+    /// runtime and compiles clean — the worst kind of schema drift. This pins the
+    /// serialised field set to the column list, both ways.
+    #[test]
+    fn every_serialised_field_is_an_insert_column() {
+        let row = WafEventRow {
+            ts: 0,
+            ip: String::new(),
+            country: String::new(),
+            site: String::new(),
+            tenant: String::new(),
+            method: String::new(),
+            path: String::new(),
+            query: String::new(),
+            referer: String::new(),
+            matched: String::new(),
+            rule: String::new(),
+            attack: String::new(),
+            action: String::new(),
+            severity: String::new(),
+            score: 0,
+            status: 0,
+            protocol: String::new(),
+            request_id: String::new(),
+            target: String::new(),
+            mode: String::new(),
+            threshold: 0,
+            explanation: String::new(),
+            ja4: String::new(),
+        };
+        let json = serde_json::to_value(&row).expect("serialise");
+        let mut fields: Vec<&str> = json
+            .as_object()
+            .expect("row serialises to an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort_unstable();
+
+        let mut cols: Vec<&str> = WAF_EVENT_COLUMNS
+            .split(',')
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .collect();
+        cols.sort_unstable();
+
+        assert_eq!(
+            fields, cols,
+            "WafEventRow's serialised fields and WAF_EVENT_COLUMNS have drifted. A field \
+             without a column makes ClickHouse reject EVERY event insert; a column without \
+             a field is a silent NULL/default. Fix both sides together, and add the column \
+             to ensure_schema's ADD COLUMN list."
+        );
     }
 }

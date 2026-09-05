@@ -387,6 +387,11 @@ export interface WafEvent {
   /** Plain-English explanation written when the event was recorded. Absent on
    *  rows stored before the explain-the-verdict change. */
   explanation?: string;
+  /** JA4 TLS fingerprint of the client (`t…` TCP, `q…` QUIC). The value that
+   *  drove the malicious-JA4 bot signal and the JA4 blocklist — the field that
+   *  makes a JA4-based block explainable. Absent on rows stored before it was
+   *  recorded, and for plaintext requests. */
+  ja4?: string;
 }
 
 /** One configuration rollback point (control-plane db.ConfigVersionSummary). */

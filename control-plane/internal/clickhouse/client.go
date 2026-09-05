@@ -194,6 +194,11 @@ type Event struct {
 	Mode        string `json:"mode"`
 	Threshold   int    `json:"threshold"`
 	Explanation string `json:"explanation"`
+	// JA4 TLS fingerprint of the client (t… TCP, q… QUIC), empty for plaintext
+	// or rows stored before it was recorded. The value that drove the
+	// malicious-JA4 bot signal and the JA4 blocklist — without it, a block it
+	// caused could not be explained from the row.
+	JA4 string `json:"ja4"`
 }
 
 type TimelineBucket struct {
@@ -341,8 +346,8 @@ func (c *Client) searchWhere(f SearchFilter) []string {
 			"(positionCaseInsensitive(path, '%s') > 0 OR positionCaseInsensitive(attack, '%s') > 0 "+
 				"OR positionCaseInsensitive(explanation, '%s') > 0 "+
 				"OR positionCaseInsensitive(query, '%s') > 0 OR positionCaseInsensitive(matched, '%s') > 0 "+
-				"OR rule = '%s' OR request_id = '%s')",
-			q, q, q, q, q, q, q))
+				"OR rule = '%s' OR request_id = '%s' OR ja4 = '%s')",
+			q, q, q, q, q, q, q, q))
 	}
 	return where
 }
@@ -356,7 +361,7 @@ func (c *Client) Search(ctx context.Context, f SearchFilter) ([]Event, error) {
 	sql := fmt.Sprintf(
 		"SELECT toUnixTimestamp(ts) AS ts, ip, country, site, method, path, query, referer, matched, "+
 			"rule, attack, action, severity, score, status, protocol, "+
-			"request_id, target, mode, threshold, explanation "+
+			"request_id, target, mode, threshold, explanation, ja4 "+
 			"FROM %s.waf_events WHERE %s ORDER BY ts DESC LIMIT %d",
 		c.db, strings.Join(where, " AND "), limit)
 	var out []Event
@@ -386,7 +391,7 @@ func (c *Client) FindBySupportID(ctx context.Context, tenant, supportID string) 
 	sql := fmt.Sprintf(
 		"SELECT toUnixTimestamp(ts) AS ts, ip, country, site, method, path, query, referer, matched, "+
 			"rule, attack, action, severity, score, status, protocol, "+
-			"request_id, target, mode, threshold, explanation "+
+			"request_id, target, mode, threshold, explanation, ja4 "+
 			"FROM %s.waf_events WHERE %s AND %s ORDER BY ts DESC LIMIT 25",
 		c.db, eq("tenant", tenant), eq("request_id", id))
 	var out []Event
@@ -618,7 +623,7 @@ func (c *Client) RecentThreatIntelBlocks(ctx context.Context, tenant string, fro
 // single most common complaint about exported WAF logs.
 const exportColumns = `formatDateTime(ts, '%Y-%m-%dT%H:%i:%SZ', 'UTC') AS timestamp_utc, ` +
 	`ip, country, site, method, path, query, referer, matched, rule, attack, action, severity, score, status, ` +
-	`protocol, request_id, target, mode, threshold, explanation`
+	`protocol, request_id, target, mode, threshold, explanation, ja4`
 
 // ExportFormat maps a requested format onto its ClickHouse FORMAT clause, MIME
 // type and file extension. Whitelisted — the format string reaches SQL.
