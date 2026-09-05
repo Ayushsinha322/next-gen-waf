@@ -34,6 +34,17 @@ webpki-roots = "1"
 quinn = { workspace = true }
 h3 = { workspace = true }
 h3-quinn = { workspace = true }
+# Named directly, NOT reached through `quinn::proto`: quinn renames its own
+# dependency (`[dependencies.proto] package = "quinn-proto"`), so that path does
+# not exist. Needed only to name `TransportParameters` in the `crypto::Session`
+# decorator's `start_session` signature — see src/ja4_quic.rs.
+#
+# Pinned to the exact version already in Cargo.lock: resolving a second
+# quinn-proto would make `impl quinn::crypto::ServerConfig` reference a
+# DIFFERENT trait, and the error message for that is deeply unhelpful.
+# `default-features = false` is load-bearing — quinn-proto's defaults include
+# `bloom = ["dep:fastbloom"]`, and fastbloom is absent from our lock.
+quinn-proto = { version = "0.11.15", default-features = false, features = ["rustls-ring"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "tls12", "webpki-roots"] }
 arc-swap = { workspace = true }
 dashmap = { workspace = true }

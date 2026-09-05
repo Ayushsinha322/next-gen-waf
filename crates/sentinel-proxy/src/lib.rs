@@ -25,6 +25,7 @@
 pub mod captcha;
 pub mod challenge;
 pub mod http3;
+pub(crate) mod ja4_quic;
 mod jwks;
 pub mod proxy_protocol;
 /// Continuous security-event feed to a SIEM (see the module docs for why the
@@ -76,11 +77,12 @@ use sentinel_telemetry::{
     graphql_inspected_total, grpc_inspected_total, history_shed_total, inc_active_connections,
     inc_blocked, inc_ebpf_drops, inc_history_shed, inc_load_shed_connections,
     inc_load_shed_requests, inc_log_lines_dropped, inc_requests, inc_rule_hits, ja4_attempts_total,
-    ja4_no_hello_total, ja4_success_total, note_good_bot_allowed, note_graphql_blocked,
-    note_graphql_inspected, note_grpc_inspected, note_ja4_attempt, note_ja4_no_hello,
-    note_ja4_success, note_smuggling_evaluated, note_smuggling_rejected_framing,
-    note_smuggling_rejected_header, observe_duration, prometheus_text, smuggling_evaluated_total,
-    smuggling_rejected_framing_total, smuggling_rejected_header_total,
+    ja4_h3_absent_total, ja4_h3_attempts_total, ja4_h3_success_total, ja4_no_hello_total,
+    ja4_success_total, note_good_bot_allowed, note_graphql_blocked, note_graphql_inspected,
+    note_grpc_inspected, note_ja4_attempt, note_ja4_no_hello, note_ja4_success,
+    note_smuggling_evaluated, note_smuggling_rejected_framing, note_smuggling_rejected_header,
+    observe_duration, prometheus_text, smuggling_evaluated_total, smuggling_rejected_framing_total,
+    smuggling_rejected_header_total,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Semaphore};
@@ -6713,6 +6715,18 @@ fn health_response(state: &ServerState) -> Response<BoxBody> {
                 "attempts": ja4_attempts_total(),
                 "success": ja4_success_total(),
                 "no_hello": ja4_no_hello_total(),
+                // h3 counted SEPARATELY on purpose. Folded together, a blind
+                // spot in one transport hides behind healthy coverage in the
+                // other — and h3 was blind for its entire existence while the
+                // TCP ratio looked fine. `absent` non-zero with `attempts`
+                // non-zero means h3 clients are reaching the pipeline
+                // unfingerprinted; if it equals `attempts`, the decorator is
+                // very likely not installed at all (see ja4_quic).
+                "h3": {
+                    "attempts": ja4_h3_attempts_total(),
+                    "success": ja4_h3_success_total(),
+                    "absent": ja4_h3_absent_total(),
+                },
             },
             "bot": {
                 "good_bot_allowed_unverified": bot_good_bot_allowed_total(),

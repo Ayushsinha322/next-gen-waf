@@ -511,6 +511,16 @@ struct WafMetrics {
     /// `ja4_attempts_total` so `success / attempts` is real coverage rather than
     /// a number dominated by traffic that was never a TLS client.
     pub ja4_no_hello_total: Counter,
+    /// HTTP/3 (QUIC) fingerprinting, counted SEPARATELY from the TCP path.
+    ///
+    /// Deliberately not folded into the TCP counters: a blind spot in one
+    /// transport would otherwise hide behind healthy coverage in the other, and
+    /// h3 was blind for its entire existence while TCP looked fine.
+    pub ja4_h3_attempts_total: Counter,
+    pub ja4_h3_success_total: Counter,
+    /// h3 connections that completed a handshake and yielded no fingerprint —
+    /// including the case where the decorator is not installed at all.
+    pub ja4_h3_absent_total: Counter,
     /// Requests allowed by the good-bot User-Agent allowlist. Reverse-DNS
     /// verification is still a TODO, so this counts unauthenticated trust —
     /// anyone may claim to be Googlebot.
@@ -599,6 +609,18 @@ impl WafMetrics {
             "sentinel_ja4_no_hello_total",
             "Connections that never sent a TLS handshake record (probes/scans), excluded from ja4_attempts_total",
         );
+        let ja4_h3_attempts_total = registry.register_counter(
+            "sentinel_ja4_h3_attempts_total",
+            "HTTP/3 connections whose TLS session was inspected for a JA4 fingerprint",
+        );
+        let ja4_h3_success_total = registry.register_counter(
+            "sentinel_ja4_h3_success_total",
+            "HTTP/3 connections that yielded a JA4 fingerprint",
+        );
+        let ja4_h3_absent_total = registry.register_counter(
+            "sentinel_ja4_h3_absent_total",
+            "HTTP/3 connections with no fingerprint (includes the decorator not being installed)",
+        );
         let bot_good_bot_allowed_total = registry.register_counter(
             "sentinel_bot_good_bot_allowed_total",
             "Requests allowed by the good-bot User-Agent allowlist, which is NOT reverse-DNS verified",
@@ -624,6 +646,9 @@ impl WafMetrics {
             ja4_attempts_total,
             ja4_success_total,
             ja4_no_hello_total,
+            ja4_h3_attempts_total,
+            ja4_h3_success_total,
+            ja4_h3_absent_total,
             bot_good_bot_allowed_total,
             registry,
         }
@@ -775,6 +800,26 @@ pub fn note_ja4_no_hello() {
 }
 pub fn ja4_no_hello_total() -> u64 {
     WAF_METRICS.ja4_no_hello_total.get()
+}
+
+/// One h3 connection inspected for a fingerprint, and whether it produced one.
+/// Always increments `attempts`; `success` or `absent` in addition.
+pub fn note_ja4_h3(success: bool) {
+    WAF_METRICS.ja4_h3_attempts_total.inc();
+    if success {
+        WAF_METRICS.ja4_h3_success_total.inc();
+    } else {
+        WAF_METRICS.ja4_h3_absent_total.inc();
+    }
+}
+pub fn ja4_h3_attempts_total() -> u64 {
+    WAF_METRICS.ja4_h3_attempts_total.get()
+}
+pub fn ja4_h3_success_total() -> u64 {
+    WAF_METRICS.ja4_h3_success_total.get()
+}
+pub fn ja4_h3_absent_total() -> u64 {
+    WAF_METRICS.ja4_h3_absent_total.get()
 }
 
 /// A request was allowed because its User-Agent claimed to be a known good bot.
