@@ -26,7 +26,9 @@ pub mod threat_intel;
 pub mod tls_fingerprint;
 
 pub use anti_ddos::{AntiDdos, DdosVerdict};
-pub use bot_detect::{BotDetector, BotScore, BotSignals, BotTier, BotVerdict};
+pub use bot_detect::{
+    good_bot_name, good_bot_verify_domains, BotDetector, BotScore, BotSignals, BotTier, BotVerdict,
+};
 pub use dlp::DlpEngine;
 pub use geoip::{GeoIp, GeoVerdict};
 pub use graphql::{inspect as inspect_graphql, GraphqlLimits};
