@@ -27,6 +27,7 @@ import (
 	"github.com/your-org/sentinel-waf/control-plane/internal/logs"
 	"github.com/your-org/sentinel-waf/control-plane/internal/nodehealth"
 	"github.com/your-org/sentinel-waf/control-plane/internal/rbac"
+	"github.com/your-org/sentinel-waf/control-plane/internal/settings"
 	"github.com/your-org/sentinel-waf/control-plane/internal/threatintel"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -237,6 +238,9 @@ func run() error {
 				if err := db.EnsurePluginSchema(ctx, pool); err != nil {
 					log.Warn("plugin schema ensure failed (non-fatal)", zap.Error(err))
 				}
+				if err := db.EnsureSettingsSchema(ctx, pool); err != nil {
+					log.Warn("global_settings schema bootstrap failed (Global Settings page will be read-only)", zap.Error(err))
+				}
 				if err := db.EnsureLogProfileSchema(ctx, pool); err != nil {
 					log.Warn("log profile schema ensure failed (non-fatal)", zap.Error(err))
 				}
@@ -346,15 +350,34 @@ func run() error {
 		// fresh set is built on every leadership acquisition (Stop closes each
 		// monitor's channel, so instances are single-use).
 		startMonitors := func() func() {
-			eng := alerting.New(store, hub, db.DevTenantID, db.DevAdminID, alertingConfigFromEnv(), log)
+			// Node-wide settings: DB override > env > default, re-read by each
+			// subsystem on its own tick, so a Global Settings edit is live within
+			// a minute and survives a restart. See internal/settings.
+			settingsNow := func() settings.Values {
+				sctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				defer cancel()
+				rows, err := store.ListSettings(sctx, db.DevTenantID, db.DevAdminID)
+				if err != nil {
+					rows = nil // env/default resolution still applies
+				}
+				return settings.Snapshot(settingsOverrides(rows))
+			}
+			eng := alerting.New(store, hub, db.DevTenantID, db.DevAdminID, alertingConfigFromSettings(settingsNow()), log)
+			eng.SetConfigSource(func() alerting.Config { return alertingConfigFromSettings(settingsNow()) })
 			eng.Start()
 			stops := []func(){eng.Stop}
-			if tiCfg := threatintel.ConfigFromEnv(); tiCfg.Enabled {
-				agg := threatintel.New(store, tiCfg, log)
-				agg.Start(ctx)
-				stops = append(stops, agg.Stop)
-			} else {
-				log.Info("threat-intel aggregator disabled (SENTINEL_THREATINTEL_ENABLED=false)")
+			// Always construct the aggregator: "enabled" is now an operator
+			// setting, and a subsystem that only exists when a boot-time env var
+			// said so cannot be switched on from the console.
+			tiCfg := threatIntelConfigFromSettings(threatintel.ConfigFromEnv(), settingsNow())
+			agg := threatintel.New(store, tiCfg, log)
+			agg.SetConfigSource(func() threatintel.Config {
+				return threatIntelConfigFromSettings(threatintel.ConfigFromEnv(), settingsNow())
+			})
+			agg.Start(ctx)
+			stops = append(stops, agg.Stop)
+			if !tiCfg.Enabled {
+				log.Info("threat-intel feed fetching disabled in settings (indicators already stored stay enforced)")
 			}
 			nm := nodehealth.New(store, eng, log)
 			nm.Start()
@@ -617,6 +640,11 @@ func run() error {
 		protected.POST("/alerts/:id/resolve", func(c *gin.Context) { handleResolveAlert(c, enforcer, store, hub, cl) })
 
 		// Notification channels (SOC integration: webhook / Slack / syslog / CEF).
+		// Node-wide operator settings (alert thresholds, threat-intel feeds) plus
+		// the data plane's read-only global config — the Global Settings page.
+		protected.GET("/settings/global", func(c *gin.Context) { handleGetGlobalSettings(c, enforcer, store) })
+		protected.PUT("/settings/global", func(c *gin.Context) { handlePutGlobalSettings(c, enforcer, store, hub, cl) })
+		protected.DELETE("/settings/global/:key", func(c *gin.Context) { handleDeleteGlobalSetting(c, enforcer, store, hub, cl) })
 		protected.GET("/notifications/channels", func(c *gin.Context) { handleListChannels(c, enforcer, store) })
 		protected.POST("/notifications/channels", func(c *gin.Context) { handleCreateChannel(c, enforcer, store, hub) })
 		protected.PUT("/notifications/channels/:id", func(c *gin.Context) { handleUpdateChannel(c, enforcer, store, hub) })
@@ -815,6 +843,45 @@ func alertingConfigFromEnv() alerting.Config {
 		// 30 min default; a negative value disables auto-resolve entirely.
 		AutoResolveAfter: autoResolveFromEnv(),
 	}
+}
+
+// alertingConfigFromSettings maps the resolved settings snapshot (DB > env >
+// default) onto the engine's Config. -1 for auto-resolve means disabled.
+func alertingConfigFromSettings(v settings.Values) alerting.Config {
+	ar := v.Int("alerting.auto_resolve_secs")
+	var auto time.Duration
+	switch {
+	case ar < 0:
+		auto = -1
+	case ar > 0:
+		auto = time.Duration(ar) * time.Second
+	}
+	return alerting.Config{
+		SpikeWindow:       v.Duration("alerting.window_secs"),
+		SpikeThreshold:    int(v.Int("alerting.spike_threshold")),
+		OffenderThreshold: int(v.Int("alerting.offender_threshold")),
+		Throttle:          v.Duration("alerting.throttle_secs"),
+		AutoResolveAfter:  auto,
+	}
+}
+
+// threatIntelConfigFromSettings overlays the operator-editable keys on the
+// env-derived base (HTTP timeout and user agent stay env-only).
+func threatIntelConfigFromSettings(base threatintel.Config, v settings.Values) threatintel.Config {
+	base.Enabled = v.Bool("threat_intel.enabled")
+	base.Interval = v.Duration("threat_intel.interval_secs")
+	feed := func(name string) string {
+		s := strings.TrimSpace(v.String(name))
+		if s == "" {
+			return "off"
+		}
+		return s
+	}
+	base.TorURL = feed("threat_intel.feed.tor")
+	base.FeodoURL = feed("threat_intel.feed.feodo")
+	base.URLhausURL = feed("threat_intel.feed.urlhaus")
+	base.STIXURL = feed("threat_intel.feed.stix")
+	return base
 }
 
 // autoResolveFromEnv reads SENTINEL_ALERT_AUTORESOLVE_SECS: unset/0 -> engine

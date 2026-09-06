@@ -369,6 +369,32 @@ export interface RuleInventory {
   totals: { compiled: number; enforced: number; dropped: number; disabled: number; hits_24h?: number };
 }
 
+/** One node-wide setting the console may edit (GET /settings/global). */
+export interface GlobalSetting {
+  key:          string;
+  group:        string;
+  type:         "int" | "bool" | "string";
+  description:  string;
+  env?:         string;
+  default:      unknown;
+  applies:      string;
+  unit?:        string;
+  value:        unknown;
+  /** Where the effective value came from. */
+  source:       "db" | "env" | "default";
+  updated_at?:  string;
+  updated_by?:  string | null;
+}
+
+export interface GlobalSettingsResponse {
+  editable:     GlobalSetting[];
+  groups:       string[];
+  db_available: boolean;
+  /** The data plane's own global config (listeners, TLS, logging, storage, eBPF,
+   *  limits), read-only: it is the node's configuration file. */
+  dataplane:    { reachable: boolean; error?: string; config?: Record<string, unknown> };
+}
+
 /** An installed WASM plugin (module bytes are never sent to the browser). */
 export interface Plugin {
   id:          string;
@@ -1031,6 +1057,15 @@ export const api = {
       ),
     ack:     (id: string) => apiFetch<{ ok: boolean }>(`/alerts/${id}/ack`,     { method: "POST" }),
     resolve: (id: string) => apiFetch<{ ok: boolean }>(`/alerts/${id}/resolve`, { method: "POST" }),
+  },
+
+  /** Node-wide operator settings — the Global Settings page. */
+  globalSettings: {
+    get:   () => apiFetch<GlobalSettingsResponse>("/settings/global"),
+    put:   (values: Record<string, unknown>) =>
+      apiFetch<{ editable: GlobalSetting[]; applied: string }>("/settings/global", { method: "PUT", body: JSON.stringify({ values }) }),
+    reset: (key: string) =>
+      apiFetch<{ editable: GlobalSetting[] }>(`/settings/global/${encodeURIComponent(key)}`, { method: "DELETE" }),
   },
 
   notifications: {

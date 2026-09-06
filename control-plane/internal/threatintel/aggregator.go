@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -34,6 +35,49 @@ type Aggregator struct {
 	interval time.Duration
 	log      *zap.Logger
 	done     chan struct{}
+
+	// configSource, when set, is consulted before every refresh so feed URLs,
+	// the interval and the enabled flag edited on the Global Settings page take
+	// effect without a restart. Enabled=false skips fetching but keeps the loop
+	// (and the already-stored indicators) alive.
+	mu           sync.Mutex
+	configSource func() Config
+	enabled      bool
+}
+
+// SetConfigSource installs a function returning the desired Config; see the
+// field comment. Safe to call before Start.
+func (a *Aggregator) SetConfigSource(fn func() Config) { a.configSource = fn }
+
+// reload applies the current configSource. Returns the (possibly new) interval.
+func (a *Aggregator) reload() time.Duration {
+	if a.configSource == nil {
+		return a.interval
+	}
+	cfg := a.configSource()
+	if cfg.Interval <= 0 {
+		cfg.Interval = time.Hour
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	newNames := namesOf(cfg.Sources())
+	oldNames := namesOf(a.sources)
+	if newNames != oldNames || cfg.Interval != a.interval || cfg.Enabled != a.enabled {
+		a.log.Info("threat-intel config applied", zap.Bool("enabled", cfg.Enabled),
+			zap.Duration("interval", cfg.Interval), zap.String("sources", newNames))
+	}
+	a.sources = cfg.Sources()
+	a.interval = cfg.Interval
+	a.enabled = cfg.Enabled
+	return a.interval
+}
+
+func namesOf(src []Source) string {
+	names := make([]string, len(src))
+	for i, s := range src {
+		names[i] = s.Name
+	}
+	return strings.Join(names, ",")
 }
 
 // New builds an Aggregator from config. Defaults are applied for zero values.
@@ -53,6 +97,7 @@ func New(store IOCStore, cfg Config, log *zap.Logger) *Aggregator {
 		ua:       cfg.UserAgent,
 		sources:  cfg.Sources(),
 		interval: cfg.Interval,
+		enabled:  true,
 		log:      log,
 		done:     make(chan struct{}),
 	}
@@ -60,6 +105,8 @@ func New(store IOCStore, cfg Config, log *zap.Logger) *Aggregator {
 
 // SourceNames lists the enabled feed names (for startup logging).
 func (a *Aggregator) SourceNames() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	names := make([]string, len(a.sources))
 	for i, s := range a.sources {
 		names[i] = s.Name
@@ -85,13 +132,13 @@ func (a *Aggregator) Stop() { close(a.done) }
 
 func (a *Aggregator) run(ctx context.Context) {
 	// Initial population shortly after boot (feeds can be slow; don't block).
-	if n, err := a.RefreshOnce(ctx); err != nil {
-		a.log.Warn("threat-intel initial refresh failed", zap.Error(err))
-	} else {
-		a.log.Info("threat-intel initial refresh complete", zap.Int("iocs", n))
-	}
+	a.reload()
+	a.refreshIfEnabled(ctx, "initial")
 
-	t := time.NewTicker(a.interval)
+	// The ticker follows the operator-set interval: a console edit is applied on
+	// the next tick, and the ticker is reset when the interval changed.
+	interval := a.interval
+	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
 		select {
@@ -100,12 +147,27 @@ func (a *Aggregator) run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if n, err := a.RefreshOnce(ctx); err != nil {
-				a.log.Warn("threat-intel refresh failed", zap.Error(err))
-			} else {
-				a.log.Info("threat-intel refresh complete", zap.Int("iocs", n))
+			if ni := a.reload(); ni != interval {
+				interval = ni
+				t.Reset(interval)
 			}
+			a.refreshIfEnabled(ctx, "scheduled")
 		}
+	}
+}
+
+func (a *Aggregator) refreshIfEnabled(ctx context.Context, why string) {
+	a.mu.Lock()
+	enabled := a.enabled
+	a.mu.Unlock()
+	if !enabled {
+		a.log.Info("threat-intel feed fetch skipped — disabled in settings", zap.String("run", why))
+		return
+	}
+	if n, err := a.RefreshOnce(ctx); err != nil {
+		a.log.Warn("threat-intel refresh failed", zap.Error(err), zap.String("run", why))
+	} else {
+		a.log.Info("threat-intel refresh complete", zap.Int("iocs", n), zap.String("run", why))
 	}
 }
 
@@ -121,9 +183,14 @@ func (a *Aggregator) RefreshOnce(ctx context.Context) (int, error) {
 		iocs []db.IOC
 		err  error
 	}
-	results := make([]result, len(a.sources))
+	// Snapshot the source list: reload() may swap it from the run loop while a
+	// caller-driven RefreshOnce is in flight.
+	a.mu.Lock()
+	sources := append([]Source(nil), a.sources...)
+	a.mu.Unlock()
+	results := make([]result, len(sources))
 	var wg sync.WaitGroup
-	for i, src := range a.sources {
+	for i, src := range sources {
 		wg.Add(1)
 		go func(i int, src Source) {
 			defer wg.Done()
@@ -166,7 +233,7 @@ func (a *Aggregator) RefreshOnce(ctx context.Context) (int, error) {
 	}
 
 	if okSources == 0 {
-		return 0, fmt.Errorf("all %d threat-intel sources failed", len(a.sources))
+		return 0, fmt.Errorf("all %d threat-intel sources failed", len(sources))
 	}
 
 	batch := make([]db.IOC, 0, len(merged))

@@ -53,6 +53,7 @@ const (
 	ResourceManagementTLS = "management_tls" // management-console TLS certificate
 	ResourceThreatIntel   = "threat_intel"   // threat-intelligence IOC corpus (node-global)
 	ResourceLogProfile    = "log_profile"    // saved log views + bulk log export
+	ResourceSettings      = "settings"       // node-wide operator settings (alert thresholds, feeds)
 )
 
 // Action verbs.
@@ -109,6 +110,8 @@ var rolePermissions = map[Role]map[string]struct{}{
 		perm(ResourceNotification, ActionUpdate):  {},
 		perm(ResourceNotification, ActionDelete):  {},
 		perm(ResourceNotification, ActionList):    {},
+		perm(ResourceSettings, ActionRead):        {},
+		perm(ResourceSettings, ActionUpdate):      {},
 		perm(ResourceThreatIntel, ActionCreate):   {},
 		perm(ResourceThreatIntel, ActionRead):     {},
 		perm(ResourceThreatIntel, ActionDelete):   {},
@@ -163,6 +166,8 @@ var rolePermissions = map[Role]map[string]struct{}{
 		perm(ResourceNotification, ActionUpdate):  {},
 		perm(ResourceNotification, ActionDelete):  {},
 		perm(ResourceNotification, ActionList):    {},
+		perm(ResourceSettings, ActionRead):        {},
+		perm(ResourceSettings, ActionUpdate):      {},
 		perm(ResourceThreatIntel, ActionCreate):   {},
 		perm(ResourceThreatIntel, ActionRead):     {},
 		perm(ResourceThreatIntel, ActionDelete):   {},
@@ -203,6 +208,7 @@ var rolePermissions = map[Role]map[string]struct{}{
 		perm(ResourceAlert, ActionList):         {},
 		perm(ResourceNotification, ActionRead):  {},
 		perm(ResourceNotification, ActionList):  {},
+		perm(ResourceSettings, ActionRead):      {},
 		perm(ResourceThreatIntel, ActionRead):   {},
 		perm(ResourceThreatIntel, ActionList):   {},
 		perm(ResourceAudit, ActionRead):         {},
@@ -231,6 +237,7 @@ var rolePermissions = map[Role]map[string]struct{}{
 		perm(ResourceAlert, ActionList):         {},
 		perm(ResourceNotification, ActionRead):  {},
 		perm(ResourceNotification, ActionList):  {},
+		perm(ResourceSettings, ActionRead):      {},
 		perm(ResourceThreatIntel, ActionRead):   {},
 		perm(ResourceThreatIntel, ActionList):   {},
 		perm(ResourceManagementTLS, ActionRead): {},
@@ -255,6 +262,7 @@ var rolePermissions = map[Role]map[string]struct{}{
 		perm(ResourceAlert, ActionList):         {},
 		perm(ResourceNotification, ActionRead):  {},
 		perm(ResourceNotification, ActionList):  {},
+		perm(ResourceSettings, ActionRead):      {},
 		perm(ResourceThreatIntel, ActionRead):   {},
 		perm(ResourceThreatIntel, ActionList):   {},
 		perm(ResourceAudit, ActionRead):         {},

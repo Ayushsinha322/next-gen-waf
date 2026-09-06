@@ -2633,6 +2633,9 @@ async fn handle_request(
         if req.method() == http::Method::GET && req.uri().path() == "/api/v1/internal/rules" {
             return Ok(rules_inventory_response(&state, req.uri().query()));
         }
+        if req.method() == http::Method::GET && req.uri().path() == "/api/v1/internal/settings" {
+            return Ok(global_settings_response(&state));
+        }
         return Ok(error_response(
             StatusCode::NOT_FOUND,
             "unknown internal endpoint",
@@ -6682,6 +6685,76 @@ fn json_err(status: StatusCode, message: &str) -> Response<BoxBody> {
         .unwrap()
 }
 
+/// `GET /api/v1/internal/settings` — this node's global configuration, minus
+/// sites and with secrets redacted, for the console's Global Settings page.
+///
+/// Listeners, TLS floor, HTTP/3, logging, storage, eBPF and admission limits
+/// come from the node's YAML and change only with a restart. Until this
+/// endpoint existed they were visible nowhere in the console; an operator had
+/// to ssh to the node to learn which ports it listened on. Read-only by design:
+/// the response says so, and the page repeats it.
+fn global_settings_response(state: &ServerState) -> Response<BoxBody> {
+    let cfg = state.config.load();
+    let mut v = serde_json::to_value(&**cfg).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(obj) = v.as_object_mut() {
+        obj.remove("sites");
+        obj.insert(
+            "version".into(),
+            serde_json::json!(env!("CARGO_PKG_VERSION")),
+        );
+        obj.insert(
+            "read_only".into(),
+            serde_json::json!("node configuration file — edit on the node and restart to change"),
+        );
+        obj.insert("site_count".into(), serde_json::json!(cfg.sites.len()));
+    }
+    redact_secrets(&mut v);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(full_body(Bytes::from(v.to_string())))
+        .unwrap()
+}
+
+/// Replace credential-bearing values in a config JSON tree: any key named like
+/// a secret, and the userinfo part of any URL (`redis://user:pw@host`).
+fn redact_secrets(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::Object(map) => {
+            for (k, val) in map.iter_mut() {
+                let kl = k.to_ascii_lowercase();
+                if kl.contains("password")
+                    || kl.contains("secret")
+                    || kl.contains("token")
+                    || kl == "api_key"
+                    || kl == "apikey"
+                {
+                    if !val.is_null() {
+                        *val = serde_json::Value::String("***".into());
+                    }
+                    continue;
+                }
+                redact_secrets(val);
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(redact_secrets),
+        serde_json::Value::String(s) => {
+            // scheme://user:pass@host → scheme://***@host
+            if let Some(scheme_end) = s.find("://") {
+                let rest = &s[scheme_end + 3..];
+                // Only an '@' inside the authority (before any '/') is userinfo.
+                let authority_end = rest.find('/').unwrap_or(rest.len());
+                if let Some(at) = rest[..authority_end].rfind('@') {
+                    if at > 0 {
+                        *s = format!("{}://***@{}", &s[..scheme_end], &rest[at + 1..]);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// `GET /api/v1/internal/rules[?site=<id>][&summary=1]` — the compiled rule
 /// inventory of every site engine on this node.
 ///
@@ -10720,6 +10793,43 @@ mod threat_intel_visibility_tests {
         assert_eq!(
             s["poller"], "not_started",
             "configured-but-not-running must be distinguishable from not-configured"
+        );
+    }
+}
+
+#[cfg(test)]
+mod global_settings_redaction_tests {
+    use super::redact_secrets;
+
+    #[test]
+    fn redacts_secret_keys_and_url_userinfo_but_keeps_paths() {
+        let mut v = serde_json::json!({
+            "storage": {
+                "timeseries": { "url": "http://ch:8123", "username": "u", "password": "pw" },
+                "kv": { "backend": "redis", "url": "redis://default:s3cr3t@redis:6379/0" }
+            },
+            "cluster": { "control_plane": { "endpoints": ["https://cp:9501"], "tls": { "key": "/etc/sentinel/tls.key" } } },
+            "logging": { "outputs": [{ "type": "otlp", "endpoint": "http://otel:4318/v1/logs", "auth_token": "abc" }] }
+        });
+        redact_secrets(&mut v);
+        assert_eq!(v["storage"]["timeseries"]["password"], "***");
+        assert_eq!(
+            v["storage"]["timeseries"]["username"], "u",
+            "usernames are not secrets"
+        );
+        assert_eq!(v["storage"]["kv"]["url"], "redis://***@redis:6379/0");
+        assert_eq!(
+            v["cluster"]["control_plane"]["endpoints"][0], "https://cp:9501",
+            "no userinfo → untouched"
+        );
+        assert_eq!(
+            v["cluster"]["control_plane"]["tls"]["key"], "/etc/sentinel/tls.key",
+            "a TLS key PATH is not a secret value"
+        );
+        assert_eq!(v["logging"]["outputs"][0]["auth_token"], "***");
+        assert_eq!(
+            v["logging"]["outputs"][0]["endpoint"],
+            "http://otel:4318/v1/logs"
         );
     }
 }

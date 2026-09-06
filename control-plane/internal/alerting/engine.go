@@ -57,11 +57,38 @@ type Engine struct {
 	// engine drop WAF events during an attack spike.
 	dispatchCh chan notify.Alert
 
+	// configSource, when set, is consulted once a minute so thresholds edited
+	// on the Global Settings page take effect without a restart.
+	configSource func() Config
+
 	done chan struct{}
 }
 
-// New constructs an Engine with defaults applied.
-func New(store *db.Store, hub *logs.Hub, tenantID, userID string, cfg Config, log *zap.Logger) *Engine {
+// SetConfigSource installs a function that returns the current desired Config
+// (from the settings store). Zero fields fall back to defaults exactly as in
+// New. Safe to call before Start.
+func (e *Engine) SetConfigSource(fn func() Config) { e.configSource = fn }
+
+// applyConfig swaps thresholds under the lock. Windows keep their history; the
+// new thresholds apply to the next event.
+func (e *Engine) applyConfig(cfg Config) {
+	cfg = withDefaults(cfg)
+	e.mu.Lock()
+	changed := cfg != e.cfg
+	e.cfg = cfg
+	e.mu.Unlock()
+	if changed {
+		e.log.Info("alert engine config applied",
+			zap.Int("spike_threshold", cfg.SpikeThreshold), zap.Int("offender_threshold", cfg.OffenderThreshold),
+			zap.Duration("window", cfg.SpikeWindow), zap.Duration("throttle", cfg.Throttle),
+			zap.Duration("auto_resolve", cfg.AutoResolveAfter))
+	}
+}
+
+// Config returns the thresholds currently in force.
+func (e *Engine) Config() Config { e.mu.Lock(); defer e.mu.Unlock(); return e.cfg }
+
+func withDefaults(cfg Config) Config {
 	if cfg.SpikeWindow == 0 {
 		cfg.SpikeWindow = 60 * time.Second
 	}
@@ -77,6 +104,12 @@ func New(store *db.Store, hub *logs.Hub, tenantID, userID string, cfg Config, lo
 	if cfg.AutoResolveAfter == 0 {
 		cfg.AutoResolveAfter = 30 * time.Minute
 	}
+	return cfg
+}
+
+// New constructs an Engine with defaults applied.
+func New(store *db.Store, hub *logs.Hub, tenantID, userID string, cfg Config, log *zap.Logger) *Engine {
+	cfg = withDefaults(cfg)
 	return &Engine{
 		store:      store,
 		hub:        hub,
@@ -151,6 +184,7 @@ func (e *Engine) onWaf(data json.RawMessage) {
 		return
 	}
 	now := time.Now()
+	cfg := e.Config()
 	sev := strings.ToLower(ev.Sev)
 	// Attribute the alert to the owning tenant (the proxy now tags every event
 	// with it); fall back to the default tenant for untagged events.
@@ -161,24 +195,24 @@ func (e *Engine) onWaf(data json.RawMessage) {
 
 	// Condition 1 — repeat offender: one IP blocked many times in the window.
 	if ev.IP != "" {
-		if n := e.bumpWindow(e.ipWindow, ev.IP, now); n >= e.cfg.OffenderThreshold {
+		if n := e.bumpWindow(e.ipWindow, ev.IP, now); n >= cfg.OffenderThreshold {
 			e.raiseForTenant(effTenant, "offender:"+ev.IP, db.CreateAlertRequest{
 				Severity: "high",
 				Kind:     "repeat_offender",
-				Summary:  fmt.Sprintf("IP %s blocked %d times in %s", ev.IP, n, e.cfg.SpikeWindow),
-				Details:  jsonObj(map[string]any{"ip": ev.IP, "count": n, "window": e.cfg.SpikeWindow.String(), "last_rule": ev.Rule}),
+				Summary:  fmt.Sprintf("IP %s blocked %d times in %s", ev.IP, n, cfg.SpikeWindow),
+				Details:  jsonObj(map[string]any{"ip": ev.IP, "count": n, "window": cfg.SpikeWindow.String(), "last_rule": ev.Rule}),
 			}, notify.Alert{Severity: "high", Kind: "repeat_offender", SourceIP: ev.IP, Rule: ev.Rule, Site: ev.Site, Count: n})
 		}
 	}
 
 	// Condition 2 — attack spike: a site sees a burst of blocks in the window.
 	if ev.Site != "" && ev.Site != "-" {
-		if n := e.bumpWindow(e.siteWindow, ev.Site, now); n >= e.cfg.SpikeThreshold {
+		if n := e.bumpWindow(e.siteWindow, ev.Site, now); n >= cfg.SpikeThreshold {
 			e.raiseForTenant(effTenant, "spike:"+ev.Site, db.CreateAlertRequest{
 				Severity: "critical",
 				Kind:     "attack_spike",
-				Summary:  fmt.Sprintf("Attack spike on %s — %d blocks in %s", ev.Site, n, e.cfg.SpikeWindow),
-				Details:  jsonObj(map[string]any{"site": ev.Site, "count": n, "window": e.cfg.SpikeWindow.String()}),
+				Summary:  fmt.Sprintf("Attack spike on %s — %d blocks in %s", ev.Site, n, cfg.SpikeWindow),
+				Details:  jsonObj(map[string]any{"site": ev.Site, "count": n, "window": cfg.SpikeWindow.String()}),
 			}, notify.Alert{Severity: "critical", Kind: "attack_spike", Site: ev.Site, Count: n})
 		}
 	}
@@ -334,10 +368,6 @@ var EventDrivenKinds = []string{
 // autoResolver closes stale event-driven alerts once a minute. See
 // db.Store.AutoResolveQuietAlerts for why this exists.
 func (e *Engine) autoResolver() {
-	if e.cfg.AutoResolveAfter < 0 {
-		e.log.Info("alert auto-resolve disabled")
-		return
-	}
 	t := time.NewTicker(time.Minute)
 	defer t.Stop()
 	for {
@@ -345,13 +375,22 @@ func (e *Engine) autoResolver() {
 		case <-e.done:
 			return
 		case <-t.C:
+			// Pick up console edits first, so a threshold change is live within
+			// a minute of being saved.
+			if e.configSource != nil {
+				e.applyConfig(e.configSource())
+			}
+			quiet := e.Config().AutoResolveAfter
+			if quiet < 0 {
+				continue // disabled by the operator
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-			n, err := e.store.AutoResolveQuietAlerts(ctx, e.tenantID, e.userID, EventDrivenKinds, e.cfg.AutoResolveAfter)
+			n, err := e.store.AutoResolveQuietAlerts(ctx, e.tenantID, e.userID, EventDrivenKinds, quiet)
 			cancel()
 			if err != nil {
 				e.log.Warn("alert auto-resolve failed", zap.Error(err))
 			} else if n > 0 {
-				e.log.Info("auto-resolved quiet alerts", zap.Int64("count", n), zap.Duration("quiet", e.cfg.AutoResolveAfter))
+				e.log.Info("auto-resolved quiet alerts", zap.Int64("count", n), zap.Duration("quiet", quiet))
 			}
 		}
 	}

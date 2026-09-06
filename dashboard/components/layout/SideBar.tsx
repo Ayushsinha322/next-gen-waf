@@ -116,6 +116,7 @@ const NAV = [
   { group: "SYSTEM", items: [
     { id: "cluster",  Icon: Icon.Cluster,  label: "Cluster" },
     { id: "audit",    Icon: Icon.Audit,    label: "Audit Log" },
+    { id: "global-settings", Icon: Icon.Settings, label: "Global Settings" },
     { id: "settings", Icon: Icon.Settings, label: "Settings" },
   ]},
 ];
