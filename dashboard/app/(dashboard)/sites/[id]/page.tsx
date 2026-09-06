@@ -10,14 +10,14 @@ import { useState, useEffect, useMemo, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
-import { api, type Site, type Certificate, type SiteStat, type LearningStat } from "@/lib/api";
+import { api, type Site, type Certificate, type SiteStat, type LearningStat, type EffectiveConfig } from "@/lib/api";
 import { staggerContainer, cardVariants, fadeUp } from "@/lib/animations";
 import SiteWizard from "@/components/sites/SiteWizard";
 import { siteToForm, type SiteForm, type PathOverride, CRS_REQUEST_CATEGORIES, ALL_CRS_RESPONSE_KEYS } from "@/lib/siteConfig";
 
 type WafRow = { ts: string; ip: string; rule: string; attack: string; sev: string; action: string };
 type AccessRow = { ts: string; ip: string; method: string; path: string; status: number; latency: number };
-type Tab = "overview" | "waf" | "access" | "learning" | "paths" | "cert";
+type Tab = "overview" | "waf" | "access" | "learning" | "paths" | "cert" | "config";
 
 const MODES = [
   { key: "off",      label: "Off",      desc: "WAF disabled — pass-through",         color: "var(--text3)" },
@@ -45,6 +45,14 @@ export default function SiteDetailPage() {
   const [learn, setLearn] = useState<LearningStat[]>([]);
   const [learnBusy, setLearnBusy] = useState<number | null>(null);
   const [tab, setTab] = useState<Tab>("overview");
+  // Pushed-vs-held config, fetched when the tab opens and on demand.
+  const [eff, setEff] = useState<EffectiveConfig | null>(null);
+  const [effErr, setEffErr] = useState<string | null>(null);
+  const loadEffective = useCallback(async () => {
+    try { setEff(await api.sites.effective(siteId)); setEffErr(null); }
+    catch (e) { setEffErr(e instanceof Error ? e.message : String(e)); }
+  }, [siteId]);
+  useEffect(() => { if (tab === "config") loadEffective(); }, [tab, loadEffective]);
   const [pathBusy, setPathBusy] = useState(false);
   const [busy, setBusy] = useState(false);
   const [editing, setEditing] = useState(false);
@@ -290,7 +298,7 @@ export default function SiteDetailPage() {
 
       {/* Tabs */}
       <motion.div variants={fadeUp} style={{ display: "flex", gap: 4, padding: 4, background: "var(--bg3)", borderRadius: 10, width: "fit-content" }}>
-        {([["overview", "🗂 Overview"], ["waf", "🛡️ WAF Logs"], ["access", "📡 Access Logs"], ["learning", "📚 Learning Report"], ["paths", "🛣 Path Policy"], ["cert", "🔐 Certificate"]] as [Tab, string][]).map(([k, label]) => (
+        {([["overview", "🗂 Overview"], ["waf", "🛡️ WAF Logs"], ["access", "📡 Access Logs"], ["learning", "📚 Learning Report"], ["paths", "🛣 Path Policy"], ["cert", "🔐 Certificate"], ["config", "🧾 Effective Config"]] as [Tab, string][]).map(([k, label]) => (
           <button key={k} onClick={() => setTab(k)} style={{
             padding: "7px 16px", borderRadius: 7, border: "none", cursor: "pointer", fontSize: 14, fontWeight: 600,
             background: tab === k ? "var(--cyan)" : "transparent", color: tab === k ? "#021018" : "var(--text2)",
@@ -580,6 +588,10 @@ export default function SiteDetailPage() {
           )}
 
           {/* CERTIFICATE */}
+          {tab === "config" && (
+            <EffectiveConfigPanel eff={eff} err={effErr} onRefresh={loadEffective} />
+          )}
+
           {tab === "cert" && (
             <div className="panel">
               <div className="ph"><div className="ptitle">TLS Certificate</div></div>
@@ -629,6 +641,119 @@ export default function SiteDetailPage() {
         )}
       </AnimatePresence>
     </motion.div>
+  );
+}
+
+/** Pushed vs held. Two JSON panes and the list of fields that differ, plus the
+ *  stored policy keys that never reach the data plane. Every silently-inert
+ *  defect found so far would have shown up here as a diff row or an ignored key. */
+function EffectiveConfigPanel({ eff, err, onRefresh }: { eff: EffectiveConfig | null; err: string | null; onRefresh: () => void }) {
+  const [showJSON, setShowJSON] = useState(false);
+  if (err) return <div className="code-block" style={{ borderLeft: "3px solid var(--red-b)" }}><span style={{ color: "var(--red-b)" }}>● COULD NOT LOAD</span> — {err}</div>;
+  if (!eff) return <Empty text="Comparing what the control plane pushes with what the data plane holds…" />;
+  const dp = eff.dataplane;
+  const diff = eff.diff ?? [];
+  // Three kinds of difference, in order of how much they matter: a value that
+  // differs, a field pushed but not held, and a field the data plane filled with
+  // a default because the control plane never sent it (the wizard does not model
+  // it yet). The last group is informational and starts collapsed.
+  const changed  = diff.filter(d => d.pushed !== "(not sent)" && d.applied !== "(not held)");
+  const notHeld  = diff.filter(d => d.applied === "(not held)");
+  const notSent  = diff.filter(d => d.pushed === "(not sent)");
+  const [showDefaults, setShowDefaults] = useState(false);
+  const clean = dp.reachable && eff.applied && changed.length === 0 && notHeld.length === 0 && eff.ignored_policy_keys.length === 0 && !eff.pushed_error;
+  const fmt = (v: unknown) => typeof v === "string" ? v : JSON.stringify(v);
+  const DiffTable = ({ rows, tone }: { rows: typeof diff; tone: string }) => (
+    <div className="tw" style={{ borderLeft: `3px solid ${tone}` }}>
+      <table>
+        <thead><tr><th>Field</th><th>Pushed by control plane</th><th>Held by data plane</th></tr></thead>
+        <tbody>
+          {rows.map(d => (
+            <tr key={d.path}>
+              <td style={{ fontFamily: "var(--font-mono)", fontSize: 12.5 }}>{d.path}</td>
+              <td className="td3" style={{ fontFamily: "var(--font-mono)", fontSize: 12.5, maxWidth: 320, wordBreak: "break-all", whiteSpace: "normal" }}>{fmt(d.pushed)}</td>
+              <td className="td3" style={{ fontFamily: "var(--font-mono)", fontSize: 12.5, maxWidth: 320, wordBreak: "break-all", whiteSpace: "normal" }}>{fmt(d.applied)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+      <div className="panel">
+        <div className="ph">
+          <div className="ptitle">Pushed vs held — {eff.site}</div>
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            {dp.engine && <span className="td3" style={{ fontSize: 12.5 }}>engine: {dp.engine.rules_enforced}/{dp.engine.rules_compiled} rules enforcing{dp.engine.rules_dropped ? ` · ${dp.engine.rules_dropped} dropped` : ""}</span>}
+            <button className="btn bg-btn btn-xs" onClick={() => setShowJSON(v => !v)}>{showJSON ? "Hide JSON" : "Show JSON"}</button>
+            <button className="btn bg-btn btn-xs" onClick={onRefresh}>⟳</button>
+          </div>
+        </div>
+        <div className="pb" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          <div className="td3" style={{ fontSize: 12.5, lineHeight: 1.5 }}>
+            <strong>Pushed</strong> is the exact structure this control plane sends to the data plane for this site — the same
+            conversion the config sync runs. <strong>Held</strong> is what the data plane reports it is applying right now.
+            A difference here is a control that is not doing what the console says.
+          </div>
+
+          {eff.pushed_error && (
+            <div className="code-block" style={{ borderLeft: "3px solid var(--red-b)" }}>
+              <span style={{ color: "var(--red-b)" }}>● THIS SITE CANNOT BE CONVERTED</span> — it is excluded from the sync and is not protected.{"\n"}{eff.pushed_error}
+            </div>
+          )}
+          {!dp.reachable && (
+            <div className="code-block" style={{ borderLeft: "3px solid var(--red-b)" }}>
+              <span style={{ color: "var(--red-b)" }}>● DATA PLANE UNREACHABLE</span> — nothing is known about what is held. {dp.error}
+            </div>
+          )}
+          {dp.reachable && eff.applied === null && (
+            <div className="code-block" style={{ borderLeft: "3px solid var(--red-b)" }}>
+              <span style={{ color: "var(--red-b)" }}>● NOT ON THE DATA PLANE</span> — the data plane does not hold this site at all.
+              {eff.status === "active" ? " It is listed as active here and is NOT being protected." : ` Expected: the site is ${eff.status}.`}
+            </div>
+          )}
+          {eff.ignored_policy_keys.length > 0 && (
+            <div className="code-block" style={{ borderLeft: "3px solid var(--amber)" }}>
+              <span style={{ color: "var(--amber)" }}>● {eff.ignored_policy_keys.length} STORED KEY{eff.ignored_policy_keys.length === 1 ? "" : "S"} NEVER REACH THE DATA PLANE</span>
+              {" — "}stored and echoed back to the console, but not in the conversion, so whatever they represent is inert:{"\n"}
+              {eff.ignored_policy_keys.join(", ")}
+            </div>
+          )}
+          {clean && (
+            <div className="code-block" style={{ borderLeft: "3px solid var(--green)" }}>
+              <span style={{ color: "var(--green)" }}>● IDENTICAL</span> — every field pushed is held with the same value, and every stored policy key is understood.
+            </div>
+          )}
+
+          {changed.length > 0 && (<>
+            <div style={{ color: "var(--red-b)", fontSize: 13, fontWeight: 600 }}>● {changed.length} field{changed.length === 1 ? "" : "s"} differ — the console is not showing what the data plane does</div>
+            <DiffTable rows={changed} tone="var(--red-b)" />
+          </>)}
+          {notHeld.length > 0 && (<>
+            <div style={{ color: "var(--red-b)", fontSize: 13, fontWeight: 600 }}>● {notHeld.length} field{notHeld.length === 1 ? "" : "s"} pushed but NOT held by the data plane</div>
+            <DiffTable rows={notHeld} tone="var(--red-b)" />
+          </>)}
+          {notSent.length > 0 && (
+            <div>
+              <button className="btn bg-btn btn-xs" onClick={() => setShowDefaults(v => !v)}>
+                {showDefaults ? "▾" : "▸"} {notSent.length} field{notSent.length === 1 ? "" : "s"} filled by data-plane defaults (never sent by the control plane)
+              </button>
+              {showDefaults && <div style={{ marginTop: 8 }}><DiffTable rows={notSent} tone="var(--amber)" /></div>}
+            </div>
+          )}
+
+          {showJSON && (
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+              <div><div className="td3" style={{ fontSize: 11, letterSpacing: ".04em", textTransform: "uppercase", marginBottom: 4 }}>pushed</div>
+                <pre className="code-block" style={{ maxHeight: 460, overflow: "auto", fontSize: 11.5 }}>{JSON.stringify(eff.pushed ?? null, null, 2)}</pre></div>
+              <div><div className="td3" style={{ fontSize: 11, letterSpacing: ".04em", textTransform: "uppercase", marginBottom: 4 }}>held{dp.version ? ` · data plane ${dp.version}` : ""}</div>
+                <pre className="code-block" style={{ maxHeight: 460, overflow: "auto", fontSize: 11.5 }}>{JSON.stringify(eff.applied ?? null, null, 2)}</pre></div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
   );
 }
 

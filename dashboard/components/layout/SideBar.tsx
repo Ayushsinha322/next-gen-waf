@@ -106,6 +106,7 @@ const NAV = [
     { id: "sites",   Icon: Icon.Sites,   label: "Sites" },
     { id: "rules",   Icon: Icon.Rules,   label: "Rules" },
     { id: "certificates", Icon: Icon.Certificates, label: "Certificates", badge: "TLS", badgeCls: "nb-g" },
+    { id: "blocked", Icon: Icon.ThreatIntel, label: "Blocked Sources" },
     { id: "plugins", Icon: Icon.Plugins, label: "Plugins" },
   ]},
   { group: "INTELLIGENCE", items: [
@@ -116,6 +117,7 @@ const NAV = [
   { group: "SYSTEM", items: [
     { id: "cluster",  Icon: Icon.Cluster,  label: "Cluster" },
     { id: "audit",    Icon: Icon.Audit,    label: "Audit Log" },
+    { id: "jobs",     Icon: Icon.Cluster,  label: "System Jobs" },
     { id: "global-settings", Icon: Icon.Settings, label: "Global Settings" },
     { id: "settings", Icon: Icon.Settings, label: "Settings" },
   ]},

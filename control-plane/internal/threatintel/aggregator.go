@@ -3,6 +3,7 @@ package threatintel
 import (
 	"context"
 	"fmt"
+	"github.com/your-org/sentinel-waf/control-plane/internal/jobs"
 	"io"
 	"net/http"
 	"strings"
@@ -43,6 +44,7 @@ type Aggregator struct {
 	mu           sync.Mutex
 	configSource func() Config
 	enabled      bool
+	job          *jobs.Job
 }
 
 // SetConfigSource installs a function returning the desired Config; see the
@@ -91,7 +93,7 @@ func New(store IOCStore, cfg Config, log *zap.Logger) *Aggregator {
 	if cfg.UserAgent == "" {
 		cfg.UserAgent = "SentinelWAF-CTI/1.0"
 	}
-	return &Aggregator{
+	a := &Aggregator{
 		store:    store,
 		client:   &http.Client{Timeout: cfg.HTTPTimeout},
 		ua:       cfg.UserAgent,
@@ -101,6 +103,13 @@ func New(store IOCStore, cfg Config, log *zap.Logger) *Aggregator {
 		log:      log,
 		done:     make(chan struct{}),
 	}
+	a.job = jobs.Register("threat-intel.refresh",
+		"Fetch every enabled indicator feed, merge into the corpus, purge expired indicators.",
+		cfg.Interval, func(ctx context.Context) (string, error) {
+			n, err := a.RefreshOnce(ctx)
+			return fmt.Sprintf("%d indicators upserted", n), err
+		})
+	return a
 }
 
 // SourceNames lists the enabled feed names (for startup logging).
@@ -162,13 +171,18 @@ func (a *Aggregator) refreshIfEnabled(ctx context.Context, why string) {
 	a.mu.Unlock()
 	if !enabled {
 		a.log.Info("threat-intel feed fetch skipped — disabled in settings", zap.String("run", why))
+		a.job.Track(func() (string, error) { return "skipped — disabled in settings", nil })
 		return
 	}
-	if n, err := a.RefreshOnce(ctx); err != nil {
-		a.log.Warn("threat-intel refresh failed", zap.Error(err), zap.String("run", why))
-	} else {
+	a.job.Track(func() (string, error) {
+		n, err := a.RefreshOnce(ctx)
+		if err != nil {
+			a.log.Warn("threat-intel refresh failed", zap.Error(err), zap.String("run", why))
+			return "", err
+		}
 		a.log.Info("threat-intel refresh complete", zap.Int("iocs", n), zap.String("run", why))
-	}
+		return fmt.Sprintf("%d indicators upserted", n), nil
+	})
 }
 
 // RefreshOnce fetches every enabled source concurrently, dedupes across sources,

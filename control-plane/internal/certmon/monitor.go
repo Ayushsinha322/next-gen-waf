@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/your-org/sentinel-waf/control-plane/internal/jobs"
 	"net/http"
 	"os"
 	"strconv"
@@ -44,6 +45,7 @@ type Monitor struct {
 	internalSecret string // X-Sentinel-Internal shared secret ("" = co-located dev)
 	interval       time.Duration
 	done           chan struct{}
+	job            *jobs.Job
 
 	// lastSev tracks the last severity bucket alerted per domain so each
 	// escalation level (medium -> high -> critical) fires once, not every tick.
@@ -78,6 +80,9 @@ func New(engine *alerting.Engine, baseURL, internalSecret string, log *zap.Logge
 
 // Start launches the check loop in its own goroutine.
 func (m *Monitor) Start() {
+	m.job = jobs.Register("certificates.expiry-check",
+		"Read every certificate the data plane holds and alert on those expiring soon.",
+		m.interval, func(ctx context.Context) (string, error) { return m.tickTracked(ctx) })
 	m.log.Info("cert-expiry monitor started",
 		zap.Duration("interval", m.interval),
 		zap.String("data_plane", m.baseURL))
@@ -105,7 +110,17 @@ func (m *Monitor) loop() {
 func (m *Monitor) tickOnce() {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
+	m.job.Track(func() (string, error) { return m.tickTracked(ctx) })
+}
+
+// tickTracked runs one check and reports what it saw, for the jobs registry.
+func (m *Monitor) tickTracked(ctx context.Context) (string, error) {
+	certs, err := m.fetchCerts(ctx)
+	if err != nil {
+		return "", err
+	}
 	m.tick(ctx)
+	return fmt.Sprintf("%d certificates checked", len(certs)), nil
 }
 
 // certEntry is the subset of the data plane's CertMeta JSON we need.

@@ -382,6 +382,43 @@ impl CorrelationEngine {
         rec.last_block_at.store(now as usize, Ordering::Relaxed);
     }
 
+    /// Every IP with blocks inside the current window, most-blocked first:
+    /// `(ip, blocks_in_window, last_block_unix)`. For the Blocked Sources page.
+    fn offenders(&self) -> Vec<(IpAddr, u32, u64)> {
+        let now = unix_now_secs();
+        let mut out: Vec<(IpAddr, u32, u64)> = self
+            .state
+            .iter()
+            .filter_map(|e| {
+                let last = e.value().last_block_at.load(Ordering::Relaxed) as u64;
+                if now.saturating_sub(last) > self.window_secs {
+                    return None;
+                }
+                Some((
+                    *e.key(),
+                    e.value().blocks.load(Ordering::Relaxed) as u32,
+                    last,
+                ))
+            })
+            .collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
+        out
+    }
+
+    /// Drop an IP's history so it is no longer escalated or counted toward the
+    /// auto-ban threshold. Returns whether anything was tracked.
+    fn forget(&self, ip: IpAddr) -> bool {
+        self.state.remove(&ip).is_some()
+    }
+
+    fn window(&self) -> u64 {
+        self.window_secs
+    }
+
+    fn escalate_threshold(&self) -> usize {
+        self.escalate_threshold
+    }
+
     /// Remove entries older than the window.  Call periodically.
     fn gc(&self) {
         let now = unix_now_secs();
@@ -1353,6 +1390,7 @@ impl ProxyServer {
                         // discover the change on its next 5s tick. That poll is
                         // what made the fail-open window as long as it was.
                         reload_notify.notify_one();
+                        CONFIG_VERSION_APPLIED.store(sync.version, Ordering::Relaxed);
                         last_version = sync.version;
                         info!(version = last_version, sites = count, "sites hot-synced");
                     }
@@ -1768,6 +1806,9 @@ impl ProxyServer {
         if let Some(sync_url) = cfg.cluster.sync_url.clone() {
             let hb_cfg = Arc::clone(&state.config);
             let hb_pool = Arc::clone(&state.upstream_pool);
+            let hb_engines = Arc::clone(&state.engines);
+            let hb_ebpf = Arc::clone(&state.ebpf);
+            let hb_modules = Arc::clone(&state.modules);
             // Resolve the node identity once (the configured id defaults to the
             // literal "auto", which we resolve from env / hostname).
             let node_id = if cfg.cluster.node_id != "auto" {
@@ -1830,6 +1871,16 @@ impl ProxyServer {
                             "upstreams_healthy": pool.healthy,
                             "upstreams_total": pool.total,
                             "http3_enabled": http3_enabled,
+                            // Per-node drill-down for the cluster page: which config
+                            // version this node applied (stale-node detection), how
+                            // many rules it compiled, and what its own bans/feeds hold.
+                            "config_version_applied": CONFIG_VERSION_APPLIED.load(Ordering::Relaxed),
+                            "rules_compiled": hb_engines.load().values().map(|e| e.rule_count()).sum::<usize>(),
+                            "rules_enforced": hb_engines.load().values().map(|e| e.inventory().enforced).sum::<usize>(),
+                            "ebpf_mode": hb_ebpf.mode().to_string(),
+                            "ebpf_drops": hb_ebpf.ebpf_drops(),
+                            "threat_intel_entries": hb_modules.threat_intel.load().entry_count(),
+                            "threat_intel_version": hb_modules.threat_intel.load().version(),
                             // Ground truth for which operator-authored rules are
                             // actually compiled and running on THIS node. The
                             // control plane cannot derive this — it has no SRL
@@ -2635,6 +2686,21 @@ async fn handle_request(
         }
         if req.method() == http::Method::GET && req.uri().path() == "/api/v1/internal/settings" {
             return Ok(global_settings_response(&state));
+        }
+        if req.method() == http::Method::GET && req.uri().path() == "/api/v1/internal/blocks" {
+            return Ok(blocks_response(&state));
+        }
+        if req.method() == http::Method::GET {
+            if let Some(rest) = req.uri().path().strip_prefix("/api/v1/internal/sites/") {
+                if let Some(site_id) = rest.strip_suffix("/config") {
+                    return Ok(site_effective_config_response(&state, site_id));
+                }
+            }
+        }
+        if req.method() == http::Method::DELETE {
+            if let Some(ip) = req.uri().path().strip_prefix("/api/v1/internal/blocks/") {
+                return Ok(unblock_response(&state, ip.trim_end_matches('/')));
+            }
         }
         return Ok(error_response(
             StatusCode::NOT_FOUND,
@@ -4656,6 +4722,10 @@ static ENGINES_WARMING: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 // config sync or the heartbeat, this failure looks exactly like a world with no
 // attackers.
 static TI_POLLER_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The control-plane config version this node most recently APPLIED (0 = never
+/// synced). Reported in the heartbeat so the cluster page can flag a node that
+/// is still running an older configuration than the control plane holds.
+static CONFIG_VERSION_APPLIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// HTTP status of the most recent sync attempt; 0 = no attempt has completed.
 /// A 403 here means the shared secret does not match and this node's IOC set is
 /// frozen — which previously produced no log line at all, because the status was
@@ -6585,14 +6655,16 @@ async fn handle_internal_mgmt_tls_api(
 
     if method == hyper::Method::GET {
         return match state.cert_manager.store.get_meta(tls::MANAGEMENT_CERT_KEY) {
-            Some(m) => {
+            // The persisted self-signed fallback now lives under this key too, so
+            // "present" no longer means "an operator installed a certificate".
+            Some(m) if !matches!(m.source, tls::CertSource::SelfSigned) => {
                 let mut v = serde_json::to_value(&m).unwrap_or_else(|_| serde_json::json!({}));
                 if let Some(obj) = v.as_object_mut() {
                     obj.insert("self_signed".to_string(), serde_json::json!(false));
                 }
                 json_ok(v)
             }
-            None => json_ok(serde_json::json!({"self_signed": true})),
+            _ => json_ok(serde_json::json!({"self_signed": true})),
         };
     }
 
@@ -6682,6 +6754,158 @@ fn json_err(status: StatusCode, message: &str) -> Response<BoxBody> {
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")
         .body(full_body(Bytes::from(body)))
+        .unwrap()
+}
+
+/// `GET /api/v1/internal/sites/{id}/config` — the site configuration THIS node is
+/// actually applying, secrets redacted, plus the compiled rule count for it.
+///
+/// The control plane converts a stored site into this shape and pushes it; the
+/// console shows both side by side. Every one of the six "silently inert" bugs
+/// was a control the console showed that never reached this struct, and a
+/// diff between what was pushed and what is held would have found each of them
+/// in minutes.
+fn site_effective_config_response(state: &ServerState, site_id: &str) -> Response<BoxBody> {
+    let site_id = match percent_decode_simple(site_id) {
+        Some(s) => s,
+        None => return json_err(StatusCode::BAD_REQUEST, "bad site id"),
+    };
+    let cfg = state.config.load();
+    let Some(site) = cfg.sites.iter().find(|s| s.id == site_id) else {
+        return json_err(StatusCode::NOT_FOUND, "no such site on this node");
+    };
+    let mut v = serde_json::to_value(site).unwrap_or_else(|_| serde_json::json!({}));
+    redact_secrets(&mut v);
+    let engines = state.engines.load();
+    let engine = engines.get(&site_id).map(|e| {
+        let inv = e.inventory();
+        serde_json::json!({
+            "rules_compiled": inv.total,
+            "rules_enforced": inv.enforced,
+            "rules_dropped": inv.dropped.len(),
+        })
+    });
+    let body = serde_json::json!({
+        "site": site_id,
+        "version": env!("CARGO_PKG_VERSION"),
+        "applied": v,
+        "engine": engine,
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(full_body(Bytes::from(body.to_string())))
+        .unwrap()
+}
+
+/// Minimal `%XX` decoding for a path segment (site ids are slugs or host names,
+/// but a name with a space or unicode arrives encoded).
+fn percent_decode_simple(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = bytes.get(i + 1..i + 3)?;
+            out.push(u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// `GET /api/v1/internal/blocks` — every source THIS node is currently
+/// dropping or escalating on its own initiative: XDP auto-bans, the eBPF
+/// blocklist (auto-bans plus operator CIDRs seeded from ip_reputation), and the
+/// repeat-offender table for the current correlation window.
+///
+/// Threat-intel indicators and GeoIP country blocks are control-plane state and
+/// are merged there; this is the part only the data plane knows. Until this
+/// endpoint existed an auto-banned IP appeared nowhere in the console, and the
+/// only way to lift the ban was a restart.
+fn blocks_response(state: &ServerState) -> Response<BoxBody> {
+    let ab = autoban_config();
+    let (ebpf_ips, ebpf_ranges) = state.ebpf.blocked_entries();
+    let autobanned: Vec<String> = {
+        let mut v: Vec<std::net::IpAddr> = xdp_autobanned().iter().map(|e| *e).collect();
+        v.sort();
+        v.into_iter().map(|ip| ip.to_string()).collect()
+    };
+    let corr = &state.modules.correlation;
+    let offenders: Vec<serde_json::Value> = corr
+        .offenders()
+        .into_iter()
+        .map(|(ip, blocks, last)| {
+            serde_json::json!({
+                "ip": ip.to_string(),
+                "blocks_in_window": blocks,
+                "last_block_unix": last,
+                "escalated": blocks as usize >= corr.escalate_threshold(),
+                "autoban_pending": ab.enabled && (blocks < ab.threshold_blocks)
+                    && autoban_eligible(ip, ab.include_private),
+            })
+        })
+        .collect();
+    let body = serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "ebpf": {
+            "mode": state.ebpf.mode().to_string(),
+            "drops": state.ebpf.ebpf_drops(),
+            "exact_ips": ebpf_ips.iter().map(|ip| ip.to_string()).collect::<Vec<_>>(),
+            "ranges": ebpf_ranges.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+        },
+        "autoban": {
+            "enabled": ab.enabled,
+            "threshold_blocks": ab.threshold_blocks,
+            "include_private": ab.include_private,
+            "window_secs": corr.window(),
+            "banned": autobanned,
+        },
+        "offenders": {
+            "window_secs": corr.window(),
+            "escalate_threshold": corr.escalate_threshold(),
+            "entries": offenders,
+        },
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(full_body(Bytes::from(body.to_string())))
+        .unwrap()
+}
+
+/// `DELETE /api/v1/internal/blocks/{ip}` — lift this node's own block on one
+/// address: out of the auto-ban set, out of the eBPF blocklist, and out of the
+/// repeat-offender table so it is not re-banned on its next request. A CIDR
+/// seeded from site policy is not touched (change the policy instead), and the
+/// response says whether such a range still covers the address.
+fn unblock_response(state: &ServerState, raw: &str) -> Response<BoxBody> {
+    let Ok(ip) = raw.parse::<std::net::IpAddr>() else {
+        return json_err(StatusCode::BAD_REQUEST, "not an IP address");
+    };
+    let was_autobanned = xdp_autobanned().remove(&ip).is_some();
+    let (before_ips, ranges) = state.ebpf.blocked_entries();
+    let was_ebpf = before_ips.contains(&ip);
+    state.ebpf.unblock_ip(ip);
+    let forgot = state.modules.correlation.forget(ip);
+    let still_in_range = ranges.iter().any(|n| n.contains(&ip));
+    if was_autobanned || was_ebpf || forgot {
+        warn!(%ip, was_autobanned, was_ebpf, forgot, "operator lifted block");
+    }
+    let body = serde_json::json!({
+        "ip": ip.to_string(),
+        "was_autobanned": was_autobanned,
+        "was_in_ebpf_blocklist": was_ebpf,
+        "offender_history_cleared": forgot,
+        "still_covered_by_range": still_in_range,
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(full_body(Bytes::from(body.to_string())))
         .unwrap()
 }
 

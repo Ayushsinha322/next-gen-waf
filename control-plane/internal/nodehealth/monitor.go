@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/your-org/sentinel-waf/control-plane/internal/jobs"
 	"os"
 	"strconv"
 	"time"
@@ -45,6 +46,7 @@ type Monitor struct {
 	log       *zap.Logger
 	downAfter time.Duration
 	done      chan struct{}
+	job       *jobs.Job
 
 	// In-memory transition state (single monitor goroutine — no locking needed).
 	dpPrev map[string]string // data-plane node id -> last effective status
@@ -74,6 +76,9 @@ func New(store *db.Store, engine *alerting.Engine, log *zap.Logger) *Monitor {
 
 // Start launches the health-check loop in its own goroutine.
 func (m *Monitor) Start() {
+	m.job = jobs.Register("nodes.health-sweep",
+		"Mark data-plane nodes that stopped heart-beating as down and alert on transitions.",
+		tickInterval, func(ctx context.Context) (string, error) { return m.tickTracked(ctx) })
 	m.log.Info("node-health monitor started",
 		zap.Duration("down_after", m.downAfter))
 	go m.loop()
@@ -91,7 +96,7 @@ func (m *Monitor) loop() {
 			return
 		case <-t.C:
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			m.tick(ctx)
+			m.job.Track(func() (string, error) { return m.tickTracked(ctx) })
 			cancel()
 		}
 	}
@@ -99,6 +104,16 @@ func (m *Monitor) loop() {
 
 func (m *Monitor) tick(ctx context.Context) {
 	m.checkDataPlane(ctx)
+}
+
+// tickTracked runs one sweep and reports the node count, for the jobs registry.
+func (m *Monitor) tickTracked(ctx context.Context) (string, error) {
+	nodes, err := m.store.ListNodes(ctx)
+	if err != nil {
+		return "", err
+	}
+	m.tick(ctx)
+	return fmt.Sprintf("%d nodes checked", len(nodes)), nil
 }
 
 // checkDataPlane flips stale nodes to "down" and raises down/recovered alerts on

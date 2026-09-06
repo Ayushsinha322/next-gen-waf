@@ -5,7 +5,7 @@ import { showToast } from "@/components/ui/Toast";
 import Toggle from "@/components/ui/Toggle";
 import { api, type UserRow, type APIKeyRow, type NotificationChannel, type ChannelType, type ChannelConfig, type Severity, type ManagementTLSInfo, type ClusterHealth } from "@/lib/api";
 import { staggerContainer, fadeUp, spring } from "@/lib/animations";
-import { logout } from "@/lib/auth";
+import { logout, getUser } from "@/lib/auth";
 
 const TABS = ["General","Auth & SSO","API Keys","Users & RBAC","Cluster","Notifications","Management TLS"];
 
@@ -366,11 +366,14 @@ function UsersTab() {
   const [mailReady, setMailReady] = useState<boolean | null>(null);
   const [mailHost, setMailHost]   = useState("");
 
-  useEffect(() => {
+  const loadUsers = () =>
     api.admin.users.list()
       .then(r => setUsers(r.users ?? []))
       .catch(() => showToast("Failed to load users","e","⚠️"))
       .finally(() => setLoading(false));
+
+  useEffect(() => {
+    loadUsers();
     api.mail.status()
       .then(r => { setMailReady(r.mail.password_reset_ready); setMailHost(r.mail.host); })
       .catch(() => setMailReady(null));
@@ -431,6 +434,7 @@ function UsersTab() {
   return (
     <>
     <ChangePasswordCard />
+    <TwoFactorCard users={users} onChanged={loadUsers} />
 
     {/* Password recovery depends entirely on outbound mail, so its real state
         belongs here rather than being discovered when someone is locked out. */}
@@ -497,7 +501,7 @@ function UsersTab() {
                   <td>{u.name||"—"}</td>
                   <td className="td2">{u.email}</td>
                   <td>{roleBadge(u.role)}</td>
-                  <td><span className={`bdg ${u.twofa?"bgg":"bgr"}`}>{u.twofa?"✓ TOTP":"✗ None"}</span></td>
+                  <td><span className={`bdg ${u.mfa_enabled?"bgg":"bgr"}`}>{u.mfa_enabled?"✓ TOTP":"✗ None"}</span></td>
                   <td className="td3">{fmtLogin(u.last_login)}</td>
                   <td><span className={`bdg ${u.status==="active"?"bgg":"bgr"}`}>{u.status.toUpperCase()}</span></td>
                   <td>
@@ -531,6 +535,114 @@ function UsersTab() {
  * included, so the user is sent back to the login page rather than left holding
  * a token that will start returning 401 a moment later.
  */
+// ---------------------------------------------------------------------------
+// Two-factor authentication (TOTP). The control plane has had enrol / confirm /
+// disable and a login step-up for a while; nothing in the console called them,
+// so the 2FA column read "None" for everyone with no way to change it. This is
+// the enrolment: secret + QR, one code to confirm, one code to disable.
+// ---------------------------------------------------------------------------
+function TwoFactorCard({ users, onChanged }: { users: UserRow[]; onChanged: () => void | Promise<void> }) {
+  const me = getUser();
+  const mine = users.find(u => me && u.email.toLowerCase() === me.email.toLowerCase());
+  const enabled = mine?.mfa_enabled ?? null;
+
+  const [enrolling, setEnrolling] = useState<{ secret: string; uri: string; qr: string } | null>(null);
+  const [code, setCode]           = useState("");
+  const [busy, setBusy]           = useState(false);
+  const [disabling, setDisabling] = useState(false);
+
+  async function startEnrol() {
+    setBusy(true);
+    try {
+      const r = await api.auth.mfaEnroll();
+      const QR = await import("qrcode");
+      const qr = await QR.toDataURL(r.otpauth_uri, { margin: 1, width: 180, color: { dark: "#e6eaef", light: "#00000000" } });
+      setEnrolling({ secret: r.secret, uri: r.otpauth_uri, qr });
+      setCode("");
+    } catch (e) {
+      showToast(`Could not start enrolment: ${e instanceof Error ? e.message : String(e)}`, "e", "⚠️");
+    } finally { setBusy(false); }
+  }
+  async function confirm() {
+    if (!enrolling || code.trim().length < 6) return;
+    setBusy(true);
+    try {
+      await api.auth.mfaConfirm(enrolling.secret, code.trim());
+      showToast("Two-factor authentication is on. You will be asked for a code at every sign-in.", "s", "🔐");
+      setEnrolling(null); setCode("");
+      await onChanged();
+    } catch (e) {
+      showToast(`Not activated: ${e instanceof Error ? e.message : String(e)}`, "e", "⚠️");
+    } finally { setBusy(false); }
+  }
+  async function disable() {
+    if (code.trim().length < 6) return;
+    setBusy(true);
+    try {
+      await api.auth.mfaDisable(code.trim());
+      showToast("Two-factor authentication is off for your account.", "s", "🔓");
+      setDisabling(false); setCode("");
+      await onChanged();
+    } catch (e) {
+      showToast(`Not disabled: ${e instanceof Error ? e.message : String(e)}`, "e", "⚠️");
+    } finally { setBusy(false); }
+  }
+
+  return (
+    <motion.div className="panel" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}>
+      <div className="ph">
+        <div className="ptitle">🔐 Two-factor authentication</div>
+        {enabled === null ? <span className="td3" style={{ fontSize: 12.5 }}>—</span>
+          : <span className={`bdg ${enabled ? "bgg" : "ba"}`}>{enabled ? "ON · TOTP" : "OFF"}</span>}
+      </div>
+      <div className="pb" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+        <div className="td3" style={{ fontSize: 13, lineHeight: 1.5 }}>
+          Time-based one-time codes from an authenticator app (Google Authenticator, Authy, 1Password, Bitwarden).
+          Once on, every sign-in to this account asks for the 6-digit code after the password.
+          {enabled === false && " Recommended for every account that can change WAF policy."}
+        </div>
+
+        {enabled === false && !enrolling && (
+          <div><motion.button className="btn bp btn-sm" disabled={busy} onClick={startEnrol} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
+            {busy ? "…" : "🔐 Turn on two-factor"}
+          </motion.button></div>
+        )}
+
+        {enrolling && (
+          <div style={{ display: "grid", gridTemplateColumns: "200px 1fr", gap: 18, alignItems: "start" }}>
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src={enrolling.qr} alt="TOTP enrolment QR code" width={180} height={180} style={{ border: "1px solid var(--border)", borderRadius: 6, padding: 8, background: "rgba(255,255,255,.03)" }} />
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              <div className="td3" style={{ fontSize: 13 }}>1. Scan the code with your authenticator app, or enter the secret by hand:</div>
+              <code style={{ fontSize: 13, userSelect: "all", wordBreak: "break-all" }}>{enrolling.secret}</code>
+              <div className="td3" style={{ fontSize: 13 }}>2. Enter the 6-digit code the app shows now. Nothing changes until this code is accepted.</div>
+              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                <input className="fin2" inputMode="numeric" pattern="[0-9]*" maxLength={8} placeholder="123 456" value={code}
+                  onChange={e => setCode(e.target.value.replace(/\s+/g, ""))} onKeyDown={e => { if (e.key === "Enter") confirm(); }} style={{ width: 140, fontFamily: "var(--font-mono)", letterSpacing: ".12em" }} />
+                <motion.button className="btn bp btn-sm" disabled={busy || code.trim().length < 6} onClick={confirm} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>{busy ? "…" : "✅ Activate"}</motion.button>
+                <button className="btn bg-btn btn-sm" onClick={() => { setEnrolling(null); setCode(""); }}>Cancel</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {enabled === true && !disabling && (
+          <div><button className="btn bg-btn btn-sm" onClick={() => { setDisabling(true); setCode(""); }}>Turn off two-factor…</button></div>
+        )}
+        {enabled === true && disabling && (
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <span className="td3" style={{ fontSize: 13 }}>Enter a current code to turn it off:</span>
+            <input className="fin2" inputMode="numeric" maxLength={8} placeholder="123 456" value={code}
+              onChange={e => setCode(e.target.value.replace(/\s+/g, ""))} onKeyDown={e => { if (e.key === "Enter") disable(); }} style={{ width: 140, fontFamily: "var(--font-mono)", letterSpacing: ".12em" }} />
+            <motion.button className="btn bgn btn-sm" disabled={busy || code.trim().length < 6} onClick={disable} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>{busy ? "…" : "Turn off"}</motion.button>
+            <button className="btn bg-btn btn-sm" onClick={() => { setDisabling(false); setCode(""); }}>Cancel</button>
+          </div>
+        )}
+      </div>
+    </motion.div>
+  );
+}
+
 function ChangePasswordCard() {
   const [cur, setCur] = useState("");
   const [next, setNext] = useState("");

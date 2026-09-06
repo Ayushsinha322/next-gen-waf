@@ -602,6 +602,8 @@ func run() error {
 			handleRollbackConfig(c, enforcer, store, hub, cl, log)
 		})
 		protected.GET("/sites/:id", func(c *gin.Context) { handleGetSite(c, enforcer, store) })
+		// Pushed vs held config for one site, with a field diff — the silently-inert detector.
+		protected.GET("/sites/:id/effective", func(c *gin.Context) { handleSiteEffectiveConfig(c, enforcer, store) })
 		protected.PUT("/sites/:id", func(c *gin.Context) { handleUpdateSite(c, enforcer, store, hub, cl, log) })
 		protected.PATCH("/sites/:id", func(c *gin.Context) { handleUpdateSite(c, enforcer, store, hub, cl, log) })
 		protected.DELETE("/sites/:id", func(c *gin.Context) { handleDeleteSite(c, enforcer, store, hub, cl, log) })
@@ -642,6 +644,9 @@ func run() error {
 		// Notification channels (SOC integration: webhook / Slack / syslog / CEF).
 		// Node-wide operator settings (alert thresholds, threat-intel feeds) plus
 		// the data plane's read-only global config — the Global Settings page.
+		// Background jobs: what runs, when it last ran, how it went, run it now.
+		protected.GET("/jobs", func(c *gin.Context) { handleListJobs(c, enforcer, cl) })
+		protected.POST("/jobs/:name/run", func(c *gin.Context) { handleRunJob(c, enforcer, store, hub, cl) })
 		protected.GET("/settings/global", func(c *gin.Context) { handleGetGlobalSettings(c, enforcer, store) })
 		protected.PUT("/settings/global", func(c *gin.Context) { handlePutGlobalSettings(c, enforcer, store, hub, cl) })
 		protected.DELETE("/settings/global/:key", func(c *gin.Context) { handleDeleteGlobalSetting(c, enforcer, store, hub, cl) })
@@ -681,6 +686,9 @@ func run() error {
 		protected.GET("/logs/profiles/:id/export", func(c *gin.Context) { handleExportLogProfile(c, enforcer, store, chClient, hub) })
 
 		protected.GET("/geoip/blocked", func(c *gin.Context) { handleListBlockedCountries(c, enforcer, store) })
+		// Every active block in one place (data-plane bans + block-tier indicators + countries).
+		protected.GET("/blocks", func(c *gin.Context) { handleListBlocks(c, enforcer, store) })
+		protected.DELETE("/blocks/ip/:ip", func(c *gin.Context) { handleUnblockIP(c, enforcer, store, hub, cl) })
 		protected.POST("/geoip/block", func(c *gin.Context) { handleBlockCountry(c, enforcer, store, hub, cl) })
 		protected.DELETE("/geoip/block/:code", func(c *gin.Context) { handleUnblockCountry(c, enforcer, store, hub, cl) })
 		protected.GET("/metrics/snapshot", func(c *gin.Context) {

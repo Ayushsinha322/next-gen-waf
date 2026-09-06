@@ -15,6 +15,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/your-org/sentinel-waf/control-plane/internal/jobs"
 	"os"
 	"strconv"
 	"time"
@@ -44,6 +45,7 @@ type Monitor struct {
 	interval  time.Duration
 	threshold float64 // percent (0..100) at which "warning" begins
 	done      chan struct{}
+	job       *jobs.Job
 
 	// lastSev tracks the last severity bucket alerted so each escalation level
 	// (warning -> high -> critical) fires once, not every tick. Single goroutine
@@ -81,6 +83,9 @@ func New(engine *alerting.Engine, ch *chreader.Client, log *zap.Logger) *Monitor
 
 // Start launches the check loop in its own goroutine.
 func (m *Monitor) Start() {
+	m.job = jobs.Register("clickhouse.disk-pressure",
+		"Read the event store's disk usage and alert when it crosses the threshold.",
+		m.interval, func(ctx context.Context) (string, error) { return m.tickTracked(ctx) })
 	m.log.Info("disk-pressure monitor started",
 		zap.Duration("interval", m.interval),
 		zap.Float64("threshold_pct", m.threshold))
@@ -107,7 +112,17 @@ func (m *Monitor) loop() {
 func (m *Monitor) tickOnce() {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+	m.job.Track(func() (string, error) { return m.tickTracked(ctx) })
+}
+
+// tickTracked runs one check and reports usage, for the jobs registry.
+func (m *Monitor) tickTracked(ctx context.Context) (string, error) {
+	usedFrac, _, _, err := m.ch.DiskUsage(ctx)
+	if err != nil {
+		return "", err
+	}
 	m.tick(ctx)
+	return fmt.Sprintf("%.1f%% used", usedFrac*100), nil
 }
 
 func (m *Monitor) tick(ctx context.Context) {

@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/your-org/sentinel-waf/control-plane/internal/jobs"
 	"sort"
 	"strings"
 	"sync"
@@ -374,6 +375,9 @@ var EventDrivenKinds = []string{
 // autoResolver closes stale event-driven alerts once a minute. See
 // db.Store.AutoResolveQuietAlerts for why this exists.
 func (e *Engine) autoResolver() {
+	job := jobs.Register("alerts.auto-resolve",
+		"Close attack alerts that have not recurred within the quiet window; re-read Global Settings.",
+		time.Minute, func(ctx context.Context) (string, error) { return e.autoResolveOnce(ctx) })
 	t := time.NewTicker(time.Minute)
 	defer t.Stop()
 	for {
@@ -381,25 +385,33 @@ func (e *Engine) autoResolver() {
 		case <-e.done:
 			return
 		case <-t.C:
-			// Pick up console edits first, so a threshold change is live within
-			// a minute of being saved.
-			if e.configSource != nil {
-				e.applyConfig(e.configSource())
-			}
-			quiet := e.Config().AutoResolveAfter
-			if quiet < 0 {
-				continue // disabled by the operator
-			}
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-			n, err := e.store.AutoResolveQuietAlerts(ctx, e.tenantID, e.userID, EventDrivenKinds, quiet)
+			job.Track(func() (string, error) { return e.autoResolveOnce(ctx) })
 			cancel()
-			if err != nil {
-				e.log.Warn("alert auto-resolve failed", zap.Error(err))
-			} else if n > 0 {
-				e.log.Info("auto-resolved quiet alerts", zap.Int64("count", n), zap.Duration("quiet", quiet))
-			}
 		}
 	}
+}
+
+// autoResolveOnce is one tick: apply console settings, then sweep.
+func (e *Engine) autoResolveOnce(ctx context.Context) (string, error) {
+	// Pick up console edits first, so a threshold change is live within a
+	// minute of being saved.
+	if e.configSource != nil {
+		e.applyConfig(e.configSource())
+	}
+	quiet := e.Config().AutoResolveAfter
+	if quiet < 0 {
+		return "skipped — auto-resolve disabled", nil
+	}
+	n, err := e.store.AutoResolveQuietAlerts(ctx, e.tenantID, e.userID, EventDrivenKinds, quiet)
+	if err != nil {
+		e.log.Warn("alert auto-resolve failed", zap.Error(err))
+		return "", err
+	}
+	if n > 0 {
+		e.log.Info("auto-resolved quiet alerts", zap.Int64("count", n), zap.Duration("quiet", quiet))
+	}
+	return fmt.Sprintf("%d alerts resolved", n), nil
 }
 
 // janitor periodically drops stale throttle/window entries.

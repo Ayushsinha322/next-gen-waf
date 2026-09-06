@@ -395,6 +395,46 @@ export interface GlobalSettingsResponse {
   dataplane:    { reachable: boolean; error?: string; config?: Record<string, unknown> };
 }
 
+/** GET /blocks — every active block, from three places. */
+export interface BlocksResponse {
+  dataplane: {
+    reachable: boolean; error?: string; version?: string;
+    ebpf?: { mode: string; drops: number; exact_ips: string[]; ranges: string[] };
+    autoban?: { enabled: boolean; threshold_blocks: number; include_private: boolean; window_secs: number; banned: string[] };
+    offenders?: { window_secs: number; escalate_threshold: number;
+      entries: { ip: string; blocks_in_window: number; last_block_unix: number; escalated: boolean; autoban_pending: boolean }[] };
+  };
+  indicators: IOC[];
+  indicators_error?: string;
+  countries: string[];
+}
+
+/** GET /sites/:id/effective — pushed vs held config with a field diff. */
+export interface EffectiveConfig {
+  site_id: string; site: string; status: string;
+  ignored_policy_keys: string[];
+  pushed?: Record<string, unknown>; pushed_error?: string;
+  applied?: Record<string, unknown> | null;
+  dataplane: { reachable: boolean; error?: string; version?: string;
+    engine?: { rules_compiled: number; rules_enforced: number; rules_dropped: number } | null };
+  diff?: { path: string; pushed: unknown; applied: unknown }[];
+}
+
+/** GET /jobs — background work on this control-plane node plus the data plane's pollers. */
+export interface JobStatus {
+  name: string; description: string; interval: string; interval_secs: number;
+  running: boolean; runs: number; failures: number;
+  last_start?: string; last_end?: string; last_duration_ms: number;
+  last_error?: string; last_note?: string; next_due?: string; can_run_now: boolean;
+}
+export interface JobsResponse {
+  node: { role: "leader" | "follower" | "standalone"; runs_jobs: boolean };
+  jobs: JobStatus[];
+  note: string;
+  dataplane?: { reachable: boolean; error?: string; version?: string; uptime_secs?: number;
+    threat_intel?: { configured: boolean; poller: string; last_sync_status: number; version: number; entries: number; active: boolean; inert_reason?: string | null } };
+}
+
 /** An installed WASM plugin (module bytes are never sent to the browser). */
 export interface Plugin {
   id:          string;
@@ -642,7 +682,9 @@ export interface UserRow {
   name:       string;
   role:       string;
   status:     string;
-  twofa:      boolean;
+  /** Emitted by the control plane as mfa_enabled. The column read a field
+   *  called twofa that never existed, so it showed "None" for every user. */
+  mfa_enabled: boolean;
   last_login: string | null;
 }
 
@@ -744,6 +786,17 @@ export interface DataPlaneNode {
   sites:            number;
   upstreams_healthy: number;
   upstreams_total:  number;
+  /** Drill-down fields, reported by newer data planes; absent/zero on older ones. */
+  listeners?:              string[];
+  http3_enabled?:          boolean;
+  config_version_applied?: number;
+  rules_compiled?:         number;
+  rules_enforced?:         number;
+  ebpf_mode?:              string;
+  ebpf_drops?:             number;
+  threat_intel_entries?:   number;
+  threat_intel_version?:   number;
+  inline_rules?:           unknown;
 }
 
 /** A single control-plane (Raft) node. */
@@ -762,6 +815,8 @@ export interface ControlPlaneNode {
 
 /** Fleet-wide health roll-up (data plane + control plane). */
 export interface ClusterHealth {
+  /** The config version the control plane serves now; compare with each node's config_version_applied. */
+  config_version?: number;
   generated_at:      number; // unix seconds
   overall:           "healthy" | "degraded" | "critical";
   protection_active: boolean;
@@ -865,6 +920,13 @@ async function downloadExport(path: string, fallbackName: string): Promise<{ fil
 
 export const api = {
   auth: {
+    /** TOTP enrolment: enroll returns a fresh secret + otpauth URI to show as a
+     *  QR; confirm activates it with one valid code; disable needs a current code. */
+    mfaEnroll:  () => apiFetch<{ secret: string; otpauth_uri: string }>("/auth/mfa/enroll", { method: "POST" }),
+    mfaConfirm: (secret: string, code: string) =>
+      apiFetch<{ ok: boolean; mfa_enabled: boolean }>("/auth/mfa/confirm", { method: "POST", body: JSON.stringify({ secret, code }) }),
+    mfaDisable: (code: string) =>
+      apiFetch<{ ok: boolean; mfa_enabled: boolean }>("/auth/mfa/disable", { method: "POST", body: JSON.stringify({ code }) }),
     login: (email: string, password: string) =>
       apiFetch<{ access_token: string; user: { id: string; email: string; role: string } }>(
         "/auth/login",
@@ -923,6 +985,8 @@ export const api = {
   sites: {
     list: () => apiFetch<{ sites: Site[]; tenant_id: string }>("/sites"),
     get:  (id: string) => apiFetch<{ site: Site }>(`/sites/${id}`),
+    /** What the control plane pushes vs what the data plane holds, with a diff. */
+    effective: (id: string) => apiFetch<EffectiveConfig>(`/sites/${id}/effective`),
     create: (body: { name: string; domains: string[]; upstream?: object; waf_policy?: object }) =>
       apiFetch<{ site: Site }>("/sites", { method: "POST", body: JSON.stringify(body) }),
     update: (id: string, body: { name?: string; domains?: string[]; upstream?: object; waf_policy?: object }) =>
@@ -1057,6 +1121,19 @@ export const api = {
       ),
     ack:     (id: string) => apiFetch<{ ok: boolean }>(`/alerts/${id}/ack`,     { method: "POST" }),
     resolve: (id: string) => apiFetch<{ ok: boolean }>(`/alerts/${id}/resolve`, { method: "POST" }),
+  },
+
+  /** Background jobs — the System Jobs page. */
+  jobs: {
+    list: () => apiFetch<JobsResponse>("/jobs"),
+    run:  (name: string) => apiFetch<{ ok: boolean; job: JobStatus; error?: string }>(`/jobs/${encodeURIComponent(name)}/run`, { method: "POST" }),
+  },
+
+  /** Blocked sources: the unified view plus the data-plane unblock. */
+  blocks: {
+    list:      () => apiFetch<BlocksResponse>("/blocks"),
+    unblockIP: (ip: string) =>
+      apiFetch<{ ok: boolean; result: Record<string, unknown> }>(`/blocks/ip/${encodeURIComponent(ip)}`, { method: "DELETE" }),
   },
 
   /** Node-wide operator settings — the Global Settings page. */
