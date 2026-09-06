@@ -61,15 +61,26 @@ export function isAuthenticated(): boolean {
  * POST /api/v1/auth/login and persist tokens on success.
  * Throws on HTTP errors.
  */
-export async function login(email: string, password: string): Promise<LoginResponse> {
+/** Thrown when the account has TOTP on and no (or no valid) code was supplied.
+ *  The control plane answers 401 {mfa_required: true}; the login page catches
+ *  this and asks for the code instead of showing a generic failure. */
+export class MfaRequiredError extends Error {
+  constructor(message = "Enter the 6-digit code from your authenticator app") { super(message); this.name = "MfaRequiredError"; }
+}
+
+export async function login(email: string, password: string, mfaCode?: string): Promise<LoginResponse> {
   const res = await fetch("/api/v1/auth/login", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email, password }),
+    body: JSON.stringify(mfaCode ? { email, password, mfa_code: mfaCode } : { email, password }),
   });
 
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: res.statusText }));
+    if (res.status === 401 && body.mfa_required === true) throw new MfaRequiredError();
+    if (res.status === 401 && typeof body.error === "string" && body.error.includes("mfa code")) {
+      throw new MfaRequiredError("That code was not accepted. Codes rotate every 30 seconds — try the current one.");
+    }
     throw new Error(body.error ?? "Login failed");
   }
 

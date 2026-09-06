@@ -542,12 +542,23 @@ impl ResolvesServerCert for SentinelCertResolver {
             if let Some(ck) = self.store.resolve_live(key) {
                 return Some(ck);
             }
-            let mut fb = self.fallback.lock().expect("fallback lock");
-            if let Some(ck) = fb.get(key) {
-                return Some(Arc::clone(ck));
+            {
+                let fb = self.fallback.lock().expect("fallback lock");
+                if let Some(ck) = fb.get(key) {
+                    return Some(Arc::clone(ck));
+                }
             }
-            let ck = generate_self_signed(key).ok()?;
-            fb.insert(key.clone(), Arc::clone(&ck));
+            // Persisted and shared, like the site fallback below. This used to be
+            // a per-process in-memory cert, so every data-plane restart minted a
+            // new management cert and every roll put the browser's certificate
+            // warning back on the console. Now the first node to need it writes
+            // it to the cert volume and every node — and every restart — serves
+            // the same bytes until an operator uploads a real one.
+            let ck = self.store.self_signed_shared(key)?;
+            self.fallback
+                .lock()
+                .expect("fallback lock")
+                .insert(key.clone(), Arc::clone(&ck));
             return Some(ck);
         }
 
@@ -844,6 +855,41 @@ mod tests {
         // Nothing installed on failure.
         assert!(store.get_meta(MANAGEMENT_CERT_KEY).is_none());
     }
+
+    /// The management cert must survive a restart and be shared by the fleet,
+    /// or every roll re-triggers the browser warning on the console.
+    #[test]
+    fn management_self_signed_cert_is_persisted_and_shared() {
+        let dir = tmp_dir();
+        let a = CertStore::new(dir.clone());
+        let first = a
+            .self_signed_shared(MANAGEMENT_CERT_KEY)
+            .expect("node a mints the management cert");
+        // A second process over the same volume — a restart, or another node.
+        let b = CertStore::new(dir.clone());
+        let second = b
+            .self_signed_shared(MANAGEMENT_CERT_KEY)
+            .expect("node b adopts it");
+        assert_eq!(
+            first.cert[0].as_ref(),
+            second.cert[0].as_ref(),
+            "restart/other node must serve the SAME management cert bytes"
+        );
+        // It is on disk under the reserved key, and still hidden from the
+        // customer cert repository listing.
+        assert!(dir
+            .join(domain_to_dirname(MANAGEMENT_CERT_KEY))
+            .join("cert.pem")
+            .exists());
+        assert!(a.all_meta().iter().all(|m| m.domain != MANAGEMENT_CERT_KEY));
+        // And it reports itself as self-signed, so the Management TLS page does
+        // not claim an operator certificate is installed.
+        assert!(matches!(
+            a.get_meta(MANAGEMENT_CERT_KEY).map(|m| m.source),
+            Some(CertSource::SelfSigned)
+        ));
+    }
+
     /// Two nodes sharing a cert volume must serve the SAME self-signed cert.
     ///
     /// This is the whole point. Before it, the fallback lived in a per-process

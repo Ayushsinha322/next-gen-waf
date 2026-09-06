@@ -642,7 +642,9 @@ export interface UserRow {
   name:       string;
   role:       string;
   status:     string;
-  twofa:      boolean;
+  /** Emitted by the control plane as mfa_enabled. The column read a field
+   *  called twofa that never existed, so it showed "None" for every user. */
+  mfa_enabled: boolean;
   last_login: string | null;
 }
 
@@ -865,6 +867,13 @@ async function downloadExport(path: string, fallbackName: string): Promise<{ fil
 
 export const api = {
   auth: {
+    /** TOTP enrolment: enroll returns a fresh secret + otpauth URI to show as a
+     *  QR; confirm activates it with one valid code; disable needs a current code. */
+    mfaEnroll:  () => apiFetch<{ secret: string; otpauth_uri: string }>("/auth/mfa/enroll", { method: "POST" }),
+    mfaConfirm: (secret: string, code: string) =>
+      apiFetch<{ ok: boolean; mfa_enabled: boolean }>("/auth/mfa/confirm", { method: "POST", body: JSON.stringify({ secret, code }) }),
+    mfaDisable: (code: string) =>
+      apiFetch<{ ok: boolean; mfa_enabled: boolean }>("/auth/mfa/disable", { method: "POST", body: JSON.stringify({ code }) }),
     login: (email: string, password: string) =>
       apiFetch<{ access_token: string; user: { id: string; email: string; role: string } }>(
         "/auth/login",

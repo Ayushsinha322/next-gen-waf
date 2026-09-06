@@ -3,7 +3,7 @@ import { PRODUCT_VERSION } from "@/lib/version";
 import { useState, useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
-import { login, clearSessionCookie } from "@/lib/auth";
+import { login, clearSessionCookie, MfaRequiredError } from "@/lib/auth";
 import { spring } from "@/lib/animations";
 
 type AuthTab  = "std" | "sso" | "api";
@@ -24,6 +24,8 @@ export default function LoginPage() {
   // ── Preserved logic state ────────────────────────────────────────────────
   const [email, setEmail]           = useState("");
   const [password, setPassword]     = useState("");
+  const [mfaCode, setMfaCode]       = useState("");
+  const [mfaNeeded, setMfaNeeded]   = useState(false);
   const [loginError, setLoginError] = useState("");
   // null = not asked yet, false = not configured, true = usable. The button
   // renders ONLY on true: /oidc/login answers 501 when the issuer and client
@@ -199,7 +201,7 @@ export default function LoginPage() {
     setBtnState("loading");
     setLoginError("");
     try {
-      await login(email, password);
+      await login(email, password, mfaCode || undefined);
       const token = typeof window !== "undefined"
         ? localStorage.getItem("sentinel_access_token")
         : null;
@@ -211,6 +213,12 @@ export default function LoginPage() {
     } catch (err: unknown) {
       setBtnState("idle");
       clearSessionCookie();
+      if (err instanceof MfaRequiredError) {
+        // Second step, not a failure: reveal the code field and say so.
+        setMfaNeeded(true);
+        setLoginError(mfaCode ? err.message : "");
+        return;
+      }
       setLoginError(err instanceof Error ? err.message : "Login failed");
     }
   }
@@ -361,6 +369,31 @@ export default function LoginPage() {
               </button>
             </div>
           </div>
+
+          {/* Second factor — shown only once the control plane has asked for it */}
+          {mfaNeeded && (
+            <motion.div className="fg" initial={{ opacity: 0, y: -6 }} animate={{ opacity: 1, y: 0 }}>
+              <label className="fl">Authenticator code</label>
+              <div className="fi-wrap">
+                <input
+                  className="fi"
+                  inputMode="numeric"
+                  autoComplete="one-time-code"
+                  placeholder="6-digit code"
+                  maxLength={8}
+                  autoFocus
+                  value={mfaCode}
+                  onChange={e => setMfaCode(e.target.value.replace(/\s+/g, ""))}
+                  onKeyDown={e => { if (e.key === "Enter") doLogin(); }}
+                  style={{ letterSpacing: ".14em", fontFamily: "var(--font-mono)" }}
+                />
+                <span className="fi-icon">🔐</span>
+              </div>
+              <div style={{ fontSize: 12, color: "var(--text3)", marginTop: 6 }}>
+                Two-factor authentication is on for this account. Enter the code from your authenticator app.
+              </div>
+            </motion.div>
+          )}
 
           {/* Remember + Forgot */}
           <div id="extras">

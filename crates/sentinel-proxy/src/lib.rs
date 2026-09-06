@@ -6585,14 +6585,16 @@ async fn handle_internal_mgmt_tls_api(
 
     if method == hyper::Method::GET {
         return match state.cert_manager.store.get_meta(tls::MANAGEMENT_CERT_KEY) {
-            Some(m) => {
+            // The persisted self-signed fallback now lives under this key too, so
+            // "present" no longer means "an operator installed a certificate".
+            Some(m) if !matches!(m.source, tls::CertSource::SelfSigned) => {
                 let mut v = serde_json::to_value(&m).unwrap_or_else(|_| serde_json::json!({}));
                 if let Some(obj) = v.as_object_mut() {
                     obj.insert("self_signed".to_string(), serde_json::json!(false));
                 }
                 json_ok(v)
             }
-            None => json_ok(serde_json::json!({"self_signed": true})),
+            _ => json_ok(serde_json::json!({"self_signed": true})),
         };
     }
 
