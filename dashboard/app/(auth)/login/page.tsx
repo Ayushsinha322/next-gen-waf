@@ -1,4 +1,5 @@
 "use client";
+import { PRODUCT_VERSION } from "@/lib/version";
 import { useState, useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
@@ -250,28 +251,31 @@ export default function LoginPage() {
             Protect every<br />request. <span>Instantly.</span>
           </motion.div>
           <motion.div id="hero-desc" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.45, duration: 0.4 }}>
-            Next-generation Web Application Firewall with AI-powered threat detection,
-            eBPF kernel-level DDoS mitigation, and sub-millisecond latency.
+            Web Application Firewall with a Rust data plane, rule engine plus ML
+            detection, eBPF kernel-level DDoS mitigation, and HTTP/3 with JA4 fingerprinting.
           </motion.div>
 
           <motion.div id="stats" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.55, ...spring }}>
+            {/* Measured, not aspirational: GoTestWAF and vegeta head-to-head vs
+                BunkerWeb 1.6.9 on 2026-09-06, deploy/load-test/BUNKERWEB-COMPARISON-2026-09.md.
+                Update these when the benchmark is re-run — never round up. */}
             <div className="stat-item">
-              <div className="sv green">&lt;1ms</div>
-              <div className="sl">p99 latency</div>
+              <div className="sv green">99.5%</div>
+              <div className="sl">GoTestWAF detection</div>
             </div>
             <div className="stat-item">
-              <div className="sv blue">500k+</div>
-              <div className="sl">req/s throughput</div>
+              <div className="sv blue">98.6%</div>
+              <div className="sl">benign traffic passed</div>
             </div>
             <div className="stat-item">
-              <div className="sv" style={{ color: "#a78bfa" }}>99.9%</div>
-              <div className="sl">DDoS mitigation</div>
+              <div className="sv" style={{ color: "#a78bfa" }}>2.3 ms</div>
+              <div className="sl">p99 at 3,000 req/s</div>
             </div>
           </motion.div>
 
           <motion.div id="feats" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.65 }}>
             {["eBPF / XDP","OWASP CRS v4","WASM Plugins","LLM Copilot",
-              "Post-Quantum TLS","Raft HA","GraphQL FW","Outbound DLP"].map(f => (
+              "HTTP/3 + JA4","Raft HA","GraphQL / gRPC FW","Outbound DLP"].map(f => (
               <div key={f} className="feat-pill">{f}</div>
             ))}
           </motion.div>
@@ -280,7 +284,7 @@ export default function LoginPage() {
         <div id="LP-bottom">
           <div id="lp-footer">
             <div className="lp-dot" />
-            <span>All systems operational &nbsp;·&nbsp; v4.2.1 &nbsp;·&nbsp; AES-256-GCM</span>
+            <span>Next-Gen ESDS WAF &nbsp;·&nbsp; v{PRODUCT_VERSION}</span>
           </div>
         </div>
       </div>
@@ -418,7 +422,6 @@ export default function LoginPage() {
           )}
 
           <div id="form-footer">
-            Protected by Next-Gen ESDS WAF · AES-256 encrypted<br />
             All authentication attempts are logged and audited
           </div>
         </motion.div>

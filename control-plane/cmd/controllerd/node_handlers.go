@@ -13,6 +13,8 @@ import (
 	"github.com/your-org/sentinel-waf/control-plane/internal/db"
 	"github.com/your-org/sentinel-waf/control-plane/internal/leader"
 	"github.com/your-org/sentinel-waf/control-plane/internal/rbac"
+
+	"github.com/your-org/sentinel-waf/control-plane/internal/version"
 )
 
 // nodeHeartbeatRequest is the body posted by a data-plane node to
@@ -256,6 +258,7 @@ func handleClusterHealth(c *gin.Context, enf *rbac.Enforcer, store *db.Store, cl
 	protectionActive := dpHealthy >= 1 || dpTotal == 0
 
 	c.JSON(http.StatusOK, gin.H{
+		"build":             version.Info(),
 		"generated_at":      time.Now().Unix(),
 		"overall":           overall,
 		"protection_active": protectionActive,

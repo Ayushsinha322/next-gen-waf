@@ -11,6 +11,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/your-org/sentinel-waf/control-plane/internal/leader"
+
+	"github.com/your-org/sentinel-waf/control-plane/internal/version"
 )
 
 // hopByHopHeaders are connection-scoped and must NOT be copied from the leader's
@@ -185,6 +187,7 @@ func handleClusterStatus(c *gin.Context, cl *leader.Elector) {
 		c.JSON(http.StatusOK, gin.H{
 			"enabled": false,
 			"role":    "standalone",
+			"build":   version.Info(),
 		})
 		return
 	}
@@ -192,5 +195,6 @@ func handleClusterStatus(c *gin.Context, cl *leader.Elector) {
 	c.JSON(http.StatusOK, gin.H{
 		"enabled": true,
 		"status":  st,
+		"build":   version.Info(),
 	})
 }

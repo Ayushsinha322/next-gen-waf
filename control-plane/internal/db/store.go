@@ -597,6 +597,56 @@ func (s *Store) ResolveAlert(ctx context.Context, tenantID, userID, alertID stri
 	return tx.Commit(ctx)
 }
 
+// AutoResolveQuietAlerts resolves every open or acknowledged alert of the given
+// kinds that was raised before the quiet window began, stamping the reason into
+// details so the row is distinguishable from an operator's click. Returns how
+// many rows changed.
+//
+// Why: event-driven alerts (attack_spike, repeat_offender, the per-attack
+// criticals) describe a condition in a one-minute window. Nothing ever closed
+// them, so a demo box accumulated 562 open alerts and the badge stopped
+// meaning anything. An alert that has not recurred within the quiet window
+// describes something that is over; the throttled re-raise of an ONGOING
+// condition keeps a fresh open row, so live attacks stay visible.
+func (s *Store) AutoResolveQuietAlerts(ctx context.Context, tenantID, userID string, kinds []string, quiet time.Duration) (int64, error) {
+	if len(kinds) == 0 || quiet <= 0 {
+		return 0, nil
+	}
+	tx, err := s.pool.BeginTenant(ctx, tenantID, userID)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+
+	rows, err := tx.Query(ctx,
+		`UPDATE alerts
+		    SET state = 'resolved',
+		        resolved_at = now(),
+		        details = details || jsonb_build_object('auto_resolved', true,
+		                                                 'auto_resolve_reason', 'no recurrence within quiet window')
+		  WHERE tenant_id = $1
+		    AND state IN ('open', 'acked')
+		    AND kind = ANY($2)
+		    AND created_at < now() - ($3::bigint * interval '1 second')
+		  RETURNING id`,
+		tenantID, kinds, int64(quiet/time.Second))
+	if err != nil {
+		return 0, fmt.Errorf("store: auto-resolve alerts: %w", err)
+	}
+	var n int64
+	for rows.Next() {
+		n++
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
 // ---------------------------------------------------------------------------
 // Audit
 // ---------------------------------------------------------------------------

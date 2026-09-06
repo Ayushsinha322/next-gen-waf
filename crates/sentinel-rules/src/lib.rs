@@ -107,6 +107,59 @@ impl RuleEngine {
         self.ruleset.rule_meta.len()
     }
 
+    /// Everything an operator needs to see about what this engine enforces.
+    ///
+    /// The console used to list the control plane's *authored* rule store (six
+    /// rows) and call it "loaded rules", while the data plane was enforcing a
+    /// few hundred compiled CRS rules it had no way to show. This is the
+    /// inventory of the compiled set itself: every rule id with its message,
+    /// severity, phase, paranoia level and category (both parsed from CRS
+    /// tags), plus the rules that did NOT make it — compile-dropped with the
+    /// reason, and inert because their operator is unsupported. Sorted by id.
+    pub fn inventory(&self) -> RuleInventory {
+        let rs = &self.ruleset;
+        let inert: std::collections::HashSet<u32> = rs.coverage.disabled.iter().copied().collect();
+        let mut rules: Vec<RuleInventoryEntry> = rs
+            .rule_meta
+            .values()
+            .map(|m| RuleInventoryEntry {
+                id: m.id,
+                message: m.message.clone(),
+                severity: format!("{:?}", m.severity).to_lowercase(),
+                phase: m.phase as u8,
+                action: action_kind(&m.action),
+                score_delta: m.score_delta,
+                paranoia_level: m.tags.iter().find_map(|t| {
+                    t.strip_prefix("paranoia-level/")
+                        .and_then(|n| n.parse().ok())
+                }),
+                category: m
+                    .tags
+                    .iter()
+                    .find_map(|t| t.strip_prefix("attack-").map(|c| c.to_string())),
+                inert: inert.contains(&m.id),
+                tags: m.tags.clone(),
+            })
+            .collect();
+        rules.sort_by_key(|r| r.id);
+        let disabled = rs.coverage.disabled.clone();
+        RuleInventory {
+            total: rules.len(),
+            enforced: rules.iter().filter(|r| !r.inert).count(),
+            dropped: rs
+                .coverage
+                .dropped
+                .iter()
+                .map(|(id, reason)| DroppedRule {
+                    id: *id,
+                    reason: reason.clone(),
+                })
+                .collect(),
+            disabled,
+            rules,
+        }
+    }
+
     /// `true` if this rule set has any rules in the response-body phase.
     ///
     /// The proxy uses this to decide whether to buffer the response body for
@@ -123,6 +176,61 @@ impl RuleEngine {
             .values()
             .any(|m| m.phase == RulePhase::ResponseBody)
     }
+}
+
+/// One compiled rule, as reported by [`RuleEngine::inventory`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RuleInventoryEntry {
+    pub id: u32,
+    pub message: String,
+    /// `critical` / `high` / `medium` / `low` / `notice`.
+    pub severity: String,
+    /// `RulePhase` discriminant (0 connection … 6 logging).
+    pub phase: u8,
+    /// `score` / `block` / `allow` / `log` / `challenge` / `plugin`.
+    pub action: String,
+    pub score_delta: i32,
+    /// From the CRS `paranoia-level/N` tag, when present.
+    pub paranoia_level: Option<u8>,
+    /// From the CRS `attack-<category>` tag, when present (e.g. `sqli`).
+    pub category: Option<String>,
+    /// Loaded but can never match — its operator is unsupported.
+    pub inert: bool,
+    pub tags: Vec<String>,
+}
+
+/// A rule from the source set that failed to compile and is not loaded.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DroppedRule {
+    pub id: u32,
+    pub reason: String,
+}
+
+/// The enforced rule set of one engine, for operators. See [`RuleEngine::inventory`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RuleInventory {
+    /// Rules compiled into the engine (includes inert ones).
+    pub total: usize,
+    /// Rules that can actually fire: `total` minus inert.
+    pub enforced: usize,
+    /// Source rules that failed to compile — not loaded at all.
+    pub dropped: Vec<DroppedRule>,
+    /// Ids of loaded-but-inert rules (unsupported operator).
+    pub disabled: Vec<u32>,
+    pub rules: Vec<RuleInventoryEntry>,
+}
+
+fn action_kind(a: &ast::RuleAction) -> String {
+    match a {
+        ast::RuleAction::Score => "score",
+        ast::RuleAction::Block => "block",
+        ast::RuleAction::Allow => "allow",
+        ast::RuleAction::Log => "log",
+        ast::RuleAction::Challenge(_) => "challenge",
+        ast::RuleAction::PluginCall { .. } => "plugin",
+        ast::RuleAction::Redirect(_) => "redirect",
+    }
+    .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -146,6 +254,32 @@ pub fn compile(mut file: RuleFile) -> Result<CompiledRuleSet> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn inventory_reports_compiled_rules_with_crs_tags_and_gaps() {
+        let conf = r#"
+SecRule ARGS "@rx (?i)union\s+select" "id:942100,phase:2,block,severity:CRITICAL,msg:'SQLi',tag:'attack-sqli',tag:'paranoia-level/1',tag:'OWASP_CRS'"
+SecRule ARGS "@rx (?i)<script" "id:941100,phase:2,block,severity:CRITICAL,msg:'XSS',tag:'attack-xss',tag:'paranoia-level/2'"
+"#;
+        let engine = RuleEngine::from_crs_conf(conf).expect("crs conf compiles");
+        let inv = engine.inventory();
+        assert_eq!(inv.total, 2);
+        assert_eq!(inv.enforced, 2, "both rules have supported operators");
+        assert!(inv.dropped.is_empty());
+        assert_eq!(inv.rules[0].id, 941100, "sorted by id");
+        let sqli = inv.rules.iter().find(|r| r.id == 942100).unwrap();
+        assert_eq!(sqli.category.as_deref(), Some("sqli"));
+        assert_eq!(sqli.paranoia_level, Some(1));
+        assert_eq!(sqli.severity, "critical");
+        assert_eq!(sqli.action, "block");
+        assert_eq!(sqli.phase, 2);
+        assert!(!sqli.inert);
+        let xss = inv.rules.iter().find(|r| r.id == 941100).unwrap();
+        assert_eq!(xss.paranoia_level, Some(2));
+        // Serialises: the data plane ships this straight to the control plane.
+        let json = serde_json::to_string(&inv).unwrap();
+        assert!(json.contains("\"paranoia_level\":1"));
+    }
+
     use std::net::{IpAddr, Ipv4Addr};
 
     use bytes::Bytes;

@@ -226,6 +226,10 @@ deploy-shell:
     #    /opt/sentinel written — with an error about a blog's database.
     #    Nothing caught it because CI never invoked compose at all.
     - ./deploy/ci/check-compose-parses-clean.sh
+    # 3b. One version number: VERSION == Cargo.toml == package.json == Go const,
+    #     and no hard-coded vN.N.N in dashboard source. The console once showed
+    #     four different versions on one deployment.
+    - ./deploy/ci/check-version-consistency.sh
     # 4. The contract check — the one that catches shipping-breaking bugs.
     - STAGE_ONLY=1 ./deploy/package/build-bundle.sh
     - ./deploy/ci/check-bundle-contract.sh

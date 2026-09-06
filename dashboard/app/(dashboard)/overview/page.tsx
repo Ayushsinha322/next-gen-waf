@@ -5,8 +5,7 @@ import { showToast } from "@/components/ui/Toast";
 import {
   api,
   type DashboardStats, type MetricsSnapshot, type Attacker,
-  type Rule, type MLStats, type ThreatIntelSummary, type ClusterHealth,
-} from "@/lib/api";
+  type Rule, type MLStats, type ThreatIntelSummary, type ClusterHealth, type RuleInventory } from "@/lib/api";
 import { staggerContainer, cardVariants, fadeUp, spring } from "@/lib/animations";
 import { PLANS, ACTIVE_PLAN, type PlanKey } from "@/lib/plans";
 import { country } from "@/lib/geo";
@@ -545,12 +544,18 @@ function TopAttackers() {
 // ---------------------------------------------------------------------------
 function RuleEngineHealth({ metrics, running }: { metrics: MetricsSnapshot | null; running: boolean }) {
   const [rules, setRules] = useState<Rule[] | null>(null);
+  // The compiled inventory is what the data plane enforces. Without it this card
+  // read "OWASP CRS v4 core 5/5 rules enabled" — the five seeded rows of the
+  // authored store — while the engine held a few hundred compiled CRS rules.
+  const [inv, setInv] = useState<RuleInventory | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     async function f() {
       try { const r = await api.rules.list(); if (!cancelled) setRules(r.rules ?? []); }
       catch { if (!cancelled) setRules([]); }
+      try { const i = await api.rules.inventory({ summary: true }); if (!cancelled) setInv(i); }
+      catch { if (!cancelled) setInv(null); }
     }
     f(); const t = setInterval(f, 30_000); return () => { cancelled = true; clearInterval(t); };
   }, []);
@@ -572,7 +577,17 @@ function RuleEngineHealth({ metrics, running }: { metrics: MetricsSnapshot | nul
   const mlHits  = metrics?.ml_anomalies ?? 0;
 
   const rows: { name: string; sub: string; on: boolean; loading: boolean; hits: number | null }[] = [
-    { name: "OWASP CRS v4 core",   sub: loading ? "…" : `${crs.on}/${crs.total} rules enabled`,   on: crs.on > 0,            loading, hits: crsHits },
+    {
+      name: "OWASP CRS v4 (compiled)",
+      sub: inv == null ? (loading ? "…" : "inventory unavailable")
+         : !inv.dataplane_reachable ? "data plane unreachable"
+         : `${inv.totals.enforced.toLocaleString()} of ${inv.totals.compiled.toLocaleString()} compiled rules enforcing`
+           + (inv.totals.dropped > 0 ? ` · ${inv.totals.dropped} failed to compile` : "")
+           + (inv.totals.disabled > 0 ? ` · ${inv.totals.disabled} inert` : ""),
+      on: (inv?.totals.enforced ?? 0) > 0,
+      loading: inv == null && loading,
+      hits: crsHits,
+    },
     { name: "Custom SRL rules",    sub: loading ? "…" : `${custom.on}/${custom.total} rules enabled`, on: custom.on > 0,      loading, hits: null },
     { name: "Virtual patches",     sub: loading ? "…" : vp.total > 0 ? `${vp.on}/${vp.total} rules enabled` : "none loaded", on: vp.on > 0, loading, hits: null },
     { name: "ML anomaly engine",   sub: "behavioural scoring",       on: running, loading: false, hits: mlHits },
