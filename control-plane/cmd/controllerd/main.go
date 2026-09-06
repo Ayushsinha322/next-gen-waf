@@ -586,6 +586,8 @@ func run() error {
 		protected.POST("/sites/:id/exclusions", func(c *gin.Context) { handleAddSiteExclusion(c, enforcer, store, hub, cl) })
 		protected.DELETE("/sites/:id/exclusions/:rule_id", func(c *gin.Context) { handleDeleteSiteExclusion(c, enforcer, store, hub, cl) })
 		protected.GET("/rules", func(c *gin.Context) { handleListRules(c, enforcer, store) })
+		// The compiled set the data plane enforces (per site, with 24h hits) — not the authored store.
+		protected.GET("/rules/inventory", func(c *gin.Context) { handleRuleInventory(c, enforcer, chClient) })
 		protected.POST("/rules", func(c *gin.Context) { handleCreateRule(c, enforcer, store, hub, cl) })
 		// PATCH is a partial update (dsl, severity, phase, tags, enabled, site_id).
 		// PUT stays mapped to the enable/disable toggle so existing callers of the

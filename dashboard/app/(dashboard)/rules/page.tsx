@@ -2,7 +2,7 @@
 import { useState, useEffect } from "react";
 import { motion } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
-import { api, type Rule, type RuleTestResult } from "@/lib/api";
+import { api, type Rule, type RuleTestResult, type CompiledRule, type RuleInventory, type SiteRuleInventory } from "@/lib/api";
 import { staggerContainer, cardVariants, fadeUp, spring } from "@/lib/animations";
 
 const PHASE_LABELS = ["conn","req_hdr","req_body","upstream","resp_hdr","resp_body","log"];
@@ -54,6 +54,81 @@ const BLANK_DSL = `rule 9000100 {
   message  : "Custom SQL injection detection"
 }`;
 
+/** Right-hand panel for the Compiled tab: the enforced set's totals and gaps,
+ *  and the selected compiled rule. Read-only by design — these rules come from
+ *  the CRS files and the site's policy, not from the authored store. */
+function CompiledDetail({ inv, site, rule }: { inv: RuleInventory | null; site?: SiteRuleInventory; rule: CompiledRule | null }) {
+  if (!inv) return <div className="td3" style={{ padding:"16px 0", textAlign:"center", fontSize:13, fontFamily:"var(--font-mono)" }}>Loading the enforced rule set…</div>;
+  if (!inv.dataplane_reachable) {
+    return (
+      <div className="code-block" style={{ whiteSpace:"pre-wrap", borderLeft:"3px solid var(--red-b)" }}>
+        <span style={{ color:"var(--red-b)" }}>● DATA PLANE UNREACHABLE</span> — the control plane could not
+        fetch the compiled inventory, so nothing on this tab is known.{"\n"}{inv.error ?? ""}
+      </div>
+    );
+  }
+  const t = inv.totals;
+  const gaps = (site?.dropped.length ?? 0) + (site?.disabled.length ?? 0);
+  const stat = (label: string, value: string, color?: string) => (
+    <div style={{ minWidth:110 }}>
+      <div className="td3" style={{ fontSize:11, letterSpacing:".04em", textTransform:"uppercase" }}>{label}</div>
+      <div style={{ fontFamily:"var(--font-mono)", fontSize:18, fontVariantNumeric:"tabular-nums", color }}>{value}</div>
+    </div>
+  );
+  return (
+    <>
+      <div style={{ display:"flex", gap:18, flexWrap:"wrap" }}>
+        {stat("compiled", t.compiled.toLocaleString())}
+        {stat("enforcing", t.enforced.toLocaleString(), "var(--green)")}
+        {stat("failed to compile", String(t.dropped), t.dropped > 0 ? "var(--red-b)" : undefined)}
+        {stat("inert", String(t.disabled), t.disabled > 0 ? "var(--amber)" : undefined)}
+        {stat("hits · 24h", inv.clickhouse ? (t.hits_24h ?? 0).toLocaleString() : "no event store")}
+      </div>
+      <div className="td3" style={{ fontSize:12.5, lineHeight:1.5 }}>
+        This is what the data plane is enforcing right now{inv.version ? ` (data plane ${inv.version})` : ""}:
+        the OWASP CRS files, the placement and coverage signatures, and every authored rule that
+        compiled. The Authored tabs list what this control plane stores; the two are not the same thing.
+      </div>
+
+      {gaps > 0 && site && (
+        <div className="code-block" style={{ whiteSpace:"pre-wrap", borderLeft:"3px solid var(--amber)" }}>
+          <span style={{ color:"var(--amber)" }}>● {gaps} RULE{gaps === 1 ? "" : "S"} NOT ENFORCED on {site.site}</span>{"\n"}
+          {site.dropped.map(d => `${d.id}  failed to compile — ${d.reason}`).join("\n")}
+          {site.dropped.length > 0 && site.disabled.length > 0 ? "\n" : ""}
+          {site.disabled.length > 0 ? `inert (unsupported operator): ${site.disabled.join(", ")}` : ""}
+        </div>
+      )}
+
+      {rule ? (
+        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 }}>
+          <div className="fg2"><label className="flbl2">Rule id</label>
+            <input className="fin2" value={String(rule.id)} readOnly style={{ opacity:0.7 }} /></div>
+          <div className="fg2"><label className="flbl2">Phase</label>
+            <input className="fin2" value={PHASE_LABELS[rule.phase] ?? `phase ${rule.phase}`} readOnly style={{ opacity:0.7 }} /></div>
+          <div className="fg2" style={{ gridColumn:"1 / -1" }}><label className="flbl2">Message</label>
+            <input className="fin2" value={rule.message || "—"} readOnly style={{ opacity:0.7 }} /></div>
+          <div className="fg2"><label className="flbl2">Severity · action · score</label>
+            <input className="fin2" value={`${rule.severity} · ${rule.action} · ${rule.score_delta >= 0 ? "+" : ""}${rule.score_delta}`} readOnly style={{ opacity:0.7 }} /></div>
+          <div className="fg2"><label className="flbl2">Paranoia level · category</label>
+            <input className="fin2" value={`${rule.paranoia_level ?? "—"} · ${rule.category ?? "—"}`} readOnly style={{ opacity:0.7 }} /></div>
+          <div className="fg2"><label className="flbl2">Hits · blocks (24h)</label>
+            <input className="fin2" value={inv.clickhouse ? `${(rule.hits_24h ?? 0).toLocaleString()} · ${(rule.blocks_24h ?? 0).toLocaleString()}` : "no event store configured"} readOnly style={{ opacity:0.7 }} /></div>
+          <div className="fg2"><label className="flbl2">Enforcement</label>
+            <input className="fin2" value={rule.inert ? "INERT — loaded, operator unsupported, can never match" : "LIVE — compiled and evaluated on every request"} readOnly style={{ opacity:0.7, color: rule.inert ? "var(--amber)" : "var(--green)" }} /></div>
+          <div className="fg2" style={{ gridColumn:"1 / -1" }}><label className="flbl2">Tags</label>
+            <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
+              {rule.tags.length ? rule.tags.map(tg => <span key={tg} className="bdg bcy" style={{ textTransform:"none" }}>{tg}</span>) : <span className="td3">—</span>}
+            </div></div>
+        </div>
+      ) : (
+        <div className="td3" style={{ padding:"12px 0", textAlign:"center", fontSize:13, fontFamily:"var(--font-mono)" }}>
+          ← Click a compiled rule to inspect it
+        </div>
+      )}
+    </>
+  );
+}
+
 export default function RulesPage() {
   const [rules, setRules]         = useState<Rule[]>([]);
   const [loading, setLoading]     = useState(true);
@@ -71,10 +146,23 @@ export default function RulesPage() {
   const [saving, setSaving]           = useState(false);
   const [showModal, setShowModal]     = useState(false);
 
-  const refresh = () =>
+  // The compiled inventory — what the data plane ENFORCES. The authored list
+  // above is what this control plane STORES. Showing only the second under the
+  // heading "loaded rules" made a 347-rule engine read as a six-rule WAF.
+  const [inv, setInv]                 = useState<RuleInventory | null>(null);
+  const [invSite, setInvSite]         = useState<string>("");
+  const [selCompiled, setSelCompiled] = useState<CompiledRule | null>(null);
+  const [plFilter, setPlFilter]       = useState<number>(0);
+
+  const refresh = () => Promise.all([
     api.rules.list()
       .then(r => setRules(r.rules ?? []))
-      .catch(() => showToast("Failed to load rules", "e", "⚠️"));
+      .catch(() => showToast("Failed to load rules", "e", "⚠️")),
+    api.rules.inventory()
+      .then(setInv)
+      .catch(() => setInv({ dataplane_reachable: false, error: "control plane did not answer", sites: [],
+                            totals: { compiled: 0, enforced: 0, dropped: 0, disabled: 0 } })),
+  ]);
 
   useEffect(() => { refresh().finally(() => setLoading(false)); }, []);
 
@@ -86,16 +174,28 @@ export default function RulesPage() {
     return () => clearInterval(t);
   }, []);
 
-  const tabs = [
-    { label: "All",             data: rules },
+  const authoredTabs = [
+    { label: "Authored",        data: rules },
     { label: "CRS",             data: rules.filter(r => r.source === "crs") },
     { label: "Custom",          data: rules.filter(r => r.source === "custom" || r.source === "ai_generated") },
     { label: "Virtual Patches", data: rules.filter(r => r.source === "virtual_patch") },
   ].map(t => ({ ...t, label: `${t.label} (${t.data.length})` }));
+  const compiledLabel = inv?.dataplane_reachable ? `Compiled (${inv.totals.enforced.toLocaleString()})` : "Compiled";
+  const tabs = [{ label: compiledLabel, data: [] as Rule[] }, ...authoredTabs];
+  const isCompiledTab = activeTab === 0;
 
-  const displayed = tabs[activeTab].data.filter(r => {
+  const displayed = isCompiledTab ? [] : tabs[activeTab].data.filter(r => {
     const q = search.toLowerCase();
     return !q || r.name.toLowerCase().includes(q) || r.dsl.toLowerCase().includes(q);
+  });
+
+  const invSites = inv?.sites ?? [];
+  const curSite  = invSites.find(s => s.site === invSite) ?? invSites[0];
+  const compiledRows = (curSite?.rules ?? []).filter(r => {
+    if (plFilter && r.paranoia_level !== plFilter) return false;
+    const q = search.toLowerCase();
+    return !q || String(r.id).includes(q) || r.message.toLowerCase().includes(q)
+      || (r.category ?? "").includes(q) || r.tags.some(t => t.toLowerCase().includes(q));
   });
 
   async function toggleRule(r: Rule) {
@@ -198,7 +298,14 @@ export default function RulesPage() {
       <motion.div variants={fadeUp} style={{ display:"flex", alignItems:"flex-start", justifyContent:"space-between", gap:14 }}>
         <div>
           <div className="sec-title">📋 Rules Engine</div>
-          <div className="sec-sub">OWASP CRS v4.7 · Custom SRL · Virtual Patches · {rules.length} loaded rules</div>
+          <div className="sec-sub">
+            {inv == null ? "reading the enforced rule set…"
+              : !inv.dataplane_reachable ? "data plane unreachable — enforced rule set unknown"
+              : `${inv.totals.enforced.toLocaleString()} rules enforcing on the data plane`
+                + (inv.totals.dropped ? ` · ${inv.totals.dropped} failed to compile` : "")
+                + (inv.totals.disabled ? ` · ${inv.totals.disabled} inert` : "")}
+            {" · "}{rules.length} authored in this control plane
+          </div>
         </div>
         <div style={{ display:"flex", gap:8 }}>
           <motion.button className="btn bc btn-sm" onClick={runTest} disabled={testLoading} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
@@ -228,8 +335,51 @@ export default function RulesPage() {
                 onClick={() => { setActiveTab(i); setSearch(""); }}>{t.label}</div>
             ))}
           </div>
+          {isCompiledTab && inv?.dataplane_reachable && (
+            <div style={{ display:"flex", gap:8, padding:"8px 12px 0", alignItems:"center", flexWrap:"wrap" }}>
+              {invSites.length > 1 && (
+                <select className="fin2 fsel2" value={curSite?.site ?? ""} onChange={e => { setInvSite(e.target.value); setSelCompiled(null); }} style={{ width:180 }}>
+                  {invSites.map(si => <option key={si.site} value={si.site}>{si.site}</option>)}
+                </select>
+              )}
+              <select className="fin2 fsel2" value={plFilter} onChange={e => setPlFilter(Number(e.target.value))} style={{ width:120 }}>
+                <option value={0}>All PL</option><option value={1}>PL1</option><option value={2}>PL2</option>
+                <option value={3}>PL3</option><option value={4}>PL4</option>
+              </select>
+              <span className="td3" style={{ fontSize:12, fontFamily:"var(--font-mono)" }}>{compiledRows.length} shown</span>
+            </div>
+          )}
           <div className="tw" style={{ maxHeight:480, overflowY:"auto" }}>
-            {loading ? (
+            {isCompiledTab ? (
+              !inv ? (
+                <div style={{ padding:"24px", textAlign:"center", fontFamily:"var(--font-mono)", fontSize: 13, color:"var(--text3)" }}>Loading…</div>
+              ) : !inv.dataplane_reachable ? (
+                <div style={{ padding:"24px", textAlign:"center", fontFamily:"var(--font-mono)", fontSize: 13, color:"var(--red-b)" }}>data plane unreachable</div>
+              ) : (
+                <table>
+                  <thead><tr><th>Rule</th><th>Message</th><th>PL</th><th>Sev</th><th title="events attributed to this rule in the last 24 hours (ClickHouse)">Hits 24h</th></tr></thead>
+                  <tbody>
+                    {compiledRows.map(r => (
+                      <tr key={r.id} onClick={() => setSelCompiled(r)}
+                        style={{ cursor:"pointer", opacity: r.inert ? 0.55 : 1,
+                                 background: selCompiled?.id === r.id ? "rgba(0,200,240,0.06)" : undefined }}>
+                        <td>
+                          <span style={{ color:"var(--cyan)", fontSize: 14, fontFamily:"var(--font-mono)" }}>{r.id}</span>
+                          {r.inert && <span className="bdg ba" style={{ marginLeft:6 }} title="Loaded, but its operator is unsupported by the engine — it can never match">INERT</span>}
+                        </td>
+                        <td className="td3" title={r.message} style={{ maxWidth:240, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{r.message || r.category || "—"}</td>
+                        <td className="td3">{r.paranoia_level ?? "—"}</td>
+                        <td><SevBadge sev={r.severity === "notice" ? "info" : r.severity} /></td>
+                        <td className="td3" style={{ fontVariantNumeric:"tabular-nums", fontFamily:"var(--font-mono)" }}>{inv.clickhouse ? (r.hits_24h ?? 0).toLocaleString() : "—"}</td>
+                      </tr>
+                    ))}
+                    {compiledRows.length === 0 && (
+                      <tr><td colSpan={5} className="td3" style={{ textAlign:"center", padding:18 }}>no compiled rules match</td></tr>
+                    )}
+                  </tbody>
+                </table>
+              )
+            ) : loading ? (
               <div style={{ padding:"24px", textAlign:"center", fontFamily:"var(--font-mono)", fontSize: 13, color:"var(--text3)" }}>Loading…</div>
             ) : (
               <table>
@@ -269,14 +419,17 @@ export default function RulesPage() {
         <div className="panel" style={{ display:"flex", flexDirection:"column" }}>
           <div className="ph">
             <div className="ptitle">
-              ✏️ Rule Editor
-              {editorRule && <span style={{ fontSize: 14, color:"var(--text3)", marginLeft:8 }}>— {editorRule.name}</span>}
+              {isCompiledTab ? "🔎 Enforced rule set" : "✏️ Rule Editor"}
+              {!isCompiledTab && editorRule && <span style={{ fontSize: 14, color:"var(--text3)", marginLeft:8 }}>— {editorRule.name}</span>}
             </div>
             <motion.button className="btn bc btn-sm" onClick={runTest} disabled={testLoading} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
               {testLoading ? "⏳" : "▶ Test"}
             </motion.button>
           </div>
           <div className="pb" style={{ flex:1, display:"flex", flexDirection:"column", gap:12 }}>
+            {isCompiledTab ? (
+              <CompiledDetail inv={inv} site={curSite} rule={selCompiled} />
+            ) : (<>
             {editorRule ? (
               <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 }}>
                 <div className="fg2"><label className="flbl2">Name</label>
@@ -363,6 +516,7 @@ export default function RulesPage() {
                 )}
               </motion.div>
             )}
+            </>)}
           </div>
         </div>
       </motion.div>

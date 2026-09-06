@@ -327,6 +327,48 @@ export interface PluginPermissions {
   host_http_callout?:   boolean;
 }
 
+/** One rule compiled into a site's engine on the data plane (GET /rules/inventory). */
+export interface CompiledRule {
+  id:             number;
+  message:        string;
+  severity:       "critical" | "high" | "medium" | "low" | "notice" | string;
+  /** RulePhase discriminant: 0 conn · 1 req_hdr · 2 req_body · 3 upstream · 4 resp_hdr · 5 resp_body · 6 log */
+  phase:          number;
+  action:         string;
+  score_delta:    number;
+  paranoia_level: number | null;
+  category:       string | null;
+  /** Loaded but can never match — operator unsupported by the engine. */
+  inert:          boolean;
+  tags:           string[];
+  /** Present when ClickHouse is configured. */
+  hits_24h?:      number;
+  blocks_24h?:    number;
+}
+
+/** The compiled rule set of one site engine. */
+export interface SiteRuleInventory {
+  site:     string;
+  total:    number;
+  enforced: number;
+  dropped:  { id: number; reason: string }[];
+  disabled: number[];
+  /** Absent when fetched with summary=1. */
+  rules?:   CompiledRule[];
+}
+
+/** GET /rules/inventory — what the data plane ENFORCES, as opposed to GET /rules,
+ *  which is what operators have authored in the control plane's store. */
+export interface RuleInventory {
+  dataplane_reachable: boolean;
+  error?:              string;
+  version?:            string;
+  clickhouse?:         boolean;
+  hits_window_secs?:   number;
+  sites:               SiteRuleInventory[];
+  totals: { compiled: number; enforced: number; dropped: number; disabled: number; hits_24h?: number };
+}
+
 /** An installed WASM plugin (module bytes are never sent to the browser). */
 export interface Plugin {
   id:          string;
@@ -903,6 +945,15 @@ export const api = {
 
   rules: {
     list:   () => apiFetch<{ rules: Rule[]; tenant_id: string }>("/rules"),
+    /** The compiled set the data plane enforces, per site, with 24h hit counts.
+     *  `summary` drops the per-rule list — for badges and cards that poll. */
+    inventory: (opts: { site?: string; summary?: boolean } = {}) => {
+      const q = new URLSearchParams();
+      if (opts.site) q.set("site", opts.site);
+      if (opts.summary) q.set("summary", "1");
+      const qs = q.toString();
+      return apiFetch<RuleInventory>(`/rules/inventory${qs ? `?${qs}` : ""}`);
+    },
     create: (body: Partial<Rule>) =>
       apiFetch<{ rule: Rule }>("/rules", { method: "POST", body: JSON.stringify(body) }),
     /** Enable/disable only. PATCH is a full partial-update now, so the toggle

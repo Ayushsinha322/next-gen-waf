@@ -137,13 +137,19 @@ export default function SideBar() {
   useEffect(() => {
     let cancelled = false;
     async function load() {
-      const [sites, rules, plugins, alerts] = await Promise.allSettled([
+      const [sites, rules, plugins, alerts, inv] = await Promise.allSettled([
         api.sites.list(), api.rules.list(), api.plugins.list(), api.alerts.list(),
+        api.rules.inventory({ summary: true }),
       ]);
       if (cancelled) return;
+      // The Rules badge is the number of rules the data plane ENFORCES (compiled
+      // CRS + custom + patches), not the size of the authored store. When the data
+      // plane is unreachable fall back to the store count rather than showing 0.
+      const enforced = inv.status === "fulfilled" && inv.value.dataplane_reachable
+        ? inv.value.totals.enforced : null;
       setCounts({
         sites:   sites.status   === "fulfilled" ? (sites.value.sites?.length     ?? 0) : null,
-        rules:   rules.status   === "fulfilled" ? (rules.value.rules?.length     ?? 0) : null,
+        rules:   enforced ?? (rules.status === "fulfilled" ? (rules.value.rules?.length ?? 0) : null),
         plugins: plugins.status === "fulfilled" ? (plugins.value.plugins?.length ?? 0) : null,
         alerts:  alerts.status  === "fulfilled" ? (alerts.value.alerts?.filter(a => a.state === "open").length ?? 0) : null,
       });

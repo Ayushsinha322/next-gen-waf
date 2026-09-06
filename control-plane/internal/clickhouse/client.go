@@ -467,6 +467,33 @@ func (c *Client) Facets(ctx context.Context, column, tenant string, from, to int
 	return out, nil
 }
 
+// RuleHit is how often one rule fired over a window, and how often the
+// request was actually blocked (a rule can fire in learning mode or below the
+// anomaly threshold without a block).
+type RuleHit struct {
+	RuleID  string `json:"rule_id"`
+	Count   int64  `json:"count"`
+	Blocked int64  `json:"blocked"`
+}
+
+// RuleHits rolls up waf_events by rule id over the window. It feeds the Rules
+// page's compiled-rule inventory, so an operator can see which of the few
+// hundred CRS rules actually do work on this deployment. Tenant-scoped like
+// every other read here.
+func (c *Client) RuleHits(ctx context.Context, tenant string, from, to int64) ([]RuleHit, error) {
+	where := append(c.timeWhere(from, to), eq("tenant", tenant))
+	sql := fmt.Sprintf(
+		"SELECT rule AS rule_id, count() AS count, countIf(action = 'BLOCK') AS blocked "+
+			"FROM %s.waf_events WHERE %s AND rule != '' "+
+			"GROUP BY rule ORDER BY count DESC LIMIT 5000",
+		c.db, strings.Join(where, " AND "))
+	var out []RuleHit
+	if err := c.queryJSON(ctx, sql, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // LearningStat is one rule's would-have-blocked aggregate, reconstructed from
 // the stored DETECT events. Field names match logs.LearningStat so the two
 // sources are interchangeable to an API consumer.

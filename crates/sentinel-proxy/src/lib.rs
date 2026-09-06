@@ -2630,6 +2630,9 @@ async fn handle_request(
         if req.uri().path().starts_with("/api/v1/internal/certs") {
             return Ok(handle_internal_cert_api(state, req).await);
         }
+        if req.method() == http::Method::GET && req.uri().path() == "/api/v1/internal/rules" {
+            return Ok(rules_inventory_response(&state, req.uri().query()));
+        }
         return Ok(error_response(
             StatusCode::NOT_FOUND,
             "unknown internal endpoint",
@@ -6676,6 +6679,72 @@ fn json_err(status: StatusCode, message: &str) -> Response<BoxBody> {
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")
         .body(full_body(Bytes::from(body)))
+        .unwrap()
+}
+
+/// `GET /api/v1/internal/rules[?site=<id>][&summary=1]` — the compiled rule
+/// inventory of every site engine on this node.
+///
+/// This exists because the console's Rules page listed the control plane's
+/// authored rule store (six rows) and called it "loaded rules" while this
+/// process was enforcing a few hundred compiled CRS rules with no way to show
+/// them. The control plane proxies this to the dashboard and adds hit counts.
+///
+/// `summary=1` omits the per-rule list (totals and gaps only), which is what
+/// the sidebar badge and the overview card need every few seconds.
+fn rules_inventory_response(state: &ServerState, query: Option<&str>) -> Response<BoxBody> {
+    let mut site_filter: Option<String> = None;
+    let mut summary = false;
+    for pair in query.unwrap_or("").split('&') {
+        match pair.split_once('=') {
+            Some(("site", v)) if !v.is_empty() => site_filter = Some(v.to_string()),
+            Some(("summary", v)) => summary = v == "1" || v == "true",
+            _ => {}
+        }
+    }
+
+    let engines = state.engines.load();
+    let mut sites: Vec<serde_json::Value> = Vec::new();
+    let (mut compiled, mut enforced, mut dropped, mut disabled) = (0usize, 0usize, 0usize, 0usize);
+    let mut ids: Vec<&String> = engines.keys().collect();
+    ids.sort();
+    for site_id in ids {
+        if let Some(f) = &site_filter {
+            if f != site_id {
+                continue;
+            }
+        }
+        let inv = engines[site_id].inventory();
+        compiled += inv.total;
+        enforced += inv.enforced;
+        dropped += inv.dropped.len();
+        disabled += inv.disabled.len();
+        let mut v = serde_json::to_value(&inv).unwrap_or_else(|_| serde_json::json!({}));
+        if summary {
+            if let Some(obj) = v.as_object_mut() {
+                obj.remove("rules");
+            }
+        }
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("site".into(), serde_json::Value::String(site_id.clone()));
+        }
+        sites.push(v);
+    }
+
+    let body = serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "sites": sites,
+        "totals": {
+            "compiled": compiled,
+            "enforced": enforced,
+            "dropped": dropped,
+            "disabled": disabled,
+        },
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(full_body(Bytes::from(body.to_string())))
         .unwrap()
 }
 
