@@ -5944,6 +5944,30 @@ fn inject_security_headers(headers: &mut http::HeaderMap, cfg: Option<&SecurityH
             }
         }
     }
+    // HSTS — only when the operator turned it on (browsers ignore it over plain
+    // HTTP, so emitting it unconditionally is harmless but pointless; the site
+    // policy decides).
+    if let Some(h) = cfg.hsts.as_ref().filter(|h| h.enabled) {
+        let max_age = if h.max_age == 0 {
+            31_536_000
+        } else {
+            h.max_age
+        };
+        let mut v = format!("max-age={max_age}");
+        if h.include_subdomains {
+            v.push_str("; includeSubDomains");
+        }
+        if h.preload {
+            v.push_str("; preload");
+        }
+        if let Ok(hv) = http::HeaderValue::from_str(&v) {
+            headers.insert(header::STRICT_TRANSPORT_SECURITY, hv);
+        }
+    }
+    // Cookie hardening: append missing attributes to matching Set-Cookie headers.
+    if let Some(spec) = cfg.cookie_flags.as_deref().filter(|s| !s.trim().is_empty()) {
+        harden_set_cookies(headers, spec);
+    }
     // Operator-defined custom headers, applied last so they win.
     for h in &cfg.custom {
         if h.name.is_empty() {
@@ -5955,6 +5979,72 @@ fn inject_security_headers(headers: &mut http::HeaderMap, cfg: Option<&SecurityH
         ) {
             headers.insert(name, val);
         }
+    }
+}
+
+/// Apply a cookie-flags spec (`"<name-or-*> Flag [Flag…]"`) to every
+/// `Set-Cookie` header: for each cookie whose name matches, append each listed
+/// attribute the origin did not already set (compared case-insensitively on the
+/// attribute name, so `SameSite=Strict` from the origin is left alone when the
+/// policy says `SameSite=Lax`). Malformed spec → no change.
+fn harden_set_cookies(headers: &mut http::HeaderMap, spec: &str) {
+    let mut parts = spec.split_whitespace();
+    let Some(pattern) = parts.next() else { return };
+    let flags: Vec<&str> = parts.collect();
+    if flags.is_empty() {
+        return;
+    }
+    let existing: Vec<http::HeaderValue> = headers
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .cloned()
+        .collect();
+    if existing.is_empty() {
+        return;
+    }
+    let mut rewritten: Vec<http::HeaderValue> = Vec::with_capacity(existing.len());
+    for hv in &existing {
+        let Ok(raw) = hv.to_str() else {
+            rewritten.push(hv.clone());
+            continue;
+        };
+        let name = raw
+            .split(';')
+            .next()
+            .and_then(|kv| kv.split('=').next())
+            .unwrap_or("")
+            .trim();
+        if pattern != "*" && !pattern.eq_ignore_ascii_case(name) {
+            rewritten.push(hv.clone());
+            continue;
+        }
+        let present: Vec<String> = raw
+            .split(';')
+            .skip(1)
+            .map(|a| {
+                a.trim()
+                    .split('=')
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase()
+            })
+            .collect();
+        let mut out = raw.to_string();
+        for f in &flags {
+            let key = f.split('=').next().unwrap_or("").to_ascii_lowercase();
+            if !key.is_empty() && !present.iter().any(|p| p == &key) {
+                out.push_str("; ");
+                out.push_str(f);
+            }
+        }
+        match http::HeaderValue::from_str(&out) {
+            Ok(v) => rewritten.push(v),
+            Err(_) => rewritten.push(hv.clone()),
+        }
+    }
+    headers.remove(header::SET_COOKIE);
+    for v in rewritten {
+        headers.append(header::SET_COOKIE, v);
     }
 }
 
@@ -11055,5 +11145,82 @@ mod global_settings_redaction_tests {
             v["logging"]["outputs"][0]["endpoint"],
             "http://otel:4318/v1/logs"
         );
+    }
+}
+
+#[cfg(test)]
+mod security_header_hardening_tests {
+    use super::*;
+    use sentinel_core::config::{HstsConfig, SecurityHeadersConfig};
+
+    #[test]
+    fn hsts_and_cookie_flags_are_applied_when_configured() {
+        let cfg = SecurityHeadersConfig {
+            hsts: Some(HstsConfig {
+                enabled: true,
+                max_age: 0,
+                include_subdomains: true,
+                preload: false,
+            }),
+            cookie_flags: Some("* HttpOnly SameSite=Lax Secure".into()),
+            ..Default::default()
+        };
+        let mut h = http::HeaderMap::new();
+        h.append(
+            header::SET_COOKIE,
+            http::HeaderValue::from_static("sid=abc; Path=/"),
+        );
+        h.append(
+            header::SET_COOKIE,
+            http::HeaderValue::from_static("pref=1; SameSite=Strict; HttpOnly"),
+        );
+        inject_security_headers(&mut h, Some(&cfg));
+        assert_eq!(
+            h.get(header::STRICT_TRANSPORT_SECURITY).unwrap(),
+            "max-age=31536000; includeSubDomains"
+        );
+        let cookies: Vec<&str> = h
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            cookies[0],
+            "sid=abc; Path=/; HttpOnly; SameSite=Lax; Secure"
+        );
+        // Origin's own SameSite=Strict wins; only the missing attribute is added.
+        assert_eq!(cookies[1], "pref=1; SameSite=Strict; HttpOnly; Secure");
+    }
+
+    #[test]
+    fn disabled_hsts_and_named_pattern() {
+        let cfg = SecurityHeadersConfig {
+            hsts: Some(HstsConfig {
+                enabled: false,
+                ..Default::default()
+            }),
+            cookie_flags: Some("session Secure".into()),
+            ..Default::default()
+        };
+        let mut h = http::HeaderMap::new();
+        h.append(
+            header::SET_COOKIE,
+            http::HeaderValue::from_static("session=x"),
+        );
+        h.append(
+            header::SET_COOKIE,
+            http::HeaderValue::from_static("other=y"),
+        );
+        inject_security_headers(&mut h, Some(&cfg));
+        assert!(
+            h.get(header::STRICT_TRANSPORT_SECURITY).is_none(),
+            "disabled must emit nothing"
+        );
+        let cookies: Vec<&str> = h
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(cookies, vec!["session=x; Secure", "other=y"]);
     }
 }

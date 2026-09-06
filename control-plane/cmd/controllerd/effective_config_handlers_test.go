@@ -27,6 +27,19 @@ func TestDiffJSONFindsDroppedNestedKeyAndDefaults(t *testing.T) {
 	}
 }
 
+func TestDiffJSONIgnoresFloat32Precision(t *testing.T) {
+	// Seen live on .71: the wizard pushes 0.99, the data plane holds an f32.
+	a := toJSON(map[string]any{"waf": map[string]any{"ml": map[string]any{"sensitivity": 0.99}}})
+	b := toJSON(map[string]any{"waf": map[string]any{"ml": map[string]any{"sensitivity": 0.9900000095367432}}})
+	if d := diffJSON(a, b); len(d) != 0 {
+		t.Fatalf("f32 rounding must not be a diff: %+v", d)
+	}
+	c := toJSON(map[string]any{"waf": map[string]any{"ml": map[string]any{"sensitivity": 0.98}}})
+	if d := diffJSON(a, c); len(d) != 1 {
+		t.Fatalf("a real change must still be a diff: %+v", d)
+	}
+}
+
 func TestDiffJSONIdenticalIsEmptyAndRedactionMatchesDataPlane(t *testing.T) {
 	v := toJSON(map[string]any{"waf": map[string]any{"jwt": map[string]any{"hs_secret": "x", "issuer": "i"}}})
 	if d := diffJSON(v, v); len(d) != 0 {

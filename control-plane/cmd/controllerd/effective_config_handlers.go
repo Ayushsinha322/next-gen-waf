@@ -213,7 +213,26 @@ func flatten(prefix string, v any, out map[string]any) {
 	}
 }
 
+// jsonEqual treats two numbers as equal within float32 precision: the data
+// plane stores some tunables as f32 (0.99 comes back as 0.9900000095367432),
+// and reporting that as a configuration difference would bury real ones.
 func jsonEqual(a, b any) bool {
+	if fa, ok := a.(float64); ok {
+		if fb, ok := b.(float64); ok {
+			diff := fa - fb
+			if diff < 0 {
+				diff = -diff
+			}
+			scale := fa
+			if scale < 0 {
+				scale = -scale
+			}
+			if scale < 1 {
+				scale = 1
+			}
+			return diff <= scale*1e-6
+		}
+	}
 	ab, _ := json.Marshal(a)
 	bb, _ := json.Marshal(b)
 	return string(ab) == string(bb)

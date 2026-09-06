@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"time"
 
@@ -38,6 +39,36 @@ func handleListJobs(c *gin.Context, enf *rbac.Enforcer, cl *leader.Elector) {
 			role = "leader"
 		} else {
 			role = "follower"
+		}
+	}
+	// Jobs run on the leader, and the console usually reaches a follower (the
+	// management listener proxies to one fixed control-plane hostname). The
+	// generic leader-forward middleware only routes writes, so forward this read
+	// by hand: ask the leader for its list and return that, marked as such.
+	if !isLeader && cl != nil && c.GetHeader("X-Sentinel-Forwarded") == "" {
+		if _, advertise, ok := cl.Leader(); ok && advertise != "" {
+			host, port, err := net.SplitHostPort(advertise)
+			if err != nil {
+				host, port = advertise, clusterRESTPort()
+			}
+			target := "http://" + net.JoinHostPort(host, port) + c.Request.URL.RequestURI()
+			req, _ := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, target, nil)
+			req.Header = c.Request.Header.Clone()
+			req.Header.Set("X-Sentinel-Forwarded", "1")
+			if r, err := leaderForwardClient.Do(req); err == nil {
+				body, _ := io.ReadAll(io.LimitReader(r.Body, 4<<20))
+				r.Body.Close()
+				if r.StatusCode == http.StatusOK {
+					var fwd map[string]any
+					if json.Unmarshal(body, &fwd) == nil {
+						fwd["forwarded_from"] = "leader"
+						fwd["answered_by"] = "leader via this follower"
+						c.JSON(http.StatusOK, fwd)
+						return
+					}
+				}
+			}
+			// Leader unreachable: fall through and answer with what this node knows.
 		}
 	}
 	resp := gin.H{

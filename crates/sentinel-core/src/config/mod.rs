@@ -706,6 +706,28 @@ pub struct SecurityHeadersConfig {
     /// Arbitrary operator-defined response headers (name/value), applied last.
     #[serde(default)]
     pub custom: Vec<CustomHeader>,
+    /// `Strict-Transport-Security`. The console has offered this toggle since
+    /// July; until this field existed the value was pushed and silently dropped
+    /// here, so the switch did nothing. Found by the Effective Config diff.
+    pub hsts: Option<HstsConfig>,
+    /// Cookie hardening: `"<name-or-*> Flag [Flag…]"`, e.g.
+    /// `"* HttpOnly SameSite=Lax"` — append the listed attributes to every
+    /// matching `Set-Cookie` the origin emits, when it did not set them itself.
+    /// Same story as `hsts`: offered by the console, dropped by the data plane.
+    pub cookie_flags: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HstsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Seconds. 0 → the conventional one year.
+    #[serde(default)]
+    pub max_age: u64,
+    #[serde(default)]
+    pub include_subdomains: bool,
+    #[serde(default)]
+    pub preload: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
