@@ -1,5 +1,14 @@
 /** @type {import('next').NextConfig} */
+// The product version is read from package.json, which the CI check
+// deploy/ci/check-version-consistency.sh pins to the repo-root VERSION file
+// (as it does Cargo.toml and the Go version package). Exposing it here means the
+// login page, the top bar and the cluster footer all print ONE number, at build
+// time, with no runtime call — the console once showed v4.2.1, v3.1.0, 0.1.0 and
+// 1.1.0 on the same deployment because each was a separate hard-coded string.
+const PRODUCT_VERSION = require("./package.json").version;
+
 const nextConfig = {
+  env: { NEXT_PUBLIC_PRODUCT_VERSION: PRODUCT_VERSION },
   eslint: { ignoreDuringBuilds: true },
   typescript: { ignoreBuildErrors: true },
   // Emit .next/standalone — a self-contained server with ONLY the node_modules

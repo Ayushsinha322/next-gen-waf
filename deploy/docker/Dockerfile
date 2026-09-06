@@ -67,7 +67,15 @@ FROM golang:1.24-alpine AS go-builder
 ENV CGO_ENABLED=0
 WORKDIR /src/control-plane
 COPY control-plane ./
-RUN go build -ldflags="-s -w" -o /out/controllerd ./cmd/controllerd \
+# Stamp the binary with its commit and build date so /api/v1/cluster/status
+# reports what it was built from. The product version itself is a constant in
+# internal/version, pinned to the repo-root VERSION file by CI.
+ARG GIT_SHA=unknown
+ARG BUILD_DATE=unknown
+RUN go build -ldflags="-s -w \
+      -X github.com/your-org/sentinel-waf/control-plane/internal/version.Commit=${GIT_SHA} \
+      -X github.com/your-org/sentinel-waf/control-plane/internal/version.BuildDate=${BUILD_DATE}" \
+      -o /out/controllerd ./cmd/controllerd \
  && go build -ldflags="-s -w" -o /out/sentinelctl  ./cmd/sentinelctl
 
 # ---- Data plane (Rust proxy) ----
