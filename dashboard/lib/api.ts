@@ -420,6 +420,21 @@ export interface EffectiveConfig {
   diff?: { path: string; pushed: unknown; applied: unknown }[];
 }
 
+/** GET /jobs — background work on this control-plane node plus the data plane's pollers. */
+export interface JobStatus {
+  name: string; description: string; interval: string; interval_secs: number;
+  running: boolean; runs: number; failures: number;
+  last_start?: string; last_end?: string; last_duration_ms: number;
+  last_error?: string; last_note?: string; next_due?: string; can_run_now: boolean;
+}
+export interface JobsResponse {
+  node: { role: "leader" | "follower" | "standalone"; runs_jobs: boolean };
+  jobs: JobStatus[];
+  note: string;
+  dataplane?: { reachable: boolean; error?: string; version?: string; uptime_secs?: number;
+    threat_intel?: { configured: boolean; poller: string; last_sync_status: number; version: number; entries: number; active: boolean; inert_reason?: string | null } };
+}
+
 /** An installed WASM plugin (module bytes are never sent to the browser). */
 export interface Plugin {
   id:          string;
@@ -1093,6 +1108,12 @@ export const api = {
       ),
     ack:     (id: string) => apiFetch<{ ok: boolean }>(`/alerts/${id}/ack`,     { method: "POST" }),
     resolve: (id: string) => apiFetch<{ ok: boolean }>(`/alerts/${id}/resolve`, { method: "POST" }),
+  },
+
+  /** Background jobs — the System Jobs page. */
+  jobs: {
+    list: () => apiFetch<JobsResponse>("/jobs"),
+    run:  (name: string) => apiFetch<{ ok: boolean; job: JobStatus; error?: string }>(`/jobs/${encodeURIComponent(name)}/run`, { method: "POST" }),
   },
 
   /** Blocked sources: the unified view plus the data-plane unblock. */

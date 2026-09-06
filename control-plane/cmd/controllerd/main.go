@@ -644,6 +644,9 @@ func run() error {
 		// Notification channels (SOC integration: webhook / Slack / syslog / CEF).
 		// Node-wide operator settings (alert thresholds, threat-intel feeds) plus
 		// the data plane's read-only global config — the Global Settings page.
+		// Background jobs: what runs, when it last ran, how it went, run it now.
+		protected.GET("/jobs", func(c *gin.Context) { handleListJobs(c, enforcer, cl) })
+		protected.POST("/jobs/:name/run", func(c *gin.Context) { handleRunJob(c, enforcer, store, hub, cl) })
 		protected.GET("/settings/global", func(c *gin.Context) { handleGetGlobalSettings(c, enforcer, store) })
 		protected.PUT("/settings/global", func(c *gin.Context) { handlePutGlobalSettings(c, enforcer, store, hub, cl) })
 		protected.DELETE("/settings/global/:key", func(c *gin.Context) { handleDeleteGlobalSetting(c, enforcer, store, hub, cl) })
