@@ -409,6 +409,17 @@ export interface BlocksResponse {
   countries: string[];
 }
 
+/** GET /sites/:id/effective — pushed vs held config with a field diff. */
+export interface EffectiveConfig {
+  site_id: string; site: string; status: string;
+  ignored_policy_keys: string[];
+  pushed?: Record<string, unknown>; pushed_error?: string;
+  applied?: Record<string, unknown> | null;
+  dataplane: { reachable: boolean; error?: string; version?: string;
+    engine?: { rules_compiled: number; rules_enforced: number; rules_dropped: number } | null };
+  diff?: { path: string; pushed: unknown; applied: unknown }[];
+}
+
 /** An installed WASM plugin (module bytes are never sent to the browser). */
 export interface Plugin {
   id:          string;
@@ -946,6 +957,8 @@ export const api = {
   sites: {
     list: () => apiFetch<{ sites: Site[]; tenant_id: string }>("/sites"),
     get:  (id: string) => apiFetch<{ site: Site }>(`/sites/${id}`),
+    /** What the control plane pushes vs what the data plane holds, with a diff. */
+    effective: (id: string) => apiFetch<EffectiveConfig>(`/sites/${id}/effective`),
     create: (body: { name: string; domains: string[]; upstream?: object; waf_policy?: object }) =>
       apiFetch<{ site: Site }>("/sites", { method: "POST", body: JSON.stringify(body) }),
     update: (id: string, body: { name?: string; domains?: string[]; upstream?: object; waf_policy?: object }) =>

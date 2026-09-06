@@ -602,6 +602,8 @@ func run() error {
 			handleRollbackConfig(c, enforcer, store, hub, cl, log)
 		})
 		protected.GET("/sites/:id", func(c *gin.Context) { handleGetSite(c, enforcer, store) })
+		// Pushed vs held config for one site, with a field diff — the silently-inert detector.
+		protected.GET("/sites/:id/effective", func(c *gin.Context) { handleSiteEffectiveConfig(c, enforcer, store) })
 		protected.PUT("/sites/:id", func(c *gin.Context) { handleUpdateSite(c, enforcer, store, hub, cl, log) })
 		protected.PATCH("/sites/:id", func(c *gin.Context) { handleUpdateSite(c, enforcer, store, hub, cl, log) })
 		protected.DELETE("/sites/:id", func(c *gin.Context) { handleDeleteSite(c, enforcer, store, hub, cl, log) })

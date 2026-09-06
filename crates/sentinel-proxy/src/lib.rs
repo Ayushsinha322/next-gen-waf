@@ -2676,6 +2676,13 @@ async fn handle_request(
         if req.method() == http::Method::GET && req.uri().path() == "/api/v1/internal/blocks" {
             return Ok(blocks_response(&state));
         }
+        if req.method() == http::Method::GET {
+            if let Some(rest) = req.uri().path().strip_prefix("/api/v1/internal/sites/") {
+                if let Some(site_id) = rest.strip_suffix("/config") {
+                    return Ok(site_effective_config_response(&state, site_id));
+                }
+            }
+        }
         if req.method() == http::Method::DELETE {
             if let Some(ip) = req.uri().path().strip_prefix("/api/v1/internal/blocks/") {
                 return Ok(unblock_response(&state, ip.trim_end_matches('/')));
@@ -6730,6 +6737,66 @@ fn json_err(status: StatusCode, message: &str) -> Response<BoxBody> {
         .header(header::CONTENT_TYPE, "application/json")
         .body(full_body(Bytes::from(body)))
         .unwrap()
+}
+
+/// `GET /api/v1/internal/sites/{id}/config` — the site configuration THIS node is
+/// actually applying, secrets redacted, plus the compiled rule count for it.
+///
+/// The control plane converts a stored site into this shape and pushes it; the
+/// console shows both side by side. Every one of the six "silently inert" bugs
+/// was a control the console showed that never reached this struct, and a
+/// diff between what was pushed and what is held would have found each of them
+/// in minutes.
+fn site_effective_config_response(state: &ServerState, site_id: &str) -> Response<BoxBody> {
+    let site_id = match percent_decode_simple(site_id) {
+        Some(s) => s,
+        None => return json_err(StatusCode::BAD_REQUEST, "bad site id"),
+    };
+    let cfg = state.config.load();
+    let Some(site) = cfg.sites.iter().find(|s| s.id == site_id) else {
+        return json_err(StatusCode::NOT_FOUND, "no such site on this node");
+    };
+    let mut v = serde_json::to_value(site).unwrap_or_else(|_| serde_json::json!({}));
+    redact_secrets(&mut v);
+    let engines = state.engines.load();
+    let engine = engines.get(&site_id).map(|e| {
+        let inv = e.inventory();
+        serde_json::json!({
+            "rules_compiled": inv.total,
+            "rules_enforced": inv.enforced,
+            "rules_dropped": inv.dropped.len(),
+        })
+    });
+    let body = serde_json::json!({
+        "site": site_id,
+        "version": env!("CARGO_PKG_VERSION"),
+        "applied": v,
+        "engine": engine,
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(full_body(Bytes::from(body.to_string())))
+        .unwrap()
+}
+
+/// Minimal `%XX` decoding for a path segment (site ids are slugs or host names,
+/// but a name with a space or unicode arrives encoded).
+fn percent_decode_simple(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = bytes.get(i + 1..i + 3)?;
+            out.push(u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// `GET /api/v1/internal/blocks` — every source THIS node is currently
