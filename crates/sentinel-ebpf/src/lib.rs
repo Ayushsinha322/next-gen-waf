@@ -820,6 +820,16 @@ impl EbpfManager {
     /// O(10³) exact-IP entries and O(10) CIDR ranges, so this is fast enough.
     ///
     /// When a match is found the `xdp_drop` counter is incremented.
+    /// Everything currently in the blocklist: exact IPs (sorted) and CIDR ranges.
+    /// For the console's Blocked Sources page; the set is small (bans are
+    /// low-volume) so a copy under the read lock is fine.
+    pub fn blocked_entries(&self) -> (Vec<IpAddr>, Vec<IpNet>) {
+        let bl = self.blocklist.read().expect("blocklist RwLock poisoned");
+        let mut ips: Vec<IpAddr> = bl.exact.iter().copied().collect();
+        ips.sort();
+        (ips, bl.ranges.clone())
+    }
+
     #[inline]
     pub fn is_blocked(&self, ip: IpAddr) -> bool {
         let bl = self.blocklist.read().expect("blocklist RwLock poisoned");

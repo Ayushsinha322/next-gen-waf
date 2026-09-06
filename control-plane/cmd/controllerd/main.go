@@ -681,6 +681,9 @@ func run() error {
 		protected.GET("/logs/profiles/:id/export", func(c *gin.Context) { handleExportLogProfile(c, enforcer, store, chClient, hub) })
 
 		protected.GET("/geoip/blocked", func(c *gin.Context) { handleListBlockedCountries(c, enforcer, store) })
+		// Every active block in one place (data-plane bans + block-tier indicators + countries).
+		protected.GET("/blocks", func(c *gin.Context) { handleListBlocks(c, enforcer, store) })
+		protected.DELETE("/blocks/ip/:ip", func(c *gin.Context) { handleUnblockIP(c, enforcer, store, hub, cl) })
 		protected.POST("/geoip/block", func(c *gin.Context) { handleBlockCountry(c, enforcer, store, hub, cl) })
 		protected.DELETE("/geoip/block/:code", func(c *gin.Context) { handleUnblockCountry(c, enforcer, store, hub, cl) })
 		protected.GET("/metrics/snapshot", func(c *gin.Context) {

@@ -382,6 +382,43 @@ impl CorrelationEngine {
         rec.last_block_at.store(now as usize, Ordering::Relaxed);
     }
 
+    /// Every IP with blocks inside the current window, most-blocked first:
+    /// `(ip, blocks_in_window, last_block_unix)`. For the Blocked Sources page.
+    fn offenders(&self) -> Vec<(IpAddr, u32, u64)> {
+        let now = unix_now_secs();
+        let mut out: Vec<(IpAddr, u32, u64)> = self
+            .state
+            .iter()
+            .filter_map(|e| {
+                let last = e.value().last_block_at.load(Ordering::Relaxed) as u64;
+                if now.saturating_sub(last) > self.window_secs {
+                    return None;
+                }
+                Some((
+                    *e.key(),
+                    e.value().blocks.load(Ordering::Relaxed) as u32,
+                    last,
+                ))
+            })
+            .collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
+        out
+    }
+
+    /// Drop an IP's history so it is no longer escalated or counted toward the
+    /// auto-ban threshold. Returns whether anything was tracked.
+    fn forget(&self, ip: IpAddr) -> bool {
+        self.state.remove(&ip).is_some()
+    }
+
+    fn window(&self) -> u64 {
+        self.window_secs
+    }
+
+    fn escalate_threshold(&self) -> usize {
+        self.escalate_threshold
+    }
+
     /// Remove entries older than the window.  Call periodically.
     fn gc(&self) {
         let now = unix_now_secs();
@@ -2635,6 +2672,14 @@ async fn handle_request(
         }
         if req.method() == http::Method::GET && req.uri().path() == "/api/v1/internal/settings" {
             return Ok(global_settings_response(&state));
+        }
+        if req.method() == http::Method::GET && req.uri().path() == "/api/v1/internal/blocks" {
+            return Ok(blocks_response(&state));
+        }
+        if req.method() == http::Method::DELETE {
+            if let Some(ip) = req.uri().path().strip_prefix("/api/v1/internal/blocks/") {
+                return Ok(unblock_response(&state, ip.trim_end_matches('/')));
+            }
         }
         return Ok(error_response(
             StatusCode::NOT_FOUND,
@@ -6684,6 +6729,98 @@ fn json_err(status: StatusCode, message: &str) -> Response<BoxBody> {
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")
         .body(full_body(Bytes::from(body)))
+        .unwrap()
+}
+
+/// `GET /api/v1/internal/blocks` — every source THIS node is currently
+/// dropping or escalating on its own initiative: XDP auto-bans, the eBPF
+/// blocklist (auto-bans plus operator CIDRs seeded from ip_reputation), and the
+/// repeat-offender table for the current correlation window.
+///
+/// Threat-intel indicators and GeoIP country blocks are control-plane state and
+/// are merged there; this is the part only the data plane knows. Until this
+/// endpoint existed an auto-banned IP appeared nowhere in the console, and the
+/// only way to lift the ban was a restart.
+fn blocks_response(state: &ServerState) -> Response<BoxBody> {
+    let ab = autoban_config();
+    let (ebpf_ips, ebpf_ranges) = state.ebpf.blocked_entries();
+    let autobanned: Vec<String> = {
+        let mut v: Vec<std::net::IpAddr> = xdp_autobanned().iter().map(|e| *e).collect();
+        v.sort();
+        v.into_iter().map(|ip| ip.to_string()).collect()
+    };
+    let corr = &state.modules.correlation;
+    let offenders: Vec<serde_json::Value> = corr
+        .offenders()
+        .into_iter()
+        .map(|(ip, blocks, last)| {
+            serde_json::json!({
+                "ip": ip.to_string(),
+                "blocks_in_window": blocks,
+                "last_block_unix": last,
+                "escalated": blocks as usize >= corr.escalate_threshold(),
+                "autoban_pending": ab.enabled && (blocks < ab.threshold_blocks)
+                    && autoban_eligible(ip, ab.include_private),
+            })
+        })
+        .collect();
+    let body = serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "ebpf": {
+            "mode": state.ebpf.mode().to_string(),
+            "drops": state.ebpf.ebpf_drops(),
+            "exact_ips": ebpf_ips.iter().map(|ip| ip.to_string()).collect::<Vec<_>>(),
+            "ranges": ebpf_ranges.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+        },
+        "autoban": {
+            "enabled": ab.enabled,
+            "threshold_blocks": ab.threshold_blocks,
+            "include_private": ab.include_private,
+            "window_secs": corr.window(),
+            "banned": autobanned,
+        },
+        "offenders": {
+            "window_secs": corr.window(),
+            "escalate_threshold": corr.escalate_threshold(),
+            "entries": offenders,
+        },
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(full_body(Bytes::from(body.to_string())))
+        .unwrap()
+}
+
+/// `DELETE /api/v1/internal/blocks/{ip}` — lift this node's own block on one
+/// address: out of the auto-ban set, out of the eBPF blocklist, and out of the
+/// repeat-offender table so it is not re-banned on its next request. A CIDR
+/// seeded from site policy is not touched (change the policy instead), and the
+/// response says whether such a range still covers the address.
+fn unblock_response(state: &ServerState, raw: &str) -> Response<BoxBody> {
+    let Ok(ip) = raw.parse::<std::net::IpAddr>() else {
+        return json_err(StatusCode::BAD_REQUEST, "not an IP address");
+    };
+    let was_autobanned = xdp_autobanned().remove(&ip).is_some();
+    let (before_ips, ranges) = state.ebpf.blocked_entries();
+    let was_ebpf = before_ips.contains(&ip);
+    state.ebpf.unblock_ip(ip);
+    let forgot = state.modules.correlation.forget(ip);
+    let still_in_range = ranges.iter().any(|n| n.contains(&ip));
+    if was_autobanned || was_ebpf || forgot {
+        warn!(%ip, was_autobanned, was_ebpf, forgot, "operator lifted block");
+    }
+    let body = serde_json::json!({
+        "ip": ip.to_string(),
+        "was_autobanned": was_autobanned,
+        "was_in_ebpf_blocklist": was_ebpf,
+        "offender_history_cleared": forgot,
+        "still_covered_by_range": still_in_range,
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(full_body(Bytes::from(body.to_string())))
         .unwrap()
 }
 

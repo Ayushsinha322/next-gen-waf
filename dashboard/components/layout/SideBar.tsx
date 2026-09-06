@@ -106,6 +106,7 @@ const NAV = [
     { id: "sites",   Icon: Icon.Sites,   label: "Sites" },
     { id: "rules",   Icon: Icon.Rules,   label: "Rules" },
     { id: "certificates", Icon: Icon.Certificates, label: "Certificates", badge: "TLS", badgeCls: "nb-g" },
+    { id: "blocked", Icon: Icon.ThreatIntel, label: "Blocked Sources" },
     { id: "plugins", Icon: Icon.Plugins, label: "Plugins" },
   ]},
   { group: "INTELLIGENCE", items: [

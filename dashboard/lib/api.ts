@@ -395,6 +395,20 @@ export interface GlobalSettingsResponse {
   dataplane:    { reachable: boolean; error?: string; config?: Record<string, unknown> };
 }
 
+/** GET /blocks — every active block, from three places. */
+export interface BlocksResponse {
+  dataplane: {
+    reachable: boolean; error?: string; version?: string;
+    ebpf?: { mode: string; drops: number; exact_ips: string[]; ranges: string[] };
+    autoban?: { enabled: boolean; threshold_blocks: number; include_private: boolean; window_secs: number; banned: string[] };
+    offenders?: { window_secs: number; escalate_threshold: number;
+      entries: { ip: string; blocks_in_window: number; last_block_unix: number; escalated: boolean; autoban_pending: boolean }[] };
+  };
+  indicators: IOC[];
+  indicators_error?: string;
+  countries: string[];
+}
+
 /** An installed WASM plugin (module bytes are never sent to the browser). */
 export interface Plugin {
   id:          string;
@@ -1066,6 +1080,13 @@ export const api = {
       ),
     ack:     (id: string) => apiFetch<{ ok: boolean }>(`/alerts/${id}/ack`,     { method: "POST" }),
     resolve: (id: string) => apiFetch<{ ok: boolean }>(`/alerts/${id}/resolve`, { method: "POST" }),
+  },
+
+  /** Blocked sources: the unified view plus the data-plane unblock. */
+  blocks: {
+    list:      () => apiFetch<BlocksResponse>("/blocks"),
+    unblockIP: (ip: string) =>
+      apiFetch<{ ok: boolean; result: Record<string, unknown> }>(`/blocks/ip/${encodeURIComponent(ip)}`, { method: "DELETE" }),
   },
 
   /** Node-wide operator settings — the Global Settings page. */
