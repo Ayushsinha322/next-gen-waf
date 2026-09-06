@@ -82,6 +82,13 @@ var Registry = []Key{
 		Env: "SENTINEL_TI_URLHAUS_URL", Description: "abuse.ch URLhaus malware-distribution domains (block tier). 'off' disables.", Validate: urlOrOff},
 	{Name: "threat_intel.feed.stix", Group: "threat_intel", Type: String, Unit: "url", Default: "", Applies: "live",
 		Env: "SENTINEL_TI_STIX_URL", Description: "A STIX 2.1 bundle URL from your own CTI platform. Empty or 'off' disables.", Validate: urlOrOff},
+	// ---- GeoIP ------------------------------------------------------------
+	{Name: "geoip.auto_fetch", Group: "geoip", Type: Bool, Default: true, Applies: "live",
+		Env: "SENTINEL_GEOIP_AUTO_FETCH", Description: "Download the monthly DB-IP country database (CC BY 4.0, attribution: IP Geolocation by DB-IP) so country rules can enforce. Off = supply your own .mmdb."},
+	{Name: "geoip.fetch_url", Group: "geoip", Type: String, Unit: "url", Default: "https://download.db-ip.com/free/dbip-country-lite-{YYYY}-{MM}.mmdb.gz", Applies: "live",
+		Env: "SENTINEL_GEOIP_FETCH_URL", Description: "Where to fetch the database; {YYYY} and {MM} expand to the current month, previous month is tried as fallback. Any MMDB country database (gzipped or not) works.", Validate: urlOrOff},
+	{Name: "geoip.max_age_days", Group: "geoip", Type: Int, Unit: "days", Min: 1, Max: 90, Default: 7, Applies: "live",
+		Env: "SENTINEL_GEOIP_MAX_AGE_DAYS", Description: "Re-download when the database on disk is older than this."},
 }
 
 func urlOrOff(v any) error {

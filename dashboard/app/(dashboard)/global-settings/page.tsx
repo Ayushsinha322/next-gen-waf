@@ -21,6 +21,7 @@ import { staggerContainer, fadeUp } from "@/lib/animations";
 const GROUP_META: Record<string, { title: string; blurb: string }> = {
   alerting:     { title: "Alerting",            blurb: "When the event stream becomes an alert, and when an alert closes itself." },
   threat_intel: { title: "Threat intelligence", blurb: "External indicator feeds merged into the corpus the data plane enforces." },
+  geoip:        { title: "GeoIP database",      blurb: "The country database behind GeoIP rules, fetched monthly. IP Geolocation by DB-IP (CC BY 4.0)." },
 };
 
 function SourcePill({ s }: { s: GlobalSetting["source"] }) {
