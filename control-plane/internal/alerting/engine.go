@@ -363,6 +363,12 @@ func (e *Engine) dispatch(ctx context.Context, na notify.Alert) {
 var EventDrivenKinds = []string{
 	"attack_spike", "repeat_offender",
 	"sqli", "xss", "rce", "file_inclusion", "scanner", "attack",
+	// Kinds an earlier engine version emitted; rows of these were still open
+	// from June on the first deployment because nothing recognised them.
+	"rate_limit", "path_traversal", "log4shell",
+	// Recovery notices are informational: once a node has been back for the
+	// quiet window there is nothing left to act on.
+	"node_recovered", "cp_node_recovered",
 }
 
 // autoResolver closes stale event-driven alerts once a minute. See

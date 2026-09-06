@@ -25,8 +25,13 @@ func TestAttackKindsAreAllEventDriven(t *testing.T) {
 			t.Fatalf("attackKind(%q,%q)=%q is not in EventDrivenKinds", c[0], c[1], k)
 		}
 	}
-	if set["node_down"] || set["cert_expiring"] || set["disk_pressure"] {
+	if set["node_down"] || set["cp_node_down"] || set["quorum_at_risk"] || set["cert_expiring"] || set["disk_pressure"] {
 		t.Fatal("operational kinds must never auto-resolve on quiet")
+	}
+	for _, legacy := range []string{"rate_limit", "path_traversal", "log4shell", "node_recovered"} {
+		if !set[legacy] {
+			t.Fatalf("%s must auto-resolve: 253 such rows sat open from June on the first deployment", legacy)
+		}
 	}
 }
 
