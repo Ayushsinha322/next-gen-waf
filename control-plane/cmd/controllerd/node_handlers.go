@@ -71,6 +71,17 @@ type nodeMetadata struct {
 	Sites            int   `json:"sites"`
 	UpstreamsHealthy int   `json:"upstreams_healthy"`
 	UpstreamsTotal   int   `json:"upstreams_total"`
+	// Per-node drill-down (newer data planes; zero/absent on older ones).
+	Listeners            []string        `json:"listeners"`
+	HTTP3Enabled         bool            `json:"http3_enabled"`
+	ConfigVersionApplied int64           `json:"config_version_applied"`
+	RulesCompiled        int             `json:"rules_compiled"`
+	RulesEnforced        int             `json:"rules_enforced"`
+	EbpfMode             string          `json:"ebpf_mode"`
+	EbpfDrops            int64           `json:"ebpf_drops"`
+	ThreatIntelEntries   int             `json:"threat_intel_entries"`
+	ThreatIntelVersion   int64           `json:"threat_intel_version"`
+	InlineRules          json.RawMessage `json:"inline_rules"`
 }
 
 // nodeDownAfter reads the staleness window (default 30s) shared with the
@@ -139,8 +150,27 @@ func handleClusterHealth(c *gin.Context, enf *rbac.Enforcer, store *db.Store, cl
 					"sites":              md.Sites,
 					"upstreams_healthy":  md.UpstreamsHealthy,
 					"upstreams_total":    md.UpstreamsTotal,
+					// drill-down
+					"listeners":              md.Listeners,
+					"http3_enabled":          md.HTTP3Enabled,
+					"config_version_applied": md.ConfigVersionApplied,
+					"rules_compiled":         md.RulesCompiled,
+					"rules_enforced":         md.RulesEnforced,
+					"ebpf_mode":              md.EbpfMode,
+					"ebpf_drops":             md.EbpfDrops,
+					"threat_intel_entries":   md.ThreatIntelEntries,
+					"threat_intel_version":   md.ThreatIntelVersion,
+					"inline_rules":           md.InlineRules,
 				})
 			}
+		}
+	}
+	// The version the control plane currently serves, so the page can flag a
+	// node whose config_version_applied lags it (stale, not just "healthy").
+	var currentCfgVersion int64
+	if store != nil {
+		if v, err := store.ConfigVersion(c.Request.Context()); err == nil {
+			currentCfgVersion = v
 		}
 	}
 	dpTotal := len(dpNodes)
@@ -258,6 +288,7 @@ func handleClusterHealth(c *gin.Context, enf *rbac.Enforcer, store *db.Store, cl
 	protectionActive := dpHealthy >= 1 || dpTotal == 0
 
 	c.JSON(http.StatusOK, gin.H{
+		"config_version":    currentCfgVersion,
 		"build":             version.Info(),
 		"generated_at":      time.Now().Unix(),
 		"overall":           overall,

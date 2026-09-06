@@ -6,7 +6,7 @@
  * and WAF nodes to the origins. Everything degrades silently to placeholders
  * when the control plane is unreachable.
  */
-import { useState, useEffect } from "react";
+import { useState, useEffect, Fragment } from "react";
 import { motion } from "framer-motion";
 import { api, type ClusterHealth, type NotificationChannel } from "@/lib/api";
 import { staggerContainer, cardVariants, fadeUp, spring } from "@/lib/animations";
@@ -86,6 +86,7 @@ function Connector({ color }: { color?: string }) {
 // ---------------------------------------------------------------------------
 export default function ClusterPage() {
   const [health, setHealth] = useState<ClusterHealth | null>(null);
+  const [openNode, setOpenNode] = useState<string | null>(null);
   const [channels, setChannels] = useState<NotificationChannel[] | null>(null);
 
   // ── Cluster health (10s poll) — same silent-degrade pattern as overview ──
@@ -359,15 +360,22 @@ Fleet-wide health of the WAF data plane and control plane — live topology, fai
             <table>
               <thead>
                 <tr>
-                  <th>Node</th><th>Status</th><th>Version</th><th>Uptime</th>
-                  <th>Sites</th><th>Upstreams</th><th>Last seen</th>
+                  <th></th><th>Node</th><th>Status</th><th>Version</th><th>Config</th><th>Uptime</th>
+                  <th>Sites</th><th>Rules</th><th>Upstreams</th><th>Last seen</th>
                 </tr>
               </thead>
               <tbody>
                 {dpNodes.map(n => {
                   const upDown = n.upstreams_total > 0 && n.upstreams_healthy < n.upstreams_total;
+                  const cur = health?.config_version ?? 0;
+                  const applied = n.config_version_applied ?? 0;
+                  const stale = cur > 0 && applied > 0 && applied < cur;
+                  const neverSynced = cur > 0 && applied === 0 && n.status !== "down";
+                  const open = openNode === n.id;
                   return (
-                    <tr key={n.id} className={n.status === "down" ? "sev-c" : ""}>
+                    <Fragment key={n.id}>
+                    <tr className={n.status === "down" ? "sev-c" : ""} onClick={() => setOpenNode(open ? null : n.id)} style={{ cursor: "pointer" }}>
+                      <td className="td3" style={{ width: 18 }}>{open ? "▾" : "▸"}</td>
                       <td className="td2">
                         <div style={{ display: "flex", flexDirection: "column" }}>
                           <span style={{ color: "var(--text)", fontWeight: 600 }}>{n.hostname || n.id}</span>
@@ -380,13 +388,45 @@ Fleet-wide health of the WAF data plane and control plane — live topology, fai
                         </span>
                       </td>
                       <td className="td3">{n.version || "—"}</td>
+                      <td>
+                        {applied === 0 && !neverSynced ? <span className="td3">—</span>
+                          : stale ? <span className="bdg ba" title={`Node applied config version ${applied}; the control plane serves ${cur}. Changes made since have not reached this node.`}>STALE · v{applied}</span>
+                          : neverSynced ? <span className="bdg br" title="This node has never applied a configuration from the control plane">NEVER SYNCED</span>
+                          : <span className="bdg bgg" title={`Config version ${applied}, current`}>v{applied}</span>}
+                      </td>
                       <td className="td3">{fmtUptime(n.uptime_secs)}</td>
                       <td className="td3">{n.sites}</td>
+                      <td className="td3" style={{ fontVariantNumeric: "tabular-nums" }}>{n.rules_compiled ? `${n.rules_enforced ?? n.rules_compiled}/${n.rules_compiled}` : "—"}</td>
                       <td className={upDown ? "" : "td3"} style={{ color: upDown ? "var(--amber)" : undefined }}>
                         {n.upstreams_healthy}/{n.upstreams_total}
                       </td>
                       <td className="td3">{fmtAgoSec(n.seconds_since_seen)}</td>
                     </tr>
+                    {open && (
+                      <tr>
+                        <td colSpan={10} style={{ background: "rgba(255,255,255,.015)", padding: "12px 18px" }}>
+                          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(210px, 1fr))", gap: 12 }}>
+                            {([
+                              ["Listeners", (n.listeners && n.listeners.length) ? n.listeners.join("  ") : "not reported"],
+                              ["HTTP/3", n.http3_enabled === undefined ? "not reported" : n.http3_enabled ? "enabled" : "off"],
+                              ["Config version applied", applied ? `v${applied}${stale ? ` — control plane is at v${cur}` : " (current)"}` : "never synced"],
+                              ["Compiled rules", n.rules_compiled ? `${n.rules_enforced} enforcing of ${n.rules_compiled}` : "not reported"],
+                              ["eBPF / XDP", n.ebpf_mode ? `${n.ebpf_mode} · ${(n.ebpf_drops ?? 0).toLocaleString()} drops` : "not reported"],
+                              ["Threat intel", n.threat_intel_entries !== undefined ? `${n.threat_intel_entries.toLocaleString()} indicators · corpus v${n.threat_intel_version ?? 0}` : "not reported"],
+                              ["Upstreams", `${n.upstreams_healthy} healthy of ${n.upstreams_total}`],
+                              ["Last heartbeat", `${fmtAgoSec(n.seconds_since_seen)} · uptime ${fmtUptime(n.uptime_secs)}`],
+                            ] as [string, string][]).map(([k, v]) => (
+                              <div key={k} style={{ border: "1px solid var(--border)", borderRadius: 6, padding: "8px 10px" }}>
+                                <div className="td3" style={{ fontSize: 11, letterSpacing: ".04em", textTransform: "uppercase" }}>{k}</div>
+                                <div style={{ fontFamily: MONO, fontSize: 12.5, marginTop: 3, wordBreak: "break-word" }}>{v}</div>
+                              </div>
+                            ))}
+                          </div>
+                          {stale && <div style={{ marginTop: 10, fontSize: 12.5, color: "var(--amber)", fontFamily: MONO }}>⚠ This node is enforcing an older configuration than the control plane holds. It polls every few seconds; if this persists, check the node&apos;s config-sync log.</div>}
+                        </td>
+                      </tr>
+                    )}
+                    </Fragment>
                   );
                 })}
               </tbody>

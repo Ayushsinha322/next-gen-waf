@@ -1390,6 +1390,7 @@ impl ProxyServer {
                         // discover the change on its next 5s tick. That poll is
                         // what made the fail-open window as long as it was.
                         reload_notify.notify_one();
+                        CONFIG_VERSION_APPLIED.store(sync.version, Ordering::Relaxed);
                         last_version = sync.version;
                         info!(version = last_version, sites = count, "sites hot-synced");
                     }
@@ -1805,6 +1806,9 @@ impl ProxyServer {
         if let Some(sync_url) = cfg.cluster.sync_url.clone() {
             let hb_cfg = Arc::clone(&state.config);
             let hb_pool = Arc::clone(&state.upstream_pool);
+            let hb_engines = Arc::clone(&state.engines);
+            let hb_ebpf = Arc::clone(&state.ebpf);
+            let hb_modules = Arc::clone(&state.modules);
             // Resolve the node identity once (the configured id defaults to the
             // literal "auto", which we resolve from env / hostname).
             let node_id = if cfg.cluster.node_id != "auto" {
@@ -1867,6 +1871,16 @@ impl ProxyServer {
                             "upstreams_healthy": pool.healthy,
                             "upstreams_total": pool.total,
                             "http3_enabled": http3_enabled,
+                            // Per-node drill-down for the cluster page: which config
+                            // version this node applied (stale-node detection), how
+                            // many rules it compiled, and what its own bans/feeds hold.
+                            "config_version_applied": CONFIG_VERSION_APPLIED.load(Ordering::Relaxed),
+                            "rules_compiled": hb_engines.load().values().map(|e| e.rule_count()).sum::<usize>(),
+                            "rules_enforced": hb_engines.load().values().map(|e| e.inventory().enforced).sum::<usize>(),
+                            "ebpf_mode": hb_ebpf.mode().to_string(),
+                            "ebpf_drops": hb_ebpf.ebpf_drops(),
+                            "threat_intel_entries": hb_modules.threat_intel.load().entry_count(),
+                            "threat_intel_version": hb_modules.threat_intel.load().version(),
                             // Ground truth for which operator-authored rules are
                             // actually compiled and running on THIS node. The
                             // control plane cannot derive this — it has no SRL
@@ -4708,6 +4722,10 @@ static ENGINES_WARMING: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 // config sync or the heartbeat, this failure looks exactly like a world with no
 // attackers.
 static TI_POLLER_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The control-plane config version this node most recently APPLIED (0 = never
+/// synced). Reported in the heartbeat so the cluster page can flag a node that
+/// is still running an older configuration than the control plane holds.
+static CONFIG_VERSION_APPLIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// HTTP status of the most recent sync attempt; 0 = no attempt has completed.
 /// A 403 here means the shared secret does not match and this node's IOC set is
 /// frozen — which previously produced no log line at all, because the status was

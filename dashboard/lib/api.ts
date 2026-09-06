@@ -786,6 +786,17 @@ export interface DataPlaneNode {
   sites:            number;
   upstreams_healthy: number;
   upstreams_total:  number;
+  /** Drill-down fields, reported by newer data planes; absent/zero on older ones. */
+  listeners?:              string[];
+  http3_enabled?:          boolean;
+  config_version_applied?: number;
+  rules_compiled?:         number;
+  rules_enforced?:         number;
+  ebpf_mode?:              string;
+  ebpf_drops?:             number;
+  threat_intel_entries?:   number;
+  threat_intel_version?:   number;
+  inline_rules?:           unknown;
 }
 
 /** A single control-plane (Raft) node. */
@@ -804,6 +815,8 @@ export interface ControlPlaneNode {
 
 /** Fleet-wide health roll-up (data plane + control plane). */
 export interface ClusterHealth {
+  /** The config version the control plane serves now; compare with each node's config_version_applied. */
+  config_version?: number;
   generated_at:      number; // unix seconds
   overall:           "healthy" | "degraded" | "critical";
   protection_active: boolean;
