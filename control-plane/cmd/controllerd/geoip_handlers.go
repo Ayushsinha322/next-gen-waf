@@ -20,9 +20,11 @@ import (
 // treat blocking as a GLOBAL policy: the code is added to / removed from every
 // active site, then configVersion is bumped so the data plane hot-applies.
 //
-// NOTE (honest): enforcement requires a GeoLite2-Country.mmdb in the proxy's
-// rules/ dir. Without it the GeoIP module degrades to no-op — the block is
-// persisted and will take effect the moment the database is present.
+// Enforcement needs the country database at waf_policy.geoip.db_path
+// (SENTINEL_GEOIP_DB). Since 2026-09-07 the geoip.refresh job downloads DB-IP's
+// CC BY 4.0 country database into the shared geoip directory and the data plane
+// picks it up within a minute; until the file exists the module is a no-op, the
+// block is persisted, and /healthz -> geoip.inert says so.
 
 // handleListBlockedCountries returns the union of blocked country codes across
 // all of the tenant's sites.
