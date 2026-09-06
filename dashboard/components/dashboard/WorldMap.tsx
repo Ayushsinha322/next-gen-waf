@@ -119,7 +119,7 @@ export default function WorldMap({
       const r = isBlocked ? await api.geoip.unblock(code) : await api.geoip.block(code);
       setBlocked(new Set(r.countries ?? []));
       showToast(
-        `${name} ${isBlocked ? "unblocked" : "blocked"}${loaded ? " · applies in ~5s" : " · stored (needs GeoLite2 to enforce)"}`,
+        `${name} ${isBlocked ? "unblocked" : "blocked"}${loaded ? " · applies in ~5s" : " · stored (enforces once the country database is downloaded)"}`,
         "s", isBlocked ? "\u{1F513}" : "\u{1F6AB}",
       );
       setMenu(null);
@@ -238,12 +238,17 @@ export default function WorldMap({
             </button>
             {!loaded && (
               <div style={{ fontSize: 12, color: "var(--text3)", marginTop: 6, lineHeight: 1.4, fontFamily: "var(--font-mono)" }}>
-                Stored now — enforces once a GeoLite2-Country.mmdb is in rules/.
+                Stored now — enforces once the country database is downloaded (System Jobs → geoip.refresh).
               </div>
             )}
           </div>
         )}
 
+        {loaded && (
+          <div style={{ position: "absolute", right: 10, bottom: 6, fontSize: 10, color: "var(--text3)", fontFamily: "var(--font-mono)", pointerEvents: "auto" }}>
+            IP Geolocation by <a href="https://db-ip.com" target="_blank" rel="noreferrer" style={{ color: "var(--text3)" }}>DB-IP</a>
+          </div>
+        )}
         {/* not-loaded note */}
         {!loaded && !menu && (
           <div style={{
@@ -253,7 +258,7 @@ export default function WorldMap({
           }}>
             <span style={{ fontSize: 18 }}>{"\u{1F30D}"}</span>
             <span style={{ fontSize: 14, color: "var(--text3)", lineHeight: 1.5, fontFamily: "var(--font-mono)" }}>
-              GeoIP not loaded — drop a <span style={{ color: "var(--cyan)" }}>GeoLite2-Country.mmdb</span> into <span style={{ color: "var(--cyan)" }}>rules/</span> to map live origins.
+              Country database not loaded yet — the <span style={{ color: "var(--cyan)" }}>geoip.refresh</span> job downloads it (System Jobs → Run now), or set <span style={{ color: "var(--cyan)" }}>SENTINEL_GEOIP_DB</span> to your own .mmdb.
             </span>
           </div>
         )}

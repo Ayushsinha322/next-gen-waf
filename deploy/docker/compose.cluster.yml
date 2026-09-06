@@ -119,11 +119,13 @@ services:
       migrate: { condition: service_completed_successfully }
       clickhouse: { condition: service_started }
     environment:
+      SENTINEL_GEOIP_DIR: /var/lib/sentinel/geoip
       <<: *cp-env
       SENTINEL_NODE_ID: "2"
       # Address the other nodes forward writes to (this node's REST API).
       SENTINEL_ADVERTISE_ADDR: cp2:9501
     volumes:
+      - ${SENTINEL_GEOIP_DIR:-./geoip}:/var/lib/sentinel/geoip   # geoip.refresh writes here when leader
       - sentinel-logs:/var/log/sentinel
       # Public Root CA (read-only) so this node can serve CA-download when leader.
       - /opt/sentinel-pki/root.crt:/etc/sentinel/root-ca.crt:ro
@@ -150,11 +152,13 @@ services:
       migrate: { condition: service_completed_successfully }
       clickhouse: { condition: service_started }
     environment:
+      SENTINEL_GEOIP_DIR: /var/lib/sentinel/geoip
       <<: *cp-env
       SENTINEL_NODE_ID: "3"
       # Address the other nodes forward writes to (this node's REST API).
       SENTINEL_ADVERTISE_ADDR: cp3:9501
     volumes:
+      - ${SENTINEL_GEOIP_DIR:-./geoip}:/var/lib/sentinel/geoip   # geoip.refresh writes here when leader
       - sentinel-logs:/var/log/sentinel
       - /opt/sentinel-pki/root.crt:/etc/sentinel/root-ca.crt:ro
       # See cp2: required for the DSN's sslrootcert, not optional.

@@ -207,6 +207,8 @@ export interface SiteForm {
   ip_allow:       string[];
   ip_block:       string[];
   dnsbl_enabled:  boolean;
+  /** Mirror the block-list into the kernel (XDP). Node-wide: blocks those sources for EVERY site on the node. */
+  ip_block_xdp:   boolean;
   dnsbl_servers:  string[];
   blacklist_user_agents: string[];
   blacklist_uris: string[];
@@ -466,7 +468,7 @@ export function emptyForm(): SiteForm {
 
     geo_mode: "off", geo_countries: [],
     ip_allow: [], ip_block: [],
-    dnsbl_enabled: false, dnsbl_servers: [], blacklist_user_agents: [], blacklist_uris: [],
+    dnsbl_enabled: false, ip_block_xdp: false, dnsbl_servers: [], blacklist_user_agents: [], blacklist_uris: [],
 
     csp: "", referrer_policy: "strict-origin-when-cross-origin",
     permissions_policy: "geolocation=(), microphone=(), camera=()",
@@ -659,6 +661,7 @@ export function formToPayload(f: SiteForm): {
   if (f.ip_allow.length > 0 || f.ip_block.length > 0 || f.dnsbl_enabled ||
       f.blacklist_user_agents.length > 0 || f.blacklist_uris.length > 0 || ipFeeds.length > 0) {
     const ipr: Record<string, unknown> = { allow: f.ip_allow, block: f.ip_block };
+    if (f.ip_block_xdp) ipr.xdp_mirror = true;
     if (ipFeeds.length) ipr.feeds = ipFeeds;
     if (f.dnsbl_enabled) ipr.dnsbl = { enabled: true, servers: f.dnsbl_servers };
     if (f.blacklist_user_agents.length) ipr.block_user_agents = f.blacklist_user_agents;
@@ -918,6 +921,7 @@ export function siteToForm(site: Site): SiteForm {
   if (ipr) {
     f.ip_allow = arr<string>(ipr.allow);
     f.ip_block = arr<string>(ipr.block);
+    f.ip_block_xdp = ipr.xdp_mirror === true;
     const dnsbl = ipr.dnsbl as AnyRec | undefined;
     if (dnsbl && dnsbl.enabled) { f.dnsbl_enabled = true; f.dnsbl_servers = arr<string>(dnsbl.servers); }
     f.blacklist_user_agents = arr<string>(ipr.block_user_agents);

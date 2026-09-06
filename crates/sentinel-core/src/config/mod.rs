@@ -887,6 +887,13 @@ fn default_sensitivity() -> f32 {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct IpReputationConfig {
+    /// Also drop `block` sources in the kernel (eBPF/XDP). That is NODE-WIDE:
+    /// the packet is gone before any site is matched, so a range mirrored here
+    /// is blocked for every site on the node. Off by default since 2026-09-07;
+    /// before that every site's block list was mirrored unconditionally and a
+    /// CIDR blocked on one site silently vanished from all of them.
+    #[serde(default)]
+    pub xdp_mirror: bool,
     /// CIDR ranges that are always allowed (overrides blocklist).
     #[serde(default)]
     pub allow: Vec<String>,

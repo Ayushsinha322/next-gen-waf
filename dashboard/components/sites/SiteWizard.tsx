@@ -925,7 +925,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                 {/* ───────── GEO & IP (advanced) ───────── */}
                 {screen === "geoip" && (<>
                   <StepHead title="Geo & IP" sub="Country filtering, IP allow/block lists and external blacklist sources." tag="enforced" />
-                  <Field label="GeoIP Filtering" hint="Allow-list takes precedence over block-list">
+                  <Field label="GeoIP Filtering" hint="Allow-list takes precedence over block-list · country data: IP Geolocation by DB-IP (fetched monthly by the geoip.refresh job)">
                     <select className="fin2 fsel2" value={form.geo_mode} onChange={e => upd({ geo_mode: e.target.value as SiteForm["geo_mode"] })}>
                       <option value="off">Disabled</option>
                       <option value="block">Block selected countries</option>
@@ -948,6 +948,9 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     <Field label="IP / CIDR Block-list" hint="Always denied"><ChipInput values={form.ip_block} onChange={v => upd({ ip_block: v })} placeholder="203.0.113.7" /></Field>
                   </Row>
                   <GroupLabel>Blacklist Sources <Tag kind="stored" /></GroupLabel>
+                  {form.ip_block.length > 0 && (
+                    <SectionToggle label="Drop block-list sources in the kernel (XDP)" desc="Faster, but node-wide: these sources are then blocked for every site on this node, not just this one. Leave off unless the block is meant for the whole edge." on={form.ip_block_xdp} set={v => upd({ ip_block_xdp: v })} />
+                  )}
                   <SectionToggle label="DNSBL (DNS blacklists)" desc="Reject IPs listed on the configured DNSBL servers" on={form.dnsbl_enabled} set={v => upd({ dnsbl_enabled: v })} />
                   {form.dnsbl_enabled && <Field label="DNSBL Servers" hint="e.g. bl.blocklist.de, sbl.spamhaus.org"><ChipInput values={form.dnsbl_servers} onChange={v => upd({ dnsbl_servers: v })} placeholder="bl.blocklist.de" /></Field>}
                   <Row>

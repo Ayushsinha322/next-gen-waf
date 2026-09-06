@@ -58,6 +58,14 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
         r"\b(?:4[0-9]{12,15}|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12}|(?:2131|1800|35\d{3})\d{11})\b",
         "credit_card",
     ),
+    // The same cards as people actually print them: 4-4-4-4 (Visa/MC/Discover)
+    // and 4-6-5 (Amex) groups separated by a space or dash. The contiguous
+    // pattern above misses "4111 1111 1111 1111"; the only reason a spaced PAN
+    // was ever caught was the Aadhaar pattern matching part of it by accident.
+    (
+        r"\b(?:4\d{3}|5[1-5]\d{2}|6(?:011|5\d{2}))[ -]\d{4}[ -]\d{4}[ -]\d{4}\b|\b3[47]\d{2}[ -]\d{6}[ -]\d{5}\b",
+        "credit_card",
+    ),
     // US Social Security Number. Word-boundary anchored (the proxy used
     // negative look-aheads to exclude reserved ranges; not supported here).
     (r"\b\d{3}-\d{2}-\d{4}\b", "ssn"),
@@ -281,6 +289,25 @@ impl DlpEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formatted_card_numbers_are_credit_cards_not_aadhaar() {
+        let e = DlpEngine::new(&[]);
+        assert_eq!(
+            e.scan(b"card 4111 1111 1111 1111 on file"),
+            Some("credit_card")
+        );
+        assert_eq!(
+            e.scan(b"card 4111-1111-1111-1111 on file"),
+            Some("credit_card")
+        );
+        assert_eq!(e.scan(b"amex 3714 496353 98431 ok"), Some("credit_card"));
+        let (masked, hits) = e.mask(b"pay 4111 1111 1111 1111 now").unwrap();
+        let m = String::from_utf8(masked).unwrap();
+        assert!(m.contains("1111 now"), "{m}");
+        assert!(m.contains('*'), "{m}");
+        assert_eq!(hits, vec!["credit_card".to_string()]);
+    }
 
     /// Build an engine with no user patterns.
     fn engine() -> DlpEngine {

@@ -2124,7 +2124,7 @@ func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
 			allow, _ := g["allow_countries"].([]any)
 			if len(block) > 0 || len(allow) > 0 {
 				if _, ok := g["db_path"]; !ok || g["db_path"] == "" {
-					g["db_path"] = osGetenv("SENTINEL_GEOIP_DB", "rules/GeoLite2-Country.mmdb")
+					g["db_path"] = osGetenv("SENTINEL_GEOIP_DB", "/var/lib/sentinel/geoip/dbip-country-lite.mmdb")
 				}
 				waf["geoip"] = g
 			}

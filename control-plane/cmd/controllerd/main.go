@@ -23,6 +23,7 @@ import (
 	chreader "github.com/your-org/sentinel-waf/control-plane/internal/clickhouse"
 	"github.com/your-org/sentinel-waf/control-plane/internal/db"
 	"github.com/your-org/sentinel-waf/control-plane/internal/diskmon"
+	"github.com/your-org/sentinel-waf/control-plane/internal/geoipfetch"
 	"github.com/your-org/sentinel-waf/control-plane/internal/leader"
 	"github.com/your-org/sentinel-waf/control-plane/internal/logs"
 	"github.com/your-org/sentinel-waf/control-plane/internal/nodehealth"
@@ -379,6 +380,18 @@ func run() error {
 			if !tiCfg.Enabled {
 				log.Info("threat-intel feed fetching disabled in settings (indicators already stored stay enforced)")
 			}
+			// GeoIP database fetcher: writes into the directory every data plane
+			// mounts (SENTINEL_GEOIP_DIR); the data plane's watcher opens it.
+			gf := geoipfetch.New(os.Getenv("SENTINEL_GEOIP_DIR"), func() geoipfetch.Config {
+				v := settingsNow()
+				return geoipfetch.Config{
+					Enabled: v.Bool("geoip.auto_fetch"),
+					URL:     v.String("geoip.fetch_url"),
+					MaxAge:  time.Duration(v.Int("geoip.max_age_days")) * 24 * time.Hour,
+				}
+			}, log)
+			gf.Start()
+			stops = append(stops, gf.Stop)
 			nm := nodehealth.New(store, eng, log)
 			nm.Start()
 			stops = append(stops, nm.Stop)

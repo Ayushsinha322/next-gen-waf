@@ -43,6 +43,22 @@ pub struct GeoIp {
     reader: Option<Reader<Vec<u8>>>,
     block_countries: HashSet<String>,
     allow_countries: HashSet<String>,
+    /// `(mtime_secs, len)` of the database file when this instance was built,
+    /// or `None` when it was absent — so a watcher can tell whether the file on
+    /// disk has since appeared, changed or vanished and rebuild only then.
+    db_state: Option<(u64, u64)>,
+}
+
+/// Snapshot of a database file for change detection; `None` = not present.
+pub fn db_file_state(path: &Path) -> Option<(u64, u64)> {
+    let md = std::fs::metadata(path).ok()?;
+    let mtime = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Some((mtime, md.len()))
 }
 
 impl Default for GeoIp {
@@ -58,7 +74,14 @@ impl GeoIp {
             reader: None,
             block_countries: HashSet::new(),
             allow_countries: HashSet::new(),
+            db_state: None,
         }
+    }
+
+    /// `true` when the database file's presence or contents differ from what
+    /// this instance was built from — the signal to rebuild.
+    pub fn db_changed(&self, path: &Path) -> bool {
+        db_file_state(path) != self.db_state
     }
 
     /// Load a MaxMind GeoLite2-Country `.mmdb` database.
@@ -97,6 +120,7 @@ impl GeoIp {
             }
         };
         Self {
+            db_state: db_file_state(path),
             reader,
             block_countries: block_countries
                 .into_iter()
@@ -183,6 +207,7 @@ mod tests {
             reader: None,
             block_countries: countries.iter().map(|s| s.to_uppercase()).collect(),
             allow_countries: HashSet::new(),
+            db_state: None,
         }
     }
 
@@ -191,6 +216,7 @@ mod tests {
             reader: None,
             block_countries: HashSet::new(),
             allow_countries: countries.iter().map(|s| s.to_uppercase()).collect(),
+            db_state: None,
         }
     }
 
@@ -262,6 +288,7 @@ mod tests {
             reader: None,
             block_countries: vec!["US".to_string()].into_iter().collect(),
             allow_countries: vec!["US".to_string()].into_iter().collect(),
+            db_state: None,
         };
         // US is in allow_countries → Allow (even though also in block_countries).
         assert_eq!(geo.classify(Some("US")), GeoVerdict::Allow);

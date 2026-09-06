@@ -151,6 +151,13 @@ impl IpReputation {
         IpVerdict::Allow
     }
 
+    /// `true` when `ip` is on this table's allowlist (used so a site's own
+    /// allow entry also bypasses the node-wide feed check).
+    pub fn is_allowlisted(&self, ip: IpAddr) -> bool {
+        let ip = normalize_ip(ip);
+        self.allowlist.iter().any(|net| net_contains(net, ip))
+    }
+
     /// Number of entries across all lists (useful for logging).
     pub fn entry_count(&self) -> usize {
         self.allowlist.len() + self.blocklist.len() + self.suspect_list.len()
@@ -361,11 +368,13 @@ mod tests {
             block: vec!["192.0.2.0/24".to_string()],
             allow: vec![],
             feeds: vec![],
+            xdp_mirror: false,
         };
         let cfg2 = IpReputationConfig {
             block: vec!["198.51.100.0/24".to_string()],
             allow: vec!["198.51.100.1/32".to_string()],
             feeds: vec![],
+            xdp_mirror: false,
         };
         let rep = IpReputation::from_configs(&[&cfg1, &cfg2]);
         assert!(matches!(
