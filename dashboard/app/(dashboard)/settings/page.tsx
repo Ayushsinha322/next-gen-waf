@@ -9,8 +9,21 @@ import { logout } from "@/lib/auth";
 
 const TABS = ["General","Auth & SSO","API Keys","Users & RBAC","Cluster","Notifications","Management TLS"];
 
+/** Slug per tab so other pages can deep-link (e.g. the Alerts page sends an
+ *  operator with no delivery channel straight to /settings?tab=notifications). */
+const TAB_SLUGS = ["general","auth","api-keys","users","cluster","notifications","management-tls"];
+
 export default function SettingsPage() {
   const [tab, setTab] = useState(0);
+  // Read ?tab= after mount (window only) rather than useSearchParams, which
+  // would force a Suspense boundary on this statically-rendered client page.
+  useEffect(() => {
+    try {
+      const want = new URLSearchParams(window.location.search).get("tab");
+      const i = want ? TAB_SLUGS.indexOf(want) : -1;
+      if (i >= 0) setTab(i);
+    } catch { /* no window */ }
+  }, []);
   return (
     <motion.div className="sec" variants={staggerContainer} initial="hidden" animate="visible">
       <motion.div variants={fadeUp} style={{ display:"flex", alignItems:"flex-start", justifyContent:"space-between", gap:14 }}>
@@ -20,7 +33,7 @@ export default function SettingsPage() {
         </div>
       </motion.div>
       <motion.div className="tabs" variants={fadeUp}>
-        {TABS.map((t,i) => <div key={i} className={`tab ${tab===i?"active":""}`} onClick={() => setTab(i)}>{t}</div>)}
+        {TABS.map((t,i) => <div key={i} className={`tab ${tab===i?"active":""}`} onClick={() => { setTab(i); try { history.replaceState(null, "", `/settings?tab=${TAB_SLUGS[i]}`); } catch { /* */ } }}>{t}</div>)}
       </motion.div>
       {tab === 0 && <GeneralTab />}
       {tab === 1 && <AuthTab />}

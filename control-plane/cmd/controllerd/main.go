@@ -811,7 +811,23 @@ func alertingConfigFromEnv() alerting.Config {
 		SpikeThreshold:    atoi("SENTINEL_ALERT_SPIKE_THRESHOLD"),
 		OffenderThreshold: atoi("SENTINEL_ALERT_OFFENDER_THRESHOLD"),
 		Throttle:          secs("SENTINEL_ALERT_THROTTLE_SECS"),
+		// Quiet window after which an event-driven alert auto-resolves. 0/unset =
+		// 30 min default; a negative value disables auto-resolve entirely.
+		AutoResolveAfter: autoResolveFromEnv(),
 	}
+}
+
+// autoResolveFromEnv reads SENTINEL_ALERT_AUTORESOLVE_SECS: unset/0 -> engine
+// default, "-1" (or any negative) -> disabled, N>0 -> N seconds.
+func autoResolveFromEnv() time.Duration {
+	n, err := strconv.Atoi(strings.TrimSpace(os.Getenv("SENTINEL_ALERT_AUTORESOLVE_SECS")))
+	if err != nil || n == 0 {
+		return 0
+	}
+	if n < 0 {
+		return -1
+	}
+	return time.Duration(n) * time.Second
 }
 
 // autoStartDataPlane finds the Rust proxy binary and starts it as a managed

@@ -27,6 +27,11 @@ type Config struct {
 	SpikeThreshold    int           // blocks per site in window → attack_spike
 	OffenderThreshold int           // blocks per IP in window → repeat_offender
 	Throttle          time.Duration // min interval between identical alerts
+	// AutoResolveAfter closes an event-driven alert that has not recurred for
+	// this long. An ongoing condition is re-raised every Throttle, so it keeps a
+	// fresh open row; a finished one stops piling up. 0 = default (30 min);
+	// negative disables.
+	AutoResolveAfter time.Duration
 }
 
 // Engine consumes hub events and raises alerts. It owns one tenant context
@@ -69,6 +74,9 @@ func New(store *db.Store, hub *logs.Hub, tenantID, userID string, cfg Config, lo
 	if cfg.Throttle == 0 {
 		cfg.Throttle = 5 * time.Minute
 	}
+	if cfg.AutoResolveAfter == 0 {
+		cfg.AutoResolveAfter = 30 * time.Minute
+	}
 	return &Engine{
 		store:      store,
 		hub:        hub,
@@ -95,6 +103,7 @@ func (e *Engine) Start() {
 	go e.loop(ch)
 	go e.dispatchWorker()
 	go e.janitor()
+	go e.autoResolver()
 	e.log.Info("alert engine started",
 		zap.Int("spike_threshold", e.cfg.SpikeThreshold),
 		zap.Int("offender_threshold", e.cfg.OffenderThreshold),
@@ -308,6 +317,42 @@ func (e *Engine) dispatch(ctx context.Context, na notify.Alert) {
 		}
 		if !res.OK {
 			e.log.Warn("alert delivery failed", zap.String("channel", res.Name), zap.String("err", res.Err))
+		}
+	}
+}
+
+// EventDrivenKinds are the alert kinds that describe a condition observed in a
+// traffic window and are therefore safe to auto-resolve once it stops recurring.
+// Operational kinds (node_down, cert_expiring, disk_pressure) are excluded: they
+// are resolved by their own monitors when the underlying state recovers, and a
+// quiet period does not mean the disk is no longer full.
+var EventDrivenKinds = []string{
+	"attack_spike", "repeat_offender",
+	"sqli", "xss", "rce", "file_inclusion", "scanner", "attack",
+}
+
+// autoResolver closes stale event-driven alerts once a minute. See
+// db.Store.AutoResolveQuietAlerts for why this exists.
+func (e *Engine) autoResolver() {
+	if e.cfg.AutoResolveAfter < 0 {
+		e.log.Info("alert auto-resolve disabled")
+		return
+	}
+	t := time.NewTicker(time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-e.done:
+			return
+		case <-t.C:
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			n, err := e.store.AutoResolveQuietAlerts(ctx, e.tenantID, e.userID, EventDrivenKinds, e.cfg.AutoResolveAfter)
+			cancel()
+			if err != nil {
+				e.log.Warn("alert auto-resolve failed", zap.Error(err))
+			} else if n > 0 {
+				e.log.Info("auto-resolved quiet alerts", zap.Int64("count", n), zap.Duration("quiet", e.cfg.AutoResolveAfter))
+			}
 		}
 	}
 }
