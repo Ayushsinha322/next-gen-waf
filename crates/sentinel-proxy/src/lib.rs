@@ -58,8 +58,8 @@ use rustls::ServerConfig;
 use sentinel_core::{
     config::{
         BotDetectionConfig, ChallengeMode, ConfigHandle, DlpAction, DlpConfig, FusionConfig,
-        IpReputationConfig, ListenerConfig, Protocol, SecurityHeadersConfig, SentinelConfig,
-        SiteConfig, WafConfig, WafMode,
+        ListenerConfig, Protocol, SecurityHeadersConfig, SentinelConfig, SiteConfig, WafConfig,
+        WafMode,
     },
     context::{Phase, RequestContext, WafDecision},
 };
@@ -447,7 +447,13 @@ fn unix_now_secs() -> u64 {
 /// in-memory counters and block-lists survive config reloads.
 struct ModulesState {
     /// Global IP reputation (merged across all sites, includes feed CIDRs).
+    /// Node-wide reputation from FEEDS (threat-intel suspect lists). Site
+    /// allow/block lists are per site in `ip_rep_sites`.
     ip_rep: ArcSwap<IpReputation>,
+    /// Each site's own allow/block lists. Before 2026-09-07 every site's lists
+    /// were merged into one node-wide table, so a CIDR blocked on one site was
+    /// blocked on all of them.
+    ip_rep_sites: ArcSwap<HashMap<String, IpReputation>>,
 
     /// Token-bucket rate limiter — state preserved across reloads.
     rate_limiter: RateLimiter,
@@ -1095,6 +1101,7 @@ impl ProxyServer {
 
         let modules = Arc::new(ModulesState {
             ip_rep: ArcSwap::new(Arc::new(build_ip_reputation(&cfg, &[]))),
+            ip_rep_sites: ArcSwap::new(Arc::new(build_site_ip_reputation(&cfg))),
             rate_limiter: RateLimiter::with_redis(storage.redis.clone()),
             bot_detector: ArcSwap::new(Arc::new(BotDetector::new())),
             goodbot: goodbot::GoodBotVerifier::new(),
@@ -1273,6 +1280,8 @@ impl ProxyServer {
                                 let feed_cidrs = mr.feed_cache.load_full();
                                 mr.ip_rep
                                     .store(Arc::new(build_ip_reputation(&current, &feed_cidrs)));
+                                mr.ip_rep_sites
+                                    .store(Arc::new(build_site_ip_reputation(&current)));
                                 mr.bot_detector.store(Arc::new(BotDetector::new()));
                                 mr.geoip_map.store(Arc::new(build_geoip_map(&current)));
 
@@ -1796,6 +1805,42 @@ impl ProxyServer {
                  http://controlplane:9501); if it is deliberately standalone, this is expected. \
                  Queryable at /healthz -> threat_intel.poller."
             );
+        }
+
+        // --- Background: GeoIP database watcher (every 60 s) ---
+        // The database is supplied out of band (the control plane's geoip.refresh
+        // job, or an operator copying a file). Until now it was only opened when
+        // a site config changed, so a database that appeared after boot stayed
+        // unused and healthz kept reporting the control as inert. Rebuild the
+        // per-site readers whenever a configured file appears, changes or goes.
+        {
+            let gw_cfg = Arc::clone(&state.config);
+            let gw_modules = Arc::clone(&state.modules);
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(60));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    ticker.tick().await;
+                    let cfg = gw_cfg.load();
+                    let map = gw_modules.geoip_map.load();
+                    let changed = cfg.sites.iter().any(|site| {
+                        site.waf.geoip.as_ref().is_some_and(|gc| {
+                            map.get(&site.id)
+                                .map(|g| g.db_changed(std::path::Path::new(&gc.db_path)))
+                                .unwrap_or(true)
+                        })
+                    });
+                    if changed {
+                        let rebuilt = build_geoip_map(&cfg);
+                        let active = rebuilt.values().filter(|g| g.is_active()).count();
+                        info!(
+                            sites = rebuilt.len(),
+                            active, "GeoIP database changed on disk — readers rebuilt"
+                        );
+                        gw_modules.geoip_map.store(Arc::new(rebuilt));
+                    }
+                }
+            });
         }
 
         // --- Background: control-plane node heartbeat (every 10 s) ---
@@ -2995,10 +3040,21 @@ async fn proxy_inner(
         DdosVerdict::Allow => {}
     }
 
-    // IP reputation: explicit blocklist / suspect scoring.
+    // IP reputation: THIS site's allow/block lists first (an allow here also
+    // skips the feed check), then the node-wide feed table for suspect scoring.
     {
-        let ip_rep = state.modules.ip_rep.load();
-        match ip_rep.check(ctx.client_ip) {
+        // Keyed on the Host-attributed site above; a request no site claims
+        // gets the node-wide feed check only.
+        let sites = state.modules.ip_rep_sites.load();
+        let site_rep = ctx.site_id.as_deref().and_then(|id| sites.get(id));
+        let verdict = match site_rep.map(|r| r.check(ctx.client_ip)) {
+            Some(v @ IpVerdict::Block { .. }) => v,
+            Some(IpVerdict::Allow) if site_rep.is_some_and(|r| r.is_allowlisted(ctx.client_ip)) => {
+                IpVerdict::Allow
+            }
+            _ => state.modules.ip_rep.load().check(ctx.client_ip),
+        };
+        match verdict {
             IpVerdict::Block { reason } => {
                 ctx.decision = WafDecision::Block;
                 ctx.block_reason = Some(format!("IP reputation: {reason}"));
@@ -3762,16 +3818,23 @@ async fn proxy_inner(
     let final_body: BoxBody = if needs_inspection {
         // Only buffer text-ish responses; skip binary/media to avoid breaking
         // streaming downloads.
-        let ct = resp_parts
+        // Any of the Content-Type headers, not just the first: an origin that
+        // emits two (nginx `return` + `add_header` does) put a binary type
+        // first and slipped a card number past the scanner. No header at all
+        // is scannable too — an origin that does not say is not trusted.
+        let cts: Vec<&str> = resp_parts
             .headers
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let is_scannable = ct.contains("text")
-            || ct.contains("json")
-            || ct.contains("xml")
-            || ct.contains("javascript")
-            || ct.is_empty();
+            .get_all(header::CONTENT_TYPE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        let is_scannable = cts.is_empty()
+            || cts.iter().any(|ct| {
+                ct.contains("text")
+                    || ct.contains("json")
+                    || ct.contains("xml")
+                    || ct.contains("javascript")
+            });
 
         // A response that DECLARES an oversized length streams straight through
         // — no point buffering to discover what the origin already told us.
@@ -4022,6 +4085,8 @@ async fn phase1_headers(
             {
                 ctx.decision = WafDecision::Block;
                 ctx.block_reason = Some(format!("rate limit exceeded for {}", ctx.client_ip));
+                // A throttle is not a policy block: answer 429 so clients back off.
+                ctx.block_status = Some(429);
             }
         }
     }
@@ -5299,6 +5364,12 @@ fn seed_ebpf_from_ip_reputation(ebpf: &EbpfManager, cfg: &SentinelConfig) {
         let Some(rep) = site.waf.ip_reputation.as_ref() else {
             continue;
         };
+        // Kernel drops are node-wide by nature, so only a site that asked for
+        // that explicitly gets its list mirrored. Everyone else is enforced per
+        // site in the request path.
+        if !rep.xdp_mirror {
+            continue;
+        }
         for cidr in &rep.block {
             if let Some(net) = parse_block_cidr(cidr) {
                 ebpf.block_net(net);
@@ -5314,13 +5385,24 @@ fn seed_ebpf_from_ip_reputation(ebpf: &EbpfManager, cfg: &SentinelConfig) {
     }
 }
 
+/// One reputation table per site, from that site's own allow/block lists.
+fn build_site_ip_reputation(cfg: &SentinelConfig) -> HashMap<String, IpReputation> {
+    let mut map = HashMap::new();
+    for site in &cfg.sites {
+        if let Some(rc) = site.waf.ip_reputation.as_ref() {
+            if !rc.allow.is_empty() || !rc.block.is_empty() {
+                map.insert(site.id.clone(), IpReputation::from_configs(&[rc]));
+            }
+        }
+    }
+    map
+}
+
+/// The node-wide table: reputation FEEDS only. Site lists used to be merged in
+/// here too, which is how a per-site block became a node-wide one.
 fn build_ip_reputation(cfg: &SentinelConfig, feed_cidrs: &[(String, Vec<String>)]) -> IpReputation {
-    let configs: Vec<&IpReputationConfig> = cfg
-        .sites
-        .iter()
-        .filter_map(|s| s.waf.ip_reputation.as_ref())
-        .collect();
-    let mut rep = IpReputation::from_configs(&configs);
+    let _ = cfg;
+    let mut rep = IpReputation::new();
     for (cidr, tags) in feed_cidrs {
         if let Err(e) = rep.add_suspect_cidr(cidr, tags.clone()) {
             warn!(cidr = %cidr, "feed: invalid CIDR skipped: {e}");
@@ -6310,6 +6392,13 @@ fn wants_html(headers: &http::HeaderMap) -> bool {
 fn block_response(ctx: &RequestContext) -> Response<BoxBody> {
     let cfg = ctx.block_page.as_ref();
     let support_id = ctx.request_id.to_string();
+    // 403 unless the decision asked for something else (rate limit → 429).
+    let status = ctx
+        .block_status
+        .and_then(|s| StatusCode::from_u16(s).ok())
+        .unwrap_or(StatusCode::FORBIDDEN);
+    let error_text = status.canonical_reason().unwrap_or("Forbidden");
+    let retry_after = (status == StatusCode::TOO_MANY_REQUESTS).then_some("1");
     let show_reason = cfg.map(|c| c.show_reason).unwrap_or(false);
     let reason = if show_reason {
         ctx.block_reason.as_deref()
@@ -6320,9 +6409,13 @@ fn block_response(ctx: &RequestContext) -> Response<BoxBody> {
     let html_enabled = cfg.map(|c| c.enabled).unwrap_or(true);
     if html_enabled && ctx.client_accepts_html {
         let body = render_block_page(cfg, &support_id, reason);
-        return Response::builder()
-            .status(StatusCode::FORBIDDEN)
-            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        let mut b = Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8");
+        if let Some(ra) = retry_after {
+            b = b.header(header::RETRY_AFTER, ra);
+        }
+        return b
             // The page names a support id and nothing else of value, but it is
             // still an error page: keep it out of caches and out of frames.
             .header(header::CACHE_CONTROL, "no-store")
@@ -6334,7 +6427,7 @@ fn block_response(ctx: &RequestContext) -> Response<BoxBody> {
     }
 
     let mut payload = serde_json::json!({
-        "error": "Forbidden",
+        "error": error_text,
         "support_id": support_id,
         // Kept for compatibility with clients written against the previous
         // response shape, which used request_id.
@@ -6343,13 +6436,15 @@ fn block_response(ctx: &RequestContext) -> Response<BoxBody> {
     if let Some(r) = reason {
         payload["message"] = serde_json::Value::String(r.to_string());
     }
-    Response::builder()
-        .status(StatusCode::FORBIDDEN)
+    let mut b = Response::builder()
+        .status(status)
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::CACHE_CONTROL, "no-store")
-        .header("X-Content-Type-Options", "nosniff")
-        .body(full_body(Bytes::from(payload.to_string())))
-        .unwrap()
+        .header("X-Content-Type-Options", "nosniff");
+    if let Some(ra) = retry_after {
+        b = b.header(header::RETRY_AFTER, ra);
+    }
+    b.body(full_body(Bytes::from(payload.to_string()))).unwrap()
 }
 
 /// Self-contained block page: no external CSS, fonts or images, so it renders
@@ -10294,6 +10389,37 @@ mod block_page_tests {
                 "detection reason leaked with Accept={accept:?}: {body}"
             );
         }
+    }
+
+    /// A throttle is not a policy block: a rate-limited client must get 429 and
+    /// a Retry-After in both the HTML and JSON shapes, and a plain block must
+    /// stay 403 without one.
+    #[tokio::test]
+    async fn rate_limit_block_is_429_with_retry_after() {
+        for accept in [Some("text/html"), Some("application/json"), None] {
+            let mut ctx = ctx_with(accept, None);
+            ctx.block_status = Some(429);
+            let resp = block_response(&ctx);
+            assert_eq!(
+                resp.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "Accept={accept:?}"
+            );
+            assert_eq!(
+                resp.headers()
+                    .get(header::RETRY_AFTER)
+                    .map(|v| v.to_str().unwrap()),
+                Some("1"),
+                "Accept={accept:?}"
+            );
+            if accept != Some("text/html") {
+                let body = body_string(resp).await;
+                assert!(body.contains("Too Many Requests"), "{body}");
+            }
+        }
+        let plain = block_response(&ctx_with(Some("application/json"), None));
+        assert_eq!(plain.status(), StatusCode::FORBIDDEN);
+        assert!(plain.headers().get(header::RETRY_AFTER).is_none());
     }
 
     /// ...but an operator debugging a false positive on an internal site can

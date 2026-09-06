@@ -178,6 +178,9 @@ pub struct RequestContext {
     pub decision: WafDecision,
     /// Human-readable reason for a Block/Challenge decision.
     pub block_reason: Option<String>,
+    /// HTTP status for the block response when it should not be 403 — a rate
+    /// limit answers 429 so an API client can tell a throttle from a policy block.
+    pub block_status: Option<u16>,
     /// Set when the request could not be served at all — origin refused, no site
     /// matched, body unreadable — i.e. the paths that answer 502.
     ///
@@ -250,6 +253,7 @@ impl RequestContext {
             tx_vars: HashMap::new(),
             decision: WafDecision::Allow,
             block_reason: None,
+            block_status: None,
             gateway_error: None,
             would_block: false,
             threat_intel_hit: false,
