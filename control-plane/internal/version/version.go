@@ -19,12 +19,22 @@ import (
 // [workspace.package].version and dashboard/package.json — CI refuses a drift.
 const Product = "1.1.0"
 
-// commitLinked and buildDateLinked are what the binary was built from; set via
-// -ldflags. Read them through Commit() and BuildDate(), which prefer the
-// deployment's own value.
+// CommitLinked and BuildDateLinked are what the binary was built from, injected
+// by the Dockerfile with
+//
+//	-X .../internal/version.CommitLinked=$GIT_SHA
+//
+// Read them through Commit() and BuildDate(), which prefer the deployment's own
+// value.
+//
+// EXPORTED on purpose. They were briefly unexported, and `go build -X` on a
+// symbol it cannot find is a SILENT no-op — so the injection stopped working and
+// every binary reported "unknown" while the build logs looked perfect. The names
+// here and in the Dockerfile are now checked against each other by
+// deploy/ci/check-version-consistency.sh.
 var (
-	commitLinked    = "unknown"
-	buildDateLinked = "unknown"
+	CommitLinked    = "unknown"
+	BuildDateLinked = "unknown"
 )
 
 // Commit is the git SHA this deployment is running.
@@ -43,7 +53,7 @@ func Commit() string {
 	if v := strings.TrimSpace(os.Getenv("SENTINEL_GIT_SHA")); v != "" && v != "unknown" {
 		return v
 	}
-	return commitLinked
+	return CommitLinked
 }
 
 // BuildDate is the RFC 3339 timestamp of the deployed set, same reasoning.
@@ -51,13 +61,13 @@ func BuildDate() string {
 	if v := strings.TrimSpace(os.Getenv("SENTINEL_BUILD_DATE")); v != "" && v != "unknown" {
 		return v
 	}
-	return buildDateLinked
+	return BuildDateLinked
 }
 
 // LinkedCommit reports what THIS binary was compiled from, regardless of the
 // environment — so "the image is a retag of an older build" stays diagnosable
 // instead of being papered over by the value above.
-func LinkedCommit() string { return commitLinked }
+func LinkedCommit() string { return CommitLinked }
 
 // Info is the map every status endpoint embeds so operators see one version.
 func Info() map[string]string {

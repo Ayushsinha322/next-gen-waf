@@ -73,8 +73,8 @@ COPY control-plane ./
 ARG GIT_SHA=unknown
 ARG BUILD_DATE=unknown
 RUN go build -ldflags="-s -w \
-      -X github.com/your-org/sentinel-waf/control-plane/internal/version.Commit=${GIT_SHA} \
-      -X github.com/your-org/sentinel-waf/control-plane/internal/version.BuildDate=${BUILD_DATE}" \
+      -X github.com/your-org/sentinel-waf/control-plane/internal/version.CommitLinked=${GIT_SHA} \
+      -X github.com/your-org/sentinel-waf/control-plane/internal/version.BuildDateLinked=${BUILD_DATE}" \
       -o /out/controllerd ./cmd/controllerd \
  && go build -ldflags="-s -w" -o /out/sentinelctl  ./cmd/sentinelctl
 

@@ -6,7 +6,7 @@ import "testing"
 // retags byte-identical images would otherwise report the previous commit — the
 // console did exactly that for two deploys on 2026-09-07.
 func TestCommitPrefersTheDeploymentValue(t *testing.T) {
-	commitLinked, buildDateLinked = "aaaaaaa", "2026-01-01T00:00:00Z"
+	CommitLinked, BuildDateLinked = "aaaaaaa", "2026-01-01T00:00:00Z"
 
 	t.Setenv("SENTINEL_GIT_SHA", "")
 	t.Setenv("SENTINEL_BUILD_DATE", "")

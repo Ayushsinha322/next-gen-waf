@@ -4366,7 +4366,7 @@ async fn phase1_headers(
                                     has_hs_secret = jwt_cfg.hs_secret.is_some(),
                                     has_public_key = jwt_cfg.public_key_pem.is_some(),
                                     "JWT policy cannot verify tokens — every request presenting one \
-                                     is being rejected with 403. This is a configuration fault, not \
+                                     is being rejected with 401. This is a configuration fault, not \
                                      an attack: fix the key material (hs_secret, public_key_pem or a \
                                      reachable jwks_url), or disable JWT for this site."
                                 );
