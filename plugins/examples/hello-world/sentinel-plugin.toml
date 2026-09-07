@@ -1,0 +1,17 @@
+[plugin]
+name        = "hello-world"
+version     = "0.1.0"
+description = "The SDK example: logs a line per request, scores an empty User-Agent, blocks the sqlmap UA and keeps a request counter in the shared KV store. Install it to see a plugin's log lines and host calls end to end; it is not a security control."
+author      = "ESDS WAF team"
+wasm        = "plugin.wasm"
+
+[plugin.hooks]
+request_headers = true
+
+[plugin.permissions]
+host_log            = true
+host_get_req_header = true
+host_set_decision   = true
+host_add_score      = true
+host_kv_get         = true
+host_kv_set         = true

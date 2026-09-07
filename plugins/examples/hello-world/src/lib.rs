@@ -6,6 +6,7 @@
 #![no_std]
 
 extern crate alloc;
+use alloc::string::ToString;
 
 use sentinel_plugin_sdk::*;
 

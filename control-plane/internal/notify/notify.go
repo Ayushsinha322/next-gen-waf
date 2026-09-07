@@ -67,10 +67,13 @@ type Config struct {
 
 // Result is the outcome of one delivery attempt.
 type Result struct {
-	ChannelID string
-	Name      string
-	OK        bool
-	Err       string
+	// JSON tags matter: the report-delivery endpoint returns these verbatim to
+	// the console, which reads {name, ok, err}. Without them Go's field names
+	// were sent and every target rendered as "undefined".
+	ChannelID string `json:"channel_id"`
+	Name      string `json:"name"`
+	OK        bool   `json:"ok"`
+	Err       string `json:"err,omitempty"`
 }
 
 // Status returns "ok" or the error string, for persisting last_status.

@@ -4,6 +4,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { motion } from "framer-motion";
 import { api, type ClusterHealth } from "@/lib/api";
 import { navGroupStagger, navItemVariants, spring } from "@/lib/animations";
+import { useT } from "@/lib/i18n";
 
 // ── Inline SVG icons ─────────────────────────────────────────────────────────
 const Icon = {
@@ -86,6 +87,17 @@ const Icon = {
       <line x1="1.5" y1="12" x2="5" y2="12"/><line x1="19" y1="12" x2="22.5" y2="12"/>
     </svg>
   ),
+  Jobs: () => (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15.5 14"/>
+    </svg>
+  ),
+  Reports: () => (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>
+      <line x1="8" y1="17" x2="8" y2="13"/><line x1="12" y1="17" x2="12" y2="10"/><line x1="16" y1="17" x2="16" y2="15"/>
+    </svg>
+  ),
   Cluster: () => (
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
       <circle cx="12" cy="4" r="2.4"/><circle cx="5" cy="19" r="2.4"/><circle cx="19" cy="19" r="2.4"/>
@@ -94,32 +106,37 @@ const Icon = {
   ),
 };
 
-const NAV = [
-  { group: "MONITOR", items: [
-    { id: "overview", Icon: Icon.Overview, label: "Overview" },
-    { id: "traffic",  Icon: Icon.Traffic,  label: "Traffic",  badge: "LIVE", badgeCls: "nb-g" },
-    { id: "alerts",   Icon: Icon.Alerts,   label: "Alerts" },
-    { id: "logs",     Icon: Icon.Logs,     label: "Logs",     badge: "LIVE", badgeCls: "nb-g" },
-    { id: "events",   Icon: Icon.Search,   label: "Threat Search" },
+// One badge policy. The right-hand column carries a LIVE COUNT where one exists
+// (sites, enforced rules, plugins, open alerts) and nothing else; pages fed by a
+// live stream get a small pulsing dot instead of a "LIVE" word. The mix of tier
+// tags ("NEW", "AI", "TLS"), counts and status chips in one column is gone.
+const NAV: Array<{ group: string; items: Array<{ id: string; Icon: () => JSX.Element; live?: boolean }> }> = [
+  { group: "monitor", items: [
+    { id: "overview", Icon: Icon.Overview },
+    { id: "traffic",  Icon: Icon.Traffic, live: true },
+    { id: "alerts",   Icon: Icon.Alerts },
+    { id: "logs",     Icon: Icon.Logs, live: true },
+    { id: "events",   Icon: Icon.Search },
+    { id: "reports",  Icon: Icon.Reports },
   ]},
-  { group: "PROTECT", items: [
-    { id: "sites",   Icon: Icon.Sites,   label: "Sites" },
-    { id: "rules",   Icon: Icon.Rules,   label: "Rules" },
-    { id: "certificates", Icon: Icon.Certificates, label: "Certificates", badge: "TLS", badgeCls: "nb-g" },
-    { id: "blocked", Icon: Icon.ThreatIntel, label: "Blocked Sources" },
-    { id: "plugins", Icon: Icon.Plugins, label: "Plugins" },
+  { group: "protect", items: [
+    { id: "sites",        Icon: Icon.Sites },
+    { id: "rules",        Icon: Icon.Rules },
+    { id: "certificates", Icon: Icon.Certificates },
+    { id: "blocked",      Icon: Icon.ThreatIntel },
+    { id: "plugins",      Icon: Icon.Plugins },
   ]},
-  { group: "INTELLIGENCE", items: [
-    { id: "threat-intel", Icon: Icon.ThreatIntel, label: "Threat Intel", badge: "NEW", badgeCls: "nb-c" },
-    { id: "copilot", Icon: Icon.Copilot, label: "AI Copilot", badge: "AI",   badgeCls: "nb-a", badgeStyle: { background: "rgba(124,58,237,.18)", color: "#a78bfa", borderColor: "rgba(124,58,237,.3)" } },
-    { id: "ml",      Icon: Icon.ML,      label: "ML Engine",  badge: "LIVE", badgeCls: "nb-g" },
+  { group: "intelligence", items: [
+    { id: "threat-intel", Icon: Icon.ThreatIntel },
+    { id: "copilot",      Icon: Icon.Copilot },
+    { id: "ml",           Icon: Icon.ML, live: true },
   ]},
-  { group: "SYSTEM", items: [
-    { id: "cluster",  Icon: Icon.Cluster,  label: "Cluster" },
-    { id: "audit",    Icon: Icon.Audit,    label: "Audit Log" },
-    { id: "jobs",     Icon: Icon.Cluster,  label: "System Jobs" },
-    { id: "global-settings", Icon: Icon.Settings, label: "Global Settings" },
-    { id: "settings", Icon: Icon.Settings, label: "Settings" },
+  { group: "system", items: [
+    { id: "cluster",         Icon: Icon.Cluster },
+    { id: "audit",           Icon: Icon.Audit },
+    { id: "jobs",            Icon: Icon.Jobs },
+    { id: "global-settings", Icon: Icon.Settings },
+    { id: "settings",        Icon: Icon.Settings },
   ]},
 ];
 
@@ -128,6 +145,7 @@ type Counts = { sites: number | null; rules: number | null; plugins: number | nu
 export default function SideBar() {
   const pathname = usePathname();
   const router   = useRouter();
+  const { t }    = useT();
   const current  = pathname.split("/").pop() || "overview";
 
   // Live nav counts + cluster footer — never hard-coded. Any endpoint that
@@ -188,16 +206,17 @@ export default function SideBar() {
 
   let footTitle: string, footSub: string, footDot: string;
   if (!health) {
-    footTitle = "Cluster";
-    footSub   = healthErr ? "control plane unreachable" : "connecting…";
+    footTitle = t("nav.cluster");
+    footSub   = healthErr ? t("cluster.unreachable") : t("cluster.connecting");
     footDot   = healthErr ? "r" : "a";
   } else if (cp?.enabled) {
-    footTitle = cp.leader_id != null ? `${cp.leader_id} · leader` : "no leader elected";
-    footSub   = `${cp.healthy}/${cp.total} online${fleetVersion ? ` · ${fleetVersion}` : ""}`;
+    footTitle = cp.leader_id != null ? t("cluster.leader", { id: cp.leader_id }) : t("cluster.no_leader");
+    footSub   = `${t("cluster.online", { healthy: cp.healthy, total: cp.total })}${fleetVersion ? ` · ${fleetVersion}` : ""}`;
     footDot   = cp.write_available ? "g" : "r";
   } else {
-    footTitle = "Standalone";
-    footSub   = `${dp?.total ?? 0} WAF node${(dp?.total ?? 0) === 1 ? "" : "s"}${fleetVersion ? ` · ${fleetVersion}` : ""}`;
+    const n = dp?.total ?? 0;
+    footTitle = t("cluster.standalone");
+    footSub   = `${t(n === 1 ? "cluster.nodes" : "cluster.nodes_plural", { n })}${fleetVersion ? ` · ${fleetVersion}` : ""}`;
     footDot   = dp && dp.healthy > 0 ? "g" : "r";
   }
 
@@ -211,7 +230,7 @@ export default function SideBar() {
       <div style={{ flex: 1, overflowY: "auto", padding: "8px 8px" }}>
         {NAV.map(g => (
           <motion.div key={g.group} variants={navGroupStagger} initial="hidden" animate="visible">
-            <span className="sb-lbl">{g.group}</span>
+            <span className="sb-lbl">{t(`nav.group.${g.group}`)}</span>
             {g.items.map((item, idx) => (
               <motion.div
                 key={item.id}
@@ -223,17 +242,11 @@ export default function SideBar() {
                 whileTap={{ scale: 0.98 }}
               >
                 <span className="nv-ico"><item.Icon /></span>
-                <span className="nv-lbl">{item.label}</span>
-                {(() => {
-                  const lb = liveBadge[item.id];
-                  const badgeText = lb ? lb.value : item.badge;
-                  const badgeCls  = lb ? lb.cls : item.badgeCls;
-                  return badgeText ? (
-                    <span className={`nv-b ${badgeCls}`} style={(item as any).badgeStyle}>
-                      {badgeText}
-                    </span>
-                  ) : null;
-                })()}
+                <span className="nv-lbl">{t(`nav.${item.id}`)}</span>
+                {item.live && <span className="nv-live" title={t("nav.live")} aria-label={t("nav.live")} />}
+                {liveBadge[item.id] && (
+                  <span className={`nv-b ${liveBadge[item.id].cls}`}>{liveBadge[item.id].value}</span>
+                )}
               </motion.div>
             ))}
           </motion.div>

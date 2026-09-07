@@ -1,10 +1,11 @@
 "use client";
+import { useT, SUPPORTED_LOCALES, type Locale } from "@/lib/i18n";
 import { useState, useEffect } from "react";
 import { motion } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
 import Toggle from "@/components/ui/Toggle";
 import { api, type UserRow, type APIKeyRow, type NotificationChannel, type ChannelType, type ChannelConfig, type Severity, type ManagementTLSInfo, type ClusterHealth } from "@/lib/api";
-import { staggerContainer, fadeUp, spring } from "@/lib/animations";
+import { staggerContainer, fadeUp, spring, tweenFast } from "@/lib/animations";
 import { logout, getUser } from "@/lib/auth";
 
 const TABS = ["General","Auth & SSO","API Keys","Users & RBAC","Cluster","Notifications","Management TLS"];
@@ -110,7 +111,7 @@ function GeneralTab() {
   };
 
   return (
-    <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}
+    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={tweenFast}
       style={{ display: "grid", gap: 14 }}>
 
       {errs.length > 0 && (
@@ -133,6 +134,13 @@ function GeneralTab() {
           <KV label="Upstream health" value={
             waf ? `${waf.upstreams_healthy ?? 0} / ${waf.upstreams_total ?? 0} healthy` : "…"} />
           <KV label="Listeners" value={waf?.listeners?.length ? waf.listeners.join("   ") : "…"} />
+        </div>
+      </div>
+
+      <div className="panel">
+        <div className="ph"><div className="ptitle">Console language</div></div>
+        <div className="pb">
+          <LanguagePicker />
           <KV label="HTTP/3 (QUIC)" value={
             waf?.http3 ? (waf.http3.enabled ? `enabled · advertised :${waf.http3.advertise_port ?? "?"}` : "disabled") : "…"} />
         </div>
@@ -194,7 +202,7 @@ function GeneralTab() {
 
 function AuthTab() {
   return (
-    <motion.div className="panel" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}>
+    <motion.div className="panel" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={tweenFast}>
       <div className="pb">
         <div style={{ fontSize: "var(--fs-h3)", fontWeight: 600, color: "var(--text)", margin: "4px 0 6px" }}>
           Single sign-on
@@ -292,7 +300,7 @@ function APIKeysTab() {
   }
 
   return (
-    <motion.div className="panel" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}>
+    <motion.div className="panel" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={tweenFast}>
       <div className="ph">
         <div className="ptitle">🔑 API Keys</div>
         <motion.button className="btn bp btn-sm" onClick={() => { setShowCreate(s=>!s); setRevealKey(null); }} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
@@ -454,7 +462,7 @@ function UsersTab() {
       </Note>
     )}
 
-    <motion.div className="panel" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}>
+    <motion.div className="panel" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={tweenFast}>
       <div className="ph">
         <div className="ptitle">👥 Team Members</div>
         <motion.button className="btn bp btn-sm" onClick={() => setShowInvite(s=>!s)} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
@@ -589,7 +597,7 @@ function TwoFactorCard({ users, onChanged }: { users: UserRow[]; onChanged: () =
   }
 
   return (
-    <motion.div className="panel" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}>
+    <motion.div className="panel" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={tweenFast}>
       <div className="ph">
         <div className="ptitle">🔐 Two-factor authentication</div>
         {enabled === null ? <span className="td3" style={{ fontSize: 12.5 }}>—</span>
@@ -670,7 +678,7 @@ function ChangePasswordCard() {
 
   return (
     <motion.div className="panel" style={{ marginBottom: 14 }}
-      initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}>
+      initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={tweenFast}>
       <div className="ph"><div className="ptitle">🔐 Your password</div></div>
       <div className="pb">
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
@@ -731,7 +739,7 @@ function ClusterTab() {
       : <span className="bdg bcy">standalone</span>;
 
   return (
-    <motion.div className="panel" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}>
+    <motion.div className="panel" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={tweenFast}>
       <div className="ph">
         <div className="ptitle">⚡ Cluster Status</div>
         {headBadge}
@@ -868,7 +876,7 @@ function NotificationsTab() {
   const isNet = form.type === "syslog" || form.type === "cef";
 
   return (
-    <motion.div className="panel" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}>
+    <motion.div className="panel" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={tweenFast}>
       <div className="ph">
         <div className="ptitle">🔔 Notification Channels</div>
         <motion.button className="btn bc btn-sm" onClick={() => setAdding(a => !a)} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
@@ -1004,7 +1012,7 @@ function ManagementTLSTab() {
 
   const d = daysLeft(info?.expires_at);
   return (
-    <motion.div className="panel" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}>
+    <motion.div className="panel" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={tweenFast}>
       <div className="ph">
         <div className="ptitle">🔐 Management Console Certificate</div>
         {info && !info.self_signed && (
@@ -1083,5 +1091,18 @@ function ManagementTLSTab() {
         </div>
       </div>
     </motion.div>
+  );
+}
+
+function LanguagePicker() {
+  const { locale, setLocale, t } = useT();
+  return (
+    <div style={{ display: "grid", gap: 6 }}>
+      <label style={{ fontSize: 12, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>{t("common.language")}</label>
+      <select className="fsel" value={locale} onChange={e => setLocale(e.target.value as Locale)} style={{ maxWidth: 260 }}>
+        {SUPPORTED_LOCALES.map(l => <option key={l.code} value={l.code}>{l.label}</option>)}
+      </select>
+      <div style={{ fontSize: 12, color: "var(--text3)", lineHeight: 1.5 }}>{t("common.language_hint")}</div>
+    </div>
   );
 }

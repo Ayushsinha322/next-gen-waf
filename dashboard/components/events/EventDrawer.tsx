@@ -18,7 +18,9 @@
  */
 import { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
+import { useRouter } from "next/navigation";
 import { api, type WafEvent, type Site } from "@/lib/api";
+import { openCopilotWith, explainEventPrompt, draftExclusionPrompt } from "@/lib/copilotContext";
 import { showToast } from "@/components/ui/Toast";
 
 function Row({ label, children, mono = false }: { label: string; children: React.ReactNode; mono?: boolean }) {
@@ -37,6 +39,7 @@ export default function EventDrawer({
   sites: Site[];
   onClose: () => void;
 }) {
+  const router = useRouter();
   const [busy, setBusy] = useState(false);
 
   // Escape closes, matching every drawer pattern operators already know.
@@ -227,6 +230,10 @@ export default function EventDrawer({
                 {busy ? "Applying…" : `Exclude rule ${ruleIsNumeric ? ruleId : ""} on this site`}
               </button>
               <button className="btn bg-btn btn-sm" onClick={copyJson}>Copy event JSON</button>
+              <button className="btn bg-btn btn-sm" title="Open the AI Copilot with this event loaded and ask what fired and why"
+                onClick={() => openCopilotWith(router, explainEventPrompt(event as unknown as Record<string, unknown>))}>🤖 Explain</button>
+              <button className="btn bg-btn btn-sm" title="Open the AI Copilot with this event loaded and ask for the narrowest exclusion"
+                onClick={() => openCopilotWith(router, draftExclusionPrompt(event as unknown as Record<string, unknown>))}>🤖 Draft exclusion</button>
             </div>
 
             <div style={{ fontSize: "var(--fs-label)", color: "var(--text3)", marginTop: 10, lineHeight: 1.6 }}>

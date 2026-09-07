@@ -1,7 +1,7 @@
 "use client";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
-import { api, type Plugin, type PluginHooks, type PluginPermissions } from "@/lib/api";
+import { api, type Plugin, type CatalogPlugin, type PluginHooks, type PluginPermissions } from "@/lib/api";
 import { staggerContainer, fadeUp } from "@/lib/animations";
 
 /**
@@ -55,6 +55,9 @@ function formatWhen(iso: string): string {
 
 export default function PluginsPage() {
   const [plugins, setPlugins] = useState<Plugin[] | null>(null);
+  const [catalog, setCatalog] = useState<CatalogPlugin[] | null>(null);
+  const [catalogErr, setCatalogErr] = useState<string | null>(null);
+  const [installing, setInstalling] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
@@ -106,6 +109,35 @@ export default function PluginsPage() {
       if (file) void upload(file);
     },
     [upload],
+  );
+
+  const loadCatalog = useCallback(async () => {
+    try {
+      const r = await api.plugins.catalog();
+      setCatalog(r.catalog);
+      setCatalogErr(r.errors?.length ? r.errors.join("; ") : null);
+    } catch (e) {
+      setCatalog([]);
+      setCatalogErr(e instanceof Error ? e.message : "catalogue unavailable");
+    }
+  }, []);
+  useEffect(() => { void loadCatalog(); }, [loadCatalog]);
+
+  const installFromCatalog = useCallback(
+    async (entry: CatalogPlugin) => {
+      setInstalling(entry.name);
+      setNotice(null);
+      try {
+        const r = await api.plugins.installFromCatalog(entry.name);
+        setNotice(`${r.plugin.name} v${r.plugin.version} installed. ${r.note ?? ""}`.trim());
+        await Promise.all([load(), loadCatalog()]);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "install failed");
+      } finally {
+        setInstalling(null);
+      }
+    },
+    [load, loadCatalog],
   );
 
   const toggle = useCallback(
@@ -255,6 +287,59 @@ export default function PluginsPage() {
         </motion.div>
       )}
 
+      {catalog !== null && (
+        <motion.div variants={fadeUp} className="pc">
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 12, flexWrap: "wrap", marginBottom: 6 }}>
+            <div style={{ fontSize: "var(--fs-h3)", fontWeight: 600, color: "var(--text)" }}>Catalogue</div>
+            <div style={{ fontSize: "var(--fs-sm)", color: "var(--text2)" }}>{catalog.length} bundled with this build · install is one click, enabling is a second</div>
+          </div>
+          <div style={{ fontSize: "var(--fs-sm)", color: "var(--text2)", lineHeight: 1.6, marginBottom: 14 }}>
+            Each entry runs in the WebAssembly sandbox and can call only the host functions its manifest declares — shown
+            per plugin below. Source for every entry is in <code>plugins/examples/</code>; the archives are rebuilt by{" "}
+            <code>plugins/build-catalog.sh</code>.
+          </div>
+          {catalogErr && <div style={{ color: "var(--amber)", fontSize: "var(--fs-sm)", marginBottom: 10 }}>⚠ {catalogErr}</div>}
+          <div style={{ display: "grid", gap: 12 }}>
+            {catalog.map(entry => {
+              const hooks = HOOK_LABELS.filter(([k]) => entry.hooks?.[k]);
+              const perms = PERM_LABELS.filter(([k]) => entry.permissions?.[k]);
+              const busyNow = installing === entry.name;
+              const label = !entry.installed ? "Install" : entry.up_to_date ? "Installed" : `Update to v${entry.version}`;
+              return (
+                <div key={entry.name} style={{ border: "1px solid var(--border2)", borderRadius: 10, padding: 14, display: "grid", gap: 10 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", alignItems: "flex-start" }}>
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontWeight: 700, color: "var(--text)", display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                        📦 {entry.name}
+                        <span className="bdg bgr">v{entry.version}</span>
+                        {entry.installed && <span className={`bdg ${entry.installed_enabled ? "bgg" : "ba"}`}>{entry.installed_enabled ? "ACTIVE" : `INSTALLED v${entry.installed_version}`}</span>}
+                      </div>
+                      <div style={{ fontSize: "var(--fs-sm)", color: "var(--text2)", marginTop: 4, lineHeight: 1.6, maxWidth: 760 }}>{entry.description}</div>
+                      <div style={{ fontSize: 11, color: "var(--text3)", fontFamily: "var(--font-mono)", marginTop: 6 }}>
+                        {entry.author} · {formatBytes(entry.size_bytes)} · sha256 {entry.sha256.slice(0, 12)}…
+                      </div>
+                    </div>
+                    <button className={`btn ${entry.installed && entry.up_to_date ? "bg-btn" : "bp"} btn-sm`} disabled={busyNow || (entry.installed && entry.up_to_date)}
+                      title={entry.installed && entry.up_to_date ? "This exact build is already installed" : "Install into this tenant (arrives disabled)"}
+                      onClick={() => void installFromCatalog(entry)}>
+                      {busyNow ? "Installing…" : label}
+                    </button>
+                  </div>
+                  <div style={{ display: "flex", gap: 18, flexWrap: "wrap", fontSize: "var(--fs-sm)" }}>
+                    <div><span style={{ color: "var(--text3)" }}>Hooks: </span>{hooks.length ? hooks.map(([, l]) => l).join(", ") : "none"}</div>
+                    <div><span style={{ color: "var(--text3)" }}>Host calls: </span>
+                      {perms.length ? perms.map(([k, l]) => (
+                        <span key={k} className={`bdg ${HIGH_IMPACT.includes(k) ? "ba" : "bgr"}`} style={{ marginRight: 4 }} title={HIGH_IMPACT.includes(k) ? "Changes what happens to traffic" : undefined}>{l}</span>
+                      )) : "none"}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </motion.div>
+      )}
+
       {!error && plugins !== null && (
         <motion.div variants={fadeUp} className="pc">
           <div
@@ -279,9 +364,7 @@ export default function PluginsPage() {
             <div style={{ color: "var(--text2)", fontSize: "var(--fs-sm)", lineHeight: 1.7 }}>
               No plugins installed. The WebAssembly runtime is loaded and idle.
               <br />
-              A working example — a scanner User-Agent guard — is in the repository at{" "}
-              <code>examples/plugins/ua-guard</code>; run its <code>build.sh</code> to produce an
-              uploadable archive.
+              Install <strong>scanner-guard</strong> from the catalogue above to see one run on real traffic, or upload your own archive.
             </div>
           ) : (
             <div style={{ display: "grid", gap: 12 }}>

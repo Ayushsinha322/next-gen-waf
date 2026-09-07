@@ -2,6 +2,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { motion } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
+import EmptyState from "@/components/ui/EmptyState";
 import { api, type TrafficBucket, type MetricsSnapshot } from "@/lib/api";
 import { staggerContainer, cardVariants, fadeUp, spring } from "@/lib/animations";
 
@@ -208,9 +209,7 @@ export default function TrafficPage() {
           </div>
           <div className="pb">
             {topIPs.length === 0 ? (
-              <div style={{ padding: "16px 0", textAlign: "center", fontSize: 13, fontFamily: "var(--font-mono)", color: "rgba(100,116,139,0.5)" }}>
-                No traffic yet
-              </div>
+              <EmptyState compact icon="📡" title="No traffic yet" hint="Top sources fill in as requests pass through a protected site. Point a hostname at the WAF, or open a site's public endpoint from the Sites page." action={{ label: "Go to Sites", href: "/sites" }} />
             ) : (
               topIPs.map(([ip, cnt], idx) => (
                 <motion.div key={ip} className="eprow" style={{ marginBottom: 7 }} initial={{ opacity: 0, x: -6 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: idx * 0.04 }}>

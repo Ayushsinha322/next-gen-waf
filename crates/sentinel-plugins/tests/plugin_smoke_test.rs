@@ -410,3 +410,46 @@ fn wasm_that_loops() -> Vec<u8> {
     )
     .unwrap()
 }
+
+// ---------------------------------------------------------------------------
+// Bundled catalogue plugin: scanner-guard
+// ---------------------------------------------------------------------------
+
+/// Built by `plugins/build-catalog.sh`; skipped (not failed) when absent so a
+/// checkout without the wasm target still runs the suite.
+fn scanner_guard_wasm_path() -> &'static Path {
+    Path::new("../../plugins/examples/scanner-guard/target/wasm32-unknown-unknown/release/sentinel_plugin_scanner_guard.wasm")
+}
+
+/// The catalogue's first entry must do what its description says on real
+/// request contexts: block a scanner UA, leave a browser alone, score a missing UA.
+#[tokio::test]
+async fn scanner_guard_blocks_scanner_user_agents_only() {
+    let path = scanner_guard_wasm_path();
+    if !path.exists() {
+        eprintln!("skipping: {} not built", path.display());
+        return;
+    }
+    let wasm = std::fs::read(path).unwrap();
+    let mut rt = PluginRuntime::new().unwrap();
+    rt.load_plugin("scanner-guard", &wasm).expect("load scanner-guard");
+
+    let ua_ctx = |ua: &str| {
+        let mut ctx = make_ctx();
+        ctx.request_headers.insert(http::header::USER_AGENT, ua.parse().unwrap());
+        ctx
+    };
+    for ua in ["sqlmap/1.7.2#stable (https://sqlmap.org)", "Mozilla/5.0 Nikto/2.1.6", "Nuclei - Open-source project", "WPScan v3.8"] {
+        let r = rt.evaluate_plugin("scanner-guard", &ua_ctx(ua)).await;
+        assert_eq!(r.decision, WafDecision::Block, "UA {ua:?} must be blocked");
+    }
+    let r = rt.evaluate_plugin("scanner-guard", &make_ctx()).await;
+    assert_eq!(r.decision, WafDecision::Allow, "a browser UA must pass");
+    assert_eq!(r.anomaly_score_delta, 0);
+
+    let mut no_ua = make_ctx();
+    no_ua.request_headers.remove(http::header::USER_AGENT);
+    let r = rt.evaluate_plugin("scanner-guard", &no_ua).await;
+    assert_eq!(r.decision, WafDecision::Allow, "a missing UA is scored, not blocked");
+    assert_eq!(r.anomaly_score_delta, 2);
+}

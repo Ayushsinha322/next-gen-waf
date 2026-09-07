@@ -5,6 +5,7 @@ import SideBar from "@/components/layout/SideBar";
 import ToastContainer from "@/components/ui/Toast";
 import ModalContainer from "@/components/ui/Modal";
 import CopilotFab from "@/components/copilot/CopilotFab";
+import { I18nProvider } from "@/lib/i18n";
 
 /**
  * Three things were removed from this layout and none of them should come back.
@@ -28,7 +29,7 @@ import CopilotFab from "@/components/copilot/CopilotFab";
  */
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
   return (
-    <>
+    <I18nProvider>
       <TopBar />
       <SideBar />
       <main className="content">
@@ -47,6 +48,6 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
       <CopilotFab variant="dashboard" />
       <ToastContainer />
       <ModalContainer />
-    </>
+    </I18nProvider>
   );
 }

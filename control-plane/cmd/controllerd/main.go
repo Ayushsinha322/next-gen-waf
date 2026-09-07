@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -28,11 +29,17 @@ import (
 	"github.com/your-org/sentinel-waf/control-plane/internal/logs"
 	"github.com/your-org/sentinel-waf/control-plane/internal/nodehealth"
 	"github.com/your-org/sentinel-waf/control-plane/internal/rbac"
+	"github.com/your-org/sentinel-waf/control-plane/internal/reports"
 	"github.com/your-org/sentinel-waf/control-plane/internal/settings"
 	"github.com/your-org/sentinel-waf/control-plane/internal/threatintel"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
+
+// reportDeliverer is set while this node is the leader (reports are sent once
+// per cluster); the run-now handler reads it and answers 503 on a follower
+// that was not forwarded.
+var reportDeliverer atomic.Pointer[reports.Deliverer]
 
 func main() {
 	fmt.Fprintln(os.Stderr, "controllerd starting…")
@@ -242,6 +249,9 @@ func run() error {
 				if err := db.EnsureSettingsSchema(ctx, pool); err != nil {
 					log.Warn("global_settings schema bootstrap failed (Global Settings page will be read-only)", zap.Error(err))
 				}
+				if err := db.EnsureReportsSchema(ctx, pool); err != nil {
+					log.Warn("reports schema", zap.Error(err))
+				}
 				if err := db.EnsureLogProfileSchema(ctx, pool); err != nil {
 					log.Warn("log profile schema ensure failed (non-fatal)", zap.Error(err))
 				}
@@ -392,6 +402,11 @@ func run() error {
 			}, log)
 			gf.Start()
 			stops = append(stops, gf.Stop)
+			// Scheduled reports: build from ClickHouse, deliver to a channel/mailbox.
+			rd := reports.NewDeliverer(store, chClient, currentMailer, log)
+			rd.Start()
+			reportDeliverer.Store(rd)
+			stops = append(stops, func() { rd.Stop(); reportDeliverer.Store((*reports.Deliverer)(nil)) })
 			nm := nodehealth.New(store, eng, log)
 			nm.Start()
 			stops = append(stops, nm.Stop)
@@ -647,6 +662,20 @@ func run() error {
 		// WASM plugins. Upload is a .zip containing sentinel-plugin.toml plus the
 		// module; a freshly uploaded plugin is inactive until explicitly enabled.
 		protected.GET("/plugins", func(c *gin.Context) { handleListPluginsReal(c, enforcer, store) })
+		// Bundled catalogue: what ships with this build, installable in one click.
+		// Scheduled security reports (per site, daily/weekly, to a channel or mailbox).
+		protected.GET("/reports/schedules", func(c *gin.Context) {
+			handleListReportSchedules(c, enforcer, store, currentMailer().Config().Configured())
+		})
+		protected.POST("/reports/schedules", func(c *gin.Context) { handleCreateReportSchedule(c, enforcer, store, hub, cl) })
+		protected.PUT("/reports/schedules/:id", func(c *gin.Context) { handleUpdateReportSchedule(c, enforcer, store, hub, cl) })
+		protected.DELETE("/reports/schedules/:id", func(c *gin.Context) { handleDeleteReportSchedule(c, enforcer, store, hub, cl) })
+		protected.POST("/reports/schedules/:id/run", func(c *gin.Context) {
+			handleRunReportSchedule(c, enforcer, store, hub, cl, reportDeliverer.Load())
+		})
+		protected.GET("/reports/preview", func(c *gin.Context) { handlePreviewReport(c, enforcer, chClient) })
+		protected.GET("/plugins/catalog", func(c *gin.Context) { handleListPluginCatalog(c, enforcer, store) })
+		protected.POST("/plugins/catalog/:name/install", func(c *gin.Context) { handleInstallCatalogPlugin(c, enforcer, store) })
 		protected.POST("/plugins", func(c *gin.Context) { handleUploadPlugin(c, enforcer, store) })
 		protected.PATCH("/plugins/:name", func(c *gin.Context) { handleSetPluginEnabled(c, enforcer, store) })
 		protected.DELETE("/plugins/:name", func(c *gin.Context) { handleDeletePlugin(c, enforcer, store) })

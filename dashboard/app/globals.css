@@ -441,6 +441,10 @@ input, select, textarea { font-family:inherit; }
 .nb-g { background:rgba(0,200,122,.12); color:var(--green); border:1px solid rgba(0,200,122,.28); }
 .nb-a { background:rgba(255,170,0,.12); color:var(--amber); border:1px solid rgba(255,170,0,.28); }
 .nb-c { background:rgba(0,212,255,.1); color:var(--cyan); border:1px solid rgba(0,212,255,.25); }
+/* Live-stream marker on nav items fed by a stream (Traffic, Logs, ML): a dot, not a word. */
+.nv-live { width:6px; height:6px; border-radius:50%; background:var(--green); box-shadow:0 0 6px var(--green); animation:nvpulse 2.2s ease-in-out infinite; flex-shrink:0; }
+@keyframes nvpulse { 0%,100% { opacity:.55; } 50% { opacity:1; } }
+@media (prefers-reduced-motion: reduce) { .nv-live { animation:none; } }
 .leader-dot {
   width:6px; height:6px; border-radius:50%; background:var(--green);
   box-shadow:0 0 8px var(--green); animation:pulse 2.5s infinite; display:inline-block;
