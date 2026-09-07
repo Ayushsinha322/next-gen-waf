@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
 import { login, clearSessionCookie, MfaRequiredError } from "@/lib/auth";
 import { spring } from "@/lib/animations";
+import ChunkRecovery from "@/components/layout/ChunkRecovery";
 
 type AuthTab  = "std" | "sso" | "api";
 type BtnState = "idle" | "loading" | "success";
@@ -228,6 +229,8 @@ export default function LoginPage() {
       animate={{ opacity: 1 }}
       transition={{ duration: 0.5 }}
     >
+      {/* A stale tab after a dashboard roll lands HERE, so recovery belongs here too. */}
+      <ChunkRecovery />
       {/* ══ LEFT PANEL ══════════════════════════════════════════════════════ */}
       <div id="LP" ref={lpRef}>
         <canvas id="LC" ref={canvasRef} />

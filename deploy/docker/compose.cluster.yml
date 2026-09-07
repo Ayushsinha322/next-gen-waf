@@ -119,6 +119,8 @@ services:
       migrate: { condition: service_completed_successfully }
       clickhouse: { condition: service_started }
     environment:
+      SENTINEL_GIT_SHA: ${SENTINEL_VERSION:-unknown}
+      SENTINEL_BUILD_DATE: ${SENTINEL_BUILD_DATE:-unknown}
       SENTINEL_GEOIP_DIR: /var/lib/sentinel/geoip
       <<: *cp-env
       SENTINEL_NODE_ID: "2"
@@ -152,6 +154,8 @@ services:
       migrate: { condition: service_completed_successfully }
       clickhouse: { condition: service_started }
     environment:
+      SENTINEL_GIT_SHA: ${SENTINEL_VERSION:-unknown}
+      SENTINEL_BUILD_DATE: ${SENTINEL_BUILD_DATE:-unknown}
       SENTINEL_GEOIP_DIR: /var/lib/sentinel/geoip
       <<: *cp-env
       SENTINEL_NODE_ID: "3"

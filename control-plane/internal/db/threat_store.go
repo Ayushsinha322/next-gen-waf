@@ -167,6 +167,54 @@ func (s *Store) PurgeExpiredIOCs(ctx context.Context) (int64, error) {
 	return ct.RowsAffected(), nil
 }
 
+// ReconcileStaticSource deletes the indicators attributed to `source` whose
+// value is no longer in `keep`. It returns how many were removed.
+//
+// The corpus is otherwise purely additive: UpsertIOCs inserts and refreshes,
+// PurgeExpiredIOCs only removes rows whose TTL has passed, and a locally
+// generated source (the built-in scanner user-agent seed) has no TTL because it
+// is regenerated on every refresh. So an entry REMOVED from the seed kept
+// enforcing for ever. That was observed on 2026-09-07: "dirbuster" was still
+// stored and enforcing after being dropped from the seed in favour of the
+// shorter "dirb". Harmless in that instance, but the mechanism means a name
+// withdrawn BECAUSE it caused false positives would go on blocking traffic.
+//
+// Scoped to one source on purpose. It must never touch operator-created
+// indicators (source "manual"), nor a URL feed's rows — a feed that returns
+// nothing because it was unreachable would otherwise wipe its own corpus.
+func (s *Store) ReconcileStaticSource(ctx context.Context, source string, keep []IOC) (int64, error) {
+	pg, ok := s.pool.(*pgxPool)
+	if !ok {
+		return 0, fmt.Errorf("store: pool is not a *pgxPool")
+	}
+	if source == "" {
+		return 0, fmt.Errorf("store: reconcile needs a source name")
+	}
+	// An empty keep set means the source produced nothing this run. Deleting
+	// everything it owns would be the same failure as trusting an unreachable
+	// feed, so refuse instead.
+	if len(keep) == 0 {
+		return 0, nil
+	}
+	values := make([]string, 0, len(keep))
+	types := make([]string, 0, len(keep))
+	for _, i := range keep {
+		values = append(values, i.Value)
+		types = append(types, i.Type)
+	}
+	ct, err := pg.pool.Exec(ctx, `
+DELETE FROM threat_intel_iocs t
+ WHERE t.source = $1
+   AND NOT EXISTS (
+        SELECT 1 FROM unnest($2::text[], $3::text[]) AS k(ioc_type, value)
+         WHERE k.ioc_type = t.ioc_type AND k.value = t.value)`,
+		source, types, values)
+	if err != nil {
+		return 0, fmt.Errorf("store: reconcile static source %s: %w", source, err)
+	}
+	return ct.RowsAffected(), nil
+}
+
 // ThreatIntelStats returns the active IOC count and a version derived from the
 // most recent last_seen (epoch seconds).
 func (s *Store) ThreatIntelStats(ctx context.Context) (ThreatIntelStats, error) {

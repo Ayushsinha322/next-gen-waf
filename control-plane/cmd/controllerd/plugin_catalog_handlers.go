@@ -112,7 +112,10 @@ func handleListPluginCatalog(c *gin.Context, enf *rbac.Enforcer, store *db.Store
 			}
 		}
 	}
-	resp := gin.H{"catalog": entries, "source": "bundled with control plane " + version.Commit}
+	// LinkedCommit, not Commit: these archives are embedded in THIS binary, so
+	// the honest provenance is what the binary was compiled from, even when the
+	// image was retagged into a newer deployment version.
+	resp := gin.H{"catalog": entries, "source": "bundled with control plane " + version.LinkedCommit()}
 	if len(bad) > 0 {
 		resp["errors"] = bad
 	}

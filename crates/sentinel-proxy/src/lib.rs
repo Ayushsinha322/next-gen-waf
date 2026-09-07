@@ -71,7 +71,7 @@ use sentinel_modules::{
     GeoVerdict, GraphqlLimits, GrpcLimits, IpReputation, IpVerdict, JwtPolicy, RateLimiter,
     RawTier, SmugglingVerdict, ThreatFeed, ThreatVerdict,
 };
-use sentinel_plugins::PluginRuntime;
+use sentinel_plugins::{PluginEvalResult, PluginRuntime};
 use sentinel_rules::RuleEngine;
 use sentinel_telemetry::{
     bot_good_bot_allowed_total, dec_active_connections, graphql_blocked_total,
@@ -80,9 +80,11 @@ use sentinel_telemetry::{
     inc_load_shed_requests, inc_log_lines_dropped, inc_requests, inc_rule_hits, ja4_attempts_total,
     ja4_h3_absent_total, ja4_h3_attempts_total, ja4_h3_success_total, ja4_no_hello_total,
     ja4_success_total, note_good_bot_allowed, note_graphql_blocked, note_graphql_inspected,
-    note_grpc_inspected, note_ja4_attempt, note_ja4_no_hello, note_ja4_success,
-    note_smuggling_evaluated, note_smuggling_rejected_framing, note_smuggling_rejected_header,
-    observe_duration, prometheus_text, smuggling_evaluated_total, smuggling_rejected_framing_total,
+    note_grpc_inspected, note_ja4_attempt, note_ja4_no_hello, note_ja4_success, note_plugin_block,
+    note_plugin_invocation, note_plugin_score, note_plugin_trap, note_smuggling_evaluated,
+    note_smuggling_rejected_framing, note_smuggling_rejected_header, observe_duration,
+    plugin_blocks_total, plugin_invocations_total, plugin_scores_total, plugin_traps_total,
+    prometheus_text, smuggling_evaluated_total, smuggling_rejected_framing_total,
     smuggling_rejected_header_total,
 };
 use tokio::net::{TcpListener, TcpStream};
@@ -4351,6 +4353,24 @@ async fn phase1_headers(
                         // regardless of `required` (WafMode::Learning still
                         // downgrades Block → Log via enforce_mode below).
                         if let Err(reason) = result {
+                            // The operator's problem, not the client's: this
+                            // policy cannot verify ANY token, so every request
+                            // carrying one is rejected. Said once per
+                            // (site, reason) rather than per request.
+                            if jwt_failure_is_misconfiguration(&reason)
+                                && diag_first_time(format!("jwt:{}:{}", site.id, reason))
+                            {
+                                error!(
+                                    site = %site.id, reason = %reason,
+                                    jwks_url = jwt_cfg.jwks_url.as_deref().unwrap_or("-"),
+                                    has_hs_secret = jwt_cfg.hs_secret.is_some(),
+                                    has_public_key = jwt_cfg.public_key_pem.is_some(),
+                                    "JWT policy cannot verify tokens — every request presenting one \
+                                     is being rejected with 403. This is a configuration fault, not \
+                                     an attack: fix the key material (hs_secret, public_key_pem or a \
+                                     reachable jwks_url), or disable JWT for this site."
+                                );
+                            }
                             ctx.decision = WafDecision::Block;
                             ctx.block_reason = Some(format!("jwt: {reason}"));
                         }
@@ -4400,6 +4420,7 @@ async fn phase1_headers(
     if still_evaluating(ctx) && !site_plugins.is_empty() {
         for plugin_name in site_plugins {
             let result = plugin_runtime.evaluate_plugin(plugin_name, ctx).await;
+            note_plugin_outcome(&result);
             if result.anomaly_score_delta > 0 {
                 ctx.add_engine_score("plugin", result.anomaly_score_delta);
             }
@@ -4425,6 +4446,7 @@ async fn phase1_headers(
                         .execute_pending_callouts(callouts.clone())
                         .await;
                     let result2 = plugin_runtime.evaluate_plugin(plugin_name, ctx).await;
+                    note_plugin_outcome(&result2);
                     if result2.anomaly_score_delta > 0 {
                         ctx.add_engine_score("plugin", result2.anomaly_score_delta);
                     }
@@ -5078,6 +5100,38 @@ fn unprotected_sites(cfg: &SentinelConfig, engines: &RuleEngineMap) -> Vec<Strin
         .collect()
 }
 
+/// True the FIRST time this key is seen, so an operator-facing diagnostic can
+/// be logged once instead of once per request.
+///
+/// A misconfiguration that only manifests per request produces either silence or
+/// a flood, and both hide it. The Go side already does this for unknown
+/// waf_policy keys (`warnedUnknownWafKeys`); this is the data-plane equivalent.
+fn diag_first_time(key: String) -> bool {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    match seen.lock() {
+        Ok(mut set) => set.insert(key),
+        // A poisoned lock must not silence a diagnostic; logging twice is better.
+        Err(_) => true,
+    }
+}
+
+/// Whether a JWT failure is the CLIENT's fault or the OPERATOR's.
+///
+/// Both end in the same 403, which is correct — a request that cannot be
+/// verified is not authenticated — but they need different audiences. A bad or
+/// expired token is routine and belongs in the request record. A site whose JWT
+/// policy has no usable key can never verify anything: every token-bearing
+/// request is rejected, and the only trace was one block reason per request,
+/// with nothing telling the operator their configuration is broken.
+fn jwt_failure_is_misconfiguration(reason: &str) -> bool {
+    matches!(
+        reason,
+        "no verification key configured" | "misconfigured public key"
+    ) || reason.starts_with("unknown key id")
+}
+
 fn site_expects_engine(site: &SiteConfig) -> bool {
     site.waf.mode != WafMode::Off
         && !(site.waf.rules.is_empty() && site.waf.inline_rules.is_empty())
@@ -5610,8 +5664,23 @@ fn plugin_status(
         }
     }
     let running: usize = by_plugin.len();
+    let invocations = plugin_invocations_total();
+    let traps = plugin_traps_total();
     serde_json::json!({
         "loaded": loaded,
+        // Execution counters, also in /metrics. `traps` is the one to alert on:
+        // every failure path inside the runtime returns Allow, so a plugin
+        // trapping on every request is indistinguishable from one that never
+        // blocks anything — the control looks enabled and judges nothing.
+        "invocations": invocations,
+        "blocks": plugin_blocks_total(),
+        "scores": plugin_scores_total(),
+        "traps": traps,
+        "trap_ratio": if invocations > 0 {
+            (traps as f64 / invocations as f64 * 1000.0).round() / 1000.0
+        } else {
+            0.0
+        },
         "running_on_at_least_one_site": running,
         // A module loaded but selected by no site: it costs memory and nothing else.
         "loaded_but_unused": loaded
@@ -5944,6 +6013,27 @@ type UploadedPlugins = Arc<DashMap<String, (String, Vec<u8>)>>;
 /// swapping the result in unloads all uploaded plugins, which is a silent
 /// protection outage: the module is still installed and enabled in the UI, the
 /// node reports no error, and the plugin simply stops running.
+/// Count one plugin evaluation.
+///
+/// A plugin runs operator-supplied code in the request path, and until
+/// 2026-09-07 nothing counted it: cost and failure rate were visible only as log
+/// lines. `failed` is the important one — every failure path inside the runtime
+/// returns Allow, so a plugin that traps on every request looks exactly like one
+/// that never blocks anything.
+fn note_plugin_outcome(result: &PluginEvalResult) {
+    note_plugin_invocation();
+    if result.failed {
+        note_plugin_trap();
+        return;
+    }
+    if matches!(result.decision, WafDecision::Block | WafDecision::Challenge) {
+        note_plugin_block();
+    }
+    if result.anomaly_score_delta > 0 {
+        note_plugin_score();
+    }
+}
+
 /// Resolve `waf.enabled_plugins` for every site against the modules this node
 /// actually holds, starting from the per-site manifest entries.
 ///
@@ -10680,6 +10770,54 @@ mod block_page_tests {
             tls: Default::default(),
             origin: Default::default(),
         }
+    }
+
+    /// A JWT failure is either the client's fault or the operator's, and only
+    /// the second one needs an operator-facing line. Getting this wrong in
+    /// either direction is bad: classify a bad token as a misconfiguration and
+    /// the log fills with client noise; classify a missing key as a bad token
+    /// and a site that can never authenticate anyone looks like an attack.
+    #[test]
+    fn jwt_misconfiguration_is_told_apart_from_a_bad_token() {
+        for operator in [
+            "no verification key configured",
+            "misconfigured public key",
+            "unknown key id: abc123",
+        ] {
+            assert!(
+                jwt_failure_is_misconfiguration(operator),
+                "{operator:?} is the operator's problem"
+            );
+        }
+        for client in [
+            "token expired",
+            "invalid signature",
+            "malformed token header",
+            "token header missing kid (required for JWKS)",
+            "issuer mismatch",
+        ] {
+            assert!(
+                !jwt_failure_is_misconfiguration(client),
+                "{client:?} is the client's problem and must not page an operator"
+            );
+        }
+    }
+
+    /// The diagnostic fires once per key, so a broken config produces one line
+    /// rather than one per request.
+    #[test]
+    fn an_operator_diagnostic_is_logged_once_per_key() {
+        let key = format!("test-key-{}", std::process::id());
+        assert!(diag_first_time(key.clone()), "first time must report true");
+        assert!(
+            !diag_first_time(key.clone()),
+            "second time must be suppressed"
+        );
+        assert!(!diag_first_time(key), "and stay suppressed");
+        assert!(
+            diag_first_time(format!("other-key-{}", std::process::id())),
+            "a different key is a different diagnostic"
+        );
     }
 
     /// A blocking-mode site whose rules will not compile must be REFUSED, not

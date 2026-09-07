@@ -49,6 +49,17 @@ x-build-provenance: &build-provenance
   BUILD_DATE: ${SENTINEL_BUILD_DATE:-unknown}
   VERSION: ${SENTINEL_VERSION:-0.0.0}
 
+# The same provenance as RUNTIME environment, so a component reports the version
+# of the DEPLOYED SET rather than of the build its own image came from. A deploy
+# that changes one component retags the others — they are byte-identical, so
+# rebuilding them is waste — and their link-time SHA then belongs to the previous
+# version. The console reported that older commit for two deploys on 2026-09-07.
+# SENTINEL_VERSION is the value that also picks the image tags, so it is the one
+# an operator means by "what is deployed".
+x-runtime-provenance: &runtime-provenance
+  SENTINEL_GIT_SHA: ${SENTINEL_VERSION:-unknown}
+  SENTINEL_BUILD_DATE: ${SENTINEL_BUILD_DATE:-unknown}
+
 services:
   postgres:
     image: ${SENTINEL_THIRDPARTY_PREFIX:-}postgres:16-alpine
@@ -202,6 +213,7 @@ services:
       # self-heals. (A broken CH healthcheck previously gated and downed the stack.)
       clickhouse: { condition: service_started }
     environment:
+      <<: *runtime-provenance
       SENTINEL_DB_URL: ${SENTINEL_DB_URL}
       SENTINEL_REDIS_URL: redis://redis:6379
       # ClickHouse reader → powers the dashboard's "Threat Search" (/events).

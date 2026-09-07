@@ -506,6 +506,18 @@ struct WafMetrics {
     /// JA4-dependent control downstream, and HTTP/3 supplies none at all.
     pub ja4_attempts_total: Counter,
     pub ja4_success_total: Counter,
+    /// WASM plugin execution. A plugin runs arbitrary operator-supplied code in
+    /// the request path, and until 2026-09-07 nothing counted it: its cost and
+    /// its failure rate were visible only as log lines, so a plugin degrading
+    /// slowly or trapping on a fraction of requests would not show anywhere.
+    ///
+    /// `traps` is the one that matters most: a trap FAILS OPEN — the request is
+    /// allowed — so a plugin that traps on every call is indistinguishable from
+    /// one that never blocks anything.
+    pub plugin_invocations_total: Counter,
+    pub plugin_blocks_total: Counter,
+    pub plugin_scores_total: Counter,
+    pub plugin_traps_total: Counter,
     /// Connections that never presented a TLS handshake record at all — TCP
     /// probes, port scans, abandoned connections. Kept OUT of
     /// `ja4_attempts_total` so `success / attempts` is real coverage rather than
@@ -610,6 +622,22 @@ impl WafMetrics {
             "sentinel_ja4_success_total",
             "TLS ClientHello peeks that yielded a JA4 fingerprint (attempts minus this is silent JA4 coverage loss)",
         );
+        let plugin_invocations_total = registry.register_counter(
+            "sentinel_plugin_invocations_total",
+            "WASM plugin evaluations executed in the request path",
+        );
+        let plugin_blocks_total = registry.register_counter(
+            "sentinel_plugin_blocks_total",
+            "Requests a WASM plugin blocked or challenged",
+        );
+        let plugin_scores_total = registry.register_counter(
+            "sentinel_plugin_scores_total",
+            "Evaluations where a WASM plugin contributed to the anomaly score",
+        );
+        let plugin_traps_total = registry.register_counter(
+            "sentinel_plugin_traps_total",
+            "WASM plugin evaluations that failed (trap, fuel exhaustion, instantiation) and therefore FAILED OPEN",
+        );
         let ja4_no_hello_total = registry.register_counter(
             "sentinel_ja4_no_hello_total",
             "Connections that never sent a TLS handshake record (probes/scans), excluded from ja4_attempts_total",
@@ -650,6 +678,10 @@ impl WafMetrics {
             grpc_inspected_total,
             ja4_attempts_total,
             ja4_success_total,
+            plugin_invocations_total,
+            plugin_blocks_total,
+            plugin_scores_total,
+            plugin_traps_total,
             ja4_no_hello_total,
             ja4_h3_attempts_total,
             ja4_h3_success_total,
@@ -781,6 +813,41 @@ pub fn note_grpc_inspected() {
 }
 pub fn grpc_inspected_total() -> u64 {
     WAF_METRICS.grpc_inspected_total.get()
+}
+
+/// One WASM plugin evaluation ran. Counted per (plugin, request) pair, so a
+/// site selecting three plugins produces three invocations per request.
+pub fn note_plugin_invocation() {
+    WAF_METRICS.plugin_invocations_total.inc();
+}
+pub fn plugin_invocations_total() -> u64 {
+    WAF_METRICS.plugin_invocations_total.get()
+}
+
+/// A plugin set a Block or Challenge decision.
+pub fn note_plugin_block() {
+    WAF_METRICS.plugin_blocks_total.inc();
+}
+pub fn plugin_blocks_total() -> u64 {
+    WAF_METRICS.plugin_blocks_total.get()
+}
+
+/// A plugin added to the anomaly score without deciding on its own.
+pub fn note_plugin_score() {
+    WAF_METRICS.plugin_scores_total.inc();
+}
+pub fn plugin_scores_total() -> u64 {
+    WAF_METRICS.plugin_scores_total.get()
+}
+
+/// A plugin evaluation FAILED — trap, fuel exhaustion, instantiation error.
+/// The request is allowed when this happens, so a non-zero rate here means a
+/// control that looks enabled is not judging traffic.
+pub fn note_plugin_trap() {
+    WAF_METRICS.plugin_traps_total.inc();
+}
+pub fn plugin_traps_total() -> u64 {
+    WAF_METRICS.plugin_traps_total.get()
 }
 
 /// A JA4 fingerprint was attempted, and whether it produced one. Call the
