@@ -5,7 +5,7 @@ edition = "2021"
 description = "Rust SDK for building Sentinel WAF WASM plugins"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["rlib"]
 
 [dependencies]
 

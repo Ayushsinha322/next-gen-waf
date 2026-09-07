@@ -1,0 +1,15 @@
+[plugin]
+name        = "scanner-guard"
+version     = "1.0.0"
+description = "Blocks well-known vulnerability scanners and brute-force tools (sqlmap, nikto, nmap, masscan, nuclei, wpscan, dirbuster, gobuster, acunetix, nessus, zgrab, …) by their User-Agent, and scores an empty or missing User-Agent. Runs in the WebAssembly sandbox with read-only access to request headers."
+author      = "ESDS WAF team"
+wasm        = "plugin.wasm"
+
+[plugin.hooks]
+request_headers = true
+
+[plugin.permissions]
+host_log            = true
+host_get_req_header = true
+host_set_decision   = true
+host_add_score      = true

@@ -1,0 +1,21 @@
+[package]
+name = "sentinel-plugin-scanner-guard"
+version = "1.0.0"
+edition = "2021"
+description = "Blocks well-known vulnerability scanners and brute-force tools by their request signature"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+sentinel-plugin-sdk = { path = "../../sdk-rust" }
+wee_alloc = "0.4"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+panic = "abort"
+
+[workspace]
+# standalone — not part of the parent sentinel workspace
