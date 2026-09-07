@@ -7,6 +7,7 @@
 import { useState, useEffect, useMemo } from "react";
 import { motion } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
+import EmptyState from "@/components/ui/EmptyState";
 import { api, type AuditEntry, type AuditVerifyResult } from "@/lib/api";
 import { staggerContainer, cardVariants, fadeUp } from "@/lib/animations";
 
@@ -134,7 +135,7 @@ export default function AuditPage() {
               <div style={{ marginTop: 8, color: "var(--text3)" }}>{loadError}</div>
             </div>
           ) : filtered.length === 0 ? (
-            <div style={{ padding: 24, textAlign: "center", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--text3)" }}>No audit events recorded yet. Administrative actions (site/rule/channel changes, logins) appear here.</div>
+            <EmptyState icon="🧾" title="No audit events yet" hint="Every administrative action — site, rule and channel changes, logins, settings — is written here in a hash-chained log. Make a change and it appears within a second." />
           ) : (
             <table>
               <thead><tr><th>Time</th><th>Result</th><th>Action</th><th>Target</th><th>Actor</th><th>Source IP</th></tr></thead>

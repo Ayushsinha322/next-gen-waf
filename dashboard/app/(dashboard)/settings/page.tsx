@@ -1,4 +1,5 @@
 "use client";
+import { useT, SUPPORTED_LOCALES, type Locale } from "@/lib/i18n";
 import { useState, useEffect } from "react";
 import { motion } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
@@ -133,6 +134,13 @@ function GeneralTab() {
           <KV label="Upstream health" value={
             waf ? `${waf.upstreams_healthy ?? 0} / ${waf.upstreams_total ?? 0} healthy` : "…"} />
           <KV label="Listeners" value={waf?.listeners?.length ? waf.listeners.join("   ") : "…"} />
+        </div>
+      </div>
+
+      <div className="panel">
+        <div className="ph"><div className="ptitle">Console language</div></div>
+        <div className="pb">
+          <LanguagePicker />
           <KV label="HTTP/3 (QUIC)" value={
             waf?.http3 ? (waf.http3.enabled ? `enabled · advertised :${waf.http3.advertise_port ?? "?"}` : "disabled") : "…"} />
         </div>
@@ -1083,5 +1091,18 @@ function ManagementTLSTab() {
         </div>
       </div>
     </motion.div>
+  );
+}
+
+function LanguagePicker() {
+  const { locale, setLocale, t } = useT();
+  return (
+    <div style={{ display: "grid", gap: 6 }}>
+      <label style={{ fontSize: 12, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>{t("common.language")}</label>
+      <select className="fsel" value={locale} onChange={e => setLocale(e.target.value as Locale)} style={{ maxWidth: 260 }}>
+        {SUPPORTED_LOCALES.map(l => <option key={l.code} value={l.code}>{l.label}</option>)}
+      </select>
+      <div style={{ fontSize: 12, color: "var(--text3)", lineHeight: 1.5 }}>{t("common.language_hint")}</div>
+    </div>
   );
 }

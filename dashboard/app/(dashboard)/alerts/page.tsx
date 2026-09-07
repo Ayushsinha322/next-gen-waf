@@ -1,11 +1,15 @@
 "use client";
 import { useState, useEffect } from "react";
+import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
+import { openCopilotWith, explainAlertPrompt } from "@/lib/copilotContext";
 import { showToast } from "@/components/ui/Toast";
+import EmptyState from "@/components/ui/EmptyState";
 import { api, type Alert, type NotificationChannel } from "@/lib/api";
 import { staggerContainer, cardVariants, fadeUp, spring } from "@/lib/animations";
 
 export default function AlertsPage() {
+  const router = useRouter();
   const [alerts, setAlerts]       = useState<Alert[]>([]);
   const [loading, setLoading]     = useState(true);
   const [search, setSearch]       = useState("");
@@ -224,7 +228,9 @@ export default function AlertsPage() {
           {loading ? (
             <div style={{padding:"24px",textAlign:"center",fontFamily:"var(--font-mono)",fontSize: 13,color:"var(--text3)"}}>Loading alerts…</div>
           ) : filtered.length === 0 ? (
-            <div style={{padding:"24px",textAlign:"center",fontFamily:"var(--font-mono)",fontSize: 13,color:"var(--text3)"}}>No alerts found</div>
+            <EmptyState icon="🔔" title={alerts.length === 0 ? "No alerts" : "No alerts match this filter"}
+              hint={alerts.length === 0 ? "Alerts are raised from live detections: attack spikes, repeat offenders, node and certificate problems. A quiet queue with traffic flowing is the good state." : "Change the severity or state filter to see the rest."}
+              action={alerts.length === 0 ? { label: "Set up a delivery channel", href: "/settings?tab=notifications" } : undefined} />
           ) : (
             <table>
               <thead><tr><th>Severity</th><th>Last seen</th><th>Kind</th><th>Summary</th><th>State</th><th>Actions</th></tr></thead>
@@ -258,6 +264,9 @@ export default function AlertsPage() {
                           {d.auto_resolved === true && <span className="td3" style={{ fontSize:10, marginLeft:6 }} title="Closed automatically: no recurrence within the quiet window">auto</span>}
                         </td>
                         <td><div style={{display:"flex",gap:4}}>
+                          <motion.button className="btn bg-btn btn-xs" whileHover={{ scale: 1.06 }} whileTap={{ scale: 0.95 }}
+                            title="Open the AI Copilot with this alert loaded: what happened, real or false positive, what to do"
+                            onClick={() => openCopilotWith(router, explainAlertPrompt(x))}>🤖</motion.button>
                           {!sub && ip && (
                             <motion.button className="btn bgn btn-xs" disabled={blocking === ip} whileHover={{ scale: 1.06 }} whileTap={{ scale: 0.95 }}
                               onClick={() => blockIP(ip)} title="Add a manual block-tier indicator for this IP to the threat-intel corpus">

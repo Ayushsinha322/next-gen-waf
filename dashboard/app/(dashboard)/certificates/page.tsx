@@ -2,6 +2,7 @@
 import { useState, useEffect, useMemo } from "react";
 import { motion } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
+import EmptyState from "@/components/ui/EmptyState";
 import {
   api,
   type Certificate,
@@ -395,9 +396,7 @@ export default function CertificatesPage() {
           {loading ? (
             <div style={{ padding: 24, textAlign: "center", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--text3)" }}>Loading certificates…</div>
           ) : certs.length === 0 ? (
-            <div style={{ padding: 24, textAlign: "center", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--text3)" }}>
-              No certificates yet — request one with ACME or upload a PEM above.
-            </div>
+            <EmptyState icon="🔐" title="No certificates yet" hint="Sites are served with the shared self-signed certificate until one is issued. Request one with ACME or upload a PEM above — every WAF node picks it up on the next sync." />
           ) : (
             <table>
               <thead><tr><th>Domain</th><th>Protects</th><th>Source</th><th>Status</th><th>Expiry</th><th>Lifetime</th><th>Actions</th></tr></thead>

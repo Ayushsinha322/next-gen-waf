@@ -3,6 +3,7 @@ import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
+import EmptyState from "@/components/ui/EmptyState";
 import ConfigHistory from "@/components/sites/ConfigHistory";
 import { openModal } from "@/components/ui/Modal";
 import { api, type Site } from "@/lib/api";
@@ -320,7 +321,9 @@ export default function SitesPage() {
           {loading ? (
             <div style={{ padding: "24px", textAlign: "center", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--text3)" }}>Loading sites…</div>
           ) : filtered.length === 0 ? (
-            <div style={{ padding: "24px", textAlign: "center", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--text3)" }}>No sites found</div>
+            <EmptyState icon="🌐" title={sites.length === 0 ? "No sites protected yet" : "No site matches this filter"}
+              hint={sites.length === 0 ? "A site is a hostname routed through the WAF to an origin. Add the first one and traffic is inspected within seconds of the config sync." : "Clear the search or filter to see all sites."}
+              action={sites.length === 0 ? { label: "＋ Add Site", onClick: openCreate } : undefined} />
           ) : (
             <table>
               <thead><tr><th>Status</th><th>Name</th><th>Domains</th><th>Mode</th><th>WAF Policy</th><th>State</th><th>Actions</th></tr></thead>
@@ -333,9 +336,10 @@ export default function SitesPage() {
                     <motion.tr key={s.id} initial={{ opacity: 0, x: -8 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: idx * 0.02 }}>
                       <td><div className={`sd ${stDot}`} /></td>
                       <td>
-                        <span style={{ color: meta ? (s.name === "dvwa.local" ? "var(--red-b)" : "var(--cyan)") : "var(--cyan)", fontWeight: meta ? 700 : 400 }}>
+                        <a href={`/sites/${s.id}`} onClick={e => { e.preventDefault(); router.push(`/sites/${s.id}`); }} title="Open site dashboard"
+                          style={{ color: meta ? (s.name === "dvwa.local" ? "var(--red-b)" : "var(--cyan)") : "var(--cyan)", fontWeight: meta ? 700 : 400, textDecoration: "none", borderBottom: "1px dotted rgba(0,212,255,.45)" }}>
                           {meta ? `${meta.icon} ` : ""}{s.name}
-                        </span>
+                        </a>
                       </td>
                       <td style={{ maxWidth: 240, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={s.domains.join(", ")}>{s.domains.join(", ")}</td>
                       <td><span className={`bdg ${mode === "BLOCKING" ? "br" : mode === "LEARNING" ? "ba blink" : "bgr"}`}><span className="bdr" />{mode}</span></td>
