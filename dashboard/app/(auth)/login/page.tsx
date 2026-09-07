@@ -9,14 +9,23 @@ import { spring } from "@/lib/animations";
 type AuthTab  = "std" | "sso" | "api";
 type BtnState = "idle" | "loading" | "success";
 
-const THREAT_LABELS = [
-  "THREAT BLOCKED: SQLi attempt",
-  "THREAT BLOCKED: XSS payload",
-  "RATE LIMIT: 10.0.0.44",
-  "BOT DETECTED: crawler",
-  "CVE-2024-3912: patched",
-  "DDoS DROP: SYN flood",
-];
+// A rotating "threat feed" badge used to sit in the corner of this page,
+// cycling six hardcoded strings every three seconds: "THREAT BLOCKED: SQLi
+// attempt", "RATE LIMIT: 10.0.0.44", "BOT DETECTED: crawler",
+// "CVE-2024-3912: patched", "DDoS DROP: SYN flood". None of it was observed
+// traffic. The source IP was invented, the CVE does not exist, and the same
+// six events replayed forever on every load.
+//
+// It was removed on 2026-09-07 because it did real harm: an operator read
+// "RATE LIMIT" and "BOT DETECTED" on the login screen, concluded the WAF had
+// blocked them, and went looking for a block that never existed. Nobody can
+// tell decoration from telemetry on a security product's own login page — and
+// the same fabrication was already deleted from the dashboard layout (the
+// "LIVE THREATS" marquee) for exactly this reason. Live activity belongs on
+// /events, sourced from ClickHouse, behind a login.
+//
+// The login page still shows measured facts: the product version, and the
+// benchmark numbers under the form.
 
 export default function LoginPage() {
   const router = useRouter();
@@ -46,7 +55,6 @@ export default function LoginPage() {
   // ── UI state ─────────────────────────────────────────────────────────────
   const [tab, setTab]               = useState<AuthTab>("std");
   const [showPwd, setShowPwd]       = useState(false);
-  const [threatLabel, setThreatLabel] = useState(THREAT_LABELS[0]);
 
   // ── Refs ─────────────────────────────────────────────────────────────────
   const canvasRef   = useRef<HTMLCanvasElement>(null);
@@ -55,16 +63,6 @@ export default function LoginPage() {
 
   // ── Clear any stale session cookie on login page mount ───────────────────
   useEffect(() => { clearSessionCookie(); }, []);
-
-  // ── Threat label rotation ─────────────────────────────────────────────────
-  useEffect(() => {
-    let i = 0;
-    const t = setInterval(() => {
-      i = (i + 1) % THREAT_LABELS.length;
-      setThreatLabel(THREAT_LABELS[i]);
-    }, 3000);
-    return () => clearInterval(t);
-  }, []);
 
   // ── Canvas animation (ported from sentinel_waf_login.html) ───────────────
   useEffect(() => {
@@ -296,18 +294,6 @@ export default function LoginPage() {
           </div>
         </div>
       </div>
-
-      {/* ══ THREAT FEED BADGE ═══════════════════════════════════════════════ */}
-      <motion.div
-        id="threat-feed"
-        key={threatLabel}
-        initial={{ opacity: 0, y: -8 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.25 }}
-      >
-        <div className="tf-dot" />
-        <div id="tf-text">{threatLabel}</div>
-      </motion.div>
 
       {/* ══ RIGHT PANEL ═════════════════════════════════════════════════════ */}
       <div id="RP">
