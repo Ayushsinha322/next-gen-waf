@@ -140,6 +140,14 @@ export default function RulesPage() {
   const [editorName, setEditorName]   = useState("");
   const [editorPhase, setEditorPhase] = useState(2);
   const [editorSev, setEditorSev]     = useState("high");
+  // Which site a rule applies to. "" = every site in the deployment, which is
+  // what every console-authored rule has been until now: `rules.site_id` has
+  // existed since migration 0018, attachInlineRules honours it, and this page
+  // even shows a "site" tag for a scoped rule — but nothing here could SET it,
+  // so the scoping was reachable only through the API. A capability with no
+  // input is the same as an absent one.
+  const [editorSite, setEditorSite]   = useState("");
+  const [siteList, setSiteList]       = useState<Array<{ id: string; name: string }>>([]);
   const [testPayload, setTestPayload] = useState("1' UNION SELECT * FROM users--");
   const [testResult, setTestResult]   = useState<RuleTestResult | null>(null);
   const [testLoading, setTestLoading] = useState(false);
@@ -226,11 +234,43 @@ export default function RulesPage() {
   function openEditor(r: Rule) {
     setEditorRule(r); setEditorDSL(r.dsl || BLANK_DSL);
     setEditorName(r.name); setEditorPhase(r.phase); setEditorSev(r.severity);
+    setEditorSite(r.site_id ?? "");
     setTestResult(null);
+    void loadSitesForScoping();
+  }
+
+  /** The scope control. Rendered in both the edit panel and the create modal —
+   *  a rule authored deployment-wide and then narrowed is the common path, and
+   *  offering it in only one of the two would leave the other lying by omission. */
+  function ScopeSelect({ disabled }: { disabled?: boolean }) {
+    return (
+      <div className="fg2">
+        <label className="flbl2">Applies to</label>
+        <select className="fin2 fsel2" value={editorSite} disabled={disabled}
+          onChange={e => setEditorSite(e.target.value)}>
+          <option value="">Every site (deployment-wide)</option>
+          {siteList.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+        </select>
+        <div className="td3" style={{ fontSize: 11, marginTop: 3, lineHeight: 1.4 }}>
+          {editorSite
+            ? "Compiled into this site's engine only. Other sites never see it."
+            : "Compiled into every site's engine, including sites created later."}
+        </div>
+      </div>
+    );
   }
 
   const editorReadOnly =
     editorRule?.source === "crs" || editorRule?.source === "community";
+
+  /** Open the create modal from a clean slate: a new rule defaults to
+   *  deployment-wide, and the site list has to be there before the selector is
+   *  rendered or it would offer only that one option. */
+  function openCreate() {
+    setEditorSite("");
+    void loadSitesForScoping();
+    setShowModal(true);
+  }
 
   async function createRule() {
     if (!editorName.trim()) { showToast("Rule name is required", "w", "⚠️"); return; }
@@ -240,6 +280,9 @@ export default function RulesPage() {
         name: editorName, source: "custom",
         phase: editorPhase, severity: editorSev as Rule["severity"],
         dsl: editorDSL, enabled: true, tags: [],
+        // Omitted when empty: the API treats an absent site_id as
+        // deployment-wide, which is the safe default for a new rule.
+        ...(editorSite ? { site_id: editorSite } : {}),
       });
       setRules(prev => [res.rule, ...prev]);
       setEditorRule(res.rule); setShowModal(false);
@@ -265,6 +308,9 @@ export default function RulesPage() {
     try {
       const res = await api.rules.update(editorRule.id, {
         dsl: editorDSL, severity: editorSev, phase: editorPhase,
+        // An omitted field is left alone, so widening a rule back to every site
+        // needs the explicit clear flag rather than an empty string.
+        ...(editorSite ? { site_id: editorSite } : { clear_site_id: true }),
       });
       setRules(prev => prev.map(x => x.id === res.rule.id ? res.rule : x));
       setEditorRule(res.rule);
@@ -275,6 +321,17 @@ export default function RulesPage() {
     } catch (err: unknown) {
       showToast(err instanceof Error ? err.message : "Save failed — the rule was not changed", "e", "⚠️");
     } finally { setSaving(false); }
+  }
+
+  async function loadSitesForScoping() {
+    try {
+      const r = await api.sites.list();
+      setSiteList((r.sites ?? []).map(x => ({ id: x.id, name: x.name })));
+    } catch {
+      // A rule can still be authored deployment-wide without this list; the
+      // selector just shows only that option.
+      setSiteList([]);
+    }
   }
 
   async function runTest() {
@@ -314,7 +371,7 @@ export default function RulesPage() {
           <motion.button className="btn bp btn-sm" whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }} onClick={() => {
             setEditorRule(null); setEditorDSL(BLANK_DSL);
             setEditorName(""); setEditorPhase(2); setEditorSev("high");
-            setTestResult(null); setShowModal(true);
+            setTestResult(null); openCreate();
           }}>＋ New Rule</motion.button>
         </div>
       </motion.div>
@@ -463,6 +520,7 @@ export default function RulesPage() {
                   <select className="fin2 fsel2" value={editorPhase} onChange={e=>setEditorPhase(Number(e.target.value))}>
                     {PHASE_LABELS.map((l,i) => <option key={i} value={i}>{i} — {l}</option>)}
                   </select></div>
+                <ScopeSelect />
               </div>
             )}
 
@@ -544,6 +602,7 @@ export default function RulesPage() {
                   <select className="fin2 fsel2" value={editorPhase} onChange={e=>setEditorPhase(Number(e.target.value))}>
                     {PHASE_LABELS.map((l,i) => <option key={i} value={i}>{i} — {l}</option>)}
                   </select></div>
+                <ScopeSelect />
               </div>
               <div className="fg2"><label className="flbl2">SRL DSL</label>
                 <textarea className="rule-ta" value={editorDSL} onChange={e=>setEditorDSL(e.target.value)} style={{ minHeight:160 }} /></div>
