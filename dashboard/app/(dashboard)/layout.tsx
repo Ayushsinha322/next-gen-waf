@@ -5,6 +5,7 @@ import SideBar from "@/components/layout/SideBar";
 import ToastContainer from "@/components/ui/Toast";
 import ModalContainer from "@/components/ui/Modal";
 import CopilotFab from "@/components/copilot/CopilotFab";
+import ChunkRecovery from "@/components/layout/ChunkRecovery";
 import { I18nProvider } from "@/lib/i18n";
 
 /**
@@ -30,6 +31,10 @@ import { I18nProvider } from "@/lib/i18n";
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
   return (
     <I18nProvider>
+      {/* Rolling the dashboard changes every chunk filename, so a tab that was
+          already open 404s on its own JavaScript and looks locked out. This
+          reloads it once against the new build. */}
+      <ChunkRecovery />
       <TopBar />
       <SideBar />
       <main className="content">
