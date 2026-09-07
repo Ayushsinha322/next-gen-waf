@@ -1,7 +1,7 @@
 [plugin]
 name        = "scanner-guard"
-version     = "1.0.0"
-description = "Blocks well-known vulnerability scanners and brute-force tools (sqlmap, nikto, nmap, masscan, nuclei, wpscan, dirbuster, gobuster, acunetix, nessus, zgrab, …) by their User-Agent, and scores an empty or missing User-Agent. Runs in the WebAssembly sandbox with read-only access to request headers."
+version     = "1.0.1"
+description = "Blocks 31 vulnerability-scanner and exploitation User-Agents (sqlmap, nikto, nuclei, wpscan, ffuf, hydra, ...) and adds 2 to the anomaly score when a request carries no User-Agent at all. The blocklist follows the same policy as the built-in threat-intel indicators and deliberately omits authorised scanners (Qualys, AppScan) and names that collide with legitimate software (Medusa). Those indicators normally match node-wide before a plugin runs, so on a deployment with threat intel enabled this plugin's own contribution is the missing-User-Agent score; it is also the reference example for the WebAssembly sandbox and for per-site plugin selection."
 author      = "ESDS WAF team"
 wasm        = "plugin.wasm"
 

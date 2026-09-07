@@ -24,15 +24,40 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
     core::arch::wasm32::unreachable()
 }
 
-/// Lower-cased substrings that identify scanners and attack tooling. Kept to
-/// tools whose default UA is unambiguous — a match here has essentially no
-/// false-positive cost, which is why the action is Block rather than a score.
+/// Lower-cased substrings that identify scanner and exploitation tooling.
+///
+/// This list follows the SAME policy as the control plane's built-in
+/// bad-user-agent indicators (`builtinBadUserAgents` in
+/// internal/threatintel/sources.go), and it must not drift from it:
+///
+///  1. The string is meaningless outside the tool. No generic words, and no
+///     names that collide with legitimate software.
+///  2. The tool is hostile in UNSOLICITED traffic. An enterprise scanner a
+///     customer points at their own site under a maintenance window is not.
+///
+/// Removed 2026-09-07 for violating those rules: `qualys` and `appscan` are
+/// authorised scans, `medusa` collides with a widely used media manager whose
+/// UA is "Medusa/x.y", and `brutus` is a word. They were the ONLY entries here
+/// that the control plane's policy deliberately refuses — so the plugin was
+/// blocking traffic the product had decided not to block, which is the worst
+/// kind of divergence: invisible, and only in one direction.
+///
+/// The remaining names overlap the node-wide indicator corpus by design. That
+/// corpus normally matches first, so this plugin's block path is usually
+/// unreachable on a deployment with threat intel enabled; it still matters
+/// where threat intel is off, its feed is stale, or an operator wants the check
+/// on one site only. The scoring branch below (no User-Agent at all) is this
+/// plugin's own contribution either way.
 const SCANNERS: &[&str] = &[
-    "sqlmap", "nikto", "nmap scripting engine", "masscan", "zgrab", "nuclei",
-    "wpscan", "dirbuster", "gobuster", "feroxbuster", "ffuf", "dirb",
-    "acunetix", "nessus", "openvas", "netsparker", "qualys", "appscan",
-    "whatweb", "arachni", "w3af", "skipfish", "jaeles", "havij",
-    "hydra", "medusa", "brutus", "commix", "xsser", "wfuzz",
+    // exploitation
+    "sqlmap", "sqlninja", "commix", "havij", "xsser", "xsstrike", "dalfox",
+    "fimap", "hydra",
+    // scanners
+    "nikto", "nmap scripting engine", "masscan", "zgrab", "nuclei", "wpscan",
+    "whatweb", "arachni", "w3af", "skipfish", "jaeles", "openvas", "netsparker",
+    "nessus", "acunetix",
+    // content discovery / fuzzing
+    "dirb", "gobuster", "feroxbuster", "ffuf", "wfuzz", "dirsearch",
 ];
 
 fn to_lower(s: &str) -> String {

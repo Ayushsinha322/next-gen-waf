@@ -1,6 +1,6 @@
 [package]
 name = "sentinel-plugin-scanner-guard"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "Blocks well-known vulnerability scanners and brute-force tools by their request signature"
 

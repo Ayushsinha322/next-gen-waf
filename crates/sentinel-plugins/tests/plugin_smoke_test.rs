@@ -452,4 +452,25 @@ async fn scanner_guard_blocks_scanner_user_agents_only() {
     let r = rt.evaluate_plugin("scanner-guard", &no_ua).await;
     assert_eq!(r.decision, WafDecision::Allow, "a missing UA is scored, not blocked");
     assert_eq!(r.anomaly_score_delta, 2);
+
+    // The plugin must not block what the product's own indicator policy
+    // deliberately allows. These four were in the list until 2026-09-07 and
+    // were the only entries that diverged from it: two authorised enterprise
+    // scanners, one collision with a media manager, one plain word. A plugin
+    // blocking traffic the product decided not to block is a divergence that
+    // is invisible and only ever in one direction.
+    for ua in [
+        "Qualys was here",
+        "AppScan/9.0",
+        "Medusa/1.0",
+        "Brutus AET2",
+        "Mozilla/5.0 (compatible; MonitoringBot/1.0)",
+    ] {
+        let r = rt.evaluate_plugin("scanner-guard", &ua_ctx(ua)).await;
+        assert_eq!(
+            r.decision,
+            WafDecision::Allow,
+            "UA {ua:?} must NOT be blocked — see the policy on SCANNERS"
+        );
+    }
 }
