@@ -74,9 +74,16 @@ func TestRefreshOnce_MergesStampsTTLAndDedupes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RefreshOnce: %v", err)
 	}
-	// 4 unique IPs (5.5.5.5 deduped across tor+feodo) + 19 builtin UAs = 23.
-	if n != 23 {
-		t.Fatalf("want 23 IOCs upserted, got %d", n)
+	// 4 unique IPs (5.5.5.5 deduped across tor+feodo) + the built-in UA seed.
+	// Derived rather than hard-coded: this test is about cross-source dedupe, and
+	// pinning the seed size made curating the UA list fail an unrelated test.
+	builtin, err := builtinBadUserAgents()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := 4 + len(builtin)
+	if n != want {
+		t.Fatalf("want %d IOCs upserted (4 unique IPs + %d built-in UAs), got %d", want, len(builtin), n)
 	}
 
 	// Cross-source dedupe keeps the higher-confidence (feodo=90 > tor=60) entry.

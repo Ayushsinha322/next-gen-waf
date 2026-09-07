@@ -90,10 +90,31 @@ func urlDisabled(u string) bool {
 }
 
 // builtinBadUserAgents is a curated seed of scanner/exploit-tool User-Agents.
-// These are exact-match IOCs (Type user_agent). Kept small and high-signal —
-// broad UA blocklists cause false positives.
+// These are SUBSTRING IOCs (Type user_agent): the data plane lowercases the
+// header and asks whether it contains the value, so "nmap" also catches
+// "Mozilla/5.0 (compatible; Nmap Scripting Engine)". Confidence 85 puts them in
+// the block tier.
+//
+// Kept small and high-signal on purpose — a broad UA blocklist is a false
+// positive generator, and a UA is trivially spoofed so this is a cost-imposer,
+// not a defence. Two rules for anything added here:
+//
+//  1. The string must be meaningless outside the tool. That rules out generic
+//     words ("brutus") and names that collide with legitimate software: e.g.
+//     "medusa" is also a widely used media manager whose UA is "Medusa/x.y".
+//  2. The tool must be hostile in UNSOLICITED traffic. That rules out
+//     enterprise scanners a customer legitimately points at their own site
+//     under a maintenance window — "qualys", "appscan", "burp". (nessus and
+//     acunetix predate this rule; they are kept because removing an indicator
+//     that has been enforcing silently changes a customer's posture, and both
+//     announce themselves only when a scan is actually running.)
+//
+// 2026-09-07: extended after a live probe showed sqlmap and feroxbuster blocked
+// while commix walked through. The additions are all exploitation or
+// content-discovery tools with no legitimate unsolicited use.
 func builtinBadUserAgents() ([]db.IOC, error) {
 	uas := []string{
+		// original seed
 		"sqlmap",
 		"nikto",
 		"nmap",
@@ -101,7 +122,6 @@ func builtinBadUserAgents() ([]db.IOC, error) {
 		"nessus",
 		"acunetix",
 		"nuclei",
-		"dirbuster",
 		"gobuster",
 		"wpscan",
 		"hydra",
@@ -113,6 +133,24 @@ func builtinBadUserAgents() ([]db.IOC, error) {
 		"feroxbuster",
 		"whatweb",
 		"arachni",
+		// added 2026-09-07 — exploitation tools
+		"commix",   // command-injection exploitation
+		"sqlninja", // SQL Server exploitation
+		"xsser",    // XSS exploitation framework
+		"xsstrike", // XSS fuzzer
+		"dalfox",   // XSS scanner
+		"w3af",     // web attack + audit framework
+		"skipfish", // active recon scanner
+		"openvas",  // vulnerability scanner (unsolicited)
+		"netsparker",
+		// added 2026-09-07 — content discovery / fuzzing.
+		// "dirb" replaces the original "dirbuster": it is the shorter substring,
+		// so it covers dirb, dirbuster and dirbusterng, and leaving both in means
+		// the longer one can never be the match that gets reported.
+		"wfuzz",
+		"ffuf",
+		"dirb",
+		"dirsearch",
 	}
 	out := make([]db.IOC, 0, len(uas))
 	for _, ua := range uas {
