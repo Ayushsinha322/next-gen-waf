@@ -4351,6 +4351,24 @@ async fn phase1_headers(
                         // regardless of `required` (WafMode::Learning still
                         // downgrades Block → Log via enforce_mode below).
                         if let Err(reason) = result {
+                            // The operator's problem, not the client's: this
+                            // policy cannot verify ANY token, so every request
+                            // carrying one is rejected. Said once per
+                            // (site, reason) rather than per request.
+                            if jwt_failure_is_misconfiguration(&reason)
+                                && diag_first_time(format!("jwt:{}:{}", site.id, reason))
+                            {
+                                error!(
+                                    site = %site.id, reason = %reason,
+                                    jwks_url = jwt_cfg.jwks_url.as_deref().unwrap_or("-"),
+                                    has_hs_secret = jwt_cfg.hs_secret.is_some(),
+                                    has_public_key = jwt_cfg.public_key_pem.is_some(),
+                                    "JWT policy cannot verify tokens — every request presenting one \
+                                     is being rejected with 403. This is a configuration fault, not \
+                                     an attack: fix the key material (hs_secret, public_key_pem or a \
+                                     reachable jwks_url), or disable JWT for this site."
+                                );
+                            }
                             ctx.decision = WafDecision::Block;
                             ctx.block_reason = Some(format!("jwt: {reason}"));
                         }
@@ -5076,6 +5094,38 @@ fn unprotected_sites(cfg: &SentinelConfig, engines: &RuleEngineMap) -> Vec<Strin
         .filter(|s| site_expects_engine(s) && !engines.contains_key(&s.id))
         .map(|s| s.id.clone())
         .collect()
+}
+
+/// True the FIRST time this key is seen, so an operator-facing diagnostic can
+/// be logged once instead of once per request.
+///
+/// A misconfiguration that only manifests per request produces either silence or
+/// a flood, and both hide it. The Go side already does this for unknown
+/// waf_policy keys (`warnedUnknownWafKeys`); this is the data-plane equivalent.
+fn diag_first_time(key: String) -> bool {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    match seen.lock() {
+        Ok(mut set) => set.insert(key),
+        // A poisoned lock must not silence a diagnostic; logging twice is better.
+        Err(_) => true,
+    }
+}
+
+/// Whether a JWT failure is the CLIENT's fault or the OPERATOR's.
+///
+/// Both end in the same 403, which is correct — a request that cannot be
+/// verified is not authenticated — but they need different audiences. A bad or
+/// expired token is routine and belongs in the request record. A site whose JWT
+/// policy has no usable key can never verify anything: every token-bearing
+/// request is rejected, and the only trace was one block reason per request,
+/// with nothing telling the operator their configuration is broken.
+fn jwt_failure_is_misconfiguration(reason: &str) -> bool {
+    matches!(
+        reason,
+        "no verification key configured" | "misconfigured public key"
+    ) || reason.starts_with("unknown key id")
 }
 
 fn site_expects_engine(site: &SiteConfig) -> bool {
@@ -10680,6 +10730,54 @@ mod block_page_tests {
             tls: Default::default(),
             origin: Default::default(),
         }
+    }
+
+    /// A JWT failure is either the client's fault or the operator's, and only
+    /// the second one needs an operator-facing line. Getting this wrong in
+    /// either direction is bad: classify a bad token as a misconfiguration and
+    /// the log fills with client noise; classify a missing key as a bad token
+    /// and a site that can never authenticate anyone looks like an attack.
+    #[test]
+    fn jwt_misconfiguration_is_told_apart_from_a_bad_token() {
+        for operator in [
+            "no verification key configured",
+            "misconfigured public key",
+            "unknown key id: abc123",
+        ] {
+            assert!(
+                jwt_failure_is_misconfiguration(operator),
+                "{operator:?} is the operator's problem"
+            );
+        }
+        for client in [
+            "token expired",
+            "invalid signature",
+            "malformed token header",
+            "token header missing kid (required for JWKS)",
+            "issuer mismatch",
+        ] {
+            assert!(
+                !jwt_failure_is_misconfiguration(client),
+                "{client:?} is the client's problem and must not page an operator"
+            );
+        }
+    }
+
+    /// The diagnostic fires once per key, so a broken config produces one line
+    /// rather than one per request.
+    #[test]
+    fn an_operator_diagnostic_is_logged_once_per_key() {
+        let key = format!("test-key-{}", std::process::id());
+        assert!(diag_first_time(key.clone()), "first time must report true");
+        assert!(
+            !diag_first_time(key.clone()),
+            "second time must be suppressed"
+        );
+        assert!(!diag_first_time(key), "and stay suppressed");
+        assert!(
+            diag_first_time(format!("other-key-{}", std::process::id())),
+            "a different key is a different diagnostic"
+        );
     }
 
     /// A blocking-mode site whose rules will not compile must be REFUSED, not
