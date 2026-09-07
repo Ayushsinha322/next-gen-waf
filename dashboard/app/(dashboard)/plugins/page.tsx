@@ -356,7 +356,7 @@ export default function PluginsPage() {
               Installed
             </div>
             <div style={{ fontSize: "var(--fs-sm)", color: "var(--text2)" }}>
-              {plugins.length} installed · {active} active in the request path
+              {plugins.length} installed · {active} enabled · {plugins.filter(p => p.enabled && (p.sites?.length ?? 0) > 0).length} running on at least one site
             </div>
           </div>
 
@@ -415,9 +415,38 @@ export default function PluginsPage() {
                               color: p.enabled ? "var(--green)" : "var(--text2)",
                             }}
                           >
-                            {p.enabled ? "ACTIVE" : "INACTIVE"}
+                            {p.enabled ? "ENABLED" : "DISABLED"}
+                          </span>
+                          {/* Enabled is availability, not enforcement: a plugin
+                              judges a site's traffic only when that site's policy
+                              names it. Saying "ACTIVE" for an enabled-but-unselected
+                              module was the same fiction as a control that stores a
+                              value and never applies it. */}
+                          <span
+                            style={{
+                              fontSize: 11,
+                              padding: "2px 8px",
+                              borderRadius: 999,
+                              border: `1px solid ${(p.sites?.length ?? 0) > 0 ? "var(--cyan)" : "var(--border2)"}`,
+                              color: (p.sites?.length ?? 0) > 0 ? "var(--cyan)" : "var(--text2)",
+                            }}
+                            title={(p.sites?.length ?? 0) > 0
+                              ? `Runs on: ${p.sites!.join(", ")}`
+                              : "No site selects this plugin, so it never runs. Pick it in a site's Advanced step."}
+                          >
+                            {(p.sites?.length ?? 0) > 0 ? `RUNS ON ${p.sites!.length} SITE${p.sites!.length === 1 ? "" : "S"}` : "NO SITES"}
                           </span>
                         </div>
+                        {(p.sites?.length ?? 0) > 0 && (
+                          <div style={{ fontSize: 12, color: "var(--text3)", fontFamily: "var(--font-mono)", marginTop: 4 }}>
+                            {p.sites!.join(" · ")}
+                          </div>
+                        )}
+                        {p.enabled && (p.sites?.length ?? 0) === 0 && (
+                          <div style={{ fontSize: 12, color: "var(--amber)", marginTop: 4, lineHeight: 1.5 }}>
+                            ⚠ Enabled but no site runs it. Open a site → Advanced → WebAssembly Plugins and tick it.
+                          </div>
+                        )}
                         {p.description && (
                           <div
                             style={{

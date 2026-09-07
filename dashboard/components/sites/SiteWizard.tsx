@@ -16,7 +16,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
-import { api, type Certificate, type SiteConfigProblem } from "@/lib/api";
+import { api, type Certificate, type Plugin, type SiteConfigProblem } from "@/lib/api";
 import {
   SiteForm, emptyForm, applyPreset, formToPayload, PRESETS, CRS_CATEGORIES,
   CRS_REQUEST_CATEGORIES, CRS_RESPONSE_CATEGORIES, ALL_CRS_RESPONSE_KEYS, type CrsCategory,
@@ -227,6 +227,11 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
   // Load the certificate repository so the user can assign an existing cert
   // (e.g. an enterprise wildcard) without re-uploading per site.
   useEffect(() => { api.certs.list().then(r => setRepoCerts(r.certs ?? [])).catch(() => {}); }, []);
+  // Installed plugins, for the per-site selection on the Advanced step. Plugins
+  // are opt-in per site: installing and enabling one makes the module available
+  // to the fleet, and a site runs it only when it is ticked there.
+  const [installedPlugins, setInstalledPlugins] = useState<Plugin[]>([]);
+  useEffect(() => { api.plugins.list().then(r => setInstalledPlugins(r.plugins ?? [])).catch(() => {}); }, []);
 
   // Server-side dry run. The control plane exposes POST /sites/validate, which
   // runs the SAME conversion functions the config sync runs — so a green result
@@ -1049,6 +1054,41 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                   </>)}
                   <SectionToggle label="API Discovery" desc="Learn and document API endpoints automatically" on={form.api_discovery} set={v => upd({ api_discovery: v })} />
 
+                  <GroupLabel>WebAssembly Plugins <Tag kind="enforced" /></GroupLabel>
+                  {installedPlugins.length === 0 ? (
+                    <InfoBox>
+                      No plugins installed. Install one from <strong style={{ color: "var(--cyan)" }}>Plugins</strong> — the
+                      catalogue ships a scanner guard — then tick it here to run it on this site.
+                    </InfoBox>
+                  ) : (<>
+                    <InfoBox tone="amber">
+                      A plugin runs on this site only when it is ticked here, and only while it is <em>enabled</em> on the
+                      Plugins page. That is deliberate: it lets you try a plugin on one site before trusting it with the rest.
+                    </InfoBox>
+                    <div style={{ display: "grid", gap: 8 }}>
+                      {installedPlugins.map(p => {
+                        const on = form.site_plugins.includes(p.name);
+                        const perms = Object.entries(p.permissions ?? {}).filter(([, v]) => v).map(([k]) => k);
+                        const decides = perms.includes("host_set_decision") || perms.includes("host_add_score");
+                        return (
+                          <label key={p.name} style={{ display: "flex", gap: 10, alignItems: "flex-start", border: "1px solid var(--border2)", borderRadius: 8, padding: "9px 11px", cursor: "pointer" }}>
+                            <input type="checkbox" checked={on} style={{ marginTop: 3 }}
+                              onChange={e => upd({ site_plugins: e.target.checked ? [...form.site_plugins, p.name] : form.site_plugins.filter(x => x !== p.name) })} />
+                            <div style={{ minWidth: 0 }}>
+                              <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                                <span style={{ fontWeight: 600 }}>{p.name}</span>
+                                <span className="bdg bgr">v{p.version}</span>
+                                {!p.enabled && <span className="bdg ba" title="Installed but not enabled — it will not run until you enable it on the Plugins page">NOT ENABLED</span>}
+                                {decides && <span className="bdg ba" title="This plugin can block a request or add to its anomaly score">CHANGES VERDICTS</span>}
+                              </div>
+                              <div style={{ fontSize: 12, color: "var(--text3)", marginTop: 3, lineHeight: 1.5 }}>{p.description}</div>
+                            </div>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  </>)}
+
                   {/* Response DLP */}
                   <GroupLabel>Response Data-Loss Prevention</GroupLabel>
                   <SectionToggle label="Response DLP scanning" desc="Detect PII/PAN/SSN/secrets in responses — block, mask, or log" on={form.dlp_enabled} set={v => upd({ dlp_enabled: v })} />
@@ -1132,6 +1172,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                       ["Antibot", `${form.bot_ja4 ? "JA4" : ""}${form.bot_ja4 && form.bot_challenge !== "off" ? " · " : ""}${form.bot_challenge !== "off" ? form.bot_challenge : ""}` || "off"],
                       ["GeoIP", form.geo_mode === "off" ? "off" : `${form.geo_mode} ${form.geo_countries.join(",")}`],
                       ["IP / Blacklist", `${form.ip_allow.length} allow · ${form.ip_block.length} block${form.dnsbl_enabled ? " · DNSBL" : ""}`],
+                      ["Plugins", form.site_plugins.length ? form.site_plugins.join(", ") : "none"],
                       ["Headers", `${form.csp ? "CSP " : ""}${form.cors_enabled ? "CORS " : ""}${form.hsts ? "HSTS " : ""}${form.custom_headers.filter(h => h.name).length} custom`],
                       ["ML", form.ml_enabled ? `on (${form.ml_sensitivity})${form.ml_models.length ? ` · ${form.ml_models.length} models` : ""}` : "off"],
                       ["API Auth (JWT)", form.jwt_enabled ? `on${form.jwt_jwks_url ? " · JWKS" : form.jwt_hs_secret ? " · HS" : form.jwt_public_key_pem ? " · PEM" : ""}${form.jwt_required_scopes.length ? ` · ${form.jwt_required_scopes.length} scopes` : ""}` : "off"],

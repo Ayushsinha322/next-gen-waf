@@ -764,6 +764,9 @@ fn cmd_site_add(
             inline_rules: vec![],
             // Per-path overrides come from the control plane, not a local file.
             path_overrides: vec![],
+            // Plugin selection is per site and comes from the control plane; a
+            // CLI-built config runs no plugins.
+            enabled_plugins: vec![],
             ml: None,
             ip_reputation: None,
             rate_limit: None,

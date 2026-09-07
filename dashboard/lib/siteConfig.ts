@@ -207,6 +207,8 @@ export interface SiteForm {
   ip_allow:       string[];
   ip_block:       string[];
   dnsbl_enabled:  boolean;
+  /** Names of installed plugins THIS site runs. Opt-in: empty = none. */
+  site_plugins:   string[];
   /** Mirror the block-list into the kernel (XDP). Node-wide: blocks those sources for EVERY site on the node. */
   ip_block_xdp:   boolean;
   dnsbl_servers:  string[];
@@ -468,7 +470,7 @@ export function emptyForm(): SiteForm {
 
     geo_mode: "off", geo_countries: [],
     ip_allow: [], ip_block: [],
-    dnsbl_enabled: false, ip_block_xdp: false, dnsbl_servers: [], blacklist_user_agents: [], blacklist_uris: [],
+    dnsbl_enabled: false, ip_block_xdp: false, site_plugins: [], dnsbl_servers: [], blacklist_user_agents: [], blacklist_uris: [],
 
     csp: "", referrer_policy: "strict-origin-when-cross-origin",
     permissions_policy: "geolocation=(), microphone=(), camera=()",
@@ -598,6 +600,10 @@ export function formToPayload(f: SiteForm): {
     max_header_count: Number(f.max_header_count) || 100,
     allowed_methods: f.allowed_methods,
     api_discovery: f.api_discovery,
+    // Always emitted, including empty: a site with no plugins selected runs
+    // none, and sending it explicitly makes a deselection legible in the
+    // effective-config diff instead of looking like an omitted key.
+    enabled_plugins: f.site_plugins,
     // Always emitted, including when empty: waf_policy is REPLACED wholesale, so
     // an absent key and an empty list mean the same thing to the server — but
     // sending it explicitly keeps "cleared on purpose" legible in a request log.
@@ -916,6 +922,8 @@ export function siteToForm(site: Site): SiteForm {
     if (allow.length) { f.geo_mode = "allow"; f.geo_countries = allow; }
     else if (block.length) { f.geo_mode = "block"; f.geo_countries = block; }
   }
+
+  f.site_plugins = arr<string>(w.enabled_plugins);
 
   const ipr = w.ip_reputation as AnyRec | undefined;
   if (ipr) {
