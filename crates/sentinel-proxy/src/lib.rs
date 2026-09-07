@@ -3260,17 +3260,40 @@ async fn proxy_inner(
     // on the warming flag so a site whose rules FAILED to compile keeps its
     // existing loud-warning behaviour rather than becoming permanently 503.
     if let Some(s) = &site {
-        if site_expects_engine(s)
-            && !engine_map.contains_key(&s.id)
-            && ENGINES_WARMING.load(std::sync::atomic::Ordering::Acquire)
-        {
-            warn!(
-                site = %s.id,
-                "site config has landed but its rule engine is still compiling — \
-                 refusing with 503 rather than forwarding uninspected traffic"
-            );
+        let action = missing_engine_action(
+            s,
+            engine_map.contains_key(&s.id),
+            ENGINES_WARMING.load(std::sync::atomic::Ordering::Acquire),
+            serve_on_rule_compile_failure(),
+        );
+        if action != MissingEngine::Serve {
+            // The public body stays generic in both cases: which of the two it is
+            // tells an attacker whether this site currently has signature
+            // protection, and that is not their business. The operator gets the
+            // difference in the log and at /healthz.
+            let (reason, log_detail) = match action {
+                MissingEngine::RefuseWarming => (
+                    "site initializing: rule engine still compiling",
+                    "site config has landed but its rule engine is still compiling — \
+                     refusing with 503 rather than forwarding uninspected traffic",
+                ),
+                _ => (
+                    "site rule set failed to compile: refusing rather than serving unprotected",
+                    "site is in BLOCKING mode and its rule set will not compile, with no \
+                     last-good ruleset to fall back on — refusing with 503 rather than serving \
+                     it with no signature protection. Fix the rules, or switch the site to \
+                     learning mode to serve traffic uninspected on purpose. Override with \
+                     SENTINEL_SERVE_ON_RULE_COMPILE_FAILURE=1. Listed at \
+                     /healthz inspection.sites_refused.",
+                ),
+            };
+            if action == MissingEngine::RefuseWarming {
+                warn!(site = %s.id, "{log_detail}");
+            } else {
+                error!(site = %s.id, "{log_detail}");
+            }
             ctx.decision = WafDecision::Block;
-            ctx.block_reason = Some("site initializing: rule engine still compiling".into());
+            ctx.block_reason = Some(reason.into());
             let resp = error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Service Unavailable — site is initializing",
@@ -4967,6 +4990,86 @@ fn clear_warming_if_current(
 /// a site whose rules FAILED to compile and which is now being served with no
 /// signature protection at all — a standing fail-open that only a config fix
 /// clears, and which was previously visible in nothing but one log line.
+/// What to do about a request for a site that has no compiled rule engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissingEngine {
+    /// The site has an engine, wants none, or is in learning mode: carry on.
+    Serve,
+    /// A reload is in flight. Transient, so refuse and let the client retry.
+    RefuseWarming,
+    /// The rule set FAILED to compile and there is no last-good ruleset to fall
+    /// back on. Persistent until an operator fixes the config.
+    RefuseBroken,
+}
+
+/// Decide it in one place, from values, so every branch is testable.
+///
+/// Until 2026-09-07 the refusal was gated on `warming` alone, which meant a
+/// blocking-mode site whose rules failed to compile was refused for a few
+/// seconds and then served with NO signature protection for as long as the
+/// config stayed broken. That is the one direction of failure a WAF may never
+/// take, and it was reachable by a single bad rule.
+///
+/// The site's own mode carries the operator's intent, so no new config field is
+/// needed to decide it:
+///
+///   * `blocking` is a promise to enforce. A node that cannot enforce cannot
+///     keep it, so it refuses rather than pretending.
+///   * `learning` promises the opposite — it never blocks anything — so serving
+///     uninspected matches what the operator asked for, and refusing would cost
+///     availability for no security gain. The ERROR log and the health endpoint
+///     still say the site is unprotected.
+///   * `off`, or a site with no rules at all, never expected an engine.
+///
+/// `serve_on_failure` is the escape hatch: an operator whose rules will not
+/// compile and who needs the site up NOW sets
+/// `SENTINEL_SERVE_ON_RULE_COMPILE_FAILURE=1` and gets the old behaviour, loudly.
+fn missing_engine_action(
+    site: &SiteConfig,
+    has_engine: bool,
+    warming: bool,
+    serve_on_failure: bool,
+) -> MissingEngine {
+    if has_engine || !site_expects_engine(site) {
+        return MissingEngine::Serve;
+    }
+    if warming {
+        return MissingEngine::RefuseWarming;
+    }
+    if serve_on_failure || site.waf.mode != WafMode::Blocking {
+        return MissingEngine::Serve;
+    }
+    MissingEngine::RefuseBroken
+}
+
+/// Reads the escape hatch once per process.
+fn serve_on_rule_compile_failure() -> bool {
+    static SERVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SERVE.get_or_init(|| {
+        matches!(
+            std::env::var("SENTINEL_SERVE_ON_RULE_COMPILE_FAILURE")
+                .ok()
+                .as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    })
+}
+
+/// Sites that are being REFUSED because their rules will not compile — the
+/// consequence, next to `sites_without_engine`, which is only the condition.
+fn refused_sites(cfg: &SentinelConfig, engines: &RuleEngineMap) -> Vec<String> {
+    let warming = ENGINES_WARMING.load(std::sync::atomic::Ordering::Acquire);
+    let serve = serve_on_rule_compile_failure();
+    cfg.sites
+        .iter()
+        .filter(|s| {
+            missing_engine_action(s, engines.contains_key(&s.id), warming, serve)
+                == MissingEngine::RefuseBroken
+        })
+        .map(|s| s.id.clone())
+        .collect()
+}
+
 fn unprotected_sites(cfg: &SentinelConfig, engines: &RuleEngineMap) -> Vec<String> {
     cfg.sites
         .iter()
@@ -5055,16 +5158,16 @@ fn build_rule_engines(cfg: &SentinelConfig, previous: &RuleEngineMap) -> RuleEng
                     map.insert(site.id.clone(), prev.clone());
                 } else {
                     // ERROR, not WARN: unlike the retain-last-good branch above,
-                    // this site has no ruleset at ALL and is about to be served
-                    // uninspected for as long as the config stays broken. Once
-                    // ENGINES_WARMING clears it stops being 503'd and starts
-                    // passing traffic, so the only thing standing between a
-                    // blocking-mode site and zero signature protection is this
-                    // line and the /healthz field it feeds.
-                    error!(site = %site.id,
-                        "rule engine load failed and no prior ruleset — site has NO signature protection \
-                         and WILL be served uninspected once warming clears; listed in \
-                         /healthz inspection.sites_without_engine until the config is fixed: {e:#}");
+                    // this site has no ruleset at ALL. A blocking-mode site is
+                    // now REFUSED with 503 rather than served without signature
+                    // protection (see missing_engine_action); a learning-mode
+                    // site is still served, because learning never promised to
+                    // block. Either way the config is broken and needs fixing.
+                    error!(site = %site.id, mode = ?site.waf.mode,
+                        "rule engine load failed and no prior ruleset — site has NO signature protection. \
+                         A blocking-mode site is refused with 503 until this is fixed; a learning-mode \
+                         site is served uninspected. Listed at /healthz inspection.sites_without_engine \
+                         and .sites_refused: {e:#}");
                 }
             }
         }
@@ -7428,6 +7531,12 @@ fn health_response(state: &ServerState) -> Response<BoxBody> {
         "inspection": {
             "engines_warming": ENGINES_WARMING.load(std::sync::atomic::Ordering::Acquire),
             "sites_without_engine": unprotected_sites(&cfg, &state.engines.load_full()),
+            // Which of those are actually being REFUSED. Since 2026-09-07 a
+            // blocking-mode site whose rules will not compile fails closed
+            // instead of being served with no signature protection; a
+            // learning-mode site in the same state is still served, on purpose.
+            "sites_refused": refused_sites(&cfg, &state.engines.load_full()),
+            "serve_on_rule_compile_failure": serve_on_rule_compile_failure(),
         },
         "listeners": listeners,
         "http3": http3,
@@ -10571,6 +10680,113 @@ mod block_page_tests {
             tls: Default::default(),
             origin: Default::default(),
         }
+    }
+
+    /// A blocking-mode site whose rules will not compile must be REFUSED, not
+    /// served without signature protection. Every branch of the decision, because
+    /// the old version got this wrong in exactly one of them: it refused while a
+    /// reload was in flight and then served the same broken site for ever.
+    #[test]
+    fn a_blocking_site_with_no_rule_engine_fails_closed() {
+        use sentinel_core::config::WafMode;
+
+        // has_engine=true → always served, whatever the mode.
+        for mode in [WafMode::Blocking, WafMode::Learning] {
+            let s = rules_site("s", mode, true);
+            assert_eq!(
+                missing_engine_action(&s, true, false, false),
+                MissingEngine::Serve
+            );
+        }
+
+        // Reload in flight: transient, refuse and let the client retry. Same for
+        // both modes — the config may be seconds from being correct.
+        for mode in [WafMode::Blocking, WafMode::Learning] {
+            let s = rules_site("s", mode, true);
+            assert_eq!(
+                missing_engine_action(&s, false, true, false),
+                MissingEngine::RefuseWarming
+            );
+        }
+
+        // THE FIX: not warming, no engine, blocking mode → refuse permanently.
+        let blocking = rules_site("s", WafMode::Blocking, true);
+        assert_eq!(
+            missing_engine_action(&blocking, false, false, false),
+            MissingEngine::RefuseBroken,
+            "a blocking-mode site that cannot enforce must not be served"
+        );
+
+        // Learning mode never promised to block, so serving uninspected is what
+        // the operator asked for. Refusing would cost availability for nothing.
+        let learning = rules_site("s", WafMode::Learning, true);
+        assert_eq!(
+            missing_engine_action(&learning, false, false, false),
+            MissingEngine::Serve
+        );
+
+        // The escape hatch restores the old behaviour, deliberately.
+        assert_eq!(
+            missing_engine_action(&blocking, false, false, true),
+            MissingEngine::Serve
+        );
+
+        // A site that never expected an engine is unaffected: mode off, or no
+        // rules at all. Both must serve even in blocking mode with no engine.
+        let off = rules_site("s", WafMode::Off, true);
+        assert_eq!(
+            missing_engine_action(&off, false, false, false),
+            MissingEngine::Serve
+        );
+        let no_rules = rules_site("s", WafMode::Blocking, false);
+        assert_eq!(
+            missing_engine_action(&no_rules, false, false, false),
+            MissingEngine::Serve,
+            "a blocking site with no rules configured legitimately has no engine"
+        );
+    }
+
+    /// `sites_refused` must name the consequence, not merely repeat the condition.
+    #[test]
+    fn healthz_separates_unprotected_from_refused() {
+        use sentinel_core::config::WafMode;
+        let cfg = SentinelConfig {
+            sites: vec![
+                rules_site("blocking-broken", WafMode::Blocking, true),
+                rules_site("learning-broken", WafMode::Learning, true),
+                rules_site("no-rules", WafMode::Blocking, false),
+            ],
+            ..Default::default()
+        };
+        let engines = RuleEngineMap::new(); // nothing compiled
+        let unprotected = unprotected_sites(&cfg, &engines);
+        assert_eq!(
+            unprotected,
+            vec!["blocking-broken".to_string(), "learning-broken".to_string()],
+            "both broken sites lack signature protection"
+        );
+        // refused_sites reads the live warming flag and env, so assert the
+        // decision directly for the blocking site and the learning one.
+        assert_eq!(
+            missing_engine_action(&cfg.sites[0], false, false, false),
+            MissingEngine::RefuseBroken
+        );
+        assert_eq!(
+            missing_engine_action(&cfg.sites[1], false, false, false),
+            MissingEngine::Serve
+        );
+    }
+
+    /// A site with rule files, at a given mode.
+    fn rules_site(id: &str, mode: sentinel_core::config::WafMode, with_rules: bool) -> SiteConfig {
+        let mut s = plugin_site(id, vec![]);
+        s.waf.mode = mode;
+        s.waf.rules = if with_rules {
+            vec!["rules/owasp-crs/rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf".to_string()]
+        } else {
+            vec![]
+        };
+        s
     }
 
     /// Plugins are opt-in per site. Before 2026-09-07 the request path ran every
