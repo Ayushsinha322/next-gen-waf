@@ -432,14 +432,21 @@ async fn scanner_guard_blocks_scanner_user_agents_only() {
     }
     let wasm = std::fs::read(path).unwrap();
     let mut rt = PluginRuntime::new().unwrap();
-    rt.load_plugin("scanner-guard", &wasm).expect("load scanner-guard");
+    rt.load_plugin("scanner-guard", &wasm)
+        .expect("load scanner-guard");
 
     let ua_ctx = |ua: &str| {
         let mut ctx = make_ctx();
-        ctx.request_headers.insert(http::header::USER_AGENT, ua.parse().unwrap());
+        ctx.request_headers
+            .insert(http::header::USER_AGENT, ua.parse().unwrap());
         ctx
     };
-    for ua in ["sqlmap/1.7.2#stable (https://sqlmap.org)", "Mozilla/5.0 Nikto/2.1.6", "Nuclei - Open-source project", "WPScan v3.8"] {
+    for ua in [
+        "sqlmap/1.7.2#stable (https://sqlmap.org)",
+        "Mozilla/5.0 Nikto/2.1.6",
+        "Nuclei - Open-source project",
+        "WPScan v3.8",
+    ] {
         let r = rt.evaluate_plugin("scanner-guard", &ua_ctx(ua)).await;
         assert_eq!(r.decision, WafDecision::Block, "UA {ua:?} must be blocked");
     }
@@ -450,7 +457,11 @@ async fn scanner_guard_blocks_scanner_user_agents_only() {
     let mut no_ua = make_ctx();
     no_ua.request_headers.remove(http::header::USER_AGENT);
     let r = rt.evaluate_plugin("scanner-guard", &no_ua).await;
-    assert_eq!(r.decision, WafDecision::Allow, "a missing UA is scored, not blocked");
+    assert_eq!(
+        r.decision,
+        WafDecision::Allow,
+        "a missing UA is scored, not blocked"
+    );
     assert_eq!(r.anomaly_score_delta, 2);
 
     // The plugin must not block what the product's own indicator policy
