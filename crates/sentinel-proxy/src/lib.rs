@@ -71,7 +71,7 @@ use sentinel_modules::{
     GeoVerdict, GraphqlLimits, GrpcLimits, IpReputation, IpVerdict, JwtPolicy, RateLimiter,
     RawTier, SmugglingVerdict, ThreatFeed, ThreatVerdict,
 };
-use sentinel_plugins::PluginRuntime;
+use sentinel_plugins::{PluginEvalResult, PluginRuntime};
 use sentinel_rules::RuleEngine;
 use sentinel_telemetry::{
     bot_good_bot_allowed_total, dec_active_connections, graphql_blocked_total,
@@ -80,9 +80,11 @@ use sentinel_telemetry::{
     inc_load_shed_requests, inc_log_lines_dropped, inc_requests, inc_rule_hits, ja4_attempts_total,
     ja4_h3_absent_total, ja4_h3_attempts_total, ja4_h3_success_total, ja4_no_hello_total,
     ja4_success_total, note_good_bot_allowed, note_graphql_blocked, note_graphql_inspected,
-    note_grpc_inspected, note_ja4_attempt, note_ja4_no_hello, note_ja4_success,
-    note_smuggling_evaluated, note_smuggling_rejected_framing, note_smuggling_rejected_header,
-    observe_duration, prometheus_text, smuggling_evaluated_total, smuggling_rejected_framing_total,
+    note_grpc_inspected, note_ja4_attempt, note_ja4_no_hello, note_ja4_success, note_plugin_block,
+    note_plugin_invocation, note_plugin_score, note_plugin_trap, note_smuggling_evaluated,
+    note_smuggling_rejected_framing, note_smuggling_rejected_header, observe_duration,
+    plugin_blocks_total, plugin_invocations_total, plugin_scores_total, plugin_traps_total,
+    prometheus_text, smuggling_evaluated_total, smuggling_rejected_framing_total,
     smuggling_rejected_header_total,
 };
 use tokio::net::{TcpListener, TcpStream};
@@ -4418,6 +4420,7 @@ async fn phase1_headers(
     if still_evaluating(ctx) && !site_plugins.is_empty() {
         for plugin_name in site_plugins {
             let result = plugin_runtime.evaluate_plugin(plugin_name, ctx).await;
+            note_plugin_outcome(&result);
             if result.anomaly_score_delta > 0 {
                 ctx.add_engine_score("plugin", result.anomaly_score_delta);
             }
@@ -4443,6 +4446,7 @@ async fn phase1_headers(
                         .execute_pending_callouts(callouts.clone())
                         .await;
                     let result2 = plugin_runtime.evaluate_plugin(plugin_name, ctx).await;
+                    note_plugin_outcome(&result2);
                     if result2.anomaly_score_delta > 0 {
                         ctx.add_engine_score("plugin", result2.anomaly_score_delta);
                     }
@@ -5660,8 +5664,23 @@ fn plugin_status(
         }
     }
     let running: usize = by_plugin.len();
+    let invocations = plugin_invocations_total();
+    let traps = plugin_traps_total();
     serde_json::json!({
         "loaded": loaded,
+        // Execution counters, also in /metrics. `traps` is the one to alert on:
+        // every failure path inside the runtime returns Allow, so a plugin
+        // trapping on every request is indistinguishable from one that never
+        // blocks anything — the control looks enabled and judges nothing.
+        "invocations": invocations,
+        "blocks": plugin_blocks_total(),
+        "scores": plugin_scores_total(),
+        "traps": traps,
+        "trap_ratio": if invocations > 0 {
+            (traps as f64 / invocations as f64 * 1000.0).round() / 1000.0
+        } else {
+            0.0
+        },
         "running_on_at_least_one_site": running,
         // A module loaded but selected by no site: it costs memory and nothing else.
         "loaded_but_unused": loaded
@@ -5994,6 +6013,27 @@ type UploadedPlugins = Arc<DashMap<String, (String, Vec<u8>)>>;
 /// swapping the result in unloads all uploaded plugins, which is a silent
 /// protection outage: the module is still installed and enabled in the UI, the
 /// node reports no error, and the plugin simply stops running.
+/// Count one plugin evaluation.
+///
+/// A plugin runs operator-supplied code in the request path, and until
+/// 2026-09-07 nothing counted it: cost and failure rate were visible only as log
+/// lines. `failed` is the important one — every failure path inside the runtime
+/// returns Allow, so a plugin that traps on every request looks exactly like one
+/// that never blocks anything.
+fn note_plugin_outcome(result: &PluginEvalResult) {
+    note_plugin_invocation();
+    if result.failed {
+        note_plugin_trap();
+        return;
+    }
+    if matches!(result.decision, WafDecision::Block | WafDecision::Challenge) {
+        note_plugin_block();
+    }
+    if result.anomaly_score_delta > 0 {
+        note_plugin_score();
+    }
+}
+
 /// Resolve `waf.enabled_plugins` for every site against the modules this node
 /// actually holds, starting from the per-site manifest entries.
 ///

@@ -52,6 +52,16 @@ pub struct PluginEvalResult {
     /// [`PluginRuntime::execute_pending_callouts`] and re-evaluates the plugin
     /// so it can read the results.
     pub pending_callouts: Option<Vec<crate::abi::HttpCalloutRequest>>,
+    /// True when the evaluation FAILED rather than completing: the module was
+    /// not loaded, would not instantiate, exports no `evaluate`, or trapped
+    /// (including fuel exhaustion and the epoch deadline).
+    ///
+    /// Every one of those paths returns an Allow, so a plugin that fails on
+    /// every request is indistinguishable from one that never blocks anything.
+    /// The caller counts this — see `sentinel_plugin_traps_total` — so "the
+    /// control looks enabled and is judging nothing" is measurable instead of
+    /// being buried in ERROR lines.
+    pub failed: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +292,7 @@ impl PluginRuntime {
                     anomaly_score_delta: 0,
                     response_headers: Vec::new(),
                     pending_callouts: None,
+                    failed: true,
                 };
             }
         };
@@ -321,6 +332,7 @@ impl PluginRuntime {
                 anomaly_score_delta: 0,
                 response_headers: Vec::new(),
                 pending_callouts: None,
+                failed: true,
             };
         }
 
@@ -334,6 +346,7 @@ impl PluginRuntime {
                     anomaly_score_delta: 0,
                     response_headers: Vec::new(),
                     pending_callouts: None,
+                    failed: true,
                 };
             }
         };
@@ -348,6 +361,7 @@ impl PluginRuntime {
                     anomaly_score_delta: 0,
                     response_headers: Vec::new(),
                     pending_callouts: None,
+                    failed: true,
                 };
             }
         };
@@ -360,6 +374,7 @@ impl PluginRuntime {
                 anomaly_score_delta: 0,
                 response_headers: Vec::new(),
                 pending_callouts: None,
+                failed: true,
             };
         }
 
@@ -374,6 +389,7 @@ impl PluginRuntime {
             anomaly_score_delta: data.anomaly_score_delta,
             response_headers: data.response_headers,
             pending_callouts,
+            failed: false,
         }
     }
 
