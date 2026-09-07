@@ -18,6 +18,9 @@ type fakeStore struct {
 	mu       sync.Mutex
 	upserted []db.IOC
 	purges   int
+	// reconciled records (source -> the keep-set it was given), so a test can
+	// assert WHICH sources were reconciled and with what.
+	reconciled map[string][]db.IOC
 }
 
 func (f *fakeStore) UpsertIOCs(_ context.Context, iocs []db.IOC) (int, error) {
@@ -31,6 +34,16 @@ func (f *fakeStore) PurgeExpiredIOCs(_ context.Context) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.purges++
+	return 0, nil
+}
+
+func (f *fakeStore) ReconcileStaticSource(_ context.Context, source string, keep []db.IOC) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.reconciled == nil {
+		f.reconciled = map[string][]db.IOC{}
+	}
+	f.reconciled[source] = append([]db.IOC(nil), keep...)
 	return 0, nil
 }
 
@@ -164,5 +177,49 @@ func TestConfigSourcesDisable(t *testing.T) {
 	}
 	if !names["builtin_bad_ua"] {
 		t.Error("builtin UA provider is always enabled")
+	}
+}
+
+// A locally generated source must be reconciled so an entry withdrawn from the
+// seed stops enforcing; a URL feed must NOT be, because a feed that returns
+// nothing because it was unreachable would otherwise delete its own corpus.
+func TestOnlyStaticSourcesAreReconciled(t *testing.T) {
+	torSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("1.1.1.1\n"))
+	}))
+	defer torSrv.Close()
+
+	fs := &fakeStore{}
+	agg := New(fs, Config{
+		Enabled:     true,
+		Interval:    time.Hour,
+		HTTPTimeout: 5 * time.Second,
+		TorURL:      torSrv.URL,
+		FeodoURL:    "off",
+		URLhausURL:  "off",
+		STIXURL:     "off",
+	}, zap.NewNop())
+
+	if _, err := agg.RefreshOnce(context.Background()); err != nil {
+		t.Fatalf("RefreshOnce: %v", err)
+	}
+
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	keep, ok := fs.reconciled["builtin_bad_ua"]
+	if !ok {
+		t.Fatal("the built-in user-agent seed is locally generated and must be reconciled")
+	}
+	builtin, _ := builtinBadUserAgents()
+	if len(keep) != len(builtin) {
+		t.Errorf("reconcile keep-set should be the whole current seed: got %d, want %d", len(keep), len(builtin))
+	}
+	for _, i := range keep {
+		if i.Source != "builtin_bad_ua" {
+			t.Errorf("keep-set entries must be attributed to the source, got %q", i.Source)
+		}
+	}
+	if _, ok := fs.reconciled["tor"]; ok {
+		t.Error("a URL feed must never be reconciled — an unreachable feed would wipe its own corpus")
 	}
 }

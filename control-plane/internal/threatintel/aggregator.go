@@ -25,6 +25,10 @@ const maxFeedBytes = 64 << 20 // 64 MiB
 type IOCStore interface {
 	UpsertIOCs(ctx context.Context, iocs []db.IOC) (int, error)
 	PurgeExpiredIOCs(ctx context.Context) (int64, error)
+	// ReconcileStaticSource removes rows a locally generated source no longer
+	// produces. Without it the corpus is additive and an entry withdrawn from a
+	// built-in seed keeps enforcing for ever.
+	ReconcileStaticSource(ctx context.Context, source string, keep []db.IOC) (int64, error)
 }
 
 // Aggregator periodically fetches CTI feeds and syncs them into the IOC store.
@@ -263,6 +267,32 @@ func (a *Aggregator) RefreshOnce(ctx context.Context) (int, error) {
 		a.log.Warn("threat-intel purge failed", zap.Error(perr))
 	} else if purged > 0 {
 		a.log.Info("threat-intel purged expired IOCs", zap.Int64("removed", purged))
+	}
+
+	// Reconcile the locally generated sources: whatever a static provider no
+	// longer emits must stop enforcing. These have no TTL — they are rebuilt on
+	// every refresh — so nothing else would ever remove a withdrawn entry.
+	// Only sources that produced something this run are reconciled, and URL
+	// feeds are never touched: an unreachable feed returning nothing must not
+	// delete its own corpus.
+	for _, r := range results {
+		if r.err != nil || r.src.Provider == nil || len(r.iocs) == 0 {
+			continue
+		}
+		owned := make([]db.IOC, 0, len(r.iocs))
+		for _, ioc := range r.iocs {
+			ioc.Source = r.src.Name
+			owned = append(owned, ioc)
+		}
+		removed, rerr := a.store.ReconcileStaticSource(ctx, r.src.Name, owned)
+		switch {
+		case rerr != nil:
+			a.log.Warn("threat-intel reconcile failed",
+				zap.String("source", r.src.Name), zap.Error(rerr))
+		case removed > 0:
+			a.log.Info("threat-intel withdrew indicators no longer in the built-in seed",
+				zap.String("source", r.src.Name), zap.Int64("removed", removed))
+		}
 	}
 	return upserted, nil
 }
