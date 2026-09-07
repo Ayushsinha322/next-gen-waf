@@ -436,6 +436,54 @@ export interface JobsResponse {
 }
 
 /** An installed WASM plugin (module bytes are never sent to the browser). */
+export interface ReportSchedule {
+  id:            string;
+  tenant_id:     string;
+  name:          string;
+  site:          string;           // site name, "" = all sites
+  cadence:       "daily" | "weekly";
+  day_of_week:   number;           // 0 Sunday … 6 Saturday
+  hour_utc:      number;
+  format:        "html" | "csv";
+  channel_id:    string | null;
+  recipients:    string[];
+  enabled:       boolean;
+  last_run_at:   string | null;
+  last_status:   string | null;
+  created_at:    string;
+  updated_at:    string;
+  next_run_at:   string;
+  due:           boolean;
+}
+
+export interface ReportScheduleInput {
+  name:         string;
+  site:         string;
+  cadence:      "daily" | "weekly";
+  day_of_week:  number;
+  hour_utc:     number;
+  format:       "html" | "csv";
+  channel_id:   string | null;
+  recipients:   string[];
+  enabled:      boolean;
+}
+
+/** One entry of the plugin catalogue bundled with the control-plane build. */
+export interface CatalogPlugin {
+  name:               string;
+  version:            string;
+  description:        string;
+  author:             string;
+  hooks:              PluginHooks;
+  permissions:        PluginPermissions;
+  sha256:             string;
+  size_bytes:         number;
+  installed:          boolean;
+  installed_version?: string;
+  installed_enabled?: boolean;
+  up_to_date:         boolean;
+}
+
 export interface Plugin {
   id:          string;
   tenant_id:   string;
@@ -918,6 +966,15 @@ async function downloadExport(path: string, fallbackName: string): Promise<{ fil
   return { filename, rows };
 }
 
+function reportPreviewPath(q: { site?: string; days?: number; format?: "html" | "csv"; download?: boolean }): string {
+  const p = new URLSearchParams();
+  if (q.site) p.set("site", q.site);
+  p.set("days", String(q.days ?? 7));
+  p.set("format", q.format ?? "html");
+  if (q.download) p.set("download", "1");
+  return `/reports/preview?${p}`;
+}
+
 export const api = {
   auth: {
     /** TOTP enrolment: enroll returns a fresh secret + otpauth URI to show as a
@@ -1161,6 +1218,40 @@ export const api = {
       apiFetch<{ ok: boolean; message?: string }>(`/notifications/channels/${id}/test`, { method: "POST" }),
   },
 
+  reports: {
+    list: () =>
+      apiFetch<{ schedules: ReportSchedule[]; mail_configured: boolean; formats: string[]; note?: string }>("/reports/schedules"),
+    create: (body: ReportScheduleInput) =>
+      apiFetch<{ schedule: ReportSchedule }>("/reports/schedules", { method: "POST", body: JSON.stringify(body) }),
+    update: (id: string, body: ReportScheduleInput) =>
+      apiFetch<{ schedule: ReportSchedule }>(`/reports/schedules/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+    remove: (id: string) =>
+      apiFetch<{ deleted: string }>(`/reports/schedules/${id}`, { method: "DELETE" }),
+    /** Build the last period's report and deliver it to the schedule's targets now. */
+    run: (id: string) =>
+      apiFetch<{ ok: boolean; results: Array<{ name: string; ok: boolean; err?: string }>; error?: string }>(`/reports/schedules/${id}/run`, { method: "POST" }),
+    /** Build a report now and save it. The endpoint needs the bearer token, so
+     *  this fetches with auth and saves a blob rather than linking to the URL. */
+    download: (q: { site?: string; days?: number; format: "html" | "csv" }) =>
+      downloadExport(reportPreviewPath({ ...q, download: true }), `waf-report.${q.format}`),
+    /** Same build, opened in a new tab for reading (HTML only). */
+    open: async (q: { site?: string; days?: number }): Promise<void> => {
+      const token = getToken();
+      const res = await fetch(`${BASE}${reportPreviewPath({ ...q, format: "html" })}`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (!res.ok) {
+        const data = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(data.error || `report failed: ${res.status}`);
+      }
+      const url = URL.createObjectURL(await res.blob());
+      window.open(url, "_blank", "noopener");
+      // The tab keeps its own reference; revoke on the next macrotask so the
+      // object URL does not leak for the life of the session.
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    },
+  },
+
   plugins: {
     list: () =>
       apiFetch<{ plugins: Plugin[]; tenant_id?: string; database?: boolean }>("/plugins"),
@@ -1179,6 +1270,11 @@ export const api = {
       apiFetch<{ deleted: string }>(`/plugins/${encodeURIComponent(name)}`, {
         method: "DELETE",
       }),
+    /** Plugins bundled with this control-plane build, with install state per tenant. */
+    catalog: () =>
+      apiFetch<{ catalog: CatalogPlugin[]; source: string; errors?: string[] }>("/plugins/catalog"),
+    installFromCatalog: (name: string) =>
+      apiFetch<{ plugin: Plugin; note?: string }>(`/plugins/catalog/${encodeURIComponent(name)}/install`, { method: "POST" }),
   },
 
   cluster: {

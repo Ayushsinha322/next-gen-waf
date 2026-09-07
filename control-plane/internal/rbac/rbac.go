@@ -54,6 +54,7 @@ const (
 	ResourceThreatIntel   = "threat_intel"   // threat-intelligence IOC corpus (node-global)
 	ResourceLogProfile    = "log_profile"    // saved log views + bulk log export
 	ResourceSettings      = "settings"       // node-wide operator settings (alert thresholds, feeds)
+	ResourceReport        = "report"         // scheduled security reports (per site, to a channel or mailbox)
 )
 
 // Action verbs.
@@ -110,6 +111,12 @@ var rolePermissions = map[Role]map[string]struct{}{
 		perm(ResourceNotification, ActionUpdate):  {},
 		perm(ResourceNotification, ActionDelete):  {},
 		perm(ResourceNotification, ActionList):    {},
+		perm(ResourceReport, ActionCreate):        {},
+		perm(ResourceReport, ActionRead):          {},
+		perm(ResourceReport, ActionUpdate):        {},
+		perm(ResourceReport, ActionDelete):        {},
+		perm(ResourceReport, ActionList):          {},
+		perm(ResourceReport, ActionDownload):      {},
 		perm(ResourceSettings, ActionRead):        {},
 		perm(ResourceSettings, ActionUpdate):      {},
 		perm(ResourceThreatIntel, ActionCreate):   {},
@@ -166,6 +173,12 @@ var rolePermissions = map[Role]map[string]struct{}{
 		perm(ResourceNotification, ActionUpdate):  {},
 		perm(ResourceNotification, ActionDelete):  {},
 		perm(ResourceNotification, ActionList):    {},
+		perm(ResourceReport, ActionCreate):        {},
+		perm(ResourceReport, ActionRead):          {},
+		perm(ResourceReport, ActionUpdate):        {},
+		perm(ResourceReport, ActionDelete):        {},
+		perm(ResourceReport, ActionList):          {},
+		perm(ResourceReport, ActionDownload):      {},
 		perm(ResourceSettings, ActionRead):        {},
 		perm(ResourceSettings, ActionUpdate):      {},
 		perm(ResourceThreatIntel, ActionCreate):   {},
@@ -208,6 +221,11 @@ var rolePermissions = map[Role]map[string]struct{}{
 		perm(ResourceAlert, ActionList):         {},
 		perm(ResourceNotification, ActionRead):  {},
 		perm(ResourceNotification, ActionList):  {},
+		perm(ResourceReport, ActionCreate):      {},
+		perm(ResourceReport, ActionRead):        {},
+		perm(ResourceReport, ActionUpdate):      {},
+		perm(ResourceReport, ActionList):        {},
+		perm(ResourceReport, ActionDownload):    {},
 		perm(ResourceSettings, ActionRead):      {},
 		perm(ResourceThreatIntel, ActionRead):   {},
 		perm(ResourceThreatIntel, ActionList):   {},
@@ -237,6 +255,9 @@ var rolePermissions = map[Role]map[string]struct{}{
 		perm(ResourceAlert, ActionList):         {},
 		perm(ResourceNotification, ActionRead):  {},
 		perm(ResourceNotification, ActionList):  {},
+		perm(ResourceReport, ActionRead):        {},
+		perm(ResourceReport, ActionList):        {},
+		perm(ResourceReport, ActionDownload):    {},
 		perm(ResourceSettings, ActionRead):      {},
 		perm(ResourceThreatIntel, ActionRead):   {},
 		perm(ResourceThreatIntel, ActionList):   {},
@@ -262,6 +283,9 @@ var rolePermissions = map[Role]map[string]struct{}{
 		perm(ResourceAlert, ActionList):         {},
 		perm(ResourceNotification, ActionRead):  {},
 		perm(ResourceNotification, ActionList):  {},
+		perm(ResourceReport, ActionRead):        {},
+		perm(ResourceReport, ActionList):        {},
+		perm(ResourceReport, ActionDownload):    {},
 		perm(ResourceSettings, ActionRead):      {},
 		perm(ResourceThreatIntel, ActionRead):   {},
 		perm(ResourceThreatIntel, ActionList):   {},

@@ -5,7 +5,7 @@ import { motion } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
 import Toggle from "@/components/ui/Toggle";
 import { api, type UserRow, type APIKeyRow, type NotificationChannel, type ChannelType, type ChannelConfig, type Severity, type ManagementTLSInfo, type ClusterHealth } from "@/lib/api";
-import { staggerContainer, fadeUp, spring } from "@/lib/animations";
+import { staggerContainer, fadeUp, spring, tweenFast } from "@/lib/animations";
 import { logout, getUser } from "@/lib/auth";
 
 const TABS = ["General","Auth & SSO","API Keys","Users & RBAC","Cluster","Notifications","Management TLS"];
@@ -111,7 +111,7 @@ function GeneralTab() {
   };
 
   return (
-    <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}
+    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={tweenFast}
       style={{ display: "grid", gap: 14 }}>
 
       {errs.length > 0 && (
@@ -202,7 +202,7 @@ function GeneralTab() {
 
 function AuthTab() {
   return (
-    <motion.div className="panel" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}>
+    <motion.div className="panel" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={tweenFast}>
       <div className="pb">
         <div style={{ fontSize: "var(--fs-h3)", fontWeight: 600, color: "var(--text)", margin: "4px 0 6px" }}>
           Single sign-on
@@ -300,7 +300,7 @@ function APIKeysTab() {
   }
 
   return (
-    <motion.div className="panel" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}>
+    <motion.div className="panel" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={tweenFast}>
       <div className="ph">
         <div className="ptitle">🔑 API Keys</div>
         <motion.button className="btn bp btn-sm" onClick={() => { setShowCreate(s=>!s); setRevealKey(null); }} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
@@ -462,7 +462,7 @@ function UsersTab() {
       </Note>
     )}
 
-    <motion.div className="panel" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}>
+    <motion.div className="panel" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={tweenFast}>
       <div className="ph">
         <div className="ptitle">👥 Team Members</div>
         <motion.button className="btn bp btn-sm" onClick={() => setShowInvite(s=>!s)} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
@@ -597,7 +597,7 @@ function TwoFactorCard({ users, onChanged }: { users: UserRow[]; onChanged: () =
   }
 
   return (
-    <motion.div className="panel" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}>
+    <motion.div className="panel" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={tweenFast}>
       <div className="ph">
         <div className="ptitle">🔐 Two-factor authentication</div>
         {enabled === null ? <span className="td3" style={{ fontSize: 12.5 }}>—</span>
@@ -678,7 +678,7 @@ function ChangePasswordCard() {
 
   return (
     <motion.div className="panel" style={{ marginBottom: 14 }}
-      initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}>
+      initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={tweenFast}>
       <div className="ph"><div className="ptitle">🔐 Your password</div></div>
       <div className="pb">
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
@@ -739,7 +739,7 @@ function ClusterTab() {
       : <span className="bdg bcy">standalone</span>;
 
   return (
-    <motion.div className="panel" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}>
+    <motion.div className="panel" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={tweenFast}>
       <div className="ph">
         <div className="ptitle">⚡ Cluster Status</div>
         {headBadge}
@@ -876,7 +876,7 @@ function NotificationsTab() {
   const isNet = form.type === "syslog" || form.type === "cef";
 
   return (
-    <motion.div className="panel" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}>
+    <motion.div className="panel" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={tweenFast}>
       <div className="ph">
         <div className="ptitle">🔔 Notification Channels</div>
         <motion.button className="btn bc btn-sm" onClick={() => setAdding(a => !a)} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
@@ -1012,7 +1012,7 @@ function ManagementTLSTab() {
 
   const d = daysLeft(info?.expires_at);
   return (
-    <motion.div className="panel" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={spring}>
+    <motion.div className="panel" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={tweenFast}>
       <div className="ph">
         <div className="ptitle">🔐 Management Console Certificate</div>
         {info && !info.self_signed && (
