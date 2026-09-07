@@ -499,6 +499,10 @@ struct ServerState {
     dlp_map: Arc<ArcSwap<DlpMap>>,
     modules: Arc<ModulesState>,
     plugin_runtime: Arc<ArcSwap<PluginRuntime>>,
+    /// Per-site plugin selection, swapped together with the runtime above.
+    site_plugins: Arc<ArcSwap<SitePluginMap>>,
+    /// Names a site asked for that are not loaded (reported at /healthz).
+    unresolved_plugins: Arc<ArcSwap<UnresolvedPlugins>>,
     ml_engine: Arc<MlEngine>,
     ebpf: Arc<EbpfManager>,
     /// ACME/TLS certificate manager — hot-swaps certs without listener restart.
@@ -1113,12 +1117,23 @@ impl ProxyServer {
             jwks: jwks::JwksCache::new(),
         });
 
-        let plugin_runtime = build_plugin_runtime(&cfg).unwrap_or_else(|e| {
+        let (plugin_runtime, manifest_plugins) = build_plugin_runtime(&cfg).unwrap_or_else(|e| {
             warn!("failed to load plugins: {e:#}");
-            PluginRuntime::new().expect("create empty plugin runtime")
+            (
+                PluginRuntime::new().expect("create empty plugin runtime"),
+                SitePluginMap::new(),
+            )
         });
+        // Resolve the per-site selection at boot as well as on reload: a node
+        // that had just started used to run nothing a site had named.
+        let (startup_site_plugins, startup_unresolved) =
+            resolve_site_plugins(&cfg, &plugin_runtime, manifest_plugins);
         let plugin_runtime: Arc<ArcSwap<PluginRuntime>> =
             Arc::new(ArcSwap::new(Arc::new(plugin_runtime)));
+        let site_plugins: Arc<ArcSwap<SitePluginMap>> =
+            Arc::new(ArcSwap::new(Arc::new(startup_site_plugins)));
+        let unresolved_plugins: Arc<ArcSwap<UnresolvedPlugins>> =
+            Arc::new(ArcSwap::new(Arc::new(startup_unresolved)));
 
         let ml_engine = {
             let model_dir = std::path::Path::new("ml-models");
@@ -1215,6 +1230,8 @@ impl ProxyServer {
             dlp_map: Arc::clone(&dlp_map),
             modules: Arc::clone(&modules),
             plugin_runtime: Arc::clone(&plugin_runtime),
+            site_plugins: Arc::clone(&site_plugins),
+            unresolved_plugins: Arc::clone(&unresolved_plugins),
             ml_engine: Arc::clone(&ml_engine),
             ebpf: Arc::clone(&ebpf),
             cert_manager,
@@ -1237,6 +1254,8 @@ impl ProxyServer {
             let dlp_swap = Arc::clone(&dlp_map);
             let modules_ref = Arc::clone(&modules);
             let plugin_swap = Arc::clone(&plugin_runtime);
+            let site_plugin_swap = Arc::clone(&site_plugins);
+            let unresolved_swap = Arc::clone(&unresolved_plugins);
             let uploaded_ref = Arc::clone(&uploaded_plugins);
             // Wakes the engine rebuild the instant new sites are published,
             // instead of leaving it to the 5s poll below. See ENGINES_WARMING.
@@ -1249,6 +1268,8 @@ impl ProxyServer {
                     let ds = Arc::clone(&dlp_swap);
                     let mr = Arc::clone(&modules_ref);
                     let ps = Arc::clone(&plugin_swap);
+                    let sp_swap = Arc::clone(&site_plugin_swap);
+                    let un_swap = Arc::clone(&unresolved_swap);
                     let up_cache = Arc::clone(&uploaded_ref);
                     let handle = tokio::spawn(async move {
                         let mut last_ptr = Arc::as_ptr(&cw.load_full()) as usize;
@@ -1293,7 +1314,12 @@ impl ProxyServer {
                                 // back — the module stayed "enabled" in the UI while
                                 // silently no longer running.
                                 match build_full_plugin_runtime(&current, &up_cache) {
-                                    Ok((new_pr, names, rejected)) => {
+                                    Ok((new_pr, per_site, names, rejected, unresolved)) => {
+                                        // Store the selection FIRST: a request that
+                                        // reads the new runtime with the old map
+                                        // would run a module the site never named.
+                                        sp_swap.store(Arc::new(per_site));
+                                        un_swap.store(Arc::new(unresolved));
                                         ps.store(Arc::new(new_pr));
                                         info!(
                                             uploaded = names.len(),
@@ -1420,6 +1446,8 @@ impl ProxyServer {
         // 5s poll affordable for multi-megabyte modules.
         if let Some(sync_url) = cfg.cluster.sync_url.clone() {
             let plugin_sync_swap = Arc::clone(&plugin_runtime);
+            let sync_site_plugin_swap = Arc::clone(&site_plugins);
+            let sync_unresolved_swap = Arc::clone(&unresolved_plugins);
             let plugin_sync_cfg = Arc::clone(&state.config);
             let sync_cache = Arc::clone(&uploaded_plugins);
             let secs = cfg.cluster.sync_interval_secs.max(1);
@@ -1579,7 +1607,7 @@ impl ProxyServer {
                     // Rebuild from the local manifest set plus every uploaded module,
                     // so file-configured plugins (dev, site.waf.plugins) survive too.
                     let current = plugin_sync_cfg.load_full();
-                    let (rt, loaded, rejected) =
+                    let (rt, per_site, loaded, rejected, unresolved) =
                         match build_full_plugin_runtime(&current, &sync_cache) {
                             Ok(v) => v,
                             Err(e) => {
@@ -1587,6 +1615,8 @@ impl ProxyServer {
                                 continue;
                             }
                         };
+                    sync_site_plugin_swap.store(Arc::new(per_site));
+                    sync_unresolved_swap.store(Arc::new(unresolved));
                     plugin_sync_swap.store(Arc::new(rt));
                     have = next;
                     info!(
@@ -3319,7 +3349,18 @@ async fn proxy_inner(
     // WAF phase 1: rate limit → bot → GeoIP → rule engine → plugins.
     {
         let pr = state.plugin_runtime.load();
-        phase1_headers(ctx, site, &engine_map, &state.modules, &pr).await?;
+        let site_plugin_names = site
+            .and_then(|s| state.site_plugins.load().get(&s.id).cloned())
+            .unwrap_or_default();
+        phase1_headers(
+            ctx,
+            site,
+            &engine_map,
+            &state.modules,
+            &pr,
+            &site_plugin_names,
+        )
+        .await?;
     }
 
     // Browser challenge (Proof-of-Work) — serve an interstitial or, if the
@@ -4017,6 +4058,10 @@ async fn phase1_headers(
     engines: &RuleEngineMap,
     modules: &ModulesState,
     plugin_runtime: &PluginRuntime,
+    // The plugins THIS SITE runs. Empty means none: plugins are opt-in per
+    // site, so a module being loaded on the node is not permission to judge
+    // every site's traffic with it.
+    site_plugins: &[String],
 ) -> anyhow::Result<()> {
     let Some(site) = site else { return Ok(()) };
     if site.waf.mode == WafMode::Off {
@@ -4328,9 +4373,9 @@ async fn phase1_headers(
         }
     }
 
-    // --- WASM plugins ---
-    if still_evaluating(ctx) {
-        for plugin_name in &plugin_runtime.plugin_names() {
+    // --- WASM plugins (only those this site opted into) ---
+    if still_evaluating(ctx) && !site_plugins.is_empty() {
+        for plugin_name in site_plugins {
             let result = plugin_runtime.evaluate_plugin(plugin_name, ctx).await;
             if result.anomaly_score_delta > 0 {
                 ctx.add_engine_score("plugin", result.anomaly_score_delta);
@@ -5444,6 +5489,41 @@ fn build_geoip_map(cfg: &SentinelConfig) -> GeoIpMap {
 /// Same shape, and same remedy, as the `ebpf` block below: kernel XDP silently
 /// ran in software for six weeks with a single startup WARN as the only trace,
 /// until /healthz was made to say so.
+/// Plugin picture for `/healthz`: modules held, who runs them, and any site
+/// asking for one that is absent.
+fn plugin_status(
+    rt: &PluginRuntime,
+    per_site: &SitePluginMap,
+    unresolved: &UnresolvedPlugins,
+) -> serde_json::Value {
+    let mut loaded = rt.plugin_names();
+    loaded.sort();
+    // Reverse the map so an operator reading this sees, per plugin, which sites
+    // it judges — the question you actually ask before enabling one.
+    let mut by_plugin: std::collections::BTreeMap<&str, Vec<&str>> = Default::default();
+    for (site, names) in per_site {
+        for n in names {
+            by_plugin.entry(n.as_str()).or_default().push(site.as_str());
+        }
+    }
+    let running: usize = by_plugin.len();
+    serde_json::json!({
+        "loaded": loaded,
+        "running_on_at_least_one_site": running,
+        // A module loaded but selected by no site: it costs memory and nothing else.
+        "loaded_but_unused": loaded
+            .iter()
+            .filter(|n| !by_plugin.contains_key(n.as_str()))
+            .cloned()
+            .collect::<Vec<String>>(),
+        "per_plugin_sites": by_plugin,
+        "unresolved": unresolved
+            .iter()
+            .map(|(site, name)| serde_json::json!({ "site": site, "plugin": name }))
+            .collect::<Vec<_>>(),
+    })
+}
+
 fn geoip_status(cfg: &SentinelConfig, map: &GeoIpMap) -> serde_json::Value {
     let mut configured = 0usize;
     let mut active = 0usize;
@@ -5707,14 +5787,33 @@ fn load_site_engine(site: &SiteConfig) -> anyhow::Result<RuleEngine> {
         .with_context(|| format!("compiling rules for site '{}'", site.id))
 }
 
-fn build_plugin_runtime(cfg: &SentinelConfig) -> anyhow::Result<PluginRuntime> {
+/// Which plugins each site runs: site id → plugin names, in policy order.
+///
+/// The request path used to iterate EVERY loaded module for EVERY site, so
+/// enabling one plugin put it in front of all traffic on the node. This map is
+/// the per-site selection; a site with no entry runs none.
+pub type SitePluginMap = HashMap<String, Vec<String>>;
+
+/// Plugin names a site asked for that are not loaded on this node — a typo, or
+/// a module the control plane has not synced yet. Surfaced at `/healthz` rather
+/// than dropped, so "enabled but never runs" cannot hide.
+pub type UnresolvedPlugins = Vec<(String, String)>;
+
+fn build_plugin_runtime(cfg: &SentinelConfig) -> anyhow::Result<(PluginRuntime, SitePluginMap)> {
     let mut rt = PluginRuntime::new()?;
+    let mut per_site: SitePluginMap = HashMap::new();
     let mut loaded = 0usize;
     let mut failed = 0usize;
     for site in &cfg.sites {
         for manifest_path in &site.waf.plugins {
             match rt.load_from_manifest(std::path::Path::new(manifest_path)) {
-                Ok(()) => loaded += 1,
+                // A manifest listed by a site is that site's own choice, so the
+                // module it declares runs for that site without being named
+                // again in `enabled_plugins`.
+                Ok(name) => {
+                    per_site.entry(site.id.clone()).or_default().push(name);
+                    loaded += 1;
+                }
                 Err(e) => {
                     warn!(site = %site.id, path = %manifest_path, "plugin load failed: {e:#}");
                     failed += 1;
@@ -5725,7 +5824,7 @@ fn build_plugin_runtime(cfg: &SentinelConfig) -> anyhow::Result<PluginRuntime> {
     if loaded > 0 || failed > 0 {
         info!(loaded, failed, "plugin runtime built");
     }
-    Ok(rt)
+    Ok((rt, per_site))
 }
 
 /// Cache of plugins uploaded through the control plane: name → (sha256, module).
@@ -5742,11 +5841,55 @@ type UploadedPlugins = Arc<DashMap<String, (String, Vec<u8>)>>;
 /// swapping the result in unloads all uploaded plugins, which is a silent
 /// protection outage: the module is still installed and enabled in the UI, the
 /// node reports no error, and the plugin simply stops running.
+/// Resolve `waf.enabled_plugins` for every site against the modules this node
+/// actually holds, starting from the per-site manifest entries.
+///
+/// Called from BOTH build paths on purpose: applying it only in the hot-reload
+/// path meant a freshly booted node ran no selected plugin until some unrelated
+/// config change happened to rebuild the runtime — the module was installed,
+/// enabled and named, and still never ran. Found by a local four-site probe,
+/// not by reading the code.
+fn resolve_site_plugins(
+    cfg: &SentinelConfig,
+    rt: &PluginRuntime,
+    mut per_site: SitePluginMap,
+) -> (SitePluginMap, UnresolvedPlugins) {
+    let loaded = rt.plugin_names();
+    let mut unresolved: UnresolvedPlugins = Vec::new();
+    for site in &cfg.sites {
+        for want in &site.waf.enabled_plugins {
+            if loaded.iter().any(|n| n == want) {
+                let list = per_site.entry(site.id.clone()).or_default();
+                if !list.contains(want) {
+                    list.push(want.clone());
+                }
+            } else {
+                unresolved.push((site.id.clone(), want.clone()));
+            }
+        }
+    }
+    for (site, name) in &unresolved {
+        warn!(
+            site = %site, plugin = %name,
+            "site policy names a plugin that is not installed on this node — it will NOT run. \
+             Install and enable it in the console, or remove it from the site's policy. \
+             Queryable at /healthz -> plugins.unresolved."
+        );
+    }
+    (per_site, unresolved)
+}
+
 fn build_full_plugin_runtime(
     cfg: &SentinelConfig,
     uploaded: &UploadedPlugins,
-) -> anyhow::Result<(PluginRuntime, Vec<String>, usize)> {
-    let mut rt = build_plugin_runtime(cfg)?;
+) -> anyhow::Result<(
+    PluginRuntime,
+    SitePluginMap,
+    Vec<String>,
+    usize,
+    UnresolvedPlugins,
+)> {
+    let (mut rt, manifest_map) = build_plugin_runtime(cfg)?;
     let mut loaded = Vec::new();
     let mut rejected = 0usize;
     for entry in uploaded.iter() {
@@ -5762,7 +5905,8 @@ fn build_full_plugin_runtime(
         }
     }
     loaded.sort();
-    Ok((rt, loaded, rejected))
+    let (per_site, unresolved) = resolve_site_plugins(cfg, &rt, manifest_map);
+    Ok((rt, per_site, loaded, rejected, unresolved))
 }
 
 // ---------------------------------------------------------------------------
@@ -7316,6 +7460,16 @@ fn health_response(state: &ServerState) -> Response<BoxBody> {
         // the field that matters — non-empty means a site's country policy is
         // displayed and not applied, because no MaxMind database is present.
         "geoip": geoip_status(&state.config.load(), &state.modules.geoip_map.load()),
+        // WASM plugins. `loaded` is what this node holds; `per_site` is who
+        // actually runs each one (plugins are opt-in per site since 2026-09-07 —
+        // before that every loaded module judged every site's traffic).
+        // `unresolved` is a site naming a plugin this node does not have: it
+        // will NOT run, and that must be visible rather than silently inert.
+        "plugins": plugin_status(
+            &state.plugin_runtime.load(),
+            &state.site_plugins.load(),
+            &state.unresolved_plugins.load(),
+        ),
         // Global IOC enforcement: is it on, and if not, why not? `active` is the
         // honest summary; `configured` only means a sync URL exists. There was no
         // `threat_intel` key here at all, which is how a node serving every
@@ -10389,6 +10543,126 @@ mod block_page_tests {
                 "detection reason leaked with Accept={accept:?}: {body}"
             );
         }
+    }
+
+    /// A site with only the fields this test cares about; SiteConfig has no
+    /// Default, so the rest is spelled out once here.
+    fn plugin_site(id: &str, names: Vec<&str>) -> SiteConfig {
+        SiteConfig {
+            id: id.to_string(),
+            tenant_id: String::new(),
+            domains: vec![format!("{id}.local")],
+            upstream: sentinel_core::config::UpstreamConfig {
+                load_balancer: sentinel_core::config::LoadBalancerStrategy::RoundRobin,
+                servers: vec![],
+                health_check: None,
+                timeout_secs: None,
+                websocket: false,
+                host_header: None,
+                keepalive: true,
+                connect_timeout_secs: None,
+                sni_name: None,
+            },
+            waf: sentinel_core::config::WafConfig {
+                enabled_plugins: names.into_iter().map(String::from).collect(),
+                ..Default::default()
+            },
+            plugins: vec![],
+            tls: Default::default(),
+            origin: Default::default(),
+        }
+    }
+
+    /// Plugins are opt-in per site. Before 2026-09-07 the request path ran every
+    /// loaded module for every site, so enabling one plugin to try it on a test
+    /// site put it in front of production traffic too. These tests pin the
+    /// selection: a site gets its own manifest plugins plus the installed ones it
+    /// names, nothing else, and a name that is not loaded is reported.
+    #[test]
+    fn per_site_plugin_selection_is_opt_in() {
+        let cfg = SentinelConfig {
+            sites: vec![
+                plugin_site("prod", vec![]),
+                plugin_site("staging", vec!["scanner-guard"]),
+                plugin_site("typo", vec!["scaner-guard"]),
+            ],
+            ..Default::default()
+        };
+
+        // Pretend the control plane installed one module.
+        let uploaded: UploadedPlugins = Arc::new(DashMap::new());
+        uploaded.insert(
+            "scanner-guard".to_string(),
+            ("sha".to_string(), minimal_plugin_wasm()),
+        );
+
+        let (rt, per_site, loaded, rejected, unresolved) =
+            build_full_plugin_runtime(&cfg, &uploaded).expect("build runtime");
+        assert_eq!(rejected, 0, "the fixture module must compile");
+        assert_eq!(loaded, vec!["scanner-guard".to_string()]);
+
+        // The site that named it runs it; the one that did not runs nothing.
+        assert_eq!(
+            per_site.get("staging").map(Vec::as_slice),
+            Some(["scanner-guard".to_string()].as_slice())
+        );
+        assert!(
+            !per_site.contains_key("prod"),
+            "a site that named no plugin must run none — this is the whole point"
+        );
+
+        // A misspelled name is reported, never silently ignored.
+        assert_eq!(
+            unresolved,
+            vec![("typo".to_string(), "scaner-guard".to_string())]
+        );
+
+        // …and healthz says all of that out loud.
+        let st = plugin_status(&rt, &per_site, &unresolved);
+        assert_eq!(st["loaded"], serde_json::json!(["scanner-guard"]));
+        assert_eq!(st["running_on_at_least_one_site"], 1);
+        assert_eq!(
+            st["per_plugin_sites"]["scanner-guard"],
+            serde_json::json!(["staging"])
+        );
+        assert_eq!(st["unresolved"][0]["site"], "typo");
+        assert_eq!(st["unresolved"][0]["plugin"], "scaner-guard");
+        assert_eq!(st["loaded_but_unused"], serde_json::json!([]));
+    }
+
+    /// A module nobody selected is reported as unused rather than looking active.
+    #[test]
+    fn a_loaded_plugin_no_site_selected_is_reported_unused() {
+        let cfg = SentinelConfig {
+            sites: vec![plugin_site("prod", vec![])],
+            ..Default::default()
+        };
+        let uploaded: UploadedPlugins = Arc::new(DashMap::new());
+        uploaded.insert(
+            "scanner-guard".to_string(),
+            ("sha".to_string(), minimal_plugin_wasm()),
+        );
+        let (rt, per_site, _, _, unresolved) =
+            build_full_plugin_runtime(&cfg, &uploaded).expect("build runtime");
+        let st = plugin_status(&rt, &per_site, &unresolved);
+        assert_eq!(st["running_on_at_least_one_site"], 0);
+        assert_eq!(
+            st["loaded_but_unused"],
+            serde_json::json!(["scanner-guard"])
+        );
+    }
+
+    /// Smallest module the runtime will accept: exports `evaluate`, does nothing.
+    fn minimal_plugin_wasm() -> Vec<u8> {
+        // (module (func (export "evaluate")))
+        vec![
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic + version
+            0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type: () -> ()
+            0x03, 0x02, 0x01, 0x00, // function section
+            0x07, 0x0c, 0x01, 0x08, 0x65, 0x76, 0x61, 0x6c, 0x75, 0x61, 0x74, 0x65, 0x00,
+            0x00, // export "evaluate"
+            0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b, // code: empty body
+        ]
     }
 
     /// A throttle is not a policy block: a rate-limited client must get 429 and

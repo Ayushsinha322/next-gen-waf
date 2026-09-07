@@ -273,7 +273,49 @@ func handleListPluginsReal(c *gin.Context, enf *rbac.Enforcer, store *db.Store) 
 		respondStoreError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"plugins": plugins, "tenant_id": claims.TenantID, "database": true})
+	// Which sites actually run each plugin. Enabling a plugin makes the module
+	// available to the fleet; a site runs it when its policy names it in
+	// waf_policy.enabled_plugins. Without this the page could not answer the
+	// only question that matters before enabling one — whose traffic does it
+	// judge — and an enabled-but-unselected module looked active.
+	usedBy := map[string][]string{}
+	if sites, err := store.ListSites(c.Request.Context(), claims.TenantID, claims.UserID); err == nil {
+		for _, site := range sites {
+			for _, name := range siteEnabledPlugins(site.WafPolicy) {
+				usedBy[name] = append(usedBy[name], site.Name)
+			}
+		}
+	}
+	out := make([]gin.H, 0, len(plugins))
+	for _, p := range plugins {
+		sites := usedBy[p.Name]
+		if sites == nil {
+			sites = []string{}
+		}
+		out = append(out, gin.H{
+			"id": p.ID, "tenant_id": p.TenantID, "name": p.Name, "version": p.Version,
+			"description": p.Description, "author": p.Author, "hooks": p.Hooks,
+			"permissions": p.Permissions, "sha256": p.SHA256, "size_bytes": p.SizeBytes,
+			"enabled": p.Enabled, "uploaded_by": p.UploadedBy,
+			"created_at": p.CreatedAt, "updated_at": p.UpdatedAt,
+			"sites": sites,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"plugins": out, "tenant_id": claims.TenantID, "database": true})
+}
+
+// siteEnabledPlugins reads waf_policy.enabled_plugins from a stored site row.
+func siteEnabledPlugins(raw json.RawMessage) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	var p struct {
+		EnabledPlugins []string `json:"enabled_plugins"`
+	}
+	if json.Unmarshal(raw, &p) != nil {
+		return nil
+	}
+	return p.EnabledPlugins
 }
 
 // handleUploadPlugin installs a plugin from a multipart .zip upload.

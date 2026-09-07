@@ -732,7 +732,10 @@ func handleCreateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 	// Validate BEFORE committing. An unconvertible site used to be accepted here
 	// and then silently dropped by the data-plane config sync, leaving the site
 	// unprotected while the dashboard still showed it active.
-	if problems := validateSiteConfig(req.Name, req.Domains, req.Upstream, req.WafPolicy); len(problems) > 0 {
+	if problems := append(
+		validateSiteConfig(req.Name, req.Domains, req.Upstream, req.WafPolicy),
+		validateSitePluginNames(c, store, claims.TenantID, claims.UserID, req.WafPolicy)...,
+	); len(problems) > 0 {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":    "site configuration is not usable by the data plane",
 			"problems": problems,
@@ -882,7 +885,10 @@ func handleUpdateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 		return
 	}
 	name, domains, upstream, waf := mergedSiteForValidation(*cur, req)
-	if problems := validateSiteConfig(name, domains, upstream, waf); len(problems) > 0 {
+	if problems := append(
+		validateSiteConfig(name, domains, upstream, waf),
+		validateSitePluginNames(c, store, claims.TenantID, claims.UserID, waf)...,
+	); len(problems) > 0 {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":    "the resulting site configuration is not usable by the data plane",
 			"problems": problems,
@@ -980,7 +986,10 @@ func handleValidateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 		name, domains, upstream, waf = mergedSiteForValidation(*cur, patch)
 	}
 
-	problems := validateSiteConfig(name, domains, upstream, waf)
+	problems := append(
+		validateSiteConfig(name, domains, upstream, waf),
+		validateSitePluginNames(c, store, claims.TenantID, claims.UserID, waf)...,
+	)
 	// 200 either way: the dry-run itself succeeded. `valid` carries the verdict, so
 	// a client cannot mistake "your config is bad" for "the request failed".
 	c.JSON(http.StatusOK, gin.H{
@@ -1918,7 +1927,8 @@ var knownWafPolicyKeys = map[string]struct{}{
 	"allowed_methods": {}, "api_discovery": {}, "security_headers": {},
 	"rate_limit": {}, "anti_ddos": {}, "bot_detection": {}, "geoip": {},
 	"ip_reputation": {}, "ml": {}, "jwt": {}, "graphql": {}, "grpc": {},
-	"dlp": {}, "fusion": {}, "block_page": {},
+	"enabled_plugins": {},
+	"dlp":             {}, "fusion": {}, "block_page": {},
 	// Consumed by buildRustSiteTLS into the top-level SiteConfig.tls rather
 	// than by buildRustWaf, so its absence from the struct above is correct.
 	"tls": {},
@@ -1993,6 +2003,7 @@ func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
 		GeoIP            json.RawMessage `json:"geoip"`
 		ML               json.RawMessage `json:"ml"`
 		IPReputation     json.RawMessage `json:"ip_reputation"`
+		EnabledPlugins   []string        `json:"enabled_plugins"`
 		MaxBodySize      *uint64         `json:"max_body_size"`
 		MaxURILength     *uint32         `json:"max_uri_length"`
 		MaxHeaderCount   *uint32         `json:"max_header_count"`
@@ -2092,6 +2103,17 @@ func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
 	attachRawObject(waf, "fusion", p.Fusion)
 	attachRawObject(waf, "ml", p.ML)
 	attachRawObject(waf, "ip_reputation", p.IPReputation)
+	// Per-site plugin selection. Always emitted, including empty: plugins are
+	// opt-in per site, and an absent key and an empty list mean the same thing
+	// (this site runs none) — sending it explicitly keeps "deselected on
+	// purpose" legible in a request log and in the effective-config diff.
+	names := make([]string, 0, len(p.EnabledPlugins))
+	for _, n := range p.EnabledPlugins {
+		if n = strings.TrimSpace(n); n != "" {
+			names = append(names, n)
+		}
+	}
+	waf["enabled_plugins"] = names
 	attachRawObject(waf, "block_page", p.BlockPage)
 
 	// Per-path overrides pass through verbatim as an ARRAY (attachRawObject only

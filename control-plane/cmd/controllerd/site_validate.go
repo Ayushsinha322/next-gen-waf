@@ -6,6 +6,8 @@ import (
 	"net"
 	"strings"
 
+	"github.com/gin-gonic/gin"
+
 	"github.com/your-org/sentinel-waf/control-plane/internal/db"
 )
 
@@ -43,6 +45,62 @@ func (p SiteConfigProblem) String() string { return p.Field + ": " + p.Problem }
 //
 // Returns nil when the configuration is usable. `name` and `domains` may be empty
 // for a partial update; pass the post-merge values when validating an update.
+// maxSitePlugins caps per-site plugin selection. Every selected module runs in
+// the request path for that site, so this is a latency budget, not a storage one.
+const maxSitePlugins = 16
+
+// validateSitePluginNames rejects a policy that names a plugin this tenant has
+// not installed — almost always a typo, and one that would otherwise show up
+// only as a /healthz "unresolved" entry after the config had already shipped.
+//
+// Naming an installed-but-DISABLED plugin is allowed on purpose: selecting the
+// site first and enabling the module second is exactly how a staged rollout
+// works. Until it is enabled the data plane reports it unresolved and does not
+// run it.
+func validateSitePluginNames(c *gin.Context, store *db.Store, tenantID, userID string, wafPolicy json.RawMessage) []SiteConfigProblem {
+	names := siteEnabledPlugins(wafPolicy)
+	if len(names) == 0 || store == nil {
+		return nil
+	}
+	installed, err := store.ListPlugins(c.Request.Context(), tenantID, userID)
+	if err != nil {
+		// Do not fail the write on a read error: the shape checks already ran,
+		// and the data plane reports an unknown name at /healthz.
+		return nil
+	}
+	have := make(map[string]bool, len(installed))
+	disabled := make(map[string]bool, len(installed))
+	for _, p := range installed {
+		have[p.Name] = true
+		if !p.Enabled {
+			disabled[p.Name] = true
+		}
+	}
+	var problems []SiteConfigProblem
+	for _, n := range names {
+		n = strings.TrimSpace(n)
+		if n == "" || have[n] {
+			continue
+		}
+		problems = append(problems, SiteConfigProblem{
+			Field:   "waf_policy.enabled_plugins",
+			Problem: fmt.Sprintf("%q is not an installed plugin — install it from the Plugins page first (installed: %s)", n, strings.Join(pluginNames(installed), ", ")),
+		})
+	}
+	return problems
+}
+
+func pluginNames(rows []db.PluginRow) []string {
+	if len(rows) == 0 {
+		return []string{"none"}
+	}
+	out := make([]string, 0, len(rows))
+	for _, p := range rows {
+		out = append(out, p.Name)
+	}
+	return out
+}
+
 func validateSiteConfig(name string, domains []string, upstream, wafPolicy json.RawMessage) []SiteConfigProblem {
 	var problems []SiteConfigProblem
 	add := func(field, problem string) {
@@ -128,9 +186,10 @@ func validateWafPolicyValues(raw json.RawMessage) []SiteConfigProblem {
 		return nil
 	}
 	var p struct {
-		Mode             *string `json:"mode"`
-		ParanoiaLevel    *int    `json:"paranoia_level"`
-		AnomalyThreshold *int    `json:"anomaly_threshold"`
+		Mode             *string  `json:"mode"`
+		EnabledPlugins   []string `json:"enabled_plugins"`
+		ParanoiaLevel    *int     `json:"paranoia_level"`
+		AnomalyThreshold *int     `json:"anomaly_threshold"`
 		PathOverrides    []struct {
 			PathPrefix       string          `json:"path_prefix"`
 			Mode             *string         `json:"mode"`
@@ -150,6 +209,25 @@ func validateWafPolicyValues(raw json.RawMessage) []SiteConfigProblem {
 		case "blocking", "learning", "off":
 		default:
 			add("waf_policy.mode", fmt.Sprintf("%q is not one of blocking, learning, off", *p.Mode))
+		}
+		// Per-site plugin selection: shape only here; whether the named plugin is
+		// actually installed needs the database and is checked by
+		// validateSitePluginNames at the handler.
+		if len(p.EnabledPlugins) > maxSitePlugins {
+			add("waf_policy.enabled_plugins", fmt.Sprintf("names %d plugins; the limit is %d per site", len(p.EnabledPlugins), maxSitePlugins))
+		}
+		seenPlugin := map[string]bool{}
+		for _, n := range p.EnabledPlugins {
+			trimmed := strings.TrimSpace(n)
+			switch {
+			case trimmed == "":
+				add("waf_policy.enabled_plugins", "contains an empty plugin name")
+			case len(trimmed) > 100:
+				add("waf_policy.enabled_plugins", "contains a plugin name longer than 100 characters")
+			case seenPlugin[trimmed]:
+				add("waf_policy.enabled_plugins", fmt.Sprintf("lists %q twice", trimmed))
+			}
+			seenPlugin[trimmed] = true
 		}
 	}
 	if p.ParanoiaLevel != nil && (*p.ParanoiaLevel < 1 || *p.ParanoiaLevel > 4) {

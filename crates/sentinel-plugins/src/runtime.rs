@@ -216,7 +216,10 @@ impl PluginRuntime {
     ///
     /// Reads the manifest, resolves the `.wasm` path relative to the manifest
     /// directory, and compiles the WASM binary.
-    pub fn load_from_manifest(&mut self, manifest_path: &Path) -> anyhow::Result<()> {
+    /// Load a plugin described by a manifest file and return its declared name,
+    /// so the caller can record which site asked for it (per-site selection
+    /// needs the name, and the manifest is the only place it is written).
+    pub fn load_from_manifest(&mut self, manifest_path: &Path) -> anyhow::Result<String> {
         let manifest_bytes = std::fs::read(manifest_path)
             .map_err(|e| anyhow::anyhow!("failed to read manifest {:?}: {}", manifest_path, e))?;
         let manifest = PluginManifest::from_slice(&manifest_bytes)
@@ -239,7 +242,7 @@ impl PluginRuntime {
             "plugin loaded from manifest"
         );
 
-        Ok(())
+        Ok(manifest.plugin.name)
     }
 
     /// Return the number of loaded plugins.

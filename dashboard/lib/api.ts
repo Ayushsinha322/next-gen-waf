@@ -499,6 +499,9 @@ export interface Plugin {
   uploaded_by: string;
   created_at:  string;
   updated_at:  string;
+  /** Names of sites whose policy selects this plugin. Plugins are opt-in per
+   *  site: enabling makes the module available, a site runs it when it names it. */
+  sites?:      string[];
 }
 
 /** A rule's would-have-blocked aggregation while a site runs in Learning mode. */

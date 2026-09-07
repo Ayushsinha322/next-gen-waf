@@ -609,9 +609,21 @@ pub struct WafConfig {
     pub grpc: Option<GrpcConfig>,
     pub anti_ddos: Option<AntiDdosConfig>,
     pub geoip: Option<GeoIpConfig>,
-    /// Paths to plugin manifests (`sentinel-plugin.toml` files).
+    /// Paths to plugin manifests (`sentinel-plugin.toml` files) loaded from
+    /// disk. File config only — the control plane never sets this.
     #[serde(default)]
     pub plugins: Vec<String>,
+    /// Names of control-plane-installed plugins THIS SITE runs.
+    ///
+    /// Opt-in, and deliberately so. Until 2026-09-07 there was no per-site
+    /// selection at all: enabling a plugin loaded it into one node-wide runtime
+    /// and the request path ran every loaded module for every site, so there was
+    /// no way to stage a plugin on one site before trusting it with the rest.
+    /// Enabling now makes a module AVAILABLE to the fleet; a site runs it when
+    /// its policy names it here. A name that is not installed is reported at
+    /// `/healthz -> plugins.unresolved` rather than being silently ignored.
+    #[serde(default)]
+    pub enabled_plugins: Vec<String>,
     /// Per-rule exclusions: remove specific targets from a rule to suppress false positives.
     #[serde(default)]
     pub rule_exclusions: Vec<RuleExclusion>,
