@@ -9,16 +9,24 @@ both outputs follow. Narrative and structure are in `build.py`.
 
 Two documents are built from the same data:
 
-| Output | Pages | Audience |
-|---|---|---|
-| `ESDS-WAF-Benchmark-Report-v1.0` | 24 | technical evaluators, full evidence base, appendices |
-| `Swaraj-Kavach-Benchmark-Summary-v1.0` | 2 | executives and first customer contact |
+| Output | Pages | Shape | Audience |
+|---|---|---|---|
+| `ESDS-WAF-Benchmark-Report-v1.0` | 24 | narrative, one row per configuration | technical evaluators, full evidence base, appendices |
+| `Swaraj-Kavach-Benchmark-Summary-v1.0` | 2 | narrative, one row per configuration | executives, first customer contact |
+| `Swaraj-Kavach-Competitive-Comparison-v1.0` | 2 | **matrix, one column per product** | competitive discussions, bid responses |
+
+The comparison document is the one to reach for in a competitive conversation: rows are
+dimensions and columns are products, so a reader compares across a row instead of
+hunting between tables. Our column is shaded and bold; the best figure in each row is
+green and each failure is red. Where a competitor has two sensitivity settings both
+values appear in the cell, shipped default first.
 
 ```bash
 pip install python-docx matplotlib      # only dependencies
 
 python3 charts.py        && python3 build.py         # the 24-page report
 python3 charts_brief.py  && python3 build_brief.py   # the 2-page summary
+python3 build_matrix.py                              # the 2-page comparison matrix
 libreoffice --headless --convert-to pdf *.docx
 ```
 
@@ -64,3 +72,15 @@ never "the Swaraj Kavach refuses". Two traps when renaming: the article and the 
 often sit in *different* adjacent string literals, and the old name was itself split
 across a line break, so a plain search-and-replace on the source misses both. Verify a
 rename against the rendered PDF with `pdftotext`, not against the source.
+
+
+## The table helper
+
+`build_helpers.table()` carries the column shading and per-cell colouring the matrix
+document needs: `shade_cols={1: SH_OURS}` tints a whole column including its header,
+`bold_cols=(1,)` bolds it, and `col_colors={(row, col): COLOUR}` marks winners and
+failures individually.
+
+One trap: the bold flag must be coerced with `bool()`. `is_group or (col_colors and ...)`
+returns the empty dict when `col_colors` is `{}`, and python-docx rejects anything that
+is not exactly True, False or None with a `TypeError` deep inside the XML layer.

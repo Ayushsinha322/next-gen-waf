@@ -120,7 +120,7 @@ def callout(doc, tag, lines, accent=True):
 
 def table(doc, headers, rows, widths=None, align=None, caption=None,
           note=None, font=8.5, group_rows=(), ours_rows=(), col_colors=None,
-          mono=True):
+          mono=True, shade_cols=None, bold_cols=()):
     """headers: list[str]; rows: list[list[str]]. align: 'l'/'r'/'c' per column."""
     if caption:
         p = doc.add_paragraph(); no_space(p, before=8, after=3); keep_with_next(p)
@@ -137,6 +137,7 @@ def table(doc, headers, rows, widths=None, align=None, caption=None,
     th = OxmlElement("w:tblHeader"); trpr.append(th)          # repeat on page break
     for i, h in enumerate(headers):
         c = hdr.cells[i]; shade(c, SH_HEAD)
+        if shade_cols and i in shade_cols: shade(c, "07564A")
         cell_borders(c, bottom="0A6A5C")
         cell_margins(c, top=70, bottom=70)
         p = c.paragraphs[0]; no_space(p); p.alignment = amap[align[i]]
@@ -150,6 +151,7 @@ def table(doc, headers, rows, widths=None, align=None, caption=None,
             c = r.cells[i]
             if is_group:   shade(c, SH_GROUP)
             elif is_ours:  shade(c, SH_OURS)
+            elif shade_cols and i in shade_cols: shade(c, shade_cols[i])
             elif ri % 2:   shade(c, SH_ZEBRA)
             cell_borders(c, bottom="DDE4E1")
             cell_margins(c, top=52, bottom=52)
@@ -157,7 +159,8 @@ def table(doc, headers, rows, widths=None, align=None, caption=None,
             txt = str(v)
             col = INK
             if col_colors and (ri, i) in col_colors: col = col_colors[(ri, i)]
-            bold = is_group or is_ours or (col_colors and (ri, i) in col_colors)
+            bold = bool(is_group or is_ours or i in bold_cols
+                        or (col_colors and (ri, i) in col_colors))
             fname = BODY_FONT if (i == 0 or not mono) else MONO_FONT
             if is_group: fname = BODY_FONT
             set_font(p.add_run(txt), fname, font - (0.8 if is_group else 0), col,
