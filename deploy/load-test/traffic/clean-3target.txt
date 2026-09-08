@@ -1,0 +1,20 @@
+# Clean 3-target mix used by the BunkerWeb and SafeLine head-to-heads.
+# Replace AUTH with host:port and @LOGIN_BODY with a path to a file containing
+#   username=alice&password=s3cret
+# Substitute with:  sed -e "s#AUTH#127.0.0.1:18091#g" -e "s#@LOGIN_BODY#@$PWD/login.body#"
+#
+# NOTE: the body is deliberately two fields. Adding a third (remember=1) is
+# blocked by Sentinel's ML classifier as of 2026-09-08 — a real false positive,
+# recorded in SAFELINE-COMPARISON-2026-09.md. Do not "fix" this file by removing
+# the POST arm; the POST arm is what found the bug.
+GET http://AUTH/
+Host: localhost
+
+GET http://AUTH/products?category=shoes&page=2
+Host: localhost
+
+POST http://AUTH/login
+Host: localhost
+Content-Type: application/x-www-form-urlencoded
+@LOGIN_BODY
+

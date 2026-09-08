@@ -1,0 +1,13 @@
+# Attack 3-target mix (SQLi, XSS, traversal) — every request must be blocked.
+# Replace AUTH with host:port. The Host header is required: BunkerWeb serves its
+# default landing page without it, with neither the proxy nor CRS engaged, which
+# silently scores as "not blocked".
+GET http://AUTH/?id=1%27%20OR%20%271%27=%271
+Host: localhost
+
+GET http://AUTH/?q=%3Cscript%3Ealert(1)%3C%2Fscript%3E
+Host: localhost
+
+GET http://AUTH/?file=..%2F..%2F..%2F..%2Fetc%2Fpasswd
+Host: localhost
+
