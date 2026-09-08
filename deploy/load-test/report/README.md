@@ -7,12 +7,28 @@ revision never means re-editing two files.
 The measured numbers live in `content.py` and nowhere else. Change a figure there and
 both outputs follow. Narrative and structure are in `build.py`.
 
+Two documents are built from the same data:
+
+| Output | Pages | Audience |
+|---|---|---|
+| `ESDS-WAF-Benchmark-Report-v1.0` | 24 | technical evaluators, full evidence base, appendices |
+| `Swaraj-Kavach-Benchmark-Summary-v1.0` | 2 | executives and first customer contact |
+
 ```bash
-pip install python-docx matplotlib          # only dependencies
-python3 charts.py                           # writes figs/*.png at 200 dpi
-python3 build.py                             # writes ESDS-WAF-Benchmark-Report-v1.0.docx
-libreoffice --headless --convert-to pdf ESDS-WAF-Benchmark-Report-v1.0.docx
+pip install python-docx matplotlib      # only dependencies
+
+python3 charts.py        && python3 build.py         # the 24-page report
+python3 charts_brief.py  && python3 build_brief.py   # the 2-page summary
+libreoffice --headless --convert-to pdf *.docx
 ```
+
+### Keeping the summary at exactly two pages
+
+It is tuned to fill two pages with no third. The margins are 1.35 cm top and
+1.55 cm sides, body text is 8.8 pt and tables 7.6 pt. Adding a figure or more than
+about six lines of prose pushes it to three pages — a throughput chart was tried on
+page 2 and had to be removed for exactly that reason. After any edit, check
+`pdfinfo | grep Pages` before shipping.
 
 ## Why it is built this way
 
