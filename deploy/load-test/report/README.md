@@ -1,6 +1,6 @@
 # Customer-facing benchmark report generator
 
-Builds the enterprise comparison document (Next-Gen ESDS WAF vs BunkerWeb 1.6.9 vs
+Builds the enterprise comparison document (Swaraj Kavach vs BunkerWeb 1.6.9 vs
 SafeLine 9.4.1) as a Word document, then a PDF. One source, both formats, so a
 revision never means re-editing two files.
 
@@ -36,5 +36,15 @@ and every dimension on which a competitor beats us. Do not remove those to make 
 document more flattering — the credibility of the other 23 pages depends on them, and
 a customer who finds an undisclosed weakness later discounts everything else.
 
-Product naming follows the standing rule: **Next-Gen ESDS WAF** in customer-facing
-material, `sentinel` only where it appears in commands and log output.
+## Product naming
+
+Customer-facing material names the product **Swaraj Kavach**, with the descriptor
+"Next-Generation Web Application Firewall" on first mention only. `sentinel` is the
+internal engineering codename and appears only in commands, configuration and log
+output.
+
+The name is a proper noun, so it takes no definite article: "Swaraj Kavach refuses",
+never "the Swaraj Kavach refuses". Two traps when renaming: the article and the name
+often sit in *different* adjacent string literals, and the old name was itself split
+across a line break, so a plain search-and-replace on the source misses both. Verify a
+rename against the rendered PDF with `pdftotext`, not against the source.

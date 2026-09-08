@@ -44,7 +44,7 @@ def barh(fname, labels, values, colors, xlabel, fmt, xmax=None, figh=None, note=
     fig.savefig(os.path.join(OUT, fname)); plt.close(fig)
 
 # ---- 1. detection: attacks blocked vs benign passed -----------------------
-arms = ["Next-Gen ESDS WAF\n(CRS PL2 + ML)", "SafeLine 9.4.1\n(all modules strict)",
+arms = ["Swaraj Kavach\n(CRS PL2 + ML)", "SafeLine 9.4.1\n(all modules strict)",
         "SafeLine 9.4.1\n(shipped defaults)", "BunkerWeb 1.6.9\n(PL4, maximum)",
         "BunkerWeb 1.6.9\n(PL1, shipped)"]
 atk = [99.24, 60.47, 47.38, 74.01, 47.09]
@@ -73,7 +73,7 @@ fig.savefig(os.path.join(OUT, "fig1-detection.png")); plt.close(fig)
 
 # ---- 2. clean throughput --------------------------------------------------
 barh("fig2-throughput.png",
-     ["Origin with no WAF\n(theoretical ceiling)", "Next-Gen ESDS WAF",
+     ["Origin with no WAF\n(theoretical ceiling)", "Swaraj Kavach",
       "SafeLine (defaults)", "SafeLine (strict)", "BunkerWeb (PL1)"],
      [32190, 7595, 6006, 4688, 2000], [NEU, OURS, SL, SL, BW],
      "Sustained requests per second, legitimate traffic",
@@ -81,8 +81,8 @@ barh("fig2-throughput.png",
 
 # ---- 3. CPU per request --------------------------------------------------
 barh("fig3-cpu.png",
-     ["SafeLine, request path\n(legitimate traffic)", "Next-Gen ESDS WAF\n(legitimate traffic)",
-      "Next-Gen ESDS WAF\n(attack traffic)", "SafeLine, request path\n(attack traffic)",
+     ["SafeLine, request path\n(legitimate traffic)", "Swaraj Kavach\n(legitimate traffic)",
+      "Swaraj Kavach\n(attack traffic)", "SafeLine, request path\n(attack traffic)",
       "BunkerWeb\n(legitimate traffic)"],
      [419, 636, 648, 724, 2918], [SL, OURS, OURS, SL, BW],
      "CPU microseconds consumed per request (lower is better)",
@@ -91,7 +91,7 @@ barh("fig3-cpu.png",
 
 # ---- 4. requests lost under sustained attack -----------------------------
 barh("fig4-attack.png",
-     ["Next-Gen ESDS WAF", "SafeLine (defaults)", "SafeLine (strict)",
+     ["Swaraj Kavach", "SafeLine (defaults)", "SafeLine (strict)",
       "BunkerWeb (PL1, error page off)", "BunkerWeb (PL1, as shipped)"],
      [0, 0, 0, 4672, 13073], [OURS, SL, SL, BW, BAD],
      "Requests that received no response, of 45,000 sent at 3,000/s",
@@ -100,7 +100,7 @@ barh("fig4-attack.png",
 
 # ---- 5. memory -----------------------------------------------------------
 barh("fig5-memory.png",
-     ["Next-Gen ESDS WAF\n(single process)", "SafeLine\n(inspection path only)",
+     ["Swaraj Kavach\n(single process)", "SafeLine\n(inspection path only)",
       "BunkerWeb\n(single container)", "SafeLine\n(complete product, 7 containers)"],
      [131, 349, 993, 1381], [OURS, SL, BW, SL],
      "Peak resident memory under load, MiB",

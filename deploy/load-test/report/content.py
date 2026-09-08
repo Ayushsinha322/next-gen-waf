@@ -2,7 +2,8 @@
 """All measured data and narrative for the benchmark report, in one place."""
 
 META = dict(
-    product   = "Next-Gen ESDS WAF",
+    product   = "Swaraj Kavach",
+    descriptor= "Next-Generation Web Application Firewall",
     codename  = "sentinel",
     build     = "92e0d46",
     title     = "Comparative Security and Performance Benchmark",
@@ -15,13 +16,14 @@ META = dict(
 )
 
 DOC_CONTROL = [
-    ["Document title",   "Next-Gen ESDS WAF — Comparative Security and Performance Benchmark"],
+    ["Document title",   "Swaraj Kavach — Comparative Security and Performance Benchmark"],
+    ["Product",           "Swaraj Kavach, next-generation web application firewall"],
     ["Version",          "1.0"],
     ["Date of issue",    "8 September 2026"],
     ["Status",           "Final"],
     ["Classification",   "Confidential — for customer and executive distribution"],
     ["Prepared by",      "Research and Development, Cyber Security Special Interest Group"],
-    ["Product build",    "Next-Gen ESDS WAF, build 92e0d46"],
+    ["Build identifier", "92e0d46 (internal engineering codename: sentinel)"],
     ["Products compared","BunkerWeb 1.6.9 (all-in-one); SafeLine 9.4.1 Community"],
     ["Measurement date", "All results captured 8 September 2026 in a single test session"],
     ["Supersedes",       "Preliminary single-product comparisons dated 6 September 2026"],
@@ -49,7 +51,7 @@ DETECT_HEAD = dict(
                "Attacks\nblocked", "API attacks\nblocked",
                "Legitimate\nallowed", "Legitimate\nblocked"],
     rows = [
-        ["Next-Gen ESDS WAF (CRS PL2 + ML)", "99.64%", "99.24%", "100%", "99.29%", "1 of 141"],
+        ["Swaraj Kavach (CRS PL2 + ML)", "99.64%", "99.24%", "100%", "99.29%", "1 of 141"],
         ["SafeLine 9.4.1, shipped defaults", "58.28%", "47.38%", "42.86%", "100.00%", "0 of 141"],
         ["SafeLine 9.4.1, all modules strict", "75.30%", "60.47%", "71.43%", "97.87%", "3 of 141"],
         ["BunkerWeb 1.6.9, PL1 (shipped)", "59.47%", "47.09%", "50.00%", "90.78%", "13 of 141"],
@@ -57,7 +59,7 @@ DETECT_HEAD = dict(
     ],
     note = ("Composite score is the tool's own headline figure, the mean of its API and application "
             "averages. API percentages rest on different denominators (14 resolved tests for the "
-            "Next-Gen ESDS WAF, 12 for BunkerWeb, 7 for SafeLine) and are indicative only; the "
+            "Swaraj Kavach, 12 for BunkerWeb, 7 for SafeLine) and are indicative only; the "
             "'attacks blocked' column is the like-for-like comparison. BunkerWeb at PL4 retains a "
             "68.51% composite while blocking every one of the 141 legitimate requests, which is why "
             "the two right-hand columns must always be read together with the first."),
@@ -108,7 +110,7 @@ PERF_CLEAN = dict(
                "99th percentile\nlatency", "99.9th percentile", "Failed\nrequests"],
     rows = [
         ["Origin server with no WAF (ceiling)", "32,190 /s", "1.74 ms", "4.79 ms", "13.5 ms", "0"],
-        ["Next-Gen ESDS WAF", "7,595 /s", "7.45 ms", "16.3 ms", "50.6 ms", "0"],
+        ["Swaraj Kavach", "7,595 /s", "7.45 ms", "16.3 ms", "50.6 ms", "0"],
         ["SafeLine, shipped defaults", "6,006 /s", "10.7 ms", "14.6 ms", "26.1 ms", "0"],
         ["SafeLine, all modules strict", "4,688 /s", "13.1 ms", "22.9 ms", "45.6 ms", "0"],
         ["BunkerWeb, PL1", "2,000 /s", "27.5 ms", "94.4 ms", "126 ms", "0"],
@@ -119,7 +121,7 @@ PERF_ATTACK = dict(
     headers = ["Target", "Refusal\nresponse size", "Sustained\nblock rate",
                "Median\nlatency", "99th percentile"],
     rows = [
-        ["Next-Gen ESDS WAF", "125 B", "7,870 /s", "7.49 ms", "15.8 ms"],
+        ["Swaraj Kavach", "125 B", "7,870 /s", "7.49 ms", "15.8 ms"],
         ["SafeLine, shipped defaults", "15,604 B", "4,573 /s", "12.0 ms", "29.7 ms"],
         ["SafeLine, all modules strict", "15,604 B", "4,054 /s", "13.1 ms", "37.4 ms"],
         ["BunkerWeb PL1, error page enabled", "69,283 B", "376 /s", "135 ms", "722 ms"],
@@ -137,7 +139,7 @@ PERF_FIXED = dict(
     headers = ["Target", "1,000/s\nmedian", "1,000/s\n99th pct", "1,000/s\nlost",
                "3,000/s\nmedian", "3,000/s\n99th pct", "3,000/s\nlost"],
     rows = [
-        ["Next-Gen ESDS WAF", "0.65 ms", "1.63 ms", "0", "0.93 ms", "8.16 ms", "0"],
+        ["Swaraj Kavach", "0.65 ms", "1.63 ms", "0", "0.93 ms", "8.16 ms", "0"],
         ["SafeLine, shipped defaults", "0.81 ms", "1.97 ms", "0", "1.19 ms", "59.1 ms", "0"],
         ["SafeLine, all modules strict", "0.78 ms", "1.33 ms", "0", "1.34 ms", "14.1 ms", "0"],
         ["BunkerWeb PL1, error page enabled", "10.8 s", "30 s", "2,404", "13.4 s", "30 s", "13,073"],
@@ -155,20 +157,20 @@ RES = dict(
                "Peak\nmemory", "Requests\nunanswered"],
     rows = [
         ["GROUP", "Legitimate traffic", "", "", "", ""],
-        ["Next-Gen ESDS WAF (single process)", "12.73 s", "0.636 ms", "0.63", "131 MiB", "0"],
+        ["Swaraj Kavach (single process)", "12.73 s", "0.636 ms", "0.63", "131 MiB", "0"],
         ["SafeLine, inspection path only", "8.39 s", "0.419 ms", "0.40", "349 MiB", "0"],
         ["SafeLine, complete product (7 containers)", "11.18 s", "0.559 ms", "0.53", "1,381 MiB", "0"],
         ["BunkerWeb (single container)", "58.36 s", "2.918 ms", "2.85", "993 MiB", "0"],
         ["GROUP", "Attack traffic, every request refused", "", "", "", ""],
-        ["Next-Gen ESDS WAF (single process)", "12.96 s", "0.648 ms", "0.65", "131 MiB", "0"],
+        ["Swaraj Kavach (single process)", "12.96 s", "0.648 ms", "0.65", "131 MiB", "0"],
         ["SafeLine, inspection path only", "14.49 s", "0.724 ms", "0.70", "328 MiB", "0"],
         ["SafeLine, complete product (7 containers)", "19.79 s", "0.989 ms", "0.97", "1,449 MiB", "0"],
         ["BunkerWeb (single container)", "640.17 s", "41.5 ms", "12.70", "1,110 MiB", "4,581 of 20,000"],
     ],
     note = ("Load held identical at 1,000 requests per second for 20 seconds, 20,000 requests "
             "offered to each target. Container processor time is read from the operating system "
-            "control group, which accounts for every process inside the container; the Next-Gen "
-            "ESDS WAF is a single native process and is read from the kernel's own counters. An "
+            "control group, which accounts for every process inside the container; "
+            "Swaraj Kavach is a single native process and is read from the kernel's own counters. An "
             "idle baseline measured over an identical window was negligible for all three products, "
             "so no figure is inflated by background activity. Processor time per request is divided "
             "by requests actually answered and cores busy by real elapsed time, so that a product "
@@ -176,7 +178,7 @@ RES = dict(
 )
 
 IDLE_MEM = [
-    ["Next-Gen ESDS WAF (single process)", "131 MiB"],
+    ["Swaraj Kavach (single process)", "131 MiB"],
     ["SafeLine, inspection path (2 containers)", "568 MiB"],
     ["SafeLine, complete product (7 containers)", "1,132 MiB"],
     ["BunkerWeb (single container)", "490 MiB"],

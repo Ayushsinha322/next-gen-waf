@@ -85,18 +85,21 @@ set_font(p.add_run(M["unit"]), BODY_FONT, 9.5, MUTED)
 hrule(P(after=0), "0A6A5C", 12)
 doc.add_paragraph().paragraph_format.space_after = Pt(26)
 
-p = P(after=4)
-set_font(p.add_run(M["product"]), BODY_FONT, 15, INK2, bold=True)
-p = P(after=6, line=1.06)
-set_font(p.add_run(M["title"]), BODY_FONT, 31, INK, bold=True)
+p = P(after=1, line=1.0)
+set_font(p.add_run(M["product"]), BODY_FONT, 30, ACCENT, bold=True)
+p = P(after=14)
+set_font(p.add_run(M["descriptor"]), BODY_FONT, 11.5, INK2)
+p = P(after=6, line=1.08)
+set_font(p.add_run(M["title"]), BODY_FONT, 25, INK, bold=True)
 p = P(after=0, line=1.3)
-set_font(p.add_run(M["subtitle"]), BODY_FONT, 12.5, MUTED)
+set_font(p.add_run(M["subtitle"]), BODY_FONT, 12, MUTED)
 
 doc.add_paragraph().paragraph_format.space_after = Pt(28)
 t = table(doc, ["", ""], [
     ["Document version", M["version"]],
     ["Date of issue", M["date"]],
-    ["Product build under test", f'{M["product"]}, build {M["build"]}'],
+    ["Product under test", f'{M["product"]} — {M["descriptor"]}'],
+    ["Build identifier", f'{M["build"]} (internal codename {M["codename"]})'],
     ["Comparison products", "BunkerWeb 1.6.9 (all-in-one)\nSafeLine 9.4.1 Community"],
     ["Measurement basis", "All results captured in a single test session on identical hardware"],
     ["Classification", M["classif"]],
@@ -164,20 +167,21 @@ PAGEBREAK()
 # ================================================ 1. EXECUTIVE SUMMARY ====
 H1("1", "Executive summary")
 
-RICH([("ESDS has completed a controlled, measured comparison of the ", False),
-      ("Next-Gen ESDS WAF", True),
-      (" against the two most widely deployed free web application firewalls, "
+RICH([("ESDS has completed a controlled, measured comparison of ", False),
+      ("Swaraj Kavach", True),
+      (", its next-generation web application firewall, against the two most widely "
+       "deployed free web application firewalls, "
        "BunkerWeb 1.6.9 and SafeLine 9.4.1. All three products were tested in one "
        "continuous session on the same hardware, in front of the same origin server, "
        "using the same industry-standard attack corpus and the same load generator.", False)],
      size=11.5)
 
-RICH([("The Next-Gen ESDS WAF blocked ", False), ("99.2 per cent", True),
+RICH([("Swaraj Kavach blocked ", False), ("99.2 per cent", True),
       (" of 675 attack payloads while allowing ", False), ("99.3 per cent", True),
       (" of legitimate traffic through. The strongest configuration either competitor "
        "could reach was 74.0 per cent attack detection, and in that configuration "
        "BunkerWeb blocked every single legitimate request, making the setting unusable "
-       "in production. On sustained legitimate traffic the Next-Gen ESDS WAF handled "
+       "in production. On sustained legitimate traffic Swaraj Kavach handled "
        "7,595 requests per second against SafeLine's 6,006 and BunkerWeb's 2,000, in "
        "131 MiB of memory against 993 MiB and 1,381 MiB respectively.", False)])
 
@@ -190,7 +194,7 @@ table(doc, C.DETECT_HEAD["headers"], C.DETECT_HEAD["rows"],
 H2("Principal findings")
 BULLETS([
   [("Detection breadth is decisive and structural. ", True),
-   ("The Next-Gen ESDS WAF covers every attack class in the corpus. SafeLine records "
+   ("Swaraj Kavach covers every attack class in the corpus. SafeLine records "
     "zero detection across five complete classes — LDAP injection, mail header "
     "injection, XML injection, CRLF injection and server-side includes, 86 payloads "
     "in total — at every available setting, because its engine contains no module for "
@@ -201,11 +205,11 @@ BULLETS([
     "corpus or, at maximum sensitivity, so aggressive that it rejects all legitimate "
     "traffic. No usable setting exists between those two states.", False)],
   [("Cost per request does not change when the product starts blocking. ", True),
-   ("The Next-Gen ESDS WAF consumes 636 microseconds of processor time to allow a "
+   ("Swaraj Kavach consumes 636 microseconds of processor time to allow a "
     "request and 648 to refuse one, with memory unchanged at 131 MiB. SafeLine's "
     "processor cost rises by 73 per cent under attack and BunkerWeb's by a factor of "
     "fourteen. Predictable cost under attack is what makes capacity planning possible.", False)],
-  [("Only the Next-Gen ESDS WAF absorbed every attack flood without loss. ", True),
+  [("Only Swaraj Kavach absorbed every attack flood without loss. ", True),
    ("At 3,000 attacks per second it refused all 45,000 requests with a 99th-percentile "
     "latency of 8.16 milliseconds. BunkerWeb failed to answer 13,073 of them, and "
     "still lost 4,672 after its refusal page was reduced in size.", False)],
@@ -218,14 +222,14 @@ BULLETS([
 ])
 
 callout(doc, "For executive readers",
- [[("The competitive question this report answers is not whether the Next-Gen ESDS WAF "
+ [[("The competitive question this report answers is not whether Swaraj Kavach "
     "is faster. It is whether a commercial product can justify itself against "
     "capable free alternatives. ", False)],
   [("It can, on one specific and defensible basis: ", False),
    ("the free products each protect a subset of the attack surface and cannot be "
     "configured to protect the rest", True),
    (". SafeLine is precise but narrow. BunkerWeb is broad but cannot be set to a "
-    "usable sensitivity. The Next-Gen ESDS WAF is the only product tested that is "
+    "usable sensitivity. Swaraj Kavach is the only product tested that is "
     "simultaneously broad, precise enough for production, and stable under attack "
     "load.", False)]])
 
@@ -234,8 +238,8 @@ callout(doc, "For executive readers",
 H1("2", "Purpose, scope and audience")
 
 H2("Purpose")
-P("This document records the results of a comparative technical evaluation of the "
-  "Next-Gen ESDS WAF against two established open-source web application firewalls. "
+P("This document records the results of a comparative technical evaluation of "
+  "Swaraj Kavach against two established open-source web application firewalls. "
   "It is intended to support three decisions: whether the product's protective "
   "coverage is competitive, whether its performance is adequate for production "
   "deployment, and where engineering investment should next be directed.")
@@ -243,7 +247,7 @@ P("This document records the results of a comparative technical evaluation of th
 H2("Audience")
 BULLETS([
   [("Prospective and existing customers ", True),
-   ("evaluating the Next-Gen ESDS WAF against alternatives, including free "
+   ("evaluating Swaraj Kavach against alternatives, including free "
     "alternatives their own engineering teams may already be running.", False)],
   [("Executive and commercial stakeholders ", True),
    ("who require an evidence base for competitive claims. Every claim in this "
@@ -271,7 +275,7 @@ P("This is a laboratory measurement on a single host. It is a reliable compariso
 # ================================================= 3. PRODUCTS EVALUATED ==
 H1("3", "Products evaluated")
 
-table(doc, ["", "Next-Gen ESDS WAF", "BunkerWeb 1.6.9", "SafeLine 9.4.1"], [
+table(doc, ["", "Swaraj Kavach", "BunkerWeb 1.6.9", "SafeLine 9.4.1"], [
   ["Detection approach", "Signature engine on OWASP Core Rule Set 4.7.0, with a "
    "machine-learning classifier", "Signature engine: ModSecurity 3.0.14 with Core "
    "Rule Set 4.24.1", "Semantic analysis engine; no signature corpus"],
@@ -284,7 +288,7 @@ table(doc, ["", "Next-Gen ESDS WAF", "BunkerWeb 1.6.9", "SafeLine 9.4.1"], [
   ["Licence of tested build", "Commercial", "Open source", "Community edition"],
 ], widths=[3.3, 4.3, 4.0, 4.0], align=["l","l","l","l"], font=8.5, mono=False,
   caption="Table 2 — Products and configurations under test",
-  note="The Next-Gen ESDS WAF was measured in one configuration, its shipped detection "
+  note="Swaraj Kavach was measured in one configuration, its shipped detection "
        "profile. Both competing products were measured at shipped defaults and again at "
        "their maximum available detection setting, so that neither is represented only by "
        "its weakest configuration.")
@@ -372,7 +376,7 @@ PAGEBREAK()
 H1("5", "Security effectiveness results")
 
 H2("5.1  Headline result")
-P("The Next-Gen ESDS WAF refused 670 of 675 attack payloads and allowed 140 of 141 "
+P("Swaraj Kavach refused 670 of 675 attack payloads and allowed 140 of 141 "
   "legitimate requests. No competing configuration achieved both a higher attack "
   "detection rate and an acceptable legitimate-traffic rate.")
 
@@ -426,7 +430,7 @@ RICH([("BunkerWeb is broad but has no usable operating point. ", True),
        "corpus. Between those two configurations there is no setting that is both "
        "protective and deployable.", False)])
 
-RICH([("The Next-Gen ESDS WAF is the only product tested that is both broad and "
+RICH([("Swaraj Kavach is the only product tested that is both broad and "
        "deployable. ", True),
       ("It records complete detection in 19 of the 25 classes and no class below 87.5 "
        "per cent, while allowing 99.3 per cent of legitimate traffic. Its two weakest "
@@ -450,7 +454,7 @@ figure(doc, FIG("fig2-throughput.png"),
        "Figure 2 — Maximum sustained throughput on legitimate traffic. The unprotected "
        "origin is shown as the ceiling against which every product is working.")
 
-P("The Next-Gen ESDS WAF sustains 26 per cent more legitimate traffic than SafeLine "
+P("Swaraj Kavach sustains 26 per cent more legitimate traffic than SafeLine "
   "at its defaults, 62 per cent more than SafeLine at strict, and 3.8 times "
   "BunkerWeb. It should be stated plainly that SafeLine is a capable performer and "
   "the margin over it is modest.")
@@ -490,7 +494,7 @@ callout(doc, "The finding that matters operationally", [
    (", and SafeLine at maximum sensitivity is marginally the fastest of the three. "
     "Any claim of a large inspection-cost advantage at ordinary attack rates would "
     "not survive measurement.", False)],
-  [("Separation appears at 3,000 per second. The Next-Gen ESDS WAF holds 8.16 "
+  [("Separation appears at 3,000 per second. Swaraj Kavach holds 8.16 "
     "milliseconds at the 99th percentile and loses nothing. SafeLine also holds, more "
     "slowly. BunkerWeb ceases to function in both configurations, and reducing its "
     "refusal page from 69,283 bytes to 146 bytes raises its block rate fourfold but "
@@ -513,11 +517,11 @@ table(doc, C.RES["headers"], C.RES["rows"],
 
 figure(doc, FIG("fig3-cpu.png"),
        "Figure 4 — Processor time consumed per request. Lower is less expensive to "
-       "operate. SafeLine is the least expensive product on legitimate traffic; the "
-       "Next-Gen ESDS WAF is the least expensive on attack traffic.")
+       "operate. SafeLine is the least expensive product on legitimate traffic; "
+       "Swaraj Kavach is the least expensive on attack traffic.")
 
 H2("7.1  SafeLine is less expensive than our product on legitimate traffic")
-RICH([("This result goes against the Next-Gen ESDS WAF and is reported without "
+RICH([("This result goes against Swaraj Kavach and is reported without "
        "qualification. ", True),
       ("SafeLine handles a legitimate request for 419 microseconds of processor time "
        "against our 636, and its complete seven-container product still comes in below "
@@ -555,7 +559,7 @@ table(doc, ["Product", "Memory at rest, before any load"], C.IDLE_MEM,
       widths=[8.6, 7.0], align=["l","r"], font=9,
       caption="Table 10 — Memory at rest")
 
-RICH([("The Next-Gen ESDS WAF occupies 131 MiB and does not move. ", True),
+RICH([("Swaraj Kavach occupies 131 MiB and does not move. ", True),
       ("Its memory figure is identical on legitimate and attack traffic, at rest and "
        "under load. SafeLine's inspection path occupies between 328 and 349 MiB and its "
        "complete product between 1,132 and 1,449 MiB. BunkerWeb occupies between 490 and "
@@ -568,7 +572,7 @@ RICH([("The Next-Gen ESDS WAF occupies 131 MiB and does not move. ", True),
 # ======================================= 8. COMPETITIVE POSITIONING =======
 H1("8", "Competitive positioning")
 
-table(doc, ["Dimension", "Next-Gen ESDS WAF", "SafeLine 9.4.1", "BunkerWeb 1.6.9"], [
+table(doc, ["Dimension", "Swaraj Kavach", "SafeLine 9.4.1", "BunkerWeb 1.6.9"], [
   ["Attack coverage", "Complete across all 25 classes; lowest class 87.5%",
    "Five classes at zero, unreachable by configuration", "Complete coverage, but no usable sensitivity setting"],
   ["Precision on legitimate traffic", "99.3% allowed; one open defect (section 9.1)",
@@ -584,7 +588,7 @@ table(doc, ["Dimension", "Next-Gen ESDS WAF", "SafeLine 9.4.1", "BunkerWeb 1.6.9
 
 H2("Where each product should be expected to win")
 BULLETS([
-  [("The Next-Gen ESDS WAF ", True),
+  [("Swaraj Kavach ", True),
    ("wins wherever the customer's exposure is broad — multiple application "
     "technologies, API surfaces, inherited or third-party code — and wherever attack "
     "load must be absorbed without degradation. It is the only product tested that "
@@ -665,7 +669,7 @@ BULLETS([
   "and were excluded from its denominator by the test tool rather than counted "
   "against it, which slightly favours SafeLine. The behaviour did not reproduce when "
   "the same requests were replayed in isolation and under concurrency.",
-  "The Next-Gen ESDS WAF was measured in one configuration. Both competitors were "
+  "Swaraj Kavach was measured in one configuration. Both competitors were "
   "measured at defaults and at maximum sensitivity. A signatures-only measurement of "
   "our engine from an earlier session placed it at 90.91 per cent composite, which "
   "separates engine from classifier, but that arm was not repeated in this session.",
@@ -683,7 +687,7 @@ H1("10", "Conclusions and recommendations")
 
 H2("Conclusions")
 RICH([("On protective coverage the advantage is substantial and durable. ", True),
-      ("The Next-Gen ESDS WAF refuses 99.2 per cent of a 675-payload corpus while "
+      ("Swaraj Kavach refuses 99.2 per cent of a 675-payload corpus while "
        "allowing 99.3 per cent of legitimate traffic. The best result any competitor "
        "reached at a deployable setting was 60.5 per cent. The advantage does not "
        "narrow when competitors are given their strongest configuration, because their "
@@ -735,7 +739,7 @@ H1("A", "Appendix A — Complete result tables")
 H2("A.1  Security effectiveness, raw counts")
 table(doc, ["Configuration", "Attacks\noffered", "Attacks\nrefused", "Attacks\nallowed",
             "Not\ncompleted", "Legitimate\noffered", "Legitimate\nrefused"], [
-  ["Next-Gen ESDS WAF", "675", "670", "5", "0", "141", "1"],
+  ["Swaraj Kavach", "675", "670", "5", "0", "141", "1"],
   ["SafeLine, shipped defaults", "675", "314", "350", "10", "141", "0"],
   ["SafeLine, all modules strict", "675", "400", "259", "15", "141", "3"],
   ["BunkerWeb, PL1", "675", "318", "357", "0", "141", "13"],
@@ -750,21 +754,21 @@ H2("A.2  Load-test arms as executed")
 table(doc, ["Arm", "Traffic", "Rate applied", "Achieved", "Median",
             "99th pct", "Lost"], [
   ["Origin, no WAF", "legitimate", "unbounded", "32,190 /s", "1.74 ms", "4.79 ms", "0"],
-  ["Next-Gen ESDS WAF", "legitimate", "unbounded", "7,595 /s", "7.45 ms", "16.3 ms", "0"],
+  ["Swaraj Kavach", "legitimate", "unbounded", "7,595 /s", "7.45 ms", "16.3 ms", "0"],
   ["SafeLine, defaults", "legitimate", "unbounded", "6,006 /s", "10.7 ms", "14.6 ms", "0"],
   ["SafeLine, strict", "legitimate", "unbounded", "4,688 /s", "13.1 ms", "22.9 ms", "0"],
   ["BunkerWeb, PL1", "legitimate", "unbounded", "2,000 /s", "27.5 ms", "94.4 ms", "0"],
-  ["Next-Gen ESDS WAF", "attack", "unbounded", "7,870 /s", "7.49 ms", "15.8 ms", "0"],
+  ["Swaraj Kavach", "attack", "unbounded", "7,870 /s", "7.49 ms", "15.8 ms", "0"],
   ["SafeLine, defaults", "attack", "unbounded", "4,573 /s", "12.0 ms", "29.7 ms", "0"],
   ["SafeLine, strict", "attack", "unbounded", "4,054 /s", "13.1 ms", "37.4 ms", "0"],
   ["BunkerWeb, error page on", "attack", "unbounded", "376 /s", "135 ms", "722 ms", "0"],
   ["BunkerWeb, error page off", "attack", "unbounded", "1,541 /s", "38.0 ms", "103 ms", "0"],
-  ["Next-Gen ESDS WAF", "attack", "1,000 /s", "1,000 /s", "0.65 ms", "1.63 ms", "0"],
+  ["Swaraj Kavach", "attack", "1,000 /s", "1,000 /s", "0.65 ms", "1.63 ms", "0"],
   ["SafeLine, defaults", "attack", "1,000 /s", "1,000 /s", "0.81 ms", "1.97 ms", "0"],
   ["SafeLine, strict", "attack", "1,000 /s", "1,000 /s", "0.78 ms", "1.33 ms", "0"],
   ["BunkerWeb, error page on", "attack", "1,000 /s", "1,000 /s", "10.8 s", "30 s", "2,404"],
   ["BunkerWeb, error page off", "attack", "1,000 /s", "1,000 /s", "5.13 ms", "137 ms", "0"],
-  ["Next-Gen ESDS WAF", "attack", "3,000 /s", "3,000 /s", "0.93 ms", "8.16 ms", "0"],
+  ["Swaraj Kavach", "attack", "3,000 /s", "3,000 /s", "0.93 ms", "8.16 ms", "0"],
   ["SafeLine, defaults", "attack", "3,000 /s", "3,000 /s", "1.19 ms", "59.1 ms", "0"],
   ["SafeLine, strict", "attack", "3,000 /s", "3,000 /s", "1.34 ms", "14.1 ms", "0"],
   ["BunkerWeb, error page on", "attack", "3,000 /s", "1,282 /s", "13.4 s", "30 s", "13,073"],
@@ -805,7 +809,7 @@ CODE(["docker run -d --name bench-origin \\",
       "",
       "# returns HTTP 200 to every method and path, so the WAF alone decides"])
 
-H2("B.2  Next-Gen ESDS WAF")
+H2("B.2  Swaraj Kavach")
 CODE(["sed 's/host: \"127.0.0.1\", port: 18090/host: \"172.17.0.2\", port: 80/' \\",
       "  waf-detection.yaml > /tmp/det.yaml",
       "SENTINEL_DISABLE_CORRELATION=1 ./sentinel-bin --config /tmp/det.yaml &",
@@ -916,7 +920,7 @@ table(doc, ["Term", "Meaning as used in this document"], [
   ["Paranoia level", "A sensitivity setting in the OWASP Core Rule Set. Higher levels "
    "enable additional rules that detect more attacks and also match more legitimate "
    "traffic."],
-  ["Anomaly threshold", "The accumulated score at which the Next-Gen ESDS WAF refuses "
+  ["Anomaly threshold", "The accumulated score at which Swaraj Kavach refuses "
    "a request. Individual detections contribute scores; the request is refused when "
    "the total reaches the threshold."],
   ["Semantic analysis", "SafeLine's detection method, which parses request content and "
