@@ -115,6 +115,59 @@ still loses 4,672 of 45,000 at 3,000 — the deny page was costing it 4x its blo
 engine underneath is still the ceiling. **SafeLine is not slow and the comparison must not say it
 is.**
 
+## Resource cost — CPU and memory, identical load
+
+**Fairness first:** no CPU quota, no CPU shares, no `cpuset` pinning and no memory cap on any
+container or process. Our data plane's affinity is `0-15` of 16 threads. All three had the whole
+machine available. Verified with `docker inspect` and `/proc/<pid>/status`, not assumed.
+
+Load held identical at 1,000 rps for 20 s (20,000 requests offered). Container CPU from the cgroup
+(`cpu.stat usage_usec`, covers every process inside); our single process from `/proc/<pid>/stat`.
+An idle baseline over the same window was negligible for all three, so nothing below is inflated by
+background polling. **CPU per request is divided by requests actually ANSWERED and cores by REAL
+elapsed time** — otherwise a product that drops requests looks cheap on both counts at once.
+
+| Target | CPU used | CPU/req | Cores busy | Peak memory | Unanswered |
+|---|---|---|---|---|---|
+| *clean traffic* | | | | | |
+| **Next-Gen ESDS WAF** (1 process) | 12.73 s | 0.636 ms | 0.63 | **131 MiB** | 0 |
+| SafeLine, request path (tengine+detector) | 8.39 s | **0.419 ms** | 0.40 | 349 MiB | 0 |
+| SafeLine, all 7 containers | 11.18 s | 0.559 ms | 0.53 | 1,381 MiB | 0 |
+| BunkerWeb (1 container) | 58.36 s | 2.918 ms | 2.85 | 993 MiB | 0 |
+| *attack traffic, all refused* | | | | | |
+| **Next-Gen ESDS WAF** (1 process) | 12.96 s | **0.648 ms** | 0.65 | **131 MiB** | 0 |
+| SafeLine, request path | 14.49 s | 0.724 ms | 0.70 | 328 MiB | 0 |
+| SafeLine, all 7 containers | 19.79 s | 0.989 ms | 0.97 | 1,449 MiB | 0 |
+| BunkerWeb (1 container) | 640.17 s | 41.5 ms | **12.70** | 1,110 MiB | **4,581 / 20,000** |
+
+Idle memory before any load: ours 131 MiB, SafeLine request path 568 MiB, SafeLine all 7
+1,132 MiB, BunkerWeb 490 MiB.
+
+BunkerWeb's attack arm ran 50.4 s of wall time, not 20 s, because it was still draining 30 s
+timeouts — an earlier version of this measurement divided by the nominal 20 s and produced an
+impossible 28 cores on a 16-thread box. Divide by real elapsed time.
+
+**Findings:**
+
+1. 🟠 **SafeLine is ~34% cheaper than us per CLEAN request** (0.419 vs 0.636 ms), and even its whole
+   7-container stack beats us (0.559). Under attack this reverses: we refuse for 0.648 ms vs its
+   0.724 (0.989 all-in).
+2. **The cost is our RULE ENGINE, not the ML classifier** — checked, not assumed. Two instances from
+   an identical config at the same log level, differing only in `ml.enable`: **ML on 0.666 ms/req,
+   ML off 0.717 ms/req** on clean traffic. The classifier is free at this scale and marginally
+   negative (a confident verdict lets evaluation stop early). We pay for 350 compiled signatures
+   evaluated per request — the same thing that buys the coverage lead in the class table above.
+3. **Our cost barely moves between passing and blocking** (0.636 → 0.648 ms) and memory is flat at
+   131 MiB in every arm. SafeLine's CPU rises 73% when it starts blocking; BunkerWeb's rises 14x.
+   Flat cost regardless of verdict is what makes capacity planning under attack possible.
+4. **We are 2.5–11x leaner on memory** than either rival, though the memory column reflects
+   packaging as much as inspection cost: we are one process, SafeLine splits proxy and detector and
+   ships seven containers, BunkerWeb bundles its stack into one.
+5. **BunkerWeb under attack took 12.7 of 16 cores** and still failed to answer 23% of requests.
+
+Harness: `deploy/load-test/` — `perf/res3.sh` (per-product CPU/memory) and `perf/res4.sh` (the
+ML attribution) in the session scratchpad; method reproduced above.
+
 ## Where we lose
 
 1. 🔴 **OPEN — our ML classifier blocks ordinary login forms.**
