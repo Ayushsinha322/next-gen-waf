@@ -1,4 +1,4 @@
-# Head-to-head: Sentinel vs BunkerWeb 1.6.9 — measured 2026-09-06
+# Head-to-head: Sentinel vs BunkerWeb 1.6.9 — measured 2026-09-06, block-path cause corrected 2026-09-08
 
 Question this answers: is Sentinel's architecture actually competitive in protection and
 performance against an established open-source WAF, measured the same way on the same box?
@@ -88,17 +88,57 @@ Clean traffic (3-target mix: `GET /`, `GET /products?category=shoes&page=2`, `PO
 
 Attack traffic (3-target mix: SQLi, XSS, traversal — every request must be blocked):
 
-| Target | Max block throughput | p99 at max | At fixed 1,000 rps |
-|---|---|---|---|
-| **Sentinel** | **4,588 rps** (100% 403) | 33 ms | p99 3.3 ms, 0 errors; at 3,000 rps p99 2.4 ms |
-| BunkerWeb PL1 | **350 rps** (100% 403) | 495 ms | **collapsed**: 1,560/15,000 timed out (30 s), p50 13.5 s |
-| BunkerWeb PL1 at 300 rps | — | — | p99 62 ms, 0 errors |
+| Target | 403 body | Max block throughput | p99 at max | At fixed 1,000 rps |
+|---|---|---|---|---|
+| **Sentinel** | 125 B | **4,588 rps** (100% 403) | 33 ms | p99 3.3 ms, 0 errors; at 3,000 rps p99 2.4 ms |
+| BunkerWeb PL1 | 69,283 B | **350 rps** (100% 403) | 495 ms | **collapsed**: 1,560/15,000 timed out (30 s), p50 13.5 s |
+| BunkerWeb PL1 at 300 rps | 69,283 B | — | — | p99 62 ms, 0 errors |
+| BunkerWeb PL1, 403 not intercepted | 146 B | not measured | — | p99 77 ms, 0 errors (2026-09-08) |
 
-BunkerWeb's block path is 13x slower than Sentinel's and 5x slower than its own pass path. Cause,
-verified: ModSecurity's `SecAuditEngine RelevantOnly` (BunkerWeb default) writes a full audit record
-for every blocked request. After ~45 s of attack traffic `/var/log/bunkerweb/modsec_audit.log` was
-104 MB / 745,502 lines. Under an attack flood the default config makes the WAF itself the
-bottleneck. Sentinel logs one JSON line per request (also on) and held 4,588 rps.
+Read the `403 body` column before comparing rows 1 and 2 — they differ by 554x in response size and
+that, not the rule engine, is what the max-block-throughput column is dominated by. See the cause
+analysis below.
+
+On shipped defaults BunkerWeb's block path tops out 5x below its own pass path (350 vs 1,752 rps)
+and collapses at 1,000 attack rps. Note that this pass-vs-block comparison is also a body-size
+comparison, not a measure of what blocking costs: the pass path returns 28 B, the block path
+69,283 B. Inspecting and denying a request is cheap; rendering the deny page is not.
+
+**Cause — corrected 2026-09-08.** The original text here blamed ModSecurity's `SecAuditEngine
+RelevantOnly` and cited the 104 MB / 745,502-line `modsec_audit.log` after ~45 s of attack traffic.
+That was wrong: it was a correlation observed during the collapse, not the cause. A follow-up 2x2 on
+the same host, holding BunkerWeb's config fixed and varying only the deny-response body and the
+audit engine, at a fixed 1,000 attack rps:
+
+| Deny body | `SecAuditEngine` | p50 | p99 | Dropped of 15,000 |
+|---|---|---|---|---|
+| 69,283 B (default) | `RelevantOnly` (default) | 8.99 s / 13.8 s | 30 s | 2,046 / 4,176 |
+| 69,283 B (default) | `Off` | 11.5 s | 30 s | 2,348 |
+| 146 B | `RelevantOnly` | **5.5 ms** | **77 ms** | **0** |
+| 146 B | `Off` | 8.3 ms | 244 ms | 0 |
+
+Disabling audit logging on an otherwise-default instance did not prevent the collapse — it was
+marginally worse. Row 3 had audit logging fully on, wrote 560,000 audit lines / 76.6 MB during that
+run, and still cleared all 15,000 blocks at p50 5.5 ms. **Deny-response size decides survival; the
+audit engine does not.**
+
+The real cause is BunkerWeb's default error page. `INTERCEPTED_ERROR_CODES` includes 403 by default,
+so every block returns the full `error.html` — 139,058 bytes in the repo, 91% of it inline
+decorative SVG (with 40,490 bytes of byte-identical duplicated SVG), rendering to a 69,283-byte
+response. A ~140-byte attack request therefore costs BunkerWeb ~69 KB of response generation:
+~495x amplification on the deny path, and 2,400x more bytes than its own clean 200 (28 B).
+
+Audit log volume is real but secondary: ~37 lines and ~5.1 KB per blocked request, costing ~5x p99
+at 300 rps (459 ms with audit on vs 84 ms off). That is a cost and tunability problem, not the
+availability one.
+
+**The 13x block-path figure has been withdrawn as an engine comparison.** Sentinel's 403 body is
+125 bytes; BunkerWeb's is 69,283 — 554x larger. BunkerWeb's 350 rps block ceiling is a property of
+its default error page, not of libmodsecurity or CRS, and most of the original 13x was measuring
+page size. With a small deny body BunkerWeb held a fixed 1,000 attack rps at p99 77 ms against
+Sentinel's 3.3 ms — still a real gap, roughly 23x at that rate, but nothing like a collapse.
+BunkerWeb's *maximum* block throughput with a small deny body was not measured, so the fair
+engine-to-engine block ceiling remains unknown. Do not quote 13x.
 
 Sentinel's 1,000 rps p99 of 8.1 ms was measured with its own per-request INFO log to a file on; the
 2.3 ms p99 at 3,000 rps in the next run shows the first number includes warm-up.
@@ -114,6 +154,16 @@ Sentinel's 1,000 rps p99 of 8.1 ms was measured with its own per-request INFO lo
   rules-only TN exactly (same 13 benign texts trip the same CRS rules).
 - GoTestWAF is held-out for Sentinel's ML: the classifier was never trained on any of it.
 - BunkerWeb ran the newer CRS (4.24.1 vs 4.7.0). Newer CRS did not help it here.
+- **The block-path throughput comparison is confounded by deny-response size and should not be
+  quoted as an engine result.** Sentinel returns a 125-byte 403; BunkerWeb returns 69,283 bytes by
+  default. Both are each product's default, so the comparison is fair as a *default-configuration*
+  result — it is not fair as a rule-engine result, and the original 13x claim conflated the two.
+  A fair engine comparison would need BunkerWeb's max block throughput remeasured with 403 excluded
+  from `INTERCEPTED_ERROR_CODES`; that was not done.
+- The first version of this report named `SecAuditEngine RelevantOnly` as the verified cause of the
+  block-path collapse. A 2x2 on 2026-09-08 disproved it. The lesson is recorded rather than quietly
+  edited out: log volume measured *during* a collapse is not evidence that logging caused it, and
+  the controlled A/B cost about twenty minutes.
 - Not measured: HTTPS/TLS termination cost, HTTP/2 or HTTP/3, response-body inspection, multi-node.
 
 ## Reproduce
@@ -142,4 +192,31 @@ docker run --rm --network host -v $PWD/out:/app/reports wallarm/gotestwaf:latest
   --skipWAFIdentification --noEmailReport --reportPath /app/reports --reportFormat json,html
 # vegeta
 vegeta attack -duration=15s -rate=0 -max-workers=64 -connections=200 -targets=targets.txt | vegeta report
+```
+
+### The 2026-09-08 deny-body 2x2
+
+Four BunkerWeb runs, identical except for the two variables. `INTERCEPTED_ERROR_CODES` with 403
+omitted is what shrinks the deny body from 69,283 B to 146 B; everything else stays at defaults.
+
+```
+# vary these two env vars across the four arms:
+#   -e MODSECURITY_SEC_AUDIT_ENGINE=RelevantOnly   (default)  | Off
+#   (omit)                                                    | -e "INTERCEPTED_ERROR_CODES=400 401 404 405 413 429 500 501 502 503 504"
+
+# attack targets must carry the Host header or BunkerWeb serves its default landing page
+# with neither the reverse proxy nor CRS engaged (silently scores as "not blocked"):
+#   GET http://127.0.0.1:18092/?id=1%27%20OR%20%271%27=%271
+#   Host: localhost
+
+# confirm the deny body size before each arm
+curl -s -H 'Host: localhost' -o /dev/null -w '%{http_code} %{size_download}\n' \
+  "http://127.0.0.1:18092/?id=1%27%20OR%20%271%27=%271"
+
+# fixed-rate run
+vegeta attack -duration=15s -rate=1000 -timeout=30s -connections=200 -targets=attack.txt | vegeta report
+
+# audit log growth per arm (truncate first, then measure)
+docker exec bw-bench sh -c ': > /var/log/bunkerweb/modsec_audit.log'
+docker exec bw-bench sh -c 'wc -lc < /var/log/bunkerweb/modsec_audit.log'
 ```
