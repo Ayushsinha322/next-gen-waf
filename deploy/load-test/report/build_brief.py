@@ -75,7 +75,7 @@ set_font(p.add_run("Comparative Security and Performance Benchmark"), BODY_FONT,
 
 rp = R.paragraphs[0]; no_space(rp, after=0); rp.alignment = WD_ALIGN_PARAGRAPH.RIGHT
 set_font(rp.add_run("ESDS"), BODY_FONT, 13, ACCENT, bold=True)
-for line in ("Research and Development", "Cyber Security Special Interest Group",
+for line in ("Research and Development", "Ayush Sinha",
              "", "Version 1.0  ·  8 September 2026",
              "Confidential — customer and executive distribution"):
     q = R.add_paragraph(); no_space(q, after=0, line=1.16)

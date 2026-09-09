@@ -105,3 +105,17 @@ data (`max(series)`), never from expectation, and read the rendered figure befor
 
 Both were caught only because the figure was rendered and looked at. Neither would have
 been caught by re-reading the code.
+
+
+## A build habit this session earned twice
+
+Every string replacement in these generators must assert that its pattern matched.
+Two silent no-ops shipped before being caught by looking at the rendered PDF:
+
+* a table-signature edit whose pattern did not match, so `shade_cols` was never added
+  and the call failed at runtime instead;
+* a cross-reference fix (`section 4` -> `section 5`) whose pattern carried a stray
+  quote character, so the document went out pointing readers at the wrong section.
+
+`t.replace(old, new)` returns the string unchanged when `old` is absent and reports
+nothing. Write `assert old in t` before every replace, and read the output.

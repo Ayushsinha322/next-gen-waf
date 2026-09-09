@@ -72,7 +72,7 @@ q = L.add_paragraph(); no_space(q, before=3, after=0)
 set_font(q.add_run("Competitive Comparison — measured, side by side"), BODY_FONT, 11.5, INK, bold=True)
 rp = R.paragraphs[0]; no_space(rp, after=0); rp.alignment = WD_ALIGN_PARAGRAPH.RIGHT
 set_font(rp.add_run("ESDS"), BODY_FONT, 12.5, ACCENT, bold=True)
-for line in ("Research and Development", "Cyber Security Special Interest Group", "",
+for line in ("Research and Development", "Ayush Sinha", "",
              "Version 1.0  ·  8 September 2026",
              "Confidential — customer and executive distribution"):
     z = R.add_paragraph(); no_space(z, after=0, line=1.14)

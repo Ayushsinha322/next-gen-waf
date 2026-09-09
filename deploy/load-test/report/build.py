@@ -80,8 +80,10 @@ def PAGEBREAK():
 doc.add_paragraph().paragraph_format.space_after = Pt(30)
 p = P(align=WD_ALIGN_PARAGRAPH.LEFT, after=0)
 set_font(p.add_run(M["org"]), BODY_FONT, 26, ACCENT, bold=True)
-p = P(after=2)
+p = P(after=1)
 set_font(p.add_run(M["unit"]), BODY_FONT, 9.5, MUTED)
+p = P(after=2)
+set_font(p.add_run(M["author"]), BODY_FONT, 9.5, INK2)
 hrule(P(after=0), "0A6A5C", 12)
 doc.add_paragraph().paragraph_format.space_after = Pt(26)
 
@@ -628,7 +630,7 @@ callout(doc, "Open — remediation scheduled", [
     "of them login forms carrying a persistent-session field. Search forms, "
     "name and address forms, review submissions and payment forms were all allowed.", False)],
   [("Remediation is a matter of training-data coverage rather than threshold "
-    "adjustment, and is scheduled to follow the current 48-hour stability measurement. "
+    "adjustment, and is scheduled to follow the current 46-hour stability measurement. "
     "Customers deploying in advance of that fix should run the affected paths in "
     "monitoring mode, which the product supports per site.", False)]], accent=False)
 
@@ -675,7 +677,7 @@ BULLETS([
   "separates engine from classifier, but that arm was not repeated in this session.",
   "Resource figures are single 20-second windows. They are sufficient to separate "
   "419 from 636 from 2,918 microseconds and insufficient to characterise long-run "
-  "drift, which a separate 48-hour stability measurement addresses for our product only.",
+  "drift, which a separate 46-hour stability measurement addresses for our product only.",
   "No result in this document measures false-positive behaviour against real "
   "production traffic. That remains an open programme of work and no claim about it "
   "is made here.",
@@ -941,7 +943,7 @@ doc.add_paragraph().paragraph_format.space_after = Pt(18)
 hrule(P(after=6), "C9D2CF", 6)
 RICH([("Document ends. ", True),
       (f'{M["product"]} — {M["title"]}, version {M["version"]}, {M["date"]}. '
-       f'Prepared by {M["unit"]}, {M["org"]}. {M["classif"]}.', False)], size=8.5)
+       f'Prepared by {M["author"]}, {M["unit"]}, {M["org"]}. {M["classif"]}.', False)], size=8.5)
 
 out = os.path.join(HERE, "ESDS-WAF-Benchmark-Report-v1.0.docx")
 doc.save(out)

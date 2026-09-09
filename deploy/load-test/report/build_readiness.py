@@ -74,7 +74,7 @@ q = L.add_paragraph(); no_space(q, before=3, after=0)
 set_font(q.add_run("Production Readiness and Stability Assessment"), BODY_FONT, 11.5, INK, bold=True)
 rp = R.paragraphs[0]; no_space(rp, after=0); rp.alignment = WD_ALIGN_PARAGRAPH.RIGHT
 set_font(rp.add_run("ESDS"), BODY_FONT, 12.5, ACCENT, bold=True)
-for line in ("Research and Development", "Cyber Security Special Interest Group", "",
+for line in ("Research and Development", "Ayush Sinha", "",
              "Version 1.0  ·  9 September 2026",
              "Confidential — internal and executive distribution"):
     z = R.add_paragraph(); no_space(z, after=0, line=1.14)
@@ -86,7 +86,7 @@ hrule(P(after=5), "0A6A5C", 10)
 callout(doc, "Verdict",
  [[("Approved for internal deployment.", True),
    (" One condition: run authentication paths in learning mode per site until the "
-    "classifier defect in section 4 is remediated. Every other control is verified.", False)],
+    "classifier defect in section 5 is remediated. Every other control is verified.", False)],
   [("Readiness rating ", False), ("8.9 of 10", True),
    (" on the single-tenant product-readiness scale, up from 8.8 recorded 31 July. "
     "The increment is small deliberately: three of the four evidence gaps recorded at "
