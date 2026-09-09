@@ -15,6 +15,7 @@ Two documents are built from the same data:
 | `Swaraj-Kavach-Benchmark-Summary-v1.0` | 2 | narrative, one row per configuration | executives, first customer contact |
 | `Swaraj-Kavach-Competitive-Comparison-v1.0` | 2 | **matrix, one column per product** | competitive discussions, bid responses |
 | `Swaraj-Kavach-Readiness-Assessment-v1.0` | 2 | scorecard + stability evidence | internal go/no-go, executive review |
+| `Swaraj-Kavach-Stability-Test-Report-v1.0` | 2 | soak method, results, root-cause work | engineering record of the 46-hour run |
 
 The readiness assessment is the only one of the four that is not competitive. It answers
 "is this deployable and how good is it", carries the dimension scorecard and the 46-hour
@@ -119,3 +120,18 @@ Two silent no-ops shipped before being caught by looking at the rendered PDF:
 
 `t.replace(old, new)` returns the string unchanged when `old` is absent and reports
 nothing. Write `assert old in t` before every replace, and read the output.
+
+
+## Stationary series against cumulative counters
+
+The soak sampler writes both kinds of column and they need different treatment. Memory,
+descriptors, latency and disk are stationary: compare the median of the first half against
+the second. Requests, blocks, log volume, event rows and alert counts are cumulative:
+compare the first reading against the last.
+
+Applying the halves-median to a cumulative counter produces a number that looks like a
+measurement and means nothing. It shipped once in the readiness assessment before being
+caught: the request count was reported as 100,332, which was the second-half median of a
+rising counter rather than the 132,486 actually inspected, and alerts were reported as
+"steady at 17" when they had in fact gone from 11 to 17. `build_soak.py` separates the two
+kinds explicitly, with a group row in the results table naming which is which.
