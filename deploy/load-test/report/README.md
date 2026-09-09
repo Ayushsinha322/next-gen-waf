@@ -14,6 +14,12 @@ Two documents are built from the same data:
 | `ESDS-WAF-Benchmark-Report-v1.0` | 24 | narrative, one row per configuration | technical evaluators, full evidence base, appendices |
 | `Swaraj-Kavach-Benchmark-Summary-v1.0` | 2 | narrative, one row per configuration | executives, first customer contact |
 | `Swaraj-Kavach-Competitive-Comparison-v1.0` | 2 | **matrix, one column per product** | competitive discussions, bid responses |
+| `Swaraj-Kavach-Readiness-Assessment-v1.0` | 2 | scorecard + stability evidence | internal go/no-go, executive review |
+
+The readiness assessment is the only one of the four that is not competitive. It answers
+"is this deployable and how good is it", carries the dimension scorecard and the 46-hour
+stability run, and is built from `build_readiness.py` + `charts_soak.py` over the raw
+sample file `soak-samples.tsv`.
 
 The comparison document is the one to reach for in a competitive conversation: rows are
 dimensions and columns are products, so a reader compares across a row instead of
@@ -84,3 +90,18 @@ failures individually.
 One trap: the bold flag must be coerced with `bool()`. `is_group or (col_colors and ...)`
 returns the empty dict when `col_colors` is `{}`, and python-docx rejects anything that
 is not exactly True, False or None with a `TypeError` deep inside the XML layer.
+
+
+## Two corrections the readiness document forced, worth remembering
+
+**A median is not a trend, and a trend is not a shape.** The soak's descriptor column
+compares 28 to 28 across halves, which is true and reads as "flat". Plotting it showed
+five excursions peaking at 81, the longest lasting 8.6 hours, each returning to baseline.
+The summary statistic and the series tell different stories; publish the series.
+
+**The first chart clipped its own maximum.** `ax2.set_ylim(0, 60)` silently cut a peak of
+81 out of the picture while the caption claimed the line was flat. Set limits from the
+data (`max(series)`), never from expectation, and read the rendered figure before it ships.
+
+Both were caught only because the figure was rendered and looked at. Neither would have
+been caught by re-reading the code.
