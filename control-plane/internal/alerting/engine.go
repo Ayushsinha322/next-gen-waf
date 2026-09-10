@@ -249,6 +249,16 @@ func (e *Engine) bumpWindow(m map[string][]time.Time, key string, now time.Time)
 // Raise is an exported wrapper over raise so out-of-package monitors (e.g. the
 // node-health monitor) can surface alerts through the same persistence +
 // throttling + channel fan-out path. Callers MUST set na.Severity and na.Kind.
+// Identity returns the tenant and user the engine writes alerts as. The
+// node-health monitor needs it to resolve rows the engine raised, and duplicating
+// the values at both call sites is how they drift apart.
+func (e *Engine) Identity() (tenantID, userID string) {
+	if e == nil {
+		return "", ""
+	}
+	return e.tenantID, e.userID
+}
+
 func (e *Engine) Raise(throttleKey string, req db.CreateAlertRequest, na notify.Alert) {
 	e.raise(throttleKey, req, na)
 }

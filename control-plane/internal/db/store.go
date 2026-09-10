@@ -597,6 +597,77 @@ func (s *Store) ResolveAlert(ctx context.Context, tenantID, userID, alertID stri
 	return tx.Commit(ctx)
 }
 
+// ResolveAlertsByKind resolves every open or acknowledged alert of the given
+// kinds, stamping `reason` into details so the row is distinguishable from an
+// operator's click. When detailKey is non-empty the update is restricted to rows
+// whose details->>detailKey matches one of `values`; pass an empty detailKey to
+// match every row of those kinds. Returns how many rows changed.
+//
+// Why this exists, and why it reconciles rather than reacting to a transition:
+// the node-health monitor kept its previous-status map in memory, so a control
+// plane restart erased it. A node that went down before the restart and came back
+// after produced no transition, and its node_down alert stayed open forever — the
+// deployment carried eleven CRITICAL alerts from 13 July on a cluster that had
+// been 3/3 healthy ever since. Comparing open alerts against current state on
+// every sweep is idempotent, survives restarts, and needs no one-off cleanup
+// script for the rows already stranded.
+//
+// detailKey is a JSON key, not a column, and is bound as a parameter rather than
+// interpolated. It is caller-supplied today, but a query built by string
+// concatenation in this package is the shape of a problem regardless of who
+// calls it.
+func (s *Store) ResolveAlertsByKind(ctx context.Context, tenantID, userID string,
+	kinds []string, detailKey string, values []string, reason string) (int64, error) {
+
+	if len(kinds) == 0 {
+		return 0, nil
+	}
+	if detailKey != "" && len(values) == 0 {
+		// A key with no values matches nothing; return plainly rather than run a
+		// query whose empty result reads as "nothing was stale".
+		return 0, nil
+	}
+	tx, err := s.pool.BeginTenant(ctx, tenantID, userID)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+
+	// $3 NULL means "every row of these kinds"; otherwise filter on the JSON key.
+	var key *string
+	if detailKey != "" {
+		key = &detailKey
+	}
+	rows, err := tx.Query(ctx,
+		`UPDATE alerts
+		    SET state = 'resolved',
+		        resolved_at = now(),
+		        details = coalesce(details, '{}'::jsonb)
+		                  || jsonb_build_object('auto_resolved', true,
+		                                        'auto_resolve_reason', $5::text)
+		  WHERE tenant_id = $1
+		    AND state IN ('open', 'acked')
+		    AND kind = ANY($2)
+		    AND ($3::text IS NULL OR details->>($3::text) = ANY($4::text[]))
+		  RETURNING id`,
+		tenantID, kinds, key, values, reason)
+	if err != nil {
+		return 0, fmt.Errorf("store: resolve alerts by kind: %w", err)
+	}
+	var n int64
+	for rows.Next() {
+		n++
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
 // AutoResolveQuietAlerts resolves every open or acknowledged alert of the given
 // kinds that was raised before the quiet window began, stamping the reason into
 // details so the row is distinguishable from an operator's click. Returns how
