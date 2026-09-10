@@ -54,15 +54,61 @@ USAGE
 if [ "$HOST" = "--list-runtime-mounts" ]; then
   H="${2:-}"; [ -z "$H" ] && { usage; exit 2; }
   ROOT="${3:-/opt/sentinel-src}"
-  echo "Bind mounts on $H whose SOURCE is inside $ROOT:"
-  ssh -o BatchMode=yes -i "$KEY" "$H" '
-    for c in $(docker ps --format "{{.Names}}"); do
-      docker inspect "$c" -f "{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Source}} -> {{.Destination}}{{\"\n\"}}{{end}}{{end}}" \
-        | grep "^/opt/sentinel-src" | sed "s|^|  $c: |"
-    done | sort -u'
+  [ -f deploy/docker/compose.prod.yml ] || { echo "ERROR: run this from the repository root"; exit 1; }
+
+  # Classify, do not merely list. A bind mount inside the tree is only dangerous
+  # if the repo does NOT carry it: rsync --delete removes exactly those. A mount
+  # of a TRACKED file (haproxy.cfg, prometheus.yml, the proxy yaml) is source and
+  # is supposed to be synced — telling an operator to protect those would mean a
+  # config change could never be deployed again. So the three verdicts are:
+  #
+  #   PROTECTED  matches RUNTIME_PATHS — never synced, never deleted.
+  #   source     git-tracked — synced on purpose; the repo is authoritative.
+  #   AT RISK    neither. rsync --delete WILL remove it. Add to RUNTIME_PATHS.
+  #
+  # The GeoIP .mmdb was exactly the third case and nothing said so.
+  # Compare FILE BY FILE, never directory by directory. deploy/docker/geoip/
+  # tracks a .gitkeep and a README, so "the repo carries something under this
+  # mount" would have called that directory source-controlled and said nothing
+  # about the 8 MB .mmdb sitting beside them — the actual file rsync deleted.
+  # Only the host knows what is really in a mounted directory, so ask it.
+  echo "Files under bind mounts on $H whose source is inside $ROOT:"
   echo
-  echo "Every SOURCE above must match an entry in RUNTIME_PATHS, or the next"
-  echo "--delete sync will remove whatever the repo does not carry."
+  files=$(ssh -o BatchMode=yes -o ConnectTimeout=15 -i "$KEY" "$H" "
+    for c in \$(docker ps --format '{{.Names}}'); do
+      docker inspect \"\$c\" -f '{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Source}}{{\"\n\"}}{{end}}{{end}}'
+    done | grep '^$ROOT/' | sort -u | while IFS= read -r s; do
+      if [ -d \"\$s\" ]; then find \"\$s\" -type f 2>/dev/null; else [ -e \"\$s\" ] && echo \"\$s\"; fi
+    done | sort -u" 2>/dev/null)
+  [ -z "$files" ] && { echo "  (none, or the host could not be reached)"; exit 1; }
+
+  risk=0; okp=0; oks=0
+  while IFS= read -r src; do
+    rel="${src#"$ROOT"/}"
+    verdict="AT RISK"
+    for p in "${RUNTIME_PATHS[@]}"; do
+      case "$rel/" in ${p%/}/*) verdict="PROTECTED" ;; esac
+      case "$rel"  in $p)       verdict="PROTECTED" ;; esac
+    done
+    if [ "$verdict" = "AT RISK" ] && git ls-files --error-unmatch -- "$rel" >/dev/null 2>&1; then
+      verdict="source"
+    fi
+    case "$verdict" in
+      PROTECTED) okp=$((okp+1)) ;;
+      source)    oks=$((oks+1)) ;;
+      *)         risk=$((risk+1)); printf '  AT RISK   %s\n' "$rel" ;;
+    esac
+  done <<< "$files"
+
+  printf '  PROTECTED %s file(s) — excluded from the sync, never deleted\n' "$okp"
+  printf '  source    %s file(s) — tracked; synced on purpose\n' "$oks"
+  echo
+  if [ "$risk" -gt 0 ]; then
+    echo "$risk file(s) AT RISK: on the host, not in the repo, not protected."
+    echo "rsync --delete REMOVES them. Add their directory to RUNTIME_PATHS first."
+    exit 1
+  fi
+  echo "No untracked runtime state is exposed to --delete."
   exit 0
 fi
 
