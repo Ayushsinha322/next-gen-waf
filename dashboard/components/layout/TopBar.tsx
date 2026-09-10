@@ -3,7 +3,7 @@ import { PRODUCT_VERSION } from "@/lib/version";
 import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
-import { logout } from "@/lib/auth";
+import { signOut } from "@/lib/auth";
 import { api } from "@/lib/api";
 import { spring } from "@/lib/animations";
 
@@ -255,7 +255,7 @@ export default function TopBar() {
         <motion.div
           className="tb-btn"
           title="Sign out"
-          onClick={() => { logout(); router.push("/login"); }}
+          onClick={async () => { await signOut(); router.push("/login"); }}
           style={{ color: "var(--red-b)" }}
           whileHover={{ scale: 1.1 }}
           whileTap={{ scale: 0.95 }}

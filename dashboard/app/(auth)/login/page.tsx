@@ -1,5 +1,5 @@
 "use client";
-import { PRODUCT_VERSION } from "@/lib/version";
+import { PRODUCT_NAME, PRODUCT_VERSION } from "@/lib/version";
 import { useState, useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
@@ -293,7 +293,7 @@ export default function LoginPage() {
         <div id="LP-bottom">
           <div id="lp-footer">
             <div className="lp-dot" />
-            <span>Next-Gen ESDS WAF &nbsp;·&nbsp; v{PRODUCT_VERSION}</span>
+            <span>{PRODUCT_NAME} &nbsp;·&nbsp; v{PRODUCT_VERSION}</span>
           </div>
         </div>
       </div>
@@ -308,7 +308,7 @@ export default function LoginPage() {
         >
           <div id="form-header">
             <div id="form-title">Welcome back</div>
-            <div id="form-sub">Sign in to your Next-Gen ESDS WAF dashboard</div>
+            <div id="form-sub">Sign in to your {PRODUCT_NAME} dashboard</div>
           </div>
 
           {/* Auth tabs */}
@@ -409,7 +409,7 @@ export default function LoginPage() {
             whileHover={btnState === "idle" ? { scale: 1.02, y: -1 } : {}}
             whileTap={btnState === "idle" ? { scale: 0.98 } : {}}
           >
-            {btnState === "idle"    && "🔐 Sign in to Next-Gen ESDS WAF"}
+            {btnState === "idle"    && `🔐 Sign in to ${PRODUCT_NAME}`}
             {btnState === "loading" && <><span className="btn-spin" /> Authenticating...</>}
             {btnState === "success" && "✓ Access granted"}
           </motion.button>

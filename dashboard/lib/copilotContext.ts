@@ -1,3 +1,4 @@
+import { PRODUCT_NAME } from "@/lib/version";
 // Copilot hand-off: open the AI Copilot WITH the thing the operator was looking
 // at, instead of an empty chat.
 //
@@ -125,7 +126,7 @@ export function virtualPatchPrompt(cve: string, note?: string): Omit<CopilotHand
     source: "rules",
     title: `Virtual patch for ${cve}`,
     prompt:
-      `Write a virtual patch for ${cve} as a Sentinel WAF custom rule in ModSecurity/SecRule syntax (the engine ` +
+      `Write a virtual patch for ${cve} as a ${PRODUCT_NAME} custom rule in ModSecurity/SecRule syntax (the engine ` +
       `compiles CRS-style rules): match only the vulnerable request shape, block, and set a unique id in the ` +
       `9000000-9999999 range. Explain what it matches and what it deliberately does not.` +
       (note ? `\n\nNotes from the operator: ${note}` : ""),

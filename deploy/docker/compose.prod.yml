@@ -639,9 +639,23 @@ services:
   #
   # ⚠️ Any site whose upstream is `juiceshop:3000` returns 502 without this
   # profile — including the .88/.89 pilot pair. Pass --profile demo there.
+  #
+  # ⚠️ A profile gates what STARTS and what is RECREATED, not what is pulled or
+  # parsed. Roll a demo box with --profile demo or compose leaves this container
+  # alone: that is how it kept a 163 MB uncapped log through the roll that capped
+  # every other service.
+  #
+  # PINNED, tag AND digest. `latest` on a deliberately vulnerable application is
+  # the one floating tag that must never float: at the time of pinning `latest`
+  # already resolved to sha256:73c53fbf… while this deployment was running
+  # 20.1.1, and v20.2.0 was published — so any `compose pull` would have swapped
+  # the exploitable app for a different version nobody had tested behind the WAF.
+  # The digest is the manifest digest from the registry, so the reference is
+  # reproducible on a host that has never pulled this image. To move version,
+  # change both halves together.
   juiceshop:
     profiles: [demo]
-    image: bkimminich/juice-shop:latest
+    image: bkimminich/juice-shop:v20.1.1@sha256:cd58d79c5cb4d82f22fbaf616f9ff43bbd04ba630cd6b448a9ed99cf652fcebf
     logging: *logging
     restart: unless-stopped
     mem_limit: 768m

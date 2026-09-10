@@ -2,6 +2,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
+import FirstRunNote from "@/components/ui/FirstRunNote";
 import { api, type BlocksResponse, type IOC } from "@/lib/api";
 import { staggerContainer, fadeUp, cardVariants } from "@/lib/animations";
 
@@ -146,6 +147,12 @@ export default function BlockedSourcesPage() {
 
   return (
     <motion.div className="sec" variants={staggerContainer} initial="hidden" animate="visible">
+      <FirstRunNote id="blocked" title="Three separate mechanisms are merged into this list">
+        A source can be blocked by the data plane&apos;s own kernel/XDP list (including automatic
+        bans for repeated offences), by the threat-intelligence indicator feed, or by country
+        policy. Each row is unblocked at whichever of those set it. Indicators are capped at 500
+        per type for display, so the number listed here is not the size of the feed.
+      </FirstRunNote>
       <motion.div variants={fadeUp} style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 14 }}>
         <div>
           <div className="sec-title">🚫 Blocked Sources</div>

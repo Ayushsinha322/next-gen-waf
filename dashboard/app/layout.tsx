@@ -1,9 +1,10 @@
 import type { Metadata } from "next";
 import { headers } from "next/headers";
 import "./globals.css";
+import { PRODUCT_NAME } from "@/lib/version";
 
 export const metadata: Metadata = {
-  title: "Next-Gen ESDS WAF — Enterprise Security Platform",
+  title: `${PRODUCT_NAME} — Web Application Firewall`,
   description: "High-performance Web Application Firewall control plane",
 };
 

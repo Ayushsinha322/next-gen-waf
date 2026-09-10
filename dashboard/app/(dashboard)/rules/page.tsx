@@ -2,6 +2,7 @@
 import { useState, useEffect } from "react";
 import { motion } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
+import FirstRunNote from "@/components/ui/FirstRunNote";
 import { api, type Rule, type RuleTestResult, type CompiledRule, type RuleInventory, type SiteRuleInventory } from "@/lib/api";
 import { staggerContainer, cardVariants, fadeUp, spring } from "@/lib/animations";
 
@@ -352,6 +353,14 @@ export default function RulesPage() {
 
   return (
     <motion.div className="sec" variants={staggerContainer} initial="hidden" animate="visible">
+      <FirstRunNote id="rules" title="Two different rule sets are summarised above">
+        The OWASP Core Rule Set is compiled into the data plane and enforced as a whole — the
+        &ldquo;enforcing&rdquo; figure is what the engine actually runs, and anything that failed to
+        compile is counted separately rather than silently skipped. Rules you author here are the
+        second set, and each one can apply to a single site or to every site. A site in
+        <strong> learning</strong> mode scores matches and does not block them, so a rule can be
+        matching constantly and changing nothing.
+      </FirstRunNote>
       <motion.div variants={fadeUp} style={{ display:"flex", alignItems:"flex-start", justifyContent:"space-between", gap:14 }}>
         <div>
           <div className="sec-title">📋 Rules Engine</div>
