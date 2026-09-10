@@ -18,50 +18,93 @@ to anyone clicking through.
 
 ### Operational hygiene
 
-- [ ] **A1. No log rotation on any service.** Not one service in `compose.prod.yml` caps its
+- [x] **A1. No log rotation on any service.** Not one service in `compose.prod.yml` caps its
       json-file log. The soak accumulated **648 MB in 46 hours at 3 requests/second** with no
       rotation in force; at production rates this fills a customer's disk. SafeLine caps four
       of its seven services at 100 MB across five files. Add `logging.options.max-size` and
       `max-file` per service. Six lines each.
-- [ ] **A2. No healthcheck on any of our own containers.** We have four, all on third-party
+      **Fixed** (`7e1de8b`) — All 14 services capped at 100 MB x 5 via an `x-logging`
+      anchor in prod, cluster and ha compose files. The anchor must precede the first
+      top-level key, not `services:` — `x-wafnode` references it earlier. Merged 3-file
+      config validates.
+
+- [x] **A2. No healthcheck on any of our own containers.** We have four, all on third-party
       images (Postgres, ClickHouse, Redis, Prometheus). `controlplane`, `dataplane`,
       `dashboard` and `migrate` have none, so `docker ps` reports "Up" for a hung control
       plane and compose cannot express `depends_on: service_healthy`. The endpoints already
       exist: data plane `/healthz` and `/readyz`, control plane `/metrics`.
-- [ ] **A4. Deploy sync can delete runtime data.** `rsync --delete` of the repo removed
+      **Fixed** (`7e1de8b`) — The distroless images have no shell, curl or wget, so a
+      command healthcheck could not work: added `cmd/healthprobe`, a stdlib-only static
+      binary, copied into both distroless stages. Dashboard uses wget (its image has
+      one). All four exit codes checked.
+
+- [x] **A4. Deploy sync can delete runtime data.** `rsync --delete` of the repo removed
       `deploy/docker/geoip/dbip-country-lite.mmdb` from the host on 2026-09-09, because that
       directory is a bind mount inside the synced tree and the `.mmdb` is gitignored locally.
       GeoIP silently went inert until the refresh job was re-run. Same class as the earlier
       `.env` clobber. Commit a `deploy/sync-to-host.sh` that carries the exclusions
       (`.env*`, `deploy/docker/geoip/`, `deploy/docker/origin-ca/`) so they cannot be
       forgotten.
+      **Fixed** (`7e1de8b`) — `deploy/sync-to-host.sh` carries the exclusions and
+      verifies `.env`, the `.mmdb` and the CA anchors survived the sync; refuses to run
+      outside the repo root; `DRY_RUN=1` and `--list-runtime-mounts` for inspection.
 
 ### Console credibility
 
-- [ ] **B1. Eleven CRITICAL alerts open since 13 July** ("node down" ×3, "control-plane node
+- [x] **B1. Eleven CRITICAL alerts open since 13 July** ("node down" ×3, "control-plane node
       unreachable" ×5, "quorum at risk" ×3) while the Cluster page correctly shows 3 of 3
       healthy. Two causes: `raiseDataPlaneRecovered` raises a *new* `node_recovered` alert
       instead of resolving the open `node_down`; and `AutoResolveQuietAlerts` only covers
       `EventDrivenKinds` (attack kinds plus the `*_recovered` notices), so infrastructure
       kinds are owned by nothing. `cp_node_down` and `quorum_at_risk` have no raise site in
       the current Go at all — those rows are legacy.
-- [ ] **B2. The Alerts page shows "0 open" while the API returns 11.** `api.alerts.list()`
+      **Fixed** (`18a6e69`) — `node_down` is now reconciled against live heartbeats
+      rather than waiting for a transition, and the two kinds nothing in this build
+      raises are swept as orphaned. Covered by unit tests plus four integration tests
+      against real Postgres — which disproved the assumption that `details` could be
+      NULL.
+
+- [x] **B2. The Alerts page shows "0 open" while the API returns 11.** `api.alerts.list()`
       is called with no state filter, the backend caps at `LIMIT 200 ORDER BY created_at DESC`,
       and `openCount` is then computed client-side, so older open rows fall off the list and
       out of the count. Overview uses `?state=open` and is right. Two screens disagree.
-- [ ] **B3. Overview shows "Instances: 1, standalone" on a three-node cluster.** It reads
+      **Fixed** (`4beb4f5`) — The page asks for the open set explicitly and merges it
+      into the display set; count, severity breakdown and Acknowledge-all all derive
+      from the open rows.
+
+- [x] **B3. Overview shows "Instances: 1, standalone" on a three-node cluster.** It reads
       `cluster.status().status.peers`, which the API does not return (the payload has
       `enabled, node_id, role, leader_id, leader_addr, since_unix`), so the catch sets 1.
-- [ ] **B4. "Sub-millisecond target" caption under a p99 of 80 ms.** Static string. The 80 ms
+      **Fixed** (`4beb4f5`) — Switched to `/cluster/health`, the fleet roll-up the
+      Cluster page already used. An unreachable roll-up renders —, not a fleet of one.
+
+- [x] **B4. "Sub-millisecond target" caption under a p99 of 80 ms.** Static string. The 80 ms
       is end-to-end including the demo origin; the WAF's own share is about 3 ms per the
       access log. Either fix the caption or show the WAF-only figure, which is both truer and
       more flattering.
-- [ ] **B5. Global Settings says "eBPF / XDP: off"** while the data plane reports
+      **Fixed** (`4beb4f5`) — Captioned “end-to-end, incl. origin” with the per-node WAF
+      share pointed to on the Cluster page. Kept the end-to-end figure: it is the one a
+      customer experiences.
+
+- [x] **B5. Global Settings says "eBPF / XDP: off"** while the data plane reports
       `mode: kernel-xdp` with 11 million packets passed. The page reads `cfg.ebpf.enable`
       from the node's config file; the runtime is enabled by `SENTINEL_XDP_ENABLE=1`. Show
       effective state, not file state.
-- [ ] **B12. Clean up the alert backlog.** 78 acknowledged alerts, all older than seven days,
+      **Fixed** (`4beb4f5`) — Root cause was worse than a stale read: `cfg.ebpf.enable`
+      has ZERO consumers in the data plane, and `EbpfMode` has no “off” state at all, so
+      the card was reporting an inert key about a binary that does not exist. The
+      control plane now returns `dataplane.runtime` from the node's `/healthz`; the card
+      shows the three real states including software-while-kernel-was-requested, and
+      “unknown” when unreachable. Verified against .71: kernel-xdp on eth0, 11,657,160
+      passed.
+
+- [x] **B12. Clean up the alert backlog.** 78 acknowledged alerts, all older than seven days,
       never resolved. One-time sweep after B1 lands.
+      **Fixed** (`d866ea1`) — Not a cleanup after all — a live bug. All 78 are seeder
+      rows (no empty-table guard, 78 boots x 7 kinds), and `cmdinj` alone survived July
+      because `EventDrivenKinds` is an allowlist and nothing named it. Added to the
+      legacy group; the guard test now states the rule, and a new test asserts the two
+      sweep lists are disjoint. Both guards checked by reintroducing the defect.
 
 ---
 
