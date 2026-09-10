@@ -60,9 +60,20 @@ x-runtime-provenance: &runtime-provenance
   SENTINEL_GIT_SHA: ${SENTINEL_VERSION:-unknown}
   SENTINEL_BUILD_DATE: ${SENTINEL_BUILD_DATE:-unknown}
 
+# Cap every container's json-file log. Nothing did before: a 46-hour soak at only
+# 3 requests/second accumulated 648 MB and the disk had no ceiling at all. 100 MB
+# across 5 files is 500 MB worst case per service, which a 40 GB root can hold
+# while still keeping several days of history at realistic rates.
+x-logging: &logging
+  driver: "json-file"
+  options:
+    max-size: "100m"
+    max-file: "5"
+
 services:
   postgres:
     image: ${SENTINEL_THIRDPARTY_PREFIX:-}postgres:16-alpine
+    logging: *logging
     restart: unless-stopped
     # TLS is served, not optional. Without these flags the server offers no TLS at
     # all, so every client DSN had to say sslmode=disable and all database traffic —
@@ -112,6 +123,7 @@ services:
 
   redis:
     image: ${SENTINEL_THIRDPARTY_PREFIX:-}redis:7-alpine
+    logging: *logging
     restart: unless-stopped
     command: ["redis-server", "--save", "", "--appendonly", "no"]
     healthcheck:
@@ -127,6 +139,7 @@ services:
   # planes reach it over the docker network at clickhouse:8123.
   clickhouse:
     image: ${SENTINEL_THIRDPARTY_PREFIX:-}clickhouse/clickhouse-server:24-alpine
+    logging: *logging
     restart: unless-stopped
     # 1536m is NOT enough: at that limit ClickHouse's own internal-table merges
     # (system.text_log) get OOM-killed during startup, and the container
@@ -181,6 +194,7 @@ services:
       args:
         <<: *build-provenance
     image: ${SENTINEL_IMAGE_PREFIX:-sentinel}/migrate:${SENTINEL_VERSION:-latest}
+    logging: *logging
     restart: "no"
     depends_on:
       postgres: { condition: service_healthy }
@@ -200,6 +214,7 @@ services:
       args:
         <<: *build-provenance
     image: ${SENTINEL_IMAGE_PREFIX:-sentinel}/controlplane:${SENTINEL_VERSION:-latest}
+    logging: *logging
     restart: unless-stopped
     # root so it can write the shared NDJSON log volume (hardened via K8s
     # securityContext later). The control-plane hub reads what the proxy writes.
@@ -355,6 +370,7 @@ services:
       args:
         <<: *build-provenance
     image: ${SENTINEL_IMAGE_PREFIX:-sentinel}/dataplane:${SENTINEL_VERSION:-latest}
+    logging: *logging
     restart: unless-stopped
     user: "0:0"
     # Kernel XDP needs these to load/attach the BPF program and its maps.
@@ -582,6 +598,13 @@ services:
         # Set it ONLY for an origin that does not proxy /api — e.g. the
         # cleartext :3000 break-glass path, where Next.js rewrites buffer SSE.
     image: ${SENTINEL_IMAGE_PREFIX:-sentinel}/dashboard:${SENTINEL_VERSION:-latest}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/login"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 4
+    logging: *logging
     restart: unless-stopped
     depends_on:
       controlplane: { condition: service_started }
@@ -619,6 +642,7 @@ services:
   juiceshop:
     profiles: [demo]
     image: bkimminich/juice-shop:latest
+    logging: *logging
     restart: unless-stopped
     mem_limit: 768m
     networks: [sentinel]
@@ -645,6 +669,7 @@ services:
   # "Sentinel WAF — Overview" dashboard. Grafana UI on host :3001.
   prometheus:
     image: ${SENTINEL_THIRDPARTY_PREFIX:-}prom/prometheus:v2.54.1
+    logging: *logging
     restart: unless-stopped
     command:
       - --config.file=/etc/prometheus/prometheus.yml
@@ -663,6 +688,7 @@ services:
 
   grafana:
     image: ${SENTINEL_THIRDPARTY_PREFIX:-}grafana/grafana:11.2.0
+    logging: *logging
     restart: unless-stopped
     environment:
       # Required, with no fallback. This used to default to literal "admin",

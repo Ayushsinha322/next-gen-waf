@@ -79,6 +79,13 @@ RUN go build -ldflags="-s -w \
  && go build -ldflags="-s -w" -o /out/sentinelctl  ./cmd/sentinelctl
 
 # ---- Data plane (Rust proxy) ----
+
+# A container healthcheck for the distroless runtime stages. Both distroless
+# images have no shell, no curl and no wget, so a compose `healthcheck` had
+# nowhere to run and neither container ever reported health to Docker. Static,
+# stdlib-only, ~5 MB stripped.
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/healthprobe ./cmd/healthprobe/
+
 FROM gcr.io/distroless/cc-debian12 AS sentinel-dataplane
 # Re-declared inside the stage: an ARG before the first FROM is global but is NOT
 # in scope in any stage until named again. Omitting these is the classic way to
@@ -117,6 +124,12 @@ ENTRYPOINT ["/usr/local/bin/sentinel"]
 # The alternative was cross-compiling it against musl, which means carrying a musl
 # toolchain and a second link configuration to save a few megabytes — the data
 # plane already runs on cc.
+# Container healthcheck. See control-plane/cmd/healthprobe for why a binary is
+# needed rather than a curl one-liner.
+COPY --from=go-builder /out/healthprobe /healthprobe
+HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=4 \
+  CMD ["/healthprobe", "http://127.0.0.1:8080/readyz"]
+
 FROM gcr.io/distroless/cc-debian12 AS sentinel-controlplane
 ARG GIT_SHA
 ARG BUILD_DATE
@@ -131,6 +144,11 @@ COPY --from=go-builder /out/sentinelctl  /usr/local/bin/sentinelctl
 COPY --from=srl-builder /src/target/release/sentinel-srl-validate /usr/local/bin/srl-validate
 EXPOSE 9501
 ENTRYPOINT ["/usr/local/bin/controllerd"]
+# Container healthcheck. See control-plane/cmd/healthprobe for why a binary is
+# needed rather than a curl one-liner.
+COPY --from=go-builder /out/healthprobe /healthprobe
+HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=4 \
+  CMD ["/healthprobe", "http://127.0.0.1:9501/readyz"]
 
 # ---- DB migrations (goose) ----
 # Self-contained migration runner: bundles the goose CLI + the SQL migrations so
