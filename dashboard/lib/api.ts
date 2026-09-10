@@ -392,7 +392,12 @@ export interface GlobalSettingsResponse {
   db_available: boolean;
   /** The data plane's own global config (listeners, TLS, logging, storage, eBPF,
    *  limits), read-only: it is the node's configuration file. */
-  dataplane:    { reachable: boolean; error?: string; config?: Record<string, unknown> };
+  /** What the node is actually running, from its /healthz — as opposed to what
+   *  its file asks for. Several controls are switched on by environment variable
+   *  rather than in the YAML, so the file alone misreports them. Absent when the
+   *  node could not be reached, which must render as "unknown", not "off". */
+  dataplane:    { reachable: boolean; error?: string; config?: Record<string, unknown>;
+                  runtime?: Record<string, unknown> | null };
 }
 
 /** GET /blocks — every active block, from three places. */

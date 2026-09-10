@@ -116,9 +116,18 @@ export default function OverviewPage() {
     async function f() {
       try { const p = await api.plugins.list(); if (!cancelled) setPlugins((p.plugins ?? []).length); } catch { /* */ }
       try {
-        const c = await api.cluster.status();
-        if (!cancelled) setInstances(c.enabled ? ((c.status?.peers?.length ?? 0) + 1) : 1);
-      } catch { if (!cancelled) setInstances(1); }
+        // /cluster/status describes THIS control-plane node (node_id, role,
+        // leader_id) and carries no peer list, so `status.peers?.length ?? 0`
+        // was always 0 and this card read "1 · standalone" on a healthy
+        // three-node cluster while the Cluster page showed 3/3 correctly.
+        // /cluster/health is the fleet roll-up that page uses.
+        const h = await api.cluster.health();
+        if (!cancelled) {
+          const dp = h.data_plane?.total ?? 0;
+          const cp = h.control_plane?.total ?? 0;
+          setInstances(Math.max(dp, cp, 1));
+        }
+      } catch { if (!cancelled) setInstances(null); }
     }
     f(); const t = setInterval(f, 30_000); return () => { cancelled = true; clearInterval(t); };
   }, []);
@@ -291,7 +300,7 @@ export default function OverviewPage() {
       <motion.div variants={staggerContainer} style={{ display: "grid", gridTemplateColumns: "repeat(5,minmax(0,1fr))", gap: 14 }}>
         <motion.div className="mc blue" variants={cardVariants}><div className="mc-label">Requests / sec</div><div className="mc-val"><AnimatedValue value={rps} /></div><div className="mc-delta up">▲ live · 1-sec samples</div></motion.div>
         <motion.div className="mc red" variants={cardVariants}><div className="mc-label">Threats blocked</div><div className="mc-val"><AnimatedValue value={blkCount} /></div><div className="mc-delta up">▲ {openAlerts} open alerts</div></motion.div>
-        <motion.div className="mc green" variants={cardVariants}><div className="mc-label">p99 Latency</div><div className="mc-val">{p99 > 0 ? p99.toFixed(2) + "ms" : "—"}</div><div className="mc-delta up">▼ sub-millisecond target</div></motion.div>
+        <motion.div className="mc green" variants={cardVariants}><div className="mc-label">p99 Latency</div><div className="mc-val">{p99 > 0 ? p99.toFixed(2) + "ms" : "—"}</div><div className="mc-delta up" title="End-to-end p99 across the WAF and the origin. The WAF's own share is reported per node on the Cluster page.">▼ end-to-end, incl. origin</div></motion.div>
         <motion.div className="mc pur" variants={cardVariants}><div className="mc-label">ML detections</div><div className="mc-val"><AnimatedValue value={mlDet} /></div><div className="mc-delta" style={{ color: "#c4b5fd" }}>▲ anomaly engine active</div></motion.div>
         <motion.div className="mc cyan" variants={cardVariants}>
           <div className="mc-label">HTTP/3</div>
