@@ -16,6 +16,23 @@ to anyone clicking through.
 
 ## P0 — this week. Incident risk, or visibly wrong in a demo.
 
+> **All nine closed and DEPLOYED to .71 as `bf0e4bc` on 2026-09-10.** Verified on the
+> box, 16 checks passing, against a pre-roll baseline that reproduced every defect
+> (14 uncapped logs, 7 containers with no healthcheck, 11 open criticals, 78 acked
+> `cmdinj`, `dataplane.runtime` absent). Evidence in the control-plane log:
+> `resolved stale node_down alerts count:3`, `resolved orphaned infrastructure
+> alerts count:8`, `auto-resolved quiet alerts count:78`. B2 was proved
+> behaviourally by seeding one open alert outside the 200-row window — old logic
+> counted 0, new logic counted 1 — then deleting it.
+>
+> ⚠️ **Roll this box with `--profile demo`.** Without it compose leaves
+> `juiceshop` untouched, so it kept a 163 MB uncapped log through a roll that
+> capped everything else. `juice.local` is NOT one of its domains — the site
+> answers on `172.16.21.71`, `juice`, `localhost`, `wafdemo.esds.local`, and it is
+> deliberately in **learning** mode, so an attack there returns 200 with a scored
+> event (`anomaly_score 67`, 12 CRS rules), not a block.
+
+
 ### Operational hygiene
 
 - [x] **A1. No log rotation on any service.** Not one service in `compose.prod.yml` caps its
