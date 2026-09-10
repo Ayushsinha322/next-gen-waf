@@ -127,28 +127,65 @@ to anyone clicking through.
 
 ## P1 — this week if time. Polish and honesty.
 
-- [ ] **B6. Logout is client-only.** `lib/auth.ts` clears local storage and the cookie but
+- [x] **B6. Logout is client-only.** `lib/auth.ts` clears local storage and the cookie but
       never calls `POST /api/v1/auth/logout`, so the server-side refresh-token revocation
       built in July is inert from the UI and a refresh token stays valid for its full window.
-- [ ] **B7. "Pro ● CURRENT PLAN" badge** is `ACTIVE_PLAN = "pro"` hardcoded in
+      **Fixed** (`9cd9824`) — Added `signOut()`, which calls the endpoint and then
+      clears locally; best-effort so a failed revoke cannot trap someone in a session
+      they asked to leave. Only the TopBar control was rewired — the password-change and
+      password-reset flows have already invalidated every session for the account, so
+      their token is dead and the local-only clear is right. Kept separate from
+      `logout()`, which the 401 path calls.
+
+- [x] **B7. "Pro ● CURRENT PLAN" badge** is `ACTIVE_PLAN = "pro"` hardcoded in
       `lib/plans.ts`. Marketing furniture on an operations screen. Remove, or wire to a real
       entitlement.
-- [ ] **B8. Mixed branding and internal strings in the UI.** "Next-Gen ESDS WAF" appears six
+      **Fixed** (`9cd9824`) — Removed, along with `lib/plans.ts`. No entitlement concept
+      exists to wire it to, and it advertised limits nothing enforces (90-day logs,
+      unlimited sites) in the prime row of an operations screen.
+
+- [x] **B8. Mixed branding and internal strings in the UI.** "Next-Gen ESDS WAF" appears six
       times and "Sentinel WAF" once; a shipped certificate is named
       *"shared fleet self-signed (interim — see fix/https-ha-single-homing)"*, putting a git
       branch name in front of a customer; Settings carries developer text naming source files
       ("Adding a language is one file in dashboard/lib/i18n.tsx"). Product name should be
       **Swaraj Kavach** per the branding decision.
-- [ ] **C2. Tooltips on every KPI.** Overview has thirteen stat blocks and one `title`
+      **Fixed** (`9cd9824`) — One `PRODUCT_NAME` constant beside `PRODUCT_VERSION`,
+      which exists for the same reason. Six hand-written call sites had already drifted
+      three ways. The Settings hint no longer names a source file. The two certificate
+      labels were DATA on .71, not code — renamed on the box, including the one carrying
+      a git branch name in front of a customer.
+
+- [x] **C2. Tooltips on every KPI.** Overview has thirteen stat blocks and one `title`
       attribute. Every number needs what it counts and over what window. SafeLine has a
       tooltip on every statistic. This also fixes the root cause behind B4 and B13.
-- [ ] **C5. First-run explainer banners with "Don't show again."** We have zero across the
+      **Fixed** (`9cd9824`) — A tooltip on all twelve statistics, with windows read off
+      the hub rather than guessed (10-second ring for RPS, 1000-sample ring per p99,
+      plain counters elsewhere that reset with the control plane). Found another false
+      caption of the B4 kind on the way: Requests/sec claimed “live · 1-sec samples”
+      over a 10-second window. Also surfaces `p99_waf_ms`, which the snapshot always
+      carried and this page never read, so the card now shows the WAF's own share — what
+      B4 actually asked for.
+
+- [x] **C5. First-run explainer banners with "Don't show again."** We have zero across the
       console; SafeLine has them on Attacks, Rate Limiting and Anti-Bot. Add to Rules,
       Threat Search, Plugins and Blocked Sources.
-- [ ] **A3. Pin `juice-shop:latest`** in `compose.prod.yml`, or move it out of the production
+      **Fixed** (`9cd9824`) — New `components/ui/FirstRunNote.tsx` on Rules, Threat
+      Search, Plugins and Blocked Sources. Each states the one thing that screen cannot
+      be inferred from. Dismissal is per-browser: orientation is not tenant
+      configuration. Every claim was checked against the code first — the 500-per-type
+      indicator cap came from the handler.
+
+- [x] **A3. Pin `juice-shop:latest`** in `compose.prod.yml`, or move it out of the production
       compose entirely. It is behind a `demo` profile so it does not start by default, but a
       deliberately vulnerable application with a floating tag in the production compose is
       what an auditor circles. It has already shipped starting unconditionally once.
+      **Fixed** (`9cd9824`) — Pinned by tag AND registry manifest digest
+      (`v20.1.1@sha256:cd58d79c…`), verified to resolve on a host that has not pulled
+      it. It had already floated: `latest` resolved to `sha256:73c53fbf…` while the box
+      ran 20.1.1 and v20.2.0 was published. Moving it out of the production compose is
+      the stronger fix and is deliberately NOT done — it would break the documented
+      `--profile demo` procedure on the .88/.89 pair.
 
 ---
 
