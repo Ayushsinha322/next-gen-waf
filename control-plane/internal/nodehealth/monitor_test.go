@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/your-org/sentinel-waf/control-plane/internal/alerting"
 	"github.com/your-org/sentinel-waf/control-plane/internal/db"
 )
 
@@ -55,5 +56,26 @@ func TestHealthyNodeIDsBoundaryIsInclusive(t *testing.T) {
 func TestHealthyNodeIDsEmpty(t *testing.T) {
 	if got := healthyNodeIDs(nil, time.Minute, time.Now()); len(got) != 0 {
 		t.Fatalf("no nodes should give an empty healthy set, got %v", got)
+	}
+}
+
+// The two sweeps are allowlists, and a kind named by neither is owned by nothing:
+// its rows stay open or acknowledged for ever. That is how eleven criticals from
+// 13 July and 78 acknowledged cmdinj rows survived. A kind named by BOTH is just
+// as bad in the other direction — whichever sweep ran first would decide the
+// resolve reason, so the two lists must stay disjoint.
+func TestSweepListsAreDisjoint(t *testing.T) {
+	event := map[string]bool{}
+	for _, k := range alerting.EventDrivenKinds {
+		event[k] = true
+	}
+	for _, k := range orphanedInfraKinds {
+		if event[k] {
+			t.Fatalf("kind %q is claimed by both EventDrivenKinds and orphanedInfraKinds", k)
+		}
+	}
+	// node_down is reconciled against live node health, not by either list.
+	if event["node_down"] {
+		t.Fatal("node_down must not auto-resolve on quiet; it is reconciled against heartbeats")
 	}
 }
