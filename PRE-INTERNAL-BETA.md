@@ -127,6 +127,28 @@ to anyone clicking through.
 
 ## P1 — this week if time. Polish and honesty.
 
+> **All six closed and DEPLOYED to .71 as `0fda530` on 2026-09-11.** 23 checks passing,
+> and the P0 fixes re-checked in the same run (logs capped, seven containers healthy, no
+> unresolved alerts, eBPF still kernel-xdp).
+>
+> B6 was proved by revocation, not by inspection: a token returned 200, `POST /auth/logout`
+> was called with it, and the same token then returned **401**.
+>
+> ⚠️ **Roll the whole stack, not just the changed service.** `up -d dashboard` recreated the
+> control plane as a dependency but left cp2, cp3 and waf1–3 on the previous tag, so the
+> fleet reported two versions at once on a deployment whose whole point is one version
+> string. The images were byte-identical (verified by image ID); the tag was not.
+>
+> **Not a defect, worth knowing:** the data plane's own NDJSON logs are rotated separately
+> from the container logs A1 capped — `SENTINEL_LOG_MAX_MB` (100) × `SENTINEL_LOG_KEEP` (5),
+> so ~600 MB per stream per node, ~3.6 GB worst case across the three. Currently 651 MB.
+>
+> **Measurement note:** a p99 is a tail, and the load I generated while verifying pushed the
+> Overview's p99 to 1.2 s. After flushing the 1000-sample ring with sequential traffic it
+> reads **33 ms end-to-end, 15.6 ms WAF**. Typical WAF cost over the last 300 requests is a
+> median of **3.92 ms**, which is the figure the audit quoted.
+
+
 - [x] **B6. Logout is client-only.** `lib/auth.ts` clears local storage and the cookie but
       never calls `POST /api/v1/auth/logout`, so the server-side refresh-token revocation
       built in July is inert from the UI and a refresh token stays valid for its full window.
