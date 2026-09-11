@@ -103,7 +103,10 @@ export default function OverviewPage() {
     async function f() {
       try {
         const r = await api.waf.status();
-        if (!cancelled) setWafStatus({ running: r.waf_running, uptime: r.uptime_secs, sites: r.sites, upstreams_healthy: r.upstreams_healthy, upstreams_total: r.upstreams_total, http3: r.http3 });
+        // geoip was in the response all along and was never copied here, so the
+        // System Health row and the world map both rendered their "unknown"
+        // branch no matter what the data plane reported.
+        if (!cancelled) setWafStatus({ running: r.waf_running, uptime: r.uptime_secs, sites: r.sites, upstreams_healthy: r.upstreams_healthy, upstreams_total: r.upstreams_total, http3: r.http3, geoip: r.geoip });
       } catch { setWafStatus(null); }
     }
     f(); const t = setInterval(f, 10_000); return () => { cancelled = true; clearInterval(t); };

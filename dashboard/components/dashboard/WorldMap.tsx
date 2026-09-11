@@ -272,8 +272,13 @@ export default function WorldMap({
                   which have no country in any database. */}
               {dbPresent === false ? (
                 <>Country database not loaded yet — the <span style={{ color: "var(--cyan)" }}>geoip.refresh</span> job downloads it (System Jobs → Run now), or set <span style={{ color: "var(--cyan)" }}>SENTINEL_GEOIP_DB</span> to your own .mmdb.</>
-              ) : (
+              ) : dbPresent === true ? (
                 <>Country database loaded. No country-attributed traffic yet — requests from private or loopback addresses (10.x, 172.16–31.x, 192.168.x, 127.x) have no country in any database, so they cannot appear here.</>
+              ) : (
+                // Unknown is a third state, not a synonym for "loaded". The first
+                // version collapsed undefined into the loaded branch — right on .71
+                // by accident, and a lie anywhere the data plane was unreachable.
+                <>No country-attributed traffic yet. Database state unknown — the data plane did not report it.</>
               )}
             </span>
           </div>
@@ -288,7 +293,7 @@ export default function WorldMap({
         </div>
         {ranked.length === 0 ? (
           <div style={{ fontSize: 14, color: "var(--text3)", fontFamily: "var(--font-mono)", padding: "8px 0" }}>
-            {loaded ? "No blocked traffic yet" : "Awaiting GeoIP data"}
+            {loaded ? "No blocked traffic yet" : "No country-attributed events yet"}
           </div>
         ) : ranked.map(([code, n]) => (
           <div key={code} style={{ display: "flex", alignItems: "center", gap: 8 }}>

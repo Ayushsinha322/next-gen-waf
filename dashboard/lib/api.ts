@@ -1337,7 +1337,15 @@ export const api = {
 
   waf: {
     status: () =>
-      apiFetch<{ waf_running: boolean; uptime_secs?: number; sites?: number; listeners?: string[]; upstreams_healthy?: number; upstreams_total?: number; http3?: { enabled: boolean; listener?: string; bind?: string; advertise_port?: number }; error?: string }>("/waf/status"),
+      apiFetch<{ waf_running: boolean; uptime_secs?: number; sites?: number; listeners?: string[]; upstreams_healthy?: number; upstreams_total?: number;
+                 http3?: { enabled: boolean; listener?: string; bind?: string; advertise_port?: number };
+                 /** Forwarded verbatim from the data plane's /healthz. The control plane has
+                  *  always sent this; the dashboard type never declared it and the Overview
+                  *  never copied it, so every GeoIP row rendered its "unknown" branch. */
+                 geoip?: { configured: number; active: number;
+                           inert: { site: string; db_path: string; db_present: boolean }[];
+                           database?: { path: string; present: boolean; size_bytes: number } };
+                 error?: string }>("/waf/status"),
   },
 
   certs: {
