@@ -690,9 +690,12 @@ services:
   #   practice :  docker compose -f compose.prod.yml -f compose.ghost.yml \
   #                              --profile ghost up -d ghost-db ghost
 
-  # Metrics stack. Prometheus scrapes the control plane's /metrics (real
-  # aggregated WAF metrics); Grafana ships a provisioned datasource + the
-  # "Sentinel WAF — Overview" dashboard. Grafana UI on host :3001.
+  # Metrics. Prometheus scrapes the control plane's /metrics (real aggregated
+  # WAF metrics) and is the only consumer of them here. Grafana used to sit in
+  # front of it and was removed: AGPLv3, started by default, shipped in the
+  # bundle, published a port, and referenced by nothing in the dashboard or the
+  # control plane. Prometheus keeps its own expression browser on :9090 if a
+  # human needs to query it.
   prometheus:
     image: ${SENTINEL_THIRDPARTY_PREFIX:-}prom/prometheus:v2.54.1
     logging: *logging

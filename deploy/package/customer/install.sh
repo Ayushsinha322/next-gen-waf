@@ -330,7 +330,7 @@ else
 fi
 
 # This bundle ships only the four ESDSWAF images; Postgres, Redis, ClickHouse,
-# Prometheus and Grafana are pulled from Docker Hub. Check that NOW rather than
+# Prometheus is pulled from Docker Hub. Check that NOW rather than
 # failing halfway through `up -d`.
 manifest_list() { # manifest_list KEY — the quoted strings of a top-level array
   awk -v k="\"$1\"" '
@@ -515,7 +515,7 @@ else
 # Contains every secret for this deployment. Back it up; never share it.
 SENTINEL_VERSION=$BUNDLE_VERSION
 SENTINEL_IMAGE_PREFIX=${REGISTRY_PREFIX:-sentinel}
-# Where Postgres/Redis/ClickHouse/Prometheus/Grafana/HAProxy come from. Empty means
+# Where Postgres/Valkey/ClickHouse/Prometheus/HAProxy come from. Empty means
 # Docker Hub. In registry mode it is set so the whole deployment pulls from one
 # host — otherwise our four images would come from the mirror while the other six
 # still reached for the internet and hung on a closed network.

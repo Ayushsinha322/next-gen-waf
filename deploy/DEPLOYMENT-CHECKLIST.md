@@ -63,7 +63,7 @@ whether blocking breaks a real login flow.
 
 - [ ] **Runbook**: deploy, upgrade, rollback, config hot-reload, emergency "WAF off" switch. One doc, tested.
 - [ ] **Backup + restore drill**: Postgres (config/rules/users) + certs. Actually restore, don't just back up.
-- [ ] **Monitoring live**: Prometheus + Grafana dashboards (already scaffolded) showing block rate, latency,
+- [ ] **Monitoring live**: Prometheus scraping the control plane (no Grafana — bring your own) showing block rate, latency,
       anomaly scores, health. Confirm they render on the deploy box.
 - [ ] **Alerting**: page on block-rate spikes (possible FP storm or attack), cert expiry, WAF/DB down, ML model
       load failure.

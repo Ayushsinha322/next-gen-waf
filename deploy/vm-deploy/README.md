@@ -77,7 +77,7 @@ than failing halfway through.
 > removed the images from the download altogether.
 >
 > The offline bundle still needs splitting: most of it is the six third-party
-> images (ClickHouse, Grafana, Postgres, Prometheus, Redis, HAProxy), which we do
+> images (ClickHouse, Postgres, Prometheus, Valkey, HAProxy), which we do
 > not build and cannot shrink. `get-esdswaf.sh` reassembles the parts
 > automatically; by hand it is one `cat`, and the checksum proves the join is
 > lossless.

@@ -4,7 +4,7 @@
 #
 #      GITLAB_TOKEN=… HARBOR_USER=… HARBOR_TOKEN=… ./mirror-thirdparty.sh
 #
-#  Copies Postgres, Redis, ClickHouse, Prometheus, Grafana and HAProxy from Docker
+#  Copies Postgres, Valkey, ClickHouse, Prometheus and HAProxy from Docker
 #  Hub into hub.enlight.dev/swaraj-kavach, under the SAME repository names compose
 #  asks for, so a registry-mode install reaches exactly one host.
 #

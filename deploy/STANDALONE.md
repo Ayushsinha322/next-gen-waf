@@ -105,7 +105,7 @@ It asks for two things and generates everything else:
 2. **Administrator email**
 
 Every secret — database passwords, session signing key, audit HMAC key, internal
-service token, Grafana password — is generated with `openssl rand`. You are never
+service token — is generated with `openssl rand`. You are never
 asked to invent one. They are written to `/opt/sentinel/current/.env`, mode 0600.
 **Back that file up; it is not recoverable.**
 

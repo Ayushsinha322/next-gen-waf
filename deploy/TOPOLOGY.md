@@ -1,7 +1,7 @@
 # Deployment topology
 **Generated** by `deploy/gen-topology.py` from the merged compose configuration. Do not edit by hand.
 
-The production deployment is **3 compose files, 1322 lines**, applied as an override chain:
+The production deployment is **3 compose files, 1325 lines**, applied as an override chain:
 
 1. `deploy/docker/compose.prod.yml`
 2. `deploy/docker/compose.cluster.yml`

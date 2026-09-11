@@ -238,7 +238,7 @@ whether or not it has internet, because Harbor lives on an internal address
 (`172.16.23.2`) that does not route from outside ESDS.
 
 The small one pulls six standard images (Postgres, Redis, ClickHouse, Prometheus,
-Grafana, HAProxy) from Docker Hub during the install. The offline one carries all
+HAProxy) from Docker Hub during the install. The offline one carries all
 ten images inside it and needs no internet at all.
 
 **If in doubt, and the VM has internet, use `-online`.** You cannot pick the wrong
@@ -723,7 +723,7 @@ normal: 200
 sqli:   200
 ```
 
-> **Why `/login` and not `/`?** Grafana redirects `/` to its login page, so `/`
+> **Why `/login` and not `/`?** Many apps redirect `/` to a login page, so `/`
 > answers **302**, not 200 — which would make both numbers above read `302` and
 > leave you unable to tell a working WAF from a broken one. `/login` is the same
 > upstream, reached the same way, and answers 200. If you do test `/` and see

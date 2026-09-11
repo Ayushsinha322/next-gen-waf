@@ -68,9 +68,8 @@ security appliance, and exposing it on a network interface would expose it to
 everything that network touches, including the internet if the host is ever given
 a public IP. Full explanation in [INSTALL-WALKTHROUGH.md](../vm-deploy/INSTALL-WALKTHROUGH.md) §3.
 
-There is also a plain-HTTP break-glass UI on `127.0.0.1:3000` and Grafana on
-`127.0.0.1:3001`, both loopback-only, both reachable the same way (`ssh -L
-3001:127.0.0.1:3001 …`).
+There is also a plain-HTTP break-glass UI on `127.0.0.1:3000`, loopback-only,
+reachable over a tunnel (`ssh -L 3000:127.0.0.1:3000 …`).
 
 ---
 
@@ -236,8 +235,11 @@ Point your existing NOC monitoring at these on the WAF's traffic port:
 | `/readyz` | The node can actually protect traffic right now. **This is the one to alert on** — it goes 503 during shutdown *before* the node stops accepting traffic, so a load balancer drains cleanly |
 | `/metrics` | Prometheus metrics: request counts, blocks, latency, rule hits |
 
-Prometheus and Grafana ship with the product; Grafana is on `127.0.0.1:3001`
-(tunnel to reach it) with a provisioned WAF overview dashboard.
+Prometheus ships with the product on `127.0.0.1:9090` (tunnel to reach it); its
+expression browser is enough to query these metrics directly. There is no Grafana:
+it was removed in September 2026 — AGPLv3, shipped in the bundle, and referenced by
+nothing in the product. Point your own Grafana or other dashboarding at this
+Prometheus if you want charts.
 
 ### What to alert on
 
