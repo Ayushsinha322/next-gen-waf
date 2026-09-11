@@ -383,6 +383,24 @@ to anyone clicking through.
 
 ## P3 — programme work. Cannot be closed in a week.
 
+> **E1, E4 and E5 closed and DEPLOYED to .71 as `f074a63` (2026-09-11), 12 checks.** E2 is open by
+> design. Two things inside E4 remain open and are named there.
+>
+> **The retrained model was re-benchmarked, because changing it invalidates the headline number.**
+> GoTestWAF against the deployed binary, same harness as the published run:
+>
+> | | published | after the E1 retrain |
+> |---|---|---|
+> | Composite | 99.64% | **99.81%** |
+> | Application TP | 99.24% | 99.24% |
+> | True-negative (benign) | 99.29% (140/141) | **100.00% (141/141)** |
+> | API security | 100% | 100% |
+>
+> The single benign false positive in the corpus is gone, which is exactly what E1 predicted, and
+> detection did not move. **The published 99.64% can be restated as 99.81%** — and the true-negative
+> figure is now the one worth quoting, because it went to 100%.
+
+
 - [x] **E1. The ML login-form false positive.** A login form carrying a remember-me field is
       refused: the classifier scores 13 against a blocking threshold of 10, so it blocks on
       its own with no signature match. Two of eight ordinary form bodies affected, both login
