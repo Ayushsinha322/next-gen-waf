@@ -1,5 +1,5 @@
 "use client";
-import { PRODUCT_VERSION } from "@/lib/version";
+import { PRODUCT_NAME, PRODUCT_VERSION } from "@/lib/version";
 import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
@@ -164,8 +164,7 @@ export default function TopBar() {
         </motion.div>
         <div>
           <div className="tb-nm">
-            <span className="s">NEXT-GEN ESDS</span>
-            <span className="w">WAF</span>
+            <span className="w">{PRODUCT_NAME}</span>
           </div>
           <div className="tb-ver">v{PRODUCT_VERSION}</div>
         </div>

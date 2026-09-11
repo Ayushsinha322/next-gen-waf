@@ -334,7 +334,7 @@ export default function OverviewPage() {
             <div className="ptitle" title={tip.byOrigin}>Blocked requests by origin</div>
             <span className="panel-badge pb-info" title={tip.byOrigin}>{geoLoaded ? `event store · ${Object.keys(byCountry).length} countries` : "event store · awaiting events"}</span>
           </div>
-          <div className="pb"><WorldMap data={byCountry} loaded={geoLoaded} /></div>
+          <div className="pb"><WorldMap data={byCountry} loaded={geoLoaded} dbPresent={wafStatus?.geoip?.database?.present} /></div>
         </div>
         <div className="panel" style={{ display: "flex", flexDirection: "column" }}>
           <div className="ph"><div className="ptitle">Response status</div><span className="panel-badge pb-info">{sTotal.toLocaleString()} reqs</span></div>

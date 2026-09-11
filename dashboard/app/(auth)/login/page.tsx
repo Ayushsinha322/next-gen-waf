@@ -251,8 +251,8 @@ export default function LoginPage() {
               </svg>
             </motion.div>
             <div>
-              <div id="brand-text">NEXT-GEN ESDS <span className="w">WAF</span></div>
-              <div id="brand-sub">Enterprise Security Platform</div>
+              <div id="brand-text"><span className="w">{PRODUCT_NAME}</span></div>
+              <div id="brand-sub">Web Application Firewall</div>
             </div>
           </motion.div>
 

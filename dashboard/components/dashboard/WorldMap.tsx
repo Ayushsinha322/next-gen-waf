@@ -25,8 +25,14 @@ const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v
 interface Menu { code: string; name: string; flag: string; n: number; ox: number; oy: number }
 
 export default function WorldMap({
-  data, loaded,
-}: { data: Record<string, number>; loaded: boolean }) {
+  data, loaded, dbPresent,
+}: {
+  data: Record<string, number>;
+  /** There is country-attributed event data to draw. NOT "the database exists". */
+  loaded: boolean;
+  /** The country database is present on the data plane. Undefined = unknown. */
+  dbPresent?: boolean;
+}) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const [view, setView] = useState({ s: 1, tx: 0, ty: 0 });
   const [hover, setHover] = useState<string | null>(null);
@@ -238,7 +244,7 @@ export default function WorldMap({
             </button>
             {!loaded && (
               <div style={{ fontSize: 12, color: "var(--text3)", marginTop: 6, lineHeight: 1.4, fontFamily: "var(--font-mono)" }}>
-                Stored now — enforces once the country database is downloaded (System Jobs → geoip.refresh).
+                {dbPresent === false ? "Stored now — enforces once the country database is downloaded (System Jobs → geoip.refresh)." : "Stored — applies within about 5 seconds."}
               </div>
             )}
           </div>
@@ -258,7 +264,17 @@ export default function WorldMap({
           }}>
             <span style={{ fontSize: 18 }}>{"\u{1F30D}"}</span>
             <span style={{ fontSize: 14, color: "var(--text3)", lineHeight: 1.5, fontFamily: "var(--font-mono)" }}>
-              Country database not loaded yet — the <span style={{ color: "var(--cyan)" }}>geoip.refresh</span> job downloads it (System Jobs → Run now), or set <span style={{ color: "var(--cyan)" }}>SENTINEL_GEOIP_DB</span> to your own .mmdb.
+              {/* `loaded` means "there are country-attributed events to draw", which
+                  is NOT the same as "the database is missing". Saying the latter
+                  when the database is sitting there loaded sends an operator to
+                  re-run a job that already worked — and the usual real reason for
+                  an empty map is that the traffic came from private addresses,
+                  which have no country in any database. */}
+              {dbPresent === false ? (
+                <>Country database not loaded yet — the <span style={{ color: "var(--cyan)" }}>geoip.refresh</span> job downloads it (System Jobs → Run now), or set <span style={{ color: "var(--cyan)" }}>SENTINEL_GEOIP_DB</span> to your own .mmdb.</>
+              ) : (
+                <>Country database loaded. No country-attributed traffic yet — requests from private or loopback addresses (10.x, 172.16–31.x, 192.168.x, 127.x) have no country in any database, so they cannot appear here.</>
+              )}
             </span>
           </div>
         )}
