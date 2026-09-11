@@ -77,6 +77,54 @@ impl JwksCache {
     /// otherwise the endpoint is re-fetched. On a fetch failure a stale copy is
     /// returned when one exists, else an empty map (the caller then fails
     /// closed by rejecting the token).
+    /// Queryable state for `/healthz`.
+    ///
+    /// Everything this cache knows was previously reachable only by reading
+    /// container logs. That is the wrong channel for it: the diagnostics are
+    /// LATCHED to fire on a change of state (an unknown `kid` forces a fetch on
+    /// the request path, so an unlatched line would turn an IdP incident into a
+    /// log flood), which means the one line explaining a JWT outage may have
+    /// scrolled past hours before anyone looks. `threat_intel` already reports
+    /// itself here and JWT did not, so a site rejecting every token because its
+    /// IdP published one key with an unmodelled `kty` looked, from outside,
+    /// exactly like a site with no traffic.
+    ///
+    /// An empty object means no site on this node has a JWKS endpoint
+    /// configured — not that JWT validation is broken.
+    pub(crate) async fn status(&self) -> serde_json::Value {
+        let entries = self.entries.read().await;
+        let diags = self
+            .last_diag
+            .lock()
+            .ok()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        let mut out = serde_json::Map::new();
+        for (url, entry) in entries.iter() {
+            let age = entry.fetched.elapsed();
+            let mut o = serde_json::json!({
+                "usable_keys": entry.keys.len(),
+                "age_secs": age.as_secs(),
+                // Past the TTL the next request re-fetches; if that fetch fails
+                // these keys keep being served. Non-fresh is therefore normal,
+                // but non-fresh AND a failing fetch is the state to alert on.
+                "fresh": age < JWKS_TTL,
+            });
+            if let Some(d) = diags.get(url) {
+                o["parse_failed"] = serde_json::json!(d.parse_failed);
+                o["skipped_no_kid"] = serde_json::json!(d.skipped_no_kid);
+                o["skipped_unusable"] = serde_json::json!(d.skipped_unusable);
+                // Named separately because DecodingKey::from_jwk accepts `oct`
+                // keys as HMAC verification keys: if the algorithm allow-list
+                // includes any HS*, anyone who can GET this public JWKS can mint
+                // tokens this node accepts.
+                o["symmetric_keys"] = serde_json::json!(d.symmetric);
+            }
+            out.insert(url.clone(), o);
+        }
+        serde_json::Value::Object(out)
+    }
+
     pub(crate) async fn keys(&self, url: &str, wanted_kid: Option<&str>) -> KeyMap {
         // Fast path: fresh entry that already has the key we need.
         {
@@ -231,5 +279,82 @@ impl JwksCache {
             }
         }
         Ok(keys)
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    /// No site configured a JWKS endpoint. This must be an EMPTY object, not an
+    /// absent key and not an error: "nobody uses JWT here" and "JWT is broken"
+    /// are different answers and the whole point of surfacing this is to tell
+    /// them apart.
+    #[tokio::test]
+    async fn empty_cache_reports_an_empty_object() {
+        let c = JwksCache::new();
+        let s = c.status().await;
+        assert!(s.is_object(), "status must be an object, got {s}");
+        assert_eq!(s.as_object().unwrap().len(), 0);
+    }
+
+    /// A populated endpoint reports its key count and freshness. Freshness is
+    /// the field that matters operationally: past the TTL the next request
+    /// re-fetches, and if that fetch fails these keys keep being served — so
+    /// `fresh: false` alongside a failing fetch is the state that explains an
+    /// outage, and it is exactly what could not be seen before.
+    #[tokio::test]
+    async fn populated_endpoint_reports_keys_and_freshness() {
+        let c = JwksCache::new();
+        {
+            let mut g = c.entries.write().await;
+            g.insert(
+                "https://idp.example/.well-known/jwks.json".to_string(),
+                CachedJwks {
+                    keys: Arc::new(HashMap::new()),
+                    fetched: Instant::now(),
+                },
+            );
+        }
+        let s = c.status().await;
+        let e = &s["https://idp.example/.well-known/jwks.json"];
+        assert_eq!(e["usable_keys"], 0);
+        assert_eq!(e["fresh"], true);
+        assert!(e["age_secs"].as_u64().unwrap() < 5);
+    }
+
+    /// The parse diagnostics ride along when one has been recorded — including
+    /// `symmetric_keys`, which is a security fact and not a statistic: an `oct`
+    /// key in a public JWKS combined with an HS* algorithm in the allow-list
+    /// lets anyone who can GET that document mint tokens this node accepts.
+    #[tokio::test]
+    async fn diagnostics_are_reported_when_present() {
+        let c = JwksCache::new();
+        let url = "https://idp.example/jwks";
+        {
+            let mut g = c.entries.write().await;
+            g.insert(
+                url.to_string(),
+                CachedJwks {
+                    keys: Arc::new(HashMap::new()),
+                    fetched: Instant::now(),
+                },
+            );
+        }
+        c.last_diag.lock().unwrap().insert(
+            url.to_string(),
+            JwksDiagState {
+                parse_failed: true,
+                usable: 0,
+                skipped_no_kid: 2,
+                skipped_unusable: 1,
+                symmetric: 3,
+            },
+        );
+        let s = c.status().await;
+        assert_eq!(s[url]["parse_failed"], true);
+        assert_eq!(s[url]["skipped_no_kid"], 2);
+        assert_eq!(s[url]["skipped_unusable"], 1);
+        assert_eq!(s[url]["symmetric_keys"], 3);
     }
 }

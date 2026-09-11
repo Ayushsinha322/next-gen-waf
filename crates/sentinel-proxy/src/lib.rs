@@ -2693,7 +2693,7 @@ async fn handle_request(
     // GET /healthz or GET /health returns JSON with proxy uptime, site
     // count, and listener status.  No auth required; internal-only.
     if req.uri().path() == "/healthz" || req.uri().path() == "/health" {
-        return Ok(health_response(&state));
+        return Ok(health_response(&state).await);
     }
 
     // Kubernetes READINESS probe. Unlike /healthz (liveness — "the process is
@@ -7030,6 +7030,11 @@ async fn handle_internal_cert_api(
                 email: String,
                 #[serde(default)]
                 provider: Option<String>,
+                /// Explicit ACME directory URL, overriding `provider`. Pointing
+                /// this at a local ACME server is what makes the
+                /// challenge-and-issue path testable without a public address.
+                #[serde(default)]
+                ca_server: Option<String>,
                 #[serde(default)]
                 challenge: Option<String>,
                 #[serde(default)]
@@ -7054,6 +7059,7 @@ async fn handle_internal_cert_api(
             let cfg = SiteAcmeConfig {
                 email: r.email,
                 provider,
+                ca_server: r.ca_server.unwrap_or_default(),
                 challenge,
                 renew_before_days: r.renew_before_days.unwrap_or(30),
             };
@@ -7567,7 +7573,8 @@ fn rules_inventory_response(state: &ServerState, query: Option<&str>) -> Respons
         .unwrap()
 }
 
-fn health_response(state: &ServerState) -> Response<BoxBody> {
+async fn health_response(state: &ServerState) -> Response<BoxBody> {
+    let jwks_status = state.modules.jwks.status().await;
     use std::time::SystemTime;
 
     let cfg = state.config.load();
@@ -7659,6 +7666,13 @@ fn health_response(state: &ServerState) -> Response<BoxBody> {
         // the field that matters — non-empty means a site's country policy is
         // displayed and not applied, because no MaxMind database is present.
         "geoip": geoip_status(&state.config.load(), &state.modules.geoip_map.load()),
+        // JWT/JWKS. Everything this reports was previously reachable only by
+        // reading container logs, and those diagnostics are latched to fire on a
+        // CHANGE of state — so the single line explaining why every token is
+        // being rejected may have scrolled past long before anyone looks. An
+        // empty object means no site here has a JWKS endpoint, not that JWT
+        // validation is broken.
+        "jwt": jwks_status,
         // WASM plugins. `loaded` is what this node holds; `per_site` is who
         // actually runs each one (plugins are opt-in per site since 2026-09-07 —
         // before that every loaded module judged every site's traffic).

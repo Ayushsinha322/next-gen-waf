@@ -213,7 +213,7 @@ impl AcmeClient {
         let http = build_https_client();
 
         // Fetch the ACME directory (plain GET is allowed for the directory).
-        let dir_url = provider_url(&config.provider);
+        let dir_url = directory_url(config)?;
         let dir_json = http_get_json(&http, dir_url).await?;
         let directory: AcmeDirectory =
             serde_json::from_value(dir_json).context("parsing ACME directory")?;
@@ -627,6 +627,36 @@ fn header_str<B>(resp: &http::Response<B>, name: &str) -> Option<String> {
 // Utilities
 // ---------------------------------------------------------------------------
 
+/// The ACME directory URL to use: an explicit `ca_server` wins over the
+/// `provider` enum.
+///
+/// Pure and separate from the client so it can be tested — the selection used to
+/// be one line inside an async fn that immediately fetched the URL, which meant
+/// the only way to check it was to make a network request.
+///
+/// Only an authenticated administrator of this deployment can set `ca_server`,
+/// and choosing a CA is their decision. But it is an outbound URL this node will
+/// fetch and whose certificates it will then serve, so the scheme is verified
+/// instead of trusted.
+///
+/// **https only.** `build_https_client` is built with `.https_only()`, so an
+/// `http://` directory would be accepted here and then refused by the connector
+/// — which is the same store-it-and-ignore-it failure this field was fixed for.
+/// Rejecting it here makes the refusal say why.
+fn directory_url(config: &SiteAcmeConfig) -> anyhow::Result<&str> {
+    let u = config.ca_server.trim();
+    if u.is_empty() {
+        return Ok(provider_url(&config.provider));
+    }
+    if !u.starts_with("https://") {
+        anyhow::bail!(
+            "acme ca_server must be an https:// URL (the ACME HTTP client is https-only), \
+             got {u:?} — refusing to use it"
+        );
+    }
+    Ok(u)
+}
+
 fn provider_url(provider: &AcmeProvider) -> &'static str {
     match provider {
         AcmeProvider::LetsEncrypt => "https://acme-v02.api.letsencrypt.org/directory",
@@ -885,6 +915,8 @@ mod tests {
             // LE rejects example.com as a contact domain; use a real-domain address.
             email: "ayush.sinha@esds.co.in".to_string(),
             provider: AcmeProvider::LetsEncryptStaging,
+            // No override: this test must reach the real staging CA.
+            ca_server: String::new(),
             challenge: AcmeChallengeType::Http01,
             renew_before_days: 30,
         };
@@ -948,5 +980,68 @@ mod tests {
                 .join(", ")
         );
         eprintln!("✅ LE staging protocol+crypto path verified end-to-end (pre-validation)");
+    }
+}
+
+#[cfg(test)]
+mod ca_server_tests {
+    use super::*;
+
+    fn cfg(ca: &str, provider: AcmeProvider) -> SiteAcmeConfig {
+        SiteAcmeConfig {
+            email: "ops@example.com".into(),
+            provider,
+            ca_server: ca.into(),
+            challenge: AcmeChallengeType::Http01,
+            renew_before_days: 30,
+        }
+    }
+
+    /// Empty means "use the provider", which is the behaviour every existing
+    /// deployment relies on.
+    #[test]
+    fn empty_ca_server_falls_back_to_the_provider() {
+        let c = cfg("", AcmeProvider::LetsEncryptStaging);
+        assert_eq!(
+            directory_url(&c).unwrap(),
+            "https://acme-staging-v02.api.letsencrypt.org/directory"
+        );
+    }
+
+    /// The whole point of the fix: this value used to be stored, echoed back to
+    /// the operator, and then ignored while issuance went to Let's Encrypt.
+    #[test]
+    fn explicit_ca_server_overrides_the_provider() {
+        let c = cfg("https://pebble:14000/dir", AcmeProvider::LetsEncrypt);
+        assert_eq!(directory_url(&c).unwrap(), "https://pebble:14000/dir");
+    }
+
+    /// Whitespace is an operator typing into a form field, not an intent to
+    /// override.
+    #[test]
+    fn whitespace_only_is_treated_as_unset() {
+        let c = cfg("   ", AcmeProvider::LetsEncrypt);
+        assert_eq!(
+            directory_url(&c).unwrap(),
+            "https://acme-v02.api.letsencrypt.org/directory"
+        );
+    }
+
+    /// Refused rather than passed to the HTTP client to interpret.
+    #[test]
+    fn non_http_schemes_are_refused() {
+        // http:// is in this list deliberately: the ACME HTTP client is
+        // https-only, so accepting it would re-create the exact bug this field
+        // was fixed for — a value stored, echoed back, and silently unusable.
+        for bad in [
+            "http://ca.example/dir",
+            "file:///etc/passwd",
+            "ftp://ca.example/dir",
+            "pebble:14000/dir",
+            "//ca/dir",
+        ] {
+            let c = cfg(bad, AcmeProvider::LetsEncrypt);
+            assert!(directory_url(&c).is_err(), "{bad} should be refused");
+        }
     }
 }
