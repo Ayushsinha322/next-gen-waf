@@ -213,6 +213,29 @@ to anyone clicking through.
 
 ## P2 — next sprint. Real work, not this week.
 
+> **13 of 14 closed and DEPLOYED to .71 as `68fc4e1` on 2026-09-11** (26 checks, with P0 and
+> P1 re-checked in the same run). C4 is scoped, not built, and its phase 1 shipped — see
+> `PRE-INTERNAL-BETA-C4-SCOPE.md`.
+>
+> **Valkey is live and proven in the real path**, not just at the connection: waf1 logs
+> `rate limiting: distributed mode (Redis backend active)`, and enabling a temporary per-IP
+> limit produced the exact `rate:ip:<site>:<ip>` and `rate:site:<site>` keys the Lua writes,
+> with commands going 29 → 390. The policy was restored byte-identically afterwards.
+>
+> ⚠️ **The distributed limiter is not exercised on .71 in normal operation** — the only site
+> has no `rate_limit` policy, so `check_async` is never called. And the site is in learning
+> mode, where `enforce_mode` downgrades a rate-limit block, so it would answer 200 rather
+> than 429 even if it tripped. Worth knowing before anyone reads a green rate-limit check
+> as proof of enforcement.
+>
+> **B10's real number: 13,500 block-tier indicators**, where the tile used to read 500.
+>
+> ⚠️ **Removing a dependency is mostly a documentation job.** Deleting the Grafana service
+> took one commit; the eleven stale references that told an operator to tunnel to
+> `127.0.0.1:3001` took another. The compose check that caught the first one only failed
+> because it asserted on the file rather than trusting the removal.
+
+
 ### UX fine-tuning (the SafeLine craft gap)
 
 - [x] **C1. A quick-add site path.** SafeLine creates a working site from **six fields in one
