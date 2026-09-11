@@ -222,6 +222,20 @@ export default function SiteDetailPage() {
   if (!site || !form) return <div className="sec"><div style={{ padding: 40, textAlign: "center", color: "var(--text3)" }}>Site not found. <button className="btn bg-btn btn-sm" onClick={() => router.push("/sites")}>← Back</button></div></div>;
 
   const scheme = form.front_https ? "https" : "http";
+
+  // ACME cannot issue for a bare IP address — no public CA will, and Let's
+  // Encrypt in particular requires a DNS name. A site whose domains are all IPs
+  // was still shown "auto · letsencrypt", which reads as a working automatic
+  // certificate for something that can never obtain one; what is actually served
+  // is the internal-CA/self-signed IP certificate. Say that instead.
+  const isIPv4 = (d: string) => /^\d{1,3}(\.\d{1,3}){3}$/.test(d.trim());
+  const dnsNames = (site?.domains ?? []).filter(d => !isIPv4(d) && !d.includes(":"));
+  const acmeImpossible = (site?.domains?.length ?? 0) > 0 && dnsNames.length === 0;
+  const tlsModeLabel = form.tls_mode === "auto"
+    ? (acmeImpossible
+        ? "auto — no DNS name, so ACME cannot issue; serving the internal-CA certificate"
+        : `auto · ${form.acme_staging ? "staging" : form.acme_provider}`)
+    : form.tls_mode;
   const blockRate = stat && stat.total > 0 ? (stat.blocked / stat.total) * 100 : 0;
   const certDays = cert && cert.expires_at > 0 ? Math.round((cert.expires_at * 1000 - Date.now()) / 86400000) : null;
 
@@ -346,7 +360,7 @@ export default function SiteDetailPage() {
               <ConfigCard title="Front Service / TLS">
                 <KV k="Public" v={`${scheme}://:${form.front_https ? 9443 : 9080}${form.force_https ? " · force-https" : ""}`} />
                 <KV k="HTTP/2 · HTTP/3" v={`${form.http2 ? "h2" : "—"} · ${form.http3 ? "h3" : "—"}`} />
-                <KV k="TLS mode" v={form.tls_mode === "auto" ? `auto · ${form.acme_staging ? "staging" : form.acme_provider}` : form.tls_mode} />
+                <KV k="TLS mode" v={tlsModeLabel} />
                 <KV k="HSTS" v={form.hsts ? "on" : "off"} />
               </ConfigCard>
               <ConfigCard title="HTTP Headers">

@@ -410,6 +410,10 @@ export interface BlocksResponse {
       entries: { ip: string; blocks_in_window: number; last_block_unix: number; escalated: boolean; autoban_pending: boolean }[] };
   };
   indicators: IOC[];
+  /** Total block-tier indicators matching, which is NOT indicators.length:
+   *  the list is capped at 500 per type. Counting the rows received turned a
+   *  feed of 18,013 into a card reading "500". */
+  indicators_total?: number;
   indicators_error?: string;
   countries: string[];
 }

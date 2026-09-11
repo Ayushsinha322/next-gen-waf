@@ -227,7 +227,13 @@ cp -r licenses "$STAGE/licenses" 2>/dev/null || warn "missing licenses/ director
 # The two installation guides ship WITH the bundle. An operator who has the archive
 # but not the repo otherwise has no written procedure — and the active/passive one
 # in particular is a two-machine sequence that cannot be guessed from --help.
-for d in STANDALONE.md ACTIVE-PASSIVE.md; do
+# The generated topology page. An operator with the archive and no repository
+# otherwise has to reconstruct a three-file override chain by reading it.
+if command -v python3 >/dev/null 2>&1; then
+  python3 deploy/gen-topology.py >/dev/null 2>&1 \
+    || warn "could not regenerate deploy/TOPOLOGY.md — shipping the committed copy"
+fi
+for d in STANDALONE.md ACTIVE-PASSIVE.md TOPOLOGY.md; do
   cp "deploy/$d" "$STAGE/docs/" 2>/dev/null || warn "missing guide: deploy/$d"
 done
 # The operator manual. The two guides above are installation procedures; these are

@@ -198,9 +198,23 @@ export default function RulesPage() {
     return !q || r.name.toLowerCase().includes(q) || r.dsl.toLowerCase().includes(q);
   });
 
+  const [showControlFlow, setShowControlFlow] = useState(false);
   const invSites = inv?.sites ?? [];
   const curSite  = invSites.find(s => s.site === invSite) ?? invSites[0];
-  const compiledRows = (curSite?.rules ?? []).filter(r => {
+  // CRS paranoia GATES, not detection rules. Each is
+  //   SecRule TX:DETECTION_PARANOIA_LEVEL "@lt N" ... pass,nolog,skipAfter:END-...
+  // — control flow that decides whether the block below it runs at this paranoia
+  // level. They never match traffic, never score and never log, so they have no
+  // message, no category and no score delta, and the table rendered 107 of them
+  // as blank "— —" rows among 243 real rules. They are hidden by default and
+  // counted, rather than dropped: the totals above say 350 enforced and a table
+  // that silently showed 243 would be its own contradiction.
+  const isControlFlow = (r: { message?: string; category?: string | null; score_delta?: number }) =>
+    !r.message && !r.category && (r.score_delta ?? 0) === 0;
+  const allSiteRules = curSite?.rules ?? [];
+  const controlFlowCount = allSiteRules.filter(isControlFlow).length;
+  const compiledRows = allSiteRules.filter(r => {
+    if (!showControlFlow && isControlFlow(r)) return false;
     if (plFilter && r.paranoia_level !== plFilter) return false;
     const q = search.toLowerCase();
     return !q || String(r.id).includes(q) || r.message.toLowerCase().includes(q)
@@ -413,6 +427,12 @@ export default function RulesPage() {
                 <option value={3}>PL3</option><option value={4}>PL4</option>
               </select>
               <span className="td3" style={{ fontSize:12, fontFamily:"var(--font-mono)" }}>{compiledRows.length} shown</span>
+              {controlFlowCount > 0 && (
+                <button className="btn bg-btn btn-xs" onClick={() => setShowControlFlow(v => !v)}
+                  title="CRS paranoia gates: SecRule TX:DETECTION_PARANOIA_LEVEL @lt N … skipAfter. They decide which block runs at the configured paranoia level, and never match traffic.">
+                  {showControlFlow ? `hide ${controlFlowCount} control-flow` : `show ${controlFlowCount} control-flow`}
+                </button>
+              )}
             </div>
           )}
           <div className="tw" style={{ maxHeight:480, overflowY:"auto" }}>
@@ -433,7 +453,11 @@ export default function RulesPage() {
                           <span style={{ color:"var(--cyan)", fontSize: 14, fontFamily:"var(--font-mono)" }}>{r.id}</span>
                           {r.inert && <span className="bdg ba" style={{ marginLeft:6 }} title="Loaded, but its operator is unsupported by the engine — it can never match">INERT</span>}
                         </td>
-                        <td className="td3" title={r.message} style={{ maxWidth:240, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{r.message || r.category || "—"}</td>
+                        <td className="td3" title={isControlFlow(r) ? "Paranoia gate — decides whether the following block runs at this paranoia level. Never matches traffic." : r.message}
+                            style={{ maxWidth:240, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap",
+                                     fontStyle: isControlFlow(r) ? "italic" : undefined }}>
+                          {r.message || r.category || (isControlFlow(r) ? "paranoia gate · control flow" : "—")}
+                        </td>
                         <td className="td3">{r.paranoia_level ?? "—"}</td>
                         <td><SevBadge sev={r.severity === "notice" ? "info" : r.severity} /></td>
                         <td className="td3" style={{ fontVariantNumeric:"tabular-nums", fontFamily:"var(--font-mono)" }}>{inv.clickhouse ? (r.hits_24h ?? 0).toLocaleString() : "—"}</td>

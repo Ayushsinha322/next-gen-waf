@@ -211,6 +211,10 @@ export default function OverviewPage() {
     plugins:  "WASM plugins loaded on the data plane. A loaded plugin only runs on the sites it is scoped to.",
     blkIPs:   `Distinct source addresses that have had at least one request blocked. ${sinceStart}`,
     alerts:   "Alerts currently in the open state, from the database — not a count of recent attacks.",
+    // Three different "blocked" numbers share this screen, over three different
+    // windows and from three different stores. They are not meant to agree, and
+    // the reason they appeared to disagree is that none of them said so.
+    byOrigin: "Blocked requests grouped by source country, from the durable event store (ClickHouse) over its retention window — a different span from the Threats-blocked counter above, which resets with the control plane. The two are not expected to match.",
   };
 
   // Real attack breakdown from the hub (sorted desc).
@@ -326,7 +330,10 @@ export default function OverviewPage() {
       {/* Blocked-by-country map + status distribution */}
       <motion.div variants={fadeUp} style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 14 }}>
         <div className="panel">
-          <div className="ph"><div className="ptitle">Blocked requests by origin</div><span className="panel-badge pb-info">{geoLoaded ? `GeoIP · ${Object.keys(byCountry).length} countries` : "GeoIP · awaiting events"}</span></div>
+          <div className="ph">
+            <div className="ptitle" title={tip.byOrigin}>Blocked requests by origin</div>
+            <span className="panel-badge pb-info" title={tip.byOrigin}>{geoLoaded ? `event store · ${Object.keys(byCountry).length} countries` : "event store · awaiting events"}</span>
+          </div>
           <div className="pb"><WorldMap data={byCountry} loaded={geoLoaded} /></div>
         </div>
         <div className="panel" style={{ display: "flex", flexDirection: "column" }}>
@@ -505,7 +512,7 @@ function TopAttackers() {
                 <th>IP Address</th>
                 <th>Country</th>
                 <th style={{ textAlign: "right" }}>Requests</th>
-                <th style={{ textAlign: "right" }}>Blocked</th>
+                <th style={{ textAlign: "right" }} title="From the event store over its retention window — not the Threats-blocked counter above, which counts since the control plane last started.">Blocked</th>
               </tr>
             </thead>
             <tbody>

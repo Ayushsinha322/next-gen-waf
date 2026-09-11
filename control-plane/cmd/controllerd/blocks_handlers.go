@@ -57,7 +57,15 @@ func handleListBlocks(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 	}
 
 	// 2. Block-tier IP and CIDR indicators (feeds + manual).
+	//
+	// The page is capped at 500 per type, and the console used to count the rows
+	// it received — so a feed holding 18,013 block-tier indicators displayed as
+	// "THREAT INTEL 500", a page size presented as a fleet total. ListIOCs
+	// already returns the true match count; it was simply discarded here. Both
+	// are returned now so the console can say "500 of 18,013" instead of
+	// implying the cap is the answer.
 	indicators := []db.IOCListItem{}
+	indicatorsTotal := 0
 	if store != nil {
 		for _, t := range []string{"ip", "cidr"} {
 			page, err := store.ListIOCs(c.Request.Context(), db.IOCListFilter{Type: t, Tier: "block", Limit: 500})
@@ -66,9 +74,11 @@ func handleListBlocks(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 				break
 			}
 			indicators = append(indicators, page.Items...)
+			indicatorsTotal += page.Total
 		}
 	}
 	resp["indicators"] = indicators
+	resp["indicators_total"] = indicatorsTotal
 
 	// 3. Countries blocked by any site's policy.
 	countries := []string{}

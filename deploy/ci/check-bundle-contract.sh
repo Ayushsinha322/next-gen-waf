@@ -169,7 +169,7 @@ fi
 
 # ── 6. docs ──────────────────────────────────────────────────────────────────
 sect "Operator documentation ships with the bundle"
-for d in STANDALONE.md ACTIVE-PASSIVE.md; do
+for d in STANDALONE.md ACTIVE-PASSIVE.md TOPOLOGY.md; do
   [[ -f "$STAGE/docs/$d" ]] && pass "docs/$d" || fail "docs/$d missing"
 done
 # The pages an operator actually runs the product from. Checked by name because

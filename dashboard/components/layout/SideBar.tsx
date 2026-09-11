@@ -6,6 +6,11 @@ import { api, type ClusterHealth } from "@/lib/api";
 import { navGroupStagger, navItemVariants, spring } from "@/lib/animations";
 import { useT } from "@/lib/i18n";
 
+// Deployment-specific help links. Inlined by Next at BUILD time, so they are
+// baked per bundle; unset means the link is not rendered at all.
+const DOCS_URL = process.env.NEXT_PUBLIC_DOCS_URL ?? "";
+const SUPPORT_URL = process.env.NEXT_PUBLIC_SUPPORT_URL ?? "";
+
 // ── Inline SVG icons ─────────────────────────────────────────────────────────
 const Icon = {
   Overview: () => (
@@ -272,6 +277,32 @@ export default function SideBar() {
         </div>
         <div style={{ fontSize: 13, fontFamily: "var(--font-mono)", color: "var(--text3)", letterSpacing: ".4px" }}>
           {footSub}
+        </div>
+
+        {/* Help, permanently visible.
+            The console showed a version string and nothing else: an operator who
+            did not already know where the manual lived had no way to find it from
+            inside the product. Copilot is in-product and always present, so it is
+            not configurable. The other two are DEPLOYMENT-SPECIFIC URLs and are
+            rendered only when set — an ESDS internal documentation host is not
+            something this repository can know, and a link that 404s is worse than
+            no link. Set NEXT_PUBLIC_DOCS_URL / NEXT_PUBLIC_SUPPORT_URL at build
+            time to show them. */}
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginTop: 8, paddingTop: 8,
+                      borderTop: "1px solid rgba(0,212,255,.06)" }}>
+          <a href="/copilot"
+             style={{ fontSize: 12, color: "var(--text3)", textDecoration: "none" }}
+             title="Ask the in-product assistant about this deployment">Ask Copilot</a>
+          {DOCS_URL && (
+            <a href={DOCS_URL} target="_blank" rel="noreferrer"
+               style={{ fontSize: 12, color: "var(--text3)", textDecoration: "none" }}
+               title="Product documentation">Documentation ↗</a>
+          )}
+          {SUPPORT_URL && (
+            <a href={SUPPORT_URL} target="_blank" rel="noreferrer"
+               style={{ fontSize: 12, color: "var(--text3)", textDecoration: "none" }}
+               title="Raise a support request">Get support ↗</a>
+          )}
         </div>
       </motion.div>
     </motion.nav>
