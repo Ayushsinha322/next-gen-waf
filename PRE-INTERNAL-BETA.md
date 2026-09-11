@@ -215,59 +215,146 @@ to anyone clicking through.
 
 ### UX fine-tuning (the SafeLine craft gap)
 
-- [ ] **C1. A quick-add site path.** SafeLine creates a working site from **six fields in one
+- [x] **C1. A quick-add site path.** SafeLine creates a working site from **six fields in one
       modal** with ports 80/443 pre-filled. Ours asks **127 labelled fields** across five
       steps in Easy mode and ten in Advanced. Add a three-field express lane (name, domain,
       upstream) that takes the defaults already in the wizard, with the full wizard behind an
       Advanced link. Highest perceived-quality gain per hour on the whole list.
-- [ ] **C3. Explain the remaining fields.** 55 of 127 wizard fields carry a hint; 72 do not.
+      **Fixed** (`a4951fa..`) — New `components/sites/QuickAddSite.tsx`: domain, origin,
+      optional name. It does NOT build its own payload — it takes `emptyForm()`, sets
+      three values and calls the same `formToPayload()` the wizard uses, because
+      `buildRustWaf` is an allowlist and a second hand-rolled payload is how a key gets
+      stored, echoed back and silently dropped. Dry-runs `sites.validate` first, states
+      which defaults it applies (learning mode above all), and hands off to the full
+      wizard carrying what was typed. Both create paths now share one post-create flow.
+
+- [x] **C3. Explain the remaining fields.** 55 of 127 wizard fields carry a hint; 72 do not.
       SafeLine explains nearly every toggle in one line underneath it.
+      **Fixed** (`a4951fa..`) — All 100 `<Field>` elements now carry a hint (was 56);
+      the 31 section toggles already had descriptions, so the real gap was 44, not 72.
+      ⚠️ JSX attribute strings are NOT JS string literals — a `\u2014` escape renders as
+      those six characters, so the em dashes had to be real glyphs.
+
 - [ ] **C4. Per-field "Use global / Customize" inheritance.** SafeLine's Advanced tab gives
       every setting a two-state control, greying the field but still showing the inherited
       value, so an operator sees exactly what this site overrides. We have source badges on
       Global Settings and nothing equivalent per site. With 127 fields nobody can tell what
       they changed from what shipped. The one genuine architectural gap in our UX; scope it
       properly rather than rushing it.
-- [ ] **C6. Make the site detail page a launcher, not a config dump.** Ours opens with five
+
+      **Scoped, not built** — see `PRE-INTERNAL-BETA-C4-SCOPE.md`. It needs a tenant-level
+      site-defaults store, a stored policy that can express "not set" (today an absent
+      `paranoia_level` and a stored `0` are the same value after `buildRustWaf`
+      unmarshals), and one server-side resolver. The tempting shortcut — omit inherited
+      fields from the payload — lands straight in `buildRustWaf`'s ALLOWLIST, which
+      stores, echoes back and silently drops unknown keys: a wrong inheritance
+      implementation is worse than none. **Phase 1 (diff the site against `emptyForm()`
+      and mark what differs from the shipped default) is ~a day, needs no schema change,
+      and answers most of the complaint.** Phases 2-4 are a sprint and should not start
+      in beta week.
+
+- [x] **C6. Make the site detail page a launcher, not a config dump.** Ours opens with five
       KPIs, seven tabs and roughly thirty key-value rows across six panels. SafeLine's shows
       four read-only basics, a prominent mode toggle with its consequence spelled out, and
       chips that jump to the relevant config page. Keep our density behind the existing
       Effective Config tab.
-- [ ] **C7. Docs and support links in the sidebar footer.** SafeLine keeps Homepage, Get
+      **Fixed** (`a4951fa..`) — The overview tab is now four identifying facts plus a
+      jump to whichever screen answers the next question. The six config cards and their
+      ~30 rows moved behind Effective Config, where a configuration listing belongs and
+      the data-plane diff already lives. The prominent mode control with its consequence
+      spelled out already existed above the tabs.
+
+- [x] **C7. Docs and support links in the sidebar footer.** SafeLine keeps Homepage, Get
       Support and Documentation permanently visible. We show a version and nothing else.
+      **Fixed** (`a4951fa..`) — Ask Copilot is in-product and always shown.
+      Documentation and Get support are `NEXT_PUBLIC_DOCS_URL` /
+      `NEXT_PUBLIC_SUPPORT_URL` and render only when set — this repo cannot know an ESDS
+      documentation host, and a link that 404s is worse than none.
 
 ### Smaller console items
 
-- [ ] **B9.** Rules library renders 107 CRS paranoia-level marker rules as empty "— —" rows
+- [x] **B9.** Rules library renders 107 CRS paranoia-level marker rules as empty "— —" rows
       (176 exist in the CRS source). Filter them or label them as internal.
-- [ ] **B10.** Blocked Sources "THREAT INTEL 500" is the page cap, not the 18,013 block-tier
+      **Fixed** (`a4951fa`) — They are CRS paranoia GATES (`SecRule
+      TX:DETECTION_PARANOIA_LEVEL "@lt N" … skipAfter`) — control flow that never
+      matches traffic, which is exactly why they have no message, category or score and
+      are cleanly separable (107 of 350). Hidden behind a toggle, labelled when shown,
+      and still counted.
+
+- [x] **B10.** Blocked Sources "THREAT INTEL 500" is the page cap, not the 18,013 block-tier
       total.
-- [ ] **B11.** Site page shows "TLS mode: auto · letsencrypt" for an IP-only site that cannot
+      **Fixed** (`a4951fa`) — `ListIOCs` already returned the true total and the handler
+      discarded it. Now returns `indicators_total`; the tile counts that and the table
+      says "listing 500 of 18,013" — a tile reading 18,013 above a 500-row table would
+      just be a different lie.
+
+- [x] **B11.** Site page shows "TLS mode: auto · letsencrypt" for an IP-only site that cannot
       use ACME.
-- [ ] **B13.** "Threats blocked" mixes a lifetime hub counter with a windowed snapshot on one
+      **Fixed** (`a4951fa`) — A site whose domains are all IPs now reads "auto — no DNS
+      name, so ACME cannot issue; serving the internal-CA certificate", which is what
+      actually happens.
+
+- [x] **B13.** "Threats blocked" mixes a lifetime hub counter with a windowed snapshot on one
       screen, so the number changes between reads with no window stated.
-- [ ] **A5. Topology legibility.** Production is 1,275 lines across three compose files with
+      **Fixed** (`a4951fa`) — Three blocked numbers share the Overview, from three
+      stores over three windows. They were never meant to agree; the defect was that
+      none said so. Each now names its store and window.
+
+- [x] **A5. Topology legibility.** Production is 1,275 lines across three compose files with
       an override chain; SafeLine's whole deployment is one 143-line file. Not a reason to
       restructure, but a generated `deploy/TOPOLOGY.md` would let an operator hold it in their
       head.
+      **Fixed** (`a4951fa`) — `deploy/gen-topology.py` → `deploy/TOPOLOGY.md`, generated
+      from the merged compose config. Two things it had to get right: healthchecks for
+      the distroless images live in the Dockerfile, not compose, so it distinguishes
+      `compose` from `image` rather than reporting "no health" for healthy containers;
+      and the `:latest` tags are an artefact of SENTINEL_VERSION being unset at
+      generation time, which it states.
 
 ### Licensing (blocks a customer bundle, not the internal beta)
 
-- [ ] **D1. Redis 7.4.9 is not open source.** The `redis:7-alpine` tag now resolves to 7.4,
+- [x] **D1. Redis 7.4.9 is not open source.** The `redis:7-alpine` tag now resolves to 7.4,
       dual-licensed RSALv2 and SSPL, and the offline bundle redistributes it. We use six
       commands inside one Lua script, all supported by Valkey. One-line compose change.
-- [ ] **D2. Grafana is AGPLv3, starts by default, ships in the bundle, and nothing uses it.**
+      **Fixed** (`27fa728`) — Valkey 8 (BSD-3) replaces redis:7-alpine (7.4,
+      RSALv2/SSPL). The exact rate-limit Lua was run against Valkey 8.1.10 — 5 allowed,
+      6th denied, both EXPIREs applied — plus every other command the client issues.
+      Service name and `redis://` scheme kept deliberately.
+
+- [x] **D2. Grafana is AGPLv3, starts by default, ships in the bundle, and nothing uses it.**
       Zero references in the dashboard or control plane; left over from the July observability
       round. Remove it.
-- [ ] **D3. No LICENSE, NOTICE or third-party notices file anywhere.** Apache 2.0 requires
+      **Fixed** (`27fa728`) — Removed entirely: service, volume, provisioning tree,
+      bundle and mirror entries, the generated admin password in three installers, and
+      the docs. compose.prod.yml no longer needs GRAFANA_ADMIN_PASSWORD to parse, which
+      is its own proof. It also exposed that the install walkthrough told operators to
+      point their first site at `grafana:3000` — now prometheus:9090, which is a real
+      listener.
+
+- [x] **D3. No LICENSE, NOTICE or third-party notices file anywhere.** Apache 2.0 requires
       shipping the licence text when redistributing, and 34 Rust crates plus the OWASP Core
       Rule Set are Apache 2.0. The CRS licence file is not even in the tree, only the
       per-rule headers. Generate a notices file into the bundle.
-- [ ] **D4. Classifier training data provenance.** The 32,768 weights compiled into the binary
+      **Fixed** (`27fa728`) — CRS Apache-2.0 text added where its own headers point,
+      plus `deploy/gen-notices.py`. It separates redistributed from build-only, which
+      the first cut did not: that reported 944 components including axe-core (MPL) and
+      @vercel/og (undeclared), both devDependencies that never ship. Real figure is 420
+      redistributed — none AGPL/GPL-only/SSPL, all declaring a licence. Deliberately not
+      in CI: regenerating needs cargo+go+npm and deploy-shell is alpine with none of
+      them. **The product's own LICENSE is still unchosen — a business decision.**
+
+- [x] **D4. Classifier training data provenance.** The 32,768 weights compiled into the binary
       were trained on six sources; two are MIT, four have no licence file at all, which means
       all rights reserved. The shipped artifact is hashed weights with no raw text and the
       corpora are not in the repo, but the clean fix is to retrain on the MIT sources plus our
       own data, which the pipeline already supports. Needs a legal opinion either way.
+      **Fixed** (`8407ac2`) — Documented in `crates/sentinel-ml/TRAINING-DATA-
+      PROVENANCE.md`. Verified: the shipped model is 32,768 hashed floats with no
+      recoverable text, and the corpora are not redistributed — so the question is
+      whether TRAINING was permitted. The audit undercounted: nine upstreams, ~1.57M
+      lines, exactly ONE with a licence file (HttpParamsDataset, MIT). Deliberately NOT
+      retrained — that trades the 99.64% headline against a legal question that is not
+      mine to answer.
 
 ---
 

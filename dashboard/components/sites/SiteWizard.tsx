@@ -567,7 +567,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                   {/* AUTO / ACME */}
                   {form.front_https && form.tls_mode === "auto" && (<>
                     <Row>
-                      <Field label="Certificate Authority">
+                      <Field label="Certificate Authority" hint="Which ACME authority issues the certificate. Let's Encrypt unless you have a reason to change it.">
                         <select className="fin2 fsel2" value={form.acme_provider} onChange={e => upd({ acme_provider: e.target.value as SiteForm["acme_provider"] })}>
                           {ACME_PROVIDERS.map(p => <option key={p.key} value={p.key}>{p.label}</option>)}
                         </select>
@@ -597,22 +597,22 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     {adv && form.acme_provider === "zerossl" && (<>
                       <GroupLabel>ZeroSSL API <Tag kind="stored" /></GroupLabel>
                       <Row>
-                        <Field label="ZeroSSL API Key"><SecretInput value={form.zerossl_api_key} set={v => upd({ zerossl_api_key: v })} /></Field>
-                        <Field label="API Retries"><input className="fin2" type="number" value={form.zerossl_retries} onChange={e => upd({ zerossl_retries: Number(e.target.value) })} /></Field>
+                        <Field label="ZeroSSL API Key" hint="From your ZeroSSL dashboard. Needed only for ZeroSSL's EAB registration."><SecretInput value={form.zerossl_api_key} set={v => upd({ zerossl_api_key: v })} /></Field>
+                        <Field label="API Retries" hint="How many times a failed issuance request is retried."><input className="fin2" type="number" value={form.zerossl_retries} onChange={e => upd({ zerossl_retries: Number(e.target.value) })} /></Field>
                       </Row>
                       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
-                        <Field label="Retry Delay (s)"><input className="fin2" type="number" value={form.zerossl_retry_delay} onChange={e => upd({ zerossl_retry_delay: Number(e.target.value) })} /></Field>
-                        <Field label="Connect Timeout (s)"><input className="fin2" type="number" value={form.zerossl_connect_timeout} onChange={e => upd({ zerossl_connect_timeout: Number(e.target.value) })} /></Field>
-                        <Field label="Max Time (s)"><input className="fin2" type="number" value={form.zerossl_max_time} onChange={e => upd({ zerossl_max_time: Number(e.target.value) })} /></Field>
+                        <Field label="Retry Delay (s)" hint="Seconds to wait between issuance retries."><input className="fin2" type="number" value={form.zerossl_retry_delay} onChange={e => upd({ zerossl_retry_delay: Number(e.target.value) })} /></Field>
+                        <Field label="Connect Timeout (s)" hint="Seconds to wait for the authority to answer before giving up."><input className="fin2" type="number" value={form.zerossl_connect_timeout} onChange={e => upd({ zerossl_connect_timeout: Number(e.target.value) })} /></Field>
+                        <Field label="Max Time (s)" hint="Overall ceiling for one issuance attempt, retries included."><input className="fin2" type="number" value={form.zerossl_max_time} onChange={e => upd({ zerossl_max_time: Number(e.target.value) })} /></Field>
                       </div>
                     </>)}
                     {adv && (form.acme_challenge === "dns_01" || form.acme_wildcard) && (<>
                       <GroupLabel>DNS-01 Automation <Tag kind="stored" /></GroupLabel>
                       <InfoBox tone="amber">DNS-01 issuance is on the roadmap. These settings are saved with the site; the cert is not auto-issued yet — use HTTP-01/TLS-ALPN-01 or upload a wildcard cert manually.</InfoBox>
                       <Row cols="1fr 1fr 1fr">
-                        <Field label="DNS Provider"><input className="fin2" value={form.dns_provider} placeholder="cloudflare" onChange={e => upd({ dns_provider: e.target.value })} /></Field>
-                        <Field label="Propagation"><input className="fin2" value={form.dns_propagation} onChange={e => upd({ dns_propagation: e.target.value })} /></Field>
-                        <Field label="Credential Item"><input className="fin2" value={form.dns_credential} placeholder="CF_TOKEN=…" onChange={e => upd({ dns_credential: e.target.value })} /></Field>
+                        <Field label="DNS Provider" hint="Used for the DNS-01 challenge — the only challenge that can obtain a wildcard certificate."><input className="fin2" value={form.dns_provider} placeholder="cloudflare" onChange={e => upd({ dns_provider: e.target.value })} /></Field>
+                        <Field label="Propagation" hint="How long to wait for the DNS record to become visible before asking the authority to check. “default” lets the provider decide."><input className="fin2" value={form.dns_propagation} onChange={e => upd({ dns_propagation: e.target.value })} /></Field>
+                        <Field label="Credential Item" hint="The DNS provider's API token, as KEY=value."><input className="fin2" value={form.dns_credential} placeholder="CF_TOKEN=…" onChange={e => upd({ dns_credential: e.target.value })} /></Field>
                       </Row>
                     </>)}
                     <InfoBox>🔐 On deploy we request a certificate for <strong style={{ color: "var(--cyan)" }}>{form.domains.join(", ") || "your domains"}</strong>. If DNS isn&apos;t pointed here yet, the site still deploys and issuance retries automatically.</InfoBox>
@@ -620,7 +620,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
 
                   {/* MANUAL */}
                   {form.front_https && form.tls_mode === "manual" && (<>
-                    <Field label="Certificate Source">
+                    <Field label="Certificate Source" hint="Paste the PEM here, or point at a file already present on the WAF node.">
                       <select className="fin2 fsel2" value={form.custom_priority} onChange={e => upd({ custom_priority: e.target.value as SiteForm["custom_priority"] })}>
                         <option value="data">Paste PEM data</option>
                         <option value="file">Path on WAF node</option>
@@ -636,7 +636,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     </>) : (
                       <Row>
                         <Field label="Certificate Path" hint="On the WAF node"><input className="fin2" value={form.cert_path} placeholder="/etc/ssl/site.crt" style={{ fontFamily: "var(--font-mono)", fontSize: 13 }} onChange={e => upd({ cert_path: e.target.value })} /></Field>
-                        <Field label="Key Path"><input className="fin2" value={form.key_path} placeholder="/etc/ssl/site.key" style={{ fontFamily: "var(--font-mono)", fontSize: 13 }} onChange={e => upd({ key_path: e.target.value })} /></Field>
+                        <Field label="Key Path" hint="Path on the WAF node. Read by the data plane only."><input className="fin2" value={form.key_path} placeholder="/etc/ssl/site.key" style={{ fontFamily: "var(--font-mono)", fontSize: 13 }} onChange={e => upd({ key_path: e.target.value })} /></Field>
                       </Row>
                     )}
                   </>)}
@@ -689,9 +689,9 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     <GroupLabel>Upstream Servers</GroupLabel>
                     {form.servers.map((s, i) => (
                       <div key={i} style={{ display: "grid", gridTemplateColumns: "2fr 1fr 0.8fr auto auto", gap: 8, alignItems: "end" }}>
-                        <Field label={`Host #${i + 1}`}><input className="fin2" value={s.host} placeholder="127.0.0.1" onChange={e => setServer(i, { host: e.target.value })} /></Field>
-                        <Field label="Port"><input className="fin2" type="number" value={s.port} onChange={e => setServer(i, { port: Number(e.target.value) })} /></Field>
-                        <Field label="Weight"><input className="fin2" type="number" value={s.weight} onChange={e => setServer(i, { weight: Number(e.target.value) })} /></Field>
+                        <Field label={`Host #${i + 1} hint="The origin as the WAF reaches it — a hostname or address on your network, not the public domain."`}><input className="fin2" value={s.host} placeholder="127.0.0.1" onChange={e => setServer(i, { host: e.target.value })} /></Field>
+                        <Field label="Port" hint="The port your application listens on."><input className="fin2" type="number" value={s.port} onChange={e => setServer(i, { port: Number(e.target.value) })} /></Field>
+                        <Field label="Weight" hint="Relative share of traffic when several origins are listed. Equal weights spread evenly."><input className="fin2" type="number" value={s.weight} onChange={e => setServer(i, { weight: Number(e.target.value) })} /></Field>
                         <div style={{ display: "flex", flexDirection: "column", gap: 4, alignItems: "center" }}><label className="flbl2">TLS</label><Sw on={s.tls} set={v => setServer(i, { tls: v })} /></div>
                         <button className="btn bg-btn btn-sm" type="button" disabled={form.servers.length === 1} onClick={() => rmServer(i)} style={{ opacity: form.servers.length === 1 ? 0.4 : 1 }}>🗑</button>
                       </div>
@@ -700,9 +700,9 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     <SectionToggle label="Active Health Checks" desc="Probe upstreams and route around failures" on={form.health.enabled} set={v => upd({ health: { ...form.health, enabled: v } })} />
                     {form.health.enabled && (
                       <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr", gap: 12 }}>
-                        <Field label="Path"><input className="fin2" value={form.health.path} onChange={e => upd({ health: { ...form.health, path: e.target.value } })} /></Field>
-                        <Field label="Interval"><input className="fin2" value={form.health.interval} onChange={e => upd({ health: { ...form.health, interval: e.target.value } })} /></Field>
-                        <Field label="Timeout"><input className="fin2" value={form.health.timeout} onChange={e => upd({ health: { ...form.health, timeout: e.target.value } })} /></Field>
+                        <Field label="Path" hint="The URL requested on each origin to decide whether it is up."><input className="fin2" value={form.health.path} onChange={e => upd({ health: { ...form.health, path: e.target.value } })} /></Field>
+                        <Field label="Interval" hint="How often each origin is checked."><input className="fin2" value={form.health.interval} onChange={e => upd({ health: { ...form.health, interval: e.target.value } })} /></Field>
+                        <Field label="Timeout" hint="How long a check may take before that origin counts as down."><input className="fin2" value={form.health.timeout} onChange={e => upd({ health: { ...form.health, timeout: e.target.value } })} /></Field>
                       </div>
                     )}
                     {/* Every control in this group is now read by the data plane. The
@@ -726,8 +726,8 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                                      on={form.proxy_keepalive} set={v => upd({ proxy_keepalive: v })} />
                     </Row>
                     <Row>
-                      <Field label="Connect Timeout"><input className="fin2" value={form.proxy_connect_timeout} onChange={e => upd({ proxy_connect_timeout: e.target.value })} title="How long TCP (plus TLS) to the origin may take, e.g. 5s. Narrower than Read Timeout: it fails fast on an unreachable origin without shortening the budget of one that is merely slow. Blank = node default. Capped at 60s." /></Field>
-                      <Field label="Read Timeout"><input className="fin2" value={form.proxy_read_timeout} onChange={e => upd({ proxy_read_timeout: e.target.value })} title="How long the origin may take to return response headers (e.g. 60s, 5m). Raise it for slow report/export endpoints. It does not limit download or SSE stream duration. Blank = node default (30s)." /></Field>
+                      <Field label="Connect Timeout" hint="How long to wait to establish a connection to the origin."><input className="fin2" value={form.proxy_connect_timeout} onChange={e => upd({ proxy_connect_timeout: e.target.value })} title="How long TCP (plus TLS) to the origin may take, e.g. 5s. Narrower than Read Timeout: it fails fast on an unreachable origin without shortening the budget of one that is merely slow. Blank = node default. Capped at 60s." /></Field>
+                      <Field label="Read Timeout" hint="How long to wait for the origin's response. Raise it for long-running requests."><input className="fin2" value={form.proxy_read_timeout} onChange={e => upd({ proxy_read_timeout: e.target.value })} title="How long the origin may take to return response headers (e.g. 60s, 5m). Raise it for slow report/export endpoints. It does not limit download or SSE stream duration. Blank = node default (30s)." /></Field>
                     </Row>
                   </>)}
                 </>)}
@@ -749,7 +749,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                   <StepHead title="WAF Rules" sub="OWASP CRS categories, paranoia level and per-rule exclusions." tag="enforced" />
                   <Row>
                     <Field label="Paranoia Level" hint="1–4 · higher = stricter"><input className="fin2" type="number" min={1} max={4} value={form.paranoia_level} onChange={e => upd({ paranoia_level: Number(e.target.value) })} /></Field>
-                    <Field label="Anomaly Threshold"><input className="fin2" type="number" value={form.anomaly_threshold} onChange={e => upd({ anomaly_threshold: Number(e.target.value) })} /></Field>
+                    <Field label="Anomaly Threshold" hint="Total rule score at which a request is refused. Lower blocks more — the balanced preset uses 10."><input className="fin2" type="number" value={form.anomaly_threshold} onChange={e => upd({ anomaly_threshold: Number(e.target.value) })} /></Field>
                   </Row>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                     <GroupLabel>Request Inspection ({form.rule_categories.filter(k => !ALL_CRS_RESPONSE_KEYS.includes(k)).length}/{CRS_REQUEST_CATEGORIES.length})</GroupLabel>
@@ -793,7 +793,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                   <GroupLabel>Rule Exclusions (false-positive tuning)</GroupLabel>
                   {form.rule_exclusions.map((ex, i) => (
                     <div key={i} style={{ display: "grid", gridTemplateColumns: "1fr 2fr auto", gap: 8, alignItems: "end" }}>
-                      <Field label="Rule ID"><input className="fin2" type="number" value={ex.rule_id} onChange={e => upd({ rule_exclusions: form.rule_exclusions.map((x, idx) => idx === i ? { ...x, rule_id: Number(e.target.value) } : x) })} /></Field>
+                      <Field label="Rule ID" hint="Numeric CRS or custom rule id to exclude, e.g. 942100."><input className="fin2" type="number" value={ex.rule_id} onChange={e => upd({ rule_exclusions: form.rule_exclusions.map((x, idx) => idx === i ? { ...x, rule_id: Number(e.target.value) } : x) })} /></Field>
                       <Field label="Exclude Targets" hint="comma-separated (e.g. ARGS:id, REQUEST_HEADERS:Referer)"><input className="fin2" value={ex.exclude_targets.join(", ")} onChange={e => upd({ rule_exclusions: form.rule_exclusions.map((x, idx) => idx === i ? { ...x, exclude_targets: e.target.value.split(",").map(t => t.trim()).filter(Boolean) } : x) })} /></Field>
                       <button className="btn bg-btn btn-sm" type="button" onClick={() => upd({ rule_exclusions: form.rule_exclusions.filter((_, idx) => idx !== i) })}>🗑</button>
                     </div>
@@ -851,7 +851,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                   {form.grpc_enabled && (<>
                     <Row cols="1fr 1fr 1fr">
                       <Field label="Max Message (KB)" hint="Per-message size cap"><input className="fin2" type="number" value={form.grpc_max_message_kb} onChange={e => upd({ grpc_max_message_kb: Number(e.target.value) })} /></Field>
-                      <Field label="Max Frames"><input className="fin2" type="number" value={form.grpc_max_frames} onChange={e => upd({ grpc_max_frames: Number(e.target.value) })} /></Field>
+                      <Field label="Max Frames" hint="Cap on the number of frames in one gRPC message, which bounds frame-flood."><input className="fin2" type="number" value={form.grpc_max_frames} onChange={e => upd({ grpc_max_frames: Number(e.target.value) })} /></Field>
                       <div style={{ display: "flex", alignItems: "flex-end" }}><SectionToggle label="Block reflection" desc="Hide schema" on={form.grpc_block_reflection} set={v => upd({ grpc_block_reflection: v })} /></div>
                     </Row>
                     <Row>
@@ -872,22 +872,22 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     <Row>
                       <div style={{ display: "flex", flexDirection: "column", gap: 10, padding: 12, borderRadius: 10, border: "1px solid rgba(255,255,255,.07)" }}>
                         <div style={{ fontSize: 13, fontWeight: 700, color: "var(--cyan)" }}>Per-IP</div>
-                        <Field label="Requests / sec"><input className="fin2" type="number" value={form.rl_per_ip.rps} onChange={e => upd({ rl_per_ip: { ...form.rl_per_ip, rps: Number(e.target.value) } })} /></Field>
-                        <Field label="Burst"><input className="fin2" type="number" value={form.rl_per_ip.burst} onChange={e => upd({ rl_per_ip: { ...form.rl_per_ip, burst: Number(e.target.value) } })} /></Field>
+                        <Field label="Requests / sec" hint="Sustained requests allowed from a single client address."><input className="fin2" type="number" value={form.rl_per_ip.rps} onChange={e => upd({ rl_per_ip: { ...form.rl_per_ip, rps: Number(e.target.value) } })} /></Field>
+                        <Field label="Burst" hint="Extra requests one address may make above the sustained rate before limiting starts."><input className="fin2" type="number" value={form.rl_per_ip.burst} onChange={e => upd({ rl_per_ip: { ...form.rl_per_ip, burst: Number(e.target.value) } })} /></Field>
                       </div>
                       <div style={{ display: "flex", flexDirection: "column", gap: 10, padding: 12, borderRadius: 10, border: "1px solid rgba(255,255,255,.07)" }}>
                         <div style={{ fontSize: 13, fontWeight: 700, color: "var(--cyan)" }}>Global</div>
-                        <Field label="Requests / sec"><input className="fin2" type="number" value={form.rl_global.rps} onChange={e => upd({ rl_global: { ...form.rl_global, rps: Number(e.target.value) } })} /></Field>
-                        <Field label="Burst"><input className="fin2" type="number" value={form.rl_global.burst} onChange={e => upd({ rl_global: { ...form.rl_global, burst: Number(e.target.value) } })} /></Field>
+                        <Field label="Requests / sec" hint="Sustained requests allowed across all clients of this site."><input className="fin2" type="number" value={form.rl_global.rps} onChange={e => upd({ rl_global: { ...form.rl_global, rps: Number(e.target.value) } })} /></Field>
+                        <Field label="Burst" hint="Extra requests allowed site-wide above the sustained rate."><input className="fin2" type="number" value={form.rl_global.burst} onChange={e => upd({ rl_global: { ...form.rl_global, burst: Number(e.target.value) } })} /></Field>
                       </div>
                     </Row>
                   )}
                   <SectionToggle label="Connection-rate Anti-DDoS" desc="Block IPs opening too many connections per second" on={form.antiddos_enabled} set={v => upd({ antiddos_enabled: v })} />
                   {form.antiddos_enabled && (
                     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
-                      <Field label="Conn/s limit"><input className="fin2" type="number" value={form.antiddos_conn_rate} onChange={e => upd({ antiddos_conn_rate: Number(e.target.value) })} /></Field>
-                      <Field label="Burst"><input className="fin2" type="number" value={form.antiddos_burst} onChange={e => upd({ antiddos_burst: Number(e.target.value) })} /></Field>
-                      <Field label="Block (secs)"><input className="fin2" type="number" value={form.antiddos_block_secs} onChange={e => upd({ antiddos_block_secs: Number(e.target.value) })} /></Field>
+                      <Field label="Conn/s limit" hint="New connections per second from one address before it is blocked."><input className="fin2" type="number" value={form.antiddos_conn_rate} onChange={e => upd({ antiddos_conn_rate: Number(e.target.value) })} /></Field>
+                      <Field label="Burst" hint="Connections allowed above that rate before blocking starts."><input className="fin2" type="number" value={form.antiddos_burst} onChange={e => upd({ antiddos_burst: Number(e.target.value) })} /></Field>
+                      <Field label="Block (secs)" hint="How long an address stays blocked once it trips the limit."><input className="fin2" type="number" value={form.antiddos_block_secs} onChange={e => upd({ antiddos_block_secs: Number(e.target.value) })} /></Field>
                     </div>
                   )}
                 </>)}
@@ -907,21 +907,21 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                   </Field>
                   {form.bot_challenge === "recaptcha" && (<>
                     <Row>
-                      <Field label="reCAPTCHA Site Key"><input className="fin2" value={form.bot_recaptcha_sitekey} onChange={e => upd({ bot_recaptcha_sitekey: e.target.value })} /></Field>
+                      <Field label="reCAPTCHA Site Key" hint="Public key, rendered into the challenge page."><input className="fin2" value={form.bot_recaptcha_sitekey} onChange={e => upd({ bot_recaptcha_sitekey: e.target.value })} /></Field>
                       <Field label="v3 Score Threshold" hint="0 = lenient · 1 = strict"><input className="fin2" type="number" min={0} max={1} step={0.1} value={form.bot_recaptcha_score} onChange={e => upd({ bot_recaptcha_score: Number(e.target.value) })} /></Field>
                     </Row>
-                    <Field label="reCAPTCHA Secret"><SecretInput value={form.bot_recaptcha_secret} set={v => upd({ bot_recaptcha_secret: v })} /></Field>
+                    <Field label="reCAPTCHA Secret" hint="The server-side key. Used to verify a solved challenge and never sent to the browser."><SecretInput value={form.bot_recaptcha_secret} set={v => upd({ bot_recaptcha_secret: v })} /></Field>
                   </>)}
                   {form.bot_challenge === "hcaptcha" && (
                     <Row>
-                      <Field label="hCaptcha Site Key"><input className="fin2" value={form.bot_hcaptcha_sitekey} onChange={e => upd({ bot_hcaptcha_sitekey: e.target.value })} /></Field>
-                      <Field label="hCaptcha Secret"><SecretInput value={form.bot_hcaptcha_secret} set={v => upd({ bot_hcaptcha_secret: v })} /></Field>
+                      <Field label="hCaptcha Site Key" hint="Public key, rendered into the challenge page."><input className="fin2" value={form.bot_hcaptcha_sitekey} onChange={e => upd({ bot_hcaptcha_sitekey: e.target.value })} /></Field>
+                      <Field label="hCaptcha Secret" hint="Server-side key, used to verify a solved challenge."><SecretInput value={form.bot_hcaptcha_secret} set={v => upd({ bot_hcaptcha_secret: v })} /></Field>
                     </Row>
                   )}
                   {form.bot_challenge === "turnstile" && (
                     <Row>
-                      <Field label="Turnstile Site Key"><input className="fin2" value={form.bot_turnstile_sitekey} onChange={e => upd({ bot_turnstile_sitekey: e.target.value })} /></Field>
-                      <Field label="Turnstile Secret"><SecretInput value={form.bot_turnstile_secret} set={v => upd({ bot_turnstile_secret: v })} /></Field>
+                      <Field label="Turnstile Site Key" hint="Public key, rendered into the challenge page."><input className="fin2" value={form.bot_turnstile_sitekey} onChange={e => upd({ bot_turnstile_sitekey: e.target.value })} /></Field>
+                      <Field label="Turnstile Secret" hint="Server-side key, used to verify a solved challenge."><SecretInput value={form.bot_turnstile_secret} set={v => upd({ bot_turnstile_secret: v })} /></Field>
                     </Row>
                   )}
                   {form.bot_challenge === "native_pow" && <InfoBox tone="green">⚙️ Native proof-of-work runs entirely on the WAF — no third-party keys, no external requests, fully on-prem.</InfoBox>}
@@ -966,9 +966,9 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                   <InfoBox>🌐 Auto-refreshed IP blocklists (AbuseIPDB, Spamhaus DROP, FireHOL, …). Loaded at startup and refreshed on the interval — matched IPs are blocked before rules run.</InfoBox>
                   {form.ip_feeds.map((feed, i) => (
                     <div key={i} style={{ display: "grid", gridTemplateColumns: "2.4fr 0.8fr 0.9fr auto", gap: 8, alignItems: "end" }}>
-                      <Field label={`Feed URL #${i + 1}`}><input className="fin2" value={feed.url} placeholder="https://iplists.firehol.org/…/firehol_level1.netset" style={{ fontFamily: "var(--font-mono)", fontSize: 13 }} onChange={e => upd({ ip_feeds: form.ip_feeds.map((x, idx) => idx === i ? { ...x, url: e.target.value } : x) })} /></Field>
+                      <Field label={`Feed URL #${i + 1}`} hint="HTTP(S) URL of an IP blocklist. Fetched by the data plane on the refresh interval."><input className="fin2" value={feed.url} placeholder="https://iplists.firehol.org/…/firehol_level1.netset" style={{ fontFamily: "var(--font-mono)", fontSize: 13 }} onChange={e => upd({ ip_feeds: form.ip_feeds.map((x, idx) => idx === i ? { ...x, url: e.target.value } : x) })} /></Field>
                       <Field label="Refresh" hint="e.g. 1h"><input className="fin2" value={feed.interval} placeholder="1h" onChange={e => upd({ ip_feeds: form.ip_feeds.map((x, idx) => idx === i ? { ...x, interval: e.target.value } : x) })} /></Field>
-                      <Field label="Format">
+                      <Field label="Format" hint="How this feed's file is laid out: one CIDR per line, or JSON.">
                         <select className="fin2 fsel2" value={feed.format} onChange={e => upd({ ip_feeds: form.ip_feeds.map((x, idx) => idx === i ? { ...x, format: e.target.value as IpFeed["format"] } : x) })}>
                           <option value="cidr">CIDR list</option>
                           <option value="json">JSON</option>
@@ -986,21 +986,21 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                   <InfoBox>🛡️ Secure defaults (X-Content-Type-Options, X-Frame-Options, X-XSS-Protection) are always applied. The values below override them for this site.</InfoBox>
                   <Field label="Content-Security-Policy" hint="Leave blank to omit CSP"><input className="fin2" value={form.csp} placeholder="default-src 'self'" style={{ fontFamily: "var(--font-mono)", fontSize: 13 }} onChange={e => upd({ csp: e.target.value })} /></Field>
                   <Row>
-                    <Field label="Referrer-Policy">
+                    <Field label="Referrer-Policy" hint="How much of the current URL a browser sends when following a link away from this site.">
                       <select className="fin2 fsel2" value={form.referrer_policy} onChange={e => upd({ referrer_policy: e.target.value })}>
                         {["no-referrer", "no-referrer-when-downgrade", "strict-origin", "strict-origin-when-cross-origin", "same-origin", "origin"].map(v => <option key={v} value={v}>{v}</option>)}
                       </select>
                     </Field>
                     <Field label="Cookie Flags" hint="Applied to Set-Cookie"><input className="fin2" value={form.cookie_flags} style={{ fontFamily: "var(--font-mono)", fontSize: 13 }} onChange={e => upd({ cookie_flags: e.target.value })} /></Field>
                   </Row>
-                  <Field label="Permissions-Policy"><input className="fin2" value={form.permissions_policy} style={{ fontFamily: "var(--font-mono)", fontSize: 13 }} onChange={e => upd({ permissions_policy: e.target.value })} /></Field>
+                  <Field label="Permissions-Policy" hint="Which browser features (camera, microphone, geolocation, …) pages on this site may use."><input className="fin2" value={form.permissions_policy} style={{ fontFamily: "var(--font-mono)", fontSize: 13 }} onChange={e => upd({ permissions_policy: e.target.value })} /></Field>
                   <SectionToggle label="CORS (Access-Control-Allow-Origin)" desc="Add cross-origin response headers" on={form.cors_enabled} set={v => upd({ cors_enabled: v })} />
                   {form.cors_enabled && <Field label="Allowed Origins" hint="* or comma-separated origins"><input className="fin2" value={form.cors_origins} style={{ fontFamily: "var(--font-mono)", fontSize: 13 }} onChange={e => upd({ cors_origins: e.target.value })} /></Field>}
                   <GroupLabel>Custom Headers</GroupLabel>
                   {form.custom_headers.map((h, i) => (
                     <div key={i} style={{ display: "grid", gridTemplateColumns: "1fr 1.5fr auto", gap: 8, alignItems: "end" }}>
-                      <Field label="Name"><input className="fin2" value={h.name} placeholder="X-Custom" onChange={e => setHeader(i, { name: e.target.value })} /></Field>
-                      <Field label="Value"><input className="fin2" value={h.value} onChange={e => setHeader(i, { value: e.target.value })} /></Field>
+                      <Field label="Name" hint="Header name added to every response from this site."><input className="fin2" value={h.name} placeholder="X-Custom" onChange={e => setHeader(i, { name: e.target.value })} /></Field>
+                      <Field label="Value" hint="Value sent with that header."><input className="fin2" value={h.value} onChange={e => setHeader(i, { value: e.target.value })} /></Field>
                       <button className="btn bg-btn btn-sm" type="button" onClick={() => upd({ custom_headers: form.custom_headers.filter((_, idx) => idx !== i) })}>🗑</button>
                     </div>
                   ))}
@@ -1032,9 +1032,9 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                   <StepHead title="Advanced" sub="Request limits, allowed methods, ML anomaly detection and API discovery." tag="enforced" />
                   <GroupLabel>Request Limits</GroupLabel>
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
-                    <Field label="Max Body (MB)"><input className="fin2" type="number" value={form.max_body_size_mb} onChange={e => upd({ max_body_size_mb: Number(e.target.value) })} /></Field>
-                    <Field label="Max URI (bytes)"><input className="fin2" type="number" value={form.max_uri_length} onChange={e => upd({ max_uri_length: Number(e.target.value) })} /></Field>
-                    <Field label="Max Headers"><input className="fin2" type="number" value={form.max_header_count} onChange={e => upd({ max_header_count: Number(e.target.value) })} /></Field>
+                    <Field label="Max Body (MB)" hint="Largest request body accepted. Anything larger is refused, not truncated."><input className="fin2" type="number" value={form.max_body_size_mb} onChange={e => upd({ max_body_size_mb: Number(e.target.value) })} /></Field>
+                    <Field label="Max URI (bytes)" hint="Longest request line accepted."><input className="fin2" type="number" value={form.max_uri_length} onChange={e => upd({ max_uri_length: Number(e.target.value) })} /></Field>
+                    <Field label="Max Headers" hint="Most headers one request may carry."><input className="fin2" type="number" value={form.max_header_count} onChange={e => upd({ max_header_count: Number(e.target.value) })} /></Field>
                   </div>
                   <GroupLabel>Allowed HTTP Methods</GroupLabel>
                   <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>

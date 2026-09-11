@@ -9,6 +9,7 @@ import { openModal } from "@/components/ui/Modal";
 import { api, type Site } from "@/lib/api";
 import { staggerContainer, cardVariants, fadeUp, spring } from "@/lib/animations";
 import SiteWizard from "@/components/sites/SiteWizard";
+import QuickAddSite from "@/components/sites/QuickAddSite";
 import { siteToForm, normalizeDomain, type SiteForm } from "@/lib/siteConfig";
 
 /* ── Lab-site metadata ────────────────────────────────────────── */
@@ -33,6 +34,7 @@ export default function SitesPage() {
   const [search, setSearch]       = useState("");
   const [modeFilter, setModeFilter] = useState("");
   const [wizard, setWizard]       = useState<{ mode: "create" | "edit"; siteId?: string; initial?: SiteForm } | null>(null);
+  const [quickAdd, setQuickAdd]   = useState(false);
 
   async function loadSites() {
     setLoading(true);
@@ -113,7 +115,10 @@ export default function SitesPage() {
     });
   }
 
-  function openCreate() { setWizard({ mode: "create" }); }
+  // The express lane is the default entry point. The full wizard is still one
+  // click away inside it ("All settings"), and edit still opens the wizard
+  // directly — an existing site is being adjusted, not created.
+  function openCreate() { setQuickAdd(true); }
 
   async function openEdit(s: Site) {
     // Use the freshest copy from the API so edits start from server truth.
@@ -125,9 +130,21 @@ export default function SitesPage() {
     }
   }
 
+  // Shared by both creation paths so the express lane cannot drift from the
+  // wizard's post-create behaviour (refresh the list, then show the DNS/origin
+  // instructions for what was just created).
+  async function afterCreate(domain: string) {
+    setQuickAdd(false);
+    await refreshAndInstruct(domain, true);
+  }
+
   async function onWizardSaved(domain?: string) {
     const created = wizard?.mode === "create";
     setWizard(null);
+    await refreshAndInstruct(domain, created);
+  }
+
+  async function refreshAndInstruct(domain: string | undefined, created: boolean) {
     let fresh: Site[] | null = null;
     try {
       const res = await api.sites.list();
@@ -389,6 +406,17 @@ export default function SitesPage() {
           )}
         </div>
       </motion.div>
+
+      {/* ── Express create ──────────────────────────────────────── */}
+      <AnimatePresence>
+        {quickAdd && (
+          <QuickAddSite
+            onClose={() => setQuickAdd(false)}
+            onCreated={afterCreate}
+            onAdvanced={initial => { setQuickAdd(false); setWizard({ mode: "create", initial }); }}
+          />
+        )}
+      </AnimatePresence>
 
       {/* ── Add / Edit Site Wizard ──────────────────────────────── */}
       <AnimatePresence>
