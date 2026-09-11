@@ -249,6 +249,16 @@ func (e *Engine) bumpWindow(m map[string][]time.Time, key string, now time.Time)
 // Raise is an exported wrapper over raise so out-of-package monitors (e.g. the
 // node-health monitor) can surface alerts through the same persistence +
 // throttling + channel fan-out path. Callers MUST set na.Severity and na.Kind.
+// Identity returns the tenant and user the engine writes alerts as. The
+// node-health monitor needs it to resolve rows the engine raised, and duplicating
+// the values at both call sites is how they drift apart.
+func (e *Engine) Identity() (tenantID, userID string) {
+	if e == nil {
+		return "", ""
+	}
+	return e.tenantID, e.userID
+}
+
 func (e *Engine) Raise(throttleKey string, req db.CreateAlertRequest, na notify.Alert) {
 	e.raise(throttleKey, req, na)
 }
@@ -366,7 +376,7 @@ var EventDrivenKinds = []string{
 	"sqli", "xss", "rce", "file_inclusion", "scanner", "attack",
 	// Kinds an earlier engine version emitted; rows of these were still open
 	// from June on the first deployment because nothing recognised them.
-	"rate_limit", "path_traversal", "log4shell",
+	"rate_limit", "path_traversal", "log4shell", "cmdinj",
 	// Recovery notices are informational: once a node has been back for the
 	// quiet window there is nothing left to act on.
 	"node_recovered", "cp_node_recovered",

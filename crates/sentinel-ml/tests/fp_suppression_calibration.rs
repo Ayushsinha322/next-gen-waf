@@ -91,6 +91,64 @@ fn ordinary_header_values_stay_below_the_veto_cutoff() {
 }
 
 #[test]
+fn login_form_bodies_stay_below_the_veto_cutoff() {
+    // E1. A login form carrying a remember-me field was refused: the classifier
+    // reached a blocking anomaly score on its own with no signature match. Two
+    // of eight ordinary form bodies were affected and BOTH were login forms.
+    //
+    // Measured before the fix, these were the scores — note that every
+    // INDIVIDUAL value in them is harmless (the highest, "on", is 0.21), so the
+    // model was reacting to the shape of the whole body:
+    //
+    //     username=alice&password=…&remember=1            0.625
+    //     _csrf=…&username=alice&password=…&remember_me=on 0.539
+    //     username=alice&password=…&remember_me=on         0.403
+    //     username=alice&password=…                        0.280
+    //
+    // Anything at or above 0.5 is worse than one false positive: `payload_attack`
+    // is a MAX over every candidate in the request, so one login body pins the
+    // request above the veto cutoff and disables FP suppression for everything
+    // else in it — invariant 1 at the top of this file.
+    //
+    // The authentication path is the worst possible place for this. It is the one
+    // request every user makes before they can do anything, it carries a password
+    // so an operator cannot paste the body into a bug report, and a site in
+    // blocking mode locks every user out at once.
+    assert_all_below(
+        "login form bodies",
+        SUPPRESSION_MAX,
+        &[
+            "username=alice&password=Tr0ub4dor%263",
+            "username=alice&password=Tr0ub4dor%263&remember_me=on",
+            "username=alice&password=Tr0ub4dor%263&remember=1",
+            "email=alice%40example.com&password=hunter2&rememberMe=true",
+            "_csrf=9f8a7b&username=alice&password=hunter2&remember_me=on",
+            "user%5Bemail%5D=alice%40example.com&user%5Bpassword%5D=hunter2&user%5Bremember_me%5D=1",
+            "login=alice&passwd=hunter2&keep_signed_in=yes",
+            "j_username=alice&j_password=hunter2&_spring_security_remember_me=on",
+        ],
+    );
+}
+
+#[test]
+fn ordinary_form_bodies_stay_below_the_veto_cutoff() {
+    // The non-authentication half of the same corpus, kept separate so a failure
+    // says which family regressed.
+    assert_all_below(
+        "ordinary form bodies",
+        SUPPRESSION_MAX,
+        &[
+            "name=Alice&email=alice%40example.com&message=Hello%20there",
+            "q=laptop&page=2&sort=price",
+            "first_name=Alice&last_name=Smith&bio=I%20like%20cats",
+            "quantity=2&sku=ABC-123&coupon=SPRING25",
+            "comment=Great%20article%2C%20thanks%21&post_id=4821",
+            "street=12%20High%20St&city=Nashik&postcode=422001&country=IN",
+        ],
+    );
+}
+
+#[test]
 fn ordinary_urls_stay_below_the_veto_cutoff() {
     assert_all_below(
         "ordinary URLs and share links",

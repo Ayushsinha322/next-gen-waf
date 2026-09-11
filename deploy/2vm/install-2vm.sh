@@ -398,7 +398,6 @@ if [[ "$ROLE" == "master" ]]; then
     set_kv SENTINEL_JWT_SECRET "$(gen)"
     set_kv SENTINEL_INTERNAL_SECRET "$(gen)"
     set_kv SENTINEL_AUDIT_HMAC_KEY "$(gen)"
-    set_kv GRAFANA_ADMIN_PASSWORD "$(openssl rand -base64 24 | tr -d '\n/+=' | cut -c1-24)"
     set_kv SENTINEL_REPL_USER replicator
     set_kv SENTINEL_REPL_PASSWORD "$REPLPW"
     set_kv SENTINEL_STANDBY_CIDR "${PEER_IP}/32"

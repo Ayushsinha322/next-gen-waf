@@ -7,7 +7,6 @@ import {
   type DashboardStats, type MetricsSnapshot, type Attacker,
   type Rule, type MLStats, type ThreatIntelSummary, type ClusterHealth, type RuleInventory } from "@/lib/api";
 import { staggerContainer, cardVariants, fadeUp, spring } from "@/lib/animations";
-import { PLANS, ACTIVE_PLAN, type PlanKey } from "@/lib/plans";
 import { country } from "@/lib/geo";
 import WorldMap from "@/components/dashboard/WorldMap";
 import ThreatTrend from "@/components/dashboard/ThreatTrend";
@@ -63,9 +62,9 @@ function fmtBytes(b: number): string {
 // ---------------------------------------------------------------------------
 // Small KPI tile
 // ---------------------------------------------------------------------------
-function Kpi({ icon, label, value, sub, accent }: { icon: string; label: string; value: React.ReactNode; sub?: string; accent?: string }) {
+function Kpi({ icon, label, value, sub, accent, hint }: { icon: string; label: string; value: React.ReactNode; sub?: string; accent?: string; hint?: string }) {
   return (
-    <motion.div className="panel" variants={cardVariants} style={{ padding: "14px 16px" }}>
+    <motion.div className="panel" variants={cardVariants} style={{ padding: "14px 16px", cursor: hint ? "help" : undefined }} title={hint}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
         <div style={{ fontSize: 14, color: "var(--text3)", textTransform: "uppercase", letterSpacing: 1, fontFamily: "var(--font-mono)" }}>{label}</div>
         <span style={{ fontSize: 17, opacity: 0.85 }}>{icon}</span>
@@ -116,9 +115,18 @@ export default function OverviewPage() {
     async function f() {
       try { const p = await api.plugins.list(); if (!cancelled) setPlugins((p.plugins ?? []).length); } catch { /* */ }
       try {
-        const c = await api.cluster.status();
-        if (!cancelled) setInstances(c.enabled ? ((c.status?.peers?.length ?? 0) + 1) : 1);
-      } catch { if (!cancelled) setInstances(1); }
+        // /cluster/status describes THIS control-plane node (node_id, role,
+        // leader_id) and carries no peer list, so `status.peers?.length ?? 0`
+        // was always 0 and this card read "1 · standalone" on a healthy
+        // three-node cluster while the Cluster page showed 3/3 correctly.
+        // /cluster/health is the fleet roll-up that page uses.
+        const h = await api.cluster.health();
+        if (!cancelled) {
+          const dp = h.data_plane?.total ?? 0;
+          const cp = h.control_plane?.total ?? 0;
+          setInstances(Math.max(dp, cp, 1));
+        }
+      } catch { if (!cancelled) setInstances(null); }
     }
     f(); const t = setInterval(f, 30_000); return () => { cancelled = true; clearInterval(t); };
   }, []);
@@ -181,6 +189,34 @@ export default function OverviewPage() {
   const memTotal   = metrics?.mem_total_bytes  ?? 0;
   const memPct     = memTotal > 0 ? (memUsed / memTotal) * 100 : 0;
 
+  // Tooltip text for every statistic on this page. The windows are not
+  // decoration: the hub keeps a 10-second ring for RPS, a 1000-sample ring for
+  // each p99, and plain counters for everything else that reset when the control
+  // plane restarts. Two numbers on one screen measured over different windows,
+  // with nothing saying so, is what made "sub-millisecond target" and
+  // "THREATS BLOCKED 39,534" look like defects rather than different questions.
+  const p99Waf     = metrics?.p99_waf_ms ?? 0;
+  const sinceStart = "Counted since this control plane last started — a restart resets it.";
+  const tip = {
+    rps:      "Requests per second across every site, averaged over a 10-second rolling window of access-log events.",
+    blocked:  `Requests the WAF refused. ${sinceStart} Learning-mode sites are inspected and scored but not blocked, so their attacks are not counted here.`,
+    p99:      `99th-percentile end-to-end request latency, including the wait on the origin, over the last ${metrics?.p99_samples ?? 0} samples.`
+              + (p99Waf > 0 ? ` The WAF's own processing accounts for ${p99Waf.toFixed(2)} ms of it.` : ""),
+    ml:       `Requests the ML anomaly engine flagged, independently of signature rules. ${sinceStart}`,
+    http3:    "Whether this deployment advertises HTTP/3 (QUIC), and on which listener. Per-site toggles do not apply — the listener is deployment-wide.",
+    ram:      "Physical memory in use on the control-plane host, from /proc/meminfo. This is the host, not the container.",
+    sites:    "Sites configured in the database, and how many are active. A paused or draft site is configured but serves nothing.",
+    services: "Configured upstream services, with the health of their origins as checked by the data plane.",
+    inst:     "Data-plane and control-plane nodes reporting to the cluster roll-up. Shows — when the roll-up cannot be reached, rather than assuming a single node.",
+    plugins:  "WASM plugins loaded on the data plane. A loaded plugin only runs on the sites it is scoped to.",
+    blkIPs:   `Distinct source addresses that have had at least one request blocked. ${sinceStart}`,
+    alerts:   "Alerts currently in the open state, from the database — not a count of recent attacks.",
+    // Three different "blocked" numbers share this screen, over three different
+    // windows and from three different stores. They are not meant to agree, and
+    // the reason they appeared to disagree is that none of them said so.
+    byOrigin: "Blocked requests grouped by source country, from the durable event store (ClickHouse) over its retention window — a different span from the Threats-blocked counter above, which resets with the control plane. The two are not expected to match.",
+  };
+
   // Real attack breakdown from the hub (sorted desc).
   const breakdown = metrics?.attack_breakdown ?? {};
   const attackRows = Object.entries(breakdown)
@@ -241,59 +277,26 @@ export default function OverviewPage() {
         </div>
       </motion.div>
 
-      {/* Plans */}
-      <motion.div variants={fadeUp} style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
-        {(Object.keys(PLANS) as PlanKey[]).map(k => {
-          const p = PLANS[k]; const active = k === ACTIVE_PLAN;
-          return (
-            <div key={k} className="panel" style={{ padding: 18, position: "relative", border: active ? "1px solid var(--cyan-ring)" : undefined, background: active ? "var(--cyan-dim)" : undefined }}>
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                  <span style={{ fontFamily: "var(--font-display)", fontSize: 20, fontWeight: 700, color: p.accent }}>{p.name}</span>
-                  {active && <span style={{ fontSize: 11, fontWeight: 700, padding: "3px 9px", borderRadius: 20, background: "var(--cyan)", color: "#021018", letterSpacing: 0.5 }}>● CURRENT PLAN</span>}
-                </div>
-                <span style={{ fontSize: 13, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>{p.price}</span>
-              </div>
-              <div style={{ fontSize: 13, color: "var(--text3)", marginTop: 4 }}>{p.tagline}</div>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, margin: "14px 0" }}>
-                {Object.entries(p.limits).map(([key, val]) => (
-                  <div key={key} style={{ fontSize: 12.5, color: "var(--text2)", display: "flex", alignItems: "center", gap: 6 }}>
-                    <span style={{ color: p.accent }}>▸</span>{val}
-                  </div>
-                ))}
-              </div>
-              <div style={{ display: "flex", flexDirection: "column", gap: 5, borderTop: "1px solid var(--bg4)", paddingTop: 12 }}>
-                {p.highlights.map(h => (
-                  <div key={h} style={{ fontSize: 12.5, color: h.endsWith(":") ? "var(--text3)" : "var(--text2)", display: "flex", gap: 7 }}>
-                    {!h.endsWith(":") && <span style={{ color: "var(--green)" }}>✓</span>}{h}
-                  </div>
-                ))}
-              </div>
-            </div>
-          );
-        })}
-      </motion.div>
-
       {/* KPI grid — all real */}
       <motion.div variants={staggerContainer} style={{ display: "grid", gridTemplateColumns: "repeat(7,minmax(0,1fr))", gap: 12 }}>
-        <Kpi icon="🧠" label="System RAM" accent="var(--cyan)"
+        <Kpi icon="🧠" label="System RAM" accent="var(--cyan)" hint={tip.ram}
           value={memTotal > 0 ? `${memPct.toFixed(0)}%` : "—"}
           sub={memTotal > 0 ? `${fmtBytes(memUsed)} / ${fmtBytes(memTotal)}` : "host metric"} />
-        <Kpi icon="🌐" label="Sites" value={<AnimatedValue value={stats?.total_sites ?? 0} />} sub={`${stats?.active_sites ?? 0} active`} />
-        <Kpi icon="📦" label="Services" value={<AnimatedValue value={stats?.active_sites ?? 0} />} sub={`${wafStatus?.upstreams_healthy ?? 0}/${wafStatus?.upstreams_total ?? 0} upstreams`} />
-        <Kpi icon="🖧" label="Instances" value={instances === null ? "—" : instances} sub={(instances ?? 1) > 1 ? "clustered" : "standalone"} />
-        <Kpi icon="🔌" label="Plugins" value={plugins === null ? "—" : plugins} sub="WASM loaded" />
-        <Kpi icon="🛑" label="Blocked" accent="#ef4444" value={<AnimatedValue value={blkCount} />} sub={`${openAlerts} open alerts`} />
-        <Kpi icon="📍" label="Blocked IPs" accent="#ef4444" value={<AnimatedValue value={uniqueIPs} />} sub="unique sources" />
+        <Kpi icon="🌐" label="Sites" hint={tip.sites} value={<AnimatedValue value={stats?.total_sites ?? 0} />} sub={`${stats?.active_sites ?? 0} active`} />
+        <Kpi icon="📦" label="Services" hint={tip.services} value={<AnimatedValue value={stats?.active_sites ?? 0} />} sub={`${wafStatus?.upstreams_healthy ?? 0}/${wafStatus?.upstreams_total ?? 0} upstreams`} />
+        <Kpi icon="🖧" label="Instances" hint={tip.inst} value={instances === null ? "—" : instances} sub={(instances ?? 1) > 1 ? "clustered" : "standalone"} />
+        <Kpi icon="🔌" label="Plugins" hint={tip.plugins} value={plugins === null ? "—" : plugins} sub="WASM loaded" />
+        <Kpi icon="🛑" label="Blocked" accent="#ef4444" hint={tip.blocked} value={<AnimatedValue value={blkCount} />} sub={`${openAlerts} open alerts`} />
+        <Kpi icon="📍" label="Blocked IPs" accent="#ef4444" hint={tip.blkIPs} value={<AnimatedValue value={uniqueIPs} />} sub="unique sources" />
       </motion.div>
 
       {/* Live metric cards */}
       <motion.div variants={staggerContainer} style={{ display: "grid", gridTemplateColumns: "repeat(5,minmax(0,1fr))", gap: 14 }}>
-        <motion.div className="mc blue" variants={cardVariants}><div className="mc-label">Requests / sec</div><div className="mc-val"><AnimatedValue value={rps} /></div><div className="mc-delta up">▲ live · 1-sec samples</div></motion.div>
-        <motion.div className="mc red" variants={cardVariants}><div className="mc-label">Threats blocked</div><div className="mc-val"><AnimatedValue value={blkCount} /></div><div className="mc-delta up">▲ {openAlerts} open alerts</div></motion.div>
-        <motion.div className="mc green" variants={cardVariants}><div className="mc-label">p99 Latency</div><div className="mc-val">{p99 > 0 ? p99.toFixed(2) + "ms" : "—"}</div><div className="mc-delta up">▼ sub-millisecond target</div></motion.div>
-        <motion.div className="mc pur" variants={cardVariants}><div className="mc-label">ML detections</div><div className="mc-val"><AnimatedValue value={mlDet} /></div><div className="mc-delta" style={{ color: "#c4b5fd" }}>▲ anomaly engine active</div></motion.div>
-        <motion.div className="mc cyan" variants={cardVariants}>
+        <motion.div className="mc blue" variants={cardVariants} title={tip.rps} style={{ cursor: "help" }}><div className="mc-label">Requests / sec</div><div className="mc-val"><AnimatedValue value={rps} /></div><div className="mc-delta up">▲ 10-second rolling window</div></motion.div>
+        <motion.div className="mc red" variants={cardVariants} title={tip.blocked} style={{ cursor: "help" }}><div className="mc-label">Threats blocked</div><div className="mc-val"><AnimatedValue value={blkCount} /></div><div className="mc-delta up" title={tip.alerts}>▲ {openAlerts} open alerts</div></motion.div>
+        <motion.div className="mc green" variants={cardVariants} title={tip.p99} style={{ cursor: "help" }}><div className="mc-label">p99 Latency</div><div className="mc-val">{p99 > 0 ? p99.toFixed(2) + "ms" : "—"}</div><div className="mc-delta up">{p99Waf > 0 ? `▼ end-to-end · WAF ${p99Waf.toFixed(2)}ms of it` : "▼ end-to-end, incl. origin"}</div></motion.div>
+        <motion.div className="mc pur" variants={cardVariants} title={tip.ml} style={{ cursor: "help" }}><div className="mc-label">ML detections</div><div className="mc-val"><AnimatedValue value={mlDet} /></div><div className="mc-delta" style={{ color: "#c4b5fd" }}>▲ anomaly engine active</div></motion.div>
+        <motion.div className="mc cyan" variants={cardVariants} title={tip.http3} style={{ cursor: "help" }}>
           <div className="mc-label">HTTP/3</div>
           <div className="mc-val" style={{ fontSize: 25 }}>{wafStatus?.http3?.enabled ? "Active" : "Off"}</div>
           <div className="mc-delta" style={{ color: wafStatus?.http3?.enabled ? "#67e8f9" : "var(--text3)" }}>
@@ -327,7 +330,10 @@ export default function OverviewPage() {
       {/* Blocked-by-country map + status distribution */}
       <motion.div variants={fadeUp} style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 14 }}>
         <div className="panel">
-          <div className="ph"><div className="ptitle">Blocked requests by origin</div><span className="panel-badge pb-info">{geoLoaded ? `GeoIP · ${Object.keys(byCountry).length} countries` : "GeoIP · awaiting events"}</span></div>
+          <div className="ph">
+            <div className="ptitle" title={tip.byOrigin}>Blocked requests by origin</div>
+            <span className="panel-badge pb-info" title={tip.byOrigin}>{geoLoaded ? `event store · ${Object.keys(byCountry).length} countries` : "event store · awaiting events"}</span>
+          </div>
           <div className="pb"><WorldMap data={byCountry} loaded={geoLoaded} /></div>
         </div>
         <div className="panel" style={{ display: "flex", flexDirection: "column" }}>
@@ -506,7 +512,7 @@ function TopAttackers() {
                 <th>IP Address</th>
                 <th>Country</th>
                 <th style={{ textAlign: "right" }}>Requests</th>
-                <th style={{ textAlign: "right" }}>Blocked</th>
+                <th style={{ textAlign: "right" }} title="From the event store over its retention window — not the Threats-blocked counter above, which counts since the control plane last started.">Blocked</th>
               </tr>
             </thead>
             <tbody>

@@ -103,6 +103,53 @@ export function logout() {
   clearSessionCookie();
 }
 
+/**
+ * Sign out for real: revoke the session on the server, then clear it here.
+ *
+ * `logout()` above only clears this browser. The control plane has had
+ * POST /auth/logout since July, and it does the work that matters — revokes the
+ * access token, revokes the PAIRED refresh token via the rjti embedded in the
+ * access token, and writes the audit entry that makes a session's span
+ * reconstructable. Nothing in the UI ever called it, so "Sign out" left the
+ * refresh token valid for its full window and the audit trail recorded logins
+ * and never logouts.
+ *
+ * Best-effort on purpose: a failed revoke must not trap someone in a session
+ * they asked to leave, so the local clear always runs.
+ *
+ * Deliberately separate from `logout()`. The 401 and refresh-failure paths in
+ * lib/api.ts call that one, and firing an authenticated request with a token the
+ * server has just rejected would either recurse or fail for no benefit. For the
+ * same reason the password-change and password-reset flows keep calling
+ * `logout()`: both already invalidated every session for the account, so their
+ * token is dead before we get here.
+ */
+export async function signOut(): Promise<void> {
+  const token = read(ACCESS_KEY);
+  if (token) {
+    const refresh = read(REFRESH_KEY);
+    try {
+      await fetch("/api/v1/auth/logout", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        // The handler also honours an explicitly-supplied refresh token, which
+        // covers tokens minted before rjti binding existed.
+        body: JSON.stringify(refresh ? { refresh_token: refresh } : {}),
+        // The caller navigates away immediately after; without this the request
+        // can be cancelled before it is sent, which is exactly the silent
+        // no-op this fix exists to remove.
+        keepalive: true,
+      });
+    } catch {
+      // Offline, or the control plane is down. Fall through to the local clear.
+    }
+  }
+  logout();
+}
+
 /** Expire the sentinel_token cookie immediately. */
 export function clearSessionCookie() {
   if (typeof document !== "undefined") {

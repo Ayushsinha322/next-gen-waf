@@ -352,6 +352,21 @@ pub struct SiteAcmeConfig {
     /// CA provider (default: Let's Encrypt production).
     #[serde(default)]
     pub provider: AcmeProvider,
+    /// Explicit ACME directory URL, overriding `provider` when non-empty.
+    ///
+    /// The console has offered this field ("override ACME directory URL") since
+    /// the wizard was written, and NOTHING read it: the control plane did not
+    /// parse `ca_server` and this struct had no field for it, so an operator
+    /// could set a directory URL, see it stored, see it echoed back, and have
+    /// every issuance still go to Let's Encrypt. Same silently-inert shape as
+    /// the other allowlist drops.
+    ///
+    /// It also makes issuance TESTABLE: pointed at a local ACME server (Pebble,
+    /// step-ca) the whole challenge-and-issue path can be exercised without a
+    /// public address, which is the only reason live issuance had never been
+    /// verified end-to-end.
+    #[serde(default)]
+    pub ca_server: String,
     /// ACME challenge type (default: HTTP-01).
     #[serde(default)]
     pub challenge: AcmeChallengeType,

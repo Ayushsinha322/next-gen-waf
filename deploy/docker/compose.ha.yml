@@ -39,8 +39,18 @@
 # Usage (from /opt/sentinel-src):
 #   docker compose -f deploy/docker/compose.prod.yml -f deploy/docker/compose.ha.yml up -d waf1 waf2 waf3 lb
 
+# Cap this file's containers too. YAML anchors do not cross files, so each
+# compose file that defines services declares its own copy, and it must appear
+# before any anchor that uses it. See compose.prod.yml for why.
+x-logging: &logging
+  driver: "json-file"
+  options:
+    max-size: "100m"
+    max-file: "5"
+
 x-wafnode: &wafnode
   image: ${SENTINEL_IMAGE_PREFIX:-sentinel}/dataplane:${SENTINEL_VERSION:-latest}
+  logging: *logging
   restart: unless-stopped
   user: "0:0"
   # Kernel XDP needs these to load and attach the BPF program and its maps.
@@ -373,6 +383,7 @@ services:
 
   lb:
     image: ${SENTINEL_THIRDPARTY_PREFIX:-}haproxy:2.9-alpine
+    logging: *logging
     restart: unless-stopped
     depends_on: [waf1, waf2, waf3]
     volumes:

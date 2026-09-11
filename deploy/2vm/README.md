@@ -50,7 +50,7 @@ flowchart TB
         DB1[("Postgres<br/><b>PRIMARY</b>")]
         CH1[("ClickHouse<br/>events + traffic")]
         RD1[("Redis<br/>rate-limit windows")]
-        OB1["Dashboard :3000<br/>Prometheus · Grafana<br/><i>loopback only</i>"]
+        OB1["Dashboard :3000<br/>Prometheus :9090<br/><i>loopback only</i>"]
     end
 
     subgraph VM2["VM 2 — SLAVE · priority 100"]
@@ -60,7 +60,7 @@ flowchart TB
         CP2["Control plane (Go)<br/>writes → VM1"]
         DB2[("Postgres<br/><b>STANDBY</b> read-only")]
         RD2[("Redis<br/>independent cache")]
-        OB2["Dashboard :3000<br/>Prometheus · Grafana<br/><i>loopback only</i>"]
+        OB2["Dashboard :3000<br/>Prometheus :9090<br/><i>loopback only</i>"]
     end
 
     VIP -.->|"active path"| DP1
@@ -116,7 +116,7 @@ flowchart TB
 ║      └────────────────╫──╫──────────────────────╫─┘
 ║ ClickHouse (only here)║  ║ (no ClickHouse)      ║  2 nodes cannot form a
 ║ Redis (independent)   ║  ║ Redis (independent)  ║  Keeper quorum
-║ Dashboard/Grafana     ║  ║ Dashboard/Grafana    ║  loopback only — tunnel
+║ Dashboard/Prometheus  ║  ║ Dashboard/Prometheus ║  loopback only — tunnel
 ╚═══════════════════════╝  ╚══════════════════════╝
 ```
 
@@ -142,7 +142,7 @@ plane or the database is unavailable.
 | **Postgres** | **PRIMARY** | **STANDBY** (read-only) | Async WAL streaming. Promotion is manual — see below. |
 | **ClickHouse** | yes | no | Two nodes cannot form a Keeper quorum, so a second instance would be a separate dataset, not a replica. Protected by backup. |
 | **Redis** | independent | independent | Holds only 1-second rate-limit windows, persistence off. Independent caches mean limits are per-VM — bounded, and fail-closed. |
-| **Dashboard / Grafana** | `127.0.0.1` only | `127.0.0.1` only | Not exposed on the VIP. Reach them over an SSH tunnel, or use the management console on `:9443`. |
+| **Dashboard / Prometheus** | `127.0.0.1` only | `127.0.0.1` only | Not exposed on the VIP. Reach them over an SSH tunnel, or use the management console on `:9443`. |
 
 ---
 
@@ -254,7 +254,7 @@ over. Numbers below are from measurement on the existing deploy VM, not estimate
 | | Spec | What drives it |
 |---|---|---|
 | **vCPU** | **8** | 21,198 req/s on the block path at p99 8.5 ms, measured. Throughput above 8 cores is unmeasured, so 8 is a grounded floor. |
-| **RAM** | **16 GiB** (12 GiB floor) | ClickHouse needs a 6 GiB cap — at 1536 MiB it OOM-killed its own `system.text_log` merges and crash-looped ~24,000 times. Everything else measures ~1.5 GiB idle: data plane 210 MiB, Postgres 78, Grafana 103, dashboard 59, Prometheus 38, control plane 21, Redis 4. The rest is page cache and merge headroom. |
+| **RAM** | **16 GiB** (12 GiB floor) | ClickHouse needs a 6 GiB cap — at 1536 MiB it OOM-killed its own `system.text_log` merges and crash-looped ~24,000 times. Everything else measured ~1.5 GiB idle when this was taken: data plane 210 MiB, Postgres 78, Grafana 103, dashboard 59, Prometheus 38, control plane 21, Redis 4 — Grafana has since been removed, so subtract its 103 MiB. The rest is page cache and merge headroom. |
 | **Disk** | **200 GB** if you build images on the box<br/>**80 GB** if you pull pre-built | Event data is *not* the driver: ClickHouse compresses to ~15 bytes/row, so 90-day retention is megabytes. Docker is — the existing box holds 93 GB of Rust build cache plus 13.5 GB of images. |
 | **Network** | 1 GbE, both VMs on the same L2 segment | VRRP needs protocol 112 between them, and the VIP must be a free address in the same subnet. |
 | **OS** | Ubuntu 24.04 LTS | Matches the validated platform: glibc 2.39, kernel 6.8, eBPF/XDP verified in native mode. |
@@ -278,7 +278,7 @@ Three, all in the same subnet:
 | `443` udp | HTTP/3 (QUIC) | via VIP |
 | `9443` | management console — admin UI + API | via VIP |
 | `5432` | Postgres, master only | **VM 2 only**, `/32` grant, TLS |
-| `3000` / `3001` | dashboard / Grafana | `127.0.0.1` only — SSH tunnel |
+| `3000` / `9090` | dashboard / Prometheus | `127.0.0.1` only — SSH tunnel |
 | VRRP | protocol 112, unicast | between the two VMs |
 
 Firewall everything else. Port 5432 must be reachable *from VM 2 specifically* —

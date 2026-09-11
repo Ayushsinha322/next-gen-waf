@@ -101,7 +101,6 @@ postgres:16-alpine
 redis:7-alpine
 clickhouse/clickhouse-server:24-alpine
 prom/prometheus:v2.54.1
-grafana/grafana:11.2.0
 haproxy:2.9-alpine                  # only used by the two-VM / HA topology
 ```
 

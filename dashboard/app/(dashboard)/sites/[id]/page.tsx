@@ -13,7 +13,7 @@ import { showToast } from "@/components/ui/Toast";
 import { api, type Site, type Certificate, type SiteStat, type LearningStat, type EffectiveConfig } from "@/lib/api";
 import { staggerContainer, cardVariants, fadeUp } from "@/lib/animations";
 import SiteWizard from "@/components/sites/SiteWizard";
-import { siteToForm, type SiteForm, type PathOverride, CRS_REQUEST_CATEGORIES, ALL_CRS_RESPONSE_KEYS } from "@/lib/siteConfig";
+import { siteToForm, emptyForm, type SiteForm, type PathOverride, CRS_REQUEST_CATEGORIES, ALL_CRS_RESPONSE_KEYS } from "@/lib/siteConfig";
 
 type WafRow = { ts: string; ip: string; rule: string; attack: string; sev: string; action: string };
 type AccessRow = { ts: string; ip: string; method: string; path: string; status: number; latency: number };
@@ -222,6 +222,20 @@ export default function SiteDetailPage() {
   if (!site || !form) return <div className="sec"><div style={{ padding: 40, textAlign: "center", color: "var(--text3)" }}>Site not found. <button className="btn bg-btn btn-sm" onClick={() => router.push("/sites")}>← Back</button></div></div>;
 
   const scheme = form.front_https ? "https" : "http";
+
+  // ACME cannot issue for a bare IP address — no public CA will, and Let's
+  // Encrypt in particular requires a DNS name. A site whose domains are all IPs
+  // was still shown "auto · letsencrypt", which reads as a working automatic
+  // certificate for something that can never obtain one; what is actually served
+  // is the internal-CA/self-signed IP certificate. Say that instead.
+  const isIPv4 = (d: string) => /^\d{1,3}(\.\d{1,3}){3}$/.test(d.trim());
+  const dnsNames = (site?.domains ?? []).filter(d => !isIPv4(d) && !d.includes(":"));
+  const acmeImpossible = (site?.domains?.length ?? 0) > 0 && dnsNames.length === 0;
+  const tlsModeLabel = form.tls_mode === "auto"
+    ? (acmeImpossible
+        ? "auto — no DNS name, so ACME cannot issue; serving the internal-CA certificate"
+        : `auto · ${form.acme_staging ? "staging" : form.acme_provider}`)
+    : form.tls_mode;
   const blockRate = stat && stat.total > 0 ? (stat.blocked / stat.total) * 100 : 0;
   const certDays = cert && cert.expires_at > 0 ? Math.round((cert.expires_at * 1000 - Date.now()) / 86400000) : null;
 
@@ -309,52 +323,63 @@ export default function SiteDetailPage() {
       <AnimatePresence mode="wait">
         <motion.div key={tab} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} transition={{ duration: 0.15 }}>
 
-          {/* OVERVIEW — rich config */}
+          {/* OVERVIEW — a launcher, not a config dump.
+              This tab used to render six panels of about thirty key-value rows,
+              which is a complete configuration listing presented as a landing
+              page: an operator arriving to answer "is this site healthy and what
+              is it doing?" had to read the whole thing to find out. The rows are
+              not deleted — they moved behind Effective Config, where a
+              configuration listing belongs and where the data-plane diff already
+              lives. What stays here is the four facts that identify the site and
+              a jump to whichever screen actually answers the next question. */}
           {tab === "overview" && (
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
-              <ConfigCard title="Reverse Proxy">
-                <KV k="Load balancer" v={form.lb} />
-                {form.servers.map((s, i) => <KV key={i} k={`Upstream #${i + 1}`} v={`${s.tls ? "https" : "http"}://${s.host}:${s.port} · w${s.weight}`} />)}
-                <KV k="Health checks" v={form.health.enabled ? `${form.health.path} every ${form.health.interval}` : "off"} />
-                <KV k="WebSocket" v={form.proxy_websocket ? "on" : "off"} />
-              </ConfigCard>
-              <ConfigCard title="WAF Rules">
-                <KV k="Paranoia level" v={`PL${form.paranoia_level}`} />
-                <KV k="Anomaly threshold" v={String(form.anomaly_threshold)} />
-                <KV k="Request inspection" v={`${form.rule_categories.filter(k => !ALL_CRS_RESPONSE_KEYS.includes(k)).length}/${CRS_REQUEST_CATEGORIES.length} categories`} />
-                <KV k="Response inspection" v={(() => {
-                  const n = form.rule_categories.filter(k => ALL_CRS_RESPONSE_KEYS.includes(k)).length;
-                  return n === 0 ? "off" : `${n}/${ALL_CRS_RESPONSE_KEYS.length} categories`;
-                })()} />
-                <KV k="Rule exclusions" v={`${form.rule_exclusions.length}`} />
-                <KV k="Path overrides" v={`${(form.path_overrides ?? []).length}`} />
-                <KV k="ML anomaly" v={form.ml_enabled ? `on (${form.ml_sensitivity})` : "off"} />
-              </ConfigCard>
-              <ConfigCard title="Rate & DDoS">
-                <KV k="Rate limit" v={form.rate_limit_enabled ? `${form.rl_per_ip.rps}/s per IP · ${form.rl_global.rps}/s global` : "off"} />
-                <KV k="Anti-DDoS" v={form.antiddos_enabled ? `${form.antiddos_conn_rate} conn/s · block ${form.antiddos_block_secs}s` : "off"} />
-                <KV k="Max body" v={`${form.max_body_size_mb} MB`} />
-                <KV k="Allowed methods" v={form.allowed_methods.join(" ")} />
-              </ConfigCard>
-              <ConfigCard title="Bots · Geo · IP">
-                <KV k="JA4 fingerprint" v={form.bot_ja4 ? "on" : "off"} />
-                <KV k="Challenge" v={form.bot_challenge} />
-                <KV k="GeoIP" v={form.geo_mode === "off" ? "off" : `${form.geo_mode}: ${form.geo_countries.join(", ") || "—"}`} />
-                <KV k="IP lists" v={`${form.ip_allow.length} allow · ${form.ip_block.length} block`} />
-                <KV k="Blacklists" v={form.dnsbl_enabled ? "DNSBL on" : "off"} />
-              </ConfigCard>
-              <ConfigCard title="Front Service / TLS">
-                <KV k="Public" v={`${scheme}://:${form.front_https ? 9443 : 9080}${form.force_https ? " · force-https" : ""}`} />
-                <KV k="HTTP/2 · HTTP/3" v={`${form.http2 ? "h2" : "—"} · ${form.http3 ? "h3" : "—"}`} />
-                <KV k="TLS mode" v={form.tls_mode === "auto" ? `auto · ${form.acme_staging ? "staging" : form.acme_provider}` : form.tls_mode} />
-                <KV k="HSTS" v={form.hsts ? "on" : "off"} />
-              </ConfigCard>
-              <ConfigCard title="HTTP Headers">
-                <KV k="CSP" v={form.csp || "default"} />
-                <KV k="Referrer-Policy" v={form.referrer_policy} />
-                <KV k="CORS" v={form.cors_enabled ? form.cors_origins : "off"} />
-                <KV k="Custom headers" v={`${form.custom_headers.filter(h => h.name).length}`} />
-              </ConfigCard>
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              <div className="panel">
+                <div className="ph"><div className="ptitle">This site</div></div>
+                <div className="pb" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px 22px" }}>
+                  <KV k="Domains" v={site.domains.join(", ") || "—"} />
+                  <KV k="Origin" v={form.servers.length === 0 ? "—"
+                    : form.servers.length === 1
+                      ? `${form.servers[0].tls ? "https" : "http"}://${form.servers[0].host}:${form.servers[0].port}`
+                      : `${form.servers.length} upstreams · ${form.lb}`} />
+                  <KV k="Enforcement" v={`${MODES.find(m => m.key === mode)?.label ?? mode} · PL${form.paranoia_level} · threshold ${form.anomaly_threshold}`} />
+                  <KV k="Certificate" v={cert ? (certDays !== null ? `${cert.domain} · ${certDays} days left` : cert.domain) : "none installed"} />
+                </div>
+              </div>
+
+              <div className="panel">
+                <div className="ph">
+                  <div className="ptitle">Where to go next</div>
+                  <span className="panel-badge pb-info">everything about this site</span>
+                </div>
+                <div className="pb" style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                  {([
+                    ["waf",      "🛡️ What it blocked",      "Requests this site refused, with the rule that decided"],
+                    ["access",   "📡 All traffic",           "Every request, blocked or not"],
+                    ["learning", "📚 Tune false positives",  "What blocking mode would have refused, ready to exclude"],
+                    ["paths",    "🛣 Per-path policy",       "Relax or tighten rules on individual URLs"],
+                    ["cert",     "🔐 Certificate",           "Issue, renew or replace this site's certificate"],
+                    ["config",   "🧾 Full configuration",    "Every setting, and what the data plane actually holds"],
+                  ] as [Tab, string, string][]).map(([k, label, why]) => (
+                    <button key={k} onClick={() => setTab(k)} title={why}
+                      style={{ textAlign: "left", padding: "10px 13px", borderRadius: 10, cursor: "pointer",
+                               background: "var(--bg3)", border: "1px solid var(--bg4)", color: "var(--text2)",
+                               minWidth: 215, flex: "1 1 215px" }}>
+                      <div style={{ fontSize: 13.5, fontWeight: 600 }}>{label}</div>
+                      <div className="td3" style={{ fontSize: 12, marginTop: 3, lineHeight: 1.45 }}>{why}</div>
+                    </button>
+                  ))}
+                  <button onClick={() => setTab("config")} title="Change these settings"
+                    style={{ textAlign: "left", padding: "10px 13px", borderRadius: 10, cursor: "pointer",
+                             background: "var(--cyan-dim)", border: "1px solid var(--cyan-ring)", color: "var(--text2)",
+                             minWidth: 215, flex: "1 1 215px" }}>
+                    <div style={{ fontSize: 13.5, fontWeight: 600 }}>⚙️ Change settings</div>
+                    <div className="td3" style={{ fontSize: 12, marginTop: 3, lineHeight: 1.45 }}>
+                      Open the full configuration, then Edit
+                    </div>
+                  </button>
+                </div>
+              </div>
             </div>
           )}
 
@@ -589,7 +614,56 @@ export default function SiteDetailPage() {
 
           {/* CERTIFICATE */}
           {tab === "config" && (
-            <EffectiveConfigPanel eff={eff} err={effErr} onRefresh={loadEffective} />
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              <DefaultsDiff form={form} />
+              {/* The configuration listing that used to be the landing page. */}
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+                <ConfigCard title="Reverse Proxy">
+                <KV k="Load balancer" v={form.lb} />
+                {form.servers.map((s, i) => <KV key={i} k={`Upstream #${i + 1}`} v={`${s.tls ? "https" : "http"}://${s.host}:${s.port} · w${s.weight}`} />)}
+                <KV k="Health checks" v={form.health.enabled ? `${form.health.path} every ${form.health.interval}` : "off"} />
+                <KV k="WebSocket" v={form.proxy_websocket ? "on" : "off"} />
+                </ConfigCard>
+                <ConfigCard title="WAF Rules">
+                <KV k="Paranoia level" v={`PL${form.paranoia_level}`} />
+                <KV k="Anomaly threshold" v={String(form.anomaly_threshold)} />
+                <KV k="Request inspection" v={`${form.rule_categories.filter(k => !ALL_CRS_RESPONSE_KEYS.includes(k)).length}/${CRS_REQUEST_CATEGORIES.length} categories`} />
+                <KV k="Response inspection" v={(() => {
+                const n = form.rule_categories.filter(k => ALL_CRS_RESPONSE_KEYS.includes(k)).length;
+                return n === 0 ? "off" : `${n}/${ALL_CRS_RESPONSE_KEYS.length} categories`;
+                })()} />
+                <KV k="Rule exclusions" v={`${form.rule_exclusions.length}`} />
+                <KV k="Path overrides" v={`${(form.path_overrides ?? []).length}`} />
+                <KV k="ML anomaly" v={form.ml_enabled ? `on (${form.ml_sensitivity})` : "off"} />
+                </ConfigCard>
+                <ConfigCard title="Rate & DDoS">
+                <KV k="Rate limit" v={form.rate_limit_enabled ? `${form.rl_per_ip.rps}/s per IP · ${form.rl_global.rps}/s global` : "off"} />
+                <KV k="Anti-DDoS" v={form.antiddos_enabled ? `${form.antiddos_conn_rate} conn/s · block ${form.antiddos_block_secs}s` : "off"} />
+                <KV k="Max body" v={`${form.max_body_size_mb} MB`} />
+                <KV k="Allowed methods" v={form.allowed_methods.join(" ")} />
+                </ConfigCard>
+                <ConfigCard title="Bots · Geo · IP">
+                <KV k="JA4 fingerprint" v={form.bot_ja4 ? "on" : "off"} />
+                <KV k="Challenge" v={form.bot_challenge} />
+                <KV k="GeoIP" v={form.geo_mode === "off" ? "off" : `${form.geo_mode}: ${form.geo_countries.join(", ") || "—"}`} />
+                <KV k="IP lists" v={`${form.ip_allow.length} allow · ${form.ip_block.length} block`} />
+                <KV k="Blacklists" v={form.dnsbl_enabled ? "DNSBL on" : "off"} />
+                </ConfigCard>
+                <ConfigCard title="Front Service / TLS">
+                <KV k="Public" v={`${scheme}://:${form.front_https ? 9443 : 9080}${form.force_https ? " · force-https" : ""}`} />
+                <KV k="HTTP/2 · HTTP/3" v={`${form.http2 ? "h2" : "—"} · ${form.http3 ? "h3" : "—"}`} />
+                <KV k="TLS mode" v={tlsModeLabel} />
+                <KV k="HSTS" v={form.hsts ? "on" : "off"} />
+                </ConfigCard>
+                <ConfigCard title="HTTP Headers">
+                <KV k="CSP" v={form.csp || "default"} />
+                <KV k="Referrer-Policy" v={form.referrer_policy} />
+                <KV k="CORS" v={form.cors_enabled ? form.cors_origins : "off"} />
+                <KV k="Custom headers" v={`${form.custom_headers.filter(h => h.name).length}`} />
+                </ConfigCard>
+              </div>
+              <EffectiveConfigPanel eff={eff} err={effErr} onRefresh={loadEffective} />
+            </div>
           )}
 
           {tab === "cert" && (
@@ -763,6 +837,88 @@ function ConfigCard({ title, children }: { title: string; children: React.ReactN
       <div className="ph"><div className="ptitle">{title}</div></div>
       <div className="pb" style={{ display: "flex", flexDirection: "column", gap: 7 }}>{children}</div>
     </motion.div>
+  );
+}
+
+/**
+ * C4, phase 1: what this site changed from what shipped.
+ *
+ * The full per-field "Use global / Customize" control needs a data model we do
+ * not have yet — a tenant-level defaults store and a stored policy that can tell
+ * "not set" from zero (see PRE-INTERNAL-BETA-C4-SCOPE.md). But the complaint
+ * behind it is answerable today: with 127 fields nobody can tell what they
+ * changed from what shipped.
+ *
+ * `emptyForm()` IS the shipped default, and it is already the single source the
+ * wizard creates from, so diffing against it needs no schema change, no new
+ * endpoint, and — importantly — no change to the payload. Nothing can become
+ * silently inert as a result of rendering this.
+ *
+ * Fields that are per-site by nature (name, domains, upstreams, certificates,
+ * secrets) are excluded: every site differs there, so listing them would bury
+ * the settings that were actually chosen.
+ */
+const NEVER_DIFF = new Set([
+  "name", "domains", "servers", "preset",
+  "cert_pem", "key_pem", "cert_path", "key_path", "tls_existing_cert",
+  "acme_email", "zerossl_api_key", "dns_credential", "dns_provider",
+  "bot_recaptcha_sitekey", "bot_recaptcha_secret",
+  "bot_hcaptcha_sitekey", "bot_hcaptcha_secret",
+  "bot_turnstile_sitekey", "bot_turnstile_secret",
+  "proxy_host_header", "proxy_ssl_sni_name", "acme_ca_server",
+]);
+
+const PRETTY = (k: string) =>
+  k.replace(/_/g, " ").replace(/\b(\w)/g, c => c.toUpperCase())
+   .replace(/\bMl\b/, "ML").replace(/\bTls\b/, "TLS").replace(/\bJa4\b/, "JA4")
+   .replace(/\bRl\b/, "Rate limit").replace(/\bUri\b/, "URI").replace(/\bIp\b/, "IP");
+
+function show(v: unknown): string {
+  if (v === null || v === undefined) return "—";
+  if (Array.isArray(v)) return v.length === 0 ? "(none)" : v.join(", ");
+  if (typeof v === "object") return JSON.stringify(v);
+  if (typeof v === "boolean") return v ? "on" : "off";
+  return String(v);
+}
+
+function DefaultsDiff({ form }: { form: SiteForm }) {
+  const base = emptyForm() as unknown as Record<string, unknown>;
+  const cur = form as unknown as Record<string, unknown>;
+  const rows: { key: string; mine: string; shipped: string }[] = [];
+  for (const k of Object.keys(base)) {
+    if (NEVER_DIFF.has(k)) continue;
+    const a = JSON.stringify(cur[k] ?? null);
+    const b = JSON.stringify(base[k] ?? null);
+    if (a !== b) rows.push({ key: k, mine: show(cur[k]), shipped: show(base[k]) });
+  }
+  const total = Object.keys(base).filter(k => !NEVER_DIFF.has(k)).length;
+  return (
+    <div className="panel">
+      <div className="ph">
+        <div className="ptitle">Changed from the defaults</div>
+        <span className="panel-badge pb-info">
+          {rows.length} of {total} settings
+        </span>
+      </div>
+      {rows.length === 0 ? (
+        <Empty text="This site runs the shipped defaults throughout." />
+      ) : (
+        <div className="tw">
+          <table>
+            <thead><tr><th>Setting</th><th>This site</th><th>Shipped default</th></tr></thead>
+            <tbody>
+              {rows.map(r => (
+                <tr key={r.key}>
+                  <td className="td2">{PRETTY(r.key)}</td>
+                  <td style={{ fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--cyan)" }}>{r.mine}</td>
+                  <td className="td3" style={{ fontFamily: "var(--font-mono)", fontSize: 13 }}>{r.shipped}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
   );
 }
 

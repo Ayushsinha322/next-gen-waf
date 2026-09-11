@@ -2,6 +2,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
+import FirstRunNote from "@/components/ui/FirstRunNote";
 import { api, type BlocksResponse, type IOC } from "@/lib/api";
 import { staggerContainer, fadeUp, cardVariants } from "@/lib/animations";
 
@@ -137,15 +138,27 @@ export default function BlockedSourcesPage() {
     c.autoban = dp.autoban?.banned.length ?? 0;
     c.ebpf = (dp.ebpf?.exact_ips.filter(ip => !(dp.autoban?.banned ?? []).includes(ip)).length ?? 0) + (dp.ebpf?.ranges.length ?? 0);
     c.offender = dp.offenders?.entries.filter(o => !(dp.autoban?.banned ?? []).includes(o.ip)).length ?? 0;
-    c.indicator = data.indicators.length;
+    // The API caps the indicator list at 500 per type; indicators_total is the
+    // real match count. Counting rows made an 18,013-entry feed read as 500.
+    c.indicator = data.indicators_total ?? data.indicators.length;
     c.country = data.countries.length;
     return c;
   }, [data]);
 
+  // How many block-tier indicators exist beyond the page the API returned. The
+  // tile counts the feed; the table can only list what was sent, and saying so
+  // is the difference between a cap and a contradiction.
+  const iocTruncated = data ? Math.max(0, (data.indicators_total ?? 0) - data.indicators.length) : 0;
   const dp = data?.dataplane;
 
   return (
     <motion.div className="sec" variants={staggerContainer} initial="hidden" animate="visible">
+      <FirstRunNote id="blocked" title="Three separate mechanisms are merged into this list">
+        A source can be blocked by the data plane&apos;s own kernel/XDP list (including automatic
+        bans for repeated offences), by the threat-intelligence indicator feed, or by country
+        policy. Each row is unblocked at whichever of those set it. Indicators are capped at 500
+        per type for display, so the number listed here is not the size of the feed.
+      </FirstRunNote>
       <motion.div variants={fadeUp} style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 14 }}>
         <div>
           <div className="sec-title">🚫 Blocked Sources</div>
@@ -196,6 +209,12 @@ export default function BlockedSourcesPage() {
       <motion.div className="panel" variants={fadeUp}>
         <div className="ph">
           <div className="ptitle">Active blocks ({rows.length}{filter ? ` · ${KIND_META[filter].label}` : ""})</div>
+          {iocTruncated > 0 && (
+            <div className="td3" style={{ fontSize: 12, fontFamily: "var(--font-mono)" }}
+              title="The API returns at most 500 indicators per type. The threat-intel tile counts the whole feed; this table lists the page.">
+              listing {data!.indicators.length.toLocaleString()} of {(data!.indicators_total ?? 0).toLocaleString()} indicators
+            </div>
+          )}
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
             {filter && <button className="btn bg-btn btn-xs" onClick={() => setFilter("")}>✕ clear filter</button>}
             <input className="fi2" placeholder="Search IP, CIDR, source…" value={search} onChange={e => setSearch(e.target.value)} style={{ width: 220 }} />

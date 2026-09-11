@@ -74,7 +74,7 @@ troubleshooting output:
 | `postgres` | configuration, users, sites |
 | `clickhouse` | traffic and detection events (allocated 6 GB) |
 | `redis` | rate-limit and session state |
-| `prometheus`, `grafana` | metrics, on loopback only |
+| `prometheus` | metrics, on loopback only |
 
 A ninth, `migrate`, runs the database migrations once and then exits. **It being
 gone is correct.**
@@ -397,7 +397,7 @@ It asks three things — visitor hostname, origin address, origin port — and t
 
 ```
 ==> Reaching the origin from this host
-  ✓ grafana:3000 is accepting connections
+  ✓ prometheus:9090 is accepting connections
 
 ==> Validating against the data plane
   ✓ configuration accepted

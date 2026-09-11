@@ -11,6 +11,7 @@ import { showToast } from "@/components/ui/Toast";
 import { api, type WafEvent, type TimelineBucket, type EventQuery, type Site, type LogProfile } from "@/lib/api";
 import EventDrawer from "@/components/events/EventDrawer";
 import LogProfilePanel, { type ProfileFilters } from "@/components/events/LogProfilePanel";
+import FirstRunNote from "@/components/ui/FirstRunNote";
 import { staggerContainer, fadeUp, cardVariants } from "@/lib/animations";
 
 const RANGES: { label: string; secs: number }[] = [
@@ -212,6 +213,12 @@ export default function EventsPage() {
 
   return (
     <motion.div className="sec" variants={staggerContainer} initial="hidden" animate="visible">
+      <FirstRunNote id="events" title="This is the attack history, not the access log">
+        Every request that matched a rule or was acted on is stored here durably and stays
+        searchable. Ordinary traffic that passed inspection is not, so totals on this page are
+        not meant to agree with Requests&nbsp;/&nbsp;sec on the Overview — they answer a different
+        question.
+      </FirstRunNote>
       <motion.div variants={fadeUp} style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 14 }}>
         <div>
           <div className="sec-title">🔎 Threat Search</div>

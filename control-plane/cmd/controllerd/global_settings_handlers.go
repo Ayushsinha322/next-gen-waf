@@ -74,7 +74,18 @@ func handleGetGlobalSettings(c *gin.Context, enf *rbac.Enforcer, store *db.Store
 		r.Body.Close()
 		var dp map[string]any
 		if r.StatusCode == http.StatusOK && json.Unmarshal(body, &dp) == nil {
-			resp["dataplane"] = gin.H{"reachable": true, "config": dp}
+			// The config above is the node's FILE. Several controls are switched on
+			// by environment variable at run time instead, so the file alone
+			// misreports them: the console showed "eBPF / XDP: off" on a node
+			// reporting mode kernel-xdp with 11 million packets passed, because
+			// SENTINEL_XDP_ENABLE=1 never appears in the YAML. Carry the runtime
+			// view alongside it so the page can show effective state and say which
+			// source it came from.
+			resp["dataplane"] = gin.H{
+				"reachable": true,
+				"config":    dp,
+				"runtime":   dataPlaneRuntime(c),
+			}
 		} else {
 			resp["dataplane"] = gin.H{"reachable": false, "error": "data plane returned " + r.Status}
 		}
@@ -82,6 +93,44 @@ func handleGetGlobalSettings(c *gin.Context, enf *rbac.Enforcer, store *db.Store
 		resp["dataplane"] = gin.H{"reachable": false, "error": err.Error()}
 	}
 	c.JSON(http.StatusOK, resp)
+}
+
+// dataPlaneRuntime returns the parts of the data plane's /healthz that describe
+// what is actually running, as opposed to what its config file asks for. Returns
+// nil when the node cannot be reached; the caller renders that as "unknown"
+// rather than as "off", which is the whole point of the distinction.
+func dataPlaneRuntime(c *gin.Context) map[string]any {
+	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet,
+		dataPlaneBaseURL()+"/healthz", nil)
+	if err != nil {
+		return nil
+	}
+	r, err := (&http.Client{Timeout: 4 * time.Second}).Do(req)
+	if err != nil {
+		return nil
+	}
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		return nil
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		return nil
+	}
+	var h map[string]any
+	if json.Unmarshal(body, &h) != nil {
+		return nil
+	}
+	out := map[string]any{}
+	// Only the blocks the page needs. Copying the whole document here would put
+	// the node's site list and counters behind a settings call, which is not what
+	// this endpoint is for.
+	for _, k := range []string{"ebpf", "http3", "geoip", "threat_intel", "version"} {
+		if v, ok := h[k]; ok {
+			out[k] = v
+		}
+	}
+	return out
 }
 
 type putGlobalSettingsRequest struct {

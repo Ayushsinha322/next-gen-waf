@@ -3,6 +3,7 @@ import { useState, useEffect, useMemo } from "react";
 import { motion } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
 import EmptyState from "@/components/ui/EmptyState";
+import { PRODUCT_NAME } from "@/lib/version";
 import {
   api,
   type Certificate,
@@ -308,7 +309,7 @@ export default function CertificatesPage() {
           {tab === "acme" ? (
             <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
               <div style={{ fontSize: 14, color: "var(--text2)" }}>
-                Next-Gen ESDS WAF speaks ACME natively (no certbot). Domains must resolve to this WAF and be reachable
+                {PRODUCT_NAME} speaks ACME natively (no certbot). Domains must resolve to this WAF and be reachable
                 on port 80 (HTTP-01) or 443 (TLS-ALPN-01). Certs auto-renew 30 days before expiry.
               </div>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>

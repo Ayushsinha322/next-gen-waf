@@ -238,7 +238,7 @@ whether or not it has internet, because Harbor lives on an internal address
 (`172.16.23.2`) that does not route from outside ESDS.
 
 The small one pulls six standard images (Postgres, Redis, ClickHouse, Prometheus,
-Grafana, HAProxy) from Docker Hub during the install. The offline one carries all
+HAProxy) from Docker Hub during the install. The offline one carries all
 ten images inside it and needs no internet at all.
 
 **If in doubt, and the VM has internet, use `-online`.** You cannot pick the wrong
@@ -597,15 +597,15 @@ sudo ./first-site.sh
 ```
 
 It asks three things — the hostname visitors will use, the origin's address, and the
-origin's port. For a first test answer `test.local`, `grafana`, `3000`: that is the
-monitoring dashboard the installer already put on the VM, so it works even with no
+origin's port. For a first test answer `test.local`, `prometheus`, `9090`: that is the
+metrics service the installer already put on the VM, so it works even with no
 internet.
 
 Then it does the work and, more importantly, checks it:
 
 ```
 ==> Reaching the origin from this host
-  ✓ grafana:3000 is accepting connections
+  ✓ prometheus:9090 is accepting connections
 
 ==> Validating against the data plane
   ✓ configuration accepted
@@ -667,7 +667,7 @@ certificate** TLS card).
 
 | Field | Value |
 |---|---|
-| Upstream host | `grafana` |
+| Upstream host | `prometheus` |
 | Upstream port | `3000` |
 
 Leave the remaining steps at their defaults and click save.
@@ -723,7 +723,7 @@ normal: 200
 sqli:   200
 ```
 
-> **Why `/login` and not `/`?** Grafana redirects `/` to its login page, so `/`
+> **Why `/login` and not `/`?** Many apps redirect `/` to a login page, so `/`
 > answers **302**, not 200 — which would make both numbers above read `302` and
 > leave you unable to tell a working WAF from a broken one. `/login` is the same
 > upstream, reached the same way, and answers 200. If you do test `/` and see

@@ -17,7 +17,7 @@
 # WHAT IS AND IS NOT IN THE BUNDLE
 #
 # Bundled: the four ESDSWAF images (dataplane, controlplane, dashboard, migrate).
-# NOT bundled: postgres, redis, clickhouse, prometheus, grafana — the customer's
+# NOT bundled: postgres, valkey, clickhouse, prometheus — the customer's
 # Docker pulls those from Docker Hub (or a mirror). That is a deliberate choice:
 # it keeps the archive at a few hundred MB instead of ~2 GB, and those images are
 # public and stable.
@@ -63,10 +63,9 @@ OWN_IMAGES=(dataplane controlplane dashboard migrate)
 # not bundled: the customer needs them to pre-seed a registry mirror.
 THIRD_PARTY=(
   "postgres:16-alpine"
-  "redis:7-alpine"
+  "valkey/valkey:8-alpine"
   "clickhouse/clickhouse-server:24-alpine"
   "prom/prometheus:v2.54.1"
-  "grafana/grafana:11.2.0"
   # Used only by compose.ha.yml, which is shipped — so it belongs in the list a
   # customer pre-seeds a registry mirror from, and in the offline bundle.
   "haproxy:2.9-alpine"
@@ -132,7 +131,7 @@ else
     POSTGRES_USER=build POSTGRES_PASSWORD=build POSTGRES_DB=build \
     CLICKHOUSE_USER=build CLICKHOUSE_PASSWORD=build CLICKHOUSE_DB=build \
     SENTINEL_JWT_SECRET=x SENTINEL_INTERNAL_SECRET=x SENTINEL_AUDIT_HMAC_KEY=x \
-    GRAFANA_ADMIN_PASSWORD=x SENTINEL_DB_URL=x SENTINEL_DB_URL_PRIMARY=x \
+    SENTINEL_DB_URL=x SENTINEL_DB_URL_PRIMARY=x \
     SENTINEL_REPL_USER=x SENTINEL_REPL_PASSWORD=x SENTINEL_STANDBY_CIDR=0.0.0.0/32 \
     docker compose -f compose.prod.yml build controlplane migrate dashboard dataplane ) \
     || die "image build failed"
@@ -179,7 +178,6 @@ cp deploy/docker/prometheus.yml            "$STAGE/compose/" 2>/dev/null || true
 # listed in THIRD_PARTY below for the same reason.)
 cp deploy/docker/haproxy.cfg               "$STAGE/compose/" 2>/dev/null \
   || warn "missing haproxy.cfg — compose.ha.yml would fail to start"
-cp -r deploy/docker/grafana                "$STAGE/compose/" 2>/dev/null || true
 
 # Operational scripts the customer legitimately needs.
 #
@@ -214,10 +212,28 @@ cp deploy/2vm/install-2vm.sh deploy/2vm/keepalived.conf.tmpl \
    "$STAGE/scripts/2vm/" 2>/dev/null || warn "2vm assets incomplete"
 
 cp deploy/docker/.env.example "$STAGE/configs/env.example"
+
+# Third-party notices and the licence texts they reference. Apache-2.0 section 4
+# requires shipping the licence and retaining attribution when redistributing,
+# and this bundle redistributes several hundred Apache-2.0 components plus the
+# OWASP Core Rule Set. Regenerated here rather than copied blindly, so an archive
+# can never carry a notices file that predates its own dependency list.
+if command -v python3 >/dev/null 2>&1; then
+  python3 deploy/gen-notices.py >/dev/null 2>&1 \
+    || warn "could not regenerate THIRD-PARTY-NOTICES.md — shipping the committed copy"
+fi
+cp THIRD-PARTY-NOTICES.md "$STAGE/" 2>/dev/null || warn "missing THIRD-PARTY-NOTICES.md"
+cp -r licenses "$STAGE/licenses" 2>/dev/null || warn "missing licenses/ directory"
 # The two installation guides ship WITH the bundle. An operator who has the archive
 # but not the repo otherwise has no written procedure — and the active/passive one
 # in particular is a two-machine sequence that cannot be guessed from --help.
-for d in STANDALONE.md ACTIVE-PASSIVE.md; do
+# The generated topology page. An operator with the archive and no repository
+# otherwise has to reconstruct a three-file override chain by reading it.
+if command -v python3 >/dev/null 2>&1; then
+  python3 deploy/gen-topology.py >/dev/null 2>&1 \
+    || warn "could not regenerate deploy/TOPOLOGY.md — shipping the committed copy"
+fi
+for d in STANDALONE.md ACTIVE-PASSIVE.md TOPOLOGY.md; do
   cp "deploy/$d" "$STAGE/docs/" 2>/dev/null || warn "missing guide: deploy/$d"
 done
 # The operator manual. The two guides above are installation procedures; these are

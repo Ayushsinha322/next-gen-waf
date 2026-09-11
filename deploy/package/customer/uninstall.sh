@@ -24,7 +24,7 @@ else B=''; R=''; RED=''; GRN=''; YEL=''; fi
 
 VOLUMES=(sentinel_pgdata sentinel_chdata sentinel_sentinel-logs
          sentinel_sentinel-certs sentinel_sentinel-state
-         sentinel_promdata sentinel_grafanadata)
+         sentinel_promdata)
 
 printf '\n  %sNext-Gen ESDSWAF — uninstall%s\n\n' "$B" "$R"
 

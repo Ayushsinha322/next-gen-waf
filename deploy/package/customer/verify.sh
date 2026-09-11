@@ -43,7 +43,7 @@ done
 step "Backing stores"
 docker exec sentinel-postgres-1 pg_isready -U sentinel -d sentinel >/dev/null 2>&1 \
   && pass "Postgres accepting connections" || bad "Postgres not ready"
-docker exec sentinel-redis-1 redis-cli ping 2>/dev/null | grep -q PONG \
+docker exec sentinel-redis-1 valkey-cli ping 2>/dev/null | grep -q PONG \
   && pass "Redis responding" || bad "Redis not responding"
 docker exec sentinel-clickhouse-1 wget -qO- http://127.0.0.1:8123/ping 2>/dev/null | grep -q Ok \
   && pass "ClickHouse responding" || bad "ClickHouse not responding"
@@ -176,7 +176,7 @@ if [[ "${SITES:-0}" -gt 0 ]]; then
     # Any 2xx or 3xx proves the request reached the origin and the origin
     # answered — which is all this probe is for. Requiring exactly 200 raised
     # "check the upstream is reachable" against perfectly healthy origins: a
-    # 302 is what Grafana, and any app that redirects `/` to a login page or to
+    # 302 is what any app that redirects `/` to a login page or to
     # https, returns on the path probed here. That false alarm landed on the
     # operator's FIRST verification run, next to real findings.
     case "$b" in

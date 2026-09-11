@@ -7,6 +7,7 @@ import Toggle from "@/components/ui/Toggle";
 import { api, type UserRow, type APIKeyRow, type NotificationChannel, type ChannelType, type ChannelConfig, type Severity, type ManagementTLSInfo, type ClusterHealth } from "@/lib/api";
 import { staggerContainer, fadeUp, spring, tweenFast } from "@/lib/animations";
 import { logout, getUser } from "@/lib/auth";
+import { PRODUCT_NAME } from "@/lib/version";
 
 const TABS = ["General","Auth & SSO","API Keys","Users & RBAC","Cluster","Notifications","Management TLS"];
 
@@ -1023,7 +1024,7 @@ function ManagementTLSTab() {
       <div className="pb">
         <p className="sec-sub" style={{ marginTop: 0 }}>
           The certificate the WAF presents on its <b>management endpoint</b> (this admin console). Served by
-          Next-Gen ESDS WAF&apos;s own engine — no third-party proxy. Customer-website certificates are separate and live
+          {PRODUCT_NAME}&apos;s own engine — no third-party proxy. Customer-website certificates are separate and live
           under <b>Certificates</b>.
         </p>
 

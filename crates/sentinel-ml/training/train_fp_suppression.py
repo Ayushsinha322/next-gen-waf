@@ -148,6 +148,102 @@ def gen_cmdi(n):
         o.add(rng.choice([f"{p}{s}{c}",f"{p} {s} {c}",f"$({c})",f"`{c}`",f"{p};{c};",f"|{c}"]))
     return list(o)
 
+def gen_form_benign(n=14000):
+    """Whole urlencoded FORM BODIES, especially authentication forms.
+
+    Measured gap (E1): the shipped model scored ordinary login bodies above the
+    0.5 FP-suppression cutoff and reached a blocking anomaly score on its own,
+    with no signature match:
+
+        j_username=alice&j_password=hunter2&_spring_security_remember_me=on  0.711
+        username=alice&password=...&remember=1                              0.625
+        _csrf=9f8a7b&username=alice&password=hunter2&remember_me=on          0.539
+
+    Every INDIVIDUAL value in those bodies is harmless — the highest, "on", is
+    0.21 — so the model was reacting to the SHAPE of a multi-field form body, and
+    the corpus had almost none: `form_benign` below wraps a single value in one
+    key (`q=<value>`), which never teaches what four ampersand-separated
+    key/value pairs look like.
+
+    This is the same class as the URL gap that motivated gen_web_benign, and the
+    same fix: synthesise the missing family. It is the worst possible place for a
+    false positive — the authentication path is the one request every user makes
+    before they can do anything, the body carries a password so an operator
+    cannot paste it into a bug report, and a site in blocking mode locks out
+    everyone at once.
+
+    All synthesised from generic form shapes. NO GoTestWAF content.
+    """
+    # Real framework conventions, because that is what the shapes have to cover.
+    user_keys = ["username", "user", "login", "email", "userid", "user_name", "uname",
+                 "j_username", "user%5Bemail%5D", "user%5Blogin%5D", "session%5Bemail%5D",
+                 "data%5Battributes%5D%5Bemail%5D", "identifier", "account"]
+    pass_keys = ["password", "passwd", "pass", "pwd", "j_password", "user%5Bpassword%5D",
+                 "session%5Bpassword%5D", "data%5Battributes%5D%5Bpassword%5D",
+                 "current_password", "passphrase"]
+    remember = ["remember_me=on", "remember_me=1", "remember_me=true", "remember=1",
+                "remember=on", "rememberMe=true", "rememberMe=on", "keep_signed_in=yes",
+                "stay_signed_in=1", "_spring_security_remember_me=on",
+                "user%5Bremember_me%5D=1", "persist=1", "trust_device=on", "remember=yes"]
+    csrf_keys = ["_csrf", "csrf_token", "csrfmiddlewaretoken", "authenticity_token",
+                 "__RequestVerificationToken", "_token", "xsrf", "nonce"]
+    users = ["alice", "bob", "a.sharma", "alice%40example.com", "bob.smith%40acme.co.in",
+             "admin", "operator1", "j.doe", "priya.n", "user_42", "ayush%40esds.co.in"]
+    # High-entropy, because a real password field is high-entropy and that is a
+    # plausible part of what the model was reacting to.
+    pw_alpha = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    pw_sym = "!%40%23%24%25%5E%26*()-_%3D%2B"
+    def pw():
+        n = rng.randint(8, 22)
+        body = "".join(rng.choice(pw_alpha) for _ in range(n))
+        if rng.random() < 0.55:
+            at = rng.randint(1, max(1, n - 1))
+            body = body[:at] + rng.choice([pw_sym[i:i+3] for i in range(0, len(pw_sym), 3)]) + body[at:]
+        return body
+    def tok(k=None):
+        n = rng.choice([16, 24, 32, 40, 43, 64])
+        al = "abcdef0123456789" if rng.random() < 0.5 else pw_alpha + "-_"
+        return "".join(rng.choice(al) for _ in range(n))
+
+    # Ordinary (non-authentication) forms, so the model learns the shape rather
+    # than learning "login form" as a category.
+    other_forms = [
+        lambda: f"name={rng.choice(['Alice','Bob','Priya%20N','A.%20Sharma'])}&email={rng.choice(users)}&message={rng.choice(['Hello%20there','Please%20call%20back','I%20need%20an%20invoice','Thanks%21'])}",
+        lambda: f"q={rng.choice(['laptop','ssd%20500gb','office%20chair','waf'])}&page={rng.randint(1,9)}&sort={rng.choice(['price','relevance','-created'])}",
+        lambda: f"first_name=Alice&last_name=Smith&bio={rng.choice(['I%20like%20cats','Engineer%20at%20ACME','',' '])}",
+        lambda: f"quantity={rng.randint(1,9)}&sku={rng.choice(['ABC-123','SKU%2F9981','X_44'])}&coupon={rng.choice(['SPRING25','','FREESHIP'])}",
+        lambda: f"street=12%20High%20St&city={rng.choice(['Nashik','Pune','Mumbai'])}&postcode={rng.randint(100000,999999)}&country=IN",
+        lambda: f"comment={rng.choice(['Great%20article%2C%20thanks%21','%2B1','Works%20for%20me'])}&post_id={rng.randint(100,99999)}",
+        lambda: f"old_password={pw()}&new_password={pw()}&confirm_password={pw()}",
+        lambda: f"otp={rng.randint(100000,999999)}&{rng.choice(csrf_keys)}={tok()}",
+    ]
+
+    out = set()
+    guard = 0
+    while len(out) < n and guard < n * 40:
+        guard += 1
+        r = rng.random()
+        if r < 0.62:
+            # Authentication bodies — the family that was missing.
+            parts = []
+            if rng.random() < 0.45:
+                parts.append(f"{rng.choice(csrf_keys)}={tok()}")
+            parts.append(f"{rng.choice(user_keys)}={rng.choice(users)}")
+            parts.append(f"{rng.choice(pass_keys)}={pw()}")
+            if rng.random() < 0.72:
+                parts.append(rng.choice(remember))
+            if rng.random() < 0.22:
+                parts.append(f"{rng.choice(['next','redirect','returnUrl','continue'])}={rng.choice(['%2Faccount','%2Fdashboard','%2F','%2Fsettings%2Fprofile'])}")
+            if rng.random() < 0.12:
+                parts.append(f"{rng.choice(['submit','commit','action'])}={rng.choice(['Sign%20in','Log%20in','login'])}")
+            if rng.random() < 0.3:
+                rng.shuffle(parts)
+            out.add("&".join(parts))
+        else:
+            out.add(rng.choice(other_forms)())
+    return list(out)
+
+
 def gen_web_benign(n_url=12000, n_hdr=6000):
     """Ordinary URLs and HTTP header values — benign traffic the corpus lacked.
 
@@ -297,14 +393,18 @@ print(f"adversarial benign: {len(adv_ben)}", flush=True)
 # Ordinary URLs + HTTP header values (see gen_web_benign for the measured gap).
 web_ben = gen_web_benign()
 print(f"web benign (urls + headers): {len(web_ben)}", flush=True)
+# Whole form bodies, especially authentication forms (see gen_form_benign for
+# the measured gap: E1, login bodies scoring 0.54-0.71).
+form_bodies = gen_form_benign()
+print(f"form-body benign (incl. login forms): {len(form_bodies)}", flush=True)
 # More encoded-benign
-_pool = hard+fwaf+adv_ben+web_ben
+_pool = hard+fwaf+adv_ben+web_ben+form_bodies
 enc_pool = rng.sample(_pool, min(8000, len(_pool)))
 enc_benign = [url_enc_part(b) for b in enc_pool[:4000]]
 enc_full = [url_enc(b) for b in enc_pool]
 form_benign = [f"{rng.choice(['q','field','data','input','name','value','text'])}={url_enc(b)}"
                for b in rng.sample(_pool, min(4000, len(_pool)))]
-ben = hard + fwaf + hp_ben + adv_ben + web_ben + enc_benign + enc_full + form_benign
+ben = hard + fwaf + hp_ben + adv_ben + web_ben + form_bodies + enc_benign + enc_full + form_benign
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELD-OUT SPLIT.

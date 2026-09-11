@@ -1660,6 +1660,7 @@ func buildRustSiteTLS(raw json.RawMessage) map[string]any {
 			Mode        string `json:"mode"`
 			Email       string `json:"email"`
 			Provider    string `json:"provider"`
+			CaServer    string `json:"ca_server"`
 			Challenge   string `json:"challenge"`
 			RenewBefore uint32 `json:"renew_before_days"`
 			Custom      *struct {
@@ -1681,6 +1682,17 @@ func buildRustSiteTLS(raw json.RawMessage) map[string]any {
 		acme := map[string]any{"email": t.Email}
 		if prov := rustAcmeProvider(t.Provider); prov != "" {
 			acme["provider"] = prov
+		}
+		// The console has offered "override ACME directory URL" all along and
+		// this struct did not parse it, so the value was stored, echoed back to
+		// the operator, and dropped here — every issuance went to Let's Encrypt
+		// regardless. Same shape as the other allowlist drops.
+		//
+		// https only, matching the data plane: its ACME client is built
+		// https-only, so forwarding an http:// URL would just move the silent
+		// failure one layer down.
+		if cs := strings.TrimSpace(t.CaServer); strings.HasPrefix(cs, "https://") {
+			acme["ca_server"] = cs
 		}
 		if ch := rustAcmeChallenge(t.Challenge); ch != "" {
 			acme["challenge"] = ch

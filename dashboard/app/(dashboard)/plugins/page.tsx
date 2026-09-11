@@ -1,5 +1,6 @@
 "use client";
 import { useCallback, useEffect, useRef, useState } from "react";
+import FirstRunNote from "@/components/ui/FirstRunNote";
 import { motion } from "framer-motion";
 import { api, type Plugin, type CatalogPlugin, type PluginHooks, type PluginPermissions } from "@/lib/api";
 import { staggerContainer, fadeUp } from "@/lib/animations";
@@ -185,6 +186,12 @@ export default function PluginsPage() {
 
   return (
     <motion.div className="sec" variants={staggerContainer} initial="hidden" animate="visible">
+      <FirstRunNote id="plugins" title="Uploading and enabling a plugin does not run it">
+        Enabling makes a plugin <em>available</em> to the deployment. It inspects traffic only for
+        the sites it is scoped to, so until you scope it to at least one site it runs on nothing.
+        A site that names a plugin this node does not hold is reported as unresolved rather than
+        being quietly ignored.
+      </FirstRunNote>
       <motion.div variants={fadeUp}>
         <div className="sec-title">WASM Plugins</div>
         <div className="sec-sub">

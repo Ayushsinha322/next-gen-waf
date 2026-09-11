@@ -62,7 +62,7 @@ export const en: Dict = {
   "common.delete": "Delete",
   "common.search": "Search",
   "common.language": "Language",
-  "common.language_hint": "Only English has a dictionary today. Adding a language is one file in dashboard/lib/i18n.tsx — no page changes.",
+  "common.language_hint": "Only English has a dictionary today. Further languages can be added without changing any screen.",
 };
 
 const DICTS: Record<Locale, Dict> = { en };

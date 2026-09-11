@@ -259,7 +259,7 @@ hc() { local label="$1"; shift
   for _ in $(seq 1 40); do "$@" >/dev/null 2>&1 && { ok "$label"; return 0; }; sleep 3; done
   printf '  %s✗%s %s\n' "$RED" "$R" "$label"; log "FAIL $label"; health_ok=no; return 1; }
 hc "Postgres"   docker exec sentinel-postgres-1 pg_isready -U sentinel -d sentinel
-hc "Redis"      docker exec sentinel-redis-1 redis-cli ping
+hc "Redis"      docker exec sentinel-redis-1 valkey-cli ping
 hc "ClickHouse" bash -c "docker exec sentinel-clickhouse-1 wget -qO- http://127.0.0.1:8123/ping | grep -q Ok"
 hc "Data plane" bash -c "curl -fsS --max-time 3 http://127.0.0.1:80/healthz >/dev/null"
 # Version actually in service, not merely loaded.

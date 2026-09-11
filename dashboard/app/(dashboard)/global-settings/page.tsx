@@ -108,7 +108,39 @@ export default function GlobalSettingsPage() {
   const listeners = (cfg.listeners as Array<Record<string, unknown>> | undefined) ?? [];
   const logging   = (cfg.logging as Record<string, unknown> | undefined) ?? {};
   const limits    = (cfg.limits  as Record<string, unknown> | undefined) ?? {};
-  const ebpf      = (cfg.ebpf    as Record<string, unknown> | undefined) ?? {};
+  // Effective eBPF/XDP state, taken from the NODE and not from the file.
+  //
+  // Two facts make the file useless here. First, `ebpf.enable`/`ebpf.programs`
+  // in the YAML have zero consumers in the data plane — the manager is built
+  // entirely from SENTINEL_XDP_* environment variables — so this card was
+  // rendering an inert key and reported "off" on a node running kernel XDP with
+  // 11 million packets passed. Second, there is no "off" state to report at all:
+  // EbpfMode is Kernel or Software, and the userspace software fast-fail always
+  // runs. Claiming "off" was doubly wrong.
+  //
+  // The pair that matters is mode vs kernel_requested. Requested-but-software
+  // means the kernel program did not attach and the DDoS path is running in
+  // userspace — the silent degradation this row now has to make visible.
+  const rt        = (dp?.runtime as Record<string, unknown> | undefined) ?? undefined;
+  const rtEbpf    = (rt?.ebpf as Record<string, unknown> | undefined) ?? undefined;
+  const ebpfState = (() => {
+    if (!rtEbpf) return dp?.reachable ? "unknown — node did not report" : "unknown — node unreachable";
+    const mode     = String(rtEbpf.mode ?? "");
+    const iface    = String(rtEbpf.interface ?? "");
+    const wanted   = rtEbpf.kernel_requested === true;
+    const passed   = Number(rtEbpf.xdp_pass ?? 0);
+    const dropped  = Number(rtEbpf.xdp_drop ?? 0);
+    const counters = `${passed.toLocaleString()} passed · ${dropped.toLocaleString()} dropped`;
+    if (mode === "kernel-xdp") {
+      return `kernel XDP${iface ? ` on ${iface}` : ""} · ${counters}`;
+    }
+    if (mode === "software") {
+      return wanted
+        ? `software fallback — kernel XDP requested but did not attach · ${counters}`
+        : `software fast-fail — kernel XDP not enabled · ${counters}`;
+    }
+    return mode ? `${mode} · ${counters}` : "unknown — node did not report";
+  })();
   const cluster   = (cfg.cluster as Record<string, unknown> | undefined) ?? {};
   const storage   = (cfg.storage as Record<string, unknown> | undefined) ?? {};
   const tlsOf = (l: Record<string, unknown>) => (l.tls as Record<string, unknown> | null | undefined) ?? null;
@@ -239,7 +271,7 @@ export default function GlobalSettingsPage() {
                 {[
                   ["Logging", `${String(logging.level ?? "—")} · ${String(logging.format ?? "")} · ${Array.isArray(logging.outputs) ? (logging.outputs as unknown[]).length : 0} output(s)`],
                   ["Admission limits", `${String(limits.max_connections ?? "—")} connections · ${String(limits.max_inflight_requests ?? "—")} in-flight`],
-                  ["eBPF / XDP", ebpf.enable ? `on · ${Array.isArray(ebpf.programs) ? (ebpf.programs as unknown[]).join(", ") : ""}` : "off"],
+                  ["eBPF / XDP", ebpfState],
                   ["Control-plane sync", `${String(cluster.sync_url ?? "—")} · every ${String(cluster.sync_interval_secs ?? "—")} s`],
                   ["Cache / KV", `${String((storage.cache as Record<string, unknown> | undefined)?.backend ?? "—")} ${String((storage.cache as Record<string, unknown> | undefined)?.size ?? "")} · kv ${String((storage.kv as Record<string, unknown> | undefined)?.backend ?? "—")}`],
                   ["Cert directory", String(cfg.cert_dir ?? "default")],

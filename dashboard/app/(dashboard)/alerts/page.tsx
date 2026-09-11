@@ -24,8 +24,20 @@ export default function AlertsPage() {
   async function loadAlerts() {
     setLoading(true);
     try {
-      const res = await api.alerts.list();
-      setAlerts(res.alerts ?? []);
+      // Two fetches on purpose. The unfiltered list is capped at 200 rows by
+      // recency, so on a deployment with history the OPEN rows fall off the end
+      // of it: this page reported "0 open" while eleven criticals raised in July
+      // were still open in the database, because the count was derived from a
+      // list that no longer contained them. Ask for the open set explicitly,
+      // merge it in for display, and count from it.
+      const [recent, open] = await Promise.all([
+        api.alerts.list(),
+        api.alerts.list("open"),
+      ]);
+      const byID = new Map<string, Alert>();
+      for (const a of [...(open.alerts ?? []), ...(recent.alerts ?? [])]) byID.set(a.id, a);
+      setAlerts([...byID.values()].sort(
+        (x, y) => new Date(y.created_at).getTime() - new Date(x.created_at).getTime()));
     } catch {
       showToast("Failed to load alerts","e","⚠️");
     } finally {
@@ -129,7 +141,11 @@ export default function AlertsPage() {
   }
 
   const enabledChannels = channels?.filter(c => c.enabled) ?? [];
-  const openCount = alerts.filter(a => a.state === "open").length;
+  // `alerts` now always contains the open rows (loadAlerts merges them in), so
+  // deriving from it is correct again — and stays correct for alerts arriving
+  // live over the event stream.
+  const openAlerts = alerts.filter(a => a.state === "open");
+  const openCount = openAlerts.length;
   const rel = (iso?: string | null) => {
     if (!iso) return "never";
     const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
@@ -137,14 +153,14 @@ export default function AlertsPage() {
   };
 
   const counts = {
-    critical: alerts.filter(a => a.severity === "critical" && a.state === "open").length,
-    high:     alerts.filter(a => a.severity === "high"     && a.state === "open").length,
-    medium:   alerts.filter(a => a.severity === "medium"   && a.state === "open").length,
-    low:      alerts.filter(a => (a.severity === "low" || a.severity === "info") && a.state === "open").length,
+    critical: openAlerts.filter(a => a.severity === "critical").length,
+    high:     openAlerts.filter(a => a.severity === "high").length,
+    medium:   openAlerts.filter(a => a.severity === "medium").length,
+    low:      openAlerts.filter(a => a.severity === "low" || a.severity === "info").length,
   };
 
   async function ackAll() {
-    const open = alerts.filter(a => a.state === "open");
+    const open = openAlerts;
     await Promise.allSettled(open.map(a => api.alerts.ack(a.id)));
     showToast(`${open.length} alerts acknowledged`,"s","✅");
     loadAlerts();
