@@ -209,14 +209,14 @@ cmd_build() {
     printf '  %s[dry-run]%s docker compose build (4 images, GIT_SHA=%s)\n' "$Y" "$R" "$rev"
   else
     # Compose interpolates EVERY service even when you name one, so the secret
-    # vars must resolve or the build dies at parse time with a message about
-    # grafana. These placeholders exist purely to satisfy interpolation; nothing
+    # vars must resolve or the build dies at parse time. These placeholders
+    # exist purely to satisfy interpolation; nothing
     # here reaches a running container — the real values live in each node's .env.
     ( cd deploy/docker \
       && SENTINEL_GIT_SHA="$rev" SENTINEL_BUILD_DATE="$bdate" \
          CLICKHOUSE_DB=build CLICKHOUSE_USER=build CLICKHOUSE_PASSWORD=build \
          POSTGRES_DB=build POSTGRES_USER=build POSTGRES_PASSWORD=build \
-         GRAFANA_ADMIN_PASSWORD=build SENTINEL_DB_URL=build \
+         SENTINEL_DB_URL=build \
          SENTINEL_JWT_SECRET=build SENTINEL_INTERNAL_SECRET=build SENTINEL_AUDIT_HMAC_KEY=build \
          docker compose -f compose.prod.yml build dataplane controlplane dashboard migrate )
   fi

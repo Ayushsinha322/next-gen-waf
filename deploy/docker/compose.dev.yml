@@ -35,17 +35,18 @@ services:
       retries: 10
 
   redis:
-    image: redis:7-alpine
+    # Valkey (BSD-3), not Redis 7.4 (RSALv2/SSPL). See compose.prod.yml.
+    image: valkey/valkey:8-alpine
     container_name: sentinel-redis
     restart: unless-stopped
     mem_limit: 320m
-    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    command: ["valkey-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
     ports:
       - "6379:6379"
     volumes:
       - redisdata:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "valkey-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 10

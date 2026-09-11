@@ -180,6 +180,15 @@ for d in README.md USER-MANUAL.md NOC-RUNBOOK.md ADMIN-GUIDE.md SITE-ONBOARDING.
   [[ -f "$STAGE/docs/manual/$d" ]] && pass "docs/manual/$d" || fail "docs/manual/$d missing"
 done
 # The one document a first-time operator reads end to end.
+# Attribution is a shipping requirement, not a nicety: without these the archive
+# redistributes Apache-2.0 code with no licence text and no attribution.
+[[ -f "$STAGE/THIRD-PARTY-NOTICES.md" ]] \
+  && pass "THIRD-PARTY-NOTICES.md" \
+  || fail "THIRD-PARTY-NOTICES.md missing"
+[[ -f "$STAGE/licenses/Apache-2.0.txt" ]] \
+  && pass "licenses/Apache-2.0.txt" \
+  || fail "licenses/Apache-2.0.txt missing"
+
 [[ -f "$STAGE/docs/vm-deploy/INSTALL-WALKTHROUGH.md" ]] \
   && pass "docs/vm-deploy/INSTALL-WALKTHROUGH.md" \
   || fail "docs/vm-deploy/INSTALL-WALKTHROUGH.md missing"

@@ -597,15 +597,15 @@ sudo ./first-site.sh
 ```
 
 It asks three things — the hostname visitors will use, the origin's address, and the
-origin's port. For a first test answer `test.local`, `grafana`, `3000`: that is the
-monitoring dashboard the installer already put on the VM, so it works even with no
+origin's port. For a first test answer `test.local`, `prometheus`, `9090`: that is the
+metrics service the installer already put on the VM, so it works even with no
 internet.
 
 Then it does the work and, more importantly, checks it:
 
 ```
 ==> Reaching the origin from this host
-  ✓ grafana:3000 is accepting connections
+  ✓ prometheus:9090 is accepting connections
 
 ==> Validating against the data plane
   ✓ configuration accepted
@@ -667,7 +667,7 @@ certificate** TLS card).
 
 | Field | Value |
 |---|---|
-| Upstream host | `grafana` |
+| Upstream host | `prometheus` |
 | Upstream port | `3000` |
 
 Leave the remaining steps at their defaults and click save.

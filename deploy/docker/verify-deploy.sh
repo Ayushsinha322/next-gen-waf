@@ -20,7 +20,7 @@ PG() { docker exec sentinel-postgres-1 psql -U sentinel -d sentinel -tAc "$1" 2>
 
 # ─────────────────────────────────────────────────────────────────────────────
 hdr "1. Container inventory and stability"
-expected="clickhouse controlplane cp2 cp3 dashboard grafana juiceshop lb postgres prometheus redis waf1 waf2 waf3"
+expected="clickhouse controlplane cp2 cp3 dashboard juiceshop lb postgres prometheus redis waf1 waf2 waf3"
 for svc in $expected; do
   name="sentinel-${svc}-1"
   st=$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || echo missing)

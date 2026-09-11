@@ -550,7 +550,6 @@ SENTINEL_ALLOW_SUPERUSER_DB=1
 # path needs the SMTP block below to be filled in. Until it is, THIS value is
 # still the only way in — so back this file up either way.
 SENTINEL_BOOTSTRAP_ADMIN_PASSWORD=$(gen)
-GRAFANA_ADMIN_PASSWORD=$(openssl rand -base64 24 | tr -d '\n/+=' | cut -c1-24)
 
 SENTINEL_CLICKHOUSE_EVENT_RETENTION_DAYS=90
 SENTINEL_CLICKHOUSE_TRAFFIC_RETENTION_DAYS=30
@@ -656,7 +655,7 @@ hc() { # hc LABEL COMMAND...
 }
 health_fail=0
 hc "Postgres"      docker exec sentinel-postgres-1 pg_isready -U sentinel -d sentinel || health_fail=1
-hc "Redis"         docker exec sentinel-redis-1 redis-cli ping                        || health_fail=1
+hc "Redis"         docker exec sentinel-redis-1 valkey-cli ping                        || health_fail=1
 hc "ClickHouse"    bash -c "docker exec sentinel-clickhouse-1 wget -qO- http://127.0.0.1:8123/ping | grep -q Ok" || health_fail=1
 # These replace `docker exec ... /controllerd --version || true`, which could not
 # fail for two separate reasons: `--version` only proved the BINARY was in the

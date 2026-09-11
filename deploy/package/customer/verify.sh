@@ -43,7 +43,7 @@ done
 step "Backing stores"
 docker exec sentinel-postgres-1 pg_isready -U sentinel -d sentinel >/dev/null 2>&1 \
   && pass "Postgres accepting connections" || bad "Postgres not ready"
-docker exec sentinel-redis-1 redis-cli ping 2>/dev/null | grep -q PONG \
+docker exec sentinel-redis-1 valkey-cli ping 2>/dev/null | grep -q PONG \
   && pass "Redis responding" || bad "Redis not responding"
 docker exec sentinel-clickhouse-1 wget -qO- http://127.0.0.1:8123/ping 2>/dev/null | grep -q Ok \
   && pass "ClickHouse responding" || bad "ClickHouse not responding"

@@ -1,7 +1,7 @@
 # =====================================================================
 # Sentinel WAF — lean production / MVP-demo Docker Compose.
 #
-#   postgres + redis  → control-plane backing stores
+#   postgres + redis  → control-plane backing stores (redis = Valkey, BSD-3)
 #   clickhouse        → on-prem traffic/event log store (powers Threat Search)
 #   migrate           → one-shot goose DB migrations (runs to completion first)
 #   controlplane      → REST :9501 (internal only), seeds DB on boot (after migrate)
@@ -38,7 +38,7 @@ name: sentinel
 # needs ONE reachable host rather than two: an ESDS management-network VM can
 # reach hub.enlight.dev (172.16.23.2) but usually cannot reach Docker Hub, and
 # without this the four product images would pull from the mirror while Postgres,
-# Redis, ClickHouse, Prometheus and Grafana still tried the internet and hung.
+# Valkey, ClickHouse and Prometheus still tried the internet and hung.
 #
 # Harbor repository names may contain slashes (observed on this Harbor:
 # base-images/anilrevgade/centos-apache-php), so clickhouse/clickhouse-server
@@ -122,12 +122,24 @@ services:
     networks: [sentinel]
 
   redis:
-    image: ${SENTINEL_THIRDPARTY_PREFIX:-}redis:7-alpine
+    # Valkey, NOT Redis. The `redis:7-alpine` tag resolves to 7.4, which is
+    # dual-licensed RSALv2/SSPL — not open source, and this image is
+    # redistributed in the offline customer bundle. Valkey is the BSD-3 fork of
+    # Redis 7.2.4 maintained under the Linux Foundation, speaks the same RESP
+    # protocol, and supports every command we issue (ZREMRANGEBYSCORE, ZCARD,
+    # ZADD, INCR, EXPIRE in the rate-limit Lua; GET/SET/SETEX/DEL/INCR/EXPIRE/
+    # PING from the client). The image also ships redis-* compatibility
+    # binaries, so nothing that shells out by the old name breaks.
+    #
+    # The SERVICE is still called `redis` and the URL scheme is still redis://
+    # on purpose: that is the role and the wire protocol, and renaming them
+    # would rewrite SENTINEL_REDIS_URL on every node for no licensing gain.
+    image: ${SENTINEL_THIRDPARTY_PREFIX:-}valkey/valkey:8-alpine
     logging: *logging
     restart: unless-stopped
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    command: ["valkey-server", "--save", "", "--appendonly", "no"]
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "valkey-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 30
@@ -700,32 +712,6 @@ services:
       retries: 5
     networks: [sentinel]
 
-  grafana:
-    image: ${SENTINEL_THIRDPARTY_PREFIX:-}grafana/grafana:11.2.0
-    logging: *logging
-    restart: unless-stopped
-    environment:
-      # Required, with no fallback. This used to default to literal "admin",
-      # which — combined with the port being published on every interface —
-      # shipped a reachable Grafana admin console with admin/admin on any deploy
-      # whose operator had not heard of this variable (it was not in
-      # .env.example). `:?` makes `docker compose up` fail with this message
-      # instead of silently standing up a default-credentialed console.
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in deploy/docker/.env (openssl rand -base64 24)}
-      GF_AUTH_ANONYMOUS_ENABLED: "false"
-      GF_USERS_ALLOW_SIGN_UP: "false"
-    volumes:
-      - grafanadata:/var/lib/grafana
-      - ./grafana/provisioning:/etc/grafana/provisioning:ro
-    depends_on:
-      prometheus: { condition: service_started }
-    ports:
-      # Loopback-only: Grafana is an operator surface with its own login and no
-      # TLS here. Reach it with an SSH tunnel:
-      #   ssh -L 3001:127.0.0.1:3001 <host>
-      - "127.0.0.1:3001:3000"
-    networks: [sentinel]
-
 volumes:
   pgdata:
   chdata:
@@ -736,7 +722,6 @@ volumes:
   # sharing this one — see compose.ha.yml.
   sentinel-state:
   promdata:
-  grafanadata:
   # ghostdata / ghostdbdata are declared in compose.ghost.yml, alongside the
   # services that use them. Separate volumes so tearing the practice site down
   # never touches WAF data.

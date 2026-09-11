@@ -311,7 +311,7 @@ Send the customer **both** files. The checksum file is 90 bytes and is the only 
 they can tell a truncated 2 GB transfer from a good one.
 
 The standard bundle ships the four ESDSWAF images; `postgres`, `redis`,
-`clickhouse-server`, `prometheus` and `grafana` are pulled from Docker Hub at
+`clickhouse-server` and `prometheus` are pulled from Docker Hub at
 install time. That keeps the archive at a few hundred MB instead of ~2 GB. Use
 `BUNDLE_THIRD_PARTY=1` for air-gapped sites — the installer reads which kind of
 bundle it is from the manifest and only checks registry reachability when it

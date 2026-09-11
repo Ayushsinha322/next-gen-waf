@@ -46,10 +46,9 @@ die()  { printf '\n  %s✗ %s%s\n\n' "$RED" "$*" "$R" >&2; exit 1; }
 # runs software nobody tested.
 IMAGES=(
   "postgres:16-alpine"
-  "redis:7-alpine"
+  "valkey/valkey:8-alpine"
   "clickhouse/clickhouse-server:24-alpine"
   "prom/prometheus:v2.54.1"
-  "grafana/grafana:11.2.0"
   "haproxy:2.9-alpine"
 )
 
