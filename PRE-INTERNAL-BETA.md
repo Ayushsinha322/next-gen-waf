@@ -460,6 +460,40 @@ to anyone clicking through.
 
 ---
 
+## Post-merge fixes — found from the running console after `903d1b9` (2026-09-11)
+
+Three commits, all live on .71, all "the console said something untrue about state the
+system actually had". None showed up in any automated check, because each check shared the
+blind spot of the thing it verified.
+
+- **`adb4cbd`** — the GeoIP database was invisible. `geoip_status()` derived everything from
+  site policy, so a node with a mounted, readable 8.3 MB database answered exactly what a node
+  with no database answers, and the console said "Not configured". `/healthz` now reports the
+  database itself (path, present, size). Also: "Custom SRL rules 0/0 · Off" was accurate and
+  styled as a fault — an empty list rendered in the amber of a disabled capability. Third state
+  added.
+- **`959627c`** — the map said "Country database not loaded yet" when it had been loaded since
+  10 September: its flag meant "there is country-attributed event data", not "the database
+  exists". And **two brand strings survived B8** because the fix and its verification were both
+  case-sensitive greps for `Next-Gen ESDS`; TopBar and the login page render it uppercase.
+  Swept case-insensitively — zero occurrences remain.
+- **`76ca2df`** — the data-plane fixes above were correct and *still* invisible: the control
+  plane forwarded `geoip` all along, but the dashboard never declared the field on
+  `api.waf.status()` and never copied it into state, so every GeoIP row hit its "unknown"
+  branch. Wired. And the bare `/` was a **500 for every logged-in user since 17 May**: two
+  files claimed the route (a route group adds no URL segment), Next warned instead of failing
+  and shipped one without its client manifest. Middleware 307s anonymous requests before the
+  page runs, so every curl saw a redirect and the fault survived. Reproduced with a session
+  cookie, fixed, and `/` now goes to `/overview` — not `/login`, whose page clears the session
+  cookie on mount and would have signed the user out.
+
+> **Why the map is still empty, for whoever reads this next:** all traffic so far is from
+> `172.16.21.71`, a private address with no country in any database. The database resolves
+> correctly (`8.8.8.8 → US`, `202.54.1.5 → IN`). It fills the first time attack traffic arrives
+> from a public IP. It cannot be faked from inside: XFF is only trusted from the LB subnet.
+
+---
+
 ## Closed by this audit — do not re-chase
 
 - **The soak "memory leak" was page cache, not a leak.** Measured through the cgroup, the two
