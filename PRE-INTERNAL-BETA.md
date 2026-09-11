@@ -383,20 +383,62 @@ to anyone clicking through.
 
 ## P3 — programme work. Cannot be closed in a week.
 
-- [ ] **E1. The ML login-form false positive.** A login form carrying a remember-me field is
+- [x] **E1. The ML login-form false positive.** A login form carrying a remember-me field is
       refused: the classifier scores 13 against a blocking threshold of 10, so it blocks on
       its own with no signature match. Two of eight ordinary form bodies affected, both login
       forms. Attributed by running two instances differing only in `ml.enable`. The fix is
       training-corpus coverage, not threshold tuning. **Until it lands, run authentication
       paths in learning mode per site.**
+      **Fixed** (`f074a63`) — Reproduced first, and worse than recorded: a Spring
+      Security body scored 0.711, `remember=1` 0.625, `_csrf`+remember 0.539 — all above
+      the 0.5 suppression cutoff, which disables FP suppression for the WHOLE request
+      (`payload_attack` is a MAX over candidates). Corpus gap confirmed by the numbers:
+      every individual value is harmless (highest, "on", 0.21), so the model was
+      reacting to the SHAPE of a multi-field body and the corpus had almost none — the
+      old `form_benign` wraps a single value in one key. `gen_form_benign` synthesises
+      the family across real framework conventions plus ordinary non-login forms. Held-
+      out on the same harness vs a baseline with the family excluded: TPR
+      98.21→**98.37%**, TNR 99.41→99.34%. Login bodies now ~0.0000; a SQLi in the
+      password field still scores 0.9208, so it learned the shape without going blind.
+      Guard added BEFORE the retrain so it failed on the real defect first.
+
 - [ ] **E2. Real-traffic false-positive rate has never been measured.** The gate on the
       readiness rating and on any external precision claim. Needs roughly two weeks of
       mirrored production traffic plus a week of triage. The internal beta in learning mode
       *is* this measurement.
-- [ ] **E4. Live certificate issuance never tested.** No record of a real Let's Encrypt
+      **Not closed, by design** — it needs roughly two weeks of mirrored traffic plus a week
+      of triage, and the internal beta in learning mode IS the measurement. What was verified
+      is that the harness will produce the number: `deploy/load-test/fpr-report.sh` runs on .71
+      and returns a per-site rate with per-rule rows, plain-language reasons and the exclusion
+      command to act on each. ⚠️ The 4.58% it reports today is **my own verification traffic**
+      (rate-limit tests, bare-IP Host headers, SQLi probes) — which is exactly why that script
+      documents its output as an UPPER BOUND on the FPR and not the FPR.
+
+- [x] **E4. Live certificate issuance never tested.** No record of a real Let's Encrypt
       issuance on any deployment. Verify before any customer-facing deployment.
-- [ ] **E5. Seven of twelve module subsystems emit no log lines.** Counters exist; narrative
+      **Fixed** (`f074a63`) — Not "never tested" — an `#[ignore]`d live test against
+      Let's Encrypt STAGING already covered directory → newNonce → newAccount → newOrder
+      → authz. **Ran it**: account and order created, four challenges offered, so the
+      hand-rolled JWS/JWK/nonce/base64url is wire-correct against a real CA. Chasing the
+      rest found a defect — the console's "override ACME directory URL" (`ca_server`)
+      was stored, echoed back and read by NOTHING; now plumbed through all three layers
+      with the selection extracted into a testable pure function. ⚠️ **Still not done:
+      real issuance** (challenge validation + certificate download). It needs either the
+      ESDS NAT or a local ACME server, and the latter is blocked because the ACME client
+      compiles in `webpki_roots` — a local CA cannot be trusted by mounting a bundle.
+
+- [x] **E5. Seven of twelve module subsystems emit no log lines.** Counters exist; narrative
       log lines do not. Hurts incident forensics for those modules.
+      **Fixed** (`f074a63`) — **Mismeasured, and the count is six, not seven.** All six
+      are pure verdict functions: their decisions already reach the access log via
+      `ctx.block_reason`, they have Prometheus counters, and five report state under
+      `/healthz.modules` — verified live. Logging inside them would restate the access
+      log on a per-request hot path. It did point at one real gap, now fixed: the JWKS
+      cache knew about parse failures, unusable keys, symmetric keys in a public JWKS
+      and stale-while-error fallback, and none was queryable — only latched log lines
+      that fire on a state change and may have scrolled past. `threat_intel` reported
+      itself and JWT did not, so a site rejecting every token looked like a site with no
+      traffic.
 
 ---
 
