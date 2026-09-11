@@ -690,6 +690,9 @@ tbody tr.sev-l td:first-child { border-left:3px solid var(--green); }
 .rule-st { font-size:11px; font-family:var(--font-mono); padding:2px 8px; border-radius:8px; font-weight:600; }
 .rs-on   { background:rgba(0,200,122,.12); color:var(--green); border:1px solid rgba(0,200,122,.28); }
 .rs-warn { background:rgba(255,170,0,.12); color:var(--amber); border:1px solid rgba(255,170,0,.28); }
+/* Nothing has been added yet — neutral, NOT the amber of a disabled capability.
+   "Custom SRL rules 0/0 Off" in warning amber reads as a fault; it is an empty list. */
+.rs-idle { background:rgba(255,255,255,.05); color:var(--text3); border:1px solid rgba(255,255,255,.12); }
 .rule-hits { font-size:14px; font-family:var(--font-mono); color:var(--text3); min-width:40px; text-align:right; }
 
 /* Event feed items */

@@ -82,7 +82,7 @@ export default function OverviewPage() {
   const [stats, setStats]     = useState<DashboardStats | null>(null);
   const [metrics, setMetrics] = useState<MetricsSnapshot | null>(null);
   const [feed, setFeed]       = useState<FeedRow[]>([]);
-  const [wafStatus, setWafStatus] = useState<{ running: boolean; uptime?: number; sites?: number; upstreams_healthy?: number; upstreams_total?: number; http3?: { enabled: boolean; listener?: string; bind?: string; advertise_port?: number }; geoip?: { configured: number; active: number; inert: { site: string; db_path: string; db_present: boolean }[] } } | null>(null);
+  const [wafStatus, setWafStatus] = useState<{ running: boolean; uptime?: number; sites?: number; upstreams_healthy?: number; upstreams_total?: number; http3?: { enabled: boolean; listener?: string; bind?: string; advertise_port?: number }; geoip?: { configured: number; active: number; inert: { site: string; db_path: string; db_present: boolean }[]; database?: { path: string; present: boolean; size_bytes: number } } } | null>(null);
   const [plugins, setPlugins] = useState<number | null>(null);
   const [instances, setInstances] = useState<number | null>(null);
   // Blocked-by-country lives ONLY in ClickHouse (the hub's by_country snapshot
@@ -582,7 +582,12 @@ function RuleEngineHealth({ metrics, running }: { metrics: MetricsSnapshot | nul
   const crsHits = n("sqli") + n("xss") + n("rfi_lfi") + n("rce") + n("ssrf") + n("protocol");
   const mlHits  = metrics?.ml_anomalies ?? 0;
 
-  const rows: { name: string; sub: string; on: boolean; loading: boolean; hits: number | null }[] = [
+  // Three states, not two. "Off" is rendered with the WARNING style, which is
+  // right for a capability someone switched off and wrong for one that simply
+  // has nothing in it: "Custom SRL rules · 0/0 rules enabled · Off" reads as a
+  // broken feature when the truth is that nobody has written a custom rule.
+  // Virtual patches already had an empty state ("none loaded"); this did not.
+  const rows: { name: string; sub: string; on: boolean; empty?: boolean; loading: boolean; hits: number | null }[] = [
     {
       name: "OWASP CRS v4 (compiled)",
       sub: inv == null ? (loading ? "…" : "inventory unavailable")
@@ -594,8 +599,12 @@ function RuleEngineHealth({ metrics, running }: { metrics: MetricsSnapshot | nul
       loading: inv == null && loading,
       hits: crsHits,
     },
-    { name: "Custom SRL rules",    sub: loading ? "…" : `${custom.on}/${custom.total} rules enabled`, on: custom.on > 0,      loading, hits: null },
-    { name: "Virtual patches",     sub: loading ? "…" : vp.total > 0 ? `${vp.on}/${vp.total} rules enabled` : "none loaded", on: vp.on > 0, loading, hits: null },
+    { name: "Custom SRL rules",
+      sub: loading ? "…" : custom.total > 0 ? `${custom.on}/${custom.total} rules enabled` : "none written yet",
+      on: custom.on > 0, empty: !loading && custom.total === 0, loading, hits: null },
+    { name: "Virtual patches",
+      sub: loading ? "…" : vp.total > 0 ? `${vp.on}/${vp.total} rules enabled` : "none loaded",
+      on: vp.on > 0, empty: !loading && vp.total === 0, loading, hits: null },
     { name: "ML anomaly engine",   sub: "behavioural scoring",       on: running, loading: false, hits: mlHits },
     { name: "Bot / scanner defense", sub: "signatures + heuristics", on: crs.on > 0 || running, loading, hits: n("bot") },
   ];
@@ -614,8 +623,9 @@ function RuleEngineHealth({ metrics, running }: { metrics: MetricsSnapshot | nul
               {row.name}
               <span style={{ display: "block", fontSize: 11, fontWeight: 400, marginTop: 2, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>{row.sub}</span>
             </div>
-            <span className={`rule-st ${row.loading ? "rs-warn" : row.on ? "rs-on" : "rs-warn"}`}>
-              {row.loading ? "…" : row.on ? "Active" : "Off"}
+            <span className={`rule-st ${row.loading ? "rs-warn" : row.on ? "rs-on" : row.empty ? "rs-idle" : "rs-warn"}`}
+              title={row.empty ? "Nothing has been added here yet — this is not a disabled feature" : undefined}>
+              {row.loading ? "…" : row.on ? "Active" : row.empty ? "None" : "Off"}
             </span>
             <div className="rule-hits" title={row.hits == null ? "no per-source counter" : "blocked this session"}>
               {row.hits == null ? "—" : row.hits.toLocaleString()}
@@ -636,7 +646,10 @@ function titleCase(s: string): string {
 
 type HLevel = "g" | "a" | "r" | "gr";
 
-type GeoIpStatus = { configured: number; active: number; inert: { site: string; db_path: string; db_present: boolean }[] };
+type GeoIpStatus = { configured: number; active: number;
+  inert: { site: string; db_path: string; db_present: boolean }[];
+  /** The database on the node, reported independently of site policy. */
+  database?: { path: string; present: boolean; size_bytes: number } };
 
 function SystemHealth({ wafRunning, geoip }: { wafRunning: boolean | null; geoip?: GeoIpStatus }) {
   const [health, setHealth]   = useState<ClusterHealth | null>(null);
@@ -680,7 +693,15 @@ function SystemHealth({ wafRunning, geoip }: { wafRunning: boolean | null; geoip
             level: "r" }
         : gi.active > 0
           ? { name: "GeoIP Database", value: `Active · ${gi.active} site${gi.active === 1 ? "" : "s"}`, level: "g" }
-          : { name: "GeoIP Database", value: "Not configured", level: "gr" };
+          // No site uses country rules. That used to read "Not configured" for
+          // BOTH a node with no database and a node with a freshly fetched 8 MB
+          // one sitting ready — so an operator who had just run geoip.refresh
+          // could not tell from the console whether it had worked. Say which.
+          : gi.database?.present
+            ? { name: "GeoIP Database",
+                value: `Ready · ${(gi.database.size_bytes / 1048576).toFixed(1)} MB · no site uses country rules yet`,
+                level: "g" }
+            : { name: "GeoIP Database", value: "No database installed · run the geoip.refresh job", level: "gr" };
 
   const rows: { name: string; level: HLevel; value: string }[] = [
     dp

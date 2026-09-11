@@ -5721,7 +5721,38 @@ fn geoip_status(cfg: &SentinelConfig, map: &GeoIpMap) -> serde_json::Value {
             }));
         }
     }
+    // The DATABASE ITSELF, reported independently of whether any site uses it.
+    //
+    // Everything above is derived from site policy, so a node with a perfectly
+    // good 8 MB database mounted and readable was indistinguishable from a node
+    // with no database at all: both answered configured:0, active:0, inert:[]
+    // and the console said "Not configured". An operator who had just run the
+    // geoip.refresh job had no way to confirm from the console that it worked.
+    //
+    // The path is whatever a site asks for, falling back to the same
+    // SENTINEL_GEOIP_DB default the control plane writes into site config, so
+    // the two cannot disagree about where the file is meant to live.
+    let db_path = cfg
+        .sites
+        .iter()
+        .filter_map(|s| s.waf.geoip.as_ref())
+        .map(|g| g.db_path.clone())
+        .find(|p| !p.is_empty())
+        .unwrap_or_else(|| {
+            std::env::var("SENTINEL_GEOIP_DB")
+                .unwrap_or_else(|_| "/var/lib/sentinel/geoip/dbip-country-lite.mmdb".to_string())
+        });
+    let meta = std::fs::metadata(&db_path).ok();
+    let database = serde_json::json!({
+        "path": db_path,
+        "present": meta.is_some(),
+        "size_bytes": meta.as_ref().map(|m| m.len()).unwrap_or(0),
+    });
+
     serde_json::json!({
+        // The country database on this node: present and how big, regardless of
+        // whether any site has country rules yet.
+        "database": database,
         // Sites whose policy asks for country filtering.
         "configured": configured,
         // Sites where it is actually enforceable (database loaded AND rules set).
