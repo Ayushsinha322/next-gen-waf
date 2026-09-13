@@ -29,7 +29,12 @@ echo
 echo "=== 2. ACME no longer errors hourly for un-issuable names ==="
 ERRS=$(docker logs --since 5m sentinel-waf1-1 2>&1 | grep -c 'ACME renewal failed')
 [ "$ERRS" = "0" ] && ok "no ACME renewal errors since restart" || bad "$ERRS ACME errors"
-if docker logs sentinel-waf1-1 2>&1 | grep -q 'none of its domains can be'; then
+# Captured, not piped: `grep -q` exits on its first match, `docker logs` dies on
+# SIGPIPE with 141, and pipefail then makes the pipeline non-zero — so a warning
+# that IS present would read as absent and this check would report the wrong
+# branch. See deploy/ci/check-pipefail-grep.sh.
+acmelog=$(docker logs sentinel-waf1-1 2>&1 || true)
+if grep -q 'none of its domains can be' <<<"$acmelog"; then
   ok "logged ONE warning naming the misconfiguration instead"
 else
   printf "  \033[33mNOTE\033[0m  the skip warning appears on the first hourly tick, not at boot\n"

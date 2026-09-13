@@ -42,6 +42,50 @@ jobs:
       - run: npm run lint || true    # advisory only (style)
       - run: npm run build           # production build must succeed (gating)
 
+  # Mirrors the GitLab `deploy-shell` job. This existed only on GitLab, so every
+  # guard built after the 2026-08-08 packaging audit — the one that found 54
+  # defects — was invisible to anyone working through GitHub, who saw a green
+  # tick for exactly the class of bug those guards exist to catch. Keep the two
+  # pipelines in step: a check that runs on one forge and not the other is a
+  # check you cannot rely on.
+  deploy-shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # 1. Every shell file must parse. Cheap, absolute, no exceptions.
+      - name: shell syntax
+        run: |
+          fail=0
+          while read -r f; do
+            bash -n "$f" || { echo "SYNTAX ERROR: $f"; fail=1; }
+          done < <(find deploy -name '*.sh' -type f)
+          [ $fail -eq 0 ] || exit 1
+          echo "all deploy shell parses"
+      # 2. shellcheck. Errors gate; warnings are advisory while the backlog is
+      #    worked down. Same split as GitLab, deliberately.
+      - name: shellcheck (errors gate)
+        run: shellcheck -S error $(find deploy -name '*.sh' -type f)
+      - name: shellcheck (warnings, advisory)
+        run: shellcheck -S warning $(find deploy -name '*.sh' -type f) || true
+      # 3. Every compose file must parse with the environment its own installer
+      #    generates. `docker compose config` only parses and interpolates, so
+      #    this needs no daemon.
+      - name: compose files parse
+        run: ./deploy/ci/check-compose-parses-clean.sh
+      # 3b. One version number across VERSION, Cargo.toml, package.json and Go.
+      - name: version consistency
+        run: ./deploy/ci/check-version-consistency.sh
+      # 3c. No unbounded producer piped into `grep -q` — that inverts under
+      #     pipefail and reads a present pattern as absent.
+      - name: no pipefail-inverting grep
+        run: ./deploy/ci/check-pipefail-grep.sh
+      # 4. The contract check — stages the real customer tree and asserts every
+      #    path the shipped scripts and compose overlays reference exists.
+      - name: bundle contract
+        run: |
+          STAGE_ONLY=1 ./deploy/package/build-bundle.sh
+          ./deploy/ci/check-bundle-contract.sh
+
   security:
     runs-on: ubuntu-latest
     steps:
