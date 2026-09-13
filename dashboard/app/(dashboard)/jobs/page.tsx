@@ -62,7 +62,7 @@ export default function JobsPage() {
       {err && <motion.div variants={fadeUp} className="code-block" style={{ borderLeft: "3px solid var(--red-b)" }}><span style={{ color: "var(--red-b)" }}>● COULD NOT LOAD</span> — {err}</motion.div>}
       {data && !data.node.runs_jobs && (
         <motion.div variants={fadeUp} className="code-block" style={{ borderLeft: "3px solid var(--amber)" }}>
-          <span style={{ color: "var(--amber)" }}>● THIS NODE IS A FOLLOWER</span> — the jobs below run on the Raft leader. Counts here are from this node&apos;s last term as leader; Run now is forwarded to the leader.
+          <span style={{ color: "var(--amber)" }}>● THIS NODE IS A FOLLOWER</span> — the jobs below run on the elected leader. Counts here are from this node&apos;s last term as leader; Run now is forwarded to the leader.
         </motion.div>
       )}
 
