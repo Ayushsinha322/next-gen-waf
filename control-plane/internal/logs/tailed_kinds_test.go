@@ -103,7 +103,7 @@ func TestSimulatorOnlyPublishesDisplayableKinds(t *testing.T) {
 // sub-millisecond p99 while the Logs page showed 7-18ms for the same requests.
 func TestLatencyIsSampledFromTheStringTheProxyActuallyWrites(t *testing.T) {
 	h := newTestHub()
-	h.latBuf = make([]float64, 0, 8)
+	h.latBuf = make([]latSample, 0, 8)
 
 	// Exactly the shape the data plane emits.
 	for _, lat := range []string{"7.08", "18.82", "2.94"} {
@@ -118,7 +118,7 @@ func TestLatencyIsSampledFromTheStringTheProxyActuallyWrites(t *testing.T) {
 
 	// A numeric latency (any future writer) must keep working.
 	h2 := newTestHub()
-	h2.latBuf = make([]float64, 0, 8)
+	h2.latBuf = make([]latSample, 0, 8)
 	h2.updateMetrics(Entry{Kind: "access", Data: []byte(`{"latency":12.5,"status":200}`)})
 	if got := h2.latSamples(); got != 1 {
 		t.Fatalf("numeric latency must still be sampled, got %d", got)
@@ -127,7 +127,7 @@ func TestLatencyIsSampledFromTheStringTheProxyActuallyWrites(t *testing.T) {
 	// Garbage must be ignored rather than recorded as 0, which would drag the
 	// percentile down and understate real latency.
 	h3 := newTestHub()
-	h3.latBuf = make([]float64, 0, 8)
+	h3.latBuf = make([]latSample, 0, 8)
 	h3.updateMetrics(Entry{Kind: "access", Data: []byte(`{"latency":"n/a","status":200}`)})
 	if got := h3.latSamples(); got != 0 {
 		t.Fatalf("unparseable latency must not become a 0 sample, got %d", got)
@@ -144,8 +144,8 @@ func TestLatencyIsSampledFromTheStringTheProxyActuallyWrites(t *testing.T) {
 // both rings because what they measure is connection lifetime, not latency.
 func TestWafOwnTimeIsSampledAndSlowOriginsCannotInflateIt(t *testing.T) {
 	h := newTestHub()
-	h.latBuf = make([]float64, 0, 8)
-	h.wafLatBuf = make([]float64, 0, 8)
+	h.latBuf = make([]latSample, 0, 8)
+	h.wafLatBuf = make([]latSample, 0, 8)
 
 	// A long-poll: 24s end-to-end, but the WAF only spent 1.2ms on it.
 	h.updateMetrics(Entry{Kind: "access", Data: []byte(
@@ -167,8 +167,8 @@ func TestWafOwnTimeIsSampledAndSlowOriginsCannotInflateIt(t *testing.T) {
 	// A WebSocket relay measures how long the connection LIVED. Excluded from
 	// both rings — clamping would silently invent a value instead.
 	h2 := newTestHub()
-	h2.latBuf = make([]float64, 0, 8)
-	h2.wafLatBuf = make([]float64, 0, 8)
+	h2.latBuf = make([]latSample, 0, 8)
+	h2.wafLatBuf = make([]latSample, 0, 8)
 	h2.updateMetrics(Entry{Kind: "access", Data: []byte(
 		`{"latency":"3600000.00","waf_ms":"3600000.00","status":101}`)})
 	if h2.latSamples() != 0 || h2.latWafSamples() != 0 {
@@ -179,8 +179,8 @@ func TestWafOwnTimeIsSampledAndSlowOriginsCannotInflateIt(t *testing.T) {
 	// A cheap pass can legitimately cost ~0ms of WAF time; that must record,
 	// unlike end-to-end where 0 only ever meant "not parsed".
 	h3 := newTestHub()
-	h3.latBuf = make([]float64, 0, 8)
-	h3.wafLatBuf = make([]float64, 0, 8)
+	h3.latBuf = make([]latSample, 0, 8)
+	h3.wafLatBuf = make([]latSample, 0, 8)
 	h3.updateMetrics(Entry{Kind: "access", Data: []byte(
 		`{"latency":"5.00","waf_ms":"0.00","status":200}`)})
 	if h3.latWafSamples() != 1 {
@@ -190,13 +190,96 @@ func TestWafOwnTimeIsSampledAndSlowOriginsCannotInflateIt(t *testing.T) {
 	// An access line with no waf_ms at all (a data plane older than this field)
 	// must not fabricate a sample.
 	h4 := newTestHub()
-	h4.latBuf = make([]float64, 0, 8)
-	h4.wafLatBuf = make([]float64, 0, 8)
+	h4.latBuf = make([]latSample, 0, 8)
+	h4.wafLatBuf = make([]latSample, 0, 8)
 	h4.updateMetrics(Entry{Kind: "access", Data: []byte(`{"latency":"5.00","status":200}`)})
 	if h4.latWafSamples() != 0 {
 		t.Fatalf("absent waf_ms must not become a sample, got %d", h4.latWafSamples())
 	}
 	if h4.latSamples() != 1 {
 		t.Fatalf("end-to-end must still be sampled from an older data plane, got %d", h4.latSamples())
+	}
+}
+
+// The console badge read "p99 8617.2ms" on an idle deploy VM while the data
+// plane's own summary said 90ms and real requests took 10-39ms.
+//
+// Two separate causes, both fixed here:
+//
+//  1. A 502 means the origin never answered and the request sat waiting for
+//     the upstream timeout. The data plane attributes that whole wait to
+//     waf_ms, so a dead origin reads as ten seconds of WAF processing. One
+//     such request was in the ring: GET / with waf_ms 9918.7.
+//
+//  2. The ring had no age bound, so that sample stayed the headline latency
+//     for as long as the process lived. With 38 samples the "99th percentile"
+//     index lands on the maximum, so the badge was reporting the single
+//     slowest request ever seen, presented as current performance.
+func TestGatewayErrorsDoNotCountAsWafProcessingTime(t *testing.T) {
+	h := newTestHub()
+	h.latBuf = make([]latSample, 0, 8)
+	h.wafLatBuf = make([]latSample, 0, 8)
+
+	// The real shape from the deploy VM: a 502 whose entire upstream wait was
+	// recorded against the WAF.
+	h.updateMetrics(Entry{Kind: "access", Data: []byte(
+		`{"latency":"9918.69","waf_ms":"9918.70","status":502}`)})
+	// And an ordinary request.
+	h.updateMetrics(Entry{Kind: "access", Data: []byte(
+		`{"latency":"12.40","waf_ms":"0.60","status":200}`)})
+
+	if got := h.latWafSamples(); got != 1 {
+		t.Fatalf("the 502 must not contribute a WAF sample, got %d samples", got)
+	}
+	if got := h.computeP99Waf(); got > 5 {
+		t.Fatalf("WAF p99 is inflated by a dead origin: %v", got)
+	}
+	// The user really did wait ten seconds, so end-to-end still counts it.
+	if got := h.computeP99(); got < 1000 {
+		t.Fatalf("end-to-end p99 must still include the 502 — it is what the user got: %v", got)
+	}
+	if got := h.latSamples(); got != 2 {
+		t.Fatalf("both requests contribute end-to-end samples, got %d", got)
+	}
+}
+
+// A slow request stops being reported once it ages out, so the badge describes
+// the recent past rather than the worst thing ever seen.
+func TestLatencySamplesAgeOut(t *testing.T) {
+	h := newTestHub()
+	h.latBuf = make([]latSample, 0, 8)
+	h.wafLatBuf = make([]latSample, 0, 8)
+
+	h.updateMetrics(Entry{Kind: "access", Data: []byte(
+		`{"latency":"8600.00","waf_ms":"8600.00","status":200}`)})
+	if h.latSamples() != 1 || h.computeP99() < 1000 {
+		t.Fatal("the slow sample should be counted while it is recent")
+	}
+
+	// Push it outside the window without waiting for wall-clock time.
+	h.latMu.Lock()
+	for i := range h.latBuf {
+		h.latBuf[i].at = h.latBuf[i].at.Add(-latencyWindow - time.Minute)
+	}
+	for i := range h.wafLatBuf {
+		h.wafLatBuf[i].at = h.wafLatBuf[i].at.Add(-latencyWindow - time.Minute)
+	}
+	h.latMu.Unlock()
+
+	if got := h.latSamples(); got != 0 {
+		t.Fatalf("an aged-out sample must be dropped, got %d", got)
+	}
+	if got := h.computeP99(); got != 0 {
+		t.Fatalf("with no recent samples the p99 is not a measurement, got %v", got)
+	}
+	if got := h.latWafSamples(); got != 0 {
+		t.Fatalf("aged-out WAF sample must be dropped, got %d", got)
+	}
+
+	// A fresh request re-establishes the measurement at its real value.
+	h.updateMetrics(Entry{Kind: "access", Data: []byte(
+		`{"latency":"11.20","waf_ms":"0.40","status":200}`)})
+	if got := h.computeP99(); got > 50 {
+		t.Fatalf("the badge should now reflect the recent request, got %v", got)
 	}
 }
