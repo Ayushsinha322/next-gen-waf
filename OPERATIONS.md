@@ -329,15 +329,44 @@ docker system prune -f     # safe cleanup: removes unused images/build cache (NO
 ```bash
 # from your laptop — push the latest source to the VM
 cd /home/ayush3750/waf-development
-rsync -az --delete -e "ssh -i ~/.ssh/sentinel_deploy" \
-  --exclude 'target/' --exclude '.git/' --exclude '**/node_modules/' \
-  --exclude 'dashboard/.next/' --exclude '*.tsbuildinfo' \
-  ./ root@172.16.21.71:/opt/sentinel-src/
-
-# then on the VM — rebuild changed images and restart
-ssh sentinel 'cd /opt/sentinel-src/deploy/docker && \
-  docker compose -f compose.prod.yml up -d --build'
+deploy/sync-to-host.sh root@172.16.21.71
 ```
+
+Use the wrapper, not a raw `rsync -a --delete`. The tree contains directories
+that hold **runtime** state rather than source, and a bare rsync has destroyed
+live state twice: it overwrote the deployment's `.env` (secrets and
+`SENTINEL_VERSION`) on 2026-09-06, and on 2026-09-09 it deleted the GeoIP
+database, which is a bind mount and gitignored, so the country lookup went
+inert with no error anywhere. `sync-to-host.sh` keeps that list; `DRY_RUN=1`
+shows what it would do.
+
+Then, on the VM, build the new images and **roll the fleet one node at a time**:
+
+```bash
+ssh sentinel 'cd /opt/sentinel-src/deploy/docker && \
+  docker compose -f compose.prod.yml -f compose.cluster.yml -f compose.ha.yml \
+    build dataplane controlplane dashboard && \
+  ./rolling-update.sh'
+```
+
+Do **not** use `docker compose up -d` to deploy a new version on the HA fleet.
+Compose recreates every changed service at once, so all three WAF nodes stop
+together. Measured from the balancer's own log on 2026-09-11: all three went
+DOWN at 10:22:18 with "0 active and 0 backup servers left" and the first came
+back at 10:22:32 — fourteen seconds in which every request got a 503. The data
+plane does drain gracefully, but a drain needs somewhere for the traffic to go.
+
+`rolling-update.sh` replaces one node at a time, waits for the balancer to call
+it ready again before touching the next, refuses to take out the last node
+standing, and reports the smallest number of servers any backend held during
+the roll. Run `./rolling-update.sh --check` first to confirm a safe roll is
+possible without changing anything.
+
+`docker compose up -d` is still the right command for a **cold start**, where
+nothing is serving yet — see §7 above.
+
+Note that `compose build waf1` builds nothing: the image is built once under the
+`dataplane` service and the fleet services reuse it.
 (Full from-scratch build/deploy steps, DB migrations, and demo-site seeding are
 in `mvpproduction.md` — keep that as the deploy reference; keep **this** file as
 the day-to-day operations reference.)

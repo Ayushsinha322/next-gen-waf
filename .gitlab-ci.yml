@@ -230,6 +230,13 @@ deploy-shell:
     #     and no hard-coded vN.N.N in dashboard source. The console once showed
     #     four different versions on one deployment.
     - ./deploy/ci/check-version-consistency.sh
+    # 3c. The rolling deploy must refuse to roll when rolling is not safe. Its
+    #     whole value is in the refusals, and the states worth testing (a node
+    #     already down, a single-node install, healthy on :80 but not :443) are
+    #     the ones you cannot arrange on a real box — which is why they were
+    #     never tested before. Fixtures arrive via STATS_CMD; no python and no
+    #     throwaway server, so it runs in this alpine image.
+    - ./deploy/ci/check-rolling-update-guards.sh
     # 4. The contract check — the one that catches shipping-breaking bugs.
     - STAGE_ONLY=1 ./deploy/package/build-bundle.sh
     - ./deploy/ci/check-bundle-contract.sh
