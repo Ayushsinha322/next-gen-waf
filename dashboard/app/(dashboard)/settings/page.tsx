@@ -9,6 +9,24 @@ import { staggerContainer, fadeUp, spring, tweenFast } from "@/lib/animations";
 import { logout, getUser } from "@/lib/auth";
 import { PRODUCT_NAME } from "@/lib/version";
 
+/** "2h ago" / "Never" for a nullable timestamp.
+ *
+ * Module scope on purpose: the users table and the API-keys table both answer
+ * "when was this last used", and two copies would drift into two vocabularies
+ * for the same idea. `null` and `undefined` both mean never — the control plane
+ * marks these fields `omitempty`, so an account that has never signed in has no
+ * field at all rather than a null one.
+ */
+function fmtLogin(ts: string | null | undefined) {
+  if (!ts) return "Never";
+  const diff = Date.now() - new Date(ts).getTime();
+  if (diff < 60000) return "Just now";
+  if (diff < 3600000) return Math.round(diff / 60000) + "m ago";
+  if (diff < 86400000) return Math.round(diff / 3600000) + "h ago";
+  return Math.round(diff / 86400000) + "d ago";
+}
+
+
 const TABS = ["General","Auth & SSO","API Keys","Users & RBAC","Cluster","Notifications","Management TLS"];
 
 /** Slug per tab so other pages can deep-link (e.g. the Alerts page sends an
@@ -284,8 +302,11 @@ function APIKeysTab() {
       const scopes = newScope.split(/\s+/).filter(Boolean);
       const role = scopes.some(s => s.startsWith("write:")) ? "editor" : "viewer";
       const res = await api.admin.apikeys.create({ name: newName, role, scopes });
-      setRevealKey(res.api_key.key);
-      setKeys(prev => [res.api_key as unknown as APIKeyRow, ...prev]);
+      // `key` is a sibling of `api_key`, not a field on it. Read as
+      // res.api_key.key this was undefined, the reveal block below is
+      // conditional on it, and the operator was never shown the secret at all.
+      setRevealKey(res.key);
+      setKeys(prev => [res.api_key, ...prev]);
       setNewName(""); setNewScope("read:all");
     } catch { showToast("Failed to generate key","e","⚠️"); }
     finally { setCreating(false); }
@@ -345,9 +366,11 @@ function APIKeysTab() {
                 <motion.tr key={k.id} initial={{ opacity: 0, x: -6 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: idx * 0.02 }}>
                   <td>{k.name}</td>
                   <td className="td2">{k.preview}</td>
-                  <td><span className="bdg bcy">{k.scope}</span></td>
+                  <td>{(k.scopes ?? []).length
+                    ? (k.scopes ?? []).map(sc => <span key={sc} className="bdg bcy" style={{marginRight:4}}>{sc}</span>)
+                    : <span className="td3">—</span>}</td>
                   <td className="td3">{k.expires_at ? new Date(k.expires_at).toLocaleDateString() : "—"}</td>
-                  <td className="td3">{k.last_used}</td>
+                  <td className="td3">{fmtLogin(k.last_used_at)}</td>
                   <td><motion.button className="btn bd btn-xs" onClick={() => revoke(k.id,k.name)} whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.96 }}>Revoke</motion.button></td>
                 </motion.tr>
               ))}
@@ -431,15 +454,6 @@ function UsersTab() {
     return <span className={`bdg ${cls}`}>{role.toUpperCase()}</span>;
   }
 
-  function fmtLogin(ts:string|null) {
-    if (!ts) return "Never";
-    const diff = Date.now() - new Date(ts).getTime();
-    if (diff<60000) return "Just now";
-    if (diff<3600000) return Math.round(diff/60000)+"m ago";
-    if (diff<86400000) return Math.round(diff/3600000)+"h ago";
-    return Math.round(diff/86400000)+"d ago";
-  }
-
   return (
     <>
     <ChangePasswordCard />
@@ -511,7 +525,7 @@ function UsersTab() {
                   <td className="td2">{u.email}</td>
                   <td>{roleBadge(u.role)}</td>
                   <td><span className={`bdg ${u.mfa_enabled?"bgg":"bgr"}`}>{u.mfa_enabled?"✓ TOTP":"✗ None"}</span></td>
-                  <td className="td3">{fmtLogin(u.last_login)}</td>
+                  <td className="td3">{fmtLogin(u.last_login_at)}</td>
                   <td><span className={`bdg ${u.status==="active"?"bgg":"bgr"}`}>{u.status.toUpperCase()}</span></td>
                   <td>
                     <button
