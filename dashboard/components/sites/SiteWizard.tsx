@@ -689,12 +689,32 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     </Field>
                     <GroupLabel>Upstream Servers</GroupLabel>
                     {form.servers.map((s, i) => (
-                      <div key={i} style={{ display: "grid", gridTemplateColumns: "2fr 1fr 0.8fr auto auto", gap: 8, alignItems: "end" }}>
-                        <Field label={`Host #${i + 1} hint="The origin as the WAF reaches it — a hostname or address on your network, not the public domain."`}><input className="fin2" value={s.host} placeholder="127.0.0.1" onChange={e => setServer(i, { host: e.target.value })} /></Field>
+                      // Align on the INPUT row, not the bottom of the cell.
+                      //
+                      // This was `alignItems: "end"`, which bottom-aligns every
+                      // column. The three fields carry hints of different
+                      // lengths — Weight's wraps to three lines where Port's
+                      // wraps to one — so the tallest cell pushed its own label
+                      // and input upward, while the cells with no hint at all,
+                      // TLS and the remove button, sank to the bottom. Nothing
+                      // in the row lined up with anything else.
+                      //
+                      // Starting from the top lines the labels up, and since
+                      // every label is a single line the inputs line up beneath
+                      // them. The hints then hang below at whatever height they
+                      // need, which is where variable-length text belongs.
+                      <div key={i} style={{ display: "grid", gridTemplateColumns: "2fr 1fr 0.8fr auto auto", gap: 8, alignItems: "start" }}>
+                        <Field label={`Host #${i + 1}`} hint="The origin as the WAF reaches it — a hostname or address on your network, not the public domain."><input className="fin2" value={s.host} placeholder="127.0.0.1" onChange={e => setServer(i, { host: e.target.value })} /></Field>
                         <Field label="Port" hint="The port your application listens on."><input className="fin2" type="number" value={s.port} onChange={e => setServer(i, { port: Number(e.target.value) })} /></Field>
                         <Field label="Weight" hint="Relative share of traffic when several origins are listed. Equal weights spread evenly."><input className="fin2" type="number" value={s.weight} onChange={e => setServer(i, { weight: Number(e.target.value) })} /></Field>
                         <div style={{ display: "flex", flexDirection: "column", gap: 4, alignItems: "center" }}><label className="flbl2">TLS</label><Sw on={s.tls} set={v => setServer(i, { tls: v })} /></div>
-                        <button className="btn bg-btn btn-sm" type="button" disabled={form.servers.length === 1} onClick={() => rmServer(i)} style={{ opacity: form.servers.length === 1 ? 0.4 : 1 }}><Icon name="trash" size={14} title="Remove" /></button>
+                        <div style={{ display: "flex", flexDirection: "column", gap: 4, alignItems: "center" }}>
+                          {/* A spacer, not a label: it reserves the label row so
+                              the button lands on the input line. aria-hidden so
+                              it is never announced as an empty label. */}
+                          <label className="flbl2" aria-hidden style={{ visibility: "hidden" }}>&nbsp;</label>
+                          <button className="btn bg-btn btn-sm" type="button" disabled={form.servers.length === 1} onClick={() => rmServer(i)} style={{ opacity: form.servers.length === 1 ? 0.4 : 1 }}><Icon name="trash" size={14} title="Remove" /></button>
+                        </div>
                       </div>
                     ))}
                     <button className="btn bg-btn btn-sm" type="button" onClick={addServer} style={{ alignSelf: "flex-start" }}>＋ Add Server</button>
@@ -793,10 +813,15 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                   </div>
                   <GroupLabel>Rule Exclusions (false-positive tuning)</GroupLabel>
                   {form.rule_exclusions.map((ex, i) => (
-                    <div key={i} style={{ display: "grid", gridTemplateColumns: "1fr 2fr auto", gap: 8, alignItems: "end" }}>
+                    <div key={i} style={{ display: "grid", gridTemplateColumns: "1fr 2fr auto", gap: 8, alignItems: "start" }}>
                       <Field label="Rule ID" hint="Numeric CRS or custom rule id to exclude, e.g. 942100."><input className="fin2" type="number" value={ex.rule_id} onChange={e => upd({ rule_exclusions: form.rule_exclusions.map((x, idx) => idx === i ? { ...x, rule_id: Number(e.target.value) } : x) })} /></Field>
                       <Field label="Exclude Targets" hint="comma-separated (e.g. ARGS:id, REQUEST_HEADERS:Referer)"><input className="fin2" value={ex.exclude_targets.join(", ")} onChange={e => upd({ rule_exclusions: form.rule_exclusions.map((x, idx) => idx === i ? { ...x, exclude_targets: e.target.value.split(",").map(t => t.trim()).filter(Boolean) } : x) })} /></Field>
-                      <button className="btn bg-btn btn-sm" type="button" onClick={() => upd({ rule_exclusions: form.rule_exclusions.filter((_, idx) => idx !== i) })}><Icon name="trash" size={14} title="Remove" /></button>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 4, alignItems: "center" }}>
+                          {/* Spacer, not a label: reserves the label row so the
+                              button lands on the input line. */}
+                          <label className="flbl2" aria-hidden style={{ visibility: "hidden" }}>&nbsp;</label>
+                          <button className="btn bg-btn btn-sm" type="button" onClick={() => upd({ rule_exclusions: form.rule_exclusions.filter((_, idx) => idx !== i) })}><Icon name="trash" size={14} title="Remove" /></button>
+                      </div>
                     </div>
                   ))}
                   <button className="btn bg-btn btn-xs" type="button" style={{ alignSelf: "flex-start" }} onClick={() => upd({ rule_exclusions: [...form.rule_exclusions, { rule_id: 0, exclude_targets: [] }] })}>＋ Add Exclusion</button>
@@ -966,7 +991,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                   <GroupLabel>External Threat-Intel Feeds <Tag kind="enforced" /></GroupLabel>
                   <InfoBox>Auto-refreshed IP blocklists (AbuseIPDB, Spamhaus DROP, FireHOL, …). Loaded at startup and refreshed on the interval — matched IPs are blocked before rules run.</InfoBox>
                   {form.ip_feeds.map((feed, i) => (
-                    <div key={i} style={{ display: "grid", gridTemplateColumns: "2.4fr 0.8fr 0.9fr auto", gap: 8, alignItems: "end" }}>
+                    <div key={i} style={{ display: "grid", gridTemplateColumns: "2.4fr 0.8fr 0.9fr auto", gap: 8, alignItems: "start" }}>
                       <Field label={`Feed URL #${i + 1}`} hint="HTTP(S) URL of an IP blocklist. Fetched by the data plane on the refresh interval."><input className="fin2" value={feed.url} placeholder="https://iplists.firehol.org/…/firehol_level1.netset" style={{ fontFamily: "var(--font-mono)", fontSize: 13 }} onChange={e => upd({ ip_feeds: form.ip_feeds.map((x, idx) => idx === i ? { ...x, url: e.target.value } : x) })} /></Field>
                       <Field label="Refresh" hint="e.g. 1h"><input className="fin2" value={feed.interval} placeholder="1h" onChange={e => upd({ ip_feeds: form.ip_feeds.map((x, idx) => idx === i ? { ...x, interval: e.target.value } : x) })} /></Field>
                       <Field label="Format" hint="How this feed's file is laid out: one CIDR per line, or JSON.">
@@ -975,7 +1000,12 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                           <option value="json">JSON</option>
                         </select>
                       </Field>
-                      <button className="btn bg-btn btn-sm" type="button" onClick={() => upd({ ip_feeds: form.ip_feeds.filter((_, idx) => idx !== i) })}><Icon name="trash" size={14} title="Remove" /></button>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 4, alignItems: "center" }}>
+                          {/* Spacer, not a label: reserves the label row so the
+                              button lands on the input line. */}
+                          <label className="flbl2" aria-hidden style={{ visibility: "hidden" }}>&nbsp;</label>
+                          <button className="btn bg-btn btn-sm" type="button" onClick={() => upd({ ip_feeds: form.ip_feeds.filter((_, idx) => idx !== i) })}><Icon name="trash" size={14} title="Remove" /></button>
+                      </div>
                     </div>
                   ))}
                   <button className="btn bg-btn btn-xs" type="button" style={{ alignSelf: "flex-start" }} onClick={() => upd({ ip_feeds: [...form.ip_feeds, { url: "", interval: "1h", format: "cidr" }] })}>＋ Add Feed</button>
@@ -999,10 +1029,15 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                   {form.cors_enabled && <Field label="Allowed Origins" hint="* or comma-separated origins"><input className="fin2" value={form.cors_origins} style={{ fontFamily: "var(--font-mono)", fontSize: 13 }} onChange={e => upd({ cors_origins: e.target.value })} /></Field>}
                   <GroupLabel>Custom Headers</GroupLabel>
                   {form.custom_headers.map((h, i) => (
-                    <div key={i} style={{ display: "grid", gridTemplateColumns: "1fr 1.5fr auto", gap: 8, alignItems: "end" }}>
+                    <div key={i} style={{ display: "grid", gridTemplateColumns: "1fr 1.5fr auto", gap: 8, alignItems: "start" }}>
                       <Field label="Name" hint="Header name added to every response from this site."><input className="fin2" value={h.name} placeholder="X-Custom" onChange={e => setHeader(i, { name: e.target.value })} /></Field>
                       <Field label="Value" hint="Value sent with that header."><input className="fin2" value={h.value} onChange={e => setHeader(i, { value: e.target.value })} /></Field>
-                      <button className="btn bg-btn btn-sm" type="button" onClick={() => upd({ custom_headers: form.custom_headers.filter((_, idx) => idx !== i) })}><Icon name="trash" size={14} title="Remove" /></button>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 4, alignItems: "center" }}>
+                          {/* Spacer, not a label: reserves the label row so the
+                              button lands on the input line. */}
+                          <label className="flbl2" aria-hidden style={{ visibility: "hidden" }}>&nbsp;</label>
+                          <button className="btn bg-btn btn-sm" type="button" onClick={() => upd({ custom_headers: form.custom_headers.filter((_, idx) => idx !== i) })}><Icon name="trash" size={14} title="Remove" /></button>
+                      </div>
                     </div>
                   ))}
                   <button className="btn bg-btn btn-xs" type="button" style={{ alignSelf: "flex-start" }} onClick={() => upd({ custom_headers: [...form.custom_headers, { name: "", value: "" }] })}>＋ Add Header</button>
