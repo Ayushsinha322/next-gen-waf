@@ -227,7 +227,7 @@ Fleet-wide health of the WAF data plane and control plane — live topology, fai
         </div>
       </motion.div>
 
-      {/* ── (c) CONTROL PLANE (RAFT) + (e) NOTIFICATION READINESS ── */}
+      {/* ── (c) CONTROL PLANE (leader election) + (e) NOTIFICATION READINESS ── */}
       <motion.div variants={fadeUp} style={{ display: "grid", gridTemplateColumns: "1.6fr 1fr", gap: 14 }}>
 
         {/* Control plane */}
