@@ -689,7 +689,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     <GroupLabel>Upstream Servers</GroupLabel>
                     {form.servers.map((s, i) => (
                       <div key={i} style={{ display: "grid", gridTemplateColumns: "2fr 1fr 0.8fr auto auto", gap: 8, alignItems: "end" }}>
-                        <Field label={`Host #${i + 1} hint="The origin as the WAF reaches it — a hostname or address on your network, not the public domain."`}><input className="fin2" value={s.host} placeholder="127.0.0.1" onChange={e => setServer(i, { host: e.target.value })} /></Field>
+                        <Field label={`Host #${i + 1}`} hint="The origin as the WAF reaches it — a hostname or address on your network, not the public domain."><input className="fin2" value={s.host} placeholder="127.0.0.1" onChange={e => setServer(i, { host: e.target.value })} /></Field>
                         <Field label="Port" hint="The port your application listens on."><input className="fin2" type="number" value={s.port} onChange={e => setServer(i, { port: Number(e.target.value) })} /></Field>
                         <Field label="Weight" hint="Relative share of traffic when several origins are listed. Equal weights spread evenly."><input className="fin2" type="number" value={s.weight} onChange={e => setServer(i, { weight: Number(e.target.value) })} /></Field>
                         <div style={{ display: "flex", flexDirection: "column", gap: 4, alignItems: "center" }}><label className="flbl2">TLS</label><Sw on={s.tls} set={v => setServer(i, { tls: v })} /></div>
