@@ -70,6 +70,15 @@ die()  { printf '\n  %s✗ UPGRADE ABORTED%s\n    %s\n\n' "$RED" "$R" "$*" >&2; 
 
 SERVICES=(dataplane controlplane dashboard migrate)
 
+# Images are NOT always called sentinel/*. install.sh writes
+# SENTINEL_IMAGE_PREFIX into .env, and for a registry install it is the
+# customer's registry host. Hard-coding `sentinel/` here meant a registry
+# install could never be upgraded: the "are the current images present" check
+# looked for names that do not exist, so rollback_possible was always no, and
+# `docker load` then died on a bundle that deliberately ships no images.
+IMG_PREFIX="$(sed -n 's/^SENTINEL_IMAGE_PREFIX=//p' "$ENV_FILE" 2>/dev/null | head -1)"
+IMG_PREFIX="${IMG_PREFIX:-sentinel}"
+
 printf '\n  %sNext-Gen ESDSWAF — upgrade%s\n' "$B" "$R"
 log "upgrade started"
 
@@ -81,8 +90,20 @@ step "Step 1 of 8 — versions"
 
 CURRENT=$(cat "$STATE_DIR/version" 2>/dev/null \
           || grep -oP '^SENTINEL_VERSION=\K.*' "$ENV_FILE" 2>/dev/null || echo unknown)
-NEW=$(python3 -c "import json;print(json.load(open('$HERE/bundle/manifest.json'))['version'])" 2>/dev/null || echo unknown)
-[[ "$NEW" != "unknown" ]] || die "cannot read the new version from bundle/manifest.json"
+# Read with sed, NOT python3. install.sh removed exactly this call for exactly
+# this reason: Ubuntu cloud and minimal images ship without python3, so
+# `python3 ... || echo unknown` silently produced the literal string "unknown"
+# and the run continued until something failed looking for an image tagged
+# `:unknown`. The comment recording that fix lives in install.sh; the call
+# itself survived here. manifest.json is written one key per line by
+# build-bundle.sh, so a line-oriented parse is exact.
+manifest_str() { # manifest_str KEY - value of a top-level string key
+  sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" \
+    "$HERE/bundle/manifest.json" 2>/dev/null | head -1
+}
+NEW="$(manifest_str version)"
+[[ -n "$NEW" ]] || die "cannot read the version from bundle/manifest.json - the package is malformed.
+    Re-download it; do not attempt to upgrade from this copy."
 
 say "  installed: $CURRENT"
 say "  package:   $NEW"
@@ -124,8 +145,8 @@ if [[ "$CURRENT" == "unknown" ]]; then
   warn "installed version is unknown — automatic rollback will not be available"
 else
   for svc in "${SERVICES[@]}"; do
-    docker image inspect "sentinel/${svc}:${CURRENT}" >/dev/null 2>&1 || {
-      warn "image sentinel/${svc}:${CURRENT} is not present locally"
+    docker image inspect "${IMG_PREFIX}/${svc}:${CURRENT}" >/dev/null 2>&1 || {
+      warn "image ${IMG_PREFIX}/${svc}:${CURRENT} is not present locally"
       rollback_possible=no
     }
   done
@@ -188,16 +209,55 @@ else
     && ok "pg_dump -> $BK_DIR/postgres.dump" \
     || die "could not back up the database — refusing to upgrade blind"
 fi
-printf '%s\n' "$BK_DIR" > "$STATE_DIR/last-pre-upgrade-backup"
+# Record the directory that actually CONTAINS the dump, not the one we handed
+# to backup.sh as its root.
+#
+# backup.sh writes $BACKUP_ROOT/<UTC-timestamp>/postgres.dump, and restore.sh
+# requires postgres.dump directly inside the directory it is given. Recording
+# the parent meant `rollback.sh --restore-db` died on "not a Sentinel backup (no
+# postgres.dump)" every time, and so did the recovery command this script
+# prints. It only ever worked in the FALLBACK path below, where a plain pg_dump
+# writes straight into $BK_DIR — which is why it looked fine whenever backup.sh
+# was missing and failed whenever it was present.
+DUMP_DIR="$BK_DIR"
+if [[ ! -f "$DUMP_DIR/postgres.dump" ]]; then
+  _cand="$(find "$BK_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | tail -1)"
+  if [[ -n "$_cand" && -f "$_cand/postgres.dump" ]]; then
+    DUMP_DIR="$_cand"
+  else
+    warn "no postgres.dump under $BK_DIR — a database restore will NOT be possible"
+  fi
+fi
+printf '%s\n' "$DUMP_DIR" > "$STATE_DIR/last-pre-upgrade-backup"
 
 # ── 5. load the new images ───────────────────────────────────────────────────
 step "Step 5 of 8 — loading images"
-docker load -i "$HERE/bundle/images.tar.gz" >>"$LOG" 2>&1 || die "docker load failed — see $LOG"
-for svc in "${SERVICES[@]}"; do
-  docker image inspect "sentinel/${svc}:${NEW}" >/dev/null 2>&1 \
-    || die "sentinel/${svc}:${NEW} missing after load — package is incomplete"
-done
-ok "four images loaded at version $NEW"
+# A registry package ships no images on purpose — it names a registry to pull
+# from. Running `docker load` against it failed with "package is incomplete",
+# which described the bundle rather than the mistake.
+NEW_SOURCE="$(manifest_str image_source)"
+[[ "$NEW_SOURCE" == "registry" ]] || NEW_SOURCE=bundled
+
+if [[ "$NEW_SOURCE" == "registry" ]]; then
+  NEW_PREFIX="$(manifest_str registry_prefix)"
+  [[ -n "$NEW_PREFIX" ]] \
+    || die "this package says image_source=registry but names no registry_prefix"
+  for svc in "${SERVICES[@]}"; do
+    docker pull "${NEW_PREFIX}/${svc}:${NEW}" >>"$LOG" 2>&1 \
+      || die "could not pull ${NEW_PREFIX}/${svc}:${NEW} — see $LOG"
+  done
+  ok "four images pulled from $NEW_PREFIX at version $NEW"
+  IMG_PREFIX="$NEW_PREFIX"
+else
+  [[ -f "$HERE/bundle/images.tar.gz" ]] \
+    || die "bundle/images.tar.gz missing and the package does not say image_source=registry"
+  docker load -i "$HERE/bundle/images.tar.gz" >>"$LOG" 2>&1 || die "docker load failed — see $LOG"
+  for svc in "${SERVICES[@]}"; do
+    docker image inspect "${IMG_PREFIX}/${svc}:${NEW}" >/dev/null 2>&1 \
+      || die "${IMG_PREFIX}/${svc}:${NEW} missing after load — package is incomplete"
+  done
+  ok "four images loaded at version $NEW"
+fi
 
 # ── 6. switch version and start ──────────────────────────────────────────────
 step "Step 6 of 8 — applying $NEW"
@@ -212,17 +272,27 @@ rm -rf "$INSTALL_DIR/scripts.bak" 2>/dev/null || true
 cp -r "$HERE/scripts" "$INSTALL_DIR/scripts" 2>>"$LOG" || warn "could not refresh scripts"
 chmod +x "$INSTALL_DIR"/scripts/*.sh "$INSTALL_DIR"/scripts/2vm/*.sh 2>/dev/null || true
 
-set_version() { # set_version VERSION — rewrite SENTINEL_VERSION in .env
-  python3 - "$ENV_FILE" "$1" <<'PY'
-import sys, re
-p, v = sys.argv[1], sys.argv[2]
-s = open(p).read()
-if re.search(r'^SENTINEL_VERSION=', s, flags=re.M):
-    s = re.sub(r'^SENTINEL_VERSION=.*$', 'SENTINEL_VERSION=' + v, s, count=1, flags=re.M)
-else:
-    s = 'SENTINEL_VERSION=' + v + '\n' + s
-open(p, 'w').write(s)
-PY
+# Pure shell: see the note on manifest_str above. python3 is not present on a
+# minimal Ubuntu image, and this runs mid-upgrade, which is the worst possible
+# moment to die.
+#
+# Writes through `cat >` rather than `sed -i` so the file keeps its inode and
+# its 0600 mode. The version is validated rather than escaped: a tag is
+# [A-Za-z0-9._-], and anything else means a corrupt manifest, not something to
+# quote around.
+set_version() { # set_version VERSION - rewrite SENTINEL_VERSION in .env
+  local v="$1" tmp
+  [[ "$v" =~ ^[A-Za-z0-9._-]+$ ]] \
+    || die "refusing to write a version containing unexpected characters: $v"
+  tmp="$(mktemp)"
+  if grep -q '^SENTINEL_VERSION=' "$ENV_FILE"; then
+    sed "s|^SENTINEL_VERSION=.*|SENTINEL_VERSION=${v}|" "$ENV_FILE" > "$tmp"
+  else
+    { printf 'SENTINEL_VERSION=%s\n' "$v"; cat "$ENV_FILE"; } > "$tmp"
+  fi
+  [[ -s "$tmp" ]] || { rm -f "$tmp"; die "refusing to write an empty .env"; }
+  cat "$tmp" > "$ENV_FILE"
+  rm -f "$tmp"
 }
 set_version "$NEW"
 ok ".env pinned to $NEW"
@@ -308,7 +378,7 @@ log "ROLLBACK triggered: health_ok=$health_ok reason=${ROLLBACK_REASON:-health}"
 
 if [[ "$rollback_possible" != "yes" ]]; then
   printf '\n  %s✗ CANNOT ROLL BACK AUTOMATICALLY%s — the %s images are not present.\n' "$RED" "$R" "$CURRENT"
-  printf '    Recover from the backup:\n      %s\n\n' "$BK_DIR"
+  printf '    Recover from the backup:\n      %s\n\n' "$DUMP_DIR"
   exit 1
 fi
 
@@ -336,13 +406,13 @@ if [[ "$MIGRATED" == "yes" ]]; then
   printf '  Images are back on %s, but the schema is the %s one. Older code\n' "$CURRENT" "$NEW"
   printf '  against a newer schema is not a supported state, so the rollback is\n'
   printf '  NOT complete until the database is restored:\n\n'
-  printf '      sudo %s/scripts/backup/restore.sh %s\n\n' "$INSTALL_DIR" "$BK_DIR"
+  printf '      sudo %s/scripts/backup/restore.sh %s\n\n' "$INSTALL_DIR" "$DUMP_DIR"
   printf '  %sThat discards anything written since the backup (usually seconds).%s\n' "$DIM" "$R"
   if [[ "$RESTORE_DB" == "yes" ]]; then
     printf '\n  --restore-db given: restoring now…\n'
     if [[ -x "$INSTALL_DIR/scripts/backup/restore.sh" ]]; then
-      ( cd "$INSTALL_DIR/scripts/backup" && ./restore.sh "$BK_DIR" >>"$LOG" 2>&1 ) \
-        && ok "database restored from $BK_DIR" \
+      ( cd "$INSTALL_DIR/scripts/backup" && ./restore.sh "$DUMP_DIR" >>"$LOG" 2>&1 ) \
+        && ok "database restored from $DUMP_DIR" \
         || warn "restore.sh failed — see $LOG"
     else
       warn "restore.sh not available — restore manually"

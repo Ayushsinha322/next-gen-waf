@@ -236,6 +236,14 @@ deploy-shell:
     #     three checks, including the customer installer's own verifier, which
     #     reported a database-less control plane as healthy.
     - ./deploy/ci/check-pipefail-grep.sh
+    # 3c. The upgrade/rollback path must work on a customer host. These run at
+    #     the worst moment — mid-upgrade, or after one already went wrong — so a
+    #     defect is "the customer cannot get back", not "a feature is broken".
+    #     Three shipped: --restore-db could never succeed (recorded the backup
+    #     ROOT, restore.sh needs the dated child), python3 was required on hosts
+    #     the installer documents as lacking it, and registry installs could
+    #     neither upgrade nor roll back.
+    - ./deploy/ci/check-upgrade-rollback.sh
     # 4. The contract check — the one that catches shipping-breaking bugs.
     - STAGE_ONLY=1 ./deploy/package/build-bundle.sh
     - ./deploy/ci/check-bundle-contract.sh
