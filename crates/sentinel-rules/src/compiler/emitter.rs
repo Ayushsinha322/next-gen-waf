@@ -42,6 +42,19 @@ pub enum TargetSpec {
     RemoteAddr,
     Geo,
     TxVar(String),
+    /// The value the PREVIOUS condition in this chain matched — CRS
+    /// `MATCHED_VAR` / `MATCHED_VARS`.
+    ///
+    /// Resolved from the VM's per-rule `last_matched`, not from the request, so
+    /// it is only meaningful inside a chain. Outside one it is empty, which is
+    /// the correct reading: nothing has matched yet.
+    ///
+    /// It exists because dropping the target made the condition target-less,
+    /// which compiles to a constant false and silently disabled eight shipped
+    /// rules. Several of them are NEGATED refinements ("...and the matched text
+    /// is not a JWT"), so losing the child did not make the parent stricter, it
+    /// turned the parent off.
+    MatchedVar,
     CountOf(Box<TargetSpec>),
 }
 
@@ -83,6 +96,7 @@ impl TargetSpec {
             TargetSpec::RemoteAddr => "REMOTE_ADDR".into(),
             TargetSpec::Geo => "GEO".into(),
             TargetSpec::TxVar(v) => format!("TX:{v}"),
+            TargetSpec::MatchedVar => "MATCHED_VAR".into(),
             TargetSpec::CountOf(inner) => format!("&{}", inner.label()),
         }
     }
@@ -121,6 +135,7 @@ impl From<&Target> for TargetSpec {
             Target::RemoteAddr => TargetSpec::RemoteAddr,
             Target::Geo => TargetSpec::Geo,
             Target::TxVar(v) => TargetSpec::TxVar(v.clone()),
+            Target::MatchedVar => TargetSpec::MatchedVar,
             Target::CountOf(inner) => {
                 TargetSpec::CountOf(Box::new(TargetSpec::from(inner.as_ref())))
             }

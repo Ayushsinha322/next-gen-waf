@@ -230,6 +230,9 @@ pub enum Target {
     RemoteAddr,
     Geo,
     TxVar(String),
+    /// CRS `MATCHED_VAR` / `MATCHED_VARS`: the value the previous condition in
+    /// this chain matched. Only meaningful inside a chain.
+    MatchedVar,
     CountOf(Box<Target>),
 }
 

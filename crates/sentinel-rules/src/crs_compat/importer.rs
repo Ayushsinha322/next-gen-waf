@@ -319,7 +319,18 @@ fn token_to_target(tok: &str, rule_id: Option<u32>) -> Option<Target> {
         "TX" => Some(Target::TxVar(
             sub.unwrap_or("anomaly_score").to_ascii_uppercase(),
         )),
-        "MATCHED_VAR" | "MATCHED_VARS" | "MATCHED_VAR_NAME" | "MATCHED_VARS_NAMES" => None,
+        // The value the previous condition in the chain matched. Dropping this
+        // left the condition with NO targets, which compiles to a constant
+        // false and disabled eight shipped rules outright — several of them
+        // negated refinements, so the effect was to switch the parent rule off
+        // rather than to narrow it. See tests/crs_inert_rules.rs.
+        //
+        // The _NAME forms ask for the matched target's NAME rather than its
+        // value, which the VM does not carry into the child. They stay
+        // unsupported, but a rule left target-less by them is now RECORDED as a
+        // coverage gap instead of vanishing.
+        "MATCHED_VAR" | "MATCHED_VARS" => Some(Target::MatchedVar),
+        "MATCHED_VAR_NAME" | "MATCHED_VARS_NAMES" => None,
         "FILES" => Some(Target::Files),
         "FILES_NAMES" => Some(Target::FilesNames),
         "FILES_COMBINED_SIZE" => Some(Target::FilesCombinedSize),
