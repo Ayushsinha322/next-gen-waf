@@ -2,14 +2,26 @@
 //! (9900207 raw-operator, 9900208 cmdLine-normalized) added to
 //! `rules/custom/coverage.conf`. Confirms the rules COMPILE under RE2 and that
 //! they fire on real command injection while leaving benign values clean.
+//!
+//! These assert SCORE, not the engine's own decision. The coverage signatures
+//! contribute `tx.anomaly_score=+5` and carry `pass`; the verdict is made by
+//! `apply_verdict` in the proxy, which is the only place the false-positive
+//! classifier can weigh in. Asserting `>= DEFAULT_BLOCK_THRESHOLD` says the
+//! thing that actually matters — this payload blocks at default settings — and
+//! keeps saying it if the action vocabulary changes again.
 
 mod common;
 
 use std::path::Path;
 
 use common::{eval, make_get_ctx, make_post_ctx};
-use sentinel_core::context::{Phase, WafDecision};
+use sentinel_core::context::Phase;
 use sentinel_rules::RuleEngine;
+
+/// `sentinel_core::config::default_threshold()` — the flat anomaly threshold a
+/// site gets when it sets none. A single CRITICAL coverage match (+5) reaches
+/// it, so one signature is still enough to stop an attack class CRS misses.
+const DEFAULT_BLOCK_THRESHOLD: u32 = 5;
 
 fn load_coverage_engine() -> RuleEngine {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -26,13 +38,13 @@ fn load_coverage_engine() -> RuleEngine {
 fn blocked_query(engine: &RuleEngine, uri: &str) -> bool {
     let mut ctx = make_get_ctx(uri);
     eval(engine, &mut ctx, Phase::RequestBody);
-    ctx.decision == WafDecision::Block
+    ctx.anomaly_score >= DEFAULT_BLOCK_THRESHOLD
 }
 
 fn blocked_body(engine: &RuleEngine, body: &str) -> bool {
     let mut ctx = make_post_ctx("http://example.com/submit", body);
     eval(engine, &mut ctx, Phase::RequestBody);
-    ctx.decision == WafDecision::Block
+    ctx.anomaly_score >= DEFAULT_BLOCK_THRESHOLD
 }
 
 #[test]
@@ -109,9 +121,12 @@ fn benign_values_not_flagged_by_cmdi_rules() {
     ] {
         let mut ctx = make_get_ctx(uri);
         eval(&e, &mut ctx, Phase::RequestBody);
-        assert_ne!(
-            ctx.decision,
-            WafDecision::Block,
+        // Assert NO signature matched, not merely that the engine did not
+        // decide. Since the coverage rules stopped carrying `block`, the
+        // decision is always Allow here, so checking it would pass vacuously
+        // and stop guarding anything.
+        assert!(
+            ctx.rule_matches.is_empty(),
             "benign value falsely flagged: {uri} -> {:?}",
             ctx.rule_matches
         );
