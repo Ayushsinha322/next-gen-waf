@@ -736,8 +736,14 @@ export interface MLStats {
   models:              MLModel[];
 }
 
+/** Mirrors db.UserRow in the control plane. Field names here are the Go `json`
+ *  tags, NOT prettier local names: a name that does not exist on the wire reads
+ *  as undefined, and React renders undefined as nothing at all, so the column
+ *  looks plausible and is simply always wrong. Guarded by
+ *  lib/__tests__/apiContract.test.ts. */
 export interface UserRow {
   id:         string;
+  tenant_id?: string;
   email:      string;
   name:       string;
   role:       string;
@@ -745,17 +751,31 @@ export interface UserRow {
   /** Emitted by the control plane as mfa_enabled. The column read a field
    *  called twofa that never existed, so it showed "None" for every user. */
   mfa_enabled: boolean;
-  last_login: string | null;
+  /** `last_login_at`, not `last_login`. Read under the shorter name this
+   *  rendered "Never" for every account including the one signed in, which is
+   *  indistinguishable from a dormant account during an access review.
+   *  `omitempty` on the Go side means absent, not null, for a user who has
+   *  never signed in. */
+  last_login_at?: string | null;
+  created_at?: string;
 }
 
+/** Mirrors db.APIKeyRow in the control plane. See the note on UserRow: two of
+ *  these names were wrong, so the Scope and Last Used columns rendered empty on
+ *  every row and an unused key looked identical to one used a minute ago. */
 export interface APIKeyRow {
   id:         string;
+  tenant_id?: string;
   name:       string;
+  role:       string;
+  /** `scopes`, an ARRAY, not a `scope` string. */
+  scopes:     string[];
   preview:    string;
-  scope:      string;
+  /** All three are `omitempty` on the Go side: absent, not null. */
+  expires_at?:   string;
+  revoked_at?:   string;
+  last_used_at?: string;
   created_at: string;
-  expires_at: string;
-  last_used:  string;
 }
 
 /** One rule as the compiler actually understood it. */
@@ -1174,8 +1194,15 @@ export const api = {
       // declared `scope` — singular, and a name the backend never looks at — so
       // the field was silently dropped and every key was created with whatever
       // the server defaulted to.
+      /** The secret comes back as a SIBLING of `api_key`, not a field inside it:
+       *  the handler returns `{api_key: row, key: fullKey, warning: ...}`. This
+       *  declared `api_key: APIKeyRow & {key: string}`, so TypeScript endorsed
+       *  reading `res.api_key.key` — which is undefined. The reveal block is
+       *  conditional on that value, so it never rendered: "displayed exactly
+       *  once" meant displayed zero times, and the key is stored hashed, so the
+       *  only copy was discarded. */
       create: (body: { name: string; role?: string; scopes?: string[] }) =>
-        apiFetch<{ api_key: APIKeyRow & { key: string }; warning: string }>(
+        apiFetch<{ api_key: APIKeyRow; key: string; warning: string }>(
           "/admin/apikeys", { method: "POST", body: JSON.stringify(body) }
         ),
       revoke: (id: string) =>

@@ -71,7 +71,7 @@ func requirePerm(c *gin.Context, enf *rbac.Enforcer, resource, action string) bo
 	return true
 }
 
-func handleLogin(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store, hub *logs.Hub) {
+func handleLogin(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store, hub *logs.Hub, log *zap.Logger) {
 	var req loginRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -232,6 +232,20 @@ func handleLogin(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store, hub *
 	}
 
 	loginAttempts.recordSuccess(loginKey)
+
+	// Stamp the sign-in. Best-effort: a failure here must not cost the user
+	// their session, since the login itself has already succeeded and the audit
+	// entry below is the record that matters. But it is LOGGED rather than
+	// dropped — a column that silently stops updating is how this one came to
+	// read "Never" for every account since the first migration.
+	//
+	// Skipped for the no-store dev backdoor, which has no row to stamp.
+	if store != nil {
+		if err := store.MarkLogin(c.Request.Context(), claims.TenantID, claims.UserID); err != nil {
+			log.Warn("could not stamp last login",
+				zap.String("user_id", claims.UserID), zap.Error(err))
+		}
+	}
 
 	pair, err := jwtSvc.IssueTokenPair(claims)
 	if err != nil {

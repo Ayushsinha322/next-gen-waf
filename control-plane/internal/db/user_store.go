@@ -132,6 +132,44 @@ func (s *Store) UpdateUser(ctx context.Context, tenantID, actorID, userID, role,
 	return tx.Commit(ctx)
 }
 
+// MarkLogin stamps a successful sign-in on the user row.
+//
+// The column has existed since the first migration and NOTHING EVER WROTE IT.
+// Every account read "Never" on the Settings page, including the one looking at
+// the screen, which during an access review is indistinguishable from a dormant
+// account that should be removed. The console was also reading the wrong field
+// name, so fixing that alone would have swapped one permanent "Never" for
+// another; both halves are needed for the column to mean anything.
+//
+// Deliberately NOT wrapped in the caller's audit transaction: the audit entry
+// records that a login happened, and this is a convenience timestamp. A failure
+// here must never cost someone their session, so the caller treats it as
+// best-effort — but it logs, rather than discarding the error silently.
+func (s *Store) MarkLogin(ctx context.Context, tenantID, userID string) error {
+	tx, err := s.pool.BeginTenant(ctx, tenantID, userID)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	// Explicit tenant predicate alongside the id, matching every other write in
+	// this file: isolation must not depend solely on RLS being active.
+	var got string
+	err = tx.QueryRow(ctx, `
+		UPDATE users
+		SET last_login_at = now()
+		WHERE id = $1 AND tenant_id = $2
+		RETURNING id`,
+		userID, tenantID).Scan(&got)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("user not found")
+		}
+		return fmt.Errorf("mark login: %w", err)
+	}
+	return tx.Commit(ctx)
+}
+
 // DeleteUser removes a user from the tenant.
 func (s *Store) DeleteUser(ctx context.Context, tenantID, actorID, userID string) error {
 	tx, err := s.pool.BeginTenant(ctx, tenantID, actorID)

@@ -566,7 +566,7 @@ func run() error {
 
 	authGroup := router.Group("/api/v1/auth")
 	{
-		authGroup.POST("/login", func(c *gin.Context) { handleLogin(c, jwtSvc, store, hub) })
+		authGroup.POST("/login", func(c *gin.Context) { handleLogin(c, jwtSvc, store, hub, log) })
 		authGroup.POST("/refresh", func(c *gin.Context) { handleRefresh(c, jwtSvc, store) })
 		// Unauthenticated on purpose: the login page must ask this BEFORE anyone
 		// has logged in. It reveals only whether SSO is available — which the
