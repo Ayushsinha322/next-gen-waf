@@ -182,6 +182,26 @@ export default function OverviewPage() {
   }, []);
 
   // ── Derived ──
+  //
+  // Whether each source ANSWERED. When it did not, a count is not zero — it is
+  // unknown, and rendering 0 is a claim the console cannot support.
+  //
+  // Demonstrated with the control plane genuinely unreachable: this page
+  // reported "Sites 0 · 0 active", "Services 0 · 0/0 upstreams", "Blocked 0",
+  // "Requests/sec 0" and "HTTP/3 Off" for a deployment that had a site, a
+  // healthy upstream, live traffic and HTTP/3 enabled. Every one of those reads
+  // exactly like a healthy, idle, freshly-installed WAF.
+  //
+  // Some cards here already did the right thing — System RAM, Instances,
+  // Plugins and p99 all fall back to "—". The counts did not, so the page was
+  // half honest, which is worse than uniformly wrong: the "—" cards lend
+  // credibility to the zeros beside them.
+  const metricsKnown = metrics !== null;
+  const statsKnown   = stats !== null;
+  const wafKnown     = wafStatus !== null;
+  /** A value the console has actually been told, or an em dash if it has not. */
+  const known = (ok: boolean, node: React.ReactNode): React.ReactNode => (ok ? node : "—");
+
   const rps        = metrics?.rps              ?? 0;
   const p99        = metrics?.p99_latency_ms   ?? 0;
   const mlDet      = metrics?.ml_anomalies     ?? 0;
@@ -285,25 +305,25 @@ export default function OverviewPage() {
         <Kpi icon="🧠" label="System RAM" accent="var(--cyan)" hint={tip.ram}
           value={memTotal > 0 ? `${memPct.toFixed(0)}%` : "—"}
           sub={memTotal > 0 ? `${fmtBytes(memUsed)} / ${fmtBytes(memTotal)}` : "host metric"} />
-        <Kpi icon="🌐" label="Sites" hint={tip.sites} value={<AnimatedValue value={stats?.total_sites ?? 0} />} sub={`${stats?.active_sites ?? 0} active`} />
-        <Kpi icon="📦" label="Services" hint={tip.services} value={<AnimatedValue value={stats?.active_sites ?? 0} />} sub={`${wafStatus?.upstreams_healthy ?? 0}/${wafStatus?.upstreams_total ?? 0} upstreams`} />
+        <Kpi icon="🌐" label="Sites" hint={tip.sites} value={known(statsKnown, <AnimatedValue value={stats?.total_sites ?? 0} />)} sub={statsKnown ? `${stats?.active_sites ?? 0} active` : "not reported"} />
+        <Kpi icon="📦" label="Services" hint={tip.services} value={known(statsKnown, <AnimatedValue value={stats?.active_sites ?? 0} />)} sub={wafKnown ? `${wafStatus?.upstreams_healthy ?? 0}/${wafStatus?.upstreams_total ?? 0} upstreams` : "not reported"} />
         <Kpi icon="🖧" label="Instances" hint={tip.inst} value={instances === null ? "—" : instances} sub={(instances ?? 1) > 1 ? "clustered" : "standalone"} />
         <Kpi icon="🔌" label="Plugins" hint={tip.plugins} value={plugins === null ? "—" : plugins} sub="WASM loaded" />
-        <Kpi icon="🛑" label="Blocked" accent="#ef4444" hint={tip.blocked} value={<AnimatedValue value={blkCount} />} sub={`${openAlerts} open alerts`} />
-        <Kpi icon="📍" label="Blocked IPs" accent="#ef4444" hint={tip.blkIPs} value={<AnimatedValue value={uniqueIPs} />} sub="unique sources" />
+        <Kpi icon="🛑" label="Blocked" accent="#ef4444" hint={tip.blocked} value={known(metricsKnown, <AnimatedValue value={blkCount} />)} sub={statsKnown ? `${openAlerts} open alerts` : "not reported"} />
+        <Kpi icon="📍" label="Blocked IPs" accent="#ef4444" hint={tip.blkIPs} value={known(metricsKnown, <AnimatedValue value={uniqueIPs} />)} sub={metricsKnown ? "unique sources" : "not reported"} />
       </motion.div>
 
       {/* Live metric cards */}
       <motion.div variants={staggerContainer} style={{ display: "grid", gridTemplateColumns: "repeat(5,minmax(0,1fr))", gap: 14 }}>
-        <motion.div className="mc blue" variants={cardVariants} title={tip.rps} style={{ cursor: "help" }}><div className="mc-label">Requests / sec</div><div className="mc-val"><AnimatedValue value={rps} /></div><div className="mc-delta up">▲ 10-second rolling window</div></motion.div>
-        <motion.div className="mc red" variants={cardVariants} title={tip.blocked} style={{ cursor: "help" }}><div className="mc-label">Threats blocked</div><div className="mc-val"><AnimatedValue value={blkCount} /></div><div className="mc-delta up" title={tip.alerts}>▲ {openAlerts} open alerts</div></motion.div>
+        <motion.div className="mc blue" variants={cardVariants} title={tip.rps} style={{ cursor: "help" }}><div className="mc-label">Requests / sec</div><div className="mc-val">{known(metricsKnown, <AnimatedValue value={rps} />)}</div><div className="mc-delta up">▲ 10-second rolling window</div></motion.div>
+        <motion.div className="mc red" variants={cardVariants} title={tip.blocked} style={{ cursor: "help" }}><div className="mc-label">Threats blocked</div><div className="mc-val">{known(metricsKnown, <AnimatedValue value={blkCount} />)}</div><div className="mc-delta up" title={tip.alerts}>{statsKnown ? `▲ ${openAlerts} open alerts` : "▲ alert count not reported"}</div></motion.div>
         <motion.div className="mc green" variants={cardVariants} title={tip.p99} style={{ cursor: "help" }}><div className="mc-label">p99 Latency</div><div className="mc-val">{p99 > 0 ? p99.toFixed(2) + "ms" : "—"}</div><div className="mc-delta up">{p99Waf > 0 ? `▼ end-to-end · WAF ${p99Waf.toFixed(2)}ms of it` : "▼ end-to-end, incl. origin"}</div></motion.div>
-        <motion.div className="mc pur" variants={cardVariants} title={tip.ml} style={{ cursor: "help" }}><div className="mc-label">ML detections</div><div className="mc-val"><AnimatedValue value={mlDet} /></div><div className="mc-delta" style={{ color: "#c4b5fd" }}>▲ anomaly engine active</div></motion.div>
+        <motion.div className="mc pur" variants={cardVariants} title={tip.ml} style={{ cursor: "help" }}><div className="mc-label">ML detections</div><div className="mc-val">{known(metricsKnown, <AnimatedValue value={mlDet} />)}</div><div className="mc-delta" style={{ color: "#c4b5fd" }}>{metricsKnown ? "▲ anomaly engine active" : "▲ not reported"}</div></motion.div>
         <motion.div className="mc cyan" variants={cardVariants} title={tip.http3} style={{ cursor: "help" }}>
           <div className="mc-label">HTTP/3</div>
-          <div className="mc-val" style={{ fontSize: 25 }}>{wafStatus?.http3?.enabled ? "Active" : "Off"}</div>
+          <div className="mc-val" style={{ fontSize: 25 }}>{wafKnown ? (wafStatus?.http3?.enabled ? "Active" : "Off") : "—"}</div>
           <div className="mc-delta" style={{ color: wafStatus?.http3?.enabled ? "#67e8f9" : "var(--text3)" }}>
-            {wafStatus?.http3?.enabled ? `▲ QUIC · :${wafStatus.http3.advertise_port ?? "443"}` : "— not enabled"}
+            {!wafKnown ? "data plane did not report" : wafStatus?.http3?.enabled ? `▲ QUIC · :${wafStatus.http3.advertise_port ?? "443"}` : "— not enabled"}
           </div>
         </motion.div>
       </motion.div>
