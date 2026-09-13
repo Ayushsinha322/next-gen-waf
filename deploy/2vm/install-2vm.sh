@@ -246,6 +246,33 @@ if [[ "$MODE" == "check" ]]; then
     say "  ${DIM}this node does not hold the VIP (normal for the standby)${R}"
   fi
 
+  # The control plane is checked SEPARATELY from VRRP, because VRRP does not
+  # watch it. The data plane serves traffic from a cached config and needs no
+  # database, so a control plane with no database at all leaves every VRRP probe
+  # green — which is how a 2-VM master could finish installing, report success,
+  # and refuse every login with a 503.
+  #
+  # /readyz is the only endpoint that answers this: it calls store.Ping and
+  # reports db ok|unavailable|unreachable. /health is a hardcoded {"status":"ok"}
+  # that never touches the database. 9501 is not published to the host and the
+  # control-plane image is distroless with no shell, so probe from a container
+  # that has one and shares the network.
+  step "control-plane database connectivity"
+  _rdy=$(docker exec sentinel-clickhouse-1 wget -qO- --timeout=5 \
+           http://controlplane:9501/readyz 2>/dev/null)
+  if [[ -z "$_rdy" ]]; then
+    warn "control plane /readyz did not answer — not serving, or not on the network"
+    CHECK_FAIL=1
+  elif printf '%s' "$_rdy" | grep -q '"db"[[:space:]]*:[[:space:]]*"ok"'; then
+    ok "control plane is connected to its database"
+  else
+    warn "control plane is running WITHOUT a database — every login returns 503"
+    say  "  ${DIM}$_rdy${R}"
+    say  "  ${DIM}Check SENTINEL_DB_URL in the deployment .env: Postgres accepts TLS${R}"
+    say  "  ${DIM}only (pg_hba is hostssl-only), so sslmode must be verify-full.${R}"
+    CHECK_FAIL=1
+  fi
+
   step "data-plane health (what VRRP tracks)"
   if /usr/local/sbin/sentinel-vrrp-check.sh; then
     ok "healthy — eligible for the VIP"
@@ -405,8 +432,27 @@ if [[ "$ROLE" == "master" ]]; then
     # Written here too so the file is complete if it is later reused after a role
     # swap; the slave overwrites it with its own peer address.
     set_kv SENTINEL_PRIMARY_HOST "$THIS_IP"
-    set_kv SENTINEL_DB_URL "postgres://sentinel:${PGPW}@postgres:5432/sentinel?sslmode=disable"
-    set_kv SENTINEL_DB_URL_PRIMARY "postgres://sentinel:${PGPW}@${THIS_IP}:5432/sentinel?sslmode=disable"
+    # verify-full, NOT sslmode=disable.
+    #
+    # This is not a hardening preference, it is the difference between working
+    # and not. compose.prod.yml points Postgres at our own pg_hba.conf, which
+    # has no plain `host` line at all — only `hostssl … scram-sha-256`. A TCP
+    # client that disables TLS is refused outright with "no pg_hba.conf entry
+    # for host …, SSL off". So the control plane and migrate could not connect
+    # on a fresh 2-VM master: the control plane came up in degraded mode, every
+    # login returned 503, and the installer still exited 0 because its only
+    # health probe watches the data plane, which does not use Postgres.
+    #
+    # install.sh has written exactly this DSN for the single-host path all
+    # along; only this file disagreed, and its own warning below described the
+    # result as a security posture to improve later rather than a stack that
+    # cannot start.
+    #
+    # Both forms verify: the certificate issued a few steps down carries SANs
+    # for `postgres`, this node, the peer and the VIP, and root.crt is mounted
+    # into controlplane and migrate at the path sslrootcert names.
+    set_kv SENTINEL_DB_URL "postgres://sentinel:${PGPW}@postgres:5432/sentinel?sslmode=verify-full&sslrootcert=/etc/sentinel/pki/root.crt"
+    set_kv SENTINEL_DB_URL_PRIMARY "postgres://sentinel:${PGPW}@${THIS_IP}:5432/sentinel?sslmode=verify-full&sslrootcert=/etc/sentinel/pki/root.crt"
     set_kv SENTINEL_ALLOW_SUPERUSER_DB 1
     set_kv CLICKHOUSE_MEM_LIMIT 6g
     # ClickHouse runs only here, and the slave's data plane must reach it or its
@@ -417,9 +463,9 @@ if [[ "$ROLE" == "master" ]]; then
     set_kv SENTINEL_CLICKHOUSE_URL_PRIMARY "https://${THIS_IP}:8443"
     chmod 600 "$ENV_FILE"
     ok "generated .env with fresh secrets"
-    warn "sslmode=disable is set for the replication DSNs. Run issue-postgres-cert.sh"
-    say  "  ${DIM}and switch both DSNs to verify-full before this carries real traffic —${R}"
-    say  "  ${DIM}replication streams the entire database across the network.${R}"
+    say  "  ${DIM}database DSNs use sslmode=verify-full against the CA issued below.${R}"
+    say  "  ${DIM}Replication streams the whole database across the peer link, so this${R}"
+    say  "  ${DIM}is also what keeps it off the wire in cleartext.${R}"
   fi
   say "  ${DIM}two files must be copied to the slave — exact commands are printed at the end${R}"
 else

@@ -230,6 +230,14 @@ deploy-shell:
     #     and no hard-coded vN.N.N in dashboard source. The console once showed
     #     four different versions on one deployment.
     - ./deploy/ci/check-version-consistency.sh
+    # 3c. Every generated Postgres DSN must use a TLS mode the server accepts.
+    #     pg_hba is hostssl-only, and install-2vm.sh wrote sslmode=disable — so a
+    #     fresh 2-VM master's control plane could not reach its database at all,
+    #     came up degraded, returned 503 to every login, and the installer still
+    #     exited 0 because its health probe only watches the data plane. The
+    #     check reads the policy out of pg_hba rather than hard-coding a
+    #     preference, so relaxing the policy deliberately relaxes the gate too.
+    - ./deploy/ci/check-db-tls-consistency.sh
     # 4. The contract check — the one that catches shipping-breaking bugs.
     - STAGE_ONLY=1 ./deploy/package/build-bundle.sh
     - ./deploy/ci/check-bundle-contract.sh
