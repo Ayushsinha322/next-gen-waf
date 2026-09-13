@@ -711,8 +711,19 @@ fn decode_xml_entities(s: &str) -> String {
     out
 }
 
-fn extract_target(spec: &TargetSpec, ctx: &RequestContext) -> Vec<String> {
+/// `last_matched` is what the PREVIOUS condition in the current chain matched.
+/// It is threaded in rather than read from `ctx` because it is VM state that
+/// lives for one rule: `TargetSpec::MatchedVar` is the only consumer, and
+/// resolving it anywhere else would silently yield nothing.
+fn extract_target(
+    spec: &TargetSpec,
+    ctx: &RequestContext,
+    last_matched: Option<&str>,
+) -> Vec<String> {
     match spec {
+        // Outside a chain nothing has matched yet, and an empty list is the
+        // honest answer: the condition simply does not match.
+        TargetSpec::MatchedVar => last_matched.map(|v| vec![v.to_owned()]).unwrap_or_default(),
         TargetSpec::Args => {
             let mut values: Vec<String> = parse_query_params(ctx.uri.query().unwrap_or(""))
                 .into_iter()
@@ -931,7 +942,7 @@ fn extract_target(spec: &TargetSpec, ctx: &RequestContext) -> Vec<String> {
                     .as_ref()
                     .map(|h| h.get_all(name.as_str()).iter().count())
                     .unwrap_or(0),
-                other => extract_target(other, ctx).len(),
+                other => extract_target(other, ctx, last_matched).len(),
             };
             vec![count.to_string()]
         }
@@ -1165,7 +1176,7 @@ pub fn evaluate(
                 // inspected exactly one target, and left empty otherwise.
                 targets_seen += 1;
                 last_target = Some(spec.label());
-                let values = extract_target(spec, ctx);
+                let values = extract_target(spec, ctx, last_matched.as_deref());
                 stack.push(StackVal::Strings(values));
             }
 

@@ -5783,6 +5783,7 @@ fn target_name(t: &sentinel_rules::dsl::ast::Target) -> String {
         Target::RequestUri => "REQUEST_URI".into(),
         Target::RequestFilename => "REQUEST_FILENAME".into(),
         Target::RequestMethod => "REQUEST_METHOD".into(),
+        Target::MatchedVar => "MATCHED_VAR".into(),
         Target::RequestLine => "REQUEST_LINE".into(),
         Target::RequestProtocol => "REQUEST_PROTOCOL".into(),
         Target::ReqbodyProcessor => "REQBODY_PROCESSOR".into(),

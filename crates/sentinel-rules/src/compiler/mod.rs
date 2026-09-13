@@ -249,7 +249,35 @@ pub fn compile(file: RuleFile) -> Result<CompiledRuleSet> {
                             .chain_conditions
                             .iter()
                             .any(|c| matches!(c.operator, Operator::Never));
-                        if matches!(rule.operator, Operator::Never) || never_in_chain {
+                        // A TARGET-LESS condition is inert for a different
+                        // reason and used to be invisible. The importer drops
+                        // target tokens it does not understand; when that empties
+                        // a condition's list the emitter falls back to a constant
+                        // false, and the rule is then counted in the inventory,
+                        // listed in the console, and incapable of firing.
+                        //
+                        // It cost eight shipped rules — 932200, 932206, 932240,
+                        // 933120, 933151, 941310, 942440, 944120 — all chain
+                        // children reading MATCHED_VARS. Chain links are ANDed, so
+                        // a constant-false child disables the parent, and several
+                        // of those children are NEGATED refinements, meaning the
+                        // effect was to switch the detection OFF rather than
+                        // narrow it. The census reported "zero gap" throughout.
+                        //
+                        // Operators that need no target (rate limits, the
+                        // unsupported-operator path) return before the emitter's
+                        // target check, so they must not be counted here.
+                        let needs_targets = |op: &Operator| {
+                            !matches!(op, Operator::Never | Operator::RateLimit { .. })
+                        };
+                        let targetless = (rule.targets.is_empty() && needs_targets(&rule.operator))
+                            || rule
+                                .chain_conditions
+                                .iter()
+                                .any(|c| c.targets.is_empty() && needs_targets(&c.operator));
+
+                        if matches!(rule.operator, Operator::Never) || never_in_chain || targetless
+                        {
                             disabled.push(rule_id);
                         }
                     }
