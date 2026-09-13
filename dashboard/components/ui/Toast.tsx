@@ -3,11 +3,28 @@ import { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Toast as ToastType } from "@/lib/types";
 import { toastVariants } from "@/lib/animations";
+import Icon, { type IconName } from "@/components/ui/Icon";
 
 let addToastFn: ((t: Omit<ToastType, "id">) => void) | null = null;
-export function showToast(msg: string, type: ToastType["type"] = "i", icon = "ℹ️") {
-  addToastFn?.({ msg, type, icon });
+
+/**
+ * Raise a toast.
+ *
+ * There is deliberately no icon argument. Every call site used to pass its own
+ * emoji, which meant the same severity looked different on every page and an
+ * error could be announced under a green tick. The icon now follows the
+ * severity, so it cannot disagree with the colour.
+ */
+export function showToast(msg: string, type: ToastType["type"] = "i") {
+  addToastFn?.({ msg, type });
 }
+
+const SEVERITY_ICON: Record<ToastType["type"], IconName> = {
+  s: "check-circle",
+  e: "alert-triangle",
+  w: "alert-circle",
+  i: "info",
+};
 
 export default function ToastContainer() {
   const [toasts, setToasts] = useState<ToastType[]>([]);
@@ -33,7 +50,7 @@ export default function ToastContainer() {
             exit="exit"
             layout
           >
-            <span>{t.icon}</span>
+            <Icon name={SEVERITY_ICON[t.type]} size={15} />
             <span>{t.msg}</span>
           </motion.div>
         ))}

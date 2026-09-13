@@ -64,6 +64,6 @@ export async function generateReply(history: CopilotTurn[], text: string): Promi
     d.response ??
     d.content ??
     d.message ??
-    `⚠️ Unexpected response format: ${JSON.stringify(data).slice(0, 300)}`
+    `⚠ Unexpected response format: ${JSON.stringify(data).slice(0, 300)}`
   );
 }

@@ -1,4 +1,5 @@
 "use client";
+import Icon, { type IconName } from "@/components/ui/Icon";
 /**
  * SiteWizard — full-screen, multi-step wizard for adding and editing protected
  * sites. Designed to be clearer AND more capable than BunkerWeb:
@@ -88,7 +89,7 @@ function ChipInput({
   function add() {
     const v = transform ? transform(draft) : draft.trim();
     if (!v) return;
-    if (validate && !validate(v)) { showToast("Invalid value", "e", "⚠️"); return; }
+    if (validate && !validate(v)) { showToast("Invalid value", "e"); return; }
     if (!values.includes(v)) onChange([...values, v]);
     setDraft("");
   }
@@ -148,7 +149,7 @@ function SecretInput({ value, set, placeholder }: { value: string; set: (v: stri
         onChange={e => set(e.target.value)} />
       <span onClick={() => setShow(s => !s)} title={show ? "Hide" : "Reveal"}
         style={{ position: "absolute", right: 10, top: "50%", transform: "translateY(-50%)", cursor: "pointer", color: "var(--text3)", fontSize: 15 }}>
-        {show ? "🙈" : "👁"}
+        <Icon name={show ? "eye-off" : "eye"} size={16} />
       </span>
     </div>
   );
@@ -292,12 +293,12 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
     // Repository cert: nothing to issue/upload — the data plane already serves it
     // by SNI (incl. wildcard), so it's shared across every matching site.
     if (form.tls_mode === "existing") {
-      showToast(`Using "${form.tls_existing_cert}" from the certificate repository — served via SNI, no upload`, "i", "📚");
+      showToast(`Using "${form.tls_existing_cert}" from the certificate repository — served via SNI, no upload`, "i");
       return;
     }
     // DNS-01 / wildcard issuance is roadmap — config is stored, issuance skipped.
     if (form.tls_mode === "auto" && (form.acme_challenge === "dns_01" || form.acme_wildcard)) {
-      showToast("Wildcard/DNS-01 saved as config — issuance via DNS-01 is on the roadmap", "i", "📝");
+      showToast("Wildcard/DNS-01 saved as config — issuance via DNS-01 is on the roadmap", "i");
       return;
     }
     try {
@@ -307,29 +308,29 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
           domains: form.domains, email: form.acme_email.trim(),
           provider, challenge: form.acme_challenge as "http_01" | "tls_alpn_01",
         });
-        showToast(`Certificate requested for ${form.domains[0]}`, "s", "🔐");
+        showToast(`Certificate requested for ${form.domains[0]}`, "s");
       } else if (form.tls_mode === "manual" && form.custom_priority === "data") {
         await api.certs.uploadManual({ domain: form.domains[0], cert_pem: form.cert_pem, key_pem: form.key_pem });
-        showToast(`Certificate installed for ${form.domains[0]}`, "s", "🔐");
+        showToast(`Certificate installed for ${form.domains[0]}`, "s");
       } else {
-        showToast("Custom certificate paths saved — loaded by the node from disk", "i", "📝");
+        showToast("Custom certificate paths saved — loaded by the node from disk", "i");
       }
     } catch (e) {
-      showToast(`Site saved, TLS pending: ${e instanceof Error ? e.message : "cert error"}`, "e", "⚠️");
+      showToast(`Site saved, TLS pending: ${e instanceof Error ? e.message : "cert error"}`, "e");
     }
   }
 
   async function save() {
     const err = validateAll();
-    if (err) { showToast(err, "e", "⚠️"); return; }
+    if (err) { showToast(err, "e"); return; }
     setSaving(true);
     try {
       const payload = formToPayload(form);
-      if (mode === "edit" && siteId) { await api.sites.update(siteId, payload); await provisionTls(); showToast("Site updated", "s", "✅"); }
-      else { await api.sites.create(payload); await provisionTls(); showToast("Site deployed", "s", "🚀"); }
+      if (mode === "edit" && siteId) { await api.sites.update(siteId, payload); await provisionTls(); showToast("Site updated", "s"); }
+      else { await api.sites.create(payload); await provisionTls(); showToast("Site deployed", "s"); }
       onSaved(form.domains[0]);
     } catch (e) {
-      showToast(e instanceof Error ? e.message : "Save failed", "e", "⚠️");
+      showToast(e instanceof Error ? e.message : "Save failed", "e");
     } finally { setSaving(false); }
   }
 
@@ -352,7 +353,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
         {/* Sidebar / stepper */}
         <div style={{ width: 256, flexShrink: 0, padding: "22px 18px", display: "flex", flexDirection: "column", background: "linear-gradient(180deg, rgba(0,212,255,.06), rgba(0,0,0,.15))", borderRight: "1px solid rgba(255,255,255,.06)", overflowY: "auto" }}>
           <div style={{ fontFamily: "var(--font-display)", fontWeight: 700, fontSize: 17, color: "var(--text)", letterSpacing: 1 }}>
-            {mode === "edit" ? "✏️ Edit Site" : "🌐 New Protected Site"}
+            {mode === "edit" ? "Edit Site" : "New Protected Site"}
           </div>
           <div style={{ fontSize: 14, color: "var(--text3)", marginTop: 4, fontFamily: "var(--font-mono)" }}>
             {mode === "edit" ? form.name : "Reverse proxy + WAF in minutes"}
@@ -381,7 +382,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
             })}
           </div>
           <div style={{ marginTop: "auto", paddingTop: 16, fontSize: 11, color: "var(--text3)", fontFamily: "var(--font-mono)", lineHeight: 1.6 }}>
-            💡 Public traffic enters on the WAF&rsquo;s <span style={{ color: "var(--cyan)" }}>{scheme}</span> listener and is proxied to your upstreams.
+            Public traffic enters on the WAF&rsquo;s <span style={{ color: "var(--cyan)" }}>{scheme}</span> listener and is proxied to your upstreams.
           </div>
         </div>
 
@@ -440,7 +441,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                       const p = PRESETS[k]; const active = form.preset === k;
                       return (
                         <div key={k} onClick={() => choosePreset(k)} style={{ cursor: "pointer", padding: 14, borderRadius: 12, background: active ? "rgba(0,212,255,.1)" : "rgba(255,255,255,.03)", border: active ? "1px solid rgba(0,212,255,.45)" : "1px solid rgba(255,255,255,.08)" }}>
-                          <div style={{ fontSize: 23 }}>{p.icon}</div>
+                          <Icon name={p.icon as IconName} size={21} />
                           <div style={{ fontWeight: 700, fontSize: 15, color: "var(--text)", marginTop: 6 }}>{p.label}</div>
                           <div style={{ fontSize: 14, color: "var(--text3)", marginTop: 4, lineHeight: 1.5 }}>{p.desc}</div>
                           <div style={{ fontSize: 11, color: "var(--cyan)", marginTop: 8, fontFamily: "var(--font-mono)" }}>PL{p.paranoia_level} · thr {p.anomaly_threshold}</div>
@@ -512,10 +513,10 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                   {form.front_https && (
                     <div style={{ display: "grid", gridTemplateColumns: "repeat(2,1fr)", gap: 10 }}>
                       {([
-                        ["auto", "⚡ Automatic (ACME)", "Free Let's Encrypt / ZeroSSL cert, auto-renewed"],
-                        ["existing", "📚 From Repository", "Reuse an uploaded cert (e.g. wildcard) — no re-upload"],
-                        ["manual", "📤 Upload New", "Paste your own certificate (saved to the repository)"],
-                        ["off", "🚫 No certificate", "Plain HTTP only (not recommended)"],
+                        ["auto", "Automatic (ACME)", "Free Let's Encrypt / ZeroSSL cert, auto-renewed"],
+                        ["existing", "From Repository", "Reuse an uploaded cert (e.g. wildcard) — no re-upload"],
+                        ["manual", "Upload New", "Paste your own certificate (saved to the repository)"],
+                        ["off", "No certificate", "Plain HTTP only (not recommended)"],
                       ] as const).map(([k, label, desc]) => {
                         const active = form.tls_mode === k;
                         return (
@@ -553,10 +554,10 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                         const uncovered = form.domains.filter(d => !certCoversHost(names, d));
                         return (
                           <InfoBox tone={uncovered.length === 0 && form.domains.length > 0 ? "green" : "amber"}>
-                            🔐 <strong style={{ color: "var(--text2)" }}>{sel.domain}</strong> presents: {names.join(", ")}.<br />
+                            <strong style={{ color: "var(--text2)" }}>{sel.domain}</strong> presents: {names.join(", ")}.<br />
                             {form.domains.length === 0 ? "Add domains in Basics to check coverage." : <>
-                              {covered.length > 0 && <>✅ Covers: <strong style={{ color: "var(--green)" }}>{covered.join(", ")}</strong>. </>}
-                              {uncovered.length > 0 && <>⚠️ Not covered: <strong style={{ color: "var(--amber,#ffb020)" }}>{uncovered.join(", ")}</strong> — these will fall back to a self-signed cert.</>}
+                              {covered.length > 0 && <>Covers: <strong style={{ color: "var(--green)" }}>{covered.join(", ")}</strong>. </>}
+                              {uncovered.length > 0 && <>⚠ Not covered: <strong style={{ color: "var(--amber,#ffb020)" }}>{uncovered.join(", ")}</strong> — these will fall back to a self-signed cert.</>}
                             </>}
                           </InfoBox>
                         );
@@ -615,7 +616,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                         <Field label="Credential Item" hint="The DNS provider's API token, as KEY=value."><input className="fin2" value={form.dns_credential} placeholder="CF_TOKEN=…" onChange={e => upd({ dns_credential: e.target.value })} /></Field>
                       </Row>
                     </>)}
-                    <InfoBox>🔐 On deploy we request a certificate for <strong style={{ color: "var(--cyan)" }}>{form.domains.join(", ") || "your domains"}</strong>. If DNS isn&apos;t pointed here yet, the site still deploys and issuance retries automatically.</InfoBox>
+                    <InfoBox>On deploy we request a certificate for <strong style={{ color: "var(--cyan)" }}>{form.domains.join(", ") || "your domains"}</strong>. If DNS isn&apos;t pointed here yet, the site still deploys and issuance retries automatically.</InfoBox>
                   </>)}
 
                   {/* MANUAL */}
@@ -675,7 +676,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                         certificate must likewise have its own certificate in that file.
                       </InfoBox>
                     )}
-                    <InfoBox>✅ Traffic to <strong style={{ color: "var(--cyan)" }}>{scheme}://{form.domains[0] || "your-domain"}</strong> will be proxied to <strong style={{ color: "var(--cyan)" }}>{primary.tls ? "https" : "http"}://{primary.host || "host"}:{primary.port || "port"}</strong>. Need load balancing or health checks? Switch to <strong>Advanced</strong>.</InfoBox>
+                    <InfoBox>Traffic to <strong style={{ color: "var(--cyan)" }}>{scheme}://{form.domains[0] || "your-domain"}</strong> will be proxied to <strong style={{ color: "var(--cyan)" }}>{primary.tls ? "https" : "http"}://{primary.host || "host"}:{primary.port || "port"}</strong>. Need load balancing or health checks? Switch to <strong>Advanced</strong>.</InfoBox>
                   </>) : (<>
                     <Field label="Load Balancing" hint="Strategy across upstream servers">
                       <select className="fin2 fsel2" value={form.lb} onChange={e => upd({ lb: e.target.value as SiteForm["lb"] })}>
@@ -693,7 +694,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                         <Field label="Port" hint="The port your application listens on."><input className="fin2" type="number" value={s.port} onChange={e => setServer(i, { port: Number(e.target.value) })} /></Field>
                         <Field label="Weight" hint="Relative share of traffic when several origins are listed. Equal weights spread evenly."><input className="fin2" type="number" value={s.weight} onChange={e => setServer(i, { weight: Number(e.target.value) })} /></Field>
                         <div style={{ display: "flex", flexDirection: "column", gap: 4, alignItems: "center" }}><label className="flbl2">TLS</label><Sw on={s.tls} set={v => setServer(i, { tls: v })} /></div>
-                        <button className="btn bg-btn btn-sm" type="button" disabled={form.servers.length === 1} onClick={() => rmServer(i)} style={{ opacity: form.servers.length === 1 ? 0.4 : 1 }}>🗑</button>
+                        <button className="btn bg-btn btn-sm" type="button" disabled={form.servers.length === 1} onClick={() => rmServer(i)} style={{ opacity: form.servers.length === 1 ? 0.4 : 1 }}><Icon name="trash" size={14} title="Remove" /></button>
                       </div>
                     ))}
                     <button className="btn bg-btn btn-sm" type="button" onClick={addServer} style={{ alignSelf: "flex-start" }}>＋ Add Server</button>
@@ -741,7 +742,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                   </Row>
                   <SectionToggle label="Per-IP Rate Limiting" desc={`${form.rl_per_ip.rps} req/s · burst ${form.rl_per_ip.burst}`} on={form.rate_limit_enabled} set={v => upd({ rate_limit_enabled: v })} />
                   <SectionToggle label="Bot Detection (JA4 fingerprinting)" desc="Identify automated clients by TLS fingerprint" on={form.bot_ja4} set={v => upd({ bot_ja4: v })} />
-                  <InfoBox>🛡️ All OWASP CRS categories are enabled by this template. Switch to <strong style={{ color: "var(--cyan)" }}>Advanced</strong> to fine-tune rules, antibot, GeoIP, headers, anti-DDoS and ML.</InfoBox>
+                  <InfoBox>All OWASP CRS categories are enabled by this template. Switch to <strong style={{ color: "var(--cyan)" }}>Advanced</strong> to fine-tune rules, antibot, GeoIP, headers, anti-DDoS and ML.</InfoBox>
                 </>)}
 
                 {/* ───────── WAF RULES (advanced) ───────── */}
@@ -795,7 +796,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     <div key={i} style={{ display: "grid", gridTemplateColumns: "1fr 2fr auto", gap: 8, alignItems: "end" }}>
                       <Field label="Rule ID" hint="Numeric CRS or custom rule id to exclude, e.g. 942100."><input className="fin2" type="number" value={ex.rule_id} onChange={e => upd({ rule_exclusions: form.rule_exclusions.map((x, idx) => idx === i ? { ...x, rule_id: Number(e.target.value) } : x) })} /></Field>
                       <Field label="Exclude Targets" hint="comma-separated (e.g. ARGS:id, REQUEST_HEADERS:Referer)"><input className="fin2" value={ex.exclude_targets.join(", ")} onChange={e => upd({ rule_exclusions: form.rule_exclusions.map((x, idx) => idx === i ? { ...x, exclude_targets: e.target.value.split(",").map(t => t.trim()).filter(Boolean) } : x) })} /></Field>
-                      <button className="btn bg-btn btn-sm" type="button" onClick={() => upd({ rule_exclusions: form.rule_exclusions.filter((_, idx) => idx !== i) })}>🗑</button>
+                      <button className="btn bg-btn btn-sm" type="button" onClick={() => upd({ rule_exclusions: form.rule_exclusions.filter((_, idx) => idx !== i) })}><Icon name="trash" size={14} title="Remove" /></button>
                     </div>
                   ))}
                   <button className="btn bg-btn btn-xs" type="button" style={{ alignSelf: "flex-start" }} onClick={() => upd({ rule_exclusions: [...form.rule_exclusions, { rule_id: 0, exclude_targets: [] }] })}>＋ Add Exclusion</button>
@@ -861,7 +862,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                   </>)}
 
                   {!form.jwt_enabled && !form.graphql_enabled && !form.grpc_enabled &&
-                    <InfoBox>🔌 These controls run only for matching traffic (Bearer tokens · GraphQL bodies · <span style={{ color: "var(--cyan)" }}>application/grpc</span>) — enabling them never affects ordinary web requests.</InfoBox>}
+                    <InfoBox>These controls run only for matching traffic (Bearer tokens · GraphQL bodies · <span style={{ color: "var(--cyan)" }}>application/grpc</span>) — enabling them never affects ordinary web requests.</InfoBox>}
                 </>)}
 
                 {/* ───────── RATE & DDOS (advanced) ───────── */}
@@ -924,7 +925,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                       <Field label="Turnstile Secret" hint="Server-side key, used to verify a solved challenge."><SecretInput value={form.bot_turnstile_secret} set={v => upd({ bot_turnstile_secret: v })} /></Field>
                     </Row>
                   )}
-                  {form.bot_challenge === "native_pow" && <InfoBox tone="green">⚙️ Native proof-of-work runs entirely on the WAF — no third-party keys, no external requests, fully on-prem.</InfoBox>}
+                  {form.bot_challenge === "native_pow" && <InfoBox tone="green">Native proof-of-work runs entirely on the WAF — no third-party keys, no external requests, fully on-prem.</InfoBox>}
                 </>)}
 
                 {/* ───────── GEO & IP (advanced) ───────── */}
@@ -963,7 +964,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     <Field label="Block URI Patterns" hint="Substring match"><ChipInput values={form.blacklist_uris} onChange={v => upd({ blacklist_uris: v })} placeholder="/.env" /></Field>
                   </Row>
                   <GroupLabel>External Threat-Intel Feeds <Tag kind="enforced" /></GroupLabel>
-                  <InfoBox>🌐 Auto-refreshed IP blocklists (AbuseIPDB, Spamhaus DROP, FireHOL, …). Loaded at startup and refreshed on the interval — matched IPs are blocked before rules run.</InfoBox>
+                  <InfoBox>Auto-refreshed IP blocklists (AbuseIPDB, Spamhaus DROP, FireHOL, …). Loaded at startup and refreshed on the interval — matched IPs are blocked before rules run.</InfoBox>
                   {form.ip_feeds.map((feed, i) => (
                     <div key={i} style={{ display: "grid", gridTemplateColumns: "2.4fr 0.8fr 0.9fr auto", gap: 8, alignItems: "end" }}>
                       <Field label={`Feed URL #${i + 1}`} hint="HTTP(S) URL of an IP blocklist. Fetched by the data plane on the refresh interval."><input className="fin2" value={feed.url} placeholder="https://iplists.firehol.org/…/firehol_level1.netset" style={{ fontFamily: "var(--font-mono)", fontSize: 13 }} onChange={e => upd({ ip_feeds: form.ip_feeds.map((x, idx) => idx === i ? { ...x, url: e.target.value } : x) })} /></Field>
@@ -974,7 +975,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                           <option value="json">JSON</option>
                         </select>
                       </Field>
-                      <button className="btn bg-btn btn-sm" type="button" onClick={() => upd({ ip_feeds: form.ip_feeds.filter((_, idx) => idx !== i) })}>🗑</button>
+                      <button className="btn bg-btn btn-sm" type="button" onClick={() => upd({ ip_feeds: form.ip_feeds.filter((_, idx) => idx !== i) })}><Icon name="trash" size={14} title="Remove" /></button>
                     </div>
                   ))}
                   <button className="btn bg-btn btn-xs" type="button" style={{ alignSelf: "flex-start" }} onClick={() => upd({ ip_feeds: [...form.ip_feeds, { url: "", interval: "1h", format: "cidr" }] })}>＋ Add Feed</button>
@@ -983,7 +984,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                 {/* ───────── HTTP HEADERS (advanced) ───────── */}
                 {screen === "headers" && (<>
                   <StepHead title="HTTP Headers" sub="Response security headers. The WAF always injects secure defaults; these override per-site." tag="stored" />
-                  <InfoBox>🛡️ Secure defaults (X-Content-Type-Options, X-Frame-Options, X-XSS-Protection) are always applied. The values below override them for this site.</InfoBox>
+                  <InfoBox>Secure defaults (X-Content-Type-Options, X-Frame-Options, X-XSS-Protection) are always applied. The values below override them for this site.</InfoBox>
                   <Field label="Content-Security-Policy" hint="Leave blank to omit CSP"><input className="fin2" value={form.csp} placeholder="default-src 'self'" style={{ fontFamily: "var(--font-mono)", fontSize: 13 }} onChange={e => upd({ csp: e.target.value })} /></Field>
                   <Row>
                     <Field label="Referrer-Policy" hint="How much of the current URL a browser sends when following a link away from this site.">
@@ -1001,13 +1002,13 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     <div key={i} style={{ display: "grid", gridTemplateColumns: "1fr 1.5fr auto", gap: 8, alignItems: "end" }}>
                       <Field label="Name" hint="Header name added to every response from this site."><input className="fin2" value={h.name} placeholder="X-Custom" onChange={e => setHeader(i, { name: e.target.value })} /></Field>
                       <Field label="Value" hint="Value sent with that header."><input className="fin2" value={h.value} onChange={e => setHeader(i, { value: e.target.value })} /></Field>
-                      <button className="btn bg-btn btn-sm" type="button" onClick={() => upd({ custom_headers: form.custom_headers.filter((_, idx) => idx !== i) })}>🗑</button>
+                      <button className="btn bg-btn btn-sm" type="button" onClick={() => upd({ custom_headers: form.custom_headers.filter((_, idx) => idx !== i) })}><Icon name="trash" size={14} title="Remove" /></button>
                     </div>
                   ))}
                   <button className="btn bg-btn btn-xs" type="button" style={{ alignSelf: "flex-start" }} onClick={() => upd({ custom_headers: [...form.custom_headers, { name: "", value: "" }] })}>＋ Add Header</button>
 
                   <GroupLabel>Block Page</GroupLabel>
-                  <InfoBox>🚧 What a blocked visitor sees. The page shows a <strong>Support ID</strong> — paste it into Threat Search to find the exact request, however long ago it was blocked. API clients (anything not asking for HTML) keep getting JSON.</InfoBox>
+                  <InfoBox>What a blocked visitor sees. The page shows a <strong>Support ID</strong> — paste it into Threat Search to find the exact request, however long ago it was blocked. API clients (anything not asking for HTML) keep getting JSON.</InfoBox>
                   <SectionToggle label="Branded block page" desc="Serve an HTML page to browsers instead of raw JSON" on={form.block_page_enabled} set={v => upd({ block_page_enabled: v })} />
                   {form.block_page_enabled && (<>
                     <Field label="Heading" hint="Default: “Request blocked”"><input className="fin2" value={form.block_page_title} placeholder="Request blocked" onChange={e => upd({ block_page_title: e.target.value })} /></Field>
@@ -1021,7 +1022,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                   </>)}
                   <SectionToggle
                     label="Show detection reason to the visitor"
-                    desc="⚠️ Leave OFF in production. The reason names which control fired (rule, threat-intel feed, IP reputation), letting an attacker permute payloads and read back exactly what caught them. Internal/staging sites only."
+                    desc="⚠ Leave OFF in production. The reason names which control fired (rule, threat-intel feed, IP reputation), letting an attacker permute payloads and read back exactly what caught them. Internal/staging sites only."
                     on={form.block_page_show_reason}
                     set={v => upd({ block_page_show_reason: v })}
                   />
@@ -1107,7 +1108,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                   <GroupLabel>Weighted Verdict Fusion</GroupLabel>
                   <SectionToggle label="Weighted fusion + soft LIMIT tier" desc="Combine engine scores with weights; add a 429 LIMIT tier below hard block to cut false positives" on={form.fusion_enabled} set={v => upd({ fusion_enabled: v })} />
                   {form.fusion_enabled && (<>
-                    <InfoBox>⚖️ Each engine&apos;s anomaly score is multiplied by its weight, summed, then compared to the per-paranoia thresholds. Weight 1.0 = neutral; below the block threshold but above the LIMIT threshold returns a soft <strong style={{ color: "var(--cyan)" }}>{form.fusion_limit_status}</strong>.</InfoBox>
+                    <InfoBox>Each engine&apos;s anomaly score is multiplied by its weight, summed, then compared to the per-paranoia thresholds. Weight 1.0 = neutral; below the block threshold but above the LIMIT threshold returns a soft <strong style={{ color: "var(--cyan)" }}>{form.fusion_limit_status}</strong>.</InfoBox>
                     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
                       {FUSION_ENGINES.map(eng => (
                         <Field key={eng.key} label={`${eng.label} × weight`} hint={eng.desc}>
@@ -1198,7 +1199,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
             <div style={{ display: "flex", gap: 8 }}>
               <button className="btn bg-btn" type="button" onClick={step === 0 ? onClose : back}>{step === 0 ? "Cancel" : "← Back"}</button>
               {step < steps.length - 1 && <button className="btn bg-btn" type="button" onClick={next}>Next →</button>}
-              <button className="btn bp" type="button" disabled={saving} onClick={save}>{saving ? <span className="btn-spin" /> : (mode === "edit" ? "💾 Save Changes" : "🚀 Deploy Site")}</button>
+              <button className="btn bp" type="button" disabled={saving} onClick={save}>{saving ? <span className="btn-spin" /> : (mode === "edit" ? "Save Changes" : "Deploy Site")}</button>
             </div>
           </div>
         </div>

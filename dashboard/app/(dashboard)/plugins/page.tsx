@@ -4,6 +4,7 @@ import FirstRunNote from "@/components/ui/FirstRunNote";
 import { motion } from "framer-motion";
 import { api, type Plugin, type CatalogPlugin, type PluginHooks, type PluginPermissions } from "@/lib/api";
 import { staggerContainer, fadeUp } from "@/lib/animations";
+import Icon from "@/components/ui/Icon";
 
 /**
  * This page once rendered a six-entry "WASM Plugin Marketplace" that did not
@@ -225,7 +226,7 @@ export default function PluginsPage() {
             transition: "border-color .15s, background .15s",
           }}
         >
-          <div style={{ fontSize: 26, marginBottom: 8 }}>{uploading ? "⏳" : "📦"}</div>
+          <Icon name={uploading ? "refresh" : "package"} size={26} style={{ marginBottom: 8, color: "var(--text3)" }} />
           <div style={{ fontWeight: 600, color: "var(--text)" }}>
             {uploading
               ? "Validating and installing…"
@@ -317,7 +318,7 @@ export default function PluginsPage() {
                   <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", alignItems: "flex-start" }}>
                     <div style={{ minWidth: 0 }}>
                       <div style={{ fontWeight: 700, color: "var(--text)", display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-                        📦 {entry.name}
+                        {entry.name}
                         <span className="bdg bgr">v{entry.version}</span>
                         {entry.installed && <span className={`bdg ${entry.installed_enabled ? "bgg" : "ba"}`}>{entry.installed_enabled ? "ACTIVE" : `INSTALLED v${entry.installed_version}`}</span>}
                       </div>

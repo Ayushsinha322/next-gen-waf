@@ -6,6 +6,7 @@ import { motion } from "framer-motion";
 import { login, clearSessionCookie, MfaRequiredError } from "@/lib/auth";
 import { spring } from "@/lib/animations";
 import ChunkRecovery from "@/components/layout/ChunkRecovery";
+import Icon from "@/components/ui/Icon";
 
 type AuthTab  = "std" | "sso" | "api";
 type BtnState = "idle" | "loading" | "success";
@@ -336,7 +337,7 @@ export default function LoginPage() {
                 value={email}
                 onChange={e => setEmail(e.target.value)}
               />
-              <span className="fi-icon">✉</span>
+              <span className="fi-icon"><Icon name="mail" size={15} /></span>
             </div>
           </div>
 
@@ -354,7 +355,7 @@ export default function LoginPage() {
                 onKeyDown={e => { if (e.key === "Enter") doLogin(); }}
               />
               <button className="fi-icon" onClick={() => setShowPwd(p => !p)}>
-                {showPwd ? "🙈" : "👁️"}
+                <Icon name={showPwd ? "eye-off" : "eye"} size={16} />
               </button>
             </div>
           </div>
@@ -376,7 +377,7 @@ export default function LoginPage() {
                   onKeyDown={e => { if (e.key === "Enter") doLogin(); }}
                   style={{ letterSpacing: ".14em", fontFamily: "var(--font-mono)" }}
                 />
-                <span className="fi-icon">🔐</span>
+                <span className="fi-icon"><Icon name="lock" size={15} /></span>
               </div>
               <div style={{ fontSize: 12, color: "var(--text3)", marginTop: 6 }}>
                 Two-factor authentication is on for this account. Enter the code from your authenticator app.
@@ -409,7 +410,7 @@ export default function LoginPage() {
             whileHover={btnState === "idle" ? { scale: 1.02, y: -1 } : {}}
             whileTap={btnState === "idle" ? { scale: 0.98 } : {}}
           >
-            {btnState === "idle"    && `🔐 Sign in to ${PRODUCT_NAME}`}
+            {btnState === "idle"    && `Sign in to ${PRODUCT_NAME}`}
             {btnState === "loading" && <><span className="btn-spin" /> Authenticating...</>}
             {btnState === "success" && "✓ Access granted"}
           </motion.button>

@@ -5,6 +5,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { motion } from "framer-motion";
 import { api } from "@/lib/api";
 import { logout } from "@/lib/auth";
+import Icon from "@/components/ui/Icon";
 
 /** Mirrors the server's rule (control-plane validatePassword). Checked here only
  *  to give immediate feedback — the server is the authority and re-checks. */
@@ -109,7 +110,7 @@ function ResetPasswordForm() {
             />
             <button type="button" className="fi-icon" onClick={() => setShow(s => !s)}
               aria-label={show ? "Hide password" : "Show password"}>
-              {show ? "🙈" : "👁️"}
+              <Icon name={show ? "eye-off" : "eye"} size={16} />
             </button>
           </div>
           {localProblem && <div style={inlineHint}>{localProblem}</div>}

@@ -36,11 +36,11 @@ export default function JobsPage() {
     setBusy(j.name);
     try {
       const r = await api.jobs.run(j.name);
-      if (r.ok) showToast(`${j.name}: ${r.job.last_note || "done"} (${r.job.last_duration_ms} ms)`, "s", "▶");
-      else showToast(`${j.name} failed: ${r.job?.last_error || r.error || "unknown"}`, "e", "⚠️");
+      if (r.ok) showToast(`${j.name}: ${r.job.last_note || "done"} (${r.job.last_duration_ms} ms)`, "s");
+      else showToast(`${j.name} failed: ${r.job?.last_error || r.error || "unknown"}`, "e");
       await load();
     } catch (e) {
-      showToast(`Could not run ${j.name}: ${e instanceof Error ? e.message : String(e)}`, "e", "⚠️");
+      showToast(`Could not run ${j.name}: ${e instanceof Error ? e.message : String(e)}`, "e");
     } finally { setBusy(null); }
   }
 
@@ -50,7 +50,7 @@ export default function JobsPage() {
     <motion.div className="sec" variants={staggerContainer} initial="hidden" animate="visible">
       <motion.div variants={fadeUp} style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 14 }}>
         <div>
-          <div className="sec-title">⚙️ System Jobs</div>
+          <div className="sec-title">System Jobs</div>
           <div className="sec-sub">
             Background work on the control plane and the data plane · last run, outcome, next due
             {data && ` · this control-plane node is the ${data.node.role}${data.node.runs_jobs ? "" : " — jobs run on the leader"}`}

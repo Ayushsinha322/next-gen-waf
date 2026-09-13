@@ -89,7 +89,7 @@ func sendSlack(ctx context.Context, ch Channel, a Alert) error {
 		"attachments": []map[string]interface{}{{
 			"fallback": fmt.Sprintf("[%s] %s", strings.ToUpper(a.Severity), a.Summary),
 			"color":    color,
-			"title":    "🛡️ Sentinel WAF Alert",
+			"title":    "Sentinel WAF Alert",
 			"text":     a.Summary,
 			"fields":   fields,
 			"ts":       a.CreatedAt.Unix(),

@@ -8,6 +8,7 @@ import { api, type UserRow, type APIKeyRow, type NotificationChannel, type Chann
 import { staggerContainer, fadeUp, spring, tweenFast } from "@/lib/animations";
 import { logout, getUser } from "@/lib/auth";
 import { PRODUCT_NAME } from "@/lib/version";
+import Icon from "@/components/ui/Icon";
 
 const TABS = ["General","Auth & SSO","API Keys","Users & RBAC","Cluster","Notifications","Management TLS"];
 
@@ -30,7 +31,7 @@ export default function SettingsPage() {
     <motion.div className="sec" variants={staggerContainer} initial="hidden" animate="visible">
       <motion.div variants={fadeUp} style={{ display:"flex", alignItems:"flex-start", justifyContent:"space-between", gap:14 }}>
         <div>
-          <div className="sec-title">⚙️ Settings</div>
+          <div className="sec-title">Settings</div>
           <div className="sec-sub">System configuration · Authentication · Team management · Cluster</div>
         </div>
       </motion.div>
@@ -270,12 +271,12 @@ function APIKeysTab() {
   useEffect(() => {
     api.admin.apikeys.list()
       .then(r => setKeys(r.api_keys ?? []))
-      .catch(() => showToast("Failed to load API keys","e","⚠️"))
+      .catch(() => showToast("Failed to load API keys","e"))
       .finally(() => setLoading(false));
   }, []);
 
   async function generate() {
-    if (!newName.trim()) { showToast("Key name required","w","⚠️"); return; }
+    if (!newName.trim()) { showToast("Key name required","w"); return; }
     setCreating(true);
     try {
       // The API takes `scopes` as an array and a separate `role`. The picker
@@ -287,7 +288,7 @@ function APIKeysTab() {
       setRevealKey(res.api_key.key);
       setKeys(prev => [res.api_key as unknown as APIKeyRow, ...prev]);
       setNewName(""); setNewScope("read:all");
-    } catch { showToast("Failed to generate key","e","⚠️"); }
+    } catch { showToast("Failed to generate key","e"); }
     finally { setCreating(false); }
   }
 
@@ -296,14 +297,14 @@ function APIKeysTab() {
     try {
       await api.admin.apikeys.revoke(id);
       setKeys(prev => prev.filter(k => k.id !== id));
-      showToast(`Key "${name}" revoked`,"s","🔑");
-    } catch { showToast("Failed to revoke","e","⚠️"); }
+      showToast(`Key "${name}" revoked`,"s");
+    } catch { showToast("Failed to revoke","e"); }
   }
 
   return (
     <motion.div className="panel" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={tweenFast}>
       <div className="ph">
-        <div className="ptitle">🔑 API Keys</div>
+        <div className="ptitle">API Keys</div>
         <motion.button className="btn bp btn-sm" onClick={() => { setShowCreate(s=>!s); setRevealKey(null); }} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
           {showCreate ? "✕ Cancel" : "＋ Generate Key"}
         </motion.button>
@@ -322,14 +323,14 @@ function APIKeysTab() {
               </select></div>
           </div>
           <motion.button className="btn bp btn-sm" style={{marginTop:10}} onClick={generate} disabled={creating} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
-            {creating ? "Generating…" : "🔑 Generate"}
+            {creating ? "Generating…" : "Generate"}
           </motion.button>
           {revealKey && (
             <div className="code-block" style={{marginTop:10}}>
               <div style={{color:"var(--amber)",fontSize: 14,marginBottom:4}}>⚠ Copy now — shown only once</div>
               <code style={{color:"var(--green)",wordBreak:"break-all"}}>{revealKey}</code>
               <motion.button className="btn bg-btn btn-xs" style={{marginLeft:8}}
-                onClick={() => { navigator.clipboard?.writeText(revealKey); showToast("Copied!","s","📋"); }} whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.96 }}>Copy</motion.button>
+                onClick={() => { navigator.clipboard?.writeText(revealKey); showToast("Copied!","s"); }} whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.96 }}>Copy</motion.button>
             </div>
           )}
         </div>
@@ -378,7 +379,7 @@ function UsersTab() {
   const loadUsers = () =>
     api.admin.users.list()
       .then(r => setUsers(r.users ?? []))
-      .catch(() => showToast("Failed to load users","e","⚠️"))
+      .catch(() => showToast("Failed to load users","e"))
       .finally(() => setLoading(false));
 
   useEffect(() => {
@@ -392,12 +393,12 @@ function UsersTab() {
     setResetting(id);
     try {
       const res = await api.admin.users.sendResetLink(id);
-      showToast(res.message ?? `Reset link sent to ${email}`, "s", "✉️");
+      showToast(res.message ?? `Reset link sent to ${email}`, "s");
     } catch (e) {
       // The API says exactly what is wrong (SMTP unset, no public URL, relay
       // refused). Passing it through is the difference between an operator
       // fixing it in a minute and filing a bug.
-      showToast(e instanceof Error ? e.message : "Could not send reset link", "e", "⚠️");
+      showToast(e instanceof Error ? e.message : "Could not send reset link", "e");
     } finally { setResetting(null); }
   }
 
@@ -410,18 +411,18 @@ function UsersTab() {
   // as `required,min=12`, so every attempt was rejected 400 and the catch below
   // reported a flat "Failed to invite user", hiding the reason.
   async function invite() {
-    if (!invEmail.trim()) { showToast("Email required","w","⚠️"); return; }
-    if (invPass.length < 12) { showToast("Password must be at least 12 characters","w","⚠️"); return; }
+    if (!invEmail.trim()) { showToast("Email required","w"); return; }
+    if (invPass.length < 12) { showToast("Password must be at least 12 characters","w"); return; }
     setInviting(true);
     try {
       const res = await api.admin.users.create({ email:invEmail, name:invName, role:invRole, password:invPass });
       setUsers(prev => [res.user, ...prev]);
       setShowInvite(false); setInvEmail(""); setInvName(""); setInvPass("");
-      showToast(res.message ?? "User created","s","✅");
+      showToast(res.message ?? "User created","s");
     } catch (e) {
       // Surface what the API actually said. A generic message here is what let a
       // permanently-failing form look like an intermittent glitch.
-      showToast(e instanceof Error ? e.message : "Failed to create user","e","⚠️");
+      showToast(e instanceof Error ? e.message : "Failed to create user","e");
     }
     finally { setInviting(false); }
   }
@@ -465,7 +466,7 @@ function UsersTab() {
 
     <motion.div className="panel" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={tweenFast}>
       <div className="ph">
-        <div className="ptitle">👥 Team Members</div>
+        <div className="ptitle">Team Members</div>
         <motion.button className="btn bp btn-sm" onClick={() => setShowInvite(s=>!s)} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
           {showInvite ? "✕ Cancel" : "＋ Add User"}
         </motion.button>
@@ -494,7 +495,7 @@ function UsersTab() {
             you can email them a reset link from the table below.
           </div>
           <motion.button className="btn bp btn-sm" style={{marginTop:10}} onClick={invite} disabled={inviting} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
-            {inviting ? "Creating…" : "✅ Create User"}
+            {inviting ? "Creating…" : "Create User"}
           </motion.button>
         </div>
       )}
@@ -522,7 +523,7 @@ function UsersTab() {
                         : `Email ${u.email} a single-use reset link`}
                       onClick={() => sendReset(u.id, u.email)}
                     >
-                      {resetting === u.id ? "Sending…" : "✉️ Send reset link"}
+                      {resetting === u.id ? "Sending…" : "Send reset link"}
                     </button>
                   </td>
                 </motion.tr>
@@ -569,7 +570,7 @@ function TwoFactorCard({ users, onChanged }: { users: UserRow[]; onChanged: () =
       setEnrolling({ secret: r.secret, uri: r.otpauth_uri, qr });
       setCode("");
     } catch (e) {
-      showToast(`Could not start enrolment: ${e instanceof Error ? e.message : String(e)}`, "e", "⚠️");
+      showToast(`Could not start enrolment: ${e instanceof Error ? e.message : String(e)}`, "e");
     } finally { setBusy(false); }
   }
   async function confirm() {
@@ -577,11 +578,11 @@ function TwoFactorCard({ users, onChanged }: { users: UserRow[]; onChanged: () =
     setBusy(true);
     try {
       await api.auth.mfaConfirm(enrolling.secret, code.trim());
-      showToast("Two-factor authentication is on. You will be asked for a code at every sign-in.", "s", "🔐");
+      showToast("Two-factor authentication is on. You will be asked for a code at every sign-in.", "s");
       setEnrolling(null); setCode("");
       await onChanged();
     } catch (e) {
-      showToast(`Not activated: ${e instanceof Error ? e.message : String(e)}`, "e", "⚠️");
+      showToast(`Not activated: ${e instanceof Error ? e.message : String(e)}`, "e");
     } finally { setBusy(false); }
   }
   async function disable() {
@@ -589,18 +590,18 @@ function TwoFactorCard({ users, onChanged }: { users: UserRow[]; onChanged: () =
     setBusy(true);
     try {
       await api.auth.mfaDisable(code.trim());
-      showToast("Two-factor authentication is off for your account.", "s", "🔓");
+      showToast("Two-factor authentication is off for your account.", "s");
       setDisabling(false); setCode("");
       await onChanged();
     } catch (e) {
-      showToast(`Not disabled: ${e instanceof Error ? e.message : String(e)}`, "e", "⚠️");
+      showToast(`Not disabled: ${e instanceof Error ? e.message : String(e)}`, "e");
     } finally { setBusy(false); }
   }
 
   return (
     <motion.div className="panel" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={tweenFast}>
       <div className="ph">
-        <div className="ptitle">🔐 Two-factor authentication</div>
+        <div className="ptitle">Two-factor authentication</div>
         {enabled === null ? <span className="td3" style={{ fontSize: 12.5 }}>—</span>
           : <span className={`bdg ${enabled ? "bgg" : "ba"}`}>{enabled ? "ON · TOTP" : "OFF"}</span>}
       </div>
@@ -613,7 +614,7 @@ function TwoFactorCard({ users, onChanged }: { users: UserRow[]; onChanged: () =
 
         {enabled === false && !enrolling && (
           <div><motion.button className="btn bp btn-sm" disabled={busy} onClick={startEnrol} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
-            {busy ? "…" : "🔐 Turn on two-factor"}
+            {busy ? "…" : "Turn on two-factor"}
           </motion.button></div>
         )}
 
@@ -628,7 +629,7 @@ function TwoFactorCard({ users, onChanged }: { users: UserRow[]; onChanged: () =
               <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
                 <input className="fin2" inputMode="numeric" pattern="[0-9]*" maxLength={8} placeholder="123 456" value={code}
                   onChange={e => setCode(e.target.value.replace(/\s+/g, ""))} onKeyDown={e => { if (e.key === "Enter") confirm(); }} style={{ width: 140, fontFamily: "var(--font-mono)", letterSpacing: ".12em" }} />
-                <motion.button className="btn bp btn-sm" disabled={busy || code.trim().length < 6} onClick={confirm} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>{busy ? "…" : "✅ Activate"}</motion.button>
+                <motion.button className="btn bp btn-sm" disabled={busy || code.trim().length < 6} onClick={confirm} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>{busy ? "…" : "Activate"}</motion.button>
                 <button className="btn bg-btn btn-sm" onClick={() => { setEnrolling(null); setCode(""); }}>Cancel</button>
               </div>
             </div>
@@ -667,20 +668,20 @@ function ChangePasswordCard() {
     setBusy(true);
     try {
       const res = await api.auth.changePassword(cur, next);
-      showToast(res.message ?? "Password updated", "s", "🔐");
+      showToast(res.message ?? "Password updated", "s");
       setCur(""); setNext(""); setConfirm("");
       // Every session just died, including this tab's. Send the user to sign in
       // again instead of letting the next request fail mysteriously.
       setTimeout(() => { logout(); window.location.href = "/login"; }, 1600);
     } catch (e) {
-      showToast(e instanceof Error ? e.message : "Could not change password", "e", "⚠️");
+      showToast(e instanceof Error ? e.message : "Could not change password", "e");
     } finally { setBusy(false); }
   }
 
   return (
     <motion.div className="panel" style={{ marginBottom: 14 }}
       initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={tweenFast}>
-      <div className="ph"><div className="ptitle">🔐 Your password</div></div>
+      <div className="ph"><div className="ptitle">Your password</div></div>
       <div className="pb">
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
           <div className="fg2"><label className="flbl2">Current password *</label>
@@ -700,7 +701,7 @@ function ChangePasswordCard() {
         </div>
         <motion.button className="btn bp btn-sm" style={{ marginTop: 10 }} onClick={submit}
           disabled={!ready} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
-          {busy ? "Updating…" : "🔐 Change password"}
+          {busy ? "Updating…" : "Change password"}
         </motion.button>
       </div>
     </motion.div>
@@ -742,7 +743,7 @@ function ClusterTab() {
   return (
     <motion.div className="panel" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={tweenFast}>
       <div className="ph">
-        <div className="ptitle">⚡ Cluster Status</div>
+        <div className="ptitle">Cluster Status</div>
         {headBadge}
       </div>
       <div className="pb">
@@ -771,7 +772,7 @@ function ClusterTab() {
               </div>
             ) : (
               <div style={{ padding: "18px 12px", textAlign: "center", marginBottom: 14 }}>
-                <div style={{ fontSize: 26, marginBottom: 6 }}>🧩</div>
+                <Icon name="puzzle" size={26} style={{ marginBottom: 6, color: "var(--text3)" }} />
                 <div style={{ fontSize: 15, fontWeight: 700, color: "var(--text2)", marginBottom: 4 }}>Standalone — HA not enabled</div>
                 <div className="srd">Running a single control-plane node. Add replicas for spare capacity — write leadership fails over via a Postgres advisory lock, with no quorum to maintain.</div>
               </div>
@@ -804,11 +805,11 @@ function ClusterTab() {
   );
 }
 
-const CHANNEL_META: Record<ChannelType, { label: string; icon: string; blurb: string }> = {
-  webhook: { label: "Webhook", icon: "🔗", blurb: "POST signed JSON to any HTTP endpoint (SIEM, SOAR, custom)" },
-  slack:   { label: "Slack",   icon: "💬", blurb: "Slack incoming-webhook formatted message" },
-  syslog:  { label: "Syslog",  icon: "📜", blurb: "RFC 5424 over UDP/TCP to a syslog collector" },
-  cef:     { label: "CEF",     icon: "🛰️", blurb: "ArcSight Common Event Format over syslog (SIEM)" },
+const CHANNEL_META: Record<ChannelType, { label: string; blurb: string }> = {
+  webhook: { label: "Webhook", blurb: "POST signed JSON to any HTTP endpoint (SIEM, SOAR, custom)" },
+  slack:   { label: "Slack",   blurb: "Slack incoming-webhook formatted message" },
+  syslog:  { label: "Syslog",  blurb: "RFC 5424 over UDP/TCP to a syslog collector" },
+  cef:     { label: "CEF",     blurb: "ArcSight Common Event Format over syslog (SIEM)" },
 };
 const SEVERITIES: Severity[] = ["info", "low", "medium", "high", "critical"];
 
@@ -827,7 +828,7 @@ function NotificationsTab() {
   async function load() {
     setLoading(true);
     try { setChannels((await api.notifications.list()).channels ?? []); }
-    catch { showToast("Failed to load channels", "e", "⚠️"); }
+    catch { showToast("Failed to load channels", "e"); }
     finally { setLoading(false); }
   }
   useEffect(() => { load(); }, []);
@@ -844,33 +845,33 @@ function NotificationsTab() {
   }
 
   async function create() {
-    if (!formValid()) { showToast("Fill in the required fields", "e", "⚠️"); return; }
+    if (!formValid()) { showToast("Fill in the required fields", "e"); return; }
     setBusy("new");
     try {
       await api.notifications.create({ name: form.name.trim(), type: form.type, config: buildConfig(), min_severity: form.min_severity });
-      showToast("Channel added", "s", "🔔");
+      showToast("Channel added", "s");
       setForm({ ...emptyForm }); setAdding(false); await load();
-    } catch (e) { showToast(e instanceof Error ? e.message : "Create failed", "e", "⚠️"); }
+    } catch (e) { showToast(e instanceof Error ? e.message : "Create failed", "e"); }
     finally { setBusy(null); }
   }
   async function test(id: string) {
     setBusy(id);
-    try { const r = await api.notifications.test(id); showToast(r.ok ? "✓ Test alert delivered" : "Delivery failed", r.ok ? "s" : "e", r.ok ? "✅" : "⚠️"); await load(); }
-    catch (e) { showToast(e instanceof Error ? e.message : "Delivery failed", "e", "⚠️"); await load(); }
+    try { const r = await api.notifications.test(id); showToast(r.ok ? "✓ Test alert delivered" : "Delivery failed", r.ok ? "s" : "e"); await load(); }
+    catch (e) { showToast(e instanceof Error ? e.message : "Delivery failed", "e"); await load(); }
     finally { setBusy(null); }
   }
   async function toggle(ch: NotificationChannel) {
     setBusy(ch.id);
     // Re-throw so the optimistic <Toggle> rolls back when the save fails.
     try { await api.notifications.update(ch.id, { enabled: !ch.enabled }); await load(); }
-    catch (e) { showToast("Update failed", "e", "⚠️"); throw e; }
+    catch (e) { showToast("Update failed", "e"); throw e; }
     finally { setBusy(null); }
   }
   async function del(ch: NotificationChannel) {
     if (!confirm(`Delete channel "${ch.name}"?`)) return;
     setBusy(ch.id);
-    try { await api.notifications.delete(ch.id); showToast("Channel deleted", "s", "🗑️"); await load(); }
-    catch { showToast("Delete failed", "e", "⚠️"); }
+    try { await api.notifications.delete(ch.id); showToast("Channel deleted", "s"); await load(); }
+    catch { showToast("Delete failed", "e"); }
     finally { setBusy(null); }
   }
 
@@ -879,7 +880,7 @@ function NotificationsTab() {
   return (
     <motion.div className="panel" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={tweenFast}>
       <div className="ph">
-        <div className="ptitle">🔔 Notification Channels</div>
+        <div className="ptitle">Notification Channels</div>
         <motion.button className="btn bc btn-sm" onClick={() => setAdding(a => !a)} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
           {adding ? "✕ Cancel" : "+ Add Channel"}
         </motion.button>
@@ -895,7 +896,7 @@ function NotificationsTab() {
               <div className="fg2"><label className="flbl2">Name</label><input className="fin2" value={form.name} placeholder="prod-soc-webhook" onChange={e => setForm(f => ({ ...f, name: e.target.value }))} /></div>
               <div className="fg2"><label className="flbl2">Type</label>
                 <select className="fin2 fsel2" value={form.type} onChange={e => setForm(f => ({ ...f, type: e.target.value as ChannelType }))}>
-                  {(Object.keys(CHANNEL_META) as ChannelType[]).map(t => <option key={t} value={t}>{CHANNEL_META[t].icon} {CHANNEL_META[t].label}</option>)}
+                  {(Object.keys(CHANNEL_META) as ChannelType[]).map(t => <option key={t} value={t}>{CHANNEL_META[t].label}</option>)}
                 </select>
               </div>
             </div>
@@ -931,7 +932,7 @@ function NotificationsTab() {
         ) : channels.map(ch => (
           <div key={ch.id} className="srow">
             <div style={{ flex: 1, minWidth: 0 }}>
-              <div className="srt">{CHANNEL_META[ch.type]?.icon} {ch.name} <span className="bdg bcy" style={{ marginLeft: 6 }}>{ch.type.toUpperCase()}</span> <span className="bdg" style={{ marginLeft: 4 }}>≥ {ch.min_severity.toUpperCase()}</span></div>
+              <div className="srt">{ch.name} <span className="bdg bcy" style={{ marginLeft: 6 }}>{ch.type.toUpperCase()}</span> <span className="bdg" style={{ marginLeft: 4 }}>≥ {ch.min_severity.toUpperCase()}</span></div>
               <div className="srd" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                 {ch.type === "webhook" || ch.type === "slack" ? ch.config.url : `${ch.config.host}:${ch.config.port}/${ch.config.protocol}`}
                 {ch.last_status && <span style={{ marginLeft: 8, color: ch.last_status === "ok" ? "var(--green)" : "#ef4444" }}>· last: {ch.last_status === "ok" ? "✓ ok" : ch.last_status}</span>}
@@ -940,7 +941,7 @@ function NotificationsTab() {
             <div style={{ display: "flex", gap: 6, alignItems: "center", flexShrink: 0 }}>
               <button className="btn bg-btn btn-xs" disabled={busy === ch.id} onClick={() => test(ch.id)}>{busy === ch.id ? "…" : "Test"}</button>
               <Toggle defaultOn={ch.enabled} onChange={() => toggle(ch)} />
-              <button className="btn bg-btn btn-xs" style={{ color: "#ef4444" }} disabled={busy === ch.id} onClick={() => del(ch)}>🗑️</button>
+              <button className="btn bg-btn btn-xs" style={{ color: "#ef4444" }} disabled={busy === ch.id} onClick={() => del(ch)}><Icon name="trash" size={13} title="Delete channel" /></button>
             </div>
           </div>
         ))}
@@ -975,7 +976,7 @@ function ManagementTLSTab() {
   async function load() {
     setLoading(true);
     try { setInfo(await api.managementTls.get()); }
-    catch { showToast("Failed to load management TLS", "e", "⚠️"); }
+    catch { showToast("Failed to load management TLS", "e"); }
     finally { setLoading(false); }
   }
   useEffect(() => { load(); }, []);
@@ -985,7 +986,7 @@ function ManagementTLSTab() {
   const daysLeft = (u?: number) => (u ? Math.floor((u * 1000 - Date.now()) / 86_400_000) : null);
 
   async function upload() {
-    if (!cert.trim() || !pkey.trim()) { showToast("Paste both the certificate and the private key", "e", "⚠️"); return; }
+    if (!cert.trim() || !pkey.trim()) { showToast("Paste both the certificate and the private key", "e"); return; }
     setBusy("upload"); setWarnings([]);
     try {
       const r = await api.managementTls.upload({
@@ -995,19 +996,19 @@ function ManagementTLSTab() {
         expected_host: host.trim() || undefined,
       });
       setWarnings(r.warnings ?? []);
-      showToast("Management certificate installed — applies on the next connection", "s", "🔐");
+      showToast("Management certificate installed — applies on the next connection", "s");
       setCert(""); setPkey(""); setCa("");
       await load();
     } catch (e) {
-      showToast(e instanceof Error ? e.message : "Upload failed", "e", "⛔");
+      showToast(e instanceof Error ? e.message : "Upload failed", "e");
     } finally { setBusy(null); }
   }
 
   async function revert() {
     if (!confirm("Revert to the self-signed default management certificate?")) return;
     setBusy("revert");
-    try { await api.managementTls.revert(); showToast("Reverted to self-signed default", "s", "↩️"); await load(); }
-    catch { showToast("Revert failed", "e", "⚠️"); }
+    try { await api.managementTls.revert(); showToast("Reverted to self-signed default", "s"); await load(); }
+    catch { showToast("Revert failed", "e"); }
     finally { setBusy(null); }
   }
 
@@ -1015,10 +1016,10 @@ function ManagementTLSTab() {
   return (
     <motion.div className="panel" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={tweenFast}>
       <div className="ph">
-        <div className="ptitle">🔐 Management Console Certificate</div>
+        <div className="ptitle">Management Console Certificate</div>
         {info && !info.self_signed && (
           <motion.button className="btn bg-btn btn-sm" disabled={busy === "revert"} onClick={revert}
-            whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>↩️ Revert to self-signed</motion.button>
+            whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>↩ Revert to self-signed</motion.button>
         )}
       </div>
       <div className="pb">
@@ -1033,7 +1034,7 @@ function ManagementTLSTab() {
         ) : info?.self_signed ? (
           <div className="panel" style={{ background: "rgba(245,158,11,.08)", borderColor: "var(--amber)" }}>
             <div className="pb">
-              <b>⚠️ Self-signed default in use</b>
+              <b>⚠ Self-signed default in use</b>
               <div className="sec-sub">
                 Browsers warn until you install a trusted certificate below (or import the Sentinel root CA from
                 the Certificates page). Traffic is encrypted either way.
@@ -1051,7 +1052,7 @@ function ManagementTLSTab() {
               <MgmtField label="Fingerprint (SHA-256)" value={info?.fingerprint} mono />
             </div>
             {d !== null && d <= 30 && (
-              <div style={{ color: "var(--red)", fontSize: 15, marginTop: 8 }}>⚠️ Expires in {d} day(s) — plan a rotation.</div>
+              <div style={{ color: "var(--red)", fontSize: 15, marginTop: 8 }}>⚠ Expires in {d} day(s) — plan a rotation.</div>
             )}
           </>
         )}
@@ -1073,7 +1074,7 @@ function ManagementTLSTab() {
             <input className="fin2" value={host} placeholder="172.16.21.71" onChange={e => setHost(e.target.value)} /></div>
 
           <div className="sec-sub" style={{ fontSize: 14, margin: "4px 0 10px" }}>
-            🔒 The key is validated (matches the cert, in-date, has a SAN), stored only on the WAF node, and is
+            The key is validated (matches the cert, in-date, has a SAN), stored only on the WAF node, and is
             never written to the database, logged, or shown again.
           </div>
 
@@ -1087,7 +1088,7 @@ function ManagementTLSTab() {
           )}
 
           <button className="btn bp btn-sm" disabled={busy === "upload"} onClick={upload}>
-            {busy === "upload" ? "Validating…" : "🔐 Validate & Install"}
+            {busy === "upload" ? "Validating…" : "Validate & Install"}
           </button>
         </div>
       </div>

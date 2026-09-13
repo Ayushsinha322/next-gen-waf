@@ -1,4 +1,5 @@
 "use client";
+import Icon, { type IconName } from "@/components/ui/Icon";
 /**
  * Audit Log — tamper-evident, HMAC-chained activity trail from the control
  * plane (audit_logs table). Real data via GET /api/v1/audit. Compliance/
@@ -12,18 +13,18 @@ import { api, type AuditEntry, type AuditVerifyResult } from "@/lib/api";
 import { staggerContainer, cardVariants, fadeUp } from "@/lib/animations";
 
 // Coarse category + icon from the dot-notation action (e.g. "site.create").
-function actionMeta(action: string): { icon: string; cls: string } {
+function actionMeta(action: string): { icon: IconName; cls: string } {
   const head = action.split(".")[0];
   switch (head) {
-    case "site":         return { icon: "🌐", cls: "bcy" };
-    case "rule":         return { icon: "📜", cls: "bcy" };
-    case "notification": return { icon: "🔔", cls: "ba" };
-    case "alert":        return { icon: "🔴", cls: "br" };
-    case "user":         return { icon: "👤", cls: "bgr" };
-    case "apikey":       return { icon: "🔑", cls: "ba" };
-    case "auth":         return { icon: "🔓", cls: "bgr" };
-    case "cert":         return { icon: "🔐", cls: "bgg" };
-    default:             return { icon: "•",  cls: "bgr" };
+    case "site":         return { icon: "globe", cls: "bcy" };
+    case "rule":         return { icon: "file-text", cls: "bcy" };
+    case "notification": return { icon: "bell", cls: "ba" };
+    case "alert":        return { icon: "alert-circle", cls: "br" };
+    case "user":         return { icon: "user", cls: "bgr" };
+    case "apikey":       return { icon: "key", cls: "ba" };
+    case "auth":         return { icon: "unlock", cls: "bgr" };
+    case "cert":         return { icon: "lock", cls: "bgg" };
+    default:             return { icon: "info", cls: "bgr" };
   }
 }
 
@@ -50,7 +51,7 @@ export default function AuditPage() {
     } catch (e) {
       setEntries([]);
       setLoadError(e instanceof Error ? e.message : "audit log unavailable");
-      showToast("Failed to load audit log", "e", "⚠️");
+      showToast("Failed to load audit log", "e");
     } finally { setLoading(false); }
   }
 
@@ -60,7 +61,7 @@ export default function AuditPage() {
       const r = await api.audit.verify();
       setVerify(r);
       showToast(r.verified ? "Audit chain verified" : "Audit chain DID NOT verify",
-                r.verified ? "s" : "e", r.verified ? "🔒" : "🚨");
+                r.verified ? "s" : "e");
     } catch (e) {
       // A throw means the chain did not verify (409) or the check could not run
       // (503). Either way the honest state is "not verified" — never "unknown,
@@ -68,7 +69,7 @@ export default function AuditPage() {
       setVerify({ verified: false, checked: 0, altered: [], chain_broken: [],
                   seq_gaps: [], unchained_rows: 0,
                   error: e instanceof Error ? e.message : "verification failed" });
-      showToast("Audit chain verification failed", "e", "🚨");
+      showToast("Audit chain verification failed", "e");
     } finally { setVerifying(false); }
   }
   useEffect(() => { load(); }, []);
@@ -87,7 +88,7 @@ export default function AuditPage() {
     <motion.div className="sec" variants={staggerContainer} initial="hidden" animate="visible">
       <motion.div variants={fadeUp} style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 14 }}>
         <div>
-          <div className="sec-title">📋 Audit Log</div>
+          <div className="sec-title">Audit Log</div>
           <div className="sec-sub">
             HMAC-chained activity trail · {entries.length} recent events ·{" "}
             {verify === null
@@ -103,7 +104,7 @@ export default function AuditPage() {
           <motion.button className="btn bg-btn btn-sm" onClick={runVerify} disabled={verifying}
             title="Recompute every row's HMAC and check the chain for gaps or reordering"
             whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
-            {verifying ? "Verifying…" : "🔒 Verify chain"}
+            {verifying ? "Verifying…" : "Verify chain"}
           </motion.button>
           <motion.button className="btn bg-btn btn-sm" onClick={load} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>⟳ Refresh</motion.button>
         </div>
@@ -114,7 +115,7 @@ export default function AuditPage() {
           <div className="ptitle">Activity ({filtered.length})</div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
             <div style={{ position: "relative" }}>
-              <span style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", color: "var(--text3)", fontSize: 14, pointerEvents: "none" }}>🔍</span>
+              <span style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", color: "var(--text3)", fontSize: 14, pointerEvents: "none" }}><Icon name="search" size={14} /></span>
               <input className="fi2" type="text" placeholder="Search actions, IPs…" style={{ width: 200 }} value={search} onChange={e => setSearch(e.target.value)} />
             </div>
             <select className="fsel" value={kind} onChange={e => setKind(e.target.value)}>
@@ -135,7 +136,7 @@ export default function AuditPage() {
               <div style={{ marginTop: 8, color: "var(--text3)" }}>{loadError}</div>
             </div>
           ) : filtered.length === 0 ? (
-            <EmptyState icon="🧾" title="No audit events yet" hint="Every administrative action — site, rule and channel changes, logins, settings — is written here in a hash-chained log. Make a change and it appears within a second." />
+            <EmptyState icon="file-text" title="No audit events yet" hint="Every administrative action — site, rule and channel changes, logins, settings — is written here in a hash-chained log. Make a change and it appears within a second." />
           ) : (
             <table>
               <thead><tr><th>Time</th><th>Result</th><th>Action</th><th>Target</th><th>Actor</th><th>Source IP</th></tr></thead>
@@ -153,7 +154,7 @@ export default function AuditPage() {
                           {e.result === "FAILURE" ? "FAILURE" : "SUCCESS"}
                         </span>
                       </td>
-                      <td><span className={`bdg ${m.cls}`}>{m.icon} {e.action}</span></td>
+                      <td><span className={`bdg ${m.cls}`}><Icon name={m.icon} size={11} /> {e.action}</span></td>
                       <td className="td2" style={{ maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                         {e.target_kind}{e.target_id ? ` · ${e.target_id.slice(0, 8)}…` : ""}
                       </td>

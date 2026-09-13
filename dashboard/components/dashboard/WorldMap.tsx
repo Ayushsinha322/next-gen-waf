@@ -126,10 +126,9 @@ export default function WorldMap({
       setBlocked(new Set(r.countries ?? []));
       showToast(
         `${name} ${isBlocked ? "unblocked" : "blocked"}${loaded ? " · applies in ~5s" : " · stored (enforces once the country database is downloaded)"}`,
-        "s", isBlocked ? "\u{1F513}" : "\u{1F6AB}",
-      );
+        "s");
       setMenu(null);
-    } catch (err) { showToast(err instanceof Error ? err.message : "Failed", "e", "⚠️"); }
+    } catch (err) { showToast(err instanceof Error ? err.message : "Failed", "e"); }
     finally { setBusy(null); }
   }
 

@@ -71,8 +71,8 @@ export default function BlockedSourcesPage() {
 
   async function act(key: string, fn: () => Promise<void>, ok: string) {
     setBusy(key);
-    try { await fn(); showToast(ok, "s", "🔓"); await load(); }
-    catch (e) { showToast(`Failed: ${e instanceof Error ? e.message : String(e)}`, "e", "⚠️"); }
+    try { await fn(); showToast(ok, "s"); await load(); }
+    catch (e) { showToast(`Failed: ${e instanceof Error ? e.message : String(e)}`, "e"); }
     finally { setBusy(null); }
   }
 
@@ -84,11 +84,11 @@ export default function BlockedSourcesPage() {
     try {
       const expires = newHours && Number(newHours) > 0 ? new Date(Date.now() + Number(newHours) * 3600_000).toISOString() : null;
       await api.threatIntel.create({ type: isCIDR ? "cidr" : "ip", value: v, tier: "block", source: "console", category: newWhy.trim() || "manual", confidence: 100, expires_at: expires });
-      showToast(`${v} is now blocked on every site${expires ? ` until ${new Date(expires).toLocaleString()}` : ""}`, "s", "🛡️");
+      showToast(`${v} is now blocked on every site${expires ? ` until ${new Date(expires).toLocaleString()}` : ""}`, "s");
       setNewVal(""); setNewWhy(""); setNewHours("");
       await load();
     } catch (e) {
-      showToast(`Block failed: ${e instanceof Error ? e.message : String(e)}`, "e", "⚠️");
+      showToast(`Block failed: ${e instanceof Error ? e.message : String(e)}`, "e");
     } finally { setAdding(false); }
   }
 
@@ -161,7 +161,7 @@ export default function BlockedSourcesPage() {
       </FirstRunNote>
       <motion.div variants={fadeUp} style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 14 }}>
         <div>
-          <div className="sec-title">🚫 Blocked Sources</div>
+          <div className="sec-title">Blocked Sources</div>
           <div className="sec-sub">
             Every source currently blocked, from every mechanism, with one button to undo it
             {dp?.reachable && dp.ebpf ? ` · eBPF ${dp.ebpf.mode} · ${dp.ebpf.drops.toLocaleString()} packets dropped` : ""}
@@ -202,7 +202,7 @@ export default function BlockedSourcesPage() {
           <input className="fin2" placeholder="IP or CIDR — 203.0.113.9 or 203.0.113.0/24" value={newVal} onChange={e => setNewVal(e.target.value)} style={{ width: 300, fontFamily: "var(--font-mono)" }} onKeyDown={e => { if (e.key === "Enter") addBlock(); }} />
           <input className="fin2" placeholder="reason (optional)" value={newWhy} onChange={e => setNewWhy(e.target.value)} style={{ width: 220 }} />
           <input className="fin2" type="number" min={0} placeholder="expires in hours (blank = never)" value={newHours} onChange={e => setNewHours(e.target.value)} style={{ width: 230 }} />
-          <motion.button className="btn bgn btn-sm" disabled={adding || !newVal.trim()} onClick={addBlock} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>{adding ? "…" : "🛡️ Block"}</motion.button>
+          <motion.button className="btn bgn btn-sm" disabled={adding || !newVal.trim()} onClick={addBlock} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>{adding ? "…" : "Block"}</motion.button>
         </div>
       </motion.div>
 

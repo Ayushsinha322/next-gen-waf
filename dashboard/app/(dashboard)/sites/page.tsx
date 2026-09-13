@@ -11,16 +11,17 @@ import { staggerContainer, cardVariants, fadeUp, spring } from "@/lib/animations
 import SiteWizard from "@/components/sites/SiteWizard";
 import QuickAddSite from "@/components/sites/QuickAddSite";
 import { siteToForm, normalizeDomain, type SiteForm } from "@/lib/siteConfig";
+import Icon, { type IconName } from "@/components/ui/Icon";
 
 /* ── Lab-site metadata ────────────────────────────────────────── */
-const LAB_META: Record<string, { icon: string; full: string; port: string; desc: string; color: string; accent: string }> = {
+const LAB_META: Record<string, { full: string; port: string; desc: string; color: string; accent: string }> = {
   "dvwa.local": {
-    icon: "🩸", full: "DVWA", port: "80",
+    full: "DVWA", port: "80",
     desc: "Damn Vulnerable Web Application — SQLi, XSS, CSRF, File Inclusion training target",
     color: "rgba(200,0,30,.15)", accent: "rgba(200,0,30,.45)",
   },
   "juice.local": {
-    icon: "🧃", full: "OWASP Juice Shop", port: "3000",
+    full: "OWASP Juice Shop", port: "3000",
     desc: "Intentionally insecure Node.js app — covers OWASP Top 10 + advanced vulnerabilities",
     color: "rgba(0,200,240,.12)", accent: "rgba(0,200,240,.38)",
   },
@@ -42,7 +43,7 @@ export default function SitesPage() {
       const res = await api.sites.list();
       setSites(res.sites ?? []);
     } catch {
-      showToast("Failed to load sites", "e", "⚠️");
+      showToast("Failed to load sites", "e");
     } finally {
       setLoading(false);
     }
@@ -75,11 +76,11 @@ export default function SitesPage() {
     // 8443→443, so the correct instruction is the plain URL.
     const browseURL  = `http://${host}/`;
     openModal({
-      title: "🚀 Site Deployed — Next Steps",
+      title: "Site Deployed — Next Steps",
       body: (
         <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
           <div style={{ padding: "10px 14px", background: "rgba(0,212,255,.08)", border: "1px solid rgba(0,212,255,.25)", borderRadius: "var(--r2)", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--cyan)" }}>
-            ✅ Site saved and WAF protection active in ~5 seconds
+            Site saved and WAF protection active in ~5 seconds
           </div>
           <div>
             <div style={{ fontSize: 14, color: "var(--text2)", marginBottom: 6, fontFamily: "var(--font-mono)", letterSpacing: 1 }}>STEP 1 — Add to /etc/hosts (run once as root)</div>
@@ -87,7 +88,7 @@ export default function SitesPage() {
               <code style={{ flex: 1, padding: "8px 12px", background: "rgba(0,0,0,.35)", border: "1px solid rgba(255,255,255,.08)", borderRadius: "var(--r2)", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--text)", userSelect: "all" }}>
                 {hostsEntry}
               </code>
-              <button className="btn bg-btn btn-sm" onClick={() => { navigator.clipboard.writeText(`echo '${hostsEntry}' | sudo tee -a /etc/hosts`); showToast("Copied!", "s", "📋"); }}>📋 Copy cmd</button>
+              <button className="btn bg-btn btn-sm" onClick={() => { navigator.clipboard.writeText(`echo '${hostsEntry}' | sudo tee -a /etc/hosts`); showToast("Copied!", "s"); }}>Copy cmd</button>
             </div>
             <div style={{ marginTop: 6, fontFamily: "var(--font-mono)", fontSize: 14, color: "var(--text3)" }}>
               echo &apos;{hostsEntry}&apos; | sudo tee -a /etc/hosts
@@ -99,12 +100,12 @@ export default function SitesPage() {
               <code style={{ flex: 1, padding: "8px 12px", background: "rgba(0,0,0,.35)", border: "1px solid rgba(255,255,255,.08)", borderRadius: "var(--r2)", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--green)" }}>
                 {browseURL}
               </code>
-              <button className="btn bg-btn btn-sm" onClick={() => { navigator.clipboard.writeText(browseURL); showToast("Copied!", "s", "📋"); }}>📋 Copy</button>
+              <button className="btn bg-btn btn-sm" onClick={() => { navigator.clipboard.writeText(browseURL); showToast("Copied!", "s"); }}>Copy</button>
               <a className="btn bp btn-sm" href={browseURL} target="_blank" rel="noreferrer">↗ Open</a>
             </div>
           </div>
           <div style={{ padding: "10px 14px", background: "rgba(255,165,0,.07)", border: "1px solid rgba(255,165,0,.2)", borderRadius: "var(--r2)", fontFamily: "var(--font-mono)", fontSize: 14, color: "rgba(255,200,80,1)", lineHeight: 1.7 }}>
-            ⚠️ Do NOT browse <span style={{ color: "var(--red-b)" }}>{upstream}</span> directly — that bypasses the WAF and generates no logs.
+            ⚠ Do NOT browse <span style={{ color: "var(--red-b)" }}>{upstream}</span> directly — that bypasses the WAF and generates no logs.
             <br />Always use <span style={{ color: "var(--green)" }}>{browseURL}</span> to route traffic through the WAF.
           </div>
         </div>
@@ -169,14 +170,14 @@ export default function SitesPage() {
       const a = document.createElement("a");
       a.href = url; a.download = "sentinel-sites.yaml"; a.click();
       URL.revokeObjectURL(url);
-      showToast("Exported sites to YAML", "s", "📤");
-    } catch { showToast("Export failed", "e", "⚠️"); }
+      showToast("Exported sites to YAML", "s");
+    } catch { showToast("Export failed", "e"); }
   }
 
   function openImport() {
     let yamlText = "";
     openModal({
-      title: "📥 Import Sites (Config-as-Code)",
+      title: "Import Sites (Config-as-Code)",
       body: (
         <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
           <div style={{ fontSize: 13, color: "var(--text3)", lineHeight: 1.6 }}>
@@ -198,14 +199,14 @@ export default function SitesPage() {
         <>
           <button className="btn bg-btn" onClick={() => document.querySelector<HTMLElement>(".modal-bg")?.remove()}>Cancel</button>
           <button className="btn bp" onClick={async () => {
-            if (!yamlText.trim()) { showToast("Paste or upload a YAML file", "e", "⚠️"); return; }
+            if (!yamlText.trim()) { showToast("Paste or upload a YAML file", "e"); return; }
             try {
               const res = await api.sites.importYaml(yamlText);
               document.querySelector<HTMLElement>(".modal-bg")?.remove();
-              showToast(`Imported: ${res.created} created, ${res.updated} updated`, "s", "✅");
+              showToast(`Imported: ${res.created} created, ${res.updated} updated`, "s");
               loadSites();
             } catch (err) {
-              showToast(err instanceof Error ? err.message : "Import failed", "e", "⚠️");
+              showToast(err instanceof Error ? err.message : "Import failed", "e");
             }
           }}>Import</button>
         </>
@@ -224,9 +225,9 @@ export default function SitesPage() {
         </div>
         <div style={{ display: "flex", gap: 8 }}>
           <motion.button className="btn bg-btn btn-sm" onClick={loadSites} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>⟳ Refresh</motion.button>
-          <motion.button className="btn bg-btn btn-sm" onClick={exportYaml} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }} title="Download all sites as YAML">📤 Export</motion.button>
-          <motion.button className="btn bg-btn btn-sm" onClick={() => setShowHistory(true)} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }} title="Snapshots taken before every site change — restore one to undo a bad edit">🕘 History</motion.button>
-          <motion.button className="btn bg-btn btn-sm" onClick={openImport} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }} title="Import sites from YAML">📥 Import</motion.button>
+          <motion.button className="btn bg-btn btn-sm" onClick={exportYaml} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }} title="Download all sites as YAML">Export</motion.button>
+          <motion.button className="btn bg-btn btn-sm" onClick={() => setShowHistory(true)} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }} title="Snapshots taken before every site change — restore one to undo a bad edit">History</motion.button>
+          <motion.button className="btn bg-btn btn-sm" onClick={openImport} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }} title="Import sites from YAML">Import</motion.button>
           <motion.button className="btn bp btn-sm" onClick={openCreate} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>＋ Add Site</motion.button>
         </div>
       </motion.div>
@@ -234,13 +235,13 @@ export default function SitesPage() {
       {/* ── Summary KPIs ──────────────────────────────────────── */}
       <motion.div variants={staggerContainer} initial="hidden" animate="visible" style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 12 }}>
         {[
-          { cls: "kg", ico: "✅", lbl: "Online",     val: String(online),           valCls: "g" },
-          { cls: "ka", ico: "📚", lbl: "Learning",   val: String(learning),          valCls: "a" },
-          { cls: "",   ico: "⛔", lbl: "Offline",    val: String(offline),           valCls: "" },
-          { cls: "kc", ico: "🌐", lbl: "Total Sites", val: String(sites.length),     valCls: "c" },
+          { cls: "kg", ico: "check-circle" as IconName, lbl: "Online",     val: String(online),           valCls: "g" },
+          { cls: "ka", ico: "book" as IconName, lbl: "Learning",   val: String(learning),          valCls: "a" },
+          { cls: "",   ico: "ban" as IconName, lbl: "Offline",    val: String(offline),           valCls: "" },
+          { cls: "kc", ico: "globe" as IconName, lbl: "Total Sites", val: String(sites.length),     valCls: "c" },
         ].map((k, i) => (
           <motion.div key={i} className={`kpi ${k.cls}`} variants={cardVariants}>
-            <span className="kpi-ico">{k.ico}</span>
+            <span className="kpi-ico"><Icon name={k.ico} size={16} /></span>
             <div className="kpi-lbl">{k.lbl}</div>
             <div className={`kpi-val ${k.valCls}`} style={k.valCls === "" ? { color: "var(--text2)" } : {}}>{k.val}</div>
           </motion.div>
@@ -257,7 +258,7 @@ export default function SitesPage() {
       {labSites.length > 0 && (
         <motion.div variants={fadeUp}>
           <div style={{ fontSize: 11, fontFamily: "var(--font-mono)", color: "var(--text3)", letterSpacing: 1.5, textTransform: "uppercase", marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
-            <span>🧪 Security Lab Targets</span>
+            <span>Security Lab Targets</span>
             <div style={{ flex: 1, height: 1, background: "rgba(255,255,255,.06)" }} />
           </div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
@@ -279,7 +280,7 @@ export default function SitesPage() {
                         }}
                         whileHover={{ scale: 1.1, rotate: 5 }}
                         transition={spring}
-                      >{meta.icon}</motion.div>
+                      >{meta.full.charAt(0).toUpperCase()}</motion.div>
                       <div>
                         <div style={{ fontFamily: "var(--font-display)", fontSize: 14, fontWeight: 700, color: "var(--text)", letterSpacing: 1 }}>{meta.full}</div>
                         <div style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--text3)", marginTop: 2 }}>
@@ -302,10 +303,10 @@ export default function SitesPage() {
                       {meta.desc}
                     </div>
                     <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                      <motion.button className="btn bp btn-sm" disabled={!site} onClick={() => site && router.push(`/sites/${site.id}`)} whileHover={{ scale: 1.04 }} whileTap={{ scale: 0.96 }} style={!site ? { opacity: 0.5 } : undefined}>📂 Open Dashboard</motion.button>
-                      <motion.button className="btn bc btn-sm" onClick={() => router.push(`/logs?site=${name}&tab=waf`)} whileHover={{ scale: 1.04 }} whileTap={{ scale: 0.96 }}>🛡️ WAF Logs</motion.button>
-                      <button className="btn bg-btn btn-sm" onClick={() => router.push(`/logs?site=${name}&tab=access`)}>📡 Access Logs</button>
-                      <button className="btn bg-btn btn-sm" disabled={!site} onClick={() => site && openEdit(site)} style={!site ? { opacity: 0.5 } : undefined}>✏️ Edit</button>
+                      <motion.button className="btn bp btn-sm" disabled={!site} onClick={() => site && router.push(`/sites/${site.id}`)} whileHover={{ scale: 1.04 }} whileTap={{ scale: 0.96 }} style={!site ? { opacity: 0.5 } : undefined}>Open Dashboard</motion.button>
+                      <motion.button className="btn bc btn-sm" onClick={() => router.push(`/logs?site=${name}&tab=waf`)} whileHover={{ scale: 1.04 }} whileTap={{ scale: 0.96 }}>WAF Logs</motion.button>
+                      <button className="btn bg-btn btn-sm" onClick={() => router.push(`/logs?site=${name}&tab=access`)}>Access Logs</button>
+                      <button className="btn bg-btn btn-sm" disabled={!site} onClick={() => site && openEdit(site)} style={!site ? { opacity: 0.5 } : undefined}>Edit</button>
                     </div>
                     <div style={{ marginTop: 10, padding: "8px 10px", background: "rgba(0,0,0,.2)", borderRadius: "var(--r2)", fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--text3)", display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6 }}>
                       <div><div style={{ color: "var(--text2)", marginBottom: 2 }}>Upstream</div>127.0.0.1:{meta.port}</div>
@@ -326,7 +327,7 @@ export default function SitesPage() {
           <div className="ptitle">All Sites ({filtered.length})</div>
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
             <div style={{ position: "relative" }}>
-              <span style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", color: "var(--text3)", fontSize: 14, pointerEvents: "none" }}>🔍</span>
+              <span style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", color: "var(--text3)", fontSize: 14, pointerEvents: "none" }}><Icon name="search" size={14} /></span>
               <input className="fi2" type="text" placeholder="Search sites..." value={search} onChange={e => setSearch(e.target.value)} />
             </div>
             <select className="fsel" value={modeFilter} onChange={e => setModeFilter(e.target.value)}>
@@ -338,7 +339,7 @@ export default function SitesPage() {
           {loading ? (
             <div style={{ padding: "24px", textAlign: "center", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--text3)" }}>Loading sites…</div>
           ) : filtered.length === 0 ? (
-            <EmptyState icon="🌐" title={sites.length === 0 ? "No sites protected yet" : "No site matches this filter"}
+            <EmptyState icon="globe" title={sites.length === 0 ? "No sites protected yet" : "No site matches this filter"}
               hint={sites.length === 0 ? "A site is a hostname routed through the WAF to an origin. Add the first one and traffic is inspected within seconds of the config sync." : "Clear the search or filter to see all sites."}
               action={sites.length === 0 ? { label: "＋ Add Site", onClick: openCreate } : undefined} />
           ) : (
@@ -355,7 +356,7 @@ export default function SitesPage() {
                       <td>
                         <a href={`/sites/${s.id}`} onClick={e => { e.preventDefault(); router.push(`/sites/${s.id}`); }} title="Open site dashboard"
                           style={{ color: meta ? (s.name === "dvwa.local" ? "var(--red-b)" : "var(--cyan)") : "var(--cyan)", fontWeight: meta ? 700 : 400, textDecoration: "none", borderBottom: "1px dotted rgba(0,212,255,.45)" }}>
-                          {meta ? `${meta.icon} ` : ""}{s.name}
+                          {s.name}
                         </a>
                       </td>
                       <td style={{ maxWidth: 240, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={s.domains.join(", ")}>{s.domains.join(", ")}</td>
@@ -364,10 +365,10 @@ export default function SitesPage() {
                       <td><span className={`bdg ${s.status === "active" ? "bgg" : "bgr"}`}>{s.status}</span></td>
                       <td>
                         <div style={{ display: "flex", gap: 4 }}>
-                          <motion.button className="btn bc btn-xs" title="Open site dashboard" onClick={() => router.push(`/sites/${s.id}`)} whileHover={{ scale: 1.08 }} whileTap={{ scale: 0.94 }}>📂 Open</motion.button>
-                          <motion.button className="btn bg-btn btn-xs" onClick={() => router.push(`/logs?site=${s.name}&tab=waf`)} whileHover={{ scale: 1.08 }} whileTap={{ scale: 0.94 }}>🛡️</motion.button>
-                          <motion.button className="btn bg-btn btn-xs" onClick={() => router.push(`/logs?site=${s.name}`)} whileHover={{ scale: 1.08 }} whileTap={{ scale: 0.94 }}>📜 Logs</motion.button>
-                          <motion.button className="btn bc btn-xs" title="Edit site" onClick={() => openEdit(s)} whileHover={{ scale: 1.08 }} whileTap={{ scale: 0.94 }}>✏️</motion.button>
+                          <motion.button className="btn bc btn-xs" title="Open site dashboard" onClick={() => router.push(`/sites/${s.id}`)} whileHover={{ scale: 1.08 }} whileTap={{ scale: 0.94 }}>Open</motion.button>
+                          <motion.button className="btn bg-btn btn-xs" onClick={() => router.push(`/logs?site=${s.name}&tab=waf`)} whileHover={{ scale: 1.08 }} whileTap={{ scale: 0.94 }}><Icon name="shield" size={13} title="WAF logs" /></motion.button>
+                          <motion.button className="btn bg-btn btn-xs" onClick={() => router.push(`/logs?site=${s.name}`)} whileHover={{ scale: 1.08 }} whileTap={{ scale: 0.94 }}>Logs</motion.button>
+                          <motion.button className="btn bc btn-xs" title="Edit site" onClick={() => openEdit(s)} whileHover={{ scale: 1.08 }} whileTap={{ scale: 0.94 }}><Icon name="edit" size={13} title="Edit site" /></motion.button>
                           <motion.button
                             className="btn bg-btn btn-xs"
                             title={s.status === "active" ? "Pause site" : "Activate site"}
@@ -375,13 +376,13 @@ export default function SitesPage() {
                               const next = s.status === "active" ? "paused" : "active";
                               try {
                                 await api.sites.updateStatus(s.id, next);
-                                showToast(`Site ${next}`, "s", next === "active" ? "✅" : "⏸️");
+                                showToast(`Site ${next}`, "s");
                                 loadSites();
-                              } catch { showToast("Failed", "e", "⚠️"); }
+                              } catch { showToast("Failed", "e"); }
                             }}
                             whileHover={{ scale: 1.08 }}
                             whileTap={{ scale: 0.94 }}
-                          >{s.status === "active" ? "⏸️" : "▶️"}</motion.button>
+                          >{s.status === "active" ? "⏸" : "▶"}</motion.button>
                           <motion.button
                             className="btn bg-btn btn-xs"
                             title="Delete site"
@@ -389,13 +390,13 @@ export default function SitesPage() {
                               if (!confirm(`Delete site "${s.name}"? This cannot be undone.`)) return;
                               try {
                                 await api.sites.delete(s.id);
-                                showToast("Site deleted", "s", "🗑️");
+                                showToast("Site deleted", "s");
                                 loadSites();
-                              } catch { showToast("Failed to delete", "e", "⚠️"); }
+                              } catch { showToast("Failed to delete", "e"); }
                             }}
                             whileHover={{ scale: 1.08 }}
                             whileTap={{ scale: 0.94 }}
-                          >🗑️</motion.button>
+                          ><Icon name="trash" size={13} title="Delete site" /></motion.button>
                         </div>
                       </td>
                     </motion.tr>

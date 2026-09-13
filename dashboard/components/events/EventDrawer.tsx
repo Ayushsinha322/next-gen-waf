@@ -62,10 +62,10 @@ export default function EventDrawer({
     setBusy(true);
     try {
       await api.sites.addExclusion(site.id, { rule_id: ruleId, disable: true });
-      showToast(`Rule ${ruleId} excluded on ${site.name}`, "s", "✓");
+      showToast(`Rule ${ruleId} excluded on ${site.name}`, "s");
       onClose();
     } catch (e) {
-      showToast(e instanceof Error ? e.message : "Could not add exclusion", "e", "⚠️");
+      showToast(e instanceof Error ? e.message : "Could not add exclusion", "e");
     } finally {
       setBusy(false);
     }
@@ -74,9 +74,9 @@ export default function EventDrawer({
   const copyJson = async () => {
     try {
       await navigator.clipboard.writeText(JSON.stringify(event, null, 2));
-      showToast("Event copied as JSON", "s", "✓");
+      showToast("Event copied as JSON", "s");
     } catch {
-      showToast("Clipboard unavailable", "e", "⚠️");
+      showToast("Clipboard unavailable", "e");
     }
   };
 
@@ -166,7 +166,7 @@ export default function EventDrawer({
                 style={{ cursor: "pointer", userSelect: "all" }}
                 onClick={() => {
                   navigator.clipboard.writeText(event.request_id).then(
-                    () => showToast("Support ID copied", "s", "📋"),
+                    () => showToast("Support ID copied", "s"),
                     () => {},
                   );
                 }}
@@ -231,9 +231,9 @@ export default function EventDrawer({
               </button>
               <button className="btn bg-btn btn-sm" onClick={copyJson}>Copy event JSON</button>
               <button className="btn bg-btn btn-sm" title="Open the AI Copilot with this event loaded and ask what fired and why"
-                onClick={() => openCopilotWith(router, explainEventPrompt(event as unknown as Record<string, unknown>))}>🤖 Explain</button>
+                onClick={() => openCopilotWith(router, explainEventPrompt(event as unknown as Record<string, unknown>))}>Explain</button>
               <button className="btn bg-btn btn-sm" title="Open the AI Copilot with this event loaded and ask for the narrowest exclusion"
-                onClick={() => openCopilotWith(router, draftExclusionPrompt(event as unknown as Record<string, unknown>))}>🤖 Draft exclusion</button>
+                onClick={() => openCopilotWith(router, draftExclusionPrompt(event as unknown as Record<string, unknown>))}>Draft exclusion</button>
             </div>
 
             <div style={{ fontSize: "var(--fs-label)", color: "var(--text3)", marginTop: 10, lineHeight: 1.6 }}>

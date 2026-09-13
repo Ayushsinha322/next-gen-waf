@@ -5,6 +5,7 @@ import { showToast } from "@/components/ui/Toast";
 import FirstRunNote from "@/components/ui/FirstRunNote";
 import { api, type Rule, type RuleTestResult, type CompiledRule, type RuleInventory, type SiteRuleInventory } from "@/lib/api";
 import { staggerContainer, cardVariants, fadeUp, spring } from "@/lib/animations";
+import Icon from "@/components/ui/Icon";
 
 const PHASE_LABELS = ["conn","req_hdr","req_body","upstream","resp_hdr","resp_body","log"];
 
@@ -166,7 +167,7 @@ export default function RulesPage() {
   const refresh = () => Promise.all([
     api.rules.list()
       .then(r => setRules(r.rules ?? []))
-      .catch(() => showToast("Failed to load rules", "e", "⚠️")),
+      .catch(() => showToast("Failed to load rules", "e")),
     api.rules.inventory()
       .then(setInv)
       .catch(() => setInv({ dataplane_reachable: false, error: "control plane did not answer", sites: [],
@@ -226,24 +227,24 @@ export default function RulesPage() {
     setRules(prev => prev.map(x => x.id === r.id ? { ...x, enabled: next } : x));
     try {
       await api.rules.toggle(r.id, next);
-      showToast(`Rule "${r.name}" ${next ? "enabled" : "disabled"}`, "s", "📋");
+      showToast(`Rule "${r.name}" ${next ? "enabled" : "disabled"}`, "s");
     } catch {
       setRules(prev => prev.map(x => x.id === r.id ? { ...x, enabled: !next } : x));
-      showToast("Failed to toggle rule", "e", "⚠️");
+      showToast("Failed to toggle rule", "e");
     }
   }
 
   async function deleteRule(r: Rule) {
     if (r.source === "crs" || r.source === "community") {
-      showToast("CRS/community rules cannot be deleted", "w", "⚠️"); return;
+      showToast("CRS/community rules cannot be deleted", "w"); return;
     }
     if (!confirm(`Delete rule "${r.name}"?`)) return;
     try {
       await api.rules.delete(r.id);
       setRules(prev => prev.filter(x => x.id !== r.id));
       if (editorRule?.id === r.id) setEditorRule(null);
-      showToast(`Rule "${r.name}" deleted`, "s", "🗑️");
-    } catch { showToast("Failed to delete rule", "e", "⚠️"); }
+      showToast(`Rule "${r.name}" deleted`, "s");
+    } catch { showToast("Failed to delete rule", "e"); }
   }
 
   function openEditor(r: Rule) {
@@ -288,7 +289,7 @@ export default function RulesPage() {
   }
 
   async function createRule() {
-    if (!editorName.trim()) { showToast("Rule name is required", "w", "⚠️"); return; }
+    if (!editorName.trim()) { showToast("Rule name is required", "w"); return; }
     setSaving(true);
     try {
       const res = await api.rules.create({
@@ -301,9 +302,9 @@ export default function RulesPage() {
       });
       setRules(prev => [res.rule, ...prev]);
       setEditorRule(res.rule); setShowModal(false);
-      showToast(`Rule "${res.rule.name}" created`, "s", "📋");
+      showToast(`Rule "${res.rule.name}" created`, "s");
     } catch (err: unknown) {
-      showToast(err instanceof Error ? err.message : "Create failed", "e", "⚠️");
+      showToast(err instanceof Error ? err.message : "Create failed", "e");
     } finally { setSaving(false); }
   }
 
@@ -317,7 +318,7 @@ export default function RulesPage() {
   async function saveRule() {
     if (!editorRule) return;
     if (editorRule.source === "crs" || editorRule.source === "community") {
-      showToast("Shipped CRS/community rules are read-only", "w", "⚠️"); return;
+      showToast("Shipped CRS/community rules are read-only", "w"); return;
     }
     setSaving(true);
     try {
@@ -329,12 +330,12 @@ export default function RulesPage() {
       });
       setRules(prev => prev.map(x => x.id === res.rule.id ? res.rule : x));
       setEditorRule(res.rule);
-      showToast(res.warning ?? `Rule "${res.rule.name}" saved`, res.warning ? "w" : "s", "💾");
+      showToast(res.warning ?? `Rule "${res.rule.name}" saved`, res.warning ? "w" : "s");
       // Enforcement is reported by the data plane after it re-fetches config, so
       // the badge is stale for a few seconds; pull it once it has had time.
       setTimeout(() => { void refresh(); }, 12000);
     } catch (err: unknown) {
-      showToast(err instanceof Error ? err.message : "Save failed — the rule was not changed", "e", "⚠️");
+      showToast(err instanceof Error ? err.message : "Save failed — the rule was not changed", "e");
     } finally { setSaving(false); }
   }
 
@@ -351,7 +352,7 @@ export default function RulesPage() {
 
   async function runTest() {
     const dsl = editorDSL.trim();
-    if (!dsl) { showToast("No DSL to test", "w", "⚠️"); return; }
+    if (!dsl) { showToast("No DSL to test", "w"); return; }
     setTestLoading(true); setTestResult(null);
     try {
       const res = await api.rules.test(dsl, testPayload, "POST", "/test");
@@ -360,7 +361,7 @@ export default function RulesPage() {
       // An invalid rule comes back 200 with valid:false, so reaching here means
       // the request itself failed — most often the validator is unavailable on
       // this node. Blaming the operator's syntax would misattribute it.
-      showToast(err instanceof Error ? err.message : "Could not run the test", "e", "⚠️");
+      showToast(err instanceof Error ? err.message : "Could not run the test", "e");
     }
     finally { setTestLoading(false); }
   }
@@ -377,7 +378,7 @@ export default function RulesPage() {
       </FirstRunNote>
       <motion.div variants={fadeUp} style={{ display:"flex", alignItems:"flex-start", justifyContent:"space-between", gap:14 }}>
         <div>
-          <div className="sec-title">📋 Rules Engine</div>
+          <div className="sec-title">Rules Engine</div>
           <div className="sec-sub">
             {inv == null ? "reading the enforced rule set…"
               : !inv.dataplane_reachable ? "data plane unreachable — enforced rule set unknown"
@@ -389,7 +390,7 @@ export default function RulesPage() {
         </div>
         <div style={{ display:"flex", gap:8 }}>
           <motion.button className="btn bc btn-sm" onClick={runTest} disabled={testLoading} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
-            {testLoading ? "⏳ Testing…" : "🧪 Test Rule"}
+            {testLoading ? "⏳ Testing…" : "Test Rule"}
           </motion.button>
           <motion.button className="btn bp btn-sm" whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }} onClick={() => {
             setEditorRule(null); setEditorDSL(BLANK_DSL);
@@ -402,9 +403,9 @@ export default function RulesPage() {
       <motion.div variants={fadeUp} style={{ display:"grid", gridTemplateColumns:"1fr 2fr", gap:16 }}>
         <div className="panel">
           <div className="ph">
-            <div className="ptitle">📋 Rule Library</div>
+            <div className="ptitle">Rule Library</div>
             <div style={{ position:"relative" }}>
-              <span style={{ position:"absolute", left:10, top:"50%", transform:"translateY(-50%)", color:"var(--text3)", fontSize: 14, pointerEvents:"none" }}>🔍</span>
+              <span style={{ position:"absolute", left:10, top:"50%", transform:"translateY(-50%)", color:"var(--text3)", fontSize: 14, pointerEvents:"none" }}><Icon name="search" size={14} /></span>
               <input className="fi2" type="text" placeholder="Search…" style={{ width:150 }}
                 value={search} onChange={e => setSearch(e.target.value)} />
             </div>
@@ -495,7 +496,7 @@ export default function RulesPage() {
                       <td>
                         {(r.source==="custom"||r.source==="ai_generated"||r.source==="virtual_patch") && (
                           <span style={{ cursor:"pointer", color:"var(--red-b)", fontSize: 13 }}
-                            onClick={e=>{ e.stopPropagation(); deleteRule(r); }}>🗑</span>
+                            onClick={e=>{ e.stopPropagation(); deleteRule(r); }}><Icon name="trash" size={14} title="Delete rule" /></span>
                         )}
                       </td>
                     </motion.tr>
@@ -509,7 +510,7 @@ export default function RulesPage() {
         <div className="panel" style={{ display:"flex", flexDirection:"column" }}>
           <div className="ph">
             <div className="ptitle">
-              {isCompiledTab ? "🔎 Enforced rule set" : "✏️ Rule Editor"}
+              {isCompiledTab ? "Enforced rule set" : "Rule Editor"}
               {!isCompiledTab && editorRule && <span style={{ fontSize: 14, color:"var(--text3)", marginLeft:8 }}>— {editorRule.name}</span>}
             </div>
             <motion.button className="btn bc btn-sm" onClick={runTest} disabled={testLoading} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
@@ -570,7 +571,7 @@ export default function RulesPage() {
             {editorRule && !editorReadOnly && (
               <motion.button className="btn bp" onClick={saveRule} disabled={saving}
                 whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.98 }}>
-                {saving ? "Saving…" : "💾 Save Changes"}
+                {saving ? "Saving…" : "Save Changes"}
               </motion.button>
             )}
 
@@ -642,7 +643,7 @@ export default function RulesPage() {
               <div style={{ display:"flex", gap:8, justifyContent:"flex-end" }}>
                 <button className="btn bg-btn" onClick={() => setShowModal(false)}>Cancel</button>
                 <motion.button className="btn bp" onClick={createRule} disabled={saving} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
-                  {saving ? "Saving…" : "💾 Create Rule"}
+                  {saving ? "Saving…" : "Create Rule"}
                 </motion.button>
               </div>
             </div>

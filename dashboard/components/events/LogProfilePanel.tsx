@@ -63,13 +63,11 @@ export default function LogProfilePanel({
         r.rows === 0
           ? `No events in that window — ${r.filename} is empty`
           : `${r.rows.toLocaleString()} events → ${r.filename}`,
-        r.rows === 0 ? "i" : "s",
-        r.rows === 0 ? "📭" : "📦",
-      );
+        r.rows === 0 ? "i" : "s");
     } catch (e) {
       // The server refuses an oversized export rather than silently truncating,
       // and that message carries the real row count — surface it verbatim.
-      showToast(e instanceof Error ? e.message : "Export failed", "e", "⚠️");
+      showToast(e instanceof Error ? e.message : "Export failed", "e");
     } finally {
       setExporting(false);
       onExporting(false);
@@ -80,11 +78,11 @@ export default function LogProfilePanel({
     if (!window.confirm(`Delete the log profile "${p.name}"? This does not delete any logs.`)) return;
     try {
       await api.logProfiles.remove(p.id);
-      showToast(`Profile "${p.name}" deleted`, "s", "🗑️");
+      showToast(`Profile "${p.name}" deleted`, "s");
       if (p.id === activeId) onLoad(null);
       onChanged();
     } catch (e) {
-      showToast(e instanceof Error ? e.message : "Delete failed", "e", "⚠️");
+      showToast(e instanceof Error ? e.message : "Delete failed", "e");
     }
   }
 
@@ -92,7 +90,7 @@ export default function LogProfilePanel({
     <>
       <div className="panel">
         <div className="ph">
-          <div className="ptitle">📁 Log Profiles</div>
+          <div className="ptitle">Log Profiles</div>
           <span className="panel-badge">
             {profiles.length === 0 ? "none saved" : `${profiles.length} saved`}
           </span>
@@ -118,8 +116,8 @@ export default function LogProfilePanel({
           </button>
           {active && (
             <>
-              <button className="btn bg-btn btn-sm" onClick={() => setEditing(active)}>✎ Edit</button>
-              <button className="btn bg-btn btn-sm" onClick={() => remove(active)}>🗑 Delete</button>
+              <button className="btn bg-btn btn-sm" onClick={() => setEditing(active)}>Edit</button>
+              <button className="btn bg-btn btn-sm" onClick={() => remove(active)}>Delete</button>
             </>
           )}
 
@@ -141,7 +139,7 @@ export default function LogProfilePanel({
             whileTap={{ scale: 0.97 }}
             title="Download every event in the selected window — not just the rows shown below"
           >
-            {exporting ? "Preparing…" : "⬇ Download logs"}
+            {exporting ? "Preparing…" : "Download logs"}
           </motion.button>
         </div>
 
@@ -217,15 +215,15 @@ function ProfileEditor({
   }
 
   async function save() {
-    if (!form.name.trim()) { showToast("Give the profile a name", "e", "⚠️"); return; }
+    if (!form.name.trim()) { showToast("Give the profile a name", "e"); return; }
     setSaving(true);
     try {
       if (profile) await api.logProfiles.update(profile.id, form);
       else await api.logProfiles.create(form);
-      showToast(`Profile "${form.name}" saved`, "s", "✅");
+      showToast(`Profile "${form.name}" saved`, "s");
       onSaved();
     } catch (e) {
-      showToast(e instanceof Error ? e.message : "Save failed", "e", "⚠️");
+      showToast(e instanceof Error ? e.message : "Save failed", "e");
     } finally {
       setSaving(false);
     }

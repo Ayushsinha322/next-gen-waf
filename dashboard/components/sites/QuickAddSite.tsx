@@ -98,7 +98,7 @@ export default function QuickAddSite({
         // pre-flight, not the gate.
       }
       await api.sites.create(payload);
-      showToast("Site created in learning mode", "s", "🚀");
+      showToast("Site created in learning mode", "s");
       onCreated(domain.trim());
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not create the site.");

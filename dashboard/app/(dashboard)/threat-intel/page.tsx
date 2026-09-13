@@ -1,4 +1,5 @@
 "use client";
+import Icon from "@/components/ui/Icon";
 /**
  * Threat Intelligence — the managed IOC corpus that feeds the data plane.
  * Aggregated feeds (Tor / abuse.ch Feodo & URLhaus / STIX / built-in scanner
@@ -72,7 +73,7 @@ export default function ThreatIntelPage() {
         setRecent(rb.blocks ?? []);
         setChOk(rb.clickhouse);
       } catch (e) {
-        showToast(e instanceof Error ? e.message : "Load failed", "e", "⚠️");
+        showToast(e instanceof Error ? e.message : "Load failed", "e");
       } finally {
         setLoading(false);
       }
@@ -151,7 +152,7 @@ export default function ThreatIntelPage() {
             className="btn bp"
             onClick={async () => {
               if (!value.trim()) {
-                showToast("Enter an indicator value", "e", "⚠️");
+                showToast("Enter an indicator value", "e");
                 return;
               }
               let expires_at: string | null = null;
@@ -168,10 +169,10 @@ export default function ThreatIntelPage() {
                   expires_at,
                 });
                 closeModal();
-                showToast("Indicator added", "s", "✅");
+                showToast("Indicator added", "s");
                 run();
               } catch (err) {
-                showToast(err instanceof Error ? err.message : "Add failed", "e", "⚠️");
+                showToast(err instanceof Error ? err.message : "Add failed", "e");
               }
             }}
           >
@@ -186,10 +187,10 @@ export default function ThreatIntelPage() {
     if (!confirm(`Remove ${e.type} indicator "${e.value}" from the feed?`)) return;
     try {
       await api.threatIntel.remove(e.id);
-      showToast("Indicator removed", "s", "🗑️");
+      showToast("Indicator removed", "s");
       run();
     } catch (err) {
-      showToast(err instanceof Error ? err.message : "Remove failed", "e", "⚠️");
+      showToast(err instanceof Error ? err.message : "Remove failed", "e");
     }
   }
 
@@ -201,7 +202,7 @@ export default function ThreatIntelPage() {
         style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 14 }}
       >
         <div>
-          <div className="sec-title">🎯 Threat Intelligence</div>
+          <div className="sec-title">Threat Intelligence</div>
           <div className="sec-sub">
             Managed IOC corpus feeding the data plane
             {summary ? ` · ${summary.total_active.toLocaleString()} active · block ≥ ${summary.threshold}% confidence` : " · loading…"}
@@ -228,7 +229,7 @@ export default function ThreatIntelPage() {
         <div className="pb" style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
           <input
             className="fi2"
-            placeholder="🔍 search indicator value…"
+            placeholder="search indicator value…"
             style={{ flex: 1, minWidth: 200 }}
             value={q}
             onChange={(e) => setQ(e.target.value)}
@@ -312,7 +313,7 @@ export default function ThreatIntelPage() {
         <div className="tw" style={{ maxHeight: 340, overflow: "auto" }}>
           {!chOk ? (
             <div style={{ padding: 28, textAlign: "center" }}>
-              <div style={{ fontSize: 30, marginBottom: 8 }}>🛰️</div>
+              <Icon name="activity" size={28} style={{ marginBottom: 8, color: "var(--text3)" }} />
               <div style={{ fontSize: 15, fontWeight: 700, color: "var(--text2)", marginBottom: 6 }}>Block history not available</div>
               <div style={{ fontSize: 14, color: "var(--text3)", lineHeight: 1.7, fontFamily: "var(--font-mono)", maxWidth: 520, margin: "0 auto" }}>
                 Set <span style={{ color: "var(--cyan)" }}>SENTINEL_CLICKHOUSE_URL</span> on the control plane to record and search intel-driven blocks. Enforcement still works without it.
