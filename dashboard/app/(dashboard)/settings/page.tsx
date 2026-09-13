@@ -135,6 +135,8 @@ function GeneralTab() {
           <KV label="Upstream health" value={
             waf ? `${waf.upstreams_healthy ?? 0} / ${waf.upstreams_total ?? 0} healthy` : "…"} />
           <KV label="Listeners" value={waf?.listeners?.length ? waf.listeners.join("   ") : "…"} />
+          <KV label="HTTP/3 (QUIC)" value={
+            waf?.http3 ? (waf.http3.enabled ? `enabled · advertised :${waf.http3.advertise_port ?? "?"}` : "disabled") : "…"} />
         </div>
       </div>
 
@@ -142,8 +144,6 @@ function GeneralTab() {
         <div className="ph"><div className="ptitle">Console language</div></div>
         <div className="pb">
           <LanguagePicker />
-          <KV label="HTTP/3 (QUIC)" value={
-            waf?.http3 ? (waf.http3.enabled ? `enabled · advertised :${waf.http3.advertise_port ?? "?"}` : "disabled") : "…"} />
         </div>
       </div>
 
