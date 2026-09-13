@@ -60,6 +60,13 @@ die()  { printf '\n  %s✗ ROLLBACK ABORTED%s\n    %s\n\n' "$RED" "$R" "$*" >&2;
 
 SERVICES=(dataplane controlplane dashboard migrate)
 
+# See upgrade.sh: images are not always called sentinel/*. A registry install
+# names them after the customer's registry, so a hard-coded prefix listed no
+# rollback targets at all and the script reported there was nothing to roll
+# back to on a perfectly healthy installation.
+IMG_PREFIX="$(sed -n 's/^SENTINEL_IMAGE_PREFIX=//p' "$ENV_FILE" 2>/dev/null | head -1)"
+IMG_PREFIX="${IMG_PREFIX:-sentinel}"
+
 [[ $EUID -eq 0 ]] || die "run with sudo"
 [[ -f "$ENV_FILE" ]] || die "no installation found at $INSTALL_DIR"
 
@@ -71,7 +78,7 @@ CURRENT=$(cat "$STATE_DIR/version" 2>/dev/null \
 available=()
 while read -r v; do [[ -n "$v" ]] && available+=("$v"); done < <(
   docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
-    | grep -E '^sentinel/dataplane:' | cut -d: -f2 | grep -vx latest | sort -Vr
+    | grep -E "^${IMG_PREFIX}/dataplane:" | cut -d: -f2 | grep -vx latest | sort -Vr
 )
 
 if [[ "$DO_LIST" == "yes" ]]; then
@@ -82,7 +89,7 @@ if [[ "$DO_LIST" == "yes" ]]; then
     [[ "$v" == "$CURRENT" ]] && continue
     complete=yes
     for svc in "${SERVICES[@]}"; do
-      docker image inspect "sentinel/${svc}:${v}" >/dev/null 2>&1 || complete=no
+      docker image inspect "${IMG_PREFIX}/${svc}:${v}" >/dev/null 2>&1 || complete=no
     done
     [[ "$complete" == "yes" ]] && { printf '    %s\n' "$v"; found=1; }
   done
@@ -111,8 +118,8 @@ say "  running: $CURRENT"
 say "  target:  $TARGET"
 
 for svc in "${SERVICES[@]}"; do
-  docker image inspect "sentinel/${svc}:${TARGET}" >/dev/null 2>&1 \
-    || die "image sentinel/${svc}:${TARGET} is not on this host.
+  docker image inspect "${IMG_PREFIX}/${svc}:${TARGET}" >/dev/null 2>&1 \
+    || die "image ${IMG_PREFIX}/${svc}:${TARGET} is not on this host.
 
     Rollback needs all four images for the target version. Check what is
     available with:  sudo ./rollback.sh --list"
@@ -151,16 +158,24 @@ ok "current configuration -> $SAFE/.env"
 
 # ── 4. switch ────────────────────────────────────────────────────────────────
 step "Step 4 of 5 — applying $TARGET"
-python3 - "$ENV_FILE" "$TARGET" <<'PY'
-import sys, re
-p, v = sys.argv[1], sys.argv[2]
-s = open(p).read()
-if re.search(r'^SENTINEL_VERSION=', s, flags=re.M):
-    s = re.sub(r'^SENTINEL_VERSION=.*$', 'SENTINEL_VERSION=' + v, s, count=1, flags=re.M)
-else:
-    s = 'SENTINEL_VERSION=' + v + '\n' + s
-open(p, 'w').write(s)
-PY
+# Pure shell, not python3: minimal Ubuntu images ship without it, and this is
+# the ROLLBACK path — the one thing that must still work when an upgrade has
+# already gone wrong. install.sh removed the same dependency for the same
+# reason and left this copy behind.
+#
+# `cat >` rather than `sed -i` keeps the inode and the 0600 mode. The version is
+# validated rather than escaped: a tag is [A-Za-z0-9._-].
+[[ "$TARGET" =~ ^[A-Za-z0-9._-]+$ ]] \
+  || die "refusing to write a version containing unexpected characters: $TARGET"
+_tmp="$(mktemp)"
+if grep -q '^SENTINEL_VERSION=' "$ENV_FILE"; then
+  sed "s|^SENTINEL_VERSION=.*|SENTINEL_VERSION=${TARGET}|" "$ENV_FILE" > "$_tmp"
+else
+  { printf 'SENTINEL_VERSION=%s\n' "$TARGET"; cat "$ENV_FILE"; } > "$_tmp"
+fi
+[[ -s "$_tmp" ]] || { rm -f "$_tmp"; die "refusing to write an empty .env"; }
+cat "$_tmp" > "$ENV_FILE"
+rm -f "$_tmp"
 ok ".env pinned to $TARGET"
 
 C=(docker compose -p sentinel -f "$INSTALL_DIR/compose.prod.yml" --env-file "$ENV_FILE")

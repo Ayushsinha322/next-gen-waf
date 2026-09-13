@@ -21,7 +21,22 @@ if [ "$SRC" = "latest" ]; then
   [ -n "$SRC" ] || die "no backups under $BACKUP_ROOT"
 fi
 [ -d "$SRC" ] || die "backup dir not found: $SRC"
-[ -f "$SRC/postgres.dump" ] || die "not a Sentinel backup (no postgres.dump): $SRC"
+# A caller may hand us the BACKUP_ROOT rather than one backup inside it —
+# upgrade.sh did exactly that for every release, so --restore-db could never
+# succeed. Descend when the answer is unambiguous, and when it is not, say what
+# is actually there instead of only what is missing.
+if [ ! -f "$SRC/postgres.dump" ]; then
+  n=$(find "$SRC" -mindepth 2 -maxdepth 2 -name postgres.dump -type f 2>/dev/null | wc -l)
+  if [ "$n" -eq 1 ]; then
+    SRC="$(dirname "$(find "$SRC" -mindepth 2 -maxdepth 2 -name postgres.dump -type f)")"
+    log "descended into the single backup found there: $SRC"
+  elif [ "$n" -gt 1 ]; then
+    die "$SRC holds $n backups — name the one you want:
+$(find "$SRC" -mindepth 2 -maxdepth 2 -name postgres.dump -type f -exec dirname {} \; | sort | sed 's/^/    /')"
+  else
+    die "not a Sentinel backup (no postgres.dump): $SRC"
+  fi
+fi
 log "restore source: $SRC"
 
 # ── Integrity ────────────────────────────────────────────────────────────────
