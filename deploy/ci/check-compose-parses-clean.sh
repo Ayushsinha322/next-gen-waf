@@ -57,6 +57,17 @@ TWOVM_DOC=deploy/docker/2VM-ACTIVE-PASSIVE.md
 
 fail=0
 
+# ── the gate must be able to run ─────────────────────────────────────────────
+# A check that cannot run has to FAIL, not pass. `docker compose config` only
+# parses and interpolates, so this needs no daemon and no privileged runner —
+# but if the CLI is absent (the apk package renamed, the before_script edited)
+# every check below would report a clean parse for files it never opened.
+if ! docker compose version >/dev/null 2>&1; then
+  printf '\n  %s✗%s docker compose CLI is not available — this gate cannot run\n' "$RED" "$R"
+  printf '      %sinstall docker-cli-compose (no daemon needed: `config` never contacts one)%s\n\n' "$DIM" "$R"
+  exit 1
+fi
+
 # ── what does install.sh actually put in the generated .env? ─────────────────
 # The heredoc between `cat > "$ENV_FILE" <<ENVEOF` and `ENVEOF`. Taking the names
 # from the installer rather than restating them here is the point: if someone
@@ -97,7 +108,14 @@ synth_env() {
       # word fails on shape rather than on absence and would be misread as the
       # very bug this script hunts for.
       *MEM_LIMIT*|*_LIMIT)   printf '%s=1g\n'                 "$v" ;;
-      *BIND*)                printf '%s=127.0.0.1:\n'         "$v" ;;
+      # Two bind shapes exist in the compose files and they are not the same.
+      # SENTINEL_MGMT_BIND carries its own trailing colon
+      # ("${SENTINEL_MGMT_BIND:-127.0.0.1:}9443:9443"), while SENTINEL_PG_BIND
+      # and SENTINEL_CH_BIND do not ("${SENTINEL_PG_BIND:-0.0.0.0}:5432:5432").
+      # One placeholder for both produced "127.0.0.1::5432" and failed the file
+      # on the harness's own value rather than on anything in the file.
+      *MGMT_BIND*)           printf '%s=127.0.0.1:\n'         "$v" ;;
+      *BIND*)                printf '%s=127.0.0.1\n'          "$v" ;;
       *PORT*|*_DAYS|*_BYTES) printf '%s=1\n'                  "$v" ;;
       *)                     printf '%s=placeholder\n'        "$v" ;;
     esac >> "$out"
@@ -105,24 +123,55 @@ synth_env() {
 }
 
 # ── the check ────────────────────────────────────────────────────────────────
-# $1 compose file  $2 human label  $3.. variable names considered "supplied"
+# $1 comma-separated compose files, base first  $2 human label
+# $3.. variable names considered "supplied"
+#
+# The file list matters. compose.ha.yml, compose.cluster.yml and the two 2VM
+# files are OVERLAYS — each one's own header documents the invocation as
+# `-f compose.prod.yml -f <overlay>`. Parsed alone they fail for reasons that
+# say nothing about the deployment ("service waf2 refers to undefined network
+# sentinel", "controlplane has neither an image nor a build context"), because
+# the base declares those. Checking an overlay by itself tests a command nobody
+# runs, so the stack under test is spelled out at each call site.
 check_file() {
-  local file="$1" label="$2"; shift 2
+  local spec="$1" label="$2"; shift 2
+  local -a files=() fargs=()
+  IFS=',' read -r -a files <<< "$spec"
+  local f
+  for f in "${files[@]}"; do fargs+=(-f "$f"); done
+  # Name the file under test — the last one — not the base it layers on.
+  local file="${files[${#files[@]} - 1]}"
   local envf; envf="$(mktemp)"
   synth_env "$envf" "$@"
 
-  local err
-  if err=$(env -i PATH="$PATH" HOME="$HOME" \
-             docker compose --env-file "$envf" -f "$file" config -q 2>&1 \
-             | grep -iE '^error|error while' | head -1); [[ -z "$err" ]]; then
+  # Gate on the EXIT STATUS, never on the wording of the message.
+  #
+  # This used to pipe compose's output through `grep -iE '^error|error while'`
+  # and treat an empty match as success. That matches only INTERPOLATION
+  # failures. Probed directly, all three of these produced no match and were
+  # reported as a clean parse:
+  #
+  #   yaml: line 1: did not find expected key            (syntax error)
+  #   validating ...: Additional property prots is not allowed  (schema error)
+  #   env: 'docker': No such file or directory           (tool missing)
+  #
+  # So a malformed compose file passed this gate and failed at the customer's
+  # first `docker compose up`. `config -q` already exits non-zero on every one
+  # of them; the exit code is the whole answer and needs no pattern.
+  local out rc=0
+  out=$(env -i PATH="$PATH" HOME="$HOME" \
+          docker compose --env-file "$envf" "${fargs[@]}" config -q 2>&1) || rc=$?
+
+  if (( rc == 0 )); then
     printf '  %s✓%s %-26s parses with the environment %s provides\n' \
       "$GRN" "$R" "$(basename "$file")" "$label"
   else
     printf '  %s✗%s %-26s %sunsatisfied by %s%s\n' \
       "$RED" "$R" "$(basename "$file")" "$RED" "$label" "$R"
-    printf '      %s%s%s\n' "$DIM" "$err" "$R"
-    printf '      %s→ either generate the variable in %s, or move the service\n' "$DIM" "$label"
-    printf '        into an overlay file only its users pass (see compose.ghost.yml)%s\n' "$R"
+    printf '      %s%s%s\n' "$DIM" "$(printf '%s\n' "$out" | head -1)" "$R"
+    printf '      %s→ if a variable is missing: generate it in %s, or move the\n' "$DIM" "$label"
+    printf '        service into an overlay only its users pass (see compose.ghost.yml).\n'
+    printf '        Any other error means the file itself does not parse.%s\n' "$R"
     fail=$((fail + 1))
   fi
   rm -f "$envf"
@@ -145,15 +194,19 @@ printf '  %sinstall.sh generates %d variables; build-bundle.sh exports %d for th
 
 # What a customer install actually runs.
 check_file deploy/docker/compose.prod.yml    "install.sh"   "${IVARS[@]}"
-check_file deploy/docker/compose.ha.yml      "install.sh"   "${IVARS[@]}"
-check_file deploy/docker/compose.cluster.yml "install.sh"   "${IVARS[@]}"
+check_file deploy/docker/compose.prod.yml,deploy/docker/compose.ha.yml \
+           "install.sh"   "${IVARS[@]}"
+check_file deploy/docker/compose.prod.yml,deploy/docker/compose.cluster.yml \
+           "install.sh"   "${IVARS[@]}"
 
 # What the release build runs, before any customer is involved.
 check_file deploy/docker/compose.prod.yml    "build-bundle.sh" "${BVARS[@]}"
 
 # Deliberate HA overlays: operator-supplied, per the 2VM guide.
-check_file deploy/docker/compose.2vm-active.yml  "install-2vm.sh + its guide" "${IVARS[@]}" "${HVARS[@]}"
-check_file deploy/docker/compose.2vm-passive.yml "install-2vm.sh + its guide" "${IVARS[@]}" "${HVARS[@]}"
+check_file deploy/docker/compose.prod.yml,deploy/docker/compose.2vm-active.yml \
+           "install-2vm.sh + its guide" "${IVARS[@]}" "${HVARS[@]}"
+check_file deploy/docker/compose.prod.yml,deploy/docker/compose.2vm-passive.yml \
+           "install-2vm.sh + its guide" "${IVARS[@]}" "${HVARS[@]}"
 
 # ── overlays that are allowed to be strict ──────────────────────────────────
 # compose.ghost.yml keeps its `:?` guards on purpose: for a public-edge practice

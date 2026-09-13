@@ -242,7 +242,16 @@ say "  recreating changed services (migrations run first, as a dependency)…"
 
 # Did migrations actually apply anything?
 MIGRATED=no
-if docker logs sentinel-migrate-1 2>&1 | tail -40 | grep -qE "OK\s+[0-9]+_"; then
+# `docker logs` output is unbounded, so it must NOT be piped into `grep -q`
+# under `set -o pipefail`. `grep -q` exits the moment it matches, `docker logs`
+# then dies on SIGPIPE with 141, and pipefail makes the PIPELINE non-zero — so a
+# pattern that IS present reads as absent. Verified: a 200k-line producer piped
+# into `grep -q` on a pattern it contains returns 141 and takes the else branch
+# (a small producer finishes first and happens to work, which is why this hides).
+# Capturing first and matching the variable removes the pipeline entirely.
+# A `tail` in the middle does not help: tail is then the one killed by SIGPIPE.
+miglog=$(docker logs sentinel-migrate-1 2>&1 || true)
+if grep -qE "OK\s+[0-9]+_" <<<"$(tail -40 <<<"$miglog")"; then
   MIGRATED=yes
   warn "database migrations were APPLIED by this upgrade"
 else

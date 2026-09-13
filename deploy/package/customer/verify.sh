@@ -83,7 +83,19 @@ else
 fi
 # Belt and braces: the warning is logged once at startup and is the only trace if
 # the container is later restarted into a good state while the pool stays nil.
-if docker logs sentinel-controlplane-1 2>&1 | grep -qE 'degraded mode|running standalone'; then
+#
+# `docker logs` output is unbounded, so it must NOT be piped into `grep -q`
+# under `set -o pipefail`. `grep -q` exits the moment it matches, `docker logs`
+# then dies on SIGPIPE with 141, and pipefail makes the PIPELINE non-zero — so a
+# pattern that IS present reads as absent. Verified: a 200k-line producer piped
+# into `grep -q` on a pattern it contains returns 141 and takes the else branch
+# (a small producer finishes first and happens to work, which is why this hides).
+# Capturing first and matching the variable removes the pipeline entirely.
+#
+# This check is the reason it matters: piped, a control plane that HAD logged
+# degraded mode was reported healthy by the installer's own verifier.
+cplogs=$(docker logs sentinel-controlplane-1 2>&1 || true)
+if grep -qE 'degraded mode|running standalone' <<<"$cplogs"; then
   bad "control plane logged degraded mode at startup — it has NO database
        docker logs sentinel-controlplane-1 2>&1 | grep -E 'degraded mode|running standalone'"
 fi

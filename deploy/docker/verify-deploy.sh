@@ -80,8 +80,16 @@ for c in controlplane cp2 cp3 migrate; do
   else FAIL "$c does NOT mount the CA — its verify-full DSN cannot be parsed (no database)"; fi
 done
 # And prove no node is silently running without a DB.
+# `docker logs` output is unbounded, so it must NOT be piped into `grep -q`
+# under `set -o pipefail`. `grep -q` exits the moment it matches, `docker logs`
+# then dies on SIGPIPE with 141, and pipefail makes the PIPELINE non-zero — so a
+# pattern that IS present reads as absent. Verified: a 200k-line producer piped
+# into `grep -q` on a pattern it contains returns 141 and takes the else branch
+# (a small producer finishes first and happens to work, which is why this hides).
+# Capturing first and matching the variable removes the pipeline entirely.
 for c in controlplane cp2 cp3; do
-  if docker logs "sentinel-${c}-1" --since 30m 2>&1 | grep -qi "running standalone"; then
+  clog=$(docker logs "sentinel-${c}-1" --since 30m 2>&1 || true)
+  if grep -qi "running standalone" <<<"$clog"; then
     FAIL "$c logged 'running standalone' — it has NO database"
   else PASS "$c has a database (never fell back to standalone)"; fi
 done
@@ -117,7 +125,12 @@ done
 ho=$(for c in controlplane cp2 cp3; do docker logs "sentinel-${c}-1" --since 60m 2>&1 \
        | grep -cE "acquired write leadership"; done | paste -sd+ | bc 2>/dev/null || echo 0)
 echo "        leadership acquisitions in the last hour (all nodes): ${ho:-0}"
-if ! docker logs sentinel-controlplane-1 --since 10m 2>&1 | grep -qiE "raft"; then
+# Captured, not piped — see the SIGPIPE note above. This one inverted in the
+# dangerous direction: with the pattern PRESENT the pipeline returned 141, `!`
+# flipped it true, and the check announced "no Raft references" precisely when
+# there were some.
+cplog=$(docker logs sentinel-controlplane-1 --since 10m 2>&1 || true)
+if ! grep -qiE "raft" <<<"$cplog"; then
   PASS "no Raft references in control-plane logs (Raft removed)"
 else WARN "log still mentions raft"; fi
 
@@ -133,9 +146,11 @@ done
 MARKER="203.0.113.77"
 curl -s -o /dev/null -H "Host: 172.16.21.71" -H "X-Forwarded-For: $MARKER" --max-time 10 http://127.0.0.1/ || true
 sleep 3
-if docker logs sentinel-waf1-1 --since 2m 2>&1 | grep -q "$MARKER" \
-   || docker logs sentinel-waf2-1 --since 2m 2>&1 | grep -q "$MARKER" \
-   || docker logs sentinel-waf3-1 --since 2m 2>&1 | grep -q "$MARKER"; then
+# Captured, not piped — see the SIGPIPE note above.
+nodelogs=$(for n in waf1 waf2 waf3; do
+             docker logs "sentinel-${n}-1" --since 2m 2>&1 || true
+           done)
+if grep -q "$MARKER" <<<"$nodelogs"; then
   PASS "XFF client IP $MARKER attributed (not collapsed to the LB address)"
 else
   WARN "did not observe $MARKER in node logs (log format may not include client_ip at this level)"

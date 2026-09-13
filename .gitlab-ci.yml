@@ -230,6 +230,12 @@ deploy-shell:
     #     and no hard-coded vN.N.N in dashboard source. The console once showed
     #     four different versions on one deployment.
     - ./deploy/ci/check-version-consistency.sh
+    # 3c. No unbounded producer piped into `grep -q`. Under pipefail that
+    #     inverts — `grep -q` exits on match, the producer dies on SIGPIPE with
+    #     141, and a pattern that IS present reads as absent. It silently broke
+    #     three checks, including the customer installer's own verifier, which
+    #     reported a database-less control plane as healthy.
+    - ./deploy/ci/check-pipefail-grep.sh
     # 4. The contract check — the one that catches shipping-breaking bugs.
     - STAGE_ONLY=1 ./deploy/package/build-bundle.sh
     - ./deploy/ci/check-bundle-contract.sh
