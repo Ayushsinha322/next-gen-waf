@@ -325,6 +325,41 @@ docker system df           # how much Docker is using
 docker system prune -f     # safe cleanup: removes unused images/build cache (NOT your volumes/data)
 ```
 
+**Reclaim the space ClickHouse spent logging about itself** (one time, after
+deploying `clickhouse-logging.xml`):
+
+```bash
+cd /opt/sentinel-src/deploy/docker
+./clickhouse-reclaim-logs.sh            # report only, changes nothing
+./clickhouse-reclaim-logs.sh --apply    # drop the renamed leftovers
+```
+
+ClickHouse writes its own server log into system tables, and the packaged
+configuration puts no retention on them at all. Measured on the deploy VM at 75
+days of uptime, `system.text_log` alone held **15.26 GiB across 345 million
+rows**, against **3.88 MiB** of actual WAF events — 99.9% of an 18 GiB volume
+spent describing its own merges. This is not only wasted disk: merges on that
+table are what OOM-killed ClickHouse during startup and produced the restart
+storm recorded in `compose.prod.yml`.
+
+`clickhouse-logging.xml` fixes the growth going forward, by lowering the server
+log level from `trace` to `information` and putting a TTL on every self-log
+table. But a TTL only governs a table from the moment it exists. When ClickHouse
+starts and finds a table whose definition no longer matches its config — which
+is what adding a TTL does — it **renames the old one out of the way** and
+creates a fresh one:
+
+```
+system.text_log      →  new, with the TTL
+system.text_log_0    →  every existing row, still no TTL, for ever
+```
+
+So the config alone stops the bleeding and reclaims nothing. The script is what
+turns the old table back into free disk. It only ever names ClickHouse's own log
+tables in the `system` database; `sentinel_logs` holds the product's data and is
+never matched. Run it once per node after the first deploy of the new config;
+running it again is harmless and reports nothing to do.
+
 **Update the code and redeploy** (after you change the source):
 ```bash
 # from your laptop — push the latest source to the VM

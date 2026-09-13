@@ -1,0 +1,149 @@
+<?xml version="1.0"?>
+<!--
+  ClickHouse SELF-logging retention drop-in. Mounted at
+  /etc/clickhouse-server/config.d/ so it overlays the packaged config.
+
+  THE PROBLEM THIS FIXES
+
+  ClickHouse writes its own server log into system tables, and the packaged
+  configuration puts NO retention on them. Measured on the deploy VM
+  (2026-09-13, 75 days uptime):
+
+      system.text_log                 15.26 GiB   345,169,520 rows
+      system.metric_log                1.06 GiB
+      system.asynchronous_metric_log     511 MiB
+      system.trace_log                   362 MiB
+      ·················································
+      sentinel_logs.waf_events          3.88 MiB        80,153 rows
+
+  That is 99.9% of an 18 GiB volume spent on ClickHouse describing its own
+  merges — "Trying to reserve 1.00 MiB using storage policy", "Selected
+  MergeAlgorithm: Horizontal", "Updating DNS cache" — at roughly 4.6M rows a
+  day, while the actual security events the product exists to store came to
+  under four megabytes.
+
+  It has already caused an outage rather than merely wasting disk: merges on
+  system.text_log were what OOM-killed ClickHouse during startup and produced
+  the ~24k container restarts recorded in compose.prod.yml's memory-limit
+  comment. Growth with no ceiling on an appliance a customer installs on their
+  own disk is a matter of when, not whether.
+
+  WHAT THIS SETS
+
+  1. A server log LEVEL of `information`. The image default is `trace`, which is
+     a debugging level: Trace and Debug lines were 96% of everything written in
+     a sampled hour. This also quiets the container's stdout, so Docker's
+     json-file log stops growing at the same rate.
+
+  2. A TTL on every self-log table. Retention is chosen per table by how likely
+     anyone is to read it: query_log survives long enough to investigate a slow
+     dashboard, the per-merge chatter does not.
+
+  RAISING IT AGAIN TEMPORARILY
+
+  To debug ClickHouse itself, set <level>trace</level> here and restart that one
+  container. Put it back afterwards — at trace this fills a 100 GB disk in about
+  a year and a half, faster on a busy node.
+
+  RECLAIMING SPACE ON AN EXISTING DEPLOYMENT
+
+  A TTL added here governs the table from now on; it does NOT retroactively
+  delete what a long-running node has already accumulated, and ClickHouse
+  renames rather than drops a table whose definition no longer matches its
+  config. Run deploy/docker/clickhouse-reclaim-logs.sh once after deploying
+  this, which is also what turns the 15 GiB back into free disk.
+-->
+<clickhouse>
+    <!-- Server log verbosity. `information` is the production level; `trace` is
+         for debugging ClickHouse and is what the image ships. This governs both
+         the file/stdout log and what is eligible for system.text_log. -->
+    <logger>
+        <level>information</level>
+    </logger>
+
+    <!-- The server's own message log. The single largest consumer by two orders
+         of magnitude. A week is long enough to investigate an incident nobody
+         noticed for a few days; `level` keeps Trace/Debug out of the table even
+         if the logger above is temporarily raised. -->
+    <text_log>
+        <level>information</level>
+        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
+    </text_log>
+
+    <!-- Queries. Kept longest of the self-logs: this is the one an operator
+         actually reads, when the console is slow or a report times out. -->
+    <query_log>
+        <ttl>event_date + INTERVAL 14 DAY DELETE</ttl>
+    </query_log>
+
+    <!-- Per-part merge/mutation history. Useful for exactly the failure that
+         bit this deployment (merges being killed), so it outlives the noise. -->
+    <part_log>
+        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
+    </part_log>
+
+    <!-- Sampled metrics. Prometheus already scrapes what anyone dashboards, so
+         these are a short-window fallback, not the record of truth. -->
+    <metric_log>
+        <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+    </metric_log>
+    <asynchronous_metric_log>
+        <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+    </asynchronous_metric_log>
+
+    <!-- Profiling data: only meaningful while someone is actively profiling,
+         and never read afterwards. -->
+    <trace_log>
+        <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+    </trace_log>
+    <processors_profile_log>
+        <ttl>event_date + INTERVAL 1 DAY DELETE</ttl>
+    </processors_profile_log>
+    <query_thread_log>
+        <ttl>event_date + INTERVAL 1 DAY DELETE</ttl>
+    </query_thread_log>
+    <query_views_log>
+        <ttl>event_date + INTERVAL 1 DAY DELETE</ttl>
+    </query_views_log>
+
+    <!-- Errors and backups are low-volume and worth keeping around longer, but
+         "low-volume" is not "bounded" — an appliance runs for years. -->
+    <error_log>
+        <ttl>event_date + INTERVAL 30 DAY DELETE</ttl>
+    </error_log>
+    <backup_log>
+        <ttl>event_date + INTERVAL 30 DAY DELETE</ttl>
+    </backup_log>
+
+    <!-- Per-query metric samples (24.x): sampled at query rate, so this is the
+         next text_log if left alone.
+
+         system.opentelemetry_span_log is deliberately absent. The packaged
+         config gives it an explicit <engine>, and ClickHouse then REFUSES to
+         start if a separate <ttl> is also set: "If 'engine' is specified for
+         system table, TTL parameters should be specified directly inside
+         'engine'" — exit code 36, server down. Restating their engine here just
+         to append a TTL would silently drift from the packaged definition on
+         the next image bump, and span logging is off unless someone raises
+         opentelemetry_start_trace_probability above its default of 0. If you
+         turn tracing on, bound it then, inside the engine. -->
+    <query_metric_log>
+        <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+    </query_metric_log>
+    <asynchronous_insert_log>
+        <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+    </asynchronous_insert_log>
+    <blob_storage_log>
+        <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+    </blob_storage_log>
+    <s3queue_log>
+        <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+    </s3queue_log>
+
+    <!-- Deliberately NOT bounded: system.crash_log is tiny, written only when
+         the server dies, and is the first thing anyone wants after it does.
+         system.session_log is off by default in this image and stays off.
+
+         A section here for a log this ClickHouse version does not have is
+         ignored, so the list can name tables across versions safely. -->
+</clickhouse>

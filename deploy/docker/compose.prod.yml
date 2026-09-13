@@ -170,6 +170,17 @@ services:
       CLICKHOUSE_MAX_SERVER_MEMORY_USAGE_TO_RAM_RATIO: "0.6"
     volumes:
       - chdata:/var/lib/clickhouse
+      # Retention for ClickHouse's OWN logs. Unlike the TLS drop-in below this
+      # is safe to mount unconditionally: the file is committed to the repo, so
+      # it always exists and Docker can never invent a directory in its place.
+      #
+      # Without it ClickHouse keeps its self-log forever. Measured on the deploy
+      # VM at 75 days uptime: system.text_log alone held 15.26 GiB across 345M
+      # rows, against 3.88 MiB of actual WAF events — 99.9% of an 18 GiB volume
+      # spent describing its own merges. Merges on that table are also what
+      # OOM-killed the server and produced the restart storm the mem_limit note
+      # above refers to, so this is an availability fix, not just disk hygiene.
+      - ./clickhouse-logging.xml:/etc/clickhouse-server/config.d/logging.xml:ro
       # TLS drop-in + leaf, so the HTTPS interface is available for cross-host
       # clients (the 2-VM passive node). Issued by issue-clickhouse-cert.sh.
       #
