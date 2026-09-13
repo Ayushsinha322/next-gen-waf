@@ -368,7 +368,7 @@ export default function RulesPage() {
 
   return (
     <motion.div className="sec" variants={staggerContainer} initial="hidden" animate="visible">
-      <FirstRunNote id="rules" title="Two different rule sets are summarised above">
+      <FirstRunNote id="rules" title="This page shows two different rule sets">
         The OWASP Core Rule Set is compiled into the data plane and enforced as a whole — the
         &ldquo;enforcing&rdquo; figure is what the engine actually runs, and anything that failed to
         compile is counted separately rather than silently skipped. Rules you author here are the
