@@ -812,10 +812,15 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                   </div>
                   <GroupLabel>Rule Exclusions (false-positive tuning)</GroupLabel>
                   {form.rule_exclusions.map((ex, i) => (
-                    <div key={i} style={{ display: "grid", gridTemplateColumns: "1fr 2fr auto", gap: 8, alignItems: "end" }}>
+                    <div key={i} style={{ display: "grid", gridTemplateColumns: "1fr 2fr auto", gap: 8, alignItems: "start" }}>
                       <Field label="Rule ID" hint="Numeric CRS or custom rule id to exclude, e.g. 942100."><input className="fin2" type="number" value={ex.rule_id} onChange={e => upd({ rule_exclusions: form.rule_exclusions.map((x, idx) => idx === i ? { ...x, rule_id: Number(e.target.value) } : x) })} /></Field>
                       <Field label="Exclude Targets" hint="comma-separated (e.g. ARGS:id, REQUEST_HEADERS:Referer)"><input className="fin2" value={ex.exclude_targets.join(", ")} onChange={e => upd({ rule_exclusions: form.rule_exclusions.map((x, idx) => idx === i ? { ...x, exclude_targets: e.target.value.split(",").map(t => t.trim()).filter(Boolean) } : x) })} /></Field>
-                      <button className="btn bg-btn btn-sm" type="button" onClick={() => upd({ rule_exclusions: form.rule_exclusions.filter((_, idx) => idx !== i) })}>🗑</button>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 4, alignItems: "center" }}>
+                          {/* Spacer, not a label: reserves the label row so the
+                              button lands on the input line. */}
+                          <label className="flbl2" aria-hidden style={{ visibility: "hidden" }}>&nbsp;</label>
+                          <button className="btn bg-btn btn-sm" type="button" onClick={() => upd({ rule_exclusions: form.rule_exclusions.filter((_, idx) => idx !== i) })}>🗑</button>
+                      </div>
                     </div>
                   ))}
                   <button className="btn bg-btn btn-xs" type="button" style={{ alignSelf: "flex-start" }} onClick={() => upd({ rule_exclusions: [...form.rule_exclusions, { rule_id: 0, exclude_targets: [] }] })}>＋ Add Exclusion</button>
@@ -985,7 +990,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                   <GroupLabel>External Threat-Intel Feeds <Tag kind="enforced" /></GroupLabel>
                   <InfoBox>🌐 Auto-refreshed IP blocklists (AbuseIPDB, Spamhaus DROP, FireHOL, …). Loaded at startup and refreshed on the interval — matched IPs are blocked before rules run.</InfoBox>
                   {form.ip_feeds.map((feed, i) => (
-                    <div key={i} style={{ display: "grid", gridTemplateColumns: "2.4fr 0.8fr 0.9fr auto", gap: 8, alignItems: "end" }}>
+                    <div key={i} style={{ display: "grid", gridTemplateColumns: "2.4fr 0.8fr 0.9fr auto", gap: 8, alignItems: "start" }}>
                       <Field label={`Feed URL #${i + 1}`} hint="HTTP(S) URL of an IP blocklist. Fetched by the data plane on the refresh interval."><input className="fin2" value={feed.url} placeholder="https://iplists.firehol.org/…/firehol_level1.netset" style={{ fontFamily: "var(--font-mono)", fontSize: 13 }} onChange={e => upd({ ip_feeds: form.ip_feeds.map((x, idx) => idx === i ? { ...x, url: e.target.value } : x) })} /></Field>
                       <Field label="Refresh" hint="e.g. 1h"><input className="fin2" value={feed.interval} placeholder="1h" onChange={e => upd({ ip_feeds: form.ip_feeds.map((x, idx) => idx === i ? { ...x, interval: e.target.value } : x) })} /></Field>
                       <Field label="Format" hint="How this feed's file is laid out: one CIDR per line, or JSON.">
@@ -994,7 +999,12 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                           <option value="json">JSON</option>
                         </select>
                       </Field>
-                      <button className="btn bg-btn btn-sm" type="button" onClick={() => upd({ ip_feeds: form.ip_feeds.filter((_, idx) => idx !== i) })}>🗑</button>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 4, alignItems: "center" }}>
+                          {/* Spacer, not a label: reserves the label row so the
+                              button lands on the input line. */}
+                          <label className="flbl2" aria-hidden style={{ visibility: "hidden" }}>&nbsp;</label>
+                          <button className="btn bg-btn btn-sm" type="button" onClick={() => upd({ ip_feeds: form.ip_feeds.filter((_, idx) => idx !== i) })}>🗑</button>
+                      </div>
                     </div>
                   ))}
                   <button className="btn bg-btn btn-xs" type="button" style={{ alignSelf: "flex-start" }} onClick={() => upd({ ip_feeds: [...form.ip_feeds, { url: "", interval: "1h", format: "cidr" }] })}>＋ Add Feed</button>
@@ -1018,10 +1028,15 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                   {form.cors_enabled && <Field label="Allowed Origins" hint="* or comma-separated origins"><input className="fin2" value={form.cors_origins} style={{ fontFamily: "var(--font-mono)", fontSize: 13 }} onChange={e => upd({ cors_origins: e.target.value })} /></Field>}
                   <GroupLabel>Custom Headers</GroupLabel>
                   {form.custom_headers.map((h, i) => (
-                    <div key={i} style={{ display: "grid", gridTemplateColumns: "1fr 1.5fr auto", gap: 8, alignItems: "end" }}>
+                    <div key={i} style={{ display: "grid", gridTemplateColumns: "1fr 1.5fr auto", gap: 8, alignItems: "start" }}>
                       <Field label="Name" hint="Header name added to every response from this site."><input className="fin2" value={h.name} placeholder="X-Custom" onChange={e => setHeader(i, { name: e.target.value })} /></Field>
                       <Field label="Value" hint="Value sent with that header."><input className="fin2" value={h.value} onChange={e => setHeader(i, { value: e.target.value })} /></Field>
-                      <button className="btn bg-btn btn-sm" type="button" onClick={() => upd({ custom_headers: form.custom_headers.filter((_, idx) => idx !== i) })}>🗑</button>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 4, alignItems: "center" }}>
+                          {/* Spacer, not a label: reserves the label row so the
+                              button lands on the input line. */}
+                          <label className="flbl2" aria-hidden style={{ visibility: "hidden" }}>&nbsp;</label>
+                          <button className="btn bg-btn btn-sm" type="button" onClick={() => upd({ custom_headers: form.custom_headers.filter((_, idx) => idx !== i) })}>🗑</button>
+                      </div>
                     </div>
                   ))}
                   <button className="btn bg-btn btn-xs" type="button" style={{ alignSelf: "flex-start" }} onClick={() => upd({ custom_headers: [...form.custom_headers, { name: "", value: "" }] })}>＋ Add Header</button>
