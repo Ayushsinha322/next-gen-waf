@@ -195,14 +195,20 @@ type Hub struct {
 	rpsWin  []time.Time
 	rpsLock sync.Mutex
 
-	// Latency ring for p99 (last 1000 values from access logs).
+	// Latency rings for p99, from the access log.
+	//
+	// Samples carry the time they were taken and are dropped once they age out
+	// of latencyWindow. Without that the ring was simply "the last 1000
+	// requests, of any age", and on a quiet deployment — which is every
+	// deployment on its first day — the figure never decayed: one slow request
+	// stayed the headline latency for as long as the process lived.
 	latMu  sync.Mutex
-	latBuf []float64
+	latBuf []latSample
 	// wafLatBuf holds the WAF's OWN processing time (end-to-end minus the wait
 	// on the origin). Separate ring because it answers the question the console's
 	// badge actually implies — what the WAF costs — and a slow or long-polling
 	// origin cannot distort it.
-	wafLatBuf []float64
+	wafLatBuf []latSample
 
 	// Per-second traffic history (last 120 buckets = 2 minutes).
 	histMu  sync.RWMutex
@@ -230,8 +236,8 @@ func NewHub() *Hub {
 	h := &Hub{
 		subs:       make(map[chan Entry]struct{}),
 		done:       make(chan struct{}),
-		latBuf:     make([]float64, 0, 1000),
-		wafLatBuf:  make([]float64, 0, 1000),
+		latBuf:     make([]latSample, 0, 1000),
+		wafLatBuf:  make([]latSample, 0, 1000),
 		blockedIPs: make(map[string]struct{}),
 		attackCats: make(map[string]int64),
 		byCountry:  make(map[string]int64),
@@ -585,9 +591,10 @@ func (h *Hub) updateMetrics(e Entry) {
 			// nothing about latency. Excluded from both rings rather than
 			// clamped, because a clamp would silently invent a value.
 			if row.Status != 101 {
+				now := time.Now()
 				h.latMu.Lock()
 				if ms > 0 {
-					h.latBuf = append(h.latBuf, ms)
+					h.latBuf = trimLatWindow(append(h.latBuf, latSample{at: now, ms: ms}), now)
 					if len(h.latBuf) > 1000 {
 						h.latBuf = h.latBuf[len(h.latBuf)-1000:]
 					}
@@ -595,8 +602,24 @@ func (h *Hub) updateMetrics(e Entry) {
 				// waf_ms can legitimately be ~0 for a cheap pass, so this ring
 				// admits >= 0 — unlike end-to-end latency, where 0 only ever
 				// meant "not parsed".
-				if wafMs >= 0 && row.WafMs != nil {
-					h.wafLatBuf = append(h.wafLatBuf, wafMs)
+				//
+				// A GATEWAY ERROR is excluded. On a 502 or 504 the origin never
+				// answered and the request sat waiting for the upstream timeout;
+				// the data plane attributes that whole wait to waf_ms, so a dead
+				// origin reads as ten seconds of WAF processing. Measured on the
+				// deploy VM: a single `GET /` that 502'd recorded waf_ms 9918.7
+				// against a real WAF cost of well under a millisecond, and with
+				// 38 samples in the ring the "p99" — which at that count is just
+				// the maximum — reported 8617ms in the console badge while the
+				// data plane's own summary said 90ms.
+				//
+				// Excluded rather than clamped, for the same reason status 101
+				// is: a clamp would silently invent a number. The end-to-end
+				// ring still counts it, because a 502 IS what the user
+				// experienced.
+				isGatewayError := row.Status == 502 || row.Status == 504
+				if wafMs >= 0 && row.WafMs != nil && !isGatewayError {
+					h.wafLatBuf = trimLatWindow(append(h.wafLatBuf, latSample{at: now, ms: wafMs}), now)
 					if len(h.wafLatBuf) > 1000 {
 						h.wafLatBuf = h.wafLatBuf[len(h.wafLatBuf)-1000:]
 					}
@@ -855,39 +878,76 @@ func (h *Hub) computeRPS() float64 {
 
 // latWafSamples reports how many WAF-own-time samples are held.
 func (h *Hub) latWafSamples() int {
+	now := time.Now()
 	h.latMu.Lock()
 	defer h.latMu.Unlock()
+	h.wafLatBuf = trimLatWindow(h.wafLatBuf, now)
 	return len(h.wafLatBuf)
 }
 
 // computeP99Waf is the p99 of the WAF's own processing time.
 func (h *Hub) computeP99Waf() float64 {
+	now := time.Now()
 	h.latMu.Lock()
-	cp := make([]float64, len(h.wafLatBuf))
-	copy(cp, h.wafLatBuf)
+	h.wafLatBuf = trimLatWindow(h.wafLatBuf, now)
+	cp := valuesOf(h.wafLatBuf)
 	h.latMu.Unlock()
 	return p99Of(cp)
 }
 
 // latSamples reports how many latency samples the p99 is based on.
 func (h *Hub) latSamples() int {
+	now := time.Now()
 	h.latMu.Lock()
 	defer h.latMu.Unlock()
+	h.latBuf = trimLatWindow(h.latBuf, now)
 	return len(h.latBuf)
 }
 
 func (h *Hub) computeP99() float64 {
+	now := time.Now()
 	h.latMu.Lock()
-	n := len(h.latBuf)
-	if n == 0 {
-		h.latMu.Unlock()
-		return 0
-	}
-	cp := make([]float64, n)
-	copy(cp, h.latBuf)
+	h.latBuf = trimLatWindow(h.latBuf, now)
+	cp := valuesOf(h.latBuf)
 	h.latMu.Unlock()
 
 	return p99Of(cp)
+}
+
+// latencyWindow is how far back a latency sample stays relevant.
+//
+// The badge is presented as live ("real-time security intelligence"), so it has
+// to describe the recent past rather than the worst thing ever seen. Five
+// minutes is long enough to survive a quiet patch at a few requests a second
+// and short enough that a fixed problem stops being reported as current.
+const latencyWindow = 5 * time.Minute
+
+// latSample is one latency reading and when it was taken.
+type latSample struct {
+	at time.Time
+	ms float64
+}
+
+// trimLatWindow drops samples older than latencyWindow. Callers hold latMu.
+//
+// Samples are appended in time order, so the expired ones are always a prefix
+// and this is a slice of the head rather than a scan.
+func trimLatWindow(buf []latSample, now time.Time) []latSample {
+	cut := now.Add(-latencyWindow)
+	i := 0
+	for i < len(buf) && buf[i].at.Before(cut) {
+		i++
+	}
+	return buf[i:]
+}
+
+// valuesOf extracts the readings, which is what the percentile works on.
+func valuesOf(buf []latSample) []float64 {
+	out := make([]float64, len(buf))
+	for i, s := range buf {
+		out[i] = s.ms
+	}
+	return out
 }
 
 // p99Of is the 99th percentile of an unsorted sample, rounded to one decimal.
