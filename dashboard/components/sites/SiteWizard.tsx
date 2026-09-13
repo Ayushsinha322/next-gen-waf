@@ -688,12 +688,32 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     </Field>
                     <GroupLabel>Upstream Servers</GroupLabel>
                     {form.servers.map((s, i) => (
-                      <div key={i} style={{ display: "grid", gridTemplateColumns: "2fr 1fr 0.8fr auto auto", gap: 8, alignItems: "end" }}>
+                      // Align on the INPUT row, not the bottom of the cell.
+                      //
+                      // This was `alignItems: "end"`, which bottom-aligns every
+                      // column. The three fields carry hints of different
+                      // lengths — Weight's wraps to three lines where Port's
+                      // wraps to one — so the tallest cell pushed its own label
+                      // and input upward, while the cells with no hint at all,
+                      // TLS and the remove button, sank to the bottom. Nothing
+                      // in the row lined up with anything else.
+                      //
+                      // Starting from the top lines the labels up, and since
+                      // every label is a single line the inputs line up beneath
+                      // them. The hints then hang below at whatever height they
+                      // need, which is where variable-length text belongs.
+                      <div key={i} style={{ display: "grid", gridTemplateColumns: "2fr 1fr 0.8fr auto auto", gap: 8, alignItems: "start" }}>
                         <Field label={`Host #${i + 1}`} hint="The origin as the WAF reaches it — a hostname or address on your network, not the public domain."><input className="fin2" value={s.host} placeholder="127.0.0.1" onChange={e => setServer(i, { host: e.target.value })} /></Field>
                         <Field label="Port" hint="The port your application listens on."><input className="fin2" type="number" value={s.port} onChange={e => setServer(i, { port: Number(e.target.value) })} /></Field>
                         <Field label="Weight" hint="Relative share of traffic when several origins are listed. Equal weights spread evenly."><input className="fin2" type="number" value={s.weight} onChange={e => setServer(i, { weight: Number(e.target.value) })} /></Field>
                         <div style={{ display: "flex", flexDirection: "column", gap: 4, alignItems: "center" }}><label className="flbl2">TLS</label><Sw on={s.tls} set={v => setServer(i, { tls: v })} /></div>
-                        <button className="btn bg-btn btn-sm" type="button" disabled={form.servers.length === 1} onClick={() => rmServer(i)} style={{ opacity: form.servers.length === 1 ? 0.4 : 1 }}>🗑</button>
+                        <div style={{ display: "flex", flexDirection: "column", gap: 4, alignItems: "center" }}>
+                          {/* A spacer, not a label: it reserves the label row so
+                              the button lands on the input line. aria-hidden so
+                              it is never announced as an empty label. */}
+                          <label className="flbl2" aria-hidden style={{ visibility: "hidden" }}>&nbsp;</label>
+                          <button className="btn bg-btn btn-sm" type="button" disabled={form.servers.length === 1} onClick={() => rmServer(i)} style={{ opacity: form.servers.length === 1 ? 0.4 : 1 }}>🗑</button>
+                        </div>
                       </div>
                     ))}
                     <button className="btn bg-btn btn-sm" type="button" onClick={addServer} style={{ alignSelf: "flex-start" }}>＋ Add Server</button>
