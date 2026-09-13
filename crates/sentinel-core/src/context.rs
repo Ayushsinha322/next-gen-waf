@@ -89,6 +89,25 @@ pub enum Severity {
     Notice,
 }
 
+impl Severity {
+    /// How serious this is, higher being worse.
+    ///
+    /// Deliberately an explicit method rather than a derived `Ord`. The variants
+    /// are declared most-severe-first, so a derived ordering would make
+    /// `Critical` the MINIMUM and hand anyone reaching for `max_by_key` a
+    /// `Notice` — a footgun in exactly the code that has to pick the worst
+    /// finding on a request.
+    pub fn rank(&self) -> u8 {
+        match self {
+            Severity::Critical => 4,
+            Severity::High => 3,
+            Severity::Medium => 2,
+            Severity::Low => 1,
+            Severity::Notice => 0,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Request context — lives for the duration of a single request
 // ---------------------------------------------------------------------------
@@ -308,6 +327,36 @@ impl RequestContext {
             .and_then(|v| v.to_str().ok())
             .map(|h| h.split(':').next().unwrap_or(h))
     }
+
+    /// The match that best explains why this request was flagged: highest
+    /// severity, then highest score, and the EARLIEST of equals.
+    ///
+    /// Every record of a request — the ClickHouse event row, the NDJSON line,
+    /// and the operator-facing prose — names one rule, one severity and one
+    /// target. They used to take `rule_matches.first()`, but matches are
+    /// appended in phase order, so the first is simply whichever rule ran
+    /// earliest, not the one that matters. A header-phase rule therefore masked
+    /// every later finding and donated its own, usually lower, severity to the
+    /// record.
+    ///
+    /// Measured on the live demo node: 46% of 80,153 stored events were
+    /// attributed to a MEDIUM "Host header is a numeric IP address" while
+    /// carrying scores up to 61, i.e. several further rules had matched and none
+    /// of them was named. The same request sent with an ordinary Host header was
+    /// recorded correctly as CRITICAL SQL injection, which is what made the
+    /// ordering the culprit rather than the detection.
+    ///
+    /// Ties keep the earliest match, so a request whose findings are genuinely
+    /// equal still reports them in the order they were detected.
+    pub fn primary_rule_match(&self) -> Option<&RuleMatch> {
+        self.rule_matches.iter().reduce(|best, m| {
+            if (m.severity.rank(), m.score) > (best.severity.rank(), best.score) {
+                m
+            } else {
+                best
+            }
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -318,6 +367,70 @@ impl RequestContext {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    /// Build a match with just the fields the selection looks at.
+    fn m(rule_id: &str, severity: Severity, score: u32) -> RuleMatch {
+        RuleMatch {
+            rule_id: rule_id.to_string(),
+            message: format!("finding {rule_id}"),
+            severity,
+            score,
+            target: String::new(),
+            phase: Phase::RequestHeaders,
+            matched_value: String::new(),
+        }
+    }
+
+    #[test]
+    fn severity_rank_orders_critical_above_notice() {
+        assert!(Severity::Critical.rank() > Severity::High.rank());
+        assert!(Severity::High.rank() > Severity::Medium.rank());
+        assert!(Severity::Medium.rank() > Severity::Low.rank());
+        assert!(Severity::Low.rank() > Severity::Notice.rank());
+    }
+
+    /// The regression this exists for. A header-phase rule is appended first, so
+    /// `first()` named the protocol nit and reported it as MEDIUM while the SQL
+    /// injection that actually mattered went unnamed on the record.
+    #[test]
+    fn primary_match_is_the_worst_finding_not_the_earliest() {
+        let mut ctx = RequestContext::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345);
+        ctx.rule_matches.push(m("920350", Severity::Medium, 3));
+        ctx.rule_matches.push(m("942100", Severity::Critical, 5));
+        ctx.rule_matches.push(m("920330", Severity::Notice, 2));
+
+        let top = ctx.primary_rule_match().expect("a match");
+        assert_eq!(top.rule_id, "942100");
+        assert_eq!(top.severity, Severity::Critical);
+    }
+
+    /// Within one severity the higher score wins, so "worst" stays meaningful
+    /// when every finding is critical.
+    #[test]
+    fn primary_match_breaks_severity_ties_on_score() {
+        let mut ctx = RequestContext::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345);
+        ctx.rule_matches.push(m("941100", Severity::Critical, 5));
+        ctx.rule_matches.push(m("942190", Severity::Critical, 9));
+
+        assert_eq!(ctx.primary_rule_match().unwrap().rule_id, "942190");
+    }
+
+    /// Fully equal findings keep detection order, so the record stays stable
+    /// rather than depending on which way the comparison happened to fall.
+    #[test]
+    fn primary_match_keeps_the_earliest_of_equals() {
+        let mut ctx = RequestContext::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345);
+        ctx.rule_matches.push(m("first", Severity::High, 4));
+        ctx.rule_matches.push(m("second", Severity::High, 4));
+
+        assert_eq!(ctx.primary_rule_match().unwrap().rule_id, "first");
+    }
+
+    #[test]
+    fn primary_match_is_none_without_matches() {
+        let ctx = RequestContext::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345);
+        assert!(ctx.primary_rule_match().is_none());
+    }
 
     #[test]
     fn new_context_defaults() {

@@ -8260,7 +8260,8 @@ fn record_event(ctx: &RequestContext) {
         _ if ctx.would_block => "DETECT",
         _ => return, // not notable — don't store
     };
-    let top = ctx.rule_matches.first();
+    // The WORST finding, not the earliest. See RequestContext::primary_rule_match.
+    let top = ctx.primary_rule_match();
     // Tag non-rule blocks so waf_events stays queryable. A threat-intel block
     // carries no RuleMatch and its reason isn't otherwise persisted here, so
     // surface it as rule="THREATINTEL" with the reason in `attack`; other
@@ -8892,7 +8893,8 @@ fn explain_event(ctx: &RequestContext, action: &str, rule: &str, attack: &str) -
         ctx.method.as_str(),
         truncate_for_prose(ctx.uri.path(), 120)
     );
-    let top = ctx.rule_matches.first();
+    // The WORST finding, not the earliest. See RequestContext::primary_rule_match.
+    let top = ctx.primary_rule_match();
     let is_rule_hit = top.is_some();
 
     // What the WAF did, stated so that a learning-mode record can never be
@@ -9159,7 +9161,8 @@ fn ndjson_log(ctx: &RequestContext) {
         || ctx.would_block
         || ctx.gateway_error.is_some()
     {
-        let top = ctx.rule_matches.first();
+        // The WORST finding, not the earliest. See RequestContext::primary_rule_match.
+        let top = ctx.primary_rule_match();
         let sev_str = top
             .map(|r| format!("{:?}", r.severity).to_uppercase())
             .unwrap_or_else(|| "MEDIUM".to_string());
@@ -10262,6 +10265,77 @@ mod log_explain_tests {
             phase: Phase::RequestHeaders,
             matched_value: "' OR 1=1--".to_string(),
         }
+    }
+
+    /// A protocol nit that fires in the headers phase, before any payload has
+    /// been inspected. `920350` matches whenever the Host header is a bare IP,
+    /// which on an appliance reached by address is almost every request.
+    fn host_is_bare_ip_match() -> RuleMatch {
+        RuleMatch {
+            rule_id: "920350".to_string(),
+            message: "Host header is a numeric IP address".to_string(),
+            severity: Severity::Medium,
+            score: 3,
+            target: "REQUEST_HEADERS:host".to_string(),
+            phase: Phase::RequestHeaders,
+            matched_value: "203.0.113.10".to_string(),
+        }
+    }
+
+    /// Every record of a request names ONE rule, and it must be the worst
+    /// finding rather than whichever rule happened to run first.
+    ///
+    /// Measured on the live demo node before this changed: 46% of 80,153 stored
+    /// events were attributed to a MEDIUM "Host header is a numeric IP address"
+    /// while carrying scores far above what that rule alone contributes, so the
+    /// SQL injection, traversal or Log4Shell that actually tripped the threshold
+    /// was nowhere on its own record. Detection was right the whole time; only
+    /// the attribution was wrong, which is worse than it sounds — it is the
+    /// field the console's attack breakdown and every SIEM rule group by.
+    #[test]
+    fn the_record_names_the_worst_rule_not_the_first_one() {
+        let mut ctx = RequestContext::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)), 4444);
+        // Phase order: the protocol nit is appended first, the real finding second.
+        ctx.rule_matches.push(host_is_bare_ip_match());
+        ctx.rule_matches.push(sqli_match());
+
+        let top = ctx.primary_rule_match().expect("a match");
+        assert_eq!(top.rule_id, "942100", "the record must name the injection");
+        assert_eq!(top.severity, Severity::Critical, "and carry its severity");
+        assert_eq!(
+            top.target, "ARGS:username",
+            "and point at the parameter to exclude, not at the Host header"
+        );
+        assert_eq!(
+            redacted_matched(top),
+            "' OR 1=1--",
+            "and show what the rule actually matched"
+        );
+    }
+
+    /// The prose an operator reads is built from the same choice, so it cannot
+    /// drift from the structured fields.
+    #[test]
+    fn the_explanation_describes_the_worst_rule_too() {
+        let mut ctx = RequestContext::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)), 4444);
+        ctx.site_id = Some("demo".to_string());
+        ctx.rule_matches.push(host_is_bare_ip_match());
+        ctx.rule_matches.push(sqli_match());
+
+        let (message, remediation) =
+            explain_event(&ctx, "BLOCK", "942100", "SQL injection detected");
+        assert!(
+            message.contains("942100") && message.contains("Critical"),
+            "explanation should name the injection and its severity: {message}"
+        );
+        assert!(
+            !message.contains("920350"),
+            "the masked protocol nit must not be presented as the finding: {message}"
+        );
+        assert!(
+            remediation.contains("ARGS:username") || remediation.contains("username"),
+            "remediation should name the real parameter: {remediation}"
+        );
     }
 
     #[test]
