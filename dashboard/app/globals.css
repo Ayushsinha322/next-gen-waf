@@ -522,7 +522,12 @@ input, select, textarea { font-family:inherit; }
 .kpi.ka { border-left-color:var(--amber); }
 .kpi.kp { border-left-color:var(--purple); }
 .kpi.kb { border-left-color:var(--blue); }
-.kpi-ico { position:absolute; top:12px; right:12px; opacity:.15; font-size:27px; }
+/* Watermark icon in the top-right of a stat card.
+   opacity was .15, which suited a full-colour emoji at 27px — the glyph
+   carried its own colour, so a heavy fade still left something visible. A
+   stroked line icon has no colour of its own and disappears entirely at
+   that value. Kept as a watermark, raised until the shape actually reads. */
+.kpi-ico { position:absolute; top:12px; right:12px; opacity:.32; color:var(--text2); }
 .kpi-lbl { font-size:14px; font-family:var(--font-sans); font-weight:600; color:var(--text3); text-transform:uppercase; letter-spacing:.9px; margin-bottom:6px; }
 .kpi-val { font-family:var(--font-mono); font-size:30px; font-weight:700; line-height:1; margin-bottom:4px; }
 .kpi-val.r { color:var(--red-b); }

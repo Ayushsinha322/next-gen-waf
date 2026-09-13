@@ -241,7 +241,7 @@ export default function SitesPage() {
           { cls: "kc", ico: "globe" as IconName, lbl: "Total Sites", val: String(sites.length),     valCls: "c" },
         ].map((k, i) => (
           <motion.div key={i} className={`kpi ${k.cls}`} variants={cardVariants}>
-            <span className="kpi-ico"><Icon name={k.ico} size={16} /></span>
+            <span className="kpi-ico"><Icon name={k.ico} size={24} strokeWidth={1.5} /></span>
             <div className="kpi-lbl">{k.lbl}</div>
             <div className={`kpi-val ${k.valCls}`} style={k.valCls === "" ? { color: "var(--text2)" } : {}}>{k.val}</div>
           </motion.div>
