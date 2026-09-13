@@ -53,12 +53,12 @@ export default function ConfigHistory({ onClose, onRestored }: { onClose: () => 
       const skipped = r.skipped?.length
         ? ` · ${r.skipped.length} skipped: ${r.skipped.join(", ")}`
         : "";
-      showToast(`Restored ${r.restored_sites} site(s)${skipped}`, "s", "✓");
+      showToast(`Restored ${r.restored_sites} site(s)${skipped}`, "s");
       setConfirming(null);
       onRestored?.();
       onClose();
     } catch (e) {
-      showToast(e instanceof Error ? e.message : "Rollback failed", "e", "⚠️");
+      showToast(e instanceof Error ? e.message : "Rollback failed", "e");
     } finally {
       setBusy(false);
     }

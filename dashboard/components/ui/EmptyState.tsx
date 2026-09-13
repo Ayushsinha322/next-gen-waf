@@ -1,5 +1,6 @@
 "use client";
 import type { ReactNode } from "react";
+import Icon, { type IconName } from "@/components/ui/Icon";
 
 /**
  * One empty state for every list in the console: what is empty, why that is
@@ -7,9 +8,9 @@ import type { ReactNode } from "react";
  * "No X found" in mono grey; the Plugins page set the pattern this follows.
  */
 export default function EmptyState({
-  icon = "○", title, hint, action, compact = false,
+  icon = "info", title, hint, action, compact = false,
 }: {
-  icon?: ReactNode;
+  icon?: IconName;
   title: string;
   hint?: ReactNode;
   /** Primary next step. `href` renders a link, `onClick` a button. */
@@ -21,7 +22,7 @@ export default function EmptyState({
       padding: compact ? "18px 16px" : "36px 24px", textAlign: "center",
       display: "flex", flexDirection: "column", alignItems: "center", gap: 8,
     }}>
-      <div aria-hidden style={{ fontSize: compact ? 22 : 30, lineHeight: 1, opacity: .85 }}>{icon}</div>
+      <Icon name={icon} size={compact ? 22 : 30} strokeWidth={1.5} style={{ color: "var(--text3)" }} />
       <div style={{ fontSize: compact ? 13 : 15, fontWeight: 700, color: "var(--text2)", fontFamily: "var(--font-display)", letterSpacing: .3 }}>{title}</div>
       {hint && <div style={{ fontSize: 13, color: "var(--text3)", fontFamily: "var(--font-mono)", maxWidth: 520, lineHeight: 1.5 }}>{hint}</div>}
       {action && (action.href

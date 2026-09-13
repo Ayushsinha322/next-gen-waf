@@ -1,5 +1,6 @@
 "use client";
 import { useState, useEffect, useRef } from "react";
+import Icon, { type IconName } from "@/components/ui/Icon";
 import { motion } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
 import {
@@ -62,12 +63,12 @@ function fmtBytes(b: number): string {
 // ---------------------------------------------------------------------------
 // Small KPI tile
 // ---------------------------------------------------------------------------
-function Kpi({ icon, label, value, sub, accent, hint }: { icon: string; label: string; value: React.ReactNode; sub?: string; accent?: string; hint?: string }) {
+function Kpi({ icon, label, value, sub, accent, hint }: { icon: IconName; label: string; value: React.ReactNode; sub?: string; accent?: string; hint?: string }) {
   return (
     <motion.div className="panel" variants={cardVariants} style={{ padding: "14px 16px", cursor: hint ? "help" : undefined }} title={hint}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
         <div style={{ fontSize: 14, color: "var(--text3)", textTransform: "uppercase", letterSpacing: 1, fontFamily: "var(--font-mono)" }}>{label}</div>
-        <span style={{ fontSize: 17, opacity: 0.85 }}>{icon}</span>
+        <Icon name={icon} size={17} style={{ opacity: 0.7 }} />
       </div>
       <div style={{ fontSize: 27, fontWeight: 700, color: accent ?? "var(--text)", marginTop: 8, fontFamily: "var(--font-display)", lineHeight: 1 }}>{value}</div>
       {sub && <div style={{ fontSize: 14, color: "var(--text3)", marginTop: 6, fontFamily: "var(--font-mono)" }}>{sub}</div>}
@@ -274,23 +275,23 @@ export default function OverviewPage() {
             const a = document.createElement("a");
             a.href = url; a.download = `waf-overview-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.json`;
             document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
-            showToast("Overview snapshot exported", "s", "📄");
-          }}>📄 Export</motion.button>
-          <motion.button className="btn bp btn-sm" whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }} onClick={() => { api.dashboard.stats().then(r => { setStats(r.stats); showToast("Dashboard refreshed", "i", "🔄"); }).catch(() => showToast("Refresh failed", "e", "⚠️")); }}>🔄 Refresh</motion.button>
+            showToast("Overview snapshot exported", "s");
+          }}>Export</motion.button>
+          <motion.button className="btn bp btn-sm" whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }} onClick={() => { api.dashboard.stats().then(r => { setStats(r.stats); showToast("Dashboard refreshed", "i"); }).catch(() => showToast("Refresh failed", "e")); }}>Refresh</motion.button>
         </div>
       </motion.div>
 
       {/* KPI grid — all real */}
       <motion.div variants={staggerContainer} style={{ display: "grid", gridTemplateColumns: "repeat(7,minmax(0,1fr))", gap: 12 }}>
-        <Kpi icon="🧠" label="System RAM" accent="var(--cyan)" hint={tip.ram}
+        <Kpi icon="cpu" label="System RAM" accent="var(--cyan)" hint={tip.ram}
           value={memTotal > 0 ? `${memPct.toFixed(0)}%` : "—"}
           sub={memTotal > 0 ? `${fmtBytes(memUsed)} / ${fmtBytes(memTotal)}` : "host metric"} />
-        <Kpi icon="🌐" label="Sites" hint={tip.sites} value={<AnimatedValue value={stats?.total_sites ?? 0} />} sub={`${stats?.active_sites ?? 0} active`} />
-        <Kpi icon="📦" label="Services" hint={tip.services} value={<AnimatedValue value={stats?.active_sites ?? 0} />} sub={`${wafStatus?.upstreams_healthy ?? 0}/${wafStatus?.upstreams_total ?? 0} upstreams`} />
-        <Kpi icon="🖧" label="Instances" hint={tip.inst} value={instances === null ? "—" : instances} sub={(instances ?? 1) > 1 ? "clustered" : "standalone"} />
-        <Kpi icon="🔌" label="Plugins" hint={tip.plugins} value={plugins === null ? "—" : plugins} sub="WASM loaded" />
-        <Kpi icon="🛑" label="Blocked" accent="#ef4444" hint={tip.blocked} value={<AnimatedValue value={blkCount} />} sub={`${openAlerts} open alerts`} />
-        <Kpi icon="📍" label="Blocked IPs" accent="#ef4444" hint={tip.blkIPs} value={<AnimatedValue value={uniqueIPs} />} sub="unique sources" />
+        <Kpi icon="globe" label="Sites" hint={tip.sites} value={<AnimatedValue value={stats?.total_sites ?? 0} />} sub={`${stats?.active_sites ?? 0} active`} />
+        <Kpi icon="package" label="Services" hint={tip.services} value={<AnimatedValue value={stats?.active_sites ?? 0} />} sub={`${wafStatus?.upstreams_healthy ?? 0}/${wafStatus?.upstreams_total ?? 0} upstreams`} />
+        <Kpi icon="server" label="Instances" hint={tip.inst} value={instances === null ? "—" : instances} sub={(instances ?? 1) > 1 ? "clustered" : "standalone"} />
+        <Kpi icon="plug" label="Plugins" hint={tip.plugins} value={plugins === null ? "—" : plugins} sub="WASM loaded" />
+        <Kpi icon="ban" label="Blocked" accent="#ef4444" hint={tip.blocked} value={<AnimatedValue value={blkCount} />} sub={`${openAlerts} open alerts`} />
+        <Kpi icon="map-pin" label="Blocked IPs" accent="#ef4444" hint={tip.blkIPs} value={<AnimatedValue value={uniqueIPs} />} sub="unique sources" />
       </motion.div>
 
       {/* Live metric cards */}

@@ -7,6 +7,7 @@ import { showToast } from "@/components/ui/Toast";
 import EmptyState from "@/components/ui/EmptyState";
 import { api, type Alert, type NotificationChannel } from "@/lib/api";
 import { staggerContainer, cardVariants, fadeUp, spring } from "@/lib/animations";
+import Icon from "@/components/ui/Icon";
 
 export default function AlertsPage() {
   const router = useRouter();
@@ -39,7 +40,7 @@ export default function AlertsPage() {
       setAlerts([...byID.values()].sort(
         (x, y) => new Date(y.created_at).getTime() - new Date(x.created_at).getTime()));
     } catch {
-      showToast("Failed to load alerts","e","⚠️");
+      showToast("Failed to load alerts","e");
     } finally {
       setLoading(false);
     }
@@ -116,13 +117,13 @@ export default function AlertsPage() {
   async function ackGroup(g: Group) {
     const open = g.items.filter(a => a.state === "open");
     await Promise.allSettled(open.map(a => api.alerts.ack(a.id)));
-    showToast(`${open.length} acknowledged`,"s","✅");
+    showToast(`${open.length} acknowledged`,"s");
     setAlerts(p => p.map(a => open.some(o => o.id === a.id) ? { ...a, state: "acked" } : a));
   }
   async function closeGroup(g: Group) {
     const todo = g.items.filter(a => a.state !== "resolved");
     await Promise.allSettled(todo.map(a => api.alerts.resolve(a.id)));
-    showToast(`${todo.length} closed`,"s","✅");
+    showToast(`${todo.length} closed`,"s");
     setAlerts(p => p.map(a => todo.some(o => o.id === a.id) ? { ...a, state: "resolved" } : a));
   }
 
@@ -134,9 +135,9 @@ export default function AlertsPage() {
     setBlocking(ip);
     try {
       await api.threatIntel.create({ type: "ip", value: ip, tier: "block", source: "console", category: "manual", confidence: 100 });
-      showToast(`${ip} is now blocked (threat-intel, block tier)`, "s", "🛡️");
+      showToast(`${ip} is now blocked (threat-intel, block tier)`, "s");
     } catch (e) {
-      showToast(`Block failed: ${e instanceof Error ? e.message : String(e)}`, "e", "⚠️");
+      showToast(`Block failed: ${e instanceof Error ? e.message : String(e)}`, "e");
     } finally { setBlocking(null); }
   }
 
@@ -162,27 +163,27 @@ export default function AlertsPage() {
   async function ackAll() {
     const open = openAlerts;
     await Promise.allSettled(open.map(a => api.alerts.ack(a.id)));
-    showToast(`${open.length} alerts acknowledged`,"s","✅");
+    showToast(`${open.length} alerts acknowledged`,"s");
     loadAlerts();
   }
 
   async function resolveAlert(id: string) {
     try {
       await api.alerts.resolve(id);
-      showToast("Alert resolved","s","✅");
+      showToast("Alert resolved","s");
       setAlerts(p => p.map(a => a.id === id ? { ...a, state: "resolved" } : a));
     } catch {
-      showToast("Failed to resolve","e","⚠️");
+      showToast("Failed to resolve","e");
     }
   }
 
   async function ackAlert(id: string) {
     try {
       await api.alerts.ack(id);
-      showToast("Alert acknowledged","s","✅");
+      showToast("Alert acknowledged","s");
       setAlerts(p => p.map(a => a.id === id ? { ...a, state: "acked" } : a));
     } catch {
-      showToast("Failed to acknowledge","e","⚠️");
+      showToast("Failed to acknowledge","e");
     }
   }
 
@@ -194,11 +195,11 @@ export default function AlertsPage() {
   return (
     <motion.div className="sec" variants={staggerContainer} initial="hidden" animate="visible">
       <motion.div variants={fadeUp} style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",gap:14}}>
-        <div><div className="sec-title">🔴 Security Alerts</div><div className="sec-sub">Real-time incident queue · {alerts.filter(a=>a.state==="open").length} open · {live ? <span style={{color:"var(--green)"}}>● live</span> : <span style={{color:"var(--text3)"}}>○ offline</span>} · DB-backed</div></div>
+        <div><div className="sec-title">Security Alerts</div><div className="sec-sub">Real-time incident queue · {alerts.filter(a=>a.state==="open").length} open · {live ? <span style={{color:"var(--green)"}}>● live</span> : <span style={{color:"var(--text3)"}}>○ offline</span>} · DB-backed</div></div>
         <div style={{display:"flex",gap:8}}>
           <motion.button className="btn bg-btn btn-sm" onClick={loadAlerts} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>⟳ Refresh</motion.button>
-          <motion.a className="btn bg-btn btn-sm" href="/settings" whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>🔔 Channels</motion.a>
-          <motion.button className="btn bc btn-sm" onClick={ackAll} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>✅ Ack All Open</motion.button>
+          <motion.a className="btn bg-btn btn-sm" href="/settings" whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>Channels</motion.a>
+          <motion.button className="btn bc btn-sm" onClick={ackAll} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>Ack All Open</motion.button>
         </div>
       </motion.div>
 
@@ -233,9 +234,9 @@ export default function AlertsPage() {
 
       <motion.div className="panel" variants={fadeUp}>
         <div className="ph">
-          <div className="ptitle">🔴 Alert Queue ({groups.length} incident{groups.length === 1 ? "" : "s"} · {filtered.length} alerts)</div>
+          <div className="ptitle">Alert Queue ({groups.length} incident{groups.length === 1 ? "" : "s"} · {filtered.length} alerts)</div>
           <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
-            <div style={{position:"relative"}}><span style={{position:"absolute",left:10,top:"50%",transform:"translateY(-50%)",color:"var(--text3)",fontSize: 14,pointerEvents:"none"}}>🔍</span><input className="fi2" type="text" placeholder="Search alerts..." style={{width:180}} value={search} onChange={e=>setSearch(e.target.value)} /></div>
+            <div style={{position:"relative"}}><span style={{position:"absolute",left:10,top:"50%",transform:"translateY(-50%)",color:"var(--text3)",fontSize: 14,pointerEvents:"none"}}><Icon name="search" size={14} /></span><input className="fi2" type="text" placeholder="Search alerts..." style={{width:180}} value={search} onChange={e=>setSearch(e.target.value)} /></div>
             <select className="fsel" value={sevFilter} onChange={e=>setSevFilter(e.target.value)}><option value="">All Severity</option><option value="CRITICAL">CRITICAL</option><option value="HIGH">HIGH</option><option value="MEDIUM">MEDIUM</option><option value="LOW">LOW</option></select>
             <select className="fsel" value={stateFilter} onChange={e=>setStateFilter(e.target.value)}><option value="">All States</option><option value="open">Open</option><option value="acked">Acknowledged</option><option value="resolved">Resolved</option></select>
           </div>
@@ -244,7 +245,7 @@ export default function AlertsPage() {
           {loading ? (
             <div style={{padding:"24px",textAlign:"center",fontFamily:"var(--font-mono)",fontSize: 13,color:"var(--text3)"}}>Loading alerts…</div>
           ) : filtered.length === 0 ? (
-            <EmptyState icon="🔔" title={alerts.length === 0 ? "No alerts" : "No alerts match this filter"}
+            <EmptyState icon="bell" title={alerts.length === 0 ? "No alerts" : "No alerts match this filter"}
               hint={alerts.length === 0 ? "Alerts are raised from live detections: attack spikes, repeat offenders, node and certificate problems. A quiet queue with traffic flowing is the good state." : "Change the severity or state filter to see the rest."}
               action={alerts.length === 0 ? { label: "Set up a delivery channel", href: "/settings?tab=notifications" } : undefined} />
           ) : (
@@ -282,7 +283,7 @@ export default function AlertsPage() {
                         <td><div style={{display:"flex",gap:4}}>
                           <motion.button className="btn bg-btn btn-xs" whileHover={{ scale: 1.06 }} whileTap={{ scale: 0.95 }}
                             title="Open the AI Copilot with this alert loaded: what happened, real or false positive, what to do"
-                            onClick={() => openCopilotWith(router, explainAlertPrompt(x))}>🤖</motion.button>
+                            onClick={() => openCopilotWith(router, explainAlertPrompt(x))}><Icon name="sparkles" size={14} title="Explain with Copilot" /></motion.button>
                           {!sub && ip && (
                             <motion.button className="btn bgn btn-xs" disabled={blocking === ip} whileHover={{ scale: 1.06 }} whileTap={{ scale: 0.95 }}
                               onClick={() => blockIP(ip)} title="Add a manual block-tier indicator for this IP to the threat-intel corpus">

@@ -86,9 +86,9 @@ export default function GlobalSettingsPage() {
       const r = await api.globalSettings.put(draft);
       setData(d => d ? { ...d, editable: r.editable } : d);
       setDraft({});
-      showToast(`Saved ${Object.keys(draft).length} setting${Object.keys(draft).length === 1 ? "" : "s"} · ${r.applied}`, "s", "✅");
+      showToast(`Saved ${Object.keys(draft).length} setting${Object.keys(draft).length === 1 ? "" : "s"} · ${r.applied}`, "s");
     } catch (e) {
-      showToast(`Not saved: ${e instanceof Error ? e.message : String(e)}`, "e", "⚠️");
+      showToast(`Not saved: ${e instanceof Error ? e.message : String(e)}`, "e");
     } finally { setSaving(false); }
   }
 
@@ -97,9 +97,9 @@ export default function GlobalSettingsPage() {
       const r = await api.globalSettings.reset(k.key);
       setData(d => d ? { ...d, editable: r.editable } : d);
       const n = { ...draft }; delete n[k.key]; setDraft(n);
-      showToast(`${k.key} reset to its ${k.env ? "environment or default" : "default"} value`, "s", "↺");
+      showToast(`${k.key} reset to its ${k.env ? "environment or default" : "default"} value`, "s");
     } catch (e) {
-      showToast(`Reset failed: ${e instanceof Error ? e.message : String(e)}`, "e", "⚠️");
+      showToast(`Reset failed: ${e instanceof Error ? e.message : String(e)}`, "e");
     }
   }
 
@@ -149,13 +149,13 @@ export default function GlobalSettingsPage() {
     <motion.div className="sec" variants={staggerContainer} initial="hidden" animate="visible">
       <motion.div variants={fadeUp} style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 14 }}>
         <div>
-          <div className="sec-title">🌐 Global Settings</div>
+          <div className="sec-title">Global Settings</div>
           <div className="sec-sub">Node-wide values with their source · editable ones apply live · the data plane&apos;s own file is shown read-only</div>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
           <button className="btn bg-btn btn-sm" onClick={load}>⟳ Refresh</button>
           <motion.button className="btn bp btn-sm" disabled={!dirty || saving} onClick={save} whileHover={{ scale: dirty ? 1.03 : 1 }} whileTap={{ scale: 0.97 }}>
-            {saving ? "Saving…" : dirty ? `💾 Save ${Object.keys(draft).length} change${Object.keys(draft).length === 1 ? "" : "s"}` : "No changes"}
+            {saving ? "Saving…" : dirty ? `Save ${Object.keys(draft).length} change${Object.keys(draft).length === 1 ? "" : "s"}` : "No changes"}
           </motion.button>
         </div>
       </motion.div>

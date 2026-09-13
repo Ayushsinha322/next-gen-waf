@@ -14,6 +14,7 @@
  * API (real ACME + manual upload).
  */
 import type { Site, AcmeProvider } from "./api";
+import Icon from "@/components/ui/Icon";
 
 /**
  * Reduce arbitrary user input to a bare Host-header value.
@@ -370,13 +371,13 @@ export const PRESETS: Record<Exclude<PresetKey, "custom">, {
   rl_per_ip: RateWindow; bot_ja4: boolean;
 }> = {
   essential: {
-    label: "Essential", icon: "🟢",
+    label: "Essential", icon: "shield",
     desc: "Low false-positives. Blocks the OWASP Top-10. Best for most apps.",
     paranoia_level: 1, anomaly_threshold: 10,
     rl_per_ip: { rps: 200, burst: 100 }, bot_ja4: false,
   },
   balanced: {
-    label: "Balanced", icon: "🔵",
+    label: "Balanced", icon: "scale",
     desc: "Recommended. The benchmarked default configuration.",
     // PL2 / threshold 10 — deliberately identical to defaultWafPolicyJSON in
     // control-plane/cmd/controllerd/handlers.go, whose comment reads "keep the
@@ -393,7 +394,7 @@ export const PRESETS: Record<Exclude<PresetKey, "custom">, {
     rl_per_ip: { rps: 100, burst: 50 }, bot_ja4: false,
   },
   strict: {
-    label: "Strict", icon: "🔴",
+    label: "Strict", icon: "lock",
     desc: "Maximum protection. Higher false-positive risk — tune with Learning first.",
     paranoia_level: 4, anomaly_threshold: 3,
     rl_per_ip: { rps: 50, burst: 25 }, bot_ja4: true,

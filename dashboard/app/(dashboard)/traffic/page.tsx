@@ -5,6 +5,7 @@ import { showToast } from "@/components/ui/Toast";
 import EmptyState from "@/components/ui/EmptyState";
 import { api, type TrafficBucket, type MetricsSnapshot } from "@/lib/api";
 import { staggerContainer, cardVariants, fadeUp, spring } from "@/lib/animations";
+import Icon from "@/components/ui/Icon";
 
 interface AccessRow {
   ts:      string;
@@ -155,7 +156,7 @@ export default function TrafficPage() {
     <motion.div className="sec" variants={staggerContainer} initial="hidden" animate="visible">
       <motion.div variants={fadeUp} style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 14 }}>
         <div>
-          <div className="sec-title">📊 Traffic Analysis</div>
+          <div className="sec-title">Traffic Analysis</div>
           <div className="sec-sub">Live request stream · real-time anomaly scoring · source IP analysis</div>
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
@@ -163,7 +164,7 @@ export default function TrafficPage() {
             <option>All Sites</option>
             {siteList.map(s => <option key={s}>{s}</option>)}
           </select>
-          <motion.button className="btn bp btn-sm" whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }} onClick={() => showToast("Export coming in Phase 5", "i", "📤")}>📤 Export</motion.button>
+          <motion.button className="btn bp btn-sm" whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }} onClick={() => showToast("Export coming in Phase 5", "i")}>Export</motion.button>
         </div>
       </motion.div>
 
@@ -186,7 +187,7 @@ export default function TrafficPage() {
       <motion.div variants={fadeUp} style={{ display: "grid", gridTemplateColumns: "1.6fr 1fr", gap: 14 }}>
         <div className="panel">
           <div className="ph">
-            <div className="ptitle">⚡ Request rate (live)</div>
+            <div className="ptitle">Request rate (live)</div>
             <div style={{ display: "flex", gap: 6 }}>
               <span className="panel-badge pb-live">● Live</span>
               <span className="panel-badge pb-info">Last 60 s</span>
@@ -204,12 +205,12 @@ export default function TrafficPage() {
 
         <div className="panel">
           <div className="ph">
-            <div className="ptitle">🌐 Top Source IPs</div>
+            <div className="ptitle">Top Source IPs</div>
             <span className="panel-badge pb-live">Live feed</span>
           </div>
           <div className="pb">
             {topIPs.length === 0 ? (
-              <EmptyState compact icon="📡" title="No traffic yet" hint="Top sources fill in as requests pass through a protected site. Point a hostname at the WAF, or open a site's public endpoint from the Sites page." action={{ label: "Go to Sites", href: "/sites" }} />
+              <EmptyState compact icon="activity" title="No traffic yet" hint="Top sources fill in as requests pass through a protected site. Point a hostname at the WAF, or open a site's public endpoint from the Sites page." action={{ label: "Go to Sites", href: "/sites" }} />
             ) : (
               topIPs.map(([ip, cnt], idx) => (
                 <motion.div key={ip} className="eprow" style={{ marginBottom: 7 }} initial={{ opacity: 0, x: -6 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: idx * 0.04 }}>
@@ -230,10 +231,10 @@ export default function TrafficPage() {
       {/* Live request log */}
       <motion.div className="panel" variants={fadeUp}>
         <div className="ph">
-          <div className="ptitle">📜 Live Request Log</div>
+          <div className="ptitle">Live Request Log</div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
             <div style={{ position: "relative" }}>
-              <span style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", color: "var(--text3)", fontSize: 14, pointerEvents: "none" }}>🔍</span>
+              <span style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", color: "var(--text3)", fontSize: 14, pointerEvents: "none" }}><Icon name="search" size={14} /></span>
               <input className="fi2" type="text" placeholder="Filter by IP, path, site…" style={{ width: 200 }}
                 value={search} onChange={e => setSearch(e.target.value)} />
             </div>

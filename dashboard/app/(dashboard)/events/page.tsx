@@ -1,4 +1,5 @@
 "use client";
+import Icon from "@/components/ui/Icon";
 /**
  * Threat Search — searchable WAF event history backed by ClickHouse.
  * Live tail lives on /logs; this page is the durable, queryable record:
@@ -95,7 +96,7 @@ export default function EventsPage() {
       from = fromLocalInput(absFrom);
       to = fromLocalInput(absTo);
       if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) {
-        showToast("'To' must be after 'From'", "e", "⚠️");
+        showToast("'To' must be after 'From'", "e");
         return;
       }
     } else {
@@ -122,7 +123,7 @@ export default function EventsPage() {
       setRuleFacets(rf.facets ?? []);
       setIpFacets(ipf.facets ?? []);
       setProtocolFacets(pf.facets ?? []);
-    } catch (e) { showToast(e instanceof Error ? e.message : "Search failed", "e", "⚠️"); }
+    } catch (e) { showToast(e instanceof Error ? e.message : "Search failed", "e"); }
     finally { setLoading(false); }
   }, [mode, absFrom, absTo, rangeSecs, q, site, rule, action, ip, protocol, severity, country]);
 
@@ -149,12 +150,12 @@ export default function EventsPage() {
       if (found.length === 0) {
         showToast(
           "No request found with that Support ID — check it was copied in full, or that the event store still retains that date",
-          "e", "🔍");
+          "e");
       } else {
         setSelected(found[0]);
       }
     } catch (e) {
-      showToast(e instanceof Error ? e.message : "Lookup failed", "e", "⚠️");
+      showToast(e instanceof Error ? e.message : "Lookup failed", "e");
     } finally {
       setLookingUp(false);
     }
@@ -221,7 +222,7 @@ export default function EventsPage() {
       </FirstRunNote>
       <motion.div variants={fadeUp} style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 14 }}>
         <div>
-          <div className="sec-title">🔎 Threat Search</div>
+          <div className="sec-title">Threat Search</div>
           <div className="sec-sub">
             Searchable WAF history (ClickHouse) · {status?.reachable ? `${(status.events ?? 0).toLocaleString()} events stored` : "durable event store"}
           </div>
@@ -287,7 +288,7 @@ export default function EventsPage() {
       {/* not-configured state */}
       {status && !status.configured ? (
         <motion.div className="panel" variants={fadeUp}><div className="pb" style={{ textAlign: "center", padding: 40 }}>
-          <div style={{ fontSize: 34, marginBottom: 10 }}>🗄️</div>
+          <Icon name="database" size={32} style={{ marginBottom: 10, color: "var(--text3)" }} />
           <div style={{ fontSize: 16, fontWeight: 700, color: "var(--text2)", marginBottom: 6 }}>ClickHouse not configured</div>
           <div style={{ fontSize: 14, color: "var(--text3)", lineHeight: 1.7, fontFamily: "var(--font-mono)", maxWidth: 520, margin: "0 auto" }}>
             Set <span style={{ color: "var(--cyan)" }}>SENTINEL_CLICKHOUSE_URL</span> on the control plane and run the ClickHouse container to enable durable, searchable WAF history. Live events still stream on the <strong>Logs</strong> page.
@@ -303,7 +304,7 @@ export default function EventsPage() {
               time range, because it answers a phone call rather than a search. */}
           <motion.div className="panel" variants={fadeUp}>
             <div className="ph">
-              <div className="ptitle">🎫 Support ID lookup</div>
+              <div className="ptitle">Support ID lookup</div>
               <span className="panel-badge">ignores time range</span>
             </div>
             <div className="pb" style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
@@ -342,7 +343,7 @@ export default function EventsPage() {
 
           {/* filter bar */}
           <motion.div className="panel" variants={fadeUp}><div className="pb" style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-            <input className="fi2" placeholder="🔍 search path / attack / rule…" style={{ flex: 1, minWidth: 200 }} value={q}
+            <input className="fi2" placeholder="search path / attack / rule…" style={{ flex: 1, minWidth: 200 }} value={q}
               onChange={e => setQ(e.target.value)} onKeyDown={e => e.key === "Enter" && run()} />
             <input className="fi2" placeholder="site" style={{ width: 130 }} value={site} onChange={e => setSite(e.target.value)} onKeyDown={e => e.key === "Enter" && run()} />
             <input className="fi2" placeholder="rule" style={{ width: 90 }} value={rule} onChange={e => setRule(e.target.value)} onKeyDown={e => e.key === "Enter" && run()} />

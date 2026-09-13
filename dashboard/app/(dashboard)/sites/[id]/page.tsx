@@ -1,4 +1,5 @@
 "use client";
+import Icon, { type IconName } from "@/components/ui/Icon";
 /**
  * Client Services — per-site management dashboard.
  * Everything here is real: site config from the control plane, per-site
@@ -64,7 +65,7 @@ export default function SiteDetailPage() {
       setSite(res.site);
       setForm(siteToForm(res.site));
     } catch {
-      showToast("Failed to load site", "e", "⚠️");
+      showToast("Failed to load site", "e");
     } finally { setLoading(false); }
   }, [siteId]);
 
@@ -130,13 +131,13 @@ export default function SiteDetailPage() {
   async function disableRule(ruleId: string) {
     if (!site) return;
     const id = Number(ruleId);
-    if (!Number.isFinite(id) || id === 0) { showToast("Rule has no numeric ID", "e", "⚠️"); return; }
+    if (!Number.isFinite(id) || id === 0) { showToast("Rule has no numeric ID", "e"); return; }
     setLearnBusy(id);
     try {
       await api.sites.addExclusion(siteId, { rule_id: id });
-      showToast(`Rule ${ruleId} disabled · applies in ~5s`, "s", "🔕");
+      showToast(`Rule ${ruleId} disabled · applies in ~5s`, "s");
       await loadSite();
-    } catch (e) { showToast(e instanceof Error ? e.message : "Failed", "e", "⚠️"); }
+    } catch (e) { showToast(e instanceof Error ? e.message : "Failed", "e"); }
     finally { setLearnBusy(null); }
   }
 
@@ -167,13 +168,12 @@ export default function SiteDetailPage() {
       });
       showToast(
         clean.length ? `${clean.length} path override(s) saved` : "Path overrides cleared",
-        "s", "🛣",
-      );
+        "s");
       await loadSite();
     } catch (err: unknown) {
       // The API validates prefixes and rejects per-path paranoia_level /
       // rule_exclusions, so surface its message rather than a generic failure.
-      showToast(err instanceof Error ? err.message : "Could not save path overrides", "e", "⚠️");
+      showToast(err instanceof Error ? err.message : "Could not save path overrides", "e");
     } finally { setPathBusy(false); }
   }
 
@@ -183,9 +183,9 @@ export default function SiteDetailPage() {
     setLearnBusy(id);
     try {
       await api.sites.removeExclusion(siteId, id);
-      showToast(`Rule ${ruleId} re-enabled · applies in ~5s`, "s", "🔔");
+      showToast(`Rule ${ruleId} re-enabled · applies in ~5s`, "s");
       await loadSite();
-    } catch (e) { showToast(e instanceof Error ? e.message : "Failed", "e", "⚠️"); }
+    } catch (e) { showToast(e instanceof Error ? e.message : "Failed", "e"); }
     finally { setLearnBusy(null); }
   }
 
@@ -199,23 +199,23 @@ export default function SiteDetailPage() {
     setBusy(true);
     try {
       await api.sites.update(siteId, { waf_policy: { ...(site.waf_policy as object), mode: newMode } });
-      showToast(`Mode → ${newMode.toUpperCase()} · applies in ~5s`, "s", newMode === "blocking" ? "🛡️" : newMode === "learning" ? "📚" : "⏸️");
+      showToast(`Mode → ${newMode.toUpperCase()} · applies in ~5s`, "s");
       await loadSite();
-    } catch (e) { showToast(e instanceof Error ? e.message : "Failed", "e", "⚠️"); }
+    } catch (e) { showToast(e instanceof Error ? e.message : "Failed", "e"); }
     finally { setBusy(false); }
   }
 
   async function toggleStatus() {
     if (!site) return;
     const next = site.status === "active" ? "paused" : "active";
-    try { await api.sites.updateStatus(siteId, next); showToast(`Site ${next}`, "s", next === "active" ? "✅" : "⏸️"); await loadSite(); }
-    catch { showToast("Failed", "e", "⚠️"); }
+    try { await api.sites.updateStatus(siteId, next); showToast(`Site ${next}`, "s"); await loadSite(); }
+    catch { showToast("Failed", "e"); }
   }
 
   async function del() {
     if (!site || !confirm(`Delete site "${site.name}"? This cannot be undone.`)) return;
-    try { await api.sites.delete(siteId); showToast("Site deleted", "s", "🗑️"); router.push("/sites"); }
-    catch { showToast("Failed to delete", "e", "⚠️"); }
+    try { await api.sites.delete(siteId); showToast("Site deleted", "s"); router.push("/sites"); }
+    catch { showToast("Failed to delete", "e"); }
   }
 
   if (loading) return <div className="sec"><div style={{ padding: 40, textAlign: "center", color: "var(--text3)", fontFamily: "var(--font-mono)", fontSize: 14 }}>Loading site…</div></div>;
@@ -255,9 +255,9 @@ export default function SiteDetailPage() {
           </div>
         </div>
         <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
-          <button className="btn bc btn-sm" onClick={() => setEditing(true)}>✏️ Edit</button>
-          <button className="btn bg-btn btn-sm" onClick={toggleStatus}>{site.status === "active" ? "⏸️ Pause" : "▶️ Activate"}</button>
-          <button className="btn bg-btn btn-sm" onClick={del} style={{ color: "#ef4444" }}>🗑️ Delete</button>
+          <button className="btn bc btn-sm" onClick={() => setEditing(true)}>Edit</button>
+          <button className="btn bg-btn btn-sm" onClick={toggleStatus}>{site.status === "active" ? "⏸ Pause" : "▶ Activate"}</button>
+          <button className="btn bg-btn btn-sm" onClick={del} style={{ color: "#ef4444" }}>Delete</button>
         </div>
       </motion.div>
 
@@ -285,7 +285,7 @@ export default function SiteDetailPage() {
         {mode === "learning" && (
           <div className="pb" style={{ paddingTop: 0 }}>
             <div style={{ padding: "9px 13px", background: "rgba(255,176,32,.08)", border: "1px solid rgba(255,176,32,.25)", borderRadius: "var(--r2)", fontSize: 12.5, color: "var(--text3)", fontFamily: "var(--font-mono)", lineHeight: 1.6 }}>
-              📚 In Learning mode the WAF logs what it <strong>would</strong> block without affecting traffic. Watch the <strong>WAF Logs</strong> tab below, then switch to <strong>Blocking</strong> when false-positives are tuned out.
+              In Learning mode the WAF logs what it <strong>would</strong> block without affecting traffic. Watch the <strong>WAF Logs</strong> tab below, then switch to <strong>Blocking</strong> when false-positives are tuned out.
             </div>
           </div>
         )}
@@ -294,16 +294,16 @@ export default function SiteDetailPage() {
       {/* Per-site KPIs (real) */}
       <motion.div variants={staggerContainer} style={{ display: "grid", gridTemplateColumns: "repeat(5,1fr)", gap: 12 }}>
         {[
-          { lbl: "Requests", val: stat ? stat.total.toLocaleString() : "—", ico: "📡", accent: "var(--text)" },
-          { lbl: "Blocked", val: stat ? stat.blocked.toLocaleString() : "—", ico: "🛑", accent: "#ef4444" },
-          { lbl: "Block rate", val: stat ? `${blockRate.toFixed(1)}%` : "—", ico: "📊", accent: "var(--cyan)" },
-          { lbl: "4xx / 5xx", val: stat ? `${stat.status_4xx} / ${stat.status_5xx}` : "—", ico: "⚠️", accent: "var(--amber,#ffb020)" },
-          { lbl: "Certificate", val: cert ? (certDays !== null ? `${certDays}d` : "active") : "none", ico: "🔐", accent: cert ? "var(--green)" : "var(--text3)" },
+          { lbl: "Requests", val: stat ? stat.total.toLocaleString() : "—", ico: "activity" as IconName, accent: "var(--text)" },
+          { lbl: "Blocked", val: stat ? stat.blocked.toLocaleString() : "—", ico: "ban" as IconName, accent: "#ef4444" },
+          { lbl: "Block rate", val: stat ? `${blockRate.toFixed(1)}%` : "—", ico: "bar-chart" as IconName, accent: "var(--cyan)" },
+          { lbl: "4xx / 5xx", val: stat ? `${stat.status_4xx} / ${stat.status_5xx}` : "—", ico: "alert-triangle" as IconName, accent: "var(--amber,#ffb020)" },
+          { lbl: "Certificate", val: cert ? (certDays !== null ? `${certDays}d` : "active") : "none", ico: "lock" as IconName, accent: cert ? "var(--green)" : "var(--text3)" },
         ].map((k, i) => (
           <motion.div key={i} className="panel" variants={cardVariants} style={{ padding: "13px 15px" }}>
             <div style={{ display: "flex", justifyContent: "space-between" }}>
               <span style={{ fontSize: 14, color: "var(--text3)", textTransform: "uppercase", letterSpacing: 1, fontFamily: "var(--font-mono)" }}>{k.lbl}</span>
-              <span style={{ fontSize: 15 }}>{k.ico}</span>
+              <Icon name={k.ico} size={15} />
             </div>
             <div style={{ fontSize: 25, fontWeight: 700, color: k.accent, marginTop: 6, fontFamily: "var(--font-display)" }}>{k.val}</div>
           </motion.div>
@@ -312,7 +312,7 @@ export default function SiteDetailPage() {
 
       {/* Tabs */}
       <motion.div variants={fadeUp} style={{ display: "flex", gap: 4, padding: 4, background: "var(--bg3)", borderRadius: 10, width: "fit-content" }}>
-        {([["overview", "🗂 Overview"], ["waf", "🛡️ WAF Logs"], ["access", "📡 Access Logs"], ["learning", "📚 Learning Report"], ["paths", "🛣 Path Policy"], ["cert", "🔐 Certificate"], ["config", "🧾 Effective Config"]] as [Tab, string][]).map(([k, label]) => (
+        {([["overview", "Overview"], ["waf", "WAF Logs"], ["access", "Access Logs"], ["learning", "Learning Report"], ["paths", "Path Policy"], ["cert", "Certificate"], ["config", "Effective Config"]] as [Tab, string][]).map(([k, label]) => (
           <button key={k} onClick={() => setTab(k)} style={{
             padding: "7px 16px", borderRadius: 7, border: "none", cursor: "pointer", fontSize: 14, fontWeight: 600,
             background: tab === k ? "var(--cyan)" : "transparent", color: tab === k ? "#021018" : "var(--text2)",
@@ -354,12 +354,12 @@ export default function SiteDetailPage() {
                 </div>
                 <div className="pb" style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
                   {([
-                    ["waf",      "🛡️ What it blocked",      "Requests this site refused, with the rule that decided"],
-                    ["access",   "📡 All traffic",           "Every request, blocked or not"],
-                    ["learning", "📚 Tune false positives",  "What blocking mode would have refused, ready to exclude"],
-                    ["paths",    "🛣 Per-path policy",       "Relax or tighten rules on individual URLs"],
-                    ["cert",     "🔐 Certificate",           "Issue, renew or replace this site's certificate"],
-                    ["config",   "🧾 Full configuration",    "Every setting, and what the data plane actually holds"],
+                    ["waf",      "What it blocked",      "Requests this site refused, with the rule that decided"],
+                    ["access",   "All traffic",           "Every request, blocked or not"],
+                    ["learning", "Tune false positives",  "What blocking mode would have refused, ready to exclude"],
+                    ["paths",    "Per-path policy",       "Relax or tighten rules on individual URLs"],
+                    ["cert",     "Certificate",           "Issue, renew or replace this site's certificate"],
+                    ["config",   "Full configuration",    "Every setting, and what the data plane actually holds"],
                   ] as [Tab, string, string][]).map(([k, label, why]) => (
                     <button key={k} onClick={() => setTab(k)} title={why}
                       style={{ textAlign: "left", padding: "10px 13px", borderRadius: 10, cursor: "pointer",
@@ -373,7 +373,7 @@ export default function SiteDetailPage() {
                     style={{ textAlign: "left", padding: "10px 13px", borderRadius: 10, cursor: "pointer",
                              background: "var(--cyan-dim)", border: "1px solid var(--cyan-ring)", color: "var(--text2)",
                              minWidth: 215, flex: "1 1 215px" }}>
-                    <div style={{ fontSize: 13.5, fontWeight: 600 }}>⚙️ Change settings</div>
+                    <div style={{ fontSize: 13.5, fontWeight: 600 }}>Change settings</div>
                     <div className="td3" style={{ fontSize: 12, marginTop: 3, lineHeight: 1.45 }}>
                       Open the full configuration, then Edit
                     </div>
@@ -434,7 +434,7 @@ export default function SiteDetailPage() {
                 background: "var(--bg3)", borderRadius: 8, padding: "10px 14px",
               }}>
                 {mode === "learning"
-                  ? <>📚 <strong>Learning mode is on.</strong> Each row is a rule that <strong>would</strong> have blocked traffic but didn&apos;t. Review the sample paths — if a rule is a false positive for your app, <strong>Disable</strong> it, then switch to <strong>Blocking</strong> once the list is clean.</>
+                  ? <><strong>Learning mode is on.</strong> Each row is a rule that <strong>would</strong> have blocked traffic but didn&apos;t. Review the sample paths — if a rule is a false positive for your app, <strong>Disable</strong> it, then switch to <strong>Blocking</strong> once the list is clean.</>
                   : <>This report aggregates <strong>would-have-blocked</strong> detections recorded while the site ran in <strong>Learning</strong> mode. Switch the mode control above to <strong>Learning</strong> to collect fresh data without impacting traffic.</>}
               </div>
               <div className="panel">
@@ -469,9 +469,9 @@ export default function SiteDetailPage() {
                               <td className="td3">{timePart(r.last_seen)}</td>
                               <td style={{ textAlign: "right" }}>
                                 {excluded ? (
-                                  <button className="btn bg-btn btn-xs" disabled={isBusy} onClick={() => reEnableRule(r.rule_id)}>🔔 Re-enable</button>
+                                  <button className="btn bg-btn btn-xs" disabled={isBusy} onClick={() => reEnableRule(r.rule_id)}>Re-enable</button>
                                 ) : (
-                                  <button className="btn bc btn-xs" disabled={isBusy} onClick={() => disableRule(r.rule_id)}>🔕 Disable rule</button>
+                                  <button className="btn bc btn-xs" disabled={isBusy} onClick={() => disableRule(r.rule_id)}>Disable rule</button>
                                 )}
                               </td>
                             </tr>
@@ -496,7 +496,7 @@ export default function SiteDetailPage() {
                             <td className="td3">{e.rule_id}</td>
                             <td className="td2">{e.disable || !e.exclude_targets?.length ? "whole rule disabled" : `targets: ${e.exclude_targets.join(", ")}`}</td>
                             <td style={{ textAlign: "right" }}>
-                              <button className="btn bg-btn btn-xs" disabled={learnBusy === e.rule_id} onClick={() => reEnableRule(String(e.rule_id))}>🔔 Re-enable</button>
+                              <button className="btn bg-btn btn-xs" disabled={learnBusy === e.rule_id} onClick={() => reEnableRule(String(e.rule_id))}>Re-enable</button>
                             </td>
                           </tr>
                         ))}
@@ -515,7 +515,7 @@ export default function SiteDetailPage() {
                 <div className="ph">
                   <div className="ptitle">Per-path policy overrides</div>
                   <button className="btn bp btn-sm" disabled={pathBusy} onClick={savePathOverrides}>
-                    {pathBusy ? "Saving…" : "💾 Save"}
+                    {pathBusy ? "Saving…" : "Save"}
                   </button>
                 </div>
                 <div className="pb" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
@@ -577,7 +577,7 @@ export default function SiteDetailPage() {
                                 <button className="btn bg-btn btn-xs"
                                   onClick={() => setForm(f => f && ({
                                     ...f, path_overrides: f.path_overrides.filter((_, j) => j !== i),
-                                  }))}>🗑 Remove</button>
+                                  }))}>Remove</button>
                               </td>
                             </tr>
                           ))}
@@ -674,7 +674,7 @@ export default function SiteDetailPage() {
                   <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
                     <Empty text="No certificate installed for this site's domains." />
                     <div style={{ fontSize: 13, color: "var(--text3)", lineHeight: 1.7, fontFamily: "var(--font-mono)" }}>
-                      Configure TLS in <button className="btn bg-btn btn-xs" onClick={() => setEditing(true)}>✏️ Edit → Front Service</button>. With automatic ACME, a cert is requested on save (once DNS points here). Self-signed is served until then.
+                      Configure TLS in <button className="btn bg-btn btn-xs" onClick={() => setEditing(true)}>Edit → Front Service</button>. With automatic ACME, a cert is requested on save (once DNS points here). Self-signed is served until then.
                     </div>
                   </div>
                 ) : (
@@ -696,7 +696,7 @@ export default function SiteDetailPage() {
                       </div>
                     )}
                     <div style={{ display: "flex", gap: 8 }}>
-                      <button className="btn bg-btn btn-sm" onClick={async () => { try { await api.certs.renew(cert.domain); showToast("Renewal requested", "s", "🔐"); } catch (e) { showToast(e instanceof Error ? e.message : "Renew failed", "e", "⚠️"); } }}>🔄 Renew</button>
+                      <button className="btn bg-btn btn-sm" onClick={async () => { try { await api.certs.renew(cert.domain); showToast("Renewal requested", "s"); } catch (e) { showToast(e instanceof Error ? e.message : "Renew failed", "e"); } }}>Renew</button>
                       <button className="btn bg-btn btn-sm" onClick={() => router.push("/certificates")}>Manage all certs →</button>
                     </div>
                   </div>

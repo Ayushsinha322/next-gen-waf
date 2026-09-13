@@ -5,6 +5,7 @@ import { api, type ReportSchedule, type ReportScheduleInput, type NotificationCh
 import { showToast } from "@/components/ui/Toast";
 import EmptyState from "@/components/ui/EmptyState";
 import { staggerContainer, fadeUp, cardVariants } from "@/lib/animations";
+import Icon from "@/components/ui/Icon";
 
 /**
  * Scheduled security reports.
@@ -75,7 +76,7 @@ export default function ReportsPage() {
       const r = editing.id
         ? await api.reports.update(editing.id, editing.input)
         : await api.reports.create(editing.input);
-      showToast(`Schedule "${r.schedule.name}" saved`, "s", "📄");
+      showToast(`Schedule "${r.schedule.name}" saved`, "s");
       setEditing(null);
       await load();
     } catch (e) {
@@ -97,10 +98,10 @@ export default function ReportsPage() {
       const r = await api.reports.run(s.id);
       const ok = r.results.filter(x => x.ok).length;
       showToast(r.ok ? `Sent to ${ok}/${r.results.length} target(s)` : `Delivery failed: ${r.error ?? r.results.map(x => x.err).join("; ")}`,
-        r.ok ? "s" : "e", r.ok ? "📤" : "⚠️");
+        r.ok ? "s" : "e");
       await load();
     } catch (e) {
-      showToast(e instanceof Error ? e.message : "run failed", "e", "⚠️");
+      showToast(e instanceof Error ? e.message : "run failed", "e");
     } finally { setBusy(null); }
   }, [load]);
 
@@ -109,10 +110,10 @@ export default function ReportsPage() {
     setBusy(s.id);
     try {
       await api.reports.remove(s.id);
-      showToast("Schedule deleted", "s", "🗑️");
+      showToast("Schedule deleted", "s");
       await load();
     } catch (e) {
-      showToast(e instanceof Error ? e.message : "delete failed", "e", "⚠️");
+      showToast(e instanceof Error ? e.message : "delete failed", "e");
     } finally { setBusy(null); }
   }, [load]);
 
@@ -122,7 +123,7 @@ export default function ReportsPage() {
       if (format === "open") await api.reports.open({ site: pvSite, days: pvDays });
       else await api.reports.download({ site: pvSite, days: pvDays, format });
     } catch (e) {
-      showToast(e instanceof Error ? e.message : "report failed", "e", "⚠️");
+      showToast(e instanceof Error ? e.message : "report failed", "e");
     } finally { setPvBusy(false); }
   }, [pvSite, pvDays]);
 
@@ -133,7 +134,7 @@ export default function ReportsPage() {
     <motion.div className="sec" variants={staggerContainer} initial="hidden" animate="visible">
       <motion.div variants={fadeUp} style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 14, flexWrap: "wrap" }}>
         <div>
-          <div className="sec-title">📄 Reports</div>
+          <div className="sec-title">Reports</div>
           <div className="sec-sub">Scheduled security summaries per site · built from the event store · delivered to a channel or mailbox</div>
         </div>
         <button className="btn bp btn-sm" onClick={() => { setProblems([]); setEditing({ id: null, input: emptyInput() }); }}>＋ New schedule</button>
@@ -156,9 +157,9 @@ export default function ReportsPage() {
               {[1, 7, 14, 30, 90].map(d => <option key={d} value={d}>Last {d} day{d === 1 ? "" : "s"}</option>)}
             </select>
           </div>
-          <button className="btn bc btn-sm" disabled={pvBusy} onClick={() => void buildNow("open")}>{pvBusy ? "Building…" : "👁 View"}</button>
-          <button className="btn bg-btn btn-sm" disabled={pvBusy} onClick={() => void buildNow("html")}>⬇ HTML</button>
-          <button className="btn bg-btn btn-sm" disabled={pvBusy} onClick={() => void buildNow("csv")}>⬇ CSV</button>
+          <button className="btn bc btn-sm" disabled={pvBusy} onClick={() => void buildNow("open")}>{pvBusy ? "Building…" : "View"}</button>
+          <button className="btn bg-btn btn-sm" disabled={pvBusy} onClick={() => void buildNow("html")}>HTML</button>
+          <button className="btn bg-btn btn-sm" disabled={pvBusy} onClick={() => void buildNow("csv")}>CSV</button>
           <div style={{ fontSize: 12, color: "var(--text3)", flexBasis: "100%", lineHeight: 1.5 }}>
             Events by decision, per-day trend, attack categories, top rules, top sources and countries, and the
             learning-mode false-positive candidates. The HTML version prints to PDF from your browser.
@@ -258,7 +259,7 @@ export default function ReportsPage() {
           {error && <div style={{ padding: 16, color: "var(--red-b)", fontSize: 13 }}>{error}</div>}
           {!error && schedules === null && <div style={{ padding: 24, textAlign: "center", color: "var(--text3)", fontFamily: "var(--font-mono)", fontSize: 13 }}>Loading…</div>}
           {!error && schedules?.length === 0 && (
-            <EmptyState icon="📄" title="No scheduled reports"
+            <EmptyState icon="file-text" title="No scheduled reports"
               hint="A schedule sends the same summary you can build above, on a cadence, to a webhook/Slack channel or a mailbox. Nothing is sent until you create one."
               action={{ label: "＋ New schedule", onClick: () => setEditing({ id: null, input: emptyInput() }) }} />
           )}
@@ -294,8 +295,8 @@ export default function ReportsPage() {
                           <button className="btn bc btn-xs" disabled={busy === s.id} title="Build the last period now and deliver it to the targets above" onClick={() => void runNow(s)}>
                             {busy === s.id ? "…" : "Send now"}
                           </button>
-                          <button className="btn bg-btn btn-xs" onClick={() => { setProblems([]); setEditing({ id: s.id, input: { name: s.name, site: s.site, cadence: s.cadence, day_of_week: s.day_of_week, hour_utc: s.hour_utc, format: s.format, channel_id: s.channel_id, recipients: s.recipients, enabled: s.enabled } }); }}>✏️</button>
-                          <button className="btn bg-btn btn-xs" onClick={() => void remove(s)}>🗑️</button>
+                          <button className="btn bg-btn btn-xs" onClick={() => { setProblems([]); setEditing({ id: s.id, input: { name: s.name, site: s.site, cadence: s.cadence, day_of_week: s.day_of_week, hour_utc: s.hour_utc, format: s.format, channel_id: s.channel_id, recipients: s.recipients, enabled: s.enabled } }); }}><Icon name="edit" size={13} title="Edit schedule" /></button>
+                          <button className="btn bg-btn btn-xs" onClick={() => void remove(s)}><Icon name="trash" size={13} title="Delete schedule" /></button>
                         </div>
                       </td>
                     </tr>

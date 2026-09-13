@@ -10,7 +10,7 @@
  * and shows a neutral globe, so the UI never renders a broken tofu box.
  */
 
-const GLOBE = "\u{1F310}"; // 🌐
+const GLOBE = "\u{1F310}"; // 
 
 // Intl.DisplayNames is constructed once (it is comparatively expensive) and
 // reused. Guarded because very old runtimes / odd locales can throw.
@@ -31,7 +31,7 @@ export function isCountryCode(cc: string | null | undefined): cc is string {
 }
 
 /**
- * Flag emoji for a 2-letter country code. Returns 🌐 for anything that is not a
+ * Flag emoji for a 2-letter country code. Returns for anything that is not a
  * clean alpha-2 code (empty, "XX", "unknown", a full name, an IP, …).
  */
 export function countryFlag(cc: string | null | undefined): string {

@@ -125,7 +125,7 @@ export default function CertificatesPage() {
       setSites(s.sites ?? []);
       setRootCA(ca);
     } catch {
-      showToast("Failed to load certificates", "e", "⚠️");
+      showToast("Failed to load certificates", "e");
     } finally {
       setLoading(false);
     }
@@ -137,9 +137,9 @@ export default function CertificatesPage() {
     setBusy("rootca");
     try {
       await api.certs.downloadRootCA();
-      showToast("Root CA downloaded — import it as a trusted root authority for a green lock", "s", "🛡️");
+      showToast("Root CA downloaded — import it as a trusted root authority for a green lock", "s");
     } catch {
-      showToast("Failed to download root CA", "e", "⚠️");
+      showToast("Failed to download root CA", "e");
     } finally {
       setBusy(null);
     }
@@ -169,19 +169,19 @@ export default function CertificatesPage() {
 
   async function submitAcme() {
     const domains = acmeDomains.split(/[\s,]+/).map(s => s.trim()).filter(Boolean);
-    if (domains.length === 0) return showToast("Enter at least one domain", "e", "⚠️");
-    if (!acmeEmail) return showToast("ACME account email is required", "e", "⚠️");
+    if (domains.length === 0) return showToast("Enter at least one domain", "e");
+    if (!acmeEmail) return showToast("ACME account email is required", "e");
     setBusy("acme");
-    showToast("Requesting certificate — validating domain ownership…", "i", "🔐");
+    showToast("Requesting certificate — validating domain ownership…", "i");
     try {
       const res = await api.certs.requestAcme({
         domains, email: acmeEmail, provider: acmeProvider, challenge: acmeChallenge,
       });
-      showToast(`Issued certificate for ${res.issued.join(", ")}`, "s", "✅");
+      showToast(`Issued certificate for ${res.issued.join(", ")}`, "s");
       setAcmeDomains(""); setAcmeEmail("");
       load();
     } catch (e) {
-      showToast(`ACME failed: ${(e as Error).message}`, "e", "⚠️");
+      showToast(`ACME failed: ${(e as Error).message}`, "e");
     } finally {
       setBusy(null);
     }
@@ -189,15 +189,15 @@ export default function CertificatesPage() {
 
   async function submitManual() {
     if (!manualDomain || !manualCert || !manualKey)
-      return showToast("Domain, certificate and key are all required", "e", "⚠️");
+      return showToast("Domain, certificate and key are all required", "e");
     setBusy("manual");
     try {
       await api.certs.uploadManual({ domain: manualDomain, name: manualName.trim(), cert_pem: manualCert, key_pem: manualKey });
-      showToast(`Installed certificate ${manualName.trim() || manualDomain}`, "s", "✅");
+      showToast(`Installed certificate ${manualName.trim() || manualDomain}`, "s");
       setManualDomain(""); setManualName(""); setManualCert(""); setManualKey("");
       load();
     } catch (e) {
-      showToast(`Upload failed: ${(e as Error).message}`, "e", "⚠️");
+      showToast(`Upload failed: ${(e as Error).message}`, "e");
     } finally {
       setBusy(null);
     }
@@ -210,22 +210,22 @@ export default function CertificatesPage() {
     setBusy(c.domain);
     try {
       await api.certs.rename(c.domain, next.trim());
-      showToast(`Renamed to "${next.trim() || c.domain}"`, "s", "🏷️");
+      showToast(`Renamed to "${next.trim() || c.domain}"`, "s");
       load();
     } catch (e) {
-      showToast(`Rename failed: ${(e as Error).message}`, "e", "⚠️");
+      showToast(`Rename failed: ${(e as Error).message}`, "e");
     } finally { setBusy(null); }
   }
 
   async function renew(domain: string) {
     setBusy(domain);
-    showToast(`Renewing ${domain}…`, "i", "🔄");
+    showToast(`Renewing ${domain}…`, "i");
     try {
       await api.certs.renew(domain);
-      showToast(`Renewed ${domain}`, "s", "✅");
+      showToast(`Renewed ${domain}`, "s");
       load();
     } catch (e) {
-      showToast(`Renew failed: ${(e as Error).message}`, "e", "⚠️");
+      showToast(`Renew failed: ${(e as Error).message}`, "e");
     } finally {
       setBusy(null);
     }
@@ -236,10 +236,10 @@ export default function CertificatesPage() {
     setBusy(domain);
     try {
       await api.certs.delete(domain);
-      showToast(`Deleted ${domain}`, "s", "🗑️");
+      showToast(`Deleted ${domain}`, "s");
       setCerts(p => p.filter(c => c.domain !== domain));
     } catch (e) {
-      showToast(`Delete failed: ${(e as Error).message}`, "e", "⚠️");
+      showToast(`Delete failed: ${(e as Error).message}`, "e");
     } finally {
       setBusy(null);
     }
@@ -256,7 +256,7 @@ export default function CertificatesPage() {
     <motion.div className="sec" variants={staggerContainer} initial="hidden" animate="visible">
       <motion.div variants={fadeUp} style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 14 }}>
         <div>
-          <div className="sec-title">🔐 Certificate Repository</div>
+          <div className="sec-title">Certificate Repository</div>
           <div className="sec-sub">
             Upload once, assign to many sites · wildcards cover every subdomain · ACME auto-renew · hot-swap ·{" "}
             {wafUp ? <span style={{ color: "var(--green)" }}>data plane online</span>
@@ -270,7 +270,7 @@ export default function CertificatesPage() {
         <motion.div className="panel" variants={fadeUp}
           style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 14, flexWrap: "wrap" }}>
           <div style={{ minWidth: 0 }}>
-            <div style={{ fontWeight: 600 }}>🛡️ Trust this WAF (import the Root CA)</div>
+            <div style={{ fontWeight: 600 }}>Trust this WAF (import the Root CA)</div>
             <div className="sec-sub" style={{ marginTop: 4 }}>
               Browsers warn on the WAF&apos;s HTTPS-by-IP endpoint until they trust our private CA. Download it
               once and install it as a <em>trusted root authority</em> to get a green lock — encryption is
@@ -281,7 +281,7 @@ export default function CertificatesPage() {
           </div>
           <motion.button className="btn bc btn-sm" disabled={busy === "rootca"} onClick={downloadRootCA}
             whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
-            {busy === "rootca" ? "Downloading…" : "⬇ Download Root CA"}
+            {busy === "rootca" ? "Downloading…" : "Download Root CA"}
           </motion.button>
         </motion.div>
       )}
@@ -298,7 +298,7 @@ export default function CertificatesPage() {
       {/* Issue / upload */}
       <motion.div className="panel" variants={fadeUp}>
         <div className="ph">
-          <div className="ptitle">➕ Add Certificate</div>
+          <div className="ptitle">Add Certificate</div>
           <div style={{ display: "flex", gap: 8 }}>
             <button className={`btn btn-sm ${tab === "acme" ? "bc" : "bg-btn"}`} onClick={() => setTab("acme")}>Auto SSL (ACME)</button>
             <button className={`btn btn-sm ${tab === "manual" ? "bc" : "bg-btn"}`} onClick={() => setTab("manual")}>Manual Upload</button>
@@ -339,7 +339,7 @@ export default function CertificatesPage() {
               </div>
               <div>
                 <motion.button className="btn bc" disabled={busy === "acme"} onClick={submitAcme} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
-                  {busy === "acme" ? "Requesting…" : "🔐 Request Certificate"}
+                  {busy === "acme" ? "Requesting…" : "Request Certificate"}
                 </motion.button>
               </div>
             </div>
@@ -375,7 +375,7 @@ export default function CertificatesPage() {
               </div>
               <div>
                 <motion.button className="btn bc" disabled={busy === "manual"} onClick={submitManual} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
-                  {busy === "manual" ? "Installing…" : "⬆️ Install Certificate"}
+                  {busy === "manual" ? "Installing…" : "Install Certificate"}
                 </motion.button>
               </div>
             </div>
@@ -386,7 +386,7 @@ export default function CertificatesPage() {
       {/* Cert table */}
       <motion.div className="panel" variants={fadeUp}>
         <div className="ph">
-          <div className="ptitle">📜 Installed Certificates ({certs.length})</div>
+          <div className="ptitle">Installed Certificates ({certs.length})</div>
           {(counts.expiring + counts.expired) > 0 && (
             <span className={`bdg ${counts.expired > 0 ? "br" : "ba"}`}><span className="bdr" />
               {counts.expired > 0 ? `${counts.expired} expired · ` : ""}{counts.expiring} expiring ≤30d
@@ -397,7 +397,7 @@ export default function CertificatesPage() {
           {loading ? (
             <div style={{ padding: 24, textAlign: "center", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--text3)" }}>Loading certificates…</div>
           ) : certs.length === 0 ? (
-            <EmptyState icon="🔐" title="No certificates yet" hint="Sites are served with the shared self-signed certificate until one is issued. Request one with ACME or upload a PEM above — every WAF node picks it up on the next sync." />
+            <EmptyState icon="lock" title="No certificates yet" hint="Sites are served with the shared self-signed certificate until one is issued. Request one with ACME or upload a PEM above — every WAF node picks it up on the next sync." />
           ) : (
             <table>
               <thead><tr><th>Domain</th><th>Protects</th><th>Source</th><th>Status</th><th>Expiry</th><th>Lifetime</th><th>Actions</th></tr></thead>
@@ -414,7 +414,7 @@ export default function CertificatesPage() {
                           <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={c.name || c.domain}>
                             {c.name ? c.name : c.domain}
                           </span>
-                          {isWildcard(c) && <span className="bdg bcy" style={{ flexShrink: 0 }} title="Wildcard — covers all subdomains">✦ wildcard</span>}
+                          {isWildcard(c) && <span className="bdg bcy" style={{ flexShrink: 0 }} title="Wildcard — covers all subdomains">wildcard</span>}
                         </div>
                         <div className="td3" style={{ fontSize: 14, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                           {c.name ? c.domain : ""}{c.san.length > 1 ? `${c.name ? " · " : ""}+${c.san.length - 1} SAN` : ""}
@@ -432,15 +432,15 @@ export default function CertificatesPage() {
                       <td>
                         <div style={{ display: "flex", gap: 4 }}>
                           <motion.button className="btn bg-btn btn-xs" disabled={busy === c.domain} whileHover={{ scale: 1.06 }} whileTap={{ scale: 0.95 }} onClick={() => rename(c)} title="Set profile name">
-                            🏷️ Rename
+                            Rename
                           </motion.button>
                           {isAcme && (
                             <motion.button className="btn bg-btn btn-xs" disabled={busy === c.domain} whileHover={{ scale: 1.06 }} whileTap={{ scale: 0.95 }} onClick={() => renew(c.domain)}>
-                              {busy === c.domain ? "…" : "🔄 Renew"}
+                              {busy === c.domain ? "…" : "Renew"}
                             </motion.button>
                           )}
                           <motion.button className="btn bgn btn-xs" disabled={busy === c.domain} whileHover={{ scale: 1.06 }} whileTap={{ scale: 0.95 }} onClick={() => remove(c.domain)}>
-                            🗑️ Delete
+                            Delete
                           </motion.button>
                         </div>
                       </td>

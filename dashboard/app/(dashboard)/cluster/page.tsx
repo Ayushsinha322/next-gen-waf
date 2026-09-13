@@ -7,6 +7,7 @@
  * when the control plane is unreachable.
  */
 import { useState, useEffect, Fragment } from "react";
+import Icon, { type IconName } from "@/components/ui/Icon";
 import { motion } from "framer-motion";
 import { api, type ClusterHealth, type NotificationChannel } from "@/lib/api";
 import { staggerContainer, cardVariants, fadeUp, spring } from "@/lib/animations";
@@ -58,14 +59,14 @@ function StatFigure({ label, value, sub, accent, accentCls }: { label: string; v
 // ---------------------------------------------------------------------------
 // Topology stage box (Clients / Load balancer / Origins) + connector
 // ---------------------------------------------------------------------------
-function StageBox({ icon, title, sub, tone }: { icon: string; title: string; sub?: string; tone?: string }) {
+function StageBox({ icon, title, sub, tone }: { icon: IconName; title: string; sub?: string; tone?: string }) {
   return (
     <div style={{
       display: "flex", flexDirection: "column", alignItems: "center", gap: 6,
       padding: "16px 18px", borderRadius: "var(--r)", minWidth: 108,
       background: "var(--glass-w)", border: `1px solid ${tone ?? "var(--border)"}`,
     }}>
-      <span style={{ fontSize: 24, lineHeight: 1 }}>{icon}</span>
+      <Icon name={icon} size={22} style={{ color: "var(--text2)" }} />
       <div style={{ fontSize: 13, fontWeight: 700, color: "var(--text)", fontFamily: "var(--font-sans)", textAlign: "center" }}>{title}</div>
       {sub && <div style={{ fontSize: 12, color: "var(--text3)", fontFamily: MONO }}>{sub}</div>}
     </div>
@@ -193,9 +194,9 @@ Fleet-wide health of the WAF data plane and control plane — live topology, fai
         </div>
         <div className="pb" style={{ overflowX: "auto" }}>
           <div style={{ display: "flex", alignItems: "center", gap: 4, minWidth: 620, padding: "8px 4px" }}>
-            <StageBox icon="👥" title="Clients" sub="internet" />
+            <StageBox icon="users" title="Clients" sub="internet" />
             <Connector color="var(--cyan)" />
-            <StageBox icon="⚖️" title="Load Balancer" sub={dp ? `${dp.healthy} up` : undefined} tone="var(--cyan-ring)" />
+            <StageBox icon="scale" title="Load Balancer" sub={dp ? `${dp.healthy} up` : undefined} tone="var(--cyan-ring)" />
             <Connector color={dp && dp.healthy > 0 ? "var(--green)" : "var(--red)"} />
 
             {/* WAF fleet — one chip per data-plane node */}
@@ -222,7 +223,7 @@ Fleet-wide health of the WAF data plane and control plane — live topology, fai
             </div>
 
             <Connector color={dp && dp.healthy > 0 ? "var(--green)" : "var(--red)"} />
-            <StageBox icon="🗄️" title="Origins" sub="upstreams" tone="var(--border)" />
+            <StageBox icon="database" title="Origins" sub="upstreams" tone="var(--border)" />
           </div>
         </div>
       </motion.div>
@@ -241,7 +242,7 @@ Fleet-wide health of the WAF data plane and control plane — live topology, fai
           <div className="pb">
             {!cp || !cp.enabled ? (
               <div style={{ padding: "22px 12px", textAlign: "center" }}>
-                <div style={{ fontSize: 28, marginBottom: 8 }}>🧩</div>
+                <Icon name="puzzle" size={28} style={{ marginBottom: 8, color: "var(--text3)" }} />
                 <div style={{ fontSize: 15, fontWeight: 700, color: "var(--text2)", marginBottom: 6 }}>Standalone (HA not enabled)</div>
                 <div style={{ fontSize: 14, color: "var(--text3)", fontFamily: MONO, lineHeight: 1.6, maxWidth: 440, margin: "0 auto" }}>
                   Running a single control-plane node. Add replicas for spare capacity — write leadership
@@ -286,7 +287,7 @@ Fleet-wide health of the WAF data plane and control plane — live topology, fai
                       <span className={`sd ${n.reachable ? "g" : "r"}`} />
                       <span style={{ fontSize: 14, fontFamily: MONO, color: "var(--text)", fontWeight: 600 }}>node {n.node_id}</span>
                       {n.is_leader
-                        ? <span className="bdg bcy">👑 LEADER</span>
+                        ? <span className="bdg bcy">LEADER</span>
                         : <span className="bdg bgr">{n.role}</span>}
                       {n.is_self && <span className="bdg bgr">this node</span>}
                       <span style={{ marginLeft: "auto", fontSize: 13, fontFamily: MONO, color: n.reachable ? "var(--text3)" : "var(--red)" }}>
@@ -318,7 +319,7 @@ Fleet-wide health of the WAF data plane and control plane — live topology, fai
               </div>
             ) : enabledChannels.length === 0 ? (
               <div style={{ textAlign: "center", padding: "12px 4px" }}>
-                <div style={{ fontSize: 26, marginBottom: 8 }}>🔕</div>
+                <Icon name="bell-off" size={26} style={{ marginBottom: 8, color: "var(--text3)" }} />
                 <div style={{ fontSize: 14, fontWeight: 700, color: "var(--text2)", marginBottom: 6 }}>No alert channels active</div>
                 <div style={{ fontSize: 13, color: "var(--text3)", fontFamily: MONO, lineHeight: 1.6 }}>
                   Configure alert channels in Settings to be paged on node failures.
