@@ -1,7 +1,7 @@
 # Deployment topology
 **Generated** by `deploy/gen-topology.py` from the merged compose configuration. Do not edit by hand.
 
-The production deployment is **3 compose files, 1325 lines**, applied as an override chain:
+The production deployment is **3 compose files, 1336 lines**, applied as an override chain:
 
 1. `deploy/docker/compose.prod.yml`
 2. `deploy/docker/compose.cluster.yml`
@@ -83,6 +83,7 @@ State that survives a container. Anything not listed here is lost on recreate.
 
 These are the paths a `rsync --delete` of the repository can destroy on a host. `deploy/sync-to-host.sh --list-runtime-mounts <host>` classifies what is actually mounted on a running deployment; run that rather than trusting this list, which is only what the compose files declare.
 
+- `deploy/docker/clickhouse-logging.xml` → `/etc/clickhouse-server/config.d/logging.xml`
 - `deploy/docker/geoip` → `/var/lib/sentinel/geoip`
 - `deploy/docker/haproxy.cfg` → `/usr/local/etc/haproxy/haproxy.cfg`
 - `deploy/docker/pg_hba.conf` → `/etc/sentinel/pg/pg_hba.conf`

@@ -198,7 +198,11 @@ deploy-shell:
     # docker-cli-compose is here for check-compose-parses-clean.sh. `docker
     # compose config` only parses and interpolates — it never contacts a daemon —
     # so this needs no docker-in-docker and no privileged runner.
-    - apk add --no-cache bash shellcheck git coreutils findutils grep sed docker-cli-compose
+    # libxml2-utils supplies xmllint for check-xml-configs.sh. That gate must
+    # not skip when its parser is missing: a malformed ClickHouse drop-in stops
+    # the server booting, which on a customer box is the security log going
+    # dark.
+    - apk add --no-cache bash shellcheck git coreutils findutils grep sed docker-cli-compose libxml2-utils
   script:
     # 1. Every shell file must parse. Cheap, absolute, no exceptions.
     - |
@@ -252,6 +256,11 @@ deploy-shell:
     #     check reads the policy out of pg_hba rather than hard-coding a
     #     preference, so relaxing the policy deliberately relaxes the gate too.
     - ./deploy/ci/check-db-tls-consistency.sh
+    # 3c. Every shipped XML config must parse. ClickHouse refuses to boot on a
+    #     malformed drop-in, so this is an availability gate, not tidiness. It
+    #     caught a real one: XML comments may not contain a double hyphen, and a
+    #     row of dashes used as a separator inside a comment is invalid.
+    - ./deploy/ci/check-xml-configs.sh
     # 4. The contract check — the one that catches shipping-breaking bugs.
     - STAGE_ONLY=1 ./deploy/package/build-bundle.sh
     - ./deploy/ci/check-bundle-contract.sh

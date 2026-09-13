@@ -163,6 +163,13 @@ cp deploy/docker/compose.cluster.yml       "$STAGE/compose/"
 cp deploy/docker/pg_hba.conf               "$STAGE/compose/"
 cp deploy/docker/sentinel.proxy.yaml       "$STAGE/compose/" 2>/dev/null || true
 cp deploy/docker/clickhouse-tls.xml        "$STAGE/compose/"
+# Retention for ClickHouse's own logs. compose.prod.yml mounts this on EVERY
+# install, not just the 2VM ones, so it must always be staged: Docker silently
+# creates a DIRECTORY where a bind-mounted file is missing, and the server would
+# then come up with no retention at all — the 15 GiB self-log this file exists
+# to prevent. check-bundle-contract.sh catches the omission.
+cp deploy/docker/clickhouse-logging.xml    "$STAGE/compose/"
+cp deploy/docker/clickhouse-reclaim-logs.sh "$STAGE/scripts/" 2>/dev/null || true
 # These two are bind-mounted by the 2vm overlays as ./pg-init-replication.sh and
 # ./pg-standby-entrypoint.sh — RELATIVE TO THE COMPOSE FILE. They were staged only
 # into scripts/, so in the bundle Docker found nothing at those paths and created
