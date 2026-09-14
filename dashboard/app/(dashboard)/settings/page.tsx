@@ -1038,7 +1038,7 @@ function ManagementTLSTab() {
       </div>
       <div className="pb">
         <p className="sec-sub" style={{ marginTop: 0 }}>
-          The certificate the WAF presents on its <b>management endpoint</b> (this admin console). Served by
+          The certificate the WAF presents on its <b>management endpoint</b> (this admin console). Served by{" "}
           {PRODUCT_NAME}&apos;s own engine — no third-party proxy. Customer-website certificates are separate and live
           under <b>Certificates</b>.
         </p>
