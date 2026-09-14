@@ -13,6 +13,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/your-org/sentinel-waf/control-plane/internal/version"
 )
 
 func errUnknownType(t string) error { return fmt.Errorf("unknown channel type %q", t) }
@@ -89,11 +91,11 @@ func sendSlack(ctx context.Context, ch Channel, a Alert) error {
 		"attachments": []map[string]interface{}{{
 			"fallback": fmt.Sprintf("[%s] %s", strings.ToUpper(a.Severity), a.Summary),
 			"color":    color,
-			"title":    "Sentinel WAF Alert",
+			"title":    version.Name + " Alert",
 			"text":     a.Summary,
 			"fields":   fields,
 			"ts":       a.CreatedAt.Unix(),
-			"footer":   "Sentinel WAF",
+			"footer":   version.Name,
 		}},
 	}
 	body, err := json.Marshal(payload)

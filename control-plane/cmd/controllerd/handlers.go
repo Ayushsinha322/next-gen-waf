@@ -27,6 +27,8 @@ import (
 	"github.com/your-org/sentinel-waf/control-plane/internal/logs"
 	"github.com/your-org/sentinel-waf/control-plane/internal/rbac"
 	"go.uber.org/zap"
+
+	"github.com/your-org/sentinel-waf/control-plane/internal/version"
 )
 
 // configVersion is incremented on every site create / delete / status change.
@@ -413,7 +415,7 @@ func handleMFAEnroll(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"secret":      secret,
-		"otpauth_uri": auth.TOTPURI("Sentinel WAF", claims.UserID, secret),
+		"otpauth_uri": auth.TOTPURI(version.Name, claims.UserID, secret),
 		"note":        "Add to an authenticator app, then POST {secret, code} to /auth/mfa/confirm to activate.",
 	})
 }

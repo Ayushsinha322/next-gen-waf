@@ -220,7 +220,7 @@ function sentinelSolved(token){{document.cookie="{cookie}="+token+"; path=/; max
 h1{{font-size:19px;margin:14px 0 6px}}p{{font-size:13px;color:#8b97a7;line-height:1.6;margin:0 0 20px}}
 .widget{{display:flex;justify-content:center;min-height:70px}}
 .foot{{margin-top:18px;font-size:10px;color:#52525b}}</style></head>
-<body><div class="card"><div class="logo">Sentinel WAF</div><h1>Verify you are human</h1><p>Complete the check below to continue to this site.</p>
+<body><div class="card"><div class="logo">{product}</div><h1>Verify you are human</h1><p>Complete the check below to continue to this site.</p>
 <div class="widget"><div class="{widget_class}" data-sitekey="{sitekey}" data-callback="sentinelSolved"></div></div>
 <div class="foot">Protected by {label}</div></div></body></html>"#,
         script = kind.script(),
@@ -228,6 +228,7 @@ h1{{font-size:19px;margin:14px 0 6px}}p{{font-size:13px;color:#8b97a7;line-heigh
         widget_class = kind.widget_class(),
         sitekey = sitekey,
         label = kind.label(),
+        product = sentinel_core::PRODUCT_NAME,
     )
 }
 

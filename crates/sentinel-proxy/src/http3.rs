@@ -347,7 +347,7 @@ mod tests {
             let resp = Response::builder().status(StatusCode::OK).body(()).unwrap();
             stream.send_response(resp).await?;
             stream
-                .send_data(Bytes::from_static(b"hello from Sentinel WAF over HTTP/3\n"))
+                .send_data(Bytes::from_static(b"hello from the WAF over HTTP/3\n"))
                 .await?;
             stream.finish().await?;
         }
@@ -449,7 +449,7 @@ mod tests {
         while let Some(chunk) = stream.recv_data().await.unwrap() {
             append_buf(&mut body, chunk);
         }
-        assert_eq!(&body, b"hello from Sentinel WAF over HTTP/3\n");
+        assert_eq!(&body, b"hello from the WAF over HTTP/3\n");
 
         drop(send_request);
         client.wait_idle().await;

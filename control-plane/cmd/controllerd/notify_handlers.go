@@ -12,6 +12,8 @@ import (
 	"github.com/your-org/sentinel-waf/control-plane/internal/logs"
 	"github.com/your-org/sentinel-waf/control-plane/internal/notify"
 	"github.com/your-org/sentinel-waf/control-plane/internal/rbac"
+
+	"github.com/your-org/sentinel-waf/control-plane/internal/version"
 )
 
 // sharedDispatcher backs the "test channel" endpoint. Stateless, safe to share.
@@ -132,7 +134,7 @@ func handleTestChannel(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 		ID:        "test",
 		Severity:  "high",
 		Kind:      "test",
-		Summary:   "Sentinel WAF test alert — your channel is wired correctly.",
+		Summary:   version.Name + " test alert — your channel is wired correctly.",
 		Site:      "example.com",
 		SourceIP:  "203.0.113.10",
 		Rule:      "TEST-0001",

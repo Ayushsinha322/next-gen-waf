@@ -6666,10 +6666,10 @@ fn limit_response(ctx: &RequestContext, site: Option<&SiteConfig>) -> Response<B
         .and_then(|s| s.waf.fusion.as_ref())
         .and_then(|f| StatusCode::from_u16(f.limit_status).ok())
         .unwrap_or(StatusCode::TOO_MANY_REQUESTS);
-    let reason = ctx
-        .block_reason
-        .as_deref()
-        .unwrap_or("Request rate-limited by Sentinel WAF");
+    let reason = ctx.block_reason.as_deref().unwrap_or(concat!(
+        "Request rate-limited by ",
+        sentinel_core::product_name!()
+    ));
     error_response(status, reason)
 }
 

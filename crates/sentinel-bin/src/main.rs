@@ -13,9 +13,13 @@ use tracing::{error, info};
 // CLI arguments
 // ---------------------------------------------------------------------------
 
-/// Sentinel WAF — high-performance application firewall and reverse proxy.
 #[derive(Parser, Debug)]
-#[command(name = "sentinel", version, about, long_about = None)]
+#[command(
+    name = "sentinel",
+    version,
+    about = concat!(sentinel_core::product_name!(), " — high-performance application firewall and reverse proxy."),
+    long_about = None
+)]
 struct Args {
     /// Path to the configuration file.
     #[arg(
@@ -50,7 +54,10 @@ fn main() -> anyhow::Result<()> {
     // are visible).  The log level from config is applied after loading.
     init_tracing(args.log_level.as_deref().unwrap_or("info"));
 
-    info!(version = env!("CARGO_PKG_VERSION"), "Sentinel WAF starting");
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        concat!(sentinel_core::product_name!(), " starting")
+    );
 
     // Load config.
     let loader = Arc::new(

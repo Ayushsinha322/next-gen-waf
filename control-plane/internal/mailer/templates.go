@@ -5,6 +5,8 @@ import (
 	"html"
 	"strings"
 	"time"
+
+	"github.com/your-org/sentinel-waf/control-plane/internal/version"
 )
 
 // The reset link is the only secret these templates carry. It is passed in as an
@@ -26,9 +28,9 @@ func ResetEmail(name, link string, expiresAt time.Time, byAdmin bool) Message {
 		mins = 1
 	}
 
-	reason := "We received a request to reset the password for your Next-Gen ESDSWAF console account."
+	reason := "We received a request to reset the password for your " + version.Name + " console account."
 	if byAdmin {
-		reason = "An administrator has started a password reset for your Next-Gen ESDSWAF console account."
+		reason = "An administrator has started a password reset for your " + version.Name + " console account."
 	}
 
 	text := fmt.Sprintf(`%s,
@@ -42,7 +44,7 @@ Set a new password using the link below. It works once and expires in %d minutes
 If you did not expect this, you can ignore this message — your password has not
 been changed, and this link can only be used by whoever opens it.
 
-Next-Gen ESDSWAF
+`+version.Name+`
 This is an automated message; replies are not monitored.
 `, greeting, reason, mins, link)
 
@@ -55,10 +57,10 @@ This is an automated message; replies are not monitored.
 <p style="font-size:13px;color:#555">Or paste this address into your browser:<br><span style="word-break:break-all">%s</span></p>
 <p style="font-size:13px;color:#555">If you did not expect this, you can ignore this message &mdash; your password has not been changed.</p>
 <hr style="border:0;border-top:1px solid #e0e0e0;margin:22px 0">
-<p style="font-size:12px;color:#777">Next-Gen ESDSWAF &middot; automated message, replies are not monitored.</p>
+<p style="font-size:12px;color:#777">`+version.Name+` &middot; automated message, replies are not monitored.</p>
 </div>`, html.EscapeString(greeting), html.EscapeString(reason), mins, esc, esc)
 
-	return Message{Subject: "Reset your Next-Gen ESDSWAF password", Text: text, HTML: htmlBody}
+	return Message{Subject: "Reset your " + version.Name + " password", Text: text, HTML: htmlBody}
 }
 
 // ChangedEmail confirms to the account holder that their password changed. This
@@ -74,18 +76,18 @@ func ChangedEmail(name, sourceIP string, when time.Time) Message {
 	}
 	text := fmt.Sprintf(`%s,
 
-The password for your Next-Gen ESDSWAF console account was changed at %s UTC.%s
+The password for your `+version.Name+` console account was changed at %s UTC.%s
 
 All existing sessions were signed out. If this was you, nothing further is needed.
 
 If this was NOT you, contact your WAF administrator immediately — someone else
 may control your account.
 
-Next-Gen ESDSWAF
+`+version.Name+`
 This is an automated message; replies are not monitored.
 `, greeting, when.UTC().Format("2006-01-02 15:04:05"), where)
 
-	return Message{Subject: "Your Next-Gen ESDSWAF password was changed", Text: text}
+	return Message{Subject: "Your " + version.Name + " password was changed", Text: text}
 }
 
 // AdminNoticeEmail tells the deployment's security contact that a reset
@@ -100,7 +102,7 @@ func AdminNoticeEmail(userEmail, sourceIP, initiatedBy string, when time.Time) M
 	if initiatedBy == "admin" {
 		via = "administrator-initiated reset"
 	}
-	text := fmt.Sprintf(`A console password was reset on this Next-Gen ESDSWAF deployment.
+	text := fmt.Sprintf(`A console password was reset on this `+version.Name+` deployment.
 
 Account:   %s
 Method:    %s
@@ -110,25 +112,25 @@ Time:      %s UTC
 All sessions for that account were invalidated. No action is required if this
 was expected. If it was not, review the audit log for user.password.reset.
 
-Next-Gen ESDSWAF
+`+version.Name+`
 This is an automated message; replies are not monitored.
 `, userEmail, via, orDash(sourceIP), when.UTC().Format("2006-01-02 15:04:05"))
 
-	return Message{Subject: "[ESDSWAF] Console password reset: " + userEmail, Text: text}
+	return Message{Subject: "[" + version.Name + "] Console password reset: " + userEmail, Text: text}
 }
 
 // TestEmail is what the settings "send test email" action delivers, so an
 // operator can prove the relay works before a user ever needs a reset.
 func TestEmail(deployment string) Message {
-	text := fmt.Sprintf(`This is a test message from Next-Gen ESDSWAF (%s).
+	text := fmt.Sprintf(`This is a test message from `+version.Name+` (%s).
 
 If you received it, SMTP is configured correctly and password-reset mail will
 be delivered.
 
-Next-Gen ESDSWAF
+`+version.Name+`
 This is an automated message; replies are not monitored.
 `, orDash(deployment))
-	return Message{Subject: "[ESDSWAF] SMTP test message", Text: text}
+	return Message{Subject: "[" + version.Name + "] SMTP test message", Text: text}
 }
 
 func orDash(s string) string {
