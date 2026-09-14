@@ -228,7 +228,7 @@ function AuthTab() {
           Single sign-on
         </div>
         <Note>
-          Sentinel implements <strong>one generic OpenID Connect provider</strong>,
+          {PRODUCT_NAME} implements <strong>one generic OpenID Connect provider</strong>,
           which is what integrates Microsoft Entra ID, Google Workspace, Okta and
           any other OIDC-compliant IdP. There is no separate connector per vendor,
           and <strong>SAML 2.0 is not implemented</strong> — this tab used to list
@@ -1050,7 +1050,7 @@ function ManagementTLSTab() {
             <div className="pb">
               <b>⚠ Self-signed default in use</b>
               <div className="sec-sub">
-                Browsers warn until you install a trusted certificate below (or import the Sentinel root CA from
+                Browsers warn until you install a trusted certificate below (or import the {PRODUCT_NAME} root CA from
                 the Certificates page). Traffic is encrypted either way.
               </div>
             </div>

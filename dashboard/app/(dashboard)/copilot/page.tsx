@@ -6,13 +6,14 @@ import { takeCopilotHandoff, listRecentHandoffs, rememberRecent, clearRecentHand
 import { spring } from "@/lib/animations";
 import { renderCopilotMarkdown } from "@/lib/safeMarkdown";
 import Icon from "@/components/ui/Icon";
+import { PRODUCT_NAME } from "@/lib/version";
 
 // The left column used to list six invented conversations ("SQLi on /api/login",
 // "CVE-2024-1234 patch"…) that opened nothing. It now lists the operator's real
 // hand-offs from the Alerts, Threat Search and Rules pages; empty until one is made.
 const QUICK_ACTIONS: Array<[string, string, string]> = [
   ["explain", "Explain an alert", "Open the Alerts page and press on a row — the alert is loaded here with the question asked."],
-  ["rule",    "Write a rule",     "Write a Sentinel custom rule in ModSecurity SecRule syntax that "],
+  ["rule",    "Write a rule",     `Write a ${PRODUCT_NAME} custom rule in ModSecurity SecRule syntax that `],
   ["fp",      "Fix a false positive", "Open Threat Search, pick the event, and press Draft exclusion — the event is loaded here."],
   ["patch",   "Virtual patch a CVE", "CVE-"],
   ["tune",    "Tune a threshold",  "Our anomaly threshold is 5 at paranoia level 1 with ML sensitivity 0.9. Given these false-positive candidates from learning mode, what should change first? "],
@@ -106,7 +107,7 @@ export default function CopilotPage() {
           <div style={{padding:"14px 18px",borderBottom:"1px solid rgba(124,47,191,.15)",display:"flex",alignItems:"center",gap:12,background:"linear-gradient(135deg,rgba(124,47,191,.12),transparent)",flexShrink:0}}>
             <motion.div animate={{ boxShadow: ["0 0 18px var(--pur-glow)", "0 0 32px rgba(124,58,237,.6)", "0 0 18px var(--pur-glow)"] }} transition={{ duration: 3, repeat: Infinity }} style={{width:40,height:40,borderRadius:"50%",background:"linear-gradient(135deg,var(--purple),#4A0FA0)",display:"flex",alignItems:"center",justifyContent:"center",fontSize: 25}}><Icon name="sparkles" size={18} /></motion.div>
             <div>
-              <div style={{fontFamily:"var(--font-display)",fontSize: 15,fontWeight:700}}>Sentinel AI Copilot</div>
+              <div style={{fontFamily:"var(--font-display)",fontSize: 15,fontWeight:700}}>{PRODUCT_NAME} AI Copilot</div>
               <div style={{fontFamily:"var(--font-mono)",fontSize: 11,color:"#9B60E0",display:"flex",alignItems:"center",gap:5,marginTop:2}}>
                 <span style={{width:5,height:5,borderRadius:"50%",background:"var(--green)",boxShadow:"0 0 5px var(--green)",display:"inline-block"}} />Online · Ready to assist
               </div>

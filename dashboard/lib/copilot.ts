@@ -12,12 +12,14 @@
 // NEXT_PUBLIC_* API key here — Next.js inlines those into the client bundle,
 // which would serve the gateway credential to every browser.
 
+import { PRODUCT_NAME } from "@/lib/version";
+
 export const COPILOT_MODEL = "deepseek-r1:8b";
 
 // Opening message. Note: the model name below is the real one wired above — no
 // throughput / detection numbers are quoted because none are measured here.
 export const GREET =
-  "Hello! I'm **Sentinel AI Copilot**, powered by DeepSeek R1.\n\nI can help:\n• Explain security alerts\n• Generate SRL WAF rules\n• Create CVE virtual patches\n• Debug false positives\n• Security reports\n\nWhat would you like to know?";
+  `Hello! I'm **${PRODUCT_NAME} AI Copilot**, powered by DeepSeek R1.\n\nI can help:\n• Explain security alerts\n• Generate SRL WAF rules\n• Create CVE virtual patches\n• Debug false positives\n• Security reports\n\nWhat would you like to know?`;
 
 export interface CopilotTurn {
   role: "user" | "assistant";
