@@ -400,8 +400,14 @@ input, select, textarea { font-family:inherit; }
   display:flex; align-items:center; justify-content:center; font-size:13px; font-weight:700;
   color:var(--cyan); font-family:var(--font-mono); flex-shrink:0;
 }
-.uname { font-size:16px; font-family:var(--font-sans); font-weight:500; color:var(--text); line-height:1; }
-.urole { font-size:14px; color:var(--cyan); font-family:var(--font-mono); letter-spacing:.6px; }
+/* The signed-in user is secondary chrome, so it sits BELOW the brand in the
+   type scale, not above it. It was 16px over 14px — larger than the product
+   name (.tb-nm .w, 15px) and larger than every other label in a 52px bar, so
+   the eye landed on "admin" before the page. The name also used --font-sans
+   while the avatar beside it, the role under it, the version line it mirrors
+   and the metrics chip are all --font-mono, so one word broke the row. */
+.uname { font-size:13px; font-family:var(--font-mono); font-weight:600; color:var(--text); line-height:1.25; }
+.urole { font-size:10px; color:var(--cyan); font-family:var(--font-mono); font-weight:500; letter-spacing:1.2px; line-height:1.25; }
 
 /* ═══════════════════════════════════════════
    SIDEBAR — glass + cyan border
