@@ -16,11 +16,13 @@
 // (log lines, alert details) leaves from the server, where egress is
 // observable and controllable, rather than from each operator's browser.
 
+import { PRODUCT_NAME } from "@/lib/version";
+
 export const COPILOT_MODEL = "deepseek-r1:8b";
 export const COPILOT_ENDPOINT = "https://ai.enlight.dev/api/chat/completions";
 
 const SYSTEM_PROMPT =
-  "You are Sentinel AI Copilot, an elite cybersecurity assistant integrated into an enterprise Web Application Firewall (WAF). Your job is to analyze SQLi, XSS, and DDoS threats, explain logs, and help write WAF rules. Keep answers concise, technical, and accurate. Do not hallucinate.";
+  `You are ${PRODUCT_NAME} AI Copilot, an elite cybersecurity assistant integrated into an enterprise Web Application Firewall (WAF). Your job is to analyze SQLi, XSS, and DDoS threats, explain logs, and help write WAF rules. Keep answers concise, technical, and accurate. Do not hallucinate.`;
 
 export interface CopilotTurn {
   role: "user" | "assistant";
