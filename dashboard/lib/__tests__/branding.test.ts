@@ -132,88 +132,77 @@ describe("the console shows one product name", () => {
 });
 
 /**
- * The rest of the product, as a RATCHET rather than a gate.
+ * The rest of the product.
  *
- * The console is not the only thing a customer reads. The data plane serves a
- * browser-check page and a CAPTCHA page to the protected site's own VISITORS —
- * members of the public, who have no idea what any of this is called — and both
- * carry a logo. The control plane puts a name in every password-reset email, in
- * the Slack and webhook alert payloads, and in the TOTP enrolment URI, which is
- * the label that then sits in an administrator's authenticator app for as long
- * as the account exists.
+ * The console was never the whole problem. The data plane serves a
+ * browser-check page and a CAPTCHA page to the PROTECTED SITE'S OWN VISITORS —
+ * members of the public, who have never heard of either name — and both carried
+ * the codename as their logo, as did the 429 body. The control plane put a name
+ * in every password-reset email, in the Slack and webhook alert payloads, and in
+ * the TOTP enrolment URI, which then sits in an administrator's authenticator
+ * app for as long as the account exists. The mail templates were worse than
+ * wrong: they still used the name this one replaced.
  *
- * Every one of those is wrong today, and the email templates are worse than
- * wrong: they still use the name that Swaraj Kavach replaced.
+ * All of it is fixed. Rust reads the name from `sentinel_core::product_name!()`
+ * — a macro, because those pages are compile-time `const &str` and `concat!`
+ * takes literals — and Go from `internal/version.Name`. So this is a GATE now,
+ * not the inventory it started as: nothing outside the console may name the
+ * product by hand either.
  *
- * Fixing them is a decision, not a rename — changing the TOTP issuer changes
- * what existing authenticator entries are called, and the alert payload fields
- * are consumed by whatever the customer wired them into. So this does not fail
- * on what is already there. It fails if the count GROWS, which stops the
- * problem spreading while the decision is pending, and it lists the sites so
- * they cannot be quietly forgotten the way the console's nine were.
- *
- * When one is fixed, lower its number here. When the last one goes, delete the
- * inventory and fold these paths into the gate above.
+ * Comments are exempt and stay that way. A crate's `//!` header calling itself
+ * "sentinel-ml — ML engine for Sentinel WAF" is describing the source tree,
+ * which is genuinely what `sentinel` names. The three `///` lines in
+ * sentinel-cli that reach `--help` are deliberately left as well: they describe
+ * a binary called `sentinel` reading `~/.config/sentinel/sentinel.yaml`, and
+ * renaming the prose while the paths keep the codename reads worse, not better.
  */
-const KNOWN_OUTSIDE_CONSOLE: Record<string, number> = {
-  // Shown to the PROTECTED SITE'S VISITORS, not to an operator.
-  "crates/sentinel-proxy/src/captcha.rs": 1, // the CAPTCHA page logo
-  "crates/sentinel-proxy/src/challenge.rs": 1, // the browser-check page logo
-  "crates/sentinel-proxy/src/lib.rs": 1, // the 429 rate-limit body
-  // Shown to an ADMINISTRATOR, and durable once delivered.
-  "control-plane/cmd/controllerd/handlers.go": 1, // TOTP issuer, lands in the authenticator app
-  "control-plane/internal/mailer/templates.go": 14, // password-reset mail, SUPERSEDED name
-  "control-plane/internal/mailer/mailer.go": 1, // mail From name, SUPERSEDED name
-  "control-plane/internal/notify/senders.go": 2, // Slack/webhook alert title and footer
-  "control-plane/cmd/controllerd/notify_handlers.go": 1, // test-alert summary
-  // Operator-side tooling, where the codename is defensible.
-  "control-plane/cmd/sentinelctl/main.go": 1, // the CLI is itself named for the codename
-  "crates/sentinel-cli/src/main.rs": 2,
-  "crates/sentinel-bin/src/main.rs": 1, // a startup log line, never a screen
-  "crates/sentinel-proxy/src/http3.rs": 2, // test fixture payloads
-};
-
-describe("the product name outside the console does not spread further", () => {
+describe("nothing outside the console names the product by hand", () => {
   const files = sourceFiles(REPO, /\.(go|rs)$/);
 
   it("finds source files to check", () => {
     expect(files.length).toBeGreaterThan(50);
   });
 
-  it("has no more occurrences than the inventory records", () => {
-    const found: Record<string, number> = {};
+  /** The two files that DEFINE the name, mirroring lib/version.ts above. */
+  const DEFINITIONS = [
+    join("control-plane", "internal", "version", "version.go"),
+    join("crates", "sentinel-core", "src", "lib.rs"),
+  ];
+
+  it("defines the name in both places, so the gate has something to point at", () => {
+    // Guards the guard the other way: if a definition is renamed or moved, the
+    // exemption below would silently start exempting nothing, and every call
+    // site could go back to literals without this suite noticing.
+    for (const d of DEFINITIONS) {
+      const f = files.find((x) => x.endsWith(d));
+      expect(f, `${d} not found — the exemption below is now pointing at nothing`).toBeTruthy();
+      expect(readFileSync(f!, "utf8")).toContain(PRODUCT_NAME);
+    }
+  });
+
+  it("uses the shared constant, not a literal", () => {
+    const offenders: string[] = [];
     for (const file of files) {
-      const rel = file.slice(REPO.length + 1);
+      if (DEFINITIONS.some((d) => file.endsWith(d))) continue;
+      // A test that asserts a name is ABSENT has to write that name down.
+      // control-plane/internal/mailer/templates_branding_test.go is the guard
+      // for the reset emails and lists every forbidden spelling; matching it
+      // here would be the third time in this repo that a rule failed on its own
+      // documentation. Rust `#[cfg(test)]` modules are inline and stay covered,
+      // which is stricter and costs nothing now that the h3 fixtures are clean.
+      if (file.endsWith("_test.go")) continue;
       const src = stripComments(readFileSync(file, "utf8"));
-      const n = src
-        .split("\n")
-        .filter((line) => SUPERSEDED.some((re) => re.test(line))).length;
-      if (n > 0) found[rel] = n;
-    }
-
-    const grew: string[] = [];
-    for (const [file, n] of Object.entries(found)) {
-      const allowed = KNOWN_OUTSIDE_CONSOLE[file] ?? 0;
-      if (n > allowed) {
-        grew.push(`${file}: ${n} occurrence(s), inventory allows ${allowed}`);
-      }
+      src.split("\n").forEach((line, i) => {
+        if (SUPERSEDED.some((re) => re.test(line)) || line.includes(PRODUCT_NAME)) {
+          offenders.push(`${file.slice(REPO.length + 1)}:${i + 1}  ${line.trim().slice(0, 80)}`);
+        }
+      });
     }
     expect(
-      grew,
-      "A new product-name string appeared outside the console. Use the one " +
-        "name, or add it to KNOWN_OUTSIDE_CONSOLE with a reason:\n" +
-        grew.join("\n"),
-    ).toEqual([]);
-
-    // Ratchet the other way too: once a site is fixed, the number must come
-    // down, or the inventory turns into a list of things that are no longer
-    // true and nobody trusts it.
-    const stale = Object.entries(KNOWN_OUTSIDE_CONSOLE)
-      .filter(([file, n]) => (found[file] ?? 0) < n)
-      .map(([file, n]) => `${file}: inventory says ${n}, found ${found[file] ?? 0}`);
-    expect(
-      stale,
-      `Lower these numbers — the strings are gone:\n${stale.join("\n")}`,
+      offenders,
+      "Rust: sentinel_core::product_name!() inside concat!, else PRODUCT_NAME. " +
+        "Go: internal/version.Name.\n" +
+        offenders.join("\n"),
     ).toEqual([]);
   });
 });

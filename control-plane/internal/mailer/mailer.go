@@ -17,6 +17,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/your-org/sentinel-waf/control-plane/internal/version"
 )
 
 // ErrNotConfigured is returned when no SMTP host or sender is set. Callers treat
@@ -79,7 +81,7 @@ func FromEnv() Config {
 		Username:    env("SENTINEL_SMTP_USERNAME", ""),
 		Password:    os.Getenv("SENTINEL_SMTP_PASSWORD"),
 		From:        env("SENTINEL_SMTP_FROM", ""),
-		FromName:    env("SENTINEL_SMTP_FROM_NAME", "Next-Gen ESDSWAF"),
+		FromName:    env("SENTINEL_SMTP_FROM_NAME", version.Name),
 		Security:    security,
 		SkipVerify:  skip == "1" || strings.EqualFold(skip, "true"),
 		Timeout:     timeout,

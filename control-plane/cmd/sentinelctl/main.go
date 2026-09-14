@@ -14,6 +14,8 @@ import (
 	"strings"
 	"text/tabwriter"
 	"time"
+
+	product "github.com/your-org/sentinel-waf/control-plane/internal/version"
 )
 
 const version = "0.1.0"
@@ -766,7 +768,7 @@ func cmdTest(args []string) {
 // ── usage ─────────────────────────────────────────────────────────────────────
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `sentinelctl — Sentinel WAF operator CLI (v%s)
+	fmt.Fprintf(os.Stderr, `sentinelctl — `+product.Name+` operator CLI (v%s)
 
 Usage:
   sentinelctl <command> [subcommand] [flags]

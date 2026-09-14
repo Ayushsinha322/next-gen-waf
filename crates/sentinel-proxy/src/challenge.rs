@@ -254,7 +254,11 @@ h1{font-size:19px;margin:14px 0 6px}p{font-size:13px;color:#8b97a7;line-height:1
 .bar > i{display:block;height:100%;width:0;background:linear-gradient(90deg,#22d3ee,#0d9488);transition:width .2s}
 .foot{margin-top:18px;font-size:10px;color:#52525b}</style></head>"#;
 
-const HTML_BODY: &str = r#"<body><div class="card"><div class="logo">Sentinel WAF</div><div class="spin"></div><h1>Checking your browser</h1><p id="msg">Verifying you are human — this runs entirely in your browser and takes a moment.</p><div class="bar"><i id="pb"></i></div><div class="foot">No tracking · no third-party · Proof-of-Work</div></div>"#;
+const HTML_BODY: &str = concat!(
+    r#"<body><div class="card"><div class="logo">"#,
+    sentinel_core::product_name!(),
+    r#"</div><div class="spin"></div><h1>Checking your browser</h1><p id="msg">Verifying you are human — this runs entirely in your browser and takes a moment.</p><div class="bar"><i id="pb"></i></div><div class="foot">No tracking · no third-party · Proof-of-Work</div></div>"#
+);
 
 // Synchronous SHA-256 (FIPS 180-4) over an ASCII string + the PoW solver loop.
 const SOLVER_JS: &str = r#"<script>

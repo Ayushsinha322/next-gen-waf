@@ -34,9 +34,13 @@ const DEFAULT_BIND: &str = "127.0.0.1:8080";
 // CLI definitions
 // ---------------------------------------------------------------------------
 
-/// Sentinel WAF — easy-mode admin CLI.
 #[derive(Parser)]
-#[command(name = "sentinel", version, about, long_about = None)]
+#[command(
+    name = "sentinel",
+    version,
+    about = concat!(sentinel_core::product_name!(), " — easy-mode admin CLI."),
+    long_about = None
+)]
 struct Cli {
     /// Path to the Sentinel config file.
     /// Defaults to `~/.config/sentinel/sentinel.yaml`.
@@ -620,7 +624,7 @@ fn cmd_reload() -> Result<()> {
 }
 
 fn cmd_status(cfg_path: &Path) -> Result<()> {
-    println!("Sentinel WAF\n");
+    println!("{}\n", sentinel_core::PRODUCT_NAME);
 
     let pid = read_pid()?;
     let alive = pid.map(process_alive).unwrap_or(false);
@@ -972,7 +976,7 @@ fn cmd_test(cfg_path: &Path, site_filter: Option<&str>) -> Result<()> {
         .map(|d| d.as_str())
         .unwrap_or("localhost");
 
-    println!("Testing Sentinel WAF");
+    println!("Testing {}", sentinel_core::PRODUCT_NAME);
     println!("  Target: {target}");
     println!("  Site:   {} (Host: {host})", site.id);
     println!("  Mode:   {}", fmt_mode(&site.waf.mode));

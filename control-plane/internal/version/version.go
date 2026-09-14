@@ -15,6 +15,20 @@ import (
 	"strings"
 )
 
+// Name is what the product is CALLED, as a customer reads it.
+//
+// `sentinel` is the codename for this source tree — the module path, the
+// binaries, the env prefix, the image tags. It is not the product name. Nor is
+// "Next-Gen ESDSWAF", which this name replaced and which was still going out in
+// every password-reset email.
+//
+// This matters most where the string is durable or leaves the building: the
+// TOTP issuer lands in an administrator's authenticator app and stays there for
+// the life of the account, and mail and alert payloads are read by people who
+// never see the console. The console enforces the same rule in
+// dashboard/lib/__tests__/branding.test.ts.
+const Name = "Swaraj Kavach"
+
 // Product is the release version. Bump it together with VERSION, Cargo.toml
 // [workspace.package].version and dashboard/package.json — CI refuses a drift.
 const Product = "1.1.0"
