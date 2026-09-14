@@ -3,7 +3,7 @@ import { PRODUCT_NAME, PRODUCT_VERSION } from "@/lib/version";
 import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
-import { signOut } from "@/lib/auth";
+import { signOut, getUser, type AuthUser } from "@/lib/auth";
 import { api } from "@/lib/api";
 import { spring } from "@/lib/animations";
 
@@ -52,6 +52,34 @@ const MoonIcon = () => (
 
 export default function TopBar() {
   const router = useRouter();
+
+  // Who is actually signed in.
+  //
+  // This chip read a hardcoded "admin / OWNER" for every account. Not a
+  // placeholder — a wrong claim: `owner` is the TOP of the RBAC table, and the
+  // three accounts on the first deployment are admin, editor and auditor. All
+  // three saw OWNER, which is precisely the screen someone reads during an
+  // access review.
+  //
+  // Read in an effect rather than during render because getUser() is backed by
+  // localStorage, which does not exist on the server; reading it inline would
+  // make the server and client markup disagree.
+  const [me, setMe] = useState<AuthUser | null>(null);
+  const [meLoaded, setMeLoaded] = useState(false);
+  useEffect(() => {
+    setMe(getUser());
+    setMeLoaded(true);
+  }, []);
+
+  // The stored profile carries an email and a role, no display name. The local
+  // part is what an operator calls themselves, and the full address goes in the
+  // tooltip so the chip stays short without hiding anything.
+  const localPart = me?.email.split("@")[0] ?? "";
+  // Blank until loaded, so the chip does not flash a fallback and then correct
+  // itself on every page view.
+  const displayName = localPart || (meLoaded ? "signed in" : "");
+  const displayRole = me?.role ? me.role.toUpperCase() : meLoaded ? "role unknown" : "";
+  const initial = localPart ? localPart[0].toUpperCase() : "\u00B7";
   const [rps, setRps]   = useState<number | null>(null);
   const [p99, setP99]   = useState<number | null>(null);
   // How many samples the p99 came from. 0 means NO MEASUREMENT — the control
@@ -243,11 +271,15 @@ export default function TopBar() {
 
         <div style={{ width: 1, height: 22, background: "var(--border2)", margin: "0 2px" }} />
 
-        <motion.div className="uchip" whileHover={{ scale: 1.03 }}>
-          <div className="uav">A</div>
-          <div>
-            <div className="uname">admin</div>
-            <div className="urole">OWNER</div>
+        <motion.div
+          className="uchip"
+          whileHover={{ scale: 1.03 }}
+          title={me ? `${me.email} · ${me.role}` : "Signed in. Sign out and back in to show your account here."}
+        >
+          <div className="uav">{initial}</div>
+          <div style={{ minWidth: 0 }}>
+            <div className="uname">{displayName}</div>
+            <div className="urole">{displayRole}</div>
           </div>
         </motion.div>
 
