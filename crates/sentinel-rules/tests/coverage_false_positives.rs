@@ -55,6 +55,21 @@ fn eval(engine: &RuleEngine, ctx: &mut RequestContext) {
 /// parameters an average application uses, and body text an average user types.
 fn benign_cases() -> Vec<(&'static str, RequestContext)> {
     vec![
+        // --- 9900218 must not fire on ordinary wildcard-DNS dev hostnames.
+        (
+            "wildcard dns hostname used in development",
+            make_get_ctx("/go?next=http%3A%2F%2F127.0.0.1.nip.io%3A8080%2F"),
+        ),
+        ("an ordinary browser user-agent", {
+            let mut c = make_get_ctx("/");
+            c.request_headers.insert(
+                "user-agent",
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/128.0.0.0 Safari/537.36"
+                    .parse()
+                    .unwrap(),
+            );
+            c
+        }),
         // --- 9900217, mail injection. A newline is not an attack; a newline
         // --- followed by a STANDALONE mail verb is.
         (
@@ -184,6 +199,25 @@ fn benign_cases() -> Vec<(&'static str, RequestContext)> {
 /// regression here costs real detection.
 fn attack_cases() -> Vec<(&'static str, RequestContext)> {
     vec![
+        // --- 9900218. The payload is unremarkable; the callback host is the tell.
+        ("OAST callback host appended to a browser user-agent", {
+            let mut c = make_get_ctx("/");
+            c.request_headers.insert(
+                "user-agent",
+                "Mozilla/5.0 (Windows NT 6.1) Chrome/55.0 Safari/537.36 root@w63gec.interact.sh"
+                    .parse()
+                    .unwrap(),
+            );
+            c
+        }),
+        (
+            "blind SSRF pointing at a collaborator host",
+            make_get_ctx("/fetch?url=http%3A%2F%2Fabc123.burpcollaborator.net%2Fx"),
+        ),
+        (
+            "dns exfiltration host in a parameter",
+            make_get_ctx("/q?v=data.dnslog.cn"),
+        ),
         // --- 9900217. All seven GoTestWAF bypasses were this one payload;
         // --- each encoding and placement is represented here.
         (
