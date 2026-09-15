@@ -55,6 +55,24 @@ fn eval(engine: &RuleEngine, ctx: &mut RequestContext) {
 /// parameters an average application uses, and body text an average user types.
 fn benign_cases() -> Vec<(&'static str, RequestContext)> {
     vec![
+        // --- 9900217, mail injection. A newline is not an attack; a newline
+        // --- followed by a STANDALONE mail verb is.
+        (
+            "multi-line message whose second line starts with the word data",
+            make_get_ctx("/note?body=see%20below%0D%0Adata%20collected%20from%20users%20in%20May"),
+        ),
+        (
+            "prose containing a line that begins with to",
+            make_get_ctx("/note?body=hello%0D%0Ato%20whom%20it%20may%20concern"),
+        ),
+        (
+            "quoted email thread with a To header the user pasted",
+            make_get_ctx("/ticket?body=forwarding%20this%3A%0D%0ATo%3A%20support%40example.com"),
+        ),
+        (
+            "plain multi-line address block",
+            make_get_ctx("/addr?v=12%20High%20Street%0D%0ALondon%0D%0AUK"),
+        ),
         // --- 9900216, protocol-relative URLs. A `//` only matters when it
         // --- starts the value AND is followed by something domain-shaped.
         (
@@ -166,6 +184,32 @@ fn benign_cases() -> Vec<(&'static str, RequestContext)> {
 /// regression here costs real detection.
 fn attack_cases() -> Vec<(&'static str, RequestContext)> {
     vec![
+        // --- 9900217. All seven GoTestWAF bypasses were this one payload;
+        // --- each encoding and placement is represented here.
+        (
+            "SMTP QUIT injected url-encoded",
+            make_get_ctx("/mail?to=%0D%0AQUIT%0D%0A"),
+        ),
+        (
+            "SMTP QUIT injected base64",
+            make_get_ctx("/mail?to=DQpRVUlUDQo"),
+        ),
+        (
+            "SMTP QUIT base64 in the url path",
+            make_get_ctx("/DQpRVUlUDQo"),
+        ),
+        (
+            "envelope rewrite via RCPT TO",
+            make_get_ctx("/mail?to=x%40y.com%0D%0ARCPT%20TO%3A%20victim%40elsewhere.com"),
+        ),
+        (
+            "blind carbon copy header injection",
+            make_get_ctx("/contact?email=a%40b.com%0D%0ABcc%3A%20everyone%40example.com"),
+        ),
+        (
+            "SMTP session reset",
+            make_post_ctx("/contact", "msg=hi%0D%0ARSET%0D%0A"),
+        ),
         // --- 9900216. Each of these returned 200 with NO rule firing before
         // --- this signature existed; the scheme-ful form was already a 403.
         (
