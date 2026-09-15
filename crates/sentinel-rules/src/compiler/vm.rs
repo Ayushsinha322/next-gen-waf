@@ -2059,14 +2059,65 @@ fn decode_html_entities(s: String) -> String {
             }
         }
         // Named entities (require the trailing ';').
-        let window: String = chars[i..(i + 6).min(chars.len())].iter().collect();
+        // Window must fit the LONGEST name below (&NewLine; is 9). It was 6,
+        // which was exactly long enough for the six entities that used to be
+        // here and silently too short for anything else.
+        let window: String = chars[i..(i + 10).min(chars.len())].iter().collect();
+        // HTML5 named entities for ASCII punctuation.
+        //
+        // This list held six entries — the ones everybody remembers — and that
+        // gap was a live XSS bypass, measured by GoTestWAF on 2026-09-15:
+        //
+        //     &gt; src onerror=confirm&amp;lpar;1&amp;rpar;&lt;
+        //
+        // reached the application with a 200. A browser resolves `&amp;lpar;`
+        // to `&lpar;` and then to `(`, so it reads that as `confirm(1)` and
+        // runs it. The decoder stopped at `&lpar;`, every XSS rule downstream
+        // saw a string with no parentheses, and nothing fired. The same payload
+        // spelled with literal brackets was a 403.
+        //
+        // So the entities that matter for evasion are the PUNCTUATION ones —
+        // the characters that make a payload syntactically executable. They are
+        // all here now, ordered longest-first so a prefix match cannot pick a
+        // shorter name that happens to start the same way.
+        //
+        // Decoding more of them is strictly more correct, not more aggressive:
+        // it makes the inspected string closer to what the browser will
+        // actually execute, which is the whole purpose of the transform.
         let named: &[(&str, char)] = &[
-            ("&lt;", '<'),
-            ("&gt;", '>'),
-            ("&amp;", '&'),
+            ("&NewLine;", '\n'),
+            ("&percnt;", '%'),
+            ("&lowbar;", '_'),
+            ("&period;", '.'),
+            ("&dollar;", '$'),
+            ("&commat;", '@'),
+            ("&excl;", '!'),
+            ("&quest;", '?'),
+            ("&grave;", '`'),
+            ("&equals;", '='),
+            ("&colon;", ':'),
+            ("&comma;", ','),
+            ("&nbsp;", ' '),
             ("&quot;", '"'),
             ("&apos;", '\''),
-            ("&nbsp;", ' '),
+            ("&verbar;", '|'),
+            ("&plus;", '+'),
+            ("&minus;", '-'),
+            ("&lpar;", '('),
+            ("&rpar;", ')'),
+            ("&lsqb;", '['),
+            ("&rsqb;", ']'),
+            ("&lcub;", '{'),
+            ("&rcub;", '}'),
+            ("&bsol;", '\\'),
+            ("&sol;", '/'),
+            ("&semi;", ';'),
+            ("&num;", '#'),
+            ("&ast;", '*'),
+            ("&Tab;", '\t'),
+            ("&amp;", '&'),
+            ("&lt;", '<'),
+            ("&gt;", '>'),
         ];
         if let Some((ent, ch)) = named.iter().find(|(ent, _)| window.starts_with(ent)) {
             out.push(*ch);
@@ -2451,6 +2502,65 @@ mod xml_tests {
             apply_transforms("hello world".to_string(), &[Transform::UrlDecodeUni]),
             "hello world"
         );
+    }
+
+    /// The named-entity table held six entries, and that gap was a live XSS
+    /// bypass: `&gt; src onerror=confirm&amp;lpar;1&amp;rpar;&lt;` reached the
+    /// application with a 200 while the same payload spelled with literal
+    /// brackets was a 403. A browser resolves `&amp;lpar;` to `&lpar;` to `(`
+    /// and executes it; the decoder stopped at `&lpar;`, so every XSS rule
+    /// downstream saw a string containing no parentheses at all.
+    #[test]
+    fn html_entity_decode_covers_punctuation_used_for_evasion() {
+        let d = |s: &str| apply_transforms(s.to_string(), &[Transform::HtmlEntityDecode]);
+
+        // The pair that made the bypass work.
+        assert_eq!(d("&lpar;"), "(");
+        assert_eq!(d("&rpar;"), ")");
+        // Doubly-wrapped, which is how it actually arrived. to_fixpoint unwraps
+        // `&amp;lpar;` -> `&lpar;` -> `(`.
+        assert_eq!(d("&amp;lpar;1&amp;rpar;"), "(1)");
+        // The whole payload must end up syntactically executable.
+        assert_eq!(
+            d("&gt; src onerror=confirm&amp;lpar;1&amp;rpar;&lt;"),
+            "> src onerror=confirm(1)<"
+        );
+
+        // The rest of the punctuation an evasion can hide behind.
+        assert_eq!(d("&sol;etc&sol;passwd"), "/etc/passwd");
+        assert_eq!(d("&lcub;&lcub;7&ast;7&rcub;&rcub;"), "{{7*7}}");
+        assert_eq!(
+            d("javascript&colon;alert&lpar;1&rpar;"),
+            "javascript:alert(1)"
+        );
+        assert_eq!(d("a&semi;b&num;c&excl;d"), "a;b#c!d");
+        assert_eq!(d("&lsqb;0&rsqb;"), "[0]");
+        assert_eq!(d("&bsol;u0041"), "\\u0041");
+        assert_eq!(d("&grave;id&grave;"), "`id`");
+        assert_eq!(d("a&verbar;&verbar;b"), "a||b");
+        assert_eq!(d("&dollar;&lcub;x&rcub;"), "${x}");
+
+        // The original six still work.
+        assert_eq!(d("&lt;script&gt;"), "<script>");
+        assert_eq!(d("&quot;x&quot;"), "\"x\"");
+        assert_eq!(d("&apos;"), "'");
+        assert_eq!(d("a&nbsp;b"), "a b");
+
+        // Names that share a prefix must not shadow each other: `&comma;` is
+        // not a prefix of `&commat;`, and a list ordered wrongly would decode
+        // `&commat;` as "," followed by a stray "t;".
+        assert_eq!(d("&comma;"), ",");
+        assert_eq!(d("&commat;"), "@");
+        assert_eq!(d("&num;"), "#");
+        assert_eq!(d("&nbsp;"), " ");
+        assert_eq!(d("&ast;"), "*");
+        assert_eq!(d("&amp;"), "&");
+        assert_eq!(d("&apos;"), "'");
+
+        // An unknown entity is left alone rather than mangled.
+        assert_eq!(d("&notarealentity;"), "&notarealentity;");
+        // Text with no entities is untouched.
+        assert_eq!(d("plain text, no entities"), "plain text, no entities");
     }
 
     #[test]
