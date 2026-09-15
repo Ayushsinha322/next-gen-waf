@@ -370,6 +370,33 @@ impl MlEngine {
 /// URL/Base64-encoded payload in one field decodes cleanly (its whole-value
 /// marker is intact) instead of being lost inside the raw body blob. Non-form
 /// bodies (JSON, raw) are already covered by the whole-body candidate.
+/// Push every scalar in a JSON document, so each field can be decoded and
+/// scored on its own rather than being diluted inside the envelope.
+///
+/// Keys are pushed too: a payload can be carried in a field NAME, and the rule
+/// engine inspects ARGS_NAMES for exactly that reason.
+fn json_scalar_values(v: &serde_json::Value, out: &mut Vec<String>) {
+    match v {
+        serde_json::Value::Object(map) => {
+            for (k, val) in map {
+                if !k.is_empty() {
+                    out.push(k.clone());
+                }
+                json_scalar_values(val, out);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for val in arr {
+                json_scalar_values(val, out);
+            }
+        }
+        serde_json::Value::String(s) if !s.is_empty() => out.push(s.clone()),
+        serde_json::Value::Number(n) => out.push(n.to_string()),
+        // Bools and nulls carry no payload.
+        _ => {}
+    }
+}
+
 fn body_field_values(body: &str, content_type: &str, out: &mut Vec<String>) {
     let ct = content_type.to_ascii_lowercase();
     if ct.starts_with("application/x-www-form-urlencoded") {
@@ -381,6 +408,32 @@ fn body_field_values(body: &str, content_type: &str, out: &mut Vec<String>) {
             if !dec.is_empty() {
                 out.push(dec);
             }
+        }
+    } else if ct.starts_with("application/json") || ct.contains("+json") {
+        // JSON was missing here, and that was a measured bypass on 2026-09-15.
+        //
+        // The comment on the caller explains why per-field candidates exist at
+        // all: a wholly-encoded value sits inside an envelope, so decoding the
+        // envelope as one string never reaches it. That reasoning applies to
+        // JSON exactly as it does to form and multipart bodies, and JSON was
+        // simply left out.
+        //
+        // The consequence was not a missed score, it was a WRONG VETO. A
+        // base64'd MSSQL stacked query in `{"q":"MzsvKi…"}` fired the
+        // libinjection rule for precisely the threshold score. The only
+        // candidate the classifier received was the whole body string, which is
+        // not itself base64, so `score_all` had nothing to decode and returned
+        // ~0 — "no attack here". `apply_verdict` read that as benign evidence
+        // and suppressed the block, and the payload reached the application.
+        // The identical payload in a query parameter was blocked, because query
+        // values ARE split out per field. Whether an attack was stopped depended
+        // on which body format carried it.
+        //
+        // Malformed JSON falls through deliberately: the caller has already
+        // pushed the raw body as a candidate, so nothing is lost by not
+        // guessing at a broken document.
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+            json_scalar_values(&v, out);
         }
     } else if let Some(pos) = ct.find("multipart/form-data") {
         // Boundary token from `; boundary=...`.
@@ -534,5 +587,67 @@ mod tests {
         assert_eq!(engine.sensitivity(), 0.0);
         engine.set_sensitivity(0.73);
         assert_eq!(engine.sensitivity(), 0.73);
+    }
+}
+
+#[cfg(test)]
+mod json_candidate_tests {
+    use super::body_field_values;
+
+    /// JSON bodies were absent from `body_field_values`, and the cost was not a
+    /// missed score but a WRONG VETO: the classifier only ever saw the whole
+    /// body string, which is not itself base64, so an encoded payload inside a
+    /// field decoded to nothing and scored ~0. `apply_verdict` read that as
+    /// "no attack here" and suppressed a correct libinjection block.
+    #[test]
+    fn json_bodies_yield_per_field_candidates() {
+        let mut out = Vec::new();
+        body_field_values(
+            r#"{"q":"MzsvKiBhICovIERFQ0xBUkU=","nested":{"deep":"payload"},"arr":["a","b"],"n":42}"#,
+            "application/json",
+            &mut out,
+        );
+        // Each scalar must arrive on its own so score_all can decode it.
+        assert!(out.iter().any(|c| c == "MzsvKiBhICovIERFQ0xBUkU="));
+        assert!(out.iter().any(|c| c == "payload"));
+        assert!(out.iter().any(|c| c == "a") && out.iter().any(|c| c == "b"));
+        assert!(out.iter().any(|c| c == "42"));
+        // Keys count: a payload can be carried in a field name, which is why
+        // the rule engine inspects ARGS_NAMES.
+        assert!(out.iter().any(|c| c == "q"));
+        assert!(out.iter().any(|c| c == "nested"));
+    }
+
+    #[test]
+    fn json_variant_content_types_are_handled() {
+        let mut out = Vec::new();
+        body_field_values(r#"{"a":"x"}"#, "application/vnd.api+json", &mut out);
+        assert!(out.iter().any(|c| c == "x"), "+json suffix must be parsed");
+    }
+
+    /// Malformed JSON must not panic or invent candidates. The caller has
+    /// already pushed the raw body, so nothing is lost by declining to guess.
+    #[test]
+    fn malformed_json_yields_nothing_rather_than_guessing() {
+        let mut out = Vec::new();
+        body_field_values(r#"{"a":"unterminated"#, "application/json", &mut out);
+        assert!(out.is_empty());
+    }
+
+    /// The other two body formats must keep working exactly as before.
+    #[test]
+    fn form_and_multipart_are_unchanged() {
+        let mut out = Vec::new();
+        body_field_values(
+            "q=1%20OR%201%3D1--&z=ok",
+            "application/x-www-form-urlencoded",
+            &mut out,
+        );
+        assert!(out.iter().any(|c| c == "1 OR 1=1--"));
+
+        let mut out2 = Vec::new();
+        let body = "--B\r\nContent-Disposition: form-data; name=\"f\"\r\n\r\nvalue-here\r\n--B--";
+        body_field_values(body, "multipart/form-data; boundary=B", &mut out2);
+        assert!(out2.iter().any(|c| c.contains("value-here")));
     }
 }
