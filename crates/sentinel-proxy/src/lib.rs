@@ -4626,7 +4626,43 @@ fn ml_vetoes_weak_block(ctx: &RequestContext) -> bool {
             .iter()
             .any(|m| m.rule_id.starts_with("99002"))
         && ctx.ml_scores.get("payload_attack").copied().unwrap_or(1.0) < ML_SUPPRESSION_MAX
-        && ctx.anomaly_score < 20
+        && request_evidence(ctx) < 20
+}
+
+/// Anomaly score earned by THIS request — rules, classifier, plugins — with the
+/// engines that score the client's HISTORY taken back out.
+///
+/// The veto's evidence cap is documented as "2-3 CRS matches worth". It was
+/// compared against the total `anomaly_score`, and three engines add points
+/// that come from the IP rather than from anything in the request:
+///
+///   correlation  — recent blocks from this IP, capped at 4
+///   bot          — the SAME recent-block count again as "repeat-offender",
+///                  +10/+20 to the bot score, surfacing as +4/+5 here
+///   reputation   — a tagged CIDR list (Tor, known-bad), +2
+///
+/// Measured live on 2026-09-16 with a benign search term (`D'or 1st parfume`):
+/// 15 from rules on a clean IP, vetoed as benign prose, HTTP 200. Twenty
+/// attacks from the same IP inside the 60 s correlation window, and the
+/// identical request scored 24 — 15 + 4 + 5 — cleared the cap, and was a 403.
+/// Sixty-five seconds later it was 15 and a 200 again. The request never
+/// changed. Its neighbour's did.
+///
+/// That is history manufacturing evidence, and one signal (the block count)
+/// counted twice on the way. History escalating a borderline verdict is what
+/// correlation is FOR, and it still does that against the block threshold. It
+/// must not be able to switch the false-positive protection off — the guard
+/// asks what the rules saw, and the rules saw 15.
+///
+/// GoTestWAF reproduced this as 8 benign texts "blocked under concurrency",
+/// because it sends 675 attacks and 141 benign texts from one address. It was
+/// never concurrency.
+fn request_evidence(ctx: &RequestContext) -> u32 {
+    let history: u32 = ["correlation", "bot", "reputation"]
+        .iter()
+        .filter_map(|e| ctx.engine_scores.get(*e))
+        .sum();
+    ctx.anomaly_score.saturating_sub(history)
 }
 
 /// Final verdict fusion. With fusion enabled: weighted score vs per-paranoia
@@ -9598,6 +9634,70 @@ mod fusion_tests {
         });
         apply_verdict(&mut c, &mk());
         assert_eq!(c.decision, WafDecision::Block, "in-house signature fired");
+    }
+
+    /// The live reproduction, as a test. A benign search term earning 15 from
+    /// rules is vetoed on a clean IP. After twenty attacks from the same IP,
+    /// correlation adds 4 and the bot detector adds 5 for the same block
+    /// history, and the identical request became a 403. The request did not
+    /// change; its neighbours did. History may escalate, never manufacture.
+    #[test]
+    fn ip_history_cannot_switch_off_the_veto() {
+        for w in [
+            waf(2, 10, None),
+            waf(2, 10, Some(fusion(true, &[], vec![10, 8, 6, 4], vec![]))),
+        ] {
+            let mut c = ctx();
+            c.add_engine_score("rules", 15); // borderline prose, as measured
+            c.add_engine_score("correlation", 4); // recent blocks, capped
+            c.add_engine_score("bot", 5); // the same blocks again, via repeat-offender
+            c.ml_scores.insert("payload_attack".to_string(), 0.02);
+            assert_eq!(c.anomaly_score, 24, "fixture must reproduce the live score");
+            apply_verdict(&mut c, &w);
+            assert_eq!(
+                c.decision,
+                WafDecision::Allow,
+                "a tainted IP turned benign prose into a block (fusion={})",
+                w.fusion.is_some()
+            );
+        }
+    }
+
+    /// History must still ESCALATE. When the request itself carries real
+    /// evidence, or the model agrees it is an attack, a repeat offender blocks.
+    #[test]
+    fn ip_history_still_escalates_real_evidence() {
+        let mut c = ctx();
+        c.add_engine_score("rules", 25);
+        c.add_engine_score("correlation", 4);
+        c.ml_scores.insert("payload_attack".to_string(), 0.02);
+        apply_verdict(&mut c, &waf(2, 10, None));
+        assert_eq!(c.decision, WafDecision::Block, "real evidence over the cap");
+
+        let mut c = ctx();
+        c.add_engine_score("rules", 15);
+        c.add_engine_score("correlation", 4);
+        c.add_engine_score("bot", 5);
+        c.ml_scores.insert("payload_attack".to_string(), 0.97);
+        apply_verdict(&mut c, &waf(2, 20, None)); // rules alone fall short of 20
+        assert_eq!(
+            c.decision,
+            WafDecision::Block,
+            "history lifts a real attack"
+        );
+    }
+
+    #[test]
+    fn request_evidence_strips_only_history_engines() {
+        let mut c = ctx();
+        c.add_engine_score("rules", 10);
+        c.add_engine_score("ml", 6); // the model's own points are request-derived
+        c.add_engine_score("plugin", 2);
+        c.add_engine_score("correlation", 4);
+        c.add_engine_score("bot", 5);
+        c.add_engine_score("reputation", 2);
+        assert_eq!(c.anomaly_score, 29);
+        assert_eq!(request_evidence(&c), 18, "rules + ml + plugin only");
     }
 
     /// A soft-deny is still a broken request for the customer, so the veto
