@@ -9128,6 +9128,71 @@ fn waf_own_ms(ctx: &RequestContext) -> f64 {
     (total - upstream).max(0.0)
 }
 
+/// The per-request access record — the same object `ndjson_log` writes — as a
+/// pure function so the field list is a TESTED contract rather than a side
+/// effect of a writer (a debug assertion in `ndjson_log` keeps them identical).
+///
+/// Two fields were missing until 2026-09-16, and their absence read as silence:
+///
+///   rule    — the primary rule id, or "" when no rule fired
+///   reason  — the block reason, or "" when nothing was blocked
+///
+/// Five modules (GraphQL, gRPC, JWT, threat intel, request smuggling) block
+/// with no rule match at all. Each already set `ctx.block_reason`, and that
+/// reason already reached stdout and Threat Search. It never reached THIS
+/// record — the file the console's Logs page tails and the one an operator
+/// greps — so a 403 from any of them appeared as `"action":"BLOCK","score":0`
+/// and nothing else. The modules were not silent. The record was.
+///
+/// The reason goes HERE rather than into a log line inside each module on
+/// purpose: the smuggling detector's own comment explains that a per-request
+/// log line on an attacker-controlled path is a flood primitive. This record
+/// is emitted exactly once per request already, so this is a field, not an
+/// event.
+fn access_record(ctx: &RequestContext) -> serde_json::Value {
+    let status = ctx.response_status.map(|s| s.as_u16()).unwrap_or(0);
+    let ua = ctx
+        .request_headers
+        .get(http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-");
+    let action = match ctx.decision {
+        WafDecision::Block | WafDecision::Challenge => "BLOCK",
+        _ if ctx.would_block => "DETECT",
+        _ if ctx.gateway_error.is_some() => "ERROR",
+        _ => "PASS",
+    };
+    let referer_owned = sentinel_core::redact::redact_url_query(
+        ctx.request_headers
+            .get(http::header::REFERER)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-"),
+    );
+    serde_json::json!({
+        "ts":      chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        "request_id": ctx.request_id.to_string(),
+        "ip":      ctx.client_ip.to_string(),
+        "country": ctx.geo_country.as_deref().unwrap_or(""),
+        "method":  ctx.method.as_str(),
+        "path":    capped_path(&ctx.uri),
+        "query":   capped_query(&ctx.uri),
+        "status":  status,
+        "latency": format!("{:.2}", ctx.elapsed_ms()),
+        "waf_ms": format!("{:.2}", waf_own_ms(ctx)),
+        "bytes":    ctx.bytes_sent,
+        "site":     ctx.site_id.as_deref().unwrap_or("-"),
+        "tenant":   ctx.tenant_id.as_deref().unwrap_or(""),
+        "protocol": protocol_label(ctx.http_version),
+        "ja4":      ctx.tls_fingerprint.as_deref().unwrap_or("-"),
+        "ua":       ua,
+        "referer":  referer_owned.as_str(),
+        "action":   action,
+        "score":    ctx.anomaly_score,
+        "rule":     ctx.primary_rule_match().map(|m| m.rule_id.as_str()).unwrap_or(""),
+        "reason":   ctx.block_reason.as_deref().unwrap_or(""),
+    })
+}
+
 fn ndjson_log(ctx: &RequestContext) {
     if !ndjson_logging_enabled() {
         return;
@@ -9178,39 +9243,7 @@ fn ndjson_log(ctx: &RequestContext) {
     let referer_owned = sentinel_core::redact::redact_url_query(referer_raw);
     let referer = referer_owned.as_str();
 
-    let access = serde_json::json!({
-        "ts":      ts,
-        "request_id": request_id,
-        "ip":      ctx.client_ip.to_string(),
-        "country": country,
-        "method":  ctx.method.as_str(),
-        "path":    capped_path(&ctx.uri),
-        "query":   query,
-        "status":  status,
-        "latency": format!("{:.2}", ctx.elapsed_ms()),
-        // The WAF's OWN time: end-to-end minus the wait on the origin.
-        //
-        // `latency` is honest but answers a different question than a reader of
-        // a WAF status bar assumes. A long-poll or a slow origin dominates it —
-        // Juice Shop's socket.io holds a request open ~25s, which alone drove
-        // the console's p99 badge to "24387.9ms" and reads as "the WAF is
-        // broken" when nothing is. This field is immune to that: it is what the
-        // WAF added, so a slow upstream cannot inflate it.
-        "waf_ms": format!("{:.2}", waf_own_ms(ctx)),
-        "bytes":    ctx.bytes_sent,
-        "site":     site,
-        "tenant":   tenant,
-        "protocol": protocol_label(ctx.http_version),
-        // JA4 TLS fingerprint (t… TCP, q… QUIC), "-" for plaintext or none. Not
-        // PII — a hash of TLS parameters — so no redaction. Drives bot scoring
-        // and the JA4 blocklist; was never on the record.
-        "ja4":      ctx.tls_fingerprint.as_deref().unwrap_or("-"),
-        "ua":       ua,
-        "referer":  referer,
-        "action":   action,
-        "score":    ctx.anomaly_score,
-    });
-    enqueue_log("access.log", access.to_string());
+    enqueue_log("access.log", access_record(ctx).to_string());
 
     // Emit a waf.log line for anything the WAF acted on or *would* have acted on:
     // any rule match, an enforced block, or a learning-mode would-block. The last
@@ -9288,6 +9321,7 @@ fn ndjson_log(ctx: &RequestContext) {
             "sev":    sev_str,
             "attack": attack,
             "action": action,
+            "reason": ctx.block_reason.as_deref().unwrap_or(""),
             "mode":   mode,
             "site":   site,
             "tenant": tenant,
@@ -9326,6 +9360,16 @@ fn classify_nonrule_block(reason: &str) -> (&'static str, &'static str) {
         ("RATELIMIT", "Rate limit exceeded")
     } else if r.contains("smuggling") {
         ("SMUGGLING", "HTTP request smuggling")
+    // GraphQL, gRPC and JWT all block with no rule match and all fell through
+    // to ANOMALY here — "anomaly threshold exceeded" with score 0, the same
+    // self-contradiction described below. Their reasons are prefixed at the
+    // call site ("graphql:", "grpc:", "jwt:"), which is what these match.
+    } else if r.starts_with("graphql") {
+        ("GRAPHQL", "GraphQL policy violation")
+    } else if r.starts_with("grpc") {
+        ("GRPC", "gRPC policy violation")
+    } else if r.starts_with("jwt") {
+        ("JWT", "JWT validation failure")
     // The three connection-layer reasons below were missing, so all of them
     // fell through to ANOMALY and were logged as "anomaly threshold exceeded"
     // with score=0 — a self-contradiction (0 cannot exceed a threshold of 10)
@@ -9518,6 +9562,96 @@ mod threat_intel_contract_tests {
                 "/"
             ),
             ThreatVerdict::None
+        );
+    }
+}
+
+#[cfg(test)]
+mod access_record_tests {
+    use super::*;
+
+    fn ctx() -> RequestContext {
+        RequestContext::new("203.0.113.9".parse().unwrap(), 4321)
+    }
+
+    /// A module block carries no rule match. Before 2026-09-16 this record
+    /// showed `"action":"BLOCK","score":0` and nothing else for it.
+    #[test]
+    fn module_block_is_explainable_from_the_record_alone() {
+        let mut c = ctx();
+        c.decision = WafDecision::Block;
+        c.block_reason = Some("grpc: server reflection blocked".to_string());
+        let r = access_record(&c);
+        assert_eq!(r["action"], "BLOCK");
+        assert_eq!(
+            r["rule"], "",
+            "no rule fired, so rule must be empty, not invented"
+        );
+        assert_eq!(r["reason"], "grpc: server reflection blocked");
+    }
+
+    /// A rule block names the WORST rule, matching Threat Search.
+    #[test]
+    fn rule_block_names_the_primary_rule() {
+        let mut c = ctx();
+        c.decision = WafDecision::Block;
+        c.block_reason = Some("anomaly score 24 >= threshold 10".to_string());
+        c.rule_matches.push(sentinel_core::context::RuleMatch {
+            rule_id: "942100".into(),
+            message: "SQLi".into(),
+            severity: sentinel_core::context::Severity::Critical,
+            score: 5,
+            target: "ARGS:q".into(),
+            phase: Phase::RequestBody,
+            matched_value: "x".into(),
+        });
+        c.rule_matches.push(sentinel_core::context::RuleMatch {
+            rule_id: "9900100".into(),
+            message: "libinjection".into(),
+            severity: sentinel_core::context::Severity::Critical,
+            score: 10,
+            target: "ARGS:q".into(),
+            phase: Phase::RequestBody,
+            matched_value: "x".into(),
+        });
+        let r = access_record(&c);
+        assert_eq!(r["rule"], "9900100", "highest-scoring rule, not the first");
+    }
+
+    /// A passed request must not carry a stale or invented reason.
+    #[test]
+    fn pass_has_empty_rule_and_reason() {
+        let r = access_record(&ctx());
+        assert_eq!(r["action"], "PASS");
+        assert_eq!(r["rule"], "");
+        assert_eq!(r["reason"], "");
+    }
+
+    /// The three modules that fell through to ANOMALY are now named, so the
+    /// access log and Threat Search agree about what blocked the request.
+    #[test]
+    fn module_reasons_classify_to_their_own_module() {
+        assert_eq!(
+            classify_nonrule_block("graphql: query depth 12 exceeds max 8").0,
+            "GRAPHQL"
+        );
+        assert_eq!(
+            classify_nonrule_block("grpc: method blocked: /x.Y/Z").0,
+            "GRPC"
+        );
+        assert_eq!(classify_nonrule_block("jwt: token expired").0, "JWT");
+        // and the ones that already worked still do
+        assert_eq!(
+            classify_nonrule_block("threat intel: malicious IP 1.2.3.4").0,
+            "THREATINTEL"
+        );
+        assert_eq!(
+            classify_nonrule_block("request smuggling: TE/CL conflict").0,
+            "SMUGGLING"
+        );
+        assert_eq!(
+            classify_nonrule_block("anomaly score 24 >= threshold 10").0,
+            "ANOMALY"
         );
     }
 }
