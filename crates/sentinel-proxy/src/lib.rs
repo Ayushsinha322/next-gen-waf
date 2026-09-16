@@ -4594,6 +4594,41 @@ fn fused_score(ctx: &RequestContext, f: &FusionConfig) -> u32 {
     (weighted.round().max(0.0) as u32).saturating_add(remainder)
 }
 
+/// Does the n-gram classifier veto this threshold-based block as a likely
+/// false positive?
+///
+/// Extracted so the fusion and non-fusion verdict paths cannot disagree. They
+/// did: the suppression lived inline in the non-fusion branch only, so
+/// **enabling weighted fusion silently disabled the entire precision layer**.
+/// A site with `fusion.enable: true` blocked on raw threshold arithmetic with
+/// no model input at all, which is the opposite of what turning on a more
+/// sophisticated verdict engine should do — and it is the same silently-inert
+/// shape as a feature that is configured, reported, and never consulted.
+///
+/// The three conditions are unchanged:
+///
+/// 1. No in-house coverage signature (99002xx) fired. Those are ours, tuned
+///    against this corpus, and are not second-guessed.
+/// 2. The rule evidence is thin — under 20, i.e. two or three CRS matches.
+///    This deliberately reads `anomaly_score`, the RAW rule score, in both
+///    paths: "how much did the rules actually see" is the same question
+///    however the verdict is later computed, and the fused score is a weighted
+///    transformation of that same evidence rather than new evidence.
+/// 3. The classifier scored the payload below ML_SUPPRESSION_MAX.
+///
+/// A veto needs all three. Anything the model has not seen cannot be vetoed by
+/// it — which is why the classifier's candidate list has to cover every place
+/// the rules look.
+fn ml_vetoes_weak_block(ctx: &RequestContext) -> bool {
+    sentinel_ml::models::ngram_classifier::is_loaded()
+        && !ctx
+            .rule_matches
+            .iter()
+            .any(|m| m.rule_id.starts_with("99002"))
+        && ctx.ml_scores.get("payload_attack").copied().unwrap_or(1.0) < ML_SUPPRESSION_MAX
+        && ctx.anomaly_score < 20
+}
+
 /// Final verdict fusion. With fusion enabled: weighted score vs per-paranoia
 /// block/limit thresholds (→ Block / Limit / Allow). Otherwise the legacy flat
 /// `anomaly_threshold`. An explicit Block from an earlier phase is preserved.
@@ -4612,13 +4647,17 @@ fn apply_verdict(ctx: &mut RequestContext, waf: &WafConfig) {
                 .insert("fused_score".to_string(), score.to_string());
             let block_t =
                 threshold_for_pl(&f.block_thresholds, waf.paranoia_level).unwrap_or(threshold);
-            if score > 0 && score >= block_t {
+            // The classifier gets the same veto here as on the flat-threshold
+            // path. Without this, turning fusion on disabled FP suppression
+            // entirely.
+            let vetoed = ml_vetoes_weak_block(ctx);
+            if score > 0 && score >= block_t && !vetoed {
                 ctx.decision = WafDecision::Block;
                 ctx.block_reason = Some(format!(
                     "fused anomaly score {score} >= block threshold {block_t} (PL{})",
                     waf.paranoia_level
                 ));
-            } else if ctx.decision == WafDecision::Allow {
+            } else if ctx.decision == WafDecision::Allow && !vetoed {
                 if let Some(limit_t) = threshold_for_pl(&f.limit_thresholds, waf.paranoia_level) {
                     if score > 0 && score >= limit_t {
                         ctx.decision = WafDecision::Limit;
@@ -4640,16 +4679,7 @@ fn apply_verdict(ctx: &mut RequestContext, waf: &WafConfig) {
                 // 1. No coverage rule (99002xx) fired
                 // 2. Anomaly score is moderate (< 20, i.e. 2-3 rules)
                 // 3. ML score is low (< 0.15)
-                let has_coverage_match = ctx
-                    .rule_matches
-                    .iter()
-                    .any(|m| m.rule_id.starts_with("99002"));
-                let ml_benign = sentinel_ml::models::ngram_classifier::is_loaded()
-                    && !has_coverage_match
-                    && ctx.ml_scores.get("payload_attack").copied().unwrap_or(1.0)
-                        < ML_SUPPRESSION_MAX
-                    && ctx.anomaly_score < 20;
-                if !ml_benign {
+                if !ml_vetoes_weak_block(ctx) {
                     ctx.decision = WafDecision::Block;
                     ctx.block_reason = Some(format!(
                         "anomaly score {} >= threshold {}",
@@ -9488,6 +9518,97 @@ mod fusion_tests {
             limit_thresholds: limit,
             limit_status: 429,
         }
+    }
+
+    /// Weak rule evidence plus a classifier that sees nothing.
+    fn weak_and_benign(c: &mut RequestContext) {
+        c.add_engine_score("rules", 10); // 2-3 CRS matches worth
+        c.ml_scores.insert("payload_attack".to_string(), 0.02);
+    }
+
+    /// Turning fusion on used to disable FP suppression entirely: the
+    /// suppression lived inline in the non-fusion branch, so a site with
+    /// `fusion.enable: true` blocked on threshold arithmetic with no model
+    /// input at all. Enabling a more sophisticated verdict engine silently
+    /// removed the precision layer.
+    #[test]
+    fn fusion_applies_the_same_ml_veto_as_the_flat_path() {
+        let f = fusion(true, &[], vec![10, 8, 6, 4], vec![5, 4, 3, 2]);
+        let w = waf(2, 10, Some(f));
+        let mut c = ctx();
+        weak_and_benign(&mut c);
+        apply_verdict(&mut c, &w);
+        assert_eq!(
+            c.decision,
+            WafDecision::Allow,
+            "fusion blocked what the flat path would have suppressed"
+        );
+    }
+
+    /// Same inputs, both verdict engines, same answer. This is the property
+    /// that was broken, so it is asserted directly rather than inferred.
+    #[test]
+    fn fusion_and_flat_paths_agree_on_the_same_evidence() {
+        let mut a = ctx();
+        weak_and_benign(&mut a);
+        apply_verdict(&mut a, &waf(2, 10, None));
+
+        let mut b = ctx();
+        weak_and_benign(&mut b);
+        apply_verdict(
+            &mut b,
+            &waf(2, 10, Some(fusion(true, &[], vec![10, 8, 6, 4], vec![]))),
+        );
+
+        assert_eq!(a.decision, b.decision, "the two verdict paths disagree");
+        assert_eq!(a.decision, WafDecision::Allow);
+    }
+
+    /// The veto needs all three conditions. Each of these breaks one, and each
+    /// must still block — otherwise the fix would be suppressing real attacks.
+    #[test]
+    fn fusion_still_blocks_when_any_veto_condition_fails() {
+        let mk = || waf(2, 10, Some(fusion(true, &[], vec![10, 8, 6, 4], vec![])));
+
+        // (a) the model agrees it is an attack
+        let mut c = ctx();
+        c.add_engine_score("rules", 10);
+        c.ml_scores.insert("payload_attack".to_string(), 0.97);
+        apply_verdict(&mut c, &mk());
+        assert_eq!(c.decision, WafDecision::Block, "model said attack");
+
+        // (b) strong rule evidence, regardless of the model
+        let mut c = ctx();
+        c.add_engine_score("rules", 25);
+        c.ml_scores.insert("payload_attack".to_string(), 0.01);
+        apply_verdict(&mut c, &mk());
+        assert_eq!(c.decision, WafDecision::Block, "evidence over the cap");
+
+        // (c) one of our own coverage signatures fired
+        let mut c = ctx();
+        weak_and_benign(&mut c);
+        c.rule_matches.push(sentinel_core::context::RuleMatch {
+            rule_id: "9900206".into(),
+            message: "coverage signature".into(),
+            severity: sentinel_core::context::Severity::Critical,
+            score: 5,
+            target: "ARGS:q".into(),
+            phase: Phase::RequestBody,
+            matched_value: "x".into(),
+        });
+        apply_verdict(&mut c, &mk());
+        assert_eq!(c.decision, WafDecision::Block, "in-house signature fired");
+    }
+
+    /// A soft-deny is still a broken request for the customer, so the veto
+    /// covers the Limit band too.
+    #[test]
+    fn fusion_veto_also_covers_the_limit_band() {
+        let f = fusion(true, &[], vec![100], vec![5]); // limit at 5, block far away
+        let mut c = ctx();
+        weak_and_benign(&mut c);
+        apply_verdict(&mut c, &waf(2, 10, Some(f)));
+        assert_eq!(c.decision, WafDecision::Allow, "throttled benign traffic");
     }
 
     #[test]
