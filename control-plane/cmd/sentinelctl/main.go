@@ -18,7 +18,11 @@ import (
 	product "github.com/your-org/sentinel-waf/control-plane/internal/version"
 )
 
-const version = "0.1.0"
+// The CLI reports the PRODUCT version, derived from the one place it is
+// defined. It used to carry its own literal, "0.1.0", against a product at
+// 1.1.0 — a fifth version number, and the only one outside the gate that
+// exists to prevent a fifth version number.
+const version = product.Product
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 

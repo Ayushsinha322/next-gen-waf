@@ -86,3 +86,13 @@ for sym in $(grep -oE '\-X [^ ]*internal/version\.[A-Za-z_][A-Za-z0-9_]*=' deplo
 done
 
 [ $fail -eq 0 ] && echo "version consistency OK" || { echo "version consistency FAILED"; exit 1; }
+
+# sentinelctl must not carry its own version literal. It did ("0.1.0" against a
+# 1.1.0 product) and nothing here looked, because this file checked the four
+# declared sources and the CLI was a fifth. It now derives from version.Product;
+# any literal semver assigned to `version` in that file is a regression.
+if grep -nE '^const version = "[0-9]+\.[0-9]+\.[0-9]+"' control-plane/cmd/sentinelctl/main.go; then
+  echo "✗ sentinelctl declares its own version literal — derive it from internal/version.Product"
+  exit 1
+fi
+echo "sentinelctl derives its version from version.Product"
