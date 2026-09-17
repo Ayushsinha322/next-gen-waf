@@ -1,4 +1,4 @@
-# Sentinel WAF — Backup & Restore Runbook
+# Swaraj Kavach — Backup & Restore Runbook
 
 **Problem this solves:** before this, a disk/host loss = **total data loss**. The
 control plane's state (sites, rules, users, API keys, certs, audit log) lives in

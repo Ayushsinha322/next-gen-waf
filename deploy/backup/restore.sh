@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Sentinel WAF — restore PostgreSQL + ClickHouse from a backup produced by
+# Swaraj Kavach — restore PostgreSQL + ClickHouse from a backup produced by
 # backup.sh. DESTRUCTIVE: it overwrites the current databases.
 #
 # Usage:

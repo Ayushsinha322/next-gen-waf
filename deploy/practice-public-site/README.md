@@ -233,7 +233,7 @@ Send this as written. The distinction in the first line is the one that matters.
 > so a browser cannot warn a user that they have reached the wrong one. Neither
 > port may be reachable from the internet. A 1:1 NAT would publish both.
 >
-> Purpose: a controlled internet-exposure test of the Next-Gen ESDSWAF with a
+> Purpose: a controlled internet-exposure test of Swaraj Kavach with a
 > benign origin application. Requested duration: <n> weeks. The WAF terminates
 > TLS on 443 and needs 80 reachable for Let's Encrypt HTTP-01 domain validation.
 >

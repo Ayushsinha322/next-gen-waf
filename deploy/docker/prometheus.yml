@@ -1,4 +1,4 @@
-# Prometheus scrape config for the Sentinel WAF stack.
+# Prometheus scrape config for the Swaraj Kavach stack.
 # Scrapes the control plane's /metrics endpoint (real aggregated WAF metrics
 # from the data-plane NDJSON stream). If SENTINEL_METRICS_TOKEN is set on the
 # control plane, uncomment the authorization block and set the same value.

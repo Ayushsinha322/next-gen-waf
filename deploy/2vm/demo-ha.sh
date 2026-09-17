@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Next-Gen ESDS WAF — 2-VM high-availability demonstration
+#  Swaraj Kavach — 2-VM high-availability demonstration
 #
 #  Runs the whole story in about eight minutes, paused between acts so you can
 #  talk. Run it from your laptop (needs SSH access to both VMs) or from either VM.
@@ -56,7 +56,7 @@ holder() { for ip in "$ACTIVE" "$PASSIVE"; do
            done; }
 name_of(){ [[ "$1" == "$ACTIVE" ]] && echo "VM1 / waf-active" || echo "VM2 / waf-passive"; }
 
-printf '\n%s%s  Next-Gen ESDS WAF — high availability on two VMs%s\n' "$B" "$CYN" "$R"
+printf '\n%s%s  Swaraj Kavach — high availability on two VMs%s\n' "$B" "$CYN" "$R"
 note "clients use ONE address: $VIP     nodes: $ACTIVE (master) · $PASSIVE (standby)"
 
 # ── ACT 1 ────────────────────────────────────────────────────────────────────

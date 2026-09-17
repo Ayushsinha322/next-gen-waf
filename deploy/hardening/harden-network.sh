@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Apply kernel + firewall DDoS hardening to a Sentinel WAF host.
+# Apply kernel + firewall DDoS hardening to a Swaraj Kavach host.
 #
 #   sudo deploy/hardening/harden-network.sh            # apply
 #   sudo deploy/hardening/harden-network.sh --dry-run  # show what would change

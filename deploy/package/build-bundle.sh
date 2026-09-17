@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Next-Gen ESDSWAF — release bundle builder  (INTERNAL — release engineer only)
+# Swaraj Kavach — release bundle builder  (INTERNAL — release engineer only)
 #
 # Produces the single archive a customer receives:
 #
@@ -309,7 +309,7 @@ fi
 step "Step 4 of 6 — manifest"
 {
   printf '{\n'
-  printf '  "product": "Next-Gen ESDSWAF",\n'
+  printf '  "product": "Swaraj Kavach",\n'
   printf '  "version": "%s",\n' "$VERSION"
   printf '  "built_utc": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   printf '  "built_from_commit": "%s",\n' "$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"

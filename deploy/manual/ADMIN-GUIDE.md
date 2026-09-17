@@ -1,4 +1,4 @@
-# Next-Gen ESDSWAF — Administrator Guide
+# Swaraj Kavach — Administrator Guide
 
 **Who this is for:** whoever runs the WAF day to day — SOC, NOC, or the platform
 team. It assumes the WAF is installed ([INSTALL-WALKTHROUGH.md](../vm-deploy/INSTALL-WALKTHROUGH.md)) and covers

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Next-Gen ESDSWAF — in-place upgrade
+#  Swaraj Kavach — in-place upgrade
 #
 #      sudo ./upgrade.sh                # upgrade to this package's version
 #      sudo ./upgrade.sh --dry-run      # run every check, change nothing
@@ -79,7 +79,7 @@ SERVICES=(dataplane controlplane dashboard migrate)
 IMG_PREFIX="$(sed -n 's/^SENTINEL_IMAGE_PREFIX=//p' "$ENV_FILE" 2>/dev/null | head -1)"
 IMG_PREFIX="${IMG_PREFIX:-sentinel}"
 
-printf '\n  %sNext-Gen ESDSWAF — upgrade%s\n' "$B" "$R"
+printf '\n  %sSwaraj Kavach — upgrade%s\n' "$B" "$R"
 log "upgrade started"
 
 # ── 1. what is installed, what are we installing ─────────────────────────────

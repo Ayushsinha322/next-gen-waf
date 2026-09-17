@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Sentinel WAF — 2-VM active/passive installer
+#  Swaraj Kavach — 2-VM active/passive installer
 #
 #  Run it on VM 1, answer "master". Run it on VM 2, answer "slave". A virtual IP
 #  follows whichever node can actually serve traffic, and moves back when the
@@ -201,7 +201,7 @@ ask() { # ask VAR "prompt" "default"
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
-step "Sentinel WAF — 2-VM active/passive"
+step "Swaraj Kavach — 2-VM active/passive"
 
 if [[ "$MODE" == "check" ]]; then
   # --check used to print its findings and exit 0 unconditionally: a node with

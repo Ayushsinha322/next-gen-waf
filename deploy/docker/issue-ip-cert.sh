@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sentinel WAF — internal CA + bare-IP server cert issuer.
+# Swaraj Kavach — internal CA + bare-IP server cert issuer.
 #
 # Stands up a private Root CA (once) and issues a TLS server cert for the WAF's
 # bare IP, then stages it into the data-plane cert repository under the "default"
@@ -55,7 +55,7 @@ if [[ ! -f root.key || ! -f root.crt ]]; then
   echo "[*] Generating Sentinel Internal Root CA (ECDSA P-256, ${CA_DAYS}d)..."
   openssl ecparam -name prime256v1 -genkey -noout -out root.key
   openssl req -x509 -new -nodes -key root.key -sha256 -days "$CA_DAYS" \
-    -subj "/C=${COUNTRY}/O=${ORG}/OU=${OU}/CN=Sentinel WAF Internal Root CA" \
+    -subj "/C=${COUNTRY}/O=${ORG}/OU=${OU}/CN=Swaraj Kavach Internal Root CA" \
     -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
     -addext "keyUsage=critical,keyCertSign,cRLSign" \
     -addext "subjectKeyIdentifier=hash" \

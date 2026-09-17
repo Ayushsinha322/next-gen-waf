@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Sentinel WAF — full backup: PostgreSQL (control-plane state) + ClickHouse
+# Swaraj Kavach — full backup: PostgreSQL (control-plane state) + ClickHouse
 # (traffic/event log store) → timestamped local dir → offsite.
 #
 #   PostgreSQL : pg_dump custom format (-Fc, compressed, restorable with pg_restore)

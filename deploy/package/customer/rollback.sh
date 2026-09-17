@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Next-Gen ESDSWAF — rollback to the previous version
+#  Swaraj Kavach — rollback to the previous version
 #
 #      sudo ./rollback.sh                 # back to the recorded previous version
 #      sudo ./rollback.sh --to 1.0.0      # back to a specific version
@@ -102,7 +102,7 @@ if [[ "$DO_LIST" == "yes" ]]; then
   exit 0
 fi
 
-printf '\n  %sNext-Gen ESDSWAF — rollback%s\n' "$B" "$R"
+printf '\n  %sSwaraj Kavach — rollback%s\n' "$B" "$R"
 
 step "Step 1 of 5 — target"
 if [[ -z "$TARGET" ]]; then

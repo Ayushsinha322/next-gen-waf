@@ -1,6 +1,6 @@
-# Sentinel WAF — nightly backup schedule.
+# Swaraj Kavach — nightly backup schedule.
 [Unit]
-Description=Nightly Sentinel WAF backup
+Description=Nightly Swaraj Kavach backup
 
 [Timer]
 # 02:30 local time every day, with jitter so a fleet doesn't stampede offsite.

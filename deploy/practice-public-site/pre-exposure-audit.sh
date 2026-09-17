@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Next-Gen ESDSWAF — PRE-EXPOSURE AUDIT
+# Swaraj Kavach — PRE-EXPOSURE AUDIT
 #
 # Run this on the WAF host BEFORE a public address is forwarded to it, and read
 # every line of the output. It answers one question:

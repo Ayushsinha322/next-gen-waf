@@ -1,4 +1,4 @@
-# Sentinel WAF — data-plane config for the Docker/compose deployment.
+# Swaraj Kavach — data-plane config for the Docker/compose deployment.
 #
 # Sites are intentionally EMPTY here: the control plane is authoritative and
 # hot-syncs the live site list to this proxy every few seconds via

@@ -1,5 +1,5 @@
 # =====================================================
-# Sentinel WAF — multi-stage production Dockerfile
+# Swaraj Kavach — multi-stage production Dockerfile
 #
 # Build targets:
 #   sentinel-dataplane     — Rust proxy (distroless cc, glibc)
@@ -93,7 +93,7 @@ FROM gcr.io/distroless/cc-debian12 AS sentinel-dataplane
 ARG GIT_SHA
 ARG BUILD_DATE
 ARG VERSION
-LABEL org.opencontainers.image.title="Next-Gen ESDSWAF data plane" \
+LABEL org.opencontainers.image.title="Swaraj Kavach data plane" \
       org.opencontainers.image.revision="$GIT_SHA" \
       org.opencontainers.image.created="$BUILD_DATE" \
       org.opencontainers.image.version="$VERSION" \
@@ -134,7 +134,7 @@ FROM gcr.io/distroless/cc-debian12 AS sentinel-controlplane
 ARG GIT_SHA
 ARG BUILD_DATE
 ARG VERSION
-LABEL org.opencontainers.image.title="Next-Gen ESDSWAF control plane" \
+LABEL org.opencontainers.image.title="Swaraj Kavach control plane" \
       org.opencontainers.image.revision="$GIT_SHA" \
       org.opencontainers.image.created="$BUILD_DATE" \
       org.opencontainers.image.version="$VERSION" \
@@ -166,7 +166,7 @@ FROM alpine:3.20 AS sentinel-migrate
 ARG GIT_SHA
 ARG BUILD_DATE
 ARG VERSION
-LABEL org.opencontainers.image.title="Next-Gen ESDSWAF migrations" \
+LABEL org.opencontainers.image.title="Swaraj Kavach migrations" \
       org.opencontainers.image.revision="$GIT_SHA" \
       org.opencontainers.image.created="$BUILD_DATE" \
       org.opencontainers.image.version="$VERSION" \

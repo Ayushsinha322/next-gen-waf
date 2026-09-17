@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Next-Gen ESDSWAF — internal fleet release tool  (INTERNAL — release engineer only)
+# Swaraj Kavach — internal fleet release tool  (INTERNAL — release engineer only)
 #
 #   ./deploy/fleet/fleet.sh status              # what is each node actually running?
 #   ./deploy/fleet/fleet.sh release             # build -> ship+sync -> roll -> verify

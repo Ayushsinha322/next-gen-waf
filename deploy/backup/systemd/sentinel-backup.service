@@ -1,11 +1,11 @@
-# Sentinel WAF — backup oneshot (invoked by sentinel-backup.timer).
+# Swaraj Kavach — backup oneshot (invoked by sentinel-backup.timer).
 # Install:
 #   sudo cp deploy/backup/systemd/sentinel-backup.* /etc/systemd/system/
 #   sudo mkdir -p /etc/sentinel && sudo cp deploy/backup/systemd/backup.env.example /etc/sentinel/backup.env
 #   sudo $EDITOR /etc/sentinel/backup.env      # set repo path + ONE offsite target
 #   sudo systemctl daemon-reload && sudo systemctl enable --now sentinel-backup.timer
 [Unit]
-Description=Sentinel WAF backup (PostgreSQL + ClickHouse -> offsite)
+Description=Swaraj Kavach backup (PostgreSQL + ClickHouse -> offsite)
 After=docker.service
 Requires=docker.service
 

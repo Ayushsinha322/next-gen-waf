@@ -1,4 +1,4 @@
-# Next-Gen ESDS WAF — 2-VM active/passive deployment
+# Swaraj Kavach — 2-VM active/passive deployment
 
 > **The canonical install procedure is [`../ACTIVE-PASSIVE.md`](../ACTIVE-PASSIVE.md).**
 > This document remains as background on the design. An audit found four places

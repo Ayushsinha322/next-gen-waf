@@ -34,7 +34,7 @@ FROM node:20-alpine AS runner
 ARG GIT_SHA=unknown
 ARG BUILD_DATE=unknown
 ARG VERSION=0.0.0
-LABEL org.opencontainers.image.title="Next-Gen ESDSWAF dashboard" \
+LABEL org.opencontainers.image.title="Swaraj Kavach dashboard" \
       org.opencontainers.image.revision="$GIT_SHA" \
       org.opencontainers.image.created="$BUILD_DATE" \
       org.opencontainers.image.version="$VERSION" \

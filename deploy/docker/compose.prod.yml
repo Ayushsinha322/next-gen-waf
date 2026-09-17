@@ -1,5 +1,5 @@
 # =====================================================================
-# Sentinel WAF — lean production / MVP-demo Docker Compose.
+# Swaraj Kavach — lean production / MVP-demo Docker Compose.
 #
 #   postgres + redis  → control-plane backing stores (redis = Valkey, BSD-3)
 #   clickhouse        → on-prem traffic/event log store (powers Threat Search)
@@ -288,7 +288,7 @@ services:
       SENTINEL_SMTP_USERNAME: ${SENTINEL_SMTP_USERNAME:-}
       SENTINEL_SMTP_PASSWORD: ${SENTINEL_SMTP_PASSWORD:-}
       SENTINEL_SMTP_FROM: ${SENTINEL_SMTP_FROM:-}
-      SENTINEL_SMTP_FROM_NAME: ${SENTINEL_SMTP_FROM_NAME:-Next-Gen ESDSWAF}
+      SENTINEL_SMTP_FROM_NAME: ${SENTINEL_SMTP_FROM_NAME:-Swaraj Kavach}
       # starttls (default) | tls (implicit, usually :465) | none (unauthenticated
       # local relay only — the mailer refuses to send credentials in the clear).
       SENTINEL_SMTP_SECURITY: ${SENTINEL_SMTP_SECURITY:-starttls}

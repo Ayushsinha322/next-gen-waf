@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Next-Gen ESDSWAF — download helper
+#  Swaraj Kavach — download helper
 #
 #  Fetches the installation bundle from the ESDS GitLab Package Registry,
 #  reassembles it if it was split, verifies its checksum, and extracts it.
@@ -63,7 +63,7 @@ fetch() { # fetch REMOTE_NAME
     --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -o "$1" "${BASE}/$1"
 }
 
-step "Next-Gen ESDSWAF v${VERSION} — ${VARIANT} bundle"
+step "Swaraj Kavach v${VERSION} — ${VARIANT} bundle"
 
 # The checksum is fetched first and always: it is the only way to tell a truncated
 # multi-hundred-MB download from a good one, and a truncated archive fails later

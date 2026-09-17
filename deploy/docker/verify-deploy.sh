@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Post-deploy verification for the Next-Gen ESDSWAF VM upgrade.
+# Post-deploy verification for the Swaraj Kavach VM upgrade.
 #
 # Every check prints PASS/FAIL/WARN with the evidence it used, so a green run is a
 # set of measurements rather than an assertion. Exit non-zero if any FAIL.

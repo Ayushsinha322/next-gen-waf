@@ -1,5 +1,5 @@
 # =============================================================================
-# Sentinel WAF — Kubernetes backup CronJobs (namespace: sentinel)
+# Swaraj Kavach — Kubernetes backup CronJobs (namespace: sentinel)
 #
 #   pg-backup      02:30  pg_dump (custom format)        -> PVC /backup/postgres/
 #   ch-backup      02:45  per-table schema + Native data -> PVC /backup/clickhouse/

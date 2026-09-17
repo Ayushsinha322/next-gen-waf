@@ -1,4 +1,4 @@
-# Next-Gen ESDSWAF — User Manual
+# Swaraj Kavach — User Manual
 
 **Version 1.0.2** · ESDS Software Solution Ltd
 
@@ -209,7 +209,7 @@ This runs **every check the installer makes** and changes nothing. Real output:
 
 ```
 ==> Step 1 of 10 — package
-  ✓ package: Next-Gen ESDSWAF v1.0.2
+  ✓ package: Swaraj Kavach v1.0.2
   ✓ images come from hub.enlight.dev/swaraj-kavach (nothing to load)
   ✓ package integrity verified (55 files)
 
@@ -272,7 +272,7 @@ It ends with:
 
   Installation successful
 
-    Version        Next-Gen ESDSWAF v1.0.2
+    Version        Swaraj Kavach v1.0.2
     Username       admin@sentinel.local
     Password       c7b1206837eea6deb3d530afe57b8057…
 ```
@@ -722,4 +722,4 @@ injection, XSS and traversal.
 
 ---
 
-*Next-Gen ESDSWAF 1.0.2 — ESDS Software Solution Ltd*
+*Swaraj Kavach 1.0.2 — ESDS Software Solution Ltd*

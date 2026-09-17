@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Next-Gen ESDSWAF — guided first site
+#  Swaraj Kavach — guided first site
 #
 #      sudo ./first-site.sh
 #
@@ -66,7 +66,7 @@ ask()  { # ask VAR PROMPT [DEFAULT]
 }
 
 printf '\n  %s%s================================================%s\n' "$B" "$CYN" "$R"
-printf '  %s%s   Next-Gen ESDSWAF — your first protected site%s\n' "$B" "$CYN" "$R"
+printf '  %s%s   Swaraj Kavach — your first protected site%s\n' "$B" "$CYN" "$R"
 printf '  %s%s================================================%s\n' "$B" "$CYN" "$R"
 
 # ── 0. Prerequisites ────────────────────────────────────────────────────────

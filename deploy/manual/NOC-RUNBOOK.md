@@ -1,4 +1,4 @@
-# Next-Gen ESDSWAF — NOC Runbook
+# Swaraj Kavach — NOC Runbook
 
 **Audience:** an ESDS NOC engineer, competent with Linux, who has never seen this
 product. No prior knowledge is assumed and nothing is left as an exercise.
@@ -168,7 +168,7 @@ Ten steps, roughly six minutes. It ends with:
 ```
   Installation successful
 
-    Version        Next-Gen ESDSWAF v1.0.2
+    Version        Swaraj Kavach v1.0.2
     Username       admin@sentinel.local
     Password       6c1a48cb969314feb230ce64072348d3afba849a67c59f0534ac480437a7786b
 ```

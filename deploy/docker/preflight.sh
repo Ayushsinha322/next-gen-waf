@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Deploy preflight for the Next-Gen ESDS WAF control-plane cluster.
+# Deploy preflight for the Swaraj Kavach control-plane cluster.
 #
 # Catches the failure mode that crash-looped the cluster once: an image rebuilt
 # to newer code whose boot-fatal env the .env / compose didn't supply. Run this

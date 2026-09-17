@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Next-Gen ESDSWAF — onboard the public practice site (Ghost) behind the WAF.
+# Swaraj Kavach — onboard the public practice site (Ghost) behind the WAF.
 #
 # Creates ONE site: a public hostname, upstream ghost:2368, in LEARNING mode.
 # It is deploy/SITE-ONBOARDING-CHECKLIST.md §1–§3 executed rather than read, with

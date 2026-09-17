@@ -1,4 +1,4 @@
-# How the Next-Gen ESDS WAF control-plane cluster works
+# How the Swaraj Kavach control-plane cluster works
 
 A plain-language guide to the 3-node control-plane on the deployment VM: the
 mental model, how to check health, how to deploy/rebuild without breaking it,

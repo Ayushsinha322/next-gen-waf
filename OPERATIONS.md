@@ -412,7 +412,7 @@ the day-to-day operations reference.)
 
 **What's live:** the WAF serves HTTPS on `:443`. For bare-IP access
 (`https://172.16.21.71/` over the VPN) it presents a **real certificate signed by
-our own private CA** — *"Sentinel WAF Internal Root CA"* — not a throwaway
+our own private CA** — *"Swaraj Kavach Internal Root CA"* (nodes installed before 2026-09-17 carry the previous name, "Sentinel WAF Internal Root CA" — a certificate on disk is data, it does not rename itself) — not a throwaway
 self-signed one. The cert has the VM's IP in its SAN, so it's a valid,
 chain-verifiable cert.
 

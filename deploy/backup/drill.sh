@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Sentinel WAF — backup/restore DRILL.
+# Swaraj Kavach — backup/restore DRILL.
 #
 # Proves backup.sh + restore.sh actually work, end to end, against throwaway
 # postgres + clickhouse containers (same image versions as compose.prod.yml):

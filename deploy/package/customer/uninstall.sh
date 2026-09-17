@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Next-Gen ESDSWAF — uninstaller
+#  Swaraj Kavach — uninstaller
 #
 #      sudo ./uninstall.sh              # remove containers, KEEP all data
 #      sudo ./uninstall.sh --purge      # also destroy data volumes (IRREVERSIBLE)
@@ -26,7 +26,7 @@ VOLUMES=(sentinel_pgdata sentinel_chdata sentinel_sentinel-logs
          sentinel_sentinel-certs sentinel_sentinel-state
          sentinel_promdata)
 
-printf '\n  %sNext-Gen ESDSWAF — uninstall%s\n\n' "$B" "$R"
+printf '\n  %sSwaraj Kavach — uninstall%s\n\n' "$B" "$R"
 
 if [[ "$PURGE" == "yes" ]]; then
   printf '  %s%sTHIS WILL PERMANENTLY DESTROY:%s\n' "$B" "$RED" "$R"

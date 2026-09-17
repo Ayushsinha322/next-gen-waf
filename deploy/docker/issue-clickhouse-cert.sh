@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sentinel WAF — ClickHouse TLS server certificate issuer.
+# Swaraj Kavach — ClickHouse TLS server certificate issuer.
 #
 # WHY: in the 2-VM active/passive topology ClickHouse runs on the ACTIVE node
 # only (two nodes cannot form a Keeper quorum), so the PASSIVE node's data plane
@@ -63,7 +63,7 @@ if [[ ! -f root.key || ! -f root.crt ]]; then
   echo "[*] Creating internal Root CA"
   openssl ecparam -name prime256v1 -genkey -noout -out root.key
   openssl req -x509 -new -nodes -key root.key -sha256 -days "$CA_DAYS" \
-    -subj "/C=$COUNTRY/O=$ORG/OU=$OU/CN=Sentinel WAF Internal Root CA" \
+    -subj "/C=$COUNTRY/O=$ORG/OU=$OU/CN=Swaraj Kavach Internal Root CA" \
     -out root.crt
 else
   echo "[*] Reusing existing Root CA (root.crt present)"

@@ -1,4 +1,4 @@
-# Next-Gen ESDSWAF — 2-VM Active/Passive Installation
+# Swaraj Kavach — 2-VM Active/Passive Installation
 
 Two VMs and one virtual IP. Clients use the VIP; it follows whichever node can
 actually serve traffic, and moves back when the preferred node recovers.

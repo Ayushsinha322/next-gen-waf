@@ -1,4 +1,4 @@
-# Installing Next-Gen ESDSWAF — complete walkthrough
+# Installing Swaraj Kavach — complete walkthrough
 
 A step-by-step guide from an empty virtual machine to a working WAF that blocks a
 real attack. Every command can be copied and pasted.
@@ -338,7 +338,7 @@ This checks everything and **changes nothing**. Real output from the reference V
 
 ```
 ==> Step 1 of 10 — package
-  ✓ package: Next-Gen ESDSWAF v1.0.2
+  ✓ package: Swaraj Kavach v1.0.2
   verifying every shipped file against SHA256SUMS…
   ✓ package integrity verified (54 files)
 
@@ -405,7 +405,7 @@ Ten steps, and it ends like this:
 
   Installation successful
 
-    Version        Next-Gen ESDSWAF v1.0.2
+    Version        Swaraj Kavach v1.0.2
     Username       admin@sentinel.local
     Password       6c1a48cb969314feb230ce64072348d3afba849a67c59f0534ac480437a7786b
 ```

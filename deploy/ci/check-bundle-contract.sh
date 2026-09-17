@@ -196,6 +196,26 @@ done
   && pass "docs/vm-deploy/INSTALL-WALKTHROUGH.md" \
   || fail "docs/vm-deploy/INSTALL-WALKTHROUGH.md missing"
 
+# ── 6b. branding — the package names the product, not its predecessors ───────
+# The product is Swaraj Kavach. "Next-Gen ESDSWAF" was its previous name and
+# "Sentinel" is the source codename; neither belongs in anything a customer reads.
+# On 2026-09-17 the installer was clean while NINETEEN other files in the staged
+# tree still carried the old name — the manifest, both compose files, every
+# manual page and the banners of five operator scripts — because the branding
+# gate scanned the console, Go and Rust, and never the package. Archive and
+# directory names keep ESDSWAF-v<version> (that is the bundle contract, and it
+# is a filename, not a product name), and lowercase `sentinel` in paths, service
+# and container names is an identifier, not a display string.
+sect "No previous product name or codename in customer-facing files"
+BRAND_HITS="$(grep -rIl -E 'Next-Gen ESDSWAF|Next-Gen ESDS WAF|Sentinel WAF' "$STAGE" \
+  --exclude-dir=licenses --exclude=THIRD-PARTY-NOTICES.md 2>/dev/null | sed "s#^$STAGE/##" | sort)"
+if [[ -z "$BRAND_HITS" ]]; then
+  pass "no 'Next-Gen ESDSWAF' / 'Sentinel WAF' anywhere in the staged tree"
+else
+  fail "previous product name or codename in shipped files:"
+  printf '%s\n' "$BRAND_HITS" | sed 's/^/        /'
+fi
+
 # ── 7. manifest is parseable by install.sh's own sed parser ──────────────────
 # install.sh deliberately does not use python3; if the manifest shape drifts the
 # installer reads an empty version and dies five steps later on a missing image.

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Next-Gen ESDSWAF — post-installation verification
+#  Swaraj Kavach — post-installation verification
 #
 #      sudo ./verify.sh
 #
@@ -28,7 +28,7 @@ soft() { printf '  %sWARN%s  %s\n' "$YEL" "$R" "$*"; WARN=$((WARN+1)); }
 # shellcheck disable=SC1090
 VERSION=$(grep -oP '^SENTINEL_VERSION=\K.*' "$ENV_FILE" 2>/dev/null || echo unknown)
 
-printf '\n  %sNext-Gen ESDSWAF — verification%s   version %s\n' "$B" "$R" "$VERSION"
+printf '\n  %sSwaraj Kavach — verification%s   version %s\n' "$B" "$R" "$VERSION"
 
 step "Containers"
 for c in postgres redis clickhouse controlplane dataplane dashboard; do

@@ -1,4 +1,4 @@
-# Next-Gen ESDSWAF — Standalone Installation
+# Swaraj Kavach — Standalone Installation
 
 One VM. The whole product — data plane, control plane, console, database, event
 store — on a single host.

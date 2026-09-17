@@ -1,4 +1,4 @@
-# Next-Gen ESDSWAF — Putting a website behind the WAF
+# Swaraj Kavach — Putting a website behind the WAF
 
 **Who this is for:** SOC / NOC / operations. You do not need developer access.
 Everything here is done in the console, plus two commands to test with.
