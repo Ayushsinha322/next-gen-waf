@@ -207,6 +207,13 @@ for s in preflight.sh promote-standby.sh \
   cp "deploy/docker/$s" "$STAGE/scripts/" 2>/dev/null || warn "missing script: $s"
 done
 cp -r deploy/backup "$STAGE/scripts/backup" 2>/dev/null || warn "no backup scripts"
+# install.sh Step 9 applies the kernel network profile from here (sysctl only —
+# see the NOTRACK note in the installer); the script itself ships so an operator
+# can re-apply or read the reasoning. Both must land or the installer's
+# "hardening profile not in this package" warning fires on every install.
+mkdir -p "$STAGE/scripts/hardening"
+cp deploy/hardening/99-sentinel-ddos.conf deploy/hardening/harden-network.sh \
+   "$STAGE/scripts/hardening/" 2>/dev/null || warn "hardening assets incomplete (install.sh Step 9 will skip the kernel profile)"
 # install.sh's closing message tells the operator to run this before enabling
 # blocking mode, so it has to be IN the bundle. It lives under deploy/load-test/
 # rather than deploy/docker/, so the fixed list above never picked it up and the

@@ -1,7 +1,10 @@
-# Next-Gen ESDSWAF — Installation Package
+# Swaraj Kavach — Installation Package
 
-**Product:** Next-Gen ESDSWAF
+**Product:** Swaraj Kavach
 **Vendor:** ESDS Software Solution Ltd — SIG-CyberSec
+
+The archive and the directory it extracts to keep the `ESDSWAF-v<version>` name;
+every command below is unchanged by the product name.
 
 ## New to this product? One document, start to finish
 
@@ -53,9 +56,34 @@ cd ESDSWAF-v<version>
 sudo ./install.sh
 ```
 
-The installer asks for two things — the hostname clients will use and an
-administrator email. **Every password and key is generated for you** with
+The installer asks for three things — the hostname clients will use, an
+administrator email, and whether your users arrive through a shared NAT or VPN
+address (blank if not). **Every password and key is generated for you** with
 `openssl rand`; you are never asked to invent a secret.
+
+It sizes itself to the host: the event store's memory limit, the request-log
+ceiling and the event spool are derived from the detected RAM and disk and
+written into `.env` with the numbers they came from, and a one-page
+`/opt/sentinel/install-report.txt` records the host, the sizing and every check
+verdict for support.
+
+Flags for an unattended or hardened install:
+
+| Flag | Effect |
+|---|---|
+| `--console-bind <ip>` | Publish the console (9443) on a **private** address of this host instead of `127.0.0.1`. Public and wildcard addresses are refused — there is no override. |
+| `--shared-egress <cidrs>` | Corporate NAT / VPN addresses shared by many users; their block *history* is forgiven so one person's scan cannot get the whole office blocked. Detection is unchanged. |
+| `--non-interactive` | Take answers from `WAF_HOSTNAME`, `ADMIN_EMAIL`, `SHARED_EGRESS`, `CONSOLE_BIND`. |
+| `--dry-run` | Run every check, change nothing. |
+| `--no-harden` | Skip the kernel network profile (`/etc/sysctl.d/99-sentinel-ddos.conf`). |
+| `--no-docker-tuning` | Do not enable Docker at boot or set `live-restore`. |
+| `--force` | Continue over a previous incomplete attempt (keeps `.env` and certificates as they are). |
+| `--allow-undersized` | Evaluation only: proceed below the minimum specification. |
+
+```bash
+# A production node published through a NAT, console on the management address:
+sudo ./install.sh --console-bind 172.16.21.150 --shared-egress 203.0.113.7
+```
 
 Every requirement is checked *before* anything is changed, so a host that does not
 qualify is rejected rather than half-installed. If a later step fails, the abort
@@ -72,20 +100,30 @@ sudo ./install.sh --dry-run
 
 ## Requirements
 
-| | Minimum |
-|---|---|
-| OS | Ubuntu 22.04 LTS or 24.04 LTS |
-| CPU | 4 vCPU (8 recommended) |
-| RAM | **16 GB** |
-| Disk | 100 GB free on `/opt` (200 GB recommended) |
-| Software | Docker Engine 27+ with the Compose v2 plugin |
-| Ports | 80, 443, 9443 free |
-| Network | Access to Docker Hub — **see below** |
+| | Minimum (enforced) | Production (recommended) |
+|---|---|---|
+| OS | Ubuntu 22.04 LTS or 24.04 LTS | same |
+| CPU | 4 vCPU | **16 vCPU** |
+| RAM | **16 GB** | **32 GB** |
+| Disk | 100 GB free on `/opt` and on Docker's data-root | **200 GB SSD/NVMe** |
+| Software | Docker Engine 27+ with the Compose v2 plugin | same |
+| Ports | 80, 443, 9443 free | same |
+| Network | Access to Docker Hub — **see below** | same |
 
-**RAM is the hard requirement.** ClickHouse is memory-limited to 6 GB and
-crash-loops indefinitely with less than about 2 GB available to it. The installer
-refuses to proceed below 15 GB detected rather than leaving you with a stack that
-restarts forever.
+The installer reports which tier the host falls in (`minimum`, `recommended`,
+`production`) and sizes the deployment to it: on a 32 GB node the event store
+gets 9 GB instead of 6, and a 200 GB disk keeps ~4 GB of request history instead
+of 1.2 GB. Spinning disks are detected and warned about — the event store falls
+behind on them under load.
+
+**RAM is the hard requirement.** ClickHouse crash-loops indefinitely with less
+than about 2 GB available to it. The installer refuses to proceed below 15 GB
+detected rather than leaving you with a stack that restarts forever.
+
+**Disk is measured where the data lives.** Images and every volume — the
+configuration database, the event store, the request logs — are under Docker's
+data-root (`/var/lib/docker` by default), not `/opt`. If that is a separate
+filesystem it is checked separately.
 
 **RHEL, Rocky and Alma are not supported yet.** SELinux blocks the certificate
 bind mounts this deployment needs, so it would fail *after* installing rather

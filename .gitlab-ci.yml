@@ -268,6 +268,12 @@ deploy-shell:
     #     never tested before. Fixtures arrive via STATS_CMD; no python and no
     #     throwaway server, so it runs in this alpine image.
     - ./deploy/ci/check-rolling-update-guards.sh
+    # 3c. The installer sizes the deployment to the host and refuses unsafe
+    #     console binds. Those are pure functions between marker comments, so
+    #     this lifts them out and asserts the numbers for a 16, 32 and 64 GB host
+    #     — and that every key the sizing writes is one compose actually reads,
+    #     because a .env key nothing consumes is the silently-inert class.
+    - ./deploy/ci/check-installer-sizing.sh
     # 4. The contract check — the one that catches shipping-breaking bugs.
     - STAGE_ONLY=1 ./deploy/package/build-bundle.sh
     - ./deploy/ci/check-bundle-contract.sh

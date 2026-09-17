@@ -146,8 +146,11 @@ rm -f "$RESOLVER"
 # ── 4. scripts the installers tell operators to run ──────────────────────────
 # Regression: fpr-report.sh referenced by install.sh but never staged.
 sect "Scripts referenced by the installer are shipped"
+# hardening/* : install.sh Step 9 reads the sysctl profile from scripts/hardening/
+# and warns "not in this package" when it is absent — on every install, for ever.
 for s in fpr-report.sh backup/backup.sh backup/drill.sh issue-ip-cert.sh \
-         issue-postgres-cert.sh issue-clickhouse-cert.sh promote-standby.sh preflight.sh; do
+         issue-postgres-cert.sh issue-clickhouse-cert.sh promote-standby.sh preflight.sh \
+         hardening/99-sentinel-ddos.conf hardening/harden-network.sh; do
   [[ -f "$STAGE/scripts/$s" ]] && pass "scripts/$s" || fail "scripts/$s missing (an installer or doc points at it)"
 done
 

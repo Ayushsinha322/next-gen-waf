@@ -1,23 +1,39 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Next-Gen ESDSWAF — Installer
+#  Swaraj Kavach — Installer (standalone node)
 #
 #      sudo ./install.sh
 #
 #  Asks only for information we cannot generate: the hostname clients will use,
-#  an administrator email, and which topology to deploy. Every secret — database
-#  passwords, session signing key, audit HMAC key, internal service token — is
-#  generated with `openssl rand`. You are never asked to invent a password.
+#  an administrator email, and whether users arrive through a shared NAT/VPN
+#  address. Every secret — database passwords, session signing key, audit HMAC
+#  key, internal service token — is generated with `openssl rand`. You are never
+#  asked to invent a password.
 #
 #  Aborts BEFORE changing anything if the host does not meet requirements. There
 #  is no half-installed state to clean up: every gate runs first, and the first
 #  action that alters the system is loading images, after all checks have passed.
 #
-#  Everything is logged to /var/log/sentinel/install.log — send that file to
+#  Sizes itself to the host it lands on: the event store's memory limit, the
+#  per-request log ceiling and the event spool are derived from the detected
+#  RAM and disk and written into .env with the numbers they came from.
+#
+#  Everything is logged to /var/log/sentinel/install.log, and a one-page
+#  /opt/sentinel/install-report.txt is written on success — send both to
 #  support if anything fails, rather than re-running commands by hand.
 #
-#      --non-interactive   take answers from the environment (see below)
-#      --dry-run           run every check, change nothing
+#      --non-interactive         take answers from the environment:
+#                                WAF_HOSTNAME, ADMIN_EMAIL, SHARED_EGRESS, CONSOLE_BIND
+#      --dry-run                 run every check, change nothing
+#      --force                   continue over a previous incomplete attempt
+#      --allow-undersized        evaluation only: proceed below minimum spec
+#      --console-bind <ip>       publish the console (9443) on a PRIVATE address
+#                                of this host instead of 127.0.0.1. Public and
+#                                wildcard addresses are refused.
+#      --shared-egress <cidrs>   comma-separated NAT/VPN egress addresses whose
+#                                block history must never punish bystanders
+#      --no-harden               skip the kernel network profile (sysctl)
+#      --no-docker-tuning        do not enable Docker at boot or set live-restore
 # =============================================================================
 set -uo pipefail
 
@@ -32,13 +48,26 @@ NONINTERACTIVE=no
 DRY_RUN=no
 FORCE=no
 ALLOW_UNDERSIZED=no
+HARDEN=yes
+DOCKER_TUNING=yes
+# CONSOLE_BIND / SHARED_EGRESS may also arrive from the environment (see
+# --non-interactive); a flag wins over the environment.
+CONSOLE_BIND="${CONSOLE_BIND:-}"
+SHARED_EGRESS="${SHARED_EGRESS:-}"
+need_arg() { [[ -n "${2:-}" && "${2:0:2}" != "--" ]] || { echo "$1 needs a value" >&2; exit 2; }; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --non-interactive) NONINTERACTIVE=yes ;;
     --dry-run) DRY_RUN=yes ;;
     --force) FORCE=yes ;;
     --allow-undersized) ALLOW_UNDERSIZED=yes ;;
-    -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --no-harden) HARDEN=no ;;
+    --no-docker-tuning) DOCKER_TUNING=no ;;
+    --console-bind)  need_arg "$1" "${2:-}"; CONSOLE_BIND="$2";  shift ;;
+    --shared-egress) need_arg "$1" "${2:-}"; SHARED_EGRESS="$2"; shift ;;
+    # The header block, from its second line to the closing rule. A fixed line
+    # range went stale every time the header grew and printed half a sentence.
+    -h|--help) awk 'NR>2 && /^# =+$/{exit} NR>2' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -54,6 +83,8 @@ else B=''; R=''; DIM=''; RED=''; GRN=''; YEL=''; CYN=''; fi
 # "No such file or directory" over the abort message. Gate on writability instead.
 LOG_OK=no
 if mkdir -p "$LOG_DIR" 2>/dev/null && : >>"$LOG" 2>/dev/null; then LOG_OK=yes; fi
+# The log accumulates across runs; the install report quotes only this run's lines.
+LOG_START=$(wc -l < "$LOG" 2>/dev/null || echo 0)
 log()  { [[ "$LOG_OK" == "yes" ]] || return 0
          printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$LOG" 2>/dev/null || true; }
 say()  { printf '%s\n' "$*"; log "$*"; }
@@ -102,11 +133,87 @@ MIN_RAM_GB=15          # a "16 GB" VM reports ~15.6 GiB
 MIN_DISK_GB=100
 REQUIRED_PORTS=(80 443 9443)
 
+# --- sizing-begin ------------------------------------------------------------
+# size_for_host RAM_GB VCPU DISK_GB — prints KEY=VALUE lines for the .env.
+#
+# Pure: no I/O, no globals, integer arithmetic only, so that
+# deploy/ci/check-installer-sizing.sh can lift it out by these markers and assert
+# the numbers for a 16, 32 and 64 GB host without a VM. Keep it that way.
+#
+#   CLICKHOUSE_MEM_LIMIT   ~30% of RAM, floor 6g (below which ClickHouse
+#                          crash-loops), cap 16g (past which the event store gains
+#                          nothing and the data plane — which has no cgroup limit
+#                          of its own — loses the headroom it needs under a flood).
+#   SENTINEL_LOG_MAX_MB /  the per-request NDJSON logs the console tails. On-disk
+#   SENTINEL_LOG_KEEP      ceiling = MAX_MB x (KEEP+1) x 2 streams; scaled with
+#                          the disk so a 200 GB host keeps ~4 GB of request history
+#                          instead of the 1.2 GB that fits a 100 GB one.
+#   SENTINEL_SPOOL_MAX_BYTES  events buffered on disk while ClickHouse is down.
+#   TIER                   minimum | recommended | production — printed, and
+#                          recorded in the install report, never enforced.
+size_for_host() {
+  local ram="${1:-0}" vcpu="${2:-0}" disk="${3:-0}"
+  local ch=$(( ram * 30 / 100 ))
+  (( ch < 6 ))  && ch=6
+  (( ch > 16 )) && ch=16
+  local log_mb=100 log_keep=5 spool=268435456
+  if   (( disk >= 180 )); then log_mb=250; log_keep=7; spool=1073741824
+  elif (( disk >= 120 )); then log_mb=150; log_keep=5; spool=536870912
+  fi
+  local tier=minimum
+  if   (( ram >= 30 && vcpu >= 12 && disk >= 180 )); then tier=production
+  elif (( ram >= 15 && vcpu >= 8  && disk >= 180 )); then tier=recommended
+  fi
+  printf 'TIER=%s\nCLICKHOUSE_MEM_LIMIT=%sg\nSENTINEL_LOG_MAX_MB=%s\nSENTINEL_LOG_KEEP=%s\nSENTINEL_SPOOL_MAX_BYTES=%s\n' \
+    "$tier" "$ch" "$log_mb" "$log_keep" "$spool"
+}
+# --- sizing-end --------------------------------------------------------------
+
+# --- validators-begin --------------------------------------------------------
+# console_bind_ok IP "ADDR ADDR ..." — 0 when IP is a PRIVATE IPv4 address
+# (RFC 1918 or loopback) that is configured on this host. Never 0.0.0.0, never a
+# public address, and there is deliberately no flag to allow either: the console
+# is a security appliance's admin UI, and the only thing meant to reach this host
+# from outside is a NAT that forwards 80/443. Pure; unit-tested by the CI check.
+console_bind_ok() {
+  local ip="$1" local_addrs="${2:-}"
+  [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  # 10# forces decimal: an octet such as "08" would otherwise be read as octal
+  # and abort the arithmetic instead of being judged.
+  local a=$((10#${BASH_REMATCH[1]})) b=$((10#${BASH_REMATCH[2]}))
+  local c=$((10#${BASH_REMATCH[3]})) d=$((10#${BASH_REMATCH[4]}))
+  (( a <= 255 && b <= 255 && c <= 255 && d <= 255 )) || return 1
+  [[ "$ip" == "0.0.0.0" ]] && return 1
+  if   (( a == 10 )); then :
+  elif (( a == 127 )); then :
+  elif (( a == 172 && b >= 16 && b <= 31 )); then :
+  elif (( a == 192 && b == 168 )); then :
+  else return 1
+  fi
+  [[ " $local_addrs " == *" $ip "* ]]
+}
+# cidr_list_ok "a,b/24,..." — every comma-separated item is an IPv4 address or
+# IPv4/prefix. The data plane silently drops what it cannot parse, so a typo here
+# would be a shared address that is NOT forgiven — refuse it at install instead.
+cidr_list_ok() {
+  local items item
+  # `read` drops a trailing empty field, so "a," would pass as "a". A leading,
+  # trailing or doubled comma is a list with a hole in it — refuse it whole.
+  [[ "${1:-}" =~ ^,|,,|,$ ]] && return 1
+  IFS=',' read -ra items <<<"${1:-}"
+  (( ${#items[@]} > 0 )) || return 1
+  for item in "${items[@]}"; do
+    item="${item// /}"
+    [[ "$item" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/([0-9]|[12][0-9]|3[012]))?$ ]] || return 1
+  done
+}
+# --- validators-end ----------------------------------------------------------
+
 banner() {
 cat <<'EOF'
 
   ==========================================================
-       Next-Gen ESDSWAF  —  Installer
+       Swaraj Kavach  —  Installer
        ESDS Software Solution Ltd
   ==========================================================
 EOF
@@ -115,7 +222,7 @@ banner
 say "install started $(date -u +%Y-%m-%dT%H:%M:%SZ) (log: $LOG)"
 
 # ── Step 1 — privileges and package integrity ────────────────────────────────
-step "Step 1 of 10 — package"
+step "Step 1 of 11 —package"
 [[ $EUID -eq 0 ]] || die "run with sudo — the installer writes /opt, /etc and manages Docker"
 
 # An existing installation makes every later gate misleading. Our own containers
@@ -131,7 +238,7 @@ if [[ -f "$STATE_DIR/version" || -f "$INSTALL_DIR/.env" ]]; then
   elif [[ "$DRY_RUN" == "yes" ]]; then
     warn "an installation is already present ($EXISTING) — a real run would stop here"
   else
-    die "Next-Gen ESDSWAF $EXISTING is already installed on this host.
+    die "Swaraj Kavach $EXISTING is already installed on this host.
 
     This installer will not modify an existing deployment: regenerating secrets
     against a database that already exists would lock you out of your own data.
@@ -167,7 +274,7 @@ BUNDLE_VERSION="$(manifest_str version)"
 [[ -n "$BUNDLE_VERSION" ]] \
   || die "could not read the version from bundle/manifest.json — the package is malformed.
     Re-download it; do not attempt to install this copy."
-ok "package: Next-Gen ESDSWAF v$BUNDLE_VERSION"
+ok "package: Swaraj Kavach v$BUNDLE_VERSION"
 # Where the container images come from. "registry" ships none and pulls them;
 # anything else (or an unreadable key, which is every bundle built before this
 # existed) means they are inside bundle/images.tar.gz.
@@ -202,7 +309,7 @@ else
 fi
 
 # ── Step 2 — operating system ────────────────────────────────────────────────
-step "Step 2 of 10 — operating system"
+step "Step 2 of 11 —operating system"
 [[ -r /etc/os-release ]] || die "cannot read /etc/os-release — unsupported system"
 
 # Read the three fields we need in SUBSHELLS rather than sourcing os-release into
@@ -243,7 +350,7 @@ case "${OS_ID}:${OS_VERSION_ID}" in
 esac
 
 # ── Step 3 — hardware ────────────────────────────────────────────────────────
-step "Step 3 of 10 — hardware"
+step "Step 3 of 11 —hardware"
 VCPU=$(nproc 2>/dev/null || echo 0)
 RAM_GB=$(awk '/MemTotal/{printf "%d", $2/1048576}' /proc/meminfo 2>/dev/null || echo 0)
 DISK_GB=$(df -BG --output=avail /opt 2>/dev/null | tail -1 | tr -dc '0-9' || echo 0)
@@ -295,8 +402,27 @@ if [[ $hw_fail -eq 1 ]]; then
   fi
 fi
 
+# Size the deployment to what was detected. The numbers land in .env (Step 7)
+# with the facts they were derived from, so whoever reads that file later can see
+# why the event store has the limit it has. Tier is descriptive: a host can pass
+# the minimum gate and still be told, in plain words, that it is a minimum host.
+SIZING="$(size_for_host "$RAM_GB" "$VCPU" "$DISK_GB")"
+TIER="$(sed -n 's/^TIER=//p' <<<"$SIZING")"
+CH_MEM="$(sed -n 's/^CLICKHOUSE_MEM_LIMIT=//p' <<<"$SIZING")"
+LOG_MB="$(sed -n 's/^SENTINEL_LOG_MAX_MB=//p' <<<"$SIZING")"
+LOG_KEEP="$(sed -n 's/^SENTINEL_LOG_KEEP=//p' <<<"$SIZING")"
+SPOOL_BYTES="$(sed -n 's/^SENTINEL_SPOOL_MAX_BYTES=//p' <<<"$SIZING")"
+say ""
+case "$TIER" in
+  production)  ok   "host tier: ${B}production${R} (≥12 vCPU, ≥32 GB, ≥200 GB)" ;;
+  recommended) ok   "host tier: recommended (≥8 vCPU, 16 GB, ≥200 GB)" ;;
+  *)           warn "host tier: MINIMUM — fine for an evaluation; production sizing is 16 vCPU / 32 GB / 200 GB SSD" ;;
+esac
+say "  ${DIM}sizing → event store memory ${CH_MEM}, request logs ${LOG_MB} MB × $((LOG_KEEP + 1)) × 2 streams (≈$(( LOG_MB * (LOG_KEEP + 1) * 2 / 1024 )) GB), event spool $(( SPOOL_BYTES / 1048576 )) MB${R}"
+log "SIZING tier=$TIER ch=$CH_MEM log_mb=$LOG_MB log_keep=$LOG_KEEP spool=$SPOOL_BYTES"
+
 # ── Step 4 — Docker, ports, clock, connectivity ──────────────────────────────
-step "Step 4 of 10 — prerequisites"
+step "Step 4 of 11 —prerequisites"
 command -v docker >/dev/null 2>&1 \
   || die "Docker is not installed.
 
@@ -307,6 +433,55 @@ docker compose version >/dev/null 2>&1 \
   || die "the Docker Compose v2 plugin is missing (\`docker compose version\` failed)"
 docker info >/dev/null 2>&1 || die "the Docker daemon is not running — systemctl start docker"
 ok "Docker $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo present)"
+
+# Images and EVERY volume — the configuration database, the event store, the
+# request logs — live under Docker's data-root, which is /var/lib/docker by
+# default and not /opt. Step 3 measured /opt because that is where the install
+# tree goes; on a host whose /var is a smaller separate filesystem that gate
+# passed and the event store then filled the root disk. Measure the filesystem
+# the data actually lands on, and only when it is a different one.
+DOCKER_ROOT="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)"
+DOCKER_ROOT="${DOCKER_ROOT:-/var/lib/docker}"
+DOCKER_ROOT_FS="$(df --output=source "$DOCKER_ROOT" 2>/dev/null | tail -1)"
+OPT_FS="$(df --output=source /opt 2>/dev/null | tail -1)"
+if [[ -n "$DOCKER_ROOT_FS" && "$DOCKER_ROOT_FS" != "$OPT_FS" ]]; then
+  DOCKER_DISK_GB=$(df -BG --output=avail "$DOCKER_ROOT" 2>/dev/null | tail -1 | tr -dc '0-9')
+  DOCKER_DISK_GB="${DOCKER_DISK_GB:-0}"
+  if [[ "$DOCKER_DISK_GB" -ge "$MIN_DISK_GB" ]]; then
+    ok "Docker data-root $DOCKER_ROOT: ${DOCKER_DISK_GB} GB free (separate filesystem from /opt)"
+  elif [[ "$ALLOW_UNDERSIZED" == "yes" ]]; then
+    warn "Docker data-root $DOCKER_ROOT has ${DOCKER_DISK_GB} GB free (< ${MIN_DISK_GB}) — images and ALL data volumes live there"
+  else
+    die "Docker's data-root ($DOCKER_ROOT) has ${DOCKER_DISK_GB} GB free — minimum ${MIN_DISK_GB} GB.
+
+    /opt passed the disk check, but the images, the configuration database, the
+    event store and the request logs are all stored under $DOCKER_ROOT, which is
+    on a different filesystem. Either enlarge it, or move Docker's data-root onto
+    the large disk (\"data-root\" in /etc/docker/daemon.json) and re-run."
+  fi
+else
+  ok "Docker data-root $DOCKER_ROOT is on the filesystem measured in Step 3"
+fi
+# ClickHouse and the per-request logs are write-heavy. On spinning disks the
+# event store falls behind under load and the console's Logs page lags by
+# minutes; SSD is the supported medium. Best-effort: LVM and cloud volumes
+# usually report it, some virtual disks report nothing, and nothing is a pass.
+ROOT_DEV="$(findmnt -no SOURCE --target "$DOCKER_ROOT" 2>/dev/null | head -1)"
+if [[ -n "$ROOT_DEV" && -b "$ROOT_DEV" ]]; then
+  ROTA="$(lsblk -dno ROTA "$ROOT_DEV" 2>/dev/null | tr -d '[:space:]')"
+  case "$ROTA" in
+    0) ok "storage under $DOCKER_ROOT is non-rotational (SSD/NVMe)" ;;
+    1) warn "storage under $DOCKER_ROOT reports ROTATIONAL — event ingestion and the Logs page will lag under load; SSD is the supported medium" ;;
+  esac
+fi
+# Every service is `restart: unless-stopped`, which brings the WAF back after a
+# reboot only if the Docker daemon itself starts. Reported here, fixed in Step 9.
+DOCKER_BOOT=no
+if systemctl is-enabled docker >/dev/null 2>&1; then
+  DOCKER_BOOT=yes; ok "Docker starts at boot"
+else
+  warn "Docker is NOT enabled at boot — after a reboot the WAF would stay down (fixed in Step 9)"
+fi
 
 port_busy=0
 for p in "${REQUIRED_PORTS[@]}"; do
@@ -380,14 +555,21 @@ $(manifest_list pulled_from_registry)
 
     Either allow egress to registry-1.docker.io, configure a registry mirror
     in /etc/docker/daemon.json, or ask ESDS for the fully offline bundle
-    (built with BUNDLE_THIRD_PARTY=1, which contains all nine images)."
+    (built with BUNDLE_THIRD_PARTY=1, which contains all nine images).
+
+    Behind an HTTP proxy? The Docker daemon does NOT read /etc/environment or
+    your shell's proxy variables. Give it its own:
+      mkdir -p /etc/systemd/system/docker.service.d
+      printf '[Service]\\nEnvironment=\"HTTPS_PROXY=http://proxy.example.com:3128\" \"NO_PROXY=127.0.0.1,localhost\"\\n' \\
+        > /etc/systemd/system/docker.service.d/http-proxy.conf
+      systemctl daemon-reload && systemctl restart docker"
   fi
 fi
 
 [[ "$DRY_RUN" == "yes" ]] && { say ""; ok "--dry-run: all checks passed, nothing changed"; exit 0; }
 
 # ── Step 5 — configuration questions (the only ones) ─────────────────────────
-step "Step 5 of 10 — configuration"
+step "Step 5 of 11 —configuration"
 ask() { # ask VAR PROMPT DEFAULT
   local __v="$1" __p="$2" __d="${3:-}" __a=""
   if [[ -n "${!__v:-}" ]]; then return 0; fi
@@ -410,6 +592,52 @@ ask WAF_HOSTNAME "Hostname clients will use (e.g. waf.company.com)" "${DEF_IP:-}
     Re-run with an explicit value:
       sudo WAF_HOSTNAME=waf.company.com ./install.sh --non-interactive"
 ask ADMIN_EMAIL  "Administrator email" "admin@${WAF_HOSTNAME}"
+
+# Where the management console listens. Default: loopback only, reached over an
+# SSH tunnel. On a host published through a NAT that forwards 80/443 only, the
+# enterprise-normal alternative is the PRIVATE management address — reachable
+# from the management network, unreachable through the forwarded ports. A public
+# or wildcard address is refused, and there is deliberately no flag to allow it.
+LOCAL_ADDRS="$(ip -4 -o addr show 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4}' | tr '\n' ' ')"
+if [[ -n "$CONSOLE_BIND" ]]; then
+  console_bind_ok "$CONSOLE_BIND" "$LOCAL_ADDRS" \
+    || die "--console-bind $CONSOLE_BIND refused.
+
+    It must be a PRIVATE IPv4 address (10/8, 172.16/12, 192.168/16 or 127.0.0.1)
+    that is configured on this host. Addresses found here: ${LOCAL_ADDRS:-none}
+
+    0.0.0.0 and public addresses are never accepted: the management console must
+    not be reachable from the internet. A perimeter NAT that forwards only 80/443
+    to this host is the intended boundary — keep 9443 behind it."
+  MGMT_BIND="${CONSOLE_BIND}:"
+else
+  MGMT_BIND="127.0.0.1:"
+fi
+
+# Shared egress. Per-IP reputation assumes one address is one actor. Behind a
+# corporate NAT or VPN concentrator that is false: one person's scanner gets the
+# whole office's address blocked, and every colleague's clean request with it.
+# Listing the address forgives its HISTORY only — an attack from it is still
+# judged, and blocked, on its own merits. Asked at install because the day this
+# is discovered is the day the whole office is locked out of a UAT site.
+if [[ -z "$SHARED_EGRESS" && "$NONINTERACTIVE" != "yes" ]]; then
+  say ""
+  say "  ${B}Shared egress addresses${R}"
+  say "    If your users reach this WAF through a corporate NAT or VPN, one address"
+  say "    stands for many people. Listing it stops one person's scan from getting"
+  say "    the whole office blocked. Comma-separated IPs or CIDRs; blank for none."
+  read -r -p "  Shared egress [none]: " SHARED_EGRESS || true
+fi
+SHARED_EGRESS="${SHARED_EGRESS// /}"
+if [[ -n "$SHARED_EGRESS" ]]; then
+  cidr_list_ok "$SHARED_EGRESS" \
+    || die "shared egress '$SHARED_EGRESS' is not a comma-separated list of IPv4 addresses or
+    CIDRs (for example 203.0.113.7,198.51.100.0/24). The data plane silently drops
+    entries it cannot parse, so a typo here would be an address that is NOT forgiven."
+  SHARED_EGRESS_LINE="SENTINEL_SHARED_EGRESS_CIDRS=${SHARED_EGRESS}"
+else
+  SHARED_EGRESS_LINE="# SENTINEL_SHARED_EGRESS_CIDRS=          # e.g. 203.0.113.7,198.51.100.0/24 — see configs/env.example"
+fi
 
 # This used to be a question — "1) I will supply my own certificate / 2) Self-signed"
 # — whose answer was read into TLS_CHOICE, defaulted, and then never referenced
@@ -461,9 +689,13 @@ fi
 
 ok "hostname: $WAF_HOSTNAME"
 ok "admin:    $ADMIN_EMAIL"
+if [[ -n "$CONSOLE_BIND" ]]; then ok "console:  https://${CONSOLE_BIND}:9443 (private address; restrict 9443 to the management network)"
+else ok "console:  127.0.0.1:9443 only (SSH tunnel)"; fi
+if [[ -n "$SHARED_EGRESS" ]]; then ok "shared egress: $SHARED_EGRESS (reputation history forgiven; detection unchanged)"
+else ok "shared egress: none declared"; fi
 
 # ── Step 6 — load images ─────────────────────────────────────────────────────
-step "Step 6 of 10 — obtaining images"
+step "Step 6 of 11 —obtaining images"
 # First mutation of the host. Everything above this line is a check.
 CHANGED=yes
 if [[ "$IMAGE_SOURCE" == "registry" ]]; then
@@ -489,7 +721,7 @@ else
 fi
 
 # ── Step 7 — install tree and secrets ────────────────────────────────────────
-step "Step 7 of 10 — configuration and secrets"
+step "Step 7 of 11 —configuration and secrets"
 # These four were unguarded. This script runs without `set -e` (errors are handled
 # explicitly), so a failed mkdir or cp did not stop anything: the install carried
 # on and reported success over an install tree that was empty or half-written.
@@ -508,11 +740,16 @@ gen() { openssl rand -hex 32; }
 ENV_FILE="$INSTALL_DIR/.env"
 if [[ -f "$ENV_FILE" ]]; then
   warn "$ENV_FILE exists — keeping the existing secrets (not overwriting)"
+  # The whole file is kept, so nothing decided in THIS run reaches it. Say so,
+  # or --console-bind / --shared-egress / a resize look accepted and change nothing.
+  warn "sizing, SENTINEL_MGMT_BIND and SENTINEL_SHARED_EGRESS_CIDRS in that file are also kept as they are;"
+  warn "edit them by hand and apply with: docker compose -p sentinel up -d"
 else
   PGPW=$(gen); CHPW=$(gen)
   cat > "$ENV_FILE" <<ENVEOF
-# Generated by the ESDSWAF installer on $(date -u +%Y-%m-%dT%H:%M:%SZ)
+# Generated by the Swaraj Kavach installer on $(date -u +%Y-%m-%dT%H:%M:%SZ)
 # Contains every secret for this deployment. Back it up; never share it.
+# Host at install: $VCPU vCPU, $RAM_GB GB RAM, $DISK_GB GB free — tier: $TIER
 SENTINEL_VERSION=$BUNDLE_VERSION
 SENTINEL_IMAGE_PREFIX=${REGISTRY_PREFIX:-sentinel}
 # Where Postgres/Valkey/ClickHouse/Prometheus/HAProxy come from. Empty means
@@ -529,7 +766,8 @@ SENTINEL_DB_URL=postgres://sentinel:${PGPW}@postgres:5432/sentinel?sslmode=verif
 CLICKHOUSE_USER=sentinel
 CLICKHOUSE_DB=sentinel_logs
 CLICKHOUSE_PASSWORD=$CHPW
-CLICKHOUSE_MEM_LIMIT=6g
+# Sized to this host (≈30% of RAM, 6g–16g). Below 6g ClickHouse crash-loops.
+CLICKHOUSE_MEM_LIMIT=$CH_MEM
 
 SENTINEL_JWT_SECRET=$(gen)
 SENTINEL_AUDIT_HMAC_KEY=$(gen)
@@ -554,7 +792,13 @@ SENTINEL_BOOTSTRAP_ADMIN_PASSWORD=$(gen)
 SENTINEL_CLICKHOUSE_EVENT_RETENTION_DAYS=90
 SENTINEL_CLICKHOUSE_TRAFFIC_RETENTION_DAYS=30
 SENTINEL_SPOOL_DIR=/var/lib/sentinel/state/spool
-SENTINEL_SPOOL_MAX_BYTES=268435456
+# ── Sizing (derived from the host above at install time). After resizing the VM
+#    edit these by hand and apply with: docker compose -p sentinel up -d ──────
+# Per-request logs the console tails: on-disk ceiling = MAX_MB x (KEEP+1) x 2 streams.
+SENTINEL_LOG_MAX_MB=$LOG_MB
+SENTINEL_LOG_KEEP=$LOG_KEEP
+# Events buffered on disk while ClickHouse is unreachable.
+SENTINEL_SPOOL_MAX_BYTES=$SPOOL_BYTES
 
 SENTINEL_WAF_HOSTNAME=$WAF_HOSTNAME
 SENTINEL_ADMIN_EMAIL=$ADMIN_EMAIL
@@ -576,7 +820,7 @@ SENTINEL_SMTP_PORT=587
 SENTINEL_SMTP_USERNAME=
 SENTINEL_SMTP_PASSWORD=
 SENTINEL_SMTP_FROM=
-SENTINEL_SMTP_FROM_NAME=Next-Gen ESDSWAF
+SENTINEL_SMTP_FROM_NAME=Swaraj Kavach
 SENTINEL_SMTP_SECURITY=starttls
 SENTINEL_SMTP_INSECURE_SKIP_VERIFY=0
 
@@ -590,13 +834,25 @@ SENTINEL_PUBLIC_URL=https://$WAF_HOSTNAME:9443
 # Security contact copied on every completed password reset. Defaults to the
 # administrator address collected above.
 SENTINEL_SECURITY_NOTIFY_EMAIL=$ADMIN_EMAIL
+
+# ── Management console bind ─────────────────────────────────────────────────
+# Host prefix for the console listener (9443). "127.0.0.1:" = this host only,
+# reached over an SSH tunnel. A PRIVATE management address is the alternative
+# (installer flag --console-bind). NEVER "0.0.0.0:" on a host that is reachable
+# from the internet — a NAT forwarding 80/443 is the boundary; keep 9443 inside it.
+SENTINEL_MGMT_BIND=$MGMT_BIND
+
+# ── Shared egress (corporate NAT / VPN addresses shared by many users) ──────
+# Forgives an address's block HISTORY so one person's scan cannot get the whole
+# office blocked. Detection of each request is unchanged.
+$SHARED_EGRESS_LINE
 ENVEOF
   chmod 600 "$ENV_FILE"
   ok "secrets generated (7 values, openssl rand) — $ENV_FILE, mode 0600"
 fi
 
 # ── Step 8 — internal TLS (mandatory: Postgres will not start without) ───────
-step "Step 8 of 10 — internal certificates"
+step "Step 8 of 11 —internal certificates"
 
 # The two certificates are gated SEPARATELY. A single `if pg-server.crt exists`
 # guard covered both, so any re-run over an existing Postgres certificate skipped
@@ -633,8 +889,76 @@ else
   ok "internal certificate authority + Postgres certificate issued"
 fi
 
-# ── Step 9 — start (migrations run as a compose dependency) ──────────────────
-step "Step 9 of 10 — starting services"
+# ── Step 9 — host: Docker at boot, live-restore, kernel network profile ──────
+step "Step 9 of 11 — host"
+if [[ "$DOCKER_TUNING" == "yes" ]]; then
+  if [[ "$DOCKER_BOOT" == "yes" ]]; then ok "Docker already enabled at boot"
+  elif systemctl enable docker >>"$LOG" 2>&1; then ok "Docker enabled at boot"
+  else warn "could not enable Docker at boot — run: systemctl enable docker"
+  fi
+  # live-restore keeps containers running while the Docker daemon restarts or is
+  # upgraded; without it `apt upgrade docker-ce` is a WAF outage. Written only
+  # when no daemon.json exists: an existing file is somebody's configuration, and
+  # a blind edit of JSON is how a daemon fails to start on the next boot. No
+  # containers are running yet, so restarting the daemon here costs nothing.
+  if [[ ! -f /etc/docker/daemon.json ]]; then
+    mkdir -p /etc/docker
+    printf '{\n  "live-restore": true\n}\n' > /etc/docker/daemon.json
+    if systemctl restart docker >>"$LOG" 2>&1 && docker info >/dev/null 2>&1; then
+      ok "Docker live-restore enabled (a daemon restart or upgrade no longer stops the WAF)"
+    else
+      rm -f /etc/docker/daemon.json
+      systemctl restart docker >>"$LOG" 2>&1 || true
+      docker info >/dev/null 2>&1 \
+        || die "Docker did not come back after a daemon restart — see $LOG and: journalctl -u docker"
+      warn "Docker refused the live-restore setting — removed again; the daemon runs without it"
+    fi
+  else
+    LIVE_RESTORE="$(docker info --format '{{.LiveRestoreEnabled}}' 2>/dev/null)"
+    if [[ "$LIVE_RESTORE" == "true" ]]; then ok "Docker live-restore already enabled"
+    else warn "/etc/docker/daemon.json exists without \"live-restore\": true — a Docker daemon restart or upgrade will stop the WAF. Add it and restart Docker in a maintenance window."
+    fi
+  fi
+else
+  warn "Docker boot / live-restore tuning skipped (--no-docker-tuning)"
+fi
+# Kernel network profile: SYN-flood posture (syncookies, deeper backlogs), a
+# conntrack table sized for a flood, redirect and source-route hygiene. It is a
+# sysctl.d drop-in, so it persists by itself and re-applies at every boot.
+#
+# The conntrack BYPASS (NOTRACK) that scripts/hardening/harden-network.sh also
+# offers is deliberately NOT applied here. Docker publishes 80/443 through an
+# iptables DNAT rule, and DNAT depends on connection tracking: NOTRACK on those
+# ports would send every request through the userland docker-proxy instead — a
+# quiet, large performance regression rather than a visible failure. It has
+# never been run on a Docker host; it belongs to the host-network and Kubernetes
+# deployments, where the listener owns the port directly.
+if [[ "$HARDEN" == "yes" ]]; then
+  SYSCTL_SRC="$INSTALL_DIR/scripts/hardening/99-sentinel-ddos.conf"
+  if [[ -r "$SYSCTL_SRC" ]]; then
+    # conntrack sysctls exist only once the module is loaded; without it those
+    # lines are silently ignored and the table keeps its small default.
+    grep -q '^nf_conntrack ' /proc/modules 2>/dev/null || modprobe nf_conntrack >>"$LOG" 2>&1 || true
+    if cp "$SYSCTL_SRC" /etc/sysctl.d/99-sentinel-ddos.conf 2>>"$LOG"; then
+      sysctl --system >>"$LOG" 2>&1 || true
+      SYNC="$(sysctl -n net.ipv4.tcp_syncookies 2>/dev/null)"
+      if [[ "$SYNC" == "1" ]]; then
+        ok "kernel network profile applied and persisted (/etc/sysctl.d/99-sentinel-ddos.conf)"
+      else
+        warn "kernel network profile written but tcp_syncookies reads '${SYNC:-unset}' — see $LOG"
+      fi
+    else
+      warn "could not write /etc/sysctl.d/99-sentinel-ddos.conf — kernel profile skipped"
+    fi
+  else
+    warn "kernel network profile not in this package (scripts/hardening/) — skipped"
+  fi
+else
+  warn "kernel network profile skipped (--no-harden)"
+fi
+
+# ── Step 10 — start (migrations run as a compose dependency) ─────────────────
+step "Step 10 of 11 — starting services"
 C=(docker compose -p sentinel -f "$INSTALL_DIR/compose.prod.yml" --env-file "$ENV_FILE")
 ( cd "$INSTALL_DIR" && "${C[@]}" config >/dev/null 2>>"$LOG" ) \
   || die "the compose configuration is invalid — see $LOG. Nothing was started."
@@ -643,8 +967,8 @@ say "  ${DIM}database migrations run automatically before the control plane star
   || die "failed to start services — see $LOG"
 ok "containers started"
 
-# ── Step 10 — health ─────────────────────────────────────────────────────────
-step "Step 10 of 10 — health checks"
+# ── Step 11 — health ─────────────────────────────────────────────────────────
+step "Step 11 of 11 — health checks"
 hc() { # hc LABEL COMMAND...
   local label="$1"; shift
   for _ in $(seq 1 40); do
@@ -745,42 +1069,83 @@ if [[ $health_fail -ne 0 ]]; then
 fi
 
 printf '%s\n' "$BUNDLE_VERSION" > "$STATE_DIR/version"
+
+# One page a support engineer can read without the log: what the host was, how
+# it was sized, which options were chosen, and every check verdict of THIS run.
+# No secrets in it; 0600 anyway because it names the admin address and topology.
+REPORT="$STATE_DIR/install-report.txt"
+{
+  printf 'Swaraj Kavach — install report\n\n'
+  printf '%-14s %s\n' date     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                      version  "$BUNDLE_VERSION" \
+                      host     "$(hostname -f 2>/dev/null || hostname)" \
+                      os       "${OS_PRETTY:-unknown}" \
+                      hardware "${VCPU} vCPU, ${RAM_GB} GB RAM, ${DISK_GB} GB free on /opt — tier ${TIER}" \
+                      docker   "$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo '?'), data-root ${DOCKER_ROOT:-?}" \
+                      sizing   "clickhouse ${CH_MEM}, request logs ${LOG_MB} MB x $((LOG_KEEP + 1)) x 2, spool ${SPOOL_BYTES} bytes" \
+                      hostname "$WAF_HOSTNAME" \
+                      admin    "$ADMIN_EMAIL" \
+                      console  "${MGMT_BIND}9443" \
+                      egress   "${SHARED_EGRESS:-none declared}" \
+                      options  "harden=$HARDEN docker-tuning=$DOCKER_TUNING force=$FORCE undersized=$ALLOW_UNDERSIZED images=$IMAGE_SOURCE"
+  printf '\ncheck verdicts, this run\n'
+  if [[ "$LOG_OK" == "yes" ]]; then
+    tail -n +"$((LOG_START + 1))" "$LOG" 2>/dev/null | grep -E ' (STEP|OK|WARN|FAIL|SIZING|ABORT) ' || true
+  fi
+} > "$REPORT" 2>/dev/null && chmod 600 "$REPORT" || true
+
+if [[ -n "$CONSOLE_BIND" ]]; then
+  CONSOLE_HOW="    From the management network   ${B}https://${CONSOLE_BIND}:9443${R}
+
+    ${DIM}The console listens on this PRIVATE address only. Restrict 9443 to your${R}
+    ${DIM}management network in the host or perimeter firewall. A NAT that forwards${R}
+    ${DIM}only 80/443 to this host must stay that way — never add 9443 to it.${R}"
+else
+  CONSOLE_HOW="    From this host          ${B}https://127.0.0.1:9443${R}
+    From your workstation   ${B}ssh -L 9443:127.0.0.1:9443 ${SUDO_USER:-root}@${DEF_IP:-<this-host>}${R}
+                            then open ${B}https://127.0.0.1:9443${R}
+
+    ${DIM}Bound to 127.0.0.1 deliberately: it is a security appliance's admin UI.${R}
+    ${DIM}To publish it on a private management address instead, set${R}
+    ${DIM}SENTINEL_MGMT_BIND=<private-ip>: in $ENV_FILE and run${R}
+    ${DIM}docker compose -p sentinel -f $INSTALL_DIR/compose.prod.yml up -d dataplane${R}"
+fi
+
 cat <<FINAL
 
   ${GRN}${B}Installation successful${R}
 
-    Version        Next-Gen ESDSWAF v$BUNDLE_VERSION
+    Version        Swaraj Kavach v$BUNDLE_VERSION
+    Host tier      $TIER (${VCPU} vCPU, ${RAM_GB} GB RAM, ${DISK_GB} GB free)
     Username       admin@sentinel.local
     Password       ${B}${ADMIN_PW:-NOT CAPTURED — recover it with the command below}${R}
 
-  ${YEL}${B}WRITE THIS PASSWORD DOWN NOW. It cannot be changed later.${R}
-  ${YEL}This build has no password-change screen and no password-reset endpoint${R}
-  ${YEL}— /api/v1/admin/users/:id accepts role and status only. This credential${R}
-  ${YEL}is the only way into the console for the life of the installation.${R}
-
-  ${DIM}It is stored in $ENV_FILE (mode 0600) as${R}
-  ${DIM}SENTINEL_BOOTSTRAP_ADMIN_PASSWORD, so it survives container recreates and${R}
-  ${DIM}is included in a backup of that file. Recover it at any time with:${R}
-    ${DIM}sudo grep SENTINEL_BOOTSTRAP_ADMIN_PASSWORD $ENV_FILE${R}
-  ${DIM}Lose that file without a backup and there is no way back in.${R}
+  ${YEL}${B}WRITE THIS PASSWORD DOWN NOW and sign in with it once.${R}
+  ${DIM}It is stored in $ENV_FILE (mode 0600) as SENTINEL_BOOTSTRAP_ADMIN_PASSWORD,${R}
+  ${DIM}so it survives container recreates and travels with a backup of that file.${R}
+    Recover it        sudo grep SENTINEL_BOOTSTRAP_ADMIN_PASSWORD $ENV_FILE
+    Change it         console → account menu → Change password
+    Reset by email    available once the SMTP block in $ENV_FILE is filled in
+  ${DIM}Lose that file without a backup, with no SMTP configured, and there is no way back in.${R}
 
   ${B}Reaching the console${R}
 
-    The management console is bound to ${B}127.0.0.1 only${R}, deliberately: it is a
-    security appliance's admin UI, and on 0.0.0.0 it would be exposed to whatever
-    network this host sits on — and to the internet the moment the host gets a
-    public IP. So it is NOT reachable at https://${WAF_HOSTNAME}:9443 from your
-    laptop, and that is the intended behaviour, not a fault.
-
-    From this host          ${B}https://127.0.0.1:9443${R}
-    From your workstation   ${B}ssh -L 9443:127.0.0.1:9443 ${SUDO_USER:-root}@${DEF_IP:-<this-host>}${R}
-                            then open ${B}https://127.0.0.1:9443${R}
+$CONSOLE_HOW
 
     ${DIM}Ports 80 and 443 ARE published on all interfaces — that is the WAF's${R}
     ${DIM}traffic path, and it is what your protected sites are served on.${R}
 
+  ${B}Publishing this WAF to the internet${R}
+
+    Forward ONLY these to ${B}${DEF_IP:-this host}${R}:   tcp/80   tcp/443   (udp/443 for HTTP/3)
+    Never forward 9443 (console) or 22 (SSH). Never use a 1:1 / full NAT.
+    Port 80 stays open permanently — Let's Encrypt renewals are proven on it.
+    Every site on this node answers to its own Host header the moment the forward
+    opens; before adding a second site to a public node read
+    $INSTALL_DIR/docs/manual/SITE-ONBOARDING.md.
+
   ${B}Next steps${R}
-    1. Add your first protected site in the dashboard.
+    1. Add your first protected site in the console.
        Until a site exists the WAF returns 502 to everything: correct
        behaviour, because there is no upstream to forward to yet.
     2. ${B}Leave new sites in LEARNING mode.${R} Every published detection figure
@@ -791,8 +1156,10 @@ cat <<FINAL
          $INSTALL_DIR/scripts/fpr-report.sh 168
        See section 7 of the deployment guide.
     4. Configure backups: $INSTALL_DIR/scripts/backup/backup.sh
+    5. Fill in the SMTP block in $ENV_FILE so password recovery works.
 
     Config  $ENV_FILE  ${DIM}(all secrets — back this up)${R}
+    Report  $REPORT
     Log     $LOG
 
 FINAL
