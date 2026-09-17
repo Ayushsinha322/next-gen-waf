@@ -64,7 +64,12 @@ if [[ -z "$ENV_FILE" ]]; then
 fi
 [[ -n "$ENV_FILE" && -r "$ENV_FILE" ]] || die "cannot find a readable .env — set SENTINEL_ENV_FILE"
 
-API="${SENTINEL_API:-https://127.0.0.1:9443/api/v1}"
+# The console listens where the installer bound it — SENTINEL_MGMT_BIND in that
+# .env ("127.0.0.1:" by default, "<private-ip>:" with --console-bind). Read it
+# rather than assume loopback.
+MGMT_HOST="$(sed -n 's/^SENTINEL_MGMT_BIND=//p' "$ENV_FILE" 2>/dev/null | head -1 | tr -d ':[:space:]')"
+[[ -n "$MGMT_HOST" && "$MGMT_HOST" != "0.0.0.0" ]] || MGMT_HOST=127.0.0.1
+API="${SENTINEL_API:-https://${MGMT_HOST}:9443/api/v1}"
 ADMIN_EMAIL="${SENTINEL_ADMIN_LOGIN:-admin@sentinel.local}"
 ADMIN_PW="$(grep -E '^SENTINEL_BOOTSTRAP_ADMIN_PASSWORD=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '\r\n')"
 if [[ -z "$ADMIN_PW" ]]; then

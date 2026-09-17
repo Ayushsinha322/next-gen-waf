@@ -161,6 +161,46 @@ done
 [[ "$seq_ok" == "yes" && "$((want - 1))" -eq "${TOTALS% }" ]] && pass "steps run 1..${TOTALS% } with no gap" \
   || { [[ "$seq_ok" == "yes" ]] && fail "last step is $((want - 1)) but the total says ${TOTALS% }"; }
 
+sect "no command substitution hides inside an unquoted heredoc"
+# An UNQUOTED heredoc (<<ENVEOF, <<FINAL) expands $(...) AND `...`. A comment
+# line inside the generated-.env heredoc read "# \`docker compose up
+# --force-recreate\` destroys the one copy" — so every install EXECUTED
+# `docker compose up --force-recreate` in whatever directory the operator ran
+# it from, and wrote the command's (empty) output into .env. It surfaced as a
+# stray "no configuration file provided: not found" on the first real run; from
+# a directory that holds a compose file it would have recreated the stack
+# mid-install. Backticks in prose are fine anywhere except inside these blocks.
+HEREDOC_TICKS="$(awk '
+  /<<-?[A-Z_]+[[:space:]]*$/ && $0 !~ /<<-?['"'"'"][A-Z_]+/ {
+    match($0, /<<-?[A-Z_]+/); term = substr($0, RSTART + 2, RLENGTH - 2); sub(/^-/, "", term); inh = 1; next }
+  inh && $0 == term { inh = 0; next }
+  inh && /`/ { printf "line %d: %s\n", NR, substr($0, 1, 90) }' "$INSTALLER")"
+if [[ -z "$HEREDOC_TICKS" ]]; then pass "no backticks inside any unquoted heredoc"
+else fail "backtick(s) inside an unquoted heredoc — the shell would EXECUTE them:"; printf '%s\n' "$HEREDOC_TICKS" | sed 's/^/        /'; fi
+
+sect "the console health probe targets the address the console was bound to"
+# With --console-bind the listener is on the private address only; a loopback
+# probe waits out every attempt and fails a healthy install (seen live).
+PROBE_LINE="$(grep -E '^hc "Console :9443' "$INSTALLER" || true)"
+[[ -n "$PROBE_LINE" ]] || fail "no console health probe found (hc \"Console :9443…\")"
+if grep -qF '$CONSOLE_PROBE_HOST' <<<"$PROBE_LINE" && grep -qE '^CONSOLE_PROBE_HOST="\$\{CONSOLE_BIND:-127\.0\.0\.1\}"' "$INSTALLER"; then
+  pass "console probe uses CONSOLE_BIND (falls back to 127.0.0.1)"
+else
+  fail "console probe does not use CONSOLE_BIND — an install with --console-bind fails its last health check"
+fi
+grep -qF '127.0.0.1:9443' <<<"$PROBE_LINE" && fail "console probe still hardwires 127.0.0.1:9443" || pass "console probe has no hardwired loopback address"
+# The sibling scripts must reach the console the same way.
+CUSTOMER_DIR="$(dirname "$INSTALLER")"
+for s in first-site.sh add-operator.sh; do
+  f="$CUSTOMER_DIR/$s"
+  [[ -f "$f" ]] || { fail "$s missing beside the installer"; continue; }
+  if grep -qE 'SENTINEL_MGMT_BIND' "$f" && ! grep -qE '^API="\$\{SENTINEL_API:-https://127\.0\.0\.1:9443' "$f"; then
+    pass "$s derives the console address from SENTINEL_MGMT_BIND"
+  else
+    fail "$s assumes the console is on 127.0.0.1:9443"
+  fi
+done
+
 sect "operator-facing text carries the product name"
 if grep -q 'Next-Gen ESDSWAF' "$INSTALLER"; then fail "installer still says 'Next-Gen ESDSWAF' (product is Swaraj Kavach; archive names may keep ESDSWAF)"
 else pass "no 'Next-Gen ESDSWAF' in the installer"; fi

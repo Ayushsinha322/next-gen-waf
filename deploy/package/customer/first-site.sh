@@ -34,7 +34,13 @@ set -uo pipefail
 
 INSTALL_DIR=/opt/sentinel/current
 ENV_FILE="$INSTALL_DIR/.env"
-API="${SENTINEL_API:-https://127.0.0.1:9443}"
+# The console listens where the installer bound it (SENTINEL_MGMT_BIND in .env:
+# "127.0.0.1:" by default, "<private-ip>:" with --console-bind). Read it rather
+# than assume loopback, or this script cannot reach a console that is perfectly
+# healthy on the management address.
+MGMT_HOST="$(sed -n 's/^SENTINEL_MGMT_BIND=//p' "$ENV_FILE" 2>/dev/null | head -1 | tr -d ':[:space:]')"
+[[ -n "$MGMT_HOST" && "$MGMT_HOST" != "0.0.0.0" ]] || MGMT_HOST=127.0.0.1
+API="${SENTINEL_API:-https://${MGMT_HOST}:9443}"
 EMAIL="${SENTINEL_ADMIN_EMAIL:-admin@sentinel.local}"
 
 DRY_RUN=no

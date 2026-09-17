@@ -779,7 +779,7 @@ SENTINEL_ALLOW_SUPERUSER_DB=1
 #
 # That default is a lockout waiting to happen, and this file is the fix. Sourced
 # from a container log it dies with the container: any upgrade, rollback, or
-# `docker compose up --force-recreate` destroys the one copy. Generating it here
+# "docker compose up --force-recreate" destroys the one copy. Generating it here
 # puts it in the same 0600 file as every other secret, the one the installer
 # already tells you to back up.
 #
@@ -1020,7 +1020,13 @@ hc "TLS on :443"   bash -c 'curl -sk --max-time 5 -o /dev/null https://127.0.0.1
 # path so the request actually traverses proxy → control plane. 401 is the
 # expected unauthenticated answer and is a pass; what is being tested is that
 # something on the far side spoke HTTP at all.
-hc "Console :9443" bash -c 'curl -sk --max-time 5 -o /dev/null -w "%{http_code}" https://127.0.0.1:9443/api/v1/sites | grep -qE "^[24]"' || health_fail=1
+#
+# Probe the address the console was actually BOUND to. With --console-bind the
+# listener is on the private address only, so a loopback probe cannot connect,
+# waits out all 40 attempts, and fails a healthy install — the first real run
+# with the flag did exactly that, two minutes after everything else had passed.
+CONSOLE_PROBE_HOST="${CONSOLE_BIND:-127.0.0.1}"
+hc "Console :9443 on $CONSOLE_PROBE_HOST" bash -c 'curl -sk --max-time 5 -o /dev/null -w "%{http_code}" "https://'"$CONSOLE_PROBE_HOST"':9443/api/v1/sites" | grep -qE "^[24]"' || health_fail=1
 
 # The generated password is the SECOND line of the seed banner emitted by
 # control-plane/internal/db/seed.go:
