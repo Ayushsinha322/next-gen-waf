@@ -1951,6 +1951,7 @@ var knownWafPolicyKeys = map[string]struct{}{
 	// Forwarded to the data plane by buildRustWaf.
 	"mode": {}, "paranoia_level": {}, "anomaly_threshold": {},
 	"rule_categories": {}, "rule_exclusions": {}, "path_overrides": {},
+	"crs_policy":    {},
 	"max_body_size": {}, "max_uri_length": {}, "max_header_count": {},
 	"allowed_methods": {}, "api_discovery": {}, "security_headers": {},
 	"rate_limit": {}, "anti_ddos": {}, "bot_detection": {}, "geoip": {},
@@ -2037,8 +2038,12 @@ func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
 		MaxHeaderCount   *uint32         `json:"max_header_count"`
 		APIDiscovery     bool            `json:"api_discovery"`
 		AllowedMethods   []string        `json:"allowed_methods"`
-		SecurityHeaders  json.RawMessage `json:"security_headers"`
-		PathOverrides    json.RawMessage `json:"path_overrides"`
+		// CRS policy lists (tx.*) the rule engine gates on. Empty by default:
+		// upstream CRS ships every one of these commented out, so they are
+		// opt-in policy rather than a default. See seed_crs_policy in the proxy.
+		CrsPolicy       map[string]string `json:"crs_policy"`
+		SecurityHeaders json.RawMessage   `json:"security_headers"`
+		PathOverrides   json.RawMessage   `json:"path_overrides"`
 		// Every field here is an ALLOWLIST entry: a waf_policy key absent from
 		// this struct is stored in the database, echoed back to the dashboard,
 		// and silently dropped on the way to the data plane. block_page was
@@ -2196,6 +2201,9 @@ func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
 	// list means "no restriction"; an empty/partial list restricts).
 	if len(p.AllowedMethods) > 0 {
 		waf["allowed_methods"] = p.AllowedMethods
+	}
+	if len(p.CrsPolicy) > 0 {
+		waf["crs_policy"] = p.CrsPolicy
 	}
 	attachRawObject(waf, "security_headers", p.SecurityHeaders)
 

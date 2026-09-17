@@ -4409,6 +4409,10 @@ async fn phase1_headers(
         }
     }
 
+    // Seed the CRS policy lists before the first rule sees them. Must be here
+    // rather than earlier: `site` is not resolved until the host is matched.
+    seed_crs_policy(ctx, site);
+
     // --- Rule engine (CRS / SRL) ---
     if still_evaluating(ctx) {
         if let Some(engine) = engines.get(&site.id) {
@@ -4663,6 +4667,52 @@ fn request_evidence(ctx: &RequestContext) -> u32 {
         .filter_map(|e| ctx.engine_scores.get(*e))
         .sum();
     ctx.anomaly_score.saturating_sub(history)
+}
+
+/// Seed the `tx.` policy variables CRS rules gate on, before any rule runs.
+///
+/// Thirteen CRS rules test a request against a `tx.` list that `crs-setup.conf`
+/// normally defines — restricted extensions, allowed content types and HTTP
+/// versions, argument count and length caps, restricted headers. Nothing seeded
+/// them, so `expand_operator_macros` refused to resolve them and every one of
+/// those rules was permanently inert. That is safe (the alternative, expanding
+/// an unset list to `""`, makes `!@within` match everything and denies every
+/// request) but it was also unreachable: there was no way to turn them on.
+///
+/// Two different things are seeded here, for two different reasons.
+///
+/// `allowed_methods` comes from the site's OWN `waf.allowed_methods`, never
+/// from CRS's example value. CRS ships `GET HEAD POST OPTIONS`, so seeding that
+/// would have rejected PUT, PATCH and DELETE on every site — including this
+/// deployment, whose site permits all seven. Taking it from the site config
+/// makes rule 911100 agree with the method allow-list the proxy already
+/// enforces a few lines above (with a clean 405, before rules run), rather
+/// than contradict it.
+///
+/// Everything else comes from `waf.crs_policy` and is EMPTY by default, which
+/// matches upstream: CRS ships every one of those `SecAction` blocks commented
+/// out. They are opt-in policy because the right value is a property of the
+/// application — `arg_length=400` rejects any parameter longer than an ordinary
+/// JWT. Enabling them for everyone would have made this WAF stricter than CRS's
+/// own default with limits nobody chose.
+///
+/// Names are stored upper-case and without the `tx.` prefix, matching
+/// `resolve_operator_macro`.
+fn seed_crs_policy(ctx: &mut RequestContext, s: &SiteConfig) {
+    if !s.waf.allowed_methods.is_empty() {
+        ctx.tx_vars.insert(
+            "ALLOWED_METHODS".to_string(),
+            s.waf.allowed_methods.join(" ").to_uppercase(),
+        );
+    }
+    for (k, v) in &s.waf.crs_policy {
+        if k.is_empty() || v.is_empty() {
+            continue;
+        }
+        // An operator writing `tx.max_num_args` means `max_num_args`.
+        let key = k.trim().trim_start_matches("tx.").trim_start_matches("TX.");
+        ctx.tx_vars.insert(key.to_uppercase(), v.clone());
+    }
 }
 
 /// Final verdict fusion. With fusion enabled: weighted score vs per-paranoia
@@ -5103,11 +5153,17 @@ enum MissingEngine {
 ///
 ///   * `blocking` is a promise to enforce. A node that cannot enforce cannot
 ///     keep it, so it refuses rather than pretending.
-///   * `learning` promises the opposite — it never blocks anything — so serving
-///     uninspected matches what the operator asked for, and refusing would cost
-///     availability for no security gain. The ERROR log and the health endpoint
-///     still say the site is unprotected.
+///   * `learning` is a promise to OBSERVE, and a site with no engine observes
+///     nothing. Serving it uninspected produces a learning report that is
+///     silently empty — indistinguishable from "we looked and found nothing" —
+///     which is the answer an operator then uses to decide it is safe to switch
+///     the site to blocking. That is worse than an outage, because it is wrong
+///     rather than absent. It refuses too, as of 2026-09-17 (Ayush's call).
 ///   * `off`, or a site with no rules at all, never expected an engine.
+///
+/// So the rule is now simply: a site that asked for an engine and has none is
+/// refused, whatever its mode. Only `off` and engine-less sites are served, and
+/// the escape hatch below still overrides everything.
 ///
 /// `serve_on_failure` is the escape hatch: an operator whose rules will not
 /// compile and who needs the site up NOW sets
@@ -5124,7 +5180,7 @@ fn missing_engine_action(
     if warming {
         return MissingEngine::RefuseWarming;
     }
-    if serve_on_failure || site.waf.mode != WafMode::Blocking {
+    if serve_on_failure || site.waf.mode == WafMode::Off {
         return MissingEngine::Serve;
     }
     MissingEngine::RefuseBroken
@@ -9567,6 +9623,124 @@ mod threat_intel_contract_tests {
 }
 
 #[cfg(test)]
+mod crs_policy_seed_tests {
+    use super::*;
+
+    fn site(methods: &[&str], policy: &[(&str, &str)]) -> SiteConfig {
+        let mut s = SiteConfig {
+            id: "s".to_string(),
+            tenant_id: String::new(),
+            domains: vec!["s.local".to_string()],
+            upstream: sentinel_core::config::UpstreamConfig {
+                load_balancer: sentinel_core::config::LoadBalancerStrategy::RoundRobin,
+                servers: vec![],
+                health_check: None,
+                timeout_secs: None,
+                websocket: false,
+                host_header: None,
+                keepalive: true,
+                connect_timeout_secs: None,
+                sni_name: None,
+            },
+            waf: sentinel_core::config::WafConfig::default(),
+            plugins: vec![],
+            tls: Default::default(),
+            origin: Default::default(),
+        };
+        s.waf.allowed_methods = methods.iter().map(|m| m.to_string()).collect();
+        s.waf.crs_policy = policy
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        s
+    }
+
+    fn ctx() -> RequestContext {
+        RequestContext::new("203.0.113.5".parse().unwrap(), 1111)
+    }
+
+    /// The site's own method list, never CRS's example value. CRS ships
+    /// `GET HEAD POST OPTIONS`, so seeding that would have rejected PUT, PATCH
+    /// and DELETE on every site — including this deployment, which permits all
+    /// seven and already enforces that list with a 405 before rules run.
+    #[test]
+    fn allowed_methods_comes_from_the_site_not_from_crs() {
+        let mut c = ctx();
+        seed_crs_policy(&mut c, &site(&["GET", "post", "DELETE"], &[]));
+        assert_eq!(
+            c.tx_vars.get("ALLOWED_METHODS").map(String::as_str),
+            Some("GET POST DELETE"),
+            "must be the site's list, upper-cased, space separated"
+        );
+    }
+
+    /// An empty site list means "allow all", and the proxy skips its own check
+    /// for it. Seeding an empty string would be catastrophic: `!@within ""`
+    /// means every method is not within it, i.e. deny everything. Leaving it
+    /// unset keeps rule 911100 inert, which is the safe degradation.
+    #[test]
+    fn an_empty_method_list_seeds_nothing() {
+        let mut c = ctx();
+        seed_crs_policy(&mut c, &site(&[], &[]));
+        assert!(
+            !c.tx_vars.contains_key("ALLOWED_METHODS"),
+            "an empty allow-list must stay UNSET, never seeded as empty"
+        );
+    }
+
+    /// Empty by default, matching upstream: CRS ships every one of these
+    /// SecAction blocks commented out. No site gets a limit nobody chose.
+    #[test]
+    fn nothing_else_is_seeded_by_default() {
+        let mut c = ctx();
+        seed_crs_policy(&mut c, &site(&["GET"], &[]));
+        for k in [
+            "RESTRICTED_EXTENSIONS",
+            "ALLOWED_REQUEST_CONTENT_TYPE",
+            "MAX_NUM_ARGS",
+            "ARG_LENGTH",
+        ] {
+            assert!(
+                !c.tx_vars.contains_key(k),
+                "{k} must be opt-in, not default"
+            );
+        }
+    }
+
+    /// Opting in works, and the key is normalised the way the rules look it up.
+    #[test]
+    fn opting_in_seeds_the_policy_list() {
+        let mut c = ctx();
+        seed_crs_policy(
+            &mut c,
+            &site(
+                &["GET"],
+                &[
+                    ("restricted_extensions", ".bak/ .conf/"),
+                    ("tx.max_num_args", "255"),
+                    ("ARG_LENGTH", "400"),
+                    ("blank", ""),
+                ],
+            ),
+        );
+        assert_eq!(
+            c.tx_vars.get("RESTRICTED_EXTENSIONS").map(String::as_str),
+            Some(".bak/ .conf/")
+        );
+        assert_eq!(
+            c.tx_vars.get("MAX_NUM_ARGS").map(String::as_str),
+            Some("255"),
+            "a `tx.` prefix the operator wrote must be stripped"
+        );
+        assert_eq!(c.tx_vars.get("ARG_LENGTH").map(String::as_str), Some("400"));
+        assert!(
+            !c.tx_vars.contains_key("BLANK"),
+            "an empty value must not be seeded — it would make !@within deny all"
+        );
+    }
+}
+
+#[cfg(test)]
 mod access_record_tests {
     use super::*;
 
@@ -11330,12 +11504,36 @@ mod block_page_tests {
             "a blocking-mode site that cannot enforce must not be served"
         );
 
-        // Learning mode never promised to block, so serving uninspected is what
-        // the operator asked for. Refusing would cost availability for nothing.
+        // Learning mode refuses too, as of 2026-09-17. It used to serve, on the
+        // reasoning that learning never promised to block so availability was
+        // the better trade. That reasoning was wrong about what learning
+        // promises: it promises to OBSERVE, and a site with no engine observes
+        // nothing. Serving it produces a learning report that is silently empty
+        // — indistinguishable from "we looked and found nothing" — and that is
+        // the report an operator reads to decide the site is safe to switch to
+        // blocking. A wrong answer beats a missing one only if nobody acts on
+        // it, and this one is read precisely in order to act.
         let learning = rules_site("s", WafMode::Learning, true);
         assert_eq!(
             missing_engine_action(&learning, false, false, false),
-            MissingEngine::Serve
+            MissingEngine::RefuseBroken,
+            "a learning site with no engine would report zero findings, which an \
+             operator would read as 'clean' rather than 'never inspected'"
+        );
+
+        // The escape hatch covers learning as well, so an operator who needs
+        // the site up while the rules are broken has the same one lever.
+        assert_eq!(
+            missing_engine_action(&learning, false, false, true),
+            MissingEngine::Serve,
+            "SENTINEL_SERVE_ON_RULE_COMPILE_FAILURE must still override every mode"
+        );
+
+        // Warming still wins over the mode: a reload in flight is transient and
+        // must not be reported as a broken rule set.
+        assert_eq!(
+            missing_engine_action(&learning, false, true, false),
+            MissingEngine::RefuseWarming
         );
 
         // The escape hatch restores the old behaviour, deliberately.
@@ -11379,14 +11577,28 @@ mod block_page_tests {
             "both broken sites lack signature protection"
         );
         // refused_sites reads the live warming flag and env, so assert the
-        // decision directly for the blocking site and the learning one.
+        // decision directly. Both broken sites are refused as of 2026-09-17 —
+        // learning used to be served, until it was pointed out that a learning
+        // site with no engine reports zero findings, which reads as "clean".
+        // The health endpoint still distinguishes the two lists: `unprotected`
+        // is the condition (no signature coverage), `refused` is what the node
+        // decided to do about it.
         assert_eq!(
             missing_engine_action(&cfg.sites[0], false, false, false),
-            MissingEngine::RefuseBroken
+            MissingEngine::RefuseBroken,
+            "blocking site cannot enforce"
         );
         assert_eq!(
             missing_engine_action(&cfg.sites[1], false, false, false),
-            MissingEngine::Serve
+            MissingEngine::RefuseBroken,
+            "learning site cannot observe"
+        );
+        // The site that never wanted an engine is still served, so the two
+        // lists genuinely differ rather than becoming the same list.
+        assert_eq!(
+            missing_engine_action(&cfg.sites[2], false, false, false),
+            MissingEngine::Serve,
+            "a site with no rules configured is not broken"
         );
     }
 

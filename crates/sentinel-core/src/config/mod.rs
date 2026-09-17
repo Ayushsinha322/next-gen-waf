@@ -656,6 +656,29 @@ pub struct WafConfig {
     /// isn't listed is rejected with 405. Case-insensitive.
     #[serde(default)]
     pub allowed_methods: Vec<String>,
+    /// CRS policy variables to seed before rule evaluation (`tx.*`).
+    ///
+    /// Thirteen CRS rules gate on a `tx.` policy list that `crs-setup.conf`
+    /// normally defines — restricted extensions, allowed content types, arg
+    /// count and length caps, restricted headers. Nothing seeded them here, so
+    /// every one of those rules was inert, and there was no way to turn them on.
+    ///
+    /// It stays EMPTY by default, and that is not laziness: upstream CRS ships
+    /// every one of these `SecAction` blocks COMMENTED OUT in
+    /// `crs-setup.conf.example`. They are opt-in policy, not defaults, because
+    /// the right value depends entirely on the application — `arg_length=400`
+    /// rejects any parameter over 400 characters, which is an ordinary JWT.
+    /// Seeding CRS's example values for everyone would have made this WAF
+    /// stricter than CRS's own default on every site, with limits nobody chose.
+    ///
+    /// So the mechanism is here and the policy is the operator's. Keys are
+    /// case-insensitive and written without the `tx.` prefix, e.g.
+    /// `{"restricted_extensions": ".bak/ .conf/ .sql/", "max_num_args": "255"}`.
+    ///
+    /// `allowed_methods` is seeded automatically from the site's own
+    /// `allowed_methods` and does not belong here — see `seed_crs_policy`.
+    #[serde(default)]
+    pub crs_policy: std::collections::HashMap<String, String>,
     /// Per-site response/security header policy (overrides the proxy defaults
     /// and injects operator-defined headers).
     pub security_headers: Option<SecurityHeadersConfig>,
