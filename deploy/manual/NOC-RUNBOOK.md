@@ -74,16 +74,12 @@ internet access — it sits on `172.16.23.2`, which does not route from outside 
 
 ---
 
-## 2. Install Docker
+## 2. Docker
 
-Skip if `docker --version` already works.
-
-```bash
-curl -fsSL https://get.docker.com | sh
-systemctl enable --now docker
-```
-
-Verify — **both** must answer:
+Nothing to do: `install.sh` installs Docker Engine itself when it is missing —
+from the packages shipped in the offline bundle (no network), otherwise from
+Ubuntu's repositories. If the host already has Docker, **both** of these must
+answer, or the installer tells you which part is missing:
 
 ```bash
 docker --version          # Docker version 29.7.2, build a7dcaa6

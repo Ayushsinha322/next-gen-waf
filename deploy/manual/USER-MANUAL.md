@@ -159,16 +159,16 @@ Or **Deploy → Package Registry → esdswaf**. You need the archive **and** its
 
 ## 3. Installing
 
-### 3.1 Install Docker
+### 3.1 Docker
 
-Skip if `docker --version` already answers.
+You do not install Docker by hand. When it is missing, `install.sh` installs
+Docker Engine in its Step 4 — from the packages shipped in the offline bundle
+(no network needed), otherwise from Ubuntu's own repositories — and never by
+piping a remote script into a shell. `--no-docker-install` makes it stop
+instead, for hosts where Docker is managed elsewhere.
 
-```bash
-curl -fsSL https://get.docker.com | sh
-systemctl enable --now docker
-```
-
-Verify — **both** must answer, and the daemon must be running:
+If Docker is already present, **both** of these must answer and the daemon must
+be running; the installer names whichever part is missing:
 
 ```bash
 docker --version          # e.g. Docker version 29.7.2

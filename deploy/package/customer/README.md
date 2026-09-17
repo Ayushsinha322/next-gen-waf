@@ -77,6 +77,7 @@ Flags for an unattended or hardened install:
 | `--dry-run` | Run every check, change nothing. |
 | `--no-harden` | Skip the kernel network profile (`/etc/sysctl.d/99-sentinel-ddos.conf`). |
 | `--no-docker-tuning` | Do not enable Docker at boot or set `live-restore`. |
+| `--no-docker-install` | If Docker is absent, stop instead of installing it (for hosts where Docker is managed elsewhere). |
 | `--force` | Continue over a previous incomplete attempt (keeps `.env` and certificates as they are). |
 | `--allow-undersized` | Evaluation only: proceed below the minimum specification. |
 
@@ -106,7 +107,7 @@ sudo ./install.sh --dry-run
 | CPU | 4 vCPU | **16 vCPU** |
 | RAM | **16 GB** | **32 GB** |
 | Disk | 100 GB free on `/opt` and on Docker's data-root | **200 GB SSD/NVMe** |
-| Software | Docker Engine 27+ with the Compose v2 plugin | same |
+| Software | Docker Engine with the Compose v2 plugin — **installed by the installer if absent** (from the packages in the offline bundle, else from Ubuntu's repositories). The bundled packages need `iptables` and `nftables` on the host, which Ubuntu Server images carry. | same |
 | Ports | 80, 443, 9443 free | same |
 | Network | Access to Docker Hub — **see below** | same |
 

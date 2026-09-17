@@ -174,19 +174,17 @@ different VM. The WAF needs those ports — it *is* the web front door.
 
 ---
 
-# Part 4 — Install Docker
+# Part 4 — Docker
 
-Docker runs the WAF's components in isolated containers. Skip this if Part 3
-already showed a version.
+Docker runs the WAF's components in isolated containers. **You no longer install
+it yourself**: if Part 3 showed no version, `install.sh` installs Docker Engine
+in Step 4 — from the packages inside the offline bundle (no network needed), or
+otherwise from Ubuntu's own repositories. It never pipes a remote script into a
+shell. Pass `--no-docker-install` if Docker on this host is managed by something
+else and you would rather the installer stopped.
 
-```bash
-apt-get update
-apt-get install -y curl ca-certificates
-curl -fsSL https://get.docker.com | sh
-systemctl enable --now docker
-```
-
-Check it worked. **Both** commands must answer:
+If Docker was already present, check that **both** commands answer — the
+installer needs the Compose v2 plugin as well as the engine:
 
 ```bash
 docker --version

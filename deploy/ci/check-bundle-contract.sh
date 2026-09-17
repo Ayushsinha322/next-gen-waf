@@ -216,6 +216,32 @@ else
   printf '%s\n' "$BRAND_HITS" | sed 's/^/        /'
 fi
 
+# ── 6c. Docker Engine packages, when shipped ─────────────────────────────────
+# STAGE_ONLY builds (CI, no network) ship none, so their absence is not a
+# failure. When bundle/docker/ exists each release directory must hold the four
+# packages the installer installs with one `dpkg -i`, and their checksums must
+# verify — install.sh refuses to install them otherwise, and would then fall
+# back to the distro repositories on a host that may not have them.
+sect "Docker Engine packages (offline bundle)"
+if [[ -d "$STAGE/bundle/docker" ]]; then
+  for cn in "$STAGE"/bundle/docker/*/; do
+    name="$(basename "$cn")"
+    for p in docker-ce_ docker-ce-cli_ containerd.io_ docker-compose-plugin_; do
+      compgen -G "$cn/${p}*.deb" >/dev/null && pass "bundle/docker/$name/${p}*.deb" \
+        || fail "bundle/docker/$name has no ${p}*.deb — dpkg -i would leave Docker incomplete"
+    done
+    [[ -s "$cn/VERSIONS" ]] && pass "bundle/docker/$name/VERSIONS" || fail "bundle/docker/$name/VERSIONS missing"
+    ( cd "$cn" && sha256sum -c --quiet SHA256SUMS >/dev/null 2>&1 ) \
+      && pass "bundle/docker/$name checksums verify" \
+      || fail "bundle/docker/$name/SHA256SUMS does not verify — the installer would refuse these packages"
+  done
+  grep -q 'bundle/docker' "$STAGE/install.sh" \
+    && pass "install.sh knows where the packages are" \
+    || fail "install.sh never reads bundle/docker — the packages would be dead weight"
+else
+  pass "no bundle/docker/ staged (STAGE_ONLY or BUNDLE_DOCKER=0) — installer uses the distro repositories"
+fi
+
 # ── 7. manifest is parseable by install.sh's own sed parser ──────────────────
 # install.sh deliberately does not use python3; if the manifest shape drifts the
 # installer reads an empty version and dies five steps later on a missing image.

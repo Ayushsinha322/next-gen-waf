@@ -34,6 +34,11 @@
 #                                block history must never punish bystanders
 #      --no-harden               skip the kernel network profile (sysctl)
 #      --no-docker-tuning        do not enable Docker at boot or set live-restore
+#      --no-docker-install       if Docker is absent, stop instead of installing it
+#
+#  Docker is installed by this script when it is missing: from the packages
+#  shipped in the offline bundle (no network), otherwise from Ubuntu's own
+#  repositories. No third-party script is ever piped into a shell.
 # =============================================================================
 set -uo pipefail
 
@@ -50,6 +55,7 @@ FORCE=no
 ALLOW_UNDERSIZED=no
 HARDEN=yes
 DOCKER_TUNING=yes
+DOCKER_INSTALL=yes
 # CONSOLE_BIND / SHARED_EGRESS may also arrive from the environment (see
 # --non-interactive); a flag wins over the environment.
 CONSOLE_BIND="${CONSOLE_BIND:-}"
@@ -63,6 +69,7 @@ while [[ $# -gt 0 ]]; do
     --allow-undersized) ALLOW_UNDERSIZED=yes ;;
     --no-harden) HARDEN=no ;;
     --no-docker-tuning) DOCKER_TUNING=no ;;
+    --no-docker-install) DOCKER_INSTALL=no ;;
     --console-bind)  need_arg "$1" "${2:-}"; CONSOLE_BIND="$2";  shift ;;
     --shared-egress) need_arg "$1" "${2:-}"; SHARED_EGRESS="$2"; shift ;;
     # The header block, from its second line to the closing rule. A fixed line
@@ -101,7 +108,7 @@ fail() { printf '  %s✗%s %s\n' "$RED" "$R" "$*"; log "FAIL $*"; }
 CHANGED=no
 cleanup_hint() {
   if [[ "$CHANGED" == "yes" ]]; then
-    printf '  %sThis host HAS been modified — images loaded, %s written, containers possibly started.%s\n' \
+    printf '  %sThis host HAS been modified — Docker possibly installed, images loaded, %s written, containers possibly started.%s\n' \
       "$YEL" "$STATE_DIR" "$R" >&2
     printf '  %sInspect:  docker compose -p sentinel ps%s\n' "$DIM" "$R" >&2
     printf '  %sClean up: sudo ./uninstall.sh%s\n' "$DIM" "$R" >&2
@@ -423,17 +430,146 @@ log "SIZING tier=$TIER ch=$CH_MEM log_mb=$LOG_MB log_keep=$LOG_KEEP spool=$SPOOL
 
 # ── Step 4 — Docker, ports, clock, connectivity ──────────────────────────────
 step "Step 4 of 11 —prerequisites"
-command -v docker >/dev/null 2>&1 \
-  || die "Docker is not installed.
 
+# Ports and clock first — they need nothing installed, and a host that fails
+# them should fail before Docker is touched.
+port_busy=0
+for p in "${REQUIRED_PORTS[@]}"; do
+  if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}\$"; then
+    fail "port $p is already in use"; port_busy=1
+  fi
+done
+if [[ $port_busy -eq 1 ]]; then
+  ss -ltnp 2>/dev/null | grep -E "[:.](80|443|9443)\s" >>"$LOG" 2>&1 || true
+  die "ports ${REQUIRED_PORTS[*]} must be free — the WAF binds them.
+    Something else (often nginx or apache) is listening. Stop it and re-run.
+    Details written to $LOG"
+fi
+ok "ports free: ${REQUIRED_PORTS[*]}"
+
+if timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -q yes; then
+  ok "clock synchronised"
+else
+  warn "clock is NOT NTP-synchronised — certificate validation and audit"
+  warn "timestamps depend on it. Fix with: timedatectl set-ntp true"
+fi
+
+# ── Docker ───────────────────────────────────────────────────────────────────
+# Docker is the one prerequisite this product cannot run without, and the first
+# real install stalled on exactly it: the host had none, and the documented
+# `curl get.docker.com | sh` died on a stale cdrom apt source before it began.
+# The installer now provisions Docker itself, in this order of preference:
+#
+#   1. the packages shipped in the offline bundle (bundle/docker/<codename>/) —
+#      no network at all, and the exact version this release was tested with;
+#   2. Ubuntu's own repositories (docker.io + docker-compose-v2) — only the
+#      distro mirrors an enterprise VM already reaches; no third-party apt repo
+#      is added and no remote script is piped into a shell;
+#   3. neither possible → stop with the manual instruction.
+#
+# --dry-run installs nothing and reports which of these a real run would use.
+# --no-docker-install turns the whole thing off for sites that manage Docker
+# themselves (configuration management, a golden image).
+OS_CODENAME="$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_CODENAME:-}")"
+DOCKER_DEBS="$HERE/bundle/docker/${OS_CODENAME:-unknown}"
+DOCKER_MISSING_DRYRUN=no
+docker_ready() {
+  command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1 && docker info >/dev/null 2>&1
+}
+# A leftover install-medium source ("deb file:///cdrom …", "deb cdrom:…") makes
+# EVERY apt operation fail with "no Release file" — on a VM the medium is gone
+# for good. This is the ONE edit to the host's apt configuration the installer
+# makes: only when it is about to run apt, with a backup, and announced.
+disable_cdrom_sources() {
+  local f hit=0
+  for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+    [[ -f "$f" ]] || continue
+    if grep -qE '^[[:space:]]*deb[[:space:]]+(\[[^]]*\][[:space:]]+)?(cdrom:|file:///cdrom)' "$f"; then
+      cp -n "$f" "$f.bak-sentinel" 2>/dev/null || true
+      sed -i -E 's|^([[:space:]]*deb[[:space:]]+(\[[^]]*\][[:space:]]+)?(cdrom:\|file:///cdrom))|# disabled by the Swaraj Kavach installer — install medium is not present: \1|' "$f"
+      hit=1; log "APT disabled cdrom source in $f (backup $f.bak-sentinel)"
+    fi
+  done
+  [[ $hit -eq 1 ]] && warn "disabled a cdrom / install-medium apt source so apt can run (backup: *.bak-sentinel)"
+  return 0
+}
+install_docker_from_bundle() {
+  say "  ${DIM}installing Docker Engine from the packages in this bundle — no network needed${R}"
+  ( cd "$DOCKER_DEBS" && sha256sum -c --quiet SHA256SUMS ) >>"$LOG" 2>&1 \
+    || { fail "the shipped Docker packages do not match their checksums — refusing to install them"; return 1; }
+  if DEBIAN_FRONTEND=noninteractive dpkg -i "$DOCKER_DEBS"/*.deb >>"$LOG" 2>&1; then return 0; fi
+  # A very minimal image can lack a shared library the packages need. One apt
+  # pass resolves it from the distro mirrors if those are reachable; if not,
+  # dpkg has named the missing dependency in the log.
+  warn "dpkg reported unmet dependencies — trying to resolve them from Ubuntu's repositories"
+  disable_cdrom_sources
+  apt-get -qq update >>"$LOG" 2>&1 || true
+  DEBIAN_FRONTEND=noninteractive apt-get -qq -y -f install >>"$LOG" 2>&1
+}
+install_docker_from_distro() {
+  say "  ${DIM}installing Docker from Ubuntu's own repositories (docker.io + docker-compose-v2)${R}"
+  disable_cdrom_sources
+  apt-get -qq update >>"$LOG" 2>&1 || { fail "apt-get update failed — see $LOG"; return 1; }
+  DEBIAN_FRONTEND=noninteractive apt-get -qq -y install docker.io docker-compose-v2 >>"$LOG" 2>&1
+}
+ensure_docker() {
+  if docker_ready; then
+    ok "Docker $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo present) with Compose v2"
+    return 0
+  fi
+  # Installed but not usable: name the part, never reinstall over it.
+  if command -v docker >/dev/null 2>&1; then
+    docker info >/dev/null 2>&1 \
+      || die "Docker is installed but its daemon is not running — systemctl enable --now docker, then re-run"
+    docker compose version >/dev/null 2>&1 \
+      || die "Docker is installed but the Compose v2 plugin is missing.
+      Ubuntu repositories:  apt-get install docker-compose-v2
+      Docker's repository:  apt-get install docker-compose-plugin"
+  fi
+  local source=distro
+  [[ -d "$DOCKER_DEBS" && -s "$DOCKER_DEBS/SHA256SUMS" ]] && source=bundle
+  if [[ "$DOCKER_INSTALL" != "yes" ]]; then
+    die "Docker is not installed, and --no-docker-install was given.
     Install Docker Engine with the Compose v2 plugin, then re-run:
-      curl -fsSL https://get.docker.com | sh
+      apt-get install docker.io docker-compose-v2     (Ubuntu repositories)
       systemctl enable --now docker"
-docker compose version >/dev/null 2>&1 \
-  || die "the Docker Compose v2 plugin is missing (\`docker compose version\` failed)"
-docker info >/dev/null 2>&1 || die "the Docker daemon is not running — systemctl start docker"
-ok "Docker $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo present)"
+  fi
+  if [[ "$DRY_RUN" == "yes" ]]; then
+    DOCKER_MISSING_DRYRUN=yes
+    if [[ "$source" == bundle ]]; then
+      warn "Docker is not installed — a real run would install it from this bundle ($(awk '$1 == "docker-ce" {print $2}' "$DOCKER_DEBS/VERSIONS" 2>/dev/null || echo 'shipped packages')), no network needed"
+    else
+      warn "Docker is not installed — a real run would install docker.io + docker-compose-v2 from Ubuntu's repositories"
+    fi
+    warn "checks that need Docker (data-root disk, storage type, registry reachability) are skipped in this dry run"
+    return 0
+  fi
+  # First mutation of the host in this run.
+  CHANGED=yes
+  log "DOCKER installing from $source"
+  if [[ "$source" == bundle ]]; then
+    install_docker_from_bundle \
+      || die "could not install Docker from the bundled packages — see $LOG.
+    docker-ce needs iptables and nftables on the host (both are standard on Ubuntu
+    Server; minimal images may lack nftables). If dpkg named one of them:
+      apt-get install iptables nftables        then re-run this installer
+    Manual fallback:  apt-get install docker.io docker-compose-v2 && systemctl enable --now docker"
+  else
+    install_docker_from_distro \
+      || die "could not install Docker from Ubuntu's repositories — see $LOG.
+    This host may have no route to the distro mirrors. Ask ESDS for the offline
+    bundle, which ships Docker's packages, or install Docker Engine by hand and re-run."
+  fi
+  systemctl enable --now docker >>"$LOG" 2>&1 || true
+  local tries=0
+  until docker info >/dev/null 2>&1 || (( tries >= 20 )); do sleep 2; tries=$((tries + 1)); done
+  docker_ready \
+    || die "Docker was installed but is not usable (daemon or Compose plugin) — see $LOG and: journalctl -u docker"
+  ok "Docker $(docker version --format '{{.Server.Version}}' 2>/dev/null) installed from $source and running"
+}
+ensure_docker
 
+if [[ "$DOCKER_MISSING_DRYRUN" != "yes" ]]; then
 # Images and EVERY volume — the configuration database, the event store, the
 # request logs — live under Docker's data-root, which is /var/lib/docker by
 # default and not /opt. Step 3 measured /opt because that is where the install
@@ -481,27 +617,6 @@ if systemctl is-enabled docker >/dev/null 2>&1; then
   DOCKER_BOOT=yes; ok "Docker starts at boot"
 else
   warn "Docker is NOT enabled at boot — after a reboot the WAF would stay down (fixed in Step 9)"
-fi
-
-port_busy=0
-for p in "${REQUIRED_PORTS[@]}"; do
-  if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}\$"; then
-    fail "port $p is already in use"; port_busy=1
-  fi
-done
-if [[ $port_busy -eq 1 ]]; then
-  ss -ltnp 2>/dev/null | grep -E "[:.](80|443|9443)\s" >>"$LOG" 2>&1 || true
-  die "ports ${REQUIRED_PORTS[*]} must be free — the WAF binds them.
-    Something else (often nginx or apache) is listening. Stop it and re-run.
-    Details written to $LOG"
-fi
-ok "ports free: ${REQUIRED_PORTS[*]}"
-
-if timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -q yes; then
-  ok "clock synchronised"
-else
-  warn "clock is NOT NTP-synchronised — certificate validation and audit"
-  warn "timestamps depend on it. Fix with: timedatectl set-ntp true"
 fi
 
 # This bundle ships only the four ESDSWAF images; Postgres, Redis, ClickHouse,
@@ -566,7 +681,17 @@ $(manifest_list pulled_from_registry)
   fi
 fi
 
-[[ "$DRY_RUN" == "yes" ]] && { say ""; ok "--dry-run: all checks passed, nothing changed"; exit 0; }
+fi # DOCKER_MISSING_DRYRUN — the Docker-dependent checks above are skipped only in a dry run on a host without Docker
+
+if [[ "$DRY_RUN" == "yes" ]]; then
+  say ""
+  if [[ "$DOCKER_MISSING_DRYRUN" == "yes" ]]; then
+    ok "--dry-run: every check that could run passed; nothing changed. A real run installs Docker first."
+  else
+    ok "--dry-run: all checks passed, nothing changed"
+  fi
+  exit 0
+fi
 
 # ── Step 5 — configuration questions (the only ones) ─────────────────────────
 step "Step 5 of 11 —configuration"

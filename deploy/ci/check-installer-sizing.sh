@@ -201,6 +201,34 @@ for s in first-site.sh add-operator.sh; do
   fi
 done
 
+sect "Docker is provisioned by the installer, never in a dry run, never via a piped remote script"
+declare -f ensure_docker >/dev/null 2>&1 || true
+ED="$(awk '/^ensure_docker\(\) \{/{on=1} on{print} on && /^\}/{exit}' "$INSTALLER")"
+[[ -n "$ED" ]] && pass "ensure_docker() defined" || fail "ensure_docker() missing — Docker is no longer installed by the installer"
+grep -qE '^ensure_docker$' "$INSTALLER" && pass "ensure_docker is called" || fail "ensure_docker() is defined but never called"
+# The dry-run branch must come BEFORE the first mutating call inside ensure_docker.
+dry_at="$(grep -n 'DRY_RUN' <<<"$ED" | head -1 | cut -d: -f1)"
+mut_at="$(grep -nE 'install_docker_from_(bundle|distro)' <<<"$ED" | grep -v 'if\|source ==' | head -1 | cut -d: -f1)"
+mut_at="${mut_at:-$(grep -nE 'install_docker_from_(bundle|distro) ' <<<"$ED" | head -1 | cut -d: -f1)}"
+if [[ -n "$dry_at" && -n "$mut_at" && "$dry_at" -lt "$mut_at" ]]; then
+  pass "ensure_docker checks DRY_RUN (line $dry_at of the function) before it installs anything (line $mut_at)"
+else
+  fail "ensure_docker would install Docker during --dry-run (DRY_RUN check at '${dry_at:-none}', install at '${mut_at:-none}')"
+fi
+grep -q -- '--no-docker-install) DOCKER_INSTALL=no' "$INSTALLER" && pass "--no-docker-install is parsed" || fail "--no-docker-install flag missing"
+grep -qE '"\$DOCKER_INSTALL" != "yes"' <<<"$ED" && pass "ensure_docker honours --no-docker-install" || fail "ensure_docker ignores DOCKER_INSTALL"
+# The documented manual path used to be `curl get.docker.com | sh`; the installer
+# must not do that itself — a remote script piped into a root shell is not a
+# provisioning method for a security appliance.
+# Comments stripped first: the installer's own prose EXPLAINS why it no longer
+# does this, and a guard that matches its own documentation is the class of
+# false failure this repo has now hit five times.
+if grep -vE '^\s*#' "$INSTALLER" | grep -qE 'get\.docker\.com.*\|\s*sh'; then fail "installer pipes get.docker.com into a shell"
+else pass "no remote script piped into a shell (comments excluded)"; fi
+grep -q 'bundle/docker' "$INSTALLER" && pass "installer prefers the packages shipped in bundle/docker" || fail "installer never looks in bundle/docker"
+grep -qE 'sha256sum -c --quiet SHA256SUMS' <<<"$(awk '/^install_docker_from_bundle\(\) \{/{on=1} on{print} on && /^\}/{exit}' "$INSTALLER")" \
+  && pass "bundled packages are checksum-verified before dpkg -i" || fail "bundled Docker packages are installed without checksum verification"
+
 sect "operator-facing text carries the product name"
 if grep -q 'Next-Gen ESDSWAF' "$INSTALLER"; then fail "installer still says 'Next-Gen ESDSWAF' (product is Swaraj Kavach; archive names may keep ESDSWAF)"
 else pass "no 'Next-Gen ESDSWAF' in the installer"; fi

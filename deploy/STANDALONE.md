@@ -56,12 +56,9 @@ crash-loops indefinitely with less than about 2 GB available to it. An 8 GB VM d
 not produce a slow WAF; it produces a restart loop. The installer refuses rather
 than leaving you to diagnose that.
 
-If Docker is missing:
-
-```bash
-curl -fsSL https://get.docker.com | sh
-systemctl enable --now docker
-```
+If Docker is missing, the installer installs it (Step 4) — from the packages in
+the offline bundle, otherwise from Ubuntu's repositories. Pass
+`--no-docker-install` to make it stop instead.
 
 ---
 

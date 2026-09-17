@@ -306,6 +306,21 @@ else
 fi
 
 # ── 4. manifest ──────────────────────────────────────────────────────────────
+# ── 3b. Docker Engine packages (offline bundle only) ─────────────────────────
+# The offline archive claimed "no network needed" while the one thing every step
+# depends on — Docker — still had to come from the internet. The first real
+# install stalled there. With the .debs for both supported Ubuntu releases in
+# bundle/docker/<codename>/, install.sh provisions Docker with dpkg and the
+# claim is true. ~170 MB for two releases. BUNDLE_DOCKER=0 leaves them out.
+BUNDLE_DOCKER="${BUNDLE_DOCKER:-1}"
+DOCKER_CODENAMES=(jammy noble)
+if [[ "$STAGE_ONLY" != "1" && "$BUNDLE_THIRD_PARTY" == "1" && "$BUNDLE_DOCKER" != "0" ]]; then
+  step "Step 3b of 6 — Docker Engine packages for ${DOCKER_CODENAMES[*]}"
+  ./deploy/package/fetch-docker-debs.sh "$STAGE/bundle/docker" "${DOCKER_CODENAMES[@]}" \
+    || die "could not fetch Docker's packages — build with BUNDLE_DOCKER=0 to ship without them (the installer then needs Ubuntu's repositories to install Docker)"
+  ok "Docker packages staged: $(du -sh "$STAGE/bundle/docker" | cut -f1)"
+fi
+
 step "Step 4 of 6 — manifest"
 {
   printf '{\n'
@@ -347,6 +362,20 @@ step "Step 4 of 6 — manifest"
   done
   printf '\n  ],\n'
   printf '  "requires_internet": %s,\n' "$([[ "$BUNDLE_THIRD_PARTY" == "1" ]] && echo false || echo true)"
+  # Docker Engine version shipped per Ubuntu release (empty object = installer
+  # falls back to the distro repositories). Nested, so it never collides with the
+  # top-level "version" the installer's line-oriented parser reads.
+  printf '  "docker_debs": {'
+  if [[ -d "$STAGE/bundle/docker" ]]; then
+    dd_first=1
+    for cn in "$STAGE"/bundle/docker/*/; do
+      [[ -f "$cn/VERSIONS" ]] || continue
+      [[ $dd_first -eq 1 ]] && dd_first=0 || printf ','
+      printf '\n    "%s": "%s"' "$(basename "$cn")" "$(awk '$1 == "docker-ce" {print $2}' "$cn/VERSIONS")"
+    done
+    [[ $dd_first -eq 0 ]] && printf '\n  '
+  fi
+  printf '},\n'
   printf '  "supported_os": ["Ubuntu 22.04", "Ubuntu 24.04"],\n'
   printf '  "minimum_hardware": { "vcpu": 4, "ram_gb": 16, "disk_gb": 100 }\n'
   printf '}\n'
@@ -423,6 +452,9 @@ cat <<SUMMARY
                   *:1)        echo "all $(( ${#OWN_IMAGES[@]} + ${#THIRD_PARTY[@]} )) inside the archive — air-gapped" ;;
                   *)          echo "${#OWN_IMAGES[@]} inside; ${#THIRD_PARTY[@]} pulled from Docker Hub (needs internet)" ;;
                 esac)
+    docker    $(if [[ -d "$STAGE/bundle/docker" ]]; then
+                  echo "Engine packages for $(ls "$STAGE/bundle/docker" | tr '\n' ' ')— the installer provisions Docker offline"
+                else echo "not shipped — the installer uses Ubuntu's repositories if Docker is absent"; fi)
 
   Send the customer BOTH files. They verify before extracting:
 
