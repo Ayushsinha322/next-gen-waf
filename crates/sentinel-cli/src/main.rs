@@ -791,6 +791,7 @@ fn cmd_site_add(
             allowed_methods: Default::default(),
             security_headers: Default::default(),
             block_page: Default::default(),
+            crs_policy: Default::default(),
         },
         plugins: vec![],
         tls: Default::default(),
