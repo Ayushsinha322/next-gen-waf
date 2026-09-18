@@ -433,10 +433,27 @@ step "Step 4 of 11 —prerequisites"
 
 # Ports and clock first — they need nothing installed, and a host that fails
 # them should fail before Docker is touched.
+# Ports held by OUR OWN running stack are not a conflict. On a --force re-run over
+# an existing installation the containers are up and hold 80/443/9443; Step 10's
+# `compose up` re-uses or recreates them in place. Treating that as "something
+# else is listening" sent the first real operator to `docker rm -f` every
+# container by hand to get past this gate — an outage, and a habit that would
+# be catastrophic on a production node. Only a listener that is NOT one of our
+# compose project's containers is a real conflict.
+ours_hold_port() { # ours_hold_port PORT — 0 if a sentinel compose container publishes it
+  command -v docker >/dev/null 2>&1 || return 1
+  docker ps --filter label=com.docker.compose.project=sentinel --format '{{.Ports}}' 2>/dev/null \
+    | grep -qE "[:.]${1}->"
+}
 port_busy=0
+held_by_us=()
 for p in "${REQUIRED_PORTS[@]}"; do
   if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}\$"; then
-    fail "port $p is already in use"; port_busy=1
+    if [[ "$FORCE" == "yes" ]] && ours_hold_port "$p"; then
+      held_by_us+=("$p")
+    else
+      fail "port $p is already in use"; port_busy=1
+    fi
   fi
 done
 if [[ $port_busy -eq 1 ]]; then
@@ -445,7 +462,11 @@ if [[ $port_busy -eq 1 ]]; then
     Something else (often nginx or apache) is listening. Stop it and re-run.
     Details written to $LOG"
 fi
-ok "ports free: ${REQUIRED_PORTS[*]}"
+if (( ${#held_by_us[@]} > 0 )); then
+  ok "ports ${held_by_us[*]} are held by the existing Swaraj Kavach stack — kept running, re-used in Step 10"
+else
+  ok "ports free: ${REQUIRED_PORTS[*]}"
+fi
 
 if timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -q yes; then
   ok "clock synchronised"

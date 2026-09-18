@@ -229,6 +229,16 @@ grep -q 'bundle/docker' "$INSTALLER" && pass "installer prefers the packages shi
 grep -qE 'sha256sum -c --quiet SHA256SUMS' <<<"$(awk '/^install_docker_from_bundle\(\) \{/{on=1} on{print} on && /^\}/{exit}' "$INSTALLER")" \
   && pass "bundled packages are checksum-verified before dpkg -i" || fail "bundled Docker packages are installed without checksum verification"
 
+sect "a --force re-run does not fail on ports held by our own containers"
+# The first real operator hit "port 80 is already in use" on a --force re-run —
+# the listener was the WAF itself — and worked around it with `docker rm -f` on
+# every container. The gate must tell our own compose project apart from nginx.
+if grep -q 'label=com.docker.compose.project=sentinel' "$INSTALLER" && grep -qE '"\$FORCE" == "yes" \]\] && ours_hold_port' "$INSTALLER"; then
+  pass "port check exempts the sentinel compose project's own containers under --force"
+else
+  fail "port check treats the existing WAF stack as a conflict — a --force re-run cannot pass Step 4 without removing containers by hand"
+fi
+
 sect "operator-facing text carries the product name"
 if grep -q 'Next-Gen ESDSWAF' "$INSTALLER"; then fail "installer still says 'Next-Gen ESDSWAF' (product is Swaraj Kavach; archive names may keep ESDSWAF)"
 else pass "no 'Next-Gen ESDSWAF' in the installer"; fi
