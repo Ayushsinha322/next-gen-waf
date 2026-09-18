@@ -32,6 +32,7 @@ Reference, not reading. Open the one that matches your question:
 
 | Deploying | Read |
 |---|---|
+| **One VM from the offline package** — field-tested short form, incl. split parts and re-installing | [`docs/manual/OFFLINE-INSTALL.md`](docs/manual/OFFLINE-INSTALL.md) |
 | **One VM** (evaluation, pilot, most deployments) | [`docs/STANDALONE.md`](docs/STANDALONE.md) |
 | **Two VMs**, virtual IP, automatic traffic failover | [`docs/ACTIVE-PASSIVE.md`](docs/ACTIVE-PASSIVE.md) |
 

@@ -10,6 +10,12 @@ and pasted, and it was written by following it on a real machine.
 
 Do not read anything else on this page until you have finished it.
 
+**Installing from the offline package, or re-installing over a previous attempt?**
+Use **[OFFLINE-INSTALL.md](OFFLINE-INSTALL.md)** — the field-tested short form,
+written by the operator who did the first unassisted install. It is explicit about
+which machine each command runs on, how to handle a split package, and what
+never to delete.
+
 ---
 
 ## Afterwards — running the thing

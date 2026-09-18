@@ -179,7 +179,7 @@ done
 # these are the ones referenced from install.sh's closing message, from each
 # other, and from the walkthrough — a missing one is a dead link in a document
 # someone is reading at 2am, not a cosmetic gap.
-for d in README.md USER-MANUAL.md NOC-RUNBOOK.md ADMIN-GUIDE.md SITE-ONBOARDING.md TROUBLESHOOTING.md ROLLBACK.md; do
+for d in README.md USER-MANUAL.md NOC-RUNBOOK.md ADMIN-GUIDE.md SITE-ONBOARDING.md TROUBLESHOOTING.md ROLLBACK.md OFFLINE-INSTALL.md; do
   [[ -f "$STAGE/docs/manual/$d" ]] && pass "docs/manual/$d" || fail "docs/manual/$d missing"
 done
 # The one document a first-time operator reads end to end.

@@ -1306,7 +1306,7 @@ $CONSOLE_HOW
        would have blocked without blocking it.
     3. After a full business cycle, measure and then enable blocking:
          $INSTALL_DIR/scripts/fpr-report.sh 168
-       See section 7 of the deployment guide.
+       For a real application follow $INSTALL_DIR/docs/manual/SITE-ONBOARDING.md.
     4. Configure backups: $INSTALL_DIR/scripts/backup/backup.sh
     5. Fill in the SMTP block in $ENV_FILE so password recovery works.
 
