@@ -79,6 +79,30 @@ need it in §4.
 
 ---
 
+## 1b. The one-command way (recommended for a real application)
+
+With the answers above and the certificate files on the WAF host, §2–§5 below
+collapse into one command run **on the WAF host**:
+
+```bash
+sudo ./onboard-site.sh --domain app.example.com \
+     --origin 10.20.30.40:443 --origin-tls \
+     --cert /root/app.fullchain.pem --key /root/app.key.pem \
+     --health /healthz --websocket --body-limit 52428800
+```
+
+It checks the key matches the certificate and the certificate names the domain,
+installs the certificate, creates the site in **learning** mode, waits for the
+rule engine, and then proves the path from the WAF host itself — the site
+answers for the hostname, presents *your* certificate, reaches the origin, and
+records a detection — all **before DNS moves**. It ends with the pre-cutover
+test for your laptop and the cutover steps in order. `--dry-run` shows exactly
+what it would send. If the admin account has MFA on, give it an API key via
+`SENTINEL_API_KEY`. The console steps below remain the reference for what each
+setting means, and for changing a site later.
+
+---
+
 ## 2. Open the console
 
 ```bash
