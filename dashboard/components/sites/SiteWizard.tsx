@@ -22,7 +22,7 @@ import {
   SiteForm, emptyForm, applyPreset, formToPayload, PRESETS, CRS_CATEGORIES,
   CRS_REQUEST_CATEGORIES, CRS_RESPONSE_CATEGORIES, ALL_CRS_RESPONSE_KEYS, type CrsCategory,
   ALL_CRS_KEYS, COUNTRIES, PresetKey, UpstreamServer, normalizeDomain,
-  HTTP_METHODS, ACME_PROVIDERS, CustomHeader, certCoversHost,
+  HTTP_METHODS, ACME_PROVIDERS, CustomHeader, certCoversHost, servingCertFor,
   JWT_ALGORITHMS, FUSION_ENGINES, IpFeed,
 } from "@/lib/siteConfig";
 
@@ -509,6 +509,50 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
 
                   {/* TLS mode */}
                   <GroupLabel>TLS Certificate</GroupLabel>
+
+                  {/* WHAT IS SERVED TODAY — not what this form has selected.
+                      The data plane resolves certificates by SNI out of the
+                      shared store, so a site is often already served a valid
+                      certificate while the selector below is empty. That empty
+                      selector reads as "no certificate": on the first customer
+                      deployment it sent the operator hunting for a fault in a
+                      certificate that was working. State the truth first. */}
+                  {form.front_https && form.domains.length > 0 && (() => {
+                    const rows = form.domains.map(d => {
+                      const cert = servingCertFor(repoCerts, d);
+                      return { host: d, cert, covered: cert ? certCoversHost(certNames(cert), d) : false };
+                    });
+                    const served = rows.filter(r => r.cert);
+                    if (served.length === 0) return null;
+                    const allGood = rows.every(r => r.cert && r.covered);
+                    return (
+                      <InfoBox tone={allGood ? "green" : "amber"}>
+                        <strong style={{ color: "var(--text2)" }}>Currently served</strong> — the WAF matches by hostname (SNI), so this is live whether or not a certificate is selected below:
+                        <div style={{ marginTop: 6, display: "grid", gap: 3 }}>
+                          {rows.map(r => {
+                            const days = r.cert && r.cert.expires_at > 0
+                              ? Math.round((r.cert.expires_at * 1000 - Date.now()) / 86400000) : null;
+                            return (
+                              <div key={r.host} style={{ fontFamily: "var(--font-mono)", fontSize: 13 }}>
+                                {r.host}{" → "}
+                                {r.cert ? (<>
+                                  <strong style={{ color: r.covered ? "var(--green)" : "var(--amber,#ffb020)" }}>
+                                    {r.cert.name ? `${r.cert.name} (${r.cert.domain})` : r.cert.domain}
+                                  </strong>
+                                  {r.cert.source ? ` · ${r.cert.source}` : ""}
+                                  {days !== null && ` · expires in ${days} day${days === 1 ? "" : "s"}`}
+                                  {!r.covered && " · ⚠ does not present this name — browsers will warn"}
+                                </>) : (
+                                  <span style={{ color: "var(--amber,#ffb020)" }}>no stored certificate — a self-signed one is generated, browsers will warn</span>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </InfoBox>
+                    );
+                  })()}
+
                   {!form.front_https && <InfoBox tone="amber">HTTPS is off above — enable &ldquo;Serve HTTPS&rdquo; to configure certificates.</InfoBox>}
                   {form.front_https && (
                     <div style={{ display: "grid", gridTemplateColumns: "repeat(2,1fr)", gap: 10 }}>

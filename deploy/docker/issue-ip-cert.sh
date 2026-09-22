@@ -52,7 +52,7 @@ cd "$PKI_DIR"
 
 # ---- 1. Root CA (create once; reused on re-run) ------------------------------
 if [[ ! -f root.key || ! -f root.crt ]]; then
-  echo "[*] Generating Sentinel Internal Root CA (ECDSA P-256, ${CA_DAYS}d)..."
+  echo "[*] Generating Swaraj Kavach Internal Root CA (ECDSA P-256, ${CA_DAYS}d)..."
   openssl ecparam -name prime256v1 -genkey -noout -out root.key
   openssl req -x509 -new -nodes -key root.key -sha256 -days "$CA_DAYS" \
     -subj "/C=${COUNTRY}/O=${ORG}/OU=${OU}/CN=Swaraj Kavach Internal Root CA" \
@@ -94,7 +94,7 @@ FP=$(openssl x509 -in leaf.crt -noout -fingerprint -sha256 | sed 's/.*=//; s/://
 cat > meta.json <<JSON
 {
   "domain": "default",
-  "name": "Sentinel Internal CA - default cert (${LEAF_CN})",
+  "name": "Swaraj Kavach Internal CA - default cert (${LEAF_CN})",
   "san": [${SAN_JSON}],
   "issued_at": ${ISSUED},
   "expires_at": ${EXPIRES},

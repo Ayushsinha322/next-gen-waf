@@ -99,6 +99,48 @@ export function certCoversHost(certNames: string[], host: string): boolean {
   });
 }
 
+/**
+ * The certificate-store keys the data plane tries for `host`, in order.
+ *
+ * Mirrors `resolve_live` in crates/sentinel-proxy/src/tls/cert_store.rs: the
+ * exact key first, then the same name with its first label replaced by `*`.
+ *
+ * ⚠ The resolver matches on the key a certificate was STORED under (its
+ * `domain`), and never reads the certificate's SANs. So this must not either —
+ * a lookup that consulted SANs would name a certificate the WAF would never
+ * actually serve, which is worse than showing nothing.
+ */
+export function certStoreKeysFor(host: string): string[] {
+  const h = (host || "").trim().toLowerCase().replace(/\.$/, "");
+  if (!h) return [];
+  const keys = [h];
+  const dot = h.indexOf(".");
+  // `a.example.com` -> `*.example.com`. A bare `example.com` has no parent to
+  // wildcard, and `*.` + "" would match everything, so it is not offered.
+  if (dot > 0 && dot < h.length - 1) keys.push(`*.${h.slice(dot + 1)}`);
+  return keys;
+}
+
+/**
+ * Which stored certificate the data plane would serve for `host` right now, or
+ * null — in which case it generates a self-signed one on demand and browsers
+ * warn.
+ *
+ * This exists because a site can already be served a perfectly good certificate
+ * while the site record names none: an upload through the Certificates page is
+ * bound to the DOMAIN in the shared store, not to the site row, and SNI does
+ * the rest. The site form showed an empty selector for exactly that state,
+ * which reads as "no certificate" and sent an operator looking for a fault that
+ * was not there.
+ */
+export function servingCertFor<T extends { domain: string }>(certs: T[], host: string): T | null {
+  for (const key of certStoreKeysFor(host)) {
+    const hit = certs.find(c => (c.domain || "").trim().toLowerCase().replace(/\.$/, "") === key);
+    if (hit) return hit;
+  }
+  return null;
+}
+
 /** ACME challenge type. http_01 + tls_alpn_01 are enforced by our ACME engine;
  *  dns_01 (for wildcards) is roadmap — carried for round-trip, not yet issued. */
 export type ChallengeType = "http_01" | "tls_alpn_01" | "dns_01";

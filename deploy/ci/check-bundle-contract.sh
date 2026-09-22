@@ -207,10 +207,18 @@ done
 # is a filename, not a product name), and lowercase `sentinel` in paths, service
 # and container names is an identifier, not a display string.
 sect "No previous product name or codename in customer-facing files"
-BRAND_HITS="$(grep -rIl -E 'Next-Gen ESDSWAF|Next-Gen ESDS WAF|Sentinel WAF' "$STAGE" \
+# `Sentinel [A-Z]` rather than the exact phrase `Sentinel WAF`: the narrow
+# pattern let "Sentinel Internal CA" through, and that label reached the
+# Certificates page of the first customer deployment — the codename, on screen,
+# on a page an operator reads. The general form catches every "Sentinel <Thing>"
+# display string in any shipped file type, which matters because the console's
+# branding test walks only .ts/.tsx/.go/.rs and never the shell scripts these
+# strings live in. Lowercase `sentinel` in paths, service and container names is
+# an identifier, not a display name, and is deliberately not matched.
+BRAND_HITS="$(grep -rIl -E 'Next-Gen ESDSWAF|Next-Gen ESDS WAF|Sentinel [A-Z]' "$STAGE" \
   --exclude-dir=licenses --exclude=THIRD-PARTY-NOTICES.md 2>/dev/null | sed "s#^$STAGE/##" | sort)"
 if [[ -z "$BRAND_HITS" ]]; then
-  pass "no 'Next-Gen ESDSWAF' / 'Sentinel WAF' anywhere in the staged tree"
+  pass "no superseded product name or 'Sentinel <Thing>' codename anywhere in the staged tree"
 else
   fail "previous product name or codename in shipped files:"
   printf '%s\n' "$BRAND_HITS" | sed 's/^/        /'
