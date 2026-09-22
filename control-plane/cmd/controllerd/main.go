@@ -410,6 +410,9 @@ func run() error {
 			nm := nodehealth.New(store, eng, log)
 			nm.Start()
 			stops = append(stops, nm.Stop)
+			// Forget nodes and cluster members not heard from for a day: former
+			// container identities, not outages. See node_prune.go.
+			stops = append(stops, startNodePrune(store, cl, log))
 			cm := certmon.New(eng, dataPlaneBaseURL(), os.Getenv("SENTINEL_INTERNAL_SECRET"), log)
 			cm.Start()
 			stops = append(stops, cm.Stop)

@@ -102,6 +102,32 @@ func (s *Store) ListNodes(ctx context.Context) ([]Node, error) {
 
 // UpdateNodeStatus flips a node's stored status (e.g. the health monitor marking
 // a stale node "down"). Node-global (raw pool).
+// PruneNodes deletes nodes not heard from for longer than olderThan and returns
+// how many went. Node-global (raw pool), like ListNodes.
+//
+// A node identifies itself by hostname, and an unpinned container's hostname is
+// its container id — so every recreate used to leave the previous identity
+// behind as a permanent "down" row. compose.prod.yml now pins the hostname, and
+// this is the cleanup for rows that predate that, and for any node genuinely
+// decommissioned without a clean shutdown. Heartbeats are every 10 s; the caller
+// passes a window measured in hours.
+func (s *Store) PruneNodes(ctx context.Context, olderThan time.Duration) (int64, error) {
+	pg, ok := s.pool.(*pgxPool)
+	if !ok {
+		return 0, fmt.Errorf("store: pool is not a *pgxPool")
+	}
+	if olderThan <= 0 {
+		return 0, fmt.Errorf("store: prune window must be positive, got %s", olderThan)
+	}
+	tag, err := pg.pool.Exec(ctx,
+		`DELETE FROM nodes WHERE last_seen < now() - make_interval(secs => $1)`,
+		olderThan.Seconds())
+	if err != nil {
+		return 0, fmt.Errorf("store: prune nodes: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 func (s *Store) UpdateNodeStatus(ctx context.Context, id, status string) error {
 	pg, ok := s.pool.(*pgxPool)
 	if !ok {

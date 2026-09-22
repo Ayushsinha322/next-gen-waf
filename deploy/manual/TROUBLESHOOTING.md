@@ -396,3 +396,38 @@ sudo /opt/sentinel/current/scripts/fpr-report.sh 168
 - [SITE-ONBOARDING.md](SITE-ONBOARDING.md) — the settings referenced above
 - [ROLLBACK.md](ROLLBACK.md) — when the fix is "undo it"
 - [ADMIN-GUIDE.md](ADMIN-GUIDE.md) — monitoring and what to alert on
+
+---
+
+## 14. Cluster page shows a data-plane node as "down" — but everything works
+
+**Symptom.** The Cluster page (or the Overview banner) says a data-plane node is
+down or the fleet is unhealthy, yet the WAF is serving traffic and `docker ps`
+shows every container healthy. Usually noticed after an upgrade, a rollback, or a
+`docker rm -f`/recreate.
+
+**Cause.** A node identifies itself by its hostname. Before this was pinned in
+`compose.prod.yml`, a recreated container got a new identity and its old one was
+left behind as a "down" row — permanently, because nothing removed it. The live
+node was fine the whole time.
+
+**What to check.**
+- The node id shown as down does not match any running container:
+  `docker inspect -f '{{.Config.Hostname}}' sentinel-dataplane-1`
+- Its *last seen* is hours or days ago, not seconds.
+
+**Fix.**
+- Bundles that pin the hostname: nothing — stale rows are dropped from the
+  counts after `SENTINEL_NODE_STALE_HOURS` (default 24) and pruned hourly by the
+  `nodes.prune` job (System → Jobs → run now, if you do not want to wait).
+- Older bundles: remove the row by hand, once —
+  `docker exec sentinel-postgres-1 psql -U sentinel -d sentinel -c "DELETE FROM nodes WHERE id='<old-id>'"`
+  — and upgrade so it cannot recur.
+
+**Do not confuse this with a node that is truly down:** that one was seen
+seconds ago and has stopped; its container is missing or restarting
+(see §10).
+
+**A node shown as *degraded*, not down,** means it is alive but every origin it
+serves is unreachable — see §2 (502 Bad Gateway). That is the WAF being honest
+about the application behind it, not about itself.

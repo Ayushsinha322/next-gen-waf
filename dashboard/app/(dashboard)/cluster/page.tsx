@@ -170,7 +170,7 @@ Fleet-wide health of the WAF data plane and control plane — live topology, fai
               accentCls="kg" accent="var(--green)"
               label="Data plane"
               value={dp ? `${dp.healthy}/${dp.total}` : "—"}
-              sub={dp ? `${dp.healthy} healthy · ${dp.degraded} degraded · ${dp.down} down` : "waiting…"} />
+              sub={dp ? `${dp.healthy} healthy · ${dp.degraded} degraded · ${dp.down} down${dp.stale ? ` · ${dp.stale} stale (not counted)` : ""}` : "waiting…"} />
             <StatFigure
               accentCls={cp?.enabled ? (cp?.write_available ? "kc" : "ka") : "kp"}
               accent={cp?.enabled ? (cp?.write_available ? "var(--cyan)" : "var(--red)") : "var(--text3)"}
@@ -209,8 +209,12 @@ Fleet-wide health of the WAF data plane and control plane — live topology, fai
                 <div style={{ fontSize: 13, fontFamily: MONO, color: "var(--text3)", textAlign: "center", padding: "8px 0" }}>—</div>
               ) : dpNodes.map(n => {
                 const down = n.status === "down";
+                // A stale node is a former container id, not a member of the fleet —
+                // shown dimmed so the operator can see it, never red.
+                const stale = n.status === "stale";
                 return (
-                  <div key={n.id} title={`${n.hostname} · ${n.status} · ${n.version}`} style={{
+                  <div key={n.id} title={`${n.hostname} · ${n.status}${stale ? " (not heard from in over a day)" : ""} · ${n.version}`} style={{
+                    opacity: stale ? 0.45 : 1,
                     display: "flex", alignItems: "center", gap: 8, padding: "7px 11px", borderRadius: 8,
                     background: down ? "color-mix(in srgb, var(--red) 12%, transparent)" : "var(--glass-w)",
                     border: `1px solid ${down ? "color-mix(in srgb, var(--red) 45%, transparent)" : n.status === "degraded" ? "color-mix(in srgb, var(--amber) 40%, transparent)" : "var(--border)"}`,
@@ -375,7 +379,7 @@ Fleet-wide health of the WAF data plane and control plane — live topology, fai
                   const open = openNode === n.id;
                   return (
                     <Fragment key={n.id}>
-                    <tr className={n.status === "down" ? "sev-c" : ""} onClick={() => setOpenNode(open ? null : n.id)} style={{ cursor: "pointer" }}>
+                    <tr className={n.status === "down" ? "sev-c" : ""} onClick={() => setOpenNode(open ? null : n.id)} style={{ cursor: "pointer", opacity: n.status === "stale" ? 0.5 : 1 }}>
                       <td className="td3" style={{ width: 18 }}>{open ? "▾" : "▸"}</td>
                       <td className="td2">
                         <div style={{ display: "flex", flexDirection: "column" }}>

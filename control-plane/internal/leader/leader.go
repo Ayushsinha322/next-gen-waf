@@ -389,6 +389,49 @@ func (e *Elector) Members(ctx context.Context) ([]Member, error) {
 	return out, rows.Err()
 }
 
+// PruneMembers removes membership rows not heard from for longer than olderThan,
+// never this node's own. Returns how many were removed.
+//
+// forgetMember covers the clean-shutdown case; this covers every other way a
+// node stops existing — `docker rm -f`, a recreate that minted a new hostname, a
+// VM that simply went away. Without it such a row stays in the topology view as
+// "unreachable" for ever. Membership is observability, not the authority on
+// leadership (that is the advisory lock), so removing a dead row is safe.
+func (e *Elector) PruneMembers(ctx context.Context, olderThan time.Duration) (int64, error) {
+	if e == nil {
+		return 0, nil
+	}
+	if olderThan <= 0 {
+		return 0, errors.New("leader: prune window must be positive")
+	}
+	// Count first: the pool's Exec does not expose the affected-row count.
+	var n int64
+	rows, err := e.pool.QueryGlobal(ctx, `
+		SELECT count(*) FROM cluster_members
+		 WHERE node_id <> $1 AND last_seen < now() - make_interval(secs => $2)`,
+		e.nodeID, olderThan.Seconds())
+	if err != nil {
+		return 0, err
+	}
+	if rows.Next() {
+		if err := rows.Scan(&n); err != nil {
+			rows.Close()
+			return 0, err
+		}
+	}
+	rows.Close()
+	if n == 0 {
+		return 0, nil
+	}
+	if err := e.pool.Exec(ctx, `
+		DELETE FROM cluster_members
+		 WHERE node_id <> $1 AND last_seen < now() - make_interval(secs => $2)`,
+		e.nodeID, olderThan.Seconds()); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
 // forgetMember removes this node's row on clean shutdown so the topology view does
 // not show a phantom node until its heartbeat goes stale.
 func (e *Elector) forgetMember(ctx context.Context) {

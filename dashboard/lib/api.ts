@@ -859,7 +859,7 @@ export interface DataPlaneNode {
   hostname:         string;
   role:             string;
   version:          string;
-  status:           "healthy" | "degraded" | "down";
+  status:           "healthy" | "degraded" | "down" | "stale";
   last_seen:        number; // unix seconds
   seconds_since_seen: number;
   uptime_secs:      number;
@@ -901,10 +901,13 @@ export interface ClusterHealth {
   overall:           "healthy" | "degraded" | "critical";
   protection_active: boolean;
   data_plane: {
+    /** Live nodes: healthy + degraded + down. Stale rows are listed but not counted. */
     total:            number;
     healthy:          number;
     degraded:         number;
     down:             number;
+    /** Former identities not heard from for over the stale window (default 24 h) — shown dimmed, never counted. */
+    stale:            number;
     resilience_budget: number;
     nodes:            DataPlaneNode[];
   };

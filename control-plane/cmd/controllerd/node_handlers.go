@@ -112,26 +112,29 @@ func handleClusterHealth(c *gin.Context, enf *rbac.Enforcer, store *db.Store, cl
 	}
 
 	downAfter := nodeDownAfter()
+	staleAfter := nodeStaleAfter()
 
 	// ── Data plane ──────────────────────────────────────────────────────────
 	dpNodes := []gin.H{}
-	dpHealthy, dpDegraded, dpDown := 0, 0, 0
+	dpHealthy, dpDegraded, dpDown, dpStale := 0, 0, 0, 0
 	if store != nil {
 		nodes, err := store.ListNodes(c.Request.Context())
 		if err == nil {
 			for _, n := range nodes {
-				secondsSince := int(time.Since(n.LastSeen).Seconds())
-				status := n.Status
-				if time.Since(n.LastSeen) > downAfter {
-					status = "down"
-				}
+				sinceSeen := time.Since(n.LastSeen)
+				secondsSince := int(sinceSeen.Seconds())
+				status := classifyNode(n.Status, sinceSeen, downAfter, staleAfter)
 				switch status {
 				case "healthy":
 					dpHealthy++
 				case "degraded":
 					dpDegraded++
+				case "stale":
+					// Silent for longer than the stale window: a former container
+					// identity, not an outage. Listed so the page can say "last seen
+					// 4 days ago"; never counted as down.
+					dpStale++
 				default:
-					status = "down"
 					dpDown++
 				}
 				var md nodeMetadata
@@ -173,12 +176,16 @@ func handleClusterHealth(c *gin.Context, enf *rbac.Enforcer, store *db.Store, cl
 			currentCfgVersion = v
 		}
 	}
-	dpTotal := len(dpNodes)
+	// total = nodes that exist. Stale rows are listed for the operator's benefit
+	// but are not part of the fleet, so they are excluded from total and from
+	// every verdict below.
+	dpTotal := dpHealthy + dpDegraded + dpDown
 	dataPlane := gin.H{
 		"total":             dpTotal,
 		"healthy":           dpHealthy,
 		"degraded":          dpDegraded,
 		"down":              dpDown,
+		"stale":             dpStale,
 		"resilience_budget": maxInt(0, dpHealthy-1),
 		"nodes":             dpNodes,
 	}

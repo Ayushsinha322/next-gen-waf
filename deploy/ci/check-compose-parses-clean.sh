@@ -475,6 +475,36 @@ check_rust_log_directives() {
 }
 check_rust_log_directives
 
+# ── Node services must have a pinned identity ────────────────────────────────
+#
+# A node reports itself to the cluster view under its hostname. Docker's default
+# hostname is the container id, which changes on every recreate, so an unpinned
+# controlplane/dataplane left a permanent "down" ghost behind after every
+# upgrade or rollback — seen on the first customer install. Render the standalone
+# compose file with the installer's environment and assert both services carry a
+# hostname. The cluster/HA overlays pin their own (cp2/cp3, waf1/2/3).
+check_node_identity() {
+  printf '\n%s==> node services carry a stable identity%s\n\n' "$B" "$R"
+  local envf rendered
+  envf=$(mktemp); synth_env "$envf" "${IVARS[@]}"
+  rendered=$(cd deploy/docker && docker compose --env-file "$envf" -f compose.prod.yml config --format json 2>/dev/null) || rendered=""
+  rm -f "$envf"
+  if [[ -z "$rendered" ]]; then
+    printf '  %s✗%s could not render compose.prod.yml to inspect hostnames\n' "$RED" "$R"; fail=$((fail + 1)); return
+  fi
+  local svc h
+  for svc in controlplane dataplane; do
+    h=$(jq -r --arg s "$svc" '.services[$s].hostname // empty' <<<"$rendered")
+    if [[ -n "$h" ]]; then
+      printf '  %s✓%s %s: hostname %s\n' "$GRN" "$R" "$svc" "$h"
+    else
+      printf '  %s✗%s %s has no hostname — every recreate mints a new node id and leaves a permanent "down" ghost\n' "$RED" "$R" "$svc"
+      fail=$((fail + 1))
+    fi
+  done
+}
+check_node_identity
+
 printf '\n'
 if (( fail )); then
   printf '  %s✗ %d compose problem(s) — an install or a release build would abort%s\n\n' "$RED" "$fail" "$R"

@@ -237,6 +237,14 @@ services:
       args:
         <<: *build-provenance
     image: ${SENTINEL_IMAGE_PREFIX:-sentinel}/controlplane:${SENTINEL_VERSION:-latest}
+    # A node identifies itself by its hostname (SENTINEL_NODE_ID, else HOSTNAME).
+    # Docker's default hostname is the container id, which changes on EVERY
+    # recreate — upgrade, rollback, `up --force-recreate`, `docker rm -f` — so an
+    # unpinned node minted a new identity each time and the old one stayed in the
+    # cluster view as "down" for ever (seen on the first customer install: one
+    # live data plane, one ghost, "nodes unhealthy"). Pin it. The cluster overlay
+    # sets SENTINEL_NODE_ID 1/2/3 and its own hostnames, which take precedence.
+    hostname: ${SENTINEL_CP_HOSTNAME:-sentinel-controlplane}
     logging: *logging
     restart: unless-stopped
     # root so it can write the shared NDJSON log volume (hardened via K8s
@@ -393,6 +401,9 @@ services:
       args:
         <<: *build-provenance
     image: ${SENTINEL_IMAGE_PREFIX:-sentinel}/dataplane:${SENTINEL_VERSION:-latest}
+    # Stable node identity — see the note on the controlplane service. The HA
+    # overlay replaces this service with waf1/2/3, each with its own hostname.
+    hostname: ${SENTINEL_DP_HOSTNAME:-sentinel-dataplane}
     logging: *logging
     restart: unless-stopped
     user: "0:0"
