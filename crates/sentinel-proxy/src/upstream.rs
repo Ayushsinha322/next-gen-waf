@@ -459,8 +459,39 @@ fn build_client(connect_timeout: Duration, sni_overrides: Arc<SniRegistry>) -> P
         .with_tls_config(upstream_tls_config())
         .https_or_http()
         .with_server_name_resolver(move |uri: &http::Uri| resolve_sni(&sni_overrides, uri))
+        // HTTP/1.1 ONLY to the origin, deliberately.
+        //
+        // `.enable_http2()` advertised h2 in ALPN, so any origin that speaks h2
+        // negotiated it — and the request we then sent was malformed, because
+        // the two halves of the forwarded request disagree about the authority:
+        //
+        //   * the URI is rebuilt for the connection (build_upstream_uri), so its
+        //     authority is the upstream ADDRESS — `10.0.0.5:443`. Over h2 hyper
+        //     turns that into `:authority`.
+        //   * the Host header carries the name the CLIENT asked for, which is
+        //     what a virtual-hosted origin must route on.
+        //
+        // RFC 9113 §8.3.1 requires `:authority` and `Host` to be identical when
+        // both are present, and a server MUST treat a mismatch as malformed. So
+        // an h2-capable origin answered every proxied request with a generic 400
+        // while the same request over HTTP/1.1 — where Host alone is
+        // authoritative and an absolute-form target is legal — worked.
+        //
+        // Found on the first HTTPS origin behind this WAF that speaks h2 (an
+        // APISIX gateway): identical curl to the origin returned 301, everything
+        // through the WAF returned 400. It was invisible until then because the
+        // only other origin we had ever proxied was plain HTTP.
+        //
+        // Two lines elsewhere already ASSUMED this hop is HTTP/1.1 — the request
+        // version is forced to HTTP_11, and per-site keep-alive sends
+        // `Connection: close`, which is a protocol error in h2. The connector was
+        // the odd one out; this makes the code agree with itself.
+        //
+        // Keeping h2 upstream would mean making the URI authority the client's
+        // hostname and teaching the connector to dial the configured address
+        // instead — worth doing if an origin ever needs h2, and not for the
+        // marginal gain on a proxy→origin hop that nginx also defaults to 1.1.
         .enable_http1()
-        .enable_http2()
         .wrap_connector(http);
 
     // Keep-alive pool sizing. 32 idle/host is far too low for a reverse proxy:
@@ -1245,6 +1276,43 @@ mod sni_tests {
             )],
         );
         assert!(reg.is_empty(), "an invalid sni_name must not be registered");
+    }
+}
+
+#[cfg(test)]
+mod upstream_protocol_tests {
+    /// The origin hop must stay HTTP/1.1.
+    ///
+    /// Re-enabling h2 here sends `:authority` = the upstream ADDRESS alongside a
+    /// `Host` header carrying the client's NAME. RFC 9113 §8.3.1 makes that
+    /// mismatch malformed, and an h2-capable origin answers every proxied request
+    /// with a generic 400 — which is exactly how this was found, on an APISIX
+    /// gateway where curl got 301 and everything through the WAF got 400.
+    ///
+    /// Source-level because the alternative is an h2 origin in the test rig, and
+    /// this is the line that must not change without the URI/Host rework the
+    /// comment beside it describes.
+    #[test]
+    fn origin_connections_do_not_offer_http2() {
+        let src = include_str!("upstream.rs");
+        // Assembled at compile time so the needle never exists as literal text in
+        // this file — a guard that matches its own source reports the correct
+        // code as broken, which is how several checks in this repo first failed.
+        let needle = concat!(".enable_", "http2", "()");
+        let builder_uses_h2 = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .any(|l| l.contains(needle));
+        assert!(
+            !builder_uses_h2,
+            "the upstream connector offers h2 again: over h2 the forwarded \
+             :authority (upstream address) and Host (client name) disagree, which \
+             RFC 9113 makes malformed and origins answer with 400"
+        );
+        assert!(
+            src.contains(".enable_http1()"),
+            "the upstream connector must still enable HTTP/1.1"
+        );
     }
 }
 
