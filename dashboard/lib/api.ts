@@ -908,6 +908,9 @@ export interface ClusterHealth {
     down:             number;
     /** Former identities not heard from for over the stale window (default 24 h) — shown dimmed, never counted. */
     stale:            number;
+    /** Origins reachable, summed across the nodes that are up — says WHY a fleet is degraded. */
+    upstreams_healthy: number;
+    upstreams_total:   number;
     resilience_budget: number;
     nodes:            DataPlaneNode[];
   };

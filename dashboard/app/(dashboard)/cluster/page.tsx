@@ -162,6 +162,16 @@ Fleet-wide health of the WAF data plane and control plane — live topology, fai
               <span className={`sd ${health?.protection_active ? "g" : "r"}`} />
               Protection: {health ? (health.protection_active ? "ACTIVE" : "AT RISK") : "—"}
             </div>
+            {/* A fleet is most often degraded because the APPLICATION behind it is
+                unreachable, not because the WAF is unwell — inspection carries on
+                either way. Say which it is here, rather than leaving the operator
+                to open a node to find out. */}
+            {dp && dp.upstreams_total > 0 && dp.upstreams_healthy < dp.upstreams_total && (
+              <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, fontFamily: MONO, color: "var(--amber)" }}>
+                <span className="sd a" />
+                {dp.upstreams_healthy} of {dp.upstreams_total} origin{dp.upstreams_total === 1 ? "" : "s"} reachable — traffic is inspected, the application is not answering
+              </div>
+            )}
           </div>
 
           {/* KPI figures */}

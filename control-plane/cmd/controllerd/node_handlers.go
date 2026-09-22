@@ -102,6 +102,42 @@ func maxInt(a, b int) int {
 	return b
 }
 
+// fleetVerdict turns the counted node states into the two things the console
+// puts in front of every operator: the fleet's overall status, and whether
+// traffic is being inspected at all.
+//
+// The distinction this used to get wrong. A DEGRADED node is alive, heartbeating,
+// its rules compiled, and it inspects every request — it simply cannot reach any
+// origin behind it. That is the application being unreachable, not the WAF. The
+// old rule counted only `healthy` nodes, so a single node with a broken origin
+// produced protection_active=false, and the top bar showed a red "Protection
+// inactive" badge on EVERY page while the WAF was doing its job exactly as
+// configured (seen on the UAT node, whose origin served a certificate without
+// its intermediate chain). An operator reading that badge goes looking for a
+// broken WAF, which is the one thing that is not broken.
+//
+// So:
+//   - protection is active while at least one node is UP — healthy OR degraded —
+//     and trivially so when no node is deployed yet;
+//   - critical means nothing can inspect traffic (no node up), or writes are
+//     unavailable, because those are the states where the product is not doing
+//     its job;
+//   - anything short of fully healthy is degraded, which is still visible and
+//     still worth investigating — the per-node upstream counts say why.
+//
+// Pure, so the semantics can be tested without a database.
+func fleetVerdict(dpTotal, dpHealthy, dpDegraded, dpDown int, cpEnabled, cpWritable, cpAnyUnreachable bool) (string, bool) {
+	up := dpHealthy + dpDegraded
+	protectionActive := up >= 1 || dpTotal == 0
+	switch {
+	case (dpTotal > 0 && up == 0) || (cpEnabled && !cpWritable):
+		return "critical", protectionActive
+	case dpDown > 0 || dpDegraded > 0 || cpAnyUnreachable:
+		return "degraded", protectionActive
+	}
+	return "healthy", protectionActive
+}
+
 // handleClusterHealth returns a unified data-plane + control-plane health view.
 // JWT-protected; requires site:list (same gate as handleClusterStatus).
 func handleClusterHealth(c *gin.Context, enf *rbac.Enforcer, store *db.Store, cl *leader.Elector) {
@@ -117,6 +153,7 @@ func handleClusterHealth(c *gin.Context, enf *rbac.Enforcer, store *db.Store, cl
 	// ── Data plane ──────────────────────────────────────────────────────────
 	dpNodes := []gin.H{}
 	dpHealthy, dpDegraded, dpDown, dpStale := 0, 0, 0, 0
+	dpUpstreamsHealthy, dpUpstreamsTotal := 0, 0
 	if store != nil {
 		nodes, err := store.ListNodes(c.Request.Context())
 		if err == nil {
@@ -140,6 +177,13 @@ func handleClusterHealth(c *gin.Context, enf *rbac.Enforcer, store *db.Store, cl
 				var md nodeMetadata
 				if len(n.Metadata) > 0 {
 					_ = json.Unmarshal(n.Metadata, &md)
+				}
+				// Only nodes that are up have meaningful upstream counts; a node
+				// that stopped reporting last week would otherwise contribute its
+				// final reading to a total describing the fleet right now.
+				if status == "healthy" || status == "degraded" {
+					dpUpstreamsHealthy += md.UpstreamsHealthy
+					dpUpstreamsTotal += md.UpstreamsTotal
 				}
 				dpNodes = append(dpNodes, gin.H{
 					"id":                 n.ID,
@@ -187,6 +231,11 @@ func handleClusterHealth(c *gin.Context, enf *rbac.Enforcer, store *db.Store, cl
 		"down":              dpDown,
 		"stale":             dpStale,
 		"resilience_budget": maxInt(0, dpHealthy-1),
+		// Summed across the nodes that are up, so the page can say WHY the fleet
+		// is degraded — "protection active, 0 of 1 origins reachable" rather than
+		// leaving the operator to open a node to find out.
+		"upstreams_healthy": dpUpstreamsHealthy,
+		"upstreams_total":   dpUpstreamsTotal,
 		"nodes":             dpNodes,
 	}
 
@@ -285,14 +334,7 @@ func handleClusterHealth(c *gin.Context, enf *rbac.Enforcer, store *db.Store, cl
 	cpEnabled, _ := controlPlane["enabled"].(bool)
 	cpWritable, _ := controlPlane["write_available"].(bool)
 
-	overall := "healthy"
-	switch {
-	case (dpTotal > 0 && dpHealthy == 0) || (cpEnabled && !cpWritable):
-		overall = "critical"
-	case dpDown > 0 || dpDegraded > 0 || cpAnyUnreachable:
-		overall = "degraded"
-	}
-	protectionActive := dpHealthy >= 1 || dpTotal == 0
+	overall, protectionActive := fleetVerdict(dpTotal, dpHealthy, dpDegraded, dpDown, cpEnabled, cpWritable, cpAnyUnreachable)
 
 	c.JSON(http.StatusOK, gin.H{
 		"config_version":    currentCfgVersion,

@@ -430,4 +430,11 @@ seconds ago and has stopped; its container is missing or restarting
 
 **A node shown as *degraded*, not down,** means it is alive but every origin it
 serves is unreachable — see §2 (502 Bad Gateway). That is the WAF being honest
-about the application behind it, not about itself.
+about the application behind it, not about itself. Protection stays **ACTIVE**
+in that state: every request is still inspected, it just cannot be forwarded.
+The header line says which it is — *"0 of 1 origins reachable — traffic is
+inspected, the application is not answering"*.
+
+> Before 1.1.2 a degraded node reported protection as inactive, which put a red
+> "Protection inactive" badge on every page while the WAF was working normally.
+> If you see that on an older build, check the node's origin before the WAF.
