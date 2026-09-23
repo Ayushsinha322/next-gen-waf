@@ -1118,7 +1118,9 @@ textarea.fin2 { resize:vertical; min-height:80px; line-height:1.6; }
 .auth-hint .dot { width:3px; height:3px; border-radius:50%; background:var(--text3); display:inline-block; }
 .atabs { display:flex; background:rgba(255,255,255,.03); border-radius:10px; padding:4px; margin:0 28px; gap:2px; border:1px solid rgba(255,255,255,.06); }
 .atab  { flex:1; padding:9px 4px; text-align:center; font-size:14px; font-family:var(--font-sans); font-weight:500; color:var(--text2); cursor:pointer; border-radius:7px; transition:all .22s; border:1px solid transparent; user-select:none; }
-.atab.on, .atab.active { background:rgba(255,45,85,.2); color:var(--red-b); border-color:rgba(255,45,85,.4); }
+/* Selected = the product accent. It was red, the colour every other screen uses
+   for errors and blocks, so the default "Password" tab looked like a failure. */
+.atab.on, .atab.active { background:rgba(0,212,255,.14); color:var(--cyan); border-color:rgba(0,212,255,.4); }
 .atab:hover:not(.on):not(.active) { color:var(--text); background:rgba(255,255,255,.05); }
 .flbl-dot { width:4px; height:4px; border-radius:50%; background:var(--cyan); animation:pulse 2s ease-in-out infinite; display:inline-block; }
 .fin {

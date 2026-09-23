@@ -109,8 +109,16 @@ export default function LoginPage() {
     function draw() {
       if (!c || !cx) return;
       cx.clearRect(0, 0, c.width, c.height);
-      cx.fillStyle = "rgba(4,7,15,0.85)";
-      cx.fillRect(0, 0, c.width, c.height);
+      // Paint the dark backdrop only in the dark theme. This canvas covers the
+      // whole left panel, and it used to paint near-black every frame whatever
+      // the theme — so in light mode the stylesheet's light panel never showed,
+      // while the text on it switched to light-theme (dark) colours: a dark-grey
+      // headline on near-black. In light mode the canvas stays transparent and
+      // draws only its accents, over the light gradient from globals.css.
+      if (document.documentElement.getAttribute("data-theme") !== "light") {
+        cx.fillStyle = "rgba(4,7,15,0.85)";
+        cx.fillRect(0, 0, c.width, c.height);
+      }
       t++;
 
       for (let x = 0; x < c.width; x += 50) {
