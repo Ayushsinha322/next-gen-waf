@@ -870,6 +870,10 @@ export interface DataPlaneNode {
   listeners?:              string[];
   http3_enabled?:          boolean;
   config_version_applied?: number;
+  /** The node is not applying what the control plane serves (a rejected site, or failing polls). */
+  config_rejecting?:       boolean;
+  /** Why, in the operator's terms — names the site and what the node did with it. */
+  config_sync_problem?:    string;
   rules_compiled?:         number;
   rules_enforced?:         number;
   ebpf_mode?:              string;
@@ -908,6 +912,8 @@ export interface ClusterHealth {
     down:             number;
     /** Former identities not heard from for over the stale window (default 24 h) — shown dimmed, never counted. */
     stale:            number;
+    /** Nodes that are up but not taking config — they enforce an older configuration. */
+    rejecting_config?: number;
     /** Origins reachable, summed across the nodes that are up — says WHY a fleet is degraded. */
     upstreams_healthy: number;
     upstreams_total:   number;

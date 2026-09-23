@@ -166,6 +166,19 @@ Fleet-wide health of the WAF data plane and control plane — live topology, fai
                 unreachable, not because the WAF is unwell — inspection carries on
                 either way. Say which it is here, rather than leaving the operator
                 to open a node to find out. */}
+            {/* A node that rejects config keeps enforcing its previous one, so
+                every change saved since is not in force there. Said here, in
+                the headline, because the per-node badge alone went unnoticed
+                while the whole fleet was frozen. */}
+            {dp && (dp.rejecting_config ?? 0) > 0 && (
+              <div style={{ display: "flex", alignItems: "flex-start", gap: 8, fontSize: 13, fontFamily: MONO, color: "var(--red-b)" }}>
+                <span className="sd r" style={{ marginTop: 5 }} />
+                <span>
+                  {dp.rejecting_config} node{dp.rejecting_config === 1 ? " is" : "s are"} not taking configuration — changes saved here are not in force there.{" "}
+                  {dp.nodes.find(n => n.config_rejecting)?.config_sync_problem}
+                </span>
+              </div>
+            )}
             {dp && dp.upstreams_total > 0 && dp.upstreams_healthy < dp.upstreams_total && (
               <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, fontFamily: MONO, color: "var(--amber)" }}>
                 <span className="sd a" />
@@ -404,7 +417,8 @@ Fleet-wide health of the WAF data plane and control plane — live topology, fai
                       </td>
                       <td className="td3">{n.version || "—"}</td>
                       <td>
-                        {applied === 0 && !neverSynced ? <span className="td3">—</span>
+                        {n.config_rejecting ? <span className="bdg br" title={n.config_sync_problem}>REJECTING · v{applied}</span>
+                          : applied === 0 && !neverSynced ? <span className="td3">—</span>
                           : stale ? <span className="bdg ba" title={`Node applied config version ${applied}; the control plane serves ${cur}. Changes made since have not reached this node.`}>STALE · v{applied}</span>
                           : neverSynced ? <span className="bdg br" title="This node has never applied a configuration from the control plane">NEVER SYNCED</span>
                           : <span className="bdg bgg" title={`Config version ${applied}, current`}>v{applied}</span>}

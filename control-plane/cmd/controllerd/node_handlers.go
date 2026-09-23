@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"strconv"
@@ -75,6 +76,7 @@ type nodeMetadata struct {
 	Listeners            []string        `json:"listeners"`
 	HTTP3Enabled         bool            `json:"http3_enabled"`
 	ConfigVersionApplied int64           `json:"config_version_applied"`
+	ConfigSync           *nodeConfigSync `json:"config_sync"`
 	RulesCompiled        int             `json:"rules_compiled"`
 	RulesEnforced        int             `json:"rules_enforced"`
 	EbpfMode             string          `json:"ebpf_mode"`
@@ -126,6 +128,58 @@ func maxInt(a, b int) int {
 //     still worth investigating — the per-node upstream counts say why.
 //
 // Pure, so the semantics can be tested without a database.
+// nodeConfigSync is a data plane's own account of whether it is taking config
+// (crates/sentinel-proxy ConfigSyncStatus).
+type nodeConfigSync struct {
+	LastError     *string `json:"last_error"`
+	FailingSince  *int64  `json:"failing_since"`
+	RejectedSites []struct {
+		ID           string `json:"id"`
+		Error        string `json:"error"`
+		KeptPrevious bool   `json:"kept_previous"`
+	} `json:"rejected_sites"`
+}
+
+// configSyncGrace is how long polls may fail before a node counts as not taking
+// config: one missed 5s poll during a control-plane restart is not an incident.
+const configSyncGrace = 30 * time.Second
+
+// rejectingConfig reports whether a node is not applying what the control plane
+// serves, and why, in the operator's terms.
+func rejectingConfig(cs *nodeConfigSync, now time.Time) (bool, string) {
+	if cs == nil {
+		return false, ""
+	}
+	if n := len(cs.RejectedSites); n > 0 {
+		r := cs.RejectedSites[0]
+		what := "keeps its previous config"
+		if !r.KeptPrevious {
+			what = "is not served"
+		}
+		msg := fmt.Sprintf("rejected site %s (%s): %s", r.ID, what, r.Error)
+		if n > 1 {
+			msg += fmt.Sprintf(" — and %d more", n-1)
+		}
+		return true, msg
+	}
+	if cs.LastError != nil && cs.FailingSince != nil &&
+		now.Sub(time.Unix(*cs.FailingSince, 0)) >= configSyncGrace {
+		return true, fmt.Sprintf("config sync failing since %s: %s",
+			time.Unix(*cs.FailingSince, 0).UTC().Format(time.RFC3339), *cs.LastError)
+	}
+	return false, ""
+}
+
+// withConfigSync degrades a healthy verdict when any node is not taking config.
+// Before it existed the cluster headline read HEALTHY while every node served a
+// frozen configuration and each change "saved" in the console reached none.
+func withConfigSync(overall string, nodesRejecting int) string {
+	if overall == "healthy" && nodesRejecting > 0 {
+		return "degraded"
+	}
+	return overall
+}
+
 func fleetVerdict(dpTotal, dpHealthy, dpDegraded, dpDown int, cpEnabled, cpWritable, cpAnyUnreachable bool) (string, bool) {
 	up := dpHealthy + dpDegraded
 	protectionActive := up >= 1 || dpTotal == 0
@@ -154,6 +208,7 @@ func handleClusterHealth(c *gin.Context, enf *rbac.Enforcer, store *db.Store, cl
 	dpNodes := []gin.H{}
 	dpHealthy, dpDegraded, dpDown, dpStale := 0, 0, 0, 0
 	dpUpstreamsHealthy, dpUpstreamsTotal := 0, 0
+	dpRejectingConfig := 0
 	if store != nil {
 		nodes, err := store.ListNodes(c.Request.Context())
 		if err == nil {
@@ -181,9 +236,14 @@ func handleClusterHealth(c *gin.Context, enf *rbac.Enforcer, store *db.Store, cl
 				// Only nodes that are up have meaningful upstream counts; a node
 				// that stopped reporting last week would otherwise contribute its
 				// final reading to a total describing the fleet right now.
+				rejecting, syncProblem := false, ""
 				if status == "healthy" || status == "degraded" {
 					dpUpstreamsHealthy += md.UpstreamsHealthy
 					dpUpstreamsTotal += md.UpstreamsTotal
+					rejecting, syncProblem = rejectingConfig(md.ConfigSync, time.Now())
+					if rejecting {
+						dpRejectingConfig++
+					}
 				}
 				dpNodes = append(dpNodes, gin.H{
 					"id":                 n.ID,
@@ -201,6 +261,8 @@ func handleClusterHealth(c *gin.Context, enf *rbac.Enforcer, store *db.Store, cl
 					"listeners":              md.Listeners,
 					"http3_enabled":          md.HTTP3Enabled,
 					"config_version_applied": md.ConfigVersionApplied,
+					"config_rejecting":       rejecting,
+					"config_sync_problem":    syncProblem,
 					"rules_compiled":         md.RulesCompiled,
 					"rules_enforced":         md.RulesEnforced,
 					"ebpf_mode":              md.EbpfMode,
@@ -230,6 +292,7 @@ func handleClusterHealth(c *gin.Context, enf *rbac.Enforcer, store *db.Store, cl
 		"degraded":          dpDegraded,
 		"down":              dpDown,
 		"stale":             dpStale,
+		"rejecting_config":  dpRejectingConfig,
 		"resilience_budget": maxInt(0, dpHealthy-1),
 		// Summed across the nodes that are up, so the page can say WHY the fleet
 		// is degraded — "protection active, 0 of 1 origins reachable" rather than
@@ -335,6 +398,7 @@ func handleClusterHealth(c *gin.Context, enf *rbac.Enforcer, store *db.Store, cl
 	cpWritable, _ := controlPlane["write_available"].(bool)
 
 	overall, protectionActive := fleetVerdict(dpTotal, dpHealthy, dpDegraded, dpDown, cpEnabled, cpWritable, cpAnyUnreachable)
+	overall = withConfigSync(overall, dpRejectingConfig)
 
 	c.JSON(http.StatusOK, gin.H{
 		"config_version":    currentCfgVersion,

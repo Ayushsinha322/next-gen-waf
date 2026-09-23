@@ -2072,7 +2072,12 @@ func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
 		p.AnomalyThreshold = 10
 	}
 
-	var rules []string
+	// Never nil: a nil slice marshals as JSON null, and the data plane's
+	// `rules: Vec<String>` rejects null (serde's default covers an ABSENT field,
+	// not a null one). For a site in mode "off" that null used to make every node
+	// reject the WHOLE config sync — one click on Off froze config delivery for
+	// every site on the fleet, with nothing in the console saying so.
+	rules := []string{}
 	if p.Mode != "off" {
 		rules = crsFilesForCategories(p.RuleCategories)
 		// Appended, not prepended: CRS sets up tx.anomaly_score and friends, and

@@ -656,7 +656,111 @@ impl ManagementUpstreams {
 #[derive(serde::Deserialize)]
 struct ConfigSyncResponse {
     version: u64,
+    /// Parsed one site at a time by [`parse_synced_sites`], never as a
+    /// `Vec<SiteConfig>`: with a typed Vec, one malformed site made serde reject
+    /// the whole response, and every node kept serving its previous config for
+    /// EVERY site until that one site was fixed. That is how switching a single
+    /// site to mode "off" (which sent `"rules": null`) froze config delivery for
+    /// the entire fleet on 2026-09-23 — each later change "saved" in the console
+    /// and reached no node, and nothing but a WARN line said so.
+    sites: Vec<serde_json::Value>,
+}
+
+/// A sync after per-site parsing.
+struct ParsedSync {
+    version: u64,
     sites: Vec<SiteConfig>,
+}
+
+/// A site the control plane sent that this node could not parse.
+#[derive(Clone, Debug, serde::Serialize)]
+struct RejectedSite {
+    id: String,
+    error: String,
+    /// The node still serves this site with the config it last parsed; false
+    /// means the site is new and is not served here at all.
+    kept_previous: bool,
+}
+
+/// Config-sync health, reported in the heartbeat so the cluster page can say
+/// "this node is rejecting config" instead of calling a frozen fleet healthy.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+struct ConfigSyncStatus {
+    /// Why the most recent poll could not be used at all (fetch, body, or an
+    /// envelope that is not JSON), cleared by the next usable poll.
+    last_error: Option<String>,
+    /// Unix seconds since which polls have been failing, if they are.
+    failing_since: Option<u64>,
+    /// Sites in the most recently applied version that this node rejected.
+    rejected_sites: Vec<RejectedSite>,
+}
+
+static CONFIG_SYNC_STATUS: std::sync::Mutex<ConfigSyncStatus> =
+    std::sync::Mutex::new(ConfigSyncStatus {
+        last_error: None,
+        failing_since: None,
+        rejected_sites: Vec::new(),
+    });
+
+fn config_sync_status() -> ConfigSyncStatus {
+    CONFIG_SYNC_STATUS
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default()
+}
+
+fn note_config_sync_failure(error: String) {
+    if let Ok(mut g) = CONFIG_SYNC_STATUS.lock() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        g.failing_since.get_or_insert(now);
+        g.last_error = Some(error);
+    }
+}
+
+fn note_config_sync_ok() {
+    if let Ok(mut g) = CONFIG_SYNC_STATUS.lock() {
+        g.last_error = None;
+        g.failing_since = None;
+    }
+}
+
+/// Parse each site of a sync on its own, so one bad site costs only itself.
+///
+/// A site that fails to parse keeps the config this node last held for it
+/// (fail-stale, like a whole-sync failure used to be, but for that site alone);
+/// a brand-new site that fails is not served. Every other site in the sync is
+/// applied normally.
+fn parse_synced_sites(
+    raw: Vec<serde_json::Value>,
+    previous: &[SiteConfig],
+) -> (Vec<SiteConfig>, Vec<RejectedSite>) {
+    let mut sites = Vec::with_capacity(raw.len());
+    let mut rejected = Vec::new();
+    for (i, v) in raw.into_iter().enumerate() {
+        let id = v
+            .get("id")
+            .and_then(|x| x.as_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("<site #{i} with no id>"));
+        match serde_json::from_value::<SiteConfig>(v) {
+            Ok(site) => sites.push(site),
+            Err(e) => {
+                let kept = previous.iter().find(|p| p.id == id).cloned();
+                rejected.push(RejectedSite {
+                    id: id.clone(),
+                    error: e.to_string(),
+                    kept_previous: kept.is_some(),
+                });
+                if let Some(p) = kept {
+                    sites.push(p);
+                }
+            }
+        }
+    }
+    (sites, rejected)
 }
 
 /// Digest of one enabled plugin as advertised by `GET /internal/plugins`.
@@ -1389,6 +1493,7 @@ impl ProxyServer {
                         Ok(r) => r,
                         Err(e) => {
                             warn!("config sync fetch: {e}");
+                            note_config_sync_failure(format!("fetch: {e}"));
                             continue;
                         }
                     };
@@ -1396,10 +1501,11 @@ impl ProxyServer {
                         Ok(b) => b.to_bytes(),
                         Err(e) => {
                             warn!("config sync body: {e}");
+                            note_config_sync_failure(format!("body: {e}"));
                             continue;
                         }
                     };
-                    let sync: ConfigSyncResponse = match serde_json::from_slice(&bytes) {
+                    let envelope: ConfigSyncResponse = match serde_json::from_slice(&bytes) {
                         Ok(s) => s,
                         Err(e) => {
                             warn!(
@@ -1409,10 +1515,41 @@ impl ProxyServer {
                                     .take(120)
                                     .collect::<String>()
                             );
+                            note_config_sync_failure(format!("parse: {e}"));
                             continue;
                         }
                     };
-                    if sync.version != last_version {
+                    note_config_sync_ok();
+                    if envelope.version != last_version {
+                        let previous: Vec<SiteConfig> = poll_cfg
+                            .load()
+                            .sites
+                            .iter()
+                            .filter(|s| s.origin == sentinel_core::config::SiteOrigin::ControlPlane)
+                            .cloned()
+                            .collect();
+                        let (sites, rejected) = parse_synced_sites(envelope.sites, &previous);
+                        for r in &rejected {
+                            error!(
+                                site = %r.id,
+                                kept_previous = r.kept_previous,
+                                "config sync: the control plane sent a site this node cannot \
+                                 parse — {}; every other site is applied: {}",
+                                if r.kept_previous {
+                                    "it keeps serving its previous config"
+                                } else {
+                                    "it is NOT served on this node"
+                                },
+                                r.error
+                            );
+                        }
+                        if let Ok(mut g) = CONFIG_SYNC_STATUS.lock() {
+                            g.rejected_sites = rejected;
+                        }
+                        let sync = ParsedSync {
+                            version: envelope.version,
+                            sites,
+                        };
                         let count = sync.sites.len();
                         // R5: persist the last-good config before applying, so a
                         // restart during a control-plane outage keeps these sites.
@@ -1952,6 +2089,9 @@ impl ProxyServer {
                             // version this node applied (stale-node detection), how
                             // many rules it compiled, and what its own bans/feeds hold.
                             "config_version_applied": CONFIG_VERSION_APPLIED.load(Ordering::Relaxed),
+                            // Whether this node is actually taking config: a poll
+                            // failure, or sites of the applied version it rejected.
+                            "config_sync": config_sync_status(),
                             "rules_compiled": hb_engines.load().values().map(|e| e.rule_count()).sum::<usize>(),
                             "rules_enforced": hb_engines.load().values().map(|e| e.inventory().enforced).sum::<usize>(),
                             "ebpf_mode": hb_ebpf.mode().to_string(),
@@ -12861,5 +13001,60 @@ mod security_header_hardening_tests {
             .map(|v| v.to_str().unwrap())
             .collect();
         assert_eq!(cookies, vec!["session=x; Secure", "other=y"]);
+    }
+}
+
+#[cfg(test)]
+mod config_sync_isolation_tests {
+    use super::*;
+
+    fn site(id: &str, mode: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "domains": [format!("{id}.example")],
+            "upstream": {"servers": [{"host": "10.0.0.5", "port": 80}]},
+            "waf": {"mode": mode, "rules": []}
+        })
+    }
+
+    /// The live failure: one site with `"rules": null` (a site switched to Off
+    /// under the old control plane). The other sites must still apply.
+    #[test]
+    fn one_unparseable_site_does_not_block_the_others() {
+        let mut bad = site("bad", "off");
+        bad["waf"]["rules"] = serde_json::Value::Null;
+        let (sites, rejected) =
+            parse_synced_sites(vec![site("a", "blocking"), bad, site("b", "learning")], &[]);
+        let ids: Vec<_> = sites.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b"], "the good sites must be applied");
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].id, "bad");
+        assert!(
+            !rejected[0].kept_previous,
+            "a new bad site has nothing to keep"
+        );
+        assert!(rejected[0].error.contains("null"), "{}", rejected[0].error);
+    }
+
+    /// A known site that turns unparseable keeps its last good config rather
+    /// than vanishing — dropping it would take the application offline.
+    #[test]
+    fn a_known_site_that_fails_keeps_its_previous_config() {
+        let previous: SiteConfig = serde_json::from_value(site("app", "blocking")).unwrap();
+        let mut bad = site("app", "off");
+        bad["waf"]["rules"] = serde_json::Value::Null;
+        let (sites, rejected) = parse_synced_sites(vec![bad], std::slice::from_ref(&previous));
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].id, "app");
+        assert_eq!(sites[0].waf.mode, sentinel_core::config::WafMode::Blocking);
+        assert!(rejected[0].kept_previous);
+    }
+
+    #[test]
+    fn a_clean_sync_rejects_nothing() {
+        let (sites, rejected) =
+            parse_synced_sites(vec![site("a", "off"), site("b", "blocking")], &[]);
+        assert_eq!(sites.len(), 2);
+        assert!(rejected.is_empty());
     }
 }
