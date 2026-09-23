@@ -155,8 +155,8 @@ They are there so you are never guessing which is which. Trust them.
 
 > ### ⚠️ The most important box on this page
 >
-> **Security Mode defaults to `Blocking`. Change it to `Learning` for every new
-> site.**
+> **Security Mode starts in `Learning` for every new site. Keep it there until
+> the learning report is clean.**
 >
 > Blocking means the WAF rejects requests it dislikes. That sounds like what you
 > want, and eventually it is — but **nobody has yet measured how this WAF behaves
@@ -272,13 +272,16 @@ This is where you enter the **origin server** from §1.
 | **TLS** | **On if the origin is HTTPS.** Off for plain HTTP — but see the origin-certificate limit below |
 | **Health check path** | From §1 line 4, e.g. `/healthz` or `/` — **Advanced mode only** |
 
-> **An HTTPS origin must present a publicly trusted certificate.** The upstream
-> connector verifies origin certificates against the public root store with no
-> override, so an origin using an internal-CA or self-signed certificate fails
-> the handshake on every request and returns **502 forever** — with every item on
-> the §2 troubleshooting checklist passing. There is no setting for this today.
-> Until there is, reach such an origin over plain **HTTP on a trusted network
-> segment** instead.
+> **An HTTPS origin behind an internal CA needs that CA trusted first.** The WAF
+> verifies every origin certificate. With only the public roots, an origin using
+> an internal-CA or self-signed certificate fails the handshake on every request
+> and returns **502** — with every other item on the §2 troubleshooting
+> checklist passing. The fix is node-wide, not per site: put the CA (or the self-signed origin certificate) in
+> `/opt/sentinel/current/origin-ca/origin-ca.pem`, add
+> `SENTINEL_UPSTREAM_CA_FILE=/etc/sentinel/origin-ca/origin-ca.pem` to
+> `/opt/sentinel/current/.env`, and restart the data plane. The anchors are
+> ADDED to the public roots, so public-CA origins keep working; both survive
+> `upgrade.sh`. Details: `origin-ca/README.md` in the package.
 
 Then the settings that actually break applications — **all of them Advanced
 mode**. Defaults are fine for a normal website; change them only when §1 told

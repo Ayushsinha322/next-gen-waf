@@ -377,7 +377,7 @@ copy of the admin password and of every generated secret.
 | **Console shows 500** | Cached error from startup | Hard reload, or incognito |
 | **Wizard will not save** | ACME email required by default | Turn off Serve HTTPS (§8) |
 | **Attack returns 200** | Site is in learning mode | Correct. Check the event was *recorded* |
-| **HTTPS origin always 502** | Origin certificate is not publicly trusted | Not supported today — use plain HTTP to the origin on a trusted segment |
+| **HTTPS origin always 502** | Origin certificate is not publicly trusted (internal CA / self-signed) | Put the CA in `/opt/sentinel/current/origin-ca/origin-ca.pem`, set `SENTINEL_UPSTREAM_CA_FILE=/etc/sentinel/origin-ca/origin-ca.pem` in `.env`, restart the data plane |
 | **Lost the admin password** | | Never changed: it is `SENTINEL_BOOTSTRAP_ADMIN_PASSWORD` in `/opt/sentinel/current/.env`. Changed since: "Forgot password?" or another admin's **Send reset link** (both need SMTP). No SMTP and no second admin: the installation must be rebuilt |
 
 Send `/var/log/sentinel/install.log` with any support request.
@@ -404,7 +404,7 @@ already exists, which would lock you out of your own data.
 
 ---
 
-## Known limitations in v1.0.2
+## Known limitations
 
 State these up front rather than letting a customer discover them:
 
@@ -412,7 +412,7 @@ State these up front rather than letting a customer discover them:
 |---|---|
 | **Password recovery needs email** | Change-your-own works without it; "Forgot password?" and reset links need an SMTP relay. Configure one, or keep a second admin |
 | **"Force HTTPS" does nothing** | The Front Service switches are recorded, not enforced. There is no per-site HTTP→HTTPS redirect. Control it at the network edge |
-| **HTTPS origins need a public certificate** | Internal-CA and self-signed origin certificates are not supported |
+| **Internal-CA origins are trusted node-wide** | An internal or self-signed origin CA is added for the whole node (`SENTINEL_UPSTREAM_CA_FILE`), not per site, and not from the console |
 | **Request limits follow the mode** | 413/414/431/405 in Blocking; in Learning recorded as would-block and forwarded — check the report for limit hits before switching |
 | **New sites are unprotected for a few seconds** | Rule engines load on a 5s poll after the site goes live |
 | **HTTP→HTTPS, HTTP/2, HTTP/3 toggles are per-host, not per-site** | Listener-level, configured once for the host |

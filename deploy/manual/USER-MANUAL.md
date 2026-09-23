@@ -642,7 +642,7 @@ are protecting against losing is not a backup.
 | **Attack returns 200** | Site is in learning mode | Correct. Check the event was *recorded* |
 | **Attack returns 200 in blocking mode** | Ruleset may not have compiled yet | Wait ten seconds and retry — §6.2 |
 | **413 / 414 / 431 / 405** | A request limit, which rejects in every mode | Raise the relevant limit — §5.4 |
-| **HTTPS origin always 502** | Origin certificate not publicly trusted | Not supported — §12 |
+| **HTTPS origin always 502** | Origin certificate not publicly trusted | Trust the origin's CA node-wide — §12 |
 | **Install aborted at hardware** | Disk measured on `/opt`, not `/` | §2.1 |
 | **Cannot pull images** | Registry unreachable | `curl -sS -o /dev/null -w '%{http_code}\n' https://hub.enlight.dev/v2/` — `401` is correct; a timeout means a firewall |
 | **Lost the admin password** | | `sudo grep SENTINEL_BOOTSTRAP_ADMIN_PASSWORD /opt/sentinel/current/.env` |
@@ -690,7 +690,7 @@ switched to blocking was still blocking.
 
 ---
 
-## 12. Known limitations in 1.0.2
+## 12. Known limitations
 
 **Read this section before promising anything to a customer.** Each item is a real
 constraint of this build, stated here so it is not discovered in production.
@@ -699,7 +699,7 @@ constraint of this build, stated here so it is not discovered in production.
 |---|---|
 | **Password recovery needs email** | Changing your own password works without it; "Forgot password?" and reset links need an SMTP relay. Configure one, or keep a second admin |
 | **"Force HTTPS" does nothing** | The Front Service switches are recorded, not enforced. There is no per-site HTTP→HTTPS redirect. If plain HTTP must not serve a site, control it at the network edge — but note that also disables ACME `http-01` renewal |
-| **HTTPS origins must present a publicly trusted certificate** | The upstream connector verifies against the public root store with no override. An internal-CA or self-signed origin certificate fails every handshake and returns 502 forever, with every troubleshooting check passing. Reach such an origin over plain HTTP on a trusted network segment instead |
+| **Internal-CA origins are trusted node-wide, not per site** | The WAF verifies every origin certificate against the public roots plus any CA you add. An internal-CA or self-signed origin fails every handshake (502) until its CA is added: put it in `/opt/sentinel/current/origin-ca/origin-ca.pem`, set `SENTINEL_UPSTREAM_CA_FILE=/etc/sentinel/origin-ca/origin-ca.pem` in `.env`, restart the data plane. It applies to the whole node and is not set from the console |
 | **Learning mode records over-limit requests, Blocking refuses them** | 413 / 414 / 431 / 405 apply in Blocking; in Learning they are logged as would-block and forwarded. Size them before real traffic and read the report for limit hits before switching — §5.4 |
 | **A new site is unprotected for a few seconds** | Rulesets compile on a five-second cycle after the site goes live. Never create a site directly in Blocking mode |
 | **HTTP/2, HTTP/3 and TLS toggles are host-wide, not per-site** | They are listener properties, configured once for the host |
