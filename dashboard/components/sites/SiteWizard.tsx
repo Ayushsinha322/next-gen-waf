@@ -18,6 +18,7 @@ import { useEffect, useMemo, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
 import { api, type Certificate, type Plugin, type SiteConfigProblem } from "@/lib/api";
+import { isCountryCode, countryCodeProblem, countryName, isIpOrCidr } from "@/lib/netValidate";
 import {
   SiteForm, emptyForm, applyPreset, formToPayload, PRESETS, CRS_CATEGORIES,
   CRS_REQUEST_CATEGORIES, CRS_RESPONSE_CATEGORIES, ALL_CRS_RESPONSE_KEYS, type CrsCategory,
@@ -101,16 +102,20 @@ function StepHead({ title, sub, tag }: { title: string; sub: string; tag?: "enfo
 }
 
 function ChipInput({
-  values, onChange, placeholder, mono = true, validate, transform,
+  values, onChange, placeholder, mono = true, validate, transform, invalidMessage, label,
 }: {
   values: string[]; onChange: (v: string[]) => void; placeholder: string;
   mono?: boolean; validate?: (s: string) => boolean; transform?: (s: string) => string;
+  /** What to tell the operator when `validate` refuses an entry. */
+  invalidMessage?: (s: string) => string;
+  /** Display text for a chip (the stored value is unchanged). */
+  label?: (s: string) => string;
 }) {
   const [draft, setDraft] = useState("");
   function add() {
     const v = transform ? transform(draft) : draft.trim();
     if (!v) return;
-    if (validate && !validate(v)) { showToast("Invalid value", "e"); return; }
+    if (validate && !validate(v)) { showToast(invalidMessage ? invalidMessage(v) : "Invalid value", "e"); return; }
     if (!values.includes(v)) onChange([...values, v]);
     setDraft("");
   }
@@ -125,15 +130,22 @@ function ChipInput({
       </div>
       {values.length > 0 && (
         <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8 }}>
-          {values.map(v => (
-            <span key={v} style={{
-              display: "inline-flex", alignItems: "center", gap: 6, padding: "3px 8px",
-              background: "rgba(0,212,255,.1)", border: "1px solid rgba(0,212,255,.28)",
-              borderRadius: 12, fontSize: 14, fontFamily: "var(--font-mono)", color: "var(--cyan)",
-            }}>
-              {v}<span style={{ cursor: "pointer", color: "var(--text3)" }} onClick={() => onChange(values.filter(x => x !== v))}>✕</span>
-            </span>
-          ))}
+          {values.map(v => {
+            // A stored value that would be refused today (saved before validation
+            // existed) is shown — in red, removable — never hidden: a hidden entry
+            // is one the operator cannot find, let alone fix.
+            const bad = validate ? !validate(v) : false;
+            return (
+              <span key={v} title={bad && invalidMessage ? invalidMessage(v) : undefined} style={{
+                display: "inline-flex", alignItems: "center", gap: 6, padding: "3px 8px",
+                background: bad ? "rgba(255,45,85,.12)" : "rgba(0,212,255,.1)",
+                border: `1px solid ${bad ? "rgba(255,45,85,.5)" : "rgba(0,212,255,.28)"}`,
+                borderRadius: 12, fontSize: 14, fontFamily: "var(--font-mono)", color: bad ? "var(--red-b)" : "var(--cyan)",
+              }}>
+                {label ? label(v) : v}{bad ? " — invalid" : ""}<span style={{ cursor: "pointer", color: "var(--text3)" }} onClick={() => onChange(values.filter(x => x !== v))}>✕</span>
+              </span>
+            );
+          })}
         </div>
       )}
     </div>
@@ -309,6 +321,14 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
       }
     }
     if (form.tls_mode === "manual" && form.custom_priority === "file" && (!form.cert_path.trim() || !form.key_path.trim())) return "Provide both certificate and key paths (Front Service)";
+    if (form.geo_mode !== "off") {
+      const bad = form.geo_countries.find(c => !isCountryCode(c));
+      if (bad) return `${countryCodeProblem(bad)} Remove it (Geo & IP)`;
+    }
+    {
+      const bad = [...form.ip_allow, ...form.ip_block].find(e => !isIpOrCidr(e));
+      if (bad) return `"${bad}" is not an IP address or CIDR range — remove it (Geo & IP)`;
+    }
     return null;
   }
 
@@ -1048,9 +1068,20 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                       })}
                     </div>
                   )}
+                  {form.geo_mode !== "off" && (
+                    <Field label={form.geo_mode === "allow" ? "Allowed countries" : "Blocked countries"}
+                      hint="Every selected country, including ones not in the quick list above. Add any ISO 3166 two-letter code (IN, US, GB…).">
+                      <ChipInput values={form.geo_countries} onChange={v => upd({ geo_countries: v })} placeholder="e.g. NP"
+                        transform={s => s.trim().toUpperCase()} validate={isCountryCode}
+                        invalidMessage={s => countryCodeProblem(s) ?? "Invalid country code"}
+                        label={c => isCountryCode(c) ? `${c} ${countryName(c)}` : c} />
+                    </Field>
+                  )}
                   <Row>
-                    <Field label="IP / CIDR Allow-list" hint="Always permitted (overrides blocks)"><ChipInput values={form.ip_allow} onChange={v => upd({ ip_allow: v })} placeholder="10.0.0.0/8" /></Field>
-                    <Field label="IP / CIDR Block-list" hint="Always denied"><ChipInput values={form.ip_block} onChange={v => upd({ ip_block: v })} placeholder="203.0.113.7" /></Field>
+                    <Field label="IP / CIDR Allow-list" hint="Always permitted (overrides blocks). An address or a range."><ChipInput values={form.ip_allow} onChange={v => upd({ ip_allow: v })} placeholder="10.0.0.0/8 or 192.0.2.10"
+                      validate={isIpOrCidr} invalidMessage={s => `"${s}" is not an IP address or CIDR range`} /></Field>
+                    <Field label="IP / CIDR Block-list" hint="Always denied. An address or a range."><ChipInput values={form.ip_block} onChange={v => upd({ ip_block: v })} placeholder="203.0.113.7 or 203.0.113.0/24"
+                      validate={isIpOrCidr} invalidMessage={s => `"${s}" is not an IP address or CIDR range`} /></Field>
                   </Row>
                   <GroupLabel>Blacklist Sources <Tag kind="stored" /></GroupLabel>
                   {form.ip_block.length > 0 && (

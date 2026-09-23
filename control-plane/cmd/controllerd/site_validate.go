@@ -195,7 +195,15 @@ func validateWafPolicyValues(raw json.RawMessage) []SiteConfigProblem {
 		MaxBodySize    *float64 `json:"max_body_size"`
 		MaxURILength   *float64 `json:"max_uri_length"`
 		MaxHeaderCount *float64 `json:"max_header_count"`
-		PathOverrides  []struct {
+		GeoIP          *struct {
+			BlockCountries []string `json:"block_countries"`
+			AllowCountries []string `json:"allow_countries"`
+		} `json:"geoip"`
+		IPReputation *struct {
+			Allow []string `json:"allow"`
+			Block []string `json:"block"`
+		} `json:"ip_reputation"`
+		PathOverrides []struct {
 			PathPrefix       string          `json:"path_prefix"`
 			Mode             *string         `json:"mode"`
 			AnomalyThreshold *int            `json:"anomaly_threshold"`
@@ -271,6 +279,34 @@ func validateWafPolicyValues(raw json.RawMessage) []SiteConfigProblem {
 			"limit protects nothing; SSO redirects need 16384")
 	checkLimit("waf_policy.max_header_count", p.MaxHeaderCount, maxSiteHeaders,
 		"browsers send 15-25 headers")
+
+	// Network lists. Refused rather than stored: the data plane skips an entry it
+	// cannot parse with nothing but a WARN, so a bad entry saved here is a
+	// control the console shows as set and nothing enforces.
+	if p.GeoIP != nil {
+		for field, list := range map[string][]string{
+			"waf_policy.geoip.block_countries": p.GeoIP.BlockCountries,
+			"waf_policy.geoip.allow_countries": p.GeoIP.AllowCountries,
+		} {
+			for _, c := range list {
+				if m := countryCodeProblem(c); m != "" {
+					add(field, m)
+				}
+			}
+		}
+	}
+	if p.IPReputation != nil {
+		for field, list := range map[string][]string{
+			"waf_policy.ip_reputation.allow": p.IPReputation.Allow,
+			"waf_policy.ip_reputation.block": p.IPReputation.Block,
+		} {
+			for _, e := range list {
+				if m := ipEntryProblem(e); m != "" {
+					add(field, m)
+				}
+			}
+		}
+	}
 
 	// Per-path overrides. These are rejected rather than silently normalised: an
 	// override an operator believes is protecting /api/ but which the data plane

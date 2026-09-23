@@ -91,27 +91,22 @@ impl IpReputation {
         rep
     }
 
-    /// Add a CIDR range to the allowlist.
+    /// Add an address or CIDR range to the allowlist.
     pub fn add_allowed_cidr(&mut self, cidr: &str) -> anyhow::Result<()> {
-        let net =
-            IpNet::from_str(cidr).map_err(|e| anyhow::anyhow!("invalid CIDR '{cidr}': {e}"))?;
-        self.allowlist.push(net);
+        self.allowlist.push(parse_ip_or_cidr(cidr)?);
         Ok(())
     }
 
-    /// Add a CIDR range to the blocklist with a human-readable reason.
+    /// Add an address or CIDR range to the blocklist with a human-readable reason.
     pub fn add_blocked_cidr(&mut self, cidr: &str, reason: &str) -> anyhow::Result<()> {
-        let net =
-            IpNet::from_str(cidr).map_err(|e| anyhow::anyhow!("invalid CIDR '{cidr}': {e}"))?;
-        self.blocklist.push((net, reason.to_string()));
+        self.blocklist
+            .push((parse_ip_or_cidr(cidr)?, reason.to_string()));
         Ok(())
     }
 
-    /// Add a CIDR range to the suspect list with category tags.
+    /// Add an address or CIDR range to the suspect list with category tags.
     pub fn add_suspect_cidr(&mut self, cidr: &str, tags: Vec<String>) -> anyhow::Result<()> {
-        let net =
-            IpNet::from_str(cidr).map_err(|e| anyhow::anyhow!("invalid CIDR '{cidr}': {e}"))?;
-        self.suspect_list.push((net, tags));
+        self.suspect_list.push((parse_ip_or_cidr(cidr)?, tags));
         Ok(())
     }
 
@@ -282,6 +277,25 @@ fn normalize_ip(ip: IpAddr) -> IpAddr {
     ip
 }
 
+/// Parse an operator's list entry: a CIDR (`10.0.0.0/8`) or a bare address
+/// (`203.0.113.7`, meaning that one host — /32, or /128 for IPv6).
+///
+/// Bare addresses used to fail here as "invalid CIDR" and be skipped with a WARN,
+/// so a site whose block list read `203.0.113.7` — the console's own placeholder —
+/// saved, displayed the entry, and blocked nothing. The feed loader and the XDP
+/// seeding already accepted bare addresses; only the per-site lists did not, so
+/// the same entry worked or not depending on the kernel-drop toggle.
+pub fn parse_ip_or_cidr(entry: &str) -> anyhow::Result<IpNet> {
+    let e = entry.trim();
+    if let Ok(net) = IpNet::from_str(e) {
+        return Ok(net);
+    }
+    if let Ok(addr) = e.parse::<IpAddr>() {
+        return Ok(IpNet::from(addr));
+    }
+    anyhow::bail!("'{entry}' is not an IP address or CIDR range")
+}
+
 /// Check whether an `IpNet` contains an `IpAddr`, handling v4/v6 mismatch
 /// gracefully (returns false rather than panicking).
 fn net_contains(net: &IpNet, ip: IpAddr) -> bool {
@@ -387,5 +401,50 @@ mod tests {
         ));
         // Allowlist override within cfg2
         assert_eq!(rep.check(ipv4(198, 51, 100, 1)), IpVerdict::Allow);
+    }
+}
+
+#[cfg(test)]
+mod operator_list_entry_tests {
+    use super::*;
+
+    #[test]
+    fn a_bare_address_blocks_that_host_only() {
+        let mut r = IpReputation::new();
+        r.add_blocked_cidr("203.0.113.7", "config blocklist")
+            .unwrap();
+        r.add_blocked_cidr(" 2001:db8::5 ", "config blocklist")
+            .unwrap();
+        assert!(matches!(
+            r.check("203.0.113.7".parse().unwrap()),
+            IpVerdict::Block { .. }
+        ));
+        assert!(matches!(
+            r.check("203.0.113.8".parse().unwrap()),
+            IpVerdict::Allow
+        ));
+        assert!(matches!(
+            r.check("2001:db8::5".parse().unwrap()),
+            IpVerdict::Block { .. }
+        ));
+        assert!(matches!(
+            r.check("2001:db8::6".parse().unwrap()),
+            IpVerdict::Allow
+        ));
+    }
+
+    #[test]
+    fn cidr_ranges_still_work_and_garbage_is_refused() {
+        assert_eq!(
+            parse_ip_or_cidr("10.0.0.0/8").unwrap().to_string(),
+            "10.0.0.0/8"
+        );
+        assert_eq!(
+            parse_ip_or_cidr("203.0.113.7").unwrap().to_string(),
+            "203.0.113.7/32"
+        );
+        for bad in ["not-an-ip", "", "10.0.0.0/33", "300.1.1.1", "10.0.0.1/8x"] {
+            assert!(parse_ip_or_cidr(bad).is_err(), "{bad:?} must be refused");
+        }
     }
 }
