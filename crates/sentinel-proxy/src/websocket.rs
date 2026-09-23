@@ -186,7 +186,40 @@ fn close_frame(code: u16, reason: &[u8]) -> Vec<u8> {
     let mut payload = Vec::with_capacity(reason.len() + 2);
     payload.extend_from_slice(&code.to_be_bytes());
     payload.extend_from_slice(reason);
-    encode_frame(true, OPCODE_CLOSE, false, [0u8; 4], &payload)
+    encode_frame(true, OPCODE_CLOSE, true, fresh_mask(), &payload)
+}
+
+/// A fresh, unpredictable masking key for a client-to-server frame.
+///
+/// RFC 6455 §5.1: a client MUST mask every frame it sends, and a server MUST
+/// close the connection on receiving an unmasked one. Toward the origin this
+/// relay IS the client. §5.3 requires the key to be unpredictable — it exists so
+/// a hostile page cannot choose the bytes an intermediary sees on the wire — so
+/// it comes from the system CSPRNG, never a counter.
+///
+/// `fill` failing means the OS RNG is unavailable, which on Linux does not
+/// happen after boot. The zero key it would leave is still a SET mask bit —
+/// correct framing that strict servers accept — only predictable, which is the
+/// lesser failure than breaking every WebSocket on the node.
+fn fresh_mask() -> [u8; 4] {
+    use ring::rand::SecureRandom as _;
+    let mut m = [0u8; 4];
+    let _ = ring::rand::SystemRandom::new().fill(&mut m);
+    m
+}
+
+/// Re-encode a frame read from the CLIENT for forwarding to the ORIGIN.
+///
+/// `read_frame` unmasks the payload so the rule engine can inspect it, and its
+/// `raw` is the UNMASKED encoding — right for the origin→client direction, where
+/// frames must not be masked, and wrong for this one. Forwarding `raw` upstream
+/// sent every client frame unmasked, so any strict WebSocket server (gorilla,
+/// Node `ws`, Python `websockets`) closed the connection with 1002 on the first
+/// message: VM consoles and live dashboards behind the WAF could complete the
+/// handshake and then carry nothing. The e2e suite never noticed because it
+/// checked for the 101 and stopped.
+fn to_origin(frame: &WsFrame) -> Vec<u8> {
+    encode_frame(frame.fin, frame.opcode, true, fresh_mask(), &frame.payload)
 }
 
 // ---------------------------------------------------------------------------
@@ -269,25 +302,32 @@ pub async fn relay<C, U>(
                                 payload_len = frame.payload.len(),
                                 "WS frame blocked by rule engine"
                             );
-                            // Send policy-violation close frame to client.
+                            // Ask the ORIGIN to close with 1008 (policy violation).
+                            // The client write half belongs to the u→c task, so
+                            // the client learns of it the protocol's way: the
+                            // origin answers a Close with a Close, and that
+                            // crosses the u→c relay. This comment used to say the
+                            // frame went "to client"; it never did — and it went
+                            // unmasked, so a strict origin rejected even the close
+                            // and the client was left with a silent socket.
                             let cf = close_frame(1008, b"WAF: attack detected");
                             let _ = upstream_write.write_all(&cf).await;
                             break;
                         }
                     }
-                    // Clean — forward.
-                    if upstream_write.write_all(&frame.raw).await.is_err() {
+                    // Clean — forward, masked (see `to_origin`).
+                    if upstream_write.write_all(&to_origin(&frame)).await.is_err() {
                         break;
                     }
                 }
                 OPCODE_CLOSE => {
                     // Forward close and stop.
-                    let _ = upstream_write.write_all(&frame.raw).await;
+                    let _ = upstream_write.write_all(&to_origin(&frame)).await;
                     break;
                 }
                 _ => {
-                    // Binary / continuation / ping / pong — pass through.
-                    if upstream_write.write_all(&frame.raw).await.is_err() {
+                    // Binary / continuation / ping / pong — pass through, masked.
+                    if upstream_write.write_all(&to_origin(&frame)).await.is_err() {
                         break;
                     }
                 }

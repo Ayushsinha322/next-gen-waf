@@ -2920,13 +2920,64 @@ async fn proxy(
                 client_ip = %ctx.client_ip,
                 "proxy error: {e:#}"
             );
-            let resp = error_response(StatusCode::BAD_GATEWAY, "Bad Gateway");
+            let status = gateway_error_status(&e);
+            let resp = error_response(status, status.canonical_reason().unwrap_or("Bad Gateway"));
             stamp_response(&mut ctx, &resp);
             ctx.gateway_error = Some(cap_field(&format!("{e:#}"), 512));
             ctx.advance_phase(Phase::Logging);
             log_request(&ctx);
             resp
         }
+    }
+}
+
+/// The status for a request that failed before the origin produced a response.
+///
+/// 504 when the origin was reached but did not answer within the site's read
+/// timeout — the application is slow or hung. 502 for everything else: refused,
+/// unreachable, TLS failure, no healthy upstream, no matching site. Telling the
+/// two apart is the first thing an operator needs when a site stops working,
+/// and it used to be impossible because both were 502.
+///
+/// Walks the whole error chain, since the timeout is wrapped in context on its
+/// way up, and matches on the TYPE so rewording a message cannot change a status.
+fn gateway_error_status(e: &anyhow::Error) -> StatusCode {
+    if e.chain().any(|c| c.is::<upstream::UpstreamTimeout>()) {
+        StatusCode::GATEWAY_TIMEOUT
+    } else {
+        StatusCode::BAD_GATEWAY
+    }
+}
+
+#[cfg(test)]
+mod gateway_error_status_tests {
+    use super::*;
+
+    #[test]
+    fn a_read_timeout_is_504_even_when_wrapped_in_context() {
+        let e = anyhow::Error::new(upstream::UpstreamTimeout(std::time::Duration::from_secs(
+            60,
+        )))
+        .context("upstream request failed");
+        assert_eq!(gateway_error_status(&e), StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    #[test]
+    fn every_other_failure_is_502() {
+        for e in [
+            anyhow::anyhow!("upstream request failed: connection refused"),
+            anyhow::anyhow!("no healthy upstream for site 'x'"),
+            anyhow::anyhow!("invalid peer certificate: UnknownIssuer"),
+        ] {
+            assert_eq!(gateway_error_status(&e), StatusCode::BAD_GATEWAY, "{e:#}");
+        }
+    }
+
+    #[test]
+    fn a_message_that_merely_mentions_a_timeout_is_not_a_timeout() {
+        // Matching on text would make this 504; the type is what decides.
+        let e = anyhow::anyhow!("upstream request timed out after 60s");
+        assert_eq!(gateway_error_status(&e), StatusCode::BAD_GATEWAY);
     }
 }
 

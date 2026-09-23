@@ -322,6 +322,28 @@ fn resolve_sni(
 ///
 /// Factored out because there is now more than one: the node default plus one per
 /// distinct per-site connect timeout. Everything except the connect timeout —
+/// The origin accepted the connection but sent no response headers within the
+/// site's read timeout.
+///
+/// A distinct error TYPE, because the answer to the client depends on it: an
+/// origin that is reachable but slow is a 504 Gateway Timeout, while one that
+/// refused the connection, failed TLS or sent garbage is a 502 Bad Gateway. Every
+/// upstream failure used to be 502, so "the application is hanging" and "the
+/// application is down" looked identical in the browser and in the logs — on the
+/// first real UAT deployment the operator saw 502 for an app that was accepting
+/// connections and never answering. Matched by type in
+/// `gateway_error_status`, never by message text.
+#[derive(Debug)]
+pub struct UpstreamTimeout(pub Duration);
+
+impl std::fmt::Display for UpstreamTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "upstream request timed out after {:?}", self.0)
+    }
+}
+
+impl std::error::Error for UpstreamTimeout {}
+
 /// Extra trust anchors for ORIGIN connections, from `SENTINEL_UPSTREAM_CA_FILE`.
 ///
 /// `Ok(vec![])` — not configured.
@@ -796,10 +818,10 @@ impl UpstreamPool {
         // SSE streams. A timeout is a breaker failure.
         let result = match tokio::time::timeout(timeout, client.request(req)).await {
             Ok(r) => r.context("upstream request failed"),
-            Err(_) => Err(anyhow::anyhow!(
-                "upstream request timed out after {:?}",
-                timeout
-            )),
+            // Typed, not a formatted string: the gateway answers 504 for this and
+            // 502 for everything else, and it must be able to tell them apart
+            // without parsing an error message. See `UpstreamTimeout`.
+            Err(_) => Err(anyhow::Error::new(UpstreamTimeout(timeout))),
         };
 
         if let Some(ref h) = srv_health {
