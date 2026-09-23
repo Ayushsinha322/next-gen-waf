@@ -197,16 +197,32 @@ done
 (( fail == 0 )) || die "one or more uploads failed — the published set is INCOMPLETE"
 
 step "Verifying what the registry actually serves"
-# Check back whichever variant is the preferred one that actually got built.
-VERIFY_FILE="$REGISTRY"; [[ -f "$VERIFY_FILE" ]] || VERIFY_FILE="$ONLINE"
-served=$(curl -sS -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "$BASE/$VERIFY_FILE.sha256" 2>/dev/null)
-local_sum=$(cat "$VERIFY_FILE.sha256")
-if [[ "$served" == "$local_sum" ]]; then
-  ok "the registry serves the checksum we just built"
-else
-  warn "served checksum differs from the local one:"
-  printf '      served: %s\n      local : %s\n' "${served:0:20}…" "${local_sum:0:20}…"
-fi
+# Every uploaded file, against the SHA-256 GitLab itself computed on receipt.
+# This used to check back ONE file — the registry or online bundle — so a publish
+# of only the offline bundle "verified" a file it never uploaded, got a 404 page
+# back, warned, and then printed "Published" anyway. A mismatch is now fatal.
+api="$GITLAB/api/v4/projects/$PROJECT_ID/packages"
+pkg_id=$(curl -sS -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+           "$api?package_type=generic&package_name=esdswaf&package_version=$VERSION" 2>/dev/null |
+         python3 -c 'import sys,json; d=json.load(sys.stdin); print(d[0]["id"] if d else "")' 2>/dev/null)
+[[ -n "$pkg_id" ]] || die "the registry lists no esdswaf $VERSION package after the upload"
+files_json=$(curl -sS -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "$api/$pkg_id/package_files?per_page=100" 2>/dev/null)
+bad=0
+for f in "${UPLOADS[@]}"; do
+  want=$(sha256sum "$f" | cut -d' ' -f1)
+  # Re-uploading a name adds a new entry; the newest one is what is served.
+  got=$(printf '%s' "$files_json" | python3 -c '
+import sys,json
+name=sys.argv[1]
+m=[x for x in json.load(sys.stdin) if x.get("file_name")==name]
+print(max(m,key=lambda x:x["id"]).get("file_sha256") or "" if m else "")' "$f" 2>/dev/null)
+  if [[ "$got" == "$want" ]]; then
+    ok "$f"
+  else
+    warn "$f: registry has ${got:-nothing}, local is $want"; bad=1
+  fi
+done
+(( bad == 0 )) || die "the registry does not hold what was built — do NOT announce this release"
 
 printf '\n  %s%sPublished v%s%s\n\n' "$GRN" "$B" "$VERSION" "$R"
 printf '    %s\n\n' "$GITLAB/research-lab/SIG-CyberSec/sentinel-waf/-/packages"
