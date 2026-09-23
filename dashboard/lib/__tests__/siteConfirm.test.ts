@@ -45,3 +45,19 @@ describe("the dangerous actions are wired to ask", () => {
     expect(src("components/dashboard/WorldMap.tsx")).toMatch(/confirmAction\(countryBlockConfirm/);
   });
 });
+
+// Users could be created and never changed or removed from the console — a
+// leaver kept access. Pin that the Users tab offers role, disable and remove,
+// behind a confirmation, and reads the viewer in an effect.
+describe("the Users tab can change and remove users", () => {
+  const s = readFileSync(join(__dirname, "../..", "app/(dashboard)/settings/page.tsx"), "utf8");
+  it("wires role change, disable and remove through confirmAction", () => {
+    expect(s).toMatch(/api\.admin\.users\.update\(u\.id, \{ role \}\)/);
+    expect(s).toMatch(/api\.admin\.users\.update\(u\.id, \{ status:/);
+    expect(s).toMatch(/api\.admin\.users\.remove\(u\.id\)/);
+    expect((s.match(/await confirmAction\(\{/g) ?? []).length).toBeGreaterThanOrEqual(3);
+  });
+  it("reads the signed-in user in an effect, not during render", () => {
+    expect(s).toMatch(/useEffect\(\(\) => \{ setMe\(getUser\(\)\); \}, \[\]\)/);
+  });
+});

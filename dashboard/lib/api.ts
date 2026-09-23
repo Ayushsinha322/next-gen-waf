@@ -1197,6 +1197,14 @@ export const api = {
        * in the response: an administrator who could read a colleague's new
        * password could then act as them, and the audit trail would show the
        * colleague. */
+      /** Change a user's role and/or status. The server refuses changing your own
+       *  role, granting/removing owner as a non-owner, and removing the last
+       *  active administrator — and signs the user out on every node. */
+      update: (id: string, body: { role?: string; status?: string }) =>
+        apiFetch<{ ok: boolean }>(`/admin/users/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+      remove: (id: string) =>
+        apiFetch<{ ok: boolean }>(`/admin/users/${id}`, { method: "DELETE" }),
+
       sendResetLink: (id: string) =>
         apiFetch<{ ok: boolean; message: string }>(`/admin/users/${id}/reset-password`, { method: "POST" }),
     },

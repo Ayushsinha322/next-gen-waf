@@ -119,7 +119,16 @@ func (s *Store) UpdateUser(ctx context.Context, tenantID, actorID, userID, role,
 	err = tx.QueryRow(ctx, `
 		UPDATE users
 		SET role   = COALESCE(NULLIF($2, ''), role),
-		    status = COALESCE(NULLIF($3, ''), status)
+		    status = COALESCE(NULLIF($3, ''), status),
+		    -- A role change or a disable ends the user's sessions on EVERY
+		    -- control-plane node. The role travels inside the access token, so
+		    -- without a cut-off a demoted admin kept admin rights until the token
+		    -- expired; and the in-memory cut-off the handler sets reaches only the
+		    -- node that ran the write — the others learn from this column.
+		    sessions_valid_from = CASE
+		        WHEN ($2 <> '' AND $2 <> role)
+		          OR ($3 <> '' AND $3 <> status AND $3 <> 'active') THEN now()
+		        ELSE sessions_valid_from END
 		WHERE id = $1 AND tenant_id = $4
 		RETURNING id`,
 		userID, role, status, tenantID).Scan(&got)

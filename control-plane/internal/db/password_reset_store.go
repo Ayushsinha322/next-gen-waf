@@ -261,6 +261,31 @@ func (s *Store) SessionEpochs(ctx context.Context) (map[string]time.Time, error)
 	return out, rows.Err()
 }
 
+// UserIDs lists every user id, across tenants. Used by the session cache to
+// notice an account that has been DELETED: its row — and so its session
+// cut-off — is gone, which a node that did not run the delete could otherwise
+// never learn, and would keep honouring the user's access token until expiry.
+func (s *Store) UserIDs(ctx context.Context) (map[string]struct{}, error) {
+	pg, ok := s.pool.(*pgxPool)
+	if !ok {
+		return nil, fmt.Errorf("store: pool is not a *pgxPool")
+	}
+	rows, err := pg.pool.Query(ctx, `SELECT id FROM users`)
+	if err != nil {
+		return nil, fmt.Errorf("store: user ids: %w", err)
+	}
+	defer rows.Close()
+	out := make(map[string]struct{})
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out[id] = struct{}{}
+	}
+	return out, rows.Err()
+}
+
 // CleanupExpiredResetTokens prunes spent and expired tokens. Returns rows removed.
 func (s *Store) CleanupExpiredResetTokens(ctx context.Context) (int64, error) {
 	pg, ok := s.pool.(*pgxPool)

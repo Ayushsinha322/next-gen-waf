@@ -7,6 +7,7 @@ import Toggle from "@/components/ui/Toggle";
 import { api, type UserRow, type APIKeyRow, type NotificationChannel, type ChannelType, type ChannelConfig, type Severity, type ManagementTLSInfo, type ClusterHealth } from "@/lib/api";
 import { staggerContainer, fadeUp, spring, tweenFast } from "@/lib/animations";
 import { logout, getUser } from "@/lib/auth";
+import { confirmAction } from "@/components/ui/confirm";
 import { PRODUCT_NAME } from "@/lib/version";
 import Icon from "@/components/ui/Icon";
 
@@ -399,6 +400,56 @@ function UsersTab() {
   const [mailReady, setMailReady] = useState<boolean | null>(null);
   const [mailHost, setMailHost]   = useState("");
 
+  // Who is looking at this page, read in an effect (never during render — see
+  // the top-bar identity bug). Decides which rows can be changed from here.
+  const [me, setMe] = useState<{ id: string; email: string; role: string } | null>(null);
+  useEffect(() => { setMe(getUser()); }, []);
+  const [changing, setChanging] = useState<string | null>(null);
+
+  const isSelf = (u: UserRow) => !!me && (u.id === me.id || u.email.toLowerCase() === me.email.toLowerCase());
+  // Mirrors the server's rules (control-plane user_guard.go), so the console only
+  // offers what will succeed; the server remains the authority.
+  const canManage = (u: UserRow) => !!me && !isSelf(u) && (u.role !== "owner" || me.role === "owner");
+
+  async function changeRole(u: UserRow, role: string) {
+    if (role === u.role) return;
+    const ok = await confirmAction({
+      title: `Change ${u.email} to ${role}?`,
+      body: `Their current sessions end on every node and they sign in again with ${role} permissions.`,
+      confirmLabel: `Make ${role}`, tone: role === "admin" || role === "owner" ? "danger" : "warn",
+    });
+    if (!ok) return;
+    setChanging(u.id);
+    try { await api.admin.users.update(u.id, { role }); showToast(`${u.email} is now ${role}`, "s"); await loadUsers(); }
+    catch (e) { showToast(e instanceof Error ? e.message : "Could not change role", "e"); }
+    finally { setChanging(null); }
+  }
+
+  async function toggleUserStatus(u: UserRow) {
+    const disabling = u.status === "active";
+    if (disabling && !(await confirmAction({
+      title: `Disable ${u.email}?`,
+      body: "They are signed out on every node at once and cannot sign in until re-enabled. Their audit history is kept.",
+      confirmLabel: "Disable account", tone: "danger",
+    }))) return;
+    setChanging(u.id);
+    try { await api.admin.users.update(u.id, { status: disabling ? "disabled" : "active" }); showToast(`${u.email} ${disabling ? "disabled" : "re-enabled"}`, "s"); await loadUsers(); }
+    catch (e) { showToast(e instanceof Error ? e.message : "Could not change status", "e"); }
+    finally { setChanging(null); }
+  }
+
+  async function removeUser(u: UserRow) {
+    if (!(await confirmAction({
+      title: `Remove ${u.email}?`,
+      body: "The account is deleted and signed out on every node. Their actions stay in the audit log. This cannot be undone — to block access temporarily, disable the account instead.",
+      confirmLabel: "Remove user", tone: "danger",
+    }))) return;
+    setChanging(u.id);
+    try { await api.admin.users.remove(u.id); showToast(`${u.email} removed`, "s"); await loadUsers(); }
+    catch (e) { showToast(e instanceof Error ? e.message : "Could not remove user", "e"); }
+    finally { setChanging(null); }
+  }
+
   const loadUsers = () =>
     api.admin.users.list()
       .then(r => setUsers(r.users ?? []))
@@ -518,13 +569,24 @@ function UsersTab() {
           <div style={{padding:"16px",textAlign:"center",fontSize: 13,color:"var(--text3)"}}>Loading…</div>
         ) : (
           <table>
-            <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>2FA</th><th>Last Login</th><th>Status</th><th>Password</th></tr></thead>
+            <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>2FA</th><th>Last Login</th><th>Status</th><th>Password</th><th>Access</th></tr></thead>
             <tbody>
               {users.map((u, idx) => (
                 <motion.tr key={u.id} initial={{ opacity: 0, x: -6 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: idx * 0.02 }}>
                   <td>{u.name||"—"}</td>
                   <td className="td2">{u.email}</td>
-                  <td>{roleBadge(u.role)}</td>
+                  <td>
+                    {canManage(u) ? (
+                      <select className="fin2 fsel2" style={{ padding: "4px 8px", fontSize: 13, minWidth: 110 }}
+                        aria-label={`Role for ${u.email}`} value={u.role} disabled={changing === u.id}
+                        onChange={e => changeRole(u, e.target.value)}>
+                        {["viewer", "auditor", "editor", "admin", ...(me?.role === "owner" ? ["owner"] : [])].map(r =>
+                          <option key={r} value={r}>{r}</option>)}
+                      </select>
+                    ) : (
+                      <span title={isSelf(u) ? "You cannot change your own role" : "Only an owner can change an owner"}>{roleBadge(u.role)}</span>
+                    )}
+                  </td>
                   <td><span className={`bdg ${u.mfa_enabled?"bgg":"bgr"}`}>{u.mfa_enabled?"✓ TOTP":"✗ None"}</span></td>
                   <td className="td3">{fmtLogin(u.last_login_at)}</td>
                   <td><span className={`bdg ${u.status==="active"?"bgg":"bgr"}`}>{u.status.toUpperCase()}</span></td>
@@ -539,6 +601,17 @@ function UsersTab() {
                     >
                       {resetting === u.id ? "Sending…" : "Send reset link"}
                     </button>
+                  </td>
+                  <td style={{ whiteSpace: "nowrap" }}>
+                    {canManage(u) ? (
+                      <>
+                        <button className="btn btn-sm" disabled={changing === u.id} onClick={() => toggleUserStatus(u)}>
+                          {u.status === "active" ? "Disable" : "Enable"}
+                        </button>{" "}
+                        <button className="btn btn-sm" disabled={changing === u.id} onClick={() => removeUser(u)}
+                          style={{ color: "var(--red-b)" }}>Remove</button>
+                      </>
+                    ) : <span className="td3">{isSelf(u) ? "you" : "owner"}</span>}
                   </td>
                 </motion.tr>
               ))}

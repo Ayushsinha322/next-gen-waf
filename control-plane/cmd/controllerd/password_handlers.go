@@ -67,10 +67,18 @@ var (
 type sessionEpochCache struct {
 	mu sync.RWMutex
 	m  map[string]time.Time
+	// known is every user id the last refresh saw; gone holds ids that were in
+	// it and have since disappeared (deleted users) with when that was noticed.
+	known map[string]struct{}
+	gone  map[string]time.Time
 }
 
+// goneRetention outlives the longest access token, after which a deleted
+// user's tokens are dead on their own.
+const goneRetention = 20 * time.Minute
+
 func newSessionEpochCache() *sessionEpochCache {
-	return &sessionEpochCache{m: make(map[string]time.Time)}
+	return &sessionEpochCache{m: make(map[string]time.Time), gone: make(map[string]time.Time)}
 }
 
 // valid reports whether a token issued at issuedAt is still acceptable.
@@ -83,7 +91,11 @@ func newSessionEpochCache() *sessionEpochCache {
 func (s *sessionEpochCache) valid(userID string, issuedAt time.Time) bool {
 	s.mu.RLock()
 	epoch, ok := s.m[userID]
+	_, deleted := s.gone[userID]
 	s.mu.RUnlock()
+	if deleted {
+		return false
+	}
 	if !ok {
 		return true
 	}
@@ -109,6 +121,37 @@ func (s *sessionEpochCache) replace(fresh map[string]time.Time) {
 		}
 	}
 	s.m = fresh
+}
+
+// observeUsers records the current set of user ids. An id present at the
+// previous refresh and absent now is a deleted account: its tokens are refused
+// from here on, on this node, even though no cut-off row exists for it. The
+// first observation only establishes the baseline.
+func (s *sessionEpochCache) observeUsers(ids map[string]struct{}, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.known != nil {
+		for id := range s.known {
+			if _, still := ids[id]; !still {
+				if _, already := s.gone[id]; !already {
+					s.gone[id] = now
+				}
+			}
+		}
+	}
+	for id, at := range s.gone {
+		if now.Sub(at) > goneRetention {
+			delete(s.gone, id)
+		}
+	}
+	s.known = ids
+}
+
+// markDeleted refuses a user's tokens immediately on the node that ran the delete.
+func (s *sessionEpochCache) markDeleted(userID string, now time.Time) {
+	s.mu.Lock()
+	s.gone[userID] = now
+	s.mu.Unlock()
 }
 
 var sessionEpochs = newSessionEpochCache()
@@ -137,6 +180,11 @@ func startSessionEpochRefresh(ctx context.Context, store *db.Store, log *zap.Log
 			return
 		}
 		sessionEpochs.replace(fresh)
+		if ids, err := store.UserIDs(c); err == nil {
+			sessionEpochs.observeUsers(ids, time.Now().UTC())
+		} else {
+			log.Warn("user id refresh failed; deleted-account detection is stale", zap.Error(err))
+		}
 	}
 	load()
 	go func() {

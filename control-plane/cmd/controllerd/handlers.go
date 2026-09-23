@@ -3531,6 +3531,10 @@ func handleUpdateUser(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid role"})
 		return
 	}
+	if problem, status := checkUserChange(c, store, claims.TenantID, claims.UserID, claims.Role, c.Param("id"), req.Role, req.Status, false); problem != "" {
+		c.JSON(status, gin.H{"error": problem})
+		return
+	}
 	if err := store.UpdateUser(c.Request.Context(), claims.TenantID, claims.UserID, c.Param("id"), req.Role, req.Status); err != nil {
 		respondStoreError(c, err)
 		return
@@ -3553,7 +3557,9 @@ func handleUpdateUser(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 
 	// A disabled account must stop being able to act immediately rather than at
 	// the end of its current access token's life.
-	if strings.EqualFold(req.Status, "disabled") || strings.EqualFold(req.Status, "suspended") {
+	// Sign the user out here at once; the other nodes follow from the
+	// sessions_valid_from column UpdateUser wrote, within the 5 s refresh.
+	if req.Role != "" || strings.EqualFold(req.Status, "disabled") || strings.EqualFold(req.Status, "suspended") {
 		sessionEpochs.set(targetID, time.Now().UTC())
 	}
 
@@ -3574,6 +3580,10 @@ func handleDeleteUser(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 		c.JSON(http.StatusBadRequest, gin.H{"error": "cannot delete your own account"})
 		return
 	}
+	if problem, status := checkUserChange(c, store, claims.TenantID, claims.UserID, claims.Role, c.Param("id"), "", "", true); problem != "" {
+		c.JSON(status, gin.H{"error": problem})
+		return
+	}
 	if err := store.DeleteUser(c.Request.Context(), claims.TenantID, claims.UserID, c.Param("id")); err != nil {
 		respondStoreError(c, err)
 		return
@@ -3591,7 +3601,8 @@ func handleDeleteUser(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 		TargetKind:  "user",
 		TargetID:    &targetID,
 	})
-	sessionEpochs.set(targetID, time.Now().UTC())
+	// Here at once; the other nodes notice the missing row on their next refresh.
+	sessionEpochs.markDeleted(targetID, time.Now().UTC())
 
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
