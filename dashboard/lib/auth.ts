@@ -162,26 +162,61 @@ export function clearSessionCookie() {
  * Updates the stored access token on success.
  * Returns true if refreshed, false if the refresh token is missing/invalid.
  */
-export async function refreshToken(): Promise<boolean> {
-  const refreshTok = read(REFRESH_KEY);
-  if (!refreshTok) return false;
+export type RefreshOutcome = "ok" | "invalid" | "unavailable";
 
-  const res = await fetch("/api/v1/auth/refresh", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ refresh_token: refreshTok }),
-  });
-  if (!res.ok) {
+let refreshInFlight: Promise<RefreshOutcome> | null = null;
+
+/**
+ * Renew the access token with the refresh token.
+ *
+ * "invalid" means the control plane REJECTED the session (401/403: expired,
+ * signed out elsewhere, user disabled) — only then is the browser signed out.
+ * "unavailable" means the request failed for any other reason: a 5xx while a
+ * control-plane node restarts during an upgrade, "cannot verify session" when
+ * its database check times out, a network blip. Those used to sign the operator
+ * out too, which is how a console tab left open across an upgrade dropped to
+ * the login page on its next click. The session is kept; the caller reports the
+ * outage and the next request tries again.
+ *
+ * Concurrent callers share ONE refresh: after an idle tab's access token
+ * expires, a page opening fires several requests at once, and each used to
+ * start its own refresh.
+ */
+export function refreshSession(): Promise<RefreshOutcome> {
+  if (!refreshInFlight) {
+    refreshInFlight = doRefresh().finally(() => { refreshInFlight = null; });
+  }
+  return refreshInFlight;
+}
+
+async function doRefresh(): Promise<RefreshOutcome> {
+  const refreshTok = read(REFRESH_KEY);
+  if (!refreshTok) return "invalid";
+  let res: Response;
+  try {
+    res = await fetch("/api/v1/auth/refresh", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refresh_token: refreshTok }),
+    });
+  } catch {
+    return "unavailable";
+  }
+  if (res.status === 401 || res.status === 403) {
     logout();
-    return false;
+    return "invalid";
   }
-  const data = await res.json();
-  if (data.access_token) {
-    store(ACCESS_KEY, data.access_token);
-    if (typeof document !== "undefined") {
-      document.cookie = `sentinel_token=${data.access_token}; path=/; max-age=604800; SameSite=Lax`;
-    }
-    return true;
+  if (!res.ok) return "unavailable";
+  const data = await res.json().catch(() => ({}));
+  if (!data.access_token) return "unavailable";
+  store(ACCESS_KEY, data.access_token);
+  if (typeof document !== "undefined") {
+    document.cookie = `sentinel_token=${data.access_token}; path=/; max-age=604800; SameSite=Lax`;
   }
-  return false;
+  return "ok";
+}
+
+/** Boolean form kept for existing callers: true only when a new token was stored. */
+export async function refreshToken(): Promise<boolean> {
+  return (await refreshSession()) === "ok";
 }

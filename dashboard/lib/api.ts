@@ -2,7 +2,7 @@
  * Typed REST client for the Sentinel control-plane API.
  * All paths are relative so Next.js rewrites proxy them to the control plane.
  */
-import { getToken, logout, refreshToken } from "./auth";
+import { getToken, logout, refreshSession } from "./auth";
 
 const BASE = "/api/v1";
 
@@ -22,11 +22,13 @@ async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
 
   // Attempt one token refresh on 401.
   if (res.status === 401) {
-    const refreshed = await refreshToken();
-    if (refreshed) {
+    const outcome = await refreshSession();
+    if (outcome === "ok") {
       const newToken = getToken();
       if (newToken) headers["Authorization"] = `Bearer ${newToken}`;
       res = await fetch(`${BASE}${path}`, { ...init, headers });
+    } else if (outcome === "unavailable") {
+      throw new Error("The control plane is temporarily unavailable — your session is kept; try again in a moment");
     } else {
       logout();
       if (typeof window !== "undefined") window.location.href = "/login";
@@ -92,9 +94,11 @@ async function apiUpload<T>(path: string, form: FormData): Promise<T> {
 
   let res = await send();
   if (res.status === 401) {
-    const refreshed = await refreshToken();
-    if (refreshed) {
+    const outcome = await refreshSession();
+    if (outcome === "ok") {
       res = await send();
+    } else if (outcome === "unavailable") {
+      throw new Error("The control plane is temporarily unavailable — your session is kept; try again in a moment");
     } else {
       logout();
       if (typeof window !== "undefined") window.location.href = "/login";
@@ -979,8 +983,11 @@ async function downloadExport(path: string, fallbackName: string): Promise<{ fil
 
   let res = await fetch(`${BASE}${path}`, { headers });
   if (res.status === 401) {
-    const refreshed = await refreshToken();
-    if (!refreshed) {
+    const outcome = await refreshSession();
+    if (outcome === "unavailable") {
+      throw new Error("The control plane is temporarily unavailable — your session is kept; try again in a moment");
+    }
+    if (outcome !== "ok") {
       logout();
       if (typeof window !== "undefined") window.location.href = "/login";
       throw new Error("Session expired — redirecting to login");
