@@ -335,17 +335,23 @@ Leave that open, then browse to **https://127.0.0.1:9443**
 Ports **80 and 443 *are*** published on all interfaces — that is the traffic path,
 and it is what your protected sites are served on.
 
-### 4.2 🔴 The password cannot be changed. Do these three things now.
+### 4.2 🔴 Secure the admin account. Do these four things now.
 
-**This build has no password-change screen and no password-reset endpoint.** The
-user API accepts `role` and `status` only. That one credential is the way into this
-console for the life of the installation.
+The installer generates one administrator password. Recovery of a forgotten
+password is by email only, and there is no command-line reset — so set up a way
+back in before you need one.
 
-**1. Read it back and record it somewhere durable.**
+**1. Read it back, log in, and change it.**
 
 ```bash
 sudo grep SENTINEL_BOOTSTRAP_ADMIN_PASSWORD /opt/sentinel/current/.env
 ```
+
+Then Settings → Users & RBAC → **Your password**. The `.env` keeps the ORIGINAL
+value; it is set once, when the account is created, and does not follow a change.
+The helper scripts (`first-site.sh`, `add-operator.sh`, `onboard-site.sh`) try it
+first and ask for the current password when it is rejected, or take it from
+`SENTINEL_ADMIN_PASSWORD`.
 
 **2. Back up the secrets file, off this VM.**
 
@@ -357,10 +363,16 @@ sudo cp /opt/sentinel/current/.env /root/esdswaf-secrets-$(date +%F).env
 It holds every secret for the deployment. **Lose it with no backup and the
 installation cannot be recovered — it must be rebuilt from scratch.**
 
-**3. Create a second administrator.** It is the only redundancy the product offers.
-Settings → Team Members → **Add User**. No email is sent: you set that user's
-password (minimum 12 characters) and pass it on out of band. It cannot be changed
-later either.
+**3. Configure an SMTP relay** (`SENTINEL_SMTP_HOST`, `SENTINEL_SMTP_FROM`,
+`SENTINEL_PUBLIC_URL` in `.env`). It is what makes "Forgot password?" on the
+login page and an administrator's **Send reset link** work; without it the
+console says "Password recovery is unavailable" and both are disabled.
+
+**4. Create a second administrator.** Settings → Users & RBAC → Team Members →
+**Add User**. Without SMTP it is the only way back in when a password is
+forgotten. No email is sent on creation: you set a starting password (minimum 12
+characters) and pass it on out of band; its holder changes it under **Your
+password**.
 
 ---
 
@@ -580,8 +592,10 @@ characters); no email is sent, so pass it on out of band.
 | `editor` | manage sites and rules |
 | `admin` | everything, including users |
 
-**Passwords cannot be changed after creation** — for any user, not just the
-administrator. A user who forgets theirs must be deleted and recreated.
+**Every user can change their own password** — Settings → Users & RBAC → **Your
+password**. A forgotten one is reset by email: "Forgot password?" on the login
+page, or an administrator's **Send reset link**. Both need an SMTP relay; without
+one, a user who forgets theirs must be deleted and recreated by an administrator.
 
 ---
 
@@ -683,7 +697,7 @@ constraint of this build, stated here so it is not discovered in production.
 
 | Limitation | What it means in practice |
 |---|---|
-| **No password change or reset, for any user** | The seeded admin password is permanent. Back up `.env`; create a second admin |
+| **Password recovery needs email** | Changing your own password works without it; "Forgot password?" and reset links need an SMTP relay. Configure one, or keep a second admin |
 | **"Force HTTPS" does nothing** | The Front Service switches are recorded, not enforced. There is no per-site HTTP→HTTPS redirect. If plain HTTP must not serve a site, control it at the network edge — but note that also disables ACME `http-01` renewal |
 | **HTTPS origins must present a publicly trusted certificate** | The upstream connector verifies against the public root store with no override. An internal-CA or self-signed origin certificate fails every handshake and returns 502 forever, with every troubleshooting check passing. Reach such an origin over plain HTTP on a trusted network segment instead |
 | **Learning mode records over-limit requests, Blocking refuses them** | 413 / 414 / 431 / 405 apply in Blocking; in Learning they are logged as would-block and forwarded. Size them before real traffic and read the report for limit hits before switching — §5.4 |

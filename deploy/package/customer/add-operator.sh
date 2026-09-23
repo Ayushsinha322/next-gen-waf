@@ -71,7 +71,9 @@ MGMT_HOST="$(sed -n 's/^SENTINEL_MGMT_BIND=//p' "$ENV_FILE" 2>/dev/null | head -
 [[ -n "$MGMT_HOST" && "$MGMT_HOST" != "0.0.0.0" ]] || MGMT_HOST=127.0.0.1
 API="${SENTINEL_API:-https://${MGMT_HOST}:9443/api/v1}"
 ADMIN_EMAIL="${SENTINEL_ADMIN_LOGIN:-admin@sentinel.local}"
-ADMIN_PW="$(grep -E '^SENTINEL_BOOTSTRAP_ADMIN_PASSWORD=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '\r\n')"
+# The ORIGINAL admin password from the .env, which stops working once the admin
+# changes it; SENTINEL_ADMIN_PASSWORD overrides it, and a rejected one is asked for.
+ADMIN_PW="${SENTINEL_ADMIN_PASSWORD:-$(grep -E '^SENTINEL_BOOTSTRAP_ADMIN_PASSWORD=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '\r\n')}"
 if [[ -z "$ADMIN_PW" ]]; then
   read -r -s -p "Administrator password for $ADMIN_EMAIL: " ADMIN_PW; echo
 fi
@@ -90,10 +92,16 @@ case "$ROLE" in
   *) die "invalid role \"$ROLE\" — one of: owner admin editor viewer auditor";;
 esac
 
-TOKEN="$(curl -sk -X POST "$API/auth/login" -H 'Content-Type: application/json' \
-  -d "$(python3 -c 'import json,sys; print(json.dumps({"email":sys.argv[1],"password":sys.argv[2]}))' "$ADMIN_EMAIL" "$ADMIN_PW")" \
-  | python3 -c 'import sys,json; print(json.load(sys.stdin).get("access_token",""))' 2>/dev/null)"
-[[ -n "$TOKEN" ]] || die "could not authenticate as $ADMIN_EMAIL (check the password in $ENV_FILE)"
+admin_login() { curl -sk -X POST "$API/auth/login" -H 'Content-Type: application/json' \
+  -d "$(python3 -c 'import json,sys; print(json.dumps({"email":sys.argv[1],"password":sys.argv[2]}))' "$ADMIN_EMAIL" "$1")" \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin).get("access_token",""))' 2>/dev/null; }
+TOKEN="$(admin_login "$ADMIN_PW")"
+if [[ -z "$TOKEN" && -t 0 ]]; then
+  printf 'The original password in %s no longer works for %s (changed — good).\n' "$ENV_FILE" "$ADMIN_EMAIL"
+  read -r -s -p "Current password for $ADMIN_EMAIL: " ADMIN_PW; echo
+  TOKEN="$(admin_login "$ADMIN_PW")"
+fi
+[[ -n "$TOKEN" ]] || die "could not authenticate as $ADMIN_EMAIL — if its password was changed, run with SENTINEL_ADMIN_PASSWORD=<current password>"
 ok "authenticated as $ADMIN_EMAIL"
 
 # 20 random chars plus one of each required class. The product's floor is 12 and

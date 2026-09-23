@@ -82,10 +82,11 @@ step "Checking the installation"
 command -v curl >/dev/null || die "curl is required."
 command -v jq   >/dev/null || die "jq is required.  apt-get install -y jq"
 
-# The one credential that exists. install.sh generates it into the .env because
-# there is no password-change or password-reset endpoint in this build, so a
-# password recoverable only from a container log would be lost on any recreate.
-PW=$(sed -n 's/^SENTINEL_BOOTSTRAP_ADMIN_PASSWORD=//p' "$ENV_FILE" | head -1)
+# The ORIGINAL admin password, which install.sh writes into the .env. It stops
+# working once the admin changes it (Settings → Users & RBAC → Your password) —
+# the .env is never updated — so SENTINEL_ADMIN_PASSWORD overrides it, and on a
+# terminal the script asks rather than failing.
+PW="${SENTINEL_ADMIN_PASSWORD:-$(sed -n 's/^SENTINEL_BOOTSTRAP_ADMIN_PASSWORD=//p' "$ENV_FILE" | head -1)}"
 [[ -n "$PW" ]] || die "SENTINEL_BOOTSTRAP_ADMIN_PASSWORD is not in $ENV_FILE.
     This installation predates that change. Recover the password from the
     control plane's log instead:
@@ -101,11 +102,19 @@ printf '%s' "$RDY" | grep -q '"db"[[:space:]]*:[[:space:]]*"ok"' \
     Restart it once Postgres is healthy:  docker restart sentinel-controlplane-1"
 ok "control plane is up and connected to its database"
 
-TOK=$(curl -sk --max-time 10 -X POST "$API/api/v1/auth/login" \
-        -H 'Content-Type: application/json' \
-        -d "$(jq -nc --arg e "$EMAIL" --arg p "$PW" '{email:$e,password:$p}')" \
-        2>/dev/null | jq -r '.access_token // empty')
-[[ -n "$TOK" ]] || die "could not log in as $EMAIL with the password from $ENV_FILE."
+login() { curl -sk --max-time 10 -X POST "$API/api/v1/auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "$(jq -nc --arg e "$EMAIL" --arg p "$1" '{email:$e,password:$p}')" \
+            2>/dev/null | jq -r '.access_token // empty'; }
+TOK=$(login "$PW")
+if [[ -z "$TOK" && -t 0 ]]; then
+  warn "the original password in $ENV_FILE no longer works for $EMAIL (changed — good)"
+  read -r -s -p "  Password for $EMAIL: " PW; echo
+  TOK=$(login "$PW")
+fi
+[[ -n "$TOK" ]] || die "could not log in as $EMAIL.
+    If the admin password was changed, run with SENTINEL_ADMIN_PASSWORD=<current password>."
+unset PW
 ok "authenticated as $EMAIL"
 
 # ── 1. Questions ────────────────────────────────────────────────────────────
@@ -359,6 +368,6 @@ cat <<FINAL
     ssh -L 9443:127.0.0.1:9443 root@${IP:-<this-host>}    then https://127.0.0.1:9443
     user  $EMAIL
     pass  ${DIM}sudo grep SENTINEL_BOOTSTRAP_ADMIN_PASSWORD $ENV_FILE${R}
-          ${YEL}that password cannot be changed — back up $ENV_FILE${R}
+          ${YEL}change it now: Settings → Users & RBAC → Your password — and back up $ENV_FILE${R}
 
 FINAL

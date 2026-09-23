@@ -456,20 +456,25 @@ sha256sum -c ESDSWAF-v1.0.2-offline.tar.gz.sha256</code></pre>
 
     <div class="critical">
       <h3>The single most important thing in this document</h3>
-      <p><strong>That password cannot be changed. Ever.</strong></p>
-      <p>This build has no password-change screen and no reset endpoint — the user
-      API accepts <code>role</code> and <code>status</code> only. That credential is the only way
-      into the console for the life of the installation.</p>
-      <p>It is saved for you in <code>/opt/sentinel/current/.env</code> (mode <code>0600</code>), so it
-      survives container recreates, upgrades and rollbacks:</p>
+      <p><strong>Log in and change that password straight away</strong> — Settings → Users &amp;
+      RBAC → <strong>Your password</strong> (needs the current one; no email involved).</p>
+      <p>Once you change it, the value saved in <code>/opt/sentinel/current/.env</code> is only the
+      ORIGINAL password. The installer sets it once, when the admin account is created, and
+      never again — it is not a fallback for a password you have since changed:</p>
       <pre><code>sudo grep SENTINEL_BOOTSTRAP_ADMIN_PASSWORD /opt/sentinel/current/.env</code></pre>
+      <p><strong>If a password is forgotten</strong>, recovery goes by email: “Forgot password?” on
+      the login page, or an administrator’s <strong>Send reset link</strong>. Both need an SMTP relay
+      (<code>SENTINEL_SMTP_HOST</code>, <code>SENTINEL_SMTP_FROM</code>, <code>SENTINEL_PUBLIC_URL</code> in
+      <code>.env</code>); until one is configured the console says “Password recovery is unavailable”
+      and the buttons are disabled. There is no command-line reset.</p>
       <p><strong>Back that file up today, somewhere outside this VM.</strong> It holds every
       secret for the deployment. Lose it and the installation must be rebuilt from
       scratch.</p>
-      <p><strong>Create a second administrator now</strong> — Settings → Team Members →
-      <strong>Add User</strong>. It is your only redundancy. No email is sent: you set the
-      password (minimum 12 characters) and pass it on yourself, and it cannot be
-      changed later either.</p>
+      <p><strong>Create a second administrator now</strong> — Settings → Users &amp; RBAC → Team
+      Members → <strong>Add User</strong>. Without an SMTP relay, a second admin is the only way back
+      in if the first password is forgotten. No email is sent: you set a starting password
+      (minimum 12 characters) and pass it on; its holder changes it under <strong>Your
+      password</strong>.</p>
     </div>
   </section>
 
@@ -636,7 +641,7 @@ decision "Log"   block_reason "anomaly score 30 &gt;= threshold 10"   status 200
         <tr><td><strong>Wizard will not save</strong></td><td>ACME email required by default</td><td>Turn off Serve HTTPS (08)</td></tr>
         <tr><td><strong>Attack returns 200</strong></td><td>Site is in learning mode</td><td>Correct. Check the event was <em>recorded</em></td></tr>
         <tr><td><strong>HTTPS origin always 502</strong></td><td>Origin certificate not publicly trusted</td><td>Not supported — use plain HTTP to the origin on a trusted segment</td></tr>
-        <tr><td><strong>Lost the admin password</strong></td><td>—</td><td><code>sudo grep SENTINEL_BOOTSTRAP_ADMIN_PASSWORD /opt/sentinel/current/.env</code>. If the file is gone, rebuild</td></tr>
+        <tr><td><strong>Lost the admin password</strong></td><td>—</td><td>Never changed: <code>SENTINEL_BOOTSTRAP_ADMIN_PASSWORD</code> in <code>/opt/sentinel/current/.env</code>. Changed since: “Forgot password?” or another admin’s <strong>Send reset link</strong> (both need SMTP). No SMTP and no second admin: rebuild</td></tr>
       </tbody>
     </table></div>
     <p class="footnote">Send /var/log/sentinel/install.log with any support request.</p>
@@ -662,7 +667,7 @@ sudo ./uninstall.sh --purge  # destroys everything, including the database</code
     <div class="tw"><table>
       <thead><tr><th>Limitation</th><th>Consequence</th></tr></thead>
       <tbody>
-        <tr><td><strong>No password change or reset</strong></td><td>The seeded admin password is permanent. Back up <code>.env</code></td></tr>
+        <tr><td><strong>Password recovery needs email</strong></td><td>Change-your-own works without it; “Forgot password?” and reset links need an SMTP relay. Configure one, or keep a second admin</td></tr>
         <tr><td><strong>“Force HTTPS” does nothing</strong></td><td>Front Service switches are recorded, not enforced. There is no per-site HTTP→HTTPS redirect. Control it at the network edge</td></tr>
         <tr><td><strong>HTTPS origins need a public certificate</strong></td><td>Internal-CA and self-signed origin certificates are not supported</td></tr>
         <tr><td><strong>Learning mode does not relax the 4 request limits</strong></td><td>413 / 414 / 431 / 405 reject even in learning</td></tr>

@@ -159,19 +159,19 @@ If your site has no egress, either:
 
 The installer prints the administrator password and how to reach the console.
 
-1. **Record the password. It cannot be changed.** This build ships no
-   password-change screen and no reset endpoint — `/api/v1/admin/users/:id`
-   accepts `role` and `status` only. This credential is the only way into the
-   console for the life of the installation.
-
-   The installer generates it into `/opt/sentinel/current/.env` (mode `0600`), so
-   unlike a container log it survives upgrades, rollbacks and recreates:
+1. **Record the password, then change it.** The installer generates it into
+   `/opt/sentinel/current/.env` (mode `0600`), so unlike a container log it
+   survives upgrades, rollbacks and recreates:
 
    ```bash
    sudo grep SENTINEL_BOOTSTRAP_ADMIN_PASSWORD /opt/sentinel/current/.env
    ```
 
-   Back that file up. Lose it without a backup and there is no way back in.
+   Change it under Settings → Users & RBAC → **Your password**. The `.env` keeps
+   the original value only. A forgotten password is recovered by email ("Forgot
+   password?", or an admin's **Send reset link**), which needs an SMTP relay —
+   configure one, or create a second administrator. There is no command-line
+   reset. Back up the `.env` either way: it holds every secret for the deployment.
 
 2. **The console is loopback-only, on purpose.** `https://<host>:9443` will not
    connect from your workstation. Tunnel to it:

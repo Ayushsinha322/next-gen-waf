@@ -171,26 +171,33 @@ Ten steps, roughly six minutes. It ends with:
 
 ### 🔴 The single most important thing in this document
 
-**That password cannot be changed. Ever.**
+**Log in and change that password straight away** — Settings → Users & RBAC →
+**Your password** (needs the current one; no email involved).
 
-This build has no password-change screen and no reset endpoint — the user API
-accepts `role` and `status` only. That credential is the only way into the
-console for the life of the installation.
-
-It is saved for you in `/opt/sentinel/current/.env` (mode `0600`), so it survives
-container recreates, upgrades and rollbacks:
+Once you change it, the value saved in `/opt/sentinel/current/.env` is only the
+ORIGINAL password. The installer sets it once, when the admin account is
+created, and never again — it is not a fallback for a password you have since
+changed:
 
 ```bash
 sudo grep SENTINEL_BOOTSTRAP_ADMIN_PASSWORD /opt/sentinel/current/.env
 ```
 
+**If a password is forgotten**, recovery goes by email: "Forgot password?" on
+the login page, or an administrator's **Send reset link** in Settings → Users &
+RBAC. Both need an SMTP relay (`SENTINEL_SMTP_HOST`, `SENTINEL_SMTP_FROM`,
+`SENTINEL_PUBLIC_URL` in `.env`); until one is configured the console says
+"Password recovery is unavailable" and the buttons are disabled. There is no
+command-line reset.
+
 **Back that file up today, somewhere outside this VM.** It holds every secret for
 the deployment. Lose it and the installation must be rebuilt from scratch.
 
-**Create a second administrator now**, as your only redundancy — Settings →
-Team Members → **Add User**. Note that no email is sent: you set the password
-(minimum 12 characters) and pass it on yourself, and it cannot be changed later
-either.
+**Create a second administrator now** — Settings → Users & RBAC → Team
+Members → **Add User**. Without an SMTP relay, a second admin is the only way
+back in if the first password is forgotten. No email is sent: you set a starting
+password (minimum 12 characters) and pass it on; its holder changes it under
+**Your password**.
 
 ---
 
@@ -371,7 +378,7 @@ copy of the admin password and of every generated secret.
 | **Wizard will not save** | ACME email required by default | Turn off Serve HTTPS (§8) |
 | **Attack returns 200** | Site is in learning mode | Correct. Check the event was *recorded* |
 | **HTTPS origin always 502** | Origin certificate is not publicly trusted | Not supported today — use plain HTTP to the origin on a trusted segment |
-| **Lost the admin password** | | `sudo grep SENTINEL_BOOTSTRAP_ADMIN_PASSWORD /opt/sentinel/current/.env`. If the file is gone, the installation must be rebuilt |
+| **Lost the admin password** | | Never changed: it is `SENTINEL_BOOTSTRAP_ADMIN_PASSWORD` in `/opt/sentinel/current/.env`. Changed since: "Forgot password?" or another admin's **Send reset link** (both need SMTP). No SMTP and no second admin: the installation must be rebuilt |
 
 Send `/var/log/sentinel/install.log` with any support request.
 
@@ -403,7 +410,7 @@ State these up front rather than letting a customer discover them:
 
 | Limitation | Consequence |
 |---|---|
-| **No password change or reset** | The seeded admin password is permanent. Back up `.env` |
+| **Password recovery needs email** | Change-your-own works without it; "Forgot password?" and reset links need an SMTP relay. Configure one, or keep a second admin |
 | **"Force HTTPS" does nothing** | The Front Service switches are recorded, not enforced. There is no per-site HTTP→HTTPS redirect. Control it at the network edge |
 | **HTTPS origins need a public certificate** | Internal-CA and self-signed origin certificates are not supported |
 | **Request limits follow the mode** | 413/414/431/405 in Blocking; in Learning recorded as would-block and forwarded — check the report for limit hits before switching |
