@@ -686,7 +686,7 @@ constraint of this build, stated here so it is not discovered in production.
 | **No password change or reset, for any user** | The seeded admin password is permanent. Back up `.env`; create a second admin |
 | **"Force HTTPS" does nothing** | The Front Service switches are recorded, not enforced. There is no per-site HTTP→HTTPS redirect. If plain HTTP must not serve a site, control it at the network edge — but note that also disables ACME `http-01` renewal |
 | **HTTPS origins must present a publicly trusted certificate** | The upstream connector verifies against the public root store with no override. An internal-CA or self-signed origin certificate fails every handshake and returns 502 forever, with every troubleshooting check passing. Reach such an origin over plain HTTP on a trusted network segment instead |
-| **Learning mode does not relax the four request limits** | 413 / 414 / 431 / 405 reject in every mode except Off. Size them before real traffic — §5.4 |
+| **Learning mode records over-limit requests, Blocking refuses them** | 413 / 414 / 431 / 405 apply in Blocking; in Learning they are logged as would-block and forwarded. Size them before real traffic and read the report for limit hits before switching — §5.4 |
 | **A new site is unprotected for a few seconds** | Rulesets compile on a five-second cycle after the site goes live. Never create a site directly in Blocking mode |
 | **HTTP/2, HTTP/3 and TLS toggles are host-wide, not per-site** | They are listener properties, configured once for the host |
 | **The console is loopback-only** | Reached via SSH tunnel. There is no supported way to expose it directly |

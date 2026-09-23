@@ -406,6 +406,6 @@ State these up front rather than letting a customer discover them:
 | **No password change or reset** | The seeded admin password is permanent. Back up `.env` |
 | **"Force HTTPS" does nothing** | The Front Service switches are recorded, not enforced. There is no per-site HTTP→HTTPS redirect. Control it at the network edge |
 | **HTTPS origins need a public certificate** | Internal-CA and self-signed origin certificates are not supported |
-| **Learning mode does not relax the 4 request limits** | 413/414/431/405 reject even in learning |
+| **Request limits follow the mode** | 413/414/431/405 in Blocking; in Learning recorded as would-block and forwarded — check the report for limit hits before switching |
 | **New sites are unprotected for a few seconds** | Rule engines load on a 5s poll after the site goes live |
 | **HTTP→HTTPS, HTTP/2, HTTP/3 toggles are per-host, not per-site** | Listener-level, configured once for the host |

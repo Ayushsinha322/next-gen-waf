@@ -172,27 +172,32 @@ They are there so you are never guessing which is which. Trust them.
 > scanners are still rejected. It is the *rule engine* that reports instead of
 > blocks.
 
-> ### ⚠️ Learning mode does NOT relax the four request limits
+> ### Learning mode relaxes the four request limits too — size them anyway
 >
-> This is the one place where "records instead of blocks" is not true, and it
-> bites during business hours on a site everyone believes is in a safe
-> observation period.
+> In **Learning** mode an over-limit request is **recorded as would-block and
+> forwarded**, like every other verdict. In **Blocking** mode it is refused:
 >
-> Learning mode downgrades **rule, bot and rate-limit** verdicts to log-only.
-> The four *request limits* are checked earlier, before the rule engine runs,
-> and they reject outright in **every mode except Off**:
->
-> | Limit | Rejects with | Typical real-user trigger |
+> | Limit | Refused with (Blocking) | Typical real-user trigger |
 > |---|---|---|
 > | Max body size | **413** | a large file or image upload |
 > | Max URI length | **414** | a SAML/OIDC redirect carrying a long token |
 > | Max header count | **431** | a corporate SSO session with many cookies |
 > | Allowed methods | **405** | `PUT`/`PATCH`/`DELETE` from a REST or WebDAV client |
 >
-> **Size these four from §1 before the site takes real traffic** — not at the
-> §8 go-live gate. A 413 in week one of a Learning-mode pilot is a genuine
-> outage for that user, and it will not appear in the false-positive report,
-> because the request never reached the rule engine that report is built from.
+> **Size these four from §1 before the site takes real traffic anyway.** Nothing
+> breaks during the learning window, but every over-limit request lands in the
+> learning report — and on the day you switch to Blocking, each one becomes a
+> real user's 413. Read the report for limit hits before §8, not after.
+>
+> *(Earlier editions of this manual said the opposite — that the limits reject in
+> every mode except Off. That was true of an early build and has not been since;
+> the behaviour is now pinned by an automated test.)*
+>
+> The console refuses values that cannot be meant — a body limit over 10 GB, a
+> URI limit over 128 KB, more than 1000 headers — and warns on risky ones,
+> including the **Strict preset's paranoia 4 / threshold 3**, which blocks most
+> legitimate traffic until tuned. "Max Body" is in **megabytes**: typing a byte
+> count there is the usual mistake, and the console now says so.
 
 
 
