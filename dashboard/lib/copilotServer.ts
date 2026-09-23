@@ -69,3 +69,12 @@ export async function generateReply(history: CopilotTurn[], text: string): Promi
     `⚠ Unexpected response format: ${JSON.stringify(data).slice(0, 300)}`
   );
 }
+
+/**
+ * Whether the copilot can answer at all, without calling the model. The header
+ * used to be hardcoded "Online · Ready to assist" with no key configured, so
+ * every question failed under a green dot.
+ */
+export function copilotConfigured(): boolean {
+  return Boolean(process.env.ENLIGHT_API_KEY?.trim());
+}

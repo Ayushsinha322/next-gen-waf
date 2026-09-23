@@ -7578,8 +7578,20 @@ async fn handle_internal_cert_api(
 // Management listener: reverse-proxy the admin console (our own engine)
 // ---------------------------------------------------------------------------
 
-/// Reverse-proxy a request arriving on the management listener. Path `/api/*`
-/// (REST + SSE) goes to the control plane; everything else to the dashboard.
+/// Whether a management-listener path belongs to the control plane.
+///
+/// Every control-plane route lives under `/api/v1`; the dashboard also serves
+/// server routes of its own under `/api/` (the copilot at `/api/copilot`, which
+/// keeps the model key server-side). Routing on `/api/` sent those to the
+/// control plane, which answered 404 — so from the management console the
+/// copilot could never answer, while its header said "Online".
+fn management_path_is_control_plane(path: &str) -> bool {
+    path == "/api/v1" || path.starts_with("/api/v1/")
+}
+
+/// Reverse-proxy a request arriving on the management listener. Path `/api/v1/*`
+/// (REST + SSE) goes to the control plane; everything else — pages, assets and
+/// the dashboard's own `/api/*` server routes — to the dashboard.
 /// Bodies stream in both directions, so Server-Sent Events are unbuffered.
 async fn handle_management_request(
     state: Arc<ServerState>,
@@ -7594,7 +7606,7 @@ async fn handle_management_request(
     if path.starts_with("/api/v1/internal") {
         return Ok(error_response(StatusCode::NOT_FOUND, "not found"));
     }
-    let base = if path.starts_with("/api/") {
+    let base = if management_path_is_control_plane(path) {
         &mgmt.api
     } else {
         &mgmt.dashboard
@@ -8022,7 +8034,14 @@ fn rules_inventory_response(state: &ServerState, query: Option<&str>) -> Respons
 
     let engines = state.engines.load();
     let mut sites: Vec<serde_json::Value> = Vec::new();
-    let (mut compiled, mut enforced, mut dropped, mut disabled) = (0usize, 0usize, 0usize, 0usize);
+    // Totals count DISTINCT rules across sites. They used to be summed, so three
+    // sites sharing one CRS set reported 758 "rules" (353 + 280 + 125) in the
+    // console headline and nav badge — no rule set of that size exists anywhere.
+    // Per-site counts are unchanged in `sites[]`.
+    let mut compiled_ids = std::collections::HashSet::new();
+    let mut enforced_ids = std::collections::HashSet::new();
+    let mut dropped_ids = std::collections::HashSet::new();
+    let mut disabled_ids = std::collections::HashSet::new();
     let mut ids: Vec<&String> = engines.keys().collect();
     ids.sort();
     for site_id in ids {
@@ -8032,10 +8051,14 @@ fn rules_inventory_response(state: &ServerState, query: Option<&str>) -> Respons
             }
         }
         let inv = engines[site_id].inventory();
-        compiled += inv.total;
-        enforced += inv.enforced;
-        dropped += inv.dropped.len();
-        disabled += inv.disabled.len();
+        for r in &inv.rules {
+            compiled_ids.insert(r.id);
+            if !r.inert {
+                enforced_ids.insert(r.id);
+            }
+        }
+        dropped_ids.extend(inv.dropped.iter().map(|d| d.id));
+        disabled_ids.extend(inv.disabled.iter().copied());
         let mut v = serde_json::to_value(&inv).unwrap_or_else(|_| serde_json::json!({}));
         if summary {
             if let Some(obj) = v.as_object_mut() {
@@ -8052,10 +8075,10 @@ fn rules_inventory_response(state: &ServerState, query: Option<&str>) -> Respons
         "version": env!("CARGO_PKG_VERSION"),
         "sites": sites,
         "totals": {
-            "compiled": compiled,
-            "enforced": enforced,
-            "dropped": dropped,
-            "disabled": disabled,
+            "compiled": compiled_ids.len(),
+            "enforced": enforced_ids.len(),
+            "dropped": dropped_ids.len(),
+            "disabled": disabled_ids.len(),
         },
     });
     Response::builder()
@@ -13056,5 +13079,23 @@ mod config_sync_isolation_tests {
             parse_synced_sites(vec![site("a", "off"), site("b", "blocking")], &[]);
         assert_eq!(sites.len(), 2);
         assert!(rejected.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod management_routing_tests {
+    use super::management_path_is_control_plane as cp;
+
+    #[test]
+    fn control_plane_owns_api_v1_and_nothing_else() {
+        assert!(cp("/api/v1/sites"));
+        assert!(cp("/api/v1/logs/stream"));
+        assert!(cp("/api/v1"));
+        // The dashboard's own server route — the one that 404'd.
+        assert!(!cp("/api/copilot"));
+        assert!(!cp("/api/v10/x"));
+        assert!(!cp("/api/v1x"));
+        assert!(!cp("/overview"));
+        assert!(!cp("/_next/static/chunks/a.js"));
     }
 }

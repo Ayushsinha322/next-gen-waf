@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
-import { generateReply, type CopilotTurn } from "@/lib/copilotServer";
+import { generateReply, copilotConfigured, COPILOT_MODEL, type CopilotTurn } from "@/lib/copilotServer";
 
 // Cap the forwarded conversation so a client cannot drive unbounded spend or
 // blow past the gateway's context window.
@@ -24,6 +24,15 @@ function isTurn(v: unknown): v is CopilotTurn {
  * control-plane REST proxy, so without the check below this endpoint would be an
  * unauthenticated open relay to a paid LLM gateway.
  */
+/** Status for the copilot header: configured or not, and which model. Same auth as POST. */
+export async function GET() {
+  const token = cookies().get("sentinel_token")?.value;
+  if (!token || token.split(".").length !== 3) {
+    return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+  }
+  return NextResponse.json({ configured: copilotConfigured(), model: COPILOT_MODEL });
+}
+
 export async function POST(req: Request) {
   const token = cookies().get("sentinel_token")?.value;
   if (!token || token.split(".").length !== 3) {

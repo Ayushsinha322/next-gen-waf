@@ -265,24 +265,12 @@ export default function LoginPage() {
             detection, eBPF kernel-level DDoS mitigation, and HTTP/3 with JA4 fingerprinting.
           </motion.div>
 
-          <motion.div id="stats" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.55, ...spring }}>
-            {/* Measured, not aspirational: GoTestWAF and vegeta head-to-head vs
-                BunkerWeb 1.6.9 on 2026-09-06, deploy/load-test/BUNKERWEB-COMPARISON-2026-09.md.
-                Update these when the benchmark is re-run — never round up. */}
-            <div className="stat-item">
-              <div className="sv green">99.5%</div>
-              <div className="sl">GoTestWAF detection</div>
-            </div>
-            <div className="stat-item">
-              <div className="sv blue">98.6%</div>
-              <div className="sl">benign traffic passed</div>
-            </div>
-            <div className="stat-item">
-              <div className="sv" style={{ color: "#a78bfa" }}>2.3 ms</div>
-              <div className="sl">p99 at 3,000 req/s</div>
-            </div>
-          </motion.div>
-
+          {/* No figures here. This page used to show benchmark results (GoTestWAF
+              detection, benign pass rate, p99) as if they were statistics — on the
+              login page of a CUSTOMER's deployment, where they read as this
+              installation's own numbers. They were also stale (99.5% while the
+              measured composite had moved on). Benchmarks belong in the benchmark
+              report; this page shows nothing it has not looked up. */}
           <motion.div id="feats" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.65 }}>
             {["eBPF / XDP","OWASP CRS v4","WASM Plugins","LLM Copilot",
               "HTTP/3 + JA4","Leader-elected HA","GraphQL / gRPC FW","Outbound DLP"].map(f => (
@@ -332,7 +320,7 @@ export default function LoginPage() {
               <input
                 className="fi"
                 type="email"
-                placeholder="admin@sentinel.local"
+                placeholder="name@company.com"
                 autoComplete="username"
                 value={email}
                 onChange={e => setEmail(e.target.value)}

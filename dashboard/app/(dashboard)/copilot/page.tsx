@@ -1,4 +1,5 @@
 "use client";
+import { CopilotStatusLine } from "@/components/copilot/CopilotStatus";
 import { useState, useRef, useEffect } from "react";
 import { motion } from "framer-motion";
 import { GREET, askCopilot } from "@/lib/copilot";
@@ -108,9 +109,7 @@ export default function CopilotPage() {
             <motion.div animate={{ boxShadow: ["0 0 18px var(--pur-glow)", "0 0 32px rgba(124,58,237,.6)", "0 0 18px var(--pur-glow)"] }} transition={{ duration: 3, repeat: Infinity }} style={{width:40,height:40,borderRadius:"50%",background:"linear-gradient(135deg,var(--purple),#4A0FA0)",display:"flex",alignItems:"center",justifyContent:"center",fontSize: 25}}><Icon name="sparkles" size={18} /></motion.div>
             <div>
               <div style={{fontFamily:"var(--font-display)",fontSize: 15,fontWeight:700}}>{PRODUCT_NAME} AI Copilot</div>
-              <div style={{fontFamily:"var(--font-mono)",fontSize: 11,color:"#9B60E0",display:"flex",alignItems:"center",gap:5,marginTop:2}}>
-                <span style={{width:5,height:5,borderRadius:"50%",background:"var(--green)",boxShadow:"0 0 5px var(--green)",display:"inline-block"}} />Online · Ready to assist
-              </div>
+              <CopilotStatusLine />
             </div>
             {loaded && (
               <div title={`Loaded from ${loaded.source}`} style={{marginLeft:"auto",fontSize: 11,fontFamily:"var(--font-mono)",color:"var(--cyan)",background:"rgba(0,212,255,.08)",border:"1px solid rgba(0,212,255,.25)",borderRadius:20,padding:"3px 10px",maxWidth:340,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>

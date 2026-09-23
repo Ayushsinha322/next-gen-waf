@@ -1,4 +1,5 @@
 "use client";
+import { clockTime } from "@/lib/liveRecord";
 import { useState, useEffect, useRef } from "react";
 import Icon, { type IconName } from "@/components/ui/Icon";
 import { motion } from "framer-motion";
@@ -26,6 +27,16 @@ const ATTACK_META: Record<string, { label: string; color: string }> = {
   ssrf:     { label: "SSRF",           color: "#06b6d4" },
   bot:      { label: "Bot / Scanner",  color: "#22c55e" },
   protocol: { label: "Protocol",       color: "#3b82f6" },
+  // Non-rule blocks. Missing here, they were dropped from the breakdown — 43 of
+  // 75 blocks on the demo cluster — so the chart described a minority of what the
+  // WAF actually stopped.
+  geoip:         { label: "GeoIP",           color: "#eab308" },
+  ratelimit:     { label: "Rate limit",      color: "#14b8a6" },
+  anomaly:       { label: "Anomaly score",   color: "#f97316" },
+  threat_intel:  { label: "Threat intel",    color: "#dc2626" },
+  ip_reputation: { label: "IP block list",   color: "#8b5cf6" },
+  ddos:          { label: "DDoS",            color: "#be123c" },
+  ml:            { label: "ML detection",    color: "#c084fc" },
   other:    { label: "Other",          color: "#94a3b8" },
 };
 
@@ -117,7 +128,7 @@ export default function OverviewPage() {
   useEffect(() => {
     let cancelled = false;
     async function f() {
-      try { const p = await api.plugins.list(); if (!cancelled) setPlugins((p.plugins ?? []).length); } catch { /* */ }
+      try { const p = await api.plugins.list(); if (!cancelled) setPlugins((p.plugins ?? []).filter(x => x.enabled).length); } catch { /* */ }
       try {
         // /cluster/status describes THIS control-plane node (node_id, role,
         // leader_id) and carries no peer list, so `status.peers?.length ?? 0`
@@ -172,7 +183,7 @@ export default function OverviewPage() {
         if (!entry.data) return;
         const d = entry.data;
         setFeed(prev => [{
-          t: String(d.ts ?? new Date().toTimeString().slice(0, 8)).slice(-8),
+          t: clockTime(d.ts),
           ip: String(d.ip ?? ""), m: String(d.method ?? "GET"),
           path: String(d.path ?? "/"), st: Number(d.status ?? 200),
           latency: parseFloat(String(d.latency ?? 0)),
@@ -232,7 +243,7 @@ export default function OverviewPage() {
     sites:    "Sites configured in the database, and how many are active. A paused or draft site is configured but serves nothing.",
     services: "Configured upstream services, with the health of their origins as checked by the data plane.",
     inst:     "Data-plane and control-plane nodes reporting to the cluster roll-up. Shows — when the roll-up cannot be reached, rather than assuming a single node.",
-    plugins:  "WASM plugins loaded on the data plane. A loaded plugin only runs on the sites it is scoped to.",
+    plugins:  "WASM plugins that are enabled. An installed but disabled plugin runs nowhere; an enabled one runs only on the sites it is scoped to.",
     blkIPs:   `Distinct source addresses that have had at least one request blocked. ${sinceStart}`,
     alerts:   "Alerts currently in the open state, from the database — not a count of recent attacks.",
     // Three different "blocked" numbers share this screen, over three different
@@ -309,7 +320,7 @@ export default function OverviewPage() {
         <Kpi icon="globe" label="Sites" hint={tip.sites} value={known(statsKnown, <AnimatedValue value={stats?.total_sites ?? 0} />)} sub={statsKnown ? `${stats?.active_sites ?? 0} active` : "not reported"} />
         <Kpi icon="package" label="Services" hint={tip.services} value={known(statsKnown, <AnimatedValue value={stats?.active_sites ?? 0} />)} sub={wafKnown ? `${wafStatus?.upstreams_healthy ?? 0}/${wafStatus?.upstreams_total ?? 0} upstreams` : "not reported"} />
         <Kpi icon="server" label="Instances" hint={tip.inst} value={instances === null ? "—" : instances} sub={(instances ?? 1) > 1 ? "clustered" : "standalone"} />
-        <Kpi icon="plug" label="Plugins" hint={tip.plugins} value={plugins === null ? "—" : plugins} sub="WASM loaded" />
+        <Kpi icon="plug" label="Plugins" hint={tip.plugins} value={plugins === null ? "—" : plugins} sub="enabled" />
         <Kpi icon="ban" label="Blocked" accent="#ef4444" hint={tip.blocked} value={known(metricsKnown, <AnimatedValue value={blkCount} />)} sub={statsKnown ? `${openAlerts} open alerts` : "not reported"} />
         <Kpi icon="map-pin" label="Blocked IPs" accent="#ef4444" hint={tip.blkIPs} value={known(metricsKnown, <AnimatedValue value={uniqueIPs} />)} sub={metricsKnown ? "unique sources" : "not reported"} />
       </motion.div>
@@ -630,7 +641,10 @@ function RuleEngineHealth({ metrics, running }: { metrics: MetricsSnapshot | nul
       sub: loading ? "…" : vp.total > 0 ? `${vp.on}/${vp.total} rules enabled` : "none loaded",
       on: vp.on > 0, empty: !loading && vp.total === 0, loading, hits: null },
     { name: "ML anomaly engine",   sub: "behavioural scoring",       on: running, loading: false, hits: mlHits },
-    { name: "Bot / scanner defense", sub: "signatures + heuristics", on: crs.on > 0 || running, loading, hits: n("bot") },
+    // Only what this page actually checked: the CRS scanner-detection rules are
+    // part of the enabled CRS set. It used to read "on" whenever the ML engine
+    // was running, which says nothing about bot defense.
+    { name: "Bot / scanner signatures", sub: "CRS scanner detection (913)", on: crs.on > 0, loading, hits: n("bot") },
   ];
 
   return (
@@ -687,7 +701,7 @@ function SystemHealth({ wafRunning, geoip }: { wafRunning: boolean | null; geoip
       try { const h = await api.cluster.health();     if (!cancelled) setHealth(h); } catch { /* */ }
       try { const m = await api.ml.stats();           if (!cancelled) setMl(m); }     catch { /* */ }
       try { const t = await api.threatIntel.stats();  if (!cancelled) setTi(t); }     catch { /* */ }
-      try { const p = await api.plugins.list();       if (!cancelled) setPlugins((p.plugins ?? []).length); } catch { /* */ }
+      try { const p = await api.plugins.list();       if (!cancelled) setPlugins((p.plugins ?? []).filter(x => x.enabled).length); } catch { /* */ }
     }
     f(); const t = setInterval(f, 30_000); return () => { cancelled = true; clearInterval(t); };
   }, []);
@@ -743,7 +757,7 @@ function SystemHealth({ wafRunning, geoip }: { wafRunning: boolean | null; geoip
     // the sites whose country policy is displayed and not applied.
     geo,
     { name: "Threat Intel Feeds", value: ti ? (ti.total_active > 0 ? `${ti.total_active.toLocaleString()} indicators` : "No IOCs loaded") : "—", level: ti ? (ti.total_active > 0 ? "g" : "a") : "gr" },
-    { name: "WASM Sandbox",      value: plugins === null ? "—" : plugins > 0 ? `${plugins} plugin${plugins === 1 ? "" : "s"} loaded` : "Idle", level: plugins && plugins > 0 ? "g" : "gr" },
+    { name: "WASM Sandbox",      value: plugins === null ? "—" : plugins > 0 ? `${plugins} plugin${plugins === 1 ? "" : "s"} enabled` : "Idle", level: plugins && plugins > 0 ? "g" : "gr" },
   ];
 
   const valColor: Record<HLevel, string> = { g: "var(--green)", a: "var(--amber)", r: "var(--red-b)", gr: "var(--text3)" };

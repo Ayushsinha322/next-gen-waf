@@ -682,6 +682,12 @@ func (h *Hub) updateMetrics(e Entry) {
 			if blocked {
 				h.attackCats[cat]++
 			}
+			// ML-led detections, blocked or would-block. The only other source of
+			// this counter is an "ml" log stream that no data plane emits (only the
+			// removed simulator did), so the ML card read 0 beside real ML blocks.
+			if cat == "ml" && (blocked || row.Action == "DETECT" || row.WouldBlock) {
+				h.mlAnomalies.Add(1)
+			}
 			if blocked && row.IP != "" {
 				h.blockedIPs[row.IP] = struct{}{}
 			}
@@ -763,6 +769,9 @@ func attackCategory(rule string) string {
 		return "ip_reputation"
 	case "DDOS":
 		return "ddos"
+	case "ML-ANOMALY":
+		// The n-gram classifier's own detection (no CRS rule decided it).
+		return "ml"
 	}
 	if len(rule) < 3 {
 		return "other"

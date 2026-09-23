@@ -3,6 +3,7 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { motion } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
 import EmptyState from "@/components/ui/EmptyState";
+import { verdictOf, clockTime } from "@/lib/liveRecord";
 import { api, type TrafficBucket, type MetricsSnapshot } from "@/lib/api";
 import { staggerContainer, cardVariants, fadeUp, spring } from "@/lib/animations";
 import Icon from "@/components/ui/Icon";
@@ -43,7 +44,7 @@ export default function TrafficPage() {
           const score  = Number(data.score  ?? 0);
           if (site) liveSites.current.add(site);
           setRows(prev => [{
-            ts:      String(data.ts ?? new Date().toTimeString().slice(0, 8)).slice(-8),
+            ts:      clockTime(data.ts),
             site,
             method:  String(data.method  ?? "GET"),
             path:    String(data.path    ?? "/"),
@@ -51,7 +52,7 @@ export default function TrafficPage() {
             status,
             latency: parseFloat(String(data.latency ?? "0")),
             score,
-            action:  status === 403 || score >= 5 ? "BLOCKED" : "ALLOWED",
+            action:  verdictOf(data.action, status),
           }, ...prev].slice(0, 400));
         }
       } catch { /* skip malformed */ }
@@ -271,7 +272,7 @@ export default function TrafficPage() {
                     <td style={{ color: r.status === 403 ? "var(--red-b)" : r.status >= 500 ? "var(--amber)" : "var(--green)" }}>{r.status}</td>
                     <td className="td3">{r.latency > 0 ? r.latency.toFixed(1) + " ms" : "—"}</td>
                     <td style={{ color: r.score > 5 ? "var(--red-b)" : r.score > 2 ? "var(--amber)" : "var(--text3)" }}>{r.score > 0 ? r.score : "—"}</td>
-                    <td><span className={`bdg ${r.action === "BLOCKED" ? "br" : "bgr"}`}>{r.action}</span></td>
+                    <td><span className={`bdg ${r.action === "BLOCKED" ? "br" : r.action === "WOULD BLOCK" || r.action === "ERROR" ? "ba" : "bgr"}`}>{r.action}</span></td>
                   </motion.tr>
                 ))}
               </tbody>

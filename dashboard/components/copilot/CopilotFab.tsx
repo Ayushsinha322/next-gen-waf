@@ -1,4 +1,5 @@
 "use client";
+import { CopilotStatusLine } from "@/components/copilot/CopilotStatus";
 import { useState, useRef, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { GREET, askCopilot } from "@/lib/copilot";
@@ -90,10 +91,7 @@ export default function CopilotFab({ variant = "login" }: { variant?: "login" | 
               <motion.div animate={{ boxShadow: ["0 0 14px var(--pur-glow)", "0 0 24px rgba(124,58,237,.6)", "0 0 14px var(--pur-glow)"] }} transition={{ duration: 3, repeat: Infinity }} style={{ width: 34, height: 34, borderRadius: "50%", background: "linear-gradient(135deg,var(--purple),#4A0FA0)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 19 }}><Icon name="sparkles" size={18} /></motion.div>
               <div>
                 <div style={{ fontFamily: "var(--font-display)", fontSize: 13, fontWeight: 700, color: "var(--text)" }}>{PRODUCT_NAME} AI Copilot</div>
-                <div style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "#9B60E0", display: "flex", alignItems: "center", gap: 4, marginTop: 1 }}>
-                  <span style={{ width: 5, height: 5, borderRadius: "50%", background: "var(--green)", boxShadow: "0 0 5px var(--green)", display: "inline-block" }} />
-                  Online · DeepSeek R1
-                </div>
+                <CopilotStatusLine />
               </div>
               <motion.button style={{ cursor: "pointer", color: "var(--text3)", fontSize: 19, background: "none", border: "none", marginLeft: "auto", lineHeight: 1, transition: "color .2s" }} onClick={() => setOpen(false)} whileHover={{ scale: 1.15, color: "var(--red-b)" }}>✕</motion.button>
             </div>
