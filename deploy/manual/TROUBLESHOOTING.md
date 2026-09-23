@@ -328,6 +328,16 @@ Expect `HTTP/1.1 101 Switching Protocols`. Anything else (200, 404) means the
 upgrade is still being refused. Then test the real feature — a 101 proves the
 handshake, not that messages flow.
 
+**Connected, then dropped.** Once the socket is open, every text message the
+browser sends is inspected like a request body. In **Blocking** mode a message
+the rules judge an attack closes the socket with code **1008**, and a text
+message over **1 MB** closes it with **1009** (too large to inspect). In
+**Learning** mode both are forwarded and recorded. Either way the event is in
+Console → **Events**, with a reason starting `websocket message:`. A client
+sending more than ~200 messages a second is slowed down, never dropped.
+Compression (permessage-deflate) is switched off through the WAF so messages
+can be read — that is expected, not a fault.
+
 ---
 
 ## 13. Origin sees the wrong client IP

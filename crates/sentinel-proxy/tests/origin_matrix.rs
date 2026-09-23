@@ -265,19 +265,29 @@ async fn origin(
 
         // A VM console / live-updates socket, served like a strict RFC 6455 server.
         (&Method::GET, "/ws") => {
+            // Like Python `websockets`, Jetty and Tomcat: accept permessage-deflate
+            // whenever the client offers it — and every browser offers it. From
+            // then on the origin expects compressed data frames (RSV1 set).
+            let deflate = req
+                .headers()
+                .get("sec-websocket-extensions")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.contains("permessage-deflate"));
             let on_upgrade = hyper::upgrade::on(&mut req);
             tokio::spawn(async move {
                 if let Ok(up) = on_upgrade.await {
-                    let _ = strict_ws_echo(TokioIo::new(up)).await;
+                    let _ = strict_ws_echo(TokioIo::new(up), deflate).await;
                 }
             });
-            Response::builder()
+            let mut b = Response::builder()
                 .status(StatusCode::SWITCHING_PROTOCOLS)
                 .header(header::CONNECTION, "Upgrade")
                 .header(header::UPGRADE, "websocket")
-                .header("sec-websocket-accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
-                .body(Full::new(Bytes::new()))
-                .unwrap()
+                .header("sec-websocket-accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+            if deflate {
+                b = b.header("sec-websocket-extensions", "permessage-deflate");
+            }
+            b.body(Full::new(Bytes::new())).unwrap()
         }
 
         _ => text(StatusCode::NOT_FOUND, "no such path"),
@@ -285,20 +295,31 @@ async fn origin(
     Ok(resp)
 }
 
-/// Echo WebSocket messages the way a standards-compliant server does.
+/// Echo WebSocket MESSAGES the way a standards-compliant server does.
 ///
 /// RFC 6455 §5.1: "The server MUST close the connection upon receiving a frame
 /// that is not masked." gorilla/websocket, Node `ws` and Python `websockets` all
 /// do exactly this, with close code 1002 — so a relay that forwards client frames
-/// unmasked gets a handshake and then nothing. Masked frames are unmasked and
-/// echoed back UNMASKED, as server frames must be.
-async fn strict_ws_echo<T>(mut io: T) -> std::io::Result<()>
+/// unmasked gets a handshake and then nothing. Masked frames are unmasked;
+/// fragments are reassembled (§5.4) and the whole message is echoed back as one
+/// UNMASKED frame, as server frames must be. A Close is echoed and ends the echo,
+/// so the client sees the code the relay sent upstream.
+///
+/// `deflate`: permessage-deflate was negotiated. The first frame of every data
+/// message must then carry RSV1 (RFC 7692 §6); one that does not is data this
+/// server would try to inflate and fail on — it closes with 1002, which is what a
+/// relay that strips RSV1 (or forwards the offer it cannot honour) produces.
+async fn strict_ws_echo<T>(mut io: T, deflate: bool) -> std::io::Result<()>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    let mut message: Vec<u8> = Vec::new();
+    let mut message_opcode = 0u8;
     loop {
         let mut h = [0u8; 2];
         io.read_exact(&mut h).await?;
+        let fin = h[0] & 0x80 != 0;
+        let rsv1 = h[0] & 0x40 != 0;
         let opcode = h[0] & 0x0F;
         let masked = h[1] & 0x80 != 0;
         let mut len = (h[1] & 0x7F) as usize;
@@ -323,16 +344,33 @@ where
         for (i, b) in payload.iter_mut().enumerate() {
             *b ^= key[i % 4];
         }
-        let mut out = vec![0x80 | opcode];
-        if len < 126 {
-            out.push(len as u8);
-        } else {
-            out.push(126);
-            out.extend_from_slice(&(len as u16).to_be_bytes());
+        if deflate && (opcode == 0x1 || opcode == 0x2) && !rsv1 {
+            io.write_all(&[0x88, 0x02, 0x03, 0xEA]).await?;
+            return Ok(());
         }
-        out.extend_from_slice(&payload);
+        let whole = if opcode >= 0x8 {
+            Some((opcode, payload))
+        } else {
+            if opcode != 0x0 {
+                message_opcode = opcode;
+            }
+            message.extend_from_slice(&payload);
+            fin.then(|| (message_opcode, std::mem::take(&mut message)))
+        };
+        let Some((op, body)) = whole else { continue };
+        let mut out = vec![0x80 | op];
+        if body.len() < 126 {
+            out.push(body.len() as u8);
+        } else if body.len() < 65536 {
+            out.push(126);
+            out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        } else {
+            out.push(127);
+            out.extend_from_slice(&(body.len() as u64).to_be_bytes());
+        }
+        out.extend_from_slice(&body);
         io.write_all(&out).await?;
-        if opcode == 0x8 {
+        if op == 0x8 {
             return Ok(());
         }
     }
@@ -359,6 +397,8 @@ struct Opts {
     timeout_secs: Option<u64>,
     max_body: u64,
     mode: WafMode,
+    /// CRS rule files by name, e.g. `REQUEST-941-APPLICATION-ATTACK-XSS.conf`.
+    crs: Vec<&'static str>,
 }
 
 impl Default for Opts {
@@ -367,6 +407,7 @@ impl Default for Opts {
             timeout_secs: Some(10),
             max_body: 64 * 1024 * 1024,
             mode: WafMode::Learning,
+            crs: vec![],
         }
     }
 }
@@ -411,7 +452,19 @@ fn config(h1: u16, h2: u16, origin_port: u16, o: &Opts) -> SentinelConfig {
             },
             waf: WafConfig {
                 mode: o.mode.clone(),
-                rules: vec![],
+                rules: o
+                    .crs
+                    .iter()
+                    .map(|f| {
+                        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                            .join("../../rules/owasp-crs/rules")
+                            .join(f)
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .collect(),
+                anomaly_threshold: 5,
+                paranoia_level: 1,
                 max_body_size: o.max_body,
                 ..Default::default()
             },
@@ -878,5 +931,299 @@ async fn an_unreachable_origin_is_502_bad_gateway() {
 
     let r = h1(p.h1, Method::GET, "/", &[], Bytes::new()).await;
     assert_eq!(r.status, StatusCode::BAD_GATEWAY, "body: {}", r.body);
+    p.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket inspection
+//
+// Until 1.1.5 a WebSocket message could only be refused by an operator's
+// explicit `deny` rule. The inspector ran the rule VM with the anomaly
+// threshold disabled and never reached the verdict step, and it handed the
+// rules a body with no content type, so the CRS ARGS rules had nothing to look
+// at. It also refused regardless of learning mode, inspected only the first
+// fragment of a message, silently dropped every text message past 60 a second,
+// and forwarded the browser's permessage-deflate offer while stripping the RSV1
+// bit the resulting frames depend on. Each test below is one of those.
+// ---------------------------------------------------------------------------
+
+const XSS: &str = r#"{"comment":"<script>alert(document.cookie)</script>"}"#;
+
+fn ws_blocking_xss() -> Opts {
+    Opts {
+        mode: WafMode::Blocking,
+        crs: vec!["REQUEST-941-APPLICATION-ATTACK-XSS.conf"],
+        ..Opts::default()
+    }
+}
+
+/// Complete the handshake. `extensions` is sent as `Sec-WebSocket-Extensions`.
+async fn ws_open(port: u16, extensions: Option<&str>) -> TcpStream {
+    let mut s = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+    let ext = extensions
+        .map(|e| format!("Sec-WebSocket-Extensions: {e}\r\n"))
+        .unwrap_or_default();
+    s.write_all(
+        format!(
+            "GET /ws HTTP/1.1\r\nHost: {APP}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n{ext}\r\n"
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        let n = tokio::time::timeout(Duration::from_secs(10), s.read(&mut byte))
+            .await
+            .expect("no upgrade response within 10s")
+            .unwrap();
+        assert!(n > 0, "closed before the upgrade response");
+        head.push(byte[0]);
+    }
+    let head = String::from_utf8_lossy(&head);
+    assert!(
+        head.starts_with("HTTP/1.1 101"),
+        "expected 101, got:\n{head}"
+    );
+    s
+}
+
+/// One masked client frame, as a browser sends it.
+async fn ws_send(s: &mut TcpStream, fin: bool, opcode: u8, payload: &[u8]) {
+    let key = [0x5a, 0x13, 0xc7, 0x02];
+    let mut f = vec![if fin { 0x80 } else { 0 } | opcode];
+    if payload.len() < 126 {
+        f.push(0x80 | payload.len() as u8);
+    } else if payload.len() < 65536 {
+        f.push(0x80 | 126);
+        f.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    } else {
+        f.push(0x80 | 127);
+        f.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+    }
+    f.extend_from_slice(&key);
+    f.extend(payload.iter().enumerate().map(|(i, b)| b ^ key[i % 4]));
+    s.write_all(&f).await.unwrap();
+}
+
+/// Next frame from the server: (opcode, payload). Close frames carry the code in
+/// the first two payload bytes.
+async fn ws_recv(s: &mut TcpStream) -> (u8, Vec<u8>) {
+    let mut h = [0u8; 2];
+    tokio::time::timeout(Duration::from_secs(10), s.read_exact(&mut h))
+        .await
+        .expect("no frame within 10s")
+        .expect("connection closed without a frame");
+    assert_eq!(h[1] & 0x80, 0, "server-to-client frames must not be masked");
+    let mut len = (h[1] & 0x7F) as usize;
+    if len == 126 {
+        let mut b = [0u8; 2];
+        s.read_exact(&mut b).await.unwrap();
+        len = u16::from_be_bytes(b) as usize;
+    } else if len == 127 {
+        let mut b = [0u8; 8];
+        s.read_exact(&mut b).await.unwrap();
+        len = u64::from_be_bytes(b) as usize;
+    }
+    let mut p = vec![0u8; len];
+    s.read_exact(&mut p).await.unwrap();
+    (h[0] & 0x0F, p)
+}
+
+fn close_code(p: &[u8]) -> u16 {
+    u16::from_be_bytes([p[0], p[1]])
+}
+
+/// The headline: a CRS-detectable XSS in a JSON WebSocket message is refused in
+/// blocking mode. Before 1.1.5 it was echoed.
+#[tokio::test]
+async fn blocking_a_websocket_attack_message_is_refused_with_1008() {
+    let (cert, key) = trusted_cert();
+    let (origin_port, _seen) = start_origin(cert, key).await;
+    let p = start_proxy(origin_port, ws_blocking_xss()).await;
+    let mut s = ws_open(p.h1, None).await;
+
+    // A clean message first: inspection must not break ordinary traffic.
+    ws_send(&mut s, true, 0x1, br#"{"comment":"hello"}"#).await;
+    assert_eq!(
+        ws_recv(&mut s).await,
+        (0x1, br#"{"comment":"hello"}"#.to_vec())
+    );
+
+    ws_send(&mut s, true, 0x1, XSS.as_bytes()).await;
+    let (op, body) = ws_recv(&mut s).await;
+    assert_eq!(
+        op,
+        0x8,
+        "the attack message was delivered ({:?}) — the WebSocket inspector did not \
+         refuse a CRS-detectable XSS in blocking mode",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(close_code(&body), 1008, "expected 1008 policy violation");
+    p.stop().await;
+}
+
+/// The same attack split across three fragments. Only the first fragment used to
+/// be inspected, and on its own it is harmless.
+#[tokio::test]
+async fn blocking_a_websocket_attack_split_across_fragments_is_refused() {
+    let (cert, key) = trusted_cert();
+    let (origin_port, _seen) = start_origin(cert, key).await;
+    let p = start_proxy(origin_port, ws_blocking_xss()).await;
+    let mut s = ws_open(p.h1, None).await;
+
+    let (a, rest) = XSS.as_bytes().split_at(16); // {"comment":"<scr
+    let (b, c) = rest.split_at(10);
+    ws_send(&mut s, false, 0x1, a).await;
+    ws_send(&mut s, false, 0x0, b).await;
+    // A ping between fragments is legal (RFC 6455 §5.4) and must pass straight
+    // through, not end or corrupt the message being reassembled.
+    ws_send(&mut s, true, 0x9, b"keepalive").await;
+    ws_send(&mut s, true, 0x0, c).await;
+
+    let first = ws_recv(&mut s).await;
+    assert_eq!(
+        first,
+        (0x9, b"keepalive".to_vec()),
+        "the interleaved ping was lost"
+    );
+    let (op, body) = ws_recv(&mut s).await;
+    assert_eq!(
+        op,
+        0x8,
+        "a fragmented attack was delivered ({:?}) — fragments are not being \
+         reassembled before inspection",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(close_code(&body), 1008);
+    p.stop().await;
+}
+
+/// Fragments of a CLEAN message are reassembled for inspection and still reach
+/// the origin as the same message.
+#[tokio::test]
+async fn a_fragmented_clean_websocket_message_arrives_intact() {
+    let (cert, key) = trusted_cert();
+    let (origin_port, _seen) = start_origin(cert, key).await;
+    let p = start_proxy(origin_port, ws_blocking_xss()).await;
+    let mut s = ws_open(p.h1, None).await;
+
+    ws_send(&mut s, false, 0x1, br#"{"status":"#).await;
+    ws_send(&mut s, false, 0x0, br#""rack 4 "#).await;
+    ws_send(&mut s, true, 0x0, br#"online"}"#).await;
+    assert_eq!(
+        ws_recv(&mut s).await,
+        (0x1, br#"{"status":"rack 4 online"}"#.to_vec())
+    );
+    p.stop().await;
+}
+
+/// Learning mode never refuses — a WebSocket message included. The inspector
+/// used to close the socket on a deny rule whatever the site's mode.
+#[tokio::test]
+async fn learning_a_websocket_attack_message_is_forwarded() {
+    let (cert, key) = trusted_cert();
+    let (origin_port, _seen) = start_origin(cert, key).await;
+    let p = start_proxy(
+        origin_port,
+        Opts {
+            mode: WafMode::Learning,
+            ..ws_blocking_xss()
+        },
+    )
+    .await;
+    let mut s = ws_open(p.h1, None).await;
+    ws_send(&mut s, true, 0x1, XSS.as_bytes()).await;
+    assert_eq!(ws_recv(&mut s).await, (0x1, XSS.as_bytes().to_vec()));
+    p.stop().await;
+}
+
+/// A burst far past the old 60-a-second limit: every message arrives, in order.
+/// The limit used to DROP the excess silently — characters vanishing from a web
+/// terminal, updates missing from a dashboard, with nothing telling either end.
+#[tokio::test]
+async fn a_burst_of_websocket_messages_is_throttled_never_dropped() {
+    let (cert, key) = trusted_cert();
+    let (origin_port, _seen) = start_origin(cert, key).await;
+    let p = start_proxy(origin_port, ws_blocking_xss()).await;
+    let s = ws_open(p.h1, None).await;
+    let (mut rd, mut wr) = s.into_split();
+
+    const N: usize = 500;
+    let writer = tokio::spawn(async move {
+        let key = [1u8, 2, 3, 4];
+        for i in 0..N {
+            let m = format!("{{\"k\":{i}}}");
+            let mut f = vec![0x81, 0x80 | m.len() as u8];
+            f.extend_from_slice(&key);
+            f.extend(m.bytes().enumerate().map(|(j, b)| b ^ key[j % 4]));
+            wr.write_all(&f).await.unwrap();
+        }
+        wr
+    });
+    for i in 0..N {
+        let mut h = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(20), rd.read_exact(&mut h))
+            .await
+            .unwrap_or_else(|_| panic!("message {i} of {N} never arrived — dropped"))
+            .unwrap();
+        assert_eq!(
+            h[0], 0x81,
+            "message {i}: expected a text frame, got {:#04x}",
+            h[0]
+        );
+        let mut p = vec![0u8; (h[1] & 0x7F) as usize];
+        rd.read_exact(&mut p).await.unwrap();
+        assert_eq!(
+            p,
+            format!("{{\"k\":{i}}}").as_bytes(),
+            "message {i} out of order"
+        );
+    }
+    let _ = writer.await;
+    p.stop().await;
+}
+
+/// Every browser offers permessage-deflate, and many servers accept it. The WAF
+/// cannot inspect a compressed message, and the relay re-encodes frames without
+/// the RSV1 bit compression depends on — so if the offer reaches the origin, the
+/// first message breaks the socket. The offer must be withdrawn; messages then
+/// travel uncompressed and inspectable.
+#[tokio::test]
+async fn a_browsers_compression_offer_does_not_break_or_blind_the_socket() {
+    let (cert, key) = trusted_cert();
+    let (origin_port, _seen) = start_origin(cert, key).await;
+    let p = start_proxy(origin_port, ws_blocking_xss()).await;
+    let mut s = ws_open(p.h1, Some("permessage-deflate; client_max_window_bits")).await;
+    ws_send(&mut s, true, 0x1, b"after-negotiation").await;
+    let (op, body) = ws_recv(&mut s).await;
+    assert_ne!(
+        (op, body.get(..2).map(close_code)),
+        (0x8, Some(1002)),
+        "the origin negotiated compression and then rejected the relay's frames"
+    );
+    assert_eq!((op, body), (0x1, b"after-negotiation".to_vec()));
+    p.stop().await;
+}
+
+/// A text message larger than the inspector will read is refused in blocking
+/// mode (1009 message too big) — the same rule as an over-limit HTTP body. It
+/// used to be forwarded uninspected past 64 KiB, which is a bypass by padding.
+#[tokio::test]
+async fn blocking_a_websocket_message_too_large_to_inspect_is_refused_with_1009() {
+    let (cert, key) = trusted_cert();
+    let (origin_port, _seen) = start_origin(cert, key).await;
+    let p = start_proxy(origin_port, ws_blocking_xss()).await;
+    let mut s = ws_open(p.h1, None).await;
+    let mut padded = vec![b' '; 2 * 1024 * 1024];
+    padded.extend_from_slice(XSS.as_bytes());
+    ws_send(&mut s, true, 0x1, &padded).await;
+    let (op, body) = ws_recv(&mut s).await;
+    assert_eq!(op, 0x8, "an oversized, uninspectable message was forwarded");
+    assert_eq!(close_code(&body), 1009);
     p.stop().await;
 }

@@ -3751,6 +3751,11 @@ async fn proxy_inner(
     let ws_allowed = is_ws && site_cfg.upstream.websocket;
     if ws_allowed {
         strip_hop_by_hop_except_upgrade(&mut parts.headers);
+        // Withdraw the compression offer every browser makes. A compressed
+        // message is opaque to the rules, and the relay re-encodes frames — an
+        // origin that accepted permessage-deflate would read our frames as
+        // corrupt and close with 1002 on the first message.
+        parts.headers.remove("sec-websocket-extensions");
     } else {
         strip_hop_by_hop(&mut parts.headers);
         // strip_hop_by_hop removes Connection and Upgrade, but Sec-WebSocket-*
@@ -3866,7 +3871,31 @@ async fn proxy_inner(
             ));
             let client_ip = ctx.client_ip;
             let site_id = site_cfg.id.clone();
-            let ws_engine = engine_map.get(&site_id).cloned().map(Arc::new);
+            // Cloning the site's compiled engine per connection, as this once
+            // did, copied the whole rule set for every socket; the inspector
+            // instead reads the live map, so a rule pushed while a socket is
+            // open applies to its next message.
+            let ws_inspector: Option<Arc<dyn websocket::MessageInspector>> =
+                if engine_map.contains_key(&site_id) {
+                    Some(Arc::new(WsSiteInspector {
+                        site: site_cfg.clone(),
+                        engines: Arc::clone(&state.engines),
+                        ml_engine: Arc::clone(&state.ml_engine),
+                        client_ip,
+                        uri: ctx.uri.clone(),
+                        tenant_id: ctx.tenant_id.clone(),
+                        tls_fingerprint: ctx.tls_fingerprint.clone(),
+                        enforcement_mode: ctx.enforcement_mode.clone(),
+                        anomaly_threshold: ctx.anomaly_threshold,
+                        paranoia: ctx
+                            .tx_vars
+                            .get("DETECTION_PARANOIA_LEVEL")
+                            .cloned()
+                            .unwrap_or_else(|| site_cfg.waf.paranoia_level.to_string()),
+                    }))
+                } else {
+                    None
+                };
             ctx.advance_phase(Phase::Logging);
             log_request(ctx);
 
@@ -3891,7 +3920,7 @@ async fn proxy_inner(
                     TokioIo::new(upstream_io),
                     client_ip,
                     site_id,
-                    ws_engine,
+                    ws_inspector,
                 )
                 .await;
             });
@@ -4530,6 +4559,124 @@ async fn phase1_headers(
     let gm = governing_mode(ctx, &site.waf.mode);
     enforce_mode(ctx, &gm);
     Ok(())
+}
+
+/// Judges WebSocket messages for one socket with the site's own body verdict
+/// path: rules, ML, `apply_verdict` and the governing mode — the path an HTTP
+/// request body takes, so a message is refused exactly when the same bytes
+/// POSTed would be.
+///
+/// The inspector used to call the rule VM directly with the anomaly threshold
+/// disabled and never reach a verdict, and gave it a body with no content type,
+/// so CRS's ARGS rules saw nothing: only an explicit `deny` rule could ever
+/// refuse a message, and it did so even in learning mode.
+struct WsSiteInspector {
+    site: SiteConfig,
+    engines: Arc<ArcSwap<RuleEngineMap>>,
+    ml_engine: Arc<MlEngine>,
+    client_ip: IpAddr,
+    /// The upgrade request's URI, so a record names the socket's real path.
+    uri: http::Uri,
+    tenant_id: Option<String>,
+    tls_fingerprint: Option<String>,
+    /// A path override's mode and threshold, stamped on the upgrade request.
+    enforcement_mode: Option<WafMode>,
+    anomaly_threshold: Option<u32>,
+    /// `TX:DETECTION_PARANOIA_LEVEL` as phase 1 set it for the upgrade. Every
+    /// CRS file opens with a rule that skips the whole file when it is unset.
+    paranoia: String,
+}
+
+impl WsSiteInspector {
+    fn message_ctx(&self) -> RequestContext {
+        let mut ctx = RequestContext::new(self.client_ip, 0);
+        ctx.uri = self.uri.clone();
+        ctx.site_id = Some(self.site.id.clone());
+        ctx.tenant_id = self.tenant_id.clone();
+        ctx.tls_fingerprint = self.tls_fingerprint.clone();
+        ctx.enforcement_mode = self.enforcement_mode.clone();
+        ctx.anomaly_threshold = self.anomaly_threshold;
+        ctx.tx_vars
+            .insert("DETECTION_PARANOIA_LEVEL".to_owned(), self.paranoia.clone());
+        // Only the content type, not the handshake's headers: those were judged
+        // at the upgrade, and re-scoring its cookies on every message would add
+        // their score to each one. JSON is how WebSocket apps talk; the body
+        // processor flattens it into ARGS, and anything that is not JSON falls
+        // back to being scanned whole as one value.
+        ctx.request_headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json"),
+        );
+        ctx
+    }
+
+    fn mode(&self) -> WafMode {
+        self.enforcement_mode
+            .clone()
+            .unwrap_or_else(|| self.site.waf.mode.clone())
+    }
+
+    fn record(ctx: &mut RequestContext, what: &str) {
+        let why = ctx.block_reason.take().unwrap_or_default();
+        ctx.block_reason = Some(if why.is_empty() {
+            format!("websocket message: {what}")
+        } else {
+            format!("websocket message: {why}")
+        });
+        ctx.advance_phase(Phase::Logging);
+        log_request(ctx);
+    }
+}
+
+impl websocket::MessageInspector for WsSiteInspector {
+    fn inspect(&self, message: &[u8]) -> websocket::Verdict {
+        let mut ctx = self.message_ctx();
+        ctx.request_body = Some(Bytes::copy_from_slice(message));
+        seed_crs_policy(&mut ctx, &self.site);
+        ctx.advance_phase(Phase::RequestBody);
+        let engines = self.engines.load();
+        if let Err(e) = phase2_body(&mut ctx, Some(&self.site), &engines, &self.ml_engine) {
+            warn!(site = %self.site.id, "WS message inspection failed: {e}");
+            return if self.mode() == WafMode::Blocking {
+                websocket::Verdict::Refuse(websocket::CLOSE_INTERNAL_ERROR)
+            } else {
+                websocket::Verdict::Forward
+            };
+        }
+        if ctx.decision == WafDecision::Block {
+            Self::record(&mut ctx, "blocked");
+            websocket::Verdict::Refuse(websocket::CLOSE_POLICY_VIOLATION)
+        } else {
+            if ctx.would_block {
+                Self::record(&mut ctx, "would block");
+            }
+            websocket::Verdict::Forward
+        }
+    }
+
+    fn too_large(&self, len: usize) -> websocket::Verdict {
+        let mut ctx = self.message_ctx();
+        ctx.block_reason = Some(format!(
+            "{len}+ bytes exceeds the {} byte inspection limit",
+            websocket::MAX_INSPECT_MESSAGE_BYTES
+        ));
+        if self.mode() == WafMode::Blocking {
+            ctx.decision = WafDecision::Block;
+            Self::record(&mut ctx, "too large");
+            websocket::Verdict::Refuse(websocket::CLOSE_TOO_BIG)
+        } else {
+            warn!(
+                site = %self.site.id,
+                len,
+                "WS message exceeds the inspection limit — forwarded WITHOUT inspection \
+                 (not in blocking mode); recorded as would-block"
+            );
+            ctx.decision = WafDecision::Log;
+            ctx.would_block = true;
+            Self::record(&mut ctx, "too large");
+            websocket::Verdict::Forward
+        }
+    }
 }
 
 /// Phase 2: body inspection + ML scoring + anomaly threshold catch-all.
