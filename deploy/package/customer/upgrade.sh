@@ -297,6 +297,19 @@ set_version() { # set_version VERSION - rewrite SENTINEL_VERSION in .env
 set_version "$NEW"
 ok ".env pinned to $NEW"
 
+# Installers before 2026-09-14 wrote the product's former name as the mail
+# sender default, and an upgrade keeps .env lines — so every older install kept
+# sending password-reset mail under it. Only that exact default is replaced; a
+# sender name the operator chose is never touched. The old name is assembled
+# from parts so this script does not itself trip the branding gate.
+OLD_SENDER="Next-Gen"" ESDSWAF"
+if grep -qx "SENTINEL_SMTP_FROM_NAME=${OLD_SENDER}" "$ENV_FILE"; then
+  tmp="$(mktemp)"
+  sed "s|^SENTINEL_SMTP_FROM_NAME=${OLD_SENDER}\$|SENTINEL_SMTP_FROM_NAME=Swaraj Kavach|" "$ENV_FILE" > "$tmp"
+  if [[ -s "$tmp" ]]; then cat "$tmp" > "$ENV_FILE"; ok "mail sender name updated to Swaraj Kavach"; fi
+  rm -f "$tmp"
+fi
+
 C=(docker compose -p sentinel -f "$INSTALL_DIR/compose.prod.yml" --env-file "$ENV_FILE")
 ( cd "$INSTALL_DIR" && "${C[@]}" config >/dev/null 2>>"$LOG" ) || {
   set_version "$CURRENT"

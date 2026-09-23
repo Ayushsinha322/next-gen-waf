@@ -46,7 +46,9 @@ func sendWebhook(ctx context.Context, ch Channel, a Alert) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "Sentinel-WAF/1.0")
+	// What the customer's receiver logs as the caller: the product, not the
+	// codename, and the real version rather than a fixed "1.0".
+	req.Header.Set("User-Agent", "Swaraj-Kavach/"+version.Product)
 	for k, v := range ch.Config.Headers {
 		req.Header.Set(k, v)
 	}
@@ -54,7 +56,11 @@ func sendWebhook(ctx context.Context, ch Channel, a Alert) error {
 	if ch.Config.Secret != "" {
 		mac := hmac.New(sha256.New, []byte(ch.Config.Secret))
 		mac.Write(body)
-		req.Header.Set("X-Sentinel-Signature", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+		sig := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+		req.Header.Set("X-Swaraj-Kavach-Signature", sig)
+		// The codename header, kept alongside so receivers written against
+		// earlier releases keep verifying. Documented name: the one above.
+		req.Header.Set("X-Sentinel-Signature", sig)
 	}
 	return doHTTP(req)
 }

@@ -901,7 +901,7 @@ function NotificationsTab() {
       </div>
       <div className="pb">
         <div style={{ fontSize: 13, color: "var(--text3)", lineHeight: 1.7, marginBottom: 12, fontFamily: "var(--font-mono)" }}>
-          Alerts (attack spikes, repeat offenders, critical blocks) are delivered to every enabled channel whose minimum severity the alert meets. Webhook payloads are optionally HMAC-SHA256 signed (<code>X-Sentinel-Signature</code>).
+          Alerts (attack spikes, repeat offenders, critical blocks) are delivered to every enabled channel whose minimum severity the alert meets. Webhook payloads are optionally HMAC-SHA256 signed (<code>X-Swaraj-Kavach-Signature</code>; also sent as <code>X-Sentinel-Signature</code> for receivers built against earlier releases).
         </div>
 
         {adding && (

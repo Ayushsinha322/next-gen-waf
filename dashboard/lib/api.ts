@@ -1404,7 +1404,7 @@ export const api = {
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = "sentinel-root-ca.crt";
+      a.download = "swaraj-kavach-root-ca.crt";
       document.body.appendChild(a);
       a.click();
       a.remove();

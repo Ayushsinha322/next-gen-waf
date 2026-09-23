@@ -34,10 +34,12 @@ func TestSeverityGate(t *testing.T) {
 
 func TestWebhookDeliversSignedJSON(t *testing.T) {
 	var gotBody []byte
-	var gotSig, gotCT string
+	var gotSig, gotLegacySig, gotUA, gotCT string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotBody, _ = io.ReadAll(r.Body)
-		gotSig = r.Header.Get("X-Sentinel-Signature")
+		gotSig = r.Header.Get("X-Swaraj-Kavach-Signature")
+		gotLegacySig = r.Header.Get("X-Sentinel-Signature")
+		gotUA = r.Header.Get("User-Agent")
 		gotCT = r.Header.Get("Content-Type")
 		w.WriteHeader(200)
 	}))
@@ -55,6 +57,13 @@ func TestWebhookDeliversSignedJSON(t *testing.T) {
 	}
 	if !strings.HasPrefix(gotSig, "sha256=") {
 		t.Fatalf("expected HMAC signature header, got %q", gotSig)
+	}
+	// Receivers written against earlier releases verify the codename header.
+	if gotLegacySig != gotSig {
+		t.Fatalf("legacy X-Sentinel-Signature = %q, want the same signature %q", gotLegacySig, gotSig)
+	}
+	if !strings.HasPrefix(gotUA, "Swaraj-Kavach/") {
+		t.Fatalf("User-Agent = %q — the customer's receiver logs this as the caller", gotUA)
 	}
 	var env struct {
 		Event string `json:"event"`

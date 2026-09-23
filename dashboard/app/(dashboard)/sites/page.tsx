@@ -170,7 +170,7 @@ export default function SitesPage() {
       const blob = new Blob([yaml], { type: "application/x-yaml" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
-      a.href = url; a.download = "sentinel-sites.yaml"; a.click();
+      a.href = url; a.download = "swaraj-kavach-sites.yaml"; a.click();
       URL.revokeObjectURL(url);
       showToast("Exported sites to YAML", "s");
     } catch { showToast("Export failed", "e"); }
