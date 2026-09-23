@@ -4,14 +4,29 @@ import { motion, AnimatePresence } from "framer-motion";
 import type { ReactNode } from "react";
 import { toastVariants } from "@/lib/animations";
 
-interface ModalState { title: string; body: ReactNode; footer: ReactNode; }
+interface ModalState {
+  title: string; body: ReactNode; footer: ReactNode;
+  /** Called however the modal is dismissed — ✕, backdrop, Escape, or closeModal(). */
+  onClose?: () => void;
+}
 let openModalFn: ((s: ModalState) => void) | null = null;
+let closeModalFn: (() => void) | null = null;
 export function openModal(s: ModalState) { openModalFn?.(s); }
+export function closeModal() { closeModalFn?.(); }
 
 export default function ModalContainer() {
   const [state, setState] = useState<ModalState | null>(null);
-  useEffect(() => { openModalFn = setState; return () => { openModalFn = null; }; }, []);
-  const close = useCallback(() => setState(null), []);
+  const close = useCallback(() => setState(s => { s?.onClose?.(); return null; }), []);
+  useEffect(() => {
+    openModalFn = setState; closeModalFn = close;
+    return () => { openModalFn = null; closeModalFn = null; };
+  }, [close]);
+  useEffect(() => {
+    if (!state) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") close(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [state, close]);
 
   return (
     <AnimatePresence>
@@ -25,7 +40,7 @@ export default function ModalContainer() {
           transition={{ duration: 0.2 }}
         >
           <motion.div
-            className="modal"
+            className="modal" role="dialog" aria-modal="true" aria-label={state.title}
             initial={{ opacity: 0, scale: 0.94, y: 14 }}
             animate={{ opacity: 1, scale: 1, y: 0 }}
             exit={{ opacity: 0, scale: 0.96, y: 8 }}

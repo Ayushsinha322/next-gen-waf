@@ -11,6 +11,8 @@ import { useState, useEffect, useMemo, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
+import { confirmAction } from "@/components/ui/confirm";
+import { modeChangeConfirm, pauseConfirm, deleteConfirm } from "@/lib/siteConfirm";
 import { api, type Site, type Certificate, type SiteStat, type LearningStat, type EffectiveConfig } from "@/lib/api";
 import { staggerContainer, cardVariants, fadeUp } from "@/lib/animations";
 import SiteWizard from "@/components/sites/SiteWizard";
@@ -196,6 +198,8 @@ export default function SiteDetailPage() {
 
   async function setMode(newMode: string) {
     if (!site || busy || newMode === mode) return;
+    const ok = await confirmAction(modeChangeConfirm(site.name, mode, newMode));
+    if (!ok) return;
     setBusy(true);
     try {
       await api.sites.update(siteId, { waf_policy: { ...(site.waf_policy as object), mode: newMode } });
@@ -208,12 +212,13 @@ export default function SiteDetailPage() {
   async function toggleStatus() {
     if (!site) return;
     const next = site.status === "active" ? "paused" : "active";
+    if (next === "paused" && !(await confirmAction(pauseConfirm(site.name, site.domains)))) return;
     try { await api.sites.updateStatus(siteId, next); showToast(`Site ${next}`, "s"); await loadSite(); }
     catch { showToast("Failed", "e"); }
   }
 
   async function del() {
-    if (!site || !confirm(`Delete site "${site.name}"? This cannot be undone.`)) return;
+    if (!site || !(await confirmAction(deleteConfirm(site.name, site.domains)))) return;
     try { await api.sites.delete(siteId); showToast("Site deleted", "s"); router.push("/sites"); }
     catch { showToast("Failed to delete", "e"); }
   }

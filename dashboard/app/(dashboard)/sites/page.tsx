@@ -6,6 +6,8 @@ import { showToast } from "@/components/ui/Toast";
 import EmptyState from "@/components/ui/EmptyState";
 import ConfigHistory from "@/components/sites/ConfigHistory";
 import { openModal } from "@/components/ui/Modal";
+import { confirmAction } from "@/components/ui/confirm";
+import { pauseConfirm, deleteConfirm } from "@/lib/siteConfirm";
 import { api, type Site } from "@/lib/api";
 import { staggerContainer, cardVariants, fadeUp, spring } from "@/lib/animations";
 import SiteWizard from "@/components/sites/SiteWizard";
@@ -374,6 +376,7 @@ export default function SitesPage() {
                             title={s.status === "active" ? "Pause site" : "Activate site"}
                             onClick={async () => {
                               const next = s.status === "active" ? "paused" : "active";
+                              if (next === "paused" && !(await confirmAction(pauseConfirm(s.name, s.domains)))) return;
                               try {
                                 await api.sites.updateStatus(s.id, next);
                                 showToast(`Site ${next}`, "s");
@@ -387,7 +390,7 @@ export default function SitesPage() {
                             className="btn bg-btn btn-xs"
                             title="Delete site"
                             onClick={async () => {
-                              if (!confirm(`Delete site "${s.name}"? This cannot be undone.`)) return;
+                              if (!(await confirmAction(deleteConfirm(s.name, s.domains)))) return;
                               try {
                                 await api.sites.delete(s.id);
                                 showToast("Site deleted", "s");

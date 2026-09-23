@@ -15,6 +15,8 @@
  */
 import { useState, useRef, useEffect, useCallback } from "react";
 import { showToast } from "@/components/ui/Toast";
+import { confirmAction } from "@/components/ui/confirm";
+import { countryBlockConfirm } from "@/lib/siteConfirm";
 import { api } from "@/lib/api";
 import { WORLD_PATH, COUNTRY_POS, type CountryPos } from "@/lib/worldMap";
 
@@ -120,6 +122,7 @@ export default function WorldMap({
 
   async function toggleBlock(code: string, name: string) {
     const isBlocked = blocked.has(code);
+    if (!isBlocked && !(await confirmAction(countryBlockConfirm(name)))) return;
     setBusy(code);
     try {
       const r = isBlocked ? await api.geoip.unblock(code) : await api.geoip.block(code);
