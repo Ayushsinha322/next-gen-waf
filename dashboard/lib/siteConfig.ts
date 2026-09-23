@@ -141,6 +141,109 @@ export function servingCertFor<T extends { domain: string }>(certs: T[], host: s
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// Sanity checks on the values an operator types
+// ---------------------------------------------------------------------------
+
+/** Caps shared with the control plane (control-plane/cmd/controllerd/site_validate.go). */
+export const LIMIT_CAPS = {
+  /** 10 GiB. Bodies are held in memory while inspected, so past this no sane deployment exists. */
+  maxBodyMb: 10240,
+  /** 128 KiB. nginx and Apache refuse request lines past 8 KiB, APISIX past 32 KiB. */
+  maxUriBytes: 131072,
+  /** Browsers send 15–25 headers; 1000 is already absurd. */
+  maxHeaders: 1000,
+} as const;
+
+export interface LimitCheck {
+  /** "error" blocks deploy; "warn" is shown and allowed. */
+  level: "error" | "warn";
+  field: "max_body_size_mb" | "max_uri_length" | "max_header_count" | "paranoia_level" | "anomaly_threshold";
+  message: string;
+}
+
+/**
+ * Catch the values that are almost certainly mistakes before they reach a site.
+ *
+ * Written after the first real deployment, where an operator entered 1000000 in
+ * "Max Body (MB)" — a byte count for one megabyte in a field measured in
+ * megabytes — and stored a 976 GB body limit, alongside a URI limit of 819200
+ * and the Strict preset's paranoia 4 / threshold 3. Nothing questioned any of it.
+ * A limit of 976 GB is a limit that does not exist, and bodies are buffered for
+ * inspection, so it is also a memory-exhaustion door.
+ *
+ * The unit hint matters more than the bound: the operator was not careless, the
+ * field's unit was easy to miss. So the message says what the number would mean
+ * and what was probably intended.
+ */
+export function checkSiteLimits(
+  f: Pick<SiteForm, "max_body_size_mb" | "max_uri_length" | "max_header_count" | "paranoia_level" | "anomaly_threshold" | "mode">,
+): LimitCheck[] {
+  const out: LimitCheck[] = [];
+  const err = (field: LimitCheck["field"], message: string) => out.push({ level: "error", field, message });
+  const warn = (field: LimitCheck["field"], message: string) => out.push({ level: "warn", field, message });
+  const num = (v: number) => (Number.isFinite(v) ? v : NaN);
+  const fmt = (n: number) => n.toLocaleString("en-US", { maximumFractionDigits: 1 });
+
+  const mb = num(f.max_body_size_mb);
+  if (Number.isNaN(mb) || mb < 0) {
+    err("max_body_size_mb", "Max body size must be a number of megabytes, 0 or more.");
+  } else if (mb > LIMIT_CAPS.maxBodyMb) {
+    const asBytesMb = mb / 1048576;
+    err(
+      "max_body_size_mb",
+      `Max body is ${fmt(mb)} MB (${fmt(mb / 1024)} GB) — this field is in megabytes. ` +
+        (mb >= 100_000
+          ? `If you meant ${fmt(mb)} bytes, enter ${asBytesMb < 1 ? "1" : fmt(Math.ceil(asBytesMb))}. `
+          : "") +
+        `The largest accepted is ${fmt(LIMIT_CAPS.maxBodyMb)} MB.`,
+    );
+  } else if (mb === 0) {
+    warn("max_body_size_mb", "0 means no limit at all — a request body of any size is accepted and held in memory while it is inspected.");
+  } else if (mb > 1024) {
+    warn("max_body_size_mb", `${fmt(mb)} MB is very large. Bodies are held in memory while inspected, so each concurrent upload of that size needs that much RAM.`);
+  }
+
+  const uri = num(f.max_uri_length);
+  if (Number.isNaN(uri) || uri < 0) {
+    err("max_uri_length", "Max URI must be a number of bytes, 0 or more.");
+  } else if (uri > LIMIT_CAPS.maxUriBytes) {
+    err(
+      "max_uri_length",
+      `Max URI is ${fmt(uri)} bytes (${fmt(uri / 1024)} KB). No origin accepts a request line that long — nginx and Apache stop at 8 KB, APISIX at 32 KB. ` +
+        `For SSO login redirects 16384 is enough. The largest accepted is ${fmt(LIMIT_CAPS.maxUriBytes)}.`,
+    );
+  } else if (uri > 0 && uri < 2048) {
+    warn("max_uri_length", `${fmt(uri)} bytes will reject ordinary links with a query string. The default is 8192; SSO redirects need 16384.`);
+  }
+
+  const hdr = num(f.max_header_count);
+  if (Number.isNaN(hdr) || hdr < 0) {
+    err("max_header_count", "Max headers must be a whole number, 0 or more.");
+  } else if (hdr > LIMIT_CAPS.maxHeaders) {
+    err("max_header_count", `Max headers is ${fmt(hdr)}. Browsers send 15–25; the largest accepted is ${fmt(LIMIT_CAPS.maxHeaders)}.`);
+  } else if (hdr > 0 && hdr < 30) {
+    warn("max_header_count", `${fmt(hdr)} is below what browsers routinely send with cookies and SSO — expect 431 errors. The default is 100.`);
+  }
+
+  const pl = num(f.paranoia_level);
+  if (!Number.isInteger(pl) || pl < 1 || pl > 4) {
+    err("paranoia_level", "Paranoia level must be 1, 2, 3 or 4.");
+  }
+  const thr = num(f.anomaly_threshold);
+  if (!Number.isInteger(thr) || thr < 1) {
+    err("anomaly_threshold", "Anomaly threshold must be a whole number, 1 or more — 0 would block every request.");
+  } else if (Number.isInteger(pl) && pl >= 3 && thr <= 5) {
+    warn(
+      "anomaly_threshold",
+      `${f.mode === "blocking" ? "This site is in Blocking mode. " : ""}At paranoia ${pl}, a threshold of ${thr} blocks most legitimate traffic — ` +
+        "on the first customer deployment this combination flagged the login page's own images. " +
+        "Run in Learning mode until the report is clean, or use the Balanced preset (paranoia 2, threshold 10).",
+    );
+  }
+  return out;
+}
+
 /** ACME challenge type. http_01 + tls_alpn_01 are enforced by our ACME engine;
  *  dns_01 (for wildcards) is roadmap — carried for round-trip, not yet issued. */
 export type ChallengeType = "http_01" | "tls_alpn_01" | "dns_01";

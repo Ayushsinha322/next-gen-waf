@@ -190,7 +190,12 @@ func validateWafPolicyValues(raw json.RawMessage) []SiteConfigProblem {
 		EnabledPlugins   []string `json:"enabled_plugins"`
 		ParanoiaLevel    *int     `json:"paranoia_level"`
 		AnomalyThreshold *int     `json:"anomaly_threshold"`
-		PathOverrides    []struct {
+		// float64 so ANY JSON number is judged here; an integer field would fail
+		// to unmarshal on an absurd value and skip every check in this function.
+		MaxBodySize    *float64 `json:"max_body_size"`
+		MaxURILength   *float64 `json:"max_uri_length"`
+		MaxHeaderCount *float64 `json:"max_header_count"`
+		PathOverrides  []struct {
 			PathPrefix       string          `json:"path_prefix"`
 			Mode             *string         `json:"mode"`
 			AnomalyThreshold *int            `json:"anomaly_threshold"`
@@ -237,6 +242,35 @@ func validateWafPolicyValues(raw json.RawMessage) []SiteConfigProblem {
 		add("waf_policy.anomaly_threshold",
 			fmt.Sprintf("must be >= 1, got %d — a threshold of 0 or less blocks every request", *p.AnomalyThreshold))
 	}
+
+	// Request-limit bounds. Mirrors LIMIT_CAPS in dashboard/lib/siteConfig.ts —
+	// the console checks first for an immediate message; this is the authority,
+	// because the API and scripts never see the console.
+	//
+	// Written after the first real deployment stored a 976 GB body limit (a byte
+	// count typed into a megabyte field) and an 819200-byte URI limit, and nothing
+	// refused either. Bodies are buffered for inspection, so a body "limit" that
+	// large is no limit and an open door to memory exhaustion. 0 stays legal: the
+	// data plane reads it as "unlimited", which is a choice, not a typo.
+	checkLimit := func(field string, v *float64, max float64, why string) {
+		if v == nil {
+			return
+		}
+		switch {
+		case *v < 0:
+			add(field, fmt.Sprintf("must be 0 or more, got %v", *v))
+		case *v > max:
+			add(field, fmt.Sprintf("is %.0f; the largest accepted is %.0f — %s", *v, max, why))
+		}
+	}
+	checkLimit("waf_policy.max_body_size", p.MaxBodySize, maxSiteBodyBytes,
+		"request bodies are held in memory while inspected, so a limit this large is no limit "+
+			"(a byte count typed into a megabyte field is the usual cause)")
+	checkLimit("waf_policy.max_uri_length", p.MaxURILength, maxSiteURIBytes,
+		"nginx and Apache refuse request lines past 8 KiB and APISIX past 32 KiB, so a larger "+
+			"limit protects nothing; SSO redirects need 16384")
+	checkLimit("waf_policy.max_header_count", p.MaxHeaderCount, maxSiteHeaders,
+		"browsers send 15-25 headers")
 
 	// Per-path overrides. These are rejected rather than silently normalised: an
 	// override an operator believes is protecting /api/ but which the data plane
@@ -286,6 +320,15 @@ func validateWafPolicyValues(raw json.RawMessage) []SiteConfigProblem {
 	}
 	return problems
 }
+
+// Upper bounds for a site's request limits. Kept identical to LIMIT_CAPS in
+// dashboard/lib/siteConfig.ts; siteLimits.test.ts reads this file and fails if
+// the two drift.
+const (
+	maxSiteBodyBytes = 10 * 1024 * 1024 * 1024 // 10 GiB
+	maxSiteURIBytes  = 131072                  // 128 KiB
+	maxSiteHeaders   = 1000
+)
 
 // toInt coerces the numeric forms that survive a JSON round-trip.
 func toInt(v any) (int, bool) {

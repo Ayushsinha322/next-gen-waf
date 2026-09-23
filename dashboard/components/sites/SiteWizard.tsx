@@ -23,8 +23,29 @@ import {
   CRS_REQUEST_CATEGORIES, CRS_RESPONSE_CATEGORIES, ALL_CRS_RESPONSE_KEYS, type CrsCategory,
   ALL_CRS_KEYS, COUNTRIES, PresetKey, UpstreamServer, normalizeDomain,
   HTTP_METHODS, ACME_PROVIDERS, CustomHeader, certCoversHost, servingCertFor,
+  checkSiteLimits, type LimitCheck,
   JWT_ALGORITHMS, FUSION_ENGINES, IpFeed,
 } from "@/lib/siteConfig";
+
+/** The limit checks that concern the given fields, shown next to those fields. */
+function LimitNotes({ checks, fields }: { checks: LimitCheck[]; fields: LimitCheck["field"][] }) {
+  const mine = checks.filter(c => fields.includes(c.field));
+  if (mine.length === 0) return null;
+  return (
+    <div style={{ display: "grid", gap: 6, marginTop: 8 }}>
+      {mine.map((c, i) => (
+        <div key={i} role={c.level === "error" ? "alert" : undefined} style={{
+          fontSize: 13, lineHeight: 1.5, padding: "8px 11px", borderRadius: 8,
+          color: c.level === "error" ? "var(--red)" : "var(--amber,#ffb020)",
+          background: c.level === "error" ? "color-mix(in srgb, var(--red) 10%, transparent)" : "rgba(255,176,32,.07)",
+          border: `1px solid ${c.level === "error" ? "color-mix(in srgb, var(--red) 35%, transparent)" : "rgba(255,176,32,.25)"}`,
+        }}>
+          <strong>{c.level === "error" ? "Cannot deploy: " : "Check: "}</strong>{c.message}
+        </div>
+      ))}
+    </div>
+  );
+}
 
 /** All names a cert presents (primary domain + SANs), lowercased. */
 function certNames(c: Certificate): string[] {
@@ -280,6 +301,13 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
     if (form.tls_mode === "auto" && form.front_https && !form.acme_email.trim()) return "An email is required for automatic certificates (Front Service)";
     if (form.tls_mode === "existing" && form.front_https && !form.tls_existing_cert) return "Select a certificate from the repository (Front Service)";
     if (form.tls_mode === "manual" && form.custom_priority === "data" && (!form.cert_pem.trim() || !form.key_pem.trim())) return "Paste both the certificate and private key (Front Service)";
+    {
+      const limitError = checkSiteLimits(form).find(c => c.level === "error");
+      if (limitError) {
+        const where = limitError.field === "paranoia_level" || limitError.field === "anomaly_threshold" ? "WAF Rules" : "Advanced";
+        return `${limitError.message} (${where})`;
+      }
+    }
     if (form.tls_mode === "manual" && form.custom_priority === "file" && (!form.cert_path.trim() || !form.key_path.trim())) return "Provide both certificate and key paths (Front Service)";
     return null;
   }
@@ -804,6 +832,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     <Field label="Paranoia Level" hint="1 = fewer false positives · 4 = strictest"><input className="fin2" type="number" min={1} max={4} value={form.paranoia_level} onChange={e => upd({ paranoia_level: Number(e.target.value), preset: "custom" })} /></Field>
                     <Field label="Anomaly Threshold" hint="Score needed to block a request"><input className="fin2" type="number" value={form.anomaly_threshold} onChange={e => upd({ anomaly_threshold: Number(e.target.value), preset: "custom" })} /></Field>
                   </Row>
+                  <LimitNotes checks={checkSiteLimits(form)} fields={["paranoia_level", "anomaly_threshold"]} />
                   <SectionToggle label="Per-IP Rate Limiting" desc={`${form.rl_per_ip.rps} req/s · burst ${form.rl_per_ip.burst}`} on={form.rate_limit_enabled} set={v => upd({ rate_limit_enabled: v })} />
                   <SectionToggle label="Bot Detection (JA4 fingerprinting)" desc="Identify automated clients by TLS fingerprint" on={form.bot_ja4} set={v => upd({ bot_ja4: v })} />
                   <InfoBox>All OWASP CRS categories are enabled by this template. Switch to <strong style={{ color: "var(--cyan)" }}>Advanced</strong> to fine-tune rules, antibot, GeoIP, headers, anti-DDoS and ML.</InfoBox>
@@ -816,6 +845,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     <Field label="Paranoia Level" hint="1–4 · higher = stricter"><input className="fin2" type="number" min={1} max={4} value={form.paranoia_level} onChange={e => upd({ paranoia_level: Number(e.target.value) })} /></Field>
                     <Field label="Anomaly Threshold" hint="Total rule score at which a request is refused. Lower blocks more — the balanced preset uses 10."><input className="fin2" type="number" value={form.anomaly_threshold} onChange={e => upd({ anomaly_threshold: Number(e.target.value) })} /></Field>
                   </Row>
+                  <LimitNotes checks={checkSiteLimits(form)} fields={["paranoia_level", "anomaly_threshold"]} />
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                     <GroupLabel>Request Inspection ({form.rule_categories.filter(k => !ALL_CRS_RESPONSE_KEYS.includes(k)).length}/{CRS_REQUEST_CATEGORIES.length})</GroupLabel>
                     <div style={{ display: "flex", gap: 6 }}>
@@ -1116,6 +1146,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     <Field label="Max URI (bytes)" hint="Longest request line accepted."><input className="fin2" type="number" value={form.max_uri_length} onChange={e => upd({ max_uri_length: Number(e.target.value) })} /></Field>
                     <Field label="Max Headers" hint="Most headers one request may carry."><input className="fin2" type="number" value={form.max_header_count} onChange={e => upd({ max_header_count: Number(e.target.value) })} /></Field>
                   </div>
+                  <LimitNotes checks={checkSiteLimits(form)} fields={["max_body_size_mb", "max_uri_length", "max_header_count"]} />
                   <GroupLabel>Allowed HTTP Methods</GroupLabel>
                   <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
                     {HTTP_METHODS.map(m => {
@@ -1214,6 +1245,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                 {screen === "review" && (
                   <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
                     <StepHead title="Review" sub={`Confirm your configuration, then ${mode === "edit" ? "save changes" : "deploy"}. Protection activates in ~5s.`} />
+                  <LimitNotes checks={checkSiteLimits(form)} fields={["max_body_size_mb", "max_uri_length", "max_header_count", "paranoia_level", "anomaly_threshold"]} />
                   {checking && (
                     <InfoBox tone="cyan">Validating this configuration against the data-plane converter…</InfoBox>
                   )}
