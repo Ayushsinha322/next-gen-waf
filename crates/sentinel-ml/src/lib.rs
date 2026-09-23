@@ -193,7 +193,7 @@ impl MlEngine {
             let mut candidates: Vec<String> = Vec::new();
             // URL path segments (URLPath placement; path-borne injection).
             for seg in ctx.uri.path().split('/') {
-                if !seg.is_empty() {
+                if !seg.is_empty() && !is_plain_path_word(seg) {
                     candidates.push(seg.to_string());
                 }
             }
@@ -236,7 +236,6 @@ impl MlEngine {
             // Request body (Body/JSON/form/multipart placements).
             if let Some(body) = ctx.request_body.as_ref() {
                 if let Ok(bs) = std::str::from_utf8(body.as_ref()) {
-                    candidates.push(bs.to_string());
                     // Also score each PARSED, DECODED field value. Scoring only the
                     // whole raw body misses attacks carried in a form/multipart
                     // field: a URL- or Base64-encoded payload sits inside the
@@ -248,7 +247,18 @@ impl MlEngine {
                         .get(http::header::CONTENT_TYPE)
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("");
-                    body_field_values(bs, ct, &mut candidates);
+                    // The whole raw body is a candidate only when it did NOT parse
+                    // into fields. Scored whole, a well-formed JSON document is
+                    // judged on its punctuation: `{"items":[{"id":1,…}],"note":
+                    // "deliver after 6pm; ring twice"}` scored 0.905 — over the
+                    // detection threshold, so the classifier ALONE blocked an
+                    // ordinary basket update — while every field in it scored
+                    // under 0.01. When the body parses, each field and key is
+                    // already a candidate; a body that does not parse (malformed
+                    // JSON, unknown type) is still scored whole.
+                    if !body_field_values(bs, ct, &mut candidates) {
+                        candidates.push(bs.to_string());
+                    }
                 }
             }
             // Score each candidate over its raw form AND every decoded variant
@@ -397,7 +407,25 @@ fn json_scalar_values(v: &serde_json::Value, out: &mut Vec<String>) {
     }
 }
 
-fn body_field_values(body: &str, content_type: &str, out: &mut Vec<String>) {
+/// A path segment that is one plain word — letters, digits and `-_.~`, with no
+/// `..` — and so cannot carry an injection by itself.
+///
+/// Scoring such segments let the classifier block on vocabulary: `whoami` alone
+/// scores 0.922, over the detection threshold, so `GET /rest/user/whoami` (an
+/// ordinary Juice Shop endpoint) was blocked by the model with no rule behind
+/// it. A segment with any metacharacter, encoding (`%`), traversal (`..`) or
+/// markup is still scored.
+fn is_plain_path_word(seg: &str) -> bool {
+    !seg.contains("..")
+        && seg.chars().any(|c| c.is_ascii_alphanumeric())
+        && seg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~'))
+}
+
+/// Pushes each field value of a form, JSON or multipart body. Returns whether
+/// the body was parsed into fields (so the caller need not score it whole).
+fn body_field_values(body: &str, content_type: &str, out: &mut Vec<String>) -> bool {
     let ct = content_type.to_ascii_lowercase();
     if ct.starts_with("application/x-www-form-urlencoded") {
         for kv in body.split('&') {
@@ -409,6 +437,7 @@ fn body_field_values(body: &str, content_type: &str, out: &mut Vec<String>) {
                 out.push(dec);
             }
         }
+        true
     } else if ct.starts_with("application/json") || ct.contains("+json") {
         // JSON was missing here, and that was a measured bypass on 2026-09-15.
         //
@@ -432,8 +461,12 @@ fn body_field_values(body: &str, content_type: &str, out: &mut Vec<String>) {
         // Malformed JSON falls through deliberately: the caller has already
         // pushed the raw body as a candidate, so nothing is lost by not
         // guessing at a broken document.
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
-            json_scalar_values(&v, out);
+        match serde_json::from_str::<serde_json::Value>(body) {
+            Ok(v) => {
+                json_scalar_values(&v, out);
+                true
+            }
+            Err(_) => false,
         }
     } else if let Some(pos) = ct.find("multipart/form-data") {
         // Boundary token from `; boundary=...`.
@@ -442,11 +475,12 @@ fn body_field_values(body: &str, content_type: &str, out: &mut Vec<String>) {
             .map(|i| pos + i + "boundary=".len())
             .map(|i| content_type[i..].trim().trim_matches('"'))
         else {
-            return;
+            return false;
         };
         if b.is_empty() {
-            return;
+            return false;
         }
+        let before = out.len();
         let delim = format!("--{b}");
         for part in body.split(&delim) {
             // Field value is everything after the part's header block (blank line).
@@ -461,6 +495,9 @@ fn body_field_values(body: &str, content_type: &str, out: &mut Vec<String>) {
                 }
             }
         }
+        out.len() > before
+    } else {
+        false
     }
 }
 
