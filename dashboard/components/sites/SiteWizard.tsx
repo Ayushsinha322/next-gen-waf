@@ -406,7 +406,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
           <div style={{ fontSize: 14, color: "var(--text3)", marginTop: 4, fontFamily: "var(--font-mono)" }}>
             {mode === "edit" ? form.name : "Reverse proxy + WAF in minutes"}
           </div>
-          <div style={{ display: "flex", gap: 4, margin: "16px 0 18px", padding: 3, background: "rgba(0,0,0,.3)", borderRadius: 10 }}>
+          <div style={{ display: "flex", gap: 4, margin: "16px 0 18px", padding: 3, background: "var(--inset-bg)", borderRadius: 10 }}>
             {(["Easy", "Advanced"] as const).map((m, i) => {
               const active = (i === 1) === adv;
               return (

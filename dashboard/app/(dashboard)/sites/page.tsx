@@ -87,7 +87,7 @@ export default function SitesPage() {
           <div>
             <div style={{ fontSize: 14, color: "var(--text2)", marginBottom: 6, fontFamily: "var(--font-mono)", letterSpacing: 1 }}>STEP 1 — Add to /etc/hosts (run once as root)</div>
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <code style={{ flex: 1, padding: "8px 12px", background: "rgba(0,0,0,.35)", border: "1px solid rgba(255,255,255,.08)", borderRadius: "var(--r2)", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--text)", userSelect: "all" }}>
+              <code style={{ flex: 1, padding: "8px 12px", background: "var(--inset-bg)", border: "1px solid var(--inset-border)", borderRadius: "var(--r2)", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--text)", userSelect: "all" }}>
                 {hostsEntry}
               </code>
               <button className="btn bg-btn btn-sm" onClick={() => { navigator.clipboard.writeText(`echo '${hostsEntry}' | sudo tee -a /etc/hosts`); showToast("Copied!", "s"); }}>Copy cmd</button>
@@ -99,7 +99,7 @@ export default function SitesPage() {
           <div>
             <div style={{ fontSize: 14, color: "var(--text2)", marginBottom: 6, fontFamily: "var(--font-mono)", letterSpacing: 1 }}>STEP 2 — Browse through the WAF (not the origin)</div>
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <code style={{ flex: 1, padding: "8px 12px", background: "rgba(0,0,0,.35)", border: "1px solid rgba(255,255,255,.08)", borderRadius: "var(--r2)", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--green)" }}>
+              <code style={{ flex: 1, padding: "8px 12px", background: "var(--inset-bg)", border: "1px solid var(--inset-border)", borderRadius: "var(--r2)", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--green)" }}>
                 {browseURL}
               </code>
               <button className="btn bg-btn btn-sm" onClick={() => { navigator.clipboard.writeText(browseURL); showToast("Copied!", "s"); }}>Copy</button>
@@ -261,7 +261,7 @@ export default function SitesPage() {
         <motion.div variants={fadeUp}>
           <div style={{ fontSize: 11, fontFamily: "var(--font-mono)", color: "var(--text3)", letterSpacing: 1.5, textTransform: "uppercase", marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
             <span>Security Lab Targets</span>
-            <div style={{ flex: 1, height: 1, background: "rgba(255,255,255,.06)" }} />
+            <div style={{ flex: 1, height: 1, background: "var(--inset-border)" }} />
           </div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
             {labSites.map(site => {
@@ -310,7 +310,7 @@ export default function SitesPage() {
                       <button className="btn bg-btn btn-sm" onClick={() => router.push(`/logs?site=${name}&tab=access`)}>Access Logs</button>
                       <button className="btn bg-btn btn-sm" disabled={!site} onClick={() => site && openEdit(site)} style={!site ? { opacity: 0.5 } : undefined}>Edit</button>
                     </div>
-                    <div style={{ marginTop: 10, padding: "8px 10px", background: "rgba(0,0,0,.2)", borderRadius: "var(--r2)", fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--text3)", display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6 }}>
+                    <div style={{ marginTop: 10, padding: "8px 10px", background: "var(--inset-bg)", borderRadius: "var(--r2)", fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--text3)", display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6 }}>
                       <div><div style={{ color: "var(--text2)", marginBottom: 2 }}>Upstream</div>127.0.0.1:{meta.port}</div>
                       <div><div style={{ color: "var(--text2)", marginBottom: 2 }}>Paranoia</div>Level {site?.waf_policy?.paranoia_level ?? 2}</div>
                       <div><div style={{ color: "var(--text2)", marginBottom: 2 }}>Threshold</div>{site?.waf_policy?.anomaly_threshold ?? 5} score</div>

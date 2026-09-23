@@ -8,6 +8,11 @@
    Light: crisp SaaS white/gray base
 ═══════════════════════════════════════════ */
 :root {
+  /* Inset surfaces — code snippets, tab strips, stat wells — recessed INTO a
+     panel. Inline styles used rgba(0,0,0,.2–.35) for these, which the light
+     theme could not override: dark wells under dark light-theme text. */
+  --inset-bg:     rgba(0,0,0,.3);
+  --inset-border: rgba(255,255,255,.08);
   /* ── Dark base — zinc-950 enterprise ── */
   --bg:       #09090b;
   --bg2:      #18181b;
@@ -139,6 +144,8 @@
    LIGHT MODE — premium soft slate/zinc SaaS
 ═══════════════════════════════════════════ */
 [data-theme='light'] {
+  --inset-bg:     rgba(15,23,42,.05);
+  --inset-border: rgba(15,23,42,.10);
   /* ── Surface — cool slate scale (Vercel/Linear style) ── */
   --bg:       #f8fafc;
   --bg2:      #f1f5f9;
