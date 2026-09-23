@@ -633,7 +633,7 @@ decision "Log"   block_reason "anomaly score 30 &gt;= threshold 10"   status 200
     <div class="tw"><table>
       <thead><tr><th>Symptom</th><th>Cause</th><th>Fix</th></tr></thead>
       <tbody>
-        <tr><td><strong>502 on every request</strong></td><td>No site configured yet</td><td>Expected. Add a site</td></tr>
+        <tr><td><strong>404 “No site is configured for this hostname”</strong></td><td>No site configured yet</td><td>Expected. Add a site</td></tr>
         <tr><td><strong>502 on one site</strong></td><td>Origin unreachable from the WAF host, or Host header does not match exactly</td><td><code>docker exec sentinel-clickhouse-1 nc -z &lt;origin&gt; &lt;port&gt;</code></td></tr>
         <tr><td><strong>Login returns 503</strong></td><td>Control plane has no database</td><td><code>sudo ./verify.sh</code>, then <code>docker restart sentinel-controlplane-1</code> once Postgres is healthy</td></tr>
         <tr><td><strong><code>https://&lt;vm-ip&gt;:9443</code> refuses</strong></td><td>Correct — console is loopback-only</td><td>Use the SSH tunnel in 07</td></tr>

@@ -3858,7 +3858,22 @@ async fn proxy_inner(
     // --- Phase 3: Upstream ---
     ctx.advance_phase(Phase::Upstream);
 
-    let site_cfg = site.ok_or_else(|| anyhow!("no matching site for host: {:?}", host))?;
+    // No site claims this Host. Answer 404 and say so, rather than failing the
+    // request as an upstream error: that came out as 502 Bad Gateway, which tells
+    // the visitor — and whoever is debugging a new DNS record — that the
+    // APPLICATION is broken, when the truth is that this WAF has no site for the
+    // name (a typo, DNS pointed here before the site was added, or the site was
+    // deleted). Recorded, so the access log says which name was asked for.
+    let Some(site_cfg) = site else {
+        ctx.response_status = Some(StatusCode::NOT_FOUND);
+        ctx.block_reason = Some(format!("no site is configured for host {host:?}"));
+        ctx.advance_phase(Phase::Logging);
+        log_request(ctx);
+        return Ok(error_response(
+            StatusCode::NOT_FOUND,
+            "No site is configured for this hostname on this WAF.",
+        ));
+    };
 
     let upstream_srv = state
         .upstream_pool

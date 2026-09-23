@@ -219,7 +219,7 @@ Real output on a fresh install:
 
 The two warnings are **expected and correct** before you add a site:
 
-- `no sites configured yet — the WAF returns 502 to everything`
+- `no sites configured yet — the WAF answers 404 "No site is configured for this hostname" until one exists`
 - `enforcement not tested — no site configured`
 
 > **A 502 from the WAF before you add a site is right, not broken.** There is no
@@ -370,7 +370,7 @@ copy of the admin password and of every generated secret.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| **502 on every request** | No site configured yet | Expected. Add a site |
+| **404 "No site is configured for this hostname"** | No site configured yet | Expected. Add a site |
 | **502 on one site** | Origin unreachable *from the WAF host*, or Host header does not match the site's domain exactly | `docker exec sentinel-clickhouse-1 nc -z <origin> <port>` |
 | **Login returns 503** | Control plane has no database | `sudo ./verify.sh` → check `Control plane → database`, then `docker restart sentinel-controlplane-1` once Postgres is healthy |
 | **`https://<vm-ip>:9443` refuses** | Correct — console is loopback-only | Use the SSH tunnel in §7 |

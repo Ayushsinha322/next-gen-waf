@@ -299,7 +299,7 @@ sudo ./verify.sh
 **`0 failed` is the number that matters.** The two warnings are correct at this
 point:
 
-- `no sites configured yet — the WAF returns 502 to everything`
+- `no sites configured yet — the WAF answers 404 "No site is configured for this hostname" until one exists`
 - `enforcement not tested — no site configured`
 
 > **A 502 from the WAF before you add a site is right, not broken.** You have a
@@ -633,7 +633,7 @@ are protecting against losing is not a backup.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| **502 on everything** | No site configured | Expected. Add a site — §5 |
+| **404 "No site is configured for this hostname"** | No site claims that name | Expected before the first site. Add a site — §5 |
 | **502 on one site** | Origin unreachable *from the WAF host*, or Host header does not match the site's domain exactly | `docker exec sentinel-clickhouse-1 nc -z <origin> <port>` |
 | **Login returns 503** | Control plane has no database | `sudo ./verify.sh` → check `Control plane → database`, then `docker restart sentinel-controlplane-1` once Postgres is healthy |
 | **`https://<vm-ip>:9443` refuses** | Correct — loopback only | Use the SSH tunnel — §4.1 |

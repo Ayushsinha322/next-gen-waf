@@ -30,7 +30,7 @@ section tells you what to check, in order, cheapest check first.
 | Login works but SSO login fails | [§5](#5-403-on-legitimate-traffic-false-positive) |
 | Live chat / live dashboard stopped working | [§12](#12-websockets-stopped-working) |
 | Application logs show the WAF's IP, not visitors' | [§13](#13-origin-sees-the-wrong-client-ip) |
-| Everything returns 502 on a brand-new install | Normal — no sites yet. [INSTALL-WALKTHROUGH.md](../vm-deploy/INSTALL-WALKTHROUGH.md) §4 |
+| Everything returns 404 "No site is configured for this hostname" on a brand-new install | Normal — no sites yet. [INSTALL-WALKTHROUGH.md](../vm-deploy/INSTALL-WALKTHROUGH.md) §4 |
 
 ---
 
@@ -50,8 +50,8 @@ Work down this list. Stop at the first failure.
 **Step 4 is the one people miss.** The WAF decides which website a request belongs
 to by reading the hostname the visitor's browser sent, and matching it against the
 Domains list on each site. If the visitor types `www.customer.com` and the site
-only lists `customer.com`, **nothing matches** and the WAF answers 502 — because
-there is no site, therefore no origin to forward to.
+only lists `customer.com`, **nothing matches** and the WAF answers **404 "No site
+is configured for this hostname"** — the WAF's own page, not the application's.
 
 Test from the WAF VM, which skips DNS entirely:
 
@@ -66,19 +66,12 @@ curl -sk -o /dev/null -w '%{http_code}\n' -H 'Host: www.customer.com' https://12
 
 ## 2. 502 Bad Gateway
 
-502 means: *the WAF could not get a usable answer from the origin.* There are two
-quite different causes.
+502 means: *a site matched, and the WAF could not get a usable answer from its
+origin.* (A hostname that matches NO site is answered 404 "No site is configured
+for this hostname" instead — see §1 step 4. Releases before 1.1.7 answered that
+case with 502 too.)
 
-### Cause A — no site matched the hostname
-
-There is no origin to talk to because no site claimed this name. Check the
-Domains list for a typo, a missing `www.`, or a name the visitor uses that you
-did not list.
-
-This is also why `curl -H 'Host: 127.0.0.1'` returns 502 on a working WAF — that
-is not one of your sites' names. **Correct behaviour, not a fault.**
-
-### Cause B — the origin is not answering
+### The origin is not answering
 
 Check, in this order:
 

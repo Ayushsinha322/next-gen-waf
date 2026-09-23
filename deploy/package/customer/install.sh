@@ -1152,7 +1152,7 @@ hc "Control plane → DB" bash -c '
 hc "Data plane"    bash -c "curl -fsS --max-time 3 http://127.0.0.1:80/healthz >/dev/null" || health_fail=1
 # :443 was never probed by any check, which is how a default certificate issued for
 # the wrong network shipped unnoticed. No -f here on purpose: with no sites yet the
-# WAF correctly answers 502, and a 502 still proves the TLS handshake completed and
+# WAF correctly answers 404, and that still proves the TLS handshake completed and
 # a certificate was served. Only a handshake or connection failure fails this.
 hc "TLS on :443"   bash -c 'curl -sk --max-time 5 -o /dev/null https://127.0.0.1:443/' || health_fail=1
 # End-to-end: the management listener answering. It is the first thing the
@@ -1298,7 +1298,7 @@ $CONSOLE_HOW
 
   ${B}Next steps${R}
     1. Add your first protected site in the console.
-       Until a site exists the WAF returns 502 to everything: correct
+       Until a site exists the WAF answers 404 "No site is configured": correct
        behaviour, because there is no upstream to forward to yet.
     2. ${B}Leave new sites in LEARNING mode.${R} Every published detection figure
        comes from a synthetic corpus; nobody has measured how often this

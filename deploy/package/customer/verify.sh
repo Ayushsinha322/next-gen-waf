@@ -115,7 +115,7 @@ if [[ -n "$HZ" ]]; then
   # and skipped the enforcement test below entirely.
   SITES=$(printf '%s' "$HZ" | sed -n 's/.*"sites"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)
   if [[ "${SITES:-0}" -gt 0 ]]; then pass "$SITES protected site(s) loaded"
-  else soft "no sites configured yet — the WAF returns 502 to everything until one exists (expected on a fresh install)"; fi
+  else soft "no sites configured yet — the WAF answers 404 \"No site is configured for this hostname\" until one exists (expected on a fresh install)"; fi
   SHED=$(printf '%s' "$HZ" | sed -n 's/.*"history_shed"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)
   if [[ "${SHED:-0}" -eq 0 ]]; then pass "no shed events (every block was recorded)"
   else soft "$SHED events enforced but NOT recorded — event history undercounts blocks for that window"; fi
@@ -175,13 +175,17 @@ if [[ "${SITES:-0}" -gt 0 ]]; then
   HOSTHDR="${SENTINEL_VERIFY_HOST:-}"
   [[ -n "$HOSTHDR" ]] || HOSTHDR=$(sed -n 's/^SENTINEL_WAF_HOSTNAME=//p' "$ENV_FILE" 2>/dev/null | head -1)
   HOSTHDR="${HOSTHDR:-localhost}"
-  b=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 -H "Host: $HOSTHDR" "http://127.0.0.1/" 2>/dev/null)
+  bbody=$(curl -s --max-time 8 -H "Host: $HOSTHDR" "http://127.0.0.1/" -w '\n%{http_code}' 2>/dev/null)
+  b="${bbody##*$'\n'}"
   a=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 -H "Host: $HOSTHDR" "http://127.0.0.1/?id=1%27+OR+1%3D1--" 2>/dev/null)
 
-  if [[ "$b" == "502" ]]; then
+  # A Host no site claims is answered 404 with the WAF's own message (older data
+  # planes: 502). Matched on the message, not the status alone: an application
+  # can answer 404 at "/" itself, and that request DID reach the engine.
+  if [[ "$b" == "502" ]] || { [[ "$b" == "404" ]] && [[ "$bbody" == *"No site is configured for this hostname"* ]]; }; then
     # The probe Host matched no site, so neither request reached the engine and
     # NOTHING about enforcement was measured. Saying so is the whole point.
-    soft "enforcement NOT measured — 'Host: $HOSTHDR' matches no configured site (502)"
+    soft "enforcement NOT measured — 'Host: $HOSTHDR' matches no configured site"
     printf '        %sre-run with a hostname one of your sites declares:%s\n' "$DIM" "$R"
     printf '        %s  SENTINEL_VERIFY_HOST=app.example.com sudo ./verify.sh%s\n' "$DIM" "$R"
   else

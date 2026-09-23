@@ -107,8 +107,8 @@ Console → **Sites** → the site → Delete.
 curl -sk -o /dev/null -w '%{http_code}\n' -H 'Host: www.customer.com' https://127.0.0.1/
 ```
 
-Expect **502** — no site claims that name any more, so there is nothing to
-forward to. If you still get 200, the deletion has not reached the data plane yet;
+Expect **404** with the WAF's own message, "No site is configured for this
+hostname" — no site claims that name any more. If you still get 200, the deletion has not reached the data plane yet;
 wait about 5 seconds for the next configuration poll and check again.
 
 Deleting a site removes its configuration. Its recorded events stay in the event

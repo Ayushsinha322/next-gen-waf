@@ -1623,11 +1623,12 @@ async fn a_dead_upstream_yields_a_logged_502_not_a_dropped_connection() {
     shutdown_proxy(tx, jh).await;
 }
 
-/// A request whose Host matches no site is the OTHER unlogged-502 path, and the
-/// one seen on .71: `no matching site for host`. Correct routing behaviour, but
-/// it was equally invisible.
+/// A request whose Host matches no site gets a real answer, never silence — and
+/// that answer is 404 "no site for this hostname", not 502. It used to fail as
+/// an upstream error, and a 502 tells whoever is debugging a new DNS record that
+/// the APPLICATION is down, when the WAF simply has no site for the name.
 #[tokio::test]
-async fn an_unmatched_host_yields_502_rather_than_silence() {
+async fn an_unmatched_host_yields_404_naming_the_cause() {
     let (up_addr, _up) = start_mock_upstream().await;
     let port = next_port();
     let mut cfg = test_config(
@@ -1640,11 +1641,16 @@ async fn an_unmatched_host_yields_502_rather_than_silence() {
     cfg.listeners[0].default_site = None;
     let (tx, jh) = start_proxy(cfg).await;
 
-    let (status, _b) = send_request(port, "nobody.invalid", "/", Method::GET, "").await;
+    let (status, body) = send_request(port, "nobody.invalid", "/", Method::GET, "").await;
     assert_eq!(
         status,
-        StatusCode::BAD_GATEWAY,
-        "an unmatched Host must get a real response the client can act on"
+        StatusCode::NOT_FOUND,
+        "an unmatched Host must get a response that names the cause, not a 502"
+    );
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        body.contains("No site is configured for this hostname"),
+        "body: {body}"
     );
     shutdown_proxy(tx, jh).await;
 }

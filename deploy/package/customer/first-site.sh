@@ -15,7 +15,8 @@
 #  WHY THIS EXISTS
 #
 #  install.sh ends with a healthy stack and no protected site, which means the
-#  WAF answers 502 to everything — correct, and alarming if you do not know it.
+#  WAF answers 404 "No site is configured" to everything — correct, and
+#  alarming if you do not know it.
 #  The next step was a wizard in a browser reached over an SSH tunnel, described
 #  across two documents. This is the same journey in one command, and it fails
 #  loudly at each point instead of leaving a site that looks configured.

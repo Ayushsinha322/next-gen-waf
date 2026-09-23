@@ -179,7 +179,7 @@ The installer prints the administrator password and how to reach the console.
    ```bash
    ssh -L 9443:127.0.0.1:9443 root@<host>     # then open https://127.0.0.1:9443
    ```
-3. **Add your first protected site.** Until one exists the WAF returns 502 to
+3. **Add your first protected site.** Until one exists the WAF answers 404 "No site is configured for this hostname" to
    everything — correct, because there is no upstream to forward to.
 4. **Leave new sites in LEARNING mode.**
 
@@ -260,6 +260,7 @@ ESDS support — it identifies the cause without anyone re-running commands.
 | "ports must be free" | nginx or apache is usually already on 80/443 |
 | "cannot reach the Docker registry" | See *Network access* above |
 | "CHECKSUM MISMATCH" | Corrupted transfer — re-download and re-verify |
-| Everything returns 502 | No site configured yet, or the upstream is unreachable |
+| Everything returns 404 "No site is configured for this hostname" | No site claims that name yet |
+| Everything returns 502 | The site exists but its upstream is unreachable |
 
 **Support:** ESDS SIG-CyberSec.

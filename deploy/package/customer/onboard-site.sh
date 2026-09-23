@@ -311,17 +311,21 @@ else
     || warn "after 90s /healthz still lists the site without an engine — inspection is not running for it yet"
 fi
 # 503 = engine still warming; 502 right after creation can be the upstream health
-# probe not having run yet (10s interval). Keep asking for a while before
-# calling either one final.
+# probe not having run yet (10s interval); the WAF's own 404 "No site is
+# configured" means the new site has not reached this node yet. Keep asking for
+# a while before calling any of them final.
 served=""; tries=0
 while (( tries < 12 )); do
-  served="$(curl -sk --max-time 8 -o /dev/null -w '%{http_code}' --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}${HEALTH}" 2>/dev/null)"
-  case "$served" in 503|502|000|"") sleep 5; tries=$((tries + 1)) ;; *) break ;; esac
+  resp="$(curl -sk --max-time 8 -w '\n%{http_code}' --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}${HEALTH}" 2>/dev/null)"
+  served="${resp##*$'\n'}"
+  [[ "$served" == "404" && "$resp" == *"No site is configured for this hostname"* ]] && served="nosite"
+  case "$served" in 503|502|000|nosite|"") sleep 5; tries=$((tries + 1)) ;; *) break ;; esac
 done
 case "$served" in
   2??|3??|401|403) ok "https://$DOMAIN$HEALTH via the WAF → $served (origin answered through the WAF)" ;;
   502) warn "https://$DOMAIN$HEALTH via the WAF → 502: the WAF is serving the site but cannot reach the origin — firewall, port, or --origin-tls" ;;
   503) warn "still 503 after 2 minutes — the rule engine has not come up for this site. Check: curl -s http://127.0.0.1/healthz | jq .inspection" ;;
+  nosite) warn "after 2 minutes this node still has no site for $DOMAIN — the new site has not reached the data plane. Check the Cluster page for a node REJECTING config" ;;
   *)   warn "https://$DOMAIN$HEALTH via the WAF → ${served:-no answer}" ;;
 esac
 if [[ -n "$CERT_FP" && "$HAVE_OPENSSL" == "yes" ]]; then
