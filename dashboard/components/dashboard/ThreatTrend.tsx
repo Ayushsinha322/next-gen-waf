@@ -62,15 +62,24 @@ export default function ThreatTrend() {
   const grandTotal = totals.reduce((a, b) => a + b, 0);
 
   const b = buckets ?? [];
-  const maxV = Math.max(1, ...b.flatMap(x => [x.high, x.medium, x.low, x.info])) * 1.15;
+  // Whole-number y steps from a "nice" series (1, 2, 5 × 10^k). Rounding
+  // fractions of a small max (0.25 × 1.15, …) labelled the axis "1, 1, 1, 0, 0".
+  const rawMax = Math.max(1, ...b.flatMap(x => [x.high, x.medium, x.low, x.info]));
+  const yStep = niceStep(rawMax / 4);
+  const maxV = yStep * 4;
   const n = b.length;
   const px = (i: number) => PAD.l + (n <= 1 ? 0 : (i / (n - 1)) * CW);
   const py = (v: number) => PAD.t + CH * (1 - v / maxV);
-  const yTicks = [0, 0.25, 0.5, 0.75, 1].map(f => Math.round(maxV * f));
-  // ~5 evenly spaced x labels.
-  const xTickIdx = n > 1
-    ? Array.from({ length: 5 }, (_, k) => Math.round((k / 4) * (n - 1)))
-    : [];
+  const yTicks = [0, 1, 2, 3, 4].map(k => k * yStep);
+  // ~5 evenly spaced x labels, each index and each printed time at most once:
+  // with fewer than 5 buckets, or buckets finer than a minute, the same label
+  // was drawn twice ("13:56 … 13:56").
+  const xTickIdx = (() => {
+    if (n <= 1) return [] as number[];
+    const idx = [...new Set(Array.from({ length: 5 }, (_, k) => Math.round((k / 4) * (n - 1))))];
+    const seen = new Set<string>();
+    return idx.filter(i => { const t = fmtClock(b[i].ts); if (seen.has(t)) return false; seen.add(t); return true; });
+  })();
 
   return (
     <div className="panel" style={{ display: "flex", flexDirection: "column" }}>
@@ -147,4 +156,12 @@ function Msg({ text }: { text: string }) {
       {text}
     </div>
   );
+}
+
+/** Smallest of 1, 2, 5 × 10^k that is ≥ x, and at least 1 (counts are whole). */
+export function niceStep(x: number): number {
+  if (!(x > 0)) return 1;
+  const p = 10 ** Math.floor(Math.log10(x));
+  for (const m of [1, 2, 5, 10]) if (m * p >= x) return Math.max(1, m * p);
+  return Math.max(1, 10 * p);
 }
