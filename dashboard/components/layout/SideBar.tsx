@@ -3,6 +3,7 @@ import { useState, useEffect } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { motion } from "framer-motion";
 import { api, type ClusterHealth } from "@/lib/api";
+import { onAlertsChanged } from "@/lib/alertEvents";
 import { navGroupStagger, navItemVariants, spring } from "@/lib/animations";
 import { useT } from "@/lib/i18n";
 
@@ -164,7 +165,9 @@ export default function SideBar() {
     let cancelled = false;
     async function load() {
       const [sites, rules, plugins, alerts, inv] = await Promise.allSettled([
-        api.sites.list(), api.rules.list(), api.plugins.list(), api.alerts.list(),
+        // "open" only: counting the open rows of an unfiltered list counted the
+        // open rows of whatever PAGE of alert history came back.
+        api.sites.list(), api.rules.list(), api.plugins.list(), api.alerts.list("open"),
         api.rules.inventory({ summary: true }),
       ]);
       if (cancelled) return;
@@ -182,7 +185,9 @@ export default function SideBar() {
     }
     load();
     const t = setInterval(load, 60_000);
-    return () => { cancelled = true; clearInterval(t); };
+    // The Alerts badge must move the moment an alert is closed, not a minute later.
+    const off = onAlertsChanged(load);
+    return () => { cancelled = true; clearInterval(t); off(); };
   }, []);
 
   useEffect(() => {

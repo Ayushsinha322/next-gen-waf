@@ -4,6 +4,7 @@ import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
 import { signOut, getUser, type AuthUser } from "@/lib/auth";
+import { onAlertsChanged } from "@/lib/alertEvents";
 import { api } from "@/lib/api";
 import { spring } from "@/lib/animations";
 
@@ -128,10 +129,16 @@ export default function TopBar() {
     return () => { cancelled = true; clearInterval(t); };
   }, []);
 
+  // Kept current, not fetched once: see lib/alertEvents.ts.
   useEffect(() => {
-    api.alerts.list("open")
-      .then(r => setAlerts((r.alerts ?? []).length))
+    let cancelled = false;
+    const load = () => api.alerts.list("open")
+      .then(r => { if (!cancelled) setAlerts((r.alerts ?? []).length); })
       .catch(() => {});
+    load();
+    const t = setInterval(load, 15_000);
+    const off = onAlertsChanged(load);
+    return () => { cancelled = true; clearInterval(t); off(); };
   }, []);
 
   // Poll real cluster health so the status pill reflects reality, not a

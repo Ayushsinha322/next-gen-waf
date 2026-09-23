@@ -5,6 +5,7 @@ import { motion } from "framer-motion";
 import { openCopilotWith, explainAlertPrompt } from "@/lib/copilotContext";
 import { showToast } from "@/components/ui/Toast";
 import EmptyState from "@/components/ui/EmptyState";
+import { announceAlertsChanged } from "@/lib/alertEvents";
 import { api, type Alert, type NotificationChannel } from "@/lib/api";
 import { staggerContainer, cardVariants, fadeUp, spring } from "@/lib/animations";
 import Icon from "@/components/ui/Icon";
@@ -119,12 +120,14 @@ export default function AlertsPage() {
     await Promise.allSettled(open.map(a => api.alerts.ack(a.id)));
     showToast(`${open.length} acknowledged`,"s");
     setAlerts(p => p.map(a => open.some(o => o.id === a.id) ? { ...a, state: "acked" } : a));
+    announceAlertsChanged();
   }
   async function closeGroup(g: Group) {
     const todo = g.items.filter(a => a.state !== "resolved");
     await Promise.allSettled(todo.map(a => api.alerts.resolve(a.id)));
     showToast(`${todo.length} closed`,"s");
     setAlerts(p => p.map(a => todo.some(o => o.id === a.id) ? { ...a, state: "resolved" } : a));
+    announceAlertsChanged();
   }
 
   /** Block a source for real: a manual block-tier indicator in the threat-intel
@@ -165,6 +168,7 @@ export default function AlertsPage() {
     await Promise.allSettled(open.map(a => api.alerts.ack(a.id)));
     showToast(`${open.length} alerts acknowledged`,"s");
     loadAlerts();
+    announceAlertsChanged();
   }
 
   async function resolveAlert(id: string) {
@@ -172,6 +176,7 @@ export default function AlertsPage() {
       await api.alerts.resolve(id);
       showToast("Alert resolved","s");
       setAlerts(p => p.map(a => a.id === id ? { ...a, state: "resolved" } : a));
+      announceAlertsChanged();
     } catch {
       showToast("Failed to resolve","e");
     }
@@ -182,6 +187,7 @@ export default function AlertsPage() {
       await api.alerts.ack(id);
       showToast("Alert acknowledged","s");
       setAlerts(p => p.map(a => a.id === id ? { ...a, state: "acked" } : a));
+      announceAlertsChanged();
     } catch {
       showToast("Failed to acknowledge","e");
     }

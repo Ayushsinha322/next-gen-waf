@@ -668,6 +668,70 @@ func (s *Store) ResolveAlertsByKind(ctx context.Context, tenantID, userID string
 	return n, nil
 }
 
+// RefreshOpenAlert updates the alert already open for an ongoing condition —
+// identified by kind plus one details key, e.g. node_down/"node" or
+// disk_pressure/"component" — instead of letting the caller insert another row.
+//
+// Monitors re-raise an unresolved condition every throttle interval, and each
+// re-raise used to INSERT a new alert: a disk above its threshold for a day
+// produced one row per reading ("80.4% full", "80.9% full", …), and closing one
+// in the console brought a fresh one back at the next check, so the bell count
+// never went down. The newest matching row is refreshed in place (severity,
+// summary, details merged); older duplicates left by earlier builds are resolved
+// as superseded. Returns the refreshed row and its severity before the refresh,
+// or nil when nothing is open for this condition.
+func (s *Store) RefreshOpenAlert(ctx context.Context, tenantID, userID, kind, detailKey, value string,
+	severity, summary string, details json.RawMessage) (*AlertRow, string, error) {
+
+	if len(details) == 0 {
+		details = json.RawMessage(`{}`)
+	}
+	tx, err := s.pool.BeginTenant(ctx, tenantID, userID)
+	if err != nil {
+		return nil, "", err
+	}
+	defer tx.Rollback(ctx)
+
+	var r AlertRow
+	var prevSeverity string
+	err = tx.QueryRow(ctx,
+		`WITH target AS (
+		    SELECT id, severity AS prev_severity FROM alerts
+		     WHERE tenant_id = $1 AND kind = $2 AND state IN ('open', 'acked')
+		       AND details->>($3::text) = $4
+		     ORDER BY created_at DESC
+		     LIMIT 1
+		     FOR UPDATE)
+		 UPDATE alerts a
+		    SET severity = $5, summary = $6,
+		        details = coalesce(a.details, '{}'::jsonb) || $7::jsonb
+		   FROM target
+		  WHERE a.id = target.id
+		 RETURNING a.id, a.tenant_id, a.site_id, a.severity, a.kind, a.summary, a.details,
+		           a.state, a.created_at, a.resolved_at, target.prev_severity`,
+		tenantID, kind, detailKey, value, severity, summary, details,
+	).Scan(&r.ID, &r.TenantID, &r.SiteID, &r.Severity, &r.Kind, &r.Summary,
+		&r.Details, &r.State, &r.CreatedAt, &r.ResolvedAt, &prevSeverity)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, "", nil
+	}
+	if err != nil {
+		return nil, "", fmt.Errorf("store: refresh open alert: %w", err)
+	}
+	if err := tx.Exec(ctx,
+		`UPDATE alerts
+		    SET state = 'resolved', resolved_at = now(),
+		        details = coalesce(details, '{}'::jsonb)
+		                  || jsonb_build_object('auto_resolved', true,
+		                                        'auto_resolve_reason', 'superseded by alert ' || $5::text)
+		  WHERE tenant_id = $1 AND kind = $2 AND state IN ('open', 'acked')
+		    AND details->>($3::text) = $4 AND id <> $5::uuid`,
+		tenantID, kind, detailKey, value, r.ID); err != nil {
+		return nil, "", fmt.Errorf("store: resolve superseded alerts: %w", err)
+	}
+	return &r, prevSeverity, tx.Commit(ctx)
+}
+
 // AutoResolveQuietAlerts resolves every open or acknowledged alert of the given
 // kinds that was raised before the quiet window began, stamping the reason into
 // details so the row is distinguishable from an operator's click. Returns how

@@ -51,3 +51,19 @@ func TestAutoResolveDefaultAndDisable(t *testing.T) {
 		t.Fatal("negative must be preserved as 'disabled'")
 	}
 }
+
+// An ongoing condition re-notifies channels only when it gets WORSE; the same
+// reading every throttle interval is a dashboard refresh, not a page to on-call.
+func TestOngoingAlertsNotifyOnlyOnEscalation(t *testing.T) {
+	for _, c := range []struct {
+		prev, next string
+		want       bool
+	}{
+		{"warning", "high", true}, {"high", "critical", true}, {"warning", "critical", true},
+		{"warning", "warning", false}, {"critical", "high", false}, {"high", "warning", false},
+	} {
+		if got := escalates(c.prev, c.next); got != c.want {
+			t.Errorf("escalates(%q,%q)=%v want %v", c.prev, c.next, got, c.want)
+		}
+	}
+}

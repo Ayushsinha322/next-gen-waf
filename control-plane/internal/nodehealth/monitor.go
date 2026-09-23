@@ -242,7 +242,7 @@ func (m *Monitor) raiseDataPlaneDown(node db.Node) {
 		return
 	}
 	summary := fmt.Sprintf("Data-plane node %s is DOWN", node.ID)
-	m.engine.Raise("node_down:"+node.ID, db.CreateAlertRequest{
+	m.engine.RaiseOngoing("node", node.ID, "node_down:"+node.ID, db.CreateAlertRequest{
 		Severity: "critical",
 		Kind:     "node_down",
 		Summary:  summary,

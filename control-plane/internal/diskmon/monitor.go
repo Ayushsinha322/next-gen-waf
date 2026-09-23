@@ -175,7 +175,7 @@ func (m *Monitor) raiseDiskPressure(pct float64, free, total int64, sev string) 
 	}
 	// Severity is part of the throttle key so each escalation level fires once
 	// as the disk fills, rather than being swallowed by the lower level's throttle.
-	m.engine.Raise(
+	m.engine.RaiseOngoing("component", "clickhouse",
 		fmt.Sprintf("disk_pressure:clickhouse:%s", sev),
 		db.CreateAlertRequest{
 			Severity: sev,

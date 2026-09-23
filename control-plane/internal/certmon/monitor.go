@@ -206,7 +206,7 @@ func (m *Monitor) raiseCertExpiring(c certEntry, days int64, sev string) {
 	}
 	// Severity is part of the throttle key so each escalation level fires once
 	// as days -> 0, rather than being swallowed by the down-level's throttle.
-	m.engine.Raise(
+	m.engine.RaiseOngoing("domain", c.Domain,
 		fmt.Sprintf("cert_expiring:%s:%s", c.Domain, sev),
 		db.CreateAlertRequest{
 			Severity: sev,

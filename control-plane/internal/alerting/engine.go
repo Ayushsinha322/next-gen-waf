@@ -263,6 +263,64 @@ func (e *Engine) Raise(throttleKey string, req db.CreateAlertRequest, na notify.
 	e.raise(throttleKey, req, na)
 }
 
+// RaiseOngoing raises an alert for a CONDITION that persists — a full disk, a
+// down node, an expiring certificate — identified by kind plus one details key
+// (conditionKey=conditionValue, which must also be in req.Details).
+//
+// While an alert for that condition is open it is refreshed in place rather
+// than duplicated: the monitor's periodic re-raise used to insert a new row
+// each time, so a disk over its threshold for a day produced one alert per
+// reading, and closing one brought a fresh one back at the next check — the
+// bell count an operator had just cleared came straight back. Channels are
+// notified again only when the refresh ESCALATES severity; a refresh at the same
+// or lower severity updates the row and the live dashboard only.
+func (e *Engine) RaiseOngoing(conditionKey, conditionValue, throttleKey string, req db.CreateAlertRequest, na notify.Alert) {
+	tenantID := e.tenantID
+	key := tenantID + "|" + throttleKey
+	e.mu.Lock()
+	if last, ok := e.lastRaise[key]; ok && time.Since(last) < e.cfg.Throttle {
+		e.mu.Unlock()
+		return
+	}
+	e.lastRaise[key] = time.Now()
+	e.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	row, prev, err := e.store.RefreshOpenAlert(ctx, tenantID, e.userID, req.Kind,
+		conditionKey, conditionValue, req.Severity, req.Summary, req.Details)
+	if err != nil {
+		e.log.Warn("alert refresh failed — raising a new one", zap.Error(err), zap.String("kind", req.Kind))
+	}
+	if row == nil {
+		// Nothing open for this condition: a new alert, notified as usual. The
+		// throttle slot is already taken, so go straight to the insert path.
+		e.mu.Lock()
+		delete(e.lastRaise, key)
+		e.mu.Unlock()
+		e.raiseForTenant(tenantID, throttleKey, req, na)
+		return
+	}
+	e.publishToHub(row)
+	if !escalates(prev, req.Severity) {
+		return
+	}
+	na.ID, na.Summary, na.CreatedAt, na.Tenant = row.ID, req.Summary, row.CreatedAt, tenantID
+	select {
+	case e.dispatchCh <- na:
+	default:
+		e.log.Warn("alert dispatch queue full — dropping channel fan-out", zap.String("kind", req.Kind))
+	}
+	e.log.Info("ongoing alert escalated", zap.String("kind", req.Kind),
+		zap.String("from", prev), zap.String("to", req.Severity))
+}
+
+// escalates reports whether next is strictly more severe than prev.
+func escalates(prev, next string) bool {
+	rank := map[string]int{"info": 0, "low": 1, "warning": 2, "medium": 2, "high": 3, "critical": 4}
+	return rank[strings.ToLower(next)] > rank[strings.ToLower(prev)]
+}
+
 // raise persists+dispatches under the default tenant (used by the exported
 // Raise wrapper and the node-health/cert monitors).
 func (e *Engine) raise(throttleKey string, req db.CreateAlertRequest, na notify.Alert) {
