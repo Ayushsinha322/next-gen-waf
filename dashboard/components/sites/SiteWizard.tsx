@@ -77,11 +77,16 @@ function Sw({ on, set }: { on: boolean; set: (v: boolean) => void }) {
 function Tag({ kind }: { kind: "enforced" | "stored" | "unavailable" }) {
   const palette = {
     enforced:    { fg: "var(--green)",            bg: "rgba(0,230,118,.1)",  bd: "rgba(0,230,118,.35)",  text: "● Enforced" },
-    stored:      { fg: "var(--amber, #ffb020)",   bg: "rgba(255,176,32,.1)", bd: "rgba(255,176,32,.35)", text: "◐ Stored" },
+    // Said plainly: "Stored" read as a neutral state, but these settings are saved
+    // with the site and the data plane does not act on them in this release.
+    stored:      { fg: "var(--amber, #ffb020)",   bg: "rgba(255,176,32,.1)", bd: "rgba(255,176,32,.35)", text: "◐ Not enforced yet" },
     unavailable: { fg: "var(--text3)",            bg: "rgba(255,255,255,.04)", bd: "rgba(255,255,255,.14)", text: "○ Unavailable" },
   }[kind];
+  const title = kind === "stored"
+    ? "Saved with the site, but the data plane does not act on it in this release. Do not rely on it for protection."
+    : undefined;
   return (
-    <span style={{
+    <span title={title} style={{
       fontSize: 10.5, fontWeight: 700, letterSpacing: 0.5, padding: "2px 7px", borderRadius: 20,
       fontFamily: "var(--font-mono)", textTransform: "uppercase",
       color: palette.fg, background: palette.bg, border: `1px solid ${palette.bd}`,
@@ -310,6 +315,12 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
     if (form.domains.length === 0) return "Add at least one domain (Basics)";
     if (form.servers.length === 0) return "Add at least one upstream server (Reverse Proxy)";
     if (form.servers.some(s => !s.host || !s.port)) return "Every upstream server needs a host and port (Reverse Proxy)";
+    {
+      // A non-number or out-of-range port used to pass this check and then become
+      // 80 in formToPayload (`Number(port) || 80`) — a silent change of origin.
+      const bad = form.servers.find(s => { const n = Number(s.port); return !Number.isInteger(n) || n < 1 || n > 65535; });
+      if (bad) return `Port "${bad.port}" for ${bad.host} is not a port number (1–65535) (Reverse Proxy)`;
+    }
     if (form.tls_mode === "auto" && form.front_https && !form.acme_email.trim()) return "An email is required for automatic certificates (Front Service)";
     if (form.tls_mode === "existing" && form.front_https && !form.tls_existing_cert) return "Select a certificate from the repository (Front Service)";
     if (form.tls_mode === "manual" && form.custom_priority === "data" && (!form.cert_pem.trim() || !form.key_pem.trim())) return "Paste both the certificate and private key (Front Service)";
@@ -1083,10 +1094,10 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     <Field label="IP / CIDR Block-list" hint="Always denied. An address or a range."><ChipInput values={form.ip_block} onChange={v => upd({ ip_block: v })} placeholder="203.0.113.7 or 203.0.113.0/24"
                       validate={isIpOrCidr} invalidMessage={s => `"${s}" is not an IP address or CIDR range`} /></Field>
                   </Row>
-                  <GroupLabel>Blacklist Sources <Tag kind="stored" /></GroupLabel>
                   {form.ip_block.length > 0 && (
                     <SectionToggle label="Drop block-list sources in the kernel (XDP)" desc="Faster, but node-wide: these sources are then blocked for every site on this node, not just this one. Leave off unless the block is meant for the whole edge." on={form.ip_block_xdp} set={v => upd({ ip_block_xdp: v })} />
                   )}
+                  <GroupLabel>Blacklist Sources <Tag kind="stored" /></GroupLabel>
                   <SectionToggle label="DNSBL (DNS blacklists)" desc="Reject IPs listed on the configured DNSBL servers" on={form.dnsbl_enabled} set={v => upd({ dnsbl_enabled: v })} />
                   {form.dnsbl_enabled && <Field label="DNSBL Servers" hint="e.g. bl.blocklist.de, sbl.spamhaus.org"><ChipInput values={form.dnsbl_servers} onChange={v => upd({ dnsbl_servers: v })} placeholder="bl.blocklist.de" /></Field>}
                   <Row>
