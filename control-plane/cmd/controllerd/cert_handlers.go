@@ -89,7 +89,7 @@ func handleUploadManualCert(c *gin.Context, enf *rbac.Enforcer) {
 
 	var req manualCertRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": clientError(err)})
 		return
 	}
 	// Light validation before forwarding — fail fast with a clear message.
@@ -126,7 +126,7 @@ func handleRequestAcmeCert(c *gin.Context, enf *rbac.Enforcer) {
 
 	var req acmeCertRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": clientError(err)})
 		return
 	}
 	if len(req.Domains) == 0 {
@@ -176,7 +176,7 @@ func handleRenameCert(c *gin.Context, enf *rbac.Enforcer) {
 	}
 	var req renameCertRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": clientError(err)})
 		return
 	}
 	proxyToDataPlane(c, http.MethodPatch, "/api/v1/internal/certs/"+domain, req)
@@ -217,7 +217,7 @@ func proxyToDataPlane(c *gin.Context, method, path string, payload any) {
 
 	req, err := http.NewRequest(method, dataPlaneBaseURL()+path, bodyReader)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 	if payload != nil {
@@ -302,7 +302,7 @@ func handleDownloadRootCA(c *gin.Context, enf *rbac.Enforcer) {
 	}
 	pemBytes, _, err := loadRootCA()
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		c.JSON(http.StatusNotFound, gin.H{"error": clientError(err)})
 		return
 	}
 	c.Header("Content-Disposition", `attachment; filename="sentinel-root-ca.crt"`)

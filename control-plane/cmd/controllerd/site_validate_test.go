@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 
@@ -312,5 +313,26 @@ func TestDuplicateDomainsWithinOneRequest(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("a repeated domain must be reported: %+v", problems)
+	}
+}
+
+// The wizard's dry-run must run the same domain-ownership check as create and
+// update; it once said a duplicate domain was fine and the save then 409'd.
+func TestValidateDryRunChecksDomainOwnership(t *testing.T) {
+	src, err := os.ReadFile("handlers.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(src)
+	i := strings.Index(s, "func handleValidateSite(")
+	if i < 0 {
+		t.Fatal("handleValidateSite not found")
+	}
+	body := s[i:]
+	if j := strings.Index(body[1:], "\nfunc "); j > 0 {
+		body = body[:j+1]
+	}
+	if !strings.Contains(body, "domainConflicts(existing, domains, req.SiteID)") {
+		t.Fatal("handleValidateSite no longer checks whether another site owns the domains")
 	}
 }

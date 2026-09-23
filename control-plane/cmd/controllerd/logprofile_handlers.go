@@ -63,7 +63,7 @@ func handleListLogProfiles(c *gin.Context, enf *rbac.Enforcer, store *db.Store) 
 	}
 	profiles, err := store.ListLogProfiles(c.Request.Context(), claims.TenantID, claims.UserID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 	if profiles == nil {
@@ -93,12 +93,12 @@ func handleCreateLogProfile(c *gin.Context, enf *rbac.Enforcer, store *db.Store,
 		return
 	}
 	if err := validateProfileRequest(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": clientError(err)})
 		return
 	}
 	p, err := store.CreateLogProfile(c.Request.Context(), claims.TenantID, claims.UserID, req)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 	auditLogProfile(c, store, hub, claims, "log_profile.create", p.ID, nil)
@@ -122,13 +122,13 @@ func handleUpdateLogProfile(c *gin.Context, enf *rbac.Enforcer, store *db.Store,
 	}
 	req.Name = strings.TrimSpace(req.Name)
 	if err := validateProfileRequest(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": clientError(err)})
 		return
 	}
 	id := c.Param("id")
 	p, err := store.UpdateLogProfile(c.Request.Context(), claims.TenantID, claims.UserID, id, req)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 	auditLogProfile(c, store, hub, claims, "log_profile.update", p.ID, nil)
@@ -147,7 +147,7 @@ func handleDeleteLogProfile(c *gin.Context, enf *rbac.Enforcer, store *db.Store,
 	}
 	id := c.Param("id")
 	if err := store.DeleteLogProfile(c.Request.Context(), claims.TenantID, claims.UserID, id); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 	auditLogProfile(c, store, hub, claims, "log_profile.delete", id, nil)
@@ -199,7 +199,7 @@ func handleExportLogProfile(c *gin.Context, enf *rbac.Enforcer, store *db.Store,
 		if errors.Is(err, db.ErrLogProfileNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "log profile not found"})
 		} else {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		}
 		return
 	}
@@ -279,14 +279,14 @@ func runExport(c *gin.Context, store *db.Store, ch *clickhouse.Client, hub *logs
 
 	from, to, err := resolveExportWindow(c.Query("from"), c.Query("to"), defaultWindow, time.Now())
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": clientError(err)})
 		return
 	}
 	f.From, f.To = from.Unix(), to.Unix()
 
 	rows, err := ch.ExportCount(c.Request.Context(), f)
 	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadGateway, gin.H{"error": clientError(err)})
 		return
 	}
 	if maxRows := exportRowCap(); rows > maxRows {
@@ -304,7 +304,7 @@ func runExport(c *gin.Context, store *db.Store, ch *clickhouse.Client, hub *logs
 
 	body, err := ch.ExportStream(c.Request.Context(), f, format)
 	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadGateway, gin.H{"error": clientError(err)})
 		return
 	}
 	defer body.Close()

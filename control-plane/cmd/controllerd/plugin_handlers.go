@@ -369,7 +369,7 @@ func handleUploadPlugin(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 		// Validation messages are intentionally specific: the uploader needs to
 		// know exactly what is wrong with their archive. They describe the
 		// submitted file only, never server state.
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": clientError(err)})
 		return
 	}
 

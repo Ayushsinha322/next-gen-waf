@@ -35,7 +35,7 @@ func handleThreatIntelStats(c *gin.Context, enf *rbac.Enforcer, store *db.Store)
 	}
 	sum, err := store.ThreatIntelSummary(c.Request.Context(), atoiQuery(c, "threshold", 0))
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 	c.JSON(http.StatusOK, sum)
@@ -74,7 +74,7 @@ func handleListIOCs(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 		Offset:    atoiQuery(c, "offset", 0),
 	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 	c.JSON(http.StatusOK, page)
@@ -138,7 +138,7 @@ func handleCreateIOC(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *l
 		ExpiresAt:  expires,
 	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 
@@ -171,7 +171,7 @@ func handleDeleteIOC(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *l
 	}
 	ok, err := store.DeleteIOCByID(c.Request.Context(), id)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 	if !ok {

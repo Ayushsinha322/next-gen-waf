@@ -40,7 +40,7 @@ func handleListBlockedCountries(c *gin.Context, enf *rbac.Enforcer, store *db.St
 	}
 	sites, err := store.ListSites(c.Request.Context(), claims.TenantID, claims.UserID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"countries": blockedUnion(sites)})
@@ -80,7 +80,7 @@ func geoipMutate(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.
 			Code    string `json:"code"`
 		}
 		if err := c.ShouldBindJSON(&body); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			c.JSON(http.StatusBadRequest, gin.H{"error": clientError(err)})
 			return
 		}
 		code = firstNonEmpty(body.Code, body.Country)
@@ -95,7 +95,7 @@ func geoipMutate(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.
 
 	sites, err := store.ListSites(c.Request.Context(), claims.TenantID, claims.UserID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 
@@ -122,7 +122,7 @@ func geoipMutate(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.
 		}
 		if _, err := store.UpdateSite(c.Request.Context(), claims.TenantID, claims.UserID, s.ID,
 			db.UpdateSiteRequest{WafPolicy: newPolicy}); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 			return
 		}
 		changed++

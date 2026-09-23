@@ -43,7 +43,7 @@ func handleExportSites(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 	}
 	sites, err := store.ListSites(c.Request.Context(), claims.TenantID, claims.UserID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 	doc := yamlSiteDoc{Sites: make([]yamlSite, 0, len(sites))}
@@ -62,7 +62,7 @@ func handleExportSites(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 	}
 	out, err := yaml.Marshal(doc)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 	c.Header("Content-Disposition", "attachment; filename=sentinel-sites.yaml")
@@ -92,7 +92,7 @@ func handleImportSites(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub 
 
 	var req importSitesRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": clientError(err)})
 		return
 	}
 
@@ -112,7 +112,7 @@ func handleImportSites(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub 
 
 	existing, err := store.ListSites(c.Request.Context(), claims.TenantID, claims.UserID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 	byName := make(map[string]db.SiteRow, len(existing))

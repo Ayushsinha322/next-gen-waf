@@ -166,7 +166,7 @@ func handlePutGlobalSettings(c *gin.Context, enf *rbac.Enforcer, store *db.Store
 		}
 		v, err := settings.Coerce(k, raw)
 		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			c.JSON(http.StatusBadRequest, gin.H{"error": clientError(err)})
 			return
 		}
 		b, _ := json.Marshal(v)
@@ -175,7 +175,7 @@ func handlePutGlobalSettings(c *gin.Context, enf *rbac.Enforcer, store *db.Store
 
 	before, _ := store.ListSettings(c.Request.Context(), claims.TenantID, claims.UserID)
 	if err := store.PutSettings(c.Request.Context(), claims.TenantID, claims.UserID, normalised); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 	after, _ := store.ListSettings(c.Request.Context(), claims.TenantID, claims.UserID)
@@ -224,7 +224,7 @@ func handleDeleteGlobalSetting(c *gin.Context, enf *rbac.Enforcer, store *db.Sto
 		return
 	}
 	if err := store.DeleteSetting(c.Request.Context(), claims.TenantID, claims.UserID, key); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 	actor := claims.UserID

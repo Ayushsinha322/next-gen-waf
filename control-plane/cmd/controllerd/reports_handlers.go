@@ -304,7 +304,7 @@ func handlePreviewReport(c *gin.Context, enf *rbac.Enforcer, ch *chreader.Client
 	from := to.AddDate(0, 0, -days)
 	rep, err := reports.Build(c.Request.Context(), ch, claims.TenantID, site, from, to)
 	if err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": clientError(err)})
 		return
 	}
 	name := "waf-report-" + to.Format("2006-01-02")

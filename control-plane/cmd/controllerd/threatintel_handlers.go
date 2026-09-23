@@ -91,7 +91,7 @@ func handleInternalThreatIntel(c *gin.Context, store *db.Store) {
 	}
 	iocs, err := store.ListActiveIOCs(c.Request.Context())
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 

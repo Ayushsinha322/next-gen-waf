@@ -38,7 +38,7 @@ func handleUpdateRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 
 	var req db.UpdateRuleRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": clientError(err)})
 		return
 	}
 	if req.DSL == nil && req.Severity == nil && req.Phase == nil &&
@@ -99,7 +99,7 @@ func handleUpdateRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 			})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 

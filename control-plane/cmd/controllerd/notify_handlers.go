@@ -31,7 +31,7 @@ func handleListChannels(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 	}
 	channels, err := store.ListChannels(c.Request.Context(), claims.TenantID, claims.UserID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 	if channels == nil {
@@ -61,7 +61,7 @@ func handleCreateChannel(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hu
 	}
 	ch, err := store.CreateChannel(c.Request.Context(), claims.TenantID, claims.UserID, req)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 	auditChannel(c, store, hub, claims, "notification.channel.create", ch.ID)
@@ -81,12 +81,12 @@ func handleUpdateChannel(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hu
 	id := c.Param("id")
 	var req db.UpdateChannelRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": clientError(err)})
 		return
 	}
 	ch, err := store.UpdateChannel(c.Request.Context(), claims.TenantID, claims.UserID, id, req)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 	auditChannel(c, store, hub, claims, "notification.channel.update", id)
@@ -105,7 +105,7 @@ func handleDeleteChannel(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hu
 	}
 	id := c.Param("id")
 	if err := store.DeleteChannel(c.Request.Context(), claims.TenantID, claims.UserID, id); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 	auditChannel(c, store, hub, claims, "notification.channel.delete", id)

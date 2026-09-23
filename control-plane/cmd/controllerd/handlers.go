@@ -76,7 +76,7 @@ func requirePerm(c *gin.Context, enf *rbac.Enforcer, resource, action string) bo
 func handleLogin(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store, hub *logs.Hub, log *zap.Logger) {
 	var req loginRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": clientError(err)})
 		return
 	}
 
@@ -292,7 +292,7 @@ type refreshRequest struct {
 func handleRefresh(c *gin.Context, jwtSvc *auth.JWTService, store *db.Store) {
 	var req refreshRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": clientError(err)})
 		return
 	}
 	claims, err := jwtSvc.Validate(req.RefreshToken)
@@ -410,7 +410,7 @@ func handleMFAEnroll(c *gin.Context) {
 	}
 	secret, err := auth.GenerateTOTPSecret()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -444,7 +444,7 @@ func handleMFAConfirm(c *gin.Context, store *db.Store) {
 		Code   string `json:"code" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": clientError(err)})
 		return
 	}
 	if !auth.VerifyTOTP(req.Secret, req.Code) {
@@ -452,7 +452,7 @@ func handleMFAConfirm(c *gin.Context, store *db.Store) {
 		return
 	}
 	if err := store.SetMFASecret(c.Request.Context(), claims.TenantID, claims.UserID, req.Secret); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true, "mfa_enabled": true})
@@ -473,7 +473,7 @@ func handleMFADisable(c *gin.Context, store *db.Store) {
 		Code string `json:"code" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": clientError(err)})
 		return
 	}
 	secret, err := store.GetMFASecret(c.Request.Context(), claims.TenantID, claims.UserID)
@@ -486,7 +486,7 @@ func handleMFADisable(c *gin.Context, store *db.Store) {
 		return
 	}
 	if err := store.SetMFASecret(c.Request.Context(), claims.TenantID, claims.UserID, ""); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true, "mfa_enabled": false})
@@ -736,7 +736,7 @@ func handleCreateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 	}
 	var req db.CreateSiteRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": clientError(err)})
 		return
 	}
 	if req.Upstream == nil {
@@ -889,7 +889,7 @@ func handleUpdateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 	siteID := c.Param("id")
 	var req db.UpdateSiteRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": clientError(err)})
 		return
 	}
 	// Validate the MERGED result, not just the submitted fields: a patch can be
@@ -937,7 +937,7 @@ func handleUpdateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 	snapshotBeforeMutation(c, store, log, "site.update")
 	site, err := store.UpdateSite(c.Request.Context(), claims.TenantID, claims.UserID, siteID, req)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 	configVersion.Add(1)
@@ -980,7 +980,7 @@ func handleValidateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 		WafPolicy json.RawMessage `json:"waf_policy"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": clientError(err)})
 		return
 	}
 
@@ -1006,6 +1006,15 @@ func handleValidateSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 		validateSiteConfig(name, domains, upstream, waf),
 		validateSitePluginNames(c, store, claims.TenantID, claims.UserID, waf)...,
 	)
+	// The same domain-ownership check create and update make. Without it the
+	// wizard's dry-run said a site claiming `juice` — owned by another site — was
+	// fine, and the save then failed with a 409 the operator had just been told
+	// would not happen.
+	if store != nil {
+		if existing, lerr := store.ListSites(c.Request.Context(), claims.TenantID, claims.UserID); lerr == nil {
+			problems = append(problems, domainConflicts(existing, domains, req.SiteID)...)
+		}
+	}
 	// 200 either way: the dry-run itself succeeded. `valid` carries the verdict, so
 	// a client cannot mistake "your config is bad" for "the request failed".
 	c.JSON(http.StatusOK, gin.H{
@@ -1037,7 +1046,7 @@ func handleDeleteSite(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 	// Record an undo point before removing a site from protection.
 	snapshotBeforeMutation(c, store, log, "site.delete")
 	if err := store.DeleteSite(c.Request.Context(), claims.TenantID, siteID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 	configVersion.Add(1)
@@ -1082,7 +1091,7 @@ func handleUpdateSiteStatus(c *gin.Context, enf *rbac.Enforcer, store *db.Store,
 	}
 	prior, _ := store.GetSite(c.Request.Context(), claims.TenantID, siteID)
 	if err := store.UpdateSiteStatus(c.Request.Context(), claims.TenantID, siteID, body.Status); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 	configVersion.Add(1)
@@ -1169,7 +1178,7 @@ func handleAddSiteExclusion(c *gin.Context, enf *rbac.Enforcer, store *db.Store,
 
 	newPolicy, err := encodeExclusions(waf, excl)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 	req := db.UpdateSiteRequest{WafPolicy: newPolicy}
@@ -1178,7 +1187,7 @@ func handleAddSiteExclusion(c *gin.Context, enf *rbac.Enforcer, store *db.Store,
 	}
 	updated, err := store.UpdateSite(c.Request.Context(), claims.TenantID, claims.UserID, siteID, req)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 	configVersion.Add(1)
@@ -1231,7 +1240,7 @@ func handleDeleteSiteExclusion(c *gin.Context, enf *rbac.Enforcer, store *db.Sto
 	}
 	newPolicy, err := encodeExclusions(waf, kept)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 	req := db.UpdateSiteRequest{WafPolicy: newPolicy}
@@ -1240,7 +1249,7 @@ func handleDeleteSiteExclusion(c *gin.Context, enf *rbac.Enforcer, store *db.Sto
 	}
 	updated, err := store.UpdateSite(c.Request.Context(), claims.TenantID, claims.UserID, siteID, req)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 	configVersion.Add(1)
@@ -1342,7 +1351,7 @@ func handleInternalConfig(c *gin.Context, store *db.Store, log *zap.Logger) {
 	// sync must list all active sites across tenants (not one tenant's view).
 	sites, err := store.ListAllActiveSites(c.Request.Context())
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 	// Operator-authored rules, attached per site below. A failure here must NOT
@@ -2459,7 +2468,7 @@ func handleAckAlert(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *lo
 		return
 	}
 	if err := store.AckAlert(c.Request.Context(), claims.TenantID, claims.UserID, id); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 	writeAuditEntry(c, store, hub, &db.WriteAuditRequest{
@@ -2487,7 +2496,7 @@ func handleResolveAlert(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub
 		return
 	}
 	if err := store.ResolveAlert(c.Request.Context(), claims.TenantID, claims.UserID, id); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 	writeAuditEntry(c, store, hub, &db.WriteAuditRequest{
@@ -3008,7 +3017,7 @@ func handleCreateRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 	}
 	var req db.CreateRuleRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": clientError(err)})
 		return
 	}
 	// Validate the DSL with the real engine. Unlike an UPDATE there is nothing
@@ -3049,7 +3058,7 @@ func handleCreateRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 	if store != nil {
 		rule, err := store.CreateRule(c.Request.Context(), claims.TenantID, claims.UserID, req)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 			return
 		}
 		writeAuditEntry(c, store, hub, &db.WriteAuditRequest{
@@ -3102,7 +3111,7 @@ func handleToggleRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 		Enabled bool `json:"enabled"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": clientError(err)})
 		return
 	}
 	if !requireLeader(c, cl) {
@@ -3110,7 +3119,7 @@ func handleToggleRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 	}
 	if store != nil {
 		if err := store.ToggleRule(c.Request.Context(), claims.TenantID, claims.UserID, id, req.Enabled); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 			return
 		}
 	}
@@ -3142,7 +3151,7 @@ func handleDeleteRule(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 	}
 	if store != nil {
 		if err := store.DeleteRule(c.Request.Context(), claims.TenantID, claims.UserID, id); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 			return
 		}
 	}
@@ -3169,7 +3178,7 @@ func handleTestRule(c *gin.Context, enf *rbac.Enforcer) {
 		Path    string `json:"path"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": clientError(err)})
 		return
 	}
 
@@ -3425,7 +3434,7 @@ func respondStoreError(c *gin.Context, err error) {
 		c.JSON(http.StatusConflict, gin.H{"error": "already exists"})
 	case err != nil && strings.Contains(err.Error(), "not found"):
 		// Store not-found messages are fixed, safe strings (no user input).
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		c.JSON(http.StatusNotFound, gin.H{"error": clientError(err)})
 	default:
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 	}
@@ -3466,7 +3475,7 @@ func handleCreateUserReal(c *gin.Context, enf *rbac.Enforcer, store *db.Store, h
 		Password string `json:"password" binding:"required,min=12"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": clientError(err)})
 		return
 	}
 	if req.Role == "" {
@@ -3515,7 +3524,7 @@ func handleUpdateUser(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 		Status string `json:"status"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": clientError(err)})
 		return
 	}
 	if req.Role != "" && !validUserRole(req.Role) {
@@ -3622,7 +3631,7 @@ func handleCreateAPIKeyReal(c *gin.Context, enf *rbac.Enforcer, store *db.Store,
 		ExpiresDays int      `json:"expires_days"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": clientError(err)})
 		return
 	}
 	if req.Role == "" {

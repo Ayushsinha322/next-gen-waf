@@ -48,7 +48,7 @@ func handleListConfigVersions(c *gin.Context, enf *rbac.Enforcer, store *db.Stor
 	limit, _ := strconv.Atoi(c.Query("limit"))
 	versions, err := store.ListConfigVersions(c.Request.Context(), claims.TenantID, claims.UserID, limit)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"versions": versions})
@@ -87,7 +87,7 @@ func handleRollbackConfig(c *gin.Context, enf *rbac.Enforcer, store *db.Store, h
 	restored, skipped, err := store.RestoreConfigVersion(c.Request.Context(),
 		claims.TenantID, claims.UserID, versionID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 

@@ -620,7 +620,7 @@ func handleAdminResetPassword(c *gin.Context, enf *rbac.Enforcer, store *db.Stor
 		return
 	}
 	if _, err := resetLink(m.Config().PublicURL, "probe"); err != nil {
-		c.JSON(http.StatusPreconditionFailed, gin.H{"error": err.Error()})
+		c.JSON(http.StatusPreconditionFailed, gin.H{"error": clientError(err)})
 		return
 	}
 
@@ -633,7 +633,7 @@ func handleAdminResetPassword(c *gin.Context, enf *rbac.Enforcer, store *db.Stor
 	}
 	link, err := resetLink(m.Config().PublicURL, token)
 	if err != nil {
-		c.JSON(http.StatusPreconditionFailed, gin.H{"error": err.Error()})
+		c.JSON(http.StatusPreconditionFailed, gin.H{"error": clientError(err)})
 		return
 	}
 

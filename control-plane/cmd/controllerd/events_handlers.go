@@ -54,7 +54,7 @@ func handleEventsSearch(c *gin.Context, enf *rbac.Enforcer, ch *clickhouse.Clien
 	}
 	events, err := ch.Search(c.Request.Context(), f)
 	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadGateway, gin.H{"error": clientError(err)})
 		return
 	}
 	if events == nil {
@@ -80,7 +80,7 @@ func handleSupportIDLookup(c *gin.Context, enf *rbac.Enforcer, ch *clickhouse.Cl
 	}
 	events, err := ch.FindBySupportID(c.Request.Context(), claims.TenantID, c.Param("id"))
 	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadGateway, gin.H{"error": clientError(err)})
 		return
 	}
 	if events == nil {
@@ -101,7 +101,7 @@ func handleEventsTimeline(c *gin.Context, enf *rbac.Enforcer, ch *clickhouse.Cli
 	}
 	buckets, err := ch.Timeline(c.Request.Context(), claims.TenantID, atoi64(c.Query("from")), atoi64(c.Query("to")), int(atoi64(c.Query("bucket"))))
 	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadGateway, gin.H{"error": clientError(err)})
 		return
 	}
 	if buckets == nil {
@@ -126,7 +126,7 @@ func handleEventsFacets(c *gin.Context, enf *rbac.Enforcer, ch *clickhouse.Clien
 	}
 	facets, err := ch.Facets(c.Request.Context(), col, claims.TenantID, atoi64(c.Query("from")), atoi64(c.Query("to")), int(atoi64(c.Query("limit"))))
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": clientError(err)})
 		return
 	}
 	if facets == nil {
@@ -153,7 +153,7 @@ func handleTopAttackers(c *gin.Context, enf *rbac.Enforcer, ch *clickhouse.Clien
 	attackers, err := ch.TopAttackers(c.Request.Context(), claims.TenantID,
 		atoi64(c.Query("from")), atoi64(c.Query("to")), int(atoi64(c.Query("limit"))))
 	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadGateway, gin.H{"error": clientError(err)})
 		return
 	}
 	if attackers == nil {
@@ -178,7 +178,7 @@ func handleSeverityTimeline(c *gin.Context, enf *rbac.Enforcer, ch *clickhouse.C
 	buckets, err := ch.SeverityTimeline(c.Request.Context(), claims.TenantID,
 		atoi64(c.Query("from")), atoi64(c.Query("to")), int(atoi64(c.Query("bucket"))))
 	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadGateway, gin.H{"error": clientError(err)})
 		return
 	}
 	if buckets == nil {

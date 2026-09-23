@@ -56,7 +56,7 @@ func handleCreateTenant(c *gin.Context, store *db.Store) {
 		OwnerPassword string `json:"owner_password" binding:"required,min=12"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": clientError(err)})
 		return
 	}
 	if !validPlan(req.Plan) {
@@ -89,7 +89,7 @@ func handleListTenants(c *gin.Context, store *db.Store) {
 	}
 	tenants, err := store.ListTenants(c.Request.Context())
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"tenants": tenants})
@@ -109,7 +109,7 @@ func handleSetTenantStatus(c *gin.Context, store *db.Store) {
 		Status string `json:"status" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": clientError(err)})
 		return
 	}
 	switch req.Status {
@@ -124,7 +124,7 @@ func handleSetTenantStatus(c *gin.Context, store *db.Store) {
 		return
 	}
 	if err := store.SetTenantStatus(c.Request.Context(), tid, req.Status); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true, "tenant_id": tid, "status": req.Status})
