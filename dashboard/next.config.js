@@ -16,6 +16,13 @@ const nextConfig = {
   images: { unoptimized: true },
   // No `X-Powered-By: Next.js` — it tells a scanner which advisories to try.
   poweredByHeader: false,
+  // Next.js 15 traces sharp's native image binaries (@img, ~37 MB) and the
+  // TypeScript compiler (~9 MB) into the standalone server. Neither runs here:
+  // the image optimiser is off (above) and the config is plain JS. Leaving them
+  // out keeps the image — and the offline bundle it ships in — at its 14.x size.
+  outputFileTracingExcludes: {
+    "*": ["node_modules/@img/**", "node_modules/sharp/**", "node_modules/typescript/**"],
+  },
   eslint: { ignoreDuringBuilds: true },
   typescript: { ignoreBuildErrors: true },
   // Emit .next/standalone — a self-contained server with ONLY the node_modules
