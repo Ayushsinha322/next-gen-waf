@@ -4,6 +4,7 @@ import { motion } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
 import EmptyState from "@/components/ui/EmptyState";
 import { verdictOf, clockTime } from "@/lib/liveRecord";
+import { formatP99 } from "@/lib/latency";
 import { api, type TrafficBucket, type MetricsSnapshot } from "@/lib/api";
 import { staggerContainer, cardVariants, fadeUp, spring } from "@/lib/animations";
 import Icon from "@/components/ui/Icon";
@@ -174,12 +175,24 @@ export default function TrafficPage() {
         {([
           { label: "Req / sec",      val: metrics ? metrics.rps.toFixed(1)                    : "—", cls: "blue" },
           { label: "Blocked total",  val: metrics ? metrics.blocked_requests.toLocaleString() : "—", cls: "red"  },
-          { label: "p99 Latency",    val: metrics ? metrics.p99_latency_ms.toFixed(1) + " ms"  : "—", cls: "green"},
+          // End-to-end, like the Overview card: "—" with no samples (lib/latency.ts),
+          // and the sub-line names which p99 this is — the top-bar badge shows the
+          // WAF's own time, and the two differ by whatever the origin takes.
+          { label: "p99 Latency",    val: formatP99(metrics?.p99_latency_ms, metrics?.p99_samples), cls: "green",
+            sub: !metrics || metrics.p99_samples === 0
+              ? "no requests in the last 5 min"
+              : (metrics.p99_waf_samples ?? 0) > 0
+                ? `end-to-end · WAF ${formatP99(metrics.p99_waf_ms, metrics.p99_waf_samples, 2)} of it`
+                : "end-to-end, incl. origin",
+            tip: metrics && metrics.p99_samples !== 0
+              ? `99th-percentile end-to-end latency, including the wait on the origin, over the last ${metrics.p99_samples ?? "?"} requests (5-minute window).`
+              : "No latency samples: no request reached a site in the last five minutes, or the control plane restarted since." },
           { label: "eBPF Drops",     val: metrics ? metrics.ebpf_drops.toLocaleString()        : "—", cls: "pur" },
-        ] as { label: string; val: string; cls: string }[]).map(k => (
-          <motion.div key={k.label} className={`mc ${k.cls}`} variants={cardVariants}>
+        ] as { label: string; val: string; cls: string; sub?: string; tip?: string }[]).map(k => (
+          <motion.div key={k.label} className={`mc ${k.cls}`} variants={cardVariants} title={k.tip} style={k.tip ? { cursor: "help" } : undefined}>
             <div className="mc-label">{k.label}</div>
             <div className="mc-val">{k.val}</div>
+            {k.sub && <div className="mc-delta">{k.sub}</div>}
           </motion.div>
         ))}
       </motion.div>
