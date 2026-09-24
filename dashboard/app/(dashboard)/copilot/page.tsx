@@ -1,8 +1,8 @@
 "use client";
-import { CopilotStatusLine } from "@/components/copilot/CopilotStatus";
+import { CopilotStatusLine, useCopilotStatus } from "@/components/copilot/CopilotStatus";
 import { useState, useRef, useEffect } from "react";
 import { motion } from "framer-motion";
-import { GREET, askCopilot } from "@/lib/copilot";
+import { greetingFor, askCopilot } from "@/lib/copilot";
 import { takeCopilotHandoff, listRecentHandoffs, rememberRecent, clearRecentHandoffs, buildCopilotMessage, virtualPatchPrompt, type CopilotHandoff } from "@/lib/copilotContext";
 import { spring } from "@/lib/animations";
 import { renderCopilotMarkdown } from "@/lib/safeMarkdown";
@@ -17,11 +17,18 @@ const QUICK_ACTIONS: Array<[string, string, string]> = [
   ["rule",    "Write a rule",     `Write a ${PRODUCT_NAME} custom rule in ModSecurity SecRule syntax that `],
   ["fp",      "Fix a false positive", "Open Threat Search, pick the event, and press Draft exclusion — the event is loaded here."],
   ["patch",   "Virtual patch a CVE", "CVE-"],
-  ["tune",    "Tune a threshold",  "Our anomaly threshold is 5 at paranoia level 1 with ML sensitivity 0.9. Given these false-positive candidates from learning mode, what should change first? "],
+  // Blanks, not numbers: this used to assert "threshold 5 … ML sensitivity 0.9"
+  // to the model on every console — neither the default (10) nor looked up.
+  ["tune",    "Tune a threshold",  "This site's anomaly threshold is __ at paranoia level __. Given these false-positive candidates from learning mode, what should change first? "],
 ];
 
+// `greet` marks the opening message: its text is derived from the live status
+// (greetingFor), so it corrects itself once GET /api/copilot answers.
+type Msg = { who:"ai"|"usr"; text:string; time:string; greet?: boolean };
+
 export default function CopilotPage() {
-  const [msgs, setMsgs] = useState<{who:"ai"|"usr";text:string;time:string}[]>([]);
+  const status = useCopilotStatus();
+  const [msgs, setMsgs] = useState<Msg[]>([]);
   const [typing, setTyping] = useState(false);
   const [input, setInput] = useState("");
   const [recent, setRecent] = useState<CopilotHandoff[]>([]);
@@ -34,7 +41,7 @@ export default function CopilotPage() {
     const h = takeCopilotHandoff();
     const t = setTimeout(() => {
       const now = new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"});
-      setMsgs([{ who:"ai", text:GREET, time:now }]);
+      setMsgs([{ who:"ai", text:"", greet:true, time:now }]);
       // A hand-off from another page: show what was loaded and ask its question
       // straight away — the operator came here for that answer, not for a chat box.
       if (h) startFrom(h, false);
@@ -59,7 +66,7 @@ export default function CopilotPage() {
     setMsgs(p => [...p, { who:"usr", text: shown ?? text, time:now }]);
     setTyping(true);
     try {
-      const history = msgs.map(m => ({ role: (m.who === "ai" ? "assistant" : "user") as "assistant" | "user", content: m.text }));
+      const history = msgs.map(m => ({ role: (m.who === "ai" ? "assistant" : "user") as "assistant" | "user", content: textOf(m) }));
       const reply = await askCopilot(history, text);
       const now2 = new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"});
       setTyping(false);
@@ -72,15 +79,17 @@ export default function CopilotPage() {
     }
   }
 
+  function textOf(m: Msg): string { return m.greet ? greetingFor(status) : m.text; }
+
   function send() { if(!input.trim()) return; sendMsg(input.trim()); setInput(""); }
 
   return (
     <div className="sec">
       <motion.div initial={{ opacity: 0, y: 14 }} animate={{ opacity: 1, y: 0 }} transition={spring} style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",gap:14}}>
-        <div><div className="sec-title" style={{color:"#BF7FFF"}}>AI Security Copilot</div><div className="sec-sub">Powered by DeepSeek R1 · Rule generation · CVE patching · Alert explanation</div></div>
+        <div><div className="sec-title" style={{color:"#BF7FFF"}}>AI Security Copilot</div><div className="sec-sub">Rule generation · CVE patching · Alert explanation</div></div>
         <div style={{display:"flex",gap:8,alignItems:"center"}}>
-          <span style={{fontSize: 11,fontFamily:"var(--font-mono)",color:"#A070E0",background:"rgba(124,47,191,.15)",border:"1px solid rgba(124,47,191,.3)",borderRadius:20,padding:"4px 12px"}}>deepseek-r1:8b</span>
-          <motion.button className="btn bg-btn btn-sm" whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }} onClick={() => { setMsgs([]); setTimeout(() => { const now=new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}); setMsgs([{who:"ai",text:GREET,time:now}]); },100); }}>Clear Chat</motion.button>
+          {status.kind === "ready" && status.model && <span style={{fontSize: 11,fontFamily:"var(--font-mono)",color:"#A070E0",background:"rgba(124,47,191,.15)",border:"1px solid rgba(124,47,191,.3)",borderRadius:20,padding:"4px 12px"}}>{status.model}</span>}
+          <motion.button className="btn bg-btn btn-sm" whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }} onClick={() => { setMsgs([]); setTimeout(() => { const now=new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}); setMsgs([{who:"ai",text:"",greet:true,time:now}]); },100); }}>Clear Chat</motion.button>
         </div>
       </motion.div>
 
@@ -109,14 +118,14 @@ export default function CopilotPage() {
             <motion.div animate={{ boxShadow: ["0 0 18px var(--pur-glow)", "0 0 32px rgba(124,58,237,.6)", "0 0 18px var(--pur-glow)"] }} transition={{ duration: 3, repeat: Infinity }} style={{width:40,height:40,borderRadius:"50%",background:"linear-gradient(135deg,var(--purple),#4A0FA0)",display:"flex",alignItems:"center",justifyContent:"center",fontSize: 25}}><Icon name="sparkles" size={18} /></motion.div>
             <div>
               <div style={{fontFamily:"var(--font-display)",fontSize: 15,fontWeight:700}}>{PRODUCT_NAME} AI Copilot</div>
-              <CopilotStatusLine />
+              <CopilotStatusLine status={status} />
             </div>
             {loaded && (
               <div title={`Loaded from ${loaded.source}`} style={{marginLeft:"auto",fontSize: 11,fontFamily:"var(--font-mono)",color:"var(--cyan)",background:"rgba(0,212,255,.08)",border:"1px solid rgba(0,212,255,.25)",borderRadius:20,padding:"3px 10px",maxWidth:340,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
                 {loaded.title}
               </div>
             )}
-            <div style={{marginLeft:loaded?0:"auto",fontSize: 11,fontFamily:"var(--font-mono)",color:"#A070E0",background:"rgba(124,47,191,.15)",border:"1px solid rgba(124,47,191,.3)",borderRadius:20,padding:"3px 10px"}}>deepseek-r1:8b</div>
+            {status.kind === "ready" && status.model && <div style={{marginLeft:loaded?0:"auto",fontSize: 11,fontFamily:"var(--font-mono)",color:"#A070E0",background:"rgba(124,47,191,.15)",border:"1px solid rgba(124,47,191,.3)",borderRadius:20,padding:"3px 10px"}}>{status.model}</div>}
           </div>
 
           <div ref={msgsRef} className="flex-1 overflow-y-auto" style={{padding:"16px 18px",display:"flex",flexDirection:"column",gap:12}}>
@@ -124,7 +133,7 @@ export default function CopilotPage() {
               <motion.div key={i} className={`msg2 ${m.who}`} initial={{ opacity: 0, y: 8, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} transition={{ duration: 0.25 }}>
                 <div className={`mav2 ${m.who}`}><Icon name={m.who==="ai"?"sparkles":"user"} size={14} /></div>
                 <div>
-                  <div className="mbbl2" dangerouslySetInnerHTML={{__html:renderCopilotMarkdown(m.text)}} />
+                  <div className="mbbl2" dangerouslySetInnerHTML={{__html:renderCopilotMarkdown(textOf(m))}} />
                   <div className="mt3">{m.time}</div>
                 </div>
               </motion.div>

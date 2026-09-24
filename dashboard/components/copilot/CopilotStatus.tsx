@@ -1,11 +1,8 @@
 "use client";
 import { useEffect, useState } from "react";
+import type { CopilotStatus } from "@/lib/copilot";
 
-type State =
-  | { kind: "checking" }
-  | { kind: "ready"; model: string }
-  | { kind: "unconfigured" }
-  | { kind: "unreachable" };
+type State = CopilotStatus;
 
 /**
  * The copilot's real status. The header used to be the literal text "Online ·
@@ -29,8 +26,8 @@ export function useCopilotStatus(): State {
   return s;
 }
 
-export function CopilotStatusLine({ fontSize = 11 }: { fontSize?: number }) {
-  const s = useCopilotStatus();
+/** Takes the status from the caller, whose greeting and model badge read the same one. */
+export function CopilotStatusLine({ status: s, fontSize = 11 }: { status: State; fontSize?: number }) {
   const [color, text] =
     s.kind === "ready"        ? ["var(--green)", `Online · ${s.model}`] :
     s.kind === "unconfigured" ? ["var(--amber)", "Not configured — no model key is set on the console server"] :

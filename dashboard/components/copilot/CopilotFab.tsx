@@ -1,8 +1,8 @@
 "use client";
-import { CopilotStatusLine } from "@/components/copilot/CopilotStatus";
+import { CopilotStatusLine, useCopilotStatus } from "@/components/copilot/CopilotStatus";
 import { useState, useRef, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { GREET, askCopilot } from "@/lib/copilot";
+import { greetingFor, askCopilot } from "@/lib/copilot";
 import type { ChatMessage } from "@/lib/types";
 import { spring } from "@/lib/animations";
 import { renderCopilotMarkdown } from "@/lib/safeMarkdown";
@@ -18,6 +18,7 @@ const QUICK_LABELS: Record<string, string> = {
 };
 
 export default function CopilotFab({ variant = "login" }: { variant?: "login" | "dashboard" }) {
+  const status = useCopilotStatus();
   const [open, setOpen] = useState(false);
   const [msgs, setMsgs] = useState<ChatMessage[]>([]);
   const [typing, setTyping] = useState(false);
@@ -27,7 +28,7 @@ export default function CopilotFab({ variant = "login" }: { variant?: "login" | 
   useEffect(() => {
     const t = setTimeout(() => {
       const now = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-      setMsgs([{ who: "ai", text: GREET, time: now }]);
+      setMsgs([{ who: "ai", text: "", greet: true, time: now }]);
     }, 2600);
     return () => clearTimeout(t);
   }, []);
@@ -38,7 +39,7 @@ export default function CopilotFab({ variant = "login" }: { variant?: "login" | 
 
   async function sendAI(text: string) {
     const now = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-    const history = msgs.map(m => ({ role: (m.who === "ai" ? "assistant" : "user") as "assistant" | "user", content: m.text }));
+    const history = msgs.map(m => ({ role: (m.who === "ai" ? "assistant" : "user") as "assistant" | "user", content: textOf(m) }));
     setMsgs(p => [...p, { who: "usr", text, time: now }]);
     setTyping(true);
     try {
@@ -53,6 +54,10 @@ export default function CopilotFab({ variant = "login" }: { variant?: "login" | 
       setMsgs(p => [...p, { who: "ai", text: `⚠ ${msg}`, time: now2 }]);
     }
   }
+
+  // The opening message follows the live status (greetingFor) instead of being
+  // frozen at mount, before GET /api/copilot has answered.
+  function textOf(m: ChatMessage): string { return m.greet ? greetingFor(status) : m.text; }
 
   function sendInput() {
     if (!input.trim()) return;
@@ -91,7 +96,7 @@ export default function CopilotFab({ variant = "login" }: { variant?: "login" | 
               <motion.div animate={{ boxShadow: ["0 0 14px var(--pur-glow)", "0 0 24px rgba(124,58,237,.6)", "0 0 14px var(--pur-glow)"] }} transition={{ duration: 3, repeat: Infinity }} style={{ width: 34, height: 34, borderRadius: "50%", background: "linear-gradient(135deg,var(--purple),#4A0FA0)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 19 }}><Icon name="sparkles" size={18} /></motion.div>
               <div>
                 <div style={{ fontFamily: "var(--font-display)", fontSize: 13, fontWeight: 700, color: "var(--text)" }}>{PRODUCT_NAME} AI Copilot</div>
-                <CopilotStatusLine />
+                <CopilotStatusLine status={status} />
               </div>
               <motion.button style={{ cursor: "pointer", color: "var(--text3)", fontSize: 19, background: "none", border: "none", marginLeft: "auto", lineHeight: 1, transition: "color .2s" }} onClick={() => setOpen(false)} whileHover={{ scale: 1.15, color: "var(--red-b)" }}>✕</motion.button>
             </div>
@@ -101,7 +106,7 @@ export default function CopilotFab({ variant = "login" }: { variant?: "login" | 
                 <motion.div key={i} className={`msg ${m.who}`} initial={{ opacity: 0, y: 6, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} transition={{ duration: 0.22 }}>
                   <div className={`mav ${m.who}`}><Icon name={m.who === "ai" ? "sparkles" : "user"} size={14} /></div>
                   <div>
-                    <div className="mbbl" dangerouslySetInnerHTML={{ __html: renderCopilotMarkdown(m.text) }} />
+                    <div className="mbbl" dangerouslySetInnerHTML={{ __html: renderCopilotMarkdown(textOf(m)) }} />
                     <div style={{ fontSize: 10, color: "var(--text3)", marginTop: 3, textAlign: m.who === "usr" ? "right" : "left" }}>{m.time}</div>
                   </div>
                 </motion.div>
