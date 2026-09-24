@@ -398,3 +398,47 @@ fn coverage_rules_score_rather_than_decide() {
         offenders.len()
     );
 }
+
+/// The product's default anomaly threshold: what the control plane sends for a
+/// site that sets none (buildRustWaf, `p.AnomalyThreshold = 10`).
+const DEFAULT_THRESHOLD: u32 = 10;
+
+/// Matching is not blocking. `coverage_rules_still_catch_their_attack_class`
+/// only asserts a match, and so passed for ten days while every match scored
+/// +5 against a default threshold of 10 — a lone signature blocked nothing, and
+/// GoTestWAF detection sat at 87% instead of 99%. Each attack must reach the
+/// default threshold ON ITS OWN, because these are the classes CRS misses:
+/// there is no second signal to add to it.
+#[test]
+fn a_lone_coverage_match_reaches_the_default_threshold() {
+    let engine = coverage_engine();
+    let mut short = Vec::new();
+    for (what, mut ctx) in attack_cases() {
+        eval(&engine, &mut ctx);
+        if ctx.anomaly_score < DEFAULT_THRESHOLD && ctx.decision != WafDecision::Block {
+            short.push(format!(
+                "  {what}: score {} < {DEFAULT_THRESHOLD}",
+                ctx.anomaly_score
+            ));
+        }
+    }
+    assert!(
+        short.is_empty(),
+        "coverage matches that cannot block on their own:\n{}",
+        short.join("\n")
+    );
+}
+
+/// Keep DEFAULT_THRESHOLD honest: it must be the value the control plane sends.
+#[test]
+fn the_default_threshold_is_the_control_planes() {
+    let go = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../control-plane/cmd/controllerd/handlers.go"),
+    )
+    .expect("read handlers.go");
+    assert!(
+        go.contains(&format!("p.AnomalyThreshold = {DEFAULT_THRESHOLD}")),
+        "the control plane's default anomaly threshold is no longer {DEFAULT_THRESHOLD}"
+    );
+}
