@@ -116,7 +116,7 @@ const Icon = {
 // (sites, enforced rules, plugins, open alerts) and nothing else; pages fed by a
 // live stream get a small pulsing dot instead of a "LIVE" word. The mix of tier
 // tags ("NEW", "AI", "TLS"), counts and status chips in one column is gone.
-const NAV: Array<{ group: string; items: Array<{ id: string; Icon: () => JSX.Element; live?: boolean }> }> = [
+const NAV: Array<{ group: string; items: Array<{ id: string; Icon: () => React.JSX.Element; live?: boolean }> }> = [
   { group: "monitor", items: [
     { id: "overview", Icon: Icon.Overview },
     { id: "traffic",  Icon: Icon.Traffic, live: true },

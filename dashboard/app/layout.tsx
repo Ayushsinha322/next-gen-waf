@@ -8,11 +8,12 @@ export const metadata: Metadata = {
   description: "High-performance Web Application Firewall control plane",
 };
 
-export default function RootLayout({ children }: { children: React.ReactNode }) {
+export default async function RootLayout({ children }: { children: React.ReactNode }) {
   // Per-request CSP nonce minted in middleware.ts. The inline script below is
   // the only hand-written one in the app and needs the nonce to execute under
   // the policy; Next.js nonces the scripts it injects itself.
-  const nonce = headers().get("x-nonce") ?? undefined;
+  // `headers()` is asynchronous from Next.js 15.
+  const nonce = (await headers()).get("x-nonce") ?? undefined;
 
   return (
     <html lang="en" suppressHydrationWarning>

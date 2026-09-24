@@ -26,7 +26,7 @@ function isTurn(v: unknown): v is CopilotTurn {
  */
 /** Status for the copilot header: configured or not, and which model. Same auth as POST. */
 export async function GET() {
-  const token = cookies().get("sentinel_token")?.value;
+  const token = (await cookies()).get("sentinel_token")?.value;
   if (!token || token.split(".").length !== 3) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
@@ -34,7 +34,7 @@ export async function GET() {
 }
 
 export async function POST(req: Request) {
-  const token = cookies().get("sentinel_token")?.value;
+  const token = (await cookies()).get("sentinel_token")?.value;
   if (!token || token.split(".").length !== 3) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }

@@ -9,6 +9,13 @@ const PRODUCT_VERSION = require("./package.json").version;
 
 const nextConfig = {
   env: { NEXT_PUBLIC_PRODUCT_VERSION: PRODUCT_VERSION },
+  // The console never uses next/image, but Next.js serves its image optimiser
+  // (/_next/image) by default anyway — and that endpoint carries this
+  // framework's worst advisories (unauthenticated RCE with AVIF, DoS, cache
+  // confusion, content injection). Off, it does not exist to attack.
+  images: { unoptimized: true },
+  // No `X-Powered-By: Next.js` — it tells a scanner which advisories to try.
+  poweredByHeader: false,
   eslint: { ignoreDuringBuilds: true },
   typescript: { ignoreBuildErrors: true },
   // Emit .next/standalone — a self-contained server with ONLY the node_modules
