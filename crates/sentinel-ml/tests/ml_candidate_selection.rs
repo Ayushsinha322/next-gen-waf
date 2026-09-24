@@ -85,3 +85,40 @@ fn a_path_segment_with_structure_is_still_scored() {
         assert!(s >= DETECTION_MIN, "{uri} scored only {s}");
     }
 }
+
+/// The 1.1.7 regression GoTestWAF found: a Base64 attack is letters and digits,
+/// so the plain-word rule skipped it in the URL path. Long segments are scored.
+#[test]
+fn a_base64_attack_in_the_path_is_still_scored() {
+    // base64('"onClick="(prompt)(1)'), no padding characters
+    let s = score(&ctx("/p/Im9uQ2xpY2s9Iihwcm9tcHQpKDEp", None, None));
+    assert!(
+        s >= DETECTION_MIN,
+        "base64 XSS path segment scored only {s}"
+    );
+}
+
+/// The other one: a traversal in a multipart part's filename lived only in the
+/// raw body, which a parsed body no longer contributes whole.
+#[test]
+fn a_multipart_filename_is_scored() {
+    let b = "--XyZ\r\nContent-Disposition: form-data; name=\"file\"; filename=\"/static/img/../../etc/passwd\"\r\nContent-Type: text/plain\r\n\r\nhello\r\n--XyZ--\r\n";
+    let s = score(&ctx(
+        "/upload",
+        Some("multipart/form-data; boundary=XyZ"),
+        Some(b),
+    ));
+    assert!(
+        s >= DETECTION_MIN,
+        "multipart filename traversal scored only {s}"
+    );
+}
+
+/// Short Base64 is still Base64: `(alert)(1)` → 14 characters.
+#[test]
+fn a_short_base64_attack_in_the_path_is_still_scored() {
+    for seg in ["KGFsZXJ0KSgxKQ", "Jy1hbGVydCgxKS8v"] {
+        let s = score(&ctx(&format!("/p/{seg}"), None, None));
+        assert!(s >= DETECTION_MIN, "{seg} scored only {s}");
+    }
+}

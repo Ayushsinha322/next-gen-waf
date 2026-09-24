@@ -407,8 +407,12 @@ fn json_scalar_values(v: &serde_json::Value, out: &mut Vec<String>) {
     }
 }
 
-/// A path segment that is one plain word — letters, digits and `-_.~`, with no
-/// `..` — and so cannot carry an injection by itself.
+/// Longest segment treated as a plain word rather than scored.
+const MAX_PLAIN_PATH_WORD: usize = 20;
+
+/// A path segment that is one SHORT plain word — at most MAX_PLAIN_PATH_WORD
+/// letters, digits and `-_.~`, with no `..` — and so cannot carry an injection
+/// by itself.
 ///
 /// Scoring such segments let the classifier block on vocabulary: `whoami` alone
 /// scores 0.922, over the detection threshold, so `GET /rest/user/whoami` (an
@@ -416,7 +420,16 @@ fn json_scalar_values(v: &serde_json::Value, out: &mut Vec<String>) {
 /// it. A segment with any metacharacter, encoding (`%`), traversal (`..`) or
 /// markup is still scored.
 fn is_plain_path_word(seg: &str) -> bool {
-    !seg.contains("..")
+    // Short only. A long run of word characters is not a word: Base64 of an
+    // attack is letters and digits too, and skipping it let 21 Base64Flat
+    // GoTestWAF payloads through in the URL path (1.1.7 regression). Real path
+    // words and ids — `whoami`, `products`, `v1`, a numeric id — are short.
+    seg.len() <= MAX_PLAIN_PATH_WORD
+        // …and not Base64 of readable text. `(alert)(1)` encodes to 14
+        // characters, so length alone let two short payloads through; a real
+        // word "decodes" to binary noise, which maybe_base64_decode rejects.
+        && models::ngram_classifier::maybe_base64_decode(seg).is_none()
+        && !seg.contains("..")
         && seg.chars().any(|c| c.is_ascii_alphanumeric())
         && seg
             .chars()
@@ -492,6 +505,26 @@ fn body_field_values(body: &str, content_type: &str, out: &mut Vec<String>) -> b
                 let val = part[idx..].trim_end_matches(['-', '\r', '\n']);
                 if !val.is_empty() {
                     out.push(val.to_string());
+                }
+                // The part's own header parameters — `name=` and above all
+                // `filename=` — are attacker-chosen too. They were only ever seen
+                // inside the whole raw body; once a parsed body stopped being
+                // scored whole, `filename="/static/img/../../etc/passwd"` got
+                // through (GoTestWAF community-lfi-multipart, 2/2).
+                for param in ["filename=", "name="] {
+                    let mut rest = &part[..idx];
+                    while let Some(pos) = rest.find(param) {
+                        let after = &rest[pos + param.len()..];
+                        let v = if let Some(q) = after.strip_prefix('"') {
+                            q.split('"').next().unwrap_or("")
+                        } else {
+                            after.split([';', '\r', '\n']).next().unwrap_or("").trim()
+                        };
+                        if !v.is_empty() {
+                            out.push(v.to_string());
+                        }
+                        rest = after;
+                    }
                 }
             }
         }
