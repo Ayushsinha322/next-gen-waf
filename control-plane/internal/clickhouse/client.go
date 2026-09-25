@@ -199,6 +199,45 @@ type Event struct {
 	// malicious-JA4 bot signal and the JA4 blocklist — without it, a block it
 	// caused could not be explained from the row.
 	JA4 string `json:"ja4"`
+	// Every rule that contributed to the verdict (array of {id, msg, sev,
+	// score, target, matched}, biggest score first), the redacted request
+	// headers (object), and the User-Agent. Written by the data plane since
+	// 2026-09-25; absent on older rows, which the UI renders as absent.
+	Rules   JSONText `json:"rules,omitempty"`
+	Headers JSONText `json:"headers,omitempty"`
+	UA      string   `json:"ua"`
+}
+
+// JSONText is a ClickHouse String column that holds JSON text. ClickHouse
+// returns it as a JSON *string*; this decodes that string and re-encodes the
+// JSON it contains, so the console receives an array/object rather than
+// escaped text. Empty or invalid text decodes to nothing and is omitted.
+type JSONText []byte
+
+func (j *JSONText) UnmarshalJSON(b []byte) error {
+	var text string
+	if err := json.Unmarshal(b, &text); err != nil {
+		// Already JSON rather than a string (a future column type): keep it.
+		if json.Valid(b) && string(b) != "null" {
+			*j = append((*j)[:0], b...)
+		} else {
+			*j = nil
+		}
+		return nil
+	}
+	if text == "" || !json.Valid([]byte(text)) {
+		*j = nil
+		return nil
+	}
+	*j = JSONText(text)
+	return nil
+}
+
+func (j JSONText) MarshalJSON() ([]byte, error) {
+	if len(j) == 0 {
+		return []byte("null"), nil
+	}
+	return []byte(j), nil
 }
 
 type TimelineBucket struct {
@@ -365,7 +404,7 @@ func (c *Client) Search(ctx context.Context, f SearchFilter) ([]Event, error) {
 	sql := fmt.Sprintf(
 		"SELECT toUnixTimestamp(ts) AS ts, ip, country, site, method, path, query, referer, matched, "+
 			"rule, attack, action, severity, score, status, protocol, "+
-			"request_id, target, mode, threshold, explanation, ja4 "+
+			"request_id, target, mode, threshold, explanation, ja4, rules, headers, ua "+
 			"FROM %s.waf_events WHERE %s ORDER BY ts DESC LIMIT %d",
 		c.db, strings.Join(where, " AND "), limit)
 	var out []Event
@@ -395,7 +434,7 @@ func (c *Client) FindBySupportID(ctx context.Context, tenant, supportID string) 
 	sql := fmt.Sprintf(
 		"SELECT toUnixTimestamp(ts) AS ts, ip, country, site, method, path, query, referer, matched, "+
 			"rule, attack, action, severity, score, status, protocol, "+
-			"request_id, target, mode, threshold, explanation, ja4 "+
+			"request_id, target, mode, threshold, explanation, ja4, rules, headers, ua "+
 			"FROM %s.waf_events WHERE %s AND %s ORDER BY ts DESC LIMIT 25",
 		c.db, eq("tenant", tenant), eq("request_id", id))
 	var out []Event
@@ -645,7 +684,7 @@ func (c *Client) RecentThreatIntelBlocks(ctx context.Context, tenant string, fro
 // single most common complaint about exported WAF logs.
 const exportColumns = `formatDateTime(ts, '%Y-%m-%dT%H:%i:%SZ', 'UTC') AS timestamp_utc, ` +
 	`ip, country, site, method, path, query, referer, matched, rule, attack, action, severity, score, status, ` +
-	`protocol, request_id, target, mode, threshold, explanation, ja4`
+	`protocol, request_id, target, mode, threshold, explanation, ja4, ua, rules, headers`
 
 // ExportFormat maps a requested format onto its ClickHouse FORMAT clause, MIME
 // type and file extension. Whitelisted — the format string reaches SQL.

@@ -1,6 +1,7 @@
 package clickhouse
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -64,5 +65,44 @@ func TestFacetSQL(t *testing.T) {
 
 	if _, err := c.facetSQL("attack; DROP TABLE waf_events", "t", 0, 0, 5); err == nil {
 		t.Error("a non-whitelisted facet column was accepted")
+	}
+}
+
+// rules/headers are String columns holding JSON. ClickHouse hands them back as
+// JSON strings; the API must pass real JSON on, and treat empty/invalid text
+// (rows older than the columns) as absent.
+func TestJSONTextRoundTrip(t *testing.T) {
+	var ev Event
+	row := `{"rule":"9900100","rules":"[{\"id\":\"9900100\",\"score\":50,\"target\":\"ARGS:q\"}]","headers":"{\"user-agent\":\"curl/8\"}","ua":"curl/8"}`
+	if err := json.Unmarshal([]byte(row), &ev); err != nil {
+		t.Fatal(err)
+	}
+	out, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"rules":[{"id":"9900100","score":50,"target":"ARGS:q"}]`, `"headers":{"user-agent":"curl/8"}`, `"ua":"curl/8"`} {
+		if !strings.Contains(string(out), want) {
+			t.Errorf("re-encoded event lacks %s: %s", want, out)
+		}
+	}
+
+	var old Event
+	if err := json.Unmarshal([]byte(`{"rule":"1","rules":"","headers":"not json"}`), &old); err != nil {
+		t.Fatal(err)
+	}
+	out, _ = json.Marshal(old)
+	if strings.Contains(string(out), `"rules"`) || strings.Contains(string(out), `"headers"`) {
+		t.Errorf("empty/invalid JSON text must be omitted: %s", out)
+	}
+}
+
+// A log export ("send me the logs for 3 August") must carry the new detail
+// columns too, or the exported record says less than the console does.
+func TestExportCarriesTheDetailColumns(t *testing.T) {
+	for _, col := range []string{"rules", "headers", "ua"} {
+		if !strings.Contains(exportColumns, col) {
+			t.Errorf("exportColumns lacks %s: %s", col, exportColumns)
+		}
 	}
 }
