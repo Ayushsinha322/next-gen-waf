@@ -4047,6 +4047,10 @@ async fn proxy_inner(
                             .get("DETECTION_PARANOIA_LEVEL")
                             .cloned()
                             .unwrap_or_else(|| site_cfg.waf.paranoia_level.to_string()),
+                        log_headers: [http::header::USER_AGENT, http::header::REFERER]
+                            .into_iter()
+                            .filter_map(|h| ctx.request_headers.get(&h).map(|v| (h, v.clone())))
+                            .collect(),
                     }))
                 } else {
                     None
@@ -4740,6 +4744,10 @@ struct WsSiteInspector {
     /// `TX:DETECTION_PARANOIA_LEVEL` as phase 1 set it for the upgrade. Every
     /// CRS file opens with a rule that skips the whole file when it is unset.
     paranoia: String,
+    /// The upgrade request's User-Agent and Referer — for the LOG RECORD only,
+    /// added after the verdict (see `record`), never to the context a message is
+    /// evaluated with.
+    log_headers: http::HeaderMap,
 }
 
 impl WsSiteInspector {
@@ -4771,13 +4779,22 @@ impl WsSiteInspector {
             .unwrap_or_else(|| self.site.waf.mode.clone())
     }
 
-    fn record(ctx: &mut RequestContext, what: &str) {
+    fn record(&self, ctx: &mut RequestContext, what: &str) {
         let why = ctx.block_reason.take().unwrap_or_default();
         ctx.block_reason = Some(if why.is_empty() {
             format!("websocket message: {what}")
         } else {
             format!("websocket message: {why}")
         });
+        // The record used to read status 0 and ua "-": the message context is
+        // built fresh, with no response and none of the handshake's headers. The
+        // connection WAS upgraded (101) and the message rode on it; the client is
+        // the one that opened it. Both are attached only now, after the verdict,
+        // so the handshake's headers are never re-scored on every message.
+        ctx.response_status = Some(StatusCode::SWITCHING_PROTOCOLS);
+        for (name, value) in self.log_headers.iter() {
+            ctx.request_headers.insert(name.clone(), value.clone());
+        }
         ctx.advance_phase(Phase::Logging);
         log_request(ctx);
     }
@@ -4799,11 +4816,11 @@ impl websocket::MessageInspector for WsSiteInspector {
             };
         }
         if ctx.decision == WafDecision::Block {
-            Self::record(&mut ctx, "blocked");
+            self.record(&mut ctx, "blocked");
             websocket::Verdict::Refuse(websocket::CLOSE_POLICY_VIOLATION)
         } else {
             if ctx.would_block {
-                Self::record(&mut ctx, "would block");
+                self.record(&mut ctx, "would block");
             }
             websocket::Verdict::Forward
         }
@@ -4817,7 +4834,7 @@ impl websocket::MessageInspector for WsSiteInspector {
         ));
         if self.mode() == WafMode::Blocking {
             ctx.decision = WafDecision::Block;
-            Self::record(&mut ctx, "too large");
+            self.record(&mut ctx, "too large");
             websocket::Verdict::Refuse(websocket::CLOSE_TOO_BIG)
         } else {
             warn!(
@@ -4828,7 +4845,7 @@ impl websocket::MessageInspector for WsSiteInspector {
             );
             ctx.decision = WafDecision::Log;
             ctx.would_block = true;
-            Self::record(&mut ctx, "too large");
+            self.record(&mut ctx, "too large");
             websocket::Verdict::Forward
         }
     }
@@ -8648,6 +8665,29 @@ mod event_detail_tests {
     }
 
     #[test]
+    fn the_explanation_names_the_parameter_and_speaks_plainly() {
+        let mut c = ctx("/rest/products/search?q=%27))%20UNION%20SELECT%20id%20FROM%20Users--");
+        c.decision = WafDecision::Block;
+        c.rule_matches = vec![rm("9900100", 85, "", "')) UNION SELECT id FROM Users--")];
+        let v = sentinel_rules::RequestValues::for_matches(&c);
+        let located = located_target(c.primary_rule_match(), &v);
+        let (msg, rem) = explain_event_at(&c, "BLOCK", "9900100", "SQL Injection", Some(&located));
+        assert!(msg.contains("in parameter 'q'"), "{msg}");
+        assert!(msg.contains("found in the query string or body"), "{msg}");
+        assert!(
+            !msg.contains("RequestBody") && !msg.contains("request_body"),
+            "{msg}"
+        );
+        assert!(
+            !rem.contains("more than one part"),
+            "the field is known now: {rem}"
+        );
+        // Without a located target the old honest fallback stands.
+        let (_, rem) = explain_event(&c, "BLOCK", "9900100", "SQL Injection");
+        assert!(rem.contains("more than one part"), "{rem}");
+    }
+
+    #[test]
     fn header_count_and_length_are_capped() {
         let mut h = http::HeaderMap::new();
         for i in 0..60 {
@@ -9081,6 +9121,7 @@ fn record_event(ctx: &RequestContext) {
     let ev_target = located_target(top, &values);
     // Cloned before the struct takes ownership of ev_rule/ev_attack.
     let ev_rule_for_prose = ev_rule.clone();
+    let ev_target_for_prose = ev_target.clone();
     let ev_attack_for_prose = ev_attack.clone();
     let row = sentinel_storage::WafEventRow {
         ts: unix_now(),
@@ -9143,7 +9184,14 @@ fn record_event(ctx: &RequestContext) {
         .to_string(),
         threshold: ctx.anomaly_threshold.unwrap_or(0),
         explanation: if log_explain_enabled() {
-            explain_event(ctx, action, &ev_rule_for_prose, &ev_attack_for_prose).0
+            explain_event_at(
+                ctx,
+                action,
+                &ev_rule_for_prose,
+                &ev_attack_for_prose,
+                Some(&ev_target_for_prose),
+            )
+            .0
         } else {
             String::new()
         },
@@ -9671,6 +9719,29 @@ fn humanize_target(target: &str) -> String {
     }
 }
 
+/// The phase a finding came from, in the words an operator uses. "detected
+/// during RequestBody" was ModSecurity's phase name leaking into prose — and
+/// wrong-sounding for a GET, whose query string is inspected in that same phase.
+/// The refined target when there is one, else the rule's own.
+fn pick_target<'a>(m: &'a sentinel_core::context::RuleMatch, located: Option<&'a str>) -> &'a str {
+    match located {
+        Some(t) if !t.is_empty() => t,
+        _ => m.target.as_str(),
+    }
+}
+
+fn phase_words(p: &Phase) -> &'static str {
+    match p {
+        Phase::Connection => "the connection",
+        Phase::RequestHeaders => "the request headers",
+        Phase::RequestBody => "the query string or body",
+        Phase::Upstream => "the upstream exchange",
+        Phase::ResponseHeaders => "the response headers",
+        Phase::ResponseBody => "the response body",
+        Phase::Logging => "post-response logging",
+    }
+}
+
 /// Trim a path/URI for inclusion in prose without destroying its meaning.
 fn truncate_for_prose(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -9687,7 +9758,20 @@ fn truncate_for_prose(s: &str, max: usize) -> String {
 /// the verdict followed. The remediation says what to do about it — which is the
 /// part commercial WAFs typically leave to the operator to work out from a
 /// violation code, and the reason this exists at all.
+#[cfg(test)]
 fn explain_event(ctx: &RequestContext, action: &str, rule: &str, attack: &str) -> (String, String) {
+    explain_event_at(ctx, action, rule, attack, None)
+}
+
+/// [`explain_event`] with the top rule's target refined to the parameter
+/// (`ARGS:q`) — see `located_target`. `None` keeps the rule's own target.
+fn explain_event_at(
+    ctx: &RequestContext,
+    action: &str,
+    rule: &str,
+    attack: &str,
+    located: Option<&str>,
+) -> (String, String) {
     let site = ctx.site_id.as_deref().unwrap_or("unrouted request");
     let origin = match ctx.geo_country.as_deref() {
         Some(cc) if !cc.is_empty() => format!("{} ({cc})", ctx.client_ip),
@@ -9700,6 +9784,7 @@ fn explain_event(ctx: &RequestContext, action: &str, rule: &str, attack: &str) -
     );
     // The WORST finding, not the earliest. See RequestContext::primary_rule_match.
     let top = ctx.primary_rule_match();
+    let target_of = |m| pick_target(m, located);
     let is_rule_hit = top.is_some();
 
     // What the WAF did, stated so that a learning-mode record can never be
@@ -9727,17 +9812,20 @@ fn explain_event(ctx: &RequestContext, action: &str, rule: &str, attack: &str) -
         // guessed target would send an operator to exclude something that never
         // fired. Say "in <target>" when it is known and omit the clause when it is
         // not, rather than emitting "in  (rule …)".
-        Some(m) if !m.target.is_empty() => format!(
-            "{} in {} (rule {}, severity {:?}, detected during {})",
+        Some(m) if !target_of(m).is_empty() => format!(
+            "{} in {} (rule {}, severity {:?}, found in {})",
             attack,
-            humanize_target(&m.target),
+            humanize_target(target_of(m)),
             m.rule_id,
             m.severity,
-            m.phase
+            phase_words(&m.phase)
         ),
         Some(m) => format!(
-            "{} (rule {}, severity {:?}, detected during {})",
-            attack, m.rule_id, m.severity, m.phase
+            "{} (rule {}, severity {:?}, found in {})",
+            attack,
+            m.rule_id,
+            m.severity,
+            phase_words(&m.phase)
         ),
         None => {
             let reason = ctx.block_reason.as_deref().unwrap_or("").trim();
@@ -9790,7 +9878,7 @@ fn explain_event(ctx: &RequestContext, action: &str, rule: &str, attack: &str) -
         let m = top.expect("is_rule_hit implies a match");
         // With a known target the advice can be specific; without one it must not
         // invent a parameter to exclude.
-        if m.target.is_empty() {
+        if target_of(m).is_empty() {
             format!(
                 "If this is legitimate traffic, disable rule {} for site '{}' (Sites → {} → \
                  Learning Report → Disable), or raise the site's anomaly threshold above {}. This \
@@ -9808,7 +9896,7 @@ fn explain_event(ctx: &RequestContext, action: &str, rule: &str, attack: &str) -
                  above {}. Confirm against the source IP and payload before excluding — an \
                  exclusion applies to every future request for that target.",
                 m.rule_id,
-                humanize_target(&m.target),
+                humanize_target(target_of(m)),
                 site,
                 site,
                 ctx.anomaly_score.max(1)
@@ -10045,7 +10133,7 @@ fn ndjson_log(ctx: &RequestContext) {
             None => "node",
         };
         let (message, remediation) = if log_explain_enabled() {
-            explain_event(ctx, action, rule, attack)
+            explain_event_at(ctx, action, rule, attack, Some(&target))
         } else {
             (String::new(), String::new())
         };
@@ -10092,7 +10180,10 @@ fn ndjson_log(ctx: &RequestContext) {
                           .unwrap_or(""),
             "message": message,
             "remediation": remediation,
-            "would_block": ctx.would_block,
+            // True whenever the verdict reached block level — enforced (BLOCK) or,
+            // in learning mode, not (DETECT). It read false on every real block,
+            // which in a raw record says "this would not have been blocked".
+            "would_block": ctx.would_block || action == "BLOCK",
             "threat_intel_hit": ctx.threat_intel_hit,
             "engine_scores": ctx.engine_scores,
             "ml_scores": ctx.ml_scores,
