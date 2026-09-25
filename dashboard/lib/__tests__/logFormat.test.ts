@@ -111,3 +111,18 @@ describe("Logs page counters count the lines on screen", () => {
     expect(page).not.toMatch(/logs\.waf\.filter\(/);
   });
 });
+
+describe("waf.log line lists every contributing rule", () => {
+  const base = { ts: "2026-09-25T10:00:00Z", action: "BLOCK", ip: "10.0.0.1", method: "GET", path: "/s",
+    rule: "9900100", score: 85, sev: "CRITICAL", attack: "SQL Injection", site: "Juice Shop", request_id: "abc" };
+
+  it("appends rules= with each rule's share when there are several", () => {
+    const line = fmt("waf", { ...base, rules: [{ id: "9900100", score: 50 }, { id: "942190", score: 30 }, { id: "942100", score: 5 }] });
+    expect(line).toContain("rules=9900100:50,942190:30,942100:5");
+  });
+
+  it("adds nothing for a single rule or an older record", () => {
+    expect(fmt("waf", { ...base, rules: [{ id: "9900100", score: 85 }] })).not.toContain("rules=");
+    expect(fmt("waf", base)).not.toContain("rules=");
+  });
+});

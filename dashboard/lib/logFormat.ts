@@ -35,6 +35,17 @@ export function verdict(r: Record<string, unknown>): "BLOCK" | "PASS" | "CHALLEN
   return Number(r.status ?? 200) === 403 ? "BLOCK" : "PASS";
 }
 
+/**
+ * ` rules=9900100:50,942190:30` — every rule that added to the score, with its
+ * share — when the record lists more than the leading rule. A single rule adds
+ * nothing the `rule=` field does not already say.
+ */
+function rulesPart(r: Record<string, unknown>): string {
+  const list = Array.isArray(r.rules) ? r.rules as Array<Record<string, unknown>> : [];
+  if (list.length < 2) return "";
+  return ` rules=${list.map(x => `${x.id}:${x.score}`).join(",")}`;
+}
+
 /** ` id=<request id>` — the Support ID on the block page — or nothing. */
 function idPart(r: Record<string, unknown>): string {
   const id = r.request_id;
@@ -132,7 +143,7 @@ export function fmt(kind: LogKind, r: Record<string, unknown>): string {
     // a false positive be judged without reproducing the request. Credential
     // targets arrive already redacted by the data plane.
     case "waf":
-      return `${ts} [${r.action ?? "BLOCK"}] ${r.ip} ${r.method} ${withQuery(r)} rule=${r.rule ?? r.rule_id} score=${r.score} sev=${r.sev} attack="${r.attack}"${r.matched ? ` matched="${r.matched}"` : ""}${r.target ? ` target=${r.target}` : ""} proto=${r.protocol ?? "-"} site=${r.site}${idPart(r)}`;
+      return `${ts} [${r.action ?? "BLOCK"}] ${r.ip} ${r.method} ${withQuery(r)} rule=${r.rule ?? r.rule_id} score=${r.score} sev=${r.sev} attack="${r.attack}"${r.matched ? ` matched="${r.matched}"` : ""}${r.target ? ` target=${r.target}` : ""}${rulesPart(r)} proto=${r.protocol ?? "-"} site=${r.site}${idPart(r)}`;
     case "error":
       return `${ts} [${r.lvl ?? "ERROR"}] component=${r.subsystem ?? r.component} code=${r.code ?? "-"} msg="${r.msg}"`;
     case "audit":

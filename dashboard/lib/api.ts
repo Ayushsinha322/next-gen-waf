@@ -564,6 +564,24 @@ export interface WafEvent {
    *  makes a JA4-based block explainable. Absent on rows stored before it was
    *  recorded, and for plaintext requests. */
   ja4?: string;
+  /** Every rule that added to the verdict, biggest score first. Absent on rows
+   *  stored before 2026-09-25. */
+  rules?: EventRule[];
+  /** Request headers, redacted at the source. Blocks and detections only. */
+  headers?: Record<string, string>;
+  /** User-Agent of the client. */
+  ua?: string;
+}
+
+/** One rule's contribution to a stored event's verdict. */
+export interface EventRule {
+  id:      string;
+  msg:     string;
+  sev:     string;
+  score:   number;
+  /** The parameter it matched (`ARGS:q`) where certain, else the collection or "". */
+  target:  string;
+  matched: string;
 }
 
 /** One configuration rollback point (control-plane db.ConfigVersionSummary). */

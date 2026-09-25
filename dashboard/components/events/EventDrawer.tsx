@@ -9,16 +9,17 @@
  * competitor — F5, Imperva, Cloudflare, and free open-source BunkerWeb — opens
  * a blocked request and offers remediation in place. This closes that gap.
  *
- * Honest limits, stated in the UI rather than hidden: the ClickHouse event row
- * (crates/sentinel-storage/src/clickhouse.rs WafEventRow) persists the LEADING
- * rule only — not every rule that added to the score — and no request headers
- * or User-Agent. `matched` (the payload) and `target` (the variable) are stored,
- * but `target` is empty for rules that inspect several parts of the request.
- * This drawer must not imply evidence it lacks.
+ * What the stored event carries (crates/sentinel-storage/src/clickhouse.rs
+ * WafEventRow): the leading rule and its matched text, EVERY contributing rule
+ * with its own score (`rules`, since 2026-09-25), the parameter where the data
+ * plane could be certain (`target` — "" or a collection name when it could not),
+ * and the redacted request headers and User-Agent. Rows stored before those
+ * columns have none of them, and this drawer shows nothing rather than implying
+ * evidence it lacks. No response body is stored.
  */
 import { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { api, type WafEvent, type Site } from "@/lib/api";
+import { api, type WafEvent, type EventRule, type Site } from "@/lib/api";
 import { showToast } from "@/components/ui/Toast";
 
 function Row({ label, children, mono = false }: { label: string; children: React.ReactNode; mono?: boolean }) {
@@ -155,6 +156,7 @@ export default function EventDrawer({
               plaintext requests and rows older than the column have none, and a
               placeholder here would read as "the WAF failed to fingerprint". */}
           {event.ja4 && <Row label="JA4" mono>{event.ja4}</Row>}
+          {event.ua && <Row label="User-Agent" mono>{event.ua}</Row>}
           <Row label="Response" mono>{event.status || "—"}</Row>
           <Row label="Matched rule" mono>{event.rule || "—"}</Row>
           <Row label="Anomaly score" mono>{event.score}</Row>
@@ -206,6 +208,9 @@ export default function EventDrawer({
             </div>
           )}
 
+          {event.rules && event.rules.length > 0 && <MatchedRules rules={event.rules} score={event.score} />}
+          {event.headers && Object.keys(event.headers).length > 0 && <RequestHeaders headers={event.headers} />}
+
           <div style={{ marginTop: 20 }}>
             <div style={{ fontSize: "var(--fs-label)", color: "var(--text3)", textTransform: "uppercase", letterSpacing: "var(--tr-wide)", marginBottom: 10 }}>
               Remediation
@@ -244,5 +249,70 @@ export default function EventDrawer({
         </div>
       </motion.aside>
     </AnimatePresence>
+  );
+}
+
+const sectionLabel: React.CSSProperties = {
+  fontSize: "var(--fs-label)", color: "var(--text3)", textTransform: "uppercase",
+  letterSpacing: "var(--tr-wide)", marginBottom: 8,
+};
+
+/**
+ * Every rule that added to the score. The event used to name only the leading
+ * rule, so an anomaly score of 85 read as one rule's doing — and excluding that
+ * rule for a false positive left the others still over the threshold. The sum
+ * can fall short of the anomaly score: the ML engine and IP history contribute
+ * too, and they are not rules.
+ */
+function MatchedRules({ rules, score }: { rules: EventRule[]; score: number }) {
+  const sum = rules.reduce((a, r) => a + (r.score || 0), 0);
+  return (
+    <div style={{ marginTop: 16 }}>
+      <div style={sectionLabel}>
+        Rules that matched ({rules.length}) — {sum} of anomaly score {score}
+      </div>
+      <div style={{ border: "1px solid var(--border2)", borderRadius: "var(--r2)", overflow: "hidden" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "var(--fs-sm)" }}>
+          <thead>
+            <tr style={{ background: "var(--bg3)", color: "var(--text3)", textAlign: "left" }}>
+              <th style={{ padding: "6px 8px", fontWeight: 500 }}>Rule</th>
+              <th style={{ padding: "6px 8px", fontWeight: 500 }}>Detected</th>
+              <th style={{ padding: "6px 8px", fontWeight: 500 }}>Where</th>
+              <th style={{ padding: "6px 8px", fontWeight: 500, textAlign: "right" }}>Score</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rules.map((r, i) => (
+              <tr key={`${r.id}-${i}`} style={{ borderTop: "1px solid var(--border2)" }} title={r.matched ? `matched: ${r.matched}` : undefined}>
+                <td style={{ padding: "6px 8px", fontFamily: "var(--font-mono)", whiteSpace: "nowrap" }}>{r.id}</td>
+                <td style={{ padding: "6px 8px", color: "var(--text2)" }}>{r.msg || "—"}</td>
+                <td style={{ padding: "6px 8px", fontFamily: "var(--font-mono)", color: "var(--text2)", overflowWrap: "anywhere" }}>{r.target || "—"}</td>
+                <td style={{ padding: "6px 8px", fontFamily: "var(--font-mono)", textAlign: "right" }}>{r.score}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+/** The request's headers, redacted by the data plane before the row was
+ *  written (sensitive names, session cookies, Referer/Origin query strings). */
+function RequestHeaders({ headers }: { headers: Record<string, string> }) {
+  const entries = Object.entries(headers);
+  return (
+    <details style={{ marginTop: 16 }}>
+      <summary style={{ ...sectionLabel, cursor: "pointer", marginBottom: 0 }}>
+        Request headers ({entries.length}) — redacted at the source
+      </summary>
+      <div style={{ marginTop: 8, padding: "8px 10px", borderRadius: "var(--r2)", background: "var(--bg3)", border: "1px solid var(--border2)", fontFamily: "var(--font-mono)", fontSize: "var(--fs-sm)" }}>
+        {entries.map(([k, v]) => (
+          <div key={k} style={{ overflowWrap: "anywhere", padding: "2px 0" }}>
+            <span style={{ color: "var(--text3)" }}>{k}:</span> {v}
+          </div>
+        ))}
+      </div>
+    </details>
   );
 }
