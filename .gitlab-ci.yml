@@ -202,7 +202,12 @@ deploy-shell:
     # not skip when its parser is missing: a malformed ClickHouse drop-in stops
     # the server booting, which on a customer box is the security log going
     # dark.
-    - apk add --no-cache bash shellcheck git coreutils findutils grep sed docker-cli-compose libxml2-utils
+    # jq reads the rendered compose JSON in check-compose-parses-clean.sh's
+    # node-identity check. It was missing from 2026-09-22 (9a5dd91) until this
+    # line: the check printed "controlplane has no hostname" for a file that
+    # does set one, failed every pipeline on dev and main, and — because this
+    # job gates the stage — rust-test and rust-build were skipped for all of it.
+    - apk add --no-cache bash shellcheck git coreutils findutils grep sed docker-cli-compose libxml2-utils jq
   script:
     # 1. Every shell file must parse. Cheap, absolute, no exceptions.
     - |

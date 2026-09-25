@@ -486,6 +486,14 @@ check_rust_log_directives
 check_node_identity() {
   printf '\n%s==> node services carry a stable identity%s\n\n' "$B" "$R"
   local envf rendered
+  # Without jq the lookup below returns nothing, and "nothing" used to read as
+  # "has no hostname" — a false product defect that failed every pipeline for
+  # three days while the compose file was correct. A missing tool is a missing
+  # tool: say so, and still fail, because an unrun check is not a pass.
+  if ! command -v jq >/dev/null 2>&1; then
+    printf '  %s✗%s jq is not installed — cannot inspect node hostnames (install jq; the compose file was NOT checked)\n' "$RED" "$R"
+    fail=$((fail + 1)); return
+  fi
   envf=$(mktemp); synth_env "$envf" "${IVARS[@]}"
   rendered=$(cd deploy/docker && docker compose --env-file "$envf" -f compose.prod.yml config --format json 2>/dev/null) || rendered=""
   rm -f "$envf"
