@@ -408,7 +408,7 @@ export default function EventsPage() {
               <div className="tw" style={{ maxHeight: 520, overflow: "auto" }}>
                 {events.length === 0 ? <Empty text={loading ? "Searching…" : "No events match these filters in this window."} /> : (
                   <table>
-                    <thead><tr><th>Time ({tzLabel()})</th><th>IP</th><th>Site</th><th>Method</th><th>Proto</th><th>Path</th><th>Attack</th><th>Rule</th><th>Score</th><th>Sev</th><th>Action</th><th>Status</th><th aria-label="detail" /></tr></thead>
+                    <thead><tr><th>Time ({tzLabel()})</th><th>IP</th><th>Site</th><th>Proto</th><th>Request</th><th>Attack</th><th>Rule</th><th>Score</th><th>Sev</th><th>Action</th><th>Status</th><th aria-label="detail" /></tr></thead>
                     <tbody>{events.map((e, i) => (
                       <tr key={i}
                           onClick={() => setSelected(e)}
@@ -417,12 +417,14 @@ export default function EventsPage() {
                         <td className="td3" style={{ whiteSpace: "nowrap" }}>{fmtTime(e.ts)}</td>
                         <td className="td2">{e.ip}{e.country ? ` (${e.country})` : ""}</td>
                         <td className="td3">{e.site}</td>
-                        <td className="td3">{e.method}</td>
                         <td className="td3"><span className="bdg bcy">{e.protocol || "—"}</span></td>
-                        <td style={{ maxWidth: 240, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={e.query ? `${e.path}?${e.query}` : e.path}>{e.path}</td>
+                        {/* Method and path in one "Request" cell, the way F5 lists a
+                            request: the Attack and Score columns made the table
+                            wider than its panel, hiding Action and Status. */}
+                        <td style={{ maxWidth: 230, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={`${e.method} ${e.query ? `${e.path}?${e.query}` : e.path}`}><span className="td3">{e.method}</span> {e.path}</td>
                         {/* The attack type is what SafeLine and F5 lead with; it
                             was only a tooltip on the path here. */}
-                        <td className="td2" style={{ maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={e.attack}>{e.attack || "—"}</td>
+                        <td className="td2" style={{ maxWidth: 190, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={e.attack}>{e.attack || "—"}</td>
                         <td className="td3">{e.rule}</td>
                         <td className="td3" style={{ fontFamily: "var(--font-mono)" }} title={e.threshold ? `anomaly score ${e.score} against a threshold of ${e.threshold}` : "anomaly score"}>{e.score}</td>
                         <td><span className={`bdg ${e.severity === "CRITICAL" ? "br" : e.severity === "HIGH" ? "ba" : "bcy"}`}>{e.severity || "—"}</span></td>
