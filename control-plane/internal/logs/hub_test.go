@@ -9,6 +9,7 @@ import (
 // starting any file tailers (so the test touches no filesystem).
 func newTestHub() *Hub {
 	return &Hub{
+		subs:       make(map[chan Entry]struct{}),
 		blockedIPs: make(map[string]struct{}),
 		attackCats: make(map[string]int64),
 		byCountry:  make(map[string]int64),

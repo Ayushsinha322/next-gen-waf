@@ -323,23 +323,25 @@ func (h *Hub) discoverNodeLogs(dir string, kinds []string) {
 }
 
 // Subscribe registers a new SSE client and returns its delivery channel.
-// The last 200 buffered entries are delivered first.
+// The last 200 buffered entries are delivered first, oldest to newest, then
+// live entries.
+//
+// The backlog used to be replayed from a goroutine into a 64-slot channel with
+// non-blocking sends, so everything past the first ~64 entries was dropped —
+// and those were the NEWEST ones. Opening the Logs page showed the oldest lines
+// in the buffer and silently lost the latest: on .71 it showed 65 lines from a
+// rolling update and none of five attacks sent a minute later, which every
+// hub had counted. Now the channel is sized for the backlog plus live headroom
+// and filled under the lock, so no backlog entry can be dropped and none can be
+// overtaken by a live one.
 func (h *Hub) Subscribe() chan Entry {
-	ch := make(chan Entry, 64)
 	h.mu.Lock()
+	defer h.mu.Unlock()
+	ch := make(chan Entry, len(h.buf)+64)
+	for _, e := range h.buf {
+		ch <- e // cannot block: the channel has room for the whole backlog
+	}
 	h.subs[ch] = struct{}{}
-	buf := make([]Entry, len(h.buf))
-	copy(buf, h.buf)
-	h.mu.Unlock()
-
-	go func() {
-		for _, e := range buf {
-			select {
-			case ch <- e:
-			default:
-			}
-		}
-	}()
 	return ch
 }
 
