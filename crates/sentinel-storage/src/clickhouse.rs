@@ -124,6 +124,21 @@ pub struct WafEventRow {
     /// keeps rows written before the column existed deserializable.
     #[serde(default)]
     pub ja4: String,
+    /// Every rule that contributed to the verdict, biggest score first, as a
+    /// JSON array of `{id, msg, sev, score, target, matched}`. The row used to
+    /// carry only the leading rule, so a score of 85 built from several rules
+    /// read as one rule's doing. JSON text rather than nested columns so the
+    /// shape can grow without a schema change. `"[]"`/empty on older rows.
+    #[serde(default)]
+    pub rules: String,
+    /// The request's headers as a JSON object, redacted at the source
+    /// (sensitive header names, sensitive cookie values, Referer/Origin query).
+    #[serde(default)]
+    pub headers: String,
+    /// User-Agent, capped. Also inside `headers`, but its own column so Threat
+    /// Search can filter and facet on the client without parsing JSON.
+    #[serde(default)]
+    pub ua: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -139,7 +154,7 @@ pub struct WafEventRow {
 /// pins the two together.
 const WAF_EVENT_COLUMNS: &str = "ts, ip, country, site, tenant, method, path, query, \
     referer, matched, rule, attack, action, severity, score, status, protocol, \
-    request_id, target, mode, threshold, explanation, ja4";
+    request_id, target, mode, threshold, explanation, ja4, rules, headers, ua";
 
 pub struct ClickHouseClient {
     http: HyperClient,
@@ -474,7 +489,8 @@ impl ClickHouseClient {
               action LowCardinality(String), severity LowCardinality(String), \
               score UInt32, status UInt16, protocol LowCardinality(String), \
               request_id String, target String, mode LowCardinality(String), \
-              threshold UInt32, explanation String, ja4 LowCardinality(String)) \
+              threshold UInt32, explanation String, ja4 LowCardinality(String), \
+              rules String, headers String, ua String) \
              ENGINE = MergeTree() \
              PARTITION BY toYYYYMMDD(ts) \
              ORDER BY (site, ts) \
@@ -526,6 +542,12 @@ impl ClickHouseClient {
             // not be explained from the row. LowCardinality: a fleet sees a few
             // thousand distinct fingerprints, not one per request.
             "ja4 LowCardinality(String)",
+            // Every contributing rule, the redacted request headers and the
+            // User-Agent (2026-09-25): the event named only the leading rule and
+            // never the client, so a false positive could not be triaged from it.
+            "rules String",
+            "headers String",
+            "ua String",
         ] {
             self.exec(format!(
                 "ALTER TABLE {db}.waf_events ADD COLUMN IF NOT EXISTS {col} DEFAULT {default}",
@@ -924,6 +946,9 @@ mod tests {
             threshold: 5,
             explanation: "BLOCKED on 'TESTSITE.example': SQL injection in parameter 'id'.".into(),
             ja4: String::new(),
+            rules: String::new(),
+            headers: String::new(),
+            ua: String::new(),
         }
     }
 }
@@ -961,6 +986,9 @@ mod insert_column_pinning {
             threshold: 0,
             explanation: String::new(),
             ja4: String::new(),
+            rules: String::new(),
+            headers: String::new(),
+            ua: String::new(),
         };
         let json = serde_json::to_value(&row).expect("serialise");
         let mut fields: Vec<&str> = json

@@ -494,6 +494,9 @@ mod tests {
             threshold: 10,
             explanation: "blocked: anomaly score 15 >= threshold 10".into(),
             ja4: String::new(),
+            rules: String::new(),
+            headers: String::new(),
+            ua: String::new(),
         };
         let tr = crate::TrafficRow {
             ts: 1_785_305_612,

@@ -8425,6 +8425,296 @@ fn redacted_matched(m: &sentinel_core::context::RuleMatch) -> String {
     m.matched_value.clone()
 }
 
+/// How many matched rules one event lists. A request that trips more than this
+/// is an attack tool, and the top contributors already explain the verdict.
+const MAX_LOGGED_RULES: usize = 20;
+/// Cap on one rule's matched text inside the list (the top rule's own
+/// `matched` field keeps its existing cap).
+const MAX_RULE_MATCHED_CHARS: usize = 160;
+const MAX_LOGGED_HEADERS: usize = 40;
+const MAX_HEADER_VALUE_CHARS: usize = 256;
+
+fn cap_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max).collect();
+        out.push('…');
+        out
+    }
+}
+
+/// The matched text, redacted against the REFINED target too. The VM already
+/// redacts a value it recognises as a credential, and `redacted_matched`
+/// checks the rule's own target label; naming the parameter more precisely
+/// (see [`sentinel_rules::RequestValues::locate`]) must never be what exposes
+/// one, so a refined label that names a sensitive field redacts as well.
+fn matched_at(m: &sentinel_core::context::RuleMatch, located: &str) -> String {
+    let base = redacted_matched(m);
+    if base.is_empty() || base.starts_with("[redacted") {
+        return base;
+    }
+    let member = located.rsplit(':').next().unwrap_or("");
+    if located.contains(':') && sentinel_core::redact::is_sensitive_field_name(member) {
+        return format!("[redacted:{located}]");
+    }
+    base
+}
+
+/// Every rule that added to this request's verdict, biggest contribution first.
+///
+/// The event used to name only the LEADING rule, so a score of 85 read as one
+/// rule's doing when several rules had added to it — and excluding that one
+/// rule for a false positive left the rest still over the threshold. F5 lists
+/// every violation and BunkerWeb every ModSecurity match; this is that list,
+/// with each rule's own score and, where it can be certain, the parameter.
+fn matched_rules_detail(
+    ctx: &RequestContext,
+    values: &sentinel_rules::RequestValues,
+) -> Vec<serde_json::Value> {
+    let mut rules: Vec<&sentinel_core::context::RuleMatch> = ctx.rule_matches.iter().collect();
+    rules.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| b.severity.rank().cmp(&a.severity.rank()))
+    });
+    rules
+        .into_iter()
+        .take(MAX_LOGGED_RULES)
+        .map(|r| {
+            let target = values
+                .locate(&r.target, &r.matched_value)
+                .unwrap_or_else(|| r.target.clone());
+            serde_json::json!({
+                "id": r.rule_id,
+                "msg": r.message,
+                "sev": format!("{:?}", r.severity).to_uppercase(),
+                "score": r.score,
+                "target": target,
+                "matched": cap_chars(&matched_at(r, &target), MAX_RULE_MATCHED_CHARS),
+            })
+        })
+        .collect()
+}
+
+/// The top rule's target, refined to the parameter where that is certain.
+fn located_target(
+    top: Option<&sentinel_core::context::RuleMatch>,
+    values: &sentinel_rules::RequestValues,
+) -> String {
+    top.map(|r| {
+        values
+            .locate(&r.target, &r.matched_value)
+            .unwrap_or_else(|| r.target.clone())
+    })
+    .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod event_detail_tests {
+    use super::*;
+    use sentinel_core::context::{Phase, RuleMatch, Severity};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn rm(id: &str, score: u32, target: &str, matched: &str) -> RuleMatch {
+        RuleMatch {
+            rule_id: id.into(),
+            message: format!("rule {id}"),
+            severity: Severity::Critical,
+            score,
+            target: target.into(),
+            phase: Phase::RequestBody,
+            matched_value: matched.into(),
+        }
+    }
+
+    fn ctx(uri: &str) -> RequestContext {
+        let mut c = RequestContext::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+        c.uri = uri.parse().unwrap();
+        c
+    }
+
+    #[test]
+    fn lists_every_contributing_rule_biggest_first_with_its_parameter() {
+        // The 2026-09-24 event: score 85, one rule named, target empty.
+        let mut c = ctx("/rest/products/search?q=%27))%20UNION%20SELECT%20id%20FROM%20Users--");
+        c.rule_matches = vec![
+            rm("942100", 5, "ARGS", "')) UNION SELECT id FROM Users--"),
+            rm("9900100", 50, "", "')) UNION SELECT id FROM Users--"),
+            rm("942190", 30, "", "UNION SELECT"),
+        ];
+        let v = sentinel_rules::RequestValues::from_ctx(&c);
+        let rules = matched_rules_detail(&c, &v);
+        let ids: Vec<&str> = rules.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert_eq!(
+            ids,
+            ["9900100", "942190", "942100"],
+            "sorted by score contribution"
+        );
+        assert_eq!(rules[0]["score"], 50);
+        assert_eq!(
+            rules[0]["target"], "ARGS:q",
+            "multi-target rule located to the parameter"
+        );
+        assert_eq!(
+            rules[2]["target"], "ARGS:q",
+            "collection label refined to the member"
+        );
+        assert_eq!(located_target(c.primary_rule_match(), &v), "ARGS:q");
+    }
+
+    #[test]
+    fn caps_the_rule_list() {
+        let mut c = ctx("/x?a=1");
+        c.rule_matches = (0..45)
+            .map(|i| rm(&format!("9{i:05}"), 1, "", ""))
+            .collect();
+        let v = sentinel_rules::RequestValues::from_ctx(&c);
+        assert_eq!(matched_rules_detail(&c, &v).len(), MAX_LOGGED_RULES);
+    }
+
+    #[test]
+    fn a_refined_target_that_names_a_credential_redacts_the_match() {
+        // The VM redacts values it recognises; naming the parameter must never be
+        // what exposes one. `password` located from a multi-target rule:
+        let mut c = ctx("/login");
+        c.request_headers.insert(
+            "content-type",
+            "application/x-www-form-urlencoded".parse().unwrap(),
+        );
+        c.request_body = Some(Bytes::from_static(b"user=bob&password=hunter2%27--"));
+        c.rule_matches = vec![rm("942100", 5, "", "hunter2'--")];
+        let v = sentinel_rules::RequestValues::from_ctx(&c);
+        let rules = matched_rules_detail(&c, &v);
+        assert_eq!(rules[0]["target"], "ARGS:password");
+        assert!(
+            !rules[0]["matched"].as_str().unwrap().contains("hunter2"),
+            "{}",
+            rules[0]["matched"]
+        );
+    }
+
+    #[test]
+    fn headers_are_redacted_by_name_and_cookies_per_cookie() {
+        let mut h = http::HeaderMap::new();
+        h.insert("user-agent", "Mozilla/5.0 test".parse().unwrap());
+        h.insert("authorization", "Bearer eyJsecret".parse().unwrap());
+        h.insert("x-api-key", "k-123".parse().unwrap());
+        h.insert("x-csrf-token", "abc".parse().unwrap());
+        h.insert(
+            "cookie",
+            "lang=en; sid=s3cr3t; session_id=zzz".parse().unwrap(),
+        );
+        h.insert(
+            "referer",
+            "https://site/reset?token=t0k3n&page=2".parse().unwrap(),
+        );
+        h.append("x-forwarded-for", "10.0.0.1".parse().unwrap());
+        h.append("x-forwarded-for", "10.0.0.2".parse().unwrap());
+        let m = redacted_request_headers(&h);
+        let get = |k: &str| {
+            m.get(k)
+                .and_then(|v| v.as_str())
+                .unwrap_or("<absent>")
+                .to_string()
+        };
+        assert_eq!(get("user-agent"), "Mozilla/5.0 test");
+        for k in ["authorization", "x-api-key", "x-csrf-token"] {
+            assert_eq!(
+                get(k),
+                sentinel_core::redact::REDACTED,
+                "{k} must be redacted"
+            );
+        }
+        let cookie = get("cookie");
+        assert!(
+            cookie.contains("lang=en"),
+            "non-sensitive cookie kept: {cookie}"
+        );
+        assert!(
+            !cookie.contains("s3cr3t") && !cookie.contains("zzz"),
+            "session cookies redacted: {cookie}"
+        );
+        assert!(
+            !get("referer").contains("t0k3n"),
+            "referer query redacted: {}",
+            get("referer")
+        );
+        assert_eq!(
+            get("x-forwarded-for"),
+            "10.0.0.1, 10.0.0.2",
+            "repeated header keeps every value"
+        );
+    }
+
+    #[test]
+    fn header_count_and_length_are_capped() {
+        let mut h = http::HeaderMap::new();
+        for i in 0..60 {
+            h.insert(
+                http::HeaderName::from_bytes(format!("x-h{i}").as_bytes()).unwrap(),
+                "v".repeat(1000).parse().unwrap(),
+            );
+        }
+        let m = redacted_request_headers(&h);
+        assert_eq!(m.len(), MAX_LOGGED_HEADERS);
+        assert!(m
+            .values()
+            .all(|v| v.as_str().unwrap().chars().count() <= MAX_HEADER_VALUE_CHARS + 1));
+    }
+}
+
+/// Request headers for a blocked or detected event, redacted.
+///
+/// A header whose NAME is sensitive (Authorization, X-Api-Key, X-CSRF-Token, …
+/// — the same rule the query-string redaction uses) is replaced whole; the
+/// Cookie header keeps each cookie's name and redacts only sensitive ones, the
+/// way the query string does; Referer and Origin get the URL query redaction.
+/// Capped in count and length: this lands in ClickHouse for 90 days and in the
+/// SIEM, and a hostile client picks its own headers.
+fn redacted_request_headers(h: &http::HeaderMap) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    for (name, value) in h.iter() {
+        let n = name.as_str();
+        let v = value.to_str().unwrap_or("[non-text]");
+        let shown = if n == "cookie" {
+            v.split(';')
+                .map(|c| {
+                    let c = c.trim();
+                    match c.split_once('=') {
+                        Some((k, _)) if sentinel_core::redact::is_sensitive_field_name(k) => {
+                            format!("{k}={}", sentinel_core::redact::REDACTED)
+                        }
+                        _ => c.to_string(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        } else if n == "referer" || n == "origin" {
+            sentinel_core::redact::redact_url_query(v)
+        } else if sentinel_core::redact::is_sensitive_field_name(n) {
+            sentinel_core::redact::REDACTED.to_string()
+        } else {
+            v.to_string()
+        };
+        let shown = cap_chars(&shown, MAX_HEADER_VALUE_CHARS);
+        match out.get_mut(n) {
+            // A repeated header: keep every value, as the wire had them.
+            Some(serde_json::Value::String(prev)) => {
+                prev.push_str(", ");
+                prev.push_str(&shown);
+            }
+            _ => {
+                if out.len() >= MAX_LOGGED_HEADERS {
+                    continue;
+                }
+                out.insert(n.to_string(), serde_json::Value::String(shown));
+            }
+        }
+    }
+    out
+}
+
 fn error_response(status: StatusCode, message: &str) -> Response<BoxBody> {
     Response::builder()
         .status(status)
@@ -8786,6 +9076,9 @@ fn record_event(ctx: &RequestContext) {
             (r.to_string(), a.to_string())
         }
     };
+    // Parameter-level target and the full rule list, as on the waf.log line.
+    let values = sentinel_rules::RequestValues::for_matches(ctx);
+    let ev_target = located_target(top, &values);
     // Cloned before the struct takes ownership of ev_rule/ev_attack.
     let ev_rule_for_prose = ev_rule.clone();
     let ev_attack_for_prose = ev_attack.clone();
@@ -8807,7 +9100,7 @@ fn record_event(ctx: &RequestContext) {
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or_default(),
         ),
-        matched: top.map(redacted_matched).unwrap_or_default(),
+        matched: top.map(|r| matched_at(r, &ev_target)).unwrap_or_default(),
         rule: ev_rule,
         attack: ev_attack,
         action: action.to_string(),
@@ -8822,7 +9115,21 @@ fn record_event(ctx: &RequestContext) {
         // the request that produced it. Built from the same helper as waf.log —
         // two renderings of one verdict would eventually disagree.
         request_id: ctx.request_id.to_string(),
-        target: top.map(|r| r.target.clone()).unwrap_or_default(),
+        target: ev_target,
+        // Every contributing rule, and the request's headers and User-Agent: the
+        // three things the event could not answer after the fact — which rules
+        // made up the score, which parameter, and what client sent it. JSON text
+        // columns, so the schema does not have to change as the shape grows.
+        rules: serde_json::Value::Array(matched_rules_detail(ctx, &values)).to_string(),
+        headers: serde_json::Value::Object(redacted_request_headers(&ctx.request_headers))
+            .to_string(),
+        ua: cap_chars(
+            ctx.request_headers
+                .get(http::header::USER_AGENT)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default(),
+            MAX_HEADER_VALUE_CHARS,
+        ),
         // The fingerprint that fed bot scoring and the JA4 blocklist for THIS
         // request. It was never recorded, so "why was this client scored as
         // sqlmap" was unanswerable from the row.
@@ -9714,7 +10021,21 @@ fn ndjson_log(ctx: &RequestContext) {
         // every RuleMatch and previously dropped on the floor — it is the single
         // most useful field for triaging a false positive, because it names the
         // parameter to exclude instead of leaving the operator to guess.
-        let target = top.map(|r| r.target.as_str()).unwrap_or("");
+        //
+        // Refined to the parameter itself (`ARGS:q`, not `ARGS` or nothing) where
+        // the matched text sits in exactly one place — see RequestValues::locate.
+        let values = sentinel_rules::RequestValues::for_matches(ctx);
+        let target = located_target(top, &values);
+        let rules = matched_rules_detail(ctx, &values);
+        // Headers only on what an operator investigates (a block or a learning
+        // would-block). A pass that merely matched a low-score rule — every
+        // request to a site reached by IP matches 920350 — must not carry ~1 KB
+        // of headers into waf.log.
+        let headers = if action == "BLOCK" || action == "DETECT" {
+            serde_json::Value::Object(redacted_request_headers(&ctx.request_headers))
+        } else {
+            serde_json::Value::Null
+        };
         let mode = match ctx.enforcement_mode {
             Some(WafMode::Blocking) => "blocking",
             Some(WafMode::Learning) => "learning",
@@ -9732,7 +10053,7 @@ fn ndjson_log(ctx: &RequestContext) {
         // The text the top rule actually matched — the field that lets an
         // operator judge a false positive from the log line alone. Redacted
         // when it came from a credential-bearing target.
-        let matched = top.map(redacted_matched).unwrap_or_default();
+        let matched = top.map(|r| matched_at(r, &target)).unwrap_or_default();
 
         let waf = serde_json::json!({
             "ts":     ts,
@@ -9775,6 +10096,8 @@ fn ndjson_log(ctx: &RequestContext) {
             "threat_intel_hit": ctx.threat_intel_hit,
             "engine_scores": ctx.engine_scores,
             "ml_scores": ctx.ml_scores,
+            "rules": rules,
+            "headers": headers,
         });
         enqueue_log("waf.log", waf.to_string());
     }
@@ -10649,6 +10972,9 @@ mod history_shed_tests {
                 threshold: 0,
                 explanation: String::new(),
                 ja4: String::new(),
+                rules: String::new(),
+                headers: String::new(),
+                ua: String::new(),
             };
             buf.resize_with(EVENT_BUFFER_CAP - 1, filler);
         }

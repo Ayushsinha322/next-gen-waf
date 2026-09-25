@@ -41,6 +41,7 @@ use dsl::{ParseError, RuleFile};
 // ---------------------------------------------------------------------------
 
 pub use compiler::emitter::{Instruction, RuleMeta, TargetSpec};
+pub use compiler::vm::RequestValues;
 pub use crs_compat::{import_secrule_conf, import_secrule_conf_dir};
 pub use dsl::{ast, parse_rule_file};
 

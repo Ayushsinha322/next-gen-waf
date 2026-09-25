@@ -246,13 +246,15 @@ fn cef_line(r: &WafEventRow) -> String {
     // act carries BLOCK vs DETECT, which is the field that tells a SOC whether
     // the request was actually stopped — the alert path could not express it
     // because it only ever sent blocks.
-    let pairs: [(&str, &str); 6] = [
+    // requestClientApplication is CEF's standard User-Agent key.
+    let pairs: [(&str, &str); 7] = [
         ("src", &r.ip),
         ("act", &r.action),
         ("requestMethod", &r.method),
         ("request", &r.path),
         ("externalId", &r.request_id),
         ("dhost", &r.site),
+        ("requestClientApplication", &r.ua),
     ];
     for (k, v) in pairs {
         if !v.is_empty() {
@@ -313,8 +315,17 @@ fn json_line(r: &WafEventRow) -> String {
         "request_id": r.request_id,
         "explanation": r.explanation,
         "ja4": r.ja4,
+        "ua": r.ua,
+        // Structured, not escaped JSON text: a SIEM rule should be able to read
+        // rules[].id and headers.host directly. Empty on older rows.
+        "rules": json_or(&r.rules, serde_json::Value::Array(Vec::new())),
+        "headers": json_or(&r.headers, serde_json::Value::Object(serde_json::Map::new())),
     })
     .to_string()
+}
+
+fn json_or(text: &str, empty: serde_json::Value) -> serde_json::Value {
+    serde_json::from_str(text).unwrap_or(empty)
 }
 
 /// Start the forwarder. Returns the configuration in use so the caller can pass
@@ -509,6 +520,9 @@ mod tests {
             threshold: 10,
             explanation: "would have blocked".into(),
             ja4: "t13d1516h2_8daaf6152771_02713d6af862".into(),
+            rules: String::new(),
+            headers: String::new(),
+            ua: String::new(),
         }
     }
 
