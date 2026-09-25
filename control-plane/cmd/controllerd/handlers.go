@@ -2745,12 +2745,31 @@ func handleLogsStream(c *gin.Context, jwtSvc *auth.JWTService, enf *rbac.Enforce
 			flusher.Flush()
 		}
 	}
+	// SSE comment lines (": …") are ignored by EventSource but reach the wire.
+	comment := func(text string) {
+		fmt.Fprintf(c.Writer, ": %s\n\n", text)
+		if canFlush {
+			flusher.Flush()
+		}
+	}
+
+	// Open the stream NOW. Nothing used to be flushed until the first entry, so
+	// on an idle stream — every control-plane restart (empty backlog) on a quiet
+	// site — the browser's EventSource never fired onopen and the Logs page sat
+	// on "Reconnecting" while the stream was healthy. The periodic comment keeps
+	// an idle connection from being reaped by a proxy between here and the
+	// browser, which would otherwise turn quiet periods into reconnect churn.
+	comment("connected")
+	keepAlive := time.NewTicker(20 * time.Second)
+	defer keepAlive.Stop()
 
 	notify := c.Request.Context().Done()
 	for {
 		select {
 		case <-notify:
 			return
+		case <-keepAlive.C:
+			comment("keep-alive")
 		case entry, ok := <-ch:
 			if !ok {
 				return
