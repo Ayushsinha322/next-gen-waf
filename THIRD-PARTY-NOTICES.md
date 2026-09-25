@@ -9,8 +9,8 @@ re-runs during packaging. Run it after changing a dependency. Do not edit by han
 It records what each component **declares** in its own manifest. It is an
 attribution inventory, not a legal review.
 
-**420 redistributed components** across Rust, Go, npm and container images.
-A further 104 Rust crates and 420 npm packages are
+**427 redistributed components** across Rust, Go, npm and container images.
+A further 104 Rust crates and 399 npm packages are
 build- or development-only: they are compiled or installed here but never
 shipped, and are listed separately at the end so the two are never confused.
 
@@ -436,14 +436,16 @@ In the `controllerd` module graph. Go modules carry no licence field in the grap
 
 ## npm packages (dashboard, production)
 Production dependencies only — `npm ls --omit=dev`. Next.js bundles a subset of these into the shipped client.
-**69 components.**
+**76 components.**
 
 ### MIT — 48 component(s)
-- @babel/runtime 7.22.5
-- @babel/runtime 7.29.2
-- @next/env 14.2.29
-- @next/swc-linux-x64-gnu 14.2.29
-- @next/swc-linux-x64-musl 14.2.29
+- @babel/runtime 7.27.0
+- @babel/runtime 7.29.7
+- @emnapi/runtime 1.11.3
+- @img/colour 1.1.0
+- @next/env 15.5.26
+- @next/swc-linux-x64-gnu 15.5.26
+- @next/swc-linux-x64-musl 15.5.26
 - @tanstack/query-core 5.100.10
 - @tanstack/react-query 5.100.10
 - @types/d3-array 3.2.2
@@ -455,7 +457,6 @@ Production dependencies only — `npm ls --omit=dev`. Next.js bundles a subset o
 - @types/d3-shape 3.1.8
 - @types/d3-time 3.0.4
 - @types/d3-timer 3.0.2
-- busboy 1.6.0
 - client-only 0.0.1
 - clsx 2.1.1
 - csstype 3.2.3
@@ -463,32 +464,31 @@ Production dependencies only — `npm ls --omit=dev`. Next.js bundles a subset o
 - decimal.js-light 2.5.1
 - dom-helpers 5.2.1
 - eventemitter3 4.0.7
-- fast-equals 5.4.0
+- fast-equals 5.4.3
 - framer-motion 12.40.0
+- js-tokens 4.0.0
 - lodash 4.18.1
 - loose-envify 1.4.0
 - motion-dom 12.40.0
 - motion-utils 12.39.0
-- nanoid 3.3.12
-- next 14.2.29
+- nanoid 3.3.19
+- next 15.5.26
 - object-assign 4.1.1
-- postcss 8.4.31
-- postcss 8.5.14
+- postcss 8.5.28
 - prop-types 15.8.1
-- react 18.3.1
-- react-dom 18.3.1
+- react 19.3.0
+- react-dom 19.3.0
 - react-is 16.13.1
-- react-is 18.2.0
 - react-is 18.3.1
+- react-is 19.2.0-canary-0bdb9206-20250818
 - react-smooth 4.0.4
 - recharts 2.15.4
 - recharts-scale 0.4.5
-- streamsearch 1.1.0
-- styled-jsx 5.1.1
+- styled-jsx 5.1.6
 - tailwind-merge 2.6.1
 - tiny-invariant 1.3.3
 
-### ISC — 13 component(s)
+### ISC — 14 component(s)
 - d3-array 3.2.4
 - d3-color 3.1.0
 - d3-format 3.1.2
@@ -499,21 +499,32 @@ Production dependencies only — `npm ls --omit=dev`. Next.js bundles a subset o
 - d3-time 3.1.0
 - d3-time-format 4.1.0
 - d3-timer 3.0.1
-- graceful-fs 4.2.11
 - internmap 2.0.3
 - picocolors 1.1.1
+- semver 6.3.1
+- semver 7.8.5
+
+### Apache-2.0 — 5 component(s)
+- @img/sharp-linux-x64 0.35.4
+- @img/sharp-linuxmusl-x64 0.35.4
+- @swc/helpers 0.5.15
+- detect-libc 2.1.2
+- sharp 0.35.4
 
 ### BSD-3-Clause — 3 component(s)
 - d3-ease 3.0.1
 - react-transition-group 4.4.5
 - source-map-js 1.2.1
 
-### Apache-2.0 — 2 component(s)
-- @swc/counter 0.1.3
-- @swc/helpers 0.5.5
+### LGPL-3.0-or-later — 2 component(s)
+- @img/sharp-libvips-linux-x64 1.3.3
+- @img/sharp-libvips-linuxmusl-x64 1.3.3
 
 ### 0BSD — 1 component(s)
 - tslib 2.8.1
+
+### Apache-2.0 AND LGPL-3.0-or-later AND MIT — 1 component(s)
+- @img/sharp-wasm32 0.35.4
 
 ### CC-BY-4.0 — 1 component(s)
 - caniuse-lite 1.0.30001792
@@ -700,13 +711,13 @@ Present in this working tree, **not redistributed**: test harnesses, build scrip
 
 ## npm (devDependencies)
 
-**420 components.**
+**399 components.**
 
-### MIT — 354 component(s)
+### MIT — 344 component(s)
 - @alloc/quick-lru 5.2.0
-- @edge-runtime/cookies 5.0.0
-- @edge-runtime/ponyfill 3.0.0
-- @edge-runtime/primitives 5.0.0
+- @edge-runtime/cookies 6.0.0
+- @edge-runtime/ponyfill 4.0.0
+- @edge-runtime/primitives 6.0.0
 - @esbuild/linux-x64 0.21.5
 - @eslint-community/eslint-utils 4.9.1
 - @eslint-community/regexpp 4.12.2
@@ -718,12 +729,11 @@ Present in this working tree, **not redistributed**: test harnesses, build scrip
 - @jridgewell/trace-mapping 0.3.31
 - @my-scope/package-a 0.0.0
 - @my-scope/package-b 0.0.0
-- @next/eslint-plugin-next 14.2.29
+- @next/eslint-plugin-next 15.5.26
 - @nodelib/fs.scandir 2.1.5
 - @nodelib/fs.stat 2.0.5
 - @nodelib/fs.walk 1.2.8
 - @nolyfill/is-core-module 1.0.39
-- @pkgjs/parseargs 0.11.0
 - @rollup/rollup-linux-x64-gnu 4.62.2
 - @rollup/rollup-linux-x64-musl 4.62.2
 - @rtsao/scc 1.1.0
@@ -731,10 +741,9 @@ Present in this working tree, **not redistributed**: test harnesses, build scrip
 - @types/estree 1.0.9
 - @types/json5 0.0.29
 - @types/node 20.19.41
-- @types/prop-types 15.7.15
 - @types/qrcode 1.5.6
-- @types/react 18.3.28
-- @types/react-dom 18.3.7
+- @types/react 19.3.0
+- @types/react-dom 19.3.0
 - @typescript-eslint/eslint-plugin 8.59.3
 - @typescript-eslint/parser 8.59.3
 - @typescript-eslint/project-service 8.59.3
@@ -758,9 +767,7 @@ Present in this working tree, **not redistributed**: test harnesses, build scrip
 - acorn-jsx 5.3.2
 - ajv 6.15.0
 - ansi-regex 5.0.1
-- ansi-regex 6.2.2
 - ansi-styles 4.3.0
-- ansi-styles 6.2.3
 - any-promise 1.3.0
 - arg 5.0.2
 - array-buffer-byte-length 1.0.2
@@ -780,7 +787,6 @@ Present in this working tree, **not redistributed**: test harnesses, build scrip
 - balanced-match 4.0.4
 - binary-extensions 2.3.0
 - brace-expansion 1.1.14
-- brace-expansion 2.1.0
 - brace-expansion 5.0.6
 - braces 3.0.3
 - browserslist 4.28.2
@@ -814,7 +820,6 @@ Present in this working tree, **not redistributed**: test harnesses, build scrip
 - dijkstrajs 1.0.3
 - dlv 1.1.3
 - dunder-proto 1.0.1
-- eastasianwidth 0.2.0
 - emoji-regex 8.0.0
 - emoji-regex 9.2.2
 - es-abstract 1.24.2
@@ -830,15 +835,16 @@ Present in this working tree, **not redistributed**: test harnesses, build scrip
 - escalade 3.2.0
 - escape-string-regexp 4.0.0
 - eslint 8.57.1
-- eslint-config-next 14.2.29
+- eslint-config-next 15.5.26
 - eslint-import-resolver-node 0.3.10
 - eslint-module-utils 2.12.1
 - eslint-plugin-import 2.32.0
 - eslint-plugin-jsx-a11y 6.10.2
 - eslint-plugin-react 7.37.5
-- eslint-plugin-react-hooks 5.0.0-canary-7118f5dd7-20230705
+- eslint-plugin-react-hooks 5.2.0
 - estree-walker 3.0.3
 - fast-deep-equal 3.1.3
+- fast-glob 3.3.1
 - fast-glob 3.3.3
 - fast-json-stable-stringify 2.1.0
 - fast-levenshtein 2.0.6
@@ -906,7 +912,6 @@ Present in this working tree, **not redistributed**: test harnesses, build scrip
 - isarray 2.0.5
 - iterator.prototype 1.1.5
 - jiti 1.21.7
-- js-tokens 4.0.0
 - js-yaml 4.1.1
 - json-buffer 3.0.1
 - json-schema-traverse 0.4.1
@@ -990,7 +995,7 @@ Present in this working tree, **not redistributed**: test harnesses, build scrip
 - safe-array-concat 1.1.4
 - safe-push-apply 1.0.0
 - safe-regex-test 1.1.0
-- scheduler 0.23.2
+- scheduler 0.28.0
 - server-only 0.0.1
 - set-function-length 1.2.2
 - set-function-name 2.0.2
@@ -1006,7 +1011,6 @@ Present in this working tree, **not redistributed**: test harnesses, build scrip
 - std-env 3.10.0
 - stop-iteration-iterator 1.1.0
 - string-width 4.2.3
-- string-width 5.1.2
 - string.prototype.includes 2.0.1
 - string.prototype.matchall 4.0.12
 - string.prototype.repeat 1.0.0
@@ -1014,7 +1018,6 @@ Present in this working tree, **not redistributed**: test harnesses, build scrip
 - string.prototype.trimend 1.0.9
 - string.prototype.trimstart 1.0.8
 - strip-ansi 6.0.1
-- strip-ansi 7.2.0
 - strip-bom 3.0.0
 - strip-json-comments 3.1.1
 - sucrase 3.35.1
@@ -1053,13 +1056,10 @@ Present in this working tree, **not redistributed**: test harnesses, build scrip
 - why-is-node-running 2.3.0
 - word-wrap 1.2.5
 - wrap-ansi 6.2.0
-- wrap-ansi 7.0.0
-- wrap-ansi 8.1.0
 - yargs 15.4.1
 - yocto-queue 0.1.0
 
-### ISC — 35 component(s)
-- @isaacs/cliui 8.0.2
+### ISC — 27 component(s)
 - @ungap/structured-clone 1.3.1
 - anymatch 3.1.3
 - cliui 6.0.0
@@ -1067,28 +1067,21 @@ Present in this working tree, **not redistributed**: test harnesses, build scrip
 - eslint-import-resolver-typescript 3.10.1
 - fastq 1.20.1
 - flatted 3.4.2
-- foreground-child 3.3.1
 - fs.realpath 1.0.0
 - get-caller-file 2.0.5
-- glob 10.3.10
 - glob 7.2.3
 - glob-parent 5.1.2
 - glob-parent 6.0.2
 - inflight 1.0.6
 - inherits 2.0.4
 - isexe 2.0.0
-- lru-cache 10.4.3
 - minimatch 3.1.5
-- minimatch 9.0.9
 - mylib 0.0.0
 - once 1.4.0
 - require-main-filename 2.0.0
 - rimraf 3.0.2
-- semver 6.3.1
-- semver 7.8.0
 - set-blocking 2.0.0
 - siginfo 2.0.0
-- signal-exit 4.1.0
 - which 2.0.2
 - which-module 2.0.1
 - wrappy 1.0.2
@@ -1119,28 +1112,23 @@ Present in this working tree, **not redistributed**: test harnesses, build scrip
 - esutils 2.0.3
 - uri-js 4.4.1
 
-### BlueOak-1.0.0 — 4 component(s)
-- jackspeak 2.3.6
-- minimatch 10.2.5
-- minipass 7.1.3
-- path-scurry 1.11.1
-
 ### BSD-3-Clause — 2 component(s)
 - @humanwhocodes/object-schema 2.0.3
 - esquery 1.7.0
 
+### MPL-2.0 — 2 component(s)
+- @vercel/og 0.7.2
+- axe-core 4.11.4
+
 ### (MIT OR CC0-1.0) — 1 component(s)
 - type-fest 0.20.2
+
+### BlueOak-1.0.0 — 1 component(s)
+- minimatch 10.2.5
 
 ### CC0-1.0 — 1 component(s)
 - language-subtag-registry 0.3.23
 
-### MPL-2.0 — 1 component(s)
-- axe-core 4.11.4
-
 ### Python-2.0 — 1 component(s)
 - argparse 2.0.1
-
-### UNDECLARED — 1 component(s)
-- @vercel/og 0.6.3
 
