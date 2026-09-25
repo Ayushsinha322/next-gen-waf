@@ -1487,7 +1487,8 @@ export const api = {
       apiFetch<{ buckets: TimelineBucket[]; clickhouse: boolean }>(
         `/events/timeline?${eventQS({ from, to })}&bucket=${bucket}`),
     facets: (column: string, from?: number, to?: number, limit = 10) =>
-      apiFetch<{ facets: { key: string; count: number }[]; column: string; clickhouse: boolean }>(
+      // `label` names a rule facet's key (its most recent attack message).
+      apiFetch<{ facets: { key: string; count: number; label?: string }[]; column: string; clickhouse: boolean }>(
         `/events/facets?column=${encodeURIComponent(column)}&${eventQS({ from, to })}&limit=${limit}`),
     /** Top source IPs by WAF-event volume, each with blocked count + country.
      *  ClickHouse-backed; returns `clickhouse:false` + empty list when the event

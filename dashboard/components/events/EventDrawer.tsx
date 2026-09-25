@@ -9,12 +9,12 @@
  * competitor — F5, Imperva, Cloudflare, and free open-source BunkerWeb — opens
  * a blocked request and offers remediation in place. This closes that gap.
  *
- * Honest limit, stated in the UI rather than hidden: the ClickHouse event row
- * (crates/sentinel-storage/src/clickhouse.rs WafEventRow) persists the top
- * matched rule and its message, but NOT the matched variable or the matched
- * value. So we can show which rule fired and what class of attack it judged,
- * but not "ARGS:id matched ' OR 1=1". That needs a schema column plus proxy
- * plumbing; until then this drawer must not imply it has evidence it lacks.
+ * Honest limits, stated in the UI rather than hidden: the ClickHouse event row
+ * (crates/sentinel-storage/src/clickhouse.rs WafEventRow) persists the LEADING
+ * rule only — not every rule that added to the score — and no request headers
+ * or User-Agent. `matched` (the payload) and `target` (the variable) are stored,
+ * but `target` is empty for rules that inspect several parts of the request.
+ * This drawer must not imply evidence it lacks.
  */
 import { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
@@ -140,7 +140,12 @@ export default function EventDrawer({
               )}
             </div>
           )}
-          <Row label="Time" mono>{new Date(event.ts * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z")}</Row>
+          {/* Local time first — it is what the customer quoting the Support ID
+              saw — and UTC beside it, which is what the Logs page and exports use. */}
+          <Row label="Time" mono>
+            {new Date(event.ts * 1000).toLocaleString()}
+            <span style={{ color: "var(--text3)" }}> · {new Date(event.ts * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, " UTC")}</span>
+          </Row>
           <Row label="Source IP" mono>{event.ip}{event.country ? ` · ${event.country}` : ""}</Row>
           <Row label="Site" mono>{event.site}</Row>
           <Row label="Request" mono>{event.method} {event.path}{event.query ? `?${event.query}` : ""}</Row>

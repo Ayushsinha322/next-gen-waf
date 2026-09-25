@@ -24,6 +24,17 @@ const RANGES: { label: string; secs: number }[] = [
 
 function fmtTime(ts: number) { return new Date(ts * 1000).toLocaleString(); }
 
+/** The browser's zone as a short label ("GMT+5:30", "IST"), for the Time
+ *  column: this page shows local time while the Logs page and exports are UTC,
+ *  and an unlabelled clock made the same request look 5½ hours apart. */
+function tzLabel(): string {
+  try {
+    const part = new Intl.DateTimeFormat([], { timeZoneName: "short" })
+      .formatToParts(new Date()).find(p => p.type === "timeZoneName");
+    return part?.value ?? "local";
+  } catch { return "local"; }
+}
+
 /** Format a unix timestamp for a <input type="datetime-local">, which wants
  *  local wall-clock with no zone suffix. */
 function toLocalInput(ts: number): string {
@@ -42,7 +53,8 @@ export default function EventsPage() {
   const [status, setStatus] = useState<{ configured: boolean; reachable: boolean; events?: number; error?: string } | null>(null);
   const [events, setEvents] = useState<WafEvent[]>([]);
   const [timeline, setTimeline] = useState<TimelineBucket[]>([]);
-  const [ruleFacets, setRuleFacets] = useState<{ key: string; count: number }[]>([]);
+  const [ruleFacets, setRuleFacets] = useState<{ key: string; count: number; label?: string }[]>([]);
+  const [attackFacets, setAttackFacets] = useState<{ key: string; count: number }[]>([]);
   const [ipFacets, setIpFacets] = useState<{ key: string; count: number }[]>([]);
   const [protocolFacets, setProtocolFacets] = useState<{ key: string; count: number }[]>([]);
   const [loading, setLoading] = useState(true);
@@ -123,6 +135,12 @@ export default function EventsPage() {
       setRuleFacets(rf.facets ?? []);
       setIpFacets(ipf.facets ?? []);
       setProtocolFacets(pf.facets ?? []);
+      // Fetched on its own and allowed to fail: a control plane older than the
+      // `attack` facet refuses the column, and that must cost this one card, not
+      // the whole search (it would during a rolling upgrade).
+      api.events.facets("attack", from, to, 8)
+        .then(af => setAttackFacets(af.facets ?? []))
+        .catch(() => setAttackFacets([]));
     } catch (e) { showToast(e instanceof Error ? e.message : "Search failed", "e"); }
     finally { setLoading(false); }
   }, [mode, absFrom, absTo, rangeSecs, q, site, rule, action, ip, protocol, severity, country]);
@@ -379,6 +397,7 @@ export default function EventsPage() {
           {/* facets + results */}
           <div style={{ display: "grid", gridTemplateColumns: "260px 1fr", gap: 14 }}>
             <motion.div variants={cardVariants} style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              <FacetCard title="Top Attack Types" facets={attackFacets} onPick={k => { setQ(k); run({ q: k }); }} />
               <FacetCard title="Top Rules" facets={ruleFacets} onPick={k => { setRule(k); run({ rule: k }); }} />
               <FacetCard title="Top Source IPs" facets={ipFacets} onPick={k => { setIp(k); run({ ip: k }); }} />
               <FacetCard title="Top Protocols" facets={protocolFacets} onPick={k => { setProtocol(k); run({ protocol: k }); }} />
@@ -389,7 +408,7 @@ export default function EventsPage() {
               <div className="tw" style={{ maxHeight: 520, overflow: "auto" }}>
                 {events.length === 0 ? <Empty text={loading ? "Searching…" : "No events match these filters in this window."} /> : (
                   <table>
-                    <thead><tr><th>Time</th><th>IP</th><th>Site</th><th>Method</th><th>Proto</th><th>Path</th><th>Rule</th><th>Sev</th><th>Action</th><th>Status</th><th aria-label="detail" /></tr></thead>
+                    <thead><tr><th>Time ({tzLabel()})</th><th>IP</th><th>Site</th><th>Method</th><th>Proto</th><th>Path</th><th>Attack</th><th>Rule</th><th>Score</th><th>Sev</th><th>Action</th><th>Status</th><th aria-label="detail" /></tr></thead>
                     <tbody>{events.map((e, i) => (
                       <tr key={i}
                           onClick={() => setSelected(e)}
@@ -400,8 +419,12 @@ export default function EventsPage() {
                         <td className="td3">{e.site}</td>
                         <td className="td3">{e.method}</td>
                         <td className="td3"><span className="bdg bcy">{e.protocol || "—"}</span></td>
-                        <td style={{ maxWidth: 280, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={`${e.path} — ${e.attack}`}>{e.path}</td>
+                        <td style={{ maxWidth: 240, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={e.query ? `${e.path}?${e.query}` : e.path}>{e.path}</td>
+                        {/* The attack type is what SafeLine and F5 lead with; it
+                            was only a tooltip on the path here. */}
+                        <td className="td2" style={{ maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={e.attack}>{e.attack || "—"}</td>
                         <td className="td3">{e.rule}</td>
+                        <td className="td3" style={{ fontFamily: "var(--font-mono)" }} title={e.threshold ? `anomaly score ${e.score} against a threshold of ${e.threshold}` : "anomaly score"}>{e.score}</td>
                         <td><span className={`bdg ${e.severity === "CRITICAL" ? "br" : e.severity === "HIGH" ? "ba" : "bcy"}`}>{e.severity || "—"}</span></td>
                         <td><span className={`bdg ${e.action === "BLOCK" ? "br" : "ba"}`}>{e.action}</span></td>
                         <td className="td3">{e.status || "—"}</td>
@@ -420,7 +443,7 @@ export default function EventsPage() {
   );
 }
 
-function FacetCard({ title, facets, onPick }: { title: string; facets: { key: string; count: number }[]; onPick: (k: string) => void }) {
+function FacetCard({ title, facets, onPick }: { title: string; facets: { key: string; count: number; label?: string }[]; onPick: (k: string) => void }) {
   const max = Math.max(1, ...facets.map(f => f.count));
   return (
     <div className="panel">
@@ -428,11 +451,14 @@ function FacetCard({ title, facets, onPick }: { title: string; facets: { key: st
       <div className="pb" style={{ display: "flex", flexDirection: "column", gap: 7 }}>
         {facets.length === 0 ? <div style={{ fontSize: 13, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>—</div> :
           facets.map(f => (
-            <div key={f.key} onClick={() => onPick(f.key)} style={{ cursor: "pointer" }} title="Filter by this">
+            <div key={f.key} onClick={() => onPick(f.key)} style={{ cursor: "pointer" }} title={f.label ? `${f.key} — ${f.label}` : "Filter by this"}>
               <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, marginBottom: 2 }}>
                 <span style={{ color: "var(--text2)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 160, fontFamily: "var(--font-mono)" }}>{f.key}</span>
                 <span style={{ color: "var(--text)", fontFamily: "var(--font-mono)" }}>{f.count.toLocaleString()}</span>
               </div>
+              {/* A rule id alone names nothing; the rule facet carries the
+                  attack message it most recently recorded. */}
+              {f.label && <div style={{ fontSize: 11, color: "var(--text3)", marginBottom: 3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.label}</div>}
               <div style={{ height: 4, background: "var(--bg3)", borderRadius: 2, overflow: "hidden" }}>
                 <div style={{ height: "100%", width: `${(f.count / max) * 100}%`, background: "rgba(0,229,255,.6)", borderRadius: 2 }} />
               </div>

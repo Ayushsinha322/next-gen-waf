@@ -221,6 +221,10 @@ type SeverityBucket struct {
 type Facet struct {
 	Key   string `json:"key"`
 	Count int64  `json:"count"`
+	// Label names a rule facet's key: the attack message it most recently
+	// recorded ("9900100" → "SQL Injection via libinjection"). A bare rule id
+	// told an operator nothing without a second lookup. Empty for other columns.
+	Label string `json:"label,omitempty"`
 }
 
 // Attacker is one source IP rolled up over the query window: how many WAF events
@@ -445,21 +449,12 @@ func (c *Client) SeverityTimeline(ctx context.Context, tenant string, from, to i
 	return out, nil
 }
 
-// Facets returns top values for a column (rule|ip|country|action|site).
+// Facets returns top values for a column (see facetColumn).
 func (c *Client) Facets(ctx context.Context, column, tenant string, from, to int64, limit int) ([]Facet, error) {
-	col, ok := facetColumn(column)
-	if !ok {
-		return nil, fmt.Errorf("invalid facet column %q", column)
+	sql, err := c.facetSQL(column, tenant, from, to, limit)
+	if err != nil {
+		return nil, err
 	}
-	if limit <= 0 || limit > 50 {
-		limit = 10
-	}
-	// Tenant-scoped (isolation boundary), like Search.
-	where := append(c.timeWhere(from, to), eq("tenant", tenant))
-	sql := fmt.Sprintf(
-		"SELECT %s AS key, count() AS count FROM %s.waf_events WHERE %s AND %s != '' "+
-			"GROUP BY key ORDER BY count DESC LIMIT %d",
-		col, c.db, strings.Join(where, " AND "), col, limit)
 	var out []Facet
 	if err := c.queryJSON(ctx, sql, &out); err != nil {
 		return nil, err
@@ -763,10 +758,36 @@ func (c *Client) timeWhere(from, to int64) []string {
 	return []string{fmt.Sprintf("ts >= toDateTime(%d) AND ts <= toDateTime(%d)", from, to)}
 }
 
+// facetSQL builds the Facets query. Split out so the SQL can be tested without
+// a ClickHouse server.
+func (c *Client) facetSQL(column, tenant string, from, to int64, limit int) (string, error) {
+	col, ok := facetColumn(column)
+	if !ok {
+		return "", fmt.Errorf("invalid facet column %q", column)
+	}
+	if limit <= 0 || limit > 50 {
+		limit = 10
+	}
+	// A rule facet also carries the rule's most recent attack message, the same
+	// argMax the learning report uses, so the two never name a rule differently.
+	label := ""
+	if col == "rule" {
+		label = ", argMax(attack, ts) AS label"
+	}
+	// Tenant-scoped (isolation boundary), like Search.
+	where := append(c.timeWhere(from, to), eq("tenant", tenant))
+	return fmt.Sprintf(
+		"SELECT %s AS key, count() AS count%s FROM %s.waf_events WHERE %s AND %s != '' "+
+			"GROUP BY key ORDER BY count DESC LIMIT %d",
+		col, label, c.db, strings.Join(where, " AND "), col, limit), nil
+}
+
 // facetColumn whitelists groupable columns (prevents SQL injection via column).
+// `attack` is the attack-type breakdown — the first view SafeLine and F5 open
+// on — and was the one event column an operator could not group by.
 func facetColumn(c string) (string, bool) {
 	switch strings.ToLower(c) {
-	case "rule", "ip", "country", "action", "site", "severity", "protocol":
+	case "rule", "ip", "country", "action", "site", "severity", "protocol", "attack":
 		return strings.ToLower(c), true
 	}
 	return "", false

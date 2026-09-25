@@ -1,10 +1,10 @@
 "use client";
-import { useState, useEffect, useRef, useCallback, Suspense } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo, Suspense } from "react";
 import Link from "next/link";
 import { motion } from "framer-motion";
 import { api } from "@/lib/api";
 import { spring } from "@/lib/animations";
-import { fmt, verdict, type LogKind } from "@/lib/logFormat";
+import { fmt, toneOf, lineCounts, attackByRequest, type LogKind, type LineTone } from "@/lib/logFormat";
 
 interface LogRow { _lid: number; [k: string]: unknown; }
 type LogStore = Record<LogKind, LogRow[]>;
@@ -48,22 +48,9 @@ function hl(raw: string): string {
     .replace(/score=(\d+)/g,                          'score=<span class="hl-score">$1</span>');
 }
 
-function rowClass(kind: LogKind, r: Record<string, unknown>): string {
-  switch (kind) {
-    case "access": {
-      // Severity follows the WAF verdict first; a 5xx from a healthy origin is
-      // an error worth colouring, but it is not a block.
-      const v = verdict(r);
-      if (v === "BLOCK") return "ll-block";
-      if (v === "CHALLENGE" || v === "LIMIT") return "ll-warn";
-      return Number(r.status ?? 200) >= 500 ? "ll-err" : "ll-pass";
-    }
-    case "waf":    return r.sev === "CRITICAL" ? "ll-critical" : (r.action === "BLOCKED" || r.action === "BLOCK") ? "ll-block" : "ll-warn";
-    case "error":  return r.lvl === "FATAL" ? "ll-critical" : r.lvl === "ERROR" ? "ll-err" : r.lvl === "WARN" ? "ll-warn" : "ll-info";
-    case "audit":  return r.result === "FAILURE" ? "ll-err" : "ll-info";
-    default:       return "ll-info";
-  }
-}
+const TONE_CLASS: Record<LineTone, string> = {
+  block: "ll-block", warn: "ll-warn", err: "ll-err", critical: "ll-critical", pass: "ll-pass", info: "ll-info",
+};
 
 export default function LogsPage() {
   return (
@@ -155,7 +142,9 @@ function LogsInner() {
     if (follow && bodyRef.current) {
       bodyRef.current.scrollTop = bodyRef.current.scrollHeight;
     }
-  }, [logs, follow, kind]);
+    // `search` too: clearing a filter while following used to leave the view at
+    // the top of the full list instead of at the newest line.
+  }, [logs, follow, kind, search]);
 
   useEffect(() => {
     function onDown(e: MouseEvent) {
@@ -165,14 +154,22 @@ function LogsInner() {
     return () => document.removeEventListener("mousedown", onDown);
   }, []);
 
-  const rows     = logs[kind];
+  // access.log rows carry the rule and score but not the attack's name; the
+  // waf.log row for the same request id does. Join them so a block line says
+  // what it blocked, and so searching "SQL Injection" finds access lines too.
+  const attacks  = useMemo(() => attackByRequest(logs.waf), [logs.waf]);
+  const rows     = useMemo(() => kind !== "access" ? logs[kind] : logs.access.map(r => {
+    const a = typeof r.request_id === "string" ? attacks.get(r.request_id) : undefined;
+    return a && !r.attack ? { ...r, attack: a } : r;
+  }), [logs, kind, attacks]);
   const filtered = search
     ? rows.filter(r => fmt(kind, r).toLowerCase().includes(search.toLowerCase()))
     : rows;
 
   const currFile = LOG_FILES.find(f => f.id === kind)!;
-  const threats  = logs.waf.filter(r => r.action === "BLOCKED" || r.action === "BLOCK").length;
-  const errors   = logs.error.filter(r => r.lvl === "ERROR" || r.lvl === "FATAL").length;
+  // Counted over the lines on screen — this file, this search — not over
+  // waf.log/error.log as a whole. See lineCounts.
+  const { blocked, errors } = lineCounts(kind, filtered);
 
   function copyAll() {
     const text = filtered.map(r => fmt(kind, r)).join("\n");
@@ -314,8 +311,9 @@ function LogsInner() {
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="rgba(0,212,255,.7)" strokeWidth="1.5"><path d="M13 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>
             {currFile.label}
             <span className="lgw-vbdg">{filtered.length} lines</span>
-            {threats > 0 && <span className="lgw-vbdg lgw-vbdg-r">{threats} threats</span>}
+            {blocked > 0 && <span className="lgw-vbdg lgw-vbdg-r">{blocked} blocked</span>}
             {errors  > 0 && <span className="lgw-vbdg lgw-vbdg-a">{errors} errors</span>}
+            <span className="lgw-vbdg" title="Timestamps are UTC, exactly as the data plane writes them">UTC</span>
           </div>
           <span className={`lgw-vbdg${connected ? " lgw-vbdg-g" : " lgw-vbdg-a"}`}>
             {connected ? "● live" : "⟳ reconnecting"}
@@ -326,13 +324,15 @@ function LogsInner() {
           {filtered.length === 0 ? (
             <div className="lgw-empty">
               <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,.12)" strokeWidth="1"><path d="M13 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>
-              {connected ? `Waiting for ${currFile.label} entries…` : "Connecting to log stream…"}
+              {rows.length > 0
+                ? `No line in the last ${rows.length} of ${currFile.label} matches “${search}”.`
+                : connected ? `Waiting for ${currFile.label} entries…` : "Connecting to log stream…"}
             </div>
           ) : (
             filtered.map((r, i) => (
               <motion.div
                 key={r._lid as number}
-                className={`ll ${rowClass(kind, r)}`}
+                className={`ll ${TONE_CLASS[toneOf(kind, r)]}`}
                 initial={{ opacity: 0, y: 2 }}
                 animate={{ opacity: 1, y: 0 }}
                 transition={{ duration: 0.12, delay: Math.min(i * 0.005, 0.15) }}
@@ -348,7 +348,7 @@ function LogsInner() {
         <div className="lgw-ft">
           <span className="lgw-fstat">Lines: <b>{rows.length}</b></span>
           <span className="lgw-fstat">Shown: <b>{filtered.length}</b></span>
-          <span className="lgw-fstat">Threats: <b className="lgw-r">{threats}</b></span>
+          <span className="lgw-fstat">Blocked: <b className="lgw-r">{blocked}</b></span>
           <span className="lgw-fstat">Errors: <b className="lgw-a">{errors}</b></span>
           <div style={{ flex: 1 }} />
           <motion.button className="lgw-pg" onClick={() => { if (bodyRef.current) bodyRef.current.scrollTop = 0; }} whileHover={{ color: "var(--cyan)" }}>↑ Top</motion.button>
