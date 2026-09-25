@@ -57,12 +57,6 @@ const Icon = {
       <line x1="7" y1="7" x2="7.01" y2="7"/>
     </svg>
   ),
-  Copilot: () => (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M12 2a10 10 0 1 0 10 10H12V2z"/><path d="M12 2a10 10 0 0 1 10 10"/>
-      <circle cx="12" cy="12" r="3"/>
-    </svg>
-  ),
   ML: () => (
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
       <circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/>
@@ -134,7 +128,6 @@ const NAV: Array<{ group: string; items: Array<{ id: string; Icon: () => React.J
   ]},
   { group: "intelligence", items: [
     { id: "threat-intel", Icon: Icon.ThreatIntel },
-    { id: "copilot",      Icon: Icon.Copilot },
     { id: "ml",           Icon: Icon.ML, live: true },
   ]},
   { group: "system", items: [
@@ -284,20 +277,16 @@ export default function SideBar() {
           {footSub}
         </div>
 
-        {/* Help, permanently visible.
-            The console showed a version string and nothing else: an operator who
-            did not already know where the manual lived had no way to find it from
-            inside the product. Copilot is in-product and always present, so it is
-            not configurable. The other two are DEPLOYMENT-SPECIFIC URLs and are
-            rendered only when set — an ESDS internal documentation host is not
+        {/* Help links. The console showed a version string and nothing else: an
+            operator who did not already know where the manual lived had no way to
+            find it from inside the product. Both are DEPLOYMENT-SPECIFIC URLs and
+            are rendered only when set — an ESDS internal documentation host is not
             something this repository can know, and a link that 404s is worse than
             no link. Set NEXT_PUBLIC_DOCS_URL / NEXT_PUBLIC_SUPPORT_URL at build
-            time to show them. */}
+            time to show them; with neither set the row is not drawn at all. */}
+        {(DOCS_URL || SUPPORT_URL) && (
         <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginTop: 8, paddingTop: 8,
                       borderTop: "1px solid rgba(0,212,255,.06)" }}>
-          <a href="/copilot"
-             style={{ fontSize: 12, color: "var(--text3)", textDecoration: "none" }}
-             title="Ask the in-product assistant about this deployment">Ask Copilot</a>
           {DOCS_URL && (
             <a href={DOCS_URL} target="_blank" rel="noreferrer"
                style={{ fontSize: 12, color: "var(--text3)", textDecoration: "none" }}
@@ -309,6 +298,7 @@ export default function SideBar() {
                title="Raise a support request">Get support ↗</a>
           )}
         </div>
+        )}
       </motion.div>
     </motion.nav>
   );

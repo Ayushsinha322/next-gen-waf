@@ -8,7 +8,7 @@ A next-generation, high-performance Web Application Firewall written in **Rust**
 |---|---|
 | **Rust data plane** | Zero-GC, memory-safe, p99 latency under 1ms |
 | **WASM plugin system** | Write extensions in Rust, Go, AssemblyScript, JS |
-| **AI/ML built-in** | Transformer-based payload classification, anomaly detection, LLM rule-copilot |
+| **AI/ML built-in** | Transformer-based payload classification, anomaly detection |
 | **eBPF L4 protection** | Kernel-level DDoS mitigation via XDP |
 | **HTTP/3 + Post-Quantum TLS** | Future-proof crypto (Kyber/Dilithium hybrid) |
 | **API-aware** | OpenAPI auto-discovery, GraphQL/gRPC schema firewalling |

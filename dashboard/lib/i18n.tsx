@@ -37,7 +37,6 @@ export const en: Dict = {
   "nav.blocked": "Blocked Sources",
   "nav.plugins": "Plugins",
   "nav.threat-intel": "Threat Intel",
-  "nav.copilot": "AI Copilot",
   "nav.ml": "ML Engine",
   "nav.cluster": "Cluster",
   "nav.audit": "Audit Log",

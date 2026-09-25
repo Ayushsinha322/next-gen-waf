@@ -933,127 +933,6 @@ textarea.fin2 { resize:vertical; min-height:80px; line-height:1.6; }
 .tl  { background:rgba(0,200,122,.12); color:var(--green); }
 .tsep{ color:var(--text3); }
 
-/* ═══════════════════════════════════════════
-   COPILOT FAB — DASHBOARD .cfab
-═══════════════════════════════════════════ */
-.cfab {
-  position:fixed; bottom:44px; right:20px; z-index:50; width:50px; height:50px;
-  border-radius:50%; background:linear-gradient(135deg,var(--purple),#4A0FA0);
-  border:1px solid rgba(124,58,237,.55); display:flex; align-items:center; justify-content:center;
-  cursor:pointer; box-shadow:0 4px 22px var(--pur-glow); animation:fabPulse 3.5s ease-in-out infinite; transition:all .3s;
-}
-.cfab:hover { transform:scale(1.1); box-shadow:0 6px 30px rgba(124,58,237,.7); }
-.cfab-ring {
-  position:absolute; inset:-6px; border-radius:50%;
-  border:2px solid rgba(124,58,237,.35); animation:ring2 2.5s ease-out infinite; pointer-events:none;
-}
-
-/* COPILOT FAB — LOGIN .copilot-fab */
-.copilot-fab {
-  position:fixed; bottom:50px; right:24px; z-index:30; width:52px; height:52px;
-  border-radius:50%; background:linear-gradient(135deg,var(--purple),#4A0FA0);
-  border:1px solid rgba(124,58,237,.55); display:flex; align-items:center; justify-content:center;
-  cursor:pointer; transition:all .3s; outline:none; box-shadow:0 5px 24px var(--pur-glow);
-  animation:fabPulse 3.5s ease-in-out infinite;
-}
-.copilot-fab:hover { transform:scale(1.1); }
-.fab-ring {
-  position:absolute; inset:-6px; border-radius:50%;
-  border:2px solid rgba(124,58,237,.35); animation:ring 2.5s ease-out infinite; pointer-events:none;
-}
-.fab-badge {
-  position:absolute; top:-2px; right:-2px; width:16px; height:16px; background:var(--red-b);
-  border-radius:50%; font-size:10px; font-family:var(--font-mono); font-weight:700;
-  color:#fff; display:flex; align-items:center; justify-content:center; border:2px solid var(--bg);
-}
-.fab-tip {
-  position:absolute; right:60px; top:50%; transform:translateY(-50%);
-  background:rgba(16,8,32,.97); backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(8px);
-  border:1px solid rgba(124,58,237,.45);
-  border-radius:20px; padding:5px 12px; font-size:14px; font-family:var(--font-mono);
-  color:#fff; white-space:nowrap; opacity:0; pointer-events:none; transition:opacity .25s;
-}
-.copilot-fab:hover .fab-tip { opacity:1; }
-
-/* COPILOT PANEL — LOGIN */
-.cop-panel {
-  position:fixed; bottom:115px; right:24px; z-index:30; width:360px; height:500px;
-  border-radius:var(--r); background:rgba(6,5,16,.98); border:1px solid rgba(124,58,237,.38);
-  box-shadow:0 28px 70px rgba(0,0,0,.85),0 0 0 1px rgba(124,58,237,.15); backdrop-filter:var(--blur); -webkit-backdrop-filter:var(--blur);
-  display:flex; flex-direction:column; overflow:hidden;
-  transform:scale(.86) translateY(22px); opacity:0; pointer-events:none;
-  transition:all .3s cubic-bezier(.22,1,.36,1); transform-origin:bottom right;
-}
-.cop-panel.open { transform:scale(1) translateY(0); opacity:1; pointer-events:all; }
-
-/* COPILOT MINI — DASHBOARD */
-.cop-mini {
-  position:fixed; bottom:106px; right:20px; z-index:50; width:360px; height:485px;
-  border-radius:var(--r); background:rgba(6,5,16,.98); border:1px solid rgba(124,58,237,.38);
-  box-shadow:0 28px 70px rgba(0,0,0,.85); backdrop-filter:var(--blur); -webkit-backdrop-filter:var(--blur);
-  display:flex; flex-direction:column; overflow:hidden;
-  transform:scale(.86) translateY(22px); opacity:0; pointer-events:none;
-  transition:all .3s cubic-bezier(.22,1,.36,1); transform-origin:bottom right;
-}
-.cop-mini.open { transform:scale(1) translateY(0); opacity:1; pointer-events:all; }
-
-/* Shared message styles */
-.msg, .msg2  { display:flex; gap:8px; animation:msgIn .28s ease; }
-.msg.usr, .msg2.usr { flex-direction:row-reverse; }
-.mav { width:26px; height:26px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:14px; flex-shrink:0; margin-top:2px; }
-.mav.ai  { background:linear-gradient(135deg,var(--purple),#4A0FA0); }
-.mav.usr { background:rgba(0,212,255,.2); border:1px solid rgba(0,212,255,.35); }
-.mbbl { max-width:82%; padding:9px 13px; border-radius:12px; font-size:13px; font-family:var(--font-sans); line-height:1.6; }
-.msg.ai  .mbbl { background:rgba(124,58,237,.16); border:1px solid rgba(124,58,237,.28); color:var(--text); border-radius:3px 12px 12px 12px; }
-.msg.usr .mbbl { background:rgba(0,212,255,.12); border:1px solid rgba(0,212,255,.24); color:var(--text); border-radius:12px 3px 12px 12px; }
-.tyd { width:7px; height:7px; border-radius:50%; background:var(--purple); animation:tyBounce 1.3s ease-in-out infinite; }
-.tyd:nth-child(2) { animation-delay:.22s; }
-.tyd:nth-child(3) { animation-delay:.44s; }
-.qbtn {
-  font-size:11px; font-family:var(--font-sans); font-weight:500; padding:4px 10px; border-radius:20px;
-  background:rgba(124,58,237,.12); border:1px solid rgba(124,58,237,.3); color:#A070E0;
-  cursor:pointer; transition:all .2s; white-space:nowrap;
-}
-.qbtn:hover { background:rgba(124,58,237,.22); color:#BF8FFF; border-color:rgba(124,58,237,.5); }
-.cop-inp {
-  flex:1; background:var(--glass-w); border:1px solid rgba(124,58,237,.3);
-  border-radius:20px; padding:9px 14px; font-family:var(--font-sans); font-size:13px; color:var(--text); outline:none; transition:border-color .2s;
-}
-.cop-inp:focus { border-color:rgba(124,58,237,.65); box-shadow:0 0 0 3px rgba(124,58,237,.1); }
-.cop-inp::placeholder { color:var(--text3); }
-
-/* ═══════════════════════════════════════════
-   COPILOT PAGE (full page)
-═══════════════════════════════════════════ */
-.cop-page {
-  display:grid; grid-template-columns:220px 1fr; height:calc(100vh - var(--th) - var(--bh) - 84px);
-  background:var(--glass); border:1px solid rgba(255,255,255,.05); border-radius:var(--r); overflow:hidden;
-  backdrop-filter:var(--blur); -webkit-backdrop-filter:var(--blur);
-}
-.cop-hist { border-right:1px solid rgba(124,58,237,.2); display:flex; flex-direction:column; background:rgba(6,5,16,.6); }
-.cop-main { display:flex; flex-direction:column; }
-.cop-inp2 {
-  flex:1; background:var(--glass-w); border:1px solid rgba(124,58,237,.3);
-  border-radius:var(--r2); padding:10px 14px; font-family:var(--font-sans);
-  font-size:13px; color:var(--text); outline:none; transition:border-color .2s;
-  resize:none; min-height:44px; max-height:100px; line-height:1.5;
-}
-.cop-inp2:focus { border-color:rgba(124,58,237,.65); box-shadow:0 0 0 3px rgba(124,58,237,.1); }
-.cop-inp2::placeholder { color:var(--text3); }
-.qbtn2 {
-  font-size:11px; font-family:var(--font-sans); font-weight:500; padding:4px 10px; border-radius:20px;
-  background:rgba(124,58,237,.12); border:1px solid rgba(124,58,237,.3); color:#A070E0;
-  cursor:pointer; transition:all .2s; white-space:nowrap;
-}
-.qbtn2:hover { background:rgba(124,58,237,.22); color:#BF8FFF; }
-.msg2     { display:flex; gap:9px; animation:msgIn .28s ease; }
-.msg2.usr { flex-direction:row-reverse; }
-.mav2 { width:28px; height:28px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:15px; flex-shrink:0; margin-top:2px; }
-.mav2.ai  { background:linear-gradient(135deg,var(--purple),#4A0FA0); }
-.mav2.usr { background:rgba(0,212,255,.2); border:1px solid rgba(0,212,255,.35); }
-.mbbl2 { max-width:78%; padding:10px 14px; border-radius:12px; font-size:13px; font-family:var(--font-sans); line-height:1.65; }
-.msg2.ai  .mbbl2 { background:rgba(124,58,237,.16); border:1px solid rgba(124,58,237,.28); color:var(--text); border-radius:3px 12px 12px 12px; }
-.msg2.usr .mbbl2 { background:rgba(0,212,255,.12); border:1px solid rgba(0,212,255,.24); color:var(--text); border-radius:12px 3px 12px 12px; }
 
 /* ── Simulated-data markers ──────────────────────────────────────────────────
    Deliberately loud. Fabricated entries must be impossible to mistake for real
@@ -1080,12 +959,6 @@ textarea.fin2 { resize:vertical; min-height:80px; line-height:1.6; }
 }
 [data-theme='light'] .lgw-simbanner { color:#92400e; }
 
-/* Copilot markdown output (lib/safeMarkdown.ts). These are classes rather than
-   inline style attributes so the injected HTML carries no style of its own. */
-.cp-code { background:rgba(255,255,255,.08); padding:1px 5px; border-radius:3px; font-size:12px; font-family:var(--font-mono); }
-.cp-pre  { background:rgba(0,0,0,.3); padding:8px; border-radius:6px; font-size:12px; margin:5px 0; overflow-x:auto; white-space:pre-wrap; font-family:var(--font-mono); }
-[data-theme='light'] .cp-code { background:rgba(0,0,0,.06); }
-[data-theme='light'] .cp-pre  { background:rgba(0,0,0,.05); }
 
 /* ═══════════════════════════════════════════
    LOGIN PAGE — cyberpunk fortress
@@ -1271,17 +1144,6 @@ textarea.fin2 { resize:vertical; min-height:80px; line-height:1.6; }
 [data-theme='light'] .toast.i { border-color:rgba(8,145,178,.4); box-shadow:0 0 14px rgba(8,145,178,.1); }
 [data-theme='light'] .toast.w { border-color:rgba(217,119,6,.4); box-shadow:0 0 14px rgba(217,119,6,.1); }
 
-/* ── Copilot ── */
-[data-theme='light'] .cfab, [data-theme='light'] .copilot-fab { background:linear-gradient(135deg,var(--purple),#3730a3); border-color:rgba(99,102,241,.35); box-shadow:0 4px 18px rgba(99,102,241,.28); }
-[data-theme='light'] .cop-panel, [data-theme='light'] .cop-mini { background:rgba(255,255,255,.98); border-color:rgba(99,102,241,.18); box-shadow:0 28px 60px rgba(0,0,0,.12), 0 0 0 1px rgba(99,102,241,.08); }
-[data-theme='light'] .cop-hist { background:rgba(248,248,250,.8); border-right-color:rgba(99,102,241,.1); }
-[data-theme='light'] .cop-page { border-color:rgba(0,0,0,.07); }
-[data-theme='light'] .msg.ai .mbbl, [data-theme='light'] .msg2.ai .mbbl2 { background:rgba(99,102,241,.08); border-color:rgba(99,102,241,.18); }
-[data-theme='light'] .msg.usr .mbbl, [data-theme='light'] .msg2.usr .mbbl2 { background:rgba(8,145,178,.08); border-color:rgba(8,145,178,.18); }
-[data-theme='light'] .cop-inp, [data-theme='light'] .cop-inp2 { background:rgba(0,0,0,.04); border-color:rgba(99,102,241,.18); }
-[data-theme='light'] .cop-inp:focus, [data-theme='light'] .cop-inp2:focus { border-color:rgba(99,102,241,.42); box-shadow:0 0 0 3px rgba(99,102,241,.07); }
-[data-theme='light'] .qbtn, [data-theme='light'] .qbtn2 { background:rgba(99,102,241,.07); border-color:rgba(99,102,241,.18); color:var(--purple); }
-[data-theme='light'] .qbtn:hover, [data-theme='light'] .qbtn2:hover { background:rgba(99,102,241,.14); border-color:rgba(99,102,241,.35); }
 
 /* ── Log viewer ── */
 [data-theme='light'] .lgw-viewer { background:rgba(0,0,0,.02); border-color:rgba(0,0,0,.08); }
@@ -1859,7 +1721,6 @@ textarea.fin2 { resize:vertical; min-height:80px; line-height:1.6; }
 }
 @media (max-width:600px) {
   .scanner-widget { display:none; }
-  .cop-mini, .cop-panel { right:8px; left:8px; width:auto; }
   .login-card, .card { margin:0 12px; }
   #form-box { max-width:100%; padding:0 8px; }
   #hero-title { font-size:32px; }

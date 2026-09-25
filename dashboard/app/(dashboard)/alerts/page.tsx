@@ -1,8 +1,6 @@
 "use client";
 import { useState, useEffect } from "react";
-import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
-import { openCopilotWith, explainAlertPrompt } from "@/lib/copilotContext";
 import { showToast } from "@/components/ui/Toast";
 import EmptyState from "@/components/ui/EmptyState";
 import { announceAlertsChanged } from "@/lib/alertEvents";
@@ -11,7 +9,6 @@ import { staggerContainer, cardVariants, fadeUp, spring } from "@/lib/animations
 import Icon from "@/components/ui/Icon";
 
 export default function AlertsPage() {
-  const router = useRouter();
   const [alerts, setAlerts]       = useState<Alert[]>([]);
   const [loading, setLoading]     = useState(true);
   const [search, setSearch]       = useState("");
@@ -287,9 +284,6 @@ export default function AlertsPage() {
                           {d.auto_resolved === true && <span className="td3" style={{ fontSize:10, marginLeft:6 }} title="Closed automatically: no recurrence within the quiet window">auto</span>}
                         </td>
                         <td><div style={{display:"flex",gap:4}}>
-                          <motion.button className="btn bg-btn btn-xs" whileHover={{ scale: 1.06 }} whileTap={{ scale: 0.95 }}
-                            title="Open the AI Copilot with this alert loaded: what happened, real or false positive, what to do"
-                            onClick={() => openCopilotWith(router, explainAlertPrompt(x))}><Icon name="sparkles" size={14} title="Explain with Copilot" /></motion.button>
                           {!sub && ip && (
                             <motion.button className="btn bgn btn-xs" disabled={blocking === ip} whileHover={{ scale: 1.06 }} whileTap={{ scale: 0.95 }}
                               onClick={() => blockIP(ip)} title="Add a manual block-tier indicator for this IP to the threat-intel corpus">

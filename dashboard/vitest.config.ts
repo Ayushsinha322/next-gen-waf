@@ -7,7 +7,7 @@ export default defineConfig({
   // importing `@/…` fails to load — not as an assertion failure but as a
   // collection error, which is easy to skim past in CI output.
   //
-  // That is exactly what happened: `lib/copilotContext.ts` began importing
+  // That is exactly what happened: a lib module began importing
   // `@/lib/version` on 2026-09-10, and the gating `npm run test` step has been
   // red on main ever since. Keep this in step with tsconfig.json's `paths`.
   resolve: {

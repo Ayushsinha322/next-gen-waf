@@ -25,8 +25,8 @@ function isValidJWT(token: string): boolean {
  * Build the Content-Security-Policy for this response.
  *
  * This is defence-in-depth behind output escaping, not a replacement for it: the
- * dashboard's own XSS sinks are fixed at the source (lib/safeMarkdown.ts for
- * Copilot output, `escHtml` in the logs view). The policy exists so that the
+ * dashboard's own XSS sinks are fixed at the source (`escHtml` in the logs
+ * view). The policy exists so that the
  * *next* injection bug is contained rather than immediately exploitable.
  *
  * `script-src` is nonce-based with 'strict-dynamic'. Next.js reads the nonce

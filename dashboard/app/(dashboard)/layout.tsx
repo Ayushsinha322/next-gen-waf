@@ -4,7 +4,6 @@ import TopBar from "@/components/layout/TopBar";
 import SideBar from "@/components/layout/SideBar";
 import ToastContainer from "@/components/ui/Toast";
 import ModalContainer from "@/components/ui/Modal";
-import CopilotFab from "@/components/copilot/CopilotFab";
 import ChunkRecovery from "@/components/layout/ChunkRecovery";
 import { I18nProvider } from "@/lib/i18n";
 
@@ -50,7 +49,6 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
           </motion.div>
         </AnimatePresence>
       </main>
-      <CopilotFab variant="dashboard" />
       <ToastContainer />
       <ModalContainer />
     </I18nProvider>

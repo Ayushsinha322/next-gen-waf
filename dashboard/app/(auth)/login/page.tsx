@@ -280,7 +280,7 @@ export default function LoginPage() {
               measured composite had moved on). Benchmarks belong in the benchmark
               report; this page shows nothing it has not looked up. */}
           <motion.div id="feats" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.65 }}>
-            {["eBPF / XDP","OWASP CRS v4","WASM Plugins","LLM Copilot",
+            {["eBPF / XDP","OWASP CRS v4","WASM Plugins",
               "HTTP/3 + JA4","Leader-elected HA","GraphQL / gRPC FW","Outbound DLP"].map(f => (
               <div key={f} className="feat-pill">{f}</div>
             ))}
