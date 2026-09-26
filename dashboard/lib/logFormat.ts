@@ -153,3 +153,50 @@ export function fmt(kind: LogKind, r: Record<string, unknown>): string {
   }
 }
 
+
+function escHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/** Colour everything on a line except the request path. */
+function decorate(seg: string): string {
+  return seg
+    .replace(/(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[\d.Z]*)/g, '<span class="hl-ts">$1</span>')
+    .replace(/\[(PASS)\]/g,                           '[<span class="hl-pass">$1</span>]')
+    .replace(/\[(BLOCK|BLOCKED)\]/g,                  '[<span class="hl-blk">$1</span>]')
+    .replace(/\[(ERROR|FATAL)\]/g,                    '[<span class="hl-err">$1</span>]')
+    .replace(/\[(WARN)\]/g,                           '[<span class="hl-warn">$1</span>]')
+    .replace(/\[(CHALLENGE)\]/g,                      '[<span class="hl-chal">$1</span>]')
+    .replace(/\[(LIMIT)\]/g,                          '[<span class="hl-warn">$1</span>]')
+    .replace(/\[(AUDIT|ML|CRS|INFO)\]/g,              '[<span class="hl-info">$1</span>]')
+    .replace(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/g,'<span class="hl-ip">$1</span>')
+    .replace(/\b(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\b/g, '<span class="hl-method">$1</span>')
+    // The status code: the number between the path and `proto=` on an access
+    // line. Anchored there, not matched anywhere, so a "201" inside a user
+    // agent or referer is not coloured as a response.
+    .replace(/ (\d{3})(?= proto=)/, (_m, code: string) =>
+      ` <span class="${/^[45]/.test(code) ? "hl-block" : "hl-ok"}">${code}</span>`)
+    .replace(/proto=(h[123]|-)/g,                     'proto=<span class="hl-method">$1</span>')
+    .replace(/score=(\d+)/g,                          'score=<span class="hl-score">$1</span>');
+}
+
+/**
+ * HTML for one log line: escaped first, then coloured.
+ *
+ * The request path is isolated BEFORE anything else is coloured, and nothing
+ * is coloured inside it. The previous version ran the status-code, IP and
+ * method patterns over the whole line and wrapped the path last, so a payload
+ * holding a number like 201 (`?q=1%27%20OR%201%3D1--`, the commonest SQL
+ * injection probe there is) or an IP (`?url=http://169.254.169.254/`) got a
+ * <span> inserted mid-path; the path pattern, which stops at whitespace, then
+ * cut that tag in half and the line printed ` class="hl-ok">201` as text.
+ * Invariant, pinned by tests: stripping the tags gives back the escaped line.
+ */
+export function highlightLine(raw: string): string {
+  const esc = escHtml(raw);
+  // split() with a capture group keeps the path tokens at odd indexes.
+  const parts = esc.split(/( \/[^\s"&;]+)/);
+  return parts
+    .map((seg, i) => (i % 2 === 1 ? ` <span class="hl-path">${seg.slice(1)}</span>` : decorate(seg)))
+    .join("");
+}

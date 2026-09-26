@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { fmt, verdict, attackByRequest, lineCounts, toneOf } from "../logFormat";
+import { fmt, verdict, attackByRequest, lineCounts, toneOf, highlightLine } from "../logFormat";
 
 /**
  * A module block must be explainable from the Logs page line. Until 2026-09-16
@@ -124,5 +124,42 @@ describe("waf.log line lists every contributing rule", () => {
   it("adds nothing for a single rule or an older record", () => {
     expect(fmt("waf", { ...base, rules: [{ id: "9900100", score: 85 }] })).not.toContain("rules=");
     expect(fmt("waf", base)).not.toContain("rules=");
+  });
+});
+
+describe("highlightLine never breaks its own markup", () => {
+  // Strip our tags and decode the three entities escHtml emits: what is left
+  // must be exactly the line that went in. The old highlighter failed this for
+  // any payload holding a status-like number or an IP inside the path.
+  const plain = (html: string) =>
+    html.replace(/<span class="[a-z-]+">/g, "").replace(/<\/span>/g, "")
+      .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+
+  const lines = [
+    // The line that printed ` class="hl-ok">201` on .71, 2026-09-26.
+    '2026-09-26T13:13:31Z [BLOCK] 172.18.0.1 GET /rest/products/search?q=1%27%20OR%201%3D1-- 403 proto=h1 latency=12.90ms waf=12.90ms bytes=125 site=Juice Shop ua="curl/8.5.0" rule=9900100 score=47 id=7c878003',
+    // An IP first in the query — the SSRF shape.
+    '2026-09-26T13:13:31Z [BLOCK] 10.0.0.1 GET /fetch?url=http://169.254.169.254/latest/meta-data/ 403 proto=h1 latency=1ms waf=1ms bytes=0 site=X ua="-"',
+    // A method name and a score-like token inside the path.
+    '2026-09-26T13:13:31Z [PASS] 10.0.0.1 GET /api/GET/score=5/404 200 proto=h2 latency=1ms waf=1ms bytes=0 site=X ua="Mozilla/5.0 (X11; Linux x86_64)"',
+    // Query split at & — status must still be found and the rest left intact.
+    '2026-09-26T13:14:24Z [BLOCK] 10.212.134.14 GET /socket.io/?EIO=4&transport=websocket&sid=[redacted] 101 proto=h1 latency=9ms waf=9ms bytes=0 site=Juice Shop ua="Mozilla/5.0"',
+    // HTML in a payload stays escaped.
+    '2026-09-26T13:14:10Z [BLOCK] 10.0.0.1 GET /s?x=<script>alert(1)</script> 403 proto=h1 latency=1ms waf=1ms bytes=0 site=X ua="-"',
+  ];
+
+  it.each(lines)("round-trips: %s", (line) => {
+    const html = highlightLine(line);
+    expect(plain(html)).toBe(line);
+    expect(html).not.toMatch(/<script/i);
+  });
+
+  it("still colours the status code, IP, method and path", () => {
+    const html = highlightLine(lines[0]);
+    expect(html).toContain('<span class="hl-block">403</span>');
+    expect(html).toContain('<span class="hl-ip">172.18.0.1</span>');
+    expect(html).toContain('<span class="hl-method">GET</span>');
+    expect(html).toContain('<span class="hl-path">/rest/products/search?q=1%27%20OR%201%3D1--</span>');
+    expect(highlightLine(lines[3])).toContain('<span class="hl-ok">101</span>');
   });
 });

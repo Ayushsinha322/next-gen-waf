@@ -4,7 +4,7 @@ import Link from "next/link";
 import { motion } from "framer-motion";
 import { api } from "@/lib/api";
 import { spring } from "@/lib/animations";
-import { fmt, toneOf, lineCounts, attackByRequest, type LogKind, type LineTone } from "@/lib/logFormat";
+import { fmt, toneOf, lineCounts, attackByRequest, highlightLine, type LogKind, type LineTone } from "@/lib/logFormat";
 
 interface LogRow { _lid: number; [k: string]: unknown; }
 type LogStore = Record<LogKind, LogRow[]>;
@@ -24,29 +24,6 @@ const LOG_FILES: LogFile[] = [
 
 const MAX = 500;
 const GROUPS = Array.from(new Set(LOG_FILES.map(f => f.group)));
-
-function escHtml(s: string) {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
-function hl(raw: string): string {
-  return escHtml(raw)
-    .replace(/(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[\d.Z]*)/g, '<span class="hl-ts">$1</span>')
-    .replace(/\[(PASS)\]/g,                           '[<span class="hl-pass">$1</span>]')
-    .replace(/\[(BLOCK|BLOCKED)\]/g,                  '[<span class="hl-blk">$1</span>]')
-    .replace(/\[(ERROR|FATAL)\]/g,                    '[<span class="hl-err">$1</span>]')
-    .replace(/\[(WARN)\]/g,                           '[<span class="hl-warn">$1</span>]')
-    .replace(/\[(CHALLENGE)\]/g,                      '[<span class="hl-chal">$1</span>]')
-    .replace(/\[(LIMIT)\]/g,                          '[<span class="hl-warn">$1</span>]')
-    .replace(/\[(AUDIT|ML|CRS|INFO)\]/g,              '[<span class="hl-info">$1</span>]')
-    .replace(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/g,'<span class="hl-ip">$1</span>')
-    .replace(/\b(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\b/g, '<span class="hl-method">$1</span>')
-    .replace(/\b(403|429|400|401|405|500|502|503)\b/g,'<span class="hl-block">$1</span>')
-    .replace(/\b(200|201|204|301|302|304)\b/g,        '<span class="hl-ok">$1</span>')
-    .replace(/ (\/[^\s"&;]+)/g,                       ' <span class="hl-path">$1</span>')
-    .replace(/proto=(h[123]|-)/g,                     'proto=<span class="hl-method">$1</span>')
-    .replace(/score=(\d+)/g,                          'score=<span class="hl-score">$1</span>');
-}
 
 const TONE_CLASS: Record<LineTone, string> = {
   block: "ll-block", warn: "ll-warn", err: "ll-err", critical: "ll-critical", pass: "ll-pass", info: "ll-info",
@@ -339,7 +316,7 @@ function LogsInner() {
               >
                 <div className="ll-n">{i + 1}</div>
                 {r._simulated ? <span className="ll-sim" title="Fabricated by the development simulator — not real traffic">SIMULATED</span> : null}
-                <div className="ll-t" dangerouslySetInnerHTML={{ __html: hl(fmt(kind, r)) }} />
+                <div className="ll-t" dangerouslySetInnerHTML={{ __html: highlightLine(fmt(kind, r)) }} />
               </motion.div>
             ))
           )}

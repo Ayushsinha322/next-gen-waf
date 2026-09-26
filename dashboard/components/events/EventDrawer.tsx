@@ -189,7 +189,11 @@ export default function EventDrawer({
               background: "var(--bg3)", border: "1px solid var(--border2)",
             }}>
               <div style={{ fontSize: "var(--fs-label)", color: "var(--text3)", textTransform: "uppercase", letterSpacing: "var(--tr-wide)", marginBottom: 6 }}>
-                Matched payload{event.target ? ` — ${event.target}` : ""}
+                Matched payload
+                {/* The parameter keeps its own case: the label is upper-cased
+                    by style, and `ARGS:q` rendered as "ARGS:Q" names a
+                    different, case-sensitive parameter. */}
+                {event.target && <span style={{ textTransform: "none", fontFamily: "var(--font-mono)" }}> — {event.target}</span>}
               </div>
               <code style={{
                 fontFamily: "var(--font-mono)", fontSize: "var(--fs-sm)",
@@ -272,7 +276,16 @@ function MatchedRules({ rules, score }: { rules: EventRule[]; score: number }) {
         Rules that matched ({rules.length}) — {sum} of anomaly score {score}
       </div>
       <div style={{ border: "1px solid var(--border2)", borderRadius: "var(--r2)", overflow: "hidden" }}>
-        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "var(--fs-sm)" }}>
+        {/* Fixed layout with set widths and wrapping cells: the console's global
+            table style keeps cells on one line, and a CRS message is long enough
+            to push "Where" and "Score" out of a 560 px drawer entirely. */}
+        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "var(--fs-sm)", tableLayout: "fixed" }}>
+          <colgroup>
+            <col style={{ width: 96 }} />
+            <col />
+            <col style={{ width: 128 }} />
+            <col style={{ width: 52 }} />
+          </colgroup>
           <thead>
             <tr style={{ background: "var(--bg3)", color: "var(--text3)", textAlign: "left" }}>
               <th style={{ padding: "6px 8px", fontWeight: 500 }}>Rule</th>
@@ -284,9 +297,9 @@ function MatchedRules({ rules, score }: { rules: EventRule[]; score: number }) {
           <tbody>
             {rules.map((r, i) => (
               <tr key={`${r.id}-${i}`} style={{ borderTop: "1px solid var(--border2)" }} title={r.matched ? `matched: ${r.matched}` : undefined}>
-                <td style={{ padding: "6px 8px", fontFamily: "var(--font-mono)", whiteSpace: "nowrap" }}>{r.id}</td>
-                <td style={{ padding: "6px 8px", color: "var(--text2)" }}>{r.msg || "—"}</td>
-                <td style={{ padding: "6px 8px", fontFamily: "var(--font-mono)", color: "var(--text2)", overflowWrap: "anywhere" }}>{r.target || "—"}</td>
+                <td style={{ padding: "6px 8px", fontFamily: "var(--font-mono)", whiteSpace: "normal", overflowWrap: "anywhere" }}>{r.id}</td>
+                <td style={{ padding: "6px 8px", color: "var(--text2)", whiteSpace: "normal", overflowWrap: "anywhere" }}>{r.msg || "—"}</td>
+                <td style={{ padding: "6px 8px", fontFamily: "var(--font-mono)", color: "var(--text2)", whiteSpace: "normal", overflowWrap: "anywhere" }}>{r.target || "—"}</td>
                 <td style={{ padding: "6px 8px", fontFamily: "var(--font-mono)", textAlign: "right" }}>{r.score}</td>
               </tr>
             ))}
