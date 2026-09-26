@@ -4,6 +4,8 @@
  * All storage reads/writes are guarded against SSR (typeof window check).
  */
 
+import { setSessionCookie, SESSION_COOKIE } from "@/lib/sessionCookie";
+
 const ACCESS_KEY  = "sentinel_access_token";
 const REFRESH_KEY = "sentinel_refresh_token";
 const USER_KEY    = "sentinel_user";
@@ -88,10 +90,9 @@ export async function login(email: string, password: string, mfaCode?: string): 
   store(ACCESS_KEY,  data.access_token);
   store(REFRESH_KEY, data.refresh_token);
   store(USER_KEY,    JSON.stringify(data.user));
-  // Set cookie so Next.js middleware allows page navigations.
-  if (typeof document !== "undefined") {
-    document.cookie = `sentinel_token=${data.access_token}; path=/; max-age=604800; SameSite=Lax`;
-  }
+  // Marker cookie so the Next.js middleware lets page navigations through —
+  // never the token itself. See lib/sessionCookie.ts.
+  setSessionCookie();
   return data;
 }
 
@@ -153,7 +154,7 @@ export async function signOut(): Promise<void> {
 /** Expire the sentinel_token cookie immediately. */
 export function clearSessionCookie() {
   if (typeof document !== "undefined") {
-    document.cookie = "sentinel_token=; path=/; max-age=0; SameSite=Lax";
+    document.cookie = `${SESSION_COOKIE}=; path=/; max-age=0; SameSite=Lax${typeof location !== "undefined" && location.protocol === "https:" ? "; Secure" : ""}`;
   }
 }
 
@@ -210,9 +211,8 @@ async function doRefresh(): Promise<RefreshOutcome> {
   const data = await res.json().catch(() => ({}));
   if (!data.access_token) return "unavailable";
   store(ACCESS_KEY, data.access_token);
-  if (typeof document !== "undefined") {
-    document.cookie = `sentinel_token=${data.access_token}; path=/; max-age=604800; SameSite=Lax`;
-  }
+  // Also rewrites a token-valued cookie left by an older console.
+  setSessionCookie();
   return "ok";
 }
 

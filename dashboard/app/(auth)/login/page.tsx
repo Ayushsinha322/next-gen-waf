@@ -209,13 +209,8 @@ export default function LoginPage() {
     setBtnState("loading");
     setLoginError("");
     try {
+      // login() stores the tokens and sets the session marker cookie itself.
       await login(email, password, mfaCode || undefined);
-      const token = typeof window !== "undefined"
-        ? localStorage.getItem("sentinel_access_token")
-        : null;
-      if (token) {
-        document.cookie = `sentinel_token=${token}; path=/; max-age=604800; SameSite=Lax`;
-      }
       setBtnState("success");
       setTimeout(() => router.push("/overview"), 900);
     } catch (err: unknown) {

@@ -3931,6 +3931,11 @@ async fn proxy_inner(
             );
         }
     }
+    // Never hand an origin the console's own session cookie. Browsers scope
+    // cookies by host, not port, so a console reached at https://host:9443 has
+    // its cookie sent to every site the WAF serves on that same host — and
+    // until 1.1.11 that cookie WAS the admin access token.
+    strip_console_session_cookie(&mut parts.headers);
     inject_forwarding_headers(&mut parts.headers, peer.ip())?;
 
     // Per-site `Host` override for an origin that virtual-hosts on an internal
@@ -6784,6 +6789,70 @@ fn strip_hop_by_hop(headers: &mut http::HeaderMap) {
     }
 }
 
+/// The management console's session cookie. It must never reach an origin; see
+/// [`strip_console_session_cookie`].
+const CONSOLE_SESSION_COOKIE: &str = "sentinel_token";
+
+/// Remove the console's session cookie from a request about to be forwarded to
+/// a protected site, keeping every other cookie byte-for-byte.
+///
+/// Cookies are scoped by host, not port. When an operator reaches the console
+/// at https://10.0.0.5:9443 and the WAF also serves a site on 10.0.0.5, the
+/// browser attaches the console's cookie to every request for that site; until
+/// 1.1.11 its value was the admin's access token, delivered to the origin (and
+/// over plain HTTP, readable by the origin's own scripts). The console now
+/// stores only a marker in it, and this makes sure no origin ever receives it
+/// at all — including from a browser still holding a cookie set by an older
+/// console. Only the site path calls this: the management listener forwards to
+/// the console, which needs the cookie.
+///
+/// HTTP/2 and HTTP/3 may split cookies across several `Cookie` fields, so every
+/// field is filtered; a field left empty is dropped.
+fn strip_console_session_cookie(headers: &mut http::HeaderMap) {
+    let fields: Vec<http::HeaderValue> = headers
+        .get_all(http::header::COOKIE)
+        .iter()
+        .cloned()
+        .collect();
+    if fields.is_empty() {
+        return;
+    }
+    let mut touched = false;
+    let mut kept: Vec<String> = Vec::with_capacity(fields.len());
+    for v in &fields {
+        let Ok(text) = v.to_str() else {
+            // Not visible ASCII: cannot be parsed safely, forwarded as it came.
+            kept.push(String::from_utf8_lossy(v.as_bytes()).into_owned());
+            continue;
+        };
+        let pairs: Vec<&str> = text
+            .split(';')
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .collect();
+        let remaining: Vec<&str> = pairs
+            .iter()
+            .copied()
+            .filter(|c| c.split('=').next().map(str::trim) != Some(CONSOLE_SESSION_COOKIE))
+            .collect();
+        if remaining.len() != pairs.len() {
+            touched = true;
+        }
+        if !remaining.is_empty() {
+            kept.push(remaining.join("; "));
+        }
+    }
+    if !touched {
+        return;
+    }
+    headers.remove(http::header::COOKIE);
+    for field in kept {
+        if let Ok(hv) = http::HeaderValue::from_str(&field) {
+            headers.append(http::header::COOKIE, hv);
+        }
+    }
+}
+
 /// Strip hop-by-hop headers but preserve `Upgrade` and `Connection` so that
 /// WebSocket upgrade handshakes pass through to the upstream correctly.
 fn strip_hop_by_hop_except_upgrade(headers: &mut http::HeaderMap) {
@@ -8525,6 +8594,69 @@ fn located_target(
             .unwrap_or_else(|| r.target.clone())
     })
     .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod console_cookie_tests {
+    use super::*;
+
+    fn cookies(h: &http::HeaderMap) -> Vec<String> {
+        h.get_all(http::header::COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn the_console_cookie_never_reaches_an_origin() {
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            http::header::COOKIE,
+            "language=az_AZ; sentinel_token=eyJhbGciOi.payload.sig; welcomebanner_status=dismiss"
+                .parse()
+                .unwrap(),
+        );
+        strip_console_session_cookie(&mut h);
+        assert_eq!(
+            cookies(&h),
+            ["language=az_AZ; welcomebanner_status=dismiss"]
+        );
+    }
+
+    #[test]
+    fn a_cookie_field_left_empty_is_dropped_and_split_fields_are_each_filtered() {
+        // HTTP/2 and HTTP/3 send one cookie per field.
+        let mut h = http::HeaderMap::new();
+        h.append(
+            http::header::COOKIE,
+            "sentinel_token=active".parse().unwrap(),
+        );
+        h.append(http::header::COOKIE, "sid=abc".parse().unwrap());
+        strip_console_session_cookie(&mut h);
+        assert_eq!(cookies(&h), ["sid=abc"]);
+
+        let mut only = http::HeaderMap::new();
+        only.insert(http::header::COOKIE, "sentinel_token=eyJx".parse().unwrap());
+        strip_console_session_cookie(&mut only);
+        assert!(only.get(http::header::COOKIE).is_none());
+    }
+
+    #[test]
+    fn other_cookies_are_untouched_even_with_similar_names() {
+        let original = "sentinel_token_pref=1; my_sentinel_token=2; a=b";
+        let mut h = http::HeaderMap::new();
+        h.insert(http::header::COOKIE, original.parse().unwrap());
+        strip_console_session_cookie(&mut h);
+        assert_eq!(
+            cookies(&h),
+            [original],
+            "only the exact cookie name is removed"
+        );
+
+        let mut none = http::HeaderMap::new();
+        strip_console_session_cookie(&mut none);
+        assert!(none.is_empty());
+    }
 }
 
 #[cfg(test)]

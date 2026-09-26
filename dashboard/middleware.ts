@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
+import { SESSION_COOKIE, isSessionCookieValue } from "@/lib/sessionCookie";
 
 // Password recovery has to be reachable by someone who cannot sign in, so these
 // two routes are public alongside the login page. They carry no data of their
@@ -7,19 +8,6 @@ import type { NextRequest } from "next/server";
 // without a token the server independently validates.
 const PUBLIC_PATHS = ["/login", "/forgot-password", "/reset-password", "/api/"];
 
-function isValidJWT(token: string): boolean {
-  // A JWT has exactly 3 base64url segments separated by dots.
-  // We only check structure here — the Go API enforces actual expiry on every
-  // request, and the client silently refreshes the access token via refreshToken().
-  const parts = token.split(".");
-  if (parts.length !== 3) return false;
-  try {
-    JSON.parse(Buffer.from(parts[1], "base64").toString("utf8"));
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 /**
  * Build the Content-Security-Policy for this response.
@@ -117,14 +105,15 @@ export function middleware(request: NextRequest) {
     return applyTo(NextResponse.next(forward));
   }
 
-  // Check for access token in cookies (set by the login page after auth).
-  const token = request.cookies.get("sentinel_token")?.value;
-  if (!token || !isValidJWT(token)) {
+  // The session marker cookie (lib/sessionCookie.ts) — a gate for page
+  // navigations only; every API call is authenticated by its own header.
+  const token = request.cookies.get(SESSION_COOKIE)?.value;
+  if (!isSessionCookieValue(token)) {
     const loginUrl = request.nextUrl.clone();
     loginUrl.pathname = "/login";
     // Expire the stale cookie in the response so the browser drops it.
     const res = applyTo(NextResponse.redirect(loginUrl));
-    res.cookies.set("sentinel_token", "", { path: "/", maxAge: 0 });
+    res.cookies.set(SESSION_COOKIE, "", { path: "/", maxAge: 0 });
     return res;
   }
 
