@@ -50,12 +50,22 @@ pub const MAX_SCAN_BYTES: usize = 512 * 1024;
 ///
 /// Order matters for [`DlpEngine::scan`] (first match wins). The first eight
 /// entries mirror the original proxy detector; the final three add India PII.
+///
+/// Every word boundary is the ASCII one, `(?-u:\b)`, never a bare `\b`. The
+/// `regex` crate's fast engine cannot evaluate a Unicode word boundary once the
+/// text holds a single non-ASCII byte, and falls back to one that is an order
+/// of magnitude slower. Measured on a 346 KB bundle: 2 ms scanned as ASCII,
+/// 37 ms with 1,220 bytes of translated strings sprinkled in — and a login
+/// page's JavaScript on the eNlight360 UAT console spent ~250 ms in DLP. Any
+/// Hindi-language page or JSON body pays the same. Nothing is lost: every value
+/// these patterns look for (card numbers, PAN, Aadhaar, keys) is ASCII, and an
+/// ASCII boundary still falls between an accented letter and a digit.
 const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // Credit / debit card numbers (Luhn-shaped 13-19 digit groups).
     // Word-boundary anchored (the proxy used `(?<!\d)...(?!\d)`, unsupported by
     // the `regex` crate).
     (
-        r"\b(?:4[0-9]{12,15}|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12}|(?:2131|1800|35\d{3})\d{11})\b",
+        r"(?-u:\b)(?:4[0-9]{12,15}|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12}|(?:2131|1800|35\d{3})\d{11})(?-u:\b)",
         "credit_card",
     ),
     // The same cards as people actually print them: 4-4-4-4 (Visa/MC/Discover)
@@ -63,19 +73,19 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // pattern above misses "4111 1111 1111 1111"; the only reason a spaced PAN
     // was ever caught was the Aadhaar pattern matching part of it by accident.
     (
-        r"\b(?:4\d{3}|5[1-5]\d{2}|6(?:011|5\d{2}))[ -]\d{4}[ -]\d{4}[ -]\d{4}\b|\b3[47]\d{2}[ -]\d{6}[ -]\d{5}\b",
+        r"(?-u:\b)(?:4\d{3}|5[1-5]\d{2}|6(?:011|5\d{2}))[ -]\d{4}[ -]\d{4}[ -]\d{4}(?-u:\b)|(?-u:\b)3[47]\d{2}[ -]\d{6}[ -]\d{5}(?-u:\b)",
         "credit_card",
     ),
     // US Social Security Number. Word-boundary anchored (the proxy used
     // negative look-aheads to exclude reserved ranges; not supported here).
-    (r"\b\d{3}-\d{2}-\d{4}\b", "ssn"),
+    (r"(?-u:\b)\d{3}-\d{2}-\d{4}(?-u:\b)", "ssn"),
     // PEM private key header.
     (
         r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----",
         "private_key",
     ),
     // AWS access key.
-    (r"\bAKIA[0-9A-Z]{16}\b", "aws_access_key"),
+    (r"(?-u:\b)AKIA[0-9A-Z]{16}(?-u:\b)", "aws_access_key"),
     // AWS secret key (contextual — next to a known keyword).
     (
         r#"(?i)aws[_\-\s]*secret[_\-\s]*(?:access[_\-\s]*)?key["'\s:=]+[A-Za-z0-9/+]{40}"#,
@@ -83,7 +93,7 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     ),
     // Generic high-entropy API / bearer tokens in JSON.
     (
-        r#"(?i)(?:"|\b)(?:api[_-]?key|access[_-]?token|auth[_-]?token|bearer|secret)["\s]*[:=]+\s*["']?[A-Za-z0-9/+_\-]{32,}"#,
+        r#"(?i)(?:"|(?-u:\b))(?:api[_-]?key|access[_-]?token|auth[_-]?token|bearer|secret)["\s]*[:=]+\s*["']?[A-Za-z0-9/+_\-]{32,}"#,
         "api_token",
     ),
     // Password leaked in a JSON response.
@@ -92,14 +102,14 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
         "password_in_json",
     ),
     // Generic private-looking 40-char hex string (git-style secrets).
-    (r"\b[0-9a-f]{40}\b", "hex_secret"),
+    (r"(?-u:\b)[0-9a-f]{40}(?-u:\b)", "hex_secret"),
     // India — Permanent Account Number (format AAAAA9999A).
-    (r"\b[A-Z]{5}[0-9]{4}[A-Z]\b", "indian_pan"),
+    (r"(?-u:\b)[A-Z]{5}[0-9]{4}[A-Z](?-u:\b)", "indian_pan"),
     // India — Aadhaar (UIDAI) 12-digit number, first digit 2-9, optional
     // 4-4-4 spacing.
-    (r"\b[2-9]\d{3}\s?\d{4}\s?\d{4}\b", "aadhaar"),
+    (r"(?-u:\b)[2-9]\d{3}\s?\d{4}\s?\d{4}(?-u:\b)", "aadhaar"),
     // India — 10-digit mobile number starting 6-9, optional +91 prefix.
-    (r"(?:\+?91[-\s]?)?[6-9]\d{9}\b", "indian_mobile"),
+    (r"(?:\+?91[-\s]?)?[6-9]\d{9}(?-u:\b)", "indian_mobile"),
 ];
 
 /// Label reported for a match against a user-supplied pattern.
@@ -312,6 +322,41 @@ mod tests {
     /// Build an engine with no user patterns.
     fn engine() -> DlpEngine {
         DlpEngine::new(&[])
+    }
+
+    #[test]
+    fn no_builtin_uses_a_unicode_word_boundary() {
+        // A bare `\b` is Unicode-aware, and one non-ASCII byte in the body then
+        // drops every scan to the slow engine — ~250 ms on a login page's
+        // JavaScript. See BUILTIN_PATTERNS.
+        for (pat, label) in BUILTIN_PATTERNS {
+            let bare = pat.replace(r"(?-u:\b)", "");
+            assert!(
+                !bare.contains(r"\b"),
+                "{label}: use (?-u:\\b), not \\b — {pat}"
+            );
+        }
+    }
+
+    #[test]
+    fn values_beside_non_ascii_text_are_still_found() {
+        // The ASCII boundary must still fall between an accented or non-Latin
+        // character and the value.
+        let e = engine();
+        assert_eq!(
+            e.scan("Numéro de carte: 4111111111111111 éé".as_bytes()),
+            Some("credit_card")
+        );
+        assert_eq!(
+            e.scan("पैन कार्ड ABCDE1234F है".as_bytes()),
+            Some("indian_pan")
+        );
+        assert_eq!(
+            e.scan("clé AKIAIOSFODNN7EXAMPLE fin".as_bytes()),
+            Some("aws_access_key")
+        );
+        // And still not inside a longer run of word characters.
+        assert_eq!(e.scan(b"id=x4111111111111111y"), None);
     }
 
     #[test]

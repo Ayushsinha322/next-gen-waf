@@ -4119,10 +4119,13 @@ async fn proxy_inner(
     // scanner is enabled for the site, OR the site's rule set has response-body
     // rules (e.g. CRS RESPONSE-* data-leakage rules).  Most sites have neither,
     // so the response streams straight through with zero added latency.
-    let dlp = dlp_map.get(&site_cfg.id).filter(|d| d.enabled);
-    // The response RULES read only the media types they were written for —
-    // see `response_rules_apply`. DLP keeps its wider net below: an API leaking
-    // a card number in JSON is exactly what it is for.
+    // Each scanner reads only the media types it is for — see `dlp_applies` and
+    // `response_rules_apply`. Anything else (media, downloads, scripts,
+    // stylesheets) streams straight through unbuffered.
+    let dlp = dlp_map
+        .get(&site_cfg.id)
+        .filter(|d| d.enabled)
+        .filter(|_| dlp_applies(&resp_parts.headers));
     let resp_engine = resp_engines
         .get(&site_cfg.id)
         .filter(|e| e.has_response_body_rules())
@@ -4130,26 +4133,6 @@ async fn proxy_inner(
     let needs_inspection = dlp.is_some() || resp_engine.is_some();
 
     let final_body: BoxBody = if needs_inspection {
-        // Only buffer text-ish responses; skip binary/media to avoid breaking
-        // streaming downloads.
-        // Any of the Content-Type headers, not just the first: an origin that
-        // emits two (nginx `return` + `add_header` does) put a binary type
-        // first and slipped a card number past the scanner. No header at all
-        // is scannable too — an origin that does not say is not trusted.
-        let cts: Vec<&str> = resp_parts
-            .headers
-            .get_all(header::CONTENT_TYPE)
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-            .collect();
-        let is_scannable = cts.is_empty()
-            || cts.iter().any(|ct| {
-                ct.contains("text")
-                    || ct.contains("json")
-                    || ct.contains("xml")
-                    || ct.contains("javascript")
-            });
-
         // A response that DECLARES an oversized length streams straight through
         // — no point buffering to discover what the origin already told us.
         let declared_oversize = resp_body
@@ -4157,7 +4140,7 @@ async fn proxy_inner(
             .upper()
             .is_some_and(|u| u > RESPONSE_SCAN_CAP as u64);
 
-        if is_scannable && !declared_oversize {
+        if !declared_oversize {
             // Box first so the body is `Unpin` for frame-by-frame reads; every
             // branch below boxes it anyway, so this costs nothing extra.
             match buffer_for_scan(resp_body.boxed(), RESPONSE_SCAN_CAP).await {
@@ -5115,20 +5098,57 @@ fn seed_crs_policy(ctx: &mut RequestContext, s: &SiteConfig) {
 const RESPONSE_RULE_MIME_TYPES: [&str; 3] = ["text/html", "text/plain", "text/xml"];
 
 fn response_rules_apply(headers: &http::HeaderMap) -> bool {
+    response_declares(headers, |media| RESPONSE_RULE_MIME_TYPES.contains(&media))
+}
+
+/// Whether DLP reads this response: pages and data — any `text/*`, JSON or XML
+/// type — but not scripts or stylesheets.
+///
+/// A JavaScript bundle or a stylesheet is the application's own code, shipped
+/// identically to every visitor; it carries no visitor's card number or
+/// Aadhaar. Scanning them cost real time — the eNlight360 login page's 346 KB
+/// bundle, served as `text/javascript`, was buffered and scanned on every
+/// load — and with `action: block` a digit run in minified code that happened
+/// to look like a card number would have replaced the script with a block
+/// page. An API that returns data as JSONP (`application/javascript`) is not
+/// scanned either; that pattern predates CORS and is rare.
+fn dlp_applies(headers: &http::HeaderMap) -> bool {
+    response_declares(headers, |media| {
+        !matches!(
+            media,
+            "text/css"
+                | "text/javascript"
+                | "text/ecmascript"
+                | "application/javascript"
+                | "application/x-javascript"
+                | "application/ecmascript"
+        ) && (media.starts_with("text/") || media.contains("json") || media.contains("xml"))
+    })
+}
+
+/// Whether the response's Content-Type satisfies `wanted`.
+///
+/// Any of the Content-Type headers, not just the first: an origin that emits
+/// two (nginx `return` + `add_header` does) put a binary type first and slipped
+/// a card number past the scanner. A response that does not say — no header,
+/// or one that is empty or unreadable — is inspected: an origin that does not
+/// say what it sent is not trusted to be harmless. The media type is compared
+/// lowercased, without parameters.
+fn response_declares(headers: &http::HeaderMap, wanted: impl Fn(&str) -> bool) -> bool {
     let mut cts = headers.get_all(header::CONTENT_TYPE).iter().peekable();
     if cts.peek().is_none() {
         return true;
     }
-    // Any of the Content-Type headers, as for DLP: a second header must not
-    // be a way past the scanner.
-    cts.filter_map(|v| v.to_str().ok()).any(|ct| {
-        let media = ct
+    cts.any(|v| {
+        let media = v
+            .to_str()
+            .unwrap_or("")
             .split(';')
             .next()
             .unwrap_or("")
             .trim()
             .to_ascii_lowercase();
-        RESPONSE_RULE_MIME_TYPES.contains(&media.as_str())
+        media.is_empty() || wanted(&media)
     })
 }
 
@@ -8877,6 +8897,45 @@ mod event_detail_tests {
         assert!(with(&[]));
         // A second header is not a way past the scanner.
         assert!(with(&["application/octet-stream", "text/html"]));
+    }
+
+    #[test]
+    fn dlp_reads_pages_and_data_but_not_scripts_or_stylesheets() {
+        let with = |cts: &[&str]| {
+            let mut h = http::HeaderMap::new();
+            for ct in cts {
+                h.append(http::header::CONTENT_TYPE, ct.parse().unwrap());
+            }
+            dlp_applies(&h)
+        };
+        for ct in [
+            "text/html; charset=utf-8",
+            "text/plain",
+            "text/csv",
+            "application/json",
+            "application/problem+json",
+            "application/xml",
+            "application/soap+xml",
+        ] {
+            assert!(with(&[ct]), "{ct} carries data and must be scanned");
+        }
+        // The login page's bundle on the UAT console, and its kin.
+        for ct in [
+            "text/javascript",
+            "application/javascript; charset=utf-8",
+            "application/x-javascript",
+            "text/css",
+            "image/png",
+            "application/octet-stream",
+            // "text" appeared in this binary type's name; the old substring
+            // test scanned OpenDocument zips.
+            "application/vnd.oasis.opendocument.text",
+        ] {
+            assert!(!with(&[ct]), "{ct} must stream unscanned");
+        }
+        assert!(with(&[]), "no Content-Type is not trusted to be harmless");
+        assert!(with(&[""]), "an empty one neither");
+        assert!(with(&["text/javascript", "application/json"]));
     }
 
     #[test]
