@@ -8815,6 +8815,46 @@ mod event_detail_tests {
     }
 
     #[test]
+    fn a_session_cookie_is_withheld_whatever_it_is_called() {
+        // The eNlight360 UAT console, 2026-09-29: an Express session cookie
+        // named `node-js`, which no name list would ever call sensitive.
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            "cookie",
+            "node-js=s%3AaBcD1234efGH.QmVyeVNlY3JldFNpZ25hdHVyZQ; theme=dark"
+                .parse()
+                .unwrap(),
+        );
+        // HTTP/2 and HTTP/3 send one cookie per field.
+        h.append("cookie", "lang=en".parse().unwrap());
+        let m = redacted_request_headers(&h);
+        let cookie = m["cookie"].as_str().unwrap();
+        assert_eq!(
+            cookie,
+            "node-js=[redacted]; theme=[redacted], lang=[redacted]"
+        );
+        assert!(!cookie.contains("s%3A"), "{cookie}");
+    }
+
+    #[test]
+    fn a_cookie_borne_attack_is_still_evidenced_by_the_rule_match() {
+        // Withholding cookie values from the header dump must not hide an
+        // attack delivered in a cookie: the rule's own match carries it. CRS
+        // 942100 is multi-target (REQUEST_COOKIES|ARGS|…), so its match has no
+        // single target and its text is shown (the VM has already withheld any
+        // value of a credential-named cookie).
+        let mut c = ctx("/");
+        c.request_headers
+            .insert("cookie", "theme=' OR 1=1--; sid=abc".parse().unwrap());
+        c.rule_matches = vec![rm("942100", 5, "", "' OR 1=1--")];
+        let v = sentinel_rules::RequestValues::from_ctx(&c);
+        let rules = matched_rules_detail(&c, &v);
+        assert_eq!(rules[0]["matched"], "' OR 1=1--");
+        let headers = redacted_request_headers(&c.request_headers);
+        assert_eq!(headers["cookie"], "theme=[redacted]; sid=[redacted]");
+    }
+
+    #[test]
     fn response_rules_read_only_the_pages_they_were_written_for() {
         let with = |cts: &[&str]| {
             let mut h = http::HeaderMap::new();
@@ -8929,13 +8969,9 @@ mod event_detail_tests {
             );
         }
         let cookie = get("cookie");
-        assert!(
-            cookie.contains("lang=en"),
-            "non-sensitive cookie kept: {cookie}"
-        );
-        assert!(
-            !cookie.contains("s3cr3t") && !cookie.contains("zzz"),
-            "session cookies redacted: {cookie}"
+        assert_eq!(
+            cookie, "lang=[redacted]; sid=[redacted]; session_id=[redacted]",
+            "every cookie keeps its name and loses its value"
         );
         assert!(
             !get("referer").contains("t0k3n"),
@@ -8993,10 +9029,19 @@ mod event_detail_tests {
 ///
 /// A header whose NAME is sensitive (Authorization, X-Api-Key, X-CSRF-Token, …
 /// — the same rule the query-string redaction uses) is replaced whole; the
-/// Cookie header keeps each cookie's name and redacts only sensitive ones, the
-/// way the query string does; Referer and Origin get the URL query redaction.
-/// Capped in count and length: this lands in ClickHouse for 90 days and in the
-/// SIEM, and a hostile client picks its own headers.
+/// Cookie header keeps every cookie's NAME and none of the values; Referer and
+/// Origin get the URL query redaction. Capped in count and length: this lands
+/// in ClickHouse for 90 days and in the SIEM, and a hostile client picks its
+/// own headers.
+///
+/// Cookie values are withheld by position, not by name, because a name says
+/// nothing about what the value is. The first real application behind the WAF
+/// keeps its login session in an Express cookie called `node-js`; judged by
+/// name like the query string, that session was stored whole in 22 events and
+/// shown in the console to anyone who could open one — enough to take over the
+/// user's session. A value an operator needs as evidence is not lost: when a
+/// rule fires on a cookie, the event's `matched` text and the rule's located
+/// target (`REQUEST_COOKIES:theme`) still carry the payload.
 fn redacted_request_headers(h: &http::HeaderMap) -> serde_json::Map<String, serde_json::Value> {
     let mut out = serde_json::Map::new();
     for (name, value) in h.iter() {
@@ -9004,14 +9049,12 @@ fn redacted_request_headers(h: &http::HeaderMap) -> serde_json::Map<String, serd
         let v = value.to_str().unwrap_or("[non-text]");
         let shown = if n == "cookie" {
             v.split(';')
-                .map(|c| {
-                    let c = c.trim();
-                    match c.split_once('=') {
-                        Some((k, _)) if sentinel_core::redact::is_sensitive_field_name(k) => {
-                            format!("{k}={}", sentinel_core::redact::REDACTED)
-                        }
-                        _ => c.to_string(),
-                    }
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .map(|c| match c.split_once('=') {
+                    Some((k, _)) => format!("{}={}", k.trim(), sentinel_core::redact::REDACTED),
+                    // A bare token with no `=` is a value with no name.
+                    None => sentinel_core::redact::REDACTED.to_string(),
                 })
                 .collect::<Vec<_>>()
                 .join("; ")
