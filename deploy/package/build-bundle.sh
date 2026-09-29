@@ -64,7 +64,7 @@ OWN_IMAGES=(dataplane controlplane dashboard migrate)
 THIRD_PARTY=(
   "postgres:16-alpine"
   "valkey/valkey:8-alpine"
-  "clickhouse/clickhouse-server:26.8.14.3-alpine"
+  "clickhouse/clickhouse-server:26.3.35.3-alpine"
   "prom/prometheus:v2.54.1"
   # Used only by compose.ha.yml, which is shipped — so it belongs in the list a
   # customer pre-seeds a registry mirror from, and in the offline bundle.

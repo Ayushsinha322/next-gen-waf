@@ -153,12 +153,20 @@ services:
     # An EXACT version, never a floating tag. `24-alpine` stopped moving at
     # 24.10.2.80, and 24.10 cannot correct its global memory tracker: it drifted
     # to 486 GiB on .71 (real use under 1 GiB) and refused 120,456 merges,
-    # system-log flushes and queries. 26.8 is an LTS line and carries
-    # memory_worker_correct_memory_tracker, which clickhouse-memory.xml turns on.
+    # system-log flushes and queries. 26.3 is an LTS line (supported to about
+    # 2027-03) and carries memory_worker_correct_memory_tracker, which
+    # clickhouse-memory.xml turns on.
+    #
+    # NOT 26.8, although it is the newer LTS: its official build needs x86-64-v2
+    # instructions (SSE4.2, SSSE3, POPCNT) and dies at once with SIGILL, exit
+    # 132, on a VM whose virtual CPU does not expose them. .71's "Common KVM
+    # processor" exposes none of them; 26.8 crash-looped there while 24.10
+    # through 26.3 ran. upgrade.sh test-runs the new image before it switches
+    # anything, so a CPU that cannot run a future pin stops the upgrade cleanly.
     # Moving ClickHouse forward is ONE-WAY — a newer server rewrites metadata an
     # older one cannot read — so this changes only with an upgrade that takes
     # the pre-upgrade backup (upgrade.sh does), and never back.
-    image: ${SENTINEL_THIRDPARTY_PREFIX:-}clickhouse/clickhouse-server:26.8.14.3-alpine
+    image: ${SENTINEL_THIRDPARTY_PREFIX:-}clickhouse/clickhouse-server:26.3.35.3-alpine
     logging: *logging
     restart: unless-stopped
     # 1536m is NOT enough: at that limit ClickHouse's own internal-table merges

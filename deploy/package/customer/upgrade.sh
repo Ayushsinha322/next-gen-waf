@@ -261,7 +261,7 @@ fi
 
 # Every supporting image the NEW compose file names must be on this host BEFORE
 # anything is switched. No upgrade changed one until 1.1.13, so nothing looked;
-# the first that does (ClickHouse 24.10 -> 26.8) would otherwise find out inside
+# the first that does (ClickHouse 24.10 -> 26.3) would otherwise find out inside
 # `compose up`, mid-switch, on a host that cannot reach Docker Hub. An air-gapped
 # package carries them in images.tar.gz (loaded above); an online one pulls them
 # here, where a failure still changes nothing. `config --images` resolves the
@@ -284,6 +284,21 @@ ok "every supporting image the new version names is present"
 # happens. The way back for the event store is the backup taken in step 4.
 CH_NOW=$(docker inspect -f '{{.Config.Image}}' sentinel-clickhouse-1 2>/dev/null || true)
 CH_NEW=$(grep -m1 'clickhouse-server:' <<<"$THIRD_IMAGES" || true)
+
+# ...and the new ClickHouse must actually START on this host. ClickHouse's
+# official builds raise their CPU baseline over time: 26.8 needs x86-64-v2
+# (SSE4.2, SSSE3, POPCNT) and dies at once with SIGILL (exit 132) on a VM whose
+# virtual CPU hides them. compose would then restart it for ever — the event
+# store down — and the rollback below keeps the new compose file, so it would
+# stay down. A one-line query in a throwaway container is the whole test, and it
+# runs while nothing has been changed yet.
+if [[ -n "$CH_NEW" ]]; then
+  if ! docker run --rm --entrypoint clickhouse "$CH_NEW" local -q "SELECT 1" >>"$LOG" 2>&1; then
+    die "the new ClickHouse ($CH_NEW) cannot run on this host — on a virtual machine this usually means its CPU model hides SSE4.2/SSSE3/POPCNT (ask for a host-passthrough or newer CPU model). Nothing was changed."
+  fi
+  ok "the new ClickHouse runs on this host's CPU"
+fi
+
 if [[ -n "$CH_NOW" && -n "$CH_NEW" && "$CH_NOW" != "$CH_NEW" ]]; then
   warn "ClickHouse moves from ${CH_NOW##*:} to ${CH_NEW##*:} — ONE-WAY; the event store's way back is the backup above"
   log "clickhouse image change: $CH_NOW -> $CH_NEW"

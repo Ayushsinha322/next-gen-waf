@@ -11,7 +11,7 @@
 # It reuses the REAL backup.sh/restore.sh code paths (via PG_CONTAINER/
 # CH_CONTAINER overrides), so a green drill means the real scripts work.
 #
-# Usage:  ./drill.sh      (needs docker; pulls postgres:16-alpine, clickhouse-server:26.8.14.3-alpine)
+# Usage:  ./drill.sh      (needs docker; pulls postgres:16-alpine, clickhouse-server:26.3.35.3-alpine)
 # =============================================================================
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,7 +31,7 @@ say "1. start ephemeral postgres + clickhouse"
 docker rm -f "$PGC" "$CHC" >/dev/null 2>&1 || true
 docker run -d --name "$PGC" -e POSTGRES_USER -e POSTGRES_PASSWORD -e POSTGRES_DB postgres:16-alpine >/dev/null
 docker run -d --name "$CHC" -e CLICKHOUSE_USER -e CLICKHOUSE_PASSWORD -e CLICKHOUSE_DB \
-  -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 clickhouse/clickhouse-server:26.8.14.3-alpine >/dev/null
+  -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 clickhouse/clickhouse-server:26.3.35.3-alpine >/dev/null
 
 printf 'waiting for postgres'
 for i in $(seq 1 40); do docker exec "$PGC" pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null 2>&1 && break; printf .; sleep 0.5; done; echo

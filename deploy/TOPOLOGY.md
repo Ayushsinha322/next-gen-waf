@@ -1,7 +1,7 @@
 # Deployment topology
 **Generated** by `deploy/gen-topology.py` from the merged compose configuration. Do not edit by hand.
 
-The production deployment is **3 compose files, 1361 lines**, applied as an override chain:
+The production deployment is **3 compose files, 1369 lines**, applied as an override chain:
 
 1. `deploy/docker/compose.prod.yml`
 2. `deploy/docker/compose.cluster.yml`
@@ -15,7 +15,7 @@ Image tags read `:latest` here because `SENTINEL_VERSION` is not set when this p
 
 | Service | Image | Ports | Depends on | Health | Starts by default |
 |---|---|---|---|---|---|
-| `clickhouse` | `clickhouse/clickhouse-server:26.8.14.3-alpine` | — | — | compose | yes |
+| `clickhouse` | `clickhouse/clickhouse-server:26.3.35.3-alpine` | — | — | compose | yes |
 | `controlplane` | `sentinel/controlplane:latest` | — | clickhouse, migrate, postgres, redis | image | yes |
 | `cp2` | `sentinel/controlplane:latest` | — | clickhouse, migrate, postgres, redis | image | yes |
 | `cp3` | `sentinel/controlplane:latest` | — | clickhouse, migrate, postgres, redis | image | yes |

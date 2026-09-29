@@ -10,7 +10,7 @@ package clickhouse
 //
 // The unit tests here check the SQL we BUILD; only a server can say whether
 // that SQL still parses, runs and returns the shapes the console decodes. It
-// exists for ClickHouse version changes (the 24.10 → 26.8 move was the first):
+// exists for ClickHouse version changes (the 24.10 → 26.3 move was the first):
 // run it against the old version and the new one, on the same data, before
 // changing the pin. The schema is the data plane's — create it first with the
 // sentinel-storage live tests (`cargo test -p sentinel-storage -- --ignored`).

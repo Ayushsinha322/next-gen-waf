@@ -107,7 +107,7 @@ SENTINEL_REPO=/opt/sentinel-waf BACKUP_RCLONE_REMOTE=offsite:sentinel-backups \
 ## Drill (this mechanism is TESTED, not theoretical)
 
 `deploy/backup/drill.sh` spins up throwaway `postgres:16-alpine` +
-`clickhouse-server:26.8.14.3-alpine` (same versions as prod), seeds known rows, runs the **real**
+`clickhouse-server:26.3.35.3-alpine` (same versions as prod), seeds known rows, runs the **real**
 `backup.sh`, destroys the tables, runs the **real** `restore.sh --force`, and asserts
 the restored rows/data match the seed. Run it any time — especially after touching
 the scripts or bumping DB image versions:
