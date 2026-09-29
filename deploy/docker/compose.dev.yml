@@ -52,7 +52,8 @@ services:
       retries: 10
 
   clickhouse:
-    image: clickhouse/clickhouse-server:24-alpine
+    # Same exact version as compose.prod.yml — see the note there.
+    image: clickhouse/clickhouse-server:26.8.14.3-alpine
     container_name: sentinel-clickhouse
     restart: unless-stopped
     mem_limit: 1536m
@@ -63,13 +64,14 @@ services:
       CLICKHOUSE_USER: sentinel
       CLICKHOUSE_PASSWORD: sentinel_dev
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
-      # Cap ClickHouse's own memory bookkeeping so it respects the container limit
-      CLICKHOUSE_MAX_SERVER_MEMORY_USAGE_TO_RAM_RATIO: "0.6"
     ports:
       - "8123:8123"   # HTTP
       - "9000:9000"   # native
     volumes:
       - chdata:/var/lib/clickhouse
+      # Memory-tracker correction + the real memory ratio (the env var that used
+      # to be here was never read by the image). See clickhouse-memory.xml.
+      - ./clickhouse-memory.xml:/etc/clickhouse-server/config.d/memory.xml:ro
 
   minio:
     image: minio/minio:latest

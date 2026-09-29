@@ -549,7 +549,7 @@ Production dependencies only — `npm ls --omit=dev`. Next.js bundles a subset o
 - **Licence:** BSD-3-Clause
 - Container image. Replaced redis:7-alpine, which resolves to 7.4 and is RSALv2/SSPL — not open source and not redistributable in a bundle.
 
-### ClickHouse (clickhouse-server:24-alpine) 24
+### ClickHouse (clickhouse-server:26.8.14.3-alpine) 26.8.14.3
 
 - **Licence:** Apache-2.0
 - Container image, pulled at install time.

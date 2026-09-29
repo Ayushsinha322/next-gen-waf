@@ -16,6 +16,12 @@
 #
 #  Container images: fully. They are still on disk, so switching back is a restart.
 #
+#  Supporting images (Postgres, Redis, ClickHouse, Prometheus): NOT rolled back.
+#  They stay at the version the upgrade installed — the compose files are the new
+#  ones — and that is deliberate for ClickHouse, which cannot move backward: an
+#  older server cannot read what a newer one has written. The event store's way
+#  back to before the upgrade is --restore-db.
+#
 #  Database schema: NOT by itself. Migrations are forward-only. If the upgrade you
 #  are undoing applied migrations, older code will be running against a newer
 #  schema — not a supported state. Restoring the pre-upgrade database backup is

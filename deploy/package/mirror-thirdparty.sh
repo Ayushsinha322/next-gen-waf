@@ -47,7 +47,7 @@ die()  { printf '\n  %s✗ %s%s\n\n' "$RED" "$*" "$R" >&2; exit 1; }
 IMAGES=(
   "postgres:16-alpine"
   "valkey/valkey:8-alpine"
-  "clickhouse/clickhouse-server:24-alpine"
+  "clickhouse/clickhouse-server:26.8.14.3-alpine"
   "prom/prometheus:v2.54.1"
   "haproxy:2.9-alpine"
 )

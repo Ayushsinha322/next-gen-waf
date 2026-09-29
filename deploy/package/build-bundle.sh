@@ -64,7 +64,7 @@ OWN_IMAGES=(dataplane controlplane dashboard migrate)
 THIRD_PARTY=(
   "postgres:16-alpine"
   "valkey/valkey:8-alpine"
-  "clickhouse/clickhouse-server:24-alpine"
+  "clickhouse/clickhouse-server:26.8.14.3-alpine"
   "prom/prometheus:v2.54.1"
   # Used only by compose.ha.yml, which is shipped — so it belongs in the list a
   # customer pre-seeds a registry mirror from, and in the offline bundle.
@@ -169,6 +169,11 @@ cp deploy/docker/clickhouse-tls.xml        "$STAGE/compose/"
 # then come up with no retention at all — the 15 GiB self-log this file exists
 # to prevent. check-bundle-contract.sh catches the omission.
 cp deploy/docker/clickhouse-logging.xml    "$STAGE/compose/"
+# Memory-tracker correction. Mounted unconditionally by compose.prod.yml, so it
+# must always be staged for the same reason as logging.xml above: a missing
+# bind-mount source becomes an empty DIRECTORY, and ClickHouse would come up
+# with the drifting tracker this file exists to correct.
+cp deploy/docker/clickhouse-memory.xml     "$STAGE/compose/"
 cp deploy/docker/clickhouse-reclaim-logs.sh "$STAGE/scripts/" 2>/dev/null || true
 # These two are bind-mounted by the 2vm overlays as ./pg-init-replication.sh and
 # ./pg-standby-entrypoint.sh — RELATIVE TO THE COMPOSE FILE. They were staged only

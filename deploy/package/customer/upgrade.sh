@@ -259,6 +259,36 @@ else
   ok "four images loaded at version $NEW"
 fi
 
+# Every supporting image the NEW compose file names must be on this host BEFORE
+# anything is switched. No upgrade changed one until 1.1.13, so nothing looked;
+# the first that does (ClickHouse 24.10 -> 26.8) would otherwise find out inside
+# `compose up`, mid-switch, on a host that cannot reach Docker Hub. An air-gapped
+# package carries them in images.tar.gz (loaded above); an online one pulls them
+# here, where a failure still changes nothing. `config --images` resolves the
+# same profiles and prefixes `up` will, so it names exactly what will run.
+THIRD_IMAGES=$( cd "$HERE/compose" && docker compose -p sentinel -f compose.prod.yml \
+    --env-file "$ENV_FILE" config --images 2>>"$LOG" ) \
+  || die "could not read the images the new compose file needs — see $LOG. Nothing was changed."
+while IFS= read -r img; do
+  [[ -z "$img" || "$img" =~ /(dataplane|controlplane|dashboard|migrate): ]] && continue
+  if ! docker image inspect "$img" >/dev/null 2>&1; then
+    say "  pulling $img…"
+    docker pull "$img" >>"$LOG" 2>&1 \
+      || die "the new version needs $img, which is not in this package and could not be pulled — see $LOG. Nothing was changed."
+  fi
+done <<<"$THIRD_IMAGES"
+ok "every supporting image the new version names is present"
+
+# A ClickHouse version change is the one image move that cannot be undone: a
+# newer server rewrites metadata an older one cannot read. Say so before it
+# happens. The way back for the event store is the backup taken in step 4.
+CH_NOW=$(docker inspect -f '{{.Config.Image}}' sentinel-clickhouse-1 2>/dev/null || true)
+CH_NEW=$(grep -m1 'clickhouse-server:' <<<"$THIRD_IMAGES" || true)
+if [[ -n "$CH_NOW" && -n "$CH_NEW" && "$CH_NOW" != "$CH_NEW" ]]; then
+  warn "ClickHouse moves from ${CH_NOW##*:} to ${CH_NEW##*:} — ONE-WAY; the event store's way back is the backup above"
+  log "clickhouse image change: $CH_NOW -> $CH_NEW"
+fi
+
 # ── 6. switch version and start ──────────────────────────────────────────────
 step "Step 6 of 8 — applying $NEW"
 printf '%s\n' "$CURRENT" > "$STATE_DIR/previous-version"
@@ -316,7 +346,8 @@ C=(docker compose -p sentinel -f "$INSTALL_DIR/compose.prod.yml" --env-file "$EN
   die "the new compose configuration is invalid — see $LOG. Version reverted; nothing was restarted."
 }
 # `up -d` recreates only services whose image or config changed — postgres, redis
-# and clickhouse are pinned third-party images and are left running.
+# and clickhouse are pinned third-party images and are left running, unless the
+# new compose file pins a new version (checked and announced in step 5).
 say "  recreating changed services (migrations run first, as a dependency)…"
 ( cd "$INSTALL_DIR" && "${C[@]}" up -d >>"$LOG" 2>&1 ) || {
   warn "compose up failed — rolling back"

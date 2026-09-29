@@ -150,7 +150,15 @@ services:
   # Search" (/events) page. Internal-only — no host port is published; both
   # planes reach it over the docker network at clickhouse:8123.
   clickhouse:
-    image: ${SENTINEL_THIRDPARTY_PREFIX:-}clickhouse/clickhouse-server:24-alpine
+    # An EXACT version, never a floating tag. `24-alpine` stopped moving at
+    # 24.10.2.80, and 24.10 cannot correct its global memory tracker: it drifted
+    # to 486 GiB on .71 (real use under 1 GiB) and refused 120,456 merges,
+    # system-log flushes and queries. 26.8 is an LTS line and carries
+    # memory_worker_correct_memory_tracker, which clickhouse-memory.xml turns on.
+    # Moving ClickHouse forward is ONE-WAY — a newer server rewrites metadata an
+    # older one cannot read — so this changes only with an upgrade that takes
+    # the pre-upgrade backup (upgrade.sh does), and never back.
+    image: ${SENTINEL_THIRDPARTY_PREFIX:-}clickhouse/clickhouse-server:26.8.14.3-alpine
     logging: *logging
     restart: unless-stopped
     # 1536m is NOT enough: at that limit ClickHouse's own internal-table merges
@@ -166,10 +174,16 @@ services:
       CLICKHOUSE_USER: ${CLICKHOUSE_USER}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
-      # Keep ClickHouse's own memory accounting within the container limit.
-      CLICKHOUSE_MAX_SERVER_MEMORY_USAGE_TO_RAM_RATIO: "0.6"
+      # No CLICKHOUSE_MAX_SERVER_MEMORY_USAGE_TO_RAM_RATIO here: it sat here as
+      # "0.6" for months and the image's entrypoint reads no such variable, so
+      # every install ran at ClickHouse's default of 0.9. The ratio is now set
+      # where ClickHouse reads it — clickhouse-memory.xml below.
     volumes:
       - chdata:/var/lib/clickhouse
+      # Memory accounting: corrects the global tracker from real usage (see the
+      # file). Committed to the repo, so — like logging.xml — it always exists
+      # and is safe to mount unconditionally.
+      - ./clickhouse-memory.xml:/etc/clickhouse-server/config.d/memory.xml:ro
       # Retention for ClickHouse's OWN logs. Unlike the TLS drop-in below this
       # is safe to mount unconditionally: the file is committed to the repo, so
       # it always exists and Docker can never invent a directory in its place.

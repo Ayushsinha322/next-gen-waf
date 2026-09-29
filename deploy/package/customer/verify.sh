@@ -48,6 +48,34 @@ docker exec sentinel-redis-1 valkey-cli ping 2>/dev/null | grep -q PONG \
 docker exec sentinel-clickhouse-1 wget -qO- http://127.0.0.1:8123/ping 2>/dev/null | grep -q Ok \
   && pass "ClickHouse responding" || bad "ClickHouse not responding"
 
+# ClickHouse memory accounting (compose/clickhouse-memory.xml). A responding
+# ClickHouse can still be refusing work: its global memory tracker is a counter
+# that, on 24.10, drifted to 486 GiB on a server really using under 1 GiB, and
+# it turned away merges and queries at the limit while "ClickHouse responding"
+# stayed green. Compare what it counts with what it really holds.
+gib() { awk -v b="${1:-0}" 'BEGIN { printf "%.1f GiB", b / 1073741824 }'; }
+CH_MEM=$(docker exec sentinel-clickhouse-1 clickhouse-client -q "SELECT
+    (SELECT toInt64(value) FROM system.metrics WHERE metric = 'MemoryTracking'),
+    (SELECT toInt64(value) FROM system.asynchronous_metrics WHERE metric = 'MemoryResident'),
+    (SELECT toInt64(value) FROM system.server_settings WHERE name = 'max_server_memory_usage'),
+    (SELECT any(value) FROM system.server_settings WHERE name = 'memory_worker_correct_memory_tracker')
+  FORMAT TSV" 2>/dev/null || true)
+read -r CH_TRACK CH_RSS CH_LIMIT CH_CORR <<<"$CH_MEM"
+if [[ ! "${CH_TRACK:-}" =~ ^-?[0-9]+$ || ! "${CH_RSS:-}" =~ ^[0-9]+$ ]]; then
+  soft "could not read ClickHouse's memory accounting"
+elif [[ "${CH_LIMIT:-0}" =~ ^[0-9]+$ && "${CH_LIMIT:-0}" -gt 0 && "$CH_TRACK" -ge "$CH_LIMIT" ]]; then
+  bad "ClickHouse counts $(gib "$CH_TRACK") against its limit of $(gib "$CH_LIMIT") while really using $(gib "$CH_RSS") — it is REFUSING work. Restart it: docker restart sentinel-clickhouse-1"
+elif (( CH_TRACK > CH_RSS + 1073741824 )); then
+  soft "ClickHouse's memory counter is drifting: $(gib "$CH_TRACK") counted, $(gib "$CH_RSS") really used"
+else
+  pass "ClickHouse memory accounting sane ($(gib "$CH_TRACK") counted, $(gib "$CH_RSS") used)"
+fi
+if [[ "${CH_CORR:-}" == "1" ]]; then
+  pass "ClickHouse corrects its memory tracker from real usage"
+else
+  soft "ClickHouse memory-tracker correction is OFF — the counter can drift until it refuses work (needs ClickHouse 24.11+ and compose/clickhouse-memory.xml)"
+fi
+
 step "Control plane → database"
 # THE FAILURE THIS EXISTS TO CATCH IS SILENT AND PERMANENT.
 #

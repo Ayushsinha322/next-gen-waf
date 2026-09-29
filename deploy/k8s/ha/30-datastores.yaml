@@ -176,6 +176,22 @@ spec:
     - { name: http,   port: 8123, targetPort: 8123 }
     - { name: native, port: 9000, targetPort: 9000 }
 ---
+# ClickHouse memory accounting — the same two settings as
+# deploy/docker/clickhouse-memory.xml (see that file for the measurements).
+# 24.10 could not correct its global memory tracker; it drifted to hundreds of
+# GiB while using under 1 GiB and refused merges and queries.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sentinel-clickhouse-memory
+  namespace: sentinel
+data:
+  memory.xml: |
+    <clickhouse>
+        <memory_worker_correct_memory_tracker>1</memory_worker_correct_memory_tracker>
+        <max_server_memory_usage_to_ram_ratio>0.9</max_server_memory_usage_to_ram_ratio>
+    </clickhouse>
+---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -201,7 +217,8 @@ spec:
         - { key: node.kubernetes.io/unreachable, operator: Exists, effect: NoExecute, tolerationSeconds: 20 }
       containers:
         - name: clickhouse
-          image: clickhouse/clickhouse-server:24-alpine
+          # Exact version — see deploy/docker/compose.prod.yml. One-way upgrade.
+          image: clickhouse/clickhouse-server:26.8.14.3-alpine
           ports:
             - { name: http,   containerPort: 8123 }
             - { name: native, containerPort: 9000 }
@@ -213,6 +230,7 @@ spec:
             - { name: CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT, value: "1" }
           volumeMounts:
             - { name: chdata, mountPath: /var/lib/clickhouse }
+            - { name: ch-memory-config, mountPath: /etc/clickhouse-server/config.d/memory.xml, subPath: memory.xml, readOnly: true }
           readinessProbe:
             exec: { command: ["sh", "-c", "wget -qO- http://127.0.0.1:8123/ping | grep -q Ok"] }
             initialDelaySeconds: 5
@@ -220,6 +238,8 @@ spec:
           resources:
             requests: { cpu: "250m", memory: "512Mi" }
             limits:   { memory: "1536Mi" }
+      volumes:
+        - { name: ch-memory-config, configMap: { name: sentinel-clickhouse-memory } }
   volumeClaimTemplates:
     - metadata: { name: chdata }
       spec:

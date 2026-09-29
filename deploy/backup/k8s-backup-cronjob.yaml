@@ -102,7 +102,7 @@ spec:
           restartPolicy: Never
           containers:
             - name: ch-backup
-              image: clickhouse/clickhouse-server:24-alpine
+              image: clickhouse/clickhouse-server:26.8.14.3-alpine
               env:
                 - { name: CLICKHOUSE_USER, valueFrom: { configMapKeyRef: { name: sentinel-env, key: CLICKHOUSE_USER } } }
                 - { name: CLICKHOUSE_DB,   valueFrom: { configMapKeyRef: { name: sentinel-env, key: CLICKHOUSE_DB } } }

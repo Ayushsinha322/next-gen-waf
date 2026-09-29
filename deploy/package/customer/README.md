@@ -139,7 +139,7 @@ from Docker Hub on first install:
 ```
 postgres:16-alpine
 redis:7-alpine
-clickhouse/clickhouse-server:24-alpine
+clickhouse/clickhouse-server:26.8.14.3-alpine
 prom/prometheus:v2.54.1
 haproxy:2.9-alpine                  # only used by the two-VM / HA topology
 ```

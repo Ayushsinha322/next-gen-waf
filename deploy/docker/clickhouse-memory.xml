@@ -1,0 +1,56 @@
+<?xml version="1.0"?>
+<!--
+  ClickHouse MEMORY-ACCOUNTING drop-in. Mounted at
+  /etc/clickhouse-server/config.d/memory.xml so it overlays the packaged config.
+
+  THE PROBLEM THIS FIXES
+
+  ClickHouse refuses work when its global memory tracker passes
+  max_server_memory_usage. That tracker is a counter — allocations add, frees
+  subtract — and any accounting asymmetry stays in it for good: nothing but a
+  restart brings it back down. Measured on both deployments (2026-09-29,
+  ClickHouse 24.10.2.80, the version the old `24-alpine` tag is frozen at):
+
+      host   tracker says   real resident   "Memory limit exceeded" errors
+      .71     486.69 GiB       904 MiB             120,456
+      .45     275.21 GiB      1.05 GiB              67,871
+
+  Every refusal read "would use 5.40 GiB … current RSS 1.06 GiB": the server
+  turned away background merges (one retried 5,756 times), its own system-log
+  flushes, and 970 queries — including a traffic_buckets insert — while using a
+  fifth of its limit. Under load it happens in bursts (soak tests, benchmarks);
+  small inserts mostly slip under the per-thread untracked-memory threshold,
+  which is why it looked sporadic rather than like an outage.
+
+  WHAT THIS SETS
+
+  1. memory_worker_correct_memory_tracker = 1. The background memory worker
+     re-baselines the global tracker from a measurement of the memory the
+     process really uses, on every tick (tens of milliseconds), so drift cannot
+     accumulate. Upstream: ClickHouse PR #75714 (25.1, backported to 24.11 and
+     24.12) added it OFF by default; PR #118094 turns it on by default from
+     26.10. 24.10 does not have it at all — hence the image pin in compose.
+
+  2. max_server_memory_usage_to_ram_ratio = 0.9, stated rather than assumed.
+     compose once set CLICKHOUSE_MAX_SERVER_MEMORY_USAGE_TO_RAM_RATIO=0.6, but
+     the official image's entrypoint reads no such variable: every install ran
+     at ClickHouse's own default of 0.9 of the container limit. 0.9 is what the
+     deployments have been proven on, so it is kept — and now it is written
+     where ClickHouse actually reads it. With the tracker corrected from real
+     usage, the limit now means what it says.
+
+  CHECKING IT
+
+      docker exec sentinel-clickhouse-1 clickhouse-client -q "
+        SELECT name, value FROM system.server_settings
+        WHERE name IN ('memory_worker_correct_memory_tracker',
+                       'max_server_memory_usage_to_ram_ratio')"
+
+  and compare system.metrics MemoryTracking with the asynchronous metric
+  MemoryResident: with the correction on they stay within a few hundred MiB.
+  verify.sh reports both.
+-->
+<clickhouse>
+    <memory_worker_correct_memory_tracker>1</memory_worker_correct_memory_tracker>
+    <max_server_memory_usage_to_ram_ratio>0.9</max_server_memory_usage_to_ram_ratio>
+</clickhouse>

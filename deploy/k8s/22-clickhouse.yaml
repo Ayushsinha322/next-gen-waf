@@ -15,6 +15,22 @@ spec:
     - { name: http,   port: 8123, targetPort: 8123 }
     - { name: native, port: 9000, targetPort: 9000 }
 ---
+# ClickHouse memory accounting — the same two settings as
+# deploy/docker/clickhouse-memory.xml (see that file for the measurements).
+# 24.10 could not correct its global memory tracker; it drifted to hundreds of
+# GiB while using under 1 GiB and refused merges and queries.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clickhouse-memory
+  namespace: sentinel
+data:
+  memory.xml: |
+    <clickhouse>
+        <memory_worker_correct_memory_tracker>1</memory_worker_correct_memory_tracker>
+        <max_server_memory_usage_to_ram_ratio>0.9</max_server_memory_usage_to_ram_ratio>
+    </clickhouse>
+---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -30,19 +46,21 @@ spec:
     spec:
       containers:
         - name: clickhouse
-          image: clickhouse/clickhouse-server:24-alpine
+          # Exact version — see deploy/docker/compose.prod.yml. One-way upgrade.
+          image: clickhouse/clickhouse-server:26.8.14.3-alpine
           env:
             - { name: CLICKHOUSE_DB,   valueFrom: { configMapKeyRef: { name: sentinel-env, key: CLICKHOUSE_DB } } }
             - { name: CLICKHOUSE_USER, valueFrom: { configMapKeyRef: { name: sentinel-env, key: CLICKHOUSE_USER } } }
             - { name: CLICKHOUSE_PASSWORD, valueFrom: { secretKeyRef: { name: sentinel-secrets, key: CLICKHOUSE_PASSWORD } } }
             - { name: CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT, value: "1" }
-            # Keep ClickHouse's own memory accounting within the container limit.
-            - { name: CLICKHOUSE_MAX_SERVER_MEMORY_USAGE_TO_RAM_RATIO, value: "0.6" }
+            # The memory ratio is set in the clickhouse-memory ConfigMap. An env
+            # var here ("0.6") was never read by the image's entrypoint.
           ports:
             - { name: http,   containerPort: 8123 }
             - { name: native, containerPort: 9000 }
           volumeMounts:
             - { name: chdata, mountPath: /var/lib/clickhouse }
+            - { name: ch-memory-config, mountPath: /etc/clickhouse-server/config.d/memory.xml, subPath: memory.xml, readOnly: true }
           readinessProbe:
             # /ping needs no auth; busybox wget ships in the alpine image. Use the
             # IPv4 loopback explicitly — `localhost` may resolve to ::1 where
@@ -62,6 +80,8 @@ spec:
           resources:
             requests: { cpu: "250m", memory: "512Mi" }
             limits:   { memory: "1536Mi" }
+      volumes:
+        - { name: ch-memory-config, configMap: { name: clickhouse-memory } }
   volumeClaimTemplates:
     - metadata:
         name: chdata

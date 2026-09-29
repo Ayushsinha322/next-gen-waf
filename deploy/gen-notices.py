@@ -64,7 +64,7 @@ STATIC_COMPONENTS = [
     ("Valkey (valkey/valkey:8-alpine)", "8", "BSD-3-Clause",
      "Container image. Replaced redis:7-alpine, which resolves to 7.4 and is "
      "RSALv2/SSPL — not open source and not redistributable in a bundle."),
-    ("ClickHouse (clickhouse-server:24-alpine)", "24", "Apache-2.0",
+    ("ClickHouse (clickhouse-server:26.8.14.3-alpine)", "26.8.14.3", "Apache-2.0",
      "Container image, pulled at install time."),
     ("Prometheus (prom/prometheus)", "v2.54.1", "Apache-2.0",
      "Container image, pulled at install time."),
