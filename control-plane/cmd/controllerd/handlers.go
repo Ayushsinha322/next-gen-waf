@@ -1537,9 +1537,12 @@ var crsCategoryFiles = map[string]string{
 	//
 	// They are opt-in (see crsResponseCategories) because unlike the request
 	// families they are NOT free: enabling one makes the proxy buffer every
-	// text-ish response for that site, and these rules carry `block` directly
-	// rather than contributing to the anomaly score, so a single match blocks
-	// with no threshold to moderate it.
+	// HTML, plain-text and XML response for that site, and the response is
+	// judged on its own outbound score against CRS's outbound threshold (4, or
+	// the site's crs_policy outbound_anomaly_score_threshold) — so a single
+	// critical leak blocks on its own. (These rules were long described here
+	// as carrying `block` directly; they carry `block` plus an outbound-score
+	// setvar, which the importer used to drop, compiling them to hard blocks.)
 	"leak_generic": "rules/owasp-crs/rules/RESPONSE-950-DATA-LEAKAGES.conf",
 	"leak_sql":     "rules/owasp-crs/rules/RESPONSE-951-DATA-LEAKAGES-SQL.conf",
 	"leak_java":    "rules/owasp-crs/rules/RESPONSE-952-DATA-LEAKAGES-JAVA.conf",
@@ -1574,10 +1577,11 @@ var crsResponseCategories = map[string]bool{
 //	    (default 2). The 10-not-5 choice is what measured TN 99.29%.
 //	REQUEST-949 / RESPONSE-959   26 rules each. CRS's anomaly-mode blocking
 //	    evaluators. Redundant: the importer maps every
-//	    tx.inbound_anomaly_score_plN delta straight onto the rule's score, so
-//	    the VM accumulates the total itself and blocks against the site's
-//	    configured anomaly_threshold. Loading these would add a SECOND deny path
-//	    at CRS's defaults (inbound 5, outbound 4) beside the tuned one.
+//	    tx.inbound_anomaly_score_plN and tx.outbound_anomaly_score_plN delta
+//	    straight onto the rule's score, so the VM accumulates both totals itself
+//	    and blocks against the site's anomaly_threshold (request) and the
+//	    outbound threshold (response). Loading these would add a SECOND deny
+//	    path at CRS's defaults (inbound 5, outbound 4) beside the tuned one.
 //	RESPONSE-980-CORRELATION     19 rules. Reports on the
 //	    blocking_/detection_ aggregates that only 949/959 produce.
 //	REQUEST-905-COMMON-EXCEPTIONS 2 importable rules, both Apache-pinger

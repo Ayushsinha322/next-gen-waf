@@ -462,12 +462,13 @@ export const CRS_REQUEST_CATEGORIES: CrsCategory[] = [
  *
  * Deliberately NOT part of ALL_CRS_KEYS, so they are never enabled implicitly.
  * Two reasons, both visible to the operator in the UI note:
- *   - enabling any of them makes the proxy BUFFER every text-ish response for
- *     the site (up to the scan cap) instead of streaming it through;
- *   - these rules carry `block` directly rather than adding to the anomaly
- *     score, so ONE match blocks the response — the anomaly threshold does not
- *     moderate them. A page that legitimately prints an ORA- code or a MySQL
- *     error will be blocked. */
+ *   - enabling any of them makes the proxy BUFFER every HTML, plain-text and
+ *     XML response for the site (up to the scan cap) instead of streaming it
+ *     through — scripts, stylesheets, JSON and media still stream;
+ *   - a response is judged on its OWN score against the response threshold
+ *     (CRS's 4, or the site's crs_policy outbound_anomaly_score_threshold), so
+ *     ONE critical match blocks it. A page that legitimately prints an ORA-
+ *     code or a MySQL error will be blocked. */
 export const CRS_RESPONSE_CATEGORIES: CrsCategory[] = [
   { key: "leak_sql",     label: "SQL Error Leakage",   desc: "Database errors disclosed in responses (MySQL, Oracle, MSSQL, DB2)" },
   { key: "leak_php",     label: "PHP Error Leakage",   desc: "PHP warnings, stack traces and source disclosure" },

@@ -184,7 +184,20 @@ pub struct RequestContext {
 
     // --- WAF state ---
     pub phase: Phase,
+    /// The INBOUND anomaly score: what the request itself scored.
     pub anomaly_score: u32,
+    /// The OUTBOUND anomaly score: what the RESPONSE scored (CRS RESPONSE-95x
+    /// data-leakage rules raise `tx.outbound_anomaly_score_plN`).
+    ///
+    /// Kept apart from `anomaly_score` the way CRS keeps it, with its own
+    /// threshold (`outbound_threshold`). Folding it into the inbound score would
+    /// let a response push an ordinary request over the site's request
+    /// threshold; dropping it — as the importer once did — compiled every
+    /// response rule into a hard block that recorded a score of 0.
+    pub outbound_anomaly_score: u32,
+    /// The outbound threshold the response was judged against, stamped by the
+    /// proxy when the response body is inspected. `None` = not inspected.
+    pub outbound_threshold: Option<u32>,
     /// Per-engine anomaly contributions (engine name → points), recorded
     /// alongside `anomaly_score` so weighted verdict fusion can apply per-engine
     /// weights and explain which engines drove the verdict.
@@ -266,6 +279,8 @@ impl RequestContext {
             client_accepts_html: false,
             phase: Phase::Connection,
             anomaly_score: 0,
+            outbound_anomaly_score: 0,
+            outbound_threshold: None,
             engine_scores: HashMap::new(),
             rule_matches: Vec::new(),
             ml_scores: HashMap::new(),

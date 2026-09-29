@@ -305,8 +305,17 @@ fn parse_setvar_score_delta(s: &str) -> Option<i32> {
     // anomaly score directly. Category scores (tx.sql_injection_score, etc.)
     // are deliberately ignored to avoid double-counting, and the legacy
     // tx.anomaly_score name is still honoured for older rule sets.
-    let is_score_delta =
-        lhs == "tx.anomaly_score" || lhs.starts_with("tx.inbound_anomaly_score_pl");
+    //
+    // The RESPONSE-95x rules raise tx.outbound_anomaly_score_plN instead, which
+    // 959 sums against its own threshold. Those count too: the rule's phase
+    // tells the VM which total the delta belongs to. Ignoring them left every
+    // response rule as `block` with no score, which the importer compiles to a
+    // HARD block — one match on a JavaScript bundle replaced it with a block
+    // page, and the event recorded a score of 0 beside would_block=true.
+    let is_score_delta = lhs == "tx.anomaly_score"
+        || lhs.starts_with("tx.inbound_anomaly_score_pl")
+        || lhs == "tx.outbound_anomaly_score"
+        || lhs.starts_with("tx.outbound_anomaly_score_pl");
     if !is_score_delta {
         return None;
     }
@@ -443,6 +452,28 @@ mod tests {
         assert_eq!(actions.msg.as_deref(), Some("SQL Injection"));
         assert_eq!(actions.severity, Some(RuleSeverity::Critical));
         assert!(actions.tags.iter().any(|t| t == "owasp-crs"));
+    }
+
+    #[test]
+    fn an_outbound_score_is_the_rules_score_not_a_hard_block() {
+        // RESPONSE-951 rule 951220, action list verbatim apart from the regex.
+        let actions = parse_crs_actions(
+            "id:951220,phase:4,block,capture,t:none,msg:'mssql SQL Information Leakage',\
+             tag:'paranoia-level/1',severity:'CRITICAL',\
+             setvar:'tx.outbound_anomaly_score_pl1=+%{tx.critical_anomaly_score}',\
+             setvar:'tx.sql_injection_score=+%{tx.critical_anomaly_score}'",
+        );
+        assert_eq!(actions.phase, Some(RulePhase::ResponseBody));
+        assert_eq!(
+            actions.score_delta,
+            Some(5),
+            "the outbound delta is the rule's score; the category score is not added"
+        );
+        assert_eq!(
+            parse_setvar_score_delta("tx.outbound_anomaly_score=+4"),
+            Some(4),
+            "the unsuffixed CRS v3 name counts too"
+        );
     }
 
     #[test]

@@ -898,9 +898,10 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                   <div style={{ fontSize: 11, color: "var(--text3)", lineHeight: 1.5, padding: "2px 0 4px" }}>
                     Off by default. These inspect what your <strong>origin sends back</strong>, catching database
                     errors, stack traces and web shells before they reach a visitor. Two costs to know about:
-                    responses are <strong>buffered</strong> instead of streamed, and a single match blocks the
-                    response — the anomaly threshold does not apply. Enable in learning mode first if a page
-                    legitimately prints error text.
+                    HTML, plain-text and XML responses are <strong>buffered</strong> instead of streamed (scripts,
+                    stylesheets, JSON and media still stream), and a response is judged on its own score against a
+                    response threshold of 4 — so one critical match, such as an SQL error, blocks it. Enable in
+                    learning mode first if a page legitimately prints error text.
                   </div>
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
                     {CRS_RESPONSE_CATEGORIES.map(c => <CatTile key={c.key} c={c} on={form.rule_categories.includes(c.key)} onClick={() => toggleCat(c.key)} />)}

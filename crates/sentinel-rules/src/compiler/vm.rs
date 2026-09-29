@@ -6,6 +6,11 @@ use crate::dsl::ast::{
     InterpCmp, RuleAction, RulePhase, RuleSeverity, SetVar, SetVarOp, Transform,
 };
 
+/// Whether `phase` inspects the response rather than the request.
+fn is_response_phase(phase: &Phase) -> bool {
+    matches!(phase, Phase::ResponseHeaders | Phase::ResponseBody)
+}
+
 fn rule_phase_to_phase(rp: RulePhase) -> Phase {
     match rp {
         RulePhase::Connection => Phase::Connection,
@@ -1136,6 +1141,7 @@ pub fn evaluate(
     phase: Phase,
     anomaly_threshold: u32,
 ) -> WafDecision {
+    let response_phase = is_response_phase(&phase);
     let phase_idx = phase as usize;
     let program = &ruleset.phase_programs[phase_idx];
 
@@ -1576,15 +1582,20 @@ pub fn evaluate(
                             }
                         }
                         // Short-circuit: if anomaly score exceeds threshold, block immediately.
+                        // A response phase is judged on the OUTBOUND total, and
+                        // the caller passes the outbound threshold for it.
+                        let (score, which) = if response_phase {
+                            (ctx.outbound_anomaly_score, "outbound anomaly score")
+                        } else {
+                            (ctx.anomaly_score, "anomaly score")
+                        };
                         if anomaly_threshold > 0
-                            && ctx.anomaly_score >= anomaly_threshold
+                            && score >= anomaly_threshold
                             && ctx.decision == WafDecision::Allow
                         {
                             ctx.decision = WafDecision::Block;
-                            ctx.block_reason = Some(format!(
-                                "anomaly score {} >= threshold {}",
-                                ctx.anomaly_score, anomaly_threshold
-                            ));
+                            ctx.block_reason =
+                                Some(format!("{which} {score} >= threshold {anomaly_threshold}"));
                             return WafDecision::Block;
                         }
                     } else {
@@ -1635,9 +1646,17 @@ fn fire_rule(
         }
     }
 
-    // Add anomaly score
+    // Add anomaly score — to the total of the side it judges. A rule in a
+    // response phase scores the RESPONSE (CRS's outbound score), and must never
+    // raise the request's score toward the site's request threshold.
     if meta.score_delta > 0 {
-        ctx.anomaly_score = ctx.anomaly_score.saturating_add(meta.score_delta as u32);
+        if is_response_phase(&phase) {
+            ctx.outbound_anomaly_score = ctx
+                .outbound_anomaly_score
+                .saturating_add(meta.score_delta as u32);
+        } else {
+            ctx.anomaly_score = ctx.anomaly_score.saturating_add(meta.score_delta as u32);
+        }
     }
 
     // Apply setvar mutations to the per-request TX store. Runs whenever the rule

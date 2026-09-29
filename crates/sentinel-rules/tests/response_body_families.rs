@@ -37,9 +37,13 @@ fn scan(files: &[&str], body: &str, seed_paranoia: bool) -> RequestContext {
             .insert("DETECTION_PARANOIA_LEVEL".to_owned(), "2".to_owned());
     }
     ctx.response_body = Some(body.as_bytes().to_vec().into());
-    // The site's configured anomaly threshold; these rules carry `block`
-    // directly, so the threshold is not what drives the decision.
-    eng.evaluate(&mut ctx, Phase::ResponseBody, 10);
+    // The proxy judges a response against the OUTBOUND threshold, not the
+    // site's request threshold — see DEFAULT_OUTBOUND_ANOMALY_THRESHOLD.
+    eng.evaluate(
+        &mut ctx,
+        Phase::ResponseBody,
+        sentinel_rules::DEFAULT_OUTBOUND_ANOMALY_THRESHOLD,
+    );
     ctx
 }
 
@@ -107,22 +111,93 @@ fn each_family_detects_a_real_disclosure() {
         assert_eq!(
             ctx.decision,
             WafDecision::Block,
-            "{file} matched {what} but did not block. These rules carry `block` \
-             directly rather than contributing to the anomaly score, so a match \
-             must be a decision — otherwise enabling the category detects \
-             without protecting. Matched: {:?}",
+            "{file} matched {what} but did not block. A critical leak scores 5 \
+             against the outbound threshold of 4, so a match must be a decision \
+             — otherwise enabling the category detects without protecting. \
+             Matched: {:?}",
             ctx.rule_matches
                 .iter()
                 .map(|m| m.rule_id.clone())
                 .collect::<Vec<_>>()
         );
+        // And the record can say how serious it was. These rules used to
+        // compile to a hard block with no score, so the event read "score 0"
+        // beside would_block=true.
+        assert!(
+            ctx.outbound_anomaly_score >= sentinel_rules::DEFAULT_OUTBOUND_ANOMALY_THRESHOLD,
+            "{file}: the leak must carry its outbound score, got {}",
+            ctx.outbound_anomaly_score
+        );
+        assert!(
+            ctx.rule_matches.iter().all(|m| m.score > 0),
+            "{file}: every matched response rule must record its own score: {:?}",
+            ctx.rule_matches
+                .iter()
+                .map(|m| (m.rule_id.clone(), m.score))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            ctx.anomaly_score, 0,
+            "{file}: a response must never raise the REQUEST score"
+        );
     }
 }
 
+/// The CRS semantics these rules were written for: they add to the outbound
+/// score and 959 blocks at the outbound threshold. So a WARNING-level leak (3)
+/// alone is recorded, not blocked, and a stricter or looser site policy moves
+/// the line — neither was possible while every match was a hard block.
+#[test]
+fn a_response_is_judged_against_the_outbound_threshold() {
+    let conf = r#"
+SecRule RESPONSE_BODY "@contains LEAK_A" \
+    "id:959901,phase:4,block,msg:'test leak A',severity:'WARNING',\
+    setvar:'tx.outbound_anomaly_score_pl1=+%{tx.warning_anomaly_score}'"
+SecRule RESPONSE_BODY "@contains LEAK_B" \
+    "id:959902,phase:4,block,msg:'test leak B',severity:'WARNING',\
+    setvar:'tx.outbound_anomaly_score_pl1=+%{tx.warning_anomaly_score}'"
+"#;
+    let eng = sentinel_rules::RuleEngine::from_crs_conf(conf).expect("compile");
+    let t = sentinel_rules::DEFAULT_OUTBOUND_ANOMALY_THRESHOLD;
+    let run = |body: &str, threshold: u32| {
+        let mut ctx = common::make_ctx();
+        ctx.response_body = Some(body.as_bytes().to_vec().into());
+        eng.evaluate(&mut ctx, Phase::ResponseBody, threshold);
+        ctx
+    };
+
+    let one = run("<p>LEAK_A</p>", t);
+    assert_eq!(
+        one.decision,
+        WafDecision::Allow,
+        "3 < 4: recorded, not blocked"
+    );
+    assert_eq!(one.outbound_anomaly_score, 3);
+    assert_eq!(one.rule_matches.len(), 1);
+    assert_eq!(one.anomaly_score, 0);
+
+    let two = run("<p>LEAK_A LEAK_B</p>", t);
+    assert_eq!(two.decision, WafDecision::Block, "3 + 3 >= 4");
+    assert!(
+        two.block_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("outbound anomaly score 6")),
+        "{:?}",
+        two.block_reason
+    );
+
+    let loose = run("<p>LEAK_A LEAK_B</p>", 10);
+    assert_eq!(
+        loose.decision,
+        WafDecision::Allow,
+        "a site policy of 10 lets 6 through"
+    );
+}
+
 /// False-positive guard. These rules had never run against anything in
-/// production, and they block on a SINGLE match with no anomaly threshold to
-/// moderate them, so an over-eager pattern is a customer-visible outage rather
-/// than a score nudge.
+/// production, and a single critical match reaches the outbound threshold on
+/// its own, so an over-eager pattern is a customer-visible outage rather than a
+/// score nudge.
 #[test]
 fn ordinary_pages_are_not_blocked_by_any_response_family() {
     let benign = [

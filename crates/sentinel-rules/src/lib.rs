@@ -45,6 +45,13 @@ pub use compiler::vm::RequestValues;
 pub use crs_compat::{import_secrule_conf, import_secrule_conf_dir};
 pub use dsl::{ast, parse_rule_file};
 
+/// CRS's default outbound (response) anomaly threshold —
+/// `tx.outbound_anomaly_score_threshold=4` in REQUEST-901. A response is judged
+/// against this unless the site's CRS policy sets that variable. At 4, one
+/// CRITICAL (5) or ERROR (4) leak blocks on its own, as in CRS; a WARNING (3) or
+/// NOTICE (2) needs company.
+pub const DEFAULT_OUTBOUND_ANOMALY_THRESHOLD: u32 = 4;
+
 // ---------------------------------------------------------------------------
 // RuleEngine
 // ---------------------------------------------------------------------------

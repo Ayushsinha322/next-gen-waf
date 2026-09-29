@@ -4120,9 +4120,13 @@ async fn proxy_inner(
     // rules (e.g. CRS RESPONSE-* data-leakage rules).  Most sites have neither,
     // so the response streams straight through with zero added latency.
     let dlp = dlp_map.get(&site_cfg.id).filter(|d| d.enabled);
+    // The response RULES read only the media types they were written for —
+    // see `response_rules_apply`. DLP keeps its wider net below: an API leaking
+    // a card number in JSON is exactly what it is for.
     let resp_engine = resp_engines
         .get(&site_cfg.id)
-        .filter(|e| e.has_response_body_rules());
+        .filter(|e| e.has_response_body_rules())
+        .filter(|_| response_rules_apply(&resp_parts.headers));
     let needs_inspection = dlp.is_some() || resp_engine.is_some();
 
     let final_body: BoxBody = if needs_inspection {
@@ -4182,7 +4186,11 @@ async fn proxy_inner(
                     // (1) Response-body rule engine (CRS RESPONSE-* etc.).
                     if let Some(engine) = resp_engine {
                         ctx.response_body = Some(bytes.clone());
-                        engine.evaluate(ctx, Phase::ResponseBody, site_cfg.waf.anomaly_threshold);
+                        // Judged on the response's own score against the
+                        // outbound threshold, never the site's request one.
+                        let threshold = outbound_threshold(ctx);
+                        ctx.outbound_threshold = Some(threshold);
+                        engine.evaluate(ctx, Phase::ResponseBody, threshold);
                         // Respect learning mode (downgrade Block → Log).
                         let gm = governing_mode(ctx, &site_cfg.waf.mode);
                         enforce_mode(ctx, &gm);
@@ -5087,6 +5095,69 @@ fn seed_crs_policy(ctx: &mut RequestContext, s: &SiteConfig) {
         // An operator writing `tx.max_num_args` means `max_num_args`.
         let key = k.trim().trim_start_matches("tx.").trim_start_matches("TX.");
         ctx.tx_vars.insert(key.to_uppercase(), v.clone());
+    }
+}
+
+/// The media types the response-body RULES inspect: ModSecurity's own default,
+/// `SecResponseBodyMimeType text/plain text/html text/xml`.
+///
+/// The CRS RESPONSE-95x leak rules are written for pages a server renders —
+/// error pages, stack traces, directory listings. Run over a minified
+/// JavaScript bundle or a JSON API they match the application's own code and
+/// data: on the first real application behind the WAF, all 34 response
+/// detections were false positives of exactly that kind (953101 on the login
+/// page's JavaScript, 951220 on a JSON product list mentioning "SQL Server"),
+/// every one of them would have blocked, and buffering the bundles put
+/// 400–600 ms of WAF time on the login page.
+///
+/// A response with no Content-Type is still inspected, as DLP treats it: an
+/// origin that does not say what it sent is not trusted to be harmless.
+const RESPONSE_RULE_MIME_TYPES: [&str; 3] = ["text/html", "text/plain", "text/xml"];
+
+fn response_rules_apply(headers: &http::HeaderMap) -> bool {
+    let mut cts = headers.get_all(header::CONTENT_TYPE).iter().peekable();
+    if cts.peek().is_none() {
+        return true;
+    }
+    // Any of the Content-Type headers, as for DLP: a second header must not
+    // be a way past the scanner.
+    cts.filter_map(|v| v.to_str().ok()).any(|ct| {
+        let media = ct
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        RESPONSE_RULE_MIME_TYPES.contains(&media.as_str())
+    })
+}
+
+/// The outbound (response) anomaly threshold for this request: the site's CRS
+/// policy `outbound_anomaly_score_threshold` when it sets a positive number,
+/// otherwise CRS's default of 4.
+fn outbound_threshold(ctx: &RequestContext) -> u32 {
+    ctx.tx_vars
+        .get("OUTBOUND_ANOMALY_SCORE_THRESHOLD")
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|t| *t > 0)
+        .unwrap_or(sentinel_rules::DEFAULT_OUTBOUND_ANOMALY_THRESHOLD)
+}
+
+/// The score that explains this verdict, the threshold it was judged against,
+/// and whether it is the RESPONSE's score.
+///
+/// The request and the response are scored separately (see
+/// `RequestContext::outbound_anomaly_score`), but an event records one score.
+/// It records the response's when the response is what reached its threshold,
+/// or when the response is all that scored; the request's otherwise.
+fn verdict_score(ctx: &RequestContext) -> (u32, Option<u32>, bool) {
+    let reached = |score: u32, t: Option<u32>| t.is_some_and(|t| t > 0 && score >= t);
+    let inbound_hit = reached(ctx.anomaly_score, ctx.anomaly_threshold);
+    let outbound_hit = reached(ctx.outbound_anomaly_score, ctx.outbound_threshold);
+    if ctx.outbound_anomaly_score > 0 && !inbound_hit && (outbound_hit || ctx.anomaly_score == 0) {
+        (ctx.outbound_anomaly_score, ctx.outbound_threshold, true)
+    } else {
+        (ctx.anomaly_score, ctx.anomaly_threshold, false)
     }
 }
 
@@ -8744,6 +8815,88 @@ mod event_detail_tests {
     }
 
     #[test]
+    fn response_rules_read_only_the_pages_they_were_written_for() {
+        let with = |cts: &[&str]| {
+            let mut h = http::HeaderMap::new();
+            for ct in cts {
+                h.append(http::header::CONTENT_TYPE, ct.parse().unwrap());
+            }
+            response_rules_apply(&h)
+        };
+        assert!(with(&["text/html; charset=utf-8"]));
+        assert!(with(&["TEXT/HTML"]));
+        assert!(with(&["text/plain"]));
+        assert!(with(&["text/xml"]));
+        // The two shapes that produced every false positive on the UAT console.
+        assert!(!with(&["application/javascript"]));
+        assert!(!with(&["text/javascript; charset=utf-8"]));
+        assert!(!with(&["application/json"]));
+        assert!(!with(&["text/css"]));
+        assert!(!with(&["image/png"]));
+        // No Content-Type at all is not trusted to be harmless.
+        assert!(with(&[]));
+        // A second header is not a way past the scanner.
+        assert!(with(&["application/octet-stream", "text/html"]));
+    }
+
+    #[test]
+    fn the_outbound_threshold_comes_from_the_site_policy_or_crs() {
+        let mut c = ctx("/");
+        assert_eq!(outbound_threshold(&c), 4);
+        c.tx_vars
+            .insert("OUTBOUND_ANOMALY_SCORE_THRESHOLD".into(), "12".into());
+        assert_eq!(outbound_threshold(&c), 12);
+        c.tx_vars
+            .insert("OUTBOUND_ANOMALY_SCORE_THRESHOLD".into(), "0".into());
+        assert_eq!(outbound_threshold(&c), 4, "0 would block every response");
+    }
+
+    #[test]
+    fn a_response_leak_reports_the_response_score_and_threshold() {
+        // The 2026-09-29 UAT record: rule 951220 in the response body, learning
+        // mode, would_block — recorded as "score 0" with "raise the site's
+        // anomaly threshold above 1".
+        let mut c = ctx("/node/iam-service/dashboard/get_user_modules");
+        c.site_id = Some("uat".into());
+        c.anomaly_threshold = Some(10);
+        c.outbound_threshold = Some(4);
+        c.outbound_anomaly_score = 5;
+        c.would_block = true;
+        let mut m = rm("951220", 5, "RESPONSE_BODY", "SQL Server instances");
+        m.phase = Phase::ResponseBody;
+        c.rule_matches = vec![m];
+        assert_eq!(verdict_score(&c), (5, Some(4), true));
+        let (msg, rem) = explain_event(&c, "DETECT", "951220", "mssql SQL Information Leakage");
+        assert!(
+            msg.contains(
+                "Response anomaly score 5 against the response threshold of 4 (threshold reached)"
+            ),
+            "{msg}"
+        );
+        assert!(
+            rem.contains("raise the response threshold above 5"),
+            "{rem}"
+        );
+        assert!(
+            rem.contains("outbound_anomaly_score_threshold, now 4"),
+            "{rem}"
+        );
+        assert!(!rem.contains("anomaly threshold above 1"), "{rem}");
+
+        // A request that scored is still judged — and explained — on its own score.
+        let mut r = ctx("/search?q=x");
+        r.anomaly_threshold = Some(10);
+        r.anomaly_score = 12;
+        r.outbound_threshold = Some(4);
+        r.outbound_anomaly_score = 5;
+        assert_eq!(verdict_score(&r), (12, Some(10), false));
+        // Neither reached: the request's own score, when it has one.
+        r.anomaly_score = 3;
+        r.outbound_anomaly_score = 2;
+        assert_eq!(verdict_score(&r), (3, Some(10), false));
+    }
+
+    #[test]
     fn headers_are_redacted_by_name_and_cookies_per_cookie() {
         let mut h = http::HeaderMap::new();
         h.insert("user-agent", "Mozilla/5.0 test".parse().unwrap());
@@ -9280,7 +9433,7 @@ fn record_event(ctx: &RequestContext) {
         severity: top
             .map(|r| format!("{:?}", r.severity).to_uppercase())
             .unwrap_or_default(),
-        score: ctx.anomaly_score,
+        score: verdict_score(ctx).0,
         status: ctx.response_status.map(|s| s.as_u16()).unwrap_or(0),
         protocol: protocol_label(ctx.http_version).to_string(),
         // Same correlation id and prose as the NDJSON record, so an event found in
@@ -9314,7 +9467,7 @@ fn record_event(ctx: &RequestContext) {
             None => "node",
         }
         .to_string(),
-        threshold: ctx.anomaly_threshold.unwrap_or(0),
+        threshold: verdict_score(ctx).1.unwrap_or(0),
         explanation: if log_explain_enabled() {
             explain_event_at(
                 ctx,
@@ -9972,14 +10125,18 @@ fn explain_event_at(
     // Why the verdict followed. Only meaningful for score-driven outcomes; a
     // rate-limit or GeoIP block has no score and must not pretend to have one.
     let mut why = String::new();
-    if ctx.anomaly_score > 0 {
-        match ctx.anomaly_threshold {
+    let (score, threshold, outbound) = verdict_score(ctx);
+    let (score_words, threshold_words) = if outbound {
+        ("Response anomaly score", "the response threshold of")
+    } else {
+        ("Cumulative anomaly score", "this site's threshold of")
+    };
+    if score > 0 {
+        match threshold {
             Some(t) => {
                 why = format!(
-                    " Cumulative anomaly score {} against this site's threshold of {}{}.",
-                    ctx.anomaly_score,
-                    t,
-                    if ctx.anomaly_score >= t {
+                    " {score_words} {score} against {threshold_words} {t}{}.",
+                    if score >= t {
                         " (threshold reached)"
                     } else {
                         " (below threshold)"
@@ -9987,10 +10144,23 @@ fn explain_event_at(
                 );
             }
             None => {
-                why = format!(" Cumulative anomaly score {}.", ctx.anomaly_score);
+                why = format!(" {score_words} {score}.");
             }
         }
     }
+    // The threshold advice has to name the threshold that applied. A response
+    // leak is judged on the response's score against the outbound threshold,
+    // so "raise the site's anomaly threshold above 1" — what a leak's event
+    // used to say — pointed at a knob that could not change the outcome.
+    let raise = if outbound {
+        format!(
+            "raise the response threshold above {score} (the site's CRS policy value \
+             outbound_anomaly_score_threshold, now {})",
+            threshold.unwrap_or(sentinel_rules::DEFAULT_OUTBOUND_ANOMALY_THRESHOLD)
+        )
+    } else {
+        format!("raise the site's anomaly threshold above {}", score.max(1))
+    };
     if ctx.threat_intel_hit {
         why.push_str(" The client IP also matched the live threat-intelligence feed.");
     }
@@ -10013,25 +10183,21 @@ fn explain_event_at(
         if target_of(m).is_empty() {
             format!(
                 "If this is legitimate traffic, disable rule {} for site '{}' (Sites → {} → \
-                 Learning Report → Disable), or raise the site's anomaly threshold above {}. This \
+                 Learning Report → Disable), or {raise}. This \
                  rule inspected more than one part of the request, so the exact field is not \
                  recorded — check the payload before excluding anything.",
-                m.rule_id,
-                site,
-                site,
-                ctx.anomaly_score.max(1)
+                m.rule_id, site, site,
             )
         } else {
             format!(
                 "If this is legitimate traffic, exclude rule {} for {} on site '{}' \
-                 (Sites → {} → Learning Report → Disable), or raise the site's anomaly threshold \
-                 above {}. Confirm against the source IP and payload before excluding — an \
-                 exclusion applies to every future request for that target.",
+                 (Sites → {} → Learning Report → Disable), or {raise}. Confirm against the \
+                 source IP and payload before excluding — an exclusion applies to every future \
+                 request for that target.",
                 m.rule_id,
                 humanize_target(target_of(m)),
                 site,
                 site,
-                ctx.anomaly_score.max(1)
             )
         }
     } else {
@@ -10286,8 +10452,12 @@ fn ndjson_log(ctx: &RequestContext) {
             "rule":   rule,
             "target": target,
             "matched": matched,
-            "score":  ctx.anomaly_score,
-            "threshold": ctx.anomaly_threshold,
+            // The score that decided the verdict — the response's for a leak
+            // found in the response (see verdict_score). Both totals follow.
+            "score":  verdict_score(ctx).0,
+            "threshold": verdict_score(ctx).1,
+            "inbound_score": ctx.anomaly_score,
+            "outbound_score": ctx.outbound_anomaly_score,
             // Present only when a per-path override governed this request, so a
             // threshold that differs from the site's is self-explaining.
             "path_override": ctx.path_override,
