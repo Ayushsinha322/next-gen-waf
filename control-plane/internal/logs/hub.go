@@ -669,6 +669,14 @@ func (h *Hub) updateMetrics(e Entry) {
 			Attack     string `json:"attack"`
 			TS         string `json:"ts"`
 			WouldBlock bool   `json:"would_block"`
+			// Every contributing rule (since 1.1.11). The learning report
+			// counts each of them, as the stored report does — see
+			// clickhouse learningSQL.
+			Rules []struct {
+				ID  string `json:"id"`
+				Sev string `json:"sev"`
+				Msg string `json:"msg"`
+			} `json:"rules"`
 		}
 		if json.Unmarshal(e.Data, &row) == nil {
 			blocked := row.Action == "BLOCK" || row.Action == "BLOCKED"
@@ -705,6 +713,12 @@ func (h *Hub) updateMetrics(e Entry) {
 			if (row.Action == "DETECT" || row.WouldBlock) && row.Rule != "" && row.Rule != "-" &&
 				row.Site != "" && row.Site != "-" {
 				h.recordLearningLocked(row.Site, row.Rule, cat, row.Sev, row.Attack, row.Path, row.TS)
+				for _, r := range row.Rules {
+					if r.ID == "" || r.ID == row.Rule {
+						continue
+					}
+					h.recordLearningLocked(row.Site, r.ID, attackCategory(r.ID), r.Sev, r.Msg, row.Path, row.TS)
+				}
 			}
 			h.aggMu.Unlock()
 		}

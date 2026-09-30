@@ -39,8 +39,14 @@ func TestLearningReportCountsOnlyWouldHaveBlocked(t *testing.T) {
 	if !strings.Contains(sql, "rule != '-'") || !strings.Contains(sql, "rule != ''") {
 		t.Fatalf("report must exclude empty/placeholder rule ids: %q", sql)
 	}
-	if !strings.Contains(sql, "GROUP BY rule") {
+	if !strings.Contains(sql, "GROUP BY rule_id") {
 		t.Fatalf("report must aggregate per rule: %q", sql)
+	}
+	// Every contributing rule, from the event's rules list — not the leading
+	// rule alone (code review: a response-leak rule on an already-flagged
+	// request never got a row).
+	if !strings.Contains(sql, "JSONExtractArrayRaw(rules)") || !strings.Contains(sql, "arrayJoin") {
+		t.Fatalf("report must count every rule in the event's rules list: %q", sql)
 	}
 }
 

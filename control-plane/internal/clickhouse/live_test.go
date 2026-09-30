@@ -15,9 +15,8 @@ package clickhouse
 // changing the pin. The schema is the data plane's — create it first with the
 // sentinel-storage live tests (`cargo test -p sentinel-storage -- --ignored`).
 //
-// It writes rows under a tenant of its own and deletes them afterwards, so it
-// is safe on a scratch server and harmless on a shared one — but point it at a
-// scratch server.
+// It writes rows under a tenant of its own and deletes them afterwards (a
+// lightweight DELETE), so it is safe on a scratch server — point it at one.
 
 import (
 	"context"
@@ -54,7 +53,10 @@ func TestLiveEveryControlPlaneQueryRuns(t *testing.T) {
 	tenant := fmt.Sprintf("live-test-%d", time.Now().UnixNano())
 	now := time.Now().UTC()
 	from, to := now.Add(-time.Hour).Unix(), now.Add(time.Hour).Unix()
-	ts := now.Format("2006-01-02 15:04:05")
+	// Epoch seconds, not a "YYYY-MM-DD hh:mm:ss" string: ClickHouse reads a
+	// naive DateTime string in the SERVER's timezone, so on an Asia/Kolkata
+	// server the rows landed 5.5 h away from the ±1 h query window.
+	ts := now.Unix()
 
 	type ev struct{ id, ip, rule, attack, action, sev, country string }
 	events := []ev{
@@ -65,7 +67,7 @@ func TestLiveEveryControlPlaneQueryRuns(t *testing.T) {
 	var rows strings.Builder
 	for _, e := range events {
 		fmt.Fprintf(&rows,
-			`{"ts":"%s","ip":"%s","country":"%s","site":"live.example","tenant":"%s","method":"GET",`+
+			`{"ts":%d,"ip":"%s","country":"%s","site":"live.example","tenant":"%s","method":"GET",`+
 				`"path":"/search","query":"q=x","matched":"' OR 1=1--","rule":"%s","attack":"%s","action":"%s",`+
 				`"severity":"%s","score":5,"status":403,"protocol":"h2","request_id":"%s","target":"ARGS:q",`+
 				`"mode":"blocking","threshold":10,"explanation":"live test","ja4":"t13d_live",`+
@@ -81,14 +83,16 @@ func TestLiveEveryControlPlaneQueryRuns(t *testing.T) {
 	}
 	if _, err := c.query(ctx, fmt.Sprintf(
 		"INSERT INTO %s.traffic_buckets (ts, tenant, site_id, reqs, blocked, p99_ms) FORMAT JSONEachRow\n"+
-			`{"ts":"%s","tenant":"%s","site_id":"live.example","reqs":100,"blocked":3,"p99_ms":12.5}`+"\n",
+			`{"ts":%d,"tenant":"%s","site_id":"live.example","reqs":100,"blocked":3,"p99_ms":12.5}`+"\n",
 		c.db, ts, tenant)); err != nil {
 		t.Fatalf("insert traffic_buckets: %v", err)
 	}
 	t.Cleanup(func() {
 		for _, tbl := range []string{"waf_events", "traffic_buckets"} {
+			// A lightweight DELETE, not ALTER … DELETE: a mutation rewrites every
+			// part of the table, which is not harmless on a large shared server.
 			_, _ = c.query(context.Background(), fmt.Sprintf(
-				"ALTER TABLE %s.%s DELETE WHERE tenant = '%s'", c.db, tbl, esc(tenant)))
+				"DELETE FROM %s.%s WHERE tenant = '%s'", c.db, tbl, esc(tenant)))
 		}
 	})
 
@@ -181,5 +185,27 @@ func TestLiveEveryControlPlaneQueryRuns(t *testing.T) {
 	}
 	if used, free, total, err := c.DiskUsage(ctx); err != nil || total <= 0 || free < 0 || used < 0 || used > 1 {
 		t.Errorf("DiskUsage: used=%v free=%d total=%d err=%v", used, free, total, err)
+	}
+
+	// The learning report counts every rule in a DETECT event's rules list.
+	// Event 3 is a DETECT led by 951220; add one led by 942100 that also lists
+	// 951220, as a learning-mode request that scored AND leaked does.
+	if _, err := c.query(ctx, fmt.Sprintf(
+		"INSERT INTO %s.waf_events (ts, tenant, site, path, rule, attack, action, severity, request_id, rules) FORMAT JSONEachRow\n"+
+			`{"ts":%d,"tenant":"%s","site":"live.example","path":"/both","rule":"942100","attack":"SQL Injection","action":"DETECT","severity":"CRITICAL","request_id":"44444444-4444-4444-8444-444444444444",`+
+			`"rules":"[{\"id\":\"942100\",\"sev\":\"CRITICAL\",\"msg\":\"SQL Injection\"},{\"id\":\"951220\",\"sev\":\"CRITICAL\",\"msg\":\"mssql SQL Information Leakage\"}]"}`+"\n",
+		c.db, now.Unix(), tenant)); err != nil {
+		t.Fatalf("insert learning event: %v", err)
+	}
+	ls, err := c.LearningStats(ctx, tenant, "live.example", from, to, 5)
+	if err != nil {
+		t.Fatalf("LearningStats: %v", err)
+	}
+	counts := map[string]int64{}
+	for _, r := range ls {
+		counts[r.RuleID] = r.Count
+	}
+	if counts["951220"] != 2 || counts["942100"] != 1 {
+		t.Errorf("learning report must count every rule in each DETECT: %v", counts)
 	}
 }

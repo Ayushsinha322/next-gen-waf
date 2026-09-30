@@ -599,18 +599,36 @@ func (c *Client) learningSQL(tenant, site string, from, to int64, sampleCap int)
 	if sampleCap <= 0 || sampleCap > 20 {
 		sampleCap = 5
 	}
+	// Every rule that contributed, not only each event's leading rule. The
+	// report grouped by the event's `rule` column alone, so a false positive
+	// that tripped three rules showed one of them (excluding it left the other
+	// two still over the threshold), and — code review — a response-leak rule
+	// that fired on a request learning mode had already flagged never had a row
+	// at all: the event's leading rule is the request's.
+	//
+	// The leading rule is counted exactly as before, with the event's own
+	// severity and attack label; every OTHER rule in the event's `rules` list
+	// (JSON, written since 1.1.11) is counted once more with its own severity
+	// and message. Rows from before that column have an empty list and count as
+	// they always did.
+	//
 	// argMax over ts for severity/message: the hub's in-memory version let the
 	// most recent non-empty value win, and matching that keeps the two sources
 	// from disagreeing about the same rule.
 	return fmt.Sprintf(
-		"SELECT rule AS rule_id, "+
-			"argMax(severity, ts) AS severity, "+
-			"argMax(attack, ts) AS message, "+
+		"SELECT t.1 AS rule_id, "+
+			"argMax(t.2, ts) AS severity, "+
+			"argMax(t.3, ts) AS message, "+
 			"count() AS count, "+
 			"formatDateTime(max(ts), '%%Y-%%m-%%dT%%H:%%i:%%SZ', 'UTC') AS last_seen, "+
 			"groupUniqArray(%d)(path) AS samples "+
-			"FROM %s.waf_events WHERE %s "+
-			"GROUP BY rule ORDER BY count DESC LIMIT 500",
+			"FROM (SELECT ts, path, arrayJoin(arrayConcat("+
+			"[(toString(rule), toString(severity), attack)], "+
+			"arrayFilter(x -> x.1 != '' AND x.1 != rule, "+
+			"arrayMap(x -> (JSONExtractString(x, 'id'), JSONExtractString(x, 'sev'), JSONExtractString(x, 'msg')), "+
+			"JSONExtractArrayRaw(rules))))) AS t "+
+			"FROM %s.waf_events WHERE %s) "+
+			"GROUP BY rule_id ORDER BY count DESC LIMIT 500",
 		sampleCap, c.db, strings.Join(c.learningWhere(tenant, site, from, to), " AND "))
 }
 

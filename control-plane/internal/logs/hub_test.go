@@ -104,3 +104,26 @@ func TestLearningSampleCap(t *testing.T) {
 		t.Fatalf("samples must be capped at %d, got %d", learningSampleCap, len(rules[0].Samples))
 	}
 }
+
+// Every contributing rule is counted, not only the event's leading one. A
+// response-leak rule on a request learning mode had already flagged (leading
+// rule = the request's) never had a row before. (Code review finding.)
+func TestLearningCountsEveryRuleInTheEvent(t *testing.T) {
+	h := newTestHub()
+	h.updateMetrics(wafEntry(t, map[string]any{
+		"action": "DETECT", "rule": "942100", "site": "app", "path": "/q",
+		"sev": "CRITICAL", "attack": "SQLi", "ts": "2026-09-30T10:00:00Z", "would_block": true,
+		"rules": []map[string]any{
+			{"id": "942100", "sev": "CRITICAL", "msg": "SQLi"},
+			{"id": "951220", "sev": "CRITICAL", "msg": "mssql SQL Information Leakage"},
+			{"id": "", "sev": "", "msg": ""},
+		},
+	}))
+	got := map[string]int64{}
+	for _, r := range h.GetLearningStats("app") {
+		got[r.RuleID] = r.Count
+	}
+	if got["942100"] != 1 || got["951220"] != 1 || len(got) != 2 {
+		t.Fatalf("want 942100 and 951220 once each, got %v", got)
+	}
+}
