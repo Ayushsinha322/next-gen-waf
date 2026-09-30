@@ -255,3 +255,61 @@ fn response_families_self_skip_without_the_proxy_paranoia_seed() {
          (plus the proxy's dependency on seeding) needs revisiting"
     );
 }
+
+/// A learning-mode downgrade must not blind the rules that run after it.
+///
+/// The VM stopped at `decision != Allow`, and learning mode rewrites a verdict
+/// to `Log`: on a learning-mode site the response rules therefore never ran for
+/// any request that had already scored — the attack traffic most likely to make
+/// an origin leak — and the proxy's request-phase rules never ran after an
+/// earlier `Log` (an over-long URI). Only a real `Block` stops evaluation now.
+/// (Code review finding.)
+#[test]
+fn a_learning_mode_downgrade_does_not_blind_the_response_rules() {
+    let leak = "<html>You have an error in your SQL syntax; check the manual</html>";
+    let eng = common::load_crs_engines(&["RESPONSE-951-DATA-LEAKAGES-SQL.conf"]);
+    let mut ctx = common::make_ctx();
+    ctx.tx_vars
+        .insert("DETECTION_PARANOIA_LEVEL".to_owned(), "2".to_owned());
+    // What enforce_mode leaves behind for a would-block request in learning mode.
+    ctx.decision = WafDecision::Log;
+    ctx.would_block = true;
+    ctx.response_body = Some(leak.as_bytes().to_vec().into());
+    eng.evaluate(
+        &mut ctx,
+        Phase::ResponseBody,
+        sentinel_rules::DEFAULT_OUTBOUND_ANOMALY_THRESHOLD,
+    );
+    assert!(
+        ctx.rule_matches
+            .iter()
+            .any(|m| m.rule_id.starts_with("951")),
+        "the response rules did not run after a learning-mode Log: {:?}",
+        ctx.rule_matches
+    );
+    assert_eq!(
+        ctx.decision,
+        WafDecision::Block,
+        "the leak must still reach a verdict for the proxy's mode to downgrade"
+    );
+}
+
+#[test]
+fn a_request_rule_still_runs_after_a_learning_mode_downgrade() {
+    let eng = sentinel_rules::RuleEngine::from_crs_conf(
+        r#"SecRule ARGS "@contains EVIL" "id:959903,phase:2,pass,msg:'evil',severity:'CRITICAL',setvar:'tx.inbound_anomaly_score_pl1=+%{tx.critical_anomaly_score}'""#,
+    )
+    .expect("compile");
+    let mut ctx = common::make_ctx();
+    ctx.uri = "/x?a=EVIL".parse().unwrap();
+    ctx.decision = WafDecision::Log; // e.g. an over-long URI, downgraded
+    eng.evaluate(&mut ctx, Phase::RequestBody, 0);
+    assert_eq!(ctx.rule_matches.len(), 1, "{:?}", ctx.rule_matches);
+    assert_eq!(ctx.anomaly_score, 5);
+    // And a real Block still stops everything after it.
+    let mut ctx = common::make_ctx();
+    ctx.uri = "/x?a=EVIL".parse().unwrap();
+    ctx.decision = WafDecision::Block;
+    eng.evaluate(&mut ctx, Phase::RequestBody, 0);
+    assert!(ctx.rule_matches.is_empty());
+}

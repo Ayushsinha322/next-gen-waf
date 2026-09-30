@@ -61,7 +61,7 @@ use sentinel_core::{
         ListenerConfig, Protocol, SecurityHeadersConfig, SentinelConfig, SiteConfig, WafConfig,
         WafMode,
     },
-    context::{Phase, RequestContext, WafDecision},
+    context::{Phase, RequestContext, VerdictSource, WafDecision},
 };
 use sentinel_ebpf::{EbpfConfig, EbpfManager, IpNet};
 use sentinel_ml::MlEngine;
@@ -4166,6 +4166,12 @@ async fn proxy_inner(
                     .boxed()
                 }
                 ScanBuffer::Complete(mut bytes) => {
+                    // A request that learning mode already recorded as
+                    // would-block was decided by the request; that stays the
+                    // event's explanation whatever the response adds.
+                    if ctx.would_block && ctx.verdict_source.is_none() {
+                        ctx.verdict_source = Some(VerdictSource::Request);
+                    }
                     // (1) Response-body rule engine (CRS RESPONSE-* etc.).
                     if let Some(engine) = resp_engine {
                         ctx.response_body = Some(bytes.clone());
@@ -4173,7 +4179,18 @@ async fn proxy_inner(
                         // outbound threshold, never the site's request one.
                         let threshold = outbound_threshold(ctx);
                         ctx.outbound_threshold = Some(threshold);
+                        let request_reason = ctx.block_reason.clone();
                         engine.evaluate(ctx, Phase::ResponseBody, threshold);
+                        if ctx.decision == WafDecision::Block {
+                            match ctx.verdict_source {
+                                None => ctx.verdict_source = Some(VerdictSource::Response),
+                                // Learning mode, request already would-block:
+                                // keep its reason; the response rule is listed
+                                // with the event's rules and in the learning
+                                // report, which counts every matched rule.
+                                Some(_) => ctx.block_reason = request_reason,
+                            }
+                        }
                         // Respect learning mode (downgrade Block → Log).
                         let gm = governing_mode(ctx, &site_cfg.waf.mode);
                         enforce_mode(ctx, &gm);
@@ -4199,9 +4216,12 @@ async fn proxy_inner(
                             DlpAction::Block => {
                                 if let Some(matched) = dlp.scan(&bytes) {
                                     ctx.decision = WafDecision::Block;
-                                    ctx.block_reason = Some(format!(
-                                        "DLP: sensitive data pattern matched: {matched}"
-                                    ));
+                                    if ctx.verdict_source.is_none() {
+                                        ctx.verdict_source = Some(VerdictSource::Dlp);
+                                        ctx.block_reason = Some(format!(
+                                            "DLP: sensitive data pattern matched: {matched}"
+                                        ));
+                                    }
                                     // Learning mode downgrades Block → Log —
                                     // must not block or rewrite, only record.
                                     let gm = governing_mode(ctx, &site_cfg.waf.mode);
@@ -5205,6 +5225,17 @@ fn outbound_threshold(ctx: &RequestContext) -> u32 {
 /// It records the response's when the response is what reached its threshold,
 /// or when the response is all that scored; the request's otherwise.
 fn verdict_score(ctx: &RequestContext) -> (u32, Option<u32>, bool) {
+    // A recorded decider answers it; the inference below is only for events no
+    // verdict decided (a sub-threshold match), where there is no decider to ask.
+    match ctx.verdict_source {
+        Some(VerdictSource::Response) => {
+            return (ctx.outbound_anomaly_score, ctx.outbound_threshold, true)
+        }
+        Some(VerdictSource::Request) | Some(VerdictSource::Dlp) => {
+            return (ctx.anomaly_score, ctx.anomaly_threshold, false)
+        }
+        None => {}
+    }
     let reached = |score: u32, t: Option<u32>| t.is_some_and(|t| t > 0 && score >= t);
     let inbound_hit = reached(ctx.anomaly_score, ctx.anomaly_threshold);
     let outbound_hit = reached(ctx.outbound_anomaly_score, ctx.outbound_threshold);
@@ -8796,7 +8827,7 @@ mod console_cookie_tests {
 #[cfg(test)]
 mod event_detail_tests {
     use super::*;
-    use sentinel_core::context::{Phase, RuleMatch, Severity};
+    use sentinel_core::context::{Phase, RuleMatch, Severity, VerdictSource};
     use std::net::{IpAddr, Ipv4Addr};
 
     fn rm(id: &str, score: u32, target: &str, matched: &str) -> RuleMatch {
@@ -9064,6 +9095,67 @@ mod event_detail_tests {
         assert_eq!(verdict_score(&r), (3, Some(10), false));
     }
 
+    fn response_rm(id: &str, score: u32) -> RuleMatch {
+        let mut m = rm(id, score, "RESPONSE_BODY", "SQL Server Driver");
+        m.phase = Phase::ResponseBody;
+        m
+    }
+
+    #[test]
+    fn a_response_block_names_the_response_rule_not_a_sub_threshold_request_rule() {
+        // Code review: a CRITICAL request rule below the site threshold plus a
+        // CRITICAL response rule that blocked. primary_rule_match's tie-break
+        // (earliest) named the request rule, so the advice was to exclude a
+        // rule that had decided nothing.
+        let mut c = ctx("/search?q=x");
+        c.site_id = Some("s".into());
+        c.anomaly_threshold = Some(10);
+        c.anomaly_score = 5;
+        c.outbound_threshold = Some(4);
+        c.outbound_anomaly_score = 5;
+        c.decision = WafDecision::Block;
+        c.verdict_source = Some(VerdictSource::Response);
+        c.rule_matches = vec![rm("942100", 5, "ARGS:q", "x"), response_rm("951220", 5)];
+        assert_eq!(c.deciding_rule_match().unwrap().rule_id, "951220");
+        let (msg, rem) = explain_event(&c, "BLOCK", "951220", "mssql SQL Information Leakage");
+        assert!(msg.contains("rule 951220"), "{msg}");
+        assert!(msg.contains("Response anomaly score 5"), "{msg}");
+        assert!(
+            rem.contains("rule 951220") && !rem.contains("942100"),
+            "{rem}"
+        );
+        // access.log — the file the Logs page tails — says the same thing.
+        let a = access_record(&c);
+        assert_eq!(a["score"], 5, "{a}");
+        assert_eq!(a["rule"], "951220", "{a}");
+    }
+
+    #[test]
+    fn a_dlp_block_is_explained_as_dlp_not_as_a_threshold() {
+        // Code review: a sub-threshold response rule (3 < 4) beside a DLP
+        // block read "Response anomaly score 3 … below threshold" and advised
+        // raising a threshold that could not unblock a DLP match.
+        let mut c = ctx("/account");
+        c.site_id = Some("s".into());
+        c.outbound_threshold = Some(4);
+        c.outbound_anomaly_score = 3;
+        c.decision = WafDecision::Block;
+        c.verdict_source = Some(VerdictSource::Dlp);
+        c.block_reason = Some("DLP: sensitive data pattern matched: credit_card".into());
+        c.rule_matches = vec![response_rm("953100", 3)];
+        assert!(c.deciding_rule_match().is_none());
+        let (rule, attack) = classify_nonrule_block(c.block_reason.as_deref().unwrap());
+        assert_eq!(rule, "DLP");
+        let (msg, rem) = explain_event(&c, "BLOCK", rule, attack);
+        assert!(
+            msg.contains("sensitive data pattern matched: credit_card"),
+            "{msg}"
+        );
+        assert!(!msg.contains("threshold"), "{msg}");
+        assert!(rem.contains("DLP action"), "{rem}");
+        assert!(!rem.contains("raise the response threshold"), "{rem}");
+    }
+
     #[test]
     fn headers_are_redacted_by_name_and_cookies_per_cookie() {
         let mut h = http::HeaderMap::new();
@@ -9295,6 +9387,7 @@ fn log_request(ctx: &RequestContext) {
         latency_ms = ctx.elapsed_ms(),
         ja4 = ctx.tls_fingerprint.as_deref().unwrap_or("-"),
         anomaly_score = ctx.anomaly_score,
+        outbound_score = ctx.outbound_anomaly_score,
         rule_matches = ctx.rule_matches.len(),
         rule_ids = rule_ids.join(","),
         decision = ?ctx.decision,
@@ -9544,8 +9637,9 @@ fn record_event(ctx: &RequestContext) {
         _ if ctx.would_block => "DETECT",
         _ => return, // not notable — don't store
     };
-    // The WORST finding, not the earliest. See RequestContext::primary_rule_match.
-    let top = ctx.primary_rule_match();
+    // The finding that decided the verdict: the worst from the deciding part
+    // of the exchange. See RequestContext::deciding_rule_match.
+    let top = ctx.deciding_rule_match();
     // Tag non-rule blocks so waf_events stays queryable. A threat-intel block
     // carries no RuleMatch and its reason isn't otherwise persisted here, so
     // surface it as rule="THREATINTEL" with the reason in `attack`; other
@@ -10246,8 +10340,9 @@ fn explain_event_at(
         ctx.method.as_str(),
         truncate_for_prose(ctx.uri.path(), 120)
     );
-    // The WORST finding, not the earliest. See RequestContext::primary_rule_match.
-    let top = ctx.primary_rule_match();
+    // The finding that decided the verdict: the worst from the deciding part
+    // of the exchange. See RequestContext::deciding_rule_match.
+    let top = ctx.deciding_rule_match();
     let target_of = |m| pick_target(m, located);
     let is_rule_hit = top.is_some();
 
@@ -10305,6 +10400,13 @@ fn explain_event_at(
     // rate-limit or GeoIP block has no score and must not pretend to have one.
     let mut why = String::new();
     let (score, threshold, outbound) = verdict_score(ctx);
+    // A DLP verdict is a pattern match, not a score against a threshold: its
+    // explanation must not advise moving one.
+    let score = if ctx.verdict_source == Some(VerdictSource::Dlp) {
+        0
+    } else {
+        score
+    };
     let (score_words, threshold_words) = if outbound {
         ("Response anomaly score", "the response threshold of")
     } else {
@@ -10381,6 +10483,12 @@ fn explain_event_at(
         }
     } else {
         match rule {
+            "DLP" => format!(
+                "The response from site '{site}' carried data matching a data-loss-prevention \
+                 pattern. If the page is meant to show it (for example a masked number the user \
+                 asked for), set the site's DLP action to mask or detect; otherwise the origin is \
+                 leaking it and should stop."
+            ),
             "RATELIMIT" => format!(
                 "If {origin} is a legitimate client, raise the rate limit for site '{site}' or \
                  allowlist the address. Repeated hits from many addresses instead suggest a \
@@ -10491,8 +10599,12 @@ fn access_record(ctx: &RequestContext) -> serde_json::Value {
         "ua":       ua,
         "referer":  referer_owned.as_str(),
         "action":   action,
-        "score":    ctx.anomaly_score,
-        "rule":     ctx.primary_rule_match().map(|m| m.rule_id.as_str()).unwrap_or(""),
+        // The score that decided the verdict (the response's for a leak), as
+        // in waf.log and Threat Search. This line — the one the console's Logs
+        // page tails — still printed the request score, so a response-leak
+        // block read "score 0". (Code review finding.)
+        "score":    verdict_score(ctx).0,
+        "rule":     ctx.deciding_rule_match().map(|m| m.rule_id.as_str()).unwrap_or(""),
         "reason":   ctx.block_reason.as_deref().unwrap_or(""),
     })
 }
@@ -10564,8 +10676,9 @@ fn ndjson_log(ctx: &RequestContext) {
         || ctx.would_block
         || ctx.gateway_error.is_some()
     {
-        // The WORST finding, not the earliest. See RequestContext::primary_rule_match.
-        let top = ctx.primary_rule_match();
+        // The finding that decided the verdict: the worst from the deciding
+        // part of the exchange. See RequestContext::deciding_rule_match.
+        let top = ctx.deciding_rule_match();
         let sev_str = top
             .map(|r| format!("{:?}", r.severity).to_uppercase())
             .unwrap_or_else(|| "MEDIUM".to_string());
@@ -10684,7 +10797,9 @@ fn ndjson_log(ctx: &RequestContext) {
 /// distinctly rather than lumped under "-"/"other".
 fn classify_nonrule_block(reason: &str) -> (&'static str, &'static str) {
     let r = reason.to_ascii_lowercase();
-    if r.contains("country blocked") || r.contains("geoip") {
+    if r.starts_with("dlp") {
+        ("DLP", "Sensitive data in the response")
+    } else if r.contains("country blocked") || r.contains("geoip") {
         ("GEOIP", "GeoIP country block")
     } else if r.contains("rate limit") {
         ("RATELIMIT", "Rate limit exceeded")

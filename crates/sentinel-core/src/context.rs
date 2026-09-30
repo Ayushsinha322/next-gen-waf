@@ -198,6 +198,13 @@ pub struct RequestContext {
     /// The outbound threshold the response was judged against, stamped by the
     /// proxy when the response body is inspected. `None` = not inspected.
     pub outbound_threshold: Option<u32>,
+    /// Which part of the exchange decided a block — or, in learning mode, the
+    /// would-have-blocked verdict. The first decider wins. `None` for a request
+    /// nothing blocked. Recorded rather than inferred from the scores after the
+    /// fact: a DLP block beside a sub-threshold response rule was explained as a
+    /// response-threshold verdict, and a response block beside a sub-threshold
+    /// request rule was attributed to the request rule.
+    pub verdict_source: Option<VerdictSource>,
     /// Per-engine anomaly contributions (engine name → points), recorded
     /// alongside `anomaly_score` so weighted verdict fusion can apply per-engine
     /// weights and explain which engines drove the verdict.
@@ -281,6 +288,7 @@ impl RequestContext {
             anomaly_score: 0,
             outbound_anomaly_score: 0,
             outbound_threshold: None,
+            verdict_source: None,
             engine_scores: HashMap::new(),
             rule_matches: Vec::new(),
             ml_scores: HashMap::new(),
@@ -364,14 +372,50 @@ impl RequestContext {
     /// Ties keep the earliest match, so a request whose findings are genuinely
     /// equal still reports them in the order they were detected.
     pub fn primary_rule_match(&self) -> Option<&RuleMatch> {
-        self.rule_matches.iter().reduce(|best, m| {
-            if (m.severity.rank(), m.score) > (best.severity.rank(), best.score) {
-                m
-            } else {
-                best
-            }
-        })
+        worst_match(self.rule_matches.iter())
     }
+
+    /// The finding that explains the VERDICT: the worst match from the part of
+    /// the exchange that decided it (see `verdict_source`). A response block
+    /// names a response rule even when a sub-threshold request rule matched
+    /// too — the operator would otherwise exclude a rule that did not decide
+    /// anything. A DLP verdict has no rule. With no verdict, the worst overall.
+    pub fn deciding_rule_match(&self) -> Option<&RuleMatch> {
+        let in_response =
+            |m: &&RuleMatch| matches!(m.phase, Phase::ResponseHeaders | Phase::ResponseBody);
+        match self.verdict_source {
+            Some(VerdictSource::Response) => {
+                worst_match(self.rule_matches.iter().filter(in_response))
+            }
+            Some(VerdictSource::Request) => {
+                worst_match(self.rule_matches.iter().filter(|m| !in_response(m)))
+            }
+            Some(VerdictSource::Dlp) => None,
+            None => self.primary_rule_match(),
+        }
+    }
+}
+
+/// Which part of the exchange decided a (would-be) block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerdictSource {
+    /// The request's own checks and rules, against the site's threshold.
+    Request,
+    /// The response rules, against the outbound threshold.
+    Response,
+    /// Response data-loss prevention.
+    Dlp,
+}
+
+/// Highest severity, then highest score; ties keep the earliest.
+fn worst_match<'a>(matches: impl Iterator<Item = &'a RuleMatch>) -> Option<&'a RuleMatch> {
+    matches.reduce(|best, m| {
+        if (m.severity.rank(), m.score) > (best.severity.rank(), best.score) {
+            m
+        } else {
+            best
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -382,6 +426,28 @@ impl RequestContext {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn the_deciding_rule_comes_from_the_part_that_decided() {
+        let mut ctx = RequestContext::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+        let mut resp = m("951220", Severity::Critical, 5);
+        resp.phase = Phase::ResponseBody;
+        let req = m("942100", Severity::Critical, 5);
+        ctx.rule_matches = vec![req, resp];
+        // No verdict: the worst overall (the tie keeps the earliest).
+        assert_eq!(ctx.deciding_rule_match().unwrap().rule_id, "942100");
+        ctx.verdict_source = Some(VerdictSource::Response);
+        assert_eq!(ctx.deciding_rule_match().unwrap().rule_id, "951220");
+        ctx.verdict_source = Some(VerdictSource::Request);
+        assert_eq!(ctx.deciding_rule_match().unwrap().rule_id, "942100");
+        ctx.verdict_source = Some(VerdictSource::Dlp);
+        assert!(ctx.deciding_rule_match().is_none());
+        // A request verdict with no request-phase rule (a limit, a blocklist)
+        // names no rule rather than borrowing a response rule.
+        ctx.rule_matches.remove(0);
+        ctx.verdict_source = Some(VerdictSource::Request);
+        assert!(ctx.deciding_rule_match().is_none());
+    }
 
     /// Build a match with just the fields the selection looks at.
     fn m(rule_id: &str, severity: Severity, score: u32) -> RuleMatch {

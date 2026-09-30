@@ -1149,8 +1149,16 @@ pub fn evaluate(
     let mut last_matched: Option<String> = None;
 
     while ip < program.len() {
-        // Early exit: if already decided (Block/Challenge), stop evaluating.
-        if ctx.decision != WafDecision::Allow {
+        // Early exit only on a real BLOCK — the same rule as the proxy's
+        // `still_evaluating`. This read `!= Allow`, and `Log` is not `Allow`:
+        // once learning mode had downgraded a verdict to Log (an over-long URI,
+        // or the request's own anomaly verdict), every later call returned at
+        // its first instruction. The proxy's phase-1 fix let the rule engine be
+        // CALLED after a Log, but the engine then ran nothing; and on a
+        // learning-mode site the response rules never ran for any request that
+        // had already scored — the attack traffic most likely to leak.
+        // Challenge and Limit are not refusals either. (Code review finding.)
+        if ctx.decision == WafDecision::Block {
             return ctx.decision.clone();
         }
 
@@ -1587,7 +1595,7 @@ pub fn evaluate(
                         };
                         if anomaly_threshold > 0
                             && score >= anomaly_threshold
-                            && ctx.decision == WafDecision::Allow
+                            && ctx.decision != WafDecision::Block
                         {
                             ctx.decision = WafDecision::Block;
                             ctx.block_reason =
