@@ -239,6 +239,12 @@ deploy-shell:
     #     and no hard-coded vN.N.N in dashboard source. The console once showed
     #     four different versions on one deployment.
     - ./deploy/ci/check-version-consistency.sh
+    # 2b. Every place a supporting image is named uses the tag the bundle ships
+    #     (build-bundle.sh THIRD_PARTY), and no manifest runs redis: — the k8s
+    #     manifests still did, while compose had moved to Valkey for licensing.
+    #     The ClickHouse pin lives in a dozen files; one missed made the backup
+    #     drill test a different server or an offline upgrade stop. (Code review.)
+    - ./deploy/ci/check-thirdparty-pins.sh
     # 3c. No unbounded producer piped into `grep -q`. Under pipefail that
     #     inverts — `grep -q` exits on match, the producer dies on SIGPIPE with
     #     141, and a pattern that IS present reads as absent. It silently broke

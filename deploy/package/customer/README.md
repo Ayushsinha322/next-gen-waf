@@ -133,12 +133,12 @@ than before. Support will be added once genuinely tested.
 
 ### Network access
 
-This package contains the four ESDSWAF images. Six supporting images are pulled
+This package contains the four ESDSWAF images. Five supporting images are pulled
 from Docker Hub on first install:
 
 ```
 postgres:16-alpine
-redis:7-alpine
+valkey/valkey:8-alpine
 clickhouse/clickhouse-server:26.3.35.3-alpine
 prom/prometheus:v2.54.1
 haproxy:2.9-alpine                  # only used by the two-VM / HA topology

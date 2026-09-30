@@ -123,6 +123,44 @@ else
   bad "upgrade.sh --restore-db does not use DUMP_DIR"
 fi
 
+# The ClickHouse pre-flight must run BEFORE anything is switched, before the
+# backup (a host that cannot take the upgrade must not pay for a full dump
+# first) and before --dry-run returns (dry-run runs every check). A later edit
+# that moved it below the switch would crash-loop the event store mid-upgrade —
+# the failure the check exists to prevent — with CI still green. (Code review.)
+U="$CUSTOMER/upgrade.sh"
+line_of() { grep -n -m1 -F -- "$1" "$U" | cut -d: -f1; }
+probe=$(line_of '--entrypoint clickhouse "$CH_NEW" local -q "SELECT 1"')
+server=$(line_of 'docker run -d --name sentinel-ch-preflight')
+guard=$(line_of 'moves ClickHouse BACKWARDS')
+dryexit=$(line_of '--dry-run: every check passed')
+backup=$(line_of 'step "Step 5 of 8 — backup"')
+refresh=$(line_of 'cp -r "$HERE/compose/." "$INSTALL_DIR/"')
+setver=$(line_of 'set_version "$NEW"')
+if [[ -n "$probe" && -n "$server" && -n "$guard" && -n "$dryexit" && -n "$backup" \
+      && -n "$refresh" && -n "$setver" ]] \
+   && (( probe < dryexit && server < dryexit && guard < dryexit \
+         && dryexit < backup && backup < refresh && refresh < setver )); then
+  pass "ClickHouse pre-flight (CPU probe, server start, downgrade guard) runs before dry-run exits, the backup and the switch"
+else
+  bad "ClickHouse pre-flight is missing or runs too late (probe=$probe server=$server guard=$guard dry=$dryexit backup=$backup refresh=$refresh set_version=$setver)"
+fi
+# Only exit 132 is a CPU problem; anything else must report its own error.
+if grep -q 'ch_rc -eq 132' "$U"; then
+  pass "only SIGILL (exit 132) is reported as a CPU problem"
+else
+  bad "the ClickHouse probe does not distinguish SIGILL from other docker failures"
+fi
+# The automatic rollback keeps the new compose files, and so the new
+# ClickHouse: it must check ClickHouse before calling the rollback complete.
+rb=$(line_of 'step "Step 8 of 8 — AUTOMATIC ROLLBACK"')
+rbch=$(awk -v s="${rb:-999999}" 'NR > s && /clickhouse-1 wget -qO- http:\/\/127.0.0.1:8123\/ping/ {print NR; exit}' "$U")
+if [[ -n "$rb" && -n "$rbch" ]]; then
+  pass "the automatic rollback health-checks ClickHouse"
+else
+  bad "the automatic rollback does not check ClickHouse — it can call a crash-looping event store healthy"
+fi
+
 printf '\n'
 if (( fail == 0 )); then
   printf '  %s✓%s the recovery path holds\n\n' "$GRN" "$R"

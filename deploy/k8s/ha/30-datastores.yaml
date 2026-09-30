@@ -137,12 +137,15 @@ spec:
           # only 1-second sliding windows with persistence disabled, so there is no
           # data to replicate; what matters is that a Redis endpoint exists, which
           # the toleration above restores in ~30s instead of ~5min.
-          image: redis:7-alpine
-          args: ["redis-server", "--save", "", "--appendonly", "no"]   # ephemeral rate-limit state
+          # Valkey, as compose ships: redis:7 resolves to 7.4, dual-licensed
+          # RSALv2/SSPL — not open source, not redistributable. Wire-compatible
+          # with every command the product issues.
+          image: valkey/valkey:8-alpine
+          args: ["valkey-server", "--save", "", "--appendonly", "no"]   # ephemeral rate-limit state
           ports:
             - { name: redis, containerPort: 6379 }
           readinessProbe:
-            exec: { command: ["redis-cli", "ping"] }
+            exec: { command: ["valkey-cli", "ping"] }
             initialDelaySeconds: 2
             periodSeconds: 5
           resources:
