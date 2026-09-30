@@ -4129,7 +4129,7 @@ async fn proxy_inner(
     let resp_engine = resp_engines
         .get(&site_cfg.id)
         .filter(|e| e.has_response_body_rules())
-        .filter(|_| response_rules_apply(&resp_parts.headers));
+        .filter(|_| response_rules_apply(&resp_parts.headers, resp_parts.status));
     let needs_inspection = dlp.is_some() || resp_engine.is_some();
 
     let final_body: BoxBody = if needs_inspection {
@@ -5102,7 +5102,8 @@ fn seed_crs_policy(ctx: &mut RequestContext, s: &SiteConfig) {
 }
 
 /// The media types the response-body RULES inspect: ModSecurity's own default,
-/// `SecResponseBodyMimeType text/plain text/html text/xml`.
+/// `SecResponseBodyMimeType text/plain text/html text/xml` — plus JSON on a
+/// server error (see `response_rules_apply`).
 ///
 /// The CRS RESPONSE-95x leak rules are written for pages a server renders —
 /// error pages, stack traces, directory listings. Run over a minified
@@ -5117,8 +5118,17 @@ fn seed_crs_policy(ctx: &mut RequestContext, s: &SiteConfig) {
 /// origin that does not say what it sent is not trusted to be harmless.
 const RESPONSE_RULE_MIME_TYPES: [&str; 3] = ["text/html", "text/plain", "text/xml"];
 
-fn response_rules_apply(headers: &http::HeaderMap) -> bool {
-    response_declares(headers, |media| RESPONSE_RULE_MIME_TYPES.contains(&media))
+fn response_rules_apply(headers: &http::HeaderMap, status: StatusCode) -> bool {
+    // JSON too, but only on a SERVER ERROR. That is where an API leaks what
+    // these rules exist to catch — `{"error":"ORA-00933: SQL command not
+    // properly ended"}`, a stack trace in a 500 — and a successful JSON body is
+    // where they misfire on the application's own data (951220 on a product
+    // list mentioning "SQL Server"). Restricting to HTML/plain/XML alone had
+    // dropped that coverage. (Code review finding.)
+    let error = status.is_server_error();
+    response_declares(headers, |media| {
+        RESPONSE_RULE_MIME_TYPES.contains(&media) || (error && is_json_media(media))
+    })
 }
 
 /// Whether DLP reads this response: pages and data — any `text/*`, JSON or XML
@@ -8957,13 +8967,32 @@ mod event_detail_tests {
     }
 
     #[test]
+    fn response_rules_read_json_only_on_a_server_error() {
+        let with = |ct: &str, status: u16| {
+            let mut h = http::HeaderMap::new();
+            h.insert(http::header::CONTENT_TYPE, ct.parse().unwrap());
+            response_rules_apply(&h, StatusCode::from_u16(status).unwrap())
+        };
+        // The UAT false positive: a successful JSON product list.
+        assert!(!with("application/json", 200));
+        assert!(!with("application/json", 404));
+        // What these rules exist for: a leak in an API's error response.
+        assert!(with("application/json", 500));
+        assert!(with("application/problem+json; charset=utf-8", 502));
+        // Never scripts, whatever the status.
+        assert!(!with("application/javascript", 500));
+        // Pages are read at any status.
+        assert!(with("text/html", 200));
+    }
+
+    #[test]
     fn response_rules_read_only_the_pages_they_were_written_for() {
         let with = |cts: &[&str]| {
             let mut h = http::HeaderMap::new();
             for ct in cts {
                 h.append(http::header::CONTENT_TYPE, ct.parse().unwrap());
             }
-            response_rules_apply(&h)
+            response_rules_apply(&h, StatusCode::OK)
         };
         assert!(with(&["text/html; charset=utf-8"]));
         assert!(with(&["TEXT/HTML"]));
@@ -9640,6 +9669,7 @@ fn record_event(ctx: &RequestContext) {
     // The finding that decided the verdict: the worst from the deciding part
     // of the exchange. See RequestContext::deciding_rule_match.
     let top = ctx.deciding_rule_match();
+    let (v_score, v_threshold, _) = verdict_score(ctx);
     // Tag non-rule blocks so waf_events stays queryable. A threat-intel block
     // carries no RuleMatch and its reason isn't otherwise persisted here, so
     // surface it as rule="THREATINTEL" with the reason in `attack`; other
@@ -9706,7 +9736,7 @@ fn record_event(ctx: &RequestContext) {
         severity: top
             .map(|r| format!("{:?}", r.severity).to_uppercase())
             .unwrap_or_default(),
-        score: verdict_score(ctx).0,
+        score: v_score,
         status: ctx.response_status.map(|s| s.as_u16()).unwrap_or(0),
         protocol: protocol_label(ctx.http_version).to_string(),
         // Same correlation id and prose as the NDJSON record, so an event found in
@@ -9740,7 +9770,7 @@ fn record_event(ctx: &RequestContext) {
             None => "node",
         }
         .to_string(),
-        threshold: verdict_score(ctx).1.unwrap_or(0),
+        threshold: v_threshold.unwrap_or(0),
         explanation: if log_explain_enabled() {
             explain_event_at(
                 ctx,
@@ -10679,6 +10709,7 @@ fn ndjson_log(ctx: &RequestContext) {
         // The finding that decided the verdict: the worst from the deciding
         // part of the exchange. See RequestContext::deciding_rule_match.
         let top = ctx.deciding_rule_match();
+        let (v_score, v_threshold, _) = verdict_score(ctx);
         let sev_str = top
             .map(|r| format!("{:?}", r.severity).to_uppercase())
             .unwrap_or_else(|| "MEDIUM".to_string());
@@ -10749,8 +10780,8 @@ fn ndjson_log(ctx: &RequestContext) {
             "matched": matched,
             // The score that decided the verdict — the response's for a leak
             // found in the response (see verdict_score). Both totals follow.
-            "score":  verdict_score(ctx).0,
-            "threshold": verdict_score(ctx).1,
+            "score":  v_score,
+            "threshold": v_threshold,
             "inbound_score": ctx.anomaly_score,
             "outbound_score": ctx.outbound_anomaly_score,
             // Present only when a per-path override governed this request, so a
