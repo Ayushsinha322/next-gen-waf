@@ -8626,10 +8626,18 @@ fn cap_chars(s: &str, max: usize) -> String {
 /// checks the rule's own target label; naming the parameter more precisely
 /// (see [`sentinel_rules::RequestValues::locate`]) must never be what exposes
 /// one, so a refined label that names a sensitive field redacts as well.
-fn matched_at(m: &sentinel_core::context::RuleMatch, located: &str) -> String {
+///
+/// And never a cookie value: the rule engine withholds those at capture, but
+/// other engines (ML, plugins) build RuleMatches of their own, so the check is
+/// repeated here against the request's cookies — see
+/// `sentinel_core::redact::withheld_cookie_value`.
+fn matched_at(m: &sentinel_core::context::RuleMatch, located: &str, cookies: &[String]) -> String {
     let base = redacted_matched(m);
     if base.is_empty() || base.starts_with("[redacted") {
         return base;
+    }
+    if let Some(w) = sentinel_core::redact::withheld_cookie_value(&base, cookies) {
+        return w;
     }
     let member = located.rsplit(':').next().unwrap_or("");
     if located.contains(':') && sentinel_core::redact::is_sensitive_field_name(member) {
@@ -8649,6 +8657,7 @@ fn matched_rules_detail(
     ctx: &RequestContext,
     values: &sentinel_rules::RequestValues,
 ) -> Vec<serde_json::Value> {
+    let cookies = sentinel_core::redact::request_cookie_values(&ctx.request_headers);
     let mut rules: Vec<&sentinel_core::context::RuleMatch> = ctx.rule_matches.iter().collect();
     rules.sort_by(|a, b| {
         b.score
@@ -8668,7 +8677,7 @@ fn matched_rules_detail(
                 "sev": format!("{:?}", r.severity).to_uppercase(),
                 "score": r.score,
                 "target": target,
-                "matched": cap_chars(&matched_at(r, &target), MAX_RULE_MATCHED_CHARS),
+                "matched": cap_chars(&matched_at(r, &target, &cookies), MAX_RULE_MATCHED_CHARS),
             })
         })
         .collect()
@@ -8857,21 +8866,29 @@ mod event_detail_tests {
     }
 
     #[test]
-    fn a_cookie_borne_attack_is_still_evidenced_by_the_rule_match() {
-        // Withholding cookie values from the header dump must not hide an
-        // attack delivered in a cookie: the rule's own match carries it. CRS
-        // 942100 is multi-target (REQUEST_COOKIES|ARGS|…), so its match has no
-        // single target and its text is shown (the VM has already withheld any
-        // value of a credential-named cookie).
+    fn a_cookie_value_never_reaches_a_record_even_from_another_engine() {
+        // The rule engine withholds cookie values at capture; a RuleMatch built
+        // elsewhere (ML, a plugin) must not bring one back in. Multi-target, so
+        // the match has no target to judge by — only the request's cookies.
         let mut c = ctx("/");
         c.request_headers
-            .insert("cookie", "theme=' OR 1=1--; sid=abc".parse().unwrap());
-        c.rule_matches = vec![rm("942100", 5, "", "' OR 1=1--")];
+            .insert("cookie", "lang=en".parse().unwrap());
+        c.request_headers.append(
+            "cookie",
+            "node-js=s%3AaBcD1234efGH.QmVyeVNlY3JldA".parse().unwrap(),
+        );
+        c.rule_matches = vec![rm("942440", 5, "", "s:aBcD1234efGH.QmVyeVNlY3JldA")];
         let v = sentinel_rules::RequestValues::from_ctx(&c);
         let rules = matched_rules_detail(&c, &v);
-        assert_eq!(rules[0]["matched"], "' OR 1=1--");
+        let m = rules[0]["matched"].as_str().unwrap();
+        assert!(!m.contains("aBcD1234"), "{m}");
+        assert!(m.starts_with("[redacted cookie value:"), "{m}");
         let headers = redacted_request_headers(&c.request_headers);
-        assert_eq!(headers["cookie"], "theme=[redacted]; sid=[redacted]");
+        assert_eq!(headers["cookie"], "lang=[redacted], node-js=[redacted]");
+        // Text that is not a cookie is untouched.
+        c.rule_matches = vec![rm("942100", 5, "", "' OR 1=1--")];
+        let v = sentinel_rules::RequestValues::from_ctx(&c);
+        assert_eq!(matched_rules_detail(&c, &v)[0]["matched"], "' OR 1=1--");
     }
 
     #[test]
@@ -9528,7 +9545,15 @@ fn record_event(ctx: &RequestContext) {
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or_default(),
         ),
-        matched: top.map(|r| matched_at(r, &ev_target)).unwrap_or_default(),
+        matched: top
+            .map(|r| {
+                matched_at(
+                    r,
+                    &ev_target,
+                    &sentinel_core::redact::request_cookie_values(&ctx.request_headers),
+                )
+            })
+            .unwrap_or_default(),
         rule: ev_rule,
         attack: ev_attack,
         action: action.to_string(),
@@ -10541,7 +10566,10 @@ fn ndjson_log(ctx: &RequestContext) {
         // The text the top rule actually matched — the field that lets an
         // operator judge a false positive from the log line alone. Redacted
         // when it came from a credential-bearing target.
-        let matched = top.map(|r| matched_at(r, &target)).unwrap_or_default();
+        let cookies = sentinel_core::redact::request_cookie_values(&ctx.request_headers);
+        let matched = top
+            .map(|r| matched_at(r, &target, &cookies))
+            .unwrap_or_default();
 
         let waf = serde_json::json!({
             "ts":     ts,

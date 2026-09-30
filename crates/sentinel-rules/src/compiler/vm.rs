@@ -992,35 +992,18 @@ fn collect_sensitive_values(ctx: &RequestContext) -> Vec<String> {
     let mut pairs: Vec<(String, String)> = query_pairs;
     pairs.extend(body_args(ctx));
 
-    // Every cookie, judged by its OWN name: `session=` is a credential,
-    // `theme=` is not.
-    if let Some(raw) = ctx
-        .request_headers
-        .get("cookie")
-        .and_then(|v| v.to_str().ok())
-    {
-        for c in raw.split(';') {
-            if let Some((k, v)) = c.split_once('=') {
-                pairs.push((k.trim().to_string(), v.trim().to_string()));
-            }
-        }
-    }
+    // Cookies are not collected here: EVERY cookie value is withheld at capture
+    // (see `withheld_cookie_value`), whatever its name. Judging them by name let
+    // an Express session called `node-js` through, and reading only the first
+    // Cookie field missed every cookie after it on HTTP/2 and HTTP/3.
 
     // Header values, keyed by header name — Authorization, X-Api-Key and
     // friends. Cheap: a request carries a few dozen headers at most, and this
     // runs once per phase, not once per rule.
     for (name, value) in ctx.request_headers.iter() {
-        // `Cookie` is deliberately EXCLUDED, even though its name reads as
-        // sensitive. Its value is the whole cookie jar, so treating it as one
-        // secret makes every cookie-borne match a substring of a sensitive
-        // value — and a live test caught exactly that: a SQLi payload injected
-        // into an ordinary `theme=` cookie was redacted, destroying the detail
-        // an operator needs to act on a real cookie-injection attack.
-        //
-        // Nothing is lost by skipping it. Each cookie was added individually
-        // above, so a rule matching the WHOLE header still redacts: the match
-        // text contains the `session=` value, and `value_is_sensitive` compares
-        // in both directions.
+        // `Cookie` is skipped: its values are handled, one cookie at a time,
+        // by `withheld_cookie_value`, which also catches a rule matching the
+        // WHOLE header (the match text carries each value).
         if name.as_str().eq_ignore_ascii_case("cookie") {
             continue;
         }
@@ -1155,6 +1138,9 @@ pub fn evaluate(
     // `collect_sensitive_values`. Stays `None` for the overwhelmingly common
     // case of a request where no rule fires at all.
     let mut sensitive_values: Option<Vec<String>> = None;
+    // Every cookie value (raw and decoded), for `withheld_cookie_value`. Built
+    // lazily like `sensitive_values`.
+    let mut cookie_values: Option<Vec<String>> = None;
     // The text the most recent Match* instruction of the CURRENT rule matched,
     // reset at every RuleEnd alongside the target attribution. Every match
     // instruction that can name its text writes here (Some on hit, None on
@@ -1557,7 +1543,17 @@ pub fn evaluate(
                     if let Some(meta) = ruleset.rule_meta.get(rule_id) {
                         // Redact at capture time, so a credential never enters
                         // RuleMatch and no consumer can leak what it never got.
+                        // A cookie value first — every one, whatever its name —
+                        // then any sensitively-named field.
                         let matched_value = matched_value.map(|v| {
+                            let cookies = cookie_values.get_or_insert_with(|| {
+                                sentinel_core::redact::request_cookie_values(&ctx.request_headers)
+                            });
+                            if let Some(w) =
+                                sentinel_core::redact::withheld_cookie_value(&v, cookies)
+                            {
+                                return w;
+                            }
                             let sensitive = sensitive_values
                                 .get_or_insert_with(|| collect_sensitive_values(ctx));
                             if value_is_sensitive(sensitive, &v) {

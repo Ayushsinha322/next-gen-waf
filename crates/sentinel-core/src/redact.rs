@@ -262,6 +262,101 @@ pub fn redact_url_query(url: &str) -> String {
     out
 }
 
+/// Every cookie VALUE the request carries, across every `Cookie` field.
+///
+/// HTTP/2 and HTTP/3 send one field per cookie; reading only the first field
+/// (`headers.get`) saw one cookie and missed the rest. Each value is returned
+/// raw and, when it differs, percent-decoded too: rules decode before they
+/// match, so a session that arrived as `s%3AaBcD…` is matched as `s:aBcD…`.
+pub fn request_cookie_values(headers: &http::HeaderMap) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in headers
+        .get_all(http::header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+    {
+        for c in raw.split(';') {
+            let Some((_, v)) = c.split_once('=') else {
+                continue;
+            };
+            let v = v.trim();
+            if v.is_empty() {
+                continue;
+            }
+            let decoded = percent_decode_lossy(v);
+            if decoded != v {
+                out.push(decoded);
+            }
+            out.push(v.to_string());
+        }
+    }
+    out
+}
+
+/// What to store in place of `matched` when it is, or carries, a cookie value;
+/// `None` when it carries none.
+///
+/// A cookie's NAME says nothing about its value — the eNlight360 console keeps
+/// its Express session in a cookie called `node-js` — so a cookie value is
+/// withheld wherever the WAF would write it down: the header dump, and the text
+/// a rule matched. A rule firing on a session cookie is usually a false
+/// positive on a signed token, and storing its match would put a working
+/// session into waf.log, a 90-day event store and the SIEM.
+///
+/// What is kept is what triage needs and a secret does not give away: the
+/// length, and which symbols the value contains. A session token reads as
+/// letters and digits with `% . - _`; an injection shows quotes, spaces and
+/// brackets. The rule, its message and the cookie's name are recorded as usual.
+///
+/// Matching is case-insensitive and in either direction, because transforms
+/// lowercase, decode and trim; a containment match needs both sides to be long
+/// enough to identify one value, so a one-character match inside some long
+/// cookie is not mistaken for that cookie.
+pub fn withheld_cookie_value(matched: &str, cookie_values: &[String]) -> Option<String> {
+    const MIN_IDENTIFYING_LEN: usize = 8;
+    if matched.is_empty() {
+        return None;
+    }
+    let m = matched.to_ascii_lowercase();
+    let carries_cookie = cookie_values.iter().any(|cv| {
+        let c = cv.to_ascii_lowercase();
+        c == m
+            || (c.len() >= MIN_IDENTIFYING_LEN
+                && m.len() >= MIN_IDENTIFYING_LEN
+                && (m.contains(&c) || c.contains(&m)))
+    });
+    if !carries_cookie {
+        return None;
+    }
+    let mut symbols: Vec<char> = Vec::new();
+    for ch in matched.chars() {
+        if !ch.is_ascii_alphanumeric() && !ch.is_control() && !symbols.contains(&ch) {
+            symbols.push(ch);
+        }
+    }
+    symbols.sort_unstable();
+    let len = matched.chars().count();
+    Some(if symbols.is_empty() {
+        format!("[redacted cookie value: {len} chars, letters and digits only]")
+    } else {
+        let shown: Vec<String> = symbols
+            .iter()
+            .take(16)
+            .map(|c| {
+                if *c == ' ' {
+                    "space".to_string()
+                } else {
+                    c.to_string()
+                }
+            })
+            .collect();
+        format!(
+            "[redacted cookie value: {len} chars, symbols {}]",
+            shown.join(" ")
+        )
+    })
+}
+
 /// Minimal percent-decode for comparing a parameter NAME against the list.
 ///
 /// Deliberately lossy and allocation-light: it exists so `%74oken` is recognised
@@ -300,6 +395,56 @@ fn percent_decode_lossy(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cookie_headers(fields: &[&str]) -> http::HeaderMap {
+        let mut h = http::HeaderMap::new();
+        for f in fields {
+            h.append(http::header::COOKIE, f.parse().unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn every_cookie_field_is_read_raw_and_decoded() {
+        // HTTP/2 and HTTP/3 send one Cookie field per cookie.
+        let h = cookie_headers(&["node-js=s%3AaBcD1234.sig; theme=dark", "lang=en"]);
+        let v = request_cookie_values(&h);
+        for want in ["s%3AaBcD1234.sig", "s:aBcD1234.sig", "dark", "en"] {
+            assert!(v.iter().any(|x| x == want), "missing {want}: {v:?}");
+        }
+    }
+
+    #[test]
+    fn a_cookie_value_is_withheld_from_matched_text_whatever_its_name() {
+        let h = cookie_headers(&[
+            "node-js=s%3AaBcD1234efGH.QmVyeVNlY3JldA",
+            "theme=x' UNION SELECT password FROM users--",
+        ]);
+        let v = request_cookie_values(&h);
+        // The session, as a rule saw it after urlDecode and lowercase.
+        let session = withheld_cookie_value("s:abcd1234efgh.qmvyevnly3jlda", &v).unwrap();
+        assert!(!session.contains("abcd1234"), "{session}");
+        assert!(session.contains("29 chars"), "{session}");
+        assert!(session.contains("symbols . :"), "{session}");
+        // An injection: withheld too, but its shape still says what it was.
+        let attack = withheld_cookie_value("x' UNION SELECT password FROM users--", &v).unwrap();
+        assert!(!attack.contains("UNION"), "{attack}");
+        assert!(attack.contains("symbols space ' -"), "{attack}");
+        // A whole Cookie header matched by a REQUEST_HEADERS rule.
+        assert!(withheld_cookie_value("node-js=s%3AaBcD1234efGH.QmVyeVNlY3JldA", &v).is_some());
+    }
+
+    #[test]
+    fn text_that_carries_no_cookie_is_left_alone() {
+        let v = request_cookie_values(&cookie_headers(&["theme=darkmode-v2; lang=en"]));
+        assert_eq!(withheld_cookie_value("1' OR '1'='1", &v), None);
+        // A short fragment inside a long cookie is not that cookie.
+        assert_eq!(withheld_cookie_value("dark", &v), None);
+        // A short cookie matched exactly is.
+        assert!(withheld_cookie_value("en", &v).is_some());
+        assert_eq!(withheld_cookie_value("", &v), None);
+        assert_eq!(withheld_cookie_value("anything", &[]), None);
+    }
 
     #[test]
     fn credential_names_are_recognised_including_compounds() {

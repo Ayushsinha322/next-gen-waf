@@ -333,72 +333,83 @@ fn a_short_sensitive_value_does_not_redact_every_payload() {
     }
 }
 
-/// Cookies are judged individually, not as one blob.
+/// A cookie's value is never kept in matched text, whatever the cookie is called.
 ///
-/// A live test on .71 caught this: because the `Cookie` HEADER name reads as
-/// sensitive, the entire cookie jar became a single sensitive value, so ANY
-/// payload injected into ANY cookie was a substring of it and got redacted —
-/// including an attack in an ordinary `theme=` cookie. Cookie injection is a
-/// real attack class and an operator cannot act on `[redacted]`.
+/// History: in August cookies were judged by NAME, so `theme=` kept an injected
+/// payload as evidence while `session=` was redacted — the fix for a live test
+/// in which the whole cookie jar had been treated as one secret. The first real
+/// application behind the WAF then showed why a name cannot decide it: the
+/// eNlight360 console keeps its Express session in a cookie called `node-js`,
+/// which no name list would call sensitive. So every cookie value is withheld,
+/// and what an operator keeps is its shape — length and symbols — which is
+/// enough to tell a signed token (letters, digits, `% . -`) from an injection
+/// (quotes, spaces, brackets) without keeping either.
 #[test]
-fn an_ordinary_cookie_keeps_its_payload_while_a_session_cookie_does_not() {
+fn a_cookie_value_is_withheld_whatever_the_cookie_is_called() {
     let engine = engine_from(
         r#"SecRule ARGS|REQUEST_COOKIES|REQUEST_HEADERS "@detectSQLi" "id:900110,phase:2,deny,msg:'sqli'""#,
     );
     let payload = "x' UNION SELECT password FROM users--";
 
-    // Ordinary cookie name -> the payload is evidence, and must survive.
-    let mut ctx = common::make_get_ctx("/rest/products/search?q=apple");
-    ctx.request_headers.insert(
-        http::header::COOKIE,
-        format!("theme={payload}").parse().unwrap(),
-    );
-    eval(&engine, &mut ctx, Phase::RequestBody);
-    let m = ctx
-        .rule_matches
-        .iter()
-        .find(|m| m.rule_id == "900110")
-        .expect("cookie injection must still be detected");
-    assert!(
-        !m.matched_value.contains("redacted"),
-        "an attack in an ordinary cookie lost its payload: {:?}",
-        m.matched_value
-    );
-    assert!(m.matched_value.contains("UNION"), "{:?}", m.matched_value);
-
-    // Sensitive cookie name -> the value is a credential, and must not be kept.
-    let mut ctx = common::make_get_ctx("/rest/products/search?q=apple");
-    ctx.request_headers.insert(
-        http::header::COOKIE,
-        format!("session={payload}").parse().unwrap(),
-    );
-    eval(&engine, &mut ctx, Phase::RequestBody);
-    let m = ctx
-        .rule_matches
-        .iter()
-        .find(|m| m.rule_id == "900110")
-        .expect("the rule must still fire on a session cookie");
-    assert!(
-        m.matched_value.contains("redacted"),
-        "a session cookie's value was written down: {:?}",
-        m.matched_value
-    );
-
-    // A rule matching the WHOLE cookie header still redacts, because each
-    // cookie was registered individually and the check is bidirectional.
-    let mut ctx = common::make_get_ctx("/x");
-    ctx.request_headers.insert(
-        http::header::COOKIE,
-        format!("theme=dark; session={payload}").parse().unwrap(),
-    );
-    eval(&engine, &mut ctx, Phase::RequestBody);
-    if let Some(m) = ctx.rule_matches.iter().find(|m| m.rule_id == "900110") {
+    for name in ["theme", "session", "node-js"] {
+        let mut ctx = common::make_get_ctx("/rest/products/search?q=apple");
+        ctx.request_headers.insert(
+            http::header::COOKIE,
+            format!("{name}={payload}").parse().unwrap(),
+        );
+        eval(&engine, &mut ctx, Phase::RequestBody);
+        let m = ctx
+            .rule_matches
+            .iter()
+            .find(|m| m.rule_id == "900110")
+            .expect("cookie injection must still be detected");
         assert!(
-            !m.matched_value.contains("UNION SELECT password"),
-            "the session value leaked via a whole-header match: {:?}",
+            !m.matched_value.contains("UNION"),
+            "cookie {name}: its value was written down: {:?}",
+            m.matched_value
+        );
+        assert!(
+            m.matched_value.contains("redacted cookie value")
+                && m.matched_value.contains("space ' -"),
+            "cookie {name}: the shape must survive for triage: {:?}",
             m.matched_value
         );
     }
+
+    // HTTP/2 and HTTP/3 send one Cookie field per cookie. The August code read
+    // only the first field, so a cookie in the second one was never checked.
+    let mut ctx = common::make_get_ctx("/x");
+    ctx.request_headers
+        .append(http::header::COOKIE, "lang=en".parse().unwrap());
+    ctx.request_headers.append(
+        http::header::COOKIE,
+        format!("node-js={payload}").parse().unwrap(),
+    );
+    eval(&engine, &mut ctx, Phase::RequestBody);
+    let m = ctx
+        .rule_matches
+        .iter()
+        .find(|m| m.rule_id == "900110")
+        .expect("a cookie in the second field must still be inspected");
+    assert!(
+        !m.matched_value.contains("UNION"),
+        "the second Cookie field leaked: {:?}",
+        m.matched_value
+    );
+
+    // A query-string attack is not a cookie and keeps its payload.
+    let mut ctx = common::make_get_ctx(
+        "/rest/products/search?q=x%27%20UNION%20SELECT%20password%20FROM%20users--",
+    );
+    ctx.request_headers
+        .insert(http::header::COOKIE, "theme=dark".parse().unwrap());
+    eval(&engine, &mut ctx, Phase::RequestBody);
+    let m = ctx
+        .rule_matches
+        .iter()
+        .find(|m| m.rule_id == "900110")
+        .expect("the query injection must be detected");
+    assert!(m.matched_value.contains("UNION"), "{:?}", m.matched_value);
 }
 
 /// What a CHAINED rule records. Chains are `AND`: every link must match, so
