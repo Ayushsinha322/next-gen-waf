@@ -11,6 +11,14 @@ fn is_response_phase(phase: &Phase) -> bool {
     matches!(phase, Phase::ResponseHeaders | Phase::ResponseBody)
 }
 
+/// Whether the rule scores the RESPONSE: it declares CRS's outbound anomaly
+/// score (`setvar:tx.outbound_anomaly_score[_plN]=+N`).
+fn scores_outbound(meta: &RuleMeta) -> bool {
+    meta.setvars
+        .iter()
+        .any(|sv| sv.name.starts_with("OUTBOUND_ANOMALY_SCORE"))
+}
+
 fn rule_phase_to_phase(rp: RulePhase) -> Phase {
     match rp {
         RulePhase::Connection => Phase::Connection,
@@ -1489,6 +1497,10 @@ pub fn evaluate(
             }
 
             Instruction::LoadAnomalyScore => {
+                // The REQUEST total, in every phase — deliberately. The only
+                // rules that read it are SRL rules, and an SRL rule scores the
+                // request total even in a response phase (see fire_rule); CRS's
+                // outbound total is read through TX:OUTBOUND_ANOMALY_SCORE_PLn.
                 stack.push(StackVal::Int(ctx.anomaly_score as i64));
             }
 
@@ -1586,20 +1598,34 @@ pub fn evaluate(
                             }
                         }
                         // Short-circuit: if anomaly score exceeds threshold, block immediately.
-                        // A response phase is judged on the OUTBOUND total, and
-                        // the caller passes the outbound threshold for it.
-                        let (score, which) = if response_phase {
-                            (ctx.outbound_anomaly_score, "outbound anomaly score")
-                        } else {
-                            (ctx.anomaly_score, "anomaly score")
-                        };
-                        if anomaly_threshold > 0
-                            && score >= anomaly_threshold
-                            && ctx.decision != WafDecision::Block
+                        // In a response phase the caller passes the OUTBOUND
+                        // threshold, for the outbound total; the request total
+                        // there (an operator's SRL response rule adds to it) is
+                        // judged against the site's own threshold, which the
+                        // proxy stamps on the context.
+                        let hit = if !(anomaly_threshold > 0 && ctx.decision != WafDecision::Block)
                         {
+                            None
+                        } else if !response_phase {
+                            (ctx.anomaly_score >= anomaly_threshold).then_some((
+                                "anomaly score",
+                                ctx.anomaly_score,
+                                anomaly_threshold,
+                            ))
+                        } else if ctx.outbound_anomaly_score >= anomaly_threshold {
+                            Some((
+                                "outbound anomaly score",
+                                ctx.outbound_anomaly_score,
+                                anomaly_threshold,
+                            ))
+                        } else {
+                            ctx.anomaly_threshold
+                                .filter(|t| *t > 0 && ctx.anomaly_score >= *t)
+                                .map(|t| ("anomaly score", ctx.anomaly_score, t))
+                        };
+                        if let Some((which, score, t)) = hit {
                             ctx.decision = WafDecision::Block;
-                            ctx.block_reason =
-                                Some(format!("{which} {score} >= threshold {anomaly_threshold}"));
+                            ctx.block_reason = Some(format!("{which} {score} >= threshold {t}"));
                             return WafDecision::Block;
                         }
                     } else {
@@ -1650,11 +1676,16 @@ fn fire_rule(
         }
     }
 
-    // Add anomaly score — to the total of the side it judges. A rule in a
-    // response phase scores the RESPONSE (CRS's outbound score), and must never
-    // raise the request's score toward the site's request threshold.
+    // Add anomaly score — to the total of the side the RULE says it scores. A
+    // CRS response rule declares `tx.outbound_anomaly_score_plN` and scores the
+    // RESPONSE, judged against the outbound threshold; it must never raise the
+    // request's score. Every other rule — including an operator's own SRL
+    // `response_body` rule — adds to the request total and is judged against
+    // the site's threshold, as it was before outbound scoring existed. Keying
+    // this on the phase instead turned such a rule scoring 4 or more into a
+    // standalone block at the outbound threshold. (Code review finding.)
     if meta.score_delta > 0 {
-        if is_response_phase(&phase) {
+        if scores_outbound(meta) {
             ctx.outbound_anomaly_score = ctx
                 .outbound_anomaly_score
                 .saturating_add(meta.score_delta as u32);

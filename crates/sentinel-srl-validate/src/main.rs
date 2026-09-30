@@ -204,12 +204,18 @@ fn summarise(dsl: &str) -> Vec<RuleSummary> {
 
 /// Evaluate the rule against a synthetic request.
 ///
-/// The payload is offered as BOTH the query string and the request body, because
-/// an operator testing `targets: ARGS` and one testing `targets: REQUEST_BODY`
-/// both reasonably expect their sample to be seen. Every phase is run in order so
-/// a rule declared in any phase gets its chance; the threshold is 0 to disable
-/// early exit, so the result reflects this rule alone rather than an accumulated
-/// score cutting evaluation short.
+/// The payload is offered as the query string, the request body AND the
+/// response body, because an operator testing `targets: ARGS`, one testing
+/// `targets: REQUEST_BODY` and one testing a `response_body` rule all reasonably
+/// expect their sample to be seen. Every phase is run in order so a rule
+/// declared in any phase gets its chance; the threshold is 0 to disable early
+/// exit, so the result reflects this rule alone rather than an accumulated score
+/// cutting evaluation short.
+///
+/// The score reported is the rule's own, on whichever side it lands: a rule
+/// declaring CRS's outbound score adds to the RESPONSE total, and reporting the
+/// request total alone read 0 for a rule production would block on. (Code
+/// review finding.)
 fn dry_run(engine: &sentinel_rules::RuleEngine, req: &Request) -> (String, u32, Vec<String>) {
     let mut ctx = RequestContext::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
 
@@ -224,6 +230,7 @@ fn dry_run(engine: &sentinel_rules::RuleEngine, req: &Request) -> (String, u32, 
         }
     }
     ctx.request_body = Some(req.payload.clone().into_bytes().into());
+    ctx.response_body = Some(req.payload.clone().into_bytes().into());
 
     let mut decision = sentinel_core::context::WafDecision::Allow;
     for phase in [
@@ -244,5 +251,72 @@ fn dry_run(engine: &sentinel_rules::RuleEngine, req: &Request) -> (String, u32, 
         .iter()
         .map(|m| m.rule_id.clone())
         .collect::<Vec<_>>();
-    (format!("{decision:?}"), ctx.anomaly_score, ids)
+    (
+        format!("{decision:?}"),
+        ctx.anomaly_score + ctx.outbound_anomaly_score,
+        ids,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn engine(src: &str) -> sentinel_rules::RuleEngine {
+        sentinel_rules::RuleEngine::from_srl(src).expect("compile")
+    }
+
+    fn req(payload: &str) -> Request {
+        Request {
+            payload: payload.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_response_body_rule_is_dry_run_against_the_sample() {
+        // The sample was offered as the query and the request body only, so a
+        // response_body rule on RESPONSE_BODY could never match in the console's
+        // dry-run while production evaluated it on every response.
+        let e = engine(
+            r#"
+rule 990001 {
+    phase     : response_body
+    targets   : RESPONSE_BODY
+    operator  : rx /INTERNAL_BUILD/
+    score     : +5
+    severity  : critical
+    message   : "internal build string in a response"
+    action    : score
+}
+"#,
+        );
+        let (_, score, ids) = dry_run(&e, &req("INTERNAL_BUILD 7.3"));
+        assert_eq!(ids, ["990001"]);
+        assert_eq!(score, 5, "the rule's own score, not 0");
+    }
+
+    #[test]
+    fn a_request_rule_still_reports_its_score() {
+        let e = engine(
+            r#"
+rule 990002 {
+    phase     : request_body
+    targets   : ARGS
+    operator  : rx /(?i)union\s+select/
+    score     : +5
+    severity  : critical
+    message   : "sqli"
+    action    : score
+}
+"#,
+        );
+        let (decision, score, ids) = dry_run(&e, &req("q=1%20UNION%20SELECT%201"));
+        assert_eq!(ids, ["990002"]);
+        assert_eq!(score, 5);
+        assert_eq!(
+            decision, "Allow",
+            "threshold 0: the dry-run never short-circuits"
+        );
+    }
 }

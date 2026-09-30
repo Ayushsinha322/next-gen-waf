@@ -313,3 +313,47 @@ fn a_request_rule_still_runs_after_a_learning_mode_downgrade() {
     eng.evaluate(&mut ctx, Phase::RequestBody, 0);
     assert!(ctx.rule_matches.is_empty());
 }
+
+/// Only a rule that declares CRS's OUTBOUND score is judged on the response
+/// side. Any other response-phase rule — an operator's own SRL `response_body`
+/// rule, a legacy rule scoring `tx.anomaly_score` — adds to the request total
+/// and blocks only at the site's threshold, as before outbound scoring existed.
+/// Keyed on the phase, such a rule scoring 4 or more became a standalone block
+/// at the outbound threshold on upgrade. (Code review finding.)
+#[test]
+fn a_response_rule_without_an_outbound_score_scores_the_request() {
+    let eng = sentinel_rules::RuleEngine::from_crs_conf(
+        r#"SecRule RESPONSE_BODY "@contains INTERNAL_BUILD" "id:959904,phase:4,pass,msg:'operator rule',severity:'CRITICAL',setvar:'tx.anomaly_score=+5'""#,
+    )
+    .expect("compile");
+    let run = |request_score: u32| {
+        let mut ctx = common::make_ctx();
+        ctx.anomaly_threshold = Some(10); // stamped by the proxy's routing
+        ctx.anomaly_score = request_score;
+        ctx.response_body = Some(b"<p>INTERNAL_BUILD 7.3</p>".to_vec().into());
+        eng.evaluate(
+            &mut ctx,
+            Phase::ResponseBody,
+            sentinel_rules::DEFAULT_OUTBOUND_ANOMALY_THRESHOLD,
+        );
+        ctx
+    };
+    let alone = run(0);
+    assert_eq!(alone.anomaly_score, 5, "adds to the request total");
+    assert_eq!(alone.outbound_anomaly_score, 0);
+    assert_eq!(
+        alone.decision,
+        WafDecision::Allow,
+        "5 is below the site's 10; the outbound 4 does not apply to it"
+    );
+    let with_request = run(6);
+    assert_eq!(with_request.decision, WafDecision::Block, "6 + 5 >= 10");
+    assert!(
+        with_request
+            .block_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("anomaly score 11 >= threshold 10")),
+        "{:?}",
+        with_request.block_reason
+    );
+}

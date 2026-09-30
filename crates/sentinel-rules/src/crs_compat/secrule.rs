@@ -17,6 +17,13 @@ pub struct CrsActions {
     pub severity: Option<RuleSeverity>,
     pub tags: Vec<String>,
     pub score_delta: Option<i32>,
+    /// The request-side (`tx.anomaly_score`, `tx.inbound_anomaly_score_plN`)
+    /// and response-side (`tx.outbound_anomaly_score[_plN]`) deltas, summed
+    /// separately. `score_delta` is the outbound one when the rule has any —
+    /// legacy CRS response rules set BOTH names for one finding, and summing
+    /// them scored a single critical leak 10 instead of 5 — else the inbound.
+    pub inbound_delta: Option<i32>,
+    pub outbound_delta: Option<i32>,
     /// All `setvar` mutations targeting the per-request TX store, in declaration
     /// order. Unlike `score_delta` (which only tracks anomaly-score deltas for
     /// the fast blocking path), this preserves *every* `tx.*` write so category
@@ -99,6 +106,7 @@ pub fn parse_crs_actions(s: &str) -> CrsActions {
     for token in split_crs_actions(s) {
         parse_action_token(&token, &mut out);
     }
+    out.score_delta = out.outbound_delta.or(out.inbound_delta);
     out
 }
 
@@ -168,9 +176,15 @@ fn parse_action_token(token: &str, out: &mut CrsActions) {
     if let Some(rest) = token.strip_prefix("setvar:") {
         let rest = rest.trim();
         // Keep the fast anomaly-score path (drives ctx.anomaly_score directly).
-        if let Some(delta) = parse_setvar_score_delta(rest) {
-            // Sum all anomaly-score deltas in the rule (CRS v4 has exactly one per rule).
-            out.score_delta = Some(out.score_delta.unwrap_or(0) + delta);
+        if let Some((delta, outbound)) = parse_setvar_score_delta(rest) {
+            // Summed per side (CRS v4 has exactly one per rule); the side is
+            // chosen once all actions are read — see `CrsActions::score_delta`.
+            let side = if outbound {
+                &mut out.outbound_delta
+            } else {
+                &mut out.inbound_delta
+            };
+            *side = Some(side.unwrap_or(0) + delta);
         }
         // Preserve the full TX-store mutation (arbitrary tx.* vars, macros, etc.)
         // so it executes at match time and is readable by later rules. Anomaly
@@ -291,7 +305,7 @@ fn parse_action_token(token: &str, out: &mut CrsActions) {
 ///   include a corresponding `tx.anomaly_score` delta, so we take that one).
 /// - Only delta operations (`+N` or `-N`) are extracted; absolute assignments
 ///   (`=N` without sign) are ignored for scoring purposes.
-fn parse_setvar_score_delta(s: &str) -> Option<i32> {
+fn parse_setvar_score_delta(s: &str) -> Option<(i32, bool)> {
     // Strip quotes CRS sometimes wraps setvar values in
     let s = s.trim().trim_matches('\'');
     let (lhs, rhs) = s.split_once('=')?;
@@ -312,10 +326,10 @@ fn parse_setvar_score_delta(s: &str) -> Option<i32> {
     // response rule as `block` with no score, which the importer compiles to a
     // HARD block — one match on a JavaScript bundle replaced it with a block
     // page, and the event recorded a score of 0 beside would_block=true.
-    let is_score_delta = lhs == "tx.anomaly_score"
-        || lhs.starts_with("tx.inbound_anomaly_score_pl")
-        || lhs == "tx.outbound_anomaly_score"
-        || lhs.starts_with("tx.outbound_anomaly_score_pl");
+    let outbound =
+        lhs == "tx.outbound_anomaly_score" || lhs.starts_with("tx.outbound_anomaly_score_pl");
+    let is_score_delta =
+        outbound || lhs == "tx.anomaly_score" || lhs.starts_with("tx.inbound_anomaly_score_pl");
     if !is_score_delta {
         return None;
     }
@@ -331,7 +345,7 @@ fn parse_setvar_score_delta(s: &str) -> Option<i32> {
 
     // Direct numeric: +5
     if let Ok(n) = num_str.trim().parse::<i32>() {
-        return Some(sign * n);
+        return Some((sign * n, outbound));
     }
 
     // Variable reference: +%{tx.critical_anomaly_score}
@@ -345,7 +359,7 @@ fn parse_setvar_score_delta(s: &str) -> Option<i32> {
             "tx.notice_anomaly_score" => Some(2),
             _ => None,
         };
-        return mapped.map(|v| sign * v);
+        return mapped.map(|v| (sign * v, outbound));
     }
 
     None
@@ -471,9 +485,20 @@ mod tests {
         );
         assert_eq!(
             parse_setvar_score_delta("tx.outbound_anomaly_score=+4"),
-            Some(4),
+            Some((4, true)),
             "the unsuffixed CRS v3 name counts too"
         );
+        // Legacy CRS response rules set BOTH names for one finding. Summing
+        // them scored one critical leak 10; it is 5, on the outbound side.
+        // (Code review finding.)
+        let legacy = parse_crs_actions(
+            "id:950999,phase:4,block,severity:'CRITICAL',\
+             setvar:'tx.outbound_anomaly_score=+%{tx.critical_anomaly_score}',\
+             setvar:'tx.anomaly_score=+%{tx.critical_anomaly_score}'",
+        );
+        assert_eq!(legacy.score_delta, Some(5));
+        assert_eq!(legacy.outbound_delta, Some(5));
+        assert_eq!(legacy.inbound_delta, Some(5));
     }
 
     #[test]

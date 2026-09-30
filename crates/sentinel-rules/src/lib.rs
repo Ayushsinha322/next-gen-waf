@@ -63,6 +63,10 @@ pub const DEFAULT_OUTBOUND_ANOMALY_THRESHOLD: u32 = 4;
 #[derive(Clone)]
 pub struct RuleEngine {
     ruleset: Arc<CompiledRuleSet>,
+    /// Computed once at build: the proxy asks on EVERY response, and the answer
+    /// is fixed for the life of the engine. It walked every rule's metadata
+    /// (~350) per response. (Code review finding.)
+    has_response_body_rules: bool,
 }
 
 impl std::fmt::Debug for RuleEngine {
@@ -74,8 +78,14 @@ impl std::fmt::Debug for RuleEngine {
 impl RuleEngine {
     /// Create a `RuleEngine` from an already-compiled `CompiledRuleSet`.
     pub fn new(ruleset: CompiledRuleSet) -> Self {
+        use crate::dsl::ast::RulePhase;
+        let has_response_body_rules = ruleset
+            .rule_meta
+            .values()
+            .any(|m| m.phase == RulePhase::ResponseBody);
         Self {
             ruleset: Arc::new(ruleset),
+            has_response_body_rules,
         }
     }
 
@@ -178,11 +188,7 @@ impl RuleEngine {
     /// directives are emitted into every phase program (so a non-empty program
     /// does not by itself imply a real response-body rule).
     pub fn has_response_body_rules(&self) -> bool {
-        use crate::dsl::ast::RulePhase;
-        self.ruleset
-            .rule_meta
-            .values()
-            .any(|m| m.phase == RulePhase::ResponseBody)
+        self.has_response_body_rules
     }
 }
 
