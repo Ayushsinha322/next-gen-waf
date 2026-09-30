@@ -177,3 +177,62 @@ describe("path overrides", () => {
     expect(f.path_overrides).toEqual([]);
   });
 });
+
+describe("a console save keeps the policy keys the console does not manage", () => {
+  // The server replaces waf_policy wholesale, and the form used to rebuild it
+  // from its own fields only — so saving a site erased crs_policy (set through
+  // the API) and anything else an API client had stored. (Code review.)
+  const stored = (waf_policy: Record<string, unknown>): Site =>
+    ({ id: "s1", name: "site", domains: ["app.example"], upstream: {}, waf_policy } as unknown as Site);
+
+  it("carries crs_policy and unknown keys through load and save", () => {
+    const site = stored({
+      mode: "learning", paranoia_level: 2, anomaly_threshold: 10,
+      crs_policy: { outbound_anomaly_score_threshold: "8", max_num_args: "400" },
+      some_future_key: { a: 1 },
+    });
+    const out = formToPayload(siteToForm(site)).waf_policy as Record<string, unknown>;
+    expect(out.crs_policy).toEqual({ outbound_anomaly_score_threshold: "8", max_num_args: "400" });
+    expect(out.some_future_key).toEqual({ a: 1 });
+  });
+
+  it("does not resurrect a key the form owns and switched off", () => {
+    const site = stored({
+      mode: "learning", paranoia_level: 2, anomaly_threshold: 10,
+      rate_limit: { global: { rps: 1, burst: 1 }, per_ip: { rps: 1, burst: 1 } },
+    });
+    const f = siteToForm(site);
+    f.rate_limit_enabled = false;
+    const out = formToPayload(f).waf_policy as Record<string, unknown>;
+    expect(out.rate_limit).toBeUndefined();
+  });
+
+  it("never lets a preserved key overwrite what the form wrote", () => {
+    const f = emptyForm();
+    f.preserved_policy = { mode: "off", crs_policy: { x: "1" } };
+    const out = formToPayload(f).waf_policy as Record<string, unknown>;
+    expect(out.mode).toBe(f.mode);
+    expect(out.crs_policy).toEqual({ x: "1" });
+  });
+
+  it("FORM_MANAGED_POLICY_KEYS names every key formToPayload can write", async () => {
+    // With every switch on, formToPayload writes every key it knows. A key it
+    // writes that the set does not name would be treated as "not ours" and
+    // could be resurrected from the stored policy after being switched off.
+    const { FORM_MANAGED_POLICY_KEYS } = await import("../siteConfig");
+    const f = emptyForm() as unknown as Record<string, unknown>;
+    for (const k of Object.keys(f)) if (typeof f[k] === "boolean") f[k] = true;
+    for (const mode of ["allow", "block"]) {
+      (f as { geo_mode: string }).geo_mode = mode;
+      const keys = Object.keys(formToPayload(f as unknown as SiteForm).waf_policy);
+      for (const k of keys) expect(FORM_MANAGED_POLICY_KEYS.has(k), `unlisted key ${k}`).toBe(true);
+    }
+    // And by source: every `waf_policy.X =` the builder assigns.
+    const { readFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const src = readFileSync(join(__dirname, "../siteConfig.ts"), "utf8");
+    for (const m of src.matchAll(/waf_policy\.([a-z_]+)\s*=/g)) {
+      expect(FORM_MANAGED_POLICY_KEYS.has(m[1]), `unlisted key ${m[1]}`).toBe(true);
+    }
+  });
+});

@@ -267,6 +267,10 @@ export interface SiteForm {
   domains: string[];
   preset:  PresetKey;
 
+  // Stored waf_policy keys this form does NOT manage (e.g. `crs_policy`, set
+  // through the API), carried back unchanged on save. See PRESERVED below.
+  preserved_policy: Record<string, unknown>;
+
   // front service / public exposure
   front_https:  boolean;   // terminate HTTPS on the public listener
   force_https:  boolean;   // redirect HTTP → HTTPS
@@ -565,6 +569,7 @@ export const COUNTRIES: { code: string; name: string }[] = [
 export function emptyForm(): SiteForm {
   return {
     name: "", domains: [], preset: "balanced",
+    preserved_policy: {},
 
     front_https: true, force_https: true, http2: true, http3: false,
 
@@ -681,6 +686,36 @@ export function durationToSecs(v: string): number {
 }
 
 /* ── Form → API payload ───────────────────────────────────────── */
+/* Every waf_policy key the console writes — the ones it OWNS, including those
+ * it deliberately omits to switch a feature off (rate_limit, anti_ddos, …).
+ *
+ * The server REPLACES waf_policy wholesale on update, so a save used to erase
+ * every key this form has no field for. `crs_policy` is the one that mattered:
+ * it is set through the API, and the explanation of a response-leak event tells
+ * operators to set `crs_policy.outbound_anomaly_score_threshold` there — which
+ * the next console save then silently put back to CRS's 4. Keys NOT in this set
+ * are now carried through untouched; keys in it are the form's to decide, so a
+ * feature switched off is still removed. A test fails when formToPayload learns
+ * a key this list does not name. (Code review finding.) */
+export const FORM_MANAGED_POLICY_KEYS: ReadonlySet<string> = new Set([
+  "mode", "paranoia_level", "anomaly_threshold", "rule_categories", "rule_exclusions",
+  "max_body_size", "max_uri_length", "max_header_count", "allowed_methods",
+  "api_discovery", "enabled_plugins", "path_overrides", "frontend", "tls",
+  "rate_limit", "anti_ddos", "bot_detection", "geoip", "ip_reputation",
+  "security_headers", "block_page", "ml", "jwt", "graphql", "grpc", "dlp", "fusion",
+]);
+
+/** The stored policy keys the form does not manage, to carry through a save. */
+export function unmanagedPolicy(stored: unknown): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (stored && typeof stored === "object" && !Array.isArray(stored)) {
+    for (const [k, v] of Object.entries(stored as Record<string, unknown>)) {
+      if (!FORM_MANAGED_POLICY_KEYS.has(k)) out[k] = v;
+    }
+  }
+  return out;
+}
+
 export function formToPayload(f: SiteForm): {
   name: string; domains: string[]; upstream: object; waf_policy: object;
 } {
@@ -924,6 +959,12 @@ export function formToPayload(f: SiteForm): {
     };
   }
 
+  // Carry through what the form does not own (crs_policy and anything an API
+  // client stored). Never over a key the form wrote.
+  for (const [k, v] of Object.entries(f.preserved_policy ?? {})) {
+    if (!FORM_MANAGED_POLICY_KEYS.has(k) && !(k in waf_policy)) waf_policy[k] = v;
+  }
+
   return { name: f.name.trim(), domains: f.domains, upstream, waf_policy };
 }
 
@@ -976,6 +1017,7 @@ export function siteToForm(site: Site): SiteForm {
   }
 
   const w = (site.waf_policy ?? {}) as AnyRec;
+  f.preserved_policy = unmanagedPolicy(w);
   f.mode = (w.mode as WafMode) ?? "blocking";
   f.paranoia_level = num(w.paranoia_level, 2);
   f.anomaly_threshold = num(w.anomaly_threshold, 5);
