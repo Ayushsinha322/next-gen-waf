@@ -248,7 +248,7 @@ if [[ -n "$CH_NEW" && "$CH_NOW" != "$CH_NEW" ]]; then
   if [[ $ch_rc -eq 132 ]]; then
     die "the new ClickHouse ($CH_NEW) cannot run on this host's CPU (SIGILL): on a virtual machine this means its CPU model hides SSE4.2/SSSE3/POPCNT — ask for a host-passthrough or newer CPU model. Nothing was changed."
   elif [[ $ch_rc -ne 0 ]]; then
-    die "could not run the new ClickHouse image ($CH_NEW), exit $ch_rc: $(tail -1 <<<"$ch_out"). Nothing was changed."
+    die "could not run the new ClickHouse image ($CH_NEW), exit $ch_rc: $(grep -m1 -i 'error' <<<"$ch_out" || tail -1 <<<"$ch_out"). Nothing was changed."
   fi
   # (b) Does the SERVER start with this package's configuration? A throwaway
   # server — no network, its own scratch storage, the package's config.d
@@ -261,7 +261,7 @@ if [[ -n "$CH_NEW" && "$CH_NOW" != "$CH_NEW" ]]; then
   docker rm -f -v sentinel-ch-preflight >/dev/null 2>&1 || true
   if ! ch_out=$(docker run -d --name sentinel-ch-preflight --network none \
         --ulimit nofile=262144:262144 ${ch_mounts[@]+"${ch_mounts[@]}"} "$CH_NEW" 2>&1); then
-    die "could not start a test ClickHouse from $CH_NEW: $(tail -1 <<<"$ch_out"). Nothing was changed."
+    die "could not start a test ClickHouse from $CH_NEW: $(grep -m1 -i 'error' <<<"$ch_out" || tail -1 <<<"$ch_out"). Nothing was changed."
   fi
   CH_NEW_VERSION=""
   for _ in $(seq 1 90); do

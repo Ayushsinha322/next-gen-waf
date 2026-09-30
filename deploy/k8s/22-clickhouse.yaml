@@ -44,6 +44,22 @@ spec:
     metadata:
       labels: { app: clickhouse }
     spec:
+      # Can this node's CPU run the pinned ClickHouse? A build needing
+      # instructions the (virtual) CPU hides dies with SIGILL and would
+      # CrashLoopBackOff with no explanation; this stops at Init:Error and says
+      # why. Same image as the server below. See deploy/docker/clickhouse-cpu-check.sh.
+      initContainers:
+        - name: cpu-check
+          image: clickhouse/clickhouse-server:26.3.35.3-alpine
+          command:
+            - sh
+            - -c
+            - |
+              clickhouse local -q 'SELECT 1' >/dev/null 2>&1; rc=$?
+              if [ "$rc" -eq 132 ]; then
+                echo "this node's CPU cannot run this ClickHouse build (SIGILL): its CPU model hides SSE4.2/SSSE3/POPCNT"; exit 1
+              fi
+              if [ "$rc" -ne 0 ]; then echo "clickhouse local failed (exit $rc)"; exit 1; fi
       containers:
         - name: clickhouse
           # Exact version — see deploy/docker/compose.prod.yml. One-way upgrade.

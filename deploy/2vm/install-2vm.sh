@@ -917,6 +917,23 @@ say "  ${DIM}cd $COMPOSE_DIR && ${C[*]} up -d${R}"
   || die "compose config is invalid — fix .env before starting (nothing was started)"
 ok "compose config resolves"
 
+# Can this CPU run the pinned ClickHouse? See clickhouse-cpu-check.sh — a build
+# needing instructions the virtual CPU hides restarts for ever (SIGILL). The
+# passive node runs no ClickHouse, so only the active one is checked.
+if [[ "$ROLE" != "slave" ]]; then
+  CH_IMG=$( cd "$COMPOSE_DIR" && "${C[@]}" config --images 2>/dev/null | grep -m1 'clickhouse-server:' )
+  CPU_CHECK=""
+  for c in "$SCRIPT_DIR/../clickhouse-cpu-check.sh" "$SCRIPT_DIR/../docker/clickhouse-cpu-check.sh"; do
+    [[ -x "$c" ]] && { CPU_CHECK="$c"; break; }
+  done
+  if [[ -n "$CH_IMG" && -n "$CPU_CHECK" ]]; then
+    ch_msg=$("$CPU_CHECK" "$CH_IMG") || die "$ch_msg. Nothing was started."
+    ok "this host's CPU runs $CH_IMG"
+  else
+    warn "ClickHouse CPU check skipped (clickhouse-cpu-check.sh not found beside this script)"
+  fi
+fi
+
 ( cd "$COMPOSE_DIR" && "${C[@]}" up -d ) || die "compose up failed"
 ok "containers started"
 

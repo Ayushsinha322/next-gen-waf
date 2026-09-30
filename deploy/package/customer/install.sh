@@ -1108,6 +1108,15 @@ step "Step 10 of 11 — starting services"
 C=(docker compose -p sentinel -f "$INSTALL_DIR/compose.prod.yml" --env-file "$ENV_FILE")
 ( cd "$INSTALL_DIR" && "${C[@]}" config >/dev/null 2>>"$LOG" ) \
   || die "the compose configuration is invalid — see $LOG. Nothing was started."
+# Can this CPU run the pinned ClickHouse? A build that needs instructions the
+# (virtual) CPU hides dies with SIGILL and restarts for ever; without this the
+# install timed out on a generic health check with no hint of why.
+CH_IMG=$( cd "$INSTALL_DIR" && "${C[@]}" config --images 2>>"$LOG" | grep -m1 'clickhouse-server:' )
+if [[ -n "$CH_IMG" && -x "$HERE/scripts/clickhouse-cpu-check.sh" ]]; then
+  ch_msg=$("$HERE/scripts/clickhouse-cpu-check.sh" "$CH_IMG") \
+    || die "$ch_msg. Nothing was started."
+  ok "this host's CPU runs $CH_IMG"
+fi
 say "  ${DIM}database migrations run automatically before the control plane starts${R}"
 ( cd "$INSTALL_DIR" && "${C[@]}" up -d >>"$LOG" 2>&1 ) \
   || die "failed to start services — see $LOG"

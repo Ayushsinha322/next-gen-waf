@@ -206,7 +206,7 @@ cp deploy/docker/haproxy.cfg               "$STAGE/compose/" 2>/dev/null \
 # "Post-deploy verification", so an operator troubleshooting an install would
 # reasonably run it — and then either believe their install was broken or stop
 # trusting verification output altogether. verify.sh is the customer tool.
-for s in preflight.sh promote-standby.sh \
+for s in preflight.sh promote-standby.sh clickhouse-cpu-check.sh \
          issue-ip-cert.sh issue-postgres-cert.sh issue-clickhouse-cert.sh \
          pg-init-replication.sh pg-standby-entrypoint.sh; do
   cp "deploy/docker/$s" "$STAGE/scripts/" 2>/dev/null || warn "missing script: $s"
