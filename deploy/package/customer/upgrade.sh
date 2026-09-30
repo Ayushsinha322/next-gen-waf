@@ -6,13 +6,16 @@
 #      sudo ./upgrade.sh --dry-run      # run every check, change nothing
 #      sudo ./upgrade.sh --force        # allow same-version or downgrade
 #      sudo ./upgrade.sh --yes          # no prompts (for automation)
+#      sudo ./upgrade.sh --allow-clickhouse-downgrade   # see Step 4
 #
 #  Run it from the NEW package directory. It reads the installed version from
 #  /opt/sentinel/version and upgrades that installation in place.
 #
-#  Sequence: verify package -> confirm rollback is possible -> back up database
-#  and secrets -> load new images -> start (migrations run as a dependency) ->
-#  health checks -> AUTOMATIC ROLLBACK if those fail.
+#  Sequence: verify package -> confirm rollback is possible -> load new images
+#  and pre-flight them (the new ClickHouse must start on this host) -> back up
+#  database and secrets -> start (migrations run as a dependency) -> health
+#  checks -> AUTOMATIC ROLLBACK if those fail. --dry-run stops after the
+#  pre-flight: it loads images, and changes nothing that is running.
 #
 #  HONEST LIMIT OF "AUTOMATIC ROLLBACK" — read this before relying on it.
 #
@@ -39,14 +42,15 @@ ENV_FILE="$INSTALL_DIR/.env"
 LOG_DIR=/var/log/sentinel
 LOG="$LOG_DIR/upgrade.log"
 
-DRY_RUN=no; FORCE=no; ASSUME_YES=no; RESTORE_DB=no
+DRY_RUN=no; FORCE=no; ASSUME_YES=no; RESTORE_DB=no; ALLOW_CH_DOWNGRADE=no
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY_RUN=yes ;;
+    --allow-clickhouse-downgrade) ALLOW_CH_DOWNGRADE=yes ;;
     --force) FORCE=yes ;;
     --yes|-y) ASSUME_YES=yes ;;
     --restore-db) RESTORE_DB=yes ;;
-    -h|--help) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -171,7 +175,127 @@ if [[ -n "$applied" ]]; then
   NEW_MIGRATIONS="$applied"
 fi
 
-[[ "$DRY_RUN" == "yes" ]] && { say ""; ok "--dry-run: checks passed, nothing changed"; exit 0; }
+# ── 4. load the new images, and pre-flight them ─────────────────────────────
+# Before the backup, and before --dry-run returns: loading or pulling images
+# changes nothing that is running, and a host that cannot take this upgrade —
+# a ClickHouse its CPU cannot run, a config it rejects, an image it cannot pull
+# — must find out here, not after a full event-store dump (every failed attempt
+# used to write one) and not inside `compose up`. (Code review findings.)
+step "Step 4 of 8 — images and pre-flight"
+# A registry package ships no images on purpose — it names a registry to pull
+# from. Running `docker load` against it failed with "package is incomplete",
+# which described the bundle rather than the mistake.
+NEW_SOURCE="$(manifest_str image_source)"
+[[ "$NEW_SOURCE" == "registry" ]] || NEW_SOURCE=bundled
+
+if [[ "$NEW_SOURCE" == "registry" ]]; then
+  NEW_PREFIX="$(manifest_str registry_prefix)"
+  [[ -n "$NEW_PREFIX" ]] \
+    || die "this package says image_source=registry but names no registry_prefix"
+  for svc in "${SERVICES[@]}"; do
+    docker pull "${NEW_PREFIX}/${svc}:${NEW}" >>"$LOG" 2>&1 \
+      || die "could not pull ${NEW_PREFIX}/${svc}:${NEW} — see $LOG"
+  done
+  ok "four images pulled from $NEW_PREFIX at version $NEW"
+  IMG_PREFIX="$NEW_PREFIX"
+else
+  [[ -f "$HERE/bundle/images.tar.gz" ]] \
+    || die "bundle/images.tar.gz missing and the package does not say image_source=registry"
+  docker load -i "$HERE/bundle/images.tar.gz" >>"$LOG" 2>&1 || die "docker load failed — see $LOG"
+  for svc in "${SERVICES[@]}"; do
+    docker image inspect "${IMG_PREFIX}/${svc}:${NEW}" >/dev/null 2>&1 \
+      || die "${IMG_PREFIX}/${svc}:${NEW} missing after load — package is incomplete"
+  done
+  ok "four images loaded at version $NEW"
+fi
+
+# Every supporting image the NEW compose file names must be on this host BEFORE
+# anything is switched. No upgrade changed one until 1.1.13 (ClickHouse 24.10
+# -> 26.8, withdrawn; 1.1.14 moves 24.10 -> 26.3), and nothing looked: that move
+# would otherwise have found out inside
+# `compose up`, mid-switch, on a host that cannot reach Docker Hub. An air-gapped
+# package carries them in images.tar.gz (loaded above); an online one pulls them
+# here, where a failure still changes nothing. `config --images` resolves the
+# same profiles and prefixes `up` will, so it names exactly what will run.
+THIRD_IMAGES=$( cd "$HERE/compose" && docker compose -p sentinel -f compose.prod.yml \
+    --env-file "$ENV_FILE" config --images 2>>"$LOG" ) \
+  || die "could not read the images the new compose file needs — see $LOG. Nothing was changed."
+while IFS= read -r img; do
+  [[ -z "$img" || "$img" =~ /(dataplane|controlplane|dashboard|migrate): ]] && continue
+  if ! docker image inspect "$img" >/dev/null 2>&1; then
+    say "  pulling $img…"
+    docker pull "$img" >>"$LOG" 2>&1 \
+      || die "the new version needs $img, which is not in this package and could not be pulled — see $LOG. Nothing was changed."
+  fi
+done <<<"$THIRD_IMAGES"
+ok "every supporting image the new version names is present"
+
+# ClickHouse, when this package moves it to a different image. A ClickHouse
+# version change is the one image move that cannot be undone — a newer server
+# rewrites metadata an older one cannot read — and the one that can fail on a
+# host where everything else runs. Nothing here runs when ClickHouse is not
+# changing: a docker hiccup must not abort an upgrade that never needed it.
+CH_NOW=$(docker inspect -f '{{.Config.Image}}' sentinel-clickhouse-1 2>/dev/null || true)
+CH_NEW=$(grep -m1 'clickhouse-server:' <<<"$THIRD_IMAGES" || true)
+if [[ -n "$CH_NEW" && "$CH_NOW" != "$CH_NEW" ]]; then
+  # (a) Can this CPU run the binary at all? ClickHouse raises its CPU baseline
+  # over time: 26.8 needs x86-64-v2 (SSE4.2, SSSE3, POPCNT) and dies at once
+  # with SIGILL — exit 132 — on a VM whose virtual CPU hides them. Only that
+  # exit code is called a CPU problem; anything else (a full disk, a log driver
+  # that cannot start, the wrong architecture) is reported as what it is.
+  ch_out=$(docker run --rm --network none --entrypoint clickhouse "$CH_NEW" local -q "SELECT 1" 2>&1)
+  ch_rc=$?
+  if [[ $ch_rc -eq 132 ]]; then
+    die "the new ClickHouse ($CH_NEW) cannot run on this host's CPU (SIGILL): on a virtual machine this means its CPU model hides SSE4.2/SSSE3/POPCNT — ask for a host-passthrough or newer CPU model. Nothing was changed."
+  elif [[ $ch_rc -ne 0 ]]; then
+    die "could not run the new ClickHouse image ($CH_NEW), exit $ch_rc: $(tail -1 <<<"$ch_out"). Nothing was changed."
+  fi
+  # (b) Does the SERVER start with this package's configuration? A throwaway
+  # server — no network, its own scratch storage, the package's config.d
+  # drop-ins — must answer a query. `clickhouse local` proves the CPU and
+  # nothing about a setting a new version rejects.
+  ch_mounts=()
+  for f in clickhouse-logging.xml:logging.xml clickhouse-memory.xml:memory.xml; do
+    [[ -f "$HERE/compose/${f%%:*}" ]] && ch_mounts+=(-v "$HERE/compose/${f%%:*}:/etc/clickhouse-server/config.d/${f##*:}:ro")
+  done
+  docker rm -f -v sentinel-ch-preflight >/dev/null 2>&1 || true
+  if ! ch_out=$(docker run -d --name sentinel-ch-preflight --network none \
+        --ulimit nofile=262144:262144 ${ch_mounts[@]+"${ch_mounts[@]}"} "$CH_NEW" 2>&1); then
+    die "could not start a test ClickHouse from $CH_NEW: $(tail -1 <<<"$ch_out"). Nothing was changed."
+  fi
+  CH_NEW_VERSION=""
+  for _ in $(seq 1 90); do
+    [[ "$(docker inspect -f '{{.State.Status}}' sentinel-ch-preflight 2>/dev/null)" == "running" ]] || break
+    CH_NEW_VERSION=$(docker exec sentinel-ch-preflight clickhouse-client -q "SELECT version()" 2>/dev/null || true)
+    [[ -n "$CH_NEW_VERSION" ]] && break
+    sleep 1
+  done
+  docker logs --tail 30 sentinel-ch-preflight >>"$LOG" 2>&1 || true
+  docker rm -f -v sentinel-ch-preflight >/dev/null 2>&1 || true
+  [[ -n "$CH_NEW_VERSION" ]] \
+    || die "the new ClickHouse ($CH_NEW) did not start with this package's configuration — its last log lines are in $LOG. Nothing was changed."
+  ok "the new ClickHouse $CH_NEW_VERSION starts on this host with this package's configuration"
+
+  # (c) Never backwards without saying so. An older server cannot be trusted
+  # to read what a newer one wrote, and the rollback keeps the new compose
+  # file, so a failed start here would leave the event store down. Judged on
+  # the RUNNING server's version; a server that is not running (one that
+  # crash-looped before it ever opened its data) cannot be compared, and is
+  # the case this move usually repairs.
+  CH_NOW_VERSION=$(docker exec sentinel-clickhouse-1 clickhouse-client -q "SELECT version()" 2>/dev/null || true)
+  if [[ -z "$CH_NOW_VERSION" ]]; then
+    warn "the running ClickHouse did not answer — cannot compare versions; continuing"
+  elif [[ "$CH_NOW_VERSION" != "$CH_NEW_VERSION" \
+          && "$(printf '%s\n%s\n' "$CH_NOW_VERSION" "$CH_NEW_VERSION" | sort -V | head -1)" == "$CH_NEW_VERSION" ]]; then
+    [[ "$ALLOW_CH_DOWNGRADE" == "yes" ]] \
+      || die "this package moves ClickHouse BACKWARDS, $CH_NOW_VERSION -> $CH_NEW_VERSION. An older server may not read what a newer one wrote. If you have checked that it can, re-run with --allow-clickhouse-downgrade. Nothing was changed."
+    warn "ClickHouse moves BACKWARDS, $CH_NOW_VERSION -> $CH_NEW_VERSION (--allow-clickhouse-downgrade)"
+  fi
+  warn "ClickHouse moves ${CH_NOW_VERSION:-${CH_NOW##*:}} -> $CH_NEW_VERSION — ONE-WAY; the event store's way back is the backup in Step 5"
+  log "clickhouse image change: $CH_NOW -> $CH_NEW ($CH_NOW_VERSION -> $CH_NEW_VERSION)"
+fi
+
+[[ "$DRY_RUN" == "yes" ]] && { say ""; ok "--dry-run: every check passed; nothing that is running was changed (the new images are now loaded)"; exit 0; }
 
 if [[ "$ASSUME_YES" != "yes" ]]; then
   printf '\n  %sThis will upgrade the running deployment from %s to %s.%s\n' "$B" "$CURRENT" "$NEW" "$R"
@@ -181,8 +305,8 @@ if [[ "$ASSUME_YES" != "yes" ]]; then
   [[ "$c" == "YES" ]] || die "aborted by operator"
 fi
 
-# ── 4. back up before touching anything ──────────────────────────────────────
-step "Step 4 of 8 — backup"
+# ── 5. back up before touching anything ──────────────────────────────────────
+step "Step 5 of 8 — backup"
 BK_STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 BK_DIR="$STATE_DIR/pre-upgrade-$CURRENT-to-$NEW-$BK_STAMP"
 mkdir -p "$BK_DIR"
@@ -230,80 +354,6 @@ if [[ ! -f "$DUMP_DIR/postgres.dump" ]]; then
 fi
 printf '%s\n' "$DUMP_DIR" > "$STATE_DIR/last-pre-upgrade-backup"
 
-# ── 5. load the new images ───────────────────────────────────────────────────
-step "Step 5 of 8 — loading images"
-# A registry package ships no images on purpose — it names a registry to pull
-# from. Running `docker load` against it failed with "package is incomplete",
-# which described the bundle rather than the mistake.
-NEW_SOURCE="$(manifest_str image_source)"
-[[ "$NEW_SOURCE" == "registry" ]] || NEW_SOURCE=bundled
-
-if [[ "$NEW_SOURCE" == "registry" ]]; then
-  NEW_PREFIX="$(manifest_str registry_prefix)"
-  [[ -n "$NEW_PREFIX" ]] \
-    || die "this package says image_source=registry but names no registry_prefix"
-  for svc in "${SERVICES[@]}"; do
-    docker pull "${NEW_PREFIX}/${svc}:${NEW}" >>"$LOG" 2>&1 \
-      || die "could not pull ${NEW_PREFIX}/${svc}:${NEW} — see $LOG"
-  done
-  ok "four images pulled from $NEW_PREFIX at version $NEW"
-  IMG_PREFIX="$NEW_PREFIX"
-else
-  [[ -f "$HERE/bundle/images.tar.gz" ]] \
-    || die "bundle/images.tar.gz missing and the package does not say image_source=registry"
-  docker load -i "$HERE/bundle/images.tar.gz" >>"$LOG" 2>&1 || die "docker load failed — see $LOG"
-  for svc in "${SERVICES[@]}"; do
-    docker image inspect "${IMG_PREFIX}/${svc}:${NEW}" >/dev/null 2>&1 \
-      || die "${IMG_PREFIX}/${svc}:${NEW} missing after load — package is incomplete"
-  done
-  ok "four images loaded at version $NEW"
-fi
-
-# Every supporting image the NEW compose file names must be on this host BEFORE
-# anything is switched. No upgrade changed one until 1.1.13, so nothing looked;
-# the first that does (ClickHouse 24.10 -> 26.3) would otherwise find out inside
-# `compose up`, mid-switch, on a host that cannot reach Docker Hub. An air-gapped
-# package carries them in images.tar.gz (loaded above); an online one pulls them
-# here, where a failure still changes nothing. `config --images` resolves the
-# same profiles and prefixes `up` will, so it names exactly what will run.
-THIRD_IMAGES=$( cd "$HERE/compose" && docker compose -p sentinel -f compose.prod.yml \
-    --env-file "$ENV_FILE" config --images 2>>"$LOG" ) \
-  || die "could not read the images the new compose file needs — see $LOG. Nothing was changed."
-while IFS= read -r img; do
-  [[ -z "$img" || "$img" =~ /(dataplane|controlplane|dashboard|migrate): ]] && continue
-  if ! docker image inspect "$img" >/dev/null 2>&1; then
-    say "  pulling $img…"
-    docker pull "$img" >>"$LOG" 2>&1 \
-      || die "the new version needs $img, which is not in this package and could not be pulled — see $LOG. Nothing was changed."
-  fi
-done <<<"$THIRD_IMAGES"
-ok "every supporting image the new version names is present"
-
-# A ClickHouse version change is the one image move that cannot be undone: a
-# newer server rewrites metadata an older one cannot read. Say so before it
-# happens. The way back for the event store is the backup taken in step 4.
-CH_NOW=$(docker inspect -f '{{.Config.Image}}' sentinel-clickhouse-1 2>/dev/null || true)
-CH_NEW=$(grep -m1 'clickhouse-server:' <<<"$THIRD_IMAGES" || true)
-
-# ...and the new ClickHouse must actually START on this host. ClickHouse's
-# official builds raise their CPU baseline over time: 26.8 needs x86-64-v2
-# (SSE4.2, SSSE3, POPCNT) and dies at once with SIGILL (exit 132) on a VM whose
-# virtual CPU hides them. compose would then restart it for ever — the event
-# store down — and the rollback below keeps the new compose file, so it would
-# stay down. A one-line query in a throwaway container is the whole test, and it
-# runs while nothing has been changed yet.
-if [[ -n "$CH_NEW" ]]; then
-  if ! docker run --rm --entrypoint clickhouse "$CH_NEW" local -q "SELECT 1" >>"$LOG" 2>&1; then
-    die "the new ClickHouse ($CH_NEW) cannot run on this host — on a virtual machine this usually means its CPU model hides SSE4.2/SSSE3/POPCNT (ask for a host-passthrough or newer CPU model). Nothing was changed."
-  fi
-  ok "the new ClickHouse runs on this host's CPU"
-fi
-
-if [[ -n "$CH_NOW" && -n "$CH_NEW" && "$CH_NOW" != "$CH_NEW" ]]; then
-  warn "ClickHouse moves from ${CH_NOW##*:} to ${CH_NEW##*:} — ONE-WAY; the event store's way back is the backup above"
-  log "clickhouse image change: $CH_NOW -> $CH_NEW"
-fi
-
 # ── 6. switch version and start ──────────────────────────────────────────────
 step "Step 6 of 8 — applying $NEW"
 printf '%s\n' "$CURRENT" > "$STATE_DIR/previous-version"
@@ -311,6 +361,13 @@ printf '%s\n' "$CURRENT" > "$STATE_DIR/previous-version"
 # Refresh compose files and scripts from the new package — a new version may
 # need new compose settings, and shipping new images against old compose is how
 # an upgrade half-applies.
+# The files this refresh overwrites, kept with the backup: the rollback below
+# keeps the NEW compose files (so ClickHouse never moves backwards on its own),
+# and recovering from a new ClickHouse that will not start needs the old ones.
+mkdir -p "$BK_DIR/compose"
+for f in "$HERE"/compose/*; do
+  [[ -e "$INSTALL_DIR/$(basename "$f")" ]] && cp -a "$INSTALL_DIR/$(basename "$f")" "$BK_DIR/compose/" 2>>"$LOG"
+done
 cp -r "$HERE/compose/." "$INSTALL_DIR/" 2>>"$LOG" || warn "could not refresh compose files"
 rm -rf "$INSTALL_DIR/scripts.bak" 2>/dev/null || true
 [[ -d "$INSTALL_DIR/scripts" ]] && mv "$INSTALL_DIR/scripts" "$INSTALL_DIR/scripts.bak"
@@ -446,18 +503,36 @@ set_version "$CURRENT"
 ( cd "$INSTALL_DIR" && "${C[@]}" up -d >>"$LOG" 2>&1 ) \
   || printf '  %s!%s compose up during rollback reported an error — see %s\n' "$YEL" "$R" "$LOG"
 
-rb_ok=yes
+# ClickHouse is checked too. The rollback keeps the NEW compose files — and so
+# the new ClickHouse pin — so a ClickHouse that fails for a reason the
+# pre-flight could not see stays down, and this used to print "rolled back and
+# healthy" over it. (Code review finding.)
+rb_ok=yes; ch_ok=yes
 for chk in "docker exec sentinel-postgres-1 pg_isready -U sentinel -d sentinel" \
-           "curl -fsS --max-time 3 http://127.0.0.1:80/healthz"; do
+           "curl -fsS --max-time 3 http://127.0.0.1:80/healthz" \
+           "docker exec sentinel-clickhouse-1 wget -qO- http://127.0.0.1:8123/ping | grep -q Ok"; do
   ok_this=no
   for _ in $(seq 1 30); do bash -c "$chk" >/dev/null 2>&1 && { ok_this=yes; break; }; sleep 3; done
-  [[ "$ok_this" == "yes" ]] || rb_ok=no
+  if [[ "$ok_this" != "yes" ]]; then
+    rb_ok=no
+    [[ "$chk" == *clickhouse* ]] && ch_ok=no
+  fi
 done
 
 if [[ "$rb_ok" == "yes" ]]; then
   ok "rolled back to $CURRENT and healthy"
 else
   warn "rolled back to $CURRENT but health checks are STILL failing"
+fi
+if [[ "$ch_ok" != "yes" ]]; then
+  printf '\n  %s%sCLICKHOUSE (the event store) IS NOT RUNNING%s\n' "$B" "$RED" "$R"
+  printf '  The WAF itself keeps serving; events are spooled until the store is back.\n'
+  printf '  The compose files are still the new ones. To go back to the previous\n'
+  printf '  ClickHouse: see  docker logs sentinel-clickhouse-1 , then copy the previous\n'
+  printf '  compose files back from\n      %s/compose/\n' "$BK_DIR"
+  printf '  into %s and, if the new ClickHouse had started and written data,\n' "$INSTALL_DIR"
+  printf '  restore the event store from the backup:\n'
+  printf '      sudo %s/scripts/backup/restore.sh %s\n' "$INSTALL_DIR" "$DUMP_DIR"
 fi
 
 if [[ "$MIGRATED" == "yes" ]]; then
@@ -477,8 +552,10 @@ if [[ "$MIGRATED" == "yes" ]]; then
       warn "restore.sh not available — restore manually"
     fi
   fi
-else
+elif [[ "$rb_ok" == "yes" ]]; then
   printf '\n  %sNo migrations were applied, so this rollback is complete.%s\n' "$GRN" "$R"
+else
+  printf '\n  %sThis rollback is NOT complete: see the failing checks above.%s\n' "$YEL" "$R"
 fi
 
 printf '\n  Backup:  %s\n  Log:     %s\n\n' "$BK_DIR" "$LOG"
