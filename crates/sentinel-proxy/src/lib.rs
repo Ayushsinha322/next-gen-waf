@@ -5102,7 +5102,7 @@ fn response_rules_apply(headers: &http::HeaderMap) -> bool {
 }
 
 /// Whether DLP reads this response: pages and data — any `text/*`, JSON or XML
-/// type — but not scripts or stylesheets.
+/// type — but not scripts, stylesheets or streams.
 ///
 /// A JavaScript bundle or a stylesheet is the application's own code, shipped
 /// identically to every visitor; it carries no visitor's card number or
@@ -5112,18 +5112,52 @@ fn response_rules_apply(headers: &http::HeaderMap) -> bool {
 /// to look like a card number would have replaced the script with a block
 /// page. An API that returns data as JSONP (`application/javascript`) is not
 /// scanned either; that pattern predates CORS and is rare.
+///
+/// A STREAM is never buffered: Server-Sent Events and newline-delimited JSON
+/// deliver one small message at a time on a connection that stays open, and
+/// scanning buffers the body until it ends or passes the scan cap — so a live
+/// notification feed delivered nothing at all. (Code review finding.)
+///
+/// JSON and XML are recognised by their structured types, not by a substring:
+/// `contains("xml")` also matched `application/vnd.openxmlformats-…` — every
+/// Excel, Word and PowerPoint download — and buffered up to 512 KiB of a zip.
 fn dlp_applies(headers: &http::HeaderMap) -> bool {
     response_declares(headers, |media| {
-        !matches!(
-            media,
-            "text/css"
-                | "text/javascript"
-                | "text/ecmascript"
-                | "application/javascript"
-                | "application/x-javascript"
-                | "application/ecmascript"
-        ) && (media.starts_with("text/") || media.contains("json") || media.contains("xml"))
+        if SCRIPT_OR_STYLE_MEDIA_TYPES.contains(&media) || STREAMING_MEDIA_TYPES.contains(&media) {
+            return false;
+        }
+        media.starts_with("text/") || is_json_media(media) || is_xml_media(media)
     })
+}
+
+/// The application's own code: never scanned by DLP.
+const SCRIPT_OR_STYLE_MEDIA_TYPES: [&str; 6] = [
+    "text/css",
+    "text/javascript",
+    "text/ecmascript",
+    "application/javascript",
+    "application/x-javascript",
+    "application/ecmascript",
+];
+
+/// Media types delivered incrementally on a long-lived response. Buffering one
+/// to scan it holds every message back until the stream ends.
+const STREAMING_MEDIA_TYPES: [&str; 5] = [
+    "text/event-stream",
+    "application/x-ndjson",
+    "application/jsonl",
+    "application/json-seq",
+    "application/stream+json",
+];
+
+/// `application/json` and every `+json` structured type.
+fn is_json_media(media: &str) -> bool {
+    media == "application/json" || media.ends_with("+json")
+}
+
+/// `application/xml`, `text/xml` and every `+xml` structured type.
+fn is_xml_media(media: &str) -> bool {
+    media == "application/xml" || media == "text/xml" || media.ends_with("+xml")
 }
 
 /// Whether the response's Content-Type satisfies `wanted`.
@@ -8931,10 +8965,28 @@ mod event_detail_tests {
             "text/csv",
             "application/json",
             "application/problem+json",
+            "application/vnd.api+json",
             "application/xml",
             "application/soap+xml",
+            "application/xhtml+xml",
         ] {
             assert!(with(&[ct]), "{ct} carries data and must be scanned");
+        }
+        // Streams: buffering one held every message back (code review).
+        for ct in [
+            "text/event-stream",
+            "text/event-stream; charset=utf-8",
+            "application/x-ndjson",
+            "application/stream+json",
+        ] {
+            assert!(!with(&[ct]), "{ct} is a stream and must not be buffered");
+        }
+        // Office documents contain "xml" in the type name; they are zips.
+        for ct in [
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ] {
+            assert!(!with(&[ct]), "{ct} is a zip, not XML");
         }
         // The login page's bundle on the UAT console, and its kin.
         for ct in [
