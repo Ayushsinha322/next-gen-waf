@@ -480,6 +480,52 @@ gate in §6. A 413 during a supposedly safe learning period is a genuine outage 
 that user, and it will not appear in the false-positive report, because the request
 never reached the rule engine that report is built from.
 
+#### Inspection limits
+
+Three more limits bound what inspecting one request may cost the rule engine,
+which reads every argument in hundreds of rules. A request past one is never
+inspected in part and passed: **Blocking** refuses it, **Learning** records it as
+a would-block and forwards it. Set them on **Advanced → Inspection Limits**; leave
+a field blank for the default, 0 turns that limit off.
+
+| Limit | Default | Blocking answers | Raise it for |
+|---|---|---|---|
+| Max inspected arguments | 4096 | **413** (**414** when the query string alone is over) | forms or JSON documents with thousands of fields or array items |
+| Max argument text | 512 KiB | **413** | uploads the rules read as text — see below |
+| Inspection time budget | 10 s of CPU per phase | **403** | almost never; content unusually slow to inspect |
+
+Argument text counts names and values as decoded, a multipart part's header
+lines, and — whole — a body no parser takes apart. The legitimate requests that
+reach the 512 KiB default are uploads read as text:
+
+- a file sent as **base64 inside JSON or XML** (avatar, document or KYC upload
+  APIs, SOAP attachments);
+- a raw **text, CSV or binary** body: `text/plain`, `text/csv`,
+  `application/octet-stream`, `multipart/related` (SOAP MTOM), or no
+  Content-Type — the whole body is one argument;
+- **NDJSON / JSON Lines sent as `application/json`**: it is not one JSON
+  document, so it is read whole as one value.
+
+A form, JSON or XML body is also read whole, and may then be at most four times
+the limit (2 MiB by default), however few of its bytes are arguments — an XML
+comment or one JSON key repeated in every object is read too.
+
+**Before upgrading a Blocking site to this release**, check whether it takes any
+of these shapes over 512 KiB; if so, raise Max argument text first (or run the
+site in Learning for a day and read the report). Refusals show in the learning
+report as built-in rules **9900401** (arguments), **9900402** (argument text) and
+**9900403** (time). They are not rules: the report offers *Raise …* instead of
+*Disable*, and the API refuses an exclusion of them. Every refusal is also
+counted on the node's `/metrics`, as the inspection-limit counter with a reason
+of `args`, `arg_bytes` or `time`.
+
+The limits bound the cost of a request; they do not make it small. On the
+reference laptop core a request exactly at the defaults costs up to about 2.6 s
+of CPU to inspect (eight 64 KiB fields of mixed-script text; an ordinary
+1000-field, 256 KiB form costs 0.7–0.9 s), and a slower vCPU takes longer. A
+burst of such requests from one source is a request built to be expensive — rate
+limits and anti-DDoS are the controls for that, not these.
+
 ### 5.5 DNS cutover
 
 Only after the site is created, verified, and has run in learning mode:
