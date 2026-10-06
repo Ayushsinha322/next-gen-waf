@@ -1,3 +1,7 @@
+use std::cell::{Cell, OnceCell, RefCell};
+use std::collections::HashMap;
+use std::rc::Rc;
+
 use sentinel_core::context::{Phase, RequestContext, RuleMatch, Severity, WafDecision};
 use tracing::{debug, warn};
 
@@ -38,7 +42,9 @@ fn rule_phase_to_phase(rp: RulePhase) -> Phase {
 #[derive(Debug, Clone)]
 enum StackVal {
     Bool(bool),
-    Strings(Vec<String>),
+    /// Reference-counted because a memoized target is shared with
+    /// `RequestViews`: loading ARGS must not copy every argument per rule.
+    Strings(Rc<Vec<String>>),
     Int(i64),
     Float(f32),
     Absent,
@@ -351,11 +357,14 @@ struct MultipartParts {
 }
 
 /// Locate the first occurrence of `needle` within `haystack`.
+///
+/// `memmem` rather than a `windows()` scan: the multipart parser runs this over
+/// the whole body once per part, and the naive scan compares at every offset.
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || needle.len() > haystack.len() {
         return None;
     }
-    haystack.windows(needle.len()).position(|w| w == needle)
+    memchr::memmem::find(haystack, needle)
 }
 
 /// Extract the `boundary` parameter from a `multipart/form-data` Content-Type.
@@ -393,9 +402,11 @@ fn multipart_parts(ctx: &RequestContext) -> MultipartParts {
     let body: &[u8] = body;
     let delim = format!("--{boundary}");
     let delim = delim.as_bytes();
+    // Searched for once per part, so its search table is built once.
+    let delim_finder = memchr::memmem::Finder::new(delim);
 
     // Position just past the first boundary marker.
-    let mut search_from = match find_bytes(body, delim) {
+    let mut search_from = match delim_finder.find(body) {
         Some(p) => p + delim.len(),
         None => return out,
     };
@@ -411,7 +422,7 @@ fn multipart_parts(ctx: &RequestContext) -> MultipartParts {
             None => break,
         };
         // The part runs up to the next boundary delimiter.
-        let next = match find_bytes(&body[part_start..], delim) {
+        let next = match delim_finder.find(&body[part_start..]) {
             Some(p) => part_start + p,
             None => break, // no closing delimiter — treat as malformed, stop
         };
@@ -510,11 +521,13 @@ fn disposition_param(line: &str, key: &str) -> Option<String> {
 /// (the common case for login/search forms and JSON APIs) are not missed.
 /// Supports `application/x-www-form-urlencoded` and `application/json`
 /// (including `+json` suffixes such as `application/vnd.api+json`).
-fn body_args(ctx: &RequestContext) -> Vec<(String, String)> {
+///
+/// Called only through `RequestViews::body`, which builds it once per call.
+fn body_args(ctx: &RequestContext, views: &RequestViews) -> Vec<(String, String)> {
     let Some(body) = ctx.request_body.as_ref() else {
         return Vec::new();
     };
-    let ct = content_type(ctx);
+    let ct = views.content_type(ctx);
     if ct.starts_with("application/x-www-form-urlencoded") {
         let text = String::from_utf8_lossy(body);
         parse_query_params(&text)
@@ -533,8 +546,8 @@ fn body_args(ctx: &RequestContext) -> Vec<(String, String)> {
         // Non-file form fields feed ARGS exactly like a urlencoded form, so
         // injection delivered through a multipart body is inspected the same
         // way.  File parts are surfaced via the FILES* targets, not ARGS.
-        multipart_parts(ctx).fields
-    } else if is_xml_content_type(&ct) {
+        views.multipart(ctx).fields.clone()
+    } else if is_xml_content_type(ct) {
         // XML / SOAP bodies: surface element text, attribute values, and CDATA
         // into ARGS so payloads delivered inside XML reach the same operators
         // as form/JSON parameters (SOAP APIs are a common injection vector).
@@ -724,36 +737,284 @@ fn decode_xml_entities(s: &str) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Per-evaluate request views
+// ---------------------------------------------------------------------------
+
+/// A memoizable target and the transform chain applied to it.
+type TransformKey = (TargetSpec, Vec<Transform>);
+
+/// The request-derived collections rules read, each built at most ONCE per
+/// `evaluate` call and shared by every rule that reads it.
+///
+/// Every rule loading an ARGS-family target used to re-parse the query string
+/// and the body — JSON included — and every FILES rule re-split the multipart
+/// envelope, so a request was parsed once per such rule (well over a hundred in
+/// CRS) instead of once: about half of the evaluation time on a large body.
+///
+/// Filled lazily, so a view no rule reads is never built. It lives on the stack
+/// of one `evaluate` call and never longer, which is what keeps it correct:
+/// rules change TX variables, the scores and the verdict, never the request or
+/// the response, so a view built from them stays true for the rest of the call.
+/// What DOES change mid-call — TX variables, `MATCHED_VAR` — is never memoized;
+/// see `memoizable`.
+#[derive(Default)]
+struct RequestViews {
+    content_type: OnceCell<String>,
+    host: OnceCell<String>,
+    query: OnceCell<Vec<(String, String)>>,
+    body: OnceCell<Vec<(String, String)>>,
+    multipart: OnceCell<MultipartParts>,
+    cookies: OnceCell<Vec<(String, String)>>,
+    /// Extracted values of the memoizable targets, handed to the stack by
+    /// reference count so that a rule loading ARGS copies nothing.
+    targets: RefCell<HashMap<TargetSpec, Rc<Vec<String>>>>,
+    /// The same values after a transform chain, keyed by target and chain.
+    /// CRS repeats a handful of pairs across dozens of rules — 103 rules read
+    /// ARGS through `t:urlDecodeUni` alone — and transforms are pure, so each
+    /// pair is computed once.
+    transformed: RefCell<HashMap<TransformKey, Rc<Vec<String>>>>,
+    /// Bytes of transformed copies held in `transformed`; see
+    /// `transform_memo_budget`.
+    transformed_bytes: Cell<usize>,
+}
+
+impl RequestViews {
+    /// Lower-cased `Content-Type`; see `content_type`.
+    fn content_type(&self, ctx: &RequestContext) -> &str {
+        self.content_type.get_or_init(|| content_type(ctx))
+    }
+
+    /// The request's own host; see `request_host`.
+    fn host(&self, ctx: &RequestContext) -> &str {
+        self.host.get_or_init(|| request_host(ctx))
+    }
+
+    /// Decoded query-string parameters, in request order.
+    fn query(&self, ctx: &RequestContext) -> &[(String, String)] {
+        self.query.get_or_init(|| {
+            note_view_built(View::Query);
+            parse_query_params(ctx.uri.query().unwrap_or(""))
+        })
+    }
+
+    /// Body parameters, in body order; see `body_args`.
+    fn body(&self, ctx: &RequestContext) -> &[(String, String)] {
+        self.body.get_or_init(|| {
+            note_view_built(View::Body);
+            body_args(ctx, self)
+        })
+    }
+
+    /// The parsed `multipart/form-data` body; empty for any other body.
+    fn multipart(&self, ctx: &RequestContext) -> &MultipartParts {
+        self.multipart.get_or_init(|| {
+            note_view_built(View::Multipart);
+            multipart_parts(ctx)
+        })
+    }
+
+    /// `(name, value)` pairs of the `Cookie` header — the first one only, and
+    /// none when it is not visible ASCII, as every cookie target has read it.
+    fn cookies(&self, ctx: &RequestContext) -> &[(String, String)] {
+        self.cookies.get_or_init(|| {
+            note_view_built(View::Cookies);
+            ctx.request_headers
+                .get("cookie")
+                .and_then(|v| v.to_str().ok())
+                .map(parse_cookies)
+                .unwrap_or_default()
+        })
+    }
+
+    /// The values `spec` names: from the memo when the target may be memoized,
+    /// extracted afresh when it may not.
+    fn load(
+        &self,
+        spec: &TargetSpec,
+        ctx: &RequestContext,
+        last_matched: Option<&str>,
+    ) -> Rc<Vec<String>> {
+        if !memoizable(spec) {
+            return Rc::new(extract_target(spec, ctx, self, last_matched));
+        }
+        if let Some(values) = self.targets.borrow().get(spec) {
+            return Rc::clone(values);
+        }
+        let values = Rc::new(extract_target(spec, ctx, self, last_matched));
+        self.targets
+            .borrow_mut()
+            .insert(spec.clone(), Rc::clone(&values));
+        values
+    }
+
+    /// The values of a memoizable `spec` after `transforms`, computed once per
+    /// call for each (target, chain) pair while the memory budget allows.
+    fn load_transformed(
+        &self,
+        spec: &TargetSpec,
+        transforms: &[Transform],
+        ctx: &RequestContext,
+    ) -> Rc<Vec<String>> {
+        debug_assert!(memoizable(spec));
+        let key = (spec.clone(), transforms.to_vec());
+        if let Some(values) = self.transformed.borrow().get(&key) {
+            return Rc::clone(values);
+        }
+        let base = self.load(spec, ctx, None);
+        note_view_built(View::Transform);
+        let out: Vec<String> = base
+            .iter()
+            .map(|s| apply_transforms(s.clone(), transforms))
+            .collect();
+        // On benign text most chains change nothing; sharing the untransformed
+        // values then costs no memory at all.
+        let out = if out == *base {
+            base
+        } else {
+            // Each value's own header counts too: a body of a million one-byte
+            // fields is mostly headers, and judging it by its text would let
+            // the copies dwarf the budget.
+            let bytes: usize = out
+                .iter()
+                .map(|s| s.len() + std::mem::size_of::<String>())
+                .sum();
+            let out = Rc::new(out);
+            let held = self.transformed_bytes.get() + bytes;
+            if held > transform_memo_budget(ctx) {
+                // Past the budget: transform per rule, as without the memo,
+                // rather than let a hostile body multiply its own size.
+                return out;
+            }
+            self.transformed_bytes.set(held);
+            out
+        };
+        self.transformed.borrow_mut().insert(key, Rc::clone(&out));
+        out
+    }
+}
+
+/// How many bytes of transformed copies one `evaluate` call may keep: twice the
+/// bodies under inspection, with a 1 MiB floor so that small requests always
+/// get the full benefit. A body built so that every chain rewrites every value
+/// would otherwise hold one copy per distinct chain — dozens of times its own
+/// size — where the memo-less VM held one at a time. Twice, because one
+/// rewritten copy of every argument, value headers included, can outgrow the
+/// body it came from.
+fn transform_memo_budget(ctx: &RequestContext) -> usize {
+    const FLOOR: usize = 1 << 20;
+    let len = |b: &Option<bytes::Bytes>| b.as_ref().map_or(0, |b| b.len());
+    let bodies = len(&ctx.request_body).saturating_add(len(&ctx.response_body));
+    bodies.saturating_mul(2).max(FLOOR)
+}
+
+/// Whether `spec`'s values may be memoized for the rest of an `evaluate` call:
+/// true for the collections that are expensive to build and derived from the
+/// request or response alone, which no rule modifies.
+///
+/// Exhaustive on purpose, so a new target has to be classified here. Memoizing
+/// one that reads VM state would be silently wrong: a TX variable written by a
+/// `setvar` must be visible to the very next rule.
+fn memoizable(spec: &TargetSpec) -> bool {
+    match spec {
+        TargetSpec::Args
+        | TargetSpec::ArgsNames
+        | TargetSpec::ArgsGet
+        | TargetSpec::ArgsGetNames
+        | TargetSpec::ArgsCombinedSize
+        | TargetSpec::RequestBody
+        | TargetSpec::RequestHeadersAll
+        | TargetSpec::RequestHeadersNames
+        | TargetSpec::RequestCookiesAll
+        | TargetSpec::RequestCookiesNames
+        | TargetSpec::RequestCookie(_)
+        | TargetSpec::MultipartPartHeadersAll
+        | TargetSpec::MultipartPartHeader(_)
+        | TargetSpec::Files
+        | TargetSpec::FilesNames
+        | TargetSpec::FilesCombinedSize
+        | TargetSpec::ResponseHeadersAll
+        | TargetSpec::ResponseBody => true,
+        // One short value each: a lookup would cost what extraction does.
+        TargetSpec::RequestUri
+        | TargetSpec::RequestFilename
+        | TargetSpec::RequestMethod
+        | TargetSpec::RequestLine
+        | TargetSpec::RequestProtocol
+        | TargetSpec::ReqbodyProcessor
+        | TargetSpec::RequestHeader(_)
+        | TargetSpec::QueryString
+        | TargetSpec::ResponseHeader(_)
+        | TargetSpec::RemoteAddr
+        | TargetSpec::Geo => false,
+        // Counted from the inner target, which is memoized itself when it can be.
+        TargetSpec::CountOf(_) => false,
+        // VM state: written by `setvar` and by the previous chain link.
+        TargetSpec::TxVar(_) | TargetSpec::MatchedVar => false,
+    }
+}
+
+/// A request view, for counting how often each is built.
+#[derive(Clone, Copy)]
+enum View {
+    Query,
+    Body,
+    Multipart,
+    Cookies,
+    /// A transform chain run over a memoized target.
+    Transform,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Builds of each view on this thread. Lets a test prove a view is parsed
+    /// at most once per `evaluate` call; per-thread so parallel tests do not
+    /// see each other's counts.
+    static VIEW_BUILDS: Cell<[usize; 5]> = const { Cell::new([0; 5]) };
+}
+
+#[cfg(test)]
+fn note_view_built(view: View) {
+    VIEW_BUILDS.with(|builds| {
+        let mut n = builds.get();
+        n[view as usize] += 1;
+        builds.set(n);
+    });
+}
+
+#[cfg(not(test))]
+fn note_view_built(_: View) {}
+
 /// `last_matched` is what the PREVIOUS condition in the current chain matched.
 /// It is threaded in rather than read from `ctx` because it is VM state that
 /// lives for one rule: `TargetSpec::MatchedVar` is the only consumer, and
 /// resolving it anywhere else would silently yield nothing.
+///
+/// Reads the parsed collections from `views` — see `RequestViews`.
 fn extract_target(
     spec: &TargetSpec,
     ctx: &RequestContext,
+    views: &RequestViews,
     last_matched: Option<&str>,
 ) -> Vec<String> {
     match spec {
         // Outside a chain nothing has matched yet, and an empty list is the
         // honest answer: the condition simply does not match.
         TargetSpec::MatchedVar => last_matched.map(|v| vec![v.to_owned()]).unwrap_or_default(),
-        TargetSpec::Args => {
-            let mut values: Vec<String> = parse_query_params(ctx.uri.query().unwrap_or(""))
-                .into_iter()
-                .map(|(_, v)| v)
-                .collect();
-            // ARGS also includes urlencoded / JSON POST body parameters.
-            values.extend(body_args(ctx).into_iter().map(|(_, v)| v));
-            values
-        }
-        TargetSpec::ArgsNames => {
-            let mut names: Vec<String> = parse_query_params(ctx.uri.query().unwrap_or(""))
-                .into_iter()
-                .map(|(k, _)| k)
-                .collect();
-            names.extend(body_args(ctx).into_iter().map(|(k, _)| k));
-            names
-        }
+        // ARGS also includes urlencoded / JSON POST body parameters, after the
+        // query-string ones.
+        TargetSpec::Args => views
+            .query(ctx)
+            .iter()
+            .chain(views.body(ctx))
+            .map(|(_, v)| v.clone())
+            .collect(),
+        TargetSpec::ArgsNames => views
+            .query(ctx)
+            .iter()
+            .chain(views.body(ctx))
+            .map(|(k, _)| k.clone())
+            .collect(),
         TargetSpec::RequestUri => vec![ctx.uri.to_string()],
         TargetSpec::RequestFilename => vec![ctx.uri.path().to_owned()],
         TargetSpec::RequestMethod => vec![ctx.method.as_str().to_owned()],
@@ -774,10 +1035,10 @@ fn extract_target(
         // of that decision means the two cannot disagree about whether a body
         // was JSON.
         TargetSpec::ReqbodyProcessor => {
-            let ct = content_type(ctx);
+            let ct = views.content_type(ctx);
             let processor = if ct.starts_with("application/json") || ct.contains("+json") {
                 "JSON"
-            } else if is_xml_content_type(&ct) {
+            } else if is_xml_content_type(ct) {
                 "XML"
             } else if ct.starts_with("multipart/form-data") {
                 "MULTIPART"
@@ -808,11 +1069,12 @@ fn extract_target(
         // wholly-encoded payloads, which only decode once separated from the
         // boundary noise.
         TargetSpec::RequestBody => {
-            if content_type(ctx).starts_with("multipart/form-data") {
-                multipart_parts(ctx)
+            if views.content_type(ctx).starts_with("multipart/form-data") {
+                views
+                    .multipart(ctx)
                     .fields
-                    .into_iter()
-                    .map(|(_, v)| v)
+                    .iter()
+                    .map(|(_, v)| v.clone())
                     .collect()
             } else {
                 ctx.request_body
@@ -836,12 +1098,7 @@ fn extract_target(
         // Cookie NAMES. Session-fixation and cookie-injection rules match on the
         // name side, so returning values here would silently never fire them.
         TargetSpec::RequestCookiesNames => {
-            if let Some(cookie_hdr) = ctx.request_headers.get("cookie") {
-                if let Ok(s) = cookie_hdr.to_str() {
-                    return parse_cookies(s).into_iter().map(|(k, _)| k).collect();
-                }
-            }
-            vec![]
+            views.cookies(ctx).iter().map(|(k, _)| k.clone()).collect()
         }
         // Header NAMES. HeaderMap keys are already lowercased by hyper, which
         // matches CRS expectations — its header-name patterns are written
@@ -855,38 +1112,21 @@ fn extract_target(
         // written for the query side would otherwise also score body parameters,
         // which is how a query-only restriction turns into a false positive on a
         // legitimate POST.
-        TargetSpec::ArgsGet => parse_query_params(ctx.uri.query().unwrap_or(""))
-            .into_iter()
-            .map(|(_, v)| v)
-            .collect(),
-        TargetSpec::ArgsGetNames => parse_query_params(ctx.uri.query().unwrap_or(""))
-            .into_iter()
-            .map(|(k, _)| k)
-            .collect(),
+        TargetSpec::ArgsGet => views.query(ctx).iter().map(|(_, v)| v.clone()).collect(),
+        TargetSpec::ArgsGetNames => views.query(ctx).iter().map(|(k, _)| k.clone()).collect(),
         // The raw, still-encoded query string. CRS uses this for rules that must
         // see the encoding itself — double-encoding and separator abuse — so it
         // must NOT be decoded here.
         TargetSpec::QueryString => vec![ctx.uri.query().unwrap_or("").to_owned()],
         TargetSpec::RequestCookiesAll => {
-            if let Some(cookie_hdr) = ctx.request_headers.get("cookie") {
-                if let Ok(s) = cookie_hdr.to_str() {
-                    return parse_cookies(s).into_iter().map(|(_, v)| v).collect();
-                }
-            }
-            vec![]
+            views.cookies(ctx).iter().map(|(_, v)| v.clone()).collect()
         }
-        TargetSpec::RequestCookie(name) => {
-            if let Some(cookie_hdr) = ctx.request_headers.get("cookie") {
-                if let Ok(s) = cookie_hdr.to_str() {
-                    return parse_cookies(s)
-                        .into_iter()
-                        .filter(|(k, _)| k == name)
-                        .map(|(_, v)| v)
-                        .collect();
-                }
-            }
-            vec![]
-        }
+        TargetSpec::RequestCookie(name) => views
+            .cookies(ctx)
+            .iter()
+            .filter(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+            .collect(),
         TargetSpec::ResponseHeadersAll => ctx
             .response_headers
             .as_ref()
@@ -909,31 +1149,34 @@ fn extract_target(
             .as_ref()
             .map(|b| vec![String::from_utf8_lossy(b).into_owned()])
             .unwrap_or_default(),
-        TargetSpec::MultipartPartHeadersAll => multipart_parts(ctx)
+        TargetSpec::MultipartPartHeadersAll => views
+            .multipart(ctx)
             .part_headers
-            .into_iter()
-            .map(|(_, line)| line)
+            .iter()
+            .map(|(_, line)| line.clone())
             .collect(),
         // Selecting by PART name, not header name — see the importer note. Used
         // as `&MULTIPART_PART_HEADERS:_charset_`, where a non-zero count means
         // the request carried a `_charset_` form field.
-        TargetSpec::MultipartPartHeader(part) => multipart_parts(ctx)
+        TargetSpec::MultipartPartHeader(part) => views
+            .multipart(ctx)
             .part_headers
-            .into_iter()
+            .iter()
             .filter(|(n, _)| n.eq_ignore_ascii_case(part))
-            .map(|(_, line)| line)
+            .map(|(_, line)| line.clone())
             .collect(),
-        TargetSpec::Files => multipart_parts(ctx).filenames,
-        TargetSpec::FilesNames => multipart_parts(ctx).field_names,
-        TargetSpec::FilesCombinedSize => vec![multipart_parts(ctx).combined_size.to_string()],
+        TargetSpec::Files => views.multipart(ctx).filenames.clone(),
+        TargetSpec::FilesNames => views.multipart(ctx).field_names.clone(),
+        TargetSpec::FilesCombinedSize => vec![views.multipart(ctx).combined_size.to_string()],
         TargetSpec::ArgsCombinedSize => {
             // ModSecurity counts BOTH sides of every argument: the name and the
             // value. Counting values alone would under-report a request that
             // smuggles its payload into parameter names, which is exactly the
             // shape 920390 exists to bound.
-            let total: usize = parse_query_params(ctx.uri.query().unwrap_or(""))
+            let total: usize = views
+                .query(ctx)
                 .iter()
-                .chain(body_args(ctx).iter())
+                .chain(views.body(ctx))
                 .map(|(k, v)| k.len() + v.len())
                 .sum();
             vec![total.to_string()]
@@ -955,7 +1198,7 @@ fn extract_target(
                     .as_ref()
                     .map(|h| h.get_all(name.as_str()).iter().count())
                     .unwrap_or(0),
-                other => extract_target(other, ctx, last_matched).len(),
+                other => views.load(other, ctx, last_matched).len(),
             };
             vec![count.to_string()]
         }
@@ -984,21 +1227,22 @@ use sentinel_core::redact::is_sensitive_field_name;
 
 /// The values of every sensitively-named field in this request.
 ///
-/// Collected ONCE per `evaluate` call (per phase) and cached by the caller:
-/// `body_args` re-parses the body — JSON included — so calling this per fired
-/// rule would turn a 30-rule attack request into 30 body parses on the hot
-/// path. The list is normally empty, and short when it is not.
-fn collect_sensitive_values(ctx: &RequestContext) -> Vec<String> {
-    let query_pairs = ctx.uri.query().map(parse_query_params).unwrap_or_default();
-
+/// Collected ONCE per `evaluate` call (per phase) and cached by the caller, on
+/// the first fired rule that captured anything. It reads the query and body
+/// through `views`, so it adds no parse of its own; only the sensitive values
+/// are copied. The list is normally empty, and short when it is not.
+fn collect_sensitive_values(ctx: &RequestContext, views: &RequestViews) -> Vec<String> {
     // Cookies and headers were MISSING here, and that was the hole. CRS 942100
     // (SQLi via libinjection) is multi-target and includes REQUEST_COOKIES, and
     // a multi-target rule leaves `RuleMatch.target` empty — so the proxy's
     // second, target-based redaction pass could not catch it either. A session
     // JWT that tripped libinjection was therefore written verbatim to waf.log,
     // to ClickHouse under a 90-day TTL, and out to the SIEM.
-    let mut pairs: Vec<(String, String)> = query_pairs;
-    pairs.extend(body_args(ctx));
+    let args = views
+        .query(ctx)
+        .iter()
+        .chain(views.body(ctx))
+        .map(|(name, value)| (name.as_str(), value.as_str()));
 
     // Cookies are not collected here: EVERY cookie value is withheld at capture
     // (see `withheld_cookie_value`), whatever its name. Judging them by name let
@@ -1008,22 +1252,18 @@ fn collect_sensitive_values(ctx: &RequestContext) -> Vec<String> {
     // Header values, keyed by header name — Authorization, X-Api-Key and
     // friends. Cheap: a request carries a few dozen headers at most, and this
     // runs once per phase, not once per rule.
-    for (name, value) in ctx.request_headers.iter() {
+    let headers = ctx
+        .request_headers
+        .iter()
         // `Cookie` is skipped: its values are handled, one cookie at a time,
         // by `withheld_cookie_value`, which also catches a rule matching the
         // WHOLE header (the match text carries each value).
-        if name.as_str().eq_ignore_ascii_case("cookie") {
-            continue;
-        }
-        if let Ok(v) = value.to_str() {
-            pairs.push((name.as_str().to_string(), v.to_string()));
-        }
-    }
+        .filter(|(name, _)| !name.as_str().eq_ignore_ascii_case("cookie"))
+        .filter_map(|(name, value)| Some((name.as_str(), value.to_str().ok()?)));
 
-    pairs
-        .into_iter()
+    args.chain(headers)
         .filter(|(name, value)| !value.is_empty() && is_sensitive_field_name(name))
-        .map(|(_, value)| value)
+        .map(|(_, value)| value.to_owned())
         .collect()
 }
 
@@ -1136,10 +1376,14 @@ pub fn evaluate(
     let phase_idx = phase as usize;
     let program = &ruleset.phase_programs[phase_idx];
 
+    // Parsed request collections, built once and shared by every rule for the
+    // rest of this call — and dropped with it. See `RequestViews`.
+    let views = RequestViews::default();
     let mut stack: Vec<StackVal> = Vec::with_capacity(16);
     let mut ip: usize = 0; // instruction pointer
-                           // Per-rule target attribution, reset at every RuleEnd.
-    let mut last_target: Option<String> = None;
+                           // Per-rule target attribution, reset at every RuleEnd. The spec,
+                           // not its label: the label is only formatted for a rule that fires.
+    let mut last_target: Option<&TargetSpec> = None;
     let mut targets_seen = 0usize;
     // Sensitive field values for credential redaction, computed at most once per
     // phase on the first fired rule that captured anything — see
@@ -1183,8 +1427,24 @@ pub fn evaluate(
                 // target that never fired. So the label is kept only when the rule
                 // inspected exactly one target, and left empty otherwise.
                 targets_seen += 1;
-                last_target = Some(spec.label());
-                let values = extract_target(spec, ctx, last_matched.as_deref());
+                last_target = Some(spec);
+                // The compiler emits a target's transform chain right after
+                // it. For a memoizable target, take the transformed values
+                // from the memo and step over the ApplyTransforms. multiMatch
+                // keeps every intermediate step and is left to run in full.
+                if let Some(Instruction::ApplyTransforms {
+                    transforms,
+                    multi_match: false,
+                }) = program.get(ip + 1)
+                {
+                    if memoizable(spec) {
+                        let values = views.load_transformed(spec, transforms, ctx);
+                        stack.push(StackVal::Strings(values));
+                        ip += 2;
+                        continue;
+                    }
+                }
+                let values = views.load(spec, ctx, last_matched.as_deref());
                 stack.push(StackVal::Strings(values));
             }
 
@@ -1217,7 +1477,7 @@ pub fn evaluate(
                     // actually matched instead of an empty string.
                     let matched = if regex.captures_len() > 1 {
                         let mut hit = false;
-                        for s in &values {
+                        for s in values.iter() {
                             if let Some(caps) = regex.captures(s) {
                                 for (i, g) in caps.iter().enumerate().take(10) {
                                     if let Some(m) = g {
@@ -1235,7 +1495,7 @@ pub fn evaluate(
                         // named on the eventual security event; same lazy-DFA
                         // path, and it still stops at the first matching value.
                         let mut hit = false;
-                        for s in &values {
+                        for s in values.iter() {
                             if let Some(m) = regex.find(s) {
                                 record_match(&mut last_matched, Some(m.as_str()));
                                 hit = true;
@@ -1381,8 +1641,8 @@ pub fn evaluate(
                 if values.is_empty() {
                     stack.push(StackVal::Absent);
                 } else {
-                    let host = request_host(ctx);
-                    let hit = values.iter().find(|v| contains_off_domain_url(v, &host));
+                    let host = views.host(ctx);
+                    let hit = values.iter().find(|v| contains_off_domain_url(v, host));
                     let matched = hit.is_some();
                     record_match(&mut last_matched, hit);
                     debug!(matched, "DetectOffDomainUrl");
@@ -1472,13 +1732,17 @@ pub fn evaluate(
                 multi_match,
             } => {
                 let values = pop_strings(&mut stack);
-                if *multi_match && !transforms.is_empty() {
+                if transforms.is_empty() {
+                    // Nothing to apply: pass the (possibly memoized) values on
+                    // as they are rather than copying them.
+                    stack.push(StackVal::Strings(values));
+                } else if *multi_match {
                     // multiMatch: collect the original values plus the result
                     // after each cumulative transform prefix so the subsequent
                     // operator can match at any intermediate step.
                     let mut all: Vec<String> =
                         Vec::with_capacity(values.len() * (transforms.len() + 1));
-                    for v in &values {
+                    for v in values.iter() {
                         let mut s = v.clone();
                         all.push(s.clone()); // original
                         for t in transforms.iter() {
@@ -1486,13 +1750,21 @@ pub fn evaluate(
                             all.push(s.clone()); // after this transform
                         }
                     }
-                    stack.push(StackVal::Strings(all));
+                    stack.push(StackVal::Strings(Rc::new(all)));
                 } else {
-                    let transformed: Vec<String> = values
-                        .into_iter()
-                        .map(|s| apply_transforms(s, transforms))
-                        .collect();
-                    stack.push(StackVal::Strings(transformed));
+                    let transformed: Vec<String> = match Rc::try_unwrap(values) {
+                        Ok(owned) => owned
+                            .into_iter()
+                            .map(|s| apply_transforms(s, transforms))
+                            .collect(),
+                        // Still shared with the memo: transform copies and
+                        // leave the cached values intact for the next rule.
+                        Err(shared) => shared
+                            .iter()
+                            .map(|s| apply_transforms(s.clone(), transforms))
+                            .collect(),
+                    };
+                    stack.push(StackVal::Strings(Rc::new(transformed)));
                 }
             }
 
@@ -1552,7 +1824,7 @@ pub fn evaluate(
             Instruction::RuleEnd { rule_id } => {
                 let fired = pop_bool(&mut stack);
                 let matched_target = if targets_seen == 1 {
-                    last_target.take()
+                    last_target.take().map(TargetSpec::label)
                 } else {
                     None
                 };
@@ -1575,7 +1847,7 @@ pub fn evaluate(
                                 return w;
                             }
                             let sensitive = sensitive_values
-                                .get_or_insert_with(|| collect_sensitive_values(ctx));
+                                .get_or_insert_with(|| collect_sensitive_values(ctx, &views));
                             if value_is_sensitive(sensitive, &v) {
                                 "[redacted: sensitive field]".to_string()
                             } else {
@@ -2469,16 +2741,16 @@ fn replace_sql_comments(mut s: String) -> String {
 // Stack helpers
 // ---------------------------------------------------------------------------
 
-fn pop_strings(stack: &mut Vec<StackVal>) -> Vec<String> {
+fn pop_strings(stack: &mut Vec<StackVal>) -> Rc<Vec<String>> {
     match stack.pop() {
         Some(StackVal::Strings(v)) => v,
         Some(other) => {
             warn!("VM: expected Strings on stack, got {:?}", other);
-            vec![]
+            Rc::default()
         }
         None => {
             warn!("VM: stack underflow on pop_strings");
-            vec![]
+            Rc::default()
         }
     }
 }
@@ -2567,12 +2839,16 @@ impl RequestValues {
     }
 
     pub fn from_ctx(ctx: &RequestContext) -> Self {
+        // Its own views, built here once: the logger runs after `evaluate`,
+        // whose views are gone by then. Same parsers, so the values listed are
+        // the values the rules read.
+        let views = RequestViews::default();
         let mut entries = Vec::new();
-        for (k, v) in parse_query_params(ctx.uri.query().unwrap_or("")) {
+        for (k, v) in views.query(ctx) {
             entries.push((Collection::ArgsNames, format!("ARGS_NAMES:{k}"), k.clone()));
-            entries.push((Collection::ArgsGet, format!("ARGS:{k}"), v));
+            entries.push((Collection::ArgsGet, format!("ARGS:{k}"), v.clone()));
         }
-        let body = body_args(ctx);
+        let body = views.body(ctx);
         let body_parsed = !body.is_empty();
         for (k, v) in body {
             if !k.is_empty() {
@@ -2583,16 +2859,14 @@ impl RequestValues {
             } else {
                 format!("ARGS:{k}")
             };
-            entries.push((Collection::ArgsPost, label, v));
+            entries.push((Collection::ArgsPost, label, v.clone()));
         }
-        if let Some(c) = ctx
-            .request_headers
-            .get("cookie")
-            .and_then(|v| v.to_str().ok())
-        {
-            for (k, v) in parse_cookies(c) {
-                entries.push((Collection::Cookies, format!("REQUEST_COOKIES:{k}"), v));
-            }
+        for (k, v) in views.cookies(ctx) {
+            entries.push((
+                Collection::Cookies,
+                format!("REQUEST_COOKIES:{k}"),
+                v.clone(),
+            ));
         }
         for (name, value) in ctx.request_headers.iter() {
             if let Ok(v) = value.to_str() {
@@ -2810,6 +3084,263 @@ mod locate_tests {
             None,
             "outside what we can map"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-evaluate view tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod view_cache_tests {
+    use super::*;
+    use crate::crs_compat::import_secrule_conf;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn ruleset(src: &str) -> CompiledRuleSet {
+        crate::compile(import_secrule_conf(src).expect("import")).expect("compile")
+    }
+
+    fn post(uri: &str, content_type: &str, body: &str) -> RequestContext {
+        let mut c = RequestContext::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+        c.method = http::Method::POST;
+        c.uri = uri.parse().unwrap();
+        c.request_headers
+            .insert("content-type", content_type.parse().unwrap());
+        c.request_headers
+            .insert("cookie", "session=abc123; theme=dark".parse().unwrap());
+        c.request_body = Some(bytes::Bytes::from(body.to_owned()));
+        c
+    }
+
+    /// `[query, body, multipart, cookies, transform]` builds on this thread
+    /// since `reset`.
+    fn builds() -> [usize; 5] {
+        VIEW_BUILDS.with(|b| b.get())
+    }
+
+    fn reset() {
+        VIEW_BUILDS.with(|b| b.set([0; 5]));
+    }
+
+    /// Every collection the parsed views back, each read by several rules —
+    /// the shape of CRS, where well over a hundred rules load ARGS. Rule 16
+    /// fires, so the credential-redaction pass reads the views as well.
+    const RULES: &str = r#"
+SecRule ARGS "@rx never-a" "id:1,phase:2,pass,t:none"
+SecRule ARGS "@rx never-b" "id:2,phase:2,pass,t:lowercase"
+SecRule ARGS_NAMES "@rx never-c" "id:3,phase:2,pass"
+SecRule ARGS_GET "@rx never-d" "id:4,phase:2,pass"
+SecRule ARGS_GET_NAMES "@rx never-e" "id:5,phase:2,pass"
+SecRule &ARGS "@gt 1000" "id:6,phase:2,pass"
+SecRule ARGS_COMBINED_SIZE "@gt 100000000" "id:7,phase:2,pass"
+SecRule REQUEST_COOKIES "@rx never-f" "id:8,phase:2,pass"
+SecRule REQUEST_COOKIES_NAMES "@rx never-g" "id:9,phase:2,pass"
+SecRule REQUEST_COOKIES:session "@rx never-h" "id:10,phase:2,pass"
+SecRule FILES "@rx never-i" "id:11,phase:2,pass"
+SecRule FILES_NAMES "@rx never-j" "id:12,phase:2,pass"
+SecRule FILES_COMBINED_SIZE "@gt 100000000" "id:13,phase:2,pass"
+SecRule MULTIPART_PART_HEADERS "@rx never-k" "id:14,phase:2,pass"
+SecRule REQUEST_BODY "@rx never-l" "id:15,phase:2,pass"
+SecRule ARGS "@rx hello" "id:16,phase:2,pass,msg:'fires',severity:'NOTICE'"
+SecRule ARGS|ARGS_NAMES "@rx never-m" "id:17,phase:2,pass,t:none,t:urlDecodeUni"
+"#;
+
+    /// Each request view is parsed at most once per `evaluate` call, however
+    /// many rules read it. Every ARGS rule used to re-parse the query string
+    /// and the JSON body, and every FILES rule re-split the multipart envelope.
+    #[test]
+    fn each_view_is_parsed_once_per_evaluate() {
+        let rs = ruleset(RULES);
+
+        let mut json = post(
+            "/api/orders?q=hello&page=2",
+            "application/json",
+            r#"{"user":{"name":"ann","tags":["a","b"]},"note":"hi"}"#,
+        );
+        reset();
+        evaluate(&rs, &mut json, Phase::RequestBody, 0);
+        assert!(
+            json.rule_matches.iter().any(|m| m.rule_id == "16"),
+            "the probe rule must fire, or the redaction pass was not exercised"
+        );
+        let [query, body, multipart, cookies, _] = builds();
+        assert!(
+            query == 1 && body == 1 && cookies == 1 && multipart <= 1,
+            "one evaluate parsed the query string {query}x, the JSON body {body}x, \
+             the Cookie header {cookies}x and the multipart envelope {multipart}x"
+        );
+
+        let boundary = "XyZ";
+        let form = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"note\"\r\n\r\nhello\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"doc\"; filename=\"a.txt\"\r\n\
+             Content-Type: text/plain\r\n\r\nfile body\r\n--{boundary}--\r\n"
+        );
+        let mut multi = post(
+            "/upload",
+            &format!("multipart/form-data; boundary={boundary}"),
+            &form,
+        );
+        reset();
+        evaluate(&rs, &mut multi, Phase::RequestBody, 0);
+        assert!(
+            multi.rule_matches.iter().any(|m| m.rule_id == "16"),
+            "the multipart field must reach ARGS"
+        );
+        let [_, body, multipart, _, _] = builds();
+        assert!(
+            multipart == 1 && body <= 1,
+            "one evaluate parsed the multipart envelope {multipart}x and built \
+             the body arguments {body}x"
+        );
+
+        // A second call builds its own views: nothing outlives one evaluate.
+        reset();
+        evaluate(&rs, &mut multi, Phase::RequestBody, 0);
+        assert_eq!(builds()[2], 1, "the next evaluate must parse afresh");
+    }
+
+    /// A transform chain runs once per (target, chain) pair per call, not once
+    /// per rule: CRS reads ARGS through `t:urlDecodeUni` in over a hundred
+    /// rules, and every one of them used to decode every argument again.
+    #[test]
+    fn each_transform_chain_runs_once_per_target() {
+        let rs = ruleset(
+            r#"
+SecRule ARGS "@rx never-a" "id:1,phase:2,pass,t:none,t:urlDecodeUni"
+SecRule ARGS "@rx never-b" "id:2,phase:2,pass,t:none,t:urlDecodeUni"
+SecRule ARGS "@rx never-c" "id:3,phase:2,pass,t:none,t:urlDecodeUni"
+SecRule ARGS "@rx never-d" "id:4,phase:2,pass,t:none,t:lowercase"
+SecRule ARGS "@rx never-e" "id:5,phase:2,pass,t:none,t:lowercase"
+SecRule ARGS_NAMES "@rx never-f" "id:6,phase:2,pass,t:none,t:urlDecodeUni"
+SecRule ARGS_NAMES "@rx never-g" "id:7,phase:2,pass,t:none,t:urlDecodeUni"
+SecRule ARGS "@rx ^hello world$" "id:8,phase:2,pass,t:none,t:lowercase,msg:'fires'"
+"#,
+        );
+        let mut c = post("/x?q=Hello+World&b=2", "application/json", r#"{"n":"x"}"#);
+        reset();
+        evaluate(&rs, &mut c, Phase::RequestBody, 0);
+        let runs = builds()[4];
+        assert_eq!(
+            runs, 3,
+            "8 rules over 3 distinct (target, chain) pairs ran {runs} chains"
+        );
+        assert!(c.rule_matches.iter().any(|m| m.rule_id == "8"));
+    }
+
+    /// The memo hands back exactly what applying the chain directly produces —
+    /// same values, same order — whether it is the first request for a pair or
+    /// a repeat, and whatever order the pairs are asked for in.
+    #[test]
+    fn memoized_transforms_match_direct_application() {
+        let c = post(
+            "/x?a=%253Cscript%253E&B=Mixed%20Case&c=%00nul&d=caf%C3%A9&e=",
+            "application/x-www-form-urlencoded",
+            "f=%26lt%3Bimg%26gt%3B&g=a%2F..%2F..%2Fetc&h=\\x41\\u0041&i=%E2%82%AC",
+        );
+        let chains: Vec<Vec<Transform>> = vec![
+            vec![Transform::UrlDecodeUni],
+            vec![Transform::Lowercase],
+            vec![
+                Transform::Utf8ToUnicode,
+                Transform::UrlDecodeUni,
+                Transform::HtmlEntityDecode,
+                Transform::JsDecode,
+                Transform::CssDecode,
+                Transform::RemoveNulls,
+            ],
+            vec![Transform::CmdLine, Transform::NormalisePath],
+            vec![Transform::EscapeSeqDecode],
+            vec![Transform::Length],
+        ];
+        let views = RequestViews::default();
+        for spec in [TargetSpec::Args, TargetSpec::ArgsNames] {
+            let base = views.load(&spec, &c, None);
+            for chain in chains.iter().chain(chains.iter().rev()) {
+                let direct: Vec<String> = base
+                    .iter()
+                    .map(|s| apply_transforms(s.clone(), chain))
+                    .collect();
+                let memo = views.load_transformed(&spec, chain, &c);
+                assert_eq!(*memo, direct, "{spec:?} through {chain:?}");
+            }
+            // The base values themselves are never rewritten by a chain.
+            assert_eq!(*views.load(&spec, &c, None), *base);
+        }
+    }
+
+    /// A body built so that every chain rewrites every value would make the
+    /// memo hold one copy per chain. Past the budget a chain's output is still
+    /// returned, correct, but not kept.
+    #[test]
+    fn transform_memo_stays_within_its_budget() {
+        // ~1.6 MB of body whose upper-case values every lower-casing chain
+        // rewrites: one rewritten copy (~2.1 MB with value headers) fits the
+        // budget of twice the body, a second one no longer does.
+        let body: String = (0..30_000)
+            .map(|i| format!("k{i}=VALUE+NUMBER+{i:08}+XXXXXXXXXXXXXXXXXXXXXXXX"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let c = post("/x", "application/x-www-form-urlencoded", &body);
+        let budget = transform_memo_budget(&c);
+        let views = RequestViews::default();
+        let lower = [Transform::Lowercase];
+        let lower_squeezed = [Transform::Lowercase, Transform::RemoveWhitespace];
+        let first = views.load_transformed(&TargetSpec::Args, &lower, &c);
+        let second = views.load_transformed(&TargetSpec::Args, &lower_squeezed, &c);
+        assert!(first[0].starts_with("value number"));
+        assert!(second[0].starts_with("valuenumber"));
+        assert!(views.transformed_bytes.get() <= budget);
+        let memo = views.transformed.borrow();
+        assert!(memo.contains_key(&(TargetSpec::Args, lower.to_vec())));
+        assert!(
+            !memo.contains_key(&(TargetSpec::Args, lower_squeezed.to_vec())),
+            "a chain past the budget must not be kept"
+        );
+    }
+
+    /// TX variables change DURING a call — a `setvar` is read by the rules after
+    /// it — so they must never be served from the target memo. Rule 1 reads the
+    /// variable before it exists; rule 3 must see the value rule 2 wrote.
+    #[test]
+    fn tx_targets_are_read_fresh_after_a_setvar() {
+        let rs = ruleset(
+            r#"
+SecRule TX:flag "@streq on" "id:1,phase:2,pass,msg:'read before the setvar'"
+SecRule &TX:flag "@eq 1" "id:2,phase:2,pass,msg:'counted before the setvar'"
+SecRule REQUEST_METHOD "@rx ." "id:3,phase:2,pass,nolog,setvar:tx.flag=on"
+SecRule TX:flag "@streq on" "id:4,phase:2,pass,msg:'read after the setvar'"
+SecRule &TX:flag "@eq 1" "id:5,phase:2,pass,msg:'counted after the setvar'"
+"#,
+        );
+        let mut c = post("/x?a=1", "application/json", "{}");
+        evaluate(&rs, &mut c, Phase::RequestBody, 0);
+        let fired: Vec<&str> = c.rule_matches.iter().map(|m| m.rule_id.as_str()).collect();
+        assert!(
+            !fired.contains(&"1") && !fired.contains(&"2"),
+            "fired: {fired:?}"
+        );
+        assert!(
+            fired.contains(&"4") && fired.contains(&"5"),
+            "a TX read after a setvar must see it, fired: {fired:?}"
+        );
+    }
+
+    /// A memoized target hands every rule the same values, in the same order,
+    /// and a transform on one rule must not leak into the next rule's copy.
+    #[test]
+    fn transforms_do_not_alter_the_memoized_values() {
+        let rs = ruleset(
+            r#"
+SecRule ARGS "@rx ^hello$" "id:1,phase:2,pass,t:lowercase,msg:'lowercased'"
+SecRule ARGS "@rx ^HELLO$" "id:2,phase:2,pass,t:none,msg:'original case'"
+"#,
+        );
+        let mut c = post("/x?q=HELLO", "application/json", "{}");
+        evaluate(&rs, &mut c, Phase::RequestBody, 0);
+        let fired: Vec<&str> = c.rule_matches.iter().map(|m| m.rule_id.as_str()).collect();
+        assert_eq!(fired, ["1", "2"]);
     }
 }
 

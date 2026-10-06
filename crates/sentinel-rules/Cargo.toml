@@ -21,6 +21,9 @@ parking_lot = { workspace = true }
 percent-encoding = { workspace = true }
 ipnet = { workspace = true }
 libinjectionrs = "0.1"
+# Already in the tree through regex/aho-corasick; used for the multipart
+# boundary search.
+memchr = "2"
 
 [dev-dependencies]
 tempfile = { workspace = true }

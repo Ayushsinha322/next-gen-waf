@@ -10,7 +10,9 @@ use crate::dsl::ast::{InterpCmp, RuleAction, RulePhase, RuleSeverity, SetVar, Ta
 // Target specification stored in instructions
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// What a `LoadTarget` reads. `Eq + Hash` because the VM memoizes the values of
+/// request-derived targets for the rest of one `evaluate` call.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TargetSpec {
     Args,
     ArgsNames,
