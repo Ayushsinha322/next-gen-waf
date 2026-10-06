@@ -661,6 +661,18 @@ pub(crate) fn inject_sync_panic(sites: &[sentinel_core::config::SiteConfig]) {
     }
 }
 
+/// A threat-intel corpus of this version panics the threat-intel sync while
+/// it installs it, on every poll.
+#[cfg(test)]
+pub(crate) const INJECT_TI_SYNC_PANIC_VERSION: i64 = 4_242_424;
+
+#[cfg(test)]
+pub(crate) fn inject_ti_sync_panic(version: i64) {
+    if version == INJECT_TI_SYNC_PANIC_VERSION {
+        panic!("injected threat-intel sync panic");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Background loops
 // ---------------------------------------------------------------------------
@@ -1990,9 +2002,11 @@ rule 9990102 {
         crate::reset_inline_rule_diags();
     }
 
-    /// A fake control plane: serves `config` and records every heartbeat.
+    /// A fake control plane: serves `config`, and `threat_intel` while it is
+    /// set (404 otherwise), and records every heartbeat.
     async fn fake_control_plane(
         config: serde_json::Value,
+        threat_intel: Arc<Mutex<Option<serde_json::Value>>>,
     ) -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -2002,19 +2016,24 @@ rule 9990102 {
             while let Ok((stream, _)) = listener.accept().await {
                 let seen = Arc::clone(&seen);
                 let config = config.clone();
+                let threat_intel = Arc::clone(&threat_intel);
                 tokio::spawn(async move {
                     let svc = hyper::service::service_fn(
                         move |req: http::Request<hyper::body::Incoming>| {
                             let seen = Arc::clone(&seen);
                             let config = config.clone();
+                            let threat_intel = lock(&threat_intel).clone();
                             async move {
                                 let path = req.uri().path().to_string();
                                 let body = req.into_body().collect().await.unwrap().to_bytes();
-                                let (status, out) = match path.as_str() {
-                                    "/api/v1/internal/config" => {
+                                let (status, out) = match (path.as_str(), threat_intel) {
+                                    ("/api/v1/internal/config", _) => {
                                         (StatusCode::OK, config.to_string())
                                     }
-                                    "/api/v1/internal/nodes/heartbeat" => {
+                                    ("/api/v1/internal/threat-intel", Some(ti)) => {
+                                        (StatusCode::OK, ti.to_string())
+                                    }
+                                    ("/api/v1/internal/nodes/heartbeat", _) => {
                                         if let Ok(v) = serde_json::from_slice(&body) {
                                             lock(&seen).push(v);
                                         }
@@ -2048,14 +2067,17 @@ rule 9990102 {
         let _serial = proxy_state_lock();
         crate::note_config_sync_ok();
         let (origin, _hits) = counting_origin().await;
-        let (cp, beats) = fake_control_plane(serde_json::json!({
-            "version": 7,
-            "sites": [{
-                "id": INJECT_SYNC_PANIC_SITE,
-                "domains": ["sync.local"],
-                "upstream": { "servers": [{ "host": "127.0.0.1", "port": 1 }] },
-            }],
-        }))
+        let (cp, beats) = fake_control_plane(
+            serde_json::json!({
+                "version": 7,
+                "sites": [{
+                    "id": INJECT_SYNC_PANIC_SITE,
+                    "domains": ["sync.local"],
+                    "upstream": { "servers": [{ "host": "127.0.0.1", "port": 1 }] },
+                }],
+            }),
+            Arc::default(),
+        )
         .await;
         let listen = free_port();
         let mut cfg = site_config(listen, origin, "panic-site", vec![]);
@@ -2130,6 +2152,117 @@ rule 9990102 {
 
         proxy.stop().await;
         crate::note_config_sync_ok();
+    }
+
+    /// The same for threat intel, whose failure record cp-poll-timeouts added.
+    /// A sync that crashed while installing the corpus restarted with a fetch
+    /// and a parse that both went fine, and the parse cleared the record, so
+    /// the poller read "running" on `/healthz`, the Jobs page and the cluster
+    /// page while it installed nothing. Once a run installs, it clears.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises whole server runs; see proxy_state_lock
+    async fn a_crash_looping_threat_intel_sync_reads_failing() {
+        let _serial = proxy_state_lock();
+        crate::clear_ti_sync_failure();
+        let (origin, _hits) = counting_origin().await;
+        let threat_intel = Arc::new(Mutex::new(Some(
+            serde_json::json!({ "version": INJECT_TI_SYNC_PANIC_VERSION }),
+        )));
+        let (cp, beats) = fake_control_plane(
+            serde_json::json!({ "version": 1, "sites": [] }),
+            Arc::clone(&threat_intel),
+        )
+        .await;
+        let listen = free_port();
+        let mut cfg = site_config(listen, origin, "panic-site", vec![]);
+        cfg.cluster.sync_url = Some(cp);
+        cfg.cluster.sync_interval_secs = 1;
+        cfg.cluster.node_id = "panic-guard-ti-node".into();
+        let proxy = start_proxy(listen, config_handle(cfg)).await;
+
+        // The first poll panics while installing; the poller's record says so.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let first_failure = loop {
+            if let Some((err, since)) = crate::ti_sync_failure() {
+                assert!(err.contains("threat-intel sync crashed"), "{err}");
+                assert!(!err.contains("sentinel"), "console text: {err}");
+                break since;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the crash never reached the threat-intel failure record"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        // Restarted runs fetch and parse fine before they crash again; neither
+        // may report the poller healthy or restart `failing_since`.
+        let restarts = || {
+            lock(&TASKS)
+                .get("threat-intel sync")
+                .map(|t| t.restarts)
+                .unwrap_or(0)
+        };
+        let before = restarts();
+        while restarts() < before + 2 {
+            assert!(Instant::now() < deadline, "the sync loop was not restarted");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let (_, since) =
+            crate::ti_sync_failure().expect("cleared by the restarted run's fetch and parse");
+        assert_eq!(since, first_failure, "still failing since the first crash");
+        let status = crate::threat_intel_status(
+            &SentinelConfig {
+                cluster: sentinel_core::config::ClusterConfig {
+                    sync_url: Some("http://cp".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            &sentinel_modules::ThreatFeed::empty(),
+        );
+        assert_eq!(status["poller"], "failing", "/healthz: {status}");
+
+        // The heartbeat carries it to the cluster page.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let beat = lock(&beats).last().cloned();
+            if let Some(b) = beat.filter(|b| {
+                b["metadata"]["panics"]["tasks"]["threat-intel sync"]["restarts"]
+                    .as_u64()
+                    .is_some_and(|n| n >= 1)
+            }) {
+                assert_eq!(b["status"], "degraded", "{b}");
+                assert_eq!(
+                    b["metadata"]["threat_intel_sync"]["poller"], "failing",
+                    "{b}"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no heartbeat reported the crashing loop: {:?}",
+                lock(&beats).last()
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        // A corpus that installs ends it: the next restarted run clears the
+        // record once the feed is stored.
+        *lock(&threat_intel) = Some(serde_json::json!({
+            "version": 9,
+            "block": { "ips": ["203.0.113.9"] },
+        }));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while crate::ti_sync_failure().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "an installed corpus never cleared the failure"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        proxy.stop().await;
+        crate::clear_ti_sync_failure();
     }
 
     // -- poisoned locks -------------------------------------------------------

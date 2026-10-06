@@ -1983,7 +1983,16 @@ impl ProxyServer {
                 .and_then(|s| s.parse::<u32>().ok())
                 .unwrap_or(3);
             TI_POLLER_STARTED.store(true, std::sync::atomic::Ordering::Relaxed);
-            panic_guard::supervised!("threat-intel sync", {
+            // As for config sync: a crash is a failed poll, recorded where the
+            // poller's state is read (`/healthz` threat_intel.poller, the Jobs
+            // and cluster pages). Without it a sync crash-looping on the
+            // install read "running": every restarted run fetched a 200 first.
+            let on_panic = |msg: &str| {
+                note_ti_sync_failure(format!(
+                    "threat-intel sync crashed and is restarting: {msg}"
+                ))
+            };
+            panic_guard::supervised!("threat-intel sync", on_panic = on_panic, {
                 per_run!(sync_url, ti_modules, ti_ebpf);
                 type EmptyBody = http_body_util::Empty<bytes::Bytes>;
                 let client: cp_client::CpClient<EmptyBody> = cp_client::client();
@@ -2043,6 +2052,8 @@ impl ProxyServer {
                         continue;
                     };
                     if sync.version != last_version {
+                        #[cfg(test)]
+                        panic_guard::inject_ti_sync_panic(sync.version);
                         // Mirror block-tier IPs/CIDRs into the eBPF/XDP blocklist
                         // (insert-only, capped) before the tier is consumed below.
                         if seed_ti_xdp {
@@ -2113,6 +2124,11 @@ impl ProxyServer {
                             ),
                         }
                     }
+                    // Only once the poll is INSTALLED (or had nothing new): a
+                    // run restarted after crashing in the install fetches and
+                    // parses fine first, and clearing then would report the
+                    // poller healthy and restart `failing_since` on every crash.
+                    note_ti_sync_installed();
                 }
             });
         } else {
@@ -5864,15 +5880,21 @@ async fn fetch_threat_intel(
     }
 }
 
+/// A threat-intel poll installed its corpus, or found the installed version
+/// current: the poller is healthy again.
+fn note_ti_sync_installed() {
+    clear_ti_sync_failure();
+}
+
 /// Parse a 2xx threat-intel body. A body that does not parse is recorded like a
 /// poll that got no answer: it installs nothing either, and before it was
 /// recorded `/healthz` said "running" while every poll did nothing.
+///
+/// One that parses clears nothing: it has installed nothing yet, and the
+/// install can still fail (see [`note_ti_sync_installed`]).
 fn parse_threat_intel_sync(bytes: &[u8]) -> Option<ThreatIntelSyncResponse> {
     match serde_json::from_slice(bytes) {
-        Ok(sync) => {
-            clear_ti_sync_failure();
-            Some(sync)
-        }
+        Ok(sync) => Some(sync),
         Err(e) => {
             warn!(
                 "threat-intel sync parse: {e} — snippet: {}",
@@ -14865,6 +14887,14 @@ mod cp_poll_deadline_tests {
         assert_eq!(status, 200);
         assert_eq!(&bytes[..], body.as_bytes());
         assert!(parse_threat_intel_sync(&bytes).is_some());
+        // Parsed is not installed: a sync that crashes in the install must not
+        // read healthy because its fetch and parse went fine (see
+        // panic_guard's a_crash_looping_threat_intel_sync_reads_failing).
+        assert!(
+            ti_sync_failure().is_some(),
+            "a parsed body has installed nothing yet"
+        );
+        note_ti_sync_installed();
         assert!(
             ti_sync_failure().is_none(),
             "a poll that installed a corpus must clear the failure"
