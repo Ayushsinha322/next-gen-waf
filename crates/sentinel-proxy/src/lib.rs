@@ -24,6 +24,7 @@
 
 pub mod captcha;
 pub mod challenge;
+mod cp_client;
 pub(crate) mod goodbot;
 pub mod http3;
 pub(crate) mod ja4_quic;
@@ -724,6 +725,43 @@ fn note_config_sync_ok() {
     if let Ok(mut g) = CONFIG_SYNC_STATUS.lock() {
         g.last_error = None;
         g.failing_since = None;
+    }
+}
+
+/// One config-sync fetch: the response body, or None once the reason there is
+/// none has been recorded in the sync status.
+///
+/// A control plane that never answers is recorded like any other failed poll,
+/// so the heartbeat's `config_sync` shows this node going stale and the loop
+/// simply waits for its next tick.
+async fn fetch_config_sync(
+    client: &cp_client::CpClient<http_body_util::Empty<Bytes>>,
+    sync_url: &str,
+    internal_secret: Option<&str>,
+    deadline: Duration,
+) -> Option<Bytes> {
+    let url = format!("{}/api/v1/internal/config", sync_url);
+    let uri: hyper::Uri = match url.parse() {
+        Ok(u) => u,
+        Err(e) => {
+            warn!("config sync: bad url: {e}");
+            return None;
+        }
+    };
+    let mut builder = hyper::Request::builder().method("GET").uri(uri);
+    if let Some(secret) = internal_secret {
+        builder = builder.header("x-sentinel-internal", secret);
+    }
+    let req = builder
+        .body(http_body_util::Empty::new())
+        .expect("BUG: building config-sync request");
+    match cp_client::call(client, req, deadline).await {
+        Ok((_, bytes)) => Some(bytes),
+        Err(e) => {
+            warn!("config sync {e}");
+            note_config_sync_failure(e.to_string());
+            None
+        }
     }
 }
 
@@ -1457,10 +1495,12 @@ impl ProxyServer {
             let poll_pool = Arc::clone(&state.upstream_pool);
             let secs = cfg.cluster.sync_interval_secs.max(1);
             tokio::spawn(async move {
-                use http_body_util::BodyExt as _;
                 type EmptyBody = http_body_util::Empty<bytes::Bytes>;
-                let client: Client<_, EmptyBody> =
-                    Client::builder(TokioExecutor::new()).build_http();
+                let client: cp_client::CpClient<EmptyBody> = cp_client::client();
+                let deadline = cp_client::deadline(
+                    "SENTINEL_CP_CONFIG_TIMEOUT_SECS",
+                    cp_client::CONFIG_SYNC_DEADLINE,
+                );
                 let mut last_version: u64 = u64::MAX;
                 let reload_notify = Arc::clone(&sync_reload_notify);
                 // Authenticate the config-sync poll with the shared internal
@@ -1474,36 +1514,11 @@ impl ProxyServer {
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     ticker.tick().await;
-                    let url = format!("{}/api/v1/internal/config", sync_url);
-                    let uri: hyper::Uri = match url.parse() {
-                        Ok(u) => u,
-                        Err(e) => {
-                            warn!("config sync: bad url: {e}");
-                            continue;
-                        }
-                    };
-                    let mut builder = hyper::Request::builder().method("GET").uri(uri);
-                    if let Some(secret) = &internal_secret {
-                        builder = builder.header("x-sentinel-internal", secret);
-                    }
-                    let req = builder
-                        .body(http_body_util::Empty::new())
-                        .expect("BUG: building config-sync request");
-                    let resp = match client.request(req).await {
-                        Ok(r) => r,
-                        Err(e) => {
-                            warn!("config sync fetch: {e}");
-                            note_config_sync_failure(format!("fetch: {e}"));
-                            continue;
-                        }
-                    };
-                    let bytes = match resp.collect().await {
-                        Ok(b) => b.to_bytes(),
-                        Err(e) => {
-                            warn!("config sync body: {e}");
-                            note_config_sync_failure(format!("body: {e}"));
-                            continue;
-                        }
+                    let Some(bytes) =
+                        fetch_config_sync(&client, &sync_url, internal_secret.as_deref(), deadline)
+                            .await
+                    else {
+                        continue;
                     };
                     let envelope: ConfigSyncResponse = match serde_json::from_slice(&bytes) {
                         Ok(s) => s,
@@ -1591,11 +1606,17 @@ impl ProxyServer {
             let sync_cache = Arc::clone(&uploaded_plugins);
             let secs = cfg.cluster.sync_interval_secs.max(1);
             tokio::spawn(async move {
-                use http_body_util::BodyExt as _;
                 use sha2::Digest as _;
                 type EmptyBody = http_body_util::Empty<bytes::Bytes>;
-                let client: Client<_, EmptyBody> =
-                    Client::builder(TokioExecutor::new()).build_http();
+                let client: cp_client::CpClient<EmptyBody> = cp_client::client();
+                let list_deadline = cp_client::deadline(
+                    "SENTINEL_CP_PLUGIN_LIST_TIMEOUT_SECS",
+                    cp_client::PLUGIN_LIST_DEADLINE,
+                );
+                let wasm_deadline = cp_client::deadline(
+                    "SENTINEL_CP_PLUGIN_WASM_TIMEOUT_SECS",
+                    cp_client::PLUGIN_WASM_DEADLINE,
+                );
                 let internal_secret = std::env::var("SENTINEL_INTERNAL_SECRET")
                     .ok()
                     .filter(|s| !s.is_empty());
@@ -1621,18 +1642,13 @@ impl ProxyServer {
                     let Ok(req) = builder.body(http_body_util::Empty::new()) else {
                         continue;
                     };
-                    let bytes = match client.request(req).await {
-                        Ok(r) => match r.collect().await {
-                            Ok(b) => b.to_bytes(),
-                            Err(e) => {
-                                warn!("plugin sync body: {e}");
-                                continue;
-                            }
-                        },
+                    let bytes = match cp_client::call(&client, req, list_deadline).await {
+                        Ok((_, b)) => b,
                         Err(e) => {
-                            // Control plane unreachable — keep serving whatever is
-                            // already loaded rather than dropping to zero plugins.
-                            warn!("plugin sync fetch: {e}");
+                            // Control plane unreachable or silent — keep serving
+                            // whatever is already loaded rather than dropping to
+                            // zero plugins.
+                            warn!("plugin sync {e}");
                             continue;
                         }
                     };
@@ -1699,17 +1715,10 @@ impl ProxyServer {
                             failed = true;
                             break;
                         };
-                        let wasm = match client.request(req).await {
-                            Ok(r) if r.status().is_success() => match r.collect().await {
-                                Ok(body) => body.to_bytes().to_vec(),
-                                Err(e) => {
-                                    warn!(plugin = %p.name, "plugin download body: {e}");
-                                    failed = true;
-                                    break;
-                                }
-                            },
-                            Ok(r) => {
-                                warn!(plugin = %p.name, status = %r.status(),
+                        let wasm = match cp_client::call(&client, req, wasm_deadline).await {
+                            Ok((status, body)) if status.is_success() => body.to_vec(),
+                            Ok((status, _)) => {
+                                warn!(plugin = %p.name, status = %status,
                                       "plugin download rejected");
                                 failed = true;
                                 break;
@@ -1793,10 +1802,12 @@ impl ProxyServer {
                 .unwrap_or(3);
             TI_POLLER_STARTED.store(true, std::sync::atomic::Ordering::Relaxed);
             tokio::spawn(async move {
-                use http_body_util::BodyExt as _;
                 type EmptyBody = http_body_util::Empty<bytes::Bytes>;
-                let client: Client<_, EmptyBody> =
-                    Client::builder(TokioExecutor::new()).build_http();
+                let client: cp_client::CpClient<EmptyBody> = cp_client::client();
+                let deadline = cp_client::deadline(
+                    "SENTINEL_CP_THREAT_INTEL_TIMEOUT_SECS",
+                    cp_client::THREAT_INTEL_SYNC_DEADLINE,
+                );
                 let internal_secret = std::env::var("SENTINEL_INTERNAL_SECRET")
                     .ok()
                     .filter(|s| !s.is_empty());
@@ -1815,27 +1826,15 @@ impl ProxyServer {
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     ticker.tick().await;
-                    let url = format!("{}/api/v1/internal/threat-intel", sync_url);
-                    let uri: hyper::Uri = match url.parse() {
-                        Ok(u) => u,
-                        Err(e) => {
-                            warn!("threat-intel sync: bad url: {e}");
-                            continue;
-                        }
-                    };
-                    let mut builder = hyper::Request::builder().method("GET").uri(uri);
-                    if let Some(secret) = &internal_secret {
-                        builder = builder.header("x-sentinel-internal", secret);
-                    }
-                    let req = builder
-                        .body(http_body_util::Empty::new())
-                        .expect("BUG: building threat-intel sync request");
-                    let resp = match client.request(req).await {
-                        Ok(r) => r,
-                        Err(e) => {
-                            warn!("threat-intel sync fetch: {e}");
-                            continue;
-                        }
+                    let Some((status, bytes)) = fetch_threat_intel(
+                        &client,
+                        &sync_url,
+                        internal_secret.as_deref(),
+                        deadline,
+                    )
+                    .await
+                    else {
+                        continue;
                     };
                     // Inspect the STATUS before parsing the body. It never was:
                     // a 403 (secret mismatch) or 503 (control plane without a
@@ -1843,15 +1842,6 @@ impl ProxyServer {
                     // this node's IOC set stayed frozen at whatever it last held
                     // — or at empty — with the only trace being a parse warning
                     // that named a JSON error rather than the refusal.
-                    let status = resp.status().as_u16();
-                    TI_LAST_STATUS.store(status, std::sync::atomic::Ordering::Relaxed);
-                    let bytes = match resp.collect().await {
-                        Ok(b) => b.to_bytes(),
-                        Err(e) => {
-                            warn!("threat-intel sync body: {e}");
-                            continue;
-                        }
-                    };
                     if !(200..300).contains(&status) {
                         let held = ti_modules.threat_intel.load().entry_count();
                         warn!(
@@ -2037,8 +2027,11 @@ impl ProxyServer {
             let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| node_id.clone());
             tokio::spawn(async move {
                 type JsonBody = http_body_util::Full<bytes::Bytes>;
-                let client: Client<_, JsonBody> =
-                    Client::builder(TokioExecutor::new()).build_http();
+                let client: cp_client::CpClient<JsonBody> = cp_client::client();
+                let deadline = cp_client::deadline(
+                    "SENTINEL_CP_HEARTBEAT_TIMEOUT_SECS",
+                    cp_client::HEARTBEAT_DEADLINE,
+                );
                 let internal_secret = std::env::var("SENTINEL_INTERNAL_SECRET")
                     .ok()
                     .filter(|s| !s.is_empty());
@@ -2126,9 +2119,9 @@ impl ProxyServer {
                     let req = builder
                         .body(http_body_util::Full::new(bytes::Bytes::from(body)))
                         .expect("BUG: building heartbeat request");
-                    match client.request(req).await {
-                        Ok(resp) => {
-                            debug!(status = %resp.status(), "heartbeat posted");
+                    match cp_client::call(&client, req, deadline).await {
+                        Ok((status, _)) => {
+                            debug!(status = %status, "heartbeat posted");
                         }
                         Err(e) => {
                             warn!("heartbeat post: {e}");
@@ -5543,6 +5536,68 @@ static CONFIG_VERSION_APPLIED: std::sync::atomic::AtomicU64 = std::sync::atomic:
 /// frozen — which previously produced no log line at all, because the status was
 /// never inspected before the body was parsed.
 static TI_LAST_STATUS: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+/// Why the most recent sync attempt got no complete response (connect failure,
+/// a body cut short, a control plane that never answered) and since when, as
+/// `(error, unix secs)`; cleared by the next attempt that gets one.
+/// `TI_LAST_STATUS` only ever holds a status that ARRIVED, so without this a
+/// poller failing every minute kept reporting its last 200 as "running".
+static TI_SYNC_FAILURE: std::sync::Mutex<Option<(String, u64)>> = std::sync::Mutex::new(None);
+
+fn ti_sync_failure() -> Option<(String, u64)> {
+    TI_SYNC_FAILURE.lock().ok().and_then(|g| g.clone())
+}
+
+fn note_ti_sync_failure(error: String) {
+    if let Ok(mut g) = TI_SYNC_FAILURE.lock() {
+        let since = g.as_ref().map(|(_, s)| *s).unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        });
+        *g = Some((error, since));
+    }
+}
+
+/// One threat-intel fetch: the status and body, or None once the reason no
+/// response arrived has been recorded for `/healthz`.
+async fn fetch_threat_intel(
+    client: &cp_client::CpClient<http_body_util::Empty<Bytes>>,
+    sync_url: &str,
+    internal_secret: Option<&str>,
+    deadline: Duration,
+) -> Option<(u16, Bytes)> {
+    let url = format!("{}/api/v1/internal/threat-intel", sync_url);
+    let uri: hyper::Uri = match url.parse() {
+        Ok(u) => u,
+        Err(e) => {
+            warn!("threat-intel sync: bad url: {e}");
+            return None;
+        }
+    };
+    let mut builder = hyper::Request::builder().method("GET").uri(uri);
+    if let Some(secret) = internal_secret {
+        builder = builder.header("x-sentinel-internal", secret);
+    }
+    let req = builder
+        .body(http_body_util::Empty::new())
+        .expect("BUG: building threat-intel sync request");
+    match cp_client::call(client, req, deadline).await {
+        Ok((status, bytes)) => {
+            let status = status.as_u16();
+            TI_LAST_STATUS.store(status, std::sync::atomic::Ordering::Relaxed);
+            if let Ok(mut g) = TI_SYNC_FAILURE.lock() {
+                *g = None;
+            }
+            Some((status, bytes))
+        }
+        Err(e) => {
+            warn!("threat-intel sync {e}");
+            note_ti_sync_failure(e.to_string());
+            None
+        }
+    }
+}
 
 /// What the poller should do with a completed fetch, extracted so it can be
 /// tested without a control plane.
@@ -5591,21 +5646,16 @@ fn threat_intel_status(cfg: &SentinelConfig, feed: &ThreatFeed) -> serde_json::V
     let started = TI_POLLER_STARTED.load(Ordering::Relaxed);
     let last_status = TI_LAST_STATUS.load(Ordering::Relaxed);
     let entries = feed.entry_count();
-    let poller = if !configured {
-        "not_configured"
-    } else if !started {
-        "not_started"
-    } else if last_status == 0 {
-        "starting"
-    } else if (200..300).contains(&last_status) {
-        "running"
-    } else {
-        "rejected"
-    };
+    let failure = ti_sync_failure();
+    let poller = ti_poller_state(configured, started, last_status, failure.is_some());
     serde_json::json!({
         "configured": configured,
         "poller": poller,
         "last_sync_status": last_status,
+        // Set while polls are getting no response at all; `failing_since` is
+        // how long the IOC set below has been going stale.
+        "last_error": failure.as_ref().map(|(e, _)| e.clone()),
+        "failing_since": failure.as_ref().map(|(_, s)| *s),
         "version": feed.version(),
         "entries": entries,
         // The single honest summary: are IOCs being enforced on this node?
@@ -5618,10 +5668,35 @@ fn threat_intel_status(cfg: &SentinelConfig, feed: &ThreatFeed) -> serde_json::V
             serde_json::json!(format!(
                 "control plane refused the sync with HTTP {last_status} (403 = SENTINEL_INTERNAL_SECRET mismatch)"
             ))
+        } else if let Some((e, _)) = failure.as_ref().filter(|_| poller == "failing") {
+            serde_json::json!(format!("the control plane did not answer the sync ({e})"))
         } else {
             serde_json::json!("the control-plane corpus returned no active indicators")
         },
     })
+}
+
+/// The `/healthz` poller label. `failing` outranks the last status: that status
+/// is from the last poll that got an answer, which may be hours old.
+fn ti_poller_state(
+    configured: bool,
+    started: bool,
+    last_status: u16,
+    failing: bool,
+) -> &'static str {
+    if !configured {
+        "not_configured"
+    } else if !started {
+        "not_started"
+    } else if failing {
+        "failing"
+    } else if last_status == 0 {
+        "starting"
+    } else if (200..300).contains(&last_status) {
+        "running"
+    } else {
+        "rejected"
+    }
 }
 
 /// Whether `site` is one that SHOULD have a compiled engine.
@@ -13972,6 +14047,116 @@ mod threat_intel_visibility_tests {
             s["poller"], "not_started",
             "configured-but-not-running must be distinguishable from not-configured"
         );
+    }
+}
+
+#[cfg(test)]
+mod cp_poll_deadline_tests {
+    use super::*;
+    use crate::cp_client::{self, stub};
+
+    type Empty = http_body_util::Empty<Bytes>;
+
+    const DEADLINE: Duration = Duration::from_millis(300);
+    /// Without a deadline a tick never returns; this turns that into a failure
+    /// instead of a test that never finishes.
+    const HUNG: Duration = Duration::from_secs(5);
+
+    /// The sync statuses are process-wide, so these tests take turns.
+    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Two ticks of the config-sync loop against a control plane that accepts
+    /// the connection and never answers, then one after it recovers. Each tick
+    /// must return at the deadline with the failure recorded for the heartbeat,
+    /// or the loop is parked and the node silently stops taking config.
+    #[tokio::test]
+    async fn config_sync_against_a_silent_control_plane_records_it_and_moves_on() {
+        let _serial = SERIAL.lock().await;
+        note_config_sync_ok();
+        let body = r#"{"version":7,"sites":[]}"#;
+        let addr = stub::answering_after(2, 200, body).await;
+        let url = format!("http://{addr}");
+        let client = cp_client::client::<Empty>();
+
+        let mut first_failure = None;
+        for tick in 0..2 {
+            let started = Instant::now();
+            let got = tokio::time::timeout(HUNG, fetch_config_sync(&client, &url, None, DEADLINE))
+                .await
+                .unwrap_or_else(|_| panic!("config-sync tick {tick} never returned"));
+            assert!(
+                got.is_none(),
+                "tick {tick} got a body from a silent control plane"
+            );
+            let took = started.elapsed();
+            assert!(took < DEADLINE * 4, "tick {tick} took {took:?}");
+
+            let status = config_sync_status();
+            let err = status
+                .last_error
+                .expect("a timed-out poll must be recorded");
+            assert!(err.starts_with("timeout:"), "tick {tick}: {err}");
+            assert!(status.failing_since.is_some());
+            // Stale since the FIRST failure, not the latest one.
+            first_failure = first_failure.or(status.failing_since);
+            assert_eq!(status.failing_since, first_failure);
+        }
+
+        let got = tokio::time::timeout(HUNG, fetch_config_sync(&client, &url, None, DEADLINE))
+            .await
+            .expect("the tick after recovery never returned")
+            .expect("the recovered control plane's answer");
+        assert_eq!(&got[..], body.as_bytes());
+        note_config_sync_ok();
+    }
+
+    /// The same for threat intel, whose `/healthz` state only ever recorded a
+    /// status that arrived: a poller timing out kept saying "running".
+    #[tokio::test]
+    async fn threat_intel_sync_against_a_silent_control_plane_reports_failing() {
+        let _serial = SERIAL.lock().await;
+        let body = r#"{"version":3}"#;
+        let addr = stub::answering_after(1, 200, body).await;
+        let url = format!("http://{addr}");
+        let client = cp_client::client::<Empty>();
+
+        let got = tokio::time::timeout(HUNG, fetch_threat_intel(&client, &url, None, DEADLINE))
+            .await
+            .expect("threat-intel tick never returned");
+        assert!(got.is_none());
+        let (err, _) = ti_sync_failure().expect("a timed-out poll must be recorded");
+        assert!(err.starts_with("timeout:"), "{err}");
+        let s = threat_intel_status(&SentinelConfig::default(), &ThreatFeed::empty());
+        assert!(
+            s["last_error"]
+                .as_str()
+                .is_some_and(|e| e.starts_with("timeout:")),
+            "/healthz must carry the failure, got {s}"
+        );
+
+        let (status, bytes) =
+            tokio::time::timeout(HUNG, fetch_threat_intel(&client, &url, None, DEADLINE))
+                .await
+                .expect("the tick after recovery never returned")
+                .expect("the recovered control plane's answer");
+        assert_eq!(status, 200);
+        assert_eq!(&bytes[..], body.as_bytes());
+        assert!(
+            ti_sync_failure().is_none(),
+            "a poll that got an answer must clear the failure"
+        );
+    }
+
+    /// `failing` outranks the last status that arrived, which may be hours old.
+    #[test]
+    fn a_failing_threat_intel_poller_is_not_reported_as_running() {
+        assert_eq!(ti_poller_state(true, true, 200, true), "failing");
+        assert_eq!(ti_poller_state(true, true, 403, true), "failing");
+        assert_eq!(ti_poller_state(true, true, 200, false), "running");
+        assert_eq!(ti_poller_state(true, true, 403, false), "rejected");
+        assert_eq!(ti_poller_state(true, true, 0, false), "starting");
+        assert_eq!(ti_poller_state(true, false, 0, true), "not_started");
+        assert_eq!(ti_poller_state(false, false, 0, true), "not_configured");
     }
 }
 
