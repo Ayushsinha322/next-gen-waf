@@ -189,6 +189,9 @@ async fn handle_quic_connection(
         debug!(%peer, outcome = ja4_outcome.as_str(), "no h3 JA4 fingerprint");
     }
     debug!(%peer, ja4 = tls_fp.as_deref().unwrap_or("-"), "HTTP/3 connection established");
+    // A handle on the QUIC connection itself, kept beside the h3 one: response
+    // relays watch it to learn that the client has gone (see `relay_h3_body`).
+    let quic = conn.clone();
 
     let mut h3_conn: h3::server::Connection<H3Conn, Bytes> = h3::server::builder()
         .build(h3_quinn::Connection::new(conn))
@@ -205,8 +208,9 @@ async fn handle_quic_connection(
                 // request multiplexed over it, exactly as on a keep-alive TCP
                 // connection.
                 let fp = tls_fp.clone();
+                let quic = quic.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_h3_request(resolver, state, ds, peer, fp).await {
+                    if let Err(e) = handle_h3_request(resolver, state, ds, peer, fp, quic).await {
                         debug!("HTTP/3 request error: {e}");
                     }
                 });
@@ -236,6 +240,7 @@ async fn handle_h3_request(
     default_site: Option<String>,
     peer: SocketAddr,
     tls_fp: Option<String>,
+    quic: quinn::Connection,
 ) -> Result<()> {
     let (req, mut stream) = resolver
         .resolve_request()
@@ -277,12 +282,16 @@ async fn handle_h3_request(
     // time (see `ja4_quic`) and reaches `ctx.tls_fingerprint` exactly as the TCP
     // path's peeked fingerprint does.
     let resp = run_pipeline(state, peer, pipeline_req, default_site, tls_fp).await;
-    send_h3_response(&mut stream, resp).await
+    send_h3_response(&mut stream, &quic, resp).await
 }
 
 /// Relay a pipeline response over an HTTP/3 request stream: the head, then the
 /// body as it arrives (see [`relay_h3_body`]).
-async fn send_h3_response<B>(stream: &mut H3Stream, resp: Response<B>) -> Result<()>
+async fn send_h3_response<B>(
+    stream: &mut H3Stream,
+    quic: &quinn::Connection,
+    resp: Response<B>,
+) -> Result<()>
 where
     B: Body<Data = Bytes> + Unpin,
     B::Error: std::fmt::Display,
@@ -293,7 +302,7 @@ where
         .send_response(Response::from_parts(parts, ()))
         .await
         .context("sending HTTP/3 response headers")?;
-    relay_h3_body(stream, body).await
+    relay_h3_body(stream, quic, body).await
 }
 
 /// Stream a response body onto an HTTP/3 request stream, frame by frame.
@@ -324,16 +333,37 @@ where
 /// - the client cancelled (STOP_SENDING) or its connection is gone: stop and
 ///   drop the origin body, which releases its upstream connection. That is
 ///   `Ok`, because an abandoned download is not a WAF failure. h3 exposes no
-///   STOP_SENDING notification, so it is noticed on the next write;
+///   STOP_SENDING notification, so a cancel is noticed on the next write. A
+///   closed connection is noticed at once, even while the origin is quiet
+///   (long-poll, an idle event stream, a stalled origin): by then the
+///   connection and request permits are both released, so a relay that waited
+///   for the origin's next frame would hold the task and the upstream
+///   connection with nothing bounding it;
 /// - the origin failed mid-body: RESET the stream. A FIN would present a
 ///   truncated body as a complete one, and returning without finishing is not
 ///   enough, because quinn FINISHES a send stream that is dropped unfinished.
-async fn relay_h3_body<B>(stream: &mut H3Stream, mut body: B) -> Result<()>
+async fn relay_h3_body<B>(
+    stream: &mut H3Stream,
+    quic: &quinn::Connection,
+    mut body: B,
+) -> Result<()>
 where
     B: Body<Data = Bytes> + Unpin,
     B::Error: std::fmt::Display,
 {
-    while let Some(frame) = body.frame().await {
+    let closed = quic.closed();
+    tokio::pin!(closed);
+    loop {
+        // `frame()` is cancel-safe: losing the race to `closed` loses no data.
+        let frame = tokio::select! {
+            biased;
+            e = &mut closed => {
+                debug!("HTTP/3 connection closed mid-response; relay stopped: {e}");
+                return Ok(());
+            }
+            frame = body.frame() => frame,
+        };
+        let Some(frame) = frame else { break };
         let frame = match frame {
             Ok(frame) => frame,
             Err(e) => {
@@ -619,17 +649,17 @@ mod tests {
         }
     }
 
-    /// Bind a QUIC endpoint that answers ONE request with `resp`, sent through
-    /// the production `send_h3_response`. The receiver yields the relay's own
-    /// result, so a test can assert how the relay ended as well as what the
-    /// client saw. The connection is driven as `handle_quic_connection` drives
-    /// it, until the client leaves: quinn's `finish` does not wait for delivery,
-    /// so closing the connection when the relay returns would cut off data still
-    /// in flight.
-    fn serve_one<B>(resp: Response<B>) -> (SocketAddr, oneshot::Receiver<Result<()>>)
+    /// Bind a QUIC endpoint that hands ONE request stream, and the QUIC
+    /// connection it arrived on, to `handler`. The receiver yields the
+    /// handler's result, so a test can assert how the server side ended as well
+    /// as what the client saw. The connection is driven as
+    /// `handle_quic_connection` drives it, until the client leaves: quinn's
+    /// `finish` does not wait for delivery, so closing the connection when the
+    /// handler returns would cut off data still in flight.
+    fn serve_one_with<F, Fut>(handler: F) -> (SocketAddr, oneshot::Receiver<Result<()>>)
     where
-        B: Body<Data = Bytes> + Unpin + Send + 'static,
-        B::Error: std::fmt::Display + Send,
+        F: FnOnce(H3Stream, quinn::Connection) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
     {
         let endpoint =
             quinn::Endpoint::server(test_server_config(), "127.0.0.1:0".parse().unwrap()).unwrap();
@@ -638,24 +668,39 @@ mod tests {
         tokio::spawn(async move {
             let incoming = endpoint.accept().await.expect("a client connects");
             let conn = incoming.accept().unwrap().await.unwrap();
+            let quic = conn.clone();
             let mut h3_conn: h3::server::Connection<H3Conn, Bytes> = h3::server::builder()
                 .build(h3_quinn::Connection::new(conn))
                 .await
                 .unwrap();
             let resolver = h3_conn.accept().await.unwrap().expect("one request");
             tokio::spawn(async move {
-                let (_req, mut stream) = resolver.resolve_request().await.unwrap();
-                let _ = done_tx.send(send_h3_response(&mut stream, resp).await);
+                let (_req, stream) = resolver.resolve_request().await.unwrap();
+                let _ = done_tx.send(handler(stream, quic).await);
             });
             while let Ok(Some(_)) = h3_conn.accept().await {}
         });
         (addr, done_rx)
     }
 
-    /// A test client with one GET in flight on `stream`. The other fields keep
-    /// the connection alive for as long as the test reads.
+    /// [`serve_one_with`] answering with `resp` through the production
+    /// `send_h3_response`; the receiver yields the relay's own result.
+    fn serve_one<B>(resp: Response<B>) -> (SocketAddr, oneshot::Receiver<Result<()>>)
+    where
+        B: Body<Data = Bytes> + Unpin + Send + 'static,
+        B::Error: std::fmt::Display + Send,
+    {
+        serve_one_with(move |mut stream, quic| async move {
+            send_h3_response(&mut stream, &quic, resp).await
+        })
+    }
+
+    /// A test client with one request in flight on `stream`. The other fields
+    /// keep the connection alive for as long as the test reads; `conn` lets a
+    /// test close it.
     struct Client {
         stream: ClientStream,
+        conn: quinn::Connection,
         _send_request: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
         _endpoint: quinn::Endpoint,
         driver: tokio::task::JoinHandle<()>,
@@ -667,29 +712,37 @@ mod tests {
         }
     }
 
-    async fn get(addr: SocketAddr, cfg: quinn::ClientConfig) -> Client {
+    /// Connect and send `req`'s head. The request body stays open.
+    async fn open(addr: SocketAddr, cfg: quinn::ClientConfig, req: http::Request<()>) -> Client {
         let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         endpoint.set_default_client_config(cfg);
         let conn = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
-        let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(conn))
-            .await
-            .unwrap();
+        let (mut driver, mut send_request) =
+            h3::client::new(h3_quinn::Connection::new(conn.clone()))
+                .await
+                .unwrap();
         let driver = tokio::spawn(async move {
             let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
         });
+        let stream = send_request.send_request(req).await.unwrap();
+        Client {
+            stream,
+            conn,
+            _send_request: send_request,
+            _endpoint: endpoint,
+            driver,
+        }
+    }
+
+    async fn get(addr: SocketAddr, cfg: quinn::ClientConfig) -> Client {
         let req = http::Request::builder()
             .method("GET")
             .uri("https://localhost/")
             .body(())
             .unwrap();
-        let mut stream = send_request.send_request(req).await.unwrap();
-        stream.finish().await.unwrap();
-        Client {
-            stream,
-            _send_request: send_request,
-            _endpoint: endpoint,
-            driver,
-        }
+        let mut client = open(addr, cfg, req).await;
+        client.stream.finish().await.unwrap();
+        client
     }
 
     /// Read the rest of the body into `out`. A reset stream is returned as the
@@ -885,6 +938,41 @@ mod tests {
         assert!(
             origin_task.await.unwrap(),
             "the relay must drop the origin body when the client cancels"
+        );
+    }
+
+    /// A client whose connection closes while the origin is quiet (long-poll,
+    /// an idle event stream, a stalled origin) releases the origin at once. The
+    /// relay used to notice the client only on its next write, so it held its
+    /// task and the upstream connection for as long as the origin stayed quiet,
+    /// with the connection and request permits already released.
+    #[tokio::test]
+    async fn h3_connection_closing_while_the_origin_is_quiet_releases_the_origin() {
+        let (origin_tx, body) = origin();
+        let (addr, relay_done) = serve_one(Response::new(body));
+        let mut client = get(addr, test_client_config()).await;
+        client.stream.recv_response().await.unwrap();
+        // One event proves the relay is past the head and waiting on the origin.
+        origin_tx.send(data(b"data: hello\n\n")).await.unwrap();
+        client
+            .stream
+            .recv_data()
+            .await
+            .unwrap()
+            .expect("the first event arrives");
+
+        // The origin goes quiet, and the client leaves.
+        client.conn.close(0u32.into(), b"leaving");
+        timeout(Duration::from_secs(5), origin_tx.closed())
+            .await
+            .expect("the relay kept the origin body after the client's connection closed");
+        let relay = timeout(Duration::from_secs(5), relay_done)
+            .await
+            .expect("the relay outlived its client's connection")
+            .unwrap();
+        assert!(
+            relay.is_ok(),
+            "a departed client is a normal end, not a relay error: {relay:?}"
         );
     }
 
