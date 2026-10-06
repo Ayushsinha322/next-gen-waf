@@ -21,6 +21,7 @@ parking_lot = { workspace = true }
 percent-encoding = { workspace = true }
 ipnet = { workspace = true }
 libinjectionrs = "0.1"
+memchr = "2"
 
 [dev-dependencies]
 tempfile = { workspace = true }

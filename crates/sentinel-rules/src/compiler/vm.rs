@@ -344,12 +344,17 @@ struct MultipartParts {
     part_headers: Vec<(String, String)>,
 }
 
-/// Locate the first occurrence of `needle` within `haystack`.
+/// Locate the first occurrence of `needle` within `haystack`, in time linear
+/// in both.
+///
+/// Comparing `needle` at every offset cost their PRODUCT, and the needle can
+/// be the boundary, which comes from the Content-Type header with no length
+/// limit: a 64 KB boundary against 1 MB of `-` took 2.1 s per search.
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() {
+    if needle.is_empty() {
         return None;
     }
-    haystack.windows(needle.len()).position(|w| w == needle)
+    memchr::memmem::find(haystack, needle)
 }
 
 /// Extract the `boundary` parameter from a `multipart/form-data` Content-Type.
@@ -387,9 +392,12 @@ fn multipart_parts(ctx: &RequestContext) -> MultipartParts {
     let body: &[u8] = body;
     let delim = format!("--{boundary}");
     let delim = delim.as_bytes();
+    // Built once: the delimiter is searched for once per part, and it can be
+    // as long as the Content-Type header allows.
+    let delim_finder = memchr::memmem::Finder::new(delim);
 
     // Position just past the first boundary marker.
-    let mut search_from = match find_bytes(body, delim) {
+    let mut search_from = match delim_finder.find(body) {
         Some(p) => p + delim.len(),
         None => return out,
     };
@@ -405,7 +413,7 @@ fn multipart_parts(ctx: &RequestContext) -> MultipartParts {
             None => break,
         };
         // The part runs up to the next boundary delimiter.
-        let next = match find_bytes(&body[part_start..], delim) {
+        let next = match delim_finder.find(&body[part_start..]) {
             Some(p) => part_start + p,
             None => break, // no closing delimiter — treat as malformed, stop
         };
@@ -3456,5 +3464,39 @@ mod transform_tests {
                 "XML entity decoding took over {BOUND:?} on ~1 MB"
             );
         }
+    }
+
+    /// A request whose body is `body`, sent as `content_type`.
+    fn body_ctx(content_type: &str, body: Vec<u8>) -> RequestContext {
+        let mut ctx = RequestContext::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 1);
+        ctx.uri = "/submit".parse().unwrap();
+        ctx.request_headers
+            .insert("content-type", content_type.parse().unwrap());
+        ctx.request_body = Some(body.into());
+        ctx
+    }
+
+    /// The boundary comes from Content-Type, with no length limit, and was
+    /// searched for by comparing it at every offset: time in proportion to
+    /// boundary length times body length.
+    #[test]
+    fn a_long_multipart_boundary_is_found_in_linear_time() {
+        let boundary = format!("{}b", "-".repeat(256 * 1024));
+        let ct = format!("multipart/form-data; boundary={boundary}");
+        let ctx = body_ctx(&ct, vec![b'-'; MB]);
+        assert!(
+            finishes_in_time(move || drop(multipart_parts(&ctx))),
+            "a {} KB boundary over 1 MB took over {BOUND:?}",
+            boundary.len() / 1024
+        );
+
+        // And it still delimits parts.
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"q\"\r\n\r\n1 OR 1=1\r\n--{boundary}--\r\n"
+        );
+        let ctx = body_ctx(&ct, body.into_bytes());
+        let fields = multipart_parts(&ctx).fields;
+        assert_eq!(fields.len(), 1);
+        assert_eq!((&*fields[0].0, fields[0].1.as_str()), ("q", "1 OR 1=1"));
     }
 }
