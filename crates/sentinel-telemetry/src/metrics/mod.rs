@@ -536,10 +536,11 @@ struct WafMetrics {
     /// h3 connections that completed a handshake and yielded no fingerprint —
     /// including the case where the decorator is not installed at all.
     pub ja4_h3_absent_total: Counter,
-    /// HTTP/3 responses whose stream the WAF reset after the head was sent:
-    /// the origin failed mid-body, or the relay itself could not send. The
-    /// access log recorded each of these as complete when the head was
-    /// produced, so this is the only count of the truncations.
+    /// HTTP/3 responses whose stream the WAF reset after the pipeline had
+    /// produced the response: the origin failed mid-body, the relay could not
+    /// send, or the relay panicked (before or after the head went out). The
+    /// access log recorded each of these as complete when the pipeline
+    /// produced the response, so this is the only count of the truncations.
     pub h3_response_resets_total: Counter,
     /// Requests granted the good-bot allowlist — i.e. a crawler claim that was
     /// VERIFIED by reverse DNS (PTR in the operator's published domain,
@@ -555,9 +556,13 @@ struct WafMetrics {
     /// request or background loop it happened in, which is exactly why it needs
     /// a number — a contained panic is otherwise invisible from outside.
     pub panics_total: Counter,
-    /// Requests answered 500 because their processing panicked. Some had
-    /// already reached the origin (a panic in the response phase); each one's
-    /// log line says which.
+    /// Requests whose processing panicked. Almost all are answered 500; some
+    /// had already reached the origin (a panic in the response phase), and each
+    /// one's log line says which. A WebSocket message is refused by closing
+    /// its socket (1011) instead, and an HTTP/3 request whose response was
+    /// already under way has its stream reset (counted in
+    /// `h3_response_resets_total` too); one whose head could not be decoded
+    /// has no stream to answer on.
     pub request_panics_total: Counter,
     /// Background loops (control-plane sync, ClickHouse writer, listeners, ...)
     /// restarted after a panic. Climbing steadily means one is crash-looping.
@@ -676,7 +681,7 @@ impl WafMetrics {
         );
         let h3_response_resets_total = registry.register_counter(
             "sentinel_h3_response_resets_total",
-            "HTTP/3 responses reset after the head was sent (origin failed mid-body, or the relay could not send); the access log records them as complete",
+            "HTTP/3 responses reset after the pipeline produced them (origin failed mid-body, the relay could not send, or the relay panicked); the access log records them as complete",
         );
         let bot_good_bot_allowed_total = registry.register_counter(
             "sentinel_bot_good_bot_allowlisted_total",
@@ -688,7 +693,7 @@ impl WafMetrics {
         );
         let request_panics_total = registry.register_counter(
             "sentinel_request_panics_total",
-            "Requests whose processing panicked and were answered 500 (each log line says whether it had reached the origin)",
+            "Requests whose processing panicked: answered 500 (each log line says whether it had reached the origin), or for a WebSocket message its socket closed 1011, or for an HTTP/3 response already under way its stream reset",
         );
         let task_restarts_total = registry.register_counter(
             "sentinel_task_restarts_total",
@@ -979,7 +984,8 @@ pub fn panics_total() -> u64 {
     WAF_METRICS.panics_total.get()
 }
 
-/// A request's processing panicked and it was answered 500 instead.
+/// A request's processing panicked, and it was answered 500 instead (or
+/// refused another way; see `request_panics_total`).
 pub fn note_request_panic() {
     WAF_METRICS.request_panics_total.inc();
 }

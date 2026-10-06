@@ -473,12 +473,14 @@ async fn handle_quic_connection(
 /// is read from the QUIC stream and buffered into a `BoxBody` so the pipeline
 /// sees the same request shape it does over TCP.
 ///
-/// Everything after the request head runs under a panic guard, as `proxy` and
+/// The whole request task runs under panic guards, as `proxy` and
 /// `contain_request` guard a TCP request. The pipeline keeps its own guard,
 /// which answers 500 with the request's Support ID; these cover the rest of
 /// the request's task. A panic before the response head is answered 500 with
 /// a fresh Support ID, as on TCP; one while the response goes out resets the
-/// stream (see [`respond_h3`]).
+/// stream (see [`respond_h3`]). One while the head is decoded (QPACK, in `h3`)
+/// is counted and logged like the others, rate-limited; there is no stream yet
+/// to answer on, so the client sees it ended.
 async fn handle_h3_request(
     resolver: h3::server::RequestResolver<H3Conn, Bytes>,
     state: Arc<ServerState>,
@@ -487,10 +489,25 @@ async fn handle_h3_request(
     tls_fp: Option<String>,
     quic: quinn::Connection,
 ) -> Result<()> {
-    let (req, mut stream) = resolver
-        .resolve_request()
-        .await
-        .context("resolving HTTP/3 request headers")?;
+    let resolved = crate::panic_guard::catch_request(async {
+        #[cfg(test)]
+        if INJECT_RESOLVE_PANIC.swap(false, Ordering::SeqCst) {
+            panic!("injected HTTP/3 request-head panic");
+        }
+        resolver.resolve_request().await
+    })
+    .await;
+    let (req, mut stream) = match resolved {
+        Ok(resolved) => resolved.context("resolving HTTP/3 request headers")?,
+        Err(payload) => {
+            crate::panic_guard::outside_pipeline_panicked(
+                peer,
+                &*payload,
+                "its stream ended before the request head was read",
+            );
+            return Ok(());
+        }
+    };
     let (mut parts, ()) = req.into_parts();
     // h3 delivers the request head without an http::Version tag; stamp it so the
     // WAF pipeline, NDJSON logs, and ClickHouse all record this request as h3.
@@ -534,6 +551,11 @@ async fn handle_h3_request(
 /// pipeline, in test builds only.
 #[cfg(test)]
 pub(crate) const INJECT_PREPARE_PANIC_PATH: &str = "/__h3_panic_before_pipeline__";
+
+/// The next HTTP/3 request panics while its head is read, in test builds only.
+/// Only proxy tests reach `handle_h3_request`, and they run one at a time.
+#[cfg(test)]
+pub(crate) static INJECT_RESOLVE_PANIC: AtomicBool = AtomicBool::new(false);
 
 /// What a request came to before its response head.
 enum H3Prepared {
@@ -2075,7 +2097,30 @@ mod tests {
             1,
             "a panicking request reached the origin"
         );
+        conn.driver.abort();
+        drop(conn);
 
+        // A panic while the head is read has no stream to answer on, but is
+        // counted like the others (and logged, rate-limited); the node serves
+        // on.
+        let before = sentinel_telemetry::request_panics_total();
+        INJECT_RESOLVE_PANIC.store(true, Ordering::SeqCst);
+        let mut conn =
+            H3Client::connect_within(&h3.client, h3.listen, Duration::from_secs(20)).await;
+        let req = http::Request::get("https://panic-site.local/head")
+            .body(())
+            .unwrap();
+        if let Ok(mut stream) = conn.send.send_request(req).await {
+            let _ = stream.finish().await;
+            let _ = timeout(Duration::from_secs(5), stream.recv_response()).await;
+        }
+        assert!(!INJECT_RESOLVE_PANIC.load(Ordering::SeqCst), "it fired");
+        assert!(sentinel_telemetry::request_panics_total() > before);
+        conn.driver.abort();
+        drop(conn);
+        let mut conn =
+            H3Client::connect_within(&h3.client, h3.listen, Duration::from_secs(20)).await;
+        assert_eq!(conn.get("/after-the-head").await, StatusCode::OK);
         conn.driver.abort();
         drop(conn);
         h3.stop().await;

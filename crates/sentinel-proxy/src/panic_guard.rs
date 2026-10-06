@@ -104,9 +104,13 @@ impl Drop for InRequest {
 /// (see [`panic_message`]) and, when `RUST_BACKTRACE` is set, the backtrace —
 /// the default hook printed that, and once a panic no longer ends the process
 /// the stack is the main clue left. Inside a request the guard logs it instead
-/// (see [`pipeline_panicked`]). The default hook is replaced rather than chained
-/// because it prints the raw message, which can hold request data, as a second,
-/// unstructured line. With no tracing subscriber installed (a test binary, a
+/// (see [`pipeline_panicked`]). Either way at most one line a second is written
+/// per location ([`throttle`]): a client also reaches code no request guard
+/// covers (a connection's PROXY header, TLS handshake and JA4 peek, an HTTP/3
+/// connection's setup), and replaying an input that panics there flooded the
+/// log just as it did on the request path. The default hook is replaced rather
+/// than chained because it prints the raw message, which can hold request
+/// data, as a second, unstructured line. With no tracing subscriber installed (a test binary, a
 /// tool linking this crate) the default hook still runs, because otherwise the
 /// panic would not be seen at all.
 pub fn install_panic_hook() {
@@ -134,17 +138,20 @@ pub fn install_panic_hook() {
                 record(location, backtrace, line);
                 return;
             }
-            let thread = std::thread::current();
-            let thread = thread.name().unwrap_or("unnamed");
-            let backtrace = captured_backtrace();
-            error!(
-                thread,
-                location = %location,
-                panic = %panic_message(info.payload()),
-                backtrace = backtrace.as_ref().map(tracing::field::display),
-                "{}",
-                hook_line(thread, &location)
-            );
+            if let LogLine::Due { suppressed } = throttle(&location) {
+                let thread = std::thread::current();
+                let thread = thread.name().unwrap_or("unnamed");
+                let backtrace = captured_backtrace();
+                error!(
+                    thread,
+                    location = %location,
+                    panic = %panic_message(info.payload()),
+                    suppressed,
+                    backtrace = backtrace.as_ref().map(tracing::field::display),
+                    "{}",
+                    hook_line(thread, &location)
+                );
+            }
             record(location, None, LogLine::Due { suppressed: 0 });
         }));
     });
@@ -308,13 +315,12 @@ struct LineState {
 
 static REQUEST_LINES: Mutex<BTreeMap<String, LineState>> = Mutex::new(BTreeMap::new());
 
-/// Decide whether this request panic gets a line. A client that finds an input
-/// which panics can send it as fast as it likes, and each one was two ERROR
-/// lines on stdout: with the compose log rotation that pushed every other line
-/// out — the first panic's evidence included — within minutes. The first is
-/// written in full, then at most one a second per location, each saying how
-/// many were skipped. The counters and the per-request log records still see
-/// every one.
+/// Decide whether this panic gets a line. A client that finds an input which
+/// panics can send it as fast as it likes, and each one was two ERROR lines on
+/// stdout: with the compose log rotation that pushed every other line out — the
+/// first panic's evidence included — within minutes. The first is written in
+/// full, then at most one a second per location, each saying how many were
+/// skipped. The counters and the per-request log records still see every one.
 fn throttle(location: &str) -> LogLine {
     throttle_in(&mut lock(&REQUEST_LINES), location, Instant::now())
 }
@@ -369,9 +375,10 @@ pub(crate) async fn catch_request<F: Future>(fut: F) -> Result<F::Output, Box<dy
 }
 
 /// [`catch_request`] for synchronous code a client reaches outside any request
-/// future, such as the QUIC TLS handshake, which quinn drives under its own
-/// locks. As for a request, the hook only counts the panic and the caller
-/// writes its one line, rate-limited per location ([`client_step_panicked`]).
+/// future: the QUIC TLS handshake, which quinn drives under its own locks, and
+/// the inspection of one WebSocket message. As for a request, the hook only
+/// counts the panic and the caller writes its one line, rate-limited per
+/// location ([`client_step_panicked`], [`ws_message_panicked`]).
 pub(crate) fn catch_request_sync<R>(f: impl FnOnce() -> R) -> Result<R, Box<dyn Any + Send>> {
     let _in_request = InRequest::enter();
     std::panic::catch_unwind(AssertUnwindSafe(f))
@@ -534,6 +541,59 @@ pub(crate) fn pipeline_panicked(
     resp
 }
 
+/// The reason on the log records of a WebSocket message whose inspection
+/// panicked. Starts with [`REQUEST_PANIC_PREFIX`], so waf.log labels it INTERNAL.
+const WS_MESSAGE_PANIC_REASON: &str = "internal error: websocket message inspection failed; \
+     the message was not forwarded and the socket was closed (1011)";
+
+/// Turn a panic caught while one WebSocket message was inspected into its
+/// records; the caller closes the socket with 1011 and forwards nothing.
+///
+/// Inspecting a message runs the request pipeline's body phase on it
+/// (`WsSiteInspector`), for every text message a client sends on an upgraded
+/// socket, outside any request guard. A panic there unwound the relay's
+/// client-to-origin task: no close frame, no waf.log record, no count in
+/// `sentinel_request_panics_total`, and an unthrottled ERROR line per message.
+/// It is answered like a request panic now: counted, one ERROR line
+/// rate-limited per location with the message's Support ID, and its log
+/// records written by `record`, labelled INTERNAL.
+pub(crate) fn ws_message_panicked(
+    ctx: &mut RequestContext,
+    payload: &(dyn Any + Send),
+    record: impl FnOnce(&mut RequestContext),
+) {
+    sentinel_telemetry::note_request_panic();
+    let caught = take_request_caught();
+    if let LogLine::Due { suppressed } = caught.line {
+        let thread = std::thread::current();
+        error!(
+            request_id = %ctx.request_id,
+            client_ip = %ctx.client_ip,
+            site = ctx.site_id.as_deref().unwrap_or("-"),
+            location = %caught.location,
+            panic = %panic_message(payload),
+            suppressed,
+            backtrace = caught.backtrace.as_ref().map(tracing::field::display),
+            "{}; websocket message inspection panicked, socket closed (1011), message not forwarded",
+            hook_line(thread.name().unwrap_or("unnamed"), &caught.location),
+        );
+    }
+    #[cfg(test)]
+    note_test_reason(ctx, WS_MESSAGE_PANIC_REASON);
+    ctx.gateway_error = Some(WS_MESSAGE_PANIC_REASON.to_string());
+    // Whatever the inspection had decided before it panicked is not the reason.
+    ctx.block_reason = None;
+    // The panic may have come from logging itself; a second one must not reach
+    // the relay.
+    if std::panic::catch_unwind(AssertUnwindSafe(|| record(ctx))).is_err() {
+        error!(
+            request_id = %ctx.request_id,
+            location = %take_panic_location(),
+            "websocket message log record could not be written after a panic"
+        );
+    }
+}
+
 /// Last-resort guard for a TCP request, around everything `handle_request`
 /// serves itself: health, metrics, the management console, the internal API,
 /// ACME. The WAF pipeline has its own guard in `proxy`, which keeps the request
@@ -629,6 +689,24 @@ pub(crate) fn test_reason(support_id: &str) -> Option<String> {
         .iter()
         .find(|(id, _)| id == support_id)
         .map(|(_, r)| r.clone())
+}
+
+/// A WebSocket message containing this panics its inspection.
+#[cfg(test)]
+pub(crate) const INJECT_WS_PANIC_MARKER: &str = "__panic_guard_ws__";
+
+#[cfg(test)]
+pub(crate) fn inject_ws_panic(message: &[u8]) {
+    let marker = INJECT_WS_PANIC_MARKER.as_bytes();
+    if message.windows(marker.len()).any(|w| w == marker) {
+        panic!("injected websocket inspection panic");
+    }
+}
+
+/// Whether some contained request's records were given `reason`.
+#[cfg(test)]
+pub(crate) fn test_reason_given(reason: &str) -> bool {
+    lock(&TEST_REASONS).iter().any(|(_, r)| r == reason)
 }
 
 /// Site whose first engine rebuild panics, in test builds only, so the
@@ -1473,10 +1551,43 @@ mod tests {
             .get("location")
             .is_some_and(|l| l.contains("panic_guard.rs")));
 
-        let line = hook_event(false, background_bug);
+        // Another location: the first is held back for a second (see below).
+        fn another_background_bug() {
+            panic!("hook backtrace test, no backtrace");
+        }
+        let line = hook_event(false, another_background_bug);
         assert!(
             !line.contains_key("backtrace"),
             "none unless enabled: {line:?}"
+        );
+    }
+
+    /// Panics outside a request were one ERROR line (and a backtrace) each,
+    /// unthrottled, and a client reaches code no request guard covers: a
+    /// connection's PROXY header, TLS handshake and JA4 peek. Replaying a
+    /// panicking input there flooded the log as the request path used to.
+    #[test]
+    fn panic_lines_outside_a_request_are_rate_limited_too() {
+        fn connection_prelude_bug() {
+            panic!("connection prelude bug");
+        }
+        install_panic_hook();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let dispatch = tracing::Dispatch::new(Capture(Arc::clone(&events)));
+        let before = sentinel_telemetry::panics_total();
+        tracing::dispatcher::with_default(&dispatch, || {
+            for _ in 0..5 {
+                assert!(std::panic::catch_unwind(connection_prelude_bug).is_err());
+            }
+        });
+        let lines = lock(&events)
+            .iter()
+            .filter(|e| e.get("message").is_some_and(|m| m.contains("panicked at")))
+            .count();
+        assert_eq!(lines, 1, "one line for five panics at one location");
+        assert!(
+            sentinel_telemetry::panics_total() >= before + 5,
+            "every one is still counted"
         );
     }
 
@@ -1594,6 +1705,58 @@ mod tests {
             crate::nonrule_label(&ctx),
             ("GATEWAY", "Upstream or routing failure")
         );
+    }
+
+    /// A WebSocket message is inspected outside any request guard, and a panic
+    /// there unwound the relay's client-to-origin task: no close frame, no
+    /// waf.log record, no count, and an unthrottled ERROR line per message. It
+    /// is answered like a request panic now, in every mode: the socket is
+    /// closed with 1011 and the message is not forwarded.
+    #[test]
+    fn a_websocket_message_that_panics_its_inspection_closes_the_socket() {
+        use crate::websocket::{MessageInspector as _, Verdict, CLOSE_INTERNAL_ERROR};
+
+        install_panic_hook();
+        let mut site = site(
+            "ws-panic",
+            "ws.local",
+            "127.0.0.1:1".parse().unwrap(),
+            vec![],
+            vec![],
+        );
+        site.waf.mode = sentinel_core::config::WafMode::Learning;
+        let inspector = crate::WsSiteInspector {
+            site,
+            engines: Arc::new(arc_swap::ArcSwap::new(Arc::default())),
+            ml_engine: Arc::new(sentinel_ml::MlEngine::new(64, 64, None)),
+            client_ip: "192.0.2.9".parse().unwrap(),
+            uri: "/socket".parse().unwrap(),
+            tenant_id: None,
+            tls_fingerprint: None,
+            enforcement_mode: None,
+            anomaly_threshold: None,
+            paranoia: "1".into(),
+            log_headers: Default::default(),
+        };
+        let before = sentinel_telemetry::request_panics_total();
+        let message = format!(r#"{{"q":"{INJECT_WS_PANIC_MARKER}"}}"#);
+        assert_eq!(
+            inspector.inspect(message.as_bytes()),
+            Verdict::Refuse(CLOSE_INTERNAL_ERROR)
+        );
+        assert!(sentinel_telemetry::request_panics_total() > before);
+        assert!(
+            test_reason_given(WS_MESSAGE_PANIC_REASON),
+            "the message's records were written"
+        );
+        let mut ctx = RequestContext::new("192.0.2.9".parse().unwrap(), 0);
+        ctx.gateway_error = Some(WS_MESSAGE_PANIC_REASON.to_string());
+        assert_eq!(
+            crate::nonrule_label(&ctx),
+            ("INTERNAL", "Internal processing failure")
+        );
+        // The socket's next message is judged as before.
+        assert_eq!(inspector.inspect(br#"{"q":"hello"}"#), Verdict::Forward);
     }
 
     #[tokio::test]

@@ -5050,16 +5050,37 @@ impl WsSiteInspector {
         ctx.advance_phase(Phase::Logging);
         log_request(ctx);
     }
-}
 
-impl websocket::MessageInspector for WsSiteInspector {
-    fn inspect(&self, message: &[u8]) -> websocket::Verdict {
+    /// Run `judge` on a fresh message context under a panic guard. The relay
+    /// calls the inspector for every message, outside any request guard, so a
+    /// panic in it is answered here like a request's: logged and counted
+    /// ([`panic_guard::ws_message_panicked`]), and the socket closed with 1011
+    /// without forwarding the message, in every mode, as a request that panics
+    /// is answered 500 and not forwarded.
+    fn contained(
+        &self,
+        judge: impl FnOnce(&mut RequestContext) -> websocket::Verdict,
+    ) -> websocket::Verdict {
         let mut ctx = self.message_ctx();
+        match panic_guard::catch_request_sync(|| judge(&mut ctx)) {
+            Ok(verdict) => verdict,
+            Err(payload) => {
+                panic_guard::ws_message_panicked(&mut ctx, &*payload, |ctx| {
+                    self.record(ctx, "internal error")
+                });
+                websocket::Verdict::Refuse(websocket::CLOSE_INTERNAL_ERROR)
+            }
+        }
+    }
+
+    fn judge(&self, ctx: &mut RequestContext, message: &[u8]) -> websocket::Verdict {
+        #[cfg(test)]
+        panic_guard::inject_ws_panic(message);
         ctx.request_body = Some(Bytes::copy_from_slice(message));
-        seed_crs_policy(&mut ctx, &self.site);
+        seed_crs_policy(ctx, &self.site);
         ctx.advance_phase(Phase::RequestBody);
         let engines = self.engines.load();
-        if let Err(e) = phase2_body(&mut ctx, Some(&self.site), &engines, &self.ml_engine) {
+        if let Err(e) = phase2_body(ctx, Some(&self.site), &engines, &self.ml_engine) {
             warn!(site = %self.site.id, "WS message inspection failed: {e}");
             return if self.mode() == WafMode::Blocking {
                 websocket::Verdict::Refuse(websocket::CLOSE_INTERNAL_ERROR)
@@ -5068,25 +5089,24 @@ impl websocket::MessageInspector for WsSiteInspector {
             };
         }
         if ctx.decision == WafDecision::Block {
-            self.record(&mut ctx, "blocked");
+            self.record(ctx, "blocked");
             websocket::Verdict::Refuse(websocket::CLOSE_POLICY_VIOLATION)
         } else {
             if ctx.would_block {
-                self.record(&mut ctx, "would block");
+                self.record(ctx, "would block");
             }
             websocket::Verdict::Forward
         }
     }
 
-    fn too_large(&self, len: usize) -> websocket::Verdict {
-        let mut ctx = self.message_ctx();
+    fn judge_too_large(&self, ctx: &mut RequestContext, len: usize) -> websocket::Verdict {
         ctx.block_reason = Some(format!(
             "{len}+ bytes exceeds the {} byte inspection limit",
             websocket::MAX_INSPECT_MESSAGE_BYTES
         ));
         if self.mode() == WafMode::Blocking {
             ctx.decision = WafDecision::Block;
-            self.record(&mut ctx, "too large");
+            self.record(ctx, "too large");
             websocket::Verdict::Refuse(websocket::CLOSE_TOO_BIG)
         } else {
             warn!(
@@ -5097,9 +5117,19 @@ impl websocket::MessageInspector for WsSiteInspector {
             );
             ctx.decision = WafDecision::Log;
             ctx.would_block = true;
-            self.record(&mut ctx, "too large");
+            self.record(ctx, "too large");
             websocket::Verdict::Forward
         }
+    }
+}
+
+impl websocket::MessageInspector for WsSiteInspector {
+    fn inspect(&self, message: &[u8]) -> websocket::Verdict {
+        self.contained(|ctx| self.judge(ctx, message))
+    }
+
+    fn too_large(&self, len: usize) -> websocket::Verdict {
+        self.contained(|ctx| self.judge_too_large(ctx, len))
     }
 }
 
