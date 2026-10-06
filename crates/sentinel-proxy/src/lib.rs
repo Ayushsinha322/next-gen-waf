@@ -715,8 +715,23 @@ fn sync_status_lock() -> std::sync::MutexGuard<'static, ConfigSyncStatus> {
 }
 
 fn config_sync_status() -> ConfigSyncStatus {
-    sync_status_lock().clone()
+    let mut status = sync_status_lock().clone();
+    // A site whose rules crashed the compiler is rejected config as far as the
+    // console is concerned: the change saved there is not enforced here.
+    status.rejected_sites.extend(
+        ENGINE_COMPILE_PANICS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned(),
+    );
+    status
 }
+
+/// Sites whose rules panicked the compiler in the latest engine rebuild.
+/// Replaced by every rebuild; reported with the sync status.
+static ENGINE_COMPILE_PANICS: std::sync::Mutex<Vec<RejectedSite>> =
+    std::sync::Mutex::new(Vec::new());
 
 fn note_config_sync_failure(error: String) {
     let mut g = sync_status_lock();
@@ -1026,14 +1041,20 @@ impl ProxyServer {
             HISTORY_SINK_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
             let spool = open_history_spool();
             let ch_cfg = storage_backend_cfg.clone();
-            // Supervised: a panic restarts the writer (rows buffered in that run
-            // are lost; the spool and everything after are not) instead of
-            // silently ending history recording for the life of the process.
+            // Where a run that panics leaves the rows it had drained but not yet
+            // inserted or spooled, for the restarted run to pick up.
+            let traffic_carry: Arc<std::sync::Mutex<Vec<sentinel_storage::TrafficRow>>> =
+                Arc::default();
+            let events_carry: Arc<std::sync::Mutex<Vec<sentinel_storage::WafEventRow>>> =
+                Arc::default();
+            // Supervised: a panic restarts the writer, with the rows it held,
+            // instead of silently ending history recording for the life of the
+            // process.
             panic_guard::supervised!("clickhouse history writer", {
-                per_run!(initial, spool, ch_cfg);
+                per_run!(initial, spool, ch_cfg, traffic_carry, events_carry);
                 let mut ch: Option<std::sync::Arc<sentinel_storage::ClickHouseClient>> = initial;
-                let mut buf: Vec<sentinel_storage::TrafficRow> = Vec::new();
-                let mut evbuf: Vec<sentinel_storage::WafEventRow> = Vec::new();
+                let mut buf = panic_guard::Carried::resume(&traffic_carry);
+                let mut evbuf = panic_guard::Carried::resume(&events_carry);
                 let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
                 let mut ticks = 0u32;
                 // Seconds remaining until the next reconnect attempt while down.
@@ -1469,7 +1490,14 @@ impl ProxyServer {
             let poll_cfg = Arc::clone(&state.config);
             let poll_pool = Arc::clone(&state.upstream_pool);
             let secs = cfg.cluster.sync_interval_secs.max(1);
-            panic_guard::supervised!("config sync", {
+            // A crash here is a sync failure like any other, so the heartbeat's
+            // sync status (and the console's REJECTING badge) says so. Without
+            // it a crash-looping sync left `last_error` empty and the node
+            // reporting a healthy sync while it took no config.
+            let on_panic = |msg: &str| {
+                note_config_sync_failure(format!("config sync crashed and is restarting: {msg}"))
+            };
+            panic_guard::supervised!("config sync", on_panic = on_panic, {
                 per_run!(sync_url, poll_cfg, poll_pool, sync_reload_notify);
                 use http_body_util::BodyExt as _;
                 type EmptyBody = http_body_util::Empty<bytes::Bytes>;
@@ -1535,7 +1563,6 @@ impl ProxyServer {
                             continue;
                         }
                     };
-                    note_config_sync_ok();
                     if envelope.version != last_version {
                         let previous: Vec<SiteConfig> = poll_cfg
                             .load()
@@ -1545,6 +1572,8 @@ impl ProxyServer {
                             .cloned()
                             .collect();
                         let (sites, rejected) = parse_synced_sites(envelope.sites, &previous);
+                        #[cfg(test)]
+                        panic_guard::inject_sync_panic(&sites);
                         for r in &rejected {
                             error!(
                                 site = %r.id,
@@ -1582,6 +1611,11 @@ impl ProxyServer {
                         last_version = sync.version;
                         info!(version = last_version, sites = count, "sites hot-synced");
                     }
+                    // Only once the poll is APPLIED: a sync that crashes while
+                    // applying must not be reported healthy by the next run's
+                    // successful fetch, or its failure never outlives the grace
+                    // period the console waits before saying REJECTING.
+                    note_config_sync_ok();
                 }
             });
         }
@@ -2092,8 +2126,14 @@ impl ProxyServer {
                         .elapsed()
                         .unwrap_or_default()
                         .as_secs();
-                    // Degraded when we have origins configured but none reachable.
-                    let status = if pool.total > 0 && pool.healthy == 0 {
+                    // Degraded when we have origins configured but none reachable,
+                    // or while a background loop is crash-looping. Under
+                    // panic=abort such a loop took the node down, which was at
+                    // least visible; contained, it is a node that quietly stops
+                    // doing one of its jobs, so it must not report healthy.
+                    let status = if (pool.total > 0 && pool.healthy == 0)
+                        || panic_guard::recently_restarted().is_some()
+                    {
                         "degraded"
                     } else {
                         "healthy"
@@ -2131,6 +2171,9 @@ impl ProxyServer {
                             // compiler — so without it "enabled" in the UI is an
                             // assumption rather than a fact.
                             "inline_rules": inline_rule_diag_snapshot(),
+                            // Contained panics, and which loops restarted: the
+                            // reason a node above reads "degraded".
+                            "panics": panic_guard::heartbeat_status(),
                         }
                     })
                     .to_string();
@@ -2268,8 +2311,9 @@ impl ProxyServer {
             // instead of leaving the port dead while the process looks healthy.
             // (Connections and requests panic in their own tasks and guards and
             // never reach this.) After such a restart an HTTP/3 endpoint cannot
-            // rebind while the first one is still serving; that is logged, and
-            // h3 keeps working on the original.
+            // rebind while the first one is still serving; that is logged, h3
+            // keeps working on the original, and the restarted listener stops
+            // advertising it (Alt-Svc follows its own endpoint, which is down).
             handles.push(panic_guard::supervised!("listener", {
                 per_run!(listener_cfg, state2, sd);
                 if let Err(e) = serve_listener(listener_cfg, state2, &mut sd).await {
@@ -2409,26 +2453,31 @@ async fn serve_listener(
 
     let default_site = cfg.default_site.clone();
 
+    // True while the HTTP/3 accept loop runs; gates the Alt-Svc below.
+    let h3_serving = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Spawn the HTTP/3 (QUIC over UDP) endpoint on the same address as the TCP
     // listener. It shares the listener's shutdown signal and feeds requests into
     // the same WAF pipeline (see `http3::serve_quic`).
     if let Some(qcfg) = quic_config {
         match cfg.bind.parse::<SocketAddr>() {
-            Ok(quic_bind) => {
-                let state_q = Arc::clone(&state);
-                let ds_q = default_site.clone();
-                let shutdown_q = shutdown.clone();
-                let lname = cfg.name.clone();
-                panic_guard::supervised!("HTTP/3 endpoint", {
-                    per_run!(qcfg, state_q, ds_q, shutdown_q, lname);
-                    if let Err(e) =
-                        http3::serve_quic(quic_bind, qcfg, state_q, ds_q, shutdown_q).await
-                    {
-                        error!(listener = %lname, "HTTP/3 endpoint error: {e}");
-                    }
-                });
-                info!(listener = %cfg.name, bind = %cfg.bind, "HTTP/3 (QUIC) enabled on this listener");
-            }
+            Ok(quic_bind) => match http3::bind_quic(quic_bind, qcfg) {
+                Ok(endpoint) => {
+                    let state_q = Arc::clone(&state);
+                    let ds_q = default_site.clone();
+                    let shutdown_q = shutdown.clone();
+                    let serving = Arc::clone(&h3_serving);
+                    // Bound once, out here: a run restarted after a panic
+                    // accepts on the same socket (see `http3::bind_quic`).
+                    panic_guard::supervised!("HTTP/3 endpoint", {
+                        per_run!(endpoint, state_q, ds_q, shutdown_q, serving);
+                        http3::serve_quic(endpoint, state_q, ds_q, shutdown_q, &serving).await;
+                    });
+                    info!(listener = %cfg.name, bind = %cfg.bind, "HTTP/3 (QUIC) enabled on this listener");
+                }
+                Err(e) => {
+                    error!(listener = %cfg.name, "HTTP/3 endpoint error: {e:#}; serving TCP only");
+                }
+            },
             Err(e) => {
                 error!(listener = %cfg.name, bind = %cfg.bind, "HTTP/3 requested but bind is not a socket address ({e}); h3 disabled");
             }
@@ -2439,7 +2488,7 @@ async fn serve_listener(
     // h3 on the advertised UDP port. Defaults to this listener's bind port;
     // override with SENTINEL_HTTP3_ADVERTISE_PORT when the public port differs
     // (e.g. a container mapping host :443/udp → container :8443/udp).
-    let alt_svc: Option<header::HeaderValue> = if h3_enabled {
+    let alt_svc: Option<http3::AltSvc> = if h3_enabled {
         let bind_port = cfg
             .bind
             .parse::<SocketAddr>()
@@ -2449,7 +2498,9 @@ async fn serve_listener(
             .ok()
             .and_then(|s| s.parse::<u16>().ok())
             .unwrap_or(bind_port);
-        header::HeaderValue::from_str(&format!("h3=\":{port}\"; ma=86400")).ok()
+        header::HeaderValue::from_str(&format!("h3=\":{port}\"; ma=86400"))
+            .ok()
+            .map(|v| http3::AltSvc::new(v, Arc::clone(&h3_serving)))
     } else {
         None
     };
@@ -2596,7 +2647,7 @@ async fn handle_connection(
     state: Arc<ServerState>,
     default_site: Option<String>,
     management: Option<Arc<ManagementUpstreams>>,
-    alt_svc: Option<header::HeaderValue>,
+    alt_svc: Option<http3::AltSvc>,
     proxy_protocol: bool,
 ) -> anyhow::Result<()> {
     stream.set_nodelay(true)?;
@@ -2764,7 +2815,7 @@ async fn serve_http1<T>(
     state: Arc<ServerState>,
     default_site: Option<String>,
     management: Option<Arc<ManagementUpstreams>>,
-    alt_svc: Option<header::HeaderValue>,
+    alt_svc: Option<http3::AltSvc>,
     tls_fp: Option<String>,
 ) -> anyhow::Result<()>
 where
@@ -2799,7 +2850,7 @@ async fn serve_http2<T>(
     state: Arc<ServerState>,
     default_site: Option<String>,
     management: Option<Arc<ManagementUpstreams>>,
-    alt_svc: Option<header::HeaderValue>,
+    alt_svc: Option<http3::AltSvc>,
     tls_fp: Option<String>,
 ) -> anyhow::Result<()>
 where
@@ -2829,14 +2880,14 @@ where
 }
 
 /// Attach the `Alt-Svc` header (advertising HTTP/3) to a TCP response when the
-/// listener has h3 enabled. No-op when `alt_svc` is `None`.
+/// listener has h3 enabled and its endpoint is accepting. No-op otherwise.
 fn with_alt_svc(
     resp: Result<Response<BoxBody>, Infallible>,
-    alt_svc: Option<header::HeaderValue>,
+    alt_svc: Option<http3::AltSvc>,
 ) -> Result<Response<BoxBody>, Infallible> {
-    match (resp, alt_svc) {
+    match (resp, alt_svc.as_ref().and_then(http3::AltSvc::header)) {
         (Ok(mut r), Some(v)) => {
-            r.headers_mut().insert(header::ALT_SVC, v);
+            r.headers_mut().insert(header::ALT_SVC, v.clone());
             Ok(r)
         }
         (other, _) => other,
@@ -3076,8 +3127,9 @@ async fn proxy(
     let mut ctx = RequestContext::new(peer.ip(), peer.port());
     // A panic anywhere in the pipeline is caught here, where the context
     // outlives it: the request is answered 500 with its Support ID and logged,
-    // and is never forwarded. Serves both TCP and HTTP/3 (via run_pipeline).
-    let outcome = panic_guard::catch(async {
+    // saying whether it had reached the origin. Serves both TCP and HTTP/3
+    // (via run_pipeline).
+    let outcome = panic_guard::catch_request(async {
         #[cfg(test)]
         panic_guard::inject_test_panic(&req);
         proxy_inner(&mut ctx, state, peer, req, default_site, tls_fp).await
@@ -4150,6 +4202,8 @@ async fn proxy_inner(
 
     // --- Phase 5: Response body — rule engine + DLP scan ---
     ctx.advance_phase(Phase::ResponseBody);
+    #[cfg(test)]
+    panic_guard::inject_response_panic(ctx);
 
     let dlp_map = state.dlp_map.load_full();
     let resp_engines = state.engines.load_full();
@@ -5892,6 +5946,7 @@ fn build_rule_engines(cfg: &SentinelConfig, previous: &RuleEngineMap) -> RuleEng
     // stops claiming to be enforced.
     reset_inline_rule_diags();
     let mut map = RuleEngineMap::new();
+    let mut compile_panics = Vec::new();
     for site in &cfg.sites {
         // A site with no rule FILES may still have operator-authored inline rules
         // from the control plane; skipping on `rules.is_empty()` alone would build
@@ -5904,7 +5959,27 @@ fn build_rule_engines(cfg: &SentinelConfig, previous: &RuleEngineMap) -> RuleEng
         {
             continue;
         }
-        match load_site_engine(site) {
+        // A panic compiling one site's rules (a CRS line or an operator's rule
+        // reaching a parser bug) costs that site only, like an Err: it keeps its
+        // last-good engine or is refused, below. Unguarded it unwound out of
+        // the whole rebuild, the watcher replayed the same config forever, and
+        // no later change applied to ANY site while the node reported healthy.
+        let loaded =
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load_site_engine(site)))
+            {
+                Ok(loaded) => loaded,
+                Err(payload) => {
+                    let rejected = compile_panic_rejection(
+                        &site.id,
+                        previous.contains_key(&site.id),
+                        &*payload,
+                    );
+                    let err = anyhow!(rejected.error.clone());
+                    compile_panics.push(rejected);
+                    Err(err)
+                }
+            };
+        match loaded {
             Ok(engine) => {
                 info!(site = %site.id, rules = engine.rule_count(), "rule engine loaded");
                 map.insert(site.id.clone(), engine);
@@ -5931,7 +6006,34 @@ fn build_rule_engines(cfg: &SentinelConfig, previous: &RuleEngineMap) -> RuleEng
             }
         }
     }
+    *ENGINE_COMPILE_PANICS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = compile_panics;
     map
+}
+
+/// How a site whose rules panicked the compiler is reported to the console (via
+/// the sync status in the heartbeat). Names the outcome; the location is in the
+/// node's log, because source paths carry the crate codename.
+fn compile_panic_rejection(
+    id: &str,
+    kept_previous: bool,
+    payload: &(dyn std::any::Any + Send),
+) -> RejectedSite {
+    let consequence = if kept_previous {
+        "The site keeps its previous rules."
+    } else {
+        "The site has no rules on this node."
+    };
+    RejectedSite {
+        id: id.to_string(),
+        error: format!(
+            "its rules crashed the rule compiler ({}); this is a bug, not a config error — \
+             the node log has the location. {consequence}",
+            panic_guard::panic_message(payload)
+        ),
+        kept_previous,
+    }
 }
 
 fn build_dlp_map(cfg: &SentinelConfig) -> DlpMap {
@@ -6519,6 +6621,8 @@ fn target_name(t: &sentinel_rules::dsl::ast::Target) -> String {
 
 fn load_site_engine(site: &SiteConfig) -> anyhow::Result<RuleEngine> {
     use sentinel_rules::dsl::ast::{RuleFile, RuleItem};
+    #[cfg(test)]
+    panic_guard::inject_compile_panic(site);
 
     let mut merged = RuleFile::default();
     for path_str in &site.waf.rules {
@@ -6557,7 +6661,31 @@ fn load_site_engine(site: &SiteConfig) -> anyhow::Result<RuleEngine> {
 
     for inline in &site.waf.inline_rules {
         let mut accepted = 0usize;
-        let parsed = match sentinel_rules::parse_srl(&inline.dsl) {
+        // Text typed into a web form is exactly what finds a parser bug, so a
+        // panic here costs this one rule, reported like a parse error.
+        let parsed = match std::panic::catch_unwind(|| {
+            #[cfg(test)]
+            panic_guard::inject_parse_panic(&inline.dsl);
+            sentinel_rules::parse_srl(&inline.dsl)
+        }) {
+            Ok(parsed) => parsed,
+            Err(payload) => {
+                let why = format!(
+                    "it crashed the rule parser ({}); a bug, not a typo",
+                    panic_guard::panic_message(&*payload)
+                );
+                warn!(
+                    site = %site.id,
+                    rule = %inline.name,
+                    error = %why,
+                    "CUSTOM RULE NOT ENFORCED: it crashed the rule parser. Every other rule \
+                     for this site is unaffected."
+                );
+                record_inline_rule_diag(&inline.name, false, Some(why));
+                continue;
+            }
+        };
+        let parsed = match parsed {
             Ok(f) => f,
             Err(e) => {
                 warn!(
@@ -10116,21 +10244,11 @@ fn log_sender() -> &'static std::sync::mpsc::SyncSender<LogRecord> {
         std::thread::Builder::new()
             .name("sentinel-logwriter".into())
             .spawn(move || {
-                // Restarted on a panic: ending this thread would close the
-                // channel and drop every access/waf line for the rest of the
-                // process. A clean return means every sender is gone.
-                while std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    log_writer_loop(&rx)
-                }))
-                .is_err()
-                {
-                    let restarts = sentinel_telemetry::note_task_restart();
-                    error!(
-                        restarts_total = restarts,
-                        "ndjson log writer panicked; restarting it"
-                    );
-                    std::thread::sleep(Duration::from_secs(1));
-                }
+                // Restarted on a panic, with the shared backoff: ending this
+                // thread would close the channel and drop every access/waf line
+                // for the rest of the process. A clean return means every
+                // sender is gone.
+                panic_guard::supervise_blocking("ndjson log writer", || log_writer_loop(&rx))
             })
             .expect("spawn ndjson log writer");
         tx
@@ -10787,11 +10905,7 @@ fn ndjson_log(ctx: &RequestContext) {
         // report can categorize them instead of collapsing them into "-"/"other".
         let (rule, attack): (&str, &str) = match top {
             Some(r) => (r.rule_id.as_str(), r.message.as_str()),
-            // A gateway failure is an availability event, not an attack. Given
-            // its own stable label so it is queryable without polluting the
-            // attack breakdown with "the origin is down".
-            None if ctx.gateway_error.is_some() => ("GATEWAY", "Upstream or routing failure"),
-            None => classify_nonrule_block(ctx.block_reason.as_deref().unwrap_or("")),
+            None => nonrule_label(ctx),
         };
 
         // Which part of the request tripped this, e.g. "ARGS:id". Available on
@@ -10887,6 +11001,22 @@ fn ndjson_log(ctx: &RequestContext) {
             "headers": headers,
         });
         enqueue_log("waf.log", waf.to_string());
+    }
+}
+
+/// The waf.log `(rule, attack)` pair for an event no rule decided.
+fn nonrule_label(ctx: &RequestContext) -> (&'static str, &'static str) {
+    if panic_guard::is_contained_panic(ctx) {
+        // Neither an attack nor an upstream failure: the origin may be fine,
+        // and may already have executed the request (`msg` says).
+        ("INTERNAL", "Internal processing failure")
+    } else if ctx.gateway_error.is_some() {
+        // A gateway failure is an availability event, not an attack. Given
+        // its own stable label so it is queryable without polluting the
+        // attack breakdown with "the origin is down".
+        ("GATEWAY", "Upstream or routing failure")
+    } else {
+        classify_nonrule_block(ctx.block_reason.as_deref().unwrap_or(""))
     }
 }
 
@@ -12565,8 +12695,9 @@ mod inline_rule_diag_tests {
 
     /// The diagnostics registry is process-global by design — it mirrors one
     /// node's live state. Cargo runs tests in threads, so without this they clear
-    /// each other's entries and fail intermittently. Serialise them.
-    static DIAG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// each other's entries and fail intermittently. Serialise them. The panic
+    /// tests take it too: every `ProxyServer` they start rebuilds the engines.
+    pub(crate) static DIAG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn guard() -> std::sync::MutexGuard<'static, ()> {
         DIAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
@@ -13906,6 +14037,8 @@ mod engine_warming_tests {
     /// accepts anything, so a fresh process must not 503 its first request.
     #[test]
     fn warming_flag_starts_clear() {
+        // A panic test sets the flag as config sync would; not while this runs.
+        let _serial = crate::panic_guard::testkit::proxy_state_lock();
         assert!(
             !ENGINES_WARMING.load(std::sync::atomic::Ordering::Acquire),
             "a freshly started proxy has already built its engines and must serve"

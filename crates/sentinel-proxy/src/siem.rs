@@ -332,7 +332,7 @@ fn json_or(text: &str, empty: serde_json::Value) -> serde_json::Value {
 /// format/facility/hostname to `record` without re-reading the environment per
 /// event.
 pub fn start(cfg: SiemConfig) -> SiemConfig {
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(cfg.queue);
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(cfg.queue);
     if SENDER.set(tx).is_err() {
         // Already started (a second listener, or a test). Nothing to do.
         return cfg;
@@ -345,49 +345,87 @@ pub fn start(cfg: SiemConfig) -> SiemConfig {
         "SIEM event feed enabled — every block and learning-mode detection is forwarded"
     );
 
-    let task_cfg = cfg.clone();
-    tokio::spawn(async move {
-        let mut backoff = Duration::from_millis(500);
-        const MAX_BACKOFF: Duration = Duration::from_secs(30);
-
-        loop {
-            match Conn::connect(&task_cfg).await {
-                Ok(mut conn) => {
-                    backoff = Duration::from_millis(500);
-                    info!(target_addr = %task_cfg.target, "SIEM feed connected");
-                    // Drain until a write fails, then reconnect. Events that
-                    // arrive while disconnected are dropped by `enqueue` once
-                    // the queue fills — counted, never silent.
-                    while let Some(line) = rx.recv().await {
-                        if let Err(e) = conn.write_line(&line).await {
-                            warn!(error = %e, "SIEM feed write failed — reconnecting");
-                            break;
-                        }
-                        SENT.fetch_add(1, Ordering::Relaxed);
-                    }
-                    if rx.is_closed() {
-                        return;
-                    }
-                }
-                Err(e) => {
-                    let n = CONNECT_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
-                    if n == 1 || n.is_power_of_two() {
-                        warn!(
-                            error = %e,
-                            failures = n,
-                            target_addr = %task_cfg.target,
-                            "SIEM feed cannot connect — events are recorded in ClickHouse \
-                             but NOT forwarded"
-                        );
-                    }
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(MAX_BACKOFF);
-                }
-            }
-        }
-    });
+    tokio::spawn(forward(cfg.clone(), rx));
 
     cfg
+}
+
+const MIN_BACKOFF: Duration = Duration::from_millis(500);
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// How one connect-and-drain pass ended.
+enum Pass {
+    /// Every sender is gone: the forwarder is finished.
+    Closed,
+    /// A live connection failed a write: reconnect straight away.
+    Dropped,
+    /// The connect failed: back off, then try again.
+    ConnectFailed,
+}
+
+/// The forwarder task. Each pass is panic-contained: a panic used to end this
+/// task for the life of the process, so the compliance feed went dark with only
+/// the dropped counter moving. Now the pass is restarted after the same backoff
+/// as a failed connect (which a panic does not reset, so a line that panics
+/// every time is retried at most every 30 s). The queue lives out here, so
+/// nothing queued is lost beyond the line being written when it panicked.
+async fn forward(cfg: SiemConfig, mut rx: tokio::sync::mpsc::Receiver<String>) {
+    let mut backoff = MIN_BACKOFF;
+    loop {
+        match crate::panic_guard::catch(forward_pass(&cfg, &mut rx)).await {
+            Ok(Pass::Closed) => return,
+            Ok(Pass::Dropped) => {
+                backoff = MIN_BACKOFF;
+                continue;
+            }
+            Ok(Pass::ConnectFailed) => {}
+            Err(payload) => {
+                crate::panic_guard::task_panicked("SIEM forwarder", &*payload);
+            }
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(MAX_BACKOFF);
+    }
+}
+
+async fn forward_pass(cfg: &SiemConfig, rx: &mut tokio::sync::mpsc::Receiver<String>) -> Pass {
+    match Conn::connect(cfg).await {
+        Ok(mut conn) => {
+            info!(target_addr = %cfg.target, "SIEM feed connected");
+            // Drain until a write fails, then reconnect. Events that
+            // arrive while disconnected are dropped by `enqueue` once
+            // the queue fills — counted, never silent.
+            while let Some(line) = rx.recv().await {
+                #[cfg(test)]
+                if line == tests::INJECT_PANIC_LINE {
+                    panic!("injected SIEM forwarder panic");
+                }
+                if let Err(e) = conn.write_line(&line).await {
+                    warn!(error = %e, "SIEM feed write failed — reconnecting");
+                    break;
+                }
+                SENT.fetch_add(1, Ordering::Relaxed);
+            }
+            if rx.is_closed() {
+                Pass::Closed
+            } else {
+                Pass::Dropped
+            }
+        }
+        Err(e) => {
+            let n = CONNECT_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == 1 || n.is_power_of_two() {
+                warn!(
+                    error = %e,
+                    failures = n,
+                    target_addr = %cfg.target,
+                    "SIEM feed cannot connect — events are recorded in ClickHouse \
+                     but NOT forwarded"
+                );
+            }
+            Pass::ConnectFailed
+        }
+    }
 }
 
 /// One live connection to the collector.
@@ -646,5 +684,75 @@ mod tests {
         // unknowable gap.
         assert_eq!(cfg.transport, SiemTransport::Tcp);
         std::env::remove_var("SENTINEL_SIEM_TARGET");
+    }
+
+    /// A queued line that makes the forwarder panic, in test builds only.
+    pub(super) const INJECT_PANIC_LINE: &str = "__panic_guard_siem__";
+
+    /// A panic in the forwarder ended the task for the life of the process:
+    /// every later event was queued, then dropped once the queue filled, and
+    /// the SIEM saw nothing more. Now the pass restarts and later events flow.
+    #[tokio::test]
+    async fn a_panic_in_the_forwarder_does_not_end_the_feed() {
+        use tokio::io::AsyncReadExt as _;
+
+        let collector = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = collector.local_addr().unwrap().to_string();
+        let received = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+        let sink = std::sync::Arc::clone(&received);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = collector.accept().await {
+                let sink = std::sync::Arc::clone(&sink);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    while let Ok(n) = sock.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        sink.lock()
+                            .await
+                            .push_str(&String::from_utf8_lossy(&buf[..n]));
+                    }
+                });
+            }
+        });
+
+        let cfg = SiemConfig {
+            target,
+            transport: SiemTransport::Tcp,
+            format: SiemFormat::Json,
+            ca_file: None,
+            server_name: None,
+            queue: 16,
+            facility: 16,
+            hostname: "test".into(),
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(16);
+        let forwarder = tokio::spawn(forward(cfg, rx));
+
+        tx.send("before-the-panic".into()).await.unwrap();
+        tx.send(INJECT_PANIC_LINE.into()).await.unwrap();
+        tx.send("after-the-panic".into()).await.unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !received.lock().await.contains("after-the-panic") {
+            assert!(
+                !forwarder.is_finished(),
+                "the forwarder task ended on the panic"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "nothing after the panic reached the collector: {:?}",
+                received.lock().await
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(received.lock().await.contains("before-the-panic"));
+
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(5), forwarder)
+            .await
+            .expect("closing the queue ends the forwarder")
+            .expect("the forwarder must not panic out");
     }
 }

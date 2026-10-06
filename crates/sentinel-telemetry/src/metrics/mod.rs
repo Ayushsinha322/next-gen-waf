@@ -550,7 +550,9 @@ struct WafMetrics {
     /// request or background loop it happened in, which is exactly why it needs
     /// a number — a contained panic is otherwise invisible from outside.
     pub panics_total: Counter,
-    /// Requests answered 500 because their processing panicked. Never forwarded.
+    /// Requests answered 500 because their processing panicked. Some had
+    /// already reached the origin (a panic in the response phase); each one's
+    /// log line says which.
     pub request_panics_total: Counter,
     /// Background loops (control-plane sync, ClickHouse writer, listeners, ...)
     /// restarted after a panic. Climbing steadily means one is crash-looping.
@@ -677,7 +679,7 @@ impl WafMetrics {
         );
         let request_panics_total = registry.register_counter(
             "sentinel_request_panics_total",
-            "Requests whose processing panicked and were answered 500 without being forwarded",
+            "Requests whose processing panicked and were answered 500 (each log line says whether it had reached the origin)",
         );
         let task_restarts_total = registry.register_counter(
             "sentinel_task_restarts_total",

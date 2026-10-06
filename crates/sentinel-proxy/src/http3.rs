@@ -13,13 +13,15 @@
 //! initial cipher suite from the rustls config's crypto provider (the ring
 //! provider installed process-wide in `sentinel-bin::main`).
 //!
-//! Wiring: `serve_listener` spawns [`serve_quic`] alongside the TCP accept loop
-//! when a listener advertises `Protocol::Http3`, and advertises discovery via
-//! the `Alt-Svc` header on TCP responses (browsers connect over TCP first, then
-//! upgrade). See `crate::serve_listener`.
+//! Wiring: `serve_listener` binds the endpoint ([`bind_quic`]) and runs
+//! [`serve_quic`] on it, supervised, alongside the TCP accept loop when a
+//! listener advertises `Protocol::Http3`, and advertises discovery via the
+//! `Alt-Svc` header on TCP responses while that loop runs (browsers connect over
+//! TCP first, then upgrade). See `crate::serve_listener`.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -99,26 +101,87 @@ pub fn quic_server_config_from_resolver(
 // Endpoint + accept loops
 // ---------------------------------------------------------------------------
 
-/// Bind a QUIC (UDP) endpoint and serve HTTP/3 until shutdown is signalled.
+/// Bind a listener's QUIC (UDP) endpoint.
+///
+/// Done once, outside the supervised accept loop ([`serve_quic`]), so a loop
+/// restarted after a panic accepts on the same socket. Rebinding instead failed
+/// with EADDRINUSE: quinn keeps the socket open while any connection of the old
+/// endpoint is alive, so HTTP/3 stayed down for the rest of the process while
+/// `Alt-Svc` went on advertising it.
+pub(crate) fn bind_quic(
+    bind: SocketAddr,
+    server_config: quinn::ServerConfig,
+) -> Result<quinn::Endpoint> {
+    let endpoint = quinn::Endpoint::server(server_config, bind)
+        .with_context(|| format!("binding QUIC/HTTP3 endpoint on udp://{bind}"))?;
+    info!(%bind, "HTTP/3 (QUIC) endpoint listening");
+    Ok(endpoint)
+}
+
+/// A listener's `Alt-Svc` advertisement, attached to TCP responses only while
+/// its HTTP/3 accept loop is running. A client sent to an endpoint nobody is
+/// accepting on stalls its QUIC handshake before falling back to TCP, and
+/// `ma=86400` makes it keep trying for a day.
+#[derive(Clone)]
+pub(crate) struct AltSvc {
+    value: header::HeaderValue,
+    serving: Arc<AtomicBool>,
+}
+
+impl AltSvc {
+    pub(crate) fn new(value: header::HeaderValue, serving: Arc<AtomicBool>) -> Self {
+        Self { value, serving }
+    }
+
+    /// The header to send, or `None` while the endpoint is not accepting.
+    pub(crate) fn header(&self) -> Option<&header::HeaderValue> {
+        self.serving.load(Ordering::Acquire).then_some(&self.value)
+    }
+}
+
+/// Holds `serving` true for the life of an accept loop, and clears it however
+/// the loop ends — a panic included.
+struct Serving<'a>(&'a AtomicBool);
+
+impl<'a> Serving<'a> {
+    fn start(flag: &'a AtomicBool) -> Self {
+        flag.store(true, Ordering::Release);
+        Self(flag)
+    }
+}
+
+impl Drop for Serving<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// The next accepted connection panics the accept loop, in test builds only.
+#[cfg(test)]
+pub(crate) static INJECT_ACCEPT_PANIC: AtomicBool = AtomicBool::new(false);
+
+/// Serve HTTP/3 on a bound endpoint until shutdown is signalled. `serving` is
+/// true while this runs; it gates the listener's [`AltSvc`].
 ///
 /// One QUIC connection multiplexes many HTTP/3 requests; each connection and
 /// each request runs on its own task, mirroring the TCP accept loop.
 pub(crate) async fn serve_quic(
-    bind: SocketAddr,
-    server_config: quinn::ServerConfig,
+    endpoint: quinn::Endpoint,
     state: Arc<ServerState>,
     default_site: Option<String>,
     mut shutdown: watch::Receiver<bool>,
-) -> Result<()> {
-    let endpoint = quinn::Endpoint::server(server_config, bind)
-        .with_context(|| format!("binding QUIC/HTTP3 endpoint on udp://{bind}"))?;
-    info!(%bind, "HTTP/3 (QUIC) endpoint listening");
-
+    serving: &AtomicBool,
+) {
+    let _serving = Serving::start(serving);
     loop {
         tokio::select! {
             maybe_incoming = endpoint.accept() => {
                 match maybe_incoming {
                     Some(incoming) => {
+                        #[cfg(test)]
+                        if INJECT_ACCEPT_PANIC.swap(false, Ordering::SeqCst) {
+                            panic!("injected HTTP/3 accept-loop panic");
+                        }
                         // Connection admission control — share the global
                         // connection limiter with the TCP accept loop so the
                         // cap is truly process-wide across both transports.
@@ -149,14 +212,13 @@ pub(crate) async fn serve_quic(
                 }
             }
             _ = shutdown.changed() => {
-                info!(%bind, "HTTP/3 endpoint shutting down");
+                info!(bind = ?endpoint.local_addr().ok(), "HTTP/3 endpoint shutting down");
                 // Tell peers we're going away; give in-flight streams a moment.
                 endpoint.close(0u32.into(), b"shutdown");
                 break;
             }
         }
     }
-    Ok(())
 }
 
 /// Complete the QUIC handshake for one connection, then run its HTTP/3 request
@@ -455,6 +517,151 @@ mod tests {
         client.wait_idle().await;
         drive.abort();
         server.abort();
+    }
+
+    /// `Alt-Svc` follows the accept loop: set while it runs, cleared however it
+    /// ends. It used to be attached unconditionally, so after the endpoint died
+    /// every TCP response still sent clients to it for a day (`ma=86400`).
+    #[test]
+    fn alt_svc_is_advertised_only_while_the_endpoint_accepts() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let alt = AltSvc::new(
+            header::HeaderValue::from_static("h3=\":443\"; ma=86400"),
+            Arc::clone(&flag),
+        );
+        assert!(alt.header().is_none(), "not accepting yet");
+        {
+            let _serving = Serving::start(&flag);
+            assert_eq!(alt.header().unwrap(), "h3=\":443\"; ma=86400");
+        }
+        assert!(alt.header().is_none(), "the loop returned");
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _serving = Serving::start(&flag);
+            panic!("accept loop panic");
+        }));
+        assert!(unwound.is_err());
+        assert!(alt.header().is_none(), "the loop panicked");
+    }
+
+    /// Client side of the restart test: one HTTP/3 connection and its driver.
+    struct H3Client {
+        send: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+        driver: tokio::task::JoinHandle<()>,
+    }
+
+    impl H3Client {
+        async fn connect(client: &quinn::Endpoint, addr: SocketAddr) -> Result<Self> {
+            let conn = client.connect(addr, "panic-site.local")?.await?;
+            let (mut driver, send) = h3::client::new(h3_quinn::Connection::new(conn)).await?;
+            let driver = tokio::spawn(async move {
+                let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+            });
+            Ok(Self { send, driver })
+        }
+
+        /// Keep trying for `within`: the endpoint may be between runs.
+        async fn connect_within(
+            client: &quinn::Endpoint,
+            addr: SocketAddr,
+            within: std::time::Duration,
+        ) -> Self {
+            let deadline = std::time::Instant::now() + within;
+            loop {
+                let attempt = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    Self::connect(client, addr),
+                )
+                .await;
+                match attempt {
+                    Ok(Ok(c)) => return c,
+                    Ok(Err(e)) => assert!(
+                        std::time::Instant::now() < deadline,
+                        "no HTTP/3 connection: {e:#}"
+                    ),
+                    Err(_) => assert!(
+                        std::time::Instant::now() < deadline,
+                        "no HTTP/3 connection: handshake timed out"
+                    ),
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+
+        async fn get(&mut self, path: &str) -> StatusCode {
+            let req = http::Request::get(format!("https://panic-site.local{path}"))
+                .body(())
+                .unwrap();
+            let mut stream = self.send.send_request(req).await.unwrap();
+            stream.finish().await.unwrap();
+            let resp = stream.recv_response().await.unwrap();
+            while stream.recv_data().await.unwrap().is_some() {}
+            resp.status()
+        }
+    }
+
+    /// A panic in the accept loop used to cost HTTP/3 for the rest of the
+    /// process. The restarted loop bound a new endpoint, which failed with
+    /// EADDRINUSE while any connection of the old one was alive; the failure
+    /// was a normal return, so nothing retried, and handshakes to the old
+    /// socket stalled unaccepted. Now the restart accepts on the same socket.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises whole server runs; see proxy_state_lock
+    async fn a_panic_in_the_accept_loop_does_not_take_http3_down() {
+        use crate::panic_guard::testkit::*;
+        use sentinel_core::config::{Protocol, ProtocolSpec, TlsFileConfig};
+        use std::time::Duration;
+
+        let _serial = proxy_state_lock();
+        let (origin, hits) = counting_origin().await;
+        let listen = free_port();
+        let cert_dir = std::env::temp_dir().join(format!("sk-h3-panic-{}", uuid::Uuid::new_v4()));
+        let mut cfg = site_config(listen, origin, "panic-site", vec![]);
+        cfg.cert_dir = Some(cert_dir.clone());
+        cfg.listeners[0].tls = Some(TlsFileConfig {
+            ca: None,
+            cert: None,
+            key: None,
+            min_version: Default::default(),
+            post_quantum: Default::default(),
+        });
+        cfg.listeners[0].protocol = ProtocolSpec::Multiple(vec![Protocol::Http1, Protocol::Http3]);
+        let proxy = start_proxy(listen, config_handle(cfg)).await;
+
+        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut client_cfg = test_client_config();
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_idle_timeout(Some(Duration::from_secs(5).try_into().unwrap()));
+        transport.keep_alive_interval(Some(Duration::from_secs(1)));
+        client_cfg.transport_config(Arc::new(transport));
+        client.set_default_client_config(client_cfg);
+
+        // An established connection, kept open: it is what kept the old
+        // endpoint's socket bound.
+        let mut first = H3Client::connect_within(&client, listen, Duration::from_secs(20)).await;
+        assert_eq!(first.get("/one").await, StatusCode::OK);
+
+        // The next handshake panics the accept loop.
+        INJECT_ACCEPT_PANIC.store(true, Ordering::SeqCst);
+        let _ =
+            tokio::time::timeout(Duration::from_secs(3), H3Client::connect(&client, listen)).await;
+        assert!(
+            !INJECT_ACCEPT_PANIC.load(Ordering::SeqCst),
+            "the injected panic fired"
+        );
+
+        // After the restart, a new connection is accepted and served...
+        let mut fresh = H3Client::connect_within(&client, listen, Duration::from_secs(20)).await;
+        assert_eq!(fresh.get("/after-the-panic").await, StatusCode::OK);
+        // ...and the first connection was never affected.
+        assert_eq!(first.get("/one-again").await, StatusCode::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+
+        first.driver.abort();
+        fresh.driver.abort();
+        drop((first, fresh));
+        client.close(0u32.into(), b"done");
+        proxy.stop().await;
+        let _ = std::fs::remove_dir_all(&cert_dir);
     }
 
     /// The resolver-backed config path (Phase 1) produces a usable QUIC server
