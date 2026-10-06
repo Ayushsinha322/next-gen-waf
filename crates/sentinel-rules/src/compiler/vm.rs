@@ -1,3 +1,6 @@
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
 use sentinel_core::context::{Phase, RequestContext, RuleMatch, Severity, WafDecision};
 use tracing::{debug, warn};
 
@@ -283,35 +286,111 @@ fn contains_off_domain_url(value: &str, request_host: &str) -> bool {
     false
 }
 
+/// A body parameter's name, shared by every value filed under it.
+///
+/// One name can carry any number of values — each element of a JSON array,
+/// each text node of an XML element, each header line of a multipart part —
+/// and a `String` per value copied it that many times: a 48 KB JSON body (a
+/// 32 KB key over 8 K array elements) extracted 256 MB of names, and a 1 MB
+/// one would need about 128 GB, an allocation abort no panic guard catches.
+/// Shared, a repeat costs a reference count. Consumers that walk the names
+/// key on the allocation ([`name_id`]) so they, too, do the work once per
+/// name rather than once per value.
+type ArgName = Arc<str>;
+
+/// Identity of a shared name: the address of its text.
+fn name_id(name: &ArgName) -> usize {
+    name.as_ptr() as usize
+}
+
+/// The body's parameters cannot be listed within [`name_budget`].
+///
+/// Treated as a failure to inspect, never as an empty result: returning
+/// nothing would pass the body to the origin uninspected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BodyTooComplex;
+
+/// Why a request was refused for [`BodyTooComplex`].
+const BODY_TOO_COMPLEX: &str =
+    "request body could not be inspected: its JSON field names exceed the inspection limit";
+
+/// How many bytes of DISTINCT parameter names a body of `body_len` bytes may
+/// expand to: four times its size, plus 64 KiB so that a small, deeply nested
+/// document always fits.
+///
+/// Only JSON can exceed it. Its names are paths (`a.b.c`), so a long key over
+/// many distinct child keys spells itself out once per child: `{"<32 KB>":
+/// {"a0":0,"a1":0,…}}` is a quadratic expansion that repeats cannot explain
+/// and sharing cannot fix. An ordinary document stays far below: a name is at
+/// most as many keys long as the document is deep. For scale, ModSecurity's
+/// recommended configuration refuses any body with 1000 arguments or more.
+fn name_budget(body_len: usize) -> usize {
+    body_len.saturating_mul(4).saturating_add(64 * 1024)
+}
+
+/// The names one JSON body flattens to, built once each.
+struct JsonNames<'a> {
+    /// `(parent, key)` → the name `parent.key`. Keyed on the parent's
+    /// identity rather than its text, so meeting a name again — every object
+    /// in an array has the same keys — costs the key, not the whole path.
+    /// Holding every name here also keeps each parent's address unique for as
+    /// long as it is a key.
+    known: HashMap<(usize, &'a str), ArgName>,
+    /// Bytes of distinct names built so far, against `budget`.
+    built: usize,
+    budget: usize,
+}
+
+impl<'a> JsonNames<'a> {
+    fn child(&mut self, parent: &ArgName, key: &'a str) -> Result<ArgName, BodyTooComplex> {
+        if let Some(name) = self.known.get(&(name_id(parent), key)) {
+            return Ok(name.clone());
+        }
+        let name: ArgName = if parent.is_empty() {
+            key.into()
+        } else {
+            format!("{parent}.{key}").into()
+        };
+        self.built += name.len();
+        if self.built > self.budget {
+            return Err(BodyTooComplex);
+        }
+        self.known.insert((name_id(parent), key), name.clone());
+        Ok(name)
+    }
+}
+
 /// Recursively flatten a JSON value into ModSecurity-style `(name, value)`
 /// pairs.  Object keys become the parameter name; array elements inherit the
 /// parent name (matching ModSecurity's `ARGS:json.path` behaviour closely
 /// enough for detection).  Scalars are stringified; `null` is skipped.
-fn flatten_json(prefix: &str, val: &serde_json::Value, out: &mut Vec<(String, String)>) {
+fn flatten_json<'a>(
+    name: &ArgName,
+    val: &'a serde_json::Value,
+    names: &mut JsonNames<'a>,
+    out: &mut Vec<(ArgName, String)>,
+) -> Result<(), BodyTooComplex> {
     use serde_json::Value;
     match val {
         Value::Object(map) => {
             for (k, v) in map {
-                let key = if prefix.is_empty() {
-                    k.clone()
-                } else {
-                    format!("{prefix}.{k}")
-                };
-                flatten_json(&key, v, out);
+                let key = names.child(name, k)?;
+                flatten_json(&key, v, names, out)?;
             }
         }
         Value::Array(arr) => {
             for v in arr {
                 // Array elements share the parent name (ModSecurity treats
                 // repeated ARGS with the same name); keeps names meaningful.
-                flatten_json(prefix, v, out);
+                flatten_json(name, v, names, out)?;
             }
         }
-        Value::String(s) => out.push((prefix.to_owned(), s.clone())),
-        Value::Number(n) => out.push((prefix.to_owned(), n.to_string())),
-        Value::Bool(b) => out.push((prefix.to_owned(), b.to_string())),
+        Value::String(s) => out.push((name.clone(), s.clone())),
+        Value::Number(n) => out.push((name.clone(), n.to_string())),
+        Value::Bool(b) => out.push((name.clone(), b.to_string())),
         Value::Null => {}
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -324,7 +403,7 @@ struct MultipartParts {
     /// Non-file form fields: `(name, value)`.  These feed ARGS/ARGS_NAMES so
     /// injection delivered through a multipart form is inspected exactly like
     /// an `application/x-www-form-urlencoded` form.
-    fields: Vec<(String, String)>,
+    fields: Vec<(ArgName, String)>,
     /// Original client filenames (the `filename=` attribute). ModSec `FILES`.
     filenames: Vec<String>,
     /// Field names of file-upload parts (the `name=` attribute). ModSec
@@ -340,8 +419,9 @@ struct MultipartParts {
     /// because CRS 922 inspects these bytes directly: 922130 looks for bytes
     /// outside `\x21-\x7E` in a header name, so normalising here would erase the
     /// very anomaly it hunts for. `part_name` is the form-field name from
-    /// Content-Disposition, or empty when the part declares none.
-    part_headers: Vec<(String, String)>,
+    /// Content-Disposition, or empty when the part declares none — one shared
+    /// name per part, however many lines it has.
+    part_headers: Vec<(ArgName, String)>,
 }
 
 /// Locate the first occurrence of `needle` within `haystack`, in time linear
@@ -455,7 +535,7 @@ fn parse_one_part(part: &[u8], out: &mut MultipartParts) {
     // itself the smuggling trick rule 922130 exists to catch: keeping such a
     // line intact leaves the raw \n inside the value, where the rule's
     // out-of-range byte class matches it. Splitting on \n too would hide it.
-    let part_label = name.clone().unwrap_or_default();
+    let part_label: ArgName = name.as_deref().unwrap_or_default().into();
     for line in headers.split("\r\n") {
         if !line.is_empty() {
             out.part_headers.push((part_label.clone(), line.to_owned()));
@@ -472,9 +552,9 @@ fn parse_one_part(part: &[u8], out: &mut MultipartParts) {
         }
         // Otherwise it is a regular form field; its value feeds ARGS.
         None => {
-            if let Some(n) = name {
+            if name.is_some() {
                 out.fields
-                    .push((n, String::from_utf8_lossy(content).into_owned()));
+                    .push((part_label, String::from_utf8_lossy(content).into_owned()));
             }
         }
     }
@@ -512,24 +592,36 @@ fn disposition_param(line: &str, key: &str) -> Option<String> {
 /// (the common case for login/search forms and JSON APIs) are not missed.
 /// Supports `application/x-www-form-urlencoded` and `application/json`
 /// (including `+json` suffixes such as `application/vnd.api+json`).
-fn body_args(ctx: &RequestContext) -> Vec<(String, String)> {
+///
+/// A value's name is shared with every other value under the same name (see
+/// [`ArgName`]); the only error is a JSON body whose distinct names would
+/// exceed [`name_budget`].
+fn body_args(ctx: &RequestContext) -> Result<Vec<(ArgName, String)>, BodyTooComplex> {
     let Some(body) = ctx.request_body.as_ref() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let ct = content_type(ctx);
-    if ct.starts_with("application/x-www-form-urlencoded") {
+    Ok(if ct.starts_with("application/x-www-form-urlencoded") {
         let text = String::from_utf8_lossy(body);
         parse_query_params(&text)
+            .into_iter()
+            .map(|(k, v)| (k.into(), v))
+            .collect()
     } else if ct.starts_with("application/json") || ct.contains("+json") {
         match serde_json::from_slice::<serde_json::Value>(body) {
             Ok(val) => {
+                let mut names = JsonNames {
+                    known: HashMap::new(),
+                    built: 0,
+                    budget: name_budget(body.len()),
+                };
                 let mut out = Vec::new();
-                flatten_json("", &val, &mut out);
+                flatten_json(&ArgName::from(""), &val, &mut names, &mut out)?;
                 out
             }
             // Malformed JSON: fall back to scanning the raw body as one value
             // so obfuscated/broken payloads still reach the regex operators.
-            Err(_) => vec![(String::new(), String::from_utf8_lossy(body).into_owned())],
+            Err(_) => vec![("".into(), String::from_utf8_lossy(body).into_owned())],
         }
     } else if ct.starts_with("multipart/form-data") {
         // Non-file form fields feed ARGS exactly like a urlencoded form, so
@@ -543,7 +635,7 @@ fn body_args(ctx: &RequestContext) -> Vec<(String, String)> {
         parse_xml_args(body)
     } else {
         Vec::new()
-    }
+    })
 }
 
 /// True for XML and SOAP content types — `text/xml`, `application/xml`,
@@ -565,10 +657,14 @@ fn is_xml_content_type(ct: &str) -> bool {
 /// declarations, namespaces, and DTDs are ignored. Malformed input fails open
 /// (extracts what it can). Byte offsets only ever land on ASCII delimiters
 /// (`<`, `>`, `]]>`, …), so all `&str` slicing stays on char boundaries.
-fn parse_xml_args(body: &[u8]) -> Vec<(String, String)> {
+fn parse_xml_args(body: &[u8]) -> Vec<(ArgName, String)> {
     let text = String::from_utf8_lossy(body);
-    let mut out: Vec<(String, String)> = Vec::new();
-    let mut cur_elem = String::new();
+    let mut out: Vec<(ArgName, String)> = Vec::new();
+    // One name per tag, shared by every text node and CDATA section under it:
+    // a long element name over thousands of nodes (split apart by comments)
+    // is held once, not once per node.
+    let no_elem: ArgName = "".into();
+    let mut cur_elem = no_elem.clone();
     let bytes = text.as_bytes();
     let mut i = 0;
 
@@ -617,12 +713,12 @@ fn parse_xml_args(body: &[u8]) -> Vec<(String, String)> {
             i = i + 1 + rel + 1;
             if let Some(_close) = inner.strip_prefix('/') {
                 // Closing tag — the element's text context ends.
-                cur_elem.clear();
+                cur_elem = no_elem.clone();
             } else {
                 // Opening or self-closing tag: `name attr="v" .../`.
                 let body_str = inner.trim_end_matches('/').trim();
                 let name_end = body_str.find(char::is_whitespace).unwrap_or(body_str.len());
-                cur_elem = local_name(&body_str[..name_end]);
+                cur_elem = local_name(&body_str[..name_end]).into();
                 extract_xml_attributes(&body_str[name_end..], &mut out);
             }
         }
@@ -633,13 +729,13 @@ fn parse_xml_args(body: &[u8]) -> Vec<(String, String)> {
 
 /// The local part of a possibly namespace-prefixed XML name
 /// (`soap:Envelope` → `Envelope`).
-fn local_name(raw: &str) -> String {
-    raw.rsplit(':').next().unwrap_or(raw).to_owned()
+fn local_name(raw: &str) -> &str {
+    raw.rsplit(':').next().unwrap_or(raw)
 }
 
 /// Extract `name="value"` / `name='value'` attribute pairs from the portion of
 /// a start tag after the element name, decoding XML entities in each value.
-fn extract_xml_attributes(attrs: &str, out: &mut Vec<(String, String)>) {
+fn extract_xml_attributes(attrs: &str, out: &mut Vec<(ArgName, String)>) {
     let chars: Vec<char> = attrs.chars().collect();
     let n = chars.len();
     let mut i = 0;
@@ -672,7 +768,7 @@ fn extract_xml_attributes(attrs: &str, out: &mut Vec<(String, String)>) {
                     i += 1; // consume the closing quote
                 }
                 if !name.is_empty() {
-                    out.push((name, decode_xml_entities(&val)));
+                    out.push((name.into(), decode_xml_entities(&val)));
                 }
             }
         }
@@ -737,12 +833,15 @@ fn decode_xml_entities(s: &str) -> String {
 /// It is threaded in rather than read from `ctx` because it is VM state that
 /// lives for one rule: `TargetSpec::MatchedVar` is the only consumer, and
 /// resolving it anywhere else would silently yield nothing.
+///
+/// Fails only for a body that cannot be listed within budget
+/// ([`BodyTooComplex`]); the caller refuses the request.
 fn extract_target(
     spec: &TargetSpec,
     ctx: &RequestContext,
     last_matched: Option<&str>,
-) -> Vec<String> {
-    match spec {
+) -> Result<Vec<String>, BodyTooComplex> {
+    Ok(match spec {
         // Outside a chain nothing has matched yet, and an empty list is the
         // honest answer: the condition simply does not match.
         TargetSpec::MatchedVar => last_matched.map(|v| vec![v.to_owned()]).unwrap_or_default(),
@@ -752,7 +851,7 @@ fn extract_target(
                 .map(|(_, v)| v)
                 .collect();
             // ARGS also includes urlencoded / JSON POST body parameters.
-            values.extend(body_args(ctx).into_iter().map(|(_, v)| v));
+            values.extend(body_args(ctx)?.into_iter().map(|(_, v)| v));
             values
         }
         TargetSpec::ArgsNames => {
@@ -760,7 +859,17 @@ fn extract_target(
                 .into_iter()
                 .map(|(k, _)| k)
                 .collect();
-            names.extend(body_args(ctx).into_iter().map(|(k, _)| k));
+            // A body name shared by several values is listed once. Every
+            // operator gives the same verdict on the same text, and listing it
+            // per value copied it per value — the blow-up `ArgName` exists to
+            // prevent. `&ARGS_NAMES` still counts each one (see `CountOf`).
+            let body = body_args(ctx)?;
+            let mut listed = HashSet::new();
+            names.extend(
+                body.iter()
+                    .filter(|(k, _)| listed.insert(name_id(k)))
+                    .map(|(k, _)| k.to_string()),
+            );
             names
         }
         TargetSpec::RequestUri => vec![ctx.uri.to_string()],
@@ -847,7 +956,7 @@ fn extract_target(
         TargetSpec::RequestCookiesNames => {
             if let Some(cookie_hdr) = ctx.request_headers.get("cookie") {
                 if let Ok(s) = cookie_hdr.to_str() {
-                    return parse_cookies(s).into_iter().map(|(k, _)| k).collect();
+                    return Ok(parse_cookies(s).into_iter().map(|(k, _)| k).collect());
                 }
             }
             vec![]
@@ -879,7 +988,7 @@ fn extract_target(
         TargetSpec::RequestCookiesAll => {
             if let Some(cookie_hdr) = ctx.request_headers.get("cookie") {
                 if let Ok(s) = cookie_hdr.to_str() {
-                    return parse_cookies(s).into_iter().map(|(_, v)| v).collect();
+                    return Ok(parse_cookies(s).into_iter().map(|(_, v)| v).collect());
                 }
             }
             vec![]
@@ -887,11 +996,11 @@ fn extract_target(
         TargetSpec::RequestCookie(name) => {
             if let Some(cookie_hdr) = ctx.request_headers.get("cookie") {
                 if let Ok(s) = cookie_hdr.to_str() {
-                    return parse_cookies(s)
+                    return Ok(parse_cookies(s)
                         .into_iter()
                         .filter(|(k, _)| k == name)
                         .map(|(_, v)| v)
-                        .collect();
+                        .collect());
                 }
             }
             vec![]
@@ -940,12 +1049,12 @@ fn extract_target(
             // value. Counting values alone would under-report a request that
             // smuggles its payload into parameter names, which is exactly the
             // shape 920390 exists to bound.
-            let total: usize = parse_query_params(ctx.uri.query().unwrap_or(""))
+            let query: usize = parse_query_params(ctx.uri.query().unwrap_or(""))
                 .iter()
-                .chain(body_args(ctx).iter())
                 .map(|(k, v)| k.len() + v.len())
                 .sum();
-            vec![total.to_string()]
+            let body: usize = body_args(ctx)?.iter().map(|(k, v)| k.len() + v.len()).sum();
+            vec![(query + body).to_string()]
         }
         TargetSpec::RemoteAddr => vec![ctx.client_ip.to_string()],
         TargetSpec::Geo => vec![], // TODO: GeoIP in Phase 2
@@ -964,11 +1073,16 @@ fn extract_target(
                     .as_ref()
                     .map(|h| h.get_all(name.as_str()).iter().count())
                     .unwrap_or(0),
-                other => extract_target(other, ctx, last_matched).len(),
+                // Every name, repeats included: the list itself shows a shared
+                // body name once.
+                TargetSpec::ArgsNames => {
+                    parse_query_params(ctx.uri.query().unwrap_or("")).len() + body_args(ctx)?.len()
+                }
+                other => extract_target(other, ctx, last_matched)?.len(),
             };
             vec![count.to_string()]
         }
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1007,7 +1121,31 @@ fn collect_sensitive_values(ctx: &RequestContext) -> Vec<String> {
     // JWT that tripped libinjection was therefore written verbatim to waf.log,
     // to ClickHouse under a 90-day TTL, and out to the SIEM.
     let mut pairs: Vec<(String, String)> = query_pairs;
-    pairs.extend(body_args(ctx));
+    let mut sensitive = Vec::new();
+    match body_args(ctx) {
+        Ok(body) => {
+            // Judged once per distinct name: a shared name can carry thousands
+            // of values, and the check lowercases it each time.
+            let mut verdicts: HashMap<usize, bool> = HashMap::new();
+            for (name, value) in &body {
+                if !value.is_empty()
+                    && *verdicts
+                        .entry(name_id(name))
+                        .or_insert_with(|| is_sensitive_field_name(name))
+                {
+                    sensitive.push(value.clone());
+                }
+            }
+        }
+        // The body's fields cannot be listed, so which of them are secret is
+        // unknown: the whole body stands in for them. Over-redacting a body no
+        // one could take apart is the safe side of not knowing.
+        Err(BodyTooComplex) => {
+            if let Some(b) = ctx.request_body.as_ref() {
+                sensitive.push(String::from_utf8_lossy(b).into_owned());
+            }
+        }
+    }
 
     // Cookies are not collected here: EVERY cookie value is withheld at capture
     // (see `withheld_cookie_value`), whatever its name. Judging them by name let
@@ -1029,11 +1167,13 @@ fn collect_sensitive_values(ctx: &RequestContext) -> Vec<String> {
         }
     }
 
-    pairs
-        .into_iter()
-        .filter(|(name, value)| !value.is_empty() && is_sensitive_field_name(name))
-        .map(|(_, value)| value)
-        .collect()
+    sensitive.extend(
+        pairs
+            .into_iter()
+            .filter(|(name, value)| !value.is_empty() && is_sensitive_field_name(name))
+            .map(|(_, value)| value),
+    );
+    sensitive
 }
 
 /// True when `value` is the value of a sensitively-named request field.
@@ -1193,7 +1333,18 @@ pub fn evaluate(
                 // inspected exactly one target, and left empty otherwise.
                 targets_seen += 1;
                 last_target = Some(spec.label());
-                let values = extract_target(spec, ctx, last_matched.as_deref());
+                let values = match extract_target(spec, ctx, last_matched.as_deref()) {
+                    Ok(values) => values,
+                    // A body that cannot be listed is refused, not inspected
+                    // as empty: an empty list would pass it uninspected. In
+                    // learning mode the proxy turns this into a logged
+                    // would-block, like any other verdict.
+                    Err(BodyTooComplex) => {
+                        ctx.decision = WafDecision::Block;
+                        ctx.block_reason = Some(BODY_TOO_COMPLEX.to_string());
+                        return WafDecision::Block;
+                    }
+                };
                 stack.push(StackVal::Strings(values));
             }
 
@@ -2605,7 +2756,9 @@ fn pop_numeric_f64(stack: &mut Vec<StackVal>) -> f64 {
 /// Built once per LOGGED request, by the logger, from the same parsers the VM
 /// uses — never on the evaluation path, so detection cost is unchanged.
 pub struct RequestValues {
-    entries: Vec<(Collection, String, String)>,
+    /// `(collection, label, value)`. A label is shared by every value of one
+    /// body parameter, as its name is (see [`ArgName`]).
+    entries: Vec<(Collection, Arc<str>, String)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2642,21 +2795,33 @@ impl RequestValues {
     pub fn from_ctx(ctx: &RequestContext) -> Self {
         let mut entries = Vec::new();
         for (k, v) in parse_query_params(ctx.uri.query().unwrap_or("")) {
-            entries.push((Collection::ArgsNames, format!("ARGS_NAMES:{k}"), k.clone()));
-            entries.push((Collection::ArgsGet, format!("ARGS:{k}"), v));
+            entries.push((
+                Collection::ArgsNames,
+                format!("ARGS_NAMES:{k}").into(),
+                k.clone(),
+            ));
+            entries.push((Collection::ArgsGet, format!("ARGS:{k}").into(), v));
         }
-        let body = body_args(ctx);
+        // A body that cannot be listed within budget is listed raw, below.
+        let body = body_args(ctx).unwrap_or_default();
         let body_parsed = !body.is_empty();
-        for (k, v) in body {
-            if !k.is_empty() {
-                entries.push((Collection::ArgsNames, format!("ARGS_NAMES:{k}"), k.clone()));
-            }
-            let label = if k.is_empty() {
-                "REQUEST_BODY".to_string()
-            } else {
-                format!("ARGS:{k}")
-            };
-            entries.push((Collection::ArgsPost, label, v));
+        // Each distinct name is labelled — and listed under ARGS_NAMES — once,
+        // its values sharing the label: formatting it per value copied a name
+        // as many times as it had values.
+        let mut labels: HashMap<usize, Arc<str>> = HashMap::new();
+        for (k, v) in &body {
+            let label = labels.entry(name_id(k)).or_insert_with(|| {
+                if k.is_empty() {
+                    return "REQUEST_BODY".into();
+                }
+                entries.push((
+                    Collection::ArgsNames,
+                    format!("ARGS_NAMES:{k}").into(),
+                    k.to_string(),
+                ));
+                format!("ARGS:{k}").into()
+            });
+            entries.push((Collection::ArgsPost, label.clone(), v.clone()));
         }
         if let Some(c) = ctx
             .request_headers
@@ -2664,21 +2829,25 @@ impl RequestValues {
             .and_then(|v| v.to_str().ok())
         {
             for (k, v) in parse_cookies(c) {
-                entries.push((Collection::Cookies, format!("REQUEST_COOKIES:{k}"), v));
+                entries.push((
+                    Collection::Cookies,
+                    format!("REQUEST_COOKIES:{k}").into(),
+                    v,
+                ));
             }
         }
         for (name, value) in ctx.request_headers.iter() {
             if let Ok(v) = value.to_str() {
                 entries.push((
                     Collection::Headers,
-                    format!("REQUEST_HEADERS:{}", name.as_str()),
+                    format!("REQUEST_HEADERS:{}", name.as_str()).into(),
                     v.to_owned(),
                 ));
             }
         }
         entries.push((
             Collection::Filename,
-            "REQUEST_FILENAME".to_string(),
+            "REQUEST_FILENAME".into(),
             percent_decode(ctx.uri.path()),
         ));
         // The raw body only when no parser claimed it: a parsed body is already
@@ -2688,7 +2857,7 @@ impl RequestValues {
             if let Some(b) = ctx.request_body.as_ref() {
                 entries.push((
                     Collection::Body,
-                    "REQUEST_BODY".to_string(),
+                    "REQUEST_BODY".into(),
                     String::from_utf8_lossy(b).into_owned(),
                 ));
             }
@@ -2737,26 +2906,31 @@ impl RequestValues {
             _ => return None,
         };
         let multi = rule_target.is_empty();
-        let mut found: Option<&str> = None;
+        let mut found: Option<&Arc<str>> = None;
         for (coll, label, value) in &self.entries {
             if !allowed.contains(coll) {
                 continue;
             }
             if multi
                 && *coll == Collection::Headers
-                && (label == "REQUEST_HEADERS:cookie" || label == "REQUEST_HEADERS:referer")
+                && matches!(
+                    &**label,
+                    "REQUEST_HEADERS:cookie" | "REQUEST_HEADERS:referer"
+                )
             {
                 continue;
             }
             if normalize_for_locate(value).contains(&needle) {
                 match found {
-                    None => found = Some(label.as_str()),
-                    Some(prev) if prev == label.as_str() => {}
+                    None => found = Some(label),
+                    // Another value of the same parameter: one shared label,
+                    // compared by identity before text.
+                    Some(prev) if Arc::ptr_eq(prev, label) || prev == label => {}
                     Some(_) => return None, // two places — not certain
                 }
             }
         }
-        found.map(str::to_string)
+        found.map(|label| label.to_string())
     }
 }
 
@@ -2992,12 +3166,14 @@ mod xml_tests {
         let body = br#"<order id="42"><item cat="books">' OR 1=1--</item></order>"#;
         let pairs = parse_xml_args(body);
         assert!(
-            pairs.iter().any(|(k, v)| k == "id" && v == "42"),
+            pairs.iter().any(|(k, v)| &**k == "id" && v == "42"),
             "attribute value must be surfaced: {pairs:?}"
         );
-        assert!(pairs.iter().any(|(k, v)| k == "cat" && v == "books"));
+        assert!(pairs.iter().any(|(k, v)| &**k == "cat" && v == "books"));
         assert!(
-            pairs.iter().any(|(k, v)| k == "item" && v == "' OR 1=1--"),
+            pairs
+                .iter()
+                .any(|(k, v)| &**k == "item" && v == "' OR 1=1--"),
             "element text keyed by local element name: {pairs:?}"
         );
     }
@@ -3024,7 +3200,7 @@ mod xml_tests {
         assert!(
             pairs
                 .iter()
-                .any(|(k, v)| k == "q" && v == "select * from users"),
+                .any(|(k, v)| &**k == "q" && v == "select * from users"),
             "namespace prefix stripped to local name: {pairs:?}"
         );
     }
@@ -3033,7 +3209,7 @@ mod xml_tests {
     fn xml_ignores_comments_pi_and_doctype() {
         let body = br#"<?xml version="1.0"?><!DOCTYPE x><!-- <injected> --><root>data</root>"#;
         let pairs = parse_xml_args(body);
-        assert!(pairs.iter().any(|(k, v)| k == "root" && v == "data"));
+        assert!(pairs.iter().any(|(k, v)| &**k == "root" && v == "data"));
         assert!(
             !pairs.iter().any(|(_, v)| v.contains("injected")),
             "comment content must not leak into ARGS: {pairs:?}"
@@ -3054,7 +3230,7 @@ mod xml_tests {
         // Unterminated tag / truncated body must not panic and should still
         // surface whatever text it can.
         let pairs = parse_xml_args(b"<a>hello");
-        assert!(pairs.iter().any(|(k, v)| k == "a" && v == "hello"));
+        assert!(pairs.iter().any(|(k, v)| &**k == "a" && v == "hello"));
         let _ = parse_xml_args(b"<a href=\"unterminated");
         let _ = parse_xml_args(b"<![CDATA[unterminated");
     }
@@ -3196,12 +3372,19 @@ mod transform_tests {
     /// a channel rather than joining means a quadratic regression fails in
     /// seconds instead of hanging the suite until it completes.
     fn finishes_in_time(f: impl FnOnce() + Send + 'static) -> bool {
+        within(BOUND, f).is_some()
+    }
+
+    /// `f`'s result, if it arrives within `bound`.
+    fn within<T: Send + 'static>(
+        bound: Duration,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            f();
-            let _ = tx.send(());
+            let _ = tx.send(f());
         });
-        rx.recv_timeout(BOUND).is_ok()
+        rx.recv_timeout(bound).ok()
     }
 
     /// Every `Transform` variant, read off the type itself: asked for a
@@ -3466,6 +3649,8 @@ mod transform_tests {
         }
     }
 
+    // -- Body extraction: names repeated per value ---------------------------
+
     /// A request whose body is `body`, sent as `content_type`.
     fn body_ctx(content_type: &str, body: Vec<u8>) -> RequestContext {
         let mut ctx = RequestContext::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 1);
@@ -3474,6 +3659,222 @@ mod transform_tests {
             .insert("content-type", content_type.parse().unwrap());
         ctx.request_body = Some(body.into());
         ctx
+    }
+
+    /// The body's `(name, value)` pairs, for a body within budget.
+    fn args(ctx: &RequestContext) -> Vec<(ArgName, String)> {
+        body_args(ctx).expect("within the name budget")
+    }
+
+    /// Bytes of name text actually held: each allocation once, however many
+    /// values share it. A name copied per value counts once per copy.
+    fn name_bytes<'a, N: AsRef<str> + 'a>(names: impl IntoIterator<Item = &'a N>) -> usize {
+        let mut seen = HashSet::new();
+        names
+            .into_iter()
+            .map(|n| n.as_ref())
+            .filter(|n| seen.insert(n.as_ptr() as usize))
+            .map(str::len)
+            .sum()
+    }
+
+    /// Bodies about `size` bytes long in which ONE name carries many values:
+    /// half the body is the name, half the values under it.
+    fn shared_name_bodies(size: usize) -> Vec<(&'static str, &'static str, Vec<u8>)> {
+        let half = size / 2;
+        let key = "k".repeat(half);
+        let multipart = format!(
+            "--B\r\nContent-Disposition: form-data; name=\"{key}\"\r\n{}\r\nv\r\n--B--\r\n",
+            "X: y\r\n".repeat(half / 6)
+        );
+        vec![
+            (
+                "JSON array",
+                "application/json",
+                format!("{{\"{key}\":[{}0]}}", "0,".repeat(half / 2)),
+            ),
+            (
+                "JSON objects in an array",
+                "application/json",
+                format!("{{\"{key}\":[{}{{}}]}}", "{\"a\":0},".repeat(half / 8)),
+            ),
+            (
+                "XML text between comments",
+                "application/xml",
+                format!("<{key}>{}", "x<!---->".repeat(half / 8)),
+            ),
+            (
+                "XML CDATA sections",
+                "text/xml",
+                format!("<{key}>{}", "<![CDATA[x]]>".repeat(half / 13)),
+            ),
+            (
+                "multipart header lines",
+                "multipart/form-data; boundary=B",
+                multipart,
+            ),
+        ]
+        .into_iter()
+        .map(|(what, ct, body)| (what, ct, body.into_bytes()))
+        .collect()
+    }
+
+    /// Every extractor and every consumer that walks the names, on one body:
+    /// the name bytes each one holds.
+    fn names_held(ct: &str, body: Vec<u8>) -> [usize; 4] {
+        let ctx = body_ctx(ct, body);
+        let pairs = args(&ctx);
+        let part_headers = multipart_parts(&ctx).part_headers;
+        let listed = extract_target(&TargetSpec::ArgsNames, &ctx, None).unwrap();
+        let values = RequestValues::from_ctx(&ctx);
+        drop(collect_sensitive_values(&ctx));
+        [
+            name_bytes(pairs.iter().map(|(k, _)| k)),
+            name_bytes(part_headers.iter().map(|(k, _)| k)),
+            name_bytes(listed.iter()),
+            name_bytes(values.entries.iter().map(|(_, label, _)| label))
+                + name_bytes(values.entries.iter().map(|(_, _, v)| v)),
+        ]
+    }
+
+    /// A name used to be copied once per value it carried — by the JSON, XML
+    /// and multipart extractors and again by ARGS_NAMES, the match locator and
+    /// the redaction pass — so a body made of one long name and many short
+    /// values held name bytes in proportion to their PRODUCT: 256 MB from a
+    /// 48 KB JSON body, about 128 GB from 1 MB, an allocation abort that
+    /// panic isolation cannot catch.
+    #[test]
+    fn a_name_shared_by_many_values_is_held_once() {
+        // 16 KB first: small enough that the per-value copies stay in the tens
+        // of megabytes, so the old code fails here instead of exhausting memory
+        // on the megabyte below.
+        for size in [16 * 1024, MB] {
+            for (what, ct, body) in shared_name_bodies(size) {
+                let len = body.len();
+                // Five extractions of the same body (~0.5 s for a megabyte
+                // here), hence five bounds.
+                let bound = 5 * BOUND;
+                let held = within(bound, move || names_held(ct, body))
+                    .unwrap_or_else(|| panic!("{what}: over {bound:?} on {len} bytes"));
+                // Values and the raw body are listed too; names alone stay
+                // within a couple of body lengths.
+                for (n, bytes) in held.into_iter().enumerate() {
+                    assert!(
+                        bytes <= 2 * len,
+                        "{what} ({len} bytes): consumer {n} held {bytes} bytes of names"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Sharing cannot help when every name is DIFFERENT: a JSON key spelled out
+    /// again as the prefix of each of its many child keys. Listing them all
+    /// grows with the square of the body, and listing only some would pass
+    /// the rest uninspected, so the body is refused instead.
+    #[test]
+    fn json_names_past_the_budget_refuse_the_request() {
+        let distinct_children = |size: usize| {
+            let key = "k".repeat(size / 2);
+            let kids: Vec<String> = (0..size / 20).map(|i| format!("\"a{i}\":0")).collect();
+            format!("{{\"{key}\":{{{}}}}}", kids.join(",")).into_bytes()
+        };
+        for size in [16 * 1024, MB] {
+            let body = distinct_children(size);
+            let len = body.len();
+            let over = within(BOUND, move || {
+                let ctx = body_ctx("application/json", body);
+                match body_args(&ctx) {
+                    Err(BodyTooComplex) => None,
+                    Ok(pairs) => Some(name_bytes(pairs.iter().map(|(k, _)| k))),
+                }
+            })
+            .unwrap_or_else(|| panic!("over {BOUND:?} on {len} bytes"));
+            assert_eq!(
+                over, None,
+                "{len}-byte body extracted names past the budget"
+            );
+        }
+
+        // The engine refuses it; in learning mode the proxy logs that as a
+        // would-block, as it does every Block.
+        let engine = crate::RuleEngine::from_crs_conf(
+            "SecRule ARGS \"@rx never-present\" \"id:1,phase:2,deny\"",
+        )
+        .unwrap();
+        let mut ctx = body_ctx("application/json", distinct_children(64 * 1024));
+        let decision = engine.evaluate(&mut ctx, Phase::RequestBody, 0);
+        assert_eq!(decision, WafDecision::Block);
+        assert_eq!(ctx.block_reason.as_deref(), Some(BODY_TOO_COMPLEX));
+
+        // A deep, ordinary document is nowhere near the limit: five levels of
+        // ordinary keys over 500 objects, 1,500 distinct leaves.
+        let services: Vec<String> = (0..500)
+            .map(|i| format!("\"svc{i}\":{{\"replicas\":2,\"image\":\"app:1.4\",\"port\":8080}}"))
+            .collect();
+        let doc = format!(
+            "{{\"application\":{{\"environment\":{{\"production\":{{\"services\":{{{}}}}}}}}}}}",
+            services.join(",")
+        );
+        let mut ctx = body_ctx("application/json", doc.into_bytes());
+        let pairs = args(&ctx);
+        assert_eq!(pairs.len(), 1500);
+        assert!(pairs.iter().any(|(k, v)| &**k
+            == "application.environment.production.services.svc499.port"
+            && v == "8080"));
+        assert_eq!(
+            engine.evaluate(&mut ctx, Phase::RequestBody, 0),
+            WafDecision::Allow
+        );
+    }
+
+    /// What sharing changes, and what it must not.
+    #[test]
+    fn a_shared_name_is_listed_once_and_counted_every_time() {
+        let mut ctx = body_ctx(
+            "application/json",
+            br#"{"a":["v1","v2","v3"],"b":{"c":"x"},"password":["s3cret-one","s3cret-two"]}"#
+                .to_vec(),
+        );
+        ctx.uri = "/submit?q=1&q=2".parse().unwrap();
+        let target = |spec: TargetSpec| extract_target(&spec, &ctx, None).unwrap();
+
+        // A repeated QUERY name is still listed per value; a shared body name
+        // once — the same verdict for any operator, and no copy per value.
+        assert_eq!(
+            target(TargetSpec::ArgsNames),
+            ["q", "q", "a", "b.c", "password"]
+        );
+        // Counts are of names as sent, repeats included, as before.
+        assert_eq!(
+            target(TargetSpec::CountOf(Box::new(TargetSpec::ArgsNames))),
+            ["8"]
+        );
+        assert_eq!(
+            target(TargetSpec::CountOf(Box::new(TargetSpec::Args))),
+            ["8"]
+        );
+        // q1 q2: 4; a v1 v2 v3: 9; b.c x: 4; password ×2: 2 × (8 + 10) = 36.
+        assert_eq!(target(TargetSpec::ArgsCombinedSize), ["53"]);
+
+        // Every value of a sensitive name is withheld, not only the first.
+        let sensitive = collect_sensitive_values(&ctx);
+        assert!(
+            sensitive.contains(&"s3cret-one".to_string()),
+            "{sensitive:?}"
+        );
+        assert!(
+            sensitive.contains(&"s3cret-two".to_string()),
+            "{sensitive:?}"
+        );
+
+        // Values sharing a label are one place, not an ambiguity.
+        let values = RequestValues::from_ctx(&ctx);
+        assert_eq!(values.locate("ARGS", "v").as_deref(), Some("ARGS:a"));
+        assert_eq!(
+            values.locate("ARGS_NAMES", "b.c").as_deref(),
+            Some("ARGS_NAMES:b.c")
+        );
     }
 
     /// The boundary comes from Content-Type, with no length limit, and was
