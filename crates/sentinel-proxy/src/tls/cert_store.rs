@@ -882,7 +882,11 @@ impl CertStore {
     /// Revert the management cert to the built-in self-signed default (removes
     /// the uploaded management cert from disk + the live store).
     pub fn revert_management(&self) -> Result<()> {
-        self.remove(MANAGEMENT_CERT_KEY)
+        self.remove(MANAGEMENT_CERT_KEY)?;
+        // The console listener only looks its cert up, so its shared self-signed
+        // cert is restored here; otherwise it would serve the default cert.
+        let _ = self.self_signed_shared(MANAGEMENT_CERT_KEY);
+        Ok(())
     }
 
     // ── TLS-ALPN-01 challenge helpers ─────────────────────────────────────────
@@ -1298,9 +1302,13 @@ mod tests {
             .unwrap();
         assert_eq!(prev2, Some("fp1".to_string()));
 
-        // Revert removes it → resolver falls back to self-signed.
+        // Revert removes it → back on the shared self-signed management cert,
+        // which the Management TLS page reports as self-signed.
         store.revert_management().unwrap();
-        assert!(store.get_meta(MANAGEMENT_CERT_KEY).is_none());
+        assert_eq!(
+            store.get_meta(MANAGEMENT_CERT_KEY).map(|m| m.source),
+            Some(CertSource::SelfSigned)
+        );
     }
 
     #[test]
@@ -1920,20 +1928,24 @@ mod tests {
         }
         assert_eq!(count_entries(&dir), entries);
 
-        // An uploaded cert is served at once; after a revert the listener falls
-        // to the default cert rather than minting in the handshake.
+        // An uploaded cert is served at once. A revert restores the console's
+        // own persisted self-signed cert in the store call itself — not the
+        // default cert, and not minted later in a handshake.
+        let minted = pem_leaf(&mgmt_file);
         let (cert, key) = self_signed_pem("console.example.com");
         store.install_management(&cert, &key, meta("fp")).unwrap();
         let uploaded = handshake(&resolver, None);
-        assert_ne!(
-            uploaded,
-            pem_leaf(&dir.join(DEFAULT_CERT_KEY).join("cert.pem"))
-        );
+        assert_ne!(uploaded, minted);
         store.revert_management().unwrap();
-        assert_eq!(
-            handshake(&resolver, None),
+        let reverted = pem_leaf(&mgmt_file);
+        let entries = count_entries(&dir);
+        assert_ne!(reverted, uploaded);
+        assert_ne!(
+            reverted,
             pem_leaf(&dir.join(DEFAULT_CERT_KEY).join("cert.pem"))
         );
+        assert_eq!(handshake(&resolver, Some("x.example.net")), reverted);
+        assert_eq!(count_entries(&dir), entries);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

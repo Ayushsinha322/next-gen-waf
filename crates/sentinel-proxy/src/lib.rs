@@ -7955,15 +7955,7 @@ async fn handle_internal_mgmt_tls_api(
 
     if method == hyper::Method::DELETE {
         return match state.cert_manager.store.revert_management() {
-            Ok(()) => {
-                // Restore the console's own shared self-signed cert here: the
-                // resolver only looks certs up and would serve the default one.
-                let _ = state
-                    .cert_manager
-                    .store
-                    .self_signed_shared(tls::MANAGEMENT_CERT_KEY);
-                json_ok(serde_json::json!({"reverted": true}))
-            }
+            Ok(()) => json_ok(serde_json::json!({"reverted": true})),
             Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}")),
         };
     }
