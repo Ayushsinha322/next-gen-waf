@@ -1298,26 +1298,14 @@ impl ProxyServer {
         let http01_tokens = Arc::clone(&cert_manager.http01_tokens);
 
         // Trigger initial ACME issuance for any site that has tls.mode = acme
-        // but no cert on disk yet.
-        for site in &cfg.sites {
-            if site.tls.mode == sentinel_core::config::TlsCertMode::Acme {
-                if let Some(acme_cfg) = &site.tls.acme {
-                    let has_all = site
-                        .domains
-                        .iter()
-                        .all(|d| cert_manager.store.get_meta(d).is_some());
-                    if !has_all {
-                        let cm = Arc::clone(&cert_manager);
-                        let domains = site.domains.clone();
-                        let acme = acme_cfg.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = cm.issue_acme(domains.clone(), &acme).await {
-                                warn!(?domains, "initial ACME issuance failed: {e:#}");
-                            }
-                        });
-                    }
+        // but no cert on disk yet — for the names a CA can issue for only.
+        for (domains, acme) in tls::renewal::initial_orders(&cfg.sites, &cert_manager.store) {
+            let cm = Arc::clone(&cert_manager);
+            tokio::spawn(async move {
+                if let Err(e) = cm.issue_acme(domains.clone(), &acme).await {
+                    warn!(?domains, "initial ACME issuance failed: {e:#}");
                 }
-            }
+            });
         }
 
         // Renewal background task (checks every hour).

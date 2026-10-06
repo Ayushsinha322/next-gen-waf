@@ -6,9 +6,10 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sentinel_core::config::{ConfigHandle, SiteAcmeConfig, TlsCertMode};
+use sentinel_core::config::{ConfigHandle, SiteAcmeConfig, SiteConfig, TlsCertMode};
 
 use super::acme::CertManager;
+use super::cert_store::CertStore;
 
 const CHECK_INTERVAL: Duration = Duration::from_secs(3_600); // 1 hour
 
@@ -65,11 +66,40 @@ fn is_acme_eligible(domain: &str) -> bool {
 }
 
 /// The subset of a site's domains worth sending to a CA.
-fn acme_domains(domains: &[String]) -> Vec<String> {
+pub(crate) fn acme_domains(domains: &[String]) -> Vec<String> {
     domains
         .iter()
         .filter(|d| is_acme_eligible(d))
         .cloned()
+        .collect()
+}
+
+/// The ACME orders to place at startup: for each ACME site, its orderable names
+/// (see `acme_domains`), when any of them has no issued certificate yet. A site
+/// with none is left to the renewal loop, which reports it.
+///
+/// Filtered like renewal, for the same reason: one alias in the order makes the
+/// CA reject all of it. Unfiltered, an alias with no cert (`juice`, `localhost`)
+/// sent a doomed order at every boot on every node — once a self-signed cert
+/// stopped counting as issued, nothing could ever cover it.
+pub(crate) fn initial_orders(
+    sites: &[SiteConfig],
+    store: &CertStore,
+) -> Vec<(Vec<String>, SiteAcmeConfig)> {
+    sites
+        .iter()
+        .filter_map(|site| {
+            let acme = site
+                .tls
+                .acme
+                .as_ref()
+                .filter(|_| site.tls.mode == TlsCertMode::Acme)?;
+            let orderable = acme_domains(&site.domains);
+            orderable
+                .iter()
+                .any(|d| store.get_meta(d).is_none())
+                .then(|| (orderable, acme.clone()))
+        })
         .collect()
 }
 
@@ -221,5 +251,68 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         assert!(acme_domains(&domains).is_empty());
+    }
+
+    fn acme_site(id: &str, domains: &[&str]) -> SiteConfig {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "domains": domains,
+            "upstream": { "servers": [] },
+            "tls": {
+                "mode": "acme",
+                "acme": { "email": "ops@example.org" },
+            },
+        }))
+        .expect("site config")
+    }
+
+    /// The startup order is filtered like renewal. Unfiltered, a site whose
+    /// real name was already issued still ordered at every boot because an alias
+    /// (`juice`, `localhost`) had no cert — and the CA rejected the whole order.
+    #[test]
+    fn startup_orders_only_issuable_names_and_only_when_one_is_missing() {
+        let dir =
+            std::env::temp_dir().join(format!("sentinel-renewal-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = CertStore::new(dir.clone());
+        let cert = rcgen::generate_simple_self_signed(vec!["shop.example.org".into()]).unwrap();
+        let meta = super::super::CertMeta {
+            domain: "shop.example.org".into(),
+            name: String::new(),
+            san: vec!["shop.example.org".into()],
+            issued_at: 1,
+            expires_at: u64::MAX / 2,
+            fingerprint: "fp".into(),
+            source: super::super::CertSource::Acme {
+                provider: "LetsEncrypt".into(),
+                email: "ops@example.org".into(),
+            },
+            issuer: String::new(),
+            key_type: String::new(),
+        };
+        store
+            .install(
+                "shop.example.org",
+                &cert.serialize_pem().unwrap(),
+                &cert.serialize_private_key_pem(),
+                meta,
+            )
+            .unwrap();
+
+        // ACME settings present, but the site is not in ACME mode.
+        let mut plain = acme_site("plain", &["plain.example.org"]);
+        plain.tls.mode = TlsCertMode::SelfSigned;
+        let sites = vec![
+            acme_site("issued", &["shop.example.org", "juice", "localhost"]),
+            acme_site("aliases", &["intranet", "10.0.0.5", "box.local"]),
+            acme_site("new", &["new.example.org", "juice"]),
+            plain,
+        ];
+        let orders: Vec<Vec<String>> = initial_orders(&sites, &store)
+            .into_iter()
+            .map(|(domains, _)| domains)
+            .collect();
+        assert_eq!(orders, vec![vec!["new.example.org".to_string()]]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
