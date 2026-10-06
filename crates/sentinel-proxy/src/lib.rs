@@ -966,17 +966,21 @@ impl ProxyServer {
 
         let feed_cache: FeedCache = Arc::new(ArcSwap::new(Arc::new(Vec::new())));
 
-        // Connect storage backends (Redis for distributed rate limiting,
-        // ClickHouse for traffic history).  Missing/unreachable backends
-        // degrade gracefully — the rate limiter falls back to in-memory.
-        // File config first, then SENTINEL_CLICKHOUSE_*/SENTINEL_REDIS_URL env
-        // overlay so the data plane is configured identically to the Go control
-        // plane (same Secret in compose/K8s; no CH password in the proxy YAML).
+        // Storage backends (Valkey for distributed rate limiting, ClickHouse for
+        // traffic history). File config first, then SENTINEL_CLICKHOUSE_*/
+        // SENTINEL_REDIS_URL env overlay so the data plane is configured
+        // identically to the Go control plane (same Secret in compose/K8s; no CH
+        // password in the proxy YAML).
+        //
+        // Both connect in the BACKGROUND (Valkey below, once the limiter exists;
+        // ClickHouse in the history writer) and keep retrying. Awaiting them here
+        // held every listener back until they answered — forever for one that
+        // accepts TCP and never replies — and a backend down at boot stayed
+        // unused for the life of the process.
         let storage_backend_cfg =
             sentinel_storage::StorageBackendConfig::from_core(&cfg.storage).with_env_overrides();
-        let storage = sentinel_storage::StorageHandle::connect(&storage_backend_cfg).await;
-        if storage.has_redis() {
-            info!("rate limiting: distributed mode (Redis backend active)");
+        if storage_backend_cfg.redis_url.is_some() {
+            info!("rate limiting: Valkey configured — connecting in the background; in-memory limiter until it answers");
         } else {
             info!("rate limiting: in-memory mode (no Redis backend)");
         }
@@ -1015,12 +1019,17 @@ impl ProxyServer {
         // Before the spool existed this flag meant "connected", which is exactly
         // why a node with no reachable ClickHouse recorded nothing at all.
         if storage_backend_cfg.clickhouse_url.is_some() {
-            let initial = storage.clickhouse.clone();
             HISTORY_SINK_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
             let spool = open_history_spool();
             let ch_cfg = storage_backend_cfg.clone();
             tokio::spawn(async move {
-                let mut ch: Option<std::sync::Arc<sentinel_storage::ClickHouseClient>> = initial;
+                // No client yet: the first tick (immediate) connects, so boot
+                // never waits on ClickHouse.
+                let mut ch: Option<std::sync::Arc<sentinel_storage::ClickHouseClient>> = None;
+                let mut backoff = sentinel_storage::Backoff::new(
+                    std::time::Duration::from_secs(2),
+                    std::time::Duration::from_secs(60),
+                );
                 let mut buf: Vec<sentinel_storage::TrafficRow> = Vec::new();
                 let mut evbuf: Vec<sentinel_storage::WafEventRow> = Vec::new();
                 let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -1067,21 +1076,26 @@ impl ProxyServer {
                                     ch_cfg.clickhouse_password.clone(),
                                 );
                                 match client.ping().await {
-                                    Ok(()) => {
-                                        match client.ensure_schema().await {
-                                            Ok(()) => {
-                                                info!(url, database = db, "clickhouse connected — waf history writer enabled");
-                                                ch = Some(std::sync::Arc::new(client));
-                                            }
-                                            Err(e) => {
-                                                warn!(error = %e, "clickhouse reachable but schema init failed — retrying in 10s");
-                                                reconnect_in = 10;
-                                            }
+                                    Ok(()) => match client.ensure_schema().await {
+                                        Ok(()) => {
+                                            info!(
+                                                url,
+                                                database = db,
+                                                "clickhouse connected — waf history writer enabled"
+                                            );
+                                            ch = Some(std::sync::Arc::new(client));
+                                            backoff.reset();
+                                            CLICKHOUSE_CONNECTED
+                                                .store(true, std::sync::atomic::Ordering::Relaxed);
                                         }
-                                    }
+                                        Err(e) => {
+                                            reconnect_in = backoff.next_delay().as_secs() as u32;
+                                            warn!(error = %e, retry_in_secs = reconnect_in, "clickhouse reachable but schema init failed — retrying");
+                                        }
+                                    },
                                     Err(e) => {
-                                        warn!(error = %e, "clickhouse unreachable — spooling waf history to disk, retrying in 10s");
-                                        reconnect_in = 10;
+                                        reconnect_in = backoff.next_delay().as_secs() as u32;
+                                        warn!(error = %e, retry_in_secs = reconnect_in, "clickhouse unreachable — spooling waf history to disk, retrying");
                                     }
                                 }
                             }
@@ -1152,7 +1166,8 @@ impl ProxyServer {
                             buf.clear();
                             evbuf.clear();
                             ch = None;
-                            reconnect_in = 5;
+                            CLICKHOUSE_CONNECTED.store(false, std::sync::atomic::Ordering::Relaxed);
+                            reconnect_in = backoff.next_delay().as_secs() as u32;
                         }
                     } else if ticks_disconnected >= SPOOL_FLUSH_TICKS
                         || buf.len() >= 500
@@ -1212,7 +1227,11 @@ impl ProxyServer {
         let modules = Arc::new(ModulesState {
             ip_rep: ArcSwap::new(Arc::new(build_ip_reputation(&cfg, &[]))),
             ip_rep_sites: ArcSwap::new(Arc::new(build_site_ip_reputation(&cfg))),
-            rate_limiter: RateLimiter::with_redis(storage.redis.clone()),
+            rate_limiter: if storage_backend_cfg.redis_url.is_some() {
+                RateLimiter::distributed(sentinel_modules::DistributedGuard::from_env())
+            } else {
+                RateLimiter::new()
+            },
             bot_detector: ArcSwap::new(Arc::new(BotDetector::new())),
             goodbot: goodbot::GoodBotVerifier::new(),
             geoip_map: ArcSwap::new(Arc::new(build_geoip_map(&cfg))),
@@ -1222,6 +1241,22 @@ impl ProxyServer {
             threat_intel: ArcSwap::new(Arc::new(ThreatFeed::empty())),
             jwks: jwks::JwksCache::new(),
         });
+
+        // Valkey connects in the background, retrying until it answers, and is
+        // bound into the limiter then; until that moment rate checks use the
+        // in-memory limiter. /healthz storage.valkey shows which.
+        if let Some(url) = storage_backend_cfg.redis_url.clone() {
+            let modules_ref = Arc::clone(&modules);
+            tokio::spawn(async move {
+                let client = sentinel_storage::RedisClient::connect_with_retry(
+                    &url,
+                    sentinel_storage::Backoff::new(Duration::from_secs(1), Duration::from_secs(30)),
+                )
+                .await;
+                modules_ref.rate_limiter.bind_redis(Arc::new(client));
+                info!("rate limiting: distributed mode (Valkey backend connected)");
+            });
+        }
 
         let (plugin_runtime, manifest_plugins) = build_plugin_runtime(&cfg).unwrap_or_else(|e| {
             warn!("failed to load plugins: {e:#}");
@@ -2852,7 +2887,7 @@ async fn handle_request(
     // this is internal-only (no auth) and expected to be network-restricted;
     // it is served on every listener, including the management endpoint.
     if req.method() == http::Method::GET && req.uri().path() == "/metrics" {
-        return Ok(metrics_response());
+        return Ok(metrics_response(&state.modules.rate_limiter));
     }
 
     // Management listener: this is the dedicated admin-console endpoint. It
@@ -8425,6 +8460,9 @@ async fn health_response(state: &ServerState) -> Response<BoxBody> {
         // silently incomplete audit trail is the failure this counter exists to
         // make visible.
         "history_shed": history_shed_total(),
+        // Valkey and ClickHouse connect in the background and are retried, so
+        // the node serves without them; this says whether they are in use.
+        "storage": storage_status(&state.modules.rate_limiter),
         // The eBPF/XDP data path, and specifically whether the KERNEL path is
         // live. This exists because kernel XDP had never once loaded on any
         // deployment — the embedded object was rejected before it reached the
@@ -9343,7 +9381,7 @@ fn error_response(status: StatusCode, message: &str) -> Response<BoxBody> {
 /// `GET /metrics` — the global WAF metrics registry rendered in Prometheus text
 /// exposition format. Content-Type follows the Prometheus text format spec so
 /// scrapers parse it without a manual override.
-fn metrics_response() -> Response<BoxBody> {
+fn metrics_response(rate_limiter: &RateLimiter) -> Response<BoxBody> {
     Response::builder()
         .status(StatusCode::OK)
         .header(
@@ -9351,7 +9389,7 @@ fn metrics_response() -> Response<BoxBody> {
             "text/plain; version=0.0.4; charset=utf-8",
         )
         .body(full_body(Bytes::from(
-            prometheus_text() + &siem_metrics_text(),
+            prometheus_text() + &siem_metrics_text() + &rate_limiter.prometheus_text(),
         )))
         .unwrap()
 }
@@ -9628,6 +9666,25 @@ static WAF_EVENTS: std::sync::OnceLock<std::sync::Mutex<Vec<sentinel_storage::Wa
 /// by the spool's own cap.
 static HISTORY_SINK_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the history writer currently holds a working ClickHouse client —
+/// the "sink is reachable" fact `HISTORY_SINK_ACTIVE` deliberately is not.
+/// ClickHouse connects in the background now, so startup no longer logs whether
+/// it came up; /healthz reports this instead.
+static CLICKHOUSE_CONNECTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Storage dependencies for /healthz: what rate checks are really using, and
+/// whether history is reaching ClickHouse or only the spool.
+fn storage_status(rate_limiter: &RateLimiter) -> serde_json::Value {
+    serde_json::json!({
+        "valkey": rate_limiter.distributed_status(),
+        "clickhouse": {
+            "configured": HISTORY_SINK_ACTIVE.load(std::sync::atomic::Ordering::Relaxed),
+            "connected": CLICKHOUSE_CONNECTED.load(std::sync::atomic::Ordering::Relaxed),
+        },
+    })
+}
 
 /// Cap on buffered-but-unflushed events, bounding memory when the sink is slow
 /// or unreachable. At ~200 bytes a row this is a few MB.
@@ -11810,7 +11867,7 @@ mod metrics_endpoint_tests {
         // Exercise the hot-path counters so the registry has real content.
         inc_requests();
         inc_rule_hits();
-        let resp = metrics_response();
+        let resp = metrics_response(&RateLimiter::new());
         assert_eq!(resp.status(), StatusCode::OK);
         let ct = resp
             .headers()
@@ -11829,6 +11886,79 @@ mod metrics_endpoint_tests {
         assert!(text.contains("sentinel_requests_total"));
         assert!(text.contains("sentinel_rule_hits_total"));
         assert!(text.contains("# TYPE sentinel_requests_total counter"));
+    }
+
+    #[tokio::test]
+    async fn metrics_include_the_valkey_breaker_when_valkey_is_configured() {
+        let rl = RateLimiter::distributed(sentinel_modules::DistributedGuard::default());
+        let body = metrics_response(&rl).into_body().collect().await.unwrap();
+        let text = String::from_utf8(body.to_bytes().to_vec()).unwrap();
+        assert!(text.contains("sentinel_ratelimit_valkey_connected 0"));
+        assert!(text.contains("sentinel_ratelimit_valkey_breaker_open 0"));
+    }
+}
+
+#[cfg(test)]
+mod storage_dependency_tests {
+    use super::*;
+
+    /// Storage connects in the background now, so /healthz is where an operator
+    /// learns whether rate limits are cluster-wide and history reaches ClickHouse.
+    #[test]
+    fn healthz_storage_reports_what_rate_checks_really_use() {
+        let v = storage_status(&RateLimiter::new());
+        assert_eq!(v["valkey"]["configured"], false);
+        assert_eq!(v["valkey"]["mode"], "in_memory");
+        assert!(v["clickhouse"]["configured"].is_boolean());
+        assert!(v["clickhouse"]["connected"].is_boolean());
+
+        let v = storage_status(&RateLimiter::distributed(
+            sentinel_modules::DistributedGuard::default(),
+        ));
+        assert_eq!(v["valkey"]["configured"], true);
+        assert_eq!(v["valkey"]["connected"], false);
+        assert_eq!(v["valkey"]["mode"], "in_memory_fallback");
+        assert_eq!(v["valkey"]["breaker"], "closed");
+        assert_eq!(v["valkey"]["timeout_ms"], 50);
+    }
+
+    /// A ClickHouse that accepts and never replies must be a failed replay —
+    /// segment kept for the next attempt, writer free to carry on — not a
+    /// writer stuck on the first insert for good.
+    #[tokio::test]
+    async fn spool_replay_against_a_mute_clickhouse_fails_and_keeps_the_segment() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        let dir = std::env::temp_dir().join(format!(
+            "sk-spool-mute-ch-{}-{}",
+            std::process::id(),
+            unix_now()
+        ));
+        let sp = sentinel_storage::Spool::open(&dir, 1 << 20).unwrap();
+        let row = sentinel_storage::TrafficRow {
+            ts: 1_700_000_000,
+            tenant: "t".into(),
+            site_id: "s".into(),
+            reqs: 1,
+            blocked: 0,
+            p99_ms: 1.0,
+        };
+        sp.append("traffic", &[row]).unwrap();
+
+        let client = sentinel_storage::ClickHouseClient::new(&format!("http://{addr}"), "db")
+            .with_request_timeout(Duration::from_millis(300));
+        let ok = tokio::time::timeout(Duration::from_secs(5), replay_history_spool(&sp, &client))
+            .await
+            .expect("spool replay hung on a ClickHouse that never replies");
+        assert!(!ok, "a timed-out insert is a sink failure");
+        assert_eq!(sp.segments("traffic").len(), 1, "the segment must survive");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

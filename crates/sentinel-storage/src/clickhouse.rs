@@ -18,6 +18,8 @@
 //! TTL ts + INTERVAL 30 DAY;
 //! ```
 
+use std::time::Duration;
+
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{Method, Request};
@@ -32,6 +34,34 @@ use crate::error::StorageError;
 /// unchanged while `https://…` negotiates TLS — no second client type, no
 /// branching at every call site.
 type HyperClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>;
+
+/// TCP connect ceiling. A host that drops SYNs (firewalled, VM gone) otherwise
+/// holds each connect for the kernel's SYN retry budget, about two minutes.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Keepalive on pooled connections, so one whose peer vanished without a FIN
+/// is found dead by the kernel rather than by the next insert.
+const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
+/// Whole-request ceiling: connect, send, response and body. Sized for the
+/// largest request this client makes — a 500-row `waf_events` batch, each row
+/// carrying redacted headers, every contributing rule and an explanation, so
+/// low single-digit MB that a LAN moves and ClickHouse parses in well under a
+/// second. The headroom is for a server busy merging parts; the ceiling exists
+/// because the history writer also samples traffic every second and a request
+/// with no deadline stalled it for good. `SENTINEL_CLICKHOUSE_TIMEOUT_SECS`
+/// overrides it.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// `/ping` does no work server-side, so it gets a short ceiling of its own.
+const PING_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The request ceiling from `SENTINEL_CLICKHOUSE_TIMEOUT_SECS` (1..=600),
+/// else [`DEFAULT_REQUEST_TIMEOUT`].
+fn request_timeout_from(lookup: impl Fn(&str) -> Option<String>) -> Duration {
+    lookup("SENTINEL_CLICKHOUSE_TIMEOUT_SECS")
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| (1..=600).contains(s))
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_REQUEST_TIMEOUT)
+}
 
 // ---------------------------------------------------------------------------
 // TrafficRow
@@ -165,6 +195,8 @@ pub struct ClickHouseClient {
     /// headers. ClickHouse with access-management enabled requires these.
     username: Option<String>,
     password: Option<String>,
+    /// Ceiling on every request; see [`DEFAULT_REQUEST_TIMEOUT`].
+    request_timeout: Duration,
 }
 
 /// Reads a retention window (in days) from `var`, clamped to 1..=3650 days,
@@ -257,6 +289,8 @@ fn https_connector() -> hyper_rustls::HttpsConnector<HttpConnector> {
 
     let mut http = HttpConnector::new();
     http.enforce_http(false); // required, else the connector rejects https URIs
+    http.set_connect_timeout(Some(CONNECT_TIMEOUT));
+    http.set_keepalive(Some(TCP_KEEPALIVE));
     hyper_rustls::HttpsConnectorBuilder::new()
         .with_tls_config(tls)
         .https_or_http()
@@ -406,7 +440,15 @@ impl ClickHouseClient {
             database: database.to_string(),
             username,
             password,
+            request_timeout: request_timeout_from(|k| std::env::var(k).ok()),
         }
+    }
+
+    /// Override the per-request ceiling (tests, and callers with their own
+    /// latency budget).
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
     }
 
     /// Attach ClickHouse auth headers to a request builder when credentials
@@ -436,10 +478,12 @@ impl ClickHouseClient {
             .body(Full::new(Bytes::new()))
             .map_err(|e| StorageError::ClickHouse(e.to_string()))?;
 
-        let resp = self
-            .http
-            .request(req)
+        let timeout = PING_TIMEOUT.min(self.request_timeout);
+        let resp = tokio::time::timeout(timeout, self.http.request(req))
             .await
+            .map_err(|_| {
+                StorageError::ClickHouse(format!("ping: timed out after {}ms", timeout.as_millis()))
+            })?
             .map_err(|e| StorageError::ClickHouse(format!("ping: {e}")))?;
 
         if !resp.status().is_success() {
@@ -738,19 +782,34 @@ impl ClickHouseClient {
             .body(Full::new(Bytes::from(sql)))
             .map_err(|e| StorageError::ClickHouse(e.to_string()))?;
 
-        let resp = self
-            .http
-            .request(req)
+        // One deadline over the whole exchange, so a server that accepts and
+        // then stalls (before the headers or mid-body) fails like any other
+        // error and the caller's spool/retry path takes over. An insert that
+        // timed out may still have committed; replay is at-least-once and each
+        // event row carries `request_id` for de-duplication.
+        let exchange = async {
+            let resp = self
+                .http
+                .request(req)
+                .await
+                .map_err(|e| StorageError::ClickHouse(format!("request: {e}")))?;
+            let status = resp.status();
+            let body = resp
+                .into_body()
+                .collect()
+                .await
+                .map_err(|e| StorageError::ClickHouse(format!("body: {e}")))?
+                .to_bytes();
+            Ok::<_, StorageError>((status, body))
+        };
+        let (status, body_bytes) = tokio::time::timeout(self.request_timeout, exchange)
             .await
-            .map_err(|e| StorageError::ClickHouse(format!("request: {e}")))?;
-
-        let status = resp.status();
-        let body_bytes = resp
-            .into_body()
-            .collect()
-            .await
-            .map_err(|e| StorageError::ClickHouse(format!("body: {e}")))?
-            .to_bytes();
+            .map_err(|_| {
+                StorageError::ClickHouse(format!(
+                    "request timed out after {}ms",
+                    self.request_timeout.as_millis()
+                ))
+            })??;
         let body_str = String::from_utf8_lossy(&body_bytes).into_owned();
 
         if !status.is_success() {
@@ -1013,5 +1072,113 @@ mod insert_column_pinning {
              a field is a silent NULL/default. Fix both sides together, and add the column \
              to ensure_schema's ADD COLUMN list."
         );
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+    use crate::testing::{black_hole, hang_up};
+    use std::time::Instant;
+
+    /// Upper bound the test allows any single call before declaring it hung.
+    const HUNG: Duration = Duration::from_secs(5);
+
+    /// A full-size flush: the writer sends 500-row batches.
+    fn batch() -> Vec<WafEventRow> {
+        (0..500)
+            .map(|i| WafEventRow {
+                ts: 1_700_000_000 + i,
+                ip: "203.0.113.9".into(),
+                country: String::new(),
+                site: "example.test".into(),
+                tenant: "t".into(),
+                method: "GET".into(),
+                path: "/search".into(),
+                query: "q=1".into(),
+                referer: String::new(),
+                matched: "1 UNION SELECT".into(),
+                rule: "942100".into(),
+                attack: "SQL injection".into(),
+                action: "BLOCK".into(),
+                severity: "CRITICAL".into(),
+                score: 5,
+                status: 403,
+                protocol: "h1".into(),
+                request_id: format!("req-{i}"),
+                target: "ARGS:q".into(),
+                mode: "blocking".into(),
+                threshold: 5,
+                explanation: "x".repeat(512),
+                ja4: String::new(),
+                rules: "[]".into(),
+                headers: "{}".into(),
+                ua: "curl/8".into(),
+            })
+            .collect()
+    }
+
+    fn client(addr: std::net::SocketAddr) -> ClickHouseClient {
+        ClickHouseClient::new(&format!("http://{addr}"), "sentinel_logs")
+            .with_request_timeout(Duration::from_millis(300))
+    }
+
+    /// The failure this guards: a ClickHouse that accepts the connection and
+    /// never answers held ping/insert forever — the history writer stalled
+    /// (and stopped sampling traffic) instead of spooling.
+    #[tokio::test]
+    async fn a_server_that_never_replies_times_out_as_an_error() {
+        let c = client(black_hole().await);
+
+        let t = Instant::now();
+        let ping = tokio::time::timeout(HUNG, c.ping())
+            .await
+            .expect("ping hung on a server that accepts and never replies");
+        assert!(ping.is_err());
+
+        let insert = tokio::time::timeout(HUNG, c.insert_events_batch(&batch()))
+            .await
+            .expect("insert hung on a server that accepts and never replies");
+        let err = insert
+            .expect_err("a timed-out insert must be an error")
+            .to_string();
+        assert!(err.contains("timed out"), "unexpected error: {err}");
+
+        let schema = tokio::time::timeout(HUNG, c.ensure_schema())
+            .await
+            .expect("ensure_schema hung on a server that accepts and never replies");
+        assert!(schema.is_err());
+
+        assert!(
+            t.elapsed() < Duration::from_secs(3),
+            "three calls at a 300ms ceiling took {:?}",
+            t.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_that_hangs_up_is_an_error() {
+        let c = client(hang_up().await);
+        let ping = tokio::time::timeout(HUNG, c.ping())
+            .await
+            .expect("ping hung");
+        assert!(ping.is_err());
+        let insert = tokio::time::timeout(HUNG, c.insert_events_batch(&batch()))
+            .await
+            .expect("insert hung");
+        assert!(insert.is_err());
+    }
+
+    #[test]
+    fn request_timeout_env_override_is_bounded() {
+        let env = |v: &'static str| {
+            move |k: &str| (k == "SENTINEL_CLICKHOUSE_TIMEOUT_SECS").then(|| v.to_string())
+        };
+        assert_eq!(request_timeout_from(|_| None), DEFAULT_REQUEST_TIMEOUT);
+        assert_eq!(request_timeout_from(env("30")), Duration::from_secs(30));
+        // Zero would mean "every request fails"; garbage and absurd values fall back.
+        assert_eq!(request_timeout_from(env("0")), DEFAULT_REQUEST_TIMEOUT);
+        assert_eq!(request_timeout_from(env("abc")), DEFAULT_REQUEST_TIMEOUT);
+        assert_eq!(request_timeout_from(env("100000")), DEFAULT_REQUEST_TIMEOUT);
     }
 }

@@ -6,12 +6,15 @@
 //! Checked at Phase 1 (request headers) after the site is identified.
 
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwapOption;
 use dashmap::DashMap;
 use sentinel_core::config::RateLimitConfig;
-use sentinel_storage::RedisClient;
+use sentinel_storage::{RedisClient, StorageError};
+use serde::Serialize;
 
 // ---------------------------------------------------------------------------
 // Token bucket
@@ -64,6 +67,243 @@ impl TokenBucket {
 }
 
 // ---------------------------------------------------------------------------
+// Distributed backend guard
+// ---------------------------------------------------------------------------
+
+/// How the request path treats the distributed (Valkey) backend.
+///
+/// The rate check sits on every request of a rate-limited site, so a Valkey
+/// that is slow or gone must cost a bounded, small amount of latency — and,
+/// once it is clearly down, nothing at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DistributedGuard {
+    /// Budget for the Valkey round trips of ONE rate check (both the site-wide
+    /// and the per-IP window). Past it the check is answered in-memory.
+    pub timeout: Duration,
+    /// Consecutive errors or timeouts that open the breaker.
+    pub failure_threshold: u32,
+    /// How long an open breaker skips Valkey before letting one probe through.
+    pub cooldown: Duration,
+}
+
+impl Default for DistributedGuard {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_millis(50),
+            failure_threshold: 5,
+            cooldown: Duration::from_secs(5),
+        }
+    }
+}
+
+impl DistributedGuard {
+    /// Defaults overridden by `SENTINEL_REDIS_TIMEOUT_MS` (1..=1000),
+    /// `SENTINEL_REDIS_BREAKER_FAILURES` (1..=1000) and
+    /// `SENTINEL_REDIS_BREAKER_COOLDOWN_MS` (100..=600000). Out-of-range or
+    /// unparseable values keep the default.
+    pub fn from_env() -> Self {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let num = |k: &str, lo: u64, hi: u64| {
+            lookup(k)
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|v| (lo..=hi).contains(v))
+        };
+        let d = Self::default();
+        Self {
+            timeout: num("SENTINEL_REDIS_TIMEOUT_MS", 1, 1000)
+                .map(Duration::from_millis)
+                .unwrap_or(d.timeout),
+            failure_threshold: num("SENTINEL_REDIS_BREAKER_FAILURES", 1, 1000)
+                .map(|v| v as u32)
+                .unwrap_or(d.failure_threshold),
+            cooldown: num("SENTINEL_REDIS_BREAKER_COOLDOWN_MS", 100, 600_000)
+                .map(Duration::from_millis)
+                .unwrap_or(d.cooldown),
+        }
+    }
+}
+
+/// Minimum spacing of the per-failure warnings. Breaker transitions are always
+/// logged; individual failures under a dead Valkey would otherwise be one line
+/// per request.
+const WARN_INTERVAL_MS: u64 = 10_000;
+
+/// Lock-free circuit breaker over the Valkey calls.
+///
+/// Closed: every check asks Valkey. After `failure_threshold` consecutive
+/// failures it opens: checks skip Valkey (in-memory limiter) for `cooldown`.
+/// Then the first check to arrive re-arms the cooldown and probes; a success
+/// closes the breaker, a failure leaves it open for another cooldown. Re-arming
+/// BEFORE the probe means a probe that never completes (its request cancelled)
+/// cannot wedge the breaker half-open.
+#[derive(Debug)]
+struct Breaker {
+    epoch: Instant,
+    /// Milliseconds since `epoch` (plus one, so 0 is free) until which Valkey
+    /// is skipped; 0 = closed.
+    open_until: AtomicU64,
+    consecutive_failures: AtomicU32,
+    errors_total: AtomicU64,
+    timeouts_total: AtomicU64,
+    fallback_total: AtomicU64,
+    opened_total: AtomicU64,
+    last_warn: AtomicU64,
+    suppressed_warnings: AtomicU64,
+}
+
+/// Breaker position, as reported at /healthz.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BreakerState {
+    Closed,
+    Open,
+    /// Cooldown over; the next check probes Valkey.
+    HalfOpen,
+}
+
+impl Breaker {
+    fn new() -> Self {
+        Self {
+            epoch: Instant::now(),
+            open_until: AtomicU64::new(0),
+            consecutive_failures: AtomicU32::new(0),
+            errors_total: AtomicU64::new(0),
+            timeouts_total: AtomicU64::new(0),
+            fallback_total: AtomicU64::new(0),
+            opened_total: AtomicU64::new(0),
+            last_warn: AtomicU64::new(0),
+            suppressed_warnings: AtomicU64::new(0),
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64 + 1
+    }
+
+    /// `true` if this check may call Valkey.
+    fn admit(&self, cooldown: Duration) -> bool {
+        let until = self.open_until.load(Ordering::Acquire);
+        if until == 0 {
+            return true;
+        }
+        let now = self.now_ms();
+        if now < until {
+            return false;
+        }
+        // Cooldown over: exactly one caller wins the re-arm and probes.
+        self.open_until
+            .compare_exchange(
+                until,
+                now + cooldown.as_millis() as u64,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn on_success(&self) {
+        self.consecutive_failures.store(0, Ordering::Relaxed);
+        if self.open_until.swap(0, Ordering::AcqRel) != 0 {
+            tracing::info!(
+                "valkey answered again — rate-limit circuit breaker closed, \
+                 distributed (cluster-wide) limits resumed"
+            );
+        }
+    }
+
+    fn on_failure(&self, guard: &DistributedGuard, timed_out: bool, detail: &str) {
+        if timed_out {
+            self.timeouts_total.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.errors_total.fetch_add(1, Ordering::Relaxed);
+        }
+        let n = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
+
+        if self.open_until.load(Ordering::Acquire) == 0 && n >= guard.failure_threshold {
+            let until = self.now_ms() + guard.cooldown.as_millis() as u64;
+            if self
+                .open_until
+                .compare_exchange(0, until, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                self.opened_total.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    consecutive_failures = n,
+                    cooldown_ms = guard.cooldown.as_millis() as u64,
+                    error = detail,
+                    "valkey rate-limit backend failing — circuit breaker OPEN: rate checks \
+                     use the in-memory limiter (per-node, not cluster-wide, limits) and \
+                     skip valkey until a probe succeeds"
+                );
+                return;
+            }
+        }
+        self.warn_throttled(|suppressed| {
+            tracing::warn!(
+                error = detail,
+                timed_out,
+                consecutive_failures = n,
+                suppressed,
+                "valkey rate check failed — answered by the in-memory limiter"
+            )
+        });
+    }
+
+    /// Run `emit` at most once per [`WARN_INTERVAL_MS`], passing how many
+    /// warnings were swallowed since the last one.
+    fn warn_throttled(&self, emit: impl FnOnce(u64)) {
+        let now = self.now_ms();
+        let last = self.last_warn.load(Ordering::Relaxed);
+        let due = last == 0 || now.saturating_sub(last) >= WARN_INTERVAL_MS;
+        if due
+            && self
+                .last_warn
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            emit(self.suppressed_warnings.swap(0, Ordering::Relaxed));
+        } else {
+            self.suppressed_warnings.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn state(&self) -> BreakerState {
+        match self.open_until.load(Ordering::Acquire) {
+            0 => BreakerState::Closed,
+            until if self.now_ms() < until => BreakerState::Open,
+            _ => BreakerState::HalfOpen,
+        }
+    }
+}
+
+/// The distributed backend's state, for /healthz.
+#[derive(Debug, Clone, Serialize)]
+pub struct DistributedStatus {
+    /// A Valkey URL is configured.
+    pub configured: bool,
+    /// The background connect has succeeded and the client is bound.
+    pub connected: bool,
+    /// What rate checks are actually using right now: `distributed`,
+    /// `in_memory` (no Valkey configured) or `in_memory_fallback` (configured
+    /// but not connected yet, or the breaker is open).
+    pub mode: &'static str,
+    pub breaker: BreakerState,
+    pub consecutive_failures: u32,
+    pub timeout_ms: u64,
+    pub failure_threshold: u32,
+    pub cooldown_ms: u64,
+    pub errors_total: u64,
+    pub timeouts_total: u64,
+    /// Rate checks answered by the in-memory limiter although Valkey is
+    /// configured (not connected, breaker open, error or timeout).
+    pub fallback_total: u64,
+    pub breaker_opened_total: u64,
+}
+
+// ---------------------------------------------------------------------------
 // RateLimiter
 // ---------------------------------------------------------------------------
 
@@ -78,10 +318,16 @@ impl TokenBucket {
 pub struct RateLimiter {
     per_ip: DashMap<(String, IpAddr), TokenBucket>,
     per_site: DashMap<String, TokenBucket>,
-    /// Optional distributed backend.  When present, limits are enforced via an
-    /// atomic Redis sliding window shared across all WAF nodes; when `None`,
+    /// Optional distributed backend.  When bound, limits are enforced via an
+    /// atomic Redis sliding window shared across all WAF nodes; while empty,
     /// the in-memory token buckets above are used (single-instance only).
-    redis: Option<Arc<RedisClient>>,
+    /// Late-bound: the data plane serves before Valkey has answered, and the
+    /// background connect fills this in when it does.
+    redis: ArcSwapOption<RedisClient>,
+    /// A Valkey URL is configured (whether or not it is bound yet).
+    redis_configured: AtomicBool,
+    guard: DistributedGuard,
+    breaker: Breaker,
 }
 
 impl Default for RateLimiter {
@@ -92,36 +338,101 @@ impl Default for RateLimiter {
 
 impl RateLimiter {
     pub fn new() -> Self {
-        Self::with_redis(None)
+        Self::build(false, DistributedGuard::default())
     }
 
-    /// Construct a limiter with an optional distributed Redis backend.
+    /// Construct a limiter with an optional, already-connected Redis backend.
     pub fn with_redis(redis: Option<Arc<RedisClient>>) -> Self {
+        let rl = Self::build(redis.is_some(), DistributedGuard::default());
+        rl.redis.store(redis);
+        rl
+    }
+
+    /// A limiter whose Valkey backend is configured but connects later: it
+    /// answers in-memory until [`bind_redis`](Self::bind_redis) is called.
+    pub fn distributed(guard: DistributedGuard) -> Self {
+        Self::build(true, guard)
+    }
+
+    fn build(configured: bool, guard: DistributedGuard) -> Self {
         Self {
             per_ip: DashMap::new(),
             per_site: DashMap::new(),
-            redis,
+            redis: ArcSwapOption::empty(),
+            redis_configured: AtomicBool::new(configured),
+            guard,
+            breaker: Breaker::new(),
         }
     }
 
-    /// `true` if a distributed (Redis) backend is active.
+    /// Attach the Valkey client once the background connect succeeds.
+    pub fn bind_redis(&self, redis: Arc<RedisClient>) {
+        self.redis_configured.store(true, Ordering::Relaxed);
+        self.redis.store(Some(redis));
+    }
+
+    /// `true` if a distributed (Redis) backend is bound.
     pub fn is_distributed(&self) -> bool {
-        self.redis.is_some()
+        self.redis.load().is_some()
     }
 
     /// Distributed rate check.  Uses the shared Redis sliding window when a
-    /// backend is configured; otherwise delegates to the in-memory [`check`].
+    /// backend is bound and healthy; otherwise delegates to the in-memory
+    /// [`check`].
     ///
     /// Returns `true` (= **block request**) if any limit is exceeded.  On any
-    /// Redis error the check degrades to the in-memory limiter rather than
-    /// failing open, so a Redis outage never disables rate limiting entirely.
+    /// Redis error or timeout the check degrades to the in-memory limiter
+    /// rather than failing open, so a Redis outage never disables rate limiting
+    /// entirely — and the Valkey calls are bounded by the guard's timeout, then
+    /// skipped altogether while the breaker is open, so it never stalls the
+    /// request either.
     ///
     /// [`check`]: RateLimiter::check
     pub async fn check_async(&self, site_id: &str, ip: IpAddr, config: &RateLimitConfig) -> bool {
-        let Some(redis) = &self.redis else {
+        if config.global.is_none() && config.per_ip.is_none() {
+            return false;
+        }
+        let Some(redis) = self.redis.load_full() else {
+            if self.redis_configured.load(Ordering::Relaxed) {
+                self.breaker.fallback_total.fetch_add(1, Ordering::Relaxed);
+            }
             return self.check(site_id, ip, config);
         };
+        if !self.breaker.admit(self.guard.cooldown) {
+            self.breaker.fallback_total.fetch_add(1, Ordering::Relaxed);
+            return self.check(site_id, ip, config);
+        }
 
+        match tokio::time::timeout(
+            self.guard.timeout,
+            Self::redis_check(&redis, site_id, ip, config),
+        )
+        .await
+        {
+            Ok(Ok(limited)) => {
+                self.breaker.on_success();
+                limited
+            }
+            Ok(Err(e)) => {
+                self.breaker.on_failure(&self.guard, false, &e.to_string());
+                self.breaker.fallback_total.fetch_add(1, Ordering::Relaxed);
+                self.check(site_id, ip, config)
+            }
+            Err(_) => {
+                let detail = format!("no reply within {}ms", self.guard.timeout.as_millis());
+                self.breaker.on_failure(&self.guard, true, &detail);
+                self.breaker.fallback_total.fetch_add(1, Ordering::Relaxed);
+                self.check(site_id, ip, config)
+            }
+        }
+    }
+
+    async fn redis_check(
+        redis: &RedisClient,
+        site_id: &str,
+        ip: IpAddr,
+        config: &RateLimitConfig,
+    ) -> Result<bool, StorageError> {
         // 1-second sliding window; allow `rps + burst` requests within it so
         // short bursts pass while sustained rate is capped (mirrors the
         // token-bucket semantics of the in-memory path).
@@ -131,28 +442,80 @@ impl RateLimiter {
         if let Some(ref global) = config.global {
             let key = format!("rate:site:{site_id}");
             let limit = (global.rps + global.burst) as u64;
-            match redis.rate_check(&key, limit, WINDOW_MS).await {
-                Ok(allowed) => limited |= !allowed,
-                Err(e) => {
-                    tracing::warn!(error = %e, "redis rate_check failed — falling back to in-memory");
-                    return self.check(site_id, ip, config);
-                }
-            }
+            limited |= !redis.rate_check(&key, limit, WINDOW_MS).await?;
         }
 
         if let Some(ref per_ip_cfg) = config.per_ip {
             let key = format!("rate:ip:{site_id}:{ip}");
             let limit = (per_ip_cfg.rps + per_ip_cfg.burst) as u64;
-            match redis.rate_check(&key, limit, WINDOW_MS).await {
-                Ok(allowed) => limited |= !allowed,
-                Err(e) => {
-                    tracing::warn!(error = %e, "redis rate_check failed — falling back to in-memory");
-                    return self.check(site_id, ip, config);
-                }
-            }
+            limited |= !redis.rate_check(&key, limit, WINDOW_MS).await?;
         }
 
-        limited
+        Ok(limited)
+    }
+
+    /// The distributed backend's state, for /healthz.
+    pub fn distributed_status(&self) -> DistributedStatus {
+        let configured = self.redis_configured.load(Ordering::Relaxed);
+        let connected = self.is_distributed();
+        let breaker = self.breaker.state();
+        let mode = match (configured, connected, breaker) {
+            (false, _, _) => "in_memory",
+            (true, true, BreakerState::Closed) => "distributed",
+            _ => "in_memory_fallback",
+        };
+        let b = &self.breaker;
+        DistributedStatus {
+            configured,
+            connected,
+            mode,
+            breaker,
+            consecutive_failures: b.consecutive_failures.load(Ordering::Relaxed),
+            timeout_ms: self.guard.timeout.as_millis() as u64,
+            failure_threshold: self.guard.failure_threshold,
+            cooldown_ms: self.guard.cooldown.as_millis() as u64,
+            errors_total: b.errors_total.load(Ordering::Relaxed),
+            timeouts_total: b.timeouts_total.load(Ordering::Relaxed),
+            fallback_total: b.fallback_total.load(Ordering::Relaxed),
+            breaker_opened_total: b.opened_total.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Prometheus series for the distributed backend. Empty when no Valkey is
+    /// configured: a permanently-zero `connected` series on single-node
+    /// installs would read as an outage.
+    pub fn prometheus_text(&self) -> String {
+        let st = self.distributed_status();
+        if !st.configured {
+            return String::new();
+        }
+        let breaker_open = u8::from(st.breaker != BreakerState::Closed);
+        format!(
+            "# HELP sentinel_ratelimit_valkey_connected Valkey rate-limit backend connected (1) or not yet (0)\n\
+             # TYPE sentinel_ratelimit_valkey_connected gauge\n\
+             sentinel_ratelimit_valkey_connected {}\n\
+             # HELP sentinel_ratelimit_valkey_breaker_open Circuit breaker skipping Valkey (1) or closed (0)\n\
+             # TYPE sentinel_ratelimit_valkey_breaker_open gauge\n\
+             sentinel_ratelimit_valkey_breaker_open {}\n\
+             # HELP sentinel_ratelimit_valkey_errors_total Valkey rate checks that failed with an error\n\
+             # TYPE sentinel_ratelimit_valkey_errors_total counter\n\
+             sentinel_ratelimit_valkey_errors_total {}\n\
+             # HELP sentinel_ratelimit_valkey_timeouts_total Valkey rate checks that exceeded the request-path timeout\n\
+             # TYPE sentinel_ratelimit_valkey_timeouts_total counter\n\
+             sentinel_ratelimit_valkey_timeouts_total {}\n\
+             # HELP sentinel_ratelimit_valkey_fallback_total Rate checks answered by the in-memory limiter while Valkey is configured\n\
+             # TYPE sentinel_ratelimit_valkey_fallback_total counter\n\
+             sentinel_ratelimit_valkey_fallback_total {}\n\
+             # HELP sentinel_ratelimit_valkey_breaker_opened_total Times the Valkey circuit breaker opened\n\
+             # TYPE sentinel_ratelimit_valkey_breaker_opened_total counter\n\
+             sentinel_ratelimit_valkey_breaker_opened_total {}\n",
+            u8::from(st.connected),
+            breaker_open,
+            st.errors_total,
+            st.timeouts_total,
+            st.fallback_total,
+            st.breaker_opened_total,
+        )
     }
 
     /// Check whether a request should be rate-limited.
@@ -303,5 +666,212 @@ mod tests {
         for _ in 0..1000 {
             assert!(!rl.check("site1", ip, &cfg));
         }
+    }
+}
+
+#[cfg(test)]
+mod distributed_tests {
+    use super::*;
+    use sentinel_core::config::{RateLimitConfig, RateWindow};
+    use sentinel_storage::testing::{EvalMode, FakeValkey};
+    use std::net::Ipv4Addr;
+
+    const IP: IpAddr = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+
+    fn per_ip(rps: u32, burst: u32) -> RateLimitConfig {
+        RateLimitConfig {
+            global: None,
+            per_ip: Some(RateWindow { rps, burst }),
+        }
+    }
+
+    fn guard(timeout_ms: u64, failures: u32, cooldown_ms: u64) -> DistributedGuard {
+        DistributedGuard {
+            timeout: Duration::from_millis(timeout_ms),
+            failure_threshold: failures,
+            cooldown: Duration::from_millis(cooldown_ms),
+        }
+    }
+
+    async fn limiter(fake: &FakeValkey, g: DistributedGuard) -> RateLimiter {
+        let rl = RateLimiter::distributed(g);
+        let client = RedisClient::connect(&fake.url()).await.expect("handshake");
+        rl.bind_redis(Arc::new(client));
+        rl
+    }
+
+    /// Bound the whole call, so a regression shows up as a failed assertion
+    /// rather than a test that never finishes.
+    async fn timed_check(rl: &RateLimiter, cfg: &RateLimitConfig) -> (bool, Duration) {
+        let t = Instant::now();
+        let limited =
+            tokio::time::timeout(Duration::from_secs(5), rl.check_async("site1", IP, cfg))
+                .await
+                .expect("rate check hung on an unresponsive valkey");
+        (limited, t.elapsed())
+    }
+
+    /// The request-path failure: a Valkey that stops answering held every
+    /// rate-limited request for as long as the client library waited — forever
+    /// on the 0.24 client, which had no response timeout.
+    #[tokio::test]
+    async fn an_unresponsive_valkey_costs_at_most_the_timeout() {
+        let fake = FakeValkey::start(EvalMode::Hang).await;
+        let rl = limiter(&fake, guard(50, 5, 60_000)).await;
+
+        let (limited, took) = timed_check(&rl, &per_ip(1, 5)).await;
+        assert!(!limited, "first request is within the in-memory burst");
+        assert!(
+            took < Duration::from_millis(300),
+            "a 50ms budget took {took:?}"
+        );
+        let st = rl.distributed_status();
+        assert_eq!(st.timeouts_total, 1);
+        assert_eq!(st.fallback_total, 1);
+        assert_eq!(
+            st.breaker,
+            BreakerState::Closed,
+            "one failure is below the threshold"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_breaker_opens_after_consecutive_failures_and_stops_asking_valkey() {
+        let fake = FakeValkey::start(EvalMode::Error).await;
+        let rl = limiter(&fake, guard(50, 3, 60_000)).await;
+        let cfg = per_ip(1, 5);
+
+        for _ in 0..3 {
+            timed_check(&rl, &cfg).await;
+        }
+        assert_eq!(fake.evals(), 3);
+        let st = rl.distributed_status();
+        assert_eq!(st.breaker, BreakerState::Open);
+        assert_eq!(st.breaker_opened_total, 1);
+        assert_eq!(st.errors_total, 3);
+        assert_eq!(st.mode, "in_memory_fallback");
+
+        // Open: valkey is not contacted at all, and the in-memory limiter keeps
+        // enforcing — 5 burst tokens, 3 already spent above.
+        let (a, _) = timed_check(&rl, &cfg).await;
+        let (b, _) = timed_check(&rl, &cfg).await;
+        let (c, _) = timed_check(&rl, &cfg).await;
+        assert!(!a && !b, "within the burst");
+        assert!(c, "over the burst: an open breaker must not fail open");
+        assert_eq!(fake.evals(), 3, "an open breaker must skip valkey");
+        assert_eq!(rl.distributed_status().fallback_total, 6);
+    }
+
+    #[tokio::test]
+    async fn a_probe_after_the_cooldown_closes_the_breaker_when_valkey_recovers() {
+        let fake = FakeValkey::start(EvalMode::Error).await;
+        let rl = limiter(&fake, guard(50, 1, 100)).await;
+        let cfg = per_ip(100, 100);
+
+        timed_check(&rl, &cfg).await;
+        assert_eq!(rl.distributed_status().breaker, BreakerState::Open);
+
+        fake.set_mode(EvalMode::Allow);
+        timed_check(&rl, &cfg).await;
+        assert_eq!(fake.evals(), 1, "still inside the cooldown");
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(rl.distributed_status().breaker, BreakerState::HalfOpen);
+        timed_check(&rl, &cfg).await;
+        assert_eq!(fake.evals(), 2, "one probe after the cooldown");
+        let st = rl.distributed_status();
+        assert_eq!(st.breaker, BreakerState::Closed);
+        assert_eq!(st.mode, "distributed");
+        assert_eq!(st.consecutive_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_probe_keeps_the_breaker_open_for_another_cooldown() {
+        let fake = FakeValkey::start(EvalMode::Hang).await;
+        let rl = limiter(&fake, guard(30, 1, 100)).await;
+        let cfg = per_ip(100, 100);
+
+        timed_check(&rl, &cfg).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        timed_check(&rl, &cfg).await; // the probe — times out
+        let st = rl.distributed_status();
+        assert_eq!(st.timeouts_total, 2);
+        assert_eq!(st.breaker, BreakerState::Open);
+        assert_eq!(
+            st.breaker_opened_total, 1,
+            "a failed probe re-arms, not re-opens"
+        );
+
+        timed_check(&rl, &cfg).await;
+        assert_eq!(
+            fake.evals(),
+            2,
+            "skipped again until the next cooldown ends"
+        );
+    }
+
+    /// Valkey connects after the data plane is already serving: until then
+    /// checks are in-memory; once bound, Valkey decides.
+    #[tokio::test]
+    async fn a_late_bound_client_takes_over_from_the_in_memory_limiter() {
+        let fake = FakeValkey::start(EvalMode::Deny).await;
+        let rl = RateLimiter::distributed(guard(50, 5, 60_000));
+        let cfg = per_ip(100, 100);
+
+        let (limited, _) = timed_check(&rl, &cfg).await;
+        assert!(!limited);
+        let st = rl.distributed_status();
+        assert!(st.configured && !st.connected);
+        assert_eq!(st.mode, "in_memory_fallback");
+        assert_eq!(st.fallback_total, 1);
+
+        rl.bind_redis(Arc::new(RedisClient::connect(&fake.url()).await.unwrap()));
+        let (limited, _) = timed_check(&rl, &cfg).await;
+        assert!(limited, "valkey said over-limit");
+        assert_eq!(fake.evals(), 1);
+        assert_eq!(rl.distributed_status().mode, "distributed");
+    }
+
+    #[test]
+    fn metrics_only_when_valkey_is_configured() {
+        assert_eq!(RateLimiter::new().prometheus_text(), "");
+        assert_eq!(RateLimiter::new().distributed_status().mode, "in_memory");
+
+        let text = RateLimiter::distributed(DistributedGuard::default()).prometheus_text();
+        for series in [
+            "sentinel_ratelimit_valkey_connected 0",
+            "sentinel_ratelimit_valkey_breaker_open 0",
+            "sentinel_ratelimit_valkey_errors_total 0",
+            "sentinel_ratelimit_valkey_timeouts_total 0",
+            "sentinel_ratelimit_valkey_fallback_total 0",
+            "sentinel_ratelimit_valkey_breaker_opened_total 0",
+        ] {
+            assert!(text.contains(series), "missing {series:?} in:\n{text}");
+        }
+    }
+
+    #[test]
+    fn guard_env_overrides_are_bounded() {
+        let d = DistributedGuard::default();
+        assert_eq!(d.timeout, Duration::from_millis(50));
+        assert_eq!(DistributedGuard::from_lookup(|_| None), d);
+
+        let g = DistributedGuard::from_lookup(|k| match k {
+            "SENTINEL_REDIS_TIMEOUT_MS" => Some("80".into()),
+            "SENTINEL_REDIS_BREAKER_FAILURES" => Some("2".into()),
+            "SENTINEL_REDIS_BREAKER_COOLDOWN_MS" => Some("1500".into()),
+            _ => None,
+        });
+        assert_eq!(g, guard(80, 2, 1500));
+
+        // A zero timeout would fail every check; zero failures would never
+        // close; garbage keeps the default.
+        let g = DistributedGuard::from_lookup(|k| match k {
+            "SENTINEL_REDIS_TIMEOUT_MS" => Some("0".into()),
+            "SENTINEL_REDIS_BREAKER_FAILURES" => Some("0".into()),
+            "SENTINEL_REDIS_BREAKER_COOLDOWN_MS" => Some("soon".into()),
+            _ => None,
+        });
+        assert_eq!(g, d);
     }
 }

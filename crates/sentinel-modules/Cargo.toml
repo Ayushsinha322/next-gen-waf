@@ -29,3 +29,7 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 http = { workspace = true }
 http-body-util = { workspace = true }
 bytes = { workspace = true }
+
+[dev-dependencies]
+# Local stub servers (fake Valkey) for the rate limiter's failure-path tests.
+sentinel-storage = { path = "../sentinel-storage", features = ["test-support"] }

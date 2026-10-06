@@ -40,7 +40,7 @@ pub use jwt_auth::{
     decoding_keys_from_jwks, decoding_keys_from_jwks_diag, token_header, validate as validate_jwt,
     JwksParse, JwtPolicy,
 };
-pub use rate_limit::RateLimiter;
+pub use rate_limit::{BreakerState, DistributedGuard, DistributedStatus, RateLimiter};
 pub use smuggling::{detect as detect_smuggling, SmugglingVerdict};
 pub use threat_intel::{RawTier, ThreatFeed, ThreatVerdict};
 pub use tls_fingerprint::{

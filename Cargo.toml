@@ -106,7 +106,13 @@ candle-nn = "0.7"
 candle-transformers = "0.7"
 
 # Storage
-redis = { version = "0.24", features = ["tokio-comp", "connection-manager"] }
+# =1.2.2: the newest release whose rust-version (1.85) matches CI; 1.2.3 and
+# every later release declare 1.88, so a caret range would break the build. 1.x is
+# the line whose async connection setup no longer has 0.24's
+# `unreachable!("Multiplexed connection driver unexpectedly terminated")` path,
+# and whose ConnectionManager takes connection/response timeouts.
+# Default features off: only Lua scripts are used (no streams/geo/bigint).
+redis = { version = "=1.2.2", default-features = false, features = ["tokio-comp", "connection-manager", "script"] }
 rocksdb = "0.22"
 sled = "0.34"
 

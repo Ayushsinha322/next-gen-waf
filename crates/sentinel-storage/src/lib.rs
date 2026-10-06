@@ -30,16 +30,21 @@
 //! }
 //! ```
 
+pub mod backoff;
 pub mod clickhouse;
 pub mod error;
 pub mod memory;
 pub mod redis;
 pub mod spool;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod testing;
 
+pub use backoff::Backoff;
 pub use clickhouse::{ClickHouseClient, TrafficRow, WafEventRow};
 pub use error::StorageError;
 pub use memory::MemoryStore;
-pub use redis::RedisClient;
+pub use redis::{redact_url, RedisClient};
 pub use spool::{Dropped, Spool};
 
 use std::sync::Arc;
@@ -168,23 +173,28 @@ impl Default for StorageHandle {
 }
 
 impl StorageHandle {
-    /// Connect to all configured backends.
+    /// Connect to all configured backends, once.
     ///
     /// Missing or unreachable backends are skipped with a `warn!` log rather
     /// than causing startup failure — the WAF continues in degraded mode.
+    /// Bounded by the clients' own connect/request timeouts (a few seconds per
+    /// backend), but still a one-shot: the data plane does NOT await this before
+    /// serving — it connects each backend in the background and keeps retrying
+    /// (see `RedisClient::connect_with_retry` and the history writer).
     pub async fn connect(cfg: &StorageBackendConfig) -> Self {
         let mut handle = Self::default();
 
         // --- Redis -----------------------------------------------------------
         if let Some(url) = &cfg.redis_url {
+            let endpoint = redact_url(url);
             match RedisClient::connect(url).await {
                 Ok(client) => {
-                    info!(url, "redis connected");
+                    info!(url = %endpoint, "redis connected");
                     handle.redis = Some(Arc::new(client));
                 }
                 Err(e) => {
                     warn!(
-                        url,
+                        url = %endpoint,
                         error = %e,
                         "redis unavailable — rate limit falls back to in-process store"
                     );
@@ -265,6 +275,45 @@ mod tests {
         };
         let h = StorageHandle::connect(&cfg).await;
         assert!(!h.has_redis(), "should degrade, not panic");
+    }
+
+    /// Backends that accept TCP and never answer used to hold `connect` — and
+    /// with it data-plane startup — forever.
+    #[tokio::test]
+    async fn connect_is_bounded_when_backends_accept_and_never_answer() {
+        let valkey = testing::black_hole().await;
+        let clickhouse = testing::black_hole().await;
+        let cfg = StorageBackendConfig {
+            redis_url: Some(format!("redis://{valkey}")),
+            clickhouse_url: Some(format!("http://{clickhouse}")),
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let h = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            StorageHandle::connect(&cfg),
+        )
+        .await
+        .expect("StorageHandle::connect hung on backends that never answer");
+        assert!(!h.has_redis() && !h.has_clickhouse());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn redact_url_hides_credentials_only() {
+        assert_eq!(
+            redact_url("redis://:s3cret@valkey:6379/0"),
+            "redis://***@valkey:6379/0"
+        );
+        assert_eq!(
+            redact_url("rediss://user:p@ss@valkey:6380"),
+            "rediss://***@valkey:6380"
+        );
+        assert_eq!(redact_url("redis://valkey:6379"), "redis://valkey:6379");
     }
 
     #[tokio::test]
