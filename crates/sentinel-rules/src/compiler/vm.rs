@@ -55,22 +55,21 @@ enum StackVal {
 // ---------------------------------------------------------------------------
 
 /// Parse a URL-encoded query string into (key, value) pairs.
-fn parse_query_params(query: &str) -> Vec<(String, String)> {
-    query
-        .split('&')
-        .filter(|kv| !kv.is_empty())
-        .map(|kv| {
-            let mut parts = kv.splitn(2, '=');
-            // application/x-www-form-urlencoded + query-string semantics: '+'
-            // encodes a space and must be replaced BEFORE percent-decoding (so a
-            // literal '+' sent as %2B survives). Without this, payloads whose
-            // spaces are '+'-encoded (the Go/GoTestWAF default) reach the rule
-            // operators with literal '+' and evade @rx / @detectSQLi / @detectXSS.
-            let k = percent_decode(&parts.next().unwrap_or("").replace('+', " "));
-            let v = percent_decode(&parts.next().unwrap_or("").replace('+', " "));
-            (k, v)
-        })
-        .collect()
+///
+/// Lazily, so the pairs go straight into the lists that keep them rather than
+/// through a list of pairs held alongside; see `Params::from_pairs`.
+fn parse_query_params(query: &str) -> impl Iterator<Item = (String, String)> + '_ {
+    query.split('&').filter(|kv| !kv.is_empty()).map(|kv| {
+        let mut parts = kv.splitn(2, '=');
+        // application/x-www-form-urlencoded + query-string semantics: '+'
+        // encodes a space and must be replaced BEFORE percent-decoding (so a
+        // literal '+' sent as %2B survives). Without this, payloads whose
+        // spaces are '+'-encoded (the Go/GoTestWAF default) reach the rule
+        // operators with literal '+' and evade @rx / @detectSQLi / @detectXSS.
+        let k = percent_decode(&parts.next().unwrap_or("").replace('+', " "));
+        let v = percent_decode(&parts.next().unwrap_or("").replace('+', " "));
+        (k, v)
+    })
 }
 
 /// `@validateUrlEncoding`: does this value contain malformed percent-encoding?
@@ -299,7 +298,7 @@ fn contains_off_domain_url(value: &str, request_host: &str) -> bool {
 /// pairs.  Object keys become the parameter name; array elements inherit the
 /// parent name (matching ModSecurity's `ARGS:json.path` behaviour closely
 /// enough for detection).  Scalars are stringified; `null` is skipped.
-fn flatten_json(prefix: &str, val: &serde_json::Value, out: &mut Vec<(String, String)>) {
+fn flatten_json(prefix: &str, val: &serde_json::Value, out: &mut impl Extend<(String, String)>) {
     use serde_json::Value;
     match val {
         Value::Object(map) => {
@@ -319,9 +318,9 @@ fn flatten_json(prefix: &str, val: &serde_json::Value, out: &mut Vec<(String, St
                 flatten_json(prefix, v, out);
             }
         }
-        Value::String(s) => out.push((prefix.to_owned(), s.clone())),
-        Value::Number(n) => out.push((prefix.to_owned(), n.to_string())),
-        Value::Bool(b) => out.push((prefix.to_owned(), b.to_string())),
+        Value::String(s) => out.extend([(prefix.to_owned(), s.clone())]),
+        Value::Number(n) => out.extend([(prefix.to_owned(), n.to_string())]),
+        Value::Bool(b) => out.extend([(prefix.to_owned(), b.to_string())]),
         Value::Null => {}
     }
 }
@@ -333,10 +332,11 @@ fn flatten_json(prefix: &str, val: &serde_json::Value, out: &mut Vec<(String, St
 /// Parsed components of a `multipart/form-data` request body.
 #[derive(Default)]
 struct MultipartParts {
-    /// Non-file form fields: `(name, value)`.  These feed ARGS/ARGS_NAMES so
-    /// injection delivered through a multipart form is inspected exactly like
-    /// an `application/x-www-form-urlencoded` form.
-    fields: Vec<(String, String)>,
+    /// Non-file form fields.  These feed ARGS/ARGS_NAMES so injection delivered
+    /// through a multipart form is inspected exactly like an
+    /// `application/x-www-form-urlencoded` form — they ARE the body parameters
+    /// of a multipart request; see `RequestViews::body`.
+    fields: Params,
     /// Original client filenames (the `filename=` attribute). ModSec `FILES`.
     filenames: Vec<String>,
     /// Field names of file-upload parts (the `name=` attribute). ModSec
@@ -399,6 +399,7 @@ fn multipart_parts(ctx: &RequestContext) -> MultipartParts {
     let (Some(body), Some(boundary)) = (ctx.request_body.as_ref(), multipart_boundary(ctx)) else {
         return out;
     };
+    let mut fields = (Vec::new(), Vec::new());
     let body: &[u8] = body;
     let delim = format!("--{boundary}");
     let delim = delim.as_bytes();
@@ -431,14 +432,20 @@ fn multipart_parts(ctx: &RequestContext) -> MultipartParts {
         if part_end >= part_start + 2 && &body[part_end - 2..part_end] == b"\r\n" {
             part_end -= 2;
         }
-        parse_one_part(&body[part_start..part_end], &mut out);
+        parse_one_part(&body[part_start..part_end], &mut out, &mut fields);
         search_from = next + delim.len();
     }
+    out.fields = Params::from_lists(fields);
     out
 }
 
-/// Parse a single multipart part (its headers and content) and record it.
-fn parse_one_part(part: &[u8], out: &mut MultipartParts) {
+/// Parse a single multipart part (its headers and content) and record it; a
+/// non-file field goes to `fields`.
+fn parse_one_part(
+    part: &[u8],
+    out: &mut MultipartParts,
+    fields: &mut impl Extend<(String, String)>,
+) {
     let (headers, content) = match find_bytes(part, b"\r\n\r\n") {
         Some(p) => (&part[..p], &part[p + 4..]),
         None => (part, &b""[..]),
@@ -482,8 +489,7 @@ fn parse_one_part(part: &[u8], out: &mut MultipartParts) {
         // Otherwise it is a regular form field; its value feeds ARGS.
         None => {
             if let Some(n) = name {
-                out.fields
-                    .push((n, String::from_utf8_lossy(content).into_owned()));
+                fields.extend([(n, String::from_utf8_lossy(content).into_owned())]);
             }
         }
     }
@@ -514,6 +520,33 @@ fn disposition_param(line: &str, key: &str) -> Option<String> {
     }
 }
 
+/// The parser a request body goes to, chosen by its (lower-cased)
+/// Content-Type. Tested in this order, so a type that names two —
+/// `multipart/form-data; boundary=a+json` — goes to the first.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BodyParser {
+    Urlencoded,
+    Json,
+    Multipart,
+    Xml,
+    /// No parser: the body reaches rules only as `REQUEST_BODY`.
+    None,
+}
+
+fn body_parser(ct: &str) -> BodyParser {
+    if ct.starts_with("application/x-www-form-urlencoded") {
+        BodyParser::Urlencoded
+    } else if ct.starts_with("application/json") || ct.contains("+json") {
+        BodyParser::Json
+    } else if ct.starts_with("multipart/form-data") {
+        BodyParser::Multipart
+    } else if is_xml_content_type(ct) {
+        BodyParser::Xml
+    } else {
+        BodyParser::None
+    }
+}
+
 /// Parse POST-body parameters into `(name, value)` pairs.
 ///
 /// ModSecurity's `ARGS` collection merges query-string and POST-body
@@ -523,37 +556,34 @@ fn disposition_param(line: &str, key: &str) -> Option<String> {
 /// (including `+json` suffixes such as `application/vnd.api+json`).
 ///
 /// Called only through `RequestViews::body`, which builds it once per call.
-fn body_args(ctx: &RequestContext, views: &RequestViews) -> Vec<(String, String)> {
+/// A multipart body's parameters are its non-file form fields, which
+/// `RequestViews::body` takes from the multipart view instead of copying.
+fn body_args(ctx: &RequestContext, parser: BodyParser) -> Params {
     let Some(body) = ctx.request_body.as_ref() else {
-        return Vec::new();
+        return Params::default();
     };
-    let ct = views.content_type(ctx);
-    if ct.starts_with("application/x-www-form-urlencoded") {
-        let text = String::from_utf8_lossy(body);
-        parse_query_params(&text)
-    } else if ct.starts_with("application/json") || ct.contains("+json") {
-        match serde_json::from_slice::<serde_json::Value>(body) {
+    match parser {
+        BodyParser::Urlencoded => {
+            let text = String::from_utf8_lossy(body);
+            Params::from_pairs(parse_query_params(&text))
+        }
+        BodyParser::Json => match serde_json::from_slice::<serde_json::Value>(body) {
             Ok(val) => {
-                let mut out = Vec::new();
-                flatten_json("", &val, &mut out);
-                out
+                let mut lists = (Vec::new(), Vec::new());
+                flatten_json("", &val, &mut lists);
+                Params::from_lists(lists)
             }
             // Malformed JSON: fall back to scanning the raw body as one value
             // so obfuscated/broken payloads still reach the regex operators.
-            Err(_) => vec![(String::new(), String::from_utf8_lossy(body).into_owned())],
-        }
-    } else if ct.starts_with("multipart/form-data") {
-        // Non-file form fields feed ARGS exactly like a urlencoded form, so
-        // injection delivered through a multipart body is inspected the same
-        // way.  File parts are surfaced via the FILES* targets, not ARGS.
-        views.multipart(ctx).fields.clone()
-    } else if is_xml_content_type(ct) {
+            Err(_) => {
+                Params::from_pairs([(String::new(), String::from_utf8_lossy(body).into_owned())])
+            }
+        },
         // XML / SOAP bodies: surface element text, attribute values, and CDATA
         // into ARGS so payloads delivered inside XML reach the same operators
         // as form/JSON parameters (SOAP APIs are a common injection vector).
-        parse_xml_args(body)
-    } else {
-        Vec::new()
+        BodyParser::Xml => Params::from_lists(parse_xml_args(body)),
+        BodyParser::Multipart | BodyParser::None => Params::default(),
     }
 }
 
@@ -576,9 +606,9 @@ fn is_xml_content_type(ct: &str) -> bool {
 /// declarations, namespaces, and DTDs are ignored. Malformed input fails open
 /// (extracts what it can). Byte offsets only ever land on ASCII delimiters
 /// (`<`, `>`, `]]>`, …), so all `&str` slicing stays on char boundaries.
-fn parse_xml_args(body: &[u8]) -> Vec<(String, String)> {
+fn parse_xml_args<Out: Default + Extend<(String, String)>>(body: &[u8]) -> Out {
     let text = String::from_utf8_lossy(body);
-    let mut out: Vec<(String, String)> = Vec::new();
+    let mut out = Out::default();
     let mut cur_elem = String::new();
     let bytes = text.as_bytes();
     let mut i = 0;
@@ -589,7 +619,7 @@ fn parse_xml_args(body: &[u8]) -> Vec<(String, String)> {
             let end = text[i..].find('<').map(|p| i + p).unwrap_or(bytes.len());
             let chunk = &text[i..end];
             if !chunk.trim().is_empty() {
-                out.push((cur_elem.clone(), decode_xml_entities(chunk)));
+                out.extend([(cur_elem.clone(), decode_xml_entities(chunk))]);
             }
             i = end;
             continue;
@@ -607,7 +637,7 @@ fn parse_xml_args(body: &[u8]) -> Vec<(String, String)> {
                 Some(rel) => {
                     let content = &text[start..start + rel];
                     if !content.trim().is_empty() {
-                        out.push((cur_elem.clone(), content.to_owned()));
+                        out.extend([(cur_elem.clone(), content.to_owned())]);
                     }
                     i = start + rel + 3;
                 }
@@ -650,7 +680,7 @@ fn local_name(raw: &str) -> String {
 
 /// Extract `name="value"` / `name='value'` attribute pairs from the portion of
 /// a start tag after the element name, decoding XML entities in each value.
-fn extract_xml_attributes(attrs: &str, out: &mut Vec<(String, String)>) {
+fn extract_xml_attributes(attrs: &str, out: &mut impl Extend<(String, String)>) {
     let chars: Vec<char> = attrs.chars().collect();
     let n = chars.len();
     let mut i = 0;
@@ -683,7 +713,7 @@ fn extract_xml_attributes(attrs: &str, out: &mut Vec<(String, String)>) {
                     i += 1; // consume the closing quote
                 }
                 if !name.is_empty() {
-                    out.push((name, decode_xml_entities(&val)));
+                    out.extend([(name, decode_xml_entities(&val))]);
                 }
             }
         }
@@ -741,8 +771,63 @@ fn decode_xml_entities(s: &str) -> String {
 // Per-evaluate request views
 // ---------------------------------------------------------------------------
 
-/// A memoizable target and the transform chain applied to it.
-type TransformKey = (TargetSpec, Vec<Transform>);
+/// Request parameters as parallel name and value lists, in request order.
+///
+/// Two lists rather than pairs, each behind an `Rc`, so that ARGS and
+/// ARGS_NAMES can be handed to the stack as they are. Built from pairs, each
+/// target was a copy of every name or every value, kept for the whole call.
+#[derive(Default)]
+struct Params {
+    names: Rc<Vec<String>>,
+    values: Rc<Vec<String>>,
+}
+
+impl Params {
+    /// Collect `pairs` into the two lists one pair at a time. A parser that
+    /// collected its pairs first and split them after would hold the pairs and
+    /// both lists at once — half again the parse, on a body of tiny fields.
+    fn from_pairs(pairs: impl IntoIterator<Item = (String, String)>) -> Self {
+        Self::from_lists(pairs.into_iter().unzip())
+    }
+
+    /// From the name and value lists a parser pushed its pairs into.
+    fn from_lists((names, values): (Vec<String>, Vec<String>)) -> Self {
+        Self {
+            names: Rc::new(names),
+            values: Rc::new(values),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// `(name, value)` pairs, in request order.
+    fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.names
+            .iter()
+            .zip(self.values.iter())
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+    }
+}
+
+/// A target and the transform chain applied to it — an empty chain for its
+/// untransformed values. What the per-call memo is keyed by.
+pub(crate) type MemoKey = (TargetSpec, Vec<Transform>);
+
+/// One collection kept for the rest of an `evaluate` call.
+struct MemoEntry {
+    values: Rc<Vec<String>>,
+    /// What keeping it costs: its size, or 0 when the values are held anyway —
+    /// by a parsed view, or by the entry they are shared with.
+    bytes: usize,
+    /// How many rules of the phase program read it: what keeping it saves.
+    uses: u32,
+}
 
 /// The request-derived collections rules read, each built at most ONCE per
 /// `evaluate` call and shared by every rule that reads it.
@@ -757,29 +842,51 @@ type TransformKey = (TargetSpec, Vec<Transform>);
 /// rules change TX variables, the scores and the verdict, never the request or
 /// the response, so a view built from them stays true for the rest of the call.
 /// What DOES change mid-call — TX variables, `MATCHED_VAR` — is never memoized;
-/// see `memoizable`.
+/// see `memo_policy`.
+///
+/// Memory: the parsed views hold the request's parameters once — what the old
+/// per-rule parse held for the length of one rule — and ARGS, ARGS_NAMES,
+/// ARGS_GET and a multipart REQUEST_BODY are those very lists. Everything else
+/// kept for the call, a copy no view holds or a transform chain's output, is
+/// charged to `memo_budget`. So one call holds at most its parse, that budget
+/// and the working set of the rule running — however many rules read the body
+/// and whatever the body contains (`tests/evaluate_memory.rs`). The working
+/// set is the old one: a chain over a raw body still holds its input and its
+/// output while it runs.
 #[derive(Default)]
-struct RequestViews {
+struct RequestViews<'a> {
     content_type: OnceCell<String>,
     host: OnceCell<String>,
-    query: OnceCell<Vec<(String, String)>>,
-    body: OnceCell<Vec<(String, String)>>,
+    query: OnceCell<Params>,
+    /// An urlencoded, JSON or XML body's parameters. A multipart body's are
+    /// in `multipart`; see `body`.
+    body: OnceCell<Params>,
     multipart: OnceCell<MultipartParts>,
     cookies: OnceCell<Vec<(String, String)>>,
-    /// Extracted values of the memoizable targets, handed to the stack by
-    /// reference count so that a rule loading ARGS copies nothing.
-    targets: RefCell<HashMap<TargetSpec, Rc<Vec<String>>>>,
-    /// The same values after a transform chain, keyed by target and chain.
-    /// CRS repeats a handful of pairs across dozens of rules — 103 rules read
-    /// ARGS through `t:urlDecodeUni` alone — and transforms are pure, so each
-    /// pair is computed once.
-    transformed: RefCell<HashMap<TransformKey, Rc<Vec<String>>>>,
-    /// Bytes of transformed copies held in `transformed`; see
-    /// `transform_memo_budget`.
-    transformed_bytes: Cell<usize>,
+    /// Collections kept for the call, by target and transform chain. CRS
+    /// repeats a handful of pairs across dozens of rules — 103 phase-2 rules
+    /// read ARGS through `t:urlDecodeUni` alone — and transforms are pure, so
+    /// each such pair is computed once.
+    memo: RefCell<HashMap<MemoKey, MemoEntry>>,
+    /// Sum of the entries' `bytes`; never more than `memo_budget`.
+    memo_bytes: Cell<usize>,
+    /// Set when the budget first refuses a collection, so the refusal is
+    /// logged once per call rather than once per rule.
+    memo_refused: Cell<bool>,
+    /// How many rules of this phase program read each key; see `memo_uses`.
+    /// `None` outside `evaluate`, where nothing is memoized.
+    uses: Option<&'a HashMap<MemoKey, u32>>,
 }
 
-impl RequestViews {
+impl<'a> RequestViews<'a> {
+    /// Views for one run of a phase program whose reads `uses` counts.
+    fn new(uses: &'a HashMap<MemoKey, u32>) -> Self {
+        Self {
+            uses: Some(uses),
+            ..Self::default()
+        }
+    }
+
     /// Lower-cased `Content-Type`; see `content_type`.
     fn content_type(&self, ctx: &RequestContext) -> &str {
         self.content_type.get_or_init(|| content_type(ctx))
@@ -791,19 +898,27 @@ impl RequestViews {
     }
 
     /// Decoded query-string parameters, in request order.
-    fn query(&self, ctx: &RequestContext) -> &[(String, String)] {
+    fn query(&self, ctx: &RequestContext) -> &Params {
         self.query.get_or_init(|| {
             note_view_built(View::Query);
-            parse_query_params(ctx.uri.query().unwrap_or(""))
+            Params::from_pairs(parse_query_params(ctx.uri.query().unwrap_or("")))
         })
     }
 
     /// Body parameters, in body order; see `body_args`.
-    fn body(&self, ctx: &RequestContext) -> &[(String, String)] {
-        self.body.get_or_init(|| {
-            note_view_built(View::Body);
-            body_args(ctx, self)
-        })
+    fn body(&self, ctx: &RequestContext) -> &Params {
+        match body_parser(self.content_type(ctx)) {
+            // Non-file form fields feed ARGS exactly like a urlencoded form, so
+            // injection delivered through a multipart body is inspected the
+            // same way; file parts are surfaced via the FILES* targets instead.
+            // Taken from the multipart view, not copied out of it: the copy
+            // duplicated every field of the body for the whole call.
+            BodyParser::Multipart => &self.multipart(ctx).fields,
+            parser => self.body.get_or_init(|| {
+                note_view_built(View::Body);
+                body_args(ctx, parser)
+            }),
+        }
     }
 
     /// The parsed `multipart/form-data` body; empty for any other body.
@@ -827,102 +942,285 @@ impl RequestViews {
         })
     }
 
-    /// The values `spec` names: from the memo when the target may be memoized,
-    /// extracted afresh when it may not.
+    /// The values of `spec` that a parsed view already holds, handed out
+    /// without a copy.
+    fn shared(&self, spec: &TargetSpec, ctx: &RequestContext) -> Option<Rc<Vec<String>>> {
+        let side = |params: &Params, names: bool| {
+            Rc::clone(if names { &params.names } else { &params.values })
+        };
+        match spec {
+            TargetSpec::ArgsGet => Some(side(self.query(ctx), false)),
+            TargetSpec::ArgsGetNames => Some(side(self.query(ctx), true)),
+            // ARGS is the query parameters followed by the body ones. With one
+            // side empty — a GET, or a POST without a query string — it IS the
+            // other side; only a request carrying both needs a joined copy.
+            TargetSpec::Args | TargetSpec::ArgsNames => {
+                let names = matches!(spec, TargetSpec::ArgsNames);
+                let (query, body) = (self.query(ctx), self.body(ctx));
+                if body.is_empty() {
+                    Some(side(query, names))
+                } else if query.is_empty() {
+                    Some(side(body, names))
+                } else {
+                    None
+                }
+            }
+            // The part values, not the envelope; see `extract_target`.
+            TargetSpec::RequestBody
+                if self.content_type(ctx).starts_with("multipart/form-data") =>
+            {
+                Some(Rc::clone(&self.multipart(ctx).fields.values))
+            }
+            _ => None,
+        }
+    }
+
+    /// The values `spec` names: shared from a view, taken from the memo, or
+    /// extracted afresh.
     fn load(
         &self,
         spec: &TargetSpec,
         ctx: &RequestContext,
         last_matched: Option<&str>,
     ) -> Rc<Vec<String>> {
-        if !memoizable(spec) {
-            return Rc::new(extract_target(spec, ctx, self, last_matched));
-        }
-        if let Some(values) = self.targets.borrow().get(spec) {
-            return Rc::clone(values);
-        }
-        let values = Rc::new(extract_target(spec, ctx, self, last_matched));
-        self.targets
-            .borrow_mut()
-            .insert(spec.clone(), Rc::clone(&values));
-        values
+        self.load_held(spec, ctx, last_matched).0
     }
 
-    /// The values of a memoizable `spec` after `transforms`, computed once per
-    /// call for each (target, chain) pair while the memory budget allows.
+    /// `load`, and whether the values are held for the rest of the call
+    /// anyway — by a view or by the memo — so that sharing them costs nothing.
+    fn load_held(
+        &self,
+        spec: &TargetSpec,
+        ctx: &RequestContext,
+        last_matched: Option<&str>,
+    ) -> (Rc<Vec<String>>, bool) {
+        if let Some(values) = self.shared(spec, ctx) {
+            return (values, true);
+        }
+        let policy = memo_policy(spec);
+        if policy == Memo::Never {
+            return (
+                Rc::new(extract_target(spec, ctx, self, last_matched)),
+                false,
+            );
+        }
+        let key = (spec.clone(), Vec::new());
+        if let Some(entry) = self.memo.borrow().get(&key) {
+            return (Rc::clone(&entry.values), true);
+        }
+        let values = Rc::new(extract_target(spec, ctx, self, last_matched));
+        let held = policy == Memo::All && self.retain(key, &values, held_size(&values), ctx);
+        (values, held)
+    }
+
+    /// How many values `spec` names, without building a joined ARGS for it.
+    fn count(&self, spec: &TargetSpec, ctx: &RequestContext, last_matched: Option<&str>) -> usize {
+        match spec {
+            TargetSpec::Args | TargetSpec::ArgsNames => {
+                self.query(ctx).len() + self.body(ctx).len()
+            }
+            other => self.load(other, ctx, last_matched).len(),
+        }
+    }
+
+    /// The values of a memoizable `spec` after `transforms`: computed once per
+    /// call for a (target, chain) pair that several rules read, while the
+    /// budget allows, and once per rule otherwise.
     fn load_transformed(
         &self,
         spec: &TargetSpec,
         transforms: &[Transform],
         ctx: &RequestContext,
     ) -> Rc<Vec<String>> {
-        debug_assert!(memoizable(spec));
-        let key = (spec.clone(), transforms.to_vec());
-        if let Some(values) = self.transformed.borrow().get(&key) {
-            return Rc::clone(values);
+        debug_assert!(memo_policy(spec) != Memo::Never);
+        if transforms.is_empty() {
+            return self.load(spec, ctx, None);
         }
-        let base = self.load(spec, ctx, None);
+        let key = (spec.clone(), transforms.to_vec());
+        if let Some(entry) = self.memo.borrow().get(&key) {
+            return Rc::clone(&entry.values);
+        }
+        let (base, held) = self.load_held(spec, ctx, None);
         note_view_built(View::Transform);
-        let out: Vec<String> = base
-            .iter()
-            .map(|s| apply_transforms(s.clone(), transforms))
-            .collect();
-        // On benign text most chains change nothing; sharing the untransformed
-        // values then costs no memory at all.
-        let out = if out == *base {
-            base
-        } else {
-            // Each value's own header counts too: a body of a million one-byte
-            // fields is mostly headers, and judging it by its text would let
-            // the copies dwarf the budget.
-            let bytes: usize = out
-                .iter()
-                .map(|s| s.len() + std::mem::size_of::<String>())
-                .sum();
+        if let Some(out) = transform_values(&base, transforms) {
             let out = Rc::new(out);
-            let held = self.transformed_bytes.get() + bytes;
-            if held > transform_memo_budget(ctx) {
-                // Past the budget: transform per rule, as without the memo,
-                // rather than let a hostile body multiply its own size.
-                return out;
+            self.retain(key, &out, held_size(&out), ctx);
+            return out;
+        }
+        // On benign text most chains change nothing, and their output is the
+        // untransformed values. Held by a view or the memo already, those cost
+        // nothing to share. Otherwise — a raw body, copied per read — they are
+        // kept once, under the untransformed key, for every chain that leaves
+        // them as they are.
+        if held || self.retain((spec.clone(), Vec::new()), &base, held_size(&base), ctx) {
+            self.retain(key, &base, 0, ctx);
+        }
+        base
+    }
+
+    /// Keep `values` under `key` for the rest of the call if that pays and the
+    /// budget allows; `bytes` is what keeping them adds. Returns whether they
+    /// were kept.
+    ///
+    /// A key only one rule reads is never kept: it would spend budget and save
+    /// nothing. When the budget is full, copies that fewer rules read are
+    /// dropped to make room, so the chains CRS repeats most keep theirs
+    /// whichever rule happened to ask first.
+    fn retain(
+        &self,
+        key: MemoKey,
+        values: &Rc<Vec<String>>,
+        bytes: usize,
+        ctx: &RequestContext,
+    ) -> bool {
+        let uses = self.uses.and_then(|u| u.get(&key)).copied().unwrap_or(0);
+        if uses < 2 {
+            return false;
+        }
+        let mut memo = self.memo.borrow_mut();
+        if bytes > 0 {
+            let budget = memo_budget(ctx);
+            let held = self.memo_bytes.get();
+            let over = (held + bytes).saturating_sub(budget);
+            if over > 0 && !self.evict(&mut memo, over, uses) {
+                // Past the budget the VM costs what it did without the memo:
+                // one extraction and one chain per rule. Logged once per call
+                // so that a slow request can be told apart from a slow rule.
+                if !self.memo_refused.replace(true) {
+                    debug!(
+                        rule_target = %key.0.label(),
+                        chain_len = key.1.len(),
+                        bytes,
+                        memo_bytes = held,
+                        budget,
+                        "rule VM: per-request memo budget reached; collections past it \
+                         are re-extracted and re-transformed by every rule that reads them"
+                    );
+                }
+                return false;
             }
-            self.transformed_bytes.set(held);
-            out
-        };
-        self.transformed.borrow_mut().insert(key, Rc::clone(&out));
-        out
+            self.memo_bytes.set(self.memo_bytes.get() + bytes);
+        }
+        let replaced = memo.insert(
+            key,
+            MemoEntry {
+                values: Rc::clone(values),
+                bytes,
+                uses,
+            },
+        );
+        // Callers look a key up before computing it, so nothing is replaced;
+        // if something were, its bytes must not stay counted.
+        if let Some(old) = replaced {
+            self.memo_bytes.set(self.memo_bytes.get() - old.bytes);
+        }
+        true
+    }
+
+    /// Drop kept copies that fewer than `uses` rules read, fewest first, until
+    /// `needed` bytes are free. Drops nothing when that cannot free enough.
+    fn evict(&self, memo: &mut HashMap<MemoKey, MemoEntry>, needed: usize, uses: u32) -> bool {
+        let mut victims: Vec<(u32, usize, MemoKey)> = memo
+            .iter()
+            .filter(|(_, e)| e.bytes > 0 && e.uses < uses)
+            .map(|(key, e)| (e.uses, e.bytes, key.clone()))
+            .collect();
+        if victims.iter().map(|&(_, bytes, _)| bytes).sum::<usize>() < needed {
+            return false;
+        }
+        victims.sort_unstable_by_key(|&(uses, _, _)| uses);
+        let mut freed = 0;
+        for (_, bytes, key) in victims {
+            if freed >= needed {
+                break;
+            }
+            if let Some(gone) = memo.remove(&key) {
+                // Entries sharing its values held nothing of their own, and
+                // would keep them alive uncounted: they go with it.
+                memo.retain(|_, e| !Rc::ptr_eq(&e.values, &gone.values));
+                freed += bytes;
+            }
+        }
+        self.memo_bytes.set(self.memo_bytes.get() - freed);
+        true
     }
 }
 
-/// How many bytes of transformed copies one `evaluate` call may keep: twice the
-/// bodies under inspection, with a 1 MiB floor so that small requests always
-/// get the full benefit. A body built so that every chain rewrites every value
-/// would otherwise hold one copy per distinct chain — dozens of times its own
-/// size — where the memo-less VM held one at a time. Twice, because one
-/// rewritten copy of every argument, value headers included, can outgrow the
-/// body it came from.
-fn transform_memo_budget(ctx: &RequestContext) -> usize {
+/// `values` after `transforms`, or `None` when the chain changes none of them.
+///
+/// The copy starts at the first value the chain changes. On benign text most
+/// chains change nothing, and transforming into a full copy only to compare it
+/// with the original held a second copy of every argument for each chain.
+fn transform_values(values: &[String], transforms: &[Transform]) -> Option<Vec<String>> {
+    let mut out: Option<Vec<String>> = None;
+    for (i, value) in values.iter().enumerate() {
+        let transformed = apply_transforms(value.clone(), transforms);
+        match out.as_mut() {
+            Some(out) => out.push(transformed),
+            None if transformed != *value => {
+                let mut changed = Vec::with_capacity(values.len());
+                changed.extend_from_slice(&values[..i]);
+                changed.push(transformed);
+                out = Some(changed);
+            }
+            None => {}
+        }
+    }
+    out
+}
+
+/// What keeping `values` for the call costs. Each value's own header counts
+/// too: a body of a million one-byte fields is mostly headers, and judging it
+/// by its text would let the copies dwarf the budget.
+fn held_size(values: &[String]) -> usize {
+    values
+        .iter()
+        .map(|s| s.len() + std::mem::size_of::<String>())
+        .sum()
+}
+
+/// How many bytes the memo may keep in one `evaluate` call — copies that no
+/// parsed view holds, and transform chains' output: twice the bodies under
+/// inspection, with a 1 MiB floor so that small requests always get the full
+/// benefit. Without it, a body built so that every chain rewrites every value
+/// would hold one copy per distinct chain — dozens of times its own size —
+/// where the memo-less VM held one at a time. Twice, because one rewritten copy
+/// of every argument, value headers included, can outgrow the body it came
+/// from, and the most-read chain should still fit.
+fn memo_budget(ctx: &RequestContext) -> usize {
     const FLOOR: usize = 1 << 20;
     let len = |b: &Option<bytes::Bytes>| b.as_ref().map_or(0, |b| b.len());
     let bodies = len(&ctx.request_body).saturating_add(len(&ctx.response_body));
     bodies.saturating_mul(2).max(FLOOR)
 }
 
-/// Whether `spec`'s values may be memoized for the rest of an `evaluate` call:
-/// true for the collections that are expensive to build and derived from the
+/// What of a target's values may be kept for the rest of an `evaluate` call.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Memo {
+    /// Nothing: VM state, or one short value whose lookup would cost what
+    /// extracting it does.
+    Never,
+    /// Its transform chains' output, not its own values: a raw body, which is
+    /// one copy of bytes the context holds — cheap to make again per rule, and
+    /// a whole body to keep — while a chain over it is a pass over every byte.
+    Chains,
+    /// Its values and its chains' output: a collection built from many values.
+    All,
+}
+
+/// Which of `spec`'s values may be memoized: only collections derived from the
 /// request or response alone, which no rule modifies.
 ///
 /// Exhaustive on purpose, so a new target has to be classified here. Memoizing
 /// one that reads VM state would be silently wrong: a TX variable written by a
 /// `setvar` must be visible to the very next rule.
-fn memoizable(spec: &TargetSpec) -> bool {
+fn memo_policy(spec: &TargetSpec) -> Memo {
     match spec {
         TargetSpec::Args
         | TargetSpec::ArgsNames
         | TargetSpec::ArgsGet
         | TargetSpec::ArgsGetNames
         | TargetSpec::ArgsCombinedSize
-        | TargetSpec::RequestBody
         | TargetSpec::RequestHeadersAll
         | TargetSpec::RequestHeadersNames
         | TargetSpec::RequestCookiesAll
@@ -933,9 +1231,8 @@ fn memoizable(spec: &TargetSpec) -> bool {
         | TargetSpec::Files
         | TargetSpec::FilesNames
         | TargetSpec::FilesCombinedSize
-        | TargetSpec::ResponseHeadersAll
-        | TargetSpec::ResponseBody => true,
-        // One short value each: a lookup would cost what extraction does.
+        | TargetSpec::ResponseHeadersAll => Memo::All,
+        TargetSpec::RequestBody | TargetSpec::ResponseBody => Memo::Chains,
         TargetSpec::RequestUri
         | TargetSpec::RequestFilename
         | TargetSpec::RequestMethod
@@ -946,12 +1243,51 @@ fn memoizable(spec: &TargetSpec) -> bool {
         | TargetSpec::QueryString
         | TargetSpec::ResponseHeader(_)
         | TargetSpec::RemoteAddr
-        | TargetSpec::Geo => false,
+        | TargetSpec::Geo => Memo::Never,
         // Counted from the inner target, which is memoized itself when it can be.
-        TargetSpec::CountOf(_) => false,
+        TargetSpec::CountOf(_) => Memo::Never,
         // VM state: written by `setvar` and by the previous chain link.
-        TargetSpec::TxVar(_) | TargetSpec::MatchedVar => false,
+        TargetSpec::TxVar(_) | TargetSpec::MatchedVar => Memo::Never,
     }
+}
+
+/// How many rules of `program` read each memoizable target — untransformed,
+/// and through each transform chain — which is what keeping it for a call
+/// saves. Computed once per compiled program, so `evaluate` only looks it up.
+///
+/// Mirrors `evaluate`: the chain is the `ApplyTransforms` the compiler emits
+/// right after a `LoadTarget`, and a multiMatch chain is never memoized. Every
+/// read needs the untransformed values, if only to transform them, so each one
+/// counts for them as well.
+pub(crate) fn memo_uses(program: &[Instruction]) -> HashMap<MemoKey, u32> {
+    let mut uses: HashMap<MemoKey, u32> = HashMap::new();
+    for (ip, instr) in program.iter().enumerate() {
+        let Instruction::LoadTarget(spec) = instr else {
+            continue;
+        };
+        if let TargetSpec::CountOf(inner) = spec {
+            if memo_policy(inner) != Memo::Never {
+                *uses
+                    .entry((inner.as_ref().clone(), Vec::new()))
+                    .or_default() += 1;
+            }
+            continue;
+        }
+        if memo_policy(spec) == Memo::Never {
+            continue;
+        }
+        *uses.entry((spec.clone(), Vec::new())).or_default() += 1;
+        if let Some(Instruction::ApplyTransforms {
+            transforms,
+            multi_match: false,
+        }) = program.get(ip + 1)
+        {
+            if !transforms.is_empty() {
+                *uses.entry((spec.clone(), transforms.clone())).or_default() += 1;
+            }
+        }
+    }
+    uses
 }
 
 /// A request view, for counting how often each is built.
@@ -1002,19 +1338,26 @@ fn extract_target(
         // honest answer: the condition simply does not match.
         TargetSpec::MatchedVar => last_matched.map(|v| vec![v.to_owned()]).unwrap_or_default(),
         // ARGS also includes urlencoded / JSON POST body parameters, after the
-        // query-string ones.
-        TargetSpec::Args => views
-            .query(ctx)
-            .iter()
-            .chain(views.body(ctx))
-            .map(|(_, v)| v.clone())
-            .collect(),
-        TargetSpec::ArgsNames => views
-            .query(ctx)
-            .iter()
-            .chain(views.body(ctx))
-            .map(|(k, _)| k.clone())
-            .collect(),
+        // query-string ones. Built only for a request carrying both; with one
+        // side empty `RequestViews::shared` hands out the other side as it is.
+        TargetSpec::Args => {
+            let (query, body) = (views.query(ctx), views.body(ctx));
+            query
+                .values
+                .iter()
+                .chain(body.values.iter())
+                .cloned()
+                .collect()
+        }
+        TargetSpec::ArgsNames => {
+            let (query, body) = (views.query(ctx), views.body(ctx));
+            query
+                .names
+                .iter()
+                .chain(body.names.iter())
+                .cloned()
+                .collect()
+        }
         TargetSpec::RequestUri => vec![ctx.uri.to_string()],
         TargetSpec::RequestFilename => vec![ctx.uri.path().to_owned()],
         TargetSpec::RequestMethod => vec![ctx.method.as_str().to_owned()],
@@ -1070,12 +1413,7 @@ fn extract_target(
         // boundary noise.
         TargetSpec::RequestBody => {
             if views.content_type(ctx).starts_with("multipart/form-data") {
-                views
-                    .multipart(ctx)
-                    .fields
-                    .iter()
-                    .map(|(_, v)| v.clone())
-                    .collect()
+                views.multipart(ctx).fields.values.to_vec()
             } else {
                 ctx.request_body
                     .as_ref()
@@ -1112,8 +1450,8 @@ fn extract_target(
         // written for the query side would otherwise also score body parameters,
         // which is how a query-only restriction turns into a false positive on a
         // legitimate POST.
-        TargetSpec::ArgsGet => views.query(ctx).iter().map(|(_, v)| v.clone()).collect(),
-        TargetSpec::ArgsGetNames => views.query(ctx).iter().map(|(k, _)| k.clone()).collect(),
+        TargetSpec::ArgsGet => views.query(ctx).values.to_vec(),
+        TargetSpec::ArgsGetNames => views.query(ctx).names.to_vec(),
         // The raw, still-encoded query string. CRS uses this for rules that must
         // see the encoding itself — double-encoding and separator abuse — so it
         // must NOT be decoded here.
@@ -1176,7 +1514,7 @@ fn extract_target(
             let total: usize = views
                 .query(ctx)
                 .iter()
-                .chain(views.body(ctx))
+                .chain(views.body(ctx).iter())
                 .map(|(k, v)| k.len() + v.len())
                 .sum();
             vec![total.to_string()]
@@ -1198,7 +1536,7 @@ fn extract_target(
                     .as_ref()
                     .map(|h| h.get_all(name.as_str()).iter().count())
                     .unwrap_or(0),
-                other => views.load(other, ctx, last_matched).len(),
+                other => views.count(other, ctx, last_matched),
             };
             vec![count.to_string()]
         }
@@ -1238,11 +1576,7 @@ fn collect_sensitive_values(ctx: &RequestContext, views: &RequestViews) -> Vec<S
     // second, target-based redaction pass could not catch it either. A session
     // JWT that tripped libinjection was therefore written verbatim to waf.log,
     // to ClickHouse under a 90-day TTL, and out to the SIEM.
-    let args = views
-        .query(ctx)
-        .iter()
-        .chain(views.body(ctx))
-        .map(|(name, value)| (name.as_str(), value.as_str()));
+    let args = views.query(ctx).iter().chain(views.body(ctx).iter());
 
     // Cookies are not collected here: EVERY cookie value is withheld at capture
     // (see `withheld_cookie_value`), whatever its name. Judging them by name let
@@ -1378,7 +1712,7 @@ pub fn evaluate(
 
     // Parsed request collections, built once and shared by every rule for the
     // rest of this call — and dropped with it. See `RequestViews`.
-    let views = RequestViews::default();
+    let views = RequestViews::new(&ruleset.memo_uses[phase_idx]);
     let mut stack: Vec<StackVal> = Vec::with_capacity(16);
     let mut ip: usize = 0; // instruction pointer
                            // Per-rule target attribution, reset at every RuleEnd. The spec,
@@ -1432,12 +1766,13 @@ pub fn evaluate(
                 // it. For a memoizable target, take the transformed values
                 // from the memo and step over the ApplyTransforms. multiMatch
                 // keeps every intermediate step and is left to run in full.
+                // `memo_uses` counts the pairs on this same pattern.
                 if let Some(Instruction::ApplyTransforms {
                     transforms,
                     multi_match: false,
                 }) = program.get(ip + 1)
                 {
-                    if memoizable(spec) {
+                    if memo_policy(spec) != Memo::Never {
                         let values = views.load_transformed(spec, transforms, ctx);
                         stack.push(StackVal::Strings(values));
                         ip += 2;
@@ -2844,22 +3179,30 @@ impl RequestValues {
         // the values the rules read.
         let views = RequestViews::default();
         let mut entries = Vec::new();
-        for (k, v) in views.query(ctx) {
-            entries.push((Collection::ArgsNames, format!("ARGS_NAMES:{k}"), k.clone()));
-            entries.push((Collection::ArgsGet, format!("ARGS:{k}"), v.clone()));
+        for (k, v) in views.query(ctx).iter() {
+            entries.push((
+                Collection::ArgsNames,
+                format!("ARGS_NAMES:{k}"),
+                k.to_owned(),
+            ));
+            entries.push((Collection::ArgsGet, format!("ARGS:{k}"), v.to_owned()));
         }
         let body = views.body(ctx);
         let body_parsed = !body.is_empty();
-        for (k, v) in body {
+        for (k, v) in body.iter() {
             if !k.is_empty() {
-                entries.push((Collection::ArgsNames, format!("ARGS_NAMES:{k}"), k.clone()));
+                entries.push((
+                    Collection::ArgsNames,
+                    format!("ARGS_NAMES:{k}"),
+                    k.to_owned(),
+                ));
             }
             let label = if k.is_empty() {
                 "REQUEST_BODY".to_string()
             } else {
                 format!("ARGS:{k}")
             };
-            entries.push((Collection::ArgsPost, label, v.clone()));
+            entries.push((Collection::ArgsPost, label, v.to_owned()));
         }
         for (k, v) in views.cookies(ctx) {
             entries.push((
@@ -3190,9 +3533,9 @@ SecRule ARGS|ARGS_NAMES "@rx never-m" "id:17,phase:2,pass,t:none,t:urlDecodeUni"
         );
         let [_, body, multipart, _, _] = builds();
         assert!(
-            multipart == 1 && body <= 1,
+            multipart == 1 && body == 0,
             "one evaluate parsed the multipart envelope {multipart}x and built \
-             the body arguments {body}x"
+             a separate copy of its fields {body}x"
         );
 
         // A second call builds its own views: nothing outlives one evaluate.
@@ -3229,6 +3572,16 @@ SecRule ARGS "@rx ^hello world$" "id:8,phase:2,pass,t:none,t:lowercase,msg:'fire
         assert!(c.rule_matches.iter().any(|m| m.rule_id == "8"));
     }
 
+    /// A use count of `n` for each key: what `memo_uses` would report for a
+    /// program in which `n` rules read each of them.
+    fn read_by(n: u32, keys: &[MemoKey]) -> HashMap<MemoKey, u32> {
+        keys.iter().map(|k| (k.clone(), n)).collect()
+    }
+
+    fn key(spec: TargetSpec, chain: &[Transform]) -> MemoKey {
+        (spec, chain.to_vec())
+    }
+
     /// The memo hands back exactly what applying the chain directly produces —
     /// same values, same order — whether it is the first request for a pair or
     /// a repeat, and whatever order the pairs are asked for in.
@@ -3254,8 +3607,19 @@ SecRule ARGS "@rx ^hello world$" "id:8,phase:2,pass,t:none,t:lowercase,msg:'fire
             vec![Transform::EscapeSeqDecode],
             vec![Transform::Length],
         ];
-        let views = RequestViews::default();
-        for spec in [TargetSpec::Args, TargetSpec::ArgsNames] {
+        let specs = [
+            TargetSpec::Args,
+            TargetSpec::ArgsNames,
+            TargetSpec::RequestBody,
+        ];
+        let keys: Vec<MemoKey> = specs
+            .iter()
+            .flat_map(|s| chains.iter().map(|ch| key(s.clone(), ch)))
+            .chain(specs.iter().map(|s| key(s.clone(), &[])))
+            .collect();
+        let uses = read_by(2, &keys);
+        let views = RequestViews::new(&uses);
+        for spec in specs {
             let base = views.load(&spec, &c, None);
             for chain in chains.iter().chain(chains.iter().rev()) {
                 let direct: Vec<String> = base
@@ -3268,35 +3632,294 @@ SecRule ARGS "@rx ^hello world$" "id:8,phase:2,pass,t:none,t:lowercase,msg:'fire
             // The base values themselves are never rewritten by a chain.
             assert_eq!(*views.load(&spec, &c, None), *base);
         }
+        assert!(views.memo_bytes.get() <= memo_budget(&c));
+    }
+
+    /// ARGS, ARGS_NAMES and ARGS_GET are the parsed lists themselves, handed
+    /// out without a copy, whenever one side of the request is empty — a POST
+    /// without a query string, or a GET. So is a multipart body's REQUEST_BODY,
+    /// and its body parameters are the multipart view's fields, not a copy of
+    /// them. Each of these used to be a full copy of the body's names or values,
+    /// kept for the rest of the call.
+    #[test]
+    fn args_are_the_parsed_lists_not_copies() {
+        let keys = [
+            key(TargetSpec::Args, &[]),
+            key(TargetSpec::ArgsNames, &[]),
+            key(TargetSpec::ArgsGet, &[]),
+            key(TargetSpec::ArgsGetNames, &[]),
+            key(TargetSpec::RequestBody, &[]),
+        ];
+        let uses = read_by(50, &keys);
+        let same = |a: &Rc<Vec<String>>, b: &Rc<Vec<String>>| Rc::ptr_eq(a, b);
+
+        let form = post(
+            "/login",
+            "application/x-www-form-urlencoded",
+            "user=ann&pass=x",
+        );
+        let views = RequestViews::new(&uses);
+        let body = views.body(&form);
+        assert!(same(
+            &views.load(&TargetSpec::Args, &form, None),
+            &body.values
+        ));
+        assert!(same(
+            &views.load(&TargetSpec::ArgsNames, &form, None),
+            &body.names
+        ));
+        assert_eq!(
+            *views.load(&TargetSpec::ArgsNames, &form, None),
+            ["user", "pass"]
+        );
+        assert_eq!(views.memo_bytes.get(), 0, "nothing was copied");
+
+        let mut get = post("/search?q=shoes&page=2", "", "");
+        get.request_body = None;
+        let views = RequestViews::new(&uses);
+        let query = views.query(&get);
+        for spec in [TargetSpec::Args, TargetSpec::ArgsGet] {
+            assert!(same(&views.load(&spec, &get, None), &query.values));
+        }
+        for spec in [TargetSpec::ArgsNames, TargetSpec::ArgsGetNames] {
+            assert!(same(&views.load(&spec, &get, None), &query.names));
+        }
+        assert_eq!(views.memo_bytes.get(), 0, "nothing was copied");
+
+        let boundary = "XyZ";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"note\"\r\n\r\nhello\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"doc\"; filename=\"a.txt\"\r\n\
+             Content-Type: text/plain\r\n\r\nfile body\r\n--{boundary}--\r\n"
+        );
+        let multi = post(
+            "/upload",
+            &format!("multipart/form-data; boundary={boundary}"),
+            &body,
+        );
+        let views = RequestViews::new(&uses);
+        assert!(
+            std::ptr::eq(views.body(&multi), &views.multipart(&multi).fields),
+            "a multipart body's parameters must be the multipart view's fields"
+        );
+        let fields = &views.multipart(&multi).fields;
+        assert_eq!(*fields.values, ["hello"]);
+        assert!(same(
+            &views.load(&TargetSpec::Args, &multi, None),
+            &fields.values
+        ));
+        assert!(same(
+            &views.load(&TargetSpec::RequestBody, &multi, None),
+            &fields.values
+        ));
+        assert_eq!(views.memo_bytes.get(), 0, "nothing was copied");
+    }
+
+    /// A request carrying parameters on both sides gets ONE joined copy of ARGS
+    /// — query first, then body, as before — and that copy is charged to the
+    /// budget like any other.
+    #[test]
+    fn a_joined_args_copy_is_ordered_and_charged() {
+        let c = post("/x?a=1&b=2", "application/json", r#"{"c":"3","d":"4"}"#);
+        let uses = read_by(50, &[key(TargetSpec::Args, &[])]);
+        let views = RequestViews::new(&uses);
+        let args = views.load(&TargetSpec::Args, &c, None);
+        assert_eq!(*args, ["1", "2", "3", "4"]);
+        assert_eq!(
+            *views.load(&TargetSpec::ArgsNames, &c, None),
+            ["a", "b", "c", "d"]
+        );
+        assert_eq!(views.memo_bytes.get(), held_size(&args));
+        assert!(Rc::ptr_eq(&views.load(&TargetSpec::Args, &c, None), &args));
+        assert_eq!(views.count(&TargetSpec::Args, &c, None), 4);
+    }
+
+    /// Body of `n` fields `k=VALUE...` whose values every lower-casing chain
+    /// rewrites. About 50 bytes per field, 74 of copy with the value header.
+    fn upper_case_form(n: usize) -> RequestContext {
+        let body: String = (0..n)
+            .map(|i| format!("k{i}=VALUE+NUMBER+{i:08}+XXXXXXXXXXXXXXXXXXXXXXXX"))
+            .collect::<Vec<_>>()
+            .join("&");
+        post("/x", "application/x-www-form-urlencoded", &body)
     }
 
     /// A body built so that every chain rewrites every value would make the
     /// memo hold one copy per chain. Past the budget a chain's output is still
-    /// returned, correct, but not kept.
+    /// returned, correct, but not kept — and the refusal is flagged, once.
     #[test]
     fn transform_memo_stays_within_its_budget() {
-        // ~1.6 MB of body whose upper-case values every lower-casing chain
-        // rewrites: one rewritten copy (~2.1 MB with value headers) fits the
-        // budget of twice the body, a second one no longer does.
-        let body: String = (0..30_000)
-            .map(|i| format!("k{i}=VALUE+NUMBER+{i:08}+XXXXXXXXXXXXXXXXXXXXXXXX"))
-            .collect::<Vec<_>>()
-            .join("&");
-        let c = post("/x", "application/x-www-form-urlencoded", &body);
-        let budget = transform_memo_budget(&c);
-        let views = RequestViews::default();
+        // ~1.6 MB of body: one rewritten copy (~2.2 MB with value headers) fits
+        // the budget of twice the body, a second one no longer does.
+        let c = upper_case_form(30_000);
+        let budget = memo_budget(&c);
         let lower = [Transform::Lowercase];
         let lower_squeezed = [Transform::Lowercase, Transform::RemoveWhitespace];
+        let uses = read_by(
+            2,
+            &[
+                key(TargetSpec::Args, &lower),
+                key(TargetSpec::Args, &lower_squeezed),
+            ],
+        );
+        let views = RequestViews::new(&uses);
         let first = views.load_transformed(&TargetSpec::Args, &lower, &c);
+        assert!(!views.memo_refused.get());
         let second = views.load_transformed(&TargetSpec::Args, &lower_squeezed, &c);
         assert!(first[0].starts_with("value number"));
         assert!(second[0].starts_with("valuenumber"));
-        assert!(views.transformed_bytes.get() <= budget);
-        let memo = views.transformed.borrow();
-        assert!(memo.contains_key(&(TargetSpec::Args, lower.to_vec())));
+        assert!(views.memo_bytes.get() <= budget);
         assert!(
-            !memo.contains_key(&(TargetSpec::Args, lower_squeezed.to_vec())),
+            views.memo_refused.get(),
+            "the refusal must be flagged for the log"
+        );
+        let memo = views.memo.borrow();
+        assert!(memo.contains_key(&key(TargetSpec::Args, &lower)));
+        assert!(
+            !memo.contains_key(&key(TargetSpec::Args, &lower_squeezed)),
             "a chain past the budget must not be kept"
+        );
+    }
+
+    /// Copies no view holds count against the budget too, not only transform
+    /// output: a joined ARGS too big for the budget is handed out but not kept.
+    /// The old memo kept every untransformed target uncounted, so a hostile
+    /// body of tiny fields held several copies of itself for the whole call.
+    #[test]
+    fn untransformed_copies_are_charged_to_the_budget() {
+        // 400 000 one-byte fields: ~1.6 MB of body, but every value is a
+        // 24-byte String header plus its byte, so a joined ARGS is ~10 MB.
+        let body = "a=1&".repeat(400_000);
+        let c = post("/x?q=1", "application/x-www-form-urlencoded", &body);
+        let uses = read_by(
+            350,
+            &[key(TargetSpec::Args, &[]), key(TargetSpec::ArgsNames, &[])],
+        );
+        let views = RequestViews::new(&uses);
+        let args = views.load(&TargetSpec::Args, &c, None);
+        assert_eq!(args.len(), 400_001);
+        assert!(held_size(&args) > memo_budget(&c));
+        assert!(views.memo.borrow().is_empty(), "past the budget: not kept");
+        assert_eq!(views.memo_bytes.get(), 0);
+        assert!(views.memo_refused.get());
+    }
+
+    /// A pair only one rule reads is never kept: keeping it saves nothing, and
+    /// CRS 921110 reading REQUEST_BODY through `t:htmlEntityDecode,t:lowercase`
+    /// once, early, would otherwise take budget the chains that dozens of rules
+    /// share need later.
+    #[test]
+    fn a_chain_one_rule_reads_is_not_kept() {
+        let c = upper_case_form(100);
+        let lower = [Transform::Lowercase];
+        let mut uses = read_by(1, &[key(TargetSpec::Args, &lower)]);
+        let views = RequestViews::new(&uses);
+        let out = views.load_transformed(&TargetSpec::Args, &lower, &c);
+        assert!(out[0].starts_with("value number"));
+        assert!(views.memo.borrow().is_empty());
+        assert_eq!(views.memo_bytes.get(), 0);
+
+        uses.insert(key(TargetSpec::Args, &lower), 2);
+        let views = RequestViews::new(&uses);
+        views.load_transformed(&TargetSpec::Args, &lower, &c);
+        assert!(views
+            .memo
+            .borrow()
+            .contains_key(&key(TargetSpec::Args, &lower)));
+    }
+
+    /// When the budget is full, a chain more rules read displaces the copies
+    /// of chains fewer rules read — whichever rule asked first — and a chain
+    /// fewer rules read cannot displace it in turn.
+    #[test]
+    fn the_most_read_chain_keeps_its_copy() {
+        let c = upper_case_form(30_000);
+        let rare = [Transform::Lowercase, Transform::RemoveWhitespace];
+        let common = [Transform::Lowercase];
+        let rarest = [Transform::Lowercase, Transform::CompressWhitespace];
+        let mut uses = read_by(5, &[key(TargetSpec::Args, &rare)]);
+        uses.insert(key(TargetSpec::Args, &common), 19);
+        uses.insert(key(TargetSpec::Args, &rarest), 2);
+        let views = RequestViews::new(&uses);
+
+        views.load_transformed(&TargetSpec::Args, &rare, &c);
+        assert!(views
+            .memo
+            .borrow()
+            .contains_key(&key(TargetSpec::Args, &rare)));
+        let kept = views.load_transformed(&TargetSpec::Args, &common, &c);
+        {
+            let memo = views.memo.borrow();
+            assert!(memo.contains_key(&key(TargetSpec::Args, &common)));
+            assert!(
+                !memo.contains_key(&key(TargetSpec::Args, &rare)),
+                "the less-read copy must make room"
+            );
+        }
+        assert_eq!(views.memo_bytes.get(), held_size(&kept));
+        views.load_transformed(&TargetSpec::Args, &rarest, &c);
+        let memo = views.memo.borrow();
+        assert!(memo.contains_key(&key(TargetSpec::Args, &common)));
+        assert!(!memo.contains_key(&key(TargetSpec::Args, &rarest)));
+        assert!(views.memo_bytes.get() <= memo_budget(&c));
+    }
+
+    /// A raw body is copied per read rather than kept, but when chains leave
+    /// it unchanged their output IS that copy: it is kept once, charged once,
+    /// and shared by every such chain and by plain reads.
+    #[test]
+    fn an_unchanged_raw_body_is_kept_once() {
+        let c = post(
+            "/x",
+            "application/json",
+            r#"{"note":"plain lower-case text"}"#,
+        );
+        let lower = [Transform::Lowercase];
+        let decode = [Transform::UrlDecodeUni];
+        let uses = read_by(
+            4,
+            &[
+                key(TargetSpec::RequestBody, &[]),
+                key(TargetSpec::RequestBody, &lower),
+                key(TargetSpec::RequestBody, &decode),
+            ],
+        );
+        let views = RequestViews::new(&uses);
+        // A plain read alone does not keep the raw body.
+        views.load(&TargetSpec::RequestBody, &c, None);
+        assert_eq!(views.memo_bytes.get(), 0);
+        let a = views.load_transformed(&TargetSpec::RequestBody, &lower, &c);
+        let b = views.load_transformed(&TargetSpec::RequestBody, &decode, &c);
+        let plain = views.load(&TargetSpec::RequestBody, &c, None);
+        assert!(Rc::ptr_eq(&a, &b) && Rc::ptr_eq(&a, &plain));
+        assert_eq!(views.memo_bytes.get(), held_size(&a));
+    }
+
+    /// `memo_uses` counts what `evaluate` memoizes: a target per read, a chain
+    /// per rule that applies it, a `&TARGET` count as a read of the target —
+    /// and nothing for multiMatch chains or VM state.
+    #[test]
+    fn memo_uses_counts_reads_per_target_and_chain() {
+        let rs = ruleset(
+            r#"
+SecRule ARGS "@rx a" "id:1,phase:2,pass,t:none,t:urlDecodeUni"
+SecRule ARGS "@rx b" "id:2,phase:2,pass,t:none,t:urlDecodeUni"
+SecRule ARGS|ARGS_NAMES "@rx c" "id:3,phase:2,pass,t:none,t:lowercase"
+SecRule ARGS "@rx d" "id:4,phase:2,pass,t:none,t:urlDecodeUni,multiMatch"
+SecRule &ARGS "@gt 5" "id:5,phase:2,pass"
+SecRule TX:x "@rx e" "id:6,phase:2,pass,t:lowercase"
+"#,
+        );
+        let uses = &rs.memo_uses[Phase::RequestBody as usize];
+        let n = |spec: TargetSpec, chain: &[Transform]| uses.get(&key(spec, chain)).copied();
+        assert_eq!(n(TargetSpec::Args, &[]), Some(5));
+        assert_eq!(n(TargetSpec::Args, &[Transform::UrlDecodeUni]), Some(2));
+        assert_eq!(n(TargetSpec::Args, &[Transform::Lowercase]), Some(1));
+        assert_eq!(n(TargetSpec::ArgsNames, &[Transform::Lowercase]), Some(1));
+        assert!(
+            uses.keys()
+                .all(|(spec, _)| !matches!(spec, TargetSpec::TxVar(_))),
+            "VM state is never memoized: {uses:?}"
         );
     }
 
@@ -3448,7 +4071,7 @@ mod xml_tests {
     #[test]
     fn xml_extracts_element_text_and_attributes() {
         let body = br#"<order id="42"><item cat="books">' OR 1=1--</item></order>"#;
-        let pairs = parse_xml_args(body);
+        let pairs: Vec<(String, String)> = parse_xml_args(body);
         assert!(
             pairs.iter().any(|(k, v)| k == "id" && v == "42"),
             "attribute value must be surfaced: {pairs:?}"
@@ -3463,7 +4086,7 @@ mod xml_tests {
     #[test]
     fn xml_decodes_entities_and_cdata() {
         let body = br#"<a>&lt;script&gt;</a><b><![CDATA[<xss>alert(1)</xss>]]></b>"#;
-        let pairs = parse_xml_args(body);
+        let pairs: Vec<(String, String)> = parse_xml_args(body);
         assert!(
             pairs.iter().any(|(_, v)| v == "<script>"),
             "entities decoded: {pairs:?}"
@@ -3478,7 +4101,7 @@ mod xml_tests {
     fn xml_strips_namespace_prefixes_soap() {
         let body =
             br#"<soap:Envelope><soap:Body><q>select * from users</q></soap:Body></soap:Envelope>"#;
-        let pairs = parse_xml_args(body);
+        let pairs: Vec<(String, String)> = parse_xml_args(body);
         assert!(
             pairs
                 .iter()
@@ -3490,7 +4113,7 @@ mod xml_tests {
     #[test]
     fn xml_ignores_comments_pi_and_doctype() {
         let body = br#"<?xml version="1.0"?><!DOCTYPE x><!-- <injected> --><root>data</root>"#;
-        let pairs = parse_xml_args(body);
+        let pairs: Vec<(String, String)> = parse_xml_args(body);
         assert!(pairs.iter().any(|(k, v)| k == "root" && v == "data"));
         assert!(
             !pairs.iter().any(|(_, v)| v.contains("injected")),
@@ -3511,10 +4134,10 @@ mod xml_tests {
     fn xml_malformed_fails_open() {
         // Unterminated tag / truncated body must not panic and should still
         // surface whatever text it can.
-        let pairs = parse_xml_args(b"<a>hello");
+        let pairs: Vec<(String, String)> = parse_xml_args(b"<a>hello");
         assert!(pairs.iter().any(|(k, v)| k == "a" && v == "hello"));
-        let _ = parse_xml_args(b"<a href=\"unterminated");
-        let _ = parse_xml_args(b"<![CDATA[unterminated");
+        let _: Vec<(String, String)> = parse_xml_args(b"<a href=\"unterminated");
+        let _: Vec<(String, String)> = parse_xml_args(b"<![CDATA[unterminated");
     }
 }
 

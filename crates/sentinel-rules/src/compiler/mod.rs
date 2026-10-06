@@ -340,8 +340,12 @@ pub fn compile(file: RuleFile) -> Result<CompiledRuleSet> {
         "compiled ruleset"
     );
 
+    let memo_uses = phase_programs
+        .each_ref()
+        .map(|program| vm::memo_uses(program));
     Ok(CompiledRuleSet {
         phase_programs,
+        memo_uses,
         patterns: state.patterns,
         ac_sets,
         literals: state.literals,
