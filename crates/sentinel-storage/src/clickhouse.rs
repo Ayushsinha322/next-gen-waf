@@ -42,14 +42,25 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// is found dead by the kernel rather than by the next insert.
 const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
 /// Whole-request ceiling: connect, send, response and body. Sized for the
-/// largest request this client makes — a 500-row `waf_events` batch, each row
-/// carrying redacted headers, every contributing rule and an explanation, so
-/// low single-digit MB that a LAN moves and ClickHouse parses in well under a
-/// second. The headroom is for a server busy merging parts; the ceiling exists
+/// largest request this client makes: one INSERT, which carries at most
+/// [`MAX_INSERT_ROWS`] rows and about [`MAX_INSERT_BYTES`] of body, because
+/// larger batches are split into several requests, each with its own deadline.
+/// That is a few MB at most, which a LAN moves and ClickHouse parses in well
+/// under a second. The headroom is for a server busy merging parts, or a WAN
+/// peer link (the 2-VM passive node writes across one). The ceiling exists
 /// because the history writer also samples traffic every second and a request
 /// with no deadline stalled it for good. `SENTINEL_CLICKHOUSE_TIMEOUT_SECS`
 /// overrides it.
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Rows per INSERT request. The writer's flush can hand over a whole drain of
+/// the event buffer (up to 20,000 rows) and a spool segment can be as large;
+/// one request that size outgrew the deadline above, timed out, and was
+/// retried whole on every reconnect.
+pub const MAX_INSERT_ROWS: usize = 500;
+/// Body bytes per INSERT request (soft: the row that crosses it is included).
+/// Rows carry the request's headers, so their size is the client's choice; a
+/// row cap alone does not bound the body.
+pub const MAX_INSERT_BYTES: usize = 4 * 1024 * 1024;
 /// `/ping` does no work server-side, so it gets a short ceiling of its own.
 const PING_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -174,6 +185,65 @@ pub struct WafEventRow {
 // ---------------------------------------------------------------------------
 // ClickHouseClient
 // ---------------------------------------------------------------------------
+
+/// A row type the client can INSERT: it knows its table and column list.
+pub trait InsertRow: Serialize {
+    /// `INSERT INTO <db>.<table> (<cols>) FORMAT JSONEachRow\n`
+    fn insert_head(database: &str) -> String;
+}
+
+impl InsertRow for WafEventRow {
+    fn insert_head(database: &str) -> String {
+        format!("INSERT INTO {database}.waf_events ({WAF_EVENT_COLUMNS}) FORMAT JSONEachRow\n")
+    }
+}
+
+impl InsertRow for TrafficRow {
+    fn insert_head(database: &str) -> String {
+        format!(
+            "INSERT INTO {database}.traffic_buckets \
+             (ts, tenant, site_id, reqs, blocked, p99_ms) \
+             FORMAT JSONEachRow\n"
+        )
+    }
+}
+
+/// An insert that stopped part-way. Rows go out in order, in requests of at
+/// most [`MAX_INSERT_ROWS`]; the first `inserted` were accepted and the rest
+/// were not. The request that failed may still have committed server-side (a
+/// timeout does not cancel it), which is the at-least-once window, so a caller
+/// keeps `rows[inserted..]` for a retry rather than the whole batch.
+#[derive(Debug)]
+pub struct InsertError {
+    pub inserted: usize,
+    pub source: StorageError,
+}
+
+impl std::fmt::Display for InsertError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.inserted == 0 {
+            write!(f, "{}", self.source)
+        } else {
+            write!(
+                f,
+                "{} (the first {} rows were accepted)",
+                self.source, self.inserted
+            )
+        }
+    }
+}
+
+impl std::error::Error for InsertError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+impl From<InsertError> for StorageError {
+    fn from(e: InsertError) -> Self {
+        e.source
+    }
+}
 
 /// Every column the event INSERT names — and it MUST list every serialised
 /// field of [`WafEventRow`], because the body is `FORMAT JSONEachRow` from
@@ -629,21 +699,41 @@ impl ClickHouseClient {
         .await
     }
 
-    /// Batch-insert detailed WAF events into `waf_events`.
-    pub async fn insert_events_batch(&self, rows: &[WafEventRow]) -> Result<(), StorageError> {
-        if rows.is_empty() {
-            return Ok(());
+    /// Batch-insert detailed WAF events into `waf_events`, in requests of at
+    /// most [`MAX_INSERT_ROWS`] rows; see [`insert_rows`](Self::insert_rows).
+    pub async fn insert_events_batch(&self, rows: &[WafEventRow]) -> Result<(), InsertError> {
+        self.insert_rows(rows).await
+    }
+
+    /// INSERT `rows` in order, as requests of at most [`MAX_INSERT_ROWS`] rows
+    /// and about [`MAX_INSERT_BYTES`] each, every request under its own
+    /// deadline. Stops at the first failure and reports how many rows went in
+    /// before it.
+    pub async fn insert_rows<T: InsertRow>(&self, rows: &[T]) -> Result<(), InsertError> {
+        let head = T::insert_head(&self.database);
+        let mut start = 0;
+        while start < rows.len() {
+            let mut sql = head.clone();
+            let mut end = start;
+            while end < rows.len()
+                && end - start < MAX_INSERT_ROWS
+                && (end == start || sql.len() < MAX_INSERT_BYTES)
+            {
+                let line = serde_json::to_string(&rows[end]).map_err(|e| InsertError {
+                    inserted: start,
+                    source: e.into(),
+                })?;
+                sql.push_str(&line);
+                sql.push('\n');
+                end += 1;
+            }
+            self.exec(sql).await.map_err(|source| InsertError {
+                inserted: start,
+                source,
+            })?;
+            start = end;
         }
-        let mut sql = format!(
-            "INSERT INTO {db}.waf_events ({cols}) FORMAT JSONEachRow\n",
-            db = self.database,
-            cols = WAF_EVENT_COLUMNS,
-        );
-        for row in rows {
-            sql.push_str(&serde_json::to_string(row)?);
-            sql.push('\n');
-        }
-        self.exec(sql).await
+        Ok(())
     }
 
     /// Query recent `waf_events`, optionally filtered. Each filter is an
@@ -693,24 +783,10 @@ impl ClickHouseClient {
         Ok(out)
     }
 
-    /// Batch-insert traffic rows.  Sends a single `INSERT … FORMAT JSONEachRow`
-    /// request with all rows as newline-separated JSON objects in the body.
-    pub async fn insert_traffic_batch(&self, rows: &[TrafficRow]) -> Result<(), StorageError> {
-        if rows.is_empty() {
-            return Ok(());
-        }
-
-        let mut sql = format!(
-            "INSERT INTO {db}.traffic_buckets \
-             (ts, tenant, site_id, reqs, blocked, p99_ms) \
-             FORMAT JSONEachRow\n",
-            db = self.database
-        );
-        for row in rows {
-            sql.push_str(&serde_json::to_string(row)?);
-            sql.push('\n');
-        }
-        self.exec(sql).await
+    /// Batch-insert traffic rows as `INSERT … FORMAT JSONEachRow` requests of
+    /// at most [`MAX_INSERT_ROWS`] rows; see [`insert_rows`](Self::insert_rows).
+    pub async fn insert_traffic_batch(&self, rows: &[TrafficRow]) -> Result<(), InsertError> {
+        self.insert_rows(rows).await
     }
 
     /// Query per-second buckets between two Unix timestamps (inclusive).
@@ -1078,15 +1154,19 @@ mod insert_column_pinning {
 #[cfg(test)]
 mod timeout_tests {
     use super::*;
-    use crate::testing::{black_hole, hang_up};
+    use crate::testing::{black_hole, hang_up, FakeClickHouse, InsertMode};
     use std::time::Instant;
 
     /// Upper bound the test allows any single call before declaring it hung.
     const HUNG: Duration = Duration::from_secs(5);
 
-    /// A full-size flush: the writer sends 500-row batches.
+    /// One full-size INSERT request.
     fn batch() -> Vec<WafEventRow> {
-        (0..500)
+        rows(MAX_INSERT_ROWS)
+    }
+
+    fn rows(n: usize) -> Vec<WafEventRow> {
+        (0..n as i64)
             .map(|i| WafEventRow {
                 ts: 1_700_000_000 + i,
                 ip: "203.0.113.9".into(),
@@ -1180,5 +1260,57 @@ mod timeout_tests {
         assert_eq!(request_timeout_from(env("0")), DEFAULT_REQUEST_TIMEOUT);
         assert_eq!(request_timeout_from(env("abc")), DEFAULT_REQUEST_TIMEOUT);
         assert_eq!(request_timeout_from(env("100000")), DEFAULT_REQUEST_TIMEOUT);
+    }
+
+    /// The writer hands over a whole drain of the event buffer (up to 20,000
+    /// rows). Sent as ONE request, it was 40 times the size the deadline was set
+    /// for; it must arrive as requests the deadline fits.
+    #[tokio::test]
+    async fn a_large_batch_is_sent_as_requests_of_at_most_500_rows() {
+        let ch = FakeClickHouse::start(InsertMode::Accept).await;
+        let c = ClickHouseClient::new(&ch.url(), "db");
+        tokio::time::timeout(HUNG, c.insert_events_batch(&rows(20_000)))
+            .await
+            .expect("insert hung")
+            .expect("insert failed");
+        let sizes = ch.inserts();
+        assert_eq!(ch.committed_rows(), 20_000, "every row, once");
+        assert!(sizes.len() >= 40, "{} requests", sizes.len());
+        assert!(
+            sizes.iter().all(|&n| n <= MAX_INSERT_ROWS),
+            "request sizes {sizes:?}"
+        );
+    }
+
+    /// Rows are attacker-sized (they carry the request's headers), so the row
+    /// cap alone does not bound a request body.
+    #[tokio::test]
+    async fn large_rows_are_split_by_body_size_too() {
+        let ch = FakeClickHouse::start(InsertMode::Accept).await;
+        let c = ClickHouseClient::new(&ch.url(), "db");
+        let mut big = rows(100);
+        for r in &mut big {
+            r.headers = "h".repeat(200 * 1024);
+        }
+        c.insert_events_batch(&big).await.expect("insert failed");
+        let sizes = ch.inserts();
+        assert_eq!(ch.committed_rows(), 100);
+        // 4 MiB at 200 KiB a row: 21 rows (the one crossing the cap included).
+        assert!(sizes.iter().all(|&n| n <= 21), "request sizes {sizes:?}");
+    }
+
+    /// A failure part-way reports how far it got, so the caller retries only
+    /// the rows that did not go in.
+    #[tokio::test]
+    async fn a_failed_request_reports_the_rows_already_accepted() {
+        let ch = FakeClickHouse::start(InsertMode::RejectAfter(1_200)).await;
+        let c = ClickHouseClient::new(&ch.url(), "db");
+        let e = c
+            .insert_events_batch(&rows(2_000))
+            .await
+            .expect_err("the third request is rejected");
+        assert_eq!(e.inserted, 1_000);
+        assert_eq!(ch.inserts(), vec![500, 500]);
+        assert!(e.to_string().contains("first 1000 rows"), "{e}");
     }
 }

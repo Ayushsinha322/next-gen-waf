@@ -76,3 +76,6 @@ http-body-util = { workspace = true }
 bytes = { workspace = true }
 arc-swap = { workspace = true }
 rustls = { workspace = true }
+# Local stub servers (a ClickHouse that records what it committed) for the
+# history writer's spool-replay tests.
+sentinel-storage = { path = "../sentinel-storage", features = ["test-support"] }

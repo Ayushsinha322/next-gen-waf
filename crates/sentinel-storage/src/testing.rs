@@ -2,8 +2,9 @@
 //!
 //! The failures that matter — a server that accepts and never answers, one that
 //! hangs up at once, a Valkey that answers the handshake and then stalls or
-//! errors — cannot be produced with a real Valkey or ClickHouse, and the live
-//! tests that need one are `#[ignore]`d in CI anyway. Compiled only for tests
+//! errors, a ClickHouse that commits an insert it answers too late — cannot be
+//! produced with a real Valkey or ClickHouse, and the live tests that need one
+//! are `#[ignore]`d in CI anyway. Compiled only for tests
 //! (this crate's, and dependants' via the `test-support` feature).
 
 use std::net::SocketAddr;
@@ -128,6 +129,125 @@ impl FakeValkey {
     /// Rate-limit script invocations received so far.
     pub fn evals(&self) -> u64 {
         self.evals.load(Ordering::SeqCst)
+    }
+}
+
+/// How [`FakeClickHouse`] answers an `INSERT`. Everything else (`/ping`, DDL)
+/// gets `200 Ok.`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertMode {
+    /// Commit the rows and answer 200.
+    Accept,
+    /// Commit an INSERT of more than this many rows but never answer it: a
+    /// server too slow for the client's deadline that still finishes the work,
+    /// as ClickHouse does once the body has arrived.
+    CommitSilentlyAbove(usize),
+    /// Answer 500 (committing nothing) to the INSERT that would take the
+    /// committed total past this many rows, and to every one after it.
+    RejectAfter(usize),
+}
+
+/// A minimal ClickHouse HTTP endpoint that records the rows of each INSERT it
+/// commits.
+pub struct FakeClickHouse {
+    pub addr: SocketAddr,
+    committed: Arc<std::sync::Mutex<Vec<usize>>>,
+}
+
+impl FakeClickHouse {
+    pub async fn start(mode: InsertMode) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let committed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&committed);
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                tokio::spawn(serve_clickhouse(sock, mode, Arc::clone(&log)));
+            }
+        });
+        Self { addr, committed }
+    }
+
+    pub fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    /// Row count of each committed INSERT, in arrival order.
+    pub fn inserts(&self) -> Vec<usize> {
+        self.committed.lock().unwrap().clone()
+    }
+
+    /// Rows committed across every INSERT (duplicates included).
+    pub fn committed_rows(&self) -> usize {
+        self.inserts().iter().sum()
+    }
+}
+
+const HTTP_OK_EMPTY: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n";
+
+/// One keep-alive HTTP/1.1 connection: read each request (headers, then a
+/// `content-length` body), answer per `mode`.
+async fn serve_clickhouse(
+    mut sock: tokio::net::TcpStream,
+    mode: InsertMode,
+    committed: Arc<std::sync::Mutex<Vec<usize>>>,
+) {
+    let mut buf = Vec::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        let head_end = loop {
+            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i + 4;
+            }
+            match sock.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        };
+        let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+        let len: usize = head
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
+        while buf.len() < head_end + len {
+            match sock.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        }
+        let body = String::from_utf8_lossy(&buf[head_end..head_end + len]).into_owned();
+        buf.drain(..head_end + len);
+
+        // `None`: committed, but never answered.
+        let reply: Option<&[u8]> = if body.starts_with("INSERT") {
+            let rows = body.lines().skip(1).filter(|l| !l.is_empty()).count();
+            let mut log = committed.lock().unwrap();
+            match mode {
+                InsertMode::CommitSilentlyAbove(n) if rows > n => {
+                    log.push(rows);
+                    None
+                }
+                InsertMode::RejectAfter(total) if log.iter().sum::<usize>() + rows > total => {
+                    Some(b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 4\r\n\r\nnope")
+                }
+                _ => {
+                    log.push(rows);
+                    Some(HTTP_OK_EMPTY)
+                }
+            }
+        } else {
+            Some(b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\nOk.\n")
+        };
+        let Some(reply) = reply else {
+            // Hold the connection open, unanswered, until the client gives up
+            // and closes it.
+            let _ = sock.read(&mut chunk).await;
+            return;
+        };
+        if sock.write_all(reply).await.is_err() {
+            return;
+        }
     }
 }
 

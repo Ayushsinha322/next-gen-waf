@@ -101,33 +101,28 @@ impl Spool {
     ///
     /// Returns the number of bytes written. An empty batch writes nothing.
     pub fn append<T: Serialize>(&self, kind: &str, rows: &[T]) -> io::Result<u64> {
-        use std::io::Write as _;
         if rows.is_empty() {
             return Ok(0);
         }
-        let mut body: Vec<u8> = Vec::with_capacity(rows.len() * 256);
-        for r in rows {
-            serde_json::to_writer(&mut body, r).map_err(to_io)?;
-            body.push(b'\n');
-        }
+        let body = encode(rows)?;
+        write_atomic(&self.dir.join(Self::segment_name(kind)), &body, None)?;
+        Ok(body.len() as u64)
+    }
 
-        let name = Self::segment_name(kind);
-        let final_path = self.dir.join(&name);
-        // Temp name is per-process for the same reason the config cache's is:
-        // two nodes pointed at one directory must not truncate each other's
-        // in-flight temp file and then rename the partial result into place.
-        let tmp = self.dir.join(format!("{name}.tmp.{}", std::process::id()));
-
-        let res = (|| -> io::Result<()> {
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(&body)?;
-            f.sync_all()?;
-            std::fs::rename(&tmp, &final_path)
-        })();
-        if let Err(e) = res {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
+    /// Replace the segment at `path` with `rows`: what is left of it after a
+    /// replay that got part-way. Without this, the rows ClickHouse had already
+    /// accepted were sent again on every retry. The name is kept, so the segment
+    /// keeps its place in the replay order, and so is the mtime, so it keeps its
+    /// place in the cap's oldest-first order. Atomic like `append`; empty `rows`
+    /// removes the segment.
+    pub fn rewrite<T: Serialize>(path: &Path, rows: &[T]) -> io::Result<u64> {
+        if rows.is_empty() {
+            Self::remove(path);
+            return Ok(0);
         }
+        let body = encode(rows)?;
+        let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        write_atomic(path, &body, mtime)?;
         Ok(body.len() as u64)
     }
 
@@ -241,6 +236,46 @@ impl Spool {
         let seq = SEQ.fetch_add(1, Ordering::Relaxed) % 1_000_000;
         format!("{kind}-{millis:013}-{seq:06}.{SEGMENT_EXT}")
     }
+}
+
+/// Rows as NDJSON.
+fn encode<T: Serialize>(rows: &[T]) -> io::Result<Vec<u8>> {
+    let mut body: Vec<u8> = Vec::with_capacity(rows.len() * 256);
+    for r in rows {
+        serde_json::to_writer(&mut body, r).map_err(to_io)?;
+        body.push(b'\n');
+    }
+    Ok(body)
+}
+
+/// Write `body` to a temp name beside `final_path`, fsync, then rename it into
+/// place, so a reader never observes a half-written segment.
+fn write_atomic(
+    final_path: &Path,
+    body: &[u8],
+    mtime: Option<std::time::SystemTime>,
+) -> io::Result<()> {
+    use std::io::Write as _;
+    // Temp name is per-process for the same reason the config cache's is:
+    // two nodes pointed at one directory must not truncate each other's
+    // in-flight temp file and then rename the partial result into place.
+    let mut tmp_name = final_path.as_os_str().to_owned();
+    tmp_name.push(format!(".tmp.{}", std::process::id()));
+    let tmp = PathBuf::from(tmp_name);
+
+    let res = (|| -> io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(body)?;
+        if let Some(t) = mtime {
+            f.set_modified(t)?;
+        }
+        f.sync_all()?;
+        std::fs::rename(&tmp, final_path)
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
 }
 
 fn is_segment(p: &Path) -> bool {
@@ -516,6 +551,37 @@ mod tests {
         assert_eq!(s2, 0);
         assert_eq!(evs, vec![ev]);
         assert_eq!(trs, vec![tr]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A partly replayed segment keeps only what is left, in its old place in
+    /// both orders (replay by name, cap by mtime).
+    #[test]
+    fn rewrite_keeps_the_rest_in_place() {
+        let dir = tmpdir("rewrite");
+        let sp = Spool::open(&dir, DEFAULT_MAX_BYTES).unwrap();
+        sp.append("events", &rows(5)).unwrap();
+        let path = sp.segments("events").remove(0);
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        Spool::rewrite(&path, &rows(5)[3..]).unwrap();
+        assert_eq!(sp.segments("events"), vec![path.clone()]);
+        assert_eq!(Spool::load::<Row>(&path).unwrap().0, rows(5)[3..].to_vec());
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), old);
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "no temp file left"
+        );
+
+        Spool::rewrite::<Row>(&path, &[]).unwrap();
+        assert!(sp.segments("events").is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

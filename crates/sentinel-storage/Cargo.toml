@@ -49,3 +49,5 @@ test-support = []
 
 [dev-dependencies]
 tokio-test = { workspace = true }
+# Captures log output, to check that connection URLs are logged redacted.
+tracing-subscriber = { workspace = true }
