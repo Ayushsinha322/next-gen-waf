@@ -223,15 +223,13 @@ fn take_request_caught() -> Caught {
 /// Longest panic message carried onto a log line.
 const PANIC_MESSAGE_MAX: usize = 200;
 
-/// Backtick spans std's own panic messages use for method and variant names.
-/// Every other span is redacted — see [`panic_message`].
-const STD_MESSAGE_TERMS: &[&str] = &[
-    "Option::unwrap()",
-    "Result::unwrap()",
-    "Result::unwrap_err()",
-    "None",
-    "Err",
-    "Ok",
+/// std's own panic messages that open with backtick spans of their own (method
+/// and variant names, never data). Kept verbatim only as the START of a message,
+/// the one place std puts them — see [`panic_message`].
+const STD_MESSAGE_PREFIXES: &[&str] = &[
+    "called `Option::unwrap()` on a `None` value",
+    "called `Result::unwrap()` on an `Err` value: ",
+    "called `Result::unwrap_err()` on an `Ok` value: ",
 ];
 
 /// The panic's message, reduced to what is safe to log.
@@ -239,14 +237,17 @@ const STD_MESSAGE_TERMS: &[&str] = &[
 /// std quotes the operand of a failed str slice between backticks — "byte index
 /// 7 is not a char boundary; it is inside 'é' (bytes 6..8) of `<the string>`" —
 /// and on the request path that operand is request data: a header, a query
-/// value, a cookie, a body. The first backtick span that is not one of std's own
-/// terms is therefore redacted together with EVERYTHING after it. Redacting only
-/// the span is not enough: the operand can contain backticks of its own (`it`s`,
-/// a JavaScript template literal), and pairing them up put the text after the
-/// operand's own backtick — a password, a session id — back on the log line. std
-/// puts the operand last in every such message, so nothing useful follows it.
-/// The whole message is also capped. An `unwrap()` on an error whose Debug output
-/// embeds input can still carry a fragment, never a whole value.
+/// value, a cookie, a body. So everything from the first backtick on is
+/// redacted, after one of std's own prefixes if the message starts with one.
+/// Redacting only the span is not enough: the operand can contain backticks of
+/// its own (`it`s`, a JavaScript template literal), and pairing them up put the
+/// text after the operand's own backtick — a password, a session id — back on
+/// the log line. Nor may a std term be recognised anywhere but in its prefix: an
+/// operand starting "None`" or "Ok`" looked like std's own span, and the text
+/// after it was logged in clear. std puts the operand last in every such
+/// message, so nothing useful follows it. The whole message is also capped. An
+/// `unwrap()` on an error whose Debug output embeds input can still carry a
+/// fragment, never a whole value.
 pub(crate) fn panic_message(payload: &(dyn Any + Send)) -> String {
     let raw = if let Some(s) = payload.downcast_ref::<&'static str>() {
         s
@@ -256,18 +257,18 @@ pub(crate) fn panic_message(payload: &(dyn Any + Send)) -> String {
         return "non-string panic payload".to_string();
     };
     let mut out = String::with_capacity(raw.len().min(PANIC_MESSAGE_MAX) + 16);
-    let mut parts = raw.split('`');
-    out.push_str(parts.next().unwrap_or(""));
-    // Alternates: a span opened by a backtick, then the text after it closes.
-    let mut in_span = true;
-    for part in parts {
-        out.push('`');
-        if in_span && !STD_MESSAGE_TERMS.contains(&part) {
-            out.push_str("<redacted>");
-            break;
+    let std_prefix = STD_MESSAGE_PREFIXES
+        .iter()
+        .find(|p| raw.starts_with(*p))
+        .map_or(0, |p| p.len());
+    let (head, rest) = raw.split_at(std_prefix);
+    out.push_str(head);
+    match rest.split_once('`') {
+        Some((before, _)) => {
+            out.push_str(before);
+            out.push_str("`<redacted>");
         }
-        out.push_str(part);
-        in_span = !in_span;
+        None => out.push_str(rest),
     }
     if out.len() > PANIC_MESSAGE_MAX {
         let mut cut = PANIC_MESSAGE_MAX;
@@ -1281,6 +1282,36 @@ mod tests {
         let result = "called `Result::unwrap()` on an `Err` value: Timeout";
         assert_eq!(panic_message(&result), result);
         assert_eq!(panic_message(&"ok `then dangling"), "ok `<redacted>");
+        // An error's Debug output is not std's text: its spans are redacted.
+        let quoted = "called `Result::unwrap()` on an `Err` value: Bad(\"`tok`=hunter2\")";
+        assert_eq!(
+            panic_message(&quoted),
+            "called `Result::unwrap()` on an `Err` value: Bad(\"`<redacted>"
+        );
+    }
+
+    /// std's terms were recognised in ANY backtick span, the operand's own
+    /// first one included, so an operand starting with one ("None`", "Ok`")
+    /// flipped the span pairing and the rest of it was logged in clear:
+    /// "… of `None`session=s3cr3t é`<redacted>". Real std slice panics here,
+    /// not hand-written messages.
+    #[test]
+    fn an_operand_starting_with_a_std_term_stays_redacted() {
+        for operand in [
+            "None`session=s3cr3t é",
+            "Ok`password=s3cr3t é",
+            "Err`token=s3cr3t é",
+            "Option::unwrap()`sid=s3cr3t é",
+            "called `Option::unwrap()` on a `None` value`k=s3cr3t é",
+        ] {
+            let s = operand.to_string();
+            // Inside the trailing 'é', as a parser slicing request data would.
+            let cut = s.len() - 1;
+            let payload = std::panic::catch_unwind(|| s[..cut].len()).unwrap_err();
+            let logged = panic_message(&*payload);
+            assert!(!logged.contains("s3cr3t"), "{operand:?} → {logged}");
+            assert!(logged.ends_with("of `<redacted>"), "{operand:?} → {logged}");
+        }
     }
 
     #[test]
