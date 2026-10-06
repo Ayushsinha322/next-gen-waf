@@ -533,6 +533,11 @@ struct WafMetrics {
     /// h3 connections that completed a handshake and yielded no fingerprint —
     /// including the case where the decorator is not installed at all.
     pub ja4_h3_absent_total: Counter,
+    /// HTTP/3 responses whose stream the WAF reset after the head was sent:
+    /// the origin failed mid-body, or the relay itself could not send. The
+    /// access log recorded each of these as complete when the head was
+    /// produced, so this is the only count of the truncations.
+    pub h3_response_resets_total: Counter,
     /// Requests granted the good-bot allowlist — i.e. a crawler claim that was
     /// VERIFIED by reverse DNS (PTR in the operator's published domain,
     /// forward-confirmed) and therefore scored 0.
@@ -654,6 +659,10 @@ impl WafMetrics {
             "sentinel_ja4_h3_absent_total",
             "HTTP/3 connections with no fingerprint (includes the decorator not being installed)",
         );
+        let h3_response_resets_total = registry.register_counter(
+            "sentinel_h3_response_resets_total",
+            "HTTP/3 responses reset after the head was sent (origin failed mid-body, or the relay could not send); the access log records them as complete",
+        );
         let bot_good_bot_allowed_total = registry.register_counter(
             "sentinel_bot_good_bot_allowlisted_total",
             "Requests granted the good-bot allowlist after reverse-DNS verification (PTR in the operator's domain, forward-confirmed)",
@@ -686,6 +695,7 @@ impl WafMetrics {
             ja4_h3_attempts_total,
             ja4_h3_success_total,
             ja4_h3_absent_total,
+            h3_response_resets_total,
             bot_good_bot_allowed_total,
             registry,
         }
@@ -894,6 +904,14 @@ pub fn ja4_h3_absent_total() -> u64 {
     WAF_METRICS.ja4_h3_absent_total.get()
 }
 
+/// An HTTP/3 response stream was reset after its head had been sent.
+pub fn note_h3_response_reset() {
+    WAF_METRICS.h3_response_resets_total.inc();
+}
+pub fn h3_response_resets_total() -> u64 {
+    WAF_METRICS.h3_response_resets_total.get()
+}
+
 /// The good-bot allowlist was granted — only reachable for a VERIFIED claim.
 pub fn note_good_bot_allowed() {
     WAF_METRICS.bot_good_bot_allowed_total.inc();
@@ -1002,6 +1020,14 @@ mod tests {
         let text = prometheus_text();
         assert!(text.contains("sentinel_requests_total"));
         assert!(text.contains("sentinel_blocked_total"));
+    }
+
+    #[test]
+    fn h3_response_reset_counter_exposed() {
+        let before = h3_response_resets_total();
+        note_h3_response_reset();
+        assert!(h3_response_resets_total() > before);
+        assert!(prometheus_text().contains("sentinel_h3_response_resets_total"));
     }
 
     #[test]
