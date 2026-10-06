@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -204,9 +205,6 @@ func validateWafPolicyValues(raw json.RawMessage) []SiteConfigProblem {
 		IPReputation *struct {
 			Allow []string `json:"allow"`
 			Block []string `json:"block"`
-			// Raw so a malformed list is reported by feedProblems rather than
-			// failing this whole unmarshal, which would skip every check here.
-			Feeds json.RawMessage `json:"feeds"`
 		} `json:"ip_reputation"`
 		PathOverrides []struct {
 			PathPrefix       string          `json:"path_prefix"`
@@ -216,8 +214,14 @@ func validateWafPolicyValues(raw json.RawMessage) []SiteConfigProblem {
 			RuleExclusions   json.RawMessage `json:"rule_exclusions"`
 		} `json:"path_overrides"`
 	}
+	// Feeds are judged from their own decode, never from the struct above: a
+	// type error in ANY field of it fails that unmarshal and skips every check
+	// below, and the converter passes ip_reputation through without looking
+	// inside, so {"allow": "10.0.0.1", "feeds": [{"url": "file:///…"}]} used to
+	// be accepted with nothing reported.
+	feedPs := feedProblems(policyFeeds(raw))
 	if err := json.Unmarshal(raw, &p); err != nil {
-		return nil // shape errors are already reported by the converter
+		return feedPs // other shape errors are reported by the converter
 	}
 	var problems []SiteConfigProblem
 	add := func(f, m string) { problems = append(problems, SiteConfigProblem{Field: f, Problem: m}) }
@@ -311,8 +315,8 @@ func validateWafPolicyValues(raw json.RawMessage) []SiteConfigProblem {
 				}
 			}
 		}
-		problems = append(problems, feedProblems(p.IPReputation.Feeds)...)
 	}
+	problems = append(problems, feedPs...)
 
 	// Per-path overrides. These are rejected rather than silently normalised: an
 	// override an operator believes is protecting /api/ but which the data plane
@@ -368,16 +372,37 @@ func validateWafPolicyValues(raw json.RawMessage) []SiteConfigProblem {
 // an access-key query string.
 const maxFeedURLLength = 2048
 
+// maxSiteFeeds caps a site's feed list. Every node fetches every feed on every
+// refresh and holds the entries in a table each request is checked against, so
+// the list is console input that drives outbound requests and per-request work
+// on every node; the data plane also caps feeds per node (ip_feed.rs).
+const maxSiteFeeds = 16
+
+// policyFeeds returns waf_policy.ip_reputation.feeds, decoding nothing else, so
+// no other field can fail the decode. The error is ignored on purpose: it can
+// only mean the policy or ip_reputation is not an object, and then there are no
+// feeds to check (the converter drops a non-object ip_reputation).
+func policyFeeds(raw json.RawMessage) json.RawMessage {
+	var p struct {
+		IPReputation struct {
+			Feeds json.RawMessage `json:"feeds"`
+		} `json:"ip_reputation"`
+	}
+	_ = json.Unmarshal(raw, &p)
+	return p.IPReputation.Feeds
+}
+
 // feedProblems checks waf_policy.ip_reputation.feeds.
 //
 // Every data-plane node fetches each feed URL itself, so a URL is held to what
 // that fetcher accepts: http or https, with a host. Nothing refused a file://
 // URL here, and the data plane used to read it off the node's own disk.
 //
-// The list's shape is checked as well: ip_reputation reaches the data plane
-// verbatim and is parsed with the rest of the site, so a feed it cannot read
-// (no url, or a url that is not a string) makes it reject the entire site — a
-// new site is not served at all, an existing one stays on its last config.
+// Each feed's shape is checked as well: ip_reputation reaches the data plane
+// verbatim and is parsed with the rest of the site, where url is a required
+// string and interval and format are strings when present (null included), so
+// a feed that breaks any of that makes it reject the entire site — a new site
+// is not served at all, an existing one stays on its last config.
 func feedProblems(raw json.RawMessage) []SiteConfigProblem {
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil
@@ -388,27 +413,68 @@ func feedProblems(raw json.RawMessage) []SiteConfigProblem {
 		return []SiteConfigProblem{{Field: field,
 			Problem: `must be a list of feeds, each an object like {"url": "https://…"}`}}
 	}
+	if len(feeds) > maxSiteFeeds {
+		return []SiteConfigProblem{{Field: field, Problem: fmt.Sprintf(
+			"names %d feeds; the limit is %d per site — every node fetches each one on every refresh",
+			len(feeds), maxSiteFeeds)}}
+	}
 	var problems []SiteConfigProblem
 	for i, f := range feeds {
-		urlField := fmt.Sprintf("%s[%d].url", field, i)
-		rawURL, ok := f["url"]
-		if !ok || string(rawURL) == "null" {
-			problems = append(problems, SiteConfigProblem{Field: urlField, Problem: "is required"})
-			continue
+		at := func(key string) string { return fmt.Sprintf("%s[%d].%s", field, i, key) }
+		add := func(key, m string) { problems = append(problems, SiteConfigProblem{Field: at(key), Problem: m}) }
+
+		if u, ok := feedString(f, "url"); !ok {
+			add("url", "must be a string")
+		} else if u == nil {
+			add("url", "is required")
+		} else if m := feedURLProblem(*u); m != "" {
+			add("url", m)
 		}
-		var u string
-		if err := json.Unmarshal(rawURL, &u); err != nil {
-			problems = append(problems, SiteConfigProblem{Field: urlField, Problem: "must be a string"})
-			continue
+		// interval and format may be left out (the data plane defaults them),
+		// but not sent as null or as another type. Neither is acted on yet: the
+		// data plane refreshes every feed on one fixed timer and reads every
+		// body as one entry per line.
+		if v, ok := feedString(f, "interval"); !ok {
+			add("interval", `must be a string like "1h"`)
+		} else if v != nil && strings.TrimSpace(*v) != "" && !feedIntervalPattern.MatchString(strings.TrimSpace(*v)) {
+			add("interval", fmt.Sprintf("%q is not a duration like 30m, 1h or 1d", *v))
 		}
-		if m := feedURLProblem(u); m != "" {
-			problems = append(problems, SiteConfigProblem{Field: urlField, Problem: m})
+		if v, ok := feedString(f, "format"); !ok {
+			add("format", `must be a string, "cidr" or "json"`)
+		} else if v != nil && *v != "cidr" && *v != "json" {
+			add("format", fmt.Sprintf("%q is not one of cidr, json", *v))
 		}
 	}
 	return problems
 }
 
+// feedIntervalPattern accepts what the console's Refresh field suggests: whole
+// numbers with s, m, h or d, combinable ("1h30m").
+var feedIntervalPattern = regexp.MustCompile(`(?i)^([0-9]+[smhd])+$`)
+
+// feedString reads one key of a feed object. The value is nil when the key is
+// absent; ok is false when the key is present but not a string — null included,
+// because the data plane's default applies only to a MISSING key.
+func feedString(f map[string]json.RawMessage, key string) (v *string, ok bool) {
+	raw, present := f[key]
+	if !present {
+		return nil, true
+	}
+	var s string
+	if string(raw) == "null" || json.Unmarshal(raw, &s) != nil {
+		return nil, false
+	}
+	return &s, true
+}
+
 // feedURLProblem says what is wrong with one feed URL, or "" if nothing.
+//
+// Go's url.Parse accepts more than the data plane's parser (http::Uri), and a
+// URL accepted here but refused there is stored and then fails on every node at
+// every refresh. So the check is stricter than both: only RFC 3986 characters,
+// no percent-encoding in the host. testdata/feed_urls_accepted.txt lists URLs
+// this accepts, and a test in crates/sentinel-proxy/src/ip_feed.rs fails if the
+// data plane refuses any of them.
 func feedURLProblem(raw string) string {
 	u := strings.TrimSpace(raw)
 	if u == "" {
@@ -417,14 +483,24 @@ func feedURLProblem(raw string) string {
 	if len(u) > maxFeedURLLength {
 		return fmt.Sprintf("is %d characters; the longest accepted is %d", len(u), maxFeedURLLength)
 	}
+	// Echoed in the messages below, without any user:password@ it carries.
 	shown := u
-	if r := []rune(u); len(r) > 100 {
+	if a := rawAuthority(u); strings.Contains(a, "@") {
+		shown = strings.Replace(u, a[:strings.LastIndex(a, "@")+1], "[redacted]@", 1)
+	}
+	if r := []rune(shown); len(r) > 100 {
 		shown = string(r[:100]) + "…"
 	}
-	// Go's parser tolerates a space in the path; the data plane's does not, and
-	// the feed would fail on every node at every refresh.
-	if strings.ContainsAny(u, " \t") {
-		return fmt.Sprintf("%q contains a space — percent-encode it as %%20", shown)
+	for i := 0; i < len(u); i++ {
+		switch b := u[i]; {
+		case b == ' ' || b == '\t':
+			return fmt.Sprintf("%q contains a space — percent-encode it as %%20", shown)
+		case b < 0x21 || b > 0x7e:
+			return fmt.Sprintf("%q contains a character a URL cannot carry as-is — use the punycode "+
+				"form (xn--…) for an international host name and percent-encode the path", shown)
+		case strings.IndexByte(`"<>\^`+"`"+`{|}`, b) >= 0:
+			return fmt.Sprintf("%q contains %q, which must be percent-encoded", shown, string(b))
+		}
 	}
 	parsed, err := url.Parse(u)
 	if err != nil {
@@ -434,8 +510,17 @@ func feedURLProblem(raw string) string {
 		return fmt.Sprintf("%q is not an http:// or https:// URL — feeds are fetched over HTTP(S) only; "+
 			"file:// and other schemes are refused", shown)
 	}
+	if parsed.User != nil {
+		return fmt.Sprintf("%q carries credentials (user:password@) — the data plane does not send "+
+			"them, so the feed would be refused on every refresh; use a feed URL that needs none", shown)
+	}
 	if parsed.Hostname() == "" {
 		return fmt.Sprintf("%q has no host", shown)
+	}
+	// url.Parse allows a percent-escape in an IPv6 zone ([fe80::1%25en0]); the
+	// data plane refuses any '%' in the host.
+	if strings.Contains(rawAuthority(u), "%") {
+		return fmt.Sprintf("%q has a percent-encoded host — write the host name plainly", shown)
 	}
 	if p := parsed.Port(); p != "" {
 		if n, err := strconv.Atoi(p); err != nil || n < 1 || n > 65535 {
@@ -443,6 +528,18 @@ func feedURLProblem(raw string) string {
 		}
 	}
 	return ""
+}
+
+// rawAuthority is the text between "//" and the path, query or fragment.
+func rawAuthority(u string) string {
+	_, rest, ok := strings.Cut(u, "//")
+	if !ok {
+		return ""
+	}
+	if i := strings.IndexAny(rest, "/?#"); i >= 0 {
+		rest = rest[:i]
+	}
+	return rest
 }
 
 // Upper bounds for a site's request limits. Kept identical to LIMIT_CAPS in

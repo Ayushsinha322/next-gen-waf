@@ -1,0 +1,31 @@
+# Feed URLs the control plane accepts (feedURLProblem in site_validate.go).
+#
+# Read by two tests, so the two parsers cannot drift apart unnoticed:
+#   - TestFeedURLParityFixtureIsAccepted (site_validate_test.go): every line here
+#     must pass the control plane's check;
+#   - every_url_the_control_plane_accepts_is_fetchable (crates/sentinel-proxy/
+#     src/ip_feed.rs): the data plane must accept every line too.
+# A URL stored by the console but refused by the data plane fails on every node
+# at every refresh while the console shows it as set. Add a line here whenever
+# the control-plane check is loosened.
+#
+# One URL per line; blank lines and lines starting with # are skipped.
+
+https://iplists.firehol.org/files/firehol_level1.netset
+http://feeds.example/list
+HTTP://10.0.0.5:8080/list.txt
+HTTPS://FEEDS.EXAMPLE/list
+https://feeds.example:8443/list?key=abc&format=plain
+http://[2001:db8::1]/list
+http://[2001:db8::1]:8080/list
+https://feeds.example
+https://feeds.example?x=1
+https://feeds_x.example/list
+https://xn--bcher-kva.example/list
+https://feeds.example/a%20b/%C3%BC.txt
+https://feeds.example/a'b(c)*+,;=:@!$&~-._/list
+https://feeds.example/l?a=1&b=/?:@[x]
+https://feeds.example/[v1]/list
+https://feeds.example/list#section
+https://feeds.example:1/list
+https://feeds.example:65535/list
