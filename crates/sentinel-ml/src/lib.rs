@@ -512,25 +512,99 @@ fn body_field_values(body: &str, content_type: &str, out: &mut Vec<String>) -> b
                 // scored whole, `filename="/static/img/../../etc/passwd"` got
                 // through (GoTestWAF community-lfi-multipart, 2/2).
                 for param in ["filename=", "name="] {
-                    let mut rest = &part[..idx];
-                    while let Some(pos) = rest.find(param) {
-                        let after = &rest[pos + param.len()..];
-                        let v = if let Some(q) = after.strip_prefix('"') {
-                            q.split('"').next().unwrap_or("")
-                        } else {
-                            after.split([';', '\r', '\n']).next().unwrap_or("").trim()
-                        };
-                        if !v.is_empty() {
-                            out.push(v.to_string());
-                        }
-                        rest = after;
-                    }
+                    header_param_values(&part[..idx], param, out);
                 }
             }
         }
         out.len() > before
     } else {
         false
+    }
+}
+
+/// Pushes the values of `param` (`name=`, `filename=`) found in one multipart
+/// part's header block.
+///
+/// The scan resumes just past each `param`, so it also finds one INSIDE a value
+/// it has read: `name="…fname=|/bin/id"` yields the fragment `|/bin/id"` too,
+/// and the classifier can score such a fragment far above the whole value —
+/// 0.55 against 0.07 on a scanner-corpus line, either side of the veto line.
+/// Each fragment, though, is a copy running to the end of the value, so
+/// `name=name=name=…` copied the block once per repetition: 409 MB of
+/// candidates from 64 KB, and the search for each value's end was quadratic
+/// too. So the two kinds are told apart. A PARAMETER value — one starting
+/// where the previous value ended — is always kept, and those add up to at
+/// most the block. Fragments share a budget of four times the block plus
+/// 64 KiB: every fragment of an ordinary header fits (all of them, over
+/// 1.44 M corpus-built headers), and a real parameter is never crowded out.
+/// Each value's end is found once per stretch (`NextHit`).
+fn header_param_values(block: &str, param: &str, out: &mut Vec<String>) {
+    let b = block.as_bytes();
+    let mut quote = NextHit::new(b, |c| c == b'"');
+    let mut delim = NextHit::new(b, |c| matches!(c, b';' | b'\r' | b'\n'));
+    let mut fragment_budget = block.len().saturating_mul(4).saturating_add(64 * 1024);
+    // Where the last parameter value (not fragment) ended.
+    let mut value_end = 0;
+    let mut from = 0;
+    while let Some(rel) = block[from..].find(param) {
+        let at = from + rel;
+        let start = at + param.len();
+        from = start;
+        let quoted = b.get(start) == Some(&b'"');
+        // The value before trimming, and where it ends (past a closing quote).
+        let (raw, end) = if quoted {
+            let close = quote.at_or_after(start + 1);
+            (&block[start + 1..close], (close + 1).min(b.len()))
+        } else {
+            let stop = delim.at_or_after(start);
+            (&block[start..stop], stop)
+        };
+        if at >= value_end {
+            value_end = end;
+        } else if raw.len() <= fragment_budget {
+            fragment_budget -= raw.len();
+        } else {
+            continue;
+        }
+        let v = if quoted { raw } else { raw.trim() };
+        if !v.is_empty() {
+            out.push(v.to_string());
+        }
+    }
+}
+
+/// The next byte satisfying `hit` at or after a position, for positions that
+/// never decrease: an answer is reused until the position passes it, so each
+/// byte is examined once in all, however many values share an end.
+struct NextHit<'a, F: Fn(u8) -> bool> {
+    b: &'a [u8],
+    hit: F,
+    /// Where the last search started; no hit lies in `searched_from..found`.
+    searched_from: usize,
+    /// The hit it found, or `b.len()` for none.
+    found: usize,
+}
+
+impl<'a, F: Fn(u8) -> bool> NextHit<'a, F> {
+    fn new(b: &'a [u8], hit: F) -> Self {
+        Self {
+            b,
+            hit,
+            searched_from: usize::MAX,
+            found: 0,
+        }
+    }
+
+    fn at_or_after(&mut self, pos: usize) -> usize {
+        if !(self.searched_from <= pos && pos <= self.found) {
+            let hit = &self.hit;
+            self.found = self.b[pos..]
+                .iter()
+                .position(|&c| hit(c))
+                .map_or(self.b.len(), |i| pos + i);
+            self.searched_from = pos;
+        }
+        self.found
     }
 }
 
@@ -719,5 +793,57 @@ mod json_candidate_tests {
         let body = "--B\r\nContent-Disposition: form-data; name=\"f\"\r\n\r\nvalue-here\r\n--B--";
         body_field_values(body, "multipart/form-data; boundary=B", &mut out2);
         assert!(out2.iter().any(|c| c.contains("value-here")));
+    }
+
+    /// A multipart header parameter's value was searched again for the next
+    /// `name=`, so `name=name=name=…` copied a suffix of the header block per
+    /// repetition — quadratic: 409 MB of candidates from a 64 KB block, about
+    /// 100 GB from 1 MB, before the classifier scored any of it.
+    #[test]
+    fn multipart_header_parameters_are_read_in_linear_time() {
+        let multipart = |headers: &str| {
+            let body =
+                format!("--B\r\nContent-Disposition: form-data; {headers}\r\n\r\nv\r\n--B--");
+            let mut out = Vec::new();
+            body_field_values(&body, "multipart/form-data; boundary=B", &mut out);
+            (body.len(), out)
+        };
+
+        // Still every parameter, quoted or not, `filename=` included.
+        let (_, out) = multipart("name=\"f\"; filename=\"../../etc/passwd\"; x=1");
+        assert!(out.iter().any(|c| c == "f"), "{out:?}");
+        assert!(out.iter().any(|c| c == "../../etc/passwd"), "{out:?}");
+        let (_, out) = multipart("name=q ; filename=a.php");
+        assert!(out.iter().any(|c| c == "q") && out.iter().any(|c| c == "a.php"));
+        // A `name=` inside a value still yields its fragment, as it always
+        // has: the classifier can score a fragment above the whole value.
+        let (_, out) = multipart("name=\"x; name=y\"");
+        assert!(out.iter().any(|c| c == "x; name=y"), "{out:?}");
+        assert!(out.iter().any(|c| c == "y\""), "{out:?}");
+        // A real parameter after a block built to multiply fragments is
+        // still read.
+        let (_, out) = multipart(&format!("{}; filename=\"evil.php\"", "name=".repeat(5000)));
+        assert!(out.iter().any(|c| c == "evil.php"), "{out:?}");
+
+        // 16 KB first: the old scan copied ~26 MB there and failed before
+        // reaching the megabyte, which would have needed about 100 GB.
+        for size in [16 * 1024, 1 << 20] {
+            for unit in ["name=", "name=\"\"", "filename=x;", "name= ", "name=\""] {
+                let started = std::time::Instant::now();
+                let (len, out) = multipart(&unit.repeat(size / unit.len()));
+                // Per parameter kind: values up to the block, fragments up to
+                // four blocks plus 64 KiB.
+                let copied: usize = out.iter().map(String::len).sum();
+                assert!(
+                    copied <= 10 * len + 128 * 1024,
+                    "{unit:?} x {size} bytes: {copied} bytes of candidates"
+                );
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(2),
+                    "{unit:?} x {size} bytes took {:?}",
+                    started.elapsed()
+                );
+            }
+        }
     }
 }
