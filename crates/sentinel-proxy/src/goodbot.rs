@@ -315,7 +315,7 @@ impl GoodBotVerifier {
 
     /// For /healthz.
     pub(crate) fn status(&self) -> serde_json::Value {
-        let cache_entries = self.cache.lock().map(|c| c.len()).unwrap_or(0);
+        let cache_entries = self.cache.lock().unwrap_or_else(|e| e.into_inner()).len();
         serde_json::json!({
             "lookups": self.lookups.load(Ordering::Relaxed),
             "verified": self.verified.load(Ordering::Relaxed),

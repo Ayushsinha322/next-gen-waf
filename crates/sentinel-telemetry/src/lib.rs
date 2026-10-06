@@ -38,13 +38,14 @@ pub use metrics::{
     ja4_h3_absent_total, ja4_h3_attempts_total, ja4_h3_success_total, ja4_no_hello_total,
     ja4_success_total, log_lines_dropped_total, note_good_bot_allowed, note_graphql_blocked,
     note_graphql_inspected, note_grpc_inspected, note_ja4_attempt, note_ja4_h3, note_ja4_no_hello,
-    note_ja4_success, note_plugin_block, note_plugin_invocation, note_plugin_score,
-    note_plugin_trap, note_smuggling_evaluated, note_smuggling_rejected_framing,
-    note_smuggling_rejected_header, observe_duration, plugin_blocks_total,
-    plugin_invocations_total, plugin_scores_total, plugin_traps_total, prometheus_text,
+    note_ja4_success, note_panic, note_plugin_block, note_plugin_invocation, note_plugin_score,
+    note_plugin_trap, note_request_panic, note_smuggling_evaluated,
+    note_smuggling_rejected_framing, note_smuggling_rejected_header, note_task_restart,
+    observe_duration, panics_total, plugin_blocks_total, plugin_invocations_total,
+    plugin_scores_total, plugin_traps_total, prometheus_text, request_panics_total,
     set_active_connections, smuggling_evaluated_total, smuggling_rejected_framing_total,
-    smuggling_rejected_header_total, snapshot, Counter, Gauge, Histogram, MetricLine,
-    MetricsRegistry, MetricsSnapshot,
+    smuggling_rejected_header_total, snapshot, task_restarts_total, Counter, Gauge, Histogram,
+    MetricLine, MetricsRegistry, MetricsSnapshot,
 };
 
 pub use traces::{start_child_span, start_span, Span, SpanId, TraceId, Tracer, TRACER};

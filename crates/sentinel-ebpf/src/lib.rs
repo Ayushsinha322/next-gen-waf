@@ -42,7 +42,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -566,10 +566,15 @@ mod kernel_xdp {
 
         // -- internals ------------------------------------------------------
 
+        /// Poisoning is recovered rather than reported: every map update is a
+        /// single syscall, so a panic elsewhere cannot leave the maps half
+        /// written, and refusing the lock would freeze the kernel blocklist for
+        /// the rest of the process.
         fn lock(&self) -> Result<std::sync::MutexGuard<'_, Ebpf>> {
-            self.ebpf
+            Ok(self
+                .ebpf
                 .lock()
-                .map_err(|_| EbpfError::MapError("ebpf mutex poisoned".to_string()))
+                .unwrap_or_else(std::sync::PoisonError::into_inner))
         }
 
         fn insert_v4(&self, data: u32, prefix_len: u32) -> Result<()> {
@@ -617,6 +622,10 @@ mod kernel_xdp {
 /// on each new connection in software mode.
 pub struct EbpfManager {
     config: Arc<EbpfConfig>,
+    /// Every lock site recovers a poisoned lock. Each critical section is one
+    /// set or vec operation, so the list stays usable after a panic, and
+    /// `is_blocked` runs on every connection: a lock that panicked once poisoned
+    /// would turn one panic into a node that panics on every request.
     blocklist: Arc<RwLock<Blocklist>>,
     stats: Arc<AtomicStats>,
     running: Arc<AtomicBool>,
@@ -733,7 +742,10 @@ impl EbpfManager {
                 }
 
                 let snap = stats.snapshot();
-                let bl_len = blocklist.read().expect("blocklist RwLock poisoned").len();
+                let bl_len = blocklist
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .len();
 
                 debug!(
                     mode = %mode,
@@ -769,7 +781,10 @@ impl EbpfManager {
     /// In kernel mode this would also update the BPF LPM-trie map so that
     /// the XDP program starts dropping packets immediately.
     pub fn block_ip(&self, ip: IpAddr) {
-        let mut bl = self.blocklist.write().expect("blocklist RwLock poisoned");
+        let mut bl = self
+            .blocklist
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         bl.add_ip(ip);
         self.stats.xdp_drop.fetch_add(0, Ordering::Relaxed); // no-op; update on match
         debug!(%ip, "blocked IP added");
@@ -785,7 +800,10 @@ impl EbpfManager {
 
     /// Add a CIDR range to the blocklist.
     pub fn block_net(&self, net: IpNet) {
-        let mut bl = self.blocklist.write().expect("blocklist RwLock poisoned");
+        let mut bl = self
+            .blocklist
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         bl.ranges.push(net.clone());
         debug!(%net, "blocked CIDR range added");
         drop(bl);
@@ -799,7 +817,10 @@ impl EbpfManager {
 
     /// Remove a single IP from the blocklist.
     pub fn unblock_ip(&self, ip: IpAddr) {
-        let mut bl = self.blocklist.write().expect("blocklist RwLock poisoned");
+        let mut bl = self
+            .blocklist
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         bl.remove_ip(&ip);
         debug!(%ip, "unblocked IP removed");
         drop(bl);
@@ -824,7 +845,10 @@ impl EbpfManager {
     /// For the console's Blocked Sources page; the set is small (bans are
     /// low-volume) so a copy under the read lock is fine.
     pub fn blocked_entries(&self) -> (Vec<IpAddr>, Vec<IpNet>) {
-        let bl = self.blocklist.read().expect("blocklist RwLock poisoned");
+        let bl = self
+            .blocklist
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
         let mut ips: Vec<IpAddr> = bl.exact.iter().copied().collect();
         ips.sort();
         (ips, bl.ranges.clone())
@@ -832,7 +856,10 @@ impl EbpfManager {
 
     #[inline]
     pub fn is_blocked(&self, ip: IpAddr) -> bool {
-        let bl = self.blocklist.read().expect("blocklist RwLock poisoned");
+        let bl = self
+            .blocklist
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
         if bl.contains(&ip) {
             self.stats.xdp_drop.fetch_add(1, Ordering::Relaxed);
             self.stats
@@ -1161,6 +1188,37 @@ mod tests {
         mgr.block_ip(ip);
         assert!(mgr.is_blocked(ip));
         assert!(!mgr.is_blocked(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2))));
+    }
+
+    /// A panic while the blocklist was locked used to make every later
+    /// `is_blocked` panic too, and `is_blocked` runs on every connection — one
+    /// panic became a node that could serve nothing. Now the list is recovered.
+    #[tokio::test]
+    async fn a_poisoned_blocklist_keeps_enforcing() {
+        let mgr = EbpfManager::new(EbpfConfig::default()).await.unwrap();
+        let before: IpAddr = "203.0.113.7".parse().unwrap();
+        mgr.block_ip(before);
+
+        let bl = Arc::clone(&mgr.blocklist);
+        let _ = std::thread::spawn(move || {
+            let _held = bl.write().unwrap();
+            panic!("poisoning the blocklist on purpose");
+        })
+        .join();
+        assert!(mgr.blocklist.is_poisoned(), "fixture must poison the lock");
+
+        assert!(
+            mgr.is_blocked(before),
+            "entries from before the panic still apply"
+        );
+        let after: IpAddr = "203.0.113.8".parse().unwrap();
+        mgr.block_ip(after);
+        mgr.block_net(IpNet::new("198.51.100.0".parse().unwrap(), 24));
+        assert!(mgr.is_blocked(after));
+        assert!(mgr.is_blocked("198.51.100.9".parse().unwrap()));
+        mgr.unblock_ip(after);
+        assert!(!mgr.is_blocked(after));
+        assert_eq!(mgr.blocked_entries().0, vec![before]);
     }
 
     // ------------------------------------------------------------------

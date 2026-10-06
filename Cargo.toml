@@ -156,7 +156,13 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
-panic = "abort"
+# Unwind, deliberately. Under "abort" one panic anywhere — one hostile request
+# reaching a slicing bug, a dependency's `unreachable!` — killed the node with
+# every site and connection on it. With unwinding the data plane contains a panic
+# to the request (500) or background loop (restarted) it happened in; see
+# crates/sentinel-proxy/src/panic_guard.rs. Do not switch this back to save
+# binary size.
+panic = "unwind"
 
 [profile.bench]
 opt-level = 3

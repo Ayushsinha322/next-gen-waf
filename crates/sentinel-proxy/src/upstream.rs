@@ -926,9 +926,13 @@ impl UpstreamPool {
             let timeout_secs = parse_duration_secs(&hc_cfg.timeout).unwrap_or(2);
             let pool2 = Arc::clone(&pool);
             let site_id = site.id.clone();
-            let mut sd = shutdown.clone();
+            let sd = shutdown.clone();
 
-            tokio::spawn(async move {
+            // Supervised: a panic restarts the probe loop. Unsupervised, the
+            // site's servers kept whatever health they last had for good — a
+            // dead origin stayed "healthy", a recovered one stayed out.
+            crate::panic_guard::supervised!("upstream health check", {
+                per_run!(path, pool2, site_id, sd);
                 let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 

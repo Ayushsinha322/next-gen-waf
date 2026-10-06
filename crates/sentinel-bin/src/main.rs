@@ -53,6 +53,9 @@ fn main() -> anyhow::Result<()> {
     // Bootstrap a minimal logger before config is loaded (so startup errors
     // are visible).  The log level from config is applied after loading.
     init_tracing(args.log_level.as_deref().unwrap_or("info"));
+    // After tracing, so a panic is one structured line with its location (and
+    // is counted at /metrics) rather than the default hook's stderr text.
+    sentinel_proxy::install_panic_hook();
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -91,18 +94,33 @@ async fn async_main(loader: Arc<ConfigLoader>) -> anyhow::Result<()> {
 
     // Spawn the proxy server.
     let proxy = ProxyServer::new(Arc::clone(&config));
-    let proxy_handle = tokio::spawn(async move {
-        if let Err(e) = proxy.run(shutdown_rx).await {
-            error!("proxy server error: {e:#}");
-        }
-    });
+    let mut proxy_handle = tokio::spawn(async move { proxy.run(shutdown_rx).await });
 
-    // Wait for Ctrl-C / SIGTERM.
-    wait_for_shutdown().await;
+    // Wait for Ctrl-C / SIGTERM — or for the proxy to stop on its own, which it
+    // only does when it failed. That used to leave this process waiting for a
+    // signal with no listeners: alive to the service manager, serving nothing.
+    // Under the old panic="abort" profile a panic at least took the process
+    // down; with unwinding the task absorbs it, so exiting is now this code's
+    // job, and it applies to an error return just the same.
+    tokio::select! {
+        _ = wait_for_shutdown() => {}
+        res = &mut proxy_handle => {
+            match res {
+                Ok(Ok(())) => error!("proxy stopped without a shutdown signal"),
+                Ok(Err(e)) => error!("proxy server error: {e:#}"),
+                Err(e) => error!("proxy server task failed: {e}"),
+            }
+            anyhow::bail!("proxy stopped unexpectedly; exiting so the service manager restarts it");
+        }
+    }
     info!("shutdown signal received — stopping");
 
     let _ = shutdown_tx.send(true);
-    proxy_handle.await.ok();
+    match proxy_handle.await {
+        Ok(Err(e)) => error!("proxy server error during shutdown: {e:#}"),
+        Err(e) => error!("proxy server task failed during shutdown: {e}"),
+        Ok(Ok(())) => {}
+    }
 
     info!("goodbye");
     Ok(())

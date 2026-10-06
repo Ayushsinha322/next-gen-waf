@@ -96,9 +96,8 @@ impl JwksCache {
         let diags = self
             .last_diag
             .lock()
-            .ok()
-            .map(|g| g.clone())
-            .unwrap_or_default();
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let mut out = serde_json::Map::new();
         for (url, entry) in entries.iter() {
             let age = entry.fetched.elapsed();

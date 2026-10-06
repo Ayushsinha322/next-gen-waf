@@ -17,6 +17,11 @@ libc = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true, features = ["rt"] }
+# `FutureExt::catch_unwind`: a panic in one request or background loop is
+# contained to it instead of ending the process. See src/panic_guard.rs.
+futures = { workspace = true }
+# Support ID for a request that panicked before it had a context.
+uuid = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

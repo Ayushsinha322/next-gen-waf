@@ -5,7 +5,7 @@
 /// `SentinelCertResolver` wraps this and plugs straight into rustls.
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -501,6 +501,14 @@ impl std::fmt::Debug for SentinelCertResolver {
 }
 
 impl SentinelCertResolver {
+    /// The fallback cache, recovered if a panic poisoned it. Every TLS handshake
+    /// on the listener comes through here, so a lock that panicked once poisoned
+    /// would fail every handshake that followed; the cache is a plain map and
+    /// stays valid.
+    fn fallback_cache(&self) -> MutexGuard<'_, HashMap<String, Arc<CertifiedKey>>> {
+        self.fallback.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     pub fn new(store: Arc<CertStore>) -> Arc<Self> {
         Arc::new(Self {
             store,
@@ -523,7 +531,7 @@ impl SentinelCertResolver {
 
     /// Pre-warm the self-signed fallback cache for known domains.
     pub fn pre_warm(&self, domains: &[String]) {
-        let mut fb = self.fallback.lock().expect("fallback lock");
+        let mut fb = self.fallback_cache();
         for d in domains {
             if self.store.resolve_live(d).is_none() {
                 if let Ok(ck) = generate_self_signed(d) {
@@ -543,7 +551,7 @@ impl ResolvesServerCert for SentinelCertResolver {
                 return Some(ck);
             }
             {
-                let fb = self.fallback.lock().expect("fallback lock");
+                let fb = self.fallback_cache();
                 if let Some(ck) = fb.get(key) {
                     return Some(Arc::clone(ck));
                 }
@@ -555,10 +563,7 @@ impl ResolvesServerCert for SentinelCertResolver {
             // it to the cert volume and every node — and every restart — serves
             // the same bytes until an operator uploads a real one.
             let ck = self.store.self_signed_shared(key)?;
-            self.fallback
-                .lock()
-                .expect("fallback lock")
-                .insert(key.clone(), Arc::clone(&ck));
+            self.fallback_cache().insert(key.clone(), Arc::clone(&ck));
             return Some(ck);
         }
 
@@ -592,15 +597,13 @@ impl ResolvesServerCert for SentinelCertResolver {
         // load balancer began spreading it. Now the first node to need a name
         // persists the cert to the shared volume and the others adopt it.
         {
-            let fb = self.fallback.lock().expect("fallback lock");
+            let fb = self.fallback_cache();
             if let Some(ck) = fb.get(sni) {
                 return Some(Arc::clone(ck));
             }
         }
         let ck = self.store.self_signed_shared(sni)?;
-        self.fallback
-            .lock()
-            .expect("fallback lock")
+        self.fallback_cache()
             .insert(sni.to_string(), Arc::clone(&ck));
         Some(ck)
     }
@@ -962,6 +965,32 @@ mod tests {
             two.end_entity_cert().unwrap().as_ref()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A panic while the fallback cache was locked used to make every later
+    /// lookup `expect` on the poisoned lock — and every TLS handshake on the
+    /// listener goes through it, so one panic ended HTTPS on that listener.
+    #[test]
+    fn a_poisoned_fallback_cache_keeps_serving() {
+        let resolver = SentinelCertResolver::new(tmp_store());
+        let poisoner = Arc::clone(&resolver);
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.fallback.lock().unwrap();
+            panic!("poisoning the fallback cache on purpose");
+        })
+        .join();
+        assert!(
+            resolver.fallback.is_poisoned(),
+            "fixture must poison the lock"
+        );
+
+        resolver.pre_warm(&["after-poison.example".to_string()]);
+        assert!(
+            resolver
+                .fallback_cache()
+                .contains_key("after-poison.example"),
+            "the cache must still take and serve certificates"
+        );
     }
 
     /// An unwritable store must still yield a working cert. Refusing TLS because
