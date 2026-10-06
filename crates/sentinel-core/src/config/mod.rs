@@ -682,10 +682,13 @@ pub struct WafConfig {
     /// an XML comment, or one JSON key repeated in every object of an array.
     #[serde(default = "default_max_inspected_arg_bytes")]
     pub max_inspected_arg_bytes: u64,
-    /// Longest the rule engine may spend on one phase of a request, in
+    /// Most CPU time the rule engine may spend on one phase of a request, in
     /// milliseconds (0 = unlimited, default
-    /// [`DEFAULT_INSPECTION_TIME_BUDGET_MS`]). Checked between rule
-    /// instructions, so one long instruction can overrun it; what it bounds is
+    /// [`DEFAULT_INSPECTION_TIME_BUDGET_MS`]). CPU time, so time a busy node
+    /// keeps the evaluating thread waiting is not held against the request;
+    /// per phase, the request body being the one a client can make
+    /// expensive. Checked between rule instructions — every one after a large
+    /// value is loaded — so one instruction can overrun it; what it bounds is
     /// how much further evaluation a slow request can buy.
     #[serde(default = "default_inspection_time_budget_ms")]
     pub inspection_time_budget_ms: u32,
@@ -924,24 +927,27 @@ fn default_max_header_count() -> u32 {
 // ASCII text and 4-5 µs per byte of real-world text (mixed case, Devanagari,
 // accents, `+` and `%`, which the transforms rewrite):
 //
-//   request                                   plain     mixed text
-//   ordinary: 1000 fields, 256 KiB of text    0.21 s    0.89-0.95 s
-//   at both limits: 4096 fields, 512 KiB      0.58 s    1.8-1.9 s
-//   at the byte limit in 8 fields             0.27 s    2.5-2.6 s
+//   request                                   plain         mixed text
+//   ordinary: 1000 fields, 256 KiB of text    0.20-0.21 s   0.68-0.91 s
+//   at both limits: 4096 fields, 512 KiB      0.46-0.57 s   0.91-1.97 s
+//   at the byte limit in 8 fields             0.26-0.27 s   2.56 s
 //
-// with no limit, 4 MiB of mixed text took 20-40 s, so a default-sized (10 MiB)
-// body costs a minute or more. A body the rules read whole costs less per
-// byte (about 25 rules read REQUEST_BODY): 0.2-0.3 s at the byte limit with no
-// parser (text/plain, octet-stream), and at most 0.8 s at four times it for a
-// parsed body that is mostly not arguments; at 10 MiB both were read in full,
-// 4-10 s, and are now refused in 3-100 ms. The limits keep the ordinary form well inside
-// them (4x the fields, 2x the bytes). A request AT them costs far more than
-// the ~50 ms first aimed for, and that is the engine's cost, not the limits':
-// limits low enough for 50 ms (~200 fields, tens of KiB of text) would refuse
-// that ordinary form. The same rows ran up to 2x slower when the core was
-// shared with a build, so the time budget sits at 4x the costliest request
-// within the limits and ~10x the ordinary form: it catches content unusually
-// slow to inspect, never a slow node.
+// Multipart is the cheaper end: its part header lines count against the byte
+// limit, so its values are shorter. With no limit, 4 MiB of mixed text took
+// 20-40 s, so a default-sized (10 MiB) body cost a minute or more. A body the
+// rules read whole costs less per byte, as about 25 rules read REQUEST_BODY:
+// 0.02-0.28 s at the byte limit with no parser (text/plain, octet-stream),
+// at most 0.81 s at four times it for a parsed body that is mostly not
+// arguments; at 10 MiB these took 4-10 s, and are now refused in 5-100 ms.
+//
+// The limits keep the ordinary form well inside them (4x the fields, 2x the
+// bytes). A request AT them costs far more than the ~50 ms first aimed for,
+// and that is the engine's cost, not the limits': limits low enough for 50 ms
+// (~200 fields, tens of KiB of text) would refuse that ordinary form. The
+// time budget is CPU time, so a busy node does not spend it but a slower core
+// does; it sits at 4x the costliest request within the limits and ~10x the
+// ordinary form, room for a core several times slower than this one: it
+// catches content unusually slow to inspect, not a slow node.
 
 /// Default `max_inspected_args`.
 pub const DEFAULT_MAX_INSPECTED_ARGS: u32 = 4096;

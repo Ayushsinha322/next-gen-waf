@@ -122,7 +122,8 @@ pub struct InspectionLimits {
     pub max_args: u32,
     /// Most bytes of argument names and values, as the parsers decode them.
     pub max_arg_bytes: u64,
-    /// Longest one `evaluate` call — one phase — may run, in milliseconds.
+    /// Most CPU time one `evaluate` call — one phase — may use, in
+    /// milliseconds.
     pub time_budget_ms: u32,
 }
 

@@ -2126,12 +2126,31 @@ fn record_match<S: AsRef<str>>(last_matched: &mut Option<String>, hit: Option<S>
 // ---------------------------------------------------------------------------
 
 /// How many instructions run between two reads of the clock for the site's
-/// time budget. Reading it costs tens of nanoseconds and an instruction costs
-/// at least that, so the check adds little, and a budget is overrun by at most
-/// this many instructions plus whatever the one running when it ran out takes.
+/// time budget while the values in hand are small. Reading it costs tens of
+/// nanoseconds and such an instruction at least that, so the check adds
+/// little.
 const CLOCK_EVERY: u32 = 64;
 
-/// The clock the time budget is read from.
+/// After a target loads at least this many bytes of values, the clock is read
+/// before every instruction until the next load. One transform chain or
+/// operator over large values can take longer than `CLOCK_EVERY` cheap
+/// instructions — about 0.4 s over 10 MiB — so reading it only every
+/// `CLOCK_EVERY` let a budget be overrun by a dozen such rules; and a read is
+/// nothing beside the work on 64 KiB. A budget is overrun by at most one
+/// instruction, or `CLOCK_EVERY` cheap ones.
+const CLOCK_BYTES: usize = 64 * 1024;
+
+/// Whether `values` hold at least `bytes` bytes between them; counts no
+/// further.
+fn holds_at_least(values: &[String], bytes: usize) -> bool {
+    let mut held = 0;
+    values.iter().any(|v| {
+        held += v.len();
+        held >= bytes
+    })
+}
+
+/// The wall clock the time budget watches.
 #[cfg(not(any(test, feature = "test-hooks")))]
 fn eval_clock() -> std::time::Instant {
     std::time::Instant::now()
@@ -2140,6 +2159,95 @@ fn eval_clock() -> std::time::Instant {
 #[cfg(any(test, feature = "test-hooks"))]
 fn eval_clock() -> std::time::Instant {
     std::time::Instant::now() + crate::test_hooks::eval_clock_skew()
+}
+
+/// The CPU time this thread has used, where the platform keeps it.
+#[cfg(target_os = "linux")]
+fn thread_cpu_time() -> Option<std::time::Duration> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `clock_gettime` writes one `timespec` through the pointer, which
+    // points at a live, writable one.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    (rc == 0).then(|| std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn thread_cpu_time() -> Option<std::time::Duration> {
+    None
+}
+
+/// The CPU clock the time budget is measured in.
+#[cfg(not(any(test, feature = "test-hooks")))]
+fn eval_cpu_clock() -> Option<std::time::Duration> {
+    thread_cpu_time()
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+fn eval_cpu_clock() -> Option<std::time::Duration> {
+    thread_cpu_time().map(|t| t + crate::test_hooks::eval_cpu_clock_skew())
+}
+
+/// The site's time budget (`inspection_time_budget_ms`) for one `evaluate`
+/// call: one phase of one request.
+///
+/// It is CPU time this thread spends evaluating, which is the request's own
+/// cost: `evaluate` never yields, so the thread runs nothing else until it
+/// returns. Wall time also counted time the thread spent descheduled — a busy
+/// node, which is what a flood makes — so a heavy but legitimate request
+/// could be refused for the load around it. Where there is no thread CPU
+/// clock, wall time is all there is.
+///
+/// Per phase, not per request: the request headers are bounded by the proxy's
+/// header limits, the response by what the origin sends, so the phase a
+/// client can make expensive is the request body; and a budget spent across
+/// phases would let a costly request body refuse the response that follows.
+struct TimeBudget {
+    budget: std::time::Duration,
+    wall_started: std::time::Instant,
+    cpu_started: Option<std::time::Duration>,
+    /// How much wall time passes before the CPU clock is worth reading. A
+    /// thread uses no more CPU time than wall time passes, so until then the
+    /// budget cannot be spent; and the CPU clock is a system call, the wall
+    /// clock is not.
+    cpu_unread_for: std::time::Duration,
+}
+
+impl TimeBudget {
+    /// The budget `limits` set, from now; `None` for none.
+    fn start(limits: &InspectionLimits) -> Option<Self> {
+        (limits.time_budget_ms > 0).then(|| {
+            let budget = std::time::Duration::from_millis(limits.time_budget_ms.into());
+            Self {
+                budget,
+                wall_started: eval_clock(),
+                cpu_started: eval_cpu_clock(),
+                cpu_unread_for: budget,
+            }
+        })
+    }
+
+    /// Once the budget is spent, the CPU time this call has used and the wall
+    /// time it has taken.
+    fn spent(&mut self) -> Option<(std::time::Duration, std::time::Duration)> {
+        let wall = eval_clock().saturating_duration_since(self.wall_started);
+        if wall <= self.cpu_unread_for {
+            return None;
+        }
+        let cpu = match (self.cpu_started, eval_cpu_clock()) {
+            (Some(started), Some(now)) => now.saturating_sub(started),
+            _ => wall,
+        };
+        if cpu > self.budget {
+            return Some((cpu, wall));
+        }
+        // Descheduled for the difference: the CPU clock cannot pass the
+        // budget before the wall clock moves on by what is left of it.
+        self.cpu_unread_for = wall + (self.budget - cpu);
+        None
+    }
 }
 
 /// What a request past `limit` is refused for, in words.
@@ -2251,26 +2359,14 @@ pub fn evaluate(
     // miss), so a stale value from an earlier rule can never be attributed to
     // a later one.
     let mut last_matched: Option<String> = None;
-    // The site's time budget for this call: when it started, and how long it
-    // may run. Read every `CLOCK_EVERY` instructions.
-    let time_budget = (ctx.inspection_limits.time_budget_ms > 0).then(|| {
-        (
-            eval_clock(),
-            std::time::Duration::from_millis(ctx.inspection_limits.time_budget_ms.into()),
-        )
-    });
+    // The site's time budget for this call; see `TimeBudget`. Its clock is
+    // read every `CLOCK_EVERY` instructions, and before every instruction
+    // while `large_values` — the last target loaded `CLOCK_BYTES` or more.
+    let mut time_budget = TimeBudget::start(&ctx.inspection_limits);
     let mut steps: u32 = 0;
+    let mut large_values = false;
 
     while ip < program.len() {
-        steps = steps.wrapping_add(1);
-        if let Some((started, budget)) = time_budget.filter(|_| steps % CLOCK_EVERY == 0) {
-            let spent = eval_clock().saturating_duration_since(started);
-            if spent > budget {
-                let after = format!("stopped after {} ms", spent.as_millis());
-                return refuse_uninspected(ctx, &views, phase, InspectionLimit::Time, Some(after));
-            }
-        }
-
         // Early exit only on a real BLOCK — the same rule as the proxy's
         // `still_evaluating`. This read `!= Allow`, and `Log` is not `Allow`:
         // once learning mode had downgraded a verdict to Log (an over-long URI,
@@ -2282,6 +2378,25 @@ pub fn evaluate(
         // Challenge and Limit are not refusals either. (Code review finding.)
         if ctx.decision == WafDecision::Block {
             return ctx.decision.clone();
+        }
+
+        // After the Block exit, not before it: a rule that blocked decided the
+        // request, and a budget found spent at the next instruction overwrote
+        // its verdict with a time refusal — whose advice, raise the budget,
+        // would change nothing. (Review finding.)
+        steps = steps.wrapping_add(1);
+        if let Some(budget) = time_budget
+            .as_mut()
+            .filter(|_| large_values || steps % CLOCK_EVERY == 0)
+        {
+            if let Some((cpu, wall)) = budget.spent() {
+                let after = format!(
+                    "stopped after {} ms of CPU time ({} ms elapsed)",
+                    cpu.as_millis(),
+                    wall.as_millis()
+                );
+                return refuse_uninspected(ctx, &views, phase, InspectionLimit::Time, Some(after));
+            }
         }
 
         let instr = &program[ip];
@@ -2350,6 +2465,7 @@ pub fn evaluate(
                         );
                     }
                 };
+                large_values = holds_at_least(&values, CLOCK_BYTES);
                 stack.push(StackVal::Strings(values));
                 if memo_chain.is_some() {
                     ip += 2;
@@ -6078,6 +6194,117 @@ SecRule REQUEST_BODY "@rx ." "id:31,phase:2,pass,msg:'body read'"
         let mut c = request("", form, "a=last-value", limits(0, 0, 50));
         assert_eq!(run(&rs, &mut c), WafDecision::Allow);
         assert!(fired(&c, "29"));
+    }
+
+    /// A rule that blocks decides the request. The clock was read before the
+    /// Block early exit, so a budget found spent at the very next instruction
+    /// overwrote the rule's verdict: the event named the time budget, its
+    /// advice said to raise it (which would change nothing), and the time
+    /// reason was counted. Markers are one instruction each, so some count of
+    /// them puts the deny's last instruction just before a clock read.
+    #[test]
+    fn a_rule_s_block_stands_when_the_budget_runs_out_just_after_it() {
+        let _serial = serial();
+        // A rule after the deny, so the loop comes round again.
+        let deny = "SecRule REQUEST_HEADERS:User-Agent \"@rx probe\" \
+                    \"id:50,phase:2,deny,status:403,msg:'denied'\"\n\
+                    SecRule ARGS \"@rx never\" \"id:51,phase:2,pass\"\n";
+        let form = "application/x-www-form-urlencoded";
+        let mut decided_by_the_rule = 0;
+        crate::test_hooks::set_eval_clock_step(Duration::from_millis(51));
+        for n in 0..CLOCK_EVERY {
+            let mut src = String::new();
+            for i in 0..n {
+                writeln!(src, "SecMarker \"pad-{i}\"").unwrap();
+            }
+            src.push_str(deny);
+            let rs = ruleset(&src);
+            let mut c = request("", form, "a=v", limits(0, 0, 50));
+            evaluate(&rs, &mut c, Phase::RequestBody, 0);
+            // Past the deny, the budget is found spent before it runs: that
+            // is a time refusal, and right.
+            if fired(&c, "50") {
+                decided_by_the_rule += 1;
+                assert!(refusals(&c).is_empty(), "{n} markers: {:?}", c.rule_matches);
+                assert_eq!(c.block_reason.as_deref(), Some("denied"), "{n} markers");
+            }
+        }
+        crate::test_hooks::set_eval_clock_step(Duration::ZERO);
+        assert!(decided_by_the_rule > 0);
+    }
+
+    /// One instruction over a large value can take longer than many cheap
+    /// ones: a transform chain and a regex over 10 MiB took about 0.4 s, and
+    /// the clock was read only every `CLOCK_EVERY` instructions. After a load
+    /// of `CLOCK_BYTES` or more it is read before every instruction, so the
+    /// budget is overrun by at most one. This program is shorter than
+    /// `CLOCK_EVERY`, so before, the clock was never read at all.
+    #[test]
+    fn after_a_large_load_the_clock_is_read_every_instruction() {
+        let _serial = serial();
+        let rs = ruleset(RULES);
+        assert!(rs.phase_programs[Phase::RequestBody as usize].len() < CLOCK_EVERY as usize);
+        let form = "application/x-www-form-urlencoded";
+        let large = format!("a={}&z=last-value", "x".repeat(CLOCK_BYTES));
+        crate::test_hooks::set_eval_clock_step(Duration::from_millis(51));
+        let mut c = request("", form, &large, limits(0, 0, 50));
+        let decision = run(&rs, &mut c);
+        let mut small = request("", form, "z=last-value", limits(0, 0, 50));
+        let small_decision = run(&rs, &mut small);
+        crate::test_hooks::set_eval_clock_step(Duration::ZERO);
+
+        assert_eq!(decision, WafDecision::Block);
+        let refused = refusals(&c);
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].rule_id, InspectionLimit::Time.rule_id());
+        assert!(
+            !fired(&c, "29"),
+            "the budget was found spent only at the end"
+        );
+        // A small request is read every CLOCK_EVERY instructions, as before.
+        assert_eq!(small_decision, WafDecision::Allow);
+        assert!(fired(&small, "29"));
+    }
+
+    /// The budget is CPU time this thread spends evaluating. Wall time also
+    /// counted time the thread spent descheduled — a busy node, as in a
+    /// flood — so a heavy but legitimate request could be refused for the
+    /// load around it. The wall clock still decides when the CPU clock is
+    /// worth reading: a thread uses no more CPU time than wall time passes.
+    #[test]
+    fn time_the_thread_spends_descheduled_is_not_held_against_the_request() {
+        let _serial = serial();
+        let mut src = String::from(RULES);
+        for i in 0..40 {
+            src.push_str(&format!(
+                "SecRule ARGS \"@rx never-{i}\" \"id:{},phase:2,pass\"\n",
+                100 + i
+            ));
+        }
+        let rs = ruleset(&src);
+        let form = "application/x-www-form-urlencoded";
+        // The wall clock moves 51 ms per read; the CPU clock does not.
+        crate::test_hooks::set_eval_wall_clock_step(Duration::from_millis(51));
+        let mut c = request("", form, "a=last-value", limits(0, 0, 50));
+        let decision = run(&rs, &mut c);
+        crate::test_hooks::set_eval_clock_step(Duration::ZERO);
+        assert_eq!(decision, WafDecision::Allow, "{:?}", c.block_reason);
+        assert!(refusals(&c).is_empty());
+        assert!(fired(&c, "29"));
+    }
+
+    /// The hooks above stand in for the clocks; this is the real CPU clock:
+    /// present on Linux, and moving with work done on this thread.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_thread_cpu_clock_is_read_and_moves_with_work() {
+        let before = thread_cpu_time().expect("CLOCK_THREAD_CPUTIME_ID");
+        let mut x = 0u64;
+        for i in 0..20_000_000u64 {
+            x = std::hint::black_box(x.wrapping_mul(31).wrapping_add(i));
+        }
+        let after = thread_cpu_time().expect("CLOCK_THREAD_CPUTIME_ID");
+        assert!(after > before, "{before:?} -> {after:?} ({x})");
     }
 
     /// In learning mode the proxy turns the Block into a logged would-block
