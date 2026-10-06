@@ -1357,7 +1357,7 @@ impl ProxyServer {
                 .unwrap_or_else(|_| std::path::PathBuf::from("/var/lib/sentinel/certs"))
         });
         let cert_manager = tls::CertManager::new(cert_dir.clone());
-        match cert_manager.load_from_disk() {
+        match cert_manager.load_from_disk(&cfg.sites) {
             Ok(n) if n > 0 => info!(certs = n, "loaded persisted TLS certs from disk"),
             Ok(_) => {}
             Err(e) => warn!("cert disk load: {e:#}"),
@@ -1365,26 +1365,14 @@ impl ProxyServer {
         let http01_tokens = Arc::clone(&cert_manager.http01_tokens);
 
         // Trigger initial ACME issuance for any site that has tls.mode = acme
-        // but no cert on disk yet.
-        for site in &cfg.sites {
-            if site.tls.mode == sentinel_core::config::TlsCertMode::Acme {
-                if let Some(acme_cfg) = &site.tls.acme {
-                    let has_all = site
-                        .domains
-                        .iter()
-                        .all(|d| cert_manager.store.get_meta(d).is_some());
-                    if !has_all {
-                        let cm = Arc::clone(&cert_manager);
-                        let domains = site.domains.clone();
-                        let acme = acme_cfg.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = cm.issue_acme(domains.clone(), &acme).await {
-                                warn!(?domains, "initial ACME issuance failed: {e:#}");
-                            }
-                        });
-                    }
+        // but no cert on disk yet — for the names a CA can issue for only.
+        for (domains, acme) in tls::renewal::initial_orders(&cfg.sites, &cert_manager.store) {
+            let cm = Arc::clone(&cert_manager);
+            tokio::spawn(async move {
+                if let Err(e) = cm.issue_acme(domains.clone(), &acme).await {
+                    warn!(?domains, "initial ACME issuance failed: {e:#}");
                 }
-            }
+            });
         }
 
         // Renewal background task (checks every hour).
@@ -2375,17 +2363,15 @@ async fn serve_listener(
             }
             (Some(build_tls_acceptor(tls_cfg)?), None)
         } else {
-            // SNI-based per-domain resolution across all sites.
-            let cfg_snap = state.config.load();
-            let domains: Vec<String> = cfg_snap
-                .sites
-                .iter()
-                .flat_map(|s| s.domains.iter().cloned())
-                .collect();
+            // SNI-based per-domain resolution across all sites. Site certs are
+            // minted on config sync by one task per node, started by the first
+            // such listener — never in a handshake. The old per-listener
+            // pre-warm minted a different in-memory cert on every node.
             let resolver = tls::SentinelCertResolver::new(Arc::clone(&state.cert_manager.store));
-            if !domains.is_empty() {
-                resolver.pre_warm(&domains);
-            }
+            tls::cert_store::start_site_cert_sync(
+                &state.cert_manager.store,
+                Arc::clone(&state.config),
+            );
 
             // Same resolver → QUIC server config (ALPN h3), when enabled. Build
             // this from a clone *before* the TCP config consumes the resolver.

@@ -462,8 +462,12 @@ mod tests {
     #[test]
     fn resolver_config_builds() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let store = crate::tls::CertStore::new(std::path::PathBuf::from("/tmp/sentinel-h3-test"));
+        // Its own directory: building the resolver persists the default cert,
+        // and a fixed shared path would collect keys from every run and user.
+        let dir = std::env::temp_dir().join(format!("sentinel-h3-test-{}", std::process::id()));
+        let store = crate::tls::CertStore::new(dir.clone());
         let resolver = crate::tls::SentinelCertResolver::new(store);
         assert!(quic_server_config_from_resolver(resolver).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

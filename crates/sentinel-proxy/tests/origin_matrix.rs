@@ -486,7 +486,12 @@ struct Proxy {
 async fn start_proxy(origin_port: u16, o: Opts) -> Proxy {
     pki();
     let (h1, h2) = (next_port(), next_port());
-    let cfg = config(h1, h2, origin_port, &o);
+    let mut cfg = config(h1, h2, origin_port, &o);
+    // Not the developer's own `$HOME/.config/sentinel/certs`.
+    cfg.cert_dir = Some(std::env::temp_dir().join(format!(
+        "sentinel-origin-matrix-certs-{}",
+        std::process::id()
+    )));
     let handle: ConfigHandle = Arc::new(ArcSwap::new(Arc::new(cfg)));
     let (stop, rx) = watch::channel(false);
     let proxy = ProxyServer::new(handle);

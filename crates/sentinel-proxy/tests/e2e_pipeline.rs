@@ -63,6 +63,12 @@ fn config_handle(cfg: SentinelConfig) -> ConfigHandle {
     Arc::new(ArcSwap::new(Arc::new(cfg)))
 }
 
+/// A cert dir for this test process. Unset, the proxy uses the developer's own
+/// `$HOME/.config/sentinel/certs`.
+fn scratch_cert_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("sentinel-e2e-certs-{}", std::process::id()))
+}
+
 fn crs_rule_dir() -> std::path::PathBuf {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     manifest.join("../../rules/owasp-crs/rules")
@@ -239,12 +245,13 @@ async fn start_mock_upstream() -> (SocketAddr, tokio::task::JoinHandle<()>) {
 static PROXY_START_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
 async fn start_proxy(
-    cfg: SentinelConfig,
+    mut cfg: SentinelConfig,
 ) -> (
     watch::Sender<bool>,
     tokio::task::JoinHandle<anyhow::Result<()>>,
 ) {
     install_crypto();
+    cfg.cert_dir.get_or_insert_with(scratch_cert_dir);
     // Capture the bind addresses before the config is moved into the server.
     let binds: Vec<String> = cfg.listeners.iter().map(|l| l.bind.clone()).collect();
     let handle = config_handle(cfg);
@@ -1836,6 +1843,7 @@ async fn a_listener_that_cannot_bind_does_not_stop_the_proxy() {
         WafMode::Blocking,
     );
     cfg.listeners[0].bind = "999.999.999.999:8080".into();
+    cfg.cert_dir = Some(scratch_cert_dir());
 
     // Deliberately NOT via `start_proxy`: that would wait out the whole bind
     // budget, adding 30s to every run of this binary to record one fact.
@@ -1861,4 +1869,52 @@ async fn a_listener_that_cannot_bind_does_not_stop_the_proxy() {
 
     let _ = tx.send(true);
     let _ = jh.await;
+}
+
+/// Every file under `dir`, recursively.
+fn files_under(dir: &Path) -> Vec<std::path::PathBuf> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    rd.flatten()
+        .flat_map(|e| {
+            let p = e.path();
+            if p.is_dir() {
+                files_under(&p)
+            } else {
+                vec![p]
+            }
+        })
+        .collect()
+}
+
+/// A node with no SNI TLS listener (HTTP only, or TLS offloaded in front of it)
+/// never serves a site's self-signed certificate, so it must not mint one.
+/// The site cert sync used to start on every node and, within moments of
+/// boot, generate and store a private key for each configured domain — and list
+/// a self-signed row per site in that node's cert inventory.
+#[tokio::test]
+async fn an_http_only_node_mints_no_site_certificates() {
+    let (up_addr, _up) = start_mock_upstream().await;
+    let port = next_port();
+    let mut cfg = test_config(
+        port,
+        up_addr.port(),
+        "REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
+        WafMode::Blocking,
+    );
+    let dir = std::env::temp_dir().join(format!("sentinel-e2e-nomint-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    cfg.cert_dir = Some(dir.clone());
+    let (tx, jh) = start_proxy(cfg).await;
+
+    // A sync's first pass runs as soon as it starts and mints in milliseconds.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let written = files_under(&dir);
+    shutdown_proxy(tx, jh).await;
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        written.is_empty(),
+        "an HTTP-only node wrote certificate files: {written:?}"
+    );
 }
