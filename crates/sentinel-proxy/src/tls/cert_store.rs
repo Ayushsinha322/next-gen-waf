@@ -166,7 +166,8 @@ pub fn site_cert_names(sites: &[SiteConfig]) -> HashSet<String> {
 /// `_` — an IDN arrives as its `xn--` A-label. A cert for any other name could
 /// never be served, and minting one is worse than useless: rcgen asserts that
 /// SAN names are ASCII, so `bücher.example` panicked the sync, and with the
-/// release profile's `panic = "abort"`, the node. Reserved keys are internal.
+/// release profile's `panic = "abort"` of the time, the node. Reserved keys are
+/// internal.
 fn sni_matchable(name: &str) -> bool {
     let host = name.strip_prefix("*.").unwrap_or(name);
     !name.starts_with(RESERVED_PREFIX) && DnsName::try_from(host).is_ok()
@@ -188,14 +189,21 @@ pub fn start_site_cert_sync(store: &Arc<CertStore>, config: ConfigHandle) {
 /// Watches the config handle, so a site arriving by any route (control-plane
 /// sync, file reload, cached-config restore) gets its cert, and a removed site
 /// drops out of the fallback map. The minting runs on a blocking thread.
+///
+/// Supervised like the data plane's other background loops: a panic restarts
+/// the sync, whose first round then syncs every name again, instead of ending
+/// it and leaving every site configured afterwards on the default cert.
 fn spawn_site_cert_sync_every(
     store: Arc<CertStore>,
     config: ConfigHandle,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    crate::panic_guard::supervised!("site certificate sync", {
+        per_run!(store, config);
         let mut sync = SiteSync::default();
         loop {
+            #[cfg(test)]
+            inject_site_sync_panic(&config.load());
             if let Some(names) = sync.due(config.load_full()) {
                 let report = store.sync_site_fallbacks(names.clone()).await;
                 for name in sync.record(names, report.failed) {
@@ -209,6 +217,25 @@ fn spawn_site_cert_sync_every(
             tokio::time::sleep(interval).await;
         }
     })
+}
+
+/// A site name that panics the site cert sync once per process, in test builds
+/// only.
+#[cfg(test)]
+const INJECT_SITE_SYNC_PANIC_NAME: &str = "panic-guard-site-sync.example";
+
+#[cfg(test)]
+static SITE_SYNC_PANICKED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+fn inject_site_sync_panic(cfg: &SentinelConfig) {
+    let named = cfg
+        .sites
+        .iter()
+        .any(|s| s.domains.iter().any(|d| d == INJECT_SITE_SYNC_PANIC_NAME));
+    if named && !SITE_SYNC_PANICKED.swap(true, Ordering::SeqCst) {
+        panic!("injected site certificate sync panic");
+    }
 }
 
 /// When the site cert sync has to run, and which failures it has reported.
@@ -1088,8 +1115,9 @@ pub fn generate_self_signed(domain: &str) -> Result<Arc<CertifiedKey>> {
 }
 
 /// rcgen encodes SAN names as IA5String and asserts they are ASCII, so a
-/// non-ASCII name is a panic — and under the release profile's
-/// `panic = "abort"`, a dead process. Refuse it as an error instead.
+/// non-ASCII name is a panic: a dead process while release builds aborted on
+/// panic, and still a restarted sync and a site on the default cert now that
+/// they unwind. Refuse it as an error instead.
 fn ensure_ascii_name(domain: &str) -> Result<()> {
     anyhow::ensure!(
         domain.is_ascii(),
@@ -1742,6 +1770,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A panic in the sync restarts it. A bare spawn ended it for good: the
+    /// sites configured then, and every site added later, stayed on the default
+    /// certificate until the node restarted.
+    #[tokio::test]
+    async fn a_panic_in_the_site_sync_restarts_it() {
+        let dir = tmp_dir();
+        let store = CertStore::new(dir.clone());
+        let config = config_with(vec![site("p", &[INJECT_SITE_SYNC_PANIC_NAME])]);
+        let task = spawn_site_cert_sync_every(
+            Arc::clone(&store),
+            Arc::clone(&config),
+            Duration::from_millis(10),
+        );
+        // The first round panics; the restarted run mints the cert.
+        eventually("the restarted sync to mint the site's cert", || {
+            store.resolve_site_fallback(INJECT_SITE_SYNC_PANIC_NAME)
+        })
+        .await;
+        assert!(
+            SITE_SYNC_PANICKED.load(Ordering::SeqCst),
+            "the injected panic fired"
+        );
+        task.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// No SNI (bare-IP access) still completes the handshake, with the one
     /// persisted default cert — the same bytes on every node and restart.
     #[test]
@@ -1985,9 +2039,9 @@ mod tests {
     /// A site domain with a non-ASCII character (a console typo, a pasted IDN
     /// U-label, a zero-width space) is accepted by the control plane. rcgen
     /// asserts SAN names are ASCII, so the sync panicked minting it — under the
-    /// release profile's `panic = "abort"`, every node within seconds of the
-    /// config push and again at each boot. No handshake can ever carry such a
-    /// name, so it is simply not a cert name.
+    /// release profile's `panic = "abort"` of the time, every node within
+    /// seconds of the config push and again at each boot. No handshake can ever
+    /// carry such a name, so it is simply not a cert name.
     #[tokio::test]
     async fn a_non_ascii_site_name_is_skipped_not_a_crash() {
         let dir = tmp_dir();

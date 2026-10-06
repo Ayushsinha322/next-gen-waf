@@ -520,25 +520,40 @@ where
     match catch_request(fut).await {
         Ok(resp) => resp,
         Err(payload) => {
-            sentinel_telemetry::note_request_panic();
-            let support_id = uuid::Uuid::new_v4().to_string();
-            let caught = take_request_caught();
-            if let LogLine::Due { suppressed } = caught.line {
-                let thread = std::thread::current();
-                error!(
-                    request_id = %support_id,
-                    client_ip = %peer.ip(),
-                    location = %caught.location,
-                    panic = %panic_message(&*payload),
-                    suppressed,
-                    backtrace = caught.backtrace.as_ref().map(tracing::field::display),
-                    "{}; request panicked outside the WAF pipeline, answered 500",
-                    hook_line(thread.name().unwrap_or("unnamed"), &caught.location),
-                );
-            }
+            let support_id = outside_pipeline_panicked(peer, &*payload, "answered 500");
             Ok(panic_response(&support_id))
         }
     }
+}
+
+/// Count and log a request panic caught by [`catch_request`] outside the WAF
+/// pipeline, where there is no request context: [`contain_request`] on TCP, the
+/// HTTP/3 request task in `http3`. `outcome` says what the client got. Returns
+/// the fresh Support ID on the log line, for the response if one can still be
+/// sent.
+pub(crate) fn outside_pipeline_panicked(
+    peer: SocketAddr,
+    payload: &(dyn Any + Send),
+    outcome: &str,
+) -> String {
+    sentinel_telemetry::note_request_panic();
+    let support_id = uuid::Uuid::new_v4().to_string();
+    let caught = take_request_caught();
+    if let LogLine::Due { suppressed } = caught.line {
+        let thread = std::thread::current();
+        error!(
+            request_id = %support_id,
+            client_ip = %peer.ip(),
+            location = %caught.location,
+            panic = %panic_message(payload),
+            suppressed,
+            backtrace = caught.backtrace.as_ref().map(tracing::field::display),
+            "{}; request panicked outside the WAF pipeline, {}",
+            hook_line(thread.name().unwrap_or("unnamed"), &caught.location),
+            outcome,
+        );
+    }
+    support_id
 }
 
 // ---------------------------------------------------------------------------

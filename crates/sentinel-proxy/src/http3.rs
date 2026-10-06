@@ -363,6 +363,13 @@ async fn handle_quic_connection(
 /// `proxy`'s existing `:authority`→`Host` synthesis works unchanged). The body
 /// is read from the QUIC stream and buffered into a `BoxBody` so the pipeline
 /// sees the same request shape it does over TCP.
+///
+/// Everything after the request head runs under a panic guard, as `proxy` and
+/// `contain_request` guard a TCP request. The pipeline keeps its own guard,
+/// which answers 500 with the request's Support ID; these cover the rest of
+/// the request's task. A panic before the response head is answered 500 with
+/// a fresh Support ID, as on TCP; one while the response goes out resets the
+/// stream (see [`respond_h3`]).
 async fn handle_h3_request(
     resolver: h3::server::RequestResolver<H3Conn, Bytes>,
     state: Arc<ServerState>,
@@ -385,18 +392,67 @@ async fn handle_h3_request(
     let method = parts.method.clone();
     let path = crate::cap_field(parts.uri.path(), 256);
 
-    // Buffer the request body from the QUIC stream (capped as an OOM guard;
-    // per-site size limits are enforced downstream in `proxy`).
-    let body_buf = match read_h3_request_body(&mut stream, crate::body_read_timeout()).await? {
-        H3RequestBody::Complete(body) => body,
-        H3RequestBody::Refused(status) => {
+    let prepared = crate::panic_guard::catch_request(prepare_h3_response(
+        &mut stream,
+        parts,
+        state,
+        default_site,
+        peer,
+        tls_fp,
+    ))
+    .await;
+    let resp = match prepared {
+        Ok(Ok(H3Prepared::Response(resp))) => resp,
+        Ok(Ok(H3Prepared::Refused(status))) => {
             // This runs before the pipeline, so there is no access-log line;
             // this event is the record.
             info!(%peer, %method, %path, %status, "HTTP/3 request body refused");
             refuse_h3_request(&mut stream, status).await;
             return Ok(());
         }
+        Ok(Err(e)) => return Err(e),
+        Err(payload) => {
+            let support_id =
+                crate::panic_guard::outside_pipeline_panicked(peer, &*payload, "answered 500");
+            crate::panic_guard::panic_response(&support_id)
+        }
     };
+    respond_h3(&mut stream, &quic, peer, &method, &path, resp).await;
+    Ok(())
+}
+
+/// Request path that panics once the request body is read, before the
+/// pipeline, in test builds only.
+#[cfg(test)]
+pub(crate) const INJECT_PREPARE_PANIC_PATH: &str = "/__h3_panic_before_pipeline__";
+
+/// What a request came to before its response head.
+enum H3Prepared {
+    /// The pipeline's response.
+    Response(Response<BoxBody>),
+    /// The body cannot be taken: answer with this status instead.
+    Refused(StatusCode),
+}
+
+/// Read the request body off the stream, then run the WAF pipeline on it.
+async fn prepare_h3_response(
+    stream: &mut H3Stream,
+    parts: http::request::Parts,
+    state: Arc<ServerState>,
+    default_site: Option<String>,
+    peer: SocketAddr,
+    tls_fp: Option<String>,
+) -> Result<H3Prepared> {
+    // Buffer the request body from the QUIC stream (capped as an OOM guard;
+    // per-site size limits are enforced downstream in `proxy`).
+    let body_buf = match read_h3_request_body(stream, crate::body_read_timeout()).await? {
+        H3RequestBody::Complete(body) => body,
+        H3RequestBody::Refused(status) => return Ok(H3Prepared::Refused(status)),
+    };
+    #[cfg(test)]
+    if parts.uri.path() == INJECT_PREPARE_PANIC_PATH {
+        panic!("injected HTTP/3 request panic");
+    }
 
     let body: BoxBody = Full::new(Bytes::from(body_buf))
         .map_err(|never: Infallible| match never {})
@@ -407,16 +463,52 @@ async fn handle_h3_request(
     // fingerprint was extracted from this connection's TLS session at accept
     // time (see `ja4_quic`) and reaches `ctx.tls_fingerprint` exactly as the TCP
     // path's peeked fingerprint does.
-    let resp = run_pipeline(state, peer, pipeline_req, default_site, tls_fp).await;
-    if let Err(e) = send_h3_response(&mut stream, &quic, resp).await {
-        // The access-log line was written with the head and records a complete
-        // response, so this is the only trace of the truncation. Client
-        // cancels and closed connections end the relay with Ok and never get
-        // here, so this does not fire for ordinary abandoned downloads.
-        sentinel_telemetry::metrics::note_h3_response_reset();
-        warn!(%peer, %method, %path, "HTTP/3 response cut short, stream reset: {e:#}");
+    Ok(H3Prepared::Response(
+        run_pipeline(state, peer, pipeline_req, default_site, tls_fp).await,
+    ))
+}
+
+/// Send `resp` and relay its body ([`send_h3_response`]), under a panic guard
+/// of its own.
+///
+/// The relay polls the response body after `proxy`'s guard has returned. A
+/// panic there used to unwind the request's task and drop the stream, and
+/// quinn FINISHES a send stream that is dropped unfinished: the client took
+/// the truncated body for the whole response, which is what resetting the
+/// stream on an origin failure exists to prevent. A panic resets it the same
+/// way, also when it came before the head, so the client sees an error.
+async fn respond_h3<B>(
+    stream: &mut H3Stream,
+    quic: &quinn::Connection,
+    peer: SocketAddr,
+    method: &http::Method,
+    path: &str,
+    resp: Response<B>,
+) where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
+    match crate::panic_guard::catch_request(send_h3_response(stream, quic, resp)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            // The access-log line was written with the head and records a
+            // complete response, so this is the only trace of the truncation.
+            // Client cancels and closed connections end the relay with Ok and
+            // never get here, so this does not fire for ordinary abandoned
+            // downloads.
+            sentinel_telemetry::metrics::note_h3_response_reset();
+            warn!(%peer, %method, %path, "HTTP/3 response cut short, stream reset: {e:#}");
+        }
+        Err(payload) => {
+            stream.stop_stream(Code::H3_INTERNAL_ERROR);
+            sentinel_telemetry::metrics::note_h3_response_reset();
+            crate::panic_guard::outside_pipeline_panicked(
+                peer,
+                &*payload,
+                "HTTP/3 response stream reset",
+            );
+        }
     }
-    Ok(())
 }
 
 /// What reading an HTTP/3 request body produced.
@@ -1368,7 +1460,8 @@ mod tests {
         assert!(alt.header().is_none(), "the loop panicked");
     }
 
-    /// Client side of the restart test: one HTTP/3 connection and its driver.
+    /// Client side of the proxy tests below: one HTTP/3 connection and its
+    /// driver.
     struct H3Client {
         send: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
         driver: tokio::task::JoinHandle<()>,
@@ -1412,15 +1505,79 @@ mod tests {
             }
         }
 
-        async fn get(&mut self, path: &str) -> StatusCode {
+        async fn request(&mut self, path: &str) -> (StatusCode, Vec<u8>) {
             let req = http::Request::get(format!("https://panic-site.local{path}"))
                 .body(())
                 .unwrap();
             let mut stream = self.send.send_request(req).await.unwrap();
             stream.finish().await.unwrap();
             let resp = stream.recv_response().await.unwrap();
-            while stream.recv_data().await.unwrap().is_some() {}
-            resp.status()
+            let mut body = Vec::new();
+            while let Some(chunk) = stream.recv_data().await.unwrap() {
+                append_buf(&mut body, chunk);
+            }
+            (resp.status(), body)
+        }
+
+        async fn get(&mut self, path: &str) -> StatusCode {
+            self.request(path).await.0
+        }
+    }
+
+    /// A running proxy serving `panic-site.local` over HTTP/1.1 and HTTP/3,
+    /// and a client endpoint for it.
+    struct H3Proxy {
+        proxy: crate::panic_guard::testkit::RunningProxy,
+        listen: SocketAddr,
+        /// Requests that reached the origin.
+        hits: Arc<AtomicUsize>,
+        cert_dir: std::path::PathBuf,
+        client: quinn::Endpoint,
+    }
+
+    impl H3Proxy {
+        /// Callers hold `proxy_state_lock`, as for every test that runs a proxy.
+        async fn start() -> Self {
+            use crate::panic_guard::testkit::*;
+            use sentinel_core::config::{Protocol, ProtocolSpec, TlsFileConfig};
+
+            let (origin, hits) = counting_origin().await;
+            let listen = free_port();
+            let cert_dir =
+                std::env::temp_dir().join(format!("sk-h3-panic-{}", uuid::Uuid::new_v4()));
+            let mut cfg = site_config(listen, origin, "panic-site", vec![]);
+            cfg.cert_dir = Some(cert_dir.clone());
+            cfg.listeners[0].tls = Some(TlsFileConfig {
+                ca: None,
+                cert: None,
+                key: None,
+                min_version: Default::default(),
+                post_quantum: Default::default(),
+            });
+            cfg.listeners[0].protocol =
+                ProtocolSpec::Multiple(vec![Protocol::Http1, Protocol::Http3]);
+            let proxy = start_proxy(listen, config_handle(cfg)).await;
+
+            let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            let mut client_cfg = test_client_config();
+            let mut transport = quinn::TransportConfig::default();
+            transport.max_idle_timeout(Some(Duration::from_secs(5).try_into().unwrap()));
+            transport.keep_alive_interval(Some(Duration::from_secs(1)));
+            client_cfg.transport_config(Arc::new(transport));
+            client.set_default_client_config(client_cfg);
+            Self {
+                proxy,
+                listen,
+                hits,
+                cert_dir,
+                client,
+            }
+        }
+
+        async fn stop(self) {
+            self.client.close(0u32.into(), b"done");
+            self.proxy.stop().await;
+            let _ = std::fs::remove_dir_all(&self.cert_dir);
         }
     }
 
@@ -1432,61 +1589,136 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // serialises whole server runs; see proxy_state_lock
     async fn a_panic_in_the_accept_loop_does_not_take_http3_down() {
-        use crate::panic_guard::testkit::*;
-        use sentinel_core::config::{Protocol, ProtocolSpec, TlsFileConfig};
-        use std::time::Duration;
-
-        let _serial = proxy_state_lock();
-        let (origin, hits) = counting_origin().await;
-        let listen = free_port();
-        let cert_dir = std::env::temp_dir().join(format!("sk-h3-panic-{}", uuid::Uuid::new_v4()));
-        let mut cfg = site_config(listen, origin, "panic-site", vec![]);
-        cfg.cert_dir = Some(cert_dir.clone());
-        cfg.listeners[0].tls = Some(TlsFileConfig {
-            ca: None,
-            cert: None,
-            key: None,
-            min_version: Default::default(),
-            post_quantum: Default::default(),
-        });
-        cfg.listeners[0].protocol = ProtocolSpec::Multiple(vec![Protocol::Http1, Protocol::Http3]);
-        let proxy = start_proxy(listen, config_handle(cfg)).await;
-
-        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-        let mut client_cfg = test_client_config();
-        let mut transport = quinn::TransportConfig::default();
-        transport.max_idle_timeout(Some(Duration::from_secs(5).try_into().unwrap()));
-        transport.keep_alive_interval(Some(Duration::from_secs(1)));
-        client_cfg.transport_config(Arc::new(transport));
-        client.set_default_client_config(client_cfg);
+        let _serial = crate::panic_guard::testkit::proxy_state_lock();
+        let h3 = H3Proxy::start().await;
+        let (client, listen) = (&h3.client, h3.listen);
 
         // An established connection, kept open: it is what kept the old
         // endpoint's socket bound.
-        let mut first = H3Client::connect_within(&client, listen, Duration::from_secs(20)).await;
+        let mut first = H3Client::connect_within(client, listen, Duration::from_secs(20)).await;
         assert_eq!(first.get("/one").await, StatusCode::OK);
 
         // The next handshake panics the accept loop.
         INJECT_ACCEPT_PANIC.store(true, Ordering::SeqCst);
         let _ =
-            tokio::time::timeout(Duration::from_secs(3), H3Client::connect(&client, listen)).await;
+            tokio::time::timeout(Duration::from_secs(3), H3Client::connect(client, listen)).await;
         assert!(
             !INJECT_ACCEPT_PANIC.load(Ordering::SeqCst),
             "the injected panic fired"
         );
 
         // After the restart, a new connection is accepted and served...
-        let mut fresh = H3Client::connect_within(&client, listen, Duration::from_secs(20)).await;
+        let mut fresh = H3Client::connect_within(client, listen, Duration::from_secs(20)).await;
         assert_eq!(fresh.get("/after-the-panic").await, StatusCode::OK);
         // ...and the first connection was never affected.
         assert_eq!(first.get("/one-again").await, StatusCode::OK);
-        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        assert_eq!(h3.hits.load(Ordering::SeqCst), 3);
 
         first.driver.abort();
         fresh.driver.abort();
         drop((first, fresh));
-        client.close(0u32.into(), b"done");
-        proxy.stop().await;
-        let _ = std::fs::remove_dir_all(&cert_dir);
+        h3.stop().await;
+    }
+
+    /// An HTTP/3 request that panics is contained like a TCP one: answered 500
+    /// with a Support ID, never forwarded, and the connection keeps serving.
+    /// A panic in the pipeline is `proxy`'s guard, reached through
+    /// `run_pipeline`. One in the h3 request task outside the pipeline (here,
+    /// once the body is read) had no guard: it unwound the task and the client
+    /// got a stream that ended with no response at all.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises whole server runs; see proxy_state_lock
+    async fn a_panicking_h3_request_gets_a_500_and_the_connection_keeps_serving() {
+        let _serial = crate::panic_guard::testkit::proxy_state_lock();
+        let h3 = H3Proxy::start().await;
+        let mut conn =
+            H3Client::connect_within(&h3.client, h3.listen, Duration::from_secs(20)).await;
+
+        for path in [
+            INJECT_PREPARE_PANIC_PATH,
+            crate::panic_guard::INJECT_PANIC_PATH,
+        ] {
+            let (status, body) = conn.request(path).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{path}");
+            let json: serde_json::Value = serde_json::from_slice(&body)
+                .unwrap_or_else(|e| panic!("{path}: {e}: {}", String::from_utf8_lossy(&body)));
+            let id = json["support_id"].as_str().unwrap_or_default();
+            assert!(uuid::Uuid::parse_str(id).is_ok(), "{path}: {json}");
+        }
+        assert_eq!(conn.get("/after-the-panics").await, StatusCode::OK);
+        assert_eq!(
+            h3.hits.load(Ordering::SeqCst),
+            1,
+            "a panicking request reached the origin"
+        );
+
+        conn.driver.abort();
+        drop(conn);
+        h3.stop().await;
+    }
+
+    /// A response body that yields one chunk, then panics once `go` fires: a
+    /// bug reached while the relay polls a body, after the pipeline's guard has
+    /// returned. Waiting for `go` lets the client take the head and the first
+    /// chunk before the panic.
+    struct PanicAfterFirstChunk {
+        sent: bool,
+        go: oneshot::Receiver<()>,
+    }
+
+    impl Body for PanicAfterFirstChunk {
+        type Data = Bytes;
+        type Error = String;
+        fn poll_frame(mut self: Pin<&mut Self>, cx: &mut TaskCx<'_>) -> Poll<Option<OriginFrame>> {
+            if !std::mem::replace(&mut self.sent, true) {
+                return Poll::Ready(Some(data(b"partial ")));
+            }
+            match std::future::Future::poll(Pin::new(&mut self.go), cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(_) => panic!("injected response-body panic"),
+            }
+        }
+    }
+
+    /// A panic while the body is relayed resets the stream. It used to unwind
+    /// the request's task; quinn finished the dropped stream, and the client
+    /// read the truncated body as the complete response.
+    #[tokio::test]
+    async fn h3_panic_while_relaying_resets_the_stream() {
+        let before = sentinel_telemetry::request_panics_total();
+        let peer: SocketAddr = "198.51.100.7:4433".parse().unwrap();
+        let (go_tx, go) = oneshot::channel();
+        let (addr, relay_done) = serve_one_with(move |mut stream, quic| async move {
+            let resp = Response::new(PanicAfterFirstChunk { sent: false, go });
+            respond_h3(&mut stream, &quic, peer, &http::Method::GET, "/", resp).await;
+            Ok(())
+        });
+
+        let mut client = get(addr, test_client_config()).await;
+        let resp = client.stream.recv_response().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let first = timeout(Duration::from_secs(5), client.stream.recv_data())
+            .await
+            .expect("the first chunk never arrived")
+            .unwrap()
+            .expect("the body ended before its first chunk");
+        let mut body = Vec::new();
+        append_buf(&mut body, first);
+        go_tx.send(()).unwrap();
+
+        let end = timeout(
+            Duration::from_secs(5),
+            read_to_end(&mut client.stream, &mut body),
+        )
+        .await
+        .expect("the stream neither ended nor was reset");
+        assert!(
+            end.is_err(),
+            "a truncated body ended as a complete one: {:?}",
+            String::from_utf8_lossy(&body)
+        );
+        relay_done.await.unwrap().unwrap();
+        assert!(sentinel_telemetry::request_panics_total() > before);
     }
 
     /// The resolver-backed config path (Phase 1) produces a usable QUIC server

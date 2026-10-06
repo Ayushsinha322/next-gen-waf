@@ -312,6 +312,14 @@ impl FeedLoader {
         }
     }
 
+    /// Make the next pass rebuild the node's table, whatever table it builds.
+    /// For a loader loop restarted after a panic: the run before may have built
+    /// a table and died before the node's tables were rebuilt from it, so the
+    /// last table handed out says nothing about what the node holds.
+    pub(crate) fn rebuild_next_pass(&mut self) {
+        self.last_table_empty = false;
+    }
+
     /// Fetch every configured feed and build the node-wide suspect table.
     ///
     /// A feed that fails costs only itself; the others still load.
@@ -1483,6 +1491,23 @@ mod tests {
         let removed = bounded(loader.load(&[])).await;
         assert!(removed.rebuild, "the removed feed's entries stay enforced");
         assert!(removed.table.is_empty());
+        assert!(!bounded(loader.load(&[])).await.rebuild);
+    }
+
+    // A loader loop restarted after a panic cannot tell whether the run before
+    // it stored the last table it built, so its first pass rebuilds even when
+    // that table and this one are both empty; later passes are back to normal.
+    #[tokio::test]
+    async fn a_resumed_loader_rebuilds_on_its_next_pass() {
+        let mut loader = FeedLoader::new(FeedLimits::default());
+        assert!(!bounded(loader.load(&[])).await.rebuild);
+        loader.rebuild_next_pass();
+        let resumed = bounded(loader.load(&[])).await;
+        assert!(
+            resumed.rebuild,
+            "a table the dead run built may still be enforced"
+        );
+        assert!(resumed.table.is_empty());
         assert!(!bounded(loader.load(&[])).await.rebuild);
     }
 

@@ -1402,10 +1402,14 @@ impl ProxyServer {
 
         // Valkey connects in the background, retrying until it answers, and is
         // bound into the limiter then; until that moment rate checks use the
-        // in-memory limiter. /healthz storage.valkey shows which.
+        // in-memory limiter. /healthz storage.valkey shows which. Supervised
+        // like the other background loops: a panic while connecting starts the
+        // connect again instead of leaving rate limits node-local for the life
+        // of the process.
         if let Some(url) = storage_backend_cfg.redis_url.clone() {
             let modules_ref = Arc::clone(&modules);
-            tokio::spawn(async move {
+            panic_guard::supervised!("Valkey connect", {
+                per_run!(url, modules_ref);
                 let client = sentinel_storage::RedisClient::connect_with_retry(
                     &url,
                     sentinel_storage::Backoff::new(Duration::from_secs(1), Duration::from_secs(30)),
@@ -2372,13 +2376,28 @@ impl ProxyServer {
         {
             let config_watch = Arc::clone(&self.config);
             let modules_ref = Arc::clone(&modules);
+            // Bounds, fair sharing, last-good reuse and the /healthz report:
+            // see ip_feed. The loader holds what must outlive one pass, so it
+            // lives outside the supervised loop, like the history writer's
+            // carry. A run restarted after a panic built a fresh one, which
+            // dropped every failing feed's last good entries and took the
+            // node's table for empty, so removing the last feed afterwards left
+            // its entries enforced.
+            let loader = Arc::new(tokio::sync::Mutex::new(ip_feed::FeedLoader::new(
+                ip_feed::FeedLimits::from_env(),
+            )));
+            let resumed = Arc::new(std::sync::atomic::AtomicBool::new(false));
             panic_guard::supervised!("IP feed loader", {
-                per_run!(config_watch, modules_ref);
+                per_run!(config_watch, modules_ref, loader, resumed);
+                // Held for the run; a panic releases it as the run unwinds.
+                let mut loader = loader.lock().await;
+                if resumed.swap(true, Ordering::AcqRel) {
+                    // The run before may have died between building a table
+                    // and storing it.
+                    loader.rebuild_next_pass();
+                }
                 let mut interval = tokio::time::interval(Duration::from_secs(300));
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                // Bounds, fair sharing, last-good reuse and the /healthz report:
-                // see ip_feed.
-                let mut loader = ip_feed::FeedLoader::new(ip_feed::FeedLimits::from_env());
                 loop {
                     interval.tick().await;
                     let cfg = config_watch.load_full();
@@ -5772,26 +5791,32 @@ static TI_LAST_STATUS: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU
 /// poll timed out or installed nothing.
 static TI_SYNC_FAILURE: std::sync::Mutex<Option<(String, u64)>> = std::sync::Mutex::new(None);
 
+/// The threat-intel failure record, recovered if a panic poisoned its lock, as
+/// for the config-sync status: skipping a poisoned lock froze the record, and
+/// the poller went on reading "running" (or "failing") whatever its polls did.
+fn ti_sync_failure_lock() -> std::sync::MutexGuard<'static, Option<(String, u64)>> {
+    TI_SYNC_FAILURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn ti_sync_failure() -> Option<(String, u64)> {
-    TI_SYNC_FAILURE.lock().ok().and_then(|g| g.clone())
+    ti_sync_failure_lock().clone()
 }
 
 fn clear_ti_sync_failure() {
-    if let Ok(mut g) = TI_SYNC_FAILURE.lock() {
-        *g = None;
-    }
+    *ti_sync_failure_lock() = None;
 }
 
 fn note_ti_sync_failure(error: String) {
-    if let Ok(mut g) = TI_SYNC_FAILURE.lock() {
-        let since = g.as_ref().map(|(_, s)| *s).unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0)
-        });
-        *g = Some((error, since));
-    }
+    let mut g = ti_sync_failure_lock();
+    let since = g.as_ref().map(|(_, s)| *s).unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    });
+    *g = Some((error, since));
 }
 
 /// One threat-intel fetch: the status and body, or None once the reason no
@@ -14734,16 +14759,21 @@ mod cp_poll_deadline_tests {
     /// instead of a test that never finishes.
     const HUNG: Duration = Duration::from_secs(5);
 
-    /// The sync statuses are process-wide, so these tests take turns.
-    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    /// The sync statuses are process-wide, and so is what writes them: these
+    /// tests take turns with each other and with the tests that run a proxy,
+    /// whose config and threat-intel syncs record into the same statuses.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        crate::panic_guard::testkit::proxy_state_lock()
+    }
 
     /// Two ticks of the config-sync loop against a control plane that accepts
     /// the connection and never answers, then one after it recovers. Each tick
     /// must return at the deadline with the failure recorded for the heartbeat,
     /// or the loop is parked and the node silently stops taking config.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see serial()
     async fn config_sync_against_a_silent_control_plane_records_it_and_moves_on() {
-        let _serial = SERIAL.lock().await;
+        let _serial = serial();
         note_config_sync_ok();
         let body = r#"{"version":7,"sites":[]}"#;
         let addr = stub::answering_after(2, 200, body).await;
@@ -14796,8 +14826,9 @@ mod cp_poll_deadline_tests {
     /// The same for threat intel, whose `/healthz` state only ever recorded a
     /// status that arrived: a poller timing out kept saying "running".
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see serial()
     async fn threat_intel_sync_against_a_silent_control_plane_reports_failing() {
-        let _serial = SERIAL.lock().await;
+        let _serial = serial();
         let body = r#"{"version":3}"#;
         let addr = stub::answering_after(1, 200, body).await;
         let url = format!("http://{addr}");
@@ -14844,8 +14875,9 @@ mod cp_poll_deadline_tests {
     /// so a 403 went on to the parser and was recorded as the JSON error its
     /// error body produced ("parse: expected value at line 1 column 1").
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see serial()
     async fn a_refused_config_sync_is_recorded_as_a_refusal() {
-        let _serial = SERIAL.lock().await;
+        let _serial = serial();
         note_config_sync_ok();
         let addr = stub::answering_after(0, 403, r#"{"error":"forbidden"}"#).await;
         let url = format!("http://{addr}");
@@ -14867,15 +14899,14 @@ mod cp_poll_deadline_tests {
     /// poller read "running" while every poll did nothing. `failing_since` must
     /// also survive it, not restart with each bad poll.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see serial()
     async fn a_threat_intel_body_that_does_not_parse_keeps_the_poller_failing() {
-        let _serial = SERIAL.lock().await;
+        let _serial = serial();
         let garbage = stub::answering_after(0, 200, "<html>gateway</html>").await;
         let refusing = stub::answering_after(0, 403, r#"{"error":"forbidden"}"#).await;
         let client = cp_client::client::<Empty>();
         // A poll that timed out long ago, still unresolved.
-        if let Ok(mut g) = TI_SYNC_FAILURE.lock() {
-            *g = Some(("timeout: earlier".into(), 1_000));
-        }
+        *ti_sync_failure_lock() = Some(("timeout: earlier".into(), 1_000));
 
         for tick in 0..2 {
             let (status, bytes) = tokio::time::timeout(
@@ -14918,6 +14949,35 @@ mod cp_poll_deadline_tests {
         assert_eq!(ti_poller_state(true, true, 0, false), "starting");
         assert_eq!(ti_poller_state(true, false, 0, true), "not_started");
         assert_eq!(ti_poller_state(false, false, 0, true), "not_configured");
+    }
+
+    /// A poisoned failure record used to be skipped: polls that timed out were
+    /// no longer recorded, a recovery no longer cleared an old failure, and the
+    /// poller's label stayed whatever it was when the lock was poisoned.
+    #[test]
+    fn the_threat_intel_failure_record_survives_a_poisoned_lock() {
+        let _serial = serial();
+        clear_ti_sync_failure();
+        let _ = std::thread::spawn(|| {
+            let _held = TI_SYNC_FAILURE.lock().unwrap();
+            panic!("poisoning the threat-intel failure record on purpose");
+        })
+        .join();
+        assert!(
+            TI_SYNC_FAILURE.is_poisoned(),
+            "fixture must poison the lock"
+        );
+
+        note_ti_sync_failure("timeout: after the poison".to_string());
+        let recorded = ti_sync_failure();
+        clear_ti_sync_failure();
+        let cleared = ti_sync_failure();
+        TI_SYNC_FAILURE.clear_poison();
+        assert_eq!(
+            recorded.map(|(e, _)| e).as_deref(),
+            Some("timeout: after the poison")
+        );
+        assert!(cleared.is_none(), "a recovery must clear the failure");
     }
 }
 
