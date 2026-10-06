@@ -21,6 +21,7 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use bytes::{Buf, Bytes};
@@ -251,30 +252,23 @@ async fn handle_h3_request(
     // WAF pipeline, NDJSON logs, and ClickHouse all record this request as h3.
     parts.version = http::Version::HTTP_3;
     debug!(method = %parts.method, uri = %parts.uri, "HTTP/3 request");
-    // For the warning if the response is cut short. Path only: the query can
-    // carry credentials, and the access log already holds its redacted form.
+    // For the log lines below. Path only: the query can carry credentials, and
+    // the access log already holds its redacted form.
     let method = parts.method.clone();
     let path = crate::cap_field(parts.uri.path(), 256);
 
     // Buffer the request body from the QUIC stream (capped as an OOM guard;
     // per-site size limits are enforced downstream in `proxy`).
-    let mut body_buf: Vec<u8> = Vec::new();
-    while let Some(chunk) = stream
-        .recv_data()
-        .await
-        .context("reading HTTP/3 request body")?
-    {
-        if body_buf.len().saturating_add(chunk.remaining()) > MAX_H3_BODY_BYTES {
-            let resp = Response::builder()
-                .status(StatusCode::PAYLOAD_TOO_LARGE)
-                .body(())
-                .expect("static response always builds");
-            stream.send_response(resp).await.ok();
-            stream.finish().await.ok();
+    let body_buf = match read_h3_request_body(&mut stream, crate::body_read_timeout()).await? {
+        H3RequestBody::Complete(body) => body,
+        H3RequestBody::Refused(status) => {
+            // This runs before the pipeline, so there is no access-log line;
+            // this event is the record.
+            info!(%peer, %method, %path, %status, "HTTP/3 request body refused");
+            refuse_h3_request(&mut stream, status).await;
             return Ok(());
         }
-        append_buf(&mut body_buf, chunk);
-    }
+    };
 
     let body: BoxBody = Full::new(Bytes::from(body_buf))
         .map_err(|never: Infallible| match never {})
@@ -295,6 +289,56 @@ async fn handle_h3_request(
         warn!(%peer, %method, %path, "HTTP/3 response cut short, stream reset: {e:#}");
     }
     Ok(())
+}
+
+/// What reading an HTTP/3 request body produced.
+enum H3RequestBody {
+    Complete(Vec<u8>),
+    /// The body cannot be taken: answer with this status instead.
+    Refused(StatusCode),
+}
+
+/// Read a request body off the QUIC stream: at most [`MAX_H3_BODY_BYTES`]
+/// (else 413), and the whole of it within `deadline` (else 408).
+///
+/// The deadline is the TCP path's slow-body deadline (`body_read_timeout`).
+/// There used to be none: a client could send part of a body and stop, and the
+/// stream held its buffer (up to 64 MiB) for as long as the connection lived,
+/// outside the request permit, which is taken only in `run_pipeline`. One QUIC
+/// connection carries up to 100 such streams.
+async fn read_h3_request_body(stream: &mut H3Stream, deadline: Duration) -> Result<H3RequestBody> {
+    let read = async {
+        let mut body = Vec::new();
+        while let Some(chunk) = stream
+            .recv_data()
+            .await
+            .context("reading HTTP/3 request body")?
+        {
+            if body.len().saturating_add(chunk.remaining()) > MAX_H3_BODY_BYTES {
+                return Ok(H3RequestBody::Refused(StatusCode::PAYLOAD_TOO_LARGE));
+            }
+            append_buf(&mut body, chunk);
+        }
+        Ok(H3RequestBody::Complete(body))
+    };
+    tokio::time::timeout(deadline, read)
+        .await
+        .unwrap_or(Ok(H3RequestBody::Refused(StatusCode::REQUEST_TIMEOUT)))
+}
+
+/// Answer a request without reading the rest of its body.
+///
+/// No explicit STOP_SENDING: after a timed-out read, h3-quinn 0.0.10 still
+/// holds the quinn receive stream inside the cancelled read, and its
+/// `stop_sending` unwraps it and panics. Dropping the request stream when the
+/// task ends sends STOP_SENDING anyway.
+async fn refuse_h3_request(stream: &mut H3Stream, status: StatusCode) {
+    let resp = Response::builder()
+        .status(status)
+        .body(())
+        .expect("static response always builds");
+    stream.send_response(resp).await.ok();
+    stream.finish().await.ok();
 }
 
 /// Relay a pipeline response over an HTTP/3 request stream: the head, then the
@@ -1014,6 +1058,84 @@ mod tests {
             relay.is_ok(),
             "a client that left before the head is not a relay error: {relay:?}"
         );
+    }
+
+    /// POST `body` and leave the request open when `finish` is false.
+    async fn post(addr: SocketAddr, body: &'static [u8], finish: bool) -> Client {
+        let req = http::Request::builder()
+            .method("POST")
+            .uri("https://localhost/upload")
+            .body(())
+            .unwrap();
+        let mut client = open(addr, test_client_config(), req).await;
+        client
+            .stream
+            .send_data(Bytes::from_static(body))
+            .await
+            .unwrap();
+        if finish {
+            client.stream.finish().await.unwrap();
+        }
+        client
+    }
+
+    /// Serve one request the way `handle_h3_request` takes its body, with a
+    /// short read deadline. The receiver yields the body when it was read.
+    fn serve_body_read(
+        deadline: Duration,
+    ) -> (
+        SocketAddr,
+        oneshot::Receiver<Vec<u8>>,
+        oneshot::Receiver<Result<()>>,
+    ) {
+        let (body_tx, body_rx) = oneshot::channel();
+        let (addr, done) = serve_one_with(move |mut stream, quic| async move {
+            match read_h3_request_body(&mut stream, deadline).await? {
+                H3RequestBody::Complete(body) => {
+                    let _ = body_tx.send(body);
+                    let resp = Response::new(Full::new(Bytes::from_static(b"stored")));
+                    send_h3_response(&mut stream, &quic, resp).await
+                }
+                H3RequestBody::Refused(status) => {
+                    refuse_h3_request(&mut stream, status).await;
+                    Ok(())
+                }
+            }
+        });
+        (addr, body_rx, done)
+    }
+
+    /// A request body that stalls is answered 408 once the read deadline
+    /// passes. There was no deadline: this client would have held its stream
+    /// and buffer for as long as the connection lived.
+    #[tokio::test]
+    async fn h3_request_body_that_stalls_is_answered_408() {
+        let (addr, _body, done) = serve_body_read(Duration::from_millis(200));
+        let mut client = post(addr, b"part of a body", false).await;
+        let resp = timeout(Duration::from_secs(5), client.stream.recv_response())
+            .await
+            .expect("a stalled request body was never answered")
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
+        timeout(Duration::from_secs(5), done)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    /// A body that arrives within the deadline is read whole.
+    #[tokio::test]
+    async fn h3_request_body_within_the_deadline_is_read_whole() {
+        let (addr, body, done) = serve_body_read(Duration::from_secs(5));
+        let mut client = post(addr, b"the whole body", true).await;
+        let resp = client.stream.recv_response().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body.await.unwrap(), b"the whole body");
+        let mut out = Vec::new();
+        read_to_end(&mut client.stream, &mut out).await.unwrap();
+        assert_eq!(out, b"stored");
+        done.await.unwrap().unwrap();
     }
 
     /// An origin that fails mid-body reaches the client as a stream error, never
