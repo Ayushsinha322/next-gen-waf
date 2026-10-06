@@ -982,8 +982,10 @@ impl<T> Drop for Carried<T> {
 // Reporting
 // ---------------------------------------------------------------------------
 
-/// What `/healthz` reports under `panics`. Node-local, so it carries each
-/// loop's last location and message: the first things to chase.
+/// What `/healthz` reports under `panics`. It carries each loop's last location
+/// and message, the first things to chase, with the location in
+/// [`reported_location`]'s form: the console's status call passes `/healthz`
+/// through to the browser.
 pub(crate) fn status() -> serde_json::Value {
     let tasks: serde_json::Map<String, serde_json::Value> = lock(&TASKS)
         .iter()
@@ -993,7 +995,7 @@ pub(crate) fn status() -> serde_json::Value {
                 serde_json::json!({
                     "restarts": t.restarts,
                     "last_at": t.last_at,
-                    "last_location": t.last_location,
+                    "last_location": reported_location(&t.last_location),
                     "last_panic": t.last_panic,
                 }),
             )
@@ -1008,10 +1010,26 @@ pub(crate) fn status() -> serde_json::Value {
     })
 }
 
+/// A panic location as `/healthz` reports it. Workspace paths
+/// ("crates/sentinel-proxy/src/lib.rs:1234:5") carry the source codename, and
+/// `/healthz` reaches the console's API unchanged, so they are reported from
+/// the crate's own directory without the codename ("proxy/src/lib.rs:1234:5").
+/// A dependency's path starts at its crate directory, without the build host's
+/// cargo home. The node's log keeps the full path.
+fn reported_location(location: &str) -> String {
+    if let Some(rest) = location.strip_prefix("crates/") {
+        return rest.strip_prefix("sentinel-").unwrap_or(rest).to_string();
+    }
+    if let Some((_, rest)) = location.split_once("/registry/src/") {
+        // "<index dir>/tokio-1.47.1/src/…" → "tokio-1.47.1/src/…"
+        return rest.split_once('/').map_or(rest, |(_, r)| r).to_string();
+    }
+    location.to_string()
+}
+
 /// What the heartbeat reports under `panics`: the counts and which loops
-/// restarted, without locations or messages. Those are source paths that carry
-/// the crate codename, and the heartbeat feeds the console; they are on
-/// `/healthz` and in the node's log.
+/// restarted, without locations or messages. The console shows neither; they
+/// are on `/healthz` and in the node's log.
 pub(crate) fn heartbeat_status() -> serde_json::Value {
     let tasks: serde_json::Map<String, serde_json::Value> = lock(&TASKS)
         .iter()
@@ -2235,6 +2253,34 @@ rule 9990102 {
                 .is_none(),
             "no source paths in what reaches the console"
         );
+    }
+
+    /// `/healthz` reported a loop's location as the workspace path,
+    /// "crates/sentinel-proxy/src/lib.rs:…", and the console's status call
+    /// returns `/healthz` to the browser as it is: the source codename reached
+    /// the console. Locations are reported from the crate directory now.
+    #[test]
+    fn healthz_locations_carry_no_codename() {
+        for (name, raw, reported) in [
+            (
+                "healthz location test: workspace",
+                "crates/sentinel-proxy/src/lib.rs:1234:5",
+                "proxy/src/lib.rs:1234:5",
+            ),
+            (
+                "healthz location test: dependency",
+                "/home/builder/.cargo/registry/src/index.crates.io-6f17d22bba15001f/\
+                 tokio-1.47.1/src/runtime/task/mod.rs:10:1",
+                "tokio-1.47.1/src/runtime/task/mod.rs:10:1",
+            ),
+            ("healthz location test: unknown", "unknown", "unknown"),
+        ] {
+            note_task_panic(name, raw, "boom");
+            let health = status();
+            let task = &health["tasks"][name];
+            assert_eq!(task["last_location"], reported, "{name}");
+            assert!(!task.to_string().contains("sentinel"), "{name}: {task}");
+        }
     }
 
     /// The macro form: each run gets fresh clones of what it moves in, and state
