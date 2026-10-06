@@ -653,8 +653,10 @@ pub struct WafConfig {
     #[serde(default = "default_max_header_count")]
     pub max_header_count: u32,
     /// Most arguments the rule engine inspects in one request — query-string,
-    /// body and multipart parameters together, a file part counting as one
-    /// (0 = unlimited, default [`DEFAULT_MAX_INSPECTED_ARGS`]).
+    /// body and multipart parameters together, every multipart part (a file
+    /// or a part with no name too) counting as one, and a body no parser takes
+    /// apart (text/plain, octet-stream, multipart/related, no Content-Type)
+    /// counting as one (0 = unlimited, default [`DEFAULT_MAX_INSPECTED_ARGS`]).
     ///
     /// This and the two settings below bound what inspecting one request can
     /// cost: the engine reads every argument in hundreds of rules, so the work
@@ -671,6 +673,13 @@ pub struct WafConfig {
     /// Most bytes of argument names and values inspected in one request, as
     /// the parsers decode them; a name several values share counts once (0 =
     /// unlimited, default [`DEFAULT_MAX_INSPECTED_ARG_BYTES`]).
+    ///
+    /// A multipart part's header lines count too, as the rules read them. A
+    /// body no parser takes apart is read whole, so it counts whole, as text.
+    /// A parsed body that rules read whole (REQUEST_BODY) as well as by its
+    /// arguments may be at most four times this: room for the encoding and
+    /// markup around its arguments, and no more for what is not an argument —
+    /// an XML comment, or one JSON key repeated in every object of an array.
     #[serde(default = "default_max_inspected_arg_bytes")]
     pub max_inspected_arg_bytes: u64,
     /// Longest the rule engine may spend on one phase of a request, in
@@ -921,7 +930,11 @@ fn default_max_header_count() -> u32 {
 //   at the byte limit in 8 fields             0.27 s    2.5-2.6 s
 //
 // with no limit, 4 MiB of mixed text took 20-40 s, so a default-sized (10 MiB)
-// body costs a minute or more. The limits keep the ordinary form well inside
+// body costs a minute or more. A body the rules read whole costs less per
+// byte (about 25 rules read REQUEST_BODY): 0.2-0.3 s at the byte limit with no
+// parser (text/plain, octet-stream), and at most 0.8 s at four times it for a
+// parsed body that is mostly not arguments; at 10 MiB both were read in full,
+// 4-10 s, and are now refused in 3-100 ms. The limits keep the ordinary form well inside
 // them (4x the fields, 2x the bytes). A request AT them costs far more than
 // the ~50 ms first aimed for, and that is the engine's cost, not the limits':
 // limits low enough for 50 ms (~200 fields, tens of KiB of text) would refuse
