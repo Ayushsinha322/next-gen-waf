@@ -6,6 +6,10 @@
 //! and its reason, and the `sentinel_inspection_limit_exceeded_total` count);
 //! the site's mode then governs it like any other verdict.
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 use sentinel_core::config::SiteConfig;
 use sentinel_core::context::{InspectionLimit, Phase, RequestContext, WafDecision};
 use tracing::warn;
@@ -19,19 +23,75 @@ fn refusal_in(ctx: &RequestContext, phase: &Phase) -> Option<InspectionLimit> {
         .find_map(|m| InspectionLimit::of_rule(&m.rule_id))
 }
 
+/// Whether the engine refused to finish inspecting this request, in any
+/// phase so far.
+pub(crate) fn refused(ctx: &RequestContext) -> bool {
+    ctx.rule_matches
+        .iter()
+        .any(|m| InspectionLimit::of_rule(&m.rule_id).is_some())
+}
+
+/// At most one learning-mode WARN per site and limit in this long.
+const WARN_EVERY: Duration = Duration::from_secs(10);
+
+/// When each site and limit last logged its WARN, and how many it has held
+/// back since.
+type WarnLog = HashMap<(String, &'static str), (Instant, u64)>;
+
+static WARNED: Mutex<Option<WarnLog>> = Mutex::new(None);
+
+/// Whether a WARN for `site` and `limit` is due at `now`: `Some(held back
+/// since the last one)`, or `None` within `WARN_EVERY` of it.
+fn warning_due(log: &mut WarnLog, site: &str, limit: InspectionLimit, now: Instant) -> Option<u64> {
+    match log.get_mut(&(site.to_owned(), limit.reason())) {
+        Some((last, held)) if now.saturating_duration_since(*last) < WARN_EVERY => {
+            *held += 1;
+            None
+        }
+        Some((last, held)) => {
+            *last = now;
+            Some(std::mem::take(held))
+        }
+        None => {
+            log.insert((site.to_owned(), limit.reason()), (now, 0));
+            Some(0)
+        }
+    }
+}
+
 /// Called once the site's mode has been applied to `phase`'s verdict. A
 /// refused request that learning mode lets through reaches the origin partly
 /// uninspected, which is a coverage gap and must not be silent — the same rule
 /// the oversize-body path follows for a body it forwards unread.
+///
+/// Throttled, unlike that path: a client can send refused requests at any
+/// rate, and one WARN each let it write the log at that rate. The event and
+/// `sentinel_inspection_limit_exceeded_total{reason}` still record every one;
+/// the log says it is happening, once per site and limit every `WARN_EVERY`,
+/// with how many it held back.
 pub(crate) fn warn_if_forwarded(ctx: &RequestContext, site: &SiteConfig, phase: &Phase) {
     if ctx.decision == WafDecision::Block || !ctx.would_block {
         return;
     }
-    if let Some(limit) = refusal_in(ctx, phase) {
+    let Some(limit) = refusal_in(ctx, phase) else {
+        return;
+    };
+    let due = {
+        let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+        warning_due(
+            warned.get_or_insert_with(HashMap::new),
+            &site.id,
+            limit,
+            Instant::now(),
+        )
+    };
+    if let Some(held_back) = due {
         warn!(
             site = %site.id,
             limit = limit.setting(),
             reason = ctx.block_reason.as_deref().unwrap_or(""),
+            // Like requests not logged since this site's last such warning.
+            held_back,
             "request not fully inspected (inspection limit) — NOT rejected (learning mode); \
              recorded as would-block"
         );
@@ -49,12 +109,28 @@ pub(crate) fn remediation(limit: InspectionLimit, ctx: &RequestContext, site: &s
         InspectionLimit::ArgBytes => format!("{} bytes", l.max_arg_bytes),
         InspectionLimit::Time => format!("{} ms", l.time_budget_ms),
     };
+    // The legitimate traffic that meets each limit, so the operator can tell
+    // it from a request built to be expensive.
+    let legitimate = match limit {
+        InspectionLimit::Args => {
+            "Legitimate requests that reach it are forms or JSON documents with thousands of \
+             fields or array items. "
+        }
+        InspectionLimit::ArgBytes => {
+            "Legitimate requests that reach it are usually uploads read as text: a file sent \
+             as base64 inside JSON or XML; a raw text, CSV or binary body (text/plain, \
+             application/octet-stream, multipart/related, or no Content-Type), which is one \
+             argument of its whole length; or NDJSON sent as application/json, which is not \
+             one JSON document and is read whole. "
+        }
+        InspectionLimit::Time => "",
+    };
     format!(
         "This request went past site '{site}''s inspection limit {setting} (now {now}), so the \
-         rule engine stopped rather than judge it on part of its content. If such requests are \
-         legitimate, raise {setting} in the site's policy; each increase lets one request cost \
-         more inspection time, which is what the limit bounds. A burst of these from one source \
-         usually means requests built to be expensive to inspect.",
+         rule engine stopped rather than judge it on part of its content. {legitimate}If such \
+         requests are legitimate, raise {setting} in the site's policy; each increase lets one \
+         request cost more inspection time, which is what the limit bounds. A burst of these \
+         from one source usually means requests built to be expensive to inspect.",
         setting = limit.setting(),
     )
 }
@@ -295,6 +371,97 @@ mod tests {
         assert_eq!(refusal_in(&ctx, &Phase::RequestBody), None);
     }
 
+    /// Counts the WARN events this module logs, on the thread it is the
+    /// default subscriber for.
+    struct CountWarnings(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl tracing::Subscriber for CountWarnings {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() == tracing::Level::WARN
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if event.metadata().target() == "sentinel_proxy::inspection_limits" {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Learning mode forwards every refused request, and logged a WARN for
+    /// each: a client could write the log at its own request rate. The event
+    /// and the counter record each one; the log says so once per site and
+    /// limit every `WARN_EVERY`.
+    #[test]
+    fn learning_mode_warns_once_per_site_and_limit_not_once_per_request() {
+        let mut s = site(
+            WafMode::Learning,
+            serde_json::json!({"max_inspected_args": 3}),
+        );
+        // A site of its own: the throttle is process-wide.
+        s.id = "warn-throttle".into();
+        let warnings = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tracing::subscriber::with_default(CountWarnings(Arc::clone(&warnings)), || {
+            for _ in 0..50 {
+                let ctx = body_phase(&s, "/f", "a=v&b=v&c=v&d=v");
+                assert!(ctx.would_block);
+            }
+        });
+        assert_eq!(warnings.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A refused request is decided — blocking mode refuses it, learning mode
+    /// records it — and an ML score could change neither, since
+    /// `apply_verdict` returns on a Block; while what ML reads is not bounded
+    /// by the limits (307 ms on a 9.9 MiB form the rules refused in 12 ms).
+    #[test]
+    fn ml_is_not_run_on_a_request_the_engine_refused() {
+        let policy = serde_json::json!({"max_inspected_args": 3, "ml": {"enable": true}});
+        for mode in [WafMode::Blocking, WafMode::Learning] {
+            let s = site(mode.clone(), policy.clone());
+            let past = body_phase(&s, "/f", "a=v&b=v&c=v&d=v");
+            assert!(
+                past.rule_matches
+                    .iter()
+                    .any(|m| m.rule_id == InspectionLimit::Args.rule_id()),
+                "{mode:?}"
+            );
+            assert!(
+                past.ml_scores.is_empty(),
+                "{mode:?}: ML scored a refused request: {:?}",
+                past.ml_scores
+            );
+            let within = body_phase(&s, "/f", "a=v&b=v&c=last-value");
+            assert!(
+                within.ml_scores.contains_key("combined"),
+                "{mode:?}: ML must still score what was inspected"
+            );
+        }
+    }
+
+    /// The legitimate traffic that meets a limit, named in the advice so an
+    /// operator can tell it from a request built to be expensive.
+    #[test]
+    fn the_remediation_names_the_legitimate_shapes_that_reach_a_limit() {
+        let ctx = refused(Phase::RequestBody);
+        let text = remediation(InspectionLimit::ArgBytes, &ctx, "shop");
+        for shape in [
+            "base64 inside JSON or XML",
+            "text/plain",
+            "multipart/related",
+            "NDJSON sent as application/json",
+        ] {
+            assert!(text.contains(shape), "{shape}: {text}");
+        }
+        let text = remediation(InspectionLimit::Args, &ctx, "shop");
+        assert!(text.contains("thousands of fields"), "{text}");
+    }
+
     #[test]
     fn the_remediation_names_the_setting_and_its_value() {
         let ctx = refused(Phase::RequestBody);
@@ -309,5 +476,23 @@ mod tests {
             text.contains("inspection_time_budget_ms (now 1000 ms)"),
             "{text}"
         );
+    }
+
+    /// One WARN per site and limit every `WARN_EVERY`, counting the ones it
+    /// held back in between; each site and limit on its own.
+    #[test]
+    fn a_held_back_warning_is_counted_on_the_next_one() {
+        let mut log = WarnLog::new();
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let (args, bytes) = (InspectionLimit::Args, InspectionLimit::ArgBytes);
+        assert_eq!(warning_due(&mut log, "a", args, at(0)), Some(0));
+        assert_eq!(warning_due(&mut log, "a", args, at(1)), None);
+        assert_eq!(warning_due(&mut log, "a", args, at(9)), None);
+        assert_eq!(warning_due(&mut log, "a", bytes, at(9)), Some(0));
+        assert_eq!(warning_due(&mut log, "b", args, at(9)), Some(0));
+        assert_eq!(warning_due(&mut log, "a", args, at(10)), Some(2));
+        assert_eq!(warning_due(&mut log, "a", args, at(11)), None);
+        assert_eq!(warning_due(&mut log, "a", args, at(25)), Some(1));
     }
 }

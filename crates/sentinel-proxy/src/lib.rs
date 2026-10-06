@@ -4889,7 +4889,14 @@ fn phase2_body(
         eval_rules(ctx, engine, Phase::RequestBody);
     }
 
-    if let Some(ref ml_cfg) = site.waf.ml {
+    // A request the rule engine refused to finish inspecting is decided by the
+    // refusal — blocking mode refuses it, learning mode records it — and an ML
+    // score could change neither: `apply_verdict` returns on a Block. The
+    // inspection limits do not bound what ML reads, so scoring it anyway cost
+    // 25-35 times the refusal: 307 ms on a 9.9 MiB form the rules refused in
+    // 12 ms, 450 ms on 9.9 MiB of text.
+    let refused = inspection_limits::refused(ctx);
+    if let Some(ml_cfg) = site.waf.ml.as_ref().filter(|_| !refused) {
         if ml_cfg.enable {
             let ml_scores = ml_engine.evaluate(ctx);
 

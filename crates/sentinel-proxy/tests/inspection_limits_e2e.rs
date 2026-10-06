@@ -175,11 +175,23 @@ fn exceeded(reason: &str) -> u64 {
     sentinel_telemetry::inspection_limit_exceeded_total(reason)
 }
 
+/// The counter is process-wide and these tests run in parallel, so each holds
+/// this for its whole run: a count one test reads moved for its own requests
+/// only, and can be asserted exactly. (Held across awaits, so a tokio mutex.)
+static COUNTER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The counts of every reason, to compare after a test's requests.
+fn counts() -> [u64; 3] {
+    ["args", "arg_bytes", "time"].map(exceeded)
+}
+
 /// Blocking mode: a request past either argument limit never reaches the
 /// origin — 413, or 414 for a query string over the limit on its own — and a
 /// request at the limits is inspected and forwarded as before.
 #[tokio::test]
 async fn blocking_mode_refuses_requests_past_the_argument_limits() {
+    let _counter = COUNTER.lock().await;
+    let before = counts();
     let origin = start_origin().await;
     let port = next_port();
     let limits = serde_json::json!({"max_inspected_args": 50, "max_inspected_arg_bytes": 2000});
@@ -207,23 +219,27 @@ async fn blocking_mode_refuses_requests_past_the_argument_limits() {
     let (status, _) = send(port, Method::POST, "/form", past).await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
 
-    assert!(exceeded("args") >= 2);
-    assert!(exceeded("arg_bytes") >= 1);
+    // One count per refused request: two over the argument limit, one over
+    // the byte limit, none for the time budget.
+    let [args, bytes, time] = before;
+    assert_eq!(counts(), [args + 2, bytes + 1, time]);
     let _ = shutdown.send(true);
 }
 
 /// Learning mode: the same requests reach the origin, and are counted.
 #[tokio::test]
 async fn learning_mode_forwards_requests_past_the_argument_limits_and_counts_them() {
+    let _counter = COUNTER.lock().await;
     let origin = start_origin().await;
     let port = next_port();
     let limits = serde_json::json!({"max_inspected_args": 50});
     let shutdown = start_proxy(config(port, origin, "learning", limits)).await;
 
-    let before = exceeded("args");
+    let [args, bytes, time] = counts();
     let (status, body) = send(port, Method::POST, "/form", fields(51)).await;
     assert_eq!((status, body.as_str()), (StatusCode::OK, "upstream-ok"));
-    assert!(exceeded("args") > before);
+    // Once, though learning mode runs the rules of every phase after it.
+    assert_eq!(counts(), [args + 1, bytes, time]);
     let _ = shutdown.send(true);
 }
 
@@ -231,6 +247,8 @@ async fn learning_mode_forwards_requests_past_the_argument_limits_and_counts_the
 /// ordinary large form is well within.
 #[tokio::test]
 async fn an_ordinary_large_form_is_within_the_default_limits() {
+    let _counter = COUNTER.lock().await;
+    let before = counts();
     let origin = start_origin().await;
     let port = next_port();
     let shutdown = start_proxy(config(port, origin, "blocking", serde_json::json!({}))).await;
@@ -240,5 +258,6 @@ async fn an_ordinary_large_form_is_within_the_default_limits() {
         .join("&");
     let (status, body) = send(port, Method::POST, "/form", form).await;
     assert_eq!((status, body.as_str()), (StatusCode::OK, "upstream-ok"));
+    assert_eq!(counts(), before, "nothing refused");
     let _ = shutdown.send(true);
 }
