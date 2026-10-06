@@ -5521,6 +5521,27 @@ fn record_inline_rule_diag(name: &str, enforced: bool, error: Option<String>) {
     );
 }
 
+/// A site whose engine did not build enforces none of its inline rules, however
+/// each parsed: the inline loop has already recorded those it accepted as
+/// enforced. A rule already recorded as failing keeps its own reason.
+fn record_site_inline_rules_unenforced(site: &SiteConfig, kept_previous: bool) {
+    let why = if kept_previous {
+        "the site's rules did not compile; it runs its previous rules"
+    } else {
+        "the site's rules did not compile; it has no rules on this node"
+    };
+    for rule in &site.waf.inline_rules {
+        let failed = inline_rule_diags()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&rule.name)
+            .is_some_and(|d| !d.enforced);
+        if !failed {
+            record_inline_rule_diag(&rule.name, false, Some(why.to_string()));
+        }
+    }
+}
+
 fn inline_rule_diag_snapshot() -> Vec<InlineRuleDiag> {
     inline_rule_diags()
         .lock()
@@ -6000,6 +6021,7 @@ fn build_rule_engines(cfg: &SentinelConfig, previous: &RuleEngineMap) -> RuleEng
                 map.insert(site.id.clone(), engine);
             }
             Err(e) => {
+                record_site_inline_rules_unenforced(site, previous.contains_key(&site.id));
                 // RuleEngine is Arc-backed → clone is cheap.
                 if let Some(prev) = previous.get(&site.id) {
                     warn!(site = %site.id, rules = prev.rule_count(),
@@ -6636,8 +6658,6 @@ fn target_name(t: &sentinel_rules::dsl::ast::Target) -> String {
 
 fn load_site_engine(site: &SiteConfig) -> anyhow::Result<RuleEngine> {
     use sentinel_rules::dsl::ast::{RuleFile, RuleItem};
-    #[cfg(test)]
-    panic_guard::inject_compile_panic(site);
 
     let mut merged = RuleFile::default();
     for path_str in &site.waf.rules {
@@ -6834,6 +6854,10 @@ fn load_site_engine(site: &SiteConfig) -> anyhow::Result<RuleEngine> {
         }
     }
 
+    // After the inline-rule loop has recorded its diagnostics, as a panic in
+    // `compile` would be.
+    #[cfg(test)]
+    panic_guard::inject_compile_panic(site);
     sentinel_rules::compile(merged)
         .map(RuleEngine::new)
         .with_context(|| format!("compiling rules for site '{}'", site.id))

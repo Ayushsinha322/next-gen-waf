@@ -605,8 +605,9 @@ pub(crate) fn inject_rebuild_panic(cfg: &sentinel_core::config::SentinelConfig) 
     }
 }
 
-/// An inline rule of this name makes compiling its SITE panic, every time —
-/// a CRS line or a compiler bug, as far as the caller can tell.
+/// An inline rule of this name makes compiling its SITE panic, every time, in
+/// `compile`: after every inline rule was parsed and its diagnostic recorded,
+/// as a compiler bug reached by the merged ruleset would.
 #[cfg(test)]
 pub(crate) const INJECT_COMPILE_PANIC_RULE: &str = "panic-guard-compile";
 
@@ -1714,9 +1715,21 @@ mod tests {
 
         // v2: A's rules now panic the compiler; B gains a rule of its own.
         let mut v2 = v1;
+        // The rule itself parses, so the inline loop records it as enforced
+        // before the compile panics.
         v2.sites[0].waf.inline_rules = vec![InlineRule {
             name: INJECT_COMPILE_PANIC_RULE.into(),
-            dsl: String::new(),
+            dsl: r#"
+rule 9990103 {
+    phase    : request_headers
+    targets  : ARGS
+    operator : rx /AMARKER/
+    action   : block
+    severity : critical
+    message  : "a marker"
+}
+"#
+            .into(),
         }];
         v2.sites[1].waf.inline_rules = vec![InlineRule {
             name: "b-marker".into(),
@@ -1766,10 +1779,128 @@ rule 9990101 {
         assert!(a.kept_previous, "{a:?}");
         assert!(a.error.contains("crashed the rule compiler"), "{a:?}");
         assert!(!a.error.contains("sentinel"), "console text: {a:?}");
+        // The rule row agrees: the rule parsed, but its site kept the old rules.
+        let diag = crate::inline_rule_diag_snapshot()
+            .into_iter()
+            .find(|d| d.name == INJECT_COMPILE_PANIC_RULE)
+            .expect("the rule is reported");
+        assert!(
+            !diag.enforced,
+            "the console was told the rule is enforced: {diag:?}"
+        );
+        assert_eq!(
+            get_host(&mut conn, "a.local", "/?x=AMARKER").await.0,
+            StatusCode::OK,
+            "and indeed it is not"
+        );
 
         drop(conn);
         proxy.stop().await;
         crate::ENGINES_WARMING.store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// A site whose engine did not build enforces none of its inline rules,
+    /// however each one parsed. The inline loop had already recorded them as
+    /// enforced when `compile` panicked (and when a rule file failed before the
+    /// loop, they were not reported at all), so the console's rule row said
+    /// "enforced" while the site ran its previous rules, or none.
+    #[test]
+    fn inline_rules_of_a_site_that_did_not_compile_are_not_enforced() {
+        let _serial = proxy_state_lock();
+        let good = |name: &str, id: u32| InlineRule {
+            name: name.into(),
+            dsl: format!(
+                r#"
+rule {id} {{
+    phase    : request_headers
+    targets  : ARGS
+    operator : rx /DIAGMARKER/
+    action   : block
+    severity : critical
+    message  : "diag"
+}}
+"#
+            ),
+        };
+        let bad = InlineRule {
+            name: "kept-bad".into(),
+            dsl: "rule nope { totally invalid (((".into(),
+        };
+        let origin: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        // v1 compiles, so v2's panicking site has a previous engine to keep.
+        let v1 = SentinelConfig {
+            sites: vec![site(
+                "diag-kept",
+                "kept.local",
+                origin,
+                vec![],
+                vec![good("kept-ok", 9990104)],
+            )],
+            ..Default::default()
+        };
+        let previous = crate::build_rule_engines(&v1, &crate::RuleEngineMap::new());
+        assert!(previous.contains_key("diag-kept"), "precondition");
+        let v2 = SentinelConfig {
+            sites: vec![
+                site(
+                    "diag-kept",
+                    "kept.local",
+                    origin,
+                    vec![],
+                    vec![
+                        good("kept-ok", 9990104),
+                        bad,
+                        good(INJECT_COMPILE_PANIC_RULE, 9990105),
+                    ],
+                ),
+                site(
+                    "diag-none",
+                    "none.local",
+                    origin,
+                    vec!["/nonexistent/panic-guard/rules.conf".into()],
+                    vec![good("none-ok", 9990106)],
+                ),
+                site(
+                    "diag-fine",
+                    "fine.local",
+                    origin,
+                    vec![],
+                    vec![good("fine-ok", 9990107)],
+                ),
+            ],
+            ..Default::default()
+        };
+        let built = crate::build_rule_engines(&v2, &previous);
+        assert!(built.contains_key("diag-kept"), "kept its previous engine");
+        assert!(!built.contains_key("diag-none"), "no engine at all");
+
+        let diags = crate::inline_rule_diag_snapshot();
+        let get = |name: &str| {
+            diags
+                .iter()
+                .find(|d| d.name == name)
+                .cloned()
+                .unwrap_or_else(|| panic!("{name} not reported: {diags:?}"))
+        };
+        for (name, consequence) in [
+            ("kept-ok", "previous rules"),
+            (INJECT_COMPILE_PANIC_RULE, "previous rules"),
+            ("none-ok", "no rules on this node"),
+        ] {
+            let d = get(name);
+            assert!(!d.enforced, "the console is told {name} is enforced: {d:?}");
+            let err = d.error.unwrap_or_default();
+            assert!(err.contains("did not compile"), "{name}: {err}");
+            assert!(err.contains(consequence), "{name}: {err}");
+            assert!(!err.contains("sentinel"), "console text: {err}");
+        }
+        let kept_bad = get("kept-bad").error.unwrap_or_default();
+        assert!(
+            kept_bad.contains("does not parse"),
+            "a rule's own failure keeps its own reason: {kept_bad}"
+        );
+        assert!(get("fine-ok").enforced, "another site's rule is unaffected");
+        crate::reset_inline_rule_diags();
     }
 
     /// An operator's rule is text typed into a web form, which is exactly what
