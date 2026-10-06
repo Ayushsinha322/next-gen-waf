@@ -109,6 +109,14 @@ pub fn quic_server_config_from_resolver(
 ///
 /// One QUIC connection multiplexes many HTTP/3 requests; each connection and
 /// each request runs on its own task, mirroring the TCP accept loop.
+///
+/// Shutdown drains rather than cuts. Connection and request tasks run on the
+/// same `conn_tracker` as TCP connections, so `run` waits for them (bounded by
+/// the drain grace). Each connection sends GOAWAY and finishes the requests it
+/// already accepted; the endpoint refuses new connections and stays up until
+/// every connection has closed or the grace runs out. It used to close at
+/// once, cutting every in-flight h3 download and stream on each deploy while
+/// TCP clients got the grace.
 pub(crate) async fn serve_quic(
     bind: SocketAddr,
     server_config: quinn::ServerConfig,
@@ -141,28 +149,61 @@ pub(crate) async fn serve_quic(
                         };
                         let state = Arc::clone(&state);
                         let ds = default_site.clone();
-                        tokio::spawn(async move {
+                        let conn_shutdown = shutdown.clone();
+                        let tracker = state.conn_tracker.clone();
+                        tracker.spawn(async move {
                             // Permit + gauge guard held for the connection's life.
                             let _permit = permit;
                             let _active = ActiveConnGuard::new();
-                            if let Err(e) = handle_quic_connection(incoming, state, ds).await {
+                            if let Err(e) =
+                                handle_quic_connection(incoming, state, ds, conn_shutdown).await
+                            {
                                 debug!("HTTP/3 connection error: {e}");
                             }
                         });
                     }
                     // Endpoint closed / no more connections.
-                    None => break,
+                    None => return Ok(()),
                 }
             }
-            _ = shutdown.changed() => {
-                info!(%bind, "HTTP/3 endpoint shutting down");
-                // Tell peers we're going away; give in-flight streams a moment.
-                endpoint.close(0u32.into(), b"shutdown");
-                break;
-            }
+            _ = shutdown.changed() => break,
         }
     }
+
+    let grace = crate::drain_grace();
+    info!(%bind, grace_secs = grace.as_secs(), "HTTP/3 endpoint draining");
+    if drain_endpoint(&endpoint, grace).await {
+        info!(%bind, "HTTP/3 connections drained");
+    } else {
+        warn!(
+            %bind,
+            grace_secs = grace.as_secs(),
+            "drain grace elapsed; closing remaining HTTP/3 connections"
+        );
+    }
+    endpoint.close(0u32.into(), b"shutdown");
     Ok(())
+}
+
+/// Keep the endpoint up while its connections finish, refusing new ones, for
+/// at most `grace`. True when every connection closed in time.
+async fn drain_endpoint(endpoint: &quinn::Endpoint, grace: Duration) -> bool {
+    let drained = async {
+        let idle = endpoint.wait_idle();
+        tokio::pin!(idle);
+        loop {
+            tokio::select! {
+                biased;
+                () = &mut idle => return,
+                incoming = endpoint.accept() => match incoming {
+                    Some(incoming) => incoming.refuse(),
+                    // Closed elsewhere: nothing new can arrive.
+                    None => return (&mut idle).await,
+                },
+            }
+        }
+    };
+    tokio::time::timeout(grace, drained).await.is_ok()
 }
 
 /// Complete the QUIC handshake for one connection, then run its HTTP/3 request
@@ -171,6 +212,7 @@ async fn handle_quic_connection(
     incoming: quinn::Incoming,
     state: Arc<ServerState>,
     default_site: Option<String>,
+    mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let conn = incoming
         .accept()
@@ -199,28 +241,48 @@ async fn handle_quic_connection(
         .await
         .context("HTTP/3 connection setup")?;
 
+    let mut goaway_sent = false;
     loop {
-        match h3_conn.accept().await {
-            // A new request on a fresh QUIC stream.
-            Ok(Some(resolver)) => {
-                let state = Arc::clone(&state);
-                let ds = default_site.clone();
-                // Cloned per request: one connection's fingerprint serves every
-                // request multiplexed over it, exactly as on a keep-alive TCP
-                // connection.
-                let fp = tls_fp.clone();
-                let quic = quic.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handle_h3_request(resolver, state, ds, peer, fp, quic).await {
-                        debug!("HTTP/3 request error: {e}");
-                    }
-                });
-            }
-            // Client closed the connection cleanly.
-            Ok(None) => break,
-            Err(e) => {
-                debug!("HTTP/3 accept error: {e}");
-                break;
+        tokio::select! {
+            accepted = h3_conn.accept() => match accepted {
+                // A new request on a fresh QUIC stream.
+                Ok(Some(resolver)) => {
+                    let ds = default_site.clone();
+                    // Cloned per request: one connection's fingerprint serves
+                    // every request multiplexed over it, exactly as on a
+                    // keep-alive TCP connection.
+                    let fp = tls_fp.clone();
+                    let quic = quic.clone();
+                    // Tracked like the connection, so a drain also waits for a
+                    // request whose client has already gone.
+                    let tracker = state.conn_tracker.clone();
+                    let state = Arc::clone(&state);
+                    tracker.spawn(async move {
+                        if let Err(e) = handle_h3_request(resolver, state, ds, peer, fp, quic).await
+                        {
+                            debug!("HTTP/3 request error: {e}");
+                        }
+                    });
+                }
+                // Client closed the connection cleanly.
+                Ok(None) => break,
+                Err(e) => {
+                    debug!("HTTP/3 accept error: {e}");
+                    break;
+                }
+            },
+            // Graceful shutdown. GOAWAY tells the client to send no new
+            // requests here; the ones already accepted finish normally. Keep
+            // accepting, so h3 refuses late streams, until the client closes
+            // the connection or the drain grace ends and `serve_quic` closes
+            // the endpoint. Closing it ourselves when the last response is
+            // finished could cut off data quinn has not yet delivered.
+            _ = shutdown.changed(), if !goaway_sent => {
+                goaway_sent = true;
+                if let Err(e) = h3_conn.shutdown(0).await {
+                    debug!(%peer, "HTTP/3 GOAWAY failed: {e}");
+                    break;
+                }
             }
         }
     }
@@ -1172,6 +1234,48 @@ mod tests {
             );
         }
         assert!(relay_done.await.unwrap().is_err());
+    }
+
+    /// The shutdown drain is bounded and ends early. A client that stays holds
+    /// the endpoint only for the grace; once it leaves, the drain completes.
+    #[tokio::test]
+    async fn endpoint_drain_waits_for_clients_and_is_bounded() {
+        let endpoint =
+            quinn::Endpoint::server(test_server_config(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let mut client_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client_endpoint.set_default_client_config(test_client_config());
+        let (client, _server) = tokio::join!(
+            async {
+                client_endpoint
+                    .connect(addr, "localhost")
+                    .unwrap()
+                    .await
+                    .unwrap()
+            },
+            async { endpoint.accept().await.unwrap().await.unwrap() },
+        );
+
+        let started = tokio::time::Instant::now();
+        assert!(
+            !drain_endpoint(&endpoint, Duration::from_millis(200)).await,
+            "the drain reported success with a client still connected"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the drain outlived its grace"
+        );
+
+        client.close(0u32.into(), b"leaving");
+        assert!(
+            timeout(
+                Duration::from_secs(5),
+                drain_endpoint(&endpoint, Duration::from_secs(30))
+            )
+            .await
+            .expect("the drain kept waiting after the last client left"),
+            "the drain should end once every connection has closed"
+        );
     }
 
     /// The resolver-backed config path (Phase 1) produces a usable QUIC server

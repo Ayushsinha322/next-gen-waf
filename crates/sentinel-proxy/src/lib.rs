@@ -2278,13 +2278,7 @@ impl ProxyServer {
         for h in handles {
             h.abort();
         }
-        let grace = Duration::from_secs(
-            std::env::var("SENTINEL_DRAIN_GRACE_SECS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .filter(|&n| n > 0)
-                .unwrap_or(25),
-        );
+        let grace = drain_grace();
         state.conn_tracker.close();
         match tokio::time::timeout(grace, state.conn_tracker.wait()).await {
             Ok(_) => info!("all in-flight connections drained"),
@@ -2295,6 +2289,19 @@ impl ProxyServer {
         }
         Ok(())
     }
+}
+
+/// How long a graceful shutdown waits for in-flight connections, TCP and HTTP/3
+/// alike (`http3::serve_quic` drains its endpoint for the same time). Env
+/// override: `SENTINEL_DRAIN_GRACE_SECS`.
+fn drain_grace() -> Duration {
+    Duration::from_secs(
+        std::env::var("SENTINEL_DRAIN_GRACE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(25),
+    )
 }
 
 // ---------------------------------------------------------------------------

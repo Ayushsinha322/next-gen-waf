@@ -560,3 +560,96 @@ async fn h3_response_cut_short_after_the_head_is_counted() {
     drop(client);
     proxy.stop().await;
 }
+
+/// A graceful shutdown lets an in-flight h3 response finish. The QUIC endpoint
+/// used to close the moment shutdown was signalled, cutting every h3 download
+/// and stream mid-body on each deploy, while TCP connections got the drain
+/// grace. Now the connection gets a GOAWAY and its response completes, new
+/// connections are refused, and the proxy stops once the client has gone.
+#[tokio::test]
+async fn h3_in_flight_response_survives_a_graceful_shutdown() {
+    let (origin, mut streams) = start_origin().await;
+    let proxy = start_proxy(origin).await;
+
+    let mut client = h3_get(proxy.addr, "/stream").await;
+    let origin_tx = timeout(Duration::from_secs(10), streams.recv())
+        .await
+        .expect("the request never reached the origin")
+        .unwrap();
+    origin_tx
+        .send(Ok(Frame::data(Bytes::from_static(b"first "))))
+        .await
+        .unwrap();
+    let resp = timeout(Duration::from_secs(10), client.stream.recv_response())
+        .await
+        .expect("no response head")
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mut body = Vec::new();
+    let first = timeout(Duration::from_secs(5), client.stream.recv_data())
+        .await
+        .expect("the first chunk never arrived")
+        .unwrap()
+        .expect("the body ended before its first chunk");
+    body.extend_from_slice(first.chunk());
+
+    // Deploy while the response is still streaming, and let the shutdown reach
+    // the endpoint before the origin finishes.
+    proxy.shutdown.send(true).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let refused = timeout(Duration::from_secs(5), try_h3_connect(proxy.addr)).await;
+    assert!(
+        matches!(
+            &refused,
+            Ok(Err(quinn::ConnectionError::ConnectionClosed(close)))
+                if close.error_code == quinn::TransportErrorCode::CONNECTION_REFUSED
+        ),
+        "a draining endpoint must refuse new connections: {refused:?}"
+    );
+
+    // Not unwrapped: if the shutdown cut the response, the relay has dropped
+    // the origin body and the client's read below says so.
+    let _ = origin_tx
+        .send(Ok(Frame::data(Bytes::from_static(b"second"))))
+        .await;
+    drop(origin_tx);
+    let rest = timeout(Duration::from_secs(10), async {
+        loop {
+            match client.stream.recv_data().await {
+                Ok(Some(chunk)) => body.extend_from_slice(chunk.chunk()),
+                Ok(None) => break Ok(()),
+                Err(e) => break Err(e),
+            }
+        }
+    })
+    .await
+    .expect("the in-flight body never completed");
+    assert!(
+        rest.is_ok(),
+        "the shutdown cut off the in-flight h3 response: {rest:?}"
+    );
+    assert_eq!(body, b"first second");
+
+    // The drain ends once the last client has gone, well inside the grace.
+    drop(client);
+    let Proxy { task, cert_dir, .. } = proxy;
+    timeout(Duration::from_secs(10), task)
+        .await
+        .expect("the proxy was still draining after its last h3 client left")
+        .unwrap()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&cert_dir);
+}
+
+/// One QUIC handshake attempt; `Err` when the endpoint refuses it.
+async fn try_h3_connect(addr: SocketAddr) -> Result<quinn::Connection, quinn::ConnectionError> {
+    let mut tls = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerify))
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+    let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic)));
+    endpoint.connect(addr, "localhost").unwrap().await
+}
