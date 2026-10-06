@@ -242,7 +242,8 @@ pub enum Target {
 
 /// Input transformations applied to target values before operator matching.
 /// Applied in declaration order; `t:none` resets the list (handled by the importer).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `Hash` because the VM memoizes a transform chain's output per target.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Transform {
     Lowercase,
     UrlDecodeUni,

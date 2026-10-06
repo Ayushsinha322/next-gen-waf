@@ -4,13 +4,16 @@ use aho_corasick::AhoCorasick;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+use super::vm::MemoKey;
 use crate::dsl::ast::{InterpCmp, RuleAction, RulePhase, RuleSeverity, SetVar, Target, Transform};
 
 // ---------------------------------------------------------------------------
 // Target specification stored in instructions
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// What a `LoadTarget` reads. `Eq + Hash` because the VM memoizes the values of
+/// request-derived targets for the rest of one `evaluate` call.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TargetSpec {
     Args,
     ArgsNames,
@@ -351,6 +354,13 @@ pub struct CompiledRuleSet {
     /// Rules from the source set that are not enforced (compile-dropped or
     /// disabled). Empty when every rule compiled and is active.
     pub coverage: RuleCoverage,
+
+    /// How many rules of each phase program read each memoizable target and
+    /// (target, transform chain) pair; see `vm::memo_uses`. The VM keeps a
+    /// collection for the rest of a call only when several rules read it, and
+    /// spends its memory budget on the most-read ones first. Derived from
+    /// `phase_programs` at compile time.
+    pub(crate) memo_uses: [HashMap<MemoKey, u32>; 7],
 }
 
 impl std::fmt::Debug for CompiledRuleSet {
