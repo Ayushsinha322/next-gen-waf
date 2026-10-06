@@ -12,7 +12,7 @@ use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicI64, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard, PoisonError,
     },
 };
 
@@ -280,6 +280,15 @@ pub struct MetricsRegistry {
     histograms: Mutex<Vec<Histogram>>,
 }
 
+/// Lock a registry list, recovering it if a panic poisoned the mutex.
+///
+/// Every critical section here is a plain `push` or read, so a poisoned list is
+/// still whole. Refusing it would turn one panic into a `/metrics` endpoint that
+/// panics on every scrape — the moment the counters matter most.
+fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 impl MetricsRegistry {
     pub fn new() -> Self {
         Self {
@@ -292,17 +301,14 @@ impl MetricsRegistry {
     /// Register and return a new counter.
     pub fn register_counter(&self, name: impl Into<String>, help: impl Into<String>) -> Counter {
         let c = Counter::new(name, help);
-        self.counters
-            .lock()
-            .expect("counters poisoned")
-            .push(c.clone());
+        locked(&self.counters).push(c.clone());
         c
     }
 
     /// Register and return a new gauge.
     pub fn register_gauge(&self, name: impl Into<String>, help: impl Into<String>) -> Gauge {
         let g = Gauge::new(name, help);
-        self.gauges.lock().expect("gauges poisoned").push(g.clone());
+        locked(&self.gauges).push(g.clone());
         g
     }
 
@@ -313,10 +319,7 @@ impl MetricsRegistry {
         help: impl Into<String>,
     ) -> Histogram {
         let h = Histogram::new(name, help);
-        self.histograms
-            .lock()
-            .expect("histograms poisoned")
-            .push(h.clone());
+        locked(&self.histograms).push(h.clone());
         h
     }
 
@@ -324,7 +327,7 @@ impl MetricsRegistry {
     pub fn snapshot(&self) -> MetricsSnapshot {
         let mut lines = Vec::new();
 
-        for c in self.counters.lock().expect("counters poisoned").iter() {
+        for c in locked(&self.counters).iter() {
             lines.push(MetricLine {
                 name: c.name.clone(),
                 kind: "counter",
@@ -334,7 +337,7 @@ impl MetricsRegistry {
             });
         }
 
-        for g in self.gauges.lock().expect("gauges poisoned").iter() {
+        for g in locked(&self.gauges).iter() {
             lines.push(MetricLine {
                 name: g.name.clone(),
                 kind: "gauge",
@@ -344,7 +347,7 @@ impl MetricsRegistry {
             });
         }
 
-        for h in self.histograms.lock().expect("histograms poisoned").iter() {
+        for h in locked(&self.histograms).iter() {
             let count = h.count();
             let sum = h.sum();
             let p50 = h.percentile(50.0).unwrap_or(0.0);
@@ -547,6 +550,18 @@ struct WafMetrics {
     /// number of crawlers actually proven — and from an address that cannot
     /// verify, it must stay 0.
     pub bot_good_bot_allowed_total: Counter,
+    /// Panics anywhere in the process, counted by the panic hook. Release builds
+    /// aborted on the first one until 2026-10; now a panic is contained to the
+    /// request or background loop it happened in, which is exactly why it needs
+    /// a number — a contained panic is otherwise invisible from outside.
+    pub panics_total: Counter,
+    /// Requests answered 500 because their processing panicked. Some had
+    /// already reached the origin (a panic in the response phase); each one's
+    /// log line says which.
+    pub request_panics_total: Counter,
+    /// Background loops (control-plane sync, ClickHouse writer, listeners, ...)
+    /// restarted after a panic. Climbing steadily means one is crash-looping.
+    pub task_restarts_total: Counter,
 
     pub registry: MetricsRegistry,
 }
@@ -667,6 +682,18 @@ impl WafMetrics {
             "sentinel_bot_good_bot_allowlisted_total",
             "Requests granted the good-bot allowlist after reverse-DNS verification (PTR in the operator's domain, forward-confirmed)",
         );
+        let panics_total = registry.register_counter(
+            "sentinel_panics_total",
+            "Panics anywhere in the data-plane process; each is logged with its source location",
+        );
+        let request_panics_total = registry.register_counter(
+            "sentinel_request_panics_total",
+            "Requests whose processing panicked and were answered 500 (each log line says whether it had reached the origin)",
+        );
+        let task_restarts_total = registry.register_counter(
+            "sentinel_task_restarts_total",
+            "Background loops (control-plane sync, ClickHouse writer, listeners) restarted after a panic",
+        );
 
         Self {
             requests_total,
@@ -697,6 +724,9 @@ impl WafMetrics {
             ja4_h3_absent_total,
             h3_response_resets_total,
             bot_good_bot_allowed_total,
+            panics_total,
+            request_panics_total,
+            task_restarts_total,
             registry,
         }
     }
@@ -939,6 +969,34 @@ pub fn log_lines_dropped_total() -> u64 {
     WAF_METRICS.log_lines_dropped_total.get()
 }
 
+// ---- Panic containment ------------------------------------------------------
+
+/// A panic happened somewhere in the process. Called by the panic hook only.
+pub fn note_panic() {
+    WAF_METRICS.panics_total.inc();
+}
+pub fn panics_total() -> u64 {
+    WAF_METRICS.panics_total.get()
+}
+
+/// A request's processing panicked and it was answered 500 instead.
+pub fn note_request_panic() {
+    WAF_METRICS.request_panics_total.inc();
+}
+pub fn request_panics_total() -> u64 {
+    WAF_METRICS.request_panics_total.get()
+}
+
+/// A supervised background loop panicked and is being restarted. Returns the
+/// new total so the caller can put it on its log line.
+pub fn note_task_restart() -> u64 {
+    WAF_METRICS.task_restarts_total.inc();
+    WAF_METRICS.task_restarts_total.get()
+}
+pub fn task_restarts_total() -> u64 {
+    WAF_METRICS.task_restarts_total.get()
+}
+
 /// Increment the rule-hits counter.
 pub fn inc_rule_hits() {
     WAF_METRICS.rule_hits_total.inc();
@@ -1007,6 +1065,29 @@ mod tests {
         assert!(text.contains("# HELP http_reqs"));
         assert!(text.contains("# TYPE http_reqs counter"));
         assert!(text.contains("http_reqs 1"));
+    }
+
+    /// A panic while a registry list is locked poisons it. `/metrics` used to
+    /// `expect` on every lock, so from then on every scrape panicked too — the
+    /// node's counters went dark right after the event they should have shown.
+    #[test]
+    fn a_poisoned_registry_still_scrapes_and_registers() {
+        let r = std::sync::Arc::new(MetricsRegistry::new());
+        r.register_counter("before_poison", "registered before the panic")
+            .inc();
+        let poisoner = std::sync::Arc::clone(&r);
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.counters.lock().unwrap();
+            panic!("poisoning the counters list on purpose");
+        })
+        .join();
+        assert!(r.counters.is_poisoned(), "fixture must poison the lock");
+
+        r.register_counter("after_poison", "registered after the panic")
+            .inc_by(2);
+        let text = r.prometheus_text();
+        assert!(text.contains("before_poison 1"), "{text}");
+        assert!(text.contains("after_poison 2"), "{text}");
     }
 
     #[test]

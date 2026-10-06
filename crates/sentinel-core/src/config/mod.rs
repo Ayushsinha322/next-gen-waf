@@ -1427,11 +1427,32 @@ impl ConfigLoader {
             loop {
                 stream.recv().await;
                 info!("SIGHUP received — reloading configuration");
-                if let Err(e) = loader.reload() {
-                    warn!("config reload failed: {e}");
-                }
+                loader.reload_contained();
             }
         });
+    }
+
+    /// [`ConfigLoader::reload`] for the SIGHUP watcher: a failure — a panic
+    /// included — keeps the configuration in force. Unguarded, a panic while
+    /// parsing a bad file ended the watcher, and with it SIGHUP reloads, for
+    /// the life of the process, with nothing but the panic line to say so.
+    /// Returns whether the new configuration was applied.
+    pub fn reload_contained(&self) -> bool {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.reload())) {
+            Ok(Ok(())) => true,
+            Ok(Err(e)) => {
+                warn!("config reload failed: {e}");
+                false
+            }
+            Err(_) => {
+                error!(
+                    path = %self.path.display(),
+                    "config reload panicked — keeping the current configuration; the panic \
+                     is logged above with its location"
+                );
+                false
+            }
+        }
     }
 
     #[cfg(not(unix))]
@@ -1504,6 +1525,10 @@ pub fn update_sites(handle: &ConfigHandle, mut db_sites: Vec<SiteConfig>) {
 fn read_config_file(path: &Path) -> anyhow::Result<SentinelConfig> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading config file: {}", path.display()))?;
+    #[cfg(test)]
+    if raw.contains(tests::RELOAD_PANIC_MARKER) {
+        panic!("injected config-parse panic");
+    }
     let mut cfg: SentinelConfig = serde_yaml::from_str(&raw)
         .with_context(|| format!("parsing config file: {}", path.display()))?;
     apply_proxy_protocol_env(
@@ -1611,6 +1636,47 @@ tls:
         let l: ListenerConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(l.protocols(), vec![Protocol::Http1, Protocol::Http2]);
         assert!(l.is_tls());
+    }
+
+    /// A config file containing this makes parsing it panic, in test builds.
+    pub(super) const RELOAD_PANIC_MARKER: &str = "__panic_guard_reload__";
+
+    /// A panic while reloading on SIGHUP ended the watcher task, and with it
+    /// every later SIGHUP reload, for the life of the process (release builds
+    /// unwind now, so the task absorbed the panic instead of the process dying).
+    #[test]
+    fn a_panicking_reload_keeps_the_config_and_the_watcher() {
+        let dir = std::env::temp_dir().join(format!(
+            "sk-reload-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        let with_node = |id: &str| {
+            let mut cfg = SentinelConfig::default();
+            cfg.cluster.node_id = id.to_string();
+            serde_yaml::to_string(&cfg).unwrap()
+        };
+        std::fs::write(&path, with_node("before")).unwrap();
+        let loader = ConfigLoader::from_file(&path).unwrap();
+
+        std::fs::write(
+            &path,
+            format!("{}# {RELOAD_PANIC_MARKER}\n", with_node("broken")),
+        )
+        .unwrap();
+        assert!(
+            !loader.reload_contained(),
+            "a panicking reload applies nothing"
+        );
+        assert_eq!(loader.handle().load().cluster.node_id, "before");
+
+        // The next SIGHUP still works.
+        std::fs::write(&path, with_node("after")).unwrap();
+        assert!(loader.reload_contained());
+        assert_eq!(loader.handle().load().cluster.node_id, "after");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

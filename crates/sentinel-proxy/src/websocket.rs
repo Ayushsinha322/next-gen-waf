@@ -73,9 +73,10 @@ pub const MAX_INSPECT_MESSAGE_BYTES: usize = 1024 * 1024;
 /// Absolute maximum WebSocket frame payload we will buffer and relay (bytes).
 /// A frame declaring a larger length is rejected and the connection is torn
 /// down.  This guard runs *before* any allocation, so a malicious length field
-/// cannot trigger an allocation-capacity panic (release builds use
-/// `panic = "abort"`, so such a panic would crash the entire proxy process)
-/// or exhaust worker memory.
+/// cannot trigger an allocation-capacity panic or exhaust worker memory. (Such a
+/// panic once aborted the whole proxy; release builds unwind now and it would
+/// cost only this connection, but an attacker-sized allocation is still never
+/// attempted.)
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 
 // ---------------------------------------------------------------------------
@@ -136,8 +137,9 @@ pub async fn read_frame<R: AsyncReadExt + Unpin>(
 
     // Hard-cap the declared length BEFORE allocating.  Without this, a ~10-byte
     // frame declaring a huge length reaches `vec![0u8; payload_len]` below and
-    // aborts the process (capacity-overflow panic under panic=abort) or OOMs
-    // the worker.  Reject oversized frames and let the caller close the relay.
+    // panics on capacity overflow (fatal to the whole process while release
+    // builds used panic=abort) or OOMs the worker.  Reject oversized frames and
+    // let the caller close the relay.
     if payload_len > MAX_FRAME_BYTES {
         anyhow::bail!("WS frame payload length {payload_len} exceeds maximum {MAX_FRAME_BYTES}");
     }

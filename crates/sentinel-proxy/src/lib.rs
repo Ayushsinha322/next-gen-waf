@@ -30,6 +30,7 @@ pub mod http3;
 mod ip_feed;
 pub(crate) mod ja4_quic;
 mod jwks;
+mod panic_guard;
 pub mod proxy_protocol;
 /// Continuous security-event feed to a SIEM (see the module docs for why the
 /// alert path could not serve this purpose).
@@ -94,6 +95,8 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn, Instrument};
 
 use crate::upstream::UpstreamPool;
+
+pub use crate::panic_guard::install_panic_hook;
 
 // ---------------------------------------------------------------------------
 // Type aliases
@@ -727,29 +730,48 @@ static CONFIG_SYNC_STATUS: std::sync::Mutex<ConfigSyncStatus> =
         rejected_sites: Vec::new(),
     });
 
-fn config_sync_status() -> ConfigSyncStatus {
+/// The sync status, recovered if a panic poisoned its lock. Skipping a poisoned
+/// lock, as this used to, froze the status: the heartbeat kept reporting a
+/// healthy sync while the node stopped taking config.
+fn sync_status_lock() -> std::sync::MutexGuard<'static, ConfigSyncStatus> {
     CONFIG_SYNC_STATUS
         .lock()
-        .map(|g| g.clone())
-        .unwrap_or_default()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+fn config_sync_status() -> ConfigSyncStatus {
+    let mut status = sync_status_lock().clone();
+    // A site whose rules crashed the compiler is rejected config as far as the
+    // console is concerned: the change saved there is not enforced here.
+    status.rejected_sites.extend(
+        ENGINE_COMPILE_PANICS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned(),
+    );
+    status
+}
+
+/// Sites whose rules panicked the compiler in the latest engine rebuild.
+/// Replaced by every rebuild; reported with the sync status.
+static ENGINE_COMPILE_PANICS: std::sync::Mutex<Vec<RejectedSite>> =
+    std::sync::Mutex::new(Vec::new());
+
 fn note_config_sync_failure(error: String) {
-    if let Ok(mut g) = CONFIG_SYNC_STATUS.lock() {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        g.failing_since.get_or_insert(now);
-        g.last_error = Some(error);
-    }
+    let mut g = sync_status_lock();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    g.failing_since.get_or_insert(now);
+    g.last_error = Some(error);
 }
 
 fn note_config_sync_ok() {
-    if let Ok(mut g) = CONFIG_SYNC_STATUS.lock() {
-        g.last_error = None;
-        g.failing_since = None;
-    }
+    let mut g = sync_status_lock();
+    g.last_error = None;
+    g.failing_since = None;
 }
 
 /// One config-sync fetch: the response body, or None once the reason there is
@@ -1113,7 +1135,32 @@ impl ProxyServer {
             HISTORY_SINK_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
             let spool = open_history_spool();
             let ch_cfg = storage_backend_cfg.clone();
-            tokio::spawn(async move {
+            // Where a run that panics leaves the rows it had drained but not yet
+            // inserted or spooled, for the restarted run to pick up: at most the
+            // event buffer's cap each, and only once (see `Carried`).
+            fn shed_carried(rows: usize) {
+                for _ in 0..rows {
+                    inc_history_shed();
+                }
+                warn!(
+                    rows,
+                    "history writer panicked holding rows it cannot retry; they are lost \
+                     (see sentinel_history_shed_total)"
+                );
+            }
+            let traffic_carry = panic_guard::Carry::<sentinel_storage::TrafficRow>::new(
+                EVENT_BUFFER_CAP,
+                shed_carried,
+            );
+            let events_carry = panic_guard::Carry::<sentinel_storage::WafEventRow>::new(
+                EVENT_BUFFER_CAP,
+                shed_carried,
+            );
+            // Supervised: a panic restarts the writer, with the rows it held,
+            // instead of silently ending history recording for the life of the
+            // process.
+            panic_guard::supervised!("clickhouse history writer", {
+                per_run!(spool, ch_cfg, traffic_carry, events_carry);
                 // No client yet: the first tick (immediate) connects, so boot
                 // never waits on ClickHouse. Said explicitly so that a writer
                 // started again (after a panic) does not inherit a stale
@@ -1125,8 +1172,8 @@ impl ProxyServer {
                     std::time::Duration::from_secs(2),
                     std::time::Duration::from_secs(60),
                 );
-                let mut buf: Vec<sentinel_storage::TrafficRow> = Vec::new();
-                let mut evbuf: Vec<sentinel_storage::WafEventRow> = Vec::new();
+                let mut buf = panic_guard::Carried::resume(&traffic_carry);
+                let mut evbuf = panic_guard::Carried::resume(&events_carry);
                 let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
                 let mut ticks = 0u32;
                 // Seconds remaining until the next reconnect attempt while down.
@@ -1458,7 +1505,8 @@ impl ProxyServer {
         {
             let cm = Arc::clone(&cert_manager);
             let cfg_handle = Arc::clone(&self.config);
-            tokio::spawn(async move {
+            panic_guard::supervised!("certificate renewal", {
+                per_run!(cm, cfg_handle);
                 tls::renewal::renewal_loop(cm, cfg_handle).await;
             });
         }
@@ -1489,97 +1537,98 @@ impl ProxyServer {
 
         // --- Background: config hot-reload watcher ---
         {
-            let config_watch = Arc::clone(&self.config);
-            let engines_swap = Arc::clone(&engines);
-            let dlp_swap = Arc::clone(&dlp_map);
-            let modules_ref = Arc::clone(&modules);
-            let plugin_swap = Arc::clone(&plugin_runtime);
-            let site_plugin_swap = Arc::clone(&site_plugins);
-            let unresolved_swap = Arc::clone(&unresolved_plugins);
-            let uploaded_ref = Arc::clone(&uploaded_plugins);
+            let cw = Arc::clone(&self.config);
+            let es = Arc::clone(&engines);
+            let ds = Arc::clone(&dlp_map);
+            let mr = Arc::clone(&modules);
+            let ps = Arc::clone(&plugin_runtime);
+            let sp_swap = Arc::clone(&site_plugins);
+            let un_swap = Arc::clone(&unresolved_plugins);
+            let up_cache = Arc::clone(&uploaded_plugins);
             // Wakes the engine rebuild the instant new sites are published,
             // instead of leaving it to the 5s poll below. See ENGINES_WARMING.
-            let reload_wake_outer = Arc::clone(&engine_reload_notify);
-            tokio::spawn(async move {
+            let reload_wake = Arc::clone(&engine_reload_notify);
+            // The config the engines were last fully built from. It lives outside
+            // the loop and advances only once a rebuild completes, so a run that
+            // panics mid-rebuild is retried by the restarted one. Starting from
+            // the current config instead — what this did before — would leave
+            // the engines stale and ENGINES_WARMING set until the next change.
+            let built_from = Arc::new(AtomicUsize::new(Arc::as_ptr(&cw.load_full()) as usize));
+            panic_guard::supervised!("config hot-reload watcher", {
+                per_run!(
+                    reload_wake,
+                    cw,
+                    es,
+                    ds,
+                    mr,
+                    ps,
+                    sp_swap,
+                    un_swap,
+                    up_cache,
+                    built_from
+                );
+                let mut last_ptr = built_from.load(Ordering::Acquire);
                 loop {
-                    let reload_wake = Arc::clone(&reload_wake_outer);
-                    let cw = Arc::clone(&config_watch);
-                    let es = Arc::clone(&engines_swap);
-                    let ds = Arc::clone(&dlp_swap);
-                    let mr = Arc::clone(&modules_ref);
-                    let ps = Arc::clone(&plugin_swap);
-                    let sp_swap = Arc::clone(&site_plugin_swap);
-                    let un_swap = Arc::clone(&unresolved_swap);
-                    let up_cache = Arc::clone(&uploaded_ref);
-                    let handle = tokio::spawn(async move {
-                        let mut last_ptr = Arc::as_ptr(&cw.load_full()) as usize;
-                        loop {
-                            // Woken by the sync task the moment new sites land,
-                            // with the 5s sleep retained as a backstop for
-                            // config changes that arrive by another route (a
-                            // file reload, a cached-config restore).
-                            tokio::select! {
-                                _ = reload_wake.notified() => {}
-                                _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    // Woken by the sync task the moment new sites land,
+                    // with the 5s sleep retained as a backstop for
+                    // config changes that arrive by another route (a
+                    // file reload, a cached-config restore).
+                    tokio::select! {
+                        _ = reload_wake.notified() => {}
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    }
+                    let current = cw.load_full();
+                    let ptr = Arc::as_ptr(&current) as usize;
+                    if ptr != last_ptr {
+                        last_ptr = ptr;
+                        let prev_engines = es.load_full();
+                        #[cfg(test)]
+                        panic_guard::inject_rebuild_panic(&current);
+                        let new_engines = build_rule_engines(&current, &prev_engines);
+                        let rule_count: usize = new_engines.values().map(|e| e.rule_count()).sum();
+                        es.store(Arc::new(new_engines));
+                        // Engines now match the config we built FROM — but
+                        // only clear the flag if that is still the config
+                        // being served. Cleared after the store, never
+                        // before, and never for a superseded config.
+                        clear_warming_if_current(&cw, ptr, &ENGINES_WARMING);
+                        ds.store(Arc::new(build_dlp_map(&current)));
+
+                        let feed_cidrs = mr.feed_cache.load_full();
+                        mr.ip_rep
+                            .store(Arc::new(build_ip_reputation(&current, &feed_cidrs)));
+                        mr.ip_rep_sites
+                            .store(Arc::new(build_site_ip_reputation(&current)));
+                        mr.bot_detector.store(Arc::new(BotDetector::new()));
+                        mr.geoip_map.store(Arc::new(build_geoip_map(&current)));
+
+                        // Rebuild through build_full_plugin_runtime so
+                        // uploaded plugins survive a config change. Using
+                        // build_plugin_runtime here unloaded every uploaded
+                        // plugin, and because the sync task skips work when
+                        // the advertised set is unchanged, they never came
+                        // back — the module stayed "enabled" in the UI while
+                        // silently no longer running.
+                        match build_full_plugin_runtime(&current, &up_cache) {
+                            Ok((new_pr, per_site, names, rejected, unresolved)) => {
+                                // Store the selection FIRST: a request that
+                                // reads the new runtime with the old map
+                                // would run a module the site never named.
+                                sp_swap.store(Arc::new(per_site));
+                                un_swap.store(Arc::new(unresolved));
+                                ps.store(Arc::new(new_pr));
+                                info!(
+                                    uploaded = names.len(),
+                                    rejected, "plugin runtime hot-reloaded"
+                                );
                             }
-                            let current = cw.load_full();
-                            let ptr = Arc::as_ptr(&current) as usize;
-                            if ptr != last_ptr {
-                                last_ptr = ptr;
-                                let prev_engines = es.load_full();
-                                let new_engines = build_rule_engines(&current, &prev_engines);
-                                let rule_count: usize =
-                                    new_engines.values().map(|e| e.rule_count()).sum();
-                                es.store(Arc::new(new_engines));
-                                // Engines now match the config we built FROM — but
-                                // only clear the flag if that is still the config
-                                // being served. Cleared after the store, never
-                                // before, and never for a superseded config.
-                                clear_warming_if_current(&cw, ptr, &ENGINES_WARMING);
-                                ds.store(Arc::new(build_dlp_map(&current)));
-
-                                let feed_cidrs = mr.feed_cache.load_full();
-                                mr.ip_rep
-                                    .store(Arc::new(build_ip_reputation(&current, &feed_cidrs)));
-                                mr.ip_rep_sites
-                                    .store(Arc::new(build_site_ip_reputation(&current)));
-                                mr.bot_detector.store(Arc::new(BotDetector::new()));
-                                mr.geoip_map.store(Arc::new(build_geoip_map(&current)));
-
-                                // Rebuild through build_full_plugin_runtime so
-                                // uploaded plugins survive a config change. Using
-                                // build_plugin_runtime here unloaded every uploaded
-                                // plugin, and because the sync task skips work when
-                                // the advertised set is unchanged, they never came
-                                // back — the module stayed "enabled" in the UI while
-                                // silently no longer running.
-                                match build_full_plugin_runtime(&current, &up_cache) {
-                                    Ok((new_pr, per_site, names, rejected, unresolved)) => {
-                                        // Store the selection FIRST: a request that
-                                        // reads the new runtime with the old map
-                                        // would run a module the site never named.
-                                        sp_swap.store(Arc::new(per_site));
-                                        un_swap.store(Arc::new(unresolved));
-                                        ps.store(Arc::new(new_pr));
-                                        info!(
-                                            uploaded = names.len(),
-                                            rejected, "plugin runtime hot-reloaded"
-                                        );
-                                    }
-                                    Err(e) => {
-                                        warn!("failed to reload plugins — keeping current: {e:#}");
-                                    }
-                                }
-
-                                info!(rules = rule_count, "rule engines + modules hot-reloaded");
+                            Err(e) => {
+                                warn!("failed to reload plugins — keeping current: {e:#}");
                             }
                         }
-                    });
-                    if let Err(e) = handle.await {
-                        if e.is_panic() {
-                            error!("config hot-reload watcher panicked, restarting: {e}");
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                        }
+
+                        info!(rules = rule_count, "rule engines + modules hot-reloaded");
+                        built_from.store(ptr, Ordering::Release);
                     }
                 }
             });
@@ -1590,13 +1639,23 @@ impl ProxyServer {
             let poll_cfg = Arc::clone(&state.config);
             let poll_pool = Arc::clone(&state.upstream_pool);
             let secs = cfg.cluster.sync_interval_secs.max(1);
-            tokio::spawn(async move {
+            // A crash here is a sync failure like any other, so the heartbeat's
+            // sync status (and the console's REJECTING badge) says so. Without
+            // it a crash-looping sync left `last_error` empty and the node
+            // reporting a healthy sync while it took no config.
+            let on_panic = |msg: &str| {
+                note_config_sync_failure(format!("config sync crashed and is restarting: {msg}"))
+            };
+            panic_guard::supervised!("config sync", on_panic = on_panic, {
+                per_run!(sync_url, poll_cfg, poll_pool, sync_reload_notify);
                 type EmptyBody = http_body_util::Empty<bytes::Bytes>;
                 let client: cp_client::CpClient<EmptyBody> = cp_client::client();
                 let deadline = cp_client::deadline(
                     "SENTINEL_CP_CONFIG_TIMEOUT_SECS",
                     cp_client::CONFIG_SYNC_DEADLINE,
                 );
+                // Restarts at "nothing applied", so a run that panicked
+                // mid-apply is re-applied on the next poll.
                 let mut last_version: u64 = u64::MAX;
                 let reload_notify = Arc::clone(&sync_reload_notify);
                 // Authenticate the config-sync poll with the shared internal
@@ -1630,7 +1689,6 @@ impl ProxyServer {
                             continue;
                         }
                     };
-                    note_config_sync_ok();
                     if envelope.version != last_version {
                         let previous: Vec<SiteConfig> = poll_cfg
                             .load()
@@ -1640,6 +1698,8 @@ impl ProxyServer {
                             .cloned()
                             .collect();
                         let (sites, rejected) = parse_synced_sites(envelope.sites, &previous);
+                        #[cfg(test)]
+                        panic_guard::inject_sync_panic(&sites);
                         for r in &rejected {
                             error!(
                                 site = %r.id,
@@ -1654,9 +1714,7 @@ impl ProxyServer {
                                 r.error
                             );
                         }
-                        if let Ok(mut g) = CONFIG_SYNC_STATUS.lock() {
-                            g.rejected_sites = rejected;
-                        }
+                        sync_status_lock().rejected_sites = rejected;
                         let sync = ParsedSync {
                             version: envelope.version,
                             sites,
@@ -1679,6 +1737,11 @@ impl ProxyServer {
                         last_version = sync.version;
                         info!(version = last_version, sites = count, "sites hot-synced");
                     }
+                    // Only once the poll is APPLIED: a sync that crashes while
+                    // applying must not be reported healthy by the next run's
+                    // successful fetch, or its failure never outlives the grace
+                    // period the console waits before saying REJECTING.
+                    note_config_sync_ok();
                 }
             });
         }
@@ -1701,7 +1764,15 @@ impl ProxyServer {
             let plugin_sync_cfg = Arc::clone(&state.config);
             let sync_cache = Arc::clone(&uploaded_plugins);
             let secs = cfg.cluster.sync_interval_secs.max(1);
-            tokio::spawn(async move {
+            panic_guard::supervised!("plugin sync", {
+                per_run!(
+                    sync_url,
+                    plugin_sync_swap,
+                    sync_site_plugin_swap,
+                    sync_unresolved_swap,
+                    plugin_sync_cfg,
+                    sync_cache
+                );
                 use sha2::Digest as _;
                 type EmptyBody = http_body_util::Empty<bytes::Bytes>;
                 let client: cp_client::CpClient<EmptyBody> = cp_client::client();
@@ -1908,7 +1979,8 @@ impl ProxyServer {
                 .and_then(|s| s.parse::<u32>().ok())
                 .unwrap_or(3);
             TI_POLLER_STARTED.store(true, std::sync::atomic::Ordering::Relaxed);
-            tokio::spawn(async move {
+            panic_guard::supervised!("threat-intel sync", {
+                per_run!(sync_url, ti_modules, ti_ebpf);
                 type EmptyBody = http_body_util::Empty<bytes::Bytes>;
                 let client: cp_client::CpClient<EmptyBody> = cp_client::client();
                 let deadline = cp_client::deadline(
@@ -2072,7 +2144,8 @@ impl ProxyServer {
         {
             let gw_cfg = Arc::clone(&state.config);
             let gw_modules = Arc::clone(&state.modules);
-            tokio::spawn(async move {
+            panic_guard::supervised!("GeoIP watcher", {
+                per_run!(gw_cfg, gw_modules);
                 let mut ticker = tokio::time::interval(Duration::from_secs(60));
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
@@ -2122,7 +2195,10 @@ impl ProxyServer {
                     .unwrap_or_else(|| "node".to_string())
             };
             let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| node_id.clone());
-            tokio::spawn(async move {
+            panic_guard::supervised!("node heartbeat", {
+                per_run!(
+                    sync_url, hb_cfg, hb_pool, hb_engines, hb_ebpf, hb_modules, node_id, hostname
+                );
                 type JsonBody = http_body_util::Full<bytes::Bytes>;
                 let client: cp_client::CpClient<JsonBody> = cp_client::client();
                 let deadline = cp_client::deadline(
@@ -2155,8 +2231,14 @@ impl ProxyServer {
                         .elapsed()
                         .unwrap_or_default()
                         .as_secs();
-                    // Degraded when we have origins configured but none reachable.
-                    let status = if pool.total > 0 && pool.healthy == 0 {
+                    // Degraded when we have origins configured but none reachable,
+                    // or while a background loop is crash-looping. Under
+                    // panic=abort such a loop took the node down, which was at
+                    // least visible; contained, it is a node that quietly stops
+                    // doing one of its jobs, so it must not report healthy.
+                    let status = if (pool.total > 0 && pool.healthy == 0)
+                        || panic_guard::recently_restarted().is_some()
+                    {
                         "degraded"
                     } else {
                         "healthy"
@@ -2196,6 +2278,9 @@ impl ProxyServer {
                             // compiler — so without it "enabled" in the UI is an
                             // assumption rather than a fact.
                             "inline_rules": inline_rule_diag_snapshot(),
+                            // Contained panics, and which loops restarted: the
+                            // reason a node above reads "degraded".
+                            "panics": panic_guard::heartbeat_status(),
                         }
                     })
                     .to_string();
@@ -2233,7 +2318,8 @@ impl ProxyServer {
         // --- Background: RateLimiter GC (every 60 s) ---
         {
             let modules_ref = Arc::clone(&modules);
-            watchdog_task("rate-limiter GC", async move {
+            panic_guard::supervised!("rate-limiter GC", {
+                per_run!(modules_ref);
                 let mut interval = tokio::time::interval(Duration::from_secs(60));
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
@@ -2251,7 +2337,8 @@ impl ProxyServer {
         // --- Background: AntiDdos GC (every 60 s) ---
         {
             let modules_ref = Arc::clone(&modules);
-            watchdog_task("anti-DDoS GC", async move {
+            panic_guard::supervised!("anti-DDoS GC", {
+                per_run!(modules_ref);
                 let mut interval = tokio::time::interval(Duration::from_secs(60));
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
@@ -2269,7 +2356,8 @@ impl ProxyServer {
         // --- Background: Correlation GC (every 120 s) ---
         {
             let modules_ref = Arc::clone(&modules);
-            watchdog_task("correlation GC", async move {
+            panic_guard::supervised!("correlation GC", {
+                per_run!(modules_ref);
                 let mut interval = tokio::time::interval(Duration::from_secs(120));
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
@@ -2284,7 +2372,8 @@ impl ProxyServer {
         {
             let config_watch = Arc::clone(&self.config);
             let modules_ref = Arc::clone(&modules);
-            watchdog_task("IP feed loader", async move {
+            panic_guard::supervised!("IP feed loader", {
+                per_run!(config_watch, modules_ref);
                 let mut interval = tokio::time::interval(Duration::from_secs(300));
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 // Bounds, fair sharing, last-good reuse and the /healthz report:
@@ -2311,8 +2400,16 @@ impl ProxyServer {
         let mut handles = Vec::new();
         for listener_cfg in cfg.listeners.clone() {
             let state2 = Arc::clone(&state);
-            let mut sd = shutdown.clone();
-            handles.push(tokio::spawn(async move {
+            let sd = shutdown.clone();
+            // Supervised so a panic in the accept loop rebinds the listener
+            // instead of leaving the port dead while the process looks healthy.
+            // (Connections and requests panic in their own tasks and guards and
+            // never reach this.) After such a restart an HTTP/3 endpoint cannot
+            // rebind while the first one is still serving; that is logged, h3
+            // keeps working on the original, and the restarted listener stops
+            // advertising it (Alt-Svc follows its own endpoint, which is down).
+            handles.push(panic_guard::supervised!("listener", {
+                per_run!(listener_cfg, state2, sd);
                 if let Err(e) = serve_listener(listener_cfg, state2, &mut sd).await {
                     error!("listener error: {e}");
                 }
@@ -2357,23 +2454,6 @@ fn drain_grace() -> Duration {
             .filter(|&n| n > 0)
             .unwrap_or(25),
     )
-}
-
-// ---------------------------------------------------------------------------
-// Watchdog helper — restarts panic-crashed background tasks
-// ---------------------------------------------------------------------------
-
-fn watchdog_task<Fut>(name: &'static str, make_fut: Fut)
-where
-    Fut: std::future::Future<Output = ()> + Send + 'static,
-{
-    tokio::spawn(async move {
-        if let Err(e) = tokio::spawn(make_fut).await {
-            if e.is_panic() {
-                error!("{name} task panicked: {e}");
-            }
-        }
-    });
 }
 
 // ---------------------------------------------------------------------------
@@ -2472,25 +2552,31 @@ async fn serve_listener(
 
     let default_site = cfg.default_site.clone();
 
+    // True while the HTTP/3 accept loop runs; gates the Alt-Svc below.
+    let h3_serving = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Spawn the HTTP/3 (QUIC over UDP) endpoint on the same address as the TCP
     // listener. It shares the listener's shutdown signal and feeds requests into
     // the same WAF pipeline (see `http3::serve_quic`).
     if let Some(qcfg) = quic_config {
         match cfg.bind.parse::<SocketAddr>() {
-            Ok(quic_bind) => {
-                let state_q = Arc::clone(&state);
-                let ds_q = default_site.clone();
-                let shutdown_q = shutdown.clone();
-                let lname = cfg.name.clone();
-                tokio::spawn(async move {
-                    if let Err(e) =
-                        http3::serve_quic(quic_bind, qcfg, state_q, ds_q, shutdown_q).await
-                    {
-                        error!(listener = %lname, "HTTP/3 endpoint error: {e}");
-                    }
-                });
-                info!(listener = %cfg.name, bind = %cfg.bind, "HTTP/3 (QUIC) enabled on this listener");
-            }
+            Ok(quic_bind) => match http3::bind_quic(quic_bind, qcfg) {
+                Ok(endpoint) => {
+                    let state_q = Arc::clone(&state);
+                    let ds_q = default_site.clone();
+                    let shutdown_q = shutdown.clone();
+                    let serving = Arc::clone(&h3_serving);
+                    // Bound once, out here: a run restarted after a panic
+                    // accepts on the same socket (see `http3::bind_quic`).
+                    panic_guard::supervised!("HTTP/3 endpoint", {
+                        per_run!(endpoint, state_q, ds_q, shutdown_q, serving);
+                        http3::serve_quic(endpoint, state_q, ds_q, shutdown_q, &serving).await;
+                    });
+                    info!(listener = %cfg.name, bind = %cfg.bind, "HTTP/3 (QUIC) enabled on this listener");
+                }
+                Err(e) => {
+                    error!(listener = %cfg.name, "HTTP/3 endpoint error: {e:#}; serving TCP only");
+                }
+            },
             Err(e) => {
                 error!(listener = %cfg.name, bind = %cfg.bind, "HTTP/3 requested but bind is not a socket address ({e}); h3 disabled");
             }
@@ -2501,7 +2587,7 @@ async fn serve_listener(
     // h3 on the advertised UDP port. Defaults to this listener's bind port;
     // override with SENTINEL_HTTP3_ADVERTISE_PORT when the public port differs
     // (e.g. a container mapping host :443/udp → container :8443/udp).
-    let alt_svc: Option<header::HeaderValue> = if h3_enabled {
+    let alt_svc: Option<http3::AltSvc> = if h3_enabled {
         let bind_port = cfg
             .bind
             .parse::<SocketAddr>()
@@ -2511,7 +2597,9 @@ async fn serve_listener(
             .ok()
             .and_then(|s| s.parse::<u16>().ok())
             .unwrap_or(bind_port);
-        header::HeaderValue::from_str(&format!("h3=\":{port}\"; ma=86400")).ok()
+        header::HeaderValue::from_str(&format!("h3=\":{port}\"; ma=86400"))
+            .ok()
+            .map(|v| http3::AltSvc::new(v, Arc::clone(&h3_serving)))
     } else {
         None
     };
@@ -2658,7 +2746,7 @@ async fn handle_connection(
     state: Arc<ServerState>,
     default_site: Option<String>,
     management: Option<Arc<ManagementUpstreams>>,
-    alt_svc: Option<header::HeaderValue>,
+    alt_svc: Option<http3::AltSvc>,
     proxy_protocol: bool,
 ) -> anyhow::Result<()> {
     stream.set_nodelay(true)?;
@@ -2826,7 +2914,7 @@ async fn serve_http1<T>(
     state: Arc<ServerState>,
     default_site: Option<String>,
     management: Option<Arc<ManagementUpstreams>>,
-    alt_svc: Option<header::HeaderValue>,
+    alt_svc: Option<http3::AltSvc>,
     tls_fp: Option<String>,
 ) -> anyhow::Result<()>
 where
@@ -2845,7 +2933,9 @@ where
                 let mgmt = management.clone();
                 let av = alt_svc.clone();
                 let fp = tls_fp.clone();
-                async move { with_alt_svc(handle_request(s, peer, req, ds, mgmt, fp).await, av) }
+                let resp =
+                    panic_guard::contain_request(peer, handle_request(s, peer, req, ds, mgmt, fp));
+                async move { with_alt_svc(resp.await, av) }
             }),
         )
         .with_upgrades()
@@ -2859,7 +2949,7 @@ async fn serve_http2<T>(
     state: Arc<ServerState>,
     default_site: Option<String>,
     management: Option<Arc<ManagementUpstreams>>,
-    alt_svc: Option<header::HeaderValue>,
+    alt_svc: Option<http3::AltSvc>,
     tls_fp: Option<String>,
 ) -> anyhow::Result<()>
 where
@@ -2879,7 +2969,9 @@ where
                 let mgmt = management.clone();
                 let av = alt_svc.clone();
                 let fp = tls_fp.clone();
-                async move { with_alt_svc(handle_request(s, peer, req, ds, mgmt, fp).await, av) }
+                let resp =
+                    panic_guard::contain_request(peer, handle_request(s, peer, req, ds, mgmt, fp));
+                async move { with_alt_svc(resp.await, av) }
             }),
         )
         .await
@@ -2887,14 +2979,14 @@ where
 }
 
 /// Attach the `Alt-Svc` header (advertising HTTP/3) to a TCP response when the
-/// listener has h3 enabled. No-op when `alt_svc` is `None`.
+/// listener has h3 enabled and its endpoint is accepting. No-op otherwise.
 fn with_alt_svc(
     resp: Result<Response<BoxBody>, Infallible>,
-    alt_svc: Option<header::HeaderValue>,
+    alt_svc: Option<http3::AltSvc>,
 ) -> Result<Response<BoxBody>, Infallible> {
-    match (resp, alt_svc) {
+    match (resp, alt_svc.as_ref().and_then(http3::AltSvc::header)) {
         (Ok(mut r), Some(v)) => {
-            r.headers_mut().insert(header::ALT_SVC, v);
+            r.headers_mut().insert(header::ALT_SVC, v.clone());
             Ok(r)
         }
         (other, _) => other,
@@ -3132,7 +3224,21 @@ async fn proxy(
     // Created here, not inside the fallible body, so every exit has a context to
     // log from.
     let mut ctx = RequestContext::new(peer.ip(), peer.port());
-    match proxy_inner(&mut ctx, state, peer, req, default_site, tls_fp).await {
+    // A panic anywhere in the pipeline is caught here, where the context
+    // outlives it: the request is answered 500 with its Support ID and logged,
+    // saying whether it had reached the origin. Serves both TCP and HTTP/3
+    // (via run_pipeline).
+    let outcome = panic_guard::catch_request(async {
+        #[cfg(test)]
+        panic_guard::inject_test_panic(&req);
+        proxy_inner(&mut ctx, state, peer, req, default_site, tls_fp).await
+    })
+    .await;
+    let result = match outcome {
+        Ok(result) => result,
+        Err(payload) => return panic_guard::pipeline_panicked(&mut ctx, payload),
+    };
+    match result {
         Ok(r) => r,
         Err(e) => {
             // The error text is the operator's only clue about WHY the gateway
@@ -4199,6 +4305,8 @@ async fn proxy_inner(
 
     // --- Phase 5: Response body — rule engine + DLP scan ---
     ctx.advance_phase(Phase::ResponseBody);
+    #[cfg(test)]
+    panic_guard::inject_response_panic(ctx);
 
     let dlp_map = state.dlp_map.load_full();
     let resp_engines = state.engines.load_full();
@@ -5471,39 +5579,64 @@ fn inline_rule_diags(
 /// Without this a rule the operator has since deleted keeps reporting "enforced"
 /// forever, which is the same lie in the opposite direction.
 fn reset_inline_rule_diags() {
-    if let Ok(mut m) = inline_rule_diags().lock() {
-        m.clear();
-    }
+    inline_rule_diags()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
 }
 
 /// Record one rule's outcome. Keyed by name, which is unique per tenant; a rule
 /// shared by several sites either parses everywhere or nowhere, so aggregating by
 /// name loses nothing and keeps the heartbeat small.
 fn record_inline_rule_diag(name: &str, enforced: bool, error: Option<String>) {
-    if let Ok(mut m) = inline_rule_diags().lock() {
-        // A failure anywhere is the interesting outcome, so never let a later
-        // success overwrite a recorded error.
-        if let Some(existing) = m.get(name) {
-            if !existing.enforced && enforced {
-                return;
-            }
+    let mut m = inline_rule_diags()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // A failure anywhere is the interesting outcome, so never let a later
+    // success overwrite a recorded error.
+    if let Some(existing) = m.get(name) {
+        if !existing.enforced && enforced {
+            return;
         }
-        m.insert(
-            name.to_string(),
-            InlineRuleDiag {
-                name: name.to_string(),
-                enforced,
-                error,
-            },
-        );
+    }
+    m.insert(
+        name.to_string(),
+        InlineRuleDiag {
+            name: name.to_string(),
+            enforced,
+            error,
+        },
+    );
+}
+
+/// A site whose engine did not build enforces none of its inline rules, however
+/// each parsed: the inline loop has already recorded those it accepted as
+/// enforced. A rule already recorded as failing keeps its own reason.
+fn record_site_inline_rules_unenforced(site: &SiteConfig, kept_previous: bool) {
+    let why = if kept_previous {
+        "the site's rules did not compile; it runs its previous rules"
+    } else {
+        "the site's rules did not compile; it has no rules on this node"
+    };
+    for rule in &site.waf.inline_rules {
+        let failed = inline_rule_diags()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&rule.name)
+            .is_some_and(|d| !d.enforced);
+        if !failed {
+            record_inline_rule_diag(&rule.name, false, Some(why.to_string()));
+        }
     }
 }
 
 fn inline_rule_diag_snapshot() -> Vec<InlineRuleDiag> {
     inline_rule_diags()
         .lock()
-        .map(|m| m.values().cloned().collect())
-        .unwrap_or_default()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values()
+        .cloned()
+        .collect()
 }
 
 /// The per-path override governing `path`, or None. Longest matching prefix wins,
@@ -6000,11 +6133,10 @@ fn diag_first_time(key: String) -> bool {
     static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
         std::sync::OnceLock::new();
     let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-    match seen.lock() {
-        Ok(mut set) => set.insert(key),
-        // A poisoned lock must not silence a diagnostic; logging twice is better.
-        Err(_) => true,
-    }
+    // A poisoned set is still a set; the worst it can do is log one twice.
+    seen.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key)
 }
 
 /// Whether a JWT failure is the CLIENT's fault or the OPERATOR's.
@@ -6077,6 +6209,7 @@ fn build_rule_engines(cfg: &SentinelConfig, previous: &RuleEngineMap) -> RuleEng
     // stops claiming to be enforced.
     reset_inline_rule_diags();
     let mut map = RuleEngineMap::new();
+    let mut compile_panics = Vec::new();
     for site in &cfg.sites {
         // A site with no rule FILES may still have operator-authored inline rules
         // from the control plane; skipping on `rules.is_empty()` alone would build
@@ -6089,12 +6222,33 @@ fn build_rule_engines(cfg: &SentinelConfig, previous: &RuleEngineMap) -> RuleEng
         {
             continue;
         }
-        match load_site_engine(site) {
+        // A panic compiling one site's rules (a CRS line or an operator's rule
+        // reaching a parser bug) costs that site only, like an Err: it keeps its
+        // last-good engine or is refused, below. Unguarded it unwound out of
+        // the whole rebuild, the watcher replayed the same config forever, and
+        // no later change applied to ANY site while the node reported healthy.
+        let loaded =
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load_site_engine(site)))
+            {
+                Ok(loaded) => loaded,
+                Err(payload) => {
+                    let rejected = compile_panic_rejection(
+                        &site.id,
+                        previous.contains_key(&site.id),
+                        &*payload,
+                    );
+                    let err = anyhow!(rejected.error.clone());
+                    compile_panics.push(rejected);
+                    Err(err)
+                }
+            };
+        match loaded {
             Ok(engine) => {
                 info!(site = %site.id, rules = engine.rule_count(), "rule engine loaded");
                 map.insert(site.id.clone(), engine);
             }
             Err(e) => {
+                record_site_inline_rules_unenforced(site, previous.contains_key(&site.id));
                 // RuleEngine is Arc-backed → clone is cheap.
                 if let Some(prev) = previous.get(&site.id) {
                     warn!(site = %site.id, rules = prev.rule_count(),
@@ -6116,7 +6270,34 @@ fn build_rule_engines(cfg: &SentinelConfig, previous: &RuleEngineMap) -> RuleEng
             }
         }
     }
+    *ENGINE_COMPILE_PANICS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = compile_panics;
     map
+}
+
+/// How a site whose rules panicked the compiler is reported to the console (via
+/// the sync status in the heartbeat). Names the outcome; the location is in the
+/// node's log, because source paths carry the crate codename.
+fn compile_panic_rejection(
+    id: &str,
+    kept_previous: bool,
+    payload: &(dyn std::any::Any + Send),
+) -> RejectedSite {
+    let consequence = if kept_previous {
+        "The site keeps its previous rules."
+    } else {
+        "The site has no rules on this node."
+    };
+    RejectedSite {
+        id: id.to_string(),
+        error: format!(
+            "its rules crashed the rule compiler ({}); this is a bug, not a config error — \
+             the node log has the location. {consequence}",
+            panic_guard::panic_message(payload)
+        ),
+        kept_previous,
+    }
 }
 
 fn build_dlp_map(cfg: &SentinelConfig) -> DlpMap {
@@ -6742,7 +6923,31 @@ fn load_site_engine(site: &SiteConfig) -> anyhow::Result<RuleEngine> {
 
     for inline in &site.waf.inline_rules {
         let mut accepted = 0usize;
-        let parsed = match sentinel_rules::parse_srl(&inline.dsl) {
+        // Text typed into a web form is exactly what finds a parser bug, so a
+        // panic here costs this one rule, reported like a parse error.
+        let parsed = match std::panic::catch_unwind(|| {
+            #[cfg(test)]
+            panic_guard::inject_parse_panic(&inline.dsl);
+            sentinel_rules::parse_srl(&inline.dsl)
+        }) {
+            Ok(parsed) => parsed,
+            Err(payload) => {
+                let why = format!(
+                    "it crashed the rule parser ({}); a bug, not a typo",
+                    panic_guard::panic_message(&*payload)
+                );
+                warn!(
+                    site = %site.id,
+                    rule = %inline.name,
+                    error = %why,
+                    "CUSTOM RULE NOT ENFORCED: it crashed the rule parser. Every other rule \
+                     for this site is unaffected."
+                );
+                record_inline_rule_diag(&inline.name, false, Some(why));
+                continue;
+            }
+        };
+        let parsed = match parsed {
             Ok(f) => f,
             Err(e) => {
                 warn!(
@@ -6876,6 +7081,10 @@ fn load_site_engine(site: &SiteConfig) -> anyhow::Result<RuleEngine> {
         }
     }
 
+    // After the inline-rule loop has recorded its diagnostics, as a panic in
+    // `compile` would be.
+    #[cfg(test)]
+    panic_guard::inject_compile_panic(site);
     sentinel_rules::compile(merged)
         .map(RuleEngine::new)
         .with_context(|| format!("compiling rules for site '{}'", site.id))
@@ -8594,6 +8803,10 @@ async fn health_response(state: &ServerState) -> Response<BoxBody> {
         // Valkey and ClickHouse connect in the background and are retried, so
         // the node serves without them; this says whether they are in use.
         "storage": storage_status(&state.modules.rate_limiter),
+        // Panics this process contained instead of dying on. Non-zero is a bug
+        // to chase (each has a log line with its location); `task_restarts`
+        // climbing means a background loop is crash-looping.
+        "panics": panic_guard::status(),
         // The eBPF/XDP data path, and specifically whether the KERNEL path is
         // live. This exists because kernel XDP had never once loaded on any
         // deployment — the embedded object was rejected before it reached the
@@ -9809,8 +10022,9 @@ static WAF_EVENTS: std::sync::OnceLock<std::sync::Mutex<Vec<sentinel_storage::Wa
 /// disconnect, so a node that could not reach ClickHouse buffered nothing, and
 /// therefore recorded nothing, while still enforcing perfectly. The flusher now
 /// spools what it cannot insert (see `sentinel_storage::Spool`), so buffering
-/// while disconnected is correct and bounded — memory by the 20k cap below, disk
-/// by the spool's own cap.
+/// while disconnected is correct and bounded — memory by the 20k cap below (plus
+/// at most as many rows per stream carried over a writer panic), disk by the
+/// spool's own cap.
 static HISTORY_SINK_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -10023,7 +10237,12 @@ fn record_event(ctx: &RequestContext) {
     if !history_active {
         return; // SIEM-only deployment: nothing to buffer
     }
-    if let Ok(mut buf) = waf_events().lock() {
+    // Recovered, not skipped, when poisoned: skipping dropped every event for the
+    // rest of the process, uncounted, while blocks went on being enforced.
+    {
+        let mut buf = waf_events()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if buf.len() < EVENT_BUFFER_CAP {
             buf.push(row);
         } else {
@@ -10062,10 +10281,11 @@ fn siem_config() -> Option<&'static siem::SiemConfig> {
 
 /// Drain up to all buffered events for flushing.
 fn drain_events() -> Vec<sentinel_storage::WafEventRow> {
-    match waf_events().lock() {
-        Ok(mut buf) => std::mem::take(&mut *buf),
-        Err(_) => Vec::new(),
-    }
+    std::mem::take(
+        &mut *waf_events()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -10302,7 +10522,13 @@ fn log_sender() -> &'static std::sync::mpsc::SyncSender<LogRecord> {
         let (tx, rx) = std::sync::mpsc::sync_channel::<LogRecord>(65_536);
         std::thread::Builder::new()
             .name("sentinel-logwriter".into())
-            .spawn(move || log_writer_loop(rx))
+            .spawn(move || {
+                // Restarted on a panic, with the shared backoff: ending this
+                // thread would close the channel and drop every access/waf line
+                // for the rest of the process. A clean return means every
+                // sender is gone.
+                panic_guard::supervise_blocking("ndjson log writer", || log_writer_loop(&rx))
+            })
             .expect("spawn ndjson log writer");
         tx
     })
@@ -10405,7 +10631,7 @@ impl RotatingFile {
 
 /// The dedicated writer thread: resolve config once, then drain the channel,
 /// batching writes and flushing per batch.
-fn log_writer_loop(rx: std::sync::mpsc::Receiver<LogRecord>) {
+fn log_writer_loop(rx: &std::sync::mpsc::Receiver<LogRecord>) {
     let dir = resolve_log_dir();
     let _ = std::fs::create_dir_all(&dir);
     let max_bytes = std::env::var("SENTINEL_LOG_MAX_MB")
@@ -10958,11 +11184,7 @@ fn ndjson_log(ctx: &RequestContext) {
         // report can categorize them instead of collapsing them into "-"/"other".
         let (rule, attack): (&str, &str) = match top {
             Some(r) => (r.rule_id.as_str(), r.message.as_str()),
-            // A gateway failure is an availability event, not an attack. Given
-            // its own stable label so it is queryable without polluting the
-            // attack breakdown with "the origin is down".
-            None if ctx.gateway_error.is_some() => ("GATEWAY", "Upstream or routing failure"),
-            None => classify_nonrule_block(ctx.block_reason.as_deref().unwrap_or("")),
+            None => nonrule_label(ctx),
         };
 
         // Which part of the request tripped this, e.g. "ARGS:id". Available on
@@ -11058,6 +11280,22 @@ fn ndjson_log(ctx: &RequestContext) {
             "headers": headers,
         });
         enqueue_log("waf.log", waf.to_string());
+    }
+}
+
+/// The waf.log `(rule, attack)` pair for an event no rule decided.
+fn nonrule_label(ctx: &RequestContext) -> (&'static str, &'static str) {
+    if panic_guard::is_contained_panic(ctx) {
+        // Neither an attack nor an upstream failure: the origin may be fine,
+        // and may already have executed the request (`msg` says).
+        ("INTERNAL", "Internal processing failure")
+    } else if ctx.gateway_error.is_some() {
+        // A gateway failure is an availability event, not an attack. Given
+        // its own stable label so it is queryable without polluting the
+        // attack breakdown with "the origin is down".
+        ("GATEWAY", "Upstream or routing failure")
+    } else {
+        classify_nonrule_block(ctx.block_reason.as_deref().unwrap_or(""))
     }
 }
 
@@ -11893,6 +12131,39 @@ mod history_shed_tests {
             "no fingerprint must be stored as empty"
         );
         HISTORY_SINK_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// A poisoned buffer lock used to be skipped both ways: every event after
+    /// the panic was dropped without even counting as shed, and the flusher
+    /// drained nothing — blocks kept being enforced while the event store
+    /// recorded none of them.
+    #[test]
+    fn a_poisoned_event_buffer_still_records_and_drains() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        HISTORY_SINK_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = drain_events();
+        let _ = std::thread::spawn(|| {
+            let _held = waf_events().lock().unwrap();
+            panic!("poisoning the event buffer on purpose");
+        })
+        .join();
+        assert!(waf_events().is_poisoned(), "fixture must poison the lock");
+
+        let shed_before = history_shed_total();
+        record_event(&blocking_ctx());
+        let rows = drain_events();
+        // Restored before asserting: the other tests here lock it with unwrap().
+        waf_events().clear_poison();
+        HISTORY_SINK_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            rows.iter().any(|r| r.site == "shedtest"),
+            "a block after the panic must still be recorded"
+        );
+        assert_eq!(
+            history_shed_total(),
+            shed_before,
+            "and not be counted as shed"
+        );
     }
 
     #[test]
@@ -12887,8 +13158,9 @@ mod inline_rule_diag_tests {
 
     /// The diagnostics registry is process-global by design — it mirrors one
     /// node's live state. Cargo runs tests in threads, so without this they clear
-    /// each other's entries and fail intermittently. Serialise them.
-    static DIAG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// each other's entries and fail intermittently. Serialise them. The panic
+    /// tests take it too: every `ProxyServer` they start rebuilds the engines.
+    pub(crate) static DIAG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn guard() -> std::sync::MutexGuard<'static, ()> {
         DIAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
@@ -14278,6 +14550,8 @@ mod engine_warming_tests {
     /// accepts anything, so a fresh process must not 503 its first request.
     #[test]
     fn warming_flag_starts_clear() {
+        // A panic test sets the flag as config sync would; not while this runs.
+        let _serial = crate::panic_guard::testkit::proxy_state_lock();
         assert!(
             !ENGINES_WARMING.load(std::sync::atomic::Ordering::Acquire),
             "a freshly started proxy has already built its engines and must serve"

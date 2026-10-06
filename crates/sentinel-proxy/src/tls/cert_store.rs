@@ -1429,6 +1429,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A panic while the site-fallback map was locked must not end TLS. Every
+    /// handshake for a configured site reads it and the site sync writes it; the
+    /// fallback cache it replaced `expect`ed its lock, so one panic there failed
+    /// every later handshake on the listener.
+    #[test]
+    fn a_poisoned_fallback_map_keeps_serving() {
+        let dir = tmp_dir();
+        let store = CertStore::new(dir.clone());
+        let resolver = SentinelCertResolver::new(Arc::clone(&store));
+        let poisoner = Arc::clone(&store);
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.fallback.write().unwrap();
+            panic!("poisoning the fallback map on purpose");
+        })
+        .join();
+        assert!(store.fallback.is_poisoned(), "fixture must poison the lock");
+
+        // The sync still records the site and mints its cert...
+        let missing = store.set_site_names(names(&["after-poison.example"]));
+        assert_eq!(missing, vec!["after-poison.example".to_string()]);
+        assert_eq!(store.ensure_site_fallbacks(&missing).added, 1);
+        // ...and a handshake for it is served that cert, not the default one.
+        let served = leaf(
+            &resolver
+                .select(Some("after-poison.example"), false)
+                .unwrap(),
+        );
+        assert_ne!(served, leaf(&store.default_cert().unwrap()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// An unwritable store must still yield a working cert. Refusing TLS because
     /// a volume is read-only would be a worse failure than an inconsistent cert.
     #[test]

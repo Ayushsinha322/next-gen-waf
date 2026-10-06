@@ -2475,6 +2475,7 @@ dependencies = [
  "bytes",
  "chrono",
  "dashmap",
+ "futures",
  "h3",
  "h3-quinn",
  "hex",
@@ -2508,6 +2509,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "tracing",
+ "uuid",
  "webpki-roots 1.0.7",
 ]
 
