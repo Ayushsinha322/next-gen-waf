@@ -407,8 +407,9 @@ const (
 	maxSiteHeaders   = 1000
 )
 
-// Bounds for a site's inspection limits (max_inspected_args and friends). The
-// console has no fields for these yet, so there is nothing to keep in step.
+// Bounds for a site's inspection limits (max_inspected_args and friends). Keep
+// in step with LIMIT_CAPS in dashboard/lib/siteConfig.ts (the console's
+// siteLimits test compares them), as for the request limits above.
 const (
 	maxSiteInspectedArgs      = 100000
 	maxSiteInspectedArgBytes  = 16 * 1024 * 1024 // 16 MiB

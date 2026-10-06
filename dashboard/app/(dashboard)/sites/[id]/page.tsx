@@ -16,7 +16,7 @@ import { modeChangeConfirm, pauseConfirm, deleteConfirm } from "@/lib/siteConfir
 import { api, type Site, type Certificate, type SiteStat, type LearningStat, type EffectiveConfig } from "@/lib/api";
 import { staggerContainer, cardVariants, fadeUp } from "@/lib/animations";
 import SiteWizard from "@/components/sites/SiteWizard";
-import { siteToForm, emptyForm, type SiteForm, type PathOverride, CRS_REQUEST_CATEGORIES, ALL_CRS_RESPONSE_KEYS } from "@/lib/siteConfig";
+import { siteToForm, emptyForm, type SiteForm, type PathOverride, CRS_REQUEST_CATEGORIES, ALL_CRS_RESPONSE_KEYS, inspectionLimitOf } from "@/lib/siteConfig";
 
 type WafRow = { ts: string; ip: string; rule: string; attack: string; sev: string; action: string };
 type AccessRow = { ts: string; ip: string; method: string; path: string; status: number; latency: number };
@@ -457,6 +457,10 @@ export default function SiteDetailPage() {
                         {learn.map((r) => {
                           const excluded = excludedIds.has(r.rule_id);
                           const isBusy = learnBusy === Number(r.rule_id);
+                          // Not a rule: the request went past one of this
+                          // site's inspection limits. Excluding it would change
+                          // nothing (the API refuses it); raising the limit does.
+                          const limit = inspectionLimitOf(r.rule_id);
                           return (
                             <tr key={r.rule_id} style={excluded ? { opacity: 0.55 } : undefined}>
                               <td className="td3">{r.rule_id}</td>
@@ -473,7 +477,14 @@ export default function SiteDetailPage() {
                               </td>
                               <td className="td3">{timePart(r.last_seen)}</td>
                               <td style={{ textAlign: "right" }}>
-                                {excluded ? (
+                                {limit ? (
+                                  <span
+                                    title={`Not a rule: these requests went past this site's inspection limit ${limit.setting}, so they were not inspected in part. If they are legitimate, raise it (Edit site → Advanced → Inspection Limits); disabling cannot apply here.`}
+                                    style={{ fontSize: 13, color: "var(--text3)" }}
+                                  >
+                                    Raise {limit.label}
+                                  </span>
+                                ) : excluded ? (
                                   <button className="btn bg-btn btn-xs" disabled={isBusy} onClick={() => reEnableRule(r.rule_id)}>Re-enable</button>
                                 ) : (
                                   <button className="btn bc btn-xs" disabled={isBusy} onClick={() => disableRule(r.rule_id)}>Disable rule</button>
