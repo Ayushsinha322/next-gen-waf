@@ -445,7 +445,11 @@ export interface JobsResponse {
   jobs: JobStatus[];
   note: string;
   dataplane?: { reachable: boolean; error?: string; version?: string; uptime_secs?: number;
-    threat_intel?: { configured: boolean; poller: string; last_sync_status: number; version: number; entries: number; active: boolean; inert_reason?: string | null } };
+    /** `last_error`/`failing_since` (unix secs) are set while polls install nothing; poller then reads "failing". */
+    threat_intel?: { configured: boolean; poller: string; last_sync_status: number; version: number; entries: number; active: boolean; inert_reason?: string | null;
+      last_error?: string | null; failing_since?: number | null };
+    /** The node's own config-sync state; absent from data planes older than the field. */
+    config_sync?: { configured: boolean; version_applied: number; last_error?: string | null; failing_since?: number | null; rejected_site_count: number } | null };
 }
 
 /** An installed WASM plugin (module bytes are never sent to the browser). */
@@ -902,6 +906,8 @@ export interface DataPlaneNode {
   ebpf_drops?:             number;
   threat_intel_entries?:   number;
   threat_intel_version?:   number;
+  /** Why this node's IOC set is not being refreshed (failing or refused polls); empty when it is. */
+  threat_intel_problem?:   string;
   inline_rules?:           unknown;
 }
 

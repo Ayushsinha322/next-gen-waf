@@ -84,17 +84,26 @@ func handleListJobs(c *gin.Context, enf *rbac.Enforcer, cl *leader.Elector) {
 		r.Body.Close()
 		var h map[string]any
 		if json.Unmarshal(body, &h) == nil {
-			resp["dataplane"] = gin.H{
-				"reachable":    true,
-				"threat_intel": h["threat_intel"],
-				"uptime_secs":  h["uptime_secs"],
-				"version":      h["version"],
-			}
+			resp["dataplane"] = dataPlaneJobsView(h)
 		}
 	} else {
 		resp["dataplane"] = gin.H{"reachable": false, "error": err.Error()}
 	}
 	c.JSON(http.StatusOK, resp)
+}
+
+// dataPlaneJobsView picks the data plane's poller state out of its /healthz.
+// config_sync was not passed on, so the console drew config.sync as a fixed
+// green "running" badge whatever the node's polls were doing; it is null from a
+// data plane older than the field, and the console says "not reported".
+func dataPlaneJobsView(h map[string]any) gin.H {
+	return gin.H{
+		"reachable":    true,
+		"threat_intel": h["threat_intel"],
+		"config_sync":  h["config_sync"],
+		"uptime_secs":  h["uptime_secs"],
+		"version":      h["version"],
+	}
 }
 
 func handleRunJob(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.Hub, cl *leader.Elector) {

@@ -20,6 +20,11 @@ const rel = (iso?: string) => {
   const t = a < 60 ? `${Math.round(a)}s` : a < 3600 ? `${Math.round(a/60)}m` : a < 86400 ? `${Math.round(a/3600)}h` : `${Math.round(a/86400)}d`;
   return past ? `${t} ago` : `in ${t}`;
 };
+const relUnix = (secs?: number | null) => rel(secs ? new Date(secs * 1000).toISOString() : undefined);
+
+/** A poller's failure as one detail fragment: what went wrong and since when. */
+const failing = (err?: string | null, since?: number | null) =>
+  err ? `polls failing (first failed ${relUnix(since)}): ${err}` : "";
 
 export default function JobsPage() {
   const [data, setData] = useState<JobsResponse | null>(null);
@@ -45,6 +50,10 @@ export default function JobsPage() {
   }
 
   const ti = data?.dataplane?.threat_intel;
+  const cs = data?.dataplane?.config_sync;
+  // Green only for a poller that is working: a stale feed still has entries, so
+  // `active` alone painted a timing-out poller green.
+  const tiBadge = !ti ? "" : ti.poller === "running" && ti.active ? "bgg" : ti.poller === "failing" || ti.poller === "rejected" ? "br" : "ba";
 
   return (
     <motion.div className="sec" variants={staggerContainer} initial="hidden" animate="visible">
@@ -117,13 +126,22 @@ export default function JobsPage() {
               <tbody>
                 <tr>
                   <td><div style={{ fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--cyan)" }}>threat-intel.poll</div><div className="td3" style={{ fontSize: 12.5, whiteSpace: "normal", maxWidth: 420, lineHeight: 1.45 }}>Pull the indicator corpus from the control plane and swap it into the enforcement path.</div></td>
-                  <td>{ti ? <span className={`bdg ${ti.active ? "bgg" : "ba"}`}>{ti.poller}</span> : <span className="td3">—</span>}</td>
-                  <td className="td3" style={{ whiteSpace: "normal" }}>{ti ? `${ti.entries.toLocaleString()} indicators enforced · last sync HTTP ${ti.last_sync_status} · corpus version ${ti.version}${ti.inert_reason ? ` · ${ti.inert_reason}` : ""}` : "not reported"}</td>
+                  <td>{ti ? <span className={`bdg ${tiBadge}`}>{ti.poller}</span> : <span className="td3">—</span>}</td>
+                  <td className="td3" style={{ whiteSpace: "normal" }}>{ti ? `${ti.entries.toLocaleString()} indicators enforced · last sync HTTP ${ti.last_sync_status} · corpus version ${ti.version}${ti.last_error ? ` · ${failing(ti.last_error, ti.failing_since)}` : ti.inert_reason ? ` · ${ti.inert_reason}` : ""}` : "not reported"}</td>
                 </tr>
                 <tr>
                   <td><div style={{ fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--cyan)" }}>config.sync</div><div className="td3" style={{ fontSize: 12.5, whiteSpace: "normal", maxWidth: 420, lineHeight: 1.45 }}>Poll the control plane for site configuration and hot-reload the rule engines.</div></td>
-                  <td><span className="bdg bgg">running</span></td>
-                  <td className="td3" style={{ whiteSpace: "normal" }}>See each site&apos;s Effective Config tab for what this node holds.</td>
+                  <td>{!cs ? <span className="td3">—</span>
+                    : !cs.configured ? <span className="bdg ba">not configured</span>
+                    : cs.last_error ? <span className="bdg br">failing</span>
+                    : cs.rejected_site_count > 0 ? <span className="bdg ba">rejecting</span>
+                    : <span className="bdg bgg">running</span>}</td>
+                  <td className="td3" style={{ whiteSpace: "normal" }}>
+                    {!cs ? "not reported by this data plane · "
+                      : !cs.configured ? "no cluster.sync_url — this node serves only its local configuration · "
+                      : `${cs.version_applied ? `config version ${cs.version_applied} applied` : "no configuration applied yet"}${cs.last_error ? ` · ${failing(cs.last_error, cs.failing_since)}` : ""}${cs.rejected_site_count > 0 ? ` · ${cs.rejected_site_count} site${cs.rejected_site_count === 1 ? "" : "s"} rejected (named on the Cluster page)` : ""} · `}
+                    See each site&apos;s Effective Config tab for what this node holds.
+                  </td>
                 </tr>
               </tbody>
             </table>
