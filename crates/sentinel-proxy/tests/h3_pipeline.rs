@@ -45,7 +45,9 @@ const PII: &str = "customer ssn 123-45-6789 on file";
 
 /// An HTTP/1.1 origin. `/stream` answers `application/octet-stream` (a type
 /// nothing inspects) with a body whose frames the test sends through the
-/// channel handed out on `streams`; any other path answers [`PII`].
+/// channel handed out on `streams`. `/partial` answers `text/plain` (a type DLP
+/// reads), sends part of the body and then fails. Any other path answers
+/// [`PII`].
 async fn start_origin() -> (SocketAddr, mpsc::Receiver<mpsc::Sender<OriginFrame>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -58,15 +60,28 @@ async fn start_origin() -> (SocketAddr, mpsc::Receiver<mpsc::Sender<OriginFrame>
                     let streams_tx = streams_tx.clone();
                     async move {
                         let (tx, rx) = mpsc::channel(1);
-                        let ctype = if req.uri().path() == "/stream" {
-                            let _ = streams_tx.send(tx).await;
-                            "application/octet-stream"
-                        } else {
-                            tx.send(Ok(Frame::data(Bytes::from_static(PII.as_bytes()))))
-                                .await
-                                .unwrap();
-                            drop(tx);
-                            "text/plain"
+                        let ctype = match req.uri().path() {
+                            "/stream" => {
+                                let _ = streams_tx.send(tx).await;
+                                "application/octet-stream"
+                            }
+                            "/partial" => {
+                                // A body error makes hyper abort the chunked
+                                // response, so the proxy reads a truncated body.
+                                tokio::spawn(async move {
+                                    let part = Frame::data(Bytes::from_static(b"record 1 of 2\n"));
+                                    let _ = tx.send(Ok(part)).await;
+                                    let _ = tx.send(Err("origin died mid-body".into())).await;
+                                });
+                                "text/plain"
+                            }
+                            _ => {
+                                tx.send(Ok(Frame::data(Bytes::from_static(PII.as_bytes()))))
+                                    .await
+                                    .unwrap();
+                                drop(tx);
+                                "text/plain"
+                            }
                         };
                         Ok::<_, std::convert::Infallible>(
                             Response::builder()
@@ -374,6 +389,46 @@ async fn h3_client_receives_the_post_inspection_body() {
     assert!(
         body.contains("***-**-6789"),
         "expected the masked SSN: {body:?}"
+    );
+
+    drop(client);
+    proxy.stop().await;
+}
+
+/// An inspected response whose origin fails part-way through the body is a
+/// gateway error, never a clean response. `proxy` buffers what DLP reads, so it
+/// sees the failure before any head is sent. It used to forward the origin's
+/// head with an empty body: the h3 client got a complete, empty 200 and the
+/// access log recorded a clean 200 with no gateway error.
+#[tokio::test]
+async fn h3_inspected_response_cut_short_by_the_origin_is_a_502() {
+    let (origin, _streams) = start_origin().await;
+    let proxy = start_proxy(origin).await;
+
+    let mut client = h3_get(proxy.addr, "/partial").await;
+    let resp = timeout(Duration::from_secs(10), client.stream.recv_response())
+        .await
+        .expect("no response head")
+        .unwrap();
+    let mut body = Vec::new();
+    timeout(
+        Duration::from_secs(10),
+        read_to_end(&mut client.stream, &mut body),
+    )
+    .await
+    .expect("body never completed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_GATEWAY,
+        "a body the origin cut short reached the h3 client as a {} with {} bytes \
+         ({:?}), not as a gateway error",
+        resp.status(),
+        body.len(),
+        String::from_utf8_lossy(&body),
+    );
+    assert!(
+        !String::from_utf8_lossy(&body).contains("record 1 of 2"),
+        "the truncated origin body must not be relayed"
     );
 
     drop(client);

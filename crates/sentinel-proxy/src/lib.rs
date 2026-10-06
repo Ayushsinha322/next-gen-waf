@@ -4144,11 +4144,13 @@ async fn proxy_inner(
             // Box first so the body is `Unpin` for frame-by-frame reads; every
             // branch below boxes it anyway, so this costs nothing extra.
             match buffer_for_scan(resp_body.boxed(), RESPONSE_SCAN_CAP).await {
+                // The origin failed mid-body. This used to forward the head with
+                // an EMPTY body, which every client took as a complete, empty
+                // response, logged as a clean 200. No head has been sent yet, so
+                // fail the request: `proxy` answers a logged 502.
                 ScanBuffer::Error(e) => {
-                    warn!("response-body read error: {e}");
-                    http_body_util::Empty::<Bytes>::new()
-                        .map_err(|never: Infallible| match never {})
-                        .boxed()
+                    return Err(anyhow::Error::new(e)
+                        .context("reading origin response body for inspection"));
                 }
                 ScanBuffer::Oversize { prefix, rest } => {
                     // Too large to scan: replay what was already read, stream

@@ -307,9 +307,10 @@ where
 ///
 /// `body` is the response exactly as `run_pipeline` returned it, so it is
 /// already past response inspection: a body that DLP or response rules had to
-/// see was buffered and judged inside `proxy` and arrives here complete;
-/// anything else is the origin's own stream. Nothing here inspects, so nothing
-/// here needs to buffer.
+/// see was buffered and judged inside `proxy` and arrives here complete (an
+/// origin that fails while it is being buffered is answered there with a logged
+/// 502, since no head has been sent yet); anything else is the origin's own
+/// stream. Nothing here inspects, so nothing here needs to buffer.
 ///
 /// Accounting matches the TCP path because all of it happened before this
 /// point. The access-log line, `bytes_sent` and the request-duration histogram
