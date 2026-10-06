@@ -144,8 +144,9 @@ fn percent_decode(s: &str) -> String {
 /// The previous loop re-decoded the whole remainder of the value for every
 /// `%` (quadratic: minutes on a 1 MB body of `%41`), turned `%C3%A9` into
 /// `é` plus a stray U+FFFD, and pushed raw bytes as Latin-1 chars, so `é`
-/// became `Ã©` whenever the value also held a `%`. Values whose escapes decode
-/// to ASCII come out exactly as before.
+/// became `Ã©` whenever the value also held a `%`. An ASCII value whose `%XX`
+/// escapes are all below `%80` comes out exactly as before; non-ASCII text and
+/// high-byte escapes are what decode differently (correctly) now.
 fn url_decode_uni(s: &str) -> String {
     // Fast path: if no `%`, nothing to decode.
     if !s.contains('%') {
@@ -3195,35 +3196,36 @@ mod transform_tests {
         rx.recv_timeout(BOUND).is_ok()
     }
 
-    const ALL: [Transform; 23] = [
-        Transform::Lowercase,
-        Transform::UrlDecodeUni,
-        Transform::RemoveNulls,
-        Transform::ReplaceNulls,
-        Transform::HtmlEntityDecode,
-        Transform::RemoveWhitespace,
-        Transform::CompressWhitespace,
-        Transform::JsDecode,
-        Transform::CssDecode,
-        Transform::Base64Decode,
-        Transform::HexDecode,
-        Transform::NormalisePath,
-        Transform::NormalisePathWin,
-        Transform::Trim,
-        Transform::TrimLeft,
-        Transform::TrimRight,
-        Transform::Utf8ToUnicode,
-        Transform::RemoveCommentsChar,
-        Transform::RemoveComments,
-        Transform::ReplaceComments,
-        Transform::CmdLine,
-        Transform::EscapeSeqDecode,
-        Transform::Length,
-    ];
+    /// Every `Transform` variant, read off the type itself: asked for a
+    /// variant that does not exist, serde's error names all of them. A
+    /// hand-kept list compiled just as happily with a new variant left out,
+    /// and that variant then never ran here.
+    fn all_transforms() -> Vec<Transform> {
+        let err = serde_json::from_str::<Transform>("\"__\"")
+            .expect_err("`__` is not a transform")
+            .to_string();
+        let (_, listed) = err
+            .split_once("expected one of")
+            .unwrap_or_else(|| panic!("serde's error no longer lists the variants: {err}"));
+        // "`A`, `B`, … at line 1 column 4": every other piece is a name.
+        let all: Vec<Transform> = listed
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .map(|name| serde_json::from_str(&format!("\"{name}\"")).expect(name))
+            .collect();
+        // A message that parsed into a stub would pass every check below.
+        assert!(
+            all.len() >= 23,
+            "only {} transforms read from {err}",
+            all.len()
+        );
+        all
+    }
 
     /// Inputs that drive each transform down its escape / rescan path as often
     /// as 1 MB allows. The match is exhaustive on purpose: a new transform has
-    /// to name its own worst case (and be added to `ALL`).
+    /// to name its own worst case, and `all_transforms` makes sure it runs.
     fn worst_cases(t: &Transform) -> Vec<String> {
         match t {
             Transform::UrlDecodeUni => vec![
@@ -3273,7 +3275,7 @@ mod transform_tests {
     #[test]
     fn every_transform_is_linear_on_a_megabyte() {
         let mut slow = Vec::new();
-        for t in ALL {
+        for t in all_transforms() {
             for (case, input) in worst_cases(&t).into_iter().enumerate() {
                 let tr = t.clone();
                 if !finishes_in_time(move || drop(apply_single_transform(input, &tr))) {
@@ -3318,8 +3320,8 @@ mod transform_tests {
         );
     }
 
-    /// The pre-fix decoder, verbatim: the oracle for "values whose escapes
-    /// decode to ASCII come out exactly as before".
+    /// The pre-fix decoder, verbatim: the oracle for "an ASCII value whose
+    /// `%XX` escapes are all below `%80` comes out exactly as before".
     fn old_url_decode_uni(s: &str) -> String {
         if !s.contains('%') {
             return s.to_owned();
@@ -3405,9 +3407,11 @@ mod transform_tests {
     }
 
     #[test]
-    fn url_decode_uni_is_unchanged_where_escapes_decode_to_ascii() {
-        // Hex digits 0/4/7 keep every `%XX` below 0x80, where the old decoder
-        // was right; `u`/`U` reach the %uXXXX path, `%` the malformed ones.
+    fn url_decode_uni_is_unchanged_on_ascii_input_and_escapes() {
+        // ASCII input only, and hex digits 0/4/7 keep every `%XX` below 0x80,
+        // where the old decoder was right; `u`/`U` reach the %uXXXX path, `%`
+        // the malformed ones. Not ASCII input alone: `%C3%A9` is ASCII and the
+        // old decoder still gave `é` plus a stray U+FFFD.
         for s in all_strings(&['%', 'u', 'U', '0', '4', '7'], 7) {
             assert_eq!(url_decode_uni(&s), old_url_decode_uni(&s), "input {s:?}");
         }
