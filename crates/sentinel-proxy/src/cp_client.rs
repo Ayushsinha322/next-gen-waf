@@ -100,11 +100,40 @@ pub(crate) enum CallError {
 impl fmt::Display for CallError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CallError::Fetch(e) => write!(f, "fetch: {e}"),
-            CallError::Body(e) => write!(f, "body: {e}"),
+            CallError::Fetch(e) => {
+                f.write_str("fetch: ")?;
+                write_chain(f, e)
+            }
+            CallError::Body(e) => {
+                f.write_str("body: ")?;
+                write_chain(f, e)
+            }
             CallError::Timeout(d) => write!(f, "timeout: no complete response within {d:?}"),
         }
     }
+}
+
+/// `e` and every cause beneath it, joined with ": ".
+///
+/// hyper-util's own message is only the error kind, so a refused connection, a
+/// failed DNS lookup and the connect timeout all read `client error (Connect)`;
+/// what actually happened is one or two causes down. No layer of this chain
+/// carries the peer's address (hyper-util keeps that to `Debug`), so the text is
+/// fit for `/healthz`.
+fn write_chain(f: &mut fmt::Formatter<'_>, e: &(dyn std::error::Error + 'static)) -> fmt::Result {
+    let mut last = e.to_string();
+    f.write_str(&last)?;
+    let mut cause = e.source();
+    while let Some(c) = cause {
+        let msg = c.to_string();
+        // A layer that already prints its cause would otherwise say it twice.
+        if !last.contains(&msg) {
+            write!(f, ": {msg}")?;
+        }
+        last = msg;
+        cause = c.source();
+    }
+    Ok(())
 }
 
 /// Send `req` and read the whole response body, all within `deadline`.
@@ -332,6 +361,45 @@ mod tests {
             other => panic!("expected a connect failure, got {other}"),
         }
         assert!(took < Duration::from_secs(2), "connect took {took:?}");
+    }
+
+    /// The recorded error has to say WHICH connect failure it was. hyper-util's
+    /// message is `client error (Connect)` for all of them, so a black-holed
+    /// control plane (the connect timeout) read exactly like one that is down.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_connect_timeout_reads_differently_from_a_refused_connect() {
+        let (black_holed, _listener, _fill) = stub::unconnectable();
+        let client = client_with_connect_timeout::<Empty>(Duration::from_millis(200));
+        let timed_out = call_or_hang(&client, black_holed, Duration::from_secs(4))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        // A port nothing listens on: bound, then released.
+        let down = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let refused = call_or_hang(&client, down, Duration::from_secs(4))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            timed_out.starts_with("fetch: client error (Connect): tcp connect error: "),
+            "{timed_out}"
+        );
+        assert!(timed_out.contains("deadline has elapsed"), "{timed_out}");
+        assert!(
+            refused.to_lowercase().contains("connection refused"),
+            "{refused}"
+        );
+        assert_ne!(timed_out, refused);
+        // Both reach the public /healthz, so neither may name the peer.
+        for msg in [&timed_out, &refused] {
+            assert!(!msg.contains("127.0.0.1"), "{msg}");
+        }
     }
 
     /// An answering control plane is unaffected: status and whole body.

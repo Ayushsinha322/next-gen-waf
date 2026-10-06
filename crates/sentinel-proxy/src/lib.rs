@@ -756,6 +756,19 @@ async fn fetch_config_sync(
         .body(http_body_util::Empty::new())
         .expect("BUG: building config-sync request");
     match cp_client::call(client, req, deadline).await {
+        // Judge the status before the body is parsed, or a refusal is recorded
+        // as the JSON error its error body produces ("parse: expected value").
+        Ok((status, bytes)) if !status.is_success() => {
+            warn!(
+                status = %status,
+                snippet = %String::from_utf8_lossy(&bytes).chars().take(120).collect::<String>(),
+                "config sync REFUSED by the control plane — this node keeps its current \
+                 config. 403 means SENTINEL_INTERNAL_SECRET does not match; 503 means the \
+                 control plane has no database"
+            );
+            note_config_sync_failure(format!("refused: HTTP {status}"));
+            None
+        }
         Ok((_, bytes)) => Some(bytes),
         Err(e) => {
             warn!("config sync {e}");
@@ -763,6 +776,22 @@ async fn fetch_config_sync(
             None
         }
     }
+}
+
+/// Config-sync state for `/healthz`, which is served on every listener: the
+/// heartbeat carries the full record, but when the control plane has stopped
+/// answering the heartbeat goes unanswered too, and this is then the only place
+/// the node says it is going stale. Rejected sites are given as a count, since
+/// their ids and errors name tenant sites.
+fn config_sync_health(cfg: &SentinelConfig) -> serde_json::Value {
+    let s = config_sync_status();
+    serde_json::json!({
+        "configured": cfg.cluster.sync_url.is_some(),
+        "version_applied": CONFIG_VERSION_APPLIED.load(std::sync::atomic::Ordering::Relaxed),
+        "last_error": s.last_error,
+        "failing_since": s.failing_since,
+        "rejected_site_count": s.rejected_sites.len(),
+    })
 }
 
 /// Parse each site of a sync on its own, so one bad site costs only itself.
@@ -1643,6 +1672,17 @@ impl ProxyServer {
                         continue;
                     };
                     let bytes = match cp_client::call(&client, req, list_deadline).await {
+                        // A refusal used to surface only as the JSON error its
+                        // error body produced ("plugin sync parse: ...").
+                        Ok((status, _)) if !status.is_success() => {
+                            warn!(
+                                status = %status,
+                                "plugin sync REFUSED by the control plane — keeping the \
+                                 plugins already loaded. 403 means SENTINEL_INTERNAL_SECRET \
+                                 does not match"
+                            );
+                            continue;
+                        }
                         Ok((_, b)) => b,
                         Err(e) => {
                             // Control plane unreachable or silent — keep serving
@@ -1856,18 +1896,8 @@ impl ProxyServer {
                         );
                         continue;
                     }
-                    let sync: ThreatIntelSyncResponse = match serde_json::from_slice(&bytes) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            warn!(
-                                "threat-intel sync parse: {e} — snippet: {}",
-                                String::from_utf8_lossy(&bytes)
-                                    .chars()
-                                    .take(120)
-                                    .collect::<String>()
-                            );
-                            continue;
-                        }
+                    let Some(sync) = parse_threat_intel_sync(&bytes) else {
+                        continue;
                     };
                     if sync.version != last_version {
                         // Mirror block-tier IPs/CIDRs into the eBPF/XDP blocklist
@@ -2091,6 +2121,8 @@ impl ProxyServer {
                             "ebpf_drops": hb_ebpf.ebpf_drops(),
                             "threat_intel_entries": hb_modules.threat_intel.load().entry_count(),
                             "threat_intel_version": hb_modules.threat_intel.load().version(),
+                            // Whether those entries are still being refreshed.
+                            "threat_intel_sync": ti_sync_heartbeat(),
                             // Ground truth for which operator-authored rules are
                             // actually compiled and running on THIS node. The
                             // control plane cannot derive this — it has no SRL
@@ -5536,15 +5568,22 @@ static CONFIG_VERSION_APPLIED: std::sync::atomic::AtomicU64 = std::sync::atomic:
 /// frozen — which previously produced no log line at all, because the status was
 /// never inspected before the body was parsed.
 static TI_LAST_STATUS: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
-/// Why the most recent sync attempt got no complete response (connect failure,
-/// a body cut short, a control plane that never answered) and since when, as
-/// `(error, unix secs)`; cleared by the next attempt that gets one.
-/// `TI_LAST_STATUS` only ever holds a status that ARRIVED, so without this a
-/// poller failing every minute kept reporting its last 200 as "running".
+/// Why recent sync attempts produced no usable response (connect failure, a body
+/// cut short, a control plane that never answered, a 2xx body that does not
+/// parse) and since when, as `(error, unix secs)`; cleared by the next attempt
+/// that installs a corpus, or that is refused (a refusal has its own record in
+/// `TI_LAST_STATUS`). That status alone said "running" for a poller whose every
+/// poll timed out or installed nothing.
 static TI_SYNC_FAILURE: std::sync::Mutex<Option<(String, u64)>> = std::sync::Mutex::new(None);
 
 fn ti_sync_failure() -> Option<(String, u64)> {
     TI_SYNC_FAILURE.lock().ok().and_then(|g| g.clone())
+}
+
+fn clear_ti_sync_failure() {
+    if let Ok(mut g) = TI_SYNC_FAILURE.lock() {
+        *g = None;
+    }
 }
 
 fn note_ti_sync_failure(error: String) {
@@ -5560,7 +5599,8 @@ fn note_ti_sync_failure(error: String) {
 }
 
 /// One threat-intel fetch: the status and body, or None once the reason no
-/// response arrived has been recorded for `/healthz`.
+/// response arrived has been recorded for `/healthz`. A 2xx still has to parse
+/// before it counts; see [`parse_threat_intel_sync`].
 async fn fetch_threat_intel(
     client: &cp_client::CpClient<http_body_util::Empty<Bytes>>,
     sync_url: &str,
@@ -5586,8 +5626,12 @@ async fn fetch_threat_intel(
         Ok((status, bytes)) => {
             let status = status.as_u16();
             TI_LAST_STATUS.store(status, std::sync::atomic::Ordering::Relaxed);
-            if let Ok(mut g) = TI_SYNC_FAILURE.lock() {
-                *g = None;
+            // A refusal is reported through the status ("rejected"); an older
+            // failure left in place would mask it as "failing". A 2xx is not
+            // cleared here: until it parses, the poll has installed nothing, and
+            // clearing now would restart `failing_since` on every bad poll.
+            if !(200..300).contains(&status) {
+                clear_ti_sync_failure();
             }
             Some((status, bytes))
         }
@@ -5597,6 +5641,50 @@ async fn fetch_threat_intel(
             None
         }
     }
+}
+
+/// Parse a 2xx threat-intel body. A body that does not parse is recorded like a
+/// poll that got no answer: it installs nothing either, and before it was
+/// recorded `/healthz` said "running" while every poll did nothing.
+fn parse_threat_intel_sync(bytes: &[u8]) -> Option<ThreatIntelSyncResponse> {
+    match serde_json::from_slice(bytes) {
+        Ok(sync) => {
+            clear_ti_sync_failure();
+            Some(sync)
+        }
+        Err(e) => {
+            warn!(
+                "threat-intel sync parse: {e} — snippet: {}",
+                String::from_utf8_lossy(bytes)
+                    .chars()
+                    .take(120)
+                    .collect::<String>()
+            );
+            note_ti_sync_failure(format!("parse: {e}"));
+            None
+        }
+    }
+}
+
+/// Threat-intel sync state for the heartbeat, so the cluster page shows a node
+/// whose IOC set has stopped updating without anyone querying that node's
+/// `/healthz`. The heartbeat runs only with a sync URL, so the poller is
+/// configured by definition.
+fn ti_sync_heartbeat() -> serde_json::Value {
+    use std::sync::atomic::Ordering;
+    let last_status = TI_LAST_STATUS.load(Ordering::Relaxed);
+    let failure = ti_sync_failure();
+    serde_json::json!({
+        "poller": ti_poller_state(
+            true,
+            TI_POLLER_STARTED.load(Ordering::Relaxed),
+            last_status,
+            failure.is_some(),
+        ),
+        "last_sync_status": last_status,
+        "last_error": failure.as_ref().map(|(e, _)| e.clone()),
+        "failing_since": failure.as_ref().map(|(_, s)| *s),
+    })
 }
 
 /// What the poller should do with a completed fetch, extracted so it can be
@@ -5652,8 +5740,9 @@ fn threat_intel_status(cfg: &SentinelConfig, feed: &ThreatFeed) -> serde_json::V
         "configured": configured,
         "poller": poller,
         "last_sync_status": last_status,
-        // Set while polls are getting no response at all; `failing_since` is
-        // how long the IOC set below has been going stale.
+        // Set while polls install nothing (no answer, or a body that does not
+        // parse); `failing_since` is how long the IOC set below has been going
+        // stale.
         "last_error": failure.as_ref().map(|(e, _)| e.clone()),
         "failing_since": failure.as_ref().map(|(_, s)| *s),
         "version": feed.version(),
@@ -5669,7 +5758,7 @@ fn threat_intel_status(cfg: &SentinelConfig, feed: &ThreatFeed) -> serde_json::V
                 "control plane refused the sync with HTTP {last_status} (403 = SENTINEL_INTERNAL_SECRET mismatch)"
             ))
         } else if let Some((e, _)) = failure.as_ref().filter(|_| poller == "failing") {
-            serde_json::json!(format!("the control plane did not answer the sync ({e})"))
+            serde_json::json!(format!("no usable threat-intel sync ({e})"))
         } else {
             serde_json::json!("the control-plane corpus returned no active indicators")
         },
@@ -8548,6 +8637,10 @@ async fn health_response(state: &ServerState) -> Response<BoxBody> {
             &state.config.load(),
             &state.modules.threat_intel.load(),
         ),
+        // Is this node still taking config? Failing polls (a control plane that
+        // refuses, or never answers, the sync) showed only in WARN lines and in
+        // the heartbeat, which a silent control plane never receives.
+        "config_sync": config_sync_health(&cfg),
         // Module reachability. Seven subsystems had no logging at all, and their
         // entry points are per-request pure functions on attacker-controlled
         // input, so they cannot be given log lines. These counters answer the one
@@ -14100,6 +14193,17 @@ mod cp_poll_deadline_tests {
             // Stale since the FIRST failure, not the latest one.
             first_failure = first_failure.or(status.failing_since);
             assert_eq!(status.failing_since, first_failure);
+
+            // And on the node's own /healthz: the heartbeat that also carries
+            // it goes to the same silent control plane and times out too.
+            let h = config_sync_health(&SentinelConfig::default());
+            assert!(
+                h["last_error"]
+                    .as_str()
+                    .is_some_and(|e| e.starts_with("timeout:")),
+                "/healthz must carry the failure, got {h}"
+            );
+            assert_eq!(h["failing_since"].as_u64(), first_failure);
         }
 
         let got = tokio::time::timeout(HUNG, fetch_config_sync(&client, &url, None, DEADLINE))
@@ -14134,6 +14238,15 @@ mod cp_poll_deadline_tests {
             "/healthz must carry the failure, got {s}"
         );
 
+        let hb = ti_sync_heartbeat();
+        assert!(
+            hb["last_error"]
+                .as_str()
+                .is_some_and(|e| e.starts_with("timeout:")),
+            "the heartbeat must carry the failure, got {hb}"
+        );
+        assert!(hb["failing_since"].is_u64(), "{hb}");
+
         let (status, bytes) =
             tokio::time::timeout(HUNG, fetch_threat_intel(&client, &url, None, DEADLINE))
                 .await
@@ -14141,10 +14254,79 @@ mod cp_poll_deadline_tests {
                 .expect("the recovered control plane's answer");
         assert_eq!(status, 200);
         assert_eq!(&bytes[..], body.as_bytes());
+        assert!(parse_threat_intel_sync(&bytes).is_some());
         assert!(
             ti_sync_failure().is_none(),
-            "a poll that got an answer must clear the failure"
+            "a poll that installed a corpus must clear the failure"
         );
+    }
+
+    /// A refusal is a failed poll, recorded as one. The status was thrown away,
+    /// so a 403 went on to the parser and was recorded as the JSON error its
+    /// error body produced ("parse: expected value at line 1 column 1").
+    #[tokio::test]
+    async fn a_refused_config_sync_is_recorded_as_a_refusal() {
+        let _serial = SERIAL.lock().await;
+        note_config_sync_ok();
+        let addr = stub::answering_after(0, 403, r#"{"error":"forbidden"}"#).await;
+        let url = format!("http://{addr}");
+        let client = cp_client::client::<Empty>();
+
+        let got = tokio::time::timeout(HUNG, fetch_config_sync(&client, &url, None, DEADLINE))
+            .await
+            .expect("config-sync tick never returned");
+        assert!(got.is_none(), "a refusal must not reach the parser");
+        let err = config_sync_status()
+            .last_error
+            .expect("a refused poll must be recorded");
+        assert_eq!(err, "refused: HTTP 403 Forbidden");
+        note_config_sync_ok();
+    }
+
+    /// A 200 whose body does not parse installs nothing, the same as no answer,
+    /// and has to be recorded as such: it cleared the failure instead, so the
+    /// poller read "running" while every poll did nothing. `failing_since` must
+    /// also survive it, not restart with each bad poll.
+    #[tokio::test]
+    async fn a_threat_intel_body_that_does_not_parse_keeps_the_poller_failing() {
+        let _serial = SERIAL.lock().await;
+        let garbage = stub::answering_after(0, 200, "<html>gateway</html>").await;
+        let refusing = stub::answering_after(0, 403, r#"{"error":"forbidden"}"#).await;
+        let client = cp_client::client::<Empty>();
+        // A poll that timed out long ago, still unresolved.
+        if let Ok(mut g) = TI_SYNC_FAILURE.lock() {
+            *g = Some(("timeout: earlier".into(), 1_000));
+        }
+
+        for tick in 0..2 {
+            let (status, bytes) = tokio::time::timeout(
+                HUNG,
+                fetch_threat_intel(&client, &format!("http://{garbage}"), None, DEADLINE),
+            )
+            .await
+            .expect("threat-intel tick never returned")
+            .expect("the control plane answered");
+            assert_eq!(status, 200);
+            assert!(parse_threat_intel_sync(&bytes).is_none());
+            let (err, since) = ti_sync_failure()
+                .unwrap_or_else(|| panic!("tick {tick}: an unparseable 200 must be recorded"));
+            assert!(err.starts_with("parse: "), "tick {tick}: {err}");
+            assert_eq!(since, 1_000, "tick {tick}: failing_since restarted");
+            assert_eq!(ti_poller_state(true, true, status, true), "failing");
+        }
+
+        // A refusal clears it: "rejected" is the truer label, and a leftover
+        // failure would read "failing" over it.
+        let (status, _) = tokio::time::timeout(
+            HUNG,
+            fetch_threat_intel(&client, &format!("http://{refusing}"), None, DEADLINE),
+        )
+        .await
+        .expect("threat-intel tick never returned")
+        .expect("the control plane answered");
+        assert_eq!(status, 403);
+        assert!(ti_sync_failure().is_none());
+        assert_eq!(ti_poller_state(true, true, status, false), "rejected");
     }
 
     /// `failing` outranks the last status that arrived, which may be hours old.
