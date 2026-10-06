@@ -54,7 +54,6 @@ use http::{header, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Body;
 use hyper::body::Incoming;
-use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use rustls::ServerConfig;
 use sentinel_core::{
