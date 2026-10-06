@@ -2532,6 +2532,7 @@ dependencies = [
  "regex",
  "sentinel-core",
  "sentinel-modules",
+ "sentinel-telemetry",
  "serde",
  "serde_json",
  "tempfile",

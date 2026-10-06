@@ -1150,6 +1150,10 @@ func handleAddSiteExclusion(c *gin.Context, enf *rbac.Enforcer, store *db.Store,
 		c.JSON(http.StatusBadRequest, gin.H{"error": "rule_id is required"})
 		return
 	}
+	if msg := inspectionLimitExclusionProblem(body.RuleID); msg != "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": msg})
+		return
+	}
 	// Default to disabling the whole rule when no targets are given — the most
 	// common learning-report action for a confirmed false positive.
 	if len(body.ExcludeTargets) == 0 {
@@ -1966,6 +1970,7 @@ var knownWafPolicyKeys = map[string]struct{}{
 	"rule_categories": {}, "rule_exclusions": {}, "path_overrides": {},
 	"crs_policy":    {},
 	"max_body_size": {}, "max_uri_length": {}, "max_header_count": {},
+	"max_inspected_args": {}, "max_inspected_arg_bytes": {}, "inspection_time_budget_ms": {},
 	"allowed_methods": {}, "api_discovery": {}, "security_headers": {},
 	"rate_limit": {}, "anti_ddos": {}, "bot_detection": {}, "geoip": {},
 	"ip_reputation": {}, "ml": {}, "jwt": {}, "graphql": {}, "grpc": {},
@@ -2051,6 +2056,12 @@ func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
 		MaxHeaderCount   *uint32         `json:"max_header_count"`
 		APIDiscovery     bool            `json:"api_discovery"`
 		AllowedMethods   []string        `json:"allowed_methods"`
+		// Inspection limits: what inspecting one request may cost the rule
+		// engine. Pointers because absent means the data plane's defaults,
+		// while 0 is a legal value meaning "no limit".
+		MaxInspectedArgs       *uint32 `json:"max_inspected_args"`
+		MaxInspectedArgBytes   *uint64 `json:"max_inspected_arg_bytes"`
+		InspectionTimeBudgetMs *uint32 `json:"inspection_time_budget_ms"`
 		// CRS policy lists (tx.*) the rule engine gates on. Empty by default:
 		// upstream CRS ships every one of these commented out, so they are
 		// opt-in policy rather than a default. See seed_crs_policy in the proxy.
@@ -2212,6 +2223,15 @@ func buildRustWaf(raw json.RawMessage) (map[string]any, error) {
 	}
 	if p.MaxHeaderCount != nil {
 		waf["max_header_count"] = *p.MaxHeaderCount
+	}
+	if p.MaxInspectedArgs != nil {
+		waf["max_inspected_args"] = *p.MaxInspectedArgs
+	}
+	if p.MaxInspectedArgBytes != nil {
+		waf["max_inspected_arg_bytes"] = *p.MaxInspectedArgBytes
+	}
+	if p.InspectionTimeBudgetMs != nil {
+		waf["inspection_time_budget_ms"] = *p.InspectionTimeBudgetMs
 	}
 
 	// Method allow-list and response/security headers — pass through so the

@@ -4,8 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# `test_hooks`: lets another crate's tests run an inspection time budget out
+# without a slow request. Enabled only from dev-dependencies, so a release
+# build never has it.
+test-hooks = []
+
 [dependencies]
 sentinel-core = { path = "../sentinel-core" }
+# Counts requests refused for an inspection limit, by reason.
+sentinel-telemetry = { path = "../sentinel-telemetry" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }

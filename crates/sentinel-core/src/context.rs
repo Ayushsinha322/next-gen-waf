@@ -109,6 +109,76 @@ impl Severity {
 }
 
 // ---------------------------------------------------------------------------
+// Inspection limits
+// ---------------------------------------------------------------------------
+
+/// The bounds a site puts on what inspecting one request may cost the rule
+/// engine; 0 means no bound. Stamped from the site's policy at routing (see
+/// `WafConfig::inspection_limits`). A context nothing stamped is unbounded,
+/// which is what callers outside the proxy — tools, tests — get.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InspectionLimits {
+    /// Most arguments: query-string, body and multipart parameters together.
+    pub max_args: u32,
+    /// Most bytes of argument names and values, as the parsers decode them.
+    pub max_arg_bytes: u64,
+    /// Longest one `evaluate` call — one phase — may run, in milliseconds.
+    pub time_budget_ms: u32,
+}
+
+/// An inspection limit a request went past.
+///
+/// The rule engine records it as a built-in CRITICAL match under an id of its
+/// own in the product's custom range, so events, rule facets and the learning
+/// report keep the three apart, and a request refused for it reads as what it
+/// is rather than as an attack or an anomaly score.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InspectionLimit {
+    /// More arguments than `max_args`.
+    Args,
+    /// More argument bytes than `max_arg_bytes`.
+    ArgBytes,
+    /// Evaluation ran past `time_budget_ms`.
+    Time,
+}
+
+impl InspectionLimit {
+    pub const ALL: [InspectionLimit; 3] = [Self::Args, Self::ArgBytes, Self::Time];
+
+    /// The built-in rule id it is recorded under.
+    pub const fn rule_id(self) -> &'static str {
+        match self {
+            Self::Args => "9900401",
+            Self::ArgBytes => "9900402",
+            Self::Time => "9900403",
+        }
+    }
+
+    /// The `reason` label it is counted under in `/metrics`.
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::Args => "args",
+            Self::ArgBytes => "arg_bytes",
+            Self::Time => "time",
+        }
+    }
+
+    /// The site policy key that sets it.
+    pub const fn setting(self) -> &'static str {
+        match self {
+            Self::Args => "max_inspected_args",
+            Self::ArgBytes => "max_inspected_arg_bytes",
+            Self::Time => "inspection_time_budget_ms",
+        }
+    }
+
+    /// The limit a built-in rule id records, if it is one.
+    pub fn of_rule(rule_id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|l| l.rule_id() == rule_id)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Request context — lives for the duration of a single request
 // ---------------------------------------------------------------------------
 
@@ -170,6 +240,10 @@ pub struct RequestContext {
     /// means "no site matched, or the site customised nothing" and renders the
     /// built-in default page.
     pub block_page: Option<crate::config::BlockPageConfig>,
+    /// The matched site's inspection limits, stamped at routing time. The rule
+    /// engine reads them here because a WebSocket message and the logger's
+    /// match locator parse the same arguments with no site config in scope.
+    pub inspection_limits: InspectionLimits,
     /// Whether the client asked for HTML, decided once at Phase 0.
     ///
     /// Stamped this early because the connection-layer rejections (anti-DDoS, IP
@@ -283,6 +357,7 @@ impl RequestContext {
             anomaly_threshold: None,
             path_override: None,
             block_page: None,
+            inspection_limits: InspectionLimits::default(),
             client_accepts_html: false,
             phase: Phase::Connection,
             anomaly_score: 0,
@@ -380,18 +455,27 @@ impl RequestContext {
     /// names a response rule even when a sub-threshold request rule matched
     /// too — the operator would otherwise exclude a rule that did not decide
     /// anything. A DLP verdict has no rule. With no verdict, the worst overall.
+    ///
+    /// A request the rule engine refused to finish inspecting (an
+    /// [`InspectionLimit`]) was decided by that refusal, which sets the verdict
+    /// itself: a rule that only added score, however severe, did not decide it,
+    /// and excluding that rule would change nothing.
     pub fn deciding_rule_match(&self) -> Option<&RuleMatch> {
         let in_response =
             |m: &&RuleMatch| matches!(m.phase, Phase::ResponseHeaders | Phase::ResponseBody);
+        let refusal = || {
+            self.rule_matches
+                .iter()
+                .find(|m| !in_response(m) && InspectionLimit::of_rule(&m.rule_id).is_some())
+        };
         match self.verdict_source {
             Some(VerdictSource::Response) => {
                 worst_match(self.rule_matches.iter().filter(in_response))
             }
-            Some(VerdictSource::Request) => {
-                worst_match(self.rule_matches.iter().filter(|m| !in_response(m)))
-            }
+            Some(VerdictSource::Request) => refusal()
+                .or_else(|| worst_match(self.rule_matches.iter().filter(|m| !in_response(m)))),
             Some(VerdictSource::Dlp) => None,
-            None => self.primary_rule_match(),
+            None => refusal().or_else(|| self.primary_rule_match()),
         }
     }
 }
@@ -447,6 +531,53 @@ mod tests {
         ctx.rule_matches.remove(0);
         ctx.verdict_source = Some(VerdictSource::Request);
         assert!(ctx.deciding_rule_match().is_none());
+    }
+
+    /// A request the rule engine refused to finish inspecting was decided by
+    /// the refusal, which adds no score: a CRITICAL rule that matched first and
+    /// scored must not be named instead, or the operator is told to exclude a
+    /// rule that changes nothing.
+    #[test]
+    fn an_inspection_refusal_is_the_deciding_match() {
+        let mut ctx = RequestContext::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+        let mut refusal = m(InspectionLimit::Args.rule_id(), Severity::Critical, 0);
+        refusal.phase = Phase::RequestBody;
+        ctx.rule_matches = vec![m("942100", Severity::Critical, 5), refusal];
+        for source in [None, Some(VerdictSource::Request)] {
+            ctx.verdict_source = source;
+            assert_eq!(
+                ctx.deciding_rule_match().unwrap().rule_id,
+                InspectionLimit::Args.rule_id(),
+                "{source:?}"
+            );
+        }
+        // A response verdict is still explained by the response.
+        let mut resp = m("951220", Severity::Critical, 5);
+        resp.phase = Phase::ResponseBody;
+        ctx.rule_matches.push(resp);
+        ctx.verdict_source = Some(VerdictSource::Response);
+        assert_eq!(ctx.deciding_rule_match().unwrap().rule_id, "951220");
+        // Without a refusal, nothing changes.
+        ctx.rule_matches.remove(1);
+        ctx.verdict_source = Some(VerdictSource::Request);
+        assert_eq!(ctx.deciding_rule_match().unwrap().rule_id, "942100");
+    }
+
+    /// Each limit has its own id in the custom range, and every lookup is the
+    /// inverse of the other.
+    #[test]
+    fn inspection_limits_have_distinct_built_in_rule_ids() {
+        let ids: Vec<&str> = InspectionLimit::ALL.iter().map(|l| l.rule_id()).collect();
+        assert_eq!(ids, ["9900401", "9900402", "9900403"]);
+        for l in InspectionLimit::ALL {
+            assert_eq!(InspectionLimit::of_rule(l.rule_id()), Some(l));
+        }
+        assert_eq!(InspectionLimit::of_rule("942100"), None);
+        assert_eq!(
+            InspectionLimits::default().max_args,
+            0,
+            "unstamped = unbounded"
+        );
     }
 
     /// Build a match with just the fields the selection looks at.

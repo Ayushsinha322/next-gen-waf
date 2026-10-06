@@ -72,6 +72,9 @@ sentinel-telemetry = { path = "../sentinel-telemetry" }
 sentinel-ebpf = { path = "../sentinel-ebpf" }
 
 [dev-dependencies]
+# The rule engine's test hook, to run an inspection time budget out without a
+# slow request; dev-only, so a release build has none of it.
+sentinel-rules = { path = "../sentinel-rules", features = ["test-hooks"] }
 anyhow = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 hyper = { workspace = true, features = ["client", "http1", "server"] }

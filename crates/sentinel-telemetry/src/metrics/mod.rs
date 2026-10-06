@@ -1013,9 +1013,61 @@ pub fn inc_ebpf_drops() {
     WAF_METRICS.ebpf_drops_total.inc();
 }
 
+// ---- Inspection limits -------------------------------------------------------
+
+/// The reasons a request can go past a site's inspection limits — the
+/// `InspectionLimit::reason` values in sentinel-core, which a test there keeps
+/// in step with this list. Listed rather than registered on first use so every
+/// series is scraped from the start, at 0: an alert on the rate of a series
+/// that only appears with its first event misses that event.
+const INSPECTION_LIMIT_REASONS: [&str; 3] = ["args", "arg_bytes", "time"];
+
+static INSPECTION_LIMIT_EXCEEDED: [AtomicU64; INSPECTION_LIMIT_REASONS.len()] =
+    [const { AtomicU64::new(0) }; INSPECTION_LIMIT_REASONS.len()];
+
+/// The `reason` labels `sentinel_inspection_limit_exceeded_total` carries.
+pub fn inspection_limit_reasons() -> &'static [&'static str] {
+    &INSPECTION_LIMIT_REASONS
+}
+
+/// One request that inspecting would have taken past a site's inspection
+/// limit, so the rule engine refused it (a logged would-block in learning
+/// mode). An unknown `reason` is not counted: the list above is the contract.
+pub fn note_inspection_limit_exceeded(reason: &str) {
+    if let Some(i) = INSPECTION_LIMIT_REASONS.iter().position(|r| *r == reason) {
+        INSPECTION_LIMIT_EXCEEDED[i].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Requests counted under `reason` so far; 0 for an unknown one.
+pub fn inspection_limit_exceeded_total(reason: &str) -> u64 {
+    INSPECTION_LIMIT_REASONS
+        .iter()
+        .position(|r| *r == reason)
+        .map_or(0, |i| INSPECTION_LIMIT_EXCEEDED[i].load(Ordering::Relaxed))
+}
+
+/// The family in exposition format: one HELP and TYPE, then a series per
+/// reason. Rendered here rather than through the registry, whose lines carry
+/// no labels for a counter.
+fn inspection_limit_text() -> String {
+    let mut out = String::from(
+        "# HELP sentinel_inspection_limit_exceeded_total Requests refused (or, in learning mode, \
+         recorded as would-block) because inspecting them would pass a site's inspection limit\n\
+         # TYPE sentinel_inspection_limit_exceeded_total counter\n",
+    );
+    for reason in INSPECTION_LIMIT_REASONS {
+        out.push_str(&format!(
+            "sentinel_inspection_limit_exceeded_total{{reason=\"{reason}\"}} {}\n",
+            inspection_limit_exceeded_total(reason)
+        ));
+    }
+    out
+}
+
 /// Render the global WAF metrics in Prometheus text exposition format.
 pub fn prometheus_text() -> String {
-    WAF_METRICS.registry.prometheus_text()
+    WAF_METRICS.registry.prometheus_text() + &inspection_limit_text()
 }
 
 /// Return a snapshot of all global WAF metrics.
@@ -1127,6 +1179,35 @@ mod tests {
         assert!(text.contains("sentinel_load_shed_connections_total"));
         assert!(text.contains("sentinel_load_shed_requests_total"));
         assert!(text.contains("sentinel_active_connections"));
+    }
+
+    /// Every reason is scraped from the start, under one HELP and TYPE, and a
+    /// note moves only its own series.
+    #[test]
+    fn inspection_limit_family_is_labelled_and_starts_at_zero() {
+        let text = prometheus_text();
+        assert_eq!(
+            text.matches("# TYPE sentinel_inspection_limit_exceeded_total counter")
+                .count(),
+            1
+        );
+        for reason in inspection_limit_reasons() {
+            assert!(
+                text.contains(&format!(
+                    "sentinel_inspection_limit_exceeded_total{{reason=\"{reason}\"}} "
+                )),
+                "{reason} missing from the scrape:\n{text}"
+            );
+        }
+        let (args, time) = (
+            inspection_limit_exceeded_total("args"),
+            inspection_limit_exceeded_total("time"),
+        );
+        note_inspection_limit_exceeded("time");
+        note_inspection_limit_exceeded("no-such-reason");
+        assert_eq!(inspection_limit_exceeded_total("time"), time + 1);
+        assert_eq!(inspection_limit_exceeded_total("args"), args);
+        assert_eq!(inspection_limit_exceeded_total("no-such-reason"), 0);
     }
 
     #[test]

@@ -130,7 +130,8 @@ func TestEveryForwardedFieldIsKnown(t *testing.T) {
 	forwarded := []string{
 		"mode", "paranoia_level", "anomaly_threshold", "rule_categories",
 		"rule_exclusions", "path_overrides", "max_body_size", "max_uri_length",
-		"max_header_count", "allowed_methods", "api_discovery", "security_headers",
+		"max_header_count", "max_inspected_args", "max_inspected_arg_bytes",
+		"inspection_time_budget_ms", "allowed_methods", "api_discovery", "security_headers",
 		"rate_limit", "anti_ddos", "bot_detection", "geoip", "ip_reputation",
 		"ml", "jwt", "graphql", "grpc", "dlp", "fusion", "block_page",
 	}

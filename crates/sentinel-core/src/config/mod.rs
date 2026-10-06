@@ -652,6 +652,34 @@ pub struct WafConfig {
     /// Maximum number of request headers (0 = unlimited, default 100).
     #[serde(default = "default_max_header_count")]
     pub max_header_count: u32,
+    /// Most arguments the rule engine inspects in one request — query-string,
+    /// body and multipart parameters together, a file part counting as one
+    /// (0 = unlimited, default [`DEFAULT_MAX_INSPECTED_ARGS`]).
+    ///
+    /// This and the two settings below bound what inspecting one request can
+    /// cost: the engine reads every argument in hundreds of rules, so the work
+    /// grows with what the client chooses to send, well below `max_body_size`.
+    /// A request past a limit is not inspected in part and passed: it is
+    /// refused (blocking mode) or recorded as a would-block (learning mode),
+    /// as built-in rule 9900401, 9900402 or 9900403.
+    ///
+    /// As with `max_body_size`, the derived `WafConfig::default()` leaves all
+    /// three at 0; a policy parsed from the control plane or YAML gets the
+    /// defaults.
+    #[serde(default = "default_max_inspected_args")]
+    pub max_inspected_args: u32,
+    /// Most bytes of argument names and values inspected in one request, as
+    /// the parsers decode them; a name several values share counts once (0 =
+    /// unlimited, default [`DEFAULT_MAX_INSPECTED_ARG_BYTES`]).
+    #[serde(default = "default_max_inspected_arg_bytes")]
+    pub max_inspected_arg_bytes: u64,
+    /// Longest the rule engine may spend on one phase of a request, in
+    /// milliseconds (0 = unlimited, default
+    /// [`DEFAULT_INSPECTION_TIME_BUDGET_MS`]). Checked between rule
+    /// instructions, so one long instruction can overrun it; what it bounds is
+    /// how much further evaluation a slow request can buy.
+    #[serde(default = "default_inspection_time_budget_ms")]
+    pub inspection_time_budget_ms: u32,
     /// Allowed HTTP methods. Empty = allow all; otherwise a request whose method
     /// isn't listed is rejected with 405. Case-insensitive.
     #[serde(default)]
@@ -684,6 +712,17 @@ pub struct WafConfig {
     pub security_headers: Option<SecurityHeadersConfig>,
     /// What a blocked visitor sees. Absent = the built-in default page.
     pub block_page: Option<BlockPageConfig>,
+}
+
+impl WafConfig {
+    /// The inspection limits a request to this site is evaluated under.
+    pub fn inspection_limits(&self) -> crate::context::InspectionLimits {
+        crate::context::InspectionLimits {
+            max_args: self.max_inspected_args,
+            max_arg_bytes: self.max_inspected_arg_bytes,
+            time_budget_ms: self.inspection_time_budget_ms,
+        }
+    }
 }
 
 /// Per-site customisation of the page a blocked visitor receives.
@@ -867,6 +906,47 @@ fn default_max_uri_length() -> u32 {
 
 fn default_max_header_count() -> u32 {
     100
+}
+
+// The inspection-limit defaults, from `tests/inspection_limits_perf.rs` in
+// sentinel-rules: the default ruleset at PL2 in an optimized build, on one
+// laptop core (Ryzen 7 7730U), urlencoded, JSON and multipart alike.
+// Evaluation costs about 0.07 ms per argument plus 0.5 µs per byte of plain
+// ASCII text and 4-5 µs per byte of real-world text (mixed case, Devanagari,
+// accents, `+` and `%`, which the transforms rewrite):
+//
+//   request                                   plain     mixed text
+//   ordinary: 1000 fields, 256 KiB of text    0.21 s    0.89-0.95 s
+//   at both limits: 4096 fields, 512 KiB      0.58 s    1.8-1.9 s
+//   at the byte limit in 8 fields             0.27 s    2.5-2.6 s
+//
+// with no limit, 4 MiB of mixed text took 20-40 s, so a default-sized (10 MiB)
+// body costs a minute or more. The limits keep the ordinary form well inside
+// them (4x the fields, 2x the bytes). A request AT them costs far more than
+// the ~50 ms first aimed for, and that is the engine's cost, not the limits':
+// limits low enough for 50 ms (~200 fields, tens of KiB of text) would refuse
+// that ordinary form. The same rows ran up to 2x slower when the core was
+// shared with a build, so the time budget sits at 4x the costliest request
+// within the limits and ~10x the ordinary form: it catches content unusually
+// slow to inspect, never a slow node.
+
+/// Default `max_inspected_args`.
+pub const DEFAULT_MAX_INSPECTED_ARGS: u32 = 4096;
+/// Default `max_inspected_arg_bytes`: 512 KiB.
+pub const DEFAULT_MAX_INSPECTED_ARG_BYTES: u64 = 512 * 1024;
+/// Default `inspection_time_budget_ms`: 10 s.
+pub const DEFAULT_INSPECTION_TIME_BUDGET_MS: u32 = 10_000;
+
+fn default_max_inspected_args() -> u32 {
+    DEFAULT_MAX_INSPECTED_ARGS
+}
+
+fn default_max_inspected_arg_bytes() -> u64 {
+    DEFAULT_MAX_INSPECTED_ARG_BYTES
+}
+
+fn default_inspection_time_budget_ms() -> u32 {
+    DEFAULT_INSPECTION_TIME_BUDGET_MS
 }
 
 fn default_paranoia() -> u8 {
@@ -1924,6 +2004,53 @@ sites: []
         assert_eq!(WafConfig::default().mode, WafMode::Blocking);
         let deserialized: WafConfig = serde_yaml::from_str("{}").expect("parse");
         assert_eq!(deserialized.mode, WafConfig::default().mode);
+    }
+
+    /// A policy that names no inspection limit gets the defaults; one that
+    /// sets them, including 0 for "no limit", gets exactly what it set, and the
+    /// request is evaluated under those values.
+    #[test]
+    fn inspection_limits_default_and_parse() {
+        let waf: WafConfig = serde_json::from_str("{}").expect("parse");
+        assert_eq!(waf.max_inspected_args, DEFAULT_MAX_INSPECTED_ARGS);
+        assert_eq!(waf.max_inspected_arg_bytes, DEFAULT_MAX_INSPECTED_ARG_BYTES);
+        assert_eq!(
+            waf.inspection_time_budget_ms,
+            DEFAULT_INSPECTION_TIME_BUDGET_MS
+        );
+        assert_eq!(
+            waf.inspection_limits(),
+            crate::context::InspectionLimits {
+                max_args: DEFAULT_MAX_INSPECTED_ARGS,
+                max_arg_bytes: DEFAULT_MAX_INSPECTED_ARG_BYTES,
+                time_budget_ms: DEFAULT_INSPECTION_TIME_BUDGET_MS,
+            }
+        );
+        // The neighbouring request limit keeps its default.
+        assert_eq!(waf.max_body_size, 10 * 1024 * 1024);
+
+        let waf: WafConfig = serde_json::from_str(
+            r#"{"max_inspected_args": 2000, "max_inspected_arg_bytes": 0,
+                "inspection_time_budget_ms": 1500}"#,
+        )
+        .expect("parse");
+        assert_eq!(
+            waf.inspection_limits(),
+            crate::context::InspectionLimits {
+                max_args: 2000,
+                max_arg_bytes: 0,
+                time_budget_ms: 1500,
+            }
+        );
+        let yaml: WafConfig =
+            serde_yaml::from_str("max_inspected_args: 10\ninspection_time_budget_ms: 0\n")
+                .expect("parse");
+        assert_eq!(yaml.max_inspected_args, 10);
+        assert_eq!(yaml.inspection_time_budget_ms, 0);
+        assert_eq!(
+            yaml.max_inspected_arg_bytes,
+            DEFAULT_MAX_INSPECTED_ARG_BYTES
+        );
     }
 
     /// Failing closed must not override an operator who explicitly asked to

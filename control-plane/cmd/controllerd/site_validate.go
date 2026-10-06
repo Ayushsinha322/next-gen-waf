@@ -198,6 +198,13 @@ func validateWafPolicyValues(raw json.RawMessage) []SiteConfigProblem {
 		MaxBodySize    *float64 `json:"max_body_size"`
 		MaxURILength   *float64 `json:"max_uri_length"`
 		MaxHeaderCount *float64 `json:"max_header_count"`
+		// Inspection limits, float64 for the same reason.
+		MaxInspectedArgs       *float64 `json:"max_inspected_args"`
+		MaxInspectedArgBytes   *float64 `json:"max_inspected_arg_bytes"`
+		InspectionTimeBudgetMs *float64 `json:"inspection_time_budget_ms"`
+		// Raw so a shape this function does not expect cannot fail the whole
+		// decode and skip every check below; read on its own further down.
+		RuleExclusions json.RawMessage `json:"rule_exclusions"`
 		GeoIP          *struct {
 			BlockCountries []string `json:"block_countries"`
 			AllowCountries []string `json:"allow_countries"`
@@ -288,6 +295,40 @@ func validateWafPolicyValues(raw json.RawMessage) []SiteConfigProblem {
 			"limit protects nothing; SSO redirects need 16384")
 	checkLimit("waf_policy.max_header_count", p.MaxHeaderCount, maxSiteHeaders,
 		"browsers send 15-25 headers")
+
+	// Inspection limits bound what one request may cost the rule engine, which
+	// reads every argument in hundreds of rules; the caps are where a limit
+	// stops bounding anything. 0 is legal and means no limit, as above.
+	checkLimit("waf_policy.max_inspected_args", p.MaxInspectedArgs, maxSiteInspectedArgs,
+		"each argument costs about 0.1 ms of rule evaluation at the default paranoia level, "+
+			"so this many is 10 s or more for one request")
+	checkLimit("waf_policy.max_inspected_arg_bytes", p.MaxInspectedArgBytes, maxSiteInspectedArgBytes,
+		"inspection costs 0.5-5 µs per byte of argument text, so this much is 8 s to over a "+
+			"minute for one request")
+	checkLimit("waf_policy.inspection_time_budget_ms", p.InspectionTimeBudgetMs, maxSiteInspectionBudgetMs,
+		"it is a budget in milliseconds; a request that needs a minute to inspect is not one to wait for")
+	// A budget is also refused when it is too SMALL to pass ordinary traffic:
+	// a seconds value typed into this milliseconds field would refuse forms in
+	// blocking mode, which is an outage rather than a protection.
+	if v := p.InspectionTimeBudgetMs; v != nil && *v > 0 && *v < minSiteInspectionBudgetMs {
+		add("waf_policy.inspection_time_budget_ms",
+			fmt.Sprintf("is %v ms; the smallest accepted is %d ms (0 turns the budget off) — "+
+				"a 100-field form takes 13-65 ms to inspect", *v, minSiteInspectionBudgetMs))
+	}
+
+	// An exclusion of an inspection-limit refusal would be stored and do
+	// nothing: the refusal is not a compiled rule. Read on its own, leniently;
+	// the converter reports a malformed list.
+	var exclusions []struct {
+		RuleID int `json:"rule_id"`
+	}
+	if json.Unmarshal(p.RuleExclusions, &exclusions) == nil {
+		for _, e := range exclusions {
+			if msg := inspectionLimitExclusionProblem(e.RuleID); msg != "" {
+				add("waf_policy.rule_exclusions", msg)
+			}
+		}
+	}
 
 	// Network lists. Refused rather than stored: the data plane skips an entry it
 	// cannot parse with nothing but a WARN, so a bad entry saved here is a
@@ -550,6 +591,40 @@ const (
 	maxSiteURIBytes  = 131072                  // 128 KiB
 	maxSiteHeaders   = 1000
 )
+
+// Bounds for a site's inspection limits (max_inspected_args and friends). The
+// console has no fields for these yet, so there is nothing to keep in step.
+const (
+	maxSiteInspectedArgs      = 100000
+	maxSiteInspectedArgBytes  = 16 * 1024 * 1024 // 16 MiB
+	maxSiteInspectionBudgetMs = 60000
+	minSiteInspectionBudgetMs = 100
+)
+
+// The built-in rule ids the data plane records a request under when inspecting
+// it would pass one of the site's inspection limits, and the setting each one
+// is for. Keep in step with InspectionLimit::rule_id in
+// crates/sentinel-core/src/context.rs.
+var inspectionLimitRuleSettings = map[int]string{
+	9900401: "max_inspected_args",
+	9900402: "max_inspected_arg_bytes",
+	9900403: "inspection_time_budget_ms",
+}
+
+// inspectionLimitExclusionProblem says why ruleID cannot be excluded, or ""
+// when it can. An inspection-limit refusal shows in the learning report like a
+// rule, but it is not one: an exclusion naming it is stored and changes
+// nothing, which is a control that reports success and does not act.
+func inspectionLimitExclusionProblem(ruleID int) string {
+	setting, ok := inspectionLimitRuleSettings[ruleID]
+	if !ok {
+		return ""
+	}
+	return fmt.Sprintf("rule %d cannot be disabled or excluded: it is not a rule but the record of "+
+		"a request that went past the site's inspection limit %s. If such requests are "+
+		"legitimate, raise %s in the site's policy instead (0 turns the limit off)",
+		ruleID, setting, setting)
+}
 
 // toInt coerces the numeric forms that survive a JSON round-trip.
 func toInt(v any) (int, bool) {
