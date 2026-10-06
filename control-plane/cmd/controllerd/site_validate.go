@@ -418,8 +418,9 @@ const (
 
 // The built-in rule ids the data plane records a request under when inspecting
 // it would pass one of the site's inspection limits, and the setting each one
-// is for. Keep in step with InspectionLimit::rule_id in
-// crates/sentinel-core/src/context.rs.
+// is for: InspectionLimit::rule_id and InspectionLimit::setting in
+// crates/sentinel-core/src/context.rs, which
+// TestInspectionLimitRuleSettingsMatchTheDataPlane reads and compares.
 var inspectionLimitRuleSettings = map[int]string{
 	9900401: "max_inspected_args",
 	9900402: "max_inspected_arg_bytes",
