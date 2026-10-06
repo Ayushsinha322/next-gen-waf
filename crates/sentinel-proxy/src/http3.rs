@@ -24,8 +24,10 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use bytes::{Buf, Bytes};
+use h3::error::{Code, StreamError};
 use http::{header, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
+use hyper::body::Body;
 use sentinel_telemetry::inc_load_shed_connections;
 use tokio::sync::watch;
 use tracing::{debug, info};
@@ -36,6 +38,9 @@ use crate::{run_pipeline, ActiveConnGuard, BoxBody, ServerState};
 /// `h3-quinn` is our only one, so we pin it here rather than threading `h3::quic`
 /// trait bounds through every signature.
 type H3Conn = h3_quinn::Connection;
+
+/// One HTTP/3 request stream over [`H3Conn`], as the server side sees it.
+type H3Stream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
 
 /// ALPN identifier for HTTP/3. Clients advertise this over QUIC; the server must
 /// select it or the handshake completes with no application protocol.
@@ -272,29 +277,118 @@ async fn handle_h3_request(
     // time (see `ja4_quic`) and reaches `ctx.tls_fingerprint` exactly as the TCP
     // path's peeked fingerprint does.
     let resp = run_pipeline(state, peer, pipeline_req, default_site, tls_fp).await;
+    send_h3_response(&mut stream, resp).await
+}
 
-    // Relay the response over the QUIC stream: headers first, then body.
-    let (mut resp_parts, resp_body) = resp.into_parts();
-    strip_forbidden_h3_headers(&mut resp_parts.headers);
-    let head = Response::from_parts(resp_parts, ());
+/// Relay a pipeline response over an HTTP/3 request stream: the head, then the
+/// body as it arrives (see [`relay_h3_body`]).
+async fn send_h3_response<B>(stream: &mut H3Stream, resp: Response<B>) -> Result<()>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
+    let (mut parts, body) = resp.into_parts();
+    strip_forbidden_h3_headers(&mut parts.headers);
     stream
-        .send_response(head)
+        .send_response(Response::from_parts(parts, ()))
         .await
         .context("sending HTTP/3 response headers")?;
+    relay_h3_body(stream, body).await
+}
 
-    let bytes = resp_body
-        .collect()
-        .await
-        .map_err(|e| anyhow!("collecting response body for HTTP/3: {e}"))?
-        .to_bytes();
-    if !bytes.is_empty() {
-        stream
-            .send_data(bytes)
-            .await
-            .context("sending HTTP/3 response body")?;
+/// Stream a response body onto an HTTP/3 request stream, frame by frame.
+///
+/// This used to `collect()` the whole body and send it as one DATA frame. An h3
+/// client then got nothing until the origin had finished: a large download sat
+/// whole in WAF memory (per stream, and one connection multiplexes many), an
+/// event stream that never ends never arrived at all, and trailers (gRPC's
+/// `grpc-status`) were dropped. TCP clients had none of this, because hyper
+/// streams the same body as it arrives.
+///
+/// `body` is the response exactly as `run_pipeline` returned it, so it is
+/// already past response inspection: a body that DLP or response rules had to
+/// see was buffered and judged inside `proxy` and arrives here complete;
+/// anything else is the origin's own stream. Nothing here inspects, so nothing
+/// here needs to buffer.
+///
+/// Accounting matches the TCP path because all of it happened before this
+/// point. The access-log line, `bytes_sent` and the request-duration histogram
+/// were recorded when `proxy` produced the response head, and the in-flight
+/// request permit was released when `run_pipeline` returned. hyper streams a
+/// TCP body after the service future has returned, outside the request permit,
+/// and so does this.
+///
+/// How the relay ends:
+/// - the origin finished: trailers if it sent any, then FIN;
+/// - the client cancelled (STOP_SENDING) or its connection is gone: stop and
+///   drop the origin body, which releases its upstream connection. That is
+///   `Ok`, because an abandoned download is not a WAF failure. h3 exposes no
+///   STOP_SENDING notification, so it is noticed on the next write;
+/// - the origin failed mid-body: RESET the stream. A FIN would present a
+///   truncated body as a complete one, and returning without finishing is not
+///   enough, because quinn FINISHES a send stream that is dropped unfinished.
+async fn relay_h3_body<B>(stream: &mut H3Stream, mut body: B) -> Result<()>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
+    while let Some(frame) = body.frame().await {
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(e) => {
+                stream.stop_stream(Code::H3_INTERNAL_ERROR);
+                return Err(anyhow!(
+                    "response body failed mid-stream; HTTP/3 stream reset: {e}"
+                ));
+            }
+        };
+        let (sent, trailers_sent) = match frame.into_data() {
+            Ok(data) if data.is_empty() => continue,
+            Ok(data) => (stream.send_data(data).await, false),
+            Err(frame) => match frame.into_trailers() {
+                Ok(mut trailers) => {
+                    strip_forbidden_h3_headers(&mut trailers);
+                    (stream.send_trailers(trailers).await, true)
+                }
+                // A frame kind this relay does not know carries nothing to send.
+                Err(_) => continue,
+            },
+        };
+        if let Err(e) = sent {
+            return end_on_send_error(stream, e, "sending HTTP/3 response body");
+        }
+        // Trailers end the message (RFC 9114 §4.1): no DATA may follow them.
+        if trailers_sent {
+            break;
+        }
     }
-    stream.finish().await.context("finishing HTTP/3 stream")?;
+    if let Err(e) = stream.finish().await {
+        return end_on_send_error(stream, e, "finishing HTTP/3 stream");
+    }
     Ok(())
+}
+
+/// Turn a failed send into the relay's result. A client that cancelled the
+/// stream, or whose connection has closed, ends the response normally (`Ok`):
+/// there is nobody left to tell. Anything else is our failure, and the stream
+/// is reset so the client sees an error rather than a clean end to a short body.
+fn end_on_send_error(stream: &mut H3Stream, e: StreamError, what: &'static str) -> Result<()> {
+    match e {
+        StreamError::RemoteTerminate { code, .. } => {
+            debug!(%code, "HTTP/3 client cancelled the response; relay stopped");
+            Ok(())
+        }
+        // Brace syntax: the variant is `#[non_exhaustive]`, so its tuple form
+        // cannot be matched from outside h3.
+        StreamError::ConnectionError { 0: e, .. } => {
+            debug!("HTTP/3 connection closed mid-response; relay stopped: {e}");
+            Ok(())
+        }
+        e => {
+            stream.stop_stream(Code::H3_INTERNAL_ERROR);
+            Err(anyhow::Error::new(e).context(what))
+        }
+    }
 }
 
 /// Append every segment of a `Buf` to `out`. `Buf::chunk` only exposes the first
@@ -455,6 +549,378 @@ mod tests {
         client.wait_idle().await;
         drive.abort();
         server.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // Response streaming: `send_h3_response` / `relay_h3_body`
+    // -----------------------------------------------------------------------
+
+    use hyper::body::Frame;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context as TaskCx, Poll};
+    use std::time::Duration;
+    use tokio::sync::{mpsc, oneshot};
+    use tokio::time::timeout;
+
+    type OriginFrame = std::result::Result<Frame<Bytes>, String>;
+    type ClientStream = h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
+
+    /// A response body the test feeds frame by frame, standing in for an origin
+    /// that sends when the test says so. The channel holds one frame, so the
+    /// origin cannot run ahead of what the relay has taken. Dropping the body
+    /// closes the channel, which is how a test sees the relay let go of it.
+    struct ChanBody(mpsc::Receiver<OriginFrame>);
+
+    impl Body for ChanBody {
+        type Data = Bytes;
+        type Error = String;
+        fn poll_frame(mut self: Pin<&mut Self>, cx: &mut TaskCx<'_>) -> Poll<Option<OriginFrame>> {
+            self.0.poll_recv(cx)
+        }
+    }
+
+    fn origin() -> (mpsc::Sender<OriginFrame>, ChanBody) {
+        let (tx, rx) = mpsc::channel(1);
+        (tx, ChanBody(rx))
+    }
+
+    fn data(b: &'static [u8]) -> OriginFrame {
+        Ok(Frame::data(Bytes::from_static(b)))
+    }
+
+    /// A body of `total` bytes generated on demand, `LAZY_CHUNK` per frame, that
+    /// records how much the relay has pulled from it. Each byte is derived from
+    /// its offset, so the client can verify the whole body.
+    struct LazyBody {
+        total: usize,
+        pulled: Arc<AtomicUsize>,
+    }
+
+    const LAZY_CHUNK: usize = 64 * 1024;
+
+    fn byte_at(offset: usize) -> u8 {
+        (offset % 251) as u8
+    }
+
+    impl Body for LazyBody {
+        type Data = Bytes;
+        type Error = String;
+        fn poll_frame(self: Pin<&mut Self>, _cx: &mut TaskCx<'_>) -> Poll<Option<OriginFrame>> {
+            let done = self.pulled.load(Ordering::SeqCst);
+            if done >= self.total {
+                return Poll::Ready(None);
+            }
+            let n = LAZY_CHUNK.min(self.total - done);
+            let chunk: Vec<u8> = (done..done + n).map(byte_at).collect();
+            self.pulled.store(done + n, Ordering::SeqCst);
+            Poll::Ready(Some(Ok(Frame::data(Bytes::from(chunk)))))
+        }
+    }
+
+    /// Bind a QUIC endpoint that answers ONE request with `resp`, sent through
+    /// the production `send_h3_response`. The receiver yields the relay's own
+    /// result, so a test can assert how the relay ended as well as what the
+    /// client saw. The connection is driven as `handle_quic_connection` drives
+    /// it, until the client leaves: quinn's `finish` does not wait for delivery,
+    /// so closing the connection when the relay returns would cut off data still
+    /// in flight.
+    fn serve_one<B>(resp: Response<B>) -> (SocketAddr, oneshot::Receiver<Result<()>>)
+    where
+        B: Body<Data = Bytes> + Unpin + Send + 'static,
+        B::Error: std::fmt::Display + Send,
+    {
+        let endpoint =
+            quinn::Endpoint::server(test_server_config(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let (done_tx, done_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let incoming = endpoint.accept().await.expect("a client connects");
+            let conn = incoming.accept().unwrap().await.unwrap();
+            let mut h3_conn: h3::server::Connection<H3Conn, Bytes> = h3::server::builder()
+                .build(h3_quinn::Connection::new(conn))
+                .await
+                .unwrap();
+            let resolver = h3_conn.accept().await.unwrap().expect("one request");
+            tokio::spawn(async move {
+                let (_req, mut stream) = resolver.resolve_request().await.unwrap();
+                let _ = done_tx.send(send_h3_response(&mut stream, resp).await);
+            });
+            while let Ok(Some(_)) = h3_conn.accept().await {}
+        });
+        (addr, done_rx)
+    }
+
+    /// A test client with one GET in flight on `stream`. The other fields keep
+    /// the connection alive for as long as the test reads.
+    struct Client {
+        stream: ClientStream,
+        _send_request: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+        _endpoint: quinn::Endpoint,
+        driver: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for Client {
+        fn drop(&mut self) {
+            self.driver.abort();
+        }
+    }
+
+    async fn get(addr: SocketAddr, cfg: quinn::ClientConfig) -> Client {
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(cfg);
+        let conn = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
+        let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(conn))
+            .await
+            .unwrap();
+        let driver = tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("https://localhost/")
+            .body(())
+            .unwrap();
+        let mut stream = send_request.send_request(req).await.unwrap();
+        stream.finish().await.unwrap();
+        Client {
+            stream,
+            _send_request: send_request,
+            _endpoint: endpoint,
+            driver,
+        }
+    }
+
+    /// Read the rest of the body into `out`. A reset stream is returned as the
+    /// error, not unwrapped: some tests expect one.
+    async fn read_to_end(
+        stream: &mut ClientStream,
+        out: &mut Vec<u8>,
+    ) -> std::result::Result<(), StreamError> {
+        while let Some(chunk) = stream.recv_data().await? {
+            append_buf(out, chunk);
+        }
+        Ok(())
+    }
+
+    /// The first body chunk reaches the client while the origin is still
+    /// sending. This origin sends one chunk and then WAITS for the client to
+    /// confirm it before sending the rest, so a relay that collects the body
+    /// before sending delivers nothing (the old relay timed out here).
+    #[tokio::test]
+    async fn h3_first_body_chunk_reaches_client_before_origin_finishes() {
+        let (origin_tx, body) = origin();
+        let (addr, relay_done) = serve_one(Response::new(body));
+        let (got_first_tx, got_first_rx) = oneshot::channel::<()>();
+        let origin_task = tokio::spawn(async move {
+            origin_tx.send(data(b"first ")).await.unwrap();
+            if got_first_rx.await.is_ok() {
+                origin_tx.send(data(b"second")).await.unwrap();
+            }
+            // Dropping the sender ends the body.
+        });
+
+        let mut client = get(addr, test_client_config()).await;
+        let resp = client.stream.recv_response().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let first = timeout(Duration::from_secs(5), client.stream.recv_data())
+            .await
+            .expect(
+                "no body reached the h3 client while the origin was still sending: \
+                 the relay is buffering the response instead of streaming it",
+            )
+            .unwrap()
+            .expect("the body ended before its first chunk");
+        let mut body = Vec::new();
+        append_buf(&mut body, first);
+        assert_eq!(body, b"first ");
+
+        got_first_tx.send(()).unwrap();
+        read_to_end(&mut client.stream, &mut body).await.unwrap();
+        assert_eq!(body, b"first second");
+        relay_done.await.unwrap().unwrap();
+        origin_task.await.unwrap();
+    }
+
+    /// A 16 MiB body arrives intact, and the relay never runs far ahead of the
+    /// client. The client's stream window is pinned at 1 MiB, so QUIC flow
+    /// control lets the relay hand quinn at most what the client has read plus
+    /// that window; a streaming relay therefore pulls little more than the
+    /// window beyond the client's position. The old relay pulled all 16 MiB into
+    /// memory before the first byte left.
+    #[tokio::test]
+    async fn h3_large_body_streams_under_flow_control() {
+        const TOTAL: usize = 16 * 1024 * 1024;
+        const WINDOW: u32 = 1024 * 1024;
+        // Twice the window covers quinn re-advertising credit before the client
+        // reads it all; the chunks cover the frame the relay holds.
+        const MAX_AHEAD: usize = 2 * WINDOW as usize + 4 * LAZY_CHUNK;
+
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let body = LazyBody {
+            total: TOTAL,
+            pulled: Arc::clone(&pulled),
+        };
+        let resp = Response::builder()
+            .header(header::CONTENT_LENGTH, TOTAL)
+            .body(body)
+            .unwrap();
+        let (addr, relay_done) = serve_one(resp);
+
+        let mut cfg = test_client_config();
+        let mut transport = quinn::TransportConfig::default();
+        transport.stream_receive_window(quinn::VarInt::from_u32(WINDOW));
+        cfg.transport_config(Arc::new(transport));
+        let mut client = get(addr, cfg).await;
+        let resp = client.stream.recv_response().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let mut received = 0usize;
+        let mut max_ahead = 0usize;
+        let mut first_bad_offset = None;
+        while let Some(mut chunk) = timeout(Duration::from_secs(30), client.stream.recv_data())
+            .await
+            .expect("large h3 body stalled")
+            .unwrap()
+        {
+            max_ahead = max_ahead.max(pulled.load(Ordering::SeqCst).saturating_sub(received));
+            while chunk.has_remaining() {
+                let piece = chunk.chunk();
+                if first_bad_offset.is_none() {
+                    first_bad_offset = piece
+                        .iter()
+                        .enumerate()
+                        .find(|&(i, &b)| b != byte_at(received + i))
+                        .map(|(i, _)| received + i);
+                }
+                let n = piece.len();
+                received += n;
+                chunk.advance(n);
+            }
+        }
+
+        assert_eq!(received, TOTAL, "the whole body must arrive");
+        assert_eq!(first_bad_offset, None, "body bytes corrupted in transit");
+        assert!(
+            max_ahead <= MAX_AHEAD,
+            "the relay pulled {max_ahead} bytes beyond what the client had read \
+             (bound {MAX_AHEAD}): it is buffering the body, not streaming it"
+        );
+        relay_done.await.unwrap().unwrap();
+    }
+
+    /// Trailers reach the client after the body. gRPC carries its status in
+    /// trailers, so losing them fails every gRPC call; the old relay dropped
+    /// them in `collect().to_bytes()`.
+    #[tokio::test]
+    async fn h3_response_trailers_are_relayed() {
+        let (origin_tx, body) = origin();
+        let (addr, relay_done) = serve_one(Response::new(body));
+        tokio::spawn(async move {
+            origin_tx.send(data(b"\0\0\0\0\x05hello")).await.unwrap();
+            let mut trailers = header::HeaderMap::new();
+            trailers.insert("grpc-status", header::HeaderValue::from_static("0"));
+            trailers.insert("grpc-message", header::HeaderValue::from_static("ok"));
+            origin_tx.send(Ok(Frame::trailers(trailers))).await.unwrap();
+        });
+
+        let mut client = get(addr, test_client_config()).await;
+        client.stream.recv_response().await.unwrap();
+        let mut body = Vec::new();
+        read_to_end(&mut client.stream, &mut body).await.unwrap();
+        assert_eq!(body, b"\0\0\0\0\x05hello");
+        let trailers = client
+            .stream
+            .recv_trailers()
+            .await
+            .unwrap()
+            .expect("the origin's trailers must reach the h3 client");
+        assert_eq!(trailers.get("grpc-status").unwrap(), "0");
+        assert_eq!(trailers.get("grpc-message").unwrap(), "ok");
+        relay_done.await.unwrap().unwrap();
+    }
+
+    /// A client that cancels mid-body (STOP_SENDING) ends the relay promptly and
+    /// cleanly: `Ok`, with the origin body dropped so its upstream connection is
+    /// released. This origin would keep sending for seconds; the old relay kept
+    /// collecting until it finished, then reported an error.
+    #[tokio::test]
+    async fn h3_client_cancel_stops_relay_and_releases_origin() {
+        const ORIGIN_RUN: Duration = Duration::from_secs(5);
+        let (origin_tx, body) = origin();
+        let (addr, relay_done) = serve_one(Response::new(body));
+        // Streams until ORIGIN_RUN elapses or the relay drops the body; says which.
+        let origin_task = tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + ORIGIN_RUN;
+            while tokio::time::Instant::now() < deadline {
+                let chunk = Ok(Frame::data(Bytes::from(vec![b'x'; 16 * 1024])));
+                if origin_tx.send(chunk).await.is_err() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            false
+        });
+
+        let mut client = get(addr, test_client_config()).await;
+        client.stream.recv_response().await.unwrap();
+        client
+            .stream
+            .recv_data()
+            .await
+            .unwrap()
+            .expect("some body arrives before the cancel");
+        client.stream.stop_sending(Code::H3_REQUEST_CANCELLED);
+
+        let relay = timeout(Duration::from_secs(3), relay_done)
+            .await
+            .expect("the relay kept going after the client cancelled")
+            .unwrap();
+        assert!(
+            relay.is_ok(),
+            "a client cancel is a normal end, not a relay error: {relay:?}"
+        );
+        assert!(
+            origin_task.await.unwrap(),
+            "the relay must drop the origin body when the client cancels"
+        );
+    }
+
+    /// An origin that fails mid-body reaches the client as a stream error, never
+    /// as a clean end to a short body. The old relay returned early once the head
+    /// was sent, quinn finished the dropped stream, and the client saw a
+    /// complete, empty 200.
+    #[tokio::test]
+    async fn h3_origin_failure_mid_body_resets_the_stream() {
+        let (origin_tx, body) = origin();
+        let (addr, relay_done) = serve_one(Response::new(body));
+        tokio::spawn(async move {
+            origin_tx.send(data(b"partial")).await.unwrap();
+            let _ = origin_tx
+                .send(Err("origin reset the connection".into()))
+                .await;
+        });
+
+        let mut client = get(addr, test_client_config()).await;
+        // The error may surface at the head: a RESET_STREAM lets the receiver
+        // discard whatever it has not yet read, the head included.
+        let outcome = timeout(Duration::from_secs(5), async {
+            client.stream.recv_response().await?;
+            let mut body = Vec::new();
+            read_to_end(&mut client.stream, &mut body).await?;
+            Ok::<_, StreamError>(body)
+        })
+        .await
+        .expect("the client never learned how the body ended");
+        if let Ok(body) = outcome {
+            panic!(
+                "a body the origin cut short must reach the client as a stream error, \
+                 not a clean end ({} bytes then FIN)",
+                body.len()
+            );
+        }
+        assert!(relay_done.await.unwrap().is_err());
     }
 
     /// The resolver-backed config path (Phase 1) produces a usable QUIC server
