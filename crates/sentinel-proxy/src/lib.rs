@@ -10846,6 +10846,12 @@ fn classify_nonrule_block(reason: &str) -> (&'static str, &'static str) {
         ("GRPC", "gRPC policy violation")
     } else if r.starts_with("jwt") {
         ("JWT", "JWT validation failure")
+    // A body refused before any rule judged it: over the size limit, too slow
+    // to arrive, or (the rule engine's BODY_TOO_COMPLEX) too many field names
+    // to list. Filed as ANOMALY with score 0 these claimed a scoring verdict,
+    // and an operator looked for a rule to exclude where there was none.
+    } else if r.starts_with("request body") {
+        ("BODY", "Request body could not be inspected")
     // The three connection-layer reasons below were missing, so all of them
     // fell through to ANOMALY and were logged as "anomaly threshold exceeded"
     // with score=0 — a self-contradiction (0 cannot exceed a threshold of 10)
@@ -13442,6 +13448,41 @@ mod nonrule_block_classification_tests {
     fn threat_intel_wins_over_a_bot_shaped_feed_name() {
         let (rule, _) = classify_nonrule_block("threat intel: matched bot-net IOC feed");
         assert_eq!(rule, "THREATINTEL", "feed name must not steal the match");
+    }
+
+    /// A body refused before any rule judged it read "anomaly threshold
+    /// exceeded" with score 0, and the rule engine's own refusal (field names
+    /// it cannot list) looked like a rule block with no rule to exclude.
+    #[test]
+    fn uninspectable_body_reasons_are_labelled_body() {
+        // Exactly the strings the proxy builds at the body-read sites.
+        assert_eq!(
+            classify_nonrule_block("request body too large (limit 1048576 bytes)"),
+            ("BODY", "Request body could not be inspected")
+        );
+        assert_eq!(
+            classify_nonrule_block("request body read timed out (slow-body)").0,
+            "BODY"
+        );
+        // The rule engine's reason, produced as a request produces it: a 32 KB
+        // JSON key spelled out once per child is past the name budget.
+        let engine =
+            RuleEngine::from_crs_conf("SecRule ARGS \"@rx never-present\" \"id:1,phase:2,deny\"")
+                .unwrap();
+        let kids: Vec<String> = (0..3000).map(|i| format!("\"a{i}\":0")).collect();
+        let body = format!("{{\"{}\":{{{}}}}}", "k".repeat(32 * 1024), kids.join(","));
+        let mut ctx = RequestContext::new("203.0.113.9".parse().unwrap(), 4321);
+        ctx.uri = "/submit".parse().unwrap();
+        ctx.request_headers
+            .insert("content-type", "application/json".parse().unwrap());
+        ctx.request_body = Some(body.into_bytes().into());
+        assert_eq!(
+            engine.evaluate(&mut ctx, Phase::RequestBody, 0),
+            WafDecision::Block
+        );
+        assert!(ctx.rule_matches.is_empty());
+        let reason = ctx.block_reason.as_deref().unwrap();
+        assert_eq!(classify_nonrule_block(reason).0, "BODY", "{reason}");
     }
 
     /// The arms that already worked must keep working.
