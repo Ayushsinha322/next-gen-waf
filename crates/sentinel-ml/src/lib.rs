@@ -495,6 +495,9 @@ fn body_field_values(body: &str, content_type: &str, out: &mut Vec<String>) -> b
         }
         let before = out.len();
         let delim = format!("--{b}");
+        // One fragment allowance for the whole body (see header_param_values).
+        // One per part let every ~1 KB part of a body spend 64 KiB.
+        let mut fragment_budget = body.len().saturating_mul(4).saturating_add(64 * 1024);
         for part in body.split(&delim) {
             // Field value is everything after the part's header block (blank line).
             if let Some(idx) = part
@@ -512,25 +515,109 @@ fn body_field_values(body: &str, content_type: &str, out: &mut Vec<String>) -> b
                 // scored whole, `filename="/static/img/../../etc/passwd"` got
                 // through (GoTestWAF community-lfi-multipart, 2/2).
                 for param in ["filename=", "name="] {
-                    let mut rest = &part[..idx];
-                    while let Some(pos) = rest.find(param) {
-                        let after = &rest[pos + param.len()..];
-                        let v = if let Some(q) = after.strip_prefix('"') {
-                            q.split('"').next().unwrap_or("")
-                        } else {
-                            after.split([';', '\r', '\n']).next().unwrap_or("").trim()
-                        };
-                        if !v.is_empty() {
-                            out.push(v.to_string());
-                        }
-                        rest = after;
-                    }
+                    header_param_values(&part[..idx], param, &mut fragment_budget, out);
                 }
             }
         }
         out.len() > before
     } else {
         false
+    }
+}
+
+/// Pushes the values of `param` (`name=`, `filename=`) found in one multipart
+/// part's header block.
+///
+/// The scan resumes just past each `param`, so it also finds one INSIDE a value
+/// it has read: `name="…fname=|/bin/id"` yields the fragment `|/bin/id"` too,
+/// and the classifier can score such a fragment far above the whole value —
+/// 0.55 against 0.07 on a scanner-corpus line, either side of the veto line.
+/// Each fragment, though, is a copy running to the end of the value, so
+/// `name=name=name=…` copied the block once per repetition: 409 MB of
+/// candidates from 64 KB, and the search for each value's end was quadratic
+/// too. So the two kinds are told apart. A PARAMETER value — one starting
+/// where the previous value ended — is always kept, and those add up to at
+/// most the block. Whole fragments draw on `fragment_budget`, one allowance
+/// for every header block of the body (four times the body plus 64 KiB); the
+/// most any of 1.6 M corpus-built headers spends is 2.7 KB. Past it a
+/// fragment is CUT at the next `param`, never dropped: those pieces do not
+/// overlap, so they add up to at most the block, and the last one, the text
+/// after the final `param`, is always whole. Dropping them let junk earlier
+/// in the body decide which fragment the classifier never saw. Each value's
+/// end is found once per stretch (`NextHit`).
+fn header_param_values(
+    block: &str,
+    param: &str,
+    fragment_budget: &mut usize,
+    out: &mut Vec<String>,
+) {
+    let b = block.as_bytes();
+    let mut quote = NextHit::new(b, |c| c == b'"');
+    let mut delim = NextHit::new(b, |c| matches!(c, b';' | b'\r' | b'\n'));
+    // Where the last parameter value (not fragment) ended.
+    let mut value_end = 0;
+    let mut next = block.find(param);
+    while let Some(at) = next {
+        let start = at + param.len();
+        // Looked up before this value is read: a fragment cut short ends there.
+        next = block[start..].find(param).map(|rel| start + rel);
+        let quoted = b.get(start) == Some(&b'"');
+        // The value's span before trimming, and where it ends (past a closing
+        // quote).
+        let (first, mut stop, end) = if quoted {
+            let close = quote.at_or_after(start + 1);
+            (start + 1, close, (close + 1).min(b.len()))
+        } else {
+            let stop = delim.at_or_after(start);
+            (start, stop, stop)
+        };
+        if at >= value_end {
+            value_end = end;
+        } else if stop - first <= *fragment_budget {
+            *fragment_budget -= stop - first;
+        } else if let Some(cut) = next {
+            stop = stop.min(cut.max(first));
+        }
+        let raw = &block[first..stop];
+        let v = if quoted { raw } else { raw.trim() };
+        if !v.is_empty() {
+            out.push(v.to_string());
+        }
+    }
+}
+
+/// The next byte satisfying `hit` at or after a position, for positions that
+/// never decrease: an answer is reused until the position passes it, so each
+/// byte is examined once in all, however many values share an end.
+struct NextHit<'a, F: Fn(u8) -> bool> {
+    b: &'a [u8],
+    hit: F,
+    /// Where the last search started; no hit lies in `searched_from..found`.
+    searched_from: usize,
+    /// The hit it found, or `b.len()` for none.
+    found: usize,
+}
+
+impl<'a, F: Fn(u8) -> bool> NextHit<'a, F> {
+    fn new(b: &'a [u8], hit: F) -> Self {
+        Self {
+            b,
+            hit,
+            searched_from: usize::MAX,
+            found: 0,
+        }
+    }
+
+    fn at_or_after(&mut self, pos: usize) -> usize {
+        if !(self.searched_from <= pos && pos <= self.found) {
+            let hit = &self.hit;
+            self.found = self.b[pos..]
+                .iter()
+                .position(|&c| hit(c))
+                .map_or(self.b.len(), |i| pos + i);
+            self.searched_from = pos;
+        }
+        self.found
     }
 }
 
@@ -663,6 +750,7 @@ mod tests {
 #[cfg(test)]
 mod json_candidate_tests {
     use super::body_field_values;
+    use std::time::{Duration, Instant};
 
     /// JSON bodies were absent from `body_field_values`, and the cost was not a
     /// missed score but a WRONG VETO: the classifier only ever saw the whole
@@ -719,5 +807,110 @@ mod json_candidate_tests {
         let body = "--B\r\nContent-Disposition: form-data; name=\"f\"\r\n\r\nvalue-here\r\n--B--";
         body_field_values(body, "multipart/form-data; boundary=B", &mut out2);
         assert!(out2.iter().any(|c| c.contains("value-here")));
+    }
+
+    /// A multipart header parameter's value was searched again for the next
+    /// `name=`, so `name=name=name=…` copied a suffix of the header block per
+    /// repetition — quadratic: 409 MB of candidates from a 64 KB block, about
+    /// 100 GB from 1 MB, before the classifier scored any of it.
+    #[test]
+    fn multipart_header_parameters_are_read_in_linear_time() {
+        let multipart = |headers: &str| {
+            let body =
+                format!("--B\r\nContent-Disposition: form-data; {headers}\r\n\r\nv\r\n--B--");
+            let mut out = Vec::new();
+            body_field_values(&body, "multipart/form-data; boundary=B", &mut out);
+            (body.len(), out)
+        };
+
+        // Still every parameter, quoted or not, `filename=` included.
+        let (_, out) = multipart("name=\"f\"; filename=\"../../etc/passwd\"; x=1");
+        assert!(out.iter().any(|c| c == "f"), "{out:?}");
+        assert!(out.iter().any(|c| c == "../../etc/passwd"), "{out:?}");
+        let (_, out) = multipart("name=q ; filename=a.php");
+        assert!(out.iter().any(|c| c == "q") && out.iter().any(|c| c == "a.php"));
+        // A `name=` inside a value still yields its fragment, as it always
+        // has: the classifier can score a fragment above the whole value.
+        let (_, out) = multipart("name=\"x; name=y\"");
+        assert!(out.iter().any(|c| c == "x; name=y"), "{out:?}");
+        assert!(out.iter().any(|c| c == "y\""), "{out:?}");
+        // A real parameter after a block built to multiply fragments is
+        // still read.
+        let (_, out) = multipart(&format!("{}; filename=\"evil.php\"", "name=".repeat(5000)));
+        assert!(out.iter().any(|c| c == "evil.php"), "{out:?}");
+
+        // Every parameter value (per kind, at most the body), cut-short
+        // fragments (likewise) and whole fragments (at most four bodies plus
+        // 64 KiB): bounded by the WHOLE body, however it is split into parts.
+        let within_bound = |what: &str, len: usize, out: &[String], started: Instant| {
+            let copied: usize = out.iter().map(String::len).sum();
+            assert!(
+                copied <= 10 * len + 128 * 1024,
+                "{what}: {copied} bytes of candidates from {len}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "{what} took {:?}",
+                started.elapsed()
+            );
+        };
+
+        // 16 KB first: the old scan copied ~26 MB there and failed before
+        // reaching the megabyte, which would have needed about 100 GB.
+        for size in [16 * 1024, 1 << 20] {
+            for unit in ["name=", "name=\"\"", "filename=x;", "name= ", "name=\""] {
+                let started = Instant::now();
+                let (len, out) = multipart(&unit.repeat(size / unit.len()));
+                within_bound(&format!("{unit:?} x {size} bytes"), len, &out, started);
+            }
+        }
+
+        // The same spread over many parts. With a budget per header block,
+        // each ~1 KB part could spend 64 KiB on fragments: 1 MB of them made
+        // about 120 times the body in candidates (10 MiB, the default body
+        // limit, 1.29 GB). The budget is per body.
+        for (unit, reps) in [("filename=", 125), ("name=", 166), ("name=\"", 166)] {
+            let started = Instant::now();
+            let part = format!(
+                "--B\r\nContent-Disposition: form-data; {}\r\n\r\nv\r\n",
+                unit.repeat(reps)
+            );
+            let body = format!("{}--B--", part.repeat((1 << 20) / part.len()));
+            let mut out = Vec::new();
+            body_field_values(&body, "multipart/form-data; boundary=B", &mut out);
+            let what = format!("{unit:?} x {reps} in each part of 1 MB");
+            within_bound(&what, body.len(), &out, started);
+        }
+    }
+
+    /// A fragment over the budget is cut short at the next parameter name,
+    /// never dropped. Dropping it let the client choose what the classifier
+    /// saw: 200 `name=` inside the name value spent the budget, the fragment
+    /// `|/bin/id"` was skipped, and the request's score fell from 0.546 to
+    /// 0.216 — under 0.5, where ml_vetoes_weak_block may suppress a rule block.
+    #[test]
+    fn a_fragment_over_the_budget_is_cut_short_not_dropped() {
+        let attack = "filename=\"/cgi-bin/infosrch.cgi?cmd=getdoc&db=man&fname=|/bin/id\"";
+        let part = |headers: &str| {
+            format!("--B\r\nContent-Disposition: form-data; {headers}\r\n\r\nv\r\n")
+        };
+        let fragment_kept = |body: &str| {
+            let mut out = Vec::new();
+            body_field_values(body, "multipart/form-data; boundary=B", &mut out);
+            out.iter().any(|c| c.starts_with("|/bin/id"))
+        };
+
+        // Junk in the same header block, at every count up to twice the one
+        // that first lost the fragment (167).
+        for junk in 0..400 {
+            let headers = format!("name=\"{}\"; {attack}", "name=".repeat(junk));
+            let body = format!("{}--B--", part(&headers));
+            assert!(fragment_kept(&body), "lost after {junk} x name=");
+        }
+        // Junk in EARLIER parts: the budget belongs to the whole body, so they
+        // can spend all of it before the part that matters.
+        let junk = part(&"filename=".repeat(125)).repeat(900);
+        let body = format!("{junk}{}--B--", part(&format!("name=\"f\"; {attack}")));
+        assert!(fragment_kept(&body), "lost after 900 junk parts");
     }
 }

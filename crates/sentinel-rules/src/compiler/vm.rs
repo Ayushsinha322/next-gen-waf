@@ -1,3 +1,6 @@
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
 use sentinel_core::context::{Phase, RequestContext, RuleMatch, Severity, WafDecision};
 use tracing::{debug, warn};
 
@@ -134,56 +137,50 @@ fn percent_decode(s: &str) -> String {
 
 /// Decode both standard `%XX` and Microsoft IIS-style `%uXXXX` Unicode escapes.
 /// Used by the `UrlDecodeUni` transform to match ModSecurity's `t:urlDecodeUni`.
+///
+/// One pass over the BYTES — `%XX` becomes that byte, `%uXXXX` the UTF-8 bytes
+/// of its code point, a malformed escape (or a surrogate) stays literal, and
+/// everything else is copied — then ONE lossy UTF-8 conversion. Decoding into
+/// bytes first is what keeps a multi-byte character intact whether it arrives
+/// escaped (`%C3%A9`) or raw (`é`).
+///
+/// The previous loop re-decoded the whole remainder of the value for every
+/// `%` (quadratic: minutes on a 1 MB body of `%41`), turned `%C3%A9` into
+/// `é` plus a stray U+FFFD, and pushed raw bytes as Latin-1 chars, so `é`
+/// became `Ã©` whenever the value also held a `%`. An ASCII value whose `%XX`
+/// escapes are all below `%80` comes out exactly as before; non-ASCII text and
+/// high-byte escapes are what decode differently (correctly) now.
 fn url_decode_uni(s: &str) -> String {
     // Fast path: if no `%`, nothing to decode.
     if !s.contains('%') {
         return s.to_owned();
     }
 
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
+    let b = s.as_bytes();
+    let hex = |i: usize| b.get(i).and_then(|&c| (c as char).to_digit(16));
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            // Check for %uXXXX (4 hex digits after 'u' or 'U').
-            if i + 5 < bytes.len()
-                && (bytes[i + 1] == b'u' || bytes[i + 1] == b'U')
-                && bytes[i + 2..i + 6].iter().all(|b| b.is_ascii_hexdigit())
-            {
-                let hex = std::str::from_utf8(&bytes[i + 2..i + 6]).unwrap_or("0000");
-                if let Ok(n) = u32::from_str_radix(hex, 16) {
-                    if let Some(ch) = char::from_u32(n) {
-                        out.push(ch);
-                        i += 6;
-                        continue;
-                    }
+    while i < b.len() {
+        if b[i] == b'%' {
+            if matches!(b.get(i + 1), Some(b'u' | b'U')) {
+                // %uXXXX — exactly four hex digits naming a scalar value.
+                let cp = (i + 2..i + 6).try_fold(0u32, |acc, j| Some((acc << 4) | hex(j)?));
+                if let Some(ch) = cp.and_then(char::from_u32) {
+                    out.extend_from_slice(ch.encode_utf8(&mut [0u8; 4]).as_bytes());
+                    i += 6;
+                    continue;
                 }
-            }
-            // Standard %XX — delegate to percent_encoding for the remainder.
-            out.push_str(
-                &percent_encoding::percent_decode_str(&s[i..])
-                    .decode_utf8_lossy()
-                    .chars()
-                    .take(1)
-                    .collect::<String>(),
-            );
-            // Advance past `%XX` (3 bytes if valid, 1 byte if not).
-            if i + 2 < bytes.len()
-                && bytes[i + 1].is_ascii_hexdigit()
-                && bytes[i + 2].is_ascii_hexdigit()
-            {
+            } else if let (Some(hi), Some(lo)) = (hex(i + 1), hex(i + 2)) {
+                out.push(((hi << 4) | lo) as u8);
                 i += 3;
-            } else {
-                out.pop();
-                out.push(bytes[i] as char);
-                i += 1;
+                continue;
             }
-        } else {
-            out.push(bytes[i] as char);
-            i += 1;
         }
+        out.push(b[i]);
+        i += 1;
     }
-    out
+    // Valid UTF-8 (the common case) is adopted without a second copy.
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 /// Parse the Cookie header into (name, value) pairs.
@@ -289,35 +286,111 @@ fn contains_off_domain_url(value: &str, request_host: &str) -> bool {
     false
 }
 
+/// A body parameter's name, shared by every value filed under it.
+///
+/// One name can carry any number of values — each element of a JSON array,
+/// each text node of an XML element, each header line of a multipart part —
+/// and a `String` per value copied it that many times: a 48 KB JSON body (a
+/// 32 KB key over 8 K array elements) extracted 256 MB of names, and a 1 MB
+/// one would need about 128 GB, an allocation abort no panic guard catches.
+/// Shared, a repeat costs a reference count. Consumers that walk the names
+/// key on the allocation ([`name_id`]) so they, too, do the work once per
+/// name rather than once per value.
+type ArgName = Arc<str>;
+
+/// Identity of a shared name: the address of its text.
+fn name_id(name: &ArgName) -> usize {
+    name.as_ptr() as usize
+}
+
+/// The body's parameters cannot be listed within [`name_budget`].
+///
+/// Treated as a failure to inspect, never as an empty result: returning
+/// nothing would pass the body to the origin uninspected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BodyTooComplex;
+
+/// Why a request was refused for [`BodyTooComplex`].
+const BODY_TOO_COMPLEX: &str =
+    "request body could not be inspected: its JSON field names exceed the inspection limit";
+
+/// How many bytes of DISTINCT parameter names a body of `body_len` bytes may
+/// expand to: four times its size, plus 64 KiB so that a small, deeply nested
+/// document always fits.
+///
+/// Only JSON can exceed it. Its names are paths (`a.b.c`), so a long key over
+/// many distinct child keys spells itself out once per child: `{"<32 KB>":
+/// {"a0":0,"a1":0,…}}` is a quadratic expansion that repeats cannot explain
+/// and sharing cannot fix. An ordinary document stays far below: a name is at
+/// most as many keys long as the document is deep. For scale, ModSecurity's
+/// recommended configuration refuses any body with 1000 arguments or more.
+fn name_budget(body_len: usize) -> usize {
+    body_len.saturating_mul(4).saturating_add(64 * 1024)
+}
+
+/// The names one JSON body flattens to, built once each.
+struct JsonNames<'a> {
+    /// `(parent, key)` → the name `parent.key`. Keyed on the parent's
+    /// identity rather than its text, so meeting a name again — every object
+    /// in an array has the same keys — costs the key, not the whole path.
+    /// Holding every name here also keeps each parent's address unique for as
+    /// long as it is a key.
+    known: HashMap<(usize, &'a str), ArgName>,
+    /// Bytes of distinct names built so far, against `budget`.
+    built: usize,
+    budget: usize,
+}
+
+impl<'a> JsonNames<'a> {
+    fn child(&mut self, parent: &ArgName, key: &'a str) -> Result<ArgName, BodyTooComplex> {
+        if let Some(name) = self.known.get(&(name_id(parent), key)) {
+            return Ok(name.clone());
+        }
+        let name: ArgName = if parent.is_empty() {
+            key.into()
+        } else {
+            format!("{parent}.{key}").into()
+        };
+        self.built += name.len();
+        if self.built > self.budget {
+            return Err(BodyTooComplex);
+        }
+        self.known.insert((name_id(parent), key), name.clone());
+        Ok(name)
+    }
+}
+
 /// Recursively flatten a JSON value into ModSecurity-style `(name, value)`
 /// pairs.  Object keys become the parameter name; array elements inherit the
 /// parent name (matching ModSecurity's `ARGS:json.path` behaviour closely
 /// enough for detection).  Scalars are stringified; `null` is skipped.
-fn flatten_json(prefix: &str, val: &serde_json::Value, out: &mut Vec<(String, String)>) {
+fn flatten_json<'a>(
+    name: &ArgName,
+    val: &'a serde_json::Value,
+    names: &mut JsonNames<'a>,
+    out: &mut Vec<(ArgName, String)>,
+) -> Result<(), BodyTooComplex> {
     use serde_json::Value;
     match val {
         Value::Object(map) => {
             for (k, v) in map {
-                let key = if prefix.is_empty() {
-                    k.clone()
-                } else {
-                    format!("{prefix}.{k}")
-                };
-                flatten_json(&key, v, out);
+                let key = names.child(name, k)?;
+                flatten_json(&key, v, names, out)?;
             }
         }
         Value::Array(arr) => {
             for v in arr {
                 // Array elements share the parent name (ModSecurity treats
                 // repeated ARGS with the same name); keeps names meaningful.
-                flatten_json(prefix, v, out);
+                flatten_json(name, v, names, out)?;
             }
         }
-        Value::String(s) => out.push((prefix.to_owned(), s.clone())),
-        Value::Number(n) => out.push((prefix.to_owned(), n.to_string())),
-        Value::Bool(b) => out.push((prefix.to_owned(), b.to_string())),
+        Value::String(s) => out.push((name.clone(), s.clone())),
+        Value::Number(n) => out.push((name.clone(), n.to_string())),
+        Value::Bool(b) => out.push((name.clone(), b.to_string())),
         Value::Null => {}
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -330,7 +403,7 @@ struct MultipartParts {
     /// Non-file form fields: `(name, value)`.  These feed ARGS/ARGS_NAMES so
     /// injection delivered through a multipart form is inspected exactly like
     /// an `application/x-www-form-urlencoded` form.
-    fields: Vec<(String, String)>,
+    fields: Vec<(ArgName, String)>,
     /// Original client filenames (the `filename=` attribute). ModSec `FILES`.
     filenames: Vec<String>,
     /// Field names of file-upload parts (the `name=` attribute). ModSec
@@ -346,16 +419,22 @@ struct MultipartParts {
     /// because CRS 922 inspects these bytes directly: 922130 looks for bytes
     /// outside `\x21-\x7E` in a header name, so normalising here would erase the
     /// very anomaly it hunts for. `part_name` is the form-field name from
-    /// Content-Disposition, or empty when the part declares none.
-    part_headers: Vec<(String, String)>,
+    /// Content-Disposition, or empty when the part declares none — one shared
+    /// name per part, however many lines it has.
+    part_headers: Vec<(ArgName, String)>,
 }
 
-/// Locate the first occurrence of `needle` within `haystack`.
+/// Locate the first occurrence of `needle` within `haystack`, in time linear
+/// in both.
+///
+/// Comparing `needle` at every offset cost their PRODUCT, and the needle can
+/// be the boundary, which comes from the Content-Type header with no length
+/// limit: a 64 KB boundary against 1 MB of `-` took 2.1 s per search.
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() {
+    if needle.is_empty() {
         return None;
     }
-    haystack.windows(needle.len()).position(|w| w == needle)
+    memchr::memmem::find(haystack, needle)
 }
 
 /// Extract the `boundary` parameter from a `multipart/form-data` Content-Type.
@@ -393,9 +472,12 @@ fn multipart_parts(ctx: &RequestContext) -> MultipartParts {
     let body: &[u8] = body;
     let delim = format!("--{boundary}");
     let delim = delim.as_bytes();
+    // Built once: the delimiter is searched for once per part, and it can be
+    // as long as the Content-Type header allows.
+    let delim_finder = memchr::memmem::Finder::new(delim);
 
     // Position just past the first boundary marker.
-    let mut search_from = match find_bytes(body, delim) {
+    let mut search_from = match delim_finder.find(body) {
         Some(p) => p + delim.len(),
         None => return out,
     };
@@ -411,7 +493,7 @@ fn multipart_parts(ctx: &RequestContext) -> MultipartParts {
             None => break,
         };
         // The part runs up to the next boundary delimiter.
-        let next = match find_bytes(&body[part_start..], delim) {
+        let next = match delim_finder.find(&body[part_start..]) {
             Some(p) => part_start + p,
             None => break, // no closing delimiter — treat as malformed, stop
         };
@@ -453,7 +535,7 @@ fn parse_one_part(part: &[u8], out: &mut MultipartParts) {
     // itself the smuggling trick rule 922130 exists to catch: keeping such a
     // line intact leaves the raw \n inside the value, where the rule's
     // out-of-range byte class matches it. Splitting on \n too would hide it.
-    let part_label = name.clone().unwrap_or_default();
+    let part_label: ArgName = name.as_deref().unwrap_or_default().into();
     for line in headers.split("\r\n") {
         if !line.is_empty() {
             out.part_headers.push((part_label.clone(), line.to_owned()));
@@ -470,9 +552,9 @@ fn parse_one_part(part: &[u8], out: &mut MultipartParts) {
         }
         // Otherwise it is a regular form field; its value feeds ARGS.
         None => {
-            if let Some(n) = name {
+            if name.is_some() {
                 out.fields
-                    .push((n, String::from_utf8_lossy(content).into_owned()));
+                    .push((part_label, String::from_utf8_lossy(content).into_owned()));
             }
         }
     }
@@ -510,24 +592,36 @@ fn disposition_param(line: &str, key: &str) -> Option<String> {
 /// (the common case for login/search forms and JSON APIs) are not missed.
 /// Supports `application/x-www-form-urlencoded` and `application/json`
 /// (including `+json` suffixes such as `application/vnd.api+json`).
-fn body_args(ctx: &RequestContext) -> Vec<(String, String)> {
+///
+/// A value's name is shared with every other value under the same name (see
+/// [`ArgName`]); the only error is a JSON body whose distinct names would
+/// exceed [`name_budget`].
+fn body_args(ctx: &RequestContext) -> Result<Vec<(ArgName, String)>, BodyTooComplex> {
     let Some(body) = ctx.request_body.as_ref() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let ct = content_type(ctx);
-    if ct.starts_with("application/x-www-form-urlencoded") {
+    Ok(if ct.starts_with("application/x-www-form-urlencoded") {
         let text = String::from_utf8_lossy(body);
         parse_query_params(&text)
+            .into_iter()
+            .map(|(k, v)| (k.into(), v))
+            .collect()
     } else if ct.starts_with("application/json") || ct.contains("+json") {
         match serde_json::from_slice::<serde_json::Value>(body) {
             Ok(val) => {
+                let mut names = JsonNames {
+                    known: HashMap::new(),
+                    built: 0,
+                    budget: name_budget(body.len()),
+                };
                 let mut out = Vec::new();
-                flatten_json("", &val, &mut out);
+                flatten_json(&ArgName::from(""), &val, &mut names, &mut out)?;
                 out
             }
             // Malformed JSON: fall back to scanning the raw body as one value
             // so obfuscated/broken payloads still reach the regex operators.
-            Err(_) => vec![(String::new(), String::from_utf8_lossy(body).into_owned())],
+            Err(_) => vec![("".into(), String::from_utf8_lossy(body).into_owned())],
         }
     } else if ct.starts_with("multipart/form-data") {
         // Non-file form fields feed ARGS exactly like a urlencoded form, so
@@ -541,7 +635,7 @@ fn body_args(ctx: &RequestContext) -> Vec<(String, String)> {
         parse_xml_args(body)
     } else {
         Vec::new()
-    }
+    })
 }
 
 /// True for XML and SOAP content types — `text/xml`, `application/xml`,
@@ -563,10 +657,14 @@ fn is_xml_content_type(ct: &str) -> bool {
 /// declarations, namespaces, and DTDs are ignored. Malformed input fails open
 /// (extracts what it can). Byte offsets only ever land on ASCII delimiters
 /// (`<`, `>`, `]]>`, …), so all `&str` slicing stays on char boundaries.
-fn parse_xml_args(body: &[u8]) -> Vec<(String, String)> {
+fn parse_xml_args(body: &[u8]) -> Vec<(ArgName, String)> {
     let text = String::from_utf8_lossy(body);
-    let mut out: Vec<(String, String)> = Vec::new();
-    let mut cur_elem = String::new();
+    let mut out: Vec<(ArgName, String)> = Vec::new();
+    // One name per tag, shared by every text node and CDATA section under it:
+    // a long element name over thousands of nodes (split apart by comments)
+    // is held once, not once per node.
+    let no_elem: ArgName = "".into();
+    let mut cur_elem = no_elem.clone();
     let bytes = text.as_bytes();
     let mut i = 0;
 
@@ -615,12 +713,12 @@ fn parse_xml_args(body: &[u8]) -> Vec<(String, String)> {
             i = i + 1 + rel + 1;
             if let Some(_close) = inner.strip_prefix('/') {
                 // Closing tag — the element's text context ends.
-                cur_elem.clear();
+                cur_elem = no_elem.clone();
             } else {
                 // Opening or self-closing tag: `name attr="v" .../`.
                 let body_str = inner.trim_end_matches('/').trim();
                 let name_end = body_str.find(char::is_whitespace).unwrap_or(body_str.len());
-                cur_elem = local_name(&body_str[..name_end]);
+                cur_elem = local_name(&body_str[..name_end]).into();
                 extract_xml_attributes(&body_str[name_end..], &mut out);
             }
         }
@@ -631,13 +729,13 @@ fn parse_xml_args(body: &[u8]) -> Vec<(String, String)> {
 
 /// The local part of a possibly namespace-prefixed XML name
 /// (`soap:Envelope` → `Envelope`).
-fn local_name(raw: &str) -> String {
-    raw.rsplit(':').next().unwrap_or(raw).to_owned()
+fn local_name(raw: &str) -> &str {
+    raw.rsplit(':').next().unwrap_or(raw)
 }
 
 /// Extract `name="value"` / `name='value'` attribute pairs from the portion of
 /// a start tag after the element name, decoding XML entities in each value.
-fn extract_xml_attributes(attrs: &str, out: &mut Vec<(String, String)>) {
+fn extract_xml_attributes(attrs: &str, out: &mut Vec<(ArgName, String)>) {
     let chars: Vec<char> = attrs.chars().collect();
     let n = chars.len();
     let mut i = 0;
@@ -670,7 +768,7 @@ fn extract_xml_attributes(attrs: &str, out: &mut Vec<(String, String)>) {
                     i += 1; // consume the closing quote
                 }
                 if !name.is_empty() {
-                    out.push((name, decode_xml_entities(&val)));
+                    out.push((name.into(), decode_xml_entities(&val)));
                 }
             }
         }
@@ -688,10 +786,17 @@ fn decode_xml_entities(s: &str) -> String {
     while let Some(pos) = rest.find('&') {
         out.push_str(&rest[..pos]);
         let after = &rest[pos..];
-        let Some(semi) = after.find(';') else {
-            out.push('&');
-            rest = &after[1..];
-            continue;
+        // The reference ends at the first `;` — unless another `&` comes first,
+        // and then this `&` cannot start one (no entity contains `&`). Looking
+        // for `;` alone rescanned the rest of the body for every `&`: quadratic
+        // on an XML body full of `&` with no `;`.
+        let semi = match after[1..].find([';', '&']) {
+            Some(p) if after.as_bytes()[1 + p] == b';' => 1 + p,
+            _ => {
+                out.push('&');
+                rest = &after[1..];
+                continue;
+            }
         };
         let entity = &after[1..semi];
         let decoded = match entity {
@@ -728,12 +833,15 @@ fn decode_xml_entities(s: &str) -> String {
 /// It is threaded in rather than read from `ctx` because it is VM state that
 /// lives for one rule: `TargetSpec::MatchedVar` is the only consumer, and
 /// resolving it anywhere else would silently yield nothing.
+///
+/// Fails only for a body that cannot be listed within budget
+/// ([`BodyTooComplex`]); the caller refuses the request.
 fn extract_target(
     spec: &TargetSpec,
     ctx: &RequestContext,
     last_matched: Option<&str>,
-) -> Vec<String> {
-    match spec {
+) -> Result<Vec<String>, BodyTooComplex> {
+    Ok(match spec {
         // Outside a chain nothing has matched yet, and an empty list is the
         // honest answer: the condition simply does not match.
         TargetSpec::MatchedVar => last_matched.map(|v| vec![v.to_owned()]).unwrap_or_default(),
@@ -743,7 +851,7 @@ fn extract_target(
                 .map(|(_, v)| v)
                 .collect();
             // ARGS also includes urlencoded / JSON POST body parameters.
-            values.extend(body_args(ctx).into_iter().map(|(_, v)| v));
+            values.extend(body_args(ctx)?.into_iter().map(|(_, v)| v));
             values
         }
         TargetSpec::ArgsNames => {
@@ -751,7 +859,17 @@ fn extract_target(
                 .into_iter()
                 .map(|(k, _)| k)
                 .collect();
-            names.extend(body_args(ctx).into_iter().map(|(k, _)| k));
+            // A body name shared by several values is listed once. Every
+            // operator gives the same verdict on the same text, and listing it
+            // per value copied it per value — the blow-up `ArgName` exists to
+            // prevent. `&ARGS_NAMES` still counts each one (see `CountOf`).
+            let body = body_args(ctx)?;
+            let mut listed = HashSet::new();
+            names.extend(
+                body.iter()
+                    .filter(|(k, _)| listed.insert(name_id(k)))
+                    .map(|(k, _)| k.to_string()),
+            );
             names
         }
         TargetSpec::RequestUri => vec![ctx.uri.to_string()],
@@ -838,7 +956,7 @@ fn extract_target(
         TargetSpec::RequestCookiesNames => {
             if let Some(cookie_hdr) = ctx.request_headers.get("cookie") {
                 if let Ok(s) = cookie_hdr.to_str() {
-                    return parse_cookies(s).into_iter().map(|(k, _)| k).collect();
+                    return Ok(parse_cookies(s).into_iter().map(|(k, _)| k).collect());
                 }
             }
             vec![]
@@ -870,7 +988,7 @@ fn extract_target(
         TargetSpec::RequestCookiesAll => {
             if let Some(cookie_hdr) = ctx.request_headers.get("cookie") {
                 if let Ok(s) = cookie_hdr.to_str() {
-                    return parse_cookies(s).into_iter().map(|(_, v)| v).collect();
+                    return Ok(parse_cookies(s).into_iter().map(|(_, v)| v).collect());
                 }
             }
             vec![]
@@ -878,11 +996,11 @@ fn extract_target(
         TargetSpec::RequestCookie(name) => {
             if let Some(cookie_hdr) = ctx.request_headers.get("cookie") {
                 if let Ok(s) = cookie_hdr.to_str() {
-                    return parse_cookies(s)
+                    return Ok(parse_cookies(s)
                         .into_iter()
                         .filter(|(k, _)| k == name)
                         .map(|(_, v)| v)
-                        .collect();
+                        .collect());
                 }
             }
             vec![]
@@ -931,12 +1049,12 @@ fn extract_target(
             // value. Counting values alone would under-report a request that
             // smuggles its payload into parameter names, which is exactly the
             // shape 920390 exists to bound.
-            let total: usize = parse_query_params(ctx.uri.query().unwrap_or(""))
+            let query: usize = parse_query_params(ctx.uri.query().unwrap_or(""))
                 .iter()
-                .chain(body_args(ctx).iter())
                 .map(|(k, v)| k.len() + v.len())
                 .sum();
-            vec![total.to_string()]
+            let body: usize = body_args(ctx)?.iter().map(|(k, v)| k.len() + v.len()).sum();
+            vec![(query + body).to_string()]
         }
         TargetSpec::RemoteAddr => vec![ctx.client_ip.to_string()],
         TargetSpec::Geo => vec![], // TODO: GeoIP in Phase 2
@@ -955,11 +1073,16 @@ fn extract_target(
                     .as_ref()
                     .map(|h| h.get_all(name.as_str()).iter().count())
                     .unwrap_or(0),
-                other => extract_target(other, ctx, last_matched).len(),
+                // Every name, repeats included: the list itself shows a shared
+                // body name once.
+                TargetSpec::ArgsNames => {
+                    parse_query_params(ctx.uri.query().unwrap_or("")).len() + body_args(ctx)?.len()
+                }
+                other => extract_target(other, ctx, last_matched)?.len(),
             };
             vec![count.to_string()]
         }
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -998,7 +1121,31 @@ fn collect_sensitive_values(ctx: &RequestContext) -> Vec<String> {
     // JWT that tripped libinjection was therefore written verbatim to waf.log,
     // to ClickHouse under a 90-day TTL, and out to the SIEM.
     let mut pairs: Vec<(String, String)> = query_pairs;
-    pairs.extend(body_args(ctx));
+    let mut sensitive = Vec::new();
+    match body_args(ctx) {
+        Ok(body) => {
+            // Judged once per distinct name: a shared name can carry thousands
+            // of values, and the check lowercases it each time.
+            let mut verdicts: HashMap<usize, bool> = HashMap::new();
+            for (name, value) in &body {
+                if !value.is_empty()
+                    && *verdicts
+                        .entry(name_id(name))
+                        .or_insert_with(|| is_sensitive_field_name(name))
+                {
+                    sensitive.push(value.clone());
+                }
+            }
+        }
+        // The body's fields cannot be listed, so which of them are secret is
+        // unknown: the whole body stands in for them. Over-redacting a body no
+        // one could take apart is the safe side of not knowing.
+        Err(BodyTooComplex) => {
+            if let Some(b) = ctx.request_body.as_ref() {
+                sensitive.push(String::from_utf8_lossy(b).into_owned());
+            }
+        }
+    }
 
     // Cookies are not collected here: EVERY cookie value is withheld at capture
     // (see `withheld_cookie_value`), whatever its name. Judging them by name let
@@ -1020,11 +1167,13 @@ fn collect_sensitive_values(ctx: &RequestContext) -> Vec<String> {
         }
     }
 
-    pairs
-        .into_iter()
-        .filter(|(name, value)| !value.is_empty() && is_sensitive_field_name(name))
-        .map(|(_, value)| value)
-        .collect()
+    sensitive.extend(
+        pairs
+            .into_iter()
+            .filter(|(name, value)| !value.is_empty() && is_sensitive_field_name(name))
+            .map(|(_, value)| value),
+    );
+    sensitive
 }
 
 /// True when `value` is the value of a sensitively-named request field.
@@ -1184,7 +1333,18 @@ pub fn evaluate(
                 // inspected exactly one target, and left empty otherwise.
                 targets_seen += 1;
                 last_target = Some(spec.label());
-                let values = extract_target(spec, ctx, last_matched.as_deref());
+                let values = match extract_target(spec, ctx, last_matched.as_deref()) {
+                    Ok(values) => values,
+                    // A body that cannot be listed is refused, not inspected
+                    // as empty: an empty list would pass it uninspected. In
+                    // learning mode the proxy turns this into a logged
+                    // would-block, like any other verdict.
+                    Err(BodyTooComplex) => {
+                        ctx.decision = WafDecision::Block;
+                        ctx.block_reason = Some(BODY_TOO_COMPLEX.to_string());
+                        return WafDecision::Block;
+                    }
+                };
                 stack.push(StackVal::Strings(values));
             }
 
@@ -1897,10 +2057,12 @@ fn apply_transforms(mut s: String, transforms: &[Transform]) -> String {
 /// decoders that are idempotent once fully decoded, so benign text stabilises
 /// after one pass and is left unchanged. NOT used for base64/hex, where a second
 /// pass can spuriously "decode" already-plaintext into garbage.
-fn to_fixpoint(s: String, max: usize, f: impl Fn(String) -> String) -> String {
-    let mut cur = s;
+///
+/// Linear as long as `f` is: at most `max` passes, and decoding never grows
+/// the value. `f` borrows, so a pass costs one allocation, not a clone plus one.
+fn to_fixpoint(mut cur: String, max: usize, f: impl Fn(&str) -> String) -> String {
     for _ in 0..max {
-        let next = f(cur.clone());
+        let next = f(&cur);
         if next == cur {
             break;
         }
@@ -1915,7 +2077,7 @@ fn apply_single_transform(s: String, t: &Transform) -> String {
     match t {
         Transform::Lowercase => s.to_ascii_lowercase(),
         // Recursive: defeats double/triple URL-encoding evasion (%253Cscript).
-        Transform::UrlDecodeUni => to_fixpoint(s, 3, |x| url_decode_uni(&x)),
+        Transform::UrlDecodeUni => to_fixpoint(s, 3, url_decode_uni),
         Transform::RemoveNulls => s.replace('\0', ""),
         Transform::ReplaceNulls => s.replace('\0', " "),
         // Recursive: defeats nested HTML-entity encoding (&amp;#60; -> &#60; -> <).
@@ -2069,42 +2231,48 @@ fn escape_seq_decode(s: String) -> String {
 /// plus the common named entities. Previously only a fixed ~13-entry table,
 /// which let attackers evade the 39 XSS/SQLi rules that rely on this transform
 /// via arbitrary numeric entities (e.g. `&#40;` → `(`, `&#x61;` → `a`).
-fn decode_html_entities(s: String) -> String {
+///
+/// Works on the `&str` itself: every index it computes sits on an ASCII byte
+/// (`&`, `#`, a digit, `;`), so slicing never splits a character. It used to
+/// copy the value into a `Vec<char>`, then build a window `String` and try all
+/// 33 names against it for every `&` — linear, but the slowest transform by far
+/// (~0.5 s on 1 MB of `&` in the test profile).
+fn decode_html_entities(s: &str) -> String {
     if !s.contains('&') {
-        return s;
+        return s.to_owned();
     }
-    let chars: Vec<char> = s.chars().collect();
+    let b = s.as_bytes();
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
-    while i < chars.len() {
-        if chars[i] != '&' {
-            out.push(chars[i]);
-            i += 1;
-            continue;
-        }
+    while let Some(p) = s[i..].find('&') {
+        out.push_str(&s[i..i + p]);
+        i += p;
         // Numeric entity: &#DDD; (decimal) or &#xHH; / &#XHH; (hex).
-        if i + 2 < chars.len() && chars[i + 1] == '#' {
-            let (is_hex, start) = if chars[i + 2] == 'x' || chars[i + 2] == 'X' {
+        if i + 2 < b.len() && b[i + 1] == b'#' {
+            let (is_hex, start) = if matches!(b[i + 2], b'x' | b'X') {
                 (true, i + 3)
             } else {
                 (false, i + 2)
             };
-            let mut j = start;
-            while j < chars.len()
-                && ((is_hex && chars[j].is_ascii_hexdigit())
-                    || (!is_hex && chars[j].is_ascii_digit()))
-            {
-                j += 1;
-            }
-            if j > start {
-                let num: String = chars[start..j].iter().collect();
+            let digits = b[start..]
+                .iter()
+                .take_while(|c| {
+                    if is_hex {
+                        c.is_ascii_hexdigit()
+                    } else {
+                        c.is_ascii_digit()
+                    }
+                })
+                .count();
+            if digits > 0 {
+                let mut j = start + digits;
                 let radix = if is_hex { 16 } else { 10 };
-                if let Some(ch) = u32::from_str_radix(&num, radix)
+                if let Some(ch) = u32::from_str_radix(&s[start..j], radix)
                     .ok()
                     .and_then(char::from_u32)
                 {
                     out.push(ch);
-                    if j < chars.len() && chars[j] == ';' {
+                    if b.get(j) == Some(&b';') {
                         j += 1; // consume optional trailing ';'
                     }
                     i = j;
@@ -2113,10 +2281,7 @@ fn decode_html_entities(s: String) -> String {
             }
         }
         // Named entities (require the trailing ';').
-        // Window must fit the LONGEST name below (&NewLine; is 9). It was 6,
-        // which was exactly long enough for the six entities that used to be
-        // here and silently too short for anything else.
-        let window: String = chars[i..(i + 10).min(chars.len())].iter().collect();
+        //
         // HTML5 named entities for ASCII punctuation.
         //
         // This list held six entries — the ones everybody remembers — and that
@@ -2132,13 +2297,13 @@ fn decode_html_entities(s: String) -> String {
         //
         // So the entities that matter for evasion are the PUNCTUATION ones —
         // the characters that make a payload syntactically executable. They are
-        // all here now, ordered longest-first so a prefix match cannot pick a
-        // shorter name that happens to start the same way.
+        // all here now, and a name is matched whole, up to its `;`, so one that
+        // starts like another (`&comma;` / `&commat;`) cannot shadow it.
         //
         // Decoding more of them is strictly more correct, not more aggressive:
         // it makes the inspected string closer to what the browser will
         // actually execute, which is the whole purpose of the transform.
-        let named: &[(&str, char)] = &[
+        const NAMED: &[(&str, char)] = &[
             ("&NewLine;", '\n'),
             ("&percnt;", '%'),
             ("&lowbar;", '_'),
@@ -2173,14 +2338,33 @@ fn decode_html_entities(s: String) -> String {
             ("&lt;", '<'),
             ("&gt;", '>'),
         ];
-        if let Some((ent, ch)) = named.iter().find(|(ent, _)| window.starts_with(ent)) {
-            out.push(*ch);
-            i += ent.chars().count();
-            continue;
+        // A name's only `;` is its last byte, so the one candidate is the text
+        // up to the first `;`, looked for no further than the longest name.
+        // (A window shorter than that once made every name past the original
+        // six undecodable; an unbounded one would rescan the value per `&`.)
+        const LONGEST: usize = {
+            let (mut k, mut longest) = (0, 0);
+            while k < NAMED.len() {
+                if NAMED[k].0.len() > longest {
+                    longest = NAMED[k].0.len();
+                }
+                k += 1;
+            }
+            longest
+        };
+        let window = &b[i..b.len().min(i + LONGEST)];
+        if let Some(semi) = window.iter().position(|&c| c == b';') {
+            let name = &window[..=semi];
+            if let Some((_, ch)) = NAMED.iter().find(|(ent, _)| ent.as_bytes() == name) {
+                out.push(*ch);
+                i += name.len();
+                continue;
+            }
         }
         out.push('&');
         i += 1;
     }
+    out.push_str(&s[i..]);
     out
 }
 
@@ -2442,27 +2626,67 @@ fn remove_comments_char(s: String) -> String {
 }
 
 /// Remove SQL/C block comments (`/* ... */`) from input.
-fn remove_sql_comments(mut s: String) -> String {
-    while let Some(start) = s.find("/*") {
-        let end = match s[start + 2..].find("*/") {
-            Some(i) => start + 2 + i + 2,
-            None => break,
-        };
-        s = format!("{}{}", &s[..start], &s[end..]);
+///
+/// Same result as the loop this replaces — delete the leftmost complete comment,
+/// rescan from the start, stop at the first unterminated `/*` — without that
+/// loop's full rebuild per comment (quadratic: seconds on a 1 MB body of `/**/`).
+/// The rescan had one visible effect that is kept: deleting a comment can join
+/// a `/` before it to a `*` after it into a NEW opener (`/` `/**/` `*x*/` →
+/// `/*x*/` → ``), so a trailing `/` already emitted is checked first.
+fn remove_sql_comments(s: String) -> String {
+    if !s.contains("/*") {
+        return s;
     }
-    s
+    // Invariant: the string so far is `out + s[i..]`, and `out` holds no `/*`.
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    loop {
+        // (where `out` stops taking input, index just past the opener's `*`)
+        let (copy_to, body) = if out.ends_with('/') && s[i..].starts_with('*') {
+            (None, i + 1)
+        } else {
+            match s[i..].find("/*") {
+                Some(p) => (Some(i + p), i + p + 2),
+                None => break,
+            }
+        };
+        let Some(close) = s[body..].find("*/") else {
+            break; // unterminated: the rest stays as it is
+        };
+        match copy_to {
+            Some(start) => out.push_str(&s[i..start]),
+            None => {
+                out.pop(); // the `/` that opened this comment
+            }
+        }
+        i = body + close + 2;
+    }
+    out.push_str(&s[i..]);
+    out
 }
 
 /// Replace SQL/C block comments with a single space.
-fn replace_sql_comments(mut s: String) -> String {
-    while let Some(start) = s.find("/*") {
-        let end = match s[start + 2..].find("*/") {
-            Some(i) => start + 2 + i + 2,
-            None => break,
-        };
-        s = format!("{} {}", &s[..start], &s[end..]);
+///
+/// One pass, same result as the rescan loop it replaces (see
+/// [`remove_sql_comments`]). The emitted space means a deletion can never join
+/// two halves into a new opener, so no lookbehind is needed here.
+fn replace_sql_comments(s: String) -> String {
+    if !s.contains("/*") {
+        return s;
     }
-    s
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while let Some(p) = s[i..].find("/*") {
+        let start = i + p;
+        let Some(close) = s[start + 2..].find("*/") else {
+            break; // unterminated: the rest stays as it is
+        };
+        out.push_str(&s[i..start]);
+        out.push(' ');
+        i = start + 2 + close + 2;
+    }
+    out.push_str(&s[i..]);
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -2532,7 +2756,9 @@ fn pop_numeric_f64(stack: &mut Vec<StackVal>) -> f64 {
 /// Built once per LOGGED request, by the logger, from the same parsers the VM
 /// uses — never on the evaluation path, so detection cost is unchanged.
 pub struct RequestValues {
-    entries: Vec<(Collection, String, String)>,
+    /// `(collection, label, value)`. A label is shared by every value of one
+    /// body parameter, as its name is (see [`ArgName`]).
+    entries: Vec<(Collection, Arc<str>, String)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2569,21 +2795,33 @@ impl RequestValues {
     pub fn from_ctx(ctx: &RequestContext) -> Self {
         let mut entries = Vec::new();
         for (k, v) in parse_query_params(ctx.uri.query().unwrap_or("")) {
-            entries.push((Collection::ArgsNames, format!("ARGS_NAMES:{k}"), k.clone()));
-            entries.push((Collection::ArgsGet, format!("ARGS:{k}"), v));
+            entries.push((
+                Collection::ArgsNames,
+                format!("ARGS_NAMES:{k}").into(),
+                k.clone(),
+            ));
+            entries.push((Collection::ArgsGet, format!("ARGS:{k}").into(), v));
         }
-        let body = body_args(ctx);
+        // A body that cannot be listed within budget is listed raw, below.
+        let body = body_args(ctx).unwrap_or_default();
         let body_parsed = !body.is_empty();
-        for (k, v) in body {
-            if !k.is_empty() {
-                entries.push((Collection::ArgsNames, format!("ARGS_NAMES:{k}"), k.clone()));
-            }
-            let label = if k.is_empty() {
-                "REQUEST_BODY".to_string()
-            } else {
-                format!("ARGS:{k}")
-            };
-            entries.push((Collection::ArgsPost, label, v));
+        // Each distinct name is labelled — and listed under ARGS_NAMES — once,
+        // its values sharing the label: formatting it per value copied a name
+        // as many times as it had values.
+        let mut labels: HashMap<usize, Arc<str>> = HashMap::new();
+        for (k, v) in &body {
+            let label = labels.entry(name_id(k)).or_insert_with(|| {
+                if k.is_empty() {
+                    return "REQUEST_BODY".into();
+                }
+                entries.push((
+                    Collection::ArgsNames,
+                    format!("ARGS_NAMES:{k}").into(),
+                    k.to_string(),
+                ));
+                format!("ARGS:{k}").into()
+            });
+            entries.push((Collection::ArgsPost, label.clone(), v.clone()));
         }
         if let Some(c) = ctx
             .request_headers
@@ -2591,21 +2829,25 @@ impl RequestValues {
             .and_then(|v| v.to_str().ok())
         {
             for (k, v) in parse_cookies(c) {
-                entries.push((Collection::Cookies, format!("REQUEST_COOKIES:{k}"), v));
+                entries.push((
+                    Collection::Cookies,
+                    format!("REQUEST_COOKIES:{k}").into(),
+                    v,
+                ));
             }
         }
         for (name, value) in ctx.request_headers.iter() {
             if let Ok(v) = value.to_str() {
                 entries.push((
                     Collection::Headers,
-                    format!("REQUEST_HEADERS:{}", name.as_str()),
+                    format!("REQUEST_HEADERS:{}", name.as_str()).into(),
                     v.to_owned(),
                 ));
             }
         }
         entries.push((
             Collection::Filename,
-            "REQUEST_FILENAME".to_string(),
+            "REQUEST_FILENAME".into(),
             percent_decode(ctx.uri.path()),
         ));
         // The raw body only when no parser claimed it: a parsed body is already
@@ -2615,7 +2857,7 @@ impl RequestValues {
             if let Some(b) = ctx.request_body.as_ref() {
                 entries.push((
                     Collection::Body,
-                    "REQUEST_BODY".to_string(),
+                    "REQUEST_BODY".into(),
                     String::from_utf8_lossy(b).into_owned(),
                 ));
             }
@@ -2664,26 +2906,31 @@ impl RequestValues {
             _ => return None,
         };
         let multi = rule_target.is_empty();
-        let mut found: Option<&str> = None;
+        let mut found: Option<&Arc<str>> = None;
         for (coll, label, value) in &self.entries {
             if !allowed.contains(coll) {
                 continue;
             }
             if multi
                 && *coll == Collection::Headers
-                && (label == "REQUEST_HEADERS:cookie" || label == "REQUEST_HEADERS:referer")
+                && matches!(
+                    &**label,
+                    "REQUEST_HEADERS:cookie" | "REQUEST_HEADERS:referer"
+                )
             {
                 continue;
             }
             if normalize_for_locate(value).contains(&needle) {
                 match found {
-                    None => found = Some(label.as_str()),
-                    Some(prev) if prev == label.as_str() => {}
+                    None => found = Some(label),
+                    // Another value of the same parameter: one shared label,
+                    // compared by identity before text.
+                    Some(prev) if Arc::ptr_eq(prev, label) || prev == label => {}
                     Some(_) => return None, // two places — not certain
                 }
             }
         }
-        found.map(str::to_string)
+        found.map(|label| label.to_string())
     }
 }
 
@@ -2919,12 +3166,14 @@ mod xml_tests {
         let body = br#"<order id="42"><item cat="books">' OR 1=1--</item></order>"#;
         let pairs = parse_xml_args(body);
         assert!(
-            pairs.iter().any(|(k, v)| k == "id" && v == "42"),
+            pairs.iter().any(|(k, v)| &**k == "id" && v == "42"),
             "attribute value must be surfaced: {pairs:?}"
         );
-        assert!(pairs.iter().any(|(k, v)| k == "cat" && v == "books"));
+        assert!(pairs.iter().any(|(k, v)| &**k == "cat" && v == "books"));
         assert!(
-            pairs.iter().any(|(k, v)| k == "item" && v == "' OR 1=1--"),
+            pairs
+                .iter()
+                .any(|(k, v)| &**k == "item" && v == "' OR 1=1--"),
             "element text keyed by local element name: {pairs:?}"
         );
     }
@@ -2951,7 +3200,7 @@ mod xml_tests {
         assert!(
             pairs
                 .iter()
-                .any(|(k, v)| k == "q" && v == "select * from users"),
+                .any(|(k, v)| &**k == "q" && v == "select * from users"),
             "namespace prefix stripped to local name: {pairs:?}"
         );
     }
@@ -2960,7 +3209,7 @@ mod xml_tests {
     fn xml_ignores_comments_pi_and_doctype() {
         let body = br#"<?xml version="1.0"?><!DOCTYPE x><!-- <injected> --><root>data</root>"#;
         let pairs = parse_xml_args(body);
-        assert!(pairs.iter().any(|(k, v)| k == "root" && v == "data"));
+        assert!(pairs.iter().any(|(k, v)| &**k == "root" && v == "data"));
         assert!(
             !pairs.iter().any(|(_, v)| v.contains("injected")),
             "comment content must not leak into ARGS: {pairs:?}"
@@ -2981,7 +3230,7 @@ mod xml_tests {
         // Unterminated tag / truncated body must not panic and should still
         // surface whatever text it can.
         let pairs = parse_xml_args(b"<a>hello");
-        assert!(pairs.iter().any(|(k, v)| k == "a" && v == "hello"));
+        assert!(pairs.iter().any(|(k, v)| &**k == "a" && v == "hello"));
         let _ = parse_xml_args(b"<a href=\"unterminated");
         let _ = parse_xml_args(b"<![CDATA[unterminated");
     }
@@ -3093,5 +3342,562 @@ mod encoding_validator_tests {
              must still be detectable, or the operator is inert for the targets \
              CRS 920250 names"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transform correctness and cost tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod transform_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// About 1 MB: a tenth of the default `max_body_size`, so well within what
+    /// any client can make the engine inspect.
+    const MB: usize = 1 << 20;
+
+    /// Generous for linear work on 1 MB at the test profile's opt-level (each
+    /// case takes milliseconds); the quadratic versions took seconds to minutes.
+    const BOUND: Duration = Duration::from_secs(2);
+
+    /// `unit` repeated to about 1 MB.
+    fn mb_of(unit: &str) -> String {
+        unit.repeat(MB / unit.len())
+    }
+
+    /// Whether `f`, run on a worker thread, finishes within `BOUND`. Waiting on
+    /// a channel rather than joining means a quadratic regression fails in
+    /// seconds instead of hanging the suite until it completes.
+    fn finishes_in_time(f: impl FnOnce() + Send + 'static) -> bool {
+        within(BOUND, f).is_some()
+    }
+
+    /// `f`'s result, if it arrives within `bound`.
+    fn within<T: Send + 'static>(
+        bound: Duration,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(bound).ok()
+    }
+
+    /// Every `Transform` variant, read off the type itself: asked for a
+    /// variant that does not exist, serde's error names all of them. A
+    /// hand-kept list compiled just as happily with a new variant left out,
+    /// and that variant then never ran here.
+    fn all_transforms() -> Vec<Transform> {
+        let err = serde_json::from_str::<Transform>("\"__\"")
+            .expect_err("`__` is not a transform")
+            .to_string();
+        let (_, listed) = err
+            .split_once("expected one of")
+            .unwrap_or_else(|| panic!("serde's error no longer lists the variants: {err}"));
+        // "`A`, `B`, … at line 1 column 4": every other piece is a name.
+        let all: Vec<Transform> = listed
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .map(|name| serde_json::from_str(&format!("\"{name}\"")).expect(name))
+            .collect();
+        // A message that parsed into a stub would pass every check below.
+        assert!(
+            all.len() >= 23,
+            "only {} transforms read from {err}",
+            all.len()
+        );
+        all
+    }
+
+    /// Inputs that drive each transform down its escape / rescan path as often
+    /// as 1 MB allows. The match is exhaustive on purpose: a new transform has
+    /// to name its own worst case, and `all_transforms` makes sure it runs.
+    fn worst_cases(t: &Transform) -> Vec<String> {
+        match t {
+            Transform::UrlDecodeUni => vec![
+                mb_of("%41"),
+                mb_of("%u0041"),
+                mb_of("%"),
+                mb_of("%C3%A9é"),
+                mb_of("%2541"),
+            ],
+            Transform::HtmlEntityDecode => vec![
+                mb_of("&amp;"),
+                mb_of("&#x41;"),
+                mb_of("&"),
+                format!("&#{}", "0".repeat(MB)),
+            ],
+            Transform::JsDecode => vec![mb_of("\\u0041\\x41\\n"), mb_of("\\")],
+            Transform::CssDecode => vec![mb_of("\\41 "), mb_of("\\")],
+            Transform::EscapeSeqDecode => vec![mb_of("\\x41\\101\\n"), mb_of("\\")],
+            Transform::CmdLine => vec![mb_of("a ;\\\"^' /(,")],
+            Transform::RemoveComments | Transform::ReplaceComments => {
+                vec![mb_of("/**/"), mb_of("x/**/"), mb_of("//**/*"), mb_of("/*")]
+            }
+            Transform::RemoveCommentsChar => vec![mb_of("/**///")],
+            Transform::RemoveWhitespace | Transform::CompressWhitespace => {
+                vec![mb_of(" \t\n")]
+            }
+            Transform::Trim | Transform::TrimLeft | Transform::TrimRight => {
+                vec![mb_of(" "), mb_of(" a ")]
+            }
+            Transform::NormalisePath | Transform::NormalisePathWin => {
+                vec![mb_of("../a/./"), mb_of("a//"), mb_of("..\\a\\.\\")]
+            }
+            Transform::Base64Decode => vec![mb_of("QUJD"), format!("/{}", mb_of("QUJD"))],
+            Transform::HexDecode => vec![mb_of("41")],
+            Transform::Utf8ToUnicode => vec![mb_of("é€a")],
+            Transform::Lowercase
+            | Transform::RemoveNulls
+            | Transform::ReplaceNulls
+            | Transform::Length => vec![mb_of("A\0")],
+        }
+    }
+
+    /// The transforms run on every inspected value, so one that is not linear
+    /// in its input is a CPU-exhaustion lever for whoever sends the request.
+    /// `t:urlDecodeUni` re-decoded the rest of the value for every `%`, and
+    /// `t:removeComments` / `t:replaceComments` rebuilt it for every comment.
+    #[test]
+    fn every_transform_is_linear_on_a_megabyte() {
+        let mut slow = Vec::new();
+        for t in all_transforms() {
+            for (case, input) in worst_cases(&t).into_iter().enumerate() {
+                let tr = t.clone();
+                if !finishes_in_time(move || drop(apply_single_transform(input, &tr))) {
+                    slow.push(format!("{t:?} case {case}"));
+                }
+            }
+        }
+        assert!(
+            slow.is_empty(),
+            "over {BOUND:?} on ~1 MB, i.e. not linear in input length: {slow:?}"
+        );
+    }
+
+    /// `%XX` is a BYTE and `%uXXXX` a code point; the text is formed once, at
+    /// the end, so a character is never split between two escapes or misread.
+    #[test]
+    fn url_decode_uni_keeps_multibyte_utf8() {
+        let d = url_decode_uni;
+        // Escaped multi-byte characters: one `é`, not `é` plus U+FFFD.
+        assert_eq!(d("caf%C3%A9"), "café");
+        assert_eq!(d("%E2%82%AC"), "€");
+        assert_eq!(d("%F0%9F%98%80"), "😀");
+        // Raw multi-byte text beside an escape is copied, not read as Latin-1
+        // (`é` came out as `Ã©` whenever the value also held a `%`).
+        assert_eq!(d("café%20au%20lait"), "café au lait");
+        assert_eq!(d("日本%2F語"), "日本/語");
+        // %uXXXX in either case, encoded as UTF-8.
+        assert_eq!(d("%u00e9%U20AC"), "é€");
+        assert_eq!(d("%u003Cscript%u003E"), "<script>");
+        // Malformed escapes stay literal; a lone surrogate is not a character.
+        assert_eq!(d("100%"), "100%");
+        assert_eq!(d("%zz%4"), "%zz%4");
+        assert_eq!(d("%u12"), "%u12");
+        assert_eq!(d("%uD800x"), "%uD800x");
+        // Bytes that are not UTF-8 become U+FFFD.
+        assert_eq!(d("a%FFb"), "a\u{FFFD}b");
+        assert_eq!(d("%C3"), "\u{FFFD}");
+        // The recursive transform unwraps double-encoded multi-byte text.
+        assert_eq!(
+            apply_transforms("caf%25C3%25A9".to_string(), &[Transform::UrlDecodeUni]),
+            "café"
+        );
+    }
+
+    /// The pre-fix decoder, verbatim: the oracle for "an ASCII value whose
+    /// `%XX` escapes are all below `%80` comes out exactly as before".
+    fn old_url_decode_uni(s: &str) -> String {
+        if !s.contains('%') {
+            return s.to_owned();
+        }
+        let bytes = s.as_bytes();
+        let mut out = String::with_capacity(s.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' {
+                if i + 5 < bytes.len()
+                    && (bytes[i + 1] == b'u' || bytes[i + 1] == b'U')
+                    && bytes[i + 2..i + 6].iter().all(|b| b.is_ascii_hexdigit())
+                {
+                    let hex = std::str::from_utf8(&bytes[i + 2..i + 6]).unwrap_or("0000");
+                    if let Ok(n) = u32::from_str_radix(hex, 16) {
+                        if let Some(ch) = char::from_u32(n) {
+                            out.push(ch);
+                            i += 6;
+                            continue;
+                        }
+                    }
+                }
+                out.push_str(
+                    &percent_encoding::percent_decode_str(&s[i..])
+                        .decode_utf8_lossy()
+                        .chars()
+                        .take(1)
+                        .collect::<String>(),
+                );
+                if i + 2 < bytes.len()
+                    && bytes[i + 1].is_ascii_hexdigit()
+                    && bytes[i + 2].is_ascii_hexdigit()
+                {
+                    i += 3;
+                } else {
+                    out.pop();
+                    out.push(bytes[i] as char);
+                    i += 1;
+                }
+            } else {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// The pre-fix comment loops, verbatim: oracles for the one-pass versions.
+    fn old_remove_sql_comments(mut s: String) -> String {
+        while let Some(start) = s.find("/*") {
+            let end = match s[start + 2..].find("*/") {
+                Some(i) => start + 2 + i + 2,
+                None => break,
+            };
+            s = format!("{}{}", &s[..start], &s[end..]);
+        }
+        s
+    }
+
+    fn old_replace_sql_comments(mut s: String) -> String {
+        while let Some(start) = s.find("/*") {
+            let end = match s[start + 2..].find("*/") {
+                Some(i) => start + 2 + i + 2,
+                None => break,
+            };
+            s = format!("{} {}", &s[..start], &s[end..]);
+        }
+        s
+    }
+
+    /// Every string of length `0..=max` over `alphabet`.
+    fn all_strings(alphabet: &[char], max: usize) -> Vec<String> {
+        let mut layer = vec![String::new()];
+        let mut all = layer.clone();
+        for _ in 0..max {
+            layer = layer
+                .iter()
+                .flat_map(|p| alphabet.iter().map(move |c| format!("{p}{c}")))
+                .collect();
+            all.extend(layer.iter().cloned());
+        }
+        all
+    }
+
+    #[test]
+    fn url_decode_uni_is_unchanged_on_ascii_input_and_escapes() {
+        // ASCII input only, and hex digits 0/4/7 keep every `%XX` below 0x80,
+        // where the old decoder was right; `u`/`U` reach the %uXXXX path, `%`
+        // the malformed ones. Not ASCII input alone: `%C3%A9` is ASCII and the
+        // old decoder still gave `é` plus a stray U+FFFD.
+        for s in all_strings(&['%', 'u', 'U', '0', '4', '7'], 7) {
+            assert_eq!(url_decode_uni(&s), old_url_decode_uni(&s), "input {s:?}");
+        }
+    }
+
+    #[test]
+    fn comment_transforms_match_the_rescan_loop() {
+        let rm = |s: &str| remove_sql_comments(s.to_owned());
+        let rp = |s: &str| replace_sql_comments(s.to_owned());
+        assert_eq!(rm("UNION/**/SELECT"), "UNIONSELECT");
+        assert_eq!(rp("UNION/**/SELECT"), "UNION SELECT");
+        assert_eq!(rm("é/*x*/ü"), "éü");
+        // Unterminated: everything from the open comment on is kept.
+        assert_eq!(rm("a/**/b/*c"), "ab/*c");
+        assert_eq!(rp("a/**/b/*c"), "a b/*c");
+        // Deleting a comment can join `/` and `*` into a new opener, which the
+        // rescan then deleted too. A space in between cannot form one.
+        assert_eq!(rm("//**/*x*/"), "");
+        assert_eq!(rp("//**/*x*/"), "/ *x*/");
+        // Exhaustive over the characters that decide it.
+        for s in all_strings(&['/', '*', 'x'], 10) {
+            assert_eq!(rm(&s), old_remove_sql_comments(s.clone()), "remove {s:?}");
+            assert_eq!(rp(&s), old_replace_sql_comments(s.clone()), "replace {s:?}");
+        }
+    }
+
+    /// XML bodies feed `ARGS`, and every `&` used to search for `;` to the end
+    /// of the value: quadratic on a body of `&` with no `;`.
+    #[test]
+    fn xml_entity_decoding_is_linear() {
+        // An `&` with another `&` before any `;` is literal, as it always was.
+        assert_eq!(decode_xml_entities("a & b &lt; c"), "a & b < c");
+        assert_eq!(decode_xml_entities("&a&lt;"), "&a<");
+        assert_eq!(decode_xml_entities("&#60&gt;"), "&#60>");
+        assert_eq!(decode_xml_entities("&&&;"), "&&&;");
+
+        let text = format!("<a>{}</a>", "&".repeat(MB));
+        let attr = format!("<a v=\"{}\"/>", mb_of("&x"));
+        for body in [text, attr] {
+            assert!(
+                finishes_in_time(move || drop(parse_xml_args(body.as_bytes()))),
+                "XML entity decoding took over {BOUND:?} on ~1 MB"
+            );
+        }
+    }
+
+    // -- Body extraction: names repeated per value ---------------------------
+
+    /// A request whose body is `body`, sent as `content_type`.
+    fn body_ctx(content_type: &str, body: Vec<u8>) -> RequestContext {
+        let mut ctx = RequestContext::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 1);
+        ctx.uri = "/submit".parse().unwrap();
+        ctx.request_headers
+            .insert("content-type", content_type.parse().unwrap());
+        ctx.request_body = Some(body.into());
+        ctx
+    }
+
+    /// The body's `(name, value)` pairs, for a body within budget.
+    fn args(ctx: &RequestContext) -> Vec<(ArgName, String)> {
+        body_args(ctx).expect("within the name budget")
+    }
+
+    /// Bytes of name text actually held: each allocation once, however many
+    /// values share it. A name copied per value counts once per copy.
+    fn name_bytes<'a, N: AsRef<str> + 'a>(names: impl IntoIterator<Item = &'a N>) -> usize {
+        let mut seen = HashSet::new();
+        names
+            .into_iter()
+            .map(|n| n.as_ref())
+            .filter(|n| seen.insert(n.as_ptr() as usize))
+            .map(str::len)
+            .sum()
+    }
+
+    /// Bodies about `size` bytes long in which ONE name carries many values:
+    /// half the body is the name, half the values under it.
+    fn shared_name_bodies(size: usize) -> Vec<(&'static str, &'static str, Vec<u8>)> {
+        let half = size / 2;
+        let key = "k".repeat(half);
+        let multipart = format!(
+            "--B\r\nContent-Disposition: form-data; name=\"{key}\"\r\n{}\r\nv\r\n--B--\r\n",
+            "X: y\r\n".repeat(half / 6)
+        );
+        vec![
+            (
+                "JSON array",
+                "application/json",
+                format!("{{\"{key}\":[{}0]}}", "0,".repeat(half / 2)),
+            ),
+            (
+                "JSON objects in an array",
+                "application/json",
+                format!("{{\"{key}\":[{}{{}}]}}", "{\"a\":0},".repeat(half / 8)),
+            ),
+            (
+                "XML text between comments",
+                "application/xml",
+                format!("<{key}>{}", "x<!---->".repeat(half / 8)),
+            ),
+            (
+                "XML CDATA sections",
+                "text/xml",
+                format!("<{key}>{}", "<![CDATA[x]]>".repeat(half / 13)),
+            ),
+            (
+                "multipart header lines",
+                "multipart/form-data; boundary=B",
+                multipart,
+            ),
+        ]
+        .into_iter()
+        .map(|(what, ct, body)| (what, ct, body.into_bytes()))
+        .collect()
+    }
+
+    /// Every extractor and every consumer that walks the names, on one body:
+    /// the name bytes each one holds.
+    fn names_held(ct: &str, body: Vec<u8>) -> [usize; 4] {
+        let ctx = body_ctx(ct, body);
+        let pairs = args(&ctx);
+        let part_headers = multipart_parts(&ctx).part_headers;
+        let listed = extract_target(&TargetSpec::ArgsNames, &ctx, None).unwrap();
+        let values = RequestValues::from_ctx(&ctx);
+        drop(collect_sensitive_values(&ctx));
+        [
+            name_bytes(pairs.iter().map(|(k, _)| k)),
+            name_bytes(part_headers.iter().map(|(k, _)| k)),
+            name_bytes(listed.iter()),
+            name_bytes(values.entries.iter().map(|(_, label, _)| label))
+                + name_bytes(values.entries.iter().map(|(_, _, v)| v)),
+        ]
+    }
+
+    /// A name used to be copied once per value it carried — by the JSON, XML
+    /// and multipart extractors and again by ARGS_NAMES, the match locator and
+    /// the redaction pass — so a body made of one long name and many short
+    /// values held name bytes in proportion to their PRODUCT: 256 MB from a
+    /// 48 KB JSON body, about 128 GB from 1 MB, an allocation abort that
+    /// panic isolation cannot catch.
+    #[test]
+    fn a_name_shared_by_many_values_is_held_once() {
+        // 16 KB first: small enough that the per-value copies stay in the tens
+        // of megabytes, so the old code fails here instead of exhausting memory
+        // on the megabyte below.
+        for size in [16 * 1024, MB] {
+            for (what, ct, body) in shared_name_bodies(size) {
+                let len = body.len();
+                // Five extractions of the same body (~0.5 s for a megabyte
+                // here), hence five bounds.
+                let bound = 5 * BOUND;
+                let held = within(bound, move || names_held(ct, body))
+                    .unwrap_or_else(|| panic!("{what}: over {bound:?} on {len} bytes"));
+                // Values and the raw body are listed too; names alone stay
+                // within a couple of body lengths.
+                for (n, bytes) in held.into_iter().enumerate() {
+                    assert!(
+                        bytes <= 2 * len,
+                        "{what} ({len} bytes): consumer {n} held {bytes} bytes of names"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Sharing cannot help when every name is DIFFERENT: a JSON key spelled out
+    /// again as the prefix of each of its many child keys. Listing them all
+    /// grows with the square of the body, and listing only some would pass
+    /// the rest uninspected, so the body is refused instead.
+    #[test]
+    fn json_names_past_the_budget_refuse_the_request() {
+        let distinct_children = |size: usize| {
+            let key = "k".repeat(size / 2);
+            let kids: Vec<String> = (0..size / 20).map(|i| format!("\"a{i}\":0")).collect();
+            format!("{{\"{key}\":{{{}}}}}", kids.join(",")).into_bytes()
+        };
+        for size in [16 * 1024, MB] {
+            let body = distinct_children(size);
+            let len = body.len();
+            let over = within(BOUND, move || {
+                let ctx = body_ctx("application/json", body);
+                match body_args(&ctx) {
+                    Err(BodyTooComplex) => None,
+                    Ok(pairs) => Some(name_bytes(pairs.iter().map(|(k, _)| k))),
+                }
+            })
+            .unwrap_or_else(|| panic!("over {BOUND:?} on {len} bytes"));
+            assert_eq!(
+                over, None,
+                "{len}-byte body extracted names past the budget"
+            );
+        }
+
+        // The engine refuses it; in learning mode the proxy logs that as a
+        // would-block, as it does every Block.
+        let engine = crate::RuleEngine::from_crs_conf(
+            "SecRule ARGS \"@rx never-present\" \"id:1,phase:2,deny\"",
+        )
+        .unwrap();
+        let mut ctx = body_ctx("application/json", distinct_children(64 * 1024));
+        let decision = engine.evaluate(&mut ctx, Phase::RequestBody, 0);
+        assert_eq!(decision, WafDecision::Block);
+        assert_eq!(ctx.block_reason.as_deref(), Some(BODY_TOO_COMPLEX));
+
+        // A deep, ordinary document is nowhere near the limit: five levels of
+        // ordinary keys over 500 objects, 1,500 distinct leaves.
+        let services: Vec<String> = (0..500)
+            .map(|i| format!("\"svc{i}\":{{\"replicas\":2,\"image\":\"app:1.4\",\"port\":8080}}"))
+            .collect();
+        let doc = format!(
+            "{{\"application\":{{\"environment\":{{\"production\":{{\"services\":{{{}}}}}}}}}}}",
+            services.join(",")
+        );
+        let mut ctx = body_ctx("application/json", doc.into_bytes());
+        let pairs = args(&ctx);
+        assert_eq!(pairs.len(), 1500);
+        assert!(pairs.iter().any(|(k, v)| &**k
+            == "application.environment.production.services.svc499.port"
+            && v == "8080"));
+        assert_eq!(
+            engine.evaluate(&mut ctx, Phase::RequestBody, 0),
+            WafDecision::Allow
+        );
+    }
+
+    /// What sharing changes, and what it must not.
+    #[test]
+    fn a_shared_name_is_listed_once_and_counted_every_time() {
+        let mut ctx = body_ctx(
+            "application/json",
+            br#"{"a":["v1","v2","v3"],"b":{"c":"x"},"password":["s3cret-one","s3cret-two"]}"#
+                .to_vec(),
+        );
+        ctx.uri = "/submit?q=1&q=2".parse().unwrap();
+        let target = |spec: TargetSpec| extract_target(&spec, &ctx, None).unwrap();
+
+        // A repeated QUERY name is still listed per value; a shared body name
+        // once — the same verdict for any operator, and no copy per value.
+        assert_eq!(
+            target(TargetSpec::ArgsNames),
+            ["q", "q", "a", "b.c", "password"]
+        );
+        // Counts are of names as sent, repeats included, as before.
+        assert_eq!(
+            target(TargetSpec::CountOf(Box::new(TargetSpec::ArgsNames))),
+            ["8"]
+        );
+        assert_eq!(
+            target(TargetSpec::CountOf(Box::new(TargetSpec::Args))),
+            ["8"]
+        );
+        // q1 q2: 4; a v1 v2 v3: 9; b.c x: 4; password ×2: 2 × (8 + 10) = 36.
+        assert_eq!(target(TargetSpec::ArgsCombinedSize), ["53"]);
+
+        // Every value of a sensitive name is withheld, not only the first.
+        let sensitive = collect_sensitive_values(&ctx);
+        assert!(
+            sensitive.contains(&"s3cret-one".to_string()),
+            "{sensitive:?}"
+        );
+        assert!(
+            sensitive.contains(&"s3cret-two".to_string()),
+            "{sensitive:?}"
+        );
+
+        // Values sharing a label are one place, not an ambiguity.
+        let values = RequestValues::from_ctx(&ctx);
+        assert_eq!(values.locate("ARGS", "v").as_deref(), Some("ARGS:a"));
+        assert_eq!(
+            values.locate("ARGS_NAMES", "b.c").as_deref(),
+            Some("ARGS_NAMES:b.c")
+        );
+    }
+
+    /// The boundary comes from Content-Type, with no length limit, and was
+    /// searched for by comparing it at every offset: time in proportion to
+    /// boundary length times body length.
+    #[test]
+    fn a_long_multipart_boundary_is_found_in_linear_time() {
+        let boundary = format!("{}b", "-".repeat(256 * 1024));
+        let ct = format!("multipart/form-data; boundary={boundary}");
+        let ctx = body_ctx(&ct, vec![b'-'; MB]);
+        assert!(
+            finishes_in_time(move || drop(multipart_parts(&ctx))),
+            "a {} KB boundary over 1 MB took over {BOUND:?}",
+            boundary.len() / 1024
+        );
+
+        // And it still delimits parts.
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"q\"\r\n\r\n1 OR 1=1\r\n--{boundary}--\r\n"
+        );
+        let ctx = body_ctx(&ct, body.into_bytes());
+        let fields = multipart_parts(&ctx).fields;
+        assert_eq!(fields.len(), 1);
+        assert_eq!((&*fields[0].0, fields[0].1.as_str()), ("q", "1 OR 1=1"));
     }
 }

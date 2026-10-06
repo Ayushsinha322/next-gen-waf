@@ -2524,6 +2524,7 @@ dependencies = [
  "http",
  "ipnet",
  "libinjectionrs",
+ "memchr",
  "nom",
  "once_cell",
  "parking_lot",
