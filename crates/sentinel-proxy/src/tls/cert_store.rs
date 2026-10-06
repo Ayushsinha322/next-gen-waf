@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use arc_swap::ArcSwapOption;
 use dashmap::DashMap;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::{CertificateDer, DnsName, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::ResolvesServerCert;
 use rustls::sign::CertifiedKey;
 use sentinel_core::config::{ConfigHandle, SentinelConfig, SiteConfig};
@@ -151,14 +151,21 @@ pub fn site_cert_names(sites: &[SiteConfig]) -> HashSet<String> {
         .flat_map(|s| s.domains.iter())
         .filter_map(|d| {
             let d = d.trim().trim_end_matches('.').to_ascii_lowercase();
-            // An IP literal is never sent as SNI (RFC 6066) and reserved keys are
-            // internal; a cert minted for either could never be served.
-            let unservable = d.is_empty()
-                || d.starts_with(RESERVED_PREFIX)
-                || d.parse::<std::net::IpAddr>().is_ok();
-            (!unservable).then_some(d)
+            sni_matchable(&d).then_some(d)
         })
         .collect()
+}
+
+/// Whether a handshake could ever ask for `name` (or, for `*.x`, a name one
+/// label below it). rustls hands the resolver only a valid DNS name: never an IP
+/// literal (RFC 6066), and never a byte outside ASCII letters, digits, `-` and
+/// `_` — an IDN arrives as its `xn--` A-label. A cert for any other name could
+/// never be served, and minting one is worse than useless: rcgen asserts that
+/// SAN names are ASCII, so `bücher.example` panicked the sync, and with the
+/// release profile's `panic = "abort"`, the node. Reserved keys are internal.
+fn sni_matchable(name: &str) -> bool {
+    let host = name.strip_prefix("*.").unwrap_or(name);
+    !name.starts_with(RESERVED_PREFIX) && DnsName::try_from(host).is_ok()
 }
 
 /// Keep the per-site self-signed certs in step with the configured sites.
@@ -179,23 +186,68 @@ fn spawn_site_cert_sync_every(
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        // The config last examined is held, not its address: a freed address
-        // can be reused by the next config and the change would be missed.
-        let mut seen: Option<Arc<SentinelConfig>> = None;
-        let mut names_seen: Option<HashSet<String>> = None;
+        let mut sync = SiteSync::default();
         loop {
-            let cfg = config.load_full();
-            if !seen.as_ref().is_some_and(|s| Arc::ptr_eq(s, &cfg)) {
-                let names = site_cert_names(&cfg.sites);
-                seen = Some(cfg);
-                if names_seen.as_ref() != Some(&names) {
-                    store.sync_site_fallbacks(names.clone()).await;
-                    names_seen = Some(names);
+            if let Some(names) = sync.due(config.load_full()) {
+                let report = store.sync_site_fallbacks(names.clone()).await;
+                for name in sync.record(names, report.failed) {
+                    tracing::warn!(
+                        domain = %name,
+                        "could not create a self-signed certificate for this site; \
+                         serving the default one and retrying"
+                    );
                 }
             }
             tokio::time::sleep(interval).await;
         }
     })
+}
+
+/// When the site cert sync has to run, and which failures it has reported.
+#[derive(Default)]
+struct SiteSync {
+    /// The config last examined. Held, not its address: a freed address can be
+    /// reused by the next config and the change would be missed.
+    seen: Option<Arc<SentinelConfig>>,
+    /// The site names of the last sync.
+    synced: Option<HashSet<String>>,
+    /// Names whose cert could not be minted at the last sync. While any remain
+    /// every tick retries them — otherwise they would wait for the next change
+    /// to the site list — but each is reported once.
+    failing: HashSet<String>,
+}
+
+impl SiteSync {
+    /// The site names to sync now: the site list changed, or a mint is owed.
+    fn due(&mut self, cfg: Arc<SentinelConfig>) -> Option<HashSet<String>> {
+        let changed = !self.seen.as_ref().is_some_and(|s| Arc::ptr_eq(s, &cfg));
+        if !changed && self.failing.is_empty() {
+            return None;
+        }
+        let names = site_cert_names(&cfg.sites);
+        self.seen = Some(cfg);
+        (self.synced.as_ref() != Some(&names) || !self.failing.is_empty()).then_some(names)
+    }
+
+    /// Record a sync of `names`; returns the failures not reported before.
+    fn record(&mut self, names: HashSet<String>, failed: Vec<String>) -> Vec<String> {
+        let new = failed
+            .iter()
+            .filter(|n| !self.failing.contains(*n))
+            .cloned()
+            .collect();
+        self.failing = failed.into_iter().collect();
+        self.synced = Some(names);
+        new
+    }
+}
+
+/// What one round of minting site certs did.
+#[derive(Debug, Default)]
+pub struct MintReport {
+    pub added: usize,
+    /// Names whose cert could not be created; they stay on the default cert.
+    pub failed: Vec<String>,
 }
 
 impl CertStore {
@@ -350,19 +402,16 @@ impl CertStore {
 
     /// Adopt or create the shared self-signed cert for each of `names` that is
     /// still configured and still has no cert. Blocking (keygen and disk), so the
-    /// sync task runs it on a blocking thread; returns how many were added.
-    pub fn ensure_site_fallbacks(&self, names: &[String]) -> usize {
-        let mut added = 0;
+    /// sync task runs it on a blocking thread.
+    pub fn ensure_site_fallbacks(&self, names: &[String]) -> MintReport {
+        let mut report = MintReport::default();
         for name in names {
             // The site may have been removed, or given a real cert, mid-batch.
             if !self.needs_site_fallback(name) {
                 continue;
             }
             let Some(ck) = self.adopt_or_create_self_signed(name) else {
-                tracing::warn!(
-                    domain = %name,
-                    "could not create a self-signed certificate; serving the default one"
-                );
+                report.failed.push(name.clone());
                 continue;
             };
             let entry = Arc::new(CertEntry {
@@ -374,32 +423,36 @@ impl CertStore {
             // just dropped is exactly the growth this map exists to prevent.
             if fb.configured.contains(name) && !self.live.contains_key(name) {
                 fb.certs.insert(name.clone(), entry);
-                added += 1;
+                report.added += 1;
             }
         }
-        added
+        report
     }
 
     /// `set_site_names`, then mint what is missing on a blocking thread.
-    pub async fn sync_site_fallbacks(self: &Arc<Self>, names: HashSet<String>) -> usize {
+    pub async fn sync_site_fallbacks(self: &Arc<Self>, names: HashSet<String>) -> MintReport {
         let missing = self.set_site_names(names);
         if missing.is_empty() {
-            return 0;
+            return MintReport::default();
         }
         let store = Arc::clone(self);
-        match tokio::task::spawn_blocking(move || store.ensure_site_fallbacks(&missing)).await {
-            Ok(added) => {
-                if added > 0 {
+        let batch = missing.clone();
+        match tokio::task::spawn_blocking(move || store.ensure_site_fallbacks(&batch)).await {
+            Ok(report) => {
+                if report.added > 0 {
                     tracing::info!(
-                        certs = added,
+                        certs = report.added,
                         "self-signed certificates ready for new sites"
                     );
                 }
-                added
+                report
             }
             Err(e) => {
                 tracing::warn!("minting self-signed site certificates failed: {e}");
-                0
+                MintReport {
+                    added: 0,
+                    failed: missing,
+                }
             }
         }
     }
@@ -580,7 +633,12 @@ impl CertStore {
         // the default cert until the next config change.
         let name = domain.to_ascii_lowercase();
         self.fallback_write().certs.remove(&name);
-        self.ensure_site_fallbacks(&[name]);
+        for failed in self.ensure_site_fallbacks(&[name]).failed {
+            tracing::warn!(
+                domain = %failed,
+                "could not create a self-signed certificate; serving the default one"
+            );
+        }
         Ok(())
     }
 
@@ -912,6 +970,7 @@ fn self_signed_meta(domain: &str) -> CertMeta {
 /// balancer picked. Measured on .71 the moment HTTPS moved behind the LB — 12
 /// handshakes returned exactly 3 distinct certificates, 4 each.
 pub fn generate_self_signed_pem(domain: &str) -> Result<(String, String)> {
+    ensure_ascii_name(domain)?;
     let names = vec![domain.to_string(), format!("*.{domain}")];
     let cert =
         rcgen::generate_simple_self_signed(names).context("rcgen generate_simple_self_signed")?;
@@ -922,6 +981,7 @@ pub fn generate_self_signed_pem(domain: &str) -> Result<(String, String)> {
 }
 
 pub fn generate_self_signed(domain: &str) -> Result<Arc<CertifiedKey>> {
+    ensure_ascii_name(domain)?;
     let names = vec![domain.to_string(), format!("*.{domain}")];
     let cert =
         rcgen::generate_simple_self_signed(names).context("rcgen generate_simple_self_signed")?;
@@ -938,6 +998,17 @@ pub fn generate_self_signed(domain: &str) -> Result<Arc<CertifiedKey>> {
         vec![CertificateDer::from(cert_der)],
         signing,
     )))
+}
+
+/// rcgen encodes SAN names as IA5String and asserts they are ASCII, so a
+/// non-ASCII name is a panic — and under the release profile's
+/// `panic = "abort"`, a dead process. Refuse it as an error instead.
+fn ensure_ascii_name(domain: &str) -> Result<()> {
+    anyhow::ensure!(
+        domain.is_ascii(),
+        "certificate name {domain:?} is not ASCII; use its xn-- form"
+    );
+    Ok(())
 }
 
 fn load_pem_files(cert_path: &Path, key_path: &Path) -> Result<Arc<CertifiedKey>> {
@@ -1604,7 +1675,9 @@ mod tests {
         let store = CertStore::new(dir.clone());
         store.load_from_disk(&names(&["*.example.com"])).unwrap();
         assert_eq!(
-            store.ensure_site_fallbacks(&["*.example.com".to_string()]),
+            store
+                .ensure_site_fallbacks(&["*.example.com".to_string()])
+                .added,
             1
         );
         let resolver = SentinelCertResolver::new(Arc::clone(&store));
@@ -1703,7 +1776,8 @@ mod tests {
         let missing = store.set_site_names(names(&["gone.example.com"]));
         assert_eq!(missing, vec!["gone.example.com".to_string()]);
         store.set_site_names(HashSet::new());
-        assert_eq!(store.ensure_site_fallbacks(&missing), 0);
+        let report = store.ensure_site_fallbacks(&missing);
+        assert_eq!((report.added, report.failed.len()), (0, 0));
         assert!(store.fallback_read().certs.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1768,5 +1842,112 @@ mod tests {
             pem_leaf(&dir.join(DEFAULT_CERT_KEY).join("cert.pem"))
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── follow-up: which names get certs, and sync retries ──────────────────
+
+    /// A site domain with a non-ASCII character (a console typo, a pasted IDN
+    /// U-label, a zero-width space) is accepted by the control plane. rcgen
+    /// asserts SAN names are ASCII, so the sync panicked minting it — under the
+    /// release profile's `panic = "abort"`, every node within seconds of the
+    /// config push and again at each boot. No handshake can ever carry such a
+    /// name, so it is simply not a cert name.
+    #[tokio::test]
+    async fn a_non_ascii_site_name_is_skipped_not_a_crash() {
+        let dir = tmp_dir();
+        let store = CertStore::new(dir.clone());
+        let sites = vec![
+            site("books", &["bücher.example", "shop\u{200b}.example.com"]),
+            site("shop", &["shop.example.com"]),
+        ];
+        let wanted = site_cert_names(&sites);
+        assert_eq!(wanted, names(&["shop.example.com"]));
+
+        let report = store.sync_site_fallbacks(wanted).await;
+        assert_eq!(
+            report.added, 1,
+            "the other sites must still get their certs"
+        );
+        assert!(report.failed.is_empty());
+        assert!(dir.join("shop.example.com").join("cert.pem").exists());
+        assert!(!dir.join(domain_to_dirname("bücher.example")).exists());
+
+        // No caller can reach the rcgen assert any more.
+        assert!(generate_self_signed_pem("bücher.example").is_err());
+        assert!(generate_self_signed("bücher.example").is_err());
+        store.remove("bücher.example").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only names a handshake can carry are cert names: rustls hands the
+    /// resolver a valid DNS name or nothing.
+    #[test]
+    fn site_cert_names_keeps_only_names_sni_can_carry() {
+        let got = site_cert_names(&[site(
+            "s",
+            &[
+                "Shop.Example.com.",
+                "*.example.org",
+                "under_score.example.net",
+                "juice",
+                "xn--bcher-kva.example",
+                "10.0.0.5",
+                "::1",
+                "",
+                "__management__",
+                "*.*.example.com",
+                "bad host.example",
+                "bücher.example",
+                "app.example.com:8443",
+            ],
+        )]);
+        assert_eq!(
+            got,
+            names(&[
+                "shop.example.com",
+                "*.example.org",
+                "under_score.example.net",
+                "juice",
+                "xn--bcher-kva.example",
+            ])
+        );
+    }
+
+    /// A mint that fails is retried on the next tick rather than waiting for
+    /// the next change to the site list, and reported once, not every tick.
+    #[test]
+    fn a_failed_mint_is_retried_and_reported_once() {
+        let cfg = Arc::new(SentinelConfig {
+            sites: vec![site("a", &["a.example.com"]), site("b", &["b.example.com"])],
+            ..Default::default()
+        });
+        let mut sync = SiteSync::default();
+        let n = sync.due(Arc::clone(&cfg)).expect("the first look syncs");
+        assert_eq!(
+            sync.record(n, vec!["a.example.com".into()]),
+            vec!["a.example.com".to_string()]
+        );
+
+        let n = sync
+            .due(Arc::clone(&cfg))
+            .expect("same config, but a mint is owed");
+        assert!(
+            sync.record(n, vec!["a.example.com".into()]).is_empty(),
+            "a repeat failure is not reported again"
+        );
+
+        let n = sync.due(Arc::clone(&cfg)).expect("still owed");
+        assert!(sync.record(n, Vec::new()).is_empty());
+        assert!(
+            sync.due(Arc::clone(&cfg)).is_none(),
+            "nothing owed and nothing changed: quiet"
+        );
+
+        // A new config with the same names needs no work either.
+        let same = Arc::new(SentinelConfig {
+            sites: cfg.sites.clone(),
+            ..Default::default()
+        });
+        assert!(sync.due(same).is_none());
     }
 }
