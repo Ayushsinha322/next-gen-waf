@@ -71,6 +71,31 @@
 //! lose or swap its fingerprint, whereas an address-keyed table could blend two
 //! clients. `start_session` runs once per accepted connection, after token
 //! validation, so our state is also downstream of quinn's own DoS protection.
+//!
+//! # Panics must not unwind into quinn
+//!
+//! quinn calls the session while it holds its own `std::sync::Mutex`es and
+//! takes them with `.lock().unwrap()` every time. The first Initial packet (and
+//! any datagram buffered before the accept) is read inside the ENDPOINT's lock
+//! (`EndpointInner::accept` → `handle_first_packet` → `read_crypto`); later
+//! handshake packets inside the CONNECTION's lock, on its driver task. What
+//! runs there is ours and client-reachable: the accumulator, the JA4 parser on
+//! raw client bytes, and rustls's ClientHello handling, which calls the SNI
+//! cert resolver. A panic that unwound out of it poisoned that lock:
+//!
+//! - the endpoint's: its driver panicked on the next datagram, then again in
+//!   its own `Drop` during that unwind (it unwraps the same lock), and a panic
+//!   while unwinding aborts the process;
+//! - a connection's, on its driver: the driver's handle is dropped during that
+//!   unwind, and while the handshake is under way it is the one that takes the
+//!   lock to close the connection, so the same abort.
+//!
+//! Either way one ClientHello took the node down, as under `panic = "abort"`.
+//! On TCP the same parser or resolver panic costs that one connection, and so
+//! it does here: `read_handshake` and `write_handshake` contain any panic and
+//! fail the handshake (INTERNAL_ERROR), so quinn closes the connection and
+//! nothing else. A panic in the fingerprinting alone leaves the handshake to
+//! complete without a fingerprint, like any hello the parser refuses.
 
 use std::any::Any;
 use std::sync::{Arc, Mutex};
@@ -80,7 +105,7 @@ use quinn::crypto::{
 };
 use quinn::{ConnectionId, Side};
 use quinn_proto::transport_parameters::TransportParameters;
-use quinn_proto::TransportError;
+use quinn_proto::{TransportError, TransportErrorCode};
 use tracing::error;
 
 /// Mirrors quinn's own `crypto_buffer_size` default (16 KiB, quinn-proto
@@ -150,12 +175,21 @@ impl quinn::crypto::ServerConfig for Ja4ServerConfig {
             accum: Vec::new(),
             result: Arc::new(Mutex::new((None, H3Ja4Outcome::Absent))),
             done: false,
+            broken: false,
+            #[cfg(test)]
+            stalled: false,
         })
     }
 }
 
 struct Ja4Session {
     inner: Box<dyn Session>,
+    /// The TLS session panicked: it is never driven again, and the handshake
+    /// fails. Whatever rustls left half-updated stays unread.
+    broken: bool,
+    /// See [`inject::STALL`].
+    #[cfg(test)]
+    stalled: bool,
     /// Bytes of the client's first handshake flight, in stream order.
     accum: Vec<u8>,
     /// Published through `handshake_data`, which is the only per-connection
@@ -243,6 +277,8 @@ impl Ja4Session {
             return;
         }
         self.accum.extend_from_slice(buf);
+        #[cfg(test)]
+        inject::fingerprinting(&self.accum, buf);
 
         let need = match quic_handshake_needed_len(&self.accum) {
             Some(n) => n,
@@ -283,12 +319,50 @@ impl Ja4Session {
     }
 }
 
+/// The handshake error for a TLS session that panicked. quinn answers it with
+/// CONNECTION_CLOSE and drops that one connection.
+fn handshake_panicked() -> TransportError {
+    TransportError {
+        code: TransportErrorCode::INTERNAL_ERROR,
+        frame: None,
+        reason: "TLS handshake failed".into(),
+    }
+}
+
 impl Session for Ja4Session {
     fn read_handshake(&mut self, buf: &[u8]) -> Result<bool, TransportError> {
+        if self.broken {
+            return Err(handshake_panicked());
+        }
+        #[cfg(test)]
+        inject::stall(&mut self.stalled, buf);
         // Delegate FIRST and propagate the error before accumulating, so we can
-        // never fingerprint a handshake the real TLS stack rejected.
-        let ready = self.inner.read_handshake(buf)?;
-        self.accumulate(buf);
+        // never fingerprint a handshake the real TLS stack rejected. Both run
+        // inside quinn's locks, so neither may unwind (see the module docs).
+        let ready = match crate::panic_guard::catch_request_sync(|| self.inner.read_handshake(buf))
+        {
+            Ok(ready) => ready?,
+            Err(payload) => {
+                self.broken = true;
+                self.finish(None, H3Ja4Outcome::Absent);
+                crate::panic_guard::client_step_panicked(
+                    "the HTTP/3 TLS handshake",
+                    &*payload,
+                    "that connection is closed",
+                );
+                return Err(handshake_panicked());
+            }
+        };
+        if let Err(payload) = crate::panic_guard::catch_request_sync(|| self.accumulate(buf)) {
+            // The handshake is rustls's and went fine: it completes, without a
+            // fingerprint, as for a hello the parser refuses.
+            self.finish(None, H3Ja4Outcome::RefusedUnparseable);
+            crate::panic_guard::client_step_panicked(
+                "HTTP/3 JA4 fingerprinting",
+                &*payload,
+                "that connection has no fingerprint",
+            );
+        }
         Ok(ready)
     }
 
@@ -334,7 +408,27 @@ impl Session for Ja4Session {
     }
 
     fn write_handshake(&mut self, buf: &mut Vec<u8>) -> Option<Keys> {
-        self.inner.write_handshake(buf)
+        if self.broken {
+            return None;
+        }
+        #[cfg(test)]
+        if self.stalled {
+            return None;
+        }
+        // Inside quinn's locks too. Nothing more is written for a session that
+        // panicked; its next read fails the handshake.
+        match crate::panic_guard::catch_request_sync(|| self.inner.write_handshake(buf)) {
+            Ok(keys) => keys,
+            Err(payload) => {
+                self.broken = true;
+                crate::panic_guard::client_step_panicked(
+                    "the HTTP/3 TLS handshake",
+                    &*payload,
+                    "that connection is closed",
+                );
+                None
+            }
+        }
     }
 
     fn next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn PacketKey>>> {
@@ -383,6 +477,40 @@ pub(crate) fn fingerprint_for(conn: &quinn::Connection) -> (Option<String>, H3Ja
         // Should be unreachable once the handshake has completed; counted rather
         // than assumed away.
         None => (None, H3Ja4Outcome::Absent),
+    }
+}
+
+/// Failures on demand inside the handshake, in test builds only. Each is keyed on
+/// a marker the test client offers as an ALPN protocol, so it fires in that
+/// client's handshake and in no other test's.
+#[cfg(test)]
+pub(crate) mod inject {
+    /// Panics the fingerprinting on the hello's first chunk: the first Initial
+    /// packet, read inside quinn's ENDPOINT lock.
+    pub(crate) const FIRST_CHUNK: &[u8] = b"panic-guard-ja4-first";
+    /// Panics the fingerprinting on a later chunk of a hello that spans
+    /// packets, read inside the CONNECTION's lock.
+    pub(crate) const LATER_CHUNK: &[u8] = b"panic-guard-ja4-later";
+    /// Stalls the handshake: the server's flight is never written, so the
+    /// client retransmits its hello and the handshake never completes.
+    pub(crate) const STALL: &[u8] = b"panic-guard-stall";
+
+    fn has(hay: &[u8], marker: &[u8]) -> bool {
+        hay.windows(marker.len()).any(|w| w == marker)
+    }
+
+    pub(super) fn stall(stalled: &mut bool, chunk: &[u8]) {
+        *stalled |= has(chunk, STALL);
+    }
+
+    pub(super) fn fingerprinting(accum: &[u8], chunk: &[u8]) {
+        let first = accum.len() == chunk.len();
+        if first && has(chunk, FIRST_CHUNK) {
+            panic!("injected JA4 panic on the first handshake chunk");
+        }
+        if !first && has(accum, LATER_CHUNK) {
+            panic!("injected JA4 panic on a later handshake chunk");
+        }
     }
 }
 
@@ -736,6 +864,206 @@ mod tests {
             fp.is_some_and(|f| f.starts_with('q')),
             "the production config must yield a q-prefixed JA4"
         );
+    }
+
+    // ---- PANICS INSIDE THE HANDSHAKE ---------------------------------------
+    //
+    // quinn drives the session under its own locks (see the module docs), so
+    // these run real handshakes against a real endpoint: what matters is that
+    // the endpoint, and every other connection, outlive the panic.
+
+    /// A client config like `test_client_config` that offers `alpn`.
+    fn client_config_offering(server_cert: &[u8], alpn: Vec<Vec<u8>>) -> quinn::ClientConfig {
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from(
+                server_cert.to_vec(),
+            ))
+            .expect("add root");
+        let mut cfg = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        cfg.alpn_protocols = alpn;
+        let quic = quinn::crypto::rustls::QuicClientConfig::try_from(cfg).expect("quic client cfg");
+        quinn::ClientConfig::new(Arc::new(quic))
+    }
+
+    type HandshakeResult = Result<(Option<String>, H3Ja4Outcome), String>;
+
+    /// Accept every connection on its own task, as `serve_quic` does, and
+    /// report how each handshake ended. A task the panic unwound reports
+    /// nothing; one whose handshake never ends reports nothing either.
+    fn serve_handshakes(
+        server_cfg: quinn::ServerConfig,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::sync::mpsc::UnboundedReceiver<HandshakeResult>,
+    ) {
+        let server = quinn::Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap())
+            .expect("server endpoint");
+        let addr = server.local_addr().expect("addr");
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(incoming) = server.accept().await {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let ended = match incoming.accept() {
+                        Ok(connecting) => match connecting.await {
+                            Ok(conn) => Ok(fingerprint_for(&conn)),
+                            Err(e) => Err(e.to_string()),
+                        },
+                        Err(e) => Err(e.to_string()),
+                    };
+                    let _ = tx.send(ended);
+                });
+            }
+        });
+        (addr, rx)
+    }
+
+    async fn handshake(
+        addr: std::net::SocketAddr,
+        cfg: quinn::ClientConfig,
+        sni: &str,
+    ) -> Result<quinn::Connection, String> {
+        let client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("client");
+        let connecting = client
+            .connect_with(cfg, addr, sni)
+            .map_err(|e| e.to_string())?;
+        tokio::time::timeout(std::time::Duration::from_secs(10), connecting)
+            .await
+            .map_err(|_| "the client's handshake timed out".to_string())?
+            .map_err(|e| e.to_string())
+    }
+
+    async fn server_side(
+        outcomes: &mut tokio::sync::mpsc::UnboundedReceiver<HandshakeResult>,
+        what: &str,
+    ) -> HandshakeResult {
+        tokio::time::timeout(std::time::Duration::from_secs(10), outcomes.recv())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("{what}: the server's handshake never ended — the panic left it waiting")
+            })
+            .unwrap_or_else(|| panic!("{what}: the server stopped accepting"))
+    }
+
+    /// Serves `cert` for every name but one, for which it panics: rustls calls
+    /// it while it reads the ClientHello, inside quinn's endpoint lock.
+    #[derive(Debug)]
+    struct PanicsForOneName(Arc<rustls::sign::CertifiedKey>);
+
+    const PANIC_SNI: &str = "panic.ja4-test.local";
+
+    impl rustls::server::ResolvesServerCert for PanicsForOneName {
+        fn resolve(
+            &self,
+            hello: rustls::server::ClientHello<'_>,
+        ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+            if hello.server_name() == Some(PANIC_SNI) {
+                panic!("injected certificate resolver panic");
+            }
+            Some(Arc::clone(&self.0))
+        }
+    }
+
+    /// A panic in rustls's handshake (here its cert resolver) on the first
+    /// Initial packet unwound through quinn's endpoint lock and poisoned it:
+    /// the endpoint's driver panicked on the next datagram, and no connection
+    /// on the listener was ever served again. It now fails that one handshake.
+    #[tokio::test]
+    async fn a_tls_handshake_panic_costs_only_that_connection() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cert =
+            rcgen::generate_simple_self_signed(vec!["ja4-test.local".to_string()]).expect("rcgen");
+        let der = cert.serialize_der().expect("cert der");
+        let key = rustls::pki_types::PrivateKeyDer::try_from(cert.serialize_private_key_der())
+            .expect("key der");
+        let signing = rustls::crypto::ring::sign::any_supported_type(&key).expect("signing key");
+        let certified = Arc::new(rustls::sign::CertifiedKey::new(
+            vec![rustls::pki_types::CertificateDer::from(der.clone())],
+            signing,
+        ));
+        let rustls_cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(PanicsForOneName(certified)));
+        let (addr, mut outcomes) =
+            serve_handshakes(crate::http3::quic_server_config(rustls_cfg).expect("quic config"));
+
+        let refused = handshake(addr, test_client_config(&der), PANIC_SNI).await;
+        assert!(refused.is_err(), "the handshake whose resolver panicked");
+        let ended = server_side(&mut outcomes, "the panicking handshake").await;
+        assert!(
+            ended.is_err(),
+            "the server failed that handshake: {ended:?}"
+        );
+
+        // The endpoint, and the next client, never noticed.
+        for n in 0..2 {
+            let conn = handshake(addr, test_client_config(&der), "ja4-test.local")
+                .await
+                .unwrap_or_else(|e| panic!("handshake {n} after the panic: {e}"));
+            let (fp, outcome) = server_side(&mut outcomes, "a later handshake")
+                .await
+                .unwrap_or_else(|e| panic!("handshake {n} after the panic, server side: {e}"));
+            assert_eq!(outcome, H3Ja4Outcome::Ok);
+            assert!(fp.is_some_and(|f| f.starts_with('q')));
+            drop(conn);
+        }
+    }
+
+    /// A panic in the fingerprinting, on the hello's first chunk (inside
+    /// quinn's endpoint lock) or on a later one (a hello that spans Initial
+    /// packets, inside the connection's lock on its driver: the common case for
+    /// post-quantum hellos). The first poisoned the endpoint; the second killed
+    /// the connection's driver, and the accepting side waited for ever on a
+    /// handshake nobody would finish. The handshake is rustls's and went fine,
+    /// so it now completes, without a fingerprint, like a hello the parser
+    /// refuses.
+    #[tokio::test]
+    async fn a_fingerprinting_panic_completes_the_handshake_unfingerprinted() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (server_cfg, der) = test_server_config();
+        let (addr, mut outcomes) = serve_handshakes(server_cfg);
+
+        // Six 250-byte protocols put the hello past one Initial packet.
+        let padding: Vec<Vec<u8>> = (0..6u8).map(|i| vec![b'a' + i; 250]).collect();
+        let cases = [
+            (
+                "first chunk",
+                vec![b"h3".to_vec(), inject::FIRST_CHUNK.to_vec()],
+            ),
+            (
+                "later chunk",
+                [
+                    vec![b"h3".to_vec()],
+                    padding,
+                    vec![inject::LATER_CHUNK.to_vec()],
+                ]
+                .concat(),
+            ),
+        ];
+        for (label, alpn) in cases {
+            let conn = handshake(addr, client_config_offering(&der, alpn), "ja4-test.local")
+                .await
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            let (fp, outcome) = server_side(&mut outcomes, label)
+                .await
+                .unwrap_or_else(|e| panic!("{label}: the server failed the handshake: {e}"));
+            assert_eq!(outcome, H3Ja4Outcome::RefusedUnparseable, "{label}");
+            assert!(fp.is_none(), "{label}: a partial fingerprint: {fp:?}");
+            drop(conn);
+        }
+
+        let conn = handshake(addr, test_client_config(&der), "ja4-test.local")
+            .await
+            .expect("a hello that does not panic");
+        let (fp, outcome) = server_side(&mut outcomes, "a plain hello")
+            .await
+            .expect("the plain handshake, server side");
+        assert_eq!(outcome, H3Ja4Outcome::Ok);
+        assert!(fp.is_some());
+        drop(conn);
     }
 
     /// The TCP helper must NOT be reused here — it demands a 0x16 record header,

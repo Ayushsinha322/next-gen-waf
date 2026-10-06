@@ -368,6 +368,36 @@ pub(crate) async fn catch_request<F: Future>(fut: F) -> Result<F::Output, Box<dy
     .await
 }
 
+/// [`catch_request`] for synchronous code a client reaches outside any request
+/// future, such as the QUIC TLS handshake, which quinn drives under its own
+/// locks. As for a request, the hook only counts the panic and the caller
+/// writes its one line, rate-limited per location ([`client_step_panicked`]).
+pub(crate) fn catch_request_sync<R>(f: impl FnOnce() -> R) -> Result<R, Box<dyn Any + Send>> {
+    let _in_request = InRequest::enter();
+    std::panic::catch_unwind(AssertUnwindSafe(f))
+}
+
+/// Log a panic [`catch_request_sync`] caught in a client-reachable step that is
+/// not a request (no Support ID, no request context): one ERROR line, at most
+/// one a second per location like a request's, naming the step and what the
+/// client got.
+pub(crate) fn client_step_panicked(step: &str, payload: &(dyn Any + Send), outcome: &str) {
+    let caught = take_request_caught();
+    if let LogLine::Due { suppressed } = caught.line {
+        let thread = std::thread::current();
+        error!(
+            location = %caught.location,
+            panic = %panic_message(payload),
+            suppressed,
+            backtrace = caught.backtrace.as_ref().map(tracing::field::display),
+            "{}; {} panicked, {}",
+            hook_line(thread.name().unwrap_or("unnamed"), &caught.location),
+            step,
+            outcome,
+        );
+    }
+}
+
 /// Whether a request whose processing panicked had already been sent upstream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Forwarded {
@@ -767,6 +797,13 @@ pub(crate) fn task_panicked(name: &'static str, payload: &(dyn Any + Send)) -> u
         "background task panicked; restarting it"
     );
     restarts
+}
+
+/// How many times the loop `name` has been restarted, for tests outside this
+/// module.
+#[cfg(test)]
+pub(crate) fn task_restarts(name: &str) -> u64 {
+    lock(&TASKS).get(name).map_or(0, |t| t.restarts)
 }
 
 /// The loop that restarted most recently within [`RECENT_RESTART`], if any.

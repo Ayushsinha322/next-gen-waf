@@ -2252,12 +2252,14 @@ impl ProxyServer {
                         .unwrap_or_default()
                         .as_secs();
                     // Degraded when we have origins configured but none reachable,
-                    // or while a background loop is crash-looping. Under
-                    // panic=abort such a loop took the node down, which was at
-                    // least visible; contained, it is a node that quietly stops
-                    // doing one of its jobs, so it must not report healthy.
+                    // while a background loop is crash-looping, or once an
+                    // HTTP/3 endpoint has stopped for good. Under panic=abort
+                    // such a failure took the node down, which was at least
+                    // visible; contained, it is a node that quietly stops doing
+                    // one of its jobs, so it must not report healthy.
                     let status = if (pool.total > 0 && pool.healthy == 0)
                         || panic_guard::recently_restarted().is_some()
+                        || http3::any_endpoint_down()
                     {
                         "degraded"
                     } else {
@@ -2277,6 +2279,8 @@ impl ProxyServer {
                             "upstreams_healthy": pool.healthy,
                             "upstreams_total": pool.total,
                             "http3_enabled": http3_enabled,
+                            // HTTP/3 endpoints that stopped serving for good.
+                            "http3_down": http3::endpoints_down(),
                             // Per-node drill-down for the cluster page: which config
                             // version this node applied (stale-node detection), how
                             // many rules it compiled, and what its own bans/feeds hold.
@@ -2604,7 +2608,8 @@ async fn serve_listener(
                     // accepts on the same socket (see `http3::bind_quic`).
                     panic_guard::supervised!("HTTP/3 endpoint", {
                         per_run!(endpoint, state_q, ds_q, shutdown_q, serving);
-                        http3::serve_quic(endpoint, state_q, ds_q, shutdown_q, &serving).await;
+                        http3::serve_quic(endpoint, quic_bind, state_q, ds_q, shutdown_q, &serving)
+                            .await;
                     });
                     info!(listener = %cfg.name, bind = %cfg.bind, "HTTP/3 (QUIC) enabled on this listener");
                 }
@@ -8809,6 +8814,8 @@ async fn health_response(state: &ServerState) -> Response<BoxBody> {
                 "listener": l.name,
                 "bind": l.bind,
                 "advertise_port": advertise_port,
+                // Endpoints that stopped serving for good: enabled, and off.
+                "down": http3::endpoints_down(),
             })
         }
         None => serde_json::json!({ "enabled": false }),

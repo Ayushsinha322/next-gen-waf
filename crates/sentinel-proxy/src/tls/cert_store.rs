@@ -1046,8 +1046,17 @@ impl SentinelCertResolver {
     }
 }
 
+/// An SNI that panics the resolver inside the TLS handshake, in test builds
+/// only: rustls calls it while quinn holds its locks on an HTTP/3 handshake.
+#[cfg(test)]
+pub(crate) const INJECT_RESOLVER_PANIC_SNI: &str = "panic-guard-resolver.local";
+
 impl ResolvesServerCert for SentinelCertResolver {
     fn resolve(&self, client_hello: rustls::server::ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        #[cfg(test)]
+        if client_hello.server_name() == Some(INJECT_RESOLVER_PANIC_SNI) {
+            panic!("injected certificate resolver panic");
+        }
         let acme_alpn = client_hello
             .alpn()
             .map(|mut it| it.any(|p| p == b"acme-tls/1"))

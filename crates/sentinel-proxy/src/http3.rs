@@ -33,7 +33,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Body;
 use sentinel_telemetry::inc_load_shed_connections;
 use tokio::sync::watch;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{run_pipeline, ActiveConnGuard, BoxBody, ServerState};
 
@@ -118,10 +118,89 @@ pub(crate) fn bind_quic(
     bind: SocketAddr,
     server_config: quinn::ServerConfig,
 ) -> Result<quinn::Endpoint> {
-    let endpoint = quinn::Endpoint::server(server_config, bind)
+    let endpoint = new_endpoint(bind, server_config)
         .with_context(|| format!("binding QUIC/HTTP3 endpoint on udp://{bind}"))?;
+    // A fresh endpoint on this address is up, whatever became of the last one.
+    endpoints_down_lock().remove(&bind);
     info!(%bind, "HTTP/3 (QUIC) endpoint listening");
     Ok(endpoint)
+}
+
+/// `quinn::Endpoint::server`, spelled out so that a test can put a socket of
+/// its own under the endpoint.
+fn new_endpoint(
+    bind: SocketAddr,
+    server_config: quinn::ServerConfig,
+) -> std::io::Result<quinn::Endpoint> {
+    let socket = std::net::UdpSocket::bind(bind)?;
+    let runtime =
+        quinn::default_runtime().ok_or_else(|| std::io::Error::other("no async runtime found"))?;
+    let socket = runtime.wrap_udp_socket(socket)?;
+    #[cfg(test)]
+    let socket = inject::FailingSocket::wrap(socket);
+    quinn::Endpoint::new_with_abstract_socket(
+        quinn::EndpointConfig::default(),
+        Some(server_config),
+        socket,
+        runtime,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Endpoints lost for good
+// ---------------------------------------------------------------------------
+
+/// An HTTP/3 endpoint that stopped serving for the rest of the process.
+struct EndpointDown {
+    reason: &'static str,
+    /// Unix seconds.
+    since: u64,
+}
+
+/// Endpoints whose accept loop stopped for good, by bind address: reported in
+/// `/healthz` (`http3.down`) and the heartbeat, which reads "degraded" while
+/// any is listed. The accept loop used to return without a word when its
+/// endpoint's I/O driver stopped (a socket error ends it): the supervisor took
+/// that for a clean finish, Alt-Svc was withdrawn, and `/healthz` went on
+/// saying HTTP/3 was enabled.
+static ENDPOINTS_DOWN: std::sync::Mutex<std::collections::BTreeMap<SocketAddr, EndpointDown>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn endpoints_down_lock(
+) -> std::sync::MutexGuard<'static, std::collections::BTreeMap<SocketAddr, EndpointDown>> {
+    ENDPOINTS_DOWN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn note_endpoint_down(bind: SocketAddr, reason: &'static str) {
+    error!(
+        %bind,
+        reason,
+        "HTTP/3 endpoint is gone; HTTP/3 is OFF on this listener until the process \
+         restarts (TCP is unaffected and Alt-Svc is withdrawn). Queryable at \
+         /healthz -> http3.down."
+    );
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    endpoints_down_lock().insert(bind, EndpointDown { reason, since });
+}
+
+/// Whether any HTTP/3 endpoint of this node has stopped for good.
+pub(crate) fn any_endpoint_down() -> bool {
+    !endpoints_down_lock().is_empty()
+}
+
+/// The endpoints that stopped for good, for `/healthz` and the heartbeat.
+pub(crate) fn endpoints_down() -> serde_json::Value {
+    endpoints_down_lock()
+        .iter()
+        .map(|(bind, d)| {
+            serde_json::json!({ "bind": bind.to_string(), "reason": d.reason, "since": d.since })
+        })
+        .collect()
 }
 
 /// A listener's `Alt-Svc` advertisement, attached to TCP responses only while
@@ -180,8 +259,20 @@ pub(crate) static INJECT_ACCEPT_PANIC: AtomicBool = AtomicBool::new(false);
 /// every connection has closed or the grace runs out. It used to close at
 /// once, cutting every in-flight h3 download and stream on each deploy while
 /// TCP clients got the grace.
+///
+/// An endpoint whose I/O driver stopped ends the loop for good: nothing more
+/// can arrive on it. That is recorded for `/healthz` and the heartbeat, and the
+/// loop returns normally, so the supervisor does not restart it on the same
+/// dead endpoint.
+///
+/// What this cannot report is an endpoint POISONED by a panic inside one of
+/// quinn's critical sections: quinn's driver unwraps the poisoned lock on the
+/// next datagram, and its `Drop` unwraps it again during that unwind, which
+/// aborts the process. Our own code that quinn runs under that lock (the TLS
+/// session decorator) is therefore kept from unwinding; see `ja4_quic`.
 pub(crate) async fn serve_quic(
     endpoint: quinn::Endpoint,
+    bind: SocketAddr,
     state: Arc<ServerState>,
     default_site: Option<String>,
     mut shutdown: watch::Receiver<bool>,
@@ -226,8 +317,12 @@ pub(crate) async fn serve_quic(
                             }
                         });
                     }
-                    // Endpoint closed / no more connections.
-                    None => return,
+                    // The endpoint is closed only after this loop, so its I/O
+                    // driver has stopped: nothing more can arrive.
+                    None => {
+                        note_endpoint_down(bind, "the endpoint's I/O driver stopped");
+                        return;
+                    }
                 }
             }
             _ = shutdown.changed() => break,
@@ -272,6 +367,14 @@ async fn drain_endpoint(endpoint: &quinn::Endpoint, grace: Duration) -> bool {
     tokio::time::timeout(grace, drained).await.is_ok()
 }
 
+/// Longest a QUIC handshake may take: the TCP path's TLS handshake bound, and
+/// shorter in tests, which wait one out.
+const H3_HANDSHAKE_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(4)
+} else {
+    crate::HANDSHAKE_TIMEOUT
+};
+
 /// Complete the QUIC handshake for one connection, then run its HTTP/3 request
 /// loop. The QUIC peer address is the client IP the WAF pipeline sees.
 async fn handle_quic_connection(
@@ -280,11 +383,17 @@ async fn handle_quic_connection(
     default_site: Option<String>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    let conn = incoming
-        .accept()
-        .context("accepting QUIC connection")?
-        .await
-        .context("QUIC handshake failed")?;
+    // Bounded like the TCP handshake. quinn has no handshake deadline of its
+    // own, only the idle timeout, which every packet the client sends re-arms:
+    // a client that kept retransmitting its hello held this task, and the
+    // connection permit TCP shares, for as long as it liked.
+    let conn = tokio::time::timeout(
+        H3_HANDSHAKE_TIMEOUT,
+        incoming.accept().context("accepting QUIC connection")?,
+    )
+    .await
+    .context("QUIC handshake timed out")?
+    .context("QUIC handshake failed")?;
     let peer = conn.remote_address();
     // Must happen BEFORE `conn` is moved into h3_quinn below: the fingerprint
     // rides in the connection's own TLS session, so there is no side table to
@@ -708,6 +817,75 @@ fn append_buf(out: &mut Vec<u8>, mut b: impl Buf) {
         out.extend_from_slice(chunk);
         let n = chunk.len();
         b.advance(n);
+    }
+}
+
+/// Failures on demand under a real endpoint, in test builds only.
+#[cfg(test)]
+pub(crate) mod inject {
+    use std::io::{self, IoSliceMut};
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+
+    use quinn::udp::{RecvMeta, Transmit};
+    use quinn::{AsyncUdpSocket, UdpPoller};
+
+    /// Ports whose endpoint socket fails its next receive, as a socket whose
+    /// interface went away does. quinn's I/O driver stops on it.
+    pub(crate) static FAIL_RECV: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+
+    /// The endpoint's real socket, with [`FAIL_RECV`] in front of its receive.
+    #[derive(Debug)]
+    pub(crate) struct FailingSocket(Arc<dyn AsyncUdpSocket>);
+
+    impl FailingSocket {
+        pub(crate) fn wrap(inner: Arc<dyn AsyncUdpSocket>) -> Arc<dyn AsyncUdpSocket> {
+            Arc::new(Self(inner))
+        }
+    }
+
+    impl AsyncUdpSocket for FailingSocket {
+        fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+            Arc::clone(&self.0).create_io_poller()
+        }
+
+        fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
+            self.0.try_send(transmit)
+        }
+
+        fn poll_recv(
+            &self,
+            cx: &mut Context,
+            bufs: &mut [IoSliceMut<'_>],
+            meta: &mut [RecvMeta],
+        ) -> Poll<io::Result<usize>> {
+            let port = self.0.local_addr().map(|a| a.port()).unwrap_or(0);
+            let fail = FAIL_RECV
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&port);
+            if fail {
+                return Poll::Ready(Err(io::Error::other("injected socket failure")));
+            }
+            self.0.poll_recv(cx, bufs, meta)
+        }
+
+        fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
+            self.0.local_addr()
+        }
+
+        fn max_transmit_segments(&self) -> usize {
+            self.0.max_transmit_segments()
+        }
+
+        fn max_receive_segments(&self) -> usize {
+            self.0.max_receive_segments()
+        }
+
+        fn may_fragment(&self) -> bool {
+            self.0.may_fragment()
+        }
     }
 }
 
@@ -1469,7 +1647,20 @@ mod tests {
 
     impl H3Client {
         async fn connect(client: &quinn::Endpoint, addr: SocketAddr) -> Result<Self> {
-            let conn = client.connect(addr, "panic-site.local")?.await?;
+            Self::connect_using(client, addr, None).await
+        }
+
+        /// [`H3Client::connect`] with a client config other than the default.
+        async fn connect_using(
+            client: &quinn::Endpoint,
+            addr: SocketAddr,
+            cfg: Option<&quinn::ClientConfig>,
+        ) -> Result<Self> {
+            let connecting = match cfg {
+                Some(cfg) => client.connect_with(cfg.clone(), addr, "panic-site.local")?,
+                None => client.connect(addr, "panic-site.local")?,
+            };
+            let conn = connecting.await?;
             let (mut driver, send) = h3::client::new(h3_quinn::Connection::new(conn)).await?;
             let driver = tokio::spawn(async move {
                 let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
@@ -1483,11 +1674,20 @@ mod tests {
             addr: SocketAddr,
             within: std::time::Duration,
         ) -> Self {
+            Self::connect_within_using(client, addr, within, None).await
+        }
+
+        async fn connect_within_using(
+            client: &quinn::Endpoint,
+            addr: SocketAddr,
+            within: std::time::Duration,
+            cfg: Option<&quinn::ClientConfig>,
+        ) -> Self {
             let deadline = std::time::Instant::now() + within;
             loop {
                 let attempt = tokio::time::timeout(
                     std::time::Duration::from_secs(3),
-                    Self::connect(client, addr),
+                    Self::connect_using(client, addr, cfg),
                 )
                 .await;
                 match attempt {
@@ -1538,6 +1738,13 @@ mod tests {
     impl H3Proxy {
         /// Callers hold `proxy_state_lock`, as for every test that runs a proxy.
         async fn start() -> Self {
+            Self::start_with(|_| {}).await
+        }
+
+        /// [`H3Proxy::start`], with `tweak` applied to the config first.
+        async fn start_with(
+            tweak: impl FnOnce(&mut sentinel_core::config::SentinelConfig),
+        ) -> Self {
             use crate::panic_guard::testkit::*;
             use sentinel_core::config::{Protocol, ProtocolSpec, TlsFileConfig};
 
@@ -1556,15 +1763,11 @@ mod tests {
             });
             cfg.listeners[0].protocol =
                 ProtocolSpec::Multiple(vec![Protocol::Http1, Protocol::Http3]);
+            tweak(&mut cfg);
             let proxy = start_proxy(listen, config_handle(cfg)).await;
 
             let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-            let mut client_cfg = test_client_config();
-            let mut transport = quinn::TransportConfig::default();
-            transport.max_idle_timeout(Some(Duration::from_secs(5).try_into().unwrap()));
-            transport.keep_alive_interval(Some(Duration::from_secs(1)));
-            client_cfg.transport_config(Arc::new(transport));
-            client.set_default_client_config(client_cfg);
+            client.set_default_client_config(Self::client_config(vec![ALPN_H3.to_vec()]));
             Self {
                 proxy,
                 listen,
@@ -1572,6 +1775,22 @@ mod tests {
                 cert_dir,
                 client,
             }
+        }
+
+        /// The client config: `alpn` offered, and a short idle timeout.
+        fn client_config(alpn: Vec<Vec<u8>>) -> quinn::ClientConfig {
+            let mut rustls_cfg = rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerify))
+                .with_no_client_auth();
+            rustls_cfg.alpn_protocols = alpn;
+            let qcc = quinn::crypto::rustls::QuicClientConfig::try_from(rustls_cfg).unwrap();
+            let mut client_cfg = quinn::ClientConfig::new(Arc::new(qcc));
+            let mut transport = quinn::TransportConfig::default();
+            transport.max_idle_timeout(Some(Duration::from_secs(5).try_into().unwrap()));
+            transport.keep_alive_interval(Some(Duration::from_secs(1)));
+            client_cfg.transport_config(Arc::new(transport));
+            client_cfg
         }
 
         async fn stop(self) {
@@ -1617,6 +1836,211 @@ mod tests {
         first.driver.abort();
         fresh.driver.abort();
         drop((first, fresh));
+        h3.stop().await;
+    }
+
+    /// The proxy side of ja4_quic's handshake-panic tests. A panic in the
+    /// handshake ran inside quinn's locks: on the first Initial packet it
+    /// poisoned the endpoint and HTTP/3 stopped for good; on a later one it
+    /// killed the connection's driver, and the accepting task waited for ever
+    /// holding its connection permit, which TCP shares. With max_connections = 1
+    /// each connection here is accepted only once the one before it gave its
+    /// permit back.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises whole server runs; see proxy_state_lock
+    async fn a_panicking_handshake_costs_only_that_connection() {
+        use crate::ja4_quic::inject;
+
+        let _serial = crate::panic_guard::testkit::proxy_state_lock();
+        let h3 = H3Proxy::start_with(|cfg| cfg.limits.max_connections = 1).await;
+        let within = Duration::from_secs(20);
+
+        let mut plain = H3Client::connect_within(&h3.client, h3.listen, within).await;
+        assert_eq!(plain.get("/before").await, StatusCode::OK);
+        plain.driver.abort();
+        drop(plain);
+
+        // The cert resolver panics: that handshake fails, promptly.
+        let mut refused = None;
+        let deadline = std::time::Instant::now() + within;
+        while refused.is_none() {
+            let connecting = h3
+                .client
+                .connect(h3.listen, crate::tls::cert_store::INJECT_RESOLVER_PANIC_SNI)
+                .unwrap();
+            match timeout(Duration::from_secs(10), connecting).await {
+                // Refused for want of a permit while the last connection ends.
+                Ok(Err(quinn::ConnectionError::ConnectionClosed(close)))
+                    if close.error_code == quinn_proto::TransportErrorCode::CONNECTION_REFUSED => {}
+                Ok(Err(quinn::ConnectionError::ConnectionClosed(close))) => refused = Some(close),
+                other => panic!("the handshake whose resolver panicked: {other:?}"),
+            }
+            assert!(std::time::Instant::now() < deadline, "never got a permit");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let refused = refused.unwrap();
+        assert_eq!(
+            refused.error_code,
+            quinn_proto::TransportErrorCode::INTERNAL_ERROR,
+            "{refused:?}"
+        );
+
+        // The fingerprinting panics, on the first packet or a later one: the
+        // connection is served, unfingerprinted.
+        let padding: Vec<Vec<u8>> = (0..6u8).map(|i| vec![b'a' + i; 250]).collect();
+        for alpn in [
+            vec![ALPN_H3.to_vec(), inject::FIRST_CHUNK.to_vec()],
+            [
+                vec![ALPN_H3.to_vec()],
+                padding,
+                vec![inject::LATER_CHUNK.to_vec()],
+            ]
+            .concat(),
+        ] {
+            let cfg = H3Proxy::client_config(alpn);
+            let mut conn =
+                H3Client::connect_within_using(&h3.client, h3.listen, within, Some(&cfg)).await;
+            assert_eq!(conn.get("/unfingerprinted").await, StatusCode::OK);
+            conn.driver.abort();
+            drop(conn);
+        }
+
+        let mut after = H3Client::connect_within(&h3.client, h3.listen, within).await;
+        assert_eq!(after.get("/after").await, StatusCode::OK);
+        assert_eq!(h3.hits.load(Ordering::SeqCst), 4);
+        after.driver.abort();
+        drop(after);
+        h3.stop().await;
+    }
+
+    /// A handshake that never completes (here the server's flight is never
+    /// written, so the client keeps retransmitting its hello) held its task
+    /// and its connection permit, which TCP shares, for as long as the client
+    /// kept the connection from idling: quinn has no handshake deadline. Enough
+    /// of them and the node accepted nothing on either transport. The
+    /// handshake is bounded now, like TCP's, and the permit comes back.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises whole server runs; see proxy_state_lock
+    async fn a_stalled_handshake_gives_its_permit_back() {
+        let _serial = crate::panic_guard::testkit::proxy_state_lock();
+        let h3 = H3Proxy::start_with(|cfg| cfg.limits.max_connections = 1).await;
+        let within = Duration::from_secs(20);
+        let refused = |r: &std::result::Result<quinn::Connection, quinn::ConnectionError>| {
+            matches!(r, Err(quinn::ConnectionError::ConnectionClosed(c))
+                if c.error_code == quinn_proto::TransportErrorCode::CONNECTION_REFUSED)
+        };
+
+        // A patient client: its own idle timeout must not end the handshake.
+        let mut cfg = H3Proxy::client_config(vec![
+            ALPN_H3.to_vec(),
+            crate::ja4_quic::inject::STALL.to_vec(),
+        ]);
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_idle_timeout(Some(Duration::from_secs(60).try_into().unwrap()));
+        cfg.transport_config(Arc::new(transport));
+
+        // Until the stalled handshake holds the one permit (start-up's TCP
+        // probe can hold it for a moment, and then this one is refused).
+        let deadline = std::time::Instant::now() + within;
+        let stalled = loop {
+            let attempt = h3
+                .client
+                .connect_with(cfg.clone(), h3.listen, "panic-site.local")
+                .unwrap();
+            let mut attempt = tokio::spawn(attempt);
+            match timeout(Duration::from_secs(1), &mut attempt).await {
+                Err(_) => break attempt,
+                Ok(r) => assert!(refused(&r.unwrap()), "the stall did not stall"),
+            }
+            assert!(std::time::Instant::now() < deadline, "never got a permit");
+        };
+        let probe = h3.client.connect(h3.listen, "panic-site.local").unwrap();
+        let probe = timeout(Duration::from_secs(3), probe).await;
+        assert!(
+            probe.as_ref().is_ok_and(refused),
+            "the stalled handshake must hold the permit: {probe:?}"
+        );
+        let held_since = std::time::Instant::now();
+
+        // Accepted only once the stalled handshake's permit is back.
+        let mut next = H3Client::connect_within(
+            &h3.client,
+            h3.listen,
+            H3_HANDSHAKE_TIMEOUT + Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(next.get("/after").await, StatusCode::OK);
+        assert!(
+            held_since.elapsed() < H3_HANDSHAKE_TIMEOUT + Duration::from_secs(10),
+            "held for {:?}",
+            held_since.elapsed()
+        );
+        let ended = timeout(Duration::from_secs(5), stalled)
+            .await
+            .expect("the stalled client never learned its handshake was over")
+            .unwrap();
+        assert!(
+            ended.is_err() && !refused(&ended),
+            "the stalled handshake: {ended:?}"
+        );
+        next.driver.abort();
+        drop(next);
+        h3.stop().await;
+    }
+
+    /// An endpoint whose I/O driver stopped (a socket error ends it) made the
+    /// accept loop return without a word: the supervisor took it for a clean
+    /// finish, and `/healthz` and the heartbeat went on reporting HTTP/3
+    /// enabled and the node healthy while nothing was served over it. It is
+    /// recorded now, once, and the loop is not restarted on the dead endpoint.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises whole server runs; see proxy_state_lock
+    async fn a_lost_endpoint_is_reported_and_not_restarted() {
+        let _serial = crate::panic_guard::testkit::proxy_state_lock();
+        let h3 = H3Proxy::start().await;
+        let restarts = crate::panic_guard::task_restarts("HTTP/3 endpoint");
+
+        inject::FAIL_RECV.lock().unwrap().push(h3.listen.port());
+        // A datagram for the driver to fail on.
+        let _ = timeout(
+            Duration::from_secs(3),
+            H3Client::connect(&h3.client, h3.listen),
+        )
+        .await;
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let reason = loop {
+            if let Some(d) = endpoints_down_lock().get(&h3.listen) {
+                break d.reason;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the lost endpoint was never reported: {}",
+                endpoints_down()
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert!(reason.contains("driver stopped"), "{reason}");
+        assert!(any_endpoint_down(), "the heartbeat must read degraded");
+        assert!(
+            endpoints_down()
+                .as_array()
+                .is_some_and(|d| d.iter().any(|e| e["bind"] == h3.listen.to_string())),
+            "/healthz: {}",
+            endpoints_down()
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            crate::panic_guard::task_restarts("HTTP/3 endpoint"),
+            restarts,
+            "the accept loop was restarted on a dead endpoint"
+        );
+
+        inject::FAIL_RECV
+            .lock()
+            .unwrap()
+            .retain(|p| *p != h3.listen.port());
+        endpoints_down_lock().remove(&h3.listen);
         h3.stop().await;
     }
 
