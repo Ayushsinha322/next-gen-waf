@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use sentinel_core::context::{Phase, RequestContext, RuleMatch, Severity, WafDecision};
+use sentinel_core::context::{
+    InspectionLimit, InspectionLimits, Phase, RequestContext, RuleMatch, Severity, WafDecision,
+};
 use tracing::{debug, warn};
 
 use super::emitter::{CompiledRuleSet, Instruction, RuleMeta, TargetSpec};
@@ -306,14 +308,20 @@ fn name_id(name: &ArgName) -> usize {
     name.as_ptr() as usize
 }
 
-/// The body's parameters cannot be listed within [`name_budget`].
+/// Why a request's parameters cannot be listed in full.
 ///
-/// Treated as a failure to inspect, never as an empty result: returning
-/// nothing would pass the body to the origin uninspected.
+/// Treated as a failure to inspect, never as an empty or a partial result:
+/// either would pass what was not listed to the origin uninspected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct BodyTooComplex;
+enum Unlisted {
+    /// The body's JSON field names would exceed [`name_budget`].
+    BodyTooComplex,
+    /// The arguments exceed one of the site's inspection limits
+    /// ([`InspectionLimit::Args`] or [`InspectionLimit::ArgBytes`]).
+    OverLimit(InspectionLimit),
+}
 
-/// Why a request was refused for [`BodyTooComplex`].
+/// Why a request was refused for [`Unlisted::BodyTooComplex`].
 const BODY_TOO_COMPLEX: &str =
     "request body could not be inspected: its JSON field names exceed the inspection limit";
 
@@ -345,7 +353,7 @@ struct JsonNames<'a> {
 }
 
 impl<'a> JsonNames<'a> {
-    fn child(&mut self, parent: &ArgName, key: &'a str) -> Result<ArgName, BodyTooComplex> {
+    fn child(&mut self, parent: &ArgName, key: &'a str) -> Result<ArgName, Unlisted> {
         if let Some(name) = self.known.get(&(name_id(parent), key)) {
             return Ok(name.clone());
         }
@@ -356,7 +364,7 @@ impl<'a> JsonNames<'a> {
         };
         self.built += name.len();
         if self.built > self.budget {
-            return Err(BodyTooComplex);
+            return Err(Unlisted::BodyTooComplex);
         }
         self.known.insert((name_id(parent), key), name.clone());
         Ok(name)
@@ -372,7 +380,7 @@ fn flatten_json<'a>(
     val: &'a serde_json::Value,
     names: &mut JsonNames<'a>,
     out: &mut ParamsBuilder,
-) -> Result<(), BodyTooComplex> {
+) -> Result<(), Unlisted> {
     use serde_json::Value;
     match val {
         Value::Object(map) => {
@@ -388,9 +396,9 @@ fn flatten_json<'a>(
                 flatten_json(name, v, names, out)?;
             }
         }
-        Value::String(s) => out.push_shared(name, s.clone()),
-        Value::Number(n) => out.push_shared(name, n.to_string()),
-        Value::Bool(b) => out.push_shared(name, b.to_string()),
+        Value::String(s) => out.push_shared(name, s.clone())?,
+        Value::Number(n) => out.push_shared(name, n.to_string())?,
+        Value::Bool(b) => out.push_shared(name, b.to_string())?,
         Value::Null => {}
     }
     Ok(())
@@ -469,12 +477,15 @@ fn multipart_boundary(ctx: &RequestContext) -> Option<String> {
 /// Parse a `multipart/form-data` body into its constituent parts.  Malformed
 /// or non-multipart bodies yield an empty result (fail-open on parse, but the
 /// raw body is still reachable via `REQUEST_BODY` rules).
-fn multipart_parts(ctx: &RequestContext) -> MultipartParts {
+///
+/// Fails when the parts pass `budget` (see [`ArgBudget`]): every field and
+/// file part is an argument.
+fn multipart_parts(ctx: &RequestContext, budget: ArgBudget) -> Result<MultipartParts, Unlisted> {
     let mut out = MultipartParts::default();
     let (Some(body), Some(boundary)) = (ctx.request_body.as_ref(), multipart_boundary(ctx)) else {
-        return out;
+        return Ok(out);
     };
-    let mut fields = ParamsBuilder::default();
+    let mut fields = ParamsBuilder::new(budget);
     let body: &[u8] = body;
     let delim = format!("--{boundary}");
     let delim = delim.as_bytes();
@@ -485,7 +496,7 @@ fn multipart_parts(ctx: &RequestContext) -> MultipartParts {
     // Position just past the first boundary marker.
     let mut search_from = match delim_finder.find(body) {
         Some(p) => p + delim.len(),
-        None => return out,
+        None => return Ok(out),
     };
     loop {
         let after = &body[search_from..];
@@ -508,16 +519,20 @@ fn multipart_parts(ctx: &RequestContext) -> MultipartParts {
         if part_end >= part_start + 2 && &body[part_end - 2..part_end] == b"\r\n" {
             part_end -= 2;
         }
-        parse_one_part(&body[part_start..part_end], &mut out, &mut fields);
+        parse_one_part(&body[part_start..part_end], &mut out, &mut fields)?;
         search_from = next + delim.len();
     }
     out.fields = fields.finish();
-    out
+    Ok(out)
 }
 
 /// Parse a single multipart part (its headers and content) and record it; a
 /// non-file field goes to `fields`.
-fn parse_one_part(part: &[u8], out: &mut MultipartParts, fields: &mut ParamsBuilder) {
+fn parse_one_part(
+    part: &[u8],
+    out: &mut MultipartParts,
+    fields: &mut ParamsBuilder,
+) -> Result<(), Unlisted> {
     let (headers, content) = match find_bytes(part, b"\r\n\r\n") {
         Some(p) => (&part[..p], &part[p + 4..]),
         None => (part, &b""[..]),
@@ -550,8 +565,11 @@ fn parse_one_part(part: &[u8], out: &mut MultipartParts, fields: &mut ParamsBuil
         }
     }
     match filename {
-        // A part with a `filename` attribute is a file upload.
+        // A part with a `filename` attribute is a file upload. Its name and
+        // filename are inspected (FILES_NAMES, FILES), so it counts against
+        // the argument limits too; its content does not, as no rule reads it.
         Some(fname) => {
+            fields.charge(name.as_ref().map_or(0, String::len) + fname.len())?;
             out.filenames.push(fname);
             if let Some(n) = name {
                 out.field_names.push(n);
@@ -561,10 +579,11 @@ fn parse_one_part(part: &[u8], out: &mut MultipartParts, fields: &mut ParamsBuil
         // Otherwise it is a regular form field; its value feeds ARGS.
         None => {
             if let Some(n) = name {
-                fields.push(n, String::from_utf8_lossy(content).into_owned());
+                fields.push(n, String::from_utf8_lossy(content).into_owned())?;
             }
         }
     }
+    Ok(())
 }
 
 /// Extract a `key="value"` (or unquoted `key=value`) parameter from a
@@ -631,16 +650,22 @@ fn body_parser(ct: &str) -> BodyParser {
 /// A multipart body's parameters are its non-file form fields, which
 /// `RequestViews::body` takes from the multipart view instead of copying.
 ///
-/// A name shared by several values is held once (see [`ArgName`]); the only
-/// error is a JSON body whose distinct names would exceed [`name_budget`].
-fn body_args(ctx: &RequestContext, parser: BodyParser) -> Result<Params, BodyTooComplex> {
+/// A name shared by several values is held once (see [`ArgName`]). Fails for
+/// a JSON body whose distinct names would exceed [`name_budget`], and for
+/// parameters past `budget`, what the site's argument limits leave once the
+/// query string is charged.
+fn body_args(
+    ctx: &RequestContext,
+    parser: BodyParser,
+    budget: ArgBudget,
+) -> Result<Params, Unlisted> {
     let Some(body) = ctx.request_body.as_ref() else {
         return Ok(Params::default());
     };
     Ok(match parser {
         BodyParser::Urlencoded => {
             let text = String::from_utf8_lossy(body);
-            Params::from_pairs(parse_query_params(&text))
+            Params::from_pairs(parse_query_params(&text), budget)?
         }
         BodyParser::Json => match serde_json::from_slice::<serde_json::Value>(body) {
             Ok(val) => {
@@ -649,20 +674,21 @@ fn body_args(ctx: &RequestContext, parser: BodyParser) -> Result<Params, BodyToo
                     built: 0,
                     budget: name_budget(body.len()),
                 };
-                let mut out = ParamsBuilder::default();
+                let mut out = ParamsBuilder::new(budget);
                 flatten_json(&ArgName::from(""), &val, &mut names, &mut out)?;
                 out.finish()
             }
             // Malformed JSON: fall back to scanning the raw body as one value
             // so obfuscated/broken payloads still reach the regex operators.
-            Err(_) => {
-                Params::from_pairs([(String::new(), String::from_utf8_lossy(body).into_owned())])
-            }
+            Err(_) => Params::from_pairs(
+                [(String::new(), String::from_utf8_lossy(body).into_owned())],
+                budget,
+            )?,
         },
         // XML / SOAP bodies: surface element text, attribute values, and CDATA
         // into ARGS so payloads delivered inside XML reach the same operators
         // as form/JSON parameters (SOAP APIs are a common injection vector).
-        BodyParser::Xml => parse_xml_args(body),
+        BodyParser::Xml => parse_xml_args(body, budget)?,
         BodyParser::Multipart | BodyParser::None => Params::default(),
     })
 }
@@ -686,9 +712,9 @@ fn is_xml_content_type(ct: &str) -> bool {
 /// declarations, namespaces, and DTDs are ignored. Malformed input fails open
 /// (extracts what it can). Byte offsets only ever land on ASCII delimiters
 /// (`<`, `>`, `]]>`, …), so all `&str` slicing stays on char boundaries.
-fn parse_xml_args(body: &[u8]) -> Params {
+fn parse_xml_args(body: &[u8], budget: ArgBudget) -> Result<Params, Unlisted> {
     let text = String::from_utf8_lossy(body);
-    let mut out = ParamsBuilder::default();
+    let mut out = ParamsBuilder::new(budget);
     // One name per tag, shared by every text node and CDATA section under it:
     // a long element name over thousands of nodes (split apart by comments)
     // is held once, not once per node.
@@ -703,7 +729,7 @@ fn parse_xml_args(body: &[u8]) -> Params {
             let end = text[i..].find('<').map(|p| i + p).unwrap_or(bytes.len());
             let chunk = &text[i..end];
             if !chunk.trim().is_empty() {
-                out.push_shared(&cur_elem, decode_xml_entities(chunk));
+                out.push_shared(&cur_elem, decode_xml_entities(chunk))?;
             }
             i = end;
             continue;
@@ -721,7 +747,7 @@ fn parse_xml_args(body: &[u8]) -> Params {
                 Some(rel) => {
                     let content = &text[start..start + rel];
                     if !content.trim().is_empty() {
-                        out.push_shared(&cur_elem, content.to_owned());
+                        out.push_shared(&cur_elem, content.to_owned())?;
                     }
                     i = start + rel + 3;
                 }
@@ -748,12 +774,12 @@ fn parse_xml_args(body: &[u8]) -> Params {
                 let body_str = inner.trim_end_matches('/').trim();
                 let name_end = body_str.find(char::is_whitespace).unwrap_or(body_str.len());
                 cur_elem = local_name(&body_str[..name_end]).into();
-                extract_xml_attributes(&body_str[name_end..], &mut out);
+                extract_xml_attributes(&body_str[name_end..], &mut out)?;
             }
         }
     }
 
-    out.finish()
+    Ok(out.finish())
 }
 
 /// The local part of a possibly namespace-prefixed XML name
@@ -764,7 +790,7 @@ fn local_name(raw: &str) -> &str {
 
 /// Extract `name="value"` / `name='value'` attribute pairs from the portion of
 /// a start tag after the element name, decoding XML entities in each value.
-fn extract_xml_attributes(attrs: &str, out: &mut ParamsBuilder) {
+fn extract_xml_attributes(attrs: &str, out: &mut ParamsBuilder) -> Result<(), Unlisted> {
     let chars: Vec<char> = attrs.chars().collect();
     let n = chars.len();
     let mut i = 0;
@@ -797,11 +823,12 @@ fn extract_xml_attributes(attrs: &str, out: &mut ParamsBuilder) {
                     i += 1; // consume the closing quote
                 }
                 if !name.is_empty() {
-                    out.push(name, decode_xml_entities(&val));
+                    out.push(name, decode_xml_entities(&val))?;
                 }
             }
         }
     }
+    Ok(())
 }
 
 /// Decode the five predefined XML entities plus numeric character references
@@ -882,18 +909,25 @@ struct Params {
     /// has a name of its own, `names[i]` — always so for a query string, an
     /// urlencoded form and multipart fields, which pay nothing for it.
     name_of: Vec<usize>,
+    /// Bytes charged to the site's `max_inspected_arg_bytes`: every value,
+    /// each listed name once, and a multipart file part's name and filename.
+    bytes: u64,
 }
 
 impl Params {
     /// Collect `pairs` into the two lists one pair at a time. A parser that
     /// collected its pairs first and split them after would hold the pairs and
     /// both lists at once — half again the parse, on a body of tiny fields.
-    fn from_pairs(pairs: impl IntoIterator<Item = (String, String)>) -> Self {
-        let mut out = ParamsBuilder::default();
+    /// Lazy `pairs` stop being parsed at the first one past `budget`.
+    fn from_pairs(
+        pairs: impl IntoIterator<Item = (String, String)>,
+        budget: ArgBudget,
+    ) -> Result<Self, Unlisted> {
+        let mut out = ParamsBuilder::new(budget);
         for (name, value) in pairs {
-            out.push(name, value);
+            out.push(name, value)?;
         }
-        out.finish()
+        Ok(out.finish())
     }
 
     /// How many values, and so how many names as sent.
@@ -924,7 +958,59 @@ impl Params {
     }
 }
 
-/// Builds [`Params`] as a parser finds its pairs.
+/// What is left of a site's argument limits ([`InspectionLimits`]) for one
+/// parse; `u64::MAX` where the site sets none.
+///
+/// Charged as the parser goes, so a request past a limit stops being parsed
+/// there: the arguments it is refused for are never built, and parsing costs
+/// what the limits allow rather than what the client sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArgBudget {
+    args: u64,
+    bytes: u64,
+}
+
+impl Default for ArgBudget {
+    fn default() -> Self {
+        Self::UNLIMITED
+    }
+}
+
+impl ArgBudget {
+    const UNLIMITED: Self = Self {
+        args: u64::MAX,
+        bytes: u64::MAX,
+    };
+
+    /// The whole of a request's limits.
+    fn of(limits: &InspectionLimits) -> Self {
+        let bound = |n: u64| if n == 0 { u64::MAX } else { n };
+        Self {
+            args: bound(limits.max_args.into()),
+            bytes: bound(limits.max_arg_bytes),
+        }
+    }
+
+    /// Take `args` arguments of `bytes` bytes, or name the limit they pass.
+    fn charge(&mut self, args: u64, bytes: u64) -> Result<(), Unlisted> {
+        self.args =
+            (self.args.checked_sub(args)).ok_or(Unlisted::OverLimit(InspectionLimit::Args))?;
+        self.bytes = (self.bytes.checked_sub(bytes))
+            .ok_or(Unlisted::OverLimit(InspectionLimit::ArgBytes))?;
+        Ok(())
+    }
+
+    /// What is left after the query string's `parsed` parameters, which were
+    /// charged to a budget of the same limits.
+    fn after(self, parsed: &Params) -> Self {
+        Self {
+            args: self.args.saturating_sub(parsed.len() as u64),
+            bytes: self.bytes.saturating_sub(parsed.bytes),
+        }
+    }
+}
+
+/// Builds [`Params`] as a parser finds its pairs, charging each to the budget.
 #[derive(Default)]
 struct ParamsBuilder {
     names: Vec<String>,
@@ -935,27 +1021,48 @@ struct ParamsBuilder {
     /// lives, and a parser may drop one (an XML element's, at its closing tag)
     /// before a later name takes over the address.
     shared: HashMap<usize, (usize, ArgName)>,
+    bytes: u64,
+    budget: ArgBudget,
 }
 
 impl ParamsBuilder {
-    /// A value with a name of its own.
-    fn push(&mut self, name: String, value: String) {
-        self.names.push(name);
-        self.file(self.names.len() - 1, value);
+    fn new(budget: ArgBudget) -> Self {
+        Self {
+            budget,
+            ..Self::default()
+        }
     }
 
-    /// A value under a name other values may share: listed the first time.
-    fn push_shared(&mut self, name: &ArgName, value: String) {
-        let next = self.names.len();
-        let (listed, _) = self
-            .shared
-            .entry(name_id(name))
-            .or_insert_with(|| (next, name.clone()));
-        let listed = *listed;
-        if listed == next {
+    /// A value with a name of its own.
+    fn push(&mut self, name: String, value: String) -> Result<(), Unlisted> {
+        self.charge(name.len() + value.len())?;
+        self.names.push(name);
+        self.file(self.names.len() - 1, value);
+        Ok(())
+    }
+
+    /// A value under a name other values may share: listed, and its bytes
+    /// charged, the first time — it is inspected once.
+    fn push_shared(&mut self, name: &ArgName, value: String) -> Result<(), Unlisted> {
+        let known = self.shared.get(&name_id(name)).map(|&(at, _)| at);
+        self.charge(known.map_or(name.len(), |_| 0) + value.len())?;
+        let listed = known.unwrap_or_else(|| {
+            let at = self.names.len();
+            self.shared.insert(name_id(name), (at, name.clone()));
             self.names.push(name.to_string());
-        }
+            at
+        });
         self.file(listed, value);
+        Ok(())
+    }
+
+    /// One argument of `bytes` bytes. Also how a multipart file part is
+    /// counted: its name and filename are inspected (FILES_NAMES, FILES) but
+    /// it is not a parameter.
+    fn charge(&mut self, bytes: usize) -> Result<(), Unlisted> {
+        self.budget.charge(1, bytes as u64)?;
+        self.bytes += bytes as u64;
+        Ok(())
     }
 
     fn file(&mut self, listed: usize, value: String) {
@@ -975,6 +1082,7 @@ impl ParamsBuilder {
             names: Rc::new(self.names),
             values: Rc::new(self.values),
             name_of: self.name_of,
+            bytes: self.bytes,
         }
     }
 }
@@ -1021,11 +1129,13 @@ struct MemoEntry {
 struct RequestViews<'a> {
     content_type: OnceCell<String>,
     host: OnceCell<String>,
-    query: OnceCell<Params>,
-    /// An urlencoded, JSON or XML body's parameters, or why they cannot be
-    /// listed. A multipart body's are in `multipart`; see `body`.
-    body: OnceCell<Result<Params, BodyTooComplex>>,
-    multipart: OnceCell<MultipartParts>,
+    /// Each parsed view of the request's arguments, or why it cannot be listed
+    /// — past the site's argument limits, or (a body) too complex to list.
+    query: OnceCell<Result<Params, Unlisted>>,
+    /// An urlencoded, JSON or XML body's parameters. A multipart body's are in
+    /// `multipart`; see `body`.
+    body: OnceCell<Result<Params, Unlisted>>,
+    multipart: OnceCell<Result<MultipartParts, Unlisted>>,
     cookies: OnceCell<Vec<(String, String)>>,
     /// Collections kept for the call, by target and transform chain. CRS
     /// repeats a handful of pairs across dozens of rules — 103 phase-2 rules
@@ -1061,28 +1171,39 @@ impl<'a> RequestViews<'a> {
         self.host.get_or_init(|| request_host(ctx))
     }
 
-    /// Decoded query-string parameters, in request order.
-    fn query(&self, ctx: &RequestContext) -> &Params {
-        self.query.get_or_init(|| {
-            note_view_built(View::Query);
-            Params::from_pairs(parse_query_params(ctx.uri.query().unwrap_or("")))
-        })
+    /// Decoded query-string parameters, in request order, charged to the
+    /// site's argument limits (`ctx.inspection_limits`).
+    fn query(&self, ctx: &RequestContext) -> Result<&Params, Unlisted> {
+        self.query
+            .get_or_init(|| {
+                note_view_built(View::Query);
+                let budget = ArgBudget::of(&ctx.inspection_limits);
+                Params::from_pairs(parse_query_params(ctx.uri.query().unwrap_or("")), budget)
+            })
+            .as_ref()
+            .map_err(|&e| e)
+    }
+
+    /// What the site's argument limits leave for the body: the query string
+    /// and the body are judged together, as ARGS holds both.
+    fn body_budget(&self, ctx: &RequestContext) -> Result<ArgBudget, Unlisted> {
+        Ok(ArgBudget::of(&ctx.inspection_limits).after(self.query(ctx)?))
     }
 
     /// Body parameters, in body order; see `body_args`.
-    fn body(&self, ctx: &RequestContext) -> Result<&Params, BodyTooComplex> {
+    fn body(&self, ctx: &RequestContext) -> Result<&Params, Unlisted> {
         match body_parser(self.content_type(ctx)) {
             // Non-file form fields feed ARGS exactly like a urlencoded form, so
             // injection delivered through a multipart body is inspected the
             // same way; file parts are surfaced via the FILES* targets instead.
             // Taken from the multipart view, not copied out of it: the copy
             // duplicated every field of the body for the whole call.
-            BodyParser::Multipart => Ok(&self.multipart(ctx).fields),
+            BodyParser::Multipart => Ok(&self.multipart(ctx)?.fields),
             parser => self
                 .body
                 .get_or_init(|| {
                     note_view_built(View::Body);
-                    body_args(ctx, parser)
+                    body_args(ctx, parser, self.body_budget(ctx)?)
                 })
                 .as_ref()
                 .map_err(|&e| e),
@@ -1090,11 +1211,14 @@ impl<'a> RequestViews<'a> {
     }
 
     /// The parsed `multipart/form-data` body; empty for any other body.
-    fn multipart(&self, ctx: &RequestContext) -> &MultipartParts {
-        self.multipart.get_or_init(|| {
-            note_view_built(View::Multipart);
-            multipart_parts(ctx)
-        })
+    fn multipart(&self, ctx: &RequestContext) -> Result<&MultipartParts, Unlisted> {
+        self.multipart
+            .get_or_init(|| {
+                note_view_built(View::Multipart);
+                multipart_parts(ctx, self.body_budget(ctx)?)
+            })
+            .as_ref()
+            .map_err(|&e| e)
     }
 
     /// `(name, value)` pairs of the `Cookie` header — the first one only, and
@@ -1116,19 +1240,19 @@ impl<'a> RequestViews<'a> {
         &self,
         spec: &TargetSpec,
         ctx: &RequestContext,
-    ) -> Result<Option<Rc<Vec<String>>>, BodyTooComplex> {
+    ) -> Result<Option<Rc<Vec<String>>>, Unlisted> {
         let side = |params: &Params, names: bool| {
             Rc::clone(if names { &params.names } else { &params.values })
         };
         Ok(match spec {
-            TargetSpec::ArgsGet => Some(side(self.query(ctx), false)),
-            TargetSpec::ArgsGetNames => Some(side(self.query(ctx), true)),
+            TargetSpec::ArgsGet => Some(side(self.query(ctx)?, false)),
+            TargetSpec::ArgsGetNames => Some(side(self.query(ctx)?, true)),
             // ARGS is the query parameters followed by the body ones. With one
             // side empty — a GET, or a POST without a query string — it IS the
             // other side; only a request carrying both needs a joined copy.
             TargetSpec::Args | TargetSpec::ArgsNames => {
                 let names = matches!(spec, TargetSpec::ArgsNames);
-                let (query, body) = (self.query(ctx), self.body(ctx)?);
+                let (query, body) = (self.query(ctx)?, self.body(ctx)?);
                 if body.is_empty() {
                     Some(side(query, names))
                 } else if query.is_empty() {
@@ -1141,7 +1265,7 @@ impl<'a> RequestViews<'a> {
             TargetSpec::RequestBody
                 if self.content_type(ctx).starts_with("multipart/form-data") =>
             {
-                Some(Rc::clone(&self.multipart(ctx).fields.values))
+                Some(Rc::clone(&self.multipart(ctx)?.fields.values))
             }
             _ => None,
         })
@@ -1149,13 +1273,13 @@ impl<'a> RequestViews<'a> {
 
     /// The values `spec` names: shared from a view, taken from the memo, or
     /// extracted afresh. Fails only for a body that cannot be listed within
-    /// budget ([`BodyTooComplex`]); the caller refuses the request.
+    /// budget ([`Unlisted`]); the caller refuses the request.
     fn load(
         &self,
         spec: &TargetSpec,
         ctx: &RequestContext,
         last_matched: Option<&str>,
-    ) -> Result<Rc<Vec<String>>, BodyTooComplex> {
+    ) -> Result<Rc<Vec<String>>, Unlisted> {
         Ok(self.load_held(spec, ctx, last_matched)?.0)
     }
 
@@ -1166,7 +1290,7 @@ impl<'a> RequestViews<'a> {
         spec: &TargetSpec,
         ctx: &RequestContext,
         last_matched: Option<&str>,
-    ) -> Result<(Rc<Vec<String>>, bool), BodyTooComplex> {
+    ) -> Result<(Rc<Vec<String>>, bool), Unlisted> {
         if let Some(values) = self.shared(spec, ctx)? {
             return Ok((values, true));
         }
@@ -1193,10 +1317,10 @@ impl<'a> RequestViews<'a> {
         spec: &TargetSpec,
         ctx: &RequestContext,
         last_matched: Option<&str>,
-    ) -> Result<usize, BodyTooComplex> {
+    ) -> Result<usize, Unlisted> {
         Ok(match spec {
             TargetSpec::Args | TargetSpec::ArgsNames => {
-                self.query(ctx).len() + self.body(ctx)?.len()
+                self.query(ctx)?.len() + self.body(ctx)?.len()
             }
             other => self.load(other, ctx, last_matched)?.len(),
         })
@@ -1210,7 +1334,7 @@ impl<'a> RequestViews<'a> {
         spec: &TargetSpec,
         transforms: &[Transform],
         ctx: &RequestContext,
-    ) -> Result<Rc<Vec<String>>, BodyTooComplex> {
+    ) -> Result<Rc<Vec<String>>, Unlisted> {
         debug_assert!(memo_policy(spec) != Memo::Never);
         if transforms.is_empty() {
             return self.load(spec, ctx, None);
@@ -1506,14 +1630,14 @@ fn note_view_built(_: View) {}
 /// resolving it anywhere else would silently yield nothing.
 ///
 /// Reads the parsed collections from `views` — see `RequestViews`. Fails only
-/// for a body that cannot be listed within budget ([`BodyTooComplex`]); the
+/// for a body that cannot be listed within budget ([`Unlisted`]); the
 /// caller refuses the request.
 fn extract_target(
     spec: &TargetSpec,
     ctx: &RequestContext,
     views: &RequestViews,
     last_matched: Option<&str>,
-) -> Result<Vec<String>, BodyTooComplex> {
+) -> Result<Vec<String>, Unlisted> {
     Ok(match spec {
         // Outside a chain nothing has matched yet, and an empty list is the
         // honest answer: the condition simply does not match.
@@ -1522,7 +1646,7 @@ fn extract_target(
         // query-string ones. Built only for a request carrying both; with one
         // side empty `RequestViews::shared` hands out the other side as it is.
         TargetSpec::Args => {
-            let (query, body) = (views.query(ctx), views.body(ctx)?);
+            let (query, body) = (views.query(ctx)?, views.body(ctx)?);
             query
                 .values
                 .iter()
@@ -1533,7 +1657,7 @@ fn extract_target(
         TargetSpec::ArgsNames => {
             // A body name shared by several values is listed once; see
             // `Params`. `&ARGS_NAMES` still counts each one (see `count`).
-            let (query, body) = (views.query(ctx), views.body(ctx)?);
+            let (query, body) = (views.query(ctx)?, views.body(ctx)?);
             query
                 .names
                 .iter()
@@ -1596,7 +1720,7 @@ fn extract_target(
         // boundary noise.
         TargetSpec::RequestBody => {
             if views.content_type(ctx).starts_with("multipart/form-data") {
-                views.multipart(ctx).fields.values.to_vec()
+                views.multipart(ctx)?.fields.values.to_vec()
             } else {
                 ctx.request_body
                     .as_ref()
@@ -1633,8 +1757,8 @@ fn extract_target(
         // written for the query side would otherwise also score body parameters,
         // which is how a query-only restriction turns into a false positive on a
         // legitimate POST.
-        TargetSpec::ArgsGet => views.query(ctx).values.to_vec(),
-        TargetSpec::ArgsGetNames => views.query(ctx).names.to_vec(),
+        TargetSpec::ArgsGet => views.query(ctx)?.values.to_vec(),
+        TargetSpec::ArgsGetNames => views.query(ctx)?.names.to_vec(),
         // The raw, still-encoded query string. CRS uses this for rules that must
         // see the encoding itself — double-encoding and separator abuse — so it
         // must NOT be decoded here.
@@ -1671,7 +1795,7 @@ fn extract_target(
             .map(|b| vec![String::from_utf8_lossy(b).into_owned()])
             .unwrap_or_default(),
         TargetSpec::MultipartPartHeadersAll => views
-            .multipart(ctx)
+            .multipart(ctx)?
             .part_headers
             .iter()
             .map(|(_, line)| line.clone())
@@ -1680,22 +1804,22 @@ fn extract_target(
         // as `&MULTIPART_PART_HEADERS:_charset_`, where a non-zero count means
         // the request carried a `_charset_` form field.
         TargetSpec::MultipartPartHeader(part) => views
-            .multipart(ctx)
+            .multipart(ctx)?
             .part_headers
             .iter()
             .filter(|(n, _)| n.eq_ignore_ascii_case(part))
             .map(|(_, line)| line.clone())
             .collect(),
-        TargetSpec::Files => views.multipart(ctx).filenames.clone(),
-        TargetSpec::FilesNames => views.multipart(ctx).field_names.clone(),
-        TargetSpec::FilesCombinedSize => vec![views.multipart(ctx).combined_size.to_string()],
+        TargetSpec::Files => views.multipart(ctx)?.filenames.clone(),
+        TargetSpec::FilesNames => views.multipart(ctx)?.field_names.clone(),
+        TargetSpec::FilesCombinedSize => vec![views.multipart(ctx)?.combined_size.to_string()],
         TargetSpec::ArgsCombinedSize => {
             // ModSecurity counts BOTH sides of every argument: the name and the
             // value. Counting values alone would under-report a request that
             // smuggles its payload into parameter names, which is exactly the
             // shape 920390 exists to bound.
             let total: usize = views
-                .query(ctx)
+                .query(ctx)?
                 .iter()
                 .chain(views.body(ctx)?.iter())
                 .map(|(k, v)| k.len() + v.len())
@@ -1760,6 +1884,15 @@ fn collect_sensitive_values(ctx: &RequestContext, views: &RequestViews) -> Vec<S
     // JWT that tripped libinjection was therefore written verbatim to waf.log,
     // to ClickHouse under a 90-day TTL, and out to the SIEM.
     let mut sensitive = Vec::new();
+    // A side the engine could not list — too complex, or past the site's
+    // argument limits — has fields no one knows the names of, so its whole
+    // text stands in for them. Over-redacting what could not be taken apart
+    // is the safe side of not knowing.
+    let query = views.query(ctx).ok();
+    if let (None, Some(q)) = (query, ctx.uri.query()) {
+        sensitive.push(q.to_owned());
+        sensitive.push(percent_decode(&q.replace('+', " ")));
+    }
     match views.body(ctx) {
         Ok(body) => {
             // Judged once per listed name: a shared name can carry thousands
@@ -1777,10 +1910,7 @@ fn collect_sensitive_values(ctx: &RequestContext, views: &RequestViews) -> Vec<S
                     .map(|(_, value)| value.clone()),
             );
         }
-        // The body's fields cannot be listed, so which of them are secret is
-        // unknown: the whole body stands in for them. Over-redacting a body no
-        // one could take apart is the safe side of not knowing.
-        Err(BodyTooComplex) => {
+        Err(_) => {
             if let Some(b) = ctx.request_body.as_ref() {
                 sensitive.push(String::from_utf8_lossy(b).into_owned());
             }
@@ -1805,9 +1935,9 @@ fn collect_sensitive_values(ctx: &RequestContext, views: &RequestViews) -> Vec<S
         .filter_map(|(name, value)| Some((name.as_str(), value.to_str().ok()?)));
 
     sensitive.extend(
-        views
-            .query(ctx)
-            .iter()
+        query
+            .into_iter()
+            .flat_map(Params::iter)
             .chain(headers)
             .filter(|(name, value)| !value.is_empty() && is_sensitive_field_name(name))
             .map(|(_, value)| value.to_owned()),
@@ -1910,6 +2040,95 @@ fn record_match<S: AsRef<str>>(last_matched: &mut Option<String>, hit: Option<S>
 // VM evaluator
 // ---------------------------------------------------------------------------
 
+/// How many instructions run between two reads of the clock for the site's
+/// time budget. Reading it costs tens of nanoseconds and an instruction costs
+/// at least that, so the check adds little, and a budget is overrun by at most
+/// this many instructions plus whatever the one running when it ran out takes.
+const CLOCK_EVERY: u32 = 64;
+
+/// The clock the time budget is read from.
+#[cfg(not(any(test, feature = "test-hooks")))]
+fn eval_clock() -> std::time::Instant {
+    std::time::Instant::now()
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+fn eval_clock() -> std::time::Instant {
+    std::time::Instant::now() + crate::test_hooks::eval_clock_skew()
+}
+
+/// What a request past `limit` is refused for, in words.
+fn over_limit_detail(limits: &InspectionLimits, limit: InspectionLimit) -> String {
+    match limit {
+        InspectionLimit::Args => format!(
+            "more than {} arguments ({})",
+            limits.max_args,
+            limit.setting()
+        ),
+        InspectionLimit::ArgBytes => format!(
+            "more than {} bytes of argument names and values ({})",
+            limits.max_arg_bytes,
+            limit.setting()
+        ),
+        InspectionLimit::Time => format!(
+            "rule evaluation passed the {} ms time budget ({})",
+            limits.time_budget_ms,
+            limit.setting()
+        ),
+    }
+}
+
+/// Refuse a request the engine cannot inspect within the site's limits.
+///
+/// Stopping early and returning what was found so far would pass the rest
+/// uninspected, so the request is blocked instead, with the reason and a
+/// built-in CRITICAL match under the limit's own rule id. In learning mode the
+/// proxy downgrades the block to a logged would-block, as it does every verdict.
+/// An argument limit answers 413, or 414 when the query string alone is over
+/// it, as the proxy's size limits do; the time budget answers 403.
+///
+/// `more` is added to the reason only: the match's message stays the same for
+/// every request refused for one setting, as the event's attack name.
+fn refuse_uninspected(
+    ctx: &mut RequestContext,
+    views: &RequestViews,
+    phase: Phase,
+    limit: InspectionLimit,
+    more: Option<String>,
+) -> WafDecision {
+    let detail = over_limit_detail(&ctx.inspection_limits, limit);
+    // Once per request: in learning mode the next phase can meet the same
+    // limit again, and one request is one event.
+    if !ctx
+        .rule_matches
+        .iter()
+        .any(|m| m.rule_id == limit.rule_id())
+    {
+        sentinel_telemetry::note_inspection_limit_exceeded(limit.reason());
+        ctx.rule_matches.push(RuleMatch {
+            rule_id: limit.rule_id().to_string(),
+            message: format!("Request not fully inspected: {detail}"),
+            severity: Severity::Critical,
+            // The refusal decides the verdict itself; it adds no score.
+            score: 0,
+            // About the request as a whole: there is no one field to name, and
+            // a target is what an operator would write an exclusion against.
+            target: String::new(),
+            phase: phase.clone(),
+            matched_value: String::new(),
+        });
+    }
+    if limit != InspectionLimit::Time && !is_response_phase(&phase) {
+        ctx.block_status = Some(if views.query(ctx).is_err() { 414 } else { 413 });
+    }
+    ctx.decision = WafDecision::Block;
+    ctx.block_reason = Some(match more {
+        Some(more) => format!("inspection limit exceeded: {detail}; {more}"),
+        None => format!("inspection limit exceeded: {detail}"),
+    });
+    WafDecision::Block
+}
+
 /// Execute the instruction program for `phase` against `ctx`.
 ///
 /// Returns the final `WafDecision` (may update `ctx.decision` and
@@ -1921,7 +2140,7 @@ pub fn evaluate(
     anomaly_threshold: u32,
 ) -> WafDecision {
     let response_phase = is_response_phase(&phase);
-    let phase_idx = phase as usize;
+    let phase_idx = phase.clone() as usize;
     let program = &ruleset.phase_programs[phase_idx];
 
     // Parsed request collections, built once and shared by every rule for the
@@ -1947,8 +2166,26 @@ pub fn evaluate(
     // miss), so a stale value from an earlier rule can never be attributed to
     // a later one.
     let mut last_matched: Option<String> = None;
+    // The site's time budget for this call: when it started, and how long it
+    // may run. Read every `CLOCK_EVERY` instructions.
+    let time_budget = (ctx.inspection_limits.time_budget_ms > 0).then(|| {
+        (
+            eval_clock(),
+            std::time::Duration::from_millis(ctx.inspection_limits.time_budget_ms.into()),
+        )
+    });
+    let mut steps: u32 = 0;
 
     while ip < program.len() {
+        steps = steps.wrapping_add(1);
+        if let Some((started, budget)) = time_budget.filter(|_| steps % CLOCK_EVERY == 0) {
+            let spent = eval_clock().saturating_duration_since(started);
+            if spent > budget {
+                let after = format!("stopped after {} ms", spent.as_millis());
+                return refuse_uninspected(ctx, &views, phase, InspectionLimit::Time, Some(after));
+            }
+        }
+
         // Early exit only on a real BLOCK — the same rule as the proxy's
         // `still_evaluating`. This read `!= Allow`, and `Log` is not `Allow`:
         // once learning mode had downgraded a verdict to Log (an over-long URI,
@@ -1998,10 +2235,15 @@ pub fn evaluate(
                     // as empty: an empty list would pass it uninspected. In
                     // learning mode the proxy turns this into a logged
                     // would-block, like any other verdict.
-                    Err(BodyTooComplex) => {
+                    Err(Unlisted::BodyTooComplex) => {
                         ctx.decision = WafDecision::Block;
                         ctx.block_reason = Some(BODY_TOO_COMPLEX.to_string());
                         return WafDecision::Block;
+                    }
+                    // Past the site's argument limits: the arguments were not
+                    // all parsed, so no ARGS-family rule can judge them.
+                    Err(Unlisted::OverLimit(limit)) => {
+                        return refuse_uninspected(ctx, &views, phase, limit, None);
                     }
                 };
                 stack.push(StackVal::Strings(values));
@@ -3473,7 +3715,10 @@ impl RequestValues {
         // the values the rules read.
         let views = RequestViews::default();
         let mut entries = Vec::new();
-        for (k, v) in views.query(ctx).iter() {
+        // Arguments past the site's limits are not listed: the engine refused
+        // to parse them, so no ARGS-family rule matched in them either.
+        let unlisted = Params::default();
+        for (k, v) in views.query(ctx).unwrap_or(&unlisted).iter() {
             entries.push((
                 Collection::ArgsNames,
                 format!("ARGS_NAMES:{k}").into(),
@@ -3485,8 +3730,7 @@ impl RequestValues {
                 v.to_owned(),
             ));
         }
-        // A body that cannot be listed within budget is listed raw, below.
-        let unlisted = Params::default();
+        // A body that cannot be listed is listed raw, below.
         let body = views.body(ctx).unwrap_or(&unlisted);
         let body_parsed = !body.is_empty();
         // Each listed name is labelled — and listed under ARGS_NAMES — once,
@@ -3986,7 +4230,7 @@ SecRule ARGS "@rx ^hello world$" "id:8,phase:2,pass,t:none,t:lowercase,msg:'fire
         let mut get = post("/search?q=shoes&page=2", "", "");
         get.request_body = None;
         let views = RequestViews::new(&uses);
-        let query = views.query(&get);
+        let query = views.query(&get).unwrap();
         for spec in [TargetSpec::Args, TargetSpec::ArgsGet] {
             assert!(same(&views.load(&spec, &get, None).unwrap(), &query.values));
         }
@@ -4008,10 +4252,13 @@ SecRule ARGS "@rx ^hello world$" "id:8,phase:2,pass,t:none,t:lowercase,msg:'fire
         );
         let views = RequestViews::new(&uses);
         assert!(
-            std::ptr::eq(views.body(&multi).unwrap(), &views.multipart(&multi).fields),
+            std::ptr::eq(
+                views.body(&multi).unwrap(),
+                &views.multipart(&multi).unwrap().fields
+            ),
             "a multipart body's parameters must be the multipart view's fields"
         );
-        let fields = &views.multipart(&multi).fields;
+        let fields = &views.multipart(&multi).unwrap().fields;
         assert_eq!(*fields.values, ["hello"]);
         assert!(same(
             &views.load(&TargetSpec::Args, &multi, None).unwrap(),
@@ -4401,7 +4648,7 @@ mod xml_tests {
     #[test]
     fn xml_extracts_element_text_and_attributes() {
         let body = br#"<order id="42"><item cat="books">' OR 1=1--</item></order>"#;
-        let pairs = parse_xml_args(body);
+        let pairs = parse_xml_args(body, ArgBudget::UNLIMITED).unwrap();
         assert!(
             pairs.iter().any(|(k, v)| k == "id" && v == "42"),
             "attribute value must be surfaced: {pairs:?}"
@@ -4416,7 +4663,7 @@ mod xml_tests {
     #[test]
     fn xml_decodes_entities_and_cdata() {
         let body = br#"<a>&lt;script&gt;</a><b><![CDATA[<xss>alert(1)</xss>]]></b>"#;
-        let pairs = parse_xml_args(body);
+        let pairs = parse_xml_args(body, ArgBudget::UNLIMITED).unwrap();
         assert!(
             pairs.iter().any(|(_, v)| v == "<script>"),
             "entities decoded: {pairs:?}"
@@ -4431,7 +4678,7 @@ mod xml_tests {
     fn xml_strips_namespace_prefixes_soap() {
         let body =
             br#"<soap:Envelope><soap:Body><q>select * from users</q></soap:Body></soap:Envelope>"#;
-        let pairs = parse_xml_args(body);
+        let pairs = parse_xml_args(body, ArgBudget::UNLIMITED).unwrap();
         assert!(
             pairs
                 .iter()
@@ -4443,7 +4690,7 @@ mod xml_tests {
     #[test]
     fn xml_ignores_comments_pi_and_doctype() {
         let body = br#"<?xml version="1.0"?><!DOCTYPE x><!-- <injected> --><root>data</root>"#;
-        let pairs = parse_xml_args(body);
+        let pairs = parse_xml_args(body, ArgBudget::UNLIMITED).unwrap();
         assert!(pairs.iter().any(|(k, v)| k == "root" && v == "data"));
         assert!(
             !pairs.iter().any(|(_, v)| v.contains("injected")),
@@ -4464,10 +4711,10 @@ mod xml_tests {
     fn xml_malformed_fails_open() {
         // Unterminated tag / truncated body must not panic and should still
         // surface whatever text it can.
-        let pairs = parse_xml_args(b"<a>hello");
+        let pairs = parse_xml_args(b"<a>hello", ArgBudget::UNLIMITED).unwrap();
         assert!(pairs.iter().any(|(k, v)| k == "a" && v == "hello"));
-        let _ = parse_xml_args(b"<a href=\"unterminated");
-        let _ = parse_xml_args(b"<![CDATA[unterminated");
+        let _ = parse_xml_args(b"<a href=\"unterminated", ArgBudget::UNLIMITED).unwrap();
+        let _ = parse_xml_args(b"<![CDATA[unterminated", ArgBudget::UNLIMITED).unwrap();
     }
 }
 
@@ -4879,7 +5126,9 @@ mod transform_tests {
         let attr = format!("<a v=\"{}\"/>", mb_of("&x"));
         for body in [text, attr] {
             assert!(
-                finishes_in_time(move || drop(parse_xml_args(body.as_bytes()))),
+                finishes_in_time(move || drop(
+                    parse_xml_args(body.as_bytes(), ArgBudget::UNLIMITED).unwrap()
+                )),
                 "XML entity decoding took over {BOUND:?} on ~1 MB"
             );
         }
@@ -4900,8 +5149,8 @@ mod transform_tests {
     /// The body's parameters, for a body within budget.
     fn args(ctx: &RequestContext) -> Params {
         match body_parser(&content_type(ctx)) {
-            BodyParser::Multipart => multipart_parts(ctx).fields,
-            parser => body_args(ctx, parser).expect("within the name budget"),
+            BodyParser::Multipart => multipart_parts(ctx, ArgBudget::UNLIMITED).unwrap().fields,
+            parser => body_args(ctx, parser, ArgBudget::UNLIMITED).expect("within the name budget"),
         }
     }
 
@@ -4964,7 +5213,9 @@ mod transform_tests {
         let ctx = body_ctx(ct, body);
         let views = RequestViews::default();
         let pairs = args(&ctx);
-        let part_headers = multipart_parts(&ctx).part_headers;
+        let part_headers = multipart_parts(&ctx, ArgBudget::UNLIMITED)
+            .unwrap()
+            .part_headers;
         let listed = extract_target(&TargetSpec::ArgsNames, &ctx, &views, None).unwrap();
         let values = RequestValues::from_ctx(&ctx);
         drop(collect_sensitive_values(&ctx, &views));
@@ -5024,8 +5275,9 @@ mod transform_tests {
             let len = body.len();
             let over = within(BOUND, move || {
                 let ctx = body_ctx("application/json", body);
-                match body_args(&ctx, BodyParser::Json) {
-                    Err(BodyTooComplex) => None,
+                match body_args(&ctx, BodyParser::Json, ArgBudget::UNLIMITED) {
+                    Err(Unlisted::BodyTooComplex) => None,
+                    Err(other) => panic!("no limits were set, yet {other:?}"),
                     Ok(pairs) => Some(name_bytes(pairs.names.iter())),
                 }
             })
@@ -5127,7 +5379,7 @@ mod transform_tests {
         let ct = format!("multipart/form-data; boundary={boundary}");
         let ctx = body_ctx(&ct, vec![b'-'; MB]);
         assert!(
-            finishes_in_time(move || drop(multipart_parts(&ctx))),
+            finishes_in_time(move || drop(multipart_parts(&ctx, ArgBudget::UNLIMITED).unwrap())),
             "a {} KB boundary over 1 MB took over {BOUND:?}",
             boundary.len() / 1024
         );
@@ -5137,7 +5389,443 @@ mod transform_tests {
             "--{boundary}\r\nContent-Disposition: form-data; name=\"q\"\r\n\r\n1 OR 1=1\r\n--{boundary}--\r\n"
         );
         let ctx = body_ctx(&ct, body.into_bytes());
-        let fields = multipart_parts(&ctx).fields;
+        let fields = multipart_parts(&ctx, ArgBudget::UNLIMITED).unwrap().fields;
         assert_eq!(fields.iter().collect::<Vec<_>>(), [("q", "1 OR 1=1")]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inspection limit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod inspection_limit_tests {
+    use super::*;
+    use crate::crs_compat::import_secrule_conf;
+    use std::fmt::Write as _;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::{Mutex, MutexGuard};
+    use std::time::Duration;
+
+    /// The refusal count is process-wide, so every test here that refuses a
+    /// request holds this: a count one test reads is then its own.
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    fn serial() -> MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn ruleset(src: &str) -> CompiledRuleSet {
+        crate::compile(import_secrule_conf(src).expect("import")).expect("compile")
+    }
+
+    /// What CRS does with arguments, in miniature: phase 1 reads the query
+    /// string, phase 2 every argument collection. Rule 1 fires on a header
+    /// before any argument is read; rule 29 fires on the LAST argument, so a
+    /// run that reaches it inspected every one.
+    const RULES: &str = r#"
+SecRule REQUEST_HEADERS:User-Agent "@rx probe" "id:1,phase:1,pass,msg:'header rule'"
+SecRule ARGS_GET "@rx never-a" "id:2,phase:1,pass"
+SecRule ARGS "@rx never-b" "id:20,phase:2,pass,t:none,t:lowercase"
+SecRule ARGS_NAMES "@rx never-c" "id:21,phase:2,pass"
+SecRule FILES_NAMES|FILES "@rx never-d" "id:22,phase:2,pass"
+SecRule ARGS "@rx ^last-value$" "id:29,phase:2,pass,msg:'last argument seen'"
+"#;
+
+    fn limits(max_args: u32, max_arg_bytes: u64, time_budget_ms: u32) -> InspectionLimits {
+        InspectionLimits {
+            max_args,
+            max_arg_bytes,
+            time_budget_ms,
+        }
+    }
+
+    fn request(query: &str, content_type: &str, body: &str, l: InspectionLimits) -> RequestContext {
+        let mut c = RequestContext::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+        c.method = http::Method::POST;
+        c.uri = format!("/form{query}").parse().unwrap();
+        c.request_headers
+            .insert("user-agent", "probe".parse().unwrap());
+        if !content_type.is_empty() {
+            c.request_headers
+                .insert("content-type", content_type.parse().unwrap());
+        }
+        c.request_body = Some(bytes::Bytes::from(body.to_owned()));
+        c.inspection_limits = l;
+        c
+    }
+
+    /// Phase 1, then phase 2 unless phase 1 blocked — as the proxy runs them.
+    fn run(rs: &CompiledRuleSet, c: &mut RequestContext) -> WafDecision {
+        if evaluate(rs, c, Phase::RequestHeaders, 0) == WafDecision::Block {
+            return WafDecision::Block;
+        }
+        evaluate(rs, c, Phase::RequestBody, 0)
+    }
+
+    fn fired(c: &RequestContext, id: &str) -> bool {
+        c.rule_matches.iter().any(|m| m.rule_id == id)
+    }
+
+    fn refusals(c: &RequestContext) -> Vec<&RuleMatch> {
+        c.rule_matches
+            .iter()
+            .filter(|m| InspectionLimit::of_rule(&m.rule_id).is_some())
+            .collect()
+    }
+
+    /// `n` arguments `a0=v`, `a1=v`, … whose last value is `last-value`, as
+    /// `(shape, query, content type, body)` for every parser, and the bytes of
+    /// their names and values.
+    fn shapes(n: usize) -> (Vec<(&'static str, String, String, String)>, u64) {
+        let args: Vec<(String, String)> = (0..n)
+            .map(|i| {
+                let v = if i + 1 == n { "last-value" } else { "v" };
+                (format!("a{i}"), v.to_string())
+            })
+            .collect();
+        let bytes = args.iter().map(|(k, v)| (k.len() + v.len()) as u64).sum();
+        let pairs = |sep: &str| {
+            args.iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(sep)
+        };
+        let json = args
+            .iter()
+            .map(|(k, v)| format!("\"{k}\":\"{v}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let (mut xml, mut multipart) = (String::new(), String::new());
+        for (k, v) in &args {
+            write!(xml, "<{k}>{v}</{k}>").unwrap();
+            write!(
+                multipart,
+                "--B\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n"
+            )
+            .unwrap();
+        }
+        let shapes = vec![
+            (
+                "query",
+                format!("?{}", pairs("&")),
+                String::new(),
+                String::new(),
+            ),
+            (
+                "urlencoded",
+                String::new(),
+                "application/x-www-form-urlencoded".into(),
+                pairs("&"),
+            ),
+            (
+                "json",
+                String::new(),
+                "application/json".into(),
+                format!("{{{json}}}"),
+            ),
+            (
+                "xml",
+                String::new(),
+                "application/xml".into(),
+                format!("<r>{xml}</r>"),
+            ),
+            (
+                "multipart",
+                String::new(),
+                "multipart/form-data; boundary=B".into(),
+                format!("{multipart}--B--\r\n"),
+            ),
+        ];
+        (shapes, bytes)
+    }
+
+    /// At a limit every argument is inspected; one past it the request is
+    /// refused — never judged on the arguments that fitted and passed — with
+    /// the limit's own built-in rule, for every parser that feeds ARGS.
+    #[test]
+    fn at_an_argument_limit_all_is_inspected_and_past_it_the_request_is_refused() {
+        let _serial = serial();
+        let rs = ruleset(RULES);
+        let (shapes, bytes) = shapes(20);
+        for (shape, query, ct, body) in shapes {
+            let status = if shape == "query" { 414 } else { 413 };
+            for (at, past, limit) in [
+                (limits(20, 0, 0), limits(19, 0, 0), InspectionLimit::Args),
+                (
+                    limits(0, bytes, 0),
+                    limits(0, bytes - 1, 0),
+                    InspectionLimit::ArgBytes,
+                ),
+            ] {
+                let mut c = request(&query, &ct, &body, at);
+                assert_eq!(run(&rs, &mut c), WafDecision::Allow, "{shape} at {at:?}");
+                assert!(
+                    fired(&c, "29"),
+                    "{shape} at {at:?}: the last argument was not inspected"
+                );
+                assert!(refusals(&c).is_empty(), "{shape} at {at:?}");
+                assert_eq!(c.block_status, None);
+
+                let mut c = request(&query, &ct, &body, past);
+                assert_eq!(
+                    run(&rs, &mut c),
+                    WafDecision::Block,
+                    "{shape} past {past:?}"
+                );
+                assert!(!fired(&c, "29"), "{shape}: judged on part of its arguments");
+                assert!(fired(&c, "1"), "{shape}: the earlier finding must be kept");
+                let detail = match limit {
+                    InspectionLimit::Args => {
+                        "more than 19 arguments (max_inspected_args)".to_string()
+                    }
+                    _ => format!(
+                        "more than {} bytes of argument names and values (max_inspected_arg_bytes)",
+                        bytes - 1
+                    ),
+                };
+                assert_eq!(
+                    c.block_reason.as_deref(),
+                    Some(format!("inspection limit exceeded: {detail}").as_str()),
+                    "{shape}"
+                );
+                assert_eq!(c.block_status, Some(status), "{shape}");
+                let refused = refusals(&c);
+                assert_eq!(refused.len(), 1, "{shape}");
+                let m = refused[0];
+                assert_eq!(m.rule_id, limit.rule_id(), "{shape}");
+                assert_eq!(m.severity, Severity::Critical);
+                assert_eq!(m.score, 0, "the refusal decides; it adds no score");
+                assert_eq!(m.target, "", "no single field to exclude");
+                assert_eq!(m.message, format!("Request not fully inspected: {detail}"));
+                assert!(m.matched_value.is_empty());
+            }
+        }
+    }
+
+    /// ARGS holds the query string and the body together, so they share one
+    /// budget: a request cannot double its allowance by splitting it.
+    #[test]
+    fn query_and_body_arguments_share_the_limits() {
+        let _serial = serial();
+        let rs = ruleset(RULES);
+        let form = "application/x-www-form-urlencoded";
+        let mut c = request(
+            "?q1=1&q2=2&q3=3",
+            form,
+            "a0=v&a1=v&a2=last-value",
+            limits(6, 0, 0),
+        );
+        assert_eq!(run(&rs, &mut c), WafDecision::Allow);
+        assert!(fired(&c, "29"));
+
+        // The query fits on its own; the body is what goes past.
+        let mut c = request(
+            "?q1=1&q2=2&q3=3",
+            form,
+            "a0=v&a1=v&a2=last-value",
+            limits(5, 0, 0),
+        );
+        assert_eq!(run(&rs, &mut c), WafDecision::Block);
+        assert_eq!(refusals(&c)[0].phase, Phase::RequestBody);
+        assert_eq!(c.block_status, Some(413));
+
+        // Here the query string alone is over, and phase 1 refuses it.
+        let mut c = request("?q1=1&q2=2&q3=3", form, "a0=v", limits(2, 0, 0));
+        assert_eq!(run(&rs, &mut c), WafDecision::Block);
+        assert_eq!(refusals(&c)[0].phase, Phase::RequestHeaders);
+        assert_eq!(c.block_status, Some(414));
+    }
+
+    /// A name several values share is inspected once (ARGS_NAMES lists it
+    /// once), so its bytes are charged once; a file part is an argument (its
+    /// name and filename are inspected) though not a parameter.
+    #[test]
+    fn shared_names_count_once_and_file_parts_count() {
+        let _serial = serial();
+        let rs = ruleset(RULES);
+        // "k" + "aa" + "bb" + "last-value": 15 bytes; per value it would be 17.
+        let json = r#"{"k":["aa","bb","last-value"]}"#;
+        let mut c = request("", "application/json", json, limits(0, 15, 0));
+        assert_eq!(run(&rs, &mut c), WafDecision::Allow);
+        assert!(fired(&c, "29"));
+        let mut c = request("", "application/json", json, limits(0, 14, 0));
+        assert_eq!(run(&rs, &mut c), WafDecision::Block);
+
+        let body = "--B\r\nContent-Disposition: form-data; name=\"note\"\r\n\r\nlast-value\r\n\
+                    --B\r\nContent-Disposition: form-data; name=\"doc\"; filename=\"a.txt\"\r\n\r\n\
+                    file body that no rule reads\r\n--B--\r\n";
+        let ct = "multipart/form-data; boundary=B";
+        // note + last-value + doc + a.txt = 22 bytes, two arguments.
+        for (l, want) in [
+            (limits(2, 22, 0), WafDecision::Allow),
+            (limits(1, 0, 0), WafDecision::Block),
+            (limits(0, 21, 0), WafDecision::Block),
+        ] {
+            let mut c = request("", ct, body, l);
+            assert_eq!(run(&rs, &mut c), want, "{l:?}");
+        }
+    }
+
+    /// The budget is charged as the parser goes: a request far past a limit
+    /// costs the limit to parse, not what the client sent.
+    #[test]
+    fn parsing_stops_at_the_first_argument_past_a_limit() {
+        for (l, limit) in [
+            (limits(10, 0, 0), InspectionLimit::Args),
+            (limits(0, 30, 0), InspectionLimit::ArgBytes),
+        ] {
+            let pulled = Cell::new(0usize);
+            let pairs = (0..1_000_000).map(|i| {
+                pulled.set(pulled.get() + 1);
+                (format!("n{i}"), "v".to_string())
+            });
+            let err = Params::from_pairs(pairs, ArgBudget::of(&l)).unwrap_err();
+            assert_eq!(err, Unlisted::OverLimit(limit));
+            // Ten 3-byte arguments fit either limit; the eleventh is refused.
+            assert_eq!(pulled.get(), 11, "{limit:?}");
+        }
+    }
+
+    /// 0 is "no limit", as for the proxy's other request limits; a context
+    /// nothing stamped is unbounded.
+    #[test]
+    fn zero_means_no_limit() {
+        let rs = ruleset(RULES);
+        let (shapes, _) = shapes(200);
+        for (shape, query, ct, body) in shapes {
+            let mut c = request(&query, &ct, &body, InspectionLimits::default());
+            assert_eq!(run(&rs, &mut c), WafDecision::Allow, "{shape}");
+            assert!(fired(&c, "29"), "{shape}");
+        }
+    }
+
+    /// The time budget is read every `CLOCK_EVERY` instructions. The test hook
+    /// moves the clock a fixed step per read, so the budget runs out at the
+    /// first check without a slow request.
+    #[test]
+    fn the_time_budget_refuses_an_evaluation_that_runs_past_it() {
+        let _serial = serial();
+        // Enough rules that phase 2 runs well past CLOCK_EVERY instructions.
+        let mut src = String::from(RULES);
+        for i in 0..40 {
+            src.push_str(&format!(
+                "SecRule ARGS \"@rx never-{i}\" \"id:{},phase:2,pass\"\n",
+                100 + i
+            ));
+        }
+        let rs = ruleset(&src);
+        assert!(rs.phase_programs[Phase::RequestBody as usize].len() > 2 * CLOCK_EVERY as usize);
+        let form = "application/x-www-form-urlencoded";
+
+        // The clock moves 51 ms per read against a 50 ms budget.
+        crate::test_hooks::set_eval_clock_step(Duration::from_millis(51));
+        let mut c = request("", form, "a=last-value", limits(0, 0, 50));
+        let decision = run(&rs, &mut c);
+        // No budget, no clock: the same hook changes nothing.
+        let mut unbudgeted = request("", form, "a=last-value", limits(0, 0, 0));
+        let unbudgeted_decision = run(&rs, &mut unbudgeted);
+        crate::test_hooks::set_eval_clock_step(Duration::ZERO);
+
+        assert_eq!(decision, WafDecision::Block);
+        let refused = refusals(&c);
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].rule_id, InspectionLimit::Time.rule_id());
+        assert_eq!(refused[0].phase, Phase::RequestBody);
+        assert_eq!(refused[0].target, "");
+        // The same for every request refused under this budget; how long this
+        // one ran is in the reason.
+        assert_eq!(
+            refused[0].message,
+            "Request not fully inspected: rule evaluation passed the 50 ms time budget \
+             (inspection_time_budget_ms)"
+        );
+        let reason = c.block_reason.as_deref().unwrap();
+        assert!(
+            reason.starts_with(
+                "inspection limit exceeded: rule evaluation passed the 50 ms time budget \
+                 (inspection_time_budget_ms); stopped after "
+            ),
+            "{reason}"
+        );
+        assert_eq!(c.block_status, None, "a time refusal answers 403");
+        assert!(
+            fired(&c, "1"),
+            "findings before the budget ran out are kept"
+        );
+        assert_eq!(unbudgeted_decision, WafDecision::Allow);
+        assert!(fired(&unbudgeted, "29"));
+
+        // With the real clock, a 50 ms budget is far above this request.
+        let mut c = request("", form, "a=last-value", limits(0, 0, 50));
+        assert_eq!(run(&rs, &mut c), WafDecision::Allow);
+        assert!(fired(&c, "29"));
+    }
+
+    /// In learning mode the proxy turns the Block into a logged would-block
+    /// and runs the next phase, which meets the same limit: one request is
+    /// still one refusal, recorded and counted once.
+    #[test]
+    fn a_refusal_is_recorded_and_counted_once_per_request() {
+        let _serial = serial();
+        let rs = ruleset(RULES);
+        let before = sentinel_telemetry::inspection_limit_exceeded_total("args");
+        let mut c = request("?q1=1&q2=2&q3=3", "", "", limits(2, 0, 0));
+        assert_eq!(
+            evaluate(&rs, &mut c, Phase::RequestHeaders, 0),
+            WafDecision::Block
+        );
+        // What the proxy's enforce_mode does in learning mode.
+        c.decision = WafDecision::Log;
+        c.would_block = true;
+        assert_eq!(
+            evaluate(&rs, &mut c, Phase::RequestBody, 0),
+            WafDecision::Block
+        );
+        assert_eq!(refusals(&c).len(), 1);
+        assert_eq!(
+            sentinel_telemetry::inspection_limit_exceeded_total("args"),
+            before + 1
+        );
+    }
+
+    /// The metric's reason labels are the limits' own.
+    #[test]
+    fn every_limit_is_a_metric_reason() {
+        let reasons: Vec<&str> = InspectionLimit::ALL.iter().map(|l| l.reason()).collect();
+        assert_eq!(reasons, sentinel_telemetry::inspection_limit_reasons());
+    }
+
+    /// Arguments past a limit were never parsed, so which of them are secret
+    /// is unknown: the whole query string stands in for them, and the logger's
+    /// locator lists none of them.
+    #[test]
+    fn arguments_past_a_limit_are_withheld_whole_and_not_listed() {
+        let c = request(
+            "?password=hunter2-secret&a=1&b=2",
+            "application/x-www-form-urlencoded",
+            "token=abcdef-123456",
+            limits(1, 0, 0),
+        );
+        let views = RequestViews::default();
+        let sensitive = collect_sensitive_values(&c, &views);
+        assert!(
+            value_is_sensitive(&sensitive, "hunter2-secret"),
+            "{sensitive:?}"
+        );
+        assert!(
+            value_is_sensitive(&sensitive, "abcdef-123456"),
+            "{sensitive:?}"
+        );
+
+        let values = RequestValues::from_ctx(&c);
+        assert!(values
+            .entries
+            .iter()
+            .all(|(coll, _, _)| !matches!(coll, Collection::ArgsGet | Collection::ArgsPost)));
+        assert!(values
+            .entries
+            .iter()
+            .any(|(coll, _, v)| *coll == Collection::Body && v == "token=abcdef-123456"));
     }
 }

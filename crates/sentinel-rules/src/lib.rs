@@ -26,6 +26,8 @@ pub mod compiler;
 pub mod crs_compat;
 pub mod dsl;
 pub mod ssrf;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod test_hooks;
 
 use std::sync::Arc;
 

@@ -26,6 +26,7 @@ pub mod captcha;
 pub mod challenge;
 pub(crate) mod goodbot;
 pub mod http3;
+mod inspection_limits;
 pub(crate) mod ja4_quic;
 mod jwks;
 pub mod proxy_protocol;
@@ -3435,6 +3436,8 @@ async fn proxy_inner(
         // Stamped here for the same reason as the fields above: the block
         // renderer runs at call sites that have no site config in scope.
         ctx.block_page = s.waf.block_page.clone();
+        // What inspecting this request may cost; the rule engine reads it.
+        ctx.inspection_limits = s.waf.inspection_limits();
     }
 
     // Refuse to serve a site whose rule engine has not finished compiling.
@@ -4194,6 +4197,7 @@ async fn proxy_inner(
                         // Respect learning mode (downgrade Block → Log).
                         let gm = governing_mode(ctx, &site_cfg.waf.mode);
                         enforce_mode(ctx, &gm);
+                        inspection_limits::warn_if_forwarded(ctx, site_cfg, &Phase::ResponseBody);
                         if ctx.decision == WafDecision::Block {
                             warn!(
                                 site = %site_cfg.id,
@@ -4733,6 +4737,7 @@ async fn phase1_headers(
 
     let gm = governing_mode(ctx, &site.waf.mode);
     enforce_mode(ctx, &gm);
+    inspection_limits::warn_if_forwarded(ctx, site, &Phase::RequestHeaders);
     Ok(())
 }
 
@@ -4775,6 +4780,7 @@ impl WsSiteInspector {
         ctx.tls_fingerprint = self.tls_fingerprint.clone();
         ctx.enforcement_mode = self.enforcement_mode.clone();
         ctx.anomaly_threshold = self.anomaly_threshold;
+        ctx.inspection_limits = self.site.waf.inspection_limits();
         ctx.tx_vars
             .insert("DETECTION_PARANOIA_LEVEL".to_owned(), self.paranoia.clone());
         // Only the content type, not the handshake's headers: those were judged
@@ -4937,6 +4943,7 @@ fn phase2_body(
 
     let gm = governing_mode(ctx, &site.waf.mode);
     enforce_mode(ctx, &gm);
+    inspection_limits::warn_if_forwarded(ctx, site, &Phase::RequestBody);
     Ok(())
 }
 
@@ -10487,6 +10494,10 @@ fn explain_event_at(
     // than a generic "review your policy".
     let remediation = if action == "PASS" {
         String::new()
+    } else if let Some(limit) =
+        top.and_then(|m| sentinel_core::context::InspectionLimit::of_rule(&m.rule_id))
+    {
+        inspection_limits::remediation(limit, ctx, site)
     } else if is_rule_hit {
         let m = top.expect("is_rule_hit implies a match");
         // With a known target the advice can be specific; without one it must not
