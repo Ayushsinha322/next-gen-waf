@@ -236,3 +236,37 @@ describe("a console save keeps the policy keys the console does not manage", () 
     }
   });
 });
+
+describe("inspection limits in the site form", () => {
+  const stored = (waf_policy: Record<string, unknown>): Site =>
+    ({ id: "s1", name: "site", domains: ["app.example"], upstream: {}, waf_policy } as unknown as Site);
+
+  it("leaves an unset limit out, so the data plane's default applies", () => {
+    const wp = formToPayload(emptyForm()).waf_policy as Record<string, unknown>;
+    for (const k of ["max_inspected_args", "max_inspected_arg_bytes", "inspection_time_budget_ms"]) {
+      expect(k in wp, k).toBe(false);
+    }
+  });
+
+  it("writes a set limit — KiB as bytes, and 0 as 0 (no limit), not the default", () => {
+    const f = emptyForm();
+    f.max_inspected_args = 2000;
+    f.max_inspected_arg_kib = 1024;
+    f.inspection_time_budget_ms = 0;
+    const wp = formToPayload(f).waf_policy as Record<string, unknown>;
+    expect(wp.max_inspected_args).toBe(2000);
+    expect(wp.max_inspected_arg_bytes).toBe(1024 * 1024);
+    expect(wp.inspection_time_budget_ms).toBe(0);
+  });
+
+  it("round-trips a stored limit exactly, and an absent one as unset", () => {
+    const site = stored({ mode: "learning", max_inspected_arg_bytes: 524289, inspection_time_budget_ms: 0 });
+    const f = siteToForm(site);
+    expect(f.max_inspected_args).toBe("");
+    expect(f.inspection_time_budget_ms).toBe(0);
+    const wp = formToPayload(f).waf_policy as Record<string, unknown>;
+    expect(wp.max_inspected_arg_bytes).toBe(524289);
+    expect(wp.inspection_time_budget_ms).toBe(0);
+    expect("max_inspected_args" in wp).toBe(false);
+  });
+});

@@ -19,6 +19,15 @@
 //!     allowed (`at-limits`), and 8 fields sharing them (`at-bytes`), the
 //!     costliest shape per byte. The `refused` column says whether the default
 //!     limits — the time budget included — let them through.
+//!   * bodies the rules read whole (REQUEST_BODY), under the default limits:
+//!     `whole/…` has no parser (text/plain, octet-stream, multipart/related),
+//!     so the body is one argument of its whole length — at the byte limit,
+//!     and at a default-sized 10 MiB, which must be refused; `parsed/…` is a
+//!     parsed body whose bytes are mostly NOT arguments (an XML comment, one
+//!     long JSON key repeated, nulls, whitespace, empty form pairs), so the
+//!     argument limits barely charge it while REQUEST_BODY reads all of it —
+//!     at the most it may be read whole (four times the byte limit), and at
+//!     10 MiB, which must be refused.
 //!
 //! The limits are judged on the arguments the parser produces (decoded names
 //! and values), so each row also prints those bytes. Like `large_body_perf`,
@@ -153,9 +162,10 @@ impl Shape {
         }
     }
 
-    /// `n` fields of at least `len`-byte values — with `exact`, of exactly
-    /// `len` bytes of name and value together: the body, and the bytes of
-    /// argument names and values the parser yields from it.
+    /// `n` fields of at least `len`-byte values — with `exact`, each charged
+    /// exactly `len` bytes by the argument limits: the body, and the bytes
+    /// they charge for it (name and value; a multipart part's header line too,
+    /// which the 922 rules read).
     fn body(self, fields: Fields, n: usize, len: usize, exact: bool) -> (String, usize) {
         let mut s = String::new();
         let mut arg_bytes = 0;
@@ -164,8 +174,13 @@ impl Shape {
         }
         for i in 0..n {
             let (name, mut value) = fields(i, len);
+            let part_header = format!("Content-Disposition: form-data; name=\"{name}\"");
+            let header_bytes = match self {
+                Shape::Multipart => part_header.len(),
+                Shape::Form | Shape::Json => 0,
+            };
             if exact {
-                let want = len - name.len();
+                let want = len - name.len() - header_bytes;
                 let mut cut = want;
                 while !value.is_char_boundary(cut) {
                     cut -= 1;
@@ -175,7 +190,7 @@ impl Shape {
                     value.push('x');
                 }
             }
-            arg_bytes += name.len() + value.len();
+            arg_bytes += header_bytes + name.len() + value.len();
             match self {
                 Shape::Form => {
                     if i > 0 {
@@ -191,11 +206,9 @@ impl Shape {
                     }
                     write!(s, "\"{name}\":\"{value}\"").unwrap();
                 }
-                Shape::Multipart => write!(
-                    s,
-                    "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
-                )
-                .unwrap(),
+                Shape::Multipart => {
+                    write!(s, "--{BOUNDARY}\r\n{part_header}\r\n\r\n{value}\r\n").unwrap()
+                }
             }
         }
         match self {
@@ -232,6 +245,135 @@ fn post_ctx(body: &Bytes, content_type: &str, limits: InspectionLimits) -> Reque
         ctx.inspection_limits.time_budget_ms = ms;
     }
     ctx
+}
+
+/// `len` bytes of text that is `fields` row after row, cut to a char boundary
+/// and padded with `x` to exactly `len`.
+fn text_of(fields: Fields, len: usize) -> String {
+    let mut s = String::with_capacity(len + 256);
+    let mut i = 0;
+    while s.len() < len {
+        s.push_str(&fields(i, 0).1);
+        s.push('\n');
+        i += 1;
+    }
+    let mut cut = len;
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    s.truncate(cut);
+    while s.len() < len {
+        s.push('x');
+    }
+    s
+}
+
+/// The length of the body as the rules read it, as text.
+fn lossy_len(b: &[u8]) -> usize {
+    String::from_utf8_lossy(b).len()
+}
+
+/// Bytes that look like a compressed or encrypted upload, deterministic; as
+/// many as read as `len` bytes of text (an invalid byte reads as three).
+fn binary_of(len: usize) -> Vec<u8> {
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    // `len` bytes read as at least `len`; back off to the longest prefix that
+    // reads as at most `len`.
+    let mut out: Vec<u8> = (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
+        .collect();
+    let (mut lo, mut hi) = (0, out.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if lossy_len(&out[..mid]) <= len {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    out.truncate(lo);
+    out
+}
+
+/// Bodies the rules read whole: `(label, content type, body, within the
+/// default argument limits)`. See the module comment.
+fn whole_body_rows(max_bytes: usize) -> Vec<(String, String, Vec<u8>, bool)> {
+    // A default-sized body (max_body_size, 10 MiB), less room for headers.
+    let big = 10 * 1024 * 1024 - 64 * 1024;
+    let mut rows = Vec::new();
+    for (text, fields) in [("plain", plain as Fields), ("mixed", mixed as Fields)] {
+        for (size, len, within) in [("at-bytes", max_bytes, true), ("10mib", big, false)] {
+            rows.push((
+                format!("whole/text-plain/{text}/{size}"),
+                "text/plain".to_string(),
+                text_of(fields, len).into_bytes(),
+                within,
+            ));
+        }
+    }
+    rows.push((
+        "whole/multipart-related/mixed/at-bytes".into(),
+        "multipart/related; boundary=rel".into(),
+        text_of(mixed, max_bytes).into_bytes(),
+        true,
+    ));
+    for (size, len, within) in [("at-bytes", max_bytes, true), ("10mib", big, false)] {
+        rows.push((
+            format!("whole/octet-stream/binary/{size}"),
+            "application/octet-stream".into(),
+            binary_of(len),
+            within,
+        ));
+    }
+
+    // Parsed bodies whose bytes are mostly not arguments, at what a parsed
+    // body may be read whole (the engine's WHOLE_BODY_FACTOR, 4, times the
+    // byte limit) and at a default-sized body.
+    let allowance = 4 * max_bytes;
+    for (size, len, within) in [("at-whole", allowance, true), ("10mib", big, false)] {
+        rows.push((
+            format!("parsed/xml-comment/mixed/{size}"),
+            "application/xml".into(),
+            format!("<r><a>1</a><!-- {} --></r>", text_of(mixed, len - 24)).into_bytes(),
+            within,
+        ));
+        // One 2 KiB key in every object: a name several values share is
+        // charged once, so the arguments are the key and one-byte values.
+        let key = text_of(mixed, 2048).replace('\n', " ");
+        let object = format!("{{\"{key}\":1}}");
+        let objects = vec![object.as_str(); (len - 2) / (object.len() + 1)];
+        rows.push((
+            format!("parsed/json-repeated-key/mixed/{size}"),
+            "application/json".into(),
+            format!("[{}]", objects.join(",")).into_bytes(),
+            within,
+        ));
+        let nulls = vec!["null"; (len - 1) / 5];
+        rows.push((
+            format!("parsed/json-nulls/{size}"),
+            "application/json".into(),
+            format!("[{}]", nulls.join(",")).into_bytes(),
+            within,
+        ));
+        rows.push((
+            format!("parsed/json-whitespace/{size}"),
+            "application/json".into(),
+            format!("{{\"a\":1}}{}", " ".repeat(len - 7)).into_bytes(),
+            within,
+        ));
+        rows.push((
+            format!("parsed/form-empty-pairs/{size}"),
+            "application/x-www-form-urlencoded".into(),
+            format!("{}a=1", "&".repeat(len - 3)).into_bytes(),
+            within,
+        ));
+    }
+    rows
 }
 
 /// The inspection limit the engine refused the request for, if any.
@@ -400,5 +542,45 @@ fn evaluate_cost_by_argument_count_and_size() {
             paranoia() > 2 || score < 5,
             "{label} with {n} fields is not benign: score {score}"
         );
+    }
+
+    println!(
+        "\n{:<38} {:>10} {:>10} {:>10} {:>9} {:>6} {:>9}",
+        "row", "body B", "read as B", "median ms", "min ms", "score", "refused"
+    );
+    for (label, ct, body, within) in whole_body_rows(max_bytes) {
+        if !selected(&label) {
+            continue;
+        }
+        let body = Bytes::from(body);
+        let read_as = lossy_len(&body);
+        let (median, min, score, refused) = time_eval(&engine, || post_ctx(&body, &ct, defaults));
+        println!(
+            "{:<38} {:>10} {:>10} {:>10.2} {:>9.2} {:>6} {:>9}",
+            label,
+            body.len(),
+            read_as,
+            median.as_secs_f64() * 1e3,
+            min.as_secs_f64() * 1e3,
+            score,
+            refused.map_or("-", |l| l.reason())
+        );
+        if within {
+            assert!(
+                !matches!(
+                    refused,
+                    Some(InspectionLimit::Args | InspectionLimit::ArgBytes)
+                ),
+                "{label} is within the default argument limits, yet refused for {refused:?}"
+            );
+        } else {
+            assert!(
+                matches!(
+                    refused,
+                    Some(InspectionLimit::Args | InspectionLimit::ArgBytes)
+                ),
+                "{label} is past the default argument limits, yet {refused:?}"
+            );
+        }
     }
 }

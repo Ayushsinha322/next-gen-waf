@@ -122,6 +122,22 @@ need 50 MB.
 per in-flight request, so an unnecessarily large value is a free
 memory-amplification target for an attacker.
 
+### 413 under Max body size: an inspection limit
+
+If the event's reason begins **`inspection limit exceeded`** (built-in rule
+9900401 or 9900402), the body was within Max body size but past one of the
+site's inspection limits — too many arguments, or too much argument text for the
+rules to read. The usual legitimate cause is an upload the rules read as text: a
+file sent as base64 inside JSON or XML, a raw text/CSV/binary or
+`multipart/related` body, or NDJSON sent as `application/json` (User Manual
+§5.4, *Inspection limits*).
+
+**Fix:** Console → site → Edit → Advanced → **Inspection Limits**, raise the
+setting the event names (Max argument text is in KiB). Disabling 9900401–9900403
+in the learning report does nothing and is refused; they are not rules. A 403
+with rule 9900403 is the time budget: raise it only if the request is legitimate
+and the node is not simply overloaded.
+
 ---
 
 ## 5. 403 on legitimate traffic (false positive)

@@ -592,8 +592,9 @@ const (
 	maxSiteHeaders   = 1000
 )
 
-// Bounds for a site's inspection limits (max_inspected_args and friends). The
-// console has no fields for these yet, so there is nothing to keep in step.
+// Bounds for a site's inspection limits (max_inspected_args and friends). Keep
+// in step with LIMIT_CAPS in dashboard/lib/siteConfig.ts (the console's
+// siteLimits test compares them), as for the request limits above.
 const (
 	maxSiteInspectedArgs      = 100000
 	maxSiteInspectedArgBytes  = 16 * 1024 * 1024 // 16 MiB
@@ -603,8 +604,9 @@ const (
 
 // The built-in rule ids the data plane records a request under when inspecting
 // it would pass one of the site's inspection limits, and the setting each one
-// is for. Keep in step with InspectionLimit::rule_id in
-// crates/sentinel-core/src/context.rs.
+// is for: InspectionLimit::rule_id and InspectionLimit::setting in
+// crates/sentinel-core/src/context.rs, which
+// TestInspectionLimitRuleSettingsMatchTheDataPlane reads and compares.
 var inspectionLimitRuleSettings = map[int]string{
 	9900401: "max_inspected_args",
 	9900402: "max_inspected_arg_bytes",

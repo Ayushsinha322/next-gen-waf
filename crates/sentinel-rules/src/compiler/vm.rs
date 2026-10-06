@@ -319,6 +319,9 @@ enum Unlisted {
     /// The arguments exceed one of the site's inspection limits
     /// ([`InspectionLimit::Args`] or [`InspectionLimit::ArgBytes`]).
     OverLimit(InspectionLimit),
+    /// A parsed body of this many bytes is more than REQUEST_BODY may read
+    /// whole: [`WHOLE_BODY_FACTOR`] times `max_inspected_arg_bytes`.
+    WholeBodyOverLimit(u64),
 }
 
 /// Why a request was refused for [`Unlisted::BodyTooComplex`].
@@ -434,6 +437,29 @@ struct MultipartParts {
     /// Content-Disposition, or empty when the part declares none — one shared
     /// name per part, however many lines it has.
     part_headers: Vec<(ArgName, String)>,
+}
+
+/// How many times `max_inspected_arg_bytes` a parsed (non-multipart) body
+/// may be when REQUEST_BODY rules read it whole.
+///
+/// Its arguments were charged as it was parsed, but its bytes need not be
+/// arguments: encodings spell a byte of an argument in up to three
+/// (`%E0`, `\u0928` for a 3-byte character) and markup sits between them
+/// (`<qty>1</qty>`). They need not be arguments at all, either: an XML
+/// comment, a JSON key repeated in every object of an array (a shared name is
+/// charged once), nulls, whitespace. 10 MiB in one XML comment cost 4.0 s,
+/// read whole under every argument limit. Four times the byte limit covers
+/// any encoding with room for markup, and costs about what the arguments may.
+const WHOLE_BODY_FACTOR: u64 = 4;
+
+/// The length of `String::from_utf8_lossy(bytes)` — what a rule reading the
+/// bytes as text reads — without building it: each invalid sequence becomes
+/// U+FFFD, three bytes.
+fn lossy_len(bytes: &[u8]) -> usize {
+    bytes
+        .utf8_chunks()
+        .map(|c| c.valid().len() + if c.invalid().is_empty() { 0 } else { 3 })
+        .sum()
 }
 
 /// Locate the first occurrence of `needle` within `haystack`, in time linear
@@ -552,24 +578,36 @@ fn parse_one_part(
         }
     }
 
-    // Record the header lines for MULTIPART_PART_HEADERS.
+    // The header lines, for MULTIPART_PART_HEADERS.
     //
     // Split on CRLF only, deliberately. A bare LF used as a header separator is
     // itself the smuggling trick rule 922130 exists to catch: keeping such a
     // line intact leaves the raw \n inside the value, where the rule's
     // out-of-range byte class matches it. Splitting on \n too would hide it.
-    let part_label: ArgName = name.as_deref().unwrap_or_default().into();
-    for line in headers.split("\r\n") {
-        if !line.is_empty() {
-            out.part_headers.push((part_label.clone(), line.to_owned()));
+    let lines = || headers.split("\r\n").filter(|line| !line.is_empty());
+    // Every part is an argument, and its header lines are inspected (the 922
+    // rules read them), so they count against the argument limits along with
+    // what the part adds below. A part with no name cost nothing and header
+    // lines were not counted, so 9.9 MiB of nameless parts or of padding
+    // lines was parsed and inspected under any limit.
+    let header_bytes: usize = lines().map(str::len).sum();
+    match (&filename, &name) {
+        // A file part's name and filename are inspected (FILES_NAMES, FILES);
+        // its content is not, as no rule reads it.
+        (Some(fname), _) => {
+            fields.charge(header_bytes + name.as_ref().map_or(0, String::len) + fname.len())?
         }
+        // `push` below charges the argument, its name and its value.
+        (None, Some(_)) => fields.charge_bytes(header_bytes)?,
+        (None, None) => fields.charge(header_bytes)?,
+    }
+    let part_label: ArgName = name.as_deref().unwrap_or_default().into();
+    for line in lines() {
+        out.part_headers.push((part_label.clone(), line.to_owned()));
     }
     match filename {
-        // A part with a `filename` attribute is a file upload. Its name and
-        // filename are inspected (FILES_NAMES, FILES), so it counts against
-        // the argument limits too; its content does not, as no rule reads it.
+        // A part with a `filename` attribute is a file upload.
         Some(fname) => {
-            fields.charge(name.as_ref().map_or(0, String::len) + fname.len())?;
             out.filenames.push(fname);
             if let Some(n) = name {
                 out.field_names.push(n);
@@ -1056,11 +1094,20 @@ impl ParamsBuilder {
         Ok(())
     }
 
-    /// One argument of `bytes` bytes. Also how a multipart file part is
-    /// counted: its name and filename are inspected (FILES_NAMES, FILES) but
-    /// it is not a parameter.
+    /// One argument of `bytes` bytes. Also how a multipart part that is not
+    /// a parameter is counted — a file part, whose name and filename are
+    /// inspected (FILES_NAMES, FILES), or a part with no name — with its
+    /// header lines (MULTIPART_PART_HEADERS).
     fn charge(&mut self, bytes: usize) -> Result<(), Unlisted> {
         self.budget.charge(1, bytes as u64)?;
+        self.bytes += bytes as u64;
+        Ok(())
+    }
+
+    /// `bytes` more of an argument charged elsewhere: a multipart field's
+    /// header lines.
+    fn charge_bytes(&mut self, bytes: usize) -> Result<(), Unlisted> {
+        self.budget.charge(0, bytes as u64)?;
         self.bytes += bytes as u64;
         Ok(())
     }
@@ -1136,6 +1183,8 @@ struct RequestViews<'a> {
     /// `multipart`; see `body`.
     body: OnceCell<Result<Params, Unlisted>>,
     multipart: OnceCell<Result<MultipartParts, Unlisted>>,
+    /// Whether REQUEST_BODY may read the body whole; see `whole_body`.
+    whole_body: OnceCell<Result<(), Unlisted>>,
     cookies: OnceCell<Vec<(String, String)>>,
     /// Collections kept for the call, by target and transform chain. CRS
     /// repeats a handful of pairs across dozens of rules — 103 phase-2 rules
@@ -1208,6 +1257,41 @@ impl<'a> RequestViews<'a> {
                 .as_ref()
                 .map_err(|&e| e),
         }
+    }
+
+    /// Whether REQUEST_BODY may read a (non-multipart) body whole within the
+    /// site's argument limits. Before, nothing bounded it but `max_body_size`:
+    /// 10 MiB of octet-stream ran to the time budget, as did 10 MiB of XML
+    /// comment under every argument limit.
+    ///
+    /// A body no parser takes apart — text/plain, octet-stream,
+    /// multipart/related, no Content-Type — reaches the rules only this way,
+    /// so it is one argument of its whole length as the rules read it (see
+    /// `lossy_len`), after the query string's: as the malformed-JSON fallback
+    /// in `body_args` is.
+    ///
+    /// A body a parser takes apart was charged as its arguments, and is not
+    /// charged again. That parse must fit, so a body past the limits is
+    /// refused before it is read whole rather than after; and read whole it
+    /// may be at most [`WHOLE_BODY_FACTOR`] times the byte limit.
+    fn whole_body(&self, ctx: &RequestContext) -> Result<(), Unlisted> {
+        *self.whole_body.get_or_init(|| {
+            let Some(body) = ctx.request_body.as_deref().filter(|b| !b.is_empty()) else {
+                return Ok(());
+            };
+            let len = lossy_len(body) as u64;
+            match body_parser(self.content_type(ctx)) {
+                BodyParser::None => self.body_budget(ctx)?.charge(1, len),
+                _ => {
+                    self.body(ctx)?;
+                    let limit = ctx.inspection_limits.max_arg_bytes;
+                    if limit > 0 && len > limit.saturating_mul(WHOLE_BODY_FACTOR) {
+                        return Err(Unlisted::WholeBodyOverLimit(len));
+                    }
+                    Ok(())
+                }
+            }
+        })
     }
 
     /// The parsed `multipart/form-data` body; empty for any other body.
@@ -1722,6 +1806,7 @@ fn extract_target(
             if views.content_type(ctx).starts_with("multipart/form-data") {
                 views.multipart(ctx)?.fields.values.to_vec()
             } else {
+                views.whole_body(ctx)?;
                 ctx.request_body
                     .as_ref()
                     .map(|b| vec![String::from_utf8_lossy(b).into_owned()])
@@ -2041,12 +2126,31 @@ fn record_match<S: AsRef<str>>(last_matched: &mut Option<String>, hit: Option<S>
 // ---------------------------------------------------------------------------
 
 /// How many instructions run between two reads of the clock for the site's
-/// time budget. Reading it costs tens of nanoseconds and an instruction costs
-/// at least that, so the check adds little, and a budget is overrun by at most
-/// this many instructions plus whatever the one running when it ran out takes.
+/// time budget while the values in hand are small. Reading it costs tens of
+/// nanoseconds and such an instruction at least that, so the check adds
+/// little.
 const CLOCK_EVERY: u32 = 64;
 
-/// The clock the time budget is read from.
+/// After a target loads at least this many bytes of values, the clock is read
+/// before every instruction until the next load. One transform chain or
+/// operator over large values can take longer than `CLOCK_EVERY` cheap
+/// instructions — about 0.4 s over 10 MiB — so reading it only every
+/// `CLOCK_EVERY` let a budget be overrun by a dozen such rules; and a read is
+/// nothing beside the work on 64 KiB. A budget is overrun by at most one
+/// instruction, or `CLOCK_EVERY` cheap ones.
+const CLOCK_BYTES: usize = 64 * 1024;
+
+/// Whether `values` hold at least `bytes` bytes between them; counts no
+/// further.
+fn holds_at_least(values: &[String], bytes: usize) -> bool {
+    let mut held = 0;
+    values.iter().any(|v| {
+        held += v.len();
+        held >= bytes
+    })
+}
+
+/// The wall clock the time budget watches.
 #[cfg(not(any(test, feature = "test-hooks")))]
 fn eval_clock() -> std::time::Instant {
     std::time::Instant::now()
@@ -2055,6 +2159,95 @@ fn eval_clock() -> std::time::Instant {
 #[cfg(any(test, feature = "test-hooks"))]
 fn eval_clock() -> std::time::Instant {
     std::time::Instant::now() + crate::test_hooks::eval_clock_skew()
+}
+
+/// The CPU time this thread has used, where the platform keeps it.
+#[cfg(target_os = "linux")]
+fn thread_cpu_time() -> Option<std::time::Duration> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `clock_gettime` writes one `timespec` through the pointer, which
+    // points at a live, writable one.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    (rc == 0).then(|| std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn thread_cpu_time() -> Option<std::time::Duration> {
+    None
+}
+
+/// The CPU clock the time budget is measured in.
+#[cfg(not(any(test, feature = "test-hooks")))]
+fn eval_cpu_clock() -> Option<std::time::Duration> {
+    thread_cpu_time()
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+fn eval_cpu_clock() -> Option<std::time::Duration> {
+    thread_cpu_time().map(|t| t + crate::test_hooks::eval_cpu_clock_skew())
+}
+
+/// The site's time budget (`inspection_time_budget_ms`) for one `evaluate`
+/// call: one phase of one request.
+///
+/// It is CPU time this thread spends evaluating, which is the request's own
+/// cost: `evaluate` never yields, so the thread runs nothing else until it
+/// returns. Wall time also counted time the thread spent descheduled — a busy
+/// node, which is what a flood makes — so a heavy but legitimate request
+/// could be refused for the load around it. Where there is no thread CPU
+/// clock, wall time is all there is.
+///
+/// Per phase, not per request: the request headers are bounded by the proxy's
+/// header limits, the response by what the origin sends, so the phase a
+/// client can make expensive is the request body; and a budget spent across
+/// phases would let a costly request body refuse the response that follows.
+struct TimeBudget {
+    budget: std::time::Duration,
+    wall_started: std::time::Instant,
+    cpu_started: Option<std::time::Duration>,
+    /// How much wall time passes before the CPU clock is worth reading. A
+    /// thread uses no more CPU time than wall time passes, so until then the
+    /// budget cannot be spent; and the CPU clock is a system call, the wall
+    /// clock is not.
+    cpu_unread_for: std::time::Duration,
+}
+
+impl TimeBudget {
+    /// The budget `limits` set, from now; `None` for none.
+    fn start(limits: &InspectionLimits) -> Option<Self> {
+        (limits.time_budget_ms > 0).then(|| {
+            let budget = std::time::Duration::from_millis(limits.time_budget_ms.into());
+            Self {
+                budget,
+                wall_started: eval_clock(),
+                cpu_started: eval_cpu_clock(),
+                cpu_unread_for: budget,
+            }
+        })
+    }
+
+    /// Once the budget is spent, the CPU time this call has used and the wall
+    /// time it has taken.
+    fn spent(&mut self) -> Option<(std::time::Duration, std::time::Duration)> {
+        let wall = eval_clock().saturating_duration_since(self.wall_started);
+        if wall <= self.cpu_unread_for {
+            return None;
+        }
+        let cpu = match (self.cpu_started, eval_cpu_clock()) {
+            (Some(started), Some(now)) => now.saturating_sub(started),
+            _ => wall,
+        };
+        if cpu > self.budget {
+            return Some((cpu, wall));
+        }
+        // Descheduled for the difference: the CPU clock cannot pass the
+        // budget before the wall clock moves on by what is left of it.
+        self.cpu_unread_for = wall + (self.budget - cpu);
+        None
+    }
 }
 
 /// What a request past `limit` is refused for, in words.
@@ -2166,26 +2359,14 @@ pub fn evaluate(
     // miss), so a stale value from an earlier rule can never be attributed to
     // a later one.
     let mut last_matched: Option<String> = None;
-    // The site's time budget for this call: when it started, and how long it
-    // may run. Read every `CLOCK_EVERY` instructions.
-    let time_budget = (ctx.inspection_limits.time_budget_ms > 0).then(|| {
-        (
-            eval_clock(),
-            std::time::Duration::from_millis(ctx.inspection_limits.time_budget_ms.into()),
-        )
-    });
+    // The site's time budget for this call; see `TimeBudget`. Its clock is
+    // read every `CLOCK_EVERY` instructions, and before every instruction
+    // while `large_values` — the last target loaded `CLOCK_BYTES` or more.
+    let mut time_budget = TimeBudget::start(&ctx.inspection_limits);
     let mut steps: u32 = 0;
+    let mut large_values = false;
 
     while ip < program.len() {
-        steps = steps.wrapping_add(1);
-        if let Some((started, budget)) = time_budget.filter(|_| steps % CLOCK_EVERY == 0) {
-            let spent = eval_clock().saturating_duration_since(started);
-            if spent > budget {
-                let after = format!("stopped after {} ms", spent.as_millis());
-                return refuse_uninspected(ctx, &views, phase, InspectionLimit::Time, Some(after));
-            }
-        }
-
         // Early exit only on a real BLOCK — the same rule as the proxy's
         // `still_evaluating`. This read `!= Allow`, and `Log` is not `Allow`:
         // once learning mode had downgraded a verdict to Log (an over-long URI,
@@ -2197,6 +2378,25 @@ pub fn evaluate(
         // Challenge and Limit are not refusals either. (Code review finding.)
         if ctx.decision == WafDecision::Block {
             return ctx.decision.clone();
+        }
+
+        // After the Block exit, not before it: a rule that blocked decided the
+        // request, and a budget found spent at the next instruction overwrote
+        // its verdict with a time refusal — whose advice, raise the budget,
+        // would change nothing. (Review finding.)
+        steps = steps.wrapping_add(1);
+        if let Some(budget) = time_budget
+            .as_mut()
+            .filter(|_| large_values || steps % CLOCK_EVERY == 0)
+        {
+            if let Some((cpu, wall)) = budget.spent() {
+                let after = format!(
+                    "stopped after {} ms of CPU time ({} ms elapsed)",
+                    cpu.as_millis(),
+                    wall.as_millis()
+                );
+                return refuse_uninspected(ctx, &views, phase, InspectionLimit::Time, Some(after));
+            }
         }
 
         let instr = &program[ip];
@@ -2245,7 +2445,27 @@ pub fn evaluate(
                     Err(Unlisted::OverLimit(limit)) => {
                         return refuse_uninspected(ctx, &views, phase, limit, None);
                     }
+                    // A parsed body too long to read whole: what the rules
+                    // reading it whole would have judged is unknown.
+                    Err(Unlisted::WholeBodyOverLimit(len)) => {
+                        let allowed = ctx
+                            .inspection_limits
+                            .max_arg_bytes
+                            .saturating_mul(WHOLE_BODY_FACTOR);
+                        let more = format!(
+                            "read whole, the body is {len} bytes, more than the {allowed} its \
+                             encoding and markup may take"
+                        );
+                        return refuse_uninspected(
+                            ctx,
+                            &views,
+                            phase,
+                            InspectionLimit::ArgBytes,
+                            Some(more),
+                        );
+                    }
                 };
+                large_values = holds_at_least(&values, CLOCK_BYTES);
                 stack.push(StackVal::Strings(values));
                 if memo_chain.is_some() {
                     ip += 2;
@@ -5474,17 +5694,23 @@ SecRule ARGS "@rx ^last-value$" "id:29,phase:2,pass,msg:'last argument seen'"
             .collect()
     }
 
-    /// `n` arguments `a0=v`, `a1=v`, … whose last value is `last-value`, as
-    /// `(shape, query, content type, body)` for every parser, and the bytes of
-    /// their names and values.
-    fn shapes(n: usize) -> (Vec<(&'static str, String, String, String)>, u64) {
+    /// `(shape, query, content type, body, bytes)`: `bytes` is what the
+    /// argument limits charge — the names and values, and for multipart each
+    /// part's header line too.
+    type Shape = (&'static str, String, String, String, u64);
+
+    /// `n` arguments `a0=v`, `a1=v`, … whose last value is `last-value`, in
+    /// every shape a parser takes them in.
+    fn shapes(n: usize) -> Vec<Shape> {
         let args: Vec<(String, String)> = (0..n)
             .map(|i| {
                 let v = if i + 1 == n { "last-value" } else { "v" };
                 (format!("a{i}"), v.to_string())
             })
             .collect();
-        let bytes = args.iter().map(|(k, v)| (k.len() + v.len()) as u64).sum();
+        let bytes: u64 = args.iter().map(|(k, v)| (k.len() + v.len()) as u64).sum();
+        let part_header = |k: &str| format!("Content-Disposition: form-data; name=\"{k}\"");
+        let part_headers: u64 = args.iter().map(|(k, _)| part_header(k).len() as u64).sum();
         let pairs = |sep: &str| {
             args.iter()
                 .map(|(k, v)| format!("{k}={v}"))
@@ -5499,45 +5725,45 @@ SecRule ARGS "@rx ^last-value$" "id:29,phase:2,pass,msg:'last argument seen'"
         let (mut xml, mut multipart) = (String::new(), String::new());
         for (k, v) in &args {
             write!(xml, "<{k}>{v}</{k}>").unwrap();
-            write!(
-                multipart,
-                "--B\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n"
-            )
-            .unwrap();
+            write!(multipart, "--B\r\n{}\r\n\r\n{v}\r\n", part_header(k)).unwrap();
         }
-        let shapes = vec![
+        vec![
             (
                 "query",
                 format!("?{}", pairs("&")),
                 String::new(),
                 String::new(),
+                bytes,
             ),
             (
                 "urlencoded",
                 String::new(),
                 "application/x-www-form-urlencoded".into(),
                 pairs("&"),
+                bytes,
             ),
             (
                 "json",
                 String::new(),
                 "application/json".into(),
                 format!("{{{json}}}"),
+                bytes,
             ),
             (
                 "xml",
                 String::new(),
                 "application/xml".into(),
                 format!("<r>{xml}</r>"),
+                bytes,
             ),
             (
                 "multipart",
                 String::new(),
                 "multipart/form-data; boundary=B".into(),
                 format!("{multipart}--B--\r\n"),
+                bytes + part_headers,
             ),
-        ];
-        (shapes, bytes)
+        ]
     }
 
     /// At a limit every argument is inspected; one past it the request is
@@ -5547,8 +5773,7 @@ SecRule ARGS "@rx ^last-value$" "id:29,phase:2,pass,msg:'last argument seen'"
     fn at_an_argument_limit_all_is_inspected_and_past_it_the_request_is_refused() {
         let _serial = serial();
         let rs = ruleset(RULES);
-        let (shapes, bytes) = shapes(20);
-        for (shape, query, ct, body) in shapes {
+        for (shape, query, ct, body, bytes) in shapes(20) {
             let status = if shape == "query" { 414 } else { 413 };
             for (at, past, limit) in [
                 (limits(20, 0, 0), limits(19, 0, 0), InspectionLimit::Args),
@@ -5652,18 +5877,228 @@ SecRule ARGS "@rx ^last-value$" "id:29,phase:2,pass,msg:'last argument seen'"
         let mut c = request("", "application/json", json, limits(0, 14, 0));
         assert_eq!(run(&rs, &mut c), WafDecision::Block);
 
-        let body = "--B\r\nContent-Disposition: form-data; name=\"note\"\r\n\r\nlast-value\r\n\
-                    --B\r\nContent-Disposition: form-data; name=\"doc\"; filename=\"a.txt\"\r\n\r\n\
-                    file body that no rule reads\r\n--B--\r\n";
+        let (field, file) = (
+            "Content-Disposition: form-data; name=\"note\"",
+            "Content-Disposition: form-data; name=\"doc\"; filename=\"a.txt\"",
+        );
+        let body = format!(
+            "--B\r\n{field}\r\n\r\nlast-value\r\n\
+             --B\r\n{file}\r\n\r\nfile body that no rule reads\r\n--B--\r\n"
+        );
         let ct = "multipart/form-data; boundary=B";
-        // note + last-value + doc + a.txt = 22 bytes, two arguments.
+        // note + last-value + doc + a.txt = 22 bytes, and each part's header
+        // line; two arguments.
+        let bytes = 22 + (field.len() + file.len()) as u64;
         for (l, want) in [
-            (limits(2, 22, 0), WafDecision::Allow),
+            (limits(2, bytes, 0), WafDecision::Allow),
             (limits(1, 0, 0), WafDecision::Block),
-            (limits(0, 21, 0), WafDecision::Block),
+            (limits(0, bytes - 1, 0), WafDecision::Block),
         ] {
-            let mut c = request("", ct, body, l);
+            let mut c = request("", ct, &body, l);
             assert_eq!(run(&rs, &mut c), want, "{l:?}");
+        }
+    }
+
+    /// Every multipart part is an argument, and its header lines count as
+    /// bytes: the 922 rules read them (MULTIPART_PART_HEADERS). A part with no
+    /// name cost nothing and header lines added bytes nothing counted, so
+    /// 9.9 MiB of nameless parts or of padding header lines was parsed and
+    /// inspected in full under any argument limit.
+    #[test]
+    fn multipart_part_headers_and_nameless_parts_count() {
+        let _serial = serial();
+        let rs = ruleset(&format!(
+            "{RULES}SecRule MULTIPART_PART_HEADERS \"@rx never-f\" \"id:24,phase:2,pass\"\n"
+        ));
+        let (named, pad, nameless) = (
+            "Content-Disposition: form-data; name=\"note\"",
+            "X-Pad: padding the part with header lines",
+            "Content-Type: text/plain",
+        );
+        let body = format!(
+            "--B\r\n{named}\r\n{pad}\r\n\r\nlast-value\r\n\
+             --B\r\n{nameless}\r\n\r\na part with no name\r\n--B--\r\n"
+        );
+        let ct = "multipart/form-data; boundary=B";
+        // note + last-value, and three header lines; two parts.
+        let bytes = 14 + (named.len() + pad.len() + nameless.len()) as u64;
+        let mut c = request("", ct, &body, limits(2, bytes, 0));
+        assert_eq!(run(&rs, &mut c), WafDecision::Allow);
+        assert!(fired(&c, "29"));
+        for (l, limit) in [
+            (limits(1, 0, 0), InspectionLimit::Args),
+            (limits(0, bytes - 1, 0), InspectionLimit::ArgBytes),
+        ] {
+            let mut c = request("", ct, &body, l);
+            assert_eq!(run(&rs, &mut c), WafDecision::Block, "{l:?}");
+            assert_eq!(refusals(&c)[0].rule_id, limit.rule_id(), "{l:?}");
+        }
+
+        // Many nameless parts: refused at the argument limit.
+        let mut many = String::new();
+        for _ in 0..100 {
+            write!(many, "--B\r\n{nameless}\r\n\r\nx\r\n").unwrap();
+        }
+        many.push_str("--B--\r\n");
+        let mut c = request("", ct, &many, limits(50, 0, 0));
+        assert_eq!(run(&rs, &mut c), WafDecision::Block);
+        assert_eq!(refusals(&c)[0].rule_id, InspectionLimit::Args.rule_id());
+    }
+
+    /// Rules that read the body whole, as CRS 920/921/931/944 do.
+    const RAW_RULES: &str = r#"
+SecRule REQUEST_HEADERS:User-Agent "@rx probe" "id:1,phase:1,pass,msg:'header rule'"
+SecRule REQUEST_BODY "@rx never-e" "id:23,phase:2,pass,t:none,t:lowercase"
+SecRule REQUEST_BODY "@rx last-value$" "id:30,phase:2,pass,msg:'whole body seen'"
+SecRule REQUEST_BODY "@rx ." "id:31,phase:2,pass,msg:'body read'"
+"#;
+
+    /// A body no parser takes apart reaches the rules only as REQUEST_BODY,
+    /// read whole. It is one argument of its whole length: it was read whole
+    /// past `max_inspected_arg_bytes`, up to `max_body_size` (a 10 MiB
+    /// octet-stream body ran to the 10 s time budget), and the argument limits
+    /// never applied to it.
+    #[test]
+    fn a_body_no_parser_takes_apart_is_one_argument_of_its_whole_length() {
+        let _serial = serial();
+        let rs = ruleset(RAW_RULES);
+        let body = format!("{}last-value", "x".repeat(90));
+        let n = body.len() as u64;
+        for ct in [
+            "text/plain",
+            "text/csv",
+            "application/octet-stream",
+            "multipart/related; boundary=B",
+            "",
+        ] {
+            // The query string's `q` and `1`, and the body.
+            let mut c = request("?q=1", ct, &body, limits(2, n + 2, 0));
+            assert_eq!(run(&rs, &mut c), WafDecision::Allow, "{ct:?} at the limits");
+            assert!(fired(&c, "30"), "{ct:?}: the body was not read whole");
+            assert!(refusals(&c).is_empty(), "{ct:?}");
+
+            // One byte over: refused before any rule reads the body.
+            let mut c = request("?q=1", ct, &body, limits(0, n + 1, 0));
+            assert_eq!(run(&rs, &mut c), WafDecision::Block, "{ct:?}");
+            assert!(!fired(&c, "30"), "{ct:?}: read whole past the byte limit");
+            assert!(fired(&c, "1"), "{ct:?}: the earlier finding must be kept");
+            let refused = refusals(&c);
+            assert_eq!(refused.len(), 1, "{ct:?}");
+            assert_eq!(refused[0].rule_id, InspectionLimit::ArgBytes.rule_id());
+            assert_eq!(refused[0].phase, Phase::RequestBody);
+            assert_eq!(c.block_status, Some(413), "{ct:?}");
+            assert_eq!(
+                c.block_reason.as_deref(),
+                Some(
+                    format!(
+                        "inspection limit exceeded: more than {} bytes of argument names and \
+                         values (max_inspected_arg_bytes)",
+                        n + 1
+                    )
+                    .as_str()
+                ),
+            );
+
+            // The body is an argument, with the query string's.
+            let mut c = request("?q=1", ct, &body, limits(1, 0, 0));
+            assert_eq!(run(&rs, &mut c), WafDecision::Block, "{ct:?}");
+            assert_eq!(refusals(&c)[0].rule_id, InspectionLimit::Args.rule_id());
+        }
+
+        // Charged as the rules read it: a byte that is not UTF-8 is read as
+        // U+FFFD, three bytes.
+        let mut c = request("", "application/octet-stream", "", limits(0, 6, 0));
+        c.request_body = Some(bytes::Bytes::from_static(b"\xff\xfe"));
+        assert_eq!(run(&rs, &mut c), WafDecision::Allow);
+        let mut c = request("", "application/octet-stream", "", limits(0, 5, 0));
+        c.request_body = Some(bytes::Bytes::from_static(b"\xff\xfe"));
+        assert_eq!(run(&rs, &mut c), WafDecision::Block);
+
+        // No body, nothing to charge: a query string at the argument limit
+        // still passes a REQUEST_BODY rule.
+        let mut c = request("?a=1&b=2", "text/plain", "", limits(2, 0, 0));
+        assert_eq!(run(&rs, &mut c), WafDecision::Allow);
+    }
+
+    /// A body a parser takes apart is read whole by REQUEST_BODY rules too.
+    /// Its arguments were charged as they were parsed and are not charged
+    /// again; but a body past the limits is refused before it is read whole,
+    /// even by rules that read no argument.
+    #[test]
+    fn a_parsed_body_past_the_limits_is_refused_before_it_is_read_whole() {
+        let _serial = serial();
+        let rs = ruleset(RAW_RULES);
+        for (shape, _, ct, body, bytes) in shapes(20).into_iter().filter(|(s, ..)| *s != "query") {
+            // Charged as its arguments only: the body itself is longer.
+            assert!(body.len() as u64 > bytes, "{shape}");
+            let mut c = request("", &ct, &body, limits(20, bytes, 0));
+            assert_eq!(run(&rs, &mut c), WafDecision::Allow, "{shape}");
+            assert!(refusals(&c).is_empty(), "{shape}");
+
+            for l in [limits(19, 0, 0), limits(0, bytes - 1, 0)] {
+                let mut c = request("", &ct, &body, l);
+                assert_eq!(run(&rs, &mut c), WafDecision::Block, "{shape} {l:?}");
+                assert_eq!(refusals(&c).len(), 1, "{shape} {l:?}");
+                assert!(!fired(&c, "30"), "{shape} {l:?}: read whole past a limit");
+            }
+        }
+    }
+
+    /// A parsed body's bytes need not be arguments: an XML comment, one JSON
+    /// key repeated in every object of an array (a shared name is charged
+    /// once), nulls, whitespace. The argument limits barely charged such a
+    /// body while REQUEST_BODY rules read all of it: 10 MiB in one XML comment
+    /// cost 4.0 s, a 2 KiB key in 4000 objects 3.3 s. Read whole, a parsed body
+    /// may be `WHOLE_BODY_FACTOR` times the byte limit — what encodings and
+    /// markup take beyond the arguments they carry.
+    #[test]
+    fn a_parsed_body_read_whole_is_held_to_a_multiple_of_the_byte_limit() {
+        let _serial = serial();
+        let rs = ruleset(RAW_RULES);
+        let cases = [
+            (
+                "application/xml",
+                format!("<r><a>last-value</a><!-- {} --></r>", "x".repeat(400)),
+            ),
+            (
+                "application/json",
+                format!(
+                    "[{}]",
+                    vec![format!("{{\"{}\":1}}", "k".repeat(98)); 4].join(",")
+                ),
+            ),
+            ("application/json", format!("[{}null]", "null,".repeat(80))),
+        ];
+        for (ct, body) in cases {
+            let len = body.len() as u64;
+            // A limit the arguments are well within, and the body within
+            // four times; then the smallest limit the body is past.
+            let at = len.div_ceil(WHOLE_BODY_FACTOR);
+            let mut c = request("", ct, &body, limits(0, at, 0));
+            assert_eq!(run(&rs, &mut c), WafDecision::Allow, "{ct} {len}");
+            assert!(refusals(&c).is_empty());
+            assert!(fired(&c, "31"), "{ct}");
+
+            let mut c = request("", ct, &body, limits(0, at - 1, 0));
+            assert_eq!(run(&rs, &mut c), WafDecision::Block, "{ct} {len}");
+            let refused = refusals(&c);
+            assert_eq!(refused.len(), 1);
+            assert_eq!(refused[0].rule_id, InspectionLimit::ArgBytes.rule_id());
+            assert_eq!(c.block_status, Some(413));
+            assert_eq!(
+                c.block_reason.as_deref(),
+                Some(
+                    format!(
+                        "inspection limit exceeded: more than {} bytes of argument names and \
+                         values (max_inspected_arg_bytes); read whole, the body is {len} bytes, \
+                         more than the {} its encoding and markup may take",
+                        at - 1,
+                        (at - 1) * WHOLE_BODY_FACTOR
+                    )
+                    .as_str()
+                ),
+            );
+            assert!(!fired(&c, "31"), "{ct}: read whole past the limit");
         }
     }
 
@@ -5692,8 +6127,7 @@ SecRule ARGS "@rx ^last-value$" "id:29,phase:2,pass,msg:'last argument seen'"
     #[test]
     fn zero_means_no_limit() {
         let rs = ruleset(RULES);
-        let (shapes, _) = shapes(200);
-        for (shape, query, ct, body) in shapes {
+        for (shape, query, ct, body, _) in shapes(200) {
             let mut c = request(&query, &ct, &body, InspectionLimits::default());
             assert_eq!(run(&rs, &mut c), WafDecision::Allow, "{shape}");
             assert!(fired(&c, "29"), "{shape}");
@@ -5760,6 +6194,117 @@ SecRule ARGS "@rx ^last-value$" "id:29,phase:2,pass,msg:'last argument seen'"
         let mut c = request("", form, "a=last-value", limits(0, 0, 50));
         assert_eq!(run(&rs, &mut c), WafDecision::Allow);
         assert!(fired(&c, "29"));
+    }
+
+    /// A rule that blocks decides the request. The clock was read before the
+    /// Block early exit, so a budget found spent at the very next instruction
+    /// overwrote the rule's verdict: the event named the time budget, its
+    /// advice said to raise it (which would change nothing), and the time
+    /// reason was counted. Markers are one instruction each, so some count of
+    /// them puts the deny's last instruction just before a clock read.
+    #[test]
+    fn a_rule_s_block_stands_when_the_budget_runs_out_just_after_it() {
+        let _serial = serial();
+        // A rule after the deny, so the loop comes round again.
+        let deny = "SecRule REQUEST_HEADERS:User-Agent \"@rx probe\" \
+                    \"id:50,phase:2,deny,status:403,msg:'denied'\"\n\
+                    SecRule ARGS \"@rx never\" \"id:51,phase:2,pass\"\n";
+        let form = "application/x-www-form-urlencoded";
+        let mut decided_by_the_rule = 0;
+        crate::test_hooks::set_eval_clock_step(Duration::from_millis(51));
+        for n in 0..CLOCK_EVERY {
+            let mut src = String::new();
+            for i in 0..n {
+                writeln!(src, "SecMarker \"pad-{i}\"").unwrap();
+            }
+            src.push_str(deny);
+            let rs = ruleset(&src);
+            let mut c = request("", form, "a=v", limits(0, 0, 50));
+            evaluate(&rs, &mut c, Phase::RequestBody, 0);
+            // Past the deny, the budget is found spent before it runs: that
+            // is a time refusal, and right.
+            if fired(&c, "50") {
+                decided_by_the_rule += 1;
+                assert!(refusals(&c).is_empty(), "{n} markers: {:?}", c.rule_matches);
+                assert_eq!(c.block_reason.as_deref(), Some("denied"), "{n} markers");
+            }
+        }
+        crate::test_hooks::set_eval_clock_step(Duration::ZERO);
+        assert!(decided_by_the_rule > 0);
+    }
+
+    /// One instruction over a large value can take longer than many cheap
+    /// ones: a transform chain and a regex over 10 MiB took about 0.4 s, and
+    /// the clock was read only every `CLOCK_EVERY` instructions. After a load
+    /// of `CLOCK_BYTES` or more it is read before every instruction, so the
+    /// budget is overrun by at most one. This program is shorter than
+    /// `CLOCK_EVERY`, so before, the clock was never read at all.
+    #[test]
+    fn after_a_large_load_the_clock_is_read_every_instruction() {
+        let _serial = serial();
+        let rs = ruleset(RULES);
+        assert!(rs.phase_programs[Phase::RequestBody as usize].len() < CLOCK_EVERY as usize);
+        let form = "application/x-www-form-urlencoded";
+        let large = format!("a={}&z=last-value", "x".repeat(CLOCK_BYTES));
+        crate::test_hooks::set_eval_clock_step(Duration::from_millis(51));
+        let mut c = request("", form, &large, limits(0, 0, 50));
+        let decision = run(&rs, &mut c);
+        let mut small = request("", form, "z=last-value", limits(0, 0, 50));
+        let small_decision = run(&rs, &mut small);
+        crate::test_hooks::set_eval_clock_step(Duration::ZERO);
+
+        assert_eq!(decision, WafDecision::Block);
+        let refused = refusals(&c);
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].rule_id, InspectionLimit::Time.rule_id());
+        assert!(
+            !fired(&c, "29"),
+            "the budget was found spent only at the end"
+        );
+        // A small request is read every CLOCK_EVERY instructions, as before.
+        assert_eq!(small_decision, WafDecision::Allow);
+        assert!(fired(&small, "29"));
+    }
+
+    /// The budget is CPU time this thread spends evaluating. Wall time also
+    /// counted time the thread spent descheduled — a busy node, as in a
+    /// flood — so a heavy but legitimate request could be refused for the
+    /// load around it. The wall clock still decides when the CPU clock is
+    /// worth reading: a thread uses no more CPU time than wall time passes.
+    #[test]
+    fn time_the_thread_spends_descheduled_is_not_held_against_the_request() {
+        let _serial = serial();
+        let mut src = String::from(RULES);
+        for i in 0..40 {
+            src.push_str(&format!(
+                "SecRule ARGS \"@rx never-{i}\" \"id:{},phase:2,pass\"\n",
+                100 + i
+            ));
+        }
+        let rs = ruleset(&src);
+        let form = "application/x-www-form-urlencoded";
+        // The wall clock moves 51 ms per read; the CPU clock does not.
+        crate::test_hooks::set_eval_wall_clock_step(Duration::from_millis(51));
+        let mut c = request("", form, "a=last-value", limits(0, 0, 50));
+        let decision = run(&rs, &mut c);
+        crate::test_hooks::set_eval_clock_step(Duration::ZERO);
+        assert_eq!(decision, WafDecision::Allow, "{:?}", c.block_reason);
+        assert!(refusals(&c).is_empty());
+        assert!(fired(&c, "29"));
+    }
+
+    /// The hooks above stand in for the clocks; this is the real CPU clock:
+    /// present on Linux, and moving with work done on this thread.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_thread_cpu_clock_is_read_and_moves_with_work() {
+        let before = thread_cpu_time().expect("CLOCK_THREAD_CPUTIME_ID");
+        let mut x = 0u64;
+        for i in 0..20_000_000u64 {
+            x = std::hint::black_box(x.wrapping_mul(31).wrapping_add(i));
+        }
+        let after = thread_cpu_time().expect("CLOCK_THREAD_CPUTIME_ID");
+        assert!(after > before, "{before:?} -> {after:?} ({x})");
     }
 
     /// In learning mode the proxy turns the Block into a logged would-block

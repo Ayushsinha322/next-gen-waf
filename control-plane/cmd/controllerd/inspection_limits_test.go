@@ -6,6 +6,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"reflect"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -157,5 +161,51 @@ func TestInspectionLimitRefusalsCannotBeExcluded(t *testing.T) {
 	}
 	if w := exclude("942100"); w.Code == http.StatusBadRequest {
 		t.Fatalf("excluding a real rule was refused: %s", w.Body.String())
+	}
+}
+
+// inspectionLimitRuleSettings is a copy of what the data plane records: the
+// built-in rule id of each inspection limit (InspectionLimit::rule_id in
+// sentinel-core) and the setting that limit is for (InspectionLimit::setting).
+// If the two drift, the exclusion guard lets the data plane's real ids through
+// again — an exclusion stored that changes nothing — and its message names a
+// setting that is not the one to raise. This reads the Rust and compares.
+func TestInspectionLimitRuleSettingsMatchTheDataPlane(t *testing.T) {
+	src, err := os.ReadFile("../../../crates/sentinel-core/src/context.rs")
+	if err != nil {
+		t.Skipf("data-plane sources not present: %v", err)
+	}
+	arms := func(fn string) map[string]string {
+		re := regexp.MustCompile(`(?s)pub const fn ` + fn + `\(self\) -> &'static str \{\s*match self \{(.*?)\}`)
+		m := re.FindSubmatch(src)
+		if m == nil {
+			t.Fatalf("InspectionLimit::%s not found in context.rs", fn)
+		}
+		out := map[string]string{}
+		for _, arm := range regexp.MustCompile(`Self::(\w+) => "([^"]*)"`).FindAllSubmatch(m[1], -1) {
+			out[string(arm[1])] = string(arm[2])
+		}
+		if len(out) == 0 {
+			t.Fatalf("InspectionLimit::%s has no arms this test can read", fn)
+		}
+		return out
+	}
+	ids, settings := arms("rule_id"), arms("setting")
+
+	dataPlane := map[int]string{}
+	for variant, id := range ids {
+		setting, ok := settings[variant]
+		if !ok {
+			t.Fatalf("InspectionLimit::%s has a rule id but no setting", variant)
+		}
+		n, err := strconv.Atoi(id)
+		if err != nil {
+			t.Fatalf("InspectionLimit::%s rule id %q is not a number", variant, id)
+		}
+		dataPlane[n] = setting
+	}
+	if !reflect.DeepEqual(dataPlane, inspectionLimitRuleSettings) {
+		t.Fatalf("inspectionLimitRuleSettings = %v, but the data plane records %v",
+			inspectionLimitRuleSettings, dataPlane)
 	}
 }

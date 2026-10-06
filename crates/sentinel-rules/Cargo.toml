@@ -32,6 +32,8 @@ libinjectionrs = "0.1"
 # Already in the tree through regex/aho-corasick; used for the multipart
 # boundary search.
 memchr = "2"
+# The thread's CPU clock, which the inspection time budget is measured in.
+libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

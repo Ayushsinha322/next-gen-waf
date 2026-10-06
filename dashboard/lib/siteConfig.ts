@@ -153,14 +153,56 @@ export const LIMIT_CAPS = {
   maxUriBytes: 131072,
   /** Browsers send 15–25 headers; 1000 is already absurd. */
   maxHeaders: 1000,
+  /** Inspection limits. Past these a limit bounds nothing: each argument costs
+   *  the rule engine about 0.1 ms, each KiB of argument text 0.5–5 ms. */
+  maxInspectedArgs: 100000,
+  maxInspectedArgKib: 16384,
+  maxInspectionBudgetMs: 60000,
+  /** A budget under this is a seconds value typed into a milliseconds field. */
+  minInspectionBudgetMs: 100,
 } as const;
+
+/** What a site gets when its policy leaves an inspection limit unset; the
+ *  data plane's defaults (DEFAULT_MAX_INSPECTED_ARGS and friends in
+ *  crates/sentinel-core/src/config/mod.rs). Shown, never written: an unset
+ *  field is omitted from the policy so the data plane's default applies. */
+export const INSPECTION_LIMIT_DEFAULTS = {
+  max_inspected_args: 4096,
+  max_inspected_arg_kib: 512,
+  inspection_time_budget_ms: 10000,
+} as const;
+
+/**
+ * The built-in rule ids a request is recorded under when inspecting it would
+ * have gone past one of the site's inspection limits, and the setting to raise.
+ * They show in the learning report like rules, but are not: an exclusion of one
+ * would change nothing, and the API refuses it. Mirrors
+ * inspectionLimitRuleSettings in control-plane/cmd/controllerd/site_validate.go,
+ * which a test compares.
+ */
+export const INSPECTION_LIMIT_RULES: Readonly<Record<string, { setting: string; label: string }>> = {
+  "9900401": { setting: "max_inspected_args", label: "Max Inspected Arguments" },
+  "9900402": { setting: "max_inspected_arg_bytes", label: "Max Inspected Argument Text (KiB)" },
+  "9900403": { setting: "inspection_time_budget_ms", label: "Inspection Time Budget (ms)" },
+};
+
+/** The inspection limit a learning-report row records, if it is one rather
+ *  than a rule. */
+export function inspectionLimitOf(ruleId: string | number): { setting: string; label: string } | undefined {
+  return INSPECTION_LIMIT_RULES[String(ruleId)];
+}
 
 export interface LimitCheck {
   /** "error" blocks deploy; "warn" is shown and allowed. */
   level: "error" | "warn";
-  field: "max_body_size_mb" | "max_uri_length" | "max_header_count" | "paranoia_level" | "anomaly_threshold";
+  field:
+    | "max_body_size_mb" | "max_uri_length" | "max_header_count" | "paranoia_level" | "anomaly_threshold"
+    | "max_inspected_args" | "max_inspected_arg_kib" | "inspection_time_budget_ms";
   message: string;
 }
+
+/** The inspection-limit fields; "" means unset (the data plane's default). */
+type InspectionLimitFields = Pick<SiteForm, "max_inspected_args" | "max_inspected_arg_kib" | "inspection_time_budget_ms">;
 
 /**
  * Catch the values that are almost certainly mistakes before they reach a site.
@@ -177,7 +219,8 @@ export interface LimitCheck {
  * and what was probably intended.
  */
 export function checkSiteLimits(
-  f: Pick<SiteForm, "max_body_size_mb" | "max_uri_length" | "max_header_count" | "paranoia_level" | "anomaly_threshold" | "mode">,
+  f: Pick<SiteForm, "max_body_size_mb" | "max_uri_length" | "max_header_count" | "paranoia_level" | "anomaly_threshold" | "mode">
+    & Partial<InspectionLimitFields>,
 ): LimitCheck[] {
   const out: LimitCheck[] = [];
   const err = (field: LimitCheck["field"], message: string) => out.push({ level: "error", field, message });
@@ -224,6 +267,47 @@ export function checkSiteLimits(
     err("max_header_count", `Max headers is ${fmt(hdr)}. Browsers send 15–25; the largest accepted is ${fmt(LIMIT_CAPS.maxHeaders)}.`);
   } else if (hdr > 0 && hdr < 30) {
     warn("max_header_count", `${fmt(hdr)} is below what browsers routinely send with cookies and SSO — expect 431 errors. The default is 100.`);
+  }
+
+  // Inspection limits: unset ("") is the data plane's default and needs no
+  // check. They bound what inspecting one request may cost; a request past one
+  // is refused in Blocking mode, so a value too small is an outage.
+  const set = (v: number | "" | undefined) => (v === "" || v === undefined ? null : num(Number(v)));
+  const args = set(f.max_inspected_args);
+  if (args !== null) {
+    if (Number.isNaN(args) || args < 0 || !Number.isInteger(args)) {
+      err("max_inspected_args", "Max inspected arguments must be a whole number, 0 or more.");
+    } else if (args > LIMIT_CAPS.maxInspectedArgs) {
+      err("max_inspected_args", `Max inspected arguments is ${fmt(args)}; the largest accepted is ${fmt(LIMIT_CAPS.maxInspectedArgs)} — each argument costs about 0.1 ms to inspect, so past that the limit bounds nothing.`);
+    } else if (args === 0) {
+      warn("max_inspected_args", "0 means no limit: a request may carry any number of arguments, and each one costs inspection time.");
+    } else if (args < 1000) {
+      warn("max_inspected_args", `${fmt(args)} arguments will refuse large forms and JSON documents in Blocking mode — ordinary ones carry up to about 1,000. The default is ${fmt(INSPECTION_LIMIT_DEFAULTS.max_inspected_args)}.`);
+    }
+  }
+  const kib = set(f.max_inspected_arg_kib);
+  if (kib !== null) {
+    if (Number.isNaN(kib) || kib < 0) {
+      err("max_inspected_arg_kib", "Max inspected argument text must be a number of KiB, 0 or more.");
+    } else if (kib > LIMIT_CAPS.maxInspectedArgKib) {
+      err("max_inspected_arg_kib", `Max inspected argument text is ${fmt(kib)} KiB; the largest accepted is ${fmt(LIMIT_CAPS.maxInspectedArgKib)} KiB (16 MiB) — this field is in KiB.`);
+    } else if (kib === 0) {
+      warn("max_inspected_arg_kib", "0 means no limit: a request's argument text is inspected however long it is, up to Max Body.");
+    } else if (kib < 256) {
+      warn("max_inspected_arg_kib", `${fmt(kib)} KiB will refuse large forms and uploads read as text (base64 in JSON, text/plain, CSV) in Blocking mode. The default is ${fmt(INSPECTION_LIMIT_DEFAULTS.max_inspected_arg_kib)} KiB.`);
+    }
+  }
+  const ms = set(f.inspection_time_budget_ms);
+  if (ms !== null) {
+    if (Number.isNaN(ms) || ms < 0 || !Number.isInteger(ms)) {
+      err("inspection_time_budget_ms", "Inspection time budget must be a whole number of milliseconds, 0 or more.");
+    } else if (ms > LIMIT_CAPS.maxInspectionBudgetMs) {
+      err("inspection_time_budget_ms", `Inspection time budget is ${fmt(ms)} ms; the largest accepted is ${fmt(LIMIT_CAPS.maxInspectionBudgetMs)} ms — this field is in milliseconds.`);
+    } else if (ms > 0 && ms < LIMIT_CAPS.minInspectionBudgetMs) {
+      err("inspection_time_budget_ms", `Inspection time budget is ${fmt(ms)} ms; the smallest accepted is ${fmt(LIMIT_CAPS.minInspectionBudgetMs)} ms (0 turns it off). This field is in milliseconds — a 100-field form takes 13–65 ms to inspect.`);
+    } else if (ms === 0) {
+      warn("inspection_time_budget_ms", "0 means no time budget: one request may hold a CPU core for as long as its content takes to inspect.");
+    }
   }
 
   const pl = num(f.paranoia_level);
@@ -330,6 +414,11 @@ export interface SiteForm {
   max_uri_length:   number;
   max_header_count: number;
   allowed_methods:  string[];
+  // inspection limits — "" leaves the key out, so the data plane's default
+  // (INSPECTION_LIMIT_DEFAULTS) applies; 0 means no limit
+  max_inspected_args:        number | "";
+  max_inspected_arg_kib:     number | "";   // stored in bytes as max_inspected_arg_bytes
+  inspection_time_budget_ms: number | "";
 
   // rate limiting + anti-ddos
   rate_limit_enabled: boolean;
@@ -609,6 +698,7 @@ export function emptyForm(): SiteForm {
 
     max_body_size_mb: 10, max_uri_length: 8192, max_header_count: 100,
     allowed_methods: ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"],
+    max_inspected_args: "", max_inspected_arg_kib: "", inspection_time_budget_ms: "",
 
     rate_limit_enabled: true,
     rl_global: { rps: 5000, burst: 10000 },
@@ -700,6 +790,7 @@ export function durationToSecs(v: string): number {
 export const FORM_MANAGED_POLICY_KEYS: ReadonlySet<string> = new Set([
   "mode", "paranoia_level", "anomaly_threshold", "rule_categories", "rule_exclusions",
   "max_body_size", "max_uri_length", "max_header_count", "allowed_methods",
+  "max_inspected_args", "max_inspected_arg_bytes", "inspection_time_budget_ms",
   "api_discovery", "enabled_plugins", "path_overrides", "frontend", "tls",
   "rate_limit", "anti_ddos", "bot_detection", "geoip", "ip_reputation",
   "security_headers", "block_page", "ml", "jwt", "graphql", "grpc", "dlp", "fusion",
@@ -816,6 +907,13 @@ export function formToPayload(f: SiteForm): {
       custom: { priority: f.custom_priority, cert_path: f.cert_path, key_path: f.key_path },
     },
   };
+
+  // Inspection limits: written only when set. An unset field leaves the key
+  // out, and the data plane applies its own default — a value written here
+  // would pin today's default on the site after the default changes.
+  if (f.max_inspected_args !== "") waf_policy.max_inspected_args = Number(f.max_inspected_args);
+  if (f.max_inspected_arg_kib !== "") waf_policy.max_inspected_arg_bytes = Math.round(Number(f.max_inspected_arg_kib) * 1024);
+  if (f.inspection_time_budget_ms !== "") waf_policy.inspection_time_budget_ms = Number(f.inspection_time_budget_ms);
 
   if (f.rate_limit_enabled) {
     waf_policy.rate_limit = { global: f.rl_global, per_ip: f.rl_per_ip };
@@ -1039,6 +1137,12 @@ export function siteToForm(site: Site): SiteForm {
   if (typeof w.max_body_size === "number") f.max_body_size_mb = Math.round((w.max_body_size as number) / (1024 * 1024));
   f.max_uri_length = num(w.max_uri_length, 8192);
   f.max_header_count = num(w.max_header_count, 100);
+  // Absent stays "" (the data plane's default); 0 is a setting (no limit).
+  const limit = (v: unknown): number | "" => (typeof v === "number" && Number.isFinite(v) ? v : "");
+  f.max_inspected_args = limit(w.max_inspected_args);
+  const argBytes = limit(w.max_inspected_arg_bytes);
+  f.max_inspected_arg_kib = argBytes === "" ? "" : argBytes / 1024;
+  f.inspection_time_budget_ms = limit(w.inspection_time_budget_ms);
   const methods = arr<string>(w.allowed_methods);
   if (methods.length) f.allowed_methods = methods;
   f.api_discovery = !!w.api_discovery;

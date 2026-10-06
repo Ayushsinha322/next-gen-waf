@@ -24,9 +24,12 @@ import {
   CRS_REQUEST_CATEGORIES, CRS_RESPONSE_CATEGORIES, ALL_CRS_RESPONSE_KEYS, type CrsCategory,
   ALL_CRS_KEYS, COUNTRIES, PresetKey, UpstreamServer, normalizeDomain,
   HTTP_METHODS, ACME_PROVIDERS, CustomHeader, certCoversHost, servingCertFor,
-  checkSiteLimits, type LimitCheck,
+  checkSiteLimits, type LimitCheck, INSPECTION_LIMIT_DEFAULTS,
   JWT_ALGORITHMS, FUSION_ENGINES, IpFeed,
 } from "@/lib/siteConfig";
+
+/** A number input's value for a field where "" means unset. */
+const optionalNumber = (v: string): number | "" => (v.trim() === "" ? "" : Number(v));
 
 /** The limit checks that concern the given fields, shown next to those fields. */
 function LimitNotes({ checks, fields }: { checks: LimitCheck[]; fields: LimitCheck["field"][] }) {
@@ -1190,6 +1193,16 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     <Field label="Max Headers" hint="Most headers one request may carry."><input className="fin2" type="number" value={form.max_header_count} onChange={e => upd({ max_header_count: Number(e.target.value) })} /></Field>
                   </div>
                   <LimitNotes checks={checkSiteLimits(form)} fields={["max_body_size_mb", "max_uri_length", "max_header_count"]} />
+                  <GroupLabel>Inspection Limits</GroupLabel>
+                  <div style={{ fontSize: 12, color: "var(--text3)", lineHeight: 1.6 }}>
+                    What inspecting one request may cost. A request past one is never inspected in part: Blocking mode refuses it (413, or 403 for the time budget) and Learning mode records it. Leave blank for the default; 0 means no limit.
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
+                    <Field label="Max Inspected Arguments" hint={`Query, form, JSON, XML and multipart arguments together. Default ${INSPECTION_LIMIT_DEFAULTS.max_inspected_args}.`}><input className="fin2" type="number" min={0} value={form.max_inspected_args} placeholder={String(INSPECTION_LIMIT_DEFAULTS.max_inspected_args)} onChange={e => upd({ max_inspected_args: optionalNumber(e.target.value) })} /></Field>
+                    <Field label="Max Argument Text (KiB)" hint={`Argument names and values, and a body read as text (base64 uploads, text/plain, CSV). Default ${INSPECTION_LIMIT_DEFAULTS.max_inspected_arg_kib}.`}><input className="fin2" type="number" min={0} value={form.max_inspected_arg_kib} placeholder={String(INSPECTION_LIMIT_DEFAULTS.max_inspected_arg_kib)} onChange={e => upd({ max_inspected_arg_kib: optionalNumber(e.target.value) })} /></Field>
+                    <Field label="Inspection Time Budget (ms)" hint={`CPU time the rules may spend on one phase of a request. Default ${INSPECTION_LIMIT_DEFAULTS.inspection_time_budget_ms}.`}><input className="fin2" type="number" min={0} value={form.inspection_time_budget_ms} placeholder={String(INSPECTION_LIMIT_DEFAULTS.inspection_time_budget_ms)} onChange={e => upd({ inspection_time_budget_ms: optionalNumber(e.target.value) })} /></Field>
+                  </div>
+                  <LimitNotes checks={checkSiteLimits(form)} fields={["max_inspected_args", "max_inspected_arg_kib", "inspection_time_budget_ms"]} />
                   <GroupLabel>Allowed HTTP Methods</GroupLabel>
                   <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
                     {HTTP_METHODS.map(m => {
@@ -1288,7 +1301,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                 {screen === "review" && (
                   <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
                     <StepHead title="Review" sub={`Confirm your configuration, then ${mode === "edit" ? "save changes" : "deploy"}. Protection activates in ~5s.`} />
-                  <LimitNotes checks={checkSiteLimits(form)} fields={["max_body_size_mb", "max_uri_length", "max_header_count", "paranoia_level", "anomaly_threshold"]} />
+                  <LimitNotes checks={checkSiteLimits(form)} fields={["max_body_size_mb", "max_uri_length", "max_header_count", "max_inspected_args", "max_inspected_arg_kib", "inspection_time_budget_ms", "paranoia_level", "anomaly_threshold"]} />
                   {checking && (
                     <InfoBox tone="cyan">Validating this configuration against the data-plane converter…</InfoBox>
                   )}

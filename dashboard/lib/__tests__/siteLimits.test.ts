@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { checkSiteLimits, LIMIT_CAPS } from "../siteConfig";
+import { checkSiteLimits, LIMIT_CAPS, INSPECTION_LIMIT_RULES, INSPECTION_LIMIT_DEFAULTS, inspectionLimitOf } from "../siteConfig";
 
 /**
  * The console's caps and the control plane's must be the same numbers. If they
@@ -19,6 +19,44 @@ describe("LIMIT_CAPS agree with the control plane", () => {
   it("body", () => expect(constant("maxSiteBodyBytes")).toBe(LIMIT_CAPS.maxBodyMb * 1024 * 1024));
   it("uri", () => expect(constant("maxSiteURIBytes")).toBe(LIMIT_CAPS.maxUriBytes));
   it("headers", () => expect(constant("maxSiteHeaders")).toBe(LIMIT_CAPS.maxHeaders));
+  it("inspection limits", () => {
+    expect(constant("maxSiteInspectedArgs")).toBe(LIMIT_CAPS.maxInspectedArgs);
+    expect(constant("maxSiteInspectedArgBytes")).toBe(LIMIT_CAPS.maxInspectedArgKib * 1024);
+    expect(constant("maxSiteInspectionBudgetMs")).toBe(LIMIT_CAPS.maxInspectionBudgetMs);
+    expect(constant("minSiteInspectionBudgetMs")).toBe(LIMIT_CAPS.minInspectionBudgetMs);
+  });
+
+  // The learning report offers "raise <setting>" instead of Disable for these
+  // ids; the control plane refuses to exclude them. The two lists must be one.
+  it("inspection-limit rule ids", () => {
+    const m = go.match(/inspectionLimitRuleSettings = map\[int\]string\{([^}]*)\}/);
+    if (!m) throw new Error("inspectionLimitRuleSettings not found in site_validate.go");
+    const goMap = Object.fromEntries([...m[1].matchAll(/(\d+):\s*"(\w+)"/g)].map(e => [e[1], e[2]]));
+    expect(Object.keys(goMap)).toHaveLength(3);
+    const ours = Object.fromEntries(Object.entries(INSPECTION_LIMIT_RULES).map(([id, l]) => [id, l.setting]));
+    expect(ours).toEqual(goMap);
+  });
+});
+
+/** The defaults the form shows for an unset limit are the data plane's. */
+describe("INSPECTION_LIMIT_DEFAULTS agree with the data plane", () => {
+  const rust = readFileSync(join(__dirname, "../../../crates/sentinel-core/src/config/mod.rs"), "utf8");
+  const constant = (name: string): number => {
+    const m = rust.match(new RegExp(`pub const ${name}: u\\d+ = ([0-9_*\\s]+);`));
+    if (!m) throw new Error(`${name} not found in config/mod.rs`);
+    return m[1].split("*").map(s => Number(s.replace(/_/g, "").trim())).reduce((a, b) => a * b, 1);
+  };
+  it("args", () => expect(constant("DEFAULT_MAX_INSPECTED_ARGS")).toBe(INSPECTION_LIMIT_DEFAULTS.max_inspected_args));
+  it("bytes", () => expect(constant("DEFAULT_MAX_INSPECTED_ARG_BYTES")).toBe(INSPECTION_LIMIT_DEFAULTS.max_inspected_arg_kib * 1024));
+  it("time", () => expect(constant("DEFAULT_INSPECTION_TIME_BUDGET_MS")).toBe(INSPECTION_LIMIT_DEFAULTS.inspection_time_budget_ms));
+});
+
+describe("inspectionLimitOf", () => {
+  it("names the setting for a refusal id, and nothing for a rule", () => {
+    expect(inspectionLimitOf("9900402")?.setting).toBe("max_inspected_arg_bytes");
+    expect(inspectionLimitOf(9900403)?.setting).toBe("inspection_time_budget_ms");
+    expect(inspectionLimitOf("942100")).toBeUndefined();
+  });
 });
 
 /**
@@ -96,6 +134,33 @@ describe("checkSiteLimits", () => {
     expect(errors({ paranoia_level: 5 }).map(e => e.field)).toContain("paranoia_level");
     expect(errors({ paranoia_level: 0 }).map(e => e.field)).toContain("paranoia_level");
     expect(errors({ anomaly_threshold: 0 }).map(e => e.field)).toContain("anomaly_threshold");
+  });
+
+  it("says nothing about unset inspection limits, which take the data plane's defaults", () => {
+    expect(checkSiteLimits({ ...sane, max_inspected_args: "", max_inspected_arg_kib: "", inspection_time_budget_ms: "" })).toEqual([]);
+    expect(checkSiteLimits({ ...sane, max_inspected_args: 4096, max_inspected_arg_kib: 512, inspection_time_budget_ms: 10000 })).toEqual([]);
+  });
+
+  it("bounds the inspection limits as the control plane does", () => {
+    const e = (f: object) => checkSiteLimits({ ...sane, ...f }).filter(c => c.level === "error").map(c => c.field);
+    expect(e({ max_inspected_args: LIMIT_CAPS.maxInspectedArgs })).toEqual([]);
+    expect(e({ max_inspected_args: LIMIT_CAPS.maxInspectedArgs + 1 })).toEqual(["max_inspected_args"]);
+    expect(e({ max_inspected_args: 2.5 })).toEqual(["max_inspected_args"]);
+    expect(e({ max_inspected_arg_kib: LIMIT_CAPS.maxInspectedArgKib + 1 })).toEqual(["max_inspected_arg_kib"]);
+    expect(e({ max_inspected_arg_kib: -1 })).toEqual(["max_inspected_arg_kib"]);
+    expect(e({ inspection_time_budget_ms: LIMIT_CAPS.maxInspectionBudgetMs + 1 })).toEqual(["inspection_time_budget_ms"]);
+    // Seconds typed into the milliseconds field: refused, as the API refuses it.
+    const tiny = checkSiteLimits({ ...sane, inspection_time_budget_ms: 10 }).filter(c => c.level === "error");
+    expect(tiny.map(c => c.field)).toEqual(["inspection_time_budget_ms"]);
+    expect(tiny[0].message).toMatch(/milliseconds/);
+  });
+
+  it("warns that 0 turns an inspection limit off, and that a small one refuses ordinary forms", () => {
+    const w = (f: object) => checkSiteLimits({ ...sane, ...f }).filter(c => c.level === "warn").map(c => c.field);
+    expect(w({ max_inspected_args: 0, max_inspected_arg_kib: 0, inspection_time_budget_ms: 0 }))
+      .toEqual(["max_inspected_args", "max_inspected_arg_kib", "inspection_time_budget_ms"]);
+    expect(w({ max_inspected_args: 200 })).toEqual(["max_inspected_args"]);
+    expect(w({ max_inspected_arg_kib: 64 })).toEqual(["max_inspected_arg_kib"]);
   });
 
   it("refuses values a number input can produce but a limit cannot mean", () => {
