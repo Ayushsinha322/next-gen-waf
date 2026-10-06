@@ -504,3 +504,59 @@ async fn h3_inspected_response_keeps_its_trailers() {
     drop(client);
     proxy.stop().await;
 }
+
+/// A response cut short after its head is recorded. The access-log line was
+/// written with the head and says the response was complete, so the counter
+/// (and a warning naming the peer and path) is the only trace of the
+/// truncation; it used to be a debug line with neither.
+#[tokio::test]
+async fn h3_response_cut_short_after_the_head_is_counted() {
+    let (origin, mut streams) = start_origin().await;
+    let proxy = start_proxy(origin).await;
+    let before = sentinel_telemetry::metrics::h3_response_resets_total();
+
+    let mut client = h3_get(proxy.addr, "/stream").await;
+    let origin_tx = timeout(Duration::from_secs(10), streams.recv())
+        .await
+        .expect("the request never reached the origin")
+        .unwrap();
+    origin_tx
+        .send(Ok(Frame::data(Bytes::from_static(b"first "))))
+        .await
+        .unwrap();
+    let resp = timeout(Duration::from_secs(10), client.stream.recv_response())
+        .await
+        .expect("no response head")
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    origin_tx
+        .send(Err("origin died mid-body".into()))
+        .await
+        .unwrap();
+
+    let ended = timeout(Duration::from_secs(10), async {
+        loop {
+            match client.stream.recv_data().await {
+                Ok(Some(_)) => continue,
+                Ok(None) => break Ok(()),
+                Err(e) => break Err(e),
+            }
+        }
+    })
+    .await
+    .expect("the client never learned how the body ended");
+    assert!(ended.is_err(), "a body the origin cut short ended cleanly");
+
+    // The client can see the reset just before the relay task records it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while sentinel_telemetry::metrics::h3_response_resets_total() == before {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the WAF did not record the h3 response it cut short"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    drop(client);
+    proxy.stop().await;
+}

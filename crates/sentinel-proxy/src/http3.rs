@@ -30,7 +30,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Body;
 use sentinel_telemetry::inc_load_shed_connections;
 use tokio::sync::watch;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::{run_pipeline, ActiveConnGuard, BoxBody, ServerState};
 
@@ -251,6 +251,10 @@ async fn handle_h3_request(
     // WAF pipeline, NDJSON logs, and ClickHouse all record this request as h3.
     parts.version = http::Version::HTTP_3;
     debug!(method = %parts.method, uri = %parts.uri, "HTTP/3 request");
+    // For the warning if the response is cut short. Path only: the query can
+    // carry credentials, and the access log already holds its redacted form.
+    let method = parts.method.clone();
+    let path = crate::cap_field(parts.uri.path(), 256);
 
     // Buffer the request body from the QUIC stream (capped as an OOM guard;
     // per-site size limits are enforced downstream in `proxy`).
@@ -282,7 +286,15 @@ async fn handle_h3_request(
     // time (see `ja4_quic`) and reaches `ctx.tls_fingerprint` exactly as the TCP
     // path's peeked fingerprint does.
     let resp = run_pipeline(state, peer, pipeline_req, default_site, tls_fp).await;
-    send_h3_response(&mut stream, &quic, resp).await
+    if let Err(e) = send_h3_response(&mut stream, &quic, resp).await {
+        // The access-log line was written with the head and records a complete
+        // response, so this is the only trace of the truncation. Client
+        // cancels and closed connections end the relay with Ok and never get
+        // here, so this does not fire for ordinary abandoned downloads.
+        sentinel_telemetry::metrics::note_h3_response_reset();
+        warn!(%peer, %method, %path, "HTTP/3 response cut short, stream reset: {e:#}");
+    }
+    Ok(())
 }
 
 /// Relay a pipeline response over an HTTP/3 request stream: the head, then the
@@ -298,10 +310,11 @@ where
 {
     let (mut parts, body) = resp.into_parts();
     strip_forbidden_h3_headers(&mut parts.headers);
-    stream
-        .send_response(Response::from_parts(parts, ()))
-        .await
-        .context("sending HTTP/3 response headers")?;
+    // Through `end_on_send_error` like every other send: a client that
+    // cancelled while the pipeline ran is not a failure of ours.
+    if let Err(e) = stream.send_response(Response::from_parts(parts, ())).await {
+        return end_on_send_error(stream, e, "sending HTTP/3 response headers");
+    }
     relay_h3_body(stream, quic, body).await
 }
 
@@ -973,6 +986,33 @@ mod tests {
         assert!(
             relay.is_ok(),
             "a departed client is a normal end, not a relay error: {relay:?}"
+        );
+    }
+
+    /// A client that leaves before the head is sent (it gave up while the
+    /// pipeline waited on the origin) is an ordinary end, not a failure. The
+    /// head send used to return an error, and errors from here are now warned
+    /// about and counted as truncated responses.
+    #[tokio::test]
+    async fn h3_client_leaving_before_the_head_is_not_a_failure() {
+        let (got_request_tx, got_request_rx) = oneshot::channel();
+        let (addr, relay_done) = serve_one_with(|mut stream, quic| async move {
+            let _ = got_request_tx.send(());
+            // Stands in for a pipeline still waiting on its origin.
+            quic.closed().await;
+            let resp = Response::new(Full::new(Bytes::from_static(b"too late")));
+            send_h3_response(&mut stream, &quic, resp).await
+        });
+        let client = get(addr, test_client_config()).await;
+        got_request_rx.await.unwrap();
+        client.conn.close(0u32.into(), b"leaving");
+        let relay = timeout(Duration::from_secs(5), relay_done)
+            .await
+            .expect("the server side never finished")
+            .unwrap();
+        assert!(
+            relay.is_ok(),
+            "a client that left before the head is not a relay error: {relay:?}"
         );
     }
 
