@@ -11893,7 +11893,7 @@ mod metrics_endpoint_tests {
         let rl = RateLimiter::distributed(sentinel_modules::DistributedGuard::default());
         let body = metrics_response(&rl).into_body().collect().await.unwrap();
         let text = String::from_utf8(body.to_bytes().to_vec()).unwrap();
-        assert!(text.contains("sentinel_ratelimit_valkey_connected 0"));
+        assert!(text.contains("sentinel_ratelimit_valkey_client_bound 0"));
         assert!(text.contains("sentinel_ratelimit_valkey_breaker_open 0"));
     }
 }
@@ -11916,7 +11916,7 @@ mod storage_dependency_tests {
             sentinel_modules::DistributedGuard::default(),
         ));
         assert_eq!(v["valkey"]["configured"], true);
-        assert_eq!(v["valkey"]["connected"], false);
+        assert_eq!(v["valkey"]["client_bound"], false);
         assert_eq!(v["valkey"]["mode"], "in_memory_fallback");
         assert_eq!(v["valkey"]["breaker"], "closed");
         assert_eq!(v["valkey"]["timeout_ms"], 50);

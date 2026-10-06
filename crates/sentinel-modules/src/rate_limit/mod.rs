@@ -97,23 +97,41 @@ impl Default for DistributedGuard {
 }
 
 impl DistributedGuard {
-    /// Defaults overridden by `SENTINEL_REDIS_TIMEOUT_MS` (1..=1000),
+    /// Defaults overridden by `SENTINEL_REDIS_TIMEOUT_MS` (1..=500),
     /// `SENTINEL_REDIS_BREAKER_FAILURES` (1..=1000) and
     /// `SENTINEL_REDIS_BREAKER_COOLDOWN_MS` (100..=600000). Out-of-range or
-    /// unparseable values keep the default.
+    /// unparseable values keep the default, with a warning.
+    ///
+    /// The timeout's ceiling is the Valkey client's own per-command timeout
+    /// ([`sentinel_storage::redis::RESPONSE_TIMEOUT`]): each call fails there
+    /// first, so a larger budget was accepted and silently had no effect.
     pub fn from_env() -> Self {
         Self::from_lookup(|k| std::env::var(k).ok())
     }
 
     fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
         let num = |k: &str, lo: u64, hi: u64| {
-            lookup(k)
-                .and_then(|v| v.trim().parse::<u64>().ok())
-                .filter(|v| (lo..=hi).contains(v))
+            let raw = lookup(k)?;
+            let v = raw
+                .trim()
+                .parse::<u64>()
+                .ok()
+                .filter(|v| (lo..=hi).contains(v));
+            if v.is_none() {
+                tracing::warn!(
+                    var = k,
+                    value = %raw,
+                    min = lo,
+                    max = hi,
+                    "ignoring out-of-range rate-limit backend setting — using the default"
+                );
+            }
+            v
         };
+        let max_timeout_ms = sentinel_storage::redis::RESPONSE_TIMEOUT.as_millis() as u64;
         let d = Self::default();
         Self {
-            timeout: num("SENTINEL_REDIS_TIMEOUT_MS", 1, 1000)
+            timeout: num("SENTINEL_REDIS_TIMEOUT_MS", 1, max_timeout_ms)
                 .map(Duration::from_millis)
                 .unwrap_or(d.timeout),
             failure_threshold: num("SENTINEL_REDIS_BREAKER_FAILURES", 1, 1000)
@@ -126,9 +144,9 @@ impl DistributedGuard {
     }
 }
 
-/// Minimum spacing of the per-failure warnings. Breaker transitions are always
-/// logged; individual failures under a dead Valkey would otherwise be one line
-/// per request.
+/// Minimum spacing of the per-failure warnings, and of the breaker's OPEN lines.
+/// Individual failures under a dead Valkey would otherwise be one line per
+/// request, and a flapping breaker one WARN and one INFO per cycle.
 const WARN_INTERVAL_MS: u64 = 10_000;
 
 /// Lock-free circuit breaker over the Valkey calls.
@@ -139,6 +157,12 @@ const WARN_INTERVAL_MS: u64 = 10_000;
 /// closes the breaker, a failure leaves it open for another cooldown. Re-arming
 /// BEFORE the probe means a probe that never completes (its request cancelled)
 /// cannot wedge the breaker half-open.
+///
+/// Only the probe can close it. Calls admitted while it was still closed keep
+/// completing after it opens, and when Valkey only partly fails (latency near
+/// the budget) some of those succeed; letting any success close the breaker
+/// reopened and reclosed it thousands of times a minute while shedding almost
+/// no load.
 #[derive(Debug)]
 struct Breaker {
     epoch: Instant,
@@ -152,6 +176,26 @@ struct Breaker {
     opened_total: AtomicU64,
     last_warn: AtomicU64,
     suppressed_warnings: AtomicU64,
+    /// What the log last said: an OPEN line not yet followed by a CLOSE line.
+    logged_open: AtomicBool,
+    last_open_line: AtomicU64,
+    /// Transitions not logged since the last transition line.
+    suppressed_transitions: AtomicU64,
+    /// Added to the clock, so tests can step past a cooldown without sleeping.
+    #[cfg(test)]
+    skew_ms: AtomicU64,
+}
+
+/// How a rate check was let through the breaker. The completion is judged by
+/// it: only a [`Probe`](Admission::Probe) success closes an open breaker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    /// The breaker was closed: ask Valkey.
+    Closed,
+    /// The cooldown is over and this check won the probe.
+    Probe,
+    /// Open: answer in-memory without asking Valkey.
+    Skip,
 }
 
 /// Breaker position, as reported at /healthz.
@@ -176,45 +220,62 @@ impl Breaker {
             opened_total: AtomicU64::new(0),
             last_warn: AtomicU64::new(0),
             suppressed_warnings: AtomicU64::new(0),
+            logged_open: AtomicBool::new(false),
+            last_open_line: AtomicU64::new(0),
+            suppressed_transitions: AtomicU64::new(0),
+            #[cfg(test)]
+            skew_ms: AtomicU64::new(0),
         }
     }
 
     fn now_ms(&self) -> u64 {
-        self.epoch.elapsed().as_millis() as u64 + 1
+        let ms = self.epoch.elapsed().as_millis() as u64 + 1;
+        #[cfg(test)]
+        let ms = ms + self.skew_ms.load(Ordering::Relaxed);
+        ms
     }
 
-    /// `true` if this check may call Valkey.
-    fn admit(&self, cooldown: Duration) -> bool {
+    #[cfg(test)]
+    fn advance(&self, d: Duration) {
+        self.skew_ms
+            .fetch_add(d.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    fn admit(&self, cooldown: Duration) -> Admission {
         let until = self.open_until.load(Ordering::Acquire);
         if until == 0 {
-            return true;
+            return Admission::Closed;
         }
         let now = self.now_ms();
         if now < until {
-            return false;
+            return Admission::Skip;
         }
         // Cooldown over: exactly one caller wins the re-arm and probes.
-        self.open_until
-            .compare_exchange(
-                until,
-                now + cooldown.as_millis() as u64,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-    }
-
-    fn on_success(&self) {
-        self.consecutive_failures.store(0, Ordering::Relaxed);
-        if self.open_until.swap(0, Ordering::AcqRel) != 0 {
-            tracing::info!(
-                "valkey answered again — rate-limit circuit breaker closed, \
-                 distributed (cluster-wide) limits resumed"
-            );
+        match self.open_until.compare_exchange(
+            until,
+            now + cooldown.as_millis() as u64,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Admission::Probe,
+            Err(_) => Admission::Skip,
         }
     }
 
-    fn on_failure(&self, guard: &DistributedGuard, timed_out: bool, detail: &str) {
+    fn on_success(&self, admission: Admission) {
+        self.consecutive_failures.store(0, Ordering::Relaxed);
+        if admission == Admission::Probe && self.open_until.swap(0, Ordering::AcqRel) != 0 {
+            self.log_closed();
+        }
+    }
+
+    fn on_failure(
+        &self,
+        guard: &DistributedGuard,
+        admission: Admission,
+        timed_out: bool,
+        detail: &str,
+    ) {
         if timed_out {
             self.timeouts_total.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -230,16 +291,14 @@ impl Breaker {
                 .is_ok()
             {
                 self.opened_total.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(
-                    consecutive_failures = n,
-                    cooldown_ms = guard.cooldown.as_millis() as u64,
-                    error = detail,
-                    "valkey rate-limit backend failing — circuit breaker OPEN: rate checks \
-                     use the in-memory limiter (per-node, not cluster-wide, limits) and \
-                     skip valkey until a probe succeeds"
-                );
+                self.log_open(guard, n, detail, true);
                 return;
             }
+        }
+        if admission == Admission::Probe {
+            // Still open, for another cooldown. If the OPEN line was
+            // suppressed, this is where the log catches up with the state.
+            self.log_open(guard, n, detail, false);
         }
         self.warn_throttled(|suppressed| {
             tracing::warn!(
@@ -250,6 +309,51 @@ impl Breaker {
                 "valkey rate check failed — answered by the in-memory limiter"
             )
         });
+    }
+
+    /// The breaker opened (`transition`), or a probe failed and it stays open.
+    /// One OPEN line per [`WARN_INTERVAL_MS`] at most, and none while the log
+    /// already says open; a skipped transition is counted into the next line.
+    fn log_open(&self, guard: &DistributedGuard, n: u32, detail: &str, transition: bool) {
+        let now = self.now_ms();
+        let last = self.last_open_line.load(Ordering::Relaxed);
+        let due = !self.logged_open.load(Ordering::Relaxed)
+            && (last == 0 || now.saturating_sub(last) >= WARN_INTERVAL_MS);
+        if due
+            && self
+                .last_open_line
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            self.logged_open.store(true, Ordering::Relaxed);
+            let unlogged = self.suppressed_transitions.swap(0, Ordering::Relaxed);
+            tracing::warn!(
+                consecutive_failures = n,
+                cooldown_ms = guard.cooldown.as_millis() as u64,
+                error = detail,
+                unlogged_transitions = unlogged,
+                "valkey rate-limit backend failing — circuit breaker OPEN: rate checks \
+                 use the in-memory limiter (per-node, not cluster-wide, limits) and \
+                 skip valkey until a probe succeeds"
+            );
+        } else if transition {
+            self.suppressed_transitions.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A probe closed the breaker. Logged only if the log says open, so every
+    /// OPEN line gets its CLOSE and no CLOSE appears without one.
+    fn log_closed(&self) {
+        if self.logged_open.swap(false, Ordering::Relaxed) {
+            let unlogged = self.suppressed_transitions.swap(0, Ordering::Relaxed);
+            tracing::info!(
+                unlogged_transitions = unlogged,
+                "valkey answered again — rate-limit circuit breaker closed, \
+                 distributed (cluster-wide) limits resumed"
+            );
+        } else {
+            self.suppressed_transitions.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Run `emit` at most once per [`WARN_INTERVAL_MS`], passing how many
@@ -284,8 +388,12 @@ impl Breaker {
 pub struct DistributedStatus {
     /// A Valkey URL is configured.
     pub configured: bool,
-    /// The background connect has succeeded and the client is bound.
-    pub connected: bool,
+    /// The background connect has succeeded and the client is bound into the
+    /// limiter. Set once and never cleared: the client reconnects by itself,
+    /// so this is NOT a liveness signal. An outage after boot shows in
+    /// `breaker` and `consecutive_failures` (and only once rate-limited
+    /// traffic has asked Valkey).
+    pub client_bound: bool,
     /// What rate checks are actually using right now: `distributed`,
     /// `in_memory` (no Valkey configured) or `in_memory_fallback` (configured
     /// but not connected yet, or the breaker is open).
@@ -398,7 +506,8 @@ impl RateLimiter {
             }
             return self.check(site_id, ip, config);
         };
-        if !self.breaker.admit(self.guard.cooldown) {
+        let admission = self.breaker.admit(self.guard.cooldown);
+        if admission == Admission::Skip {
             self.breaker.fallback_total.fetch_add(1, Ordering::Relaxed);
             return self.check(site_id, ip, config);
         }
@@ -410,17 +519,21 @@ impl RateLimiter {
         .await
         {
             Ok(Ok(limited)) => {
-                self.breaker.on_success();
+                self.breaker.on_success(admission);
                 limited
             }
             Ok(Err(e)) => {
-                self.breaker.on_failure(&self.guard, false, &e.to_string());
+                // The client's own response timeout comes back as an error;
+                // it is still a timeout.
+                self.breaker
+                    .on_failure(&self.guard, admission, e.is_timeout(), &e.to_string());
                 self.breaker.fallback_total.fetch_add(1, Ordering::Relaxed);
                 self.check(site_id, ip, config)
             }
             Err(_) => {
                 let detail = format!("no reply within {}ms", self.guard.timeout.as_millis());
-                self.breaker.on_failure(&self.guard, true, &detail);
+                self.breaker
+                    .on_failure(&self.guard, admission, true, &detail);
                 self.breaker.fallback_total.fetch_add(1, Ordering::Relaxed);
                 self.check(site_id, ip, config)
             }
@@ -457,9 +570,9 @@ impl RateLimiter {
     /// The distributed backend's state, for /healthz.
     pub fn distributed_status(&self) -> DistributedStatus {
         let configured = self.redis_configured.load(Ordering::Relaxed);
-        let connected = self.is_distributed();
+        let client_bound = self.is_distributed();
         let breaker = self.breaker.state();
-        let mode = match (configured, connected, breaker) {
+        let mode = match (configured, client_bound, breaker) {
             (false, _, _) => "in_memory",
             (true, true, BreakerState::Closed) => "distributed",
             _ => "in_memory_fallback",
@@ -467,7 +580,7 @@ impl RateLimiter {
         let b = &self.breaker;
         DistributedStatus {
             configured,
-            connected,
+            client_bound,
             mode,
             breaker,
             consecutive_failures: b.consecutive_failures.load(Ordering::Relaxed),
@@ -482,8 +595,12 @@ impl RateLimiter {
     }
 
     /// Prometheus series for the distributed backend. Empty when no Valkey is
-    /// configured: a permanently-zero `connected` series on single-node
-    /// installs would read as an outage.
+    /// configured: permanently-zero series on single-node installs would read
+    /// as an outage.
+    ///
+    /// Alert on `breaker_open` and `consecutive_failures`. `client_bound` only
+    /// says the startup connect has finished; it stays 1 through any later
+    /// outage.
     pub fn prometheus_text(&self) -> String {
         let st = self.distributed_status();
         if !st.configured {
@@ -491,12 +608,15 @@ impl RateLimiter {
         }
         let breaker_open = u8::from(st.breaker != BreakerState::Closed);
         format!(
-            "# HELP sentinel_ratelimit_valkey_connected Valkey rate-limit backend connected (1) or not yet (0)\n\
-             # TYPE sentinel_ratelimit_valkey_connected gauge\n\
-             sentinel_ratelimit_valkey_connected {}\n\
+            "# HELP sentinel_ratelimit_valkey_client_bound Valkey client bound into the rate limiter (1) or still connecting at startup (0); not a liveness signal\n\
+             # TYPE sentinel_ratelimit_valkey_client_bound gauge\n\
+             sentinel_ratelimit_valkey_client_bound {}\n\
              # HELP sentinel_ratelimit_valkey_breaker_open Circuit breaker skipping Valkey (1) or closed (0)\n\
              # TYPE sentinel_ratelimit_valkey_breaker_open gauge\n\
              sentinel_ratelimit_valkey_breaker_open {}\n\
+             # HELP sentinel_ratelimit_valkey_consecutive_failures Valkey rate checks failed in a row (0 after any success)\n\
+             # TYPE sentinel_ratelimit_valkey_consecutive_failures gauge\n\
+             sentinel_ratelimit_valkey_consecutive_failures {}\n\
              # HELP sentinel_ratelimit_valkey_errors_total Valkey rate checks that failed with an error\n\
              # TYPE sentinel_ratelimit_valkey_errors_total counter\n\
              sentinel_ratelimit_valkey_errors_total {}\n\
@@ -509,8 +629,9 @@ impl RateLimiter {
              # HELP sentinel_ratelimit_valkey_breaker_opened_total Times the Valkey circuit breaker opened\n\
              # TYPE sentinel_ratelimit_valkey_breaker_opened_total counter\n\
              sentinel_ratelimit_valkey_breaker_opened_total {}\n",
-            u8::from(st.connected),
+            u8::from(st.client_bound),
             breaker_open,
+            st.consecutive_failures,
             st.errors_total,
             st.timeouts_total,
             st.fallback_total,
@@ -762,10 +883,15 @@ mod distributed_tests {
         assert_eq!(rl.distributed_status().fallback_total, 6);
     }
 
+    // The cooldown tests step the breaker's clock (`advance`) instead of
+    // sleeping: with a 60s cooldown, real time that passes during the test (a
+    // stalled CI runner) cannot reach the next cooldown boundary.
+    const COOLDOWN_MS: u64 = 60_000;
+
     #[tokio::test]
     async fn a_probe_after_the_cooldown_closes_the_breaker_when_valkey_recovers() {
         let fake = FakeValkey::start(EvalMode::Error).await;
-        let rl = limiter(&fake, guard(50, 1, 100)).await;
+        let rl = limiter(&fake, guard(50, 1, COOLDOWN_MS)).await;
         let cfg = per_ip(100, 100);
 
         timed_check(&rl, &cfg).await;
@@ -775,7 +901,7 @@ mod distributed_tests {
         timed_check(&rl, &cfg).await;
         assert_eq!(fake.evals(), 1, "still inside the cooldown");
 
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        rl.breaker.advance(Duration::from_millis(COOLDOWN_MS));
         assert_eq!(rl.distributed_status().breaker, BreakerState::HalfOpen);
         timed_check(&rl, &cfg).await;
         assert_eq!(fake.evals(), 2, "one probe after the cooldown");
@@ -788,11 +914,11 @@ mod distributed_tests {
     #[tokio::test]
     async fn a_failed_probe_keeps_the_breaker_open_for_another_cooldown() {
         let fake = FakeValkey::start(EvalMode::Hang).await;
-        let rl = limiter(&fake, guard(30, 1, 100)).await;
+        let rl = limiter(&fake, guard(30, 1, COOLDOWN_MS)).await;
         let cfg = per_ip(100, 100);
 
         timed_check(&rl, &cfg).await;
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        rl.breaker.advance(Duration::from_millis(COOLDOWN_MS));
         timed_check(&rl, &cfg).await; // the probe — times out
         let st = rl.distributed_status();
         assert_eq!(st.timeouts_total, 2);
@@ -821,7 +947,7 @@ mod distributed_tests {
         let (limited, _) = timed_check(&rl, &cfg).await;
         assert!(!limited);
         let st = rl.distributed_status();
-        assert!(st.configured && !st.connected);
+        assert!(st.configured && !st.client_bound);
         assert_eq!(st.mode, "in_memory_fallback");
         assert_eq!(st.fallback_total, 1);
 
@@ -839,8 +965,9 @@ mod distributed_tests {
 
         let text = RateLimiter::distributed(DistributedGuard::default()).prometheus_text();
         for series in [
-            "sentinel_ratelimit_valkey_connected 0",
+            "sentinel_ratelimit_valkey_client_bound 0",
             "sentinel_ratelimit_valkey_breaker_open 0",
+            "sentinel_ratelimit_valkey_consecutive_failures 0",
             "sentinel_ratelimit_valkey_errors_total 0",
             "sentinel_ratelimit_valkey_timeouts_total 0",
             "sentinel_ratelimit_valkey_fallback_total 0",
@@ -873,5 +1000,199 @@ mod distributed_tests {
             _ => None,
         });
         assert_eq!(g, d);
+    }
+
+    /// A budget above the client's own per-command timeout was accepted and
+    /// had no effect: every call failed at 500ms regardless.
+    #[test]
+    fn a_timeout_beyond_the_clients_own_is_rejected() {
+        let env = |v: &'static str| {
+            move |k: &str| (k == "SENTINEL_REDIS_TIMEOUT_MS").then(|| v.to_string())
+        };
+        let max = sentinel_storage::redis::RESPONSE_TIMEOUT;
+        assert_eq!(max, Duration::from_millis(500));
+        assert_eq!(DistributedGuard::from_lookup(env("500")).timeout, max);
+        assert_eq!(
+            DistributedGuard::from_lookup(env("800")).timeout,
+            DistributedGuard::default().timeout
+        );
+    }
+
+    /// The client's own response timeout surfaces as an error from the call,
+    /// not as our deadline firing; it was counted in `errors_total`, so
+    /// /healthz and /metrics blamed errors for what was a slow Valkey.
+    #[tokio::test]
+    async fn the_clients_own_response_timeout_counts_as_a_timeout() {
+        let fake = FakeValkey::start(EvalMode::Hang).await;
+        // A budget above the client's 500ms, so the client's timer fires first
+        // (from_env no longer allows this; the fields are set directly).
+        let rl = limiter(&fake, guard(2_000, 5, COOLDOWN_MS)).await;
+        timed_check(&rl, &per_ip(100, 100)).await;
+        let st = rl.distributed_status();
+        assert_eq!((st.timeouts_total, st.errors_total), (1, 0));
+    }
+}
+
+/// The breaker state machine on its own, with its clock stepped explicitly.
+#[cfg(test)]
+mod breaker_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    fn guard(failures: u32, cooldown_ms: u64) -> DistributedGuard {
+        DistributedGuard {
+            timeout: Duration::from_millis(50),
+            failure_threshold: failures,
+            cooldown: Duration::from_millis(cooldown_ms),
+        }
+    }
+
+    /// A check admitted while the breaker was closed can complete after it
+    /// opened. Its success used to close the breaker.
+    #[test]
+    fn a_stale_success_does_not_close_an_open_breaker() {
+        let g = guard(3, 5_000);
+        let b = Breaker::new();
+        let in_flight = b.admit(g.cooldown);
+        assert_eq!(in_flight, Admission::Closed);
+        for _ in 0..3 {
+            let a = b.admit(g.cooldown);
+            b.on_failure(&g, a, true, "slow");
+        }
+        assert_eq!(b.state(), BreakerState::Open);
+
+        b.on_success(in_flight);
+        assert_eq!(b.state(), BreakerState::Open, "only the probe may close it");
+        assert_eq!(b.admit(g.cooldown), Admission::Skip);
+
+        b.advance(g.cooldown);
+        let probe = b.admit(g.cooldown);
+        assert_eq!(probe, Admission::Probe);
+        b.on_success(probe);
+        assert_eq!(b.state(), BreakerState::Closed);
+    }
+
+    /// Log lines written while `f` runs, from this thread.
+    fn captured_lines(f: impl FnOnce()) -> Vec<String> {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let out = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || out.clone())
+            .with_ansi(false)
+            .finish();
+        // tracing caches each callsite's interest globally. While only one
+        // dispatcher is registered, a callsite first hit on another test thread
+        // (no subscriber there) is cached as "never" and this thread's events
+        // from it are dropped. A second live dispatcher makes tracing ask every
+        // registered one instead.
+        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        tracing::subscriber::with_default(subscriber, f);
+        let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        text.lines().map(str::to_string).collect()
+    }
+
+    /// The flapping the reviewer modelled: Valkey answering about half the
+    /// calls within the budget, at 5k rate checks a second, each call
+    /// completing 50ms after it was admitted. When any success closed the
+    /// breaker, a minute of this opened it thousands of times and wrote a WARN
+    /// and an INFO line each time, while Valkey calls barely dropped.
+    #[test]
+    fn a_half_failing_valkey_opens_the_breaker_at_most_once_per_cooldown() {
+        let g = guard(5, 5_000);
+        let b = Breaker::new();
+        let mut rng: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut coin = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng & 1 == 0
+        };
+        let mut valkey_calls = 0u64;
+        let lines = captured_lines(|| {
+            // (completes at ms, admission, succeeds)
+            let mut in_flight: std::collections::VecDeque<(u64, Admission, bool)> =
+                Default::default();
+            for ms in 0..60_000u64 {
+                while in_flight.front().is_some_and(|c| c.0 <= ms) {
+                    let (_, a, ok) = in_flight.pop_front().unwrap();
+                    if ok {
+                        b.on_success(a);
+                    } else {
+                        b.on_failure(&g, a, true, "no reply within 50ms");
+                    }
+                }
+                for _ in 0..5 {
+                    let a = b.admit(g.cooldown);
+                    if a != Admission::Skip {
+                        valkey_calls += 1;
+                        in_flight.push_back((ms + 50, a, coin()));
+                    }
+                }
+                b.advance(Duration::from_millis(1));
+            }
+        });
+
+        let opened = b.opened_total.load(Ordering::Relaxed);
+        // Every reopen needs a probe, and a probe needs a whole cooldown.
+        assert!(opened <= 13, "opened {opened} times in a minute");
+        assert!(
+            valkey_calls < 30_000,
+            "{valkey_calls} valkey calls: an open breaker must shed load"
+        );
+        let transitions = lines
+            .iter()
+            .filter(|l| l.contains("circuit breaker"))
+            .count();
+        assert!(
+            transitions <= 14,
+            "{transitions} breaker lines in a minute:\n{}",
+            lines.join("\n")
+        );
+    }
+
+    /// Throttling must not leave the log saying the opposite of the truth: a
+    /// logged OPEN is always followed by a CLOSE when a probe succeeds, and an
+    /// unlogged reopen is reported once the breaker has stayed open a while.
+    #[test]
+    fn the_log_catches_up_with_the_breaker() {
+        let g = guard(1, 5_000);
+        let b = Breaker::new();
+        let fail = |b: &Breaker| {
+            let a = b.admit(g.cooldown);
+            b.on_failure(&g, a, false, "down");
+        };
+        let probe_ok = |b: &Breaker| {
+            b.advance(g.cooldown);
+            let a = b.admit(g.cooldown);
+            assert_eq!(a, Admission::Probe);
+            b.on_success(a);
+        };
+        let lines = captured_lines(|| {
+            fail(&b); // OPEN (logged)
+            probe_ok(&b); // CLOSE (logged)
+            fail(&b); // reopened within 10s of the last OPEN line: not logged
+            b.advance(g.cooldown);
+            fail(&b); // failed probe 10s after the OPEN line: logged now
+        });
+        let breaker: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("circuit breaker"))
+            .collect();
+        assert_eq!(breaker.len(), 3, "{breaker:#?}");
+        assert!(breaker[0].contains("OPEN"));
+        assert!(breaker[1].contains("closed"));
+        assert!(breaker[2].contains("OPEN") && breaker[2].contains("unlogged_transitions=1"));
+        assert_eq!(b.state(), BreakerState::Open);
     }
 }

@@ -33,3 +33,5 @@ bytes = { workspace = true }
 [dev-dependencies]
 # Local stub servers (fake Valkey) for the rate limiter's failure-path tests.
 sentinel-storage = { path = "../sentinel-storage", features = ["test-support"] }
+# Captures the circuit breaker's log lines in its throttling tests.
+tracing-subscriber = { workspace = true }

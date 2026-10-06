@@ -23,8 +23,10 @@ use crate::error::StorageError;
 /// TCP connect + handshake, per attempt.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 /// Per command. The request path applies its own, much shorter budget on top
-/// (see the rate limiter); this one bounds everything else.
-const RESPONSE_TIMEOUT: Duration = Duration::from_millis(500);
+/// (see the rate limiter); this one bounds everything else, and it caps that
+/// budget: a longer one could never take effect, since the command fails here
+/// first.
+pub const RESPONSE_TIMEOUT: Duration = Duration::from_millis(500);
 /// Reconnect attempts inside the manager after a dropped connection. Kept
 /// small: a command issued while reconnecting waits on the attempt, and the
 /// background connector (not the manager) is what retries indefinitely.
@@ -47,7 +49,8 @@ pub struct RedisClient {
 }
 
 /// `scheme://user:pass@host` → `scheme://***@host`, for log lines. The URL is
-/// the one place a Valkey password lives, and it was logged verbatim.
+/// the one place a Valkey password lives, and a ClickHouse URL may carry one
+/// too (`http://user:pass@clickhouse:8123/`); both were logged verbatim.
 pub fn redact_url(url: &str) -> String {
     match (url.find("://"), url.rfind('@')) {
         (Some(scheme_end), Some(at)) if at > scheme_end => {
