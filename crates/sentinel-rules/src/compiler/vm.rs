@@ -134,56 +134,49 @@ fn percent_decode(s: &str) -> String {
 
 /// Decode both standard `%XX` and Microsoft IIS-style `%uXXXX` Unicode escapes.
 /// Used by the `UrlDecodeUni` transform to match ModSecurity's `t:urlDecodeUni`.
+///
+/// One pass over the BYTES — `%XX` becomes that byte, `%uXXXX` the UTF-8 bytes
+/// of its code point, a malformed escape (or a surrogate) stays literal, and
+/// everything else is copied — then ONE lossy UTF-8 conversion. Decoding into
+/// bytes first is what keeps a multi-byte character intact whether it arrives
+/// escaped (`%C3%A9`) or raw (`é`).
+///
+/// The previous loop re-decoded the whole remainder of the value for every
+/// `%` (quadratic: minutes on a 1 MB body of `%41`), turned `%C3%A9` into
+/// `é` plus a stray U+FFFD, and pushed raw bytes as Latin-1 chars, so `é`
+/// became `Ã©` whenever the value also held a `%`. Values whose escapes decode
+/// to ASCII come out exactly as before.
 fn url_decode_uni(s: &str) -> String {
     // Fast path: if no `%`, nothing to decode.
     if !s.contains('%') {
         return s.to_owned();
     }
 
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
+    let b = s.as_bytes();
+    let hex = |i: usize| b.get(i).and_then(|&c| (c as char).to_digit(16));
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            // Check for %uXXXX (4 hex digits after 'u' or 'U').
-            if i + 5 < bytes.len()
-                && (bytes[i + 1] == b'u' || bytes[i + 1] == b'U')
-                && bytes[i + 2..i + 6].iter().all(|b| b.is_ascii_hexdigit())
-            {
-                let hex = std::str::from_utf8(&bytes[i + 2..i + 6]).unwrap_or("0000");
-                if let Ok(n) = u32::from_str_radix(hex, 16) {
-                    if let Some(ch) = char::from_u32(n) {
-                        out.push(ch);
-                        i += 6;
-                        continue;
-                    }
+    while i < b.len() {
+        if b[i] == b'%' {
+            if matches!(b.get(i + 1), Some(b'u' | b'U')) {
+                // %uXXXX — exactly four hex digits naming a scalar value.
+                let cp = (i + 2..i + 6).try_fold(0u32, |acc, j| Some((acc << 4) | hex(j)?));
+                if let Some(ch) = cp.and_then(char::from_u32) {
+                    out.extend_from_slice(ch.encode_utf8(&mut [0u8; 4]).as_bytes());
+                    i += 6;
+                    continue;
                 }
-            }
-            // Standard %XX — delegate to percent_encoding for the remainder.
-            out.push_str(
-                &percent_encoding::percent_decode_str(&s[i..])
-                    .decode_utf8_lossy()
-                    .chars()
-                    .take(1)
-                    .collect::<String>(),
-            );
-            // Advance past `%XX` (3 bytes if valid, 1 byte if not).
-            if i + 2 < bytes.len()
-                && bytes[i + 1].is_ascii_hexdigit()
-                && bytes[i + 2].is_ascii_hexdigit()
-            {
+            } else if let (Some(hi), Some(lo)) = (hex(i + 1), hex(i + 2)) {
+                out.push(((hi << 4) | lo) as u8);
                 i += 3;
-            } else {
-                out.pop();
-                out.push(bytes[i] as char);
-                i += 1;
+                continue;
             }
-        } else {
-            out.push(bytes[i] as char);
-            i += 1;
         }
+        out.push(b[i]);
+        i += 1;
     }
-    out
+    // Valid UTF-8 (the common case) is adopted without a second copy.
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 /// Parse the Cookie header into (name, value) pairs.
@@ -688,10 +681,17 @@ fn decode_xml_entities(s: &str) -> String {
     while let Some(pos) = rest.find('&') {
         out.push_str(&rest[..pos]);
         let after = &rest[pos..];
-        let Some(semi) = after.find(';') else {
-            out.push('&');
-            rest = &after[1..];
-            continue;
+        // The reference ends at the first `;` — unless another `&` comes first,
+        // and then this `&` cannot start one (no entity contains `&`). Looking
+        // for `;` alone rescanned the rest of the body for every `&`: quadratic
+        // on an XML body full of `&` with no `;`.
+        let semi = match after[1..].find([';', '&']) {
+            Some(p) if after.as_bytes()[1 + p] == b';' => 1 + p,
+            _ => {
+                out.push('&');
+                rest = &after[1..];
+                continue;
+            }
         };
         let entity = &after[1..semi];
         let decoded = match entity {
@@ -1897,10 +1897,12 @@ fn apply_transforms(mut s: String, transforms: &[Transform]) -> String {
 /// decoders that are idempotent once fully decoded, so benign text stabilises
 /// after one pass and is left unchanged. NOT used for base64/hex, where a second
 /// pass can spuriously "decode" already-plaintext into garbage.
-fn to_fixpoint(s: String, max: usize, f: impl Fn(String) -> String) -> String {
-    let mut cur = s;
+///
+/// Linear as long as `f` is: at most `max` passes, and decoding never grows
+/// the value. `f` borrows, so a pass costs one allocation, not a clone plus one.
+fn to_fixpoint(mut cur: String, max: usize, f: impl Fn(&str) -> String) -> String {
     for _ in 0..max {
-        let next = f(cur.clone());
+        let next = f(&cur);
         if next == cur {
             break;
         }
@@ -1915,7 +1917,7 @@ fn apply_single_transform(s: String, t: &Transform) -> String {
     match t {
         Transform::Lowercase => s.to_ascii_lowercase(),
         // Recursive: defeats double/triple URL-encoding evasion (%253Cscript).
-        Transform::UrlDecodeUni => to_fixpoint(s, 3, |x| url_decode_uni(&x)),
+        Transform::UrlDecodeUni => to_fixpoint(s, 3, url_decode_uni),
         Transform::RemoveNulls => s.replace('\0', ""),
         Transform::ReplaceNulls => s.replace('\0', " "),
         // Recursive: defeats nested HTML-entity encoding (&amp;#60; -> &#60; -> <).
@@ -2069,42 +2071,48 @@ fn escape_seq_decode(s: String) -> String {
 /// plus the common named entities. Previously only a fixed ~13-entry table,
 /// which let attackers evade the 39 XSS/SQLi rules that rely on this transform
 /// via arbitrary numeric entities (e.g. `&#40;` → `(`, `&#x61;` → `a`).
-fn decode_html_entities(s: String) -> String {
+///
+/// Works on the `&str` itself: every index it computes sits on an ASCII byte
+/// (`&`, `#`, a digit, `;`), so slicing never splits a character. It used to
+/// copy the value into a `Vec<char>`, then build a window `String` and try all
+/// 33 names against it for every `&` — linear, but the slowest transform by far
+/// (~0.5 s on 1 MB of `&` in the test profile).
+fn decode_html_entities(s: &str) -> String {
     if !s.contains('&') {
-        return s;
+        return s.to_owned();
     }
-    let chars: Vec<char> = s.chars().collect();
+    let b = s.as_bytes();
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
-    while i < chars.len() {
-        if chars[i] != '&' {
-            out.push(chars[i]);
-            i += 1;
-            continue;
-        }
+    while let Some(p) = s[i..].find('&') {
+        out.push_str(&s[i..i + p]);
+        i += p;
         // Numeric entity: &#DDD; (decimal) or &#xHH; / &#XHH; (hex).
-        if i + 2 < chars.len() && chars[i + 1] == '#' {
-            let (is_hex, start) = if chars[i + 2] == 'x' || chars[i + 2] == 'X' {
+        if i + 2 < b.len() && b[i + 1] == b'#' {
+            let (is_hex, start) = if matches!(b[i + 2], b'x' | b'X') {
                 (true, i + 3)
             } else {
                 (false, i + 2)
             };
-            let mut j = start;
-            while j < chars.len()
-                && ((is_hex && chars[j].is_ascii_hexdigit())
-                    || (!is_hex && chars[j].is_ascii_digit()))
-            {
-                j += 1;
-            }
-            if j > start {
-                let num: String = chars[start..j].iter().collect();
+            let digits = b[start..]
+                .iter()
+                .take_while(|c| {
+                    if is_hex {
+                        c.is_ascii_hexdigit()
+                    } else {
+                        c.is_ascii_digit()
+                    }
+                })
+                .count();
+            if digits > 0 {
+                let mut j = start + digits;
                 let radix = if is_hex { 16 } else { 10 };
-                if let Some(ch) = u32::from_str_radix(&num, radix)
+                if let Some(ch) = u32::from_str_radix(&s[start..j], radix)
                     .ok()
                     .and_then(char::from_u32)
                 {
                     out.push(ch);
-                    if j < chars.len() && chars[j] == ';' {
+                    if b.get(j) == Some(&b';') {
                         j += 1; // consume optional trailing ';'
                     }
                     i = j;
@@ -2113,10 +2121,7 @@ fn decode_html_entities(s: String) -> String {
             }
         }
         // Named entities (require the trailing ';').
-        // Window must fit the LONGEST name below (&NewLine; is 9). It was 6,
-        // which was exactly long enough for the six entities that used to be
-        // here and silently too short for anything else.
-        let window: String = chars[i..(i + 10).min(chars.len())].iter().collect();
+        //
         // HTML5 named entities for ASCII punctuation.
         //
         // This list held six entries — the ones everybody remembers — and that
@@ -2132,13 +2137,13 @@ fn decode_html_entities(s: String) -> String {
         //
         // So the entities that matter for evasion are the PUNCTUATION ones —
         // the characters that make a payload syntactically executable. They are
-        // all here now, ordered longest-first so a prefix match cannot pick a
-        // shorter name that happens to start the same way.
+        // all here now, and a name is matched whole, up to its `;`, so one that
+        // starts like another (`&comma;` / `&commat;`) cannot shadow it.
         //
         // Decoding more of them is strictly more correct, not more aggressive:
         // it makes the inspected string closer to what the browser will
         // actually execute, which is the whole purpose of the transform.
-        let named: &[(&str, char)] = &[
+        const NAMED: &[(&str, char)] = &[
             ("&NewLine;", '\n'),
             ("&percnt;", '%'),
             ("&lowbar;", '_'),
@@ -2173,14 +2178,33 @@ fn decode_html_entities(s: String) -> String {
             ("&lt;", '<'),
             ("&gt;", '>'),
         ];
-        if let Some((ent, ch)) = named.iter().find(|(ent, _)| window.starts_with(ent)) {
-            out.push(*ch);
-            i += ent.chars().count();
-            continue;
+        // A name's only `;` is its last byte, so the one candidate is the text
+        // up to the first `;`, looked for no further than the longest name.
+        // (A window shorter than that once made every name past the original
+        // six undecodable; an unbounded one would rescan the value per `&`.)
+        const LONGEST: usize = {
+            let (mut k, mut longest) = (0, 0);
+            while k < NAMED.len() {
+                if NAMED[k].0.len() > longest {
+                    longest = NAMED[k].0.len();
+                }
+                k += 1;
+            }
+            longest
+        };
+        let window = &b[i..b.len().min(i + LONGEST)];
+        if let Some(semi) = window.iter().position(|&c| c == b';') {
+            let name = &window[..=semi];
+            if let Some((_, ch)) = NAMED.iter().find(|(ent, _)| ent.as_bytes() == name) {
+                out.push(*ch);
+                i += name.len();
+                continue;
+            }
         }
         out.push('&');
         i += 1;
     }
+    out.push_str(&s[i..]);
     out
 }
 
@@ -2442,27 +2466,67 @@ fn remove_comments_char(s: String) -> String {
 }
 
 /// Remove SQL/C block comments (`/* ... */`) from input.
-fn remove_sql_comments(mut s: String) -> String {
-    while let Some(start) = s.find("/*") {
-        let end = match s[start + 2..].find("*/") {
-            Some(i) => start + 2 + i + 2,
-            None => break,
-        };
-        s = format!("{}{}", &s[..start], &s[end..]);
+///
+/// Same result as the loop this replaces — delete the leftmost complete comment,
+/// rescan from the start, stop at the first unterminated `/*` — without that
+/// loop's full rebuild per comment (quadratic: seconds on a 1 MB body of `/**/`).
+/// The rescan had one visible effect that is kept: deleting a comment can join
+/// a `/` before it to a `*` after it into a NEW opener (`/` `/**/` `*x*/` →
+/// `/*x*/` → ``), so a trailing `/` already emitted is checked first.
+fn remove_sql_comments(s: String) -> String {
+    if !s.contains("/*") {
+        return s;
     }
-    s
+    // Invariant: the string so far is `out + s[i..]`, and `out` holds no `/*`.
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    loop {
+        // (where `out` stops taking input, index just past the opener's `*`)
+        let (copy_to, body) = if out.ends_with('/') && s[i..].starts_with('*') {
+            (None, i + 1)
+        } else {
+            match s[i..].find("/*") {
+                Some(p) => (Some(i + p), i + p + 2),
+                None => break,
+            }
+        };
+        let Some(close) = s[body..].find("*/") else {
+            break; // unterminated: the rest stays as it is
+        };
+        match copy_to {
+            Some(start) => out.push_str(&s[i..start]),
+            None => {
+                out.pop(); // the `/` that opened this comment
+            }
+        }
+        i = body + close + 2;
+    }
+    out.push_str(&s[i..]);
+    out
 }
 
 /// Replace SQL/C block comments with a single space.
-fn replace_sql_comments(mut s: String) -> String {
-    while let Some(start) = s.find("/*") {
-        let end = match s[start + 2..].find("*/") {
-            Some(i) => start + 2 + i + 2,
-            None => break,
-        };
-        s = format!("{} {}", &s[..start], &s[end..]);
+///
+/// One pass, same result as the rescan loop it replaces (see
+/// [`remove_sql_comments`]). The emitted space means a deletion can never join
+/// two halves into a new opener, so no lookbehind is needed here.
+fn replace_sql_comments(s: String) -> String {
+    if !s.contains("/*") {
+        return s;
     }
-    s
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while let Some(p) = s[i..].find("/*") {
+        let start = i + p;
+        let Some(close) = s[start + 2..].find("*/") else {
+            break; // unterminated: the rest stays as it is
+        };
+        out.push_str(&s[i..start]);
+        out.push(' ');
+        i = start + 2 + close + 2;
+    }
+    out.push_str(&s[i..]);
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -3093,5 +3157,300 @@ mod encoding_validator_tests {
              must still be detectable, or the operator is inert for the targets \
              CRS 920250 names"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transform correctness and cost tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod transform_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// About 1 MB: a tenth of the default `max_body_size`, so well within what
+    /// any client can make the engine inspect.
+    const MB: usize = 1 << 20;
+
+    /// Generous for linear work on 1 MB at the test profile's opt-level (each
+    /// case takes milliseconds); the quadratic versions took seconds to minutes.
+    const BOUND: Duration = Duration::from_secs(2);
+
+    /// `unit` repeated to about 1 MB.
+    fn mb_of(unit: &str) -> String {
+        unit.repeat(MB / unit.len())
+    }
+
+    /// Whether `f`, run on a worker thread, finishes within `BOUND`. Waiting on
+    /// a channel rather than joining means a quadratic regression fails in
+    /// seconds instead of hanging the suite until it completes.
+    fn finishes_in_time(f: impl FnOnce() + Send + 'static) -> bool {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            f();
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(BOUND).is_ok()
+    }
+
+    const ALL: [Transform; 23] = [
+        Transform::Lowercase,
+        Transform::UrlDecodeUni,
+        Transform::RemoveNulls,
+        Transform::ReplaceNulls,
+        Transform::HtmlEntityDecode,
+        Transform::RemoveWhitespace,
+        Transform::CompressWhitespace,
+        Transform::JsDecode,
+        Transform::CssDecode,
+        Transform::Base64Decode,
+        Transform::HexDecode,
+        Transform::NormalisePath,
+        Transform::NormalisePathWin,
+        Transform::Trim,
+        Transform::TrimLeft,
+        Transform::TrimRight,
+        Transform::Utf8ToUnicode,
+        Transform::RemoveCommentsChar,
+        Transform::RemoveComments,
+        Transform::ReplaceComments,
+        Transform::CmdLine,
+        Transform::EscapeSeqDecode,
+        Transform::Length,
+    ];
+
+    /// Inputs that drive each transform down its escape / rescan path as often
+    /// as 1 MB allows. The match is exhaustive on purpose: a new transform has
+    /// to name its own worst case (and be added to `ALL`).
+    fn worst_cases(t: &Transform) -> Vec<String> {
+        match t {
+            Transform::UrlDecodeUni => vec![
+                mb_of("%41"),
+                mb_of("%u0041"),
+                mb_of("%"),
+                mb_of("%C3%A9é"),
+                mb_of("%2541"),
+            ],
+            Transform::HtmlEntityDecode => vec![
+                mb_of("&amp;"),
+                mb_of("&#x41;"),
+                mb_of("&"),
+                format!("&#{}", "0".repeat(MB)),
+            ],
+            Transform::JsDecode => vec![mb_of("\\u0041\\x41\\n"), mb_of("\\")],
+            Transform::CssDecode => vec![mb_of("\\41 "), mb_of("\\")],
+            Transform::EscapeSeqDecode => vec![mb_of("\\x41\\101\\n"), mb_of("\\")],
+            Transform::CmdLine => vec![mb_of("a ;\\\"^' /(,")],
+            Transform::RemoveComments | Transform::ReplaceComments => {
+                vec![mb_of("/**/"), mb_of("x/**/"), mb_of("//**/*"), mb_of("/*")]
+            }
+            Transform::RemoveCommentsChar => vec![mb_of("/**///")],
+            Transform::RemoveWhitespace | Transform::CompressWhitespace => {
+                vec![mb_of(" \t\n")]
+            }
+            Transform::Trim | Transform::TrimLeft | Transform::TrimRight => {
+                vec![mb_of(" "), mb_of(" a ")]
+            }
+            Transform::NormalisePath | Transform::NormalisePathWin => {
+                vec![mb_of("../a/./"), mb_of("a//"), mb_of("..\\a\\.\\")]
+            }
+            Transform::Base64Decode => vec![mb_of("QUJD"), format!("/{}", mb_of("QUJD"))],
+            Transform::HexDecode => vec![mb_of("41")],
+            Transform::Utf8ToUnicode => vec![mb_of("é€a")],
+            Transform::Lowercase
+            | Transform::RemoveNulls
+            | Transform::ReplaceNulls
+            | Transform::Length => vec![mb_of("A\0")],
+        }
+    }
+
+    /// The transforms run on every inspected value, so one that is not linear
+    /// in its input is a CPU-exhaustion lever for whoever sends the request.
+    /// `t:urlDecodeUni` re-decoded the rest of the value for every `%`, and
+    /// `t:removeComments` / `t:replaceComments` rebuilt it for every comment.
+    #[test]
+    fn every_transform_is_linear_on_a_megabyte() {
+        let mut slow = Vec::new();
+        for t in ALL {
+            for (case, input) in worst_cases(&t).into_iter().enumerate() {
+                let tr = t.clone();
+                if !finishes_in_time(move || drop(apply_single_transform(input, &tr))) {
+                    slow.push(format!("{t:?} case {case}"));
+                }
+            }
+        }
+        assert!(
+            slow.is_empty(),
+            "over {BOUND:?} on ~1 MB, i.e. not linear in input length: {slow:?}"
+        );
+    }
+
+    /// `%XX` is a BYTE and `%uXXXX` a code point; the text is formed once, at
+    /// the end, so a character is never split between two escapes or misread.
+    #[test]
+    fn url_decode_uni_keeps_multibyte_utf8() {
+        let d = url_decode_uni;
+        // Escaped multi-byte characters: one `é`, not `é` plus U+FFFD.
+        assert_eq!(d("caf%C3%A9"), "café");
+        assert_eq!(d("%E2%82%AC"), "€");
+        assert_eq!(d("%F0%9F%98%80"), "😀");
+        // Raw multi-byte text beside an escape is copied, not read as Latin-1
+        // (`é` came out as `Ã©` whenever the value also held a `%`).
+        assert_eq!(d("café%20au%20lait"), "café au lait");
+        assert_eq!(d("日本%2F語"), "日本/語");
+        // %uXXXX in either case, encoded as UTF-8.
+        assert_eq!(d("%u00e9%U20AC"), "é€");
+        assert_eq!(d("%u003Cscript%u003E"), "<script>");
+        // Malformed escapes stay literal; a lone surrogate is not a character.
+        assert_eq!(d("100%"), "100%");
+        assert_eq!(d("%zz%4"), "%zz%4");
+        assert_eq!(d("%u12"), "%u12");
+        assert_eq!(d("%uD800x"), "%uD800x");
+        // Bytes that are not UTF-8 become U+FFFD.
+        assert_eq!(d("a%FFb"), "a\u{FFFD}b");
+        assert_eq!(d("%C3"), "\u{FFFD}");
+        // The recursive transform unwraps double-encoded multi-byte text.
+        assert_eq!(
+            apply_transforms("caf%25C3%25A9".to_string(), &[Transform::UrlDecodeUni]),
+            "café"
+        );
+    }
+
+    /// The pre-fix decoder, verbatim: the oracle for "values whose escapes
+    /// decode to ASCII come out exactly as before".
+    fn old_url_decode_uni(s: &str) -> String {
+        if !s.contains('%') {
+            return s.to_owned();
+        }
+        let bytes = s.as_bytes();
+        let mut out = String::with_capacity(s.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' {
+                if i + 5 < bytes.len()
+                    && (bytes[i + 1] == b'u' || bytes[i + 1] == b'U')
+                    && bytes[i + 2..i + 6].iter().all(|b| b.is_ascii_hexdigit())
+                {
+                    let hex = std::str::from_utf8(&bytes[i + 2..i + 6]).unwrap_or("0000");
+                    if let Ok(n) = u32::from_str_radix(hex, 16) {
+                        if let Some(ch) = char::from_u32(n) {
+                            out.push(ch);
+                            i += 6;
+                            continue;
+                        }
+                    }
+                }
+                out.push_str(
+                    &percent_encoding::percent_decode_str(&s[i..])
+                        .decode_utf8_lossy()
+                        .chars()
+                        .take(1)
+                        .collect::<String>(),
+                );
+                if i + 2 < bytes.len()
+                    && bytes[i + 1].is_ascii_hexdigit()
+                    && bytes[i + 2].is_ascii_hexdigit()
+                {
+                    i += 3;
+                } else {
+                    out.pop();
+                    out.push(bytes[i] as char);
+                    i += 1;
+                }
+            } else {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// The pre-fix comment loops, verbatim: oracles for the one-pass versions.
+    fn old_remove_sql_comments(mut s: String) -> String {
+        while let Some(start) = s.find("/*") {
+            let end = match s[start + 2..].find("*/") {
+                Some(i) => start + 2 + i + 2,
+                None => break,
+            };
+            s = format!("{}{}", &s[..start], &s[end..]);
+        }
+        s
+    }
+
+    fn old_replace_sql_comments(mut s: String) -> String {
+        while let Some(start) = s.find("/*") {
+            let end = match s[start + 2..].find("*/") {
+                Some(i) => start + 2 + i + 2,
+                None => break,
+            };
+            s = format!("{} {}", &s[..start], &s[end..]);
+        }
+        s
+    }
+
+    /// Every string of length `0..=max` over `alphabet`.
+    fn all_strings(alphabet: &[char], max: usize) -> Vec<String> {
+        let mut layer = vec![String::new()];
+        let mut all = layer.clone();
+        for _ in 0..max {
+            layer = layer
+                .iter()
+                .flat_map(|p| alphabet.iter().map(move |c| format!("{p}{c}")))
+                .collect();
+            all.extend(layer.iter().cloned());
+        }
+        all
+    }
+
+    #[test]
+    fn url_decode_uni_is_unchanged_where_escapes_decode_to_ascii() {
+        // Hex digits 0/4/7 keep every `%XX` below 0x80, where the old decoder
+        // was right; `u`/`U` reach the %uXXXX path, `%` the malformed ones.
+        for s in all_strings(&['%', 'u', 'U', '0', '4', '7'], 7) {
+            assert_eq!(url_decode_uni(&s), old_url_decode_uni(&s), "input {s:?}");
+        }
+    }
+
+    #[test]
+    fn comment_transforms_match_the_rescan_loop() {
+        let rm = |s: &str| remove_sql_comments(s.to_owned());
+        let rp = |s: &str| replace_sql_comments(s.to_owned());
+        assert_eq!(rm("UNION/**/SELECT"), "UNIONSELECT");
+        assert_eq!(rp("UNION/**/SELECT"), "UNION SELECT");
+        assert_eq!(rm("é/*x*/ü"), "éü");
+        // Unterminated: everything from the open comment on is kept.
+        assert_eq!(rm("a/**/b/*c"), "ab/*c");
+        assert_eq!(rp("a/**/b/*c"), "a b/*c");
+        // Deleting a comment can join `/` and `*` into a new opener, which the
+        // rescan then deleted too. A space in between cannot form one.
+        assert_eq!(rm("//**/*x*/"), "");
+        assert_eq!(rp("//**/*x*/"), "/ *x*/");
+        // Exhaustive over the characters that decide it.
+        for s in all_strings(&['/', '*', 'x'], 10) {
+            assert_eq!(rm(&s), old_remove_sql_comments(s.clone()), "remove {s:?}");
+            assert_eq!(rp(&s), old_replace_sql_comments(s.clone()), "replace {s:?}");
+        }
+    }
+
+    /// XML bodies feed `ARGS`, and every `&` used to search for `;` to the end
+    /// of the value: quadratic on a body of `&` with no `;`.
+    #[test]
+    fn xml_entity_decoding_is_linear() {
+        // An `&` with another `&` before any `;` is literal, as it always was.
+        assert_eq!(decode_xml_entities("a & b &lt; c"), "a & b < c");
+        assert_eq!(decode_xml_entities("&a&lt;"), "&a<");
+        assert_eq!(decode_xml_entities("&#60&gt;"), "&#60>");
+        assert_eq!(decode_xml_entities("&&&;"), "&&&;");
+
+        let text = format!("<a>{}</a>", "&".repeat(MB));
+        let attr = format!("<a v=\"{}\"/>", mb_of("&x"));
+        for body in [text, attr] {
+            assert!(
+                finishes_in_time(move || drop(parse_xml_args(body.as_bytes()))),
+                "XML entity decoding took over {BOUND:?} on ~1 MB"
+            );
+        }
     }
 }
