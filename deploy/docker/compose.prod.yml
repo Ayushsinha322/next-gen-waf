@@ -502,6 +502,10 @@ services:
       SENTINEL_CLICKHOUSE_DB: ${CLICKHOUSE_DB}
       SENTINEL_CLICKHOUSE_USER: ${CLICKHOUSE_USER}
       SENTINEL_CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      # Deadline for each ClickHouse request (one INSERT of up to 500 rows); past
+      # it the batch is spooled and replayed on reconnect. The 2-VM overlays
+      # inherit this; raise it if the passive node's peer link is slow.
+      SENTINEL_CLICKHOUSE_TIMEOUT_SECS: ${SENTINEL_CLICKHOUSE_TIMEOUT_SECS:-10}
       # History spool. Rows ClickHouse cannot accept are written here and replayed
       # on reconnect, so an outage DELAYS the audit trail instead of erasing it.
       # It must sit on the sentinel-state volume: the spool exists to outlive the

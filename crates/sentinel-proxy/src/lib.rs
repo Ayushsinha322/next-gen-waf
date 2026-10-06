@@ -1033,17 +1033,21 @@ impl ProxyServer {
 
         let feed_cache: FeedCache = Arc::new(ArcSwap::new(Arc::new(Vec::new())));
 
-        // Connect storage backends (Redis for distributed rate limiting,
-        // ClickHouse for traffic history).  Missing/unreachable backends
-        // degrade gracefully — the rate limiter falls back to in-memory.
-        // File config first, then SENTINEL_CLICKHOUSE_*/SENTINEL_REDIS_URL env
-        // overlay so the data plane is configured identically to the Go control
-        // plane (same Secret in compose/K8s; no CH password in the proxy YAML).
+        // Storage backends (Valkey for distributed rate limiting, ClickHouse for
+        // traffic history). File config first, then SENTINEL_CLICKHOUSE_*/
+        // SENTINEL_REDIS_URL env overlay so the data plane is configured
+        // identically to the Go control plane (same Secret in compose/K8s; no CH
+        // password in the proxy YAML).
+        //
+        // Both connect in the BACKGROUND (Valkey below, once the limiter exists;
+        // ClickHouse in the history writer) and keep retrying. Awaiting them here
+        // held every listener back until they answered — forever for one that
+        // accepts TCP and never replies — and a backend down at boot stayed
+        // unused for the life of the process.
         let storage_backend_cfg =
             sentinel_storage::StorageBackendConfig::from_core(&cfg.storage).with_env_overrides();
-        let storage = sentinel_storage::StorageHandle::connect(&storage_backend_cfg).await;
-        if storage.has_redis() {
-            info!("rate limiting: distributed mode (Redis backend active)");
+        if storage_backend_cfg.redis_url.is_some() {
+            info!("rate limiting: Valkey configured — connecting in the background; in-memory limiter until it answers");
         } else {
             info!("rate limiting: in-memory mode (no Redis backend)");
         }
@@ -1082,12 +1086,21 @@ impl ProxyServer {
         // Before the spool existed this flag meant "connected", which is exactly
         // why a node with no reachable ClickHouse recorded nothing at all.
         if storage_backend_cfg.clickhouse_url.is_some() {
-            let initial = storage.clickhouse.clone();
             HISTORY_SINK_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
             let spool = open_history_spool();
             let ch_cfg = storage_backend_cfg.clone();
             tokio::spawn(async move {
-                let mut ch: Option<std::sync::Arc<sentinel_storage::ClickHouseClient>> = initial;
+                // No client yet: the first tick (immediate) connects, so boot
+                // never waits on ClickHouse. Said explicitly so that a writer
+                // started again (after a panic) does not inherit a stale
+                // "connected" at /healthz while it only spools.
+                CLICKHOUSE_CONNECTED.store(false, std::sync::atomic::Ordering::Relaxed);
+                let mut ch: Option<std::sync::Arc<sentinel_storage::ClickHouseClient>> = None;
+                // Reset by a successful write, not by a connect: see SinkRetry.
+                let mut retry = sentinel_storage::SinkRetry::new(
+                    std::time::Duration::from_secs(2),
+                    std::time::Duration::from_secs(60),
+                );
                 let mut buf: Vec<sentinel_storage::TrafficRow> = Vec::new();
                 let mut evbuf: Vec<sentinel_storage::WafEventRow> = Vec::new();
                 let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -1134,21 +1147,34 @@ impl ProxyServer {
                                     ch_cfg.clickhouse_password.clone(),
                                 );
                                 match client.ping().await {
-                                    Ok(()) => {
-                                        match client.ensure_schema().await {
-                                            Ok(()) => {
-                                                info!(url, database = db, "clickhouse connected — waf history writer enabled");
-                                                ch = Some(std::sync::Arc::new(client));
-                                            }
-                                            Err(e) => {
-                                                warn!(error = %e, "clickhouse reachable but schema init failed — retrying in 10s");
-                                                reconnect_in = 10;
-                                            }
+                                    Ok(()) => match client.ensure_schema().await {
+                                        Ok(()) => {
+                                            info!(
+                                                url = %sentinel_storage::redact_url(url),
+                                                database = db,
+                                                "clickhouse connected — waf history writer enabled"
+                                            );
+                                            ch = Some(std::sync::Arc::new(client));
+                                            retry.connected(std::time::Instant::now());
+                                            CLICKHOUSE_CONNECTED
+                                                .store(true, std::sync::atomic::Ordering::Relaxed);
                                         }
-                                    }
+                                        Err(e) => {
+                                            CLICKHOUSE_FAILURES
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            reconnect_in =
+                                                retry.failed(std::time::Instant::now()).as_secs()
+                                                    as u32;
+                                            warn!(error = %e, retry_in_secs = reconnect_in, "clickhouse reachable but schema init failed — retrying");
+                                        }
+                                    },
                                     Err(e) => {
-                                        warn!(error = %e, "clickhouse unreachable — spooling waf history to disk, retrying in 10s");
-                                        reconnect_in = 10;
+                                        CLICKHOUSE_FAILURES
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        reconnect_in =
+                                            retry.failed(std::time::Instant::now()).as_secs()
+                                                as u32;
+                                        warn!(error = %e, retry_in_secs = reconnect_in, "clickhouse unreachable — spooling waf history to disk, retrying");
                                     }
                                 }
                             }
@@ -1184,24 +1210,31 @@ impl ProxyServer {
                             }
                         }
 
+                        // A batch goes in as several requests; on a failure
+                        // only the rows not yet accepted are spooled, so the
+                        // retry does not insert the accepted ones again.
                         if !conn_lost && (time_due || buf.len() >= 500) && !buf.is_empty() {
                             if let Err(e) = client.insert_traffic_batch(&buf).await {
-                                warn!(error = %e, rows = buf.len(), "clickhouse traffic flush failed — spooling batch, will reconnect");
-                                bytes_since_cap += spool_batch(spool.as_ref(), "traffic", &buf);
+                                warn!(error = %e, rows = buf.len() - e.inserted, "clickhouse traffic flush failed — spooling the unsent rows, will reconnect");
+                                bytes_since_cap +=
+                                    spool_batch(spool.as_ref(), "traffic", &buf[e.inserted..]);
                                 conn_lost = true;
                             } else {
                                 debug!(rows = buf.len(), "clickhouse traffic flushed");
+                                retry.wrote();
                             }
                             buf.clear();
                         }
 
                         if !conn_lost && (time_due || evbuf.len() >= 500) && !evbuf.is_empty() {
                             if let Err(e) = client.insert_events_batch(&evbuf).await {
-                                warn!(error = %e, rows = evbuf.len(), "clickhouse events flush failed — spooling batch, will reconnect");
-                                bytes_since_cap += spool_batch(spool.as_ref(), "events", &evbuf);
+                                warn!(error = %e, rows = evbuf.len() - e.inserted, "clickhouse events flush failed — spooling the unsent rows, will reconnect");
+                                bytes_since_cap +=
+                                    spool_batch(spool.as_ref(), "events", &evbuf[e.inserted..]);
                                 conn_lost = true;
                             } else {
                                 debug!(rows = evbuf.len(), "clickhouse events flushed");
+                                retry.wrote();
                             }
                             evbuf.clear();
                         }
@@ -1219,7 +1252,9 @@ impl ProxyServer {
                             buf.clear();
                             evbuf.clear();
                             ch = None;
-                            reconnect_in = 5;
+                            CLICKHOUSE_CONNECTED.store(false, std::sync::atomic::Ordering::Relaxed);
+                            CLICKHOUSE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            reconnect_in = retry.failed(std::time::Instant::now()).as_secs() as u32;
                         }
                     } else if ticks_disconnected >= SPOOL_FLUSH_TICKS
                         || buf.len() >= 500
@@ -1279,7 +1314,11 @@ impl ProxyServer {
         let modules = Arc::new(ModulesState {
             ip_rep: ArcSwap::new(Arc::new(build_ip_reputation(&cfg, &[]))),
             ip_rep_sites: ArcSwap::new(Arc::new(build_site_ip_reputation(&cfg))),
-            rate_limiter: RateLimiter::with_redis(storage.redis.clone()),
+            rate_limiter: if storage_backend_cfg.redis_url.is_some() {
+                RateLimiter::distributed(sentinel_modules::DistributedGuard::from_env())
+            } else {
+                RateLimiter::new()
+            },
             bot_detector: ArcSwap::new(Arc::new(BotDetector::new())),
             goodbot: goodbot::GoodBotVerifier::new(),
             geoip_map: ArcSwap::new(Arc::new(build_geoip_map(&cfg))),
@@ -1289,6 +1328,22 @@ impl ProxyServer {
             threat_intel: ArcSwap::new(Arc::new(ThreatFeed::empty())),
             jwks: jwks::JwksCache::new(),
         });
+
+        // Valkey connects in the background, retrying until it answers, and is
+        // bound into the limiter then; until that moment rate checks use the
+        // in-memory limiter. /healthz storage.valkey shows which.
+        if let Some(url) = storage_backend_cfg.redis_url.clone() {
+            let modules_ref = Arc::clone(&modules);
+            tokio::spawn(async move {
+                let client = sentinel_storage::RedisClient::connect_with_retry(
+                    &url,
+                    sentinel_storage::Backoff::new(Duration::from_secs(1), Duration::from_secs(30)),
+                )
+                .await;
+                modules_ref.rate_limiter.bind_redis(Arc::new(client));
+                info!("rate limiting: distributed mode (Valkey backend connected)");
+            });
+        }
 
         let (plugin_runtime, manifest_plugins) = build_plugin_runtime(&cfg).unwrap_or_else(|e| {
             warn!("failed to load plugins: {e:#}");
@@ -2850,7 +2905,7 @@ async fn handle_request(
     // this is internal-only (no auth) and expected to be network-restricted;
     // it is served on every listener, including the management endpoint.
     if req.method() == http::Method::GET && req.uri().path() == "/metrics" {
-        return Ok(metrics_response());
+        return Ok(metrics_response(&state.modules.rate_limiter));
     }
 
     // Management listener: this is the dedicated admin-console endpoint. It
@@ -8501,6 +8556,9 @@ async fn health_response(state: &ServerState) -> Response<BoxBody> {
         // silently incomplete audit trail is the failure this counter exists to
         // make visible.
         "history_shed": history_shed_total(),
+        // Valkey and ClickHouse connect in the background and are retried, so
+        // the node serves without them; this says whether they are in use.
+        "storage": storage_status(&state.modules.rate_limiter),
         // The eBPF/XDP data path, and specifically whether the KERNEL path is
         // live. This exists because kernel XDP had never once loaded on any
         // deployment — the embedded object was rejected before it reached the
@@ -9427,7 +9485,7 @@ fn error_response(status: StatusCode, message: &str) -> Response<BoxBody> {
 /// `GET /metrics` — the global WAF metrics registry rendered in Prometheus text
 /// exposition format. Content-Type follows the Prometheus text format spec so
 /// scrapers parse it without a manual override.
-fn metrics_response() -> Response<BoxBody> {
+fn metrics_response(rate_limiter: &RateLimiter) -> Response<BoxBody> {
     Response::builder()
         .status(StatusCode::OK)
         .header(
@@ -9435,7 +9493,15 @@ fn metrics_response() -> Response<BoxBody> {
             "text/plain; version=0.0.4; charset=utf-8",
         )
         .body(full_body(Bytes::from(
-            prometheus_text() + &siem_metrics_text() + &ip_feed::metrics_text(),
+            prometheus_text()
+                + &siem_metrics_text()
+                + &ip_feed::metrics_text()
+                + &rate_limiter.prometheus_text()
+                + &history_sink_metrics_text(
+                    HISTORY_SINK_ACTIVE.load(std::sync::atomic::Ordering::Relaxed),
+                    CLICKHOUSE_CONNECTED.load(std::sync::atomic::Ordering::Relaxed),
+                    CLICKHOUSE_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
+                ),
         )))
         .unwrap()
 }
@@ -9712,6 +9778,50 @@ static WAF_EVENTS: std::sync::OnceLock<std::sync::Mutex<Vec<sentinel_storage::Wa
 /// by the spool's own cap.
 static HISTORY_SINK_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the history writer currently holds a working ClickHouse client —
+/// the "sink is reachable" fact `HISTORY_SINK_ACTIVE` deliberately is not.
+/// ClickHouse connects in the background now, so startup no longer logs whether
+/// it came up; /healthz reports this instead.
+static CLICKHOUSE_CONNECTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// ClickHouse connect attempts and write cycles that failed or timed out (each
+/// one drops the client and spools until the next connect).
+static CLICKHOUSE_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Storage dependencies for /healthz: what rate checks are really using, and
+/// whether history is reaching ClickHouse or only the spool.
+fn storage_status(rate_limiter: &RateLimiter) -> serde_json::Value {
+    serde_json::json!({
+        "valkey": rate_limiter.distributed_status(),
+        "clickhouse": {
+            "configured": HISTORY_SINK_ACTIVE.load(std::sync::atomic::Ordering::Relaxed),
+            "connected": CLICKHOUSE_CONNECTED.load(std::sync::atomic::Ordering::Relaxed),
+            "failures_total": CLICKHOUSE_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
+        },
+    })
+}
+
+/// The history sink's state for /metrics, so a writer that has been spooling
+/// for hours can be alerted on from Prometheus, not only seen at /healthz.
+/// Empty when no ClickHouse is configured (a permanently-zero `connected`
+/// series would read as an outage).
+fn history_sink_metrics_text(configured: bool, connected: bool, failures: u64) -> String {
+    if !configured {
+        return String::new();
+    }
+    format!(
+        "# HELP sentinel_history_clickhouse_connected History writer holds a working ClickHouse client (1) or is spooling to disk (0)\n\
+         # TYPE sentinel_history_clickhouse_connected gauge\n\
+         sentinel_history_clickhouse_connected {}\n\
+         # HELP sentinel_history_clickhouse_failures_total ClickHouse connects and writes that failed or timed out\n\
+         # TYPE sentinel_history_clickhouse_failures_total counter\n\
+         sentinel_history_clickhouse_failures_total {}\n",
+        u8::from(connected),
+        failures,
+    )
+}
 
 /// Cap on buffered-but-unflushed events, bounding memory when the sink is slow
 /// or unreachable. At ~200 bytes a row this is a few MB.
@@ -9991,6 +10101,10 @@ fn open_history_spool() -> Option<sentinel_storage::Spool> {
 }
 
 /// Append a batch to the spool, returning bytes written (0 if empty or no spool).
+///
+/// One segment per INSERT-sized chunk: a segment is replayed as a unit, and a
+/// whole 20k-row drain in one segment was the request that outgrew the
+/// ClickHouse deadline on every reconnect.
 fn spool_batch<T: serde::Serialize>(
     spool: Option<&sentinel_storage::Spool>,
     kind: &str,
@@ -10007,16 +10121,19 @@ fn spool_batch<T: serde::Serialize>(
         );
         return 0;
     };
-    match sp.append(kind, rows) {
-        Ok(bytes) => {
-            debug!(kind, rows = rows.len(), bytes, "history spooled to disk");
-            bytes
-        }
-        Err(e) => {
-            warn!(error = %e, kind, rows = rows.len(), "history spool write failed — batch lost");
-            0
+    let mut written = 0;
+    for chunk in rows.chunks(sentinel_storage::clickhouse::MAX_INSERT_ROWS) {
+        match sp.append(kind, chunk) {
+            Ok(bytes) => {
+                debug!(kind, rows = chunk.len(), bytes, "history spooled to disk");
+                written += bytes;
+            }
+            Err(e) => {
+                warn!(error = %e, kind, rows = chunk.len(), "history spool write failed — batch lost");
+            }
         }
     }
+    written
 }
 
 /// Replay spooled segments, oldest first, deleting each only after ClickHouse
@@ -10029,31 +10146,57 @@ async fn replay_history_spool(
     sp: &sentinel_storage::Spool,
     client: &sentinel_storage::ClickHouseClient,
 ) -> bool {
-    // Bounded per tick so a large backlog can never stall the loop (which also
-    // samples traffic every second) or starve live rows behind an hour of replay.
-    const MAX_SEGMENTS_PER_TICK: usize = 20;
+    replay_spool_kind::<sentinel_storage::TrafficRow>(sp, client, "traffic").await
+        && replay_spool_kind::<sentinel_storage::WafEventRow>(sp, client, "events").await
+}
 
-    for path in sp
-        .segments("traffic")
-        .into_iter()
-        .take(MAX_SEGMENTS_PER_TICK)
-    {
-        match sentinel_storage::Spool::load::<sentinel_storage::TrafficRow>(&path) {
+/// [`replay_history_spool`] for one kind of row.
+///
+/// A segment that goes in part-way (the client splits it into INSERT-sized
+/// requests) is rewritten to the rows not yet accepted, so a retry does not
+/// insert the accepted ones again: MergeTree does not de-duplicate, and a
+/// segment that failed whole on every reconnect added another copy each time.
+async fn replay_spool_kind<T>(
+    sp: &sentinel_storage::Spool,
+    client: &sentinel_storage::ClickHouseClient,
+    kind: &str,
+) -> bool
+where
+    T: sentinel_storage::InsertRow + serde::de::DeserializeOwned,
+{
+    // Bounded per tick so a large backlog can never stall the loop (which also
+    // samples traffic every second) or starve live rows behind an hour of
+    // replay. Rows as well as segments: segments written before they were
+    // capped at an INSERT's size can hold a whole 20k-row drain.
+    const MAX_SEGMENTS_PER_TICK: usize = 20;
+    const MAX_ROWS_PER_TICK: usize = 20 * sentinel_storage::clickhouse::MAX_INSERT_ROWS;
+
+    let mut budget = MAX_ROWS_PER_TICK;
+    for path in sp.segments(kind).into_iter().take(MAX_SEGMENTS_PER_TICK) {
+        if budget == 0 {
+            break;
+        }
+        match sentinel_storage::Spool::load::<T>(&path) {
             Ok((rows, skipped)) => {
                 if skipped > 0 {
-                    warn!(path = %path.display(), skipped, "history spool: unparseable traffic lines skipped");
+                    warn!(path = %path.display(), kind, skipped, "history spool: unparseable lines skipped");
                 }
                 if rows.is_empty() {
                     sentinel_storage::Spool::remove(&path);
                     continue;
                 }
-                match client.insert_traffic_batch(&rows).await {
+                let take = rows.len().min(budget);
+                match client.insert_rows(&rows[..take]).await {
                     Ok(()) => {
-                        info!(rows = rows.len(), "history spool: replayed traffic batch");
-                        sentinel_storage::Spool::remove(&path);
+                        info!(kind, rows = take, "history spool: replayed batch");
+                        budget -= take;
+                        keep_unreplayed(&path, &rows[take..]);
                     }
                     Err(e) => {
-                        warn!(error = %e, "history spool: traffic replay failed — keeping segment, will retry");
+                        warn!(error = %e, kind, "history spool: replay failed — keeping the unreplayed rows, will retry");
+                        if e.inserted > 0 {
+                            keep_unreplayed(&path, &rows[e.inserted..]);
+                        }
                         return false;
                     }
                 }
@@ -10066,39 +10209,16 @@ async fn replay_history_spool(
             }
         }
     }
-
-    for path in sp
-        .segments("events")
-        .into_iter()
-        .take(MAX_SEGMENTS_PER_TICK)
-    {
-        match sentinel_storage::Spool::load::<sentinel_storage::WafEventRow>(&path) {
-            Ok((rows, skipped)) => {
-                if skipped > 0 {
-                    warn!(path = %path.display(), skipped, "history spool: unparseable event lines skipped");
-                }
-                if rows.is_empty() {
-                    sentinel_storage::Spool::remove(&path);
-                    continue;
-                }
-                match client.insert_events_batch(&rows).await {
-                    Ok(()) => {
-                        info!(rows = rows.len(), "history spool: replayed events batch");
-                        sentinel_storage::Spool::remove(&path);
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "history spool: events replay failed — keeping segment, will retry");
-                        return false;
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, path = %path.display(), "history spool: segment unreadable — skipping");
-            }
-        }
-    }
-
     true
+}
+
+/// Shrink a replayed segment to `rest`, or remove it when nothing is left. A
+/// failed rewrite leaves the segment whole: its accepted rows are sent again
+/// (duplicates, the at-least-once side), never lost.
+fn keep_unreplayed<T: serde::Serialize>(path: &std::path::Path, rest: &[T]) {
+    if let Err(e) = sentinel_storage::Spool::rewrite(path, rest) {
+        warn!(error = %e, path = %path.display(), "history spool: could not trim a replayed segment — its replayed rows will be sent again");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -11894,7 +12014,7 @@ mod metrics_endpoint_tests {
         // Exercise the hot-path counters so the registry has real content.
         inc_requests();
         inc_rule_hits();
-        let resp = metrics_response();
+        let resp = metrics_response(&RateLimiter::new());
         assert_eq!(resp.status(), StatusCode::OK);
         let ct = resp
             .headers()
@@ -11913,6 +12033,190 @@ mod metrics_endpoint_tests {
         assert!(text.contains("sentinel_requests_total"));
         assert!(text.contains("sentinel_rule_hits_total"));
         assert!(text.contains("# TYPE sentinel_requests_total counter"));
+    }
+
+    #[tokio::test]
+    async fn metrics_include_the_valkey_breaker_when_valkey_is_configured() {
+        let rl = RateLimiter::distributed(sentinel_modules::DistributedGuard::default());
+        let body = metrics_response(&rl).into_body().collect().await.unwrap();
+        let text = String::from_utf8(body.to_bytes().to_vec()).unwrap();
+        assert!(text.contains("sentinel_ratelimit_valkey_client_bound 0"));
+        assert!(text.contains("sentinel_ratelimit_valkey_breaker_open 0"));
+    }
+
+    /// ClickHouse state was only in /healthz JSON; a writer spooling for hours
+    /// was invisible to a Prometheus alert.
+    #[test]
+    fn history_sink_series_only_when_clickhouse_is_configured() {
+        assert_eq!(history_sink_metrics_text(false, false, 0), "");
+        let text = history_sink_metrics_text(true, false, 7);
+        assert!(
+            text.contains("sentinel_history_clickhouse_connected 0"),
+            "{text}"
+        );
+        assert!(
+            text.contains("sentinel_history_clickhouse_failures_total 7"),
+            "{text}"
+        );
+        assert!(history_sink_metrics_text(true, true, 0)
+            .contains("sentinel_history_clickhouse_connected 1"));
+    }
+}
+
+#[cfg(test)]
+mod storage_dependency_tests {
+    use super::*;
+
+    /// Storage connects in the background now, so /healthz is where an operator
+    /// learns whether rate limits are cluster-wide and history reaches ClickHouse.
+    #[test]
+    fn healthz_storage_reports_what_rate_checks_really_use() {
+        let v = storage_status(&RateLimiter::new());
+        assert_eq!(v["valkey"]["configured"], false);
+        assert_eq!(v["valkey"]["mode"], "in_memory");
+        assert!(v["clickhouse"]["configured"].is_boolean());
+        assert!(v["clickhouse"]["connected"].is_boolean());
+        assert!(v["clickhouse"]["failures_total"].is_u64());
+
+        let v = storage_status(&RateLimiter::distributed(
+            sentinel_modules::DistributedGuard::default(),
+        ));
+        assert_eq!(v["valkey"]["configured"], true);
+        assert_eq!(v["valkey"]["client_bound"], false);
+        assert_eq!(v["valkey"]["mode"], "in_memory_fallback");
+        assert_eq!(v["valkey"]["breaker"], "closed");
+        assert_eq!(v["valkey"]["timeout_ms"], 50);
+    }
+
+    /// A ClickHouse that accepts and never replies must be a failed replay —
+    /// segment kept for the next attempt, writer free to carry on — not a
+    /// writer stuck on the first insert for good.
+    #[tokio::test]
+    async fn spool_replay_against_a_mute_clickhouse_fails_and_keeps_the_segment() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        let dir = std::env::temp_dir().join(format!(
+            "sk-spool-mute-ch-{}-{}",
+            std::process::id(),
+            unix_now()
+        ));
+        let sp = sentinel_storage::Spool::open(&dir, 1 << 20).unwrap();
+        let row = sentinel_storage::TrafficRow {
+            ts: 1_700_000_000,
+            tenant: "t".into(),
+            site_id: "s".into(),
+            reqs: 1,
+            blocked: 0,
+            p99_ms: 1.0,
+        };
+        sp.append("traffic", &[row]).unwrap();
+
+        let client = sentinel_storage::ClickHouseClient::new(&format!("http://{addr}"), "db")
+            .with_request_timeout(Duration::from_millis(300));
+        let ok = tokio::time::timeout(Duration::from_secs(5), replay_history_spool(&sp, &client))
+            .await
+            .expect("spool replay hung on a ClickHouse that never replies");
+        assert!(!ok, "a timed-out insert is a sink failure");
+        assert_eq!(sp.segments("traffic").len(), 1, "the segment must survive");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn spool_dir(tag: &str) -> sentinel_storage::Spool {
+        let dir = std::env::temp_dir().join(format!(
+            "sk-spool-{tag}-{}-{}",
+            std::process::id(),
+            unix_now()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        sentinel_storage::Spool::open(&dir, 1 << 30).unwrap()
+    }
+
+    fn traffic_rows(n: usize) -> Vec<sentinel_storage::TrafficRow> {
+        (0..n as i64)
+            .map(|i| sentinel_storage::TrafficRow {
+                ts: 1_700_000_000 + i,
+                tenant: "t".into(),
+                site_id: "s".into(),
+                reqs: 1,
+                blocked: 0,
+                p99_ms: 1.0,
+            })
+            .collect()
+    }
+
+    fn spooled_rows(sp: &sentinel_storage::Spool, kind: &str) -> Vec<usize> {
+        sp.segments(kind)
+            .iter()
+            .map(|p| {
+                sentinel_storage::Spool::load::<sentinel_storage::TrafficRow>(p)
+                    .unwrap()
+                    .0
+                    .len()
+            })
+            .collect()
+    }
+
+    /// Spooled while ClickHouse is down, a 20k-row drain became ONE segment,
+    /// replayed as one request on every reconnect.
+    #[test]
+    fn spooling_writes_insert_sized_segments() {
+        let sp = spool_dir("chunks");
+        spool_batch(Some(&sp), "traffic", &traffic_rows(1_200));
+        assert_eq!(spooled_rows(&sp, "traffic"), vec![500, 500, 200]);
+        let _ = std::fs::remove_dir_all(sp.dir());
+    }
+
+    /// The reviewer's loop: a ClickHouse slow enough that an oversized insert
+    /// misses the client's deadline still commits it, the segment is kept,
+    /// and every reconnect replays it whole — another copy each time, and the
+    /// spool never drains. Sent in INSERT-sized requests it goes in once.
+    #[tokio::test]
+    async fn an_oversized_segment_replays_once_against_a_slow_clickhouse() {
+        use sentinel_storage::testing::{FakeClickHouse, InsertMode};
+        // Commits any insert above 500 rows but answers it too late.
+        let ch = FakeClickHouse::start(InsertMode::CommitSilentlyAbove(500)).await;
+        let client = sentinel_storage::ClickHouseClient::new(&ch.url(), "db")
+            .with_request_timeout(Duration::from_millis(300));
+        let sp = spool_dir("oversized");
+        // A segment from before segments were capped: one whole drain.
+        sp.append("traffic", &traffic_rows(1_200)).unwrap();
+
+        for _ in 0..2 {
+            let _ =
+                tokio::time::timeout(Duration::from_secs(5), replay_history_spool(&sp, &client))
+                    .await
+                    .expect("replay hung");
+        }
+        assert_eq!(ch.committed_rows(), 1_200, "inserts {:?}", ch.inserts());
+        assert!(sp.segments("traffic").is_empty(), "the segment must drain");
+        let _ = std::fs::remove_dir_all(sp.dir());
+    }
+
+    /// A replay that fails part-way keeps only what did not go in.
+    #[tokio::test]
+    async fn a_replay_that_fails_part_way_keeps_only_the_unreplayed_rows() {
+        use sentinel_storage::testing::{FakeClickHouse, InsertMode};
+        let sp = spool_dir("partial");
+        sp.append("traffic", &traffic_rows(1_200)).unwrap();
+
+        let flaky = FakeClickHouse::start(InsertMode::RejectAfter(1_000)).await;
+        let client = sentinel_storage::ClickHouseClient::new(&flaky.url(), "db");
+        assert!(!replay_history_spool(&sp, &client).await);
+        assert_eq!(flaky.committed_rows(), 1_000);
+        assert_eq!(spooled_rows(&sp, "traffic"), vec![200]);
+
+        let healthy = FakeClickHouse::start(InsertMode::Accept).await;
+        let client = sentinel_storage::ClickHouseClient::new(&healthy.url(), "db");
+        assert!(replay_history_spool(&sp, &client).await);
+        assert_eq!(healthy.committed_rows(), 200, "no row sent twice");
+        assert!(sp.segments("traffic").is_empty());
+        let _ = std::fs::remove_dir_all(sp.dir());
     }
 }
 

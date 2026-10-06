@@ -15,9 +15,10 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 
 redis = { workspace = true }
-# Pin url to 2.4.x to prevent url 2.5.x from pulling icu_* crates that
-# require Rust 1.86. Redis only needs url ^2.1 so 2.4.1 satisfies it.
-url = ">=2.4.0, <2.5.0"
+# Pin url below 2.5.3: from 2.5.3 url moved to idna 1.x, which pulls icu_*
+# crates that require Rust 1.86. redis 1.2 needs url ^2.5, and 2.5.2 still uses
+# idna 0.5 (no ICU).
+url = ">=2.5.0, <2.5.3"
 
 # ClickHouse HTTP client — use hyper (already in workspace) to avoid reqwest
 # pulling icu_* crates that require Rust ≥ 1.86.
@@ -42,5 +43,11 @@ rustls-pki-types = "1"
 # tests and any binary that is not sentinel-bin.
 webpki-roots = "1"
 
+[features]
+# Exposes `sentinel_storage::testing` (local stub servers) to dependants' tests.
+test-support = []
+
 [dev-dependencies]
 tokio-test = { workspace = true }
+# Captures log output, to check that connection URLs are logged redacted.
+tracing-subscriber = { workspace = true }

@@ -73,9 +73,18 @@ spec:
             - { name: RUST_LOG, value: "info" }
             # Shared rate-limit state so limits are fleet-wide (points at the HA Redis).
             - { name: SENTINEL_REDIS_URL, value: "redis://sentinel-redis:6379" }
+            # Valkey on the request path: per-check budget (1..500 ms), then the
+            # per-node limiter answers; the breaker skips Valkey for the cooldown
+            # after that many failures in a row.
+            - { name: SENTINEL_REDIS_TIMEOUT_MS, value: "50" }
+            - { name: SENTINEL_REDIS_BREAKER_FAILURES, value: "5" }
+            - { name: SENTINEL_REDIS_BREAKER_COOLDOWN_MS, value: "5000" }
             # ClickHouse writer: the data plane bulk-inserts traffic + WAF events
             # (creates the schema on first connect). Powers Threat Search history.
             - { name: SENTINEL_CLICKHOUSE_URL, value: "http://sentinel-clickhouse:8123" }
+            # Per-request deadline (one INSERT of up to 500 rows); past it the
+            # batch is spooled and replayed on reconnect.
+            - { name: SENTINEL_CLICKHOUSE_TIMEOUT_SECS, value: "10" }
             - { name: SENTINEL_CLICKHOUSE_DB, value: "sentinel_logs" }
             - { name: SENTINEL_CLICKHOUSE_USER, value: "sentinel" }
             - name: SENTINEL_CLICKHOUSE_PASSWORD

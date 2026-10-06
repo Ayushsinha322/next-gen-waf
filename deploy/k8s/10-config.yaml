@@ -64,6 +64,9 @@ data:
   # READS. Password comes from the Secret (SENTINEL_CLICKHOUSE_PASSWORD).
   SENTINEL_CLICKHOUSE_URL: http://clickhouse:8123
   SENTINEL_CLICKHOUSE_DB: sentinel_logs
+  # Data-plane writer: deadline for each ClickHouse request (one INSERT of up to
+  # 500 rows); past it the batch is spooled and replayed on reconnect.
+  SENTINEL_CLICKHOUSE_TIMEOUT_SECS: "10"
   SENTINEL_CLICKHOUSE_USER: sentinel
 ---
 apiVersion: v1

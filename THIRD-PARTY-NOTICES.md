@@ -9,7 +9,7 @@ re-runs during packaging. Run it after changing a dependency. Do not edit by han
 It records what each component **declares** in its own manifest. It is an
 attribution inventory, not a legal review.
 
-**427 redistributed components** across Rust, Go, npm and container images.
+**432 redistributed components** across Rust, Go, npm and container images.
 A further 104 Rust crates and 399 npm packages are
 build- or development-only: they are compiled or installed here but never
 shipped, and are listed separately at the end so the two are never confused.
@@ -28,9 +28,9 @@ the OWASP Core Rule Set keeps its own copy at `rules/owasp-crs/LICENSE`.
 
 ## Rust crates (data plane)
 Reachable through normal (non-dev, non-build) edges from a shipped binary, so these are compiled into what customers run. Workspace members excluded.
-**276 components.**
+**281 components.**
 
-### MIT OR Apache-2.0 — 146 component(s)
+### MIT OR Apache-2.0 — 145 component(s)
 - ahash 0.8.12
 - anstream 1.0.0
 - anstyle 1.0.14
@@ -95,7 +95,7 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - httparse 1.10.1
 - httpdate 1.0.3
 - iana-time-zone 0.1.65
-- idna 0.4.0
+- idna 0.5.0
 - ipnet 2.12.0
 - ipnetwork 0.20.0
 - is_terminal_polyfill 1.70.2
@@ -149,7 +149,6 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - sha2 0.10.9
 - signal-hook-registry 1.4.8
 - smallvec 1.15.1
-- socket2 0.4.10
 - socket2 0.6.3
 - sptr 0.3.2
 - syn 2.0.117
@@ -173,12 +172,12 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - unicode-width 0.2.2
 - unicode-xid 0.2.6
 - ureq 2.9.7
-- url 2.4.1
+- url 2.5.2
 - xattr 1.6.1
 - yasna 0.5.2
 - zstd-safe 7.2.4
 
-### MIT — 41 component(s)
+### MIT — 40 component(s)
 - bytes 1.11.1
 - combine 4.6.7
 - dashmap 6.1.0
@@ -204,7 +203,6 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - strsim 0.11.1
 - tokio 1.52.3
 - tokio-macros 2.7.0
-- tokio-retry 0.3.1
 - tokio-util 0.7.18
 - tower-layer 0.3.3
 - tower-service 0.3.3
@@ -248,13 +246,17 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - wasmtime-versioned-export-macros 25.0.3
 - wasmtime-wit-bindgen 25.0.3
 
-### Apache-2.0 OR MIT — 11 component(s)
+### Apache-2.0 OR MIT — 15 component(s)
 - addr2line 0.22.0
+- async-lock 3.4.2
 - atomic-waker 1.1.2
 - equivalent 1.0.2
+- event-listener 5.4.2
+- event-listener-strategy 0.5.4
 - fastrand 2.4.1
 - indexmap 2.14.0
 - object 0.36.7
+- parking 2.2.1
 - pin-project-lite 0.2.17
 - rustc-hash 2.1.2
 - utf8parse 0.2.2
@@ -296,7 +298,7 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 
 ### BSD-3-Clause — 4 component(s)
 - libinjectionrs 0.1.1
-- redis 0.24.1
+- redis 1.2.2
 - sha1_smol 1.0.1
 - subtle 2.6.1
 
@@ -305,6 +307,10 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - byteorder 1.5.0
 - memchr 2.8.0
 - termcolor 1.4.1
+
+### Apache-2.0 — 2 component(s)
+- backon 1.6.0
+- debugid 0.8.0
 
 ### CDLA-Permissive-2.0 — 2 component(s)
 - webpki-roots 0.26.11
@@ -327,9 +333,6 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 ### 0BSD OR MIT OR Apache-2.0 — 1 component(s)
 - adler2 2.0.1
 
-### Apache-2.0 — 1 component(s)
-- debugid 0.8.0
-
 ### Apache-2.0 / MIT — 1 component(s)
 - fnv 1.0.7
 
@@ -339,11 +342,17 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 ### Apache-2.0 OR BSL-1.0 — 1 component(s)
 - ryu 1.0.23
 
+### Apache-2.0 OR MIT OR Zlib — 1 component(s)
+- arcstr 1.2.0
+
 ### Apache-2.0/MIT — 1 component(s)
 - fxhash 0.2.1
 
 ### BSD-2-Clause OR Apache-2.0 OR MIT — 1 component(s)
 - zerocopy 0.8.48
+
+### BSL-1.0 — 1 component(s)
+- xxhash-rust 0.8.19
 
 ### ISC AND (Apache-2.0 OR ISC) — 1 component(s)
 - aws-lc-rs 1.16.3

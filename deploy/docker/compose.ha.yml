@@ -118,7 +118,17 @@ x-wafnode: &wafnode
     SENTINEL_INTERNAL_SECRET: ${SENTINEL_INTERNAL_SECRET}
     # Shared rate-limit state across the fleet (distributed sliding window).
     SENTINEL_REDIS_URL: redis://redis:6379
+    # Valkey on the request path: each rate check waits at most this long
+    # (1..500 ms), then answers from the per-node limiter. After BREAKER_FAILURES
+    # failures in a row, Valkey is skipped for BREAKER_COOLDOWN_MS. Raise the
+    # timeout if the Valkey round trip is near 50 ms, or the breaker stays open.
+    SENTINEL_REDIS_TIMEOUT_MS: ${SENTINEL_REDIS_TIMEOUT_MS:-50}
+    SENTINEL_REDIS_BREAKER_FAILURES: ${SENTINEL_REDIS_BREAKER_FAILURES:-5}
+    SENTINEL_REDIS_BREAKER_COOLDOWN_MS: ${SENTINEL_REDIS_BREAKER_COOLDOWN_MS:-5000}
     SENTINEL_CLICKHOUSE_URL: http://clickhouse:8123
+    # Deadline for each ClickHouse request (one INSERT of up to 500 rows); past
+    # it the batch is spooled to disk and replayed on reconnect.
+    SENTINEL_CLICKHOUSE_TIMEOUT_SECS: ${SENTINEL_CLICKHOUSE_TIMEOUT_SECS:-10}
     SENTINEL_CLICKHOUSE_DB: ${CLICKHOUSE_DB}
     SENTINEL_CLICKHOUSE_USER: ${CLICKHOUSE_USER}
     SENTINEL_CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
