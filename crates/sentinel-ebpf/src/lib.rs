@@ -637,6 +637,48 @@ pub struct EbpfManager {
     kernel: Option<Arc<kernel_xdp::XdpKernel>>,
 }
 
+/// What the stats task reads and updates, apart from the manager, so
+/// [`EbpfManager::start`] can move it into its task.
+struct StatsTask {
+    running: Arc<AtomicBool>,
+    stats: Arc<AtomicStats>,
+    blocklist: Arc<RwLock<Blocklist>>,
+    mode: EbpfMode,
+    #[cfg(feature = "kernel")]
+    kernel: Option<Arc<kernel_xdp::XdpKernel>>,
+}
+
+impl StatsTask {
+    fn refresh(&self) {
+        // In kernel mode, refresh our counters from the live BPF per-CPU
+        // array so stats()/ebpf_drops() reflect real kernel drops (packets
+        // dropped in the NIC driver never touch userspace, so is_blocked()
+        // cannot account for them).
+        #[cfg(feature = "kernel")]
+        if let Some(k) = self.kernel.as_ref() {
+            let (pass, drop) = k.read_counters();
+            self.stats.xdp_pass.store(pass, Ordering::Relaxed);
+            self.stats.xdp_drop.store(drop, Ordering::Relaxed);
+        }
+
+        let snap = self.stats.snapshot();
+        let bl_len = self
+            .blocklist
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+
+        debug!(
+            mode = %self.mode,
+            xdp_pass  = snap.xdp_pass,
+            xdp_drop  = snap.xdp_drop,
+            xdp_abort = snap.xdp_aborted,
+            blocklist_entries = bl_len,
+            "eBPF stats"
+        );
+    }
+}
+
 impl EbpfManager {
     /// Create a new manager.  Does NOT start the background task; call
     /// [`start`][Self::start] afterwards.
@@ -707,60 +749,75 @@ impl EbpfManager {
     ///
     /// In software mode this is a lightweight periodic log; in kernel mode
     /// (when fully implemented) it would also poll BPF map counters.
+    ///
+    /// The task is a bare `tokio::spawn`: a panic in it ends it, with the
+    /// kernel counters frozen. A caller that supervises its background loops
+    /// runs it itself instead ([`claim_stats_task`][Self::claim_stats_task]).
     pub async fn start(&self) -> Result<()> {
-        if self.running.swap(true, Ordering::SeqCst) {
+        if !self.claim_stats_task() {
             // Already running — idempotent
             return Ok(());
         }
 
-        let running = Arc::clone(&self.running);
-        let stats = Arc::clone(&self.stats);
-        let blocklist = Arc::clone(&self.blocklist);
-        let interval_secs = self.config.stats_interval_secs.max(1);
-        let mode = self.mode;
+        let stats = self.stats_task();
+        let interval = self.stats_interval();
         let iface = self.config.interface.clone();
-        #[cfg(feature = "kernel")]
-        let kernel = self.kernel.clone();
+        let mode = self.mode;
 
         tokio::spawn(async move {
             info!(mode = %mode, interface = %iface, "eBPF background task started");
-            let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+            let mut ticker = tokio::time::interval(interval);
             ticker.tick().await; // skip the immediate first tick
 
-            while running.load(Ordering::Relaxed) {
+            while stats.running.load(Ordering::Relaxed) {
                 ticker.tick().await;
-
-                // In kernel mode, refresh our counters from the live BPF
-                // per-CPU array so stats()/ebpf_drops() reflect real kernel
-                // drops (packets dropped in the NIC driver never touch
-                // userspace, so is_blocked() cannot account for them).
-                #[cfg(feature = "kernel")]
-                if let Some(k) = kernel.as_ref() {
-                    let (pass, drop) = k.read_counters();
-                    stats.xdp_pass.store(pass, Ordering::Relaxed);
-                    stats.xdp_drop.store(drop, Ordering::Relaxed);
-                }
-
-                let snap = stats.snapshot();
-                let bl_len = blocklist
-                    .read()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .len();
-
-                debug!(
-                    mode = %mode,
-                    xdp_pass  = snap.xdp_pass,
-                    xdp_drop  = snap.xdp_drop,
-                    xdp_abort = snap.xdp_aborted,
-                    blocklist_entries = bl_len,
-                    "eBPF stats"
-                );
+                stats.refresh();
             }
 
             info!("eBPF background task stopped");
         });
 
         Ok(())
+    }
+
+    /// Mark the stats task as running, for a caller that runs its loop itself
+    /// (every [`stats_interval`][Self::stats_interval], call
+    /// [`refresh_stats`][Self::refresh_stats] while
+    /// [`stats_running`][Self::stats_running]) instead of [`start`][Self::start]'s
+    /// bare spawn — the proxy, which restarts the loop after a panic. False
+    /// when it is already running, and then the caller must not run another.
+    pub fn claim_stats_task(&self) -> bool {
+        !self.running.swap(true, Ordering::SeqCst)
+    }
+
+    /// Whether the stats task should keep running; [`shutdown`][Self::shutdown]
+    /// clears it.
+    pub fn stats_running(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
+    }
+
+    /// How often the stats task runs.
+    pub fn stats_interval(&self) -> Duration {
+        Duration::from_secs(self.config.stats_interval_secs.max(1))
+    }
+
+    fn stats_task(&self) -> StatsTask {
+        StatsTask {
+            running: Arc::clone(&self.running),
+            stats: Arc::clone(&self.stats),
+            blocklist: Arc::clone(&self.blocklist),
+            mode: self.mode,
+            #[cfg(feature = "kernel")]
+            kernel: self.kernel.clone(),
+        }
+    }
+
+    /// One pass of the stats task: in kernel mode, read the live BPF per-CPU
+    /// counters into [`stats`][Self::stats] (packets dropped in the NIC driver
+    /// never reach userspace, so nothing else can count them), then log a
+    /// snapshot.
+    pub fn refresh_stats(&self) {
+        self.stats_task().refresh();
     }
 
     /// Gracefully stop the background task.

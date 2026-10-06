@@ -238,6 +238,23 @@ fn inject_site_sync_panic(cfg: &SentinelConfig) {
     }
 }
 
+/// A site name whose self-signed cert panics the mint, every time, in test
+/// builds only.
+#[cfg(test)]
+const INJECT_MINT_PANIC_NAME: &str = "panic-guard-mint.example";
+
+/// How many times the injected mint panic fired.
+#[cfg(test)]
+static MINT_PANICS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn inject_mint_panic(names: &[String]) {
+    if names.iter().any(|n| n == INJECT_MINT_PANIC_NAME) {
+        MINT_PANICS.fetch_add(1, Ordering::SeqCst);
+        panic!("injected site certificate mint panic");
+    }
+}
+
 /// When the site cert sync has to run, and which failures it has reported.
 #[derive(Default)]
 struct SiteSync {
@@ -531,6 +548,13 @@ impl CertStore {
     }
 
     /// `set_site_names`, then mint what is missing on a blocking thread.
+    ///
+    /// A panic while minting is raised again here, in the caller (the site
+    /// cert sync, which is supervised). It used to come back as a JoinError
+    /// taken for "all failed": one WARN, and since a failure is retried every
+    /// `SITE_SYNC_INTERVAL`, a mint that panics every time logged a fresh
+    /// panic (and backtrace) every 2 s for ever, never backing off and never
+    /// recorded as a restart.
     pub async fn sync_site_fallbacks(self: &Arc<Self>, names: HashSet<String>) -> MintReport {
         let missing = self.set_site_names(names);
         if missing.is_empty() {
@@ -538,8 +562,16 @@ impl CertStore {
         }
         let store = Arc::clone(self);
         let batch = missing.clone();
-        match tokio::task::spawn_blocking(move || store.ensure_site_fallbacks(&batch)).await {
-            Ok(report) => {
+        let minted = tokio::task::spawn_blocking(move || {
+            crate::panic_guard::catch_for_elsewhere(|| {
+                #[cfg(test)]
+                inject_mint_panic(&batch);
+                store.ensure_site_fallbacks(&batch)
+            })
+        })
+        .await;
+        match minted {
+            Ok(Ok(report)) => {
                 if report.added > 0 {
                     tracing::info!(
                         certs = report.added,
@@ -548,6 +580,8 @@ impl CertStore {
                 }
                 report
             }
+            Ok(Err(panicked)) => panicked.resume(),
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
             Err(e) => {
                 tracing::warn!("minting self-signed site certificates failed: {e}");
                 MintReport {
@@ -1801,6 +1835,38 @@ mod tests {
             SITE_SYNC_PANICKED.load(Ordering::SeqCst),
             "the injected panic fired"
         );
+        task.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A mint that panics, on the blocking pool, came back as a JoinError the
+    /// sync took for "all failed", and a failure is retried every tick: a
+    /// fresh panic, ERROR line and backtrace each time, for ever, with no
+    /// backoff and no restart recorded. It reaches the supervisor now, which
+    /// records it under the mint's own location and backs off.
+    #[tokio::test]
+    async fn a_panicking_mint_reaches_the_supervisor() {
+        crate::panic_guard::install_panic_hook();
+        let dir = tmp_dir();
+        let store = CertStore::new(dir.clone());
+        let config = config_with(vec![site("m", &[INJECT_MINT_PANIC_NAME])]);
+        let task = spawn_site_cert_sync_every(
+            Arc::clone(&store),
+            Arc::clone(&config),
+            Duration::from_millis(10),
+        );
+        let (location, _) = eventually("the mint's panic to restart the sync", || {
+            crate::panic_guard::task_last_panic("site certificate sync")
+                .filter(|(_, panic)| panic == "injected site certificate mint panic")
+        })
+        .await;
+        assert!(location.contains("cert_store.rs"), "{location}");
+
+        // Backed off: the old sync retried every 10 ms here.
+        let mints = MINT_PANICS.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let more = MINT_PANICS.load(Ordering::SeqCst) - mints;
+        assert!(more <= 2, "{more} mints in 1.5 s");
         task.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -691,6 +691,27 @@ pub(crate) fn test_reason(support_id: &str) -> Option<String> {
         .map(|(_, r)| r.clone())
 }
 
+/// The eBPF manager at this address panics its stats task's next pass, once.
+#[cfg(test)]
+pub(crate) static INJECT_EBPF_STATS_PANIC: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn inject_ebpf_stats_panic(ebpf: &Arc<sentinel_ebpf::EbpfManager>) {
+    let target = Arc::as_ptr(ebpf) as usize;
+    if INJECT_EBPF_STATS_PANIC
+        .compare_exchange(
+            target,
+            0,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_ok()
+    {
+        panic!("injected eBPF stats panic");
+    }
+}
+
 /// A WebSocket message containing this panics its inspection.
 #[cfg(test)]
 pub(crate) const INJECT_WS_PANIC_MARKER: &str = "__panic_guard_ws__";
@@ -882,6 +903,42 @@ pub(crate) fn task_panicked(name: &'static str, payload: &(dyn Any + Send)) -> u
 #[cfg(test)]
 pub(crate) fn task_restarts(name: &str) -> u64 {
     lock(&TASKS).get(name).map_or(0, |t| t.restarts)
+}
+
+/// The loop `name`'s latest panic, as `(location, message)`, for tests outside
+/// this module.
+#[cfg(test)]
+pub(crate) fn task_last_panic(name: &str) -> Option<(String, String)> {
+    lock(&TASKS)
+        .get(name)
+        .map(|t| (t.last_location.clone(), t.last_panic.clone()))
+}
+
+/// A panic caught on one thread, to be raised again on another with the
+/// location the hook recorded where it happened: a blocking-pool job's panic,
+/// raised in the supervised loop that waits for the job, so that loop's
+/// supervisor applies its backoff and records the job's location (the hook's
+/// record is per thread, and would otherwise read "unknown").
+pub(crate) struct PanickedElsewhere {
+    location: String,
+    payload: Box<dyn Any + Send>,
+}
+
+impl PanickedElsewhere {
+    /// Raise it here. The hook has counted and logged it already, and
+    /// `resume_unwind` does not call the hook again.
+    pub(crate) fn resume(self) -> ! {
+        record(self.location, None, LogLine::Due { suppressed: 0 });
+        std::panic::resume_unwind(self.payload)
+    }
+}
+
+/// Run `f`, catching a panic for [`PanickedElsewhere::resume`].
+pub(crate) fn catch_for_elsewhere<R>(f: impl FnOnce() -> R) -> Result<R, PanickedElsewhere> {
+    std::panic::catch_unwind(AssertUnwindSafe(f)).map_err(|payload| PanickedElsewhere {
+        location: take_panic_location(),
+        payload,
+    })
 }
 
 /// The loop that restarted most recently within [`RECENT_RESTART`], if any.
@@ -2655,6 +2712,51 @@ rule 9990102 {
 
     /// The NDJSON writer thread restarted after a fixed 1 s with no backoff, so
     /// a deterministic panic in its setup looped at 1 Hz forever.
+    /// The eBPF stats task was a bare spawn: a panic in one pass ended it for
+    /// good (`running` stayed true, so nothing started it again), and in
+    /// kernel mode the XDP counters froze with no restart recorded. It runs
+    /// supervised now, and still stops when the manager shuts down.
+    #[tokio::test]
+    async fn a_panic_in_the_ebpf_stats_task_restarts_it() {
+        let ebpf = Arc::new(
+            sentinel_ebpf::EbpfManager::new(sentinel_ebpf::EbpfConfig {
+                stats_interval_secs: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        let before = lock(&TASKS).get("eBPF stats").map_or(0, |t| t.restarts);
+        INJECT_EBPF_STATS_PANIC.store(
+            Arc::as_ptr(&ebpf) as usize,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        let task = crate::spawn_ebpf_stats(&ebpf).expect("claimed");
+        assert!(crate::spawn_ebpf_stats(&ebpf).is_none(), "claimed once");
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while lock(&TASKS).get("eBPF stats").map_or(0, |t| t.restarts) == before {
+            assert!(
+                Instant::now() < deadline,
+                "the stats task was not restarted"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            INJECT_EBPF_STATS_PANIC.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the injected panic fired"
+        );
+        // The restarted run keeps going, and ends with the manager.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert!(!task.is_finished(), "the restarted task ended");
+        ebpf.shutdown().await;
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the stats task outlived the manager's shutdown")
+            .unwrap();
+    }
+
     #[test]
     fn a_panicking_thread_loop_backs_off_and_is_recorded() {
         let mut runs = 0;

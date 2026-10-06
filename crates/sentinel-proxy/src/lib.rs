@@ -1474,9 +1474,7 @@ impl ProxyServer {
         //
         // In software mode it is nearly free and changes nothing: the kernel
         // branch is skipped and the userspace per-connection counts stand.
-        if let Err(e) = ebpf.start().await {
-            warn!(error = %e, "eBPF stats task failed to start — kernel XDP counters will not update");
-        }
+        spawn_ebpf_stats(&ebpf);
 
         // Certificate manager — loads persisted ACME/manual certs from disk,
         // then runs background renewal every hour.
@@ -6611,6 +6609,38 @@ fn build_ebpf_config() -> EbpfConfig {
         enable_kernel,
         stats_interval_secs: 5,
     }
+}
+
+/// Run the eBPF stats task, supervised like the node's other background loops.
+///
+/// `EbpfManager::start` runs it on a bare `tokio::spawn`, so a panic in one
+/// pass ended it for the life of the process: `running` stayed true, so
+/// nothing started it again, and in kernel mode `xdp_pass`/`xdp_drop` froze in
+/// `/healthz` and `/metrics` with no restart recorded and the heartbeat
+/// healthy. A restart here is recorded under "eBPF stats".
+fn spawn_ebpf_stats(ebpf: &Arc<EbpfManager>) -> Option<tokio::task::JoinHandle<()>> {
+    if !ebpf.claim_stats_task() {
+        return None;
+    }
+    info!(
+        mode = %ebpf.mode(),
+        interface = %ebpf.config().interface,
+        "eBPF background task started"
+    );
+    let ebpf = Arc::clone(ebpf);
+    Some(panic_guard::supervised!("eBPF stats", {
+        per_run!(ebpf);
+        let mut ticker = tokio::time::interval(ebpf.stats_interval());
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await; // the first tick is immediate
+        while ebpf.stats_running() {
+            ticker.tick().await;
+            #[cfg(test)]
+            panic_guard::inject_ebpf_stats_panic(&ebpf);
+            ebpf.refresh_stats();
+        }
+        info!("eBPF background task stopped");
+    }))
 }
 
 /// XDP auto-ban policy: when a source IP is blocked by the WAF often enough
