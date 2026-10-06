@@ -738,6 +738,33 @@ fn der_not_after(der: &[u8]) -> Option<u64> {
     None
 }
 
+/// Whether the certificate's issuer and subject names are byte-identical — a
+/// self-issued (in practice self-signed) cert. None if the DER cannot be walked.
+pub(super) fn der_self_issued(der: &[u8]) -> Option<bool> {
+    // TBSCertificate ::= SEQUENCE { [0] version OPTIONAL, serialNumber,
+    //   signature, issuer, validity, subject, ... }
+    let tbs_inner = der_seq_content(der_seq_content(der, 0)?, 0)?;
+    let mut fields: Vec<(u8, &[u8])> = Vec::with_capacity(6);
+    let mut pos = 0usize;
+    while pos < tbs_inner.len() && fields.len() < 6 {
+        let (len, hdr) = der_len(tbs_inner, pos + 1)?;
+        let end = pos + 1 + hdr + len;
+        if end > tbs_inner.len() {
+            return None;
+        }
+        fields.push((tbs_inner[pos], &tbs_inner[pos..end]));
+        pos = end;
+    }
+    let fields = match fields.first() {
+        Some((0xA0, _)) => &fields[1..],
+        _ => &fields[..],
+    };
+    let [_, _, (0x30, issuer), _, (0x30, subject), ..] = fields else {
+        return None;
+    };
+    Some(issuer == subject)
+}
+
 /// Given the content of a candidate `validity` SEQUENCE (two time values), return notAfter.
 fn validity_not_after(buf: &[u8]) -> Option<u64> {
     let mut pos = 0usize;

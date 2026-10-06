@@ -267,6 +267,20 @@ fn cert_covers(cert_name: &str, site: &str) -> bool {
             .is_some_and(|base| site.split_once('.').is_some_and(|(_, rest)| rest == base))
 }
 
+/// Whether a cert stored under `name` would be served for a configured site.
+fn serves_configured_name(name: &str, site_names: &HashSet<String>) -> bool {
+    site_names.iter().any(|site| cert_covers(name, site))
+}
+
+/// Outcome of loading one directory of the cert volume.
+enum DirLoad {
+    Loaded,
+    /// A self-signed cert for a name no site is configured for, left in place.
+    Skipped,
+    /// No cert in it, or the default cert, which `ensure_default_cert` adopts.
+    Nothing,
+}
+
 impl CertStore {
     pub fn new(cert_dir: PathBuf) -> Arc<Self> {
         Arc::new(Self {
@@ -295,9 +309,11 @@ impl CertStore {
     ///
     /// `site_names` are the configured site names (see `site_cert_names`). A
     /// self-signed cert for one of them becomes that site's fallback; one for any
-    /// other name is skipped and counted, never deleted. Those directories are
-    /// what the old resolver minted for whatever SNI a client sent, and loading
-    /// them would rebuild the unbounded map at every boot.
+    /// other name is skipped and counted, never deleted — also when its
+    /// meta.json is missing. Those directories are what the old resolver minted
+    /// for whatever SNI a client sent, and loading them would rebuild the
+    /// unbounded map at every boot. A directory that cannot be read is counted
+    /// as failed and the rest still load.
     pub fn load_from_disk(&self, site_names: &HashSet<String>) -> Result<usize> {
         // Recorded first, so a load that fails part-way still leaves the sync
         // task knowing which names to mint.
@@ -309,74 +325,30 @@ impl CertStore {
         std::fs::create_dir_all(&self.cert_dir)
             .with_context(|| format!("creating cert dir: {}", self.cert_dir.display()))?;
 
-        let mut count = 0;
-        let mut skipped = 0usize;
+        // One bad directory costs only itself. The old resolver wrote meta.json
+        // best-effort for every probed name, so a crash or a full disk mid-flood
+        // leaves truncated files; aborting on the first would leave every
+        // operator cert after it in readdir order unloaded.
+        let (mut count, mut skipped, mut failed) = (0usize, 0usize, 0usize);
         for entry in std::fs::read_dir(&self.cert_dir)
             .with_context(|| format!("reading cert dir: {}", self.cert_dir.display()))?
         {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            let dir = entry.path();
-            let cert_file = dir.join("cert.pem");
-            let key_file = dir.join("key.pem");
-            if !cert_file.exists() || !key_file.exists() {
-                continue;
-            }
-
-            let meta_file = dir.join("meta.json");
-            let meta: CertMeta = if meta_file.exists() {
-                serde_json::from_str(&std::fs::read_to_string(&meta_file)?)?
-            } else {
-                let domain = entry
-                    .file_name()
-                    .to_string_lossy()
-                    .replace("_wildcard_", "*");
-                CertMeta {
-                    domain: domain.clone(),
-                    name: String::new(),
-                    san: vec![domain],
-                    issued_at: 0,
-                    expires_at: 0,
-                    fingerprint: String::new(),
-                    source: CertSource::Manual,
-                    issuer: String::new(),
-                    key_type: String::new(),
+            let dir = match entry.and_then(|e| Ok((e.path(), e.file_type()?.is_dir()))) {
+                Ok((dir, true)) => dir,
+                Ok(_) => continue,
+                Err(e) => {
+                    tracing::warn!("unreadable entry in the cert dir: {e}");
+                    failed += 1;
+                    continue;
                 }
             };
-
-            // A site's self-signed cert goes to the fallback map; operator certs
-            // and reserved keys (the management cert, even self-signed) to `live`.
-            let fallback_name = (meta.source == CertSource::SelfSigned
-                && !meta.domain.starts_with(RESERVED_PREFIX))
-            .then(|| meta.domain.to_ascii_lowercase());
-            if let Some(name) = &fallback_name {
-                // Adopted by `ensure_default_cert`, and not a site's cert.
-                if name == DEFAULT_CERT_KEY {
-                    continue;
-                }
-                if !site_names.contains(name) {
-                    skipped += 1;
-                    continue;
-                }
-            }
-
-            match load_pem_files(&cert_file, &key_file) {
-                Ok(ck) => {
-                    let entry = Arc::new(CertEntry { key: ck, meta });
-                    match fallback_name {
-                        Some(name) => {
-                            self.fallback_write().certs.insert(name, entry);
-                        }
-                        None => {
-                            self.live.insert(entry.meta.domain.clone(), entry);
-                        }
-                    }
-                    count += 1;
-                }
+            match self.load_cert_dir(&dir, site_names) {
+                Ok(DirLoad::Loaded) => count += 1,
+                Ok(DirLoad::Skipped) => skipped += 1,
+                Ok(DirLoad::Nothing) => {}
                 Err(e) => {
-                    tracing::warn!(?dir, "failed to load cert: {e}");
+                    tracing::warn!(?dir, "failed to load cert: {e:#}");
+                    failed += 1;
                 }
             }
         }
@@ -387,7 +359,89 @@ impl CertStore {
                  on disk, unloaded"
             );
         }
+        if failed > 0 {
+            tracing::warn!(
+                failed,
+                "cert directories that could not be loaded were skipped; the rest loaded"
+            );
+        }
         Ok(count)
+    }
+
+    /// Load the cert in one directory of the volume (see `load_from_disk`).
+    fn load_cert_dir(&self, dir: &Path, site_names: &HashSet<String>) -> Result<DirLoad> {
+        let cert_file = dir.join("cert.pem");
+        let key_file = dir.join("key.pem");
+        if !cert_file.exists() || !key_file.exists() {
+            return Ok(DirLoad::Nothing);
+        }
+        let cert_pem = std::fs::read(&cert_file).context("reading cert.pem")?;
+
+        let meta_file = dir.join("meta.json");
+        let meta: CertMeta = if meta_file.exists() {
+            let raw = std::fs::read_to_string(&meta_file).context("reading meta.json")?;
+            serde_json::from_str(&raw).context("parsing meta.json")?
+        } else {
+            let domain = dir
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .replace("_wildcard_", "*");
+            let name = domain.to_ascii_lowercase();
+            if name == DEFAULT_CERT_KEY {
+                return Ok(DirLoad::Nothing);
+            }
+            // No metadata: an operator's hand-placed PEM pair, or what the old
+            // resolver left when its meta.json write failed. A cert for a
+            // configured site, an internal key, or one someone else issued is
+            // the operator's; a self-issued cert for any other name is a
+            // leftover and must not reach `live` as "Manual" past the skip.
+            let operator_cert = name.starts_with(RESERVED_PREFIX)
+                || serves_configured_name(&name, site_names)
+                || !pem_is_self_issued(&cert_pem);
+            if !operator_cert {
+                return Ok(DirLoad::Skipped);
+            }
+            CertMeta {
+                domain: domain.clone(),
+                name: String::new(),
+                san: vec![domain],
+                issued_at: 0,
+                expires_at: 0,
+                fingerprint: String::new(),
+                source: CertSource::Manual,
+                issuer: String::new(),
+                key_type: String::new(),
+            }
+        };
+
+        // A site's self-signed cert goes to the fallback map; operator certs
+        // and reserved keys (the management cert, even self-signed) to `live`.
+        let fallback_name = (meta.source == CertSource::SelfSigned
+            && !meta.domain.starts_with(RESERVED_PREFIX))
+        .then(|| meta.domain.to_ascii_lowercase());
+        if let Some(name) = &fallback_name {
+            // Adopted by `ensure_default_cert`, and not a site's cert.
+            if name == DEFAULT_CERT_KEY {
+                return Ok(DirLoad::Nothing);
+            }
+            if !site_names.contains(name) {
+                return Ok(DirLoad::Skipped);
+            }
+        }
+
+        let key_pem = std::fs::read(&key_file).context("reading key.pem")?;
+        let ck = load_pem_bytes(&cert_pem, &key_pem)?;
+        let entry = Arc::new(CertEntry { key: ck, meta });
+        match fallback_name {
+            Some(name) => {
+                self.fallback_write().certs.insert(name, entry);
+            }
+            None => {
+                self.live.insert(entry.meta.domain.clone(), entry);
+            }
+        }
+        Ok(DirLoad::Loaded)
     }
 
     /// The certificate served for every name no site is configured for, and to
@@ -1038,6 +1092,16 @@ fn ensure_ascii_name(domain: &str) -> Result<()> {
         "certificate name {domain:?} is not ASCII; use its xn-- form"
     );
     Ok(())
+}
+
+/// Whether the first cert in `cert_pem` names itself as its issuer. Unknown
+/// (unparseable) counts as no, so an operator's cert is never dropped on a guess.
+fn pem_is_self_issued(cert_pem: &[u8]) -> bool {
+    rustls_pemfile::certs(&mut std::io::Cursor::new(cert_pem))
+        .next()
+        .and_then(|c| c.ok())
+        .and_then(|der| super::acme::der_self_issued(der.as_ref()))
+        .unwrap_or(false)
 }
 
 fn load_pem_files(cert_path: &Path, key_path: &Path) -> Result<Arc<CertifiedKey>> {
@@ -2002,6 +2066,93 @@ mod tests {
             assert_ne!(served, default_cert, "{site} fell to the default cert");
         }
         assert!(dir.join("api.example.com").join("cert.pem").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn write_dir(dir: &Path, name: &str, cert: &str, key: &str, meta_json: Option<&str>) {
+        let d = dir.join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("cert.pem"), cert).unwrap();
+        std::fs::write(d.join("key.pem"), key).unwrap();
+        if let Some(m) = meta_json {
+            std::fs::write(d.join("meta.json"), m).unwrap();
+        }
+    }
+
+    fn ca_issued_pem(cn: &str) -> (String, String) {
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new());
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Test CA");
+        let ca = rcgen::Certificate::from_params(ca_params).unwrap();
+        let leaf = rcgen::generate_simple_self_signed(vec![cn.to_string()]).unwrap();
+        (
+            leaf.serialize_pem_with_signer(&ca).unwrap(),
+            leaf.serialize_private_key_pem(),
+        )
+    }
+
+    #[test]
+    fn self_issued_is_told_apart_from_ca_issued() {
+        let (own, _) = self_signed_pem("a.example.com");
+        let (issued, _) = ca_issued_pem("b.example.com");
+        assert!(pem_is_self_issued(own.as_bytes()));
+        assert!(!pem_is_self_issued(issued.as_bytes()));
+        assert!(!pem_is_self_issued(b"not a cert"));
+    }
+
+    /// What a flood against the old resolver can leave on the volume: a
+    /// truncated meta.json (crash or full disk mid-write) and self-issued
+    /// certs with no meta.json at all. The first aborted the whole load, so
+    /// every operator cert after it in readdir order went unloaded; the second
+    /// loaded as a "Manual" operator cert, past the skip.
+    #[test]
+    fn startup_survives_bad_dirs_and_skips_metaless_leftovers() {
+        let dir = tmp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let (junk_c, junk_k) = self_signed_pem("junk.example");
+        write_dir(
+            &dir,
+            "truncated.example",
+            &junk_c,
+            &junk_k,
+            Some("{\"domain\": \"trun"),
+        );
+        write_dir(&dir, "metaless-junk.example", &junk_c, &junk_k, None);
+        let (ca_c, ca_k) = ca_issued_pem("metaless-ca.example.com");
+        write_dir(&dir, "metaless-ca.example.com", &ca_c, &ca_k, None);
+        let (own_c, own_k) = self_signed_pem("hand.example.com");
+        write_dir(&dir, "hand.example.com", &own_c, &own_k, None);
+        let (wc_c, wc_k) = self_signed_pem("*.corp.example.com");
+        write_dir(&dir, "_wildcard_.corp.example.com", &wc_c, &wc_k, None);
+        let (mgmt_c, mgmt_k) = self_signed_pem("console");
+        write_dir(&dir, MANAGEMENT_CERT_KEY, &mgmt_c, &mgmt_k, None);
+        {
+            let old = CertStore::new(dir.clone());
+            install_manual(&old, "manual.example.com");
+        }
+
+        let store = CertStore::new(dir.clone());
+        let loaded = store
+            .load_from_disk(&names(&["hand.example.com", "app.corp.example.com"]))
+            .expect("one bad directory must not fail the whole load");
+        let mut live: Vec<String> = store.live.iter().map(|e| e.key().clone()).collect();
+        live.sort();
+        assert_eq!(
+            live,
+            vec![
+                "*.corp.example.com",
+                MANAGEMENT_CERT_KEY,
+                "hand.example.com",
+                "manual.example.com",
+                "metaless-ca.example.com",
+            ]
+        );
+        assert_eq!(loaded, 5);
+        // Skipped, not deleted.
+        assert!(dir.join("metaless-junk.example").join("cert.pem").exists());
+        assert!(dir.join("truncated.example").join("cert.pem").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
