@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -202,6 +204,9 @@ func validateWafPolicyValues(raw json.RawMessage) []SiteConfigProblem {
 		IPReputation *struct {
 			Allow []string `json:"allow"`
 			Block []string `json:"block"`
+			// Raw so a malformed list is reported by feedProblems rather than
+			// failing this whole unmarshal, which would skip every check here.
+			Feeds json.RawMessage `json:"feeds"`
 		} `json:"ip_reputation"`
 		PathOverrides []struct {
 			PathPrefix       string          `json:"path_prefix"`
@@ -306,6 +311,7 @@ func validateWafPolicyValues(raw json.RawMessage) []SiteConfigProblem {
 				}
 			}
 		}
+		problems = append(problems, feedProblems(p.IPReputation.Feeds)...)
 	}
 
 	// Per-path overrides. These are rejected rather than silently normalised: an
@@ -355,6 +361,88 @@ func validateWafPolicyValues(raw json.RawMessage) []SiteConfigProblem {
 		}
 	}
 	return problems
+}
+
+// maxFeedURLLength bounds an IP-reputation feed URL, which is synced to and
+// logged by every data-plane node. 2048 leaves ample room for a long path plus
+// an access-key query string.
+const maxFeedURLLength = 2048
+
+// feedProblems checks waf_policy.ip_reputation.feeds.
+//
+// Every data-plane node fetches each feed URL itself, so a URL is held to what
+// that fetcher accepts: http or https, with a host. Nothing refused a file://
+// URL here, and the data plane used to read it off the node's own disk.
+//
+// The list's shape is checked as well: ip_reputation reaches the data plane
+// verbatim and is parsed with the rest of the site, so a feed it cannot read
+// (no url, or a url that is not a string) makes it reject the entire site — a
+// new site is not served at all, an existing one stays on its last config.
+func feedProblems(raw json.RawMessage) []SiteConfigProblem {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	const field = "waf_policy.ip_reputation.feeds"
+	var feeds []map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &feeds); err != nil {
+		return []SiteConfigProblem{{Field: field,
+			Problem: `must be a list of feeds, each an object like {"url": "https://…"}`}}
+	}
+	var problems []SiteConfigProblem
+	for i, f := range feeds {
+		urlField := fmt.Sprintf("%s[%d].url", field, i)
+		rawURL, ok := f["url"]
+		if !ok || string(rawURL) == "null" {
+			problems = append(problems, SiteConfigProblem{Field: urlField, Problem: "is required"})
+			continue
+		}
+		var u string
+		if err := json.Unmarshal(rawURL, &u); err != nil {
+			problems = append(problems, SiteConfigProblem{Field: urlField, Problem: "must be a string"})
+			continue
+		}
+		if m := feedURLProblem(u); m != "" {
+			problems = append(problems, SiteConfigProblem{Field: urlField, Problem: m})
+		}
+	}
+	return problems
+}
+
+// feedURLProblem says what is wrong with one feed URL, or "" if nothing.
+func feedURLProblem(raw string) string {
+	u := strings.TrimSpace(raw)
+	if u == "" {
+		return "must not be empty — remove the feed instead"
+	}
+	if len(u) > maxFeedURLLength {
+		return fmt.Sprintf("is %d characters; the longest accepted is %d", len(u), maxFeedURLLength)
+	}
+	shown := u
+	if r := []rune(u); len(r) > 100 {
+		shown = string(r[:100]) + "…"
+	}
+	// Go's parser tolerates a space in the path; the data plane's does not, and
+	// the feed would fail on every node at every refresh.
+	if strings.ContainsAny(u, " \t") {
+		return fmt.Sprintf("%q contains a space — percent-encode it as %%20", shown)
+	}
+	parsed, err := url.Parse(u)
+	if err != nil {
+		return fmt.Sprintf("%q is not a valid URL", shown)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Sprintf("%q is not an http:// or https:// URL — feeds are fetched over HTTP(S) only; "+
+			"file:// and other schemes are refused", shown)
+	}
+	if parsed.Hostname() == "" {
+		return fmt.Sprintf("%q has no host", shown)
+	}
+	if p := parsed.Port(); p != "" {
+		if n, err := strconv.Atoi(p); err != nil || n < 1 || n > 65535 {
+			return fmt.Sprintf("%q has port %s; ports are 1-65535", shown, p)
+		}
+	}
+	return ""
 }
 
 // Upper bounds for a site's request limits. Kept identical to LIMIT_CAPS in

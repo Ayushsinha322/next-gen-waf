@@ -336,3 +336,102 @@ func TestValidateDryRunChecksDomainOwnership(t *testing.T) {
 		t.Fatal("handleValidateSite no longer checks whether another site owns the domains")
 	}
 }
+
+func feedPolicy(t *testing.T, url string) json.RawMessage {
+	t.Helper()
+	b, err := json.Marshal(map[string]any{"ip_reputation": map[string]any{
+		"feeds": []map[string]string{{"url": url, "interval": "1h", "format": "cidr"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// Every data-plane node fetches each feed URL itself, and a file:// URL used to
+// be read off the node's own disk. Only http(s) with a host is accepted.
+func TestFeedURLsAreRefusedUnlessHTTP(t *testing.T) {
+	const field = "waf_policy.ip_reputation.feeds[0].url"
+	cases := []struct{ url, want string }{
+		{"file:///etc/passwd", "http:// or https://"},
+		{"FILE:///etc/passwd", "http:// or https://"},
+		{"ftp://feeds.example/list", "http:// or https://"},
+		{"gopher://feeds.example/", "http:// or https://"},
+		{"javascript:alert(1)", "http:// or https://"},
+		{"//feeds.example/list", "http:// or https://"},
+		{"feeds.example/list.txt", "http:// or https://"},
+		{"http:///list", "has no host"},
+		{"http://feeds.example:99999/list", "ports are 1-65535"},
+		{"http://feeds.example/my list.txt", "contains a space"},
+		{"   ", "must not be empty"},
+		{"https://feeds.example/" + strings.Repeat("a", maxFeedURLLength), "longest accepted is 2048"},
+	}
+	for _, c := range cases {
+		ps := validateWafPolicyValues(feedPolicy(t, c.url))
+		if len(ps) != 1 || ps[0].Field != field || !strings.Contains(ps[0].Problem, c.want) {
+			t.Errorf("%.60q: got %s, want one problem on %s mentioning %q", c.url, fields(ps), field, c.want)
+		}
+	}
+}
+
+// A feed the data plane cannot deserialize makes it reject the whole site, so
+// the list's shape is refused too — without hiding the policy's other checks.
+func TestMalformedFeedListIsRefused(t *testing.T) {
+	cases := []struct{ policy, field, want string }{
+		{`{"ip_reputation":{"feeds":"https://feeds.example/list"}}`, "waf_policy.ip_reputation.feeds", "must be a list"},
+		{`{"ip_reputation":{"feeds":[{"interval":"1h"}]}}`, "waf_policy.ip_reputation.feeds[0].url", "is required"},
+		{`{"ip_reputation":{"feeds":[null]}}`, "waf_policy.ip_reputation.feeds[0].url", "is required"},
+		{`{"ip_reputation":{"feeds":[{"url":42}]}}`, "waf_policy.ip_reputation.feeds[0].url", "must be a string"},
+	}
+	for _, c := range cases {
+		ps := problemsFor(t, c.policy)
+		if len(ps) != 1 || ps[0].Field != c.field || !strings.Contains(ps[0].Problem, c.want) {
+			t.Errorf("%s: got %s, want one problem on %s mentioning %q", c.policy, fields(ps), c.field, c.want)
+		}
+	}
+	ps := problemsFor(t, `{"ip_reputation":{"block":["not-an-ip"],"feeds":"x"}}`)
+	if !hasField(ps, "waf_policy.ip_reputation.block") || !hasField(ps, "waf_policy.ip_reputation.feeds") {
+		t.Errorf("a malformed feed list hid the block-list check: %s", fields(ps))
+	}
+}
+
+func TestGoodFeedURLsPass(t *testing.T) {
+	for _, pol := range []string{
+		`{"ip_reputation":{"feeds":[
+			{"url":"https://iplists.firehol.org/files/firehol_level1.netset","interval":"1h","format":"cidr"},
+			{"url":"HTTP://10.0.0.5:8080/list.txt"},
+			{"url":"https://user:pass@feeds.example/list?key=abc"},
+			{"url":"http://[2001:db8::1]/list"},
+			{"url":" https://feeds.example/list "}]}}`,
+		`{"ip_reputation":{"feeds":[]}}`,
+		`{"ip_reputation":{"feeds":null}}`,
+		`{"ip_reputation":{"allow":["10.0.0.0/8"]}}`,
+	} {
+		if ps := problemsFor(t, pol); len(ps) != 0 {
+			t.Errorf("%s: unexpected problems %s", pol, fields(ps))
+		}
+	}
+}
+
+// Create validates the request and update validates the merge with the stored
+// row; a problem from either is the handler's 400.
+func TestFeedURLIsCheckedOnCreateAndUpdate(t *testing.T) {
+	const field = "waf_policy.ip_reputation.feeds[0].url"
+	up := json.RawMessage(`{"servers":["10.0.0.5:8080"]}`)
+	bad := json.RawMessage(`{"mode":"blocking","ip_reputation":{"feeds":[{"url":"file:///etc/shadow"}]}}`)
+
+	if ps := validateSiteConfig("shop", []string{"shop.example.com"}, up, bad); !hasField(ps, field) {
+		t.Errorf("create accepted a file:// feed: %s", fields(ps))
+	}
+
+	cur := db.SiteRow{
+		Name:      "shop",
+		Domains:   []string{"shop.example.com"},
+		Upstream:  up,
+		WafPolicy: json.RawMessage(`{"mode":"blocking"}`),
+	}
+	name, domains, u, waf := mergedSiteForValidation(cur, db.UpdateSiteRequest{WafPolicy: bad})
+	if ps := validateSiteConfig(name, domains, u, waf); !hasField(ps, field) {
+		t.Errorf("update accepted a file:// feed: %s", fields(ps))
+	}
+}

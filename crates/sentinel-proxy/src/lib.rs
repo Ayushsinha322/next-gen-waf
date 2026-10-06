@@ -26,6 +26,7 @@ pub mod captcha;
 pub mod challenge;
 pub(crate) mod goodbot;
 pub mod http3;
+mod ip_feed;
 pub(crate) mod ja4_quic;
 mod jwks;
 pub mod proxy_protocol;
@@ -2207,18 +2208,9 @@ impl ProxyServer {
                     if feeds.is_empty() {
                         continue;
                     }
-                    let mut new_cidrs: Vec<(String, Vec<String>)> = Vec::new();
-                    for feed in &feeds {
-                        match fetch_feed_cidrs(&feed.url).await {
-                            Ok(cidrs) => {
-                                info!(url = %feed.url, count = cidrs.len(), "IP feed loaded");
-                                for cidr in cidrs {
-                                    new_cidrs.push((cidr, vec!["feed".to_string()]));
-                                }
-                            }
-                            Err(e) => warn!(url = %feed.url, "IP feed fetch failed: {e}"),
-                        }
-                    }
+                    // Scheme, size, time and entry bounds: see ip_feed.
+                    let new_cidrs =
+                        ip_feed::load_feed_table(&feeds, &ip_feed::FeedLimits::default()).await;
                     let new_arc: Arc<Vec<_>> = Arc::new(new_cidrs);
                     modules_ref.feed_cache.store(Arc::clone(&new_arc));
                     let new_ip_rep = build_ip_reputation(&cfg, &new_arc);
@@ -6795,67 +6787,6 @@ fn build_full_plugin_runtime(
     loaded.sort();
     let (per_site, unresolved) = resolve_site_plugins(cfg, &rt, manifest_map);
     Ok((rt, per_site, loaded, rejected, unresolved))
-}
-
-// ---------------------------------------------------------------------------
-// IP feed loader helpers
-// ---------------------------------------------------------------------------
-
-async fn fetch_feed_cidrs(url: &str) -> anyhow::Result<Vec<String>> {
-    if let Some(path) = url.strip_prefix("file://") {
-        let text = tokio::fs::read_to_string(path)
-            .await
-            .with_context(|| format!("reading file feed: {path}"))?;
-        return Ok(parse_cidr_text(&text));
-    }
-
-    let https = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_webpki_roots()
-        .https_or_http()
-        .enable_http1()
-        .enable_http2()
-        .build();
-    let client: Client<_, http_body_util::combinators::BoxBody<Bytes, hyper::Error>> =
-        Client::builder(TokioExecutor::new()).build(https);
-
-    let uri: Uri = url
-        .parse()
-        .with_context(|| format!("invalid feed URL: {url}"))?;
-    let req = Request::builder()
-        .method("GET")
-        .uri(uri)
-        .header("User-Agent", "sentinel-waf/1.0 ip-reputation-feed-fetcher")
-        .body(
-            http_body_util::Empty::<Bytes>::new()
-                .map_err(|never: Infallible| match never {})
-                .boxed(),
-        )
-        .context("building feed request")?;
-
-    let resp = tokio::time::timeout(Duration::from_secs(30), client.request(req))
-        .await
-        .context("feed request timed out after 30s")?
-        .context("feed HTTP request failed")?;
-
-    if !resp.status().is_success() {
-        anyhow::bail!("feed returned HTTP {}", resp.status());
-    }
-
-    let body = resp
-        .collect()
-        .await
-        .context("reading feed body")?
-        .to_bytes();
-    let text = std::str::from_utf8(&body).context("feed body is not valid UTF-8")?;
-    Ok(parse_cidr_text(text))
-}
-
-fn parse_cidr_text(text: &str) -> Vec<String> {
-    text.lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(String::from)
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
