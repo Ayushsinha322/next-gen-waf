@@ -59,8 +59,11 @@ impl CertManager {
         })
     }
 
-    pub fn load_from_disk(&self) -> Result<usize> {
-        self.store.load_from_disk()
+    /// Load persisted certs at startup. `sites` decides which self-signed certs
+    /// on the volume are still wanted (see `CertStore::load_from_disk`).
+    pub fn load_from_disk(&self, sites: &[sentinel_core::config::SiteConfig]) -> Result<usize> {
+        self.store
+            .load_from_disk(&super::cert_store::site_cert_names(sites))
     }
 
     /// Issue (or renew) a certificate for `domains` via ACME.

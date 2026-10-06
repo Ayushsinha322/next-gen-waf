@@ -1,18 +1,23 @@
 /// Hot-swappable certificate store with disk persistence.
 ///
-/// Holds live TLS certs per domain (from ACME or manual upload) plus a fallback
-/// self-signed generator for domains that have no configured cert.  The
-/// `SentinelCertResolver` wraps this and plugs straight into rustls.
-use std::collections::HashMap;
+/// Holds live TLS certs per domain (from ACME or manual upload), a self-signed
+/// cert for each configured site that has neither, and one default cert for
+/// every other name. The `SentinelCertResolver` wraps this and plugs straight
+/// into rustls. It only looks certs up: everything that generates or writes one
+/// runs at startup, on config sync, or in an admin call — never in a handshake,
+/// where any client could pick the name.
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use arc_swap::ArcSwapOption;
 use dashmap::DashMap;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::ResolvesServerCert;
 use rustls::sign::CertifiedKey;
+use sentinel_core::config::{ConfigHandle, SentinelConfig, SiteConfig};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -48,6 +53,17 @@ pub const MANAGEMENT_CERT_KEY: &str = "__management__";
 /// Cert store keys beginning with this prefix are internal (e.g. the management
 /// cert) and are hidden from the customer cert repository listing.
 const RESERVED_PREFIX: &str = "__";
+
+/// Key of the one certificate served for every name no site is configured for,
+/// and to clients that send no SNI (bare-IP access). It is the name the no-SNI
+/// path has always used, so a fleet upgrading keeps serving the certificate its
+/// clients already accepted.
+pub const DEFAULT_CERT_KEY: &str = "default";
+
+/// How often the site cert sync looks for a changed site list. Until it has run
+/// for a new site, that site is served the default certificate — self-signed
+/// either way.
+const SITE_SYNC_INTERVAL: Duration = Duration::from_secs(2);
 
 impl CertMeta {
     pub fn days_until_expiry(&self) -> i64 {
@@ -101,10 +117,85 @@ struct CertEntry {
 }
 
 pub struct CertStore {
+    /// Operator certificates: ACME, manual uploads and the management cert.
+    /// `get_meta` answers from here alone, so a self-signed cert can never look
+    /// like an issued one to the ACME issuance and renewal checks.
     live: DashMap<String, Arc<CertEntry>>,
     /// TLS-ALPN-01 challenge certs: domain → special cert served during challenge.
     alpn_challenge: DashMap<String, Arc<CertifiedKey>>,
+    /// Self-signed certs for configured site names that have no live cert.
+    /// Bounded by the configuration: rebuilt on every sync, never grown by a
+    /// handshake.
+    fallback: RwLock<SiteFallbacks>,
+    /// Served for every name that is not a configured site, and when the client
+    /// sends no SNI. Set once at startup by `ensure_default_cert`.
+    default_cert: ArcSwapOption<CertifiedKey>,
     cert_dir: PathBuf,
+}
+
+/// The configured names and their self-signed certs, under ONE lock so that a
+/// cert minted for a site removed meanwhile is never inserted after the sync
+/// that dropped it.
+#[derive(Default)]
+struct SiteFallbacks {
+    /// Lower-cased site names; rustls lower-cases the SNI it hands the resolver.
+    configured: HashSet<String>,
+    certs: HashMap<String, Arc<CertEntry>>,
+}
+
+/// The names a configured site can be reached by over SNI, normalised the way
+/// rustls normalises the SNI it hands the resolver.
+pub fn site_cert_names(sites: &[SiteConfig]) -> HashSet<String> {
+    sites
+        .iter()
+        .flat_map(|s| s.domains.iter())
+        .filter_map(|d| {
+            let d = d.trim().trim_end_matches('.').to_ascii_lowercase();
+            // An IP literal is never sent as SNI (RFC 6066) and reserved keys are
+            // internal; a cert minted for either could never be served.
+            let unservable = d.is_empty()
+                || d.starts_with(RESERVED_PREFIX)
+                || d.parse::<std::net::IpAddr>().is_ok();
+            (!unservable).then_some(d)
+        })
+        .collect()
+}
+
+/// Keep the per-site self-signed certs in step with the configured sites.
+///
+/// Watches the config handle, so a site arriving by any route (control-plane
+/// sync, file reload, cached-config restore) gets its cert, and a removed site
+/// drops out of the fallback map. The minting runs on a blocking thread.
+pub fn spawn_site_cert_sync(
+    store: Arc<CertStore>,
+    config: ConfigHandle,
+) -> tokio::task::JoinHandle<()> {
+    spawn_site_cert_sync_every(store, config, SITE_SYNC_INTERVAL)
+}
+
+fn spawn_site_cert_sync_every(
+    store: Arc<CertStore>,
+    config: ConfigHandle,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // The config last examined is held, not its address: a freed address
+        // can be reused by the next config and the change would be missed.
+        let mut seen: Option<Arc<SentinelConfig>> = None;
+        let mut names_seen: Option<HashSet<String>> = None;
+        loop {
+            let cfg = config.load_full();
+            if !seen.as_ref().is_some_and(|s| Arc::ptr_eq(s, &cfg)) {
+                let names = site_cert_names(&cfg.sites);
+                seen = Some(cfg);
+                if names_seen.as_ref() != Some(&names) {
+                    store.sync_site_fallbacks(names.clone()).await;
+                    names_seen = Some(names);
+                }
+            }
+            tokio::time::sleep(interval).await;
+        }
+    })
 }
 
 impl CertStore {
@@ -112,16 +203,44 @@ impl CertStore {
         Arc::new(Self {
             live: DashMap::new(),
             alpn_challenge: DashMap::new(),
+            fallback: RwLock::new(SiteFallbacks::default()),
+            default_cert: ArcSwapOption::empty(),
             cert_dir,
         })
     }
 
+    // A panic elsewhere must not take TLS down with it: the guarded data is a
+    // plain map that is never left half-updated, so a poisoned lock is usable.
+    fn fallback_read(&self) -> RwLockReadGuard<'_, SiteFallbacks> {
+        self.fallback.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn fallback_write(&self) -> RwLockWriteGuard<'_, SiteFallbacks> {
+        self.fallback
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Load all persisted certs from `cert_dir/{domain}/` on startup.
-    pub fn load_from_disk(&self) -> Result<usize> {
+    ///
+    /// `site_names` are the configured site names (see `site_cert_names`). A
+    /// self-signed cert for one of them becomes that site's fallback; one for any
+    /// other name is skipped and counted, never deleted. Those directories are
+    /// what the old resolver minted for whatever SNI a client sent, and loading
+    /// them would rebuild the unbounded map at every boot.
+    pub fn load_from_disk(&self, site_names: &HashSet<String>) -> Result<usize> {
+        // Recorded first, so a load that fails part-way still leaves the sync
+        // task knowing which names to mint.
+        {
+            let mut fb = self.fallback_write();
+            fb.configured = site_names.clone();
+            fb.certs.retain(|name, _| site_names.contains(name));
+        }
         std::fs::create_dir_all(&self.cert_dir)
             .with_context(|| format!("creating cert dir: {}", self.cert_dir.display()))?;
 
         let mut count = 0;
+        let mut skipped = 0usize;
         for entry in std::fs::read_dir(&self.cert_dir)
             .with_context(|| format!("reading cert dir: {}", self.cert_dir.display()))?
         {
@@ -157,10 +276,33 @@ impl CertStore {
                 }
             };
 
+            // A site's self-signed cert goes to the fallback map; operator certs
+            // and reserved keys (the management cert, even self-signed) to `live`.
+            let fallback_name = (meta.source == CertSource::SelfSigned
+                && !meta.domain.starts_with(RESERVED_PREFIX))
+            .then(|| meta.domain.to_ascii_lowercase());
+            if let Some(name) = &fallback_name {
+                // Adopted by `ensure_default_cert`, and not a site's cert.
+                if name == DEFAULT_CERT_KEY {
+                    continue;
+                }
+                if !site_names.contains(name) {
+                    skipped += 1;
+                    continue;
+                }
+            }
+
             match load_pem_files(&cert_file, &key_file) {
                 Ok(ck) => {
-                    self.live
-                        .insert(meta.domain.clone(), Arc::new(CertEntry { key: ck, meta }));
+                    let entry = Arc::new(CertEntry { key: ck, meta });
+                    match fallback_name {
+                        Some(name) => {
+                            self.fallback_write().certs.insert(name, entry);
+                        }
+                        None => {
+                            self.live.insert(entry.meta.domain.clone(), entry);
+                        }
+                    }
                     count += 1;
                 }
                 Err(e) => {
@@ -168,11 +310,125 @@ impl CertStore {
                 }
             }
         }
+        if skipped > 0 {
+            tracing::info!(
+                skipped,
+                "left self-signed certificates for names no site is configured for \
+                 on disk, unloaded"
+            );
+        }
         Ok(count)
     }
 
+    /// The certificate served for every name no site is configured for, and to
+    /// clients that send no SNI. One for the whole fleet, persisted like the
+    /// others so every node and every restart serve the same bytes. Created at
+    /// startup (resolver construction), so no handshake ever has to.
+    pub fn ensure_default_cert(&self) -> Option<Arc<CertifiedKey>> {
+        if let Some(ck) = self.default_cert.load_full() {
+            return Some(ck);
+        }
+        let ck = self.adopt_or_create_self_signed(DEFAULT_CERT_KEY)?;
+        self.default_cert.store(Some(Arc::clone(&ck)));
+        Some(ck)
+    }
+
+    /// Point the fallback map at the configured `names`: certs for names no
+    /// longer configured are dropped, and the names still lacking any cert are
+    /// returned for `ensure_site_fallbacks`. Cheap — no keygen, no disk.
+    pub fn set_site_names(&self, names: HashSet<String>) -> Vec<String> {
+        let mut fb = self.fallback_write();
+        fb.certs.retain(|name, _| names.contains(name));
+        let missing = names
+            .iter()
+            .filter(|n| !fb.certs.contains_key(*n) && !self.live.contains_key(*n))
+            .cloned()
+            .collect();
+        fb.configured = names;
+        missing
+    }
+
+    /// Adopt or create the shared self-signed cert for each of `names` that is
+    /// still configured and still has no cert. Blocking (keygen and disk), so the
+    /// sync task runs it on a blocking thread; returns how many were added.
+    pub fn ensure_site_fallbacks(&self, names: &[String]) -> usize {
+        let mut added = 0;
+        for name in names {
+            // The site may have been removed, or given a real cert, mid-batch.
+            if !self.needs_site_fallback(name) {
+                continue;
+            }
+            let Some(ck) = self.adopt_or_create_self_signed(name) else {
+                tracing::warn!(
+                    domain = %name,
+                    "could not create a self-signed certificate; serving the default one"
+                );
+                continue;
+            };
+            let entry = Arc::new(CertEntry {
+                key: ck,
+                meta: self_signed_meta(name),
+            });
+            let mut fb = self.fallback_write();
+            // Checked again under the lock: an entry for a name a concurrent sync
+            // just dropped is exactly the growth this map exists to prevent.
+            if fb.configured.contains(name) && !self.live.contains_key(name) {
+                fb.certs.insert(name.clone(), entry);
+                added += 1;
+            }
+        }
+        added
+    }
+
+    /// `set_site_names`, then mint what is missing on a blocking thread.
+    pub async fn sync_site_fallbacks(self: &Arc<Self>, names: HashSet<String>) -> usize {
+        let missing = self.set_site_names(names);
+        if missing.is_empty() {
+            return 0;
+        }
+        let store = Arc::clone(self);
+        match tokio::task::spawn_blocking(move || store.ensure_site_fallbacks(&missing)).await {
+            Ok(added) => {
+                if added > 0 {
+                    tracing::info!(
+                        certs = added,
+                        "self-signed certificates ready for new sites"
+                    );
+                }
+                added
+            }
+            Err(e) => {
+                tracing::warn!("minting self-signed site certificates failed: {e}");
+                0
+            }
+        }
+    }
+
+    fn needs_site_fallback(&self, name: &str) -> bool {
+        let fb = self.fallback_read();
+        fb.configured.contains(name)
+            && !fb.certs.contains_key(name)
+            && !self.live.contains_key(name)
+    }
+
     /// Return the shared self-signed cert for `domain`, creating it once if no
-    /// node has yet.
+    /// node has yet, and record it in `live`.
+    ///
+    /// This is how a reserved key (the management listener's cert) gets its
+    /// self-signed default. Site names go through `ensure_site_fallbacks`
+    /// instead, into the bounded fallback map that ACME decisions do not see.
+    pub fn self_signed_shared(&self, domain: &str) -> Option<Arc<CertifiedKey>> {
+        // Someone — possibly this process, at boot — already has it.
+        if let Some(e) = self.live.get(domain) {
+            return Some(Arc::clone(&e.key));
+        }
+        let ck = self.adopt_or_create_self_signed(domain)?;
+        self.remember_self_signed(domain, Arc::clone(&ck));
+        Some(ck)
+    }
+
+    /// The fleet's shared self-signed cert for `domain`: adopted from the cert
+    /// volume, or created there if no node has yet. Touches no in-memory map.
     ///
     /// The point is convergence across a fleet. `cert_dir` is a volume shared by
     /// every node, so the FIRST node to need a name writes the cert and the
@@ -191,12 +447,7 @@ impl CertStore {
     /// cannot be written (read-only volume, no permissions) still yields a
     /// working in-memory cert, because refusing TLS would be worse than an
     /// inconsistent cert.
-    pub fn self_signed_shared(&self, domain: &str) -> Option<Arc<CertifiedKey>> {
-        // Someone — possibly this process, at boot — already has it.
-        if let Some(e) = self.live.get(domain) {
-            return Some(Arc::clone(&e.key));
-        }
-
+    fn adopt_or_create_self_signed(&self, domain: &str) -> Option<Arc<CertifiedKey>> {
         let dir = self.cert_dir.join(domain_to_dirname(domain));
         let cert_file = dir.join("cert.pem");
         let key_file = dir.join("key.pem");
@@ -204,7 +455,6 @@ impl CertStore {
         // Another node may have written it since this process started.
         if cert_file.exists() && key_file.exists() {
             if let Ok(ck) = load_pem_files(&cert_file, &key_file) {
-                self.remember_self_signed(domain, Arc::clone(&ck));
                 tracing::debug!(domain, "adopted the fleet's shared self-signed cert");
                 return Some(ck);
             }
@@ -221,11 +471,9 @@ impl CertStore {
 
         // Re-read regardless of who won, so every node ends up serving the same
         // bytes. Only fall back to our own copy if the store is unusable.
-        let ck = load_pem_files(&cert_file, &key_file)
+        load_pem_files(&cert_file, &key_file)
             .or_else(|_| load_pem_bytes(cert_pem.as_bytes(), key_pem.as_bytes()))
-            .ok()?;
-        self.remember_self_signed(domain, Arc::clone(&ck));
-        Some(ck)
+            .ok()
     }
 
     /// Write the cert files only if absent, atomically claiming the name.
@@ -274,17 +522,7 @@ impl CertStore {
     }
 
     fn remember_self_signed(&self, domain: &str, ck: Arc<CertifiedKey>) {
-        let meta = CertMeta {
-            domain: domain.to_string(),
-            name: String::new(),
-            san: vec![domain.to_string(), format!("*.{domain}")],
-            issued_at: 0,
-            expires_at: 0,
-            fingerprint: String::new(),
-            source: CertSource::SelfSigned,
-            issuer: String::new(),
-            key_type: String::new(),
-        };
+        let meta = self_signed_meta(domain);
         self.live
             .insert(domain.to_string(), Arc::new(CertEntry { key: ck, meta }));
     }
@@ -322,6 +560,11 @@ impl CertStore {
 
         self.live
             .insert(domain.to_string(), Arc::new(CertEntry { key: ck, meta }));
+        // The self-signed cert this replaces would only be listed beside it; its
+        // files were just overwritten anyway.
+        self.fallback_write()
+            .certs
+            .remove(&domain.to_ascii_lowercase());
         tracing::info!(domain, "TLS cert installed and hot-swapped");
         Ok(())
     }
@@ -332,6 +575,12 @@ impl CertStore {
         if dir.exists() {
             std::fs::remove_dir_all(&dir)?;
         }
+        // A site's self-signed cert lived in that directory too. A site that is
+        // still configured gets a fresh one now, in this admin call, rather than
+        // the default cert until the next config change.
+        let name = domain.to_ascii_lowercase();
+        self.fallback_write().certs.remove(&name);
+        self.ensure_site_fallbacks(&[name]);
         Ok(())
     }
 
@@ -352,24 +601,66 @@ impl CertStore {
         let key_pem = std::fs::read_to_string(dir.join("key.pem"))?;
         let ck = load_pem_bytes(cert_pem.as_bytes(), key_pem.as_bytes())
             .context("reloading cert after rename")?;
-        self.live
-            .insert(domain.to_string(), Arc::new(CertEntry { key: ck, meta }));
+        let entry = Arc::new(CertEntry { key: ck, meta });
+        // Renaming a site's self-signed cert must not promote it into `live`,
+        // where `get_meta` would report it as issued and hold off ACME.
+        if entry.meta.source == CertSource::SelfSigned && !domain.starts_with(RESERVED_PREFIX) {
+            let name = domain.to_ascii_lowercase();
+            let mut fb = self.fallback_write();
+            if fb.configured.contains(&name) {
+                fb.certs.insert(name, entry);
+            }
+        } else {
+            self.live.insert(domain.to_string(), entry);
+        }
         Ok(())
     }
 
     /// All cert metadata for the customer cert repository (the dashboard API).
     /// Internal/reserved certs (e.g. the management cert) are hidden so they
     /// can't be listed, renamed, or deleted from the customer cert page.
+    /// Configured sites still on their self-signed cert are listed too.
     pub fn all_meta(&self) -> Vec<CertMeta> {
-        self.live
+        let mut all: Vec<CertMeta> = self
+            .live
             .iter()
             .filter(|e| !e.key().starts_with(RESERVED_PREFIX))
             .map(|e| e.value().meta.clone())
-            .collect()
+            .collect();
+        let fb = self.fallback_read();
+        all.extend(
+            fb.certs
+                .iter()
+                .filter(|(name, _)| !self.live.contains_key(name.as_str()))
+                .map(|(_, e)| e.meta.clone()),
+        );
+        all
     }
 
+    /// Metadata of the operator cert answering for `domain`: its own entry, else
+    /// a cert that lists it in its SAN. Self-signed fallbacks are deliberately
+    /// not reported — ACME issuance and renewal read this, and a self-signed
+    /// cert (which never expires by its metadata) would hold them off for ever.
+    ///
+    /// The SAN match matters because an ACME order is stored under its first
+    /// name only. The other names used to be "covered" by accident, by the
+    /// self-signed cert a handshake had minted for them; without the match the
+    /// renewal loop would re-order such a site every hour.
     pub fn get_meta(&self, domain: &str) -> Option<CertMeta> {
-        self.live.get(domain).map(|e| e.value().meta.clone())
+        if let Some(e) = self.live.get(domain) {
+            return Some(e.value().meta.clone());
+        }
+        self.live
+            .iter()
+            .filter(|e| !e.key().starts_with(RESERVED_PREFIX))
+            .find(|e| {
+                e.value()
+                    .meta
+                    .san
+                    .iter()
+                    .any(|s| s.eq_ignore_ascii_case(domain))
+            })
+            .map(|e| e.value().meta.clone())
     }
 
     /// Install (or replace) the management-console certificate, hot-swapped with
@@ -478,6 +769,20 @@ impl CertStore {
         }
         None
     }
+
+    /// The self-signed cert of a configured site, matched like `resolve_live`.
+    fn resolve_site_fallback(&self, sni: &str) -> Option<Arc<CertifiedKey>> {
+        let fb = self.fallback_read();
+        if let Some(e) = fb.certs.get(sni) {
+            return Some(Arc::clone(&e.key));
+        }
+        let parent = sni.split_once('.').map(|(_, rest)| format!("*.{rest}"))?;
+        fb.certs.get(&parent).map(|e| Arc::clone(&e.key))
+    }
+
+    fn default_cert(&self) -> Option<Arc<CertifiedKey>> {
+        self.default_cert.load_full()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -486,8 +791,6 @@ impl CertStore {
 
 pub struct SentinelCertResolver {
     store: Arc<CertStore>,
-    /// Self-signed fallback (generated once per domain, cached).
-    fallback: Mutex<HashMap<String, Arc<CertifiedKey>>>,
     /// When set, every handshake resolves THIS store key regardless of SNI.
     /// Used by the management listener to always serve the management cert.
     fixed_key: Option<String>,
@@ -501,10 +804,12 @@ impl std::fmt::Debug for SentinelCertResolver {
 }
 
 impl SentinelCertResolver {
+    /// Resolver for the SNI listeners. The default certificate is made sure of
+    /// here, at listener startup, so `resolve` never has to create one.
     pub fn new(store: Arc<CertStore>) -> Arc<Self> {
+        store.ensure_default_cert();
         Arc::new(Self {
             store,
-            fallback: Mutex::new(HashMap::new()),
             fixed_key: None,
         })
     }
@@ -513,102 +818,90 @@ impl SentinelCertResolver {
     /// falling back to a self-signed cert for `key` until one is uploaded. This
     /// backs the management listener: it's a single-purpose HTTPS endpoint, so
     /// there's no SNI multiplexing — one cert, hot-swappable.
+    ///
+    /// The self-signed cert is persisted and shared: the first node to need it
+    /// writes it to the cert volume and every node — and every restart — serves
+    /// the same bytes until an operator uploads a real one. A per-process cert
+    /// put the browser's certificate warning back on the console at every roll.
+    /// It is minted here, at listener startup, not in the first handshake.
     pub fn new_fixed(store: Arc<CertStore>, key: &str) -> Arc<Self> {
+        store.ensure_default_cert();
+        if store.resolve_live(key).is_none() {
+            let _ = store.self_signed_shared(key);
+        }
         Arc::new(Self {
             store,
-            fallback: Mutex::new(HashMap::new()),
             fixed_key: Some(key.to_string()),
         })
     }
 
-    /// Pre-warm the self-signed fallback cache for known domains.
-    pub fn pre_warm(&self, domains: &[String]) {
-        let mut fb = self.fallback.lock().expect("fallback lock");
-        for d in domains {
-            if self.store.resolve_live(d).is_none() {
-                if let Ok(ck) = generate_self_signed(d) {
-                    fb.insert(d.clone(), ck);
-                }
-            }
-        }
-    }
-}
-
-impl ResolvesServerCert for SentinelCertResolver {
-    fn resolve(&self, client_hello: rustls::server::ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        // Fixed-key mode (management listener): always serve the one configured
-        // cert, regardless of SNI, with a self-signed fallback until uploaded.
+    /// Pick the certificate for one handshake.
+    ///
+    /// Lookups only. This used to mint and persist a self-signed cert for any
+    /// SNI it had not seen, so every name a scanner tried cost a key generation,
+    /// a directory on the shared cert volume and an entry in two maps that were
+    /// never pruned — at the client's choosing, before any WAF check ran. A name
+    /// with no cert of its own now gets the default certificate.
+    fn select(&self, sni: Option<&str>, acme_alpn: bool) -> Option<Arc<CertifiedKey>> {
+        // Fixed-key mode (management listener): always the one configured cert,
+        // regardless of SNI.
         if let Some(key) = &self.fixed_key {
-            if let Some(ck) = self.store.resolve_live(key) {
-                return Some(ck);
-            }
-            {
-                let fb = self.fallback.lock().expect("fallback lock");
-                if let Some(ck) = fb.get(key) {
-                    return Some(Arc::clone(ck));
-                }
-            }
-            // Persisted and shared, like the site fallback below. This used to be
-            // a per-process in-memory cert, so every data-plane restart minted a
-            // new management cert and every roll put the browser's certificate
-            // warning back on the console. Now the first node to need it writes
-            // it to the cert volume and every node — and every restart — serves
-            // the same bytes until an operator uploads a real one.
-            let ck = self.store.self_signed_shared(key)?;
-            self.fallback
-                .lock()
-                .expect("fallback lock")
-                .insert(key.clone(), Arc::clone(&ck));
-            return Some(ck);
+            return self
+                .store
+                .resolve_live(key)
+                .or_else(|| self.store.default_cert());
         }
 
         // Clients connecting by bare IP (and some older clients) send no SNI.
-        // Serve a stable default self-signed cert so the handshake still
-        // completes — Host-header routing then selects the site. Without this,
-        // returning None here would abort the handshake and break IP access.
-        let sni = client_hello.server_name().unwrap_or("default");
+        // They get the default cert so the handshake still completes — Host-header
+        // routing then selects the site. Returning None would abort the handshake
+        // and break IP access.
+        let sni = sni.unwrap_or(DEFAULT_CERT_KEY);
 
         // 1. TLS-ALPN-01 challenge takes highest priority
-        let is_acme_alpn = client_hello
-            .alpn()
-            .map(|mut it| it.any(|p| p == b"acme-tls/1"))
-            .unwrap_or(false);
-        if is_acme_alpn {
+        if acme_alpn {
             if let Some(ck) = self.store.alpn_challenge.get(sni) {
                 return Some(Arc::clone(ck.value()));
             }
         }
 
-        // 2. Live ACME / manual cert
-        if let Some(ck) = self.store.resolve_live(sni) {
-            return Some(ck);
-        }
+        // 2. Live ACME / manual cert, 3. a configured site's self-signed cert,
+        // 4. the default cert for everything else.
+        self.store
+            .resolve_live(sni)
+            .or_else(|| self.store.resolve_site_fallback(sni))
+            .or_else(|| self.store.default_cert())
+    }
+}
 
-        // 3. Self-signed fallback, SHARED across the fleet.
-        //
-        // Was a per-process in-memory cache, which meant three nodes served
-        // three different certificates for the same name — invisible while one
-        // node owned :443, and a browser warning on every other request once the
-        // load balancer began spreading it. Now the first node to need a name
-        // persists the cert to the shared volume and the others adopt it.
-        {
-            let fb = self.fallback.lock().expect("fallback lock");
-            if let Some(ck) = fb.get(sni) {
-                return Some(Arc::clone(ck));
-            }
-        }
-        let ck = self.store.self_signed_shared(sni)?;
-        self.fallback
-            .lock()
-            .expect("fallback lock")
-            .insert(sni.to_string(), Arc::clone(&ck));
-        Some(ck)
+impl ResolvesServerCert for SentinelCertResolver {
+    fn resolve(&self, client_hello: rustls::server::ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        let acme_alpn = client_hello
+            .alpn()
+            .map(|mut it| it.any(|p| p == b"acme-tls/1"))
+            .unwrap_or(false);
+        self.select(client_hello.server_name(), acme_alpn)
     }
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Metadata for a self-signed cert held in memory.
+fn self_signed_meta(domain: &str) -> CertMeta {
+    CertMeta {
+        domain: domain.to_string(),
+        name: String::new(),
+        san: vec![domain.to_string(), format!("*.{domain}")],
+        issued_at: 0,
+        expires_at: 0,
+        fingerprint: String::new(),
+        source: CertSource::SelfSigned,
+        issuer: String::new(),
+        key_type: String::new(),
+    }
+}
 
 /// Generate a self-signed cert for `domain` and return it as PEM.
 ///
@@ -973,5 +1266,507 @@ mod tests {
             s.self_signed_shared("x.example.com").is_some(),
             "a read-only or missing cert dir must not take HTTPS down"
         );
+    }
+
+    // ── resolver: lookups only ───────────────────────────────────────────────
+
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::pki_types::{ServerName, UnixTime};
+    use rustls::{DigitallySignedStruct, SignatureScheme};
+
+    /// The client side of a test handshake trusts anything: what is under test
+    /// is WHICH certificate the server picks, not whether it chains.
+    #[derive(Debug)]
+    struct AcceptAnyCert;
+
+    impl ServerCertVerifier for AcceptAnyCert {
+        fn verify_server_cert(
+            &self,
+            _: &CertificateDer<'_>,
+            _: &[CertificateDer<'_>],
+            _: &ServerName<'_>,
+            _: &[u8],
+            _: UnixTime,
+        ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _: &[u8],
+            _: &CertificateDer<'_>,
+            _: &DigitallySignedStruct,
+        ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _: &[u8],
+            _: &CertificateDer<'_>,
+            _: &DigitallySignedStruct,
+        ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            rustls::crypto::aws_lc_rs::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
+    /// A full in-memory TLS handshake against `resolver`; returns the leaf
+    /// certificate the server presented. `None` sends no SNI — what a browser
+    /// does for `https://<ip>/`.
+    fn handshake(resolver: &Arc<SentinelCertResolver>, sni: Option<&str>) -> Vec<u8> {
+        use rustls::{ClientConfig, ClientConnection, ServerConfig, ServerConnection};
+        // Explicit provider: both aws-lc-rs and ring are compiled in, so the
+        // process-default builder would panic.
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let server_cfg = ServerConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::clone(resolver) as Arc<dyn ResolvesServerCert>);
+        let client_cfg = ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert))
+            .with_no_client_auth();
+        // rustls never sends an IP address as SNI.
+        let name = match sni {
+            Some(n) => ServerName::try_from(n.to_string()).expect("valid DNS name"),
+            None => ServerName::IpAddress(std::net::Ipv4Addr::new(192, 0, 2, 1).into()),
+        };
+        let mut client = ClientConnection::new(Arc::new(client_cfg), name).unwrap();
+        let mut server = ServerConnection::new(Arc::new(server_cfg)).unwrap();
+        for _ in 0..10 {
+            if !client.is_handshaking() && !server.is_handshaking() {
+                break;
+            }
+            let mut wire = Vec::new();
+            while client.wants_write() {
+                client.write_tls(&mut wire).unwrap();
+            }
+            let mut rd = wire.as_slice();
+            while !rd.is_empty() {
+                server.read_tls(&mut rd).unwrap();
+                server.process_new_packets().expect("server handshake");
+            }
+            let mut wire = Vec::new();
+            while server.wants_write() {
+                server.write_tls(&mut wire).unwrap();
+            }
+            let mut rd = wire.as_slice();
+            while !rd.is_empty() {
+                client.read_tls(&mut rd).unwrap();
+                client.process_new_packets().expect("client handshake");
+            }
+        }
+        client
+            .peer_certificates()
+            .expect("the server presented a certificate")[0]
+            .as_ref()
+            .to_vec()
+    }
+
+    /// Every file and directory under `dir`, recursively.
+    fn count_entries(dir: &Path) -> usize {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| {
+                        1 + if e.path().is_dir() {
+                            count_entries(&e.path())
+                        } else {
+                            0
+                        }
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    fn names(list: &[&str]) -> HashSet<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn site(id: &str, domains: &[&str]) -> SiteConfig {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "domains": domains,
+            "upstream": { "servers": [] },
+        }))
+        .expect("site config")
+    }
+
+    fn config_with(sites: Vec<SiteConfig>) -> ConfigHandle {
+        Arc::new(arc_swap::ArcSwap::from_pointee(SentinelConfig {
+            sites,
+            ..Default::default()
+        }))
+    }
+
+    fn leaf(ck: &Arc<CertifiedKey>) -> Vec<u8> {
+        ck.cert[0].as_ref().to_vec()
+    }
+
+    fn pem_leaf(path: &Path) -> Vec<u8> {
+        let pem = std::fs::read(path).expect("cert.pem");
+        let der = rustls_pemfile::certs(&mut pem.as_slice())
+            .next()
+            .expect("one cert")
+            .expect("parse");
+        der.as_ref().to_vec()
+    }
+
+    /// The defect: the resolver minted and persisted a certificate for any SNI
+    /// it had not seen. Every name a scanner sent cost a key generation, a
+    /// directory on the shared cert volume, and an entry in two maps nothing
+    /// ever pruned — at the client's choosing, before any WAF check ran.
+    #[test]
+    fn resolving_many_unconfigured_names_writes_nothing_and_grows_nothing() {
+        let dir = tmp_dir();
+        let store = CertStore::new(dir.clone());
+        store.load_from_disk(&names(&["shop.example.com"])).unwrap();
+        store.ensure_site_fallbacks(&["shop.example.com".to_string()]);
+        let resolver = SentinelCertResolver::new(Arc::clone(&store));
+        let default_cert = handshake(&resolver, None);
+        let shop = handshake(&resolver, Some("shop.example.com"));
+
+        let entries_before = count_entries(&dir);
+        let live_before = store.live.len();
+        let fallback_before = store.fallback_read().certs.len();
+
+        let served: Vec<Vec<u8>> = (0..200)
+            .map(|i| handshake(&resolver, Some(&format!("probe-{i}.scanner.example"))))
+            .collect();
+
+        assert_eq!(
+            count_entries(&dir),
+            entries_before,
+            "a handshake for an unconfigured name wrote to the cert volume"
+        );
+        assert_eq!(store.live.len(), live_before, "the live map grew");
+        assert_eq!(
+            store.fallback_read().certs.len(),
+            fallback_before,
+            "the fallback map grew"
+        );
+        assert!(
+            served.iter().all(|c| *c == default_cert),
+            "an unconfigured name must be served the default certificate"
+        );
+        // The configured site still has its own.
+        assert_ne!(shop, default_cert);
+        assert_eq!(handshake(&resolver, Some("shop.example.com")), shop);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Wait (bounded) for the background sync to produce `f`'s answer.
+    async fn eventually<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
+        for _ in 0..500 {
+            if let Some(v) = f() {
+                return v;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for: {what}");
+    }
+
+    /// A configured site with no certificate gets its own self-signed one from
+    /// the background sync — at startup, and when a later sync adds a site —
+    /// and a removed site drops out of the fallback map.
+    #[tokio::test]
+    async fn a_configured_site_without_a_cert_gets_one_after_sync() {
+        let dir = tmp_dir();
+        let store = CertStore::new(dir.clone());
+        let config = config_with(vec![site("shop", &["shop.example.com"])]);
+        store
+            .load_from_disk(&site_cert_names(&config.load().sites))
+            .unwrap();
+        let resolver = SentinelCertResolver::new(Arc::clone(&store));
+        let default_cert = handshake(&resolver, None);
+
+        // Before the sync has run the site is on the default cert, and asking
+        // for it did not make the handshake mint one.
+        assert_eq!(handshake(&resolver, Some("shop.example.com")), default_cert);
+        assert!(!dir.join("shop.example.com").exists());
+
+        let task = spawn_site_cert_sync_every(
+            Arc::clone(&store),
+            Arc::clone(&config),
+            Duration::from_millis(10),
+        );
+        let shop = eventually("the configured site's own cert", || {
+            let c = handshake(&resolver, Some("shop.example.com"));
+            (c != default_cert).then_some(c)
+        })
+        .await;
+        assert_eq!(
+            pem_leaf(&dir.join("shop.example.com").join("cert.pem")),
+            shop,
+            "the site cert must be the one on the shared volume, or nodes diverge"
+        );
+
+        // A later sync adds a site: it gets its own as well.
+        config.store(Arc::new(SentinelConfig {
+            sites: vec![
+                site("shop", &["shop.example.com"]),
+                site("api", &["API.Example.com"]),
+            ],
+            ..Default::default()
+        }));
+        let api = eventually("the added site's cert", || {
+            let c = handshake(&resolver, Some("api.example.com"));
+            (c != default_cert).then_some(c)
+        })
+        .await;
+        assert_ne!(api, shop);
+
+        // A sync that removes a site prunes the map; the name falls to the
+        // default cert. Nothing is deleted from the volume.
+        config.store(Arc::new(SentinelConfig {
+            sites: vec![site("api", &["api.example.com"])],
+            ..Default::default()
+        }));
+        eventually("the removed site to fall back to the default cert", || {
+            (handshake(&resolver, Some("shop.example.com")) == default_cert).then_some(())
+        })
+        .await;
+        assert_eq!(store.fallback_read().certs.len(), 1);
+        assert!(dir.join("shop.example.com").join("cert.pem").exists());
+        task.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No SNI (bare-IP access) still completes the handshake, with the one
+    /// persisted default cert — the same bytes on every node and restart.
+    #[test]
+    fn no_sni_gets_the_shared_default_cert() {
+        let dir = tmp_dir();
+        let a = CertStore::new(dir.clone());
+        a.load_from_disk(&names(&["shop.example.com"])).unwrap();
+        let ra = SentinelCertResolver::new(Arc::clone(&a));
+        let served = handshake(&ra, None);
+        assert_eq!(
+            served,
+            pem_leaf(&dir.join(DEFAULT_CERT_KEY).join("cert.pem"))
+        );
+
+        // Another node over the same volume serves the same default cert, for no
+        // SNI and for a name it has no cert for.
+        let b = CertStore::new(dir.clone());
+        b.load_from_disk(&names(&["shop.example.com"])).unwrap();
+        let rb = SentinelCertResolver::new(Arc::clone(&b));
+        assert_eq!(handshake(&rb, None), served);
+        assert_eq!(handshake(&rb, Some("unknown.example.net")), served);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TLS-ALPN-01 keeps priority over every other cert, and live certs over the
+    /// self-signed fallback.
+    #[test]
+    fn acme_challenge_then_live_then_fallback_then_default() {
+        let dir = tmp_dir();
+        let store = CertStore::new(dir.clone());
+        store.load_from_disk(&names(&["shop.example.com"])).unwrap();
+        store.ensure_site_fallbacks(&["shop.example.com".to_string()]);
+        let resolver = SentinelCertResolver::new(Arc::clone(&store));
+        let fallback = leaf(&resolver.select(Some("shop.example.com"), false).unwrap());
+
+        let (cert, key) = self_signed_pem("shop.example.com");
+        let mut m = meta("fp");
+        m.domain = "shop.example.com".into();
+        store.install("shop.example.com", &cert, &key, m).unwrap();
+        let live = leaf(&resolver.select(Some("shop.example.com"), false).unwrap());
+        assert_ne!(live, fallback, "a manual cert must win over the fallback");
+
+        let challenge = generate_self_signed("shop.example.com").unwrap();
+        store.set_alpn_challenge("shop.example.com", Arc::clone(&challenge));
+        assert_eq!(
+            leaf(&resolver.select(Some("shop.example.com"), true).unwrap()),
+            leaf(&challenge),
+            "the acme-tls/1 challenge cert must win"
+        );
+        // Only for a challenge handshake.
+        assert_eq!(
+            leaf(&resolver.select(Some("shop.example.com"), false).unwrap()),
+            live
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A configured wildcard site covers one label below it, as a live wildcard
+    /// cert does.
+    #[test]
+    fn a_wildcard_site_cert_covers_its_subdomains() {
+        let dir = tmp_dir();
+        let store = CertStore::new(dir.clone());
+        store.load_from_disk(&names(&["*.example.com"])).unwrap();
+        assert_eq!(
+            store.ensure_site_fallbacks(&["*.example.com".to_string()]),
+            1
+        );
+        let resolver = SentinelCertResolver::new(Arc::clone(&store));
+        let default_cert = leaf(&store.default_cert().unwrap());
+        let sub = leaf(&resolver.select(Some("shop.example.com"), false).unwrap());
+        assert_ne!(sub, default_cert);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// At startup, self-signed dirs for names no site is configured for — what
+    /// the old resolver left on the volume for every probed SNI — are skipped,
+    /// counted and left in place. Everything else loads as before.
+    #[test]
+    fn startup_skips_self_signed_dirs_for_unconfigured_names() {
+        let dir = tmp_dir();
+        {
+            // What a fleet running the old resolver left on the volume.
+            let old = CertStore::new(dir.clone());
+            for n in ["junk-1.example", "junk-2.example", "shop.example.com"] {
+                old.self_signed_shared(n).unwrap();
+            }
+            old.self_signed_shared(MANAGEMENT_CERT_KEY).unwrap();
+            old.self_signed_shared(DEFAULT_CERT_KEY).unwrap();
+            let (cert, key) = self_signed_pem("manual.example.com");
+            let mut m = meta("fp");
+            m.domain = "manual.example.com".into();
+            old.install("manual.example.com", &cert, &key, m).unwrap();
+        }
+
+        let store = CertStore::new(dir.clone());
+        let loaded = store
+            .load_from_disk(&names(&["shop.example.com", "manual.example.com"]))
+            .unwrap();
+        assert_eq!(loaded, 3, "shop (fallback), manual and management");
+        assert!(store.live.contains_key("manual.example.com"));
+        assert!(store.live.contains_key(MANAGEMENT_CERT_KEY));
+        assert!(!store.live.contains_key("junk-1.example"));
+        assert!(!store.live.contains_key("shop.example.com"));
+        assert!(store.fallback_read().certs.contains_key("shop.example.com"));
+        assert_eq!(store.fallback_read().certs.len(), 1);
+        // Delete nothing.
+        assert!(dir.join("junk-1.example").join("cert.pem").exists());
+        assert!(dir.join("junk-2.example").join("cert.pem").exists());
+
+        // A self-signed cert is never reported as issued: ACME would wait for
+        // ever behind it. It is still listed for the console.
+        assert!(store.get_meta("shop.example.com").is_none());
+        let listed: Vec<String> = store.all_meta().into_iter().map(|m| m.domain).collect();
+        assert!(listed.contains(&"shop.example.com".to_string()));
+        assert!(listed.contains(&"manual.example.com".to_string()));
+        assert!(!listed.iter().any(|d| d.starts_with("junk")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Installing a real cert supersedes the fallback (one listing row);
+    /// removing it gives the still-configured site a fresh self-signed cert in
+    /// that admin call, not the default cert.
+    #[test]
+    fn install_replaces_the_fallback_and_remove_restores_one() {
+        let dir = tmp_dir();
+        let store = CertStore::new(dir.clone());
+        store.load_from_disk(&names(&["shop.example.com"])).unwrap();
+        store.ensure_site_fallbacks(&["shop.example.com".to_string()]);
+        let resolver = SentinelCertResolver::new(Arc::clone(&store));
+        let default_cert = leaf(&store.default_cert().unwrap());
+
+        let (cert, key) = self_signed_pem("shop.example.com");
+        let mut m = meta("fp");
+        m.domain = "shop.example.com".into();
+        store.install("shop.example.com", &cert, &key, m).unwrap();
+        let manual = leaf(&resolver.select(Some("shop.example.com"), false).unwrap());
+        let rows: Vec<CertMeta> = store
+            .all_meta()
+            .into_iter()
+            .filter(|m| m.domain == "shop.example.com")
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source, CertSource::Manual);
+
+        store.remove("shop.example.com").unwrap();
+        let after = leaf(&resolver.select(Some("shop.example.com"), false).unwrap());
+        assert_ne!(after, manual);
+        assert_ne!(after, default_cert);
+        assert_eq!(
+            pem_leaf(&dir.join("shop.example.com").join("cert.pem")),
+            after
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cert minted for a site that a sync removed meanwhile is not kept.
+    #[test]
+    fn a_site_removed_mid_batch_is_not_added() {
+        let dir = tmp_dir();
+        let store = CertStore::new(dir.clone());
+        let missing = store.set_site_names(names(&["gone.example.com"]));
+        assert_eq!(missing, vec!["gone.example.com".to_string()]);
+        store.set_site_names(HashSet::new());
+        assert_eq!(store.ensure_site_fallbacks(&missing), 0);
+        assert!(store.fallback_read().certs.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An ACME order is stored under its first name. Its other names must read
+    /// as covered, or the renewal loop re-orders the site every hour.
+    #[test]
+    fn get_meta_answers_for_a_name_in_an_issued_certs_san() {
+        let store = tmp_store();
+        let (cert, key) = self_signed_pem("example.org");
+        let m = CertMeta {
+            domain: "example.org".into(),
+            name: String::new(),
+            san: vec!["example.org".into(), "www.example.org".into()],
+            issued_at: 1,
+            expires_at: 2,
+            fingerprint: "fp".into(),
+            source: CertSource::Acme {
+                provider: "LetsEncrypt".into(),
+                email: "ops@example.org".into(),
+            },
+            issuer: String::new(),
+            key_type: String::new(),
+        };
+        store.install("example.org", &cert, &key, m).unwrap();
+        assert_eq!(
+            store.get_meta("www.example.org").map(|m| m.domain),
+            Some("example.org".to_string())
+        );
+        assert!(store.get_meta("other.example.org").is_none());
+    }
+
+    /// The management listener's self-signed cert is minted when the listener
+    /// is built; a handshake only looks it up, whatever SNI it carries.
+    #[test]
+    fn management_cert_is_minted_at_startup_not_in_the_handshake() {
+        let dir = tmp_dir();
+        let store = CertStore::new(dir.clone());
+        let resolver = SentinelCertResolver::new_fixed(Arc::clone(&store), MANAGEMENT_CERT_KEY);
+        let mgmt_file = dir
+            .join(domain_to_dirname(MANAGEMENT_CERT_KEY))
+            .join("cert.pem");
+        assert!(mgmt_file.exists(), "not minted at listener construction");
+        let entries = count_entries(&dir);
+        for sni in [None, Some("console.example.com"), Some("x.example.net")] {
+            assert_eq!(handshake(&resolver, sni), pem_leaf(&mgmt_file));
+        }
+        assert_eq!(count_entries(&dir), entries);
+
+        // An uploaded cert is served at once; after a revert the listener falls
+        // to the default cert rather than minting in the handshake.
+        let (cert, key) = self_signed_pem("console.example.com");
+        store.install_management(&cert, &key, meta("fp")).unwrap();
+        let uploaded = handshake(&resolver, None);
+        assert_ne!(
+            uploaded,
+            pem_leaf(&dir.join(DEFAULT_CERT_KEY).join("cert.pem"))
+        );
+        store.revert_management().unwrap();
+        assert_eq!(
+            handshake(&resolver, None),
+            pem_leaf(&dir.join(DEFAULT_CERT_KEY).join("cert.pem"))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

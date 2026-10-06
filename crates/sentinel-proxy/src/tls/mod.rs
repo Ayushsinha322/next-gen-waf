@@ -3,7 +3,9 @@
 //! Three cert sources, in priority order:
 //!   1. **ACME** (Let's Encrypt / ZeroSSL) — auto-issued and auto-renewed
 //!   2. **Manual** — operator-uploaded PEM files
-//!   3. **Self-signed fallback** — generated on demand for any unknown domain
+//!   3. **Self-signed fallback** — one per configured site without a cert,
+//!      minted in the background on config sync; every other name, and a
+//!      client sending no SNI, gets the single shared default cert
 //!
 //! The `SentinelCertResolver` plugs into rustls `ServerConfig::with_cert_resolver`
 //! and hot-swaps certs without restarting any listener.

@@ -1290,7 +1290,7 @@ impl ProxyServer {
                 .unwrap_or_else(|_| std::path::PathBuf::from("/var/lib/sentinel/certs"))
         });
         let cert_manager = tls::CertManager::new(cert_dir.clone());
-        match cert_manager.load_from_disk() {
+        match cert_manager.load_from_disk(&cfg.sites) {
             Ok(n) if n > 0 => info!(certs = n, "loaded persisted TLS certs from disk"),
             Ok(_) => {}
             Err(e) => warn!("cert disk load: {e:#}"),
@@ -1327,6 +1327,12 @@ impl ProxyServer {
             tokio::spawn(async move {
                 tls::renewal::renewal_loop(cm, cfg_handle).await;
             });
+            // Self-signed certs for configured sites are minted by this task as
+            // sites arrive — never inside a TLS handshake.
+            tls::cert_store::spawn_site_cert_sync(
+                Arc::clone(&cert_manager.store),
+                Arc::clone(&self.config),
+            );
         }
 
         let state = Arc::new(ServerState {
@@ -2350,17 +2356,10 @@ async fn serve_listener(
             }
             (Some(build_tls_acceptor(tls_cfg)?), None)
         } else {
-            // SNI-based per-domain resolution across all sites.
-            let cfg_snap = state.config.load();
-            let domains: Vec<String> = cfg_snap
-                .sites
-                .iter()
-                .flat_map(|s| s.domains.iter().cloned())
-                .collect();
+            // SNI-based per-domain resolution across all sites. Site certs come
+            // from the shared store (see spawn_site_cert_sync); the old per-
+            // listener pre-warm minted a different in-memory cert on every node.
             let resolver = tls::SentinelCertResolver::new(Arc::clone(&state.cert_manager.store));
-            if !domains.is_empty() {
-                resolver.pre_warm(&domains);
-            }
 
             // Same resolver → QUIC server config (ALPN h3), when enabled. Build
             // this from a clone *before* the TCP config consumes the resolver.
@@ -7969,7 +7968,15 @@ async fn handle_internal_mgmt_tls_api(
 
     if method == hyper::Method::DELETE {
         return match state.cert_manager.store.revert_management() {
-            Ok(()) => json_ok(serde_json::json!({"reverted": true})),
+            Ok(()) => {
+                // Restore the console's own shared self-signed cert here: the
+                // resolver only looks certs up and would serve the default one.
+                let _ = state
+                    .cert_manager
+                    .store
+                    .self_signed_shared(tls::MANAGEMENT_CERT_KEY);
+                json_ok(serde_json::json!({"reverted": true}))
+            }
             Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}")),
         };
     }
