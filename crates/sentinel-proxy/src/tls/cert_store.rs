@@ -8,6 +8,7 @@
 /// where any client could pick the name.
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -130,6 +131,9 @@ pub struct CertStore {
     /// Served for every name that is not a configured site, and when the client
     /// sends no SNI. Set once at startup by `ensure_default_cert`.
     default_cert: ArcSwapOption<CertifiedKey>,
+    /// Set by the first `start_site_cert_sync`, so a node runs one sync task
+    /// however many SNI listeners it has.
+    site_sync_started: AtomicBool,
     cert_dir: PathBuf,
 }
 
@@ -168,18 +172,22 @@ fn sni_matchable(name: &str) -> bool {
     !name.starts_with(RESERVED_PREFIX) && DnsName::try_from(host).is_ok()
 }
 
-/// Keep the per-site self-signed certs in step with the configured sites.
+/// Start the background sync that keeps the per-site self-signed certs in step
+/// with the configured sites; once per store, however often it is called.
 ///
+/// Each listener that serves certs through the SNI resolver calls this. A node
+/// with none (HTTP only, TLS offloaded, explicit cert/key) never serves those
+/// certs, so it mints none: no private keys on its volume, and no self-signed
+/// rows in its cert listing for certificates nobody is shown.
+pub fn start_site_cert_sync(store: &Arc<CertStore>, config: ConfigHandle) {
+    if !store.site_sync_started.swap(true, Ordering::AcqRel) {
+        spawn_site_cert_sync_every(Arc::clone(store), config, SITE_SYNC_INTERVAL);
+    }
+}
+
 /// Watches the config handle, so a site arriving by any route (control-plane
 /// sync, file reload, cached-config restore) gets its cert, and a removed site
 /// drops out of the fallback map. The minting runs on a blocking thread.
-pub fn spawn_site_cert_sync(
-    store: Arc<CertStore>,
-    config: ConfigHandle,
-) -> tokio::task::JoinHandle<()> {
-    spawn_site_cert_sync_every(store, config, SITE_SYNC_INTERVAL)
-}
-
 fn spawn_site_cert_sync_every(
     store: Arc<CertStore>,
     config: ConfigHandle,
@@ -250,6 +258,15 @@ pub struct MintReport {
     pub failed: Vec<String>,
 }
 
+/// Whether a cert stored under `cert_name` is served for the SNI `site`: the
+/// same name, or a wildcard one label above it — the match `resolve_live` makes.
+fn cert_covers(cert_name: &str, site: &str) -> bool {
+    cert_name == site
+        || cert_name
+            .strip_prefix("*.")
+            .is_some_and(|base| site.split_once('.').is_some_and(|(_, rest)| rest == base))
+}
+
 impl CertStore {
     pub fn new(cert_dir: PathBuf) -> Arc<Self> {
         Arc::new(Self {
@@ -257,6 +274,7 @@ impl CertStore {
             alpn_challenge: DashMap::new(),
             fallback: RwLock::new(SiteFallbacks::default()),
             default_cert: ArcSwapOption::empty(),
+            site_sync_started: AtomicBool::new(false),
             cert_dir,
         })
     }
@@ -388,16 +406,18 @@ impl CertStore {
     /// Point the fallback map at the configured `names`: certs for names no
     /// longer configured are dropped, and the names still lacking any cert are
     /// returned for `ensure_site_fallbacks`. Cheap — no keygen, no disk.
+    ///
+    /// "Any cert" is what a handshake would find: a live wildcard covering a
+    /// site counts, so no key is minted for a site the wildcard serves.
     pub fn set_site_names(&self, names: HashSet<String>) -> Vec<String> {
         let mut fb = self.fallback_write();
         fb.certs.retain(|name, _| names.contains(name));
-        let missing = names
-            .iter()
-            .filter(|n| !fb.certs.contains_key(*n) && !self.live.contains_key(*n))
-            .cloned()
-            .collect();
         fb.configured = names;
-        missing
+        fb.configured
+            .iter()
+            .filter(|n| !fb.certs.contains_key(*n) && self.resolve_live(n).is_none())
+            .cloned()
+            .collect()
     }
 
     /// Adopt or create the shared self-signed cert for each of `names` that is
@@ -421,7 +441,7 @@ impl CertStore {
             let mut fb = self.fallback_write();
             // Checked again under the lock: an entry for a name a concurrent sync
             // just dropped is exactly the growth this map exists to prevent.
-            if fb.configured.contains(name) && !self.live.contains_key(name) {
+            if fb.configured.contains(name) && self.resolve_live(name).is_none() {
                 fb.certs.insert(name.clone(), entry);
                 report.added += 1;
             }
@@ -461,7 +481,7 @@ impl CertStore {
         let fb = self.fallback_read();
         fb.configured.contains(name)
             && !fb.certs.contains_key(name)
-            && !self.live.contains_key(name)
+            && self.resolve_live(name).is_none()
     }
 
     /// Return the shared self-signed cert for `domain`, creating it once if no
@@ -628,12 +648,20 @@ impl CertStore {
         if dir.exists() {
             std::fs::remove_dir_all(&dir)?;
         }
-        // A site's self-signed cert lived in that directory too. A site that is
-        // still configured gets a fresh one now, in this admin call, rather than
+        // A site's self-signed cert lived in that directory too. The configured
+        // sites this cert answered for — its own name, or every name a wildcard
+        // covered — get a self-signed one now, in this admin call, rather than
         // the default cert until the next config change.
         let name = domain.to_ascii_lowercase();
         self.fallback_write().certs.remove(&name);
-        for failed in self.ensure_site_fallbacks(&[name]).failed {
+        let uncovered: Vec<String> = self
+            .fallback_read()
+            .configured
+            .iter()
+            .filter(|site| cert_covers(&name, site))
+            .cloned()
+            .collect();
+        for failed in self.ensure_site_fallbacks(&uncovered).failed {
             tracing::warn!(
                 domain = %failed,
                 "could not create a self-signed certificate; serving the default one"
@@ -677,7 +705,8 @@ impl CertStore {
     /// All cert metadata for the customer cert repository (the dashboard API).
     /// Internal/reserved certs (e.g. the management cert) are hidden so they
     /// can't be listed, renamed, or deleted from the customer cert page.
-    /// Configured sites still on their self-signed cert are listed too.
+    /// Configured sites still on their self-signed cert are listed too — only
+    /// while a handshake would serve it, not under a live cert or wildcard.
     pub fn all_meta(&self) -> Vec<CertMeta> {
         let mut all: Vec<CertMeta> = self
             .live
@@ -689,7 +718,7 @@ impl CertStore {
         all.extend(
             fb.certs
                 .iter()
-                .filter(|(name, _)| !self.live.contains_key(name.as_str()))
+                .filter(|(name, _)| self.resolve_live(name).is_none())
                 .map(|(_, e)| e.meta.clone()),
         );
         all
@@ -1844,7 +1873,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ── follow-up: which names get certs, and sync retries ──────────────────
+    // ── follow-up: names, wildcards, startup robustness, retries ────────────
 
     /// A site domain with a non-ASCII character (a console typo, a pasted IDN
     /// U-label, a zero-width space) is accepted by the control plane. rcgen
@@ -1911,6 +1940,69 @@ mod tests {
                 "xn--bcher-kva.example",
             ])
         );
+    }
+
+    fn install_manual(store: &CertStore, domain: &str) {
+        let (cert, key) = self_signed_pem(domain);
+        let mut m = meta("fp");
+        m.domain = domain.into();
+        m.san = vec![domain.into()];
+        store.install(domain, &cert, &key, m).unwrap();
+    }
+
+    /// A configured site served by a live wildcard cert: a handshake gets the
+    /// wildcard, so no self-signed key is minted for it and the console lists
+    /// no self-signed row claiming otherwise. Removing the wildcard gives the
+    /// site its self-signed cert in that call.
+    #[test]
+    fn a_site_under_a_live_wildcard_gets_no_self_signed_cert_or_row() {
+        let dir = tmp_dir();
+        let store = CertStore::new(dir.clone());
+        store
+            .load_from_disk(&names(&["shop.example.com", "api.example.com"]))
+            .unwrap();
+        // shop already has its self-signed cert when the wildcard arrives.
+        store.ensure_site_fallbacks(&["shop.example.com".to_string()]);
+        install_manual(&store, "*.example.com");
+        let resolver = SentinelCertResolver::new(Arc::clone(&store));
+        let wildcard = leaf(&resolver.select(Some("api.example.com"), false).unwrap());
+
+        let missing = store.set_site_names(names(&["shop.example.com", "api.example.com"]));
+        assert!(
+            missing.is_empty(),
+            "minting for wildcard-served sites: {missing:?}"
+        );
+        assert_eq!(
+            store
+                .ensure_site_fallbacks(&["api.example.com".to_string()])
+                .added,
+            0
+        );
+        assert!(!dir.join("api.example.com").exists());
+        let rows: Vec<(String, CertSource)> = store
+            .all_meta()
+            .into_iter()
+            .map(|m| (m.domain, m.source))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![("*.example.com".to_string(), CertSource::Manual)],
+            "the listing must show what a handshake serves"
+        );
+        assert_eq!(
+            leaf(&resolver.select(Some("shop.example.com"), false).unwrap()),
+            wildcard
+        );
+
+        store.remove("*.example.com").unwrap();
+        let default_cert = leaf(&store.default_cert().unwrap());
+        for site in ["shop.example.com", "api.example.com"] {
+            let served = leaf(&resolver.select(Some(site), false).unwrap());
+            assert_ne!(served, wildcard);
+            assert_ne!(served, default_cert, "{site} fell to the default cert");
+        }
+        assert!(dir.join("api.example.com").join("cert.pem").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A mint that fails is retried on the next tick rather than waiting for

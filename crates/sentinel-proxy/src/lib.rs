@@ -1327,12 +1327,6 @@ impl ProxyServer {
             tokio::spawn(async move {
                 tls::renewal::renewal_loop(cm, cfg_handle).await;
             });
-            // Self-signed certs for configured sites are minted by this task as
-            // sites arrive — never inside a TLS handshake.
-            tls::cert_store::spawn_site_cert_sync(
-                Arc::clone(&cert_manager.store),
-                Arc::clone(&self.config),
-            );
         }
 
         let state = Arc::new(ServerState {
@@ -2356,10 +2350,15 @@ async fn serve_listener(
             }
             (Some(build_tls_acceptor(tls_cfg)?), None)
         } else {
-            // SNI-based per-domain resolution across all sites. Site certs come
-            // from the shared store (see spawn_site_cert_sync); the old per-
-            // listener pre-warm minted a different in-memory cert on every node.
+            // SNI-based per-domain resolution across all sites. Site certs are
+            // minted on config sync by one task per node, started by the first
+            // such listener — never in a handshake. The old per-listener
+            // pre-warm minted a different in-memory cert on every node.
             let resolver = tls::SentinelCertResolver::new(Arc::clone(&state.cert_manager.store));
+            tls::cert_store::start_site_cert_sync(
+                &state.cert_manager.store,
+                Arc::clone(&state.config),
+            );
 
             // Same resolver → QUIC server config (ALPN h3), when enabled. Build
             // this from a clone *before* the TCP config consumes the resolver.
