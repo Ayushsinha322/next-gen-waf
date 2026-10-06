@@ -1042,11 +1042,26 @@ impl ProxyServer {
             let spool = open_history_spool();
             let ch_cfg = storage_backend_cfg.clone();
             // Where a run that panics leaves the rows it had drained but not yet
-            // inserted or spooled, for the restarted run to pick up.
-            let traffic_carry: Arc<std::sync::Mutex<Vec<sentinel_storage::TrafficRow>>> =
-                Arc::default();
-            let events_carry: Arc<std::sync::Mutex<Vec<sentinel_storage::WafEventRow>>> =
-                Arc::default();
+            // inserted or spooled, for the restarted run to pick up: at most the
+            // event buffer's cap each, and only once (see `Carried`).
+            fn shed_carried(rows: usize) {
+                for _ in 0..rows {
+                    inc_history_shed();
+                }
+                warn!(
+                    rows,
+                    "history writer panicked holding rows it cannot retry; they are lost \
+                     (see sentinel_history_shed_total)"
+                );
+            }
+            let traffic_carry = panic_guard::Carry::<sentinel_storage::TrafficRow>::new(
+                EVENT_BUFFER_CAP,
+                shed_carried,
+            );
+            let events_carry = panic_guard::Carry::<sentinel_storage::WafEventRow>::new(
+                EVENT_BUFFER_CAP,
+                shed_carried,
+            );
             // Supervised: a panic restarts the writer, with the rows it held,
             // instead of silently ending history recording for the life of the
             // process.
@@ -9798,8 +9813,9 @@ static WAF_EVENTS: std::sync::OnceLock<std::sync::Mutex<Vec<sentinel_storage::Wa
 /// disconnect, so a node that could not reach ClickHouse buffered nothing, and
 /// therefore recorded nothing, while still enforcing perfectly. The flusher now
 /// spools what it cannot insert (see `sentinel_storage::Spool`), so buffering
-/// while disconnected is correct and bounded — memory by the 20k cap below, disk
-/// by the spool's own cap.
+/// while disconnected is correct and bounded — memory by the 20k cap below (plus
+/// at most as many rows per stream carried over a writer panic), disk by the
+/// spool's own cap.
 static HISTORY_SINK_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 

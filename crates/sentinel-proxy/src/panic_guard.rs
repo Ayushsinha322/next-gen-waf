@@ -882,46 +882,96 @@ macro_rules! supervised {
 }
 pub(crate) use supervised;
 
-/// Rows a background run holds in memory, handed back to `carry` when the run
-/// ends — by a panic too — so the restarted run resumes with them.
+/// Where a supervised run leaves the rows it held when it ended, for the next
+/// run to resume (see [`Carried`]). Bounded, and each row is retried once.
+pub(crate) struct Carry<T> {
+    rows: Mutex<Vec<T>>,
+    /// Most rows held between runs; the rest are shed.
+    cap: usize,
+    /// Told how many rows were shed: over `cap`, or back from a second panic.
+    shed: fn(usize),
+}
+
+impl<T> Carry<T> {
+    pub(crate) fn new(cap: usize, shed: fn(usize)) -> Arc<Self> {
+        Arc::new(Self {
+            rows: Mutex::new(Vec::new()),
+            cap,
+            shed,
+        })
+    }
+}
+
+/// Rows a background run holds in memory, handed back to its [`Carry`] when
+/// the run ends — by a panic too — so the restarted run resumes with them.
 ///
 /// The ClickHouse writer drains the shared buffers into its own vectors before
 /// inserting or spooling them; a panic in between dropped those rows without
 /// even counting them in `history_shed`, and the audit trail was silently
 /// incomplete. If the panic came after ClickHouse had accepted a batch, the
 /// batch is sent again: a duplicated row is visible, a missing one is not.
+///
+/// What is handed back is bounded twice. Rows this run resumed and still holds
+/// when it panics as well are shed, not handed on again: a panic that repeats on
+/// the same rows (one row whose content breaks the insert) retried them for
+/// ever, and history stopped for the life of the process. And the carry holds at
+/// most its `cap`: a writer panicking on every run added up to a full drain to
+/// it each time, past the event buffer's bound and past the spool, until the
+/// node was OOM-killed. Both are counted through `shed`.
 pub(crate) struct Carried<T> {
     rows: Vec<T>,
-    carry: Arc<Mutex<Vec<T>>>,
+    /// How many rows at the front of `rows` came from the carry. No `DerefMut`,
+    /// so nothing but [`Carried::clear`] can move them.
+    resumed: usize,
+    carry: Arc<Carry<T>>,
 }
 
 impl<T> Carried<T> {
     /// Take over whatever the previous run left in `carry`.
-    pub(crate) fn resume(carry: &Arc<Mutex<Vec<T>>>) -> Self {
+    pub(crate) fn resume(carry: &Arc<Carry<T>>) -> Self {
+        let rows = std::mem::take(&mut *lock(&carry.rows));
         Self {
-            rows: std::mem::take(&mut *lock(carry)),
+            resumed: rows.len(),
+            rows,
             carry: Arc::clone(carry),
         }
+    }
+
+    pub(crate) fn extend(&mut self, rows: impl IntoIterator<Item = T>) {
+        self.rows.extend(rows);
+    }
+
+    /// Empty the buffer once its rows are stored or spooled. The resumed rows go
+    /// with it, so a later panic in this run hands its new rows on in full.
+    pub(crate) fn clear(&mut self) {
+        self.rows.clear();
+        self.resumed = 0;
     }
 }
 
 impl<T> std::ops::Deref for Carried<T> {
-    type Target = Vec<T>;
-    fn deref(&self) -> &Vec<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
         &self.rows
-    }
-}
-
-impl<T> std::ops::DerefMut for Carried<T> {
-    fn deref_mut(&mut self) -> &mut Vec<T> {
-        &mut self.rows
     }
 }
 
 impl<T> Drop for Carried<T> {
     fn drop(&mut self) {
-        if !self.rows.is_empty() {
-            lock(&self.carry).append(&mut self.rows);
+        // Rows that already came back once stay in `self.rows` and are dropped.
+        let retried = self.resumed.min(self.rows.len());
+        let mut fresh = self.rows.split_off(retried);
+        let mut shed = retried;
+        let mut held = lock(&self.carry.rows);
+        let room = self.carry.cap.saturating_sub(held.len());
+        if fresh.len() > room {
+            shed += fresh.len() - room;
+            fresh.truncate(room);
+        }
+        held.append(&mut fresh);
+        drop(held);
+        if shed > 0 {
+            (self.carry.shed)(shed);
         }
     }
 }
@@ -2074,24 +2124,91 @@ rule 9990102 {
     /// next run instead of vanishing uncounted.
     #[test]
     fn rows_held_by_a_run_that_panics_are_resumed_by_the_next() {
-        let carry: Arc<Mutex<Vec<u32>>> = Arc::default();
-        let run = |carry: &Arc<Mutex<Vec<u32>>>, panic_after: bool| {
+        fn no_shed(n: usize) {
+            panic!("{n} rows shed by a single panic");
+        }
+        let carry = Carry::<u32>::new(100, no_shed);
+        let run = |carry: &Arc<Carry<u32>>, panic_after: bool| {
             let mut rows = Carried::resume(carry);
             rows.extend([1, 2, 3]);
             if panic_after {
                 panic!("writer panic with rows in hand");
             }
-            let flushed: Vec<u32> = std::mem::take(&mut *rows);
+            let flushed = rows.to_vec();
+            rows.clear();
             flushed
         };
         assert!(std::panic::catch_unwind(AssertUnwindSafe(|| run(&carry, true))).is_err());
-        assert_eq!(*lock(&carry), [1, 2, 3], "handed back on the panic");
+        assert_eq!(*lock(&carry.rows), [1, 2, 3], "handed back on the panic");
         let flushed = run(&carry, false);
         assert_eq!(
             flushed,
             [1, 2, 3, 1, 2, 3],
             "the restarted run resumes them"
         );
-        assert!(lock(&carry).is_empty());
+        assert!(lock(&carry.rows).is_empty());
+    }
+
+    /// A writer that panics on every run handed its whole drain back each time,
+    /// and the resumed rows with it: the carry grew by a full drain per restart
+    /// (1000 rows after ten runs against a 100-row cap), outside every memory
+    /// bound, until the node was OOM-killed. Now it never exceeds its cap, rows
+    /// back from a second panic are shed, and every shed row is counted.
+    #[test]
+    fn a_writer_that_panics_every_run_keeps_its_carry_bounded() {
+        static SHED: AtomicUsize = AtomicUsize::new(0);
+        fn count_shed(n: usize) {
+            SHED.fetch_add(n, Ordering::SeqCst);
+        }
+        const CAP: usize = 100;
+        let carry = Carry::<u32>::new(CAP, count_shed);
+        let mut resumed = Vec::new();
+        for run in 0..10u32 {
+            let caught = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let mut rows = Carried::resume(&carry);
+                resumed.push(rows.to_vec());
+                // A full drain per run, more than the carry may hold.
+                rows.extend(std::iter::repeat_n(run, CAP + 20));
+                panic!("every run panics after the drain");
+            }));
+            assert!(caught.is_err());
+            let held = lock(&carry.rows).len();
+            assert!(held <= CAP, "run {run}: carry holds {held}, cap {CAP}");
+        }
+        // Run 0 handed on 100 of its 120 rows (20 shed); every later run shed
+        // the 100 it resumed plus 20 of its own.
+        assert_eq!(SHED.load(Ordering::SeqCst), 20 + 9 * 120);
+        for (run, rows) in resumed.iter().enumerate().skip(1) {
+            assert!(
+                rows.iter().all(|&r| r as usize == run - 1),
+                "run {run} resumed only the previous run's rows, never older ones"
+            );
+        }
+    }
+
+    /// A row whose content panics the insert (a poison row) is retried once,
+    /// then shed, and the writer makes progress again with what came after it.
+    #[test]
+    fn a_poison_row_is_retried_once_then_shed() {
+        static SHED: AtomicUsize = AtomicUsize::new(0);
+        fn count_shed(n: usize) {
+            SHED.fetch_add(n, Ordering::SeqCst);
+        }
+        let carry = Carry::<u32>::new(100, count_shed);
+        let run = |carry: &Arc<Carry<u32>>, fresh: &[u32]| {
+            let mut rows = Carried::resume(carry);
+            rows.extend(fresh.iter().copied());
+            assert!(!rows.contains(&0), "the insert panics on the poison row");
+            let stored = rows.to_vec();
+            rows.clear();
+            stored
+        };
+        let first = std::panic::catch_unwind(AssertUnwindSafe(|| run(&carry, &[0, 1])));
+        assert!(first.is_err());
+        assert_eq!(SHED.load(Ordering::SeqCst), 0, "retried once first");
+        let second = std::panic::catch_unwind(AssertUnwindSafe(|| run(&carry, &[2])));
+        assert!(second.is_err(), "the retry meets the poison row again");
+        assert_eq!(SHED.load(Ordering::SeqCst), 2, "0 and 1 shed, 2 carried");
+        assert_eq!(run(&carry, &[3]), [2, 3], "the third run stores");
     }
 }
