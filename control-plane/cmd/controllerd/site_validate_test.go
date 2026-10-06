@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -334,5 +335,179 @@ func TestValidateDryRunChecksDomainOwnership(t *testing.T) {
 	}
 	if !strings.Contains(body, "domainConflicts(existing, domains, req.SiteID)") {
 		t.Fatal("handleValidateSite no longer checks whether another site owns the domains")
+	}
+}
+
+func feedPolicy(t *testing.T, url string) json.RawMessage {
+	t.Helper()
+	b, err := json.Marshal(map[string]any{"ip_reputation": map[string]any{
+		"feeds": []map[string]string{{"url": url, "interval": "1h", "format": "cidr"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// Every data-plane node fetches each feed URL itself, and a file:// URL used to
+// be read off the node's own disk. Only http(s) with a host is accepted.
+func TestFeedURLsAreRefusedUnlessHTTP(t *testing.T) {
+	const field = "waf_policy.ip_reputation.feeds[0].url"
+	cases := []struct{ url, want string }{
+		{"file:///etc/passwd", "http:// or https://"},
+		{"FILE:///etc/passwd", "http:// or https://"},
+		{"ftp://feeds.example/list", "http:// or https://"},
+		{"gopher://feeds.example/", "http:// or https://"},
+		{"javascript:alert(1)", "http:// or https://"},
+		{"//feeds.example/list", "http:// or https://"},
+		{"feeds.example/list.txt", "http:// or https://"},
+		{"http:///list", "has no host"},
+		{"http://feeds.example:99999/list", "ports are 1-65535"},
+		{"http://feeds.example/my list.txt", "contains a space"},
+		{"   ", "must not be empty"},
+		{"https://feeds.example/" + strings.Repeat("a", maxFeedURLLength), "longest accepted is 2048"},
+		// Accepted by url.Parse, refused by the data plane's http::Uri (or, for
+		// a non-ASCII path, a character only some clients would send as-is).
+		{"http://bücher.example/list", "punycode"},
+		{"https://fëeds.example/list", "punycode"},
+		{"http://feeds.example/ünï", "percent-encode the path"},
+		{"http://feeds.example/a<b", `"<", which must be percent-encoded`},
+		{"http://feeds.example/a>b", `">", which must be percent-encoded`},
+		{"http://feeds.example/a`b", "which must be percent-encoded"},
+		{`http://feeds.example/l?q=a"b`, "which must be percent-encoded"},
+		{`http://feeds.example/a\b`, "which must be percent-encoded"},
+		{"http://ex%41mple.com/list", "not a valid URL"},
+		{"http://[fe80::1%25en0]/list", "percent-encoded host"},
+		// hyper never sends userinfo, so the feed could never authenticate.
+		{"https://user:pass@feeds.example/list", "carries credentials"},
+		{"https://token@feeds.example/list", "carries credentials"},
+	}
+	for _, c := range cases {
+		ps := validateWafPolicyValues(feedPolicy(t, c.url))
+		if len(ps) != 1 || ps[0].Field != field || !strings.Contains(ps[0].Problem, c.want) {
+			t.Errorf("%.60q: got %s, want one problem on %s mentioning %q", c.url, fields(ps), field, c.want)
+		}
+	}
+	// A refusal must not repeat a credential in the URL, whatever it refuses.
+	for _, u := range []string{"https://user:s3cret@feeds.example/l", "ftp://user:s3cret@feeds.example/l",
+		"https://user:s3cret@feeds.example/a<b"} {
+		if ps := validateWafPolicyValues(feedPolicy(t, u)); len(ps) != 1 || strings.Contains(ps[0].Problem, "s3cret") {
+			t.Errorf("%s: got %s", u, fields(ps))
+		}
+	}
+}
+
+// Every URL in testdata/feed_urls_accepted.txt must pass here; a test in
+// crates/sentinel-proxy/src/ip_feed.rs requires the data plane to accept the
+// same file, so the two parsers cannot drift apart unnoticed.
+func TestFeedURLParityFixtureIsAccepted(t *testing.T) {
+	src, err := os.ReadFile("testdata/feed_urls_accepted.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, line := range strings.Split(string(src), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		n++
+		if m := feedURLProblem(line); m != "" {
+			t.Errorf("%s: refused (%s) — the fixture lists only URLs the control plane accepts", line, m)
+		}
+	}
+	if n < 10 {
+		t.Fatalf("fixture has %d URLs; expected the full list", n)
+	}
+}
+
+// A feed the data plane cannot deserialize makes it reject the whole site, so
+// the list's shape is refused too — without hiding the policy's other checks.
+func TestMalformedFeedListIsRefused(t *testing.T) {
+	cases := []struct{ policy, field, want string }{
+		{`{"ip_reputation":{"feeds":"https://feeds.example/list"}}`, "waf_policy.ip_reputation.feeds", "must be a list"},
+		{`{"ip_reputation":{"feeds":[{"interval":"1h"}]}}`, "waf_policy.ip_reputation.feeds[0].url", "is required"},
+		{`{"ip_reputation":{"feeds":[null]}}`, "waf_policy.ip_reputation.feeds[0].url", "is required"},
+		{`{"ip_reputation":{"feeds":[{"url":42}]}}`, "waf_policy.ip_reputation.feeds[0].url", "must be a string"},
+		// interval and format are Strings with a serde default on the data
+		// plane: a default fills a MISSING key, never a null or a number.
+		{`{"ip_reputation":{"feeds":[{"url":"https://x.example/l","interval":null}]}}`, "waf_policy.ip_reputation.feeds[0].interval", "must be a string"},
+		{`{"ip_reputation":{"feeds":[{"url":"https://x.example/l","interval":3600}]}}`, "waf_policy.ip_reputation.feeds[0].interval", "must be a string"},
+		{`{"ip_reputation":{"feeds":[{"url":"https://x.example/l","interval":"daily"}]}}`, "waf_policy.ip_reputation.feeds[0].interval", "not a duration"},
+		{`{"ip_reputation":{"feeds":[{"url":"https://x.example/l","format":null}]}}`, "waf_policy.ip_reputation.feeds[0].format", "must be a string"},
+		{`{"ip_reputation":{"feeds":[{"url":"https://x.example/l","format":["cidr"]}]}}`, "waf_policy.ip_reputation.feeds[0].format", "must be a string"},
+		{`{"ip_reputation":{"feeds":[{"url":"https://x.example/l","format":"xml"}]}}`, "waf_policy.ip_reputation.feeds[0].format", "not one of cidr, json"},
+		// Every node fetches every feed on every refresh.
+		{feedList(maxSiteFeeds + 1), "waf_policy.ip_reputation.feeds", "the limit is 16 per site"},
+		// A type error elsewhere in ip_reputation used to fail the policy decode
+		// and skip the feed check, with nothing reported.
+		{`{"ip_reputation":{"allow":"10.0.0.1","feeds":[{"url":"file:///etc/passwd"}]}}`, "waf_policy.ip_reputation.feeds[0].url", "http:// or https://"},
+		{`{"paranoia_level":"high","ip_reputation":{"feeds":[{"url":"file:///etc/passwd"}]}}`, "waf_policy.ip_reputation.feeds[0].url", "http:// or https://"},
+	}
+	for _, c := range cases {
+		ps := problemsFor(t, c.policy)
+		if len(ps) != 1 || ps[0].Field != c.field || !strings.Contains(ps[0].Problem, c.want) {
+			t.Errorf("%s: got %s, want one problem on %s mentioning %q", c.policy, fields(ps), c.field, c.want)
+		}
+	}
+	ps := problemsFor(t, `{"ip_reputation":{"block":["not-an-ip"],"feeds":"x"}}`)
+	if !hasField(ps, "waf_policy.ip_reputation.block") || !hasField(ps, "waf_policy.ip_reputation.feeds") {
+		t.Errorf("a malformed feed list hid the block-list check: %s", fields(ps))
+	}
+	if ps := problemsFor(t, feedList(maxSiteFeeds)); len(ps) != 0 {
+		t.Errorf("%d feeds is within the limit: %s", maxSiteFeeds, fields(ps))
+	}
+}
+
+// feedList is a policy naming n distinct, valid feeds.
+func feedList(n int) string {
+	feeds := make([]string, n)
+	for i := range feeds {
+		feeds[i] = fmt.Sprintf(`{"url":"https://feeds.example/%d.netset","interval":"1h","format":"cidr"}`, i)
+	}
+	return `{"ip_reputation":{"feeds":[` + strings.Join(feeds, ",") + `]}}`
+}
+
+func TestGoodFeedURLsPass(t *testing.T) {
+	for _, pol := range []string{
+		`{"ip_reputation":{"feeds":[
+			{"url":"https://iplists.firehol.org/files/firehol_level1.netset","interval":"1h","format":"cidr"},
+			{"url":"HTTP://10.0.0.5:8080/list.txt"},
+			{"url":"https://feeds.example/list?key=abc"},
+			{"url":"http://[2001:db8::1]/list"},
+			{"url":" https://feeds.example/list "},
+			{"url":"https://feeds.example/json","interval":"1h30m","format":"json"},
+			{"url":"https://feeds.example/d","interval":"1D"},
+			{"url":"https://feeds.example/e","interval":""}]}}`,
+		`{"ip_reputation":{"feeds":[]}}`,
+		`{"ip_reputation":{"feeds":null}}`,
+		`{"ip_reputation":{"allow":["10.0.0.0/8"]}}`,
+	} {
+		if ps := problemsFor(t, pol); len(ps) != 0 {
+			t.Errorf("%s: unexpected problems %s", pol, fields(ps))
+		}
+	}
+}
+
+// Create validates the request and update validates the merge with the stored
+// row; a problem from either is the handler's 400.
+func TestFeedURLIsCheckedOnCreateAndUpdate(t *testing.T) {
+	const field = "waf_policy.ip_reputation.feeds[0].url"
+	up := json.RawMessage(`{"servers":["10.0.0.5:8080"]}`)
+	bad := json.RawMessage(`{"mode":"blocking","ip_reputation":{"feeds":[{"url":"file:///etc/shadow"}]}}`)
+
+	if ps := validateSiteConfig("shop", []string{"shop.example.com"}, up, bad); !hasField(ps, field) {
+		t.Errorf("create accepted a file:// feed: %s", fields(ps))
+	}
+
+	cur := db.SiteRow{
+		Name:      "shop",
+		Domains:   []string{"shop.example.com"},
+		Upstream:  up,
+		WafPolicy: json.RawMessage(`{"mode":"blocking"}`),
+	}
+	name, domains, u, waf := mergedSiteForValidation(cur, db.UpdateSiteRequest{WafPolicy: bad})
+	if ps := validateSiteConfig(name, domains, u, waf); !hasField(ps, field) {
+		t.Errorf("update accepted a file:// feed: %s", fields(ps))
 	}
 }

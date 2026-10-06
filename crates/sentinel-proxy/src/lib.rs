@@ -27,6 +27,7 @@ pub mod challenge;
 mod cp_client;
 pub(crate) mod goodbot;
 pub mod http3;
+mod ip_feed;
 pub(crate) mod ja4_quic;
 mod jwks;
 pub mod proxy_protocol;
@@ -2208,31 +2209,18 @@ impl ProxyServer {
             watchdog_task("IP feed loader", async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(300));
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                // Bounds, fair sharing, last-good reuse and the /healthz report:
+                // see ip_feed.
+                let mut loader = ip_feed::FeedLoader::new(ip_feed::FeedLimits::from_env());
                 loop {
                     interval.tick().await;
                     let cfg = config_watch.load_full();
-                    let feeds: Vec<_> = cfg
-                        .sites
-                        .iter()
-                        .filter_map(|s| s.waf.ip_reputation.as_ref())
-                        .flat_map(|r| r.feeds.iter().cloned())
-                        .collect();
-                    if feeds.is_empty() {
+                    let load = loader.load(&ip_feed::configured_feeds(&cfg)).await;
+                    ip_feed::publish(load.report);
+                    if !load.rebuild {
                         continue;
                     }
-                    let mut new_cidrs: Vec<(String, Vec<String>)> = Vec::new();
-                    for feed in &feeds {
-                        match fetch_feed_cidrs(&feed.url).await {
-                            Ok(cidrs) => {
-                                info!(url = %feed.url, count = cidrs.len(), "IP feed loaded");
-                                for cidr in cidrs {
-                                    new_cidrs.push((cidr, vec!["feed".to_string()]));
-                                }
-                            }
-                            Err(e) => warn!(url = %feed.url, "IP feed fetch failed: {e}"),
-                        }
-                    }
-                    let new_arc: Arc<Vec<_>> = Arc::new(new_cidrs);
+                    let new_arc: Arc<Vec<_>> = Arc::new(load.table);
                     modules_ref.feed_cache.store(Arc::clone(&new_arc));
                     let new_ip_rep = build_ip_reputation(&cfg, &new_arc);
                     let count = new_ip_rep.entry_count();
@@ -6948,67 +6936,6 @@ fn build_full_plugin_runtime(
 }
 
 // ---------------------------------------------------------------------------
-// IP feed loader helpers
-// ---------------------------------------------------------------------------
-
-async fn fetch_feed_cidrs(url: &str) -> anyhow::Result<Vec<String>> {
-    if let Some(path) = url.strip_prefix("file://") {
-        let text = tokio::fs::read_to_string(path)
-            .await
-            .with_context(|| format!("reading file feed: {path}"))?;
-        return Ok(parse_cidr_text(&text));
-    }
-
-    let https = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_webpki_roots()
-        .https_or_http()
-        .enable_http1()
-        .enable_http2()
-        .build();
-    let client: Client<_, http_body_util::combinators::BoxBody<Bytes, hyper::Error>> =
-        Client::builder(TokioExecutor::new()).build(https);
-
-    let uri: Uri = url
-        .parse()
-        .with_context(|| format!("invalid feed URL: {url}"))?;
-    let req = Request::builder()
-        .method("GET")
-        .uri(uri)
-        .header("User-Agent", "sentinel-waf/1.0 ip-reputation-feed-fetcher")
-        .body(
-            http_body_util::Empty::<Bytes>::new()
-                .map_err(|never: Infallible| match never {})
-                .boxed(),
-        )
-        .context("building feed request")?;
-
-    let resp = tokio::time::timeout(Duration::from_secs(30), client.request(req))
-        .await
-        .context("feed request timed out after 30s")?
-        .context("feed HTTP request failed")?;
-
-    if !resp.status().is_success() {
-        anyhow::bail!("feed returned HTTP {}", resp.status());
-    }
-
-    let body = resp
-        .collect()
-        .await
-        .context("reading feed body")?
-        .to_bytes();
-    let text = std::str::from_utf8(&body).context("feed body is not valid UTF-8")?;
-    Ok(parse_cidr_text(text))
-}
-
-fn parse_cidr_text(text: &str) -> Vec<String> {
-    text.lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(String::from)
-        .collect()
-}
-
-// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -8627,6 +8554,10 @@ async fn health_response(state: &ServerState) -> Response<BoxBody> {
         // refuses, or never answers, the sync) showed only in WARN lines and in
         // the heartbeat, which a silent control plane never receives.
         "config_sync": config_sync_health(&cfg),
+        // Site IP feeds: per feed, loaded / stale / failed / skipped, and what
+        // the per-feed and per-node caps cut. Each is a way for a feed to show as
+        // set in the console and enforce nothing.
+        "ip_feeds": ip_feed::status_json(),
         // Module reachability. Seven subsystems had no logging at all, and their
         // entry points are per-request pure functions on attacker-controlled
         // input, so they cannot be given log lines. These counters answer the one
@@ -9505,7 +9436,7 @@ fn metrics_response() -> Response<BoxBody> {
             "text/plain; version=0.0.4; charset=utf-8",
         )
         .body(full_body(Bytes::from(
-            prometheus_text() + &siem_metrics_text(),
+            prometheus_text() + &siem_metrics_text() + &ip_feed::metrics_text(),
         )))
         .unwrap()
 }

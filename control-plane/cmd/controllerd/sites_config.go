@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -110,17 +111,17 @@ func handleImportSites(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub 
 		return
 	}
 
-	existing, err := store.ListSites(c.Request.Context(), claims.TenantID, claims.UserID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
-		return
+	// An import creates and updates sites, so it applies the policy checks
+	// create and update do; without them a YAML file could store what the
+	// console refuses (a file:// feed, a paranoia level of 9). Every site is
+	// checked before any is written, so a refused document changes nothing
+	// rather than leaving the catalogue half-imported.
+	type importSite struct {
+		yamlSite
+		upJSON, wafJSON json.RawMessage
 	}
-	byName := make(map[string]db.SiteRow, len(existing))
-	for _, s := range existing {
-		byName[s.Name] = s
-	}
-
-	created, updated := 0, 0
+	var sites []importSite
+	var problems []SiteConfigProblem
 	for _, ys := range doc.Sites {
 		if ys.Name == "" {
 			continue
@@ -133,7 +134,33 @@ func handleImportSites(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub 
 		if len(ys.WafPolicy) == 0 {
 			wafJSON = json.RawMessage(defaultWafPolicyJSON)
 		}
+		for _, p := range validateWafPolicyValues(wafJSON) {
+			p.Field = fmt.Sprintf("sites[%s].%s", ys.Name, p.Field)
+			problems = append(problems, p)
+		}
+		sites = append(sites, importSite{ys, upJSON, wafJSON})
+	}
+	if len(problems) > 0 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":    fmt.Sprintf("nothing was imported — %s", importProblemSummary(problems)),
+			"problems": problems,
+		})
+		return
+	}
 
+	existing, err := store.ListSites(c.Request.Context(), claims.TenantID, claims.UserID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
+		return
+	}
+	byName := make(map[string]db.SiteRow, len(existing))
+	for _, s := range existing {
+		byName[s.Name] = s
+	}
+
+	created, updated := 0, 0
+	for _, is := range sites {
+		ys, upJSON, wafJSON := is.yamlSite, is.upJSON, is.wafJSON
 		if cur, ok := byName[ys.Name]; ok {
 			name := ys.Name
 			ureq := db.UpdateSiteRequest{
@@ -178,4 +205,14 @@ func handleImportSites(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub 
 		TargetKind:  "site",
 	})
 	c.JSON(http.StatusOK, gin.H{"ok": true, "created": created, "updated": updated, "total": created + updated})
+}
+
+// importProblemSummary names the first problem and counts the rest, for the
+// one-line error the console shows.
+func importProblemSummary(problems []SiteConfigProblem) string {
+	first := problems[0].String()
+	if n := len(problems) - 1; n > 0 {
+		return fmt.Sprintf("%s (and %d more)", first, n)
+	}
+	return first
 }
