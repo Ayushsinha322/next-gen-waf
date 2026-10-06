@@ -23,6 +23,7 @@ use sentinel_core::config::{
     TlsFileConfig, UpstreamConfig, UpstreamServer, WafConfig, WafMode,
 };
 use sentinel_proxy::ProxyServer;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
 
@@ -98,6 +99,32 @@ async fn start_origin() -> (SocketAddr, mpsc::Receiver<mpsc::Sender<OriginFrame>
         }
     });
     (addr, streams_rx)
+}
+
+/// An origin that answers every request with `raw`, written verbatim. For
+/// framing a hyper server will not produce: it sends chunked trailers only to a
+/// client that asked with `TE: trailers`.
+async fn start_raw_origin(raw: &'static [u8]) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut tcp, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                // The test requests carry no body: the head is the request.
+                let mut head = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match tcp.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let _ = tcp.write_all(raw).await;
+                let _ = tcp.shutdown().await;
+            });
+        }
+    });
+    addr
 }
 
 /// A port free on both TCP and UDP: the h3 endpoint binds the listener's own
@@ -430,6 +457,49 @@ async fn h3_inspected_response_cut_short_by_the_origin_is_a_502() {
         !String::from_utf8_lossy(&body).contains("record 1 of 2"),
         "the truncated origin body must not be relayed"
     );
+
+    drop(client);
+    proxy.stop().await;
+}
+
+/// An inspected response keeps its trailers. `proxy` buffers what DLP reads
+/// and rebuilds the body afterwards; the trailers used to be dropped in that
+/// round trip, so an h3 client never saw them.
+#[tokio::test]
+async fn h3_inspected_response_keeps_its_trailers() {
+    let origin = start_raw_origin(
+        b"HTTP/1.1 200 OK\r\n\
+          Content-Type: text/plain\r\n\
+          Transfer-Encoding: chunked\r\n\
+          Trailer: x-record-count\r\n\
+          Connection: close\r\n\
+          \r\n\
+          e\r\nrecord 1 of 1\n\r\n\
+          0\r\nx-record-count: 1\r\n\r\n",
+    )
+    .await;
+    let proxy = start_proxy(origin).await;
+
+    let mut client = h3_get(proxy.addr, "/trailers").await;
+    let resp = timeout(Duration::from_secs(10), client.stream.recv_response())
+        .await
+        .expect("no response head")
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mut body = Vec::new();
+    timeout(
+        Duration::from_secs(10),
+        read_to_end(&mut client.stream, &mut body),
+    )
+    .await
+    .expect("body never completed");
+    assert_eq!(body, b"record 1 of 1\n");
+    let trailers = timeout(Duration::from_secs(10), client.stream.recv_trailers())
+        .await
+        .expect("trailers never arrived")
+        .unwrap()
+        .expect("the inspected response reached the h3 client without its trailers");
+    assert_eq!(trailers.get("x-record-count").unwrap(), "1");
 
     drop(client);
     proxy.stop().await;

@@ -174,8 +174,9 @@ impl Body for PrefixedBody {
 
 /// Outcome of buffering a response body for inspection.
 enum ScanBuffer {
-    /// The whole body fit under the cap and can be scanned / rewritten.
-    Complete(Bytes),
+    /// The whole body fit under the cap and can be scanned / rewritten, plus the
+    /// trailers that followed it, if any.
+    Complete(Bytes, Option<header::HeaderMap>),
     /// The body exceeds the cap: the prefix already read off the wire, plus the
     /// untouched remainder. Inspection is skipped — a partial view cannot be
     /// scanned soundly, and DLP masking has to rewrite the whole payload.
@@ -193,14 +194,14 @@ enum ScanBuffer {
 async fn buffer_for_scan(mut body: BoxBody, cap: usize) -> ScanBuffer {
     let mut chunks: Vec<Bytes> = Vec::new();
     let mut buffered = 0usize;
+    let mut trailers: Option<header::HeaderMap> = None;
 
     loop {
         match body.frame().await {
-            None => return ScanBuffer::Complete(concat_chunks(chunks)),
+            None => return ScanBuffer::Complete(concat_chunks(chunks), trailers),
             Some(Err(e)) => return ScanBuffer::Error(e),
-            Some(Ok(frame)) => {
-                // Non-data frames (trailers) carry nothing to scan.
-                if let Ok(data) = frame.into_data() {
+            Some(Ok(frame)) => match frame.into_data() {
+                Ok(data) => {
                     buffered += data.len();
                     chunks.push(data);
                     if buffered > cap {
@@ -210,8 +211,31 @@ async fn buffer_for_scan(mut body: BoxBody, cap: usize) -> ScanBuffer {
                         };
                     }
                 }
-            }
+                // Trailers carry nothing to scan, but they are part of the
+                // message (a checksum, a final status) and the client may rely
+                // on them. They used to be dropped here, so every inspected
+                // response lost them.
+                Err(frame) => {
+                    if let Ok(t) = frame.into_trailers() {
+                        trailers
+                            .get_or_insert_with(header::HeaderMap::new)
+                            .extend(t);
+                    }
+                }
+            },
         }
+    }
+}
+
+/// Rebuild a body that was buffered for inspection, with the trailers it
+/// arrived with. Trailers are attached only when there are some: `Full` alone
+/// keeps the exact size hint that sets Content-Length and the logged byte count
+/// (and `WithTrailers` passes it through while the data is being read).
+fn rebuilt_body(bytes: Bytes, trailers: Option<header::HeaderMap>) -> BoxBody {
+    let body = Full::new(bytes).map_err(|never: Infallible| match never {});
+    match trailers {
+        Some(t) => body.with_trailers(async move { Some(Ok(t)) }).boxed(),
+        None => body.boxed(),
     }
 }
 
@@ -3672,7 +3696,11 @@ async fn proxy_inner(
                 )
                 .await
                 {
-                    Ok(ScanBuffer::Complete(b)) => b,
+                    // Request trailers are deliberately not forwarded: no rule
+                    // reads them, so passing them on would hand the origin
+                    // fields that skipped the inspection the body just got.
+                    // (The no-limit `collect` arm below drops them too.)
+                    Ok(ScanBuffer::Complete(b, _trailers)) => b,
                     Ok(ScanBuffer::Oversize { prefix, rest }) => {
                         if let Some(resp) = enforce_request_limit(
                             ctx,
@@ -4167,7 +4195,7 @@ async fn proxy_inner(
                     }
                     .boxed()
                 }
-                ScanBuffer::Complete(mut bytes) => {
+                ScanBuffer::Complete(mut bytes, trailers) => {
                     // A request that learning mode already recorded as
                     // would-block was decided by the request; that stays the
                     // event's explanation whatever the response adds.
@@ -4295,9 +4323,7 @@ async fn proxy_inner(
                         }
                     }
 
-                    Full::new(bytes)
-                        .map_err(|never: Infallible| match never {})
-                        .boxed()
+                    rebuilt_body(bytes, trailers)
                 }
             }
         } else {
@@ -12688,9 +12714,59 @@ mod response_scan_tests {
             Bytes::from_static(b"world"),
         ]);
         match buffer_for_scan(b, 1024).await {
-            ScanBuffer::Complete(bytes) => assert_eq!(&bytes[..], b"hello world"),
+            ScanBuffer::Complete(bytes, trailers) => {
+                assert_eq!(&bytes[..], b"hello world");
+                assert!(trailers.is_none());
+            }
             _ => panic!("expected Complete"),
         }
+    }
+
+    /// Trailers survive inspection. `buffer_for_scan` used to drop them, so a
+    /// response that DLP or response rules read reached the client without
+    /// them.
+    #[tokio::test]
+    async fn trailers_survive_buffering_and_the_rebuild() {
+        let mut sent = header::HeaderMap::new();
+        sent.insert("grpc-status", header::HeaderValue::from_static("0"));
+        let origin_trailers = sent.clone();
+        let body = Full::new(Bytes::from_static(b"payload"))
+            .with_trailers(async move { Some(Ok(origin_trailers)) })
+            .map_err(|never: Infallible| match never {})
+            .boxed();
+
+        let ScanBuffer::Complete(bytes, trailers) = buffer_for_scan(body, 1024).await else {
+            panic!("expected Complete");
+        };
+        assert_eq!(&bytes[..], b"payload");
+        assert_eq!(
+            trailers.as_ref(),
+            Some(&sent),
+            "trailers dropped while buffering"
+        );
+
+        let rebuilt = rebuilt_body(bytes, trailers);
+        assert_eq!(
+            rebuilt.size_hint().exact(),
+            Some(7),
+            "Content-Length and the logged size come from this hint"
+        );
+        let collected = rebuilt.collect().await.unwrap();
+        assert_eq!(
+            collected.trailers(),
+            Some(&sent),
+            "trailers dropped in the rebuild"
+        );
+        assert_eq!(&collected.to_bytes()[..], b"payload");
+    }
+
+    #[tokio::test]
+    async fn a_rebuilt_body_without_trailers_is_just_the_bytes() {
+        let rebuilt = rebuilt_body(Bytes::from_static(b"abc"), None);
+        assert_eq!(rebuilt.size_hint().exact(), Some(3));
+        let collected = rebuilt.collect().await.unwrap();
+        assert!(collected.trailers().is_none());
+        assert_eq!(&collected.to_bytes()[..], b"abc");
     }
 
     /// THE REGRESSION TEST. A chunked body reports no size hint, so the old
