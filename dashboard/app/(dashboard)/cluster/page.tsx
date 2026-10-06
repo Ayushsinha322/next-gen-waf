@@ -441,7 +441,7 @@ Fleet-wide health of the WAF data plane and control plane — live topology, fai
                               ["Config version applied", applied ? `v${applied}${stale ? ` — control plane is at v${cur}` : " (current)"}` : "never synced"],
                               ["Compiled rules", n.rules_compiled ? `${n.rules_enforced} enforcing of ${n.rules_compiled}` : "not reported"],
                               ["eBPF / XDP", n.ebpf_mode ? `${n.ebpf_mode} · ${(n.ebpf_drops ?? 0).toLocaleString()} drops` : "not reported"],
-                              ["Threat intel", n.threat_intel_entries !== undefined ? `${n.threat_intel_entries.toLocaleString()} indicators · corpus v${n.threat_intel_version ?? 0}` : "not reported"],
+                              ["Threat intel", n.threat_intel_entries !== undefined ? `${n.threat_intel_entries.toLocaleString()} indicators · corpus v${n.threat_intel_version ?? 0}${n.threat_intel_problem ? ` · ${n.threat_intel_problem}` : ""}` : "not reported"],
                               ["Upstreams", `${n.upstreams_healthy} healthy of ${n.upstreams_total}`],
                               ["Last heartbeat", `${fmtAgoSec(n.seconds_since_seen)} · uptime ${fmtUptime(n.uptime_secs)}`],
                             ] as [string, string][]).map(([k, v]) => (

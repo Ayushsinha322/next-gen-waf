@@ -83,6 +83,7 @@ type nodeMetadata struct {
 	EbpfDrops            int64           `json:"ebpf_drops"`
 	ThreatIntelEntries   int             `json:"threat_intel_entries"`
 	ThreatIntelVersion   int64           `json:"threat_intel_version"`
+	ThreatIntelSync      *nodeTISync     `json:"threat_intel_sync"`
 	InlineRules          json.RawMessage `json:"inline_rules"`
 }
 
@@ -138,6 +139,38 @@ type nodeConfigSync struct {
 		Error        string `json:"error"`
 		KeptPrevious bool   `json:"kept_previous"`
 	} `json:"rejected_sites"`
+}
+
+// nodeTISync is a data plane's account of its threat-intel poller
+// (crates/sentinel-proxy ti_sync_heartbeat). Without it the entry count above
+// read the same for a node refreshing its IOC set every minute and one whose
+// polls had been failing for a day.
+type nodeTISync struct {
+	Poller         string  `json:"poller"`
+	LastSyncStatus int     `json:"last_sync_status"`
+	LastError      *string `json:"last_error"`
+	FailingSince   *int64  `json:"failing_since"`
+}
+
+// threatIntelSyncProblem says why a node's IOC set is not being refreshed, or
+// "" when it is (or the node predates the field). Shown on the node, not folded
+// into the fleet verdict: a stale feed still enforces what it holds.
+func threatIntelSyncProblem(ts *nodeTISync) string {
+	if ts == nil {
+		return ""
+	}
+	if ts.LastError != nil {
+		if ts.FailingSince != nil {
+			return fmt.Sprintf("threat-intel sync failing since %s: %s",
+				time.Unix(*ts.FailingSince, 0).UTC().Format(time.RFC3339), *ts.LastError)
+		}
+		return "threat-intel sync failing: " + *ts.LastError
+	}
+	if ts.Poller == "rejected" {
+		return fmt.Sprintf("threat-intel sync refused by the control plane with HTTP %d (403 = SENTINEL_INTERNAL_SECRET mismatch)",
+			ts.LastSyncStatus)
+	}
+	return ""
 }
 
 // configSyncGrace is how long polls may fail before a node counts as not taking
@@ -269,6 +302,7 @@ func handleClusterHealth(c *gin.Context, enf *rbac.Enforcer, store *db.Store, cl
 					"ebpf_drops":             md.EbpfDrops,
 					"threat_intel_entries":   md.ThreatIntelEntries,
 					"threat_intel_version":   md.ThreatIntelVersion,
+					"threat_intel_problem":   threatIntelSyncProblem(md.ThreatIntelSync),
 					"inline_rules":           md.InlineRules,
 				})
 			}

@@ -58,3 +58,63 @@ func TestAHealthyOrOlderNodeIsNotRejecting(t *testing.T) {
 		t.Fatal(got)
 	}
 }
+
+// The data plane's /healthz config_sync block (crates/sentinel-proxy
+// config_sync_health). The Jobs page drew config.sync as a fixed green
+// "running" badge because the block was never passed on.
+func TestTheJobsViewCarriesTheDataPlaneConfigSync(t *testing.T) {
+	var h map[string]any
+	healthz := `{"uptime_secs":12,"version":"1.1.15","threat_intel":{"poller":"failing"},
+ "config_sync":{"configured":true,"version_applied":221,"last_error":"timeout: no complete response within 10s",
+  "failing_since":1790000000,"rejected_site_count":0}}`
+	if err := json.Unmarshal([]byte(healthz), &h); err != nil {
+		t.Fatal(err)
+	}
+	view := dataPlaneJobsView(h)
+	cs, ok := view["config_sync"].(map[string]any)
+	if !ok {
+		t.Fatalf("config_sync must reach the console, got %#v", view["config_sync"])
+	}
+	if cs["last_error"] != "timeout: no complete response within 10s" {
+		t.Fatalf("the failure must arrive as the node reported it: %#v", cs)
+	}
+	if view["threat_intel"] == nil || view["reachable"] != true {
+		t.Fatalf("the existing fields must still be carried: %#v", view)
+	}
+	// A data plane older than the field: absent, which the console shows as
+	// "not reported" rather than as healthy.
+	if v := dataPlaneJobsView(map[string]any{})["config_sync"]; v != nil {
+		t.Fatalf("an absent block must stay absent, got %#v", v)
+	}
+}
+
+// The heartbeat shape from crates/sentinel-proxy ti_sync_heartbeat. The cluster
+// read carried only the entry count, which reads the same for a node refreshing
+// its IOC set and one whose polls have failed for a day.
+func TestAThreatIntelSyncFailureReachesTheClusterRead(t *testing.T) {
+	var md nodeMetadata
+	hb := `{"threat_intel_entries":5000,"threat_intel_sync":{"poller":"failing","last_sync_status":200,
+ "last_error":"timeout: no complete response within 30s","failing_since":1790000000}}`
+	if err := json.Unmarshal([]byte(hb), &md); err != nil {
+		t.Fatal(err)
+	}
+	why := threatIntelSyncProblem(md.ThreatIntelSync)
+	if !strings.Contains(why, "timeout: no complete response within 30s") ||
+		!strings.Contains(why, time.Unix(1790000000, 0).UTC().Format(time.RFC3339)) {
+		t.Fatalf("the problem must give the error and since when: %q", why)
+	}
+
+	refused := &nodeTISync{Poller: "rejected", LastSyncStatus: 403}
+	if why := threatIntelSyncProblem(refused); !strings.Contains(why, "HTTP 403") {
+		t.Fatalf("a refusal must name the status: %q", why)
+	}
+
+	if why := threatIntelSyncProblem(&nodeTISync{Poller: "running", LastSyncStatus: 200}); why != "" {
+		t.Fatalf("a running poller has no problem: %q", why)
+	}
+	var older nodeMetadata
+	_ = json.Unmarshal([]byte(`{"threat_intel_entries":5000}`), &older)
+	if why := threatIntelSyncProblem(older.ThreatIntelSync); why != "" {
+		t.Fatalf("a node from before the field must not be flagged: %q", why)
+	}
+}
