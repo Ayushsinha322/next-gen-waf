@@ -3044,30 +3044,48 @@ async fn handle_request(
     management: Option<Arc<ManagementUpstreams>>,
     tls_fp: Option<String>,
 ) -> Result<Response<BoxBody>, Infallible> {
-    // Health / readiness endpoint — served before any WAF pipeline work.
-    // GET /healthz or GET /health returns JSON with proxy uptime, site
-    // count, and listener status.  No auth required; internal-only.
-    if req.uri().path() == "/healthz" || req.uri().path() == "/health" {
-        return Ok(health_response(&state).await);
-    }
-
-    // Kubernetes READINESS probe. Unlike /healthz (liveness — "the process is
-    // up"), /readyz reports whether this node can actually protect traffic: it
-    // returns 200 only once the WAF config has synced from the control plane
-    // (sites > 0). A freshly-started or rejoining pod reports 503 until its
-    // rules are loaded, so the Service / load balancer won't route to it early
-    // → no 502s on rollout or recovery. No auth required; internal-only.
-    if req.uri().path() == "/readyz" || req.uri().path() == "/ready" {
-        return Ok(readyz_response(&state));
-    }
-
-    // Prometheus metrics — served before any WAF pipeline work so every proxy
-    // pod is scrapeable at GET /metrics (requests/blocked/latency/rule-hits/
-    // eBPF-drops/active-connections/load-shed). Like the health probes above,
-    // this is internal-only (no auth) and expected to be network-restricted;
-    // it is served on every listener, including the management endpoint.
-    if req.method() == http::Method::GET && req.uri().path() == "/metrics" {
-        return Ok(metrics_response(&state.modules.rate_limiter));
+    // Health, readiness and metrics — answered before any WAF pipeline work,
+    // but not for every request that names those paths (see probe_disposition).
+    let probe_path = matches!(
+        req.uri().path(),
+        "/healthz" | "/health" | "/readyz" | "/ready"
+    ) || (req.method() == http::Method::GET && req.uri().path() == "/metrics");
+    if probe_path {
+        let host_is_site = {
+            let cfg = state.config.load();
+            req.headers()
+                .get(header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .or_else(|| req.uri().authority().map(|a| a.as_str()))
+                .is_some_and(|h| {
+                    let name = h.rsplit_once(':').map_or(h, |(n, p)| {
+                        if p.chars().all(|c| c.is_ascii_digit()) {
+                            n
+                        } else {
+                            h
+                        }
+                    });
+                    cfg.sites.iter().any(|s| site_matches(s, name))
+                })
+        };
+        if let ProbeDisposition::Answer { detailed } =
+            probe_disposition(management.is_some(), peer.ip(), host_is_site)
+        {
+            let path = req.uri().path();
+            return Ok(match path {
+                // Kubernetes/HAProxy READINESS: 200 only once this node has
+                // config to protect traffic with, else 503 — no early routing.
+                "/readyz" | "/ready" => readyz_response(&state),
+                "/metrics" if detailed => metrics_response(&state.modules.rate_limiter),
+                "/metrics" => error_response(StatusCode::NOT_FOUND, "not found"),
+                _ if detailed => health_response(&state).await,
+                _ => Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(full_body(Bytes::from_static(b"{\"status\":\"ok\"}")))
+                    .unwrap(),
+            });
+        }
     }
 
     // Management listener: this is the dedicated admin-console endpoint. It
@@ -3423,10 +3441,16 @@ async fn proxy_inner(
     // Host lookup deliberately does not attempt. A wrong guess here cannot
     // change enforcement, only which tenant owns the log line — and no guess
     // at all guarantees the line is owned by nobody.
+    // HTTP/2 and HTTP/3 carry the host in `:authority` (the URI), normally with
+    // no Host header — and the Host header is only synthesised from it further
+    // down. Attributing from Host alone left every h2/h3 request unattributed
+    // here, so the site's own IP block and allow lists below were skipped for
+    // most browser HTTPS traffic.
     if let Some(h) = req
         .headers()
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
+        .or_else(|| req.uri().authority().map(|a| a.as_str()))
         .map(|h| h.split(':').next().unwrap_or(h))
     {
         if let Some(s) = cfg.sites.iter().find(|s| site_matches(s, h)) {
@@ -5723,15 +5747,89 @@ fn inline_rule_diag_snapshot() -> Vec<InlineRuleDiag> {
 
 /// The per-path override governing `path`, or None. Longest matching prefix wins,
 /// so `/api/v2/` beats `/api/` for a `/api/v2/orders` request regardless of the
-/// order an operator happened to list them in.
+/// order an operator happened to list them in. Both sides are compared in the
+/// form `override_match_path` gives them.
 fn match_path_override<'a>(
     waf: &'a sentinel_core::config::WafConfig,
     path: &str,
 ) -> Option<&'a sentinel_core::config::PathOverride> {
+    let path = override_match_path(path);
     waf.path_overrides
         .iter()
-        .filter(|o| !o.path_prefix.is_empty() && path.starts_with(&o.path_prefix))
+        .filter(|o| {
+            !o.path_prefix.is_empty()
+                && path.starts_with(override_match_path(&o.path_prefix).as_ref())
+        })
         .max_by_key(|o| o.path_prefix.len())
+}
+
+/// A request path as an origin server resolves it before routing — the form
+/// per-path overrides are matched in.
+///
+/// The raw path let one request be two paths. `/%2egit/config`, `//.git/config`
+/// and `/x/../.git/config` all missed the shipped stricter `/.git` override while
+/// the origin served `/.git/config`; and `/assets/../api/users` (or the servlet
+/// spelling `/assets/..;/api/users`) took a mode-`off` `/assets/` override, so a
+/// request the origin routed to its API was never inspected.
+///
+/// Decoded once, as an origin does: an encoded dot or slash counts as one (nginx
+/// and IIS route them so), `\` is a separator (IIS), `;parameters` are dropped
+/// from each segment (Java servlet containers), empty and `.` segments vanish
+/// and `..` removes its parent. Matching stays a plain prefix test rather than a
+/// segment-wise one: the shipped `/.env` override is meant to cover
+/// `/.env.production`. Only matching changes — the origin gets the client's path.
+fn override_match_path(raw: &str) -> std::borrow::Cow<'_, str> {
+    let plain = !raw.contains(['%', '\\', ';'])
+        && !raw.contains("//")
+        && !raw.split('/').any(|seg| seg == "." || seg == "..");
+    if plain || !raw.starts_with('/') {
+        return std::borrow::Cow::Borrowed(raw);
+    }
+    let bytes = raw.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let mut b = bytes[i];
+        i += 1;
+        if b == b'%' {
+            if let Some(hex) = bytes
+                .get(i..i + 2)
+                .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
+            {
+                // Both bytes are ASCII hex digits, so this cannot fail.
+                b = u8::from_str_radix(std::str::from_utf8(hex).unwrap_or("00"), 16).unwrap_or(0);
+                i += 2;
+            }
+        }
+        decoded.push(if b == b'\\' { b'/' } else { b });
+    }
+    let decoded = String::from_utf8_lossy(&decoded);
+    let mut parts: Vec<&str> = Vec::new();
+    // Whether the path ends at a directory (`/a/`, `/a/.`, `/a/b/..`): its
+    // trailing slash is what a `/a/` prefix matches.
+    let mut dir = false;
+    for seg in decoded.split('/') {
+        dir = true;
+        match seg.split(';').next().unwrap_or("") {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            name => {
+                parts.push(name);
+                dir = false;
+            }
+        }
+    }
+    let mut out = String::with_capacity(decoded.len());
+    for p in &parts {
+        out.push('/');
+        out.push_str(p);
+    }
+    if dir || out.is_empty() {
+        out.push('/');
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// The mode governing this request: the effective one stamped at routing time
@@ -7387,6 +7485,60 @@ fn internal_auth_ok(headers: &http::HeaderMap) -> bool {
             .map(|got| constant_time_eq(got.as_bytes(), secret.as_bytes()))
             .unwrap_or(false),
         _ => false,
+    }
+}
+
+/// What the data plane does with a request for /health(z), /ready(z) or /metrics.
+#[derive(Debug, PartialEq, Eq)]
+enum ProbeDisposition {
+    /// Not a probe of this node: route it to the site like any other path.
+    Route,
+    /// Answer it here; `detailed` = the full /healthz body and /metrics.
+    Answer { detailed: bool },
+}
+
+/// These paths were answered by the WAF on every listener for every Host, before
+/// routing: a protected site's own /health or /metrics was unreachable (its
+/// uptime monitor stayed green while the app was down), and anyone on the
+/// internet could read /metrics and a /healthz body naming site ids, feed URLs
+/// and errors, sync errors, panic locations, listener binds and the eBPF
+/// interface.
+///
+/// Now a request for a configured site's own host is that site's — unless it
+/// comes from loopback. Every probe of the node itself keeps working: host
+/// scripts (Host 127.0.0.1), the control plane (`dataplane:8080`), HAProxy
+/// (no Host), the VRRP script and Docker healthchecks (loopback), and the
+/// management listener. The detail goes only to loopback, the management
+/// listener and private-network peers (the control plane and the host reach it
+/// over the Docker network); a public client gets bare liveness.
+fn probe_disposition(
+    management: bool,
+    peer: std::net::IpAddr,
+    host_is_site: bool,
+) -> ProbeDisposition {
+    if management || peer.is_loopback() {
+        return ProbeDisposition::Answer { detailed: true };
+    }
+    if host_is_site {
+        return ProbeDisposition::Route;
+    }
+    ProbeDisposition::Answer {
+        detailed: is_private_peer(peer),
+    }
+}
+
+/// Loopback, RFC 1918, link-local, or IPv6 unique-local — never carrier-grade
+/// NAT (100.64/10), whose addresses are public subscribers.
+fn is_private_peer(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_private_peer(std::net::IpAddr::V4(v4));
+            }
+            let seg0 = v6.segments()[0];
+            v6.is_loopback() || (seg0 & 0xfe00) == 0xfc00 || (seg0 & 0xffc0) == 0xfe80
+        }
     }
 }
 
@@ -12504,6 +12656,183 @@ mod metrics_endpoint_tests {
         );
         assert!(history_sink_metrics_text(true, true, 0)
             .contains("sentinel_history_clickhouse_connected 1"));
+    }
+}
+
+#[cfg(test)]
+mod path_override_match_tests {
+    use super::*;
+    use sentinel_core::config::{PathOverride, WafConfig};
+
+    fn matched(path: &str) -> Option<String> {
+        let po = |p: &str, mode: Option<WafMode>, t: Option<u32>| PathOverride {
+            path_prefix: p.into(),
+            mode,
+            anomaly_threshold: t,
+        };
+        let waf = WafConfig {
+            path_overrides: vec![
+                po("/.git", None, Some(5)),
+                po("/.env", None, Some(5)),
+                po("/assets/", Some(WafMode::Off), None),
+            ],
+            ..Default::default()
+        };
+        match_path_override(&waf, path).map(|o| o.path_prefix.clone())
+    }
+
+    /// Every spelling an origin serves as `/.git/config` gets the stricter
+    /// `/.git` policy the control plane ships.
+    #[test]
+    fn encoded_and_dot_segment_spellings_reach_the_stricter_override() {
+        for p in [
+            "/.git/config",
+            "/%2egit/config",
+            "/%2Egit/config",
+            "//.git/config",
+            "/x/../.git/config",
+            "/./.git/config",
+            "/.git%2fconfig",
+            "/x/..%2f.git/config",
+            "/x\\..\\.git\\config",
+            "/x/..;/.git/config",
+        ] {
+            assert_eq!(matched(p).as_deref(), Some("/.git"), "{p}");
+        }
+        // Still a prefix test: the shipped `/.env` covers its siblings.
+        assert_eq!(matched("/.env.production").as_deref(), Some("/.env"));
+    }
+
+    /// A path the origin routes outside an exempt prefix must not borrow the
+    /// exemption; real asset paths keep it.
+    #[test]
+    fn a_dot_segment_cannot_borrow_an_exempt_prefix() {
+        for p in [
+            "/assets/../api/users",
+            "/assets/..;/api/users",
+            "/assets/%2e%2e/api/users",
+            "/assets%2f..%2fapi/users",
+            "/assets/./../api",
+        ] {
+            assert_eq!(matched(p), None, "{p}");
+        }
+        for p in [
+            "/assets/app.js",
+            "/assets/",
+            "/assets/my%20icon.png",
+            "/assets//app.js",
+            "/assets/x/../app.js",
+        ] {
+            assert_eq!(matched(p).as_deref(), Some("/assets/"), "{p}");
+        }
+    }
+
+    #[test]
+    fn the_canonical_form() {
+        for (raw, want) in [
+            ("/", "/"),
+            ("/a/b", "/a/b"),
+            ("/a/b/", "/a/b/"),
+            ("/a/b/..", "/a/"),
+            ("/a/./", "/a/"),
+            ("/..", "/"),
+            ("/../../etc", "/etc"),
+            ("/shop;jsessionid=1/cart", "/shop/cart"),
+            ("/100%", "/100%"),
+            ("/%zz/%4", "/%zz/%4"),
+            ("/%2B5", "/+5"),
+            ("/%+5", "/%+5"),
+            ("*", "*"),
+        ] {
+            assert_eq!(override_match_path(raw), want, "{raw}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod probe_disposition_tests {
+    use super::*;
+
+    fn ip(s: &str) -> std::net::IpAddr {
+        s.parse().unwrap()
+    }
+
+    /// A protected site's own /health and /metrics belong to the site: the WAF
+    /// answered them for every Host, so the app's uptime check stayed green
+    /// while it was down, and the internet could read the node's metrics.
+    #[test]
+    fn a_public_request_for_a_sites_host_is_routed_to_the_site() {
+        assert_eq!(
+            probe_disposition(false, ip("203.0.113.9"), true),
+            ProbeDisposition::Route
+        );
+        assert_eq!(
+            probe_disposition(false, ip("2001:db8::9"), true),
+            ProbeDisposition::Route
+        );
+    }
+
+    /// A public client that does not name a site gets bare liveness — never the
+    /// /healthz detail or /metrics.
+    #[test]
+    fn a_public_client_gets_no_detail() {
+        for peer in [
+            "203.0.113.9",
+            "100.64.0.7",
+            "2001:db8::9",
+            "::ffff:203.0.113.9",
+        ] {
+            assert_eq!(
+                probe_disposition(false, ip(peer), false),
+                ProbeDisposition::Answer { detailed: false },
+                "{peer}"
+            );
+        }
+    }
+
+    /// Every existing probe of the node keeps its answer: loopback (VRRP
+    /// script, Docker healthcheck), the control plane and HAProxy over the
+    /// private network, and the management listener.
+    #[test]
+    fn the_nodes_own_probes_keep_working() {
+        let detailed = ProbeDisposition::Answer { detailed: true };
+        // Loopback is the node itself, whatever Host it sends.
+        assert_eq!(probe_disposition(false, ip("127.0.0.1"), true), detailed);
+        assert_eq!(probe_disposition(false, ip("::1"), true), detailed);
+        // The management listener is the operator's.
+        assert_eq!(probe_disposition(true, ip("203.0.113.9"), true), detailed);
+        // The control plane (`dataplane:8080`) and HAProxy (no Host) over Docker
+        // or the LAN.
+        for peer in [
+            "172.18.0.5",
+            "10.0.0.3",
+            "192.168.1.4",
+            "169.254.1.1",
+            "fd00::5",
+            "fe80::1",
+        ] {
+            assert_eq!(
+                probe_disposition(false, ip(peer), false),
+                detailed,
+                "{peer}"
+            );
+        }
+    }
+
+    #[test]
+    fn carrier_grade_nat_and_public_v6_are_not_private() {
+        for peer in ["100.64.0.1", "8.8.8.8", "2001:db8::1", "::ffff:8.8.8.8"] {
+            assert!(!is_private_peer(ip(peer)), "{peer}");
+        }
+        for peer in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.31.255.1",
+            "::ffff:10.0.0.1",
+            "fc00::1",
+        ] {
+            assert!(is_private_peer(ip(peer)), "{peer}");
+        }
     }
 }
 
