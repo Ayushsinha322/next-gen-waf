@@ -214,7 +214,9 @@ if [[ "$RESTORE_DB" == "yes" ]]; then
     [[ "$c" == "RESTORE" ]] || die "database restore declined — images are on $TARGET, schema unchanged"
   fi
   if [[ -x "$INSTALL_DIR/scripts/backup/restore.sh" ]]; then
-    ( cd "$INSTALL_DIR/scripts/backup" && ./restore.sh "$BK" >>"$LOG" 2>&1 ) \
+    # --force: the confirmation was asked above (or --yes given). restore.sh
+    # must not ask again: its output goes to the log, where nobody sees a prompt.
+    ( cd "$INSTALL_DIR/scripts/backup" && ./restore.sh "$BK" --force >>"$LOG" 2>&1 ) \
       && ok "database restored from $BK" || die "restore.sh failed — see $LOG"
   else
     die "restore.sh not available — restore manually from $BK"

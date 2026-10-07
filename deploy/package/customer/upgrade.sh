@@ -545,7 +545,9 @@ if [[ "$MIGRATED" == "yes" ]]; then
   if [[ "$RESTORE_DB" == "yes" ]]; then
     printf '\n  --restore-db given: restoring now…\n'
     if [[ -x "$INSTALL_DIR/scripts/backup/restore.sh" ]]; then
-      ( cd "$INSTALL_DIR/scripts/backup" && ./restore.sh "$DUMP_DIR" >>"$LOG" 2>&1 ) \
+      # --force: --restore-db was the confirmation. restore.sh must not ask
+      # again: its output goes to the log, where nobody sees a prompt.
+      ( cd "$INSTALL_DIR/scripts/backup" && ./restore.sh "$DUMP_DIR" --force >>"$LOG" 2>&1 ) \
         && ok "database restored from $DUMP_DIR" \
         || warn "restore.sh failed — see $LOG"
     else
