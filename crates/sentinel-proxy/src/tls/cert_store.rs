@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -115,13 +115,27 @@ pub enum CertSource {
 struct CertEntry {
     key: Arc<CertifiedKey>,
     meta: CertMeta,
+    /// The SNI names this cert is served for: every DNS name in its leaf's
+    /// subjectAltName (wildcards included) plus the key it is stored under,
+    /// normalised like an SNI. Empty for reserved keys and site fallbacks,
+    /// which are looked up by key only.
+    names: Vec<String>,
 }
 
 pub struct CertStore {
-    /// Operator certificates: ACME, manual uploads and the management cert.
-    /// `get_meta` answers from here alone, so a self-signed cert can never look
-    /// like an issued one to the ACME issuance and renewal checks.
+    /// Operator certificates: ACME, manual uploads and the management cert,
+    /// by store key. `get_meta` answers from here alone, so a self-signed cert
+    /// can never look like an issued one to the ACME issuance and renewal
+    /// checks. Changed only through `insert_live` / `remove_live`, which keep
+    /// `by_name` in step.
     live: DashMap<String, Arc<CertEntry>>,
+    /// SNI name → keys in `live` of the certs whose `names` hold it. A cert
+    /// used to be found by its store key alone — the first name of an ACME
+    /// order — so every other name it carried got the self-signed fallback.
+    by_name: DashMap<String, Vec<String>>,
+    /// Serialises `live` + `by_name` updates so two installs cannot interleave
+    /// their index edits. Handshakes never take it.
+    index_write: Mutex<()>,
     /// TLS-ALPN-01 challenge certs: domain → special cert served during challenge.
     alpn_challenge: DashMap<String, Arc<CertifiedKey>>,
     /// Self-signed certs for configured site names that have no live cert.
@@ -302,9 +316,9 @@ pub struct MintReport {
     pub failed: Vec<String>,
 }
 
-/// Whether a cert stored under `cert_name` is served for the SNI `site`: the
+/// Whether a cert served for `cert_name` is served for the SNI `site`: the
 /// same name, or a wildcard one label above it — the match `resolve_live` makes.
-fn cert_covers(cert_name: &str, site: &str) -> bool {
+pub(crate) fn cert_covers(cert_name: &str, site: &str) -> bool {
     cert_name == site
         || cert_name
             .strip_prefix("*.")
@@ -314,6 +328,87 @@ fn cert_covers(cert_name: &str, site: &str) -> bool {
 /// Whether a cert stored under `name` would be served for a configured site.
 fn serves_configured_name(name: &str, site_names: &HashSet<String>) -> bool {
     site_names.iter().any(|site| cert_covers(name, site))
+}
+
+/// How `serving_entry` orders the certs that carry one name: valid, the name
+/// itself (not via a wildcard), stored under it, expiry, then the lowest key.
+type ServeRank = (bool, bool, bool, u64, std::cmp::Reverse<String>);
+
+/// A name as rustls hands it to the resolver: no surrounding space, no
+/// trailing dot, lower case.
+pub(crate) fn normalize_name(name: &str) -> String {
+    name.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// The DNS names in the leaf's subjectAltName, wildcards included, normalised.
+/// IP-address entries are not names: rustls never hands the resolver one.
+pub(crate) fn leaf_dns_names(leaf: &CertificateDer<'_>) -> Result<Vec<String>> {
+    let cert = webpki::EndEntityCert::try_from(leaf)
+        .map_err(|e| anyhow::anyhow!("the certificate could not be parsed: {e}"))?;
+    let mut names: Vec<String> = Vec::new();
+    for name in cert.valid_dns_names().map(normalize_name) {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
+
+/// Whether a certificate carrying `names` is valid for `host`, as a client
+/// checks it: the name itself, or a wildcard one label above it.
+pub(crate) fn names_cover(names: &[String], host: &str) -> bool {
+    let host = normalize_name(host);
+    names.iter().any(|n| cert_covers(n, &host))
+}
+
+/// A live entry for `ck` stored under `key`, served for every DNS name in its
+/// leaf and for `key` itself — the name it has always been found by, and the
+/// only one for a leaf that names none (the bare-IP `default` cert) or cannot
+/// be parsed. Reserved keys are internal: found by key, never by SNI.
+fn live_entry(key: &str, ck: Arc<CertifiedKey>, meta: CertMeta) -> Arc<CertEntry> {
+    let names = if key.starts_with(RESERVED_PREFIX) {
+        Vec::new()
+    } else {
+        let mut names = ck
+            .end_entity_cert()
+            .ok()
+            .and_then(|leaf| leaf_dns_names(leaf).ok())
+            .unwrap_or_default();
+        let own = normalize_name(key);
+        if !own.is_empty() && !names.contains(&own) {
+            names.push(own);
+        }
+        names
+    };
+    Arc::new(CertEntry {
+        key: ck,
+        meta,
+        names,
+    })
+}
+
+/// Fill what the metadata lacks from the leaf: names its subjectAltName
+/// carries that `san` does not list (an upload's meta used to hold only the
+/// name it was uploaded for), and an unknown expiry.
+fn complete_meta(meta: &mut CertMeta, ck: &CertifiedKey) {
+    let Ok(leaf) = ck.end_entity_cert() else {
+        return;
+    };
+    for name in leaf_dns_names(leaf).unwrap_or_default() {
+        if !meta.san.iter().any(|s| s.eq_ignore_ascii_case(&name)) {
+            meta.san.push(name);
+        }
+    }
+    if meta.expires_at == 0 {
+        meta.expires_at = super::acme::der_not_after(leaf.as_ref()).unwrap_or(0);
+    }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// Outcome of loading one directory of the cert volume.
@@ -329,6 +424,8 @@ impl CertStore {
     pub fn new(cert_dir: PathBuf) -> Arc<Self> {
         Arc::new(Self {
             live: DashMap::new(),
+            by_name: DashMap::new(),
+            index_write: Mutex::new(()),
             alpn_challenge: DashMap::new(),
             fallback: RwLock::new(SiteFallbacks::default()),
             default_cert: ArcSwapOption::empty(),
@@ -347,6 +444,96 @@ impl CertStore {
         self.fallback
             .write()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    // ── live certs and the names they are served for ────────────────────────
+
+    /// Put `entry` in `live` under `key`, replacing what was there, and point
+    /// each of its names at it. A name only the replaced cert carried stops
+    /// resolving to this key.
+    fn insert_live(&self, key: String, entry: Arc<CertEntry>) {
+        let _w = self
+            .index_write
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let old = self.live.insert(key.clone(), Arc::clone(&entry));
+        for name in old.iter().flat_map(|o| o.names.iter()) {
+            if !entry.names.contains(name) {
+                self.unindex(name, &key);
+            }
+        }
+        for name in &entry.names {
+            let mut keys = self.by_name.entry(name.clone()).or_default();
+            if !keys.contains(&key) {
+                keys.push(key.clone());
+            }
+        }
+    }
+
+    /// Take `key` out of `live`, and every name it was served for with it.
+    fn remove_live(&self, key: &str) -> Option<Arc<CertEntry>> {
+        let _w = self
+            .index_write
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let (_, old) = self.live.remove(key)?;
+        for name in &old.names {
+            self.unindex(name, key);
+        }
+        Some(old)
+    }
+
+    fn unindex(&self, name: &str, key: &str) {
+        if let Some(mut keys) = self.by_name.get_mut(name) {
+            keys.retain(|k| k != key);
+        }
+        self.by_name.remove_if(name, |_, keys| keys.is_empty());
+    }
+
+    /// The live cert a handshake for `sni` is served, if any: one whose names
+    /// hold `sni` itself, else its wildcard one label up.
+    ///
+    /// Several certs can carry one name (an ACME cert for `example.com` +
+    /// `www.example.com`, and an upload for `www.example.com` alone). The pick
+    /// is the same on every node and every restart: an unexpired cert over an
+    /// expired one, the name itself over a wildcard, the cert stored under that
+    /// very name over one that merely lists it, then the later expiry, then
+    /// the lowest key.
+    fn serving_entry(&self, sni: &str) -> Option<Arc<CertEntry>> {
+        let sni = normalize_name(sni);
+        let wildcard = sni.split_once('.').map(|(_, rest)| format!("*.{rest}"));
+        let now = unix_now();
+        let mut best: Option<(ServeRank, Arc<CertEntry>)> = None;
+        let lookups =
+            std::iter::once((sni.as_str(), true)).chain(wildcard.as_deref().map(|w| (w, false)));
+        for (name, literal) in lookups {
+            // Cloned so no index guard is held while `live` is read.
+            let Some(keys) = self.by_name.get(name).map(|k| k.clone()) else {
+                continue;
+            };
+            for key in keys {
+                let Some(entry) = self.live.get(&key).map(|e| Arc::clone(e.value())) else {
+                    continue;
+                };
+                // The index can trail a concurrent install by an instant; only
+                // the entry's own names are trusted.
+                if !entry.names.iter().any(|n| n == name) {
+                    continue;
+                }
+                let expires = entry.meta.expires_at;
+                let rank = (
+                    expires == 0 || expires > now,
+                    literal,
+                    key.eq_ignore_ascii_case(name),
+                    expires,
+                    std::cmp::Reverse(key),
+                );
+                if best.as_ref().is_none_or(|(b, _)| rank > *b) {
+                    best = Some((rank, entry));
+                }
+            }
+        }
+        best.map(|(_, e)| e)
     }
 
     /// Load all persisted certs from `cert_dir/{domain}/` on startup.
@@ -476,13 +663,22 @@ impl CertStore {
 
         let key_pem = std::fs::read(&key_file).context("reading key.pem")?;
         let ck = load_pem_bytes(&cert_pem, &key_pem)?;
-        let entry = Arc::new(CertEntry { key: ck, meta });
         match fallback_name {
             Some(name) => {
+                let entry = Arc::new(CertEntry {
+                    key: ck,
+                    meta,
+                    names: Vec::new(),
+                });
                 self.fallback_write().certs.insert(name, entry);
             }
             None => {
-                self.live.insert(entry.meta.domain.clone(), entry);
+                // Served for every name its leaf carries, whatever the meta
+                // written when it was installed says.
+                let mut meta = meta;
+                complete_meta(&mut meta, &ck);
+                let key = meta.domain.clone();
+                self.insert_live(key.clone(), live_entry(&key, ck, meta));
             }
         }
         Ok(DirLoad::Loaded)
@@ -535,6 +731,7 @@ impl CertStore {
             let entry = Arc::new(CertEntry {
                 key: ck,
                 meta: self_signed_meta(name),
+                names: Vec::new(),
             });
             let mut fb = self.fallback_write();
             // Checked again under the lock: an entry for a name a concurrent sync
@@ -711,19 +908,26 @@ impl CertStore {
 
     fn remember_self_signed(&self, domain: &str, ck: Arc<CertifiedKey>) {
         let meta = self_signed_meta(domain);
-        self.live
-            .insert(domain.to_string(), Arc::new(CertEntry { key: ck, meta }));
+        self.insert_live(domain.to_string(), live_entry(domain, ck, meta));
     }
 
-    /// Install a cert from PEM strings (from ACME or manual upload).
-    /// Hot-swaps immediately — no restart required.
+    /// Install a cert from PEM strings (from ACME or manual upload), stored
+    /// under `domain` and served for every DNS name its leaf carries.
+    /// Hot-swaps immediately — no restart required. A cert it replaces stops
+    /// being served for the names only that cert carried.
     pub fn install(
         &self,
         domain: &str,
         cert_pem: &str,
         key_pem: &str,
-        meta: CertMeta,
+        mut meta: CertMeta,
     ) -> Result<()> {
+        // Loaded before anything is written: a PEM pair that does not load
+        // must not replace the files of the cert being served.
+        let ck = load_pem_bytes(cert_pem.as_bytes(), key_pem.as_bytes())
+            .context("loading installed cert into rustls")?;
+        complete_meta(&mut meta, &ck);
+
         let dir = self.cert_dir.join(domain_to_dirname(domain));
         std::fs::create_dir_all(&dir)?;
         // The directory (and thus the private key it holds) must not be
@@ -743,37 +947,35 @@ impl CertStore {
             serde_json::to_string_pretty(&meta)?.as_bytes(),
         )?;
 
-        let ck = load_pem_bytes(cert_pem.as_bytes(), key_pem.as_bytes())
-            .context("loading installed cert into rustls")?;
-
-        self.live
-            .insert(domain.to_string(), Arc::new(CertEntry { key: ck, meta }));
+        let entry = live_entry(domain, ck, meta);
+        let names = entry.names.clone();
+        self.insert_live(domain.to_string(), entry);
         // The self-signed cert this replaces would only be listed beside it; its
         // files were just overwritten anyway.
-        self.fallback_write()
-            .certs
-            .remove(&domain.to_ascii_lowercase());
-        tracing::info!(domain, "TLS cert installed and hot-swapped");
+        self.fallback_write().certs.remove(&normalize_name(domain));
+        tracing::info!(domain, ?names, "TLS cert installed and hot-swapped");
         Ok(())
     }
 
     pub fn remove(&self, domain: &str) -> Result<()> {
-        self.live.remove(domain);
+        let removed = self.remove_live(domain);
         let dir = self.cert_dir.join(domain_to_dirname(domain));
         if dir.exists() {
             std::fs::remove_dir_all(&dir)?;
         }
         // A site's self-signed cert lived in that directory too. The configured
-        // sites this cert answered for — its own name, or every name a wildcard
-        // covered — get a self-signed one now, in this admin call, rather than
-        // the default cert until the next config change.
-        let name = domain.to_ascii_lowercase();
-        self.fallback_write().certs.remove(&name);
+        // sites this cert answered for — any name it carried, or every name one
+        // of its wildcards covered — get a self-signed one now, in this admin
+        // call, rather than the default cert until the next config change. One
+        // another live cert still serves keeps that cert.
+        let own = normalize_name(domain);
+        self.fallback_write().certs.remove(&own);
+        let served = removed.map_or_else(|| vec![own], |e| e.names.clone());
         let uncovered: Vec<String> = self
             .fallback_read()
             .configured
             .iter()
-            .filter(|site| cert_covers(&name, site))
+            .filter(|site| served.iter().any(|n| cert_covers(n, site)))
             .cloned()
             .collect();
         for failed in self.ensure_site_fallbacks(&uncovered).failed {
@@ -802,17 +1004,25 @@ impl CertStore {
         let key_pem = std::fs::read_to_string(dir.join("key.pem"))?;
         let ck = load_pem_bytes(cert_pem.as_bytes(), key_pem.as_bytes())
             .context("reloading cert after rename")?;
-        let entry = Arc::new(CertEntry { key: ck, meta });
         // Renaming a site's self-signed cert must not promote it into `live`,
         // where `get_meta` would report it as issued and hold off ACME.
-        if entry.meta.source == CertSource::SelfSigned && !domain.starts_with(RESERVED_PREFIX) {
-            let name = domain.to_ascii_lowercase();
+        if meta.source == CertSource::SelfSigned && !domain.starts_with(RESERVED_PREFIX) {
+            let name = normalize_name(domain);
             let mut fb = self.fallback_write();
             if fb.configured.contains(&name) {
-                fb.certs.insert(name, entry);
+                let names = Vec::new();
+                fb.certs.insert(
+                    name,
+                    Arc::new(CertEntry {
+                        key: ck,
+                        meta,
+                        names,
+                    }),
+                );
             }
         } else {
-            self.live.insert(domain.to_string(), entry);
+            complete_meta(&mut meta, &ck);
+            self.insert_live(domain.to_string(), live_entry(domain, ck, meta));
         }
         Ok(())
     }
@@ -839,29 +1049,26 @@ impl CertStore {
         all
     }
 
-    /// Metadata of the operator cert answering for `domain`: its own entry, else
-    /// a cert that lists it in its SAN. Self-signed fallbacks are deliberately
-    /// not reported — ACME issuance and renewal read this, and a self-signed
-    /// cert (which never expires by its metadata) would hold them off for ever.
-    ///
-    /// The SAN match matters because an ACME order is stored under its first
-    /// name only. The other names used to be "covered" by accident, by the
-    /// self-signed cert a handshake had minted for them; without the match the
-    /// renewal loop would re-order such a site every hour.
+    /// Metadata of the operator cert a handshake for `domain` is served — the
+    /// pick `serving_entry` makes among every cert whose leaf carries the name
+    /// or a wildcard over it — or, for a reserved key, the cert stored under
+    /// it. Self-signed fallbacks are deliberately not reported — ACME issuance
+    /// and renewal read this, and a self-signed cert (which never expires by
+    /// its metadata) would hold them off for ever.
     pub fn get_meta(&self, domain: &str) -> Option<CertMeta> {
-        if let Some(e) = self.live.get(domain) {
-            return Some(e.value().meta.clone());
+        if domain.starts_with(RESERVED_PREFIX) {
+            return self.live.get(domain).map(|e| e.value().meta.clone());
         }
+        if let Some(e) = self.serving_entry(domain) {
+            return Some(e.meta.clone());
+        }
+        // The names recorded at issuance count too: the renewal loop asks
+        // whether an issued cert covers a site, and must not re-order one every
+        // hour because the serving index was built from the leaf alone.
+        let want = normalize_name(domain);
         self.live
             .iter()
-            .filter(|e| !e.key().starts_with(RESERVED_PREFIX))
-            .find(|e| {
-                e.value()
-                    .meta
-                    .san
-                    .iter()
-                    .any(|s| s.eq_ignore_ascii_case(domain))
-            })
+            .find(|e| e.value().meta.san.iter().any(|s| normalize_name(s) == want))
             .map(|e| e.value().meta.clone())
     }
 
@@ -932,9 +1139,9 @@ impl CertStore {
         }
 
         // 3. Hot-swap the live entry — picked up on the next TLS handshake.
-        self.live.insert(
+        self.insert_live(
             MANAGEMENT_CERT_KEY.to_string(),
-            Arc::new(CertEntry { key: ck, meta }),
+            live_entry(MANAGEMENT_CERT_KEY, ck, meta),
         );
         tracing::info!("management TLS cert installed and hot-swapped");
         Ok(prev_fp)
@@ -962,18 +1169,16 @@ impl CertStore {
 
     // ── internal resolvers ────────────────────────────────────────────────────
 
+    /// The live cert served for `sni`: one carrying the name, or a wildcard
+    /// over it (see `serving_entry`).
     fn resolve_live(&self, sni: &str) -> Option<Arc<CertifiedKey>> {
-        // Exact match
-        if let Some(e) = self.live.get(sni) {
-            return Some(Arc::clone(&e.value().key));
-        }
-        // Wildcard: *.example.com covers sub.example.com
-        if let Some(parent) = sni.split_once('.').map(|(_, rest)| format!("*.{rest}")) {
-            if let Some(e) = self.live.get(&parent) {
-                return Some(Arc::clone(&e.value().key));
-            }
-        }
-        None
+        self.serving_entry(sni).map(|e| Arc::clone(&e.key))
+    }
+
+    /// The live cert stored under `key`, whatever its names: how the
+    /// management listener finds the one cert it serves.
+    fn resolve_key(&self, key: &str) -> Option<Arc<CertifiedKey>> {
+        self.live.get(key).map(|e| Arc::clone(&e.value().key))
     }
 
     /// The self-signed cert of a configured site, matched like `resolve_live`.
@@ -1032,7 +1237,7 @@ impl SentinelCertResolver {
     /// It is minted here, at listener startup, not in the first handshake.
     pub fn new_fixed(store: Arc<CertStore>, key: &str) -> Arc<Self> {
         store.ensure_default_cert();
-        if store.resolve_live(key).is_none() {
+        if store.resolve_key(key).is_none() {
             let _ = store.self_signed_shared(key);
         }
         Arc::new(Self {
@@ -1054,7 +1259,7 @@ impl SentinelCertResolver {
         if let Some(key) = &self.fixed_key {
             return self
                 .store
-                .resolve_live(key)
+                .resolve_key(key)
                 .or_else(|| self.store.default_cert());
         }
 
@@ -2175,6 +2380,78 @@ mod tests {
                 "juice",
                 "xn--bcher-kva.example",
             ])
+        );
+    }
+
+    /// One ACME order covers every name of a site, but the cert was stored and
+    /// found under the first name only: www.example.com got the self-signed
+    /// fallback while example.com got the real certificate.
+    #[test]
+    fn a_cert_is_served_for_every_name_in_its_subject_alt_name() {
+        let dir = tmp_dir();
+        let store = CertStore::new(dir.clone());
+        store
+            .load_from_disk(&names(&["example.com", "www.example.com"]))
+            .unwrap();
+        let cert = rcgen::generate_simple_self_signed(vec![
+            "example.com".to_string(),
+            "www.example.com".to_string(),
+        ])
+        .unwrap();
+        let (pem, key) = (
+            cert.serialize_pem().unwrap(),
+            cert.serialize_private_key_pem(),
+        );
+        let mut m = meta("fp-multi");
+        m.domain = "example.com".into();
+        m.san = vec!["example.com".into()];
+        store.install("example.com", &pem, &key, m).unwrap();
+
+        let resolver = SentinelCertResolver::new(Arc::clone(&store));
+        let apex = leaf(&resolver.select(Some("example.com"), false).unwrap());
+        let www = leaf(&resolver.select(Some("WWW.Example.com."), false).unwrap());
+        assert_eq!(apex, www, "www.example.com must get the same issued cert");
+
+        // Survives a restart: the names come from the leaf, not the stored key.
+        let reloaded = CertStore::new(dir.clone());
+        reloaded
+            .load_from_disk(&names(&["example.com", "www.example.com"]))
+            .unwrap();
+        let resolver = SentinelCertResolver::new(Arc::clone(&reloaded));
+        assert_eq!(
+            leaf(&resolver.select(Some("www.example.com"), false).unwrap()),
+            apex
+        );
+
+        // Removing the cert stops serving it for every name it carried.
+        reloaded.remove("example.com").unwrap();
+        let resolver = SentinelCertResolver::new(Arc::clone(&reloaded));
+        let after = resolver
+            .select(Some("www.example.com"), false)
+            .map(|ck| leaf(&ck));
+        assert_ne!(after.as_deref(), Some(apex.as_slice()));
+    }
+
+    #[test]
+    fn an_upload_with_the_wrong_key_or_for_another_name_is_refused() {
+        let (pem, key) = self_signed_pem("shop.example.in");
+        let (_, other_key) = self_signed_pem("shop.example.in");
+        assert!(super::super::acme::check_upload("shop.example.in", &pem, &key).is_ok());
+        let wrong_key = super::super::acme::check_upload("shop.example.in", &pem, &other_key);
+        assert!(
+            wrong_key
+                .unwrap_err()
+                .to_string()
+                .contains("does not belong"),
+            "a mismatched key must be refused"
+        );
+        let wrong_name = super::super::acme::check_upload("pay.example.in", &pem, &key);
+        assert!(
+            wrong_name
+                .unwrap_err()
+                .to_string()
+                .contains("does not cover pay.example.in"),
+            "a cert for another name must be refused"
         );
     }
 

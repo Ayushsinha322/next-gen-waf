@@ -37,6 +37,10 @@ export default function QuickAddSite({
   const [name, setName] = useState("");
   const [domain, setDomain] = useState("");
   const [upstream, setUpstream] = useState("");
+  // The automatic certificate needs a contact email: without one the control
+  // plane turns TLS off, and Quick Add said "automatic certificate" while none
+  // was ever requested.
+  const [email, setEmail] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
@@ -61,6 +65,7 @@ export default function QuickAddSite({
     const up = parseUpstream(upstream);
     f.name = name.trim() || domain.trim();
     f.domains = domain.trim() ? [domain.trim()] : [];
+    f.acme_email = email.trim();
     if (up) {
       const tls = /^https:\/\//i.test(upstream.trim()) || up.port === 443;
       f.servers = [{ host: up.host, port: up.port, weight: 1, tls }];
@@ -163,6 +168,14 @@ export default function QuickAddSite({
               placeholder={domain.trim() || "defaults to the domain"}
               onKeyDown={e => { if (e.key === "Enter" && ready) create(); }} />
           </label>
+          <label style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+            <span style={{ fontSize: 12.5, color: "var(--text2)", fontWeight: 600 }}>
+              Certificate email <span className="td3" style={{ fontWeight: 400 }}>— for the automatic Let&apos;s Encrypt certificate</span>
+            </span>
+            <input className="fin2" type="email" value={email} onChange={e => setEmail(e.target.value)}
+              placeholder="ops@example.com — leave empty to upload a certificate later"
+              onKeyDown={e => { if (e.key === "Enter" && ready) create(); }} />
+          </label>
         </div>
 
         {/* State what the defaults ARE. "Takes the defaults" is only reassuring
@@ -179,8 +192,9 @@ export default function QuickAddSite({
             it lets you see this application&apos;s false positives before they reject a
             real customer.<br />
             OWASP CRS at paranoia level {p.paranoia_level}, anomaly threshold{" "}
-            {p.anomaly_threshold} · HTTPS with force-https and HSTS · automatic
-            certificate · rate limiting on · health checks on.
+            {p.anomaly_threshold} · HTTPS with HSTS ·{" "}
+            {email.trim() ? "automatic certificate" : "no certificate requested until you add an email or upload one"}{" "}
+            · rate limiting on · health checks on.
           </div>
         </div>
 

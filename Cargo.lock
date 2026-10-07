@@ -2493,6 +2493,7 @@ dependencies = [
  "ring",
  "rustls 0.23.40",
  "rustls-pemfile",
+ "rustls-webpki 0.103.13",
  "sentinel-core",
  "sentinel-ebpf",
  "sentinel-ml",
