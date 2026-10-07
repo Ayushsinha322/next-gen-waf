@@ -183,7 +183,9 @@ export default function SitesPage() {
       body: (
         <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
           <div style={{ fontSize: 13, color: "var(--text3)", lineHeight: 1.6 }}>
-            Paste a YAML document (same shape as Export). Sites are matched by <strong>name</strong> — existing ones are updated, new ones created.
+            Paste a YAML document (same shape as Export). Sites are matched by <strong>name</strong>: new ones are created; for an existing site,
+            the keys you give replace its stored ones and every key you leave out keeps its current value. Every site is checked the way
+            create and edit check it, and a document with any problem imports nothing. A rollback point is saved in Config History first.
           </div>
           <input type="file" accept=".yaml,.yml" style={{ fontSize: 13, color: "var(--text3)" }}
             onChange={async e => {
@@ -193,7 +195,7 @@ export default function SitesPage() {
               if (ta) ta.value = yamlText;
             }} />
           <textarea id="yaml-import-area" className="fin2" style={{ minHeight: 220, fontFamily: "var(--font-mono)", fontSize: 13 }}
-            placeholder={"sites:\n  - name: app\n    domains: [app.example.com]\n    upstream:\n      servers: [{host: 127.0.0.1, port: 8080}]\n    waf_policy:\n      mode: blocking"}
+            placeholder={"sites:\n  - name: app\n    domains: [app.example.com]\n    upstream:\n      servers: [{host: 10.0.0.5, port: 8080}]\n    waf_policy:\n      mode: blocking"}
             onChange={e => { yamlText = e.target.value; }} />
         </div>
       ),

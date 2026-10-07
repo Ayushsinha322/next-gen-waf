@@ -162,6 +162,23 @@ export const LIMIT_CAPS = {
   minInspectionBudgetMs: 100,
 } as const;
 
+/** What a site runs when its stored policy leaves one of these keys out:
+ *  buildRustWaf's defaults in control-plane/cmd/controllerd/handlers.go for
+ *  mode, paranoia and threshold, the data plane's (sentinel-core
+ *  config/mod.rs) for the request limits. The edit form shows these for an
+ *  unset key, never the wizard's new-site defaults: those are a
+ *  recommendation, not what the site is running. siteResave.test.ts reads
+ *  both sources. */
+const MIB = 1024 * 1024;
+export const SERVER_POLICY_DEFAULTS = {
+  mode: "blocking",
+  paranoia_level: 2,
+  anomaly_threshold: 10,
+  max_body_size: 10 * 1024 * 1024,
+  max_uri_length: 8192,
+  max_header_count: 100,
+} as const;
+
 /** What a site gets when its policy leaves an inspection limit unset; the
  *  data plane's defaults (DEFAULT_MAX_INSPECTED_ARGS and friends in
  *  crates/sentinel-core/src/config/mod.rs). Shown, never written: an unset
@@ -344,6 +361,15 @@ export interface IpFeed { url: string; interval: string; format: "cidr" | "json"
 /* ── DLP action (response data-loss prevention) ───────────────── */
 export type DlpAction = "block" | "mask" | "detect";
 
+/* ── What an edit started from ────────────────────────────────── */
+export interface LoadedSite {
+  /** The site's upstream and waf_policy exactly as stored. */
+  upstream:   Record<string, unknown>;
+  waf_policy: Record<string, unknown>;
+  /** What the form rendered them as when it was loaded, before any edit. */
+  rendered: { upstream: Record<string, unknown>; waf_policy: Record<string, unknown> };
+}
+
 /* ── Full form state ───────────────────────────────────────────── */
 export interface SiteForm {
   // basics
@@ -354,6 +380,11 @@ export interface SiteForm {
   // Stored waf_policy keys this form does NOT manage (e.g. `crs_policy`, set
   // through the API), carried back unchanged on save. See PRESERVED below.
   preserved_policy: Record<string, unknown>;
+
+  // The stored site this form was loaded from; null for a new site. A save
+  // writes back what was stored for every key the operator did not change, so
+  // a key the site never had stays unset. See keepUnedited.
+  loaded: LoadedSite | null;
 
   // front service / public exposure
   front_https:  boolean;   // terminate HTTPS on the public listener
@@ -659,11 +690,14 @@ export function emptyForm(): SiteForm {
   return {
     name: "", domains: [], preset: "balanced",
     preserved_policy: {},
+    loaded: null,
 
     front_https: true, force_https: true, http2: true, http3: false,
 
     lb: "round_robin",
-    servers: [{ host: "127.0.0.1", port: 8080, weight: 1, tls: false }],
+    // No pre-filled origin: 127.0.0.1:8080 was the data plane's own listener,
+    // so an unedited save made the WAF proxy to itself.
+    servers: [{ host: "", port: 80, weight: 1, tls: false }],
     health: { enabled: true, path: "/", interval: "10s", timeout: "3s" },
     proxy_host_header: "", proxy_ssl_sni: false, proxy_ssl_sni_name: "",
     proxy_websocket: false, proxy_keepalive: true,
@@ -807,8 +841,95 @@ export function unmanagedPolicy(stored: unknown): Record<string, unknown> {
   return out;
 }
 
+type Rec = Record<string, unknown>;
+const isRec = (v: unknown): v is Rec => typeof v === "object" && v !== null && !Array.isArray(v);
+const jsonType = (v: unknown) => (v === null ? "null" : Array.isArray(v) ? "array" : typeof v);
+const jsonCopy = <T,>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
+
+function sameJson(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (Array.isArray(a) && Array.isArray(b)) return a.length === b.length && a.every((x, i) => sameJson(x, b[i]));
+  if (isRec(a) && isRec(b)) {
+    const ka = Object.keys(a);
+    return ka.length === Object.keys(b).length && ka.every(k => k in b && sameJson(a[k], b[k]));
+  }
+  return false;
+}
+
+/**
+ * What a save of an existing site writes for one object of the payload
+ * (upstream or waf_policy, and the objects inside them), from what the form
+ * renders now, what it rendered when the site was loaded, and what was stored.
+ *
+ * The form starts from defaults for every field, so its rendering of a key the
+ * site never had is a default, not a setting: a site created by first-site.sh
+ * (no security_headers) gained one-year HSTS and cookie flags on its first save,
+ * and one stored without anomaly_threshold was saved at 5, half what it ran.
+ *
+ *  - A key the operator left as loaded is written back exactly as stored, and
+ *    one the site never had stays unset.
+ *  - A key whose rendering changed is the operator's edit and is written; inside
+ *    an object only the changed keys are, so editing one header neither adds
+ *    the others nor drops what the form has no field for (hsts.preload).
+ *  - A key rendered at load and not now was cleared or switched off: removed.
+ *  - A key the form does not render is carried through.
+ *
+ * A stored value of another JSON type than the form's rendering (a paranoia
+ * level stored as "3", which sync cannot convert) is one the form had to
+ * coerce; its rendering is written, which repairs it.
+ */
+export function keepUnedited(next: Rec, rendered: Rec, stored: Rec): Rec {
+  const out: Rec = {};
+  for (const k of new Set([...Object.keys(next), ...Object.keys(stored)])) {
+    const inRendered = k in rendered, inStored = k in stored;
+    if (!(k in next)) {
+      if (!inRendered && inStored) out[k] = stored[k];
+      continue;
+    }
+    const n = next[k];
+    if (inRendered && sameJson(n, rendered[k])) {
+      if (inStored) out[k] = jsonType(stored[k]) === jsonType(n) ? stored[k] : n;
+      continue;
+    }
+    if (isRec(n)) {
+      const merged = keepUnedited(
+        n,
+        inRendered && isRec(rendered[k]) ? rendered[k] as Rec : {},
+        inStored && isRec(stored[k]) ? stored[k] as Rec : {},
+      );
+      if (inStored || Object.keys(merged).length > 0) out[k] = merged;
+      continue;
+    }
+    out[k] = n;
+  }
+  return out;
+}
+
 export function formToPayload(f: SiteForm): {
   name: string; domains: string[]; upstream: object; waf_policy: object;
+} {
+  const out = renderPayload(f);
+  if (!f.loaded) return out;
+  // Compared as JSON, the way it is sent and the way the baseline was kept.
+  const { upstream, waf_policy } = jsonCopy({ upstream: out.upstream, waf_policy: out.waf_policy });
+  return {
+    ...out,
+    upstream: keepUnedited(upstream, f.loaded.rendered.upstream, f.loaded.upstream),
+    waf_policy: keepUnedited(waf_policy, f.loaded.rendered.waf_policy, f.loaded.waf_policy),
+  };
+}
+
+/** A limit as typed. 0 is a setting (no limit), so only a value that is not a
+ *  number at all falls back to the default. */
+const limitOr = (v: unknown, d: number) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : d;
+};
+
+/** The form's own rendering of every key it manages, ignoring what the edited
+ *  site had stored; formToPayload reconciles the two. */
+function renderPayload(f: SiteForm): {
+  name: string; domains: string[]; upstream: Rec; waf_policy: Rec;
 } {
   const upstream: Record<string, unknown> = {
     lb: f.lb,
@@ -868,9 +989,11 @@ export function formToPayload(f: SiteForm): {
     anomaly_threshold: Number(f.anomaly_threshold) || PRESETS.balanced.anomaly_threshold,
     rule_categories: f.rule_categories,
     rule_exclusions: f.rule_exclusions,
-    max_body_size: Math.round((Number(f.max_body_size_mb) || 10) * 1024 * 1024),
-    max_uri_length: Number(f.max_uri_length) || 8192,
-    max_header_count: Number(f.max_header_count) || 100,
+    // 0 means no limit and is written as 0; `|| default` turned it, and any
+    // body limit under 0.5 MiB (which loaded as 0), into the default.
+    max_body_size: Math.round(limitOr(f.max_body_size_mb, SERVER_POLICY_DEFAULTS.max_body_size / MIB) * MIB),
+    max_uri_length: limitOr(f.max_uri_length, SERVER_POLICY_DEFAULTS.max_uri_length),
+    max_header_count: limitOr(f.max_header_count, SERVER_POLICY_DEFAULTS.max_header_count),
     allowed_methods: f.allowed_methods,
     api_discovery: f.api_discovery,
     // Always emitted, including empty: a site with no plugins selected runs
@@ -1066,6 +1189,12 @@ export function formToPayload(f: SiteForm): {
   return { name: f.name.trim(), domains: f.domains, upstream, waf_policy };
 }
 
+/** Whether the edited site's stored policy leaves `key` out, so what the form
+ *  shows for it is the server's default rather than a setting of this site. */
+export function policyKeyUnset(f: SiteForm, key: string): boolean {
+  return f.loaded !== null && !(key in f.loaded.waf_policy);
+}
+
 /* ── API Site → Form (for editing) ────────────────────────────── */
 type AnyRec = Record<string, unknown>;
 const num = (v: unknown, d: number) => (typeof v === "number" ? v : Number(v) || d);
@@ -1088,7 +1217,7 @@ export function siteToForm(site: Site): SiteForm {
         return { host, port: Number(port) || 80, weight: 1, tls: false };
       }
       const o = s as AnyRec;
-      return { host: String(o.host ?? "127.0.0.1"), port: num(o.port, 80), weight: num(o.weight, 1), tls: !!o.tls };
+      return { host: String(o.host ?? ""), port: num(o.port, 80), weight: num(o.weight, 1), tls: !!o.tls };
     });
   }
   const hc = up.health_check as AnyRec | undefined;
@@ -1101,24 +1230,26 @@ export function siteToForm(site: Site): SiteForm {
   if (proxy) {
     f.proxy_websocket = bool(proxy.websocket);
     f.proxy_keepalive = proxy.keepalive === undefined ? true : bool(proxy.keepalive);
-    f.proxy_connect_timeout = str(proxy.connect_timeout, "5s");
-    f.proxy_read_timeout = str(proxy.read_timeout, "60s");
     f.proxy_host_header = str(proxy.host_header);
     f.proxy_ssl_sni = bool(proxy.ssl_sni);
     f.proxy_ssl_sni_name = str(proxy.ssl_sni_name);
   }
-  // `timeout_secs` is the value the data plane actually enforces, so it wins
-  // over the legacy `proxy.read_timeout` display string when both are present.
-  const timeoutSecs = Number(up.timeout_secs);
-  if (Number.isFinite(timeoutSecs) && timeoutSecs > 0) {
-    f.proxy_read_timeout = `${timeoutSecs}s`;
-  }
+  // The timeouts show what the data plane enforces: `timeout_secs` and
+  // `connect_timeout_secs`, or blank (the node's default) without them. The
+  // duration strings under `proxy` are display copies it never read, and the
+  // wizard's new-site "60s"/"5s" are not what a site without them runs — a
+  // save wrote them, doubling the read timeout of a site on the 30 s default.
+  const secs = (v: unknown) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? `${n}s` : ""; };
+  f.proxy_read_timeout = secs(up.timeout_secs);
+  f.proxy_connect_timeout = secs(up.connect_timeout_secs);
 
+  // An unset key shows what the site runs (SERVER_POLICY_DEFAULTS), not the
+  // wizard's new-site defaults; formToPayload leaves it unset unless changed.
   const w = (site.waf_policy ?? {}) as AnyRec;
   f.preserved_policy = unmanagedPolicy(w);
-  f.mode = (w.mode as WafMode) ?? "blocking";
-  f.paranoia_level = num(w.paranoia_level, 2);
-  f.anomaly_threshold = num(w.anomaly_threshold, 5);
+  f.mode = (w.mode as WafMode) ?? SERVER_POLICY_DEFAULTS.mode;
+  f.paranoia_level = num(w.paranoia_level, SERVER_POLICY_DEFAULTS.paranoia_level);
+  f.anomaly_threshold = num(w.anomaly_threshold, SERVER_POLICY_DEFAULTS.anomaly_threshold);
   const cats = arr<string>(w.rule_categories);
   f.rule_categories = cats.length ? cats : [...ALL_CRS_KEYS];
   f.rule_exclusions = arr<RuleExclusion>(w.rule_exclusions);
@@ -1134,17 +1265,20 @@ export function siteToForm(site: Site): SiteForm {
     mode:              (o.mode as WafMode) ?? "",
     anomaly_threshold: typeof o.anomaly_threshold === "number" ? o.anomaly_threshold : "",
   }));
-  if (typeof w.max_body_size === "number") f.max_body_size_mb = Math.round((w.max_body_size as number) / (1024 * 1024));
-  f.max_uri_length = num(w.max_uri_length, 8192);
-  f.max_header_count = num(w.max_header_count, 100);
+  // Not rounded to whole MiB: that made any limit under 0.5 MiB 0, which is no
+  // limit at all, and a save then wrote it as the 10 MiB default.
+  f.max_body_size_mb = (typeof w.max_body_size === "number" ? w.max_body_size : SERVER_POLICY_DEFAULTS.max_body_size) / MIB;
+  f.max_uri_length = num(w.max_uri_length, SERVER_POLICY_DEFAULTS.max_uri_length);
+  f.max_header_count = num(w.max_header_count, SERVER_POLICY_DEFAULTS.max_header_count);
   // Absent stays "" (the data plane's default); 0 is a setting (no limit).
   const limit = (v: unknown): number | "" => (typeof v === "number" && Number.isFinite(v) ? v : "");
   f.max_inspected_args = limit(w.max_inspected_args);
   const argBytes = limit(w.max_inspected_arg_bytes);
   f.max_inspected_arg_kib = argBytes === "" ? "" : argBytes / 1024;
   f.inspection_time_budget_ms = limit(w.inspection_time_budget_ms);
+  // Absent or empty restricts no method, so every one shows as allowed.
   const methods = arr<string>(w.allowed_methods);
-  if (methods.length) f.allowed_methods = methods;
+  f.allowed_methods = methods.length ? methods : [...HTTP_METHODS];
   f.api_discovery = !!w.api_discovery;
 
   const fe = w.frontend as AnyRec | undefined;
@@ -1233,19 +1367,22 @@ export function siteToForm(site: Site): SiteForm {
     }));
   }
 
-  const sh = w.security_headers as AnyRec | undefined;
-  if (sh) {
-    f.csp = str(sh.content_security_policy);
-    if (sh.referrer_policy) f.referrer_policy = str(sh.referrer_policy);
-    if (sh.permissions_policy) f.permissions_policy = str(sh.permissions_policy);
-    if (sh.cookie_flags) f.cookie_flags = str(sh.cookie_flags);
-    const cors = sh.cors as AnyRec | undefined;
-    if (cors && cors.enabled) { f.cors_enabled = true; f.cors_origins = str(cors.allow_origin, "*"); }
-    const hsts = sh.hsts as AnyRec | undefined;
-    if (hsts) { f.hsts = bool(hsts.enabled); f.hsts_max_age = num(hsts.max_age, 31536000); }
-    else { f.hsts = false; }
-    f.custom_headers = arr<AnyRec>(sh.custom).map(h => ({ name: str(h.name), value: str(h.value) }));
-  }
+  // A header the site does not set shows as unset, not as the wizard's new-site
+  // value. The data plane forces Referrer-Policy and Permissions-Policy only
+  // when set (else it keeps the origin's, or adds its default), and adds HSTS
+  // and cookie flags only when set. Loading the defaults also meant clearing
+  // one never stuck: the next load showed the default and the next save wrote it.
+  const sh = (isRec(w.security_headers) ? w.security_headers : {}) as AnyRec;
+  f.csp = str(sh.content_security_policy);
+  f.referrer_policy = str(sh.referrer_policy);
+  f.permissions_policy = str(sh.permissions_policy);
+  f.cookie_flags = str(sh.cookie_flags);
+  const cors = sh.cors as AnyRec | undefined;
+  if (cors && cors.enabled) { f.cors_enabled = true; f.cors_origins = str(cors.allow_origin, "*"); }
+  const hsts = sh.hsts as AnyRec | undefined;
+  f.hsts = !!hsts && bool(hsts.enabled);
+  if (hsts) f.hsts_max_age = num(hsts.max_age, 31536000);
+  f.custom_headers = arr<AnyRec>(sh.custom).map(h => ({ name: str(h.name), value: str(h.value) }));
 
   const bp = w.block_page as AnyRec | undefined;
   if (bp) {
@@ -1318,5 +1455,14 @@ export function siteToForm(site: Site): SiteForm {
   }
 
   f.preset = "custom";
+  // What was stored, and the form's rendering of it before any edit, so a save
+  // writes only what the operator changed (keepUnedited). Copies: an in-place
+  // edit of a form array must not move the baseline it is compared with.
+  const rendered = renderPayload(f);
+  f.loaded = {
+    upstream: jsonCopy(isRec(up) ? up : {}),
+    waf_policy: jsonCopy(isRec(w) ? w : {}),
+    rendered: jsonCopy({ upstream: rendered.upstream, waf_policy: rendered.waf_policy }),
+  };
   return f;
 }

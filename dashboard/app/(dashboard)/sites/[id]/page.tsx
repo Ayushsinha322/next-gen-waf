@@ -673,7 +673,7 @@ export default function SiteDetailPage() {
                 </ConfigCard>
                 <ConfigCard title="HTTP Headers">
                 <KV k="CSP" v={form.csp || "default"} />
-                <KV k="Referrer-Policy" v={form.referrer_policy} />
+                <KV k="Referrer-Policy" v={form.referrer_policy || "not set"} />
                 <KV k="CORS" v={form.cors_enabled ? form.cors_origins : "off"} />
                 <KV k="Custom headers" v={`${form.custom_headers.filter(h => h.name).length}`} />
                 </ConfigCard>
@@ -875,7 +875,7 @@ function ConfigCard({ title, children }: { title: string; children: React.ReactN
  * the settings that were actually chosen.
  */
 const NEVER_DIFF = new Set([
-  "name", "domains", "servers", "preset",
+  "name", "domains", "servers", "preset", "loaded",
   "cert_pem", "key_pem", "cert_path", "key_path", "tls_existing_cert",
   "acme_email", "zerossl_api_key", "dns_credential", "dns_provider",
   "bot_recaptcha_sitekey", "bot_recaptcha_secret",
