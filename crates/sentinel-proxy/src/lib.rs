@@ -695,6 +695,33 @@ struct ConfigSyncResponse {
     /// the entire fleet on 2026-09-23 — each later change "saved" in the console
     /// and reached no node, and nothing but a WARN line said so.
     sites: Vec<serde_json::Value>,
+    /// "generation" when `version` is the control plane's database config
+    /// counter, so a higher one is a later state of the same database;
+    /// "fingerprint" (or absent, from an older control plane) when it is a
+    /// content hash with no order.
+    #[serde(default)]
+    version_source: Option<String>,
+}
+
+/// Whether a sync listing no sites may replace the `serving` control-plane
+/// sites this node has.
+///
+/// Applied as sent, a control plane reading the wrong database — a blank one
+/// after a volume mix-up, an empty restore, a role that sees no rows — took
+/// every site off every node at once, and the empty list was cached to disk,
+/// so a restart did not bring them back. It is accepted when the version is
+/// the database's config generation and newer than the one this node applied:
+/// the same database, after its last site was deleted. A blank database starts
+/// its generation over and is refused. `SENTINEL_ALLOW_EMPTY_SITE_SYNC=1`
+/// accepts it regardless.
+fn empty_sync_allowed(
+    serving: usize,
+    version: u64,
+    applied: u64,
+    version_is_generation: bool,
+    allow_env: bool,
+) -> bool {
+    serving == 0 || allow_env || (version_is_generation && applied > 0 && version > applied)
 }
 
 /// A sync after per-site parsing.
@@ -1032,6 +1059,9 @@ impl ProxyServer {
         // overwrites both the live config and the cache.
         if let Some(cached) = load_cached_sites() {
             let n = cached.sites.len();
+            // The version these sites are: what a later sync is compared with
+            // before it may remove them all.
+            CONFIG_VERSION_APPLIED.store(cached.version, Ordering::Relaxed);
             sentinel_core::config::update_sites(&self.config, cached.sites);
             info!(
                 sites = n,
@@ -1670,6 +1700,15 @@ impl ProxyServer {
                 let internal_secret = std::env::var("SENTINEL_INTERNAL_SECRET")
                     .ok()
                     .filter(|s| !s.is_empty());
+                let allow_empty = matches!(
+                    std::env::var("SENTINEL_ALLOW_EMPTY_SITE_SYNC")
+                        .ok()
+                        .as_deref(),
+                    Some("1") | Some("true") | Some("yes") | Some("on")
+                );
+                // A SIGHUP reload re-applies the sites even at an unchanged version.
+                let mut reloads_seen = sentinel_core::config::reload_count();
+                let mut refused_version: Option<u64> = None;
                 let mut ticker = tokio::time::interval(Duration::from_secs(secs));
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
@@ -1694,7 +1733,8 @@ impl ProxyServer {
                             continue;
                         }
                     };
-                    if envelope.version != last_version {
+                    let reloads = sentinel_core::config::reload_count();
+                    if envelope.version != last_version || reloads != reloads_seen {
                         let previous: Vec<SiteConfig> = poll_cfg
                             .load()
                             .sites
@@ -1702,6 +1742,37 @@ impl ProxyServer {
                             .filter(|s| s.origin == sentinel_core::config::SiteOrigin::ControlPlane)
                             .cloned()
                             .collect();
+                        if envelope.sites.is_empty()
+                            && !empty_sync_allowed(
+                                previous.len(),
+                                envelope.version,
+                                CONFIG_VERSION_APPLIED.load(Ordering::Relaxed),
+                                envelope.version_source.as_deref() == Some("generation"),
+                                allow_empty,
+                            )
+                        {
+                            if refused_version != Some(envelope.version) {
+                                error!(
+                                    version = envelope.version,
+                                    serving = previous.len(),
+                                    "config sync REFUSED: the control plane sent NO sites, which \
+                                     would take every site off this node. It keeps serving them. \
+                                     Check which database the control plane is connected to; if \
+                                     every site really was removed, set \
+                                     SENTINEL_ALLOW_EMPTY_SITE_SYNC=1 on this node"
+                                );
+                                refused_version = Some(envelope.version);
+                            }
+                            note_config_sync_failure(format!(
+                                "refused: the control plane sent no sites (version {}) and this \
+                                 node serves {}",
+                                envelope.version,
+                                previous.len()
+                            ));
+                            continue;
+                        }
+                        refused_version = None;
+                        reloads_seen = reloads;
                         let (sites, rejected) = parse_synced_sites(envelope.sites, &previous);
                         #[cfg(test)]
                         panic_guard::inject_sync_panic(&sites);
@@ -12774,6 +12845,138 @@ mod history_shed_tests {
         for k in ["xdp_pass", "xdp_drop", "xdp_aborted"] {
             assert!(e[k].is_number(), "{k} must be numeric");
         }
+    }
+}
+
+#[cfg(test)]
+mod empty_sync_guard_tests {
+    use super::*;
+    use crate::panic_guard::testkit::{
+        config_handle, counting_origin, free_port, proxy_state_lock, site_config, start_proxy,
+    };
+
+    #[test]
+    fn when_an_empty_site_list_may_replace_the_sites_a_node_serves() {
+        // Nothing served, nothing to protect.
+        assert!(empty_sync_allowed(0, 1, 0, false, false));
+        // A blank database: its generation starts over.
+        assert!(!empty_sync_allowed(3, 2, 57, true, false));
+        // The same database after its last site was deleted.
+        assert!(empty_sync_allowed(3, 58, 57, true, false));
+        // A fingerprint has no order; an older control plane says nothing.
+        assert!(!empty_sync_allowed(3, 58, 57, false, false));
+        // Nothing applied yet to compare with.
+        assert!(!empty_sync_allowed(3, 58, 0, true, false));
+        // The operator's override.
+        assert!(empty_sync_allowed(3, 2, 57, true, true));
+    }
+
+    /// A control plane whose answer the test changes between polls.
+    async fn mutable_control_plane(config: Arc<std::sync::Mutex<serde_json::Value>>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let config = Arc::clone(&config);
+                tokio::spawn(async move {
+                    let svc = hyper::service::service_fn(move |req: Request<Incoming>| {
+                        let body = (req.uri().path() == "/api/v1/internal/config")
+                            .then(|| config.lock().unwrap().to_string());
+                        async move {
+                            let (status, out) = match body {
+                                Some(b) => (StatusCode::OK, b),
+                                None => (StatusCode::NOT_FOUND, "{}".to_string()),
+                            };
+                            let mut resp =
+                                Response::new(http_body_util::Full::new(Bytes::from(out)));
+                            *resp.status_mut() = status;
+                            Ok::<_, Infallible>(resp)
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), svc)
+                        .await;
+                });
+            }
+        });
+        url
+    }
+
+    async fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !cond() {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// A control plane reading the wrong database sent an empty site list,
+    /// and every node dropped every site and cached that to disk.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises whole server runs; see proxy_state_lock
+    async fn an_empty_sync_is_refused_unless_it_is_a_later_generation() {
+        let _serial = proxy_state_lock();
+        let cache = std::env::temp_dir().join(format!("sk-empty-sync-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&cache);
+        std::env::set_var("SENTINEL_CONFIG_CACHE_PATH", &cache);
+        CONFIG_VERSION_APPLIED.store(0, Ordering::Relaxed);
+        note_config_sync_ok();
+
+        let (origin, _hits) = counting_origin().await;
+        let site = |id: &str| {
+            serde_json::json!({
+                "id": id,
+                "domains": [format!("{id}.sync.local")],
+                "upstream": { "servers": [{ "host": "127.0.0.1", "port": origin.port() }] },
+            })
+        };
+        let answer = Arc::new(std::sync::Mutex::new(serde_json::json!({
+            "version": 50, "version_source": "generation", "sites": [site("shop")],
+        })));
+        let cp = mutable_control_plane(Arc::clone(&answer)).await;
+        let listen = free_port();
+        let mut cfg = site_config(listen, origin, "file-site", vec![]);
+        cfg.cluster.sync_url = Some(cp);
+        cfg.cluster.sync_interval_secs = 1;
+        let handle = config_handle(cfg);
+        let proxy = start_proxy(listen, Arc::clone(&handle)).await;
+        let serves = |id: &str| handle.load().sites.iter().any(|s| s.id == id);
+
+        wait_until(|| serves("shop"), "the first sync never applied").await;
+
+        // A blank database: its generation starts over.
+        *answer.lock().unwrap() =
+            serde_json::json!({ "version": 2, "version_source": "generation", "sites": [] });
+        wait_until(
+            || {
+                config_sync_status()
+                    .last_error
+                    .is_some_and(|e| e.contains("sent no sites"))
+            },
+            "the empty sync was neither applied nor refused",
+        )
+        .await;
+        assert!(
+            serves("shop"),
+            "an empty sync from a blank database took the site down"
+        );
+
+        // The same database, after its last site was deleted.
+        *answer.lock().unwrap() =
+            serde_json::json!({ "version": 51, "version_source": "generation", "sites": [] });
+        wait_until(
+            || !serves("shop"),
+            "a deliberate removal of every site never applied",
+        )
+        .await;
+        assert!(
+            serves("file-site"),
+            "file sites are not the control plane's to remove"
+        );
+
+        proxy.stop().await;
+        std::env::remove_var("SENTINEL_CONFIG_CACHE_PATH");
+        let _ = std::fs::remove_file(&cache);
     }
 }
 

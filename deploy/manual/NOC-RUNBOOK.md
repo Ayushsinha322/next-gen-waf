@@ -165,7 +165,7 @@ Ten steps, roughly six minutes. It ends with:
   Installation successful
 
     Version        Swaraj Kavach v1.0.2
-    Username       admin@sentinel.local
+    Username       <the Administrator email you gave the installer>
     Password       6c1a48cb969314feb230ce64072348d3afba849a67c59f0534ac480437a7786b
 ```
 
@@ -246,7 +246,8 @@ ssh -L 9443:127.0.0.1:9443 root@172.16.21.101
 then open **https://127.0.0.1:9443**
 
 - Expect a **certificate warning** — the WAF issued its own. Advanced → Proceed.
-- Log in with `admin@sentinel.local` and the password from step 5.
+- Log in with the Administrator email you gave the installer and the password from step 5.
+  Lost it? On the host: `sudo docker exec -it sentinel-controlplane-1 controllerd reset-admin`.
 - A **500** on first load is usually a cached error: hard-reload
   (`Ctrl+Shift+R`) or use an incognito window.
 

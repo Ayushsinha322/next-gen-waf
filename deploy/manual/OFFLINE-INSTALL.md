@@ -153,7 +153,7 @@ is gone.)
 On success the installer prints:
 
 ```
-Username   admin@sentinel.local
+Username   <the Administrator email you gave the installer>
 Password   <generated>
 ```
 

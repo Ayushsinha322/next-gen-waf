@@ -269,6 +269,17 @@ services:
     hostname: ${SENTINEL_CP_HOSTNAME:-sentinel-controlplane}
     logging: *logging
     restart: unless-stopped
+    # /readyz through the binary itself: the image has no shell or HTTP client.
+    # Without a healthcheck a control plane that had lost its database read
+    # "running" to Docker and to rolling-update.sh. start_period covers the
+    # database wait at boot (SENTINEL_DB_CONNECT_TIMEOUT, default 60 s), after
+    # which the process exits for this restart policy to try again.
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/controllerd", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      start_period: 90s
+      retries: 3
     # root so it can write the shared NDJSON log volume (hardened via K8s
     # securityContext later). The control-plane hub reads what the proxy writes.
     user: "0:0"
@@ -291,13 +302,16 @@ services:
       SENTINEL_CLICKHOUSE_USER: ${CLICKHOUSE_USER}
       SENTINEL_CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
       SENTINEL_JWT_SECRET: ${SENTINEL_JWT_SECRET}
-      # Initial console password, read by seed.go on first boot only (the INSERT
-      # is ON CONFLICT DO NOTHING, so later boots never re-apply it). Unset, the
-      # seeder invents a random password and prints it to this container's stderr
-      # once — which dies with the container, and there is no password-change
-      # endpoint to recover through. install.sh generates this into its .env so
-      # the credential outlives any recreate. Empty default keeps the file
-      # parseable for anyone running compose by hand.
+      # The first administrator's login and password, read by seed.go only
+      # while the tenant has no users at all — so once anyone exists, deleting
+      # or renaming this account sticks (it used to be re-created on every boot
+      # with this password). Unset, the login is admin@sentinel.local and the
+      # seeder invents a password and prints it to this container's stderr
+      # once, which dies with the container; install.sh generates both into its
+      # .env so they outlive any recreate. A lost password is reset with
+      # `docker exec -it sentinel-controlplane-1 controllerd reset-admin`.
+      # Empty defaults keep the file parseable for anyone running compose by hand.
+      SENTINEL_BOOTSTRAP_ADMIN_EMAIL: ${SENTINEL_BOOTSTRAP_ADMIN_EMAIL:-}
       SENTINEL_BOOTSTRAP_ADMIN_PASSWORD: ${SENTINEL_BOOTSTRAP_ADMIN_PASSWORD:-}
       # Required by the audit-HMAC fail-fast; keep it out of the committed YAML.
       SENTINEL_AUDIT_HMAC_KEY: ${SENTINEL_AUDIT_HMAC_KEY}

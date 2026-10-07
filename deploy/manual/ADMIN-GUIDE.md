@@ -76,7 +76,7 @@ reachable over a tunnel (`ssh -L 3000:127.0.0.1:3000 …`).
 ## 3. Users and roles
 
 **Do this before anything else: create a personal login for every operator and
-stop sharing the `admin@sentinel.local` account.** A shared account means the
+stop sharing the installer's administrator account.** A shared account means the
 audit log can tell you *what* changed but never *who* changed it — which is
 exactly the question asked after an incident.
 

@@ -1342,6 +1342,16 @@ func siteSetFingerprint(sites []map[string]any) int64 {
 	return int64(h.Sum64() & 0x7fffffffffffffff)
 }
 
+// The three reads a config sync is built from. Variables only so a test can
+// fail or order them; production always uses the store.
+var (
+	syncConfigVersion = func(ctx context.Context, s *db.Store) (int64, error) { return s.ConfigVersion(ctx) }
+	syncActiveSites   = func(ctx context.Context, s *db.Store) ([]db.SiteRow, error) { return s.ListAllActiveSites(ctx) }
+	syncCustomRules   = func(ctx context.Context, s *db.Store) (map[string][]db.DeployableRule, error) {
+		return s.ListDeployableRules(ctx)
+	}
+)
+
 func handleInternalConfig(c *gin.Context, store *db.Store, log *zap.Logger) {
 	if !internalSecretOK(c) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
@@ -1351,22 +1361,34 @@ func handleInternalConfig(c *gin.Context, store *db.Store, log *zap.Logger) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "db unavailable"})
 		return
 	}
+	ctx := c.Request.Context()
+	// The version is read BEFORE the content it labels. Read after it, a write
+	// landing between the two reads labelled the older site list with the newer
+	// version: every node cached it as current and never fetched that write
+	// until some later edit. Read first, the content can only be newer than its
+	// label, which costs one extra fetch on the next poll.
+	version, verr := syncConfigVersion(ctx, store)
 	// Node-global: the shared data plane serves EVERY tenant's sites, so this
 	// sync must list all active sites across tenants (not one tenant's view).
-	sites, err := store.ListAllActiveSites(c.Request.Context())
+	sites, err := syncActiveSites(ctx, store)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
-	// Operator-authored rules, attached per site below. A failure here must NOT
-	// fail the whole sync: sites would stop being configured at all, which is a
-	// far worse outcome than custom rules being briefly absent. Log loudly and
-	// continue with an empty set.
-	rulesByTenant, err := store.ListDeployableRules(c.Request.Context())
+	// Operator-authored rules, attached per site below. A sync without them is
+	// refused rather than sent: it carried the real version, so every node
+	// cached a config with NO custom rules — virtual patches included — as
+	// current, and stayed that way after the read recovered, until some later
+	// edit bumped the version. A refusal keeps each node on the config it has;
+	// the next poll tries again.
+	rulesByTenant, err := syncCustomRules(ctx, store)
 	if err != nil {
-		log.Error("CONFIG SYNC: custom rules could not be read and are NOT being "+
-			"enforced this cycle; site policies are unaffected", zap.Error(err))
-		rulesByTenant = map[string][]db.DeployableRule{}
+		log.Error("CONFIG SYNC REFUSED: custom rules could not be read; nodes keep their "+
+			"current config and retry on the next poll", zap.Error(err))
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "custom rules could not be read; nodes keep their current config",
+		})
+		return
 	}
 
 	rustSites := make([]map[string]any, 0, len(sites))
@@ -1408,12 +1430,12 @@ func handleInternalConfig(c *gin.Context, store *db.Store, log *zap.Logger) {
 		attachInlineRules(rs, s.ID, rulesByTenant[s.TenantID])
 		rustSites = append(rustSites, rs)
 	}
-	// Shared, DB-derived, restart-surviving freshness signal (migration 0012).
-	// On a transient read error (e.g. before the migration applies) fall back to
-	// a strictly-changing value so the data plane re-syncs rather than latching a
-	// stale version — it still receives the correct DB-backed site list above.
-	version, verr := store.ConfigVersion(c.Request.Context())
+	// Shared, DB-derived, restart-surviving freshness signal (migration 0012),
+	// read above. On a read error (e.g. before the migration applies) fall back
+	// to a content fingerprint.
+	versionSource := "generation"
 	if verr != nil {
+		versionSource = "fingerprint"
 		// The old fallback was time.Now().UnixNano(), reasoning that re-syncing beats
 		// latching a stale version. That is right for a TRANSIENT read error and badly
 		// wrong for a PERMANENT one: where migration 0012 has not been applied,
@@ -1432,7 +1454,12 @@ func handleInternalConfig(c *gin.Context, store *db.Store, log *zap.Logger) {
 	}
 	resp := gin.H{
 		"version": version,
-		"sites":   rustSites,
+		// "generation": the database's config counter, so a higher version is a
+		// later state of the same database — what lets a node accept a sync
+		// that removes every site. "fingerprint": a content hash, which has no
+		// order.
+		"version_source": versionSource,
+		"sites":          rustSites,
 	}
 	// Surfaced in the response as well as the log, so the condition is observable
 	// by the data plane and by anyone curling this endpoint — not just by whoever
