@@ -1138,7 +1138,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
 
                 {/* ───────── HTTP HEADERS (advanced) ───────── */}
                 {screen === "headers" && (<>
-                  <StepHead title="HTTP Headers" sub="Response security headers. The WAF always injects secure defaults; these override per-site." tag="stored" />
+                  <StepHead title="HTTP Headers" sub="Response security headers. The WAF always injects secure defaults; these override per-site." tag="enforced" />
                   <InfoBox>Secure defaults (X-Content-Type-Options, X-Frame-Options, X-XSS-Protection) are always applied. The values below override them for this site.</InfoBox>
                   <Field label="Content-Security-Policy" hint="Leave blank to omit CSP"><input className="fin2" value={form.csp} placeholder="default-src 'self'" style={{ fontFamily: "var(--font-mono)", fontSize: 13 }} onChange={e => upd({ csp: e.target.value })} /></Field>
                   <Row>

@@ -686,6 +686,132 @@ async fn the_origin_gets_our_forwarding_headers_not_the_clients() {
     );
 }
 
+/// Ordinary text the 2026-10-07 review found blocked, under the posture a new
+/// site now gets: the CRS request families at PL2, the in-house files and the
+/// classifier on at 0.9 (the benchmarked posture). The coverage rules used to
+/// fire on these AND switch the classifier's veto off; anchored to code syntax
+/// they no longer fire, and the veto clears the weak CRS-only matches — once
+/// the site's own hostname (`test-site.local` scored 0.505) stopped deciding it.
+#[tokio::test]
+async fn reported_false_positives_pass_under_the_default_posture() {
+    let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
+    let listen_port = next_port();
+    let mut cfg = test_config(
+        listen_port,
+        upstream_addr.port(),
+        "REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
+        WafMode::Blocking,
+    );
+    let mut rules: Vec<String> = std::fs::read_dir(crs_rule_dir())
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            // What the control plane gives a site: the request families
+            // 911-944 — not 901/905 or 949, whose own threshold the proxy
+            // replaces — plus the in-house files.
+            let n = p.file_name().unwrap().to_string_lossy().into_owned();
+            n.starts_with("REQUEST-9")
+                && n.ends_with(".conf")
+                && !["901", "905", "949"].iter().any(|x| n.contains(x))
+        })
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    rules.sort();
+    for custom in ["placement.conf", "coverage.conf"] {
+        rules.push(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../rules/custom")
+                .join(custom)
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    cfg.sites[0].waf.rules = rules;
+    // The control plane's default exclusions (defaultRuleExclusions).
+    cfg.sites[0].waf.rule_exclusions = vec![
+        sentinel_core::config::RuleExclusion {
+            rule_id: 932236,
+            exclude_targets: vec!["ARGS_NAMES".into()],
+            disable: false,
+        },
+        sentinel_core::config::RuleExclusion {
+            rule_id: 920230,
+            exclude_targets: vec![],
+            disable: true,
+        },
+        sentinel_core::config::RuleExclusion {
+            rule_id: 922110,
+            exclude_targets: vec![],
+            disable: true,
+        },
+    ];
+    cfg.sites[0].waf.anomaly_threshold = 10;
+    cfg.sites[0].waf.ml = Some(sentinel_core::config::MlConfig {
+        enable: true,
+        models: vec![],
+        sensitivity: 0.9,
+    });
+    let (shutdown_tx, jh) = start_proxy(cfg).await;
+
+    let mut statuses = Vec::new();
+    for text in [
+        "I was charged twice; for some reason the refund never came",
+        "We moved; update my address please",
+        "Sleep (8 hours) is recommended",
+        // (A GraphQL query using `$type` is no longer matched by the in-house
+        // NoSQL rule, but CRS still scores it 13 and the classifier rates the
+        // syntax 0.757, so it needs a per-path exclusion for the endpoint.)
+        "Ticket #1234\nmore: the printer is offline again\nset: floor 3",
+        "Hello,\necho, echo is anyone there?",
+        "1' UNION SELECT password FROM users--",
+    ] {
+        let q: String = text
+            .bytes()
+            .map(|b| match b {
+                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'.' | b'_' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect();
+        let (status, body) = send_request(
+            listen_port,
+            "test-site.local",
+            &format!("/search?q={q}"),
+            Method::GET,
+            "",
+        )
+        .await;
+        if status != StatusCode::OK {
+            eprintln!(
+                "BLOCKED {text:?}: {}",
+                String::from_utf8_lossy(&body)
+                    .chars()
+                    .take(600)
+                    .collect::<String>()
+            );
+        }
+        statuses.push((text, status));
+    }
+    shutdown_proxy(shutdown_tx, jh).await;
+
+    let (attack, benign) = statuses.split_last().unwrap();
+    assert_eq!(
+        attack.1,
+        StatusCode::FORBIDDEN,
+        "the control attack must still be blocked"
+    );
+    let blocked: Vec<_> = benign
+        .iter()
+        .filter(|(_, s)| *s != StatusCode::OK)
+        .collect();
+    assert!(
+        blocked.is_empty(),
+        "ordinary text still blocked: {blocked:?}"
+    );
+}
+
 #[tokio::test]
 async fn post_body_sqli_is_blocked() {
     let (upstream_addr, _upstream_handle) = start_mock_upstream().await;

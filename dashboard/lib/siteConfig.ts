@@ -750,13 +750,18 @@ export function emptyForm(): SiteForm {
 
     csp: "", referrer_policy: "strict-origin-when-cross-origin",
     permissions_policy: "geolocation=(), microphone=(), camera=()",
-    cors_enabled: false, cors_origins: "*", cookie_flags: "* HttpOnly SameSite=Lax",
+    // No cookie flags unless the operator asks: `* HttpOnly SameSite=Lax` made
+    // JS-read CSRF cookies (XSRF-TOKEN, csrftoken) HttpOnly and broke forms.
+    cors_enabled: false, cors_origins: "*", cookie_flags: "",
     custom_headers: [],
 
     block_page_enabled: true, block_page_title: "", block_page_message: "",
     block_page_contact: "", block_page_logo: "", block_page_show_reason: false,
 
-    ml_enabled: false, ml_sensitivity: 0.85, ml_models: [],
+    // On for a new site, at the benchmarked posture (the classifier's veto is
+    // what clears weak CRS-only matches on ordinary text). A loaded site shows
+    // what it has stored — see siteToForm.
+    ml_enabled: true, ml_sensitivity: 0.9, ml_models: [],
     api_discovery: false,
 
     jwt_enabled: false, jwt_required: true, jwt_issuer: "", jwt_audience: "",
@@ -1398,7 +1403,9 @@ export function siteToForm(site: Site): SiteForm {
   }
 
   const ml = w.ml as AnyRec | undefined;
-  if (ml && ml.enable) { f.ml_enabled = true; f.ml_sensitivity = num(ml.sensitivity, 0.85); f.ml_models = arr<string>(ml.models); }
+  // Set either way: a site stored without ML must not show the new-site default.
+  f.ml_enabled = !!(ml && ml.enable);
+  if (ml && ml.enable) { f.ml_sensitivity = num(ml.sensitivity, 0.85); f.ml_models = arr<string>(ml.models); }
 
   const jwt = w.jwt as AnyRec | undefined;
   if (jwt && jwt.enable) {

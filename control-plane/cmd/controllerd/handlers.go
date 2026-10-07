@@ -2396,6 +2396,10 @@ func attachInlineRules(rs map[string]any, siteID string, rules []db.DeployableRu
 // ACME HTTP-01 challenges live there, so blocking it would break certificate
 // issuance. That is why these are specific prefixes and not a blanket `/.`.
 const defaultWafPolicyJSON = `{"mode":"learning","paranoia_level":2,"anomaly_threshold":10,` +
+	// The classifier at the benchmarked posture: its veto is what clears weak
+	// CRS-only matches on ordinary text, and it was off on every creation path
+	// (2026-10-07 review). New sites only — a stored site keeps its setting.
+	`"ml":{"enable":true,"models":[],"sensitivity":0.9},` +
 	`"path_overrides":[` +
 	`{"path_prefix":"/.git","anomaly_threshold":5},` +
 	`{"path_prefix":"/.env","anomaly_threshold":5},` +

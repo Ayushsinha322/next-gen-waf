@@ -226,6 +226,9 @@ impl MlEngine {
             // while the rules still matched it — exactly the blind veto above.
             for (name, value) in ctx.request_headers.iter() {
                 let v = String::from_utf8_lossy(value.as_bytes());
+                if is_plain_locator(&v) {
+                    continue;
+                }
                 if name == http::header::COOKIE {
                     for c in v.split(';') {
                         let val = c.split_once('=').map(|(_, x)| x).unwrap_or(c).trim();
@@ -439,6 +442,56 @@ fn is_plain_path_word(seg: &str) -> bool {
         && seg
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~'))
+}
+
+/// A header value that only names a place: a host (`shop.example.in`,
+/// `test-site.local:8443`, an IPv4 address) or an http(s) URL with no query and
+/// nothing but host and path characters (`https://shop.example.in/cart`).
+///
+/// Such a value cannot carry an injection payload, and Host, Origin and a
+/// same-site Referer are the same on most requests to a site — so as a
+/// classifier candidate it decided the veto for the whole site.
+/// `test-site.local` scores 0.505 and `my-test-app.internal` 0.513, just over
+/// the 0.5 cut-off, so no weak block on such a site could ever be vetoed; and
+/// `http://localhost:3000/` scores 0.909, enough to block a request alone. A
+/// value with anything else in it — a quote, a space, a query, `..` — is still
+/// scored.
+fn is_plain_locator(v: &str) -> bool {
+    let v = v.trim();
+    let (rest, url) = match v
+        .strip_prefix("https://")
+        .or_else(|| v.strip_prefix("http://"))
+    {
+        Some(r) => (r, true),
+        None => (v, false),
+    };
+    let (authority, path) = match rest.find('/') {
+        Some(i) if url => (&rest[..i], &rest[i..]),
+        Some(_) => return false,
+        None => (rest, ""),
+    };
+    let host = match authority.rsplit_once(':') {
+        Some((h, port))
+            if !port.is_empty() && port.len() <= 5 && port.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            h
+        }
+        Some(_) => return false,
+        None => authority,
+    };
+    let host_ok = !host.is_empty()
+        && host.len() <= 253
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        && (host.contains('.') || host.eq_ignore_ascii_case("localhost"))
+        && !host.starts_with(['.', '-']);
+    let path_ok = path.len() <= 512
+        && !path.contains("..")
+        && path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'-' | b'_' | b'~'));
+    host_ok && path_ok
 }
 
 /// Pushes each field value of a form, JSON or multipart body. Returns whether

@@ -239,7 +239,8 @@ UPSTREAM="$(jq -nc --argjson s "$SERVERS" --arg hp "$HEALTH" --argjson px "$PROX
   '{load_balancer:"round_robin", servers:$s, health_check:{path:$hp, interval:"10s", timeout:"3s"}, timeout_secs:30, connect_timeout_secs:5, proxy:$px}')"
 WAF="$(jq -nc --arg m "$MODE" --argjson t "$THRESHOLD" --argjson bl "$BODY_LIMIT" \
   '{mode:$m, paranoia_level:2, anomaly_threshold:$t, max_body_size:$bl, max_uri_length:8192, max_header_count:100,
-    allowed_methods:["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]}')"
+    allowed_methods:["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"],
+    ml:{enable:true, models:[], sensitivity:0.9}}')"
 BODY="$(jq -nc --arg n "$NAME" --arg d "$DOMAIN" --argjson u "$UPSTREAM" --argjson w "$WAF" '{name:$n, domains:[$d], upstream:$u, waf_policy:$w}')"
 
 step "What will be created"

@@ -154,3 +154,46 @@ fn a_cookie_in_a_field_with_a_non_ascii_byte_is_still_scored() {
         "a cookie payload behind a non-ASCII byte scored only {s}"
     );
 }
+
+/// A Host, Origin or same-site Referer that only names a place decided the
+/// veto for a whole site: `test-site.local` scored 0.505, over the 0.5 cut-off,
+/// so no weak block there could be vetoed — and `http://localhost:3000/` scored
+/// 0.909, enough to block a request on its own.
+#[test]
+fn a_plain_host_or_url_header_does_not_decide_the_score() {
+    let mut c = ctx(
+        "/search?q=We%20moved%3B%20update%20my%20address",
+        None,
+        None,
+    );
+    for (h, v) in [
+        (http::header::HOST, "test-site.local"),
+        (http::header::REFERER, "http://localhost:3000/"),
+        (http::header::ORIGIN, "https://my-test-app.internal"),
+    ] {
+        c.request_headers
+            .insert(h, http::HeaderValue::from_static(v));
+    }
+    let s = score(&c);
+    assert!(s < 0.5, "an ordinary request on such a site scored {s}");
+}
+
+#[test]
+fn a_host_or_referer_carrying_a_payload_is_still_scored() {
+    for (h, v) in [
+        (
+            http::header::HOST,
+            "x'><script>alert(document.cookie)</script>",
+        ),
+        (
+            http::header::REFERER,
+            "https://shop.example.in/?q=1' UNION SELECT password FROM users--",
+        ),
+    ] {
+        let mut c = ctx("/", None, None);
+        c.request_headers
+            .insert(h.clone(), http::HeaderValue::from_str(v).unwrap());
+        let s = score(&c);
+        assert!(s >= DETECTION_MIN, "{h}: {v} scored only {s}");
+    }
+}

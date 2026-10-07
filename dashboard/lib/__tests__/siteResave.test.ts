@@ -89,3 +89,21 @@ describe("a new site starts without an origin", () => {
     expect(f.servers.every(s => s.host === "")).toBe(true);
   });
 });
+
+describe("1.1.18 new-site defaults", () => {
+  it("a new site gets the classifier at the benchmarked posture and no cookie flags", async () => {
+    const { emptyForm } = await import("../siteConfig");
+    const f = emptyForm();
+    expect(f.ml_enabled).toBe(true);
+    expect(f.ml_sensitivity).toBe(0.9);
+    // `* HttpOnly SameSite=Lax` broke JS-read CSRF cookies on every site.
+    expect(f.cookie_flags).toBe("");
+  });
+
+  it("a stored site without ML shows ML off, and saving it unedited does not turn it on", () => {
+    const stored = scriptSite();
+    const f = siteToForm(stored);
+    expect(f.ml_enabled).toBe(false);
+    expect(policyOf(stored).ml).toBeUndefined();
+  });
+});

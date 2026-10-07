@@ -8150,8 +8150,15 @@ fn inject_security_headers(headers: &mut http::HeaderMap, cfg: Option<&SecurityH
     }
     // HSTS — only when the operator turned it on (browsers ignore it over plain
     // HTTP, so emitting it unconditionally is harmless but pointless; the site
-    // policy decides).
-    if let Some(h) = cfg.hsts.as_ref().filter(|h| h.enabled) {
+    // policy decides). An origin that sends its own keeps it: replacing it
+    // dropped the origin's includeSubDomains and preload, which a preloaded
+    // domain must keep.
+    if let Some(h) = cfg
+        .hsts
+        .as_ref()
+        .filter(|h| h.enabled)
+        .filter(|_| !headers.contains_key(header::STRICT_TRANSPORT_SECURITY))
+    {
         let max_age = if h.max_age == 0 {
             31_536_000
         } else {
@@ -8222,6 +8229,14 @@ fn harden_set_cookies(headers: &mut http::HeaderMap, spec: &str) {
             rewritten.push(hv.clone());
             continue;
         }
+        // A wildcard never makes a CSRF token HttpOnly: the double-submit
+        // pattern (Angular's XSRF-TOKEN, Django's csrftoken) has page script
+        // read the cookie, so `* HttpOnly` broke every form on such a site.
+        // Naming the cookie in the pattern still applies it.
+        let csrf_cookie = pattern == "*" && {
+            let n = name.to_ascii_lowercase();
+            n.contains("csrf") || n.contains("xsrf")
+        };
         let present: Vec<String> = raw
             .split(';')
             .skip(1)
@@ -8236,6 +8251,9 @@ fn harden_set_cookies(headers: &mut http::HeaderMap, spec: &str) {
         let mut out = raw.to_string();
         for f in &flags {
             let key = f.split('=').next().unwrap_or("").to_ascii_lowercase();
+            if csrf_cookie && key == "httponly" {
+                continue;
+            }
             if !key.is_empty() && !present.iter().any(|p| p == &key) {
                 out.push_str("; ");
                 out.push_str(f);
@@ -16351,6 +16369,70 @@ mod security_header_hardening_tests {
         );
         // Origin's own SameSite=Strict wins; only the missing attribute is added.
         assert_eq!(cookies[1], "pref=1; SameSite=Strict; HttpOnly; Secure");
+    }
+
+    /// An origin's own HSTS — with its includeSubDomains and preload — is kept;
+    /// replacing it dropped the directives a preloaded domain must keep.
+    #[test]
+    fn the_origins_hsts_is_kept() {
+        let cfg = SecurityHeadersConfig {
+            hsts: Some(HstsConfig {
+                enabled: true,
+                max_age: 300,
+                include_subdomains: false,
+                preload: false,
+            }),
+            ..Default::default()
+        };
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            http::HeaderValue::from_static("max-age=63072000; includeSubDomains; preload"),
+        );
+        inject_security_headers(&mut h, Some(&cfg));
+        assert_eq!(
+            h.get(header::STRICT_TRANSPORT_SECURITY).unwrap(),
+            "max-age=63072000; includeSubDomains; preload"
+        );
+    }
+
+    /// `* HttpOnly` made the CSRF cookie page script must read HttpOnly and
+    /// broke every form on a double-submit site; the other flags still apply,
+    /// and naming the cookie still makes it HttpOnly.
+    #[test]
+    fn a_wildcard_never_makes_a_csrf_cookie_httponly() {
+        let cfg = SecurityHeadersConfig {
+            cookie_flags: Some("* HttpOnly SameSite=Lax".into()),
+            ..Default::default()
+        };
+        let mut h = http::HeaderMap::new();
+        for c in ["XSRF-TOKEN=abc; Path=/", "csrftoken=def", "sid=1"] {
+            h.append(header::SET_COOKIE, http::HeaderValue::from_str(c).unwrap());
+        }
+        inject_security_headers(&mut h, Some(&cfg));
+        let cookies: Vec<&str> = h
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(cookies[0], "XSRF-TOKEN=abc; Path=/; SameSite=Lax");
+        assert_eq!(cookies[1], "csrftoken=def; SameSite=Lax");
+        assert_eq!(cookies[2], "sid=1; HttpOnly; SameSite=Lax");
+
+        let named = SecurityHeadersConfig {
+            cookie_flags: Some("csrftoken HttpOnly".into()),
+            ..Default::default()
+        };
+        let mut h = http::HeaderMap::new();
+        h.append(
+            header::SET_COOKIE,
+            http::HeaderValue::from_static("csrftoken=def"),
+        );
+        inject_security_headers(&mut h, Some(&named));
+        assert_eq!(
+            h.get(header::SET_COOKIE).unwrap(),
+            "csrftoken=def; HttpOnly"
+        );
     }
 
     #[test]
