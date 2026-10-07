@@ -530,6 +530,52 @@ async fn metrics_endpoint_is_scrapeable() {
     assert!(text.contains("sentinel_active_connections"));
 }
 
+/// HTTP/2 names the site only in `:authority` — a browser sends no Host header —
+/// and a site's own IP lists were looked up by Host alone. So they were skipped
+/// for every h2 (and h3) request: a source the site had blocked was served as
+/// soon as it spoke HTTP/2, which is most HTTPS traffic.
+#[tokio::test]
+async fn a_sites_ip_block_list_applies_to_http2_requests() {
+    let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
+    let listen_port = next_port();
+    let mut cfg = test_config(
+        listen_port,
+        upstream_addr.port(),
+        "REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
+        WafMode::Blocking,
+    );
+    cfg.listeners[0].protocol = ProtocolSpec::Single(Protocol::Http2);
+    cfg.sites[0].waf.ip_reputation = Some(sentinel_core::config::IpReputationConfig {
+        block: vec!["127.0.0.1".into()],
+        ..Default::default()
+    });
+    let (shutdown_tx, jh) = start_proxy(cfg).await;
+
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", listen_port))
+        .await
+        .expect("connect");
+    let (mut tx, conn) = hyper::client::conn::http2::handshake(
+        hyper_util::rt::TokioExecutor::new(),
+        TokioIo::new(stream),
+    )
+    .await
+    .expect("h2 handshake");
+    tokio::spawn(conn);
+    let req = Request::builder()
+        .uri("http://test-site.local/")
+        .body(http_body_util::Empty::<bytes::Bytes>::new())
+        .unwrap();
+    assert!(req.headers().get(header::HOST).is_none());
+    let status = tx.send_request(req).await.expect("h2 send").status();
+
+    shutdown_proxy(shutdown_tx, jh).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the site blocks 127.0.0.1, but an HTTP/2 request from it was not refused"
+    );
+}
+
 #[tokio::test]
 async fn post_body_sqli_is_blocked() {
     let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
@@ -1055,6 +1101,45 @@ async fn path_override_off_exempts_the_path() {
         StatusCode::OK,
         "an `off` path must pass traffic regardless of what the rules found"
     );
+}
+
+/// `/assets/../search` is `/search` to the origin. Matched on the raw path it
+/// took the `/assets/` exemption, so an attack routed to the application was
+/// never inspected.
+#[tokio::test]
+async fn a_dot_segment_path_does_not_borrow_an_off_paths_exemption() {
+    let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
+    let listen_port = next_port();
+    let cfg = path_override_config(
+        listen_port,
+        upstream_addr.port(),
+        5,
+        vec![PathOverride {
+            path_prefix: "/assets/".into(),
+            mode: Some(WafMode::Off),
+            anomaly_threshold: None,
+        }],
+    );
+    let (shutdown_tx, jh) = start_proxy(cfg).await;
+
+    let mut statuses = Vec::new();
+    for uri in [
+        "/assets/../search?q=1%27%20OR%201%3D1--",
+        "/assets/%2e%2e/search?q=1%27%20OR%201%3D1--",
+        "/assets/..;/search?q=1%27%20OR%201%3D1--",
+    ] {
+        let (status, _) = send_request(listen_port, "test-site.local", uri, Method::GET, "").await;
+        statuses.push((uri, status));
+    }
+
+    shutdown_proxy(shutdown_tx, jh).await;
+    for (uri, status) in statuses {
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{uri} is not under /assets/ at the origin, so it must be inspected"
+        );
+    }
 }
 
 /// Longest prefix wins, independently of declaration order — otherwise an
