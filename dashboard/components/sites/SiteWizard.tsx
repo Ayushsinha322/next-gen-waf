@@ -1100,7 +1100,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     </Field>
                   )}
                   <Row>
-                    <Field label="IP / CIDR Allow-list" hint="Always permitted (overrides blocks). An address or a range."><ChipInput values={form.ip_allow} onChange={v => upd({ ip_allow: v })} placeholder="10.0.0.0/8 or 192.0.2.10"
+                    <Field label="IP / CIDR Allow-list" hint="Trusted for this site: skips every check — rules, rate limits, bans, bot and GeoIP checks (response data-leak checks still apply). Keep it to addresses you control. An address or a range."><ChipInput values={form.ip_allow} onChange={v => upd({ ip_allow: v })} placeholder="10.0.0.0/8 or 192.0.2.10"
                       validate={isIpOrCidr} invalidMessage={s => `"${s}" is not an IP address or CIDR range`} /></Field>
                     <Field label="IP / CIDR Block-list" hint="Always denied. An address or a range."><ChipInput values={form.ip_block} onChange={v => upd({ ip_block: v })} placeholder="203.0.113.7 or 203.0.113.0/24"
                       validate={isIpOrCidr} invalidMessage={s => `"${s}" is not an IP address or CIDR range`} /></Field>

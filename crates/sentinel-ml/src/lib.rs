@@ -220,8 +220,12 @@ impl MlEngine {
             // scoring high would pin every request above the suppression cutoff and
             // silently disable FP suppression — the previous model scored a plain
             // `Accept: text/html,...` at 0.897, which would have done exactly that.
+            //
+            // Decoded lossily, as the rules read them: `to_str()` refused any byte
+            // >= 0x80, so one such byte hid the whole header from the classifier
+            // while the rules still matched it — exactly the blind veto above.
             for (name, value) in ctx.request_headers.iter() {
-                let Ok(v) = value.to_str() else { continue };
+                let v = String::from_utf8_lossy(value.as_bytes());
                 if name == http::header::COOKIE {
                     for c in v.split(';') {
                         let val = c.split_once('=').map(|(_, x)| x).unwrap_or(c).trim();
@@ -245,8 +249,9 @@ impl MlEngine {
                     let ct = ctx
                         .request_headers
                         .get(http::header::CONTENT_TYPE)
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("");
+                        .map(|v| String::from_utf8_lossy(v.as_bytes()))
+                        .unwrap_or_default();
+                    let ct: &str = &ct;
                     // The whole raw body is a candidate only when it did NOT parse
                     // into fields. Scored whole, a well-formed JSON document is
                     // judged on its punctuation: `{"items":[{"id":1,…}],"note":

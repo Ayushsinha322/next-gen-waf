@@ -122,3 +122,35 @@ fn a_short_base64_attack_in_the_path_is_still_scored() {
         assert!(s >= DETECTION_MIN, "{seg} scored only {s}");
     }
 }
+
+/// The classifier's veto may only judge what it saw. A header holding a byte
+/// 0x80 or above was skipped whole (`to_str()` refuses it) while the rules matched
+/// it, so its payload scored as nothing — and could veto a correct block.
+#[test]
+fn a_header_with_a_non_ascii_byte_is_still_scored() {
+    let mut c = ctx("/", None, None);
+    c.request_headers.insert(
+        http::header::HeaderName::from_static("x-note"),
+        http::HeaderValue::from_bytes(b"caf\xe9 <script>alert(document.cookie)</script>").unwrap(),
+    );
+    let s = score(&c);
+    assert!(
+        s >= DETECTION_MIN,
+        "a header payload behind a non-ASCII byte scored only {s}"
+    );
+}
+
+#[test]
+fn a_cookie_in_a_field_with_a_non_ascii_byte_is_still_scored() {
+    let mut c = ctx("/", None, None);
+    c.request_headers.append(
+        http::header::COOKIE,
+        http::HeaderValue::from_bytes(b"lang=caf\xe9; pref=1' UNION SELECT password FROM users--")
+            .unwrap(),
+    );
+    let s = score(&c);
+    assert!(
+        s >= DETECTION_MIN,
+        "a cookie payload behind a non-ASCII byte scored only {s}"
+    );
+}
