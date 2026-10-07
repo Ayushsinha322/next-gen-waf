@@ -2328,7 +2328,7 @@ dependencies = [
 
 [[package]]
 name = "sentinel-bin"
-version = "1.1.16"
+version = "1.1.17"
 dependencies = [
  "anyhow",
  "clap",
@@ -2343,7 +2343,7 @@ dependencies = [
 
 [[package]]
 name = "sentinel-cli"
-version = "1.1.16"
+version = "1.1.17"
 dependencies = [
  "anyhow",
  "clap",
@@ -2363,7 +2363,7 @@ dependencies = [
 
 [[package]]
 name = "sentinel-core"
-version = "1.1.16"
+version = "1.1.17"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2381,7 +2381,7 @@ dependencies = [
 
 [[package]]
 name = "sentinel-ebpf"
-version = "1.1.16"
+version = "1.1.17"
 dependencies = [
  "anyhow",
  "aya",
@@ -2397,7 +2397,7 @@ dependencies = [
 
 [[package]]
 name = "sentinel-ml"
-version = "1.1.16"
+version = "1.1.17"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2421,7 +2421,7 @@ dependencies = [
 
 [[package]]
 name = "sentinel-modules"
-version = "1.1.16"
+version = "1.1.17"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2452,7 +2452,7 @@ dependencies = [
 
 [[package]]
 name = "sentinel-plugins"
-version = "1.1.16"
+version = "1.1.17"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2477,7 +2477,7 @@ dependencies = [
 
 [[package]]
 name = "sentinel-proxy"
-version = "1.1.16"
+version = "1.1.17"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2526,7 +2526,7 @@ dependencies = [
 
 [[package]]
 name = "sentinel-rules"
-version = "1.1.16"
+version = "1.1.17"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -2566,7 +2566,7 @@ dependencies = [
 
 [[package]]
 name = "sentinel-storage"
-version = "1.1.16"
+version = "1.1.17"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2592,7 +2592,7 @@ dependencies = [
 
 [[package]]
 name = "sentinel-telemetry"
-version = "1.1.16"
+version = "1.1.17"
 dependencies = [
  "anyhow",
  "hmac",
