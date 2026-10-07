@@ -5,7 +5,10 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use super::vm::MemoKey;
-use crate::dsl::ast::{InterpCmp, RuleAction, RulePhase, RuleSeverity, SetVar, Target, Transform};
+use crate::dsl::ast::{
+    ExclusionKey, InterpCmp, RuleAction, RulePhase, RuleSeverity, SetVar, Target, TargetExclusion,
+    Transform,
+};
 
 // ---------------------------------------------------------------------------
 // Target specification stored in instructions
@@ -59,9 +62,48 @@ pub enum TargetSpec {
     /// turned the parent off.
     MatchedVar,
     CountOf(Box<TargetSpec>),
+    /// `base` without the members `keys` name: a collection target its rule
+    /// has exclusions for (`REQUEST_COOKIES|!REQUEST_COOKIES:/__utm/`).
+    Except {
+        base: Box<TargetSpec>,
+        keys: Vec<ExclusionKey>,
+    },
 }
 
 impl TargetSpec {
+    /// This target with the `exclusions` that name its collection applied —
+    /// wrapped in `Except` — or unchanged when none does. Only the keyed
+    /// collections have members to leave out.
+    pub fn excluding(self, exclusions: &[TargetExclusion]) -> TargetSpec {
+        let collection = match &self {
+            TargetSpec::Args => "ARGS",
+            TargetSpec::ArgsNames => "ARGS_NAMES",
+            TargetSpec::ArgsGet => "ARGS_GET",
+            TargetSpec::ArgsGetNames => "ARGS_GET_NAMES",
+            TargetSpec::RequestCookiesAll => "REQUEST_COOKIES",
+            TargetSpec::RequestCookiesNames => "REQUEST_COOKIES_NAMES",
+            TargetSpec::RequestHeadersAll => "REQUEST_HEADERS",
+            TargetSpec::RequestHeadersNames => "REQUEST_HEADERS_NAMES",
+            _ => return self,
+        };
+        let mut keys: Vec<ExclusionKey> = exclusions
+            .iter()
+            .filter(|e| e.collection == collection)
+            .map(|e| e.key.clone())
+            .collect();
+        if keys.is_empty() {
+            return self;
+        }
+        // One memo entry for every rule with the same exclusions, whatever
+        // order they were written in.
+        keys.sort();
+        keys.dedup();
+        TargetSpec::Except {
+            base: Box::new(self),
+            keys,
+        }
+    }
+
     /// ModSecurity-style label for this target, e.g. `ARGS`,
     /// `REQUEST_HEADERS:User-Agent`.
     ///
@@ -69,6 +111,7 @@ impl TargetSpec {
     /// can name the parameter to exclude instead of leaving an operator to guess.
     pub fn label(&self) -> String {
         match self {
+            TargetSpec::Except { base, .. } => base.label(),
             TargetSpec::Args => "ARGS".into(),
             TargetSpec::ArgsNames => "ARGS_NAMES".into(),
             TargetSpec::RequestBody => "REQUEST_BODY".into(),

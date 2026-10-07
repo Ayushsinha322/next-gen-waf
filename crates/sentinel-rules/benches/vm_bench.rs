@@ -32,6 +32,7 @@ fn build_rules(n: usize) -> RuleFile {
                 skip_after: None,
                 multi_match: false,
                 setvars: vec![],
+                exclusions: vec![],
             })
         })
         .collect();

@@ -268,13 +268,12 @@ pub fn redact_url_query(url: &str) -> String {
 /// (`headers.get`) saw one cookie and missed the rest. Each value is returned
 /// raw and, when it differs, percent-decoded too: rules decode before they
 /// match, so a session that arrived as `s%3AaBcD…` is matched as `s:aBcD…`.
+/// A field holding a byte >= 0x80 is decoded lossily, exactly as the rules
+/// read it — skipping it would leave a cookie the rules can match unwithheld.
 pub fn request_cookie_values(headers: &http::HeaderMap) -> Vec<String> {
     let mut out = Vec::new();
-    for raw in headers
-        .get_all(http::header::COOKIE)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-    {
+    for field in headers.get_all(http::header::COOKIE) {
+        let raw = String::from_utf8_lossy(field.as_bytes());
         for c in raw.split(';') {
             let Some((_, v)) = c.split_once('=') else {
                 continue;
@@ -432,6 +431,20 @@ mod tests {
         assert!(attack.contains("symbols space ' -"), "{attack}");
         // A whole Cookie header matched by a REQUEST_HEADERS rule.
         assert!(withheld_cookie_value("node-js=s%3AaBcD1234efGH.QmVyeVNlY3JldA", &v).is_some());
+    }
+
+    /// The rules read a Cookie field holding a byte >= 0x80 (decoded lossily);
+    /// skipping it here left a session the rules matched unwithheld in the log.
+    #[test]
+    fn a_cookie_in_a_field_with_a_non_ascii_byte_is_still_withheld() {
+        let mut h = http::HeaderMap::new();
+        h.append(
+            http::header::COOKIE,
+            http::HeaderValue::from_bytes(b"lang=caf\xe9; sid=Zq81LmKx0aPw7Yt2").unwrap(),
+        );
+        let v = request_cookie_values(&h);
+        assert!(v.iter().any(|x| x == "Zq81LmKx0aPw7Yt2"), "{v:?}");
+        assert!(withheld_cookie_value("Zq81LmKx0aPw7Yt2", &v).is_some());
     }
 
     #[test]

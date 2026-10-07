@@ -86,12 +86,14 @@ pub fn parse_crs_operator(s: &str) -> (String, String) {
 // Parse CRS target string into individual target tokens
 // ---------------------------------------------------------------------------
 
-/// Split a CRS target string like `"ARGS|ARGS_NAMES|REQUEST_HEADERS"` into
-/// individual tokens, preserving `!` exclusions (currently ignored).
+/// Split a CRS target string like `"ARGS|ARGS_NAMES|!REQUEST_COOKIES:/__utm/"`
+/// into upper-cased tokens. An exclusion keeps its `!`: this used to strip it
+/// while its comment said otherwise, which turned every CRS exclusion into one
+/// more TARGET — `!REQUEST_HEADERS:Referer` had the rule read Referer twice.
 pub fn split_crs_targets(s: &str) -> Vec<String> {
     s.split('|')
-        .map(|t| t.trim().trim_start_matches('!').to_uppercase())
-        .filter(|t| !t.is_empty())
+        .map(|t| t.trim().to_uppercase())
+        .filter(|t| !t.is_empty() && t != "!")
         .collect()
 }
 
@@ -453,6 +455,12 @@ mod tests {
     fn test_split_crs_targets() {
         let targets = split_crs_targets("ARGS|ARGS_NAMES|REQUEST_BODY");
         assert_eq!(targets, vec!["ARGS", "ARGS_NAMES", "REQUEST_BODY"]);
+        // An exclusion stays one: without its `!` it reads as a target.
+        let targets = split_crs_targets("REQUEST_COOKIES|!REQUEST_COOKIES:/__utm/|ARGS");
+        assert_eq!(
+            targets,
+            vec!["REQUEST_COOKIES", "!REQUEST_COOKIES:/__UTM/", "ARGS"]
+        );
     }
 
     #[test]

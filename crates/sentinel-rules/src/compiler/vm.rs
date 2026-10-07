@@ -10,7 +10,7 @@ use tracing::{debug, warn};
 
 use super::emitter::{CompiledRuleSet, Instruction, RuleMeta, TargetSpec};
 use crate::dsl::ast::{
-    InterpCmp, RuleAction, RulePhase, RuleSeverity, SetVar, SetVarOp, Transform,
+    ExclusionKey, InterpCmp, RuleAction, RulePhase, RuleSeverity, SetVar, SetVarOp, Transform,
 };
 
 /// Whether `phase` inspects the response rather than the request.
@@ -204,8 +204,7 @@ fn parse_cookies(header_val: &str) -> Vec<(String, String)> {
 fn content_type(ctx: &RequestContext) -> String {
     ctx.request_headers
         .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .map(|ct| ct.to_ascii_lowercase())
+        .map(|ct| header_text(ct).to_ascii_lowercase())
         .unwrap_or_default()
 }
 
@@ -213,9 +212,43 @@ fn content_type(ctx: &RequestContext) -> String {
 fn request_host(ctx: &RequestContext) -> String {
     ctx.request_headers
         .get("host")
-        .and_then(|v| v.to_str().ok())
-        .map(|h| h.split(':').next().unwrap_or(h).trim().to_ascii_lowercase())
+        .map(|v| {
+            let h = header_text(v);
+            h.split(':')
+                .next()
+                .unwrap_or(&h)
+                .trim()
+                .to_ascii_lowercase()
+        })
         .unwrap_or_default()
+}
+
+/// A header value as text, decoded lossily. `to_str()` refuses any byte
+/// 0x80 or above, and every target that used it dropped the WHOLE header — a single
+/// such byte hid a header, or every cookie in it, from the rules.
+fn header_text(v: &impl AsRef<[u8]>) -> std::borrow::Cow<'_, str> {
+    String::from_utf8_lossy(v.as_ref())
+}
+
+/// Every value of request header `name`, as the rules read it. `Cookie` is one
+/// value, its fields joined with `; ` as HTTP/1.1 carries it (RFC 9113
+/// 8.2.3): HTTP/2 and HTTP/3 send a field per cookie, and reading only the
+/// first left the rest unseen. Any other header yields one value per field.
+fn request_header_values(ctx: &RequestContext, name: &str) -> Vec<String> {
+    let fields = ctx
+        .request_headers
+        .get_all(name)
+        .iter()
+        .map(|v| header_text(v).into_owned());
+    if name.eq_ignore_ascii_case("cookie") {
+        let joined = fields.collect::<Vec<_>>().join("; ");
+        return if joined.is_empty() {
+            Vec::new()
+        } else {
+            vec![joined]
+        };
+    }
+    fields.collect()
 }
 
 /// True if `value` contains a `scheme://host` URL whose host is off-domain
@@ -482,10 +515,8 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// preserves byte length, so indices computed on the lowercased copy are valid
 /// offsets into the original header value.
 fn multipart_boundary(ctx: &RequestContext) -> Option<String> {
-    let raw = ctx
-        .request_headers
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())?;
+    let raw = header_text(ctx.request_headers.get("content-type")?);
+    let raw: &str = &raw;
     let lower = raw.to_ascii_lowercase();
     if !lower.trim_start().starts_with("multipart/form-data") {
         return None;
@@ -1305,16 +1336,18 @@ impl<'a> RequestViews<'a> {
             .map_err(|&e| e)
     }
 
-    /// `(name, value)` pairs of the `Cookie` header — the first one only, and
-    /// none when it is not visible ASCII, as every cookie target has read it.
+    /// `(name, value)` pairs of every `Cookie` field. This read the first
+    /// field only, and nothing when it held a byte >= 0x80: HTTP/2 and HTTP/3
+    /// send a field per cookie, so every cookie after the first was unseen by
+    /// every cookie rule (live on .71: 9 CRS matches became 1).
     fn cookies(&self, ctx: &RequestContext) -> &[(String, String)] {
         self.cookies.get_or_init(|| {
             note_view_built(View::Cookies);
             ctx.request_headers
-                .get("cookie")
-                .and_then(|v| v.to_str().ok())
-                .map(parse_cookies)
-                .unwrap_or_default()
+                .get_all("cookie")
+                .iter()
+                .flat_map(|v| parse_cookies(&header_text(v)))
+                .collect()
         })
     }
 
@@ -1635,7 +1668,49 @@ fn memo_policy(spec: &TargetSpec) -> Memo {
         TargetSpec::CountOf(_) => Memo::Never,
         // VM state: written by `setvar` and by the previous chain link.
         TargetSpec::TxVar(_) | TargetSpec::MatchedVar => Memo::Never,
+        // As its collection: every rule with the same exclusions shares it.
+        TargetSpec::Except { base, .. } => memo_policy(base),
     }
+}
+
+/// Whether a member called `name` is one `keys` leaves out.
+fn excluded(keys: &[ExclusionKey], name: &str) -> bool {
+    keys.iter().any(|key| match key {
+        ExclusionKey::Name(n) => n.eq_ignore_ascii_case(name),
+        ExclusionKey::Pattern(p) => key_pattern_finds(p, name),
+    })
+}
+
+/// Does `/pattern/` find `name`, case-insensitively? CRS's own patterns
+/// (`__utm`, `_pk_ref`) are plain text and are searched for as such; anything
+/// else is compiled once per thread. A pattern that does not compile excludes
+/// nothing, so the member stays inspected.
+fn key_pattern_finds(pattern: &str, name: &str) -> bool {
+    const META: &[char] = &[
+        '\\', '.', '+', '*', '?', '(', ')', '|', '[', ']', '{', '}', '^', '$',
+    ];
+    if !pattern.contains(META) {
+        return name
+            .to_ascii_lowercase()
+            .contains(&pattern.to_ascii_lowercase());
+    }
+    thread_local! {
+        static COMPILED: RefCell<HashMap<String, Option<regex::Regex>>> =
+            RefCell::new(HashMap::new());
+    }
+    COMPILED.with(|c| {
+        c.borrow_mut()
+            .entry(pattern.to_owned())
+            .or_insert_with(|| {
+                regex::RegexBuilder::new(pattern)
+                    .case_insensitive(true)
+                    .size_limit(1 << 20)
+                    .build()
+                    .ok()
+            })
+            .as_ref()
+            .is_some_and(|rx| rx.is_match(name))
+    })
 }
 
 /// How many rules of `program` read each memoizable target — untransformed,
@@ -1726,6 +1801,61 @@ fn extract_target(
         // Outside a chain nothing has matched yet, and an empty list is the
         // honest answer: the condition simply does not match.
         TargetSpec::MatchedVar => last_matched.map(|v| vec![v.to_owned()]).unwrap_or_default(),
+        // The collection's values in the order `base` lists them, less the
+        // members the rule excludes.
+        TargetSpec::Except { base, keys } => {
+            let keep =
+                |(name, value): (&str, &str)| (!excluded(keys, name)).then(|| value.to_owned());
+            match base.as_ref() {
+                TargetSpec::Args => {
+                    let (query, body) = (views.query(ctx)?, views.body(ctx)?);
+                    query.iter().chain(body.iter()).filter_map(keep).collect()
+                }
+                TargetSpec::ArgsGet => views.query(ctx)?.iter().filter_map(keep).collect(),
+                TargetSpec::ArgsNames => {
+                    let (query, body) = (views.query(ctx)?, views.body(ctx)?);
+                    query
+                        .names
+                        .iter()
+                        .chain(body.names.iter())
+                        .filter(|n| !excluded(keys, n))
+                        .cloned()
+                        .collect()
+                }
+                TargetSpec::ArgsGetNames => views
+                    .query(ctx)?
+                    .names
+                    .iter()
+                    .filter(|n| !excluded(keys, n))
+                    .cloned()
+                    .collect(),
+                TargetSpec::RequestCookiesAll => views
+                    .cookies(ctx)
+                    .iter()
+                    .filter_map(|(k, v)| keep((k, v)))
+                    .collect(),
+                TargetSpec::RequestCookiesNames => views
+                    .cookies(ctx)
+                    .iter()
+                    .filter(|(k, _)| !excluded(keys, k))
+                    .map(|(k, _)| k.clone())
+                    .collect(),
+                TargetSpec::RequestHeadersAll => ctx
+                    .request_headers
+                    .iter()
+                    .filter(|(name, _)| !excluded(keys, name.as_str()))
+                    .map(|(_, v)| header_text(v).into_owned())
+                    .collect(),
+                TargetSpec::RequestHeadersNames => ctx
+                    .request_headers
+                    .keys()
+                    .filter(|name| !excluded(keys, name.as_str()))
+                    .map(|name| name.as_str().to_owned())
+                    .collect(),
+                // `TargetSpec::excluding` wraps only the collections above.
+                other => extract_target(other, ctx, views, last_matched)?,
+            }
+        }
         // ARGS also includes urlencoded / JSON POST body parameters, after the
         // query-string ones. Built only for a request carrying both; with one
         // side empty `RequestViews::shared` hands out the other side as it is.
@@ -1816,15 +1946,9 @@ fn extract_target(
         TargetSpec::RequestHeadersAll => ctx
             .request_headers
             .values()
-            .filter_map(|v| v.to_str().ok())
-            .map(String::from)
+            .map(|v| header_text(v).into_owned())
             .collect(),
-        TargetSpec::RequestHeader(name) => ctx
-            .request_headers
-            .get(name.as_str())
-            .and_then(|v| v.to_str().ok())
-            .map(|v| vec![v.to_owned()])
-            .unwrap_or_default(),
+        TargetSpec::RequestHeader(name) => request_header_values(ctx, name),
         // Cookie NAMES. Session-fixation and cookie-injection rules match on the
         // name side, so returning values here would silently never fire them.
         TargetSpec::RequestCookiesNames => {
@@ -1860,19 +1984,17 @@ fn extract_target(
         TargetSpec::ResponseHeadersAll => ctx
             .response_headers
             .as_ref()
-            .map(|h| {
-                h.values()
-                    .filter_map(|v| v.to_str().ok())
-                    .map(String::from)
-                    .collect()
-            })
+            .map(|h| h.values().map(|v| header_text(v).into_owned()).collect())
             .unwrap_or_default(),
         TargetSpec::ResponseHeader(name) => ctx
             .response_headers
             .as_ref()
-            .and_then(|h| h.get(name.as_str()))
-            .and_then(|v| v.to_str().ok())
-            .map(|v| vec![v.to_owned()])
+            .map(|h| {
+                h.get_all(name.as_str())
+                    .iter()
+                    .map(|v| header_text(v).into_owned())
+                    .collect()
+            })
             .unwrap_or_default(),
         TargetSpec::ResponseBody => ctx
             .response_body
@@ -2010,22 +2132,24 @@ fn collect_sensitive_values(ctx: &RequestContext, views: &RequestViews) -> Vec<S
     // Header values, keyed by header name — Authorization, X-Api-Key and
     // friends. Cheap: a request carries a few dozen headers at most, and this
     // runs once per phase, not once per rule.
-    let headers = ctx
-        .request_headers
-        .iter()
-        // `Cookie` is skipped: its values are handled, one cookie at a time,
-        // by `withheld_cookie_value`, which also catches a rule matching the
-        // WHOLE header (the match text carries each value).
-        .filter(|(name, _)| !name.as_str().eq_ignore_ascii_case("cookie"))
-        .filter_map(|(name, value)| Some((name.as_str(), value.to_str().ok()?)));
-
     sensitive.extend(
         query
             .into_iter()
             .flat_map(Params::iter)
-            .chain(headers)
             .filter(|(name, value)| !value.is_empty() && is_sensitive_field_name(name))
             .map(|(_, value)| value.to_owned()),
+    );
+    sensitive.extend(
+        ctx.request_headers
+            .iter()
+            // `Cookie` is skipped: its values are handled, one cookie at a time,
+            // by `withheld_cookie_value`, which also catches a rule matching the
+            // WHOLE header (the match text carries each value).
+            .filter(|(name, _)| !name.as_str().eq_ignore_ascii_case("cookie"))
+            // Decoded as the rules read it, so a value they can now match is
+            // also one capture withholds.
+            .filter(|(name, value)| !value.is_empty() && is_sensitive_field_name(name.as_str()))
+            .map(|(_, value)| header_text(value).into_owned()),
     );
     sensitive
 }
@@ -3158,7 +3282,7 @@ fn resolve_operator_macro(inner: &str, ctx: &RequestContext) -> Option<String> {
     // `request_headers.NAME` — used by the RFI and session-fixation rules to
     // compare a candidate host against the request's own Host.
     if let Some(name) = lower.strip_prefix("request_headers.") {
-        let v = ctx.request_headers.get(name)?.to_str().ok()?.to_owned();
+        let v = header_text(ctx.request_headers.get(name)?).into_owned();
         return (!v.is_empty()).then_some(v);
     }
     None
@@ -3980,13 +4104,11 @@ impl RequestValues {
             ));
         }
         for (name, value) in ctx.request_headers.iter() {
-            if let Ok(v) = value.to_str() {
-                entries.push((
-                    Collection::Headers,
-                    format!("REQUEST_HEADERS:{}", name.as_str()).into(),
-                    v.to_owned(),
-                ));
-            }
+            entries.push((
+                Collection::Headers,
+                format!("REQUEST_HEADERS:{}", name.as_str()).into(),
+                header_text(value).into_owned(),
+            ));
         }
         entries.push((
             Collection::Filename,

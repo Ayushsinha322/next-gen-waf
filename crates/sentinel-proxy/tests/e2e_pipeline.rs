@@ -530,6 +530,45 @@ async fn metrics_endpoint_is_scrapeable() {
     assert!(text.contains("sentinel_active_connections"));
 }
 
+/// A source the site allow-lists is trusted by its operator. It used to skip
+/// only the site block list and the reputation feed: rules, rate limits, bans,
+/// bot and GeoIP checks still judged it, so allow-listing a partner did not
+/// stop its false positives.
+#[tokio::test]
+async fn a_sites_allow_list_skips_the_rules() {
+    let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
+    let attack = "/search?q=1%27%20UNION%20SELECT%20password%20FROM%20users--";
+    let mut statuses = Vec::new();
+    for allow in ["10.9.9.9", "127.0.0.1"] {
+        let listen_port = next_port();
+        let mut cfg = test_config(
+            listen_port,
+            upstream_addr.port(),
+            "REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
+            WafMode::Blocking,
+        );
+        cfg.sites[0].waf.ip_reputation = Some(sentinel_core::config::IpReputationConfig {
+            allow: vec![allow.into()],
+            ..Default::default()
+        });
+        let (shutdown_tx, jh) = start_proxy(cfg).await;
+        let (status, _) =
+            send_request(listen_port, "test-site.local", attack, Method::GET, "").await;
+        shutdown_proxy(shutdown_tx, jh).await;
+        statuses.push(status);
+    }
+    assert_eq!(
+        statuses[0],
+        StatusCode::FORBIDDEN,
+        "a source the site does not allow-list must be inspected"
+    );
+    assert_eq!(
+        statuses[1],
+        StatusCode::OK,
+        "an allow-listed source was still judged by the rules"
+    );
+}
+
 #[tokio::test]
 async fn post_body_sqli_is_blocked() {
     let (upstream_addr, _upstream_handle) = start_mock_upstream().await;

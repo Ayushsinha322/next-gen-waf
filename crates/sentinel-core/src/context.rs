@@ -317,6 +317,11 @@ pub struct RequestContext {
     /// runs). The ML feature extractor turns this into a strong anomaly signal
     /// so the classifier learns to treat feed-matched traffic as malicious.
     pub threat_intel_hit: bool,
+    /// The client is on THIS site's allow list: its operator trusts it, so
+    /// nothing after attribution judges it — bans, connection limits, threat
+    /// intel, rate limits, bot and GeoIP checks, rules, ML and plugins. It used
+    /// to skip only the site block list and the reputation feed.
+    pub allowlisted: bool,
 
     // --- Upstream / response ---
     pub upstream_addr: Option<std::net::SocketAddr>,
@@ -375,6 +380,7 @@ impl RequestContext {
             gateway_error: None,
             would_block: false,
             threat_intel_hit: false,
+            allowlisted: false,
             upstream_addr: None,
             upstream_latency_us: None,
             response_status: None,

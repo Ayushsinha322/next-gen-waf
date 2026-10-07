@@ -9,7 +9,7 @@ use tracing::debug;
 
 use crate::dsl::ast::{
     CmpOp, Directive, Operator, RuleDef, RuleFile, RuleItem, RuleSeverity, TargetCombinator,
-    TargetExpr, Transform, VirtualPatch,
+    TargetExclusion, TargetExpr, Transform, VirtualPatch,
 };
 use emitter::{CompiledRuleSet, Instruction, RuleCoverage, RuleMeta, TargetSpec};
 use optimizer::build_ac;
@@ -376,6 +376,7 @@ fn compile_rule(rule: &RuleDef, state: &mut CompilerState) -> Result<(Vec<Instru
 
     emit_condition(
         &rule.targets,
+        &rule.exclusions,
         &rule.operator,
         &rule.transforms,
         rule.multi_match,
@@ -388,6 +389,7 @@ fn compile_rule(rule: &RuleDef, state: &mut CompilerState) -> Result<(Vec<Instru
     for chain in &rule.chain_conditions {
         emit_condition(
             &chain.targets,
+            &[],
             &chain.operator,
             &rule.transforms,
             rule.multi_match,
@@ -423,7 +425,15 @@ fn compile_virtual_patch(
         setvars: Vec::new(),
     };
 
-    emit_condition(&vp.targets, &vp.operator, &[], false, state, &mut instrs)?;
+    emit_condition(
+        &vp.targets,
+        &[],
+        &vp.operator,
+        &[],
+        false,
+        state,
+        &mut instrs,
+    )?;
     instrs.push(Instruction::RuleEnd { rule_id: vp_id });
 
     Ok((instrs, meta))
@@ -439,6 +449,7 @@ fn compile_virtual_patch(
 /// ```
 fn emit_condition(
     targets: &[TargetExpr],
+    exclusions: &[TargetExclusion],
     operator: &Operator,
     transforms: &[Transform],
     multi_match: bool,
@@ -487,7 +498,7 @@ fn emit_condition(
 
     // Emit one "load+[transforms]+match" per target, combining with And/Or combinators.
     for (i, tex) in targets.iter().enumerate() {
-        let spec = TargetSpec::from(&tex.target);
+        let spec = TargetSpec::from(&tex.target).excluding(exclusions);
         instrs.push(Instruction::LoadTarget(spec));
         if !transforms.is_empty() {
             instrs.push(Instruction::ApplyTransforms {

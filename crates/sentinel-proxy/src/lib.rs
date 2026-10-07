@@ -3435,6 +3435,20 @@ async fn proxy_inner(
         }
     }
 
+    // A source the attributed site allow-lists is trusted by that site's
+    // operator. Every check below skips it — the node blocklist and auto-bans
+    // included, so an allow-listed partner that tripped a ban elsewhere is let
+    // back in here. Response-side data-leak controls still apply: they guard
+    // the site's data, not a judgement of the client.
+    ctx.allowlisted = ctx.site_id.as_deref().is_some_and(|id| {
+        state
+            .modules
+            .ip_rep_sites
+            .load()
+            .get(id)
+            .is_some_and(|r| r.is_allowlisted(ctx.client_ip))
+    });
+
     // Blocklist fast-fail: known-blocked addresses never enter the WAF pipeline.
     // First check after attribution, so nothing else runs for a blocked source.
     //
@@ -3459,12 +3473,14 @@ async fn proxy_inner(
     // `req.headers()` rather than `ctx.request_headers`: Phase 0 copies only the
     // two headers logging reads, and this needs the X-Forwarded-For chain. The
     // full map is still intact here — `into_parts()` runs at Phase 1.
-    if blocklist_hit(
-        peer.ip(),
-        req.headers(),
-        |ip| state.ebpf.is_blocked(ip),
-        is_trusted_proxy,
-    ) {
+    if !ctx.allowlisted
+        && blocklist_hit(
+            peer.ip(),
+            req.headers(),
+            |ip| state.ebpf.is_blocked(ip),
+            is_trusted_proxy,
+        )
+    {
         inc_ebpf_drops();
         ctx.decision = WafDecision::Block;
         // Named so `classify_nonrule_block` files it under IPREP rather than
@@ -3478,7 +3494,12 @@ async fn proxy_inner(
     }
 
     // Anti-DDoS: connection-rate check.
-    match state.modules.anti_ddos.check_connection(ctx.client_ip) {
+    let ddos = if ctx.allowlisted {
+        DdosVerdict::Allow
+    } else {
+        state.modules.anti_ddos.check_connection(ctx.client_ip)
+    };
+    match ddos {
         DdosVerdict::Block { reason } => {
             ctx.decision = WafDecision::Block;
             ctx.block_reason = Some(reason);
@@ -3533,7 +3554,7 @@ async fn proxy_inner(
     // let the rule engine / ML decide.
     {
         let ti = state.modules.threat_intel.load();
-        if !ti.is_empty() {
+        if !ctx.allowlisted && !ti.is_empty() {
             let ua = req
                 .headers()
                 .get(http::header::USER_AGENT)
@@ -3583,7 +3604,7 @@ async fn proxy_inner(
                 Some("1") | Some("true") | Some("yes") | Some("on")
             )
         });
-        if disabled || is_shared_egress(ctx.client_ip) {
+        if disabled || ctx.allowlisted || is_shared_egress(ctx.client_ip) {
             // Shared egress: the address is not an actor, so its history is not its
             // fault. See shared_egress_nets().
             0
@@ -3731,7 +3752,7 @@ async fn proxy_inner(
 
     // Request size limits: URI and header count (Phase 1, before body read).
     if let Some(s) = &site {
-        if s.waf.mode != WafMode::Off {
+        if s.waf.mode != WafMode::Off && !ctx.allowlisted {
             // URI length limit.
             if s.waf.max_uri_length > 0 {
                 let uri_len = ctx.uri.to_string().len() as u32;
@@ -3859,7 +3880,9 @@ async fn proxy_inner(
     // --- Phase 2: Request body ---
     ctx.advance_phase(Phase::RequestBody);
 
-    let should_inspect_body = site.map(|s| s.waf.mode != WafMode::Off).unwrap_or(false);
+    let should_inspect_body = site
+        .map(|s| s.waf.mode != WafMode::Off && !ctx.allowlisted)
+        .unwrap_or(false);
 
     let boxed_body: BoxBody = if should_inspect_body {
         let max_bytes = site.map(|s| s.waf.max_body_size).unwrap_or(0);
@@ -4271,7 +4294,7 @@ async fn proxy_inner(
             // instead reads the live map, so a rule pushed while a socket is
             // open applies to its next message.
             let ws_inspector: Option<Arc<dyn websocket::MessageInspector>> =
-                if engine_map.contains_key(&site_id) {
+                if engine_map.contains_key(&site_id) && !ctx.allowlisted {
                     Some(Arc::new(WsSiteInspector {
                         site: site_cfg.clone(),
                         engines: Arc::clone(&state.engines),
@@ -4582,7 +4605,7 @@ async fn phase1_headers(
     site_plugins: &[String],
 ) -> anyhow::Result<()> {
     let Some(site) = site else { return Ok(()) };
-    if site.waf.mode == WafMode::Off {
+    if site.waf.mode == WafMode::Off || ctx.allowlisted {
         return Ok(());
     }
 
@@ -5145,7 +5168,7 @@ fn phase2_body(
     ml_engine: &MlEngine,
 ) -> anyhow::Result<()> {
     let Some(site) = site else { return Ok(()) };
-    if site.waf.mode == WafMode::Off {
+    if site.waf.mode == WafMode::Off || ctx.allowlisted {
         return Ok(());
     }
 
@@ -7177,7 +7200,14 @@ fn load_site_engine(site: &SiteConfig) -> anyhow::Result<RuleEngine> {
         );
     }
 
-    // Rule target exclusions.
+    // Rule target exclusions. A target named exactly (`ARGS_NAMES`,
+    // `REQUEST_HEADERS:User-Agent`) is removed from the rule. A member of a
+    // collection (`ARGS:q`, `REQUEST_COOKIES:/^_ga/`) is left out of the rule's
+    // collection target, as ModSecurity's `!ARGS:q`: compared with whole
+    // target names only, it never matched — a rule reads `ARGS`, never
+    // `ARGS:q` — so an operator clearing a false positive on one parameter
+    // cleared nothing.
+    let mut emptied: std::collections::HashSet<u32> = std::collections::HashSet::new();
     for exclusion in &site.waf.rule_exclusions {
         if exclusion.disable || exclusion.exclude_targets.is_empty() {
             continue;
@@ -7187,6 +7217,11 @@ fn load_site_engine(site: &SiteConfig) -> anyhow::Result<RuleEngine> {
             .iter()
             .map(|t| t.to_ascii_uppercase())
             .collect();
+        let members: Vec<sentinel_rules::ast::TargetExclusion> = exclusion
+            .exclude_targets
+            .iter()
+            .filter_map(|t| sentinel_rules::ast::TargetExclusion::parse(t))
+            .collect();
         for item in &mut merged.items {
             if let RuleItem::Rule(rule) = item {
                 if rule.id == exclusion.rule_id {
@@ -7194,7 +7229,11 @@ fn load_site_engine(site: &SiteConfig) -> anyhow::Result<RuleEngine> {
                     rule.targets.retain(|t| {
                         !excl_upper.contains(&target_name(&t.target).to_ascii_uppercase())
                     });
-                    if rule.targets.len() < before_len {
+                    rule.exclusions.extend(members.iter().cloned());
+                    if before_len > 0 && rule.targets.is_empty() {
+                        emptied.insert(rule.id);
+                    }
+                    if rule.targets.len() < before_len || !members.is_empty() {
                         debug!(
                             site = %site.id,
                             rule_id = exclusion.rule_id,
@@ -7205,6 +7244,22 @@ fn load_site_engine(site: &SiteConfig) -> anyhow::Result<RuleEngine> {
                 }
             }
         }
+    }
+    // A rule whose every target was excluded is off for this site, which is
+    // what the operator asked for. Left in, it failed `compile` ("operator
+    // requires at least one target") and took the site's WHOLE rule set with
+    // it — excluding `REQUEST_HEADERS:User-Agent` from a rule reading only that
+    // header made a blocking site refuse all traffic.
+    if !emptied.is_empty() {
+        merged.items.retain(|item| match item {
+            RuleItem::Rule(rule) => !emptied.contains(&rule.id),
+            _ => true,
+        });
+        info!(
+            site = %site.id,
+            rules = ?emptied,
+            "every target of these rules is excluded; they are off for this site"
+        );
     }
 
     // After the inline-rule loop has recorded its diagnostics, as a panic in
@@ -13290,6 +13345,90 @@ mod log_explain_tests {
 }
 
 #[cfg(test)]
+mod rule_exclusion_tests {
+    use super::*;
+    use sentinel_core::config::{InlineRule, RuleExclusion};
+
+    const RULE: &str = r#"
+rule 9990301 {
+    phase    : request_body
+    targets  : ARGS
+    operator : rx /EXCLMARKER/
+    action   : block
+    severity : critical
+    message  : "marker"
+}
+"#;
+
+    fn engine(exclude_targets: &[&str]) -> RuleEngine {
+        // The inline-rule diagnostics registry is process-global.
+        let _g = crate::inline_rule_diag_tests::DIAG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut site = crate::inline_rule_diag_tests::site_with(vec![InlineRule {
+            name: "exclusion-test".into(),
+            dsl: RULE.into(),
+        }]);
+        // A derived WafConfig has paranoia level 0, which gates out every rule.
+        site.waf.paranoia_level = 1;
+        site.waf.rule_exclusions = vec![RuleExclusion {
+            rule_id: 9990301,
+            exclude_targets: exclude_targets.iter().map(|t| t.to_string()).collect(),
+            disable: false,
+        }];
+        load_site_engine(&site)
+            .map_err(|e| format!("{e:#}"))
+            .expect("engine builds")
+    }
+
+    fn fires(engine: &RuleEngine, uri: &str) -> bool {
+        let mut ctx = RequestContext::new("192.0.2.1".parse().unwrap(), 1);
+        ctx.uri = uri.parse().unwrap();
+        engine.evaluate(&mut ctx, Phase::RequestHeaders, 0);
+        engine.evaluate(&mut ctx, Phase::RequestBody, 0);
+        ctx.rule_matches.iter().any(|m| m.rule_id == "9990301")
+    }
+
+    /// The console's exclusion for one parameter. Compared with whole target
+    /// names it never matched a rule reading `ARGS`, so it cleared nothing.
+    #[test]
+    fn an_args_name_exclusion_leaves_out_that_parameter_only() {
+        assert!(fires(&engine(&[]), "/?q=EXCLMARKER"), "test premise");
+
+        let e = engine(&["ARGS:q"]);
+        assert!(
+            !fires(&e, "/?q=EXCLMARKER"),
+            "the excluded parameter was still inspected"
+        );
+        assert!(
+            !fires(&e, "/?Q=EXCLMARKER"),
+            "parameter names compare case-insensitively"
+        );
+        assert!(
+            fires(&e, "/?r=EXCLMARKER"),
+            "every other parameter must stay inspected"
+        );
+        assert!(fires(&e, "/?q=ok&r=EXCLMARKER"));
+    }
+
+    #[test]
+    fn a_pattern_exclusion_leaves_out_every_matching_parameter() {
+        let e = engine(&["ARGS:/^utm_/"]);
+        assert!(!fires(&e, "/?utm_source=EXCLMARKER"));
+        assert!(!fires(&e, "/?UTM_campaign=EXCLMARKER"));
+        assert!(fires(&e, "/?source_utm_=EXCLMARKER"));
+    }
+
+    /// Naming the whole target removes it. When that was the rule's only
+    /// target, the rule used to fail to compile and take every rule of the
+    /// site with it; now the rule is simply off for the site.
+    #[test]
+    fn excluding_a_rules_only_target_turns_the_rule_off_not_the_site() {
+        assert!(!fires(&engine(&["ARGS"]), "/?r=EXCLMARKER"));
+    }
+}
+
+#[cfg(test)]
 mod inline_rule_diag_tests {
     use super::*;
     use sentinel_core::config::{InlineRule, UpstreamConfig};
@@ -13304,7 +13443,7 @@ mod inline_rule_diag_tests {
         DIAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn site_with(inline: Vec<InlineRule>) -> SiteConfig {
+    pub(crate) fn site_with(inline: Vec<InlineRule>) -> SiteConfig {
         SiteConfig {
             id: "s".into(),
             tenant_id: String::new(),
@@ -14883,13 +15022,18 @@ mod threat_intel_visibility_tests {
             s["inert_reason"]
         );
 
-        // 2. Configured, but the poller has not been spawned.
+        // 2. Configured, but the poller has not been spawned. "Spawned" is a
+        // process-wide flag, and the panic-guard tests in this binary start
+        // proxies that spawn pollers — so, read through `threat_intel_status`,
+        // this case depended on test order. Asserted on the state itself.
         cfg.cluster.sync_url = Some("http://controlplane:9501".into());
         let s = threat_intel_status(&cfg, &feed);
         assert_eq!(s["configured"], true);
         assert_eq!(s["active"], false);
+        assert_ne!(s["poller"], "not_configured");
         assert_eq!(
-            s["poller"], "not_started",
+            ti_poller_state(true, false, 0, false),
+            "not_started",
             "configured-but-not-running must be distinguishable from not-configured"
         );
     }

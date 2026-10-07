@@ -6,7 +6,7 @@ use super::secrule::{
 };
 use crate::dsl::ast::{
     ChainCondition, Directive, InterpCmp, Operator, RuleAction, RuleDef, RuleFile, RuleItem,
-    RulePhase, Target, TargetCombinator, TargetExpr,
+    RulePhase, Target, TargetCombinator, TargetExclusion, TargetExpr,
 };
 
 // ---------------------------------------------------------------------------
@@ -243,7 +243,19 @@ fn secrule_directive_to_rule_with_actions(
         skip_after: actions.skip_after.clone(),
         multi_match: actions.multi_match,
         setvars: actions.setvars.clone(),
+        exclusions: parse_crs_target_exclusions(targets_str),
     }))
+}
+
+/// The `!COLLECTION:key` tokens of a target list. `token_to_target` drops
+/// them as targets; they are kept here as what they are, the members the
+/// rule leaves out. Read from the raw text: the target tokens are
+/// upper-cased, which would turn a pattern's `\d` into `\D`.
+fn parse_crs_target_exclusions(s: &str) -> Vec<TargetExclusion> {
+    s.split('|')
+        .filter_map(|tok| tok.trim().strip_prefix('!'))
+        .filter_map(TargetExclusion::parse)
+        .collect()
 }
 
 /// Public helper — kept for tests that pass actions as a raw string.

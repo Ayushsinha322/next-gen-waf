@@ -53,6 +53,53 @@ pub struct RuleDef {
     /// (e.g. `tx.sql_injection_score`) that later rules read via `TX:` targets.
     #[serde(default)]
     pub setvars: Vec<SetVar>,
+    /// Members of this rule's collection targets it must not inspect: CRS's
+    /// `!REQUEST_COOKIES:/__utm/`, an operator's `ARGS:q`.
+    #[serde(default)]
+    pub exclusions: Vec<TargetExclusion>,
+}
+
+/// `!COLLECTION:key` — one member of a collection a rule leaves out
+/// (ModSecurity's target exclusion).
+///
+/// CRS ships 151 rules that leave out analytics cookies (`__utm*`, `_pk_ref`)
+/// and a few headers this way. The importer dropped every `!` token, so each
+/// of those rules inspected the very values CRS had excluded. An operator's
+/// `ARGS:q` exclusion compiles to the same thing; it used to be compared with
+/// whole target names and so could never match a rule reading `ARGS`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TargetExclusion {
+    /// The collection as ModSecurity names it, upper-case: `ARGS`,
+    /// `REQUEST_COOKIES`, `REQUEST_HEADERS`, ...
+    pub collection: String,
+    pub key: ExclusionKey,
+}
+
+/// Which members of the collection are left out.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ExclusionKey {
+    /// A member name, compared case-insensitively as ModSecurity does.
+    Name(String),
+    /// `/pattern/`: every member whose name the pattern finds,
+    /// case-insensitively.
+    Pattern(String),
+}
+
+impl TargetExclusion {
+    /// `COLLECTION:name` or `COLLECTION:/pattern/`, without the `!`. None when
+    /// there is no member: leaving out a whole collection is removing the
+    /// target, not an exclusion.
+    pub fn parse(spec: &str) -> Option<Self> {
+        let (collection, key) = spec.trim().split_once(':')?;
+        let key = key.trim().trim_matches('\'');
+        let key = match key.strip_prefix('/').and_then(|k| k.strip_suffix('/')) {
+            Some(p) if !p.is_empty() => ExclusionKey::Pattern(p.to_owned()),
+            _ if !key.is_empty() => ExclusionKey::Name(key.to_owned()),
+            _ => return None,
+        };
+        let collection = collection.trim().to_ascii_uppercase();
+        (!collection.is_empty()).then_some(Self { collection, key })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -110,6 +157,7 @@ impl Default for RuleDef {
             skip_after: None,
             multi_match: false,
             setvars: Vec::new(),
+            exclusions: Vec::new(),
         }
     }
 }
