@@ -42,6 +42,9 @@ import (
 var reportDeliverer atomic.Pointer[reports.Deliverer]
 
 func main() {
+	if code, handled := runSubcommand(os.Args[1:]); handled {
+		os.Exit(code)
+	}
 	fmt.Fprintln(os.Stderr, "controllerd starting…")
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "fatal:", err)
@@ -50,8 +53,9 @@ func main() {
 }
 
 // dbConnectMaxWait is how long openDBWithRetry keeps retrying the initial DB
-// connection before giving up (then falling back to degraded mode). Override
-// with SENTINEL_DB_CONNECT_TIMEOUT (seconds); 0 disables retry. Default 60s.
+// connection before the process exits for its restart policy to try again.
+// Override with SENTINEL_DB_CONNECT_TIMEOUT (seconds); 0 disables retry.
+// Default 60s.
 func dbConnectMaxWait() time.Duration {
 	if v := os.Getenv("SENTINEL_DB_CONNECT_TIMEOUT"); v != "" {
 		if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
@@ -195,10 +199,19 @@ func run() error {
 		// instead of dropping straight into degraded mode on the first ping.
 		pool, dbErr = openDBWithRetry(ctx, log, db.Config{URL: dbURL, MaxConns: 20, MinConns: 2}, dbConnectMaxWait())
 		if dbErr != nil {
-			// safeErr, not zap.Error: a connect/parse failure can quote the DSN
-			// it choked on, which would put the password in the log.
-			log.Warn("DB unavailable — running in degraded mode (mock data only)",
-				zap.String("error", safeErr(dbErr)))
+			// A database that is configured but not reachable yet is not "no
+			// database". This fell back to degraded mode (mock data, every login
+			// refused) and nothing ever retried: after a power cut in which
+			// Postgres came up slower than the window above, the console stayed
+			// down until someone restarted it by hand. Exit instead — the restart
+			// policy (compose `unless-stopped`, Kubernetes) starts it again, and
+			// the first attempt after Postgres is up succeeds. Degraded mode is
+			// still what an unset SENTINEL_DB_URL gets.
+			//
+			// safeErr, not the raw error: a connect/parse failure can quote the
+			// DSN it choked on, which would put the password in the log.
+			return fmt.Errorf("database not reachable within %s (SENTINEL_DB_CONNECT_TIMEOUT); exiting so the restart policy retries: %s",
+				dbConnectMaxWait(), safeErr(dbErr))
 		} else {
 			log.Info("DB connected", zap.String("url", maskPassword(dbURL)))
 			store = db.NewStore(pool)

@@ -114,7 +114,11 @@ HAVE_OPENSSL=no; command -v openssl >/dev/null && HAVE_OPENSSL=yes
 MGMT_HOST="$(sed -n 's/^SENTINEL_MGMT_BIND=//p' "$ENV_FILE" | head -1 | tr -d ':[:space:]')"
 [[ -n "$MGMT_HOST" && "$MGMT_HOST" != "0.0.0.0" ]] || MGMT_HOST=127.0.0.1
 API="${SENTINEL_API:-https://${MGMT_HOST}:9443}"
-EMAIL="${SENTINEL_ADMIN_EMAIL:-admin@sentinel.local}"
+# The console login the installer created (SENTINEL_BOOTSTRAP_ADMIN_EMAIL, the
+# "Administrator email" it asked for); installs older than that setting use
+# the old fixed login.
+BOOT_LOGIN="$(sed -n 's/^SENTINEL_BOOTSTRAP_ADMIN_EMAIL=//p' "$ENV_FILE" 2>/dev/null | head -1)"
+EMAIL="${SENTINEL_ADMIN_EMAIL:-${BOOT_LOGIN:-admin@sentinel.local}}"
 WAF_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')"
 [[ -n "$WAF_IP" ]] || WAF_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 

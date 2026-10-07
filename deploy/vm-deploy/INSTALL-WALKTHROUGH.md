@@ -404,7 +404,7 @@ Ten steps, and it ends like this:
   Installation successful
 
     Version        Swaraj Kavach v1.0.2
-    Username       admin@sentinel.local
+    Username       <the Administrator email you gave the installer>
     Password       6c1a48cb969314feb230ce64072348d3afba849a67c59f0534ac480437a7786b
 ```
 
@@ -550,7 +550,8 @@ Enter the root password. **Leave this window open** — closing it closes the tu
 
 - You will see a **certificate warning**. This is expected — the WAF issued its own
   certificate. Click **Advanced** → **Proceed to 127.0.0.1 (unsafe)**.
-- Log in with `admin@sentinel.local` and the password from Part 6.
+- Log in with the Administrator email you gave the installer and the password from Part 6.
+  Lost it? On the host: `sudo docker exec -it sentinel-controlplane-1 controllerd reset-admin`.
 
 > ### ⚠️ That password cannot be changed. Record it now.
 >

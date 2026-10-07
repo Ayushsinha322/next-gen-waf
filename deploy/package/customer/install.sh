@@ -934,6 +934,10 @@ SENTINEL_ALLOW_SUPERUSER_DB=1
 # path needs the SMTP block below to be filled in. Until it is, THIS value is
 # still the only way in — so back this file up either way.
 SENTINEL_BOOTSTRAP_ADMIN_PASSWORD=$(gen)
+# The console login that password belongs to — the administrator email above.
+# Read only when the first account is created; a lost password is reset with
+#   docker exec -it sentinel-controlplane-1 controllerd reset-admin
+SENTINEL_BOOTSTRAP_ADMIN_EMAIL=$ADMIN_EMAIL
 
 SENTINEL_CLICKHOUSE_EVENT_RETENTION_DAYS=90
 SENTINEL_CLICKHOUSE_TRAFFIC_RETENTION_DAYS=30
@@ -1212,6 +1216,10 @@ hc "Console :9443 on $CONSOLE_PROBE_HOST" bash -c 'curl -sk --max-time 5 -o /dev
 # this change, where the .env has no bootstrap value and the log is genuinely
 # the only copy.
 ADMIN_PW=$(sed -n 's/^SENTINEL_BOOTSTRAP_ADMIN_PASSWORD=//p' "$ENV_FILE" 2>/dev/null | head -1)
+# The login that password belongs to. A .env from before the login was
+# configurable (kept by --force) means the account was made with the old fixed one.
+ADMIN_LOGIN=$(sed -n 's/^SENTINEL_BOOTSTRAP_ADMIN_EMAIL=//p' "$ENV_FILE" 2>/dev/null | head -1)
+ADMIN_LOGIN=${ADMIN_LOGIN:-admin@sentinel.local}
 if [[ ! "$ADMIN_PW" =~ ^[0-9a-f]{64}$ ]]; then
   ADMIN_PW=$(docker logs sentinel-controlplane-1 2>&1 \
     | grep -A1 'GENERATED password' | tail -1 \
@@ -1278,7 +1286,7 @@ cat <<FINAL
 
     Version        Swaraj Kavach v$BUNDLE_VERSION
     Host tier      $TIER (${VCPU} vCPU, ${RAM_GB} GB RAM, ${DISK_GB} GB free)
-    Username       admin@sentinel.local
+    Username       ${ADMIN_LOGIN}
     Password       ${B}${ADMIN_PW:-NOT CAPTURED — recover it with the command below}${R}
 
   ${YEL}${B}WRITE THIS PASSWORD DOWN NOW and sign in with it once.${R}
@@ -1287,7 +1295,7 @@ cat <<FINAL
     Recover it        sudo grep SENTINEL_BOOTSTRAP_ADMIN_PASSWORD $ENV_FILE
     Change it         console → account menu → Change password
     Reset by email    available once the SMTP block in $ENV_FILE is filled in
-  ${DIM}Lose that file without a backup, with no SMTP configured, and there is no way back in.${R}
+    Reset on the host sudo docker exec -it sentinel-controlplane-1 controllerd reset-admin
 
   ${B}Reaching the console${R}
 

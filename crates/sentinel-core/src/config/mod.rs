@@ -1503,8 +1503,23 @@ impl ConfigLoader {
 
     /// Reload config from the file on disk and atomically swap it in.
     pub fn reload(&self) -> anyhow::Result<()> {
-        let cfg = read_config_file(&self.path)?;
+        let mut cfg = read_config_file(&self.path)?;
+        // The file declares only its own sites. Storing it as the whole config
+        // dropped every site the control plane had delivered — and they stayed
+        // down until the next console edit, because the sync applies a version
+        // only when it changes. They are kept, and `reload_count` tells the
+        // sync to re-apply on its next poll.
+        let current = self.handle.load_full();
+        cfg.sites.retain(|s| s.origin == SiteOrigin::File);
+        cfg.sites.extend(
+            current
+                .sites
+                .iter()
+                .filter(|s| s.origin == SiteOrigin::ControlPlane)
+                .cloned(),
+        );
         self.handle.store(Arc::new(cfg));
+        RELOADS.fetch_add(1, std::sync::atomic::Ordering::Release);
         info!(path = %self.path.display(), "configuration reloaded");
         Ok(())
     }
@@ -1563,6 +1578,14 @@ impl ConfigLoader {
 // ---------------------------------------------------------------------------
 // Live site update — called by the control-plane polling task
 // ---------------------------------------------------------------------------
+
+static RELOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many times the config file has been reloaded (SIGHUP). The control-plane
+/// sync re-applies its sites when this moves, whether or not their version has.
+pub fn reload_count() -> u64 {
+    RELOADS.load(std::sync::atomic::Ordering::Acquire)
+}
 
 /// Merge sites received from the control plane into the live config.
 ///
@@ -1775,6 +1798,58 @@ tls:
         std::fs::write(&path, with_node("after")).unwrap();
         assert!(loader.reload_contained());
         assert_eq!(loader.handle().load().cluster.node_id, "after");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod sighup_reload_tests {
+    use super::*;
+
+    /// SIGHUP stored the file's config as the whole config, so every site the
+    /// control plane had delivered went down — and stayed down until the next
+    /// console edit, because the sync applies a version only when it changes.
+    #[test]
+    fn a_reload_keeps_the_control_planes_sites_and_asks_for_a_resync() {
+        let dir = std::env::temp_dir().join(format!(
+            "sk-sighup-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        let file_site = |node: &str| {
+            let mut cfg = SentinelConfig::default();
+            cfg.cluster.node_id = node.to_string();
+            cfg.sites.push(
+                serde_yaml::from_str(
+                    "id: file-site\ndomains: [\"file.example\"]\nupstream:\n  servers:\n    - { host: \"127.0.0.1\", port: 8080 }\n",
+                )
+                .unwrap(),
+            );
+            serde_yaml::to_string(&cfg).unwrap()
+        };
+        std::fs::write(&path, file_site("before")).unwrap();
+        let loader = ConfigLoader::from_file(&path).unwrap();
+
+        let synced: SiteConfig = serde_yaml::from_str(
+            "id: console-site\ndomains: [\"shop.example\"]\nupstream:\n  servers:\n    - { host: \"10.0.0.5\", port: 8080 }\n",
+        )
+        .unwrap();
+        update_sites(&loader.handle(), vec![synced]);
+
+        std::fs::write(&path, file_site("after")).unwrap();
+        let before = reload_count();
+        assert!(loader.reload_contained());
+        let cfg = loader.handle().load_full();
+        assert_eq!(cfg.cluster.node_id, "after", "the file's settings apply");
+        let ids: Vec<&str> = cfg.sites.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(&"file-site"), "{ids:?}");
+        assert!(
+            ids.contains(&"console-site"),
+            "a SIGHUP took the control plane's sites down: {ids:?}"
+        );
+        assert!(reload_count() > before, "the sync is not told to re-apply");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

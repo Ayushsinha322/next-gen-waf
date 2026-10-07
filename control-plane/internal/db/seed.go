@@ -8,8 +8,6 @@ import (
 	"fmt"
 	"os"
 	"strings"
-
-	"golang.org/x/crypto/argon2"
 )
 
 // seedAdminPassword decides the initial admin password. Precedence:
@@ -40,7 +38,32 @@ const (
 
 	// DemoFixturesEnvVar must be "1" to insert fabricated demo content.
 	DemoFixturesEnvVar = "SENTINEL_DEV_SEED"
+
+	// BootstrapAdminEmailEnvVar is the console login the first administrator is
+	// created with. install.sh writes the "Administrator email" it asks for
+	// here, beside SENTINEL_BOOTSTRAP_ADMIN_PASSWORD; like the password it is
+	// read only when that account is created.
+	//
+	// Deliberately not SENTINEL_ADMIN_EMAIL, which every install has carried
+	// since the first installer as the security contact while the login stayed
+	// DefaultAdminEmail. Keying the login on it would make that value mean the
+	// login on new installs and not on upgraded ones, and nothing reading the
+	// .env could tell which.
+	BootstrapAdminEmailEnvVar = "SENTINEL_BOOTSTRAP_ADMIN_EMAIL"
+
+	// DefaultAdminEmail is the bootstrap login when none is configured, and the
+	// login of every installation made before one could be.
+	DefaultAdminEmail = "admin@sentinel.local"
 )
+
+// BootstrapAdminEmail is the login the bootstrap administrator is created
+// with, and the account `controllerd reset-admin` resets when not told which.
+func BootstrapAdminEmail() string {
+	if e := strings.TrimSpace(os.Getenv(BootstrapAdminEmailEnvVar)); e != "" {
+		return e
+	}
+	return DefaultAdminEmail
+}
 
 // DemoFixturesEnabled reports whether the operator explicitly asked for
 // fabricated demo content (sample sites, sample rules, invented alerts).
@@ -58,8 +81,9 @@ func DemoFixturesEnabled() bool {
 	return os.Getenv(DemoFixturesEnvVar) == "1"
 }
 
-// SeedDev bootstraps the default tenant and admin user, which every deployment
-// needs in order to log in at all. Safe to call on every startup (idempotent).
+// SeedDev bootstraps the default tenant and, while the tenant has no users at
+// all, its first administrator — which a fresh deployment needs in order to log
+// in at all. Safe to call on every startup.
 //
 // Fabricated demo content (sample sites, sample rules, sample alerts) is only
 // inserted when DemoFixturesEnabled() — see its doc comment.
@@ -94,30 +118,39 @@ func SeedDev(ctx context.Context, pool Pool) error {
 	}
 
 	// ── Admin user ───────────────────────────────────────────────────────────
+	// Only into a tenant with no users at all. This was `ON CONFLICT (id) DO
+	// NOTHING` on every boot, which re-created a deliberately deleted default
+	// admin on the next restart — with the bootstrap password still sitting in
+	// .env. Any user means the deployment has been taken over by its operators,
+	// and from then on accounts are theirs to manage; `controllerd reset-admin`
+	// is the way back in for a lost one. ON CONFLICT stays for two control
+	// planes booting together against an empty table.
 	adminPw, generatedPw := seedAdminPassword()
-	salt := make([]byte, 16)
-	if _, err := rand.Read(salt); err != nil {
-		return fmt.Errorf("seed: salt: %w", err)
+	adminEmail := BootstrapAdminEmail()
+	pwdHash, err := hashPassword(adminPw)
+	if err != nil {
+		return fmt.Errorf("seed: %w", err)
 	}
-	hash := argon2.IDKey([]byte(adminPw), salt, 1, 64*1024, 4, 32)
-	pwdHash := fmt.Sprintf("argon2id$%s$%s", hex.EncodeToString(salt), hex.EncodeToString(hash))
 
 	ct, err := tx.Exec(ctx, `
 		INSERT INTO users (id, tenant_id, email, name, password_hash, role, status)
-		VALUES ($1, $2, 'admin@sentinel.local', 'Admin User', $3, 'admin', 'active')
-		ON CONFLICT (id) DO NOTHING`,
-		DevAdminID, DevTenantID, pwdHash)
+		SELECT $1, $2, $3, 'Admin User', $4, 'admin', 'active'
+		WHERE NOT EXISTS (SELECT 1 FROM users WHERE tenant_id = $2)
+		ON CONFLICT DO NOTHING`,
+		DevAdminID, DevTenantID, adminEmail, pwdHash)
 	if err != nil {
 		return fmt.Errorf("seed: admin user: %w", err)
 	}
-	// If we generated the password AND actually created the row (didn't hit the
-	// ON CONFLICT no-op), surface it once so the operator can log in and rotate.
+	// If we generated the password AND actually created the row, surface it
+	// once so the operator can log in and rotate. install.sh scrapes the line
+	// after "GENERATED password" for installs predating its own .env value, so
+	// that two-line shape is load-bearing.
 	if generatedPw && ct.RowsAffected() > 0 {
 		fmt.Fprintf(os.Stderr,
-			"\n[sentinel] Seeded initial admin 'admin@sentinel.local' with a GENERATED password:\n"+
+			"\n[sentinel] Seeded initial admin '%s' with a GENERATED password:\n"+
 				"[sentinel]     %s\n"+
 				"[sentinel] Log in and change it immediately. Set SENTINEL_BOOTSTRAP_ADMIN_PASSWORD to control it.\n\n",
-			adminPw)
+			adminEmail, adminPw)
 	}
 
 	// Everything below this point is FABRICATED demo content, not configuration a
@@ -235,9 +268,11 @@ func SeedDev(ctx context.Context, pool Pool) error {
 }`, 1},
 	}
 	for _, r := range rules {
+		// created_by through a lookup: the bootstrap admin is no longer
+		// re-created once deleted, and a dangling id fails the foreign key.
 		_, err = tx.Exec(ctx, `
 			INSERT INTO rules (tenant_id, name, source, phase, severity, dsl, enabled, created_by)
-			VALUES ($1, $2, $3, $4, $5, $6, true, $7)
+			VALUES ($1, $2, $3, $4, $5, $6, true, (SELECT id FROM users WHERE id = $7::uuid))
 			ON CONFLICT (tenant_id, name) DO NOTHING`,
 			DevTenantID, r.name, r.source, r.phase, r.severity, r.dsl, DevAdminID)
 		if err != nil {

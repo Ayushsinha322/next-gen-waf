@@ -273,7 +273,7 @@ It ends with:
   Installation successful
 
     Version        Swaraj Kavach v1.0.2
-    Username       admin@sentinel.local
+    Username       <the Administrator email you gave the installer>
     Password       c7b1206837eea6deb3d530afe57b8057…
 ```
 
@@ -328,7 +328,8 @@ Leave that open, then browse to **https://127.0.0.1:9443**
 
 - Expect a **certificate warning** — the WAF issued its own certificate.
   Advanced → Proceed.
-- Log in as `admin@sentinel.local` with the password from §3.4.
+- Log in with the Administrator email you gave the installer and the password from §3.4.
+  Lost it? On the host: `sudo docker exec -it sentinel-controlplane-1 controllerd reset-admin`.
 - A **500** on the very first load is usually a cached error from while the console
   was still starting: hard-reload (`Ctrl+Shift+R`) or use a private window.
 
