@@ -2,7 +2,7 @@
 ///
 /// Checks every hour; renews any cert whose expiry is within `renew_before_days`
 /// (default 30) days.  Runs as a detached tokio task started once at proxy boot.
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,7 +11,39 @@ use sentinel_core::config::{ConfigHandle, SiteAcmeConfig, SiteConfig, TlsCertMod
 use super::acme::CertManager;
 use super::cert_store::CertStore;
 
-const CHECK_INTERVAL: Duration = Duration::from_secs(3_600); // 1 hour
+/// How often the loop looks at every ACME site. Cheap: a lookup per name.
+const CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// When to try again after `failures` failed orders in a row: 2, 5 and 15
+/// minutes, then hourly. A failed first order (DNS not moved yet, port 80 not
+/// forwarded) used to wait for the next hourly pass — up to an hour of the
+/// self-signed certificate on a just-cut-over public domain — and every retry
+/// after that waited an hour too.
+pub(crate) fn retry_delay(failures: u32) -> Duration {
+    const STEPS: [u64; 3] = [120, 300, 900];
+    Duration::from_secs(
+        STEPS
+            .get(failures.saturating_sub(1) as usize)
+            .copied()
+            .unwrap_or(3_600),
+    )
+}
+
+/// Whether every name already has an issued certificate (ACME or uploaded)
+/// that is not due for renewal. Ordering again would only spend the CA's
+/// duplicate-certificate allowance (Let's Encrypt: 5 per name set per week).
+pub(crate) fn names_already_covered(
+    store: &CertStore,
+    names: &[String],
+    renew_before_days: u32,
+) -> bool {
+    !names.is_empty()
+        && names.iter().all(|d| {
+            store
+                .get_meta(d)
+                .is_some_and(|m| !m.needs_renewal(renew_before_days))
+        })
+}
 
 /// Reserved / private-use suffixes that no public CA will ever issue for.
 ///
@@ -107,10 +139,13 @@ pub async fn renewal_loop(cert_manager: Arc<CertManager>, config_handle: ConfigH
     // Sites already reported as having nothing issuable. Without this the
     // "skipping" line would repeat hourly and become the same noise it replaces.
     let mut reported_ineligible: HashSet<String> = HashSet::new();
+    // Site id → (failed orders in a row, not before). Cleared on success.
+    let mut backoff: HashMap<String, (u32, tokio::time::Instant)> = HashMap::new();
 
     loop {
         tokio::time::sleep(CHECK_INTERVAL).await;
         let cfg = config_handle.load();
+        let now = tokio::time::Instant::now();
 
         for site in &cfg.sites {
             let acme_cfg = match &site.tls.acme {
@@ -151,7 +186,15 @@ pub async fn renewal_loop(cert_manager: Arc<CertManager>, config_handle: ConfigH
                     Some(m) => m,
                     None => {
                         tracing::info!(domain, "no cert found — triggering initial issuance");
-                        trigger_issuance(&cert_manager, orderable.clone(), acme_cfg).await;
+                        order_with_backoff(
+                            &cert_manager,
+                            &mut backoff,
+                            &site.id,
+                            now,
+                            orderable.clone(),
+                            acme_cfg,
+                        )
+                        .await;
                         break; // domains share one order; break inner loop
                     }
                 };
@@ -162,7 +205,15 @@ pub async fn renewal_loop(cert_manager: Arc<CertManager>, config_handle: ConfigH
                         days_remaining = meta.days_until_expiry(),
                         "cert nearing expiry — renewing"
                     );
-                    trigger_issuance(&cert_manager, orderable.clone(), acme_cfg).await;
+                    order_with_backoff(
+                        &cert_manager,
+                        &mut backoff,
+                        &site.id,
+                        now,
+                        orderable.clone(),
+                        acme_cfg,
+                    )
+                    .await;
                     break;
                 }
             }
@@ -170,15 +221,36 @@ pub async fn renewal_loop(cert_manager: Arc<CertManager>, config_handle: ConfigH
     }
 }
 
-async fn trigger_issuance(
+/// Order `domains` unless the site is still backing off from a failure; record
+/// the outcome so the next attempt follows `retry_delay`.
+async fn order_with_backoff(
     cert_manager: &Arc<CertManager>,
+    backoff: &mut HashMap<String, (u32, tokio::time::Instant)>,
+    site: &str,
+    now: tokio::time::Instant,
     domains: Vec<String>,
     config: &SiteAcmeConfig,
 ) {
+    if backoff
+        .get(site)
+        .is_some_and(|(_, not_before)| now < *not_before)
+    {
+        return;
+    }
     match cert_manager.issue_acme(domains.clone(), config).await {
-        Ok(()) => {}
+        Ok(()) => {
+            backoff.remove(site);
+        }
         Err(e) => {
-            tracing::error!(?domains, "ACME renewal failed: {e:#}");
+            let failures = backoff.get(site).map_or(0, |(n, _)| *n) + 1;
+            let wait = retry_delay(failures);
+            tracing::error!(
+                ?domains,
+                failures,
+                retry_in_secs = wait.as_secs(),
+                "ACME order failed: {e:#}"
+            );
+            backoff.insert(site.to_string(), (failures, now + wait));
         }
     }
 }
@@ -186,6 +258,66 @@ async fn trigger_issuance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_order_is_retried_within_minutes_then_hourly() {
+        let secs: Vec<u64> = (1..=5).map(|n| retry_delay(n).as_secs()).collect();
+        assert_eq!(secs, vec![120, 300, 900, 3_600, 3_600]);
+    }
+
+    #[test]
+    fn a_site_whose_names_all_hold_a_valid_issued_cert_is_not_ordered_again() {
+        use super::super::cert_store::{CertMeta, CertSource};
+        let dir = std::env::temp_dir().join(format!("sk-acme-cover-{}", std::process::id()));
+        let store = CertStore::new(dir);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let install = |name: &str, days_left: u64| {
+            let c = rcgen::generate_simple_self_signed(vec![name.to_string()]).unwrap();
+            let meta = CertMeta {
+                domain: name.into(),
+                name: String::new(),
+                san: vec![name.into()],
+                issued_at: now,
+                expires_at: now + days_left * 86_400,
+                fingerprint: format!("fp-{name}"),
+                source: CertSource::Acme {
+                    provider: "LetsEncrypt".into(),
+                    email: "ops@example.in".into(),
+                },
+                issuer: String::new(),
+                key_type: String::new(),
+            };
+            store
+                .install(
+                    name,
+                    &c.serialize_pem().unwrap(),
+                    &c.serialize_private_key_pem(),
+                    meta,
+                )
+                .unwrap();
+        };
+        install("shop.example.in", 60);
+        install("old.example.in", 10);
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(names_already_covered(
+            &store,
+            &names(&["shop.example.in"]),
+            30
+        ));
+        assert!(!names_already_covered(
+            &store,
+            &names(&["shop.example.in", "new.example.in"]),
+            30
+        ));
+        assert!(
+            !names_already_covered(&store, &names(&["old.example.in"]), 30),
+            "due for renewal"
+        );
+        assert!(!names_already_covered(&store, &[], 30));
+    }
 
     #[test]
     fn ip_addresses_and_internal_aliases_are_not_ordered() {

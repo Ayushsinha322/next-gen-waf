@@ -22,6 +22,8 @@
 //! Phase 6: logging + correlation state update
 //! ```
 
+#[cfg(test)]
+mod acme_alpn_test;
 pub mod captcha;
 pub mod challenge;
 mod cp_client;
@@ -2585,10 +2587,7 @@ async fn serve_listener(
                 None
             };
 
-            let mut server_cfg = ServerConfig::builder()
-                .with_no_client_auth()
-                .with_cert_resolver(resolver);
-            server_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            let server_cfg = sni_listener_tls_config(resolver);
             (Some(TlsAcceptor::from(Arc::new(server_cfg))), quic)
         }
     } else {
@@ -2854,6 +2853,11 @@ async fn handle_connection(
             .context("TLS handshake timed out")?
             .context("TLS handshake failed")?;
         let negotiated = tls.get_ref().1.alpn_protocol().map(|p| p.to_vec());
+        if negotiated.as_deref() == Some(ACME_TLS_ALPN) {
+            // A TLS-ALPN-01 validation: the CA only inspects the certificate
+            // the handshake presented. Never HTTP — close it.
+            return Ok(());
+        }
         let io = TokioIo::new(tls);
         if negotiated.as_deref() == Some(b"h2") {
             serve_http2(io, peer, state, default_site, management, alt_svc, tls_fp).await
@@ -7433,6 +7437,24 @@ fn internal_auth_ok(headers: &http::HeaderMap) -> bool {
     }
 }
 
+/// ALPN protocol id of a TLS-ALPN-01 validation (RFC 8737).
+const ACME_TLS_ALPN: &[u8] = b"acme-tls/1";
+
+/// TLS config of the public SNI listener.
+///
+/// `acme-tls/1` was missing from the list, so a CA's validation handshake —
+/// which offers nothing else — failed ALPN negotiation before the resolver
+/// could present the challenge cert, and TLS-ALPN-01 could never succeed. It is
+/// listed last: rustls picks by the server's order, so no client that offers
+/// h2 or http/1.1 ever negotiates it.
+fn sni_listener_tls_config(resolver: Arc<dyn rustls::server::ResolvesServerCert>) -> ServerConfig {
+    let mut cfg = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), ACME_TLS_ALPN.to_vec()];
+    cfg
+}
+
 // Wildcard host matching indexes the domain by byte offset after a "*." check;
 // keep the explicit slicing rather than strip_prefix — it is security-sensitive
 // and the manual form is unambiguous.
@@ -8388,6 +8410,29 @@ async fn handle_internal_cert_api(
             (r.domains, cfg)
         };
 
+        // Only names a public CA can issue for: an IP or a single-label alias in
+        // the list made the whole order fail. The boot path already filtered;
+        // the console's orders did not.
+        let domains = tls::renewal::acme_domains(&domains);
+        if domains.is_empty() {
+            return json_err(
+                StatusCode::BAD_REQUEST,
+                "none of these names can get a public certificate (IP addresses, single-label and internal names are left out)",
+            );
+        }
+        // Every console save of an ACME site requested a certificate, and each
+        // was a new production order: ordinary tuning used up Let's Encrypt's
+        // 5-per-week duplicate allowance, so a re-issue that was really needed
+        // then failed for days. Renew still orders unconditionally.
+        if !path.ends_with("/renew")
+            && tls::renewal::names_already_covered(
+                &state.cert_manager.store,
+                &domains,
+                acme_cfg.renew_before_days,
+            )
+        {
+            return json_ok(serde_json::json!({"issued": [], "already_covered": domains}));
+        }
         return match state
             .cert_manager
             .issue_acme(domains.clone(), &acme_cfg)

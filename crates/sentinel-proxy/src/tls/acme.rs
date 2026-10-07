@@ -109,6 +109,7 @@ impl CertManager {
         cert_pem: &str,
         key_pem: &str,
     ) -> Result<()> {
+        check_upload(domain, cert_pem, key_pem)?;
         let expires_at = parse_expiry(cert_pem).unwrap_or(unix_now() + 90 * 86_400);
         let meta = CertMeta {
             domain: domain.to_string(),
@@ -123,6 +124,40 @@ impl CertManager {
         };
         self.store.install(domain, cert_pem, key_pem, meta)
     }
+}
+
+/// Refuse an upload that could never serve `domain` correctly, before anything
+/// is written: a private key that does not belong to the certificate (every
+/// handshake fails), a certificate that does not name `domain` (every browser
+/// warns), or one already expired. These were all accepted and served.
+/// Internal keys (`__…`) and the bare-IP `default` cert are not hostnames.
+pub(crate) fn check_upload(domain: &str, cert_pem: &str, key_pem: &str) -> Result<()> {
+    let ck = super::cert_store::load_pem_bytes(cert_pem.as_bytes(), key_pem.as_bytes())
+        .context("the certificate and key could not be loaded")?;
+    ck.keys_match()
+        .map_err(|_| anyhow::anyhow!("the private key does not belong to this certificate"))?;
+    let leaf = ck
+        .end_entity_cert()
+        .map_err(|_| anyhow::anyhow!("the upload contains no certificate"))?;
+    if !domain.starts_with("__") && domain != "default" {
+        let names = super::cert_store::leaf_dns_names(leaf)?;
+        if !super::cert_store::names_cover(&names, domain) {
+            anyhow::bail!(
+                "the certificate does not cover {domain}; it names: {}",
+                if names.is_empty() {
+                    "no DNS names".to_string()
+                } else {
+                    names.join(", ")
+                }
+            );
+        }
+    }
+    if let Some(not_after) = der_not_after(leaf.as_ref()) {
+        if not_after <= unix_now() {
+            anyhow::bail!("the certificate has expired");
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -713,7 +748,7 @@ fn parse_expiry(cert_pem: &str) -> Option<u64> {
 
 /// Minimal ASN.1 DER walk to extract the certificate's notAfter time.
 /// Returns a UNIX timestamp; conservative — returns None on anything unexpected.
-fn der_not_after(der: &[u8]) -> Option<u64> {
+pub(super) fn der_not_after(der: &[u8]) -> Option<u64> {
     // Certificate ::= SEQUENCE { tbsCertificate SEQUENCE { ... validity SEQUENCE {..} } }
     let cert_inner = der_seq_content(der, 0)?;
     let tbs_inner = der_seq_content(cert_inner, 0)?;

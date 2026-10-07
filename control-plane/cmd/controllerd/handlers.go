@@ -1695,6 +1695,7 @@ func buildRustSiteTLS(raw json.RawMessage) map[string]any {
 			Provider    string `json:"provider"`
 			CaServer    string `json:"ca_server"`
 			Challenge   string `json:"challenge"`
+			Staging     bool   `json:"staging"`
 			RenewBefore uint32 `json:"renew_before_days"`
 			Custom      *struct {
 				Priority string `json:"priority"`
@@ -1713,6 +1714,11 @@ func buildRustSiteTLS(raw json.RawMessage) map[string]any {
 			return off // ACME needs a contact email; nothing to do without one
 		}
 		acme := map[string]any{"email": t.Email}
+		// The console's "staging" switch was read by nothing, so a test site's
+		// orders went to the production CA and spent its rate limits.
+		if t.Staging && (t.Provider == "" || rustAcmeProvider(t.Provider) == "lets_encrypt") {
+			t.Provider = "letsencrypt_staging"
+		}
 		if prov := rustAcmeProvider(t.Provider); prov != "" {
 			acme["provider"] = prov
 		}
