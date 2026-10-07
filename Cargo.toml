@@ -62,6 +62,8 @@ tonic = "0.12"
 # Observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# Off-thread, lossy stdout for the data plane's log lines; see sentinel-bin.
+tracing-appender = "0.2"
 opentelemetry = "0.24"
 opentelemetry_sdk = "0.24"
 opentelemetry-otlp = "0.17"

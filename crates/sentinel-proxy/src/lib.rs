@@ -2013,6 +2013,10 @@ impl ProxyServer {
                     "threat-intel poller started"
                 );
                 let mut last_version: i64 = i64::MIN;
+                // Addresses this loop put into XDP that were not blocked
+                // before, so a withdrawn indicator can be taken out again.
+                let mut ti_seeded: std::collections::HashSet<std::net::IpAddr> =
+                    std::collections::HashSet::new();
                 let mut ticker = tokio::time::interval(Duration::from_secs(secs));
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
@@ -2058,11 +2062,14 @@ impl ProxyServer {
                         if seed_ti_xdp {
                             const CAP: usize = 60_000;
                             let mut n = 0usize;
-                            for ip_s in sync.block.ips.iter().take(CAP) {
-                                if let Ok(ip) = ip_s.parse::<std::net::IpAddr>() {
-                                    ti_ebpf.block_ip(ip);
-                                    n += 1;
-                                }
+                            let (seeded, withdrawn) =
+                                reseed_ti_xdp_ips(&ti_ebpf, &mut ti_seeded, &sync.block.ips, CAP);
+                            n += seeded;
+                            if withdrawn > 0 {
+                                info!(
+                                    removed = withdrawn,
+                                    "removed withdrawn threat-intel addresses from the eBPF/XDP blocklist"
+                                );
                             }
                             for cidr in sync.block.cidrs.iter().take(CAP.saturating_sub(n)) {
                                 if let Some(net) = parse_block_cidr(cidr) {
@@ -3543,6 +3550,7 @@ async fn proxy_inner(
                 .get(http::header::HOST)
                 .and_then(|v| v.to_str().ok())
                 .or_else(|| req.uri().authority().map(|a| a.as_str()));
+            let host = host.filter(|h| !is_own_site_host(&cfg.sites, h));
             match ti.check(ctx.client_ip, ua, host, req.uri().path()) {
                 ThreatVerdict::Block { reason } => {
                     ctx.threat_intel_hit = true;
@@ -6693,6 +6701,41 @@ fn autoban_config() -> AutoBanConfig {
 
 /// IPs already pushed to the eBPF blocklist by the auto-ban, so we ban + log
 /// each offender once instead of on every subsequent block.
+/// Mirror the threat-intel block tier's addresses into XDP, and take out the ones
+/// the feed no longer lists. Returns (addresses in the tier, addresses removed).
+///
+/// Seeding was insert-only: an indicator deleted or expired in the console
+/// stayed dropped in-kernel until the node restarted. Only addresses this
+/// mirror added itself (`seeded`) are ever removed — never one that was already
+/// blocked when it was seeded, nor one an auto-ban has claimed since.
+fn reseed_ti_xdp_ips(
+    ebpf: &EbpfManager,
+    seeded: &mut std::collections::HashSet<std::net::IpAddr>,
+    block_ips: &[String],
+    cap: usize,
+) -> (usize, usize) {
+    let mut current = std::collections::HashSet::new();
+    for ip in block_ips
+        .iter()
+        .take(cap)
+        .filter_map(|s| s.parse::<std::net::IpAddr>().ok())
+    {
+        current.insert(ip);
+        if !ebpf.is_blocked(ip) {
+            ebpf.block_ip(ip);
+            seeded.insert(ip);
+        }
+    }
+    let withdrawn: Vec<std::net::IpAddr> = seeded.difference(&current).copied().collect();
+    for ip in &withdrawn {
+        seeded.remove(ip);
+        if !xdp_autobanned().contains(ip) {
+            ebpf.unblock_ip(*ip);
+        }
+    }
+    (current.len(), withdrawn.len())
+}
+
 fn xdp_autobanned() -> &'static DashSet<std::net::IpAddr> {
     static SET: std::sync::OnceLock<DashSet<std::net::IpAddr>> = std::sync::OnceLock::new();
     SET.get_or_init(DashSet::new)
@@ -7405,6 +7448,25 @@ fn site_matches(site: &SiteConfig, host: &str) -> bool {
             d_lc == host_lc
         }
     })
+}
+
+/// Whether `host` (a Host header or authority, port allowed) is one of the
+/// protected sites' own domains.
+///
+/// Threat-intel domain indicators come from URLhaus URLs reduced to their host,
+/// and were matched against the request's Host. A customer whose own domain was
+/// ever listed — typically a site compromised once, the usual WAF buyer — had
+/// every request to it blocked as a "malicious domain", in learning mode too.
+/// The protected site is not an indicator of compromise for requests to it.
+fn is_own_site_host(sites: &[SiteConfig], host: &str) -> bool {
+    let name = host.rsplit_once(':').map_or(host, |(h, port)| {
+        if port.chars().all(|c| c.is_ascii_digit()) && !h.ends_with(':') {
+            h
+        } else {
+            host
+        }
+    });
+    sites.iter().any(|s| site_matches(s, name))
 }
 
 fn build_upstream_uri(host: &str, port: u16, tls: bool, original: &Uri) -> anyhow::Result<Uri> {
@@ -9170,6 +9232,21 @@ fn capped_path(uri: &http::Uri) -> String {
     cap_field(uri.path(), 1024)
 }
 
+/// The request target for the stdout log lines: access.log's `path` and
+/// `query`, rejoined, so it is redacted and capped exactly as they are.
+///
+/// The per-request `request` line printed `ctx.uri` whole. A `?token=` that
+/// access.log recorded as `[redacted]` went verbatim to stdout, and from there
+/// into `docker logs` and whatever collects the container output.
+fn logged_uri(uri: &http::Uri) -> String {
+    let query = capped_query(uri);
+    if query.is_empty() {
+        capped_path(uri)
+    } else {
+        format!("{}?{query}", capped_path(uri))
+    }
+}
+
 /// The matched text of a rule hit, for logging.
 ///
 /// The primary credential guard is in the rule VM, which redacts by consulting
@@ -9935,7 +10012,7 @@ fn log_request(ctx: &RequestContext) {
     tracing::info!(
         request_id = %ctx.request_id,
         method = %ctx.method,
-        uri = %ctx.uri,
+        uri = %logged_uri(&ctx.uri),
         client_ip = %ctx.client_ip,
         site = ctx.site_id.as_deref().unwrap_or("-"),
         status,
@@ -13170,6 +13247,28 @@ mod log_explain_tests {
     }
 
     #[test]
+    fn the_stdout_request_line_redacts_the_query_as_access_log_does() {
+        // Proven live on 1.1.14: `?token=` reached `docker logs` verbatim while
+        // access.log recorded `token=[redacted]`.
+        let uri: http::Uri = "/rest/search?q=apple&token=zzprobeDUMMY0042"
+            .parse()
+            .unwrap();
+        let line = logged_uri(&uri);
+        assert!(
+            !line.contains("zzprobeDUMMY0042"),
+            "secret reached stdout: {line}"
+        );
+        assert_eq!(
+            line,
+            format!("{}?{}", capped_path(&uri), capped_query(&uri))
+        );
+        assert!(line.starts_with("/rest/search?q=apple"), "got {line}");
+
+        let bare: http::Uri = "/rest/search".parse().unwrap();
+        assert_eq!(logged_uri(&bare), "/rest/search");
+    }
+
+    #[test]
     fn target_is_rendered_in_english() {
         assert_eq!(humanize_target("ARGS:id"), "parameter 'id'");
         assert_eq!(
@@ -13302,6 +13401,79 @@ mod inline_rule_diag_tests {
 
     fn guard() -> std::sync::MutexGuard<'static, ()> {
         DIAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn a_protected_sites_own_domain_is_never_a_threat_intel_domain_indicator() {
+        let mut s = site_with(vec![]);
+        s.domains = vec!["shop.example.in".into(), "*.cdn.example.in".into()];
+        let sites = vec![s];
+        for own in [
+            "shop.example.in",
+            "SHOP.example.in:443",
+            "img.cdn.example.in",
+            "cdn.example.in:8443",
+        ] {
+            assert!(
+                is_own_site_host(&sites, own),
+                "{own} is the site's own domain"
+            );
+        }
+        for other in ["evil.example", "shop.example.in.evil.example", "example.in"] {
+            assert!(!is_own_site_host(&sites, other), "{other} is not");
+        }
+
+        // The check as the pipeline makes it: a feed listing the site's own
+        // domain must not block requests to it; a listed foreign domain still does.
+        use sentinel_modules::threat_intel::{RawTier, ThreatFeed};
+        let block = RawTier {
+            domains: vec!["shop.example.in".into(), "evil.example".into()],
+            ..Default::default()
+        };
+        let feed = ThreatFeed::from_parts(1, 3, block, RawTier::default());
+        let ip: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+        // 1.1.16 passed the Host through unfiltered, and this blocked the site.
+        assert!(matches!(
+            feed.check(ip, None, Some("shop.example.in"), "/"),
+            ThreatVerdict::Block { .. }
+        ));
+        let own = Some("shop.example.in").filter(|h| !is_own_site_host(&sites, h));
+        assert!(matches!(
+            feed.check(ip, None, own, "/"),
+            ThreatVerdict::None
+        ));
+        let foreign = Some("evil.example").filter(|h| !is_own_site_host(&sites, h));
+        assert!(matches!(
+            feed.check(ip, None, foreign, "/"),
+            ThreatVerdict::Block { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_withdrawn_threat_intel_address_leaves_xdp_but_other_blocks_stay() {
+        let ebpf = EbpfManager::new(sentinel_ebpf::EbpfConfig::default())
+            .await
+            .unwrap();
+        let (a, b, c): (std::net::IpAddr, std::net::IpAddr, std::net::IpAddr) = (
+            "203.0.113.10".parse().unwrap(),
+            "203.0.113.11".parse().unwrap(),
+            "203.0.113.12".parse().unwrap(),
+        );
+        // c was blocked for another reason before the feed listed it.
+        ebpf.block_ip(c);
+        let mut seeded = std::collections::HashSet::new();
+        let feed = |ips: &[std::net::IpAddr]| ips.iter().map(|i| i.to_string()).collect::<Vec<_>>();
+
+        reseed_ti_xdp_ips(&ebpf, &mut seeded, &feed(&[a, b, c]), 100);
+        assert!(ebpf.is_blocked(a) && ebpf.is_blocked(b) && ebpf.is_blocked(c));
+
+        // b and c deleted from the feed: b leaves XDP; c stays, the feed never
+        // owned it. Under 1.1.16's insert-only seeding b stayed until restart.
+        let (_, removed) = reseed_ti_xdp_ips(&ebpf, &mut seeded, &feed(&[a]), 100);
+        assert_eq!(removed, 1);
+        assert!(ebpf.is_blocked(a));
+        assert!(!ebpf.is_blocked(b), "a withdrawn indicator must leave XDP");
+        assert!(ebpf.is_blocked(c), "a block the feed did not add must stay");
     }
 
     fn site_with(inline: Vec<InlineRule>) -> SiteConfig {
