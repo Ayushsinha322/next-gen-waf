@@ -1,8 +1,11 @@
 package main
 
 import (
+	"hash/fnv"
+	"math"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"time"
 
@@ -76,6 +79,31 @@ func blockConfidenceThreshold() int {
 	return defaultBlockConfidence
 }
 
+// corpusVersion fingerprints exactly what a data plane enforces: every active
+// indicator with its tier. Nodes reload the feed only when the version differs.
+//
+// It was the newest last_seen, which deleting or expiring an indicator never
+// changes — an operator's "remove it to unblock" left every node blocking
+// until some other indicator happened to be refreshed, which on an air-gapped
+// install is never. Order-independent (sorted), positive, stable across nodes.
+func corpusVersion(iocs []db.IOC, threshold int) int64 {
+	entries := make([]string, 0, len(iocs))
+	for _, ioc := range iocs {
+		tier := "w"
+		if ioc.Confidence >= threshold {
+			tier = "b"
+		}
+		entries = append(entries, tier+"\x00"+ioc.Type+"\x00"+ioc.Value)
+	}
+	sort.Strings(entries)
+	h := fnv.New64a()
+	for _, e := range entries {
+		h.Write([]byte(e))
+		h.Write([]byte{'\n'})
+	}
+	return int64(h.Sum64() & math.MaxInt64)
+}
+
 // handleInternalThreatIntel serves the active IOC set to the data-plane poller.
 // Gated by the shared internal secret (not JWT), like handleInternalConfig:
 // exposing the REST port must not leak the threat-intel corpus. Node-global
@@ -102,18 +130,14 @@ func handleInternalThreatIntel(c *gin.Context, store *db.Store) {
 		Block:           newTier(),
 		Watch:           newTier(),
 	}
-	var version int64
 	for _, ioc := range iocs {
-		if ts := ioc.LastSeen.Unix(); ts > version {
-			version = ts
-		}
 		if ioc.Confidence >= threshold {
 			resp.Block.add(ioc.Type, ioc.Value)
 		} else {
 			resp.Watch.add(ioc.Type, ioc.Value)
 		}
 	}
-	resp.Version = version
+	resp.Version = corpusVersion(iocs, threshold)
 	resp.GeneratedAt = time.Now().UTC().Format(time.RFC3339)
 
 	c.JSON(http.StatusOK, resp)
