@@ -47,9 +47,16 @@ docker exec "$CHC" clickhouse-client -u "$CLICKHOUSE_USER" --password "$CLICKHOU
   "CREATE TABLE ev (ts DateTime, msg String) ENGINE=MergeTree ORDER BY ts"
 docker exec "$CHC" clickhouse-client -u "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" -d "$CLICKHOUSE_DB" -q \
   "INSERT INTO ev VALUES (now(),'e1'),(now(),'e2'),(now(),'e3'),(now(),'e4')"
+# A SECOND table: with one, the drill could not see that restore.sh restored
+# only the first table of the list (docker exec -i swallowed the rest of it).
+docker exec "$CHC" clickhouse-client -u "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" -d "$CLICKHOUSE_DB" -q \
+  "CREATE TABLE ev2 (ts DateTime, msg String) ENGINE=MergeTree ORDER BY ts"
+docker exec "$CHC" clickhouse-client -u "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" -d "$CLICKHOUSE_DB" -q \
+  "INSERT INTO ev2 VALUES (now(),'f1'),(now(),'f2')"
 PG_SEED=$(docker exec "$PGC" psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT count(*) FROM drill_t")
 CH_SEED=$(docker exec "$CHC" clickhouse-client -u "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" -d "$CLICKHOUSE_DB" -q "SELECT count(*) FROM ev")
-echo "seeded: postgres=$PG_SEED rows, clickhouse=$CH_SEED rows"
+CH2_SEED=$(docker exec "$CHC" clickhouse-client -u "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" -d "$CLICKHOUSE_DB" -q "SELECT count(*) FROM ev2")
+echo "seeded: postgres=$PG_SEED rows, clickhouse=$CH_SEED + $CH2_SEED rows"
 
 say "3. backup.sh (via PG_CONTAINER/CH_CONTAINER overrides)"
 PG_CONTAINER="$PGC" CH_CONTAINER="$CHC" BACKUP_ROOT="$DRILL_BACKUP_ROOT" RETENTION_DAYS=999 "$HERE/backup.sh"
@@ -57,7 +64,8 @@ PG_CONTAINER="$PGC" CH_CONTAINER="$CHC" BACKUP_ROOT="$DRILL_BACKUP_ROOT" RETENTI
 say "4. destroy the data"
 docker exec "$PGC" psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "DROP TABLE drill_t"
 docker exec "$CHC" clickhouse-client -u "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" -d "$CLICKHOUSE_DB" -q "DROP TABLE ev"
-echo "dropped both tables"
+docker exec "$CHC" clickhouse-client -u "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" -d "$CLICKHOUSE_DB" -q "DROP TABLE ev2"
+echo "dropped all three tables"
 
 say "5. restore.sh --force"
 PG_CONTAINER="$PGC" CH_CONTAINER="$CHC" BACKUP_ROOT="$DRILL_BACKUP_ROOT" "$HERE/restore.sh" latest --force
@@ -65,10 +73,11 @@ PG_CONTAINER="$PGC" CH_CONTAINER="$CHC" BACKUP_ROOT="$DRILL_BACKUP_ROOT" "$HERE/
 say "6. verify"
 PG_NOW=$(docker exec "$PGC" psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT count(*) FROM drill_t")
 CH_NOW=$(docker exec "$CHC" clickhouse-client -u "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" -d "$CLICKHOUSE_DB" -q "SELECT count(*) FROM ev")
-echo "restored: postgres=$PG_NOW rows (seed $PG_SEED), clickhouse=$CH_NOW rows (seed $CH_SEED)"
+CH2_NOW=$(docker exec "$CHC" clickhouse-client -u "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" -d "$CLICKHOUSE_DB" -q "SELECT count(*) FROM ev2" 2>/dev/null || echo missing)
+echo "restored: postgres=$PG_NOW rows (seed $PG_SEED), clickhouse=$CH_NOW + $CH2_NOW rows (seed $CH_SEED + $CH2_SEED)"
 PG_SUM=$(docker exec "$PGC" psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT string_agg(v,',' ORDER BY id) FROM drill_t")
 
-if [ "$PG_NOW" = "$PG_SEED" ] && [ "$CH_NOW" = "$CH_SEED" ] && [ "$PG_SUM" = "alpha,bravo,charlie" ]; then
+if [ "$PG_NOW" = "$PG_SEED" ] && [ "$CH_NOW" = "$CH_SEED" ] && [ "$CH2_NOW" = "$CH2_SEED" ] && [ "$PG_SUM" = "alpha,bravo,charlie" ]; then
   printf '\n\033[32m✔ DRILL PASSED — backup + restore round-trips both databases correctly.\033[0m\n'
   exit 0
 else

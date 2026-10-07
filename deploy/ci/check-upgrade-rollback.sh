@@ -161,6 +161,39 @@ else
   bad "the automatic rollback does not check ClickHouse — it can call a crash-looping event store healthy"
 fi
 
+printf '\n%s%s==> the database restore can complete when a script runs it%s\n\n' "$B" "$YEL" "$R"
+
+# rollback.sh and upgrade.sh confirm first, then run restore.sh with its output
+# in their log. Without --force restore.sh asked again — into that log — and
+# waited on a terminal nobody was watching, or hit end-of-input under --yes. So
+# every executed call must pass --force, and restore.sh must never read a
+# confirmation from something that is not a terminal.
+RS=deploy/backup/restore.sh
+for f in "$CUSTOMER/rollback.sh" "$CUSTOMER/upgrade.sh"; do
+  calls=$(grep -n '\./restore\.sh' "$f" | grep -v '^[0-9]*:[[:space:]]*#' || true)
+  if [[ -z "$calls" ]]; then
+    bad "$f no longer calls restore.sh — update this check"
+  elif grep -v -- '--force' <<<"$calls" | grep -q .; then
+    bad "$f calls restore.sh without --force — the prompt goes into the log and the restore never completes:"
+    grep -v -- '--force' <<<"$calls" | sed 's/^/        /'
+  else
+    pass "$f passes --force after its own confirmation"
+  fi
+done
+if grep -q '\[ ! -t 0 \]' "$RS" && grep -q 'Type YES' "$RS"; then
+  pass "restore.sh refuses to prompt without a terminal"
+else
+  bad "restore.sh can wait on a confirmation with no terminal to ask on"
+fi
+# The ClickHouse loop reads its table list on fd 3: `docker exec -i` forwards
+# stdin into the container, so a list on stdin was swallowed by the first call
+# and only the first table was ever restored.
+if grep -q 'read -r t <&3' "$RS" && grep -q 'done 3<' "$RS"; then
+  pass "restore.sh reads the ClickHouse table list on its own descriptor"
+else
+  bad "restore.sh reads the ClickHouse table list on stdin — docker exec -i swallows it after the first table"
+fi
+
 printf '\n'
 if (( fail == 0 )); then
   printf '  %s✓%s the recovery path holds\n\n' "$GRN" "$R"
