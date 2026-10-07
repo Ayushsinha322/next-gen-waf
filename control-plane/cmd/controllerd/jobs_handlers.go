@@ -79,6 +79,8 @@ func handleListJobs(c *gin.Context, enf *rbac.Enforcer, cl *leader.Elector) {
 	}
 	// Data-plane background work, from its health endpoint.
 	req, _ := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, dataPlaneBaseURL()+"/healthz", nil)
+	// The detailed body goes only to loopback and to holders of this secret.
+	setInternalAuth(req)
 	if r, err := (&http.Client{Timeout: 4 * time.Second}).Do(req); err == nil {
 		body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 		r.Body.Close()

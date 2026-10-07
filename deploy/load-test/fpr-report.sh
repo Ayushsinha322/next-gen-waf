@@ -90,7 +90,11 @@ printf "  requests seen        %s\n" "$reqs"
 # A non-zero shed means the data plane enforced blocks it could NOT record, so
 # waf_events undercounts and every ratio below is understated. Read from the live
 # node rather than ClickHouse — the whole point is that these never reached it.
-shed=$(curl -s --max-time 3 http://127.0.0.1:80/healthz 2>/dev/null \
+# The /healthz detail needs the internal secret (SENTINEL_INTERNAL_SECRET, or the
+# deployment's .env); it goes on stdin so `ps` cannot show it.
+HZ_SECRET="${SENTINEL_INTERNAL_SECRET:-$(sed -n 's/^SENTINEL_INTERNAL_SECRET=//p' \
+  /opt/sentinel/current/.env /opt/sentinel-src/deploy/docker/.env 2>/dev/null | head -1)}"
+shed=$(curl -s --max-time 3 -H @- http://127.0.0.1:80/healthz 2>/dev/null <<<"x-sentinel-internal: $HZ_SECRET" \
         | python3 -c 'import sys,json;print(json.load(sys.stdin).get("history_shed",0))' 2>/dev/null || echo 0)
 if [ "${shed:-0}" -gt 0 ] 2>/dev/null; then
   printf "  ⚠️  events SHED       %s   (enforced but never recorded — history buffer full)\n" "$shed"

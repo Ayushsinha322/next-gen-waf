@@ -35,7 +35,7 @@ bad()  { printf "  \033[31mFAIL\033[0m  %s\n" "$1"; fail=$((fail+1)); }
 note() { printf "  \033[33mNOTE\033[0m  %s\n" "$1"; }
 hz() { curl -sk --max-time 8 "https://127.0.0.1:9443/healthz" 2>/dev/null; }
 node_ips() { for n in waf1 waf2 waf3; do docker inspect "sentinel-$n-1" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' 2>/dev/null | awk '{print $1}'; done; }
-hzsum() { local t=0 v; for ip in $(node_ips); do v=$(curl -s --max-time 6 "http://$ip:8080/healthz" 2>/dev/null | PATHSPEC="$1" python3 -c "
+hzsum() { local t=0 v; for ip in $(node_ips); do v=$(curl -s --max-time 6 -H @- "http://$ip:8080/healthz" 2>/dev/null <<<"x-sentinel-internal: ${SENTINEL_INTERNAL_SECRET:-$(sed -n 's/^SENTINEL_INTERNAL_SECRET=//p' /opt/sentinel-src/deploy/docker/.env 2>/dev/null | head -1)}" | PATHSPEC="$1" python3 -c "
 import sys, json, os
 try: d = json.load(sys.stdin)
 except Exception: print(0); raise SystemExit

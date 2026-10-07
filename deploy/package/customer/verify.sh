@@ -135,7 +135,10 @@ if [[ "${n:-0}" -gt 5 ]]; then pass "schema present ($n tables — migrations ra
 else bad "schema missing or incomplete (${n:-0} tables) — check the migrate container's logs"; fi
 
 step "Data plane"
-HZ=$(curl -fsS --max-time 5 http://127.0.0.1:80/healthz 2>/dev/null)
+# The /healthz detail goes only to loopback inside the container and to holders
+# of the internal secret; this host reaches it through Docker's gateway. The
+# secret goes on stdin (-H @-), not the command line, where `ps` would show it.
+HZ=$(curl -fsS --max-time 5 -H @- http://127.0.0.1:80/healthz 2>/dev/null <<<"x-sentinel-internal: $(sed -n 's/^SENTINEL_INTERNAL_SECRET=//p' "$ENV_FILE" 2>/dev/null | head -1)")
 if [[ -n "$HZ" ]]; then
   pass "/healthz answering"
   # sed, not python3 — this script is shipped to hosts that may not have python3,

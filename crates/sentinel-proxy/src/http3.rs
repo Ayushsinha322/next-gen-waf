@@ -512,6 +512,8 @@ async fn handle_h3_request(
     // h3 delivers the request head without an http::Version tag; stamp it so the
     // WAF pipeline, NDJSON logs, and ClickHouse all record this request as h3.
     parts.version = http::Version::HTTP_3;
+    // QUIC is always TLS (`client_https`).
+    parts.extensions.insert(crate::ClientTls);
     // Redacted as the access log is: the query can carry credentials.
     debug!(method = %parts.method, uri = %crate::logged_uri(&parts.uri), "HTTP/3 request");
     // For the log lines below. Path only: the query can carry credentials, and

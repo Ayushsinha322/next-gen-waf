@@ -2931,16 +2931,56 @@ async fn handle_connection(
         }
         let io = TokioIo::new(tls);
         if negotiated.as_deref() == Some(b"h2") {
-            serve_http2(io, peer, state, default_site, management, alt_svc, tls_fp).await
+            serve_http2(
+                io,
+                peer,
+                state,
+                default_site,
+                management,
+                alt_svc,
+                tls_fp,
+                true,
+            )
+            .await
         } else {
-            serve_http1(io, peer, state, default_site, management, alt_svc, tls_fp).await
+            serve_http1(
+                io,
+                peer,
+                state,
+                default_site,
+                management,
+                alt_svc,
+                tls_fp,
+                true,
+            )
+            .await
         }
     } else {
         let io = TokioIo::new(stream);
         if protocols.contains(&Protocol::Http2) && !protocols.contains(&Protocol::Http1) {
-            serve_http2(io, peer, state, default_site, management, alt_svc, None).await
+            serve_http2(
+                io,
+                peer,
+                state,
+                default_site,
+                management,
+                alt_svc,
+                None,
+                false,
+            )
+            .await
         } else {
-            serve_http1(io, peer, state, default_site, management, alt_svc, None).await
+            serve_http1(
+                io,
+                peer,
+                state,
+                default_site,
+                management,
+                alt_svc,
+                None,
+                false,
+            )
+            .await
         }
     }
 }
@@ -3029,6 +3069,7 @@ async fn peek_ja4(stream: &TcpStream) -> Ja4Peek {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // per-connection state, as handle_connection
 async fn serve_http1<T>(
     io: TokioIo<T>,
     peer: SocketAddr,
@@ -3037,6 +3078,8 @@ async fn serve_http1<T>(
     management: Option<Arc<ManagementUpstreams>>,
     alt_svc: Option<http3::AltSvc>,
     tls_fp: Option<String>,
+    // The connection is TLS: marked on each request for `client_https`.
+    tls: bool,
 ) -> anyhow::Result<()>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -3048,7 +3091,10 @@ where
         .header_read_timeout(HEADER_READ_TIMEOUT)
         .serve_connection(
             io,
-            hyper::service::service_fn(move |req| {
+            hyper::service::service_fn(move |mut req: Request<Incoming>| {
+                if tls {
+                    req.extensions_mut().insert(ClientTls);
+                }
                 let s = Arc::clone(&state);
                 let ds = default_site.clone();
                 let mgmt = management.clone();
@@ -3064,6 +3110,7 @@ where
         .map_err(|e| anyhow!("http1 serve error: {e}"))
 }
 
+#[allow(clippy::too_many_arguments)] // per-connection state, as handle_connection
 async fn serve_http2<T>(
     io: TokioIo<T>,
     peer: SocketAddr,
@@ -3072,6 +3119,8 @@ async fn serve_http2<T>(
     management: Option<Arc<ManagementUpstreams>>,
     alt_svc: Option<http3::AltSvc>,
     tls_fp: Option<String>,
+    // The connection is TLS: marked on each request for `client_https`.
+    tls: bool,
 ) -> anyhow::Result<()>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -3084,7 +3133,10 @@ where
         .keep_alive_timeout(H2_KEEPALIVE_TIMEOUT)
         .serve_connection(
             io,
-            hyper::service::service_fn(move |req| {
+            hyper::service::service_fn(move |mut req: Request<Incoming>| {
+                if tls {
+                    req.extensions_mut().insert(ClientTls);
+                }
                 let s = Arc::clone(&state);
                 let ds = default_site.clone();
                 let mgmt = management.clone();
@@ -3150,9 +3202,12 @@ async fn handle_request(
                     cfg.sites.iter().any(|s| site_matches(s, name))
                 })
         };
-        if let ProbeDisposition::Answer { detailed } =
-            probe_disposition(management.is_some(), peer.ip(), host_is_site)
-        {
+        if let ProbeDisposition::Answer { detailed } = probe_disposition(
+            management.is_some(),
+            peer.ip(),
+            host_is_site,
+            internal_auth_ok(req.headers()),
+        ) {
             let path = req.uri().path();
             return Ok(match path {
                 // Kubernetes/HAProxy READINESS: 200 only once this node has
@@ -3461,6 +3516,10 @@ async fn proxy_inner(
 ) -> anyhow::Result<Response<BoxBody>> {
     let cfg = state.config.load();
     let engine_map = state.engines.load_full();
+    // Whether the client's request reached us over HTTPS: this connection is
+    // TLS, or a trusted proxy in front of us terminated TLS and says so.
+    let client_https = req.extensions().get::<ClientTls>().is_some()
+        || (is_trusted_proxy(peer.ip()) && forwarded_proto_is_https(req.headers()));
 
     // Capture WebSocket upgrade future early (must happen before into_parts()).
     let is_ws = is_websocket_upgrade(req.headers());
@@ -3794,6 +3853,30 @@ async fn proxy_inner(
         ctx.block_page = s.waf.block_page.clone();
         // What inspecting this request may cost; the rule engine reads it.
         ctx.inspection_limits = s.waf.inspection_limits();
+    }
+
+    // Force HTTPS: a plain-HTTP request for a site with a certificate is
+    // redirected before anything else runs (see https_redirect_location).
+    if let Some(s) = &site {
+        let location = https_redirect_location(s, ctx.host(), &ctx.uri, client_https, |h| {
+            state
+                .cert_manager
+                .store
+                .get_meta(h)
+                .is_some_and(|m| m.expires_at > unix_now_secs())
+        });
+        if let Some(location) = location {
+            let resp = Response::builder()
+                .status(StatusCode::PERMANENT_REDIRECT)
+                .header(header::LOCATION, location)
+                .header(header::CONTENT_LENGTH, "0")
+                .body(full_body(Bytes::new()))
+                .expect("a 308 with a validated Location builds");
+            stamp_response(ctx, &resp);
+            ctx.advance_phase(Phase::Logging);
+            log_request(ctx);
+            return Ok(resp);
+        }
     }
 
     // Refuse to serve a site whose rule engine has not finished compiling.
@@ -4301,7 +4384,7 @@ async fn proxy_inner(
     // its cookie sent to every site the WAF serves on that same host — and
     // until 1.1.11 that cookie WAS the admin access token.
     strip_console_session_cookie(&mut parts.headers);
-    inject_forwarding_headers(&mut parts.headers, peer.ip())?;
+    inject_forwarding_headers(&mut parts.headers, peer.ip(), client_https)?;
 
     // Per-site `Host` override for an origin that virtual-hosts on an internal
     // name. Applied HERE, at the last step before the request leaves us, and
@@ -7679,6 +7762,56 @@ fn sni_listener_tls_config(resolver: Arc<dyn rustls::server::ResolvesServerCert>
     cfg
 }
 
+/// Marks a request that reached this node over TLS (HTTPS on TCP, or QUIC).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ClientTls;
+
+/// A trusted proxy's word that the client used HTTPS: the first
+/// `X-Forwarded-Proto` value (the hop nearest the client).
+fn forwarded_proto_is_https(headers: &http::HeaderMap) -> bool {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .is_some_and(|p| p.trim().eq_ignore_ascii_case("https"))
+}
+
+/// Where a plain-HTTP request for `site` is redirected, if it is.
+///
+/// The console's "Force HTTPS" (on by default) was stored and read by
+/// nothing, so every site also answered plain HTTP: a login form could be
+/// posted in the clear, and HSTS never took hold. A request is now redirected
+/// (308, which keeps the method and body) when the site asks for it, the host
+/// it named is one of the site's own and covered by an unexpired certificate
+/// an operator installed (`has_cert`) — redirecting to a name with no
+/// certificate, or only the self-signed fallback, would trade a working page
+/// for a TLS error — and the request did not already arrive over HTTPS, which
+/// includes a TLS-terminating proxy in front saying so: redirecting that
+/// again would loop. ACME HTTP-01 challenges stay on HTTP.
+fn https_redirect_location(
+    site: &SiteConfig,
+    host: Option<&str>,
+    uri: &Uri,
+    client_https: bool,
+    has_cert: impl Fn(&str) -> bool,
+) -> Option<String> {
+    if client_https || !site.tls.redirect_http {
+        return None;
+    }
+    if uri.path().starts_with("/.well-known/acme-challenge/") {
+        return None;
+    }
+    let host = host?.trim().trim_end_matches('.');
+    if host.is_empty() || !site_matches(site, host) || !has_cert(host) {
+        return None;
+    }
+    let pq = uri.path_and_query().map_or("/", |pq| pq.as_str());
+    let location = format!("https://{host}{pq}");
+    header::HeaderValue::from_str(&location)
+        .ok()
+        .map(|_| location)
+}
+
 /// What the data plane does with a request for /health(z), /ready(z) or /metrics.
 #[derive(Debug, PartialEq, Eq)]
 enum ProbeDisposition {
@@ -7695,42 +7828,27 @@ enum ProbeDisposition {
 /// and errors, sync errors, panic locations, listener binds and the eBPF
 /// interface.
 ///
-/// Now a request for a configured site's own host is that site's — unless it
-/// comes from loopback. Every probe of the node itself keeps working: host
-/// scripts (Host 127.0.0.1), the control plane (`dataplane:8080`), HAProxy
-/// (no Host), the VRRP script and Docker healthchecks (loopback), and the
-/// management listener. The detail goes only to loopback, the management
-/// listener and private-network peers (the control plane and the host reach it
-/// over the Docker network); a public client gets bare liveness.
+/// A request naming a configured site's own host is that site's, unless it
+/// comes from loopback. Every probe of the node itself still gets an answer —
+/// host scripts, the control plane (`dataplane:8080`), HAProxy (no Host), the
+/// VRRP script, Docker healthchecks and the management listener — but only
+/// loopback, the management listener and a caller holding the internal secret
+/// (`internal`) get the detail and /metrics. 1.1.17 also gave it to any
+/// private-network peer; behind a load balancer that does not send PROXY
+/// protocol every client is one, so the detail went to the internet again.
 fn probe_disposition(
     management: bool,
     peer: std::net::IpAddr,
     host_is_site: bool,
+    internal: bool,
 ) -> ProbeDisposition {
-    if management || peer.is_loopback() {
+    if management || peer.is_loopback() || internal {
         return ProbeDisposition::Answer { detailed: true };
     }
     if host_is_site {
         return ProbeDisposition::Route;
     }
-    ProbeDisposition::Answer {
-        detailed: is_private_peer(peer),
-    }
-}
-
-/// Loopback, RFC 1918, link-local, or IPv6 unique-local — never carrier-grade
-/// NAT (100.64/10), whose addresses are public subscribers.
-fn is_private_peer(ip: std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
-        std::net::IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return is_private_peer(std::net::IpAddr::V4(v4));
-            }
-            let seg0 = v6.segments()[0];
-            v6.is_loopback() || (seg0 & 0xfe00) == 0xfc00 || (seg0 & 0xffc0) == 0xfe80
-        }
-    }
+    ProbeDisposition::Answer { detailed: false }
 }
 
 // Wildcard host matching indexes the domain by byte offset after a "*." check;
@@ -7900,10 +8018,55 @@ fn strip_hop_by_hop_except_upgrade(headers: &mut http::HeaderMap) {
     }
 }
 
+/// Request headers an origin may route or build URLs by, which only the WAF
+/// may set. Some origins (IIS rewrite, Symfony and Laravel behind proxies)
+/// serve the path named in `X-Original-URL` / `X-Rewrite-URL`, so a request
+/// inspected here as `GET /` could be served there as `/admin`.
+const ORIGIN_ROUTING_HEADERS: &[&str] = &[
+    "forwarded",
+    "x-original-url",
+    "x-rewrite-url",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-forwarded-port",
+];
+
+/// What the origin is told about the client's request.
+///
+/// Only X-Forwarded-For and X-Real-IP were set, and whatever the client sent
+/// as X-Forwarded-Proto/-Host/-Port, `Forwarded` or `X-Original-URL` reached
+/// the origin as if it were ours: an origin behind this TLS termination could
+/// not tell its client used HTTPS (absolute URLs, Secure cookies and
+/// redirects came out http://), and a client could poison the host it built
+/// links with. Those headers are now dropped and ours set: the scheme the
+/// client used, the Host it sent, and that Host's port (else the scheme's).
 fn inject_forwarding_headers(
     headers: &mut http::HeaderMap,
     client_ip: IpAddr,
+    https: bool,
 ) -> anyhow::Result<()> {
+    for name in ORIGIN_ROUTING_HEADERS {
+        headers.remove(*name);
+    }
+    headers.insert(
+        header::HeaderName::from_static("x-forwarded-proto"),
+        header::HeaderValue::from_static(if https { "https" } else { "http" }),
+    );
+    if let Some(host) = headers.get(header::HOST).cloned() {
+        let port = host
+            .to_str()
+            .ok()
+            .and_then(|h| h.rsplit_once(':'))
+            .map(|(_, p)| p)
+            .filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+            .map(str::to_owned)
+            .unwrap_or_else(|| if https { "443" } else { "80" }.to_owned());
+        headers.insert(header::HeaderName::from_static("x-forwarded-host"), host);
+        headers.insert(
+            header::HeaderName::from_static("x-forwarded-port"),
+            port.parse()?,
+        );
+    }
     let ip_str = client_ip.to_string();
     if let Some(existing) = headers.get(header::HeaderName::from_static("x-forwarded-for")) {
         let val = format!("{}, {}", existing.to_str().unwrap_or(""), ip_str);
@@ -13130,6 +13293,107 @@ mod path_override_match_tests {
 }
 
 #[cfg(test)]
+mod https_redirect_tests {
+    use super::*;
+
+    fn site(redirect: bool) -> SiteConfig {
+        let mut s: SiteConfig = serde_json::from_value(serde_json::json!({
+            "id": "shop",
+            "domains": ["shop.example.in", "*.cdn.example.in"],
+            "upstream": { "servers": [{ "host": "10.0.0.5", "port": 8080 }] },
+        }))
+        .unwrap();
+        s.tls.redirect_http = redirect;
+        s
+    }
+
+    fn loc(s: &SiteConfig, host: &str, uri: &str, https: bool, cert: bool) -> Option<String> {
+        https_redirect_location(s, Some(host), &uri.parse().unwrap(), https, |_| cert)
+    }
+
+    /// "Force HTTPS" was stored and read by nothing: every site also answered
+    /// plain HTTP. With a certificate for the host, HTTP now redirects.
+    #[test]
+    fn plain_http_for_a_site_with_a_certificate_is_redirected() {
+        let s = site(true);
+        assert_eq!(
+            loc(&s, "shop.example.in", "/login?next=/cart", false, true).as_deref(),
+            Some("https://shop.example.in/login?next=/cart")
+        );
+        assert_eq!(
+            loc(&s, "img.cdn.example.in", "/", false, true).as_deref(),
+            Some("https://img.cdn.example.in/")
+        );
+    }
+
+    #[test]
+    fn no_redirect_where_it_would_break_or_loop() {
+        let s = site(true);
+        // Already HTTPS — on this connection or per a trusted TLS-terminating proxy.
+        assert_eq!(loc(&s, "shop.example.in", "/", true, true), None);
+        // No installed certificate: a redirect would trade a page for a TLS error.
+        assert_eq!(loc(&s, "shop.example.in", "/", false, false), None);
+        // ACME HTTP-01 must stay on HTTP.
+        assert_eq!(
+            loc(
+                &s,
+                "shop.example.in",
+                "/.well-known/acme-challenge/tok",
+                false,
+                true
+            ),
+            None
+        );
+        // A host the site does not own (a default-site fallback) is never echoed.
+        assert_eq!(loc(&s, "evil.example", "/", false, true), None);
+        // The site turned it off.
+        assert_eq!(loc(&site(false), "shop.example.in", "/", false, true), None);
+    }
+
+    #[test]
+    fn only_a_trusted_proxys_https_counts() {
+        let mut h = http::HeaderMap::new();
+        h.insert("x-forwarded-proto", "https, http".parse().unwrap());
+        assert!(forwarded_proto_is_https(&h));
+        h.insert("x-forwarded-proto", "http".parse().unwrap());
+        assert!(!forwarded_proto_is_https(&h));
+        assert!(!forwarded_proto_is_https(&http::HeaderMap::new()));
+    }
+
+    /// The origin hears the scheme, Host and port from us alone, and never the
+    /// client's routing headers.
+    #[test]
+    fn forwarding_headers_are_ours_and_routing_overrides_are_dropped() {
+        let mut h = http::HeaderMap::new();
+        h.insert(header::HOST, "shop.example.in".parse().unwrap());
+        for (k, v) in [
+            ("x-forwarded-proto", "https"),
+            ("x-forwarded-host", "evil.example"),
+            ("x-forwarded-port", "1"),
+            ("forwarded", "for=1.2.3.4;proto=https"),
+            ("x-original-url", "/admin"),
+            ("x-rewrite-url", "/admin"),
+        ] {
+            h.insert(header::HeaderName::from_static(k), v.parse().unwrap());
+        }
+        inject_forwarding_headers(&mut h, "203.0.113.9".parse().unwrap(), false).unwrap();
+        assert_eq!(h["x-forwarded-proto"], "http");
+        assert_eq!(h["x-forwarded-host"], "shop.example.in");
+        assert_eq!(h["x-forwarded-port"], "80");
+        for gone in ["forwarded", "x-original-url", "x-rewrite-url"] {
+            assert!(h.get(gone).is_none(), "{gone} reached the origin");
+        }
+        assert_eq!(h["x-real-ip"], "203.0.113.9");
+
+        let mut h = http::HeaderMap::new();
+        h.insert(header::HOST, "shop.example.in:8443".parse().unwrap());
+        inject_forwarding_headers(&mut h, "203.0.113.9".parse().unwrap(), true).unwrap();
+        assert_eq!(h["x-forwarded-proto"], "https");
+        assert_eq!(h["x-forwarded-port"], "8443");
+    }
+}
+
+#[cfg(test)]
 mod probe_disposition_tests {
     use super::*;
 
@@ -13141,78 +13405,56 @@ mod probe_disposition_tests {
     /// answered them for every Host, so the app's uptime check stayed green
     /// while it was down, and the internet could read the node's metrics.
     #[test]
-    fn a_public_request_for_a_sites_host_is_routed_to_the_site() {
-        assert_eq!(
-            probe_disposition(false, ip("203.0.113.9"), true),
-            ProbeDisposition::Route
-        );
-        assert_eq!(
-            probe_disposition(false, ip("2001:db8::9"), true),
-            ProbeDisposition::Route
-        );
+    fn a_request_for_a_sites_host_is_routed_to_the_site() {
+        for peer in ["203.0.113.9", "2001:db8::9", "10.0.0.3"] {
+            assert_eq!(
+                probe_disposition(false, ip(peer), true, false),
+                ProbeDisposition::Route,
+                "{peer}"
+            );
+        }
     }
 
-    /// A public client that does not name a site gets bare liveness — never the
-    /// /healthz detail or /metrics.
+    /// Nobody without the internal secret gets the detail or /metrics — a
+    /// private peer included: behind a load balancer that sends no PROXY
+    /// protocol, every internet client arrives from one.
     #[test]
-    fn a_public_client_gets_no_detail() {
+    fn no_detail_without_loopback_management_or_the_secret() {
         for peer in [
             "203.0.113.9",
             "100.64.0.7",
             "2001:db8::9",
-            "::ffff:203.0.113.9",
+            "172.18.0.5",
+            "10.0.0.3",
+            "fd00::5",
         ] {
             assert_eq!(
-                probe_disposition(false, ip(peer), false),
+                probe_disposition(false, ip(peer), false, false),
                 ProbeDisposition::Answer { detailed: false },
                 "{peer}"
             );
         }
     }
 
-    /// Every existing probe of the node keeps its answer: loopback (VRRP
-    /// script, Docker healthcheck), the control plane and HAProxy over the
-    /// private network, and the management listener.
+    /// The node's own probes keep the detail: loopback (VRRP script, Docker
+    /// healthcheck), the management listener, and the control plane, which
+    /// sends the internal secret.
     #[test]
-    fn the_nodes_own_probes_keep_working() {
+    fn the_nodes_own_probes_keep_the_detail() {
         let detailed = ProbeDisposition::Answer { detailed: true };
-        // Loopback is the node itself, whatever Host it sends.
-        assert_eq!(probe_disposition(false, ip("127.0.0.1"), true), detailed);
-        assert_eq!(probe_disposition(false, ip("::1"), true), detailed);
-        // The management listener is the operator's.
-        assert_eq!(probe_disposition(true, ip("203.0.113.9"), true), detailed);
-        // The control plane (`dataplane:8080`) and HAProxy (no Host) over Docker
-        // or the LAN.
-        for peer in [
-            "172.18.0.5",
-            "10.0.0.3",
-            "192.168.1.4",
-            "169.254.1.1",
-            "fd00::5",
-            "fe80::1",
-        ] {
-            assert_eq!(
-                probe_disposition(false, ip(peer), false),
-                detailed,
-                "{peer}"
-            );
-        }
-    }
-
-    #[test]
-    fn carrier_grade_nat_and_public_v6_are_not_private() {
-        for peer in ["100.64.0.1", "8.8.8.8", "2001:db8::1", "::ffff:8.8.8.8"] {
-            assert!(!is_private_peer(ip(peer)), "{peer}");
-        }
-        for peer in [
-            "127.0.0.1",
-            "10.1.2.3",
-            "172.31.255.1",
-            "::ffff:10.0.0.1",
-            "fc00::1",
-        ] {
-            assert!(is_private_peer(ip(peer)), "{peer}");
-        }
+        assert_eq!(
+            probe_disposition(false, ip("127.0.0.1"), true, false),
+            detailed
+        );
+        assert_eq!(probe_disposition(false, ip("::1"), false, false), detailed);
+        assert_eq!(
+            probe_disposition(true, ip("203.0.113.9"), true, false),
+            detailed
+        );
+        assert_eq!(
+            probe_disposition(false, ip("172.18.0.5"), false, true),
+            detailed
+        );
     }
 }
 

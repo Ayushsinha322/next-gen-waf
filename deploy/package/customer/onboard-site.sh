@@ -301,13 +301,13 @@ step "Proving the path from this host"
 # uninspected and proves nothing. Wait until /healthz no longer lists the site
 # as without an engine, then probe.
 engine=no; tries=0
-INSP="$(curl -s --max-time 5 http://127.0.0.1/healthz 2>/dev/null | jq -c '.inspection.sites_without_engine' 2>/dev/null)"
+INSP="$(curl -s --max-time 5 -H @- http://127.0.0.1/healthz 2>/dev/null <<<"x-sentinel-internal: $(sed -n 's/^SENTINEL_INTERNAL_SECRET=//p' "$ENV_FILE" 2>/dev/null | head -1)" | jq -c '.inspection.sites_without_engine' 2>/dev/null)"
 if [[ -z "$INSP" || "$INSP" == "null" ]]; then
   warn "this data plane does not report per-site engine state at /healthz (older build) — waiting 20s instead"
   sleep 20; engine=unknown
 else
   while (( tries < 18 )); do
-    INSP="$(curl -s --max-time 5 http://127.0.0.1/healthz 2>/dev/null | jq -c '.inspection.sites_without_engine // []' 2>/dev/null)"
+    INSP="$(curl -s --max-time 5 -H @- http://127.0.0.1/healthz 2>/dev/null <<<"x-sentinel-internal: $(sed -n 's/^SENTINEL_INTERNAL_SECRET=//p' "$ENV_FILE" 2>/dev/null | head -1)" | jq -c '.inspection.sites_without_engine // []' 2>/dev/null)"
     if [[ -n "$INSP" ]] && ! grep -qF "$NAME" <<<"$INSP" && ! grep -qF "${SITE_ID:-__none__}" <<<"$INSP"; then engine=yes; break; fi
     sleep 5; tries=$((tries + 1))
   done

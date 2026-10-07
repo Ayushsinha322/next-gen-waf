@@ -1476,7 +1476,11 @@ func handleProxyHealth(c *gin.Context) {
 	client := &http.Client{Timeout: 3 * time.Second}
 	// Probe the data plane at its configured base URL (SENTINEL_DATAPLANE_URL),
 	// not a hardcoded port: prod/K8s bind :8080, only the dev config uses :9080.
-	resp, err := client.Get(dataPlaneBaseURL() + "/healthz")
+	// The internal secret buys the detailed body the data plane gives no one
+	// else across the network.
+	hreq, _ := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, dataPlaneBaseURL()+"/healthz", nil)
+	setInternalAuth(hreq)
+	resp, err := client.Do(hreq)
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{"waf_running": false, "error": err.Error()})
 		return
@@ -1710,7 +1714,32 @@ func siteRowToRustConfig(s db.SiteRow) (map[string]any, error) {
 //	off / "" -> off
 //
 // It always returns a valid SiteTlsConfig so the config-sync never fails to parse.
+//
+// It also carries the console's "Force HTTPS" as redirect_http. That switch
+// (on by default) was stored and read by nothing, so every site answered plain
+// HTTP as well; the data plane now redirects once a certificate covers the
+// host. A site stored without the setting — created by script or API — gets the
+// console's default, on.
 func buildRustSiteTLS(raw json.RawMessage) map[string]any {
+	tls := buildRustSiteTLSMode(raw)
+	tls["redirect_http"] = siteForcesHTTPS(raw)
+	return tls
+}
+
+// siteForcesHTTPS reads waf_policy.frontend.force_https, defaulting to true.
+func siteForcesHTTPS(raw json.RawMessage) bool {
+	var p struct {
+		Frontend *struct {
+			ForceHTTPS *bool `json:"force_https"`
+		} `json:"frontend"`
+	}
+	if len(raw) == 0 || json.Unmarshal(raw, &p) != nil || p.Frontend == nil || p.Frontend.ForceHTTPS == nil {
+		return true
+	}
+	return *p.Frontend.ForceHTTPS
+}
+
+func buildRustSiteTLSMode(raw json.RawMessage) map[string]any {
 	off := map[string]any{"mode": "off"}
 	if len(raw) == 0 {
 		return off
@@ -2012,10 +2041,9 @@ var knownWafPolicyKeys = map[string]struct{}{
 	// Consumed by buildRustSiteTLS into the top-level SiteConfig.tls rather
 	// than by buildRustWaf, so its absence from the struct above is correct.
 	"tls": {},
-	// Deliberately stored-only: TLS termination and the HTTP protocol set are
-	// properties of the WAF *listener*, shared by every site on a node, so
-	// there is no per-site plumbing to forward these to. The wizard's Front
-	// Service step is tagged "stored" and says so to the operator.
+	// force_https is consumed by buildRustSiteTLS (as tls.redirect_http). The
+	// rest is stored-only: TLS termination and the HTTP protocol set are
+	// properties of the WAF *listener*, shared by every site on a node.
 	"frontend": {},
 }
 

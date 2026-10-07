@@ -525,25 +525,23 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                   <StepHead title="Front Service" sub="The public, client-facing side of this site: how it's exposed and its TLS certificate." tag="stored" />
 
                   {/* exposure
-                      These five toggles are STORED, not enforced per site, and the
-                      step is tagged accordingly. Verified: front_https, force_https
-                      and hsts appear nowhere in the control plane's config builder
-                      or in the Rust SiteConfig, and http2/http3 exist only as
-                      LISTENER protocol sets — there is no per-site plumbing for any
-                      of them. The step previously carried "● Enforced", which put a
-                      false claim on two compliance line-items (HTTPS redirect and
-                      HSTS). The TLS certificate block below IS applied. */}
+                      Force HTTPS IS enforced (control plane → tls.redirect_http → the
+                      data plane's 308), once a certificate covers the host. The other
+                      toggles are still STORED only: TLS termination and http2/http3
+                      are LISTENER properties with no per-site plumbing, and HSTS is
+                      set under Security headers. */}
                   <InfoBox tone="amber">
-                    <strong>Saved with the site, not yet enforced per site.</strong> TLS
+                    <strong>Force HTTPS is enforced; the other switches here are saved, not applied per site.</strong>{" "}
+                    Plain-HTTP requests are redirected (308) to HTTPS once a certificate
+                    for the host is installed — ACME challenges excepted, and never for a
+                    request a trusted load balancer already received over HTTPS. TLS
                     termination and the HTTP protocol set are properties of the WAF
-                    <em> listener</em>, shared by every site on this node — these
-                    switches record your intent but do not currently change how this
-                    site is served. The TLS certificate you choose below <em>is</em>
-                    applied. Per-site exposure is on the roadmap.
+                    <em> listener</em>, shared by every site on this node. The TLS
+                    certificate you choose below <em>is</em> applied.
                   </InfoBox>
                   <Row cols={adv ? "1fr 1fr" : "1fr 1fr"}>
                     <SectionToggle label="Serve HTTPS" desc="Terminate TLS on the public listener" on={form.front_https} set={v => upd({ front_https: v })} />
-                    <SectionToggle label="Force HTTPS redirect" desc="301 plain HTTP → HTTPS" on={form.force_https} set={v => upd({ force_https: v })} />
+                    <SectionToggle label="Force HTTPS redirect" desc="308 plain HTTP → HTTPS once a certificate covers the host" on={form.force_https} set={v => upd({ force_https: v })} />
                   </Row>
                   {adv && (
                     <Row>

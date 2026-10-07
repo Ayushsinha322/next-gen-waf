@@ -233,7 +233,8 @@ fi
 # Recorded BEFORE creation so the wait below can prove THIS site arrived, rather
 # than observing that some site exists. See the note at that step.
 dp_site_count() {
-  curl -fsS --max-time 5 http://127.0.0.1/healthz 2>/dev/null \
+  # Detail needs the internal secret from this host (on stdin, not in `ps`).
+  curl -fsS --max-time 5 -H @- http://127.0.0.1/healthz 2>/dev/null <<<"x-sentinel-internal: $(sed -n 's/^SENTINEL_INTERNAL_SECRET=//p' "$ENV_FILE" 2>/dev/null | head -1)" \
     | sed -n 's/.*"sites"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1
 }
 SITES_BEFORE=$(dp_site_count); SITES_BEFORE=${SITES_BEFORE:-0}

@@ -65,7 +65,7 @@ node_ips() {
 hzsum() {
   local path="$1" total=0 v
   for ip in $(node_ips); do
-    v=$(curl -s --max-time 6 "http://$ip:8080/healthz" 2>/dev/null \
+    v=$(curl -s --max-time 6 -H @- "http://$ip:8080/healthz" 2>/dev/null <<<"x-sentinel-internal: ${SENTINEL_INTERNAL_SECRET:-$(sed -n 's/^SENTINEL_INTERNAL_SECRET=//p' /opt/sentinel-src/deploy/docker/.env 2>/dev/null | head -1)}" \
         | PATHSPEC="$path" python3 -c "
 import sys, json, os
 try: d = json.load(sys.stdin)

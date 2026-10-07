@@ -952,7 +952,8 @@ else
   # and a node that cannot serve must not hold the VIP. That is correct behaviour,
   # not a fault, but "not healthy" alone reads like a failure and sends the
   # operator hunting for a bug that is not there.
-  _hz="$(curl -fsS --max-time 3 http://127.0.0.1:80/healthz 2>/dev/null || true)"
+  # The detail needs the internal secret from this host (on stdin, not in `ps`).
+  _hz="$(curl -fsS --max-time 3 -H @- http://127.0.0.1:80/healthz 2>/dev/null <<<"x-sentinel-internal: $(sed -n 's/^SENTINEL_INTERNAL_SECRET=//p' "$ENV_FILE" 2>/dev/null | head -1)" || true)"
   _probe="$(cat "$PROBE_HOST_FILE" 2>/dev/null || echo "$VIP")"
   if [[ "$_hz" == *'"sites":0'* ]]; then
     warn "no sites configured yet, so the data plane is intentionally not eligible for the VIP"

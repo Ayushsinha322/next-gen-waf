@@ -615,6 +615,77 @@ async fn a_sites_allow_list_skips_the_rules() {
     );
 }
 
+/// The origin is told the scheme, Host and port by the WAF alone. Client-sent
+/// copies — and `X-Original-URL`, which some origins route by — used to reach
+/// it untouched: `GET /` inspected here could be served there as `/admin`.
+#[tokio::test]
+async fn the_origin_gets_our_forwarding_headers_not_the_clients() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let svc = hyper::service::service_fn(|req: Request<Incoming>| async move {
+                    let h = |n: &str| {
+                        req.headers()
+                            .get(n)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("-")
+                            .to_owned()
+                    };
+                    let body = format!(
+                        "proto={} host={} port={} original={} forwarded={}",
+                        h("x-forwarded-proto"),
+                        h("x-forwarded-host"),
+                        h("x-forwarded-port"),
+                        h("x-original-url"),
+                        h("forwarded"),
+                    );
+                    Ok::<_, std::convert::Infallible>(http::Response::new(body))
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), svc)
+                    .await;
+            });
+        }
+    });
+    let listen_port = next_port();
+    let cfg = test_config(
+        listen_port,
+        upstream.port(),
+        "REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
+        WafMode::Blocking,
+    );
+    let (shutdown_tx, jh) = start_proxy(cfg).await;
+
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", listen_port))
+        .await
+        .unwrap();
+    let (mut tx, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .unwrap();
+    tokio::spawn(conn);
+    let req = Request::builder()
+        .uri("/")
+        .header(header::HOST, "test-site.local")
+        .header("x-forwarded-proto", "https")
+        .header("x-forwarded-host", "evil.example")
+        .header("x-forwarded-port", "1")
+        .header("x-original-url", "/admin")
+        .header("forwarded", "for=1.2.3.4;proto=https")
+        .body(http_body_util::Empty::<bytes::Bytes>::new())
+        .unwrap();
+    let resp = tx.send_request(req).await.unwrap();
+    use http_body_util::BodyExt;
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    shutdown_proxy(shutdown_tx, jh).await;
+
+    assert_eq!(
+        String::from_utf8_lossy(&body),
+        "proto=http host=test-site.local port=80 original=- forwarded=-"
+    );
+}
+
 #[tokio::test]
 async fn post_body_sqli_is_blocked() {
     let (upstream_addr, _upstream_handle) = start_mock_upstream().await;

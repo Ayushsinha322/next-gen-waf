@@ -329,6 +329,11 @@ pub struct SiteTlsConfig {
     pub key: Option<PathBuf>,
     /// ACME mode configuration.
     pub acme: Option<SiteAcmeConfig>,
+    /// Redirect plain-HTTP requests to HTTPS (308) once an installed
+    /// certificate covers the host — the console's "Force HTTPS". Off unless
+    /// set, so a hand-written config keeps answering HTTP.
+    #[serde(default)]
+    pub redirect_http: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
