@@ -269,17 +269,6 @@ services:
     hostname: ${SENTINEL_CP_HOSTNAME:-sentinel-controlplane}
     logging: *logging
     restart: unless-stopped
-    # /readyz through the binary itself: the image has no shell or HTTP client.
-    # Without a healthcheck a control plane that had lost its database read
-    # "running" to Docker and to rolling-update.sh. start_period covers the
-    # database wait at boot (SENTINEL_DB_CONNECT_TIMEOUT, default 60 s), after
-    # which the process exits for this restart policy to try again.
-    healthcheck:
-      test: ["CMD", "/usr/local/bin/controllerd", "healthcheck"]
-      interval: 10s
-      timeout: 5s
-      start_period: 90s
-      retries: 3
     # root so it can write the shared NDJSON log volume (hardened via K8s
     # securityContext later). The control-plane hub reads what the proxy writes.
     user: "0:0"

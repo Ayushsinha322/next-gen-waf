@@ -5,8 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net"
-	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -17,43 +15,18 @@ import (
 // runSubcommand runs a one-shot command given as the first argument and
 // reports whether there was one; with none the server starts as always.
 //
-//	healthcheck   the container healthcheck (the image has no shell or HTTP client)
 //	reset-admin   the break-glass way back in for a lost administrator
+//
+// (The container healthcheck is the image's own /healthprobe on /readyz.)
 func runSubcommand(args []string) (code int, handled bool) {
 	if len(args) == 0 {
 		return 0, false
 	}
 	switch args[0] {
-	case "healthcheck":
-		return healthcheck(os.Stderr), true
 	case "reset-admin":
 		return resetAdminCmd(args[1:], os.Stdout, os.Stderr), true
 	}
 	return 0, false
-}
-
-// healthcheck asks this container's own server whether it is ready: /readyz
-// answers 200 only with the database reachable. There was no healthcheck, so
-// a control plane that had lost its database read "running" to Docker and to
-// the rolling update.
-func healthcheck(stderr io.Writer) int {
-	port := "9501"
-	if _, p, err := net.SplitHostPort(envOrDefault("SENTINEL_REST_ADDR", "0.0.0.0:9501")); err == nil && p != "" {
-		port = p
-	}
-	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get("http://127.0.0.1:" + port + "/readyz")
-	if err != nil {
-		fmt.Fprintln(stderr, "healthcheck:", err)
-		return 1
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		fmt.Fprintf(stderr, "healthcheck: /readyz answered %s %s\n", resp.Status, strings.TrimSpace(string(body)))
-		return 1
-	}
-	return 0
 }
 
 // resetAdminCmd gives an administrator account a new password, run inside the
