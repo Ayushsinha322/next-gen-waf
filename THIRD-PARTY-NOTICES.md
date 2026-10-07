@@ -9,7 +9,7 @@ re-runs during packaging. Run it after changing a dependency. Do not edit by han
 It records what each component **declares** in its own manifest. It is an
 attribution inventory, not a legal review.
 
-**432 redistributed components** across Rust, Go, npm and container images.
+**435 redistributed components** across Rust, Go, npm and container images.
 A further 104 Rust crates and 399 npm packages are
 build- or development-only: they are compiled or installed here but never
 shipped, and are listed separately at the end so the two are never confused.
@@ -28,9 +28,9 @@ the OWASP Core Rule Set keeps its own copy at `rules/owasp-crs/LICENSE`.
 
 ## Rust crates (data plane)
 Reachable through normal (non-dev, non-build) edges from a shipped binary, so these are compiled into what customers run. Workspace members excluded.
-**281 components.**
+**284 components.**
 
-### MIT OR Apache-2.0 — 145 component(s)
+### MIT OR Apache-2.0 — 146 component(s)
 - ahash 0.8.12
 - anstream 1.0.0
 - anstyle 1.0.14
@@ -58,6 +58,7 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - cpufeatures 0.2.17
 - cpufeatures 0.3.0
 - crc32fast 1.5.0
+- crossbeam-channel 0.5.17
 - crossbeam-deque 0.8.6
 - crossbeam-epoch 0.9.18
 - crossbeam-utils 0.8.21
@@ -177,7 +178,7 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - yasna 0.5.2
 - zstd-safe 7.2.4
 
-### MIT — 40 component(s)
+### MIT — 41 component(s)
 - bytes 1.11.1
 - combine 4.6.7
 - dashmap 6.1.0
@@ -207,6 +208,7 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - tower-layer 0.3.3
 - tower-service 0.3.3
 - tracing 0.1.44
+- tracing-appender 0.2.5
 - tracing-attributes 0.1.31
 - tracing-core 0.1.36
 - tracing-log 0.2.0
@@ -276,19 +278,20 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - wat 1.248.0
 - wit-parser 0.217.1
 
+### MIT/Apache-2.0 — 6 component(s)
+- filetime 0.2.28
+- id-arena 2.3.0
+- minimal-lexical 0.2.1
+- rustc-demangle 0.1.27
+- symlink 0.1.0
+- zstd-sys 2.0.16+zstd.1.5.7
+
 ### ISC — 5 component(s)
 - maxminddb 0.24.0
 - rustls-webpki 0.102.8
 - rustls-webpki 0.103.13
 - simple_asn1 0.6.3
 - untrusted 0.9.0
-
-### MIT/Apache-2.0 — 5 component(s)
-- filetime 0.2.28
-- id-arena 2.3.0
-- minimal-lexical 0.2.1
-- rustc-demangle 0.1.27
-- zstd-sys 2.0.16+zstd.1.5.7
 
 ### Apache-2.0 OR ISC OR MIT — 4 component(s)
 - hyper-rustls 0.27.9
