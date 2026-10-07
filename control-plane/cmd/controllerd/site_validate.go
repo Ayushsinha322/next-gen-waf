@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -165,6 +166,10 @@ func validateSiteConfig(name string, domains []string, upstream, wafPolicy json.
 				if h, _, err := net.SplitHostPort(host); err == nil && h != "" {
 					add(fmt.Sprintf("upstream.servers[%d].host", i),
 						fmt.Sprintf("%q looks like host:port — put the port in the port field", host))
+				}
+				if isWAFSelfUpstream(host) && !loopbackUpstreamAllowed() {
+					add(fmt.Sprintf("upstream.servers[%d].host", i),
+						fmt.Sprintf("%q is this WAF node itself: requests would loop back into the WAF until every site answers 503 — use the application's address", host))
 				}
 			}
 		}
@@ -717,4 +722,33 @@ func domainConflicts(existing []db.SiteRow, domains []string, excludeSiteID stri
 		}
 	}
 	return problems
+}
+
+// isWAFSelfUpstream reports an origin address that is the WAF node itself:
+// loopback, the unspecified address, localhost, or the data plane's own
+// compose service names. The site wizard pre-filled 127.0.0.1:8080 — the data
+// plane's own HTTP listener — so one unedited save made it proxy to itself.
+func isWAFSelfUpstream(host string) bool {
+	h := strings.ToLower(strings.Trim(strings.TrimSpace(host), "[]"))
+	if ip := net.ParseIP(h); ip != nil {
+		return ip.IsLoopback() || ip.IsUnspecified()
+	}
+	if h == "localhost" || strings.HasSuffix(h, ".localhost") {
+		return true
+	}
+	switch h {
+	case "dataplane", "waf1", "waf2", "waf3", "sentinel-dataplane-1":
+		return true
+	}
+	return false
+}
+
+// loopbackUpstreamAllowed is the explicit opt-in for a same-host development
+// origin (SENTINEL_ALLOW_LOOPBACK_UPSTREAM=1); never set on a customer node.
+func loopbackUpstreamAllowed() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("SENTINEL_ALLOW_LOOPBACK_UPSTREAM"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }

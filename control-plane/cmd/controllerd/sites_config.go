@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/your-org/sentinel-waf/control-plane/internal/auth"
@@ -11,6 +13,7 @@ import (
 	"github.com/your-org/sentinel-waf/control-plane/internal/leader"
 	"github.com/your-org/sentinel-waf/control-plane/internal/logs"
 	"github.com/your-org/sentinel-waf/control-plane/internal/rbac"
+	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
 )
 
@@ -111,34 +114,18 @@ func handleImportSites(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub 
 		return
 	}
 
-	// An import creates and updates sites, so it applies the policy checks
-	// create and update do; without them a YAML file could store what the
-	// console refuses (a file:// feed, a paranoia level of 9). Every site is
-	// checked before any is written, so a refused document changes nothing
-	// rather than leaving the catalogue half-imported.
-	type importSite struct {
-		yamlSite
-		upJSON, wafJSON json.RawMessage
-	}
-	var sites []importSite
+	// The document's own policy values first, before the store is read: a bad
+	// document is refused without touching the database.
 	var problems []SiteConfigProblem
 	for _, ys := range doc.Sites {
-		if ys.Name == "" {
+		if ys.Name == "" || len(ys.WafPolicy) == 0 {
 			continue
 		}
-		upJSON, _ := json.Marshal(ys.Upstream)
 		wafJSON, _ := json.Marshal(ys.WafPolicy)
-		if len(ys.Upstream) == 0 {
-			upJSON = json.RawMessage(`{"servers":[],"lb":"round_robin"}`)
-		}
-		if len(ys.WafPolicy) == 0 {
-			wafJSON = json.RawMessage(defaultWafPolicyJSON)
-		}
 		for _, p := range validateWafPolicyValues(wafJSON) {
 			p.Field = fmt.Sprintf("sites[%s].%s", ys.Name, p.Field)
 			problems = append(problems, p)
 		}
-		sites = append(sites, importSite{ys, upJSON, wafJSON})
 	}
 	if len(problems) > 0 {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -153,58 +140,190 @@ func handleImportSites(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub 
 		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
+	sites, problems := planImport(doc.Sites, existing)
+	for _, is := range sites {
+		for _, p := range validateSitePluginNames(c, store, claims.TenantID, claims.UserID, is.wafJSON) {
+			p.Field = fmt.Sprintf("sites[%s].%s", is.Name, p.Field)
+			problems = append(problems, p)
+		}
+	}
+
+	// An import creates and updates sites, so every site gets the checks create
+	// and update apply — the whole site, plugin names, and domains no other site
+	// claims. It used to run only the policy-value check, so a document could
+	// store an origin or domain the console refuses. Every site is checked before
+	// any is written: a refused document changes nothing.
+	//
+	// An existing site is MERGED, not replaced: keys the document gives replace
+	// the stored ones, keys it leaves out keep their stored values. Replacing it
+	// wholesale turned a document naming only `waf_policy: {mode: blocking}` —
+	// the import box's own example — into a site with no exclusions, overrides,
+	// TLS or rate limits, and one with no upstream into a site with no servers.
+	if len(problems) > 0 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":    fmt.Sprintf("nothing was imported — %s", importProblemSummary(problems)),
+			"problems": problems,
+		})
+		return
+	}
+	if !requireLeader(c, cl) {
+		return
+	}
+
+	// A rollback point for the whole import, taken before the first write: the
+	// sites are written one by one, so a failure part-way is undone from Config
+	// History rather than left half-applied.
+	snapshotBeforeMutation(c, store, zap.L(), "site.import")
+
+	created, updated := 0, 0
+	for _, is := range sites {
+		ys := is.yamlSite
+		var siteID, op string
+		if is.cur != nil {
+			name := ys.Name
+			ureq := db.UpdateSiteRequest{Name: &name, Domains: is.domains, Upstream: is.upJSON, WafPolicy: is.wafJSON}
+			if _, err := store.UpdateSite(c.Request.Context(), claims.TenantID, claims.UserID, is.cur.ID, ureq); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"error": fmt.Sprintf("update %s: %s — %d created and %d updated before it; restore the site.import point in Config History to undo them", ys.Name, clientError(err), created, updated),
+				})
+				return
+			}
+			siteID, op = is.cur.ID, "update"
+			updated++
+		} else {
+			creq := db.CreateSiteRequest{Name: ys.Name, Domains: is.domains, Upstream: is.upJSON, WafPolicy: is.wafJSON}
+			site, err := store.CreateSite(c.Request.Context(), claims.TenantID, claims.UserID, creq)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"error": fmt.Sprintf("create %s: %s — %d created and %d updated before it; restore the site.import point in Config History to undo them", ys.Name, clientError(err), created, updated),
+				})
+				return
+			}
+			siteID, op = site.ID, "create"
+			created++
+		}
+		// One audit row per site, naming what the document set: an import
+		// used to leave a single row with no site and no change.
+		id := siteID
+		writeAuditEntry(c, store, hub, &db.WriteAuditRequest{
+			TenantID:    claims.TenantID,
+			ActorUserID: &claims.UserID,
+			Action:      "site.import",
+			TargetKind:  "site",
+			TargetID:    &id,
+			Diff:        importAuditDiff(op, ys),
+		})
+	}
+
+	configVersion.Add(1)
+	c.JSON(http.StatusOK, gin.H{"ok": true, "created": created, "updated": updated, "total": created + updated})
+}
+
+// importSite is one document site resolved against the catalogue: merged onto
+// the stored site when the name exists, defaulted when it is new.
+type importSite struct {
+	yamlSite
+	cur             *db.SiteRow
+	domains         []string
+	upJSON, wafJSON json.RawMessage
+}
+
+// planImport resolves and checks every document site against the existing
+// catalogue without writing anything (plugin names are checked by the caller,
+// which needs the store). See handleImportSites for why sites are merged.
+func planImport(docSites []yamlSite, existing []db.SiteRow) ([]importSite, []SiteConfigProblem) {
 	byName := make(map[string]db.SiteRow, len(existing))
 	for _, s := range existing {
 		byName[s.Name] = s
 	}
-
-	created, updated := 0, 0
-	for _, is := range sites {
-		ys, upJSON, wafJSON := is.yamlSite, is.upJSON, is.wafJSON
-		if cur, ok := byName[ys.Name]; ok {
-			name := ys.Name
-			ureq := db.UpdateSiteRequest{
-				Name:      &name,
-				Domains:   ys.Domains,
-				Upstream:  upJSON,
-				WafPolicy: wafJSON,
-			}
-			if !requireLeader(c, cl) {
-				return
-			}
-			if _, err := store.UpdateSite(c.Request.Context(), claims.TenantID, claims.UserID, cur.ID, ureq); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "update " + ys.Name + ": " + err.Error()})
-				return
-			}
-			updated++
-		} else {
-			creq := db.CreateSiteRequest{
-				Name:      ys.Name,
-				Domains:   ys.Domains,
-				Upstream:  upJSON,
-				WafPolicy: wafJSON,
-			}
-			if !requireLeader(c, cl) {
-				return
-			}
-			site, err := store.CreateSite(c.Request.Context(), claims.TenantID, claims.UserID, creq)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "create " + ys.Name + ": " + err.Error()})
-				return
-			}
-			_ = site
-			created++
+	var sites []importSite
+	var problems []SiteConfigProblem
+	claimed := map[string]string{} // domain → the site in this document that claims it
+	for _, ys := range docSites {
+		if ys.Name == "" {
+			continue
 		}
+		is := importSite{yamlSite: ys, domains: ys.Domains}
+		if cur, ok := byName[ys.Name]; ok {
+			is.cur = &cur
+			if ys.Domains == nil {
+				is.domains = cur.Domains
+			}
+			is.upJSON = mergeTopLevel(cur.Upstream, ys.Upstream)
+			is.wafJSON = mergeTopLevel(cur.WafPolicy, ys.WafPolicy)
+		} else {
+			is.upJSON, _ = json.Marshal(ys.Upstream)
+			if len(ys.Upstream) == 0 {
+				is.upJSON = json.RawMessage(`{"servers":[],"lb":"round_robin"}`)
+			}
+			is.wafJSON, _ = json.Marshal(ys.WafPolicy)
+			if len(ys.WafPolicy) == 0 {
+				is.wafJSON = json.RawMessage(defaultWafPolicyJSON)
+			}
+		}
+		add := func(ps []SiteConfigProblem) {
+			for _, p := range ps {
+				p.Field = fmt.Sprintf("sites[%s].%s", ys.Name, p.Field)
+				problems = append(problems, p)
+			}
+		}
+		add(validateSiteConfig(ys.Name, is.domains, is.upJSON, is.wafJSON))
+		exclude := ""
+		if is.cur != nil {
+			exclude = is.cur.ID
+		}
+		add(domainConflicts(existing, is.domains, exclude))
+		for _, d := range is.domains {
+			key := strings.ToLower(strings.TrimSpace(d))
+			if other, dup := claimed[key]; dup && other != ys.Name {
+				add([]SiteConfigProblem{{Field: "domains", Problem: fmt.Sprintf("%q is also claimed by %q in this document", d, other)}})
+			}
+			claimed[key] = ys.Name
+		}
+		sites = append(sites, is)
 	}
+	return sites, problems
+}
 
-	configVersion.Add(1)
-	writeAuditEntry(c, store, hub, &db.WriteAuditRequest{
-		TenantID:    claims.TenantID,
-		ActorUserID: &claims.UserID,
-		Action:      "site.import",
-		TargetKind:  "site",
+// mergeTopLevel lays the document's keys over the stored object: keys present
+// replace, keys absent keep the stored value. An absent or empty document
+// object keeps the stored one as it is.
+func mergeTopLevel(stored json.RawMessage, doc map[string]interface{}) json.RawMessage {
+	if len(doc) == 0 {
+		return stored
+	}
+	merged := map[string]interface{}{}
+	if len(stored) > 0 {
+		_ = json.Unmarshal(stored, &merged)
+	}
+	for k, v := range doc {
+		merged[k] = v
+	}
+	out, err := json.Marshal(merged)
+	if err != nil {
+		return stored
+	}
+	return out
+}
+
+// importAuditDiff records which top-level keys an import set on a site.
+func importAuditDiff(op string, ys yamlSite) json.RawMessage {
+	keys := func(m map[string]interface{}) []string {
+		out := make([]string, 0, len(m))
+		for k := range m {
+			out = append(out, k)
+		}
+		sort.Strings(out)
+		return out
+	}
+	b, _ := json.Marshal(map[string]interface{}{
+		"op":         op,
+		"name":       ys.Name,
+		"domains":    ys.Domains,
+		"upstream":   keys(ys.Upstream),
+		"waf_policy": keys(ys.WafPolicy),
 	})
-	c.JSON(http.StatusOK, gin.H{"ok": true, "created": created, "updated": updated, "total": created + updated})
+	return b
 }
 
 // importProblemSummary names the first problem and counts the rest, for the

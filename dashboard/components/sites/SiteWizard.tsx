@@ -25,7 +25,7 @@ import {
   ALL_CRS_KEYS, COUNTRIES, PresetKey, UpstreamServer, normalizeDomain,
   HTTP_METHODS, ACME_PROVIDERS, CustomHeader, certCoversHost, servingCertFor,
   checkSiteLimits, type LimitCheck, INSPECTION_LIMIT_DEFAULTS,
-  JWT_ALGORITHMS, FUSION_ENGINES, IpFeed,
+  JWT_ALGORITHMS, FUSION_ENGINES, IpFeed, SERVER_POLICY_DEFAULTS, policyKeyUnset,
 } from "@/lib/siteConfig";
 
 /** A number input's value for a field where "" means unset. */
@@ -395,6 +395,13 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
       showToast(e instanceof Error ? e.message : "Save failed", "e");
     } finally { setSaving(false); }
   }
+
+  // For a key the edited site's policy leaves out, the field shows the server's
+  // default, and a save keeps the key unset unless the value is changed.
+  const serverDefaultHint = (key: "paranoia_level" | "anomaly_threshold") =>
+    policyKeyUnset(form, key) && Number(form[key]) === SERVER_POLICY_DEFAULTS[key]
+      ? `Not set on this site: the server default (${SERVER_POLICY_DEFAULTS[key]}) applies, and saving keeps it unset unless you change it.`
+      : undefined;
 
   const toggleCat = (k: string) => upd({ rule_categories: form.rule_categories.includes(k) ? form.rule_categories.filter(x => x !== k) : [...form.rule_categories, k] });
   const toggleMethod = (m: string) => upd({ allowed_methods: form.allowed_methods.includes(m) ? form.allowed_methods.filter(x => x !== m) : [...form.allowed_methods, m] });
@@ -853,8 +860,8 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                                      on={form.proxy_keepalive} set={v => upd({ proxy_keepalive: v })} />
                     </Row>
                     <Row>
-                      <Field label="Connect Timeout" hint="How long to wait to establish a connection to the origin."><input className="fin2" value={form.proxy_connect_timeout} onChange={e => upd({ proxy_connect_timeout: e.target.value })} title="How long TCP (plus TLS) to the origin may take, e.g. 5s. Narrower than Read Timeout: it fails fast on an unreachable origin without shortening the budget of one that is merely slow. Blank = node default. Capped at 60s." /></Field>
-                      <Field label="Read Timeout" hint="How long to wait for the origin's response. Raise it for long-running requests."><input className="fin2" value={form.proxy_read_timeout} onChange={e => upd({ proxy_read_timeout: e.target.value })} title="How long the origin may take to return response headers (e.g. 60s, 5m). Raise it for slow report/export endpoints. It does not limit download or SSE stream duration. Blank = node default (30s)." /></Field>
+                      <Field label="Connect Timeout" hint="How long to wait to establish a connection to the origin."><input className="fin2" value={form.proxy_connect_timeout} placeholder="node default (10s)" onChange={e => upd({ proxy_connect_timeout: e.target.value })} title="How long TCP (plus TLS) to the origin may take, e.g. 5s. Narrower than Read Timeout: it fails fast on an unreachable origin without shortening the budget of one that is merely slow. Blank = node default. Capped at 60s." /></Field>
+                      <Field label="Read Timeout" hint="How long to wait for the origin's response. Raise it for long-running requests."><input className="fin2" value={form.proxy_read_timeout} placeholder="node default (30s)" onChange={e => upd({ proxy_read_timeout: e.target.value })} title="How long the origin may take to return response headers (e.g. 60s, 5m). Raise it for slow report/export endpoints. It does not limit download or SSE stream duration. Blank = node default (30s)." /></Field>
                     </Row>
                   </>)}
                 </>)}
@@ -863,8 +870,8 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                 {screen === "protect" && (<>
                   <StepHead title="Protection" sub="Core WAF settings. Switch to Advanced for full control." tag="enforced" />
                   <Row>
-                    <Field label="Paranoia Level" hint="1 = fewer false positives · 4 = strictest"><input className="fin2" type="number" min={1} max={4} value={form.paranoia_level} onChange={e => upd({ paranoia_level: Number(e.target.value), preset: "custom" })} /></Field>
-                    <Field label="Anomaly Threshold" hint="Score needed to block a request"><input className="fin2" type="number" value={form.anomaly_threshold} onChange={e => upd({ anomaly_threshold: Number(e.target.value), preset: "custom" })} /></Field>
+                    <Field label="Paranoia Level" hint={serverDefaultHint("paranoia_level") ?? "1 = fewer false positives · 4 = strictest"}><input className="fin2" type="number" min={1} max={4} value={form.paranoia_level} onChange={e => upd({ paranoia_level: Number(e.target.value), preset: "custom" })} /></Field>
+                    <Field label="Anomaly Threshold" hint={serverDefaultHint("anomaly_threshold") ?? "Score needed to block a request"}><input className="fin2" type="number" value={form.anomaly_threshold} onChange={e => upd({ anomaly_threshold: Number(e.target.value), preset: "custom" })} /></Field>
                   </Row>
                   <LimitNotes checks={checkSiteLimits(form)} fields={["paranoia_level", "anomaly_threshold"]} />
                   <SectionToggle label="Per-IP Rate Limiting" desc={`${form.rl_per_ip.rps} req/s · burst ${form.rl_per_ip.burst}`} on={form.rate_limit_enabled} set={v => upd({ rate_limit_enabled: v })} />
@@ -876,8 +883,8 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                 {screen === "rules" && (<>
                   <StepHead title="WAF Rules" sub="OWASP CRS categories, paranoia level and per-rule exclusions." tag="enforced" />
                   <Row>
-                    <Field label="Paranoia Level" hint="1–4 · higher = stricter"><input className="fin2" type="number" min={1} max={4} value={form.paranoia_level} onChange={e => upd({ paranoia_level: Number(e.target.value) })} /></Field>
-                    <Field label="Anomaly Threshold" hint="Total rule score at which a request is refused. Lower blocks more — the balanced preset uses 10."><input className="fin2" type="number" value={form.anomaly_threshold} onChange={e => upd({ anomaly_threshold: Number(e.target.value) })} /></Field>
+                    <Field label="Paranoia Level" hint={serverDefaultHint("paranoia_level") ?? "1–4 · higher = stricter"}><input className="fin2" type="number" min={1} max={4} value={form.paranoia_level} onChange={e => upd({ paranoia_level: Number(e.target.value) })} /></Field>
+                    <Field label="Anomaly Threshold" hint={serverDefaultHint("anomaly_threshold") ?? "Total rule score at which a request is refused. Lower blocks more — the balanced preset uses 10."}><input className="fin2" type="number" value={form.anomaly_threshold} onChange={e => upd({ anomaly_threshold: Number(e.target.value) })} /></Field>
                   </Row>
                   <LimitNotes checks={checkSiteLimits(form)} fields={["paranoia_level", "anomaly_threshold"]} />
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
@@ -1137,14 +1144,18 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                   <InfoBox>Secure defaults (X-Content-Type-Options, X-Frame-Options, X-XSS-Protection) are always applied. The values below override them for this site.</InfoBox>
                   <Field label="Content-Security-Policy" hint="Leave blank to omit CSP"><input className="fin2" value={form.csp} placeholder="default-src 'self'" style={{ fontFamily: "var(--font-mono)", fontSize: 13 }} onChange={e => upd({ csp: e.target.value })} /></Field>
                   <Row>
+                    {/* "Not set" is a real choice, not a missing one: the data
+                        plane then keeps the origin's header (or adds its own
+                        default), where a value here replaces the origin's. */}
                     <Field label="Referrer-Policy" hint="How much of the current URL a browser sends when following a link away from this site.">
                       <select className="fin2 fsel2" value={form.referrer_policy} onChange={e => upd({ referrer_policy: e.target.value })}>
+                        <option value="">Not set (the origin&apos;s, else strict-origin-when-cross-origin)</option>
                         {["no-referrer", "no-referrer-when-downgrade", "strict-origin", "strict-origin-when-cross-origin", "same-origin", "origin"].map(v => <option key={v} value={v}>{v}</option>)}
                       </select>
                     </Field>
-                    <Field label="Cookie Flags" hint="Applied to Set-Cookie"><input className="fin2" value={form.cookie_flags} style={{ fontFamily: "var(--font-mono)", fontSize: 13 }} onChange={e => upd({ cookie_flags: e.target.value })} /></Field>
+                    <Field label="Cookie Flags" hint="Applied to Set-Cookie. Blank leaves cookies as the origin sets them."><input className="fin2" value={form.cookie_flags} placeholder="Not set, e.g. * HttpOnly SameSite=Lax" style={{ fontFamily: "var(--font-mono)", fontSize: 13 }} onChange={e => upd({ cookie_flags: e.target.value })} /></Field>
                   </Row>
-                  <Field label="Permissions-Policy" hint="Which browser features (camera, microphone, geolocation, …) pages on this site may use."><input className="fin2" value={form.permissions_policy} style={{ fontFamily: "var(--font-mono)", fontSize: 13 }} onChange={e => upd({ permissions_policy: e.target.value })} /></Field>
+                  <Field label="Permissions-Policy" hint="Which browser features (camera, microphone, geolocation, …) pages on this site may use. Blank keeps the origin's, else geolocation=(), microphone=(), camera=()."><input className="fin2" value={form.permissions_policy} placeholder="Not set" style={{ fontFamily: "var(--font-mono)", fontSize: 13 }} onChange={e => upd({ permissions_policy: e.target.value })} /></Field>
                   <SectionToggle label="CORS (Access-Control-Allow-Origin)" desc="Add cross-origin response headers" on={form.cors_enabled} set={v => upd({ cors_enabled: v })} />
                   {form.cors_enabled && <Field label="Allowed Origins" hint="* or comma-separated origins"><input className="fin2" value={form.cors_origins} style={{ fontFamily: "var(--font-mono)", fontSize: 13 }} onChange={e => upd({ cors_origins: e.target.value })} /></Field>}
                   <GroupLabel>Custom Headers</GroupLabel>
