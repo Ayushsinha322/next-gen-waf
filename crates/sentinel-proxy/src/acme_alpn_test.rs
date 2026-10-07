@@ -42,7 +42,7 @@ impl ServerCertVerifier for AcceptAny {
         Ok(HandshakeSignatureValid::assertion())
     }
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        rustls::crypto::aws_lc_rs::default_provider()
+        rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
     }
@@ -91,7 +91,7 @@ fn validate(server_cfg: ServerConfig) -> Result<(Option<Vec<u8>>, Vec<u8>), rust
 
 #[test]
 fn a_tls_alpn_01_validation_gets_the_challenge_cert() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let dir = std::env::temp_dir().join(format!("sk-alpn-{}", std::process::id()));
     let store = CertStore::new(dir);
     let challenge = rcgen::generate_simple_self_signed(vec!["example.org".to_string()]).unwrap();

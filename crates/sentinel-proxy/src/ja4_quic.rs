@@ -682,6 +682,21 @@ mod tests {
         (wrapped, der)
     }
 
+    /// A client config on the ring provider, whatever this test process
+    /// installed as its default. The panic-injection test depends on how many
+    /// Initial packets the hello takes: aws-lc-rs adds a 1,216-byte ML-KEM key
+    /// share, which pushes the hello into a second packet, and rustls shuffles
+    /// extension order — so a marker meant for the first chunk landed in the
+    /// second about half the time once another test had installed aws-lc-rs
+    /// first (CI pipeline 32237).
+    fn ring_client_builder() -> rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier> {
+        rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("ring supports the default protocol versions")
+    }
+
     fn test_client_config(server_cert: &[u8]) -> quinn::ClientConfig {
         let mut roots = rustls::RootCertStore::empty();
         roots
@@ -689,7 +704,7 @@ mod tests {
                 server_cert.to_vec(),
             ))
             .expect("add root");
-        let mut cfg = rustls::ClientConfig::builder()
+        let mut cfg = ring_client_builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
         cfg.alpn_protocols = vec![b"h3".to_vec()];
@@ -880,7 +895,7 @@ mod tests {
                 server_cert.to_vec(),
             ))
             .expect("add root");
-        let mut cfg = rustls::ClientConfig::builder()
+        let mut cfg = ring_client_builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
         cfg.alpn_protocols = alpn;
