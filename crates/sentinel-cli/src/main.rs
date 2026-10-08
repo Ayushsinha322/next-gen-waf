@@ -1125,8 +1125,13 @@ async fn cmd_copilot(action: CopilotCmd) -> Result<()> {
     let cfg = CopilotConfig {
         endpoint: std::env::var("SENTINEL_LLM_ENDPOINT")
             .unwrap_or_else(|_| "https://ai.enlight.dev/api".into()),
+        // No built-in key: one sat here as a literal and so shipped in every
+        // build and in git history (2026-10-07 review), so it must be revoked at
+        // the provider; deleting it here does not take it back.
         api_key: std::env::var("SENTINEL_LLM_API_KEY")
-            .unwrap_or_else(|_| "sk-f87a48c6102447abb3382b596ebf51de".into()),
+            .ok()
+            .filter(|k| !k.trim().is_empty())
+            .ok_or_else(|| anyhow!("set SENTINEL_LLM_API_KEY to use the copilot"))?,
         model: std::env::var("SENTINEL_LLM_MODEL").unwrap_or_else(|_| "deepseek-r1:8b".into()),
         timeout_secs: 30,
     };
