@@ -125,6 +125,9 @@ rust-audit:
   stage: test
   script:
     - cargo install cargo-audit --version 0.22.1 --locked
+    # .cargo/ is also CARGO_HOME and is cached: the cache restore can lay an older
+    # audit.toml over the committed one. The committed exceptions are the policy.
+    - git checkout -- .cargo/audit.toml
     - cargo audit
 
 rust-test:
