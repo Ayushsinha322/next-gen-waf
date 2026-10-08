@@ -309,7 +309,9 @@ fi
 step "Step 5 of 8 — backup"
 BK_STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 BK_DIR="$STATE_DIR/pre-upgrade-$CURRENT-to-$NEW-$BK_STAMP"
-mkdir -p "$BK_DIR"
+# Root-only: it holds a copy of .env and, before backup.sh tightens it, was
+# created with the default umask.
+mkdir -p -m 700 "$BK_DIR"
 # The .env FIRST and unconditionally. A restored database is useless without the
 # keys that authenticate and sign against it, and it is one small file.
 cp "$ENV_FILE" "$BK_DIR/.env" && chmod 600 "$BK_DIR/.env"

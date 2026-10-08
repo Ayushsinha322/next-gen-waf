@@ -8,6 +8,11 @@
 #   ./restore.sh latest                # newest dir under $BACKUP_ROOT
 #   ./restore.sh <dir> --force         # skip the confirmation prompt (automation)
 #
+# An encrypted backup (1.1.18 on; see _crypto.sh) needs the key it was taken
+# with: $BACKUP_KEY_FILE, or the private key of BACKUP_GPG_RECIPIENT in root's
+# keyring. That is checked before anything is stopped. The .env, PKI and
+# certificates in the backup are not restored here: extract-secrets.sh.
+#
 # Without --force it asks for a typed YES, on a terminal only: with no terminal
 # to ask on (a script, a pipe, output sent to a log) it refuses rather than wait
 # on a question nobody can see. Callers confirm first and pass --force.
@@ -52,6 +57,12 @@ if [ -f "$SRC/SHA256SUMS" ]; then
   log "  checksums OK"
 fi
 
+# ── Decryption ───────────────────────────────────────────────────────────────
+# Proven here, before the prompt and before anything is stopped: a wrong or
+# missing key must not be found out with the WAF already down.
+trap gpg_cleanup EXIT
+open_backup "$SRC"
+
 # ── Confirm ──────────────────────────────────────────────────────────────────
 # Only where someone can see the question and answer it. rollback.sh and
 # upgrade.sh ran this without --force and with all its output in their log: the
@@ -93,6 +104,7 @@ on_exit() {
     printf 'ERROR: the restore did not finish, so the databases may be partly restored.\n       The backup itself is unchanged: run the restore again.\n' >&2
   fi
   start_writers || rc=1
+  gpg_cleanup
   exit "$rc"
 }
 trap on_exit EXIT
@@ -115,7 +127,8 @@ fi
 # ── PostgreSQL ───────────────────────────────────────────────────────────────
 RESTORING=yes
 log "pg_restore (--clean --if-exists)…"
-pg_sh 'exec pg_restore --clean --if-exists --no-owner -U "$POSTGRES_USER" -d "$POSTGRES_DB"' < "$SRC/postgres.dump"
+dec < "$SRC/postgres.dump" \
+  | pg_sh 'exec pg_restore --clean --if-exists --no-owner -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
 log "  postgres restored"
 
 # ── ClickHouse ───────────────────────────────────────────────────────────────
@@ -132,9 +145,10 @@ if [ -f "$SRC/clickhouse/TABLES.txt" ]; then
     log "  table $t"
     ch_sh "clickhouse-client -u \"\$CLICKHOUSE_USER\" --password \"\$CLICKHOUSE_PASSWORD\" -q \"DROP TABLE IF EXISTS \$CLICKHOUSE_DB.\\\`$t\\\`\"" </dev/null
     # recreate from the saved DDL (which carries the db-qualified name)
-    ch_sh "clickhouse-client -u \"\$CLICKHOUSE_USER\" --password \"\$CLICKHOUSE_PASSWORD\" --multiquery" < "$SRC/clickhouse/$t.schema.sql"
+    dec < "$SRC/clickhouse/$t.schema.sql" \
+      | ch_sh "clickhouse-client -u \"\$CLICKHOUSE_USER\" --password \"\$CLICKHOUSE_PASSWORD\" --multiquery"
     # reload data
-    gzip -dc "$SRC/clickhouse/$t.native.gz" \
+    dec < "$SRC/clickhouse/$t.native.gz" | gzip -dc \
       | ch_sh "clickhouse-client -u \"\$CLICKHOUSE_USER\" --password \"\$CLICKHOUSE_PASSWORD\" -q \"INSERT INTO \$CLICKHOUSE_DB.\\\`$t\\\` FORMAT Native\""
   done 3< "$SRC/clickhouse/TABLES.txt"
   log "  clickhouse restored"

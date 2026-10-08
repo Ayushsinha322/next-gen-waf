@@ -1,21 +1,26 @@
 # Swaraj Kavach — backup oneshot (invoked by sentinel-backup.timer).
-# Install:
-#   sudo cp deploy/backup/systemd/sentinel-backup.* /etc/systemd/system/
-#   sudo mkdir -p /etc/sentinel && sudo cp deploy/backup/systemd/backup.env.example /etc/sentinel/backup.env
-#   sudo $EDITOR /etc/sentinel/backup.env      # set repo path + ONE offsite target
+#
+# install.sh installs and enables this on every host (1.1.18 on). By hand:
+#   sudo cp scripts/backup/systemd/sentinel-backup.* /etc/systemd/system/
+#   sudo mkdir -p /etc/sentinel && sudo cp scripts/backup/systemd/backup.env.example /etc/sentinel/backup.env
+#   sudo $EDITOR /etc/sentinel/backup.env      # paths + ONE offsite target
 #   sudo systemctl daemon-reload && sudo systemctl enable --now sentinel-backup.timer
+# Run one now:   sudo systemctl start sentinel-backup.service
+# Last result:   systemctl status sentinel-backup.service ; journalctl -u sentinel-backup
 [Unit]
-Description=Swaraj Kavach backup (PostgreSQL + ClickHouse -> offsite)
+Description=Swaraj Kavach backup (PostgreSQL + ClickHouse + secrets, encrypted -> offsite)
 After=docker.service
 Requires=docker.service
 
 [Service]
 Type=oneshot
-# All tunables (repo path, BACKUP_ROOT, RETENTION_DAYS, offsite target) live here.
-# (backup.sh resolves its own paths, so no WorkingDirectory is needed; systemd does
-#  not expand ${VAR} in WorkingDirectory anyway.)
+# All tunables (script location, BACKUP_ROOT, RETENTION_DAYS, the key, the
+# offsite target) live here. systemd expands ${VAR} in ExecStart from it.
 EnvironmentFile=/etc/sentinel/backup.env
-ExecStart=/bin/bash ${SENTINEL_REPO}/deploy/backup/backup.sh
+ExecStart=/bin/bash ${SENTINEL_BACKUP_DIR}/backup.sh
+# Belt and braces with backup.sh's own umask: nothing it writes is readable by
+# anyone but root.
+UMask=0077
 # Backups should never wedge the box:
 Nice=10
 IOSchedulingClass=idle

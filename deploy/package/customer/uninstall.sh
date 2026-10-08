@@ -49,6 +49,15 @@ fi
 docker ps -aq --filter "name=sentinel-" | xargs -r docker rm -f >/dev/null 2>&1 || true
 printf '  %s✓%s containers removed\n' "$GRN" "$R"
 
+# The nightly backup has nothing left to back up. Backups and their key are
+# kept, --purge included: they are how this uninstall is undone.
+if [[ -f /etc/systemd/system/sentinel-backup.timer ]]; then
+  systemctl disable --now sentinel-backup.timer >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/sentinel-backup.timer /etc/systemd/system/sentinel-backup.service
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  printf '  %s✓%s nightly backup unscheduled; backups KEPT in /var/backups/sentinel, key KEPT at /etc/sentinel/backup.key\n' "$GRN" "$R"
+fi
+
 if [[ "$PURGE" == "yes" ]]; then
   for v in "${VOLUMES[@]}"; do docker volume rm "$v" >/dev/null 2>&1 || true; done
   rm -rf "$STATE_DIR" "$PKI_DIR"

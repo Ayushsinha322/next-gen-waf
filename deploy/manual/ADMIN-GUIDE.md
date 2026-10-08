@@ -159,20 +159,28 @@ machines to remove browser warnings for internal names.
 certificates, attack history — is in two databases. A VM failure without a backup
 means rebuilding every site by hand from memory.
 
+The installer schedules a nightly backup (02:30, `sentinel-backup.timer`).
+It covers PostgreSQL (all configuration), ClickHouse (traffic and event
+history), and the host's secrets: `.env`, the internal certificate authority in
+`/opt/sentinel-pki/`, and the certificate store with every site's TLS key. Each
+backup is a timestamped, root-only directory under `/var/backups/sentinel` with
+a manifest and SHA-256 checksums, **encrypted** with the key in
+`/etc/sentinel/backup.key`. Old copies are pruned and the result is pushed
+offsite.
+
+Two things are yours to do on day one:
+
+1. **Copy `/etc/sentinel/backup.key` off this VM** (a password manager, a vault).
+   It is in no backup by design. Lose the VM and the key together and every
+   backup is unreadable.
+2. **Add an offsite target** in `/etc/sentinel/backup.env` (`BACKUP_RCLONE_REMOTE`
+   or `BACKUP_RSYNC_DEST`). Until then backups live only on the disk they protect.
+
 ```bash
-sudo /opt/sentinel/current/scripts/backup/backup.sh
+sudo systemctl start sentinel-backup.service     # take one now
+journalctl -u sentinel-backup -n 30              # see how the last one went
+systemctl list-timers sentinel-backup.timer      # when the next one runs
 ```
-
-It backs up PostgreSQL (all configuration) and ClickHouse (traffic and event
-history) into a timestamped directory with a manifest and SHA-256 checksums,
-prunes old copies, and pushes the result offsite.
-
-Settings — backup location, retention, offsite target — are in `_common.sh` in
-that directory. A systemd timer is provided in `scripts/backup/systemd/` to run
-it on a schedule; use it rather than remembering to run it by hand.
-
-**Also back up `/opt/sentinel/current/.env`.** It holds every generated secret.
-Without it a restore cannot decrypt or reconnect to anything.
 
 ### Test the restore, do not assume it
 

@@ -648,31 +648,36 @@ one, a user who forgets theirs must be deleted and recreated by an administrator
 
 ## 9. Backup and recovery
 
-### What to back up
+### What is backed up
 
 | | Why |
 |---|---|
 | **`/opt/sentinel/current/.env`** | **Every secret, including the only admin password. Irreplaceable.** |
 | `/opt/sentinel-pki/` | the internal certificate authority |
-| The database | sites, users, configuration, event history |
+| the certificate store | every site's TLS certificate and private key |
+| the databases | sites, users, configuration, event history |
 
 ### How
 
+The installer schedules this nightly at 02:30, encrypted with the key in
+`/etc/sentinel/backup.key`. Take one by hand with:
+
 ```bash
-/opt/sentinel/current/scripts/backup/backup.sh
+sudo systemctl start sentinel-backup.service
 ```
 
 Then **test it**, which is the step everybody skips:
 
 ```bash
-/opt/sentinel/current/scripts/backup/drill.sh
+sudo /opt/sentinel/current/scripts/backup/drill.sh
 ```
 
 An untested backup is a hope, not a backup.
 
-Schedule it with the shipped systemd timer (see `scripts/backup/RUNBOOK.md`), and
-**copy `.env` somewhere off this VM.** A backup that only exists on the machine you
-are protecting against losing is not a backup.
+**Copy `/etc/sentinel/backup.key` somewhere off this VM, and set an offsite
+target in `/etc/sentinel/backup.env`.** The key is in no backup, and a backup
+that only exists on the machine you are protecting against losing is not a
+backup. Details: `scripts/backup/RUNBOOK.md`.
 
 ---
 

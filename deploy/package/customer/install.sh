@@ -52,6 +52,8 @@ LOG="$LOG_DIR/install.log"
 STATE_DIR=/opt/sentinel
 INSTALL_DIR="$STATE_DIR/current"
 PKI_DIR=/opt/sentinel-pki
+BACKUP_ENV=/etc/sentinel/backup.env
+BACKUP_KEY=/etc/sentinel/backup.key
 
 NONINTERACTIVE=no
 DRY_RUN=no
@@ -1154,6 +1156,33 @@ else
   warn "kernel network profile skipped (--no-harden)"
 fi
 
+# Nightly encrypted backup. The units shipped with every bundle and nothing
+# installed them, so no installation had ever taken a backup on its own. An
+# existing backup.env or key is someone's configuration and is kept.
+BACKUP_UNITS="$INSTALL_DIR/scripts/backup/systemd"
+if [[ -r "$BACKUP_UNITS/sentinel-backup.service" ]]; then
+  mkdir -p /etc/sentinel && chmod 755 /etc/sentinel
+  if [[ ! -f "$BACKUP_ENV" ]]; then
+    sed -e "s|^SENTINEL_BACKUP_DIR=.*|SENTINEL_BACKUP_DIR=$INSTALL_DIR/scripts/backup|" \
+        -e "s|^COMPOSE_FILE=.*|COMPOSE_FILE=$INSTALL_DIR/compose.prod.yml|" \
+        -e "s|^ENV_FILE=.*|ENV_FILE=$ENV_FILE|" \
+        -e "s|^BACKUP_KEY_FILE=.*|BACKUP_KEY_FILE=$BACKUP_KEY|" \
+        "$BACKUP_UNITS/backup.env.example" > "$BACKUP_ENV" && chmod 600 "$BACKUP_ENV"
+  fi
+  [[ -s "$BACKUP_KEY" ]] || ( umask 077; openssl rand -hex 32 > "$BACKUP_KEY" )
+  command -v gpg >/dev/null 2>&1 \
+    || warn "gpg is not installed: backups will be root-only but NOT encrypted, and never sent offsite — apt-get install gnupg"
+  if cp "$BACKUP_UNITS"/sentinel-backup.{service,timer} /etc/systemd/system/ 2>>"$LOG" \
+     && systemctl daemon-reload >>"$LOG" 2>&1 \
+     && systemctl enable --now sentinel-backup.timer >>"$LOG" 2>&1; then
+    ok "nightly encrypted backup scheduled (sentinel-backup.timer, 02:30) → /var/backups/sentinel"
+  else
+    warn "could not schedule the nightly backup — see $LOG; run $INSTALL_DIR/scripts/backup/backup.sh by hand"
+  fi
+else
+  warn "backup units not in this package (scripts/backup/systemd/) — no backup is scheduled"
+fi
+
 # ── Step 10 — start (migrations run as a compose dependency) ─────────────────
 step "Step 10 of 11 — starting services"
 C=(docker compose -p sentinel -f "$INSTALL_DIR/compose.prod.yml" --env-file "$ENV_FILE")
@@ -1371,10 +1400,12 @@ $CONSOLE_HOW
     3. After a full business cycle, measure and then enable blocking:
          $INSTALL_DIR/scripts/fpr-report.sh 168
        For a real application follow $INSTALL_DIR/docs/manual/SITE-ONBOARDING.md.
-    4. Configure backups: $INSTALL_DIR/scripts/backup/backup.sh
+    4. ${B}Copy the backup key off this host:${R} $BACKUP_KEY
+       Nightly backups are encrypted with it and it is in none of them; without
+       it no backup can be restored. Add an offsite target in $BACKUP_ENV.
     5. Fill in the SMTP block in $ENV_FILE so password recovery works.
 
-    Config  $ENV_FILE  ${DIM}(all secrets — back this up)${R}
+    Config  $ENV_FILE  ${DIM}(all secrets — in every backup, encrypted)${R}
     Report  $REPORT
     Log     $LOG
 

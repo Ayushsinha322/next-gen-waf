@@ -52,6 +52,9 @@ CH_CONTAINER="${CH_CONTAINER:-}"
 log()  { printf '%s  %s\n' "$(date -u +%FT%TZ)" "$*"; }
 die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
+# shellcheck source=_crypto.sh
+. "$BK_DIR/_crypto.sh"
+
 dc() { docker compose -f "$COMPOSE_FILE" ${ENV_FILE:+--env-file "$ENV_FILE"} "$@"; }
 
 # Run a shell snippet inside the postgres / clickhouse container. Creds are read
@@ -69,6 +72,10 @@ ch_sh() {
 # is configured but the transfer fails (so cron/systemd surfaces it).
 offsite_push() {
   local src="$1" name; name="$(basename "$src")"
+  if [ "$ENCRYPTION" = none ] && [ -n "$BACKUP_RCLONE_REMOTE$BACKUP_RSYNC_DEST" ]; then
+    log "refusing to send an unencrypted backup offsite — install gpg (apt-get install gnupg)"
+    return 1
+  fi
   if [ -n "$BACKUP_RCLONE_REMOTE" ]; then
     command -v rclone >/dev/null || die "BACKUP_RCLONE_REMOTE set but rclone not installed"
     log "offsite → rclone $BACKUP_RCLONE_REMOTE/$name"

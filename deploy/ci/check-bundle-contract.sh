@@ -148,7 +148,11 @@ rm -f "$RESOLVER"
 sect "Scripts referenced by the installer are shipped"
 # hardening/* : install.sh Step 9 reads the sysctl profile from scripts/hardening/
 # and warns "not in this package" when it is absent — on every install, for ever.
+# backup/systemd/* : install.sh schedules the nightly backup from these.
 for s in fpr-report.sh backup/backup.sh backup/drill.sh issue-ip-cert.sh \
+         backup/_crypto.sh backup/restore.sh backup/extract-secrets.sh \
+         backup/systemd/sentinel-backup.service backup/systemd/sentinel-backup.timer \
+         backup/systemd/backup.env.example \
          issue-postgres-cert.sh issue-clickhouse-cert.sh promote-standby.sh preflight.sh \
          clickhouse-cpu-check.sh \
          hardening/99-sentinel-ddos.conf hardening/harden-network.sh; do

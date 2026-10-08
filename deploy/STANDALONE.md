@@ -222,9 +222,13 @@ you spend the following week on the phone.
 Not a formality on a single VM — it is the **only** recovery mechanism. There is no
 second copy of anything here.
 
+The installer schedules an encrypted nightly backup (`sentinel-backup.timer`).
+Copy its key, `/etc/sentinel/backup.key`, off the VM, and give it an offsite
+target in `/etc/sentinel/backup.env`.
+
 ```bash
-/opt/sentinel/current/scripts/backup/backup.sh
-/opt/sentinel/current/scripts/backup/drill.sh      # prove a restore actually works
+sudo systemctl start sentinel-backup.service                # take one now
+sudo /opt/sentinel/current/scripts/backup/drill.sh          # prove a restore actually works
 ```
 
 Run the drill before you call this production. An untested backup is an assumption.
