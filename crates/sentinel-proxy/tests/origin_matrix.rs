@@ -107,6 +107,11 @@ fn trusted_cert() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
 
 /// Right name, wrong issuer: self-signed, not from the trusted CA.
 fn untrusted_cert() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+    // pki() also installs the process crypto provider. The one test using this
+    // never called it before start_origin built a ServerConfig, so whenever it
+    // ran first (CI 32374) rustls could not choose between ring and aws-lc-rs
+    // and panicked — and run alone it failed every time.
+    pki();
     let c = rcgen::generate_simple_self_signed(vec![APP.to_string()]).expect("self-signed");
     (
         CertificateDer::from(c.serialize_der().expect("der")),
