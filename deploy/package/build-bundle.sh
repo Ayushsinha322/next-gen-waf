@@ -185,6 +185,7 @@ cp deploy/docker/pg-init-replication.sh    "$STAGE/compose/"
 cp deploy/docker/pg-standby-entrypoint.sh  "$STAGE/compose/"
 chmod +x "$STAGE/compose/pg-init-replication.sh" "$STAGE/compose/pg-standby-entrypoint.sh"
 cp deploy/docker/prometheus.yml            "$STAGE/compose/" 2>/dev/null || true
+cp deploy/docker/prometheus-rules.yml      "$STAGE/compose/" || die "prometheus-rules.yml missing: compose.prod.yml mounts it"
 # compose.ha.yml is shipped and bind-mounts ./haproxy.cfg; without it Docker would
 # create a directory there and HAProxy would fail to start. (haproxy:2.9-alpine is
 # listed in THIRD_PARTY below for the same reason.)

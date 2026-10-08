@@ -282,6 +282,14 @@ func run() error {
 			} else if !privileged {
 				log.Info("non-superuser DB role — skipping auto-seed/ensure-schema (handled by migrations run as the owner role)")
 			}
+			// The installer's alert address becomes an email channel, once.
+			if addr := strings.TrimSpace(os.Getenv("SENTINEL_ALERT_EMAIL")); addr != "" && privileged {
+				if created, err := db.SeedAlertEmailChannel(ctx, pool, addr); err != nil {
+					log.Warn("alert email channel not created", zap.Error(err))
+				} else if created {
+					log.Info("alert email channel created from SENTINEL_ALERT_EMAIL", zap.String("to", addr))
+				}
+			}
 
 			// JWT revocation: consult the shared denylist on every Validate so a
 			// logout kills the session cluster-wide. Fail OPEN on a DB error (a
@@ -432,6 +440,9 @@ func run() error {
 			reportDeliverer.Store(rd)
 			stops = append(stops, func() { rd.Stop(); reportDeliverer.Store((*reports.Deliverer)(nil)) })
 			nm := nodehealth.New(store, eng, log)
+			if chClient != nil && chClient.Enabled() {
+				nm.SetClickHousePing(chClient.Ping)
+			}
 			nm.Start()
 			stops = append(stops, nm.Stop)
 			// Forget nodes and cluster members not heard from for a day: former

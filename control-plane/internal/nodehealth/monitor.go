@@ -11,6 +11,7 @@ import (
 	"github.com/your-org/sentinel-waf/control-plane/internal/jobs"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -57,7 +58,24 @@ type Monitor struct {
 	// NOTE: this is why reconcileAlerts exists — a restart empties this map, so
 	// transitions alone cannot be trusted to close anything.
 	dpPrev map[string]string // data-plane node id -> last effective status
+
+	// Per-node heartbeat history behind the condition alerts (conditions.go).
+	tracks map[string]*nodeTrack
+	// Ping for the control plane's own ClickHouse; nil when none is configured.
+	chPing func(context.Context) error
+	// Close condition alerts without a transition on the next sweep: the first
+	// after a start (the in-memory "open" set is empty, so rows left open by the
+	// previous leader would otherwise stay open), and periodically after.
+	reconcileDue bool
+	sweeps       int
+	// One sweep at a time: the loop and a "run now" from the Jobs page share
+	// the maps above.
+	sweepMu sync.Mutex
 }
+
+// SetClickHousePing lets the monitor alert when the control plane itself
+// cannot reach the event store.
+func (m *Monitor) SetClickHousePing(ping func(context.Context) error) { m.chPing = ping }
 
 // New builds a Monitor. downAfter comes from SENTINEL_NODE_DOWN_SECS (seconds;
 // default 30s). The Monitor should only be started when store != nil.
@@ -73,14 +91,16 @@ func New(store *db.Store, engine *alerting.Engine, log *zap.Logger) *Monitor {
 	}
 	tenantID, userID := engine.Identity()
 	return &Monitor{
-		store:     store,
-		engine:    engine,
-		log:       log,
-		downAfter: downAfter,
-		done:      make(chan struct{}),
-		dpPrev:    make(map[string]string),
-		tenantID:  tenantID,
-		userID:    userID,
+		store:        store,
+		engine:       engine,
+		log:          log,
+		downAfter:    downAfter,
+		done:         make(chan struct{}),
+		dpPrev:       make(map[string]string),
+		tracks:       make(map[string]*nodeTrack),
+		reconcileDue: true,
+		tenantID:     tenantID,
+		userID:       userID,
 	}
 }
 
@@ -184,11 +204,18 @@ func (m *Monitor) reconcileAlerts(ctx context.Context, healthy []string) (int64,
 
 // tickTracked runs one sweep and reports the node count, for the jobs registry.
 func (m *Monitor) tickTracked(ctx context.Context) (string, error) {
+	m.sweepMu.Lock()
+	defer m.sweepMu.Unlock()
 	nodes, err := m.store.ListNodes(ctx)
 	if err != nil {
 		return "", err
 	}
 	m.tick(ctx)
+	m.sweeps++
+	if m.sweeps%30 == 0 {
+		m.reconcileDue = true
+	}
+	m.checkConditions(ctx, nodes)
 
 	resolved, err := m.reconcileAlerts(ctx, healthyNodeIDs(nodes, m.downAfter, time.Now()))
 	if err != nil {

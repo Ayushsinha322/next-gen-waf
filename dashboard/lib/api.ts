@@ -193,7 +193,7 @@ export interface Alert {
 }
 
 export type Severity = "info" | "low" | "medium" | "high" | "critical";
-export type ChannelType = "webhook" | "slack" | "syslog" | "cef";
+export type ChannelType = "webhook" | "slack" | "syslog" | "cef" | "email";
 
 /** Type-specific settings for a notification channel (superset; only the
  *  relevant subset is used per channel type). */
@@ -209,6 +209,8 @@ export interface ChannelConfig {
   protocol?: "udp" | "tcp";
   facility?: number;
   tag?:      string;
+  // email: recipients, comma-separated; sent through the SMTP relay in .env
+  to?:       string;
 }
 
 export interface NotificationChannel {

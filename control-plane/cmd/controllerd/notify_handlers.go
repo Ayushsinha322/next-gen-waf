@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -10,6 +12,7 @@ import (
 	"github.com/your-org/sentinel-waf/control-plane/internal/auth"
 	"github.com/your-org/sentinel-waf/control-plane/internal/db"
 	"github.com/your-org/sentinel-waf/control-plane/internal/logs"
+	"github.com/your-org/sentinel-waf/control-plane/internal/mailer"
 	"github.com/your-org/sentinel-waf/control-plane/internal/notify"
 	"github.com/your-org/sentinel-waf/control-plane/internal/rbac"
 
@@ -18,6 +21,18 @@ import (
 
 // sharedDispatcher backs the "test channel" endpoint. Stateless, safe to share.
 var sharedDispatcher = &notify.Dispatcher{}
+
+// Email channels send through the relay password recovery uses, read from the
+// environment on each send like currentMailer.
+func init() {
+	notify.MailSender = func(to, subject, text string) error {
+		err := currentMailer().Send(mailer.Message{To: to, Subject: subject, Text: text})
+		if errors.Is(err, mailer.ErrNotConfigured) {
+			return fmt.Errorf("SMTP is not configured: fill in the SENTINEL_SMTP_* block in .env and restart the control plane")
+		}
+		return err
+	}
+}
 
 func handleListChannels(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 	claims, _ := auth.GetClaims(c.Request.Context())
@@ -56,7 +71,11 @@ func handleCreateChannel(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hu
 		return
 	}
 	if !validChannelType(req.Type) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "type must be one of webhook, slack, syslog, cef"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "type must be one of webhook, slack, syslog, cef, email"})
+		return
+	}
+	if err := validateChannelConfig(req.Type, req.Config); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 	ch, err := store.CreateChannel(c.Request.Context(), claims.TenantID, claims.UserID, req)
@@ -83,6 +102,17 @@ func handleUpdateChannel(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hu
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": clientError(err)})
 		return
+	}
+	if len(req.Config) > 0 {
+		cur, err := store.GetChannel(c.Request.Context(), claims.TenantID, claims.UserID, id)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "channel not found"})
+			return
+		}
+		if err := validateChannelConfig(cur.Type, req.Config); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 	}
 	ch, err := store.UpdateChannel(c.Request.Context(), claims.TenantID, claims.UserID, id, req)
 	if err != nil {
@@ -151,10 +181,29 @@ func handleTestChannel(c *gin.Context, enf *rbac.Enforcer, store *db.Store) {
 
 func validChannelType(t string) bool {
 	switch t {
-	case "webhook", "slack", "syslog", "cef":
+	case "webhook", "slack", "syslog", "cef", "email":
 		return true
 	}
 	return false
+}
+
+// validateChannelConfig checks what a channel cannot work without, where the
+// mistake is the operator's and should be refused at save rather than found
+// out by an alert that never arrives. Only email is checked here for now: its
+// recipients must all be addresses, and a list with one typo in it would
+// otherwise deliver to the others and fail for that one only on the night.
+func validateChannelConfig(typ string, raw json.RawMessage) error {
+	if typ != "email" {
+		return nil
+	}
+	var cfg notify.Config
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &cfg); err != nil {
+			return fmt.Errorf("config: %v", err)
+		}
+	}
+	_, err := notify.Recipients(cfg.To)
+	return err
 }
 
 // notifyChannelFromRow converts a stored channel row to a notify.Channel.

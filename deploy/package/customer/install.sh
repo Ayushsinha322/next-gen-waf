@@ -23,7 +23,9 @@
 #  support if anything fails, rather than re-running commands by hand.
 #
 #      --non-interactive         take answers from the environment:
-#                                WAF_HOSTNAME, ADMIN_EMAIL, SHARED_EGRESS, CONSOLE_BIND
+#                                WAF_HOSTNAME, ADMIN_EMAIL, SHARED_EGRESS, CONSOLE_BIND,
+#                                ALERT_EMAIL, SMTP_HOST[:port], SMTP_FROM,
+#                                SMTP_USERNAME, SMTP_PASSWORD
 #      --dry-run                 run every check, change nothing
 #      --force                   continue over a previous incomplete attempt
 #      --allow-undersized        evaluation only: proceed below minimum spec
@@ -759,6 +761,36 @@ ask WAF_HOSTNAME "Hostname clients will use (e.g. waf.company.com)" "${DEF_IP:-}
       sudo WAF_HOSTNAME=waf.company.com ./install.sh --non-interactive"
 ask ADMIN_EMAIL  "Administrator email" "admin@${WAF_HOSTNAME}"
 
+# Who hears about a node down, a site refusing traffic, a certificate order
+# failing. Alerts reached nobody before 1.1.18: every channel needed something
+# the customer ran (a SIEM, Slack, a webhook receiver), and none was set up.
+# The address becomes an email channel; the relay below is what sends it, and
+# password recovery uses the same relay.
+ask ALERT_EMAIL  "Email for operational alerts" "$ADMIN_EMAIL"
+[[ "$ALERT_EMAIL" =~ ^[^[:space:]@,\;]+@[^[:space:]@,\;]+\.[^[:space:]@,\;]+$ ]] \
+  || die "\"$ALERT_EMAIL\" is not an email address — re-run with one (ALERT_EMAIL=… for --non-interactive)"
+SMTP_HOST="${SMTP_HOST:-}"
+if [[ -z "$SMTP_HOST" && "$NONINTERACTIVE" != "yes" ]]; then
+  read -r -p "  SMTP relay for alerts and password resets, host[:port] (blank = set it in .env later): " SMTP_HOST || true
+fi
+SMTP_PORT=587
+if [[ "$SMTP_HOST" =~ ^(.+):([0-9]{1,5})$ ]]; then SMTP_HOST="${BASH_REMATCH[1]}"; SMTP_PORT="${BASH_REMATCH[2]}"; fi
+SMTP_FROM="${SMTP_FROM:-}"; SMTP_USERNAME="${SMTP_USERNAME:-}"; SMTP_PASSWORD="${SMTP_PASSWORD:-}"
+if [[ -n "$SMTP_HOST" ]]; then
+  ask SMTP_FROM "Sender address the relay accepts" "$ADMIN_EMAIL"
+  if [[ -z "$SMTP_USERNAME" && "$NONINTERACTIVE" != "yes" ]]; then
+    read -r -p "  SMTP username (blank = the relay needs none): " SMTP_USERNAME || true
+  fi
+  if [[ -n "$SMTP_USERNAME" && -z "$SMTP_PASSWORD" && "$NONINTERACTIVE" != "yes" ]]; then
+    read -r -s -p "  SMTP password: " SMTP_PASSWORD || true; echo
+  fi
+  # Written single-quoted, so compose does not expand a "$" in it; a quote
+  # cannot be written that way.
+  [[ "$SMTP_PASSWORD" != *"'"* ]] \
+    || die "the SMTP password contains a single quote, which .env cannot hold as written here.
+    Re-run, leave the relay blank, and set SENTINEL_SMTP_PASSWORD in .env by hand."
+fi
+
 # Where the management console listens. Default: loopback only, reached over an
 # SSH tunnel. On a host published through a NAT that forwards 80/443 only, the
 # enterprise-normal alternative is the PRIVATE management address — reachable
@@ -877,6 +909,7 @@ fi
 
 ok "hostname: $WAF_HOSTNAME"
 ok "admin:    $ADMIN_EMAIL"
+ok "alerts:   $ALERT_EMAIL$([[ -n "$SMTP_HOST" ]] && printf ' via %s:%s' "$SMTP_HOST" "$SMTP_PORT" || printf ' (no relay yet: set the SMTP block in .env)')"
 if [[ -n "$CONSOLE_BIND" ]]; then ok "console:  https://${CONSOLE_BIND}:9443 (private address; restrict 9443 to the management network)"
 else ok "console:  127.0.0.1:9443 only (SSH tunnel)"; fi
 if [[ -n "$SHARED_EGRESS" ]]; then ok "shared egress: $SHARED_EGRESS (reputation history forgiven; detection unchanged)"
@@ -1013,11 +1046,11 @@ SENTINEL_ADMIN_EMAIL=$ADMIN_EMAIL
 #   SENTINEL_SMTP_SECURITY: starttls (default) | tls (implicit, usually :465)
 #                           | none (unauthenticated internal relay only)
 # Verify it from the console: Settings → Users → Send test email.
-SENTINEL_SMTP_HOST=
-SENTINEL_SMTP_PORT=587
-SENTINEL_SMTP_USERNAME=
-SENTINEL_SMTP_PASSWORD=
-SENTINEL_SMTP_FROM=
+SENTINEL_SMTP_HOST=$SMTP_HOST
+SENTINEL_SMTP_PORT=$SMTP_PORT
+SENTINEL_SMTP_USERNAME=$SMTP_USERNAME
+SENTINEL_SMTP_PASSWORD='$SMTP_PASSWORD'
+SENTINEL_SMTP_FROM=$SMTP_FROM
 SENTINEL_SMTP_FROM_NAME=Swaraj Kavach
 SENTINEL_SMTP_SECURITY=starttls
 SENTINEL_SMTP_INSECURE_SKIP_VERIFY=0
@@ -1032,6 +1065,12 @@ SENTINEL_PUBLIC_URL=https://$WAF_HOSTNAME:9443
 # Security contact copied on every completed password reset. Defaults to the
 # administrator address collected above.
 SENTINEL_SECURITY_NOTIFY_EMAIL=$ADMIN_EMAIL
+
+# Operational alerts by email: the control plane makes this an "Operations
+# email" channel (severity high and above) on its first boot, once. Manage it
+# afterwards in the console, Settings → Notifications; delivery needs the SMTP
+# block above.
+SENTINEL_ALERT_EMAIL=$ALERT_EMAIL
 
 # ── Management console bind ─────────────────────────────────────────────────
 # Host prefix for the console listener (9443). "127.0.0.1:" = this host only,
@@ -1403,7 +1442,7 @@ $CONSOLE_HOW
     4. ${B}Copy the backup key off this host:${R} $BACKUP_KEY
        Nightly backups are encrypted with it and it is in none of them; without
        it no backup can be restored. Add an offsite target in $BACKUP_ENV.
-    5. Fill in the SMTP block in $ENV_FILE so password recovery works.
+    5. $( [[ -n "$SMTP_HOST" ]] && printf 'Send a test alert: console → Settings → Notifications → Test.' || printf 'Fill in the SMTP block in %s: alerts to %s and password recovery need it.' "$ENV_FILE" "$ALERT_EMAIL" )
 
     Config  $ENV_FILE  ${DIM}(all secrets — in every backup, encrypted)${R}
     Report  $REPORT

@@ -1,0 +1,70 @@
+# Alert rules for the Swaraj Kavach stack (see prometheus.yml). The control
+# plane raises the same conditions as console alerts and delivers them to the
+# notification channels; these are for a site that routes Prometheus through
+# its own Alertmanager.
+groups:
+  - name: swaraj-kavach
+    rules:
+      - alert: DataPlaneDown
+        expr: up{job="sentinel-dataplane"} == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "Data-plane node {{ $labels.node }} is not answering /metrics"
+
+      - alert: ControlPlaneDown
+        expr: up{job="sentinel-controlplane"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "The control plane is not answering /metrics"
+
+      - alert: EventStoreUnreachable
+        expr: sentinel_history_clickhouse_connected == 0
+        for: 2m
+        labels: { severity: high }
+        annotations:
+          summary: "{{ $labels.node }} cannot reach ClickHouse: events are spooled to disk and Threat Search is behind"
+
+      - alert: BlocksNotRecorded
+        expr: increase(sentinel_history_shed_total[5m]) > 0
+        labels: { severity: high }
+        annotations:
+          summary: "{{ $labels.node }} blocked requests it could not record ({{ $value | humanize }} in 5 min)"
+
+      - alert: LoadShedding
+        expr: increase(sentinel_load_shed_requests_total[5m]) > 0 or increase(sentinel_load_shed_connections_total[5m]) > 0
+        labels: { severity: high }
+        annotations:
+          summary: "{{ $labels.node }} is refusing work under load (admission control)"
+
+      - alert: ContainedPanics
+        expr: increase(sentinel_panics_total[10m]) > 0
+        labels: { severity: high }
+        annotations:
+          summary: "{{ $labels.node }} contained a panic: a defect to report (its log has the location)"
+
+      - alert: BackgroundTaskCrashLoop
+        expr: increase(sentinel_task_restarts_total[15m]) >= 3
+        labels: { severity: critical }
+        annotations:
+          summary: "A background loop on {{ $labels.node }} keeps crashing and restarting"
+
+      - alert: DataPlaneRestartLoop
+        expr: changes(process_start_time_seconds{job="sentinel-dataplane"}[15m]) >= 3 or resets(sentinel_requests_total{job="sentinel-dataplane"}[15m]) >= 3
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.node }} restarted at least three times in 15 minutes"
+
+      - alert: SiemEventsDropped
+        expr: increase(sentinel_siem_events_dropped_total[5m]) > 0
+        labels: { severity: medium }
+        annotations:
+          summary: "{{ $labels.node }} dropped security events bound for the SIEM feed"
+
+      - alert: ValkeyBreakerOpen
+        expr: sentinel_ratelimit_valkey_breaker_open == 1
+        for: 2m
+        labels: { severity: medium }
+        annotations:
+          summary: "{{ $labels.node }} cannot use Valkey: rate limits are per node, not cluster-wide"

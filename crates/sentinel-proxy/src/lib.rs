@@ -1517,7 +1517,9 @@ impl ProxyServer {
         for (domains, acme) in tls::renewal::initial_orders(&cfg.sites, &cert_manager.store) {
             let cm = Arc::clone(&cert_manager);
             tokio::spawn(async move {
-                if let Err(e) = cm.issue_acme(domains.clone(), &acme).await {
+                let result = cm.issue_acme(domains.clone(), &acme).await;
+                tls::renewal::record_acme_outcome(&domains, result.as_ref().map(|_| ()));
+                if let Err(e) = result {
                     warn!(?domains, "initial ACME issuance failed: {e:#}");
                 }
             });
@@ -2371,6 +2373,16 @@ impl ProxyServer {
                             // Contained panics, and which loops restarted: the
                             // reason a node above reads "degraded".
                             "panics": panic_guard::heartbeat_status(),
+                            // What the control plane alerts on. Each was on
+                            // /healthz only, which nothing polls: a site refused
+                            // 503 because its rules do not compile, attacks
+                            // blocked and never recorded, the event store gone,
+                            // a certificate order failing every retry until the
+                            // certificate expired.
+                            "sites_refused": refused_sites(&cfg_snap, &hb_engines.load_full()),
+                            "history_shed": history_shed_total(),
+                            "clickhouse": clickhouse_status(),
+                            "acme_failing": tls::renewal::acme_failures_json(),
                         }
                     })
                     .to_string();
@@ -9095,11 +9107,14 @@ async fn handle_internal_cert_api(
         {
             return json_ok(serde_json::json!({"issued": [], "already_covered": domains}));
         }
-        return match state
+        let result = state
             .cert_manager
             .issue_acme(domains.clone(), &acme_cfg)
-            .await
-        {
+            .await;
+        // An operator's retry from the console clears (or renews) the failure
+        // the control plane is alerting on, like any other order.
+        tls::renewal::record_acme_outcome(&domains, result.as_ref().map(|_| ()));
+        return match result {
             Ok(()) => json_ok(serde_json::json!({"issued": domains})),
             Err(e) => json_err(
                 StatusCode::BAD_GATEWAY,
@@ -9722,6 +9737,9 @@ async fn health_response(state: &ServerState) -> Response<BoxBody> {
         // silently incomplete audit trail is the failure this counter exists to
         // make visible.
         "history_shed": history_shed_total(),
+        // Certificate orders whose last attempt failed (the control plane
+        // alerts on these from the heartbeat). Empty is healthy.
+        "acme_failing": tls::renewal::acme_failures_json(),
         // Valkey and ClickHouse connect in the background and are retried, so
         // the node serves without them; this says whether they are in use.
         "storage": storage_status(&state.modules.rate_limiter),
@@ -10981,11 +10999,15 @@ static CLICKHOUSE_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 fn storage_status(rate_limiter: &RateLimiter) -> serde_json::Value {
     serde_json::json!({
         "valkey": rate_limiter.distributed_status(),
-        "clickhouse": {
-            "configured": HISTORY_SINK_ACTIVE.load(std::sync::atomic::Ordering::Relaxed),
-            "connected": CLICKHOUSE_CONNECTED.load(std::sync::atomic::Ordering::Relaxed),
-            "failures_total": CLICKHOUSE_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
-        },
+        "clickhouse": clickhouse_status(),
+    })
+}
+
+fn clickhouse_status() -> serde_json::Value {
+    serde_json::json!({
+        "configured": HISTORY_SINK_ACTIVE.load(std::sync::atomic::Ordering::Relaxed),
+        "connected": CLICKHOUSE_CONNECTED.load(std::sync::atomic::Ordering::Relaxed),
+        "failures_total": CLICKHOUSE_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
     })
 }
 

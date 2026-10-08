@@ -1,6 +1,6 @@
 // Package notify delivers Sentinel WAF alerts to external SOC sinks:
-// generic webhooks, Slack incoming webhooks, RFC 5424 syslog, and ArcSight CEF
-// (over syslog transport). It is dependency-free (stdlib only) and decoupled
+// generic webhooks, Slack incoming webhooks, RFC 5424 syslog, ArcSight CEF
+// (over syslog transport), and email (through the control plane's SMTP relay). It is dependency-free (stdlib only) and decoupled
 // from the database layer — callers translate their rows into notify.Channel
 // and notify.Alert.
 package notify
@@ -42,7 +42,7 @@ type Alert struct {
 type Channel struct {
 	ID          string
 	Name        string
-	Type        string // webhook | slack | syslog | cef
+	Type        string // webhook | slack | syslog | cef | email
 	MinSeverity string
 	Config      Config
 }
@@ -63,6 +63,9 @@ type Config struct {
 	Protocol string `json:"protocol"` // udp | tcp
 	Facility int    `json:"facility"` // syslog facility (default 16 = local0)
 	Tag      string `json:"tag"`      // app-name / syslog tag (default "sentinel-waf")
+
+	// email: recipients, separated by commas, semicolons or spaces.
+	To string `json:"to"`
 }
 
 // Result is the outcome of one delivery attempt.
@@ -155,6 +158,8 @@ func send(ctx context.Context, ch Channel, a Alert) error {
 		return sendSyslog(ctx, ch, a)
 	case "cef":
 		return sendCEF(ctx, ch, a)
+	case "email":
+		return sendEmail(ctx, ch, a)
 	default:
 		return errUnknownType(ch.Type)
 	}

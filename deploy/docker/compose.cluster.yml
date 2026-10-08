@@ -97,6 +97,9 @@ x-cp-env: &cp-env
   SENTINEL_PUBLIC_URL: ${SENTINEL_PUBLIC_URL:-}
   SENTINEL_ADMIN_EMAIL: ${SENTINEL_ADMIN_EMAIL:-}
   SENTINEL_SECURITY_NOTIFY_EMAIL: ${SENTINEL_SECURITY_NOTIFY_EMAIL:-}
+  # Turned into an "Operations email" alert channel on the first boot that
+  # sees it (once: a channel deleted in the console stays deleted).
+  SENTINEL_ALERT_EMAIL: ${SENTINEL_ALERT_EMAIL:-}
   # Disk-pressure alert: page the SOC when ClickHouse disk crosses this used-%.
   SENTINEL_DISK_ALERT_PCT: ${SENTINEL_DISK_ALERT_PCT:-80}
   SENTINEL_DISK_CHECK_SECS: ${SENTINEL_DISK_CHECK_SECS:-300}

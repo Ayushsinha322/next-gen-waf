@@ -3,7 +3,7 @@
 /// Checks every hour; renews any cert whose expiry is within `renew_before_days`
 /// (default 30) days.  Runs as a detached tokio task started once at proxy boot.
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use sentinel_core::config::{ConfigHandle, SiteAcmeConfig, SiteConfig, TlsCertMode};
@@ -135,6 +135,70 @@ pub(crate) fn initial_orders(
         .collect()
 }
 
+/// ACME orders whose last attempt failed, keyed by the names ordered together.
+///
+/// A failing renewal was a log line every retry and nothing else: nothing told
+/// anyone until the certificate expired and every client got a TLS error. This
+/// is what the heartbeat carries to the control plane, which alerts on it.
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct AcmeFailure {
+    pub domains: Vec<String>,
+    /// Failed orders in a row.
+    pub failures: u32,
+    /// The last error, shortened.
+    pub error: String,
+    /// Unix seconds of the first failure in this run.
+    pub since: u64,
+}
+
+fn acme_failures() -> &'static Mutex<HashMap<String, AcmeFailure>> {
+    static F: OnceLock<Mutex<HashMap<String, AcmeFailure>>> = OnceLock::new();
+    F.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record how an order for `domains` went. Every issuance path calls this:
+/// the first order at boot and the renewal loop.
+pub(crate) fn record_acme_outcome(domains: &[String], outcome: Result<(), &anyhow::Error>) {
+    let key = domains.join(",");
+    let mut map = acme_failures().lock().unwrap_or_else(|p| p.into_inner());
+    match outcome {
+        Ok(()) => {
+            map.remove(&key);
+        }
+        Err(e) => {
+            let mut error = format!("{e:#}");
+            if error.len() > 300 {
+                let mut cut = 300;
+                while !error.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                error.truncate(cut);
+                error.push('…');
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let entry = map.entry(key).or_insert_with(|| AcmeFailure {
+                domains: domains.to_vec(),
+                failures: 0,
+                error: String::new(),
+                since: now,
+            });
+            entry.failures += 1;
+            entry.error = error;
+        }
+    }
+}
+
+/// The failing orders, for the heartbeat and `/healthz`. Empty when every
+/// order's last attempt succeeded (or none was made).
+pub(crate) fn acme_failures_json() -> serde_json::Value {
+    let map = acme_failures().lock().unwrap_or_else(|p| p.into_inner());
+    let mut list: Vec<&AcmeFailure> = map.values().collect();
+    list.sort_by(|a, b| a.domains.cmp(&b.domains));
+    serde_json::to_value(list).unwrap_or_else(|_| serde_json::json!([]))
+}
+
 pub async fn renewal_loop(cert_manager: Arc<CertManager>, config_handle: ConfigHandle) {
     // Sites already reported as having nothing issuable. Without this the
     // "skipping" line would repeat hourly and become the same noise it replaces.
@@ -237,7 +301,9 @@ async fn order_with_backoff(
     {
         return;
     }
-    match cert_manager.issue_acme(domains.clone(), config).await {
+    let result = cert_manager.issue_acme(domains.clone(), config).await;
+    record_acme_outcome(&domains, result.as_ref().map(|_| ()));
+    match result {
         Ok(()) => {
             backoff.remove(site);
         }
@@ -258,6 +324,32 @@ async fn order_with_backoff(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failing_order_is_reported_until_it_succeeds() {
+        let names = vec!["acme-report-test.example".to_string()];
+        let find = || {
+            acme_failures_json()
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|f| f["domains"] == serde_json::json!(names))
+                .cloned()
+        };
+        let err = anyhow::anyhow!("urn:ietf:params:acme:error:dns: NXDOMAIN looking up A");
+        record_acme_outcome(&names, Err(&err));
+        record_acme_outcome(&names, Err(&err));
+        let f = find().expect("a failing order is in the report");
+        assert_eq!(f["failures"], 2);
+        assert!(f["error"].as_str().unwrap().contains("NXDOMAIN"));
+
+        let long = anyhow::anyhow!("é".repeat(400));
+        record_acme_outcome(&names, Err(&long));
+        assert!(find().unwrap()["error"].as_str().unwrap().len() <= 304);
+
+        record_acme_outcome(&names, Ok(()));
+        assert!(find().is_none(), "a success clears it");
+    }
 
     #[test]
     fn a_failed_order_is_retried_within_minutes_then_hourly() {

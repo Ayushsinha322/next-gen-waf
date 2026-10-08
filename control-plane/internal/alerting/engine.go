@@ -438,6 +438,9 @@ var EventDrivenKinds = []string{
 	// Recovery notices are informational: once a node has been back for the
 	// quiet window there is nothing left to act on.
 	"node_recovered", "cp_node_recovered",
+	// One per increase of a node's counter (nodehealth/conditions.go): shed
+	// events and contained panics. Nothing "clears" a counter; quiet does.
+	"events_shed", "panic",
 }
 
 // autoResolver closes stale event-driven alerts once a minute. See

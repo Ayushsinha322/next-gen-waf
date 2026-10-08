@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS notification_channels (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id     UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     name          TEXT NOT NULL,
-    type          TEXT NOT NULL CHECK (type IN ('webhook','slack','syslog','cef')),
+    type          TEXT NOT NULL CHECK (type IN ('webhook','slack','syslog','cef','email')),
     config        JSONB NOT NULL DEFAULT '{}'::jsonb,
     min_severity  TEXT NOT NULL DEFAULT 'low'
                   CHECK (min_severity IN ('info','low','medium','high','critical')),
@@ -74,6 +74,18 @@ CREATE TABLE IF NOT EXISTS notification_channels (
 );
 CREATE INDEX IF NOT EXISTS notification_channels_tenant_idx ON notification_channels(tenant_id);
 ALTER TABLE notification_channels ENABLE ROW LEVEL SECURITY;
+-- A table created before email existed (migration 0024 does the same).
+DO $$ BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'notification_channels_type_check'
+          AND pg_get_constraintdef(oid) LIKE '%email%'
+    ) THEN
+        ALTER TABLE notification_channels DROP CONSTRAINT IF EXISTS notification_channels_type_check;
+        ALTER TABLE notification_channels ADD CONSTRAINT notification_channels_type_check
+            CHECK (type IN ('webhook','slack','syslog','cef','email'));
+    END IF;
+END $$;
 DO $$ BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM pg_policies

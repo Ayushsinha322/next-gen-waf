@@ -111,6 +111,12 @@ func FromEnv() *Client {
 
 func (c *Client) Enabled() bool { return c.enabled }
 
+// Ping runs the cheapest query there is, for the event-store health alert.
+func (c *Client) Ping(ctx context.Context) error {
+	_, err := c.query(ctx, "SELECT 1")
+	return err
+}
+
 // ErrDisabled is returned when ClickHouse is not configured.
 var ErrDisabled = fmt.Errorf("clickhouse not configured (set SENTINEL_CLICKHOUSE_URL)")
 

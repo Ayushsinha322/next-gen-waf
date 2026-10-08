@@ -341,6 +341,9 @@ services:
       # back to SENTINEL_ADMIN_EMAIL, which install.sh already collects.
       SENTINEL_ADMIN_EMAIL: ${SENTINEL_ADMIN_EMAIL:-}
       SENTINEL_SECURITY_NOTIFY_EMAIL: ${SENTINEL_SECURITY_NOTIFY_EMAIL:-}
+      # Turned into an "Operations email" alert channel on the first boot that
+      # sees it (once: a channel deleted in the console stays deleted).
+      SENTINEL_ALERT_EMAIL: ${SENTINEL_ALERT_EMAIL:-}
       # SINGLE-TENANT DEMO POSTURE. This stack connects as the Postgres superuser
       # ('sentinel'), which bypasses FORCE ROW LEVEL SECURITY. Tenant isolation
       # here is enforced by the explicit tenant_id predicates in the stores (not
@@ -761,11 +764,22 @@ services:
     image: ${SENTINEL_THIRDPARTY_PREFIX:-}prom/prometheus:v2.54.1
     logging: *logging
     restart: unless-stopped
+    # The data planes serve /metrics only with the internal secret. Prometheus
+    # reads scrape headers from files, not the environment, so the entrypoint
+    # puts the secret in a tmpfs file (never on a volume) and starts it.
+    entrypoint: ["/bin/sh", "-c"]
     command:
-      - --config.file=/etc/prometheus/prometheus.yml
-      - --storage.tsdb.retention.time=15d
+      - >-
+        umask 077 && printf '%s' "$$SENTINEL_INTERNAL_SECRET" > /run/sk/internal-secret &&
+        exec /bin/prometheus --config.file=/etc/prometheus/prometheus.yml
+        --storage.tsdb.path=/prometheus --storage.tsdb.retention.time=15d
+    environment:
+      SENTINEL_INTERNAL_SECRET: ${SENTINEL_INTERNAL_SECRET}
+    tmpfs:
+      - /run/sk:mode=1777,size=64k
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus-rules.yml:/etc/prometheus/prometheus-rules.yml:ro
       - promdata:/prometheus
     depends_on:
       controlplane: { condition: service_started }

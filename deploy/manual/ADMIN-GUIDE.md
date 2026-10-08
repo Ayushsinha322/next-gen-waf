@@ -241,15 +241,39 @@ Point your existing NOC monitoring at these on the WAF's traffic port:
 |---|---|
 | `/healthz` | The process is alive |
 | `/readyz` | The node can actually protect traffic right now. **This is the one to alert on** — it goes 503 during shutdown *before* the node stops accepting traffic, so a load balancer drains cleanly |
-| `/metrics` | Prometheus metrics: request counts, blocks, latency, rule hits |
+| `/metrics` | Prometheus metrics: request counts, blocks, latency, rule hits. Only with the `x-sentinel-internal` header (the secret in `.env`) or from the host itself |
 
-Prometheus ships with the product on `127.0.0.1:9090` (tunnel to reach it); its
-expression browser is enough to query these metrics directly. There is no Grafana:
+Prometheus ships with the product on `127.0.0.1:9090` (tunnel to reach it). It
+scrapes the control plane and every data-plane node, and carries alert rules
+(`prometheus-rules.yml`) on its Alerts page; point your Alertmanager at it to
+route them. Its expression browser is enough to query these metrics directly. There is no Grafana:
 it was removed in September 2026 — AGPLv3, shipped in the bundle, and referenced by
 nothing in the product. Point your own Grafana or other dashboarding at this
 Prometheus if you want charts.
 
-### What to alert on
+### Alerts that reach you by themselves
+
+The control plane watches every node's heartbeat and raises these as console
+alerts, delivered to every enabled channel (Settings → Notifications) whose
+minimum severity they meet. The installer turns the alert address it asked for
+into an **Operations email** channel (high and above); the SMTP block in `.env`
+is what sends it. Ongoing conditions close themselves when they clear.
+
+| Alert | Severity | Raised when |
+|---|---|---|
+| `node_down` | critical | a data-plane node stops heart-beating |
+| `site_refused` | critical | a site is refused 503 for a minute because its rules do not compile |
+| `restart_loop` | critical | a node restarts three times in 15 minutes, or a background loop keeps crashing |
+| `clickhouse_down` | high (critical from the control plane) | the event store is unreachable for two minutes |
+| `acme_failing` | high | a certificate order has failed twice in a row |
+| `config_stale` | high | a node's config polls fail, it trails the served version, or it rejected a site's config, for five minutes |
+| `events_shed` | high | a node blocked requests it could not record |
+| `panic` | high | a node contained a panic (a defect: send its log) |
+| `cert_expiring`, `disk_pressure` | by days / % | as before |
+
+Check delivery once after install: Settings → Notifications → **Test**.
+
+### What to alert on in your own monitoring
 
 | Alert | Why |
 |---|---|

@@ -897,12 +897,16 @@ const CHANNEL_META: Record<ChannelType, { label: string; blurb: string }> = {
   slack:   { label: "Slack",   blurb: "Slack incoming-webhook formatted message" },
   syslog:  { label: "Syslog",  blurb: "RFC 5424 over UDP/TCP to a syslog collector" },
   cef:     { label: "CEF",     blurb: "ArcSight Common Event Format over syslog (SIEM)" },
+  email:   { label: "Email",   blurb: "Plain-text mail to one or more people, through the SMTP relay set in .env (the one password recovery uses)" },
 };
+// One address per entry; the control plane refuses the whole list over one typo.
+const EMAIL_RE = /^[^\s@,;]+@[^\s@,;]+\.[^\s@,;]+$/;
+const recipients = (to: string) => to.split(/[\s,;]+/).filter(Boolean);
 const SEVERITIES: Severity[] = ["info", "low", "medium", "high", "critical"];
 
 const emptyForm = {
   name: "", type: "webhook" as ChannelType, min_severity: "medium" as Severity,
-  url: "", secret: "", host: "", port: 514, protocol: "udp" as "udp" | "tcp",
+  url: "", secret: "", host: "", port: 514, protocol: "udp" as "udp" | "tcp", to: "",
 };
 
 function NotificationsTab() {
@@ -923,11 +927,13 @@ function NotificationsTab() {
   function buildConfig(): ChannelConfig {
     if (form.type === "webhook") return { url: form.url.trim(), ...(form.secret ? { secret: form.secret } : {}) };
     if (form.type === "slack")   return { url: form.url.trim() };
+    if (form.type === "email")   return { to: recipients(form.to).join(", ") };
     return { host: form.host.trim(), port: Number(form.port) || 514, protocol: form.protocol };
   }
   function formValid(): boolean {
     if (!form.name.trim()) return false;
     if (form.type === "webhook" || form.type === "slack") return /^https?:\/\//.test(form.url.trim());
+    if (form.type === "email") { const r = recipients(form.to); return r.length > 0 && r.every(a => EMAIL_RE.test(a)); }
     return !!form.host.trim();
   }
 
@@ -974,7 +980,7 @@ function NotificationsTab() {
       </div>
       <div className="pb">
         <div style={{ fontSize: 13, color: "var(--text3)", lineHeight: 1.7, marginBottom: 12, fontFamily: "var(--font-mono)" }}>
-          Alerts (attack spikes, repeat offenders, critical blocks) are delivered to every enabled channel whose minimum severity the alert meets. Webhook payloads are optionally HMAC-SHA256 signed (<code>X-Swaraj-Kavach-Signature</code>; also sent as <code>X-Sentinel-Signature</code> for receivers built against earlier releases).
+          Alerts (attack spikes, repeat offenders, critical blocks, and the node conditions: a site refusing traffic, the event store unreachable, a certificate order failing, a node not taking config or restarting) are delivered to every enabled channel whose minimum severity the alert meets. Webhook payloads are optionally HMAC-SHA256 signed (<code>X-Swaraj-Kavach-Signature</code>; also sent as <code>X-Sentinel-Signature</code> for receivers built against earlier releases).
         </div>
 
         {adding && (
@@ -989,7 +995,9 @@ function NotificationsTab() {
             </div>
             <div style={{ fontSize: 12.5, color: "var(--text3)", margin: "2px 0 10px" }}>{CHANNEL_META[form.type].blurb}</div>
 
-            {!isNet ? (
+            {form.type === "email" ? (
+              <div className="fg2"><label className="flbl2">Recipients</label><input className="fin2" value={form.to} placeholder="noc@example.in, oncall@example.in" onChange={e => setForm(f => ({ ...f, to: e.target.value }))} /></div>
+            ) : !isNet ? (
               <div style={{ display: "grid", gridTemplateColumns: form.type === "webhook" ? "1fr 1fr" : "1fr", gap: 10 }}>
                 <div className="fg2"><label className="flbl2">{form.type === "slack" ? "Slack Webhook URL" : "Endpoint URL"}</label><input className="fin2" value={form.url} placeholder="https://…" onChange={e => setForm(f => ({ ...f, url: e.target.value }))} /></div>
                 {form.type === "webhook" && <div className="fg2"><label className="flbl2">Signing Secret (optional)</label><input className="fin2" value={form.secret} placeholder="HMAC-SHA256 key" onChange={e => setForm(f => ({ ...f, secret: e.target.value }))} /></div>}
@@ -1021,7 +1029,7 @@ function NotificationsTab() {
             <div style={{ flex: 1, minWidth: 0 }}>
               <div className="srt">{ch.name} <span className="bdg bcy" style={{ marginLeft: 6 }}>{ch.type.toUpperCase()}</span> <span className="bdg" style={{ marginLeft: 4 }}>≥ {ch.min_severity.toUpperCase()}</span></div>
               <div className="srd" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                {ch.type === "webhook" || ch.type === "slack" ? ch.config.url : `${ch.config.host}:${ch.config.port}/${ch.config.protocol}`}
+                {ch.type === "email" ? ch.config.to : ch.type === "webhook" || ch.type === "slack" ? ch.config.url : `${ch.config.host}:${ch.config.port}/${ch.config.protocol}`}
                 {ch.last_status && <span style={{ marginLeft: 8, color: ch.last_status === "ok" ? "var(--green)" : "#ef4444" }}>· last: {ch.last_status === "ok" ? "✓ ok" : ch.last_status}</span>}
               </div>
             </div>
