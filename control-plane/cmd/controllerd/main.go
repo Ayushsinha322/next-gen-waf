@@ -241,12 +241,23 @@ func run() error {
 			// not have — in that posture the migrate step (run as the owner
 			// role) is responsible for schema + seed. Only run these when
 			// connected as a privileged/dev role.
+			// sentinel_cp (the installer's control-plane login) bypasses RLS, so
+			// it seeds the first administrator, but it is not a superuser and
+			// cannot create tables: the schema-ensure fallbacks need the owner,
+			// and the migrate job — run as the owner — has done that already.
+			superuser, _ := store.ConnRoleIsSuperuser(ctx)
 			if privileged {
 				if err := db.SeedDev(ctx, pool); err != nil {
 					log.Warn("DB seed failed (non-fatal)", zap.Error(err))
 				} else {
 					log.Info("DB seeded")
 				}
+			}
+			if privileged && !superuser {
+				log.Info("control-plane DB role is not a superuser — schema is the migrate job's (run as the owner)",
+					zap.String("db_role", role))
+			}
+			if superuser {
 				if err := db.EnsureNotificationSchema(ctx, pool); err != nil {
 					log.Warn("notification schema ensure failed (non-fatal)", zap.Error(err))
 				}
@@ -268,7 +279,7 @@ func run() error {
 				if err := db.EnsureLogProfileSchema(ctx, pool); err != nil {
 					log.Warn("log profile schema ensure failed (non-fatal)", zap.Error(err))
 				}
-			} else {
+			} else if !privileged {
 				log.Info("non-superuser DB role — skipping auto-seed/ensure-schema (handled by migrations run as the owner role)")
 			}
 

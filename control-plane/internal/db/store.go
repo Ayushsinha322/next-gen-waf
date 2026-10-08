@@ -316,6 +316,20 @@ func (s *Store) GetDashboardStats(ctx context.Context, tenantID, userID string) 
 // SECURITY (the backstop for tenant isolation) a silent no-op. Used for a
 // boot-time safety assertion so we never run multi-tenant on a role that
 // bypasses RLS. Returns the role name for diagnostics.
+// ConnRoleIsSuperuser reports whether the connection's role is a superuser —
+// what the schema-ensure fallbacks need (they create tables and policies).
+// sentinel_cp bypasses row-level security but is not one.
+func (s *Store) ConnRoleIsSuperuser(ctx context.Context) (bool, error) {
+	pg, ok := s.pool.(*pgxPool)
+	if !ok {
+		return false, fmt.Errorf("store: pool is not a *pgxPool")
+	}
+	var super bool
+	err := pg.pool.QueryRow(ctx,
+		`SELECT rolsuper FROM pg_roles WHERE rolname = current_user`).Scan(&super)
+	return super, err
+}
+
 func (s *Store) ConnRoleIsPrivileged(ctx context.Context) (privileged bool, role string, err error) {
 	pg, ok := s.pool.(*pgxPool)
 	if !ok {

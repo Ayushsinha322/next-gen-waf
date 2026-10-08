@@ -244,8 +244,13 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
     environment:
-      # goose reads GOOSE_DBSTRING; the SENTINEL_DB_URL DSN form works as-is.
-      GOOSE_DBSTRING: ${SENTINEL_DB_URL}
+      # goose reads GOOSE_DBSTRING. Migrations run as the database OWNER
+      # (SENTINEL_MIGRATE_DB_URL); the control plane connects as sentinel_cp,
+      # whose password the entrypoint sets from SENTINEL_CP_DB_PASSWORD. An
+      # installation from before that has only SENTINEL_DB_URL (the owner) and
+      # keeps using it for both.
+      GOOSE_DBSTRING: ${SENTINEL_MIGRATE_DB_URL:-${SENTINEL_DB_URL}}
+      SENTINEL_CP_DB_PASSWORD: ${SENTINEL_CP_DB_PASSWORD:-}
     volumes:
       # CA the DSN's sslrootcert points at, so migrations verify the server too.
       - /opt/sentinel-pki/root.crt:/etc/sentinel/pki/root.crt:ro

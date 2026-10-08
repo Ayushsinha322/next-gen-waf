@@ -171,11 +171,13 @@ LABEL org.opencontainers.image.title="Swaraj Kavach migrations" \
       org.opencontainers.image.created="$BUILD_DATE" \
       org.opencontainers.image.version="$VERSION" \
       org.opencontainers.image.source="https://git.enlight.dev/research-lab/SIG-CyberSec/sentinel-waf"
-RUN apk add --no-cache ca-certificates
+# psql: the entrypoint sets the control plane's database login after goose.
+RUN apk add --no-cache ca-certificates postgresql16-client
 COPY --from=goose-builder /go/bin/goose /usr/local/bin/goose
 COPY control-plane/internal/db/migrations /migrations
+COPY deploy/docker/migrate-entrypoint.sh /usr/local/bin/migrate-entrypoint.sh
 ENV GOOSE_DRIVER=postgres \
     GOOSE_MIGRATION_DIR=/migrations
 # GOOSE_DBSTRING (the postgres DSN) is injected at run time. Default: apply Up.
-ENTRYPOINT ["goose"]
+ENTRYPOINT ["/usr/local/bin/migrate-entrypoint.sh"]
 CMD ["up"]

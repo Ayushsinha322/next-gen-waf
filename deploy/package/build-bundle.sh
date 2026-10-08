@@ -413,7 +413,7 @@ ok "SHA256SUMS — $(wc -l < "$STAGE/SHA256SUMS") files"
 
 # ── 6. installer entry points + archive ──────────────────────────────────────
 step "Step 6 of 6 — installer and archive"
-for f in install.sh uninstall.sh verify.sh first-site.sh onboard-site.sh add-operator.sh upgrade.sh rollback.sh README.md; do
+for f in install.sh uninstall.sh verify.sh first-site.sh onboard-site.sh add-operator.sh least-privilege-db.sh upgrade.sh rollback.sh README.md; do
   if [[ -f "deploy/package/customer/$f" ]]; then
     cp "deploy/package/customer/$f" "$STAGE/$f"
     [[ "$f" == *.sh ]] && chmod +x "$STAGE/$f"
