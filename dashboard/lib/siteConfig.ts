@@ -734,9 +734,12 @@ export function emptyForm(): SiteForm {
     allowed_methods: ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"],
     max_inspected_args: "", max_inspected_arg_kib: "", inspection_time_budget_ms: "",
 
-    rate_limit_enabled: true,
+    // Off for a new site until learning shows its real peaks: on at 100 rps it
+    // threw 429s at offices, CGNAT and CDN PoPs behind one address. When it is
+    // turned on, static assets are not counted (data plane, is_static_asset).
+    rate_limit_enabled: false,
     rl_global: { rps: 5000, burst: 10000 },
-    rl_per_ip: { rps: 100, burst: 50 },
+    rl_per_ip: { rps: 1000, burst: 500 },
     antiddos_enabled: false, antiddos_conn_rate: 200, antiddos_burst: 50, antiddos_block_secs: 300,
 
     bot_ja4: false, bot_challenge: "off",

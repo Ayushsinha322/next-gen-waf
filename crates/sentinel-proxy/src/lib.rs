@@ -53,7 +53,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{anyhow, Context};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use http::{header, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Body;
@@ -84,13 +84,13 @@ use sentinel_telemetry::{
     inc_blocked, inc_ebpf_drops, inc_history_shed, inc_load_shed_connections,
     inc_load_shed_requests, inc_log_lines_dropped, inc_requests, inc_rule_hits, ja4_attempts_total,
     ja4_h3_absent_total, ja4_h3_attempts_total, ja4_h3_success_total, ja4_no_hello_total,
-    ja4_success_total, note_good_bot_allowed, note_graphql_blocked, note_graphql_inspected,
-    note_grpc_inspected, note_ja4_attempt, note_ja4_no_hello, note_ja4_success, note_plugin_block,
-    note_plugin_invocation, note_plugin_score, note_plugin_trap, note_smuggling_evaluated,
-    note_smuggling_rejected_framing, note_smuggling_rejected_header, observe_duration,
-    plugin_blocks_total, plugin_invocations_total, plugin_scores_total, plugin_traps_total,
-    prometheus_text, smuggling_evaluated_total, smuggling_rejected_framing_total,
-    smuggling_rejected_header_total,
+    ja4_success_total, note_autoban, note_good_bot_allowed, note_graphql_blocked,
+    note_graphql_inspected, note_grpc_inspected, note_ja4_attempt, note_ja4_no_hello,
+    note_ja4_success, note_plugin_block, note_plugin_invocation, note_plugin_score,
+    note_plugin_trap, note_smuggling_evaluated, note_smuggling_rejected_framing,
+    note_smuggling_rejected_header, observe_duration, plugin_blocks_total,
+    plugin_invocations_total, plugin_scores_total, plugin_traps_total, prometheus_text,
+    smuggling_evaluated_total, smuggling_rejected_framing_total, smuggling_rejected_header_total,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Semaphore};
@@ -364,19 +364,6 @@ impl CorrelationEngine {
         } else {
             0
         }
-    }
-
-    /// Number of blocks recorded for `ip` within the current rolling window
-    /// (0 if unknown or the window has expired). Used by the XDP auto-ban.
-    fn block_count_for_ip(&self, ip: IpAddr) -> u32 {
-        let Some(rec) = self.state.get(&ip) else {
-            return 0;
-        };
-        let last = rec.last_block_at.load(Ordering::Relaxed) as u64;
-        if unix_now_secs().saturating_sub(last) > self.window_secs {
-            return 0;
-        }
-        rec.blocks.load(Ordering::Relaxed) as u32
     }
 
     /// Record that `ip` was just blocked.
@@ -3614,6 +3601,27 @@ async fn proxy_inner(
             .is_some_and(|r| r.is_allowlisted(ctx.client_ip))
     });
 
+    // A source this site auto-banned is refused here, with a block page and a
+    // log line — not dropped in the kernel, silently, for every site on the node.
+    if !ctx.allowlisted {
+        if let Some(left) = ctx
+            .site_id
+            .as_deref()
+            .and_then(|s| site_ban_remaining(s, ctx.client_ip))
+        {
+            ctx.decision = WafDecision::Block;
+            ctx.block_reason = Some(format!(
+                "ip reputation: auto-banned from this site after repeated attacks; lifted in {} min",
+                left.div_ceil(60)
+            ));
+            let resp = block_response(ctx);
+            stamp_response(ctx, &resp);
+            ctx.advance_phase(Phase::Logging);
+            log_request(ctx);
+            return Ok(resp);
+        }
+    }
+
     // Blocklist fast-fail: known-blocked addresses never enter the WAF pipeline.
     // First check after attribution, so nothing else runs for a blocked source.
     //
@@ -3736,6 +3744,7 @@ async fn proxy_inner(
                     ctx.decision = WafDecision::Block;
                     ctx.block_reason = Some(format!("threat intel: {reason}"));
                     note_block(&state, ctx.client_ip);
+                    note_attack_verdict(ctx);
                     let resp = block_response(ctx);
                     stamp_response(ctx, &resp);
                     ctx.advance_phase(Phase::Logging);
@@ -4042,6 +4051,9 @@ async fn proxy_inner(
 
     if ctx.decision == WafDecision::Block {
         note_block(&state, ctx.client_ip);
+        if is_attack_verdict(ctx) {
+            note_attack_verdict(ctx);
+        }
         let reason = ctx.block_reason.as_deref().unwrap_or("");
         let resp = if reason.starts_with("HTTP request smuggling") {
             // RFC 7230 §3.3.3: malformed framing MUST be rejected with 400. The
@@ -4287,6 +4299,9 @@ async fn proxy_inner(
             }
             if ctx.decision == WafDecision::Block {
                 note_block(&state, ctx.client_ip);
+                if is_attack_verdict(ctx) {
+                    note_attack_verdict(ctx);
+                }
                 let resp = block_response(ctx);
                 stamp_response(ctx, &resp);
                 ctx.advance_phase(Phase::Logging);
@@ -4852,7 +4867,7 @@ async fn phase1_headers(
     }
 
     // --- Rate limiting ---
-    if still_evaluating(ctx) {
+    if still_evaluating(ctx) && !is_static_asset(&ctx.method, ctx.uri.path()) {
         if let Some(ref rl_cfg) = site.waf.rate_limit {
             if modules
                 .rate_limiter
@@ -6700,13 +6715,49 @@ fn trusted_proxies() -> &'static [IpNet] {
     P.get_or_init(|| {
         std::env::var("SENTINEL_TRUSTED_PROXIES")
             .ok()
-            .map(|s| {
-                s.split(',')
-                    .filter_map(|c| parse_block_cidr(c.trim()))
-                    .collect()
-            })
+            .map(|s| parse_trusted_proxies(&s))
             .unwrap_or_default()
     })
+}
+
+/// Cloudflare's published edge ranges (cloudflare.com/ips), for
+/// `SENTINEL_TRUSTED_PROXIES=cloudflare`. They change rarely; listing them by
+/// hand is the error the preset exists to avoid.
+const CLOUDFLARE_RANGES: &[&str] = &[
+    "173.245.48.0/20",
+    "103.21.244.0/22",
+    "103.22.200.0/22",
+    "103.31.4.0/22",
+    "141.101.64.0/18",
+    "108.162.192.0/18",
+    "190.93.240.0/20",
+    "188.114.96.0/20",
+    "197.234.240.0/22",
+    "198.41.128.0/17",
+    "162.158.0.0/15",
+    "104.16.0.0/13",
+    "104.24.0.0/14",
+    "172.64.0.0/13",
+    "131.0.72.0/22",
+    "2400:cb00::/32",
+    "2606:4700::/32",
+    "2803:f800::/32",
+    "2405:b500::/32",
+    "2405:8100::/32",
+    "2a06:98c0::/29",
+    "2c0f:f248::/32",
+];
+
+/// `SENTINEL_TRUSTED_PROXIES`: comma-separated addresses and CIDRs, where
+/// `cloudflare` stands for Cloudflare's published ranges.
+fn parse_trusted_proxies(s: &str) -> Vec<IpNet> {
+    s.split(',')
+        .flat_map(|c| match c.trim() {
+            "cloudflare" => CLOUDFLARE_RANGES.to_vec(),
+            other => vec![other],
+        })
+        .filter_map(|c| parse_block_cidr(c.trim()))
+        .collect()
 }
 
 fn is_trusted_proxy(ip: std::net::IpAddr) -> bool {
@@ -6789,7 +6840,19 @@ fn resolve_client_ip_with(
     if !is_trusted(peer) {
         return None;
     }
-    let xff = headers.get("x-forwarded-for")?.to_str().ok()?;
+    // Every X-Forwarded-For field, in order. Reading only the first let the
+    // client win behind any proxy that adds its own field rather than
+    // appending to the client's (HAProxy `option forwardfor`, F5, Citrix):
+    // the right-most hop the trusted proxy observed was never read.
+    let xff = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect::<Vec<_>>()
+        .join(",");
+    if xff.trim().is_empty() {
+        return None;
+    }
     xff.split(',')
         .rev()
         .filter_map(|p| p.trim().parse::<std::net::IpAddr>().ok())
@@ -7008,16 +7071,9 @@ fn reseed_ti_xdp_ips(
     let withdrawn: Vec<std::net::IpAddr> = seeded.difference(&current).copied().collect();
     for ip in &withdrawn {
         seeded.remove(ip);
-        if !xdp_autobanned().contains(ip) {
-            ebpf.unblock_ip(*ip);
-        }
+        ebpf.unblock_ip(*ip);
     }
     (current.len(), withdrawn.len())
-}
-
-fn xdp_autobanned() -> &'static DashSet<std::net::IpAddr> {
-    static SET: std::sync::OnceLock<DashSet<std::net::IpAddr>> = std::sync::OnceLock::new();
-    SET.get_or_init(DashSet::new)
 }
 
 /// Whether an IP is eligible for auto-ban. Private/loopback/link-local/etc. are
@@ -7055,25 +7111,128 @@ fn autoban_eligible(ip: std::net::IpAddr, include_private: bool) -> bool {
     }
 }
 
-/// Record a WAF block against `ip` and, if it has crossed the auto-ban
-/// threshold, push it to the eBPF/XDP blocklist (idempotent; logged once).
+/// Record a WAF block against `ip` for the repeat-offender score. Bans are
+/// `note_attack_verdict`'s.
 fn note_block(state: &ServerState, ip: std::net::IpAddr) {
     state.modules.correlation.record_block(ip);
+}
+
+/// A block the rule engine or the classifier reached: what a ban may be built
+/// on. Not a 429 (rate limit), a 401 (edge JWT), a GeoIP or bot decision, a
+/// size limit or an IP list — the auto-ban counted all of those, so an office
+/// throttled by the rate limiter was banned for it.
+fn is_attack_verdict(ctx: &RequestContext) -> bool {
+    ctx.block_status.is_none() && !ctx.rule_matches.is_empty()
+}
+
+/// A source's standing with one site.
+#[derive(Clone, Copy, Debug)]
+struct SiteOffender {
+    verdicts: u32,
+    window_start: std::time::Instant,
+    banned_until: Option<std::time::Instant>,
+    banned_until_unix: u64,
+    strikes: u32,
+    last_ban: Option<std::time::Instant>,
+}
+
+/// Attack verdicts are counted over this window toward a ban.
+const AUTOBAN_WINDOW: Duration = Duration::from_secs(600);
+/// Earlier bans count toward a longer one for this long.
+const AUTOBAN_STRIKE_MEMORY: Duration = Duration::from_secs(24 * 3600);
+
+/// source → site id → standing. Per site: an office reaching ten sites is not
+/// banned from nine of them for what one user did on the tenth.
+fn site_offenders() -> &'static DashMap<IpAddr, HashMap<String, SiteOffender>> {
+    static M: std::sync::OnceLock<DashMap<IpAddr, HashMap<String, SiteOffender>>> =
+        std::sync::OnceLock::new();
+    M.get_or_init(DashMap::new)
+}
+
+/// 15 minutes, then 30, then 60 at most — never permanent. It was permanent,
+/// node-wide and in-kernel: a CGNAT or office address lost every site on the
+/// node with no block page and no log line, until someone restarted it.
+fn autoban_duration(strikes: u32) -> Duration {
+    Duration::from_secs(60 * (15u64 << strikes.min(2)))
+}
+
+/// Seconds left on `ip`'s ban from `site`, if it is banned.
+fn site_ban_remaining(site: &str, ip: IpAddr) -> Option<u64> {
+    let now = std::time::Instant::now();
+    site_offenders()
+        .get(&ip)?
+        .get(site)?
+        .banned_until
+        .filter(|u| *u > now)
+        .map(|u| u.duration_since(now).as_secs().max(1))
+}
+
+/// Count one attack verdict against the request's source on its site, and ban
+/// it from that site once `SENTINEL_XDP_AUTOBAN_BLOCKS` (default 20) land
+/// within `AUTOBAN_WINDOW`. Never for an allow-listed source, a verified good
+/// bot, or a shared-egress or private address (`autoban_eligible`).
+fn note_attack_verdict(ctx: &RequestContext) {
     let ab = autoban_config();
-    if !ab.enabled || !autoban_eligible(ip, ab.include_private) {
+    let Some(site) = ctx.site_id.as_deref() else {
+        return;
+    };
+    if !ab.enabled
+        || ctx.allowlisted
+        || ctx.tx_vars.get("bot_good").is_some_and(|v| v == "1")
+        || !autoban_eligible(ctx.client_ip, ab.include_private)
+    {
         return;
     }
-    if state.modules.correlation.block_count_for_ip(ip) >= ab.threshold_blocks
-        && xdp_autobanned().insert(ip)
-    {
-        state.ebpf.block_ip(ip);
-        warn!(
-            %ip,
-            threshold = ab.threshold_blocks,
-            mode = %state.ebpf.mode(),
-            "auto-banned repeat offender — added to eBPF/XDP blocklist"
-        );
+    let now = std::time::Instant::now();
+    if site_offenders().len() > 50_000 {
+        // Bounded: a scanner rotating addresses must not grow this for ever.
+        site_offenders().retain(|_, sites| {
+            sites.retain(|_, o| {
+                o.banned_until.is_some_and(|u| u > now)
+                    || now.duration_since(o.window_start) < AUTOBAN_WINDOW
+                    || o.last_ban
+                        .is_some_and(|t| now.duration_since(t) < AUTOBAN_STRIKE_MEMORY)
+            });
+            !sites.is_empty()
+        });
     }
+    let mut sites = site_offenders().entry(ctx.client_ip).or_default();
+    let o = sites.entry(site.to_owned()).or_insert(SiteOffender {
+        verdicts: 0,
+        window_start: now,
+        banned_until: None,
+        banned_until_unix: 0,
+        strikes: 0,
+        last_ban: None,
+    });
+    if now.duration_since(o.window_start) > AUTOBAN_WINDOW {
+        o.verdicts = 0;
+        o.window_start = now;
+    }
+    o.verdicts += 1;
+    if o.verdicts < ab.threshold_blocks || o.banned_until.is_some_and(|u| u > now) {
+        return;
+    }
+    if o.last_ban
+        .is_some_and(|t| now.duration_since(t) > AUTOBAN_STRIKE_MEMORY)
+    {
+        o.strikes = 0;
+    }
+    let ban = autoban_duration(o.strikes);
+    o.strikes += 1;
+    o.banned_until = Some(now + ban);
+    o.banned_until_unix = unix_now_secs() + ban.as_secs();
+    o.last_ban = Some(now);
+    o.verdicts = 0;
+    note_autoban();
+    warn!(
+        ip = %ctx.client_ip,
+        site = %site,
+        minutes = ban.as_secs() / 60,
+        strikes = o.strikes,
+        threshold = ab.threshold_blocks,
+        "auto-banned from the site after repeated attack verdicts"
+    );
 }
 
 /// Seed the eBPF blocklist from operator-configured IP-reputation block CIDRs
@@ -7760,6 +7919,50 @@ fn sni_listener_tls_config(resolver: Arc<dyn rustls::server::ResolvesServerCert>
         .with_cert_resolver(resolver);
     cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), ACME_TLS_ALPN.to_vec()];
     cfg
+}
+
+/// A GET or HEAD for a static file: a stylesheet, script, image, font or media
+/// file, by the extension of the request's canonical path.
+///
+/// The per-IP rate limit counted every asset, so one page load — 50 to 100 of
+/// them — spent a 100 rps bucket, and an office or a CDN PoP behind one
+/// address got 429s on CSS and JS. Matched on the canonical path, so
+/// `/login;x.css` — served as `/login` by servlet containers — is not one.
+fn is_static_asset(method: &http::Method, path: &str) -> bool {
+    if method != http::Method::GET && method != http::Method::HEAD {
+        return false;
+    }
+    let path = override_match_path(path);
+    let last = path.rsplit('/').next().unwrap_or("");
+    let Some((_, ext)) = last.rsplit_once('.') else {
+        return false;
+    };
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "css"
+            | "js"
+            | "mjs"
+            | "map"
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "svg"
+            | "webp"
+            | "avif"
+            | "ico"
+            | "bmp"
+            | "woff"
+            | "woff2"
+            | "ttf"
+            | "otf"
+            | "eot"
+            | "mp4"
+            | "webm"
+            | "mp3"
+            | "ogg"
+            | "wav"
+    )
 }
 
 /// Marks a request that reached this node over TLS (HTTPS on TCP, or QUIC).
@@ -9195,9 +9398,22 @@ fn percent_decode_simple(s: &str) -> Option<String> {
 fn blocks_response(state: &ServerState) -> Response<BoxBody> {
     let ab = autoban_config();
     let (ebpf_ips, ebpf_ranges) = state.ebpf.blocked_entries();
+    let now = std::time::Instant::now();
+    let mut ban_entries: Vec<(IpAddr, String, u64, u32)> = site_offenders()
+        .iter()
+        .flat_map(|e| {
+            let ip = *e.key();
+            e.value()
+                .iter()
+                .filter(|(_, o)| o.banned_until.is_some_and(|u| u > now))
+                .map(|(site, o)| (ip, site.clone(), o.banned_until_unix, o.strikes))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    ban_entries.sort();
     let autobanned: Vec<String> = {
-        let mut v: Vec<std::net::IpAddr> = xdp_autobanned().iter().map(|e| *e).collect();
-        v.sort();
+        let mut v: Vec<IpAddr> = ban_entries.iter().map(|b| b.0).collect();
+        v.dedup();
         v.into_iter().map(|ip| ip.to_string()).collect()
     };
     let corr = &state.modules.correlation;
@@ -9227,8 +9443,15 @@ fn blocks_response(state: &ServerState) -> Response<BoxBody> {
             "enabled": ab.enabled,
             "threshold_blocks": ab.threshold_blocks,
             "include_private": ab.include_private,
-            "window_secs": corr.window(),
+            "window_secs": AUTOBAN_WINDOW.as_secs(),
             "banned": autobanned,
+            // Per site and time-limited: who, where, until when, which ban.
+            "entries": ban_entries
+                .iter()
+                .map(|(ip, site, until, strikes)| serde_json::json!({
+                    "ip": ip.to_string(), "site": site, "until_unix": until, "strikes": strikes,
+                }))
+                .collect::<Vec<_>>(),
         },
         "offenders": {
             "window_secs": corr.window(),
@@ -9252,7 +9475,12 @@ fn unblock_response(state: &ServerState, raw: &str) -> Response<BoxBody> {
     let Ok(ip) = raw.parse::<std::net::IpAddr>() else {
         return json_err(StatusCode::BAD_REQUEST, "not an IP address");
     };
-    let was_autobanned = xdp_autobanned().remove(&ip).is_some();
+    let was_autobanned = site_offenders().remove(&ip).is_some_and(|(_, sites)| {
+        let now = std::time::Instant::now();
+        sites
+            .values()
+            .any(|o| o.banned_until.is_some_and(|u| u > now))
+    });
     let (before_ips, ranges) = state.ebpf.blocked_entries();
     let was_ebpf = before_ips.contains(&ip);
     state.ebpf.unblock_ip(ip);
@@ -13307,6 +13535,157 @@ mod path_override_match_tests {
         ] {
             assert_eq!(override_match_path(raw), want, "{raw}");
         }
+    }
+}
+
+#[cfg(test)]
+mod autoban_tests {
+    use super::*;
+
+    fn attack(site: &str, ip: &str) -> RequestContext {
+        let mut ctx = RequestContext::new(ip.parse().unwrap(), 1);
+        ctx.site_id = Some(site.to_owned());
+        ctx.rule_matches.push(sentinel_core::context::RuleMatch {
+            rule_id: "942100".into(),
+            message: "sqli".into(),
+            severity: sentinel_core::context::Severity::Critical,
+            score: 5,
+            target: "ARGS".into(),
+            phase: Phase::RequestBody,
+            matched_value: String::new(),
+        });
+        ctx
+    }
+
+    /// A ban is per site and ends: it was node-wide, in the kernel, permanent
+    /// and silent, so one office user's scan cost the whole office every site.
+    #[test]
+    fn repeated_attacks_ban_the_source_from_that_site_only_for_a_while() {
+        let ip = "8.8.4.41";
+        for _ in 0..autoban_config().threshold_blocks {
+            note_attack_verdict(&attack("shop", ip));
+        }
+        let left = site_ban_remaining("shop", ip.parse().unwrap()).expect("banned from shop");
+        assert!(
+            (14 * 60..=15 * 60).contains(&left),
+            "first ban is 15 min, got {left}s"
+        );
+        assert_eq!(
+            site_ban_remaining("blog", ip.parse().unwrap()),
+            None,
+            "not from other sites"
+        );
+    }
+
+    #[test]
+    fn longer_bans_for_repeat_offenders_but_never_beyond_an_hour() {
+        let mins: Vec<u64> = (0..5).map(|s| autoban_duration(s).as_secs() / 60).collect();
+        assert_eq!(mins, vec![15, 30, 60, 60, 60]);
+    }
+
+    #[test]
+    fn allow_listed_sources_and_verified_crawlers_are_never_banned() {
+        for (i, setup) in [
+            |c: &mut RequestContext| c.allowlisted = true,
+            |c: &mut RequestContext| {
+                c.tx_vars.insert("bot_good".into(), "1".into());
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let ip = format!("8.8.4.{}", 50 + i);
+            for _ in 0..autoban_config().threshold_blocks * 2 {
+                let mut c = attack("shop", &ip);
+                setup(&mut c);
+                note_attack_verdict(&c);
+            }
+            assert_eq!(
+                site_ban_remaining("shop", ip.parse().unwrap()),
+                None,
+                "{ip}"
+            );
+        }
+    }
+
+    /// A 429, a 401 or a block with no rule behind it is not an attack: the
+    /// auto-ban counted them, so a rate-limited office was banned for it.
+    #[test]
+    fn only_rule_and_classifier_verdicts_count() {
+        let mut c = attack("shop", "8.8.4.60");
+        assert!(is_attack_verdict(&c));
+        c.block_status = Some(429);
+        assert!(!is_attack_verdict(&c));
+        c.block_status = Some(401);
+        assert!(!is_attack_verdict(&c));
+        let bare = RequestContext::new("8.8.4.61".parse().unwrap(), 1);
+        assert!(
+            !is_attack_verdict(&bare),
+            "a GeoIP or bot block has no rule match"
+        );
+    }
+}
+
+#[cfg(test)]
+mod rate_limit_scope_tests {
+    use super::*;
+
+    #[test]
+    fn page_assets_are_not_rate_limited_but_dynamic_paths_are() {
+        let get = http::Method::GET;
+        for p in [
+            "/static/app.css",
+            "/js/main.min.js",
+            "/img/Logo.PNG",
+            "/fonts/a.woff2",
+            "/favicon.ico",
+        ] {
+            assert!(is_static_asset(&get, p), "{p}");
+        }
+        for p in [
+            "/login",
+            "/api/orders",
+            "/index.html",
+            "/report.php",
+            "/login;x.css",
+            "/a/..;/login",
+        ] {
+            assert!(!is_static_asset(&get, p), "{p}");
+        }
+        assert!(!is_static_asset(&http::Method::POST, "/upload/a.png"));
+    }
+
+    /// HAProxy, F5 and Citrix add their own X-Forwarded-For field rather than
+    /// appending to the client's. Reading only the first field let a client's
+    /// spoofed value win.
+    #[test]
+    fn every_forwarded_for_field_is_read() {
+        let mut h = http::HeaderMap::new();
+        h.append("x-forwarded-for", "6.6.6.6".parse().unwrap());
+        h.append("x-forwarded-for", "203.0.113.9".parse().unwrap());
+        let lb: IpAddr = "10.0.0.1".parse().unwrap();
+        let trusted = |ip: IpAddr| ip == lb;
+        assert_eq!(
+            resolve_client_ip_with(lb, &h, trusted),
+            Some("203.0.113.9".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn the_cloudflare_preset_expands() {
+        let nets = parse_trusted_proxies("cloudflare, 10.0.0.0/8");
+        assert!(nets
+            .iter()
+            .any(|n| n.contains(&"104.16.1.1".parse::<IpAddr>().unwrap())));
+        assert!(nets
+            .iter()
+            .any(|n| n.contains(&"2606:4700::1".parse::<IpAddr>().unwrap())));
+        assert!(nets
+            .iter()
+            .any(|n| n.contains(&"10.1.2.3".parse::<IpAddr>().unwrap())));
+        assert!(!nets
+            .iter()
+            .any(|n| n.contains(&"8.8.8.8".parse::<IpAddr>().unwrap())));
     }
 }
 

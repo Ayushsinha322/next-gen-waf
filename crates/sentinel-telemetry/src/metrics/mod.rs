@@ -551,6 +551,9 @@ struct WafMetrics {
     /// number of crawlers actually proven — and from an address that cannot
     /// verify, it must stay 0.
     pub bot_good_bot_allowed_total: Counter,
+    /// Sources auto-banned from a site for repeated attack verdicts. Each ban
+    /// is also logged; this is what an alert rule watches.
+    pub autobans_total: Counter,
     /// Panics anywhere in the process, counted by the panic hook. Release builds
     /// aborted on the first one until 2026-10; now a panic is contained to the
     /// request or background loop it happened in, which is exactly why it needs
@@ -687,6 +690,10 @@ impl WafMetrics {
             "sentinel_bot_good_bot_allowlisted_total",
             "Requests granted the good-bot allowlist after reverse-DNS verification (PTR in the operator's domain, forward-confirmed)",
         );
+        let autobans_total = registry.register_counter(
+            "sentinel_autobans_total",
+            "Sources auto-banned from a site after repeated attack verdicts (time-limited, per site)",
+        );
         let panics_total = registry.register_counter(
             "sentinel_panics_total",
             "Panics anywhere in the data-plane process; each is logged with its source location",
@@ -729,6 +736,7 @@ impl WafMetrics {
             ja4_h3_absent_total,
             h3_response_resets_total,
             bot_good_bot_allowed_total,
+            autobans_total,
             panics_total,
             request_panics_total,
             task_restarts_total,
@@ -953,6 +961,11 @@ pub fn note_good_bot_allowed() {
 }
 pub fn bot_good_bot_allowed_total() -> u64 {
     WAF_METRICS.bot_good_bot_allowed_total.get()
+}
+
+/// One source was auto-banned from a site.
+pub fn note_autoban() {
+    WAF_METRICS.autobans_total.inc();
 }
 
 /// Record one NDJSON log line dropped because the writer queue was full, and

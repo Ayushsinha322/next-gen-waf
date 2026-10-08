@@ -29,7 +29,7 @@ interface Row {
 }
 
 const KIND_META: Record<Kind, { label: string; bg: string; fg: string; tip: string }> = {
-  autoban:   { label: "XDP auto-ban",     bg: "rgba(224,80,70,.16)",   fg: "var(--red-b)", tip: "Repeat offender pushed to the eBPF/XDP blocklist by the data plane; packets are dropped before the HTTP layer" },
+  autoban:   { label: "Auto-ban",         bg: "rgba(224,80,70,.16)",   fg: "var(--red-b)", tip: "Banned from one site for 15–60 minutes after repeated attack verdicts; the client sees the block page, and Unblock lifts it on every node" },
   ebpf:      { label: "eBPF blocklist",   bg: "rgba(224,80,70,.10)",   fg: "var(--red-b)", tip: "In the kernel/software drop list: seeded from a site's IP-reputation block CIDRs or added by the auto-ban" },
   offender:  { label: "repeat offender",  bg: "rgba(224,166,58,.14)",  fg: "var(--amber)", tip: "Blocked several times inside the correlation window; extra anomaly score on every request until the window passes" },
   indicator: { label: "threat intel",     bg: "rgba(0,200,240,.12)",   fg: "var(--cyan)",  tip: "Block-tier indicator in the corpus the data plane enforces (feed or manual)" },

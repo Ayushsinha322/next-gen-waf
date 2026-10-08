@@ -32,6 +32,10 @@
 #                                wildcard addresses are refused.
 #      --shared-egress <cidrs>   comma-separated NAT/VPN egress addresses whose
 #                                block history must never punish bystanders
+#      --trusted-proxies <list>  load balancers / CDN in front of this WAF whose
+#                                X-Forwarded-For is believed: comma-separated
+#                                IPv4 addresses or CIDRs, or `cloudflare` for
+#                                Cloudflare's published ranges
 #      --no-harden               skip the kernel network profile (sysctl)
 #      --no-docker-tuning        do not enable Docker at boot or set live-restore
 #      --no-docker-install       if Docker is absent, stop instead of installing it
@@ -60,6 +64,7 @@ DOCKER_INSTALL=yes
 # --non-interactive); a flag wins over the environment.
 CONSOLE_BIND="${CONSOLE_BIND:-}"
 SHARED_EGRESS="${SHARED_EGRESS:-}"
+TRUSTED_PROXIES="${TRUSTED_PROXIES:-}"
 need_arg() { [[ -n "${2:-}" && "${2:0:2}" != "--" ]] || { echo "$1 needs a value" >&2; exit 2; }; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -72,6 +77,7 @@ while [[ $# -gt 0 ]]; do
     --no-docker-install) DOCKER_INSTALL=no ;;
     --console-bind)  need_arg "$1" "${2:-}"; CONSOLE_BIND="$2";  shift ;;
     --shared-egress) need_arg "$1" "${2:-}"; SHARED_EGRESS="$2"; shift ;;
+    --trusted-proxies) need_arg "$1" "${2:-}"; TRUSTED_PROXIES="$2"; shift ;;
     # The header block, from its second line to the closing rule. A fixed line
     # range went stale every time the header grew and printed half a sentence.
     -h|--help) awk 'NR>2 && /^# =+$/{exit} NR>2' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -212,6 +218,18 @@ cidr_list_ok() {
   for item in "${items[@]}"; do
     item="${item// /}"
     [[ "$item" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/([0-9]|[12][0-9]|3[012]))?$ ]] || return 1
+  done
+}
+# A trusted-proxy list: cidr_list_ok entries, or the `cloudflare` preset.
+trusted_list_ok() {
+  local items item
+  [[ "${1:-}" =~ ^,|,,|,$ ]] && return 1
+  IFS=',' read -ra items <<<"${1:-}"
+  (( ${#items[@]} > 0 )) || return 1
+  for item in "${items[@]}"; do
+    item="${item// /}"
+    [[ "$item" == cloudflare ]] && continue
+    cidr_list_ok "$item" || return 1
   done
 }
 # --- validators-end ----------------------------------------------------------
@@ -785,6 +803,28 @@ else
   SHARED_EGRESS_LINE="# SENTINEL_SHARED_EGRESS_CIDRS=          # e.g. 203.0.113.7,198.51.100.0/24 — see configs/env.example"
 fi
 
+# Trusted proxies. With a load balancer or CDN in front, every request arrives
+# from it, so per-IP limits, bans and the logs saw ONE client — the balancer —
+# until its X-Forwarded-For is believed. Only listed peers are believed: a
+# client reaching the WAF directly cannot forge its address.
+if [[ -z "$TRUSTED_PROXIES" && "$NONINTERACTIVE" != "yes" ]]; then
+  say ""
+  say "  ${B}Load balancer or CDN in front of this WAF${R}"
+  say "    Its addresses, so the real client IP is read from X-Forwarded-For."
+  say "    Comma-separated IPs or CIDRs, \`cloudflare\` for Cloudflare; blank for none."
+  read -r -p "  Trusted proxies [none]: " TRUSTED_PROXIES || true
+fi
+TRUSTED_PROXIES="${TRUSTED_PROXIES// /}"
+if [[ -n "$TRUSTED_PROXIES" ]]; then
+  trusted_list_ok "$TRUSTED_PROXIES" \
+    || die "trusted proxies '$TRUSTED_PROXIES' is not a comma-separated list of IPv4
+    addresses or CIDRs (or \`cloudflare\`). The data plane drops entries it cannot
+    parse, so a typo would leave the balancer untrusted and every client one IP."
+  TRUSTED_PROXIES_LINE="SENTINEL_TRUSTED_PROXIES=${TRUSTED_PROXIES}"
+else
+  TRUSTED_PROXIES_LINE="# SENTINEL_TRUSTED_PROXIES=              # e.g. 10.0.0.5,cloudflare — the balancer/CDN in front"
+fi
+
 # This used to be a question — "1) I will supply my own certificate / 2) Self-signed"
 # — whose answer was read into TLS_CHOICE, defaulted, and then never referenced
 # again anywhere in the script. Both answers produced identical behaviour. Asking
@@ -996,6 +1036,7 @@ SENTINEL_MGMT_BIND=$MGMT_BIND
 # Forgives an address's block HISTORY so one person's scan cannot get the whole
 # office blocked. Detection of each request is unchanged.
 $SHARED_EGRESS_LINE
+$TRUSTED_PROXIES_LINE
 ENVEOF
   chmod 600 "$ENV_FILE"
   ok "secrets generated (7 values, openssl rand) — $ENV_FILE, mode 0600"

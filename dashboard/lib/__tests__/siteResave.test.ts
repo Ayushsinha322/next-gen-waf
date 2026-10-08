@@ -98,6 +98,8 @@ describe("1.1.18 new-site defaults", () => {
     expect(f.ml_sensitivity).toBe(0.9);
     // `* HttpOnly SameSite=Lax` broke JS-read CSRF cookies on every site.
     expect(f.cookie_flags).toBe("");
+    // 100 rps per IP threw 429s at offices and CDN PoPs behind one address.
+    expect(f.rate_limit_enabled).toBe(false);
   });
 
   it("a stored site without ML shows ML off, and saving it unedited does not turn it on", () => {

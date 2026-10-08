@@ -550,9 +550,14 @@ services:
       #
       #   SENTINEL_XDP_BLOCK           comma-separated IPs/CIDRs to drop at XDP
       #                                from startup (e.g. "1.2.3.4,10.0.0.0/8")
-      #   SENTINEL_XDP_AUTOBAN         "0" disables auto-ban (default on)
-      #   SENTINEL_XDP_AUTOBAN_BLOCKS  WAF blocks in-window before a source IP
-      #                                is pushed to the kernel blocklist (20)
+      #   SENTINEL_XDP_AUTOBAN         "0" disables auto-ban (default on). The
+      #                                name is historical: since 1.1.18 a ban is
+      #                                per site, 15-60 min, a logged 403 with the
+      #                                block page — not a permanent kernel drop
+      #   SENTINEL_XDP_AUTOBAN_BLOCKS  attack verdicts (rules, classifier, threat
+      #                                intel — not 429s or 401s) from one source
+      #                                on one site within 10 min before it is
+      #                                banned from that site (20)
       #
       # Auto-ban being on by default with no way to tune or disable it from the
       # shipped configuration is why these matter: an operator whose traffic

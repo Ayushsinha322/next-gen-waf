@@ -1,10 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -106,24 +110,56 @@ func handleUnblockIP(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *l
 		c.JSON(http.StatusBadRequest, gin.H{"error": "not an IP address"})
 		return
 	}
-	req, _ := http.NewRequestWithContext(c.Request.Context(), http.MethodDelete, dataPlaneBaseURL()+"/api/v1/internal/blocks/"+ip.String(), nil)
-	setInternalAuth(req)
-	r, err := blocksHTTPClient.Do(req)
-	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": "data plane unreachable: " + err.Error()})
-		return
+	// Every data-plane node holds its own bans. Sent to one URL, an unblock
+	// lifted the ban on whichever node answered and left it on the rest.
+	targets := unblockTargets(c.Request.Context(), store)
+	type nodeResult struct {
+		Target string         `json:"target"`
+		OK     bool           `json:"ok"`
+		Error  string         `json:"error,omitempty"`
+		Result map[string]any `json:"result,omitempty"`
 	}
-	defer r.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-	if r.StatusCode != http.StatusOK {
-		c.JSON(http.StatusBadGateway, gin.H{"error": "data plane returned " + r.Status, "detail": string(body)})
-		return
+	results := make([]nodeResult, len(targets))
+	var wg sync.WaitGroup
+	for i, t := range targets {
+		wg.Add(1)
+		go func(i int, t string) {
+			defer wg.Done()
+			results[i] = nodeResult{Target: t}
+			req, _ := http.NewRequestWithContext(c.Request.Context(), http.MethodDelete, t+"/api/v1/internal/blocks/"+ip.String(), nil)
+			setInternalAuth(req)
+			r, err := blocksHTTPClient.Do(req)
+			if err != nil {
+				results[i].Error = "unreachable: " + err.Error()
+				return
+			}
+			defer r.Body.Close()
+			body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+			if r.StatusCode != http.StatusOK {
+				results[i].Error = "returned " + r.Status
+				return
+			}
+			_ = json.Unmarshal(body, &results[i].Result)
+			results[i].OK = true
+		}(i, t)
 	}
+	wg.Wait()
 	var result map[string]any
-	_ = json.Unmarshal(body, &result)
+	failed := 0
+	for _, r := range results {
+		if !r.OK {
+			failed++
+		} else if result == nil {
+			result = r.Result
+		}
+	}
+	if failed == len(results) {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "no data-plane node accepted the unblock", "nodes": results})
+		return
+	}
 	if store != nil {
 		actor := claims.UserID
-		diff, _ := json.Marshal(gin.H{"ip": ip.String(), "result": result})
+		diff, _ := json.Marshal(gin.H{"ip": ip.String(), "result": result, "nodes": results})
 		writeAuditEntry(c, store, hub, &db.WriteAuditRequest{
 			TenantID:    claims.TenantID,
 			ActorUserID: &actor,
@@ -132,5 +168,49 @@ func handleUnblockIP(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *l
 			Diff:        diff,
 		})
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true, "result": result})
+	c.JSON(http.StatusOK, gin.H{"ok": failed == 0, "partial": failed > 0, "result": result, "nodes": results})
+}
+
+// unblockTargets is the configured data-plane URL plus every data-plane node
+// heard from in the last ten minutes, by its hostname on the same scheme and
+// port. A hostname is used only if it is a plain host name: the request carries
+// the internal secret.
+func unblockTargets(ctx context.Context, store *db.Store) []string {
+	base := strings.TrimRight(dataPlaneBaseURL(), "/")
+	out := []string{base}
+	u, err := url.Parse(base)
+	if err != nil || store == nil {
+		return out
+	}
+	nodes, err := store.ListNodes(ctx)
+	if err != nil {
+		return out
+	}
+	seen := map[string]bool{base: true}
+	for _, n := range nodes {
+		if n.Role != "data-plane" || time.Since(n.LastSeen) > 10*time.Minute || !plainHostname(n.Hostname) {
+			continue
+		}
+		host := n.Hostname
+		if p := u.Port(); p != "" {
+			host = net.JoinHostPort(host, p)
+		}
+		if t := u.Scheme + "://" + host; !seen[t] {
+			seen[t] = true
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+func plainHostname(h string) bool {
+	if h == "" || len(h) > 253 {
+		return false
+	}
+	for _, r := range h {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '.' || r == '-') {
+			return false
+		}
+	}
+	return true
 }
