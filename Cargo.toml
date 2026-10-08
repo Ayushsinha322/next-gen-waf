@@ -97,8 +97,12 @@ aho-corasick = "1"
 hyperscan = "0.3"           # high-perf DPI (optional)
 
 # Plugins / WASM
-wasmtime = "25"
-wasmtime-wasi = "25"
+# 24.x, not 25: 25.0.3 carried 18 advisories (sandbox escapes among them) and
+# the 25 line has no patched release; 24.0.4+ is patched and builds on our Rust
+# 1.85 toolchain. The supported LTS is 36, which needs Rust 1.86 — move there
+# with the toolchain (2026-10-07 review #16).
+wasmtime = "24.0.4"
+wasmtime-wasi = "24.0.4"
 
 # ML inference
 ort = "2.0.0-rc.4"          # ONNX runtime

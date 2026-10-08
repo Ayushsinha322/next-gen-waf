@@ -115,6 +115,18 @@ rust-lint:
     # rather than from a Kubernetes eviction event.
     - du -sh target .cargo 2>/dev/null || true
 
+# GATING: known-vulnerable crates. Reads Cargo.lock only — no workspace build —
+# so it is cheap. Exceptions live in .cargo/audit.toml, each with the reason it
+# cannot be reached and what fixes it; any other advisory fails the pipeline.
+# 0.22.1 is the newest that builds on this toolchain AND reads the CVSS 4.0
+# entries now in the advisory database (0.21 cannot).
+rust-audit:
+  <<: *rust-base
+  stage: test
+  script:
+    - cargo install cargo-audit --version 0.22.1 --locked
+    - cargo audit
+
 rust-test:
   <<: *rust-base
   stage: rust-test
@@ -134,7 +146,9 @@ rust-build:
 # ── Go control plane ─────────────────────────────────────────────────────────
 go:
   stage: test
-  image: golang:1.22
+  # 1.25: pgx 5.9 requires it, and Go 1.24's standard library carries
+  # vulnerabilities our code reaches (govulncheck below).
+  image: golang:1.25
   tags:
     - k8s-docker
   cache:
@@ -153,13 +167,16 @@ go:
     - go vet ./...
     - go test ./...
     - go build ./...
+    # GATING: a vulnerability our code can reach, in a module or in the standard
+    # library of this Go. Pinned: govulncheck@latest needs a newer Go.
+    - go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
 
 # ── Dashboard ────────────────────────────────────────────────────────────────
 # GATING: type-check + unit tests + production build must all pass. (Was
 # allow_failure with `|| true` on every step — i.e. it could never fail.)
 dashboard:
   stage: test
-  image: node:20
+  image: node:22
   tags:
     - k8s-docker
   cache:
@@ -174,6 +191,7 @@ dashboard:
     - npm run test             # vitest unit tests
     - npm run lint || true     # advisory only (style); does not gate
     - npm run build            # production build must succeed
+    - npm audit --omit=dev --audit-level=high   # shipped dependencies: no high/critical
 
 # ── Deploy / operational shell ───────────────────────────────────────────────
 # GATING. Until now the entire operational surface — installer, upgrade, rollback,

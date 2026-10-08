@@ -1,0 +1,31 @@
+# cargo-audit exceptions. Each one is an advisory our code cannot reach whose fix
+# needs a newer Rust than the 1.85 toolchain the CI and images build with. They go
+# with the toolchain move (Rust 1.88 + wasmtime 36 LTS), not by being forgotten.
+# Reviewed 2026-10-08 (production-readiness review #16). Anything not listed here
+# fails CI.
+[advisories]
+ignore = [
+  # time 0.3.36: stack exhaustion parsing RFC 2822 dates. Nothing we build parses
+  # RFC 2822 (dependents: rcgen, simple_asn1, yasna, tracing-appender). Fixed in
+  # 0.3.47, which needs Rust 1.88.
+  "RUSTSEC-2026-0009",
+  # idna 0.5 via url 2.5.2, pinned in sentinel-storage: url 2.5.3+ pulls ICU
+  # crates that need Rust 1.86. It parses only the operator's Redis URL and the
+  # CLI's own endpoints.
+  "RUSTSEC-2024-0421",
+  # maxminddb: `Reader::open_mmap` is unsound. We open the database with
+  # `open_readfile` (sentinel-modules/src/geoip). 0.27 is an API break.
+  "RUSTSEC-2025-0132",
+  # wasmtime 24.0.13 (the patched line nearest 25 that builds on 1.85). These
+  # need the Winch compiler, the pooling allocator, 64-bit tables, the component
+  # model or aarch64 Cranelift; the plugin runtime uses default Cranelift with
+  # fuel, core modules only, and the shipped images are amd64. Fixed only in 36
+  # LTS (Rust 1.86).
+  "RUSTSEC-2026-0316",
+  "RUSTSEC-2026-0086",
+  "RUSTSEC-2026-0088",
+  "RUSTSEC-2026-0089",
+  "RUSTSEC-2026-0094",
+  "RUSTSEC-2026-0095",
+  "RUSTSEC-2026-0096",
+]
