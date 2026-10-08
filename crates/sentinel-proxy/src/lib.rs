@@ -691,6 +691,30 @@ struct ConfigSyncResponse {
     version_source: Option<String>,
 }
 
+/// A fingerprint of the sites a sync serves, compared alongside its version.
+///
+/// The version is the control plane's database generation: it moves when a
+/// site, rule or setting is edited, not when the control plane itself changes
+/// how it renders the same rows. 1.1.18's control plane added
+/// `tls.redirect_http` (Force HTTPS) to every site under an unchanged version,
+/// and nodes that had applied that version from the 1.1.17 control plane during
+/// a rolling upgrade (data planes first) never applied it: the redirect stayed
+/// inert until somebody edited something. The served JSON is stable between
+/// polls, so this changes only when the content does.
+fn sites_fingerprint(sites: &[serde_json::Value]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_vec(sites).unwrap_or_default().hash(&mut h);
+    h.finish()
+}
+
+/// Whether a poll's answer must be applied: a new version, different content
+/// under the same version, or a SIGHUP since the last apply. Each pair is
+/// (this poll, last applied).
+fn sync_needs_apply(version: (u64, u64), content: (u64, Option<u64>), reloads: (u64, u64)) -> bool {
+    version.0 != version.1 || Some(content.0) != content.1 || reloads.0 != reloads.1
+}
+
 /// Whether a sync listing no sites may replace the `serving` control-plane
 /// sites this node has.
 ///
@@ -1682,6 +1706,7 @@ impl ProxyServer {
                 // Restarts at "nothing applied", so a run that panicked
                 // mid-apply is re-applied on the next poll.
                 let mut last_version: u64 = u64::MAX;
+                let mut last_content: Option<u64> = None;
                 let reload_notify = Arc::clone(&sync_reload_notify);
                 // Authenticate the config-sync poll with the shared internal
                 // secret when configured, so the control plane's internal/config
@@ -1724,7 +1749,19 @@ impl ProxyServer {
                         }
                     };
                     let reloads = sentinel_core::config::reload_count();
-                    if envelope.version != last_version || reloads != reloads_seen {
+                    let content = sites_fingerprint(&envelope.sites);
+                    if sync_needs_apply(
+                        (envelope.version, last_version),
+                        (content, last_content),
+                        (reloads, reloads_seen),
+                    ) {
+                        if envelope.version == last_version && reloads == reloads_seen {
+                            info!(
+                                version = envelope.version,
+                                "the control plane serves different sites under the same \
+                                 version (an upgraded control plane renders them anew) — applying"
+                            );
+                        }
                         let previous: Vec<SiteConfig> = poll_cfg
                             .load()
                             .sites
@@ -1801,6 +1838,7 @@ impl ProxyServer {
                         reload_notify.notify_one();
                         CONFIG_VERSION_APPLIED.store(sync.version, Ordering::Relaxed);
                         last_version = sync.version;
+                        last_content = Some(content);
                         info!(version = last_version, sites = count, "sites hot-synced");
                     }
                     // Only once the poll is APPLIED: a sync that crashes while
@@ -13721,6 +13759,34 @@ mod rate_limit_scope_tests {
         assert!(!nets
             .iter()
             .any(|n| n.contains(&"8.8.8.8".parse::<IpAddr>().unwrap())));
+    }
+}
+
+#[cfg(test)]
+mod sync_apply_tests {
+    use super::*;
+
+    #[test]
+    fn a_poll_is_applied_on_a_new_version_new_content_or_a_reload() {
+        let a =
+            sites_fingerprint(&[serde_json::json!({"id": "s", "tls": {"redirect_http": false}})]);
+        let b =
+            sites_fingerprint(&[serde_json::json!({"id": "s", "tls": {"redirect_http": true}})]);
+        assert_ne!(a, b, "a rendering change must change the fingerprint");
+        assert_eq!(
+            a,
+            sites_fingerprint(&[serde_json::json!({"id": "s", "tls": {"redirect_http": false}})]),
+            "the same content must give the same fingerprint, or every poll re-applies"
+        );
+        // Nothing applied yet (boot, or a restarted run).
+        assert!(sync_needs_apply((221, u64::MAX), (a, None), (0, 0)));
+        // Steady state: nothing to do.
+        assert!(!sync_needs_apply((221, 221), (a, Some(a)), (0, 0)));
+        // Same version, rendered anew by an upgraded control plane.
+        assert!(sync_needs_apply((221, 221), (b, Some(a)), (0, 0)));
+        // A new version, or a SIGHUP.
+        assert!(sync_needs_apply((222, 221), (a, Some(a)), (0, 0)));
+        assert!(sync_needs_apply((221, 221), (a, Some(a)), (1, 0)));
     }
 }
 

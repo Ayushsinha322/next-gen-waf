@@ -2265,6 +2265,14 @@ rule 9990102 {
         config: serde_json::Value,
         threat_intel: Arc<Mutex<Option<serde_json::Value>>>,
     ) -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
+        switchable_control_plane(Arc::new(Mutex::new(config)), threat_intel).await
+    }
+
+    /// The same, serving whatever `config` holds at the time of each request.
+    async fn switchable_control_plane(
+        config: Arc<Mutex<serde_json::Value>>,
+        threat_intel: Arc<Mutex<Option<serde_json::Value>>>,
+    ) -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let beats: Arc<Mutex<Vec<serde_json::Value>>> = Arc::default();
@@ -2272,13 +2280,13 @@ rule 9990102 {
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let seen = Arc::clone(&seen);
-                let config = config.clone();
+                let config = Arc::clone(&config);
                 let threat_intel = Arc::clone(&threat_intel);
                 tokio::spawn(async move {
                     let svc = hyper::service::service_fn(
                         move |req: http::Request<hyper::body::Incoming>| {
                             let seen = Arc::clone(&seen);
-                            let config = config.clone();
+                            let config = lock(&config).clone();
                             let threat_intel = lock(&threat_intel).clone();
                             async move {
                                 let path = req.uri().path().to_string();
@@ -2312,6 +2320,69 @@ rule 9990102 {
             }
         });
         (url, beats)
+    }
+
+    /// An upgraded control plane can render the same database rows differently
+    /// under the same config version: 1.1.18 added `tls.redirect_http` to every
+    /// site. A node applied a sync only when the version changed, so one that
+    /// had applied that version from the old control plane — data planes roll
+    /// first — kept the old rendering, and Force HTTPS stayed inert on .71
+    /// until someone edited something.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises whole server runs; see proxy_state_lock
+    async fn new_content_under_the_same_version_is_applied() {
+        let _serial = proxy_state_lock();
+        crate::note_config_sync_ok();
+        let (origin, _hits) = counting_origin().await;
+        let served = |redirect: bool| {
+            serde_json::json!({
+                "version": 221,
+                "version_source": "generation",
+                "sites": [{
+                    "id": "rendered-anew",
+                    "domains": ["rendered.local"],
+                    "upstream": { "servers": [{ "host": origin.ip().to_string(), "port": origin.port() }] },
+                    "tls": { "redirect_http": redirect },
+                }],
+            })
+        };
+        let config = Arc::new(Mutex::new(served(false)));
+        let (cp, _beats) = switchable_control_plane(Arc::clone(&config), Arc::default()).await;
+        let listen = free_port();
+        let mut cfg = site_config(listen, origin, "local-site", vec![]);
+        cfg.cluster.sync_url = Some(cp);
+        cfg.cluster.sync_interval_secs = 1;
+        cfg.cluster.node_id = "content-sync-node".into();
+        let handle = config_handle(cfg);
+        let proxy = start_proxy(listen, Arc::clone(&handle)).await;
+
+        let redirect_of = || {
+            handle
+                .load()
+                .sites
+                .iter()
+                .find(|s| s.id == "rendered-anew")
+                .map(|s| s.tls.redirect_http)
+        };
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while redirect_of() != Some(false) {
+            assert!(Instant::now() < deadline, "the first sync never applied");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // The control plane is upgraded: same version, the site rendered anew.
+        *lock(&config) = served(true);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while redirect_of() != Some(true) {
+            assert!(
+                Instant::now() < deadline,
+                "different content under the same version was never applied"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        proxy.stop().await;
+        crate::note_config_sync_ok();
     }
 
     /// A crash-looping config sync was visible only on node-local /healthz:
