@@ -73,7 +73,10 @@ for _ in $(seq 1 60); do
   sleep 2
 done
 [[ "$st" == "exited 0" ]] || restore "the migrate job did not finish cleanly ($st)"
-docker logs sentinel-migrate-1 2>&1 | grep -q 'sentinel_cp) ready' || restore "the migrate job did not create the login"
+# Captured first: `docker logs | grep -q` under pipefail reads a present line
+# as absent once grep exits early and docker logs takes a SIGPIPE.
+mlog="$(docker logs sentinel-migrate-1 2>&1 || true)"
+grep -q 'sentinel_cp) ready' <<<"$mlog" || restore "the migrate job did not create the login"
 ok "sentinel_cp login created"
 
 ( cd "$INSTALL_DIR" && "${C[@]}" up -d controlplane >/dev/null 2>&1 ) || restore "the control plane did not restart"
