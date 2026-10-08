@@ -354,6 +354,40 @@ else
   warn "test attack → $ATTACK but no detection was recorded for '$NAME' within 30s — inspection is NOT confirmed; do not switch to blocking until it is"
 fi
 
+# ── DNS facts that decide the cutover ────────────────────────────────────────
+# An AAAA record sends IPv6 visitors around the WAF; CAA records can make ACME
+# issuance fail at the CA; and with no certificate here yet, the minutes after
+# cutover serve the internal certificate. Checked now, not discovered then.
+dns_q() { # dns_q TYPE NAME → answers, one per line (empty if none or no tool)
+  if command -v dig >/dev/null; then dig +short +time=3 +tries=1 "$1" "$2" 2>/dev/null
+  elif command -v host >/dev/null; then host -W 3 -t "$1" "$2" 2>/dev/null | sed -n "s/.* has \(IPv6 \)\{0,1\}address //p; s/.* has CAA record //p"
+  fi
+}
+DNS_WARN=()
+if command -v dig >/dev/null || command -v host >/dev/null; then
+  step "DNS for $DOMAIN"
+  A_NOW="$(dns_q A "$DOMAIN" | tr '\n' ' ')"
+  AAAA_NOW="$(dns_q AAAA "$DOMAIN" | tr '\n' ' ')"
+  ok "A today:    ${A_NOW:-none}"
+  if [[ -n "${AAAA_NOW// /}" ]]; then
+    DNS_WARN+=("$DOMAIN has an AAAA record (${AAAA_NOW% }): IPv6 visitors bypass the WAF. Remove it at cutover — do not point it here (IPv4-only container network).")
+  fi
+  CAA_NOW=""; d="$DOMAIN"
+  while [[ "$d" == *.* && -z "$CAA_NOW" ]]; do
+    CAA_NOW="$(dns_q CAA "$d" | tr '\n' ' ')"; [[ -n "$CAA_NOW" ]] || d="${d#*.}"
+  done
+  if [[ -n "${CAA_NOW// /}" ]]; then
+    if [[ "$CAA_NOW" == *letsencrypt.org* ]]; then ok "CAA ($d) allows Let's Encrypt"
+    else DNS_WARN+=("CAA on $d (${CAA_NOW% }) does not list letsencrypt.org: ACME issuance for $DOMAIN will fail unless it is added.")
+    fi
+  fi
+else
+  warn "neither dig nor host is installed — check the AAAA and CAA records for $DOMAIN by hand (docs/manual/SITE-ONBOARDING.md §6)"
+fi
+if [[ -z "$CERT" ]]; then
+  DNS_WARN+=("No certificate was uploaded for $DOMAIN: until one is, HTTPS visitors get the WAF's internal certificate. Upload the current one before DNS moves, or issue via ACME (staging first) right after.")
+fi
+
 # ── what happens next, in order ──────────────────────────────────────────────
 EGRESS_SET="$(sed -n 's/^SENTINEL_SHARED_EGRESS_CIDRS=//p' "$ENV_FILE" | head -1)"
 cat <<NEXT
@@ -374,8 +408,9 @@ cat <<NEXT
   ${B}3. Public ingress${R} — network team forwards ONLY tcp/80 and tcp/443 (udp/443 optional)
      from the public address to ${B}$WAF_IP${R}. Never 9443, never 22, never 1:1.
 
-  ${B}4. Cutover${R} — change the A record for $DOMAIN to the public address. Rollback is
-     the same change in reverse (takes one TTL).
+  ${B}4. Cutover${R} — with the certificate already on the WAF, change the A record for
+     $DOMAIN to the public address and remove any AAAA record. Rollback is the
+     same change in reverse (takes one TTL).
 
   ${B}5. Lock the origin${R} — the application's firewall accepts 80/443 only from $WAF_IP.
      Until then the WAF can be walked around by anyone who learns the origin address.
@@ -384,6 +419,9 @@ cat <<NEXT
      scoped exclusions for what the application legitimately does, then switch
      to blocking in the console. Guide: $INSTALL_DIR/docs/manual/SITE-ONBOARDING.md
 NEXT
+for w in "${DNS_WARN[@]}"; do
+  printf '\n  %s!%s %s\n' "$YEL" "$R" "$w"
+done
 if [[ -z "$EGRESS_SET" ]]; then
   printf '\n  %s!%s SENTINEL_SHARED_EGRESS_CIDRS is not set in %s. If your users reach the WAF\n' "$YEL" "$R" "$ENV_FILE"
   printf '    through one office NAT/VPN address, set it (comma-separated) and run\n'

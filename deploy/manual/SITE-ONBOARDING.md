@@ -443,6 +443,25 @@ Public IP :80 and :443   →   WAF VM private IP :80 and :443
 **Only ports 80 and 443.** The console on 9443 and SSH on 22 must never be
 forwarded from the internet.
 
+### Before you move the record
+
+- **The certificate must already be on the WAF.** Upload the site's current
+  certificate (§5, Manual Upload) *before* DNS moves. If you rely on ACME, it can
+  only be issued once DNS points here — run it against the **staging** CA first
+  (the "staging" switch), then switch to production. Either way, for the
+  minutes between cutover and a real certificate, visitors see the WAF's
+  internal certificate and a browser warning: plan that window, or upload first.
+- **IPv6 (AAAA records).** If `www.customer.com` has an AAAA record, IPv6
+  visitors keep going straight to the old server and **bypass the WAF**. Remove
+  the AAAA record at cutover. Do not point it at the WAF either: the WAF's
+  container network is IPv4-only, so every IPv6 visitor would arrive as one
+  address (rate limits, bans and logs would treat them all as one client).
+- **CAA records.** If the domain (or its parent) has CAA records, they must
+  allow your certificate's issuer — `letsencrypt.org` for ACME — or issuance
+  fails at the CA.
+
+`onboard-site.sh` checks all three and prints what it found.
+
 ---
 
 ## 7. Test properly
