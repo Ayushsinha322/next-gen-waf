@@ -29,6 +29,7 @@ pub mod challenge;
 mod cp_client;
 pub(crate) mod goodbot;
 pub mod http3;
+mod inspect_pool;
 mod inspection_limits;
 mod ip_feed;
 pub(crate) mod ja4_quic;
@@ -4215,7 +4216,12 @@ async fn proxy_inner(
             passthrough
         } else {
             ctx.request_body = Some(bytes.clone());
-            phase2_body(ctx, site, &engine_map, &state.ml_engine)?;
+            // A large body is inspected off the async workers, so it cannot
+            // delay every other site and the health probes (inspect_pool).
+            inspect_pool::run(bytes.len(), || {
+                phase2_body(ctx, site, &engine_map, &state.ml_engine)
+            })
+            .await?;
 
             // GraphQL firewall — query depth / complexity / introspection on the
             // body. Gated to GraphQL endpoints so nested REST-JSON bodies aren't
@@ -4659,7 +4665,10 @@ async fn proxy_inner(
                         let threshold = outbound_threshold(ctx);
                         ctx.outbound_threshold = Some(threshold);
                         let request_reason = ctx.block_reason.clone();
-                        engine.evaluate(ctx, Phase::ResponseBody, threshold);
+                        inspect_pool::run(bytes.len(), || {
+                            engine.evaluate(ctx, Phase::ResponseBody, threshold)
+                        })
+                        .await;
                         if ctx.decision == WafDecision::Block {
                             match ctx.verdict_source {
                                 None => ctx.verdict_source = Some(VerdictSource::Response),
@@ -5324,7 +5333,10 @@ impl WsSiteInspector {
         seed_crs_policy(ctx, &self.site);
         ctx.advance_phase(Phase::RequestBody);
         let engines = self.engines.load();
-        if let Err(e) = phase2_body(ctx, Some(&self.site), &engines, &self.ml_engine) {
+        let inspected = inspect_pool::run_now(message.len(), || {
+            phase2_body(ctx, Some(&self.site), &engines, &self.ml_engine)
+        });
+        if let Err(e) = inspected {
             warn!(site = %self.site.id, "WS message inspection failed: {e}");
             return if self.mode() == WafMode::Blocking {
                 websocket::Verdict::Refuse(websocket::CLOSE_INTERNAL_ERROR)
@@ -10699,6 +10711,7 @@ fn metrics_response(rate_limiter: &RateLimiter) -> Response<BoxBody> {
             prometheus_text()
                 + &siem_metrics_text()
                 + &ip_feed::metrics_text()
+                + &inspect_pool::metrics_text()
                 + &rate_limiter.prometheus_text()
                 + &history_sink_metrics_text(
                     HISTORY_SINK_ACTIVE.load(std::sync::atomic::Ordering::Relaxed),
