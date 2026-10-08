@@ -31,7 +31,7 @@ const Name = "Swaraj Kavach"
 
 // Product is the release version. Bump it together with VERSION, Cargo.toml
 // [workspace.package].version and dashboard/package.json — CI refuses a drift.
-const Product = "1.1.17"
+const Product = "1.1.18"
 
 // CommitLinked and BuildDateLinked are what the binary was built from, injected
 // by the Dockerfile with
