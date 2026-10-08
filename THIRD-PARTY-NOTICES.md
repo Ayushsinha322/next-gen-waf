@@ -9,7 +9,7 @@ re-runs during packaging. Run it after changing a dependency. Do not edit by han
 It records what each component **declares** in its own manifest. It is an
 attribution inventory, not a legal review.
 
-**435 redistributed components** across Rust, Go, npm and container images.
+**422 redistributed components** across Rust, Go, npm and container images.
 A further 104 Rust crates and 399 npm packages are
 build- or development-only: they are compiled or installed here but never
 shipped, and are listed separately at the end so the two are never confused.
@@ -30,7 +30,7 @@ the OWASP Core Rule Set keeps its own copy at `rules/owasp-crs/LICENSE`.
 Reachable through normal (non-dev, non-build) edges from a shipped binary, so these are compiled into what customers run. Workspace members excluded.
 **284 components.**
 
-### MIT OR Apache-2.0 — 146 component(s)
+### MIT OR Apache-2.0 — 147 component(s)
 - ahash 0.8.12
 - anstream 1.0.0
 - anstyle 1.0.14
@@ -60,7 +60,7 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - crc32fast 1.5.0
 - crossbeam-channel 0.5.17
 - crossbeam-deque 0.8.6
-- crossbeam-epoch 0.9.18
+- crossbeam-epoch 0.9.21
 - crossbeam-utils 0.8.21
 - crypto-common 0.1.7
 - deranged 0.3.11
@@ -85,6 +85,7 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - getrandom 0.3.4
 - getrandom 0.4.2
 - gimli 0.29.0
+- hashbrown 0.13.2
 - hashbrown 0.14.5
 - hashbrown 0.15.5
 - hashbrown 0.17.1
@@ -172,7 +173,7 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - unicode-normalization 0.1.25
 - unicode-width 0.2.2
 - unicode-xid 0.2.6
-- ureq 2.9.7
+- ureq 2.12.1
 - url 2.5.2
 - xattr 1.6.1
 - yasna 0.5.2
@@ -183,7 +184,7 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - combine 4.6.7
 - dashmap 6.1.0
 - generic-array 0.14.7
-- h2 0.4.14
+- h2 0.4.20
 - h3 0.0.8
 - h3-quinn 0.0.10
 - http-body 1.0.1
@@ -222,31 +223,31 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - zstd 0.13.3
 
 ### Apache-2.0 WITH LLVM-exception — 25 component(s)
-- cranelift-bforest 0.112.3
-- cranelift-bitset 0.112.3
-- cranelift-codegen 0.112.3
-- cranelift-codegen-shared 0.112.3
-- cranelift-control 0.112.3
-- cranelift-entity 0.112.3
-- cranelift-frontend 0.112.3
-- cranelift-native 0.112.3
-- cranelift-wasm 0.112.3
-- regalloc2 0.10.2
+- cranelift-bforest 0.111.13
+- cranelift-bitset 0.111.13
+- cranelift-codegen 0.111.13
+- cranelift-codegen-shared 0.111.13
+- cranelift-control 0.111.13
+- cranelift-entity 0.111.13
+- cranelift-frontend 0.111.13
+- cranelift-native 0.111.13
+- cranelift-wasm 0.111.13
+- regalloc2 0.9.3
 - target-lexicon 0.12.16
-- wasmtime 25.0.3
-- wasmtime-asm-macros 25.0.3
-- wasmtime-cache 25.0.3
-- wasmtime-component-macro 25.0.3
-- wasmtime-component-util 25.0.3
-- wasmtime-cranelift 25.0.3
-- wasmtime-environ 25.0.3
-- wasmtime-fiber 25.0.3
-- wasmtime-jit-debug 25.0.3
-- wasmtime-jit-icache-coherence 25.0.3
-- wasmtime-slab 25.0.3
-- wasmtime-types 25.0.3
-- wasmtime-versioned-export-macros 25.0.3
-- wasmtime-wit-bindgen 25.0.3
+- wasmtime 24.0.13
+- wasmtime-asm-macros 24.0.13
+- wasmtime-cache 24.0.13
+- wasmtime-component-macro 24.0.13
+- wasmtime-component-util 24.0.13
+- wasmtime-cranelift 24.0.13
+- wasmtime-environ 24.0.13
+- wasmtime-fiber 24.0.13
+- wasmtime-jit-debug 24.0.13
+- wasmtime-jit-icache-coherence 24.0.13
+- wasmtime-slab 24.0.13
+- wasmtime-types 24.0.13
+- wasmtime-versioned-export-macros 24.0.13
+- wasmtime-wit-bindgen 24.0.13
 
 ### Apache-2.0 OR MIT — 15 component(s)
 - addr2line 0.22.0
@@ -270,13 +271,13 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - linux-raw-sys 0.4.15
 - rustix 0.38.44
 - rustix 1.1.4
-- wasm-encoder 0.217.1
+- wasm-encoder 0.215.0
 - wasm-encoder 0.248.0
-- wasmparser 0.217.1
-- wasmprinter 0.217.1
+- wasmparser 0.215.0
+- wasmprinter 0.215.0
 - wast 248.0.0
 - wat 1.248.0
-- wit-parser 0.217.1
+- wit-parser 0.215.0
 
 ### MIT/Apache-2.0 — 6 component(s)
 - filetime 0.2.28
@@ -286,24 +287,17 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - symlink 0.1.0
 - zstd-sys 2.0.16+zstd.1.5.7
 
-### ISC — 5 component(s)
-- maxminddb 0.24.0
-- rustls-webpki 0.102.8
-- rustls-webpki 0.103.13
-- simple_asn1 0.6.3
-- untrusted 0.9.0
-
-### Apache-2.0 OR ISC OR MIT — 4 component(s)
-- hyper-rustls 0.27.9
-- rustls 0.22.4
-- rustls 0.23.40
-- rustls-pemfile 2.2.0
-
 ### BSD-3-Clause — 4 component(s)
 - libinjectionrs 0.1.1
 - redis 1.2.2
 - sha1_smol 1.0.1
 - subtle 2.6.1
+
+### ISC — 4 component(s)
+- maxminddb 0.24.0
+- rustls-webpki 0.103.15
+- simple_asn1 0.6.3
+- untrusted 0.9.0
 
 ### Unlicense OR MIT — 4 component(s)
 - aho-corasick 1.1.4
@@ -311,9 +305,18 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - memchr 2.8.0
 - termcolor 1.4.1
 
+### Apache-2.0 OR ISC OR MIT — 3 component(s)
+- hyper-rustls 0.27.9
+- rustls 0.23.45
+- rustls-pemfile 2.2.0
+
 ### Apache-2.0 — 2 component(s)
 - backon 1.6.0
 - debugid 0.8.0
+
+### Apache-2.0/MIT — 2 component(s)
+- fxhash 0.2.1
+- rustc-hash 1.1.0
 
 ### CDLA-Permissive-2.0 — 2 component(s)
 - webpki-roots 0.26.11
@@ -348,9 +351,6 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 ### Apache-2.0 OR MIT OR Zlib — 1 component(s)
 - arcstr 1.2.0
 
-### Apache-2.0/MIT — 1 component(s)
-- fxhash 0.2.1
-
 ### BSD-2-Clause OR Apache-2.0 OR MIT — 1 component(s)
 - zerocopy 0.8.48
 
@@ -358,10 +358,10 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - xxhash-rust 0.8.19
 
 ### ISC AND (Apache-2.0 OR ISC) — 1 component(s)
-- aws-lc-rs 1.16.3
+- aws-lc-rs 1.18.1
 
 ### ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0) — 1 component(s)
-- aws-lc-sys 0.40.0
+- aws-lc-sys 0.45.0
 
 ### MIT OR Zlib OR Apache-2.0 — 1 component(s)
 - miniz_oxide 0.8.9
@@ -374,21 +374,14 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 
 ## Go modules (control plane)
 In the `controllerd` module graph. Go modules carry no licence field in the graph itself; each module's own repository is authoritative.
-**68 components.**
+**55 components.**
 
-### see module source — 68 component(s)
-- cel.dev/expr v0.15.0
-- cloud.google.com/go/compute/metadata v0.3.0
+### see module source — 55 component(s)
 - github.com/bytedance/sonic v1.11.6
 - github.com/bytedance/sonic/loader v0.1.1
-- github.com/census-instrumentation/opencensus-proto v0.4.1
-- github.com/cespare/xxhash/v2 v2.3.0
 - github.com/cloudwego/base64x v0.1.4
 - github.com/cloudwego/iasm v0.2.0
-- github.com/cncf/xds/go v0.0.0-20240423153145-555b57ec207b
 - github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc
-- github.com/envoyproxy/go-control-plane v0.12.1-0.20240621013728-1eb8caab5155
-- github.com/envoyproxy/protoc-gen-validate v1.0.4
 - github.com/gabriel-vasile/mimetype v1.4.3
 - github.com/gin-contrib/sse v0.1.0
 - github.com/gin-gonic/gin v1.10.0
@@ -397,16 +390,14 @@ In the `controllerd` module graph. Go modules carry no licence field in the grap
 - github.com/go-playground/universal-translator v0.18.1
 - github.com/go-playground/validator/v10 v10.20.0
 - github.com/goccy/go-json v0.10.2
-- github.com/golang-jwt/jwt/v5 v5.2.1
-- github.com/golang/glog v1.2.1
+- github.com/golang-jwt/jwt/v5 v5.2.2
 - github.com/golang/protobuf v1.5.0
 - github.com/google/go-cmp v0.6.0
 - github.com/google/gofuzz v1.0.0
-- github.com/google/uuid v1.6.0
 - github.com/jackc/pgpassfile v1.0.0
-- github.com/jackc/pgservicefile v0.0.0-20221227161230-091c0ba34f0a
-- github.com/jackc/pgx/v5 v5.6.0
-- github.com/jackc/puddle/v2 v2.2.1
+- github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761
+- github.com/jackc/pgx/v5 v5.9.2
+- github.com/jackc/puddle/v2 v2.2.2
 - github.com/json-iterator/go v1.1.12
 - github.com/klauspost/cpuid/v2 v2.2.7
 - github.com/knz/go-libedit v1.10.1
@@ -417,29 +408,25 @@ In the `controllerd` module graph. Go modules carry no licence field in the grap
 - github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd
 - github.com/modern-go/reflect2 v1.0.2
 - github.com/pelletier/go-toml/v2 v2.2.2
-- github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10
 - github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2
+- github.com/rogpeppe/go-internal v1.16.0
 - github.com/stretchr/objx v0.5.2
-- github.com/stretchr/testify v1.9.0
+- github.com/stretchr/testify v1.11.1
 - github.com/twitchyliquid64/golang-asm v0.15.1
 - github.com/ugorji/go/codec v1.2.12
 - go.uber.org/goleak v1.3.0
 - go.uber.org/multierr v1.10.0
 - go.uber.org/zap v1.27.0
 - golang.org/x/arch v0.8.0
-- golang.org/x/crypto v0.27.0
-- golang.org/x/mod v0.17.0
-- golang.org/x/net v0.29.0
-- golang.org/x/oauth2 v0.21.0
-- golang.org/x/sync v0.8.0
-- golang.org/x/sys v0.25.0
-- golang.org/x/term v0.24.0
-- golang.org/x/text v0.18.0
-- golang.org/x/tools v0.21.1-0.20240508182429-e35e4ccd0d2d
+- golang.org/x/crypto v0.51.0
+- golang.org/x/mod v0.38.0
+- golang.org/x/net v0.55.0
+- golang.org/x/sync v0.22.0
+- golang.org/x/sys v0.45.0
+- golang.org/x/term v0.43.0
+- golang.org/x/text v0.41.0
+- golang.org/x/tools v0.48.0
 - golang.org/x/xerrors v0.0.0-20191204190536-9bdfabe68543
-- google.golang.org/genproto/googleapis/api v0.0.0-20240604185151-ef581f913117
-- google.golang.org/genproto/googleapis/rpc v0.0.0-20240604185151-ef581f913117
-- google.golang.org/grpc v1.66.0
 - google.golang.org/protobuf v1.34.2
 - gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c
 - gopkg.in/yaml.v3 v3.0.1
@@ -455,9 +442,9 @@ Production dependencies only — `npm ls --omit=dev`. Next.js bundles a subset o
 - @babel/runtime 7.29.7
 - @emnapi/runtime 1.11.3
 - @img/colour 1.1.0
-- @next/env 15.5.26
-- @next/swc-linux-x64-gnu 15.5.26
-- @next/swc-linux-x64-musl 15.5.26
+- @next/env 15.5.27
+- @next/swc-linux-x64-gnu 15.5.27
+- @next/swc-linux-x64-musl 15.5.27
 - @tanstack/query-core 5.100.10
 - @tanstack/react-query 5.100.10
 - @types/d3-array 3.2.2
@@ -484,7 +471,7 @@ Production dependencies only — `npm ls --omit=dev`. Next.js bundles a subset o
 - motion-dom 12.40.0
 - motion-utils 12.39.0
 - nanoid 3.3.19
-- next 15.5.26
+- next 15.5.27
 - object-assign 4.1.1
 - postcss 8.5.28
 - prop-types 15.8.1
@@ -517,26 +504,26 @@ Production dependencies only — `npm ls --omit=dev`. Next.js bundles a subset o
 - semver 7.8.5
 
 ### Apache-2.0 — 5 component(s)
-- @img/sharp-linux-x64 0.35.4
-- @img/sharp-linuxmusl-x64 0.35.4
+- @img/sharp-linux-x64 0.35.5
+- @img/sharp-linuxmusl-x64 0.35.5
 - @swc/helpers 0.5.15
 - detect-libc 2.1.2
-- sharp 0.35.4
+- sharp 0.35.5
 
 ### BSD-3-Clause — 3 component(s)
 - d3-ease 3.0.1
 - react-transition-group 4.4.5
-- source-map-js 1.2.1
+- source-map-js 1.2.2
 
 ### LGPL-3.0-or-later — 2 component(s)
-- @img/sharp-libvips-linux-x64 1.3.3
-- @img/sharp-libvips-linuxmusl-x64 1.3.3
+- @img/sharp-libvips-linux-x64 1.3.4
+- @img/sharp-libvips-linuxmusl-x64 1.3.4
 
 ### 0BSD — 1 component(s)
 - tslib 2.8.1
 
 ### Apache-2.0 AND LGPL-3.0-or-later AND MIT — 1 component(s)
-- @img/sharp-wasm32 0.35.4
+- @img/sharp-wasm32 0.35.5
 
 ### CC-BY-4.0 — 1 component(s)
 - caniuse-lite 1.0.30001792
@@ -685,10 +672,10 @@ Present in this working tree, **not redistributed**: test harnesses, build scrip
 
 ### Apache-2.0 WITH LLVM-exception — 5 component(s)
 - ar_archive_writer 0.5.1
-- cranelift-codegen-meta 0.112.3
-- cranelift-isle 0.112.3
-- wasmtime-winch 25.0.3
-- winch-codegen 0.23.3
+- cranelift-codegen-meta 0.111.13
+- cranelift-isle 0.111.13
+- wasmtime-winch 24.0.13
+- winch-codegen 0.22.13
 
 ### Apache-2.0 OR MIT — 4 component(s)
 - autocfg 1.5.0

@@ -1,7 +1,7 @@
 # Deployment topology
 **Generated** by `deploy/gen-topology.py` from the merged compose configuration. Do not edit by hand.
 
-The production deployment is **3 compose files, 1386 lines**, applied as an override chain:
+The production deployment is **3 compose files, 1413 lines**, applied as an override chain:
 
 1. `deploy/docker/compose.prod.yml`
 2. `deploy/docker/compose.cluster.yml`
@@ -89,5 +89,6 @@ These are the paths a `rsync --delete` of the repository can destroy on a host. 
 - `deploy/docker/haproxy.cfg` → `/usr/local/etc/haproxy/haproxy.cfg`
 - `deploy/docker/pg_hba.conf` → `/etc/sentinel/pg/pg_hba.conf`
 - `deploy/docker/prometheus.yml` → `/etc/prometheus/prometheus.yml`
+- `deploy/docker/prometheus-rules.yml` → `/etc/prometheus/prometheus-rules.yml`
 - `deploy/docker/sentinel.proxy.yaml` → `/etc/sentinel/sentinel.yaml`
 - `deploy/docker/origin-ca` → `/etc/sentinel/origin-ca`
