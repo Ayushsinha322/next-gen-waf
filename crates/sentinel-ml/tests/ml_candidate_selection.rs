@@ -197,3 +197,62 @@ fn a_host_or_referer_carrying_a_payload_is_still_scored() {
         assert!(s >= DETECTION_MIN, "{h}: {v} scored only {s}");
     }
 }
+
+fn with_cookie(
+    mut c: sentinel_core::context::RequestContext,
+    cookie: &str,
+) -> sentinel_core::context::RequestContext {
+    c.request_headers.insert(
+        http::header::COOKIE,
+        http::HeaderValue::from_str(cookie).unwrap(),
+    );
+    c
+}
+
+/// On open-appsec's 1.04 million real browsing requests, 75% of the legitimate
+/// requests the classifier blocked were blocked for one cookie value: consent and
+/// analytics cookies the model never saw as benign. A cookie value may no longer
+/// add to the anomaly score, but the veto still sees it.
+#[test]
+fn a_cookie_value_cannot_make_the_classifier_block_but_the_veto_still_sees_it() {
+    let engine = sentinel_ml::MlEngine::new(64, 1_000_000, None);
+    let attack = "1' UNION SELECT password FROM users--";
+
+    let in_cookie = engine.evaluate(&with_cookie(
+        ctx("/products", None, None),
+        &format!("pref={attack}"),
+    ));
+    assert!(
+        in_cookie.payload_attack_score >= DETECTION_MIN,
+        "the veto must see a cookie-borne attack (scored {})",
+        in_cookie.payload_attack_score
+    );
+    assert!(
+        in_cookie.combined_score < DETECTION_MIN,
+        "a cookie value alone added to the score ({})",
+        in_cookie.combined_score
+    );
+
+    let in_query = engine.evaluate(&ctx(
+        &format!(
+            "/products?q={}",
+            attack.replace(' ', "%20").replace('\'', "%27")
+        ),
+        None,
+        None,
+    ));
+    assert!(
+        in_query.combined_score >= DETECTION_MIN,
+        "a query attack must still add ({})",
+        in_query.combined_score
+    );
+
+    // A real consent cookie (OneTrust's documented format) next to a clean query.
+    let consent = "OptanonConsent=isGpcEnabled=0&datestamp=Mon+Oct+14+2024+10%3A00%3A00+GMT%2B0200&version=202409.1.0&isIABGlobal=false&hosts=&interactionCount=1&landingPath=NotLandingPage&groups=C0001%3A1%2CC0002%3A1%2CC0003%3A0";
+    let page = engine.evaluate(&with_cookie(ctx("/products?page=2", None, None), consent));
+    assert!(
+        page.combined_score < DETECTION_MIN,
+        "consent cookie page view scored {}",
+        page.combined_score
+    );
+}

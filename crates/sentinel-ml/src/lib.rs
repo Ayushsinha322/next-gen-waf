@@ -65,7 +65,10 @@ pub struct MlScores {
     pub payload_attack_score: f32,
     /// Per-ONNX-model scores, keyed by model name.
     pub onnx_scores: Vec<(String, f32)>,
-    /// Combined score (max of all sources) ∈ [0, 1].
+    /// The score that may ADD to a request's anomaly score ∈ [0, 1]: the payload
+    /// score over every candidate except cookie values. `payload_attack_score`
+    /// keeps cookies, because the precision veto must not clear a block it could
+    /// not see; but a cookie value alone may not make the classifier block.
     pub combined_score: f32,
 }
 
@@ -188,9 +191,13 @@ impl MlEngine {
         //    training distribution) and takes the max, so an attack in one field
         //    is not diluted by benign content in others. Falls back to the
         //    legacy 25-feature classifier if the embedded model failed to load.
+        let mut additive_score = 0.0f32;
         let payload_attack_score = if models::ngram_classifier::is_loaded() {
-            // Collect every attackable value as a candidate.
+            // Collect every attackable value as a candidate. Cookie values are
+            // kept apart: they count for the veto (payload_attack) but not for
+            // the additive score (combined), see below.
             let mut candidates: Vec<String> = Vec::new();
+            let mut cookie_candidates: Vec<String> = Vec::new();
             // URL path segments (URLPath placement; path-borne injection).
             for seg in ctx.uri.path().split('/') {
                 if !seg.is_empty() && !is_plain_path_word(seg) {
@@ -233,7 +240,7 @@ impl MlEngine {
                     for c in v.split(';') {
                         let val = c.split_once('=').map(|(_, x)| x).unwrap_or(c).trim();
                         if !val.is_empty() {
-                            candidates.push(val.to_string());
+                            cookie_candidates.push(val.to_string());
                         }
                     }
                 } else if !v.is_empty() {
@@ -279,6 +286,21 @@ impl MlEngine {
                     max_s = max_s.max(s);
                 }
             }
+            // Cookie values never reach the additive score. On open-appsec's
+            // 1.04 million real browsing requests, 75% of the legitimate
+            // requests the classifier blocked were blocked for a cookie value
+            // alone: consent and analytics cookies (OneTrust OptanonConsent,
+            // Shopify _tracking_consent, Sourcebuster sbjs_*, Facebook fr, Adobe
+            // s_sq) are structured strings the model never saw as benign. The
+            // rule engine still inspects every cookie, and the veto below still
+            // sees them, so a cookie-borne attack is neither scored as benign
+            // nor cleared by the classifier; it is left to the rules.
+            additive_score = max_s;
+            for c in &cookie_candidates {
+                if let Some(s) = models::ngram_classifier::score_all(c) {
+                    max_s = max_s.max(s);
+                }
+            }
             max_s
         } else {
             self.payload_classifier.score(&fv)
@@ -311,7 +333,7 @@ impl MlEngine {
         // (its anomaly_score is reported but not fused into the block signal,
         // since an unsupervised model on varied benign traffic is FP-prone).
         let combined = if models::ngram_classifier::is_loaded() {
-            payload_attack_score
+            additive_score
         } else {
             anomaly_score.max(payload_attack_score)
         };
