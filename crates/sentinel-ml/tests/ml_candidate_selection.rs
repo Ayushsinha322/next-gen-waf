@@ -256,3 +256,45 @@ fn a_cookie_value_cannot_make_the_classifier_block_but_the_veto_still_sees_it() 
         page.combined_score
     );
 }
+
+/// A raw body that is neither a form nor JSON (analytics beacons, bot-manager
+/// telemetry, binary payloads) was the largest remaining source of classifier
+/// false positives once cookies were out. It still counts for the veto; only
+/// parsed fields may add to the score.
+#[test]
+fn an_unparsed_body_counts_for_the_veto_only_and_parsed_fields_still_add() {
+    let engine = sentinel_ml::MlEngine::new(64, 1_000_000, None);
+    let raw = engine.evaluate(&ctx(
+        "/api/x",
+        Some("application/json"),
+        Some(r#"{"q": "1' OR 1=1-- "#),
+    ));
+    assert!(
+        raw.payload_attack_score >= DETECTION_MIN,
+        "the veto must see it ({})",
+        raw.payload_attack_score
+    );
+    assert!(
+        raw.combined_score < DETECTION_MIN,
+        "an unparsed body added to the score ({})",
+        raw.combined_score
+    );
+
+    for (ct, body) in [
+        (
+            "application/json",
+            r#"{"q":"1' UNION SELECT password FROM users--"}"#,
+        ),
+        (
+            "application/x-www-form-urlencoded",
+            "q=1%27%20UNION%20SELECT%20password%20FROM%20users--",
+        ),
+    ] {
+        let parsed = engine.evaluate(&ctx("/api/x", Some(ct), Some(body)));
+        assert!(
+            parsed.combined_score >= DETECTION_MIN,
+            "{ct} field attack must still add ({})",
+            parsed.combined_score
+        );
+    }
+}

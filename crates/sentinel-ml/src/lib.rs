@@ -66,9 +66,10 @@ pub struct MlScores {
     /// Per-ONNX-model scores, keyed by model name.
     pub onnx_scores: Vec<(String, f32)>,
     /// The score that may ADD to a request's anomaly score ∈ [0, 1]: the payload
-    /// score over every candidate except cookie values. `payload_attack_score`
-    /// keeps cookies, because the precision veto must not clear a block it could
-    /// not see; but a cookie value alone may not make the classifier block.
+    /// score over every candidate except cookie values and a raw body that did
+    /// not parse into fields. `payload_attack_score` keeps both, because the
+    /// precision veto must not clear a block it could not see; but neither alone
+    /// may make the classifier block.
     pub combined_score: f32,
 }
 
@@ -193,11 +194,12 @@ impl MlEngine {
         //    legacy 25-feature classifier if the embedded model failed to load.
         let mut additive_score = 0.0f32;
         let payload_attack_score = if models::ngram_classifier::is_loaded() {
-            // Collect every attackable value as a candidate. Cookie values are
-            // kept apart: they count for the veto (payload_attack) but not for
-            // the additive score (combined), see below.
+            // Collect every attackable value as a candidate. Cookie values and a
+            // raw body that did not parse are kept apart: they count for the
+            // veto (payload_attack) but not for the additive score (combined),
+            // see below.
             let mut candidates: Vec<String> = Vec::new();
-            let mut cookie_candidates: Vec<String> = Vec::new();
+            let mut veto_only: Vec<String> = Vec::new();
             // URL path segments (URLPath placement; path-borne injection).
             for seg in ctx.uri.path().split('/') {
                 if !seg.is_empty() && !is_plain_path_word(seg) {
@@ -240,7 +242,7 @@ impl MlEngine {
                     for c in v.split(';') {
                         let val = c.split_once('=').map(|(_, x)| x).unwrap_or(c).trim();
                         if !val.is_empty() {
-                            cookie_candidates.push(val.to_string());
+                            veto_only.push(val.to_string());
                         }
                     }
                 } else if !v.is_empty() {
@@ -270,9 +272,9 @@ impl MlEngine {
                     // ordinary basket update — while every field in it scored
                     // under 0.01. When the body parses, each field and key is
                     // already a candidate; a body that does not parse (malformed
-                    // JSON, unknown type) is still scored whole.
+                    // JSON, unknown type) is still scored whole, for the veto only.
                     if !body_field_values(bs, ct, &mut candidates) {
-                        candidates.push(bs.to_string());
+                        veto_only.push(bs.to_string());
                     }
                 }
             }
@@ -286,17 +288,20 @@ impl MlEngine {
                     max_s = max_s.max(s);
                 }
             }
-            // Cookie values never reach the additive score. On open-appsec's
-            // 1.04 million real browsing requests, 75% of the legitimate
-            // requests the classifier blocked were blocked for a cookie value
-            // alone: consent and analytics cookies (OneTrust OptanonConsent,
-            // Shopify _tracking_consent, Sourcebuster sbjs_*, Facebook fr, Adobe
-            // s_sq) are structured strings the model never saw as benign. The
-            // rule engine still inspects every cookie, and the veto below still
-            // sees them, so a cookie-borne attack is neither scored as benign
-            // nor cleared by the classifier; it is left to the rules.
+            // Cookie values and an unparsed raw body never reach the additive
+            // score. On open-appsec's 1.04 million real browsing requests, 75%
+            // of the legitimate requests the classifier blocked were blocked for
+            // a cookie value alone: consent and analytics cookies (OneTrust
+            // OptanonConsent, Shopify _tracking_consent, Sourcebuster sbjs_*,
+            // Facebook fr, Adobe s_sq) are structured strings the model never saw
+            // as benign. Of the rest, the largest share was a raw body that is
+            // neither a form nor JSON: analytics beacons, bot-manager telemetry,
+            // binary payloads, judged whole on their punctuation. The rule engine
+            // still inspects both, and the veto still sees them, so an attack
+            // there is neither scored as benign nor cleared by the classifier; it
+            // is left to the rules.
             additive_score = max_s;
-            for c in &cookie_candidates {
+            for c in &veto_only {
                 if let Some(s) = models::ngram_classifier::score_all(c) {
                     max_s = max_s.max(s);
                 }
