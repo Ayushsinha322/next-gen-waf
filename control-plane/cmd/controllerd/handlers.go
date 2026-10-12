@@ -2395,7 +2395,12 @@ func attachInlineRules(rs map[string]any, siteID string, rules []db.DeployableRu
 // `/.well-known/` is deliberately NOT here. It is legitimate and load-bearing:
 // ACME HTTP-01 challenges live there, so blocking it would break certificate
 // issuance. That is why these are specific prefixes and not a blanket `/.`.
-const defaultWafPolicyJSON = `{"mode":"learning","paranoia_level":2,"anomaly_threshold":10,` +
+// Paranoia level 1 for new sites (2026-10-12): on open-appsec's real-traffic
+// dataset PL2 blocked 38.8% of legitimate requests even with every tuning fix,
+// PL1 6.2%, for under one point of detection (93.2% -> 92.5%) and GoTestWAF
+// 99.93% -> 99.89%. A stored site keeps its level; the fallback for a policy
+// with no level (buildRustWaf) is unchanged.
+const defaultWafPolicyJSON = `{"mode":"learning","paranoia_level":1,"anomaly_threshold":10,` +
 	// The classifier at the benchmarked posture: its veto is what clears weak
 	// CRS-only matches on ordinary text, and it was off on every creation path
 	// (2026-10-07 review). New sites only — a stored site keeps its setting.
@@ -2452,6 +2457,39 @@ var defaultRuleExclusions = []struct {
 	{922110, func() map[string]any {
 		return map[string]any{"rule_id": 922110, "disable": true}
 	}},
+	// The four below come from open-appsec's WAF Comparison Project: 1.04 million
+	// recorded requests from real websites, replayed (a 50,000-request sample)
+	// with and without each exclusion against 20,000 attacks. Not one attack was
+	// lost to any of them; together with the classifier's cookie and raw-body
+	// change they took legitimate blocked from 18.7% to 6.2% at PL1.
+	//
+	// 932270 — "Unix shell tilde expansion" (`~1`, `~+`). It matched analytics
+	// cookies and ad parameters (`__cq_seg=0~0.00!1~0.00`, `tag_exp=…~1017…`)
+	// and caught no attack in 20,000.
+	{932270, func() map[string]any {
+		return map[string]any{"rule_id": 932270, "disable": true}
+	}},
+	// 930120 — OS file names, on parameter NAMES only: `scarab.profile` and
+	// `event_data.context.environment` are JSON field names, not paths. Values
+	// stay inspected, which is where a path traversal carries its file.
+	{930120, func() map[string]any {
+		return map[string]any{"rule_id": 930120, "exclude_targets": []string{"ARGS_NAMES"}}
+	}},
+	// 942100 and our 9900100 (both libinjection SQLi) on the IAB privacy
+	// strings: the CCPA value `1---` reads to libinjection as a number and a
+	// comment, and the two rules together scored it past the threshold.
+	{942100, func() map[string]any {
+		return map[string]any{"rule_id": 942100, "exclude_targets": consentArgs()}
+	}},
+	{9900100, func() map[string]any {
+		return map[string]any{"rule_id": 9900100, "exclude_targets": consentArgs()}
+	}},
+}
+
+// consentArgs are the standard IAB consent-string parameters (US Privacy / CCPA,
+// TCF, GPP), sent by ad and analytics tags on every page view.
+func consentArgs() []string {
+	return []string{"ARGS:us_privacy", "ARGS:sst.us_privacy", "ARGS:gdpr_consent", "ARGS:gpp"}
 }
 
 func ruleIDEquals(v any, want int) bool {

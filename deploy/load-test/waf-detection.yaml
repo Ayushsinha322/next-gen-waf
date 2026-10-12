@@ -5,6 +5,13 @@
 #     dominated benign false-positives; disabling it recovers benign traffic.
 # Run with deploy/load-test/benchmark-detection.sh (uses origin-all-methods.py so
 # GoTestWAF measures the WAF, not a static backend's 405s).
+#
+# Since 2026-10-12 this is the posture a NEW site gets, so benchmarks measure what
+# ships: paranoia level 1 and the control plane's full defaultRuleExclusions (the
+# four real-traffic additions: 932270 off, 930120 not on ARGS_NAMES, 942100 and
+# 9900100 not on the IAB consent strings). Measured on open-appsec's real-traffic
+# dataset (50k/20k sample): 92.5% of attacks caught, 6.2% of legitimate requests
+# blocked; GoTestWAF 99.89%. GoTestWAF numbers before this date are at PL2.
 # Sentinel WAF — load-test configuration
 #
 # Purpose: a controlled, reproducible target for measuring the REAL end-to-end
@@ -41,7 +48,7 @@ sites:
         - { host: "127.0.0.1", port: 18090, weight: 1 }
     waf:
       mode: blocking
-      paranoia_level: 2
+      paranoia_level: 1
       anomaly_threshold: 10
       rules:
         - "rules/owasp-crs/rules/REQUEST-911-METHOD-ENFORCEMENT.conf"
@@ -64,6 +71,16 @@ sites:
           exclude_targets: ["ARGS_NAMES"]
         - rule_id: 920230
           disable: true
+        - rule_id: 922110
+          disable: true
+        - rule_id: 932270
+          disable: true
+        - rule_id: 930120
+          exclude_targets: ["ARGS_NAMES"]
+        - rule_id: 942100
+          exclude_targets: ["ARGS:us_privacy", "ARGS:sst.us_privacy", "ARGS:gdpr_consent", "ARGS:gpp"]
+        - rule_id: 9900100
+          exclude_targets: ["ARGS:us_privacy", "ARGS:sst.us_privacy", "ARGS:gdpr_consent", "ARGS:gpp"]
       ml:
         enable: true
         models: []

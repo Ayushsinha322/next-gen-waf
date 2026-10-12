@@ -648,8 +648,8 @@ export const PRESETS: Record<Exclude<PresetKey, "custom">, {
   },
   balanced: {
     label: "Balanced", icon: "scale",
-    desc: "Recommended. The benchmarked default configuration.",
-    // PL2 / threshold 10 — deliberately identical to defaultWafPolicyJSON in
+    desc: "Recommended. The default measured on real traffic: OWASP rules at paranoia level 1 with the ML classifier.",
+    // PL1 / threshold 10 — deliberately identical to defaultWafPolicyJSON in
     // control-plane/cmd/controllerd/handlers.go, whose comment reads "keep the
     // two in step, or a site's stored policy and its effective policy drift".
     //
@@ -660,7 +660,11 @@ export const PRESETS: Record<Exclude<PresetKey, "custom">, {
     // advice tells the operator "the threshold is already at the benchmarked
     // value of 10" and warns them off lowering it, which was false for every
     // site this wizard had ever created.
-    paranoia_level: 2, anomaly_threshold: 10,
+    //
+    // PL1 since 2026-10-12: on 1.04 million real browsing requests (open-appsec
+    // WAF Comparison Project) PL2 blocked 38.8% of legitimate traffic even with
+    // the tuning fixes, PL1 6.2%, for under a point of detection.
+    paranoia_level: 1, anomaly_threshold: 10,
     rl_per_ip: { rps: 100, burst: 50 }, bot_ja4: false,
   },
   strict: {

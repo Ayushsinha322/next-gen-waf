@@ -729,6 +729,15 @@ async fn reported_false_positives_pass_under_the_default_posture() {
     }
     cfg.sites[0].waf.rules = rules;
     // The control plane's default exclusions (defaultRuleExclusions).
+    let consent: Vec<String> = [
+        "ARGS:us_privacy",
+        "ARGS:sst.us_privacy",
+        "ARGS:gdpr_consent",
+        "ARGS:gpp",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
     cfg.sites[0].waf.rule_exclusions = vec![
         sentinel_core::config::RuleExclusion {
             rule_id: 932236,
@@ -745,7 +754,29 @@ async fn reported_false_positives_pass_under_the_default_posture() {
             exclude_targets: vec![],
             disable: true,
         },
+        sentinel_core::config::RuleExclusion {
+            rule_id: 932270,
+            exclude_targets: vec![],
+            disable: true,
+        },
+        sentinel_core::config::RuleExclusion {
+            rule_id: 930120,
+            exclude_targets: vec!["ARGS_NAMES".into()],
+            disable: false,
+        },
+        sentinel_core::config::RuleExclusion {
+            rule_id: 942100,
+            exclude_targets: consent.clone(),
+            disable: false,
+        },
+        sentinel_core::config::RuleExclusion {
+            rule_id: 9900100,
+            exclude_targets: consent,
+            disable: false,
+        },
     ];
+    // A new site's level since 2026-10-12 (defaultWafPolicyJSON).
+    cfg.sites[0].waf.paranoia_level = 1;
     cfg.sites[0].waf.anomaly_threshold = 10;
     cfg.sites[0].waf.ml = Some(sentinel_core::config::MlConfig {
         enable: true,
@@ -793,6 +824,16 @@ async fn reported_false_positives_pass_under_the_default_posture() {
             );
         }
         statuses.push((text, status));
+    }
+    // Shapes from open-appsec's real-traffic dataset (2026-10-12) that the
+    // tuning defaults exist for: an ad-tag beacon with the CCPA string and a
+    // tilde-numbered experiment list, and a DoubleClick floodlight path.
+    for path in [
+        "/collect?v=2&us_privacy=1---&gdpr_consent=&tag_exp=101686685~101747727",
+        "/ddm/activity/src=8421;type=invmedia;cat=fl0;ord=1",
+    ] {
+        let (status, _) = send_request(listen_port, "test-site.local", path, Method::GET, "").await;
+        assert_eq!(status, StatusCode::OK, "real-traffic shape blocked: {path}");
     }
     shutdown_proxy(shutdown_tx, jh).await;
 

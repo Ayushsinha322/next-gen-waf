@@ -68,11 +68,22 @@ func TestDefaultWafPolicyMatchesBuildDefault(t *testing.T) {
 	// exclusions) is the benchmarked configuration, and a site whose stored
 	// policy says one thing while the data plane is handed another is the exact
 	// drift e7b3249 existed to stop.
-	for _, k := range []string{"paranoia_level", "anomaly_threshold"} {
-		if stored[k] != built[k] {
-			t.Errorf("%s: stored default %v != build default %v — the two have drifted",
-				k, stored[k], built[k])
-		}
+	if stored["anomaly_threshold"] != built["anomaly_threshold"] {
+		t.Errorf("anomaly_threshold: stored default %v != build default %v — the two have drifted",
+			stored["anomaly_threshold"], built["anomaly_threshold"])
+	}
+
+	// Paranoia is deliberately different too, for the same fail-safe reason as
+	// mode below. A NEW site gets the level measured on real traffic (PL1: 6.2%
+	// of legitimate requests blocked on open-appsec's dataset, against 38.8% at
+	// PL2, for under one point of detection). A stored row with NO level keeps
+	// being read as PL2: lowering an existing site's protection is a decision for
+	// its operator, not a side effect of an upgrade.
+	if fmt.Sprint(stored["paranoia_level"]) != "1" {
+		t.Errorf("a new site must be stored at paranoia level 1, got %v", stored["paranoia_level"])
+	}
+	if fmt.Sprint(built["paranoia_level"]) != "2" {
+		t.Errorf("a row with no level must keep being read as paranoia 2, got %v", built["paranoia_level"])
 	}
 
 	// Mode is DELIBERATELY different, and the difference is not drift — the two
@@ -565,6 +576,36 @@ func TestDefaultPolicyLocksDownReconPaths(t *testing.T) {
 	for p := range got {
 		if strings.HasPrefix("/.well-known/acme-challenge/x", p) {
 			t.Errorf("override %q also covers /.well-known/ — that would break ACME", p)
+		}
+	}
+}
+
+// The real-traffic tuning defaults (open-appsec dataset, 2026-10-12) reach every
+// site that sets nothing for those rules.
+func TestRealTrafficTuningDefaultsReachEverySite(t *testing.T) {
+	waf, err := buildRustWaf(json.RawMessage(`{"mode":"blocking"}`))
+	if err != nil {
+		t.Fatalf("buildRustWaf: %v", err)
+	}
+	excl, _ := waf["rule_exclusions"].([]map[string]any)
+	find := func(id int) map[string]any {
+		for _, e := range excl {
+			if ruleIDEquals(e["rule_id"], id) {
+				return e
+			}
+		}
+		return nil
+	}
+	if e := find(932270); e == nil || e["disable"] != true {
+		t.Errorf("932270 not disabled by default: %+v", e)
+	}
+	if e := find(930120); e == nil || fmt.Sprint(e["exclude_targets"]) != "[ARGS_NAMES]" {
+		t.Errorf("930120 not limited to values by default: %+v", e)
+	}
+	for _, id := range []int{942100, 9900100} {
+		e := find(id)
+		if e == nil || !strings.Contains(fmt.Sprint(e["exclude_targets"]), "ARGS:us_privacy") {
+			t.Errorf("%d does not skip the IAB consent strings by default: %+v", id, e)
 		}
 	}
 }
