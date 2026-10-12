@@ -63,7 +63,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN cargo build --release --bin sentinel-srl-validate
 
-FROM golang:1.25-alpine AS go-builder
+FROM golang:1.26-alpine AS go-builder
 ENV CGO_ENABLED=0
 WORKDIR /src/control-plane
 COPY control-plane ./
@@ -157,7 +157,7 @@ HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=4 \
 # safe to re-run — `up` is a no-op once the DB is current. This replaces the
 # manual "apply goose Up via psql" step (raw psql is wrong here: the .sql files
 # carry goose Up/Down markers). Connection comes from GOOSE_DBSTRING at runtime.
-FROM golang:1.25-alpine AS goose-builder
+FROM golang:1.26-alpine AS goose-builder
 ENV CGO_ENABLED=0
 # Pinned for reproducibility; no_sqlite3 keeps the build pure-Go (postgres only).
 RUN go install -tags='no_sqlite3' github.com/pressly/goose/v3/cmd/goose@v3.22.1

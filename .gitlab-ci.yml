@@ -149,9 +149,10 @@ rust-build:
 # ── Go control plane ─────────────────────────────────────────────────────────
 go:
   stage: test
-  # 1.25: pgx 5.9 requires it, and Go 1.24's standard library carries
-  # vulnerabilities our code reaches (govulncheck below).
-  image: golang:1.25
+  # 1.26: golang.org/x/net 0.60 requires it, and Go 1.25 gets no fix for the
+  # net/http HTTP/2 vulnerabilities our code reaches (GO-2026-6610..6617,
+  # fixed in 1.26.9; govulncheck below).
+  image: golang:1.26
   tags:
     - k8s-docker
   cache:
