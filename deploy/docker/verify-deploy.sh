@@ -74,8 +74,8 @@ cipher=$(PG "select distinct s.version||' '||s.cipher from pg_stat_ssl s join pg
 # controlplane, and a CA missing there makes the node run with no database while
 # still reporting "Up" — which is how this was missed the first time.
 for c in controlplane cp2 cp3 migrate; do
-  if docker inspect "sentinel-${c}-1" -f '{{range .Mounts}}{{.Destination}}{{"\n"}}{{end}}' 2>/dev/null \
-       | grep -qx /etc/sentinel/pki/root.crt; then
+  dests="$(docker inspect "sentinel-${c}-1" -f '{{range .Mounts}}{{.Destination}}{{"\n"}}{{end}}' 2>/dev/null || true)"
+  if grep -qx /etc/sentinel/pki/root.crt <<<"$dests"; then
     PASS "$c mounts the CA at /etc/sentinel/pki/root.crt"
   else FAIL "$c does NOT mount the CA — its verify-full DSN cannot be parsed (no database)"; fi
 done

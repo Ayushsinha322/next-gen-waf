@@ -30,9 +30,15 @@
 #
 #  Capture first, match the variable, no pipeline, no exit-status puzzle.
 #
-#  SCOPE: only unbounded producers are flagged. `echo`, `printf`, `ss`, `ip` and
-#  a `psql -tAc` emit a few lines and complete before grep exits, so they are
-#  left alone rather than churned; the danger is proportional to output size.
+#  SCOPE: unbounded producers, AND the Docker CLI's list commands. `echo`,
+#  `printf`, `ss`, `ip` and a `psql -tAc` are buffered: they hand grep their
+#  whole output in one write and are done before it can exit, so they are left
+#  alone. Size is not the whole story, though. Docker and Compose are Go
+#  programs whose stdout is unbuffered — one write per LINE — so a short list is
+#  enough when the match is not its last line. `dc config --services` (13
+#  lines, in a different order every run) dropped the dashboard from
+#  rolling-update.sh in 2 runs of 15 on .71, and the 1.1.20 roll reported
+#  success with the console still on the old image.
 # =============================================================================
 set -uo pipefail
 
@@ -40,7 +46,14 @@ RED=$'\e[31m'; GRN=$'\e[32m'; YEL=$'\e[33m'; DIM=$'\e[2m'; B=$'\e[1m'; R=$'\e[0m
 
 # Producers whose output has no bound. `docker logs` is the one that bit us;
 # `journalctl`, `cat` of a log, and `docker compose logs` are the same shape.
+# Then Docker's list commands, written a line at a time (see SCOPE): `ps`,
+# `port`, `images`, `inspect`, and Compose's `config` / `ps`, including through
+# rolling-update.sh's `dc` wrapper. POSIX classes only, no `\b`: CI runs this
+# under Alpine's busybox grep, where `\b` silently matches nothing.
 UNBOUNDED='docker logs|docker compose logs|docker-compose logs|journalctl'
+UNBOUNDED+='|docker[[:space:]]+(ps|port|images|inspect)([[:space:]]|$)'
+UNBOUNDED+='|docker[ -]compose[^|]*[[:space:]](config|ps)([[:space:]]|$)'
+UNBOUNDED+='|(^|[^[:alnum:]_])dc[[:space:]]+(config|ps)([[:space:]]|$)'
 
 printf '\n%s%s==> no unbounded producer piped into grep -q%s\n\n' "$B" "$YEL" "$R"
 

@@ -275,7 +275,14 @@ else
   TARGETS=("${DP[@]}" "${CP[@]}")
   # The dashboard is stateless and not in the traffic path; roll it last so a
   # console reload never races the nodes actually serving requests.
-  dc config --services 2>/dev/null | grep -qx dashboard && TARGETS+=(dashboard)
+  #
+  # Captured first, never piped into `grep -q`. Compose prints its services in a
+  # different order every run, one write per line; when `dashboard` came early,
+  # grep exited, compose died of SIGPIPE and pipefail turned the match into a
+  # miss. Measured on .71: 2 runs in 15 dropped the dashboard, and the 1.1.20
+  # roll left the console on the old image while reporting success.
+  services="$(dc config --services 2>/dev/null || true)"
+  grep -qx dashboard <<<"$services" && TARGETS+=(dashboard)
 fi
 
 hdr "rolling ${#TARGETS[@]} service(s), one at a time"
