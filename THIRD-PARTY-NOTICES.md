@@ -9,8 +9,8 @@ re-runs during packaging. Run it after changing a dependency. Do not edit by han
 It records what each component **declares** in its own manifest. It is an
 attribution inventory, not a legal review.
 
-**422 redistributed components** across Rust, Go, npm and container images.
-A further 104 Rust crates and 399 npm packages are
+**418 redistributed components** across Rust, Go, npm and container images.
+A further 105 Rust crates and 399 npm packages are
 build- or development-only: they are compiled or installed here but never
 shipped, and are listed separately at the end so the two are never confused.
 
@@ -28,9 +28,9 @@ the OWASP Core Rule Set keeps its own copy at `rules/owasp-crs/LICENSE`.
 
 ## Rust crates (data plane)
 Reachable through normal (non-dev, non-build) edges from a shipped binary, so these are compiled into what customers run. Workspace members excluded.
-**284 components.**
+**280 components.**
 
-### MIT OR Apache-2.0 — 147 component(s)
+### MIT OR Apache-2.0 — 143 component(s)
 - ahash 0.8.12
 - anstream 1.0.0
 - anstyle 1.0.14
@@ -82,7 +82,6 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - futures-util 0.3.32
 - fxprof-processed-profile 0.6.0
 - getrandom 0.2.17
-- getrandom 0.3.4
 - getrandom 0.4.2
 - gimli 0.29.0
 - hashbrown 0.13.2
@@ -121,17 +120,14 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - percent-encoding 2.3.2
 - postcard 1.1.3
 - powerfmt 0.2.0
-- ppv-lite86 0.2.21
 - proc-macro2 1.0.106
 - quinn 0.11.11
-- quinn-proto 0.11.15
+- quinn-proto 0.11.19
 - quinn-udp 0.5.14
 - quote 1.0.45
 - rand 0.10.1
-- rand 0.9.4
-- rand_chacha 0.9.0
 - rand_core 0.10.1
-- rand_core 0.9.5
+- rand_pcg 0.10.2
 - rayon 1.12.0
 - rayon-core 1.13.0
 - rcgen 0.12.1
@@ -418,14 +414,14 @@ In the `controllerd` module graph. Go modules carry no licence field in the grap
 - go.uber.org/multierr v1.10.0
 - go.uber.org/zap v1.27.0
 - golang.org/x/arch v0.8.0
-- golang.org/x/crypto v0.51.0
-- golang.org/x/mod v0.38.0
-- golang.org/x/net v0.55.0
-- golang.org/x/sync v0.22.0
-- golang.org/x/sys v0.45.0
-- golang.org/x/term v0.43.0
-- golang.org/x/text v0.41.0
-- golang.org/x/tools v0.48.0
+- golang.org/x/crypto v0.57.0
+- golang.org/x/mod v0.41.0
+- golang.org/x/net v0.60.0
+- golang.org/x/sync v0.23.0
+- golang.org/x/sys v0.48.0
+- golang.org/x/term v0.46.0
+- golang.org/x/text v0.42.0
+- golang.org/x/tools v0.49.0
 - golang.org/x/xerrors v0.0.0-20191204190536-9bdfabe68543
 - google.golang.org/protobuf v1.34.2
 - gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c
@@ -576,9 +572,9 @@ Present in this working tree, **not redistributed**: test harnesses, build scrip
 
 ## Rust (dev- and build-dependencies)
 
-**104 components.**
+**105 components.**
 
-### MIT OR Apache-2.0 — 48 component(s)
+### MIT OR Apache-2.0 — 49 component(s)
 - anes 0.1.6
 - anstyle-wincon 3.0.11
 - cast 0.3.0
@@ -589,6 +585,7 @@ Present in this working tree, **not redistributed**: test harnesses, build scrip
 - embedded-io 0.4.0
 - embedded-io 0.6.1
 - find-msvc-tools 0.1.9
+- getrandom 0.3.4
 - half 2.7.1
 - hermit-abi 0.5.2
 - iana-time-zone-haiku 0.1.2
