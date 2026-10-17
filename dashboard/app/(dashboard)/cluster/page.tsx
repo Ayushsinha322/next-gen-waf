@@ -445,9 +445,9 @@ Fleet-wide health of the WAF data plane and control plane — live topology, fai
                               ["Upstreams", `${n.upstreams_healthy} healthy of ${n.upstreams_total}`],
                               ["Last heartbeat", `${fmtAgoSec(n.seconds_since_seen)} · uptime ${fmtUptime(n.uptime_secs)}`],
                             ] as [string, string][]).map(([k, v]) => (
-                              <div key={k} style={{ border: "1px solid var(--border)", borderRadius: 6, padding: "8px 10px" }}>
-                                <div className="td3" style={{ fontSize: 11 }}>{k}</div>
-                                <div style={{ fontFamily: MONO, fontSize: 12.5, marginTop: 3, wordBreak: "break-word" }}>{v}</div>
+                              <div key={k} style={{ minWidth: 0, background: "var(--card)", border: "1px solid var(--card-bd)", borderRadius: 8, padding: "8px 10px" }}>
+                                <div className="td3" style={{ fontSize: 12 }}>{k}</div>
+                                <div style={{ fontFamily: MONO, fontSize: 12.5, marginTop: 3, whiteSpace: "normal", overflowWrap: "anywhere", lineHeight: 1.45 }}>{v}</div>
                               </div>
                             ))}
                           </div>

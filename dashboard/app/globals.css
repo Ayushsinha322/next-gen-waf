@@ -626,6 +626,11 @@ tbody tr { border-bottom:1px solid var(--sep-row); transition:background-color v
 tbody tr:hover { background:var(--row-h); cursor:pointer; }
 tbody tr:last-child { border-bottom:none; }
 tbody td { padding:10px 16px; font-size:14px; color:var(--text); font-family:var(--font-sans); font-variant-numeric:tabular-nums; white-space:nowrap; }
+/* Expanded detail rows (one cell spanning the whole table) hold sentences and
+   key–value grids, not one value per column, so they must wrap. Without this
+   they inherit nowrap above and long values spill into neighbouring boxes. */
+tbody td[colspan] { white-space:normal; }
+tbody td[colspan] > * { min-width:0; }
 .td2 { color:var(--text2); }
 .td3 { color:var(--text3); }
 tbody tr.sev-c td:first-child { border-left:3px solid var(--red); }
