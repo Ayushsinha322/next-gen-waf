@@ -44,6 +44,13 @@ describe("the dangerous actions are wired to ask", () => {
   it("world map: blocking a country everywhere", () => {
     expect(src("components/dashboard/WorldMap.tsx")).toMatch(/confirmAction\(countryBlockConfirm/);
   });
+  // The map closes its menu on any pointer-down. The menu's own pointer-down
+  // must not reach it, or the button press closes the menu before the click
+  // lands and "Block this country" silently does nothing (it never worked from
+  // 2026-06-25 to 2026-10-18 for exactly this reason).
+  it("world map: the menu's own press does not close the menu", () => {
+    expect(src("components/dashboard/WorldMap.tsx")).toMatch(/onPointerDown=\{\(e\) => e\.stopPropagation\(\)\} onClick=\{\(e\) => e\.stopPropagation\(\)\}/);
+  });
 });
 
 // Users could be created and never changed or removed from the console — a

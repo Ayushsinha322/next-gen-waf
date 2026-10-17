@@ -125,6 +125,17 @@
   --seg-on:       #636366;
   --success-fill: #248a3d;
 
+  /* ── GeoIP globe (canvas reads these with getComputedStyle) ── */
+  --globe-well-hi: #1b1b1e;  /* the map well behind the sphere */
+  --globe-well-lo: #0d0d0f;
+  --globe-hi:     #3a3a3e;   /* sphere shading: lit side → limb */
+  --globe-mid:    #1d1d20;
+  --globe-lo:     #08080a;
+  --globe-dot:    #ebebf5;   /* land dots; alpha is applied per dot */
+  --globe-rim:    rgba(255,255,255,0.12);
+  --globe-glow:   rgba(64,156,255,0.16);
+  --globe-shadow: rgba(0,0,0,0);
+
   /* ── Code ── */
   --code-bg: #111113;
   --code-fg: #e5e5ea;
@@ -292,6 +303,16 @@
   --switch-on:    #34c759;
   --seg-on:       #ffffff;
   --success-fill: #1e7a34;
+
+  --globe-well-hi: #fbfbfd;
+  --globe-well-lo: #ececf0;
+  --globe-hi:     #ffffff;
+  --globe-mid:    #f4f4f7;
+  --globe-lo:     #d8d8de;
+  --globe-dot:    #3c3c43;
+  --globe-rim:    rgba(0,0,0,0.08);
+  --globe-glow:   rgba(0,113,227,0.07);
+  --globe-shadow: rgba(0,0,0,0.16);
 
   --code-bg: #f5f5f7;
   --code-fg: #1d1d1f;
@@ -1507,6 +1528,27 @@ input:-webkit-autofill:focus { -webkit-box-shadow: 0 0 0 1000px var(--bg3) inset
 /* Segmented controls written inline in pages: one line per segment; the
    track scrolls sideways when the window is too narrow, like iPadOS. */
 .seg { max-width:100%; overflow-x:auto; scrollbar-width:none; }
+
+/* ── GeoIP map: floating controls over the map well ──
+   Floating controls are chrome, so they get the material; the map itself stays solid. */
+.geo-well { background:radial-gradient(120% 95% at 50% 42%, var(--globe-well-hi), var(--globe-well-lo)); }
+.geo-globe { position:relative; aspect-ratio:950 / 620; }   /* same box as the flat map: switching views never moves the page */
+@media (max-width:640px) { .geo-globe { aspect-ratio:1 / 1; } }
+.geo-ctl { display:flex; gap:2px; padding:2px; border-radius:9px; background:var(--chrome); border:0.5px solid var(--card-bd);
+  -webkit-backdrop-filter:var(--blur); backdrop-filter:var(--blur); box-shadow:0 1px 3px rgba(0,0,0,.14); }
+.geo-ctl.col { flex-direction:column; }
+.geo-ctl > button { min-width:28px; height:26px; padding:0 9px; border:0; border-radius:7px; background:transparent; color:var(--text2);
+  font:500 13px/1 var(--font-sans); cursor:pointer; display:inline-flex; align-items:center; justify-content:center;
+  transition:background-color var(--t-fast) var(--ease), color var(--t-fast) var(--ease); }
+.geo-ctl.col > button { padding:0; font-size:15px; }
+.geo-ctl > button:hover { color:var(--text); background:var(--fill); }
+.geo-ctl > button:active { transform:scale(.97); }
+.geo-ctl > button[aria-pressed="true"] { background:var(--seg-on); color:var(--text); box-shadow:0 1px 2px rgba(0,0,0,.18); }
+.geo-callout { padding:6px 10px; border-radius:9px; background:var(--chrome); border:0.5px solid var(--card-bd);
+  -webkit-backdrop-filter:var(--blur); backdrop-filter:var(--blur); font:500 13px/1.35 var(--font-sans); color:var(--text2); }
+.geo-row { border-radius:8px; padding:4px 6px; margin:0 -6px; transition:background-color var(--t-fast) var(--ease); }
+.geo-row.live { cursor:pointer; }
+.geo-row.live:hover, .geo-row.on { background:var(--fill); }
 .seg::-webkit-scrollbar { display:none; }
 .seg > button { white-space:nowrap; flex-shrink:0; }
 

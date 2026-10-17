@@ -2,10 +2,12 @@
 /**
  * WorldMap — interactive, fully-offline threat map of blocked requests.
  *
- * Basemap: public-domain world silhouette baked in at build time (lib/worldMap.ts)
- * — NO tiles/fonts/network at runtime (air-gap / on-prem safe).
+ * Two views of the same data, chosen with the Globe / Flat control (remembered
+ * per browser): a 3D globe (components/dashboard/Globe.tsx) and the flat map.
+ * Basemaps are public-domain data baked in at build time (lib/worldMap.ts,
+ * lib/globeData.ts) — NO tiles/fonts/network at runtime (air-gap / on-prem safe).
  *
- * Interactions:
+ * Flat-map interactions:
  *  • scroll / +- buttons to zoom (toward cursor), drag to pan, ⟲ to reset
  *  • click any country marker → context menu with a real "Block this country"
  *    action (POST /geoip/block → added to every site's geoip block list,
@@ -14,6 +16,8 @@
  *  • blocked countries show an amber lock-ring; threat origins glow red.
  */
 import { useState, useRef, useEffect, useCallback } from "react";
+import Globe, { type GlobeHandle, type GlobePick } from "@/components/dashboard/Globe";
+import { countryFlag, countryName } from "@/lib/geo";
 import { showToast } from "@/components/ui/Toast";
 import { confirmAction } from "@/components/ui/confirm";
 import { countryBlockConfirm } from "@/lib/siteConfirm";
@@ -25,6 +29,9 @@ const POS_BY_CODE: Record<string, CountryPos> = Object.fromEntries(COUNTRY_POS.m
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 
 interface Menu { code: string; name: string; flag: string; n: number; ox: number; oy: number }
+type Mode = "globe" | "flat";
+const NO_DATA: Record<string, number> = {};   // stable, so the globe does not re-derive on every render
+const MODE_KEY = "sk-geo-view";
 
 export default function WorldMap({
   data, loaded, dbPresent,
@@ -42,12 +49,23 @@ export default function WorldMap({
   const [blocked, setBlocked] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState<string | null>(null);
   const pan = useRef({ active: false, sx: 0, sy: 0, tx0: 0, ty0: 0, moved: false });
+  const globeRef = useRef<GlobeHandle>(null);
+  const [mode, setModeState] = useState<Mode>("globe");
+  // Remembered per browser only — a viewing preference, not shared state.
+  useEffect(() => {
+    try { const m = localStorage.getItem(MODE_KEY); if (m === "flat" || m === "globe") setModeState(m); } catch { /* storage blocked */ }
+  }, []);
+  const setMode = (m: Mode) => {
+    setModeState(m); setMenu(null); setHover(null);
+    try { localStorage.setItem(MODE_KEY, m); } catch { /* storage blocked */ }
+  };
 
   const max = Math.max(1, ...Object.values(data));
   const totalCountries = Object.values(data).filter(v => v > 0).length;
   const ranked = Object.entries(data).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]).slice(0, 6);
-  const nameFor = (c: string) => POS_BY_CODE[c]?.name ?? c;
-  const flagFor = (c: string) => POS_BY_CODE[c]?.flag ?? "\u{1F310}";
+  // The globe can point at any country, not just the flat map's hand-placed 27.
+  const nameFor = (c: string) => POS_BY_CODE[c]?.name ?? countryName(c);
+  const flagFor = (c: string) => POS_BY_CODE[c]?.flag ?? countryFlag(c);
   const radius = (n: number) => 4 + 12 * Math.sqrt(n / max);
 
   // Load the current global block list.
@@ -80,14 +98,14 @@ export default function WorldMap({
   // Non-passive wheel listener so we can block page scroll while zooming.
   useEffect(() => {
     const el = wrapRef.current;
-    if (!el) return;
+    if (!el || mode !== "flat") return;
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
       zoomAt(e.deltaY < 0 ? 1.15 : 1 / 1.15, e.clientX, e.clientY);
     };
     el.addEventListener("wheel", onWheel, { passive: false });
     return () => el.removeEventListener("wheel", onWheel);
-  }, [zoomAt]);
+  }, [zoomAt, mode]);
 
   function onPointerDown(e: React.PointerEvent) {
     pan.current = { active: true, sx: e.clientX, sy: e.clientY, tx0: view.tx, ty0: view.ty, moved: false };
@@ -135,18 +153,46 @@ export default function WorldMap({
     finally { setBusy(null); }
   }
 
-  const reset = () => { setView({ s: 1, tx: 0, ty: 0 }); setMenu(null); };
+  const reset = () => {
+    setMenu(null);
+    if (mode === "globe") globeRef.current?.reset(); else setView({ s: 1, tx: 0, ty: 0 });
+  };
+  const zoomCentre = (f: number) => {
+    if (mode === "globe") { globeRef.current?.zoomBy(f); setMenu(null); return; }
+    const r = wrapRef.current?.getBoundingClientRect();
+    if (r) zoomAt(f, (r.left + r.right) / 2, (r.top + r.bottom) / 2);
+  };
+  const onGlobePick = (p: GlobePick) => setMenu({
+    code: p.code, name: nameFor(p.code), flag: flagFor(p.code), n: data[p.code] ?? 0, ox: p.x, oy: p.y,
+  });
+  const globeLabel = `Globe of blocked requests by origin. ${ranked.length
+    ? "Top origins: " + ranked.slice(0, 3).map(([c, n]) => `${nameFor(c)} ${n.toLocaleString()}`).join(", ") + "."
+    : "No country-attributed traffic yet."} Arrow keys turn it, plus and minus zoom, Enter acts on the country in the centre.`;
+  // Menus open above the point, or below it when the point is near the top edge.
+  const menuBelow = (menu?.oy ?? 0) < 150;
   const points = Object.entries(data).filter(([c, n]) => n > 0 && POS_BY_CODE[c])
     .map(([c, n]) => ({ ...POS_BY_CODE[c], n })).sort((a, b) => a.n - b.n);
 
   return (
     <div style={{ display: "grid", gridTemplateColumns: "1.7fr 1fr", gap: 16, alignItems: "stretch" }}>
       {/* ── map ── */}
-      <div ref={wrapRef} onPointerDown={() => setMenu(null)} style={{
-        position: "relative", borderRadius: 10, overflow: "hidden", touchAction: "none",
-        background: "var(--inset-bg)",
-        border: "1px solid var(--card-bd)", cursor: pan.current.active ? "grabbing" : "grab", userSelect: "none",
-      }}>
+      <div ref={wrapRef} onPointerDown={() => setMenu(null)}
+        onKeyDown={(e) => { if (e.key === "Escape") setMenu(null); }}
+        className={mode === "globe" ? "geo-well" : undefined}
+        style={{
+          position: "relative", borderRadius: 10, overflow: "hidden",
+          // The globe turns on horizontal drags only, so a phone can still scroll the page.
+          touchAction: mode === "globe" ? "pan-y" : "none",
+          background: mode === "flat" ? "var(--inset-bg)" : undefined,
+          border: "1px solid var(--card-bd)", userSelect: "none",
+          cursor: mode === "flat" ? (pan.current.active ? "grabbing" : "grab") : undefined,
+        }}>
+        {mode === "globe" ? (
+          <div className="geo-globe">
+            <Globe ref={globeRef} data={loaded ? data : NO_DATA} blocked={blocked} hover={hover} paused={!!menu}
+              onHover={setHover} onPick={onGlobePick} onInteract={() => setMenu(null)} label={globeLabel} />
+          </div>
+        ) : (
         <svg viewBox={`0 0 ${VB_W} ${VB_H}`} width="100%" style={{ display: "block" }}
           preserveAspectRatio="xMidYMid meet"
           onPointerDown={onPointerDown} onPointerMove={onPointerMove}
@@ -192,35 +238,52 @@ export default function WorldMap({
             })}
           </g>
         </svg>
+        )}
 
-        {/* zoom controls */}
-        <div style={{ position: "absolute", top: 8, left: 8, display: "flex", flexDirection: "column", gap: 4 }}>
-          {[["+", () => zoomAt(1.4, (wrapRef.current!.getBoundingClientRect().left + wrapRef.current!.getBoundingClientRect().right) / 2, (wrapRef.current!.getBoundingClientRect().top + wrapRef.current!.getBoundingClientRect().bottom) / 2)],
-            ["−", () => zoomAt(1 / 1.4, (wrapRef.current!.getBoundingClientRect().left + wrapRef.current!.getBoundingClientRect().right) / 2, (wrapRef.current!.getBoundingClientRect().top + wrapRef.current!.getBoundingClientRect().bottom) / 2)],
-            ["⟲", reset]].map(([label, fn], i) => (
-            <button key={i} onClick={fn as () => void} style={{
-              width: 26, height: 26, borderRadius: 6, border: "1px solid var(--bg4)",
-              background: "var(--bg2)", color: "var(--text2)", cursor: "pointer", fontSize: 15, lineHeight: 1,
-              fontFamily: "var(--font-sans)",
-            }}>{label as string}</button>
-          ))}
+        {/* view switch + zoom */}
+        <div style={{ position: "absolute", top: 8, left: 8, display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 6, zIndex: 2 }}
+          onPointerDown={(e) => e.stopPropagation()}>
+          <div className="geo-ctl" role="group" aria-label="Map view">
+            {(["globe", "flat"] as const).map(m => (
+              <button key={m} type="button" aria-pressed={mode === m} onClick={() => setMode(m)}>
+                {m === "globe" ? "Globe" : "Flat"}
+              </button>
+            ))}
+          </div>
+          <div className="geo-ctl col" role="group" aria-label="Zoom">
+            <button type="button" aria-label="Zoom in" title="Zoom in" onClick={() => zoomCentre(1.4)}>+</button>
+            <button type="button" aria-label="Zoom out" title="Zoom out" onClick={() => zoomCentre(1 / 1.4)}>−</button>
+            <button type="button" aria-label="Reset view" title="Reset view" onClick={reset}>
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M2.5 8a5.5 5.5 0 1 0 1.7-4" /><path d="M2.5 2.5v3h3" />
+              </svg>
+            </button>
+          </div>
         </div>
 
         {/* hover readout */}
-        <div style={{
-          position: "absolute", top: 8, right: 8, padding: "5px 10px", borderRadius: 8,
-          background: "var(--bg2)", border: "1px solid var(--bg4)", fontSize: 14,
-          color: "var(--text2)", fontFamily: "var(--font-sans)",
-          opacity: hover ? 1 : 0.45, transition: "opacity .15s", pointerEvents: "none", maxWidth: 200,
+        <div className="geo-callout" aria-live="polite" style={{
+          position: "absolute", top: 8, right: 8, zIndex: 2,
+          opacity: hover ? 1 : 0.7, transition: "opacity var(--t) var(--ease)", pointerEvents: "none",
+          maxWidth: "min(240px, calc(100% - 136px))",   // never over the view switch on a phone
         }}>
-          {hover ? `${flagFor(hover)} ${nameFor(hover)} · ${(data[hover] ?? 0).toLocaleString()}${blocked.has(hover) ? " · blocked" : ""}` : "Click a country to act"}
+          {hover ? (
+            <>
+              <span>{flagFor(hover)} </span><span style={{ color: "var(--text)" }}>{nameFor(hover)}</span>
+              <span style={{ fontVariantNumeric: "tabular-nums" }}> · {(data[hover] ?? 0).toLocaleString()}</span>
+              {blocked.has(hover) && <span style={{ color: "var(--amber)" }}> · Blocked</span>}
+            </>
+          ) : mode === "globe" ? "Drag to turn · click a country" : "Click a country to act"}
         </div>
 
         {/* context menu */}
         {menu && (
-          <div onClick={(e) => e.stopPropagation()} style={{
-            position: "absolute", left: clamp(menu.ox, 90, (wrapRef.current?.clientWidth ?? 400) - 90),
-            top: Math.max(8, menu.oy - 12), transform: "translate(-50%, -100%)",
+          // The map closes its menu on any pointer-down. Without this the menu's own
+          // button press closed the menu before its click landed, so "Block this
+          // country" had never worked from the map (since 183da31, 2026-06-25).
+          <div onPointerDown={(e) => e.stopPropagation()} onClick={(e) => e.stopPropagation()} style={{
+            position: "absolute", left: clamp(menu.ox, 112, (wrapRef.current?.clientWidth ?? 400) - 112),
+            top: menuBelow ? menu.oy + 14 : menu.oy - 12, transform: menuBelow ? "translate(-50%, 0)" : "translate(-50%, -100%)",
             background: "var(--elev)", border: "1px solid var(--card-bd)", borderRadius: 10,
             boxShadow: "var(--shadow-pop)", padding: 10, width: 210, zIndex: 20,
           }}>
@@ -295,7 +358,14 @@ export default function WorldMap({
             {loaded ? "No blocked traffic yet" : "No country-attributed events yet"}
           </div>
         ) : ranked.map(([code, n]) => (
-          <div key={code} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          // On the globe a row turns the globe to its country; hovering lights it up there.
+          <div key={code} className={`geo-row${mode === "globe" ? " live" : ""}${hover === code ? " on" : ""}`}
+            style={{ display: "flex", alignItems: "center", gap: 8 }}
+            role={mode === "globe" ? "button" : undefined} tabIndex={mode === "globe" ? 0 : undefined}
+            aria-label={mode === "globe" ? `Show ${nameFor(code)} on the globe` : undefined}
+            onMouseEnter={() => setHover(code)} onMouseLeave={() => setHover(null)}
+            onClick={() => { if (mode === "globe") { setMenu(null); globeRef.current?.focus(code); } }}
+            onKeyDown={(e) => { if (mode === "globe" && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); globeRef.current?.focus(code); setHover(code); } }}>
             <span style={{ fontSize: 16 }}>{flagFor(code)}</span>
             <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ fontSize: 14, color: "var(--text2)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
