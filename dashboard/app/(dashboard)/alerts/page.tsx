@@ -200,9 +200,9 @@ export default function AlertsPage() {
       <motion.div variants={fadeUp} style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",gap:14}}>
         <div><div className="sec-title">Security Alerts</div><div className="sec-sub">Real-time incident queue · {alerts.filter(a=>a.state==="open").length} open · {live ? <span style={{color:"var(--green)"}}>● live</span> : <span style={{color:"var(--text3)"}}>○ offline</span>} · DB-backed</div></div>
         <div style={{display:"flex",gap:8}}>
-          <motion.button className="btn bg-btn btn-sm" onClick={loadAlerts} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>⟳ Refresh</motion.button>
-          <motion.a className="btn bg-btn btn-sm" href="/settings" whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>Channels</motion.a>
-          <motion.button className="btn bc btn-sm" onClick={ackAll} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>Ack All Open</motion.button>
+          <motion.button className="btn bg-btn btn-sm" onClick={loadAlerts} whileTap={{ scale: 0.97 }}>⟳ Refresh</motion.button>
+          <motion.a className="btn bg-btn btn-sm" href="/settings" whileTap={{ scale: 0.97 }}>Channels</motion.a>
+          <motion.button className="btn bc btn-sm" onClick={ackAll} whileTap={{ scale: 0.97 }}>Ack All Open</motion.button>
         </div>
       </motion.div>
 
@@ -218,7 +218,7 @@ export default function AlertsPage() {
           {channels.map(c => {
             const bad = c.enabled && c.last_status && c.last_status !== "ok";
             return (
-              <span key={c.id} title={c.last_status ?? "not yet used"} className="bdg" style={{ textTransform:"none", background: !c.enabled ? "rgba(120,130,150,.12)" : bad ? "rgba(224,80,70,.15)" : "rgba(60,180,110,.14)", color: !c.enabled ? "var(--text3)" : bad ? "var(--red-b)" : "var(--green)" }}>
+              <span key={c.id} title={c.last_status ?? "not yet used"} className="bdg" style={{ textTransform:"none", background: !c.enabled ? "var(--gray-t)" : bad ? "rgba(224,80,70,.15)" : "rgba(60,180,110,.14)", color: !c.enabled ? "var(--text3)" : bad ? "var(--red-b)" : "var(--green)" }}>
                 {c.name} · {c.type} · {!c.enabled ? "off" : bad ? `FAILED ${rel(c.last_sent_at)}` : c.last_sent_at ? `ok ${rel(c.last_sent_at)}` : "never sent"}
               </span>
             );
@@ -246,7 +246,7 @@ export default function AlertsPage() {
         </div>
         <div className="tw">
           {loading ? (
-            <div style={{padding:"24px",textAlign:"center",fontFamily:"var(--font-mono)",fontSize: 13,color:"var(--text3)"}}>Loading alerts…</div>
+            <div style={{padding:"24px",textAlign:"center",fontFamily:"var(--font-sans)",fontSize: 13,color:"var(--text3)"}}>Loading alerts…</div>
           ) : filtered.length === 0 ? (
             <EmptyState icon="bell" title={alerts.length === 0 ? "No alerts" : "No alerts match this filter"}
               hint={alerts.length === 0 ? "Alerts are raised from live detections: attack spikes, repeat offenders, node and certificate problems. A quiet queue with traffic flowing is the good state." : "Change the severity or state filter to see the rest."}
@@ -265,7 +265,7 @@ export default function AlertsPage() {
                     const d = (x.details ?? {}) as Record<string, unknown>;
                     return (
                       <motion.tr key={x.id} className={`sev-${x.severity[0].toLowerCase()}`} initial={{ opacity: 0, x: -8 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: sub ? 0 : idx * 0.015 }}
-                        style={sub ? { opacity: .8, background:"rgba(255,255,255,.015)" } : undefined}>
+                        style={sub ? { opacity: .8, background:"var(--fill-soft)" } : undefined}>
                         <td>{sevBadge(x.severity)}</td>
                         <td className="td3" title={new Date(x.created_at).toLocaleString()}>{sub ? new Date(x.created_at).toLocaleTimeString() : rel(g.last)}</td>
                         <td><span className="bdg bcy"><span className="bdr" />{x.kind}</span></td>
@@ -285,17 +285,17 @@ export default function AlertsPage() {
                         </td>
                         <td><div style={{display:"flex",gap:4}}>
                           {!sub && ip && (
-                            <motion.button className="btn bgn btn-xs" disabled={blocking === ip} whileHover={{ scale: 1.06 }} whileTap={{ scale: 0.95 }}
+                            <motion.button className="btn bgn btn-xs" disabled={blocking === ip} whileTap={{ scale: 0.97 }}
                               onClick={() => blockIP(ip)} title="Add a manual block-tier indicator for this IP to the threat-intel corpus">
                               {blocking === ip ? "…" : "Block IP"}
                             </motion.button>
                           )}
                           {sub ? (<>
-                            {x.state === "open" && <motion.button className="btn bg-btn btn-xs" whileHover={{ scale: 1.06 }} whileTap={{ scale: 0.95 }} onClick={() => ackAlert(x.id)}>✓ Ack</motion.button>}
-                            {x.state !== "resolved" && <motion.button className="btn bg-btn btn-xs" whileHover={{ scale: 1.06 }} whileTap={{ scale: 0.95 }} onClick={() => resolveAlert(x.id)}>✓ Close</motion.button>}
+                            {x.state === "open" && <motion.button className="btn bg-btn btn-xs" whileTap={{ scale: 0.97 }} onClick={() => ackAlert(x.id)}>✓ Ack</motion.button>}
+                            {x.state !== "resolved" && <motion.button className="btn bg-btn btn-xs" whileTap={{ scale: 0.97 }} onClick={() => resolveAlert(x.id)}>✓ Close</motion.button>}
                           </>) : (<>
-                            {g.open > 0 && <motion.button className="btn bg-btn btn-xs" whileHover={{ scale: 1.06 }} whileTap={{ scale: 0.95 }} onClick={() => many ? ackGroup(g) : ackAlert(a.id)}>✓ Ack{many ? " all" : ""}</motion.button>}
-                            {g.items.some(i => i.state !== "resolved") && <motion.button className="btn bg-btn btn-xs" whileHover={{ scale: 1.06 }} whileTap={{ scale: 0.95 }} onClick={() => many ? closeGroup(g) : resolveAlert(a.id)}>✓ Close{many ? " all" : ""}</motion.button>}
+                            {g.open > 0 && <motion.button className="btn bg-btn btn-xs" whileTap={{ scale: 0.97 }} onClick={() => many ? ackGroup(g) : ackAlert(a.id)}>✓ Ack{many ? " all" : ""}</motion.button>}
+                            {g.items.some(i => i.state !== "resolved") && <motion.button className="btn bg-btn btn-xs" whileTap={{ scale: 0.97 }} onClick={() => many ? closeGroup(g) : resolveAlert(a.id)}>✓ Close{many ? " all" : ""}</motion.button>}
                           </>)}
                         </div></td>
                       </motion.tr>

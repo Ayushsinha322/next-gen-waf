@@ -174,18 +174,17 @@ function LogsInner() {
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
             Log Profiles &amp; history
           </Link>
-          <motion.button className="lgw-btn" onClick={copyAll} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
+          <motion.button className="lgw-btn" onClick={copyAll} whileTap={{ scale: 0.97 }}>
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
             Copy
           </motion.button>
-          <motion.button className="lgw-btn" onClick={exportLog} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
+          <motion.button className="lgw-btn" onClick={exportLog} whileTap={{ scale: 0.97 }}>
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
             Download
           </motion.button>
           <motion.button
             className={`lgw-btn${follow ? " lgw-flw-on" : ""}`}
             onClick={() => setFollow(f => !f)}
-            whileHover={{ scale: 1.03 }}
             whileTap={{ scale: 0.97 }}
           >
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M5 3l14 9-14 9V3z"/></svg>
@@ -207,7 +206,7 @@ function LogsInner() {
 
       <div className="lgw-ctrl">
         <div className="lgw-sf-wrap" ref={ddRef}>
-          <motion.button className="lgw-sfbtn" onClick={() => setDdOpen(o => !o)} whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.98 }}>
+          <motion.button className="lgw-sfbtn" onClick={() => setDdOpen(o => !o)} whileTap={{ scale: 0.97 }}>
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M13 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>
             Select File
             <span className="lgw-sf-cur">{currFile.label}</span>
@@ -272,7 +271,6 @@ function LogsInner() {
               });
             }
           }}
-          whileHover={{ scale: 1.03 }}
           whileTap={{ scale: 0.97 }}
         >
           <div className={`lgw-ldot${connected && !paused ? "" : " off"}`} />
@@ -285,7 +283,7 @@ function LogsInner() {
       <div className="lgw-viewer">
         <div className="lgw-vhd">
           <div className="lgw-vfn">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="rgba(0,212,255,.7)" strokeWidth="1.5"><path d="M13 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--cyan)" strokeWidth="1.5"><path d="M13 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>
             {currFile.label}
             <span className="lgw-vbdg">{filtered.length} lines</span>
             {blocked > 0 && <span className="lgw-vbdg lgw-vbdg-r">{blocked} blocked</span>}
@@ -300,7 +298,7 @@ function LogsInner() {
         <div className="lgw-body" ref={bodyRef}>
           {filtered.length === 0 ? (
             <div className="lgw-empty">
-              <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,.12)" strokeWidth="1"><path d="M13 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>
+              <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="var(--text4)" strokeWidth="1"><path d="M13 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>
               {rows.length > 0
                 ? `No line in the last ${rows.length} of ${currFile.label} matches “${search}”.`
                 : connected ? `Waiting for ${currFile.label} entries…` : "Connecting to log stream…"}

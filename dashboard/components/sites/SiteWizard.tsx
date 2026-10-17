@@ -40,9 +40,9 @@ function LimitNotes({ checks, fields }: { checks: LimitCheck[]; fields: LimitChe
       {mine.map((c, i) => (
         <div key={i} role={c.level === "error" ? "alert" : undefined} style={{
           fontSize: 13, lineHeight: 1.5, padding: "8px 11px", borderRadius: 8,
-          color: c.level === "error" ? "var(--red)" : "var(--amber,#ffb020)",
-          background: c.level === "error" ? "color-mix(in srgb, var(--red) 10%, transparent)" : "rgba(255,176,32,.07)",
-          border: `1px solid ${c.level === "error" ? "color-mix(in srgb, var(--red) 35%, transparent)" : "rgba(255,176,32,.25)"}`,
+          color: c.level === "error" ? "var(--red)" : "var(--amber)",
+          background: c.level === "error" ? "color-mix(in srgb, var(--red) 10%, transparent)" : "var(--amber-t)",
+          border: `1px solid ${c.level === "error" ? "color-mix(in srgb, var(--red) 35%, transparent)" : "color-mix(in srgb, var(--amber) 32%, transparent)"}`,
         }}>
           <strong>{c.level === "error" ? "Cannot deploy: " : "Check: "}</strong>{c.message}
         </div>
@@ -79,19 +79,19 @@ function Sw({ on, set }: { on: boolean; set: (v: boolean) => void }) {
 //               value that would look saved and silently do nothing
 function Tag({ kind }: { kind: "enforced" | "stored" | "unavailable" }) {
   const palette = {
-    enforced:    { fg: "var(--green)",            bg: "rgba(0,230,118,.1)",  bd: "rgba(0,230,118,.35)",  text: "● Enforced" },
+    enforced:    { fg: "var(--green)",            bg: "var(--green-t)",  bd: "var(--green-t)",  text: "● Enforced" },
     // Said plainly: "Stored" read as a neutral state, but these settings are saved
     // with the site and the data plane does not act on them in this release.
-    stored:      { fg: "var(--amber, #ffb020)",   bg: "rgba(255,176,32,.1)", bd: "rgba(255,176,32,.35)", text: "◐ Not enforced yet" },
-    unavailable: { fg: "var(--text3)",            bg: "rgba(255,255,255,.04)", bd: "rgba(255,255,255,.14)", text: "○ Unavailable" },
+    stored:      { fg: "var(--amber)",   bg: "var(--amber-t)", bd: "var(--amber-t)", text: "◐ Not enforced yet" },
+    unavailable: { fg: "var(--text3)",            bg: "var(--fill-soft)", bd: "var(--fill-h)", text: "○ Unavailable" },
   }[kind];
   const title = kind === "stored"
     ? "Saved with the site, but the data plane does not act on it in this release. Do not rely on it for protection."
     : undefined;
   return (
     <span title={title} style={{
-      fontSize: 10.5, fontWeight: 700, letterSpacing: 0.5, padding: "2px 7px", borderRadius: 20,
-      fontFamily: "var(--font-mono)", textTransform: "uppercase",
+      fontSize: 10.5, fontWeight: 700, padding: "2px 7px", borderRadius: 20,
+      fontFamily: "var(--font-sans)",
       color: palette.fg, background: palette.bg, border: `1px solid ${palette.bd}`,
     }}>{palette.text}</span>
   );
@@ -146,9 +146,9 @@ function ChipInput({
             return (
               <span key={v} title={bad && invalidMessage ? invalidMessage(v) : undefined} style={{
                 display: "inline-flex", alignItems: "center", gap: 6, padding: "3px 8px",
-                background: bad ? "rgba(255,45,85,.12)" : "rgba(0,212,255,.1)",
-                border: `1px solid ${bad ? "rgba(255,45,85,.5)" : "rgba(0,212,255,.28)"}`,
-                borderRadius: 12, fontSize: 14, fontFamily: "var(--font-mono)", color: bad ? "var(--red-b)" : "var(--cyan)",
+                background: bad ? "var(--red-t)" : "var(--accent-tint)",
+                border: `1px solid ${bad ? "color-mix(in srgb, var(--red) 32%, transparent)" : "var(--accent-line)"}`,
+                borderRadius: 12, fontSize: 14, fontFamily: "var(--font-sans)", color: bad ? "var(--red-b)" : "var(--cyan)",
               }}>
                 {label ? label(v) : v}{bad ? " — invalid" : ""}<span style={{ cursor: "pointer", color: "var(--text3)" }} onClick={() => onChange(values.filter(x => x !== v))}>✕</span>
               </span>
@@ -173,9 +173,9 @@ function Field({ label, hint, children, unavailable }: {
         {unavailable && <> <Tag kind="unavailable" /></>}
       </label>
       {children}
-      {hint && <div style={{ fontSize: 11, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>{hint}</div>}
+      {hint && <div style={{ fontSize: 11, color: "var(--text3)", fontFamily: "var(--font-sans)" }}>{hint}</div>}
       {unavailable && (
-        <div style={{ fontSize: 11, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>{unavailable}</div>
+        <div style={{ fontSize: 11, color: "var(--text3)", fontFamily: "var(--font-sans)" }}>{unavailable}</div>
       )}
     </div>
   );
@@ -208,8 +208,8 @@ function SectionToggle({ label, desc, on, set, unavailable }: {
   return (
     <div style={{
       display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12,
-      padding: "10px 14px", background: "rgba(255,255,255,.03)",
-      border: "1px solid rgba(255,255,255,.07)", borderRadius: "var(--r2)",
+      padding: "10px 14px", background: "var(--fill-soft)",
+      border: "1px solid var(--card-bd)", borderRadius: "var(--r2)",
       opacity: unavailable ? 0.55 : 1,
     }}>
       <div>
@@ -227,14 +227,14 @@ function SectionToggle({ label, desc, on, set, unavailable }: {
 }
 
 function GroupLabel({ children }: { children: React.ReactNode }) {
-  return <div style={{ fontSize: 14, color: "var(--text3)", fontFamily: "var(--font-mono)", letterSpacing: 1, textTransform: "uppercase", marginTop: 4, display: "flex", alignItems: "center", gap: 8 }}>{children}</div>;
+  return <div style={{ fontSize: 14, color: "var(--text3)", fontFamily: "var(--font-sans)", marginTop: 4, display: "flex", alignItems: "center", gap: 8 }}>{children}</div>;
 }
 
 /* One selectable CRS category tile. Extracted so the request and response
  * groups render identically — they differ only in which list they map over. */
 function CatTile({ c, on, onClick }: { c: CrsCategory; on: boolean; onClick: () => void }) {
   return (
-    <div onClick={onClick} style={{ cursor: "pointer", padding: "8px 11px", borderRadius: 8, display: "flex", justifyContent: "space-between", gap: 8, background: on ? "rgba(0,230,118,.07)" : "rgba(255,255,255,.02)", border: on ? "1px solid rgba(0,230,118,.3)" : "1px solid rgba(255,255,255,.07)" }}>
+    <div onClick={onClick} style={{ cursor: "pointer", padding: "8px 11px", borderRadius: 8, display: "flex", justifyContent: "space-between", gap: 8, background: on ? "var(--green-t)" : "var(--fill-soft)", border: on ? "1px solid color-mix(in srgb, var(--green) 32%, transparent)" : "1px solid var(--card-bd)" }}>
       <div>
         <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text)" }}>{c.label}</div>
         <div style={{ fontSize: 11, color: "var(--text3)", marginTop: 2 }}>{c.desc}</div>
@@ -245,9 +245,9 @@ function CatTile({ c, on, onClick }: { c: CrsCategory; on: boolean; onClick: () 
 }
 
 function InfoBox({ children, tone = "cyan" }: { children: React.ReactNode; tone?: "cyan" | "green" | "amber" }) {
-  const c = tone === "green" ? ["rgba(0,230,118,.07)", "rgba(0,230,118,.2)"]
-          : tone === "amber" ? ["rgba(255,176,32,.07)", "rgba(255,176,32,.25)"]
-          : ["rgba(0,212,255,.06)", "rgba(0,212,255,.18)"];
+  const c = tone === "green" ? ["var(--green-t)", "var(--green-t)"]
+          : tone === "amber" ? ["var(--amber-t)", "var(--amber-t)"]
+          : ["var(--accent-tint)", "var(--accent-tint-h)"];
   return (
     <div style={{ padding: "10px 14px", background: c[0], border: `1px solid ${c[1]}`, borderRadius: "var(--r2)", fontSize: 12.5, color: "var(--text3)", lineHeight: 1.7, fontFamily: "var(--font-mono)" }}>
       {children}
@@ -411,28 +411,28 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
 
   return (
     <motion.div
-      style={{ position: "fixed", inset: 0, zIndex: 1000, background: "rgba(2,6,14,.82)", backdropFilter: "blur(6px)", display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}
+      style={{ position: "fixed", inset: 0, zIndex: 1000, background: "var(--scrim)", display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}
       initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
       onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
       <motion.div
         initial={{ opacity: 0, scale: 0.96, y: 16 }} animate={{ opacity: 1, scale: 1, y: 0 }}
-        transition={{ type: "spring", stiffness: 260, damping: 24 }}
-        style={{ width: "min(1100px, 96vw)", height: "min(760px, 94vh)", display: "flex", background: "var(--bg2, #0a1018)", border: "1px solid rgba(0,212,255,.18)", borderRadius: 16, overflow: "hidden", boxShadow: "0 30px 90px rgba(0,0,0,.6)" }}>
+        transition={{ type: "spring", duration: 0.32, bounce: 0 }}
+        style={{ width: "min(1100px, 96vw)", height: "min(760px, 94vh)", display: "flex", background: "var(--bg2)", border: "1px solid var(--card-bd)", borderRadius: 16, overflow: "hidden", boxShadow: "var(--shadow-modal)" }}>
 
         {/* Sidebar / stepper */}
-        <div style={{ width: 256, flexShrink: 0, padding: "22px 18px", display: "flex", flexDirection: "column", background: "linear-gradient(180deg, rgba(0,212,255,.06), rgba(0,0,0,.15))", borderRight: "1px solid rgba(255,255,255,.06)", overflowY: "auto" }}>
-          <div style={{ fontFamily: "var(--font-display)", fontWeight: 700, fontSize: 17, color: "var(--text)", letterSpacing: 1 }}>
+        <div style={{ width: 256, flexShrink: 0, padding: "22px 18px", display: "flex", flexDirection: "column", background: "var(--fill-soft)", borderRight: "1px solid var(--sep)", overflowY: "auto" }}>
+          <div style={{ fontFamily: "var(--font-display)", fontWeight: 700, fontSize: 17, color: "var(--text)", letterSpacing: "-0.012em" }}>
             {mode === "edit" ? "Edit Site" : "New Protected Site"}
           </div>
-          <div style={{ fontSize: 14, color: "var(--text3)", marginTop: 4, fontFamily: "var(--font-mono)" }}>
+          <div style={{ fontSize: 14, color: "var(--text3)", marginTop: 4, fontFamily: "var(--font-sans)" }}>
             {mode === "edit" ? form.name : "Reverse proxy + WAF in minutes"}
           </div>
-          <div style={{ display: "flex", gap: 4, margin: "16px 0 18px", padding: 3, background: "var(--inset-bg)", borderRadius: 10 }}>
+          <div style={{ display: "flex", gap: 4, margin: "16px 0 18px", padding: 3, background: "var(--fill)", borderRadius: 10 }}>
             {(["Easy", "Advanced"] as const).map((m, i) => {
               const active = (i === 1) === adv;
               return (
                 <button key={m} type="button" onClick={() => { setAdv(i === 1); setStep(0); }}
-                  style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 13, fontWeight: 700, fontFamily: "var(--font-sans)", background: active ? "linear-gradient(135deg,rgba(0,212,255,.9),rgba(0,150,210,.9))" : "transparent", color: active ? "#021018" : "var(--text3)" }}>{m}</button>
+                  style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, fontFamily: "var(--font-sans)", background: active ? "var(--seg-on)" : "transparent", color: active ? "var(--text)" : "var(--text2)", boxShadow: active ? "0 1px 2px rgba(0,0,0,.18), 0 0 0 0.5px rgba(0,0,0,.04)" : "none", transition: "background-color .18s, color .18s" }}>{m}</button>
               );
             })}
           </div>
@@ -441,23 +441,23 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
               const done = i < step, cur = i === step;
               return (
                 <div key={s} onClick={() => setStep(i)}
-                  style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 10px", borderRadius: 8, cursor: "pointer", background: cur ? "rgba(0,212,255,.12)" : "transparent", border: cur ? "1px solid rgba(0,212,255,.3)" : "1px solid transparent", transition: "background .15s" }}
-                  onMouseEnter={e => { if (!cur) e.currentTarget.style.background = "rgba(255,255,255,.04)"; }}
+                  style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 10px", borderRadius: 8, cursor: "pointer", background: cur ? "var(--sel)" : "transparent", border: "1px solid transparent", transition: "background .15s" }}
+                  onMouseEnter={e => { if (!cur) e.currentTarget.style.background = "var(--fill-soft)"; }}
                   onMouseLeave={e => { if (!cur) e.currentTarget.style.background = "transparent"; }}>
-                  <div style={{ width: 22, height: 22, borderRadius: "50%", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, fontWeight: 700, background: done ? "var(--green)" : cur ? "var(--cyan)" : "rgba(255,255,255,.08)", color: done || cur ? "#021018" : "var(--text3)" }}>{done ? "✓" : i + 1}</div>
+                  <div style={{ width: 22, height: 22, borderRadius: "50%", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, fontWeight: 700, background: done ? "var(--switch-on)" : cur ? "var(--accent-fill)" : "var(--fill)", color: done || cur ? "#ffffff" : "var(--text3)" }}>{done ? "✓" : i + 1}</div>
                   <span style={{ fontSize: 14, color: cur ? "var(--text)" : "var(--text2)", fontWeight: cur ? 600 : 400 }}>{s}</span>
                 </div>
               );
             })}
           </div>
-          <div style={{ marginTop: "auto", paddingTop: 16, fontSize: 11, color: "var(--text3)", fontFamily: "var(--font-mono)", lineHeight: 1.6 }}>
+          <div style={{ marginTop: "auto", paddingTop: 16, fontSize: 11, color: "var(--text3)", fontFamily: "var(--font-sans)", lineHeight: 1.6 }}>
             Public traffic enters on the WAF&rsquo;s <span style={{ color: "var(--cyan)" }}>{scheme}</span> listener and is proxied to your upstreams.
           </div>
         </div>
 
         {/* Content */}
         <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "16px 22px", borderBottom: "1px solid rgba(255,255,255,.06)" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "16px 22px", borderBottom: "1px solid var(--card-bd)" }}>
             <div style={{ fontFamily: "var(--font-display)", fontSize: 16, fontWeight: 700, color: "var(--text)" }}>{steps[step]}</div>
             <button onClick={onClose} style={{ background: "none", border: "none", color: "var(--text3)", fontSize: 20, cursor: "pointer" }}>✕</button>
           </div>
@@ -491,7 +491,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                   {form.mode === "blocking" && (
                     <div style={{
                       margin: "4px 0 10px", padding: "10px 12px", borderRadius: 8,
-                      border: "1px solid var(--amber)", background: "rgba(255,170,0,.07)",
+                      border: "1px solid var(--amber)", background: "var(--amber-t)",
                       fontSize: "var(--fs-sm)", lineHeight: 1.6, color: "var(--text2)",
                     }}>
                       ⚠ <strong>Blocking enforces immediately.</strong> This application&rsquo;s
@@ -509,7 +509,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     {(Object.keys(PRESETS) as Array<keyof typeof PRESETS>).map(k => {
                       const p = PRESETS[k]; const active = form.preset === k;
                       return (
-                        <div key={k} onClick={() => choosePreset(k)} style={{ cursor: "pointer", padding: 14, borderRadius: 12, background: active ? "rgba(0,212,255,.1)" : "rgba(255,255,255,.03)", border: active ? "1px solid rgba(0,212,255,.45)" : "1px solid rgba(255,255,255,.08)" }}>
+                        <div key={k} onClick={() => choosePreset(k)} style={{ cursor: "pointer", padding: 14, borderRadius: 12, background: active ? "var(--accent-tint)" : "var(--fill-soft)", border: active ? "1px solid var(--accent-line)" : "1px solid var(--card-bd)" }}>
                           <Icon name={p.icon as IconName} size={21} />
                           <div style={{ fontWeight: 700, fontSize: 15, color: "var(--text)", marginTop: 6 }}>{p.label}</div>
                           <div style={{ fontSize: 14, color: "var(--text3)", marginTop: 4, lineHeight: 1.5 }}>{p.desc}</div>
@@ -553,7 +553,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     {form.domains.length === 0
                       ? <InfoBox tone="amber">Add a domain in <strong>Basics</strong> to see the public endpoint.</InfoBox>
                       : form.domains.map(d => (
-                        <span key={d} style={{ padding: "5px 11px", borderRadius: 8, background: "rgba(0,212,255,.06)", border: "1px solid rgba(0,212,255,.18)", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--cyan)" }}>
+                        <span key={d} style={{ padding: "5px 11px", borderRadius: 8, background: "var(--accent-tint)", border: "1px solid var(--card-bd)", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--cyan)" }}>
                           {scheme}://{d}
                         </span>
                       ))}
@@ -603,14 +603,14 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                               <div key={r.host} style={{ fontFamily: "var(--font-mono)", fontSize: 13 }}>
                                 {r.host}{" → "}
                                 {r.cert ? (<>
-                                  <strong style={{ color: r.covered ? "var(--green)" : "var(--amber,#ffb020)" }}>
+                                  <strong style={{ color: r.covered ? "var(--green)" : "var(--amber)" }}>
                                     {r.cert.name ? `${r.cert.name} (${r.cert.domain})` : r.cert.domain}
                                   </strong>
                                   {r.cert.source ? ` · ${r.cert.source}` : ""}
                                   {days !== null && ` · expires in ${days} day${days === 1 ? "" : "s"}`}
                                   {!r.covered && " · ⚠ does not present this name — browsers will warn"}
                                 </>) : (
-                                  <span style={{ color: "var(--amber,#ffb020)" }}>no stored certificate — a self-signed one is generated, browsers will warn</span>
+                                  <span style={{ color: "var(--amber)" }}>no stored certificate — a self-signed one is generated, browsers will warn</span>
                                 )}
                               </div>
                             );
@@ -631,7 +631,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                       ] as const).map(([k, label, desc]) => {
                         const active = form.tls_mode === k;
                         return (
-                          <div key={k} onClick={() => upd({ tls_mode: k })} style={{ cursor: "pointer", padding: 13, borderRadius: 12, background: active ? "rgba(0,212,255,.1)" : "rgba(255,255,255,.03)", border: active ? "1px solid rgba(0,212,255,.45)" : "1px solid rgba(255,255,255,.08)" }}>
+                          <div key={k} onClick={() => upd({ tls_mode: k })} style={{ cursor: "pointer", padding: 13, borderRadius: 12, background: active ? "var(--accent-tint)" : "var(--fill-soft)", border: active ? "1px solid var(--accent-line)" : "1px solid var(--card-bd)" }}>
                             <div style={{ fontWeight: 700, fontSize: 14.5, color: "var(--text)" }}>{label}</div>
                             <div style={{ fontSize: 14, color: "var(--text3)", marginTop: 5, lineHeight: 1.5 }}>{desc}</div>
                           </div>
@@ -668,7 +668,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                             <strong style={{ color: "var(--text2)" }}>{sel.domain}</strong> presents: {names.join(", ")}.<br />
                             {form.domains.length === 0 ? "Add domains in Basics to check coverage." : <>
                               {covered.length > 0 && <>Covers: <strong style={{ color: "var(--green)" }}>{covered.join(", ")}</strong>. </>}
-                              {uncovered.length > 0 && <>⚠ Not covered: <strong style={{ color: "var(--amber,#ffb020)" }}>{uncovered.join(", ")}</strong> — these will fall back to a self-signed cert.</>}
+                              {uncovered.length > 0 && <>⚠ Not covered: <strong style={{ color: "var(--amber)" }}>{uncovered.join(", ")}</strong> — these will fall back to a self-signed cert.</>}
                             </>}
                           </InfoBox>
                         );
@@ -918,7 +918,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     {CRS_CATEGORIES.map(c => {
                       const on = form.rule_categories.includes(c.key);
                       return (
-                        <div key={c.key} onClick={() => toggleCat(c.key)} style={{ cursor: "pointer", padding: "8px 11px", borderRadius: 8, display: "flex", justifyContent: "space-between", gap: 8, background: on ? "rgba(0,230,118,.07)" : "rgba(255,255,255,.02)", border: on ? "1px solid rgba(0,230,118,.3)" : "1px solid rgba(255,255,255,.07)" }}>
+                        <div key={c.key} onClick={() => toggleCat(c.key)} style={{ cursor: "pointer", padding: "8px 11px", borderRadius: 8, display: "flex", justifyContent: "space-between", gap: 8, background: on ? "var(--green-t)" : "var(--fill-soft)", border: on ? "1px solid color-mix(in srgb, var(--green) 32%, transparent)" : "1px solid var(--card-bd)" }}>
                           <div><div style={{ fontSize: 13, fontWeight: 600, color: "var(--text)" }}>{c.label}</div><div style={{ fontSize: 11, color: "var(--text3)", marginTop: 2 }}>{c.desc}</div></div>
                           <div style={{ fontSize: 15, color: on ? "var(--green)" : "var(--text3)" }}>{on ? "✓" : "○"}</div>
                         </div>
@@ -959,7 +959,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                           const on = form.jwt_algorithms.includes(a);
                           return (
                             <span key={a} onClick={() => upd({ jwt_algorithms: on ? form.jwt_algorithms.filter(x => x !== a) : [...form.jwt_algorithms, a] })}
-                              style={{ cursor: "pointer", padding: "4px 10px", borderRadius: 8, fontSize: 13, fontFamily: "var(--font-mono)", background: on ? "rgba(0,230,118,.1)" : "rgba(255,255,255,.03)", border: on ? "1px solid rgba(0,230,118,.35)" : "1px solid rgba(255,255,255,.08)", color: on ? "var(--text)" : "var(--text3)" }}>{a}</span>
+                              style={{ cursor: "pointer", padding: "4px 10px", borderRadius: 8, fontSize: 13, fontFamily: "var(--font-mono)", background: on ? "var(--green-t)" : "var(--fill-soft)", border: on ? "1px solid color-mix(in srgb, var(--green) 32%, transparent)" : "1px solid var(--card-bd)", color: on ? "var(--text)" : "var(--text3)" }}>{a}</span>
                           );
                         })}
                       </div>
@@ -1010,12 +1010,12 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                   <SectionToggle label="Rate Limiting" desc="Token-bucket limits per IP and globally" on={form.rate_limit_enabled} set={v => upd({ rate_limit_enabled: v })} />
                   {form.rate_limit_enabled && (
                     <Row>
-                      <div style={{ display: "flex", flexDirection: "column", gap: 10, padding: 12, borderRadius: 10, border: "1px solid rgba(255,255,255,.07)" }}>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 10, padding: 12, borderRadius: 10, border: "1px solid var(--card-bd)" }}>
                         <div style={{ fontSize: 13, fontWeight: 700, color: "var(--cyan)" }}>Per-IP</div>
                         <Field label="Requests / sec" hint="Sustained requests allowed from a single client address."><input className="fin2" type="number" value={form.rl_per_ip.rps} onChange={e => upd({ rl_per_ip: { ...form.rl_per_ip, rps: Number(e.target.value) } })} /></Field>
                         <Field label="Burst" hint="Extra requests one address may make above the sustained rate before limiting starts."><input className="fin2" type="number" value={form.rl_per_ip.burst} onChange={e => upd({ rl_per_ip: { ...form.rl_per_ip, burst: Number(e.target.value) } })} /></Field>
                       </div>
-                      <div style={{ display: "flex", flexDirection: "column", gap: 10, padding: 12, borderRadius: 10, border: "1px solid rgba(255,255,255,.07)" }}>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 10, padding: 12, borderRadius: 10, border: "1px solid var(--card-bd)" }}>
                         <div style={{ fontSize: 13, fontWeight: 700, color: "var(--cyan)" }}>Global</div>
                         <Field label="Requests / sec" hint="Sustained requests allowed across all clients of this site."><input className="fin2" type="number" value={form.rl_global.rps} onChange={e => upd({ rl_global: { ...form.rl_global, rps: Number(e.target.value) } })} /></Field>
                         <Field label="Burst" hint="Extra requests allowed site-wide above the sustained rate."><input className="fin2" type="number" value={form.rl_global.burst} onChange={e => upd({ rl_global: { ...form.rl_global, burst: Number(e.target.value) } })} /></Field>
@@ -1083,7 +1083,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                         const on = form.geo_countries.includes(c.code);
                         return (
                           <span key={c.code} onClick={() => upd({ geo_countries: on ? form.geo_countries.filter(x => x !== c.code) : [...form.geo_countries, c.code] })}
-                            style={{ cursor: "pointer", padding: "4px 9px", borderRadius: 12, fontSize: 14, fontFamily: "var(--font-mono)", background: on ? (form.geo_mode === "allow" ? "rgba(0,230,118,.12)" : "rgba(255,45,85,.12)") : "rgba(255,255,255,.03)", border: on ? `1px solid ${form.geo_mode === "allow" ? "rgba(0,230,118,.4)" : "rgba(255,45,85,.4)"}` : "1px solid rgba(255,255,255,.08)", color: on ? "var(--text)" : "var(--text3)" }}>{c.code} {c.name}</span>
+                            style={{ cursor: "pointer", padding: "4px 9px", borderRadius: 12, fontSize: 14, fontFamily: "var(--font-mono)", background: on ? (form.geo_mode === "allow" ? "var(--green-t)" : "var(--red-t)") : "var(--fill-soft)", border: on ? `1px solid ${form.geo_mode === "allow" ? "color-mix(in srgb, var(--green) 32%, transparent)" : "color-mix(in srgb, var(--red) 32%, transparent)"}` : "1px solid var(--card-bd)", color: on ? "var(--text)" : "var(--text3)" }}>{c.code} {c.name}</span>
                         );
                       })}
                     </div>
@@ -1217,7 +1217,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     {HTTP_METHODS.map(m => {
                       const on = form.allowed_methods.includes(m);
                       return (
-                        <span key={m} onClick={() => toggleMethod(m)} style={{ cursor: "pointer", padding: "5px 11px", borderRadius: 8, fontSize: 13, fontWeight: 600, fontFamily: "var(--font-mono)", background: on ? "rgba(0,230,118,.1)" : "rgba(255,255,255,.03)", border: on ? "1px solid rgba(0,230,118,.35)" : "1px solid rgba(255,255,255,.08)", color: on ? "var(--text)" : "var(--text3)" }}>{m}</span>
+                        <span key={m} onClick={() => toggleMethod(m)} style={{ cursor: "pointer", padding: "5px 11px", borderRadius: 8, fontSize: 13, fontWeight: 600, fontFamily: "var(--font-mono)", background: on ? "var(--green-t)" : "var(--fill-soft)", border: on ? "1px solid color-mix(in srgb, var(--green) 32%, transparent)" : "1px solid var(--card-bd)", color: on ? "var(--text)" : "var(--text3)" }}>{m}</span>
                       );
                     })}
                   </div>
@@ -1358,7 +1358,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                       ["Verdict Fusion", form.fusion_enabled ? `on · LIMIT ${form.fusion_limit_status}` : "off"],
                       ["Threat-intel feeds", form.ip_feeds.filter(x => x.url.trim()).length ? `${form.ip_feeds.filter(x => x.url.trim()).length} feeds` : "off"],
                     ].map(([k, v]) => (
-                      <div key={k} style={{ display: "flex", justifyContent: "space-between", padding: "7px 12px", background: "rgba(255,255,255,.02)", borderRadius: 8, fontSize: 13 }}>
+                      <div key={k} style={{ display: "flex", justifyContent: "space-between", padding: "7px 12px", background: "var(--fill-soft)", borderRadius: 8, fontSize: 13 }}>
                         <span style={{ color: "var(--text3)" }}>{k}</span>
                         <span style={{ color: "var(--text)", fontFamily: "var(--font-mono)", textAlign: "right", maxWidth: "62%" }}>{v}</span>
                       </div>
@@ -1370,8 +1370,8 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
           </div>
 
           {/* Footer */}
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 22px", borderTop: "1px solid rgba(255,255,255,.06)" }}>
-            <div style={{ fontSize: 14, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>Step {step + 1} / {steps.length}</div>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 22px", borderTop: "1px solid var(--card-bd)" }}>
+            <div style={{ fontSize: 14, color: "var(--text3)", fontFamily: "var(--font-sans)" }}>Step {step + 1} / {steps.length}</div>
             <div style={{ display: "flex", gap: 8 }}>
               <button className="btn bg-btn" type="button" onClick={step === 0 ? onClose : back}>{step === 0 ? "Cancel" : "← Back"}</button>
               {step < steps.length - 1 && <button className="btn bg-btn" type="button" onClick={next}>Next →</button>}

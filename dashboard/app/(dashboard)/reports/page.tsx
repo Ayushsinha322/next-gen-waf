@@ -145,14 +145,14 @@ export default function ReportsPage() {
         <div className="ph"><div className="ptitle">Build one now</div></div>
         <div className="pb" style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end" }}>
           <div style={{ display: "grid", gap: 4 }}>
-            <label style={{ fontSize: 12, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>Site</label>
+            <label style={{ fontSize: 12, color: "var(--text3)", fontFamily: "var(--font-sans)" }}>Site</label>
             <select className="fsel" value={pvSite} onChange={e => setPvSite(e.target.value)} style={{ minWidth: 200 }}>
               <option value="">All sites</option>
               {sites.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}
             </select>
           </div>
           <div style={{ display: "grid", gap: 4 }}>
-            <label style={{ fontSize: 12, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>Period</label>
+            <label style={{ fontSize: 12, color: "var(--text3)", fontFamily: "var(--font-sans)" }}>Period</label>
             <select className="fsel" value={pvDays} onChange={e => setPvDays(Number(e.target.value))}>
               {[1, 7, 14, 30, 90].map(d => <option key={d} value={d}>Last {d} day{d === 1 ? "" : "s"}</option>)}
             </select>
@@ -257,7 +257,7 @@ export default function ReportsPage() {
         </div>
         <div className="pb" style={{ padding: 0 }}>
           {error && <div style={{ padding: 16, color: "var(--red-b)", fontSize: 13 }}>{error}</div>}
-          {!error && schedules === null && <div style={{ padding: 24, textAlign: "center", color: "var(--text3)", fontFamily: "var(--font-mono)", fontSize: 13 }}>Loading…</div>}
+          {!error && schedules === null && <div style={{ padding: 24, textAlign: "center", color: "var(--text3)", fontFamily: "var(--font-sans)", fontSize: 13 }}>Loading…</div>}
           {!error && schedules?.length === 0 && (
             <EmptyState icon="file-text" title="No scheduled reports"
               hint="A schedule sends the same summary you can build above, on a cadence, to a webhook/Slack channel or a mailbox. Nothing is sent until you create one."

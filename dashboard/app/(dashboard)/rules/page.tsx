@@ -60,7 +60,7 @@ const BLANK_DSL = `rule 9000100 {
  *  and the selected compiled rule. Read-only by design — these rules come from
  *  the CRS files and the site's policy, not from the authored store. */
 function CompiledDetail({ inv, site, rule }: { inv: RuleInventory | null; site?: SiteRuleInventory; rule: CompiledRule | null }) {
-  if (!inv) return <div className="td3" style={{ padding:"16px 0", textAlign:"center", fontSize:13, fontFamily:"var(--font-mono)" }}>Loading the enforced rule set…</div>;
+  if (!inv) return <div className="td3" style={{ padding:"16px 0", textAlign:"center", fontSize:13, fontFamily:"var(--font-sans)" }}>Loading the enforced rule set…</div>;
   if (!inv.dataplane_reachable) {
     return (
       <div className="code-block" style={{ whiteSpace:"pre-wrap", borderLeft:"3px solid var(--red-b)" }}>
@@ -73,8 +73,8 @@ function CompiledDetail({ inv, site, rule }: { inv: RuleInventory | null; site?:
   const gaps = (site?.dropped.length ?? 0) + (site?.disabled.length ?? 0);
   const stat = (label: string, value: string, color?: string) => (
     <div style={{ minWidth:110 }}>
-      <div className="td3" style={{ fontSize:11, letterSpacing:".04em", textTransform:"uppercase" }}>{label}</div>
-      <div style={{ fontFamily:"var(--font-mono)", fontSize:18, fontVariantNumeric:"tabular-nums", color }}>{value}</div>
+      <div className="td3" style={{ fontSize:11 }}>{label}</div>
+      <div style={{ fontFamily:"var(--font-sans)", fontSize:18, fontVariantNumeric:"tabular-nums", color }}>{value}</div>
     </div>
   );
   return (
@@ -123,7 +123,7 @@ function CompiledDetail({ inv, site, rule }: { inv: RuleInventory | null; site?:
             </div></div>
         </div>
       ) : (
-        <div className="td3" style={{ padding:"12px 0", textAlign:"center", fontSize:13, fontFamily:"var(--font-mono)" }}>
+        <div className="td3" style={{ padding:"12px 0", textAlign:"center", fontSize:13, fontFamily:"var(--font-sans)" }}>
           ← Click a compiled rule to inspect it
         </div>
       )}
@@ -389,10 +389,10 @@ export default function RulesPage() {
           </div>
         </div>
         <div style={{ display:"flex", gap:8 }}>
-          <motion.button className="btn bc btn-sm" onClick={runTest} disabled={testLoading} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
+          <motion.button className="btn bc btn-sm" onClick={runTest} disabled={testLoading} whileTap={{ scale: 0.97 }}>
             {testLoading ? "⏳ Testing…" : "Test Rule"}
           </motion.button>
-          <motion.button className="btn bp btn-sm" whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }} onClick={() => {
+          <motion.button className="btn bp btn-sm" whileTap={{ scale: 0.97 }} onClick={() => {
             setEditorRule(null); setEditorDSL(BLANK_DSL);
             setEditorName(""); setEditorPhase(2); setEditorSev("high");
             setTestResult(null); openCreate();
@@ -427,7 +427,7 @@ export default function RulesPage() {
                 <option value={0}>All PL</option><option value={1}>PL1</option><option value={2}>PL2</option>
                 <option value={3}>PL3</option><option value={4}>PL4</option>
               </select>
-              <span className="td3" style={{ fontSize:12, fontFamily:"var(--font-mono)" }}>{compiledRows.length} shown</span>
+              <span className="td3" style={{ fontSize:12, fontFamily:"var(--font-sans)" }}>{compiledRows.length} shown</span>
               {controlFlowCount > 0 && (
                 <button className="btn bg-btn btn-xs" onClick={() => setShowControlFlow(v => !v)}
                   title="CRS paranoia gates: SecRule TX:DETECTION_PARANOIA_LEVEL @lt N … skipAfter. They decide which block runs at the configured paranoia level, and never match traffic.">
@@ -439,9 +439,9 @@ export default function RulesPage() {
           <div className="tw" style={{ maxHeight:480, overflowY:"auto" }}>
             {isCompiledTab ? (
               !inv ? (
-                <div style={{ padding:"24px", textAlign:"center", fontFamily:"var(--font-mono)", fontSize: 13, color:"var(--text3)" }}>Loading…</div>
+                <div style={{ padding:"24px", textAlign:"center", fontFamily:"var(--font-sans)", fontSize: 13, color:"var(--text3)" }}>Loading…</div>
               ) : !inv.dataplane_reachable ? (
-                <div style={{ padding:"24px", textAlign:"center", fontFamily:"var(--font-mono)", fontSize: 13, color:"var(--red-b)" }}>data plane unreachable</div>
+                <div style={{ padding:"24px", textAlign:"center", fontFamily:"var(--font-sans)", fontSize: 13, color:"var(--red-b)" }}>data plane unreachable</div>
               ) : (
                 <table>
                   <thead><tr><th>Rule</th><th>Message</th><th>PL</th><th>Sev</th><th title="events attributed to this rule in the last 24 hours (ClickHouse)">Hits 24h</th></tr></thead>
@@ -449,7 +449,7 @@ export default function RulesPage() {
                     {compiledRows.map(r => (
                       <tr key={r.id} onClick={() => setSelCompiled(r)}
                         style={{ cursor:"pointer", opacity: r.inert ? 0.55 : 1,
-                                 background: selCompiled?.id === r.id ? "rgba(0,200,240,0.06)" : undefined }}>
+                                 background: selCompiled?.id === r.id ? "var(--accent-tint)" : undefined }}>
                         <td>
                           <span style={{ color:"var(--cyan)", fontSize: 14, fontFamily:"var(--font-mono)" }}>{r.id}</span>
                           {r.inert && <span className="bdg ba" style={{ marginLeft:6 }} title="Loaded, but its operator is unsupported by the engine — it can never match">INERT</span>}
@@ -461,7 +461,7 @@ export default function RulesPage() {
                         </td>
                         <td className="td3">{r.paranoia_level ?? "—"}</td>
                         <td><SevBadge sev={r.severity === "notice" ? "info" : r.severity} /></td>
-                        <td className="td3" style={{ fontVariantNumeric:"tabular-nums", fontFamily:"var(--font-mono)" }}>{inv.clickhouse ? (r.hits_24h ?? 0).toLocaleString() : "—"}</td>
+                        <td className="td3" style={{ fontVariantNumeric:"tabular-nums", fontFamily:"var(--font-sans)" }}>{inv.clickhouse ? (r.hits_24h ?? 0).toLocaleString() : "—"}</td>
                       </tr>
                     ))}
                     {compiledRows.length === 0 && (
@@ -471,7 +471,7 @@ export default function RulesPage() {
                 </table>
               )
             ) : loading ? (
-              <div style={{ padding:"24px", textAlign:"center", fontFamily:"var(--font-mono)", fontSize: 13, color:"var(--text3)" }}>Loading…</div>
+              <div style={{ padding:"24px", textAlign:"center", fontFamily:"var(--font-sans)", fontSize: 13, color:"var(--text3)" }}>Loading…</div>
             ) : (
               <table>
                 <thead><tr><th>On</th><th>Name</th><th>Running</th><th>Phase</th><th>Sev</th><th></th></tr></thead>
@@ -479,7 +479,7 @@ export default function RulesPage() {
                   {displayed.map(r => (
                     <motion.tr key={r.id} initial={{ opacity: 0, x: -6 }} animate={{ opacity: 1, x: 0 }} transition={{ duration: 0.2 }}
                       onClick={() => openEditor(r)}
-                      style={{ cursor:"pointer", background: editorRule?.id===r.id ? "rgba(0,200,240,0.06)" : undefined }}>
+                      style={{ cursor:"pointer", background: editorRule?.id===r.id ? "var(--accent-tint)" : undefined }}>
                       <td onClick={e => { e.stopPropagation(); toggleRule(r); }}>
                         <div className={`tog ${r.enabled?"on":""}`} />
                       </td>
@@ -513,7 +513,7 @@ export default function RulesPage() {
               {isCompiledTab ? "Enforced rule set" : "Rule Editor"}
               {!isCompiledTab && editorRule && <span style={{ fontSize: 14, color:"var(--text3)", marginLeft:8 }}>— {editorRule.name}</span>}
             </div>
-            <motion.button className="btn bc btn-sm" onClick={runTest} disabled={testLoading} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
+            <motion.button className="btn bc btn-sm" onClick={runTest} disabled={testLoading} whileTap={{ scale: 0.97 }}>
               {testLoading ? "⏳" : "▶ Test"}
             </motion.button>
           </div>
@@ -529,7 +529,7 @@ export default function RulesPage() {
                   <input className="fin2" value={PHASE_LABELS[editorRule.phase]??`phase ${editorRule.phase}`} readOnly style={{ opacity:0.6 }} /></div>
               </div>
             ) : (
-              <div style={{ padding:"16px 0", textAlign:"center", fontSize: 13, fontFamily:"var(--font-mono)", color:"var(--text3)" }}>
+              <div style={{ padding:"16px 0", textAlign:"center", fontSize: 13, fontFamily:"var(--font-sans)", color:"var(--text3)" }}>
                 ← Click a rule to inspect · or use &ldquo;＋ New Rule&rdquo;
               </div>
             )}
@@ -569,8 +569,7 @@ export default function RulesPage() {
             )}
 
             {editorRule && !editorReadOnly && (
-              <motion.button className="btn bp" onClick={saveRule} disabled={saving}
-                whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.98 }}>
+              <motion.button className="btn bp" onClick={saveRule} disabled={saving} whileTap={{ scale: 0.97 }}>
                 {saving ? "Saving…" : "Save Changes"}
               </motion.button>
             )}
@@ -580,7 +579,7 @@ export default function RulesPage() {
               <input className="fin2" value={testPayload} onChange={e => setTestPayload(e.target.value)}
                 placeholder="Test payload, e.g.: 1' UNION SELECT * FROM users--" />
             </div>
-            <motion.button className="btn bc" onClick={runTest} disabled={testLoading} whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.98 }}>
+            <motion.button className="btn bc" onClick={runTest} disabled={testLoading} whileTap={{ scale: 0.97 }}>
               {testLoading ? "⏳ Running…" : "▶ Run Test"}
             </motion.button>
 
@@ -615,7 +614,7 @@ export default function RulesPage() {
 
       {showModal && (
         <motion.div
-          style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.75)", zIndex:200, display:"flex", alignItems:"center", justifyContent:"center" }}
+          style={{ position:"fixed", inset:0, background:"var(--scrim)", zIndex:200, display:"flex", alignItems:"center", justifyContent:"center" }}
           initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
         >
           <motion.div className="panel" style={{ width:560, maxHeight:"80vh", overflowY:"auto" }} initial={{ scale: 0.94, y: 14 }} animate={{ scale: 1, y: 0 }} transition={spring}>
@@ -642,7 +641,7 @@ export default function RulesPage() {
                 <textarea className="rule-ta" value={editorDSL} onChange={e=>setEditorDSL(e.target.value)} style={{ minHeight:160 }} /></div>
               <div style={{ display:"flex", gap:8, justifyContent:"flex-end" }}>
                 <button className="btn bg-btn" onClick={() => setShowModal(false)}>Cancel</button>
-                <motion.button className="btn bp" onClick={createRule} disabled={saving} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
+                <motion.button className="btn bp" onClick={createRule} disabled={saving} whileTap={{ scale: 0.97 }}>
                   {saving ? "Saving…" : "Create Rule"}
                 </motion.button>
               </div>

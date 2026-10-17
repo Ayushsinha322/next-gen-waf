@@ -113,7 +113,7 @@ const wrap: React.CSSProperties = {
   justifyContent: "center", padding: "40px 24px", background: "var(--bg)",
 };
 const hint: React.CSSProperties = {
-  background: "rgba(0,229,255,.05)", border: "1px solid rgba(0,229,255,.15)",
+  background: "var(--accent-tint)", border: "1px solid var(--card-bd)",
   borderRadius: "var(--r2)", padding: "12px 14px",
   fontSize: 14, lineHeight: 1.6, color: "var(--text2)", fontFamily: "var(--font-sans)",
 };

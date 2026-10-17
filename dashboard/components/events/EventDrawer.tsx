@@ -25,7 +25,7 @@ import { showToast } from "@/components/ui/Toast";
 function Row({ label, children, mono = false }: { label: string; children: React.ReactNode; mono?: boolean }) {
   return (
     <div style={{ display: "grid", gridTemplateColumns: "132px 1fr", gap: 12, padding: "7px 0", borderBottom: "1px solid var(--border2)" }}>
-      <div style={{ fontSize: "var(--fs-label)", color: "var(--text3)", textTransform: "uppercase", letterSpacing: "var(--tr-wide)" }}>{label}</div>
+      <div style={{ fontSize: "var(--fs-label)", color: "var(--text3)" }}>{label}</div>
       <div style={{ fontSize: "var(--fs-sm)", color: "var(--text)", fontFamily: mono ? "var(--font-mono)" : undefined, overflowWrap: "anywhere" }}>{children}</div>
     </div>
   );
@@ -88,7 +88,7 @@ export default function EventDrawer({
         initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
         transition={{ duration: 0.15 }}
         onClick={onClose}
-        style={{ position: "fixed", inset: 0, zIndex: 900, background: "rgba(2,6,14,.6)" }}
+        style={{ position: "fixed", inset: 0, zIndex: 900, background: "var(--scrim)" }}
       />
       <motion.aside
         key="drawer"
@@ -101,7 +101,7 @@ export default function EventDrawer({
         style={{
           position: "fixed", top: 0, right: 0, bottom: 0, zIndex: 901,
           width: "min(560px, 96vw)", background: "var(--bg2)",
-          borderLeft: "1px solid var(--border2)", boxShadow: "-8px 0 32px rgba(0,0,0,.4)",
+          borderLeft: "1px solid var(--border2)", boxShadow: "var(--shadow-modal)",
           display: "flex", flexDirection: "column",
         }}
       >
@@ -188,7 +188,7 @@ export default function EventDrawer({
               marginTop: 16, padding: "10px 12px", borderRadius: "var(--r2)",
               background: "var(--bg3)", border: "1px solid var(--border2)",
             }}>
-              <div style={{ fontSize: "var(--fs-label)", color: "var(--text3)", textTransform: "uppercase", letterSpacing: "var(--tr-wide)", marginBottom: 6 }}>
+              <div style={{ fontSize: "var(--fs-label)", color: "var(--text3)", marginBottom: 6 }}>
                 Matched payload
                 {/* The parameter keeps its own case: the label is upper-cased
                     by style, and `ARGS:q` rendered as "ARGS:Q" names a
@@ -216,7 +216,7 @@ export default function EventDrawer({
           {event.headers && Object.keys(event.headers).length > 0 && <RequestHeaders headers={event.headers} />}
 
           <div style={{ marginTop: 20 }}>
-            <div style={{ fontSize: "var(--fs-label)", color: "var(--text3)", textTransform: "uppercase", letterSpacing: "var(--tr-wide)", marginBottom: 10 }}>
+            <div style={{ fontSize: "var(--fs-label)", color: "var(--text3)", marginBottom: 10 }}>
               Remediation
             </div>
 
@@ -257,8 +257,7 @@ export default function EventDrawer({
 }
 
 const sectionLabel: React.CSSProperties = {
-  fontSize: "var(--fs-label)", color: "var(--text3)", textTransform: "uppercase",
-  letterSpacing: "var(--tr-wide)", marginBottom: 8,
+  fontSize: "var(--fs-label)", color: "var(--text3)", marginBottom: 8,
 };
 
 /**

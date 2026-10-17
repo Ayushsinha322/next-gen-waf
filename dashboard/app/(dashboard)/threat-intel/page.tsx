@@ -362,16 +362,16 @@ function Facet({
       <div className="ph"><div className="ptitle">{title}</div></div>
       <div className="pb" style={{ display: "flex", flexDirection: "column", gap: 7 }}>
         {rows.length === 0 ? (
-          <div style={{ fontSize: 13, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>—</div>
+          <div style={{ fontSize: 13, color: "var(--text3)", fontFamily: "var(--font-sans)" }}>—</div>
         ) : (
           rows.map(([k, v]) => (
             <div key={k} onClick={() => onPick?.(k)} style={{ cursor: onPick ? "pointer" : "default" }} title={onPick ? "Filter by this" : undefined}>
               <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, marginBottom: 2 }}>
-                <span style={{ color: "var(--text2)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 160, fontFamily: "var(--font-mono)" }}>{render ? render(k) : k}</span>
-                <span style={{ color: "var(--text)", fontFamily: "var(--font-mono)" }}>{v.toLocaleString()}</span>
+                <span style={{ color: "var(--text2)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 160, fontFamily: "var(--font-sans)" }}>{render ? render(k) : k}</span>
+                <span style={{ color: "var(--text)", fontFamily: "var(--font-sans)" }}>{v.toLocaleString()}</span>
               </div>
               <div style={{ height: 4, background: "var(--bg3)", borderRadius: 2, overflow: "hidden" }}>
-                <div style={{ height: "100%", width: `${(v / max) * 100}%`, background: "rgba(0,229,255,.6)", borderRadius: 2 }} />
+                <div style={{ height: "100%", width: `${(v / max) * 100}%`, background: "var(--accent-tint-h)", borderRadius: 2 }} />
               </div>
             </div>
           ))
@@ -383,7 +383,7 @@ function Facet({
 
 function Empty({ text }: { text: string }) {
   return (
-    <div style={{ padding: "22px 12px", textAlign: "center", fontSize: 13, color: "var(--text3)", fontFamily: "var(--font-mono)", width: "100%" }}>
+    <div style={{ padding: "22px 12px", textAlign: "center", fontSize: 13, color: "var(--text3)", fontFamily: "var(--font-sans)", width: "100%" }}>
       {text}
     </div>
   );

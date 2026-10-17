@@ -144,8 +144,8 @@ export default function WorldMap({
       {/* ── map ── */}
       <div ref={wrapRef} onPointerDown={() => setMenu(null)} style={{
         position: "relative", borderRadius: 10, overflow: "hidden", touchAction: "none",
-        background: "linear-gradient(180deg, rgba(6,12,24,.6), rgba(4,8,16,.85))",
-        border: "1px solid var(--bg4)", cursor: pan.current.active ? "grabbing" : "grab", userSelect: "none",
+        background: "var(--inset-bg)",
+        border: "1px solid var(--card-bd)", cursor: pan.current.active ? "grabbing" : "grab", userSelect: "none",
       }}>
         <svg viewBox={`0 0 ${VB_W} ${VB_H}`} width="100%" style={{ display: "block" }}
           preserveAspectRatio="xMidYMid meet"
@@ -153,23 +153,21 @@ export default function WorldMap({
           onPointerUp={onPointerUp} onPointerLeave={onPointerUp}>
           <g transform={`translate(${view.tx} ${view.ty}) scale(${view.s})`}>
             {/* graticule */}
-            <g stroke="rgba(255,255,255,.04)" strokeWidth={0.6 / view.s}>
+            <g style={{ stroke: "var(--sep-row)" }} strokeWidth={0.6 / view.s}>
               {[155, 310, 465].map(y => <line key={y} x1={0} y1={y} x2={VB_W} y2={y} />)}
               {[238, 475, 712].map(x => <line key={x} x1={x} y1={0} x2={x} y2={VB_H} />)}
             </g>
             {/* land */}
-            <path d={WORLD_PATH} fill="rgba(255,255,255,.07)"
-              stroke="rgba(0,229,255,.18)" strokeWidth={0.5 / view.s} />
+            <path d={WORLD_PATH} style={{ fill: "var(--fill-h)", stroke: "var(--sep)" }}
+              strokeWidth={0.5 / view.s} />
 
             {/* threat heat */}
             {loaded && points.map(p => {
               const r = radius(p.n), top = p.n === max;
               return (
                 <g key={"t" + p.code} style={{ pointerEvents: "none" }}>
-                  <circle cx={p.x} cy={p.y} r={r * 1.9} fill="rgba(255,69,96,.16)">
-                    {top && <animate attributeName="r" values={`${r*1.6};${r*2.4};${r*1.6}`} dur="2.2s" repeatCount="indefinite" />}
-                  </circle>
-                  <circle cx={p.x} cy={p.y} r={r} fill="rgba(255,69,96,.85)" stroke="#ff8095" strokeWidth={0.8 / view.s} />
+                  <circle cx={p.x} cy={p.y} r={top ? r * 2.2 : r * 1.9} style={{ fill: "var(--red-t)" }} />
+                  <circle cx={p.x} cy={p.y} r={r} style={{ fill: "var(--red)" }} />
                 </g>
               );
             })}
@@ -183,10 +181,10 @@ export default function WorldMap({
                   onMouseEnter={() => setHover(p.code)} onMouseLeave={() => setHover(null)}
                   onClick={(e) => openMenu(p, e)}>
                   {isBlocked && (
-                    <circle cx={p.x} cy={p.y} r={9} fill="none" stroke="var(--amber,#ffb020)"
+                    <circle cx={p.x} cy={p.y} r={9} fill="none" style={{ stroke: "var(--amber)" }}
                       strokeWidth={1.6 / view.s} strokeDasharray={`${3/view.s} ${2/view.s}`} />
                   )}
-                  {isHover && <circle cx={p.x} cy={p.y} r={7} fill="none" stroke="var(--cyan)" strokeWidth={1.2 / view.s} />}
+                  {isHover && <circle cx={p.x} cy={p.y} r={7} fill="none" style={{ stroke: "var(--cyan)" }} strokeWidth={1.2 / view.s} />}
                   {/* generous transparent hit target */}
                   <circle cx={p.x} cy={p.y} r={10} fill="transparent" />
                 </g>
@@ -203,7 +201,7 @@ export default function WorldMap({
             <button key={i} onClick={fn as () => void} style={{
               width: 26, height: 26, borderRadius: 6, border: "1px solid var(--bg4)",
               background: "var(--bg2)", color: "var(--text2)", cursor: "pointer", fontSize: 15, lineHeight: 1,
-              fontFamily: "var(--font-mono)",
+              fontFamily: "var(--font-sans)",
             }}>{label as string}</button>
           ))}
         </div>
@@ -212,10 +210,10 @@ export default function WorldMap({
         <div style={{
           position: "absolute", top: 8, right: 8, padding: "5px 10px", borderRadius: 8,
           background: "var(--bg2)", border: "1px solid var(--bg4)", fontSize: 14,
-          color: "var(--text2)", fontFamily: "var(--font-mono)",
+          color: "var(--text2)", fontFamily: "var(--font-sans)",
           opacity: hover ? 1 : 0.45, transition: "opacity .15s", pointerEvents: "none", maxWidth: 200,
         }}>
-          {hover ? `${flagFor(hover)} ${nameFor(hover)} · ${(data[hover] ?? 0).toLocaleString()}${blocked.has(hover) ? " · BLOCKED" : ""}` : "Click a country to act"}
+          {hover ? `${flagFor(hover)} ${nameFor(hover)} · ${(data[hover] ?? 0).toLocaleString()}${blocked.has(hover) ? " · blocked" : ""}` : "Click a country to act"}
         </div>
 
         {/* context menu */}
@@ -223,14 +221,14 @@ export default function WorldMap({
           <div onClick={(e) => e.stopPropagation()} style={{
             position: "absolute", left: clamp(menu.ox, 90, (wrapRef.current?.clientWidth ?? 400) - 90),
             top: Math.max(8, menu.oy - 12), transform: "translate(-50%, -100%)",
-            background: "var(--bg2)", border: "1px solid var(--bg4)", borderRadius: 10,
-            boxShadow: "0 10px 30px rgba(0,0,0,.5)", padding: 10, width: 210, zIndex: 20,
+            background: "var(--elev)", border: "1px solid var(--card-bd)", borderRadius: 10,
+            boxShadow: "var(--shadow-pop)", padding: 10, width: 210, zIndex: 20,
           }}>
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
               <span style={{ fontSize: 18 }}>{menu.flag}</span>
               <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 15, color: "var(--text)", fontWeight: 600 }}>{menu.name}</div>
-                <div style={{ fontSize: 13, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>
+                <div style={{ fontSize: 13, color: "var(--text3)", fontFamily: "var(--font-sans)" }}>
                   {menu.n > 0 ? `${menu.n.toLocaleString()} blocked requests` : "no blocked traffic"}
                 </div>
               </div>
@@ -238,14 +236,14 @@ export default function WorldMap({
             <button disabled={busy === menu.code} onClick={() => toggleBlock(menu.code, menu.name)}
               style={{
                 width: "100%", padding: "7px 10px", borderRadius: 7, cursor: "pointer", fontSize: 14, fontWeight: 600,
-                border: "1px solid " + (blocked.has(menu.code) ? "rgba(0,230,118,.4)" : "rgba(255,69,96,.45)"),
-                background: blocked.has(menu.code) ? "rgba(0,230,118,.12)" : "rgba(255,69,96,.14)",
-                color: blocked.has(menu.code) ? "var(--green)" : "#ff8095",
+                border: "1px solid transparent",
+                background: blocked.has(menu.code) ? "var(--green-t)" : "var(--red-t)",
+                color: blocked.has(menu.code) ? "var(--green)" : "var(--red-b)",
               }}>
-              {busy === menu.code ? "…" : blocked.has(menu.code) ? "\u{1F513} Unblock this country" : "\u{1F6AB} Block this country"}
+              {busy === menu.code ? "…" : blocked.has(menu.code) ? "Unblock this country" : "Block this country"}
             </button>
             {!loaded && (
-              <div style={{ fontSize: 12, color: "var(--text3)", marginTop: 6, lineHeight: 1.4, fontFamily: "var(--font-mono)" }}>
+              <div style={{ fontSize: 12, color: "var(--text3)", marginTop: 6, lineHeight: 1.4, fontFamily: "var(--font-sans)" }}>
                 {dbPresent === false ? "Stored now — enforces once the country database is downloaded (System Jobs → geoip.refresh)." : "Stored — applies within about 5 seconds."}
               </div>
             )}
@@ -253,7 +251,7 @@ export default function WorldMap({
         )}
 
         {loaded && (
-          <div style={{ position: "absolute", right: 10, bottom: 6, fontSize: 10, color: "var(--text3)", fontFamily: "var(--font-mono)", pointerEvents: "auto" }}>
+          <div style={{ position: "absolute", right: 10, bottom: 6, fontSize: 10, color: "var(--text3)", fontFamily: "var(--font-sans)", pointerEvents: "auto" }}>
             IP Geolocation by <a href="https://db-ip.com" target="_blank" rel="noreferrer" style={{ color: "var(--text3)" }}>DB-IP</a>
           </div>
         )}
@@ -262,10 +260,9 @@ export default function WorldMap({
           <div style={{
             position: "absolute", left: 0, right: 0, bottom: 0, padding: "9px 12px",
             display: "flex", alignItems: "center", gap: 10, justifyContent: "center",
-            background: "linear-gradient(0deg, rgba(4,8,16,.92), transparent)", textAlign: "center", pointerEvents: "none",
+            background: "linear-gradient(0deg, var(--card) 35%, transparent)", textAlign: "center", pointerEvents: "none",
           }}>
-            <span style={{ fontSize: 18 }}>{"\u{1F30D}"}</span>
-            <span style={{ fontSize: 14, color: "var(--text3)", lineHeight: 1.5, fontFamily: "var(--font-mono)" }}>
+            <span style={{ fontSize: 13, color: "var(--text3)", lineHeight: 1.5, fontFamily: "var(--font-sans)" }}>
               {/* `loaded` means "there are country-attributed events to draw", which
                   is NOT the same as "the database is missing". Saying the latter
                   when the database is sitting there loaded sends an operator to
@@ -289,12 +286,12 @@ export default function WorldMap({
 
       {/* ── ranked list ── */}
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-        <div style={{ fontSize: 14, color: "var(--text3)", fontFamily: "var(--font-mono)", letterSpacing: 1, textTransform: "uppercase" }}>
+        <div style={{ fontSize: 14, color: "var(--text3)", fontFamily: "var(--font-sans)" }}>
           Top origins {loaded && totalCountries > 0 ? `(${totalCountries})` : ""}
-          {blocked.size > 0 && <span style={{ color: "var(--amber,#ffb020)" }}> · {blocked.size} blocked</span>}
+          {blocked.size > 0 && <span style={{ color: "var(--amber)" }}> · {blocked.size} blocked</span>}
         </div>
         {ranked.length === 0 ? (
-          <div style={{ fontSize: 14, color: "var(--text3)", fontFamily: "var(--font-mono)", padding: "8px 0" }}>
+          <div style={{ fontSize: 14, color: "var(--text3)", fontFamily: "var(--font-sans)", padding: "8px 0" }}>
             {loaded ? "No blocked traffic yet" : "No country-attributed events yet"}
           </div>
         ) : ranked.map(([code, n]) => (
@@ -302,13 +299,13 @@ export default function WorldMap({
             <span style={{ fontSize: 16 }}>{flagFor(code)}</span>
             <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ fontSize: 14, color: "var(--text2)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                {nameFor(code)}{blocked.has(code) && <span style={{ color: "var(--amber,#ffb020)", marginLeft: 5 }}>{"\u{1F6AB}"}</span>}
+                {nameFor(code)}{blocked.has(code) && <span style={{ color: "var(--amber)", marginLeft: 6, fontSize: 12, fontWeight: 600 }}>Blocked</span>}
               </div>
-              <div style={{ height: 5, background: "var(--bg3)", borderRadius: 3, marginTop: 3, overflow: "hidden" }}>
-                <div style={{ height: "100%", width: `${(n / max) * 100}%`, background: "rgba(255,69,96,.8)", borderRadius: 3 }} />
+              <div style={{ height: 5, background: "var(--track)", borderRadius: 3, marginTop: 3, overflow: "hidden" }}>
+                <div style={{ height: "100%", width: `${(n / max) * 100}%`, background: "var(--red)", borderRadius: 3 }} />
               </div>
             </div>
-            <span style={{ fontSize: 14, color: "var(--text)", fontFamily: "var(--font-mono)" }}>{n.toLocaleString()}</span>
+            <span style={{ fontSize: 14, color: "var(--text)", fontFamily: "var(--font-sans)", fontVariantNumeric: "tabular-nums" }}>{n.toLocaleString()}</span>
           </div>
         ))}
       </div>

@@ -23,8 +23,8 @@ export default function EmptyState({
       display: "flex", flexDirection: "column", alignItems: "center", gap: 8,
     }}>
       <Icon name={icon} size={compact ? 22 : 30} strokeWidth={1.5} style={{ color: "var(--text3)" }} />
-      <div style={{ fontSize: compact ? 13 : 15, fontWeight: 700, color: "var(--text2)", fontFamily: "var(--font-display)", letterSpacing: .3 }}>{title}</div>
-      {hint && <div style={{ fontSize: 13, color: "var(--text3)", fontFamily: "var(--font-mono)", maxWidth: 520, lineHeight: 1.5 }}>{hint}</div>}
+      <div style={{ fontSize: compact ? 13 : 15, fontWeight: 700, color: "var(--text2)", fontFamily: "var(--font-display)", letterSpacing: "-0.01em" }}>{title}</div>
+      {hint && <div style={{ fontSize: 13, color: "var(--text3)", fontFamily: "var(--font-sans)", maxWidth: 520, lineHeight: 1.5 }}>{hint}</div>}
       {action && (action.href
         ? <a className="btn bp btn-sm" href={action.href} style={{ marginTop: 6 }}>{action.label}</a>
         : <button className="btn bp btn-sm" onClick={action.onClick} style={{ marginTop: 6 }}>{action.label}</button>)}

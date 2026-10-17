@@ -4,7 +4,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { motion } from "framer-motion";
 import { api, type ClusterHealth } from "@/lib/api";
 import { onAlertsChanged } from "@/lib/alertEvents";
-import { navGroupStagger, navItemVariants, spring } from "@/lib/animations";
+import { navGroupStagger, navItemVariants } from "@/lib/animations";
 import { useT } from "@/lib/i18n";
 
 // Deployment-specific help links. Inlined by Next at BUILD time, so they are
@@ -226,11 +226,11 @@ export default function SideBar() {
   return (
     <motion.nav
       className="sidebar"
-      initial={{ x: -240, opacity: 0 }}
-      animate={{ x: 0, opacity: 1 }}
-      transition={{ ...spring, stiffness: 200, damping: 22 }}
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      transition={{ duration: 0.2 }}
     >
-      <div style={{ flex: 1, overflowY: "auto", padding: "8px 8px" }}>
+      <div className="sb-scroll" style={{ flex: 1, overflowY: "auto", padding: "8px 8px" }}>
         {NAV.map(g => (
           <motion.div key={g.group} variants={navGroupStagger} initial="hidden" animate="visible">
             <span className="sb-lbl">{t(`nav.group.${g.group}`)}</span>
@@ -241,8 +241,7 @@ export default function SideBar() {
                 custom={idx}
                 className={`nv ${current === item.id ? "active" : ""}`}
                 onClick={() => router.push(`/${item.id}`)}
-                whileHover={{ x: 3 }}
-                whileTap={{ scale: 0.98 }}
+                whileTap={{ scale: 0.97 }}
               >
                 <span className="nv-ico"><item.Icon /></span>
                 <span className="nv-lbl">{t(`nav.${item.id}`)}</span>
@@ -258,22 +257,23 @@ export default function SideBar() {
 
       {/* Cluster status footer */}
       <motion.div
-        initial={{ opacity: 0, y: 10 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ delay: 0.4, ...spring }}
+        className="sb-foot"
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        transition={{ delay: 0.15, duration: 0.2 }}
         style={{
           padding: "10px 12px",
-          borderTop: "1px solid rgba(0,212,255,.08)",
+          borderTop: "1px solid var(--sep-chrome)",
           display: "flex", flexDirection: "column", gap: 4,
         }}
       >
         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-          <span className={`sd ${footDot}`} style={footDot === "g" ? { boxShadow: "0 0 6px var(--green)" } : undefined} />
-          <span style={{ fontSize: 14, fontFamily: "var(--font-mono)", color: "var(--text2)", fontWeight: 600 }}>
+          <span className={`sd ${footDot}`} />
+          <span style={{ fontSize: 13, fontFamily: "var(--font-sans)", color: "var(--text)", fontWeight: 600 }}>
             {footTitle}
           </span>
         </div>
-        <div style={{ fontSize: 13, fontFamily: "var(--font-mono)", color: "var(--text3)", letterSpacing: ".4px" }}>
+        <div style={{ fontSize: 12, fontFamily: "var(--font-sans)", color: "var(--text3)", fontVariantNumeric: "tabular-nums" }}>
           {footSub}
         </div>
 
@@ -286,7 +286,7 @@ export default function SideBar() {
             time to show them; with neither set the row is not drawn at all. */}
         {(DOCS_URL || SUPPORT_URL) && (
         <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginTop: 8, paddingTop: 8,
-                      borderTop: "1px solid rgba(0,212,255,.06)" }}>
+                      borderTop: "1px solid var(--sep-chrome)" }}>
           {DOCS_URL && (
             <a href={DOCS_URL} target="_blank" rel="noreferrer"
                style={{ fontSize: 12, color: "var(--text3)", textDecoration: "none" }}

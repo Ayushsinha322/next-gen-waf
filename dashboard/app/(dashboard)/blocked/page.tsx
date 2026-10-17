@@ -29,11 +29,11 @@ interface Row {
 }
 
 const KIND_META: Record<Kind, { label: string; bg: string; fg: string; tip: string }> = {
-  autoban:   { label: "Auto-ban",         bg: "rgba(224,80,70,.16)",   fg: "var(--red-b)", tip: "Banned from one site for 15–60 minutes after repeated attack verdicts; the client sees the block page, and Unblock lifts it on every node" },
-  ebpf:      { label: "eBPF blocklist",   bg: "rgba(224,80,70,.10)",   fg: "var(--red-b)", tip: "In the kernel/software drop list: seeded from a site's IP-reputation block CIDRs or added by the auto-ban" },
-  offender:  { label: "repeat offender",  bg: "rgba(224,166,58,.14)",  fg: "var(--amber)", tip: "Blocked several times inside the correlation window; extra anomaly score on every request until the window passes" },
-  indicator: { label: "threat intel",     bg: "rgba(0,200,240,.12)",   fg: "var(--cyan)",  tip: "Block-tier indicator in the corpus the data plane enforces (feed or manual)" },
-  country:   { label: "GeoIP country",    bg: "rgba(124,58,237,.16)",  fg: "#a78bfa",      tip: "Blocked by at least one site's GeoIP policy" },
+  autoban:   { label: "Auto-ban",         bg: "var(--red-t)",   fg: "var(--red-b)", tip: "Banned from one site for 15–60 minutes after repeated attack verdicts; the client sees the block page, and Unblock lifts it on every node" },
+  ebpf:      { label: "eBPF blocklist",   bg: "var(--red-t)",   fg: "var(--red-b)", tip: "In the kernel/software drop list: seeded from a site's IP-reputation block CIDRs or added by the auto-ban" },
+  offender:  { label: "repeat offender",  bg: "var(--amber-t)",  fg: "var(--amber)", tip: "Blocked several times inside the correlation window; extra anomaly score on every request until the window passes" },
+  indicator: { label: "threat intel",     bg: "var(--accent-tint)",   fg: "var(--cyan)",  tip: "Block-tier indicator in the corpus the data plane enforces (feed or manual)" },
+  country:   { label: "GeoIP country",    bg: "var(--purple-t)",  fg: "var(--purple)",      tip: "Blocked by at least one site's GeoIP policy" },
 };
 
 const rel = (unix?: number | string | null) => {
@@ -202,7 +202,7 @@ export default function BlockedSourcesPage() {
           <input className="fin2" placeholder="IP or CIDR — 203.0.113.9 or 203.0.113.0/24" value={newVal} onChange={e => setNewVal(e.target.value)} style={{ width: 300, fontFamily: "var(--font-mono)" }} onKeyDown={e => { if (e.key === "Enter") addBlock(); }} />
           <input className="fin2" placeholder="reason (optional)" value={newWhy} onChange={e => setNewWhy(e.target.value)} style={{ width: 220 }} />
           <input className="fin2" type="number" min={0} placeholder="expires in hours (blank = never)" value={newHours} onChange={e => setNewHours(e.target.value)} style={{ width: 230 }} />
-          <motion.button className="btn bgn btn-sm" disabled={adding || !newVal.trim()} onClick={addBlock} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>{adding ? "…" : "Block"}</motion.button>
+          <motion.button className="btn bgn btn-sm" disabled={adding || !newVal.trim()} onClick={addBlock} whileTap={{ scale: 0.97 }}>{adding ? "…" : "Block"}</motion.button>
         </div>
       </motion.div>
 
@@ -210,7 +210,7 @@ export default function BlockedSourcesPage() {
         <div className="ph">
           <div className="ptitle">Active blocks ({rows.length}{filter ? ` · ${KIND_META[filter].label}` : ""})</div>
           {iocTruncated > 0 && (
-            <div className="td3" style={{ fontSize: 12, fontFamily: "var(--font-mono)" }}
+            <div className="td3" style={{ fontSize: 12, fontFamily: "var(--font-sans)" }}
               title="The API returns at most 500 indicators per type. The threat-intel tile counts the whole feed; this table lists the page.">
               listing {data!.indicators.length.toLocaleString()} of {(data!.indicators_total ?? 0).toLocaleString()} indicators
             </div>
@@ -222,9 +222,9 @@ export default function BlockedSourcesPage() {
         </div>
         <div className="tw">
           {!data ? (
-            <div style={{ padding: 24, textAlign: "center", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--text3)" }}>Loading…</div>
+            <div style={{ padding: 24, textAlign: "center", fontFamily: "var(--font-sans)", fontSize: 13, color: "var(--text3)" }}>Loading…</div>
           ) : rows.length === 0 ? (
-            <div style={{ padding: 24, textAlign: "center", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--text3)" }}>
+            <div style={{ padding: 24, textAlign: "center", fontFamily: "var(--font-sans)", fontSize: 13, color: "var(--text3)" }}>
               {filter || search ? "nothing matches" : "nothing is blocked right now"}
             </div>
           ) : (
@@ -240,7 +240,7 @@ export default function BlockedSourcesPage() {
                     <td className="td3">{r.kind === "offender" ? `window ${dp?.offenders?.window_secs ?? 60}s` : until(r.expires)}</td>
                     <td>
                       {r.unblock ? (
-                        <motion.button className="btn bg-btn btn-xs" disabled={busy === r.key} whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}
+                        <motion.button className="btn bg-btn btn-xs" disabled={busy === r.key} whileTap={{ scale: 0.97 }}
                           onClick={() => act(r.key, r.unblock!, `${r.value} unblocked`)}>{busy === r.key ? "…" : "Unblock"}</motion.button>
                       ) : <span className="td3" style={{ fontSize: 11.5 }} title={r.note}>{r.note ?? ""}</span>}
                     </td>

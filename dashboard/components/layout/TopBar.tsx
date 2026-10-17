@@ -185,14 +185,13 @@ export default function TopBar() {
   return (
     <motion.header
       className="topbar"
-      initial={{ y: -60, opacity: 0 }}
-      animate={{ y: 0, opacity: 1 }}
-      transition={spring}
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      transition={{ duration: 0.2 }}
     >
       <a className="tb-logo-area" onClick={() => router.push("/overview")}>
         <motion.div
           className="tb-emb"
-          whileHover={{ scale: 1.08, rotate: 3 }}
           transition={spring}
         >
           <ShieldIcon />
@@ -206,7 +205,7 @@ export default function TopBar() {
       </a>
 
       <div style={{ flex: 1, display: "flex", alignItems: "center", gap: 12, padding: "0 18px" }}>
-        <div style={{ position: "relative" }}>
+        <div className="tb-search" style={{ position: "relative" }}>
           <span style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", color: "var(--text3)", pointerEvents: "none" }}>
             <SearchIcon />
           </span>
@@ -214,13 +213,14 @@ export default function TopBar() {
         </div>
 
         <motion.div
+          className="tb-chip"
           style={{
             display: "flex", alignItems: "center", gap: 7,
-            padding: "5px 12px", borderRadius: 6,
-            background: "rgba(0,212,255,.06)", border: "1px solid rgba(0,212,255,.14)",
-            fontSize: 15, fontFamily: "var(--font-mono)", color: "var(--text2)",
+            padding: "5px 12px", borderRadius: 999,
+            background: "var(--fill)", border: "1px solid transparent",
+            fontSize: 13, fontFamily: "var(--font-sans)", fontWeight: 500, color: "var(--text2)",
+            fontVariantNumeric: "tabular-nums",
           }}
-          whileHover={{ scale: 1.03, borderColor: "rgba(0,212,255,.3)" }}
         >
           <span className="tb-dot" />
           <span>{rpsDisplay} req/s</span>
@@ -236,16 +236,16 @@ export default function TopBar() {
         </motion.div>
 
         {(() => {
-          const c = health.level === "g" ? ["rgba(0,200,122,.06)", "rgba(0,200,122,.18)", "var(--green)"]
-            : health.level === "a" ? ["rgba(255,170,0,.07)", "rgba(255,170,0,.22)", "var(--amber)"]
-            : health.level === "r" ? ["rgba(255,45,85,.07)", "rgba(255,45,85,.24)", "var(--red-b)"]
-            : ["rgba(136,150,184,.07)", "rgba(136,150,184,.2)", "var(--text3)"];
+          const c = health.level === "g" ? ["var(--green-t)", "transparent", "var(--green)"]
+            : health.level === "a" ? ["var(--amber-t)", "transparent", "var(--amber)"]
+            : health.level === "r" ? ["var(--red-t)", "transparent", "var(--red-b)"]
+            : ["var(--gray-t)", "transparent", "var(--text3)"];
           return (
-            <div style={{
+            <div className="tb-chip" style={{
               display: "flex", alignItems: "center", gap: 5,
-              padding: "4px 10px", borderRadius: 6,
+              padding: "4px 10px", borderRadius: 999,
               background: c[0], border: `1px solid ${c[1]}`,
-              fontSize: 14, fontFamily: "var(--font-sans)", fontWeight: 500, color: c[2],
+              fontSize: 13, fontFamily: "var(--font-sans)", fontWeight: 500, color: c[2],
               whiteSpace: "nowrap",
             }} title="Live fleet health">
               <div className={`sd ${health.level}`} style={{ width: 5, height: 5 }} />
@@ -256,12 +256,12 @@ export default function TopBar() {
       </div>
 
       <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "0 14px", marginLeft: "auto" }}>
-        <motion.div className="tb-btn" onClick={() => router.push("/alerts")} title="Alerts" whileHover={{ scale: 1.1 }} whileTap={{ scale: 0.95 }}>
+        <motion.div className="tb-btn" onClick={() => router.push("/alerts")} title="Alerts" whileTap={{ scale: 0.97 }}>
           <BellIcon />
           {alerts > 0 && <span className="tb-badge">{alerts > 9 ? "9+" : alerts}</span>}
         </motion.div>
 
-        <motion.div className="tb-btn" onClick={() => router.push("/settings")} title="Settings" whileHover={{ scale: 1.1 }} whileTap={{ scale: 0.95 }}>
+        <motion.div className="tb-btn" onClick={() => router.push("/settings")} title="Settings" whileTap={{ scale: 0.97 }}>
           <GearIcon />
         </motion.div>
 
@@ -269,9 +269,8 @@ export default function TopBar() {
           className="tb-btn"
           onClick={toggleTheme}
           title={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
-          whileHover={{ scale: 1.1 }}
-          whileTap={{ scale: 0.95 }}
-          style={{ color: theme === "light" ? "var(--amber)" : "var(--text2)" }}
+          whileTap={{ scale: 0.97 }}
+          style={{ color: "var(--text2)" }}
         >
           {theme === "dark" ? <SunIcon /> : <MoonIcon />}
         </motion.div>
@@ -280,11 +279,10 @@ export default function TopBar() {
 
         <motion.div
           className="uchip"
-          whileHover={{ scale: 1.03 }}
           title={me ? `${me.email} · ${me.role}` : "Signed in. Sign out and back in to show your account here."}
         >
           <div className="uav">{initial}</div>
-          <div style={{ minWidth: 0 }}>
+          <div className="uchip-txt" style={{ minWidth: 0 }}>
             <div className="uname">{displayName}</div>
             <div className="urole">{displayRole}</div>
           </div>
@@ -295,8 +293,7 @@ export default function TopBar() {
           title="Sign out"
           onClick={async () => { await signOut(); router.push("/login"); }}
           style={{ color: "var(--red-b)" }}
-          whileHover={{ scale: 1.1 }}
-          whileTap={{ scale: 0.95 }}
+          whileTap={{ scale: 0.97 }}
         >
           <PowerIcon />
         </motion.div>

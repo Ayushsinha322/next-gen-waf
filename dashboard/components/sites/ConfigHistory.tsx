@@ -69,7 +69,7 @@ export default function ConfigHistory({ onClose, onRestored }: { onClose: () => 
       initial={{ opacity: 0 }} animate={{ opacity: 1 }}
       onClick={onClose}
       style={{
-        position: "fixed", inset: 0, zIndex: 1000, background: "rgba(2,6,14,.82)",
+        position: "fixed", inset: 0, zIndex: 1000, background: "var(--scrim)",
         display: "flex", alignItems: "center", justifyContent: "center", padding: 24,
       }}
     >
@@ -80,7 +80,7 @@ export default function ConfigHistory({ onClose, onRestored }: { onClose: () => 
         style={{
           width: "min(760px, 96vw)", maxHeight: "86vh", display: "flex", flexDirection: "column",
           background: "var(--bg2)", border: "1px solid var(--border2)", borderRadius: "var(--r)",
-          boxShadow: "0 24px 64px rgba(0,0,0,.5)",
+          boxShadow: "var(--shadow-modal)",
         }}
       >
         <header style={{ padding: "16px 20px", borderBottom: "1px solid var(--border2)", display: "flex", alignItems: "flex-start", gap: 12 }}>
@@ -117,10 +117,10 @@ export default function ConfigHistory({ onClose, onRestored }: { onClose: () => 
               <tbody>
                 {versions.map(v => (
                   <tr key={v.id}>
-                    <td className="td3" style={{ whiteSpace: "nowrap", fontFamily: "var(--font-mono)" }}>{when(v.created_at)}</td>
-                    <td className="td2" style={{ fontFamily: "var(--font-mono)" }}>{v.reason || "—"}</td>
+                    <td className="td3" style={{ whiteSpace: "nowrap", fontFamily: "var(--font-sans)" }}>{when(v.created_at)}</td>
+                    <td className="td2" style={{ fontFamily: "var(--font-sans)" }}>{v.reason || "—"}</td>
                     <td className="td3">{v.site_count}</td>
-                    <td className="td3" style={{ fontFamily: "var(--font-mono)" }}>{v.created_by ?? "—"}</td>
+                    <td className="td3" style={{ fontFamily: "var(--font-sans)" }}>{v.created_by ?? "—"}</td>
                     <td style={{ textAlign: "right" }}>
                       <button className="btn bg-btn btn-xs" onClick={() => setConfirming(v)}>Restore</button>
                     </td>
