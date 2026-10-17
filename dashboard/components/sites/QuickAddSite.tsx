@@ -116,17 +116,17 @@ export default function QuickAddSite({
 
   return (
     <motion.div
-      style={{ position: "fixed", inset: 0, zIndex: 1000, background: "rgba(2,6,14,.82)",
-               backdropFilter: "blur(6px)", display: "flex", alignItems: "center",
+      style={{ position: "fixed", inset: 0, zIndex: 1000, background: "var(--scrim)",
+               display: "flex", alignItems: "center",
                justifyContent: "center", padding: 24 }}
       initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
       onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
       <motion.div
         initial={{ opacity: 0, scale: 0.96, y: 16 }} animate={{ opacity: 1, scale: 1, y: 0 }}
-        transition={{ type: "spring", stiffness: 260, damping: 24 }}
-        style={{ width: "min(560px, 96vw)", background: "var(--bg2, #0a1018)",
-                 border: "1px solid rgba(0,212,255,.18)", borderRadius: 16,
-                 boxShadow: "0 30px 90px rgba(0,0,0,.6)", padding: 22 }}>
+        transition={{ type: "spring", duration: 0.32, bounce: 0 }}
+        style={{ width: "min(560px, 96vw)", background: "var(--bg2)",
+                 border: "1px solid var(--card-bd)", borderRadius: 16,
+                 boxShadow: "var(--shadow-modal)", padding: 22 }}>
 
         <div style={{ fontFamily: "var(--font-display)", fontSize: 19, fontWeight: 700, marginBottom: 4 }}>
           Protect a site
@@ -205,8 +205,7 @@ export default function QuickAddSite({
         )}
 
         <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 18 }}>
-          <motion.button className="btn bp" disabled={busy || !ready} onClick={create}
-            whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.98 }}>
+          <motion.button className="btn bp" disabled={busy || !ready} onClick={create} whileTap={{ scale: 0.97 }}>
             {busy ? "Creating…" : "Create site"}
           </motion.button>
           <button className="btn bg-btn" onClick={onClose} disabled={busy}>Cancel</button>

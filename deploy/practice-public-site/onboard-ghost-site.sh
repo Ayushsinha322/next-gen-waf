@@ -114,7 +114,8 @@ green "  ✓ authenticated as $EMAIL"
 # and 502 on a brand-new site reads as "the WAF is broken" rather than "the app
 # is not started" — the juiceshop profile note in compose.prod.yml exists for
 # exactly this confusion.
-if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "$UP_HOST"; then
+running="$(docker ps --format '{{.Names}}' 2>/dev/null || true)"
+if grep -q "$UP_HOST" <<<"$running"; then
   green "  ✓ origin container matching '$UP_HOST' is running"
 else
   die "no running container matches '$UP_HOST'. Start it first, using the SAME

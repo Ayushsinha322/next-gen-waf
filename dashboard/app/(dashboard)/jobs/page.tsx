@@ -78,7 +78,7 @@ export default function JobsPage() {
       <motion.div className="panel" variants={fadeUp}>
         <div className="ph"><div className="ptitle">Control plane ({data?.jobs.length ?? "…"})</div><span className="td3" style={{ fontSize: 12.5 }}>{data?.note}</span></div>
         <div className="tw">
-          {!data ? <div style={{ padding: 24, textAlign: "center", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--text3)" }}>Loading…</div> : (
+          {!data ? <div style={{ padding: 24, textAlign: "center", fontFamily: "var(--font-sans)", fontSize: 13, color: "var(--text3)" }}>Loading…</div> : (
             <table>
               <thead><tr><th>Job</th><th>Every</th><th>Last run</th><th>Result</th><th>Next due</th><th>Runs</th><th></th></tr></thead>
               <tbody>
@@ -94,13 +94,13 @@ export default function JobsPage() {
                       <td className="td3" title={j.last_end ?? ""}>{j.running ? <span style={{ color: "var(--cyan)" }}>running…</span> : rel(j.last_end)}{j.last_end && !j.running ? <div style={{ fontSize: 11 }}>{j.last_duration_ms} ms</div> : null}</td>
                       <td style={{ maxWidth: 300, whiteSpace: "normal" }}>
                         {j.runs === 0 ? <span className="td3">not yet run</span>
-                          : bad ? <span style={{ color: "var(--red-b)", fontFamily: "var(--font-mono)", fontSize: 12.5 }} title={j.last_error}>✗ {j.last_error}</span>
-                          : <span style={{ color: "var(--green)", fontFamily: "var(--font-mono)", fontSize: 12.5 }}>✓ {j.last_note || "ok"}</span>}
+                          : bad ? <span style={{ color: "var(--red-b)", fontFamily: "var(--font-sans)", fontSize: 12.5 }} title={j.last_error}>✗ {j.last_error}</span>
+                          : <span style={{ color: "var(--green)", fontFamily: "var(--font-sans)", fontSize: 12.5 }}>✓ {j.last_note || "ok"}</span>}
                       </td>
                       <td className="td3" title={j.next_due ?? ""}>{j.running ? "—" : rel(j.next_due)}</td>
                       <td className="td3" style={{ fontVariantNumeric: "tabular-nums" }}>{j.runs}{j.failures ? <span style={{ color: "var(--red-b)" }}> · {j.failures} failed</span> : ""}</td>
                       <td>{j.can_run_now && (
-                        <motion.button className="btn bg-btn btn-xs" disabled={busy === j.name || j.running} whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }} onClick={() => run(j)}>
+                        <motion.button className="btn bg-btn btn-xs" disabled={busy === j.name || j.running} whileTap={{ scale: 0.97 }} onClick={() => run(j)}>
                           {busy === j.name ? "…" : "▶ Run now"}
                         </motion.button>
                       )}</td>

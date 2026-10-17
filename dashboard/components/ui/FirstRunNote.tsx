@@ -61,7 +61,7 @@ export default function FirstRunNote({
       <div style={{ flex: 1, minWidth: 0 }}>
         <div style={{
           fontSize: 13.5, fontWeight: 700, color: "var(--text2)",
-          fontFamily: "var(--font-display)", letterSpacing: .2, marginBottom: 3,
+          fontFamily: "var(--font-display)", letterSpacing: "-0.005em", marginBottom: 3,
         }}>{title}</div>
         <div style={{ fontSize: 13, color: "var(--text3)", lineHeight: 1.55 }}>{children}</div>
       </div>

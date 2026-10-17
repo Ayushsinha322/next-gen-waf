@@ -20,12 +20,12 @@ const LAB_META: Record<string, { full: string; port: string; desc: string; color
   "dvwa.local": {
     full: "DVWA", port: "80",
     desc: "Damn Vulnerable Web Application — SQLi, XSS, CSRF, File Inclusion training target",
-    color: "rgba(200,0,30,.15)", accent: "rgba(200,0,30,.45)",
+    color: "var(--red-t)", accent: "var(--red)",
   },
   "juice.local": {
     full: "OWASP Juice Shop", port: "3000",
     desc: "Intentionally insecure Node.js app — covers OWASP Top 10 + advanced vulnerabilities",
-    color: "rgba(0,200,240,.12)", accent: "rgba(0,200,240,.38)",
+    color: "var(--accent-tint)", accent: "var(--accent-fill)",
   },
 };
 
@@ -81,11 +81,11 @@ export default function SitesPage() {
       title: "Site Deployed — Next Steps",
       body: (
         <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-          <div style={{ padding: "10px 14px", background: "rgba(0,212,255,.08)", border: "1px solid rgba(0,212,255,.25)", borderRadius: "var(--r2)", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--cyan)" }}>
+          <div style={{ padding: "10px 14px", background: "var(--accent-tint)", border: "1px solid var(--accent-line)", borderRadius: "var(--r2)", fontFamily: "var(--font-sans)", fontSize: 13, color: "var(--cyan)" }}>
             Site saved and WAF protection active in ~5 seconds
           </div>
           <div>
-            <div style={{ fontSize: 14, color: "var(--text2)", marginBottom: 6, fontFamily: "var(--font-mono)", letterSpacing: 1 }}>STEP 1 — Add to /etc/hosts (run once as root)</div>
+            <div style={{ fontSize: 14, color: "var(--text2)", marginBottom: 6, fontFamily: "var(--font-sans)" }}>STEP 1 — Add to /etc/hosts (run once as root)</div>
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
               <code style={{ flex: 1, padding: "8px 12px", background: "var(--inset-bg)", border: "1px solid var(--inset-border)", borderRadius: "var(--r2)", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--text)", userSelect: "all" }}>
                 {hostsEntry}
@@ -97,7 +97,7 @@ export default function SitesPage() {
             </div>
           </div>
           <div>
-            <div style={{ fontSize: 14, color: "var(--text2)", marginBottom: 6, fontFamily: "var(--font-mono)", letterSpacing: 1 }}>STEP 2 — Browse through the WAF (not the origin)</div>
+            <div style={{ fontSize: 14, color: "var(--text2)", marginBottom: 6, fontFamily: "var(--font-sans)" }}>STEP 2 — Browse through the WAF (not the origin)</div>
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
               <code style={{ flex: 1, padding: "8px 12px", background: "var(--inset-bg)", border: "1px solid var(--inset-border)", borderRadius: "var(--r2)", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--green)" }}>
                 {browseURL}
@@ -106,7 +106,7 @@ export default function SitesPage() {
               <a className="btn bp btn-sm" href={browseURL} target="_blank" rel="noreferrer">↗ Open</a>
             </div>
           </div>
-          <div style={{ padding: "10px 14px", background: "rgba(255,165,0,.07)", border: "1px solid rgba(255,165,0,.2)", borderRadius: "var(--r2)", fontFamily: "var(--font-mono)", fontSize: 14, color: "rgba(255,200,80,1)", lineHeight: 1.7 }}>
+          <div style={{ padding: "10px 14px", background: "var(--amber-t)", border: "1px solid transparent", borderRadius: "var(--r2)", fontFamily: "var(--font-sans)", fontSize: 14, color: "var(--text)", lineHeight: 1.7 }}>
             ⚠ Do NOT browse <span style={{ color: "var(--red-b)" }}>{upstream}</span> directly — that bypasses the WAF and generates no logs.
             <br />Always use <span style={{ color: "var(--green)" }}>{browseURL}</span> to route traffic through the WAF.
           </div>
@@ -228,11 +228,11 @@ export default function SitesPage() {
           <div className="sec-sub">Manage reverse proxy targets — WAF enforcement per site</div>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
-          <motion.button className="btn bg-btn btn-sm" onClick={loadSites} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>⟳ Refresh</motion.button>
-          <motion.button className="btn bg-btn btn-sm" onClick={exportYaml} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }} title="Download all sites as YAML">Export</motion.button>
-          <motion.button className="btn bg-btn btn-sm" onClick={() => setShowHistory(true)} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }} title="Snapshots taken before every site change — restore one to undo a bad edit">History</motion.button>
-          <motion.button className="btn bg-btn btn-sm" onClick={openImport} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }} title="Import sites from YAML">Import</motion.button>
-          <motion.button className="btn bp btn-sm" onClick={openCreate} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>＋ Add Site</motion.button>
+          <motion.button className="btn bg-btn btn-sm" onClick={loadSites} whileTap={{ scale: 0.97 }}>⟳ Refresh</motion.button>
+          <motion.button className="btn bg-btn btn-sm" onClick={exportYaml} whileTap={{ scale: 0.97 }} title="Download all sites as YAML">Export</motion.button>
+          <motion.button className="btn bg-btn btn-sm" onClick={() => setShowHistory(true)} whileTap={{ scale: 0.97 }} title="Snapshots taken before every site change — restore one to undo a bad edit">History</motion.button>
+          <motion.button className="btn bg-btn btn-sm" onClick={openImport} whileTap={{ scale: 0.97 }} title="Import sites from YAML">Import</motion.button>
+          <motion.button className="btn bp btn-sm" onClick={openCreate} whileTap={{ scale: 0.97 }}>＋ Add Site</motion.button>
         </div>
       </motion.div>
 
@@ -261,7 +261,7 @@ export default function SitesPage() {
           no lab sites showed two protected applications that did not exist. */}
       {labSites.length > 0 && (
         <motion.div variants={fadeUp}>
-          <div style={{ fontSize: 11, fontFamily: "var(--font-mono)", color: "var(--text3)", letterSpacing: 1.5, textTransform: "uppercase", marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
+          <div style={{ fontSize: 11, fontFamily: "var(--font-sans)", color: "var(--text3)", marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
             <span>Security Lab Targets</span>
             <div style={{ flex: 1, height: 1, background: "var(--inset-border)" }} />
           </div>
@@ -282,12 +282,11 @@ export default function SitesPage() {
                           display: "flex", alignItems: "center", justifyContent: "center",
                           fontSize: 27, flexShrink: 0,
                         }}
-                        whileHover={{ scale: 1.1, rotate: 5 }}
                         transition={spring}
                       >{meta.full.charAt(0).toUpperCase()}</motion.div>
                       <div>
-                        <div style={{ fontFamily: "var(--font-display)", fontSize: 14, fontWeight: 700, color: "var(--text)", letterSpacing: 1 }}>{meta.full}</div>
-                        <div style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--text3)", marginTop: 2 }}>
+                        <div style={{ fontFamily: "var(--font-display)", fontSize: 14, fontWeight: 600, color: "var(--text)", letterSpacing: "-0.01em" }}>{meta.full}</div>
+                        <div style={{ fontFamily: "var(--font-sans)", fontSize: 11, color: "var(--text3)", marginTop: 2 }}>
                           {name} · port {meta.port}
                         </div>
                       </div>
@@ -303,12 +302,12 @@ export default function SitesPage() {
                     </div>
                   </div>
                   <div className="pb">
-                    <div style={{ fontSize: 14, color: "var(--text2)", lineHeight: 1.6, marginBottom: 12, fontFamily: "var(--font-mono)" }}>
+                    <div style={{ fontSize: 14, color: "var(--text2)", lineHeight: 1.6, marginBottom: 12, fontFamily: "var(--font-sans)" }}>
                       {meta.desc}
                     </div>
                     <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                      <motion.button className="btn bp btn-sm" disabled={!site} onClick={() => site && router.push(`/sites/${site.id}`)} whileHover={{ scale: 1.04 }} whileTap={{ scale: 0.96 }} style={!site ? { opacity: 0.5 } : undefined}>Open Dashboard</motion.button>
-                      <motion.button className="btn bc btn-sm" onClick={() => router.push(`/logs?site=${name}&tab=waf`)} whileHover={{ scale: 1.04 }} whileTap={{ scale: 0.96 }}>WAF Logs</motion.button>
+                      <motion.button className="btn bp btn-sm" disabled={!site} onClick={() => site && router.push(`/sites/${site.id}`)} whileTap={{ scale: 0.97 }} style={!site ? { opacity: 0.5 } : undefined}>Open Dashboard</motion.button>
+                      <motion.button className="btn bc btn-sm" onClick={() => router.push(`/logs?site=${name}&tab=waf`)} whileTap={{ scale: 0.97 }}>WAF Logs</motion.button>
                       <button className="btn bg-btn btn-sm" onClick={() => router.push(`/logs?site=${name}&tab=access`)}>Access Logs</button>
                       <button className="btn bg-btn btn-sm" disabled={!site} onClick={() => site && openEdit(site)} style={!site ? { opacity: 0.5 } : undefined}>Edit</button>
                     </div>
@@ -341,7 +340,7 @@ export default function SitesPage() {
         </div>
         <div className="tw">
           {loading ? (
-            <div style={{ padding: "24px", textAlign: "center", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--text3)" }}>Loading sites…</div>
+            <div style={{ padding: "24px", textAlign: "center", fontFamily: "var(--font-sans)", fontSize: 13, color: "var(--text3)" }}>Loading sites…</div>
           ) : filtered.length === 0 ? (
             <EmptyState icon="globe" title={sites.length === 0 ? "No sites protected yet" : "No site matches this filter"}
               hint={sites.length === 0 ? "A site is a hostname routed through the WAF to an origin. Add the first one and traffic is inspected within seconds of the config sync." : "Clear the search or filter to see all sites."}
@@ -359,7 +358,7 @@ export default function SitesPage() {
                       <td><div className={`sd ${stDot}`} /></td>
                       <td>
                         <a href={`/sites/${s.id}`} onClick={e => { e.preventDefault(); router.push(`/sites/${s.id}`); }} title="Open site dashboard"
-                          style={{ color: meta ? (s.name === "dvwa.local" ? "var(--red-b)" : "var(--cyan)") : "var(--cyan)", fontWeight: meta ? 700 : 400, textDecoration: "none", borderBottom: "1px dotted rgba(0,212,255,.45)" }}>
+                          style={{ color: meta ? (s.name === "dvwa.local" ? "var(--red-b)" : "var(--cyan)") : "var(--cyan)", fontWeight: meta ? 700 : 400, textDecoration: "none", borderBottom: "1px dotted var(--accent-line)" }}>
                           {s.name}
                         </a>
                       </td>
@@ -369,10 +368,10 @@ export default function SitesPage() {
                       <td><span className={`bdg ${s.status === "active" ? "bgg" : "bgr"}`}>{s.status}</span></td>
                       <td>
                         <div style={{ display: "flex", gap: 4 }}>
-                          <motion.button className="btn bc btn-xs" title="Open site dashboard" onClick={() => router.push(`/sites/${s.id}`)} whileHover={{ scale: 1.08 }} whileTap={{ scale: 0.94 }}>Open</motion.button>
-                          <motion.button className="btn bg-btn btn-xs" onClick={() => router.push(`/logs?site=${s.name}&tab=waf`)} whileHover={{ scale: 1.08 }} whileTap={{ scale: 0.94 }}><Icon name="shield" size={13} title="WAF logs" /></motion.button>
-                          <motion.button className="btn bg-btn btn-xs" onClick={() => router.push(`/logs?site=${s.name}`)} whileHover={{ scale: 1.08 }} whileTap={{ scale: 0.94 }}>Logs</motion.button>
-                          <motion.button className="btn bc btn-xs" title="Edit site" onClick={() => openEdit(s)} whileHover={{ scale: 1.08 }} whileTap={{ scale: 0.94 }}><Icon name="edit" size={13} title="Edit site" /></motion.button>
+                          <motion.button className="btn bc btn-xs" title="Open site dashboard" onClick={() => router.push(`/sites/${s.id}`)} whileTap={{ scale: 0.97 }}>Open</motion.button>
+                          <motion.button className="btn bg-btn btn-xs" onClick={() => router.push(`/logs?site=${s.name}&tab=waf`)} whileTap={{ scale: 0.97 }}><Icon name="shield" size={13} title="WAF logs" /></motion.button>
+                          <motion.button className="btn bg-btn btn-xs" onClick={() => router.push(`/logs?site=${s.name}`)} whileTap={{ scale: 0.97 }}>Logs</motion.button>
+                          <motion.button className="btn bc btn-xs" title="Edit site" onClick={() => openEdit(s)} whileTap={{ scale: 0.97 }}><Icon name="edit" size={13} title="Edit site" /></motion.button>
                           <motion.button
                             className="btn bg-btn btn-xs"
                             title={s.status === "active" ? "Pause site" : "Activate site"}
@@ -385,8 +384,7 @@ export default function SitesPage() {
                                 loadSites();
                               } catch { showToast("Failed", "e"); }
                             }}
-                            whileHover={{ scale: 1.08 }}
-                            whileTap={{ scale: 0.94 }}
+                            whileTap={{ scale: 0.97 }}
                           >{s.status === "active" ? "⏸" : "▶"}</motion.button>
                           <motion.button
                             className="btn bg-btn btn-xs"
@@ -399,8 +397,7 @@ export default function SitesPage() {
                                 loadSites();
                               } catch { showToast("Failed to delete", "e"); }
                             }}
-                            whileHover={{ scale: 1.08 }}
-                            whileTap={{ scale: 0.94 }}
+                            whileTap={{ scale: 0.97 }}
                           ><Icon name="trash" size={13} title="Delete site" /></motion.button>
                         </div>
                       </td>

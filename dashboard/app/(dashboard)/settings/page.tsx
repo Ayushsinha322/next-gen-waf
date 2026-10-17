@@ -89,7 +89,7 @@ export default function SettingsPage() {
 function KV({ label, value, mono = true }: { label: string; value: React.ReactNode; mono?: boolean }) {
   return (
     <div style={{ display: "grid", gridTemplateColumns: "220px 1fr", gap: 12, padding: "9px 0", borderBottom: "1px solid var(--border2)" }}>
-      <div style={{ fontSize: "var(--fs-label)", color: "var(--text3)", textTransform: "uppercase", letterSpacing: "var(--tr-wide)" }}>{label}</div>
+      <div style={{ fontSize: "var(--fs-label)", color: "var(--text3)" }}>{label}</div>
       <div style={{ fontSize: "var(--fs-sm)", color: "var(--text)", fontFamily: mono ? "var(--font-mono)" : undefined, overflowWrap: "anywhere" }}>{value}</div>
     </div>
   );
@@ -97,8 +97,8 @@ function KV({ label, value, mono = true }: { label: string; value: React.ReactNo
 
 function Note({ children, tone = "info" }: { children: React.ReactNode; tone?: "info" | "warn" }) {
   const c = tone === "warn"
-    ? ["rgba(255,176,32,.07)", "rgba(255,176,32,.25)"]
-    : ["rgba(0,212,255,.06)", "rgba(0,212,255,.18)"];
+    ? ["var(--amber-t)", "var(--amber-t)"]
+    : ["var(--accent-tint)", "var(--accent-tint-h)"];
   return (
     <div style={{
       padding: "11px 14px", background: c[0], border: `1px solid ${c[1]}`,
@@ -327,12 +327,12 @@ function APIKeysTab() {
     <motion.div className="panel" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={tweenFast}>
       <div className="ph">
         <div className="ptitle">API Keys</div>
-        <motion.button className="btn bp btn-sm" onClick={() => { setShowCreate(s=>!s); setRevealKey(null); }} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
+        <motion.button className="btn bp btn-sm" onClick={() => { setShowCreate(s=>!s); setRevealKey(null); }} whileTap={{ scale: 0.97 }}>
           {showCreate ? "✕ Cancel" : "＋ Generate Key"}
         </motion.button>
       </div>
       {showCreate && (
-        <div className="pb" style={{ borderBottom:"1px solid rgba(255,255,255,.06)", paddingBottom:14 }}>
+        <div className="pb" style={{ borderBottom:"1px solid var(--card-bd)", paddingBottom:14 }}>
           <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 }}>
             <div className="fg2"><label className="flbl2">Key Name *</label>
               <input className="fin2" placeholder="CI/CD Pipeline" value={newName} onChange={e=>setNewName(e.target.value)} /></div>
@@ -344,7 +344,7 @@ function APIKeysTab() {
                 <option value="write:all">write:all</option>
               </select></div>
           </div>
-          <motion.button className="btn bp btn-sm" style={{marginTop:10}} onClick={generate} disabled={creating} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
+          <motion.button className="btn bp btn-sm" style={{marginTop:10}} onClick={generate} disabled={creating} whileTap={{ scale: 0.97 }}>
             {creating ? "Generating…" : "Generate"}
           </motion.button>
           {revealKey && (
@@ -352,7 +352,7 @@ function APIKeysTab() {
               <div style={{color:"var(--amber)",fontSize: 14,marginBottom:4}}>⚠ Copy now — shown only once</div>
               <code style={{color:"var(--green)",wordBreak:"break-all"}}>{revealKey}</code>
               <motion.button className="btn bg-btn btn-xs" style={{marginLeft:8}}
-                onClick={() => { navigator.clipboard?.writeText(revealKey); showToast("Copied!","s"); }} whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.96 }}>Copy</motion.button>
+                onClick={() => { navigator.clipboard?.writeText(revealKey); showToast("Copied!","s"); }} whileTap={{ scale: 0.97 }}>Copy</motion.button>
             </div>
           )}
         </div>
@@ -373,7 +373,7 @@ function APIKeysTab() {
                     : <span className="td3">—</span>}</td>
                   <td className="td3">{k.expires_at ? new Date(k.expires_at).toLocaleDateString() : "—"}</td>
                   <td className="td3">{fmtLogin(k.last_used_at)}</td>
-                  <td><motion.button className="btn bd btn-xs" onClick={() => revoke(k.id,k.name)} whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.96 }}>Revoke</motion.button></td>
+                  <td><motion.button className="btn bd btn-xs" onClick={() => revoke(k.id,k.name)} whileTap={{ scale: 0.97 }}>Revoke</motion.button></td>
                 </motion.tr>
               ))}
             </tbody>
@@ -532,12 +532,12 @@ function UsersTab() {
     <motion.div className="panel" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={tweenFast}>
       <div className="ph">
         <div className="ptitle">Team Members</div>
-        <motion.button className="btn bp btn-sm" onClick={() => setShowInvite(s=>!s)} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
+        <motion.button className="btn bp btn-sm" onClick={() => setShowInvite(s=>!s)} whileTap={{ scale: 0.97 }}>
           {showInvite ? "✕ Cancel" : "＋ Add User"}
         </motion.button>
       </div>
       {showInvite && (
-        <div className="pb" style={{ borderBottom:"1px solid rgba(255,255,255,.06)", paddingBottom:14 }}>
+        <div className="pb" style={{ borderBottom:"1px solid var(--card-bd)", paddingBottom:14 }}>
           <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr 1fr", gap:12 }}>
             <div className="fg2"><label className="flbl2">Email *</label>
               <input className="fin2" placeholder="user@company.com" value={invEmail} onChange={e=>setInvEmail(e.target.value)} type="email" /></div>
@@ -559,7 +559,7 @@ function UsersTab() {
             password directly. They can change it themselves after signing in, and
             you can email them a reset link from the table below.
           </div>
-          <motion.button className="btn bp btn-sm" style={{marginTop:10}} onClick={invite} disabled={inviting} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
+          <motion.button className="btn bp btn-sm" style={{marginTop:10}} onClick={invite} disabled={inviting} whileTap={{ scale: 0.97 }}>
             {inviting ? "Creating…" : "Create User"}
           </motion.button>
         </div>
@@ -653,7 +653,7 @@ function TwoFactorCard({ users, onChanged }: { users: UserRow[]; onChanged: () =
     try {
       const r = await api.auth.mfaEnroll();
       const QR = await import("qrcode");
-      const qr = await QR.toDataURL(r.otpauth_uri, { margin: 1, width: 180, color: { dark: "#e6eaef", light: "#00000000" } });
+      const qr = await QR.toDataURL(r.otpauth_uri, { margin: 1, width: 180, color: { dark: "#1d1d1f", light: "#ffffff" } });
       setEnrolling({ secret: r.secret, uri: r.otpauth_uri, qr });
       setCode("");
     } catch (e) {
@@ -700,7 +700,7 @@ function TwoFactorCard({ users, onChanged }: { users: UserRow[]; onChanged: () =
         </div>
 
         {enabled === false && !enrolling && (
-          <div><motion.button className="btn bp btn-sm" disabled={busy} onClick={startEnrol} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
+          <div><motion.button className="btn bp btn-sm" disabled={busy} onClick={startEnrol} whileTap={{ scale: 0.97 }}>
             {busy ? "…" : "Turn on two-factor"}
           </motion.button></div>
         )}
@@ -708,7 +708,7 @@ function TwoFactorCard({ users, onChanged }: { users: UserRow[]; onChanged: () =
         {enrolling && (
           <div style={{ display: "grid", gridTemplateColumns: "200px 1fr", gap: 18, alignItems: "start" }}>
             {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img src={enrolling.qr} alt="TOTP enrolment QR code" width={180} height={180} style={{ border: "1px solid var(--border)", borderRadius: 6, padding: 8, background: "rgba(255,255,255,.03)" }} />
+            <img src={enrolling.qr} alt="TOTP enrolment QR code" width={180} height={180} style={{ border: "1px solid var(--card-bd)", borderRadius: 12, padding: 10, background: "#ffffff" }} />
             <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
               <div className="td3" style={{ fontSize: 13 }}>1. Scan the code with your authenticator app, or enter the secret by hand:</div>
               <code style={{ fontSize: 13, userSelect: "all", wordBreak: "break-all" }}>{enrolling.secret}</code>
@@ -716,7 +716,7 @@ function TwoFactorCard({ users, onChanged }: { users: UserRow[]; onChanged: () =
               <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
                 <input className="fin2" inputMode="numeric" pattern="[0-9]*" maxLength={8} placeholder="123 456" value={code}
                   onChange={e => setCode(e.target.value.replace(/\s+/g, ""))} onKeyDown={e => { if (e.key === "Enter") confirm(); }} style={{ width: 140, fontFamily: "var(--font-mono)", letterSpacing: ".12em" }} />
-                <motion.button className="btn bp btn-sm" disabled={busy || code.trim().length < 6} onClick={confirm} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>{busy ? "…" : "Activate"}</motion.button>
+                <motion.button className="btn bp btn-sm" disabled={busy || code.trim().length < 6} onClick={confirm} whileTap={{ scale: 0.97 }}>{busy ? "…" : "Activate"}</motion.button>
                 <button className="btn bg-btn btn-sm" onClick={() => { setEnrolling(null); setCode(""); }}>Cancel</button>
               </div>
             </div>
@@ -731,7 +731,7 @@ function TwoFactorCard({ users, onChanged }: { users: UserRow[]; onChanged: () =
             <span className="td3" style={{ fontSize: 13 }}>Enter a current code to turn it off:</span>
             <input className="fin2" inputMode="numeric" maxLength={8} placeholder="123 456" value={code}
               onChange={e => setCode(e.target.value.replace(/\s+/g, ""))} onKeyDown={e => { if (e.key === "Enter") disable(); }} style={{ width: 140, fontFamily: "var(--font-mono)", letterSpacing: ".12em" }} />
-            <motion.button className="btn bgn btn-sm" disabled={busy || code.trim().length < 6} onClick={disable} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>{busy ? "…" : "Turn off"}</motion.button>
+            <motion.button className="btn bgn btn-sm" disabled={busy || code.trim().length < 6} onClick={disable} whileTap={{ scale: 0.97 }}>{busy ? "…" : "Turn off"}</motion.button>
             <button className="btn bg-btn btn-sm" onClick={() => { setDisabling(false); setCode(""); }}>Cancel</button>
           </div>
         )}
@@ -787,7 +787,7 @@ function ChangePasswordCard() {
             : "Changing your password signs out every session, including this one."}
         </div>
         <motion.button className="btn bp btn-sm" style={{ marginTop: 10 }} onClick={submit}
-          disabled={!ready} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
+          disabled={!ready} whileTap={{ scale: 0.97 }}>
           {busy ? "Updating…" : "Change password"}
         </motion.button>
       </div>
@@ -835,7 +835,7 @@ function ClusterTab() {
       </div>
       <div className="pb">
         {!health ? (
-          <div style={{ padding: "26px 12px", textAlign: "center", color: "var(--text3)", fontFamily: "var(--font-mono)", fontSize: 14 }}>
+          <div style={{ padding: "26px 12px", textAlign: "center", color: "var(--text3)", fontFamily: "var(--font-sans)", fontSize: 14 }}>
             {err ? "Control plane unreachable — no live cluster data to show." : "Loading live cluster health…"}
           </div>
         ) : (
@@ -848,7 +848,7 @@ function ClusterTab() {
                   <motion.div key={n.node_id} className={`nodecard ${n.is_leader ? "leader" : ""}`} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: idx * 0.08, ...spring }}>
                     <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
                       <div className={`sd ${n.reachable ? "g" : "r"}`} />
-                      <span className="ncr" style={n.is_leader ? { background: "rgba(200,0,30,.2)", color: "var(--red-b)", border: "1px solid var(--border)" } : { background: "rgba(0,200,240,.12)", color: "var(--cyan)", border: "1px solid rgba(0,200,240,.3)" }}>{n.is_leader ? "LEADER" : n.role.toUpperCase()}</span>
+                      <span className="ncr" style={n.is_leader ? { background: "var(--accent-tint)", color: "var(--cyan)", border: "1px solid transparent" } : { background: "var(--accent-tint)", color: "var(--cyan)", border: "1px solid var(--accent-line)" }}>{n.is_leader ? "LEADER" : n.role.toUpperCase()}</span>
                       {n.is_self && <span className="bdg bgr" style={{ marginLeft: "auto" }}>this node</span>}
                     </div>
                     <div className="ncn">node {n.node_id}</div>
@@ -882,7 +882,7 @@ function ClusterTab() {
               </div>
             ))}
 
-            <div style={{ marginTop: 12, fontSize: 12.5, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>
+            <div style={{ marginTop: 12, fontSize: 12.5, color: "var(--text3)", fontFamily: "var(--font-sans)" }}>
               Live from <code>GET /cluster/health</code> · refreshes every 10s · full fleet view under <b>Cluster</b>.
             </div>
           </>
@@ -974,17 +974,17 @@ function NotificationsTab() {
     <motion.div className="panel" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={tweenFast}>
       <div className="ph">
         <div className="ptitle">Notification Channels</div>
-        <motion.button className="btn bc btn-sm" onClick={() => setAdding(a => !a)} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
+        <motion.button className="btn bc btn-sm" onClick={() => setAdding(a => !a)} whileTap={{ scale: 0.97 }}>
           {adding ? "✕ Cancel" : "+ Add Channel"}
         </motion.button>
       </div>
       <div className="pb">
-        <div style={{ fontSize: 13, color: "var(--text3)", lineHeight: 1.7, marginBottom: 12, fontFamily: "var(--font-mono)" }}>
+        <div style={{ fontSize: 13, color: "var(--text3)", lineHeight: 1.7, marginBottom: 12, fontFamily: "var(--font-sans)" }}>
           Alerts (attack spikes, repeat offenders, critical blocks, and the node conditions: a site refusing traffic, the event store unreachable, a certificate order failing, a node not taking config or restarting) are delivered to every enabled channel whose minimum severity the alert meets. Webhook payloads are optionally HMAC-SHA256 signed (<code>X-Swaraj-Kavach-Signature</code>; also sent as <code>X-Sentinel-Signature</code> for receivers built against earlier releases).
         </div>
 
         {adding && (
-          <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }} style={{ overflow: "hidden", marginBottom: 16, border: "1px solid var(--border, rgba(0,229,255,0.15))", borderRadius: 10, padding: 14 }}>
+          <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }} style={{ overflow: "hidden", marginBottom: 16, border: "1px solid var(--border, var(--card-bd))", borderRadius: 10, padding: 14 }}>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
               <div className="fg2"><label className="flbl2">Name</label><input className="fin2" value={form.name} placeholder="prod-soc-webhook" onChange={e => setForm(f => ({ ...f, name: e.target.value }))} /></div>
               <div className="fg2"><label className="flbl2">Type</label>
@@ -1021,22 +1021,22 @@ function NotificationsTab() {
         )}
 
         {loading ? (
-          <div style={{ padding: 24, textAlign: "center", fontSize: 13, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>Loading channels…</div>
+          <div style={{ padding: 24, textAlign: "center", fontSize: 13, color: "var(--text3)", fontFamily: "var(--font-sans)" }}>Loading channels…</div>
         ) : channels.length === 0 ? (
-          <div style={{ padding: 24, textAlign: "center", fontSize: 13, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>No channels configured. Add one to start delivering alerts to your SOC.</div>
+          <div style={{ padding: 24, textAlign: "center", fontSize: 13, color: "var(--text3)", fontFamily: "var(--font-sans)" }}>No channels configured. Add one to start delivering alerts to your SOC.</div>
         ) : channels.map(ch => (
           <div key={ch.id} className="srow">
             <div style={{ flex: 1, minWidth: 0 }}>
               <div className="srt">{ch.name} <span className="bdg bcy" style={{ marginLeft: 6 }}>{ch.type.toUpperCase()}</span> <span className="bdg" style={{ marginLeft: 4 }}>≥ {ch.min_severity.toUpperCase()}</span></div>
               <div className="srd" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                 {ch.type === "email" ? ch.config.to : ch.type === "webhook" || ch.type === "slack" ? ch.config.url : `${ch.config.host}:${ch.config.port}/${ch.config.protocol}`}
-                {ch.last_status && <span style={{ marginLeft: 8, color: ch.last_status === "ok" ? "var(--green)" : "#ef4444" }}>· last: {ch.last_status === "ok" ? "✓ ok" : ch.last_status}</span>}
+                {ch.last_status && <span style={{ marginLeft: 8, color: ch.last_status === "ok" ? "var(--green)" : "var(--red-b)" }}>· last: {ch.last_status === "ok" ? "✓ ok" : ch.last_status}</span>}
               </div>
             </div>
             <div style={{ display: "flex", gap: 6, alignItems: "center", flexShrink: 0 }}>
               <button className="btn bg-btn btn-xs" disabled={busy === ch.id} onClick={() => test(ch.id)}>{busy === ch.id ? "…" : "Test"}</button>
               <Toggle defaultOn={ch.enabled} onChange={() => toggle(ch)} />
-              <button className="btn bg-btn btn-xs" style={{ color: "#ef4444" }} disabled={busy === ch.id} onClick={() => del(ch)}><Icon name="trash" size={13} title="Delete channel" /></button>
+              <button className="btn bg-btn btn-xs" style={{ color: "var(--red-b)" }} disabled={busy === ch.id} onClick={() => del(ch)}><Icon name="trash" size={13} title="Delete channel" /></button>
             </div>
           </div>
         ))}
@@ -1113,8 +1113,7 @@ function ManagementTLSTab() {
       <div className="ph">
         <div className="ptitle">Management Console Certificate</div>
         {info && !info.self_signed && (
-          <motion.button className="btn bg-btn btn-sm" disabled={busy === "revert"} onClick={revert}
-            whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>↩ Revert to self-signed</motion.button>
+          <motion.button className="btn bg-btn btn-sm" disabled={busy === "revert"} onClick={revert} whileTap={{ scale: 0.97 }}>↩ Revert to self-signed</motion.button>
         )}
       </div>
       <div className="pb">
@@ -1127,7 +1126,7 @@ function ManagementTLSTab() {
         {loading ? (
           <div className="sec-sub">Loading…</div>
         ) : info?.self_signed ? (
-          <div className="panel" style={{ background: "rgba(245,158,11,.08)", borderColor: "var(--amber)" }}>
+          <div className="panel" style={{ background: "var(--amber-t)", borderColor: "var(--amber)" }}>
             <div className="pb">
               <b>⚠ Self-signed default in use</b>
               <div className="sec-sub">
@@ -1174,7 +1173,7 @@ function ManagementTLSTab() {
           </div>
 
           {warnings.length > 0 && (
-            <div className="panel" style={{ background: "rgba(245,158,11,.08)", borderColor: "var(--amber)", marginBottom: 10 }}>
+            <div className="panel" style={{ background: "var(--amber-t)", borderColor: "var(--amber)", marginBottom: 10 }}>
               <div className="pb">
                 <b>Installed with warnings:</b>
                 <ul style={{ margin: "6px 0 0 18px" }}>{warnings.map((w, i) => <li key={i} className="sec-sub">{w}</li>)}</ul>
@@ -1195,7 +1194,7 @@ function LanguagePicker() {
   const { locale, setLocale, t } = useT();
   return (
     <div style={{ display: "grid", gap: 6 }}>
-      <label style={{ fontSize: 12, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>{t("common.language")}</label>
+      <label style={{ fontSize: 12, color: "var(--text3)", fontFamily: "var(--font-sans)" }}>{t("common.language")}</label>
       <select className="fsel" value={locale} onChange={e => setLocale(e.target.value as Locale)} style={{ maxWidth: 260 }}>
         {SUPPORTED_LOCALES.map(l => <option key={l.code} value={l.code}>{l.label}</option>)}
       </select>

@@ -23,12 +23,12 @@ function ArcGauge({ value, label, color }: { value: number; label: string; color
 
   return (
     <svg viewBox="0 0 128 90" className="ml-gauge-svg">
-      <path d={`M${bg1.x},${bg1.y} A${r},${r} 0 1,1 ${bg2.x},${bg2.y}`} fill="none" stroke="rgba(255,255,255,.07)" strokeWidth="8" strokeLinecap="round" />
+      <path d={`M${bg1.x},${bg1.y} A${r},${r} 0 1,1 ${bg2.x},${bg2.y}`} fill="none" stroke="var(--track)" strokeWidth="8" strokeLinecap="round" />
       {pct > 0 && (
         <path d={`M${s.x},${s.y} A${r},${r} 0 ${large},1 ${e.x},${e.y}`} fill="none" stroke={color} strokeWidth="8" strokeLinecap="round" />
       )}
-      <text x={cx} y={cy - 4} textAnchor="middle" fill="#f1f5f9" fontSize="18" fontFamily="var(--font-mono)" fontWeight="700">{displayVal}%</text>
-      <text x={cx} y={cy + 14} textAnchor="middle" fill="rgba(148,163,184,.7)" fontSize="9" fontFamily="Inter,sans-serif" letterSpacing=".5">{label}</text>
+      <text x={cx} y={cy - 4} textAnchor="middle" fill="var(--text)" fontSize="18" fontFamily="var(--font-display)" fontWeight="600">{displayVal}%</text>
+      <text x={cx} y={cy + 14} textAnchor="middle" fill="var(--text3)" fontSize="10" fontFamily="var(--font-sans)">{label}</text>
     </svg>
   );
 }
@@ -77,7 +77,7 @@ export default function MLPage() {
   // Green only when ML is genuinely enabled everywhere; amber otherwise. The old
   // check compared against the constant "active" the API always returned, so the
   // dot was green on installs where ML was disabled on every site.
-  const statusColor = stats?.model_status === "enabled" ? "#22c55e" : "#f59e0b";
+  const statusColor = stats?.model_status === "enabled" ? "var(--green)" : "var(--amber)";
 
   return (
     <motion.div className="ml-page" variants={staggerContainer} initial="hidden" animate="visible">
@@ -85,13 +85,13 @@ export default function MLPage() {
         <div className="ml-bc">/ <span>Intelligence</span> / <span>ML Engine</span></div>
         <div className="ml-hrow">
           <div className="ml-ttl">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#a78bfa" strokeWidth="1.5">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--purple)" strokeWidth="1.5">
               <path d="M12 2a10 10 0 100 20A10 10 0 0012 2z" /><path d="M8 12h8M12 8v8" />
             </svg>
             ML / AI Engine
             {stats && <span className="ml-status-dot" style={{ background: statusColor }} title={stats.model_status} />}
           </div>
-          <div style={{ fontSize: 13, fontFamily: "var(--font-mono)", color: "var(--text2)" }}>Auto-refresh: 5 s</div>
+          <div style={{ fontSize: 13, fontFamily: "var(--font-sans)", color: "var(--text2)" }}>Auto-refresh: 5 s</div>
         </div>
       </motion.div>
 
@@ -102,8 +102,8 @@ export default function MLPage() {
         <>
           <motion.div className="ml-kpis" variants={staggerContainer} initial="hidden" animate="visible">
             {[
-              { v: stats.total_analyzed.toLocaleString(), l: "Requests Analyzed", c: "#60a5fa", d: anomHist.current },
-              { v: stats.anomalies_detected.toLocaleString(), l: "Anomalies Detected", c: "#f87171", d: anomHist.current, cls: "r" },
+              { v: stats.total_analyzed.toLocaleString(), l: "Requests Analyzed", c: "var(--blue)", d: anomHist.current },
+              { v: stats.anomalies_detected.toLocaleString(), l: "Anomalies Detected", c: "var(--red-b)", d: anomHist.current, cls: "r" },
             ].map((k, i) => (
               <motion.div key={i} className="ml-kpi" variants={cardVariants}>
                 <div className={`ml-kpi-v ${k.cls || ""}`}>{k.v}</div>
@@ -112,7 +112,7 @@ export default function MLPage() {
               </motion.div>
             ))}
             <motion.div className="ml-kpi" variants={cardVariants}>
-              <div className="ml-kpi-v" style={{ color: "#a78bfa" }}>{stats.block_rate.toFixed(2)}%</div>
+              <div className="ml-kpi-v" style={{ color: "var(--purple)" }}>{stats.block_rate.toFixed(2)}%</div>
               <div className="ml-kpi-l">Block Rate</div>
             </motion.div>
           </motion.div>
@@ -133,7 +133,7 @@ export default function MLPage() {
           )}
 
           <motion.div className="ml-sec-hd" variants={fadeUp}>
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#a78bfa" strokeWidth="1.5"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--purple)" strokeWidth="1.5"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
             Active Models
           </motion.div>
           <motion.div className="ml-models" variants={staggerContainer} initial="hidden" animate="visible">
@@ -163,7 +163,7 @@ export default function MLPage() {
 
           <motion.div variants={fadeUp}>
             <div className="ml-sec-hd">
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#60a5fa" strokeWidth="1.5"><path d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/></svg>
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--blue)" strokeWidth="1.5"><path d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/></svg>
               Detection Tracker
             </div>
             <div className="ml-tracker">
@@ -178,7 +178,7 @@ export default function MLPage() {
                     look like a daily measurement.
                   */}
                   <tr><td>Anomalies Detected</td><td className="r">{stats.anomalies_detected.toLocaleString()}</td><td><span className={`ml-tag ${stats.anomalies_detected > 100 ? "r" : "a"}`}>{stats.anomalies_detected > 100 ? "HIGH" : "NORMAL"}</span></td></tr>
-                  <tr><td>Block Rate</td><td style={{ color: "#a78bfa" }}>{stats.block_rate.toFixed(2)}%</td><td><span className="ml-tag p">INFO</span></td></tr>
+                  <tr><td>Block Rate</td><td style={{ color: "var(--purple)" }}>{stats.block_rate.toFixed(2)}%</td><td><span className="ml-tag p">INFO</span></td></tr>
                 </tbody>
               </table>
             </div>

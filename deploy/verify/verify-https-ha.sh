@@ -30,8 +30,9 @@ LB_IP=$(docker inspect sentinel-lb-1 --format '{{range .NetworkSettings.Networks
 echo "=== 0. topology: who owns :443 now? ==="
 echo "    haproxy container address: $LB_IP"
 BINDER=$(docker ps --format '{{.Names}}' | while read -r c; do
-  docker port "$c" 2>/dev/null | grep -q '^8443/tcp' && echo "$c"
-  docker port "$c" 2>/dev/null | grep -q '^443/tcp'  && echo "$c"
+  ports="$(docker port "$c" 2>/dev/null || true)"
+  grep -q '^8443/tcp' <<<"$ports" && echo "$c"
+  grep -q '^443/tcp' <<<"$ports" && echo "$c"
 done | sort -u | tr '\n' ' ')
 echo "    containers publishing a 443-ish tcp port: ${BINDER:-none}"
 case "$BINDER" in
@@ -42,10 +43,11 @@ esac
 # "443/tcp", so an unanchored grep reports waf1 as still publishing 443/tcp when
 # it publishes only the management port. That produced a false FAIL on the first
 # real run of this script.
-docker port sentinel-waf1-1 2>/dev/null | grep -qE '^443/tcp' \
+waf1_ports="$(docker port sentinel-waf1-1 2>/dev/null || true)"
+grep -qE '^443/tcp' <<<"$waf1_ports" \
   && bad "waf1 still publishes 443/tcp — HTTPS is still single-homed" \
   || ok "waf1 no longer publishes 443/tcp (9443/tcp management remains, as intended)"
-docker port sentinel-waf1-1 2>/dev/null | grep -qE '^8443/udp' \
+grep -qE '^8443/udp' <<<"$waf1_ports" \
   && ok "waf1 still publishes 443/udp (HTTP/3, single-homed by design)" \
   || note "waf1 does not publish 443/udp — HTTP/3 is off entirely"
 

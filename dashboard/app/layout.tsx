@@ -25,6 +25,11 @@ export default async function RootLayout({ children }: { children: React.ReactNo
             __html: `try{var t=localStorage.getItem('sentinel-theme')||'dark';document.documentElement.setAttribute('data-theme',t);}catch(e){}`,
           }}
         />
+        {/* The console ships its own light and dark themes. Dark Reader-style
+            extensions re-colour light pages on top of that and produce a theme
+            that is neither; this tag asks them to leave the page alone. */}
+        <meta name="darkreader-lock" />
+        <meta name="color-scheme" content="dark light" />
         {/* Two families only — Inter for the interface, JetBrains Mono for data
             and log output. Orbitron and Share Tech Mono were dropped: both are
             sci-fi display faces, and a security buyer reads them as a hobby

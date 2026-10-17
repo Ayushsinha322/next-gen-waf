@@ -135,7 +135,6 @@ export default function LogProfilePanel({
             className="btn bc btn-sm"
             onClick={runExport}
             disabled={exporting || busy}
-            whileHover={{ scale: exporting ? 1 : 1.03 }}
             whileTap={{ scale: 0.97 }}
             title="Download every event in the selected window — not just the rows shown below"
           >
@@ -149,7 +148,7 @@ export default function LogProfilePanel({
           </div>
         )}
 
-        <div className="pb" style={{ paddingTop: 0, fontSize: 12, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>
+        <div className="pb" style={{ paddingTop: 0, fontSize: 12, color: "var(--text3)", fontFamily: "var(--font-sans)" }}>
           The download streams every matching event in the window from the event
           store — the table below is only a preview.
         </div>
@@ -234,7 +233,7 @@ function ProfileEditor({
       initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
       onClick={onClose}
       style={{
-        position: "fixed", inset: 0, background: "rgba(0,0,0,.6)", zIndex: 200,
+        position: "fixed", inset: 0, background: "var(--scrim)", zIndex: 200,
         display: "flex", alignItems: "center", justifyContent: "center", padding: 20,
       }}
     >

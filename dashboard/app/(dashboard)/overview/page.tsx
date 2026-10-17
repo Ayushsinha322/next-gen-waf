@@ -20,24 +20,24 @@ interface FeedRow { t: string; ip: string; m: string; path: string; st: number; 
 
 // Attack-category presentation (keys mirror the Go hub's attackCategory()).
 const ATTACK_META: Record<string, { label: string; color: string }> = {
-  sqli:     { label: "SQL Injection",  color: "#ef4444" },
-  xss:      { label: "XSS",            color: "#f59e0b" },
-  rfi_lfi:  { label: "RFI / LFI",      color: "#a78bfa" },
-  rce:      { label: "RCE / Code Exec",color: "#fb7185" },
-  ssrf:     { label: "SSRF",           color: "#06b6d4" },
-  bot:      { label: "Bot / Scanner",  color: "#22c55e" },
-  protocol: { label: "Protocol",       color: "#3b82f6" },
+  sqli:     { label: "SQL Injection",  color: "#ff453a" },
+  xss:      { label: "XSS",            color: "#ff9f0a" },
+  rfi_lfi:  { label: "RFI / LFI",      color: "#64d2ff" },
+  rce:      { label: "RCE / Code Exec",color: "#ff375f" },
+  ssrf:     { label: "SSRF",           color: "#40c8e0" },
+  bot:      { label: "Bot / Scanner",  color: "#30d158" },
+  protocol: { label: "Protocol",       color: "#0a84ff" },
   // Non-rule blocks. Missing here, they were dropped from the breakdown — 43 of
   // 75 blocks on the demo cluster — so the chart described a minority of what the
   // WAF actually stopped.
-  geoip:         { label: "GeoIP",           color: "#eab308" },
-  ratelimit:     { label: "Rate limit",      color: "#14b8a6" },
-  anomaly:       { label: "Anomaly score",   color: "#f97316" },
-  threat_intel:  { label: "Threat intel",    color: "#dc2626" },
-  ip_reputation: { label: "IP block list",   color: "#8b5cf6" },
-  ddos:          { label: "DDoS",            color: "#be123c" },
-  ml:            { label: "ML detection",    color: "#c084fc" },
-  other:    { label: "Other",          color: "#94a3b8" },
+  geoip:         { label: "GeoIP",           color: "#ffd60a" },
+  ratelimit:     { label: "Rate limit",      color: "#66d4cf" },
+  anomaly:       { label: "Anomaly score",   color: "#ac8e68" },
+  threat_intel:  { label: "Threat intel",    color: "#d70015" },
+  ip_reputation: { label: "IP block list",   color: "#5e5ce6" },
+  ddos:          { label: "DDoS",            color: "#b0003a" },
+  ml:            { label: "ML detection",    color: "#bf5af2" },
+  other:    { label: "Other",          color: "#8e8e93" },
 };
 
 // ---------------------------------------------------------------------------
@@ -78,11 +78,11 @@ function Kpi({ icon, label, value, sub, accent, hint }: { icon: IconName; label:
   return (
     <motion.div className="panel" variants={cardVariants} style={{ padding: "14px 16px", cursor: hint ? "help" : undefined }} title={hint}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-        <div style={{ fontSize: 14, color: "var(--text3)", textTransform: "uppercase", letterSpacing: 1, fontFamily: "var(--font-mono)" }}>{label}</div>
-        <Icon name={icon} size={17} style={{ opacity: 0.7 }} />
+        <div style={{ fontSize: 13, color: "var(--text2)", fontWeight: 500, fontFamily: "var(--font-sans)" }}>{label}</div>
+        <Icon name={icon} size={17} style={{ opacity: 0.6, color: "var(--text3)" }} />
       </div>
-      <div style={{ fontSize: 27, fontWeight: 700, color: accent ?? "var(--text)", marginTop: 8, fontFamily: "var(--font-display)", lineHeight: 1 }}>{value}</div>
-      {sub && <div style={{ fontSize: 14, color: "var(--text3)", marginTop: 6, fontFamily: "var(--font-mono)" }}>{sub}</div>}
+      <div style={{ fontSize: 27, fontWeight: 600, color: accent ?? "var(--text)", marginTop: 8, fontFamily: "var(--font-display)", lineHeight: 1, letterSpacing: "-0.022em", fontVariantNumeric: "tabular-nums" }}>{value}</div>
+      {sub && <div style={{ fontSize: 13, color: "var(--text3)", marginTop: 6, fontFamily: "var(--font-sans)" }}>{sub}</div>}
     </motion.div>
   );
 }
@@ -263,10 +263,10 @@ export default function OverviewPage() {
   const s2 = metrics?.status_2xx ?? 0, s3 = metrics?.status_3xx ?? 0, s4 = metrics?.status_4xx ?? 0, s5 = metrics?.status_5xx ?? 0;
   const sTotal = s2 + s3 + s4 + s5;
   const statusSlices = [
-    { label: "2xx", v: s2, color: "#22c55e" },
-    { label: "3xx", v: s3, color: "#3b82f6" },
-    { label: "4xx", v: s4, color: "#f59e0b" },
-    { label: "5xx", v: s5, color: "#ef4444" },
+    { label: "2xx", v: s2, color: "#30d158" },
+    { label: "3xx", v: s3, color: "#0a84ff" },
+    { label: "4xx", v: s4, color: "#ff9f0a" },
+    { label: "5xx", v: s5, color: "#ff453a" },
   ];
   // Build conic-gradient stops.
   let acc = 0;
@@ -292,13 +292,11 @@ export default function OverviewPage() {
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center", flexShrink: 0 }}>
           <motion.div
-            style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 12px", background: wafStatus?.running ? "rgba(34,197,94,0.08)" : "rgba(239,68,68,0.08)", border: wafStatus?.running ? "1px solid rgba(34,197,94,0.2)" : "1px solid rgba(239,68,68,0.2)", borderRadius: 20, fontSize: 13, color: wafStatus?.running ? "#86efac" : "#fca5a5" }}
-            animate={{ boxShadow: wafStatus?.running ? ["0 0 8px rgba(34,197,94,.15)", "0 0 18px rgba(34,197,94,.3)", "0 0 8px rgba(34,197,94,.15)"] : ["0 0 8px rgba(239,68,68,.15)", "0 0 18px rgba(239,68,68,.3)", "0 0 8px rgba(239,68,68,.15)"] }}
-            transition={{ duration: 2, repeat: Infinity }}>
+            style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 12px", background: wafStatus?.running ? "var(--green-t)" : "var(--red-t)", border: "1px solid transparent", borderRadius: 20, fontSize: 13, fontWeight: 500, color: wafStatus?.running ? "var(--green)" : "var(--red-b)" }}>
             <div className={`sd ${wafStatus?.running ? "g" : "r"}`} />
             {wafStatus === null ? "WAF status: unknown" : wafStatus.running ? `WAF active · ${wafStatus.sites ?? "?"} sites · uptime ${formatUptime(wafStatus.uptime ?? 0)}` : "WAF proxy NOT running"}
           </motion.div>
-          <motion.button className="btn bg-btn btn-sm" whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }} onClick={() => {
+          <motion.button className="btn bg-btn btn-sm" whileTap={{ scale: 0.97 }} onClick={() => {
             // Real export of the current overview data (not a fake toast).
             const snap = { generated_at: new Date().toISOString(), stats, metrics, waf: wafStatus, plugins, instances, by_country: byCountry };
             const blob = new Blob([JSON.stringify(snap, null, 2)], { type: "application/json" });
@@ -308,7 +306,7 @@ export default function OverviewPage() {
             document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
             showToast("Overview snapshot exported", "s");
           }}>Export</motion.button>
-          <motion.button className="btn bp btn-sm" whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }} onClick={() => { api.dashboard.stats().then(r => { setStats(r.stats); showToast("Dashboard refreshed", "i"); }).catch(() => showToast("Refresh failed", "e")); }}>Refresh</motion.button>
+          <motion.button className="btn bp btn-sm" whileTap={{ scale: 0.97 }} onClick={() => { api.dashboard.stats().then(r => { setStats(r.stats); showToast("Dashboard refreshed", "i"); }).catch(() => showToast("Refresh failed", "e")); }}>Refresh</motion.button>
         </div>
       </motion.div>
 
@@ -321,21 +319,21 @@ export default function OverviewPage() {
         <Kpi icon="package" label="Services" hint={tip.services} value={known(statsKnown, <AnimatedValue value={stats?.active_sites ?? 0} />)} sub={wafKnown ? `${wafStatus?.upstreams_healthy ?? 0}/${wafStatus?.upstreams_total ?? 0} upstreams` : "not reported"} />
         <Kpi icon="server" label="Instances" hint={tip.inst} value={instances === null ? "—" : instances} sub={(instances ?? 1) > 1 ? "clustered" : "standalone"} />
         <Kpi icon="plug" label="Plugins" hint={tip.plugins} value={plugins === null ? "—" : plugins} sub="enabled" />
-        <Kpi icon="ban" label="Blocked" accent="#ef4444" hint={tip.blocked} value={known(metricsKnown, <AnimatedValue value={blkCount} />)} sub={statsKnown ? `${openAlerts} open alerts` : "not reported"} />
-        <Kpi icon="map-pin" label="Blocked IPs" accent="#ef4444" hint={tip.blkIPs} value={known(metricsKnown, <AnimatedValue value={uniqueIPs} />)} sub={metricsKnown ? "unique sources" : "not reported"} />
+        <Kpi icon="ban" label="Blocked" accent="var(--red-b)" hint={tip.blocked} value={known(metricsKnown, <AnimatedValue value={blkCount} />)} sub={statsKnown ? `${openAlerts} open alerts` : "not reported"} />
+        <Kpi icon="map-pin" label="Blocked IPs" accent="var(--red-b)" hint={tip.blkIPs} value={known(metricsKnown, <AnimatedValue value={uniqueIPs} />)} sub={metricsKnown ? "unique sources" : "not reported"} />
       </motion.div>
 
       {/* Live metric cards */}
       <motion.div variants={staggerContainer} style={{ display: "grid", gridTemplateColumns: "repeat(5,minmax(0,1fr))", gap: 14 }}>
-        <motion.div className="mc blue" variants={cardVariants} title={tip.rps} style={{ cursor: "help" }}><div className="mc-label">Requests / sec</div><div className="mc-val">{known(metricsKnown, <AnimatedValue value={rps} />)}</div><div className="mc-delta up">▲ 10-second rolling window</div></motion.div>
-        <motion.div className="mc red" variants={cardVariants} title={tip.blocked} style={{ cursor: "help" }}><div className="mc-label">Threats blocked</div><div className="mc-val">{known(metricsKnown, <AnimatedValue value={blkCount} />)}</div><div className="mc-delta up" title={tip.alerts}>{statsKnown ? `▲ ${openAlerts} open alerts` : "▲ alert count not reported"}</div></motion.div>
-        <motion.div className="mc green" variants={cardVariants} title={tip.p99} style={{ cursor: "help" }}><div className="mc-label">p99 Latency</div><div className="mc-val">{p99 > 0 ? p99.toFixed(2) + "ms" : "—"}</div><div className="mc-delta up">{p99Waf > 0 ? `▼ end-to-end · WAF ${p99Waf.toFixed(2)}ms of it` : "▼ end-to-end, incl. origin"}</div></motion.div>
-        <motion.div className="mc pur" variants={cardVariants} title={tip.ml} style={{ cursor: "help" }}><div className="mc-label">ML detections</div><div className="mc-val">{known(metricsKnown, <AnimatedValue value={mlDet} />)}</div><div className="mc-delta" style={{ color: "#c4b5fd" }}>{metricsKnown ? "▲ anomaly engine active" : "▲ not reported"}</div></motion.div>
+        <motion.div className="mc blue" variants={cardVariants} title={tip.rps} style={{ cursor: "help" }}><div className="mc-label">Requests / sec</div><div className="mc-val">{known(metricsKnown, <AnimatedValue value={rps} />)}</div><div className="mc-delta">10-second rolling window</div></motion.div>
+        <motion.div className="mc red" variants={cardVariants} title={tip.blocked} style={{ cursor: "help" }}><div className="mc-label">Threats blocked</div><div className="mc-val">{known(metricsKnown, <AnimatedValue value={blkCount} />)}</div><div className="mc-delta" title={tip.alerts}>{statsKnown ? `${openAlerts} open alerts` : "alert count not reported"}</div></motion.div>
+        <motion.div className="mc green" variants={cardVariants} title={tip.p99} style={{ cursor: "help" }}><div className="mc-label">p99 Latency</div><div className="mc-val">{p99 > 0 ? p99.toFixed(2) + "ms" : "—"}</div><div className="mc-delta">{p99Waf > 0 ? `End-to-end · WAF ${p99Waf.toFixed(2)}ms of it` : "End-to-end, incl. origin"}</div></motion.div>
+        <motion.div className="mc pur" variants={cardVariants} title={tip.ml} style={{ cursor: "help" }}><div className="mc-label">ML detections</div><div className="mc-val">{known(metricsKnown, <AnimatedValue value={mlDet} />)}</div><div className="mc-delta">{metricsKnown ? "Anomaly engine active" : "Not reported"}</div></motion.div>
         <motion.div className="mc cyan" variants={cardVariants} title={tip.http3} style={{ cursor: "help" }}>
           <div className="mc-label">HTTP/3</div>
           <div className="mc-val" style={{ fontSize: 25 }}>{wafKnown ? (wafStatus?.http3?.enabled ? "Active" : "Off") : "—"}</div>
-          <div className="mc-delta" style={{ color: wafStatus?.http3?.enabled ? "#67e8f9" : "var(--text3)" }}>
-            {!wafKnown ? "data plane did not report" : wafStatus?.http3?.enabled ? `▲ QUIC · :${wafStatus.http3.advertise_port ?? "443"}` : "— not enabled"}
+          <div className="mc-delta">
+            {!wafKnown ? "Data plane did not report" : wafStatus?.http3?.enabled ? `QUIC on :${wafStatus.http3.advertise_port ?? "443"}` : "Not enabled"}
           </div>
         </motion.div>
       </motion.div>
@@ -347,7 +345,7 @@ export default function OverviewPage() {
           <div className="ph"><div className="ptitle">Attack breakdown</div><span className="panel-badge pb-info">Live</span></div>
           <div className="pb">
             {attackRows.length === 0 ? (
-              <div style={{ padding: "20px 0", textAlign: "center", fontSize: 13, fontFamily: "var(--font-mono)", color: "var(--text3)" }}>No attacks detected yet</div>
+              <div style={{ padding: "20px 0", textAlign: "center", fontSize: 13, fontFamily: "var(--font-sans)", color: "var(--text3)" }}>No attacks detected yet</div>
             ) : attackRows.map(([key, count], idx) => {
               const meta = ATTACK_META[key];
               return (
@@ -380,7 +378,7 @@ export default function OverviewPage() {
               <div style={{ width: 172, height: 172, borderRadius: "50%", background: `conic-gradient(${conic})`, position: "relative" }}>
                 <div style={{ position: "absolute", inset: 23, borderRadius: "50%", background: "var(--bg2)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
                   <div style={{ fontSize: 36, fontWeight: 700, color: "var(--text)", fontFamily: "var(--font-display)", lineHeight: 1 }}>{sTotal > 0 ? `${((s2 / sTotal) * 100).toFixed(0)}%` : "—"}</div>
-                  <div style={{ fontSize: 12, color: "var(--text3)", marginTop: 5, letterSpacing: 1, textTransform: "uppercase", fontFamily: "var(--font-mono)" }}>success</div>
+                  <div style={{ fontSize: 12, color: "var(--text3)", marginTop: 5, fontFamily: "var(--font-sans)" }}>Success</div>
                 </div>
               </div>
             </div>
@@ -390,12 +388,12 @@ export default function OverviewPage() {
               {statusSlices.map(s => (
                 <div key={s.label} style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 14 }}>
                   <span style={{ width: 10, height: 10, borderRadius: 2, background: s.color, flexShrink: 0 }} />
-                  <span style={{ color: "var(--text2)", width: 30, fontFamily: "var(--font-mono)", flexShrink: 0 }}>{s.label}</span>
+                  <span style={{ color: "var(--text2)", width: 30, fontFamily: "var(--font-sans)", flexShrink: 0 }}>{s.label}</span>
                   <div className="atk-bar-bg" style={{ flex: 1 }}>
                     <div className="atk-bar" style={{ width: `${sTotal > 0 ? (s.v / sTotal) * 100 : 0}%`, background: s.color }} />
                   </div>
-                  <span style={{ color: "var(--text)", fontFamily: "var(--font-mono)", width: 48, textAlign: "right", flexShrink: 0 }}>{s.v.toLocaleString()}</span>
-                  <span style={{ color: "var(--text3)", fontFamily: "var(--font-mono)", width: 38, textAlign: "right", flexShrink: 0 }}>{sTotal > 0 ? `${((s.v / sTotal) * 100).toFixed(0)}%` : "—"}</span>
+                  <span style={{ color: "var(--text)", fontFamily: "var(--font-sans)", width: 48, textAlign: "right", flexShrink: 0 }}>{s.v.toLocaleString()}</span>
+                  <span style={{ color: "var(--text3)", fontFamily: "var(--font-sans)", width: 38, textAlign: "right", flexShrink: 0 }}>{sTotal > 0 ? `${((s.v / sTotal) * 100).toFixed(0)}%` : "—"}</span>
                 </div>
               ))}
             </div>
@@ -403,13 +401,13 @@ export default function OverviewPage() {
             {/* Summary footer */}
             <div style={{ display: "flex", alignItems: "stretch", gap: 12, borderTop: "1px solid var(--bg4)", paddingTop: 16 }}>
               <div style={{ flex: 1, textAlign: "center" }}>
-                <div style={{ fontSize: 21, fontWeight: 700, color: "#22c55e", fontFamily: "var(--font-display)", lineHeight: 1 }}>{sTotal > 0 ? `${(((s2 + s3) / sTotal) * 100).toFixed(1)}%` : "—"}</div>
-                <div style={{ fontSize: 11, color: "var(--text3)", letterSpacing: 1, textTransform: "uppercase", marginTop: 5, fontFamily: "var(--font-mono)" }}>OK · 2xx/3xx</div>
+                <div style={{ fontSize: 21, fontWeight: 600, color: "var(--green)", fontFamily: "var(--font-display)", lineHeight: 1, letterSpacing: "-0.02em", fontVariantNumeric: "tabular-nums" }}>{sTotal > 0 ? `${(((s2 + s3) / sTotal) * 100).toFixed(1)}%` : "—"}</div>
+                <div style={{ fontSize: 12, color: "var(--text3)", marginTop: 5, fontFamily: "var(--font-sans)" }}>OK · 2xx/3xx</div>
               </div>
               <div style={{ width: 1, background: "var(--bg4)" }} />
               <div style={{ flex: 1, textAlign: "center" }}>
-                <div style={{ fontSize: 21, fontWeight: 700, color: "#ef4444", fontFamily: "var(--font-display)", lineHeight: 1 }}>{(s4 + s5).toLocaleString()}</div>
-                <div style={{ fontSize: 11, color: "var(--text3)", letterSpacing: 1, textTransform: "uppercase", marginTop: 5, fontFamily: "var(--font-mono)" }}>Errors · 4xx/5xx</div>
+                <div style={{ fontSize: 21, fontWeight: 600, color: "var(--red-b)", fontFamily: "var(--font-display)", lineHeight: 1, letterSpacing: "-0.02em", fontVariantNumeric: "tabular-nums" }}>{(s4 + s5).toLocaleString()}</div>
+                <div style={{ fontSize: 12, color: "var(--text3)", marginTop: 5, fontFamily: "var(--font-sans)" }}>Errors · 4xx/5xx</div>
               </div>
             </div>
           </div>
@@ -431,7 +429,7 @@ export default function OverviewPage() {
           <div className="ph"><div className="ptitle">Recent events</div><span className="panel-badge pb-live">Live</span></div>
           <div className="pb">
             {feed.length === 0 ? (
-              <div style={{ padding: "16px 0", textAlign: "center", fontSize: 13, fontFamily: "var(--font-mono)", color: "var(--text3)" }}>Waiting for events…</div>
+              <div style={{ padding: "16px 0", textAlign: "center", fontSize: 13, fontFamily: "var(--font-sans)", color: "var(--text3)" }}>Waiting for events…</div>
             ) : feed.slice(0, 7).map((r, i) => {
               const dotCls = r.st === 403 || r.st === 400 ? "ev-red" : r.st >= 500 || r.latency > 3 ? "ev-amber" : r.m === "POST" || r.m === "PUT" ? "ev-blue" : "ev-green";
               const label = r.st === 403 ? `Blocked — ${r.m} ${r.path}` : r.st >= 500 ? `Error — ${r.m} ${r.path}` : `${r.m} ${r.path}`;
@@ -469,7 +467,7 @@ function AlertsPreview() {
       </div>
       <div className="tw">
         {alerts.length === 0 ? (
-          <div style={{ padding: "16px", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--text3)", textAlign: "center" }}>No open alerts</div>
+          <div style={{ padding: "16px", fontFamily: "var(--font-sans)", fontSize: 13, color: "var(--text3)", textAlign: "center" }}>No open alerts</div>
         ) : (
           <table>
             <thead><tr><th>Severity</th><th>Time</th><th>Kind</th><th>Summary</th><th>State</th></tr></thead>
@@ -496,7 +494,7 @@ function AlertsPreview() {
 // ---------------------------------------------------------------------------
 function CardMsg({ text }: { text: string }) {
   return (
-    <div style={{ padding: "22px 8px", textAlign: "center", fontSize: 13, lineHeight: 1.55, fontFamily: "var(--font-mono)", color: "var(--text3)" }}>
+    <div style={{ padding: "22px 8px", textAlign: "center", fontSize: 13, lineHeight: 1.55, fontFamily: "var(--font-sans)", color: "var(--text3)" }}>
       {text}
     </div>
   );
@@ -659,7 +657,7 @@ function RuleEngineHealth({ metrics, running }: { metrics: MetricsSnapshot | nul
             initial={{ opacity: 0, x: -4 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: 0.05 * idx }}>
             <div className="rule-name">
               {row.name}
-              <span style={{ display: "block", fontSize: 11, fontWeight: 400, marginTop: 2, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>{row.sub}</span>
+              <span style={{ display: "block", fontSize: 11, fontWeight: 400, marginTop: 2, color: "var(--text3)", fontFamily: "var(--font-sans)" }}>{row.sub}</span>
             </div>
             <span className={`rule-st ${row.loading ? "rs-warn" : row.on ? "rs-on" : row.empty ? "rs-idle" : "rs-warn"}`}
               title={row.empty ? "Nothing has been added here yet — this is not a disabled feature" : undefined}>
@@ -776,10 +774,10 @@ function SystemHealth({ wafRunning, geoip }: { wafRunning: boolean | null; geoip
         {rows.map((row, idx) => (
           <motion.div key={row.name}
             initial={{ opacity: 0, x: -4 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: 0.05 * idx }}
-            style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 0", borderBottom: idx < rows.length - 1 ? "1px solid rgba(255,255,255,.04)" : "none" }}>
+            style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 0", borderBottom: idx < rows.length - 1 ? "1px solid var(--sep-row)" : "none" }}>
             <span className={`sd ${row.level}`} />
             <span style={{ flex: 1, fontSize: 13, color: "var(--text2)" }}>{row.name}</span>
-            <span style={{ fontSize: 13, fontFamily: "var(--font-mono)", color: valColor[row.level] }}>{row.value}</span>
+            <span style={{ fontSize: 13, fontFamily: "var(--font-sans)", color: valColor[row.level] }}>{row.value}</span>
           </motion.div>
         ))}
       </div>

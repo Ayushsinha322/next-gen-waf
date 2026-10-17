@@ -26,9 +26,9 @@ const GROUP_META: Record<string, { title: string; blurb: string }> = {
 
 function SourcePill({ s }: { s: GlobalSetting["source"] }) {
   const map = {
-    db:      { label: "set here",   bg: "rgba(60,180,110,.14)",  fg: "var(--green)",  tip: "Operator override stored in the control plane" },
-    env:     { label: "from env",   bg: "rgba(224,166,58,.14)",  fg: "var(--amber)",  tip: "Comes from the control plane's environment variable" },
-    default: { label: "default",    bg: "rgba(120,130,150,.12)", fg: "var(--text3)",  tip: "Built-in default" },
+    db:      { label: "set here",   bg: "var(--green-t)",  fg: "var(--green)",  tip: "Operator override stored in the control plane" },
+    env:     { label: "from env",   bg: "var(--amber-t)",  fg: "var(--amber)",  tip: "Comes from the control plane's environment variable" },
+    default: { label: "default",    bg: "var(--gray-t)", fg: "var(--text3)",  tip: "Built-in default" },
   }[s];
   return <span className="bdg" title={map.tip} style={{ textTransform: "none", background: map.bg, color: map.fg }}>{map.label}</span>;
 }
@@ -154,7 +154,7 @@ export default function GlobalSettingsPage() {
         </div>
         <div style={{ display: "flex", gap: 8 }}>
           <button className="btn bg-btn btn-sm" onClick={load}>⟳ Refresh</button>
-          <motion.button className="btn bp btn-sm" disabled={!dirty || saving} onClick={save} whileHover={{ scale: dirty ? 1.03 : 1 }} whileTap={{ scale: 0.97 }}>
+          <motion.button className="btn bp btn-sm" disabled={!dirty || saving} onClick={save} whileTap={{ scale: 0.97 }}>
             {saving ? "Saving…" : dirty ? `Save ${Object.keys(draft).length} change${Object.keys(draft).length === 1 ? "" : "s"}` : "No changes"}
           </motion.button>
         </div>
@@ -187,7 +187,7 @@ export default function GlobalSettingsPage() {
                     const pending = k.key in draft;
                     const cur = pending ? draft[k.key] : k.value;
                     return (
-                      <tr key={k.key} style={pending ? { background: "rgba(0,200,240,0.05)" } : undefined}>
+                      <tr key={k.key} style={pending ? { background: "var(--accent-tint)" } : undefined}>
                         <td>
                           <div style={{ fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--cyan)" }}>{k.key}</div>
                           <div className="td3" style={{ fontSize: 12.5, whiteSpace: "normal", lineHeight: 1.45, marginTop: 2 }}>{k.description}</div>
@@ -202,7 +202,7 @@ export default function GlobalSettingsPage() {
                           ) : k.type === "int" ? (
                             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                               <input className="fin2" type="number" value={String(cur ?? "")} onChange={e => setField(k, e.target.value)} style={{ width: 130 }} />
-                              <span className="td3" style={{ fontSize: 12, fontFamily: "var(--font-mono)" }}>{k.unit === "seconds" ? fmtVal(cur, "seconds") : k.unit ?? ""}</span>
+                              <span className="td3" style={{ fontSize: 12, fontFamily: "var(--font-sans)" }}>{k.unit === "seconds" ? fmtVal(cur, "seconds") : k.unit ?? ""}</span>
                             </div>
                           ) : (
                             <input className="fin2" type="text" value={String(cur ?? "")} onChange={e => setField(k, e.target.value)} placeholder={k.unit === "url" ? "https://… or off" : ""} style={{ width: "100%", fontFamily: "var(--font-mono)", fontSize: 12.5 }} />
@@ -232,7 +232,7 @@ export default function GlobalSettingsPage() {
         </div>
         <div className="pb" style={{ display: "flex", flexDirection: "column", gap: 14 }}>
           {!dp ? (
-            <div className="td3" style={{ fontFamily: "var(--font-mono)", fontSize: 13 }}>Loading…</div>
+            <div className="td3" style={{ fontFamily: "var(--font-sans)", fontSize: 13 }}>Loading…</div>
           ) : !dp.reachable ? (
             <div className="code-block" style={{ borderLeft: "3px solid var(--red-b)" }}>
               <span style={{ color: "var(--red-b)" }}>● DATA PLANE UNREACHABLE</span> — {dp.error}. Nothing below is known.
@@ -277,7 +277,7 @@ export default function GlobalSettingsPage() {
                   ["Cert directory", String(cfg.cert_dir ?? "default")],
                 ].map(([label, val]) => (
                   <div key={label} style={{ border: "1px solid var(--border)", borderRadius: 6, padding: "10px 12px" }}>
-                    <div className="td3" style={{ fontSize: 11, letterSpacing: ".04em", textTransform: "uppercase" }}>{label}</div>
+                    <div className="td3" style={{ fontSize: 11 }}>{label}</div>
                     <div style={{ fontFamily: "var(--font-mono)", fontSize: 13, marginTop: 4, wordBreak: "break-all" }}>{val}</div>
                   </div>
                 ))}

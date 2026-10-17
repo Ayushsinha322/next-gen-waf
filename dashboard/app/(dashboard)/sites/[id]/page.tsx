@@ -24,8 +24,8 @@ type Tab = "overview" | "waf" | "access" | "learning" | "paths" | "cert" | "conf
 
 const MODES = [
   { key: "off",      label: "Off",      desc: "WAF disabled — pass-through",         color: "var(--text3)" },
-  { key: "learning", label: "Learning", desc: "Log only · no traffic impact",        color: "var(--amber, #ffb020)" },
-  { key: "blocking", label: "Blocking", desc: "Enforce · block malicious requests",  color: "#ef4444" },
+  { key: "learning", label: "Learning", desc: "Log only · no traffic impact",        color: "var(--amber)" },
+  { key: "blocking", label: "Blocking", desc: "Enforce · block malicious requests",  color: "var(--red-b)" },
 ] as const;
 
 function timePart(ts: unknown): string {
@@ -223,7 +223,7 @@ export default function SiteDetailPage() {
     catch { showToast("Failed to delete", "e"); }
   }
 
-  if (loading) return <div className="sec"><div style={{ padding: 40, textAlign: "center", color: "var(--text3)", fontFamily: "var(--font-mono)", fontSize: 14 }}>Loading site…</div></div>;
+  if (loading) return <div className="sec"><div style={{ padding: 40, textAlign: "center", color: "var(--text3)", fontFamily: "var(--font-sans)", fontSize: 14 }}>Loading site…</div></div>;
   if (!site || !form) return <div className="sec"><div style={{ padding: 40, textAlign: "center", color: "var(--text3)" }}>Site not found. <button className="btn bg-btn btn-sm" onClick={() => router.push("/sites")}>← Back</button></div></div>;
 
   const scheme = form.front_https ? "https" : "http";
@@ -250,7 +250,7 @@ export default function SiteDetailPage() {
       {/* Header */}
       <motion.div variants={fadeUp} style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 14 }}>
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-          <button onClick={() => router.push("/sites")} style={{ background: "none", border: "none", color: "var(--text3)", cursor: "pointer", fontSize: 13, padding: 0, textAlign: "left", fontFamily: "var(--font-mono)" }}>← All sites</button>
+          <button onClick={() => router.push("/sites")} style={{ background: "none", border: "none", color: "var(--text3)", cursor: "pointer", fontSize: 13, padding: 0, textAlign: "left", fontFamily: "var(--font-sans)" }}>← All sites</button>
           <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
             <div className="sec-title">{site.name}</div>
             <span className={`bdg ${site.status === "active" ? "bgg" : "bgr"}`}>{site.status}</span>
@@ -262,7 +262,7 @@ export default function SiteDetailPage() {
         <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
           <button className="btn bc btn-sm" onClick={() => setEditing(true)}>Edit</button>
           <button className="btn bg-btn btn-sm" onClick={toggleStatus}>{site.status === "active" ? "⏸ Pause" : "▶ Activate"}</button>
-          <button className="btn bg-btn btn-sm" onClick={del} style={{ color: "#ef4444" }}>Delete</button>
+          <button className="btn bg-btn btn-sm" onClick={del} style={{ color: "var(--red-b)" }}>Delete</button>
         </div>
       </motion.div>
 
@@ -289,7 +289,7 @@ export default function SiteDetailPage() {
         </div>
         {mode === "learning" && (
           <div className="pb" style={{ paddingTop: 0 }}>
-            <div style={{ padding: "9px 13px", background: "rgba(255,176,32,.08)", border: "1px solid rgba(255,176,32,.25)", borderRadius: "var(--r2)", fontSize: 12.5, color: "var(--text3)", fontFamily: "var(--font-mono)", lineHeight: 1.6 }}>
+            <div style={{ padding: "9px 13px", background: "var(--amber-t)", border: "1px solid color-mix(in srgb, var(--amber) 32%, transparent)", borderRadius: "var(--r2)", fontSize: 12.5, color: "var(--text3)", fontFamily: "var(--font-sans)", lineHeight: 1.6 }}>
               In Learning mode the WAF logs what it <strong>would</strong> block without affecting traffic. Watch the <strong>WAF Logs</strong> tab below, then switch to <strong>Blocking</strong> when false-positives are tuned out.
             </div>
           </div>
@@ -300,14 +300,14 @@ export default function SiteDetailPage() {
       <motion.div variants={staggerContainer} style={{ display: "grid", gridTemplateColumns: "repeat(5,1fr)", gap: 12 }}>
         {[
           { lbl: "Requests", val: stat ? stat.total.toLocaleString() : "—", ico: "activity" as IconName, accent: "var(--text)" },
-          { lbl: "Blocked", val: stat ? stat.blocked.toLocaleString() : "—", ico: "ban" as IconName, accent: "#ef4444" },
+          { lbl: "Blocked", val: stat ? stat.blocked.toLocaleString() : "—", ico: "ban" as IconName, accent: "var(--red)" },
           { lbl: "Block rate", val: stat ? `${blockRate.toFixed(1)}%` : "—", ico: "bar-chart" as IconName, accent: "var(--cyan)" },
-          { lbl: "4xx / 5xx", val: stat ? `${stat.status_4xx} / ${stat.status_5xx}` : "—", ico: "alert-triangle" as IconName, accent: "var(--amber,#ffb020)" },
+          { lbl: "4xx / 5xx", val: stat ? `${stat.status_4xx} / ${stat.status_5xx}` : "—", ico: "alert-triangle" as IconName, accent: "var(--amber)" },
           { lbl: "Certificate", val: cert ? (certDays !== null ? `${certDays}d` : "active") : "none", ico: "lock" as IconName, accent: cert ? "var(--green)" : "var(--text3)" },
         ].map((k, i) => (
           <motion.div key={i} className="panel" variants={cardVariants} style={{ padding: "13px 15px" }}>
             <div style={{ display: "flex", justifyContent: "space-between" }}>
-              <span style={{ fontSize: 14, color: "var(--text3)", textTransform: "uppercase", letterSpacing: 1, fontFamily: "var(--font-mono)" }}>{k.lbl}</span>
+              <span style={{ fontSize: 14, color: "var(--text3)", fontFamily: "var(--font-sans)" }}>{k.lbl}</span>
               <Icon name={k.ico} size={15} />
             </div>
             <div style={{ fontSize: 25, fontWeight: 700, color: k.accent, marginTop: 6, fontFamily: "var(--font-display)" }}>{k.val}</div>
@@ -316,11 +316,13 @@ export default function SiteDetailPage() {
       </motion.div>
 
       {/* Tabs */}
-      <motion.div variants={fadeUp} style={{ display: "flex", gap: 4, padding: 4, background: "var(--bg3)", borderRadius: 10, width: "fit-content" }}>
+      <motion.div className="seg" variants={fadeUp} style={{ display: "flex", gap: 4, padding: 4, background: "var(--fill)", borderRadius: 10, width: "fit-content" }}>
         {([["overview", "Overview"], ["waf", "WAF Logs"], ["access", "Access Logs"], ["learning", "Learning Report"], ["paths", "Path Policy"], ["cert", "Certificate"], ["config", "Effective Config"]] as [Tab, string][]).map(([k, label]) => (
           <button key={k} onClick={() => setTab(k)} style={{
-            padding: "7px 16px", borderRadius: 7, border: "none", cursor: "pointer", fontSize: 14, fontWeight: 600,
-            background: tab === k ? "var(--cyan)" : "transparent", color: tab === k ? "#021018" : "var(--text2)",
+            padding: "7px 16px", borderRadius: 7, border: "none", cursor: "pointer", fontSize: 14, fontWeight: 500,
+            background: tab === k ? "var(--seg-on)" : "transparent", color: tab === k ? "var(--text)" : "var(--text2)",
+            boxShadow: tab === k ? "0 1px 2px rgba(0,0,0,.18), 0 0 0 0.5px rgba(0,0,0,.04)" : "none",
+            transition: "background-color .18s, color .18s",
           }}>{label}</button>
         ))}
       </motion.div>
@@ -435,7 +437,7 @@ export default function SiteDetailPage() {
           {tab === "learning" && (
             <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
               <div style={{
-                fontSize: 13, color: "var(--text3)", lineHeight: 1.7, fontFamily: "var(--font-mono)",
+                fontSize: 13, color: "var(--text3)", lineHeight: 1.7, fontFamily: "var(--font-sans)",
                 background: "var(--bg3)", borderRadius: 8, padding: "10px 14px",
               }}>
                 {mode === "learning"
@@ -539,7 +541,7 @@ export default function SiteDetailPage() {
                     One site normally means one policy, which is necessarily wrong somewhere:
                     strict enough for an API is too strict for content pages, and static assets
                     need no inspection at all. These override the site policy
-                    (<span style={{ fontFamily: "var(--font-mono)" }}>mode {form.mode} · threshold {form.anomaly_threshold}</span>)
+                    (<span style={{ fontFamily: "var(--font-sans)" }}>mode {form.mode} · threshold {form.anomaly_threshold}</span>)
                     for requests whose path starts with the given prefix.
                     <br />
                     <strong>Longest matching prefix wins</strong>, so
@@ -689,7 +691,7 @@ export default function SiteDetailPage() {
                 {!cert ? (
                   <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
                     <Empty text="No certificate installed for this site's domains." />
-                    <div style={{ fontSize: 13, color: "var(--text3)", lineHeight: 1.7, fontFamily: "var(--font-mono)" }}>
+                    <div style={{ fontSize: 13, color: "var(--text3)", lineHeight: 1.7, fontFamily: "var(--font-sans)" }}>
                       Configure TLS in <button className="btn bg-btn btn-xs" onClick={() => setEditing(true)}>Edit → Front Service</button>. With automatic ACME, a cert is requested on save (once DNS points here). Self-signed is served until then.
                     </div>
                   </div>
@@ -707,7 +709,7 @@ export default function SiteDetailPage() {
                           <span>Validity</span><span>{certDays} days remaining</span>
                         </div>
                         <div style={{ height: 7, background: "var(--bg3)", borderRadius: 4, overflow: "hidden" }}>
-                          <div style={{ height: "100%", width: `${Math.max(3, Math.min(100, (certDays / 90) * 100))}%`, background: certDays < 14 ? "#ef4444" : certDays < 30 ? "var(--amber,#ffb020)" : "var(--green)", borderRadius: 4 }} />
+                          <div style={{ height: "100%", width: `${Math.max(3, Math.min(100, (certDays / 90) * 100))}%`, background: certDays < 14 ? "var(--red)" : certDays < 30 ? "var(--amber)" : "var(--green)", borderRadius: 4 }} />
                         </div>
                       </div>
                     )}
@@ -835,9 +837,9 @@ function EffectiveConfigPanel({ eff, err, onRefresh }: { eff: EffectiveConfig | 
 
           {showJSON && (
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-              <div><div className="td3" style={{ fontSize: 11, letterSpacing: ".04em", textTransform: "uppercase", marginBottom: 4 }}>pushed</div>
+              <div><div className="td3" style={{ fontSize: 11, marginBottom: 4 }}>pushed</div>
                 <pre className="code-block" style={{ maxHeight: 460, overflow: "auto", fontSize: 11.5 }}>{JSON.stringify(eff.pushed ?? null, null, 2)}</pre></div>
-              <div><div className="td3" style={{ fontSize: 11, letterSpacing: ".04em", textTransform: "uppercase", marginBottom: 4 }}>held{dp.version ? ` · data plane ${dp.version}` : ""}</div>
+              <div><div className="td3" style={{ fontSize: 11, marginBottom: 4 }}>held{dp.version ? ` · data plane ${dp.version}` : ""}</div>
                 <pre className="code-block" style={{ maxHeight: 460, overflow: "auto", fontSize: 11.5 }}>{JSON.stringify(eff.applied ?? null, null, 2)}</pre></div>
             </div>
           )}

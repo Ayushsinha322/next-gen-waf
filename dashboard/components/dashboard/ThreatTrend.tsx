@@ -11,10 +11,10 @@ import { useState, useEffect, useMemo } from "react";
 import { api, type SeverityBucket } from "@/lib/api";
 
 const SERIES = [
-  { key: "high",   label: "High",   color: "#ef4444" },
-  { key: "medium", label: "Medium", color: "#f59e0b" },
-  { key: "low",    label: "Low",    color: "#3b82f6" },
-  { key: "info",   label: "Info",   color: "#22c55e" },
+  { key: "high",   label: "High",   color: "#ff453a" },
+  { key: "medium", label: "Medium", color: "#ff9f0a" },
+  { key: "low",    label: "Low",    color: "#0a84ff" },
+  { key: "info",   label: "Info",   color: "#30d158" },
 ] as const;
 
 const RANGES = [
@@ -90,7 +90,7 @@ export default function ThreatTrend() {
           onChange={e => setRangeIdx(Number(e.target.value))}
           style={{
             background: "var(--bg2)", color: "var(--text2)", border: "1px solid var(--bg4)",
-            borderRadius: 8, padding: "4px 10px", fontSize: 13, fontFamily: "var(--font-mono)", cursor: "pointer",
+            borderRadius: 8, padding: "4px 10px", fontSize: 13, fontFamily: "var(--font-sans)", cursor: "pointer",
           }}>
           {RANGES.map((r, i) => <option key={r.label} value={i}>{r.label}</option>)}
         </select>
@@ -100,9 +100,9 @@ export default function ThreatTrend() {
       <div style={{ display: "flex", gap: 16, flexWrap: "wrap", padding: "10px 16px 2px" }}>
         {SERIES.map((s, i) => (
           <div key={s.key} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, color: "var(--text2)" }}>
-            <span style={{ width: 10, height: 10, borderRadius: 2, background: s.color, boxShadow: `0 0 6px ${s.color}66` }} />
+            <span style={{ width: 10, height: 10, borderRadius: 2, background: s.color }} />
             {s.label}
-            <span style={{ color: "var(--text3)", fontFamily: "var(--font-mono)" }}>{totals[i].toLocaleString()}</span>
+            <span style={{ color: "var(--text3)", fontFamily: "var(--font-sans)" }}>{totals[i].toLocaleString()}</span>
           </div>
         ))}
       </div>
@@ -121,8 +121,8 @@ export default function ThreatTrend() {
               const y = PAD.t + (CH * i) / 4;
               return (
                 <g key={i}>
-                  <line x1={PAD.l} y1={y} x2={VBW - PAD.r} y2={y} stroke="rgba(128,128,128,.12)" strokeWidth={1} />
-                  <text x={PAD.l - 6} y={y + 3} textAnchor="end" fontSize={10} fill="rgba(128,140,160,.65)" fontFamily="var(--font-mono)">
+                  <line x1={PAD.l} y1={y} x2={VBW - PAD.r} y2={y} style={{ stroke: "var(--sep-row)" }} strokeWidth={1} />
+                  <text x={PAD.l - 6} y={y + 3} textAnchor="end" fontSize={10} style={{ fill: "var(--text3)" }} fontFamily="var(--font-sans)">
                     {yTicks[4 - i]}
                   </text>
                 </g>
@@ -131,7 +131,7 @@ export default function ThreatTrend() {
             {/* x time labels */}
             {xTickIdx.map((idx, k) => (
               <text key={k} x={px(idx)} y={VBH - 8} textAnchor={k === 0 ? "start" : k === xTickIdx.length - 1 ? "end" : "middle"}
-                fontSize={10} fill="rgba(128,140,160,.65)" fontFamily="var(--font-mono)">
+                fontSize={10} style={{ fill: "var(--text3)" }} fontFamily="var(--font-sans)">
                 {fmtClock(b[idx].ts)}
               </text>
             ))}
@@ -152,7 +152,7 @@ export default function ThreatTrend() {
 
 function Msg({ text }: { text: string }) {
   return (
-    <div style={{ height: 150, display: "flex", alignItems: "center", justifyContent: "center", textAlign: "center", padding: "0 12px", fontSize: 13, lineHeight: 1.5, fontFamily: "var(--font-mono)", color: "var(--text3)" }}>
+    <div style={{ height: 150, display: "flex", alignItems: "center", justifyContent: "center", textAlign: "center", padding: "0 12px", fontSize: 13, lineHeight: 1.5, fontFamily: "var(--font-sans)", color: "var(--text3)" }}>
       {text}
     </div>
   );

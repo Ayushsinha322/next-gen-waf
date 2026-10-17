@@ -21,10 +21,10 @@ type Dict = Record<string, string>;
 
 export const en: Dict = {
   // navigation
-  "nav.group.monitor": "MONITOR",
-  "nav.group.protect": "PROTECT",
-  "nav.group.intelligence": "INTELLIGENCE",
-  "nav.group.system": "SYSTEM",
+  "nav.group.monitor": "Monitor",
+  "nav.group.protect": "Protect",
+  "nav.group.intelligence": "Intelligence",
+  "nav.group.system": "System",
   "nav.overview": "Overview",
   "nav.traffic": "Traffic",
   "nav.alerts": "Alerts",

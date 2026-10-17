@@ -76,7 +76,7 @@ function StageBox({ icon, title, sub, tone }: { icon: IconName; title: string; s
 function Connector({ color }: { color?: string }) {
   return (
     <div style={{ flex: "0 0 auto", display: "flex", alignItems: "center", minWidth: 34 }} aria-hidden>
-      <div style={{ height: 2, flex: 1, background: `linear-gradient(90deg, ${color ?? "var(--cyan-ring)"}, ${color ?? "var(--cyan)"})`, borderRadius: 2 }} />
+      <div style={{ height: 2, flex: 1, background: color ?? "var(--accent-line)", borderRadius: 2 }} />
       <span style={{ color: color ?? "var(--cyan)", fontSize: 13, marginLeft: -2 }}>▸</span>
     </div>
   );
@@ -135,7 +135,7 @@ Fleet-wide health of the WAF data plane and control plane — live topology, fai
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center", flexShrink: 0 }}>
           {health && <span className="panel-badge pb-live">● Live</span>}
-          <motion.button className="btn bg-btn btn-sm" whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}
+          <motion.button className="btn bg-btn btn-sm" whileTap={{ scale: 0.97 }}
             onClick={() => api.cluster.health().then(setHealth).catch(() => {})}>⟳ Refresh</motion.button>
         </div>
       </motion.div>
@@ -150,17 +150,17 @@ Fleet-wide health of the WAF data plane and control plane — live topology, fai
           }}>
             <div style={{
               display: "inline-flex", alignItems: "center", gap: 10, alignSelf: "flex-start",
-              padding: "8px 18px", borderRadius: 24, fontFamily: ORB, fontWeight: 700, fontSize: 22, letterSpacing: 1,
+              padding: "8px 18px", borderRadius: 24, fontFamily: ORB, fontWeight: 700, fontSize: 22, letterSpacing: "-0.015em",
               color: overallColor(health?.overall),
               background: `color-mix(in srgb, ${overallColor(health?.overall)} 14%, transparent)`,
-              border: `1px solid color-mix(in srgb, ${overallColor(health?.overall)} 40%, transparent)`,
+              border: "1px solid transparent",
             }}>
               <span className={`sd ${statusDot(health?.overall === "critical" ? "down" : health?.overall === "degraded" ? "degraded" : health?.overall === "healthy" ? "healthy" : undefined)}`} />
-              {health ? health.overall.toUpperCase() : "—"}
+              {health ? health.overall.charAt(0).toUpperCase() + health.overall.slice(1) : "—"}
             </div>
-            <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 14, fontFamily: MONO, color: health?.protection_active ? "var(--green)" : "var(--red)" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 14, fontWeight: 500, fontFamily: "var(--font-sans)", color: health?.protection_active ? "var(--green)" : "var(--red-b)" }}>
               <span className={`sd ${health?.protection_active ? "g" : "r"}`} />
-              Protection: {health ? (health.protection_active ? "ACTIVE" : "AT RISK") : "—"}
+              {health ? (health.protection_active ? "Protection active" : "Protection at risk") : "Protection: —"}
             </div>
             {/* A fleet is most often degraded because the APPLICATION behind it is
                 unreachable, not because the WAF is unwell — inspection carries on
@@ -227,7 +227,7 @@ Fleet-wide health of the WAF data plane and control plane — live topology, fai
               display: "flex", flexDirection: "column", gap: 8, padding: "14px 14px", borderRadius: "var(--r)",
               background: "var(--cyan-dim)", border: "1px dashed var(--cyan-ring)", minWidth: 150,
             }}>
-              <div style={{ fontSize: 12, fontFamily: MONO, color: "var(--text3)", textTransform: "uppercase", letterSpacing: 1, textAlign: "center" }}>WAF Fleet</div>
+              <div style={{ fontSize: 12, fontFamily: "var(--font-sans)", color: "var(--text3)", textAlign: "center" }}>WAF Fleet</div>
               {dpNodes.length === 0 ? (
                 <div style={{ fontSize: 13, fontFamily: MONO, color: "var(--text3)", textAlign: "center", padding: "8px 0" }}>—</div>
               ) : dpNodes.map(n => {
@@ -284,12 +284,12 @@ Fleet-wide health of the WAF data plane and control plane — live topology, fai
                     required. Showing a quorum bar would imply a constraint that
                     does not exist. */}
                 <div style={{ marginBottom: 14 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, fontFamily: MONO, marginBottom: 6 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, fontFamily: "var(--font-sans)", marginBottom: 6 }}>
                     <span style={{ color: "var(--text3)" }}>
                       Nodes online{cp.leader_id ? ` · leader ${cp.leader_id}` : ""}
                     </span>
                     <span style={{ color: cp.write_available ? "var(--green)" : "var(--red)", fontWeight: 700 }}>
-                      {cp.healthy}/{cp.total} — {cp.write_available ? "WRITES AVAILABLE" : "NO WRITE LEADER"}
+                      {cp.healthy}/{cp.total} — {cp.write_available ? "writes available" : "no write leader"}
                     </span>
                   </div>
                   <div style={{ display: "flex", gap: 4 }}>
@@ -433,7 +433,7 @@ Fleet-wide health of the WAF data plane and control plane — live topology, fai
                     </tr>
                     {open && (
                       <tr>
-                        <td colSpan={10} style={{ background: "rgba(255,255,255,.015)", padding: "12px 18px" }}>
+                        <td colSpan={10} style={{ background: "var(--fill-soft)", padding: "12px 18px" }}>
                           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(210px, 1fr))", gap: 12 }}>
                             {([
                               ["Listeners", (n.listeners && n.listeners.length) ? n.listeners.join("  ") : "not reported"],
@@ -445,9 +445,9 @@ Fleet-wide health of the WAF data plane and control plane — live topology, fai
                               ["Upstreams", `${n.upstreams_healthy} healthy of ${n.upstreams_total}`],
                               ["Last heartbeat", `${fmtAgoSec(n.seconds_since_seen)} · uptime ${fmtUptime(n.uptime_secs)}`],
                             ] as [string, string][]).map(([k, v]) => (
-                              <div key={k} style={{ border: "1px solid var(--border)", borderRadius: 6, padding: "8px 10px" }}>
-                                <div className="td3" style={{ fontSize: 11, letterSpacing: ".04em", textTransform: "uppercase" }}>{k}</div>
-                                <div style={{ fontFamily: MONO, fontSize: 12.5, marginTop: 3, wordBreak: "break-word" }}>{v}</div>
+                              <div key={k} style={{ minWidth: 0, background: "var(--card)", border: "1px solid var(--card-bd)", borderRadius: 8, padding: "8px 10px" }}>
+                                <div className="td3" style={{ fontSize: 12 }}>{k}</div>
+                                <div style={{ fontFamily: MONO, fontSize: 12.5, marginTop: 3, whiteSpace: "normal", overflowWrap: "anywhere", lineHeight: 1.45 }}>{v}</div>
                               </div>
                             ))}
                           </div>

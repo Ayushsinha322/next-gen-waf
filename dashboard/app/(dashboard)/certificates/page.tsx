@@ -77,7 +77,7 @@ function lifeBar(c: Certificate) {
   const color = d <= 7 ? "var(--red)" : d <= 30 ? "var(--amber)" : "var(--green)";
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-      <div style={{ flex: 1, height: 6, background: "rgba(255,255,255,.06)", borderRadius: 3, overflow: "hidden", minWidth: 80 }}>
+      <div style={{ flex: 1, height: 6, background: "var(--fill)", borderRadius: 3, overflow: "hidden", minWidth: 80 }}>
         <div style={{ width: `${pct}%`, height: "100%", background: color, transition: "width .4s" }} />
       </div>
       <span className="td3" style={{ minWidth: 64, textAlign: "right" }}>
@@ -263,7 +263,7 @@ export default function CertificatesPage() {
                    : <span style={{ color: "var(--amber)" }}>data plane offline</span>}
           </div>
         </div>
-        <motion.button className="btn bg-btn btn-sm" onClick={load} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>⟳ Refresh</motion.button>
+        <motion.button className="btn bg-btn btn-sm" onClick={load} whileTap={{ scale: 0.97 }}>⟳ Refresh</motion.button>
       </motion.div>
 
       {rootCA?.available && (
@@ -279,8 +279,7 @@ export default function CertificatesPage() {
               {rootCA.not_after ? <> · valid to {fmtDate(rootCA.not_after)}</> : null}
             </div>
           </div>
-          <motion.button className="btn bc btn-sm" disabled={busy === "rootca"} onClick={downloadRootCA}
-            whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
+          <motion.button className="btn bc btn-sm" disabled={busy === "rootca"} onClick={downloadRootCA} whileTap={{ scale: 0.97 }}>
             {busy === "rootca" ? "Downloading…" : "Download Root CA"}
           </motion.button>
         </motion.div>
@@ -338,7 +337,7 @@ export default function CertificatesPage() {
                 </label>
               </div>
               <div>
-                <motion.button className="btn bc" disabled={busy === "acme"} onClick={submitAcme} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
+                <motion.button className="btn bc" disabled={busy === "acme"} onClick={submitAcme} whileTap={{ scale: 0.97 }}>
                   {busy === "acme" ? "Requesting…" : "Request Certificate"}
                 </motion.button>
               </div>
@@ -374,7 +373,7 @@ export default function CertificatesPage() {
                 </label>
               </div>
               <div>
-                <motion.button className="btn bc" disabled={busy === "manual"} onClick={submitManual} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
+                <motion.button className="btn bc" disabled={busy === "manual"} onClick={submitManual} whileTap={{ scale: 0.97 }}>
                   {busy === "manual" ? "Installing…" : "Install Certificate"}
                 </motion.button>
               </div>
@@ -395,7 +394,7 @@ export default function CertificatesPage() {
         </div>
         <div className="tw">
           {loading ? (
-            <div style={{ padding: 24, textAlign: "center", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--text3)" }}>Loading certificates…</div>
+            <div style={{ padding: 24, textAlign: "center", fontFamily: "var(--font-sans)", fontSize: 13, color: "var(--text3)" }}>Loading certificates…</div>
           ) : certs.length === 0 ? (
             <EmptyState icon="lock" title="No certificates yet" hint="Sites are served with the shared self-signed certificate until one is issued. Request one with ACME or upload a PEM above — every WAF node picks it up on the next sync." />
           ) : (
@@ -431,15 +430,15 @@ export default function CertificatesPage() {
                       <td style={{ minWidth: 180 }}>{lifeBar(c)}</td>
                       <td>
                         <div style={{ display: "flex", gap: 4 }}>
-                          <motion.button className="btn bg-btn btn-xs" disabled={busy === c.domain} whileHover={{ scale: 1.06 }} whileTap={{ scale: 0.95 }} onClick={() => rename(c)} title="Set profile name">
+                          <motion.button className="btn bg-btn btn-xs" disabled={busy === c.domain} whileTap={{ scale: 0.97 }} onClick={() => rename(c)} title="Set profile name">
                             Rename
                           </motion.button>
                           {isAcme && (
-                            <motion.button className="btn bg-btn btn-xs" disabled={busy === c.domain} whileHover={{ scale: 1.06 }} whileTap={{ scale: 0.95 }} onClick={() => renew(c.domain)}>
+                            <motion.button className="btn bg-btn btn-xs" disabled={busy === c.domain} whileTap={{ scale: 0.97 }} onClick={() => renew(c.domain)}>
                               {busy === c.domain ? "…" : "Renew"}
                             </motion.button>
                           )}
-                          <motion.button className="btn bgn btn-xs" disabled={busy === c.domain} whileHover={{ scale: 1.06 }} whileTap={{ scale: 0.95 }} onClick={() => remove(c.domain)}>
+                          <motion.button className="btn bgn btn-xs" disabled={busy === c.domain} whileTap={{ scale: 0.97 }} onClick={() => remove(c.domain)}>
                             Delete
                           </motion.button>
                         </div>

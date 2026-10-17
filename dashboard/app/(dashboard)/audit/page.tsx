@@ -102,11 +102,10 @@ export default function AuditPage() {
         </div>
         <div style={{ display: "flex", gap: 8 }}>
           <motion.button className="btn bg-btn btn-sm" onClick={runVerify} disabled={verifying}
-            title="Recompute every row's HMAC and check the chain for gaps or reordering"
-            whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
+            title="Recompute every row's HMAC and check the chain for gaps or reordering" whileTap={{ scale: 0.97 }}>
             {verifying ? "Verifying…" : "Verify chain"}
           </motion.button>
-          <motion.button className="btn bg-btn btn-sm" onClick={load} whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>⟳ Refresh</motion.button>
+          <motion.button className="btn bg-btn btn-sm" onClick={load} whileTap={{ scale: 0.97 }}>⟳ Refresh</motion.button>
         </div>
       </motion.div>
 
@@ -126,12 +125,12 @@ export default function AuditPage() {
         </div>
         <div className="tw">
           {loading ? (
-            <div style={{ padding: 24, textAlign: "center", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--text3)" }}>Loading audit log…</div>
+            <div style={{ padding: 24, textAlign: "center", fontFamily: "var(--font-sans)", fontSize: 13, color: "var(--text3)" }}>Loading audit log…</div>
           ) : loadError ? (
             /* An unreadable audit store must never render as an empty log —
                that is the most reassuring possible display of the least
                reassuring possible state. */
-            <div style={{ padding: 24, textAlign: "center", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--red)" }}>
+            <div style={{ padding: 24, textAlign: "center", fontFamily: "var(--font-sans)", fontSize: 13, color: "var(--red)" }}>
               ⚠ The audit log could not be read — this is NOT the same as “no activity”.
               <div style={{ marginTop: 8, color: "var(--text3)" }}>{loadError}</div>
             </div>

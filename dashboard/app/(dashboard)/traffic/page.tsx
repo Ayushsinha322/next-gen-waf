@@ -112,8 +112,8 @@ export default function TrafficPage() {
     for (let i = 0; i <= 4; i++) {
       const y = pad.t + i * (cH / 4);
       ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(W - pad.r, y);
-      ctx.strokeStyle = "rgba(255,255,255,0.04)"; ctx.lineWidth = 1; ctx.stroke();
-      ctx.fillStyle = "rgba(100,116,139,0.5)"; ctx.font = "9px monospace"; ctx.textAlign = "right";
+      ctx.strokeStyle = "rgba(142,142,147,0.16)"; ctx.lineWidth = 1; ctx.stroke();
+      ctx.fillStyle = "rgba(142,142,147,0.9)"; ctx.font = "10px -apple-system, BlinkMacSystemFont, Inter, sans-serif"; ctx.textAlign = "right";
       ctx.fillText(String(Math.round(maxV * (1 - i / 4))), pad.l - 3, y + 3);
     }
     ctx.textAlign = "left";
@@ -124,12 +124,12 @@ export default function TrafficPage() {
       ctx.lineTo(px(pts - 1), pad.t + cH); ctx.lineTo(px(0), pad.t + cH); ctx.closePath();
       ctx.fillStyle = fill; ctx.fill();
     };
-    drawLine(reqs,    "rgba(59,130,246,0.85)", "rgba(59,130,246,0.07)");
-    drawLine(blocked, "rgba(239,68,68,0.75)",  "rgba(239,68,68,0.06)");
-    ctx.fillStyle = "rgba(96,165,250,0.8)";  ctx.fillRect(pad.l, H - 16, 14, 2);
-    ctx.fillStyle = "rgba(148,163,184,0.6)"; ctx.font = "10px Inter,sans-serif"; ctx.fillText("Req/s", pad.l + 18, H - 12);
-    ctx.fillStyle = "rgba(239,68,68,0.8)";   ctx.fillRect(pad.l + 80, H - 16, 14, 2);
-    ctx.fillStyle = "rgba(148,163,184,0.6)"; ctx.fillText("Blocked/s", pad.l + 98, H - 12);
+    drawLine(reqs,    "rgba(10,132,255,0.95)", "rgba(10,132,255,0.10)");
+    drawLine(blocked, "rgba(255,69,58,0.9)",   "rgba(255,69,58,0.08)");
+    ctx.fillStyle = "rgba(10,132,255,0.95)";  ctx.fillRect(pad.l, H - 16, 14, 2);
+    ctx.fillStyle = "rgba(142,142,147,0.95)"; ctx.font = "11px -apple-system, BlinkMacSystemFont, Inter, sans-serif"; ctx.fillText("Req/s", pad.l + 18, H - 12);
+    ctx.fillStyle = "rgba(255,69,58,0.9)";   ctx.fillRect(pad.l + 80, H - 16, 14, 2);
+    ctx.fillStyle = "rgba(142,142,147,0.95)"; ctx.fillText("Blocked/s", pad.l + 98, H - 12);
   }, [buckets]);
 
   useEffect(() => { drawChart(); }, [drawChart]);
@@ -166,7 +166,7 @@ export default function TrafficPage() {
             <option>All Sites</option>
             {siteList.map(s => <option key={s}>{s}</option>)}
           </select>
-          <motion.button className="btn bp btn-sm" whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }} onClick={() => showToast("Export coming in Phase 5", "i")}>Export</motion.button>
+          <motion.button className="btn bp btn-sm" whileTap={{ scale: 0.97 }} onClick={() => showToast("Export coming in Phase 5", "i")}>Export</motion.button>
         </div>
       </motion.div>
 
@@ -210,7 +210,7 @@ export default function TrafficPage() {
           <div className="pb">
             <canvas ref={chartRef} height={110} style={{ width: "100%", display: "block" }} />
             {buckets.length === 0 && (
-              <div style={{ textAlign: "center", paddingTop: 8, fontSize: 14, fontFamily: "var(--font-mono)", color: "rgba(100,116,139,0.5)" }}>
+              <div style={{ textAlign: "center", paddingTop: 8, fontSize: 14, fontFamily: "var(--font-sans)", color: "var(--text3)" }}>
                 waiting for traffic data…
               </div>
             )}
@@ -266,7 +266,7 @@ export default function TrafficPage() {
         </div>
         <div className="tw" style={{ maxHeight: 380, overflowY: "auto" }}>
           {displayed.length === 0 ? (
-            <div style={{ padding: "24px", textAlign: "center", fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--text3)" }}>
+            <div style={{ padding: "24px", textAlign: "center", fontFamily: "var(--font-sans)", fontSize: 13, color: "var(--text3)" }}>
               {rows.length === 0 ? "Waiting for live events…" : "No rows match current filters"}
             </div>
           ) : (

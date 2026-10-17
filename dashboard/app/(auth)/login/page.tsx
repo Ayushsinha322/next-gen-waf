@@ -124,7 +124,7 @@ export default function LoginPage() {
       for (let x = 0; x < c.width; x += 50) {
         for (let y = 0; y < c.height; y += 50) {
           cx.beginPath(); cx.arc(x, y, 1, 0, Math.PI * 2);
-          cx.fillStyle = "rgba(59,130,246,0.12)"; cx.fill();
+          cx.fillStyle = "rgba(10,132,255,0.10)"; cx.fill();
         }
       }
 
@@ -165,13 +165,13 @@ export default function LoginPage() {
       const ra = (t * 0.008) % (Math.PI * 2);
       cx.save(); cx.translate(70, c.height - 70);
       cx.beginPath(); cx.moveTo(0, 0); cx.arc(0, 0, 55, ra - 0.5, ra); cx.closePath();
-      cx.fillStyle = "rgba(59,130,246,0.07)"; cx.fill();
+      cx.fillStyle = "rgba(10,132,255,0.06)"; cx.fill();
       [55, 38, 20].forEach(r => {
         cx!.beginPath(); cx!.arc(0, 0, r, 0, Math.PI * 2);
-        cx!.strokeStyle = "rgba(59,130,246,0.12)"; cx!.lineWidth = 0.5; cx!.stroke();
+        cx!.strokeStyle = "rgba(10,132,255,0.12)"; cx!.lineWidth = 0.5; cx!.stroke();
       });
       cx.beginPath(); cx.moveTo(0, 0); cx.lineTo(55 * Math.cos(ra), 55 * Math.sin(ra));
-      cx.strokeStyle = "rgba(96,165,250,0.5)"; cx.lineWidth = 1; cx.stroke();
+      cx.strokeStyle = "rgba(10,132,255,0.45)"; cx.lineWidth = 1; cx.stroke();
       cx.restore();
 
       rafId = requestAnimationFrame(draw);
@@ -241,17 +241,17 @@ export default function LoginPage() {
 
         <div ref={scanlineRef} style={{
           position: "absolute", left: 0, width: "100%", height: 1,
-          background: "rgba(59,130,246,0.12)", zIndex: 1, pointerEvents: "none",
+          background: "var(--blue-t)", zIndex: 1, pointerEvents: "none",
         }} />
 
         <div id="LP-content">
           <motion.div id="shield" initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.2, ...spring }}>
-            <motion.div id="shield-icon" animate={{ boxShadow: ["0 0 12px rgba(59,130,246,.3)", "0 0 24px rgba(59,130,246,.5)", "0 0 12px rgba(59,130,246,.3)"] }} transition={{ duration: 3, repeat: Infinity }}>
+            <motion.div id="shield-icon">
               <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
                 <path d="M12 2L3 6.5V12c0 5.5 3.8 10.7 9 12 5.2-1.3 9-6.5 9-12V6.5L12 2z"
-                  stroke="#3b82f6" strokeWidth="1.5" fill="rgba(59,130,246,0.1)" />
+                  stroke="#ffffff" strokeWidth="1.5" fill="rgba(255,255,255,0.16)" />
                 <path d="M8.5 12l2.5 2.5 4.5-4.5"
-                  stroke="#60a5fa" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                  stroke="#ffffff" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
               </svg>
             </motion.div>
             <div>
@@ -423,13 +423,12 @@ export default function LoginPage() {
               id="sso-btn"
               type="button"
               onClick={() => { window.location.href = "/api/v1/auth/oidc/login"; }}
-              whileHover={{ scale: 1.02 }}
-              whileTap={{ scale: 0.98 }}
+              whileTap={{ scale: 0.97 }}
             >
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                <circle cx="12" cy="12" r="10" stroke="#94a3b8" strokeWidth="1.5" />
+                <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="1.5" />
                 <path d="M2 12h20M12 2a15.3 15.3 0 010 20M12 2a15.3 15.3 0 000 20"
-                  stroke="#94a3b8" strokeWidth="1.5" fill="none" />
+                  stroke="currentColor" strokeWidth="1.5" fill="none" />
               </svg>
               Sign in with single sign-on
             </motion.button>

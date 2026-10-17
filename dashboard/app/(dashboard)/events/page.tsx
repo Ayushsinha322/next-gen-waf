@@ -245,12 +245,14 @@ export default function EventsPage() {
             Searchable WAF history (ClickHouse) · {status?.reachable ? `${(status.events ?? 0).toLocaleString()} events stored` : "durable event store"}
           </div>
         </div>
-        <div style={{ display: "flex", gap: 4, padding: 4, background: "var(--bg3)", borderRadius: 10 }}>
+        <div className="seg" style={{ display: "flex", gap: 4, padding: 4, background: "var(--fill)", borderRadius: 10 }}>
           {RANGES.map(r => (
             <button key={r.label} onClick={() => { setMode("relative"); setRangeSecs(r.secs); }} style={{
-              padding: "6px 14px", borderRadius: 7, border: "none", cursor: "pointer", fontSize: 14, fontWeight: 600,
-              background: mode === "relative" && rangeSecs === r.secs ? "var(--cyan)" : "transparent",
-              color: mode === "relative" && rangeSecs === r.secs ? "#021018" : "var(--text2)",
+              padding: "6px 14px", borderRadius: 7, border: "none", cursor: "pointer", fontSize: 14, fontWeight: 500,
+              background: mode === "relative" && rangeSecs === r.secs ? "var(--seg-on)" : "transparent",
+              color: mode === "relative" && rangeSecs === r.secs ? "var(--text)" : "var(--text2)",
+              boxShadow: mode === "relative" && rangeSecs === r.secs ? "0 1px 2px rgba(0,0,0,.18), 0 0 0 0.5px rgba(0,0,0,.04)" : "none",
+              transition: "background-color .18s, color .18s",
             }}>{r.label}</button>
           ))}
           <button
@@ -263,9 +265,11 @@ export default function EventsPage() {
             }}
             title="Pick exact dates — for when a customer asks for a specific day"
             style={{
-              padding: "6px 14px", borderRadius: 7, border: "none", cursor: "pointer", fontSize: 14, fontWeight: 600,
-              background: mode === "absolute" ? "var(--cyan)" : "transparent",
-              color: mode === "absolute" ? "#021018" : "var(--text2)",
+              padding: "6px 14px", borderRadius: 7, border: "none", cursor: "pointer", fontSize: 14, fontWeight: 500,
+              background: mode === "absolute" ? "var(--seg-on)" : "transparent",
+              color: mode === "absolute" ? "var(--text)" : "var(--text2)",
+              boxShadow: mode === "absolute" ? "0 1px 2px rgba(0,0,0,.18), 0 0 0 0.5px rgba(0,0,0,.04)" : "none",
+              transition: "background-color .18s, color .18s",
             }}>Custom</button>
         </div>
       </motion.div>
@@ -313,7 +317,7 @@ export default function EventsPage() {
           </div>
         </div></motion.div>
       ) : status && !status.reachable ? (
-        <motion.div className="panel" variants={fadeUp}><div className="pb" style={{ textAlign: "center", padding: 30, fontSize: 14, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>
+        <motion.div className="panel" variants={fadeUp}><div className="pb" style={{ textAlign: "center", padding: 30, fontSize: 14, color: "var(--text3)", fontFamily: "var(--font-sans)" }}>
           ClickHouse configured but unreachable{status.error ? ` — ${status.error}` : ""}.
         </div></motion.div>
       ) : (
@@ -387,8 +391,8 @@ export default function EventsPage() {
               {timeline.length === 0 ? <Empty text="No traffic in this window." /> : timeline.map((b, i) => (
                 <div key={i} title={`${fmtTime(b.ts)} · ${b.total} req · ${b.blocked} blocked`}
                   style={{ flex: 1, display: "flex", flexDirection: "column", justifyContent: "flex-end", height: "100%", minWidth: 2 }}>
-                  <div style={{ height: `${(b.blocked / maxBucket) * 100}%`, background: "rgba(255,69,96,.85)", borderRadius: "2px 2px 0 0" }} />
-                  <div style={{ height: `${((b.total - b.blocked) / maxBucket) * 100}%`, background: "rgba(0,229,255,.4)", borderRadius: timeline[i].blocked ? 0 : "2px 2px 0 0" }} />
+                  <div style={{ height: `${(b.blocked / maxBucket) * 100}%`, background: "var(--red-t)", borderRadius: "2px 2px 0 0" }} />
+                  <div style={{ height: `${((b.total - b.blocked) / maxBucket) * 100}%`, background: "var(--accent-tint-h)", borderRadius: timeline[i].blocked ? 0 : "2px 2px 0 0" }} />
                 </div>
               ))}
             </div>
@@ -462,7 +466,7 @@ function FacetCard({ title, facets, onPick }: { title: string; facets: { key: st
                   attack message it most recently recorded. */}
               {f.label && <div style={{ fontSize: 11, color: "var(--text3)", marginBottom: 3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.label}</div>}
               <div style={{ height: 4, background: "var(--bg3)", borderRadius: 2, overflow: "hidden" }}>
-                <div style={{ height: "100%", width: `${(f.count / max) * 100}%`, background: "rgba(0,229,255,.6)", borderRadius: 2 }} />
+                <div style={{ height: "100%", width: `${(f.count / max) * 100}%`, background: "var(--accent-tint-h)", borderRadius: 2 }} />
               </div>
             </div>
           ))}

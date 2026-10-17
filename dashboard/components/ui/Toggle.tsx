@@ -25,7 +25,7 @@ export default function Toggle({
           setOn(!next); // persistence failed — roll back
         }
       }}
-      whileTap={{ scale: 0.92 }}
+      whileTap={{ scale: 0.97 }}
     />
   );
 }

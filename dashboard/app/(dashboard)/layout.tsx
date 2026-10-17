@@ -1,5 +1,5 @@
 "use client";
-import { motion, AnimatePresence } from "framer-motion";
+import { motion, AnimatePresence, MotionConfig } from "framer-motion";
 import TopBar from "@/components/layout/TopBar";
 import SideBar from "@/components/layout/SideBar";
 import ToastContainer from "@/components/ui/Toast";
@@ -30,6 +30,9 @@ import { I18nProvider } from "@/lib/i18n";
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
   return (
     <I18nProvider>
+      {/* reducedMotion="user": every framer-motion animation honours the OS
+          "Reduce motion" setting (opacity only, no movement). */}
+      <MotionConfig reducedMotion="user">
       {/* Rolling the dashboard changes every chunk filename, so a tab that was
           already open 404s on its own JavaScript and looks locked out. This
           reloads it once against the new build. */}
@@ -40,10 +43,10 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
         <AnimatePresence mode="wait">
           <motion.div
             key={typeof window !== "undefined" ? window.location.pathname : "root"}
-            initial={{ opacity: 0, y: 14 }}
+            initial={{ opacity: 0, y: 6 }}
             animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -10 }}
-            transition={{ duration: 0.3, ease: [0.22, 1, 0.36, 1] }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.2, ease: [0.2, 0.8, 0.2, 1] }}
           >
             {children}
           </motion.div>
@@ -51,6 +54,7 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
       </main>
       <ToastContainer />
       <ModalContainer />
+      </MotionConfig>
     </I18nProvider>
   );
 }
