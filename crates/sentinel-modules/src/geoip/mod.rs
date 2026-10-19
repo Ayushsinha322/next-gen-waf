@@ -12,6 +12,7 @@
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::path::Path;
+use std::sync::Arc;
 
 use maxminddb::{geoip2, Reader};
 use tracing::{error, info};
@@ -32,6 +33,59 @@ pub enum GeoVerdict {
 }
 
 // ---------------------------------------------------------------------------
+// GeoDb — one loaded database file, shared
+// ---------------------------------------------------------------------------
+
+/// A country database opened once and shared by every site that reads the same
+/// file.
+///
+/// The reader holds the whole file in memory (8 MB for DB-IP country lite).
+/// While only sites with country rules had a reader that was tolerable; now that
+/// every site resolves the country of every request (so the dashboard map and
+/// the logs say where traffic came from on sites with no country rules too),
+/// one copy per site would multiply that by the number of sites. Cloning a
+/// `GeoDb` clones an `Arc`, not the file.
+#[derive(Clone, Default)]
+pub struct GeoDb {
+    reader: Option<Arc<Reader<Vec<u8>>>>,
+    state: Option<(u64, u64)>,
+    error: Option<String>,
+}
+
+impl GeoDb {
+    /// Open `path`. Never fails: an absent or unreadable file gives a `GeoDb`
+    /// that resolves nothing, with the reason kept in [`error`](Self::error) so
+    /// the caller can decide how loudly to say so — loudly for a site whose
+    /// country rules now enforce nothing, quietly for one that only wanted the
+    /// country for its logs.
+    pub fn open(path: &Path) -> Self {
+        let state = db_file_state(path);
+        match Reader::open_readfile(path) {
+            Ok(r) => Self {
+                reader: Some(Arc::new(r)),
+                state,
+                error: None,
+            },
+            Err(e) => Self {
+                reader: None,
+                state,
+                error: Some(e.to_string()),
+            },
+        }
+    }
+
+    /// A database is loaded and lookups will resolve.
+    pub fn is_loaded(&self) -> bool {
+        self.reader.is_some()
+    }
+
+    /// Why the file could not be opened, when it could not.
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // GeoIp
 // ---------------------------------------------------------------------------
 
@@ -40,7 +94,7 @@ pub enum GeoVerdict {
 /// Built cheaply from a config block; the heavy mmdb Reader is loaded once
 /// at startup and can be hot-swapped on config reload via `ArcSwap`.
 pub struct GeoIp {
-    reader: Option<Reader<Vec<u8>>>,
+    reader: Option<Arc<Reader<Vec<u8>>>>,
     block_countries: HashSet<String>,
     allow_countries: HashSet<String>,
     /// `(mtime_secs, len)` of the database file when this instance was built,
@@ -102,26 +156,28 @@ impl GeoIp {
         allow_countries: Vec<String>,
     ) -> Self {
         let path = db_path.as_ref();
-        let reader = match Reader::open_readfile(path) {
-            Ok(r) => {
-                info!(path = %path.display(), "GeoIP database loaded");
-                Some(r)
-            }
-            Err(e) => {
-                error!(
-                    path = %path.display(),
-                    "GeoIP database not found or unreadable ({e}) — COUNTRY FILTERING IS NOT \
-                     ENFORCED for this site. Every address resolves to Unknown, so configured \
-                     block/allow country rules pass all traffic. Supply a MaxMind \
-                     GeoLite2-Country.mmdb and point SENTINEL_GEOIP_DB / waf_policy.geoip.db_path \
-                     at it. Queryable at /healthz -> geoip.inert."
-                );
-                None
-            }
-        };
+        let db = GeoDb::open(path);
+        match db.error() {
+            None => info!(path = %path.display(), "GeoIP database loaded"),
+            Some(e) => error!(
+                path = %path.display(),
+                "GeoIP database not found or unreadable ({e}) — COUNTRY FILTERING IS NOT \
+                 ENFORCED for this site. Every address resolves to Unknown, so configured \
+                 block/allow country rules pass all traffic. Supply a MaxMind \
+                 GeoLite2-Country.mmdb and point SENTINEL_GEOIP_DB / waf_policy.geoip.db_path \
+                 at it. Queryable at /healthz -> geoip.inert."
+            ),
+        }
+        Self::from_db(&db, block_countries, allow_countries)
+    }
+
+    /// Build a site's filter over an already opened, shared database. Logs
+    /// nothing: the caller knows whether a missing database matters for this
+    /// site and says so itself.
+    pub fn from_db(db: &GeoDb, block_countries: Vec<String>, allow_countries: Vec<String>) -> Self {
         Self {
-            db_state: db_file_state(path),
-            reader,
+            db_state: db.state,
+            reader: db.reader.clone(),
             block_countries: block_countries
                 .into_iter()
                 .map(|s| s.to_uppercase())
@@ -133,7 +189,20 @@ impl GeoIp {
         }
     }
 
-    /// Look up the country for `ip` and apply block/allow rules.
+    /// A database is loaded, so [`country`](Self::country) can resolve —
+    /// whether or not any country rule is configured.
+    pub fn country_lookups_enabled(&self) -> bool {
+        self.reader.is_some()
+    }
+
+    /// `true` when both read the same loaded database — one copy in memory.
+    pub fn shares_database_with(&self, other: &GeoIp) -> bool {
+        match (&self.reader, &other.reader) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+
     pub fn check(&self, ip: IpAddr) -> GeoVerdict {
         self.classify(self.country(ip).as_deref())
     }

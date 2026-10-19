@@ -30,7 +30,7 @@ pub use bot_detect::{
     good_bot_name, good_bot_verify_domains, BotDetector, BotScore, BotSignals, BotTier, BotVerdict,
 };
 pub use dlp::DlpEngine;
-pub use geoip::{GeoIp, GeoVerdict};
+pub use geoip::{GeoDb, GeoIp, GeoVerdict};
 pub use graphql::{inspect as inspect_graphql, GraphqlLimits};
 pub use grpc::{
     check_body as check_grpc_body, check_request as check_grpc_request, is_grpc, GrpcLimits,

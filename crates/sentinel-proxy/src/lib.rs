@@ -64,8 +64,8 @@ use rustls::ServerConfig;
 use sentinel_core::{
     config::{
         BotDetectionConfig, ChallengeMode, ConfigHandle, DlpAction, DlpConfig, FusionConfig,
-        ListenerConfig, Protocol, SecurityHeadersConfig, SentinelConfig, SiteConfig, WafConfig,
-        WafMode,
+        GeoIpConfig, ListenerConfig, Protocol, SecurityHeadersConfig, SentinelConfig, SiteConfig,
+        WafConfig, WafMode,
     },
     context::{Phase, RequestContext, VerdictSource, WafDecision},
 };
@@ -73,7 +73,7 @@ use sentinel_ebpf::{EbpfConfig, EbpfManager, IpNet};
 use sentinel_ml::MlEngine;
 use sentinel_modules::{
     check_grpc_body, check_grpc_request, detect_smuggling, inspect_graphql, is_grpc, token_header,
-    validate_jwt, AntiDdos, BotDetector, BotSignals, BotTier, DdosVerdict, DlpEngine, GeoIp,
+    validate_jwt, AntiDdos, BotDetector, BotSignals, BotTier, DdosVerdict, DlpEngine, GeoDb, GeoIp,
     GeoVerdict, GraphqlLimits, GrpcLimits, IpReputation, IpVerdict, JwtPolicy, RateLimiter,
     RawTier, SmugglingVerdict, ThreatFeed, ThreatVerdict,
 };
@@ -488,6 +488,9 @@ struct ModulesState {
 
     /// Per-site GeoIP country filters — rebuilt on reload.
     geoip_map: ArcSwap<GeoIpMap>,
+    /// Node-wide country lookup for attribution: every request on every site,
+    /// rules or none. See `build_geoip`.
+    geoip_default: ArcSwap<GeoIp>,
 
     /// Connection-rate DDoS protector — state preserved across reloads.
     anti_ddos: AntiDdos,
@@ -1427,6 +1430,7 @@ impl ProxyServer {
             info!("clickhouse flusher started (1s sample · 5s/500-row flush → traffic_buckets + waf_events; self-healing reconnect; disk-spooled + replayed while the sink is down)");
         }
 
+        let (geo_default, geo_sites) = build_geoip(&cfg);
         let modules = Arc::new(ModulesState {
             ip_rep: ArcSwap::new(Arc::new(build_ip_reputation(&cfg, &[]))),
             ip_rep_sites: ArcSwap::new(Arc::new(build_site_ip_reputation(&cfg))),
@@ -1437,7 +1441,8 @@ impl ProxyServer {
             },
             bot_detector: ArcSwap::new(Arc::new(BotDetector::new())),
             goodbot: goodbot::GoodBotVerifier::new(),
-            geoip_map: ArcSwap::new(Arc::new(build_geoip_map(&cfg))),
+            geoip_map: ArcSwap::new(Arc::new(geo_sites)),
+            geoip_default: ArcSwap::new(Arc::new(geo_default)),
             anti_ddos: build_anti_ddos(&cfg),
             correlation: CorrelationEngine::new(),
             feed_cache: Arc::clone(&feed_cache),
@@ -1649,7 +1654,9 @@ impl ProxyServer {
                         mr.ip_rep_sites
                             .store(Arc::new(build_site_ip_reputation(&current)));
                         mr.bot_detector.store(Arc::new(BotDetector::new()));
-                        mr.geoip_map.store(Arc::new(build_geoip_map(&current)));
+                        let (geo_default, geo_sites) = build_geoip(&current);
+                        mr.geoip_map.store(Arc::new(geo_sites));
+                        mr.geoip_default.store(Arc::new(geo_default));
 
                         // Rebuild through build_full_plugin_runtime so
                         // uploaded plugins survive a config change. Using
@@ -2279,21 +2286,36 @@ impl ProxyServer {
                     ticker.tick().await;
                     let cfg = gw_cfg.load();
                     let map = gw_modules.geoip_map.load();
-                    let changed = cfg.sites.iter().any(|site| {
-                        site.waf.geoip.as_ref().is_some_and(|gc| {
-                            map.get(&site.id)
-                                .map(|g| g.db_changed(std::path::Path::new(&gc.db_path)))
-                                .unwrap_or(true)
-                        })
-                    });
+                    let default_db = default_geoip_db_path();
+                    // The node-wide reader too: it is what attributes traffic on
+                    // sites with no country rules, which is most of them.
+                    let changed = gw_modules
+                        .geoip_default
+                        .load()
+                        .db_changed(std::path::Path::new(&default_db))
+                        || cfg.sites.iter().any(|site| {
+                            site.waf.geoip.as_ref().is_some_and(|gc| {
+                                map.get(&site.id)
+                                    .map(|g| {
+                                        g.db_changed(std::path::Path::new(geoip_site_db_path(
+                                            gc,
+                                            &default_db,
+                                        )))
+                                    })
+                                    .unwrap_or(true)
+                            })
+                        });
                     if changed {
-                        let rebuilt = build_geoip_map(&cfg);
+                        let (geo_default, rebuilt) = build_geoip(&cfg);
                         let active = rebuilt.values().filter(|g| g.is_active()).count();
                         info!(
                             sites = rebuilt.len(),
-                            active, "GeoIP database changed on disk — readers rebuilt"
+                            active,
+                            attributing = geo_default.country_lookups_enabled(),
+                            "GeoIP database changed on disk — readers rebuilt"
                         );
                         gw_modules.geoip_map.store(Arc::new(rebuilt));
+                        gw_modules.geoip_default.store(Arc::new(geo_default));
                     }
                 }
             });
@@ -3637,6 +3659,13 @@ async fn proxy_inner(
             ctx.tenant_id = Some(s.tenant_id.clone());
         }
     }
+
+    // Country of origin, resolved here — once the client address is known and
+    // before any check below can reject — so every logged request carries it:
+    // blocked by the node blocklist, an auto-ban, threat intel or anti-DDoS, by
+    // a rule, or allowed; on a site with country rules or without. See
+    // `build_geoip` for why this used to be empty on most sites.
+    ctx.geo_country = state.modules.geoip_default.load().country(ctx.client_ip);
 
     // A source the attributed site allow-lists is trusted by that site's
     // operator. Every check below skips it — the node blocklist and auto-bans
@@ -5038,13 +5067,16 @@ async fn phase1_headers(
     if still_evaluating(ctx) && site.waf.geoip.is_some() {
         let geoip_map = modules.geoip_map.load();
         if let Some(geoip) = geoip_map.get(&site.id) {
-            // Resolve the country FIRST and record it whatever the verdict is.
-            // Previously it was only stamped on the Block branch, so every
-            // allowed request logged an empty country and the dashboard map and
-            // country facets saw blocked traffic only — they under-reported by
-            // construction rather than because the data was unavailable.
-            ctx.geo_country = geoip.country(ctx.client_ip);
-            match geoip.classify(ctx.geo_country.as_deref()) {
+            // The country was recorded at the start of the request (node-wide
+            // reader). Rules are judged with this site's own reader, which is
+            // the same loaded database unless the site names another file —
+            // and when it does, the record follows the database the decision
+            // used.
+            let cc = geoip.country(ctx.client_ip);
+            if cc.is_some() {
+                ctx.geo_country = cc.clone();
+            }
+            match geoip.classify(cc.as_deref()) {
                 GeoVerdict::Block { country_code } => {
                     ctx.block_reason = Some(format!("country blocked: {country_code}"));
                     ctx.decision = WafDecision::Block;
@@ -7385,19 +7417,101 @@ fn build_ip_reputation(cfg: &SentinelConfig, feed_cidrs: &[(String, Vec<String>)
     rep
 }
 
-fn build_geoip_map(cfg: &SentinelConfig) -> GeoIpMap {
+/// Where the node's country database lives: the same `SENTINEL_GEOIP_DB`
+/// default the control plane writes into site config, so the two cannot
+/// disagree about the file.
+fn default_geoip_db_path() -> String {
+    std::env::var("SENTINEL_GEOIP_DB")
+        .unwrap_or_else(|_| "/var/lib/sentinel/geoip/dbip-country-lite.mmdb".to_string())
+}
+
+/// A site's database: its own `db_path`, or the node's when it names none.
+fn geoip_site_db_path<'a>(gc: &'a GeoIpConfig, default_db: &'a str) -> &'a str {
+    if gc.db_path.is_empty() {
+        default_db
+    } else {
+        &gc.db_path
+    }
+}
+
+/// The node-wide reader plus one filter per site with a `geoip` policy.
+///
+/// The node-wide reader exists for ATTRIBUTION. Until 2026-10-19 the country of
+/// a request was looked up only inside the GeoIP stage, only for sites with a
+/// `geoip` policy — and the control plane sends that policy only when a country
+/// is blocked or allowed. So on every site without a country rule (nearly all of
+/// them) no request ever carried a country, the dashboard's origin map and the
+/// country facets stayed empty, and the console blamed private source addresses
+/// for it. Requests rejected before routing (node blocklist, auto-ban, threat
+/// intel, anti-DDoS) never reached the GeoIP stage at all, so even a site with
+/// rules saw its most common blocks without a country. The request pipeline now
+/// resolves the country with this reader as soon as the client address is
+/// known; the per-site filters below only apply country RULES.
+///
+/// Every reader of one file shares one loaded copy (`GeoDb`), so attributing
+/// all traffic costs one database in memory, not one per site.
+fn build_geoip(cfg: &SentinelConfig) -> (GeoIp, GeoIpMap) {
+    build_geoip_with(cfg, &default_geoip_db_path())
+}
+
+fn build_geoip_with(cfg: &SentinelConfig, default_db: &str) -> (GeoIp, GeoIpMap) {
+    let mut dbs: HashMap<String, GeoDb> = HashMap::new();
+    let mut open = |path: &str| -> GeoDb {
+        dbs.entry(path.to_string())
+            .or_insert_with(|| GeoDb::open(std::path::Path::new(path)))
+            .clone()
+    };
+
+    let node_db = open(default_db);
+    if node_db.is_loaded() {
+        info!(
+            path = default_db,
+            "GeoIP database loaded — requests are attributed to a country"
+        );
+    } else {
+        // Normal until the control plane's geoip.refresh job has run once, and
+        // reported by /healthz (geoip.database.present). Not an error: no
+        // country rule depends on this reader.
+        debug!(
+            path = default_db,
+            reason = node_db.error().unwrap_or("absent"),
+            "no GeoIP database yet — requests are not attributed to a country"
+        );
+    }
+    let node = GeoIp::from_db(&node_db, vec![], vec![]);
+
     let mut map = GeoIpMap::new();
     for site in &cfg.sites {
-        if let Some(ref gc) = site.waf.geoip {
-            let geoip = GeoIp::from_path(
-                &gc.db_path,
-                gc.block_countries.clone(),
-                gc.allow_countries.clone(),
+        let Some(gc) = site.waf.geoip.as_ref() else {
+            continue;
+        };
+        let path = geoip_site_db_path(gc, default_db);
+        let db = open(path);
+        let has_rules = !gc.block_countries.is_empty() || !gc.allow_countries.is_empty();
+        if has_rules && !db.is_loaded() {
+            error!(
+                site = %site.id,
+                path,
+                "GeoIP database not found or unreadable ({}) — COUNTRY FILTERING IS NOT \
+                 ENFORCED for this site. Every address resolves to Unknown, so configured \
+                 block/allow country rules pass all traffic. Run the geoip.refresh job or \
+                 point SENTINEL_GEOIP_DB / waf_policy.geoip.db_path at a country .mmdb. \
+                 Queryable at /healthz -> geoip.inert.",
+                db.error().unwrap_or("absent")
             );
-            map.insert(site.id.clone(), geoip);
         }
+        map.insert(
+            site.id.clone(),
+            GeoIp::from_db(&db, gc.block_countries.clone(), gc.allow_countries.clone()),
+        );
     }
-    map
+    (node, map)
+}
+
+/// The per-site filters alone; the shape the `/healthz` report and its tests use.
+#[cfg(test)]
+fn build_geoip_map(cfg: &SentinelConfig) -> GeoIpMap {
+    build_geoip(cfg).1
 }
 
 /// What country filtering is CONFIGURED versus what is actually ENFORCED.
@@ -16311,6 +16425,89 @@ mod geoip_honesty_tests {
         let st = geoip_status(&cfg, &build_geoip_map(&cfg));
         assert_eq!(st["configured"], 0);
         assert_eq!(st["inert"].as_array().unwrap().len(), 0);
+    }
+
+    /// The synthetic fixture (see sentinel-modules' geoip tests): 203.0.113.5 is
+    /// CN, 198.51.100.7 RU, 192.0.2.9 US.
+    const FIXTURE_DB: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../sentinel-modules/tests/fixtures/GeoLite2-Country-test.mmdb"
+    );
+
+    fn ip(s: &str) -> std::net::IpAddr {
+        s.parse().unwrap()
+    }
+
+    /// The defect this pins (found 2026-10-19): the country was looked up only
+    /// for sites with a `geoip` policy, which the control plane sends only when a
+    /// country is blocked or allowed. A site with no country rule — nearly every
+    /// site — recorded no country for any request, so the dashboard's origin map
+    /// stayed empty with public traffic and a loaded database.
+    #[test]
+    fn a_site_with_no_country_rule_still_gets_a_country() {
+        let cfg = SentinelConfig {
+            sites: vec![bare_site("plain")],
+            ..Default::default()
+        };
+        let (node, sites) = build_geoip_with(&cfg, FIXTURE_DB);
+        assert!(
+            node.country_lookups_enabled(),
+            "the fixture did not load — a test that cannot read it proves nothing"
+        );
+        assert_eq!(node.country(ip("198.51.100.7")).as_deref(), Some("RU"));
+        assert_eq!(node.country(ip("192.0.2.9")).as_deref(), Some("US"));
+        assert!(
+            sites.is_empty(),
+            "attribution must not invent a country POLICY for a site that has none"
+        );
+    }
+
+    /// Attributing every request must not cost one 8 MB database per site.
+    #[test]
+    fn sites_with_rules_share_the_node_database() {
+        let cfg = SentinelConfig {
+            sites: vec![
+                site_with_geoip("a", "", vec!["RU"]),
+                site_with_geoip("b", FIXTURE_DB, vec!["CN"]),
+                bare_site("c"),
+            ],
+            ..Default::default()
+        };
+        let (node, sites) = build_geoip_with(&cfg, FIXTURE_DB);
+        assert_eq!(
+            sites.len(),
+            2,
+            "only sites with a geoip policy get a filter"
+        );
+        for id in ["a", "b"] {
+            let g = &sites[id];
+            assert!(g.is_active(), "{id}: rules + database = enforcing");
+            assert!(
+                g.shares_database_with(&node),
+                "{id}: reads the node's file, so it must share the node's loaded copy"
+            );
+        }
+        assert!(matches!(
+            sites["a"].check(ip("198.51.100.7")),
+            GeoVerdict::Block { .. }
+        ));
+    }
+
+    /// Before the geoip.refresh job has run there is no database. That is a
+    /// normal state for a new install: no country, no panic, no false claim.
+    #[test]
+    fn no_database_yet_means_no_country_and_nothing_breaks() {
+        let cfg = SentinelConfig {
+            sites: vec![bare_site("plain")],
+            ..Default::default()
+        };
+        let (node, _) = build_geoip_with(&cfg, "/nonexistent/dbip-country-lite.mmdb");
+        assert!(!node.country_lookups_enabled());
+        assert_eq!(node.country(ip("198.51.100.7")), None);
+        assert!(
+            node.db_changed(std::path::Path::new(FIXTURE_DB)),
+            "a database appearing later must be seen as a change, so the watcher loads it"
+        );
     }
 
     /// A site with no geoip block at all contributes nothing.
