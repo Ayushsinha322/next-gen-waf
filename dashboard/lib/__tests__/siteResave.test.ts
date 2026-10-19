@@ -55,6 +55,25 @@ describe("saving a site without edits changes nothing it enforces", () => {
     expect(policyOf(scriptSite({ max_body_size: 262144 })).max_body_size).toBe(262144);
   });
 
+  // Found 2026-10-19 on a production build: editing a script-created site and
+  // pressing Save did nothing but say "An email is required for automatic
+  // certificates". The form loaded "no TLS settings" as the new-site default,
+  // automatic ACME; entering an email to get past it started Let's Encrypt
+  // issuance for a site whose certificate was managed elsewhere.
+  it("a site with no TLS settings loads as served-by-name, not as automatic ACME", () => {
+    const f = siteToForm(scriptSite());
+    expect(f.tls_mode).toBe("existing");
+    expect(f.tls_existing_cert).toBe("");
+    const tls = (policyOf(scriptSite()).tls ?? {}) as Record<string, unknown>;
+    expect(tls.mode).not.toBe("auto");
+  });
+
+  it("a site that chose automatic certificates still loads as automatic", () => {
+    const f = siteToForm(scriptSite({ tls: { mode: "auto", email: "ops@example.in" } }));
+    expect(f.tls_mode).toBe("auto");
+    expect(f.acme_email).toBe("ops@example.in");
+  });
+
   it("the timeouts a site runs are written back unchanged", () => {
     const up = formToPayload(siteToForm(scriptSite())).upstream as Record<string, unknown>;
     expect(up.timeout_secs).toBe(30);

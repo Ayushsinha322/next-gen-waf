@@ -325,7 +325,9 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
       if (bad) return `Port "${bad.port}" for ${bad.host} is not a port number (1–65535) (Reverse Proxy)`;
     }
     if (form.tls_mode === "auto" && form.front_https && !form.acme_email.trim()) return "An email is required for automatic certificates (Front Service)";
-    if (form.tls_mode === "existing" && form.front_https && !form.tls_existing_cert) return "Select a certificate from the repository (Front Service)";
+    // "existing" with nothing selected is valid: the data plane matches a
+    // repository certificate to the domain by name (SNI), or serves its
+    // self-signed fallback — exactly what a site with no TLS settings does.
     if (form.tls_mode === "manual" && form.custom_priority === "data" && (!form.cert_pem.trim() || !form.key_pem.trim())) return "Paste both the certificate and private key (Front Service)";
     {
       const limitError = checkSiteLimits(form).find(c => c.level === "error");
@@ -355,7 +357,8 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
     // Repository cert: nothing to issue/upload — the data plane already serves it
     // by SNI (incl. wildcard), so it's shared across every matching site.
     if (form.tls_mode === "existing") {
-      showToast(`Using "${form.tls_existing_cert}" from the certificate repository — served via SNI, no upload`, "i");
+      if (form.tls_existing_cert)
+        showToast(`Using "${form.tls_existing_cert}" from the certificate repository — served via SNI, no upload`, "i");
       return;
     }
     // DNS-01 / wildcard issuance is roadmap — config is stored, issuance skipped.
@@ -647,7 +650,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
                     ) : (<>
                       <Field label="Certificate" hint="One cert (e.g. a wildcard) can protect many sites — no re-upload">
                         <select className="fin2 fsel2" value={form.tls_existing_cert} onChange={e => upd({ tls_existing_cert: e.target.value })}>
-                          <option value="">— Select a certificate —</option>
+                          <option value="">Match by domain name (or self-signed)</option>
                           {repoCerts.map(c => {
                             const names = certNames(c);
                             const wild = names.some(n => n.startsWith("*."));

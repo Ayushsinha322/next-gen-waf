@@ -1302,6 +1302,17 @@ export function siteToForm(site: Site): SiteForm {
   }
 
   const tls = w.tls as AnyRec | undefined;
+  if (!tls) {
+    // A site saved without TLS intent — every site the API, onboard-site.sh or
+    // the installer's first-site creates — runs with no per-site certificate
+    // action: the data plane serves whichever repository certificate matches the
+    // domain by name, or its self-signed fallback. Loading it as the new-site
+    // default ("auto") misrepresented that and made the first edit of such a
+    // site demand an ACME email; supplying one switched on Let's Encrypt
+    // issuance for a site whose certificate was managed somewhere else.
+    f.tls_mode = "existing";
+    f.tls_existing_cert = "";
+  }
   if (tls) {
     f.tls_mode = (tls.mode as TlsMode) ?? "auto";
     f.acme_provider = (tls.provider as AcmeProvider) ?? "letsencrypt";
