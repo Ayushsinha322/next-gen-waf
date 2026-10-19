@@ -863,7 +863,7 @@ function ConfigCard({ title, children }: { title: string; children: React.ReactN
  *
  * The full per-field "Use global / Customize" control needs a data model we do
  * not have yet — a tenant-level defaults store and a stored policy that can tell
- * "not set" from zero (see PRE-INTERNAL-BETA-C4-SCOPE.md). But the complaint
+ * "not set" from zero (see engineering-notes/PRE-INTERNAL-BETA-C4-SCOPE.md). But the complaint
  * behind it is answerable today: with 127 fields nobody can tell what they
  * changed from what shipped.
  *

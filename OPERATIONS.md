@@ -191,7 +191,7 @@ docker compose -f compose.prod.yml down -v      # ⚠️ DO NOT run casually
 The `-v` also **deletes the volumes** — that wipes your **database** (all sites,
 users, settings) and certificates. Only ever use `-v` if you intentionally want a
 factory reset (and you'd then have to re-run migrations + re-seed from
-`mvpproduction.md`).
+`engineering-notes/mvpproduction.md`).
 
 **Rule of thumb:** `stop`/`start`/`restart` for daily life. `up -d` to bring up.
 `down` rarely. `down -v` almost never.
@@ -260,7 +260,7 @@ docker compose -f compose.prod.yml logs --tail 100 <the-unhealthy-service>
 | **Website returns 502 Bad Gateway** through the WAF | Upstream (`juiceshop`) is down, or the WAF has no site config yet | `ps` (is `juiceshop` Up?); `logs --tail 100 dataplane`; ensure a site exists in the dashboard |
 | **Attacks are NOT blocked (get 200)** | Site is in "detection" mode, not "blocking", or no policy | In the dashboard, set the site's WAF policy mode to **blocking** |
 | **Clean traffic gets 403 right after you tested attacks** | The WAF flagged *your* source IP as a repeat attacker (≥3 blocks in 60s → standing anomaly penalty on every request from that IP) | Expected — it's the WAF working. Stop hitting it from that IP and wait ~60s (the penalty auto-clears), or test clean traffic from another machine. Close any browser tab left open on the protected site (it keeps polling). Last resort: `restart dataplane` clears it instantly. |
-| **Logs page stuck "Connecting to log stream…"** | SSE/CORS issue (port 9501 or origin) | Confirm `controlplane` is `Up` and port `9501` is reachable from your browser; this is a known config area — see `mvpproduction.md` §3 |
+| **Logs page stuck "Connecting to log stream…"** | SSE/CORS issue (port 9501 or origin) | Confirm `controlplane` is `Up` and port `9501` is reachable from your browser; this is a known config area — see `engineering-notes/mvpproduction.md` §3 |
 | **A site change isn't taking effect** | The WAF syncs config every ~5 seconds | Wait 5–10s; if still nothing, `logs --tail 50 controlplane` and `dataplane` |
 | **One container keeps `Restarting`** | It crashes on boot (bad config/dependency) | `logs --tail 200 <service>` — the error is almost always in the last lines |
 
@@ -305,14 +305,14 @@ cd /opt/sentinel-src/deploy/docker && docker compose -f compose.prod.yml up -d
 > Historical note: a bad `/etc/fstab` entry once caused the disk to mount
 > read-only after reboot, which stopped Docker. That has been **fixed** (root now
 > mounts read-write on boot). If you ever see "read-only file system" errors after
-> a reboot, that's the area to check — see `mvpproduction.md`.
+> a reboot, that's the area to check — see `engineering-notes/mvpproduction.md`.
 
 ---
 
 ## 8. Routine admin tasks
 
 **Add/edit a protected site:** Do it in the dashboard → *Sites* → *Site Wizard*
-(easiest), or via the control-plane API (see `mvpproduction.md` §5e/§6). Changes
+(easiest), or via the control-plane API (see `engineering-notes/mvpproduction.md` §5e/§6). Changes
 hot-sync to the WAF within ~5 seconds — **no restart needed**.
 
 **Change the admin password** (still on the to-do list): log into the dashboard
@@ -403,7 +403,7 @@ nothing is serving yet — see §7 above.
 Note that `compose build waf1` builds nothing: the image is built once under the
 `dataplane` service and the fleet services reuse it.
 (Full from-scratch build/deploy steps, DB migrations, and demo-site seeding are
-in `mvpproduction.md` — keep that as the deploy reference; keep **this** file as
+in `engineering-notes/mvpproduction.md` — keep that as the deploy reference; keep **this** file as
 the day-to-day operations reference.)
 
 ---

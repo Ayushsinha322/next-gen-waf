@@ -1,3 +1,9 @@
+> **Archived 2026-10-19: superseded and partly wrong. Do not quote it.** The feature
+> matrix is a pre-build design comparison, and a later live check found errors in it:
+> BunkerWeb's data plane is nginx + OpenResty Lua, not Python, and its HTTP/3 is on by
+> default. The measured BunkerWeb section was taken with BunkerWeb's rate limit and
+> bad-behaviour ban disabled for both WAFs.
+
 # Sentinel WAF vs. Best Open-Source WAFs
 
 ## Measured against BunkerWeb 1.6.9 (2026-09-06)
