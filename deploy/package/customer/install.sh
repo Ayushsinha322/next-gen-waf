@@ -1079,6 +1079,14 @@ SENTINEL_ALERT_EMAIL=$ALERT_EMAIL
 # from the internet — a NAT forwarding 80/443 is the boundary; keep 9443 inside it.
 SENTINEL_MGMT_BIND=$MGMT_BIND
 
+# ── Node identity ────────────────────────────────────────────────────────────
+# The names this host's nodes show in the console (sidebar, Cluster page) and keep
+# across upgrades. Neutral on purpose: the product's source codename is never shown
+# to users, and compose.prod.yml's fallback names carry it. Installs made before
+# these lines keep that fallback, so an upgrade never changes a node's identity.
+SENTINEL_CP_HOSTNAME=controlplane
+SENTINEL_DP_HOSTNAME=dataplane
+
 # ── Shared egress (corporate NAT / VPN addresses shared by many users) ──────
 # Forgives an address's block HISTORY so one person's scan cannot get the whole
 # office blocked. Detection of each request is unchanged.
