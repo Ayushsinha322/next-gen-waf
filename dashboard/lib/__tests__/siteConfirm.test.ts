@@ -113,3 +113,12 @@ describe("no native browser confirm() dialogs", () => {
     for (const [f, re] of want) expect(readFileSync(join(root, f), "utf8")).toMatch(re);
   });
 });
+
+// Revoked API keys rendered exactly like live ones, Revoke button included
+// (found 2026-10-19). Pin that the table reads revoked_at.
+describe("API keys table shows revocation", () => {
+  const s = readFileSync(join(__dirname, "../..", "app/(dashboard)/settings/page.tsx"), "utf8");
+  it("labels a revoked key and offers no Revoke button for it", () => {
+    expect(s).toMatch(/\{k\.revoked_at\s*\?\s*<span className="bdg bgr"[^>]*>Revoked/);
+  });
+});

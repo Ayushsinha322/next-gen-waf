@@ -319,7 +319,10 @@ function APIKeysTab() {
     if (!(await confirmAction(apiKeyRevokeConfirm(name)))) return;
     try {
       await api.admin.apikeys.revoke(id);
-      setKeys(prev => prev.filter(k => k.id !== id));
+      // Marked, not removed: the server keeps revoked keys and lists them, so
+      // dropping the row here made it reappear on the next visit.
+      const now = new Date().toISOString();
+      setKeys(prev => prev.map(k => (k.id === id ? { ...k, revoked_at: now } : k)));
       showToast(`Key "${name}" revoked`,"s");
     } catch { showToast("Failed to revoke","e"); }
   }
@@ -366,7 +369,11 @@ function APIKeysTab() {
             <thead><tr><th>Name</th><th>Key Preview</th><th>Scope</th><th>Expires</th><th>Last Used</th><th>Actions</th></tr></thead>
             <tbody>
               {keys.map((k, idx) => (
-                <motion.tr key={k.id} initial={{ opacity: 0, x: -6 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: idx * 0.02 }}>
+                // A revoked key stays listed (it is history: who had access, until
+                // when) but must not look live. It used to render exactly like an
+                // active key, Revoke button included, so nobody could tell from
+                // this page which keys still worked.
+                <motion.tr key={k.id} initial={{ opacity: 0, x: -6 }} animate={{ opacity: k.revoked_at ? 0.55 : 1, x: 0 }} transition={{ delay: idx * 0.02 }}>
                   <td>{k.name}</td>
                   <td className="td2">{k.preview}</td>
                   <td>{(k.scopes ?? []).length
@@ -374,7 +381,9 @@ function APIKeysTab() {
                     : <span className="td3">—</span>}</td>
                   <td className="td3">{k.expires_at ? new Date(k.expires_at).toLocaleDateString() : "—"}</td>
                   <td className="td3">{fmtLogin(k.last_used_at)}</td>
-                  <td><motion.button className="btn bd btn-xs" onClick={() => revoke(k.id,k.name)} whileTap={{ scale: 0.97 }}>Revoke</motion.button></td>
+                  <td>{k.revoked_at
+                    ? <span className="bdg bgr" title={`Revoked ${new Date(k.revoked_at).toLocaleString()}`}>Revoked {new Date(k.revoked_at).toLocaleDateString()}</span>
+                    : <motion.button className="btn bd btn-xs" onClick={() => revoke(k.id,k.name)} whileTap={{ scale: 0.97 }}>Revoke</motion.button>}</td>
                 </motion.tr>
               ))}
             </tbody>
