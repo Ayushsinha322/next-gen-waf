@@ -122,3 +122,15 @@ describe("API keys table shows revocation", () => {
     expect(s).toMatch(/\{k\.revoked_at\s*\?\s*<span className="bdg bgr"[^>]*>Revoked/);
   });
 });
+
+// The two site dialogs draw their own overlays and never got the Escape key or
+// dialog semantics the shared Modal has (found 2026-10-19). Pin both.
+describe("site dialogs close on Escape and announce themselves", () => {
+  for (const f of ["components/sites/SiteWizard.tsx", "components/sites/QuickAddSite.tsx"]) {
+    it(f, () => {
+      const s = readFileSync(join(__dirname, "../..", f), "utf8");
+      expect(s).toMatch(/e\.key !== "Escape"/);
+      expect(s).toMatch(/role="dialog" aria-modal="true"/);
+    });
+  }
+});

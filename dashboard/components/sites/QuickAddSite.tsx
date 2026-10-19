@@ -1,5 +1,5 @@
 "use client";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { motion } from "framer-motion";
 import { api } from "@/lib/api";
 import { emptyForm, formToPayload, PRESETS, type SiteForm } from "@/lib/siteConfig";
@@ -42,6 +42,16 @@ export default function QuickAddSite({
   // was ever requested.
   const [email, setEmail] = useState("");
   const [busy, setBusy] = useState(false);
+  // Escape closes, as the backdrop does and as every other console dialog does.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || busy) return;
+      if (document.querySelector('.modal[role="dialog"]')) return;
+      onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose, busy]);
   const [error, setError] = useState("");
 
   // "host:port", "host", "http://host:port" all mean the same thing to an
@@ -122,6 +132,7 @@ export default function QuickAddSite({
       initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
       onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
       <motion.div
+        role="dialog" aria-modal="true" aria-label="Add site"
         initial={{ opacity: 0, scale: 0.96, y: 16 }} animate={{ opacity: 1, scale: 1, y: 0 }}
         transition={{ type: "spring", duration: 0.32, bounce: 0 }}
         style={{ width: "min(560px, 96vw)", background: "var(--bg2)",

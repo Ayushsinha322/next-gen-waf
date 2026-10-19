@@ -274,6 +274,19 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
   // to the fleet, and a site runs it only when it is ticked there.
   const [installedPlugins, setInstalledPlugins] = useState<Plugin[]>([]);
   useEffect(() => { api.plugins.list().then(r => setInstalledPlugins(r.plugins ?? [])).catch(() => {}); }, []);
+  // Escape closes, like the backdrop and Cancel already do, and like every other
+  // dialog in the console (Modal, confirmAction, the event drawer). The wizard
+  // draws its own overlay, so it never inherited that. A dialog opened on top
+  // of it (a confirmation) takes the key instead, and nothing closes mid-save.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || saving) return;
+      if (document.querySelector('.modal[role="dialog"]')) return;
+      onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose, saving]);
 
   // Server-side dry run. The control plane exposes POST /sites/validate, which
   // runs the SAME conversion functions the config sync runs — so a green result
@@ -418,6 +431,7 @@ export default function SiteWizard({ mode, siteId, initial, onClose, onSaved }: 
       initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
       onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
       <motion.div
+        role="dialog" aria-modal="true" aria-label={mode === "edit" ? "Edit site" : "Add site"}
         initial={{ opacity: 0, scale: 0.96, y: 16 }} animate={{ opacity: 1, scale: 1, y: 0 }}
         transition={{ type: "spring", duration: 0.32, bounce: 0 }}
         style={{ width: "min(1100px, 96vw)", height: "min(760px, 94vh)", display: "flex", background: "var(--bg2)", border: "1px solid var(--card-bd)", borderRadius: 16, overflow: "hidden", boxShadow: "var(--shadow-modal)" }}>
