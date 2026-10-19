@@ -1,7 +1,7 @@
 # cargo-audit exceptions. Each one is an advisory our code cannot reach whose fix
 # needs a newer Rust than the 1.85 toolchain the CI and images build with. They go
 # with the toolchain move (Rust 1.88 + wasmtime 36 LTS), not by being forgotten.
-# Reviewed 2026-10-08 (production-readiness review #16). Anything not listed here
+# Reviewed 2026-10-08 (production-readiness review #16); RUSTSEC-2026-0363 added 2026-10-19. Anything not listed here
 # fails CI.
 [advisories]
 ignore = [
@@ -28,4 +28,9 @@ ignore = [
   "RUSTSEC-2026-0094",
   "RUSTSEC-2026-0095",
   "RUSTSEC-2026-0096",
+  # Added 2026-10-19: component-model resource handle tables are capped only per
+  # instance. Same reason as the block above — the runtime never instantiates a
+  # component (no `wasmtime::component` anywhere; plugins load with
+  # Module::from_binary and the core Linker). Fixed in 36.0.18 LTS.
+  "RUSTSEC-2026-0363",
 ]
