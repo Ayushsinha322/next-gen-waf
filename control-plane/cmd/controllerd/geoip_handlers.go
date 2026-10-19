@@ -13,6 +13,8 @@ import (
 	"github.com/your-org/sentinel-waf/control-plane/internal/leader"
 	"github.com/your-org/sentinel-waf/control-plane/internal/logs"
 	"github.com/your-org/sentinel-waf/control-plane/internal/rbac"
+
+	"go.uber.org/zap"
 )
 
 // GeoIP country blocking. A country is "blocked" when its ISO-3166-1 alpha-2
@@ -107,6 +109,18 @@ func geoipMutate(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *logs.
 		if newPolicy, did := setCountryBlock(s.WafPolicy, code, block); did {
 			updated[s.ID] = newPolicy
 		}
+	}
+
+	// An undo point first, like every other site write: blocking a country
+	// rewrites the policy of every site at once, which is the change an operator
+	// most needs to be able to take back. Only when something will change, so a
+	// repeated click does not push real history out of the 50-version window.
+	if len(updated) > 0 {
+		reason := "geoip.unblock." + code
+		if block {
+			reason = "geoip.block." + code
+		}
+		snapshotBeforeMutation(c, store, zap.L(), reason)
 	}
 
 	changed := 0

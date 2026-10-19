@@ -1110,6 +1110,7 @@ func handleUpdateSiteStatus(c *gin.Context, enf *rbac.Enforcer, store *db.Store,
 		return
 	}
 	prior, _ := store.GetSite(c.Request.Context(), claims.TenantID, siteID)
+	snapshotBeforeMutation(c, store, zap.L(), "site.status."+body.Status)
 	if err := store.UpdateSiteStatus(c.Request.Context(), claims.TenantID, siteID, body.Status); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
@@ -1209,6 +1210,7 @@ func handleAddSiteExclusion(c *gin.Context, enf *rbac.Enforcer, store *db.Store,
 	if !requireLeader(c, cl) {
 		return
 	}
+	snapshotBeforeMutation(c, store, zap.L(), "site.exclusion.add")
 	updated, err := store.UpdateSite(c.Request.Context(), claims.TenantID, claims.UserID, siteID, req)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
@@ -1271,6 +1273,7 @@ func handleDeleteSiteExclusion(c *gin.Context, enf *rbac.Enforcer, store *db.Sto
 	if !requireLeader(c, cl) {
 		return
 	}
+	snapshotBeforeMutation(c, store, zap.L(), "site.exclusion.remove")
 	updated, err := store.UpdateSite(c.Request.Context(), claims.TenantID, claims.UserID, siteID, req)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
