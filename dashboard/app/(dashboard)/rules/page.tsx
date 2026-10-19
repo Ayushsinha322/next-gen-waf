@@ -6,6 +6,8 @@ import FirstRunNote from "@/components/ui/FirstRunNote";
 import { api, type Rule, type RuleTestResult, type CompiledRule, type RuleInventory, type SiteRuleInventory } from "@/lib/api";
 import { staggerContainer, cardVariants, fadeUp, spring } from "@/lib/animations";
 import Icon from "@/components/ui/Icon";
+import { confirmAction } from "@/components/ui/confirm";
+import { ruleDeleteConfirm } from "@/lib/siteConfirm";
 
 const PHASE_LABELS = ["conn","req_hdr","req_body","upstream","resp_hdr","resp_body","log"];
 
@@ -238,7 +240,7 @@ export default function RulesPage() {
     if (r.source === "crs" || r.source === "community") {
       showToast("CRS/community rules cannot be deleted", "w"); return;
     }
-    if (!confirm(`Delete rule "${r.name}"?`)) return;
+    if (!(await confirmAction(ruleDeleteConfirm(r.name)))) return;
     try {
       await api.rules.delete(r.id);
       setRules(prev => prev.filter(x => x.id !== r.id));

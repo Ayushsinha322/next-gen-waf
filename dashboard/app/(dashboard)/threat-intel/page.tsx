@@ -20,6 +20,8 @@ import {
   type IOCType,
 } from "@/lib/api";
 import { staggerContainer, fadeUp, cardVariants } from "@/lib/animations";
+import { confirmAction } from "@/components/ui/confirm";
+import { iocRemoveConfirm } from "@/lib/siteConfirm";
 
 const TYPES: { v: IOCType; l: string }[] = [
   { v: "ip", l: "IP" },
@@ -184,7 +186,7 @@ export default function ThreatIntelPage() {
   }
 
   async function removeEntry(e: IOC) {
-    if (!confirm(`Remove ${e.type} indicator "${e.value}" from the feed?`)) return;
+    if (!(await confirmAction(iocRemoveConfirm(e.type, e.value)))) return;
     try {
       await api.threatIntel.remove(e.id);
       showToast("Indicator removed", "s");

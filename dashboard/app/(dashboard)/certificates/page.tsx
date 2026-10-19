@@ -14,6 +14,8 @@ import {
 } from "@/lib/api";
 import { certCoversHost } from "@/lib/siteConfig";
 import { staggerContainer, cardVariants, fadeUp } from "@/lib/animations";
+import { confirmAction } from "@/components/ui/confirm";
+import { certDeleteConfirm } from "@/lib/siteConfirm";
 
 /** All names a cert presents (primary + SANs). */
 function certNames(c: Certificate): string[] {
@@ -232,7 +234,7 @@ export default function CertificatesPage() {
   }
 
   async function remove(domain: string) {
-    if (!confirm(`Delete the certificate for ${domain}? The site will fall back to a self-signed cert.`)) return;
+    if (!(await confirmAction(certDeleteConfirm(domain)))) return;
     setBusy(domain);
     try {
       await api.certs.delete(domain);

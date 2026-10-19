@@ -5,6 +5,8 @@ import { motion } from "framer-motion";
 import { api, type Plugin, type CatalogPlugin, type PluginHooks, type PluginPermissions } from "@/lib/api";
 import { staggerContainer, fadeUp } from "@/lib/animations";
 import Icon from "@/components/ui/Icon";
+import { confirmAction } from "@/components/ui/confirm";
+import { pluginDeleteConfirm } from "@/lib/siteConfirm";
 
 /**
  * This page once rendered a six-entry "WASM Plugin Marketplace" that did not
@@ -161,14 +163,7 @@ export default function PluginsPage() {
 
   const remove = useCallback(
     async (p: Plugin) => {
-      if (
-        !window.confirm(
-          `Delete plugin "${p.name}"? It will be removed from every WAF node on the next sync. ` +
-            `You will need the original .zip to reinstall it.`,
-        )
-      ) {
-        return;
-      }
+      if (!(await confirmAction(pluginDeleteConfirm(p.name)))) return;
       setBusy(p.name);
       try {
         await api.plugins.remove(p.name);

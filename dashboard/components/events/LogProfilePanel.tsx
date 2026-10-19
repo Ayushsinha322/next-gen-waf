@@ -15,6 +15,8 @@ import { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { showToast } from "@/components/ui/Toast";
 import { api, type LogProfile, type LogProfileInput, type ExportFormat, type Site } from "@/lib/api";
+import { confirmAction } from "@/components/ui/confirm";
+import { logProfileDeleteConfirm } from "@/lib/siteConfirm";
 
 /** The filter set a profile captures, shared with the Threat Search page. */
 export interface ProfileFilters {
@@ -75,7 +77,7 @@ export default function LogProfilePanel({
   }
 
   async function remove(p: LogProfile) {
-    if (!window.confirm(`Delete the log profile "${p.name}"? This does not delete any logs.`)) return;
+    if (!(await confirmAction(logProfileDeleteConfirm(p.name)))) return;
     try {
       await api.logProfiles.remove(p.id);
       showToast(`Profile "${p.name}" deleted`, "s");

@@ -6,6 +6,8 @@ import { showToast } from "@/components/ui/Toast";
 import EmptyState from "@/components/ui/EmptyState";
 import { staggerContainer, fadeUp, cardVariants } from "@/lib/animations";
 import Icon from "@/components/ui/Icon";
+import { confirmAction } from "@/components/ui/confirm";
+import { reportScheduleDeleteConfirm } from "@/lib/siteConfirm";
 
 /**
  * Scheduled security reports.
@@ -106,7 +108,7 @@ export default function ReportsPage() {
   }, [load]);
 
   const remove = useCallback(async (s: ReportSchedule) => {
-    if (!window.confirm(`Delete the schedule "${s.name}"? Reports already delivered are unaffected.`)) return;
+    if (!(await confirmAction(reportScheduleDeleteConfirm(s.name)))) return;
     setBusy(s.id);
     try {
       await api.reports.remove(s.id);

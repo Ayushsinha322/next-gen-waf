@@ -7,6 +7,8 @@ import { announceAlertsChanged } from "@/lib/alertEvents";
 import { api, type Alert, type NotificationChannel } from "@/lib/api";
 import { staggerContainer, cardVariants, fadeUp, spring } from "@/lib/animations";
 import Icon from "@/components/ui/Icon";
+import { confirmAction } from "@/components/ui/confirm";
+import { ipBlockEverywhereConfirm } from "@/lib/siteConfirm";
 
 export default function AlertsPage() {
   const [alerts, setAlerts]       = useState<Alert[]>([]);
@@ -131,7 +133,7 @@ export default function AlertsPage() {
    *  corpus the data plane enforces. The previous button showed a toast that said
    *  "flagged" and did nothing. */
   async function blockIP(ip: string) {
-    if (!confirm(`Block ${ip} on every site?\n\nAdds a manual block-tier indicator to the threat-intel corpus. Remove it from Threat Intel to unblock.`)) return;
+    if (!(await confirmAction(ipBlockEverywhereConfirm(ip)))) return;
     setBlocking(ip);
     try {
       await api.threatIntel.create({ type: "ip", value: ip, tier: "block", source: "console", category: "manual", confidence: 100 });

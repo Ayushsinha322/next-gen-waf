@@ -68,3 +68,48 @@ describe("the Users tab can change and remove users", () => {
     expect(s).toMatch(/useEffect\(\(\) => \{ setMe\(getUser\(\)\); \}, \[\]\)/);
   });
 });
+
+// Ten destructive actions (delete a rule, certificate, channel, plugin, report
+// schedule or log profile; revoke an API key; revert the management certificate;
+// remove an indicator; block an IP on every site) used the browser's native confirm() until 2026-10-19 — a system box that
+// freezes the page, cannot state the consequence in the product's words, and
+// can be suppressed for the session. Pin that no native confirm with a message
+// comes back anywhere in the console.
+describe("no native browser confirm() dialogs", () => {
+  const { readdirSync, statSync } = require("node:fs") as typeof import("node:fs");
+  const root = join(__dirname, "../..");
+  const files: string[] = [];
+  const walk = (d: string) => {
+    for (const n of readdirSync(d)) {
+      if (n === "node_modules" || n === ".next" || n === "__tests__") continue;
+      const p = join(d, n);
+      if (statSync(p).isDirectory()) walk(p);
+      else if (/\.(tsx?|jsx?)$/.test(n)) files.push(p);
+    }
+  };
+  walk(join(root, "app"));
+  walk(join(root, "components"));
+  it("scans a real tree", () => {
+    expect(files.length).toBeGreaterThan(30);
+  });
+  it("calls confirm() with a message nowhere", () => {
+    const offenders = files.filter(f =>
+      /(^|[^.\w])(window\.)?confirm\(\s*[`"']/m.test(readFileSync(f, "utf8")));
+    expect(offenders.map(f => f.slice(root.length + 1))).toEqual([]);
+  });
+  it("routes the ten former offenders through confirmAction", () => {
+    const want: [string, RegExp][] = [
+      ["app/(dashboard)/rules/page.tsx", /confirmAction\(ruleDeleteConfirm/],
+      ["app/(dashboard)/alerts/page.tsx", /confirmAction\(ipBlockEverywhereConfirm/],
+      ["app/(dashboard)/certificates/page.tsx", /confirmAction\(certDeleteConfirm/],
+      ["app/(dashboard)/settings/page.tsx", /confirmAction\(apiKeyRevokeConfirm/],
+      ["app/(dashboard)/settings/page.tsx", /confirmAction\(channelDeleteConfirm/],
+      ["app/(dashboard)/settings/page.tsx", /confirmAction\(mgmtCertRevertConfirm/],
+      ["app/(dashboard)/threat-intel/page.tsx", /confirmAction\(iocRemoveConfirm/],
+      ["app/(dashboard)/plugins/page.tsx", /confirmAction\(pluginDeleteConfirm/],
+      ["app/(dashboard)/reports/page.tsx", /confirmAction\(reportScheduleDeleteConfirm/],
+      ["components/events/LogProfilePanel.tsx", /confirmAction\(logProfileDeleteConfirm/],
+    ];
+    for (const [f, re] of want) expect(readFileSync(join(root, f), "utf8")).toMatch(re);
+  });
+});

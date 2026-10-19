@@ -10,6 +10,7 @@ import { logout, getUser } from "@/lib/auth";
 import { confirmAction } from "@/components/ui/confirm";
 import { PRODUCT_NAME } from "@/lib/version";
 import Icon from "@/components/ui/Icon";
+import { apiKeyRevokeConfirm, channelDeleteConfirm, mgmtCertRevertConfirm } from "@/lib/siteConfirm";
 
 /** "2h ago" / "Never" for a nullable timestamp.
  *
@@ -315,7 +316,7 @@ function APIKeysTab() {
   }
 
   async function revoke(id: string, name: string) {
-    if (!confirm(`Revoke API key "${name}"?`)) return;
+    if (!(await confirmAction(apiKeyRevokeConfirm(name)))) return;
     try {
       await api.admin.apikeys.revoke(id);
       setKeys(prev => prev.filter(k => k.id !== id));
@@ -961,7 +962,7 @@ function NotificationsTab() {
     finally { setBusy(null); }
   }
   async function del(ch: NotificationChannel) {
-    if (!confirm(`Delete channel "${ch.name}"?`)) return;
+    if (!(await confirmAction(channelDeleteConfirm(ch.name)))) return;
     setBusy(ch.id);
     try { await api.notifications.delete(ch.id); showToast("Channel deleted", "s"); await load(); }
     catch { showToast("Delete failed", "e"); }
@@ -1100,7 +1101,7 @@ function ManagementTLSTab() {
   }
 
   async function revert() {
-    if (!confirm("Revert to the self-signed default management certificate?")) return;
+    if (!(await confirmAction(mgmtCertRevertConfirm()))) return;
     setBusy("revert");
     try { await api.managementTls.revert(); showToast("Reverted to self-signed default", "s"); await load(); }
     catch { showToast("Revert failed", "e"); }
