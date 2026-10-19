@@ -180,22 +180,25 @@ func (s *Store) MarkLogin(ctx context.Context, tenantID, userID string) error {
 }
 
 // DeleteUser removes a user from the tenant.
-func (s *Store) DeleteUser(ctx context.Context, tenantID, actorID, userID string) error {
+// DeleteUser removes the account and returns the email and role it had, so the
+// caller can write them into the user.delete audit entry: once the row is gone
+// that entry is the only place left that says who the account was, and the
+// audit list reads it to name a deleted user's past actions.
+func (s *Store) DeleteUser(ctx context.Context, tenantID, actorID, userID string) (email, role string, err error) {
 	tx, err := s.pool.BeginTenant(ctx, tenantID, actorID)
 	if err != nil {
-		return err
+		return "", "", err
 	}
 	defer tx.Rollback(ctx)
 
-	var got string
-	err = tx.QueryRow(ctx, `DELETE FROM users WHERE id = $1 AND tenant_id = $2 RETURNING id`, userID, tenantID).Scan(&got)
+	err = tx.QueryRow(ctx, `DELETE FROM users WHERE id = $1 AND tenant_id = $2 RETURNING email, role`, userID, tenantID).Scan(&email, &role)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return fmt.Errorf("user not found")
+			return "", "", fmt.Errorf("user not found")
 		}
-		return fmt.Errorf("delete user: %w", err)
+		return "", "", fmt.Errorf("delete user: %w", err)
 	}
-	return tx.Commit(ctx)
+	return email, role, tx.Commit(ctx)
 }
 
 // RefreshUser re-reads a user's CURRENT role and status by id, tenant-scoped, so

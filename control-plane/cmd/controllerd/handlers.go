@@ -421,7 +421,7 @@ func handleMFAEnroll(c *gin.Context) {
 }
 
 // handleMFAConfirm activates MFA once the user proves a working code.
-func handleMFAConfirm(c *gin.Context, store *db.Store) {
+func handleMFAConfirm(c *gin.Context, store *db.Store, hub *logs.Hub) {
 	claims, ok := auth.GetClaims(c.Request.Context())
 	if !ok || claims == nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "not authenticated"})
@@ -455,11 +455,21 @@ func handleMFAConfirm(c *gin.Context, store *db.Store) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
+	// Turning a second factor on or off changes how this account can be taken
+	// over, so it belongs in the trail like a password change does.
+	mfaUser := claims.UserID
+	writeAuditEntry(c, store, hub, &db.WriteAuditRequest{
+		TenantID:    claims.TenantID,
+		ActorUserID: &mfaUser,
+		Action:      "user.mfa.enable",
+		TargetKind:  "user",
+		TargetID:    &mfaUser,
+	})
 	c.JSON(http.StatusOK, gin.H{"ok": true, "mfa_enabled": true})
 }
 
 // handleMFADisable turns MFA off after verifying a current code.
-func handleMFADisable(c *gin.Context, store *db.Store) {
+func handleMFADisable(c *gin.Context, store *db.Store, hub *logs.Hub) {
 	claims, ok := auth.GetClaims(c.Request.Context())
 	if !ok || claims == nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "not authenticated"})
@@ -489,6 +499,16 @@ func handleMFADisable(c *gin.Context, store *db.Store) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": clientError(err)})
 		return
 	}
+	// Turning a second factor on or off changes how this account can be taken
+	// over, so it belongs in the trail like a password change does.
+	mfaUser := claims.UserID
+	writeAuditEntry(c, store, hub, &db.WriteAuditRequest{
+		TenantID:    claims.TenantID,
+		ActorUserID: &mfaUser,
+		Action:      "user.mfa.disable",
+		TargetKind:  "user",
+		TargetID:    &mfaUser,
+	})
 	c.JSON(http.StatusOK, gin.H{"ok": true, "mfa_enabled": false})
 }
 
@@ -3730,7 +3750,8 @@ func handleDeleteUser(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 		c.JSON(status, gin.H{"error": problem})
 		return
 	}
-	if err := store.DeleteUser(c.Request.Context(), claims.TenantID, claims.UserID, c.Param("id")); err != nil {
+	email, role, err := store.DeleteUser(c.Request.Context(), claims.TenantID, claims.UserID, c.Param("id"))
+	if err != nil {
 		respondStoreError(c, err)
 		return
 	}
@@ -3740,12 +3761,17 @@ func handleDeleteUser(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *
 	// why "create, act, delete" left no trace before this.
 	actorID := claims.UserID
 	targetID := c.Param("id")
+	// Who the account was, kept in the trail itself: the audit list reads this
+	// to keep naming the deleted user's earlier actions (audit rows hold only
+	// the actor's id, and the users row it pointed at is gone).
+	deleted, _ := json.Marshal(map[string]string{"email": email, "role": role})
 	writeAuditEntry(c, store, hub, &db.WriteAuditRequest{
 		TenantID:    claims.TenantID,
 		ActorUserID: &actorID,
 		Action:      "user.delete",
 		TargetKind:  "user",
 		TargetID:    &targetID,
+		Diff:        deleted,
 	})
 	// Here at once; the other nodes notice the missing row on their next refresh.
 	sessionEpochs.markDeleted(targetID, time.Now().UTC())

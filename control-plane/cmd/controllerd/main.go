@@ -651,8 +651,8 @@ func run() error {
 		// password, so a borrowed session cannot be turned into ownership.
 		protected.POST("/auth/password/change", func(c *gin.Context) { handleChangePassword(c, store, hub, log) })
 		protected.POST("/auth/mfa/enroll", func(c *gin.Context) { handleMFAEnroll(c) })
-		protected.POST("/auth/mfa/confirm", func(c *gin.Context) { handleMFAConfirm(c, store) })
-		protected.POST("/auth/mfa/disable", func(c *gin.Context) { handleMFADisable(c, store) })
+		protected.POST("/auth/mfa/confirm", func(c *gin.Context) { handleMFAConfirm(c, store, hub) })
+		protected.POST("/auth/mfa/disable", func(c *gin.Context) { handleMFADisable(c, store, hub) })
 		protected.GET("/dashboard/stats", func(c *gin.Context) { handleDashboardStats(c, enforcer, store) })
 		protected.GET("/sites", func(c *gin.Context) { handleListSites(c, enforcer, store) })
 		protected.GET("/sites/export", func(c *gin.Context) { handleExportSites(c, enforcer, store) })

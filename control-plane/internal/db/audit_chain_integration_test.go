@@ -264,3 +264,54 @@ func TestAuditChainConcurrentAppendsDoNotFork(t *testing.T) {
 		t.Errorf("concurrent appends produced an invalid chain: %+v", rep)
 	}
 }
+
+// TestAuditChainSurvivesUserDeletion pins migration 0025. audit_logs referenced
+// users with ON DELETE SET NULL, so removing a user rewrote that user's past
+// rows: their HMACs stopped recomputing and verification reported them ALTERED —
+// a tamper alarm from an ordinary leaver removal, and the actor erased from the
+// very rows that record what they did. Found on a fresh 1.1.20 stack 2026-10-19.
+func TestAuditChainSurvivesUserDeletion(t *testing.T) {
+	s, pg, key := auditTestStore(t)
+	ctx := context.Background()
+
+	var userID string
+	if err := pg.pool.QueryRow(ctx, `
+		INSERT INTO users (tenant_id, email, name, role, status)
+		VALUES ($1, 'leaver@audit.test', 'Leaver', 'editor', 'active')
+		ON CONFLICT DO NOTHING
+		RETURNING id`, testTenant).Scan(&userID); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	for _, a := range []string{"user.login", "site.update", "user.password.change"} {
+		if err := s.WriteAuditLog(ctx, WriteAuditRequest{
+			TenantID: testTenant, ActorUserID: &userID, Action: a, TargetKind: "user", TargetID: &userID,
+		}, key); err != nil {
+			t.Fatalf("write audit %q: %v", a, err)
+		}
+	}
+
+	email, role, err := s.DeleteUser(ctx, testTenant, userID, userID)
+	if err != nil {
+		t.Fatalf("delete user: %v", err)
+	}
+	if email != "leaver@audit.test" || role != "editor" {
+		t.Errorf("DeleteUser returned (%q, %q); the user.delete entry needs both", email, role)
+	}
+
+	rep, err := s.VerifyAuditLog(ctx, testTenant, key, 0)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if !rep.OK() {
+		t.Fatalf("deleting a user broke the audit chain — report: %+v", rep)
+	}
+	var stillNamed int
+	if err := pg.pool.QueryRow(ctx,
+		`SELECT count(*) FROM audit_logs WHERE tenant_id = $1 AND actor_user_id = $2`,
+		testTenant, userID).Scan(&stillNamed); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if stillNamed != 3 {
+		t.Errorf("%d of 3 rows still carry the deleted user's id; the actor must not be erased", stillNamed)
+	}
+}

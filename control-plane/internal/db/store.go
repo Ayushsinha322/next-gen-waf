@@ -864,7 +864,12 @@ func (s *Store) ListAuditLogsFiltered(ctx context.Context, tenantID, userID stri
 	// concurrent writes, so it cannot page deterministically.
 	sql := fmt.Sprintf(
 		`SELECT a.id, a.tenant_id, a.actor_user_id, a.action, a.target_kind, a.target_id,
-		        a.ip::text, a.created_at, COALESCE(a.seq, 0), u.email, a.user_agent, a.diff
+		        a.ip::text, a.created_at, COALESCE(a.seq, 0),
+		        COALESCE(u.email, (SELECT d.diff->>'email' FROM audit_logs d
+		                           WHERE d.tenant_id = a.tenant_id AND d.action = 'user.delete'
+		                             AND d.target_id = a.actor_user_id
+		                           ORDER BY d.seq DESC LIMIT 1)),
+		        a.user_agent, a.diff
 		 FROM audit_logs a
 		 LEFT JOIN users u ON u.id = a.actor_user_id
 		 WHERE %s
