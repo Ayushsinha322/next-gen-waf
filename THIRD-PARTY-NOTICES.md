@@ -303,7 +303,7 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 
 ### Apache-2.0 OR ISC OR MIT — 3 component(s)
 - hyper-rustls 0.27.9
-- rustls 0.23.45
+- rustls 0.23.46
 - rustls-pemfile 2.2.0
 
 ### Apache-2.0 — 2 component(s)
