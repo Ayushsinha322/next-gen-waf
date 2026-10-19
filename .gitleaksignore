@@ -1,0 +1,38 @@
+# Gitleaks findings reviewed by hand and confirmed NOT to be secrets (2026-10-19).
+# Each line is one finding's fingerprint (commit:file:rule:line), so only that exact
+# occurrence is exempt; a new secret in the same file is still reported.
+# Real leaks never go here: rotate the secret instead. Regenerate the list with
+#   gitleaks detect --redact --report-format json --report-path f.json
+
+# dev log simulator: fake key in synthetic log lines
+7b1bfdb583539df48bd15dea5d0f11f0c9a3534d:control-plane/internal/logs/simulator.go:generic-api-key:159
+# DLP tests: AWS documented example key / obvious fake
+d0e7888eaaf5b6a3ec2775fed8b53fef4a9ee0c9:crates/sentinel-modules/src/dlp/mod.rs:aws-access-token:305
+# DLP tests: AWS documented example key / obvious fake
+d0e7888eaaf5b6a3ec2775fed8b53fef4a9ee0c9:crates/sentinel-modules/src/dlp/mod.rs:aws-access-token:421
+# DLP tests: AWS documented example key / obvious fake
+d0e7888eaaf5b6a3ec2775fed8b53fef4a9ee0c9:crates/sentinel-modules/src/dlp/mod.rs:aws-access-token:466
+# DLP tests: AWS documented example key / obvious fake
+d0e7888eaaf5b6a3ec2775fed8b53fef4a9ee0c9:crates/sentinel-modules/src/dlp/mod.rs:aws-access-token:504
+# DLP tests: AWS documented example key / obvious fake
+d0e7888eaaf5b6a3ec2775fed8b53fef4a9ee0c9:crates/sentinel-modules/src/dlp/mod.rs:aws-access-token:506
+# jwt_auth tests: RSA key pair generated for the tests
+eabda34ff9a96bb8d34a6a0afd251f331377a18b:crates/sentinel-modules/src/jwt_auth/mod.rs:private-key:273
+# test fixture: placeholder token in a test request
+fb1a3a870e138cc474c19e8b480aecbd55db3d88:crates/sentinel-proxy/src/lib.rs:generic-api-key:13253
+# RFC 6455 sample Sec-WebSocket-Key (dGhlIHNhbXBsZSBub25jZQ==)
+4985d2c98b42b382df110fa977323d24260aedf2:crates/sentinel-proxy/tests/e2e_pipeline.rs:generic-api-key:1109
+# RFC 6455 sample Sec-WebSocket-Key (dGhlIHNhbXBsZSBub25jZQ==)
+9de661bf7ec1e9b4f6127c5548937e990a818ea9:crates/sentinel-proxy/tests/origin_matrix.rs:generic-api-key:778
+# RFC 6455 sample Sec-WebSocket-Key (dGhlIHNhbXBsZSBub25jZQ==)
+258e9474ab81401e1ca81f32130f10ee68fa2504:crates/sentinel-proxy/tests/origin_matrix.rs:generic-api-key:971
+# test fixture: placeholder token in a test request
+11c0b77ab5710bf51bf496508f46e8fa515b9857:crates/sentinel-rules/src/compiler/vm.rs:generic-api-key:5807
+# test fixture: placeholder token in a test request
+11c0b77ab5710bf51bf496508f46e8fa515b9857:crates/sentinel-rules/src/compiler/vm.rs:generic-api-key:5829
+# CRS test: sample JWT in a request URI
+9225a12b722b0adbf82bbfa56da509948f529cae:crates/sentinel-rules/tests/crs_inert_rules.rs:jwt:217
+# RFC 6455 sample Sec-WebSocket-Key (dGhlIHNhbXBsZSBub25jZQ==)
+7d270d0096ce3e2bc8afdae09b3a03083fa09fb8:deploy/SITE-ONBOARDING-CHECKLIST.md:generic-api-key:187
+# RFC 6455 sample Sec-WebSocket-Key (dGhlIHNhbXBsZSBub25jZQ==)
+b62377829c0a1c823b2252677fb3eda72f91b7bd:deploy/manual/TROUBLESHOOTING.md:generic-api-key:323

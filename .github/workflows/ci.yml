@@ -1,57 +1,153 @@
 name: ci
 
+# The GitHub mirror of .gitlab-ci.yml. GitLab is the pipeline releases are cut
+# from; this one exists so that anyone working through GitHub sees the same
+# verdict. Keep the two in step: a gate that runs on one forge and not the other
+# is a gate you cannot rely on.
+#
+# Every tool version is pinned to the image GitLab uses, on purpose. Until
+# 2026-10-19 this file took `stable` Rust, and when the repository was first
+# synced here every run went red: stable had moved to 1.99, whose clippy has
+# lints 1.85 does not, so `-D warnings` failed code GitLab passed. Bump a pin
+# here in the same commit that bumps it in .gitlab-ci.yml, never on its own.
+#
+#   Rust 1.85.0      .gitlab-ci.yml  .rust-base  image: rust:1.85
+#   Go   1.26.9      .gitlab-ci.yml  go          image: golang:1.26, and the
+#                    `toolchain` line in control-plane/go.mod
+#   Node 22          .gitlab-ci.yml  dashboard   image: node:22
+#
+# Runners are pinned to ubuntu-24.04 rather than ubuntu-latest, which moves to
+# Ubuntu 26 from 2026-10-19; a runner upgrade should be a commit, not a surprise.
+
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+# A newer push to the same branch makes the older run pointless.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Same as GitLab's .rust-base: no debug info and no incremental artifacts.
+  # CI never opens a debugger, and debug info more than doubles the target dir.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_INCREMENTAL: "0"
 
 jobs:
-  rust:
-    runs-on: ubuntu-latest
+  # ── Rust data plane ────────────────────────────────────────────────────────
+  # Three jobs, as on GitLab, so each is one workspace compilation. Here they run
+  # in parallel because every GitHub job gets its own machine and its own disk.
+  rust-lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with: { components: rustfmt, clippy }
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with: { shared-key: lint }
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # GATING: known-vulnerable crates. Reads Cargo.lock only. Exceptions live in
+  # .cargo/audit.toml, each with its reason. 0.22.1 is the newest cargo-audit
+  # that builds on 1.85 and reads the CVSS 4.0 entries in the advisory database.
+  rust-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+        with: { shared-key: audit }
+      - run: cargo install cargo-audit --version 0.22.1 --locked
+      - run: cargo audit
+
+  rust-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+        with: { shared-key: test }
       - run: cargo test --workspace
+
+  rust-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+        with: { shared-key: release }
       - run: cargo build --workspace --release
 
+  # ── Go control plane ───────────────────────────────────────────────────────
   go:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     defaults: { run: { working-directory: control-plane } }
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with: { go-version: "1.22" }
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.9"
+          cache-dependency-path: control-plane/go.sum
       - run: go vet ./...
       - run: go test ./...
       - run: go build ./...
+      # GATING: a vulnerability our code can reach, in a module or in the
+      # standard library of this Go. Pinned: govulncheck@latest needs a newer Go.
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
 
+  # ── Dashboard ──────────────────────────────────────────────────────────────
   dashboard:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     defaults: { run: { working-directory: dashboard } }
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: "20", cache: npm, cache-dependency-path: dashboard/package-lock.json }
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
       - run: npm ci
       - run: npm run typecheck       # tsc --noEmit — must be clean (gating)
       - run: npm run test            # vitest unit tests (gating)
       - run: npm run lint || true    # advisory only (style)
       - run: npm run build           # production build must succeed (gating)
+      - run: npm audit --omit=dev --audit-level=high   # shipped dependencies: no high/critical
 
-  # Mirrors the GitLab `deploy-shell` job. This existed only on GitLab, so every
-  # guard built after the 2026-08-08 packaging audit — the one that found 54
-  # defects — was invisible to anyone working through GitHub, who saw a green
-  # tick for exactly the class of bug those guards exist to catch. Keep the two
-  # pipelines in step: a check that runs on one forge and not the other is a
-  # check you cannot rely on.
+  # ── Deploy / operational shell ─────────────────────────────────────────────
+  # Mirrors GitLab's `deploy-shell`, check for check and in the same order. Until
+  # 2026-10-19 this copy ran six of GitLab's twelve checks, so the other six
+  # (third-party pins, upgrade/rollback, DB TLS, XML configs, rolling-update
+  # guards, installer sizing) could fail here without anyone working through
+  # GitHub seeing it. GitLab runs these in alpine:3.20; they are plain bash and
+  # coreutils, and the runner already has shellcheck, jq and docker compose.
   deploy-shell:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+      # xmllint, for check-xml-configs.sh. That gate must not skip for want of a
+      # parser: a malformed ClickHouse drop-in stops the server booting.
+      - name: tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libxml2-utils shellcheck jq >/dev/null
+          shellcheck --version | head -2; jq --version; xmllint --version 2>&1 | head -1; docker compose version
       # 1. Every shell file must parse. Cheap, absolute, no exceptions.
       - name: shell syntax
         run: |
@@ -64,33 +160,58 @@ jobs:
       # 2. shellcheck. Errors gate; warnings are advisory while the backlog is
       #    worked down. Same split as GitLab, deliberately.
       - name: shellcheck (errors gate)
-        run: shellcheck -S error $(find deploy -name '*.sh' -type f)
+        run: find deploy -name '*.sh' -type f -exec shellcheck -S error {} +
       - name: shellcheck (warnings, advisory)
-        run: shellcheck -S warning $(find deploy -name '*.sh' -type f) || true
-      # 3. Every compose file must parse with the environment its own installer
-      #    generates. `docker compose config` only parses and interpolates, so
-      #    this needs no daemon.
+        run: find deploy -name '*.sh' -type f -exec shellcheck -S warning {} + || true
       - name: compose files parse
         run: ./deploy/ci/check-compose-parses-clean.sh
-      # 3b. One version number across VERSION, Cargo.toml, package.json and Go.
       - name: version consistency
         run: ./deploy/ci/check-version-consistency.sh
-      # 3c. No unbounded producer piped into `grep -q` — that inverts under
-      #     pipefail and reads a present pattern as absent.
+      - name: third-party image pins
+        run: ./deploy/ci/check-thirdparty-pins.sh
       - name: no pipefail-inverting grep
         run: ./deploy/ci/check-pipefail-grep.sh
-      # 4. The contract check — stages the real customer tree and asserts every
-      #    path the shipped scripts and compose overlays reference exists.
+      - name: upgrade and rollback
+        run: ./deploy/ci/check-upgrade-rollback.sh
+      - name: database TLS consistency
+        run: ./deploy/ci/check-db-tls-consistency.sh
+      - name: XML configs
+        run: ./deploy/ci/check-xml-configs.sh
+      - name: rolling-update guards
+        run: ./deploy/ci/check-rolling-update-guards.sh
+      - name: installer sizing
+        run: ./deploy/ci/check-installer-sizing.sh
+      # The contract check: stages the real customer tree and asserts every path
+      # the shipped scripts and compose overlays reference exists.
       - name: bundle contract
         run: |
           STAGE_ONLY=1 ./deploy/package/build-bundle.sh
           ./deploy/ci/check-bundle-contract.sh
 
+  # ── Secret scanning ────────────────────────────────────────────────────────
+  # GitLab uses its built-in secret detection; GitHub uses gitleaks.
   security:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # gitleaks lists a pull request's commits through the API to know what to scan.
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
-      - uses: actions/checkout@v4
+      # Full history. gitleaks scans the pushed range of commits, and with the
+      # default one-commit checkout that range does not exist: until 2026-10-19
+      # every run here crashed with "unknown revision" and scanned 0 bytes,
+      # which reported as a failure but meant no scan had happened at all.
+      - uses: actions/checkout@v5
+        with: { fetch-depth: 0 }
+      # Dependency review needs GitHub Advanced Security on a private
+      # repository and fails every pull request without it. Known-vulnerable
+      # dependencies are gated anyway, by cargo audit, npm audit and govulncheck.
       - uses: actions/dependency-review-action@v4
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && !github.event.repository.private
+      # Findings already reviewed and confirmed not to be secrets are listed by
+      # fingerprint in .gitleaksignore; anything else fails the job.
       - name: gitleaks
-        uses: gitleaks/gitleaks-action@v2
+        uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
