@@ -151,8 +151,11 @@ go:
   stage: test
   # 1.26: golang.org/x/net 0.60 requires it, and Go 1.25 gets no fix for the
   # net/http HTTP/2 vulnerabilities our code reaches (GO-2026-6610..6617,
-  # fixed in 1.26.9; govulncheck below).
-  image: golang:1.26
+  # fixed in 1.26.9; govulncheck below). The exact patch release, not the
+  # floating `1.26` tag: GO-2026-6809 (crypto/x509) is fixed in 1.26.10, and
+  # a floating tag gives no proof which toolchain built what. Same pin in
+  # deploy/docker/Dockerfile, control-plane/go.mod and .github/workflows/ci.yml.
+  image: golang:1.26.10
   tags:
     - k8s-docker
   cache:
