@@ -212,8 +212,16 @@ pub enum Instruction {
     LoadTarget(TargetSpec),
 
     /// Pop `StrVec`, apply regex `patterns[pattern_id]`, push `Bool(any_match)`.
+    ///
+    /// `negate` is `!@rx`, judged per value as ModSecurity does: true when ANY
+    /// value does not match. Negating the combined result instead asked
+    /// whether NO value matched, so on a multi-valued target (FILES_NAMES,
+    /// MATCHED_VARS, `TX:/regex/`) one value that matched hid every one that
+    /// did not.
     MatchRx {
         pattern_id: usize,
+        #[serde(default)]
+        negate: bool,
     },
 
     /// [`Instruction::MatchRx`] that tests EVERY value instead of stopping at the
@@ -225,6 +233,8 @@ pub enum Instruction {
     /// reads `MATCHED_VAR(S)`.
     MatchRxAll {
         pattern_id: usize,
+        #[serde(default)]
+        negate: bool,
     },
 
     /// [`Instruction::MatchMulti`] that tests every value and records each
@@ -243,6 +253,10 @@ pub enum Instruction {
     MatchInterpolated {
         cmp: InterpCmp,
         raw_id: usize,
+        /// Per value, as `MatchRx`'s: CRS 931130's `!@endsWith .%{request_headers.host}`
+        /// over every `TX:/rfi_parameter_.*/` it set.
+        #[serde(default)]
+        negate: bool,
     },
 
     /// Pop `StrVec`, apply Aho-Corasick set `ac_sets[set_id]`, push `Bool(any_match)`.
@@ -265,8 +279,6 @@ pub enum Instruction {
     /// Pop `StrVec`, run libinjection XSS detection on each value, push
     /// `Bool(any value flagged as XSS)`.
     DetectXss,
-    /// Pop `StrVec`, push `Bool(any value is an off-domain URL)`.
-    DetectOffDomainUrl,
     /// Pop `StrVec`, push `Bool(any value contains an SSRF URL)`.
     DetectSsrfUrl,
     /// Pop `StrVec`, push `Bool(any value is an IP inside one of these CIDRs)`.

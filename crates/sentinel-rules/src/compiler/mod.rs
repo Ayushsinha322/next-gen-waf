@@ -491,8 +491,8 @@ fn emit_link(
     if collect {
         for instr in &mut instrs[from..] {
             match *instr {
-                Instruction::MatchRx { pattern_id } => {
-                    *instr = Instruction::MatchRxAll { pattern_id };
+                Instruction::MatchRx { pattern_id, negate } => {
+                    *instr = Instruction::MatchRxAll { pattern_id, negate };
                 }
                 Instruction::MatchMulti { set_id } => {
                     *instr = Instruction::MatchMultiAll { set_id };
@@ -633,7 +633,10 @@ fn emit_operator_match(
     match operator {
         Operator::Rx(pat) => {
             let pattern_id = state.intern_pattern(pat)?;
-            instrs.push(Instruction::MatchRx { pattern_id });
+            instrs.push(Instruction::MatchRx {
+                pattern_id,
+                negate: false,
+            });
         }
         Operator::ContainsWord(words) => {
             let set_id = state.intern_ac_set(words.clone());
@@ -650,7 +653,11 @@ fn emit_operator_match(
         }
         Operator::Interpolated { cmp, raw } => {
             let raw_id = state.intern_literal(raw.clone());
-            instrs.push(Instruction::MatchInterpolated { cmp: *cmp, raw_id });
+            instrs.push(Instruction::MatchInterpolated {
+                cmp: *cmp,
+                raw_id,
+                negate: false,
+            });
         }
         Operator::Exists => {
             instrs.push(Instruction::Exists);
@@ -660,9 +667,6 @@ fn emit_operator_match(
         }
         Operator::DetectXss => {
             instrs.push(Instruction::DetectXss);
-        }
-        Operator::OffDomainUrl => {
-            instrs.push(Instruction::DetectOffDomainUrl);
         }
         Operator::SsrfUrl => {
             instrs.push(Instruction::DetectSsrfUrl);
@@ -685,6 +689,21 @@ fn emit_operator_match(
         }
         Operator::Never => {
             instrs.push(Instruction::Never);
+        }
+        // `!@rx` and a negated macro comparison are judged per value (see
+        // `Instruction::MatchRx`); CRS negates other operators only on
+        // single-valued targets, where the two readings agree.
+        Operator::Not(inner)
+            if matches!(**inner, Operator::Rx(_) | Operator::Interpolated { .. }) =>
+        {
+            emit_operator_match(inner, state, instrs)?;
+            match instrs.last_mut() {
+                Some(
+                    Instruction::MatchRx { negate, .. }
+                    | Instruction::MatchInterpolated { negate, .. },
+                ) => *negate = true,
+                _ => anyhow::bail!("negated operator did not end in its match instruction"),
+            }
         }
         Operator::Not(inner) => {
             emit_operator_match(inner, state, instrs)?;

@@ -208,21 +208,6 @@ fn content_type(ctx: &RequestContext) -> String {
         .unwrap_or_default()
 }
 
-/// The request's own Host header, lowercased, port stripped. Empty if absent.
-fn request_host(ctx: &RequestContext) -> String {
-    ctx.request_headers
-        .get("host")
-        .map(|v| {
-            let h = header_text(v);
-            h.split(':')
-                .next()
-                .unwrap_or(&h)
-                .trim()
-                .to_ascii_lowercase()
-        })
-        .unwrap_or_default()
-}
-
 /// A header value as text, decoded lossily. `to_str()` refuses any byte
 /// 0x80 or above, and every target that used it dropped the WHOLE header — a single
 /// such byte hid a header, or every cookie in it, from the rules.
@@ -251,10 +236,6 @@ fn request_header_values(ctx: &RequestContext, name: &str) -> Vec<String> {
     fields.collect()
 }
 
-/// True if `value` contains a `scheme://host` URL whose host is off-domain
-/// relative to `request_host` — i.e. not equal to it and not a subdomain of
-/// it. Reproduces CRS 931130 (off-domain reference / RFI). When the request
-/// has no Host header, any absolute URL counts as off-domain.
 /// True if `value` parses as an IP address contained in any of `cidrs`.
 ///
 /// Implements `@ipMatch` / `@ipMatchF`, which the CRS importer previously compiled to
@@ -277,51 +258,6 @@ fn ip_in_any_cidr(value: &str, cidrs: &[String]) -> bool {
             Err(_) => crate::ssrf::parse_host_to_ip(spec).is_some_and(|other| other == ip),
         }
     })
-}
-
-fn contains_off_domain_url(value: &str, request_host: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    let mut search = lower.as_str();
-    while let Some(pos) = search.find("://") {
-        // Validate the scheme: alnum/+/-/. immediately before "://".
-        let scheme: String = search[..pos]
-            .chars()
-            .rev()
-            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
-            .collect();
-        let scheme_ok = scheme
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic());
-
-        let after = &search[pos + 3..];
-        // Authority ends at the first path/query/fragment delimiter.
-        let authority_end = after
-            .find(['/', '?', '#', '\\', ' ', '\t', '"', '\''])
-            .unwrap_or(after.len());
-        let mut authority = &after[..authority_end];
-        // Strip userinfo (`user:pass@`).
-        if let Some(at) = authority.rfind('@') {
-            authority = &authority[at + 1..];
-        }
-        // Strip a trailing `:port`.
-        let host = authority.split(':').next().unwrap_or(authority);
-
-        if scheme_ok && !host.is_empty() {
-            if request_host.is_empty() {
-                return true; // no own host → any absolute URL is off-domain
-            }
-            // On-domain iff host == own host, or host is a subdomain of it.
-            let on_domain = host == request_host || host.ends_with(&format!(".{request_host}"));
-            if !on_domain {
-                return true;
-            }
-        }
-
-        // Continue scanning past this occurrence.
-        search = &search[pos + 3..];
-    }
-    false
 }
 
 /// A body parameter's name, shared by every value filed under it.
@@ -1206,7 +1142,6 @@ struct MemoEntry {
 #[derive(Default)]
 struct RequestViews<'a> {
     content_type: OnceCell<String>,
-    host: OnceCell<String>,
     /// Each parsed view of the request's arguments, or why it cannot be listed
     /// — past the site's argument limits, or (a body) too complex to list.
     query: OnceCell<Result<Params, Unlisted>>,
@@ -1244,11 +1179,6 @@ impl<'a> RequestViews<'a> {
     /// Lower-cased `Content-Type`; see `content_type`.
     fn content_type(&self, ctx: &RequestContext) -> &str {
         self.content_type.get_or_init(|| content_type(ctx))
-    }
-
-    /// The request's own host; see `request_host`.
-    fn host(&self, ctx: &RequestContext) -> &str {
-        self.host.get_or_init(|| request_host(ctx))
     }
 
     /// Decoded query-string parameters, in request order, charged to the
@@ -2502,7 +2432,7 @@ pub fn evaluate(
     let mut last_matched: Option<String> = None;
     // Every match of the current chain link's `MatchRxAll`, as capture groups,
     // for the `ChainLink` that closes it. Empty everywhere else.
-    let mut link_matches: Vec<Vec<Option<String>>> = Vec::new();
+    let mut link_matches: Vec<(Vec<Option<String>>, String)> = Vec::new();
     // The whole values the current link matched (collected by the same
     // instructions), and those the PREVIOUS link matched — what the next
     // link's MATCHED_VAR(S) reads.
@@ -2634,10 +2564,17 @@ pub fn evaluate(
                 }
             }
 
-            Instruction::MatchRx { pattern_id } => {
+            Instruction::MatchRx { pattern_id, negate } => {
                 let values = pop_strings(&mut stack);
                 if values.is_empty() {
                     stack.push(StackVal::Absent);
+                } else if *negate {
+                    // `!@rx`, per value: holds for any value the pattern does
+                    // not match, which is the value the rule is about.
+                    let regex = &ruleset.patterns[*pattern_id];
+                    let hit = values.iter().find(|s| !regex.is_match(s));
+                    record_match(&mut last_matched, hit);
+                    stack.push(StackVal::Bool(hit.is_some()));
                 } else {
                     let regex = &ruleset.patterns[*pattern_id];
                     // Regex capture groups populate TX.0 (whole match) and
@@ -2705,14 +2642,33 @@ pub fn evaluate(
             // Every value, every match recorded for the ChainLink that
             // follows; TX.N and the matched text are the FIRST match's, as
             // MatchRx leaves them.
-            Instruction::MatchRxAll { pattern_id } => {
+            Instruction::MatchRxAll { pattern_id, negate } => {
                 let values = pop_strings(&mut stack);
                 if values.is_empty() {
                     stack.push(StackVal::Absent);
+                } else if *negate {
+                    // Every value the pattern does not match is a match of the
+                    // link; a non-match has no groups to capture.
+                    let regex = &ruleset.patterns[*pattern_id];
+                    let label = last_target.map(TargetSpec::label).unwrap_or_default();
+                    let before = link_values.len();
+                    for (i, s) in values.iter().enumerate() {
+                        if !regex.is_match(s) {
+                            link_matches.push((Vec::new(), format!("{label}:{i}")));
+                            link_values.push(s.clone());
+                        }
+                    }
+                    record_match(&mut last_matched, link_values.get(before));
+                    stack.push(StackVal::Bool(link_values.len() > before));
                 } else {
                     let regex = &ruleset.patterns[*pattern_id];
                     let mut hit = false;
-                    for s in values.iter() {
+                    // Each match's MATCHED_VAR_NAME: the target and the value's
+                    // place in it — unique per value, which is what a setvar
+                    // named from it (CRS 931130) needs. ModSecurity's would be
+                    // `ARGS:url`; the parameter names are not carried here.
+                    let label = last_target.map(TargetSpec::label).unwrap_or_default();
+                    for (i, s) in values.iter().enumerate() {
                         let Some(caps) = regex.captures(s) else {
                             continue;
                         };
@@ -2726,7 +2682,7 @@ pub fn evaluate(
                             record_match(&mut last_matched, caps.get(0).map(|m| m.as_str()));
                             hit = true;
                         }
-                        link_matches.push(groups);
+                        link_matches.push((groups, format!("{label}:{i}")));
                         link_values.push(s.clone());
                     }
                     stack.push(StackVal::Bool(hit));
@@ -2756,14 +2712,23 @@ pub fn evaluate(
                 if matched {
                     for sv in setvars {
                         // A setvar named from the match runs once per matched
-                        // value, with TX.N set to that match; any other runs once.
+                        // value, with TX.N and MATCHED_VAR_NAME set to that
+                        // match; any other runs once.
                         if sv.name.contains("%{") && !link_matches.is_empty() {
-                            for groups in &link_matches {
+                            for (groups, name) in &link_matches {
                                 set_captures(ctx, groups);
-                                apply_setvar_with(ctx, sv, Some(&views));
+                                let scope = MacroScope {
+                                    views: Some(&views),
+                                    matched_var_name: Some(name),
+                                };
+                                apply_setvar_with(ctx, sv, scope);
                             }
                         } else {
-                            apply_setvar_with(ctx, sv, Some(&views));
+                            let scope = MacroScope {
+                                views: Some(&views),
+                                matched_var_name: link_matches.last().map(|(_, n)| n.as_str()),
+                            };
+                            apply_setvar_with(ctx, sv, scope);
                         }
                     }
                     link_matches.clear();
@@ -2797,7 +2762,11 @@ pub fn evaluate(
                 }
             }
 
-            Instruction::MatchInterpolated { cmp, raw_id } => {
+            Instruction::MatchInterpolated {
+                cmp,
+                raw_id,
+                negate,
+            } => {
                 let values = pop_strings(&mut stack);
                 let raw = &ruleset.literals[*raw_id];
                 match expand_operator_macros(raw, ctx) {
@@ -2816,30 +2785,34 @@ pub fn evaluate(
                     Some(pat) => {
                         // `None` here means "cannot be decided", and is pushed as
                         // Absent for the same reason as an unresolved macro.
-                        let verdict: Option<bool> = match cmp {
-                            InterpCmp::Streq => Some(values.iter().any(|v| *v == pat)),
+                        // A non-numeric bound is undecidable, NOT zero.
+                        // Treating it as 0 would make `@gt %{tx.max_num_args}`
+                        // fire on any request carrying a single argument.
+                        let bound = match cmp {
+                            InterpCmp::Ge | InterpCmp::Gt | InterpCmp::Lt => {
+                                pat.trim().parse::<f64>().ok()
+                            }
+                            _ => Some(0.0),
+                        };
+                        let holds = |v: &String, bound: f64| match cmp {
+                            InterpCmp::Streq => *v == pat,
                             // ModSecurity @within: the VALUE sits inside the
                             // pattern. CRS depends on this with pipe-delimited
                             // lists like `|utf-8| |iso-8859-1|`.
-                            InterpCmp::Within => {
-                                Some(values.iter().any(|v| pat.contains(v.as_str())))
-                            }
-                            InterpCmp::EndsWith => Some(values.iter().any(|v| v.ends_with(&pat))),
-                            // A non-numeric bound is undecidable, NOT zero.
-                            // Treating it as 0 would make `@gt %{tx.max_num_args}`
-                            // fire on any request carrying a single argument.
+                            InterpCmp::Within => pat.contains(v.as_str()),
+                            InterpCmp::EndsWith => v.ends_with(&pat),
                             InterpCmp::Ge | InterpCmp::Gt | InterpCmp::Lt => {
-                                pat.trim().parse::<f64>().ok().map(|bound| {
-                                    values.iter().any(|v| {
-                                        v.trim().parse::<f64>().is_ok_and(|n| match cmp {
-                                            InterpCmp::Ge => n >= bound,
-                                            InterpCmp::Gt => n > bound,
-                                            _ => n < bound,
-                                        })
-                                    })
+                                v.trim().parse::<f64>().is_ok_and(|n| match cmp {
+                                    InterpCmp::Ge => n >= bound,
+                                    InterpCmp::Gt => n > bound,
+                                    _ => n < bound,
                                 })
                             }
                         };
+                        // Negated per value, as `!@rx` is: any value for which
+                        // the comparison does not hold.
+                        let verdict: Option<bool> =
+                            bound.map(|b| values.iter().any(|v| holds(v, b) != *negate));
                         match verdict {
                             Some(matched) => {
                                 debug!(pat = %pat, matched, "MatchInterpolated");
@@ -2904,20 +2877,6 @@ pub fn evaluate(
                     let matched = hit.is_some();
                     record_match(&mut last_matched, hit);
                     debug!(matched, "DetectXss");
-                    stack.push(StackVal::Bool(matched));
-                }
-            }
-
-            Instruction::DetectOffDomainUrl => {
-                let values = pop_strings(&mut stack);
-                if values.is_empty() {
-                    stack.push(StackVal::Absent);
-                } else {
-                    let host = views.host(ctx);
-                    let hit = values.iter().find(|v| contains_off_domain_url(v, host));
-                    let matched = hit.is_some();
-                    record_match(&mut last_matched, hit);
-                    debug!(matched, "DetectOffDomainUrl");
                     stack.push(StackVal::Bool(matched));
                 }
             }
@@ -3285,18 +3244,27 @@ fn fire_rule(
 /// integers, defaulting a missing/non-numeric value to 0 — matching CRS
 /// category-score accumulation. `Set` stores the macro-expanded string as-is.
 fn apply_setvar(ctx: &mut RequestContext, sv: &SetVar) {
-    apply_setvar_with(ctx, sv, None);
+    apply_setvar_with(ctx, sv, MacroScope::default());
 }
 
-/// [`apply_setvar`] with the request's parsed collections, for the macros that
-/// read them (`%{ARGS._charset_}`, CRS 922100). A chain link has them; RuleEnd
-/// does not need them, as no unchained CRS rule's setvar reads a collection.
-fn apply_setvar_with(ctx: &mut RequestContext, sv: &SetVar, views: Option<&RequestViews>) {
+/// What a setvar's macros can read besides the TX store. A chain link has
+/// both; RuleEnd needs neither, as no unchained CRS rule's setvar reads them.
+#[derive(Clone, Copy, Default)]
+struct MacroScope<'s, 'v> {
+    /// The request's parsed collections, for `%{ARGS.name}` (CRS 922100).
+    views: Option<&'s RequestViews<'v>>,
+    /// `%{MATCHED_VAR_NAME}`: the variable the link matched. CRS 931130 names
+    /// one TX variable per matched value with it.
+    matched_var_name: Option<&'s str>,
+}
+
+/// [`apply_setvar`] with what a chain link can offer its macros.
+fn apply_setvar_with(ctx: &mut RequestContext, sv: &SetVar, scope: MacroScope) {
     // A name built from the match — `tx.header_name_920450_%{tx.0}` — is
     // expanded like a value and upper-cased to the store's key convention, so
     // the child's `TX:/^header_name_920450_/` finds it.
     let name = if sv.name.contains("%{") {
-        expand_tx_macros_with(&sv.name, ctx, views).to_ascii_uppercase()
+        expand_tx_macros_with(&sv.name, ctx, scope).to_ascii_uppercase()
     } else {
         sv.name.clone()
     };
@@ -3305,11 +3273,11 @@ fn apply_setvar_with(ctx: &mut RequestContext, sv: &SetVar, views: Option<&Reque
             ctx.tx_vars.remove(&name);
         }
         SetVarOp::Set(val) => {
-            let expanded = expand_tx_macros_with(val, ctx, views);
+            let expanded = expand_tx_macros_with(val, ctx, scope);
             ctx.tx_vars.insert(name, expanded);
         }
         SetVarOp::Add(expr) => {
-            let delta = expand_tx_macros_with(expr, ctx, views)
+            let delta = expand_tx_macros_with(expr, ctx, scope)
                 .trim()
                 .parse::<i64>()
                 .unwrap_or(0);
@@ -3318,7 +3286,7 @@ fn apply_setvar_with(ctx: &mut RequestContext, sv: &SetVar, views: Option<&Reque
                 .insert(name, cur.saturating_add(delta).to_string());
         }
         SetVarOp::Sub(expr) => {
-            let delta = expand_tx_macros_with(expr, ctx, views)
+            let delta = expand_tx_macros_with(expr, ctx, scope)
                 .trim()
                 .parse::<i64>()
                 .unwrap_or(0);
@@ -3330,10 +3298,14 @@ fn apply_setvar_with(ctx: &mut RequestContext, sv: &SetVar, views: Option<&Reque
 }
 
 /// The prefix of a `TX:/^PREFIX/` target name (upper-cased by the importer),
-/// or `None` for a plain variable name or a pattern that is not an anchored
-/// literal prefix.
+/// or `None` for a plain variable name or a pattern that is not a literal
+/// prefix. `/PREFIX.*/` (CRS 931130's `/rfi_parameter_.*/`) is read as a
+/// prefix too: unanchored it would also match a name holding the text later
+/// on, and no CRS variable name does.
 fn tx_name_prefix(name: &str) -> Option<&str> {
-    let prefix = name.strip_prefix("/^")?.strip_suffix('/')?;
+    let pattern = name.strip_prefix('/')?.strip_suffix('/')?;
+    let prefix = pattern.strip_prefix('^').unwrap_or(pattern);
+    let prefix = prefix.strip_suffix(".*").unwrap_or(prefix);
     (!prefix.is_empty()
         && prefix
             .bytes()
@@ -3361,11 +3333,7 @@ fn tx_var_i64(ctx: &RequestContext, name: &str) -> i64 {
 /// Expand `%{...}` macros in a setvar value against the current TX store and the
 /// CRS numeric constants. A macro that resolves to nothing expands to an empty
 /// string (which is treated as 0 in the numeric `Add`/`Sub` context). UTF-8 safe.
-fn expand_tx_macros_with(
-    input: &str,
-    ctx: &RequestContext,
-    views: Option<&RequestViews>,
-) -> String {
+fn expand_tx_macros_with(input: &str, ctx: &RequestContext, scope: MacroScope) -> String {
     if !input.contains("%{") {
         return input.to_owned();
     }
@@ -3376,7 +3344,7 @@ fn expand_tx_macros_with(
         let after = &rest[start + 2..];
         match after.find('}') {
             Some(end) => {
-                out.push_str(&resolve_macro(&after[..end], ctx, views));
+                out.push_str(&resolve_macro(&after[..end], ctx, scope));
                 rest = &after[end + 1..];
             }
             None => {
@@ -3391,10 +3359,10 @@ fn expand_tx_macros_with(
 }
 
 /// Resolve a single macro body such as `tx.critical_anomaly_score`: `tx.*`
-/// (with the CRS numeric-constant fallbacks) and, given the parsed collections,
-/// `args.NAME` — the first argument of that name, query then body. Anything
-/// else resolves to an empty string.
-fn resolve_macro(inner: &str, ctx: &RequestContext, views: Option<&RequestViews>) -> String {
+/// (with the CRS numeric-constant fallbacks) and, from a chain link's scope,
+/// `args.NAME` — the first argument of that name, query then body — and
+/// `matched_var_name`. Anything else resolves to an empty string.
+fn resolve_macro(inner: &str, ctx: &RequestContext, scope: MacroScope) -> String {
     let lower = inner.trim().to_ascii_lowercase();
     if let Some(var) = lower.strip_prefix("tx.") {
         let key = var.to_ascii_uppercase();
@@ -3405,7 +3373,10 @@ fn resolve_macro(inner: &str, ctx: &RequestContext, views: Option<&RequestViews>
             .or_else(|| crs_constant(&key).map(str::to_owned))
             .unwrap_or_default();
     }
-    if let (Some(name), Some(views)) = (lower.strip_prefix("args."), views) {
+    if lower == "matched_var_name" {
+        return scope.matched_var_name.unwrap_or_default().to_owned();
+    }
+    if let (Some(name), Some(views)) = (lower.strip_prefix("args."), scope.views) {
         let (Ok(query), Ok(body)) = (views.query(ctx), views.body(ctx)) else {
             return String::new();
         };

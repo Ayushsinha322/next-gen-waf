@@ -53,10 +53,7 @@ pub fn import_secrule_conf_dir(
         match item {
             RuleItem::Directive(Directive::SecRule(dir)) => {
                 let actions = parse_crs_actions(&dir.actions);
-                // 931130/931131 are collapsed into a single native OffDomainUrl
-                // rule (see secrule_directive_to_rule_with_actions); suppress chain
-                // accumulation so the unexpressable macro child condition is dropped.
-                let is_chain = actions.chain && !matches!(actions.id, Some(931130) | Some(931131));
+                let is_chain = actions.chain;
 
                 if let Some(ref mut pending) = pending_chain {
                     // This directive is a chain member — add its condition.
@@ -228,18 +225,7 @@ fn secrule_directive_to_rule_with_actions(
         CrsAction::Allow => RuleAction::Allow,
     };
 
-    // CRS 931130/931131 (off-domain reference / RFI) are chained rules that need
-    // capture groups, a dynamic `setvar`, a `TX:/regex/` collection, and a
-    // `%{request_headers.host}`-macro `@endsWith` — none of which the importer can
-    // express, so they were effectively disabled. Collapse them into the native
-    // `OffDomainUrl` operator and apply their critical score directly, preserving
-    // faithful detection (the chained child condition is dropped in the caller).
-    let (operator, score_delta, rule_action) = if matches!(rule_id, 931130 | 931131) {
-        (Operator::OffDomainUrl, Some(5), RuleAction::Score)
-    } else {
-        (operator, actions.score_delta, rule_action)
-    };
-
+    let score_delta = actions.score_delta;
     Ok(Some(RuleDef {
         id: rule_id,
         phase,

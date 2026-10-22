@@ -504,3 +504,37 @@ SecRule ARGS "@rx ^x" "id:1006,phase:2,block,t:none,msg:'any',chain"
     assert!(fired(&last, "1005"), "fired: {:?}", ids(&last));
     assert!(fired(&last, "1006"), "fired: {:?}", ids(&last));
 }
+
+// ---------------------------------------------------------------------------
+// 4. A negated operator is judged per value
+// ---------------------------------------------------------------------------
+
+/// ModSecurity tests `!@rx` against each value: the condition holds when ANY
+/// value does not match. Negating the combined result instead required that
+/// NO value match, so one value that matched hid every one that did not —
+/// how 942440's "…and it is not a JWT" refinement and 931130's off-domain
+/// check over `TX:/rfi_parameter_.*/` went quiet with two parameters.
+#[test]
+fn a_negated_operator_holds_for_any_value_that_fails_it() {
+    let eng = engine(
+        r#"
+SecRule ARGS "@rx ^x" "id:1007,phase:2,block,t:none,msg:'negated',chain"
+    SecRule MATCHED_VARS "!@rx ok$" "setvar:'tx.inbound_anomaly_score_pl1=+5'"
+"#,
+    );
+    let mut mixed = make_get_ctx("/?a=x-ok&b=x-bad");
+    eval(&eng, &mut mixed, Phase::RequestBody);
+    assert!(
+        fired(&mixed, "1007"),
+        "x-bad fails `ok$`; fired: {:?}",
+        ids(&mixed)
+    );
+
+    let mut all_ok = make_get_ctx("/?a=x-ok&b=x-also-ok");
+    eval(&eng, &mut all_ok, Phase::RequestBody);
+    assert!(
+        !fired(&all_ok, "1007"),
+        "every value matches; fired: {:?}",
+        ids(&all_ok)
+    );
+}

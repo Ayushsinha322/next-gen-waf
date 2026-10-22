@@ -355,12 +355,6 @@ pub enum Operator {
     DetectSqli,
     /// libinjection-based cross-site-scripting detection (`@detectXSS`).
     DetectXss,
-    /// Off-domain URL / Remote-File-Inclusion detection. Fires when a value
-    /// contains a `scheme://host` URL whose host is neither the request's own
-    /// Host nor a subdomain of it. Reproduces the semantics of CRS rule 931130
-    /// (which our importer cannot express directly — it needs capture groups,
-    /// dynamic `setvar`, a `TX:/regex/` collection, and `%{}` macro expansion).
-    OffDomainUrl,
     /// SSRF detection (`@ssrfUrl`). Fires when a value contains a URL whose host is an
     /// internal/loopback/link-local address or a cloud-metadata name, in ANY encoding
     /// the OS resolver accepts (decimal, hex, octal, short-form, IPv4-mapped IPv6).
