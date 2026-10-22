@@ -447,3 +447,60 @@ SecRule REQUEST_HEADERS_NAMES "@rx ^.*$" \
     eval(&eng, &mut clean, Phase::RequestHeaders);
     assert!(!fired(&clean, "1004"), "fired: {:?}", ids(&clean));
 }
+
+// ---------------------------------------------------------------------------
+// 3. MATCHED_VAR(S) is the whole value the previous link matched
+// ---------------------------------------------------------------------------
+
+/// 944120's parent finds a gadget-chain class name (`clonetransformer`); its
+/// child then looks for `processbuilder` in the same VALUE. Given only the
+/// text the parent's pattern found, the child could never match: 120 of CRS's
+/// own regression cases for this rule failed.
+#[test]
+fn rule_944120_checks_the_whole_matched_value() {
+    let eng = load_crs_engines(&["REQUEST-944-APPLICATION-ATTACK-JAVA.conf"]);
+    let mut attack = make_post_ctx("/post", "test=ProcessBuilder.evil.clonetransformer");
+    set_paranoia(&mut attack, 1);
+    eval(&eng, &mut attack, Phase::RequestBody);
+    assert!(fired(&attack, "944120"), "fired: {:?}", ids(&attack));
+
+    let mut benign = make_post_ctx("/post", "test=clonetransformer");
+    set_paranoia(&mut benign, 1);
+    eval(&eng, &mut benign, Phase::RequestBody);
+    assert!(!fired(&benign, "944120"), "fired: {:?}", ids(&benign));
+}
+
+/// 932200: the parent finds `/ca?`; the children need a `/` and whitespace in
+/// the value it came from (`www.google.com;/bin/ca? /et*/passwd`).
+#[test]
+fn rule_932200_reads_matched_var_through_two_children() {
+    let eng = load_crs_engines(&["REQUEST-932-APPLICATION-ATTACK-RCE.conf"]);
+    let mut ctx = make_get_ctx("/get?host=www.google.com;/bin/ca?+/et*/passwd");
+    set_paranoia(&mut ctx, 2);
+    eval(&eng, &mut ctx, Phase::RequestBody);
+    assert!(fired(&ctx, "932200"), "fired: {:?}", ids(&ctx));
+}
+
+#[test]
+fn matched_var_is_the_last_value_and_matched_vars_is_every_one() {
+    let eng = engine(
+        r#"
+SecRule ARGS "@rx ^x" "id:1005,phase:2,block,t:none,msg:'last',chain"
+    SecRule MATCHED_VAR "@rx yes" "setvar:'tx.inbound_anomaly_score_pl1=+5'"
+
+SecRule ARGS "@rx ^x" "id:1006,phase:2,block,t:none,msg:'any',chain"
+    SecRule MATCHED_VARS "@rx yes" "setvar:'tx.inbound_anomaly_score_pl1=+5'"
+"#,
+    );
+    // Only the FIRST matching value holds `yes`.
+    let mut first = make_get_ctx("/?a=x-yes&b=x-no");
+    eval(&eng, &mut first, Phase::RequestBody);
+    assert!(!fired(&first, "1005"), "fired: {:?}", ids(&first));
+    assert!(fired(&first, "1006"), "fired: {:?}", ids(&first));
+
+    // The LAST matching value holds it.
+    let mut last = make_get_ctx("/?a=x-no&b=x-yes");
+    eval(&eng, &mut last, Phase::RequestBody);
+    assert!(fired(&last, "1005"), "fired: {:?}", ids(&last));
+    assert!(fired(&last, "1006"), "fired: {:?}", ids(&last));
+}

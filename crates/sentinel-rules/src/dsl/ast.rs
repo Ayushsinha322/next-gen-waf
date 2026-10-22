@@ -289,9 +289,12 @@ pub enum Target {
     RemoteAddr,
     Geo,
     TxVar(String),
-    /// CRS `MATCHED_VAR` / `MATCHED_VARS`: the value the previous condition in
-    /// this chain matched. Only meaningful inside a chain.
+    /// CRS `MATCHED_VAR`: the WHOLE value of the variable the previous link in
+    /// this chain matched — the last one, when it matched several — not the
+    /// text its pattern found. Only meaningful inside a chain.
     MatchedVar,
+    /// CRS `MATCHED_VARS`: every value the previous link matched.
+    MatchedVars,
     CountOf(Box<Target>),
 }
 

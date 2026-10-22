@@ -353,7 +353,8 @@ fn token_to_target(tok: &str, rule_id: Option<u32>) -> Option<Target> {
         // value, which the VM does not carry into the child. They stay
         // unsupported, but a rule left target-less by them is now RECORDED as a
         // coverage gap instead of vanishing.
-        "MATCHED_VAR" | "MATCHED_VARS" => Some(Target::MatchedVar),
+        "MATCHED_VAR" => Some(Target::MatchedVar),
+        "MATCHED_VARS" => Some(Target::MatchedVars),
         "MATCHED_VAR_NAME" | "MATCHED_VARS_NAMES" => None,
         "FILES" => Some(Target::Files),
         "FILES_NAMES" => Some(Target::FilesNames),

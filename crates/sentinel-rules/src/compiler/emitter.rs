@@ -60,7 +60,14 @@ pub enum TargetSpec {
     /// rules. Several of them are NEGATED refinements ("...and the matched text
     /// is not a JWT"), so losing the child did not make the parent stricter, it
     /// turned the parent off.
+    ///
+    /// The previous link's WHOLE value, as ModSecurity gives it — the last
+    /// value that link matched — not the text its pattern found: 944120's
+    /// parent finds `clonetransformer` and its child looks for `processbuilder`
+    /// elsewhere in the same value.
     MatchedVar,
+    /// `MATCHED_VARS`: every value the previous link matched.
+    MatchedVars,
     CountOf(Box<TargetSpec>),
     /// `base` without the members `keys` name: a collection target its rule
     /// has exclusions for (`REQUEST_COOKIES|!REQUEST_COOKIES:/__utm/`).
@@ -143,6 +150,7 @@ impl TargetSpec {
             TargetSpec::Geo => "GEO".into(),
             TargetSpec::TxVar(v) => format!("TX:{v}"),
             TargetSpec::MatchedVar => "MATCHED_VAR".into(),
+            TargetSpec::MatchedVars => "MATCHED_VARS".into(),
             TargetSpec::CountOf(inner) => format!("&{}", inner.label()),
         }
     }
@@ -182,6 +190,7 @@ impl From<&Target> for TargetSpec {
             Target::Geo => TargetSpec::Geo,
             Target::TxVar(v) => TargetSpec::TxVar(v.clone()),
             Target::MatchedVar => TargetSpec::MatchedVar,
+            Target::MatchedVars => TargetSpec::MatchedVars,
             Target::CountOf(inner) => {
                 TargetSpec::CountOf(Box::new(TargetSpec::from(inner.as_ref())))
             }
@@ -208,13 +217,21 @@ pub enum Instruction {
     },
 
     /// [`Instruction::MatchRx`] that tests EVERY value instead of stopping at the
-    /// first match, and records each match's capture groups for the
-    /// [`Instruction::ChainLink`] that follows. Emitted only for a chain link
-    /// with a `setvar` whose name is built from its match — CRS's
-    /// `tx.header_name_920450_%{tx.0}`, which ModSecurity runs once per matched
-    /// value to collect every header name for the child to check.
+    /// first match, and records each match — its capture groups and the whole
+    /// value — for the [`Instruction::ChainLink`] that follows. Emitted only
+    /// for a chain link whose matches the chain goes on to use: a `setvar`
+    /// whose name is built from the match (CRS's `tx.header_name_920450_%{tx.0}`,
+    /// which ModSecurity runs once per matched value), or a next link that
+    /// reads `MATCHED_VAR(S)`.
     MatchRxAll {
         pattern_id: usize,
+    },
+
+    /// [`Instruction::MatchMulti`] that tests every value and records each
+    /// matching one, for a next link that reads `MATCHED_VAR(S)` (CRS 933120's
+    /// `@pmFromFile` parent).
+    MatchMultiAll {
+        set_id: usize,
     },
 
     /// Pop `StrVec`, expand the `%{...}` macros in `literals[raw_id]` against the

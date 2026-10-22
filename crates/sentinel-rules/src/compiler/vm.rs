@@ -1667,7 +1667,7 @@ fn memo_policy(spec: &TargetSpec) -> Memo {
         // Counted from the inner target, which is memoized itself when it can be.
         TargetSpec::CountOf(_) => Memo::Never,
         // VM state: written by `setvar` and by the previous chain link.
-        TargetSpec::TxVar(_) | TargetSpec::MatchedVar => Memo::Never,
+        TargetSpec::TxVar(_) | TargetSpec::MatchedVar | TargetSpec::MatchedVars => Memo::Never,
         // As its collection: every rule with the same exclusions shares it.
         TargetSpec::Except { base, .. } => memo_policy(base),
     }
@@ -1800,7 +1800,9 @@ fn extract_target(
     Ok(match spec {
         // Outside a chain nothing has matched yet, and an empty list is the
         // honest answer: the condition simply does not match.
-        TargetSpec::MatchedVar => last_matched.map(|v| vec![v.to_owned()]).unwrap_or_default(),
+        TargetSpec::MatchedVar | TargetSpec::MatchedVars => {
+            last_matched.map(|v| vec![v.to_owned()]).unwrap_or_default()
+        }
         // The collection's values in the order `base` lists them, less the
         // members the rule excludes.
         TargetSpec::Except { base, keys } => {
@@ -2501,6 +2503,11 @@ pub fn evaluate(
     // Every match of the current chain link's `MatchRxAll`, as capture groups,
     // for the `ChainLink` that closes it. Empty everywhere else.
     let mut link_matches: Vec<Vec<Option<String>>> = Vec::new();
+    // The whole values the current link matched (collected by the same
+    // instructions), and those the PREVIOUS link matched — what the next
+    // link's MATCHED_VAR(S) reads.
+    let mut link_values: Vec<String> = Vec::new();
+    let mut matched_vars: Vec<String> = Vec::new();
     // The site's time budget for this call; see `TimeBudget`. Its clock is
     // read every `CLOCK_EVERY` instructions, and before every instruction
     // while `large_values` — the last target loaded `CLOCK_BYTES` or more.
@@ -2567,9 +2574,21 @@ pub fn evaluate(
                     }) if memo_policy(spec) != Memo::Never => Some(transforms),
                     _ => None,
                 };
-                let loaded = match memo_chain {
-                    Some(transforms) => views.load_transformed(spec, transforms, ctx),
-                    None => views.load(spec, ctx, last_matched.as_deref()),
+                let loaded = match (spec, memo_chain) {
+                    // The previous link's whole values; outside a chain, or
+                    // after a link that did not record them, the matched text.
+                    (TargetSpec::MatchedVar | TargetSpec::MatchedVars, _)
+                        if !matched_vars.is_empty() =>
+                    {
+                        Ok(Rc::new(match spec {
+                            TargetSpec::MatchedVar => {
+                                matched_vars.last().cloned().into_iter().collect()
+                            }
+                            _ => matched_vars.clone(),
+                        }))
+                    }
+                    (_, Some(transforms)) => views.load_transformed(spec, transforms, ctx),
+                    (_, None) => views.load(spec, ctx, last_matched.as_deref()),
                 };
                 let values = match loaded {
                     Ok(values) => values,
@@ -2708,8 +2727,23 @@ pub fn evaluate(
                             hit = true;
                         }
                         link_matches.push(groups);
+                        link_values.push(s.clone());
                     }
                     stack.push(StackVal::Bool(hit));
+                }
+            }
+
+            Instruction::MatchMultiAll { set_id } => {
+                let values = pop_strings(&mut stack);
+                if values.is_empty() {
+                    stack.push(StackVal::Absent);
+                } else {
+                    let ac = &ruleset.ac_sets[*set_id];
+                    let before = link_values.len();
+                    link_values.extend(values.iter().filter(|s| ac.is_match(s)).cloned());
+                    let matched = link_values.len() > before;
+                    record_match(&mut last_matched, link_values.get(before));
+                    stack.push(StackVal::Bool(matched));
                 }
             }
 
@@ -2733,11 +2767,14 @@ pub fn evaluate(
                         }
                     }
                     link_matches.clear();
+                    matched_vars = std::mem::take(&mut link_values);
                     if *last {
                         stack.push(StackVal::Bool(true));
                     }
                 } else {
                     link_matches.clear();
+                    link_values.clear();
+                    matched_vars.clear();
                     stack.push(StackVal::Bool(false));
                     ip += *to_end as usize;
                     continue;
@@ -3066,6 +3103,8 @@ pub fn evaluate(
                 last_target = None;
                 targets_seen = 0;
                 link_matches.clear();
+                link_values.clear();
+                matched_vars.clear();
                 let matched_value = last_matched.take();
                 if fired {
                     if let Some(meta) = ruleset.rule_meta.get(rule_id) {

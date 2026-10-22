@@ -8,7 +8,7 @@ use regex::Regex;
 use tracing::debug;
 
 use crate::dsl::ast::{
-    CmpOp, Directive, Operator, RuleDef, RuleFile, RuleItem, RuleSeverity, SetVar,
+    CmpOp, Directive, Operator, RuleDef, RuleFile, RuleItem, RuleSeverity, SetVar, Target,
     TargetCombinator, TargetExclusion, TargetExpr, Transform, VirtualPatch,
 };
 use emitter::{CompiledRuleSet, Instruction, RuleCoverage, RuleMeta, TargetSpec};
@@ -404,6 +404,20 @@ fn compile_rule(rule: &RuleDef, state: &mut CompilerState) -> Result<(Vec<Instru
     // ran the starter's setvars only after the child had already been
     // evaluated against a variable that did not exist yet, and applied the
     // starter's transformations to every child.
+    //
+    // A link records every value it matched when the chain goes on to use
+    // them: a setvar named from the match, or a next link reading
+    // MATCHED_VAR(S) — the whole value, not the text the pattern found.
+    let reads_matched = |next: Option<&crate::dsl::ast::ChainCondition>| {
+        next.is_some_and(|c| {
+            c.targets
+                .iter()
+                .any(|t| matches!(t.target, Target::MatchedVar | Target::MatchedVars))
+        })
+    };
+    let collects = |setvars: &[SetVar], next| {
+        reads_matched(next) || setvars.iter().any(|sv| sv.name.contains("%{"))
+    };
     let mut links: Vec<usize> = Vec::with_capacity(rule.chain_conditions.len() + 1);
     emit_link(
         &rule.targets,
@@ -411,7 +425,7 @@ fn compile_rule(rule: &RuleDef, state: &mut CompilerState) -> Result<(Vec<Instru
         &rule.operator,
         &rule.transforms,
         rule.multi_match,
-        &rule.setvars,
+        collects(&rule.setvars, rule.chain_conditions.first()),
         state,
         &mut instrs,
     )?;
@@ -428,7 +442,7 @@ fn compile_rule(rule: &RuleDef, state: &mut CompilerState) -> Result<(Vec<Instru
             &chain.operator,
             &chain.transforms,
             chain.multi_match,
-            &chain.setvars,
+            collects(&chain.setvars, rule.chain_conditions.get(i + 1)),
             state,
             &mut instrs,
         )?;
@@ -451,9 +465,8 @@ fn compile_rule(rule: &RuleDef, state: &mut CompilerState) -> Result<(Vec<Instru
     Ok((instrs, meta))
 }
 
-/// One link of a chain: its condition, with every regex match recording all
-/// of its matches when one of the link's setvars is named from the match
-/// (`tx.header_name_920450_%{tx.0}`) and so runs once per matched value.
+/// One link of a chain: its condition, its regex and phrase matches
+/// recording every value they match when the chain uses them (`collect`).
 #[allow(clippy::too_many_arguments)]
 fn emit_link(
     targets: &[TargetExpr],
@@ -461,7 +474,7 @@ fn emit_link(
     operator: &Operator,
     transforms: &[Transform],
     multi_match: bool,
-    setvars: &[SetVar],
+    collect: bool,
     state: &mut CompilerState,
     instrs: &mut Vec<Instruction>,
 ) -> Result<()> {
@@ -475,10 +488,16 @@ fn emit_link(
         state,
         instrs,
     )?;
-    if setvars.iter().any(|sv| sv.name.contains("%{")) {
+    if collect {
         for instr in &mut instrs[from..] {
-            if let Instruction::MatchRx { pattern_id } = *instr {
-                *instr = Instruction::MatchRxAll { pattern_id };
+            match *instr {
+                Instruction::MatchRx { pattern_id } => {
+                    *instr = Instruction::MatchRxAll { pattern_id };
+                }
+                Instruction::MatchMulti { set_id } => {
+                    *instr = Instruction::MatchMultiAll { set_id };
+                }
+                _ => {}
             }
         }
     }
