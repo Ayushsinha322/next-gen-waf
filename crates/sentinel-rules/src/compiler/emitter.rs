@@ -207,6 +207,16 @@ pub enum Instruction {
         pattern_id: usize,
     },
 
+    /// [`Instruction::MatchRx`] that tests EVERY value instead of stopping at the
+    /// first match, and records each match's capture groups for the
+    /// [`Instruction::ChainLink`] that follows. Emitted only for a chain link
+    /// with a `setvar` whose name is built from its match — CRS's
+    /// `tx.header_name_920450_%{tx.0}`, which ModSecurity runs once per matched
+    /// value to collect every header name for the child to check.
+    MatchRxAll {
+        pattern_id: usize,
+    },
+
     /// Pop `StrVec`, expand the `%{...}` macros in `literals[raw_id]` against the
     /// request, then compare each value with `cmp`.
     ///
@@ -300,6 +310,21 @@ pub enum Instruction {
     /// Does NOT pop the stack.
     JmpIfFalse {
         offset: i32,
+    },
+
+    /// Close one link of a chained rule, the way ModSecurity runs a chain.
+    ///
+    /// Pops the link's result. If it matched, the link's own `setvar`s run now
+    /// — before the next link is evaluated, which is what lets a CRS parent
+    /// store a value for its child to check — and evaluation continues with the
+    /// next link; the LAST link pushes `Bool(true)` for `RuleEnd`. If it did not
+    /// match, `Bool(false)` is pushed and the VM jumps `to_end` instructions
+    /// forward, onto the rule's `RuleEnd`: no later link is evaluated and none
+    /// of its `setvar`s run.
+    ChainLink {
+        setvars: Vec<SetVar>,
+        to_end: u32,
+        last: bool,
     },
 
     /// Pop Bool from stack.  If true, apply the rule's action/score/log.

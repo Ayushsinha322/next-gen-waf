@@ -72,9 +72,21 @@ pub fn import_secrule_conf_dir(
                             // Chain members may have empty targets (bare operator
                             // that applies to the previously matched value) — we
                             // treat those as Exists stubs.
-                            pending
-                                .chain_conditions
-                                .push(ChainCondition { targets, operator });
+                            // The link keeps its own transformations and
+                            // setvars: ModSecurity runs each chain member with
+                            // its own `t:` list (the parent's do not carry
+                            // over) and executes a member's non-disruptive
+                            // actions when THAT member matches. Keeping only
+                            // targets and operator compiled the protocol-policy
+                            // rules into links that could never match — see
+                            // tests/crs_chain_semantics.rs.
+                            pending.chain_conditions.push(ChainCondition {
+                                targets,
+                                operator,
+                                transforms: actions.transforms.clone(),
+                                multi_match: actions.multi_match,
+                                setvars: actions.setvars.clone(),
+                            });
 
                             // Inherit the chain CHILD's anomaly-score
                             // contribution.

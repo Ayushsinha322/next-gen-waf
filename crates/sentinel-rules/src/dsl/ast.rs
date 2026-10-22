@@ -138,6 +138,17 @@ pub enum SetVarOp {
 pub struct ChainCondition {
     pub targets: Vec<TargetExpr>,
     pub operator: Operator,
+    /// This link's OWN transformations. ModSecurity gives every rule in a
+    /// chain its own `t:` list; the parent's never apply to a child.
+    #[serde(default)]
+    pub transforms: Vec<Transform>,
+    /// This link's own `multiMatch`.
+    #[serde(default)]
+    pub multi_match: bool,
+    /// This link's own `setvar`s, run as soon as the link matches — so a
+    /// category score on the last link counts only when the whole chain does.
+    #[serde(default)]
+    pub setvars: Vec<SetVar>,
 }
 
 impl Default for RuleDef {

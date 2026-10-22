@@ -8,8 +8,8 @@ use regex::Regex;
 use tracing::debug;
 
 use crate::dsl::ast::{
-    CmpOp, Directive, Operator, RuleDef, RuleFile, RuleItem, RuleSeverity, TargetCombinator,
-    TargetExclusion, TargetExpr, Transform, VirtualPatch,
+    CmpOp, Directive, Operator, RuleDef, RuleFile, RuleItem, RuleSeverity, SetVar,
+    TargetCombinator, TargetExclusion, TargetExpr, Transform, VirtualPatch,
 };
 use emitter::{CompiledRuleSet, Instruction, RuleCoverage, RuleMeta, TargetSpec};
 use optimizer::build_ac;
@@ -362,6 +362,7 @@ pub fn compile(file: RuleFile) -> Result<CompiledRuleSet> {
 
 fn compile_rule(rule: &RuleDef, state: &mut CompilerState) -> Result<(Vec<Instruction>, RuleMeta)> {
     let mut instrs: Vec<Instruction> = Vec::new();
+    let chained = !rule.chain_conditions.is_empty();
     let meta = RuleMeta {
         id: rule.id,
         message: rule.message.clone().unwrap_or_default(),
@@ -371,37 +372,117 @@ fn compile_rule(rule: &RuleDef, state: &mut CompilerState) -> Result<(Vec<Instru
         tags: rule.tags.clone(),
         phase: rule.phase,
         skip_after: rule.skip_after.clone(),
-        setvars: rule.setvars.clone(),
+        // A chain runs its setvars link by link (below), so none are left
+        // for RuleEnd: running the starter's again there would count a
+        // category score twice.
+        setvars: if chained {
+            Vec::new()
+        } else {
+            rule.setvars.clone()
+        },
     };
 
-    emit_condition(
-        &rule.targets,
-        &rule.exclusions,
-        &rule.operator,
-        &rule.transforms,
-        rule.multi_match,
-        state,
-        &mut instrs,
-    )?;
-
-    // Chain conditions: AND-ed with the primary condition result.
-    // Transforms from the parent rule also apply to chain member targets.
-    for chain in &rule.chain_conditions {
+    if !chained {
         emit_condition(
-            &chain.targets,
-            &[],
-            &chain.operator,
+            &rule.targets,
+            &rule.exclusions,
+            &rule.operator,
             &rule.transforms,
             rule.multi_match,
             state,
             &mut instrs,
         )?;
-        instrs.push(Instruction::And);
+        instrs.push(Instruction::RuleEnd { rule_id: rule.id });
+        return Ok((instrs, meta));
     }
 
+    // A chain, link by link, as ModSecurity runs it: each link is matched
+    // with its OWN transformations, its setvars run as soon as it matches —
+    // so the starter's `setvar:tx.content_type=|%{tx.0}|` exists before the
+    // child reads `TX:content_type` — and the first link that does not match
+    // ends the chain. Compiling every link up front and ANDing the results
+    // ran the starter's setvars only after the child had already been
+    // evaluated against a variable that did not exist yet, and applied the
+    // starter's transformations to every child.
+    let mut links: Vec<usize> = Vec::with_capacity(rule.chain_conditions.len() + 1);
+    emit_link(
+        &rule.targets,
+        &rule.exclusions,
+        &rule.operator,
+        &rule.transforms,
+        rule.multi_match,
+        &rule.setvars,
+        state,
+        &mut instrs,
+    )?;
+    links.push(instrs.len());
+    instrs.push(Instruction::ChainLink {
+        setvars: rule.setvars.clone(),
+        to_end: 0,
+        last: false,
+    });
+    for (i, chain) in rule.chain_conditions.iter().enumerate() {
+        emit_link(
+            &chain.targets,
+            &[],
+            &chain.operator,
+            &chain.transforms,
+            chain.multi_match,
+            &chain.setvars,
+            state,
+            &mut instrs,
+        )?;
+        links.push(instrs.len());
+        instrs.push(Instruction::ChainLink {
+            setvars: chain.setvars.clone(),
+            to_end: 0,
+            last: i + 1 == rule.chain_conditions.len(),
+        });
+    }
+    // Each ChainLink jumps onto the RuleEnd that follows the last link.
+    let end = instrs.len();
+    for at in links {
+        if let Instruction::ChainLink { to_end, .. } = &mut instrs[at] {
+            *to_end = u32::try_from(end - at).context("chain too long to jump over")?;
+        }
+    }
     instrs.push(Instruction::RuleEnd { rule_id: rule.id });
 
     Ok((instrs, meta))
+}
+
+/// One link of a chain: its condition, with every regex match recording all
+/// of its matches when one of the link's setvars is named from the match
+/// (`tx.header_name_920450_%{tx.0}`) and so runs once per matched value.
+#[allow(clippy::too_many_arguments)]
+fn emit_link(
+    targets: &[TargetExpr],
+    exclusions: &[TargetExclusion],
+    operator: &Operator,
+    transforms: &[Transform],
+    multi_match: bool,
+    setvars: &[SetVar],
+    state: &mut CompilerState,
+    instrs: &mut Vec<Instruction>,
+) -> Result<()> {
+    let from = instrs.len();
+    emit_condition(
+        targets,
+        exclusions,
+        operator,
+        transforms,
+        multi_match,
+        state,
+        instrs,
+    )?;
+    if setvars.iter().any(|sv| sv.name.contains("%{")) {
+        for instr in &mut instrs[from..] {
+            if let Instruction::MatchRx { pattern_id } = *instr {
+                *instr = Instruction::MatchRxAll { pattern_id };
+            }
+        }
+    }
+    Ok(())
 }
 
 fn compile_virtual_patch(

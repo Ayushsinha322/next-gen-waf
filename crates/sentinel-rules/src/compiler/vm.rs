@@ -2035,11 +2035,26 @@ fn extract_target(
         }
         TargetSpec::RemoteAddr => vec![ctx.client_ip.to_string()],
         TargetSpec::Geo => vec![], // TODO: GeoIP in Phase 2
-        TargetSpec::TxVar(name) => ctx
-            .tx_vars
-            .get(name)
-            .map(|v| vec![v.clone()])
-            .unwrap_or_default(),
+        // `TX:/^header_name_920450_/` — every variable whose name starts with
+        // the prefix, which is how CRS reads the set a per-match setvar built.
+        // Only an anchored literal prefix is understood; any other pattern
+        // reads nothing, as an unknown name does.
+        TargetSpec::TxVar(name) => match tx_name_prefix(name) {
+            Some(prefix) => {
+                let mut hits: Vec<(&String, &String)> = ctx
+                    .tx_vars
+                    .iter()
+                    .filter(|(k, _)| k.starts_with(prefix))
+                    .collect();
+                hits.sort(); // a HashMap's order is not a request's
+                hits.into_iter().map(|(_, v)| v.clone()).collect()
+            }
+            None => ctx
+                .tx_vars
+                .get(name)
+                .map(|v| vec![v.clone()])
+                .unwrap_or_default(),
+        },
         TargetSpec::CountOf(inner) => {
             let count = match inner.as_ref() {
                 TargetSpec::RequestHeader(name) => {
@@ -2483,6 +2498,9 @@ pub fn evaluate(
     // miss), so a stale value from an earlier rule can never be attributed to
     // a later one.
     let mut last_matched: Option<String> = None;
+    // Every match of the current chain link's `MatchRxAll`, as capture groups,
+    // for the `ChainLink` that closes it. Empty everywhere else.
+    let mut link_matches: Vec<Vec<Option<String>>> = Vec::new();
     // The site's time budget for this call; see `TimeBudget`. Its clock is
     // read every `CLOCK_EVERY` instructions, and before every instruction
     // while `large_values` — the last target loaded `CLOCK_BYTES` or more.
@@ -2643,9 +2661,16 @@ pub fn evaluate(
                         // `find` instead of `is_match` so the matched text can be
                         // named on the eventual security event; same lazy-DFA
                         // path, and it still stops at the first matching value.
+                        //
+                        // The whole match is TX.0 here too: `capture` needs no
+                        // group in the pattern. CRS 920420 captures with
+                        // `^[^;\s]+` and stores `|%{tx.0}|` for its child to
+                        // check — without TX.0 the child would read `||` and
+                        // flag every Content-Type there is.
                         let mut hit = false;
                         for s in values.iter() {
                             if let Some(m) = regex.find(s) {
+                                ctx.tx_vars.insert("0".to_owned(), m.as_str().to_owned());
                                 record_match(&mut last_matched, Some(m.as_str()));
                                 hit = true;
                                 break;
@@ -2655,6 +2680,67 @@ pub fn evaluate(
                     };
                     debug!(pattern = %regex.as_str(), matched, "MatchRx");
                     stack.push(StackVal::Bool(matched));
+                }
+            }
+
+            // Every value, every match recorded for the ChainLink that
+            // follows; TX.N and the matched text are the FIRST match's, as
+            // MatchRx leaves them.
+            Instruction::MatchRxAll { pattern_id } => {
+                let values = pop_strings(&mut stack);
+                if values.is_empty() {
+                    stack.push(StackVal::Absent);
+                } else {
+                    let regex = &ruleset.patterns[*pattern_id];
+                    let mut hit = false;
+                    for s in values.iter() {
+                        let Some(caps) = regex.captures(s) else {
+                            continue;
+                        };
+                        let groups: Vec<Option<String>> = caps
+                            .iter()
+                            .take(10)
+                            .map(|g| g.map(|m| m.as_str().to_owned()))
+                            .collect();
+                        if !hit {
+                            set_captures(ctx, &groups);
+                            record_match(&mut last_matched, caps.get(0).map(|m| m.as_str()));
+                            hit = true;
+                        }
+                        link_matches.push(groups);
+                    }
+                    stack.push(StackVal::Bool(hit));
+                }
+            }
+
+            Instruction::ChainLink {
+                setvars,
+                to_end,
+                last,
+            } => {
+                let matched = pop_bool(&mut stack);
+                if matched {
+                    for sv in setvars {
+                        // A setvar named from the match runs once per matched
+                        // value, with TX.N set to that match; any other runs once.
+                        if sv.name.contains("%{") && !link_matches.is_empty() {
+                            for groups in &link_matches {
+                                set_captures(ctx, groups);
+                                apply_setvar_with(ctx, sv, Some(&views));
+                            }
+                        } else {
+                            apply_setvar_with(ctx, sv, Some(&views));
+                        }
+                    }
+                    link_matches.clear();
+                    if *last {
+                        stack.push(StackVal::Bool(true));
+                    }
+                } else {
+                    link_matches.clear();
+                    stack.push(StackVal::Bool(false));
+                    ip += *to_end as usize;
+                    continue;
                 }
             }
 
@@ -2979,6 +3065,7 @@ pub fn evaluate(
                 };
                 last_target = None;
                 targets_seen = 0;
+                link_matches.clear();
                 let matched_value = last_matched.take();
                 if fired {
                     if let Some(meta) = ruleset.rule_meta.get(rule_id) {
@@ -3159,31 +3246,67 @@ fn fire_rule(
 /// integers, defaulting a missing/non-numeric value to 0 — matching CRS
 /// category-score accumulation. `Set` stores the macro-expanded string as-is.
 fn apply_setvar(ctx: &mut RequestContext, sv: &SetVar) {
+    apply_setvar_with(ctx, sv, None);
+}
+
+/// [`apply_setvar`] with the request's parsed collections, for the macros that
+/// read them (`%{ARGS._charset_}`, CRS 922100). A chain link has them; RuleEnd
+/// does not need them, as no unchained CRS rule's setvar reads a collection.
+fn apply_setvar_with(ctx: &mut RequestContext, sv: &SetVar, views: Option<&RequestViews>) {
+    // A name built from the match — `tx.header_name_920450_%{tx.0}` — is
+    // expanded like a value and upper-cased to the store's key convention, so
+    // the child's `TX:/^header_name_920450_/` finds it.
+    let name = if sv.name.contains("%{") {
+        expand_tx_macros_with(&sv.name, ctx, views).to_ascii_uppercase()
+    } else {
+        sv.name.clone()
+    };
     match &sv.op {
         SetVarOp::Unset => {
-            ctx.tx_vars.remove(&sv.name);
+            ctx.tx_vars.remove(&name);
         }
         SetVarOp::Set(val) => {
-            let expanded = expand_tx_macros(val, ctx);
-            ctx.tx_vars.insert(sv.name.clone(), expanded);
+            let expanded = expand_tx_macros_with(val, ctx, views);
+            ctx.tx_vars.insert(name, expanded);
         }
         SetVarOp::Add(expr) => {
-            let delta = expand_tx_macros(expr, ctx)
+            let delta = expand_tx_macros_with(expr, ctx, views)
                 .trim()
                 .parse::<i64>()
                 .unwrap_or(0);
-            let cur = tx_var_i64(ctx, &sv.name);
+            let cur = tx_var_i64(ctx, &name);
             ctx.tx_vars
-                .insert(sv.name.clone(), cur.saturating_add(delta).to_string());
+                .insert(name, cur.saturating_add(delta).to_string());
         }
         SetVarOp::Sub(expr) => {
-            let delta = expand_tx_macros(expr, ctx)
+            let delta = expand_tx_macros_with(expr, ctx, views)
                 .trim()
                 .parse::<i64>()
                 .unwrap_or(0);
-            let cur = tx_var_i64(ctx, &sv.name);
+            let cur = tx_var_i64(ctx, &name);
             ctx.tx_vars
-                .insert(sv.name.clone(), cur.saturating_sub(delta).to_string());
+                .insert(name, cur.saturating_sub(delta).to_string());
+        }
+    }
+}
+
+/// The prefix of a `TX:/^PREFIX/` target name (upper-cased by the importer),
+/// or `None` for a plain variable name or a pattern that is not an anchored
+/// literal prefix.
+fn tx_name_prefix(name: &str) -> Option<&str> {
+    let prefix = name.strip_prefix("/^")?.strip_suffix('/')?;
+    (!prefix.is_empty()
+        && prefix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'))
+    .then_some(prefix)
+}
+
+/// Set TX.0..TX.9 from one match's capture groups, as `capture` does.
+fn set_captures(ctx: &mut RequestContext, groups: &[Option<String>]) {
+    for (i, g) in groups.iter().enumerate() {
+        if let Some(v) = g {
+            ctx.tx_vars.insert(i.to_string(), v.clone());
         }
     }
 }
@@ -3199,7 +3322,11 @@ fn tx_var_i64(ctx: &RequestContext, name: &str) -> i64 {
 /// Expand `%{...}` macros in a setvar value against the current TX store and the
 /// CRS numeric constants. A macro that resolves to nothing expands to an empty
 /// string (which is treated as 0 in the numeric `Add`/`Sub` context). UTF-8 safe.
-fn expand_tx_macros(input: &str, ctx: &RequestContext) -> String {
+fn expand_tx_macros_with(
+    input: &str,
+    ctx: &RequestContext,
+    views: Option<&RequestViews>,
+) -> String {
     if !input.contains("%{") {
         return input.to_owned();
     }
@@ -3210,7 +3337,7 @@ fn expand_tx_macros(input: &str, ctx: &RequestContext) -> String {
         let after = &rest[start + 2..];
         match after.find('}') {
             Some(end) => {
-                out.push_str(&resolve_macro(&after[..end], ctx));
+                out.push_str(&resolve_macro(&after[..end], ctx, views));
                 rest = &after[end + 1..];
             }
             None => {
@@ -3224,28 +3351,39 @@ fn expand_tx_macros(input: &str, ctx: &RequestContext) -> String {
     out
 }
 
-/// Resolve a single macro body such as `tx.critical_anomaly_score`. Only `tx.*`
-/// references (and their CRS numeric-constant fallbacks) are modelled; any other
-/// collection resolves to an empty string.
-fn resolve_macro(inner: &str, ctx: &RequestContext) -> String {
+/// Resolve a single macro body such as `tx.critical_anomaly_score`: `tx.*`
+/// (with the CRS numeric-constant fallbacks) and, given the parsed collections,
+/// `args.NAME` — the first argument of that name, query then body. Anything
+/// else resolves to an empty string.
+fn resolve_macro(inner: &str, ctx: &RequestContext, views: Option<&RequestViews>) -> String {
     let lower = inner.trim().to_ascii_lowercase();
-    match lower.strip_prefix("tx.") {
-        Some(var) => {
-            let key = var.to_ascii_uppercase();
-            ctx.tx_vars
-                .get(&key)
-                .cloned()
-                .or_else(|| crs_constant(&key).map(str::to_owned))
-                .unwrap_or_default()
-        }
-        None => String::new(),
+    if let Some(var) = lower.strip_prefix("tx.") {
+        let key = var.to_ascii_uppercase();
+        return ctx
+            .tx_vars
+            .get(&key)
+            .cloned()
+            .or_else(|| crs_constant(&key).map(str::to_owned))
+            .unwrap_or_default();
     }
+    if let (Some(name), Some(views)) = (lower.strip_prefix("args."), views) {
+        let (Ok(query), Ok(body)) = (views.query(ctx), views.body(ctx)) else {
+            return String::new();
+        };
+        return query
+            .iter()
+            .chain(body.iter())
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.to_owned())
+            .unwrap_or_default();
+    }
+    String::new()
 }
 
 /// Expand `%{...}` macros in an OPERATOR pattern, returning `None` if any of
 /// them cannot be resolved to a non-empty value.
 ///
-/// Deliberately stricter than [`expand_tx_macros`], which is for `setvar` values
+/// Deliberately stricter than [`expand_tx_macros_with`], which is for `setvar` values
 /// and resolves the unknown to `""`. An empty expansion is harmless in a setvar
 /// and catastrophic in an operator: CRS has rules of the form
 /// `REQUEST_METHOD "!@within %{tx.allowed_methods}"`, and an empty allow-list
