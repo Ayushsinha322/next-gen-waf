@@ -485,3 +485,58 @@ async fn scanner_guard_blocks_scanner_user_agents_only() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Memory limits are enforced, not advisory
+// ---------------------------------------------------------------------------
+
+/// `evaluate` grows linear memory by `pages` 64 KiB pages and traps if the
+/// host refuses — so a refused growth shows as a failed evaluation.
+fn wasm_that_grows(pages: u32) -> Vec<u8> {
+    wat::parse_str(format!(
+        r#"
+(module
+  (memory 1)
+  (func (export "evaluate")
+    (if (i32.eq (memory.grow (i32.const {pages})) (i32.const -1))
+      (then unreachable)))
+)
+"#
+    ))
+    .unwrap()
+}
+
+/// The per-plugin limit used to be stored and read by nothing, and the engine
+/// setting that stood for a cap only chose how memory was reserved: a plugin
+/// could grow to whatever its module declared.
+#[tokio::test]
+async fn a_plugin_cannot_grow_past_its_memory_limit() {
+    let mut rt = PluginRuntime::new().unwrap();
+    rt.set_fuel_limit(None);
+    rt.load_plugin("grow32", &wasm_that_grows(512)).unwrap(); // +32 MiB
+    let ctx = make_ctx();
+    // Default limit: 16 MiB.
+    assert!(rt.evaluate_plugin("grow32", &ctx).await.failed);
+    // Given room, the same plugin runs.
+    rt.set_memory_limit("grow32", Some(64 * 1024 * 1024));
+    assert!(!rt.evaluate_plugin("grow32", &ctx).await.failed);
+    // And a small growth within the default is fine.
+    rt.load_plugin("grow1", &wasm_that_grows(16)).unwrap(); // +1 MiB
+    assert!(!rt.evaluate_plugin("grow1", &ctx).await.failed);
+}
+
+#[tokio::test]
+async fn a_module_declaring_more_than_its_limit_does_not_start() {
+    let mut rt = PluginRuntime::new().unwrap();
+    let wasm = wat::parse_str(
+        r#"
+(module
+  (memory 320) ;; 20 MiB
+  (func (export "evaluate"))
+)
+"#,
+    )
+    .unwrap();
+    rt.load_plugin("big", &wasm).unwrap();
+    assert!(rt.evaluate_plugin("big", &make_ctx()).await.failed);
+}

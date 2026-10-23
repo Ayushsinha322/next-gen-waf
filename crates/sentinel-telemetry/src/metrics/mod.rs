@@ -362,7 +362,7 @@ impl MetricsRegistry {
                     name: format!("{}_summary", h.name),
                     kind: "summary",
                     help: h.help.clone(),
-                    value: format!("{:.4}", q_val),
+                    value: format!("{q_val:.4}"),
                     labels,
                 });
             }
@@ -402,7 +402,7 @@ impl MetricsRegistry {
                 name: format!("{}_sum", h.name),
                 kind: "counter",
                 help: format!("{} (sum)", h.help),
-                value: format!("{:.4}", sum),
+                value: format!("{sum:.4}"),
                 labels: HashMap::new(),
             });
         }
@@ -426,7 +426,7 @@ impl MetricsRegistry {
                 let label_str = line
                     .labels
                     .iter()
-                    .map(|(k, v)| format!("{}=\"{}\"", k, v))
+                    .map(|(k, v)| format!("{k}=\"{v}\""))
                     .collect::<Vec<_>>()
                     .join(",");
                 out.push_str(&format!("{}{{{}}} {}\n", line.name, label_str, line.value));

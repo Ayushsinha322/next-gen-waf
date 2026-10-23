@@ -68,6 +68,9 @@ pub struct PluginEvalResult {
 // PluginRuntime
 // ---------------------------------------------------------------------------
 
+/// A plugin's linear memory when none is configured for it: 16 MiB.
+pub const DEFAULT_MEMORY_LIMIT: usize = 16 * 1024 * 1024;
+
 /// The WASM plugin host runtime.
 ///
 /// Holds a shared [`Engine`], a map of pre-compiled [`Module`]s keyed by
@@ -99,12 +102,13 @@ impl PluginRuntime {
 
     /// Create a new runtime with a default wasmtime engine.
     ///
-    /// Plugins are limited to 16 MiB of linear memory with a 2 MiB guard page.
-    /// Epoch interruption is enabled with a 1ms deadline.
+    /// Each invocation's linear memory is capped by the store's resource
+    /// limiter at the plugin's limit, [`DEFAULT_MEMORY_LIMIT`] unless one is
+    /// set. The engine setting that used to stand for this
+    /// (`static_memory_maximum_size`) chose how memory was RESERVED, never how
+    /// much a plugin could grow to. Epoch interruption: a 1 ms deadline.
     pub fn new() -> anyhow::Result<Self> {
         let mut config = wasmtime::Config::default();
-        config.static_memory_maximum_size(16 * 1024 * 1024);
-        config.static_memory_guard_size(2 * 1024 * 1024);
         // Enable fuel metering for CPU budget enforcement.
         config.consume_fuel(true);
         // Enable epoch interruption for preempting runaway plugins.
@@ -121,9 +125,8 @@ impl PluginRuntime {
         })
     }
 
-    /// Set the fuel (instruction) limit per plugin invocation.
-    ///
-    /// Set to `None` to disable fuel metering entirely.
+    /// Set the fuel (instruction) limit per plugin invocation; `None` for no
+    /// limit.
     pub fn set_fuel_limit(&mut self, limit: Option<u64>) {
         self.fuel_limit = limit;
     }
@@ -139,9 +142,10 @@ impl PluginRuntime {
         self.epoch_deadline
     }
 
-    /// Set a per-plugin memory limit hint (in bytes).  The engine-level
-    /// cap (16 MiB) applies to all plugins; this field is advisory and
-    /// reserved for future engine-per-plugin support.
+    /// Set a plugin's linear-memory limit in bytes (`None`: the default,
+    /// [`DEFAULT_MEMORY_LIMIT`]). Enforced on every invocation: memory beyond
+    /// it cannot be grown, and a module that declares more at the start fails
+    /// to instantiate.
     pub fn set_memory_limit(&mut self, plugin_name: &str, limit_bytes: Option<usize>) {
         match limit_bytes {
             Some(bytes) => {
@@ -153,8 +157,7 @@ impl PluginRuntime {
         }
     }
 
-    /// Get the per-plugin memory limit hint (in bytes). Returns `None` if no
-    /// limit has been set for this plugin.
+    /// The plugin's own memory limit in bytes, `None` when it has the default.
     pub fn memory_limit(&self, plugin_name: &str) -> Option<usize> {
         self.memory_limits.get(plugin_name).copied()
     }
@@ -169,7 +172,7 @@ impl PluginRuntime {
     /// function every time the plugin is invoked for a request.
     pub fn load_plugin(&mut self, name: &str, wasm_bytes: &[u8]) -> anyhow::Result<()> {
         let module = Module::from_binary(&self.engine, wasm_bytes)
-            .map_err(|e| anyhow::anyhow!("failed to compile plugin '{}': {}", name, e))?;
+            .map_err(|e| anyhow::anyhow!("failed to compile plugin '{name}': {e}"))?;
         self.modules.insert(name.to_string(), module);
         tracing::info!(%name, "plugin module loaded");
         Ok(())
@@ -191,7 +194,7 @@ impl PluginRuntime {
     /// clone, then swap it in via the proxy's `ArcSwap<PluginRuntime>`.
     pub fn hot_reload(&mut self, name: &str, wasm_bytes: &[u8]) -> anyhow::Result<()> {
         let module = Module::from_binary(&self.engine, wasm_bytes)
-            .map_err(|e| anyhow::anyhow!("failed to recompile plugin '{}': {}", name, e))?;
+            .map_err(|e| anyhow::anyhow!("failed to recompile plugin '{name}': {e}"))?;
         let replaced = self.modules.insert(name.to_string(), module).is_some();
         if replaced {
             tracing::info!(%name, "plugin module hot-reloaded");
@@ -208,7 +211,7 @@ impl PluginRuntime {
     pub async fn install_from_url(&mut self, name: &str, url: &str) -> anyhow::Result<()> {
         let bytes = crate::registry::download_wasm(url)
             .await
-            .map_err(|e| anyhow::anyhow!("install_from_url '{}': {}", url, e))?;
+            .map_err(|e| anyhow::anyhow!("install_from_url '{url}': {e}"))?;
         self.load_plugin(name, &bytes)
     }
 
@@ -218,7 +221,7 @@ impl PluginRuntime {
     pub async fn install_from_oci(&mut self, name: &str, oci_ref: &str) -> anyhow::Result<()> {
         let bytes = crate::registry::pull_wasm(oci_ref)
             .await
-            .map_err(|e| anyhow::anyhow!("install_from_oci '{}': {}", oci_ref, e))?;
+            .map_err(|e| anyhow::anyhow!("install_from_oci '{oci_ref}': {e}"))?;
         self.load_plugin(name, &bytes)
     }
 
@@ -231,14 +234,14 @@ impl PluginRuntime {
     /// needs the name, and the manifest is the only place it is written).
     pub fn load_from_manifest(&mut self, manifest_path: &Path) -> anyhow::Result<String> {
         let manifest_bytes = std::fs::read(manifest_path)
-            .map_err(|e| anyhow::anyhow!("failed to read manifest {:?}: {}", manifest_path, e))?;
+            .map_err(|e| anyhow::anyhow!("failed to read manifest {manifest_path:?}: {e}"))?;
         let manifest = PluginManifest::from_slice(&manifest_bytes)
-            .map_err(|e| anyhow::anyhow!("failed to parse manifest {:?}: {}", manifest_path, e))?;
+            .map_err(|e| anyhow::anyhow!("failed to parse manifest {manifest_path:?}: {e}"))?;
 
         let dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
         let wasm_path = dir.join(&manifest.plugin.wasm);
         let wasm_bytes = std::fs::read(&wasm_path)
-            .map_err(|e| anyhow::anyhow!("failed to read wasm {:?}: {}", wasm_path, e))?;
+            .map_err(|e| anyhow::anyhow!("failed to read wasm {wasm_path:?}: {e}"))?;
 
         self.load_plugin(&manifest.plugin.name, &wasm_bytes)?;
 
@@ -306,16 +309,30 @@ impl PluginRuntime {
             plugin_name: plugin_name.to_string(),
             kv_store: self.kv_store.clone(),
             callouts: Vec::new(),
+            // One instance, one memory, at most the plugin's limit.
+            limits: wasmtime::StoreLimitsBuilder::new()
+                .memory_size(
+                    self.memory_limits
+                        .get(plugin_name)
+                        .copied()
+                        .unwrap_or(DEFAULT_MEMORY_LIMIT),
+                )
+                .instances(1)
+                .memories(1)
+                .build(),
         };
 
         let mut store = Store::new(&self.engine, plugin_ctx);
+        store.limiter(|ctx| &mut ctx.limits);
 
-        // Apply fuel limit if configured.
-        if let Some(limit) = self.fuel_limit {
-            store.set_fuel(limit).unwrap_or_else(|e| {
+        // Fuel metering is on for the whole engine, so a store starts with
+        // none: "no limit" has to mean all the fuel there is. Skipping the
+        // call for `None` left every plugin trapping at its first instruction.
+        store
+            .set_fuel(self.fuel_limit.unwrap_or(u64::MAX))
+            .unwrap_or_else(|e| {
                 tracing::warn!(%plugin_name, error = %e, "failed to set fuel limit");
             });
-        }
 
         // Apply epoch deadline for interruption of runaway plugins.
         if let Some(deadline) = self.epoch_deadline {

@@ -3,22 +3,22 @@
 //! Every guest module imports the following from the `"env"` module:
 //!   - `host_log(ptr, len)`             — write a message to the Sentinel log.
 //!   - `host_get_req_header(name_ptr, name_len, out_ptr, out_max_len) -> i32`
-//!       — read a request header; returns bytes written or -1.
+//!     — read a request header; returns bytes written or -1.
 //!   - `host_set_decision(code)`        — set the WAF decision (0=Allow, 1=Block,
-//!       2=Challenge, 3=Log).
+//!     2=Challenge, 3=Log).
 //!   - `host_add_score(delta)`          — increment the anomaly score.
 //!   - `host_set_header(name_ptr, name_len, val_ptr, val_len)` — queue a
-//!       response header to be injected.
+//!     response header to be injected.
 //!   - `host_kv_get(key_ptr, key_len, out_ptr, out_max_len) -> i32`
-//!       — read from the shared plugin KV store.
+//!     — read from the shared plugin KV store.
 //!   - `host_kv_set(key_ptr, key_len, val_ptr, val_len)` — write to the
-//!       shared plugin KV store.
+//!     shared plugin KV store.
 //!   - `host_http_callout(ptr, len) -> i32` — queue an outbound HTTP request;
-//!       returns a request id (≥0) or -1 on error.
+//!     returns a request id (≥0) or -1 on error.
 //!   - `host_http_callout_status(id) -> i32` — read response status code
-//!       of a completed callout; 0 if pending/failed.
+//!     of a completed callout; 0 if pending/failed.
 //!   - `host_http_callout_body(id, out_ptr, out_max_len) -> i32` — read
-//!       response body of a completed callout; returns bytes written or -1.
+//!     response body of a completed callout; returns bytes written or -1.
 
 use std::sync::Arc;
 
@@ -53,6 +53,9 @@ pub(crate) struct PluginContext {
     /// Outbound HTTP callouts queued by the guest via `host_http_callout`.
     /// Processed asynchronously by the host after evaluate() returns.
     pub(crate) callouts: Vec<HttpCalloutRequest>,
+    /// The store's resource limiter: caps the plugin's linear memory (see
+    /// `PluginRuntime::evaluate_plugin`).
+    pub(crate) limits: wasmtime::StoreLimits,
 }
 
 /// An outbound HTTP request queued by a plugin.
@@ -459,6 +462,7 @@ mod tests {
             plugin_name: "test".into(),
             kv_store: Arc::new(DashMap::new()),
             callouts: Vec::new(),
+            limits: wasmtime::StoreLimits::default(),
         };
         assert_eq!(ctx.decision, WafDecision::Allow);
         assert_eq!(ctx.headers.len(), 1);

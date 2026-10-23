@@ -99,7 +99,7 @@ impl PluginManifest {
     /// Parse a manifest from raw TOML bytes.
     pub fn from_slice(data: &[u8]) -> Result<Self, anyhow::Error> {
         let s = std::str::from_utf8(data)
-            .map_err(|e| anyhow::anyhow!("manifest is not valid UTF-8: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("manifest is not valid UTF-8: {e}"))?;
         Ok(toml::from_str(s)?)
     }
 

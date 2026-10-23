@@ -337,10 +337,7 @@ fn check_cl_validity(headers: &http::HeaderMap) -> Option<SmugglingVerdict> {
     match value.parse::<u64>() {
         Ok(_) => None,
         Err(_) => Some(SmugglingVerdict::Reject {
-            reason: format!(
-                "HTTP request smuggling: invalid Content-Length value '{}'",
-                value
-            ),
+            reason: format!("HTTP request smuggling: invalid Content-Length value '{value}'"),
         }),
     }
 }

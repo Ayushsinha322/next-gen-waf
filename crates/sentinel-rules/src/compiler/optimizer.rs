@@ -73,5 +73,5 @@ pub fn build_ac(words: &[String]) -> anyhow::Result<AhoCorasick> {
     AhoCorasickBuilder::new()
         .ascii_case_insensitive(true)
         .build(words)
-        .map_err(|e| anyhow::anyhow!("AhoCorasick build error: {}", e))
+        .map_err(|e| anyhow::anyhow!("AhoCorasick build error: {e}"))
 }

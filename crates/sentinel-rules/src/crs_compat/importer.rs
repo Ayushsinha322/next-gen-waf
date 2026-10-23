@@ -588,21 +588,21 @@ pub(crate) fn crs_op_to_operator(
         "ge" => pattern
             .parse::<i64>()
             .map(Operator::Ge)
-            .map_err(|_| anyhow::anyhow!("invalid integer in @ge: {}", pattern)),
+            .map_err(|_| anyhow::anyhow!("invalid integer in @ge: {pattern}")),
         "lt" => {
             // @lt N → less-than comparison; expressed as Not(Ge(N)).
             // Used by CRS for TX:DETECTION_PARANOIA_LEVEL skip-gate rules.
             pattern
                 .parse::<i64>()
                 .map(|n| Operator::Not(Box::new(Operator::Ge(n))))
-                .map_err(|_| anyhow::anyhow!("invalid integer in @lt: {}", pattern))
+                .map_err(|_| anyhow::anyhow!("invalid integer in @lt: {pattern}"))
         }
         "le" => {
             // @le N → less-than-or-equal; expressed as Not(Ge(N+1)).
             pattern
                 .parse::<i64>()
                 .map(|n| Operator::Not(Box::new(Operator::Ge(n + 1))))
-                .map_err(|_| anyhow::anyhow!("invalid integer in @le: {}", pattern))
+                .map_err(|_| anyhow::anyhow!("invalid integer in @le: {pattern}"))
         }
         "within" => {
             let words: Vec<String> = pattern.split_whitespace().map(String::from).collect();
@@ -623,7 +623,7 @@ pub(crate) fn crs_op_to_operator(
         "gt" => pattern
             .parse::<i64>()
             .map(|n| Operator::Ge(n + 1))
-            .map_err(|_| anyhow::anyhow!("invalid integer in @gt: {}", pattern)),
+            .map_err(|_| anyhow::anyhow!("invalid integer in @gt: {pattern}")),
         // @ipMatch is now implemented natively instead of being disabled. The pattern is
         // a comma- or space-separated list of addresses/CIDRs.
         // @validateByteRange is now implemented instead of being disabled. It
@@ -712,7 +712,7 @@ fn comment_unknown_directives(source: &str) -> String {
             .next()
             .unwrap_or("");
 
-        let is_known = KNOWN_DIRECTIVES.iter().any(|d| first_token == *d);
+        let is_known = KNOWN_DIRECTIVES.contains(&first_token);
         let is_unknown_sec = first_token.starts_with("Sec") && !is_known;
 
         if is_unknown_sec {

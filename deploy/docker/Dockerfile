@@ -34,7 +34,7 @@ ARG GIT_SHA=unknown
 ARG BUILD_DATE=unknown
 ARG VERSION=0.0.0
 
-FROM rust:1.85-slim-bookworm AS rust-builder
+FROM rust:1.88.0-slim-bookworm AS rust-builder
 WORKDIR /src
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev clang cmake protobuf-compiler && rm -rf /var/lib/apt/lists/*
@@ -55,7 +55,7 @@ RUN cargo build --release --bin sentinel-bin --features kernel
 # build — turning a ~1 minute CP build into ~12 minutes on every crate change.
 # This stage compiles only sentinel-core + sentinel-rules and their deps, and
 # Docker skips it entirely when building the data plane.
-FROM rust:1.85-slim-bookworm AS srl-builder
+FROM rust:1.88.0-slim-bookworm AS srl-builder
 WORKDIR /src
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config clang && rm -rf /var/lib/apt/lists/*

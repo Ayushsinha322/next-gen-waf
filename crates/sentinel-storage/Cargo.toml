@@ -15,10 +15,9 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 
 redis = { workspace = true }
-# Pin url below 2.5.3: from 2.5.3 url moved to idna 1.x, which pulls icu_*
-# crates that require Rust 1.86. redis 1.2 needs url ^2.5, and 2.5.2 still uses
-# idna 0.5 (no ICU).
-url = ">=2.5.0, <2.5.3"
+# url 2.5.3+ uses idna 1.x (icu_* crates, Rust 1.86+). It was pinned below
+# 2.5.3 on the 1.85 toolchain, which kept idna 0.5 and RUSTSEC-2024-0421.
+url = "2.5"
 
 # ClickHouse HTTP client — use hyper (already in workspace) to avoid reqwest
 # pulling icu_* crates that require Rust ≥ 1.86.

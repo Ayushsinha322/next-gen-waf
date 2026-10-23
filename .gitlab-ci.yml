@@ -48,7 +48,8 @@ stages:
 # developer running cargo locally still gets debug symbols and a usable debugger.
 # Only CI, which never opens a debugger, builds without them.
 .rust-base: &rust-base
-  image: rust:1.85
+  # The exact release (as with Go): 1.88.0, the toolchain wasmtime 36 LTS needs.
+  image: rust:1.88.0
   tags:
     - k8s-docker
   variables:

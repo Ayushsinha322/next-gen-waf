@@ -97,12 +97,11 @@ aho-corasick = "1"
 hyperscan = "0.3"           # high-perf DPI (optional)
 
 # Plugins / WASM
-# 24.x, not 25: 25.0.3 carried 18 advisories (sandbox escapes among them) and
-# the 25 line has no patched release; 24.0.4+ is patched and builds on our Rust
-# 1.85 toolchain. The supported LTS is 36, which needs Rust 1.86 — move there
-# with the toolchain (2026-10-07 review #16).
-wasmtime = "24.0.4"
-wasmtime-wasi = "24.0.4"
+# The 36 LTS line. 24.x (the newest that built on Rust 1.85) carried advisories
+# only 36.0.19 fixes, RUSTSEC-2026-0380 among them — a Cranelift overflow that a
+# crafted plugin could take to a sandbox escape. wasmtime-wasi was declared here
+# and used by nothing; plugins get no WASI.
+wasmtime = "36.0.19"
 
 # ML inference
 ort = "2.0.0-rc.4"          # ONNX runtime
@@ -112,8 +111,8 @@ candle-nn = "0.7"
 candle-transformers = "0.7"
 
 # Storage
-# =1.2.2: the newest release whose rust-version (1.85) matches CI; 1.2.3 and
-# every later release declare 1.88, so a caret range would break the build. 1.x is
+# =1.2.2: pinned on the Rust 1.85 toolchain (1.2.3+ declare rust-version 1.88).
+# 1.88 now builds them; move it as its own change, not as a side effect. 1.x is
 # the line whose async connection setup no longer has 0.24's
 # `unreachable!("Multiplexed connection driver unexpectedly terminated")` path,
 # and whose ConnectionManager takes connection/response timeouts.

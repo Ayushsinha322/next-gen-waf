@@ -187,7 +187,7 @@ impl IpReputation {
     /// Parse a text feed body (one CIDR or IP per line) and add entries to the
     /// suspect list tagged with `feed:<url>`.  Returns the count added.
     fn ingest_cidr_feed(&mut self, body: &str, source_url: &str) -> usize {
-        let tag = format!("feed:{}", source_url);
+        let tag = format!("feed:{source_url}");
         let mut count = 0usize;
         for line in body.lines() {
             let line = line.trim();
@@ -202,8 +202,8 @@ impl IpReputation {
                 cidr_str.to_owned()
             } else {
                 match cidr_str.parse::<IpAddr>() {
-                    Ok(IpAddr::V4(_)) => format!("{}/32", cidr_str),
-                    Ok(IpAddr::V6(_)) => format!("{}/128", cidr_str),
+                    Ok(IpAddr::V4(_)) => format!("{cidr_str}/32"),
+                    Ok(IpAddr::V6(_)) => format!("{cidr_str}/128"),
                     Err(_) => {
                         tracing::debug!(entry = %cidr_str, "ip_reputation: skipping non-CIDR feed line");
                         continue;
@@ -237,7 +237,7 @@ fn build_https_client() -> HttpsClient {
 async fn fetch_text(client: &HttpsClient, url: &str) -> anyhow::Result<String> {
     let uri: hyper::Uri = url
         .parse()
-        .map_err(|e| anyhow::anyhow!("invalid feed URL '{}': {}", url, e))?;
+        .map_err(|e| anyhow::anyhow!("invalid feed URL '{url}': {e}"))?;
 
     let req = Request::builder()
         .uri(uri)
@@ -250,16 +250,16 @@ async fn fetch_text(client: &HttpsClient, url: &str) -> anyhow::Result<String> {
 
     let resp = tokio::time::timeout(std::time::Duration::from_secs(30), client.request(req))
         .await
-        .map_err(|_| anyhow::anyhow!("feed '{}' timed out after 30s", url))??;
+        .map_err(|_| anyhow::anyhow!("feed '{url}' timed out after 30s"))??;
 
     let status = resp.status();
     if !status.is_success() {
-        anyhow::bail!("feed '{}' returned HTTP {}", url, status);
+        anyhow::bail!("feed '{url}' returned HTTP {status}");
     }
 
     let bytes = resp.collect().await?.to_bytes();
     String::from_utf8(bytes.to_vec())
-        .map_err(|e| anyhow::anyhow!("feed '{}' body is not valid UTF-8: {}", url, e))
+        .map_err(|e| anyhow::anyhow!("feed '{url}' body is not valid UTF-8: {e}"))
 }
 
 // ---------------------------------------------------------------------------

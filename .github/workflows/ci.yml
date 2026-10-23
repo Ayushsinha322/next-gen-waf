@@ -11,7 +11,8 @@ name: ci
 # lints 1.85 does not, so `-D warnings` failed code GitLab passed. Bump a pin
 # here in the same commit that bumps it in .gitlab-ci.yml, never on its own.
 #
-#   Rust 1.85.0      .gitlab-ci.yml  .rust-base  image: rust:1.85
+#   Rust 1.88.0      .gitlab-ci.yml  .rust-base  image: rust:1.88.0, and both
+#                    rust stages of deploy/docker/Dockerfile
 #   Go   1.26.10     .gitlab-ci.yml  go          image: golang:1.26.10, the
 #                    `toolchain` line in control-plane/go.mod and both
 #                    golang stages of deploy/docker/Dockerfile
@@ -51,7 +52,7 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@1.88.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -60,14 +61,14 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   # GATING: known-vulnerable crates. Reads Cargo.lock only. Exceptions live in
-  # .cargo/audit.toml, each with its reason. 0.22.1 is the newest cargo-audit
-  # that builds on 1.85 and reads the CVSS 4.0 entries in the advisory database.
+  # .cargo/audit.toml, each with its reason. cargo-audit 0.22.1: the version
+  # GitLab installs; it reads the CVSS 4.0 entries in the advisory database.
   rust-audit:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with: { shared-key: audit }
       - run: cargo install cargo-audit --version 0.22.1 --locked
@@ -78,7 +79,7 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with: { shared-key: test }
       - run: cargo test --workspace
@@ -88,7 +89,7 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with: { shared-key: release }
       - run: cargo build --workspace --release

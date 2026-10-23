@@ -200,11 +200,11 @@ async fn fetch_with_accept(client: &HttpsClient, url: &str, accept: &str) -> Res
 
     let resp = tokio::time::timeout(std::time::Duration::from_secs(60), client.request(req))
         .await
-        .map_err(|_| anyhow::anyhow!("request to '{}' timed out after 60s", url))??;
+        .map_err(|_| anyhow::anyhow!("request to '{url}' timed out after 60s"))??;
 
     let status = resp.status();
     if !status.is_success() {
-        bail!("server returned HTTP {} for '{}'", status, url);
+        bail!("server returned HTTP {status} for '{url}'");
     }
 
     Ok(resp.collect().await?.to_bytes())

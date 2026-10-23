@@ -174,7 +174,7 @@ fn regex_literal(input: &str) -> IResult<&str, String> {
     let full_pattern = if flags.is_empty() {
         pattern
     } else {
-        format!("(?{}){}", flags, pattern)
+        format!("(?{flags}){pattern}")
     };
     Ok((remaining, full_pattern))
 }

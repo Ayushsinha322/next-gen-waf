@@ -492,8 +492,8 @@ fn cmd_init(cfg_path: &Path, bind: &str) -> Result<()> {
     println!("Sentinel initialised.");
     println!();
     println!("  Config:     {}", cfg_path.display());
-    println!("  Listening:  {}", bind);
-    println!("  CRS rules:  {}", crs_status);
+    println!("  Listening:  {bind}");
+    println!("  CRS rules:  {crs_status}");
     println!();
     println!("Next steps:");
     println!("  1. Add a site:  sentinel site add NAME --domain DOMAIN --upstream HOST:PORT");
@@ -1334,17 +1334,17 @@ fn cmd_plugin_install(reference: &str, dir: &str) -> Result<()> {
     let plugin_dir = PathBuf::from(dir);
     fs::create_dir_all(&plugin_dir)?;
 
-    println!("Installing plugin '{}' from {}", reference, registry);
+    println!("Installing plugin '{reference}' from {registry}");
     println!();
 
     let api_base = if registry.contains("://") {
         registry.clone()
     } else {
-        format!("https://{}", registry)
+        format!("https://{registry}")
     };
 
-    let manifest_url = format!("{}/v2/{}/manifests/{}", api_base, repo, tag);
-    println!("  → Fetching manifest: {}", manifest_url);
+    let manifest_url = format!("{api_base}/v2/{repo}/manifests/{tag}");
+    println!("  → Fetching manifest: {manifest_url}");
 
     let manifest_resp = ureq::get(&manifest_url)
         .set("Accept", "application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json")
@@ -1369,7 +1369,7 @@ fn cmd_plugin_install(reference: &str, dir: &str) -> Result<()> {
         anyhow::bail!("manifest has no layers");
     }
 
-    let plugin_name = repo.split('/').last().unwrap_or(&repo).to_string();
+    let plugin_name = repo.split('/').next_back().unwrap_or(&repo).to_string();
     let install_dir = plugin_dir.join(&plugin_name);
     fs::create_dir_all(&install_dir)?;
 
@@ -1380,7 +1380,7 @@ fn cmd_plugin_install(reference: &str, dir: &str) -> Result<()> {
             .ok_or_else(|| anyhow!("layer {i} missing 'digest'"))?;
         let media_type = layer["mediaType"].as_str().unwrap_or("");
 
-        let blob_url = format!("{}/v2/{}/blobs/{}", api_base, repo, digest);
+        let blob_url = format!("{api_base}/v2/{repo}/blobs/{digest}");
         println!(
             "  → Downloading layer {}/{}: {}",
             i + 1,
@@ -1405,7 +1405,7 @@ fn cmd_plugin_install(reference: &str, dir: &str) -> Result<()> {
             .context("reading blob data")?;
 
         if media_type.contains("wasm") || digest.contains("wasm") {
-            let wasm_path = install_dir.join(format!("{}.wasm", plugin_name));
+            let wasm_path = install_dir.join(format!("{plugin_name}.wasm"));
             fs::write(&wasm_path, &data)?;
             println!("     → Saved {}", wasm_path.display());
         } else if data.len() > 2 && data[0] == 0x1f && data[1] == 0x8b {
@@ -1416,7 +1416,7 @@ fn cmd_plugin_install(reference: &str, dir: &str) -> Result<()> {
                     }
                 }
                 Err(e) => {
-                    let raw_path = install_dir.join(format!("layer_{}.bin", i));
+                    let raw_path = install_dir.join(format!("layer_{i}.bin"));
                     fs::write(&raw_path, &data)?;
                     println!(
                         "     → Decompress failed ({e}), saved raw blob to {}",
@@ -1425,7 +1425,7 @@ fn cmd_plugin_install(reference: &str, dir: &str) -> Result<()> {
                 }
             }
         } else {
-            let raw_path = install_dir.join(format!("layer_{}.bin", i));
+            let raw_path = install_dir.join(format!("layer_{i}.bin"));
             fs::write(&raw_path, &data)?;
             println!("     → Saved to {}", raw_path.display());
         }
@@ -1440,8 +1440,7 @@ fn cmd_plugin_install(reference: &str, dir: &str) -> Result<()> {
     let toml_path = install_dir.join("sentinel-plugin.toml");
     if !toml_path.exists() {
         let toml_content = format!(
-            "[plugin]\nname = \"{}\"\nversion = \"{}\"\nwasm = \"{}.wasm\"\n\n[plugin.hooks]\nrequest_headers = true\n\n[plugin.permissions]\nhost_log = true\nhost_get_req_header = true\nhost_set_decision = true\nhost_add_score = true\n",
-            plugin_name, tag, plugin_name
+            "[plugin]\nname = \"{plugin_name}\"\nversion = \"{tag}\"\nwasm = \"{plugin_name}.wasm\"\n\n[plugin.hooks]\nrequest_headers = true\n\n[plugin.permissions]\nhost_log = true\nhost_get_req_header = true\nhost_set_decision = true\nhost_add_score = true\n"
         );
         fs::write(&toml_path, toml_content)?;
         println!("     → Generated {}", toml_path.display());
@@ -1482,7 +1481,7 @@ fn cmd_plugin_list(dir: &str) -> Result<()> {
                     .and_then(|l| l.split('=').nth(1))
                     .map(|v| v.trim().trim_matches('"').to_string())
                     .unwrap_or_else(|| "?".to_string());
-                let wasm_path = entry.path().join(format!("{}.wasm", name));
+                let wasm_path = entry.path().join(format!("{name}.wasm"));
                 let wasm_size = if wasm_path.exists() {
                     fs::metadata(&wasm_path).map(|m| m.len()).unwrap_or(0)
                 } else {
@@ -1491,7 +1490,7 @@ fn cmd_plugin_list(dir: &str) -> Result<()> {
                 println!("{:<24} {}  ({})", name, version, fmt_bytes(wasm_size));
                 found = true;
             } else {
-                println!("{:<24} (no manifest)", name);
+                println!("{name:<24} (no manifest)");
                 found = true;
             }
         }
@@ -1511,7 +1510,7 @@ fn cmd_plugin_remove(name: &str, dir: &str) -> Result<()> {
     }
     fs::remove_dir_all(&target)
         .with_context(|| format!("removing plugin directory '{}'", target.display()))?;
-    println!("Removed plugin '{}'", name);
+    println!("Removed plugin '{name}'");
     Ok(())
 }
 
@@ -1526,8 +1525,7 @@ fn parse_plugin_reference(reference: &str) -> Result<(String, String, String)> {
     let parts: Vec<&str> = rest.splitn(2, '/').collect();
     if parts.len() < 2 {
         anyhow::bail!(
-            "invalid plugin reference '{}'. Expected format: [registry/]namespace/name:tag",
-            reference
+            "invalid plugin reference '{reference}'. Expected format: [registry/]namespace/name:tag"
         );
     }
 
@@ -1539,7 +1537,7 @@ fn parse_plugin_reference(reference: &str) -> Result<(String, String, String)> {
     } else {
         Ok((
             "registry-1.docker.io".to_string(),
-            format!("{}/{}", first, remainder),
+            format!("{first}/{remainder}"),
             tag.to_string(),
         ))
     }
@@ -1579,6 +1577,6 @@ fn fmt_bytes(bytes: u64) -> String {
     } else if bytes >= 1024 {
         format!("{:.1} KiB", bytes as f64 / 1024.0)
     } else {
-        format!("{} B", bytes)
+        format!("{bytes} B")
     }
 }

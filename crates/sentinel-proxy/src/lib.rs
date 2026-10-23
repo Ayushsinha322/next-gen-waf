@@ -831,7 +831,7 @@ async fn fetch_config_sync(
     internal_secret: Option<&str>,
     deadline: Duration,
 ) -> Option<Bytes> {
-    let url = format!("{}/api/v1/internal/config", sync_url);
+    let url = format!("{sync_url}/api/v1/internal/config");
     let uri: hyper::Uri = match url.parse() {
         Ok(u) => u,
         Err(e) => {
@@ -2448,7 +2448,7 @@ impl ProxyServer {
                     })
                     .to_string();
 
-                    let url = format!("{}/api/v1/internal/nodes/heartbeat", sync_url);
+                    let url = format!("{sync_url}/api/v1/internal/nodes/heartbeat");
                     let uri: hyper::Uri = match url.parse() {
                         Ok(u) => u,
                         Err(e) => {
@@ -4185,7 +4185,7 @@ async fn proxy_inner(
                 if let Some(resp) = enforce_request_limit(
                     ctx,
                     site_ref,
-                    format!("request body too large (limit {} bytes)", max_bytes),
+                    format!("request body too large (limit {max_bytes} bytes)"),
                     StatusCode::PAYLOAD_TOO_LARGE,
                     "Request Entity Too Large",
                 ) {
@@ -4217,7 +4217,7 @@ async fn proxy_inner(
                         if let Some(resp) = enforce_request_limit(
                             ctx,
                             site_ref,
-                            format!("request body too large (limit {} bytes)", max_bytes),
+                            format!("request body too large (limit {max_bytes} bytes)"),
                             StatusCode::PAYLOAD_TOO_LARGE,
                             "Request Entity Too Large",
                         ) {
@@ -6316,7 +6316,7 @@ async fn fetch_threat_intel(
     internal_secret: Option<&str>,
     deadline: Duration,
 ) -> Option<(u16, Bytes)> {
-    let url = format!("{}/api/v1/internal/threat-intel", sync_url);
+    let url = format!("{sync_url}/api/v1/internal/threat-intel");
     let uri: hyper::Uri = match url.parse() {
         Ok(u) => u,
         Err(e) => {
@@ -8306,7 +8306,7 @@ fn build_upstream_uri(host: &str, port: u16, tls: bool, original: &Uri) -> anyho
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or("/");
-    let s = format!("{scheme}://{}:{}{}", host, port, path_and_query);
+    let s = format!("{scheme}://{host}:{port}{path_and_query}");
     s.parse().context("building upstream URI")
 }
 
