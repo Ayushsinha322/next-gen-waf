@@ -92,6 +92,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with: { shared-key: release }
       - run: cargo build --workspace --release
+      # CRS's own regression suite against this build; see `crs-regression` in
+      # .gitlab-ci.yml for the policy.
+      - run: deploy/load-test/crs-regression.sh --baseline deploy/load-test/crs-regression-baseline.json
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crs-regression
+          path: target/crs-regression/
+          if-no-files-found: ignore
 
   # ── Go control plane ───────────────────────────────────────────────────────
   go:

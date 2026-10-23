@@ -1,0 +1,934 @@
+{
+ "cases": {
+  "REQUEST-920-PROTOCOL-ENFORCEMENT/920100.yaml#11#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-920-PROTOCOL-ENFORCEMENT/920100.yaml#12#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-920-PROTOCOL-ENFORCEMENT/920100.yaml#13#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-920-PROTOCOL-ENFORCEMENT/920100.yaml#15#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-920-PROTOCOL-ENFORCEMENT/920100.yaml#16#0": {
+   "missing": [
+    920100
+   ],
+   "result": "fail"
+  },
+  "REQUEST-920-PROTOCOL-ENFORCEMENT/920100.yaml#2#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-920-PROTOCOL-ENFORCEMENT/920100.yaml#4#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-920-PROTOCOL-ENFORCEMENT/920100.yaml#5#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-920-PROTOCOL-ENFORCEMENT/920100.yaml#6#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-920-PROTOCOL-ENFORCEMENT/920160.yaml#1#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-920-PROTOCOL-ENFORCEMENT/920160.yaml#2#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-920-PROTOCOL-ENFORCEMENT/920160.yaml#3#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-920-PROTOCOL-ENFORCEMENT/920160.yaml#5#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-920-PROTOCOL-ENFORCEMENT/920180.yaml#4#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-920-PROTOCOL-ENFORCEMENT/920181.yaml#1#0": {
+   "result": "fail",
+   "unwanted": [
+    920181
+   ]
+  },
+  "REQUEST-920-PROTOCOL-ENFORCEMENT/920220.yaml#3#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-920-PROTOCOL-ENFORCEMENT/920280.yaml#3#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-920-PROTOCOL-ENFORCEMENT/920300.yaml#3#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-920-PROTOCOL-ENFORCEMENT/920380.yaml#1#0": {
+   "missing": [
+    920380
+   ],
+   "result": "fail"
+  },
+  "REQUEST-920-PROTOCOL-ENFORCEMENT/920390.yaml#1#0": {
+   "missing": [
+    920390
+   ],
+   "result": "fail"
+  },
+  "REQUEST-920-PROTOCOL-ENFORCEMENT/920430.yaml#10#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-920-PROTOCOL-ENFORCEMENT/920430.yaml#3#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-920-PROTOCOL-ENFORCEMENT/920430.yaml#4#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-920-PROTOCOL-ENFORCEMENT/920430.yaml#5#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-920-PROTOCOL-ENFORCEMENT/920430.yaml#6#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-920-PROTOCOL-ENFORCEMENT/920430.yaml#7#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-920-PROTOCOL-ENFORCEMENT/920430.yaml#8#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-920-PROTOCOL-ENFORCEMENT/920430.yaml#9#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-920-PROTOCOL-ENFORCEMENT/920620.yaml#1#0": {
+   "result": "fail",
+   "unwanted": [
+    920620
+   ]
+  },
+  "REQUEST-921-PROTOCOL-ATTACK/921120.yaml#1#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-921-PROTOCOL-ATTACK/921120.yaml#2#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-921-PROTOCOL-ATTACK/921140.yaml#1#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-921-PROTOCOL-ATTACK/921180.yaml#4#0": {
+   "missing": [
+    921180
+   ],
+   "result": "fail"
+  },
+  "REQUEST-921-PROTOCOL-ATTACK/921180.yaml#6#0": {
+   "missing": [
+    921180
+   ],
+   "result": "fail"
+  },
+  "REQUEST-921-PROTOCOL-ATTACK/921210.yaml#1#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-930-APPLICATION-ATTACK-LFI/930110.yaml#7#0": {
+   "result": "fail",
+   "unwanted": [
+    930110
+   ]
+  },
+  "REQUEST-930-APPLICATION-ATTACK-LFI/930120.yaml#10#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-930-APPLICATION-ATTACK-LFI/930120.yaml#9#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-932-APPLICATION-ATTACK-RCE/932200.yaml#10#0": {
+   "missing": [
+    932200
+   ],
+   "result": "fail"
+  },
+  "REQUEST-932-APPLICATION-ATTACK-RCE/932200.yaml#4#0": {
+   "missing": [
+    932200
+   ],
+   "result": "fail"
+  },
+  "REQUEST-932-APPLICATION-ATTACK-RCE/932200.yaml#5#0": {
+   "missing": [
+    932200
+   ],
+   "result": "fail"
+  },
+  "REQUEST-932-APPLICATION-ATTACK-RCE/932200.yaml#6#0": {
+   "missing": [
+    932200
+   ],
+   "result": "fail"
+  },
+  "REQUEST-932-APPLICATION-ATTACK-RCE/932200.yaml#7#0": {
+   "missing": [
+    932200
+   ],
+   "result": "fail"
+  },
+  "REQUEST-932-APPLICATION-ATTACK-RCE/932200.yaml#8#0": {
+   "missing": [
+    932200
+   ],
+   "result": "fail"
+  },
+  "REQUEST-932-APPLICATION-ATTACK-RCE/932200.yaml#9#0": {
+   "missing": [
+    932200
+   ],
+   "result": "fail"
+  },
+  "REQUEST-932-APPLICATION-ATTACK-RCE/932205.yaml#1#0": {
+   "missing": [
+    932205
+   ],
+   "result": "fail"
+  },
+  "REQUEST-932-APPLICATION-ATTACK-RCE/932205.yaml#2#0": {
+   "missing": [
+    932205
+   ],
+   "result": "fail"
+  },
+  "REQUEST-932-APPLICATION-ATTACK-RCE/932205.yaml#3#0": {
+   "missing": [
+    932205
+   ],
+   "result": "fail"
+  },
+  "REQUEST-932-APPLICATION-ATTACK-RCE/932206.yaml#1#0": {
+   "missing": [
+    932206
+   ],
+   "result": "fail"
+  },
+  "REQUEST-932-APPLICATION-ATTACK-RCE/932230.yaml#1#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-932-APPLICATION-ATTACK-RCE/932236.yaml#21#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-932-APPLICATION-ATTACK-RCE/932240.yaml#14#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-932-APPLICATION-ATTACK-RCE/932240.yaml#15#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-932-APPLICATION-ATTACK-RCE/932240.yaml#9#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-932-APPLICATION-ATTACK-RCE/932250.yaml#5#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-932-APPLICATION-ATTACK-RCE/932260.yaml#28#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-933-APPLICATION-ATTACK-PHP/933100.yaml#1#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-933-APPLICATION-ATTACK-PHP/933110.yaml#1#0": {
+   "reason": "rule not loaded by the product",
+   "result": "unsupported"
+  },
+  "REQUEST-933-APPLICATION-ATTACK-PHP/933110.yaml#11#0": {
+   "reason": "rule not loaded by the product",
+   "result": "unsupported"
+  },
+  "REQUEST-933-APPLICATION-ATTACK-PHP/933110.yaml#19#0": {
+   "reason": "rule not loaded by the product",
+   "result": "unsupported"
+  },
+  "REQUEST-933-APPLICATION-ATTACK-PHP/933110.yaml#23#0": {
+   "reason": "rule not loaded by the product",
+   "result": "unsupported"
+  },
+  "REQUEST-933-APPLICATION-ATTACK-PHP/933110.yaml#29#0": {
+   "reason": "rule not loaded by the product",
+   "result": "unsupported"
+  },
+  "REQUEST-933-APPLICATION-ATTACK-PHP/933110.yaml#30#0": {
+   "reason": "rule not loaded by the product",
+   "result": "unsupported"
+  },
+  "REQUEST-933-APPLICATION-ATTACK-PHP/933151.yaml#1#0": {
+   "missing": [
+    933151
+   ],
+   "result": "fail"
+  },
+  "REQUEST-933-APPLICATION-ATTACK-PHP/933160.yaml#16#0": {
+   "missing": [
+    933160
+   ],
+   "result": "fail"
+  },
+  "REQUEST-933-APPLICATION-ATTACK-PHP/933160.yaml#18#0": {
+   "missing": [
+    933160
+   ],
+   "result": "fail"
+  },
+  "REQUEST-933-APPLICATION-ATTACK-PHP/933160.yaml#21#0": {
+   "missing": [
+    933160
+   ],
+   "result": "fail"
+  },
+  "REQUEST-933-APPLICATION-ATTACK-PHP/933160.yaml#34#0": {
+   "missing": [
+    933160
+   ],
+   "result": "fail"
+  },
+  "REQUEST-933-APPLICATION-ATTACK-PHP/933160.yaml#37#0": {
+   "missing": [
+    933160
+   ],
+   "result": "fail"
+  },
+  "REQUEST-933-APPLICATION-ATTACK-PHP/933200.yaml#5#0": {
+   "reason": "rule not loaded by the product",
+   "result": "unsupported"
+  },
+  "REQUEST-934-APPLICATION-ATTACK-GENERIC/934100.yaml#13#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-934-APPLICATION-ATTACK-GENERIC/934100.yaml#14#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-934-APPLICATION-ATTACK-GENERIC/934100.yaml#23#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-934-APPLICATION-ATTACK-GENERIC/934101.yaml#4#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-934-APPLICATION-ATTACK-GENERIC/934120.yaml#23#0": {
+   "missing": [
+    934120
+   ],
+   "result": "fail"
+  },
+  "REQUEST-934-APPLICATION-ATTACK-GENERIC/934120.yaml#24#0": {
+   "missing": [
+    934120
+   ],
+   "result": "fail"
+  },
+  "REQUEST-934-APPLICATION-ATTACK-GENERIC/934120.yaml#25#0": {
+   "missing": [
+    934120
+   ],
+   "result": "fail"
+  },
+  "REQUEST-934-APPLICATION-ATTACK-GENERIC/934120.yaml#26#0": {
+   "missing": [
+    934120
+   ],
+   "result": "fail"
+  },
+  "REQUEST-934-APPLICATION-ATTACK-GENERIC/934120.yaml#39#0": {
+   "missing": [
+    934120
+   ],
+   "result": "fail"
+  },
+  "REQUEST-934-APPLICATION-ATTACK-GENERIC/934130.yaml#7#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-934-APPLICATION-ATTACK-GENERIC/934160.yaml#22#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-934-APPLICATION-ATTACK-GENERIC/934160.yaml#7#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-941-APPLICATION-ATTACK-XSS/941100.yaml#1#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-941-APPLICATION-ATTACK-XSS/941110.yaml#2#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-941-APPLICATION-ATTACK-XSS/941110.yaml#6#0": {
+   "missing": [
+    941110
+   ],
+   "result": "fail"
+  },
+  "REQUEST-941-APPLICATION-ATTACK-XSS/941110.yaml#7#0": {
+   "missing": [
+    941110
+   ],
+   "result": "fail"
+  },
+  "REQUEST-941-APPLICATION-ATTACK-XSS/941110.yaml#8#0": {
+   "missing": [
+    941110
+   ],
+   "result": "fail"
+  },
+  "REQUEST-941-APPLICATION-ATTACK-XSS/941160.yaml#1#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-941-APPLICATION-ATTACK-XSS/941180.yaml#7#0": {
+   "result": "fail",
+   "unwanted": [
+    941180
+   ]
+  },
+  "REQUEST-941-APPLICATION-ATTACK-XSS/941240.yaml#2#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-942-APPLICATION-ATTACK-SQLI/942101.yaml#1#0": {
+   "missing": [
+    942101
+   ],
+   "result": "fail"
+  },
+  "REQUEST-942-APPLICATION-ATTACK-SQLI/942101.yaml#5#0": {
+   "missing": [
+    942101
+   ],
+   "result": "fail"
+  },
+  "REQUEST-942-APPLICATION-ATTACK-SQLI/942101.yaml#7#0": {
+   "missing": [
+    942101
+   ],
+   "result": "fail"
+  },
+  "REQUEST-942-APPLICATION-ATTACK-SQLI/942101.yaml#8#0": {
+   "missing": [
+    942101
+   ],
+   "result": "fail"
+  },
+  "REQUEST-942-APPLICATION-ATTACK-SQLI/942130.yaml#9#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-942-APPLICATION-ATTACK-SQLI/942190.yaml#42#0": {
+   "missing": [
+    942190
+   ],
+   "result": "fail"
+  },
+  "REQUEST-942-APPLICATION-ATTACK-SQLI/942210.yaml#31#0": {
+   "result": "fail",
+   "unwanted": [
+    942210
+   ]
+  },
+  "REQUEST-942-APPLICATION-ATTACK-SQLI/942210.yaml#44#0": {
+   "result": "fail",
+   "unwanted": [
+    942210
+   ]
+  },
+  "REQUEST-942-APPLICATION-ATTACK-SQLI/942440.yaml#19#0": {
+   "result": "fail",
+   "unwanted": [
+    942440
+   ]
+  },
+  "REQUEST-942-APPLICATION-ATTACK-SQLI/942440.yaml#20#0": {
+   "result": "fail",
+   "unwanted": [
+    942440
+   ]
+  },
+  "REQUEST-942-APPLICATION-ATTACK-SQLI/942500.yaml#1#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-942-APPLICATION-ATTACK-SQLI/942500.yaml#2#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-942-APPLICATION-ATTACK-SQLI/942521.yaml#16#0": {
+   "reason": "the logs list only part of the rules that matched",
+   "result": "unsupported"
+  },
+  "REQUEST-942-APPLICATION-ATTACK-SQLI/942522.yaml#7#0": {
+   "missing": [
+    942522
+   ],
+   "result": "fail"
+  },
+  "REQUEST-942-APPLICATION-ATTACK-SQLI/942522.yaml#8#0": {
+   "reason": "the logs list only part of the rules that matched",
+   "result": "unsupported"
+  },
+  "REQUEST-943-APPLICATION-ATTACK-SESSION-FIXATION/943100.yaml#1#0": {
+   "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-944-APPLICATION-ATTACK-JAVA/944000.yaml#1#0": {
+   "reason": "rule not loaded by the product",
+   "result": "unsupported"
+  },
+  "REQUEST-944-APPLICATION-ATTACK-JAVA/944100.yaml#11#0": {
+   "result": "fail",
+   "unwanted": [
+    944100
+   ]
+  },
+  "REQUEST-944-APPLICATION-ATTACK-JAVA/944100.yaml#12#0": {
+   "result": "fail",
+   "unwanted": [
+    944100
+   ]
+  },
+  "REQUEST-944-APPLICATION-ATTACK-JAVA/944100.yaml#15#0": {
+   "result": "fail",
+   "unwanted": [
+    944100
+   ]
+  },
+  "REQUEST-944-APPLICATION-ATTACK-JAVA/944100.yaml#16#0": {
+   "result": "fail",
+   "unwanted": [
+    944100
+   ]
+  },
+  "REQUEST-944-APPLICATION-ATTACK-JAVA/944110.yaml#11#0": {
+   "result": "fail",
+   "unwanted": [
+    944110
+   ]
+  },
+  "REQUEST-944-APPLICATION-ATTACK-JAVA/944110.yaml#12#0": {
+   "result": "fail",
+   "unwanted": [
+    944110
+   ]
+  },
+  "REQUEST-944-APPLICATION-ATTACK-JAVA/944110.yaml#15#0": {
+   "result": "fail",
+   "unwanted": [
+    944110
+   ]
+  },
+  "REQUEST-944-APPLICATION-ATTACK-JAVA/944110.yaml#16#0": {
+   "result": "fail",
+   "unwanted": [
+    944110
+   ]
+  },
+  "REQUEST-944-APPLICATION-ATTACK-JAVA/944120.yaml#108#0": {
+   "result": "fail",
+   "unwanted": [
+    944120
+   ]
+  },
+  "REQUEST-944-APPLICATION-ATTACK-JAVA/944120.yaml#109#0": {
+   "result": "fail",
+   "unwanted": [
+    944120
+   ]
+  },
+  "REQUEST-944-APPLICATION-ATTACK-JAVA/944120.yaml#125#0": {
+   "result": "fail",
+   "unwanted": [
+    944120
+   ]
+  },
+  "REQUEST-944-APPLICATION-ATTACK-JAVA/944120.yaml#126#0": {
+   "result": "fail",
+   "unwanted": [
+    944120
+   ]
+  },
+  "REQUEST-944-APPLICATION-ATTACK-JAVA/944120.yaml#23#0": {
+   "result": "fail",
+   "unwanted": [
+    944120
+   ]
+  },
+  "REQUEST-944-APPLICATION-ATTACK-JAVA/944120.yaml#24#0": {
+   "result": "fail",
+   "unwanted": [
+    944120
+   ]
+  },
+  "REQUEST-944-APPLICATION-ATTACK-JAVA/944120.yaml#40#0": {
+   "result": "fail",
+   "unwanted": [
+    944120
+   ]
+  },
+  "REQUEST-944-APPLICATION-ATTACK-JAVA/944120.yaml#41#0": {
+   "result": "fail",
+   "unwanted": [
+    944120
+   ]
+  },
+  "REQUEST-944-APPLICATION-ATTACK-JAVA/944120.yaml#57#0": {
+   "result": "fail",
+   "unwanted": [
+    944120
+   ]
+  },
+  "REQUEST-944-APPLICATION-ATTACK-JAVA/944120.yaml#58#0": {
+   "result": "fail",
+   "unwanted": [
+    944120
+   ]
+  },
+  "REQUEST-944-APPLICATION-ATTACK-JAVA/944120.yaml#6#0": {
+   "result": "fail",
+   "unwanted": [
+    944120
+   ]
+  },
+  "REQUEST-944-APPLICATION-ATTACK-JAVA/944120.yaml#7#0": {
+   "result": "fail",
+   "unwanted": [
+    944120
+   ]
+  },
+  "REQUEST-944-APPLICATION-ATTACK-JAVA/944120.yaml#74#0": {
+   "result": "fail",
+   "unwanted": [
+    944120
+   ]
+  },
+  "REQUEST-944-APPLICATION-ATTACK-JAVA/944120.yaml#75#0": {
+   "result": "fail",
+   "unwanted": [
+    944120
+   ]
+  },
+  "REQUEST-944-APPLICATION-ATTACK-JAVA/944120.yaml#91#0": {
+   "result": "fail",
+   "unwanted": [
+    944120
+   ]
+  },
+  "REQUEST-944-APPLICATION-ATTACK-JAVA/944120.yaml#92#0": {
+   "result": "fail",
+   "unwanted": [
+    944120
+   ]
+  },
+  "REQUEST-944-APPLICATION-ATTACK-JAVA/944200.yaml#1#0": {
+   "missing": [
+    944200
+   ],
+   "result": "fail"
+  },
+  "REQUEST-944-APPLICATION-ATTACK-JAVA/944210.yaml#23#0": {
+   "result": "fail",
+   "unwanted": [
+    944210
+   ]
+  },
+  "REQUEST-944-APPLICATION-ATTACK-JAVA/944210.yaml#24#0": {
+   "result": "fail",
+   "unwanted": [
+    944210
+   ]
+  },
+  "REQUEST-944-APPLICATION-ATTACK-JAVA/944210.yaml#40#0": {
+   "result": "fail",
+   "unwanted": [
+    944210
+   ]
+  },
+  "REQUEST-944-APPLICATION-ATTACK-JAVA/944210.yaml#41#0": {
+   "result": "fail",
+   "unwanted": [
+    944210
+   ]
+  },
+  "REQUEST-944-APPLICATION-ATTACK-JAVA/944210.yaml#6#0": {
+   "result": "fail",
+   "unwanted": [
+    944210
+   ]
+  },
+  "REQUEST-944-APPLICATION-ATTACK-JAVA/944210.yaml#7#0": {
+   "result": "fail",
+   "unwanted": [
+    944210
+   ]
+  },
+  "REQUEST-949-BLOCKING-EVALUATION/949110.yaml#1#0": {
+   "reason": "rule not loaded by the product",
+   "result": "unsupported"
+  },
+  "REQUEST-949-BLOCKING-EVALUATION/949110.yaml#2#0": {
+   "reason": "rule not loaded by the product",
+   "result": "unsupported"
+  },
+  "REQUEST-949-BLOCKING-EVALUATION/949110.yaml#3#0": {
+   "reason": "rule not loaded by the product",
+   "result": "unsupported"
+  },
+  "REQUEST-949-BLOCKING-EVALUATION/949110.yaml#4#0": {
+   "reason": "rule not loaded by the product",
+   "result": "unsupported"
+  },
+  "REQUEST-949-BLOCKING-EVALUATION/949110.yaml#5#0": {
+   "reason": "rule not loaded by the product",
+   "result": "unsupported"
+  },
+  "RESPONSE-951-DATA-LEAKAGES-SQL/951110.yaml#1#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-951-DATA-LEAKAGES-SQL/951120.yaml#1#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-951-DATA-LEAKAGES-SQL/951130.yaml#1#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-951-DATA-LEAKAGES-SQL/951140.yaml#1#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-951-DATA-LEAKAGES-SQL/951150.yaml#1#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-951-DATA-LEAKAGES-SQL/951160.yaml#1#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-951-DATA-LEAKAGES-SQL/951170.yaml#1#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-951-DATA-LEAKAGES-SQL/951180.yaml#1#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-951-DATA-LEAKAGES-SQL/951190.yaml#1#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-951-DATA-LEAKAGES-SQL/951200.yaml#1#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-951-DATA-LEAKAGES-SQL/951210.yaml#1#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-951-DATA-LEAKAGES-SQL/951220.yaml#1#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-951-DATA-LEAKAGES-SQL/951220.yaml#2#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-951-DATA-LEAKAGES-SQL/951230.yaml#1#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-951-DATA-LEAKAGES-SQL/951230.yaml#2#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-951-DATA-LEAKAGES-SQL/951240.yaml#1#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-951-DATA-LEAKAGES-SQL/951240.yaml#2#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-951-DATA-LEAKAGES-SQL/951250.yaml#1#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-951-DATA-LEAKAGES-SQL/951260.yaml#1#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-953-DATA-LEAKAGES-PHP/953100.yaml#1#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-953-DATA-LEAKAGES-PHP/953100.yaml#2#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-953-DATA-LEAKAGES-PHP/953100.yaml#3#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-953-DATA-LEAKAGES-PHP/953100.yaml#4#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-953-DATA-LEAKAGES-PHP/953100.yaml#5#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-953-DATA-LEAKAGES-PHP/953101.yaml#1#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-953-DATA-LEAKAGES-PHP/953101.yaml#2#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-953-DATA-LEAKAGES-PHP/953101.yaml#3#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-953-DATA-LEAKAGES-PHP/953101.yaml#4#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-953-DATA-LEAKAGES-PHP/953101.yaml#5#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-953-DATA-LEAKAGES-PHP/953120.yaml#1#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-953-DATA-LEAKAGES-PHP/953120.yaml#2#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-953-DATA-LEAKAGES-PHP/953120.yaml#3#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-953-DATA-LEAKAGES-PHP/953120.yaml#4#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-953-DATA-LEAKAGES-PHP/953120.yaml#5#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-953-DATA-LEAKAGES-PHP/953120.yaml#6#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-953-DATA-LEAKAGES-PHP/953120.yaml#7#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-954-DATA-LEAKAGES-IIS/954100.yaml#1#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-954-DATA-LEAKAGES-IIS/954120.yaml#1#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-954-DATA-LEAKAGES-IIS/954120.yaml#2#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-955-WEB-SHELLS/955100.yaml#1#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-955-WEB-SHELLS/955100.yaml#2#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-955-WEB-SHELLS/955100.yaml#3#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-955-WEB-SHELLS/955260.yaml#1#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-959-BLOCKING-EVALUATION/959100.yaml#1#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-959-BLOCKING-EVALUATION/959100.yaml#2#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-959-BLOCKING-EVALUATION/959100.yaml#3#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-980-CORRELATION/980170.yaml#1#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-980-CORRELATION/980170.yaml#2#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  },
+  "RESPONSE-980-CORRELATION/980170.yaml#3#0": {
+   "reason": "response rule: needs CRS's echo backend",
+   "result": "unsupported"
+  }
+ },
+ "meta": {
+  "binary_sha256": "51b48e1963ff527f226c24f044e5a7f00c6abddd4c150fbfb48abaa99f62a804",
+  "commit": "a3aa66f60f6b071faefc4b1f9a28e3d9f98b3308",
+  "config_sha256": "b452a2291b24ea33523828b54b2a79b0c9b0b9a3231967dd803a392c7a555839",
+  "engine": "sentinel-bin a3aa66f",
+  "runner_sha256": "4687d265736ab20d0b7a873cf0782911b73b6ca6b392e4ffc7453f9441490ca0",
+  "started_at": "2026-10-22T12:57:04+00:00",
+  "suite": {
+   "crs_version": "4.7.0",
+   "suite_sha256": "832c62d0508d7bc6e17b1dc4846c74ccbfec86958d8db15c5deb5dce2e26d09b"
+  }
+ }
+}
