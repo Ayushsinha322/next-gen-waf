@@ -7661,12 +7661,17 @@ fn target_name(t: &sentinel_rules::dsl::ast::Target) -> String {
     use sentinel_rules::dsl::ast::Target;
     match t {
         Target::Args => "ARGS".into(),
+        Target::ArgNamed { name, get_only } => {
+            format!("{}:{name}", if *get_only { "ARGS_GET" } else { "ARGS" })
+        }
         Target::ArgsNames => "ARGS_NAMES".into(),
         Target::RequestBody => "REQUEST_BODY".into(),
         Target::RequestUri => "REQUEST_URI".into(),
         Target::RequestFilename => "REQUEST_FILENAME".into(),
+        Target::RequestBasename => "REQUEST_BASENAME".into(),
         Target::RequestMethod => "REQUEST_METHOD".into(),
         Target::MatchedVar => "MATCHED_VAR".into(),
+        Target::MatchedVars => "MATCHED_VARS".into(),
         Target::RequestLine => "REQUEST_LINE".into(),
         Target::RequestProtocol => "REQUEST_PROTOCOL".into(),
         Target::ReqbodyProcessor => "REQBODY_PROCESSOR".into(),

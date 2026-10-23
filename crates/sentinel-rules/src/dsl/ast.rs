@@ -57,6 +57,11 @@ pub struct RuleDef {
     /// `!REQUEST_COOKIES:/__utm/`, an operator's `ARGS:q`.
     #[serde(default)]
     pub exclusions: Vec<TargetExclusion>,
+    /// `ctl:ruleRemoveTargetById`: what this rule, when it fires, takes off
+    /// another rule for the rest of the request — `(rule, "ARGS:fbclid")`,
+    /// the target in the form `TargetExclusion::parse` reads.
+    #[serde(default)]
+    pub remove_targets: Vec<(RuleId, String)>,
 }
 
 /// `!COLLECTION:key` — one member of a collection a rule leaves out
@@ -138,6 +143,17 @@ pub enum SetVarOp {
 pub struct ChainCondition {
     pub targets: Vec<TargetExpr>,
     pub operator: Operator,
+    /// This link's OWN transformations. ModSecurity gives every rule in a
+    /// chain its own `t:` list; the parent's never apply to a child.
+    #[serde(default)]
+    pub transforms: Vec<Transform>,
+    /// This link's own `multiMatch`.
+    #[serde(default)]
+    pub multi_match: bool,
+    /// This link's own `setvar`s, run as soon as the link matches — so a
+    /// category score on the last link counts only when the whole chain does.
+    #[serde(default)]
+    pub setvars: Vec<SetVar>,
 }
 
 impl Default for RuleDef {
@@ -158,6 +174,7 @@ impl Default for RuleDef {
             multi_match: false,
             setvars: Vec::new(),
             exclusions: Vec::new(),
+            remove_targets: Vec::new(),
         }
     }
 }
@@ -205,6 +222,10 @@ pub enum Target {
     RequestBody,
     RequestUri,
     RequestFilename,
+    /// The last component of REQUEST_FILENAME (`index.php`). It was read as
+    /// the whole path, so 942101's libinjection check saw `/post/1234 OR 1=1`
+    /// — whose `/post/` prefix hides the SQL — instead of `1234 OR 1=1`.
+    RequestBasename,
     RequestMethod,
     RequestLine,
     /// The request's HTTP version as ModSecurity spells it — `HTTP/1.1`,
@@ -278,9 +299,19 @@ pub enum Target {
     RemoteAddr,
     Geo,
     TxVar(String),
-    /// CRS `MATCHED_VAR` / `MATCHED_VARS`: the value the previous condition in
-    /// this chain matched. Only meaningful inside a chain.
+    /// `ARGS:name` / `ARGS_GET:name`: that argument's values only — the name
+    /// compared case-insensitively — not the whole collection, which is what
+    /// the selector used to be widened to.
+    ArgNamed {
+        name: String,
+        get_only: bool,
+    },
+    /// CRS `MATCHED_VAR`: the WHOLE value of the variable the previous link in
+    /// this chain matched — the last one, when it matched several — not the
+    /// text its pattern found. Only meaningful inside a chain.
     MatchedVar,
+    /// CRS `MATCHED_VARS`: every value the previous link matched.
+    MatchedVars,
     CountOf(Box<Target>),
 }
 
@@ -341,12 +372,6 @@ pub enum Operator {
     DetectSqli,
     /// libinjection-based cross-site-scripting detection (`@detectXSS`).
     DetectXss,
-    /// Off-domain URL / Remote-File-Inclusion detection. Fires when a value
-    /// contains a `scheme://host` URL whose host is neither the request's own
-    /// Host nor a subdomain of it. Reproduces the semantics of CRS rule 931130
-    /// (which our importer cannot express directly — it needs capture groups,
-    /// dynamic `setvar`, a `TX:/regex/` collection, and `%{}` macro expansion).
-    OffDomainUrl,
     /// SSRF detection (`@ssrfUrl`). Fires when a value contains a URL whose host is an
     /// internal/loopback/link-local address or a cloud-metadata name, in ANY encoding
     /// the OS resolver accepts (decimal, hex, octal, short-form, IPv4-mapped IPv6).

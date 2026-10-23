@@ -53,10 +53,7 @@ pub fn import_secrule_conf_dir(
         match item {
             RuleItem::Directive(Directive::SecRule(dir)) => {
                 let actions = parse_crs_actions(&dir.actions);
-                // 931130/931131 are collapsed into a single native OffDomainUrl
-                // rule (see secrule_directive_to_rule_with_actions); suppress chain
-                // accumulation so the unexpressable macro child condition is dropped.
-                let is_chain = actions.chain && !matches!(actions.id, Some(931130) | Some(931131));
+                let is_chain = actions.chain;
 
                 if let Some(ref mut pending) = pending_chain {
                     // This directive is a chain member — add its condition.
@@ -72,9 +69,21 @@ pub fn import_secrule_conf_dir(
                             // Chain members may have empty targets (bare operator
                             // that applies to the previously matched value) — we
                             // treat those as Exists stubs.
-                            pending
-                                .chain_conditions
-                                .push(ChainCondition { targets, operator });
+                            // The link keeps its own transformations and
+                            // setvars: ModSecurity runs each chain member with
+                            // its own `t:` list (the parent's do not carry
+                            // over) and executes a member's non-disruptive
+                            // actions when THAT member matches. Keeping only
+                            // targets and operator compiled the protocol-policy
+                            // rules into links that could never match — see
+                            // tests/crs_chain_semantics.rs.
+                            pending.chain_conditions.push(ChainCondition {
+                                targets,
+                                operator,
+                                transforms: actions.transforms.clone(),
+                                multi_match: actions.multi_match,
+                                setvars: actions.setvars.clone(),
+                            });
 
                             // Inherit the chain CHILD's anomaly-score
                             // contribution.
@@ -216,18 +225,7 @@ fn secrule_directive_to_rule_with_actions(
         CrsAction::Allow => RuleAction::Allow,
     };
 
-    // CRS 931130/931131 (off-domain reference / RFI) are chained rules that need
-    // capture groups, a dynamic `setvar`, a `TX:/regex/` collection, and a
-    // `%{request_headers.host}`-macro `@endsWith` — none of which the importer can
-    // express, so they were effectively disabled. Collapse them into the native
-    // `OffDomainUrl` operator and apply their critical score directly, preserving
-    // faithful detection (the chained child condition is dropped in the caller).
-    let (operator, score_delta, rule_action) = if matches!(rule_id, 931130 | 931131) {
-        (Operator::OffDomainUrl, Some(5), RuleAction::Score)
-    } else {
-        (operator, actions.score_delta, rule_action)
-    };
-
+    let score_delta = actions.score_delta;
     Ok(Some(RuleDef {
         id: rule_id,
         phase,
@@ -244,6 +242,12 @@ fn secrule_directive_to_rule_with_actions(
         multi_match: actions.multi_match,
         setvars: actions.setvars.clone(),
         exclusions: parse_crs_target_exclusions(targets_str),
+        remove_targets: actions
+            .remove_targets
+            .iter()
+            .filter(|(_, target)| TargetExclusion::parse(target).is_some())
+            .cloned()
+            .collect(),
     }))
 }
 
@@ -303,11 +307,18 @@ fn token_to_target(tok: &str, rule_id: Option<u32>) -> Option<Target> {
     };
 
     let result: Option<Target> = match base {
+        // A named argument reads that argument only. A `/regex/` selector is
+        // still widened to the whole collection.
+        "ARGS" | "ARGS_GET" if sub.is_some_and(|s| !s.starts_with('/')) => Some(Target::ArgNamed {
+            name: sub.unwrap_or_default().to_owned(),
+            get_only: base == "ARGS_GET",
+        }),
         "ARGS" => Some(Target::Args),
         "ARGS_NAMES" => Some(Target::ArgsNames),
         "REQUEST_BODY" | "REQUEST_BODY_RAW" => Some(Target::RequestBody),
         "REQUEST_URI" | "REQUEST_URI_RAW" => Some(Target::RequestUri),
-        "REQUEST_FILENAME" | "REQUEST_BASENAME" => Some(Target::RequestFilename),
+        "REQUEST_FILENAME" => Some(Target::RequestFilename),
+        "REQUEST_BASENAME" => Some(Target::RequestBasename),
         "REQUEST_METHOD" => Some(Target::RequestMethod),
         "REQUEST_PROTOCOL" => Some(Target::RequestProtocol),
         "REQBODY_PROCESSOR" => Some(Target::ReqbodyProcessor),
@@ -341,7 +352,8 @@ fn token_to_target(tok: &str, rule_id: Option<u32>) -> Option<Target> {
         // value, which the VM does not carry into the child. They stay
         // unsupported, but a rule left target-less by them is now RECORDED as a
         // coverage gap instead of vanishing.
-        "MATCHED_VAR" | "MATCHED_VARS" => Some(Target::MatchedVar),
+        "MATCHED_VAR" => Some(Target::MatchedVar),
+        "MATCHED_VARS" => Some(Target::MatchedVars),
         "MATCHED_VAR_NAME" | "MATCHED_VARS_NAMES" => None,
         "FILES" => Some(Target::Files),
         "FILES_NAMES" => Some(Target::FilesNames),

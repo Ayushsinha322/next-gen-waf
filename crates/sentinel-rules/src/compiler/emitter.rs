@@ -23,6 +23,7 @@ pub enum TargetSpec {
     RequestBody,
     RequestUri,
     RequestFilename,
+    RequestBasename,
     RequestMethod,
     RequestLine,
     RequestProtocol,
@@ -60,7 +61,19 @@ pub enum TargetSpec {
     /// rules. Several of them are NEGATED refinements ("...and the matched text
     /// is not a JWT"), so losing the child did not make the parent stricter, it
     /// turned the parent off.
+    ///
+    /// The previous link's WHOLE value, as ModSecurity gives it — the last
+    /// value that link matched — not the text its pattern found: 944120's
+    /// parent finds `clonetransformer` and its child looks for `processbuilder`
+    /// elsewhere in the same value.
     MatchedVar,
+    /// `MATCHED_VARS`: every value the previous link matched.
+    MatchedVars,
+    /// `ARGS:name` (query then body) or `ARGS_GET:name` (query only).
+    ArgNamed {
+        name: String,
+        get_only: bool,
+    },
     CountOf(Box<TargetSpec>),
     /// `base` without the members `keys` name: a collection target its rule
     /// has exclusions for (`REQUEST_COOKIES|!REQUEST_COOKIES:/__utm/`).
@@ -117,6 +130,7 @@ impl TargetSpec {
             TargetSpec::RequestBody => "REQUEST_BODY".into(),
             TargetSpec::RequestUri => "REQUEST_URI".into(),
             TargetSpec::RequestFilename => "REQUEST_FILENAME".into(),
+            TargetSpec::RequestBasename => "REQUEST_BASENAME".into(),
             TargetSpec::RequestMethod => "REQUEST_METHOD".into(),
             TargetSpec::RequestProtocol => "REQUEST_PROTOCOL".into(),
             TargetSpec::ReqbodyProcessor => "REQBODY_PROCESSOR".into(),
@@ -130,6 +144,9 @@ impl TargetSpec {
             TargetSpec::ArgsGetNames => "ARGS_GET_NAMES".into(),
             TargetSpec::QueryString => "QUERY_STRING".into(),
             TargetSpec::RequestCookie(c) => format!("REQUEST_COOKIES:{c}"),
+            TargetSpec::ArgNamed { name, get_only } => {
+                format!("{}:{name}", if *get_only { "ARGS_GET" } else { "ARGS" })
+            }
             TargetSpec::ResponseHeadersAll => "RESPONSE_HEADERS".into(),
             TargetSpec::ResponseHeader(h) => format!("RESPONSE_HEADERS:{h}"),
             TargetSpec::ResponseBody => "RESPONSE_BODY".into(),
@@ -143,6 +160,7 @@ impl TargetSpec {
             TargetSpec::Geo => "GEO".into(),
             TargetSpec::TxVar(v) => format!("TX:{v}"),
             TargetSpec::MatchedVar => "MATCHED_VAR".into(),
+            TargetSpec::MatchedVars => "MATCHED_VARS".into(),
             TargetSpec::CountOf(inner) => format!("&{}", inner.label()),
         }
     }
@@ -161,6 +179,7 @@ impl From<&Target> for TargetSpec {
             Target::RequestBody => TargetSpec::RequestBody,
             Target::RequestUri => TargetSpec::RequestUri,
             Target::RequestFilename => TargetSpec::RequestFilename,
+            Target::RequestBasename => TargetSpec::RequestBasename,
             Target::RequestMethod => TargetSpec::RequestMethod,
             Target::RequestProtocol => TargetSpec::RequestProtocol,
             Target::ReqbodyProcessor => TargetSpec::ReqbodyProcessor,
@@ -169,6 +188,10 @@ impl From<&Target> for TargetSpec {
             Target::RequestHeaders(Some(h)) => TargetSpec::RequestHeader(h.clone()),
             Target::RequestCookies(None) => TargetSpec::RequestCookiesAll,
             Target::RequestCookies(Some(c)) => TargetSpec::RequestCookie(c.clone()),
+            Target::ArgNamed { name, get_only } => TargetSpec::ArgNamed {
+                name: name.clone(),
+                get_only: *get_only,
+            },
             Target::ResponseHeaders(None) => TargetSpec::ResponseHeadersAll,
             Target::ResponseHeaders(Some(h)) => TargetSpec::ResponseHeader(h.clone()),
             Target::ResponseBody => TargetSpec::ResponseBody,
@@ -182,6 +205,7 @@ impl From<&Target> for TargetSpec {
             Target::Geo => TargetSpec::Geo,
             Target::TxVar(v) => TargetSpec::TxVar(v.clone()),
             Target::MatchedVar => TargetSpec::MatchedVar,
+            Target::MatchedVars => TargetSpec::MatchedVars,
             Target::CountOf(inner) => {
                 TargetSpec::CountOf(Box::new(TargetSpec::from(inner.as_ref())))
             }
@@ -203,8 +227,36 @@ pub enum Instruction {
     LoadTarget(TargetSpec),
 
     /// Pop `StrVec`, apply regex `patterns[pattern_id]`, push `Bool(any_match)`.
+    ///
+    /// `negate` is `!@rx`, judged per value as ModSecurity does: true when ANY
+    /// value does not match. Negating the combined result instead asked
+    /// whether NO value matched, so on a multi-valued target (FILES_NAMES,
+    /// MATCHED_VARS, `TX:/regex/`) one value that matched hid every one that
+    /// did not.
     MatchRx {
         pattern_id: usize,
+        #[serde(default)]
+        negate: bool,
+    },
+
+    /// [`Instruction::MatchRx`] that tests EVERY value instead of stopping at the
+    /// first match, and records each match — its capture groups and the whole
+    /// value — for the [`Instruction::ChainLink`] that follows. Emitted only
+    /// for a chain link whose matches the chain goes on to use: a `setvar`
+    /// whose name is built from the match (CRS's `tx.header_name_920450_%{tx.0}`,
+    /// which ModSecurity runs once per matched value), or a next link that
+    /// reads `MATCHED_VAR(S)`.
+    MatchRxAll {
+        pattern_id: usize,
+        #[serde(default)]
+        negate: bool,
+    },
+
+    /// [`Instruction::MatchMulti`] that tests every value and records each
+    /// matching one, for a next link that reads `MATCHED_VAR(S)` (CRS 933120's
+    /// `@pmFromFile` parent).
+    MatchMultiAll {
+        set_id: usize,
     },
 
     /// Pop `StrVec`, expand the `%{...}` macros in `literals[raw_id]` against the
@@ -216,6 +268,10 @@ pub enum Instruction {
     MatchInterpolated {
         cmp: InterpCmp,
         raw_id: usize,
+        /// Per value, as `MatchRx`'s: CRS 931130's `!@endsWith .%{request_headers.host}`
+        /// over every `TX:/rfi_parameter_.*/` it set.
+        #[serde(default)]
+        negate: bool,
     },
 
     /// Pop `StrVec`, apply Aho-Corasick set `ac_sets[set_id]`, push `Bool(any_match)`.
@@ -238,8 +294,6 @@ pub enum Instruction {
     /// Pop `StrVec`, run libinjection XSS detection on each value, push
     /// `Bool(any value flagged as XSS)`.
     DetectXss,
-    /// Pop `StrVec`, push `Bool(any value is an off-domain URL)`.
-    DetectOffDomainUrl,
     /// Pop `StrVec`, push `Bool(any value contains an SSRF URL)`.
     DetectSsrfUrl,
     /// Pop `StrVec`, push `Bool(any value is an IP inside one of these CIDRs)`.
@@ -302,6 +356,29 @@ pub enum Instruction {
         offset: i32,
     },
 
+    /// Close one link of a chained rule, the way ModSecurity runs a chain.
+    ///
+    /// Pops the link's result. If it matched, the link's own `setvar`s run now
+    /// — before the next link is evaluated, which is what lets a CRS parent
+    /// store a value for its child to check — and evaluation continues with the
+    /// next link; the LAST link pushes `Bool(true)` for `RuleEnd`. If it did not
+    /// match, `Bool(false)` is pushed and the VM jumps `to_end` instructions
+    /// forward, onto the rule's `RuleEnd`: no later link is evaluated and none
+    /// of its `setvar`s run.
+    ChainLink {
+        setvars: Vec<SetVar>,
+        to_end: u32,
+        last: bool,
+    },
+
+    /// Opens a rule that another rule's `ctl:ruleRemoveTargetById` may take a
+    /// target off. Emitted only for such rules (942440, for CRS 942441/942442):
+    /// the VM applies the removals the request has collected for this rule to
+    /// every target the rule loads, until its RuleEnd.
+    RuleStart {
+        rule_id: u32,
+    },
+
     /// Pop Bool from stack.  If true, apply the rule's action/score/log.
     /// The rule metadata is looked up by `rule_id` in `CompiledRuleSet::rule_meta`.
     RuleEnd {
@@ -334,6 +411,9 @@ pub struct RuleMeta {
     /// fires (executed by the VM in `fire_rule`).
     #[serde(default)]
     pub setvars: Vec<SetVar>,
+    /// `ctl:ruleRemoveTargetById` this rule applies to the request when it fires.
+    #[serde(default)]
+    pub remove_targets: Vec<(u32, String)>,
 }
 
 impl Default for RuleMeta {
@@ -348,6 +428,7 @@ impl Default for RuleMeta {
             phase: RulePhase::RequestBody,
             skip_after: None,
             setvars: Vec::new(),
+            remove_targets: Vec::new(),
         }
     }
 }

@@ -145,14 +145,52 @@ rust-build:
   script:
     - cargo build --workspace --release
     - du -sh target 2>/dev/null || true
+  # The data plane only, for crs-regression — not target/ (13 GB, see above).
+  artifacts:
+    paths:
+      - target/release/sentinel-bin
+    expire_in: 1 day
+
+# ── CRS regression gate ──────────────────────────────────────────────────────
+# CRS's own regression suite — tests/regression of the shipped CRS, bundled as
+# rules/owasp-crs/tests/regression-4.7.0.json — against this pipeline's release
+# data plane, standalone: no control plane, database or Docker
+# (deploy/load-test/crs-regression.sh, site deploy/load-test/crs-regression.yaml).
+#
+# Fails when a case newly fails or newly cannot be judged, against
+# deploy/load-test/crs-regression-baseline.json. A case that starts passing is
+# reported (FIXED), not failed: tighten the baseline in the change that fixed it
+# with `crs-regression.sh --write-baseline`, and review its diff like code. What
+# each result means, and how requests are matched to log lines:
+# deploy/load-test/crs-regression.py. results.json records the commit, binary,
+# config and suite it ran against.
+crs-regression:
+  stage: security
+  image: python:3.12-slim-bookworm
+  tags:
+    - k8s-docker
+  needs: [rust-build]
+  timeout: 30m
+  script:
+    # An artifact is not guaranteed to keep its executable bit.
+    - chmod +x target/release/sentinel-bin
+    - deploy/load-test/crs-regression.sh --baseline deploy/load-test/crs-regression-baseline.json
+  artifacts:
+    when: always
+    expire_in: 2 weeks
+    paths:
+      - target/crs-regression/
 
 # ── Go control plane ─────────────────────────────────────────────────────────
 go:
   stage: test
   # 1.26: golang.org/x/net 0.60 requires it, and Go 1.25 gets no fix for the
   # net/http HTTP/2 vulnerabilities our code reaches (GO-2026-6610..6617,
-  # fixed in 1.26.9; govulncheck below).
-  image: golang:1.26
+  # fixed in 1.26.9; govulncheck below). The exact patch release, not the
+  # floating `1.26` tag: GO-2026-6809 (crypto/x509) is fixed in 1.26.10, and
+  # a floating tag gives no proof which toolchain built what. Same pin in
+  # deploy/docker/Dockerfile, control-plane/go.mod and .github/workflows/ci.yml.
+  image: golang:1.26.10
   tags:
     - k8s-docker
   cache:

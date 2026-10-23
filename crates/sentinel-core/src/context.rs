@@ -289,6 +289,9 @@ pub struct RequestContext {
     pub ml_scores: HashMap<String, f32>,
     /// Transaction variables for rule chaining (e.g. TX:anomaly_score_pl1).
     pub tx_vars: HashMap<String, String>,
+    /// `ctl:ruleRemoveTargetById` taken effect on this request: rule ID and
+    /// the target it no longer inspects (`ARGS:fbclid`).
+    pub removed_targets: Vec<(u32, String)>,
     pub decision: WafDecision,
     /// Human-readable reason for a Block/Challenge decision.
     pub block_reason: Option<String>,
@@ -374,6 +377,7 @@ impl RequestContext {
             rule_matches: Vec::new(),
             ml_scores: HashMap::new(),
             tx_vars: HashMap::new(),
+            removed_targets: Vec::new(),
             decision: WafDecision::Allow,
             block_reason: None,
             block_status: None,

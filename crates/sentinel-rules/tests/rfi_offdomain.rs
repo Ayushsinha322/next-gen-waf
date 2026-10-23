@@ -1,9 +1,16 @@
-//! Off-domain RFI detection (CRS 931130/931131 collapsed into the native
-//! `@offDomainUrl` operator).
+//! Off-domain RFI detection (CRS 931130/931131, run from CRS's own text).
 //!
 //! Verifies that a URL in a request argument pointing to an *off-domain* host
 //! is flagged, while a URL to the request's own domain (or a subdomain) is not
 //! — i.e. detection without a false positive on legitimate same-site links.
+//!
+//! These two rules used to be replaced by a native operator, because the
+//! engine could not run their chain (a setvar per matched value, named with
+//! MATCHED_VAR_NAME, read back through `TX:/rfi_parameter_.*/`). That operator
+//! ended the host at the first `/` and dropped the port, so CRS's own
+//! regression cases `http://example.com%2f@evil.com/` and
+//! `https://example.com:1234/` passed through. CRS treats everything up to the
+//! last `@` as userinfo — the stricter reading, against URL-parser confusion.
 
 mod common;
 
@@ -66,4 +73,46 @@ fn subdomain_url_is_not_flagged() {
         &ctx,
         "a subdomain of the request host must not be flagged as RFI",
     );
+}
+
+fn fired_931130(ctx: &sentinel_core::context::RequestContext) -> bool {
+    ctx.rule_matches.iter().any(|m| m.rule_id == "931130")
+}
+
+#[test]
+fn cases_the_native_operator_let_through_are_flagged() {
+    let eng = load_crs_engine("REQUEST-931-APPLICATION-ATTACK-RFI.conf");
+    for payload in [
+        // `%2f` decodes to `/` before the rules see it: CRS reads userinfo up
+        // to the last `@`, so the host is evil.com.
+        "http://example.com/@evil.com/",
+        "http://example.com/:foo@bar@evil.com/",
+        // Our own host on another port is a different origin to CRS.
+        "https://example.com:1234/",
+        // No host at all, behind the `url:` prefix.
+        "url:file:///etc/passwd",
+    ] {
+        let mut ctx = url_arg_ctx(payload);
+        eval(&eng, &mut ctx, Phase::RequestBody);
+        assert!(
+            fired_931130(&ctx),
+            "{payload}: 931130 must fire; fired: {:?}",
+            ctx.rule_matches
+                .iter()
+                .map(|m| &m.rule_id)
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn every_off_domain_parameter_is_checked_not_only_the_first() {
+    // One TX variable per matched parameter: the off-domain URL is the SECOND.
+    let eng = load_crs_engine("REQUEST-931-APPLICATION-ATTACK-RFI.conf");
+    let a = utf8_percent_encode("https://example.com/home", NON_ALPHANUMERIC).to_string();
+    let b = utf8_percent_encode("https://evil.example/x", NON_ALPHANUMERIC).to_string();
+    let mut ctx = make_get_ctx(&format!("/page?back={a}&next={b}"));
+    set_paranoia(&mut ctx, 2);
+    eval(&eng, &mut ctx, Phase::RequestBody);
+    assert!(fired_931130(&ctx), "the second parameter is off-domain");
 }
