@@ -371,28 +371,6 @@ mod tests {
         assert_eq!(refusal_in(&ctx, &Phase::RequestBody), None);
     }
 
-    /// Counts the WARN events this module logs, on the thread it is the
-    /// default subscriber for.
-    struct CountWarnings(Arc<std::sync::atomic::AtomicUsize>);
-
-    impl tracing::Subscriber for CountWarnings {
-        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-            *metadata.level() == tracing::Level::WARN
-        }
-        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-        fn event(&self, event: &tracing::Event<'_>) {
-            if event.metadata().target() == "sentinel_proxy::inspection_limits" {
-                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }
-        }
-        fn enter(&self, _: &tracing::span::Id) {}
-        fn exit(&self, _: &tracing::span::Id) {}
-    }
-
     /// Learning mode forwards every refused request, and logged a WARN for
     /// each: a client could write the log at its own request rate. The event
     /// and the counter record each one; the log says so once per site and
@@ -405,14 +383,19 @@ mod tests {
         );
         // A site of its own: the throttle is process-wide.
         s.id = "warn-throttle".into();
-        let warnings = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        tracing::subscriber::with_default(CountWarnings(Arc::clone(&warnings)), || {
-            for _ in 0..50 {
-                let ctx = body_phase(&s, "/f", "a=v&b=v&c=v&d=v");
-                assert!(ctx.would_block);
-            }
-        });
-        assert_eq!(warnings.load(std::sync::atomic::Ordering::SeqCst), 1);
+        for _ in 0..50 {
+            let ctx = body_phase(&s, "/f", "a=v&b=v&c=v&d=v");
+            assert!(ctx.would_block);
+        }
+        // The throttle's own record: one WARN logged, the other 49 held back.
+        // (Counting log events through a thread-scoped subscriber was flaky:
+        // tracing caches whether a callsite is enabled process-wide, and other
+        // test threads moving that cache let the WARN miss the subscriber —
+        // GitLab pipeline 33326. `warning_due` itself has its own test.)
+        let warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+        let key = ("warn-throttle".to_owned(), InspectionLimit::Args.reason());
+        let (_, held) = warned.as_ref().and_then(|log| log.get(&key)).copied().unwrap();
+        assert_eq!(held, 49);
     }
 
     /// A refused request is decided — blocking mode refuses it, learning mode
