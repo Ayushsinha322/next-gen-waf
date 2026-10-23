@@ -394,7 +394,11 @@ mod tests {
         // GitLab pipeline 33326. `warning_due` itself has its own test.)
         let warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
         let key = ("warn-throttle".to_owned(), InspectionLimit::Args.reason());
-        let (_, held) = warned.as_ref().and_then(|log| log.get(&key)).copied().unwrap();
+        let (_, held) = warned
+            .as_ref()
+            .and_then(|log| log.get(&key))
+            .copied()
+            .unwrap();
         assert_eq!(held, 49);
     }
 
