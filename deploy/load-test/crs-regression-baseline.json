@@ -168,72 +168,6 @@
    "reason": "no access-log line: rejected before the WAF",
    "result": "unsupported"
   },
-  "REQUEST-932-APPLICATION-ATTACK-RCE/932200.yaml#10#0": {
-   "missing": [
-    932200
-   ],
-   "result": "fail"
-  },
-  "REQUEST-932-APPLICATION-ATTACK-RCE/932200.yaml#4#0": {
-   "missing": [
-    932200
-   ],
-   "result": "fail"
-  },
-  "REQUEST-932-APPLICATION-ATTACK-RCE/932200.yaml#5#0": {
-   "missing": [
-    932200
-   ],
-   "result": "fail"
-  },
-  "REQUEST-932-APPLICATION-ATTACK-RCE/932200.yaml#6#0": {
-   "missing": [
-    932200
-   ],
-   "result": "fail"
-  },
-  "REQUEST-932-APPLICATION-ATTACK-RCE/932200.yaml#7#0": {
-   "missing": [
-    932200
-   ],
-   "result": "fail"
-  },
-  "REQUEST-932-APPLICATION-ATTACK-RCE/932200.yaml#8#0": {
-   "missing": [
-    932200
-   ],
-   "result": "fail"
-  },
-  "REQUEST-932-APPLICATION-ATTACK-RCE/932200.yaml#9#0": {
-   "missing": [
-    932200
-   ],
-   "result": "fail"
-  },
-  "REQUEST-932-APPLICATION-ATTACK-RCE/932205.yaml#1#0": {
-   "missing": [
-    932205
-   ],
-   "result": "fail"
-  },
-  "REQUEST-932-APPLICATION-ATTACK-RCE/932205.yaml#2#0": {
-   "missing": [
-    932205
-   ],
-   "result": "fail"
-  },
-  "REQUEST-932-APPLICATION-ATTACK-RCE/932205.yaml#3#0": {
-   "missing": [
-    932205
-   ],
-   "result": "fail"
-  },
-  "REQUEST-932-APPLICATION-ATTACK-RCE/932206.yaml#1#0": {
-   "missing": [
-    932206
-   ],
-   "result": "fail"
-  },
   "REQUEST-932-APPLICATION-ATTACK-RCE/932230.yaml#1#0": {
    "reason": "no access-log line: rejected before the WAF",
    "result": "unsupported"
@@ -396,24 +330,6 @@
    "reason": "no access-log line: rejected before the WAF",
    "result": "unsupported"
   },
-  "REQUEST-941-APPLICATION-ATTACK-XSS/941110.yaml#6#0": {
-   "missing": [
-    941110
-   ],
-   "result": "fail"
-  },
-  "REQUEST-941-APPLICATION-ATTACK-XSS/941110.yaml#7#0": {
-   "missing": [
-    941110
-   ],
-   "result": "fail"
-  },
-  "REQUEST-941-APPLICATION-ATTACK-XSS/941110.yaml#8#0": {
-   "missing": [
-    941110
-   ],
-   "result": "fail"
-  },
   "REQUEST-941-APPLICATION-ATTACK-XSS/941160.yaml#1#0": {
    "reason": "no access-log line: rejected before the WAF",
    "result": "unsupported"
@@ -428,30 +344,6 @@
    "reason": "no access-log line: rejected before the WAF",
    "result": "unsupported"
   },
-  "REQUEST-942-APPLICATION-ATTACK-SQLI/942101.yaml#1#0": {
-   "missing": [
-    942101
-   ],
-   "result": "fail"
-  },
-  "REQUEST-942-APPLICATION-ATTACK-SQLI/942101.yaml#5#0": {
-   "missing": [
-    942101
-   ],
-   "result": "fail"
-  },
-  "REQUEST-942-APPLICATION-ATTACK-SQLI/942101.yaml#7#0": {
-   "missing": [
-    942101
-   ],
-   "result": "fail"
-  },
-  "REQUEST-942-APPLICATION-ATTACK-SQLI/942101.yaml#8#0": {
-   "missing": [
-    942101
-   ],
-   "result": "fail"
-  },
   "REQUEST-942-APPLICATION-ATTACK-SQLI/942130.yaml#9#0": {
    "reason": "no access-log line: rejected before the WAF",
    "result": "unsupported"
@@ -461,30 +353,6 @@
     942190
    ],
    "result": "fail"
-  },
-  "REQUEST-942-APPLICATION-ATTACK-SQLI/942210.yaml#31#0": {
-   "result": "fail",
-   "unwanted": [
-    942210
-   ]
-  },
-  "REQUEST-942-APPLICATION-ATTACK-SQLI/942210.yaml#44#0": {
-   "result": "fail",
-   "unwanted": [
-    942210
-   ]
-  },
-  "REQUEST-942-APPLICATION-ATTACK-SQLI/942440.yaml#19#0": {
-   "result": "fail",
-   "unwanted": [
-    942440
-   ]
-  },
-  "REQUEST-942-APPLICATION-ATTACK-SQLI/942440.yaml#20#0": {
-   "result": "fail",
-   "unwanted": [
-    942440
-   ]
   },
   "REQUEST-942-APPLICATION-ATTACK-SQLI/942500.yaml#1#0": {
    "reason": "no access-log line: rejected before the WAF",
@@ -920,12 +788,12 @@
   }
  },
  "meta": {
-  "binary_sha256": "51b48e1963ff527f226c24f044e5a7f00c6abddd4c150fbfb48abaa99f62a804",
-  "commit": "a3aa66f60f6b071faefc4b1f9a28e3d9f98b3308",
+  "binary_sha256": "d879365f35fb3c6889c1d013f870f4f2c66c5d5ee4d2c9f70dcfeabe7d037899",
+  "commit": "389dc1fd620660f16affa977ec918e2cec3f98e0",
   "config_sha256": "b452a2291b24ea33523828b54b2a79b0c9b0b9a3231967dd803a392c7a555839",
-  "engine": "sentinel-bin a3aa66f",
+  "engine": "sentinel-bin 389dc1f",
   "runner_sha256": "4687d265736ab20d0b7a873cf0782911b73b6ca6b392e4ffc7453f9441490ca0",
-  "started_at": "2026-10-22T12:57:04+00:00",
+  "started_at": "2026-10-23T05:01:45+00:00",
   "suite": {
    "crs_version": "4.7.0",
    "suite_sha256": "832c62d0508d7bc6e17b1dc4846c74ccbfec86958d8db15c5deb5dce2e26d09b"
